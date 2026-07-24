@@ -233,7 +233,7 @@ class SosFlatFileTests(unittest.TestCase):
                     log=logging.getLogger("test-complete-year-window"),
                 )
             self.assertEqual(fetch.call_args.kwargs["from_day"], "2026-01-01")
-            self.assertEqual(fetch.call_args.kwargs["to_day"], "2026-12-31")
+            self.assertEqual(fetch.call_args.kwargs["to_day"], "2027-01-01")
             conn.close()
 
     def test_out_of_window_unmapped_rows_are_not_actionable(self) -> None:
@@ -422,6 +422,7 @@ class SosFlatFileTests(unittest.TestCase):
                         'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
                         "17-05-2026,01:00,10,R,ugm-3",
                         "17-05-2026,02:00,11,R,ugm-3",
+                        "17-05-2026,24:00,-1,P,ugm-3",
                         'Date,time,"Nitrogen dioxide (Hourly measured)",status,unit',
                         "17-05-2026,01:00,20,R,ugm-3",
                         "18-05-2026,01:00,21,R,ugm-3",
@@ -440,10 +441,11 @@ class SosFlatFileTests(unittest.TestCase):
             {
                 ("2026-05-17", "pm10"): 2,
                 ("2026-05-17", "no2"): 1,
+                ("2026-05-18", "pm10"): 1,
                 ("2026-05-18", "no2"): 1,
             },
         )
-        self.assertEqual(stats["rows"], 4)
+        self.assertEqual(stats["rows"], 5)
         self.assertEqual(stats["days"], ["2026-05-17", "2026-05-18"])
         self.assertEqual(stats["pollutants"], ["no2", "pm10"])
 

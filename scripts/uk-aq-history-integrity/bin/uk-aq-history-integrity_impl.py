@@ -18,6 +18,7 @@ import concurrent.futures
 import datetime as dt
 from dataclasses import dataclass
 import gzip
+import functools
 import hashlib
 import http.client
 import importlib.util
@@ -1668,6 +1669,12 @@ UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL_ENV = (
 UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL_DEFAULT = (
     "https://uk-air.defra.gov.uk/datastore/data_files/site_data"
 )
+UK_AIR_TIMESTAMP_HELPER_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "workers"
+    / "uk_aq_backfill_local"
+    / "uk_air_timestamp.mjs"
+)
 UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS_ENV = (
     "UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS"
 )
@@ -2235,16 +2242,115 @@ def _uk_air_flat_file_year_day(year: int) -> dt.date:
     return dt.date(int(year), 1, 1)
 
 
-def _uk_air_parse_day(value: Any) -> str | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%y", "%d/%m/%y"):
-        try:
-            return dt.datetime.strptime(raw, fmt).date().isoformat()
-        except ValueError:
-            continue
-    return None
+def _run_uk_air_timestamp_helper(request: Mapping[str, Any]) -> Any:
+    node_bin = str(
+        os.environ.get("UK_AQ_BACKFILL_NODE_BIN")
+        or shutil.which("node")
+        or ""
+    ).strip()
+    if not node_bin:
+        raise RuntimeError("node is required for the shared UK-AIR timestamp parser")
+    if not UK_AIR_TIMESTAMP_HELPER_PATH.is_file():
+        raise RuntimeError(
+            f"shared UK-AIR timestamp parser is missing: {UK_AIR_TIMESTAMP_HELPER_PATH}"
+        )
+    completed = subprocess.run(
+        [node_bin, str(UK_AIR_TIMESTAMP_HELPER_PATH)],
+        input=json.dumps(dict(request), separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "shared UK-AIR timestamp parser returned invalid JSON"
+        ) from exc
+    if (
+        completed.returncode != 0
+        or not isinstance(payload, dict)
+        or payload.get("ok") is not True
+    ):
+        message = (
+            str(payload.get("error") or "").strip()
+            if isinstance(payload, dict)
+            else ""
+        )
+        raise RuntimeError(
+            message or "shared UK-AIR timestamp parser failed"
+        )
+    return payload.get("result")
+
+
+def _parse_uk_air_observed_at_batch(
+    values: Iterable[tuple[str, str]],
+) -> list[dict[str, str]]:
+    pairs = [
+        {"date": str(raw_date or "").strip(), "time": str(raw_time or "").strip()}
+        for raw_date, raw_time in values
+    ]
+    result = _run_uk_air_timestamp_helper(
+        {"operation": "parse_timestamps", "values": pairs}
+    )
+    if not isinstance(result, list) or len(result) != len(pairs):
+        raise RuntimeError("shared UK-AIR timestamp parser returned the wrong row count")
+    parsed: list[dict[str, str]] = []
+    for index, entry in enumerate(result):
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                f"shared UK-AIR timestamp parser returned an invalid row at index {index}"
+            )
+        observed_at_utc = str(entry.get("observed_at_utc") or "").strip()
+        partition_day_utc = str(entry.get("partition_day_utc") or "").strip()
+        if (
+            not observed_at_utc.endswith("Z")
+            or len(partition_day_utc) != 10
+            or observed_at_utc[:10] != partition_day_utc
+        ):
+            raise RuntimeError(
+                f"shared UK-AIR timestamp parser returned invalid UTC evidence at index {index}"
+            )
+        parsed.append(
+            {
+                "observed_at_utc": observed_at_utc,
+                "partition_day_utc": partition_day_utc,
+            }
+        )
+    return parsed
+
+
+@functools.lru_cache(maxsize=512)
+def _uk_air_source_year_selection_cached(
+    requested_days: tuple[str, ...],
+) -> dict[str, Any]:
+    result = _run_uk_air_timestamp_helper(
+        {"operation": "required_source_years", "days": list(requested_days)}
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("shared UK-AIR source-year selector returned invalid evidence")
+    years = result.get("years")
+    if (
+        not isinstance(years, list)
+        or any(not isinstance(year, int) or year < 1000 or year > 9999 for year in years)
+    ):
+        raise RuntimeError("shared UK-AIR source-year selector returned invalid years")
+    return dict(result)
+
+
+def _uk_air_source_year_selection(
+    requested_days: Iterable[str | dt.date],
+) -> dict[str, Any]:
+    days = tuple(
+        sorted(
+            {
+                day.isoformat() if isinstance(day, dt.date) else str(day).strip()
+                for day in requested_days
+            }
+        )
+    )
+    return dict(_uk_air_source_year_selection_cached(days))
 
 
 def _normalise_uk_air_source_label(value: Any) -> str:
@@ -2542,9 +2648,9 @@ def _resolve_uk_air_flat_file_mapping_row(
 
 
 def _uk_air_flat_file_years_for_window(from_day: str, to_day: str) -> list[int]:
-    start = dt.date.fromisoformat(from_day)
-    end = dt.date.fromisoformat(to_day)
-    return list(range(start.year, end.year + 1))
+    requested_days = _date_range_inclusive(from_day, to_day)
+    selection = _uk_air_source_year_selection(requested_days)
+    return [int(year) for year in selection["years"]]
 
 
 def _uk_air_flat_file_parse_day_pollutant_counts(
@@ -2556,6 +2662,8 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
 
     allowed = {str(code).strip().lower() for code in target_pollutants if str(code or "").strip()}
     counts: dict[tuple[str, str], int] = {}
+    source_rows: list[tuple[tuple[str, str], str]] = []
+    timestamp_pairs: dict[tuple[str, str], None] = {}
     stats: dict[str, Any] = {
         "sections": 0,
         "rows": 0,
@@ -2585,19 +2693,29 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
                 continue
             if current_pollutant is None or current_pollutant not in allowed:
                 continue
-            day_utc = _uk_air_parse_day(cells[0] if len(cells) > 0 else "")
-            if not day_utc:
-                continue
             value = None
             if len(cells) > 2:
                 value = _sos_to_finite_number(cells[2])
             if value is None:
                 continue
-            key = (day_utc, current_pollutant)
-            counts[key] = counts.get(key, 0) + 1
+            timestamp_pair = (
+                str(cells[0] if len(cells) > 0 else "").strip(),
+                str(cells[1] if len(cells) > 1 else "").strip(),
+            )
+            timestamp_pairs[timestamp_pair] = None
+            source_rows.append((timestamp_pair, current_pollutant))
             stats["rows"] += 1
-            stats["days"].add(day_utc)
             stats["pollutants"].add(current_pollutant)
+    parsed_pairs = _parse_uk_air_observed_at_batch(timestamp_pairs)
+    partition_day_by_pair = {
+        pair: parsed["partition_day_utc"]
+        for pair, parsed in zip(timestamp_pairs, parsed_pairs, strict=True)
+    }
+    for timestamp_pair, pollutant_code in source_rows:
+        partition_day_utc = partition_day_by_pair[timestamp_pair]
+        key = (partition_day_utc, pollutant_code)
+        counts[key] = counts.get(key, 0) + 1
+        stats["days"].add(partition_day_utc)
     stats["days"] = sorted(stats["days"])
     stats["pollutants"] = sorted(stats["pollutants"])
     return counts, stats
@@ -6805,6 +6923,10 @@ def check_sos_flat_files(
         "not_found_cooldown_seconds": _resolve_sos_not_found_cooldown_seconds(),
         "flat_file_base_url": _resolve_uk_air_flat_file_base_url(env),
         "target_pollutants": list(_resolve_sos_target_pollutants(env)),
+        "annual_source_years": [],
+        "annual_source_dates": [],
+        "annual_source_year_reasons": {},
+        "previous_year_boundary_days": [],
         "sample_urls": [],
         "skipped_reason": None,
     }
@@ -6814,7 +6936,16 @@ def check_sos_flat_files(
         return metrics
 
     requested_dates = _selected_dates_or_range(from_day, to_day, selected_days)
-    years = sorted({day.year for day in requested_dates})
+    source_year_selection = _uk_air_source_year_selection(requested_dates)
+    years = [int(year) for year in source_year_selection["years"]]
+    metrics["annual_source_years"] = years
+    metrics["annual_source_dates"] = list(source_year_selection["source_dates"])
+    metrics["annual_source_year_reasons"] = dict(
+        source_year_selection["reasons_by_year"]
+    )
+    metrics["previous_year_boundary_days"] = list(
+        source_year_selection["previous_year_boundary_days"]
+    )
     if not years:
         metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
@@ -6823,7 +6954,7 @@ def check_sos_flat_files(
     mapping_rows = _fetch_uk_air_flat_file_mapping_rows(
         env=env,
         from_day=f"{min(years):04d}-01-01",
-        to_day=f"{max(years):04d}-12-31",
+        to_day=f"{max(years) + 1:04d}-01-01",
         target_pollutants=metrics["target_pollutants"],
     )
     grouped_mappings = _group_uk_air_flat_file_mapping_rows(mapping_rows)
@@ -6831,9 +6962,24 @@ def check_sos_flat_files(
         metrics["skipped_reason"] = "no UK-AIR site_ref mappings returned from Supabase"
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
         return metrics
+    requested_day_strings = tuple(day.isoformat() for day in requested_dates)
+    required_site_refs = [
+        site_ref
+        for site_ref, pollutant_groups in sorted(grouped_mappings.items())
+        if any(
+            _resolve_uk_air_flat_file_mapping_row(mapping_candidates, day_utc)[1]
+            != "unmapped_source"
+            for mapping_candidates in pollutant_groups.values()
+            for day_utc in requested_day_strings
+        )
+    ]
+    if not required_site_refs:
+        metrics["skipped_reason"] = "no date-valid UK-AIR site_ref mappings returned"
+        log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
+        return metrics
 
     tasks: list[dict[str, Any]] = []
-    for site_ref in sorted(grouped_mappings):
+    for site_ref in required_site_refs:
         for year in years:
             tasks.append({
                 "site_ref": site_ref,
@@ -6842,8 +6988,8 @@ def check_sos_flat_files(
                 "remote_url": _uk_air_flat_file_remote_url(metrics["flat_file_base_url"], site_ref, year),
             })
 
-    metrics["stations"] = len(grouped_mappings)
-    metrics["stations_checked"] = len(grouped_mappings)
+    metrics["stations"] = len(required_site_refs)
+    metrics["stations_checked"] = len(required_site_refs)
     metrics["days"] = len(requested_dates)
     metrics["site_years"] = len(tasks)
     metrics["station_days_checked"] = 0
@@ -6879,11 +7025,16 @@ def check_sos_flat_files(
         connector_scope,
         day_scope,
         metrics["stations"],
-        len(years),
+        ",".join(str(year) for year in years),
         len(tasks),
         metrics["flat_file_base_url"],
         ",".join(metrics["target_pollutants"]),
         " (dry-run)" if dry_run else "",
+    )
+    log.info(
+        "sos flat-file: annual source year reasons=%s previous_year_boundary_days=%s",
+        json.dumps(metrics["annual_source_year_reasons"], sort_keys=True),
+        ",".join(metrics["previous_year_boundary_days"]) or "none",
     )
 
     if dry_run:
@@ -6917,7 +7068,7 @@ def check_sos_flat_files(
                 metrics["keep_api_snapshots_policy"],
                 from_day,
                 to_day,
-                tuple(day.isoformat() for day in requested_dates),
+                requested_day_strings,
                 log,
                 limits,
             ))
@@ -8933,11 +9084,15 @@ def _current_source_counts_for_v2_partition(
         """,
         (int(connector_id), *source_keys),
     ).fetchall()
-    source_file_keys = [
+    source_file_keys = sorted({
         key
         for source_key, source_location_id in lookup_rows
-        if (key := _source_file_key_for_lookup_row(str(source_key), str(source_location_id), day)) is not None
-    ]
+        for key in _source_file_keys_for_lookup_row(
+            str(source_key),
+            str(source_location_id),
+            day,
+        )
+    })
     if not source_file_keys:
         return {}, partition_evidence
 
@@ -8955,6 +9110,57 @@ def _current_source_counts_for_v2_partition(
         """,
         tuple(state_params),
     ).fetchall()
+    required_sos_file_keys = {
+        key for key in source_file_keys if key.startswith("sos:site_ref=")
+    }
+    if required_sos_file_keys:
+        successful_sos_statuses = {
+            "first_seen",
+            "changed",
+            "reappeared",
+            "unchanged",
+            "unmapped_source",
+            "mixed_mapping_issues",
+        }
+        successful_sos_file_keys = {
+            str(source_file_key)
+            for source_file_key, exists_remote, last_status in state_rows
+            if (
+                str(source_file_key) in required_sos_file_keys
+                and int(exists_remote or 0) == 1
+                and str(last_status or "").strip() in successful_sos_statuses
+            )
+        }
+        if successful_sos_file_keys != required_sos_file_keys:
+            missing_keys = sorted(
+                required_sos_file_keys - successful_sos_file_keys
+            )
+            partition_evidence.update({
+                "source_partition_state": "source_files_incomplete",
+                "source_counts_present": False,
+                "source_counts_available": False,
+                "source_rows": 0,
+                "source_timeseries_row_counts": {},
+                "source_file_count": len(successful_sos_file_keys),
+                "source_file_keys": sorted(required_sos_file_keys),
+                "source_skip_reason": "required_uk_air_annual_source_files_incomplete",
+                "missing_source_file_keys": missing_keys,
+                "property_identity": property_identity_evidence,
+                "partition": {
+                    "state": "source_files_incomplete",
+                    "source_counts_present": False,
+                    "source_counts_available": False,
+                    "source_rows": 0,
+                    "source_timeseries_row_counts": {},
+                    "source_file_count": len(successful_sos_file_keys),
+                    "source_file_keys": sorted(required_sos_file_keys),
+                    "source_skip_reason":
+                        "required_uk_air_annual_source_files_incomplete",
+                    "missing_source_file_keys": missing_keys,
+                    "property_identity": property_identity_evidence,
+                },
+            })
+            return {}, partition_evidence
 
     rows_where = [
         "c.row_count > 0",
@@ -13625,16 +13831,22 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
-def _source_file_key_for_lookup_row(source_key: str, source_location_id: str, day: dt.date) -> str | None:
+def _source_file_keys_for_lookup_row(
+    source_key: str,
+    source_location_id: str,
+    day: dt.date,
+) -> list[str]:
     if source_key == OPENAQ_SOURCE_KEY:
-        return _openaq_source_file_key(source_location_id, day)
+        return [_openaq_source_file_key(source_location_id, day)]
     if source_key == SC_SOURCE_KEY:
-        return _sc_source_file_key(source_location_id, day)
+        return [_sc_source_file_key(source_location_id, day)]
     if source_key == SOS_SOURCE_KEY:
-        # UK-AIR flat files are one source file per site/year.  Their state
-        # row is anchored at 1 January, while their count rows are day-granular.
-        return _uk_air_flat_file_source_file_key(source_location_id, day.year)
-    return None
+        selection = _uk_air_source_year_selection((day,))
+        return [
+            _uk_air_flat_file_source_file_key(source_location_id, int(year))
+            for year in selection["years"]
+        ]
+    return []
 
 
 def _source_cache_status_for_connector_day(
@@ -13658,11 +13870,57 @@ def _source_cache_status_for_connector_day(
         (int(connector_id),),
     ).fetchall()
     has_sos_source = any(str(row[0]) == SOS_SOURCE_KEY for row in lookup_rows)
+    required_sos_source_keys = sorted({
+        key
+        for source_key, source_location_id in lookup_rows
+        if str(source_key) == SOS_SOURCE_KEY
+        for key in _source_file_keys_for_lookup_row(
+            str(source_key),
+            str(source_location_id),
+            day,
+        )
+    })
     if (
         has_sos_source
         and _table_exists(conn, "source_file_timeseries_counts")
         and _table_exists(conn, "core_timeseries_snapshot")
     ):
+        placeholders = ",".join("?" for _ in required_sos_source_keys)
+        required_state_rows = conn.execute(
+            f"""
+            SELECT source_file_key, exists_remote, last_status
+            FROM source_file_state
+            WHERE source_file_key IN ({placeholders})
+            ORDER BY source_file_key
+            """,
+            tuple(required_sos_source_keys),
+        ).fetchall()
+        successful_statuses = {
+            "unchanged",
+            "changed",
+            "first_seen",
+            "reappeared",
+            "unmapped_source",
+            "mixed_mapping_issues",
+        }
+        successful_source_keys = {
+            str(row[0])
+            for row in required_state_rows
+            if int(row[1] or 0) == 1 and str(row[2] or "") in successful_statuses
+        }
+        if successful_source_keys != set(required_sos_source_keys):
+            return {
+                "status": "unavailable",
+                "source_mode": "uk_air_flat_files",
+                "reason": "required UK-AIR annual source files are incomplete",
+                "required_source_file_count": len(required_sos_source_keys),
+                "source_file_count": len(successful_source_keys),
+                "source_file_keys": required_sos_source_keys,
+                "missing_source_file_keys": sorted(
+                    set(required_sos_source_keys) - successful_source_keys
+                ),
+                "evidence_day_utc": day.isoformat(),
+            }
         flat_rows = conn.execute(
             """
             SELECT
@@ -13708,17 +13966,7 @@ def _source_cache_status_for_connector_day(
                 "evidence_day_utc": day.isoformat(),
             }
 
-        flat_file_count = int(conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM source_file_state
-            WHERE source_key = ?
-              AND remote_scheme = 'uk_air_flat_file'
-              AND exists_remote = 1
-              AND source_file_key LIKE ?
-            """,
-            (SOS_SOURCE_KEY, f"sos:site_ref=%:year={day.year}"),
-        ).fetchone()[0] or 0)
+        flat_file_count = len(successful_source_keys)
         if flat_file_count > 0:
             return {
                 "status": "unavailable",
@@ -13728,11 +13976,15 @@ def _source_cache_status_for_connector_day(
                 "evidence_day_utc": day.isoformat(),
             }
 
-    source_keys = [
-        _source_file_key_for_lookup_row(str(row[0]), str(row[1]), day)
-        for row in lookup_rows
-    ]
-    source_keys = [key for key in source_keys if key]
+    source_keys = sorted({
+        key
+        for source_key, source_location_id in lookup_rows
+        for key in _source_file_keys_for_lookup_row(
+            str(source_key),
+            str(source_location_id),
+            day,
+        )
+    })
     if not source_keys:
         return {"status": "unavailable", "reason": "no active source files resolved for connector/day"}
 
