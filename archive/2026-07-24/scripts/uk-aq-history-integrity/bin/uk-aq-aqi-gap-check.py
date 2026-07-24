@@ -161,12 +161,6 @@ def parquet_files(partition: Path) -> list[Path]:
     return sorted(p for p in partition.glob("*.parquet") if p.is_file())
 
 
-def _connect_duckdb_utc(duckdb_module: Any) -> Any:
-    connection = duckdb_module.connect(database=":memory:")
-    connection.execute("SET TimeZone = 'UTC'", [])
-    return connection
-
-
 def read_parquet_counts(files: list[Path], timeseries_id: str | None) -> dict[str, int]:
     if not files:
         return {}
@@ -175,7 +169,7 @@ def read_parquet_counts(files: list[Path], timeseries_id: str | None) -> dict[st
     import duckdb
 
     query_files = [str(p) for p in files]
-    con = _connect_duckdb_utc(duckdb)
+    con = duckdb.connect(database=":memory:")
     try:
         where = ""
         params: list[Any] = [query_files]
@@ -197,7 +191,6 @@ def read_parquet_hour_keys(
     timeseries_id: str | None,
     *,
     source_observations: bool,
-    day_utc: str,
 ) -> dict[str, set[int]]:
     """Read v2 UTC-hour identities, not raw source-row counts.
 
@@ -211,7 +204,7 @@ def read_parquet_hour_keys(
         raise SystemExit("DuckDB is required to read parquet files. Install the duckdb Python package.", 2)
     import duckdb
 
-    con = _connect_duckdb_utc(duckdb)
+    con = duckdb.connect(database=":memory:")
     try:
         query_files = [str(path) for path in files]
         described = con.execute(
@@ -222,41 +215,9 @@ def read_parquet_hour_keys(
         timestamp_column = "observed_at_utc" if source_observations else "timestamp_hour_utc"
         if timestamp_column not in columns or "timeseries_id" not in columns:
             return {}
-        timestamp_expression = (
-            f"TRY_CAST({timestamp_column} AS TIMESTAMPTZ)"
-        )
-        day = dt.date.fromisoformat(day_utc)
-        day_start = dt.datetime.combine(
-            day,
-            dt.time.min,
-            tzinfo=dt.timezone.utc,
-        )
-        day_end = day_start + dt.timedelta(days=1)
-        invalid_count, outside_count = con.execute(
-            "SELECT "
-            f"COUNT(*) FILTER (WHERE {timestamp_column} IS NULL "
-            f"OR {timestamp_expression} IS NULL), "
-            "COUNT(*) FILTER (WHERE "
-            f"{timestamp_expression} IS NOT NULL AND ("
-            f"{timestamp_expression} < CAST(? AS TIMESTAMPTZ) OR "
-            f"{timestamp_expression} >= CAST(? AS TIMESTAMPTZ))) "
-            "FROM read_parquet(?, union_by_name=true)",
-            [
-                day_start.isoformat().replace("+00:00", "Z"),
-                day_end.isoformat().replace("+00:00", "Z"),
-                query_files,
-            ],
-        ).fetchone()
-        if int(invalid_count or 0) > 0 or int(outside_count or 0) > 0:
-            raise ValueError(
-                "timestamp_outside_utc_partition:"
-                f"day_utc={day_utc} "
-                f"invalid_count={int(invalid_count or 0)} "
-                f"outside_count={int(outside_count or 0)}"
-            )
         where = (
             "timeseries_id IS NOT NULL "
-            f"AND {timestamp_expression} IS NOT NULL"
+            f"AND TRY_CAST({timestamp_column} AS TIMESTAMPTZ) IS NOT NULL"
         )
         params: list[Any] = [query_files]
         if source_observations:
@@ -272,7 +233,7 @@ def read_parquet_hour_keys(
             params.append(str(timeseries_id))
         rows = con.execute(
             "SELECT CAST(timeseries_id AS VARCHAR), "
-            f"CAST(FLOOR(epoch({timestamp_expression}) / 3600) AS BIGINT) "
+            f"CAST(FLOOR(epoch(TRY_CAST({timestamp_column} AS TIMESTAMPTZ)) / 3600) AS BIGINT) "
             "FROM read_parquet(?, union_by_name=true) "
             f"WHERE {where} GROUP BY 1, 2 ORDER BY 1, 2",
             params,
@@ -364,13 +325,11 @@ def build_summary_rows(root: Path, days: list[str], connector_id: str | None, po
                 parquet_files(data_partition(root, "observations", day, cid, pol)),
                 timeseries_id,
                 source_observations=True,
-                day_utc=day,
             )
             aqi_hour_keys = read_parquet_hour_keys(
                 parquet_files(data_partition(root, "aqilevels_hourly_data", day, cid, pol)),
                 timeseries_id,
                 source_observations=False,
-                day_utc=day,
             )
             obs_manifest = read_manifest(index_manifest(root, "observations_timeseries", day, cid, pol))
             aqi_manifest = read_manifest(index_manifest(root, "aqilevels_hourly_data_timeseries", day, cid, pol))
