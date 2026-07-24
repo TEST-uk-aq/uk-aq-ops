@@ -7,13 +7,11 @@ import {
   buildRunConfig,
   buildSummaryRefreshPayload,
   DailyRefreshRpcRow,
-  listDaysInclusive,
   mergeDailyRefreshRows,
   parsePollutantCodes,
   parsePositiveInt,
   parseRunMode,
   parseTriggerMode,
-  PreparedUpsertRpcRow,
   ReadinessRpcRow,
   shouldRunReadinessGate,
   stableJson,
@@ -31,13 +29,6 @@ import {
   sha256Hex,
 } from "./r2_objects.ts";
 import {
-  createR2ObjectReader,
-  prepareWhoDailyRowsFromR2,
-  R2ObservationReadError,
-  R2PreparedDay,
-  R2ReadMetrics,
-} from "./r2_observations.ts";
-import {
   DEFAULT_REPORT_PATH,
   OperationalOutcome,
   writeBoundedReport,
@@ -47,7 +38,6 @@ import { SupabaseRpcClient } from "./supabase_rpc.ts";
 type RuntimeSettings = {
   client: SupabaseRpcClient;
   dailyRefreshRpc: string;
-  preparedUpsertRpc: string;
   readinessRpc: string;
   summaryRefreshRpc: string;
   parquetRowsRpc: string;
@@ -96,7 +86,6 @@ function parseRatio(
 }
 
 function readSettings(now: Date): RuntimeSettings {
-  const runMode = parseRunMode(Deno.env.get("UK_AQ_WHO_2021_RUN_MODE"));
   const r2PublishEnabled = parseBoolean(
     Deno.env.get("UK_AQ_WHO_2021_R2_PUBLISH_ENABLED"),
     false,
@@ -106,7 +95,7 @@ function readSettings(now: Date): RuntimeSettings {
     false,
   );
   const config = buildRunConfig({
-    runMode,
+    runMode: parseRunMode(Deno.env.get("UK_AQ_WHO_2021_RUN_MODE")),
     triggerMode: parseTriggerMode(
       Deno.env.get("UK_AQ_WHO_2021_TRIGGER_MODE"),
     ),
@@ -145,16 +134,12 @@ function readSettings(now: Date): RuntimeSettings {
     ),
     summaryRefreshEnabled: parseBoolean(
       Deno.env.get("UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED"),
-      runMode === "daily",
+      true,
     ),
     r2PublishEnabled,
     parquetR2WriteEnabled,
     chunkDays: parsePositiveInt(
       Deno.env.get("UK_AQ_WHO_2021_CHUNK_DAYS"),
-      31,
-    ),
-    backfillMaxDays: parsePositiveInt(
-      Deno.env.get("UK_AQ_WHO_2021_R2_BACKFILL_MAX_DAYS"),
       31,
     ),
   });
@@ -166,7 +151,12 @@ function readSettings(now: Date): RuntimeSettings {
   const secretAccessKey = optionalEnv("R2_SECRET_ACCESS_KEY") ||
     optionalEnv("CFLARE_R2_SECRET_ACCESS_KEY");
   let r2: R2Config | null = null;
-  if (endpoint && bucket && accessKeyId && secretAccessKey) {
+  if (r2PublishEnabled || parquetR2WriteEnabled) {
+    if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
+      throw new Error(
+        "R2 publication is enabled but endpoint, bucket, access key, or secret key is missing",
+      );
+    }
     r2 = {
       endpoint,
       bucket,
@@ -175,14 +165,6 @@ function readSettings(now: Date): RuntimeSettings {
       accessKeyId,
       secretAccessKey,
     };
-  } else if (
-    runMode === "backfill" || r2PublishEnabled || parquetR2WriteEnabled
-  ) {
-    if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
-      throw new Error(
-        "R2 access is required but endpoint, bucket, access key, or secret key is missing",
-      );
-    }
   }
   return {
     client: new SupabaseRpcClient(
@@ -193,8 +175,6 @@ function readSettings(now: Date): RuntimeSettings {
     ),
     dailyRefreshRpc: optionalEnv("UK_AQ_WHO_2021_DAILY_REFRESH_RPC") ||
       "uk_aq_rpc_who_2021_daily_status_refresh",
-    preparedUpsertRpc: optionalEnv("UK_AQ_WHO_2021_PREPARED_UPSERT_RPC") ||
-      "uk_aq_rpc_who_2021_daily_status_upsert_prepared",
     readinessRpc: optionalEnv("UK_AQ_WHO_2021_READINESS_RPC") ||
       "uk_aq_rpc_who_2021_readiness_check",
     summaryRefreshRpc: optionalEnv("UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC") ||
@@ -383,178 +363,18 @@ async function logProcessingRun(args: {
   return first.run_id;
 }
 
-type DailySourceMode = "obs_aqidb" | "r2_v2" | "unavailable";
-
-type DailySourceResult = {
-  day_utc: string;
-  source: DailySourceMode;
-  valid_timeseries_days: number;
-  not_enough_data_timeseries_days: number;
-  rows_upserted: number;
-  prepared_daily_row_count: number;
-  error: string | null;
-};
-
-type R2RunEvidence = {
-  manifestKeys: Set<string>;
-  manifestHashesValidated: number;
-  parquetHashesValidated: number;
-  objectCount: number;
-  bytesRead: number;
-  parquetRowCount: number;
-  preparedDailyRowCount: number;
-};
-
-class R2PreparedRpcError extends Error {
-  constructor(message: string, readonly prepared: R2PreparedDay) {
-    super(message);
-    this.name = "R2PreparedRpcError";
-  }
-}
-
-function emptyR2RunEvidence(): R2RunEvidence {
-  return {
-    manifestKeys: new Set(),
-    manifestHashesValidated: 0,
-    parquetHashesValidated: 0,
-    objectCount: 0,
-    bytesRead: 0,
-    parquetRowCount: 0,
-    preparedDailyRowCount: 0,
-  };
-}
-
-function accumulateR2Evidence(
-  evidence: R2RunEvidence,
-  metrics: R2ReadMetrics,
-  preparedRowCount: number,
-): void {
-  for (const key of metrics.manifestKeys) evidence.manifestKeys.add(key);
-  evidence.manifestHashesValidated += metrics.manifestHashesValidated;
-  evidence.parquetHashesValidated += metrics.parquetHashesValidated;
-  evidence.objectCount += metrics.objectCount;
-  evidence.bytesRead += metrics.bytesRead;
-  evidence.parquetRowCount += metrics.parquetRowCount;
-  evidence.preparedDailyRowCount += preparedRowCount;
-}
-
-function preparedRowAsDailyRefresh(
-  row: PreparedUpsertRpcRow,
-): DailyRefreshRpcRow {
-  return {
-    start_day_utc: row.day_utc,
-    end_day_utc: row.day_utc,
-    connector_id: row.connector_id,
-    source_network_code: row.source_network_code,
-    pollutant_codes: row.pollutant_codes,
-    candidate_timeseries_count: Number(row.candidate_timeseries_count) || 0,
-    candidate_timeseries_days: Number(row.candidate_timeseries_days) || 0,
-    source_hour_rows: Number(row.source_hour_rows) || 0,
-    valid_timeseries_days: Number(row.valid_timeseries_days) || 0,
-    not_enough_data_timeseries_days:
-      Number(row.not_enough_data_timeseries_days) || 0,
-    rows_upserted: Number(row.rows_upserted) || 0,
-    dry_run: Boolean(row.dry_run),
-  };
-}
-
-async function refreshObsDay(
-  settings: RuntimeSettings,
-  dayUtc: string,
-): Promise<DailyRefreshRpcRow> {
-  const response = await settings.client.post<unknown>(
-    settings.dailyRefreshRpc,
-    buildDailyRefreshPayload(settings.config, {
-      startDayUtc: dayUtc,
-      endDayUtc: dayUtc,
-    }),
-  );
-  if (response.error) {
-    throw new Error(`daily refresh RPC failed: ${response.error.message}`);
-  }
-  const row = parseRows<DailyRefreshRpcRow>(response.data)[0];
-  if (!row) throw new Error(`daily refresh RPC returned no row for ${dayUtc}`);
-  return row;
-}
-
-async function readinessForDay(
-  settings: RuntimeSettings,
-  dayUtc: string,
-): Promise<ReturnType<typeof summarizeReadinessRows>> {
-  const response = await settings.client.post<unknown>(
-    settings.readinessRpc,
-    buildReadinessPayload(settings.config, dayUtc),
-  );
-  if (response.error) {
-    throw new Error(`readiness RPC failed: ${response.error.message}`);
-  }
-  return summarizeReadinessRows(
-    parseRows<ReadinessRpcRow>(response.data),
-    dayUtc,
-  );
-}
-
-async function refreshR2Day(
-  settings: RuntimeSettings,
-  dayUtc: string,
-): Promise<{ prepared: R2PreparedDay; rpc: DailyRefreshRpcRow }> {
-  if (!settings.r2) {
-    throw new Error("R2 fallback is unavailable because R2 is not configured");
-  }
-  const prepared = await prepareWhoDailyRowsFromR2({
-    readObject: createR2ObjectReader(settings.r2),
-    dayUtc,
-    connectorId: settings.config.connectorId,
-    pollutantCodes: settings.config.pollutantCodes,
-    minValidHoursPerDay: settings.config.minValidHoursPerDay,
-  });
-  const response = await settings.client.post<unknown>(
-    settings.preparedUpsertRpc,
-    {
-      p_day_utc: dayUtc,
-      p_connector_id: settings.config.connectorId,
-      p_source_network_code: settings.config.sourceNetworkCode,
-      p_pollutant_codes: settings.config.pollutantCodes,
-      p_min_valid_hours_per_day: settings.config.minValidHoursPerDay,
-      p_prepared_rows: prepared.preparedRows,
-      p_dry_run: settings.config.dryRun,
-    },
-  );
-  if (response.error) {
-    throw new R2PreparedRpcError(
-      `prepared upsert RPC failed: ${response.error.message}`,
-      prepared,
-    );
-  }
-  const row = parseRows<PreparedUpsertRpcRow>(response.data)[0];
-  if (!row) {
-    throw new R2PreparedRpcError(
-      `prepared upsert RPC returned no row for ${dayUtc}`,
-      prepared,
-    );
-  }
-  return { prepared, rpc: preparedRowAsDailyRefresh(row) };
-}
-
 export async function runWho2021Daily(): Promise<void> {
   const startedAt = new Date().toISOString();
   const warnings: string[] = [];
   let settings: RuntimeSettings | null = null;
   let runId: string | null = null;
   let capturedError: unknown = null;
-  const readinessByDay: Record<string, unknown> = {};
-  const dailySources: DailySourceResult[] = [];
-  const completedDays: string[] = [];
-  const dailyRows: DailyRefreshRpcRow[] = [];
-  const r2Evidence = emptyR2RunEvidence();
-  let failedDay: string | null = null;
-  let r2ValidationFailed = false;
+  let readiness: Record<string, unknown> | null = null;
   let publicationDay: string | null = null;
   let latestCompleteDay: string | null = null;
   let correctionDay: string | null = null;
   let dailySummary = mergeDailyRefreshRows([]);
   let summaryRefresh: SummaryRefreshRpcRow | null = null;
-  let summaryRefreshCompleted = false;
   let publishSummary: PublishSummary = {
     checked: [],
     updated: [],
@@ -571,217 +391,59 @@ export async function runWho2021Daily(): Promise<void> {
     correctionDay = config.runMode === "daily"
       ? addDays(latestCompleteDay, -1)
       : config.startDayUtc;
+    let latestDayReady = true;
 
-    if (config.runMode === "backfill") {
-      for (
-        const dayUtc of listDaysInclusive(
-          config.startDayUtc,
-          config.endDayUtc,
-        )
-      ) {
-        try {
-          const result = await refreshR2Day(settings, dayUtc);
-          dailyRows.push(result.rpc);
-          accumulateR2Evidence(
-            r2Evidence,
-            result.prepared.metrics,
-            result.prepared.preparedRows.length,
-          );
-          completedDays.push(dayUtc);
-          dailySources.push({
-            day_utc: dayUtc,
-            source: "r2_v2",
-            valid_timeseries_days: result.rpc.valid_timeseries_days,
-            not_enough_data_timeseries_days:
-              result.rpc.not_enough_data_timeseries_days,
-            rows_upserted: result.rpc.rows_upserted,
-            prepared_daily_row_count: result.prepared.preparedRows.length,
-            error: null,
-          });
-        } catch (error) {
-          failedDay = dayUtc;
-          if (error instanceof R2PreparedRpcError) {
-            accumulateR2Evidence(
-              r2Evidence,
-              error.prepared.metrics,
-              error.prepared.preparedRows.length,
-            );
-          } else if (error instanceof R2ObservationReadError) {
-            accumulateR2Evidence(r2Evidence, error.metrics, 0);
-            r2ValidationFailed = true;
-          } else {
-            r2ValidationFailed = true;
-          }
-          dailySources.push({
-            day_utc: dayUtc,
-            source: "unavailable",
-            valid_timeseries_days: 0,
-            not_enough_data_timeseries_days: 0,
-            rows_upserted: 0,
-            prepared_daily_row_count: 0,
-            error: String(error instanceof Error ? error.message : error)
-              .slice(0, 500),
-          });
-          throw error;
-        }
+    if (shouldRunReadinessGate(config)) {
+      const response = await settings.client.post<unknown>(
+        settings.readinessRpc,
+        buildReadinessPayload(config),
+      );
+      if (response.error) {
+        throw new Error(`readiness RPC failed: ${response.error.message}`);
       }
-      publicationDay = config.endDayUtc;
-    } else if (config.runMode === "daily") {
-      for (
-        const dayUtc of listDaysInclusive(
-          config.startDayUtc,
-          config.endDayUtc,
-        )
-      ) {
-        let readinessReady = false;
-        try {
-          const dayReadiness = shouldRunReadinessGate(config)
-            ? await readinessForDay(settings, dayUtc)
-            : {
-              checked: false,
-              ready: true,
-              already_completed: false,
-              as_of_day_utc: dayUtc,
-              final_hour_observed_at: null,
-              pollutant_rows: [],
-            };
-          readinessByDay[dayUtc] = dayReadiness;
-          readinessReady = dayReadiness.ready;
-          if (dayReadiness.already_completed) {
-            warnings.push(
-              `A prior successful run covered ${dayUtc}; recalculation continued as required.`,
-            );
-          }
-        } catch (error) {
-          readinessByDay[dayUtc] = {
-            checked: true,
-            ready: false,
-            error: errorRecord(error),
-          };
-          warnings.push(
-            `Obs AQI DB readiness was unavailable for ${dayUtc}; exact-day R2 fallback was attempted.`,
-          );
-        }
-
-        if (readinessReady) {
-          try {
-            const row = await refreshObsDay(settings, dayUtc);
-            dailyRows.push(row);
-            completedDays.push(dayUtc);
-            dailySources.push({
-              day_utc: dayUtc,
-              source: "obs_aqidb",
-              valid_timeseries_days: row.valid_timeseries_days,
-              not_enough_data_timeseries_days:
-                row.not_enough_data_timeseries_days,
-              rows_upserted: row.rows_upserted,
-              prepared_daily_row_count: 0,
-              error: null,
-            });
-            continue;
-          } catch (error) {
-            warnings.push(
-              `Obs AQI DB refresh failed for ${dayUtc}; exact-day R2 fallback was attempted: ${
-                String(error instanceof Error ? error.message : error).slice(
-                  0,
-                  300,
-                )
-              }`,
-            );
-          }
-        }
-
-        try {
-          const result = await refreshR2Day(settings, dayUtc);
-          dailyRows.push(result.rpc);
-          accumulateR2Evidence(
-            r2Evidence,
-            result.prepared.metrics,
-            result.prepared.preparedRows.length,
-          );
-          completedDays.push(dayUtc);
-          dailySources.push({
-            day_utc: dayUtc,
-            source: "r2_v2",
-            valid_timeseries_days: result.rpc.valid_timeseries_days,
-            not_enough_data_timeseries_days:
-              result.rpc.not_enough_data_timeseries_days,
-            rows_upserted: result.rpc.rows_upserted,
-            prepared_daily_row_count: result.prepared.preparedRows.length,
-            error: null,
-          });
-        } catch (error) {
-          if (error instanceof R2PreparedRpcError) {
-            accumulateR2Evidence(
-              r2Evidence,
-              error.prepared.metrics,
-              error.prepared.preparedRows.length,
-            );
-          } else if (error instanceof R2ObservationReadError) {
-            accumulateR2Evidence(r2Evidence, error.metrics, 0);
-            r2ValidationFailed = true;
-          } else {
-            r2ValidationFailed = true;
-          }
-          const message = String(
-            error instanceof Error ? error.message : error,
-          ).slice(0, 500);
-          dailySources.push({
-            day_utc: dayUtc,
-            source: "unavailable",
-            valid_timeseries_days: 0,
-            not_enough_data_timeseries_days: 0,
-            rows_upserted: 0,
-            prepared_daily_row_count: 0,
-            error: message,
-          });
-          warnings.push(`No usable source for ${dayUtc}: ${message}`);
-        }
-      }
-      publicationDay = [...dailySources]
-        .filter((result) =>
-          result.source !== "unavailable" &&
-          result.valid_timeseries_days > 0
-        )
-        .sort((left, right) => right.day_utc.localeCompare(left.day_utc))[0]
-        ?.day_utc || null;
-    } else {
-      for (
-        const chunk of buildDayChunks(
-          config.startDayUtc,
-          config.endDayUtc,
-          config.chunkDays,
-        )
-      ) {
-        const response = await settings.client.post<unknown>(
-          settings.dailyRefreshRpc,
-          buildDailyRefreshPayload(config, chunk),
+      const readinessSummary = summarizeReadinessRows(
+        parseRows<ReadinessRpcRow>(response.data),
+        latestCompleteDay,
+      );
+      readiness = readinessSummary as unknown as Record<string, unknown>;
+      latestDayReady = readinessSummary.ready;
+      if (readinessSummary.already_completed) {
+        warnings.push(
+          "A prior successful run was present; recalculation continued as required.",
         );
-        if (response.error) {
-          throw new Error(
-            `daily refresh RPC failed: ${response.error.message}`,
-          );
-        }
-        const rows = parseRows<DailyRefreshRpcRow>(response.data);
-        dailyRows.push(...rows);
-        for (const row of rows) {
-          dailySources.push({
-            day_utc: row.end_day_utc,
-            source: "obs_aqidb",
-            valid_timeseries_days: Number(row.valid_timeseries_days) || 0,
-            not_enough_data_timeseries_days:
-              Number(row.not_enough_data_timeseries_days) || 0,
-            rows_upserted: Number(row.rows_upserted) || 0,
-            prepared_daily_row_count: 0,
-            error: null,
-          });
-        }
       }
-      publicationDay = config.endDayUtc;
+    } else {
+      readiness = {
+        checked: false,
+        ready: true,
+        as_of_day_utc: latestCompleteDay,
+        pollutant_rows: [],
+      };
+    }
+    publicationDay = config.runMode === "daily" && !latestDayReady
+      ? correctionDay
+      : config.endDayUtc;
+
+    const dailyRows: DailyRefreshRpcRow[] = [];
+    for (
+      const chunk of buildDayChunks(
+        config.startDayUtc,
+        config.endDayUtc,
+        config.chunkDays,
+      )
+    ) {
+      const response = await settings.client.post<unknown>(
+        settings.dailyRefreshRpc,
+        buildDailyRefreshPayload(config, chunk),
+      );
+      if (response.error) {
+        throw new Error(`daily refresh RPC failed: ${response.error.message}`);
+      }
+      dailyRows.push(...parseRows<DailyRefreshRpcRow>(response.data));
     }
     dailySummary = mergeDailyRefreshRows(dailyRows);
 
-    if (config.summaryRefreshEnabled && publicationDay) {
+    if (config.summaryRefreshEnabled) {
       const response = await settings.client.post<unknown>(
         settings.summaryRefreshRpc,
         buildSummaryRefreshPayload(config, publicationDay),
@@ -796,12 +458,10 @@ export async function runWho2021Daily(): Promise<void> {
       if (!summaryRefresh) {
         throw new Error("summary refresh RPC returned no row");
       }
-      summaryRefreshCompleted = true;
     }
 
     if (
       !config.dryRun &&
-      publicationDay &&
       (config.r2PublishEnabled || config.parquetR2WriteEnabled)
     ) {
       const homepageSummary = summaryRefresh?.homepage_summary;
@@ -818,7 +478,7 @@ export async function runWho2021Daily(): Promise<void> {
       });
     }
 
-    if (config.runMode === "daily" && !publicationDay) {
+    if (config.runMode === "daily" && !latestDayReady) {
       outcome = "deferred";
     } else if (config.dryRun) {
       outcome = "unchanged";
@@ -835,7 +495,6 @@ export async function runWho2021Daily(): Promise<void> {
     outcome = "failed";
   }
 
-  dailySummary = mergeDailyRefreshRows(dailyRows);
   const finishedAt = new Date().toISOString();
   const rollingRows = Number(summaryRefresh?.rolling_rows_upserted) || 0;
   const calendarRows = Number(summaryRefresh?.calendar_rows_upserted) || 0;
@@ -844,30 +503,7 @@ export async function runWho2021Daily(): Promise<void> {
     operational_outcome: outcome,
     publication_as_of_day_utc: publicationDay,
     correction_day_utc: correctionDay,
-    readiness: readinessByDay,
-    source_mode: settings?.config.runMode === "backfill"
-      ? "r2_v2"
-      : "source_priority",
-    daily_sources: dailySources,
-    completed_days: completedDays,
-    last_completed_day: completedDays.at(-1) || null,
-    failed_day: failedDay,
-    summary_refresh_requested: Boolean(
-      settings?.config.summaryRefreshEnabled,
-    ),
-    summary_refresh_completed: summaryRefreshCompleted,
-    r2_manifest_keys: [...r2Evidence.manifestKeys],
-    r2_manifest_hashes_validated: r2Evidence.manifestHashesValidated,
-    r2_parquet_hashes_validated: r2Evidence.parquetHashesValidated,
-    r2_validation_result: r2ValidationFailed
-      ? "failed"
-      : r2Evidence.objectCount > 0
-      ? "passed"
-      : "not_run",
-    r2_object_count: r2Evidence.objectCount,
-    r2_bytes_read: r2Evidence.bytesRead,
-    r2_parquet_row_count: r2Evidence.parquetRowCount,
-    prepared_daily_row_count: r2Evidence.preparedDailyRowCount,
+    readiness,
     r2_objects_checked: publishSummary.checked,
     r2_objects_updated: publishSummary.updated,
     r2_objects_unchanged: publishSummary.unchanged,
@@ -922,34 +558,7 @@ export async function runWho2021Daily(): Promise<void> {
     latest_complete_day_utc: latestCompleteDay,
     correction_day_utc: correctionDay,
     publication_as_of_day_utc: publicationDay,
-    requested_start_day_utc: settings?.config.startDayUtc || null,
-    requested_end_day_utc: settings?.config.endDayUtc || null,
-    completed_days: completedDays,
-    last_completed_day: completedDays.at(-1) || null,
-    failed_day: failedDay,
-    source_mode: settings?.config.runMode === "backfill"
-      ? "r2_v2"
-      : "source_priority",
-    daily_sources: dailySources,
-    readiness: readinessByDay,
-    manifest_keys_used: [...r2Evidence.manifestKeys],
-    manifest_hash_validation: {
-      manifests_validated: r2Evidence.manifestHashesValidated,
-      parquet_objects_validated: r2Evidence.parquetHashesValidated,
-      result: r2ValidationFailed
-        ? "failed"
-        : r2Evidence.objectCount > 0
-        ? "passed"
-        : "not_run",
-    },
-    r2_object_count: r2Evidence.objectCount,
-    r2_bytes_read: r2Evidence.bytesRead,
-    parquet_row_count: r2Evidence.parquetRowCount,
-    prepared_daily_row_count: r2Evidence.preparedDailyRowCount,
-    summary_refresh_requested: Boolean(
-      settings?.config.summaryRefreshEnabled,
-    ),
-    summary_refresh_completed: summaryRefreshCompleted,
+    readiness,
     row_counts: {
       daily_rows_upserted: dailySummary.rows_upserted,
       rolling_rows_upserted: rollingRows,

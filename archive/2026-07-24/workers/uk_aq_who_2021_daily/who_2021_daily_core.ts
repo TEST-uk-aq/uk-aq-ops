@@ -18,7 +18,6 @@ export type RunConfig = {
   r2PublishEnabled?: boolean;
   parquetR2WriteEnabled?: boolean;
   chunkDays: number;
-  backfillMaxDays: number;
   dryRun: boolean;
 };
 
@@ -38,21 +37,6 @@ export type DailyRefreshRpcRow = {
   connector_id: number;
   source_network_code: string;
   pollutant_codes: string[];
-  candidate_timeseries_count: number;
-  candidate_timeseries_days: number;
-  source_hour_rows: number;
-  valid_timeseries_days: number;
-  not_enough_data_timeseries_days: number;
-  rows_upserted: number;
-  dry_run: boolean;
-};
-
-export type PreparedUpsertRpcRow = {
-  day_utc: string;
-  connector_id: number;
-  source_network_code: string;
-  pollutant_codes: string[];
-  prepared_row_count: number;
   candidate_timeseries_count: number;
   candidate_timeseries_days: number;
   source_hour_rows: number;
@@ -232,7 +216,6 @@ export function buildRunConfig(params: {
   r2PublishEnabled?: boolean;
   parquetR2WriteEnabled?: boolean;
   chunkDays: number;
-  backfillMaxDays?: number;
 }): RunConfig {
   const latestComplete = latestCompleteDayUtc(
     params.now,
@@ -246,9 +229,6 @@ export function buildRunConfig(params: {
     if (!startDay || !endDay) {
       throw new Error("backfill requires start_day_utc and end_day_utc");
     }
-  } else if (params.runMode === "daily") {
-    endDay = latestComplete;
-    startDay = addDays(endDay, -1);
   } else {
     endDay = endDay || latestComplete;
     const lookback = Math.max(1, Math.trunc(params.lookbackDays));
@@ -259,18 +239,6 @@ export function buildRunConfig(params: {
   assertIsoDay(endDay, "end_day_utc");
   if (compareIsoDay(endDay, startDay) < 0) {
     throw new Error("end_day_utc must be >= start_day_utc");
-  }
-  const backfillMaxDays = Math.max(
-    1,
-    Math.trunc(params.backfillMaxDays ?? 31),
-  );
-  if (
-    params.runMode === "backfill" &&
-    daysBetweenInclusive(startDay, endDay) > backfillMaxDays
-  ) {
-    throw new Error(
-      `backfill range exceeds ${backfillMaxDays} inclusive days`,
-    );
   }
   if (!Number.isInteger(params.connectorId) || params.connectorId <= 0) {
     throw new Error("connector_id must be a positive integer");
@@ -303,7 +271,6 @@ export function buildRunConfig(params: {
     r2PublishEnabled: Boolean(params.r2PublishEnabled),
     parquetR2WriteEnabled: Boolean(params.parquetR2WriteEnabled),
     chunkDays: Math.max(1, Math.trunc(params.chunkDays)),
-    backfillMaxDays,
     dryRun,
   };
 }
@@ -328,11 +295,9 @@ export function buildDayChunks(
 
 export function buildReadinessPayload(
   config: RunConfig,
-  asOfDayUtc = config.endDayUtc,
 ): ReadinessRpcPayload {
-  assertIsoDay(asOfDayUtc, "asOfDayUtc");
   return {
-    p_as_of_day_utc: asOfDayUtc,
+    p_as_of_day_utc: config.endDayUtc,
     p_connector_id: config.connectorId,
     p_source_network_code: config.sourceNetworkCode,
     p_pollutant_codes: config.pollutantCodes,
@@ -411,26 +376,6 @@ export function shouldRunReadinessGate(config: RunConfig): boolean {
   return config.readinessGateEnabled &&
     config.runMode === "daily" &&
     !config.dryRun;
-}
-
-export function listDaysInclusive(
-  startDayUtc: string,
-  endDayUtc: string,
-): string[] {
-  assertIsoDay(startDayUtc, "startDayUtc");
-  assertIsoDay(endDayUtc, "endDayUtc");
-  if (compareIsoDay(endDayUtc, startDayUtc) < 0) {
-    throw new Error("endDayUtc must be >= startDayUtc");
-  }
-  const days: string[] = [];
-  for (
-    let day = startDayUtc;
-    compareIsoDay(day, endDayUtc) <= 0;
-    day = addDays(day, 1)
-  ) {
-    days.push(day);
-  }
-  return days;
 }
 
 function minIsoDay(a: string, b: string): string {
