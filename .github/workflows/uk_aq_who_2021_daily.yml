@@ -1,0 +1,159 @@
+name: UK AQ WHO 2021 Daily
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "WHO batch mode"
+        required: true
+        default: daily
+        type: choice
+        options:
+          - daily
+          - backfill
+          - dry_run
+      trigger_mode:
+        description: "Invocation source (Cloudflare Scheduler supplies scheduler)"
+        required: true
+        default: manual
+        type: choice
+        options:
+          - manual
+          - scheduler
+          - test
+      start_day_utc:
+        description: "Backfill/dry-run start day (YYYY-MM-DD)"
+        required: false
+        default: ""
+        type: string
+      end_day_utc:
+        description: "Backfill/dry-run end day (YYYY-MM-DD)"
+        required: false
+        default: ""
+        type: string
+      publish_json:
+        description: "Publish summary JSON (configured uses repository variable)"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+          - configured
+      write_parquet:
+        description: "Write derived parquet (configured uses repository variable)"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+          - configured
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-who-2021-daily
+  cancel-in-progress: false
+
+jobs:
+  who-2021-daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+      UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
+      UK_AQ_WHO_2021_DAILY_REFRESH_RPC: ${{ vars.UK_AQ_WHO_2021_DAILY_REFRESH_RPC || 'uk_aq_rpc_who_2021_daily_status_refresh' }}
+      UK_AQ_WHO_2021_READINESS_RPC: ${{ vars.UK_AQ_WHO_2021_READINESS_RPC || 'uk_aq_rpc_who_2021_readiness_check' }}
+      UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC: ${{ vars.UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC || 'uk_aq_rpc_who_2021_summary_refresh' }}
+      UK_AQ_WHO_2021_RUN_LOG_RPC: ${{ vars.UK_AQ_WHO_2021_RUN_LOG_RPC || 'uk_aq_rpc_who_2021_processing_run_log' }}
+      UK_AQ_WHO_2021_SOURCE_NETWORK_CODE: ${{ vars.UK_AQ_WHO_2021_SOURCE_NETWORK_CODE || 'gov_uk_aurn' }}
+      UK_AQ_WHO_2021_CONNECTOR_ID: ${{ vars.UK_AQ_WHO_2021_CONNECTOR_ID || '1' }}
+      UK_AQ_WHO_2021_POLLUTANT_CODES: ${{ vars.UK_AQ_WHO_2021_POLLUTANT_CODES || 'pm25,pm10,no2' }}
+      UK_AQ_WHO_2021_MIN_VALID_HOURS_PER_DAY: ${{ vars.UK_AQ_WHO_2021_MIN_VALID_HOURS_PER_DAY || '18' }}
+      UK_AQ_WHO_2021_MIN_VALID_DAYS: ${{ vars.UK_AQ_WHO_2021_MIN_VALID_DAYS || '274' }}
+      UK_AQ_WHO_2021_MIN_FINAL_HOUR_COVERAGE_RATIO: ${{ vars.UK_AQ_WHO_2021_MIN_FINAL_HOUR_COVERAGE_RATIO || '0.9' }}
+      UK_AQ_WHO_2021_READINESS_GATE_ENABLED: ${{ vars.UK_AQ_WHO_2021_READINESS_GATE_ENABLED || 'true' }}
+      UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED: ${{ vars.UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED || 'true' }}
+      UK_AQ_WHO_2021_DAILY_LOOKBACK_DAYS: "2"
+      UK_AQ_WHO_2021_CHUNK_DAYS: ${{ vars.UK_AQ_WHO_2021_CHUNK_DAYS || '31' }}
+      UK_AQ_WHO_2021_RPC_RETRIES: ${{ vars.UK_AQ_WHO_2021_RPC_RETRIES || '3' }}
+      UK_AQ_WHO_2021_RUN_MODE: ${{ github.event.inputs.run_mode || 'daily' }}
+      UK_AQ_WHO_2021_TRIGGER_MODE: ${{ github.event.inputs.trigger_mode || 'manual' }}
+      UK_AQ_WHO_2021_START_DAY_UTC: ${{ github.event.inputs.start_day_utc || '' }}
+      UK_AQ_WHO_2021_END_DAY_UTC: ${{ github.event.inputs.end_day_utc || '' }}
+      UK_AQ_WHO_2021_REPORT_PATH: tmp/uk_aq_who_2021_daily_report.json
+      CONFIGURED_PUBLISH_JSON: ${{ vars.UK_AQ_WHO_2021_R2_PUBLISH_ENABLED || 'false' }}
+      CONFIGURED_WRITE_PARQUET: ${{ vars.UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED || 'false' }}
+      INPUT_PUBLISH_JSON: ${{ github.event.inputs.publish_json || 'false' }}
+      INPUT_WRITE_PARQUET: ${{ github.event.inputs.write_parquet || 'false' }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || vars.R2_ENDPOINT || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || vars.R2_BUCKET || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || vars.R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
+        with:
+          deno-version: v2.7.13
+
+      - name: Cache Deno dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+
+      - name: Cache WHO batch dependencies
+        run: |
+          deno cache --lock=deno.lock \
+            workers/uk_aq_who_2021_daily/main.ts \
+            workers/uk_aq_who_2021_daily/upload_report.ts
+
+      - name: Resolve publication settings
+        run: |
+          set -euo pipefail
+          resolve_switch() {
+            case "$1" in
+              true|false) printf '%s' "$1" ;;
+              configured) printf '%s' "$2" ;;
+              *) echo "Invalid publication setting: $1" >&2; return 1 ;;
+            esac
+          }
+          publish_json="$(resolve_switch "${INPUT_PUBLISH_JSON}" "${CONFIGURED_PUBLISH_JSON}")"
+          write_parquet="$(resolve_switch "${INPUT_WRITE_PARQUET}" "${CONFIGURED_WRITE_PARQUET}")"
+          case "${publish_json}" in true|false) ;; *) echo "Configured JSON publication value must be true or false" >&2; exit 1 ;; esac
+          case "${write_parquet}" in true|false) ;; *) echo "Configured parquet publication value must be true or false" >&2; exit 1 ;; esac
+          echo "UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=${publish_json}" >> "${GITHUB_ENV}"
+          echo "UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=${write_parquet}" >> "${GITHUB_ENV}"
+
+      - name: Run WHO 2021 daily batch
+        run: |
+          timeout --kill-after=30s 15m \
+            deno run --allow-env --allow-net --allow-read --allow-write \
+              workers/uk_aq_who_2021_daily/main.ts
+
+      - name: Upload WHO report to Dropbox
+        if: always()
+        run: |
+          deno run --allow-env --allow-net --allow-read --allow-write \
+            workers/uk_aq_who_2021_daily/upload_report.ts
+
+      - name: Retain WHO report artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-who-2021-daily-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tmp/uk_aq_who_2021_daily_report.json
+          if-no-files-found: warn
+          retention-days: 30
