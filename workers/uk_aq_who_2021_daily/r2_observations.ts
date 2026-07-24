@@ -313,7 +313,6 @@ export function assertCompleteManifestCoverage(
         throw coverageError(label, childPath, "contains coverage warnings");
       }
       if (
-        childCoverageContext &&
         key === "limited_by_limit" &&
         isTrueCoverageValue(child)
       ) {
