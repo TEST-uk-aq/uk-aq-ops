@@ -387,20 +387,35 @@ export type FirstValueAtCandidate = {
   first_observed_at: string;
 };
 
-type FirstValueAtReconciliationSummary = {
+type FirstValueAtDatabaseReconciliationSummary = {
   attempted: boolean;
-  dry_run: boolean;
-  connector_id: number;
-  candidate_timeseries_count: number;
+  submitted_count: number;
   rpc_call_count: number;
   matched_count: number;
   would_update_count: number;
   updated_count: number;
   unchanged_count: number;
+  status:
+    | "complete"
+    | "dry_run"
+    | "skipped_empty"
+    | "blocked_dependency"
+    | "failed";
+  error: string | null;
+};
+
+type FirstValueAtReconciliationSummary = {
+  attempted: boolean;
+  dry_run: boolean;
+  connector_id: number;
+  candidate_timeseries_count: number;
+  payload_chunk_count: number;
   earliest_supplied_at: string | null;
   latest_supplied_at: string | null;
   status: "complete" | "dry_run" | "skipped_empty" | "failed";
   error: string | null;
+  ingestdb: FirstValueAtDatabaseReconciliationSummary;
+  obs_aqidb: FirstValueAtDatabaseReconciliationSummary;
 };
 
 type AqilevelsConnectorManifest = {
@@ -608,11 +623,23 @@ type SourceToAllSummary = {
     connector_day_count: number;
     failed_connector_day_count: number;
     candidate_timeseries_count: number;
-    rpc_call_count: number;
-    matched_count: number;
-    would_update_count: number;
-    updated_count: number;
-    unchanged_count: number;
+    payload_chunk_count: number;
+    ingestdb: {
+      submitted_count: number;
+      rpc_call_count: number;
+      matched_count: number;
+      would_update_count: number;
+      updated_count: number;
+      unchanged_count: number;
+    };
+    obs_aqidb: {
+      submitted_count: number;
+      rpc_call_count: number;
+      matched_count: number;
+      would_update_count: number;
+      updated_count: number;
+      unchanged_count: number;
+    };
   };
   warnings: string[];
 };
@@ -1581,17 +1608,30 @@ async function reconcileTimeseriesFirstValueAt(args: {
   r2_verification: "newly_written_verified" | "unchanged_verified" | "dry_run";
 }): Promise<FirstValueAtReconciliationSummary> {
   const candidates = deriveFirstValueAtCandidates(args.rows);
+  const chunks = chunkFirstValueAtCandidates(
+    candidates,
+    FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE,
+  );
   const timestamps = candidates.map((row) => row.first_observed_at).sort();
-  const summary: FirstValueAtReconciliationSummary = {
-    attempted: candidates.length > 0,
-    dry_run: args.dry_run,
-    connector_id: args.connector_id,
-    candidate_timeseries_count: candidates.length,
+  const emptyDatabaseSummary = (
+    status: FirstValueAtDatabaseReconciliationSummary["status"],
+  ): FirstValueAtDatabaseReconciliationSummary => ({
+    attempted: false,
+    submitted_count: 0,
     rpc_call_count: 0,
     matched_count: 0,
     would_update_count: 0,
     updated_count: 0,
     unchanged_count: 0,
+    status,
+    error: null,
+  });
+  const summary: FirstValueAtReconciliationSummary = {
+    attempted: candidates.length > 0,
+    dry_run: args.dry_run,
+    connector_id: args.connector_id,
+    candidate_timeseries_count: candidates.length,
+    payload_chunk_count: chunks.length,
     earliest_supplied_at: timestamps[0] ?? null,
     latest_supplied_at: timestamps[timestamps.length - 1] ?? null,
     status: candidates.length === 0
@@ -1600,6 +1640,12 @@ async function reconcileTimeseriesFirstValueAt(args: {
       ? "dry_run"
       : "complete",
     error: null,
+    ingestdb: emptyDatabaseSummary(
+      candidates.length === 0 ? "skipped_empty" : "blocked_dependency",
+    ),
+    obs_aqidb: emptyDatabaseSummary(
+      candidates.length === 0 ? "skipped_empty" : "blocked_dependency",
+    ),
   };
   if (!candidates.length) {
     logStructured("info", "source_to_r2_first_value_at_reconciliation", {
@@ -1610,19 +1656,21 @@ async function reconcileTimeseriesFirstValueAt(args: {
     return summary;
   }
 
-  try {
-    const source = SOURCE_DB_BY_KIND.obs_aqidb;
+  const reconcileDatabase = async (
+    databaseKind: "ingestdb" | "obs_aqidb",
+  ): Promise<void> => {
+    const databaseSummary = summary[databaseKind];
+    databaseSummary.attempted = true;
+    databaseSummary.status = args.dry_run ? "dry_run" : "complete";
+    const source = SOURCE_DB_BY_KIND[databaseKind];
     if (!source) {
       throw new Error(
-        "first_value_at reconciliation requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY",
+        databaseKind === "ingestdb"
+          ? "first_value_at reconciliation requires SUPABASE_URL + SB_SECRET_KEY"
+          : "first_value_at reconciliation requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY",
       );
     }
-    for (
-      const chunk of chunkFirstValueAtCandidates(
-        candidates,
-        FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE,
-      )
-    ) {
+    for (const chunk of chunks) {
       const response = await postgrestRpc<unknown[]>(
         source,
         FIRST_VALUE_AT_RECONCILE_RPC,
@@ -1661,23 +1709,48 @@ async function reconcileTimeseriesFirstValueAt(args: {
           "first_value_at reconciliation RPC returned an invalid summary",
         );
       }
-      summary.rpc_call_count += 1;
-      summary.matched_count += matched;
-      summary.would_update_count += wouldUpdate;
-      summary.updated_count += updated;
-      summary.unchanged_count += unchanged;
+      databaseSummary.submitted_count += submitted;
+      databaseSummary.rpc_call_count += 1;
+      databaseSummary.matched_count += matched;
+      databaseSummary.would_update_count += wouldUpdate;
+      databaseSummary.updated_count += updated;
+      databaseSummary.unchanged_count += unchanged;
     }
+  };
+
+  try {
+    await reconcileDatabase("ingestdb");
   } catch (error) {
+    summary.ingestdb.status = "failed";
+    summary.ingestdb.error =
+      (error instanceof Error ? error.message : String(error)).slice(0, 1200);
     summary.status = "failed";
-    summary.error = (error instanceof Error ? error.message : String(error))
-      .slice(0, 1200);
+    summary.error = summary.ingestdb.error;
     logStructured("error", "source_to_r2_first_value_at_reconciliation", {
       day_utc: args.day_utc,
       r2_verification: args.r2_verification,
       ...summary,
     });
     throw new Error(
-      `R2 observation partition verified but first_value_at reconciliation failed: ${summary.error}`,
+      `R2 observation partition verified but authoritative IngestDB first_value_at reconciliation failed: ${summary.error}`,
+    );
+  }
+
+  try {
+    await reconcileDatabase("obs_aqidb");
+  } catch (error) {
+    summary.obs_aqidb.status = "failed";
+    summary.obs_aqidb.error =
+      (error instanceof Error ? error.message : String(error)).slice(0, 1200);
+    summary.status = "failed";
+    summary.error = summary.obs_aqidb.error;
+    logStructured("error", "source_to_r2_first_value_at_reconciliation", {
+      day_utc: args.day_utc,
+      r2_verification: args.r2_verification,
+      ...summary,
+    });
+    throw new Error(
+      `R2 observation partition verified and authoritative IngestDB reconciliation succeeded, but Obs AQI DB first_value_at reconciliation failed: ${summary.error}`,
     );
   }
 
@@ -13728,11 +13801,23 @@ async function runSourceToAll(
     connector_day_count: 0,
     failed_connector_day_count: 0,
     candidate_timeseries_count: 0,
-    rpc_call_count: 0,
-    matched_count: 0,
-    would_update_count: 0,
-    updated_count: 0,
-    unchanged_count: 0,
+    payload_chunk_count: 0,
+    ingestdb: {
+      submitted_count: 0,
+      rpc_call_count: 0,
+      matched_count: 0,
+      would_update_count: 0,
+      updated_count: 0,
+      unchanged_count: 0,
+    },
+    obs_aqidb: {
+      submitted_count: 0,
+      rpc_call_count: 0,
+      matched_count: 0,
+      would_update_count: 0,
+      updated_count: 0,
+      unchanged_count: 0,
+    },
   };
   const recordFirstValueAtReconciliation = (
     result: FirstValueAtReconciliationSummary,
@@ -13742,12 +13827,18 @@ async function runSourceToAll(
       result.status === "failed" ? 1 : 0;
     firstValueAtReconciliationTotals.candidate_timeseries_count +=
       result.candidate_timeseries_count;
-    firstValueAtReconciliationTotals.rpc_call_count += result.rpc_call_count;
-    firstValueAtReconciliationTotals.matched_count += result.matched_count;
-    firstValueAtReconciliationTotals.would_update_count +=
-      result.would_update_count;
-    firstValueAtReconciliationTotals.updated_count += result.updated_count;
-    firstValueAtReconciliationTotals.unchanged_count += result.unchanged_count;
+    firstValueAtReconciliationTotals.payload_chunk_count +=
+      result.payload_chunk_count;
+    for (const databaseKind of ["ingestdb", "obs_aqidb"] as const) {
+      const totals = firstValueAtReconciliationTotals[databaseKind];
+      const databaseResult = result[databaseKind];
+      totals.submitted_count += databaseResult.submitted_count;
+      totals.rpc_call_count += databaseResult.rpc_call_count;
+      totals.matched_count += databaseResult.matched_count;
+      totals.would_update_count += databaseResult.would_update_count;
+      totals.updated_count += databaseResult.updated_count;
+      totals.unchanged_count += databaseResult.unchanged_count;
+    }
   };
   const sensorcommunityArchiveIndexByDay = new Map<
     string,

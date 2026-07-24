@@ -4152,11 +4152,9 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
                     "dry_run",
                     "connector_id",
                     "candidate_timeseries_count",
-                    "rpc_call_count",
-                    "matched_count",
-                    "would_update_count",
-                    "updated_count",
-                    "unchanged_count",
+                    "payload_chunk_count",
+                    "ingestdb",
+                    "obs_aqidb",
                     "earliest_supplied_at",
                     "latest_supplied_at",
                     "status",
@@ -17136,31 +17134,6 @@ def run_canonical_apply_executor(
     return {"status": "succeeded", "exit_code": 0, "output": output}
 
 
-def _resolve_obs_aqidb_rpc_credentials(
-    env: Mapping[str, str],
-) -> tuple[str, str]:
-    loaded: dict[str, str] = {}
-    env_file = str(env.get("UK_AQ_BACKFILL_ENV_FILE") or os.environ.get("UK_AQ_BACKFILL_ENV_FILE") or "").strip()
-    if env_file:
-        try:
-            loaded = load_env_file_assignments(env_file)
-        except OSError:
-            loaded = {}
-    url = str(
-        env.get("OBS_AQIDB_SUPABASE_URL")
-        or loaded.get("OBS_AQIDB_SUPABASE_URL")
-        or os.environ.get("OBS_AQIDB_SUPABASE_URL")
-        or ""
-    ).strip().rstrip("/")
-    key = str(
-        env.get("OBS_AQIDB_SECRET_KEY")
-        or loaded.get("OBS_AQIDB_SECRET_KEY")
-        or os.environ.get("OBS_AQIDB_SECRET_KEY")
-        or ""
-    ).strip()
-    return url, key
-
-
 def _first_value_at_candidates_from_evidence(
     conn: sqlite3.Connection,
     repair_entry: Mapping[str, Any],
@@ -17246,21 +17219,32 @@ def run_first_value_at_reconciliation(
     log: logging.Logger,
     verified_connector_days: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
+    def database_summary(status: str = "blocked_dependency") -> dict[str, Any]:
+        return {
+            "attempted": False,
+            "submitted_count": 0,
+            "rpc_call_count": 0,
+            "matched_count": 0,
+            "would_update_count": 0,
+            "updated_count": 0,
+            "unchanged_count": 0,
+            "status": status,
+            "error": None,
+        }
+
     aggregate: dict[str, Any] = {
         "attempted": False,
         "dry_run": bool(dry_run),
         "connector_day_count": 0,
         "failed_connector_day_count": 0,
         "candidate_timeseries_count": 0,
-        "rpc_call_count": 0,
-        "matched_count": 0,
-        "would_update_count": 0,
-        "updated_count": 0,
-        "unchanged_count": 0,
+        "payload_chunk_count": 0,
         "earliest_supplied_at": None,
         "latest_supplied_at": None,
         "status": "skipped_empty",
         "error": None,
+        "ingestdb": database_summary("skipped_empty"),
+        "obs_aqidb": database_summary("skipped_empty"),
         "connector_day_results_sample": [],
         "connector_day_results_truncated": 0,
     }
@@ -17288,27 +17272,86 @@ def run_first_value_at_reconciliation(
     if not scope_inputs:
         return aggregate
 
-    supabase_url, service_role_key = _resolve_obs_aqidb_rpc_credentials(env)
-    if not supabase_url or not service_role_key:
-        aggregate.update({
-            "status": "failed",
-            "error": "OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY are required",
-            "failed_connector_day_count": len(scope_inputs),
-        })
-        log.error(
-            "R2 observation partitions verified but first_value_at reconciliation failed: %s",
-            aggregate["error"],
-        )
-        return aggregate
-
-    endpoint = f"{supabase_url}/rest/v1/rpc/{FIRST_VALUE_AT_RECONCILE_RPC}"
-    headers = {
-        "apikey": service_role_key,
-        "Authorization": f"Bearer {service_role_key}",
-        "Content-Type": "application/json",
-        "Accept-Profile": "uk_aq_public",
-        "Content-Profile": "uk_aq_public",
+    database_configs = {
+        "ingestdb": _resolve_ingestdb_supabase_rest_config(env),
+        "obs_aqidb": _resolve_obs_aqidb_supabase_rest_config(env),
     }
+    database_requirements = {
+        "ingestdb": "SUPABASE_URL and SB_SECRET_KEY are required",
+        "obs_aqidb": (
+            "OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY are required"
+        ),
+    }
+
+    def reconcile_database(
+        *,
+        database_kind: str,
+        scope: dict[str, Any],
+        chunks: list[list[dict[str, Any]]],
+        connector_id: int,
+    ) -> None:
+        result = scope[database_kind]
+        result["attempted"] = True
+        result["status"] = "dry_run" if dry_run else "complete"
+        config = database_configs[database_kind]
+        supabase_url = str(config.get("supabase_url") or "").rstrip("/")
+        service_role_key = str(config.get("supabase_key") or "")
+        if not supabase_url or not service_role_key:
+            raise RuntimeError(database_requirements[database_kind])
+        endpoint = (
+            f"{supabase_url}/rest/v1/rpc/{FIRST_VALUE_AT_RECONCILE_RPC}"
+        )
+        headers = _supabase_rest_headers(service_role_key, "uk_aq_public")
+        for chunk in chunks:
+            response = _http_post_json(
+                url=endpoint,
+                headers=headers,
+                body={
+                    "p_connector_id": connector_id,
+                    "p_rows": chunk,
+                    "p_dry_run": bool(dry_run),
+                },
+            )
+            rpc_result = (
+                response[0]
+                if isinstance(response, list) and len(response) == 1
+                else None
+            )
+            if not isinstance(rpc_result, Mapping):
+                raise RuntimeError(
+                    "reconciliation RPC returned an unexpected response"
+                )
+            submitted = int(rpc_result.get("submitted_count"))
+            matched = int(rpc_result.get("matched_count"))
+            would_update = int(rpc_result.get("would_update_count"))
+            updated = int(rpc_result.get("updated_count"))
+            unchanged = int(
+                rpc_result.get("already_equal_or_earlier_count")
+            )
+            if (
+                submitted != len(chunk)
+                or matched != len(chunk)
+                or min(
+                    submitted,
+                    matched,
+                    would_update,
+                    updated,
+                    unchanged,
+                ) < 0
+                or unchanged + would_update != matched
+                or (updated != 0 if dry_run else updated != would_update)
+                or bool(rpc_result.get("dry_run")) != bool(dry_run)
+            ):
+                raise RuntimeError(
+                    "reconciliation RPC returned invalid summary counts"
+                )
+            result["submitted_count"] += submitted
+            result["rpc_call_count"] += 1
+            result["matched_count"] += matched
+            result["would_update_count"] += would_update
+            result["updated_count"] += updated
+            result["unchanged_count"] += unchanged
+
     scope_results: list[dict[str, Any]] = []
     for input_kind, scope_entry in sorted(
         scope_inputs,
@@ -17332,18 +17375,19 @@ def run_first_value_at_reconciliation(
                 scope_entry.get("r2_verification") or input_kind
             ),
             "candidate_timeseries_count": 0,
-            "rpc_call_count": 0,
-            "matched_count": 0,
-            "would_update_count": 0,
-            "updated_count": 0,
-            "unchanged_count": 0,
+            "payload_chunk_count": 0,
             "earliest_supplied_at": None,
             "latest_supplied_at": None,
             "status": "skipped_empty",
             "error": None,
+            "ingestdb": database_summary(),
+            "obs_aqidb": database_summary(),
         }
         try:
-            if connector_id <= 0 or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc):
+            if connector_id <= 0 or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}",
+                day_utc,
+            ):
                 raise ValueError("invalid connector/day reconciliation scope")
             candidates = (
                 _first_value_at_candidates_from_evidence(conn, scope_entry)
@@ -17352,55 +17396,77 @@ def run_first_value_at_reconciliation(
                     scope_entry.get("candidates")
                 )
             )
+            chunks = [
+                candidates[index:index + FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE]
+                for index in range(
+                    0,
+                    len(candidates),
+                    FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE,
+                )
+            ]
             scope["candidate_timeseries_count"] = len(candidates)
-            if candidates:
+            scope["payload_chunk_count"] = len(chunks)
+            if not candidates:
+                scope["ingestdb"] = database_summary("skipped_empty")
+                scope["obs_aqidb"] = database_summary("skipped_empty")
+            else:
                 scope["attempted"] = True
                 scope["earliest_supplied_at"] = min(
-                    str(candidate["first_observed_at"]) for candidate in candidates
+                    str(candidate["first_observed_at"])
+                    for candidate in candidates
                 )
                 scope["latest_supplied_at"] = max(
-                    str(candidate["first_observed_at"]) for candidate in candidates
+                    str(candidate["first_observed_at"])
+                    for candidate in candidates
                 )
-                for index in range(0, len(candidates), FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE):
-                    chunk = candidates[index:index + FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE]
-                    response = _http_post_json(
-                        url=endpoint,
-                        headers=headers,
-                        body={
-                            "p_connector_id": connector_id,
-                            "p_rows": chunk,
-                            "p_dry_run": bool(dry_run),
-                        },
+                try:
+                    reconcile_database(
+                        database_kind="ingestdb",
+                        scope=scope,
+                        chunks=chunks,
+                        connector_id=connector_id,
                     )
-                    result = response[0] if isinstance(response, list) and len(response) == 1 else None
-                    if not isinstance(result, Mapping):
-                        raise RuntimeError("reconciliation RPC returned an unexpected response")
-                    submitted = int(result.get("submitted_count"))
-                    matched = int(result.get("matched_count"))
-                    would_update = int(result.get("would_update_count"))
-                    updated = int(result.get("updated_count"))
-                    unchanged = int(result.get("already_equal_or_earlier_count"))
-                    if (
-                        submitted != len(chunk)
-                        or matched != len(chunk)
-                        or min(submitted, matched, would_update, updated, unchanged) < 0
-                        or unchanged + would_update != matched
-                        or (updated != 0 if dry_run else updated != would_update)
-                        or bool(result.get("dry_run")) != bool(dry_run)
-                    ):
-                        raise RuntimeError("reconciliation RPC returned invalid summary counts")
-                    scope["rpc_call_count"] += 1
-                    scope["matched_count"] += matched
-                    scope["would_update_count"] += would_update
-                    scope["updated_count"] += updated
-                    scope["unchanged_count"] += unchanged
+                except Exception as exc:
+                    scope["ingestdb"]["status"] = "failed"
+                    scope["ingestdb"]["error"] = _truncate_text(
+                        str(exc),
+                        1200,
+                    )
+                    scope["obs_aqidb"]["error"] = (
+                        "authoritative IngestDB reconciliation did not complete"
+                    )
+                    raise RuntimeError(
+                        "authoritative IngestDB first_value_at reconciliation "
+                        f"failed: {scope['ingestdb']['error']}"
+                    ) from exc
+                try:
+                    reconcile_database(
+                        database_kind="obs_aqidb",
+                        scope=scope,
+                        chunks=chunks,
+                        connector_id=connector_id,
+                    )
+                except Exception as exc:
+                    scope["obs_aqidb"]["status"] = "failed"
+                    scope["obs_aqidb"]["error"] = _truncate_text(
+                        str(exc),
+                        1200,
+                    )
+                    raise RuntimeError(
+                        "authoritative IngestDB reconciliation succeeded, "
+                        "but Obs AQI DB first_value_at reconciliation failed: "
+                        f"{scope['obs_aqidb']['error']}"
+                    ) from exc
                 scope["status"] = "dry_run" if dry_run else "complete"
         except Exception as exc:
             scope["status"] = "failed"
             scope["error"] = _truncate_text(str(exc), 1200)
             log.error(
-                "R2 observation partition verified but first_value_at reconciliation failed day=%s connector_id=%s error=%s",
-                day_utc, connector_id, scope["error"],
+                "R2 observation partition verified but first_value_at "
+                "reconciliation failed day=%s connector_id=%s error=%s",
+                day_utc,
+                connector_id,
+                scope["error"],
             )
         scope_results.append(scope)
 
@@ -17408,15 +17474,61 @@ def run_first_value_at_reconciliation(
     aggregate["failed_connector_day_count"] = sum(
         1 for scope in scope_results if scope["status"] == "failed"
     )
-    for field in (
-        "candidate_timeseries_count",
-        "rpc_call_count",
-        "matched_count",
-        "would_update_count",
-        "updated_count",
-        "unchanged_count",
-    ):
+    for field in ("candidate_timeseries_count", "payload_chunk_count"):
         aggregate[field] = sum(int(scope[field]) for scope in scope_results)
+
+    for database_kind in ("ingestdb", "obs_aqidb"):
+        target = database_summary("skipped_empty")
+        database_results = [
+            scope[database_kind] for scope in scope_results
+        ]
+        target["attempted"] = any(
+            bool(result["attempted"]) for result in database_results
+        )
+        for field in (
+            "submitted_count",
+            "rpc_call_count",
+            "matched_count",
+            "would_update_count",
+            "updated_count",
+            "unchanged_count",
+        ):
+            target[field] = sum(
+                int(result[field]) for result in database_results
+            )
+        failed_count = sum(
+            1 for result in database_results if result["status"] == "failed"
+        )
+        blocked_count = sum(
+            1
+            for result in database_results
+            if result["status"] == "blocked_dependency"
+        )
+        target["failed_connector_day_count"] = failed_count
+        target["blocked_connector_day_count"] = blocked_count
+        target["status"] = (
+            "failed"
+            if failed_count
+            else "blocked_dependency"
+            if blocked_count
+            else "dry_run"
+            if dry_run and target["attempted"]
+            else "complete"
+            if target["attempted"]
+            else "skipped_empty"
+        )
+        target_errors = [
+            str(result["error"])
+            for result in database_results
+            if result.get("error")
+        ]
+        target["error"] = (
+            _truncate_text("; ".join(target_errors), 1200)
+            if target_errors
+            else None
+        )
+        aggregate[database_kind] = target
+
     supplied = [
         str(scope[field])
         for scope in scope_results
@@ -17425,15 +17537,24 @@ def run_first_value_at_reconciliation(
     ]
     aggregate["earliest_supplied_at"] = min(supplied) if supplied else None
     aggregate["latest_supplied_at"] = max(supplied) if supplied else None
-    aggregate["attempted"] = any(bool(scope["attempted"]) for scope in scope_results)
+    aggregate["attempted"] = any(
+        bool(scope["attempted"]) for scope in scope_results
+    )
     aggregate["status"] = (
-        "failed" if aggregate["failed_connector_day_count"]
-        else "dry_run" if dry_run and aggregate["attempted"]
-        else "complete" if aggregate["attempted"]
+        "failed"
+        if aggregate["failed_connector_day_count"]
+        else "dry_run"
+        if dry_run and aggregate["attempted"]
+        else "complete"
+        if aggregate["attempted"]
         else "skipped_empty"
     )
-    errors = [str(scope["error"]) for scope in scope_results if scope.get("error")]
-    aggregate["error"] = _truncate_text("; ".join(errors), 1200) if errors else None
+    errors = [
+        str(scope["error"]) for scope in scope_results if scope.get("error")
+    ]
+    aggregate["error"] = (
+        _truncate_text("; ".join(errors), 1200) if errors else None
+    )
     aggregate["connector_day_results_sample"] = scope_results[
         :FIRST_VALUE_AT_RECONCILE_REPORT_SCOPE_LIMIT
     ]
@@ -17442,10 +17563,19 @@ def run_first_value_at_reconciliation(
         len(scope_results) - FIRST_VALUE_AT_RECONCILE_REPORT_SCOPE_LIMIT,
     )
     log.info(
-        "first_value_at reconciliation status=%s dry_run=%s connector_days=%s candidates=%s rpc_calls=%s would_update=%s updated=%s",
-        aggregate["status"], aggregate["dry_run"], aggregate["connector_day_count"],
-        aggregate["candidate_timeseries_count"], aggregate["rpc_call_count"],
-        aggregate["would_update_count"], aggregate["updated_count"],
+        "first_value_at reconciliation status=%s dry_run=%s "
+        "connector_days=%s candidates=%s chunks=%s "
+        "ingest_rpc_calls=%s ingest_updated=%s "
+        "obs_rpc_calls=%s obs_updated=%s",
+        aggregate["status"],
+        aggregate["dry_run"],
+        aggregate["connector_day_count"],
+        aggregate["candidate_timeseries_count"],
+        aggregate["payload_chunk_count"],
+        aggregate["ingestdb"]["rpc_call_count"],
+        aggregate["ingestdb"]["updated_count"],
+        aggregate["obs_aqidb"]["rpc_call_count"],
+        aggregate["obs_aqidb"]["updated_count"],
     )
     return aggregate
 
@@ -17820,14 +17950,32 @@ def run_v2_integrity_repair_flow(
             "connector_day_count": 0,
             "failed_connector_day_count": 0,
             "candidate_timeseries_count": 0,
-            "rpc_call_count": 0,
-            "matched_count": 0,
-            "would_update_count": 0,
-            "updated_count": 0,
-            "unchanged_count": 0,
+            "payload_chunk_count": 0,
             "earliest_supplied_at": None,
             "latest_supplied_at": None,
             "error": None,
+            "ingestdb": {
+                "attempted": False,
+                "submitted_count": 0,
+                "rpc_call_count": 0,
+                "matched_count": 0,
+                "would_update_count": 0,
+                "updated_count": 0,
+                "unchanged_count": 0,
+                "status": "blocked_dependency",
+                "error": "R2 observation verification did not complete",
+            },
+            "obs_aqidb": {
+                "attempted": False,
+                "submitted_count": 0,
+                "rpc_call_count": 0,
+                "matched_count": 0,
+                "would_update_count": 0,
+                "updated_count": 0,
+                "unchanged_count": 0,
+                "status": "blocked_dependency",
+                "error": "R2 observation verification did not complete",
+            },
             "connector_day_results_sample": [],
             "connector_day_results_truncated": 0,
         }
@@ -19830,16 +19978,31 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- Connector-days: {int(reconciliation.get('connector_day_count') or 0)}",
                 f"- Failed connector-days: {int(reconciliation.get('failed_connector_day_count') or 0)}",
                 f"- Candidate timeseries: {int(reconciliation.get('candidate_timeseries_count') or 0)}",
-                f"- RPC calls: {int(reconciliation.get('rpc_call_count') or 0)}",
-                f"- Matched: {int(reconciliation.get('matched_count') or 0)}",
-                f"- Would update: {int(reconciliation.get('would_update_count') or 0)}",
-                f"- Updated: {int(reconciliation.get('updated_count') or 0)}",
-                f"- Unchanged: {int(reconciliation.get('unchanged_count') or 0)}",
+                f"- Payload chunks: {int(reconciliation.get('payload_chunk_count') or 0)}",
                 f"- Earliest supplied: {reconciliation.get('earliest_supplied_at') or '(none)'}",
                 f"- Latest supplied: {reconciliation.get('latest_supplied_at') or '(none)'}",
                 f"- Error: {reconciliation.get('error') or '(none)'}",
                 "",
             ])
+            for database_key, database_label in (
+                ("ingestdb", "IngestDB (authoritative)"),
+                ("obs_aqidb", "Obs AQI DB"),
+            ):
+                database_result = reconciliation.get(database_key) or {}
+                lines.extend([
+                    f"#### {database_label}",
+                    "",
+                    f"- Status: {database_result.get('status') or '(none)'}",
+                    f"- Attempted: {bool(database_result.get('attempted'))}",
+                    f"- Submitted: {int(database_result.get('submitted_count') or 0)}",
+                    f"- RPC calls: {int(database_result.get('rpc_call_count') or 0)}",
+                    f"- Matched: {int(database_result.get('matched_count') or 0)}",
+                    f"- Would update: {int(database_result.get('would_update_count') or 0)}",
+                    f"- Updated: {int(database_result.get('updated_count') or 0)}",
+                    f"- Unchanged: {int(database_result.get('unchanged_count') or 0)}",
+                    f"- Error: {database_result.get('error') or '(none)'}",
+                    "",
+                ])
         final_verification = repair_flow.get("final_verification") or {}
         if final_verification:
             lines.extend([
