@@ -102,40 +102,68 @@ Deno.test("OpenAQ CSV mapping populates pollutant_code from source parameter whe
   assertEquals(parsed.rows[0].source_parameter, "pm25");
 });
 
-Deno.test("UK-AIR CSV parses GMT hour-ending rows into UTC hour starts", () => {
-  const parsed = parseUkAirFlatFileObservations({
+Deno.test("UK-AIR CSV preserves ordinary UTC times and rolls 24:00 into the next partition", () => {
+  const mappings = [{
+    site_ref: "EA8",
+    uk_air_ref: "EA8",
+    pollutant_code: "pm10" as const,
+    station_id: 1,
+    timeseries_id: 66,
+    station_ref: "station-ea8",
+    timeseries_ref: "timeseries-old",
+    valid_from_day_utc: "2020-01-01",
+    valid_to_day_utc: "2026-05-17",
+  }, {
+    site_ref: "EA8",
+    uk_air_ref: "EA8",
+    pollutant_code: "pm10" as const,
+    station_id: 1,
+    timeseries_id: 95,
+    station_ref: "station-ea8",
+    timeseries_ref: "timeseries-new",
+    valid_from_day_utc: "2026-05-18",
+    valid_to_day_utc: null,
+  }];
+  const csvText = [
+    "Station metadata",
+    "All Data GMT hour ending ",
+    'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
+    "17-05-2026,01:00,10,R,ugm-3",
+    "17-05-2026,24:00,11,P,ugm-3",
+    "18-05-2026,01:00,12,R,ugm-3",
+  ].join("\n");
+  const propertyMappings = [
+    propertyMapping("PM<sub>10</sub> particulate matter (Hourly measured)", "pm10"),
+  ];
+  const firstDay = parseUkAirFlatFileObservations({
     dayUtc: "2026-05-17",
     siteRef: "EA8",
-    csvText: [
-      "Station metadata",
-      "All Data GMT hour ending ",
-      'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
-      "17-05-2026,01:00,10,R,ugm-3",
-      "17-05-2026,24:00,11,P,ugm-3",
-      "18-05-2026,01:00,12,R,ugm-3",
-    ].join("\n"),
-    mappings: [{
-      site_ref: "EA8",
-      uk_air_ref: "EA8",
-      pollutant_code: "pm10",
-      station_id: 1,
-      timeseries_id: 66,
-      station_ref: "station-ea8",
-      timeseries_ref: "timeseries-old",
-      valid_from_day_utc: "2020-01-01",
-      valid_to_day_utc: "2026-05-17",
-    }],
-    propertyMappings: [propertyMapping("PM<sub>10</sub> particulate matter (Hourly measured)", "pm10")],
+    csvText,
+    mappings,
+    propertyMappings,
+  });
+  const secondDay = parseUkAirFlatFileObservations({
+    dayUtc: "2026-05-18",
+    siteRef: "EA8",
+    csvText,
+    mappings,
+    propertyMappings,
   });
 
-  assertEquals(parsed.rows.map((row) => row.observed_at), [
-    "2026-05-17T00:00:00.000Z",
-    "2026-05-17T23:00:00.000Z",
+  assertEquals(firstDay.rows.map((row) => row.observed_at), [
+    "2026-05-17T01:00:00.000Z",
   ]);
-  assertEquals(parsed.rows.map((row) => row.value), [10, 11]);
-  assertEquals(parsed.rows.map((row) => row.status), ["R", "P"]);
-  assertEquals(parsed.rows.map((row) => row.timeseries_id), [66, 66]);
-  assertEquals(parsed.units, ["ugm-3"]);
+  assertEquals(firstDay.rows.map((row) => row.value), [10]);
+  assertEquals(firstDay.rows.map((row) => row.status), ["R"]);
+  assertEquals(firstDay.rows.map((row) => row.timeseries_id), [66]);
+  assertEquals(secondDay.rows.map((row) => row.observed_at), [
+    "2026-05-18T00:00:00.000Z",
+    "2026-05-18T01:00:00.000Z",
+  ]);
+  assertEquals(secondDay.rows.map((row) => row.value), [11, 12]);
+  assertEquals(secondDay.rows.map((row) => row.status), ["P", "R"]);
+  assertEquals(secondDay.rows.map((row) => row.timeseries_id), [95, 95]);
+  assertEquals(secondDay.units, ["ugm-3"]);
 });
 
 Deno.test("UK-AIR CSV time-basis declaration accepts notes and warns without blocking", () => {

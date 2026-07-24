@@ -40,6 +40,10 @@ import {
   utcDayEndIso,
   utcDayStartIso,
 } from "./backfill_core.mjs";
+import {
+  parseUkAirObservedAtUtc,
+  requiredUkAirAnnualSourceYears,
+} from "./uk_air_timestamp.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -9434,30 +9438,6 @@ export function normaliseConcentrationUnitForComparison(
   return aliases.get(compact) || compact;
 }
 
-function parseUkAirCsvDay(value: string): string | null {
-  const match = value.trim().match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2}|\d{4})$/);
-  if (!match) return null;
-  const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
-  const month = Number(match[2]);
-  const day = Number(match[1]);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
-  if (
-    parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 ||
-    parsed.getUTCDate() !== day
-  ) return null;
-  return parsed.toISOString().slice(0, 10);
-}
-
-function parseUkAirGmtHourEnding(dayUtc: string, value: string): string | null {
-  const match = value.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
-  if (!match) return null;
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  if (hour < 1 || hour > 24 || minute < 0 || minute > 59) return null;
-  const start = Date.parse(`${dayUtc}T00:00:00.000Z`);
-  return new Date(start + ((hour * 60 + minute) - 60) * 60_000).toISOString();
-}
-
 export type UkAirFlatFileParseResult = {
   rows: SourceObservationRow[];
   source_records: number;
@@ -9728,24 +9708,18 @@ export function parseUkAirFlatFileObservations(args: {
       !unselectedPollutantValueIndexes.length
     ) continue;
 
-    const sourceDay = parseUkAirCsvDay(cells[0] || "");
-    if (!sourceDay) {
-      result.skipped_invalid_rows += 1;
-      result.blocked_target_day_rows += 1;
-      if (
-        result.blocked_target_day_row_samples.length <
-          INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
-      ) {
-        result.blocked_target_day_row_samples.push({
-          reason: "unparseable_observation_date",
-          site_ref: args.siteRef,
-          line_number: lineIndex + 1,
-          date: String(cells[0] || "").trim(),
-          time: String(cells[1] || "").trim(),
-        });
-      }
-      continue;
+    let observedAt: string;
+    try {
+      observedAt = parseUkAirObservedAtUtc(cells[0] || "", cells[1] || "");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `invalid_uk_air_observation_timestamp site_ref=${args.siteRef} ` +
+          `source_file=${JSON.stringify(args.sourceFile || null)} ` +
+          `line_number=${lineIndex + 1} ${message}`,
+      );
     }
+    const partitionDayUtc = observedAt.slice(0, 10);
     result.source_records += 1;
     // Unit evidence belongs to the header section, not only to the target
     // day.  A blank target-day unit may inherit only this section's proven
@@ -9762,26 +9736,8 @@ export function parseUkAirFlatFileObservations(args: {
       const unit = String(cells[skipped.valueIndex + 2] || "").trim();
       if (unit) skipped.units.add(unit);
     }
-    if (sourceDay !== args.dayUtc) {
+    if (partitionDayUtc !== args.dayUtc) {
       result.skipped_other_days += 1;
-      continue;
-    }
-    const observedAt = parseUkAirGmtHourEnding(sourceDay, cells[1] || "");
-    if (!observedAt) {
-      result.skipped_invalid_rows += 1;
-      result.blocked_target_day_rows += 1;
-      if (
-        result.blocked_target_day_row_samples.length <
-          INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
-      ) {
-        result.blocked_target_day_row_samples.push({
-          reason: "invalid_gmt_hour_ending",
-          site_ref: args.siteRef,
-          line_number: lineIndex + 1,
-          date: String(cells[0] || "").trim(),
-          time: String(cells[1] || "").trim(),
-        });
-      }
       continue;
     }
     for (const valueIndex of unselectedPollutantValueIndexes) {
@@ -9863,6 +9819,7 @@ export function parseUkAirFlatFileObservations(args: {
       classification: "no_authoritative_timeseries_binding",
       reason: "no_authoritative_timeseries_binding",
       site_ref: args.siteRef,
+      source_file: args.sourceFile || null,
       pollutant_code: column.pollutantCode,
       observed_units: Array.from(column.units).sort(),
       target_day_non_null_row_count: column.targetDayNonNullRowCount,
@@ -9883,6 +9840,7 @@ export function parseUkAirFlatFileObservations(args: {
       normalised_source_label: column.normalisedSourceLabel,
       classification: "mapped_selected",
       site_ref: args.siteRef,
+      source_file: args.sourceFile || null,
       observed_units: Array.from(column.units).sort(),
       target_day_non_null_row_count: column.targetDayNonNullRowCount,
       target_day_blank_unit_row_count: column.targetDayBlankUnitRowCount,
@@ -9898,6 +9856,7 @@ export function parseUkAirFlatFileObservations(args: {
       normalised_source_label: column.normalisedSourceLabel,
       classification: column.classification,
       site_ref: args.siteRef,
+      source_file: args.sourceFile || null,
       observed_units: Array.from(column.units).sort(),
       target_day_non_null_row_count: column.targetDayNonNullRowCount,
       possible_supported_pollutant_label:
@@ -10179,13 +10138,17 @@ function normalizeSourceObservationForV2(
   };
 }
 
-function inspectIntegritySourceRowsForBlockingEvidence(
+export function inspectIntegritySourceRowsForBlockingEvidence(
   rows: SourceObservationRow[],
   connectorId: number,
 ): IntegrityDuplicateSourceEvidence {
-  const occurrencesByCanonicalKey = new Map<
+  const occurrencesByObservationIdentity = new Map<
     string,
-    { count: number; identities: Record<string, unknown>[] }
+    {
+      count: number;
+      canonicalIdentity: Record<string, unknown>;
+      valueStatusVariants: Map<string, Record<string, unknown>>;
+    }
   >();
   const blockedRowSamples: Record<string, unknown>[] = [];
   const duplicateCanonicalRowIdentitySamples: Record<string, unknown>[] = [];
@@ -10213,39 +10176,46 @@ function inspectIntegritySourceRowsForBlockingEvidence(
       continue;
     }
     canonicalObservationRows.push(canonical);
-    const canonicalIdentity = {
+    const observationIdentity = {
       connector_id: connectorId,
       station_id: canonical.station_id,
       timeseries_id: canonical.timeseries_id,
       pollutant_code: canonical.pollutant_code,
       observed_at: canonical.observed_at,
+    };
+    const valueStatusIdentity = {
       value: canonical.value,
       value_identity: normalizeObservationValueIdentity(canonical.value),
       status: canonical.status ?? null,
     };
-    const canonicalKey = JSON.stringify(canonicalIdentity);
-    const occurrence = occurrencesByCanonicalKey.get(canonicalKey) || {
+    const observationKey = JSON.stringify(observationIdentity);
+    const valueStatusKey = JSON.stringify(valueStatusIdentity);
+    const occurrence = occurrencesByObservationIdentity.get(observationKey) || {
       count: 0,
-      identities: [],
+      canonicalIdentity: observationIdentity,
+      valueStatusVariants: new Map<string, Record<string, unknown>>(),
     };
     occurrence.count += 1;
-    if (occurrence.identities.length < 2) {
-      occurrence.identities.push(canonicalIdentity);
-    }
-    occurrencesByCanonicalKey.set(canonicalKey, occurrence);
+    occurrence.valueStatusVariants.set(valueStatusKey, valueStatusIdentity);
+    occurrencesByObservationIdentity.set(observationKey, occurrence);
   }
 
   let duplicateCanonicalRowCount = 0;
-  for (const [canonicalKey, occurrence] of Array.from(
-    occurrencesByCanonicalKey.entries(),
+  for (const [, occurrence] of Array.from(
+    occurrencesByObservationIdentity.entries(),
   ).sort(([left], [right]) => left.localeCompare(right))) {
     if (occurrence.count <= 1) continue;
     duplicateCanonicalRowCount += occurrence.count - 1;
+    const conflicting = occurrence.valueStatusVariants.size > 1;
     const duplicateSample = {
-      reason: "duplicate_canonical_source_row",
-      canonical_identity: occurrence.identities[0],
+      reason: conflicting
+        ? "contradictory_duplicate_source_observation"
+        : "duplicate_canonical_source_row",
+      canonical_identity: occurrence.canonicalIdentity,
       duplicate_row_count: occurrence.count - 1,
-      identities: occurrence.identities,
+      value_status_variants: Array.from(
+        occurrence.valueStatusVariants.values(),
+      ),
     };
     if (
       duplicateCanonicalRowIdentitySamples.length <
@@ -14844,6 +14814,20 @@ async function runSourceToAll(
           const flatFileSiteRefs = Array.from(
             new Set(validFlatFileMappings.map((row) => row.site_ref.toUpperCase())),
           ).sort();
+          const flatFileSourceYearSelection =
+            requiredUkAirAnnualSourceYears([dayUtc]);
+          const flatFileSourceYears = flatFileSourceYearSelection.years;
+          logStructured("info", "source_to_r2_sos_flat_file_source_years", {
+            run_id: runId,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_adapter: "sos",
+            source_years: flatFileSourceYears,
+            source_dates: flatFileSourceYearSelection.source_dates,
+            reasons_by_year: flatFileSourceYearSelection.reasons_by_year,
+            previous_year_boundary_days:
+              flatFileSourceYearSelection.previous_year_boundary_days,
+          });
           let flatFileSourceRecords = 0;
           let flatFileSkippedOtherDays = 0;
           let flatFileSkippedInvalidRows = 0;
@@ -14856,49 +14840,53 @@ async function runSourceToAll(
           const flatFileBlockedTargetDayRowSamples: Record<string, unknown>[] = [];
           const flatFileUnits = new Set<string>();
           for (const siteRef of flatFileSiteRefs) {
-            const csvPath = ukAirFlatFilePath(
-              SOS_FLAT_FILE_ROOT,
-              siteRef,
-              Number(dayUtc.slice(0, 4)),
-            );
-            sourceFilesEnumerated.push(csvPath);
-            sourceFilesRequired.push(csvPath);
-            if (!fs.existsSync(csvPath) || fs.statSync(csvPath).size <= 0) {
-              throw new Error(`UK-AIR annual CSV cache is missing or empty: ${csvPath}`);
-            }
-            const csvText = fs.readFileSync(csvPath, "utf8");
-            sourceFilesRead.push(csvPath);
-            recordSourceFileRead(csvPath, csvText);
-            const parsed = parseUkAirFlatFileObservations({
-              dayUtc,
-              siteRef,
-              sourceFile: path.basename(csvPath),
-              csvText,
-              mappings: validFlatFileMappings,
-              propertyMappings: observedPropertyMappings,
-            });
-            appendRowsSafe(flatFileRows, parsed.rows);
-            flatFileSourceRecords += parsed.source_records;
-            flatFileSkippedOtherDays += parsed.skipped_other_days;
-            flatFileSkippedInvalidRows += parsed.skipped_invalid_rows;
-            flatFileSkippedUnselectedPollutantRows +=
-              parsed.skipped_unselected_pollutant_rows;
-            flatFileSelectedSourceRecordsExamined +=
-              parsed.selected_source_records_examined;
-            flatFileSourceLabelClassifications.push(
-              ...parsed.source_label_classifications,
-            );
-            flatFileBlockedTargetDayRows += parsed.blocked_target_day_rows;
-            for (const sample of parsed.blocked_target_day_row_samples) {
-              if (
-                flatFileBlockedTargetDayRowSamples.length >=
-                  INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
-              ) {
-                break;
+            for (const sourceYear of flatFileSourceYears) {
+              const csvPath = ukAirFlatFilePath(
+                SOS_FLAT_FILE_ROOT,
+                siteRef,
+                sourceYear,
+              );
+              sourceFilesEnumerated.push(csvPath);
+              sourceFilesRequired.push(csvPath);
+              if (!fs.existsSync(csvPath) || fs.statSync(csvPath).size <= 0) {
+                throw new Error(
+                  `UK-AIR annual CSV cache is missing or empty: ${csvPath}`,
+                );
               }
-              flatFileBlockedTargetDayRowSamples.push(sample);
+              const csvText = fs.readFileSync(csvPath, "utf8");
+              sourceFilesRead.push(csvPath);
+              recordSourceFileRead(csvPath, csvText);
+              const parsed = parseUkAirFlatFileObservations({
+                dayUtc,
+                siteRef,
+                sourceFile: path.basename(csvPath),
+                csvText,
+                mappings: validFlatFileMappings,
+                propertyMappings: observedPropertyMappings,
+              });
+              appendRowsSafe(flatFileRows, parsed.rows);
+              flatFileSourceRecords += parsed.source_records;
+              flatFileSkippedOtherDays += parsed.skipped_other_days;
+              flatFileSkippedInvalidRows += parsed.skipped_invalid_rows;
+              flatFileSkippedUnselectedPollutantRows +=
+                parsed.skipped_unselected_pollutant_rows;
+              flatFileSelectedSourceRecordsExamined +=
+                parsed.selected_source_records_examined;
+              flatFileSourceLabelClassifications.push(
+                ...parsed.source_label_classifications,
+              );
+              flatFileBlockedTargetDayRows += parsed.blocked_target_day_rows;
+              for (const sample of parsed.blocked_target_day_row_samples) {
+                if (
+                  flatFileBlockedTargetDayRowSamples.length >=
+                    INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
+                ) {
+                  break;
+                }
+                flatFileBlockedTargetDayRowSamples.push(sample);
+              }
+              parsed.units.forEach((unit) => flatFileUnits.add(unit));
             }
-            parsed.units.forEach((unit) => flatFileUnits.add(unit));
           }
           const sourceLabelClassificationSummary = new Map<string, {
             classification: string;
@@ -14916,8 +14904,9 @@ async function runSourceToAll(
           for (const entry of flatFileSourceLabelClassifications) {
             const classification = String(entry.classification || "");
             const normalised = String(entry.normalised_source_label || "");
+            const sourceFile = String(entry.source_file || "");
             const key = classification === "no_authoritative_timeseries_binding"
-              ? `${classification}|${String(entry.site_ref || "")}|${normalised}|${String(entry.pollutant_code || "")}|${Number(entry.header_section_index || 0)}`
+              ? `${classification}|${sourceFile}|${String(entry.site_ref || "")}|${normalised}|${String(entry.pollutant_code || "")}|${Number(entry.header_section_index || 0)}`
               : `${classification}|${normalised}`;
             const summary = sourceLabelClassificationSummary.get(key) || {
               classification,
@@ -14945,6 +14934,7 @@ async function runSourceToAll(
             }
             if (entry.header_section_index !== undefined) {
               const section = {
+                source_file: sourceFile,
                 site_ref: String(entry.site_ref || ""),
                 header_section_index: Number(entry.header_section_index),
                 target_day_non_null_row_count: Number(entry.target_day_non_null_row_count || 0),
@@ -14954,7 +14944,10 @@ async function runSourceToAll(
                 expected_unit: entry.expected_unit || null,
                 expected_normalised_unit: entry.expected_normalised_unit || null,
               };
-              summary.section_unit_evidence.set(`${section.site_ref}|${section.header_section_index}`, section);
+              summary.section_unit_evidence.set(
+                `${section.source_file}|${section.site_ref}|${section.header_section_index}`,
+                section,
+              );
             }
             summary.possible_supported_pollutant_label ||= Boolean(entry.possible_supported_pollutant_label);
             sourceLabelClassificationSummary.set(key, summary);
@@ -15194,6 +15187,13 @@ async function runSourceToAll(
           sourceCheckpointJson.flat_file_mapping_site_refs = Array.from(
             new Set(validFlatFileMappings.map((row) => row.site_ref)),
           ).sort();
+          sourceCheckpointJson.flat_file_source_years = flatFileSourceYears;
+          sourceCheckpointJson.flat_file_source_dates =
+            flatFileSourceYearSelection.source_dates;
+          sourceCheckpointJson.flat_file_source_year_reasons =
+            flatFileSourceYearSelection.reasons_by_year;
+          sourceCheckpointJson.flat_file_previous_year_boundary_days =
+            flatFileSourceYearSelection.previous_year_boundary_days;
           sourceCheckpointJson.candidate_station_ref_count =
             candidateStationRefs.size;
           sourceCheckpointJson.candidate_timeseries_count =
