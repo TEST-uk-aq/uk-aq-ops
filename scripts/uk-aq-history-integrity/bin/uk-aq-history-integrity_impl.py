@@ -8251,10 +8251,41 @@ def _parse_required_timestamp_value(value: Any) -> dt.datetime | None:
     return None
 
 
+def _format_utc_timestamp(value: dt.datetime) -> str:
+    """Format one instant as canonical UTC without discarding sub-milliseconds."""
+    utc_value = value.astimezone(dt.timezone.utc)
+    timespec = (
+        "milliseconds"
+        if utc_value.microsecond % 1000 == 0
+        else "microseconds"
+    )
+    return utc_value.isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def _utc_day_bounds(day_utc: str) -> tuple[dt.datetime, dt.datetime]:
+    day = dt.date.fromisoformat(day_utc)
+    start = dt.datetime.combine(day, dt.time.min, tzinfo=dt.timezone.utc)
+    return start, start + dt.timedelta(days=1)
+
+
+def _timestamp_is_in_utc_day(value: dt.datetime, day_utc: str) -> bool:
+    start, end = _utc_day_bounds(day_utc)
+    utc_value = value.astimezone(dt.timezone.utc)
+    return start <= utc_value < end
+
+
+def _connect_duckdb_utc(duckdb_module: Any) -> Any:
+    """Create an in-memory DuckDB session with timezone-naive UTC semantics."""
+    connection = duckdb_module.connect(database=":memory:")
+    connection.execute("SET TimeZone = 'UTC'", [])
+    return connection
+
+
 def _read_parquet_partition_stats(
     files: Iterable[Path],
     *,
     include_timeseries_min_timestamps: bool = False,
+    day_utc: str | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Read actual local parquet content without trusting manifest metadata."""
     parquet_files = sorted({str(Path(path)) for path in files if Path(path).is_file()})
@@ -8275,7 +8306,7 @@ def _read_parquet_partition_stats(
 
     import duckdb  # type: ignore[import-not-found]
 
-    connection = duckdb.connect(database=":memory:")
+    connection = _connect_duckdb_utc(duckdb)
     try:
         described = connection.execute(
             "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)",
@@ -8332,12 +8363,41 @@ def _read_parquet_partition_stats(
         min_timestamp = None
         max_timestamp = None
         if timestamp_column:
+            timestamp_expression = (
+                f"TRY_CAST({timestamp_column} AS TIMESTAMPTZ)"
+            )
             min_timestamp, max_timestamp = connection.execute(
-                f"SELECT CAST(MIN({timestamp_column}) AS VARCHAR), "
-                f"CAST(MAX({timestamp_column}) AS VARCHAR) "
+                f"SELECT CAST(MIN({timestamp_expression}) AS VARCHAR), "
+                f"CAST(MAX({timestamp_expression}) AS VARCHAR) "
                 "FROM read_parquet(?, union_by_name=true)",
                 [parquet_files],
             ).fetchone()
+            if day_utc is not None:
+                start, end = _utc_day_bounds(day_utc)
+                invalid_count, outside_count = connection.execute(
+                    "SELECT "
+                    f"COUNT(*) FILTER (WHERE {timestamp_column} IS NULL "
+                    f"OR {timestamp_expression} IS NULL), "
+                    "COUNT(*) FILTER (WHERE "
+                    f"{timestamp_expression} IS NOT NULL AND ("
+                    f"{timestamp_expression} < CAST(? AS TIMESTAMPTZ) OR "
+                    f"{timestamp_expression} >= CAST(? AS TIMESTAMPTZ))) "
+                    "FROM read_parquet(?, union_by_name=true)",
+                    [
+                        _format_utc_timestamp(start),
+                        _format_utc_timestamp(end),
+                        parquet_files,
+                    ],
+                ).fetchone()
+                if int(invalid_count or 0) > 0 or int(outside_count or 0) > 0:
+                    return None, (
+                        "timestamp_outside_utc_partition:"
+                        f"day_utc={day_utc} "
+                        f"invalid_count={int(invalid_count or 0)} "
+                        f"outside_count={int(outside_count or 0)} "
+                        f"min={min_timestamp or '(none)'} "
+                        f"max={max_timestamp or '(none)'}"
+                    )
 
         # The v2 AQI writer groups valid source observations by UTC hour.  Keep
         # that identity here so completeness never compares five-minute source
@@ -8347,10 +8407,10 @@ def _read_parquet_partition_stats(
         if timestamp_column and include_timeseries_min_timestamps:
             min_timestamp_rows = connection.execute(
                 "SELECT CAST(timeseries_id AS BIGINT), "
-                f"CAST(MIN(TRY_CAST({timestamp_column} AS TIMESTAMPTZ)) AS VARCHAR) "
+                f"CAST(MIN({timestamp_expression}) AS VARCHAR) "
                 "FROM read_parquet(?, union_by_name=true) "
                 "WHERE timeseries_id IS NOT NULL "
-                f"AND TRY_CAST({timestamp_column} AS TIMESTAMPTZ) IS NOT NULL "
+                f"AND {timestamp_expression} IS NOT NULL "
                 "GROUP BY 1 ORDER BY 1",
                 [parquet_files],
             ).fetchall()
@@ -8369,10 +8429,10 @@ def _read_parquet_partition_stats(
                 )
             hour_rows = connection.execute(
                 "SELECT CAST(timeseries_id AS BIGINT), "
-                f"CAST(FLOOR(epoch(TRY_CAST({timestamp_column} AS TIMESTAMPTZ)) / 3600) AS BIGINT) "
+                f"CAST(FLOOR(epoch({timestamp_expression}) / 3600) AS BIGINT) "
                 "FROM read_parquet(?, union_by_name=true) "
                 "WHERE timeseries_id IS NOT NULL "
-                f"AND TRY_CAST({timestamp_column} AS TIMESTAMPTZ) IS NOT NULL"
+                f"AND {timestamp_expression} IS NOT NULL"
                 f"{valid_value_filter} "
                 "GROUP BY 1, 2 ORDER BY 1, 2",
                 [parquet_files],
@@ -9232,6 +9292,7 @@ def _append_actual_parquet_gaps(
     stats, error = _read_parquet_partition_stats(
         parquet_files,
         include_timeseries_min_timestamps=domain == "observations",
+        day_utc=day_utc,
     )
     if error:
         gap_type = "parquet_reader_unavailable" if error == "duckdb_unavailable" else "parquet_unreadable"
@@ -9748,9 +9809,7 @@ def run_v2_observations_integrity_checks(
             "candidates": [
                 {
                     "timeseries_id": timeseries_id,
-                    "first_observed_at": observed_at.isoformat(
-                        timespec="milliseconds"
-                    ).replace("+00:00", "Z"),
+                    "first_observed_at": _format_utc_timestamp(observed_at),
                 }
                 for timeseries_id, observed_at in sorted(minima.items())
             ],
@@ -12511,7 +12570,10 @@ def _v2_aqi_observation_coverage_gaps(
             ))
             continue
         obs_files = sorted(p for p in obs_dir.glob("*.parquet") if p.is_file())
-        obs_stats, obs_error = _read_parquet_partition_stats(obs_files)
+        obs_stats, obs_error = _read_parquet_partition_stats(
+            obs_files,
+            day_utc=day_utc,
+        )
         if obs_error:
             gaps.append(_v2_aqi_gap(
                 invalid_gap_type,
@@ -12556,7 +12618,10 @@ def _v2_aqi_observation_coverage_gaps(
             continue
 
         aqi_files = sorted(p for p in aqi_manifest_path.parent.glob("*.parquet") if p.is_file())
-        aqi_stats, aqi_error = _read_parquet_partition_stats(aqi_files)
+        aqi_stats, aqi_error = _read_parquet_partition_stats(
+            aqi_files,
+            day_utc=day_utc,
+        )
         if aqi_error:
             gaps.append(_v2_aqi_gap(
                 invalid_gap_type,
@@ -15968,7 +16033,7 @@ def _capture_local_v2_observation_scope(
 
     parquet_rows: list[tuple[Any, ...]] = []
     if parquet_paths:
-        connection = duckdb.connect(database=":memory:")
+        connection = _connect_duckdb_utc(duckdb)
         try:
             result_rows = connection.execute(
                 """
@@ -17138,6 +17203,11 @@ def _first_value_at_candidates_from_evidence(
     conn: sqlite3.Connection,
     repair_entry: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
+    day_utc = str(repair_entry.get("day_utc") or "").strip()
+    try:
+        _utc_day_bounds(day_utc)
+    except ValueError as exc:
+        raise ValueError("canonical source evidence day_utc is invalid") from exc
     persistence = repair_entry.get("immutable_detector_source_evidence_persistence")
     evidence_id = persistence.get("evidence_id") if isinstance(persistence, Mapping) else None
     try:
@@ -17165,13 +17235,17 @@ def _first_value_at_candidates_from_evidence(
         if timeseries_id <= 0 or observed_at is None or observed_at.tzinfo is None:
             raise ValueError("canonical source evidence has an invalid observation identity")
         observed_at = observed_at.astimezone(dt.timezone.utc)
+        if not _timestamp_is_in_utc_day(observed_at, day_utc):
+            raise ValueError(
+                "canonical source evidence timestamp is outside its UTC day"
+            )
         current = earliest.get(timeseries_id)
         if current is None or observed_at < current:
             earliest[timeseries_id] = observed_at
     return [
         {
             "timeseries_id": timeseries_id,
-            "first_observed_at": observed_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "first_observed_at": _format_utc_timestamp(observed_at),
         }
         for timeseries_id, observed_at in sorted(earliest.items())
     ]
@@ -17202,9 +17276,7 @@ def _normalise_first_value_at_candidates(
     return [
         {
             "timeseries_id": timeseries_id,
-            "first_observed_at": observed_at.isoformat(
-                timespec="milliseconds"
-            ).replace("+00:00", "Z"),
+            "first_observed_at": _format_utc_timestamp(observed_at),
         }
         for timeseries_id, observed_at in sorted(earliest.items())
     ]
@@ -17396,6 +17468,25 @@ def run_first_value_at_reconciliation(
                     scope_entry.get("candidates")
                 )
             )
+            candidate_timestamps: list[dt.datetime] = []
+            for candidate in candidates:
+                candidate_timestamp = _parse_required_timestamp_value(
+                    candidate.get("first_observed_at")
+                )
+                if (
+                    candidate_timestamp is None
+                    or not _timestamp_is_in_utc_day(
+                        candidate_timestamp,
+                        day_utc,
+                    )
+                ):
+                    raise ValueError(
+                        "first_value_at candidate is outside its verified "
+                        f"UTC partition day_utc={day_utc}"
+                    )
+                candidate_timestamps.append(
+                    candidate_timestamp.astimezone(dt.timezone.utc)
+                )
             chunks = [
                 candidates[index:index + FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE]
                 for index in range(
@@ -17411,13 +17502,11 @@ def run_first_value_at_reconciliation(
                 scope["obs_aqidb"] = database_summary("skipped_empty")
             else:
                 scope["attempted"] = True
-                scope["earliest_supplied_at"] = min(
-                    str(candidate["first_observed_at"])
-                    for candidate in candidates
+                scope["earliest_supplied_at"] = _format_utc_timestamp(
+                    min(candidate_timestamps)
                 )
-                scope["latest_supplied_at"] = max(
-                    str(candidate["first_observed_at"])
-                    for candidate in candidates
+                scope["latest_supplied_at"] = _format_utc_timestamp(
+                    max(candidate_timestamps)
                 )
                 try:
                     reconcile_database(
@@ -17530,13 +17619,19 @@ def run_first_value_at_reconciliation(
         aggregate[database_kind] = target
 
     supplied = [
-        str(scope[field])
+        timestamp
         for scope in scope_results
         for field in ("earliest_supplied_at", "latest_supplied_at")
-        if scope.get(field)
+        if (
+            timestamp := _parse_required_timestamp_value(scope.get(field))
+        ) is not None
     ]
-    aggregate["earliest_supplied_at"] = min(supplied) if supplied else None
-    aggregate["latest_supplied_at"] = max(supplied) if supplied else None
+    aggregate["earliest_supplied_at"] = (
+        _format_utc_timestamp(min(supplied)) if supplied else None
+    )
+    aggregate["latest_supplied_at"] = (
+        _format_utc_timestamp(max(supplied)) if supplied else None
+    )
     aggregate["attempted"] = any(
         bool(scope["attempted"]) for scope in scope_results
     )
