@@ -247,6 +247,7 @@ function logicalSummary(summary: Record<string, unknown>): unknown {
 async function publishOutputs(args: {
   settings: RuntimeSettings;
   publicationDay: string;
+  usableDailyPublicationDays: string[];
   summaryRefresh: SummaryRefreshRpcRow;
   homepageSummary: Record<string, unknown>;
 }): Promise<PublishSummary> {
@@ -268,7 +269,7 @@ async function publishOutputs(args: {
       {
         p_as_of_day_utc: args.publicationDay,
         p_start_day_utc: settings.config.startDayUtc,
-        p_end_day_utc: settings.config.endDayUtc,
+        p_end_day_utc: args.publicationDay,
         p_connector_id: settings.config.connectorId,
         p_source_network_code: settings.config.sourceNetworkCode,
         p_pollutant_codes: settings.config.pollutantCodes,
@@ -277,7 +278,23 @@ async function publishOutputs(args: {
     if (response.error) {
       throw new Error(`parquet row RPC failed: ${response.error.message}`);
     }
+    const usableDailyPublicationDays = new Set(
+      args.usableDailyPublicationDays,
+    );
     for (const batch of parseRows<Who2021ParquetBatch>(response.data)) {
+      if (batch.dataset === "daily_status") {
+        const dayUtc = batch.object_key.match(
+          /\/daily_status\/day_utc=(\d{4}-\d{2}-\d{2})\//,
+        )?.[1];
+        if (!dayUtc) {
+          throw new Error(
+            `daily parquet batch has an invalid object key: ${
+              batch.object_key.slice(0, 300)
+            }`,
+          );
+        }
+        if (!usableDailyPublicationDays.has(dayUtc)) continue;
+      }
       const bytes = rowsToWho2021ParquetBytes(batch);
       const logicalHash = await sha256Hex(stableJson({
         dataset: batch.dataset,
@@ -388,12 +405,31 @@ type DailySourceMode = "obs_aqidb" | "r2_v2" | "unavailable";
 type DailySourceResult = {
   day_utc: string;
   source: DailySourceMode;
+  calculation_status: "usable" | "unusable" | "failed";
   valid_timeseries_days: number;
   not_enough_data_timeseries_days: number;
   rows_upserted: number;
   prepared_daily_row_count: number;
+  reasons: string[];
   error: string | null;
 };
+
+export function selectNewestUsablePublicationDay(
+  results: Array<
+    Pick<
+      DailySourceResult,
+      "day_utc" | "source" | "valid_timeseries_days"
+    >
+  >,
+): string | null {
+  return [...results]
+    .filter((result) =>
+      result.source !== "unavailable" &&
+      Number(result.valid_timeseries_days) > 0
+    )
+    .sort((left, right) => right.day_utc.localeCompare(left.day_utc))[0]
+    ?.day_utc || null;
+}
 
 type R2RunEvidence = {
   manifestKeys: Set<string>;
@@ -550,6 +586,7 @@ export async function runWho2021Daily(): Promise<void> {
   let failedDay: string | null = null;
   let r2ValidationFailed = false;
   let publicationDay: string | null = null;
+  let publicationDecisionReason: string | null = null;
   let latestCompleteDay: string | null = null;
   let correctionDay: string | null = null;
   let dailySummary = mergeDailyRefreshRows([]);
@@ -591,11 +628,17 @@ export async function runWho2021Daily(): Promise<void> {
           dailySources.push({
             day_utc: dayUtc,
             source: "r2_v2",
+            calculation_status: result.rpc.valid_timeseries_days > 0
+              ? "usable"
+              : "unusable",
             valid_timeseries_days: result.rpc.valid_timeseries_days,
             not_enough_data_timeseries_days:
               result.rpc.not_enough_data_timeseries_days,
             rows_upserted: result.rpc.rows_upserted,
             prepared_daily_row_count: result.prepared.preparedRows.length,
+            reasons: result.rpc.valid_timeseries_days > 0
+              ? ["r2_backfill_used"]
+              : ["r2_backfill_zero_valid_days"],
             error: null,
           });
         } catch (error) {
@@ -615,17 +658,28 @@ export async function runWho2021Daily(): Promise<void> {
           dailySources.push({
             day_utc: dayUtc,
             source: "unavailable",
+            calculation_status: "failed",
             valid_timeseries_days: 0,
             not_enough_data_timeseries_days: 0,
             rows_upserted: 0,
             prepared_daily_row_count: 0,
+            reasons: ["r2_backfill_failed"],
             error: String(error instanceof Error ? error.message : error)
               .slice(0, 500),
           });
           throw error;
         }
       }
-      publicationDay = config.endDayUtc;
+      publicationDay = selectNewestUsablePublicationDay(dailySources);
+      if (!publicationDay) {
+        publicationDecisionReason = "no_usable_backfill_publication_day";
+        warnings.push(
+          "Backfill completed without a usable publication day; publication-dependent summaries and R2 outputs were skipped.",
+        );
+      } else if (publicationDay !== config.endDayUtc) {
+        publicationDecisionReason =
+          "backfill_end_day_unusable_selected_newest_usable_day";
+      }
     } else if (config.runMode === "daily") {
       for (
         const dayUtc of listDaysInclusive(
@@ -634,6 +688,7 @@ export async function runWho2021Daily(): Promise<void> {
         )
       ) {
         let readinessReady = false;
+        const sourceReasons: string[] = [];
         try {
           const dayReadiness = shouldRunReadinessGate(config)
             ? await readinessForDay(settings, dayUtc)
@@ -647,6 +702,7 @@ export async function runWho2021Daily(): Promise<void> {
             };
           readinessByDay[dayUtc] = dayReadiness;
           readinessReady = dayReadiness.ready;
+          if (!readinessReady) sourceReasons.push("database_not_ready");
           if (dayReadiness.already_completed) {
             warnings.push(
               `A prior successful run covered ${dayUtc}; recalculation continued as required.`,
@@ -661,25 +717,35 @@ export async function runWho2021Daily(): Promise<void> {
           warnings.push(
             `Obs AQI DB readiness was unavailable for ${dayUtc}; exact-day R2 fallback was attempted.`,
           );
+          sourceReasons.push("database_readiness_failed");
         }
 
         if (readinessReady) {
           try {
             const row = await refreshObsDay(settings, dayUtc);
-            dailyRows.push(row);
-            completedDays.push(dayUtc);
-            dailySources.push({
-              day_utc: dayUtc,
-              source: "obs_aqidb",
-              valid_timeseries_days: row.valid_timeseries_days,
-              not_enough_data_timeseries_days:
-                row.not_enough_data_timeseries_days,
-              rows_upserted: row.rows_upserted,
-              prepared_daily_row_count: 0,
-              error: null,
-            });
-            continue;
+            if (row.valid_timeseries_days > 0) {
+              dailyRows.push(row);
+              completedDays.push(dayUtc);
+              dailySources.push({
+                day_utc: dayUtc,
+                source: "obs_aqidb",
+                calculation_status: "usable",
+                valid_timeseries_days: row.valid_timeseries_days,
+                not_enough_data_timeseries_days:
+                  row.not_enough_data_timeseries_days,
+                rows_upserted: row.rows_upserted,
+                prepared_daily_row_count: 0,
+                reasons: ["database_used"],
+                error: null,
+              });
+              continue;
+            }
+            sourceReasons.push("database_ready_but_zero_valid_days");
+            warnings.push(
+              `Obs AQI DB refresh returned zero valid timeseries days for ${dayUtc}; exact-day R2 fallback was attempted.`,
+            );
           } catch (error) {
+            sourceReasons.push("database_refresh_failed");
             warnings.push(
               `Obs AQI DB refresh failed for ${dayUtc}; exact-day R2 fallback was attempted: ${
                 String(error instanceof Error ? error.message : error).slice(
@@ -693,23 +759,46 @@ export async function runWho2021Daily(): Promise<void> {
 
         try {
           const result = await refreshR2Day(settings, dayUtc);
-          dailyRows.push(result.rpc);
           accumulateR2Evidence(
             r2Evidence,
             result.prepared.metrics,
             result.prepared.preparedRows.length,
           );
-          completedDays.push(dayUtc);
-          dailySources.push({
-            day_utc: dayUtc,
-            source: "r2_v2",
-            valid_timeseries_days: result.rpc.valid_timeseries_days,
-            not_enough_data_timeseries_days:
-              result.rpc.not_enough_data_timeseries_days,
-            rows_upserted: result.rpc.rows_upserted,
-            prepared_daily_row_count: result.prepared.preparedRows.length,
-            error: null,
-          });
+          if (result.rpc.valid_timeseries_days > 0) {
+            dailyRows.push(result.rpc);
+            completedDays.push(dayUtc);
+            dailySources.push({
+              day_utc: dayUtc,
+              source: "r2_v2",
+              calculation_status: "usable",
+              valid_timeseries_days: result.rpc.valid_timeseries_days,
+              not_enough_data_timeseries_days:
+                result.rpc.not_enough_data_timeseries_days,
+              rows_upserted: result.rpc.rows_upserted,
+              prepared_daily_row_count: result.prepared.preparedRows.length,
+              reasons: [...sourceReasons, "r2_fallback_used"],
+              error: null,
+            });
+          } else {
+            dailySources.push({
+              day_utc: dayUtc,
+              source: "unavailable",
+              calculation_status: "unusable",
+              valid_timeseries_days: 0,
+              not_enough_data_timeseries_days:
+                result.rpc.not_enough_data_timeseries_days,
+              rows_upserted: result.rpc.rows_upserted,
+              prepared_daily_row_count: result.prepared.preparedRows.length,
+              reasons: [
+                ...sourceReasons,
+                "r2_fallback_zero_valid_days",
+              ],
+              error: null,
+            });
+            warnings.push(
+              `R2 fallback returned zero valid timeseries days for ${dayUtc}; the calculated day is unusable and was not selected for publication.`,
+            );
+          }
         } catch (error) {
           if (error instanceof R2PreparedRpcError) {
             accumulateR2Evidence(
@@ -729,22 +818,25 @@ export async function runWho2021Daily(): Promise<void> {
           dailySources.push({
             day_utc: dayUtc,
             source: "unavailable",
+            calculation_status: sourceReasons.includes(
+                "database_ready_but_zero_valid_days",
+              )
+              ? "unusable"
+              : "failed",
             valid_timeseries_days: 0,
             not_enough_data_timeseries_days: 0,
             rows_upserted: 0,
             prepared_daily_row_count: 0,
+            reasons: [...sourceReasons, "r2_fallback_failed"],
             error: message,
           });
           warnings.push(`No usable source for ${dayUtc}: ${message}`);
         }
       }
-      publicationDay = [...dailySources]
-        .filter((result) =>
-          result.source !== "unavailable" &&
-          result.valid_timeseries_days > 0
-        )
-        .sort((left, right) => right.day_utc.localeCompare(left.day_utc))[0]
-        ?.day_utc || null;
+      publicationDay = selectNewestUsablePublicationDay(dailySources);
+      if (!publicationDay) {
+        publicationDecisionReason = "no_usable_daily_publication_day";
+      }
     } else {
       for (
         const chunk of buildDayChunks(
@@ -768,11 +860,15 @@ export async function runWho2021Daily(): Promise<void> {
           dailySources.push({
             day_utc: row.end_day_utc,
             source: "obs_aqidb",
+            calculation_status: Number(row.valid_timeseries_days) > 0
+              ? "usable"
+              : "unusable",
             valid_timeseries_days: Number(row.valid_timeseries_days) || 0,
             not_enough_data_timeseries_days:
               Number(row.not_enough_data_timeseries_days) || 0,
             rows_upserted: Number(row.rows_upserted) || 0,
             prepared_daily_row_count: 0,
+            reasons: ["database_used"],
             error: null,
           });
         }
@@ -813,12 +909,21 @@ export async function runWho2021Daily(): Promise<void> {
       publishSummary = await publishOutputs({
         settings,
         publicationDay,
+        usableDailyPublicationDays: dailySources
+          .filter((result) =>
+            result.source !== "unavailable" &&
+            result.valid_timeseries_days > 0
+          )
+          .map((result) => result.day_utc),
         summaryRefresh,
         homepageSummary,
       });
     }
 
-    if (config.runMode === "daily" && !publicationDay) {
+    if (
+      (config.runMode === "daily" || config.runMode === "backfill") &&
+      !publicationDay
+    ) {
       outcome = "deferred";
     } else if (config.dryRun) {
       outcome = "unchanged";
@@ -843,6 +948,13 @@ export async function runWho2021Daily(): Promise<void> {
     phase_3_completed: Boolean(summaryRefresh),
     operational_outcome: outcome,
     publication_as_of_day_utc: publicationDay,
+    publication_decision_reason: publicationDecisionReason,
+    publication_eligible_days: dailySources
+      .filter((result) =>
+        result.source !== "unavailable" &&
+        result.valid_timeseries_days > 0
+      )
+      .map((result) => result.day_utc),
     correction_day_utc: correctionDay,
     readiness: readinessByDay,
     source_mode: settings?.config.runMode === "backfill"
@@ -922,6 +1034,13 @@ export async function runWho2021Daily(): Promise<void> {
     latest_complete_day_utc: latestCompleteDay,
     correction_day_utc: correctionDay,
     publication_as_of_day_utc: publicationDay,
+    publication_decision_reason: publicationDecisionReason,
+    publication_eligible_days: dailySources
+      .filter((result) =>
+        result.source !== "unavailable" &&
+        result.valid_timeseries_days > 0
+      )
+      .map((result) => result.day_utc),
     requested_start_day_utc: settings?.config.startDayUtc || null,
     requested_end_day_utc: settings?.config.endDayUtc || null,
     completed_days: completedDays,
