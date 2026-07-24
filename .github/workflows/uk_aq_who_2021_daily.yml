@@ -107,7 +107,7 @@ jobs:
         uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
         with:
           deno-version: v2.7.13
-		  
+
       - name: Install Deno dependencies
         run: deno install --frozen
 
