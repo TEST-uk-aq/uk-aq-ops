@@ -481,6 +481,170 @@ class SosFlatFileTests(unittest.TestCase):
         self.assertEqual(stats["rows"], 5)
         self.assertEqual(stats["pollutants"], ["no2", "o3", "pm10"])
 
+    def test_no2_and_nox_as_no2_headings_remain_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "NOX_2026.csv"
+            csv_path.write_text(
+                "\n".join([
+                    'Date,time,"Nitrogen dioxide",status,unit,'
+                    '"Nitrogen oxides as nitrogen dioxide",status,unit',
+                    "15-07-2026,01:00,20,R,ugm-3,30,R,ugm-3",
+                    "15-07-2026,02:00,21,R,ugm-3,31,R,ugm-3",
+                ]),
+                encoding="utf-8",
+            )
+            decisions = {
+                "nitrogen dioxide": "no2",
+                "nitrogen oxides as nitrogen dioxide": None,
+            }
+            counts, stats = MODULE._uk_air_flat_file_parse_day_pollutant_counts(
+                csv_path,
+                target_pollutants=("no2",),
+                source_label_decisions=decisions,
+            )
+        self.assertEqual(counts, {("2026-07-15", "no2"): 2})
+        self.assertEqual(stats["rows"], 2)
+        self.assertEqual(
+            MODULE._uk_air_normalize_pollutant_code("Nitrogen dioxide"),
+            "no2",
+        )
+        for label in (
+            "Nitric oxide",
+            "Nitrogen monoxide",
+            "Nitrogen oxides",
+            "Nitrogen oxides as nitrogen dioxide",
+            "NO",
+            "NOx",
+            "NOx as NO2",
+        ):
+            with self.subTest(label=label):
+                self.assertIsNone(
+                    MODULE._uk_air_normalize_pollutant_code(label)
+                )
+
+    def test_reviewed_unsafe_nox_registry_decision_is_reported_not_overwritten(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conn = MODULE.open_db(str(root / "registry.sqlite"))
+            cache_root = root / "cache"
+            csv_path = cache_root / "site_ref=TEST" / "year=2026" / "TEST_2026.csv"
+            csv_path.parent.mkdir(parents=True)
+            csv_path.write_text(
+                'Date,time,"Nitrogen oxides as nitrogen dioxide",status,unit\n'
+                "15-07-2026,01:00,30,R,ugm-3\n",
+                encoding="utf-8",
+            )
+            conn.execute(
+                """
+                INSERT INTO uk_air_csv_source_labels (
+                  connector_id, source_label, normalised_source_label,
+                  status, pollutant_code, first_seen_at_utc,
+                  last_seen_at_utc, reviewed_at_utc, review_notes
+                ) VALUES (1, ?, ?, 'mapped', 'no2', ?, ?, ?, ?)
+                """,
+                (
+                    "Nitrogen oxides as nitrogen dioxide",
+                    "nitrogen oxides as nitrogen dioxide",
+                    "2026-07-24T00:00:00Z",
+                    "2026-07-24T00:00:00Z",
+                    "2026-07-24T01:00:00Z",
+                    "operator decision fixture",
+                ),
+            )
+            MODULE.refresh_uk_air_source_label_registry(
+                conn=conn,
+                cache_root=cache_root,
+                connector_id=1,
+            )
+            row = conn.execute(
+                """
+                SELECT status, pollutant_code, reviewed_at_utc
+                FROM uk_air_csv_source_labels
+                WHERE connector_id = 1
+                  AND normalised_source_label =
+                      'nitrogen oxides as nitrogen dioxide'
+                """
+            ).fetchone()
+            decisions, conflicts = MODULE._load_uk_air_source_label_decisions(
+                conn,
+                connector_id=1,
+            )
+            conn.close()
+        self.assertEqual(
+            tuple(row),
+            ("mapped", "no2", "2026-07-24T01:00:00Z"),
+        )
+        self.assertIsNone(
+            decisions["nitrogen oxides as nitrogen dioxide"]
+        )
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(
+            conflicts[0]["issue"],
+            "non_no2_nitrogen_oxide_mapped_to_no2",
+        )
+
+    def test_unreviewed_automatic_nox_mapping_is_reseeded_to_ignore(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conn = MODULE.open_db(str(root / "registry.sqlite"))
+            cache_root = root / "cache"
+            csv_path = cache_root / "site_ref=TEST" / "year=2026" / "TEST_2026.csv"
+            csv_path.parent.mkdir(parents=True)
+            csv_path.write_text(
+                'Date,time,"Nitrogen oxides as nitrogen dioxide",status,unit\n'
+                "15-07-2026,01:00,30,R,ugm-3\n",
+                encoding="utf-8",
+            )
+            conn.execute(
+                """
+                INSERT INTO core_observed_property_mappings_snapshot (
+                  id, connector_id, source_label, mapping_kind,
+                  is_aqi_eligible, is_active
+                ) VALUES (1, 1, ?, 'ignored', 0, 1)
+                """,
+                ("Nitrogen oxides as nitrogen dioxide",),
+            )
+            conn.execute(
+                """
+                INSERT INTO uk_air_csv_source_labels (
+                  connector_id, source_label, normalised_source_label,
+                  status, pollutant_code, first_seen_at_utc,
+                  last_seen_at_utc
+                ) VALUES (1, ?, ?, 'mapped', 'no2', ?, ?)
+                """,
+                (
+                    "Nitrogen oxides as nitrogen dioxide",
+                    "nitrogen oxides as nitrogen dioxide",
+                    "2026-07-24T00:00:00Z",
+                    "2026-07-24T00:00:00Z",
+                ),
+            )
+            inventory = MODULE.refresh_uk_air_source_label_registry(
+                conn=conn,
+                cache_root=cache_root,
+                connector_id=1,
+            )
+            row = conn.execute(
+                """
+                SELECT status, pollutant_code, reviewed_at_utc
+                FROM uk_air_csv_source_labels
+                WHERE connector_id = 1
+                  AND normalised_source_label =
+                      'nitrogen oxides as nitrogen dioxide'
+                """
+            ).fetchone()
+            conn.close()
+        self.assertEqual(tuple(row), ("ignore", None, None))
+        self.assertEqual(
+            inventory["reclassified_unreviewed_labels"],
+            ["nitrogen oxides as nitrogen dioxide"],
+        )
+
     def test_mapping_resolution_respects_validity_window(self) -> None:
         rows = [
             {
