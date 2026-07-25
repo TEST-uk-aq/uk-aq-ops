@@ -11,11 +11,6 @@ import {
 } from "./lib/uk_aq_parquet_dependencies.mjs";
 import { sha256Hex } from "../../workers/shared/r2_sigv4.mjs";
 import {
-  computeObservationContentHash,
-  normalizeCanonicalObservationRow,
-  resolveLegacyVerificationStatus,
-} from "../../workers/shared/uk_aq_observation_content_hash.mjs";
-import {
   buildHistoryV2PollutantManifest,
   buildHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest,
@@ -626,82 +621,6 @@ async function parquetFileEntry({ store, key, domain, pollutantCode }) {
   };
 }
 
-async function observationContentHashForPartKeys({
-  store,
-  partKeys,
-  connectorId,
-}) {
-  const canonicalRows = [];
-  const sosConnectorId = Number.parseInt(
-    process.env.UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK || "1",
-    10,
-  );
-  for (const key of partKeys) {
-    const object = await store.getObject(key);
-    const file = new Uint8Array(object.body).slice().buffer;
-    const metadata = await parquetMetadataAsync(file);
-    const rowCount = Math.max(0, Number(metadata.num_rows || 0));
-    const schemaColumns = new Set(
-      parquetSchema(metadata).children.map((column) =>
-        String(column.element.name)
-      ),
-    );
-    const required = [
-      "connector_id",
-      "station_id",
-      "timeseries_id",
-      "pollutant_code",
-      "observed_at_utc",
-      "value",
-    ];
-    const missing = required.filter((column) => !schemaColumns.has(column));
-    if (missing.length > 0) {
-      throw new Error(
-        `parquet_canonical_columns_missing:${missing.join("|")}`,
-      );
-    }
-    const statusColumn = schemaColumns.has("verification_status")
-      ? "verification_status"
-      : schemaColumns.has("status")
-      ? "status"
-      : null;
-    const columns = [...required, ...(statusColumn ? [statusColumn] : [])];
-    let rows = [];
-    await parquetRead({
-      file,
-      metadata,
-      columns,
-      rowStart: 0,
-      rowEnd: rowCount,
-      compressors,
-      onComplete: (value) => {
-        rows = Array.isArray(value) ? value : [];
-      },
-    });
-    for (const values of rows) {
-      const statusRow = statusColumn
-        ? { [statusColumn]: values[required.length] ?? null }
-        : {};
-      canonicalRows.push(normalizeCanonicalObservationRow({
-        connector_id: values[0],
-        station_id: values[1] ?? null,
-        timeseries_id: values[2],
-        pollutant_code: values[3],
-        observed_at_utc: parquetIso(values[4]),
-        value: values[5],
-        verification_status: resolveLegacyVerificationStatus(statusRow, {
-          isSos: Number(connectorId) === sosConnectorId,
-        }),
-      }));
-    }
-  }
-  const {
-    canonical_rows: _canonicalRows,
-    ...metadata
-  } = computeObservationContentHash(canonicalRows);
-  return metadata;
-}
-
 function canonicalManifestMetadata(payload, {
   manifestKey,
   domain,
@@ -821,20 +740,7 @@ export async function leafManifestSourceFromCombined({ store, dataPrefix, base, 
     for (const key of partKeys) {
       files.push(await parquetFileEntry({ store, key, domain, pollutantCode }));
     }
-    const observationContentHash = domain === "observations"
-      ? await observationContentHashForPartKeys({
-        store,
-        partKeys,
-        connectorId,
-      })
-      : null;
-    return {
-      manifestKey,
-      payload: metadata.payload,
-      provenance: metadata.provenance,
-      files,
-      observationContentHash,
-    };
+    return { manifestKey, payload: metadata.payload, provenance: metadata.provenance, files };
   } catch (error) {
     return { blocked_reason: `canonical_parquet_metadata_unreadable:${error instanceof Error ? error.message : String(error)}` };
   }
@@ -1298,13 +1204,7 @@ export async function runV2ObservationsRepair({
           blockedConnectorScopes.add(`${dayUtc}|${scope.connectorId}`);
           continue;
         }
-        const {
-          manifestKey,
-          payload,
-          provenance,
-          files,
-          observationContentHash,
-        } = source;
+        const { manifestKey, payload, provenance, files } = source;
         const rebuilt = buildHistoryV2PollutantManifest({
           domain,
           grain: domain === "aqilevels" ? "hourly" : null,
@@ -1318,7 +1218,6 @@ export async function runV2ObservationsRepair({
           fileEntries: files,
           writerGitSha: payload.writer_git_sha || null,
           backedUpAtUtc: payload.backed_up_at_utc || `${dayUtc}T00:00:00.000Z`,
-          observationContentHash,
         });
         await staged.stage({
           key: manifestKey,

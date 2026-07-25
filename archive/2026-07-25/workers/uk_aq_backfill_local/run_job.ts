@@ -68,12 +68,6 @@ import {
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
 import {
-  computeObservationContentHash,
-  normalizeCanonicalObservationRow,
-  normalizeUkAirVerificationStatus,
-  resolveLegacyVerificationStatus,
-} from "../shared/uk_aq_observation_content_hash.mjs";
-import {
   reconcileIntegritySourceAdapterBlockedRows,
 } from "./source_integrity/blocked_rows.ts";
 type RunMode =
@@ -267,7 +261,6 @@ type ObsHistoryRow = {
   observed_at: string;
   value: number | null;
   status?: string | null;
-  verification_status?: "P" | "R" | null;
 };
 
 type ObsHistoryParquetRow = {
@@ -278,14 +271,9 @@ type ObsHistoryParquetRow = {
   status: string | null;
 };
 
-type ObsHistoryV2ParquetRow = {
-  connector_id: number;
+type ObsHistoryV2ParquetRow = ObsHistoryParquetRow & {
   station_id: number | null;
-  timeseries_id: number;
   pollutant_code: string;
-  observed_at: string;
-  value: number;
-  verification_status: "P" | "R" | null;
 };
 
 type AqilevelsHistoryRow = {
@@ -740,7 +728,7 @@ const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 = Object.freeze([
   "pollutant_code",
   "observed_at_utc",
   "value",
-  "verification_status",
+  "status",
 ]);
 const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels_hourly";
 const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
@@ -824,9 +812,7 @@ const HISTORY_R2_V2_OBSERVATIONS_PREFIX = "history/v2/observations";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug";
 const HISTORY_R2_V2_SCHEMA_VERSION = 2;
-const HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION = 3;
 const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
-const HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION = "parquet-wasm-zstd-v3";
 
 const CANONICAL_R2_HISTORY_VERSION_ENV = "UK_AQ_R2_HISTORY_VERSION";
 const DEPRECATED_R2_HISTORY_VERSION_ENVS = [
@@ -3047,7 +3033,7 @@ function statsFromFileEntries(
 }
 
 function summarizeObservationPartRows(
-  rows: Array<ObsHistoryParquetRow | ObsHistoryV2ParquetRow>,
+  rows: ObsHistoryParquetRow[],
 ): {
   min_timeseries_id: number | null;
   max_timeseries_id: number | null;
@@ -3310,7 +3296,6 @@ function createObservationV2PollutantManifest(args: {
   fileEntries: ObsHistoryFileEntry[];
   writerGitSha: string | null;
   backedUpAtUtc: string;
-  observationContentHash: Record<string, unknown>;
 }) {
   const files = args.fileEntries.map((entry) => ({
     ...entry,
@@ -3318,8 +3303,8 @@ function createObservationV2PollutantManifest(args: {
   }));
   const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
   return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION,
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
     history_version: "v2",
     manifest_kind: "pollutant",
     domain: "observations",
@@ -3341,10 +3326,9 @@ function createObservationV2PollutantManifest(args: {
     files,
     child_manifests: [],
     columns: HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
-    writer_version: HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
     writer_git_sha: args.writerGitSha,
     ...statsFromFileEntries(files, args.sourceRowCount),
-    ...args.observationContentHash,
     backed_up_at_utc: args.backedUpAtUtc,
   });
 }
@@ -3380,8 +3364,8 @@ function createObservationV2ConnectorManifest(args: {
     max_observed_at_utc: manifest.max_observed_at_utc ?? null,
   }));
   return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION,
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
     history_version: "v2",
     manifest_kind: "connector",
     domain: "observations",
@@ -3404,7 +3388,7 @@ function createObservationV2ConnectorManifest(args: {
     child_manifests: childManifests,
     pollutant_manifests: childManifests,
     columns: HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
-    writer_version: HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
     writer_git_sha: args.writerGitSha,
     ...statsFromFileEntries(files, totalRows),
     backed_up_at_utc: args.backedUpAtUtc,
@@ -4039,16 +4023,11 @@ function rowsToObservationV2ParquetBuffer(rows: ObsHistoryV2ParquetRow[]): Uint8
     pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
     observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at))),
     value: rows.map((row) => row.value === null || row.value === undefined ? null : Number(row.value)),
-    verification_status: textVector(
-      rows.map((row) => row.verification_status ?? null),
-    ),
+    status: textVector(rows.map((row) => row.status ?? null)),
   });
   return writeArrowTableToParquet(
     table,
-    parquetWriterProperties(
-      OBS_R2_ROW_GROUP_SIZE,
-      HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
-    ),
+    parquetWriterProperties(OBS_R2_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
   );
 }
 
@@ -5203,28 +5182,8 @@ async function exportObsConnectorRowsToR2V2(args: {
   let objectsWritten = 0;
 
   for (const [pollutantCode, pollutantRows] of Array.from(pollutantGroups.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-    const canonicalHashResult = computeObservationContentHash(
-      pollutantRows.map((row) => normalizeCanonicalObservationRow({
-        connector_id: args.connector_id,
-        station_id: row.station_id ?? null,
-        timeseries_id: row.timeseries_id,
-        pollutant_code: pollutantCode,
-        observed_at_utc: new Date(row.observed_at).toISOString(),
-        value: row.value,
-        verification_status: args.connector_id === SOS_CONNECTOR_ID_FALLBACK
-          ? normalizeUkAirVerificationStatus(
-            row.verification_status ?? row.status ?? null,
-          )
-          : null,
-      })),
-    );
-    const {
-      canonical_rows: canonicalPollutantRows,
-      ...observationContentHash
-    } = canonicalHashResult;
     const fileEntries: ObsHistoryFileEntry[] = [];
-    const liveParquetBodies: Uint8Array[] = [];
-    const rowChunks = chunkRows(canonicalPollutantRows, OBS_R2_PART_MAX_ROWS);
+    const rowChunks = chunkRows(pollutantRows, OBS_R2_PART_MAX_ROWS);
     for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
       const chunk = rowChunks[partIndex];
       if (!chunk.length) continue;
@@ -5233,9 +5192,9 @@ async function exportObsConnectorRowsToR2V2(args: {
         station_id: row.station_id ?? null,
         timeseries_id: row.timeseries_id,
         pollutant_code: pollutantCode,
-        observed_at: row.observed_at_utc,
+        observed_at: row.observed_at,
         value: row.value,
-        verification_status: row.verification_status,
+        status: row.status ?? null,
       }));
       const partSummary = summarizeObservationPartRows(parquetRows);
       const partKey = buildHistoryV2PartKey(
@@ -5261,7 +5220,6 @@ async function exportObsConnectorRowsToR2V2(args: {
         }
         verifiedBytes = actual.bytes;
         verifiedEtag = actual.etag || putResult.etag;
-        liveParquetBodies.push(actual.body);
       }
       fileEntries.push({
         key: partKey,
@@ -5276,28 +5234,6 @@ async function exportObsConnectorRowsToR2V2(args: {
         timeseries_row_counts: partSummary.timeseries_row_counts,
       });
       objectsWritten += 1;
-    }
-    if (!INTEGRITY_PROPOSAL_MODE) {
-      const liveCanonicalRows = (
-        await Promise.all(
-          liveParquetBodies.map((body) =>
-            readCanonicalObservationRowsFromParquet(body, {
-              isSos: args.connector_id === SOS_CONNECTOR_ID_FALLBACK,
-            })
-          ),
-        )
-      ).flat();
-      const liveHashResult = computeObservationContentHash(liveCanonicalRows);
-      if (
-        liveHashResult.observation_content_hash !==
-          observationContentHash.observation_content_hash ||
-        JSON.stringify(liveHashResult.verification_status_counts) !==
-          JSON.stringify(observationContentHash.verification_status_counts)
-      ) {
-        throw new Error(
-          `v2 observation live Parquet content verification failed: day=${args.day_utc} connector=${args.connector_id} pollutant=${pollutantCode}`,
-        );
-      }
     }
     const manifestKey = buildHistoryV2PollutantManifestKey(
       OBS_R2_HISTORY_PREFIX_V2,
@@ -5315,7 +5251,6 @@ async function exportObsConnectorRowsToR2V2(args: {
       fileEntries,
       writerGitSha: OBS_R2_WRITER_GIT_SHA,
       backedUpAtUtc: nowIso(),
-      observationContentHash,
     });
     await publishOrStageHistoryObject({
       key: manifestKey,
@@ -9410,7 +9345,7 @@ function canonicalRegistryJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-const SOURCE_EVIDENCE_CONTRACT_VERSION = 3;
+const SOURCE_EVIDENCE_CONTRACT_VERSION = 2;
 
 function deterministicSemanticHash(value: unknown): string {
   return sha256Hex(canonicalRegistryJson(value));
@@ -10705,75 +10640,6 @@ async function readParquetColumnValues(
     },
   });
   return rows.map((entry) => Array.isArray(entry) ? entry[0] : undefined);
-}
-
-async function readCanonicalObservationRowsFromParquet(
-  bytes: Uint8Array,
-  { isSos }: { isSos: boolean },
-): Promise<Array<ReturnType<typeof normalizeCanonicalObservationRow>>> {
-  const file = toArrayBufferView(bytes);
-  const metadata = await parquetMetadataAsync(file);
-  const schemaColumns = parquetSchema(metadata).children.map((column) =>
-    column.element.name
-  );
-  const required = [
-    "connector_id",
-    "station_id",
-    "timeseries_id",
-    "pollutant_code",
-    "observed_at_utc",
-    "value",
-  ];
-  const missing = required.filter((column) => !schemaColumns.includes(column));
-  if (missing.length > 0) {
-    throw new Error(
-      `Observation Parquet is missing canonical columns: ${missing.join(",")}`,
-    );
-  }
-  const rowCount = Number(metadata.num_rows || 0);
-  const columnNames = [
-    ...required,
-    ...(schemaColumns.includes("verification_status")
-      ? ["verification_status"]
-      : schemaColumns.includes("status")
-      ? ["status"]
-      : []),
-  ];
-  const values = await Promise.all(
-    columnNames.map((column) =>
-      readParquetColumnValues(file, metadata, column, 0, rowCount)
-    ),
-  );
-  const byName = new Map(
-    columnNames.map((column, index) => [column, values[index]]),
-  );
-  const rows: Array<ReturnType<typeof normalizeCanonicalObservationRow>> = [];
-  for (let index = 0; index < rowCount; index += 1) {
-    const observedAtUtc = parseHistoryIsoTimestamp(
-      byName.get("observed_at_utc")?.[index],
-    );
-    const statusRow = schemaColumns.includes("verification_status")
-      ? {
-        verification_status:
-          byName.get("verification_status")?.[index] ?? null,
-      }
-      : schemaColumns.includes("status")
-      ? { status: byName.get("status")?.[index] ?? null }
-      : {};
-    rows.push(normalizeCanonicalObservationRow({
-      connector_id: byName.get("connector_id")?.[index],
-      station_id: byName.get("station_id")?.[index] ?? null,
-      timeseries_id: byName.get("timeseries_id")?.[index],
-      pollutant_code: byName.get("pollutant_code")?.[index],
-      observed_at_utc: observedAtUtc,
-      value: byName.get("value")?.[index],
-      verification_status: resolveLegacyVerificationStatus(
-        statusRow,
-        { isSos },
-      ),
-    }));
-  }
-  return rows;
 }
 
 function sortedTimeseriesIdsFromLookup(lookup: SourceConnectorLookup): number[] {
@@ -15411,45 +15277,6 @@ async function runSourceToAll(
         let obsHistoryRows = sourceObservationsToObsHistoryRows(
           canonicalObservationRows,
         );
-        const observationContentHashes: Record<string, Record<string, unknown>> =
-          {};
-        if (INTEGRITY_COMPLETE_CONNECTOR_DAY && obsHistoryRows.length > 0) {
-          const canonicalRowsForEvidence: ObsHistoryRow[] = [];
-          const sourceGroups = groupObservationRowsByPollutant(obsHistoryRows);
-          for (
-            const [pollutantCode, pollutantRows] of Array.from(
-              sourceGroups.entries(),
-            ).sort(([left], [right]) => left.localeCompare(right))
-          ) {
-            const hashResult = computeObservationContentHash(
-              pollutantRows.map((row) => normalizeCanonicalObservationRow({
-                connector_id: connectorId,
-                station_id: row.station_id ?? null,
-                timeseries_id: row.timeseries_id,
-                pollutant_code: pollutantCode,
-                observed_at_utc: new Date(row.observed_at).toISOString(),
-                value: row.value,
-                verification_status: sourceAdapter === "sos"
-                  ? normalizeUkAirVerificationStatus(row.status ?? null)
-                  : null,
-              })),
-            );
-            const {
-              canonical_rows: canonicalRows,
-              ...hashEvidence
-            } = hashResult;
-            observationContentHashes[pollutantCode] = hashEvidence;
-            canonicalRowsForEvidence.push(...canonicalRows.map((row) => ({
-              timeseries_id: row.timeseries_id,
-              station_id: row.station_id,
-              pollutant_code: row.pollutant_code,
-              observed_at: row.observed_at_utc,
-              value: row.value,
-              verification_status: row.verification_status,
-            })));
-          }
-          obsHistoryRows = canonicalRowsForEvidence;
-        }
         let aqilevelRows: AqilevelsHistoryRow[] = [];
         let integrityProposalActiveForConnectorDay =
           INTEGRITY_COMPLETE_CONNECTOR_DAY;
@@ -15638,11 +15465,6 @@ async function runSourceToAll(
             ),
             per_pollutant_counts: Object.fromEntries(
               Object.entries(perPollutant).sort(([left], [right]) => left.localeCompare(right)),
-            ),
-            observation_content_hashes: Object.fromEntries(
-              Object.entries(observationContentHashes).sort(
-                ([left], [right]) => left.localeCompare(right),
-              ),
             ),
             pollutant_set: Object.keys(perPollutant).sort(),
             source_rows_before_canonical_dedupe: observationRowsRaw.length,

@@ -76,13 +76,20 @@ test("UK-AIR source-to-R2 requires valid flat-file mappings before fetching obse
   );
 });
 
-test("UK-AIR observation status is preserved through source rows and R2 schemas", () => {
+test("UK-AIR observation status is canonicalised for new R2 v2 writes", () => {
   assert.match(source, /status\?: string \| null/);
   assert.match(source, /status: datapoint\.status/);
   assert.match(source, /status_values/);
   assert.match(source, /HISTORY_OBSERVATIONS_COLUMNS[\s\S]*"status"/);
-  assert.match(source, /HISTORY_OBSERVATIONS_COLUMNS_R2_V2[\s\S]*"status"/);
-  assert.match(source, /status: textVector\(rows\.map\(\(row\) => row\.status \?\? null\)\)/);
+  assert.match(
+    source,
+    /HISTORY_OBSERVATIONS_COLUMNS_R2_V2[\s\S]*"verification_status"/,
+  );
+  assert.match(
+    source,
+    /verification_status: textVector\([\s\S]*row\.verification_status/,
+  );
+  assert.match(source, /normalizeUkAirVerificationStatus/);
 });
 
 test("AQI writer carries part timeseries counts into v1 and v2 manifest builders", () => {

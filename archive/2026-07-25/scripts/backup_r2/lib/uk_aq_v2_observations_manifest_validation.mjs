@@ -1,8 +1,4 @@
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
-import {
-  OBSERVATION_CONTENT_HASH_COLUMNS,
-  validateObservationContentHashMetadata,
-} from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 
 function withoutManifestHash(payload) {
   const { manifest_hash: _ignored, ...rest } = payload;
@@ -51,19 +47,8 @@ export function validateV2ObservationsChildManifest(payload, {
   pushFailure(failures, plainObject, "payload_not_object");
 
   if (plainObject) {
-    const schemaVersionAccepted =
-      payload.manifest_schema_version === 2 ||
-      payload.manifest_schema_version === 3;
-    pushFailure(
-      failures,
-      schemaVersionAccepted,
-      "manifest_schema_version_not_supported",
-    );
-    pushFailure(
-      failures,
-      payload.history_schema_version === payload.manifest_schema_version,
-      "history_schema_version_mismatch",
-    );
+    pushFailure(failures, payload.manifest_schema_version === 2, "manifest_schema_version_not_2");
+    pushFailure(failures, payload.history_schema_version === 2, "history_schema_version_not_2");
     pushFailure(failures, payload.history_version === "v2", "history_version_not_v2");
     pushFailure(failures, payload.domain === "observations", "domain_not_observations");
     pushFailure(failures, payload.manifest_kind === kind, "manifest_kind_mismatch");
@@ -99,35 +84,6 @@ export function validateV2ObservationsChildManifest(payload, {
         typeof payload.pollutant_code === "string" && payload.pollutant_code.trim() !== "",
         "pollutant_code_missing",
       );
-      const hasHash = Object.hasOwn(payload, "observation_content_hash");
-      pushFailure(
-        failures,
-        payload.manifest_schema_version !== 3 || hasHash,
-        "observation_content_hash_missing",
-      );
-      if (hasHash) {
-        try {
-          validateObservationContentHashMetadata(payload, {
-            rowCount: payload.row_count,
-          });
-        } catch (error) {
-          pushFailure(
-            failures,
-            false,
-            `observation_content_hash_invalid:${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        }
-      }
-      if (payload.manifest_schema_version === 3) {
-        pushFailure(
-          failures,
-          JSON.stringify(payload.columns) ===
-            JSON.stringify(OBSERVATION_CONTENT_HASH_COLUMNS),
-          "observation_columns_not_v3",
-        );
-      }
     }
   }
 

@@ -98,9 +98,10 @@ function bindingRequest(timeseriesId = 3742) {
   );
 }
 
-test("observations Worker preserves optional parquet observation status", () => {
-  assert.match(workerSource, /schemaColumns\.includes\("status"\)/);
-  assert.match(workerSource, /status: idx < statusValues\.length/);
+test("observations Worker prefers verification_status and falls back to legacy status", () => {
+  assert.match(workerSource, /schemaColumns\.includes\(\s*"verification_status"/);
+  assert.match(workerSource, /: schemaColumns\.includes\("status"\)/);
+  assert.match(workerSource, /verification_status:/);
 });
 
 test("observations Cache API eligibility requires complete, gap-free coverage", () => {

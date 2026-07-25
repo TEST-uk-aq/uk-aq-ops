@@ -85,6 +85,22 @@ function canonicalPollutant(connectorId, pollutantCode) {
     sourceRowCount: 1,
     writerGitSha: null,
     backedUpAtUtc: "2026-07-17T14:07:48.000Z",
+    observationContentHash: {
+      observation_content_hash: "0".repeat(64),
+      observation_content_hash_algorithm: "sha256",
+      observation_content_hash_contract_version: 1,
+      observation_content_hash_row_count: 1,
+      observation_content_hash_columns: [
+        "connector_id",
+        "station_id",
+        "timeseries_id",
+        "pollutant_code",
+        "observed_at_utc",
+        "value",
+        "verification_status",
+      ],
+      verification_status_counts: { P: 0, R: 0, null: 1 },
+    },
     fileEntries: [{
       key: key.replace("manifest.json", "part-00000.parquet"),
       bytes: 10,
@@ -257,7 +273,7 @@ test("legacy connector repair remains fail-closed when baseline data is not repr
     });
     await assert.rejects(
       () => runV2ObservationsRepair({ env: resolver.env, repairPlan: dayRepairPlan() }),
-      /cannot preserve baseline objects/,
+      /cannot preserve baseline objects|canonical pollutant manifest unavailable/,
     );
   } finally {
     resolver.cleanup();
