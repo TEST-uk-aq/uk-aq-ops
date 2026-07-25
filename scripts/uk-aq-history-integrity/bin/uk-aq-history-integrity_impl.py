@@ -1531,7 +1531,9 @@ DEFAULT_CONCURRENCY = 8
 # Thread-local SQLite connection pool. ThreadPoolExecutor reuses worker
 # threads across tasks; each worker lazily opens its own sqlite3 connection
 # the first time it's used. SQLite WAL mode handles concurrent readers and
-# serializes writers natively, so no application-level lock is required.
+# serializes writers natively. SOS annual-file persistence deliberately does
+# not use this pool: it has its own per-task connections and single-writer
+# transaction boundary below.
 _THREAD_DB = threading.local()
 
 
@@ -1543,6 +1545,233 @@ def _worker_db_conn(db_path: str) -> sqlite3.Connection:
         conn.execute("PRAGMA foreign_keys=ON")
         _THREAD_DB.conn = conn
     return conn
+
+
+SOS_SQLITE_BUSY_TIMEOUT_MS = 250
+SOS_SQLITE_PERSISTENCE_MAX_ATTEMPTS = 5
+SOS_SQLITE_PERSISTENCE_MAX_ELAPSED_SECONDS = 5.0
+SOS_SQLITE_PERSISTENCE_RETRY_BASE_SECONDS = 0.05
+SOS_SQLITE_PERSISTENCE_RETRY_MAX_SECONDS = 0.5
+_SOS_SQLITE_WRITE_LOCK = threading.Lock()
+
+
+class SosSqlitePersistenceError(RuntimeError):
+    """Raised when one SOS annual-file persistence transaction fails."""
+
+    def __init__(
+        self,
+        *,
+        source_file_key: str,
+        stage: str,
+        cause: BaseException,
+    ) -> None:
+        super().__init__(
+            "SOS SQLite persistence failed "
+            f"source_file_key={source_file_key!r} stage={stage!r} "
+            f"error_class={type(cause).__name__}"
+        )
+        self.source_file_key = source_file_key
+        self.stage = stage
+        self.cause = cause
+
+
+class SosSqlitePersistenceLockedError(SosSqlitePersistenceError):
+    """Raised after bounded SOS SQLite persistence retries are exhausted."""
+
+    def __init__(
+        self,
+        *,
+        source_file_key: str,
+        stage: str,
+        locked_count: int,
+        retry_count: int,
+        attempts: int,
+        elapsed_seconds: float,
+        cause: BaseException,
+    ) -> None:
+        super().__init__(
+            source_file_key=source_file_key,
+            stage=stage,
+            cause=cause,
+        )
+        self.args = (
+            "SOS SQLite persistence lock retry exhausted "
+            f"source_file_key={source_file_key!r} stage={stage!r} "
+            f"attempts={attempts} elapsed_seconds={elapsed_seconds:.3f}",
+        )
+        self.source_file_key = source_file_key
+        self.stage = stage
+        self.locked_count = int(locked_count)
+        self.retry_count = int(retry_count)
+        self.attempts = int(attempts)
+        self.elapsed_seconds = float(elapsed_seconds)
+        self.cause = cause
+
+
+def _is_sqlite_busy_or_locked(exc: BaseException) -> bool:
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if error_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return True
+    message = str(exc).strip().lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+def _open_sos_worker_db_conn(db_path: str) -> sqlite3.Connection:
+    """Open one SOS task connection without repeating WAL mode negotiation."""
+    conn = sqlite3.connect(
+        db_path,
+        timeout=SOS_SQLITE_BUSY_TIMEOUT_MS / 1000.0,
+    )
+    conn.execute(f"PRAGMA busy_timeout={SOS_SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _run_sos_sqlite_persistence_transaction(
+    conn: sqlite3.Connection,
+    *,
+    source_file_key: str,
+    stage: str,
+    operation: Callable[[sqlite3.Connection], Any],
+    log: logging.Logger,
+    max_attempts: int = SOS_SQLITE_PERSISTENCE_MAX_ATTEMPTS,
+    max_elapsed_seconds: float = SOS_SQLITE_PERSISTENCE_MAX_ELAPSED_SECONDS,
+    retry_base_seconds: float = SOS_SQLITE_PERSISTENCE_RETRY_BASE_SECONDS,
+    retry_max_seconds: float = SOS_SQLITE_PERSISTENCE_RETRY_MAX_SECONDS,
+) -> dict[str, Any]:
+    """Run one annual-file mutation atomically through the SOS single writer."""
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
+    if max_elapsed_seconds <= 0:
+        raise ValueError("max_elapsed_seconds must be positive")
+
+    started = time.monotonic()
+    locked_count = 0
+    retry_count = 0
+    with _SOS_SQLITE_WRITE_LOCK:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.execute(f"PRAGMA busy_timeout={SOS_SQLITE_BUSY_TIMEOUT_MS}")
+                conn.execute("BEGIN IMMEDIATE")
+                value = operation(conn)
+                conn.commit()
+                return {
+                    "value": value,
+                    "worker_database_locked_count": locked_count,
+                    "worker_database_retry_count": retry_count,
+                    "worker_database_retry_exhausted_count": 0,
+                    "persistence_success_count": 1,
+                    "persistence_failed_count": 0,
+                }
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                if not _is_sqlite_busy_or_locked(exc):
+                    event = {
+                        "event": "sos_sqlite_persistence_failed",
+                        "source_file_key": source_file_key,
+                        "stage": stage,
+                        "attempt": attempt,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "error_class": type(exc).__name__,
+                    }
+                    log.error(
+                        "sos SQLite persistence failed %s",
+                        json.dumps(event, sort_keys=True),
+                    )
+                    raise SosSqlitePersistenceError(
+                        source_file_key=source_file_key,
+                        stage=stage,
+                        cause=exc,
+                    ) from exc
+                locked_count += 1
+                elapsed = time.monotonic() - started
+                delay = min(
+                    retry_max_seconds,
+                    retry_base_seconds * (2 ** max(0, attempt - 1)),
+                )
+                remaining = max_elapsed_seconds - elapsed
+                exhausted = attempt >= max_attempts or remaining <= 0
+                if exhausted:
+                    event = {
+                        "event": "sos_sqlite_persistence_retry_exhausted",
+                        "source_file_key": source_file_key,
+                        "stage": stage,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "elapsed_seconds": round(elapsed, 3),
+                        "locked_count": locked_count,
+                        "retry_count": retry_count,
+                        "error_class": type(exc).__name__,
+                    }
+                    log.error(
+                        "sos SQLite persistence retry exhausted %s",
+                        json.dumps(event, sort_keys=True),
+                    )
+                    raise SosSqlitePersistenceLockedError(
+                        source_file_key=source_file_key,
+                        stage=stage,
+                        locked_count=locked_count,
+                        retry_count=retry_count,
+                        attempts=attempt,
+                        elapsed_seconds=elapsed,
+                        cause=exc,
+                    ) from exc
+
+                delay = min(delay, remaining)
+                retry_count += 1
+                event = {
+                    "event": "sos_sqlite_persistence_retry",
+                    "source_file_key": source_file_key,
+                    "stage": stage,
+                    "attempt": attempt,
+                    "next_attempt": attempt + 1,
+                    "max_attempts": max_attempts,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "delay_seconds": round(delay, 3),
+                    "error_class": type(exc).__name__,
+                }
+                log.warning(
+                    "sos SQLite persistence retry %s",
+                    json.dumps(event, sort_keys=True),
+                )
+                time.sleep(delay)
+            except Exception as exc:
+                conn.rollback()
+                event = {
+                    "event": "sos_sqlite_persistence_failed",
+                    "source_file_key": source_file_key,
+                    "stage": stage,
+                    "attempt": attempt,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "error_class": type(exc).__name__,
+                }
+                log.error(
+                    "sos SQLite persistence failed %s",
+                    json.dumps(event, sort_keys=True),
+                )
+                raise SosSqlitePersistenceError(
+                    source_file_key=source_file_key,
+                    stage=stage,
+                    cause=exc,
+                ) from exc
+
+    raise AssertionError("unreachable SOS SQLite persistence retry state")
+
+
+def _apply_sos_persistence_metrics(
+    metrics: dict[str, Any],
+    persistence: Mapping[str, Any],
+) -> None:
+    for key in (
+        "worker_database_locked_count",
+        "worker_database_retry_count",
+        "worker_database_retry_exhausted_count",
+        "persistence_success_count",
+        "persistence_failed_count",
+    ):
+        metrics[key] = int(persistence.get(key) or 0)
 
 
 def _copy_db_to_dropbox(
@@ -6568,8 +6797,13 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
             "event_id": None,
             "event_type": None,
             "timeseries_ids": [],
+            "worker_database_locked_count": 0,
+            "worker_database_retry_count": 0,
+            "worker_database_retry_exhausted_count": 0,
+            "persistence_success_count": 0,
+            "persistence_failed_count": 0,
         }
-    conn = _worker_db_conn(db_path)
+    conn = _open_sos_worker_db_conn(db_path)
     try:
         result = _check_one_sos_uk_air_flat_file(
             conn=conn,
@@ -6588,13 +6822,13 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
             source_count_mapping_hash=source_count_mapping_hash,
             log=log,
         )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    result["site_ref"] = str(site_ref).strip().upper()
-    result["year"] = int(year)
-    return result
+        result["site_ref"] = str(site_ref).strip().upper()
+        result["year"] = int(year)
+        return result
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+        conn.close()
 
 
 def _check_one_sos_uk_air_flat_file(
@@ -6657,130 +6891,31 @@ def _check_one_sos_uk_air_flat_file(
         "source_count_mapping_hash": source_count_mapping_hash,
         "cache_missing_redownloaded": False,
         "download_reason": None,
+        "worker_database_locked_count": 0,
+        "worker_database_retry_count": 0,
+        "worker_database_retry_exhausted_count": 0,
+        "persistence_success_count": 0,
+        "persistence_failed_count": 0,
     }
 
     try:
         head = _http_head(remote_url)
     except Exception as exc:
         snapshot_status = SOS_STATUS_TEMP_ERROR if _is_retryable_url_error(exc) else SOS_STATUS_PERM_ERROR
-        if prior is not None:
-            _mark_source_state_fetch_error(
-                conn,
-                source_file_key=sfk,
-                status=snapshot_status,
-                now_iso=now_iso,
-            )
         event_type = "temporary_error" if snapshot_status == SOS_STATUS_TEMP_ERROR else "permanent_error"
-        event_id = _insert_source_event(
-            conn=conn,
-            source_key=SOS_SOURCE_KEY,
-            event_type=event_type,
-            env_name=env_name,
-            source_file_key=sfk,
-            remote_url_or_key=remote_url,
-            station_ref=site_token,
-            source_location_id=source_location_id,
-            day=year_day,
-            prior=prior,
-            new_content_length=None,
-            new_etag=None,
-            new_last_modified_utc=None,
-            new_sha256_downloaded=None,
-            new_sha256_uncompressed=None,
-            downloaded_bytes=0,
-            hash_runtime_ms=0,
-            now_iso=now_iso,
-            notes=f"uk_air_flat_file head_failed:{exc}",
-        )
-        return {
-            **metrics,
-            "outcome": event_type,
-            "snapshot_status": snapshot_status,
-            "event_id": event_id,
-            "event_type": event_type,
-        }
 
-    status_code = int(head.get("status") or 0)
-    if status_code == 404:
-        if prior is None:
-            _upsert_source_state(
-                conn=conn,
+        def persist_head_failure(db: sqlite3.Connection) -> int:
+            if prior is not None:
+                _mark_source_state_fetch_error(
+                    db,
+                    source_file_key=sfk,
+                    status=snapshot_status,
+                    now_iso=now_iso,
+                )
+            return _insert_source_event(
+                conn=db,
                 source_key=SOS_SOURCE_KEY,
-                remote_scheme="uk_air_flat_file",
-                source_file_key=sfk,
-                env_name=env_name,
-                remote_url_or_key=remote_url,
-                station_ref=site_token,
-                source_location_id=source_location_id,
-                day=year_day,
-                exists_remote=False,
-                content_length=None,
-                etag=None,
-                last_modified_utc=None,
-                sha256_downloaded=None,
-                sha256_uncompressed=None,
-                local_cached_path=None,
-                now_iso=now_iso,
-                last_changed_at=None,
-                last_status="missing",
-                notes="uk_air_flat_file not_found",
-            )
-            event_id = _insert_source_event(
-                conn=conn,
-                source_key=SOS_SOURCE_KEY,
-                event_type="missing_first_seen",
-                env_name=env_name,
-                source_file_key=sfk,
-                remote_url_or_key=remote_url,
-                station_ref=site_token,
-                source_location_id=source_location_id,
-                day=year_day,
-                prior=None,
-                new_content_length=None,
-                new_etag=None,
-                new_last_modified_utc=None,
-                new_sha256_downloaded=None,
-                new_sha256_uncompressed=None,
-                downloaded_bytes=0,
-                hash_runtime_ms=0,
-                now_iso=now_iso,
-                notes="uk_air_flat_file not_found",
-            )
-            return {
-                **metrics,
-                "outcome": "not_found_first_seen",
-                "snapshot_status": SOS_STATUS_NOT_FOUND,
-                "event_id": event_id,
-                "event_type": "missing_first_seen",
-            }
-
-        if int(prior.get("exists_remote") or 0) == 1:
-            _upsert_source_state(
-                conn=conn,
-                source_key=SOS_SOURCE_KEY,
-                remote_scheme="uk_air_flat_file",
-                source_file_key=sfk,
-                env_name=env_name,
-                remote_url_or_key=remote_url,
-                station_ref=site_token,
-                source_location_id=source_location_id,
-                day=year_day,
-                exists_remote=False,
-                content_length=None,
-                etag=None,
-                last_modified_utc=None,
-                sha256_downloaded=None,
-                sha256_uncompressed=None,
-                local_cached_path=None,
-                now_iso=now_iso,
-                last_changed_at=now_iso,
-                last_status="missing",
-                notes="uk_air_flat_file not_found",
-            )
-            event_id = _insert_source_event(
-                conn=conn,
-                source_key=SOS_SOURCE_KEY,
-                event_type="missing_after_seen",
+                event_type=event_type,
                 env_name=env_name,
                 source_file_key=sfk,
                 remote_url_or_key=remote_url,
@@ -6796,75 +6931,151 @@ def _check_one_sos_uk_air_flat_file(
                 downloaded_bytes=0,
                 hash_runtime_ms=0,
                 now_iso=now_iso,
-                notes="uk_air_flat_file not_found after prior success",
+                notes=f"uk_air_flat_file head_failed:{exc}",
             )
-            return {
-                **metrics,
-                "outcome": "not_found_after_seen",
-                "snapshot_status": SOS_STATUS_NOT_FOUND,
-                "event_id": event_id,
-                "event_type": "missing_after_seen",
-            }
 
-        _upsert_source_state(
-            conn=conn,
-            source_key=SOS_SOURCE_KEY,
-            remote_scheme="uk_air_flat_file",
+        persistence = _run_sos_sqlite_persistence_transaction(
+            conn,
             source_file_key=sfk,
-            env_name=env_name,
-            remote_url_or_key=remote_url,
-            station_ref=site_token,
-            source_location_id=source_location_id,
-            day=year_day,
-            exists_remote=False,
-            content_length=None,
-            etag=None,
-            last_modified_utc=None,
-            sha256_downloaded=None,
-            sha256_uncompressed=None,
-            local_cached_path=None,
-            now_iso=now_iso,
-            last_changed_at=None,
-            last_status="missing",
-            notes="uk_air_flat_file still missing",
+            stage="head_failure",
+            operation=persist_head_failure,
+            log=log,
         )
+        _apply_sos_persistence_metrics(metrics, persistence)
+        event_id = int(persistence["value"])
         return {
             **metrics,
-            "outcome": "not_found_still",
+            "outcome": event_type,
+            "snapshot_status": snapshot_status,
+            "event_id": event_id,
+            "event_type": event_type,
+        }
+
+    status_code = int(head.get("status") or 0)
+    if status_code == 404:
+        if prior is None:
+            outcome = "not_found_first_seen"
+            event_type = "missing_first_seen"
+            last_changed_at = None
+            notes = "uk_air_flat_file not_found"
+        elif int(prior.get("exists_remote") or 0) == 1:
+            outcome = "not_found_after_seen"
+            event_type = "missing_after_seen"
+            last_changed_at = now_iso
+            notes = "uk_air_flat_file not_found after prior success"
+        else:
+            outcome = "not_found_still"
+            event_type = None
+            last_changed_at = None
+            notes = "uk_air_flat_file still missing"
+
+        def persist_missing(db: sqlite3.Connection) -> int | None:
+            _upsert_source_state(
+                conn=db,
+                source_key=SOS_SOURCE_KEY,
+                remote_scheme="uk_air_flat_file",
+                source_file_key=sfk,
+                env_name=env_name,
+                remote_url_or_key=remote_url,
+                station_ref=site_token,
+                source_location_id=source_location_id,
+                day=year_day,
+                exists_remote=False,
+                content_length=None,
+                etag=None,
+                last_modified_utc=None,
+                sha256_downloaded=None,
+                sha256_uncompressed=None,
+                local_cached_path=None,
+                now_iso=now_iso,
+                last_changed_at=last_changed_at,
+                last_status="missing",
+                notes=notes,
+            )
+            if event_type is None:
+                return None
+            return _insert_source_event(
+                conn=db,
+                source_key=SOS_SOURCE_KEY,
+                event_type=event_type,
+                env_name=env_name,
+                source_file_key=sfk,
+                remote_url_or_key=remote_url,
+                station_ref=site_token,
+                source_location_id=source_location_id,
+                day=year_day,
+                prior=prior,
+                new_content_length=None,
+                new_etag=None,
+                new_last_modified_utc=None,
+                new_sha256_downloaded=None,
+                new_sha256_uncompressed=None,
+                downloaded_bytes=0,
+                hash_runtime_ms=0,
+                now_iso=now_iso,
+                notes=notes,
+            )
+
+        persistence = _run_sos_sqlite_persistence_transaction(
+            conn,
+            source_file_key=sfk,
+            stage="missing",
+            operation=persist_missing,
+            log=log,
+        )
+        _apply_sos_persistence_metrics(metrics, persistence)
+        event_id = persistence["value"]
+        return {
+            **metrics,
+            "outcome": outcome,
             "snapshot_status": SOS_STATUS_NOT_FOUND,
+            "event_id": event_id,
+            "event_type": event_type,
         }
 
     if status_code != 200:
         snapshot_status = SOS_STATUS_TEMP_ERROR if status_code >= 500 or status_code == 429 else SOS_STATUS_PERM_ERROR
-        if prior is not None:
-            _mark_source_state_fetch_error(
-                conn,
-                source_file_key=sfk,
-                status=snapshot_status,
-                now_iso=now_iso,
-            )
         event_type = "temporary_error" if snapshot_status == SOS_STATUS_TEMP_ERROR else "permanent_error"
-        event_id = _insert_source_event(
-            conn=conn,
-            source_key=SOS_SOURCE_KEY,
-            event_type=event_type,
-            env_name=env_name,
+
+        def persist_head_status_failure(db: sqlite3.Connection) -> int:
+            if prior is not None:
+                _mark_source_state_fetch_error(
+                    db,
+                    source_file_key=sfk,
+                    status=snapshot_status,
+                    now_iso=now_iso,
+                )
+            return _insert_source_event(
+                conn=db,
+                source_key=SOS_SOURCE_KEY,
+                event_type=event_type,
+                env_name=env_name,
+                source_file_key=sfk,
+                remote_url_or_key=remote_url,
+                station_ref=site_token,
+                source_location_id=source_location_id,
+                day=year_day,
+                prior=prior,
+                new_content_length=None,
+                new_etag=None,
+                new_last_modified_utc=None,
+                new_sha256_downloaded=None,
+                new_sha256_uncompressed=None,
+                downloaded_bytes=0,
+                hash_runtime_ms=0,
+                now_iso=now_iso,
+                notes=f"uk_air_flat_file head_status={status_code}",
+            )
+
+        persistence = _run_sos_sqlite_persistence_transaction(
+            conn,
             source_file_key=sfk,
-            remote_url_or_key=remote_url,
-            station_ref=site_token,
-            source_location_id=source_location_id,
-            day=year_day,
-            prior=prior,
-            new_content_length=None,
-            new_etag=None,
-            new_last_modified_utc=None,
-            new_sha256_downloaded=None,
-            new_sha256_uncompressed=None,
-            downloaded_bytes=0,
-            hash_runtime_ms=0,
-            now_iso=now_iso,
-            notes=f"uk_air_flat_file head_status={status_code}",
+            stage="head_status_failure",
+            operation=persist_head_status_failure,
+            log=log,
         )
+        _apply_sos_persistence_metrics(metrics, persistence)
+        event_id = int(persistence["value"])
         return {
             **metrics,
             "outcome": event_type,
@@ -6918,42 +7129,54 @@ def _check_one_sos_uk_air_flat_file(
                 if _is_retryable_url_error(exc)
                 else SOS_STATUS_PERM_ERROR
             )
-            if prior is not None:
-                _mark_source_state_fetch_error(
-                    conn,
-                    source_file_key=sfk,
-                    status=snapshot_status,
-                    now_iso=now_iso,
-                )
             event_type = (
                 "temporary_error"
                 if snapshot_status == SOS_STATUS_TEMP_ERROR
                 else "permanent_error"
             )
-            event_id = _insert_source_event(
-                conn=conn,
-                source_key=SOS_SOURCE_KEY,
-                event_type=event_type,
-                env_name=env_name,
+
+            def persist_get_failure(db: sqlite3.Connection) -> int:
+                if prior is not None:
+                    _mark_source_state_fetch_error(
+                        db,
+                        source_file_key=sfk,
+                        status=snapshot_status,
+                        now_iso=now_iso,
+                    )
+                return _insert_source_event(
+                    conn=db,
+                    source_key=SOS_SOURCE_KEY,
+                    event_type=event_type,
+                    env_name=env_name,
+                    source_file_key=sfk,
+                    remote_url_or_key=remote_url,
+                    station_ref=site_token,
+                    source_location_id=source_location_id,
+                    day=year_day,
+                    prior=prior,
+                    new_content_length=None,
+                    new_etag=None,
+                    new_last_modified_utc=None,
+                    new_sha256_downloaded=None,
+                    new_sha256_uncompressed=None,
+                    downloaded_bytes=0,
+                    hash_runtime_ms=0,
+                    now_iso=now_iso,
+                    notes=(
+                        "uk_air_flat_file get_failed "
+                        f"download_reason={download_reason} error={exc}"
+                    ),
+                )
+
+            persistence = _run_sos_sqlite_persistence_transaction(
+                conn,
                 source_file_key=sfk,
-                remote_url_or_key=remote_url,
-                station_ref=site_token,
-                source_location_id=source_location_id,
-                day=year_day,
-                prior=prior,
-                new_content_length=None,
-                new_etag=None,
-                new_last_modified_utc=None,
-                new_sha256_downloaded=None,
-                new_sha256_uncompressed=None,
-                downloaded_bytes=0,
-                hash_runtime_ms=0,
-                now_iso=now_iso,
-                notes=(
-                    "uk_air_flat_file get_failed "
-                    f"download_reason={download_reason} error={exc}"
-                ),
+                stage="get_failure",
+                operation=persist_get_failure,
+                log=log,
             )
+            _apply_sos_persistence_metrics(metrics, persistence)
+            event_id = int(persistence["value"])
             return {
                 **metrics,
                 "outcome": event_type,
@@ -7084,15 +7307,6 @@ def _check_one_sos_uk_air_flat_file(
     metrics["downloaded_bytes"] = int(downloaded_bytes)
     metrics["snapshot_status"] = SOS_STATUS_OK if metrics["source_rows"] > 0 else SOS_STATUS_NO_DATA
 
-    replacement_metrics = _record_source_file_timeseries_counts(
-        conn,
-        sfk,
-        counts_by_day_ts,
-        now_iso,
-        default_day_utc=year_day.isoformat(),
-        source_count_mapping_identity=source_count_mapping_identity,
-        source_count_mapping_hash=source_count_mapping_hash,
-    )
     metrics["counts_rebuilt_from_cache"] = cache_reused
     metrics["counts_rebuilt_for_bridge_change"] = bool(
         cache_reused
@@ -7100,8 +7314,6 @@ def _check_one_sos_uk_air_flat_file(
         and str((prior or {}).get("source_count_mapping_hash") or "")
         != source_count_mapping_hash
     )
-    metrics["count_rows_deleted"] = replacement_metrics["deleted_rows"]
-    metrics["count_rows_inserted"] = replacement_metrics["inserted_rows"]
 
     content_changed = is_first_seen or (not prior_sha) or prior_sha != sha_csv
     state_changed = is_first_seen or was_missing or content_changed
@@ -7173,8 +7385,6 @@ def _check_one_sos_uk_air_flat_file(
         f"source_acquisition={'cache_reused' if cache_reused else 'downloaded'}",
         f"source_count_mapping_identity={source_count_mapping_identity or 'legacy'}",
         f"source_count_mapping_hash={source_count_mapping_hash or 'legacy'}",
-        f"count_rows_deleted={metrics['count_rows_deleted']}",
-        f"count_rows_inserted={metrics['count_rows_inserted']}",
     ]
     if download_reason:
         notes_bits.append(f"download_reason={download_reason}")
@@ -7182,61 +7392,91 @@ def _check_one_sos_uk_air_flat_file(
         notes_bits.append("cache_missing_redownloaded=true")
     if issue_notes:
         notes_bits.append("mapping_issues=" + ";".join(issue_notes[:25]))
-    notes = " ".join(notes_bits)
-
     try:
         source_content_length = int(head.get("content_length"))
     except (TypeError, ValueError):
         source_content_length = cache_path.stat().st_size
 
-    _upsert_source_state(
-        conn=conn,
-        source_key=SOS_SOURCE_KEY,
-        remote_scheme="uk_air_flat_file",
-        source_file_key=sfk,
-        env_name=env_name,
-        remote_url_or_key=remote_url,
-        station_ref=site_token,
-        source_location_id=source_location_id,
-        day=year_day,
-        exists_remote=True,
-        content_length=source_content_length,
-        etag=str(head.get("etag") or "") or None,
-        last_modified_utc=str(head.get("last_modified") or "") or None,
-        sha256_downloaded=sha_csv,
-        sha256_uncompressed=sha_csv,
-        local_cached_path=local_cached_path,
-        now_iso=now_iso,
-        last_changed_at=last_changed_at,
-        last_status=state_status,
-        notes=notes,
-        source_count_mapping_identity=source_count_mapping_identity,
-        source_count_mapping_hash=source_count_mapping_hash,
-    )
-
-    event_id: int | None = None
-    if event_type:
-        event_id = _insert_source_event(
-            conn=conn,
+    def persist_success(db: sqlite3.Connection) -> dict[str, Any]:
+        replacement_metrics = _record_source_file_timeseries_counts(
+            db,
+            sfk,
+            counts_by_day_ts,
+            now_iso,
+            default_day_utc=year_day.isoformat(),
+            source_count_mapping_identity=source_count_mapping_identity,
+            source_count_mapping_hash=source_count_mapping_hash,
+        )
+        notes = " ".join([
+            *notes_bits,
+            f"count_rows_deleted={replacement_metrics['deleted_rows']}",
+            f"count_rows_inserted={replacement_metrics['inserted_rows']}",
+        ])
+        _upsert_source_state(
+            conn=db,
             source_key=SOS_SOURCE_KEY,
-            event_type=event_type,
-            env_name=env_name,
+            remote_scheme="uk_air_flat_file",
             source_file_key=sfk,
+            env_name=env_name,
             remote_url_or_key=remote_url,
             station_ref=site_token,
             source_location_id=source_location_id,
             day=year_day,
-            prior=prior,
-            new_content_length=source_content_length,
-            new_etag=str(head.get("etag") or "") or None,
-            new_last_modified_utc=str(head.get("last_modified") or "") or None,
-            new_sha256_downloaded=sha_csv,
-            new_sha256_uncompressed=sha_csv,
-            downloaded_bytes=downloaded_bytes,
-            hash_runtime_ms=0,
+            exists_remote=True,
+            content_length=source_content_length,
+            etag=str(head.get("etag") or "") or None,
+            last_modified_utc=str(head.get("last_modified") or "") or None,
+            sha256_downloaded=sha_csv,
+            sha256_uncompressed=sha_csv,
+            local_cached_path=local_cached_path,
             now_iso=now_iso,
+            last_changed_at=last_changed_at,
+            last_status=state_status,
             notes=notes,
+            source_count_mapping_identity=source_count_mapping_identity,
+            source_count_mapping_hash=source_count_mapping_hash,
         )
+
+        event_id: int | None = None
+        if event_type:
+            event_id = _insert_source_event(
+                conn=db,
+                source_key=SOS_SOURCE_KEY,
+                event_type=event_type,
+                env_name=env_name,
+                source_file_key=sfk,
+                remote_url_or_key=remote_url,
+                station_ref=site_token,
+                source_location_id=source_location_id,
+                day=year_day,
+                prior=prior,
+                new_content_length=source_content_length,
+                new_etag=str(head.get("etag") or "") or None,
+                new_last_modified_utc=str(head.get("last_modified") or "") or None,
+                new_sha256_downloaded=sha_csv,
+                new_sha256_uncompressed=sha_csv,
+                downloaded_bytes=downloaded_bytes,
+                hash_runtime_ms=0,
+                now_iso=now_iso,
+                notes=notes,
+            )
+        return {
+            "event_id": event_id,
+            **replacement_metrics,
+        }
+
+    persistence = _run_sos_sqlite_persistence_transaction(
+        conn,
+        source_file_key=sfk,
+        stage="complete_file",
+        operation=persist_success,
+        log=log,
+    )
+    _apply_sos_persistence_metrics(metrics, persistence)
+    persisted = dict(persistence["value"])
+    metrics["count_rows_deleted"] = int(persisted["deleted_rows"])
+    metrics["count_rows_inserted"] = int(persisted["inserted_rows"])
+    event_id = persisted["event_id"]
 
     return {
         **metrics,
@@ -7301,6 +7541,13 @@ def check_sos_flat_files(
         "temporary_errors": 0,
         "permanent_errors": 0,
         "errors": 0,
+        "worker_database_locked_count": 0,
+        "worker_database_retry_count": 0,
+        "worker_database_retry_exhausted_count": 0,
+        "persistence_success_count": 0,
+        "persistence_failed_count": 0,
+        "mapping_issue_count": 0,
+        "network_error_count": 0,
         "rows_counted": 0,
         "source_rows": 0,
         "source_rows_total": 0,
@@ -7494,6 +7741,10 @@ def check_sos_flat_files(
     cache_root = Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY
     cache_root.mkdir(parents=True, exist_ok=True)
     db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
+    # Release any coordinator transaction before worker reads begin. Each SOS
+    # worker then opens and closes one task-scoped connection; all mutations
+    # flow through the process-local single-writer transaction helper.
+    conn.commit()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
         futures: list[concurrent.futures.Future] = []
@@ -7569,6 +7820,63 @@ def check_sos_flat_files(
             completed_tasks += 1
             try:
                 result = fut.result()
+            except SosSqlitePersistenceLockedError as exc:
+                metrics["errors"] += 1
+                metrics["worker_database_locked_count"] += exc.locked_count
+                metrics["worker_database_retry_count"] += exc.retry_count
+                metrics["worker_database_retry_exhausted_count"] += 1
+                metrics["persistence_failed_count"] += 1
+                event = {
+                    "event": "sos_flat_file_persistence_failed",
+                    "source_file_key": exc.source_file_key,
+                    "stage": exc.stage,
+                    "attempts": exc.attempts,
+                    "elapsed_seconds": round(exc.elapsed_seconds, 3),
+                    "locked_count": exc.locked_count,
+                    "retry_count": exc.retry_count,
+                    "error_class": type(exc.cause).__name__,
+                }
+                log.warning(
+                    "sos flat-file persistence failed %s",
+                    json.dumps(event, sort_keys=True),
+                )
+                progress.update(
+                    (
+                        f"connector_ids={connector_scope} day={day_scope} stations={metrics['stations']} "
+                        f"files={completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                        f"downloaded={metrics['downloaded']} cached={metrics['cache_reused']} "
+                        f"mapped_rows={metrics['rows_counted']} "
+                        f"missing={metrics['missing']} errors={metrics['errors']} "
+                        f"planned_backfills=0"
+                    ),
+                )
+                log_flat_file_progress(current_site="persistence_error")
+                continue
+            except SosSqlitePersistenceError as exc:
+                metrics["errors"] += 1
+                metrics["persistence_failed_count"] += 1
+                event = {
+                    "event": "sos_flat_file_persistence_failed",
+                    "source_file_key": exc.source_file_key,
+                    "stage": exc.stage,
+                    "error_class": type(exc.cause).__name__,
+                }
+                log.warning(
+                    "sos flat-file persistence failed %s",
+                    json.dumps(event, sort_keys=True),
+                )
+                progress.update(
+                    (
+                        f"connector_ids={connector_scope} day={day_scope} stations={metrics['stations']} "
+                        f"files={completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                        f"downloaded={metrics['downloaded']} cached={metrics['cache_reused']} "
+                        f"mapped_rows={metrics['rows_counted']} "
+                        f"missing={metrics['missing']} errors={metrics['errors']} "
+                        f"planned_backfills=0"
+                    ),
+                )
+                log_flat_file_progress(current_site="persistence_error")
+                continue
             except Exception as exc:
                 metrics["errors"] += 1
                 log.warning("sos flat-file worker raised: %s", exc)
@@ -7584,6 +7892,15 @@ def check_sos_flat_files(
                 )
                 log_flat_file_progress(current_site="error")
                 continue
+
+            for key in (
+                "worker_database_locked_count",
+                "worker_database_retry_count",
+                "worker_database_retry_exhausted_count",
+                "persistence_success_count",
+                "persistence_failed_count",
+            ):
+                metrics[key] += int(result.get(key) or 0)
 
             outcome = str(result.get("outcome") or "")
             metrics["head_checked"] += 1
@@ -7682,15 +7999,21 @@ def check_sos_flat_files(
                 metrics["missing"] += 1
             elif outcome == "temporary_error":
                 metrics["temporary_errors"] += 1
+                metrics["network_error_count"] += 1
                 metrics["errors"] += 1
             elif outcome == "permanent_error":
                 metrics["permanent_errors"] += 1
+                metrics["network_error_count"] += 1
                 metrics["errors"] += 1
             else:
                 metrics["errors"] += 1
 
-            metrics["errors"] += int(result.get("unmapped_source_groups") or 0)
-            metrics["errors"] += int(result.get("ambiguous_mapping_groups") or 0)
+            result_mapping_issue_count = (
+                int(result.get("unmapped_source_groups") or 0)
+                + int(result.get("ambiguous_mapping_groups") or 0)
+            )
+            metrics["mapping_issue_count"] += result_mapping_issue_count
+            metrics["errors"] += result_mapping_issue_count
 
             progress.update(
                 (
