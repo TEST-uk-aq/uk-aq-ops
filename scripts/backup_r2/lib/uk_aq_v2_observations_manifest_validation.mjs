@@ -28,11 +28,16 @@ function pushFailure(failures, condition, code) {
   if (!condition) failures.push(code);
 }
 
-function validatePhysicalSchemaDeclaration(payload, failures) {
+function validatePhysicalSchemaDeclaration(payload, failures, kind) {
   try {
     const schemas = observationHistoryPhysicalSchemasFromManifest(payload);
     const combined = combineObservationHistoryPhysicalSchemas(schemas);
     const mixed = Array.isArray(combined.physical_schemas);
+    pushFailure(
+      failures,
+      kind !== "pollutant" || !mixed,
+      "pollutant_physical_schemas_mixed",
+    );
     pushFailure(
       failures,
       mixed === Array.isArray(payload.physical_schemas),
@@ -105,7 +110,7 @@ export function validateV2ObservationsChildManifest(payload, {
         "history_schema_version_not_2",
       );
     } else if (payload.manifest_schema_version === 3) {
-      validatePhysicalSchemaDeclaration(payload, failures);
+      validatePhysicalSchemaDeclaration(payload, failures, kind);
     }
     pushFailure(failures, payload.history_version === "v2", "history_version_not_v2");
     pushFailure(failures, payload.domain === "observations", "domain_not_observations");
