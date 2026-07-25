@@ -31,6 +31,13 @@ import {
   normalizeUkAirVerificationStatus,
 } from "../shared/uk_aq_observation_content_hash.mjs";
 import {
+  combineObservationHistoryPhysicalSchemas,
+  OBSERVATION_HISTORY_COLUMNS_V3,
+  observationHistoryPhysicalSchemaForColumns,
+  observationHistoryPhysicalSchemasFromManifest,
+  OBSERVATION_HISTORY_WRITER_VERSION_V3,
+} from "../shared/uk_aq_observation_history_schema.mjs";
+import {
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey,
   updateR2HistoryIndexesTargeted,
 } from "../shared/uk_aq_r2_history_index.mjs";
@@ -102,15 +109,8 @@ export const HISTORY_OBSERVATIONS_COLUMNS_V2 = Object.freeze([
   "value",
 ]);
 const HISTORY_OBSERVATIONS_COLUMNS = HISTORY_OBSERVATIONS_COLUMNS_V2;
-export const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "observed_at_utc",
-  "value",
-  "verification_status",
-]);
+export const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 =
+  OBSERVATION_HISTORY_COLUMNS_V3;
 export const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
   "connector_id",
   "station_id",
@@ -190,9 +190,10 @@ const HISTORY_R2_V2_OBSERVATIONS_PREFIX = "history/v2/observations";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug";
 const HISTORY_R2_V2_SCHEMA_VERSION = 2;
-const HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION = 3;
+const HISTORY_R2_V2_OBSERVATIONS_MANIFEST_SCHEMA_VERSION = 3;
 const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
-const HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION = "parquet-wasm-zstd-v3";
+const HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION =
+  OBSERVATION_HISTORY_WRITER_VERSION_V3;
 export const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE = "^history/(v1/(observations|aqilevels/hourly)|v2/observations)/day_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}/manifest\\.json$";
 const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX = new RegExp(PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE);
 
@@ -2135,16 +2136,48 @@ function historyV2ColumnsFor(domain, profile = null) {
   throw new Error(`Unsupported R2 history v2 schema: domain=${domain} profile=${profile || "null"}`);
 }
 
-function historyV2SchemaVersionFor(domain) {
+function historyV2ManifestSchemaVersionFor(domain) {
   return domain === "observations"
-    ? HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION
+    ? HISTORY_R2_V2_OBSERVATIONS_MANIFEST_SCHEMA_VERSION
     : HISTORY_R2_V2_SCHEMA_VERSION;
 }
 
-function historyV2WriterVersionFor(domain) {
-  return domain === "observations"
-    ? HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION
-    : HISTORY_R2_V2_WRITER_VERSION;
+function defaultHistoryV2PhysicalSchemaFor(domain, profile = null) {
+  if (domain === "observations") {
+    return observationHistoryPhysicalSchemaForColumns(
+      HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
+    );
+  }
+  return {
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    columns: [...historyV2ColumnsFor(domain, profile)],
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
+  };
+}
+
+function historyV2PhysicalSchemaForChildren(manifests, domain, profile) {
+  if (domain !== "observations") {
+    return defaultHistoryV2PhysicalSchemaFor(domain, profile);
+  }
+  return combineObservationHistoryPhysicalSchemas(
+    manifests.flatMap(observationHistoryPhysicalSchemasFromManifest),
+  );
+}
+
+function historyV2PhysicalSchemaFields(schema) {
+  return {
+    history_schema_version: schema.history_schema_version,
+    columns: schema.columns === null ? null : [...schema.columns],
+    writer_version: schema.writer_version,
+    ...(Array.isArray(schema.physical_schemas)
+      ? {
+        physical_schemas: schema.physical_schemas.map((entry) => ({
+          ...entry,
+          columns: [...entry.columns],
+        })),
+      }
+      : {}),
+  };
 }
 
 function minEntryValue(entries, fieldName) {
@@ -2216,6 +2249,7 @@ function createHistoryV2PollutantManifest({
   writerGitSha,
   backedUpAtUtc,
   observationContentHash = null,
+  physicalSchema = null,
 }) {
   const normalizedPollutantCode = normalizePollutantCodeForPath(pollutantCode);
   const files = sortHistoryV2FileEntries(fileEntries).map((entry) => ({
@@ -2238,9 +2272,22 @@ function createHistoryV2PollutantManifest({
       );
     }
   }
+  const resolvedPhysicalSchemas = domain === "observations"
+    ? observationHistoryPhysicalSchemasFromManifest(
+      physicalSchema || defaultHistoryV2PhysicalSchemaFor(domain, profile),
+    )
+    : [defaultHistoryV2PhysicalSchemaFor(domain, profile)];
+  if (resolvedPhysicalSchemas.length !== 1) {
+    throw new Error(
+      `A pollutant manifest must describe one physical Parquet schema: day=${dayUtc} connector=${connectorId} pollutant=${normalizedPollutantCode}`,
+    );
+  }
+  const resolvedPhysicalSchema = resolvedPhysicalSchemas[0];
+  const physicalSchemaFields =
+    historyV2PhysicalSchemaFields(resolvedPhysicalSchema);
   const payload = {
-    manifest_schema_version: historyV2SchemaVersionFor(domain),
-    history_schema_version: historyV2SchemaVersionFor(domain),
+    manifest_schema_version: historyV2ManifestSchemaVersionFor(domain),
+    history_schema_version: physicalSchemaFields.history_schema_version,
     history_version: "v2",
     manifest_kind: "pollutant",
     domain,
@@ -2265,8 +2312,11 @@ function createHistoryV2PollutantManifest({
     total_bytes: totalBytes,
     files,
     child_manifests: [],
-    columns: historyV2ColumnsFor(domain, profile),
-    writer_version: historyV2WriterVersionFor(domain),
+    columns: physicalSchemaFields.columns,
+    writer_version: physicalSchemaFields.writer_version,
+    ...(physicalSchemaFields.physical_schemas
+      ? { physical_schemas: physicalSchemaFields.physical_schemas }
+      : {}),
     writer_git_sha: writerGitSha,
     timeseries_row_counts: aggregateTimeseriesRowCounts(files),
     ...statsFromFileEntries(files, Number(sourceRowCount)),
@@ -2309,9 +2359,15 @@ function createHistoryV2ConnectorManifest({
   const totalRows = manifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
   const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
   const pollutantCodes = uniqueSorted(manifests.map((manifest) => manifest.pollutant_code).filter(Boolean));
+  const physicalSchema = historyV2PhysicalSchemaForChildren(
+    manifests,
+    domain,
+    profile,
+  );
+  const physicalSchemaFields = historyV2PhysicalSchemaFields(physicalSchema);
   return withManifestHash({
-    manifest_schema_version: historyV2SchemaVersionFor(domain),
-    history_schema_version: historyV2SchemaVersionFor(domain),
+    manifest_schema_version: historyV2ManifestSchemaVersionFor(domain),
+    history_schema_version: physicalSchemaFields.history_schema_version,
     history_version: "v2",
     manifest_kind: "connector",
     domain,
@@ -2337,8 +2393,11 @@ function createHistoryV2ConnectorManifest({
     files,
     child_manifests: childManifests,
     pollutant_manifests: childManifests,
-    columns: historyV2ColumnsFor(domain, profile),
-    writer_version: historyV2WriterVersionFor(domain),
+    columns: physicalSchemaFields.columns,
+    writer_version: physicalSchemaFields.writer_version,
+    ...(physicalSchemaFields.physical_schemas
+      ? { physical_schemas: physicalSchemaFields.physical_schemas }
+      : {}),
     writer_git_sha: writerGitSha,
     timeseries_row_counts: aggregateTimeseriesRowCounts(manifests),
     ...statsFromFileEntries(files, totalRows),
@@ -2382,9 +2441,15 @@ function createHistoryV2DayManifest({
   const pollutantCodes = uniqueSorted(manifests.flatMap((manifest) => (
     Array.isArray(manifest.pollutant_codes) ? manifest.pollutant_codes : []
   )));
+  const physicalSchema = historyV2PhysicalSchemaForChildren(
+    manifests,
+    domain,
+    profile,
+  );
+  const physicalSchemaFields = historyV2PhysicalSchemaFields(physicalSchema);
   return withManifestHash({
-    manifest_schema_version: historyV2SchemaVersionFor(domain),
-    history_schema_version: historyV2SchemaVersionFor(domain),
+    manifest_schema_version: historyV2ManifestSchemaVersionFor(domain),
+    history_schema_version: physicalSchemaFields.history_schema_version,
     history_version: "v2",
     manifest_kind: "day",
     domain,
@@ -2411,8 +2476,11 @@ function createHistoryV2DayManifest({
     files,
     child_manifests: childManifests,
     connector_manifests: childManifests,
-    columns: historyV2ColumnsFor(domain, profile),
-    writer_version: historyV2WriterVersionFor(domain),
+    columns: physicalSchemaFields.columns,
+    writer_version: physicalSchemaFields.writer_version,
+    ...(physicalSchemaFields.physical_schemas
+      ? { physical_schemas: physicalSchemaFields.physical_schemas }
+      : {}),
     writer_git_sha: writerGitSha,
     ...statsFromFileEntries(files, totalRows),
     backed_up_at_utc: backedUpAtUtc,
@@ -2533,12 +2601,16 @@ export function rowsToAqilevelParquetBufferForTest(rows) {
   );
 }
 
-function rowsToObservationV2ParquetBuffer(rows, writerProperties) {
+function rowsToObservationV2ParquetBuffer(
+  rows,
+  writerProperties,
+  { includeVerificationStatus = true } = {},
+) {
   ensureParquetWasmInitialized();
   const int32Vector = (values) => arrow.vectorFromArray(values, new arrow.Int32());
   const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
   const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = arrow.tableFromArrays({
+  const columns = {
     connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
     station_id: int32Vector(rows.map((row) => (
       row.station_id === null || row.station_id === undefined
@@ -2549,8 +2621,15 @@ function rowsToObservationV2ParquetBuffer(rows, writerProperties) {
     pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
     observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at_utc || row.observed_at))),
     value: rows.map((row) => (row.value === null || row.value === undefined ? null : Number(row.value))),
-    verification_status: textVector(rows.map((row) => row.verification_status ?? null)),
-  });
+    ...(includeVerificationStatus
+      ? {
+        verification_status: textVector(
+          rows.map((row) => row.verification_status ?? null),
+        ),
+      }
+      : {}),
+  };
+  const table = arrow.tableFromArrays(columns);
 
   const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
   const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
@@ -2707,6 +2786,17 @@ export function rowsToObservationV2ParquetBufferForTest(rows) {
       DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE,
       HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
     ),
+  );
+}
+
+export function rowsToObservationV2LegacyParquetBufferForTest(rows) {
+  return rowsToObservationV2ParquetBuffer(
+    rows,
+    parquetWriterProperties(
+      DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE,
+      HISTORY_R2_V2_WRITER_VERSION,
+    ),
+    { includeVerificationStatus: false },
   );
 }
 

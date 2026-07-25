@@ -13,6 +13,10 @@ import {
 } from "../../uk_aq_prune_daily/phase_b_history_r2.mjs";
 import { sha256Hex } from "../../shared/r2_sigv4.mjs";
 import {
+  combineObservationHistoryPhysicalSchemas,
+  observationHistoryPhysicalSchemaForColumns,
+} from "../../shared/uk_aq_observation_history_schema.mjs";
+import {
   validateV2ObservationsChildManifest,
 } from "../../../scripts/backup_r2/lib/uk_aq_v2_observations_manifest_validation.mjs";
 import {
@@ -102,9 +106,9 @@ async function parquetFileEntry({ dropboxRoot, key, pollutantCode }) {
   const metadata = await parquetMetadataAsync(file);
   const rowCount = Math.max(0, Number(metadata.num_rows || 0));
   if (!rowCount) throw new Error(`Canonical Parquet has zero rows: ${key}`);
-  const columns = new Set(
-    parquetSchema(metadata).children.map((column) => String(column.element.name)),
-  );
+  const physicalColumns = parquetSchema(metadata).children
+    .map((column) => String(column.element.name));
+  const columns = new Set(physicalColumns);
   const timestampColumn = ["observed_at_utc", "observed_at"]
     .find((column) => columns.has(column));
   if (!timestampColumn) {
@@ -144,16 +148,19 @@ async function parquetFileEntry({ dropboxRoot, key, pollutantCode }) {
     throw new Error(`Canonical Parquet row metadata mismatch: ${key}`);
   }
   return {
-    key,
-    row_count: rowCount,
-    bytes: body.byteLength,
-    etag_or_hash: sha256Hex(body),
-    pollutant_codes: [pollutantCode],
-    min_timeseries_id: minTimeseriesId,
-    max_timeseries_id: maxTimeseriesId,
-    min_observed_at_utc: minObservedAtUtc,
-    max_observed_at_utc: maxObservedAtUtc,
-    timeseries_row_counts: counts,
+    fileEntry: {
+      key,
+      row_count: rowCount,
+      bytes: body.byteLength,
+      etag_or_hash: sha256Hex(body),
+      pollutant_codes: [pollutantCode],
+      min_timeseries_id: minTimeseriesId,
+      max_timeseries_id: maxTimeseriesId,
+      min_observed_at_utc: minObservedAtUtc,
+      max_observed_at_utc: maxObservedAtUtc,
+      timeseries_row_counts: counts,
+    },
+    physicalSchema: observationHistoryPhysicalSchemaForColumns(physicalColumns),
   };
 }
 
@@ -335,12 +342,22 @@ export async function prepareCanonicalObservationManifestCompatibility({
           throw new Error(`Blocked dependency: no immutable Parquet objects under ${sourcePrefix}`);
         }
         const fileEntries = [];
+        const physicalSchemas = [];
         for (const key of partKeys) {
-          fileEntries.push(await parquetFileEntry({
+          const inspected = await parquetFileEntry({
             dropboxRoot,
             key,
             pollutantCode: declaredCode,
-          }));
+          });
+          fileEntries.push(inspected.fileEntry);
+          physicalSchemas.push(inspected.physicalSchema);
+        }
+        const physicalSchema =
+          combineObservationHistoryPhysicalSchemas(physicalSchemas);
+        if (Array.isArray(physicalSchema.physical_schemas)) {
+          throw new Error(
+            `Blocked dependency: mixed physical Parquet schemas under ${sourcePrefix}`,
+          );
         }
         const metadata = metadataFromExisting(childPayload, parent, dayUtc);
         const observationContentHash =
@@ -367,6 +384,7 @@ export async function prepareCanonicalObservationManifestCompatibility({
           writerGitSha: metadata.writer_git_sha,
           backedUpAtUtc: metadata.backed_up_at_utc,
           observationContentHash,
+          physicalSchema,
         });
         const overlayPath = localPathForKey(overlayRoot, childKey);
         const body = writeJsonFile(overlayPath, rebuilt);

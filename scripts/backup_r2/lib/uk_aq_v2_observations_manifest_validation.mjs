@@ -1,8 +1,11 @@
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import {
-  OBSERVATION_CONTENT_HASH_COLUMNS,
   validateObservationContentHashMetadata,
 } from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
+import {
+  combineObservationHistoryPhysicalSchemas,
+  observationHistoryPhysicalSchemasFromManifest,
+} from "../../../workers/shared/uk_aq_observation_history_schema.mjs";
 
 function withoutManifestHash(payload) {
   const { manifest_hash: _ignored, ...rest } = payload;
@@ -23,6 +26,42 @@ function isValidIsoTimestamp(value) {
 
 function pushFailure(failures, condition, code) {
   if (!condition) failures.push(code);
+}
+
+function validatePhysicalSchemaDeclaration(payload, failures) {
+  try {
+    const schemas = observationHistoryPhysicalSchemasFromManifest(payload);
+    const combined = combineObservationHistoryPhysicalSchemas(schemas);
+    const mixed = Array.isArray(combined.physical_schemas);
+    pushFailure(
+      failures,
+      mixed === Array.isArray(payload.physical_schemas),
+      "physical_schemas_shape_mismatch",
+    );
+    if (mixed) {
+      pushFailure(
+        failures,
+        payload.history_schema_version === null &&
+          payload.columns === null &&
+          payload.writer_version === null,
+        "mixed_physical_schema_singular_fields_not_null",
+      );
+      pushFailure(
+        failures,
+        JSON.stringify(payload.physical_schemas) ===
+          JSON.stringify(combined.physical_schemas),
+        "physical_schemas_not_canonical",
+      );
+    }
+  } catch (error) {
+    pushFailure(
+      failures,
+      false,
+      `physical_schema_invalid:${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 export class V2ObservationsManifestValidationError extends Error {
@@ -59,11 +98,15 @@ export function validateV2ObservationsChildManifest(payload, {
       schemaVersionAccepted,
       "manifest_schema_version_not_supported",
     );
-    pushFailure(
-      failures,
-      payload.history_schema_version === payload.manifest_schema_version,
-      "history_schema_version_mismatch",
-    );
+    if (payload.manifest_schema_version === 2) {
+      pushFailure(
+        failures,
+        payload.history_schema_version === 2,
+        "history_schema_version_not_2",
+      );
+    } else if (payload.manifest_schema_version === 3) {
+      validatePhysicalSchemaDeclaration(payload, failures);
+    }
     pushFailure(failures, payload.history_version === "v2", "history_version_not_v2");
     pushFailure(failures, payload.domain === "observations", "domain_not_observations");
     pushFailure(failures, payload.manifest_kind === kind, "manifest_kind_mismatch");
@@ -80,9 +123,18 @@ export function validateV2ObservationsChildManifest(payload, {
     for (const field of ["source_row_count", "row_count", "file_count", "total_bytes"]) {
       pushFailure(failures, isNonNegativeInteger(payload[field]), `${field}_not_non_negative_integer`);
     }
-    for (const field of ["pollutant_codes", "parquet_object_keys", "files", "child_manifests", "columns"]) {
+    for (const field of ["pollutant_codes", "parquet_object_keys", "files", "child_manifests"]) {
       pushFailure(failures, Array.isArray(payload[field]), `${field}_not_array`);
     }
+    pushFailure(
+      failures,
+      Array.isArray(payload.columns) ||
+        (
+          payload.manifest_schema_version === 3 &&
+          Array.isArray(payload.physical_schemas)
+        ),
+      "columns_not_array_or_mixed_physical_schema",
+    );
     pushFailure(
       failures,
       payload.timeseries_row_counts === null || isPlainObject(payload.timeseries_row_counts),
@@ -119,14 +171,6 @@ export function validateV2ObservationsChildManifest(payload, {
             }`,
           );
         }
-      }
-      if (payload.manifest_schema_version === 3) {
-        pushFailure(
-          failures,
-          JSON.stringify(payload.columns) ===
-            JSON.stringify(OBSERVATION_CONTENT_HASH_COLUMNS),
-          "observation_columns_not_v3",
-        );
       }
     }
   }

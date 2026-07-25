@@ -13,6 +13,10 @@ import {
 } from "../../uk_aq_prune_daily/phase_b_history_r2.mjs";
 import { sha256Hex } from "../../shared/r2_sigv4.mjs";
 import {
+  combineObservationHistoryPhysicalSchemas,
+  observationHistoryPhysicalSchemaForColumns,
+} from "../../shared/uk_aq_observation_history_schema.mjs";
+import {
   observationContentHashFromLocalParquet,
 } from "../../../scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs";
 
@@ -107,9 +111,9 @@ async function parquetFileEntry({ dropboxRoot, key, pollutantCode }) {
   const metadata = await parquetMetadataAsync(file);
   const rowCount = Math.max(0, Number(metadata.num_rows || 0));
   if (!rowCount) throw new Error(`Legacy parquet has zero rows: ${key}`);
-  const columns = new Set(
-    parquetSchema(metadata).children.map((column) => String(column.element.name)),
-  );
+  const physicalColumns = parquetSchema(metadata).children
+    .map((column) => String(column.element.name));
+  const columns = new Set(physicalColumns);
   const timestampColumn = ["observed_at_utc", "observed_at"]
     .find((column) => columns.has(column));
   if (!timestampColumn) {
@@ -149,16 +153,19 @@ async function parquetFileEntry({ dropboxRoot, key, pollutantCode }) {
     throw new Error(`Legacy parquet row metadata mismatch: ${key}`);
   }
   return {
-    key,
-    row_count: rowCount,
-    bytes: body.byteLength,
-    etag_or_hash: sha256Hex(body),
-    pollutant_codes: [pollutantCode],
-    min_timeseries_id: minTimeseriesId,
-    max_timeseries_id: maxTimeseriesId,
-    min_observed_at_utc: minObservedAtUtc,
-    max_observed_at_utc: maxObservedAtUtc,
-    timeseries_row_counts: counts,
+    fileEntry: {
+      key,
+      row_count: rowCount,
+      bytes: body.byteLength,
+      etag_or_hash: sha256Hex(body),
+      pollutant_codes: [pollutantCode],
+      min_timeseries_id: minTimeseriesId,
+      max_timeseries_id: maxTimeseriesId,
+      min_observed_at_utc: minObservedAtUtc,
+      max_observed_at_utc: maxObservedAtUtc,
+      timeseries_row_counts: counts,
+    },
+    physicalSchema: observationHistoryPhysicalSchemaForColumns(physicalColumns),
   };
 }
 
@@ -291,12 +298,22 @@ export async function prepareLegacyObservationManifestCompatibility({
           );
         }
         const fileEntries = [];
+        const physicalSchemas = [];
         for (const key of partKeys) {
-          fileEntries.push(await parquetFileEntry({
+          const inspected = await parquetFileEntry({
             dropboxRoot,
             key,
             pollutantCode: child.pollutant_code,
-          }));
+          });
+          fileEntries.push(inspected.fileEntry);
+          physicalSchemas.push(inspected.physicalSchema);
+        }
+        const physicalSchema =
+          combineObservationHistoryPhysicalSchemas(physicalSchemas);
+        if (Array.isArray(physicalSchema.physical_schemas)) {
+          throw new Error(
+            `Blocked dependency: mixed physical Parquet schemas under ${sourcePrefix}`,
+          );
         }
         const metadata = metadataFromLegacy(sourceManifest, parent, dayUtc);
         const canonicalKey = `${dayKeyPrefix}/${entry.name}/pollutant_code=${child.pollutant_code}/manifest.json`;
@@ -324,6 +341,7 @@ export async function prepareLegacyObservationManifestCompatibility({
           writerGitSha: metadata.writer_git_sha,
           backedUpAtUtc: metadata.backed_up_at_utc,
           observationContentHash,
+          physicalSchema,
         });
         const overlayPath = localPathForKey(overlayRoot, canonicalKey);
         const body = writeJsonFile(overlayPath, payload);

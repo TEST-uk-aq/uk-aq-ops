@@ -9,9 +9,18 @@ import {
   buildHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest,
   buildHistoryV2PollutantManifest,
+  rowsToObservationV2LegacyParquetBufferForTest,
   rowsToObservationV2ParquetBufferForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+import {
+  OBSERVATION_HISTORY_COLUMNS_V2,
+  OBSERVATION_HISTORY_COLUMNS_V3,
+  observationHistoryPhysicalSchemaForColumns,
+} from "../workers/shared/uk_aq_observation_history_schema.mjs";
 import { runV2ObservationsRepair } from "../scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs";
+import {
+  observationContentHashFromLocalParquet,
+} from "../scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs";
 import {
   classifyRepairableV2ObservationsConnectorManifest,
   validateV2ObservationsChildManifest,
@@ -73,7 +82,7 @@ function dayRepairPlan() {
   };
 }
 
-function canonicalPollutant(connectorId, pollutantCode) {
+function canonicalPollutant(connectorId, pollutantCode, physicalSchema = null) {
   const key = `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
   return buildHistoryV2PollutantManifest({
     domain: "observations",
@@ -101,6 +110,7 @@ function canonicalPollutant(connectorId, pollutantCode) {
       ],
       verification_status_counts: { P: 0, R: 0, null: 1 },
     },
+    physicalSchema,
     fileEntries: [{
       key: key.replace("manifest.json", "part-00000.parquet"),
       bytes: 10,
@@ -114,6 +124,68 @@ function canonicalPollutant(connectorId, pollutantCode) {
     }],
   });
 }
+
+test("observation manifests distinguish manifest contract from physical schema", () => {
+  const schema2 = canonicalPollutant(
+    7,
+    "pm10",
+    observationHistoryPhysicalSchemaForColumns(OBSERVATION_HISTORY_COLUMNS_V2),
+  );
+  const schema3 = canonicalPollutant(7, "pm25");
+  assert.equal(schema2.manifest_schema_version, 3);
+  assert.equal(schema2.history_schema_version, 2);
+  assert.deepEqual(schema2.columns, OBSERVATION_HISTORY_COLUMNS_V2);
+  assert.equal(schema2.writer_version, "parquet-wasm-zstd-v2");
+  assert.equal(schema3.manifest_schema_version, 3);
+  assert.equal(schema3.history_schema_version, 3);
+  assert.deepEqual(schema3.columns, OBSERVATION_HISTORY_COLUMNS_V3);
+  assert.equal(schema3.writer_version, "parquet-wasm-zstd-v3");
+
+  const connectorKey = `${PREFIX}/day_utc=${DAY}/connector_id=7/manifest.json`;
+  const connector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY,
+    connectorId: 7,
+    runId: "fixture",
+    manifestKey: connectorKey,
+    pollutantManifests: [schema2, schema3],
+    writerGitSha: null,
+    backedUpAtUtc: "2026-07-17T14:07:48.000Z",
+  });
+  assert.equal(connector.history_schema_version, null);
+  assert.equal(connector.columns, null);
+  assert.equal(connector.writer_version, null);
+  assert.deepEqual(
+    connector.physical_schemas.map((value) => value.history_schema_version),
+    [2, 3],
+  );
+  assert.equal(
+    validateV2ObservationsChildManifest(connector, {
+      key: connectorKey,
+      kind: "connector",
+      dayUtc: DAY,
+      connectorId: 7,
+    }).ok,
+    true,
+  );
+
+  const day = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc: DAY,
+    runId: "fixture",
+    manifestKey: `${PREFIX}/day_utc=${DAY}/manifest.json`,
+    connectorManifests: [connector],
+    writerGitSha: null,
+    backedUpAtUtc: "2026-07-17T14:07:48.000Z",
+  });
+  assert.equal(day.history_schema_version, null);
+  assert.equal(day.columns, null);
+  assert.equal(day.writer_version, null);
+  assert.deepEqual(
+    day.physical_schemas.map((value) => value.history_schema_version),
+    [2, 3],
+  );
+});
 
 test("validator reports exact legacy connector contract failures", () => {
   const pollutant = canonicalPollutant(7, "pm10");
@@ -156,14 +228,16 @@ test("day repair normalises legacy pollutant paths before connector and day pare
   const dayKey = `${PREFIX}/day_utc=${DAY}/manifest.json`;
   const pm10Prefix = `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/pollutant=pm10`;
   const pm25Prefix = `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/pollutant=pm2.5`;
-  const pm10Bytes = rowsToObservationV2ParquetBufferForTest([
+  const pm10Rows = [
     { connector_id: connectorId, station_id: 70, timeseries_id: 700, pollutant_code: "pm10", observed_at_utc: `${DAY}T00:00:00.000Z`, value: 10 },
     { connector_id: connectorId, station_id: 70, timeseries_id: 700, pollutant_code: "pm10", observed_at_utc: `${DAY}T01:00:00.000Z`, value: 11 },
-  ]);
-  const pm25Bytes = rowsToObservationV2ParquetBufferForTest([
+  ];
+  const pm25Rows = [
     { connector_id: connectorId, station_id: 71, timeseries_id: 701, pollutant_code: "pm25", observed_at_utc: `${DAY}T00:00:00.000Z`, value: 5 },
     { connector_id: connectorId, station_id: 71, timeseries_id: 701, pollutant_code: "pm25", observed_at_utc: `${DAY}T01:00:00.000Z`, value: 6 },
-  ]);
+  ];
+  const pm10Bytes = rowsToObservationV2LegacyParquetBufferForTest(pm10Rows);
+  const pm25Bytes = rowsToObservationV2LegacyParquetBufferForTest(pm25Rows);
   const legacy = {
     created_at_utc: "2026-07-17T14:07:48Z",
     current_prefix: `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/`,
@@ -215,6 +289,38 @@ test("day repair normalises legacy pollutant paths before connector and day pare
     assert.ok(keys.includes(pm25Key));
     assert.ok(keys.includes(connectorKey));
     assert.ok(keys.includes(dayKey));
+    assert.equal(keys.some((key) => key.endsWith(".parquet")), false);
+    assert.deepEqual(
+      fs.readFileSync(path.join(resolver.dropboxRoot, `${pm10Prefix}/part-00000.parquet`)),
+      pm10Bytes,
+    );
+    const repairedPm10 = JSON.parse(
+      output.planning.proposals.find((proposal) => proposal.key === pm10Key).proposed_body,
+    );
+    assert.equal(repairedPm10.manifest_schema_version, 3);
+    assert.equal(repairedPm10.history_schema_version, 2);
+    assert.deepEqual(repairedPm10.columns, OBSERVATION_HISTORY_COLUMNS_V2);
+    assert.equal(repairedPm10.writer_version, "parquet-wasm-zstd-v2");
+    const v3Path = path.join(resolver.dropboxRoot, "equivalent-v3.parquet");
+    fs.writeFileSync(v3Path, rowsToObservationV2ParquetBufferForTest(pm10Rows));
+    const [schema2Hash, schema3Hash] = await Promise.all([
+      observationContentHashFromLocalParquet({
+        filePaths: [path.join(resolver.dropboxRoot, `${pm10Prefix}/part-00000.parquet`)],
+        connectorId,
+      }),
+      observationContentHashFromLocalParquet({
+        filePaths: [v3Path],
+        connectorId,
+      }),
+    ]);
+    assert.equal(
+      schema2Hash.observation_content_hash,
+      schema3Hash.observation_content_hash,
+    );
+    assert.deepEqual(
+      schema2Hash.verification_status_counts,
+      schema3Hash.verification_status_counts,
+    );
     const connectorProposal = output.planning.proposals.find((proposal) => proposal.key === connectorKey);
     const repairedConnector = JSON.parse(connectorProposal.proposed_body);
     assert.deepEqual(repairedConnector.pollutant_codes, ["pm10", "pm25"]);
