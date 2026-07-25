@@ -10,6 +10,15 @@
 - Do not inspect or modify any `LIVE` repo unless the user explicitly asks.
 - Live propagation to the sibling live ops copy is handled by the sync script/workflow process outside this repo. Do not manually update the live ops copy unless the user explicitly asks for that repo to be changed.
 
+## Authoritative System Contracts
+
+- Before analysing, planning, or changing code, schema, workflows, configuration, or non-system documentation, coding agents must read this `AGENTS.md`, any linked `AGENTS_BASE.md`, and the relevant active files under `system_docs/` in this or the related UK AQ repositories.
+- Active files under `system_docs/` define the authoritative UK AQ system contracts. Codex and other coding agents must follow those contracts and preserve the documented behaviour.
+- If a user request, the current code, or another document conflicts with `system_docs/`, stop and report the conflict. Do not silently override, reinterpret, weaken, or work around the contract.
+- `system_docs_legacy/` and archived documentation are historical references and do not override active `system_docs/`.
+- Codex and other coding agents must not create, edit, move, rename, or delete files under `system_docs/`.
+- Updating `system_docs/` is reserved for ChatGPT in Chat mode. When an implementation change requires a system-documentation update, the coding agent must provide a concise handover identifying the affected documents and summarising the implemented behaviour, files changed, schema or configuration changes, deployment implications, and validation results.
+
 ## Codex operating mode
 Default mode is code-only implementation.
 Codex should:
