@@ -2740,6 +2740,20 @@ def _normalise_uk_air_source_label(value: Any) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def _uk_air_is_non_no2_nitrogen_oxide_label(value: Any) -> bool:
+    """Return true for NO/NOx measurements that must never count as NO2."""
+    text = str(value or "").strip().lower()
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    return (
+        compact in {"no", "nox"}
+        or compact.startswith("nitricoxide")
+        or compact.startswith("nitrogenmonoxide")
+        or compact.startswith("nitrogenoxide")
+        or compact.startswith("nitrogenoxides")
+        or compact.startswith("noxasno2")
+    )
+
+
 def _uk_air_source_label_seed_decisions(conn: sqlite3.Connection) -> dict[str, tuple[str, str | None, str | None]]:
     decisions: dict[str, tuple[str, str | None, str | None]] = {}
     grouped: dict[str, list[sqlite3.Row]] = {}
@@ -2778,7 +2792,7 @@ def refresh_uk_air_source_label_registry(
     """Discover cached UK-AIR headings and idempotently register decisions.
 
     Operator-reviewed registry decisions are never replaced by a later source
-    scan. Stale unreviewed automatic decisions are returned to review.
+    scan. Stale unreviewed automatic decisions are safely reseeded.
     """
     import csv
 
@@ -2837,9 +2851,10 @@ def refresh_uk_air_source_label_registry(
         if not existing[5] and status in {"mapped", "ignore"}:
             current_decision = (status, pollutant_code, expected_uom)
             if seeds.get(key) != current_decision:
-                status = "review"
-                pollutant_code = None
-                expected_uom = None
+                status, pollutant_code, expected_uom = seeds.get(
+                    key,
+                    ("review", None, None),
+                )
                 reclassified_unreviewed_labels.append(key)
         conn.execute(
             """UPDATE uk_air_csv_source_labels SET last_seen_at_utc=?, last_seen_site_ref=?, status=?, pollutant_code=?, expected_uom=?, raw_label_variants_json=?, observed_units_json=?
@@ -2848,6 +2863,53 @@ def refresh_uk_air_source_label_registry(
         )
     counts = dict(conn.execute("SELECT status, COUNT(*) FROM uk_air_csv_source_labels WHERE connector_id=? GROUP BY status", (connector_id,)).fetchall())
     return {"discovered_labels": len(discovered), "mapped_labels": int(counts.get("mapped", 0)), "ignored_labels": int(counts.get("ignore", 0)), "review_labels": int(counts.get("review", 0)), "scan_errors": scan_errors, "reclassified_unreviewed_labels": sorted(reclassified_unreviewed_labels)}
+
+
+def _load_uk_air_source_label_decisions(
+    conn: sqlite3.Connection,
+    *,
+    connector_id: int = 1,
+) -> tuple[dict[str, str | None], list[dict[str, Any]]]:
+    """Load exact registry decisions, excluding unsafe reviewed NOx→NO2 rows."""
+    decisions: dict[str, str | None] = {}
+    conflicts: list[dict[str, Any]] = []
+    rows = conn.execute(
+        """
+        SELECT normalised_source_label, source_label, status, pollutant_code,
+               reviewed_at_utc, review_notes
+        FROM uk_air_csv_source_labels
+        WHERE connector_id = ?
+        ORDER BY normalised_source_label
+        """,
+        (connector_id,),
+    ).fetchall()
+    supported = {"pm25", "pm10", "no2", "o3"}
+    for row in rows:
+        key = _normalise_uk_air_source_label(row[0])
+        source_label = str(row[1] or key)
+        status = str(row[2] or "review").strip().lower()
+        pollutant_code = str(row[3] or "").strip().lower()
+        if status != "mapped":
+            decisions[key] = None
+            continue
+        if (
+            pollutant_code == "no2"
+            and _uk_air_is_non_no2_nitrogen_oxide_label(source_label)
+        ):
+            decisions[key] = None
+            conflicts.append({
+                "normalised_source_label": key,
+                "source_label": source_label,
+                "status": status,
+                "pollutant_code": pollutant_code,
+                "reviewed_at_utc": row[4],
+                "review_notes": row[5],
+                "issue": "non_no2_nitrogen_oxide_mapped_to_no2",
+                "action": "excluded_from_source_counts",
+            })
+            continue
+        decisions[key] = pollutant_code if pollutant_code in supported else None
+    return decisions, conflicts
 
 
 def write_uk_air_source_label_registry_snapshot(
@@ -3062,6 +3124,8 @@ def _uk_air_normalize_pollutant_code(value: Any) -> str | None:
     compact = re.sub(r"[^a-z0-9.]+", "", text)
     if not compact:
         return None
+    if _uk_air_is_non_no2_nitrogen_oxide_label(text):
+        return None
     if "pm25" in compact or "pm2.5" in compact or "pm2p5" in compact or "particulatematter25" in compact:
         return "pm25"
     if "pm10" in compact or "particulatematter10" in compact:
@@ -3210,6 +3274,7 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
     csv_path: Path,
     *,
     target_pollutants: Iterable[str],
+    source_label_decisions: Mapping[str, str | None] | None = None,
 ) -> tuple[dict[tuple[str, str], int], dict[str, Any]]:
     import csv
 
@@ -3238,9 +3303,18 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
             if first == "date" and second == "time":
                 pollutant_bindings = []
                 for value_index in range(2, len(cells), 3):
-                    pollutant = _uk_air_normalize_pollutant_code(
+                    label_key = _normalise_uk_air_source_label(
                         cells[value_index]
                     )
+                    if (
+                        source_label_decisions is not None
+                        and label_key in source_label_decisions
+                    ):
+                        pollutant = source_label_decisions[label_key]
+                    else:
+                        pollutant = _uk_air_normalize_pollutant_code(
+                            cells[value_index]
+                        )
                     if pollutant in allowed:
                         stats["sections"] += 1
                         pollutant_bindings.append((value_index, pollutant))
@@ -6785,6 +6859,7 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
     source_count_mapping_hash: str | None,
     log: logging.Logger,
     limits: LimitTracker | None = None,
+    source_label_decisions: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     if limits is not None and limits.should_stop():
         return {
@@ -6820,6 +6895,7 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
             requested_days=requested_days,
             source_count_mapping_identity=source_count_mapping_identity,
             source_count_mapping_hash=source_count_mapping_hash,
+            source_label_decisions=source_label_decisions,
             log=log,
         )
         result["site_ref"] = str(site_ref).strip().upper()
@@ -6847,6 +6923,7 @@ def _check_one_sos_uk_air_flat_file(
     requested_days: Iterable[str] | None = None,
     source_count_mapping_identity: str | None = None,
     source_count_mapping_hash: str | None = None,
+    source_label_decisions: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     site_token = str(site_ref).strip().upper()
     sfk = _uk_air_flat_file_source_file_key(site_token, year)
@@ -7194,9 +7271,14 @@ def _check_one_sos_uk_air_flat_file(
     )
     metrics["download_reason"] = download_reason
 
+    parse_kwargs: dict[str, Any] = {
+        "target_pollutants": target_pollutants,
+    }
+    if source_label_decisions is not None:
+        parse_kwargs["source_label_decisions"] = source_label_decisions
     parsed_counts, parse_stats = _uk_air_flat_file_parse_day_pollutant_counts(
         cache_path,
-        target_pollutants=target_pollutants,
+        **parse_kwargs,
     )
     grouped = grouped_mappings.get(site_token, {})
     counts_by_day_ts: dict[tuple[str, int], int] = {}
@@ -7528,6 +7610,10 @@ def check_sos_flat_files(
         "imported_bridge_row_count": 0,
         "bridge_artifact_row_count": 0,
         "selected_bridge_row_count": 0,
+        "source_label_registry": {},
+        "source_label_registry_decision_count": 0,
+        "source_label_registry_conflict_count": 0,
+        "source_label_registry_conflicts": [],
         "cache_missing_redownloaded": 0,
         "first_seen": 0,
         "changed": 0,
@@ -7741,6 +7827,49 @@ def check_sos_flat_files(
     cache_root = Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY
     cache_root.mkdir(parents=True, exist_ok=True)
     db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
+    sos_connector_row = conn.execute(
+        """
+        SELECT id
+        FROM core_connectors_snapshot
+        WHERE lower(trim(connector_code)) = 'sos'
+        ORDER BY id
+        LIMIT 1
+        """
+    ).fetchone()
+    sos_connector_id = int(sos_connector_row[0]) if sos_connector_row else 1
+    registry_inventory = refresh_uk_air_source_label_registry(
+        conn=conn,
+        cache_root=cache_root,
+        connector_id=sos_connector_id,
+    )
+    source_label_decisions, source_label_conflicts = (
+        _load_uk_air_source_label_decisions(
+            conn,
+            connector_id=sos_connector_id,
+        )
+    )
+    metrics["source_label_registry"] = registry_inventory
+    metrics["source_label_registry_decision_count"] = len(
+        source_label_decisions
+    )
+    metrics["source_label_registry_conflict_count"] = len(
+        source_label_conflicts
+    )
+    metrics["source_label_registry_conflicts"] = source_label_conflicts[:25]
+    metrics["errors"] += len(source_label_conflicts)
+    log.info(
+        "sos flat-file source-label registry %s",
+        json.dumps({
+            **registry_inventory,
+            "decision_count": len(source_label_decisions),
+            "conflict_count": len(source_label_conflicts),
+        }, sort_keys=True),
+    )
+    for conflict in source_label_conflicts[:25]:
+        log.warning(
+            "sos flat-file source-label registry conflict %s",
+            json.dumps(conflict, sort_keys=True),
+        )
     # Release any coordinator transaction before worker reads begin. Each SOS
     # worker then opens and closes one task-scoped connection; all mutations
     # flow through the process-local single-writer transaction helper.
@@ -7769,6 +7898,7 @@ def check_sos_flat_files(
                 source_count_mapping_hash,
                 log,
                 limits,
+                source_label_decisions,
             ))
 
         total_tasks = len(futures)
@@ -9756,6 +9886,8 @@ def _normalize_history_pollutant_code(value: Any) -> str | None:
     compact = re.sub(r"[^a-z0-9]+", "", text.replace("µ", "u").replace("μ", "u"))
     if not compact:
         return None
+    if _uk_air_is_non_no2_nitrogen_oxide_label(text):
+        return None
     if "pm25" in compact or "pm2p5" in compact or "particulatematter25" in compact:
         return "pm25"
     if "pm10" in compact or "particulatematter10" in compact:
@@ -10035,13 +10167,18 @@ def _sos_source_counts_for_v2_partition(
             env_name,
         ),
     ).fetchall()
-    if issue_rows:
-        evidence["unmapped_site_ref_groups"] = len({
-            str(row[0]) for row in issue_rows
-        })
+    unresolved_issue_sites = {
+        str(row[0]) for row in issue_rows
+    }
+    if unresolved_issue_sites:
+        evidence["unmapped_site_ref_groups"] = len(unresolved_issue_sites)
         evidence["unresolved_site_ref_groups"] = evidence[
             "unmapped_site_ref_groups"
         ]
+        evidence["expected_site_ref_groups"] = (
+            len(candidates_by_site)
+            + len(unresolved_issue_sites - set(candidates_by_site))
+        )
         evidence["mapping_issue_samples"] = [
             {
                 "site_ref": str(row[0]),
@@ -10052,10 +10189,6 @@ def _sos_source_counts_for_v2_partition(
             }
             for row in issue_rows[:25]
         ]
-        return finish(
-            "mapping_unavailable",
-            "sos_site_ref_bridge_mapping_unresolved",
-        )
 
     count_rows = conn.execute(
         f"""
@@ -10113,6 +10246,13 @@ def _sos_source_counts_for_v2_partition(
     evidence["resolved_site_ref_groups"] = len(candidates_by_site)
     evidence["source_group_count"] = len(counts)
     evidence["legitimate_empty_groups"] = empty_groups
+    if unresolved_issue_sites:
+        return finish(
+            "mapping_unavailable",
+            "sos_site_ref_bridge_mapping_unresolved",
+            counts,
+            available=False,
+        )
     return finish(
         "successful_non_empty" if counts else "successful_empty",
         None,

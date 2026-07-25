@@ -520,24 +520,43 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                 )
                 self.assertEqual(evidence[case["expected_counter"]], 1)
 
-    def test_unmapped_non_empty_source_group_fails_closed(self):
+    def test_unmapped_group_preserves_resolved_counts_but_fails_closed(self):
         conn = self._connection()
         try:
             conn.execute(
                 """
-                UPDATE source_file_state
-                SET last_status = 'unmapped_source',
-                    notes = 'mapping_issues=2026-07-15:no2=unmapped_source'
-                WHERE source_file_key = 'sos:site_ref=ABD9:year=2026'
-                """
+                INSERT INTO source_file_state (
+                  source_file_key, env_name, source_key, remote_scheme,
+                  remote_url_or_key, station_ref, source_location_id,
+                  day_utc, exists_remote, first_seen_at_utc,
+                  last_checked_at_utc, last_status,
+                  source_count_mapping_identity, source_count_mapping_hash,
+                  notes
+                ) VALUES (
+                  'sos:site_ref=HG4:year=2026', 'CIC-Test', 'sos',
+                  'uk_air_flat_file', 'https://example.invalid/HG4_2026.csv',
+                  'HG4', 'HG4', '2026-01-01', 1,
+                  '2026-07-25T00:00:00Z', '2026-07-25T00:00:00Z',
+                  'unmapped_source', ?, ?,
+                  'mapping_issues=2026-07-15:no2=unmapped_source'
+                )
+                """,
+                (MODULE.SOS_BRIDGE_MAPPING_IDENTITY, "a" * 64),
             )
             conn.commit()
             counts, evidence = self._counts(conn)
         finally:
             conn.close()
-        self.assertEqual(counts, {})
+        self.assertEqual(counts, {144: 24})
         self.assertEqual(evidence["source_partition_state"], "mapping_unavailable")
+        self.assertFalse(evidence["source_counts_available"])
+        self.assertEqual(evidence["source_rows"], 24)
+        self.assertEqual(evidence["expected_site_ref_groups"], 2)
+        self.assertEqual(evidence["processed_site_ref_groups"], 1)
+        self.assertEqual(evidence["resolved_site_ref_groups"], 1)
+        self.assertEqual(evidence["unresolved_site_ref_groups"], 1)
         self.assertEqual(evidence["unmapped_site_ref_groups"], 1)
+        self.assertEqual(evidence["mapping_issue_samples"][0]["site_ref"], "HG4")
 
     def test_partial_source_population_cannot_create_r2_mismatch(self):
         gap = MODULE._build_v2_source_r2_mismatch_gap_if_complete(
