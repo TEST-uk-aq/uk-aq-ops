@@ -520,9 +520,30 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                 )
                 self.assertEqual(evidence[case["expected_counter"]], 1)
 
-    def test_unmapped_group_preserves_resolved_counts_but_fails_closed(self):
+    def test_missing_binding_warning_preserves_complete_canonical_counts(self):
         conn = self._connection()
         try:
+            warning = {
+                "classification": "no_authoritative_timeseries_binding",
+                "reason": "no_authoritative_timeseries_binding",
+                "site_ref": "HG4",
+                "source_file_key": "sos:site_ref=HG4:year=2026",
+                "source_file_sha256": "b" * 64,
+                "source_label": "Nitrogen dioxide",
+                "normalised_source_label": "nitrogen dioxide",
+                "source_labels": ["Nitrogen dioxide"],
+                "normalised_source_labels": ["nitrogen dioxide"],
+                "pollutant_code": "no2",
+                "day_utc": self.day_utc,
+                "target_day_non_null_row_count": 24,
+                "date_valid_binding_candidate_count": 0,
+            }
+            notes = (
+                "mapping_issues=2026-07-15:no2="
+                "no_authoritative_timeseries_binding "
+                f"{MODULE._UK_AIR_MISSING_BINDING_NOTES_KEY}="
+                f"{MODULE._encode_uk_air_missing_binding_notes([warning])}"
+            )
             conn.execute(
                 """
                 INSERT INTO source_file_state (
@@ -530,6 +551,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                   remote_url_or_key, station_ref, source_location_id,
                   day_utc, exists_remote, first_seen_at_utc,
                   last_checked_at_utc, last_status,
+                  sha256_uncompressed,
                   source_count_mapping_identity, source_count_mapping_hash,
                   notes
                 ) VALUES (
@@ -537,26 +559,66 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                   'uk_air_flat_file', 'https://example.invalid/HG4_2026.csv',
                   'HG4', 'HG4', '2026-01-01', 1,
                   '2026-07-25T00:00:00Z', '2026-07-25T00:00:00Z',
-                  'unmapped_source', ?, ?,
-                  'mapping_issues=2026-07-15:no2=unmapped_source'
+                  'no_authoritative_timeseries_binding', ?, ?, ?, ?
                 )
                 """,
-                (MODULE.SOS_BRIDGE_MAPPING_IDENTITY, "a" * 64),
+                (
+                    "b" * 64,
+                    MODULE.SOS_BRIDGE_MAPPING_IDENTITY,
+                    "a" * 64,
+                    notes,
+                ),
             )
             conn.commit()
             counts, evidence = self._counts(conn)
         finally:
             conn.close()
         self.assertEqual(counts, {144: 24})
-        self.assertEqual(evidence["source_partition_state"], "mapping_unavailable")
-        self.assertFalse(evidence["source_counts_available"])
+        self.assertEqual(
+            evidence["source_partition_state"], "successful_non_empty"
+        )
+        self.assertTrue(evidence["source_counts_available"])
         self.assertEqual(evidence["source_rows"], 24)
-        self.assertEqual(evidence["expected_site_ref_groups"], 2)
+        self.assertEqual(evidence["expected_site_ref_groups"], 1)
         self.assertEqual(evidence["processed_site_ref_groups"], 1)
         self.assertEqual(evidence["resolved_site_ref_groups"], 1)
-        self.assertEqual(evidence["unresolved_site_ref_groups"], 1)
-        self.assertEqual(evidence["unmapped_site_ref_groups"], 1)
-        self.assertEqual(evidence["mapping_issue_samples"][0]["site_ref"], "HG4")
+        self.assertEqual(evidence["canonical_source_groups"], 1)
+        self.assertEqual(evidence["source_groups_examined"], 2)
+        self.assertEqual(evidence["unresolved_site_ref_groups"], 0)
+        self.assertEqual(evidence["unmapped_site_ref_groups"], 0)
+        self.assertEqual(
+            evidence["no_authoritative_timeseries_binding_groups"], 1
+        )
+        self.assertEqual(
+            evidence["no_authoritative_timeseries_binding_rows"], 24
+        )
+        self.assertEqual(
+            evidence["no_authoritative_timeseries_binding_warnings"],
+            [warning],
+        )
+
+        self.assertIsNone(
+            MODULE._build_v2_source_r2_mismatch_gap_if_complete(
+                day_utc=self.day_utc,
+                connector_id=1,
+                pollutant_code="no2",
+                expected_path="history/v2/observations/example",
+                source_counts=counts,
+                r2_counts={144: 24},
+                source_partition_evidence=evidence,
+            )
+        )
+
+        gap = MODULE._build_v2_source_r2_mismatch_gap_if_complete(
+            day_utc=self.day_utc,
+            connector_id=1,
+            pollutant_code="no2",
+            expected_path="history/v2/observations/example",
+            source_counts=counts,
+            r2_counts={144: 23},
+            source_partition_evidence=evidence,
+        )
+        self.assertIsNotNone(gap)
 
     def test_partial_source_population_cannot_create_r2_mismatch(self):
         gap = MODULE._build_v2_source_r2_mismatch_gap_if_complete(
