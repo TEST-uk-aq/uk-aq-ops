@@ -21,6 +21,10 @@ import {
   buildHistoryV2DayManifest,
 } from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
+  combineObservationHistoryPhysicalSchemas,
+  observationHistoryPhysicalSchemaForColumns,
+} from "../../workers/shared/uk_aq_observation_history_schema.mjs";
+import {
   resolveR2HistoryIndexConfig,
   updateR2HistoryIndexesTargeted,
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
@@ -572,9 +576,9 @@ async function parquetFileEntry({ store, key, domain, pollutantCode }) {
   const metadata = await parquetMetadataAsync(file);
   const rowCount = Math.max(0, Number(metadata.num_rows || 0));
   if (!rowCount) throw new Error("parquet_zero_rows");
-  const schemaColumns = new Set(
-    parquetSchema(metadata).children.map((column) => String(column.element.name)),
-  );
+  const physicalColumns = parquetSchema(metadata).children
+    .map((column) => String(column.element.name));
+  const schemaColumns = new Set(physicalColumns);
   const timestampCandidates = domain === "observations"
     ? ["observed_at_utc", "observed_at"]
     : ["timestamp_hour_utc"];
@@ -612,17 +616,22 @@ async function parquetFileEntry({ store, key, domain, pollutantCode }) {
     throw new Error("parquet_row_count_metadata_mismatch");
   }
   return {
-    key,
-    row_count: rowCount,
-    bytes: object.bytes,
-    etag_or_hash: sha256Hex(object.body),
-    pollutant_codes: [pollutantCode],
-    min_timeseries_id: minTimeseriesId,
-    max_timeseries_id: maxTimeseriesId,
-    ...(domain === "observations"
-      ? { min_observed_at_utc: minTimestamp, max_observed_at_utc: maxTimestamp }
-      : { min_timestamp_hour_utc: minTimestamp, max_timestamp_hour_utc: maxTimestamp }),
-    timeseries_row_counts: counts,
+    fileEntry: {
+      key,
+      row_count: rowCount,
+      bytes: object.bytes,
+      etag_or_hash: sha256Hex(object.body),
+      pollutant_codes: [pollutantCode],
+      min_timeseries_id: minTimeseriesId,
+      max_timeseries_id: maxTimeseriesId,
+      ...(domain === "observations"
+        ? { min_observed_at_utc: minTimestamp, max_observed_at_utc: maxTimestamp }
+        : { min_timestamp_hour_utc: minTimestamp, max_timestamp_hour_utc: maxTimestamp }),
+      timeseries_row_counts: counts,
+    },
+    physicalSchema: domain === "observations"
+      ? observationHistoryPhysicalSchemaForColumns(physicalColumns)
+      : null,
   };
 }
 
@@ -818,8 +827,24 @@ export async function leafManifestSourceFromCombined({ store, dataPrefix, base, 
   });
   try {
     const files = [];
+    const physicalSchemas = [];
     for (const key of partKeys) {
-      files.push(await parquetFileEntry({ store, key, domain, pollutantCode }));
+      const inspected = await parquetFileEntry({
+        store,
+        key,
+        domain,
+        pollutantCode,
+      });
+      files.push(inspected.fileEntry);
+      if (inspected.physicalSchema) {
+        physicalSchemas.push(inspected.physicalSchema);
+      }
+    }
+    const physicalSchema = domain === "observations"
+      ? combineObservationHistoryPhysicalSchemas(physicalSchemas)
+      : null;
+    if (Array.isArray(physicalSchema?.physical_schemas)) {
+      throw new Error("mixed_pollutant_parquet_physical_schemas");
     }
     const observationContentHash = domain === "observations"
       ? await observationContentHashForPartKeys({
@@ -834,6 +859,7 @@ export async function leafManifestSourceFromCombined({ store, dataPrefix, base, 
       provenance: metadata.provenance,
       files,
       observationContentHash,
+      physicalSchema,
     };
   } catch (error) {
     return { blocked_reason: `canonical_parquet_metadata_unreadable:${error instanceof Error ? error.message : String(error)}` };
@@ -1304,6 +1330,7 @@ export async function runV2ObservationsRepair({
           provenance,
           files,
           observationContentHash,
+          physicalSchema,
         } = source;
         const rebuilt = buildHistoryV2PollutantManifest({
           domain,
@@ -1319,6 +1346,7 @@ export async function runV2ObservationsRepair({
           writerGitSha: payload.writer_git_sha || null,
           backedUpAtUtc: payload.backed_up_at_utc || `${dayUtc}T00:00:00.000Z`,
           observationContentHash,
+          physicalSchema,
         });
         await staged.stage({
           key: manifestKey,
