@@ -192,7 +192,7 @@ CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER: dict[str, tuple[str, ...]] = {
 # are accepted in the manifest but not imported in this phase.
 CORE_TABLES_TO_IMPORT = (
     "connectors", "stations", "timeseries", "phenomena",
-    "observed_property_mappings",
+    "observed_property_mappings", "sos_station_timeseries_site_refs",
 )
 
 DAY_DIR_PATTERN = "day_utc=*"
@@ -210,6 +210,8 @@ CREATE TABLE IF NOT EXISTS core_snapshot_imports (
   rows_timeseries INTEGER DEFAULT 0,
   rows_pollutants INTEGER DEFAULT 0,
   rows_lookup INTEGER DEFAULT 0,
+  rows_sos_site_ref_bridge INTEGER DEFAULT 0,
+  sos_site_ref_bridge_sha256 TEXT,
   bytes_read INTEGER DEFAULT 0,
   status TEXT NOT NULL,
   notes TEXT
@@ -295,6 +297,31 @@ CREATE INDEX IF NOT EXISTS idx_core_observed_property_mappings_code
   ON core_observed_property_mappings_snapshot(observed_property_code);
 CREATE INDEX IF NOT EXISTS idx_core_observed_property_mappings_kind
   ON core_observed_property_mappings_snapshot(mapping_kind);
+
+CREATE TABLE IF NOT EXISTS sos_station_timeseries_site_refs_snapshot (
+  site_ref TEXT NOT NULL,
+  uk_air_ref TEXT,
+  pollutant_code TEXT NOT NULL,
+  station_id INTEGER NOT NULL,
+  timeseries_id INTEGER NOT NULL,
+  station_ref TEXT,
+  timeseries_ref TEXT,
+  valid_from_day_utc TEXT,
+  valid_to_day_utc TEXT,
+  match_method TEXT,
+  source_snapshot_at TEXT,
+  raw_payload TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  PRIMARY KEY (site_ref, pollutant_code, timeseries_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sos_site_ref_bridge_site_pollutant
+  ON sos_station_timeseries_site_refs_snapshot(site_ref, pollutant_code);
+CREATE INDEX IF NOT EXISTS idx_sos_site_ref_bridge_station
+  ON sos_station_timeseries_site_refs_snapshot(station_id);
+CREATE INDEX IF NOT EXISTS idx_sos_site_ref_bridge_timeseries
+  ON sos_station_timeseries_site_refs_snapshot(timeseries_id);
 
 CREATE TABLE IF NOT EXISTS source_station_timeseries_lookup (
   source_key TEXT NOT NULL,
@@ -739,6 +766,22 @@ def validate_v2_core_snapshot_manifest(
             return f"manifest table '{table}' is missing sha256"
         if not isinstance(entry.get("row_count"), int) or entry["row_count"] < 0:
             return f"manifest table '{table}' has invalid row_count"
+        expected_source_schema = str(manifest.get("source_schema") or "")
+        if table == "sos_station_timeseries_site_refs":
+            expected_source_schema = "uk_aq_raw"
+        represented_source_schema = entry.get("source_schema")
+        if (
+            table == "sos_station_timeseries_site_refs"
+            and represented_source_schema != expected_source_schema
+        ) or (
+            table != "sos_station_timeseries_site_refs"
+            and represented_source_schema is not None
+            and represented_source_schema != expected_source_schema
+        ):
+            return (
+                f"manifest table '{table}' source_schema must be "
+                f"'{expected_source_schema}'"
+            )
     return None
 
 
@@ -773,7 +816,9 @@ def latest_successful_import(
 ) -> dict[str, Any] | None:
     row = conn.execute(
         """
-        SELECT id, snapshot_path, snapshot_manifest_hash, snapshot_day_utc, imported_at_utc
+        SELECT id, snapshot_path, snapshot_manifest_hash, snapshot_day_utc,
+               imported_at_utc, rows_sos_site_ref_bridge,
+               sos_site_ref_bridge_sha256
         FROM core_snapshot_imports
         WHERE env_name = ? AND status = 'ok'
         ORDER BY id DESC
@@ -789,10 +834,16 @@ def latest_successful_import(
         "snapshot_manifest_hash": row[2],
         "snapshot_day_utc": row[3],
         "imported_at_utc": row[4],
+        "rows_sos_site_ref_bridge": int(row[5] or 0),
+        "sos_site_ref_bridge_sha256": str(row[6] or ""),
     }
 
 
-def snapshot_tables_have_rows(conn: sqlite3.Connection) -> bool:
+def snapshot_tables_have_rows(
+    conn: sqlite3.Connection,
+    manifest: Mapping[str, Any] | None = None,
+    previous: Mapping[str, Any] | None = None,
+) -> bool:
     """True if the per-env snapshot tables look populated.
     Re-import is forced if the previous run claimed success but the rows
     were wiped (e.g. by a manual DB reset)."""
@@ -800,7 +851,35 @@ def snapshot_tables_have_rows(conn: sqlite3.Connection) -> bool:
     mappings = conn.execute(
         "SELECT COUNT(*) FROM core_observed_property_mappings_snapshot"
     ).fetchone()
-    return bool(stations and stations[0] > 0 and mappings and mappings[0] > 0)
+    if not bool(stations and stations[0] > 0 and mappings and mappings[0] > 0):
+        return False
+    if manifest is None:
+        return _table_exists(conn, "sos_station_timeseries_site_refs_snapshot")
+    bridge_entry = next(
+        (
+            entry
+            for entry in list(manifest.get("tables") or [])
+            if isinstance(entry, Mapping)
+            and entry.get("table") == "sos_station_timeseries_site_refs"
+        ),
+        None,
+    )
+    if not isinstance(bridge_entry, Mapping):
+        return False
+    expected_rows = bridge_entry.get("row_count")
+    expected_sha = str(bridge_entry.get("sha256") or "")
+    if not isinstance(expected_rows, int) or expected_rows < 0 or not expected_sha:
+        return False
+    actual = conn.execute(
+        "SELECT COUNT(*) FROM sos_station_timeseries_site_refs_snapshot"
+    ).fetchone()
+    return bool(
+        actual
+        and int(actual[0] or 0) == expected_rows
+        and previous is not None
+        and int(previous.get("rows_sos_site_ref_bridge") or 0) == expected_rows
+        and str(previous.get("sos_site_ref_bridge_sha256") or "") == expected_sha
+    )
 
 
 def _row_get_int(row: dict[str, Any], key: str) -> int | None:
@@ -933,12 +1012,46 @@ def _observed_property_mappings_insert_spec() -> tuple[str, Any]:
     return sql, to_tuple
 
 
+def _sos_site_ref_bridge_insert_spec() -> tuple[str, Any]:
+    sql = (
+        "INSERT INTO sos_station_timeseries_site_refs_snapshot "
+        "(site_ref, uk_air_ref, pollutant_code, station_id, timeseries_id, "
+        " station_ref, timeseries_ref, valid_from_day_utc, valid_to_day_utc, "
+        " match_method, source_snapshot_at, raw_payload, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    def to_tuple(r: dict[str, Any]) -> tuple:
+        raw_payload = r.get("raw_payload")
+        return (
+            str(r.get("site_ref") or "").strip().upper(),
+            _row_get_str(r, "uk_air_ref"),
+            str(r.get("pollutant_code") or "").strip().lower(),
+            _row_get_int(r, "station_id"),
+            _row_get_int(r, "timeseries_id"),
+            _row_get_str(r, "station_ref"),
+            _row_get_str(r, "timeseries_ref"),
+            _row_get_str(r, "valid_from_day_utc"),
+            _row_get_str(r, "valid_to_day_utc"),
+            _row_get_str(r, "match_method"),
+            _row_get_str(r, "source_snapshot_at"),
+            json.dumps(raw_payload, sort_keys=True, separators=(",", ":"))
+            if raw_payload is not None
+            else None,
+            _row_get_str(r, "created_at"),
+            _row_get_str(r, "updated_at"),
+        )
+
+    return sql, to_tuple
+
+
 _INSERT_SPECS = {
     "connectors": _connectors_insert_spec,
     "stations":   _stations_insert_spec,
     "timeseries": _timeseries_insert_spec,
     "phenomena":  _phenomena_insert_spec,
     "observed_property_mappings": _observed_property_mappings_insert_spec,
+    "sos_station_timeseries_site_refs": _sos_site_ref_bridge_insert_spec,
 }
 
 _TARGET_TABLES = {
@@ -947,6 +1060,8 @@ _TARGET_TABLES = {
     "timeseries": "core_timeseries_snapshot",
     "phenomena":  "core_phenomena_snapshot",
     "observed_property_mappings": "core_observed_property_mappings_snapshot",
+    "sos_station_timeseries_site_refs":
+        "sos_station_timeseries_site_refs_snapshot",
 }
 
 
@@ -1209,6 +1324,12 @@ def import_core_snapshot(
         "previous_manifest_hash": None,
         "tables": {},
         "rows_lookup": 0,
+        "sos_site_ref_bridge": {
+            "row_count": 0,
+            "sha256": None,
+            "sha256_uncompressed": None,
+            "source_schema": "uk_aq_raw",
+        },
         "bytes_read": 0,
         "error": None,
     }
@@ -1237,6 +1358,20 @@ def import_core_snapshot(
     result["snapshot_day_dir"] = str(day_dir)
     result["snapshot_day_utc"] = day_utc
     result["manifest_hash"] = manifest_hash
+    bridge_entry = next(
+        entry
+        for entry in manifest["tables"]
+        if entry.get("table") == "sos_station_timeseries_site_refs"
+    )
+    result["sos_site_ref_bridge"] = {
+        "row_count": int(bridge_entry["row_count"]),
+        "sha256": str(bridge_entry["sha256"]),
+        "sha256_uncompressed": str(
+            bridge_entry.get("sha256_uncompressed") or ""
+        )
+        or None,
+        "source_schema": str(bridge_entry.get("source_schema") or ""),
+    }
 
     previous = latest_successful_import(conn, env_name)
     if previous:
@@ -1246,9 +1381,18 @@ def import_core_snapshot(
         not force
         and previous is not None
         and previous["snapshot_manifest_hash"] == manifest_hash
-        and snapshot_tables_have_rows(conn)
+        and snapshot_tables_have_rows(conn, manifest, previous)
     ):
         result["status"] = "reused"
+        result["tables"] = {
+            str(entry["table"]): int(entry["row_count"])
+            for entry in manifest["tables"]
+            if entry.get("table") in CORE_TABLES_TO_IMPORT
+        }
+        lookup_count = conn.execute(
+            "SELECT COUNT(*) FROM source_station_timeseries_lookup"
+        ).fetchone()
+        result["rows_lookup"] = int(lookup_count[0] or 0) if lookup_count else 0
         log.info(
             "snapshot reused: day=%s manifest_hash=%s (previous import id=%s)",
             day_utc, manifest_hash, previous["id"],
@@ -1309,6 +1453,8 @@ def import_core_snapshot(
               rows_timeseries = ?,
               rows_pollutants = ?,
               rows_lookup = ?,
+              rows_sos_site_ref_bridge = ?,
+              sos_site_ref_bridge_sha256 = ?,
               bytes_read = ?,
               status = 'ok',
               notes = 'phase2: import + lookup rebuild succeeded.'
@@ -1320,6 +1466,8 @@ def import_core_snapshot(
                 rows_by_table.get("timeseries", 0),
                 rows_by_table.get("phenomena", 0),
                 rows_lookup,
+                rows_by_table.get("sos_station_timeseries_site_refs", 0),
+                str(bridge_entry["sha256"]),
                 bytes_total,
                 import_id,
             ),
@@ -1678,7 +1826,7 @@ UK_AIR_TIMESTAMP_HELPER_PATH = (
 UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS_ENV = (
     "UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS"
 )
-UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS_DEFAULT = "pm25,pm10,no2"
+UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS_DEFAULT = "pm25,pm10,no2,o3"
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ENV = "UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS"
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ALLOWED = {"none", "changed", "all"}
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_DEFAULT = "changed"
@@ -2059,14 +2207,14 @@ def _resolve_sos_target_pollutants(env: Mapping[str, str] | None = None) -> tupl
         cleaned = str(token).strip().lower()
         if not cleaned:
             continue
-        if cleaned not in {"pm25", "pm10", "no2"}:
+        if cleaned not in {"pm25", "pm10", "no2", "o3"}:
             continue
         if cleaned in seen:
             continue
         seen.add(cleaned)
         out.append(cleaned)
     if not out:
-        return ("pm25", "pm10", "no2")
+        return ("pm25", "pm10", "no2", "o3")
     return tuple(out)
 
 
@@ -2517,6 +2665,8 @@ def _uk_air_normalize_pollutant_code(value: Any) -> str | None:
         return "pm10"
     if "no2" in compact or "nitrogendioxide" in compact:
         return "no2"
+    if compact == "o3" or "ozone" in compact:
+        return "o3"
     return None
 
 
@@ -2610,7 +2760,7 @@ def _group_uk_air_flat_file_mapping_rows(
     for row in rows:
         site_ref = str(row.get("site_ref") or "").strip().upper()
         pollutant_code = str(row.get("pollutant_code") or "").strip().lower()
-        if not site_ref or pollutant_code not in {"pm25", "pm10", "no2"}:
+        if not site_ref or pollutant_code not in {"pm25", "pm10", "no2", "o3"}:
             continue
         grouped.setdefault(site_ref, {}).setdefault(pollutant_code, []).append(dict(row))
     return grouped
@@ -9023,6 +9173,406 @@ def _source_counts_presence_and_availability(
     return present, present
 
 
+def _is_sos_connector(conn: sqlite3.Connection, connector_id: int) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM core_connectors_snapshot
+        WHERE id = ? AND lower(trim(connector_code)) = 'sos'
+        LIMIT 1
+        """,
+        (int(connector_id),),
+    ).fetchone()
+    return row is not None
+
+
+def _sos_source_counts_for_v2_partition(
+    conn: sqlite3.Connection,
+    *,
+    env_name: str | None,
+    day_utc: str,
+    connector_id: int,
+    pollutant_code: str,
+) -> tuple[dict[int, int], dict[str, Any]]:
+    """Resolve UK-AIR annual-file counts through the authoritative site bridge.
+
+    ``source_file_state.source_location_id`` is the UK-AIR ``site_ref``.  It
+    must never be compared with the numeric SOS ``station_ref`` held by the
+    generic source lookup.
+    """
+    wanted_pollutant = str(pollutant_code or "").strip().lower()
+    bridge_table = "sos_station_timeseries_site_refs_snapshot"
+    evidence: dict[str, Any] = {
+        "source_partition_state": "counts_unavailable",
+        "source_counts_present": False,
+        "source_counts_available": False,
+        "source_rows": 0,
+        "source_timeseries_row_counts": {},
+        "source_file_count": 0,
+        "source_file_keys": [],
+        "source_skip_reason": "sos_site_ref_bridge_unavailable",
+        "identity_resolution": "uk_air_site_ref_to_sos_timeseries_bridge",
+        "bridge_table": bridge_table,
+        "bridge_row_count": 0,
+        "bridge_sha256": None,
+        "source_group_count": 0,
+        "resolved_site_ref_groups": 0,
+        "unresolved_site_ref_groups": 0,
+        "unmapped_site_ref_groups": 0,
+        "ambiguous_site_ref_groups": 0,
+        "timeseries_conflict_groups": 0,
+        "source_counts_by_pollutant": {wanted_pollutant: 0},
+    }
+
+    def finish(
+        *,
+        state: str,
+        reason: str | None,
+        counts: Mapping[int, int] | None = None,
+        available: bool = False,
+    ) -> tuple[dict[int, int], dict[str, Any]]:
+        normalized_counts = {
+            int(timeseries_id): int(count)
+            for timeseries_id, count in sorted((counts or {}).items())
+            if int(timeseries_id) > 0 and int(count) > 0
+        }
+        source_rows = sum(normalized_counts.values())
+        evidence.update({
+            "source_partition_state": state,
+            "source_counts_present": bool(normalized_counts),
+            "source_counts_available": bool(available),
+            "source_rows": source_rows,
+            "source_timeseries_row_counts": {
+                str(timeseries_id): count
+                for timeseries_id, count in normalized_counts.items()
+            },
+            "source_skip_reason": reason,
+            "source_counts_by_pollutant": {wanted_pollutant: source_rows},
+        })
+        evidence["partition"] = {
+            "state": state,
+            "source_counts_present": bool(normalized_counts),
+            "source_counts_available": bool(available),
+            "source_rows": source_rows,
+            "source_timeseries_row_counts":
+                dict(evidence["source_timeseries_row_counts"]),
+            "source_file_count": int(evidence["source_file_count"]),
+            "source_file_keys": list(evidence["source_file_keys"]),
+            "source_skip_reason": reason,
+            "identity_resolution": evidence["identity_resolution"],
+            "bridge_row_count": int(evidence["bridge_row_count"]),
+            "bridge_sha256": evidence["bridge_sha256"],
+            "source_group_count": int(evidence["source_group_count"]),
+            "resolved_site_ref_groups":
+                int(evidence["resolved_site_ref_groups"]),
+            "unresolved_site_ref_groups":
+                int(evidence["unresolved_site_ref_groups"]),
+            "unmapped_site_ref_groups":
+                int(evidence["unmapped_site_ref_groups"]),
+            "ambiguous_site_ref_groups":
+                int(evidence["ambiguous_site_ref_groups"]),
+            "timeseries_conflict_groups":
+                int(evidence["timeseries_conflict_groups"]),
+            "source_counts_by_pollutant":
+                dict(evidence["source_counts_by_pollutant"]),
+        }
+        return normalized_counts, evidence
+
+    if not _table_exists(conn, bridge_table):
+        return finish(
+            state="bridge_unavailable",
+            reason="sos_site_ref_bridge_table_absent",
+        )
+
+    import_row = conn.execute(
+        """
+        SELECT rows_sos_site_ref_bridge, sos_site_ref_bridge_sha256
+        FROM core_snapshot_imports
+        WHERE status = 'ok'
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    actual_bridge_count_row = conn.execute(
+        f"SELECT COUNT(*) FROM {bridge_table}"
+    ).fetchone()
+    actual_bridge_count = int(actual_bridge_count_row[0] or 0)
+    evidence["bridge_row_count"] = actual_bridge_count
+    if (
+        import_row is None
+        or int(import_row[0] or 0) != actual_bridge_count
+        or not str(import_row[1] or "").strip()
+    ):
+        return finish(
+            state="bridge_unavailable",
+            reason="sos_site_ref_bridge_import_identity_unavailable",
+        )
+    evidence["bridge_sha256"] = str(import_row[1])
+    if actual_bridge_count <= 0:
+        return finish(
+            state="bridge_unavailable",
+            reason="sos_site_ref_bridge_empty",
+        )
+
+    successful_statuses = {
+        "first_seen",
+        "changed",
+        "reappeared",
+        "unchanged",
+        "unmapped_source",
+        "mixed_mapping_issues",
+    }
+    params: list[Any] = [
+        day_utc,
+        int(connector_id),
+        SOS_SOURCE_KEY,
+        *sorted(successful_statuses),
+    ]
+    env_where = ""
+    if env_name:
+        env_where = "AND s.env_name = ?"
+        params.append(env_name)
+    source_rows = conn.execute(
+        f"""
+        SELECT
+          upper(trim(s.source_location_id)) AS site_ref,
+          c.timeseries_id,
+          SUM(c.row_count) AS source_row_count,
+          group_concat(DISTINCT s.source_file_key) AS source_file_keys,
+          t.timeseries_ref,
+          t.label,
+          p.label,
+          p.source_label,
+          p.pollutant_label,
+          m.observed_property_code,
+          m.observed_property_code_count
+        FROM source_file_timeseries_counts c
+        JOIN source_file_state s
+          ON s.source_file_key = c.source_file_key
+        JOIN core_timeseries_snapshot t
+          ON t.id = c.timeseries_id
+        LEFT JOIN core_phenomena_snapshot p
+          ON p.id = t.phenomenon_id
+        LEFT JOIN (
+          SELECT
+            connector_id,
+            observed_property_id,
+            MIN(lower(trim(observed_property_code))) AS observed_property_code,
+            COUNT(DISTINCT lower(trim(observed_property_code)))
+              AS observed_property_code_count
+          FROM core_observed_property_mappings_snapshot
+          WHERE is_active = 1
+            AND observed_property_id IS NOT NULL
+            AND trim(observed_property_code) != ''
+          GROUP BY connector_id, observed_property_id
+        ) m
+          ON m.connector_id = t.connector_id
+         AND m.observed_property_id = p.observed_property_id
+        WHERE c.day_utc = ?
+          AND c.row_count > 0
+          AND t.connector_id = ?
+          AND s.source_key = ?
+          AND s.exists_remote = 1
+          AND s.last_status IN ({','.join('?' for _ in successful_statuses)})
+          AND s.source_location_id IS NOT NULL
+          AND trim(s.source_location_id) != ''
+          {env_where}
+        GROUP BY
+          upper(trim(s.source_location_id)),
+          c.timeseries_id,
+          t.timeseries_ref,
+          t.label,
+          p.label,
+          p.source_label,
+          p.pollutant_label,
+          m.observed_property_code,
+          m.observed_property_code_count
+        ORDER BY upper(trim(s.source_location_id)), c.timeseries_id
+        """,
+        tuple(params),
+    ).fetchall()
+
+    selected_source_rows: list[tuple[Any, ...]] = []
+    all_source_file_keys: set[str] = set()
+    for row in source_rows:
+        authoritative_code = str(row[9] or "").strip().lower()
+        authoritative_count = int(row[10] or 0)
+        if authoritative_count == 1 and authoritative_code:
+            resolved_pollutant = authoritative_code
+        else:
+            resolved_pollutants = {
+                code
+                for code in (
+                    _normalize_history_pollutant_code(value)
+                    for value in row[4:9]
+                )
+                if code
+            }
+            resolved_pollutant = (
+                next(iter(resolved_pollutants))
+                if len(resolved_pollutants) == 1
+                else None
+            )
+        if resolved_pollutant != wanted_pollutant:
+            continue
+        selected_source_rows.append(row)
+        all_source_file_keys.update(
+            key for key in str(row[3] or "").split(",") if key
+        )
+
+    evidence["source_group_count"] = len(selected_source_rows)
+    evidence["source_file_keys"] = sorted(all_source_file_keys)
+    evidence["source_file_count"] = len(all_source_file_keys)
+
+    bridge_rows = conn.execute(
+        f"""
+        SELECT
+          upper(trim(b.site_ref)) AS site_ref,
+          b.station_id,
+          b.timeseries_id,
+          b.valid_from_day_utc,
+          b.valid_to_day_utc,
+          t.connector_id AS timeseries_connector_id,
+          t.station_id AS timeseries_station_id,
+          s.connector_id AS station_connector_id
+        FROM {bridge_table} b
+        LEFT JOIN core_timeseries_snapshot t ON t.id = b.timeseries_id
+        LEFT JOIN core_stations_snapshot s ON s.id = b.station_id
+        WHERE lower(trim(b.pollutant_code)) = ?
+          AND (b.valid_from_day_utc IS NULL OR b.valid_from_day_utc <= ?)
+          AND (b.valid_to_day_utc IS NULL OR b.valid_to_day_utc >= ?)
+        ORDER BY upper(trim(b.site_ref)), b.timeseries_id
+        """,
+        (wanted_pollutant, day_utc, day_utc),
+    ).fetchall()
+    candidates_by_site: dict[str, list[tuple[Any, ...]]] = {}
+    for row in bridge_rows:
+        candidates_by_site.setdefault(str(row[0]), []).append(row)
+
+    if candidates_by_site:
+        selected_day = dt.date.fromisoformat(day_utc)
+        source_years = _uk_air_source_year_selection([selected_day])["years"]
+        required_source_file_keys = {
+            _uk_air_flat_file_source_file_key(site_ref, int(year))
+            for site_ref in candidates_by_site
+            for year in source_years
+        }
+        state_params: list[Any] = [
+            *sorted(required_source_file_keys),
+            *sorted(successful_statuses),
+        ]
+        state_env_where = ""
+        if env_name:
+            state_env_where = "AND env_name = ?"
+            state_params.append(env_name)
+        successful_state_rows = conn.execute(
+            f"""
+            SELECT source_file_key
+            FROM source_file_state
+            WHERE source_file_key IN (
+              {','.join('?' for _ in required_source_file_keys)}
+            )
+              AND source_key = '{SOS_SOURCE_KEY}'
+              AND exists_remote = 1
+              AND last_status IN (
+                {','.join('?' for _ in successful_statuses)}
+              )
+              {state_env_where}
+            ORDER BY source_file_key
+            """,
+            tuple(state_params),
+        ).fetchall()
+        successful_source_file_keys = {
+            str(row[0]) for row in successful_state_rows
+        }
+        missing_source_file_keys = sorted(
+            required_source_file_keys - successful_source_file_keys
+        )
+        evidence["required_source_file_count"] = len(
+            required_source_file_keys
+        )
+        evidence["successful_source_file_count"] = len(
+            successful_source_file_keys
+        )
+        if missing_source_file_keys:
+            evidence["missing_source_file_keys"] = missing_source_file_keys[:50]
+            return finish(
+                state="source_files_incomplete",
+                reason="required_uk_air_annual_source_files_incomplete",
+            )
+
+    counts: dict[int, int] = {}
+    issue_samples: list[dict[str, Any]] = []
+    for row in selected_source_rows:
+        site_ref = str(row[0])
+        timeseries_id = int(row[1])
+        source_row_count = int(row[2] or 0)
+        candidates = candidates_by_site.get(site_ref, [])
+        issue: str | None = None
+        if not candidates:
+            issue = "unmapped_site_ref"
+            evidence["unmapped_site_ref_groups"] += 1
+        elif len(candidates) != 1:
+            issue = "ambiguous_site_ref"
+            evidence["ambiguous_site_ref_groups"] += 1
+        else:
+            candidate = candidates[0]
+            bridge_station_id = int(candidate[1] or 0)
+            bridge_timeseries_id = int(candidate[2] or 0)
+            identity_valid = (
+                int(candidate[5] or 0) == int(connector_id)
+                and int(candidate[6] or 0) == bridge_station_id
+                and int(candidate[7] or 0) == int(connector_id)
+            )
+            if bridge_timeseries_id != timeseries_id or not identity_valid:
+                issue = "timeseries_conflict"
+                evidence["timeseries_conflict_groups"] += 1
+        if issue is not None:
+            evidence["unresolved_site_ref_groups"] += 1
+            if len(issue_samples) < 25:
+                issue_samples.append({
+                    "site_ref": site_ref,
+                    "timeseries_id": timeseries_id,
+                    "source_rows": source_row_count,
+                    "issue": issue,
+                    "bridge_timeseries_ids": [
+                        int(candidate[2] or 0) for candidate in candidates
+                    ],
+                })
+            continue
+        evidence["resolved_site_ref_groups"] += 1
+        counts[timeseries_id] = counts.get(timeseries_id, 0) + source_row_count
+
+    if issue_samples:
+        evidence["mapping_issue_samples"] = issue_samples
+    if evidence["unresolved_site_ref_groups"]:
+        return finish(
+            state="mapping_unavailable",
+            reason="sos_site_ref_bridge_mapping_unresolved",
+        )
+    if selected_source_rows and not counts:
+        return finish(
+            state="mapping_unavailable",
+            reason="sos_source_rows_resolved_to_zero_counts",
+        )
+    if counts:
+        return finish(
+            state="successful_non_empty",
+            reason=None,
+            counts=counts,
+            available=True,
+        )
+    if not bridge_rows:
+        return finish(
+            state="bridge_unavailable",
+            reason="sos_site_ref_bridge_pollutant_unavailable",
+        )
+    return finish(
+        state="counts_unavailable",
+        reason="sos_source_counts_unavailable_for_selected_pollutant",
+    )
+
+
 def _current_source_counts_for_v2_partition(
     conn: sqlite3.Connection | None,
     *,
@@ -9073,6 +9623,15 @@ def _current_source_counts_for_v2_partition(
         partition_evidence["partition"]["state"] = "scope_unavailable"
         partition_evidence["partition"]["source_skip_reason"] = "source_scope_has_no_source_keys"
         return {}, partition_evidence
+
+    if SOS_SOURCE_KEY in source_keys and _is_sos_connector(conn, connector_id):
+        return _sos_source_counts_for_v2_partition(
+            conn,
+            env_name=env_name,
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+        )
 
     day = dt.date.fromisoformat(day_utc)
     lookup_rows = conn.execute(
@@ -9744,6 +10303,7 @@ def run_v2_observations_integrity_checks(
 
     gaps: list[dict[str, Any]] = []
     hash_check_candidates: list[dict[str, Any]] = []
+    source_resolution_by_pollutant: dict[str, dict[str, Any]] = {}
     checked = 0
     verified_first_value_at_minima: dict[
         tuple[str, int],
@@ -9969,6 +10529,77 @@ def run_v2_observations_integrity_checks(
                     for partition_gap in gaps[partition_gap_start:]:
                         partition_gap.setdefault("source_evidence", {}).update(source_partition_evidence)
 
+                if (
+                    source_partition_evidence is not None
+                    and source_partition_evidence.get("identity_resolution")
+                    == "uk_air_site_ref_to_sos_timeseries_bridge"
+                ):
+                    source_resolution_by_pollutant[pollutant] = {
+                        "bridge_row_count": int(
+                            source_partition_evidence.get("bridge_row_count")
+                            or 0
+                        ),
+                        "bridge_sha256":
+                            source_partition_evidence.get("bridge_sha256"),
+                        "source_group_count": int(
+                            source_partition_evidence.get("source_group_count")
+                            or 0
+                        ),
+                        "resolved_site_ref_groups": int(
+                            source_partition_evidence.get(
+                                "resolved_site_ref_groups"
+                            )
+                            or 0
+                        ),
+                        "unresolved_site_ref_groups": int(
+                            source_partition_evidence.get(
+                                "unresolved_site_ref_groups"
+                            )
+                            or 0
+                        ),
+                        "source_rows": int(
+                            source_partition_evidence.get("source_rows") or 0
+                        ),
+                        "source_partition_state":
+                            source_partition_evidence.get(
+                                "source_partition_state"
+                            ),
+                        "source_skip_reason":
+                            source_partition_evidence.get("source_skip_reason"),
+                    }
+                    source_state = str(
+                        source_partition_evidence.get(
+                            "source_partition_state"
+                        )
+                        or ""
+                    )
+                    if parquet_readable and source_state not in {
+                        "successful_non_empty",
+                        "successful_empty",
+                    }:
+                        mapping_failure = source_state == "mapping_unavailable"
+                        gap = _v2_obs_gap(
+                            "source_mapping_issue"
+                            if mapping_failure
+                            else "source_unavailable",
+                            day_utc=day_utc,
+                            connector_id=connector_raw,
+                            pollutant_code=pollutant,
+                            expected_path=manifest_rel,
+                            related_paths=[
+                                str(
+                                    source_partition_evidence.get(
+                                        "source_skip_reason"
+                                    )
+                                    or "sos_source_hash_input_unavailable"
+                                )
+                            ],
+                        )
+                        gap["source_evidence"] = dict(
+                            source_partition_evidence
+                        )
+                        gaps.append(gap)
+
                 if parquet_stats is not None and connector_id_for_source is not None:
                     stale_gap = _build_v2_source_r2_mismatch_gap(
                         day_utc=day_utc,
@@ -10071,10 +10702,18 @@ def run_v2_observations_integrity_checks(
         if day_utc not in blocked_days
         and (day_utc, connector_id) not in blocked_connector_days
     ]
-    if verified_first_value_at_scope_sink is not None:
-        verified_first_value_at_scope_sink.extend(
-            verified_first_value_at_scopes
+    blocked_first_value_at_scopes = [
+        {
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "reason": "count_hash_or_status_verification_incomplete",
+        }
+        for (day_utc, connector_id) in sorted(
+            verified_first_value_at_minima
         )
+        if day_utc in blocked_days
+        or (day_utc, connector_id) in blocked_connector_days
+    ]
     status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
     result = {
         "status": status,
@@ -10085,6 +10724,21 @@ def run_v2_observations_integrity_checks(
         "gap_count": len(gaps),
         "gaps": gaps,
         "hash_check_candidates": hash_check_candidates,
+        "hash_candidates_by_pollutant": {
+            pollutant: sum(
+                1
+                for candidate in hash_check_candidates
+                if candidate.get("pollutant_code") == pollutant
+            )
+            for pollutant in sorted(V2_OBSERVATION_INTEGRITY_POLLUTANTS)
+        },
+        "source_resolution_by_pollutant": source_resolution_by_pollutant,
+        "first_value_at_candidate_scopes": verified_first_value_at_scopes,
+        "first_value_at_evidence": {
+            "status": "pending_observation_content_hash_checks",
+            "eligible_scopes": [],
+            "blocked_scopes": blocked_first_value_at_scopes,
+        },
         "repair_plan": build_v2_repair_plan(observation_gaps=gaps, conn=conn),
     }
     if source_scope is not None:
@@ -14761,6 +15415,97 @@ def _observation_rows_from_local_parquet_for_shared_hash(
     return rows
 
 
+def _finalize_first_value_at_evidence(
+    v2_observations: dict[str, Any],
+    *,
+    sink: list[dict[str, Any]] | None = None,
+) -> None:
+    blocked_days: set[str] = set()
+    blocked_connector_days: set[tuple[str, int]] = set()
+    reasons_by_scope: dict[tuple[str, int], set[str]] = {}
+    for gap in list(v2_observations.get("gaps") or []):
+        if (
+            gap.get("hash_content_verified") is True
+            and gap.get("gap_type") in {
+                "observation_content_hash_missing",
+                "observation_content_hash_invalid_contract",
+            }
+        ):
+            # A hashless legacy manifest may need metadata adoption even
+            # though its Parquet content and status counts passed the full
+            # source comparison. That metadata-only finding does not revoke
+            # the data verification used for first_value_at evidence.
+            continue
+        day_utc = str(gap.get("day_utc") or "").strip()
+        if not day_utc:
+            continue
+        try:
+            connector_id = int(gap.get("connector_id"))
+        except (TypeError, ValueError):
+            blocked_days.add(day_utc)
+            continue
+        if connector_id <= 0:
+            blocked_days.add(day_utc)
+            continue
+        scope = (day_utc, connector_id)
+        blocked_connector_days.add(scope)
+        reasons_by_scope.setdefault(scope, set()).add(
+            str(gap.get("gap_type") or "integrity_gap")
+        )
+
+    candidates = [
+        dict(scope)
+        for scope in list(
+            v2_observations.get("first_value_at_candidate_scopes") or []
+        )
+        if isinstance(scope, Mapping)
+    ]
+    eligible: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for scope in candidates:
+        day_utc = str(scope.get("day_utc") or "")
+        connector_id = int(scope.get("connector_id") or 0)
+        key = (day_utc, connector_id)
+        if day_utc in blocked_days or key in blocked_connector_days:
+            blocked.append({
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "reason": "count_hash_or_status_verification_incomplete",
+                "gap_types": sorted(reasons_by_scope.get(key, set())),
+            })
+        else:
+            eligible.append(scope)
+
+    existing_blocked = list(
+        (v2_observations.get("first_value_at_evidence") or {}).get(
+            "blocked_scopes"
+        )
+        or []
+    )
+    seen_blocked = {
+        (str(item.get("day_utc") or ""), int(item.get("connector_id") or 0))
+        for item in blocked
+    }
+    for item in existing_blocked:
+        key = (
+            str(item.get("day_utc") or ""),
+            int(item.get("connector_id") or 0),
+        )
+        if key not in seen_blocked:
+            blocked.append(dict(item))
+            seen_blocked.add(key)
+
+    v2_observations["first_value_at_evidence"] = {
+        "status": "eligible" if eligible and not blocked else "blocked",
+        "eligible_scopes": eligible,
+        "blocked_scopes": blocked,
+        "eligible_scope_count": len(eligible),
+        "blocked_scope_count": len(blocked),
+    }
+    if sink is not None:
+        sink.extend(eligible)
+
+
 def run_v2_observation_content_hash_checks(
     *,
     conn: sqlite3.Connection,
@@ -14770,6 +15515,7 @@ def run_v2_observation_content_hash_checks(
     v2_observations: dict[str, Any],
     source_scope: Mapping[str, Any] | None,
     log: logging.Logger,
+    verified_first_value_at_scope_sink: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     candidates = [
         dict(candidate)
@@ -14777,13 +15523,36 @@ def run_v2_observation_content_hash_checks(
         if isinstance(candidate, Mapping)
     ]
     if not candidates:
-        return {
+        source_resolution = dict(
+            v2_observations.get("source_resolution_by_pollutant") or {}
+        )
+        source_reasons = sorted({
+            str(entry.get("source_skip_reason"))
+            for entry in source_resolution.values()
+            if isinstance(entry, Mapping) and entry.get("source_skip_reason")
+        })
+        zero_reason = (
+            "source_resolution_failed:" + ",".join(source_reasons)
+            if source_reasons
+            else "no_count_matching_readable_partitions"
+        )
+        metrics = {
             "checked": 0,
             "verified": 0,
             "missing": 0,
             "mismatch": 0,
             "invalid_contract": 0,
+            "zero_hash_checks_reason": zero_reason,
+            "hash_candidates_by_pollutant": dict(
+                v2_observations.get("hash_candidates_by_pollutant") or {}
+            ),
         }
+        v2_observations["observation_content_hash_checks"] = metrics
+        _finalize_first_value_at_evidence(
+            v2_observations,
+            sink=verified_first_value_at_scope_sink,
+        )
+        return metrics
     log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     stage_root = log_dir / "_observation_hash_detector"
     evidence_by_connector_day: dict[tuple[str, int], dict[str, Any]] = {}
@@ -14875,6 +15644,10 @@ def run_v2_observation_content_hash_checks(
         "missing": 0,
         "mismatch": 0,
         "invalid_contract": 0,
+        "zero_hash_checks_reason": None,
+        "hash_candidates_by_pollutant": dict(
+            v2_observations.get("hash_candidates_by_pollutant") or {}
+        ),
     }
     new_gaps: list[dict[str, Any]] = []
     verified_partitions: list[dict[str, Any]] = []
@@ -15054,6 +15827,10 @@ def run_v2_observation_content_hash_checks(
         **metrics,
         "verified_partitions": verified_partitions,
     }
+    _finalize_first_value_at_evidence(
+        v2_observations,
+        sink=verified_first_value_at_scope_sink,
+    )
     return metrics
 
 
@@ -20295,6 +21072,8 @@ def open_db(db_path: str) -> sqlite3.Connection:
     ensure_columns(conn, "core_snapshot_imports", {
         "snapshot_day_utc": "TEXT",
         "bytes_read": "INTEGER DEFAULT 0",
+        "rows_sos_site_ref_bridge": "INTEGER DEFAULT 0",
+        "sos_site_ref_bridge_sha256": "TEXT",
     })
     ensure_columns(conn, "cross_checks", {
         "history_version": "TEXT",
@@ -20785,11 +21564,21 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Snapshot dir:  {snap.get('snapshot_day_dir') or '(none)'}",
             f"- Bytes read:    {snap.get('bytes_read', 0)}",
             f"- Lookup rows:   {snap.get('rows_lookup', 0)}",
+            "- SOS site-ref bridge: "
+            f"rows={(snap.get('sos_site_ref_bridge') or {}).get('row_count', 0)} "
+            f"sha256={(snap.get('sos_site_ref_bridge') or {}).get('sha256') or '(none)'} "
+            f"source_schema={(snap.get('sos_site_ref_bridge') or {}).get('source_schema') or '(none)'}",
         ])
         tables = snap.get("tables") or {}
         if tables:
             lines.append("- Table rows:")
-            for table in ("connectors", "stations", "timeseries", "phenomena"):
+            for table in (
+                "connectors",
+                "stations",
+                "timeseries",
+                "phenomena",
+                "sos_station_timeseries_site_refs",
+            ):
                 if table in tables:
                     lines.append(f"  - {table}: {tables[table]}")
         if snap.get("error"):
@@ -21132,6 +21921,17 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     debug = aqi.get("debug") or {}
                     debug_mode = "skipped" if not debug.get("checked") else ("required" if debug.get("required") else "warning-only")
                     source_scope = obs.get("source_scope") or aqi.get("source_scope") or {}
+                    hash_checks = (
+                        obs.get("observation_content_hash_checks")
+                        or cc.get("observation_content_hash_checks")
+                        or {}
+                    )
+                    source_resolution = (
+                        obs.get("source_resolution_by_pollutant") or {}
+                    )
+                    first_value_evidence = (
+                        obs.get("first_value_at_evidence") or {}
+                    )
                     source_scope_line = "all connectors"
                     if source_scope.get("scope") == "source":
                         connector_ids = source_scope.get("connector_ids") or []
@@ -21145,9 +21945,47 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         f"- AQI debug checks: {debug_mode}",
                         f"- Checked observation partitions: {obs.get('checked_partitions', 0)}",
                         f"- Observation gaps: {obs.get('gap_count', len(gaps))}",
+                        "- Observation hash checks: "
+                        f"checked={hash_checks.get('checked', 0)} "
+                        f"verified={hash_checks.get('verified', 0)} "
+                        f"missing={hash_checks.get('missing', 0)} "
+                        f"mismatch={hash_checks.get('mismatch', 0)} "
+                        f"invalid_contract={hash_checks.get('invalid_contract', 0)}",
+                        "- Hash candidates by pollutant: "
+                        + json.dumps(
+                            obs.get("hash_candidates_by_pollutant") or {},
+                            sort_keys=True,
+                        ),
+                        "- Zero hash checks reason: "
+                        f"{hash_checks.get('zero_hash_checks_reason') or '(none)'}",
+                        "- first_value_at evidence: "
+                        f"status={first_value_evidence.get('status') or '(none)'} "
+                        f"eligible={first_value_evidence.get('eligible_scope_count', 0)} "
+                        f"blocked={first_value_evidence.get('blocked_scope_count', 0)}",
                         f"- Checked AQI hourly data partitions: {aqi.get('checked_partitions', 0)}",
                         f"- AQI hourly data gaps: {aqi.get('gap_count', len(aqi.get('gaps') or []))}",
                     ])
+                    if source_resolution:
+                        lines.extend([
+                            "",
+                            "### SOS site-ref source resolution",
+                            "",
+                            "| Pollutant | Bridge rows | Source groups | Resolved | Unresolved | Source rows | State | Reason |",
+                            "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+                        ])
+                        for pollutant, source_item in sorted(
+                            source_resolution.items()
+                        ):
+                            lines.append(
+                                f"| {pollutant} | "
+                                f"{source_item.get('bridge_row_count', 0)} | "
+                                f"{source_item.get('source_group_count', 0)} | "
+                                f"{source_item.get('resolved_site_ref_groups', 0)} | "
+                                f"{source_item.get('unresolved_site_ref_groups', 0)} | "
+                                f"{source_item.get('source_rows', 0)} | "
+                                f"{source_item.get('source_partition_state') or ''} | "
+                                f"{source_item.get('source_skip_reason') or ''} |"
+                            )
                     if gaps:
                         lines.extend([
                             "",
@@ -21693,6 +22531,12 @@ def main(argv: list[str]) -> int:
                 "previous_manifest_hash": None,
                 "tables": {},
                 "rows_lookup": 0,
+                "sos_site_ref_bridge": {
+                    "row_count": 0,
+                    "sha256": None,
+                    "sha256_uncompressed": None,
+                    "source_schema": "uk_aq_raw",
+                },
                 "bytes_read": 0,
             }
             warnings_delta += 1
@@ -21833,9 +22677,6 @@ def main(argv: list[str]) -> int:
                 allowed_connector_ids=v2_allowed_connector_ids,
                 source_scope=v2_source_scope,
                 log=log,
-                verified_first_value_at_scope_sink=(
-                    verified_first_value_at_connector_days
-                ),
             )
             observation_hash_metrics = run_v2_observation_content_hash_checks(
                 conn=conn,
@@ -21845,6 +22686,9 @@ def main(argv: list[str]) -> int:
                 v2_observations=v2_obs,
                 source_scope=v2_source_scope,
                 log=log,
+                verified_first_value_at_scope_sink=(
+                    verified_first_value_at_connector_days
+                ),
             )
             v2_aqi = run_v2_aqilevels_integrity_checks(
                 r2_history_root=r2_history_root,
@@ -22310,6 +23154,8 @@ def main(argv: list[str]) -> int:
             "snapshot_manifest_hash": snapshot_result["manifest_hash"],
             "snapshot_tables": snapshot_result["tables"],
             "snapshot_rows_lookup": snapshot_result["rows_lookup"],
+            "snapshot_sos_site_ref_bridge":
+                snapshot_result.get("sos_site_ref_bridge") or {},
             "snapshot_bytes_read": snapshot_result["bytes_read"],
             "openaq_stopped_for": openaq_metrics.get("stopped_for"),
             "openaq_locations": openaq_metrics.get("locations", 0),

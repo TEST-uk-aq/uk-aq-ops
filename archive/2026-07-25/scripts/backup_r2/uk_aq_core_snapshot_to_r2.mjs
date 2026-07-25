@@ -31,7 +31,6 @@ export function resolveCoreSnapshotPrefix(env = process.env) {
 }
 
 const DEFAULT_SOURCE_SCHEMA = (process.env.UK_AQ_CORE_SNAPSHOT_SCHEMA || "uk_aq_core").trim();
-const SOS_SITE_REF_SOURCE_SCHEMA = "uk_aq_raw";
 const DEFAULT_CURSOR_BATCH_ROWS = parsePositiveInt(process.env.UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS, 5000);
 const DEFAULT_REPORT_OUT = String(process.env.UK_AQ_R2_CORE_SNAPSHOT_REPORT_OUT || "").trim();
 const CORE_SNAPSHOT_DB_RETRY_MAX_ATTEMPTS = 4;
@@ -74,10 +73,6 @@ const TABLE_EXPORT_CONFIG = Object.freeze({
   stations: Object.freeze({ order_by: "id" }),
   station_metadata: Object.freeze({ order_by: "station_id" }),
   timeseries: Object.freeze({ order_by: "id" }),
-  sos_station_timeseries_site_refs: Object.freeze({
-    source_schema: SOS_SITE_REF_SOURCE_SCHEMA,
-    order_by: "site_ref, pollutant_code, timeseries_id",
-  }),
 });
 
 export const DEFAULT_TABLES = Object.freeze([
@@ -95,7 +90,6 @@ export const DEFAULT_TABLES = Object.freeze([
   "stations",
   "station_metadata",
   "timeseries",
-  "sos_station_timeseries_site_refs",
 ]);
 export const TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION = 1;
 const TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION = 1;
@@ -654,15 +648,11 @@ async function main(args) {
         const artifacts = [];
         for (const table of args.tables) {
           const config = TABLE_EXPORT_CONFIG[table];
-          const tableSourceSchema = assertSimpleSqlIdent(
-            config.source_schema || sourceSchema,
-            `source schema for ${table}`,
-          );
           const relativePath = `table=${table}/rows.ndjson.gz`;
           const tempFile = path.join(tmpDir, `${table}.rows.ndjson.gz`);
           const result = await exportTableToGzip({
             client,
-            schema: tableSourceSchema,
+            schema: sourceSchema,
             table,
             orderBy: config.order_by,
             outputFile: tempFile,
@@ -671,7 +661,6 @@ async function main(args) {
 
           artifacts.push({
             table,
-            source_schema: tableSourceSchema,
             order_by: config.order_by,
             relative_path: relativePath,
             key: `${dayPrefix}/${relativePath}`,
@@ -707,9 +696,6 @@ async function main(args) {
       file_format: "ndjson.gz",
       tables: tableArtifacts.map((entry) => ({
         table: entry.table,
-        ...(entry.source_schema !== sourceSchema
-          ? { source_schema: entry.source_schema }
-          : {}),
         order_by: entry.order_by,
         key: entry.key,
         relative_path: entry.relative_path,
@@ -745,7 +731,6 @@ async function main(args) {
 
     report.table_exports = tableArtifacts.map((entry) => ({
       table: entry.table,
-      source_schema: entry.source_schema,
       key: entry.key,
       relative_path: entry.relative_path,
       row_count: entry.row_count,
