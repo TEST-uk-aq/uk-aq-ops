@@ -270,7 +270,7 @@ class SosFlatFileTests(unittest.TestCase):
             self.assertEqual(counts, [("2026-05-17", 66)])
             conn.close()
 
-    def test_requested_day_unmapped_rows_remain_actionable(self) -> None:
+    def test_requested_day_missing_binding_rows_are_warning_only(self) -> None:
         mappings = self._flat_file_grouped_mappings()
         mappings["EA8"]["pm10"] = mappings["EA8"]["pm10"][:1]
         with tempfile.TemporaryDirectory() as tmp:
@@ -292,17 +292,40 @@ class SosFlatFileTests(unittest.TestCase):
                     log=logging.getLogger("test-target-window"),
                     requested_from_day="2026-05-18", requested_to_day="2026-05-18",
                 )
-            self.assertEqual(result["unmapped_source_groups"], 1)
-            self.assertEqual(result["unmapped_source_rows"], 1)
-            self.assertEqual(result["actionable_mapping_issues"], [{
-                "site_ref": "EA8",
-                "day_utc": "2026-05-18",
-                "pollutant_code": "pm10",
-                "source_rows": 1,
-                "mapping_status": "unmapped_source",
-                "bridge_evidence_missing":
-                    "no unique date-valid pm10 row in mapping authority",
-            }])
+            self.assertEqual(result["unmapped_source_groups"], 0)
+            self.assertEqual(result["unmapped_source_rows"], 0)
+            self.assertEqual(result["actionable_mapping_issues"], [])
+            self.assertEqual(
+                result["no_authoritative_timeseries_binding_groups"], 1
+            )
+            self.assertEqual(
+                result["no_authoritative_timeseries_binding_rows"], 1
+            )
+            warning = result[
+                "no_authoritative_timeseries_binding_warnings"
+            ][0]
+            self.assertEqual(
+                warning["classification"],
+                "no_authoritative_timeseries_binding",
+            )
+            self.assertEqual(warning["site_ref"], "EA8")
+            self.assertEqual(warning["source_label"], "PM10")
+            self.assertEqual(warning["normalised_source_label"], "pm10")
+            self.assertEqual(
+                warning["target_day_non_null_row_count"], 1
+            )
+            state = conn.execute(
+                "SELECT last_status, notes FROM source_file_state "
+                "WHERE source_file_key = ?",
+                ("sos:site_ref=EA8:year=2026",),
+            ).fetchone()
+            self.assertEqual(
+                state[0], "no_authoritative_timeseries_binding"
+            )
+            self.assertEqual(
+                MODULE._decode_uk_air_missing_binding_notes(state[1]),
+                [warning],
+            )
             conn.close()
         self.assertEqual(
             MODULE._uk_air_flat_file_remote_url(

@@ -3264,6 +3264,41 @@ def _resolve_uk_air_flat_file_mapping_row(
     return None, "ambiguous_mapping"
 
 
+_UK_AIR_MISSING_BINDING_NOTES_KEY = (
+    "no_authoritative_timeseries_binding_json"
+)
+
+
+def _encode_uk_air_missing_binding_notes(
+    warnings: Iterable[Mapping[str, Any]],
+) -> str:
+    payload = json.dumps(
+        [dict(item) for item in warnings],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return urllib.parse.quote(payload, safe="")
+
+
+def _decode_uk_air_missing_binding_notes(
+    notes: Any,
+) -> list[dict[str, Any]]:
+    match = re.search(
+        rf"(?:^|\s){_UK_AIR_MISSING_BINDING_NOTES_KEY}=([^\s]+)",
+        str(notes or ""),
+    )
+    if match is None:
+        return []
+    try:
+        payload = json.loads(urllib.parse.unquote(match.group(1)))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [dict(item) for item in payload if isinstance(item, Mapping)]
+
+
 def _uk_air_flat_file_years_for_window(from_day: str, to_day: str) -> list[int]:
     requested_days = _date_range_inclusive(from_day, to_day)
     selection = _uk_air_source_year_selection(requested_days)
@@ -3280,7 +3315,7 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
 
     allowed = {str(code).strip().lower() for code in target_pollutants if str(code or "").strip()}
     counts: dict[tuple[str, str], int] = {}
-    source_rows: list[tuple[tuple[str, str], str]] = []
+    source_rows: list[tuple[tuple[str, str], str, str, str]] = []
     timestamp_pairs: dict[tuple[str, str], None] = {}
     stats: dict[str, Any] = {
         "sections": 0,
@@ -3288,8 +3323,9 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
         "days": set(),
         "pollutants": set(),
         "unsupported_sections": 0,
+        "source_group_evidence": [],
     }
-    pollutant_bindings: list[tuple[int, str]] = []
+    pollutant_bindings: list[tuple[int, str, str, str]] = []
     with csv_path.open("rt", encoding="utf-8", newline="") as fh:
         reader = csv.reader(fh)
         for row in reader:
@@ -3317,7 +3353,12 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
                         )
                     if pollutant in allowed:
                         stats["sections"] += 1
-                        pollutant_bindings.append((value_index, pollutant))
+                        pollutant_bindings.append((
+                            value_index,
+                            pollutant,
+                            str(cells[value_index] or "").strip(),
+                            label_key,
+                        ))
                     else:
                         stats["unsupported_sections"] += 1
                 continue
@@ -3327,7 +3368,12 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
                 str(cells[0] if len(cells) > 0 else "").strip(),
                 str(cells[1] if len(cells) > 1 else "").strip(),
             )
-            for value_index, pollutant in pollutant_bindings:
+            for (
+                value_index,
+                pollutant,
+                source_label,
+                normalised_source_label,
+            ) in pollutant_bindings:
                 value = (
                     _sos_to_finite_number(cells[value_index])
                     if value_index < len(cells)
@@ -3336,7 +3382,12 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
                 if value is None:
                     continue
                 timestamp_pairs[timestamp_pair] = None
-                source_rows.append((timestamp_pair, pollutant))
+                source_rows.append((
+                    timestamp_pair,
+                    pollutant,
+                    source_label,
+                    normalised_source_label,
+                ))
                 stats["rows"] += 1
                 stats["pollutants"].add(pollutant)
     parsed_pairs = _parse_uk_air_observed_at_batch(timestamp_pairs)
@@ -3344,11 +3395,39 @@ def _uk_air_flat_file_parse_day_pollutant_counts(
         pair: parsed["partition_day_utc"]
         for pair, parsed in zip(timestamp_pairs, parsed_pairs, strict=True)
     }
-    for timestamp_pair, pollutant_code in source_rows:
+    source_group_counts: dict[tuple[str, str, str, str], int] = {}
+    for (
+        timestamp_pair,
+        pollutant_code,
+        source_label,
+        normalised_source_label,
+    ) in source_rows:
         partition_day_utc = partition_day_by_pair[timestamp_pair]
         key = (partition_day_utc, pollutant_code)
         counts[key] = counts.get(key, 0) + 1
         stats["days"].add(partition_day_utc)
+        group_key = (
+            partition_day_utc,
+            pollutant_code,
+            source_label,
+            normalised_source_label,
+        )
+        source_group_counts[group_key] = source_group_counts.get(group_key, 0) + 1
+    stats["source_group_evidence"] = [
+        {
+            "day_utc": day_utc,
+            "pollutant_code": pollutant_code,
+            "source_label": source_label,
+            "normalised_source_label": normalised_source_label,
+            "target_day_non_null_row_count": row_count,
+        }
+        for (
+            day_utc,
+            pollutant_code,
+            source_label,
+            normalised_source_label,
+        ), row_count in sorted(source_group_counts.items())
+    ]
     stats["days"] = sorted(stats["days"])
     stats["pollutants"] = sorted(stats["pollutants"])
     return counts, stats
@@ -6956,6 +7035,9 @@ def _check_one_sos_uk_air_flat_file(
         "ambiguous_mapping_groups": 0,
         "unmapped_source_rows": 0,
         "ambiguous_mapping_rows": 0,
+        "no_authoritative_timeseries_binding_groups": 0,
+        "no_authoritative_timeseries_binding_rows": 0,
+        "no_authoritative_timeseries_binding_warnings": [],
         "out_of_window_unmapped_groups": 0,
         "out_of_window_unmapped_rows": 0,
         "actionable_mapping_issues": [],
@@ -7293,6 +7375,9 @@ def _check_one_sos_uk_air_flat_file(
     mapped_pollutants: set[str] = set()
     unmapped_groups = ambiguous_groups = unmapped_rows = ambiguous_rows = 0
     unmapped_groups_total = ambiguous_groups_total = unmapped_rows_total = ambiguous_rows_total = 0
+    missing_binding_groups = missing_binding_rows = 0
+    missing_binding_groups_total = missing_binding_rows_total = 0
+    missing_binding_warnings: list[dict[str, Any]] = []
     out_of_window_unmapped_groups = 0
     out_of_window_unmapped_rows = 0
     issue_notes: list[str] = []
@@ -7318,27 +7403,78 @@ def _check_one_sos_uk_air_flat_file(
                     ambiguous_groups += 1
                     ambiguous_rows += int(source_count)
             else:
-                unmapped_groups_total += 1
-                unmapped_rows_total += int(source_count)
+                missing_binding_groups_total += 1
+                missing_binding_rows_total += int(source_count)
                 if in_requested_window:
-                    unmapped_groups += 1
-                    unmapped_rows += int(source_count)
+                    missing_binding_groups += 1
+                    missing_binding_rows += int(source_count)
+                    group_evidence = [
+                        dict(item)
+                        for item in list(
+                            parse_stats.get("source_group_evidence") or []
+                        )
+                        if isinstance(item, Mapping)
+                        and str(item.get("day_utc") or "") == day_utc
+                        and str(item.get("pollutant_code") or "")
+                        == pollutant_code
+                    ]
+                    source_labels = sorted({
+                        str(item.get("source_label") or "").strip()
+                        for item in group_evidence
+                        if str(item.get("source_label") or "").strip()
+                    })
+                    normalised_source_labels = sorted({
+                        str(item.get("normalised_source_label") or "").strip()
+                        for item in group_evidence
+                        if str(
+                            item.get("normalised_source_label") or ""
+                        ).strip()
+                    })
+                    missing_binding_warnings.append({
+                        "classification":
+                            "no_authoritative_timeseries_binding",
+                        "reason": "no_authoritative_timeseries_binding",
+                        "site_ref": site_token,
+                        "source_file_key": sfk,
+                        "source_file_sha256": sha_csv,
+                        "source_label": source_labels[0]
+                        if source_labels else "",
+                        "normalised_source_label":
+                            normalised_source_labels[0]
+                            if normalised_source_labels else "",
+                        "source_labels": source_labels,
+                        "normalised_source_labels":
+                            normalised_source_labels,
+                        "pollutant_code": pollutant_code,
+                        "day_utc": day_utc,
+                        "target_day_non_null_row_count":
+                            int(source_count),
+                        "date_valid_binding_candidate_count": 0,
+                    })
                 else:
                     out_of_window_unmapped_groups += 1
                     out_of_window_unmapped_rows += int(source_count)
             if in_requested_window:
-                issue_notes.append(f"{day_utc}:{pollutant_code}={mapping_status}")
-                metrics["actionable_mapping_issues"].append({
-                    "site_ref": site_token,
-                    "day_utc": day_utc,
-                    "pollutant_code": pollutant_code,
-                    "source_rows": int(source_count),
-                    "mapping_status": mapping_status or "unmapped_source",
-                    "bridge_evidence_missing": (
-                        f"no unique date-valid {pollutant_code} row in "
-                        f"{source_count_mapping_identity or 'mapping authority'}"
-                    ),
-                })
+                classification = (
+                    mapping_status
+                    if mapping_status == "ambiguous_mapping"
+                    else "no_authoritative_timeseries_binding"
+                )
+                issue_notes.append(
+                    f"{day_utc}:{pollutant_code}={classification}"
+                )
+                if mapping_status == "ambiguous_mapping":
+                    metrics["actionable_mapping_issues"].append({
+                        "site_ref": site_token,
+                        "day_utc": day_utc,
+                        "pollutant_code": pollutant_code,
+                        "source_rows": int(source_count),
+                        "mapping_status": mapping_status,
+                        "bridge_evidence_missing": (
+                            f"multiple date-valid {pollutant_code} rows in "
+                            f"{source_count_mapping_identity or 'mapping authority'}"
+                        ),
+                    })
             continue
         try:
             timeseries_id = int(mapping_row.get("timeseries_id") or 0)
@@ -7387,6 +7523,21 @@ def _check_one_sos_uk_air_flat_file(
     metrics["ambiguous_mapping_groups"] = ambiguous_groups
     metrics["unmapped_source_rows"] = unmapped_rows
     metrics["ambiguous_mapping_rows"] = ambiguous_rows
+    metrics["no_authoritative_timeseries_binding_groups"] = (
+        missing_binding_groups
+    )
+    metrics["no_authoritative_timeseries_binding_rows"] = (
+        missing_binding_rows
+    )
+    metrics["no_authoritative_timeseries_binding_warnings"] = sorted(
+        missing_binding_warnings,
+        key=lambda item: (
+            str(item.get("day_utc") or ""),
+            str(item.get("site_ref") or ""),
+            str(item.get("pollutant_code") or ""),
+            str(item.get("normalised_source_label") or ""),
+        ),
+    )
     metrics["out_of_window_unmapped_groups"] = out_of_window_unmapped_groups
     metrics["out_of_window_unmapped_rows"] = out_of_window_unmapped_rows
     metrics["timeseries_ids"] = sorted(mapped_timeseries_ids)
@@ -7404,12 +7555,17 @@ def _check_one_sos_uk_air_flat_file(
     content_changed = is_first_seen or (not prior_sha) or prior_sha != sha_csv
     state_changed = is_first_seen or was_missing or content_changed
     mapping_status = "ok"
-    if unmapped_groups_total and ambiguous_groups_total:
+    if (
+        (unmapped_groups_total or missing_binding_groups_total)
+        and ambiguous_groups_total
+    ):
         mapping_status = "mixed_mapping_issues"
     elif unmapped_groups_total:
         mapping_status = "unmapped_source"
     elif ambiguous_groups_total:
         mapping_status = "ambiguous_mapping"
+    elif missing_binding_groups_total:
+        mapping_status = "no_authoritative_timeseries_binding"
     if metrics["mapped_rows_total"] <= 0 and mapping_status == "ok" and metrics["source_rows_total"] > 0:
         mapping_status = "unmapped_source"
     state_status = mapping_status if mapping_status != "ok" else (
@@ -7478,6 +7634,13 @@ def _check_one_sos_uk_air_flat_file(
         notes_bits.append("cache_missing_redownloaded=true")
     if issue_notes:
         notes_bits.append("mapping_issues=" + ";".join(issue_notes[:25]))
+    if missing_binding_warnings:
+        notes_bits.append(
+            f"{_UK_AIR_MISSING_BINDING_NOTES_KEY}="
+            + _encode_uk_air_missing_binding_notes(
+                missing_binding_warnings
+            )
+        )
     try:
         source_content_length = int(head.get("content_length"))
     except (TypeError, ValueError):
@@ -7653,6 +7816,9 @@ def check_sos_flat_files(
         "ambiguous_mapping_groups": 0,
         "unmapped_source_rows": 0,
         "ambiguous_mapping_rows": 0,
+        "no_authoritative_timeseries_binding_groups": 0,
+        "no_authoritative_timeseries_binding_rows": 0,
+        "no_authoritative_timeseries_binding_warnings": [],
         "out_of_window_unmapped_groups": 0,
         "out_of_window_unmapped_rows": 0,
         "actionable_mapping_issues": [],
@@ -8070,6 +8236,30 @@ def check_sos_flat_files(
             metrics["ambiguous_mapping_groups"] += int(result.get("ambiguous_mapping_groups") or 0)
             metrics["unmapped_source_rows"] += int(result.get("unmapped_source_rows") or 0)
             metrics["ambiguous_mapping_rows"] += int(result.get("ambiguous_mapping_rows") or 0)
+            metrics["no_authoritative_timeseries_binding_groups"] += int(
+                result.get(
+                    "no_authoritative_timeseries_binding_groups"
+                ) or 0
+            )
+            metrics["no_authoritative_timeseries_binding_rows"] += int(
+                result.get("no_authoritative_timeseries_binding_rows") or 0
+            )
+            remaining_warning_slots = max(
+                0,
+                100 - len(
+                    metrics[
+                        "no_authoritative_timeseries_binding_warnings"
+                    ]
+                ),
+            )
+            if remaining_warning_slots:
+                metrics[
+                    "no_authoritative_timeseries_binding_warnings"
+                ].extend(
+                    list(result.get(
+                        "no_authoritative_timeseries_binding_warnings"
+                    ) or [])[:remaining_warning_slots]
+                )
             metrics["out_of_window_unmapped_groups"] += int(result.get("out_of_window_unmapped_groups") or 0)
             metrics["out_of_window_unmapped_rows"] += int(result.get("out_of_window_unmapped_rows") or 0)
             remaining_issue_slots = max(0, 100 - len(metrics["actionable_mapping_issues"]))
@@ -8187,6 +8377,25 @@ def check_sos_flat_files(
             str(issue.get("pollutant_code") or ""),
         )
     )
+    metrics["no_authoritative_timeseries_binding_warnings"].sort(
+        key=lambda warning: (
+            str(warning.get("day_utc") or ""),
+            str(warning.get("site_ref") or ""),
+            str(warning.get("pollutant_code") or ""),
+            str(warning.get("normalised_source_label") or ""),
+        )
+    )
+    for warning in metrics[
+        "no_authoritative_timeseries_binding_warnings"
+    ]:
+        log.warning(
+            "sos flat-file missing binding warning %s",
+            json.dumps({
+                "event":
+                    "sos_no_authoritative_timeseries_binding_warning",
+                **warning,
+            }, sort_keys=True),
+        )
     for issue in metrics["actionable_mapping_issues"]:
         log.warning(
             "sos flat-file mapping issue %s",
@@ -9977,6 +10186,11 @@ def _sos_source_counts_for_v2_partition(
         "source_count_mapping_hash": None,
         "expected_site_ref_groups": 0,
         "processed_site_ref_groups": 0,
+        "source_groups_examined": 0,
+        "canonical_source_groups": 0,
+        "no_authoritative_timeseries_binding_groups": 0,
+        "no_authoritative_timeseries_binding_rows": 0,
+        "no_authoritative_timeseries_binding_warnings": [],
         "legitimate_empty_groups": 0,
         "source_group_count": 0,
         "resolved_site_ref_groups": 0,
@@ -10019,6 +10233,10 @@ def _sos_source_counts_for_v2_partition(
                 "identity_resolution", "bridge_row_count", "bridge_sha256",
                 "source_count_mapping_identity", "source_count_mapping_hash",
                 "expected_site_ref_groups", "processed_site_ref_groups",
+                "source_groups_examined", "canonical_source_groups",
+                "no_authoritative_timeseries_binding_groups",
+                "no_authoritative_timeseries_binding_rows",
+                "no_authoritative_timeseries_binding_warnings",
                 "legitimate_empty_groups", "source_group_count",
                 "resolved_site_ref_groups", "unresolved_site_ref_groups",
                 "unmapped_site_ref_groups", "ambiguous_site_ref_groups",
@@ -10058,12 +10276,6 @@ def _sos_source_counts_for_v2_partition(
         )
         if str(row["pollutant_code"]) == wanted_pollutant:
             candidates_by_site.setdefault(site_ref, []).append(row)
-    if not candidates_by_site:
-        return finish(
-            "bridge_unavailable",
-            "sos_site_ref_bridge_pollutant_unavailable",
-        )
-
     evidence["expected_site_ref_groups"] = len(candidates_by_site)
     evidence["expected_timeseries_ids"] = sorted({
         int(row["timeseries_id"])
@@ -10092,17 +10304,138 @@ def _sos_source_counts_for_v2_partition(
             "sos_site_ref_bridge_mapping_ambiguous",
         )
 
+    # Missing bindings are persisted by the annual-file parser as structured
+    # warning evidence. Read them before deriving the required file set: a
+    # file containing only warning-only groups is still a required, fully
+    # identity-validated source input even though it contributes no canonical
+    # timeseries count.
+    issue_token = f"{day_utc}:{wanted_pollutant}="
+    issue_rows = conn.execute(
+        """
+        SELECT upper(trim(source_location_id)), source_file_key,
+               sha256_uncompressed, last_status, notes
+        FROM source_file_state
+        WHERE source_key = ?
+          AND remote_scheme = 'uk_air_flat_file'
+          AND exists_remote = 1
+          AND source_count_mapping_identity = ?
+          AND source_count_mapping_hash = ?
+          AND instr(COALESCE(notes, ''), ?) > 0
+          AND (? IS NULL OR env_name = ?)
+        ORDER BY upper(trim(source_location_id)), source_file_key
+        """,
+        (
+            SOS_SOURCE_KEY,
+            SOS_BRIDGE_MAPPING_IDENTITY,
+            str(bridge["mapping_hash"]),
+            issue_token,
+            env_name,
+            env_name,
+        ),
+    ).fetchall()
+    warning_source_keys: set[str] = set()
+    missing_binding_warnings: list[dict[str, Any]] = []
+    blocking_mapping_issues: list[dict[str, Any]] = []
+    for site_ref_raw, source_file_key_raw, source_sha_raw, _, notes in issue_rows:
+        site_ref = str(site_ref_raw or "").strip().upper()
+        source_file_key = str(source_file_key_raw or "").strip()
+        source_sha = str(source_sha_raw or "").strip().lower()
+        classification_match = re.search(
+            rf"(?:mapping_issues=|;){re.escape(issue_token)}([^;\s]+)",
+            str(notes or ""),
+        )
+        classification = (
+            classification_match.group(1).strip()
+            if classification_match is not None
+            else "missing_mapping_classification"
+        )
+        if classification != "no_authoritative_timeseries_binding":
+            blocking_mapping_issues.append({
+                "site_ref": site_ref,
+                "source_file_key": source_file_key,
+                "issue": classification,
+            })
+            continue
+
+        matching_warning_evidence = [
+            dict(item)
+            for item in _decode_uk_air_missing_binding_notes(notes)
+            if str(item.get("site_ref") or "").strip().upper() == site_ref
+            and str(item.get("source_file_key") or "").strip()
+            == source_file_key
+            and str(item.get("day_utc") or "").strip() == day_utc
+            and str(item.get("pollutant_code") or "").strip().lower()
+            == wanted_pollutant
+        ]
+        warning = (
+            matching_warning_evidence[0]
+            if len(matching_warning_evidence) == 1
+            else None
+        )
+        warning_rows = (
+            warning.get("target_day_non_null_row_count")
+            if warning is not None else None
+        )
+        candidate_count = (
+            warning.get("date_valid_binding_candidate_count")
+            if warning is not None else None
+        )
+        warning_valid = (
+            warning is not None
+            and warning.get("classification")
+            == "no_authoritative_timeseries_binding"
+            and warning.get("reason")
+            == "no_authoritative_timeseries_binding"
+            and str(warning.get("source_file_sha256") or "").strip().lower()
+            == source_sha
+            and re.fullmatch(r"[0-9a-f]{64}", source_sha) is not None
+            and bool(str(warning.get("source_label") or "").strip())
+            and bool(str(
+                warning.get("normalised_source_label") or ""
+            ).strip())
+            and isinstance(warning_rows, int)
+            and not isinstance(warning_rows, bool)
+            and warning_rows > 0
+            and isinstance(candidate_count, int)
+            and not isinstance(candidate_count, bool)
+            and candidate_count == 0
+            and site_ref not in candidates_by_site
+        )
+        if not warning_valid:
+            blocking_mapping_issues.append({
+                "site_ref": site_ref,
+                "source_file_key": source_file_key,
+                "issue": "missing_binding_warning_evidence_invalid",
+            })
+            continue
+        warning_source_keys.add(source_file_key)
+        missing_binding_warnings.append(dict(warning))
+
     source_years = _uk_air_source_year_selection([day])["years"]
+    source_sites = set(candidates_by_site) | {
+        str(warning.get("site_ref") or "").strip().upper()
+        for warning in missing_binding_warnings
+    }
     required_keys_by_site = {
         site: {
             _uk_air_flat_file_source_file_key(site, int(year))
             for year in source_years
         }
-        for site in candidates_by_site
+        for site in source_sites
     }
-    required_keys = sorted({
-        key for keys in required_keys_by_site.values() for key in keys
-    })
+    required_keys = sorted(
+        {
+            key
+            for keys in required_keys_by_site.values()
+            for key in keys
+        }
+        | warning_source_keys
+    )
+    if not required_keys:
+        return finish(
+            "bridge_unavailable",
+            "sos_site_ref_bridge_pollutant_unavailable",
+        )
     evidence["required_source_file_count"] = len(required_keys)
     state_params: list[Any] = [*required_keys]
     env_clause = ""
@@ -10125,7 +10458,7 @@ def _sos_source_counts_for_v2_partition(
     state_by_key = {str(row[0]): row for row in states}
     usable_statuses = {
         "first_seen", "changed", "reappeared", "unchanged",
-        "unmapped_source", "mixed_mapping_issues",
+        "no_authoritative_timeseries_binding", "mixed_mapping_issues",
     }
     unusable_keys = [
         key for key in required_keys
@@ -10144,55 +10477,41 @@ def _sos_source_counts_for_v2_partition(
             "source_files_incomplete",
             "required_uk_air_annual_source_files_incomplete_or_stale_mapping",
         )
-
-    # A parsed non-empty group with no bridge mapping is not an empty expected
-    # group. Keep it as a separate source-mapping failure (for example HG4,
-    # HULR or STOR) and never compare a partial source population with R2.
-    issue_token = f"{day_utc}:{wanted_pollutant}="
-    issue_rows = conn.execute(
-        """
-        SELECT upper(trim(source_location_id)), source_file_key, notes
-        FROM source_file_state
-        WHERE source_key = ?
-          AND remote_scheme = 'uk_air_flat_file'
-          AND exists_remote = 1
-          AND source_count_mapping_identity = ?
-          AND source_count_mapping_hash = ?
-          AND instr(COALESCE(notes, ''), ?) > 0
-          AND (? IS NULL OR env_name = ?)
-        ORDER BY upper(trim(source_location_id)), source_file_key
-        """,
-        (
-            SOS_SOURCE_KEY,
-            SOS_BRIDGE_MAPPING_IDENTITY,
-            str(bridge["mapping_hash"]),
-            issue_token,
-            env_name,
-            env_name,
-        ),
-    ).fetchall()
-    unresolved_issue_sites = {
-        str(row[0]) for row in issue_rows
-    }
-    if unresolved_issue_sites:
-        evidence["unmapped_site_ref_groups"] = len(unresolved_issue_sites)
-        evidence["unresolved_site_ref_groups"] = evidence[
-            "unmapped_site_ref_groups"
-        ]
-        evidence["expected_site_ref_groups"] = (
-            len(candidates_by_site)
-            + len(unresolved_issue_sites - set(candidates_by_site))
+    if blocking_mapping_issues:
+        evidence["unresolved_site_ref_groups"] = len({
+            str(issue.get("site_ref") or "")
+            for issue in blocking_mapping_issues
+        })
+        evidence["unmapped_site_ref_groups"] = sum(
+            1 for issue in blocking_mapping_issues
+            if issue.get("issue") != "ambiguous_mapping"
         )
-        evidence["mapping_issue_samples"] = [
-            {
-                "site_ref": str(row[0]),
-                "source_file_key": str(row[1]),
-                "issue": "unmapped_source",
-                "bridge_evidence_missing":
-                    f"no unique date-valid {wanted_pollutant} bridge row",
-            }
-            for row in issue_rows[:25]
-        ]
+        evidence["ambiguous_site_ref_groups"] += sum(
+            1 for issue in blocking_mapping_issues
+            if issue.get("issue") == "ambiguous_mapping"
+        )
+        evidence["mapping_issue_samples"] = blocking_mapping_issues[:25]
+        return finish(
+            "mapping_unavailable",
+            "sos_site_ref_bridge_mapping_unresolved",
+        )
+
+    missing_binding_warnings.sort(key=lambda warning: (
+        str(warning.get("day_utc") or ""),
+        str(warning.get("site_ref") or ""),
+        str(warning.get("pollutant_code") or ""),
+        str(warning.get("normalised_source_label") or ""),
+    ))
+    evidence["no_authoritative_timeseries_binding_warnings"] = (
+        missing_binding_warnings
+    )
+    evidence["no_authoritative_timeseries_binding_groups"] = len(
+        missing_binding_warnings
+    )
+    evidence["no_authoritative_timeseries_binding_rows"] = sum(
+        int(warning["target_day_non_null_row_count"])
+        for warning in missing_binding_warnings
+    )
 
     count_rows = conn.execute(
         f"""
@@ -10248,15 +10567,12 @@ def _sos_source_counts_for_v2_partition(
             empty_groups += 1
     evidence["processed_site_ref_groups"] = len(candidates_by_site)
     evidence["resolved_site_ref_groups"] = len(candidates_by_site)
+    evidence["canonical_source_groups"] = len(candidates_by_site)
+    evidence["source_groups_examined"] = (
+        len(candidates_by_site) + len(missing_binding_warnings)
+    )
     evidence["source_group_count"] = len(counts)
     evidence["legitimate_empty_groups"] = empty_groups
-    if unresolved_issue_sites:
-        return finish(
-            "mapping_unavailable",
-            "sos_site_ref_bridge_mapping_unresolved",
-            counts,
-            available=False,
-        )
     return finish(
         "successful_non_empty" if counts else "successful_empty",
         None,
@@ -22978,6 +23294,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Permanent errors:{sos.get('permanent_errors', 0)}",
             f"- Actionable mapping groups: {sos.get('unmapped_source_groups', 0)}",
             f"- Actionable mapping rows: {sos.get('unmapped_source_rows', 0)}",
+            f"- Missing-binding warning groups: {sos.get('no_authoritative_timeseries_binding_groups', 0)}",
+            f"- Missing-binding warning rows: {sos.get('no_authoritative_timeseries_binding_rows', 0)}",
             f"- Out-of-window mapping groups: {sos.get('out_of_window_unmapped_groups', 0)}",
             f"- Out-of-window mapping rows: {sos.get('out_of_window_unmapped_rows', 0)}",
             f"- Rows counted:   {sos.get('rows_counted', 0)}",
@@ -23019,6 +23337,34 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 )
             if len(mapping_issues) > 25:
                 lines.append(f"\n- ... {len(mapping_issues) - 25} more mapping issues")
+        missing_binding_warnings = list(
+            sos.get("no_authoritative_timeseries_binding_warnings") or []
+        )
+        if missing_binding_warnings:
+            lines.extend([
+                "",
+                "### SOS missing-timeseries-binding warnings",
+                "",
+                "| Site | Day | Pollutant | Raw source label | Normalised source label | Non-null rows | Reason | Source file | SHA-256 |",
+                "| --- | --- | --- | --- | --- | ---: | --- | --- | --- |",
+            ])
+            for warning in missing_binding_warnings:
+                cells = [
+                    warning.get("site_ref", ""),
+                    warning.get("day_utc", ""),
+                    warning.get("pollutant_code", ""),
+                    warning.get("source_label", ""),
+                    warning.get("normalised_source_label", ""),
+                    warning.get("target_day_non_null_row_count", 0),
+                    warning.get("reason", ""),
+                    warning.get("source_file_key", ""),
+                    warning.get("source_file_sha256", ""),
+                ]
+                lines.append(
+                    "| " + " | ".join(
+                        str(value).replace("|", "\\|") for value in cells
+                    ) + " |"
+                )
         sos_first_seen = sos.get("first_seen_files") or []
         if sos_first_seen:
             lines.extend(["", "### First-seen station/day snapshots (sos, baselined — not backfilled)", ""])
@@ -24308,6 +24654,11 @@ def main(argv: list[str]) -> int:
             warnings_count_total += 1
         if sos_metrics.get("stopped_for"):
             warnings_count_total += 1
+        warnings_count_total += int(
+            sos_metrics.get(
+                "no_authoritative_timeseries_binding_groups"
+            ) or 0
+        )
 
         metrics: dict[str, Any] = {
             "files_head_checked": _sum("head_checked"),

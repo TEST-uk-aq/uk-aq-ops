@@ -261,6 +261,43 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     MODULE._require_nonnegative_evidence_int(evidence, "value")
 
+    def test_detector_and_proposal_missing_binding_evidence_must_match(self) -> None:
+        warning = {
+            "classification": "no_authoritative_timeseries_binding",
+            "site_ref": "HG4",
+            "source_label": "PM10 particulate matter",
+            "normalised_source_label": "pm10 particulate matter",
+            "pollutant_code": "pm10",
+            "target_day_non_null_row_count": 24,
+        }
+        detector = {
+            "canonical_rows_sha256": "a" * 64,
+            "missing_binding_groups": 1,
+            "missing_binding_rows": 24,
+            "source_label_classification_counts": {
+                "no_authoritative_timeseries_binding": 1,
+            },
+            "source_label_target_day_row_counts": {
+                "no_authoritative_timeseries_binding": 24,
+            },
+            "source_label_classifications": [warning],
+        }
+        proposal = json.loads(json.dumps(detector))
+        MODULE._assert_detector_and_proposal_source_evidence_agree(
+            detector=detector,
+            proposal=proposal,
+        )
+        proposal["source_label_classifications"][0][
+            "target_day_non_null_row_count"
+        ] = 23
+        with self.assertRaisesRegex(
+            ValueError, "source_label_classifications"
+        ):
+            MODULE._assert_detector_and_proposal_source_evidence_agree(
+                detector=detector,
+                proposal=proposal,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
