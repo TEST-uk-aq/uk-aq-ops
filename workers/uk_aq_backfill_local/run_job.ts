@@ -7400,6 +7400,8 @@ type SosSiteRefBridgeSnapshot = {
   mapping_identity: string;
   mapping_hash: string;
   content_hash: string;
+  bridge_artifact_row_count: number;
+  selected_bridge_row_count: number;
   rows: SosSiteTimeseriesRef[];
 };
 
@@ -7421,6 +7423,15 @@ export function loadSosSiteRefBridgeSnapshot(): SosSiteRefBridgeSnapshot | null 
   const mappingIdentity = String(payload.mapping_identity || "");
   const mappingHash = String(payload.bridge_artifact_sha256 || "");
   const declaredContentHash = String(payload.bridge_content_sha256 || "");
+  const compatibilityRowCount = Number(payload.bridge_row_count);
+  const bridgeArtifactRowCount = Number(
+    payload.bridge_artifact_row_count ?? payload.bridge_row_count,
+  );
+  const selectedBridgeRowCount = Number(
+    payload.selected_bridge_row_count ?? (
+      Array.isArray(payload.rows) ? payload.rows.length : -1
+    ),
+  );
   if (
     Number(payload.schema_version) !== 1 ||
     !Number.isInteger(connectorId) || connectorId <= 0 ||
@@ -7428,11 +7439,18 @@ export function loadSosSiteRefBridgeSnapshot(): SosSiteRefBridgeSnapshot | null 
     !/^[a-f0-9]{64}$/.test(mappingHash) ||
     !/^[a-f0-9]{64}$/.test(declaredContentHash) ||
     !Array.isArray(payload.rows) ||
-    Number(payload.bridge_row_count) !== payload.rows.length
+    !Number.isSafeInteger(compatibilityRowCount) ||
+    !Number.isSafeInteger(bridgeArtifactRowCount) ||
+    !Number.isSafeInteger(selectedBridgeRowCount) ||
+    compatibilityRowCount !== bridgeArtifactRowCount ||
+    bridgeArtifactRowCount <= 0 ||
+    selectedBridgeRowCount < 0 ||
+    selectedBridgeRowCount > bridgeArtifactRowCount ||
+    selectedBridgeRowCount !== payload.rows.length
   ) {
     throw new Error(`sos_site_ref_bridge_invalid path=${sourceFile}`);
   }
-  const semantic = {
+  const semantic: Record<string, unknown> = {
     schema_version: payload.schema_version,
     connector_id: payload.connector_id,
     mapping_identity: payload.mapping_identity,
@@ -7440,6 +7458,12 @@ export function loadSosSiteRefBridgeSnapshot(): SosSiteRefBridgeSnapshot | null 
     bridge_row_count: payload.bridge_row_count,
     rows: payload.rows,
   };
+  if (Object.hasOwn(payload, "bridge_artifact_row_count")) {
+    semantic.bridge_artifact_row_count = payload.bridge_artifact_row_count;
+  }
+  if (Object.hasOwn(payload, "selected_bridge_row_count")) {
+    semantic.selected_bridge_row_count = payload.selected_bridge_row_count;
+  }
   const actualContentHash = sha256Hex(canonicalRegistryJson(semantic));
   if (actualContentHash !== declaredContentHash) {
     throw new Error(`sos_site_ref_bridge_content_hash_invalid path=${sourceFile}`);
@@ -7495,14 +7519,16 @@ export function loadSosSiteRefBridgeSnapshot(): SosSiteRefBridgeSnapshot | null 
     connector_id: connectorId,
     mapping_identity: mappingIdentity,
     mapping_hash: mappingHash,
-    bridge_row_count: Number(payload.bridge_row_count),
-    selected_row_count: rows.length,
+    bridge_artifact_row_count: bridgeArtifactRowCount,
+    selected_bridge_row_count: selectedBridgeRowCount,
   });
   return sosSiteRefBridgeSnapshot = {
     connector_id: connectorId,
     mapping_identity: mappingIdentity,
     mapping_hash: mappingHash,
     content_hash: actualContentHash,
+    bridge_artifact_row_count: bridgeArtifactRowCount,
+    selected_bridge_row_count: selectedBridgeRowCount,
     rows,
   };
 }

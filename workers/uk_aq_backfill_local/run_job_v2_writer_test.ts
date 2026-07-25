@@ -56,7 +56,9 @@ Deno.test("v2 SOS bridge snapshot preserves imported mapping identity", async ()
     connector_id: 1,
     mapping_identity: "sos_station_timeseries_site_refs_snapshot",
     bridge_artifact_sha256: "a".repeat(64),
-    bridge_row_count: 1,
+    bridge_artifact_row_count: 2,
+    selected_bridge_row_count: 1,
+    bridge_row_count: 2,
     rows: [{
       site_ref: "abd9",
       uk_air_ref: null,
@@ -79,6 +81,8 @@ Deno.test("v2 SOS bridge snapshot preserves imported mapping identity", async ()
     const loaded = loadSosSiteRefBridgeSnapshot();
     assertEquals(loaded?.mapping_identity, semantic.mapping_identity);
     assertEquals(loaded?.mapping_hash, semantic.bridge_artifact_sha256);
+    assertEquals(loaded?.bridge_artifact_row_count, 2);
+    assertEquals(loaded?.selected_bridge_row_count, 1);
     assertEquals(loaded?.rows[0].site_ref, "ABD9");
     assertEquals(loaded?.rows[0].timeseries_id, 144);
   } finally {
