@@ -8825,6 +8825,13 @@ function toFiniteNumber(value: unknown): number | null {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function toFiniteUkAirCsvNumber(value: unknown): number | null {
+  if (typeof value === "string" && !value.trim()) {
+    return null;
+  }
+  return toFiniteNumber(value);
+}
+
 function normalizeBreatheLondonSensors(
   payload: unknown,
 ): Record<string, unknown>[] {
@@ -9948,13 +9955,13 @@ export function parseUkAirFlatFileObservations(args: {
     // day.  A blank target-day unit may inherit only this section's proven
     // compatible non-empty unit evidence.
     for (const binding of columnBindings) {
-      const value = toFiniteNumber(cells[binding.valueIndex]);
+      const value = toFiniteUkAirCsvNumber(cells[binding.valueIndex]);
       if (value === null) continue;
       const unit = String(cells[binding.unitIndex] || "").trim();
       if (unit) binding.units.add(unit);
     }
     for (const skipped of missingBindingSourceLabelColumns) {
-      const value = toFiniteNumber(cells[skipped.valueIndex]);
+      const value = toFiniteUkAirCsvNumber(cells[skipped.valueIndex]);
       if (value === null) continue;
       const unit = String(cells[skipped.valueIndex + 2] || "").trim();
       if (unit) skipped.units.add(unit);
@@ -9964,26 +9971,26 @@ export function parseUkAirFlatFileObservations(args: {
       continue;
     }
     for (const valueIndex of unselectedPollutantValueIndexes) {
-      if (toFiniteNumber(cells[valueIndex]) !== null) {
+      if (toFiniteUkAirCsvNumber(cells[valueIndex]) !== null) {
         result.skipped_unselected_pollutant_rows += 1;
       }
     }
     for (const skipped of skippedSourceLabelColumns) {
-      if (toFiniteNumber(cells[skipped.valueIndex]) !== null) {
+      if (toFiniteUkAirCsvNumber(cells[skipped.valueIndex]) !== null) {
         skipped.targetDayNonNullRowCount += 1;
         const unit = String(cells[skipped.valueIndex + 2] || "").trim();
         if (unit) skipped.units.add(unit);
       }
     }
     for (const skipped of missingBindingSourceLabelColumns) {
-      if (toFiniteNumber(cells[skipped.valueIndex]) !== null) {
+      if (toFiniteUkAirCsvNumber(cells[skipped.valueIndex]) !== null) {
         skipped.targetDayNonNullRowCount += 1;
         const unit = String(cells[skipped.valueIndex + 2] || "").trim();
         if (!unit) skipped.targetDayBlankUnitRowCount += 1;
       }
     }
     for (const binding of columnBindings) {
-      const value = toFiniteNumber(cells[binding.valueIndex]);
+      const value = toFiniteUkAirCsvNumber(cells[binding.valueIndex]);
       if (value === null) continue;
       const unit = String(cells[binding.unitIndex] || "").trim();
       binding.targetDayNonNullRowCount += 1;
