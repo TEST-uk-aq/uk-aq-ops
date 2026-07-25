@@ -7395,10 +7395,142 @@ function isSosMappingValidForDay(
   return true;
 }
 
+type SosSiteRefBridgeSnapshot = {
+  connector_id: number;
+  mapping_identity: string;
+  mapping_hash: string;
+  content_hash: string;
+  rows: SosSiteTimeseriesRef[];
+};
+
+let sosSiteRefBridgeSnapshot:
+  | SosSiteRefBridgeSnapshot
+  | null
+  | undefined;
+
+export function loadSosSiteRefBridgeSnapshot(): SosSiteRefBridgeSnapshot | null {
+  if (sosSiteRefBridgeSnapshot !== undefined) return sosSiteRefBridgeSnapshot;
+  const sourceFile = optionalEnv("UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE");
+  if (!sourceFile) return sosSiteRefBridgeSnapshot = null;
+  if (!fs.existsSync(sourceFile)) {
+    throw new Error(`sos_site_ref_bridge_file_missing path=${sourceFile}`);
+  }
+  const text = fs.readFileSync(sourceFile, "utf8");
+  const payload = JSON.parse(text) as Record<string, unknown>;
+  const connectorId = Number(payload.connector_id);
+  const mappingIdentity = String(payload.mapping_identity || "");
+  const mappingHash = String(payload.bridge_artifact_sha256 || "");
+  const declaredContentHash = String(payload.bridge_content_sha256 || "");
+  if (
+    Number(payload.schema_version) !== 1 ||
+    !Number.isInteger(connectorId) || connectorId <= 0 ||
+    mappingIdentity !== "sos_station_timeseries_site_refs_snapshot" ||
+    !/^[a-f0-9]{64}$/.test(mappingHash) ||
+    !/^[a-f0-9]{64}$/.test(declaredContentHash) ||
+    !Array.isArray(payload.rows) ||
+    Number(payload.bridge_row_count) !== payload.rows.length
+  ) {
+    throw new Error(`sos_site_ref_bridge_invalid path=${sourceFile}`);
+  }
+  const semantic = {
+    schema_version: payload.schema_version,
+    connector_id: payload.connector_id,
+    mapping_identity: payload.mapping_identity,
+    bridge_artifact_sha256: payload.bridge_artifact_sha256,
+    bridge_row_count: payload.bridge_row_count,
+    rows: payload.rows,
+  };
+  const actualContentHash = sha256Hex(canonicalRegistryJson(semantic));
+  if (actualContentHash !== declaredContentHash) {
+    throw new Error(`sos_site_ref_bridge_content_hash_invalid path=${sourceFile}`);
+  }
+  const rows: SosSiteTimeseriesRef[] = [];
+  const identities = new Set<string>();
+  for (const raw of payload.rows) {
+    if (!raw || typeof raw !== "object") {
+      throw new Error(`sos_site_ref_bridge_invalid_entry path=${sourceFile}`);
+    }
+    const entry = raw as Record<string, unknown>;
+    const siteRef = String(entry.site_ref || "").trim().toUpperCase();
+    const pollutantCode = parseSourcePollutantCode(
+      String(entry.pollutant_code || ""),
+    );
+    const stationId = Number(entry.station_id);
+    const timeseriesId = Number(entry.timeseries_id);
+    if (
+      !siteRef || !pollutantCode ||
+      !["pm25", "pm10", "no2", "o3"].includes(pollutantCode) ||
+      !Number.isInteger(stationId) || stationId <= 0 ||
+      !Number.isInteger(timeseriesId) || timeseriesId <= 0
+    ) {
+      throw new Error(`sos_site_ref_bridge_invalid_entry path=${sourceFile}`);
+    }
+    const row: SosSiteTimeseriesRef = {
+      site_ref: siteRef,
+      uk_air_ref: entry.uk_air_ref == null ? null : String(entry.uk_air_ref),
+      pollutant_code: pollutantCode,
+      station_id: Math.trunc(stationId),
+      timeseries_id: Math.trunc(timeseriesId),
+      station_ref: entry.station_ref == null ? null : String(entry.station_ref),
+      timeseries_ref: entry.timeseries_ref == null
+        ? null
+        : String(entry.timeseries_ref),
+      valid_from_day_utc: parseOptionalDay(entry.valid_from_day_utc),
+      valid_to_day_utc: parseOptionalDay(entry.valid_to_day_utc),
+    };
+    const identity = [
+      row.site_ref,
+      row.pollutant_code,
+      row.timeseries_id,
+      row.valid_from_day_utc || "",
+      row.valid_to_day_utc || "",
+    ].join("|");
+    if (identities.has(identity)) {
+      throw new Error(`sos_site_ref_bridge_duplicate_entry path=${sourceFile}`);
+    }
+    identities.add(identity);
+    rows.push(row);
+  }
+  logStructured("info", "sos_site_ref_bridge_snapshot_loaded", {
+    connector_id: connectorId,
+    mapping_identity: mappingIdentity,
+    mapping_hash: mappingHash,
+    bridge_row_count: Number(payload.bridge_row_count),
+    selected_row_count: rows.length,
+  });
+  return sosSiteRefBridgeSnapshot = {
+    connector_id: connectorId,
+    mapping_identity: mappingIdentity,
+    mapping_hash: mappingHash,
+    content_hash: actualContentHash,
+    rows,
+  };
+}
+
 async function fetchSosSiteTimeseriesRefsForConnector(
   connectorId: number,
   candidateTimeseriesIds: number[],
 ): Promise<SosSiteTimeseriesRef[]> {
+  const importedBridge = loadSosSiteRefBridgeSnapshot();
+  if (importedBridge) {
+    if (importedBridge.connector_id !== connectorId) {
+      throw new Error(
+        `sos_site_ref_bridge_connector_mismatch expected=${connectorId} ` +
+          `actual=${importedBridge.connector_id}`,
+      );
+    }
+    if (INTEGRITY_COMPLETE_CONNECTOR_DAY) return importedBridge.rows;
+    const candidateIdSet = new Set(candidateTimeseriesIds);
+    return importedBridge.rows.filter((row) =>
+      candidateIdSet.has(row.timeseries_id)
+    );
+  }
+  if (INTEGRITY_COMPLETE_CONNECTOR_DAY && HISTORY_R2_WRITE_VERSION === "v2") {
+    throw new Error(
+      "v2_integrity_sos_site_ref_bridge_snapshot_required; " +
+        "live Supabase mapping lookup is not an authoritative fallback",
+    );
+  }
   if (!(INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY)) {
     throw new Error(
       "UK-AIR flat-file mapping guard requires SUPABASE_URL and SB_SECRET_KEY",
@@ -9410,7 +9542,7 @@ function canonicalRegistryJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-const SOURCE_EVIDENCE_CONTRACT_VERSION = 3;
+const SOURCE_EVIDENCE_CONTRACT_VERSION = 4;
 
 function deterministicSemanticHash(value: unknown): string {
   return sha256Hex(canonicalRegistryJson(value));
@@ -14910,6 +15042,13 @@ async function runSourceToAll(
             );
           sourceCheckpointJson.authoritative_station_timeseries_mapping_sha256 =
             deterministicSemanticHash(authoritativeMappingInput);
+          const importedSiteRefBridge = loadSosSiteRefBridgeSnapshot();
+          sourceCheckpointJson.sos_site_ref_bridge_mapping_identity =
+            importedSiteRefBridge?.mapping_identity || null;
+          sourceCheckpointJson.sos_site_ref_bridge_artifact_sha256 =
+            importedSiteRefBridge?.mapping_hash || null;
+          sourceCheckpointJson.sos_site_ref_bridge_content_sha256 =
+            importedSiteRefBridge?.content_hash || null;
           sourceCheckpointJson.observed_property_mapping_sha256 =
             deterministicSemanticHash(observedPropertyMappingInput);
 
@@ -15546,8 +15685,18 @@ async function runSourceToAll(
               sourceCheckpointJson.observed_property_mapping_sha256 || "",
             )
             : null;
+          const siteRefBridgeArtifactSha256 = sourceAdapter === "sos"
+            ? String(
+              sourceCheckpointJson.sos_site_ref_bridge_artifact_sha256 || "",
+            )
+            : null;
           if (sourceAdapter === "sos" &&
-            ![registryContentSha256, authoritativeMappingSha256, observedPropertyMappingSha256]
+            ![
+              registryContentSha256,
+              authoritativeMappingSha256,
+              observedPropertyMappingSha256,
+              siteRefBridgeArtifactSha256,
+            ]
               .every((value) => /^[a-f0-9]{64}$/.test(String(value || "")))) {
             throw new Error("complete_connector_day_semantic_mapping_identity_missing");
           }
@@ -15562,6 +15711,10 @@ async function runSourceToAll(
             source_label_registry_snapshot_content_sha256: registryContentSha256,
             authoritative_station_timeseries_mapping_sha256:
               authoritativeMappingSha256,
+            sos_site_ref_bridge_mapping_identity:
+              sourceCheckpointJson.sos_site_ref_bridge_mapping_identity || null,
+            sos_site_ref_bridge_artifact_sha256:
+              siteRefBridgeArtifactSha256,
             observed_property_mapping_sha256: observedPropertyMappingSha256,
           };
           const sourceEvidenceInputSha256 = deterministicSemanticHash(
@@ -15615,6 +15768,12 @@ async function runSourceToAll(
               registryContentSha256,
             authoritative_station_timeseries_mapping_sha256:
               authoritativeMappingSha256,
+            sos_site_ref_bridge_mapping_identity:
+              sourceCheckpointJson.sos_site_ref_bridge_mapping_identity || null,
+            sos_site_ref_bridge_artifact_sha256:
+              siteRefBridgeArtifactSha256,
+            sos_site_ref_bridge_content_sha256:
+              sourceCheckpointJson.sos_site_ref_bridge_content_sha256 || null,
             observed_property_mapping_sha256: observedPropertyMappingSha256,
             source_label_classification_counts:
               sourceCheckpointJson.sos_source_label_classification_counts || {},

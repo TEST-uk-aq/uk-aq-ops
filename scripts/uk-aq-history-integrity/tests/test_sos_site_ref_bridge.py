@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = (
@@ -106,25 +107,35 @@ class SosSiteRefBridgeTests(unittest.TestCase):
               (source_file_key, env_name, source_key, remote_scheme,
                remote_url_or_key, station_ref, source_location_id, day_utc,
                exists_remote, first_seen_at_utc, last_checked_at_utc,
-               last_status)
+               last_status, source_count_mapping_identity,
+               source_count_mapping_hash)
             VALUES (?, 'CIC-Test', 'sos', 'uk_air_flat_file', ?, 'ABD9',
-                    'ABD9', '2026-01-01', 1, ?, ?, 'unchanged')
+                    'ABD9', '2026-01-01', 1, ?, ?, 'unchanged', ?, ?)
             """,
             (
                 source_file_key,
                 "https://example.invalid/ABD9_2026.csv",
                 "2026-07-25T00:00:00Z",
                 "2026-07-25T00:00:00Z",
+                MODULE.SOS_BRIDGE_MAPPING_IDENTITY,
+                "a" * 64,
             ),
         )
         conn.execute(
             """
             INSERT INTO source_file_timeseries_counts
               (source_file_key, day_utc, timeseries_id, row_count,
-               counted_at_utc)
-            VALUES (?, ?, 144, 24, ?)
+               counted_at_utc, source_count_mapping_identity,
+               source_count_mapping_hash)
+            VALUES (?, ?, 144, 24, ?, ?, ?)
             """,
-            (source_file_key, self.day_utc, "2026-07-25T00:00:00Z"),
+            (
+                source_file_key,
+                self.day_utc,
+                "2026-07-25T00:00:00Z",
+                MODULE.SOS_BRIDGE_MAPPING_IDENTITY,
+                "a" * 64,
+            ),
         )
 
         for timeseries_id in bridge_timeseries_ids:
@@ -152,9 +163,10 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                   (source_file_key, env_name, source_key, remote_scheme,
                    remote_url_or_key, station_ref, source_location_id,
                    day_utc, exists_remote, first_seen_at_utc,
-                   last_checked_at_utc, last_status)
+                   last_checked_at_utc, last_status,
+                   source_count_mapping_identity, source_count_mapping_hash)
                 VALUES (?, 'CIC-Test', 'sos', 'uk_air_flat_file', ?, ?, ?,
-                        '2026-01-01', 1, ?, ?, 'unchanged')
+                        '2026-01-01', 1, ?, ?, 'unchanged', ?, ?)
                 """,
                 (
                     bridge_file_key,
@@ -163,6 +175,8 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                     bridge_site_ref,
                     "2026-07-25T00:00:00Z",
                     "2026-07-25T00:00:00Z",
+                    MODULE.SOS_BRIDGE_MAPPING_IDENTITY,
+                    "a" * 64,
                 ),
             )
         if include_import_identity:
@@ -214,6 +228,83 @@ class SosSiteRefBridgeTests(unittest.TestCase):
         self.assertEqual(evidence["resolved_site_ref_groups"], 1)
         self.assertEqual(evidence["unresolved_site_ref_groups"], 0)
 
+    def test_annual_count_replacement_is_atomic_and_file_scoped(self):
+        conn = self._connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO source_file_timeseries_counts
+                  (source_file_key, day_utc, timeseries_id, row_count,
+                   counted_at_utc)
+                VALUES
+                  ('sos:site_ref=ABD9:year=2026', '2026-07-14', 999, 12, ?),
+                  ('sos:site_ref=OTHER:year=2026', '2026-07-15', 777, 5, ?)
+                """,
+                ("2026-07-25T00:00:00Z", "2026-07-25T00:00:00Z"),
+            )
+            result = MODULE._record_source_file_timeseries_counts(
+                conn,
+                "sos:site_ref=ABD9:year=2026",
+                {(self.day_utc, 145): 23},
+                "2026-07-25T01:00:00Z",
+                source_count_mapping_identity=MODULE.SOS_BRIDGE_MAPPING_IDENTITY,
+                source_count_mapping_hash="b" * 64,
+            )
+            rows = conn.execute(
+                """
+                SELECT source_file_key, day_utc, timeseries_id, row_count,
+                       source_count_mapping_hash
+                FROM source_file_timeseries_counts
+                ORDER BY source_file_key, day_utc, timeseries_id
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(result, {"deleted_rows": 2, "inserted_rows": 1})
+        self.assertEqual(
+            rows,
+            [
+                (
+                    "sos:site_ref=ABD9:year=2026",
+                    self.day_utc,
+                    145,
+                    23,
+                    "b" * 64,
+                ),
+                (
+                    "sos:site_ref=OTHER:year=2026",
+                    self.day_utc,
+                    777,
+                    5,
+                    None,
+                ),
+            ],
+        )
+
+    def test_o3_counts_use_date_valid_bridge_identity(self):
+        conn = self._connection()
+        try:
+            conn.execute(
+                """
+                UPDATE sos_station_timeseries_site_refs_snapshot
+                SET pollutant_code = 'o3'
+                """
+            )
+            conn.commit()
+            counts, evidence = MODULE._current_source_counts_for_v2_partition(
+                conn,
+                env_name="CIC-Test",
+                source_scope={"source": "sos"},
+                day_utc=self.day_utc,
+                connector_id=1,
+                pollutant_code="o3",
+            )
+        finally:
+            conn.close()
+        self.assertEqual(counts, {144: 24})
+        self.assertEqual(evidence["processed_site_ref_groups"], 1)
+        self.assertEqual(evidence["legitimate_empty_groups"], 0)
+
     def test_bridge_import_identity_is_required(self):
         conn = self._connection(include_import_identity=False)
         try:
@@ -226,6 +317,35 @@ class SosSiteRefBridgeTests(unittest.TestCase):
             evidence["source_skip_reason"],
             "sos_site_ref_bridge_import_identity_unavailable",
         )
+
+    def test_v2_acquisition_does_not_query_live_mapping_authority(self):
+        conn = self._connection()
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_fetch_uk_air_flat_file_mapping_rows",
+                side_effect=AssertionError("live mapping query must not run"),
+            ):
+                metrics = MODULE.check_sos_flat_files(
+                    conn,
+                    "CIC-Test",
+                    {},
+                    self.day_utc,
+                    self.day_utc,
+                    dry_run=True,
+                    run_backfill=False,
+                    limits=MODULE.LimitTracker(None, None, MODULE.time.monotonic()),
+                    log=logging.getLogger("test-v2-sos-mapping-authority"),
+                    history_version="v2",
+                )
+        finally:
+            conn.close()
+        self.assertTrue(metrics["ran"])
+        self.assertEqual(
+            metrics["source_count_mapping_identity"],
+            MODULE.SOS_BRIDGE_MAPPING_IDENTITY,
+        )
+        self.assertEqual(metrics["source_count_mapping_hash"], "a" * 64)
 
     def test_snapshot_reuse_requires_matching_bridge_count_and_hash(self):
         conn = self._connection()
@@ -256,13 +376,8 @@ class SosSiteRefBridgeTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_unmapped_ambiguous_and_conflicting_bridge_rows_fail_closed(self):
+    def test_ambiguous_and_conflicting_bridge_rows_fail_closed(self):
         cases = (
-            {
-                "bridge_timeseries_ids": (144,),
-                "bridge_site_ref": "ZZZ1",
-                "expected_counter": "unmapped_site_ref_groups",
-            },
             {
                 "bridge_timeseries_ids": (144, 145),
                 "bridge_site_ref": "ABD9",
@@ -296,6 +411,55 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                     "mapping_unavailable",
                 )
                 self.assertEqual(evidence[case["expected_counter"]], 1)
+
+    def test_unmapped_non_empty_source_group_fails_closed(self):
+        conn = self._connection()
+        try:
+            conn.execute(
+                """
+                UPDATE source_file_state
+                SET last_status = 'unmapped_source',
+                    notes = 'mapping_issues=2026-07-15:no2=unmapped_source'
+                WHERE source_file_key = 'sos:site_ref=ABD9:year=2026'
+                """
+            )
+            conn.commit()
+            counts, evidence = self._counts(conn)
+        finally:
+            conn.close()
+        self.assertEqual(counts, {})
+        self.assertEqual(evidence["source_partition_state"], "mapping_unavailable")
+        self.assertEqual(evidence["unmapped_site_ref_groups"], 1)
+
+    def test_partial_source_population_cannot_create_r2_mismatch(self):
+        gap = MODULE._build_v2_source_r2_mismatch_gap_if_complete(
+            day_utc=self.day_utc,
+            connector_id=1,
+            pollutant_code="o3",
+            expected_path="history/v2/observations/example",
+            source_counts={144: 24},
+            r2_counts={144: 24, 145: 24},
+            source_partition_evidence={
+                "source_partition_state": "mapping_unavailable",
+                "source_counts_available": False,
+                "source_skip_reason":
+                    "r2_timeseries_not_covered_by_date_valid_sos_bridge",
+            },
+        )
+        self.assertIsNone(gap)
+
+    def test_repair_dry_run_with_v2_gaps_is_top_level_failure(self):
+        self.assertEqual(
+            MODULE._v2_top_level_status_after_repair_planning(
+                "ok",
+                run_backfill=True,
+                dry_run=True,
+                coordinator_failed=False,
+                any_stopped=False,
+                v2_gap_count=1,
+            ),
+            "fail",
+        )
 
     def test_o3_is_part_of_sos_observation_scope_but_not_aqi_scope(self):
         self.assertEqual(
