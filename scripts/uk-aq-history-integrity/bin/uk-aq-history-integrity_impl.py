@@ -22543,14 +22543,28 @@ def _v2_top_level_status_after_repair_planning(
     coordinator_failed: bool,
     any_stopped: bool,
     v2_gap_count: int,
+    real_repair_verified: bool | None = None,
+    post_repair_gap_count: int | None = None,
 ) -> str:
     if run_backfill:
+        if not dry_run:
+            # Initial findings are the input to a real repair. Its final
+            # status is owned by the verified post-apply state instead.
+            if (
+                coordinator_failed
+                or real_repair_verified is not True
+                or not isinstance(post_repair_gap_count, int)
+                or isinstance(post_repair_gap_count, bool)
+                or post_repair_gap_count != 0
+            ):
+                return "fail"
+            if any_stopped:
+                return "stopped_limit"
+            return "ok"
         if coordinator_failed or v2_gap_count > 0:
             return "fail"
         if any_stopped:
             return "stopped_limit"
-        if not dry_run:
-            return "ok"
         return current_status
     if v2_gap_count > 0:
         return "fail"
@@ -24415,6 +24429,12 @@ def main(argv: list[str]) -> int:
             + int(((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0 if ((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("required") else 0)
         )
         coordinator_failed = repair_flow.get("status") in {"failed", "blocked_dependency"}
+        final_verification = repair_flow.get("final_verification") or {}
+        real_repair_verified = (
+            repair_flow.get("status") == "succeeded"
+            and final_verification.get("ran") is True
+            and final_verification.get("status") == "ok"
+        )
         status = _v2_top_level_status_after_repair_planning(
             status,
             run_backfill=args.run_backfill,
@@ -24422,6 +24442,10 @@ def main(argv: list[str]) -> int:
             coordinator_failed=coordinator_failed,
             any_stopped=bool(any_stopped),
             v2_gap_count=v2_gap_count_for_status,
+            real_repair_verified=real_repair_verified,
+            post_repair_gap_count=final_verification.get(
+                "remaining_gap_count"
+            ),
         )
 
         if daily_selection is not None:
