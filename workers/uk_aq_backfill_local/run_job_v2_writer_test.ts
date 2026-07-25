@@ -2,6 +2,7 @@ import {
   classifyObservationRowsForV2PollutantPartitions,
   createAqiV2ConnectorManifest,
   createAqiV2PollutantManifest,
+  loadSosSiteRefBridgeSnapshot,
   normaliseConcentrationUnitForComparison,
   parseOpenaqCsvObservations,
   parseUkAirFlatFileObservations,
@@ -25,6 +26,66 @@ function assertEquals(actual: unknown, expected: unknown): void {
     throw new Error(`assertEquals failed: actual=${actualJson} expected=${expectedJson}`);
   }
 }
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(record[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function testSha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+Deno.test("v2 SOS bridge snapshot preserves imported mapping identity", async () => {
+  const tempDir = await Deno.makeTempDir();
+  const path = `${tempDir}/sos-site-ref-bridge.json`;
+  const semantic = {
+    schema_version: 1,
+    connector_id: 1,
+    mapping_identity: "sos_station_timeseries_site_refs_snapshot",
+    bridge_artifact_sha256: "a".repeat(64),
+    bridge_row_count: 1,
+    rows: [{
+      site_ref: "abd9",
+      uk_air_ref: null,
+      pollutant_code: "no2",
+      station_id: 81,
+      timeseries_id: 144,
+      station_ref: "8126",
+      timeseries_ref: "ts-144",
+      valid_from_day_utc: "2026-01-01",
+      valid_to_day_utc: null,
+    }],
+  };
+  const payload = {
+    ...semantic,
+    bridge_content_sha256: await testSha256(canonicalJson(semantic)),
+  };
+  await Deno.writeTextFile(path, JSON.stringify(payload));
+  Deno.env.set("UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE", path);
+  try {
+    const loaded = loadSosSiteRefBridgeSnapshot();
+    assertEquals(loaded?.mapping_identity, semantic.mapping_identity);
+    assertEquals(loaded?.mapping_hash, semantic.bridge_artifact_sha256);
+    assertEquals(loaded?.rows[0].site_ref, "ABD9");
+    assertEquals(loaded?.rows[0].timeseries_id, 144);
+  } finally {
+    Deno.env.delete("UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE");
+    await Deno.remove(tempDir, { recursive: true });
+  }
+});
 
 Deno.test("UK-AIR concentration-unit aliases preserve scale and reject a different scale", () => {
   assertEquals(

@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +22,7 @@ SPEC = importlib.util.spec_from_file_location("uk_aq_history_integrity", MODULE_
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Unable to load module at {MODULE_PATH}")
 MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
@@ -298,6 +300,8 @@ class SosFlatFileTests(unittest.TestCase):
                 "pollutant_code": "pm10",
                 "source_rows": 1,
                 "mapping_status": "unmapped_source",
+                "bridge_evidence_missing":
+                    "no unique date-valid pm10 row in mapping authority",
             }])
             conn.close()
         self.assertEqual(
@@ -448,6 +452,34 @@ class SosFlatFileTests(unittest.TestCase):
         self.assertEqual(stats["rows"], 5)
         self.assertEqual(stats["days"], ["2026-05-17", "2026-05-18"])
         self.assertEqual(stats["pollutants"], ["no2", "pm10"])
+
+    def test_flat_file_parser_counts_every_pollutant_triplet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "multi_2026.csv"
+            csv_path.write_text(
+                "\n".join([
+                    "Station metadata",
+                    'Date,time,"PM10 particulate matter",status,unit,'
+                    '"Nitrogen dioxide",status,unit,"Ozone",status,unit',
+                    "15-07-2026,01:00,10,R,ugm-3,20,R,ugm-3,30,P,ugm-3",
+                    "15-07-2026,02:00,,R,ugm-3,21,R,ugm-3,31,P,ugm-3",
+                ]),
+                encoding="utf-8",
+            )
+            counts, stats = MODULE._uk_air_flat_file_parse_day_pollutant_counts(
+                csv_path,
+                target_pollutants=("pm10", "no2", "o3"),
+            )
+        self.assertEqual(
+            counts,
+            {
+                ("2026-07-15", "pm10"): 1,
+                ("2026-07-15", "no2"): 2,
+                ("2026-07-15", "o3"): 2,
+            },
+        )
+        self.assertEqual(stats["rows"], 5)
+        self.assertEqual(stats["pollutants"], ["no2", "o3", "pm10"])
 
     def test_mapping_resolution_respects_validity_window(self) -> None:
         rows = [
@@ -842,6 +874,9 @@ class SosFlatFileTests(unittest.TestCase):
                     target_pollutants=("pm10",),
                     cache_root=root / "source-cache" / "sos",
                     keep_policy="all",
+                    source_count_mapping_identity=
+                        MODULE.SOS_BRIDGE_MAPPING_IDENTITY,
+                    source_count_mapping_hash="b" * 64,
                     log=logging.getLogger("test-sos-flat-file-cache-reuse"),
                 )
             counts = conn.execute(
@@ -866,6 +901,9 @@ class SosFlatFileTests(unittest.TestCase):
             http_get.assert_not_called()
             self.assertEqual(result["outcome"], "unchanged")
             self.assertTrue(result["cache_reused"])
+            self.assertTrue(result["counts_rebuilt_for_bridge_change"])
+            self.assertEqual(result["count_rows_deleted"], len(expected_counts))
+            self.assertEqual(result["count_rows_inserted"], len(expected_counts))
             self.assertFalse(result["downloaded"])
             self.assertEqual(result["downloaded_bytes"], 0)
             self.assertEqual(counts, expected_counts)

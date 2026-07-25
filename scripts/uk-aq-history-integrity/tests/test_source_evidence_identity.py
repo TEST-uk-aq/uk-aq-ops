@@ -52,6 +52,9 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             "evidence_contract_version": MODULE.SOURCE_EVIDENCE_CONTRACT_VERSION,
             "source_label_registry_snapshot_content_sha256": registry_hash,
             "authoritative_station_timeseries_mapping_sha256": authoritative_mapping_hash,
+            "sos_site_ref_bridge_mapping_identity":
+                MODULE.SOS_BRIDGE_MAPPING_IDENTITY,
+            "sos_site_ref_bridge_artifact_sha256": "5" * 64,
             "observed_property_mapping_sha256": property_mapping_hash,
             "canonical_rows_sha256": hashlib.sha256(rows_bytes).hexdigest(),
             "canonical_rows_bytes": len(rows_bytes),
@@ -214,6 +217,9 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             "source_file_identities_sha256": hashlib.sha256(b"[]").hexdigest(),
             "source_label_registry_snapshot_content_sha256": "1" * 64,
             "authoritative_station_timeseries_mapping_sha256": "2" * 64,
+            "sos_site_ref_bridge_mapping_identity":
+                MODULE.SOS_BRIDGE_MAPPING_IDENTITY,
+            "sos_site_ref_bridge_artifact_sha256": "5" * 64,
             "observed_property_mapping_sha256": "3" * 64,
             "canonical_rows_sha256": hashlib.sha256(rows_bytes).hexdigest(),
             "canonical_rows_bytes": len(rows_bytes), "total_rows": 0,
@@ -232,6 +238,7 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
                 "no_authoritative_timeseries_binding": 24,
             },
             "source_label_summary": {}, "source_label_classifications": [],
+            "observation_content_hashes": {},
         }
         evidence["source_evidence_input_sha256"] = MODULE._source_evidence_input_sha256(
             evidence
