@@ -650,6 +650,45 @@ class SosSiteRefBridgeTests(unittest.TestCase):
             "fail",
         )
 
+    def test_real_repair_uses_verified_post_repair_gap_count(self):
+        cases = (
+            {
+                "name": "verified_zero_gaps",
+                "verified": True,
+                "remaining": 0,
+                "expected": "ok",
+            },
+            {
+                "name": "final_verification_failed",
+                "verified": False,
+                "remaining": 0,
+                "expected": "fail",
+            },
+            {
+                "name": "remaining_gap",
+                "verified": True,
+                "remaining": 1,
+                "expected": "fail",
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(
+                    MODULE._v2_top_level_status_after_repair_planning(
+                        "ok",
+                        run_backfill=True,
+                        dry_run=False,
+                        coordinator_failed=False,
+                        any_stopped=False,
+                        # Initial findings trigger the repair, but do not
+                        # override its verified final state.
+                        v2_gap_count=4,
+                        real_repair_verified=case["verified"],
+                        post_repair_gap_count=case["remaining"],
+                    ),
+                    case["expected"],
+                )
+
     def test_o3_is_part_of_sos_observation_scope_but_not_aqi_scope(self):
         self.assertEqual(
             MODULE._resolve_sos_target_pollutants({}),
