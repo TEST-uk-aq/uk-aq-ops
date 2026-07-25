@@ -491,18 +491,11 @@ async function fetchFilteredParquetRowsFromR2(
         chunkStart,
         chunkEnd,
       );
-      const verificationStatusColumn = schemaColumns.includes(
-        "verification_status",
-      )
-        ? "verification_status"
-        : schemaColumns.includes("status")
-        ? "status"
-        : null;
-      const verificationStatusValues = verificationStatusColumn
+      const statusValues = schemaColumns.includes("status")
         ? await readParquetColumnValues(
           arrayBuffer,
           metadata,
-          verificationStatusColumn,
+          "status",
           chunkStart,
           chunkEnd,
         )
@@ -514,10 +507,8 @@ async function fetchFilteredParquetRowsFromR2(
         outRows.push({
           observed_at: observedAtValues[idx],
           value: valueValues[idx],
-          verification_status:
-            idx < verificationStatusValues.length &&
-              verificationStatusValues[idx] != null
-            ? String(verificationStatusValues[idx])
+          status: idx < statusValues.length && statusValues[idx] != null
+            ? String(statusValues[idx])
             : null,
         });
       }

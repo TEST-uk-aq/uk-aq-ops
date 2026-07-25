@@ -10,19 +10,7 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
-import {
-  computeObservationContentHash,
-  normalizeCanonicalObservationRow,
-  resolveLegacyVerificationStatus,
-  validateObservationContentHashMetadata,
-} from "../../workers/shared/uk_aq_observation_content_hash.mjs";
 import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_history_index.mjs";
-import {
-  compressors,
-  parquetMetadataAsync,
-  parquetRead,
-  parquetSchema,
-} from "./lib/uk_aq_parquet_dependencies.mjs";
 
 const TEST_BUCKET = "uk-aq-history-cic-test";
 
@@ -83,8 +71,6 @@ const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
 ]);
 const CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN =
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
-const CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN =
-  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
 
 function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
   const parsedDay = new Date(`${dayUtc}T00:00:00.000Z`);
@@ -293,151 +279,6 @@ async function putAndVerifyObject({ r2, runState, runStatePath, object, adapters
   }
 }
 
-function parquetIso(value) {
-  if (value instanceof Date) {
-    if (Number.isNaN(value.getTime())) throw new Error("Invalid observation Parquet timestamp");
-    return value.toISOString();
-  }
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) throw new Error("Invalid observation Parquet timestamp");
-  return parsed.toISOString();
-}
-
-async function readCanonicalObservationRows({ body, connectorId }) {
-  const file = new Uint8Array(body).slice().buffer;
-  const metadata = await parquetMetadataAsync(file);
-  const rowCount = Number(metadata.num_rows || 0);
-  if (!Number.isSafeInteger(rowCount) || rowCount <= 0) {
-    throw new Error("Repaired observation Parquet must contain rows");
-  }
-  const schemaColumns = new Set(
-    parquetSchema(metadata).children.map((column) => String(column.element.name)),
-  );
-  const required = [
-    "connector_id",
-    "station_id",
-    "timeseries_id",
-    "pollutant_code",
-    "observed_at_utc",
-    "value",
-  ];
-  const missing = required.filter((column) => !schemaColumns.has(column));
-  if (missing.length) {
-    throw new Error(`Repaired observation Parquet is missing canonical columns: ${missing.join(",")}`);
-  }
-  const statusColumn = schemaColumns.has("verification_status")
-    ? "verification_status"
-    : schemaColumns.has("status")
-    ? "status"
-    : null;
-  const columns = [...required, ...(statusColumn ? [statusColumn] : [])];
-  let decodedRows = [];
-  await parquetRead({
-    file,
-    metadata,
-    columns,
-    rowStart: 0,
-    rowEnd: rowCount,
-    compressors,
-    onComplete: (rows) => {
-      decodedRows = Array.isArray(rows) ? rows : [];
-    },
-  });
-  if (decodedRows.length !== rowCount) {
-    throw new Error("Repaired observation Parquet row count changed while reading");
-  }
-  const sosConnectorId = Number.parseInt(
-    process.env.UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK || "1",
-    10,
-  );
-  return decodedRows.map((values) => {
-    if (!Array.isArray(values)) throw new Error("Invalid repaired observation Parquet row");
-    const statusRow = statusColumn
-      ? { [statusColumn]: values[required.length] ?? null }
-      : {};
-    return normalizeCanonicalObservationRow({
-      connector_id: Number(values[0]),
-      station_id: values[1] === null || values[1] === undefined
-        ? null
-        : Number(values[1]),
-      timeseries_id: Number(values[2]),
-      pollutant_code: values[3],
-      observed_at_utc: parquetIso(values[4]),
-      value: Number(values[5]),
-      verification_status: resolveLegacyVerificationStatus(statusRow, {
-        isSos: connectorId === sosConnectorId,
-      }),
-    });
-  });
-}
-
-async function verifyLiveObservationPartition({
-  r2,
-  runState,
-  runStatePath,
-  object,
-  adapters,
-}) {
-  const match = object.key.match(CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN);
-  if (!match) return;
-  const [, dayUtc, connectorIdRaw, pollutantCode] = match;
-  let manifest;
-  try {
-    manifest = JSON.parse(new TextDecoder().decode(object.body));
-  } catch {
-    throw new Error(`Proposed observation pollutant manifest is not valid JSON: ${object.key}`);
-  }
-  const connectorId = Number(connectorIdRaw);
-  if (
-    manifest?.day_utc !== dayUtc ||
-    Number(manifest?.connector_id) !== connectorId ||
-    manifest?.pollutant_code !== pollutantCode
-  ) {
-    throw new Error(`Proposed observation pollutant manifest scope mismatch: ${object.key}`);
-  }
-  validateObservationContentHashMetadata(manifest, {
-    rowCount: Number(manifest.source_row_count),
-  });
-  const partKeys = Array.isArray(manifest.parquet_object_keys)
-    ? manifest.parquet_object_keys.map(safeKey)
-    : [];
-  if (!partKeys.length || partKeys.some((key) =>
-    !key.startsWith(object.key.slice(0, -"/manifest.json".length) + "/") ||
-    !key.endsWith(".parquet")
-  )) {
-    throw new Error(`Proposed observation pollutant manifest has invalid Parquet keys: ${object.key}`);
-  }
-  const canonicalRows = [];
-  for (const key of partKeys) {
-    const live = await adapters.getObject({ r2, key });
-    canonicalRows.push(...await readCanonicalObservationRows({
-      body: live.body,
-      connectorId,
-    }));
-  }
-  const liveMetadata = computeObservationContentHash(canonicalRows);
-  if (
-    liveMetadata.observation_content_hash !== manifest.observation_content_hash ||
-    liveMetadata.observation_content_hash_row_count !==
-      manifest.observation_content_hash_row_count ||
-    ["P", "R", "null"].some((key) =>
-      liveMetadata.verification_status_counts[key] !==
-        manifest.verification_status_counts[key]
-    )
-  ) {
-    throw new Error(
-      `Live repaired observation content does not match source truth: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode}`,
-    );
-  }
-  Object.assign(object.entry, {
-    live_observation_content_verified: true,
-    live_observation_content_verified_at_utc: new Date().toISOString(),
-    live_observation_content_hash: liveMetadata.observation_content_hash,
-    live_verification_status_counts: liveMetadata.verification_status_counts,
-  });
-  atomicWriteJson(runStatePath, runState);
-}
-
 export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }) {
   const resolvedAdapters = {
     deleteObjects: adapters.deleteObjects || r2DeleteObjects,
@@ -457,13 +298,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         counts.completed_deletions += 1;
       }
       for (const object of proposal.objects.filter((entry) => entry.domain === domain)) {
-        await verifyLiveObservationPartition({
-          r2,
-          runState,
-          runStatePath,
-          object,
-          adapters: resolvedAdapters,
-        });
         await putAndVerifyObject({ r2, runState, runStatePath, object, adapters: resolvedAdapters });
         counts.completed_writes += 1;
         counts.get_verified_writes += 1;

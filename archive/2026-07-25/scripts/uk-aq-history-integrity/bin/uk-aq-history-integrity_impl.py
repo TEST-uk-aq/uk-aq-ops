@@ -7955,9 +7955,6 @@ def _enrich_v2_observations_repair_plans(
         "orphan_parquet_without_manifest",
         "missing_pollutant_partitions",
         "unexpected_connector_level_part_file",
-        "observation_content_hash_mismatch",
-        "observation_content_hash_invalid_contract",
-        "observation_content_hash_missing",
     }
     for gap in gaps:
         gap_type = str(gap.get("gap_type") or "")
@@ -9696,16 +9693,6 @@ def _classify_v2_gaps(gaps: Iterable[dict[str, Any]]) -> None:
                 if gap.get("parquet_readable") is True
                 else "data fault"
             )
-        elif (
-            gap_type in {
-                "observation_content_hash_missing",
-                "observation_content_hash_invalid_contract",
-            }
-            and gap.get("hash_content_verified") is True
-        ):
-            fault_class = "pollutant manifest-only fault"
-        elif gap_type == "observation_content_hash_mismatch":
-            fault_class = "data fault"
         elif gap_type in {"parquet_reader_unavailable"}:
             fault_class = "source unavailable"
         elif gap_type in {"source_mapping_issue"}:
@@ -9743,7 +9730,6 @@ def run_v2_observations_integrity_checks(
         raise RuntimeError("v2 observations integrity requires a selected from/to day range")
 
     gaps: list[dict[str, Any]] = []
-    hash_check_candidates: list[dict[str, Any]] = []
     checked = 0
     verified_first_value_at_minima: dict[
         tuple[str, int],
@@ -9981,37 +9967,6 @@ def run_v2_observations_integrity_checks(
                     )
                     if stale_gap is not None:
                         gaps.append(stale_gap)
-                    elif (
-                        isinstance(payload, Mapping)
-                        and parquet_readable
-                        and str(
-                            (source_partition_evidence or {}).get(
-                                "source_partition_state"
-                            )
-                            or ""
-                        )
-                        == "successful_non_empty"
-                        and source_counts
-                        and _normalize_timeseries_row_counts(source_counts)
-                        == _normalize_timeseries_row_counts(
-                            parquet_stats["timeseries_row_counts"]
-                        )
-                    ):
-                        hash_check_candidates.append({
-                            "day_utc": day_utc,
-                            "connector_id": connector_id_for_source,
-                            "pollutant_code": pollutant,
-                            "manifest_path": str(manifest_path),
-                            "manifest_rel": manifest_rel,
-                            "parquet_paths": [
-                                str(path) for path in sorted(local_parquets)
-                            ],
-                            "source_row_count": sum(source_counts.values()),
-                            "source_timeseries_row_counts": {
-                                str(key): int(value)
-                                for key, value in sorted(source_counts.items())
-                            },
-                        })
             _validate_v2_parent_hierarchy(
                 root=root,
                 data_prefix=data_prefix,
@@ -10084,7 +10039,6 @@ def run_v2_observations_integrity_checks(
         "checked_partitions": checked,
         "gap_count": len(gaps),
         "gaps": gaps,
-        "hash_check_candidates": hash_check_candidates,
         "repair_plan": build_v2_repair_plan(observation_gaps=gaps, conn=conn),
     }
     if source_scope is not None:
@@ -10706,27 +10660,13 @@ def build_v2_repair_plan(
             "data_manifest_timeseries_row_count_mismatch",
             "data_manifest_total_bytes_mismatch",
             "data_manifest_row_count_mismatch",
-            "observation_content_hash_missing",
-            "observation_content_hash_invalid_contract",
         }:
-            if (
-                gap_type.startswith("observation_content_hash_")
-                and gap.get("hash_content_verified") is not True
-            ):
-                add_action(
-                    "observation_data_repair",
-                    gap=gap,
-                    requires_index_rebuild=True,
-                    data_changes_required=True,
-                    notes="Repair the complete observation pollutant partition because semantic content is not verified.",
-                )
-            else:
-                add_action(
-                    "observation_pollutant_manifest_repair",
-                    gap=gap,
-                    requires_index_rebuild=True,
-                    notes="Repair the pollutant manifest so it matches verified Parquet content and source hash evidence.",
-                )
+            add_action(
+                "observation_pollutant_manifest_repair",
+                gap=gap,
+                requires_index_rebuild=True,
+                notes="Repair the pollutant manifest so it matches the actual live-R2 parquet set and row counts.",
+            )
         elif fault_class == "pollutant manifest-only fault" and (
             gap_type.startswith("data_manifest_") or gap_type == "orphan_parquet_without_manifest"
         ):
@@ -10752,7 +10692,6 @@ def build_v2_repair_plan(
             "orphan_parquet_without_manifest",
             "missing_pollutant_partitions",
             "unexpected_connector_level_part_file",
-            "observation_content_hash_mismatch",
         }:
             add_action(
                 "observation_data_repair",
@@ -14182,46 +14121,7 @@ def _v2_observations_index_rebuild_command(
     ]
 
 
-SOURCE_EVIDENCE_CONTRACT_VERSION = 3
-OBSERVATION_CONTENT_HASH_COLUMNS = [
-    "connector_id",
-    "station_id",
-    "timeseries_id",
-    "pollutant_code",
-    "observed_at_utc",
-    "value",
-    "verification_status",
-]
-
-
-def _validate_observation_content_hash_metadata(
-    payload: Mapping[str, Any],
-    *,
-    row_count: int,
-) -> dict[str, Any]:
-    counts = payload.get("verification_status_counts")
-    if (
-        not re.fullmatch(
-            r"[0-9a-f]{64}",
-            str(payload.get("observation_content_hash") or ""),
-        )
-        or payload.get("observation_content_hash_algorithm") != "sha256"
-        or payload.get("observation_content_hash_contract_version") != 1
-        or payload.get("observation_content_hash_row_count") != row_count
-        or payload.get("observation_content_hash_columns")
-        != OBSERVATION_CONTENT_HASH_COLUMNS
-        or not isinstance(counts, dict)
-        or set(counts) != {"P", "R", "null"}
-        or any(
-            isinstance(counts.get(key), bool)
-            or not isinstance(counts.get(key), int)
-            or counts.get(key, -1) < 0
-            for key in ("P", "R", "null")
-        )
-        or sum(int(counts[key]) for key in ("P", "R", "null")) != row_count
-    ):
-        raise ValueError("observation content hash metadata is invalid")
-    return dict(payload)
+SOURCE_EVIDENCE_CONTRACT_VERSION = 2
 
 
 def _require_nonnegative_evidence_int(
@@ -14428,7 +14328,6 @@ def _load_complete_connector_day_source_evidence(
             pollutant_code = str(row.get("pollutant_code") or "").strip().lower()
             observed_at = _parse_required_timestamp_value(row.get("observed_at"))
             value = float(row.get("value"))
-            verification_status = row.get("verification_status")
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("complete connector-day detector source row is invalid") from exc
         if (
@@ -14439,8 +14338,6 @@ def _load_complete_connector_day_source_evidence(
             or observed_at is None
             or observed_at.date().isoformat() != day_utc
             or not math.isfinite(value)
-            or verification_status not in (None, "P", "R")
-            or "status" in row
         ):
             raise ValueError("complete connector-day detector source row identity is invalid")
         per_timeseries[str(timeseries_id)] = per_timeseries.get(str(timeseries_id), 0) + 1
@@ -14460,23 +14357,6 @@ def _load_complete_connector_day_source_evidence(
         or sorted(per_pollutant) != sorted(str(value) for value in list(evidence.get("pollutant_set") or []))
     ):
         raise ValueError("complete connector-day detector source evidence counts are invalid")
-    hash_evidence = evidence.get("observation_content_hashes")
-    if not isinstance(hash_evidence, dict) or sorted(hash_evidence) != sorted(
-        per_pollutant
-    ):
-        raise ValueError(
-            "complete connector-day observation content hash evidence is incomplete"
-        )
-    for pollutant_code, row_count in per_pollutant.items():
-        metadata = hash_evidence.get(pollutant_code)
-        if not isinstance(metadata, Mapping):
-            raise ValueError(
-                "complete connector-day observation content hash evidence is invalid"
-            )
-        _validate_observation_content_hash_metadata(
-            metadata,
-            row_count=row_count,
-        )
     classification_counts = dict(
         evidence.get("source_label_classification_counts") or {}
     )
@@ -14616,7 +14496,6 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "source_evidence_input_sha256",
         "per_timeseries_counts",
         "per_pollutant_counts",
-        "observation_content_hashes",
         "pollutant_set",
         "source_file_identities_sha256",
         "requested_pollutant_set",
@@ -14645,416 +14524,6 @@ def _assert_detector_and_proposal_source_evidence_agree(
             "detector and proposal complete connector-day source evidence disagree: "
             + ",".join(mismatched)
         )
-
-
-def _compute_observation_hash_with_shared_javascript(
-    *,
-    rows: list[dict[str, Any]],
-    is_sos: bool,
-    env: Mapping[str, str],
-) -> dict[str, Any]:
-    repo_root = _repo_root_for_integrity_script(env)
-    helper = repo_root / "workers/shared/uk_aq_observation_content_hash.mjs"
-    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
-    process = subprocess.run(
-        [node_bin, str(helper)],
-        cwd=repo_root,
-        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        input=json.dumps({
-            "rows": rows,
-            "legacy_status_mode": "sos" if is_sos else "non_sos",
-        }),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if process.returncode != 0:
-        raise RuntimeError(
-            "shared observation content hash helper failed: "
-            + _truncate_text(process.stderr or process.stdout or "", 2000)
-        )
-    output = json.loads(process.stdout)
-    if not isinstance(output, dict):
-        raise ValueError("shared observation content hash helper returned invalid JSON")
-    return _validate_observation_content_hash_metadata(
-        output,
-        row_count=len(rows),
-    )
-
-
-def _observation_rows_from_local_parquet_for_shared_hash(
-    *,
-    parquet_paths: Iterable[str],
-) -> list[dict[str, Any]]:
-    paths = sorted({str(Path(path)) for path in parquet_paths if Path(path).is_file()})
-    if not paths:
-        raise FileNotFoundError("observation content hash has no readable Parquet files")
-    if importlib.util.find_spec("duckdb") is None:
-        raise RuntimeError("duckdb is required for observation content hash comparison")
-    import duckdb  # type: ignore[import-not-found]
-
-    connection = _connect_duckdb_utc(duckdb)
-    try:
-        description = connection.execute(
-            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)",
-            [paths],
-        ).fetchall()
-        columns = {str(row[0]) for row in description}
-        required = {
-            "connector_id",
-            "station_id",
-            "timeseries_id",
-            "pollutant_code",
-            "observed_at_utc",
-            "value",
-        }
-        missing = sorted(required - columns)
-        if missing:
-            raise ValueError(
-                "legacy observation Parquet is missing canonical columns: "
-                + ",".join(missing)
-            )
-        status_column = (
-            "verification_status"
-            if "verification_status" in columns
-            else "status"
-            if "status" in columns
-            else None
-        )
-        status_select = (
-            f', "{status_column}" AS source_status'
-            if status_column
-            else ", NULL::VARCHAR AS source_status"
-        )
-        result_rows = connection.execute(
-            """
-            SELECT connector_id, station_id, timeseries_id, pollutant_code,
-                   observed_at_utc, "value"
-            """
-            + status_select
-            + " FROM read_parquet(?, union_by_name=true)",
-            [paths],
-        ).fetchall()
-    finally:
-        connection.close()
-    rows: list[dict[str, Any]] = []
-    for row in result_rows:
-        observed_at = _parse_required_timestamp_value(row[4])
-        if observed_at is None:
-            raise ValueError("legacy observation Parquet timestamp is invalid")
-        observed_at = observed_at.astimezone(dt.timezone.utc)
-        canonical_timestamp = observed_at.isoformat(
-            timespec="milliseconds"
-        ).replace("+00:00", "Z")
-        item = {
-            "connector_id": row[0],
-            "station_id": row[1],
-            "timeseries_id": row[2],
-            "pollutant_code": row[3],
-            "observed_at_utc": canonical_timestamp,
-            "value": row[5],
-        }
-        if status_column:
-            item[status_column] = row[6]
-        rows.append(item)
-    return rows
-
-
-def run_v2_observation_content_hash_checks(
-    *,
-    conn: sqlite3.Connection,
-    env_name: str,
-    run_compact: str,
-    env: dict[str, str],
-    v2_observations: dict[str, Any],
-    source_scope: Mapping[str, Any] | None,
-    log: logging.Logger,
-) -> dict[str, Any]:
-    candidates = [
-        dict(candidate)
-        for candidate in list(v2_observations.get("hash_check_candidates") or [])
-        if isinstance(candidate, Mapping)
-    ]
-    if not candidates:
-        return {
-            "checked": 0,
-            "verified": 0,
-            "missing": 0,
-            "mismatch": 0,
-            "invalid_contract": 0,
-        }
-    log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
-    stage_root = log_dir / "_observation_hash_detector"
-    evidence_by_connector_day: dict[tuple[str, int], dict[str, Any]] = {}
-    errors_by_connector_day: dict[tuple[str, int], str] = {}
-    sos_connector_id = int(
-        str(env.get("UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK") or "1")
-    )
-    for day_utc, connector_id in sorted({
-        (str(candidate["day_utc"]), int(candidate["connector_id"]))
-        for candidate in candidates
-    }):
-        scope_dir = (
-            stage_root / f"day_utc={day_utc}" /
-            f"connector_id={connector_id}"
-        )
-        shutil.rmtree(scope_dir, ignore_errors=True)
-        registry_snapshot: dict[str, Any] | None = None
-        try:
-            if connector_id == sos_connector_id:
-                registry_snapshot = write_uk_air_source_label_registry_snapshot(
-                    conn=conn,
-                    connector_id=connector_id,
-                    cache_root=Path(
-                        env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]
-                    ) / SOS_SOURCE_KEY,
-                    snapshot_path=(
-                        stage_root / "sos-source-label-registry" /
-                        f"day_utc={day_utc}" /
-                        f"connector_id={connector_id}.json"
-                    ),
-                )
-            result = run_narrow_backfill(
-                wrapper_path=resolve_integrity_backfill_wrapper(),
-                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                env_name=env_name,
-                timeseries_ids=[],
-                connector_ids=[connector_id],
-                day=dt.date.fromisoformat(day_utc),
-                log=log,
-                log_dir=log_dir,
-                log_label=(
-                    f"v2_obs_hash_day_{day_utc}_connector_{connector_id}"
-                ),
-                output_scope="observations_only",
-                history_version="v2",
-                extra_env={
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "false",
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
-                    "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
-                    "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
-                    **({
-                        "UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE":
-                            registry_snapshot["path"]
-                    } if registry_snapshot else {}),
-                },
-                complete_connector_day=True,
-                repair_pollutants=None,
-            )
-            if result.get("status") != "ok":
-                raise RuntimeError(
-                    "observation hash source evidence worker failed:"
-                    + str(
-                        result.get("source_connector_day_first_error")
-                        or result.get("error")
-                        or result.get("exit_code")
-                    )
-                )
-            evidence, rows = _load_complete_connector_day_source_evidence(
-                stage_root=stage_root,
-                day_utc=day_utc,
-                connector_id=connector_id,
-            )
-            _persist_complete_connector_day_source_evidence(
-                conn=conn,
-                env_name=env_name,
-                evidence=evidence,
-                canonical_rows=rows,
-            )
-            evidence_by_connector_day[(day_utc, connector_id)] = evidence
-            conn.commit()
-        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-            errors_by_connector_day[(day_utc, connector_id)] = str(exc)
-
-    metrics = {
-        "checked": 0,
-        "verified": 0,
-        "missing": 0,
-        "mismatch": 0,
-        "invalid_contract": 0,
-    }
-    new_gaps: list[dict[str, Any]] = []
-    verified_partitions: list[dict[str, Any]] = []
-    for candidate in candidates:
-        day_utc = str(candidate["day_utc"])
-        connector_id = int(candidate["connector_id"])
-        pollutant_code = str(candidate["pollutant_code"])
-        metrics["checked"] += 1
-        evidence = evidence_by_connector_day.get((day_utc, connector_id))
-        source_error = errors_by_connector_day.get((day_utc, connector_id))
-        if evidence is None:
-            gap = _v2_obs_gap(
-                "observation_content_hash_invalid_contract",
-                day_utc=day_utc,
-                connector_id=connector_id,
-                pollutant_code=pollutant_code,
-                expected_path=str(candidate.get("manifest_rel") or ""),
-                related_paths=[f"source_hash_unavailable:{source_error or 'unknown'}"],
-            )
-            new_gaps.append(gap)
-            metrics["invalid_contract"] += 1
-            continue
-        source_hash = dict(
-            (evidence.get("observation_content_hashes") or {}).get(
-                pollutant_code
-            )
-            or {}
-        )
-        try:
-            _validate_observation_content_hash_metadata(
-                source_hash,
-                row_count=int(candidate["source_row_count"]),
-            )
-        except ValueError as exc:
-            gap = _v2_obs_gap(
-                "observation_content_hash_invalid_contract",
-                day_utc=day_utc,
-                connector_id=connector_id,
-                pollutant_code=pollutant_code,
-                expected_path=str(candidate.get("manifest_rel") or ""),
-                related_paths=[f"source_hash_invalid:{exc}"],
-            )
-            new_gaps.append(gap)
-            metrics["invalid_contract"] += 1
-            continue
-        manifest = json.loads(
-            Path(str(candidate["manifest_path"])).read_text(encoding="utf-8")
-        )
-        manifest_has_hash = isinstance(manifest, Mapping) and any(
-            str(key).startswith("observation_content_hash")
-            or key == "verification_status_counts"
-            for key in manifest
-        )
-        manifest_hash: dict[str, Any] | None = None
-        manifest_contract_error: str | None = None
-        if manifest_has_hash:
-            try:
-                manifest_hash = _validate_observation_content_hash_metadata(
-                    manifest,
-                    row_count=int(candidate["source_row_count"]),
-                )
-            except ValueError as exc:
-                manifest_contract_error = str(exc)
-        if manifest_hash is None:
-            try:
-                legacy_rows = _observation_rows_from_local_parquet_for_shared_hash(
-                    parquet_paths=candidate.get("parquet_paths") or [],
-                )
-                parquet_hash = _compute_observation_hash_with_shared_javascript(
-                    rows=legacy_rows,
-                    is_sos=connector_id == sos_connector_id,
-                    env=env,
-                )
-            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-                gap = _v2_obs_gap(
-                    "observation_content_hash_invalid_contract",
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                    expected_path=str(candidate.get("manifest_rel") or ""),
-                    related_paths=[f"parquet_hash_failed:{exc}"],
-                )
-                new_gaps.append(gap)
-                metrics["invalid_contract"] += 1
-                continue
-            content_matches = (
-                parquet_hash["observation_content_hash"]
-                == source_hash["observation_content_hash"]
-                and parquet_hash["verification_status_counts"]
-                == source_hash["verification_status_counts"]
-            )
-            gap_type = (
-                "observation_content_hash_missing"
-                if manifest_contract_error is None
-                else "observation_content_hash_invalid_contract"
-            )
-            if content_matches:
-                gap = _v2_obs_gap(
-                    gap_type,
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                    expected_path=str(candidate.get("manifest_rel") or ""),
-                    related_paths=["legacy_parquet_content_matches_source"],
-                )
-                gap["parquet_readable"] = True
-                gap["hash_content_verified"] = True
-                new_gaps.append(gap)
-                metrics[
-                    "missing"
-                    if gap_type == "observation_content_hash_missing"
-                    else "invalid_contract"
-                ] += 1
-            else:
-                gap = _v2_obs_gap(
-                    "observation_content_hash_mismatch",
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                    expected_path=str(candidate.get("manifest_rel") or ""),
-                    related_paths=[
-                        "legacy_parquet_content_differs_from_source",
-                        f"source_hash={source_hash['observation_content_hash']}",
-                        f"parquet_hash={parquet_hash['observation_content_hash']}",
-                    ],
-                )
-                new_gaps.append(gap)
-                metrics["mismatch"] += 1
-            continue
-        if (
-            manifest_hash["observation_content_hash"]
-            != source_hash["observation_content_hash"]
-            or manifest_hash["verification_status_counts"]
-            != source_hash["verification_status_counts"]
-        ):
-            gap = _v2_obs_gap(
-                "observation_content_hash_mismatch",
-                day_utc=day_utc,
-                connector_id=connector_id,
-                pollutant_code=pollutant_code,
-                expected_path=str(candidate.get("manifest_rel") or ""),
-                related_paths=[
-                    f"source_hash={source_hash['observation_content_hash']}",
-                    f"dropbox_manifest_hash={manifest_hash['observation_content_hash']}",
-                ],
-            )
-            new_gaps.append(gap)
-            metrics["mismatch"] += 1
-        else:
-            verified_partitions.append({
-                "day_utc": day_utc,
-                "connector_id": connector_id,
-                "pollutant_code": pollutant_code,
-                "status": "observation_content_hash_verified",
-                "observation_content_hash":
-                    source_hash["observation_content_hash"],
-            })
-            metrics["verified"] += 1
-
-    gaps = list(v2_observations.get("gaps") or []) + new_gaps
-    _classify_v2_gaps(gaps)
-    _enrich_v2_observations_repair_plans(
-        root=Path(str(resolve_r2_history_root({**os.environ, **env}))),
-        gaps=gaps,
-        source_scope=source_scope,
-    )
-    v2_observations["gaps"] = gaps
-    v2_observations["gap_count"] = len(gaps)
-    v2_observations["status"] = (
-        "fail" if any(gap.get("severity") == "error" for gap in gaps) else "ok"
-    )
-    v2_observations["repair_plan"] = build_v2_repair_plan(
-        observation_gaps=gaps,
-        conn=conn,
-    )
-    v2_observations["observation_content_hash_checks"] = {
-        **metrics,
-        "verified_partitions": verified_partitions,
-    }
-    return metrics
 
 
 def run_v2_gap_backfills(
@@ -16763,68 +16232,96 @@ def _capture_local_v2_observation_scope(
     ):
         raise ValueError("complete connector-day source evidence contains blocked or inactive-skipped rows")
 
+    def canonical_row_identity(row: Mapping[str, Any], *, source: str) -> tuple[Any, ...]:
+        try:
+            row_connector_id = int(row.get("connector_id", connector_id))
+            station_id = int(row.get("station_id"))
+            timeseries_id = int(row.get("timeseries_id"))
+            pollutant_code = str(row.get("pollutant_code") or "").strip().lower()
+            timestamp = row.get("observed_at")
+            parsed_timestamp = _parse_required_timestamp_value(timestamp)
+            value = float(row.get("value"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid {source} observation identity: {row!r}") from exc
+        if (
+            row_connector_id != int(connector_id)
+            or station_id <= 0
+            or timeseries_id <= 0
+            or not re.fullmatch(r"[a-z0-9_]+", pollutant_code)
+            or parsed_timestamp is None
+            or parsed_timestamp.date().isoformat() != day_utc
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"invalid {source} observation identity: {row!r}")
+        timestamp_micros = int(parsed_timestamp.timestamp() * 1_000_000)
+        value_identity = struct.pack(">d", value).hex()
+        status_value = row.get("status")
+        status = None if status_value is None else str(status_value)
+        return (
+            row_connector_id,
+            station_id,
+            timeseries_id,
+            pollutant_code,
+            timestamp_micros,
+            value_identity,
+            status,
+        )
+
+    source_identities = Counter(
+        canonical_row_identity(row, source="source")
+        for row in source_rows
+        if isinstance(row, Mapping)
+    )
+    if sum(source_identities.values()) != len(source_rows):
+        raise ValueError("source evidence contains a non-object observation row")
+
     parquet_paths = sorted(
         path for path in source_root.glob("pollutant_code=*/part-*.parquet")
         if not selected_pollutants or path.parent.name.removeprefix("pollutant_code=") in selected_pollutants
     )
-    source_hashes = evidence.get("observation_content_hashes")
-    if not isinstance(source_hashes, Mapping):
-        raise ValueError("source observation content hash evidence is unavailable")
-    is_sos = str(evidence.get("source_adapter") or "") == "sos"
-    selected_hash_pollutants = (
-        selected_pollutants
-        if selected_pollutants
-        else sorted(str(value) for value in source_hashes)
-    )
-    for pollutant_code in selected_hash_pollutants:
-        source_hash = source_hashes.get(pollutant_code)
-        if not isinstance(source_hash, Mapping):
-            raise ValueError(
-                f"source observation content hash is missing: {pollutant_code}"
+    if importlib.util.find_spec("duckdb") is None:
+        raise RuntimeError("duckdb is required for exact connector-day Parquet read-back")
+    import duckdb  # type: ignore[import-not-found]
+
+    parquet_rows: list[tuple[Any, ...]] = []
+    if parquet_paths:
+        connection = _connect_duckdb_utc(duckdb)
+        try:
+            result_rows = connection.execute(
+                """
+                SELECT connector_id, station_id, timeseries_id, pollutant_code,
+                       observed_at_utc AS observed_at, "value", status
+                FROM read_parquet(?, union_by_name=true)
+                """,
+                [[str(path) for path in parquet_paths]],
+            ).fetchall()
+        finally:
+            connection.close()
+        parquet_rows = [
+            (
+                row[0], row[1], row[2], row[3], row[4], row[5], row[6],
             )
-        pollutant_paths = [
-            str(path)
-            for path in parquet_paths
-            if path.parent.name == f"pollutant_code={pollutant_code}"
+            for row in result_rows
         ]
-        parquet_rows = _observation_rows_from_local_parquet_for_shared_hash(
-            parquet_paths=pollutant_paths,
+    parquet_identities = Counter(
+        canonical_row_identity({
+            "connector_id": row[0],
+            "station_id": row[1],
+            "timeseries_id": row[2],
+            "pollutant_code": row[3],
+            "observed_at": row[4],
+            "value": row[5],
+            "status": row[6],
+        }, source="Parquet")
+        for row in parquet_rows
+    )
+    if source_identities != parquet_identities:
+        missing = list((source_identities - parquet_identities).items())[:10]
+        surplus = list((parquet_identities - source_identities).items())[:10]
+        raise ValueError(
+            "canonical connector Parquet rows do not exactly match authoritative source rows: "
+            f"missing={missing!r} surplus={surplus!r}"
         )
-        parquet_hash = _compute_observation_hash_with_shared_javascript(
-            rows=parquet_rows,
-            is_sos=is_sos,
-            env=os.environ,
-        )
-        if (
-            parquet_hash["observation_content_hash"]
-            != source_hash.get("observation_content_hash")
-            or parquet_hash["verification_status_counts"]
-            != source_hash.get("verification_status_counts")
-        ):
-            raise ValueError(
-                "canonical connector Parquet hash does not match authoritative "
-                f"source hash: pollutant={pollutant_code}"
-            )
-        pollutant_manifest_path = (
-            source_root / f"pollutant_code={pollutant_code}" / "manifest.json"
-        )
-        pollutant_manifest = json.loads(
-            pollutant_manifest_path.read_text(encoding="utf-8")
-        )
-        manifest_hash = _validate_observation_content_hash_metadata(
-            pollutant_manifest,
-            row_count=len(parquet_rows),
-        )
-        if (
-            manifest_hash["observation_content_hash"]
-            != source_hash.get("observation_content_hash")
-            or manifest_hash["verification_status_counts"]
-            != source_hash.get("verification_status_counts")
-        ):
-            raise ValueError(
-                "canonical pollutant manifest hash does not match authoritative "
-                f"source hash: pollutant={pollutant_code}"
-            )
 
     expected_counts = _normalize_timeseries_row_counts(
         evidence.get("per_timeseries_counts")
@@ -21837,15 +21334,6 @@ def main(argv: list[str]) -> int:
                     verified_first_value_at_connector_days
                 ),
             )
-            observation_hash_metrics = run_v2_observation_content_hash_checks(
-                conn=conn,
-                env_name=args.env,
-                run_compact=run_compact,
-                env=env,
-                v2_observations=v2_obs,
-                source_scope=v2_source_scope,
-                log=log,
-            )
             v2_aqi = run_v2_aqilevels_integrity_checks(
                 r2_history_root=r2_history_root,
                 config=history_path_configs["v2"],
@@ -21865,7 +21353,6 @@ def main(argv: list[str]) -> int:
                 "skipped_reason": None,
                 "source_scope": v2_source_scope,
                 "v2_observations": v2_obs,
-                "observation_content_hash_checks": observation_hash_metrics,
                 "v2_aqilevels": v2_aqi,
                 "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0) + int(v2_aqi.get("checked_partitions", 0) or 0),
                 "cross_checks_ok": (int(v2_obs.get("checked_partitions", 0) or 0) + int(v2_aqi.get("checked_partitions", 0) or 0)) if v2_obs.get("status") == "ok" and v2_aqi.get("status") == "ok" else 0,

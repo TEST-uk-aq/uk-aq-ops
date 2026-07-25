@@ -8,8 +8,6 @@ import { Client } from "pg";
 import Cursor from "pg-cursor";
 import * as arrow from "apache-arrow";
 import * as parquetWasm from "parquet-wasm/esm";
-import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
-import { compressors } from "hyparquet-compressors";
 import {
   hasRequiredR2Config,
   normalizePrefix,
@@ -25,11 +23,6 @@ import {
   normalizeObservationPropertyCode,
   OBSERVATION_PROPERTY_CODE_SQL_PATTERN,
 } from "../shared/uk_aq_observation_property_code.mjs";
-import {
-  computeObservationContentHash,
-  normalizeCanonicalObservationRow,
-  normalizeUkAirVerificationStatus,
-} from "../shared/uk_aq_observation_content_hash.mjs";
 import {
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey,
   updateR2HistoryIndexesTargeted,
@@ -71,7 +64,6 @@ const DEFAULT_PHASE_B_PM_CONTEXT_RPC = "uk_aq_rpc_observs_aqi_pm_hourly_context"
 const DEFAULT_PHASE_B_PM_CONTEXT_PAGE_SIZE = 1_000;
 const DEFAULT_PHASE_B_PM_CONTEXT_MAX_PAGES = 100;
 const DEFAULT_PHASE_B_PM_CONTEXT_MAX_ROWS = 50_000;
-const DEFAULT_PHASE_B_SOS_CONNECTOR_ID = 1;
 const DEFAULT_PRUNE_CHECK_DROPBOX_DIR = "prune_r2_check";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
@@ -109,7 +101,6 @@ export const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 = Object.freeze([
   "pollutant_code",
   "observed_at_utc",
   "value",
-  "verification_status",
 ]);
 export const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
   "connector_id",
@@ -190,9 +181,7 @@ const HISTORY_R2_V2_OBSERVATIONS_PREFIX = "history/v2/observations";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug";
 const HISTORY_R2_V2_SCHEMA_VERSION = 2;
-const HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION = 3;
 const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
-const HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION = "parquet-wasm-zstd-v3";
 export const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE = "^history/(v1/(observations|aqilevels/hourly)|v2/observations)/day_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}/manifest\\.json$";
 const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX = new RegExp(PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE);
 
@@ -2135,18 +2124,6 @@ function historyV2ColumnsFor(domain, profile = null) {
   throw new Error(`Unsupported R2 history v2 schema: domain=${domain} profile=${profile || "null"}`);
 }
 
-function historyV2SchemaVersionFor(domain) {
-  return domain === "observations"
-    ? HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION
-    : HISTORY_R2_V2_SCHEMA_VERSION;
-}
-
-function historyV2WriterVersionFor(domain) {
-  return domain === "observations"
-    ? HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION
-    : HISTORY_R2_V2_WRITER_VERSION;
-}
-
 function minEntryValue(entries, fieldName) {
   return entries.reduce((current, entry) => minIso(current, entry?.[fieldName] || null), null);
 }
@@ -2215,7 +2192,6 @@ function createHistoryV2PollutantManifest({
   fileEntries,
   writerGitSha,
   backedUpAtUtc,
-  observationContentHash = null,
 }) {
   const normalizedPollutantCode = normalizePollutantCodeForPath(pollutantCode);
   const files = sortHistoryV2FileEntries(fileEntries).map((entry) => ({
@@ -2227,20 +2203,9 @@ function createHistoryV2PollutantManifest({
   const maxObservedAtUtc = maxEntryValue(files, "max_observed_at_utc") || maxEntryValue(files, "max_observed_at");
   const minTimestampHourUtc = minEntryValue(files, "min_timestamp_hour_utc");
   const maxTimestampHourUtc = maxEntryValue(files, "max_timestamp_hour_utc");
-  if (domain === "observations") {
-    if (
-      !observationContentHash ||
-      observationContentHash.observation_content_hash_row_count !==
-        Number(sourceRowCount)
-    ) {
-      throw new Error(
-        `Observation content hash row count mismatch for day=${dayUtc} connector=${connectorId} pollutant=${normalizedPollutantCode}`,
-      );
-    }
-  }
   const payload = {
-    manifest_schema_version: historyV2SchemaVersionFor(domain),
-    history_schema_version: historyV2SchemaVersionFor(domain),
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
     history_version: "v2",
     manifest_kind: "pollutant",
     domain,
@@ -2266,11 +2231,10 @@ function createHistoryV2PollutantManifest({
     files,
     child_manifests: [],
     columns: historyV2ColumnsFor(domain, profile),
-    writer_version: historyV2WriterVersionFor(domain),
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
     writer_git_sha: writerGitSha,
     timeseries_row_counts: aggregateTimeseriesRowCounts(files),
     ...statsFromFileEntries(files, Number(sourceRowCount)),
-    ...(domain === "observations" ? observationContentHash : {}),
     backed_up_at_utc: backedUpAtUtc,
   };
   return withManifestHash(payload);
@@ -2310,8 +2274,8 @@ function createHistoryV2ConnectorManifest({
   const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
   const pollutantCodes = uniqueSorted(manifests.map((manifest) => manifest.pollutant_code).filter(Boolean));
   return withManifestHash({
-    manifest_schema_version: historyV2SchemaVersionFor(domain),
-    history_schema_version: historyV2SchemaVersionFor(domain),
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
     history_version: "v2",
     manifest_kind: "connector",
     domain,
@@ -2338,7 +2302,7 @@ function createHistoryV2ConnectorManifest({
     child_manifests: childManifests,
     pollutant_manifests: childManifests,
     columns: historyV2ColumnsFor(domain, profile),
-    writer_version: historyV2WriterVersionFor(domain),
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
     writer_git_sha: writerGitSha,
     timeseries_row_counts: aggregateTimeseriesRowCounts(manifests),
     ...statsFromFileEntries(files, totalRows),
@@ -2383,8 +2347,8 @@ function createHistoryV2DayManifest({
     Array.isArray(manifest.pollutant_codes) ? manifest.pollutant_codes : []
   )));
   return withManifestHash({
-    manifest_schema_version: historyV2SchemaVersionFor(domain),
-    history_schema_version: historyV2SchemaVersionFor(domain),
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
     history_version: "v2",
     manifest_kind: "day",
     domain,
@@ -2412,7 +2376,7 @@ function createHistoryV2DayManifest({
     child_manifests: childManifests,
     connector_manifests: childManifests,
     columns: historyV2ColumnsFor(domain, profile),
-    writer_version: historyV2WriterVersionFor(domain),
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
     writer_git_sha: writerGitSha,
     ...statsFromFileEntries(files, totalRows),
     backed_up_at_utc: backedUpAtUtc,
@@ -2549,87 +2513,11 @@ function rowsToObservationV2ParquetBuffer(rows, writerProperties) {
     pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
     observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at_utc || row.observed_at))),
     value: rows.map((row) => (row.value === null || row.value === undefined ? null : Number(row.value))),
-    verification_status: textVector(rows.map((row) => row.verification_status ?? null)),
   });
 
   const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
   const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
   return Buffer.from(parquetBytes);
-}
-
-async function canonicalObservationRowsFromParquet(bytes, { isSos }) {
-  const file = new Uint8Array(bytes).slice().buffer;
-  const metadata = await parquetMetadataAsync(file);
-  const rowCount = Number(metadata.num_rows || 0);
-  if (!Number.isSafeInteger(rowCount) || rowCount <= 0) {
-    throw new Error("Committed observation Parquet must contain rows");
-  }
-  const schemaColumns = new Set(
-    parquetSchema(metadata).children.map((column) => String(column.element.name)),
-  );
-  const requiredColumns = [
-    "connector_id",
-    "station_id",
-    "timeseries_id",
-    "pollutant_code",
-    "observed_at_utc",
-    "value",
-  ];
-  const missingColumns = requiredColumns.filter((column) =>
-    !schemaColumns.has(column)
-  );
-  if (missingColumns.length) {
-    throw new Error(
-      `Committed observation Parquet is missing canonical columns: ${missingColumns.join(",")}`,
-    );
-  }
-  const statusColumn = schemaColumns.has("verification_status")
-    ? "verification_status"
-    : schemaColumns.has("status")
-    ? "status"
-    : null;
-  const columns = [
-    ...requiredColumns,
-    ...(statusColumn ? [statusColumn] : []),
-  ];
-  let decodedRows = [];
-  await parquetRead({
-    file,
-    metadata,
-    columns,
-    rowStart: 0,
-    rowEnd: rowCount,
-    compressors,
-    onComplete: (rows) => {
-      decodedRows = Array.isArray(rows) ? rows : [];
-    },
-  });
-  if (decodedRows.length !== rowCount) {
-    throw new Error("Committed observation Parquet row count changed while reading");
-  }
-  return decodedRows.map((values) => {
-    if (!Array.isArray(values)) {
-      throw new Error("Committed observation Parquet contains an invalid row");
-    }
-    const rawStatus = statusColumn
-      ? values[requiredColumns.length] ?? null
-      : null;
-    return normalizeCanonicalObservationRow({
-      connector_id: Number(values[0]),
-      station_id: values[1] === null || values[1] === undefined
-        ? null
-        : Number(values[1]),
-      timeseries_id: Number(values[2]),
-      pollutant_code: values[3],
-      observed_at_utc: new Date(values[4]).toISOString(),
-      value: Number(values[5]),
-      verification_status: isSos
-        ? normalizeUkAirVerificationStatus(rawStatus)
-        : statusColumn === "verification_status"
-        ? rawStatus
-        : null,
-    });
-  });
 }
 
 function rowsToAqilevelDataV2ParquetBuffer(rows, writerProperties) {
@@ -2703,10 +2591,7 @@ function rowsToAqilevelDebugV2ParquetBuffer(rows, writerProperties) {
 export function rowsToObservationV2ParquetBufferForTest(rows) {
   return rowsToObservationV2ParquetBuffer(
     rows,
-    parquetWriterProperties(
-      DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE,
-      HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
-    ),
+    parquetWriterProperties(DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
   );
 }
 
@@ -2758,7 +2643,6 @@ async function writeCommittedPartAndCheckpoint({
   committedParts,
   observedRows,
   totalBytes,
-  canonicalRowsByPollutant = null,
 }) {
   if (runtime.history_write_version === "v2") {
     return await writeCommittedV2PartAndCheckpoint({
@@ -2771,7 +2655,6 @@ async function writeCommittedPartAndCheckpoint({
       committedParts,
       observedRows,
       totalBytes,
-      canonicalRowsByPollutant,
     });
   }
 
@@ -2842,28 +2725,8 @@ async function writeCommittedV2PartAndCheckpoint({
   committedParts,
   observedRows,
   totalBytes,
-  canonicalRowsByPollutant,
 }) {
-  if (!(canonicalRowsByPollutant instanceof Map)) {
-    throw new Error("V2 observation writer requires a canonical pollutant-row accumulator");
-  }
-  const canonicalRows = rows.map((row) => normalizeCanonicalObservationRow({
-    connector_id: row.connector_id,
-    station_id: row.station_id,
-    timeseries_id: row.timeseries_id,
-    pollutant_code: normalizePollutantCodeForPath(row.pollutant_code),
-    observed_at_utc: new Date(
-      row.observed_at_utc || row.observed_at,
-    ).toISOString(),
-    value: row.value,
-    verification_status: Number(row.connector_id) ===
-        Number(runtime.sos_connector_id)
-      ? normalizeUkAirVerificationStatus(
-        row.verification_status ?? row.status ?? null,
-      )
-      : null,
-  }));
-  const groupedRows = groupRowsByPollutant(canonicalRows);
+  const groupedRows = groupRowsByPollutant(rows);
   const sourcePollutantCodes = groupedRows.map(([pollutantCode]) => pollutantCode);
   const writeGroups = groupedRows;
   const writePollutantCodes = writeGroups.map(([pollutantCode]) => pollutantCode);
@@ -2891,9 +2754,6 @@ async function writeCommittedV2PartAndCheckpoint({
 
   for (let pollutantIndex = 0; pollutantIndex < writeGroups.length; pollutantIndex += 1) {
     const [pollutantCode, pollutantRows] = writeGroups[pollutantIndex];
-    const accumulatedRows = canonicalRowsByPollutant.get(pollutantCode) || [];
-    accumulatedRows.push(...pollutantRows);
-    canonicalRowsByPollutant.set(pollutantCode, accumulatedRows);
     assertBudget(runtime, "pollutant_part", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 15_000);
     const pollutantStartedAtMs = Date.now();
     logPhaseB(runtime, "INFO", "phase_b_history_pollutant_start", {
@@ -2913,10 +2773,7 @@ async function writeCommittedV2PartAndCheckpoint({
     const parquetStartedAtMs = Date.now();
     const parquetBuffer = rowsToObservationV2ParquetBuffer(
       pollutantRows,
-      parquetWriterProperties(
-        runtime.observations_row_group_size,
-        HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
-      ),
+      parquetWriterProperties(runtime.observations_row_group_size, HISTORY_R2_V2_WRITER_VERSION),
     );
     logPhaseB(runtime, "INFO", "phase_b_history_parquet_build_complete", {
       day_utc: dayUtc,
@@ -3076,11 +2933,7 @@ async function writeCommittedV2PartAndCheckpoint({
 }
 
 export async function writeCommittedV2PartAndCheckpointForTest(args) {
-  return await writeCommittedV2PartAndCheckpoint({
-    ...args,
-    canonicalRowsByPollutant:
-      args.canonicalRowsByPollutant || new Map(),
-  });
+  return await writeCommittedV2PartAndCheckpoint(args);
 }
 
 async function writeObservationV2ConnectorManifest({
@@ -3089,11 +2942,7 @@ async function writeObservationV2ConnectorManifest({
   connectorId,
   committedParts,
   backedUpAtUtc,
-  canonicalRowsByPollutant,
 }) {
-  if (!(canonicalRowsByPollutant instanceof Map)) {
-    throw new Error("V2 observation manifest requires canonical pollutant rows");
-  }
   assertBudget(runtime, "connector_manifest_prepare", { day_utc: dayUtc, connector_id: connectorId }, 15_000);
   const prepareStartedAtMs = Date.now();
   logPhaseB(runtime, "INFO", "phase_b_history_connector_manifest_prepare_start", {
@@ -3128,13 +2977,6 @@ async function writeObservationV2ConnectorManifest({
       pollutantCode,
     );
     const sourceRowCount = pollutantParts.reduce((sum, part) => sum + Number(part.row_count || 0), 0);
-    const hashResult = computeObservationContentHash(
-      canonicalRowsByPollutant.get(pollutantCode) || [],
-    );
-    const {
-      canonical_rows: _canonicalRows,
-      ...observationContentHash
-    } = hashResult;
     const pollutantManifest = createHistoryV2PollutantManifest({
       domain: "observations",
       dayUtc,
@@ -3146,7 +2988,6 @@ async function writeObservationV2ConnectorManifest({
       fileEntries: pollutantParts,
       writerGitSha: runtime.writer_git_sha,
       backedUpAtUtc,
-      observationContentHash,
     });
     logPhaseB(runtime, "INFO", "phase_b_history_manifest_write_start", {
       day_utc: dayUtc,
@@ -3280,7 +3121,6 @@ function normalizeFrozenObservationRow(row) {
     observed_at: observedAt,
     observed_at_utc: observedAt,
     value: row.value,
-    status: row.status ?? null,
   };
 }
 
@@ -3320,7 +3160,6 @@ async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, 
   let totalBytes = 0n;
   let partIndex = 0;
   let pendingDayRows = [];
-  const canonicalRowsByPollutant = new Map();
 
   const flushObservationRows = async () => {
     if (!pendingDayRows.length) return;
@@ -3334,7 +3173,6 @@ async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, 
       committedParts,
       observedRows,
       totalBytes,
-      canonicalRowsByPollutant,
     });
     partIndex = flushed.partIndex;
     committedParts = flushed.committedParts;
@@ -3350,8 +3188,7 @@ select
   timeseries_id,
   pollutant_code,
   observed_at_utc,
-  value,
-  status
+  value
 from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   $1::integer,
   $2::timestamptz,
@@ -3399,14 +3236,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   if (observedRows !== candidate.expected_row_count) {
     throw new Error(`Row count mismatch for day=${dayUtc} connector=${connectorId}: expected=${candidate.expected_row_count.toString()} observed=${observedRows.toString()}`);
   }
-  return {
-    temp,
-    counts,
-    committedParts,
-    observedRows,
-    totalBytes,
-    canonicalRowsByPollutant,
-  };
+  return { temp, counts, committedParts, observedRows, totalBytes };
 }
 
 async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, frozenSourcePath }) {
@@ -3547,7 +3377,6 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
         connectorId,
         committedParts: staged.committedParts,
         backedUpAtUtc,
-        canonicalRowsByPollutant: staged.canonicalRowsByPollutant,
       });
       const aqiBuild = await buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, frozenSourcePath: temp.ndjsonPath });
       let aqiResult = { status: aqiBuild.status, source_row_count: BigInt(aqiBuild.rows.length), file_count: 0, total_bytes: 0n };
@@ -3628,7 +3457,6 @@ async function exportCandidateToR2({ candidate, runtime }) {
   let partIndex = Number(candidate.resume_part_index || 0);
   let resumeTimeseriesId = candidate.resume_last_timeseries_id;
   let resumeObservedAt = candidate.resume_last_observed_at;
-  const canonicalRowsByPollutant = new Map();
   logPhaseB(runtime, "INFO", "phase_b_history_connector_start", {
     day_utc: dayUtc,
     connector_id: connectorId,
@@ -3696,25 +3524,6 @@ async function exportCandidateToR2({ candidate, runtime }) {
       part.bytes = Math.trunc(head.bytes);
     }
     part.etag_or_hash = head.etag || part.etag_or_hash || null;
-    if (runtime.history_write_version === "v2") {
-      const livePart = await r2GetObject({ r2: runtime.r2, key: part.key });
-      const canonicalRows = await canonicalObservationRowsFromParquet(
-        livePart.body,
-        {
-          isSos: Number(connectorId) === Number(runtime.sos_connector_id),
-        },
-      );
-      for (
-        const [pollutantCode, pollutantRows] of groupRowsByPollutant(
-          canonicalRows,
-        )
-      ) {
-        const accumulatedRows =
-          canonicalRowsByPollutant.get(pollutantCode) || [];
-        accumulatedRows.push(...pollutantRows);
-        canonicalRowsByPollutant.set(pollutantCode, accumulatedRows);
-      }
-    }
   }
   totalBytes = committedParts.reduce((sum, part) => sum + BigInt(part.bytes), 0n);
 
@@ -3726,8 +3535,7 @@ select
   timeseries_id,
   pollutant_code,
   observed_at_utc,
-  value,
-  status
+  value
 from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   $1::integer,
   $2::timestamptz,
@@ -3791,7 +3599,6 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
               pollutant_code: normalizePollutantCodeForPath(row.pollutant_code),
               observed_at_utc: row.observed_at_utc,
               value: row.value,
-              status: row.status ?? null,
             });
           } else {
             pendingRows.push({
@@ -3813,7 +3620,6 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
               committedParts,
               observedRows,
               totalBytes,
-              canonicalRowsByPollutant,
             });
             partIndex = flushed.partIndex;
             committedParts = flushed.committedParts;
@@ -3835,7 +3641,6 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
           committedParts,
           observedRows,
           totalBytes,
-          canonicalRowsByPollutant,
         });
         partIndex = flushed.partIndex;
         committedParts = flushed.committedParts;
@@ -3861,7 +3666,6 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
       connectorId,
       committedParts,
       backedUpAtUtc,
-      canonicalRowsByPollutant,
     });
 
     logPhaseB(runtime, "INFO", "phase_b_history_connector_complete", {
@@ -4116,8 +3920,7 @@ select
   connector_id,
   timeseries_id,
   observed_at_utc as observed_at,
-  value,
-  status
+  value
 from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   $1::integer,
   $2::timestamptz,
@@ -5875,13 +5678,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES,
       1024 * 1024,
       2 * 1024 * 1024 * 1024,
-    ),
-    sos_connector_id: parsePositiveInt(
-      env.UK_AQ_PHASE_B_SOS_CONNECTOR_ID ||
-        env.UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK,
-      DEFAULT_PHASE_B_SOS_CONNECTOR_ID,
-      1,
-      2_147_483_647,
     ),
     observs_retention_days: parsePositiveInt(
       env.OBS_AQIDB_OBSERVS_RETENTION_DAYS,

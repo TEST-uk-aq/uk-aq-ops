@@ -15,6 +15,9 @@ import { sha256Hex } from "../../shared/r2_sigv4.mjs";
 import {
   validateV2ObservationsChildManifest,
 } from "../../../scripts/backup_r2/lib/uk_aq_v2_observations_manifest_validation.mjs";
+import {
+  observationContentHashFromLocalParquet,
+} from "../../../scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs";
 
 const DEFAULT_OBSERVATIONS_PREFIX = "history/v2/observations";
 const CANONICAL_CODE = /^[a-z][a-z0-9_]*$/;
@@ -340,6 +343,13 @@ export async function prepareCanonicalObservationManifestCompatibility({
           }));
         }
         const metadata = metadataFromExisting(childPayload, parent, dayUtc);
+        const observationContentHash =
+          await observationContentHashFromLocalParquet({
+            filePaths: partKeys.map((key) =>
+              localPathForKey(dropboxRoot, key)
+            ),
+            connectorId,
+          });
         const rebuilt = buildHistoryV2PollutantManifest({
           domain: "observations",
           grain: null,
@@ -356,6 +366,7 @@ export async function prepareCanonicalObservationManifestCompatibility({
           fileEntries,
           writerGitSha: metadata.writer_git_sha,
           backedUpAtUtc: metadata.backed_up_at_utc,
+          observationContentHash,
         });
         const overlayPath = localPathForKey(overlayRoot, childKey);
         const body = writeJsonFile(overlayPath, rebuilt);
