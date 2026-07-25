@@ -14,6 +14,7 @@ import {
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
   OBSERVATION_HISTORY_COLUMNS_V2,
+  OBSERVATION_HISTORY_COLUMNS_V2_STATUS,
   OBSERVATION_HISTORY_COLUMNS_V3,
   observationHistoryPhysicalSchemaForColumns,
 } from "../workers/shared/uk_aq_observation_history_schema.mjs";
@@ -131,6 +132,13 @@ test("observation manifests distinguish manifest contract from physical schema",
     "pm10",
     observationHistoryPhysicalSchemaForColumns(OBSERVATION_HISTORY_COLUMNS_V2),
   );
+  const schema2Status = canonicalPollutant(
+    7,
+    "no2",
+    observationHistoryPhysicalSchemaForColumns(
+      OBSERVATION_HISTORY_COLUMNS_V2_STATUS,
+    ),
+  );
   const schema3 = canonicalPollutant(7, "pm25");
   assert.equal(schema2.manifest_schema_version, 3);
   assert.equal(schema2.history_schema_version, 2);
@@ -140,6 +148,17 @@ test("observation manifests distinguish manifest contract from physical schema",
   assert.equal(schema3.history_schema_version, 3);
   assert.deepEqual(schema3.columns, OBSERVATION_HISTORY_COLUMNS_V3);
   assert.equal(schema3.writer_version, "parquet-wasm-zstd-v3");
+  for (const manifest of [schema2, schema2Status, schema3]) {
+    assert.equal(
+      validateV2ObservationsChildManifest(manifest, {
+        key: manifest.manifest_key,
+        kind: "pollutant",
+        dayUtc: DAY,
+        connectorId: 7,
+      }).ok,
+      true,
+    );
+  }
 
   const connectorKey = `${PREFIX}/day_utc=${DAY}/connector_id=7/manifest.json`;
   const connector = buildHistoryV2ConnectorManifest({
@@ -167,6 +186,41 @@ test("observation manifests distinguish manifest contract from physical schema",
       connectorId: 7,
     }).ok,
     true,
+  );
+
+  const malformedPollutant = {
+    ...schema3,
+    history_schema_version: null,
+    columns: null,
+    writer_version: null,
+    physical_schemas: connector.physical_schemas,
+  };
+  delete malformedPollutant.manifest_hash;
+  malformedPollutant.manifest_hash = createHash("sha256")
+    .update(JSON.stringify(malformedPollutant))
+    .digest("hex");
+  const malformedValidation = validateV2ObservationsChildManifest(
+    malformedPollutant,
+    {
+      key: malformedPollutant.manifest_key,
+      kind: "pollutant",
+      dayUtc: DAY,
+      connectorId: 7,
+    },
+  );
+  assert.equal(malformedValidation.ok, false);
+  assert.ok(
+    malformedValidation.failures.includes(
+      "pollutant_physical_schemas_mixed",
+    ),
+  );
+  assert.equal(
+    malformedValidation.failures.includes("manifest_hash_mismatch"),
+    false,
+  );
+  assert.equal(
+    malformedValidation.stored_manifest_hash,
+    malformedValidation.expected_manifest_hash,
   );
 
   const day = buildHistoryV2DayManifest({
