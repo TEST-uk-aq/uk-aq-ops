@@ -4501,6 +4501,7 @@ def _planned_backfill_command(
     history_version: str = "v1",
     env_name: str | None = None,
     complete_connector_day: bool = False,
+    repair_pollutants: Iterable[str] | None = None,
 ) -> str:
     wrapper_raw = resolve_integrity_backfill_wrapper()
     env_file = str(
@@ -4511,6 +4512,8 @@ def _planned_backfill_command(
     wrapper = wrapper_raw or "<integrity backfill wrapper unset>"
     connector_csv = ",".join(str(c) for c in (connector_ids or []) if int(c) > 0)
     ids_csv = ",".join(str(t) for t in timeseries_ids)
+    selected_pollutants = _normalise_repair_pollutants(repair_pollutants)
+    pollutants_csv = ",".join(selected_pollutants)
     iso = day.isoformat()
     wrapper_command = wrapper
     if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh":
@@ -4542,6 +4545,7 @@ def _planned_backfill_command(
         f"UK_AQ_R2_HISTORY_INDEX_VERSION={history_version} "
         f"{f'UK_AQ_BACKFILL_OUTPUT_SCOPE={output_scope} ' if output_scope else ''}"
         f"{f'UK_AQ_BACKFILL_CONNECTOR_IDS={connector_csv} ' if connector_csv else ''}"
+        f"{f'UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS={pollutants_csv} ' if pollutants_csv else ''}"
         f"{'UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY=true ' if complete_connector_day else f'UK_AQ_BACKFILL_TIMESERIES_IDS={ids_csv} '}"
         f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_TO_DAY_UTC={iso} "
@@ -16083,6 +16087,262 @@ def _parse_repair_pollutants_arg(raw: str | None) -> list[str]:
     return _normalise_repair_pollutants((raw or "").split(","))
 
 
+def _observation_repair_source_evidence_is_complete(
+    evidence: Mapping[str, Any] | None,
+) -> tuple[bool, str]:
+    if not isinstance(evidence, Mapping):
+        return False, "source_evidence_missing"
+    partition = evidence.get("partition")
+    partition = partition if isinstance(partition, Mapping) else {}
+
+    state = str(
+        evidence.get("source_partition_state")
+        or partition.get("state")
+        or partition.get("source_partition_state")
+        or ""
+    ).strip()
+    if state not in {"successful_non_empty", "successful_empty"}:
+        return False, f"source_partition_state={state or 'missing'}"
+
+    counts_available = evidence.get("source_counts_available")
+    if counts_available is None:
+        counts_available = partition.get("source_counts_available")
+    if counts_available is not True:
+        return False, (
+            "source_counts_unavailable"
+            if counts_available is False else "source_counts_evidence_missing"
+        )
+
+    source_skip_reason = str(
+        evidence.get("source_skip_reason")
+        or partition.get("source_skip_reason")
+        or ""
+    ).strip()
+    if source_skip_reason:
+        return False, f"source_skip_reason={source_skip_reason}"
+
+    for field in (
+        "unresolved_site_ref_groups",
+        "unmapped_site_ref_groups",
+        "ambiguous_site_ref_groups",
+        "timeseries_conflict_groups",
+    ):
+        raw = evidence.get(field, partition.get(field, 0))
+        try:
+            count = int(raw or 0)
+        except (TypeError, ValueError):
+            return False, f"{field}=invalid"
+        if count != 0:
+            return False, f"{field}={count}"
+
+    required_files = evidence.get("required_source_file_count")
+    successful_files = evidence.get("successful_source_file_count")
+    if required_files is None or successful_files is None:
+        return False, "source_file_count_evidence_missing"
+    try:
+        required_count = int(required_files)
+        successful_count = int(successful_files)
+    except (TypeError, ValueError):
+        return False, "source_file_counts_invalid"
+    if required_count < 0 or successful_count != required_count:
+        return False, (
+            "required_source_files_incomplete:"
+            f"{successful_count}/{required_count}"
+        )
+    return True, "complete_authoritative_source_evidence"
+
+
+def _derive_executable_observation_repair_pollutants(
+    *,
+    v2_observations: Mapping[str, Any],
+    requested_pollutants: Iterable[str] | None,
+) -> tuple[
+    dict[tuple[str, int], list[str]],
+    set[int],
+    list[dict[str, Any]],
+]:
+    """Narrow operator-allowed scope to executable data-repair findings."""
+    gaps = list(v2_observations.get("gaps") or [])
+    repair_plan_present = "repair_plan" in v2_observations
+    requested = set(_normalise_repair_pollutants(requested_pollutants))
+    source_resolution = dict(
+        v2_observations.get("source_resolution_by_pollutant") or {}
+    )
+    explicit_actions: set[tuple[str, int, str | None]] = set()
+    for action in list(v2_observations.get("repair_plan") or []):
+        if (
+            not isinstance(action, Mapping)
+            or str(action.get("kind") or "") != "observation_data_repair"
+            or action.get("data_changes_required") is False
+        ):
+            continue
+        day_utc = str(action.get("day_utc") or "").strip()
+        try:
+            connector_id = int(action.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        pollutant_code = (
+            str(action.get("pollutant_code") or "").strip().lower() or None
+        )
+        if day_utc and connector_id > 0:
+            explicit_actions.add((day_utc, connector_id, pollutant_code))
+
+    scopes: dict[tuple[str, int], set[str]] = {}
+    executable_gap_indexes: set[int] = set()
+    skipped: list[dict[str, Any]] = []
+
+    def skip(
+        *, index: int, day_utc: str, connector_id: int,
+        pollutant_code: str | None, gap_type: str, reason: str,
+    ) -> None:
+        skipped.append({
+            "gap_index": index,
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "pollutant_code": pollutant_code,
+            "gap_type": gap_type,
+            "reason": reason,
+        })
+
+    for index, raw_gap in enumerate(gaps):
+        if not isinstance(raw_gap, Mapping):
+            continue
+        gap = raw_gap
+        day_utc = str(gap.get("day_utc") or "").strip()
+        try:
+            connector_id = int(gap.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        pollutant_code = (
+            str(gap.get("pollutant_code") or "").strip().lower() or None
+        )
+        gap_type = str(gap.get("gap_type") or "").strip()
+        if not day_utc or connector_id <= 0:
+            continue
+        if gap_type == "source_mapping_issue":
+            skip(
+                index=index, day_utc=day_utc, connector_id=connector_id,
+                pollutant_code=pollutant_code, gap_type=gap_type,
+                reason="source_mapping_issue_is_not_executable",
+            )
+            continue
+
+        action_matches = any(
+            action_day == day_utc
+            and action_connector == connector_id
+            and (
+                (pollutant_code is None and action_pollutant is None)
+                or (
+                    pollutant_code is not None
+                    and action_pollutant in (None, pollutant_code)
+                )
+            )
+            for action_day, action_connector, action_pollutant in explicit_actions
+        )
+        suggested = gap.get("suggested_repair")
+        suggested_kind = (
+            str(suggested.get("kind") or "")
+            if isinstance(suggested, Mapping) else ""
+        )
+        metadata_gap = (
+            gap_type.startswith((
+                "data_manifest_", "connector_manifest_", "day_manifest_",
+                "index_", "latest_index_",
+            ))
+            or gap_type == "orphan_parquet_without_manifest"
+        )
+        if repair_plan_present:
+            explicit = action_matches
+        else:
+            explicit = (
+                suggested_kind in {
+                    "source_to_v2_observations_backfill",
+                    "source_to_v2_observations_backfill_required",
+                    "uk_air_csv_to_v2_observations_backfill_required",
+                    "source_to_v2_observations_backfill_planned",
+                }
+                or not metadata_gap
+            )
+        if not explicit:
+            skip(
+                index=index, day_utc=day_utc, connector_id=connector_id,
+                pollutant_code=pollutant_code, gap_type=gap_type,
+                reason="not_explicit_observation_data_repair",
+            )
+            continue
+
+        if pollutant_code is not None:
+            if pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS:
+                skip(
+                    index=index, day_utc=day_utc, connector_id=connector_id,
+                    pollutant_code=pollutant_code, gap_type=gap_type,
+                    reason="unsupported_observation_repair_pollutant",
+                )
+                continue
+            if requested and pollutant_code not in requested:
+                skip(
+                    index=index, day_utc=day_utc, connector_id=connector_id,
+                    pollutant_code=pollutant_code, gap_type=gap_type,
+                    reason="outside_operator_requested_pollutant_scope",
+                )
+                continue
+            evidence = gap.get("source_evidence")
+            if not isinstance(evidence, Mapping):
+                evidence = source_resolution.get(pollutant_code)
+            if repair_plan_present:
+                suitable, reason = _observation_repair_source_evidence_is_complete(
+                    evidence if isinstance(evidence, Mapping) else None
+                )
+                if not suitable:
+                    skip(
+                        index=index, day_utc=day_utc,
+                        connector_id=connector_id,
+                        pollutant_code=pollutant_code, gap_type=gap_type,
+                        reason=reason,
+                    )
+                    continue
+            scopes.setdefault((day_utc, connector_id), set()).add(
+                pollutant_code
+            )
+            executable_gap_indexes.add(index)
+            continue
+
+        # A connector/day-wide repair is allowed only when every explicitly
+        # requested pollutant has complete authoritative source evidence.
+        wildcard_pollutants = (
+            requested or set(V2_OBSERVATION_INTEGRITY_POLLUTANTS)
+        )
+        if repair_plan_present:
+            failures = []
+            for code in sorted(wildcard_pollutants):
+                suitable, reason = _observation_repair_source_evidence_is_complete(
+                    source_resolution.get(code)
+                    if isinstance(source_resolution.get(code), Mapping)
+                    else None
+                )
+                if not suitable:
+                    failures.append(f"{code}:{reason}")
+            if failures:
+                skip(
+                    index=index, day_utc=day_utc,
+                    connector_id=connector_id, pollutant_code=None,
+                    gap_type=gap_type,
+                    reason="all_pollutant_source_evidence_incomplete:"
+                    + ",".join(failures),
+                )
+                continue
+        scopes.setdefault((day_utc, connector_id), set()).update(
+            wildcard_pollutants
+        )
+        executable_gap_indexes.add(index)
+
+    return (
+        {key: sorted(values) for key, values in sorted(scopes.items())},
+        executable_gap_indexes,
+        skipped,
+    )
+
+
 def _assert_detector_and_proposal_source_evidence_agree(
     *,
     detector: Mapping[str, Any],
@@ -16735,13 +16995,6 @@ def run_v2_gap_backfills(
         "observation_index_repair",
         "rebuild_v2_observations_index_only",
     }
-    explicit_data_suggestion_kinds = {
-        "source_to_v2_observations_backfill",
-        "source_to_v2_observations_backfill_required",
-        "uk_air_csv_to_v2_observations_backfill_required",
-        "source_to_v2_observations_backfill_planned",
-    }
-
     def gap_partition(gap: Mapping[str, Any]) -> tuple[str, int, str | None] | None:
         day_iso = str(gap.get("day_utc") or "").strip()
         try:
@@ -16753,51 +17006,22 @@ def run_v2_gap_backfills(
         pollutant = str(gap.get("pollutant_code") or "").strip().lower() or None
         return day_iso, connector_id, pollutant
 
-    repair_plan_present = "repair_plan" in v2_observations
-    explicit_data_keys: set[tuple[str, int, str | None]] = set()
-    for action in list(v2_observations.get("repair_plan") or []):
-        if not isinstance(action, Mapping) or str(action.get("kind") or "") != "observation_data_repair":
-            continue
-        action_day = str(action.get("day_utc") or "").strip()
-        try:
-            action_connector = int(action.get("connector_id"))
-        except (TypeError, ValueError):
-            continue
-        if not action_day or action_connector <= 0:
-            continue
-        action_pollutant = str(action.get("pollutant_code") or "").strip().lower() or None
-        explicit_data_keys.add((action_day, action_connector, action_pollutant))
-
-    def is_explicit_data_repair(gap: Mapping[str, Any]) -> bool:
-        gap_key = gap_partition(gap)
-        if gap_key is None:
-            return False
-        if any(
-            key[:2] == gap_key[:2]
-            and (key[2] is None or gap_key[2] is None or key[2] == gap_key[2])
-            for key in explicit_data_keys
-        ):
-            return True
-        suggested = gap.get("suggested_repair")
-        suggested_kind = str(suggested.get("kind") or "") if isinstance(suggested, Mapping) else ""
-        if not repair_plan_present and suggested_kind in explicit_data_suggestion_kinds:
-            return True
-        # Direct low-level callers historically supplied unclassified data
-        # gaps. Keep that compatibility only for gap types that cannot be
-        # metadata/index findings; coordinator output is always typed with a
-        # repair_plan and therefore cannot use this fallback.
-        gap_type = str(gap.get("gap_type") or "").strip()
-        metadata_gap = (
-            gap_type.startswith(("data_manifest_", "connector_manifest_", "day_manifest_", "index_", "latest_index_"))
-            or gap_type in {"orphan_parquet_without_manifest"}
-        )
-        return not repair_plan_present and not metadata_gap
+    (
+        executable_pollutants_by_key,
+        executable_gap_indexes,
+        skipped_nonexecutable_gaps,
+    ) = _derive_executable_observation_repair_pollutants(
+        v2_observations=v2_observations,
+        requested_pollutants=repair_pollutants,
+    )
 
     by_key_sets: dict[tuple[str, int], set[int]] = {}
     gaps_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
     index_only_keys: set[tuple[str, int]] = set()
-    skipped_metadata_gaps: list[dict[str, Any]] = []
-    for gap in gaps:
+    skipped_metadata_gaps: list[dict[str, Any]] = list(
+        skipped_nonexecutable_gaps
+    )
+    for gap_index, gap in enumerate(gaps):
         partition = gap_partition(gap)
         if partition is None:
             continue
@@ -16809,11 +17033,17 @@ def run_v2_gap_backfills(
         ):
             index_only_keys.add((day_iso, connector_id))
             continue
-        if not is_explicit_data_repair(gap):
+        if gap_index not in executable_gap_indexes:
             suggested = gap.get("suggested_repair")
             suggested_kind = str(suggested.get("kind") or "") if isinstance(suggested, Mapping) else ""
-            if suggested_kind in metadata_gap_kinds or gap.get("gap_type"):
+            if (
+                suggested_kind in metadata_gap_kinds or gap.get("gap_type")
+            ) and not any(
+                int(item.get("gap_index", -1)) == gap_index
+                for item in skipped_metadata_gaps
+            ):
                 skipped_metadata_gaps.append({
+                    "gap_index": gap_index,
                     "day_utc": day_iso,
                     "connector_id": connector_id,
                     "pollutant_code": pollutant_code,
@@ -16836,7 +17066,14 @@ def run_v2_gap_backfills(
     standalone_index_keys = sorted(index_only_keys - set(by_key))
     metrics["observation_backfill_candidate_days"] = len(by_key)
     metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
-    metrics["observation_backfill_scope"] = "complete_source_derived_connector_day"
+    metrics["observation_backfill_scope"] = "complete_source_derived_selected_pollutants"
+    metrics["executable_repair_pollutants_by_connector_day"] = {
+        f"{day_utc}/connector_id={connector_id}": list(pollutants)
+        for (day_utc, connector_id), pollutants in sorted(
+            executable_pollutants_by_key.items()
+        )
+        if (day_utc, connector_id) in by_key
+    }
     metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     metrics["skipped_v2_observation_metadata_gaps"] = skipped_metadata_gaps
@@ -16846,12 +17083,23 @@ def run_v2_gap_backfills(
         idx_cmd = _v2_observations_index_rebuild_command(day_iso, connector_id)
         metrics["planned_v2_observation_index_rebuilds"].append(" ".join(idx_cmd))
     for (day_iso, connector_id), ts_ids in sorted(by_key.items()):
+        selected_repair_pollutants = list(
+            executable_pollutants_by_key.get((day_iso, connector_id)) or []
+        )
+        if not selected_repair_pollutants:
+            metrics["skipped_v2_observation_repairs"].append({
+                "day_utc": day_iso,
+                "connector_id": connector_id,
+                "reason": "no_executable_observation_repair_pollutants",
+            })
+            continue
         day_obj = dt.date.fromisoformat(day_iso)
         chunks = [[]]
         planned_cmds = [_planned_backfill_command(
             env, [], day_obj, connector_ids=[connector_id],
             output_scope="observations_only", history_version="v2",
             env_name=env_name, complete_connector_day=True,
+            repair_pollutants=selected_repair_pollutants,
         )]
         first_cmd = planned_cmds[0] if planned_cmds else None
         idx_cmd = " ".join(_v2_observations_index_rebuild_command(day_iso, connector_id))
@@ -16941,7 +17189,7 @@ def run_v2_gap_backfills(
                     **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
                 },
                 complete_connector_day=True,
-                repair_pollutants=repair_pollutants,
+                repair_pollutants=selected_repair_pollutants,
             )
             if detector_result.get("status") != "ok":
                 worker_error = str(
@@ -16957,7 +17205,7 @@ def run_v2_gap_backfills(
                 stage_root=detector_stage_root,
                 day_utc=day_iso,
                 connector_id=connector_id,
-                repair_pollutants=repair_pollutants,
+                repair_pollutants=selected_repair_pollutants,
             )
             detector_evidence_persistence = _persist_complete_connector_day_source_evidence(
                 conn=conn,
@@ -17025,7 +17273,7 @@ def run_v2_gap_backfills(
                 history_version="v2",
                 extra_env=extra_env,
                 complete_connector_day=True,
-                repair_pollutants=repair_pollutants,
+                repair_pollutants=selected_repair_pollutants,
             )
             chunk_results.append(bf)
             metrics["v2_observation_repairs_attempted"] += 1
@@ -17143,7 +17391,7 @@ def run_v2_gap_backfills(
                     stage_root=stage_root,
                     day_utc=day_iso,
                     connector_id=connector_id,
-                    repair_pollutants=repair_pollutants,
+                    repair_pollutants=selected_repair_pollutants,
                 )
                 _assert_detector_and_proposal_source_evidence_agree(
                     detector=detector_evidence,
@@ -17153,7 +17401,7 @@ def run_v2_gap_backfills(
                     run_state=run_state,
                     day_utc=day_iso,
                     connector_id=connector_id,
-                    repair_pollutants=repair_pollutants,
+                    repair_pollutants=selected_repair_pollutants,
                 )
                 expected_timeseries_row_counts = _normalize_timeseries_row_counts(
                     source_evidence.get("per_timeseries_counts")
@@ -17317,7 +17565,7 @@ def run_v2_gap_backfills(
                     for key in validated_overlay_keys
                     if (match := re.search(r"/pollutant_code=([a-z0-9_]+)/", key))
                 })
-                requested_repair_pollutants = _normalise_repair_pollutants(repair_pollutants)
+                requested_repair_pollutants = selected_repair_pollutants
                 if requested_repair_pollutants and not set(proposal_pollutants).issubset(set(requested_repair_pollutants)):
                     raise ValueError("OBSERVS_CHANGED pollutant scope escaped requested repair scope")
                 affected_pollutants = sorted({
@@ -18540,8 +18788,18 @@ def _capture_local_v2_aqi_scope(
     connector_id: int,
     env: Mapping[str, str],
     include_debug: bool = False,
+    repair_pollutants: Iterable[str] | None = None,
 ) -> list[str]:
     """Validate and stage generated AQI bytes without remote access."""
+    selected_pollutants = _normalise_repair_pollutants(repair_pollutants)
+    unsupported = sorted(
+        set(selected_pollutants) - set(V2_AQI_SUPPORTED_POLLUTANTS)
+    )
+    if unsupported:
+        raise ValueError(
+            "AQI proposal contains unsupported repair pollutants: "
+            + ",".join(unsupported)
+        )
     config = resolve_history_path_config("v2", {**os.environ, **dict(env)})
     prefixes = [config.aqilevels_hourly_data_prefix]
     if include_debug and config.aqilevels_hourly_debug_prefix:
@@ -18566,9 +18824,48 @@ def _capture_local_v2_aqi_scope(
             or int(manifest.get("connector_id") or 0) != int(connector_id)
         ):
             raise ValueError(f"invalid local AQI connector identity: {connector_key}")
+        manifest_pollutants = sorted({
+            str(value or "").strip().lower()
+            for value in list(manifest.get("pollutant_codes") or [])
+            if str(value or "").strip()
+        })
+        if selected_pollutants and not set(selected_pollutants).issubset(
+            set(manifest_pollutants)
+        ):
+            raise ValueError(
+                "local AQI connector manifest does not contain every selected "
+                "repair pollutant"
+            )
         connector_prefix = connector_key.removesuffix("/manifest.json")
         source_root = generated_root / connector_prefix
-        object_paths = sorted(path for path in source_root.rglob("*") if path.is_file())
+        object_paths = sorted(
+            path for path in source_root.rglob("*")
+            if path.is_file() and (
+                not selected_pollutants
+                or (
+                    path.relative_to(source_root).as_posix().startswith(
+                        "pollutant_code="
+                    )
+                    and path.relative_to(source_root).as_posix().split(
+                        "pollutant_code=", 1
+                    )[1].split("/", 1)[0] in selected_pollutants
+                )
+            )
+        )
+        if not object_paths:
+            raise ValueError(
+                f"local AQI proposal has no selected objects: {connector_key}"
+            )
+        for pollutant in selected_pollutants:
+            pollutant_root = source_root / f"pollutant_code={pollutant}"
+            if (
+                not (pollutant_root / "manifest.json").is_file()
+                or not any(pollutant_root.glob("part-*.parquet"))
+            ):
+                raise ValueError(
+                    "local AQI proposal is incomplete for selected pollutant: "
+                    f"{pollutant}"
+                )
         parquet_pattern = re.compile(
             rf"^{re.escape(connector_prefix)}/pollutant_code=[a-z0-9_]+/part-\d+\.parquet$"
         )
@@ -18579,13 +18876,29 @@ def _capture_local_v2_aqi_scope(
             stage_overlay_object(run_state, object_key=object_key, source_path=source, stage="aqilevels", dependencies=())
             mark_overlay_structurally_validated(run_state, object_key)
             captured.append(object_key)
-        run_state.setdefault("tombstone_prefixes", []).append({
-            "prefix": connector_prefix,
-            "proposed": True,
-            "deleted": False,
-            "deletion_verified": False,
-            "stage": "aqilevels",
-        })
+        tombstone_prefixes = (
+            [
+                f"{connector_prefix}/pollutant_code={pollutant}"
+                for pollutant in selected_pollutants
+            ]
+            if selected_pollutants else [connector_prefix]
+        )
+        for tombstone_prefix in tombstone_prefixes:
+            run_state.setdefault("tombstone_prefixes", []).append({
+                "prefix": tombstone_prefix,
+                "proposed": True,
+                "deleted": False,
+                "deletion_verified": False,
+                "stage": "aqilevels",
+                "repair_pollutants": selected_pollutants,
+            })
+    run_state["tombstone_prefixes"] = sorted(
+        {
+            entry["prefix"]: entry
+            for entry in list(run_state.get("tombstone_prefixes") or [])
+        }.values(),
+        key=lambda entry: str(entry["prefix"]),
+    )
     write_run_state(run_state)
     return sorted(set(captured))
 
@@ -20266,12 +20579,23 @@ def run_v2_integrity_repair_flow(
             except (TypeError, ValueError):
                 continue
             try:
+                matching_work = next(
+                    (
+                        item for item in aqi_work
+                        if str(item["day_utc"]) == day_utc
+                        and int(item["connector_id"]) == connector_id
+                    ),
+                    {},
+                )
                 object_keys = _capture_local_v2_aqi_scope(
                     run_state=run_state, day_utc=day_utc,
                     connector_id=connector_id, env=env,
                     include_debug=bool(
                         check_aqi_debug
                         or (v2_aqilevels.get("debug") or {}).get("required")
+                    ),
+                    repair_pollutants=list(
+                        matching_work.get("pollutant_codes") or []
                     ),
                 )
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
@@ -20284,10 +20608,6 @@ def run_v2_integrity_repair_flow(
                 })
                 continue
             rebuilt_aqi_scopes.add((day_utc, connector_id))
-            matching_work = next(
-                (item for item in aqi_work if str(item["day_utc"]) == day_utc and int(item["connector_id"]) == connector_id),
-                {},
-            )
             record_changed_scope(run_state, "AQILEVELS_CHANGED", {
                 "day_utc": day_utc,
                 "connector_id": connector_id,
