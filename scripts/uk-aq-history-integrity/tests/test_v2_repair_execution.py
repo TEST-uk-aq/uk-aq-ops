@@ -2179,6 +2179,167 @@ class V2RepairExecutionTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_source_evidence_narrows_operator_pollutants_to_no2_and_o3(self) -> None:
+        def complete_evidence(*, required_files: int) -> dict[str, object]:
+            return {
+                "source_partition_state": "successful_non_empty",
+                "source_counts_available": True,
+                "source_skip_reason": None,
+                "unresolved_site_ref_groups": 0,
+                "unmapped_site_ref_groups": 0,
+                "ambiguous_site_ref_groups": 0,
+                "timeseries_conflict_groups": 0,
+                "required_source_file_count": required_files,
+                "successful_source_file_count": required_files,
+            }
+
+        day_utc = "2026-07-15"
+        connector_id = 1
+        gaps = [
+            {
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": "no2",
+                "gap_type": "source_r2_timeseries_row_mismatch",
+                "source_evidence": complete_evidence(required_files=154),
+            },
+            {
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": "o3",
+                "gap_type": "source_r2_timeseries_row_mismatch",
+                "source_evidence": complete_evidence(required_files=95),
+            },
+            {
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": "pm10",
+                "gap_type": "source_mapping_issue",
+                "source_evidence": {
+                    "source_partition_state": "mapping_unavailable",
+                    "source_counts_available": False,
+                    "source_skip_reason": "sos_site_ref_bridge_mapping_unresolved",
+                    "unresolved_site_ref_groups": 3,
+                },
+            },
+            {
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": "pm25",
+                "gap_type": "source_mapping_issue",
+                "source_evidence": {
+                    "source_partition_state": "mapping_unavailable",
+                    "source_counts_available": False,
+                    "source_skip_reason": "sos_site_ref_bridge_mapping_unresolved",
+                    "unresolved_site_ref_groups": 2,
+                },
+            },
+        ]
+        repair_plan = [
+            {
+                "kind": "observation_data_repair",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": pollutant,
+                "data_changes_required": True,
+            }
+            for pollutant in ("no2", "o3", "pm10", "pm25")
+        ]
+        scopes, executable_indexes, skipped = (
+            MODULE._derive_executable_observation_repair_pollutants(
+                v2_observations={"gaps": gaps, "repair_plan": repair_plan},
+                requested_pollutants=["pm25", "pm10", "no2", "o3"],
+            )
+        )
+
+        self.assertEqual(scopes, {(day_utc, connector_id): ["no2", "o3"]})
+        self.assertEqual(executable_indexes, {0, 1})
+        self.assertEqual(
+            {(entry["pollutant_code"], entry["reason"]) for entry in skipped},
+            {
+                ("pm10", "source_mapping_issue_is_not_executable"),
+                ("pm25", "source_mapping_issue_is_not_executable"),
+            },
+        )
+        planned = MODULE._planned_backfill_command(
+            self.env,
+            [],
+            __import__("datetime").date.fromisoformat(day_utc),
+            connector_ids=[connector_id],
+            output_scope="observations_only",
+            history_version="v2",
+            env_name="CIC-Test",
+            complete_connector_day=True,
+            repair_pollutants=scopes[(day_utc, connector_id)],
+        )
+        self.assertIn(
+            "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS=no2,o3", planned
+        )
+        self.assertNotIn("pm10", planned)
+        self.assertNotIn("pm25", planned)
+
+    def test_all_pollutant_repair_requires_complete_source_for_every_pollutant(self) -> None:
+        day_utc = "2026-07-15"
+        connector_id = 1
+        complete = {
+            "source_partition_state": "successful_non_empty",
+            "source_counts_available": True,
+            "unresolved_site_ref_groups": 0,
+            "unmapped_site_ref_groups": 0,
+            "ambiguous_site_ref_groups": 0,
+            "timeseries_conflict_groups": 0,
+            "required_source_file_count": 1,
+            "successful_source_file_count": 1,
+        }
+        incomplete = {
+            **complete,
+            "source_partition_state": "mapping_unavailable",
+            "source_skip_reason": "mapping_unavailable",
+        }
+        observations = {
+            "gaps": [{
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "gap_type": "day_dir_missing",
+            }],
+            "repair_plan": [{
+                "kind": "observation_data_repair",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": None,
+                "data_changes_required": True,
+            }],
+            "source_resolution_by_pollutant": {
+                "no2": complete,
+                "o3": complete,
+                "pm10": incomplete,
+                "pm25": complete,
+            },
+        }
+        scopes, executable_indexes, skipped = (
+            MODULE._derive_executable_observation_repair_pollutants(
+                v2_observations=observations,
+                requested_pollutants=["pm25", "pm10", "no2", "o3"],
+            )
+        )
+        self.assertEqual(scopes, {})
+        self.assertEqual(executable_indexes, set())
+        self.assertIn("pm10:source_partition_state=mapping_unavailable", skipped[0]["reason"])
+
+        observations["source_resolution_by_pollutant"]["pm10"] = complete
+        scopes, executable_indexes, skipped = (
+            MODULE._derive_executable_observation_repair_pollutants(
+                v2_observations=observations,
+                requested_pollutants=["pm25", "pm10", "no2", "o3"],
+            )
+        )
+        self.assertEqual(
+            scopes,
+            {(day_utc, connector_id): ["no2", "o3", "pm10", "pm25"]},
+        )
+        self.assertEqual(executable_indexes, {0})
+        self.assertEqual(skipped, [])
+
     def test_v2_missing_day_gap_repairs_instead_of_skipping(self) -> None:
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,

@@ -76,6 +76,7 @@ function objectRank(key) {
 }
 
 const OBSERVATION_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
+const AQI_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2"]);
 const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
   /^history\/v2\/aqilevels\/hourly\/data\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
@@ -83,6 +84,8 @@ const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
 ]);
 const CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN =
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
+const CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN =
+  /^history\/v2\/aqilevels\/hourly\/(data|debug)\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN =
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
 
@@ -98,18 +101,26 @@ function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
 }
 
 function assertCanonicalDeletionPrefix(prefix, entry) {
-  const pollutantMatch = prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
+  const observationPollutantMatch = prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
+  const aqiPollutantMatch = prefix.match(CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN);
+  const pollutantMatch = observationPollutantMatch || aqiPollutantMatch;
   if (pollutantMatch) {
-    const [, dayUtc, connectorIdRaw, pollutant] = pollutantMatch;
+    const isObservation = Boolean(observationPollutantMatch);
+    const [, ...parts] = pollutantMatch;
+    const [dayUtc, connectorIdRaw, pollutant] = isObservation ? parts : parts.slice(1);
+    const supportedPollutants = isObservation
+      ? OBSERVATION_INTEGRITY_POLLUTANTS
+      : AQI_INTEGRITY_POLLUTANTS;
+    const domainName = isObservation ? "Observation" : "AQI";
     validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw });
-    if (!OBSERVATION_INTEGRITY_POLLUTANTS.has(pollutant)) {
-      throw new Error(`Observation deletion prefix has an unsupported pollutant: ${prefix}`);
+    if (!supportedPollutants.has(pollutant)) {
+      throw new Error(`${domainName} deletion prefix has an unsupported pollutant: ${prefix}`);
     }
     const repairPollutants = Array.isArray(entry?.repair_pollutants)
       ? entry.repair_pollutants.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).sort()
       : [];
-    if (!repairPollutants.includes(pollutant) || repairPollutants.some((value) => !OBSERVATION_INTEGRITY_POLLUTANTS.has(value))) {
-      throw new Error(`Observation pollutant deletion prefix is not backed by matching repair_pollutants evidence: ${prefix}`);
+    if (!repairPollutants.includes(pollutant) || repairPollutants.some((value) => !supportedPollutants.has(value))) {
+      throw new Error(`${domainName} pollutant deletion prefix is not backed by matching repair_pollutants evidence: ${prefix}`);
     }
     return;
   }
@@ -121,8 +132,8 @@ function assertCanonicalDeletionPrefix(prefix, entry) {
   }
   const [, dayUtc, connectorIdRaw] = match;
   validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw });
-  if (prefix.startsWith("history/v2/observations/") && Array.isArray(entry?.repair_pollutants) && entry.repair_pollutants.length > 0) {
-    throw new Error(`Pollutant-scoped observation repair cannot delete a connector-day prefix: ${prefix}`);
+  if (Array.isArray(entry?.repair_pollutants) && entry.repair_pollutants.length > 0) {
+    throw new Error(`Pollutant-scoped repair cannot delete a connector-day prefix: ${prefix}`);
   }
 }
 
@@ -200,23 +211,28 @@ export function validateLocalProposal(runState) {
     assertCanonicalDeletionPrefix(prefix, entry);
     return { entry, prefix, domain: objectDomain(prefix) };
   });
-  const scopedObservationGroups = new Map();
+  const scopedPollutantGroups = new Map();
   for (const item of normalizedPrefixes) {
-    const match = item.prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
+    const observationMatch = item.prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
+    const aqiMatch = item.prefix.match(CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN);
+    const match = observationMatch || aqiMatch;
     if (!match) continue;
-    const [, dayUtc, connectorIdRaw, pollutant] = match;
+    const isObservation = Boolean(observationMatch);
+    const [, ...parts] = match;
+    const [dayUtc, connectorIdRaw, pollutant] = isObservation ? parts : parts.slice(1);
+    const scopeName = isObservation ? "observations" : `aqilevels/${parts[0]}`;
     const repairPollutants = Array.isArray(item.entry?.repair_pollutants)
       ? item.entry.repair_pollutants.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).sort()
       : [];
-    const groupKey = `${dayUtc}|${connectorIdRaw}|${repairPollutants.join(",")}`;
-    const group = scopedObservationGroups.get(groupKey) || { repairPollutants, prefixes: new Map() };
+    const groupKey = `${scopeName}|${dayUtc}|${connectorIdRaw}|${repairPollutants.join(",")}`;
+    const group = scopedPollutantGroups.get(groupKey) || { repairPollutants, prefixes: new Map() };
     group.prefixes.set(pollutant, (group.prefixes.get(pollutant) || 0) + 1);
-    scopedObservationGroups.set(groupKey, group);
+    scopedPollutantGroups.set(groupKey, group);
   }
-  for (const [groupKey, group] of scopedObservationGroups.entries()) {
+  for (const [groupKey, group] of scopedPollutantGroups.entries()) {
     for (const pollutant of group.repairPollutants) {
       if (group.prefixes.get(pollutant) !== 1) {
-        throw new Error(`Pollutant-scoped observation repair requires exactly one deletion prefix for ${pollutant}: ${groupKey}`);
+        throw new Error(`Pollutant-scoped repair requires exactly one deletion prefix for ${pollutant}: ${groupKey}`);
       }
     }
   }
