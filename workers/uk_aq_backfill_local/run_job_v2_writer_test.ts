@@ -287,6 +287,44 @@ Deno.test("UK-AIR CSV time-basis declaration accepts notes and warns without blo
   assertEquals(warning.expected_phrase, "All Data GMT hour ending");
 });
 
+Deno.test("UK-AIR CSV excludes blank and non-numeric values but retains finite negatives", () => {
+  const sourceLabel = "Nitrogen dioxide";
+  const parsed = parseUkAirFlatFileObservations({
+    dayUtc: "2026-07-15",
+    siteRef: "NCA3",
+    csvText: [
+      "All Data GMT hour ending",
+      `Date,time,"${sourceLabel}",status,unit`,
+      "14-07-2026,24:00,,,",
+      "15-07-2026,01:00,not-a-number,P,ugm-3",
+      "15-07-2026,02:00,-1.25,P,ugm-3",
+    ].join("\n"),
+    mappings: [{
+      site_ref: "NCA3",
+      uk_air_ref: "UKA00528",
+      pollutant_code: "no2",
+      station_id: 1768,
+      timeseries_id: 529,
+      station_ref: "1038",
+      timeseries_ref: "363",
+      valid_from_day_utc: null,
+      valid_to_day_utc: null,
+    }],
+    propertyMappings: [propertyMapping(sourceLabel, "no2")],
+  });
+
+  assertEquals(parsed.rows.map((row) => ({
+    observed_at: row.observed_at,
+    value: row.value,
+    status: row.status,
+  })), [{
+    observed_at: "2026-07-15T02:00:00.000Z",
+    value: -1.25,
+    status: "P",
+  }]);
+  assertEquals(parsed.mapped_records, 1);
+});
+
 Deno.test("UK-AIR CSV mapping switches timeseries at the EA8 validity boundary", () => {
   const mappings = [
     {
