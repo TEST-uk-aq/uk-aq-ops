@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import sys
 import tempfile
@@ -204,6 +205,40 @@ class SosSiteRefBridgeTests(unittest.TestCase):
         conn.commit()
         return conn
 
+    def _add_non_target_bridge_row(self, conn) -> None:
+        conn.execute(
+            """
+            INSERT INTO core_stations_snapshot
+              (id, connector_id, station_ref)
+            VALUES (200, 1, 'ACTH')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO core_timeseries_snapshot
+              (id, station_id, connector_id, timeseries_ref, label,
+               phenomenon_id)
+            VALUES
+              (200, 200, 1, 'ts-ch2chchch2', '1,3-butadiene', 10)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO sos_station_timeseries_site_refs_snapshot
+              (site_ref, pollutant_code, station_id, timeseries_id,
+               valid_from_day_utc, valid_to_day_utc)
+            VALUES
+              ('ACTH', 'ch2chchch2', 200, 200, '2026-01-01', NULL)
+            """
+        )
+        conn.execute(
+            """
+            UPDATE core_snapshot_imports
+            SET rows_sos_site_ref_bridge = 2
+            """
+        )
+        conn.commit()
+
     def _counts(self, conn):
         return MODULE._current_source_counts_for_v2_partition(
             conn,
@@ -317,6 +352,79 @@ class SosSiteRefBridgeTests(unittest.TestCase):
             evidence["source_skip_reason"],
             "sos_site_ref_bridge_import_identity_unavailable",
         )
+
+    def test_all_property_bridge_validates_then_filters_operation_scope(self):
+        conn = self._connection()
+        try:
+            self._add_non_target_bridge_row(conn)
+            bridge = MODULE._load_authoritative_sos_bridge_mapping(
+                conn,
+                connector_id=1,
+                target_pollutants=("pm25", "pm10", "no2", "o3"),
+            )
+        finally:
+            conn.close()
+        self.assertEqual(bridge["bridge_artifact_row_count"], 2)
+        self.assertEqual(bridge["bridge_row_count"], 2)
+        self.assertEqual(bridge["selected_bridge_row_count"], 1)
+        self.assertEqual(
+            [row["pollutant_code"] for row in bridge["rows"]],
+            ["no2"],
+        )
+
+    def test_bridge_generic_identity_validation_remains_fail_closed(self):
+        conn = self._connection()
+        try:
+            cases = (
+                ("site_ref = ''", "invalid SOS site-ref bridge identity"),
+                ("pollutant_code = ''", "invalid SOS site-ref bridge identity"),
+                (
+                    "pollutant_code = 'bad/code'",
+                    "invalid SOS site-ref bridge identity",
+                ),
+                (
+                    "valid_from_day_utc = 'not-a-day'",
+                    "invalid SOS site-ref bridge validity",
+                ),
+                (
+                    "station_id = 999",
+                    "SOS site-ref bridge core ownership mismatch",
+                ),
+            )
+            for assignment, expected in cases:
+                with self.subTest(assignment=assignment):
+                    conn.execute(
+                        "UPDATE sos_station_timeseries_site_refs_snapshot "
+                        f"SET {assignment}"
+                    )
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        MODULE._load_authoritative_sos_bridge_mapping(
+                            conn,
+                            connector_id=1,
+                        )
+                    conn.rollback()
+        finally:
+            conn.close()
+
+    def test_bridge_snapshot_distinguishes_artifact_and_selected_counts(self):
+        conn = self._connection()
+        try:
+            self._add_non_target_bridge_row(conn)
+            snapshot_path = self.root / "bridge.json"
+            result = MODULE.write_sos_site_ref_bridge_snapshot(
+                conn=conn,
+                connector_id=1,
+                snapshot_path=snapshot_path,
+            )
+            payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        finally:
+            conn.close()
+        self.assertEqual(payload["bridge_artifact_row_count"], 2)
+        self.assertEqual(payload["selected_bridge_row_count"], 1)
+        self.assertEqual(payload["bridge_row_count"], 2)
+        self.assertEqual(len(payload["rows"]), 1)
+        self.assertEqual(result["bridge_artifact_row_count"], 2)
+        self.assertEqual(result["selected_bridge_row_count"], 1)
 
     def test_v2_acquisition_does_not_query_live_mapping_authority(self):
         conn = self._connection()

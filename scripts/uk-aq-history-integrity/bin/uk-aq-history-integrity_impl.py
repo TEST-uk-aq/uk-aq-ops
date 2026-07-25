@@ -2716,7 +2716,7 @@ def _load_authoritative_sos_bridge_mapping(
         timeseries_id = int(raw[4] or 0)
         valid_from = str(raw[7] or "").strip() or None
         valid_to = str(raw[8] or "").strip() or None
-        if not site_ref or pollutant_code not in {"pm25", "pm10", "no2", "o3"}:
+        if not site_ref or not re.fullmatch(r"[a-z0-9_]+", pollutant_code):
             raise RuntimeError(
                 "invalid SOS site-ref bridge identity "
                 f"site_ref={site_ref!r} pollutant_code={pollutant_code!r}"
@@ -2762,6 +2762,10 @@ def _load_authoritative_sos_bridge_mapping(
     return {
         "mapping_identity": SOS_BRIDGE_MAPPING_IDENTITY,
         "mapping_hash": bridge_hash,
+        "bridge_artifact_row_count": actual_count,
+        "selected_bridge_row_count": len(rows),
+        # Compatibility alias: this has always described the complete
+        # imported bridge artifact, not the selected operation scope.
         "bridge_row_count": actual_count,
         "rows": rows,
     }
@@ -2782,7 +2786,10 @@ def write_sos_site_ref_bridge_snapshot(
         "connector_id": int(connector_id),
         "mapping_identity": bridge["mapping_identity"],
         "bridge_artifact_sha256": bridge["mapping_hash"],
-        "bridge_row_count": bridge["bridge_row_count"],
+        "bridge_artifact_row_count": bridge["bridge_artifact_row_count"],
+        "selected_bridge_row_count": bridge["selected_bridge_row_count"],
+        # Retained for readers of schema version 1.
+        "bridge_row_count": bridge["bridge_artifact_row_count"],
         "rows": bridge["rows"],
     }
     payload = {
@@ -2805,7 +2812,9 @@ def write_sos_site_ref_bridge_snapshot(
         "path": str(snapshot_path),
         "mapping_identity": bridge["mapping_identity"],
         "mapping_hash": bridge["mapping_hash"],
-        "bridge_row_count": bridge["bridge_row_count"],
+        "bridge_artifact_row_count": bridge["bridge_artifact_row_count"],
+        "selected_bridge_row_count": bridge["selected_bridge_row_count"],
+        "bridge_row_count": bridge["bridge_artifact_row_count"],
         "bridge_content_sha256": payload["bridge_content_sha256"],
         "file_sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
     }
@@ -7277,6 +7286,8 @@ def check_sos_flat_files(
         "source_count_mapping_identity": None,
         "source_count_mapping_hash": None,
         "imported_bridge_row_count": 0,
+        "bridge_artifact_row_count": 0,
+        "selected_bridge_row_count": 0,
         "cache_missing_redownloaded": 0,
         "first_seen": 0,
         "changed": 0,
@@ -7371,7 +7382,15 @@ def check_sos_flat_files(
         source_count_mapping_hash = str(bridge["mapping_hash"])
         metrics["source_count_mapping_identity"] = source_count_mapping_identity
         metrics["source_count_mapping_hash"] = source_count_mapping_hash
-        metrics["imported_bridge_row_count"] = int(bridge["bridge_row_count"])
+        metrics["imported_bridge_row_count"] = int(
+            bridge["bridge_artifact_row_count"]
+        )
+        metrics["bridge_artifact_row_count"] = int(
+            bridge["bridge_artifact_row_count"]
+        )
+        metrics["selected_bridge_row_count"] = int(
+            bridge["selected_bridge_row_count"]
+        )
     else:
         mapping_rows = _fetch_uk_air_flat_file_mapping_rows(
             env=env,
@@ -22187,7 +22206,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Count rows deleted / inserted: {sos.get('count_rows_deleted', 0)} / {sos.get('count_rows_inserted', 0)}",
             f"- Source count mapping identity: {sos.get('source_count_mapping_identity') or '(legacy)'}",
             f"- Source count mapping hash: {sos.get('source_count_mapping_hash') or '(legacy)'}",
-            f"- Imported bridge rows: {sos.get('imported_bridge_row_count', 0)}",
+            f"- Imported bridge artifact rows: {sos.get('bridge_artifact_row_count', sos.get('imported_bridge_row_count', 0))}",
+            f"- Selected observation bridge rows: {sos.get('selected_bridge_row_count', 0)}",
             f"- Downloaded MB:  {round(sos.get('downloaded_bytes', 0) / (1024 * 1024), 4)}",
             f"- Cache keep policy: {sos.get('keep_api_snapshots_policy') or '(default)'}",
             f"- Not-found cooldown secs: {sos.get('not_found_cooldown_seconds', 0)}",
