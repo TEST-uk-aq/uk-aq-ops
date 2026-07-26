@@ -1,28 +1,29 @@
 # UK AQ Ops authoritative system documentation
 
-This directory contains the authoritative behavioural and operational documentation for the active `uk-aq-ops` systems.
+This directory contains the authoritative behavioural and operational documentation for active `uk-aq-ops` systems.
 
-The documents are written for both people and coding agents. Human-readable Markdown is the source of truth. There is no separate Codex-only behavioural specification.
+Human-readable Markdown is the source of truth for people and coding agents. There is no separate Codex-only behavioural specification.
 
-`system_docs/` is the sole active system-documentation root. Do not create a second top-level `docs/` tree. Historical reports and superseded broad documents belong under `system_docs_legacy/` and are not current operating instructions.
+`system_docs/` is the sole active system-documentation root. Historical and superseded broad documents belong under `system_docs_legacy/` and do not override active contracts.
 
 ## Authority and document types
 
-Documents in an area directory have the following roles:
+Documents in an area directory normally have these roles:
 
-- `README.md`: area orientation, ownership and reading order.
-- `contract.md`: authoritative required behaviour and explicit non-goals.
-- `data_flow.md`: inputs, processing stages, outputs and component boundaries.
-- `state_model.md`: persistent and transient state, identities and transition rules.
-- `interfaces.md`: message, object, API and database-facing contracts.
-- `operations.md`: deployment, scheduling, monitoring and routine operation.
-- `recovery.md`: repair, rebuild and rollback procedures where a separate file is warranted.
-- `validation.md`: targeted deterministic checks and TEST operational validation.
-- `decisions/`: Architecture Decision Records explaining why load-bearing choices were made.
+- `README.md`: area orientation, ownership and reading order;
+- `contract.md`: authoritative required behaviour and non-goals;
+- specific `*-contract.md` files: authoritative narrower contracts that may deliberately amend a broad area contract for one path;
+- `data_flow.md` or `data-flow.md`: inputs, processing and component boundaries;
+- `state_model.md` or `state-model.md`: state, identities and transition rules;
+- `interfaces.md`: API, message, object and database-facing contracts;
+- `operations.md`: deployment, scheduling, monitoring and routine operation;
+- `recovery.md`: repair, rebuild and rollback;
+- `validation.md` and specific `*-validation.md` files: structural and TEST operational validation;
+- `decisions/`: Architecture Decision Records.
 
-Worker-local `README.md` files remain useful implementation guides, but they do not override an area `contract.md`.
+Worker-local README files remain implementation guides. They do not override system contracts.
 
-Plans describe proposed work. Archives and `system_docs_legacy/` describe historical implementations or superseded broad documents. None is authoritative for current runtime behaviour unless an authoritative area document explicitly incorporates the relevant decision.
+Plans describe proposed work. Archives and `system_docs_legacy/` describe historical implementations. They are not current runtime authority unless an active contract explicitly incorporates a decision.
 
 ## Required reading order
 
@@ -30,95 +31,98 @@ Before changing an active system area:
 
 1. Read this index.
 2. Read the area's `README.md`.
-3. Read the area's `contract.md` when present.
-4. Read the files linked under that area's implementation ownership section.
-5. Read any relevant decision records.
-6. Confirm the requested change against the area's explicit non-goals.
+3. Read the broad `contract.md`.
+4. Read any narrower contract named by the area README.
+5. Read linked interfaces, operations, validation and decisions.
+6. Confirm the requested change against explicit non-goals.
 
-If code and the documented contract disagree, do not silently choose one. Record the conflict and identify whether the task is:
+If code and documentation disagree, do not silently choose one. Report whether the task is:
 
-- correcting the implementation to match the contract;
-- intentionally changing the contract and implementation together; or
+- correcting implementation to match the contract;
+- intentionally changing contract and implementation together; or
 - correcting inaccurate documentation without changing behaviour.
 
 ## Change rule
 
-An intentional behavioural change must update the authoritative documents in the same branch or pull request, or through the explicitly assigned post-implementation ChatGPT documentation phase.
+An intentional behavioural change must update the authoritative documents in the same branch or through the explicitly assigned ChatGPT documentation phase.
 
-An implementation-only change that preserves behaviour does not require artificial wording changes, but its change report must state:
+Codex and other coding agents must not edit `system_docs/`. They read it as authority and provide a handover for ChatGPT after implementation.
 
-- which authoritative documents were reviewed;
-- which behaviours were deliberately preserved;
-- why no contract update was necessary.
-
-See [`documentation_contract.md`](documentation_contract.md) for the full maintenance rules.
+See [`documentation_contract.md`](documentation_contract.md) for full maintenance rules.
 
 ## Active system-area map
 
 | Area | Authoritative directory | Current status |
 |---|---|---|
-| Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current, including all-only physical snapshots, validated warm local cache and failures-by-default run reports |
-| Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Binding index, integrity and active AQI write-pipeline contracts are current; remaining history migration is pending |
-| Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending |
+| Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current |
+| Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Authoritative for stable bindings, embedded continuity, integrity, targeted indexes and Phase B history writes |
+| Calculated hourly AQI and station-chart bands | [`aqi-levels/`](aqi-levels/) | Authoritative and current, including continuity-aware calculated chart AQI and asynchronous R2 validation |
+| Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending outside completed R2-history contracts |
 | Observs outbox and partition maintenance | `observs_operations/` | Migration analysis pending |
-| AQI generation and WHO summaries outside the R2 write pipeline | `aqi/` | Migration analysis pending |
-| Public and private R2-backed APIs | `api_services/` | Migration analysis pending |
-| Cache proxy and website routing | `cache_proxy/` | Migration analysis pending |
-| R2 and database backups, restore and repair | `backup_and_recovery/` | Migration analysis pending |
+| Public and private R2-backed APIs outside completed history/AQI boundaries | `api_services/` | Migration analysis pending |
+| Cache proxy and website routing outside completed history/AQI boundaries | `cache_proxy/` | Migration analysis pending |
+| R2 and database backups, restore and repair outside completed contracts | `backup_and_recovery/` | Migration analysis pending |
 | Cloudflare and GCP scheduling | `scheduling/` | Migration analysis pending |
 | Task health, metrics and operational dashboards | `monitoring/` | Migration analysis pending |
 | Hosted and local administrative dashboards | [`dashboards/`](dashboards/) | Authoritative and current |
 | Postcode and geography lookup products | [`geography/`](geography/) | Authoritative and current |
 | Shared runtime components and cross-area invariants | `shared/` | Migration analysis pending |
 
-Directories marked as pending are proposed area boundaries, not yet authoritative replacements for existing documents. Existing legacy documents remain relevant evidence until their migration is explicitly recorded, but they must not override a completed area contract.
+Directories marked pending are proposed area boundaries. They do not override completed contracts in `r2_history/`, `aqi-levels/`, `latest_snapshot/`, `dashboards/` or `geography/`.
 
-## Current authoritative areas
+## R2 history and station-history reading set
 
-The completed [`latest_snapshot/`](latest_snapshot/) area governs:
+Any change involving timeseries identity, historical charts, R2 observations, R2 AQI or Integrity rollover repair must read:
 
-- `workers/uk_aq_latest_snapshot_cloud_run/`;
-- `workers/uk_aq_latest_snapshot_r2_api_worker/`;
-- the latest-snapshot route boundary in `workers/uk_aq_cache_proxy/src/index.ts`;
-- latest-snapshot state seed, repair and rebuild tooling;
-- `.github/workflows/uk_aq_latest_snapshot_cloud_run_deploy.yml`;
-- `.github/workflows/uk_aq_latest_snapshot_r2_api_worker_deploy.yml`.
+1. [`r2_history/README.md`](r2_history/README.md)
+2. [`r2_history/contract.md`](r2_history/contract.md)
+3. [`r2_history/continuity.md`](r2_history/continuity.md)
+4. [`r2_history/interfaces.md`](r2_history/interfaces.md)
+5. [`r2_history/operations.md`](r2_history/operations.md)
+6. [`aqi-levels/README.md`](aqi-levels/README.md)
+7. [`aqi-levels/contract.md`](aqi-levels/contract.md)
+8. [`aqi-levels/station-history-contract.md`](aqi-levels/station-history-contract.md)
+9. [`aqi-levels/station-history-validation.md`](aqi-levels/station-history-validation.md)
 
-It defines:
+The specific station-history contract deliberately changes visible chart AQI source precedence while preserving persisted R2 AQI as validation evidence.
 
-- latest-valid state;
-- R2 as durable authority;
-- the disposable ETag-validated local cache for state, metadata cache and manifest;
-- the three physical pollutant `window=all` objects;
-- request-time finite-window derivation;
-- the physical manifest;
-- failures-by-default R2 run-report policy;
-- public v2 compatibility;
-- minimal TEST validation and rollback policy.
+## Current continuity decision
 
-The R2-history documents in [`r2_history/`](r2_history/) currently govern:
+The approved runtime design is Option 1:
 
-- stable v2 timeseries binding identity and routing;
-- binding publication and reconciliation;
-- v2 integrity detection, repair planning and repair execution;
-- the active Prune Daily Phase B AQI history write and targeted-index gates.
+- exact physical identity remains at the top level of `history/_index_v2/timeseries_binding/timeseries_id=<id>.json`;
+- genuine multi-member families use schema version 2 with an embedded deterministic `continuity` section;
+- exact-only single-member bindings may remain byte-identical schema version 1 objects;
+- the logical key is `connector_id + uk_air_ref + pollutant_code`;
+- `site_ref` is corroborating identity but not part of the key;
+- low-level R2 APIs remain exact physical readers;
+- the station-history Worker performs logical orchestration;
+- no separate R2 continuity prefix or station-binding index is introduced.
 
-They do not yet replace every legacy R2 layout, backup, read-API or general operations document.
+## Current calculated station-chart AQI decision
 
-The completed [`dashboards/`](dashboards/) area governs the hosted Pages and API Worker architecture, the local Python dashboard, station snapshot behaviour, displayed data-source ownership, deployment and TEST validation.
+When enabled:
 
-The completed [`geography/`](geography/) area governs ONSPD postcode builds and lookup routes, PCON and local-authority boundary shards, source-version selection, upload behaviour and TEST validation.
+- the station-history Worker merges date-valid physical observation segments into one logical observation stream;
+- visible DAQI and European AQI are calculated from those same observations;
+- PM rolling context may cross a physical timeseries transition;
+- observations and calculated AQI are returned together;
+- stored R2 AQI is compared asynchronously through Worker background execution;
+- validation does not delay, fail or redraw the chart;
+- the previous separate foreground R2 AQI path remains a feature-flag fallback;
+- historical identity repair remains gated until TEST deployment succeeds.
 
-## Repository-wide rules already defined elsewhere
+## Repository-wide operating rules
 
-`AGENTS.md` contains repository operating constraints, including:
+`AGENTS.md` additionally defines:
 
 - TEST-only scope unless LIVE is explicitly requested;
-- minimal pre-deployment validation and real TEST operational validation;
-- archive execution policy;
-- pre-change archive requirements;
-- schema placement rules;
+- minimal pre-deployment structural validation;
+- real TEST operational validation after deployment;
+- archive execution and pre-change archive rules;
+- schema placement policy;
 - R2 index byte-stability requirements;
-- limits on deployments and external operations.
+- restrictions on deployments, SQL, backfills and cloud operations;
+- `grep` as the preferred search tool.
 
-Those constraints apply in addition to the behavioural contracts in this directory.
+Those rules apply in addition to these behavioural contracts.
