@@ -4,11 +4,7 @@
 
 Created the script based on the R2 v2 paths, Rclone setup and DuckDB conventions in your supplied scripts.
 
-### Downloads
 
-[Download the new script](sandbox:/mnt/data/query_r2_v2_observations_before_after.sh)
-
-[Download the complete R2 query bundle with the new script added](sandbox:/mnt/data/r2_query_with_before_after.zip)
 
 ### Before capture
 

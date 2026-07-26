@@ -23,6 +23,14 @@ function formatName(value) {
   return ["objects", "compact", "json", "tsv"].includes(normalized) ? normalized : null;
 }
 
+function responsePartFlag(searchParams, name) {
+  if (!searchParams.has(name)) return true;
+  const value = String(searchParams.get(name) ?? "").trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(value)) return true;
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  return null;
+}
+
 export function parseHistoryChunkRequest(url, kind, limits = {}) {
   const timeseriesId = positiveInt(url.searchParams.get("timeseries_id"));
   const connectorId = positiveInt(url.searchParams.get("connector_id"));
@@ -35,7 +43,14 @@ export function parseHistoryChunkRequest(url, kind, limits = {}) {
     : (limits.observationChunkMaxHours || OBSERVATION_CHUNK_MAX_HOURS);
   const format = kind === "aqi" ? formatName(url.searchParams.get("format") || "compact") : "objects";
   const requestedLimit = positiveInt(url.searchParams.get("limit") || url.searchParams.get("row_limit"));
+  const includeObservations = kind === "observations"
+    ? responsePartFlag(url.searchParams, "include_observations")
+    : false;
+  const includeAqi = kind === "observations"
+    ? responsePartFlag(url.searchParams, "include_aqi")
+    : true;
   if (!timeseriesId || !connectorId || !pollutant || startMs === null || endMs === null || stableHeadStartMs === null || !format) return { ok: false, code: "history_chunk_request_invalid" };
+  if (includeObservations === null || includeAqi === null || (!includeObservations && !includeAqi)) return { ok: false, code: "history_chunk_response_parts_invalid" };
   if (endMs <= startMs || endMs - startMs > maxHours * HOUR_MS) return { ok: false, code: "history_chunk_bounds_invalid" };
   if (endMs > stableHeadStartMs) return { ok: false, code: "history_chunk_overlaps_stable_head" };
   if (requestedLimit && kind === "observations" && requestedLimit > OBSERVATION_CHUNK_MAX_ROWS) return { ok: false, code: "observation_chunk_row_limit_exceeded" };
@@ -45,8 +60,8 @@ export function parseHistoryChunkRequest(url, kind, limits = {}) {
   const stableHeadStartUtc = new Date(stableHeadStartMs).toISOString();
   return {
     ok: true, kind, timeseriesId, connectorId, pollutant, startMs, endMs, startUtc, endUtc,
-    stableHeadStartMs, stableHeadStartUtc, format, limit, maxHours,
-    retryKey: `v1|${kind}|${timeseriesId}|${connectorId}|${pollutant}|${startUtc}|${endUtc}|${format}|${limit}`,
+    stableHeadStartMs, stableHeadStartUtc, format, limit, maxHours, includeObservations, includeAqi,
+    retryKey: `v2|${kind}|${timeseriesId}|${connectorId}|${pollutant}|${startUtc}|${endUtc}|${format}|${limit}|obs:${includeObservations}|aqi:${includeAqi}`,
   };
 }
 
