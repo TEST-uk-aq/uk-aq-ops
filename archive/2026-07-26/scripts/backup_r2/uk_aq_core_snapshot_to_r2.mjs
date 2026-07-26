@@ -97,11 +97,11 @@ export const DEFAULT_TABLES = Object.freeze([
   "timeseries",
   "sos_station_timeseries_site_refs",
 ]);
-export const TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION = 2;
+export const TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION = 1;
 const TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION = 1;
 const TIMESERIES_BINDING_SOURCE_TABLES = Object.freeze(["timeseries", "phenomena", "observed_properties"]);
 
-export function buildTimeseriesBindingSourceFingerprint(tableArtifacts, continuityRows = []) {
+export function buildTimeseriesBindingSourceFingerprint(tableArtifacts) {
   const artifacts = tableArtifacts instanceof Map
     ? tableArtifacts
     : new Map((Array.isArray(tableArtifacts) ? tableArtifacts : []).map((entry) => [entry.table, entry]));
@@ -113,26 +113,8 @@ export function buildTimeseriesBindingSourceFingerprint(tableArtifacts, continui
     return { table, row_count: rowCount, sha256_uncompressed: sha256 };
   });
   if (tables.some((entry) => !entry)) return null;
-  const stableContinuityRows = (Array.isArray(continuityRows) ? continuityRows : []).map((row) => ({
-    connector_id: row.connector_id,
-    continuity_key: row.continuity_key,
-    site_ref: row.site_ref,
-    uk_air_ref: row.uk_air_ref,
-    pollutant_code: row.pollutant_code,
-    station_id: row.station_id,
-    station_ref: row.station_ref,
-    timeseries_id: row.timeseries_id,
-    timeseries_ref: row.timeseries_ref,
-    valid_from_day_utc: row.valid_from_day_utc,
-    valid_to_day_utc: row.valid_to_day_utc,
-  })).sort((left, right) => String(left.continuity_key).localeCompare(String(right.continuity_key)) || Number(left.timeseries_id) - Number(right.timeseries_id));
-  const continuity = {
-    view: "uk_aq_public.uk_aq_timeseries_continuity",
-    row_count: stableContinuityRows.length,
-    sha256: createHash("sha256").update(JSON.stringify(stableContinuityRows)).digest("hex"),
-  };
-  const canonical = JSON.stringify({ version: TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION, tables, continuity });
-  return { fingerprint: createHash("sha256").update(canonical).digest("hex"), tables, continuity };
+  const canonical = JSON.stringify({ version: TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION, tables });
+  return { fingerprint: createHash("sha256").update(canonical).digest("hex"), tables };
 }
 
 export function buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema, sourceFingerprint, sourceTables, authoritativeTimeseriesCount }) {
@@ -148,17 +130,6 @@ export function buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema,
     source_tables: sourceTables,
     authoritative_timeseries_count: authoritativeTimeseriesCount,
   };
-}
-
-async function readTimeseriesContinuityRows(connectionString) {
-  return withPgClient(connectionString, async (client) => {
-    const result = await client.query(`
-      select *
-      from uk_aq_public.uk_aq_timeseries_continuity
-      order by continuity_key, valid_from_day_utc, timeseries_id
-    `);
-    return result.rows || [];
-  });
 }
 
 function validTimeseriesBindingSourceState(state, { bindingPrefix, sourceSchema }) {
@@ -835,18 +806,7 @@ async function main(args) {
           const bindingPrefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
             || DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX);
           const sourceStateKey = `${bindingPrefix}/_source_state.json`;
-          const continuityRows = await retryTransient(
-            () => readTimeseriesContinuityRows(ingestDbUrl),
-            {
-              label: "timeseries continuity view read",
-              maxAttempts: CORE_SNAPSHOT_DB_RETRY_MAX_ATTEMPTS,
-              initialDelayMs: CORE_SNAPSHOT_DB_RETRY_INITIAL_DELAY_MS,
-              maxDelayMs: CORE_SNAPSHOT_DB_RETRY_MAX_DELAY_MS,
-              backoffMultiplier: CORE_SNAPSHOT_DB_RETRY_BACKOFF_MULTIPLIER,
-              shouldRetry: isRetryableCoreSnapshotDbError,
-            },
-          );
-          const source = buildTimeseriesBindingSourceFingerprint(tableArtifacts, continuityRows);
+          const source = buildTimeseriesBindingSourceFingerprint(tableArtifacts);
           if (!source) throw new Error("timeseries_binding_source_fingerprint_invalid");
           let storedState = null;
           let sourceStateStatus = "missing";
@@ -875,7 +835,6 @@ async function main(args) {
               phenomenaFile,
               observedPropertiesFile,
             }),
-            continuityRows,
             writeR2: !args.dry_run,
           });
           report.timeseries_binding_reconciliation = {

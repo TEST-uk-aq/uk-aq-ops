@@ -276,18 +276,13 @@ function parseRequiredPositiveInt(raw) {
 function isValidTimeseriesBinding(binding, requestedTimeseriesId) {
   if (!binding || typeof binding !== "object" || Array.isArray(binding)) return false;
   const pollutantCode = String(binding.pollutant_code || "").trim();
-  const baseValid = (binding.schema_version === 1 || binding.schema_version === 2)
+  return binding.schema_version === 1
     && binding.history_version === "v2"
     && binding.index_kind === "timeseries_binding"
     && parseRequiredPositiveInt(binding.timeseries_id) === requestedTimeseriesId
     && parseRequiredPositiveInt(binding.connector_id) !== null
     && /^[a-z0-9_]+$/.test(pollutantCode)
     && pollutantCode === binding.pollutant_code;
-  if (!baseValid) return false;
-  if (binding.schema_version === 1) return binding.continuity === undefined;
-  const continuity = binding.continuity;
-  if (!continuity || continuity.schema_version !== 1 || !Array.isArray(continuity.members) || continuity.members.length < 2 || continuity.pollutant_code !== pollutantCode) return false;
-  return continuity.members.filter((member) => parseRequiredPositiveInt(member?.timeseries_id) === requestedTimeseriesId).length === 1;
 }
 
 function toIsoOrNull(raw) {
