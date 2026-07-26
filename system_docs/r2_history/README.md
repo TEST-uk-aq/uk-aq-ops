@@ -2,87 +2,131 @@
 
 ## Current authority
 
-Read [`contract.md`](contract.md) first for the stable v2 per-timeseries binding contract.
+This area governs:
 
-This area currently has four completed authority groups:
+- stable v2 physical timeseries binding identity and routing;
+- embedded multi-member continuity families in schema-version-2 bindings;
+- v2 history Integrity detection, planning and repair;
+- scheduled Integrity daily date selection;
+- the active Prune Daily Phase B observation and AQI history write pipeline;
+- observation content hashing and verification-status preservation;
+- targeted v2 index generation and repair gates.
 
-- stable timeseries binding identity and routing;
-- v2 history Integrity detection and repair in [`integrity.md`](integrity.md), including count-first observation comparison followed by `observation_content_hash` comparison;
-- scheduled Integrity daily date selection in [`daily_profile_selection.md`](daily_profile_selection.md);
-- the active Prune Daily Phase B observation and AQI history write pipeline in [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md), including canonical `verification_status`, creation of the R2 observation-content hash, PM rolling context and targeted-index gates.
+The broader backup and low-level read-API documentation is still being consolidated, but completed files in this area override older broad or legacy documents for the subjects above.
 
-The remaining broader daily layout, backup and read-API documentation is still being migrated from `system_docs_legacy/`. Do not infer that a legacy broad document overrides the completed files above.
+## Required reading order
 
-## Observation content and verification-status authority
+For binding and continuity changes:
+
+1. [`contract.md`](contract.md)
+2. [`continuity.md`](continuity.md)
+3. [`interfaces.md`](interfaces.md)
+4. [`operations.md`](operations.md)
+5. [`recovery.md`](recovery.md)
+6. [`validation.md`](validation.md)
+7. relevant files under [`decisions/`](decisions/)
+
+For Integrity changes, also read:
+
+- [`integrity.md`](integrity.md);
+- [`daily_profile_selection.md`](daily_profile_selection.md) where scheduled selection is involved.
+
+For Prune Daily Phase B observation/AQI writes, also read:
+
+- [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
+
+For calculated station-chart AQI and website display, also read:
+
+- [`../aqi-levels/README.md`](../aqi-levels/README.md);
+- [`../aqi-levels/station-history-contract.md`](../aqi-levels/station-history-contract.md);
+- [`../aqi-levels/station-history-validation.md`](../aqi-levels/station-history-validation.md).
+
+## Stable binding and continuity summary
+
+The active binding object is:
+
+```text
+history/_index_v2/timeseries_binding/timeseries_id=<id>.json
+```
+
+Schema version 1 contains one exact physical binding.
+
+Schema version 2 contains the same exact physical top-level binding plus an embedded deterministic `continuity` family. Only genuine multi-member families require schema version 2. Existing single-member bindings may remain byte-identical schema version 1 objects.
+
+The logical family key is:
+
+```text
+connector_id + uk_air_ref + pollutant_code
+```
+
+`site_ref` is corroborating identity and must agree within a family, but it is not part of the key.
+
+The service-only Supabase continuity view is authoritative. The nested R2 family is its runtime materialised copy.
+
+Low-level observations and AQI history APIs remain exact physical-timeseries readers. Logical family orchestration belongs to the private station-history Worker.
+
+## Binding churn authority
+
+R2 binding byte stability is load-bearing.
+
+Binding and continuity objects must not contain run time, generation time, source snapshot time, row update time, match distance, raw payload or daily coverage.
+
+A bridge refresh with unchanged stable identity, reference and validity fields must produce zero changed binding objects.
+
+A genuine multi-member family change may rewrite each member binding in that small family. Broad unrelated rewrites are prohibited.
+
+The existing backup category remains `timeseries_binding_v2`; there is no separate R2 continuity tree or backup category.
+
+## Observation content and verification status
 
 The current observation-content-hash and verification-status contracts are jointly defined by:
 
-- [`integrity.md`](integrity.md) for source normalisation, source comparison, fault classification, repair planning, legacy reads and post-repair verification;
-- [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md) for the normal Prune Daily Phase B observation writer, canonical Parquet schema and manifest publication.
+- [`integrity.md`](integrity.md) for source normalisation, comparison, fault classification, planning, repair and post-repair verification;
+- [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md) for the normal Phase B writer, canonical Parquet schema and manifest publication.
 
-Required behaviour:
+Required behaviour includes:
 
 - canonical observation rows contain nullable `verification_status`;
-- UK-AIR SOS stores canonical `P`, `R` or null after deterministic source normalisation;
-- `P` means provisional and `R` means ratified;
+- UK-AIR SOS stores `P`, `R` or null after deterministic normalisation;
 - unknown non-empty UK-AIR SOS status values fail closed;
-- ratified rows are not locked and may be corrected later by the authoritative source;
 - legacy readers prefer `verification_status`, then legacy `status`, then null;
 - new writers emit only `verification_status`;
-- one `observation_content_hash` exists per non-empty `day_utc + connector_id + pollutant_code` observation partition;
-- the hash covers every canonical timeseries row in that pollutant partition, including `verification_status`;
-- the pollutant manifest contains deterministic `verification_status_counts` for `P`, `R` and `null`;
-- the authoritative R2 hash is stored in the existing v2 observation pollutant manifest;
-- Prune Daily and the Integrity source-to-R2 writer use one shared helper, expected at `workers/shared/uk_aq_observation_content_hash.mjs`;
-- Integrity compares authoritative source content with the hash in the Dropbox copy of the pollutant manifest;
-- Integrity SQLite stores comparison and audit evidence, not a duplicate authoritative R2 hash cache;
-- if real TEST runs show source-hash creation is materially slow, a later non-authoritative SQLite source-hash cache may be added with complete source, parser, status-normalisation, mapping and hash-contract invalidation;
-- the existing manifest/day Dropbox backup path carries the Parquet status column, hash and counts, with no separate hash object or backup category.
-
-`verification_status` is part of observation-content-hash contract version 1. A later change from provisional to ratified, ratified to provisional, known status to null or null to a known status changes the hash.
+- one deterministic `observation_content_hash` exists per non-empty v2 observation pollutant partition;
+- the hash covers every canonical row including `verification_status`;
+- the pollutant manifest contains deterministic status counts;
+- the existing Dropbox manifest/day backup carries the data and hash without a separate hash object.
 
 ## AQI writer source boundary
 
-For the current observation-derived Phase B AQI path:
+For the observation-derived Phase B AQI path:
 
-- target-day observations are frozen from IngestDB and remain the source for target-day R2 observations, canonical verification status and target-day AQI input;
-- only the preceding 23 hourly PM2.5 and PM10 aggregates are read from ObsAQIDB as calculation context;
-- context rows are never written into the target-day observation partition, included in its verification-status counts or observation-content hash, or emitted as previous-day AQI output;
-- incomplete, truncated or out-of-retention context reads fail closed and keep pruning blocked.
+- target-day IngestDB observations remain the source for target-day R2 observations and target-day AQI input;
+- only the preceding 23 hourly PM2.5 and PM10 aggregates are read from ObsAQIDB as context;
+- context rows are not written into the target-day observation partition or previous-day AQI output;
+- incomplete or truncated context fails closed and keeps pruning blocked.
 
-The exact source status, hash, RPC, pagination, retention, diagnostics and recovery contracts are defined in [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
+## Integrity historical rollover rule
 
-## Binding documentation reading order
+Integrity must distinguish a date-invalid R2 member of a known continuity family from a genuinely unknown timeseries.
 
-1. [`contract.md`](contract.md)
-2. [`interfaces.md`](interfaces.md)
-3. [`operations.md`](operations.md)
-4. [`recovery.md`](recovery.md)
-5. [`validation.md`](validation.md)
-6. relevant files under [`decisions/`](decisions/)
+For a bridge-known rollover, source mapping remains available and physical source/R2 mismatch evidence must be emitted. Repair execution remains gated until continuity-aware station history has been deployed and confirmed in TEST.
 
-For scheduled Integrity date selection, also read [`daily_profile_selection.md`](daily_profile_selection.md).
-
-For observation-content hashing, verification status, Integrity comparison and Prune Daily Phase B writes, also read both [`integrity.md`](integrity.md) and [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
-
-## Integrity repair execution scope
-
-A complete connector-day Integrity repair remains pollutant-scoped. The selected pollutant set passes unchanged to the shared source-to-R2 worker, which filters adapter bindings before mapping guards while retaining complete connector-day source evidence. Complete connector-day mode must not use a timeseries-ID filter.
-
-UK-AIR CSV heading decisions are maintained in the Integrity SQLite source-label registry. The registry is authoritative for approved SOS heading-to-pollutant decisions, while core mappings are consistency checks when present. An automatic mapped decision requires exactly one active supported mapping with an explicit expected unit; multiple active mappings require review, and stale unreviewed automatic decisions return to review without changing operator-reviewed decisions. Python's broad cached-heading inventory is warning-only. The worker derives the exact required files from validated active connector-day mappings and keeps their availability, readability and identity checks fail-closed. Each SOS repair receives one UTF-8 content-hashed and exact-file-hashed JSON snapshot for detector and proposal stages; non-SOS connectors do not load it. Unknown headings are treated as review, skipped and reported rather than broadening repair scope. For an approved heading, a source site/pollutant with no authoritative active timeseries binding is warning-only: it is recorded as `no_authoritative_timeseries_binding`, its rows are excluded from canonical output, counts, status counts and observation-content hashes, and other valid sites continue. Integrity never invents a binding. Ambiguous or contradictory bindings, incompatible units, unrecognised non-empty UK-AIR SOS statuses and invalid selected canonical rows remain fail-closed. Section-level unit evidence is independent of target-day rows, so zero target-day values do not require a target-day unit cell. Only approved mappings for `pm25`, `pm10`, `no2` and observation-only `o3` enter canonical processing. Operational validation runs only through `uk-aq-history-integrity.sh` on the dedicated Integrity machine, not on a development laptop with online-only Dropbox files; a JSON end-of-input error from an empty, unavailable or truncated online-only placeholder does not prove that the operational copy is corrupt.
+Unknown, ambiguous or contradictory identity remains fail-closed.
 
 ## Implementation ownership
 
 - `scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs`
-- `workers/shared/uk_aq_observation_content_hash.mjs`
+- `scripts/backup_r2/uk_aq_reconcile_r2_timeseries_bindings.mjs`
 - `workers/shared/uk_aq_r2_history_index.mjs`
+- `workers/shared/uk_aq_observation_content_hash.mjs`
 - `workers/uk_aq_observs_history_r2_api_worker/`
 - `workers/uk_aq_aqi_history_r2_api_worker/`
 - `workers/uk_aq_cache_proxy/src/station_history/`
+- `workers/uk_aq_station_history/`
 - `workers/uk_aq_prune_daily/phase_b_history_r2.mjs`
 - `workers/uk_aq_backfill_local/`
 - `lib/aqi/aqi_levels.mjs`
 - `scripts/backup_r2/`
 - `scripts/uk-aq-history-integrity/`
 
-The binding contract does not own daily observation or AQI coverage. The daily-profile selection contract owns scheduled Integrity date selection. The write-pipeline document owns Phase B source selection, canonical verification status, observation-content-hash publication, calculation boundaries, writes and completion gates, but not public display semantics.
+The binding and continuity contracts do not own daily observation or AQI coverage. Daily coverage remains in the domain manifests and timeseries file-range indexes.
