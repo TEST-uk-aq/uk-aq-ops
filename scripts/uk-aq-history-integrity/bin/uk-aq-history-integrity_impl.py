@@ -3040,6 +3040,7 @@ def _load_authoritative_sos_bridge_mapping(
         if pollutant_code not in allowed_pollutants:
             continue
         rows.append({
+            "connector_id": int(connector_id),
             "site_ref": site_ref,
             "uk_air_ref": str(raw[1]) if raw[1] is not None else None,
             "pollutant_code": pollutant_code,
@@ -10159,6 +10160,242 @@ def _is_sos_connector(conn: sqlite3.Connection, connector_id: int) -> bool:
     return row is not None
 
 
+def _classify_sos_r2_historical_identity_rollovers(
+    conn: sqlite3.Connection,
+    *,
+    day_utc: str,
+    connector_id: int,
+    pollutant_code: str,
+    r2_timeseries_ids: Iterable[int],
+    source_counts: Mapping[int, int],
+    r2_counts: Mapping[int, int],
+    expected_timeseries_ids: Iterable[int],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate safe continuity rollovers from unknown date-invalid R2 IDs."""
+    wanted_pollutant = str(pollutant_code or "").strip().lower()
+    selected_day = dt.date.fromisoformat(day_utc)
+    expected_ids = {
+        int(value) for value in expected_timeseries_ids if int(value) > 0
+    }
+    bridge = _load_authoritative_sos_bridge_mapping(
+        conn,
+        connector_id=connector_id,
+        target_pollutants=(wanted_pollutant,),
+    )
+
+    families: dict[str, list[dict[str, Any]]] = {}
+    bridge_rows: list[dict[str, Any]] = []
+    for raw_row in bridge["rows"]:
+        row = dict(raw_row)
+        row_connector_id = int(row.get("connector_id") or 0)
+        row_pollutant = str(row.get("pollutant_code") or "").strip().lower()
+        uk_air_ref = str(row.get("uk_air_ref") or "").strip().upper()
+        if (
+            row_connector_id != int(connector_id)
+            or row_pollutant != wanted_pollutant
+        ):
+            continue
+        bridge_rows.append(row)
+        if not uk_air_ref:
+            continue
+        continuity_key = f"{row_connector_id}:{uk_air_ref}:{row_pollutant}"
+        families.setdefault(continuity_key, []).append(row)
+
+    classified: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+
+    def unresolved_entry(
+        timeseries_id: int,
+        reason: str,
+        *,
+        continuity_keys: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        return {
+            "classification": "mapping_unavailable",
+            "reason": reason,
+            "day_utc": day_utc,
+            "connector_id": int(connector_id),
+            "pollutant_code": wanted_pollutant,
+            "existing_r2_timeseries_id": int(timeseries_id),
+            "existing_r2_row_count": int(r2_counts.get(timeseries_id) or 0),
+            "candidate_continuity_keys": sorted(set(continuity_keys)),
+        }
+
+    for raw_timeseries_id in sorted(set(r2_timeseries_ids)):
+        timeseries_id = int(raw_timeseries_id)
+        matching_bridge_rows = [
+            row for row in bridge_rows
+            if int(row.get("timeseries_id") or 0) == timeseries_id
+        ]
+        candidate_keys = [
+            continuity_key
+            for continuity_key, members in families.items()
+            if any(
+                int(member.get("timeseries_id") or 0) == timeseries_id
+                for member in members
+            )
+        ]
+        if any(
+            not str(row.get("uk_air_ref") or "").strip()
+            for row in matching_bridge_rows
+        ):
+            unresolved.append(unresolved_entry(
+                timeseries_id,
+                "continuity_family_uk_air_identity_missing",
+                continuity_keys=candidate_keys,
+            ))
+            continue
+        if len(candidate_keys) != 1:
+            unresolved.append(unresolved_entry(
+                timeseries_id,
+                "r2_timeseries_not_in_authoritative_continuity_family"
+                if not candidate_keys
+                else "r2_timeseries_matches_multiple_continuity_families",
+                continuity_keys=candidate_keys,
+            ))
+            continue
+
+        continuity_key = candidate_keys[0]
+        members = families[continuity_key]
+        site_refs = {
+            str(member.get("site_ref") or "").strip().upper()
+            for member in members
+            if str(member.get("site_ref") or "").strip()
+        }
+        uk_air_refs = {
+            str(member.get("uk_air_ref") or "").strip().upper()
+            for member in members
+            if str(member.get("uk_air_ref") or "").strip()
+        }
+        connectors = {int(member.get("connector_id") or 0) for member in members}
+        pollutants = {
+            str(member.get("pollutant_code") or "").strip().lower()
+            for member in members
+        }
+        member_timeseries_ids = [
+            int(member.get("timeseries_id") or 0) for member in members
+        ]
+        if len(members) < 2:
+            unresolved.append(unresolved_entry(
+                timeseries_id,
+                "r2_timeseries_family_is_not_multi_member",
+                continuity_keys=(continuity_key,),
+            ))
+            continue
+        if (
+            len(site_refs) != 1
+            or len(uk_air_refs) != 1
+            or connectors != {int(connector_id)}
+            or pollutants != {wanted_pollutant}
+            or any(value <= 0 for value in member_timeseries_ids)
+            or len(set(member_timeseries_ids)) != len(member_timeseries_ids)
+        ):
+            unresolved.append(unresolved_entry(
+                timeseries_id,
+                "continuity_family_identity_conflict",
+                continuity_keys=(continuity_key,),
+            ))
+            continue
+
+        parsed_members: list[tuple[dict[str, Any], dt.date, dt.date]] = []
+        invalid_interval = False
+        for member in members:
+            raw_from = str(member.get("valid_from_day_utc") or "").strip()
+            raw_to = str(member.get("valid_to_day_utc") or "").strip()
+            try:
+                valid_from = dt.date.fromisoformat(raw_from) if raw_from else dt.date.min
+                valid_to = dt.date.fromisoformat(raw_to) if raw_to else dt.date.max
+            except ValueError:
+                invalid_interval = True
+                break
+            if valid_from > valid_to:
+                invalid_interval = True
+                break
+            parsed_members.append((member, valid_from, valid_to))
+        intervals_overlap = any(
+            left_from <= right_to and right_from <= left_to
+            for index, (_, left_from, left_to) in enumerate(parsed_members)
+            for _, right_from, right_to in parsed_members[index + 1:]
+        )
+        if invalid_interval or intervals_overlap:
+            unresolved.append(unresolved_entry(
+                timeseries_id,
+                "continuity_family_invalid_or_overlapping_intervals",
+                continuity_keys=(continuity_key,),
+            ))
+            continue
+
+        existing_members = [
+            member for member, _, _ in parsed_members
+            if int(member.get("timeseries_id") or 0) == timeseries_id
+        ]
+        date_valid_members = [
+            member for member, valid_from, valid_to in parsed_members
+            if valid_from <= selected_day <= valid_to
+        ]
+        if len(existing_members) != 1 or len(date_valid_members) != 1:
+            unresolved.append(unresolved_entry(
+                timeseries_id,
+                "continuity_family_has_no_unique_date_valid_member",
+                continuity_keys=(continuity_key,),
+            ))
+            continue
+
+        existing_member = existing_members[0]
+        date_valid_member = date_valid_members[0]
+        date_valid_timeseries_id = int(date_valid_member["timeseries_id"])
+        if date_valid_timeseries_id == timeseries_id:
+            unresolved.append(unresolved_entry(
+                timeseries_id,
+                "r2_timeseries_is_already_date_valid",
+                continuity_keys=(continuity_key,),
+            ))
+            continue
+        if date_valid_timeseries_id not in expected_ids:
+            unresolved.append(unresolved_entry(
+                timeseries_id,
+                "date_valid_member_not_in_source_identity_set",
+                continuity_keys=(continuity_key,),
+            ))
+            continue
+
+        classified.append({
+            "classification": "historical_identity_rollover_mismatch",
+            "identity_classification": "bridge_known_historical_identity_rollover",
+            "day_utc": day_utc,
+            "connector_id": int(connector_id),
+            "site_ref": next(iter(site_refs)),
+            "uk_air_ref": next(iter(uk_air_refs)),
+            "pollutant_code": wanted_pollutant,
+            "continuity_key": continuity_key,
+            "existing_r2_station_id": int(existing_member["station_id"]),
+            "existing_r2_station_ref": existing_member.get("station_ref"),
+            "existing_r2_timeseries_id": timeseries_id,
+            "existing_r2_timeseries_ref": existing_member.get("timeseries_ref"),
+            "existing_r2_valid_from_day_utc":
+                existing_member.get("valid_from_day_utc"),
+            "existing_r2_valid_to_day_utc":
+                existing_member.get("valid_to_day_utc"),
+            "existing_r2_row_count": int(r2_counts.get(timeseries_id) or 0),
+            "date_valid_station_id": int(date_valid_member["station_id"]),
+            "date_valid_station_ref": date_valid_member.get("station_ref"),
+            "date_valid_timeseries_id": date_valid_timeseries_id,
+            "date_valid_timeseries_ref": date_valid_member.get("timeseries_ref"),
+            "date_valid_from_day_utc":
+                date_valid_member.get("valid_from_day_utc"),
+            "date_valid_to_day_utc":
+                date_valid_member.get("valid_to_day_utc"),
+            "source_row_count": int(source_counts.get(date_valid_timeseries_id) or 0),
+            "replace_existing_r2_pollutant_partition": True,
+            "requires_observation_manifest_rebuild": True,
+            "requires_observation_index_rebuild": True,
+            "requires_aqi_rebuild": wanted_pollutant in {"pm25", "pm10", "no2"},
+            "historical_identity_repair_gate_required": True,
+        })
+
+    return classified, unresolved
+
+
 def _sos_source_counts_for_v2_partition(
     conn: sqlite3.Connection,
     *,
@@ -11557,28 +11794,60 @@ def run_v2_observations_integrity_checks(
                     }
                     uncovered_r2_ids = sorted(r2_ids - expected_ids)
                     if uncovered_r2_ids:
-                        source_partition_evidence.update({
-                            "source_partition_state": "mapping_unavailable",
-                            "source_counts_available": False,
-                            "source_skip_reason":
-                                "r2_timeseries_not_covered_by_date_valid_sos_bridge",
-                            "r2_timeseries_without_bridge_count":
+                        historical_rollovers, unresolved_r2_ids = (
+                            _classify_sos_r2_historical_identity_rollovers(
+                                conn,
+                                day_utc=day_utc,
+                                connector_id=connector_id_for_source,
+                                pollutant_code=pollutant,
+                                r2_timeseries_ids=uncovered_r2_ids,
+                                source_counts=source_counts,
+                                r2_counts=parquet_stats.get(
+                                    "timeseries_row_counts"
+                                ) or {},
+                                expected_timeseries_ids=expected_ids,
+                            )
+                        )
+                        rollover_updates: dict[str, Any] = {
+                            "r2_date_invalid_timeseries_count":
                                 len(uncovered_r2_ids),
-                            "r2_timeseries_without_bridge_sample":
+                            "r2_date_invalid_timeseries_sample":
                                 uncovered_r2_ids[:50],
-                        })
-                        partition = source_partition_evidence.get("partition")
-                        if isinstance(partition, dict):
-                            partition.update({
-                                "state": "mapping_unavailable",
+                            "historical_identity_rollover_groups":
+                                len(historical_rollovers),
+                            "historical_identity_rollovers":
+                                historical_rollovers,
+                            "r2_timeseries_without_bridge_count":
+                                len(unresolved_r2_ids),
+                            "r2_timeseries_without_bridge_sample": [
+                                int(item["existing_r2_timeseries_id"])
+                                for item in unresolved_r2_ids[:50]
+                            ],
+                            "unresolved_r2_timeseries_mapping_issues":
+                                unresolved_r2_ids,
+                        }
+                        if historical_rollovers:
+                            rollover_updates["identity_classification"] = (
+                                "bridge_known_historical_identity_rollover"
+                            )
+                        source_partition_evidence.update(rollover_updates)
+                        if unresolved_r2_ids:
+                            source_partition_evidence.update({
+                                "source_partition_state": "mapping_unavailable",
                                 "source_counts_available": False,
                                 "source_skip_reason":
-                                    "r2_timeseries_not_covered_by_date_valid_sos_bridge",
-                                "r2_timeseries_without_bridge_count":
-                                    len(uncovered_r2_ids),
-                                "r2_timeseries_without_bridge_sample":
-                                    uncovered_r2_ids[:50],
+                                    "r2_timeseries_not_covered_by_sos_continuity_bridge",
                             })
+                        partition = source_partition_evidence.get("partition")
+                        if isinstance(partition, dict):
+                            partition.update(rollover_updates)
+                            if unresolved_r2_ids:
+                                partition.update({
+                                    "state": "mapping_unavailable",
+                                    "source_counts_available": False,
+                                    "source_skip_reason":
+                                        "r2_timeseries_not_covered_by_sos_continuity_bridge",
+                                })
                 if parquet_readable and connector_id_for_source is not None:
                     scope_minima = verified_first_value_at_minima.setdefault(
                         (day_utc, connector_id_for_source),
@@ -11713,6 +11982,30 @@ def run_v2_observations_integrity_checks(
                                 "r2_timeseries_without_bridge_sample"
                             ) or []
                         )[:50],
+                        "r2_date_invalid_timeseries_count": int(
+                            source_partition_evidence.get(
+                                "r2_date_invalid_timeseries_count"
+                            ) or 0
+                        ),
+                        "r2_date_invalid_timeseries_sample": list(
+                            source_partition_evidence.get(
+                                "r2_date_invalid_timeseries_sample"
+                            ) or []
+                        )[:50],
+                        "historical_identity_rollover_groups": int(
+                            source_partition_evidence.get(
+                                "historical_identity_rollover_groups"
+                            ) or 0
+                        ),
+                        "historical_identity_rollovers": list(
+                            source_partition_evidence.get(
+                                "historical_identity_rollovers"
+                            ) or []
+                        ),
+                        "identity_classification":
+                            source_partition_evidence.get(
+                                "identity_classification"
+                            ),
                     }
                     source_state = str(
                         source_partition_evidence.get(
@@ -12438,6 +12731,35 @@ def build_v2_repair_plan(
                 entry["aqi_rebuild_origins"] = _normalize_aqi_rebuild_origins(
                     [*(entry.get("aqi_rebuild_origins") or []), aqi_rebuild_origin or "unspecified"]
                 )
+        source_evidence = gap.get("source_evidence")
+        rollover_evidence = (
+            list(source_evidence.get("historical_identity_rollovers") or [])
+            if isinstance(source_evidence, Mapping)
+            else []
+        )
+        if rollover_evidence and kind == "observation_data_repair":
+            entry["identity_classification"] = (
+                "bridge_known_historical_identity_rollover"
+            )
+            entry["historical_identity_repair_gate_required"] = True
+            merged_rollovers = {
+                (
+                    int(item.get("existing_r2_timeseries_id") or 0),
+                    int(item.get("date_valid_timeseries_id") or 0),
+                ): dict(item)
+                for item in list(entry.get("historical_identity_rollovers") or [])
+                if isinstance(item, Mapping)
+            }
+            for item in rollover_evidence:
+                if not isinstance(item, Mapping):
+                    continue
+                merged_rollovers[(
+                    int(item.get("existing_r2_timeseries_id") or 0),
+                    int(item.get("date_valid_timeseries_id") or 0),
+                )] = dict(item)
+            entry["historical_identity_rollovers"] = [
+                merged_rollovers[key] for key in sorted(merged_rollovers)
+            ]
 
     for gap in observation_gaps:
         gap_type = str(gap.get("gap_type") or "")
