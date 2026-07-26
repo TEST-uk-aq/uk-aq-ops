@@ -100,27 +100,6 @@ async function readCoreTable(r2, manifest, table) {
   return parseNdjsonGz(object.body, entry.key);
 }
 
-async function readContinuityView(env) {
-  const baseUrl = String(env.SUPABASE_URL || "").trim().replace(/\/$/, "");
-  const serviceKey = String(env.SB_SECRET_KEY || env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
-  if (!baseUrl || !serviceKey) throw new Error("Missing SUPABASE_URL and SB_SECRET_KEY for continuity view read");
-  const pageSize = 1000;
-  const rows = [];
-  for (let offset = 0; ; offset += pageSize) {
-    const endpoint = new URL(`${baseUrl}/rest/v1/uk_aq_timeseries_continuity`);
-    endpoint.searchParams.set("select", "connector_id,continuity_key,site_ref,uk_air_ref,pollutant_code,station_id,station_ref,timeseries_id,timeseries_ref,valid_from_day_utc,valid_to_day_utc");
-    endpoint.searchParams.set("order", "continuity_key.asc,valid_from_day_utc.asc,timeseries_id.asc");
-    endpoint.searchParams.set("limit", String(pageSize));
-    endpoint.searchParams.set("offset", String(offset));
-    const response = await fetch(endpoint, { headers: { Accept: "application/json", "Accept-Profile": "uk_aq_public", apikey: serviceKey, Authorization: `Bearer ${serviceKey}` } });
-    if (!response.ok) throw new Error(`Continuity view read failed (${response.status})`);
-    const payload = await response.json();
-    if (!Array.isArray(payload)) throw new Error("Continuity view returned a non-array payload");
-    rows.push(...payload);
-    if (payload.length < pageSize) return rows;
-  }
-}
-
 export async function reconcileCoreSnapshotTimeseriesBindings({ argv = process.argv.slice(2), env = process.env } = {}) {
   const args = parseArgs(argv);
   if (args.help) return { help: true };
@@ -138,11 +117,10 @@ export async function reconcileCoreSnapshotTimeseriesBindings({ argv = process.a
   if (manifest?.schema_name !== "uk_aq_core_snapshot" || manifest?.day_utc !== dayUtc) {
     throw new Error(`Invalid core snapshot manifest contract: ${manifestKey}`);
   }
-  const [timeseriesRows, phenomenaRows, observedPropertiesRows, continuityRows] = await Promise.all([
+  const [timeseriesRows, phenomenaRows, observedPropertiesRows] = await Promise.all([
     readCoreTable(r2, manifest, "timeseries"),
     readCoreTable(r2, manifest, "phenomena"),
     readCoreTable(r2, manifest, "observed_properties"),
-    readContinuityView(env),
   ]);
   const summary = await reconcileR2HistoryV2TimeseriesBindings({
     r2,
@@ -156,7 +134,6 @@ export async function reconcileCoreSnapshotTimeseriesBindings({ argv = process.a
       phenomenaRows,
       observedPropertiesRows,
     }),
-    continuityRows,
     writeR2: args.writeR2,
   });
   return { ...summary, core_snapshot_day_utc: dayUtc, core_snapshot_manifest_key: manifestKey };

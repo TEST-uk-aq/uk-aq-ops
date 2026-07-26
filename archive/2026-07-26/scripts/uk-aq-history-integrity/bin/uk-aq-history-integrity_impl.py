@@ -10266,12 +10266,7 @@ def _sos_source_counts_for_v2_partition(
     day = dt.date.fromisoformat(day_utc)
     candidates_by_site: dict[str, list[dict[str, Any]]] = {}
     all_valid_timeseries_by_site: dict[str, set[int]] = {}
-    all_family_timeseries_by_site: dict[str, set[int]] = {}
     for row in bridge["rows"]:
-        if str(row["pollutant_code"]) == wanted_pollutant:
-            all_family_timeseries_by_site.setdefault(
-                str(row["site_ref"]), set()
-            ).add(int(row["timeseries_id"]))
         mapping, _ = _resolve_uk_air_flat_file_mapping_row([row], day_utc)
         if mapping is None:
             continue
@@ -10552,26 +10547,6 @@ def _sos_source_counts_for_v2_partition(
         for (site, ts_id), count in counts_by_site_ts.items()
         if ts_id not in all_valid_timeseries_by_site.get(site, set())
     ]
-    known_rollovers = [
-        conflict for conflict in conflicts
-        if int(conflict["timeseries_id"]) in all_family_timeseries_by_site.get(
-            str(conflict["site_ref"]), set()
-        )
-        and len(candidates_by_site.get(str(conflict["site_ref"]), [])) == 1
-    ]
-    for rollover in known_rollovers:
-        site_ref = str(rollover["site_ref"])
-        old_key = (site_ref, int(rollover["timeseries_id"]))
-        target_timeseries_id = int(candidates_by_site[site_ref][0]["timeseries_id"])
-        target_key = (site_ref, target_timeseries_id)
-        counts_by_site_ts[target_key] = counts_by_site_ts.get(target_key, 0) + counts_by_site_ts.pop(old_key, 0)
-        rollover["issue"] = "bridge_known_historical_identity_rollover"
-        rollover["date_valid_timeseries_id"] = target_timeseries_id
-    if known_rollovers:
-        evidence["historical_identity_rollover_groups"] = len(known_rollovers)
-        evidence["historical_identity_rollovers"] = known_rollovers[:25]
-        evidence["identity_classification"] = "bridge_known_historical_identity_rollover"
-    conflicts = [conflict for conflict in conflicts if conflict not in known_rollovers]
     if conflicts:
         evidence["timeseries_conflict_groups"] = len(conflicts)
         evidence["unresolved_site_ref_groups"] = len(conflicts)
@@ -19846,7 +19821,7 @@ def _validate_v2_timeseries_bindings(
     allowed_fields = {
         "schema_version", "history_version", "index_kind", "timeseries_id",
         "connector_id", "pollutant_code", "station_id", "phenomenon_id",
-        "observed_property_id", "continuity",
+        "observed_property_id",
     }
     for path in sorted(binding_root.glob("timeseries_id=*.json")) if binding_root.is_dir() else []:
         relative_key = path.relative_to(view_root).as_posix()
@@ -19862,40 +19837,20 @@ def _validate_v2_timeseries_bindings(
                 raise ValueError("binding_payload_not_object")
             if set(payload) - allowed_fields:
                 raise ValueError("binding_payload_has_non_identity_fields")
-            if payload.get("schema_version") not in {1, 2} or payload.get("history_version") != "v2":
+            if payload.get("schema_version") != 1 or payload.get("history_version") != "v2":
                 raise ValueError("binding_schema_or_history_version_mismatch")
             if payload.get("index_kind") != "timeseries_binding":
                 raise ValueError("binding_index_kind_mismatch")
             expected = expected_by_id.get(timeseries_id)
             if expected is None:
                 raise ValueError("binding_stale_timeseries_id")
-            expected_top_level = {
-                "schema_version": payload.get("schema_version"),
+            if payload != {
+                "schema_version": 1,
                 "history_version": "v2",
                 "index_kind": "timeseries_binding",
                 **expected,
-            }
-            if {key: value for key, value in payload.items() if key != "continuity"} != expected_top_level:
+            }:
                 raise ValueError("binding_payload_not_authoritative_core_identity")
-            if payload.get("schema_version") == 1:
-                if "continuity" in payload:
-                    raise ValueError("schema_v1_binding_has_continuity")
-            else:
-                continuity = payload.get("continuity")
-                if not isinstance(continuity, Mapping) or continuity.get("schema_version") != 1:
-                    raise ValueError("schema_v2_binding_continuity_invalid")
-                members = continuity.get("members")
-                if not isinstance(members, list) or len(members) < 2:
-                    raise ValueError("schema_v2_binding_members_invalid")
-                member_ids = [int(member.get("timeseries_id") or 0) for member in members if isinstance(member, Mapping)]
-                if member_ids.count(timeseries_id) != 1 or len(member_ids) != len(set(member_ids)):
-                    raise ValueError("schema_v2_binding_membership_invalid")
-                ordered = sorted(
-                    members,
-                    key=lambda member: (str(member.get("valid_from_day_utc") or ""), int(member.get("timeseries_id") or 0)),
-                )
-                if members != ordered:
-                    raise ValueError("schema_v2_binding_members_not_sorted")
         except Exception as exc:
             gaps.append({"stage": "timeseries_binding", "object_key": relative_key, "gap_type": f"timeseries_binding_invalid:{exc}"})
     for timeseries_id in sorted(set(expected_by_id) - actual_ids):
@@ -21301,12 +21256,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="",
         help="Explicit pollutant-scoped observation repair list: pm25,pm10,no2,o3.",
     )
-    p.add_argument(
-        "--enable-historical-identity-repair",
-        action="store_true",
-        default=_parse_bool(os.environ.get("UK_AQ_INTEGRITY_HISTORICAL_IDENTITY_REPAIR_ENABLED"), False),
-        help="Allow TEST execution of bridge-known historical physical-identity rollover repairs.",
-    )
     p.add_argument("--max-download-mb", type=int, default=None)
     p.add_argument("--max-runtime-minutes", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
@@ -21390,8 +21339,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         p.error(
             "--check-only and --run-backfill cannot be used together.",
         )
-    if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
-        p.error("historical identity repair must remain disabled in LIVE")
     return parsed
 
 
@@ -21410,18 +21357,6 @@ def mode_creates_repair_overlay(effective_mode: str) -> bool:
 
 def mode_allows_remote_apply(effective_mode: str) -> bool:
     return effective_mode == "repair_apply"
-
-
-def _contains_historical_identity_rollover(value: Any) -> bool:
-    if isinstance(value, Mapping):
-        if value.get("identity_classification") == "bridge_known_historical_identity_rollover":
-            return True
-        if int(value.get("historical_identity_rollover_groups") or 0) > 0:
-            return True
-        return any(_contains_historical_identity_rollover(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_contains_historical_identity_rollover(item) for item in value)
-    return value == "bridge_known_historical_identity_rollover"
 
 
 def source_acquisition_dry_run(effective_mode: str) -> bool:
@@ -24410,26 +24345,7 @@ def main(argv: list[str]) -> int:
                 "created v2 repair overlay after detection and planning run_state=%s overlay=%s",
                 repair_overlay["run_state_path"], repair_overlay["overlay_root"],
             )
-            historical_rollover_planned = _contains_historical_identity_rollover(
-                cross_check_metrics.get("v2_observations") or {}
-            )
-            if (
-                mode_allows_remote_apply(effective_mode)
-                and historical_rollover_planned
-                and not args.enable_historical_identity_repair
-            ):
-                repair_flow = {
-                    "status": "blocked_dependency",
-                    "reason": "historical_identity_repair_gate_disabled",
-                    "historical_identity_rollover_planned": True,
-                    "historical_identity_repair_enabled": False,
-                    "r2_write_attempted": False,
-                    "stage_order": list(CANONICAL_REPAIR_STAGE_ORDER),
-                    "overlay_root": repair_overlay.get("overlay_root"),
-                    "run_state_path": repair_overlay.get("run_state_path"),
-                }
-            else:
-                repair_flow = run_v2_integrity_repair_flow(
+            repair_flow = run_v2_integrity_repair_flow(
                 run_state=repair_overlay,
                 conn=conn,
                 run_id=int(run_id),
@@ -24452,8 +24368,8 @@ def main(argv: list[str]) -> int:
                 limits=limits,
                 dry_run=not mode_allows_remote_apply(effective_mode),
                 log=log,
-                    repair_pollutants=args.repair_pollutants,
-                )
+                repair_pollutants=args.repair_pollutants,
+            )
             aqi_stage = next(
                 (
                     stage.get("result")

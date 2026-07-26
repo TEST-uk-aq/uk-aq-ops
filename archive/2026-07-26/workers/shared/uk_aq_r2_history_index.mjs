@@ -214,7 +214,6 @@ const AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION = 1;
 const HISTORY_V2_TIMESERIES_INDEX_SCHEMA_VERSION = 3;
 const HISTORY_V2_TIMESERIES_METADATA_SCHEMA_VERSION = 1;
 export const HISTORY_V2_TIMESERIES_BINDING_SCHEMA_VERSION = 1;
-export const HISTORY_V2_TIMESERIES_BINDING_CONTINUITY_SCHEMA_VERSION = 2;
 const SUPPORTED_DOMAINS = new Set(["observations", "aqilevels"]);
 const MISSING_TIMESERIES_COUNTS_PREFIX =
   "Missing usable timeseries_row_counts in v2 AQI pollutant manifest";
@@ -1479,137 +1478,13 @@ function normalizeAuthoritativeTimeseriesBinding(binding) {
   return normalized;
 }
 
-function normalizeIsoDay(raw) {
-  const day = String(raw ?? "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
-  const parsed = new Date(`${day}T00:00:00.000Z`);
-  return Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== day ? null : day;
-}
-
-function stableRef(raw) {
-  const value = String(raw ?? "").trim();
-  return value || null;
-}
-
-function normalizeContinuityRow(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const connectorId = parsePositiveId(raw.connector_id);
-  const stationId = parsePositiveId(raw.station_id);
-  const timeseriesId = parsePositiveId(raw.timeseries_id);
-  const pollutantCode = parsePollutantCode(raw.pollutant_code, "observations");
-  const ukAirRef = stableRef(raw.uk_air_ref)?.toUpperCase() || null;
-  const siteRef = stableRef(raw.site_ref)?.toUpperCase() || null;
-  const validFromDayUtc = normalizeIsoDay(raw.valid_from_day_utc);
-  const validToDayUtc = raw.valid_to_day_utc == null || String(raw.valid_to_day_utc).trim() === ""
-    ? null
-    : normalizeIsoDay(raw.valid_to_day_utc);
-  if (!connectorId || !stationId || !timeseriesId || !pollutantCode || !ukAirRef || !siteRef || !validFromDayUtc) return null;
-  if (validToDayUtc && validToDayUtc < validFromDayUtc) return null;
-  const continuityKey = `${connectorId}:${ukAirRef}:${pollutantCode}`;
-  if (stableRef(raw.continuity_key) !== continuityKey) return null;
-  return {
-    connector_id: connectorId,
-    continuity_key: continuityKey,
-    site_ref: siteRef,
-    uk_air_ref: ukAirRef,
-    pollutant_code: pollutantCode,
-    station_id: stationId,
-    station_ref: stableRef(raw.station_ref),
-    timeseries_id: timeseriesId,
-    timeseries_ref: stableRef(raw.timeseries_ref),
-    valid_from_day_utc: validFromDayUtc,
-    valid_to_day_utc: validToDayUtc,
-  };
-}
-
-export function buildHistoryV2TimeseriesContinuityFamilies({ continuityRows = [], authoritativeByTimeseriesId = new Map() } = {}) {
-  const authoritative = authoritativeByTimeseriesId instanceof Map
-    ? authoritativeByTimeseriesId
-    : new Map((Array.isArray(authoritativeByTimeseriesId) ? authoritativeByTimeseriesId : [])
-      .map((row) => normalizeAuthoritativeTimeseriesBinding(row))
-      .filter(Boolean)
-      .map((row) => [String(row.timeseries_id), row]));
-  const groups = new Map();
-  let invalidRowCount = 0;
-  for (const raw of Array.isArray(continuityRows) ? continuityRows : []) {
-    const row = normalizeContinuityRow(raw);
-    if (!row) { invalidRowCount += 1; continue; }
-    if (!groups.has(row.continuity_key)) groups.set(row.continuity_key, []);
-    groups.get(row.continuity_key).push(row);
-  }
-  const membership = new Map();
-  const invalidFamilyKeys = new Set();
-  const continuityConflictedTimeseriesIds = new Set();
-  for (const [familyKey, rows] of groups) {
-    for (const row of rows) {
-      const memberKey = String(row.timeseries_id);
-      const previous = membership.get(memberKey);
-      if (previous && previous !== familyKey) {
-        invalidFamilyKeys.add(previous);
-        invalidFamilyKeys.add(familyKey);
-        continuityConflictedTimeseriesIds.add(row.timeseries_id);
-      } else membership.set(memberKey, familyKey);
-    }
-  }
-  const continuityByTimeseriesId = new Map();
-  let singleMemberFamilyCount = 0;
-  for (const [familyKey, sourceRows] of groups) {
-    const rows = [...sourceRows].sort((left, right) => left.valid_from_day_utc.localeCompare(right.valid_from_day_utc) || left.timeseries_id - right.timeseries_id);
-    const sites = new Set(rows.map((row) => row.site_ref));
-    const ids = new Set();
-    let openEndedCount = 0;
-    let valid = !invalidFamilyKeys.has(familyKey) && sites.size === 1;
-    for (let index = 0; index < rows.length; index += 1) {
-      const row = rows[index];
-      const core = authoritative.get(String(row.timeseries_id));
-      if (!core || core.connector_id !== row.connector_id || core.station_id !== row.station_id || core.pollutant_code !== row.pollutant_code || ids.has(row.timeseries_id)) valid = false;
-      ids.add(row.timeseries_id);
-      if (row.valid_to_day_utc === null) openEndedCount += 1;
-      const previous = rows[index - 1];
-      if (previous && (previous.valid_to_day_utc === null || row.valid_from_day_utc <= previous.valid_to_day_utc)) valid = false;
-    }
-    if (openEndedCount > 1) valid = false;
-    if (!valid) { invalidFamilyKeys.add(familyKey); continue; }
-    if (rows.length < 2) { singleMemberFamilyCount += 1; continue; }
-    const first = rows[0];
-    const continuity = {
-      schema_version: 1,
-      source: "sos_station_timeseries_site_refs",
-      continuity_key: familyKey,
-      site_ref: first.site_ref,
-      uk_air_ref: first.uk_air_ref,
-      pollutant_code: first.pollutant_code,
-      members: rows.map((row) => ({
-        station_id: row.station_id,
-        station_ref: row.station_ref,
-        timeseries_id: row.timeseries_id,
-        timeseries_ref: row.timeseries_ref,
-        valid_from_day_utc: row.valid_from_day_utc,
-        valid_to_day_utc: row.valid_to_day_utc,
-      })),
-    };
-    for (const row of rows) continuityByTimeseriesId.set(String(row.timeseries_id), continuity);
-  }
-  return {
-    continuityByTimeseriesId,
-    multiMemberFamilyCount: new Set([...continuityByTimeseriesId.values()].map((family) => family.continuity_key)).size,
-    schemaV2CandidateCount: continuityByTimeseriesId.size,
-    singleMemberFamilyCount,
-    invalidFamilyCount: invalidFamilyKeys.size,
-    invalidFamilyKeys: [...invalidFamilyKeys].sort(),
-    invalidRowCount,
-    conflictedTimeseriesCount: continuityConflictedTimeseriesIds.size,
-  };
-}
-
 export function buildHistoryV2TimeseriesBindingPayload(binding) {
   const normalized = normalizeAuthoritativeTimeseriesBinding(binding);
   if (!normalized) {
     throw new Error("authoritative_timeseries_binding_invalid");
   }
-  const continuity = binding?.continuity && typeof binding.continuity === "object" ? binding.continuity : null;
   const payload = {
-    schema_version: continuity ? HISTORY_V2_TIMESERIES_BINDING_CONTINUITY_SCHEMA_VERSION : HISTORY_V2_TIMESERIES_BINDING_SCHEMA_VERSION,
+    schema_version: HISTORY_V2_TIMESERIES_BINDING_SCHEMA_VERSION,
     history_version: "v2",
     index_kind: "timeseries_binding",
     timeseries_id: normalized.timeseries_id,
@@ -1619,7 +1494,6 @@ export function buildHistoryV2TimeseriesBindingPayload(binding) {
   for (const field of ["station_id", "phenomenon_id", "observed_property_id"]) {
     if (normalized[field]) payload[field] = normalized[field];
   }
-  if (continuity) payload.continuity = continuity;
   return payload;
 }
 
@@ -1628,7 +1502,6 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
   bucketName,
   timeseriesBindingIndexPrefix = DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
   authoritativeTimeseries = [],
-  continuityRows = [],
   writeR2 = true,
 } = {}) {
   if (!hasRequiredR2Config(r2)) {
@@ -1663,11 +1536,6 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
     if (!existing) authoritativeByTimeseriesId.set(key, normalized);
   }
 
-  const continuityResult = buildHistoryV2TimeseriesContinuityFamilies({
-    continuityRows,
-    authoritativeByTimeseriesId,
-  });
-
   const existingEntries = await r2ListAllObjects({
     r2,
     prefix: `${bindingPrefix}/`,
@@ -1692,20 +1560,14 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
   let plannedNewCount = 0;
   let headFallbackCount = 0;
   let bindingVerificationGetCount = 0;
-  const enrichedChangedFamilyKeys = new Set();
-  const enrichedUnchangedFamilyKeys = new Set();
-  const changedBindingTimeseriesIds = [];
-  const newBindingTimeseriesIds = [];
   for (const binding of [...authoritativeByTimeseriesId.values()]
     .sort((left, right) => left.timeseries_id - right.timeseries_id)) {
     const key = buildR2HistoryV2TimeseriesBindingKey(bindingPrefix, binding.timeseries_id);
+    const body = `${JSON.stringify(buildHistoryV2TimeseriesBindingPayload(binding), null, 2)}\n`;
     const id = String(binding.timeseries_id);
-    const continuity = continuityResult.continuityByTimeseriesId.get(id);
-    const body = `${JSON.stringify(buildHistoryV2TimeseriesBindingPayload({ ...binding, ...(continuity ? { continuity } : {}) }), null, 2)}\n`;
     const listedEtag = existingEtags.get(id);
     if (listedEtag && listedEtag === md5HexOfBody(body)) {
       bindingUnchangedCount += 1;
-      if (continuity) enrichedUnchangedFamilyKeys.add(continuity.continuity_key);
       continue;
     }
     let exists = existingIds.has(id);
@@ -1714,23 +1576,18 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
       const head = await r2HeadObject({ r2, key });
       if (head.exists && stripEtagQuotes(head.etag) === md5HexOfBody(body)) {
         bindingUnchangedCount += 1;
-        if (continuity) enrichedUnchangedFamilyKeys.add(continuity.continuity_key);
         continue;
       }
       exists = Boolean(head.exists);
     }
     if (exists) {
-      changedBindingTimeseriesIds.push(binding.timeseries_id);
       if (writeR2) bindingChangedCount += 1;
       else plannedChangedCount += 1;
     } else if (writeR2) {
-      newBindingTimeseriesIds.push(binding.timeseries_id);
       bindingNewCount += 1;
     } else {
-      newBindingTimeseriesIds.push(binding.timeseries_id);
       plannedNewCount += 1;
     }
-    if (continuity) enrichedChangedFamilyKeys.add(continuity.continuity_key);
     if (writeR2) {
       await r2PutObject({ r2, key, body, content_type: "application/json; charset=utf-8" });
       const verified = await r2GetObject({ r2, key });
@@ -1750,19 +1607,6 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
     bucket: bucketName || r2.bucket,
     timeseries_binding_index_prefix: bindingPrefix,
     authoritative_timeseries_count: authoritativeByTimeseriesId.size,
-    schema_version_1_candidate_count: authoritativeByTimeseriesId.size - continuityResult.schemaV2CandidateCount,
-    multi_member_continuity_family_count: continuityResult.multiMemberFamilyCount,
-    schema_version_2_candidate_count: continuityResult.schemaV2CandidateCount,
-    single_member_continuity_family_count: continuityResult.singleMemberFamilyCount,
-    invalid_continuity_family_count: continuityResult.invalidFamilyCount,
-    invalid_continuity_family_keys: continuityResult.invalidFamilyKeys,
-    invalid_continuity_row_count: continuityResult.invalidRowCount,
-    conflicted_timeseries_count: continuityResult.conflictedTimeseriesCount,
-    enriched_family_count: continuityResult.multiMemberFamilyCount,
-    enriched_changed_family_count: enrichedChangedFamilyKeys.size,
-    enriched_unchanged_family_count: enrichedUnchangedFamilyKeys.size,
-    enriched_changed_family_keys: [...enrichedChangedFamilyKeys].sort(),
-    skipped_single_member_family_count: continuityResult.singleMemberFamilyCount,
     binding_candidate_count: authoritativeByTimeseriesId.size,
     binding_written_count: bindingWrittenCount,
     binding_new_count: bindingNewCount,
@@ -1770,8 +1614,6 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
     binding_unchanged_count: bindingUnchangedCount,
     planned_new_count: plannedNewCount,
     planned_changed_count: plannedChangedCount,
-    changed_binding_timeseries_ids: changedBindingTimeseriesIds,
-    new_binding_timeseries_ids: newBindingTimeseriesIds,
     unchanged_count: bindingUnchangedCount,
     etag_listing_optimization_used: true,
     listed_binding_count: existingIds.size,
