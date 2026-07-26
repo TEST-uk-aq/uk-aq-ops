@@ -7,6 +7,17 @@ function intInRange(value, fallback, min, max) {
   return rounded >= min && rounded <= max ? rounded : fallback;
 }
 
+function boolFlag(value, fallback = false) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (!text) return fallback;
+  return ["1", "true", "yes", "on"].includes(text);
+}
+
+function validationMode(value) {
+  const mode = String(value ?? "off").trim().toLowerCase();
+  return ["off", "all", "sample"].includes(mode) ? mode : "off";
+}
+
 export const STATION_HISTORY_POLICY_DEFAULTS = Object.freeze({
   stableAqiHeadMaxHours: 168,
   aqiChunkMaxHours: 31 * 24,
@@ -14,6 +25,10 @@ export const STATION_HISTORY_POLICY_DEFAULTS = Object.freeze({
   observationOverlapHours: 2,
   obsAqiDbTimeoutMs: 10_000,
   ingestRetentionDays: 5,
+  continuityEnabled: false,
+  calculatedHistoryAqiEnabled: false,
+  aqiValidationMode: "off",
+  aqiValidationSamplePercent: 0,
 });
 
 export function resolveStationHistoryPolicy(env = {}) {
@@ -24,5 +39,9 @@ export function resolveStationHistoryPolicy(env = {}) {
     observationOverlapHours: intInRange(env.UK_AQ_STATION_HISTORY_OBSERVATION_OVERLAP_HOURS, STATION_HISTORY_POLICY_DEFAULTS.observationOverlapHours, 1, 3),
     obsAqiDbTimeoutMs: intInRange(env.UK_AQ_STATION_HISTORY_OBSAQIDB_TIMEOUT_MS, STATION_HISTORY_POLICY_DEFAULTS.obsAqiDbTimeoutMs, 1_000, 60_000),
     ingestRetentionDays: intInRange(env.INGESTDB_RETENTION_DAYS, STATION_HISTORY_POLICY_DEFAULTS.ingestRetentionDays, 1, 31),
+    continuityEnabled: boolFlag(env.UK_AQ_STATION_HISTORY_CONTINUITY_ENABLED),
+    calculatedHistoryAqiEnabled: boolFlag(env.UK_AQ_STATION_HISTORY_CALCULATED_HISTORY_AQI_ENABLED),
+    aqiValidationMode: validationMode(env.UK_AQ_STATION_HISTORY_AQI_VALIDATION_MODE),
+    aqiValidationSamplePercent: intInRange(env.UK_AQ_STATION_HISTORY_AQI_VALIDATION_SAMPLE_PERCENT, STATION_HISTORY_POLICY_DEFAULTS.aqiValidationSamplePercent, 0, 100),
   };
 }

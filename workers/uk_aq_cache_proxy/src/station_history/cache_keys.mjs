@@ -9,7 +9,7 @@ const AQI_HISTORY_PROXY_GENERATION_VERSION = "1";
 const AQI_HISTORY_PROXY_CONTRACT_PARAM = "__uk_aq_aqi_history_contract";
 const AQI_HISTORY_PROXY_CONTRACT_VERSION = "aqi_hour_interval_v2";
 const STATION_SERIES_PROXY_CONTRACT_PARAM = "__uk_aq_station_series_contract";
-const STATION_SERIES_PROXY_CONTRACT_VERSION = "3";
+const STATION_SERIES_PROXY_CONTRACT_VERSION = "4";
 
 function parseBooleanFlag(value) {
   return ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());

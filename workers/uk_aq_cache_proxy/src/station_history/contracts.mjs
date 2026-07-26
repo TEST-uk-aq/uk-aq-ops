@@ -19,4 +19,4 @@ export class R2HistoryFetchError extends Error {
   }
 }
 
-export const stationHistoryContractVersion = "v1";
+export const stationHistoryContractVersion = "v2";

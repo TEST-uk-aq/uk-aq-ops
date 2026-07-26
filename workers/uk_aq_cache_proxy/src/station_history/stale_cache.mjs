@@ -125,7 +125,7 @@ export function inspectCompleteGapFreePayload(payload, internalRoute) {
 
 export async function inspectStationHistoryResponse(response, internalRoute) {
   if (response.status !== 200) return { cacheable: false, immutable: false, reason: "status" };
-  if ((response.headers.get("X-UK-AQ-Station-History-Contract") || "").trim() !== "v1") {
+  if ((response.headers.get("X-UK-AQ-Station-History-Contract") || "").trim() !== "v2") {
     return { cacheable: false, immutable: false, reason: "unsupported_contract" };
   }
   const contentType = (response.headers.get("Content-Type") || "").toLowerCase();
