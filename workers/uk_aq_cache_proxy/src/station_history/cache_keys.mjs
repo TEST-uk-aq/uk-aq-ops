@@ -9,10 +9,18 @@ const AQI_HISTORY_PROXY_GENERATION_VERSION = "1";
 const AQI_HISTORY_PROXY_CONTRACT_PARAM = "__uk_aq_aqi_history_contract";
 const AQI_HISTORY_PROXY_CONTRACT_VERSION = "aqi_hour_interval_v2";
 const STATION_SERIES_PROXY_CONTRACT_PARAM = "__uk_aq_station_series_contract";
-const STATION_SERIES_PROXY_CONTRACT_VERSION = "4";
+const STATION_SERIES_PROXY_CONTRACT_VERSION = "5-explicit-response-parts";
 
 function parseBooleanFlag(value) {
   return ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
+}
+
+function normalizeResponsePartFlag(searchParams, name) {
+  if (!searchParams.has(name)) return "true";
+  const value = String(searchParams.get(name) ?? "").trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(value)) return "true";
+  if (["0", "false", "no", "off"].includes(value)) return "false";
+  return null;
 }
 
 export function canonicalizeStationSeriesRequestUrl(url, upstreamFunction, stationSeriesUpstream) {
@@ -21,7 +29,11 @@ export function canonicalizeStationSeriesRequestUrl(url, upstreamFunction, stati
   // The response schema and upstream work differ materially when AQI is
   // disabled.  Always materialise the default so the two variants can never
   // share a public gateway cache entry.
-  const includeAqi = !["0", "false", "no", "off"].includes(String(original.searchParams.get("include_aqi") ?? "").trim().toLowerCase());
+  const includeObservations = normalizeResponsePartFlag(original.searchParams, "include_observations");
+  const includeAqi = normalizeResponsePartFlag(original.searchParams, "include_aqi");
+  // Preserve malformed values so the private route can reject them rather
+  // than allowing cache canonicalisation to turn them into valid requests.
+  if (includeObservations === null || includeAqi === null) return original;
   const normalized = new URL(original.origin + original.pathname);
   const timeseriesId = String(original.searchParams.get("timeseries_id") ?? "").trim();
   if (/^\d+$/.test(timeseriesId) && Number(timeseriesId) > 0) normalized.searchParams.set("timeseries_id", String(Number(timeseriesId)));
@@ -34,7 +46,8 @@ export function canonicalizeStationSeriesRequestUrl(url, upstreamFunction, stati
   const window = String(original.searchParams.get("window") ?? "").trim().toLowerCase();
   if (window) normalized.searchParams.set("window", window);
   normalized.searchParams.set("format", "objects");
-  normalized.searchParams.set("include_aqi", includeAqi ? "true" : "false");
+  normalized.searchParams.set("include_observations", includeObservations);
+  normalized.searchParams.set("include_aqi", includeAqi);
   normalized.searchParams.set(STATION_SERIES_PROXY_CONTRACT_PARAM, STATION_SERIES_PROXY_CONTRACT_VERSION);
   // connector_id is a validation hint supplied by the browser. The private
   // Worker resolves connector authority from timeseries_id, so this hint must
