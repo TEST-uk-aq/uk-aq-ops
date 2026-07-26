@@ -1,0 +1,66 @@
+
+
+
+
+Created the script based on the R2 v2 paths, Rclone setup and DuckDB conventions in your supplied scripts.
+
+### Downloads
+
+[Download the new script](sandbox:/mnt/data/query_r2_v2_observations_before_after.sh)
+
+[Download the complete R2 query bundle with the new script added](sandbox:/mnt/data/r2_query_with_before_after.zip)
+
+### Before capture
+
+```bash
+scripts/r2_query/query_r2_v2_observations_before_after.sh \
+  --connector-id 1 \
+  --day 2026-07-12 \
+  --before
+```
+
+This creates:
+
+```text
+/Users/mikehinford/uk-aq-work/r2_integrity_check/before_20260726T100000Z.csv
+```
+
+### After capture and comparison
+
+```bash
+scripts/r2_query/query_r2_v2_observations_before_after.sh \
+  --connector-id 1 \
+  --day 2026-07-12 \
+  --after
+```
+
+This creates:
+
+```text
+after_<timestamp>.csv
+diff_<after_timestamp>_vs_<before_timestamp>.csv
+diff_<after_timestamp>_vs_<before_timestamp>.json
+```
+
+The diff CSV has a `change` column containing either:
+
+```text
+added
+removed
+```
+
+Changed observations appear as one removed row and one added row.
+
+The script:
+
+- Exports all pollutants and all observation rows for the selected connector and day.
+- Retains every original Parquet column.
+- Adds `r2_day_utc`, `r2_connector_id` and `r2_pollutant_code`.
+- Sorts the CSV deterministically.
+- Handles duplicate observations correctly.
+- Finds the newest before capture matching the same connector and day.
+- Uses `/Users/mikehinford/uk-aq-work/r2_integrity_check` by default.
+- Uses the `uk_aq_r2_test` Rclone remote by default.
+- Uses `CFLARE_R2_BUCKET`, with optional `--remote` and `--bucket` overrides.
+
+Bash syntax and the CSV comparison logic were validated locally. The live R2 download itself was not run from this environment because it does not have your Rclone configuration or R2 credentials.
