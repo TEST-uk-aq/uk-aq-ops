@@ -34,8 +34,11 @@ import {
 } from "./ingest_observations.mjs";
 import { buildR2ObservationRequestUrl, mergeObservationRowsPreferR2, readR2Observations } from "./r2_observations.mjs";
 import { resolveStationHistoryPolicy } from "./policy.mjs";
+import { buildCalculatedHistory } from "./calculated_history.mjs";
+import { publicContinuity, resolveTimeseriesBinding, selectContinuitySegments } from "./continuity.mjs";
+import { shouldValidateAqi, validateCalculatedAqiAgainstR2 } from "./aqi_validation.mjs";
 
-const CONTRACT_VERSION = "v1";
+const CONTRACT_VERSION = "v2";
 const UPSTREAM_AUTH_HEADER = "X-UK-AQ-Upstream-Auth";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -513,6 +516,70 @@ export async function buildStationSeries(request, env, nowMs = Date.now()) {
   return buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds, nowMs);
 }
 
+function exactContinuity(identity) {
+  return {
+    enabled: false,
+    continuityKey: null,
+    siteRef: null,
+    ukAirRef: null,
+    pollutant: identity.pollutant,
+    members: [{ stationId: identity.stationId, stationRef: null, timeseriesId: identity.timeseriesId, timeseriesRef: null, connectorId: identity.connectorId, pollutant: identity.pollutant, validFromDayUtc: null, validToDayUtc: null }],
+  };
+}
+
+async function buildFeatureStationSeries(request, bindingContext, env, policy, nowMs) {
+  const aqiBounds = resolveStableHeadBounds(request, policy.stableAqiHeadMaxHours);
+  const observationBounds = resolveStableHeadBounds(request, policy.observationChunkMaxHours);
+  const outputStartMs = Math.min(aqiBounds.headStartMs, observationBounds.headStartMs);
+  const contextStartMs = outputStartMs - request.contextHours * HOUR_MS;
+  const retentionHintStartMs = nowMs - policy.ingestRetentionDays * DAY_MS;
+  const continuity = policy.continuityEnabled ? bindingContext.continuity : exactContinuity(bindingContext.identity);
+  const ingestSegments = selectContinuitySegments(continuity, contextStartMs, request.endMs + 1).segments;
+  if (!ingestSegments.length) throw new Error("station_history_continuity_member_missing");
+  const directReads = await Promise.all(ingestSegments.map((segment) => readDirectIngestObservations({
+    env,
+    identity: { timeseriesId: segment.timeseriesId, connectorId: segment.connectorId, stationId: segment.stationId, pollutant: segment.pollutant },
+    startMs: segment.startMs,
+    rpcWindowStartMs: Math.max(segment.startMs, retentionHintStartMs),
+    endMs: segment.endMs,
+    nowMs,
+    timeoutMs: policy.obsAqiDbTimeoutMs,
+  })));
+  const calculatedRequest = { ...request, includeAqi: request.includeAqi && policy.calculatedHistoryAqiEnabled };
+  const combined = await buildCalculatedHistory({
+    request: calculatedRequest,
+    continuity,
+    env,
+    outputStartMs,
+    outputEndMs: request.endMs,
+    ingestRows: directReads.flatMap((entry) => entry.rows),
+    ingestComplete: directReads.every((entry) => entry.response_complete === true),
+    ingestFetchCount: directReads.length,
+    guideline: directReads.find((entry) => entry.guideline)?.guideline ?? null,
+  });
+  combined.observations.stable_head_start_utc = new Date(observationBounds.headStartMs).toISOString();
+  combined.observations.stable_head_end_utc = new Date(request.endMs).toISOString();
+  combined.observations.next_chunk_end_utc = observationBounds.headStartMs > request.startMs ? new Date(observationBounds.headStartMs).toISOString() : null;
+  combined.observations.next_older_observation_chunk_end_utc = combined.observations.next_chunk_end_utc;
+  if (policy.calculatedHistoryAqiEnabled) {
+    combined.aqi.stable_head_start_utc = new Date(aqiBounds.headStartMs).toISOString();
+    combined.aqi.stable_head_end_utc = new Date(request.endMs).toISOString();
+    combined.aqi.next_chunk_end_utc = aqiBounds.headStartMs > request.startMs ? new Date(aqiBounds.headStartMs).toISOString() : null;
+    combined.aqi.next_older_aqi_chunk_end_utc = combined.aqi.next_chunk_end_utc;
+    return { body: combined, continuity };
+  }
+  const legacy = await buildStationSeries(request, env, nowMs);
+  return {
+    body: {
+      ...legacy,
+      schema_version: 2,
+      continuity: publicContinuity(continuity),
+      observations: combined.observations,
+    },
+    continuity,
+  };
+}
+
 async function fetchJsonUpstream(target, secret, failureCode) {
   try {
     const response = await fetch(target.toString(), { headers: { Accept: "application/json", [UPSTREAM_AUTH_HEADER]: secret } });
@@ -550,10 +617,48 @@ async function handleAqiHistoryChunk(request, env) {
   } catch (error) { return errorResponse(502, error instanceof Error ? error.message : "aqi_history_r2_failed", url.pathname); }
 }
 
-async function handleObservationHistoryChunk(request, env) {
+async function handleObservationHistoryChunk(request, env, ctx) {
   const url = new URL(request.url);
-  const parsed = parseHistoryChunkRequest(url, "observations", resolveStationHistoryPolicy(env));
+  const policy = resolveStationHistoryPolicy(env);
+  const parsed = parseHistoryChunkRequest(url, "observations", policy);
   if (!parsed.ok) return errorResponse(parsed.code === "history_chunk_overlaps_stable_head" ? 409 : 400, parsed.code, url.pathname);
+  if (policy.continuityEnabled || policy.calculatedHistoryAqiEnabled) {
+    try {
+      const bindingContext = await resolveTimeseriesBinding(parsed, env);
+      const chunk = applyAuthoritativeTimeseriesIdentity(parsed, bindingContext.identity);
+      chunk.includeAqi = policy.calculatedHistoryAqiEnabled;
+      chunk.contextHours = chunk.includeAqi && ["pm25", "pm10"].includes(chunk.pollutant) ? 23 : 0;
+      const continuity = policy.continuityEnabled ? bindingContext.continuity : exactContinuity(bindingContext.identity);
+      const combined = await buildCalculatedHistory({ request: chunk, continuity, env, outputStartMs: chunk.startMs, outputEndMs: chunk.endMs });
+      const complete = combined.observations.response_complete === true && (!chunk.includeAqi || combined.aqi.response_complete === true);
+      const immutable = chunk.endMs <= Date.now() - 120 * HOUR_MS;
+      const body = {
+        ...combined,
+        rows: combined.observations.rows,
+        row_count: combined.observations.rows.length,
+        response_complete: complete,
+        has_gap: !complete,
+        coverage_state: complete ? "complete" : "partial",
+        partial_reasons: complete ? [] : [
+          ...(combined.observations.response_complete ? [] : ["observations_incomplete"]),
+          ...(!chunk.includeAqi || combined.aqi.response_complete ? [] : ["calculated_aqi_incomplete"]),
+        ],
+        chunk: {
+          direction: "newest_first", row_order: "ascending", start_utc: chunk.startUtc, end_utc: chunk.endUtc,
+          stable_head_start_utc: chunk.stableHeadStartUtc, next_older_chunk_end_utc: chunk.startUtc,
+          replacement_policy: "extend_backwards_only", cache_class: immutable ? "immutable" : "mutable", retry_key: `v2|combined|${chunk.retryKey}`,
+        },
+      };
+      if (chunk.includeAqi && shouldValidateAqi(policy, chunk) && ctx?.waitUntil) {
+        ctx.waitUntil(validateCalculatedAqiAgainstR2({ response: combined, request: chunk, continuity, env }).catch((error) => {
+          console.warn(JSON.stringify({ event: "station_history_aqi_validation_error", error: error instanceof Error ? error.message : String(error) }));
+        }));
+      }
+      return new Response(JSON.stringify(body), { status: 200, headers: chunkHeaders(body) });
+    } catch (error) {
+      return identityErrorResponse(error, url.pathname) || errorResponse(502, error instanceof Error ? error.message : "observation_history_combined_failed", url.pathname);
+    }
+  }
   let chunk;
   try { chunk = applyAuthoritativeTimeseriesIdentity(parsed, await resolveAuthoritativeTimeseriesIdentity(parsed, env)); }
   catch (error) { return identityErrorResponse(error, url.pathname) || errorResponse(502, "station_history_identity_lookup_failed", url.pathname); }
@@ -571,20 +676,31 @@ async function handleObservationHistoryChunk(request, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method !== "GET") return errorResponse(405, "internal_method_not_allowed", url.pathname);
     if (url.pathname === "/v1/aqi-history") return handleAqiHistoryChunk(request, env);
-    if (url.pathname === "/v1/observations-history") return handleObservationHistoryChunk(request, env);
+    if (url.pathname === "/v1/observations-history") return handleObservationHistoryChunk(request, env, ctx);
     if (url.pathname !== "/v1/station-series") return errorResponse(404, "internal_route_not_found", url.pathname);
     if (String(url.searchParams.get("format") ?? "").toLowerCase() !== "objects") return errorResponse(400, "station_series_format_objects_required", url.pathname);
     const parsed = resolveStationSeriesRequest(url);
     if (!parsed) return errorResponse(400, "station_series_request_invalid", url.pathname);
     try {
-      const identity = await resolveAuthoritativeTimeseriesIdentity(parsed, env);
+      const policy = resolveStationHistoryPolicy(env);
+      const featurePath = policy.continuityEnabled || policy.calculatedHistoryAqiEnabled;
+      const bindingContext = featurePath ? await resolveTimeseriesBinding(parsed, env) : null;
+      const identity = bindingContext?.identity || await resolveAuthoritativeTimeseriesIdentity(parsed, env);
       const authoritative = applyAuthoritativeTimeseriesIdentity(parsed, identity);
-      const body = attachAuthoritativeIdentity(await buildStationSeries(authoritative, env), identity);
+      const built = featurePath
+        ? await buildFeatureStationSeries(authoritative, bindingContext, env, policy, Date.now())
+        : { body: await buildStationSeries(authoritative, env), continuity: exactContinuity(identity) };
+      const body = attachAuthoritativeIdentity(built.body, identity);
       const complete = (!authoritative.includeAqi || body.aqi.response_complete === true) && body.observations.response_complete === true;
+      if (policy.calculatedHistoryAqiEnabled && authoritative.includeAqi && shouldValidateAqi(policy, authoritative) && ctx?.waitUntil) {
+        ctx.waitUntil(validateCalculatedAqiAgainstR2({ response: body, request: authoritative, continuity: built.continuity, env }).catch((error) => {
+          console.warn(JSON.stringify({ event: "station_history_aqi_validation_error", error: error instanceof Error ? error.message : String(error) }));
+        }));
+      }
       return new Response(JSON.stringify(body), { status: 200, headers: headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? "public, max-age=60, s-maxage=60" : "no-store", "X-UK-AQ-Station-History-Source-Mode": body.source.mode, "X-UK-AQ-Station-History-Ingest-Fetches": String(body.source.ingest_fetch_count) }) });
     } catch (error) {
       return ingestErrorResponse(error, url.pathname)

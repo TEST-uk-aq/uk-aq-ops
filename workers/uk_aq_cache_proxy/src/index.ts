@@ -3252,7 +3252,7 @@ export default {
         const value = request.headers.get(name);
         if (value) internalHeaders.set(name, value);
       }
-      internalHeaders.set("X-UK-AQ-Station-History-Contract", "v1");
+      internalHeaders.set("X-UK-AQ-Station-History-Contract", "v2");
       const tryStaleFallback = async (reason: string): Promise<Response | null> => {
         if (!stationHistoryStaleCache.shouldAttemptStaleFallback({
           enabled: stationHistoryStaleConfig.enabled,
