@@ -111,11 +111,14 @@ export function inspectCompleteGapFreePayload(payload, internalRoute) {
       (aqi.enabled === false && aqi.state === "disabled" && !hasKnownGap(aqi))
       || (aqi.enabled !== false && aqi.response_complete === true && !hasKnownGap(aqi))
     );
+    const observationsComplete = isObject(observations) && (
+      (observations.enabled === false && observations.state === "disabled" && !hasKnownGap(observations))
+      || (observations.enabled !== false && observations.response_complete === true && !hasKnownGap(observations))
+    );
     const cacheable = isObject(aqi)
       && isObject(observations)
       && aqiComplete
-      && observations.response_complete === true
-      && !hasKnownGap(observations);
+      && observationsComplete;
     return { cacheable, immutable: false, reason: cacheable ? null : "incomplete_or_gap" };
   }
   const complete = payload.response_complete === true && !hasKnownGap(payload);

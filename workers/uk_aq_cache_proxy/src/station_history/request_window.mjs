@@ -5,7 +5,7 @@ const TIMESERIES_V2_VERSION = "2";
 const TIMESERIES_V2_ALLOWED_WINDOWS = new Set(["12h", "24h", "7d", "31d", "90d"]);
 const TIMESERIES_V2_CACHE_BUSTER_KEYS = new Set(["_t", "timestamp", "cache_bust", "random"]);
 const TIMESERIES_V2_PRIMARY_QUERY_KEYS = [
-  "timeseries_id", "connector_id", "pollutant", "window", "since", "start_utc", "end_utc", "stable_head_start_utc", "format", "v",
+  "timeseries_id", "connector_id", "pollutant", "window", "since", "start_utc", "end_utc", "stable_head_start_utc", "format", "v", "include_observations", "include_aqi",
 ];
 const TIMESERIES_V2_DEFAULT_MAX_WINDOW_DAYS = 90;
 const TIMESERIES_V2_MAX_WINDOW_DAYS_LIMIT = 365;
@@ -58,6 +58,14 @@ function normalizeIsoOrNull(value) {
 function normalizeTimeseriesPollutantKey(value) {
   const normalized = String(value ?? "").trim().toLowerCase().replace(/[\s._-]+/g, "");
   return normalized === "pm25" || normalized === "pm10" || normalized === "no2" ? normalized : null;
+}
+
+function normalizeResponsePartFlag(searchParams, name) {
+  if (!searchParams.has(name)) return "true";
+  const value = String(searchParams.get(name) ?? "").trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(value)) return "true";
+  if (["0", "false", "no", "off"].includes(value)) return "false";
+  return String(searchParams.get(name) ?? "");
 }
 
 export function resolveTimeseriesV2FlagsFromEnv(envValues) {
@@ -121,6 +129,10 @@ export function canonicalizeTimeseriesV2RequestUrl(url, allowCacheBypassParams) 
   }
   const stableHeadStartUtc = normalizeIsoOrNull(original.searchParams.get("stable_head_start_utc"));
   if (stableHeadStartUtc) normalized.searchParams.set("stable_head_start_utc", stableHeadStartUtc);
+  if (original.searchParams.has("include_observations") || original.searchParams.has("include_aqi")) {
+    normalized.searchParams.set("include_observations", normalizeResponsePartFlag(original.searchParams, "include_observations"));
+    normalized.searchParams.set("include_aqi", normalizeResponsePartFlag(original.searchParams, "include_aqi"));
+  }
   normalized.searchParams.set("format", "json");
   normalized.searchParams.set("v", TIMESERIES_V2_VERSION);
   if (allowCacheBypassParams) {
