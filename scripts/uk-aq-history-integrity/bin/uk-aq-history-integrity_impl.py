@@ -12095,6 +12095,24 @@ def run_v2_observations_integrity_checks(
                                 str(key): int(value)
                                 for key, value in sorted(source_counts.items())
                             },
+                            "source_evidence": {
+                                field: source_partition_evidence.get(field)
+                                for field in (
+                                    "source_partition_state",
+                                    "source_counts_available",
+                                    "source_skip_reason",
+                                    "unresolved_site_ref_groups",
+                                    "unmapped_site_ref_groups",
+                                    "ambiguous_site_ref_groups",
+                                    "timeseries_conflict_groups",
+                                    "required_source_file_count",
+                                    "successful_source_file_count",
+                                    "historical_identity_rollover_groups",
+                                    "historical_identity_rollovers",
+                                    "identity_classification",
+                                )
+                                if field in source_partition_evidence
+                            },
                         })
             _validate_v2_parent_hierarchy(
                 root=root,
@@ -16815,6 +16833,61 @@ def _observation_repair_source_evidence_is_complete(
     return True, "complete_authoritative_source_evidence"
 
 
+def _derive_observation_hash_check_pollutants(
+    *,
+    candidates: Iterable[Mapping[str, Any]],
+    requested_pollutants: Iterable[str] | None,
+) -> tuple[
+    dict[tuple[str, int], list[str]],
+    dict[tuple[str, int, str], str],
+]:
+    """Derive the exact safe pollutant subset for each hash-evidence worker."""
+    requested = set(_normalise_repair_pollutants(requested_pollutants))
+    scopes: dict[tuple[str, int], set[str]] = {}
+    skipped: dict[tuple[str, int, str], str] = {}
+    for candidate in candidates:
+        day_utc = str(candidate.get("day_utc") or "").strip()
+        pollutant_code = str(
+            candidate.get("pollutant_code") or ""
+        ).strip().lower()
+        try:
+            connector_id = int(candidate.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        key = (day_utc, connector_id, pollutant_code)
+        if (
+            not day_utc
+            or connector_id <= 0
+            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+        ):
+            skipped[key] = "invalid_observation_hash_candidate_scope"
+            continue
+        if requested and pollutant_code not in requested:
+            skipped[key] = "outside_operator_requested_pollutant_scope"
+            continue
+        source_counts = candidate.get("source_timeseries_row_counts")
+        try:
+            source_row_count = int(candidate.get("source_row_count") or 0)
+        except (TypeError, ValueError):
+            source_row_count = 0
+        if source_row_count <= 0 or not isinstance(source_counts, Mapping) or not source_counts:
+            skipped[key] = "no_executable_source_rows"
+            continue
+        suitable, reason = _observation_repair_source_evidence_is_complete(
+            candidate.get("source_evidence")
+            if isinstance(candidate.get("source_evidence"), Mapping)
+            else None
+        )
+        if not suitable:
+            skipped[key] = reason
+            continue
+        scopes.setdefault((day_utc, connector_id), set()).add(pollutant_code)
+    return (
+        {key: sorted(values) for key, values in sorted(scopes.items())},
+        skipped,
+    )
+
+
 def _derive_executable_observation_repair_pollutants(
     *,
     v2_observations: Mapping[str, Any],
@@ -17264,6 +17337,7 @@ def run_v2_observation_content_hash_checks(
     v2_observations: dict[str, Any],
     source_scope: Mapping[str, Any] | None,
     log: logging.Logger,
+    repair_pollutants: Iterable[str] | None = None,
     verified_first_value_at_scope_sink: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     candidates = [
@@ -17304,6 +17378,12 @@ def run_v2_observation_content_hash_checks(
         return metrics
     log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     stage_root = log_dir / "_observation_hash_detector"
+    executable_pollutants_by_scope, skipped_candidates = (
+        _derive_observation_hash_check_pollutants(
+            candidates=candidates,
+            requested_pollutants=repair_pollutants,
+        )
+    )
     evidence_by_connector_day: dict[tuple[str, int], dict[str, Any]] = {}
     errors_by_connector_day: dict[tuple[str, int], str] = {}
     sos_connector_id = int(
@@ -17313,6 +17393,11 @@ def run_v2_observation_content_hash_checks(
         (str(candidate["day_utc"]), int(candidate["connector_id"]))
         for candidate in candidates
     }):
+        selected_pollutants = list(
+            executable_pollutants_by_scope.get((day_utc, connector_id)) or []
+        )
+        if not selected_pollutants:
+            continue
         scope_dir = (
             stage_root / f"day_utc={day_utc}" /
             f"connector_id={connector_id}"
@@ -17374,7 +17459,7 @@ def run_v2_observation_content_hash_checks(
                     } if bridge_snapshot else {}),
                 },
                 complete_connector_day=True,
-                repair_pollutants=None,
+                repair_pollutants=selected_pollutants,
             )
             if result.get("status") != "ok":
                 raise RuntimeError(
@@ -17389,6 +17474,7 @@ def run_v2_observation_content_hash_checks(
                 stage_root=stage_root,
                 day_utc=day_utc,
                 connector_id=connector_id,
+                repair_pollutants=selected_pollutants,
             )
             _persist_complete_connector_day_source_evidence(
                 conn=conn,
@@ -17411,6 +17497,13 @@ def run_v2_observation_content_hash_checks(
         "hash_candidates_by_pollutant": dict(
             v2_observations.get("hash_candidates_by_pollutant") or {}
         ),
+        "executable_pollutants_by_connector_day": {
+            f"{day_utc}|{connector_id}": pollutants
+            for (day_utc, connector_id), pollutants in sorted(
+                executable_pollutants_by_scope.items()
+            )
+        },
+        "skipped_candidate_count": len(skipped_candidates),
     }
     new_gaps: list[dict[str, Any]] = []
     verified_partitions: list[dict[str, Any]] = []
@@ -17419,6 +17512,21 @@ def run_v2_observation_content_hash_checks(
         connector_id = int(candidate["connector_id"])
         pollutant_code = str(candidate["pollutant_code"])
         metrics["checked"] += 1
+        skipped_reason = skipped_candidates.get(
+            (day_utc, connector_id, pollutant_code)
+        )
+        if skipped_reason:
+            gap = _v2_obs_gap(
+                "observation_content_hash_invalid_contract",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant_code,
+                expected_path=str(candidate.get("manifest_rel") or ""),
+                related_paths=[f"source_hash_unavailable:{skipped_reason}"],
+            )
+            new_gaps.append(gap)
+            metrics["invalid_contract"] += 1
+            continue
         evidence = evidence_by_connector_day.get((day_utc, connector_id))
         source_error = errors_by_connector_day.get((day_utc, connector_id))
         if evidence is None:
@@ -24864,6 +24972,7 @@ def main(argv: list[str]) -> int:
                 v2_observations=v2_obs,
                 source_scope=v2_source_scope,
                 log=log,
+                repair_pollutants=args.repair_pollutants,
                 verified_first_value_at_scope_sink=(
                     verified_first_value_at_connector_days
                 ),
