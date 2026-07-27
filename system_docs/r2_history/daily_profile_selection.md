@@ -9,7 +9,7 @@ The implementation is owned by:
 - `scripts/uk-aq-history-integrity/bin/daily_profile.py`
 - `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py`
 
-This document covers only how the daily profile chooses dates. Source acquisition, connector checks, repair planning and repair execution remain governed by [`integrity.md`](integrity.md).
+This document covers how the daily profile chooses dates and the narrow pre-boundary work permitted to construct that scope. Source acquisition, connector checks, repair planning and repair execution remain governed by [`integrity.md`](integrity.md), [`history_writer_coordination.md`](history_writer_coordination.md) and [`implementation_safety_contract.md`](implementation_safety_contract.md).
 
 Where active date-selection code differs from this document, this document is authoritative and the code must be brought into line before relying on the scheduled profile.
 
@@ -26,6 +26,36 @@ history/v2/observations/day_utc=YYYY-MM-DD
 Staging paths, overlays, archives, other history versions and malformed day-directory names do not participate in selection.
 
 Date discovery is performed at the top-level observations-day boundary. It does not inspect connector directories before deciding whether a date or month is represented.
+
+## Pre-boundary scope construction
+
+Automatic daily selection must construct its exact requested date set before the request-wide earliest-IngestDB-day boundary can be evaluated.
+
+Before that boundary check, the daily profile may perform only:
+
+1. direct child-name enumeration under the configured local Dropbox mirror path for `history/v2/observations`;
+2. strict parsing of `day_utc=YYYY-MM-DD` names;
+3. latest-day and represented-month calculation from those names;
+4. reads from the local Integrity SQLite `daily_profile_state` table needed to calculate missed logical-date catch-up;
+5. calculation and de-duplication of recent, historical and catch-up dates and their reasons;
+6. derivation of the selected request's minimum and maximum UTC dates.
+
+This is a narrow scope-discovery exception. It is not Dropbox readiness, comparison or validation.
+
+Before the boundary passes, daily selection must not:
+
+- inspect connector or pollutant child directories;
+- open, parse, hash or validate Dropbox manifests, Parquet or other history objects;
+- run general Dropbox freshness, inventory, placeholder or completeness checks;
+- inspect or acquire authoritative source files;
+- read live R2;
+- create findings or repair proposals;
+- mark the current logical date `complete`;
+- mark missed logical dates `caught_up`.
+
+After the exact selected date set is known, Integrity must run the request-wide boundary check for the complete requested connector set. Normal Dropbox readiness and every later Integrity stage begin only after that check succeeds.
+
+If no valid exact selection can be constructed, the daily run fails before the boundary rather than inventing a date range.
 
 ## Latest day and recent window
 
@@ -108,6 +138,8 @@ Catch-up state is cleared only by a successful real daily repair run:
 - a dry run is recorded as `dry_run` and does not clear catch-up work;
 - failed, stopped, skipped or otherwise incomplete daily runs do not clear catch-up work, so those logical dates remain eligible for a later daily profile.
 
+Pre-boundary daily-profile state reads are read-only. No state transition is permitted until the boundary has passed and the normal run reaches its documented completion outcome.
+
 ## Connector and source scope
 
 Daily date selection is global and happens before connector-specific checking.
@@ -117,6 +149,8 @@ The selected dates do not imply that every connector is expected to exist on eve
 For example, running the daily profile with `--source sos` uses the same global recent, historical and catch-up date selection, but only the SOS connector scope is acquired, checked and, when requested, repaired.
 
 The date-selection stage must not become connector-specific unless this system contract is deliberately changed.
+
+The request-wide boundary check nevertheless uses the complete connector set implied by the requested source or connector scope. A boundary failure blocks the entire selected daily request.
 
 ## Empty discovery and audit evidence
 
@@ -133,4 +167,6 @@ The run evidence records at least:
 - each catch-up logical date included in the selection;
 - whether catch-up completion occurred;
 - each logical date marked `caught_up` by the completing run;
-- the persisted state-row status for the current logical date.
+- the persisted state-row status for the current logical date;
+- whether only permitted scope discovery occurred before the boundary;
+- the request-wide boundary result for every requested connector.
