@@ -70,6 +70,17 @@ const DEFAULT_AQILEVELS_ROW_GROUP_SIZE = DEFAULT_ROW_GROUP_SIZE;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
 const DEFAULT_MAX_SECONDS_PER_RUN = 840;
 const DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS = 60;
+const PHASE_B_STAGE_MIN_MS = Object.freeze({
+  active_scope_adoption: 180_000,
+  candidate_start: 300_000,
+  observation_segment: 60_000,
+  aqi_calculation: 180_000,
+  aqi_object_write: 120_000,
+  observation_index: 120_000,
+  aqi_index: 120_000,
+  day_finalization: 120_000,
+  dropbox_comparison: 180_000,
+});
 const DEFAULT_AQILEVELS_SOURCE_MAX_PAGES = 50_000;
 const DEFAULT_STAGING_RETENTION_DAYS = 7;
 const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
@@ -264,7 +275,8 @@ function errorLogFields(error) {
 }
 
 export function createPhaseBRunBudgetForTest({
-  startedAtMs = Date.now(),
+  nowMs = Date.now,
+  startedAtMs = nowMs(),
   maxSecondsPerRun = DEFAULT_MAX_SECONDS_PER_RUN,
   stopBeforeTimeoutSeconds = DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS,
 } = {}) {
@@ -276,7 +288,13 @@ export function createPhaseBRunBudgetForTest({
     max_ms: maxMs,
     stop_before_timeout_ms: stopBeforeMs,
     deadline_ms: startedAtMs + usableMs,
+    now_ms: nowMs,
   };
+}
+
+function budgetNowMs(runtime) {
+  const now = runtime?.run_budget?.now_ms;
+  return typeof now === "function" ? Number(now()) : Date.now();
 }
 
 function budgetSnapshot(runtime) {
@@ -287,7 +305,7 @@ function budgetSnapshot(runtime) {
       remaining_budget_ms: null,
     };
   }
-  const now = Date.now();
+  const now = budgetNowMs(runtime);
   return {
     elapsed_run_ms: Math.max(0, now - budget.started_at_ms),
     remaining_budget_ms: Math.max(0, budget.deadline_ms - now),
@@ -299,7 +317,12 @@ function hasBudgetFor(runtime, minMs = 0) {
   if (!budget) {
     return true;
   }
-  return Date.now() + Math.max(0, minMs) < budget.deadline_ms;
+  return budgetNowMs(runtime) + Math.max(0, minMs) < budget.deadline_ms;
+}
+
+function remainingBudgetMs(runtime) {
+  const budget = runtime?.run_budget;
+  return budget ? Math.max(0, budget.deadline_ms - budgetNowMs(runtime)) : null;
 }
 
 function logPhaseB(runtime, severity, event, fields = {}) {
@@ -317,10 +340,11 @@ function logPhaseB(runtime, severity, event, fields = {}) {
 }
 
 class PhaseBHistoryBudgetExhaustedError extends Error {
-  constructor(message = "Phase B history run budget exhausted") {
+  constructor(message = "Phase B history run budget exhausted", operation = null) {
     super(message);
     this.name = "PhaseBHistoryBudgetExhaustedError";
     this.code = "PHASE_B_HISTORY_BUDGET_EXHAUSTED";
+    this.operation = operation;
   }
 }
 
@@ -332,7 +356,54 @@ function assertBudget(runtime, operation, fields = {}, minMs = 0) {
     operation,
     ...fields,
   });
-  throw new PhaseBHistoryBudgetExhaustedError();
+  throw new PhaseBHistoryBudgetExhaustedError(undefined, operation);
+}
+
+function rethrowIfBudgetDeadlineReached(runtime, error, operation, fields = {}) {
+  if (error instanceof PhaseBHistoryBudgetExhaustedError) throw error;
+  if (!hasBudgetFor(runtime, 2_000)) {
+    logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
+      operation,
+      ...fields,
+    });
+    throw new PhaseBHistoryBudgetExhaustedError(undefined, operation);
+  }
+}
+
+async function runBudgetedPhaseBStage({ runtime, operation, fields = {}, minMs, adapter }) {
+  assertBudget(runtime, operation, fields, minMs);
+  return await adapter({
+    deadline_ms: runtime?.run_budget?.deadline_ms ?? null,
+    remaining_ms: remainingBudgetMs(runtime),
+  });
+}
+
+export async function runBudgetedPhaseBStageForTest(args) {
+  try {
+    const value = await runBudgetedPhaseBStage(args);
+    return { status: "completed", value };
+  } catch (error) {
+    if (error instanceof PhaseBHistoryBudgetExhaustedError) {
+      return { status: "stopped_budget", value: null };
+    }
+    throw error;
+  }
+}
+
+function stopPhaseBForBudget(summary, runtime, { operation, candidate = null } = {}) {
+  summary.status = "stopped_budget";
+  summary.stopped_for_budget = true;
+  summary.budget_stop = {
+    operation: operation || "unknown",
+    day_utc: candidate?.day_utc || null,
+    connector_id: candidate?.connector_id ?? null,
+    ...budgetSnapshot(runtime),
+  };
+  return summary;
+}
+
+export function stopPhaseBForBudgetForTest({ summary, runtime, operation, candidate = null }) {
+  return stopPhaseBForBudget(summary, runtime, { operation, candidate });
 }
 
 export function isAcceptedPruneHistoryDayManifestKey(value) {
@@ -783,19 +854,20 @@ function toPgConnectionConfig(connectionString) {
   };
 }
 
-async function withPgClient(connectionString, fn) {
+async function withPgClient(connectionString, fn, { statementTimeoutMs = 600_000 } = {}) {
   const client = new Client(toPgConnectionConfig(connectionString));
   await client.connect();
   try {
     await client.query("set timezone = 'UTC'");
-    await client.query("set statement_timeout = '10min'");
+    const boundedStatementTimeoutMs = Math.max(1, Math.min(600_000, Math.trunc(Number(statementTimeoutMs) || 600_000)));
+    await client.query(`set statement_timeout = '${boundedStatementTimeoutMs}ms'`);
     return await fn(client);
   } finally {
     await client.end();
   }
 }
 
-async function postgrestRpc({ baseUrl, privilegedKey, rpcSchema, rpcName, payload }) {
+async function postgrestRpc({ baseUrl, privilegedKey, rpcSchema, rpcName, payload, signal = undefined }) {
   const endpoint = `${normalizeBaseUrl(baseUrl)}/rest/v1/rpc/${encodeURIComponent(rpcName)}`;
   const response = await fetch(endpoint, {
     method: "POST",
@@ -808,6 +880,7 @@ async function postgrestRpc({ baseUrl, privilegedKey, rpcSchema, rpcName, payloa
       "Content-Profile": rpcSchema,
     },
     body: JSON.stringify(payload ?? {}),
+    signal,
   });
 
   const text = await response.text();
@@ -966,7 +1039,7 @@ async function fetchPmHourlyContext({ runtime, dayUtc, connectorId, targetPmTime
         day_utc: dayUtc,
         connector_id: connectorId,
         ...diagnostics,
-      }, 30_000);
+      }, PHASE_B_STAGE_MIN_MS.observation_segment);
       if (diagnostics.pm_context_page_count >= runtime.pm_context_max_pages) {
         throw new Error(`PM context RPC exceeded max pages (${runtime.pm_context_max_pages}) before completion`);
       }
@@ -983,6 +1056,7 @@ async function fetchPmHourlyContext({ runtime, dayUtc, connectorId, targetPmTime
           p_after_timestamp_hour_utc: afterTimestampHourUtc,
           p_limit: runtime.pm_context_page_size,
         },
+        signal: AbortSignal.timeout(Math.max(1, (remainingBudgetMs(runtime) ?? 60_000) - 1_000)),
       });
       if (!Array.isArray(payload)) {
         throw new Error("PM context RPC returned a non-array response");
@@ -1035,6 +1109,10 @@ async function fetchPmHourlyContext({ runtime, dayUtc, connectorId, targetPmTime
       }
     }
   } catch (error) {
+    rethrowIfBudgetDeadlineReached(runtime, error, "pm_context_fetch", {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+    });
     if (error instanceof PhaseBPmContextError) throw error;
     throw new PhaseBPmContextError(
       error instanceof Error ? error.message : String(error),
@@ -1518,13 +1596,24 @@ export async function populateBackupCandidatesForTest({
   return populateBackupCandidates(client, latestEligibleWindowEndIso, runtime);
 }
 
-async function markIncompleteDaysAsBackupBlocked(client) {
+async function markActiveIncompleteDaysAsBackupBlocked(client, activeCandidates) {
+  const activeScope = activeCandidateScopeJson(activeCandidates);
+  if (activeScope === "[]") return;
   const sql = `
-with day_status as (
+with active_scope as (
+  select
+    s.day_utc::date as day_utc,
+    s.connector_id::integer as connector_id
+  from jsonb_to_recordset($1::jsonb) as s(day_utc text, connector_id integer)
+),
+day_status as (
   select
     c.day_utc,
     bool_and(c.status = 'complete') as all_complete
   from uk_aq_ops.history_candidates c
+  join active_scope s
+    on s.day_utc = c.day_utc
+   and s.connector_id = c.connector_id
   group by c.day_utc
 )
 insert into uk_aq_ops.prune_day_gates (
@@ -1561,44 +1650,33 @@ do update set
   history_completed_at = null,
   updated_at = now()
 `;
-  await client.query(sql);
+  await client.query(sql, [activeScope]);
 }
 
-async function markIncompleteConnectorCandidatesAsBackupBlocked(client) {
-  await client.query(`
-insert into uk_aq_ops.prune_connector_day_gates (
-  day_utc,
-  connector_id,
-  history_done,
-  updated_at
+function activeCandidateScopeJson(candidates) {
+  const distinct = new Map();
+  for (const candidate of candidates || []) {
+    const dayUtc = String(candidate?.day_utc || "").slice(0, 10);
+    const connectorId = Number(candidate?.connector_id);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dayUtc) || !Number.isInteger(connectorId) || connectorId <= 0) {
+      continue;
+    }
+    distinct.set(`${dayUtc}:${connectorId}`, { day_utc: dayUtc, connector_id: connectorId });
+  }
+  return JSON.stringify(Array.from(distinct.values()));
+}
+
+async function fetchPendingCandidates(client, activeCandidates, maxCandidatesPerRun) {
+  const sql = `
+with active_scope as (
+  select
+    s.day_utc::date as day_utc,
+    s.connector_id::integer as connector_id
+  from jsonb_to_recordset($1::jsonb) as s(day_utc text, connector_id integer)
 )
 select
   c.day_utc,
   c.connector_id,
-  false,
-  now()
-from uk_aq_ops.history_candidates c
-where c.status <> 'complete'
-on conflict (day_utc, connector_id)
-do update set
-  history_done = false,
-  history_run_id = null,
-  history_manifest_key = null,
-  history_manifest_hash = null,
-  history_row_count = null,
-  history_file_count = null,
-  history_total_bytes = null,
-  history_completed_at = null,
-  completion_source = null,
-  updated_at = now()
-`);
-}
-
-async function fetchPendingCandidates(client, maxCandidatesPerRun) {
-  const sql = `
-select
-  c.day_utc,
-  c.connector_id,
   c.expected_row_count,
   c.min_observed_at,
   c.max_observed_at,
@@ -1614,18 +1692,27 @@ select
   c.resume_exported_row_count,
   c.resume_parts_json
 from uk_aq_ops.history_candidates c
+join active_scope s
+  on s.day_utc = c.day_utc
+ and s.connector_id = c.connector_id
 where c.status = 'pending'
 order by c.day_utc, c.connector_id
-limit $1
+limit $2
 `;
 
-  const result = await client.query(sql, [maxCandidatesPerRun]);
+  const result = await client.query(sql, [activeCandidateScopeJson(activeCandidates), maxCandidatesPerRun]);
   return result.rows.map(toConnectorDayRow);
 }
 
-async function fetchCompleteCandidatesMissingConnectorGate(client, maxCandidatesPerRun) {
+async function fetchActiveCompleteCandidatesMissingConnectorGate(client, activeCandidates, maxCandidatesPerRun) {
   const result = await client.query(
     `
+with active_scope as (
+  select
+    s.day_utc::date as day_utc,
+    s.connector_id::integer as connector_id
+  from jsonb_to_recordset($1::jsonb) as s(day_utc text, connector_id integer)
+)
 select
   c.day_utc,
   c.connector_id,
@@ -1644,6 +1731,9 @@ select
   c.resume_exported_row_count,
   c.resume_parts_json
 from uk_aq_ops.history_candidates c
+join active_scope s
+  on s.day_utc = c.day_utc
+ and s.connector_id = c.connector_id
 left join uk_aq_ops.prune_connector_day_gates g
   on g.day_utc = c.day_utc
  and g.connector_id = c.connector_id
@@ -1660,11 +1750,19 @@ where c.status = 'complete'
     or g.history_completed_at is null
   )
 order by c.day_utc, c.connector_id
-limit $1
+limit $2
 `,
-    [maxCandidatesPerRun],
+    [activeCandidateScopeJson(activeCandidates), maxCandidatesPerRun],
   );
   return result.rows.map(toConnectorDayRow);
+}
+
+export async function fetchActiveCompleteCandidatesMissingConnectorGateForTest(args) {
+  return await fetchActiveCompleteCandidatesMissingConnectorGate(
+    args.client,
+    args.activeCandidates,
+    args.maxCandidatesPerRun,
+  );
 }
 
 async function markCandidateInProgress(client, dayUtc, connectorId, runId) {
@@ -1817,6 +1915,33 @@ where day_utc = $1::date
   and connector_id = $2::integer
 `,
     [dayUtc, connectorId, runId, errorText],
+  );
+}
+
+async function markCandidateStoppedForBudget(client, {
+  dayUtc,
+  connectorId,
+  runId,
+  errorText,
+  clearCheckpoint = false,
+}) {
+  await client.query(
+    `
+update uk_aq_ops.history_candidates
+set
+  status = 'pending',
+  run_id = $3,
+  last_error = left($4, 4000),
+  resume_last_timeseries_id = case when $5::boolean then null else resume_last_timeseries_id end,
+  resume_last_observed_at = case when $5::boolean then null else resume_last_observed_at end,
+  resume_part_index = case when $5::boolean then 0 else resume_part_index end,
+  resume_exported_row_count = case when $5::boolean then 0 else resume_exported_row_count end,
+  resume_parts_json = case when $5::boolean then '[]'::jsonb else resume_parts_json end,
+  updated_at = now()
+where day_utc = $1::date
+  and connector_id = $2::integer
+`,
+    [dayUtc, connectorId, runId, errorText, clearCheckpoint],
   );
 }
 
@@ -3106,7 +3231,7 @@ async function writeCommittedV2PartAndCheckpoint({
     const accumulatedRows = canonicalRowsByPollutant.get(pollutantCode) || [];
     accumulatedRows.push(...pollutantRows);
     canonicalRowsByPollutant.set(pollutantCode, accumulatedRows);
-    assertBudget(runtime, "pollutant_part", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 15_000);
+    assertBudget(runtime, "pollutant_part", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, PHASE_B_STAGE_MIN_MS.observation_segment);
     const pollutantStartedAtMs = Date.now();
     logPhaseB(runtime, "INFO", "phase_b_history_pollutant_start", {
       day_utc: dayUtc,
@@ -3144,7 +3269,7 @@ async function writeCommittedV2PartAndCheckpoint({
       pollutantCode,
       partIndex,
     );
-    assertBudget(runtime, "r2_put", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode, prefix: committedKey }, 15_000);
+    assertBudget(runtime, "r2_put", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode, prefix: committedKey }, PHASE_B_STAGE_MIN_MS.observation_segment);
     logPhaseB(runtime, "INFO", "phase_b_history_r2_put_start", {
       day_utc: dayUtc,
       connector_id: connectorId,
@@ -3211,7 +3336,7 @@ async function writeCommittedV2PartAndCheckpoint({
       connector_id: connectorId,
       pollutant_code: pollutantCode,
       next_pollutant_code: groupedRows[pollutantIndex + 1]?.[0] || null,
-    }, 15_000);
+    }, PHASE_B_STAGE_MIN_MS.observation_segment);
   }
 
   const nextObservedRows = observedRows + BigInt(writtenRowCount);
@@ -3306,7 +3431,7 @@ async function writeObservationV2ConnectorManifest({
   if (!(canonicalRowsByPollutant instanceof Map)) {
     throw new Error("V2 observation manifest requires canonical pollutant rows");
   }
-  assertBudget(runtime, "connector_manifest_prepare", { day_utc: dayUtc, connector_id: connectorId }, 15_000);
+  assertBudget(runtime, "connector_manifest_prepare", { day_utc: dayUtc, connector_id: connectorId }, PHASE_B_STAGE_MIN_MS.observation_segment);
   const prepareStartedAtMs = Date.now();
   logPhaseB(runtime, "INFO", "phase_b_history_connector_manifest_prepare_start", {
     day_utc: dayUtc,
@@ -3332,7 +3457,7 @@ async function writeObservationV2ConnectorManifest({
     duration_ms: Math.max(0, Date.now() - prepareStartedAtMs),
   });
   for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-    assertBudget(runtime, "manifest_write", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 10_000);
+    assertBudget(runtime, "manifest_write", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, PHASE_B_STAGE_MIN_MS.observation_segment);
     const pollutantManifestKey = buildHistoryV2PollutantManifestKey(
       runtime.committed_prefix,
       dayUtc,
@@ -3575,7 +3700,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   const cursor = streamClient.query(new Cursor(sql, [connectorId, dayStart, dayEnd]));
   try {
     for (;;) {
-      assertBudget(runtime, "frozen_source_fetch", { day_utc: dayUtc, connector_id: connectorId }, 30_000);
+      assertBudget(runtime, "frozen_source_fetch", { day_utc: dayUtc, connector_id: connectorId }, PHASE_B_STAGE_MIN_MS.observation_segment);
       const rows = await cursorRead(cursor, runtime.cursor_fetch_rows);
       if (!rows.length) break;
       for (const raw of rows) {
@@ -3624,7 +3749,16 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
 async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, frozenSourcePath }) {
   const sourceRows = [];
   let targetDaySupportedRowCount = 0;
+  let replayedRowCount = 0;
   for await (const row of readFrozenSourceRows(frozenSourcePath)) {
+    replayedRowCount += 1;
+    if (replayedRowCount % 10_000 === 0) {
+      assertBudget(runtime, "aqi_calculation_replay", {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        replayed_row_count: replayedRowCount,
+      }, PHASE_B_STAGE_MIN_MS.observation_segment);
+    }
     if (!AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)) continue;
     if (!isObservationRowInDay(row, dayUtc)) {
       throw new Error(`AQI target-day source contained an out-of-range row for day=${dayUtc} connector=${connectorId}`);
@@ -3658,6 +3792,10 @@ async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, froz
       eaqi_status_counts: {},
     };
   }
+  assertBudget(runtime, "aqi_calculation_normalize", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+  }, PHASE_B_STAGE_MIN_MS.observation_segment);
   const acceptedRows = dedupeSourceObservationRows(sourceRows);
   const targetDayHourlyRows = sourceObservationsToNarrowRows(acceptedRows);
   if (acceptedRows.length === 0 || targetDayHourlyRows.length === 0) {
@@ -3678,6 +3816,10 @@ async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, froz
     contextRows: pmContext.rows,
     targetDayRows: targetDayHourlyRows,
   });
+  assertBudget(runtime, "aqi_calculation_finalize", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+  }, PHASE_B_STAGE_MIN_MS.observation_segment);
   const rows = buildAqilevelHistoryRowsForDayFromHourlyRows(mergedHourlyRows, dayUtc);
   if (rows.length === 0) {
     throw new Error(`Phase B AQI hourly calculation produced zero output for day=${dayUtc} connector=${connectorId} despite ${targetDaySupportedRowCount} target-day supported source rows`);
@@ -3761,23 +3903,40 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
         backedUpAtUtc,
         canonicalRowsByPollutant: staged.canonicalRowsByPollutant,
       });
-      const aqiBuild = await buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, frozenSourcePath: temp.ndjsonPath });
-      let aqiResult = { status: aqiBuild.status, source_row_count: BigInt(aqiBuild.rows.length), file_count: 0, total_bytes: 0n };
-      if (aqiBuild.status !== "no_supported_aqi_source") {
-        aqiResult = await exportAqilevelConnectorRowsToR2({
+      const aqiBuild = await runBudgetedPhaseBStage({
+        runtime,
+        operation: "aqi_calculation",
+        fields: { day_utc: dayUtc, connector_id: connectorId },
+        minMs: PHASE_B_STAGE_MIN_MS.aqi_calculation,
+        adapter: async () => await buildAqiRowsFromFrozenSource({
           runtime,
           dayUtc,
-          connector: {
-            connector_id: connectorId,
-            expected_row_count: BigInt(aqiBuild.rows.length),
-            min_timeseries_id: null,
-            max_timeseries_id: null,
-          },
-          rows: aqiBuild.rows,
-        });
-      } else if (runtime.history_write_version === "v2") {
-        aqiResult = await writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc });
-      }
+          connectorId,
+          frozenSourcePath: temp.ndjsonPath,
+        }),
+      });
+      const aqiResult = await runBudgetedPhaseBStage({
+        runtime,
+        operation: "aqi_object_write",
+        fields: { day_utc: dayUtc, connector_id: connectorId },
+        minMs: PHASE_B_STAGE_MIN_MS.aqi_object_write,
+        adapter: async () => {
+          if (aqiBuild.status !== "no_supported_aqi_source") {
+            return await exportAqilevelConnectorRowsToR2({
+              runtime,
+              dayUtc,
+              connector: {
+                connector_id: connectorId,
+                expected_row_count: BigInt(aqiBuild.rows.length),
+                min_timeseries_id: null,
+                max_timeseries_id: null,
+              },
+              rows: aqiBuild.rows,
+            });
+          }
+          return await writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc });
+        },
+      });
       return {
         day_utc: dayUtc,
         connector_id: connectorId,
@@ -3811,7 +3970,7 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
     } finally {
       cleanupPhaseBTargetDaySourceTemp(temp);
     }
-  });
+  }, { statementTimeoutMs: Math.max(1, (remainingBudgetMs(runtime) ?? 600_000) - 1_000) });
 }
 
 async function exportCandidateToR2({ candidate, runtime }) {
@@ -3900,6 +4059,11 @@ async function exportCandidateToR2({ candidate, runtime }) {
   }
 
   for (const part of committedParts) {
+    assertBudget(runtime, "resume_part_verification", {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      part_key: part.key,
+    }, PHASE_B_STAGE_MIN_MS.observation_segment);
     const head = await r2HeadObject({ r2: runtime.r2, key: part.key });
     if (!head.exists) {
       throw new Error(`Resume checkpoint references missing committed object: ${part.key}`);
@@ -3974,7 +4138,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
 
     try {
       for (;;) {
-        assertBudget(runtime, "row_fetch", { day_utc: dayUtc, connector_id: connectorId }, 30_000);
+        assertBudget(runtime, "row_fetch", { day_utc: dayUtc, connector_id: connectorId }, PHASE_B_STAGE_MIN_MS.observation_segment);
         logPhaseB(runtime, "INFO", "phase_b_history_row_fetch_start", {
           day_utc: dayUtc,
           connector_id: connectorId,
@@ -4057,7 +4221,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
     } finally {
       await closeCursor(cursor);
     }
-  });
+  }, { statementTimeoutMs: Math.max(1, (remainingBudgetMs(runtime) ?? 600_000) - 1_000) });
 
   if (observedRows !== expectedRowCount) {
     throw new Error(
@@ -4135,7 +4299,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
   };
 }
 
-async function dropboxRefreshAccessToken(dropboxConfig) {
+async function dropboxRefreshAccessToken(dropboxConfig, { signal = undefined } = {}) {
   const appKey = String(dropboxConfig?.app_key || "").trim();
   const appSecret = String(dropboxConfig?.app_secret || "").trim();
   const refreshToken = String(dropboxConfig?.refresh_token || "").trim();
@@ -4154,6 +4318,7 @@ async function dropboxRefreshAccessToken(dropboxConfig) {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: tokenBody.toString(),
+    signal,
   });
   if (!tokenResp.ok) {
     const text = await readResponseText(tokenResp);
@@ -4167,7 +4332,7 @@ async function dropboxRefreshAccessToken(dropboxConfig) {
   return token;
 }
 
-async function uploadBytesToDropbox({ accessToken, path, body, contentType = "application/octet-stream" }) {
+async function uploadBytesToDropbox({ accessToken, path, body, contentType = "application/octet-stream", signal = undefined }) {
   // Dropbox /2/files/upload rejects application/json; force JSON payloads to octet-stream.
   const normalizedContentType = /^application\/json\b/i.test(String(contentType || ""))
     ? "application/octet-stream"
@@ -4185,6 +4350,7 @@ async function uploadBytesToDropbox({ accessToken, path, body, contentType = "ap
       }),
     },
     body,
+    signal,
   });
   if (!response.ok) {
     const text = await readResponseText(response);
@@ -4315,6 +4481,10 @@ export async function verifyObservationConnectorHistory({
   manifestKey,
   expectedRowCount = null,
 }) {
+  assertBudget(runtime, "observation_history_verification", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+  }, PHASE_B_STAGE_MIN_MS.observation_index);
   const expectedConnectorKey = canonicalObservationConnectorManifestKey(dayUtc, connectorId);
   if (manifestKey !== expectedConnectorKey || runtime.committed_prefix !== HISTORY_R2_V2_OBSERVATIONS_PREFIX) {
     throw new Error(`Observation connector manifest is not the canonical v2 key: ${manifestKey}`);
@@ -4343,6 +4513,11 @@ export async function verifyObservationConnectorHistory({
   const seenPollutants = new Set();
   const verifiedChildren = [];
   for (const reference of childReferences) {
+    assertBudget(runtime, "observation_history_verification", {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      pollutant_code: reference?.pollutant_code || null,
+    }, PHASE_B_STAGE_MIN_MS.observation_segment);
     const pollutantCode = normalizePollutantCodeForPath(reference?.pollutant_code);
     if (seenPollutants.has(pollutantCode)) {
       throw new Error(`Duplicate pollutant child in connector manifest: ${manifestKey}`);
@@ -4385,6 +4560,12 @@ export async function verifyObservationConnectorHistory({
     let childRows = 0;
     let childBytes = 0;
     for (const file of files) {
+      assertBudget(runtime, "observation_history_part_verification", {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        pollutant_code: pollutantCode,
+        part_key: file?.key || null,
+      }, PHASE_B_STAGE_MIN_MS.observation_segment);
       const fileKey = String(file?.key || "").trim();
       const expectedPrefix = childKey.slice(0, -"manifest.json".length);
       if (!fileKey.startsWith(expectedPrefix) || !fileKey.endsWith(".parquet")) {
@@ -4433,21 +4614,27 @@ export async function verifyObservationConnectorHistory({
     );
   }
 
-  const indexSummary = await updateR2HistoryIndexesTargeted({
-    env: {
-      ...process.env,
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: HISTORY_R2_V2_OBSERVATIONS_PREFIX,
-    },
-    r2: runtime.r2,
-    historyVersion: "v2",
-    domains: ["observations"],
-    fromDayUtc: dayUtc,
-    toDayUtc: dayUtc,
-    connectorId,
-    connectorManifestKey: manifestKey,
-    updateLatestIndex: false,
-    strictMissingTimeseriesCounts: true,
-    writeR2: true,
+  const indexSummary = await runBudgetedPhaseBStage({
+    runtime,
+    operation: "observation_index",
+    fields: { day_utc: dayUtc, connector_id: connectorId },
+    minMs: PHASE_B_STAGE_MIN_MS.observation_index,
+    adapter: async () => await updateR2HistoryIndexesTargeted({
+      env: {
+        ...process.env,
+        UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: HISTORY_R2_V2_OBSERVATIONS_PREFIX,
+      },
+      r2: runtime.r2,
+      historyVersion: "v2",
+      domains: ["observations"],
+      fromDayUtc: dayUtc,
+      toDayUtc: dayUtc,
+      connectorId,
+      connectorManifestKey: manifestKey,
+      updateLatestIndex: false,
+      strictMissingTimeseriesCounts: true,
+      writeR2: true,
+    }),
   });
   const indexResult = indexSummary.observations_timeseries;
   if (
@@ -4597,6 +4784,12 @@ async function exportPruneComparisonToDropbox({
   const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
   const comparisonRoot = buildPruneComparisonBasePath({ runtime, dayUtc, connectorId });
   const comparisonQuery = buildPruneComparisonRowsQuery({ runtime, connectorId, dayStart, dayEnd });
+  assertBudget(runtime, "dropbox_comparison", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+  }, PHASE_B_STAGE_MIN_MS.dropbox_comparison);
+  const externalTimeoutMs = Math.max(1, (remainingBudgetMs(runtime) ?? 600_000) - 1_000);
+  const externalSignal = AbortSignal.timeout(externalTimeoutMs);
 
   logStructured("INFO", "phase_b_history_prune_check_dropbox_filter", {
     run_id: runtime.run_id,
@@ -4607,7 +4800,7 @@ async function exportPruneComparisonToDropbox({
     comparison_pollutant_codes: comparisonQuery.comparison_pollutant_codes,
   });
 
-  const accessToken = await dropboxRefreshAccessToken(runtime.dropbox);
+  const accessToken = await dropboxRefreshAccessToken(runtime.dropbox, { signal: externalSignal });
   const committedParts = [];
   let observedRows = 0n;
   let totalBytes = 0n;
@@ -4625,6 +4818,11 @@ async function exportPruneComparisonToDropbox({
       }
       const rows = pendingRows;
       pendingRows = [];
+      assertBudget(runtime, "dropbox_comparison_upload", {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        part_index: partIndex,
+      }, PHASE_B_STAGE_MIN_MS.dropbox_comparison);
       const parquetBuffer = rowsToParquetBuffer(
         rows,
         parquetWriterProperties(runtime.observations_row_group_size),
@@ -4635,6 +4833,7 @@ async function exportPruneComparisonToDropbox({
         accessToken,
         path: dropboxPath,
         body: parquetBuffer,
+        signal: externalSignal,
       });
 
       const partSummary = summarizeObservationPartRows(rows);
@@ -4657,6 +4856,11 @@ async function exportPruneComparisonToDropbox({
 
     try {
       for (;;) {
+        assertBudget(runtime, "dropbox_comparison_fetch", {
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          part_index: partIndex,
+        }, PHASE_B_STAGE_MIN_MS.observation_segment);
         const rows = await cursorRead(cursor, runtime.cursor_fetch_rows);
         if (!rows.length) {
           break;
@@ -4679,7 +4883,7 @@ async function exportPruneComparisonToDropbox({
     } finally {
       await closeCursor(cursor);
     }
-  });
+  }, { statementTimeoutMs: Math.max(1, externalTimeoutMs) });
 
   const comparisonManifestBase = createConnectorManifest({
     dayUtc,
@@ -4727,18 +4931,21 @@ async function exportPruneComparisonToDropbox({
     path: `${comparisonRoot}/prune_manifest.json`,
     body: Buffer.from(JSON.stringify(pruneManifest, null, 2), "utf8"),
     contentType: "application/json",
+    signal: externalSignal,
   });
   await uploadBytesToDropbox({
     accessToken,
     path: `${comparisonRoot}/adopted_r2_manifest.json`,
     body: Buffer.from(JSON.stringify(adoptedManifest, null, 2), "utf8"),
     contentType: "application/json",
+    signal: externalSignal,
   });
   await uploadBytesToDropbox({
     accessToken,
     path: `${comparisonRoot}/comparison_context.json`,
     body: Buffer.from(JSON.stringify(comparisonContext, null, 2), "utf8"),
     contentType: "application/json",
+    signal: externalSignal,
   });
 
   logStructured("INFO", "phase_b_history_prune_check_dropbox_export_complete", {
@@ -4833,6 +5040,10 @@ async function maybeAdoptExistingConnectorManifest({
           logStructured,
         });
       } catch (error) {
+        rethrowIfBudgetDeadlineReached(runtime, error, "dropbox_comparison", {
+          day_utc: dayUtc,
+          connector_id: connectorId,
+        });
         const message = error instanceof Error ? error.message : String(error);
         logPhaseB(runtime, "ERROR", "phase_b_history_dropbox_check_failed", {
           day_utc: dayUtc,
@@ -4897,6 +5108,10 @@ async function ensureConnectorPruneComparison({
       logStructured,
     });
   } catch (error) {
+    rethrowIfBudgetDeadlineReached(runtime, error, "dropbox_comparison", {
+      day_utc: candidate.day_utc,
+      connector_id: candidate.connector_id,
+    });
     logPhaseB(runtime, "ERROR", "phase_b_history_dropbox_check_failed", {
       day_utc: candidate.day_utc,
       connector_id: candidate.connector_id,
@@ -5136,6 +5351,12 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
       for (const [pollutantCode, pollutantRows] of groupedRows) {
         const partSummary = summarizeAqilevelPartRows(pollutantRows);
         const writeProfilePart = async ({ prefix, profile, toParquetBuffer, targetFileEntries }) => {
+          assertBudget(runtime, "aqi_object_write", {
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            pollutant_code: pollutantCode,
+            profile,
+          }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
           const partKey = buildHistoryV2PartKey(prefix, dayUtc, connectorId, pollutantCode, partIndex);
           const parquetBuffer = toParquetBuffer(
             pollutantRows,
@@ -5313,6 +5534,12 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
         partsByPollutant.get(pollutantCode).push(fileEntry);
       }
       for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+        assertBudget(runtime, "aqi_object_write", {
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          pollutant_code: pollutantCode,
+          profile,
+        }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
         const pollutantManifestKey = buildHistoryV2PollutantManifestKey(prefix, dayUtc, connectorId, pollutantCode);
         const pollutantManifest = createHistoryV2PollutantManifest({
           domain: "aqilevels", grain: HISTORY_AQILEVELS_GRAIN, profile, dayUtc, connectorId, pollutantCode,
@@ -5353,6 +5580,11 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
       backedUpAtUtc,
     });
   }
+  assertBudget(runtime, "aqi_object_write", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    profile: "connector_manifest",
+  }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
   await r2PutObject({
     r2: runtime.r2,
     key: connectorManifestKey,
@@ -5366,6 +5598,11 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
   }
 
   if (runtime.history_write_version === "v2") {
+    assertBudget(runtime, "aqi_object_write", {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      profile: "debug_connector_manifest",
+    }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
     await r2PutObject({ r2: runtime.r2, key: debugConnectorManifestKey, body: Buffer.from(JSON.stringify(debugConnectorManifest, null, 2), "utf8"), content_type: "application/json" });
     const debugManifestHead = await r2HeadObject({ r2: runtime.r2, key: debugConnectorManifestKey });
     if (!debugManifestHead.exists) {
@@ -5443,6 +5680,7 @@ async function exportAqilevelDayToR2({ runtime, dayUtc }) {
     }
   }
 
+  assertBudget(runtime, "aqi_day_manifest", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.aqi_index);
   const backedUpAtUtc = nowIso();
   const dayManifestKey = buildDayManifestKey(runtime.aqilevels_prefix, dayUtc);
   const dayManifest = runtime.history_write_version === "v2"
@@ -5584,6 +5822,8 @@ export function summarizeFrozenObservationSourceForAqi({ rows = [], dayUtc, maxR
 async function runAqilevelsBackup({ runtime, latestEligibleDayUtc, dryRun, logStructured }) {
   const summary = {
     enabled: true,
+    status: "completed",
+    stopped_for_budget: false,
     dry_run: dryRun,
     latest_eligible_day_utc: latestEligibleDayUtc,
     pending_days: 0,
@@ -5627,7 +5867,7 @@ async function runAqilevelsBackup({ runtime, latestEligibleDayUtc, dryRun, logSt
       runtime,
       latestEligibleDayUtc,
     });
-  });
+  }, { statementTimeoutMs: Math.max(1, (remainingBudgetMs(runtime) ?? 600_000) - 1_000) });
 
   summary.pending_days = pendingDays.length;
   summary.pending_preview = pendingDays.slice(0, 25);
@@ -5646,6 +5886,7 @@ async function runAqilevelsBackup({ runtime, latestEligibleDayUtc, dryRun, logSt
   for (const dayUtc of pendingDays) {
     const startedAtMs = Date.now();
     try {
+      assertBudget(runtime, "legacy_aqilevels_day", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
       const dayResult = await exportAqilevelDayToR2({
         runtime,
         dayUtc,
@@ -5682,6 +5923,16 @@ async function runAqilevelsBackup({ runtime, latestEligibleDayUtc, dryRun, logSt
         duration_ms: Math.max(0, Date.now() - startedAtMs),
       });
     } catch (error) {
+      if (error instanceof PhaseBHistoryBudgetExhaustedError) {
+        summary.status = "stopped_budget";
+        summary.stopped_for_budget = true;
+        summary.budget_stop = {
+          operation: error.operation || "legacy_aqilevels_day",
+          day_utc: dayUtc,
+          ...budgetSnapshot(runtime),
+        };
+        break;
+      }
       const message = error instanceof Error ? error.message : String(error);
       summary.failed_days += 1;
       summary.failures.push({
@@ -5905,6 +6156,7 @@ export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManife
   if (requiredTargets.length === 0 && (!Array.isArray(connectorManifests) || connectorManifests.length === 0 || !hasRequiredR2Config(runtime.r2))) {
     return { required: false, reason: "no_supported_aqi_source" };
   }
+  assertBudget(runtime, "aqi_index", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.aqi_index);
   const summary = await updateR2HistoryIndexesTargeted({
     env: buildAqilevelIndexEnv(runtime),
     r2: runtime.r2,
@@ -5944,6 +6196,7 @@ export async function verifyAqilevelDayIndexes({ runtime, dayUtc, connectorManif
   if (requiredTargets.length === 0) {
     return { required: false, reason: "no_supported_aqi_source" };
   }
+  assertBudget(runtime, "aqi_index_verify", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.aqi_index);
   const buildResult = Array.isArray(indexBuild?.summary?.results)
     ? indexBuild.summary.results.find((entry) => entry?.history_version === "v2" && entry?.domain === "aqilevels")
     : null;
@@ -5960,6 +6213,11 @@ export async function verifyAqilevelDayIndexes({ runtime, dayUtc, connectorManif
   );
   const failures = [];
   for (const target of requiredTargets) {
+    assertBudget(runtime, "aqi_index_verify", {
+      day_utc: dayUtc,
+      connector_id: target.connector_id,
+      pollutant_code: target.pollutant_code,
+    }, PHASE_B_STAGE_MIN_MS.aqi_index);
     if (buildResult && !buildKeys.has(target.index_key)) {
       failures.push(`${target.index_key}: not reported by current targeted build`);
       continue;
@@ -6024,8 +6282,14 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
     };
   }
 
+  assertBudget(runtime, "day_finalization", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.day_finalization);
+
   const connectorManifests = [];
   for (const candidate of dayCandidates) {
+    assertBudget(runtime, "day_finalization", {
+      day_utc: dayUtc,
+      connector_id: candidate.connector_id,
+    }, PHASE_B_STAGE_MIN_MS.day_finalization);
     if (!candidate.manifest_key) {
       throw new Error(`Missing connector manifest_key for day=${dayUtc} connector=${candidate.connector_id}`);
     }
@@ -6467,6 +6731,8 @@ export async function runPhaseBBackup({
   const window = dayWindowFromNow(nowUtc, ingestRetentionDays);
   const summary = {
     enabled: true,
+    status: "completed",
+    stopped_for_budget: false,
     run_id: runId,
     now_utc: window.now_utc,
     ingest_retention_days: window.ingest_retention_days,
@@ -6483,6 +6749,10 @@ export async function runPhaseBBackup({
     connector_gate_existing_candidates_checked: 0,
     connector_gate_existing_candidates_completed: 0,
     connector_gate_existing_candidates_failed: 0,
+    active_scope_adoption_attempted: 0,
+    active_scope_adoption_completed: 0,
+    active_scope_adoption_blocked: 0,
+    historical_adoption_skipped: true,
     total_written_rows: "0",
     total_written_bytes: "0",
     completed_days: 0,
@@ -6546,6 +6816,10 @@ export async function runPhaseBBackup({
   let totalWrittenBytes = 0n;
 
   await withPgClient(runtime.supabase_db_url, async (controlClient) => {
+    if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
+      stopPhaseBForBudget(summary, runtime, { operation: "candidate_discovery" });
+      return;
+    }
     const upsertedCandidates = await populateBackupCandidates(
       controlClient,
       window.latest_eligible_window_end_utc,
@@ -6578,83 +6852,17 @@ export async function runPhaseBBackup({
       });
     }
 
-    await markIncompleteDaysAsBackupBlocked(controlClient);
-    if (runtime.history_write_version === "v2") {
-      await markIncompleteConnectorCandidatesAsBackupBlocked(controlClient);
+    if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
+      stopPhaseBForBudget(summary, runtime, { operation: "active_scope_gate_preparation" });
+      return;
     }
+    await markActiveIncompleteDaysAsBackupBlocked(controlClient, upsertedCandidates);
 
-    const completeCandidatesMissingGate = runtime.history_write_version === "v2"
-      ? await fetchCompleteCandidatesMissingConnectorGate(
-        controlClient,
-        runtime.max_candidates_per_run,
-      )
-      : [];
-    summary.connector_gate_existing_candidates_checked = completeCandidatesMissingGate.length;
-    if (!dryRun) {
-      for (const candidate of completeCandidatesMissingGate) {
-        try {
-          await setConnectorDayGateIncomplete(controlClient, {
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-          });
-          const manifestKey = canonicalObservationConnectorManifestKey(
-            candidate.day_utc,
-            candidate.connector_id,
-          );
-          const evidence = await verifyObservationConnectorHistory({
-            runtime,
-            dayUtc: candidate.day_utc,
-            connectorId: candidate.connector_id,
-            manifestKey,
-            expectedRowCount: candidate.expected_row_count,
-          });
-          const comparison = await ensureConnectorPruneComparison({
-            candidate,
-            runtime,
-            manifestKey,
-            manifest: evidence.connector_manifest,
-            logStructured,
-          });
-          await setConnectorDayGateComplete(controlClient, {
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            history_run_id: runId,
-            history_manifest_key: evidence.history_manifest_key,
-            history_manifest_hash: evidence.history_manifest_hash,
-            history_row_count: evidence.history_row_count,
-            history_file_count: evidence.history_file_count,
-            history_total_bytes: evidence.history_total_bytes,
-            completion_source: "prune_daily_phase_b",
-          });
-          summary.connector_gate_existing_candidates_completed += 1;
-          if (comparison) summary.prune_check_dropbox_exports += 1;
-          logStructured("INFO", "phase_b_history_existing_connector_gate_completed", {
-            run_id: runId,
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            manifest_key: evidence.history_manifest_key,
-            manifest_hash: evidence.history_manifest_hash,
-            connector_index_count: evidence.connector_index_count,
-          });
-        } catch (error) {
-          summary.connector_gate_existing_candidates_failed += 1;
-          summary.adoption_failures.push({
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            run_id: runId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          logStructured("WARNING", "phase_b_history_existing_connector_gate_blocked", {
-            run_id: runId,
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            ...errorLogFields(error),
-          });
-        }
-      }
-    }
-
-    const pendingCandidates = await fetchPendingCandidates(controlClient, runtime.max_candidates_per_run);
+    const pendingCandidates = await fetchPendingCandidates(
+      controlClient,
+      upsertedCandidates,
+      runtime.max_candidates_per_run,
+    );
     summary.pending_candidates = pendingCandidates.length;
 
     if (dryRun) {
@@ -6685,7 +6893,7 @@ export async function runPhaseBBackup({
 
     for (let candidateIndex = 0; candidateIndex < pendingCandidates.length; candidateIndex += 1) {
       const candidate = pendingCandidates[candidateIndex];
-      if (!hasBudgetFor(runtime, 60_000)) {
+      if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
         logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
           operation: "candidate_start",
           day_utc: candidate.day_utc,
@@ -6693,6 +6901,7 @@ export async function runPhaseBBackup({
           candidate_index: candidateIndex,
           candidate_count: pendingCandidates.length,
         });
+        stopPhaseBForBudget(summary, runtime, { operation: "candidate_start", candidate });
         break;
       }
       summary.processed_candidates += 1;
@@ -6710,6 +6919,7 @@ export async function runPhaseBBackup({
       }
 
       const startedAtMs = Date.now();
+      let connectorGateCompleted = false;
       try {
         if (runtime.history_write_version === "v2") {
           await setConnectorDayGateIncomplete(controlClient, {
@@ -6777,6 +6987,7 @@ export async function runPhaseBBackup({
             historyFileCount: connectorGateEvidence.history_file_count,
             historyTotalBytes: connectorGateEvidence.history_total_bytes,
           });
+          connectorGateCompleted = true;
           exportResult.written_row_count = BigInt(connectorGateEvidence.history_row_count);
           exportResult.file_count = connectorGateEvidence.history_file_count;
           exportResult.total_bytes = BigInt(connectorGateEvidence.history_total_bytes);
@@ -6863,8 +7074,52 @@ export async function runPhaseBBackup({
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof PhaseBHistoryBudgetExhaustedError) {
+          if (!connectorGateCompleted) {
+            try {
+              if (runtime.history_write_version === "v2") {
+                await cleanupCandidatePartialOutput({
+                  runtime,
+                  dayUtc: candidate.day_utc,
+                  connectorId: candidate.connector_id,
+                });
+              }
+            } catch (cleanupError) {
+              logPhaseB(runtime, "ERROR", "phase_b_history_partial_cleanup_failed", {
+                day_utc: candidate.day_utc,
+                connector_id: candidate.connector_id,
+                ...errorLogFields(cleanupError),
+              });
+            }
+            await markCandidateStoppedForBudget(controlClient, {
+              dayUtc: candidate.day_utc,
+              connectorId: candidate.connector_id,
+              runId,
+              errorText: message,
+              clearCheckpoint: runtime.history_write_version === "v2",
+            });
+          }
+          await updateDayGateBlocked(controlClient, candidate.day_utc);
+          dayResults.set(candidate.day_utc, {
+            day_utc: candidate.day_utc,
+            history_done: false,
+            pending_connectors: connectorGateCompleted ? 0 : 1,
+            reason: "phase_b_history_budget_exhausted",
+          });
+          stopPhaseBForBudget(summary, runtime, {
+            operation: error.operation || "candidate_work",
+            candidate,
+          });
+          logPhaseB(runtime, "WARNING", "phase_b_history_stopped_budget", {
+            operation: summary.budget_stop.operation,
+            day_utc: candidate.day_utc,
+            connector_id: candidate.connector_id,
+            connector_gate_preserved: connectorGateCompleted,
+          });
+          break;
+        }
         try {
-          if (runtime.history_write_version === "v2") {
+          if (runtime.history_write_version === "v2" && !connectorGateCompleted) {
             await cleanupCandidatePartialOutput({
               runtime,
               dayUtc: candidate.day_utc,
@@ -6878,12 +7133,14 @@ export async function runPhaseBBackup({
             ...errorLogFields(cleanupError),
           });
         }
-        await markCandidateFailed(controlClient, {
-          dayUtc: candidate.day_utc,
-          connectorId: candidate.connector_id,
-          runId,
-          errorText: message,
-        });
+        if (!connectorGateCompleted) {
+          await markCandidateFailed(controlClient, {
+            dayUtc: candidate.day_utc,
+            connectorId: candidate.connector_id,
+            runId,
+            errorText: message,
+          });
+        }
         const dayState = await finalizeDayGateIfReady({
           client: controlClient,
           runtime,
@@ -6920,14 +7177,97 @@ export async function runPhaseBBackup({
           next_action: "retry_safe",
           prune_blocked_for_day: true,
         });
-        if (error instanceof PhaseBHistoryBudgetExhaustedError) {
-          break;
+      }
+    }
+
+    if (runtime.history_write_version === "v2" && summary.status !== "stopped_budget") {
+      if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.active_scope_adoption)) {
+        stopPhaseBForBudget(summary, runtime, { operation: "active_scope_adoption_query" });
+      } else {
+        const activeCompleteCandidatesMissingGate = await fetchActiveCompleteCandidatesMissingConnectorGate(
+          controlClient,
+          upsertedCandidates,
+          runtime.max_candidates_per_run,
+        );
+        summary.connector_gate_existing_candidates_checked = activeCompleteCandidatesMissingGate.length;
+        summary.active_scope_adoption_attempted = activeCompleteCandidatesMissingGate.length;
+        for (const candidate of activeCompleteCandidatesMissingGate) {
+          try {
+            assertBudget(runtime, "active_scope_adoption", {
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+            }, PHASE_B_STAGE_MIN_MS.active_scope_adoption);
+            await setConnectorDayGateIncomplete(controlClient, {
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+            });
+            const manifestKey = canonicalObservationConnectorManifestKey(
+              candidate.day_utc,
+              candidate.connector_id,
+            );
+            const evidence = await verifyObservationConnectorHistory({
+              runtime,
+              dayUtc: candidate.day_utc,
+              connectorId: candidate.connector_id,
+              manifestKey,
+              expectedRowCount: candidate.expected_row_count,
+            });
+            const comparison = await ensureConnectorPruneComparison({
+              candidate,
+              runtime,
+              manifestKey,
+              manifest: evidence.connector_manifest,
+              logStructured,
+            });
+            await setConnectorDayGateComplete(controlClient, {
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+              history_run_id: runId,
+              history_manifest_key: evidence.history_manifest_key,
+              history_manifest_hash: evidence.history_manifest_hash,
+              history_row_count: evidence.history_row_count,
+              history_file_count: evidence.history_file_count,
+              history_total_bytes: evidence.history_total_bytes,
+              completion_source: "prune_daily_phase_b",
+            });
+            summary.connector_gate_existing_candidates_completed += 1;
+            summary.active_scope_adoption_completed += 1;
+            if (comparison) summary.prune_check_dropbox_exports += 1;
+          } catch (error) {
+            if (error instanceof PhaseBHistoryBudgetExhaustedError) {
+              stopPhaseBForBudget(summary, runtime, {
+                operation: error.operation || "active_scope_adoption",
+                candidate,
+              });
+              break;
+            }
+            summary.connector_gate_existing_candidates_failed += 1;
+            summary.active_scope_adoption_blocked += 1;
+            summary.adoption_failures.push({
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+              run_id: runId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
       }
     }
   });
 
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
+  logStructured("INFO", "phase_b_history_active_scope_adoption_summary", {
+    run_id: runId,
+    active_scope_adoption_attempted: summary.active_scope_adoption_attempted,
+    active_scope_adoption_completed: summary.active_scope_adoption_completed,
+    active_scope_adoption_blocked: summary.active_scope_adoption_blocked,
+    stopped_for_budget: summary.status === "stopped_budget",
+    historical_adoption_skipped: true,
+    blocked_preview: summary.adoption_failures.slice(0, 10),
+  });
+
+  if (summary.status === "stopped_budget") {
+    summary.aqilevels = { skipped: true, reason: "phase_b_history_budget_exhausted" };
+  } else if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
     summary.aqilevels = {
       enabled: true,
       source_mode: "frozen_observations_per_candidate",
@@ -6943,12 +7283,18 @@ export async function runPhaseBBackup({
       dryRun,
       logStructured,
     });
+    if (summary.aqilevels?.status === "stopped_budget") {
+      stopPhaseBForBudget(summary, runtime, {
+        operation: summary.aqilevels.budget_stop?.operation || "legacy_aqilevels_backup",
+      });
+    }
   } else if (!runtime.phase_b_legacy_aqi_rpc_export_enabled) {
     summary.aqilevels = { skipped: true, reason: "legacy_aqi_rpc_export_disabled" };
   } else {
     logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
       operation: "aqilevels_backup_start",
     });
+    stopPhaseBForBudget(summary, runtime, { operation: "aqilevels_backup_start" });
     summary.aqilevels = { skipped: true, reason: "phase_b_history_budget_exhausted" };
   }
 
@@ -6968,11 +7314,21 @@ export async function runPhaseBBackup({
   summary.adoption_failures = summary.adoption_failures.slice(0, 25);
   summary.failures = summary.failures.slice(0, 25);
 
-  const cleanupSummary = await cleanupStaging({ runtime, logStructured });
+  const cleanupSummary = summary.status === "stopped_budget"
+    ? { skipped: true, reason: "reserved_for_final_reporting" }
+    : await cleanupStaging({ runtime, logStructured });
   summary.staging_cleanup = cleanupSummary;
 
-  const runManifestKey = await writeRunManifest({ runtime, runSummary: summary });
-  summary.run_manifest_key = runManifestKey;
+  try {
+    summary.run_manifest_key = await writeRunManifest({ runtime, runSummary: summary });
+  } catch (error) {
+    if (summary.status !== "stopped_budget") throw error;
+    summary.run_manifest_key = null;
+    summary.run_manifest_error = error instanceof Error ? error.message : String(error);
+    logPhaseB(runtime, "WARNING", "phase_b_history_run_manifest_failed_after_budget_stop", {
+      ...errorLogFields(error),
+    });
+  }
 
   if (runtime.prune_check_dropbox?.enabled) {
     logStructured("INFO", "phase_b_history_prune_check_summary", {
