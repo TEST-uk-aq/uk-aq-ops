@@ -10,6 +10,7 @@ This area governs:
 - scheduled Integrity daily date selection;
 - the active Prune Daily Phase B observation and AQI history write pipeline;
 - connector-day observation deletion gates and aggregate whole-day completion gates;
+- physical Parquet identity validation before connector-day deletion gates are completed;
 - observation content hashing and verification-status preservation;
 - targeted v2 index generation and repair gates.
 
@@ -31,12 +32,14 @@ For Integrity changes, also read:
 
 - [`integrity.md`](integrity.md);
 - [`prune_connector_day_gate.md`](prune_connector_day_gate.md) where a real repair can establish or invalidate prune eligibility;
+- [`connector_gate_file_identity.md`](connector_gate_file_identity.md) where a real repair or recovery operation verifies physical Parquet identity and opaque preserved children before completing a deletion gate;
 - [`daily_profile_selection.md`](daily_profile_selection.md) where scheduled selection is involved.
 
 For Prune Daily Phase B observation/AQI writes and IngestDB deletion safety, also read:
 
 - [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md);
-- [`prune_connector_day_gate.md`](prune_connector_day_gate.md).
+- [`prune_connector_day_gate.md`](prune_connector_day_gate.md);
+- [`connector_gate_file_identity.md`](connector_gate_file_identity.md).
 
 For calculated station-chart AQI and website display, also read:
 
@@ -101,7 +104,7 @@ Required behaviour includes:
 
 ## Prune deletion gate model
 
-The authoritative gate split is defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md).
+The authoritative gate split is defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md). Physical Parquet identity and opaque-child gate validation are defined in [`connector_gate_file_identity.md`](connector_gate_file_identity.md).
 
 Required behaviour includes:
 
@@ -110,6 +113,8 @@ Required behaviour includes:
 - the existing day gate remains the aggregate whole-day completion gate;
 - a day gate cannot substitute for missing connector-level evidence;
 - Prune Daily Phase B and real Integrity repair may establish connector-level completion only after verified live R2 observation history and required observation indexes exist;
+- every referenced Parquet must match both its recorded byte count and its unambiguous SHA-256 or quoted R2 ETag identity before the gate becomes complete;
+- Integrity applies full logical validation to `pm25`, `pm10`, `no2` and `o3`, while preserved out-of-scope children still require structural manifest, physical file identity and targeted-index proof;
 - check-only and dry-run Integrity modes cannot change prune eligibility.
 
 ## AQI writer source boundary
@@ -135,6 +140,7 @@ Unknown, ambiguous or contradictory identity remains fail-closed.
 - `scripts/backup_r2/uk_aq_reconcile_r2_timeseries_bindings.mjs`
 - `workers/shared/uk_aq_r2_history_index.mjs`
 - `workers/shared/uk_aq_observation_content_hash.mjs`
+- `workers/shared/uk_aq_r2_file_identity.mjs`
 - `workers/uk_aq_observs_history_r2_api_worker/`
 - `workers/uk_aq_aqi_history_r2_api_worker/`
 - `workers/uk_aq_cache_proxy/src/station_history/`
