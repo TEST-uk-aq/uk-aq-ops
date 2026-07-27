@@ -156,9 +156,11 @@ A broader history-version helper may retain v1 support for an explicitly documen
 
 ## Integrity boundary-preflight call order
 
-For every Integrity mode, the request-wide earliest-IngestDB-day check is a hard precondition.
+For every Integrity mode, the request-wide earliest-IngestDB-day check is a hard precondition before backup validation, source work, comparison or R2 work.
 
-After argument and local configuration validation sufficient to connect to the operational database, the boundary check MUST complete before:
+### Explicitly scoped requests
+
+For a request whose date scope is supplied directly by arguments or another already-resolved input, the boundary check MUST complete after argument and local configuration validation sufficient to connect to the operational database and before:
 
 - Dropbox readiness or mirror inspection;
 - source-cache inspection or source acquisition;
@@ -169,7 +171,40 @@ After argument and local configuration validation sufficient to connect to the o
 - canonical apply;
 - any live R2 mutation.
 
-If any requested connector overlaps its boundary, the complete request exits with all blockers and none of those later adapters is called.
+### Automatic `daily` profile scope discovery
+
+The `daily` profile cannot evaluate the boundary until it has constructed its exact requested date set under [`daily_profile_selection.md`](daily_profile_selection.md).
+
+The following narrow local scope-discovery work is therefore permitted before the boundary check:
+
+1. list only the direct child names under the configured local Dropbox mirror path for `history/v2/observations`;
+2. accept only names strictly matching `day_utc=YYYY-MM-DD`;
+3. derive the latest represented day and represented historical months from those names only;
+4. read only the local Integrity SQLite `daily_profile_state` rows needed to calculate missed logical-date catch-up;
+5. construct and de-duplicate the exact selected UTC date set and its reasons;
+6. derive the request start and end dates used by the boundary check.
+
+This exception is scope construction only. Before the boundary passes, the daily profile MUST NOT:
+
+- run general Dropbox readiness, freshness, inventory or placeholder checks;
+- open, parse, hash or validate any Dropbox manifest, Parquet or other history object;
+- inspect connector or pollutant child directories;
+- inspect source-cache files beyond configuration needed to locate later stages;
+- enumerate or download authoritative source files;
+- read live R2;
+- compare source with the Dropbox mirror;
+- create findings or proposals;
+- apply a repair or migration.
+
+Directory metadata beyond what the operating system needs to enumerate the direct child names is not date-selection evidence. The selected scope and reasons may be held in memory until the boundary passes. The run MUST NOT mark daily-profile catch-up state complete or caught up during pre-boundary scope discovery.
+
+After the exact daily scope is known, the request-wide boundary check MUST run for the complete requested connector set. Only after it succeeds may normal Dropbox readiness and all later Integrity stages begin.
+
+If automatic daily scope discovery cannot determine a valid exact selection, the run fails before the boundary rather than inventing a range.
+
+### Boundary failure
+
+If any requested connector overlaps its boundary, the complete request exits with all blockers and none of the prohibited later adapters is called.
 
 The boundary is queried once for the complete requested connector set. A second routine pre-write query is not required under the continuous-boundary invariant.
 
@@ -184,7 +219,9 @@ Before deployment, only the smallest directly relevant deterministic checks are 
 - deletion-gate reads require `completion_source=prune_daily_phase_b` and complete count evidence;
 - aggregate day totals are derived from the final merged connector set when the day gate is retained;
 - the active Phase B AQI path cannot execute a v1 writer branch;
-- a blocked Integrity boundary exits before Dropbox, source or R2 adapters are called.
+- an explicitly scoped boundary failure exits before any Dropbox, source or R2 adapter is called;
+- automatic daily scope discovery performs only permitted direct-name and `daily_profile_state` reads before the boundary;
+- after daily scope construction, a boundary failure prevents Dropbox readiness, content inspection, source and R2 stages.
 
 Run syntax, import and SQL-structure checks needed to establish viability. Do not add a broad speculative pre-deployment test suite.
 
@@ -192,11 +229,12 @@ Run syntax, import and SQL-structure checks needed to establish viability. Do no
 
 After deployment, validate through real TEST operation:
 
-1. run a boundary-blocked Integrity request and confirm no Dropbox, source or R2 work starts;
-2. run Prune Daily and Integrity concurrently on non-conflicting connector-days;
-3. confirm a same-connector-day conflict fails closed through the shared lock;
-4. confirm an existing connector is preserved when another connector is added to the same day;
-5. confirm only exact affected days and connector/pollutant indexes are updated;
-6. confirm only a valid `prune_daily_phase_b` connector gate authorises IngestDB deletion;
-7. confirm AQI failure remains separate from verified observation pruning;
-8. confirm retained aggregate day metadata matches the complete merged day manifest.
+1. run a boundary-blocked explicitly scoped Integrity request and confirm no Dropbox, source or R2 work starts;
+2. run a boundary-blocked automatic daily request and confirm only scope discovery occurs before the block;
+3. run Prune Daily and Integrity concurrently on non-conflicting connector-days;
+4. confirm a same-connector-day conflict fails closed through the shared lock;
+5. confirm an existing connector is preserved when another connector is added to the same day;
+6. confirm only exact affected days and connector/pollutant indexes are updated;
+7. confirm only a valid `prune_daily_phase_b` connector gate authorises IngestDB deletion;
+8. confirm AQI failure remains separate from verified observation pruning;
+9. confirm retained aggregate day metadata matches the complete merged day manifest.
