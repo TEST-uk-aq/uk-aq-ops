@@ -13,8 +13,10 @@ This area governs:
 - connector-day, day-finalisation and global-index advisory locks;
 - Supabase project isolation and database-local advisory-lock identity;
 - the shared canonical R2 v2 connector-day writer and parent finalisers;
+- exact sparse affected-day index finalisation without intervening-range expansion;
 - the active Prune Daily Phase B observation and observation-derived AQI history write pipeline;
 - connector-day observation deletion gates and aggregate whole-day completion gates;
+- Prune Daily-only deletion authority and deletion-time completion-source/count validation;
 - physical Parquet identity validation before connector-day deletion gates are completed;
 - observation content hashing and verification-status preservation;
 - targeted v2 index generation and repair gates.
@@ -38,6 +40,7 @@ For Integrity changes, also read:
 - [`integrity.md`](integrity.md);
 - [`history_writer_coordination.md`](history_writer_coordination.md) for the request-level IngestDB boundary, shared writer and lock hierarchy;
 - [`lock_environment_boundary.md`](lock_environment_boundary.md) for the authoritative Supabase-project boundary and lock-key inputs;
+- [`implementation_safety_contract.md`](implementation_safety_contract.md) for exact affected-day finalisation, shared-writer compliance, deletion-gate validation and active v2-only AQI enforcement;
 - [`prune_connector_day_gate.md`](prune_connector_day_gate.md) for the Prune Daily-only observation deletion gate;
 - [`connector_gate_file_identity.md`](connector_gate_file_identity.md) for physical Parquet identity validation used by Prune Daily gate completion and explicit recovery verification;
 - [`daily_profile_selection.md`](daily_profile_selection.md) where scheduled selection is involved.
@@ -46,6 +49,7 @@ For Prune Daily Phase B observation/AQI writes and IngestDB deletion safety, als
 
 - [`history_writer_coordination.md`](history_writer_coordination.md);
 - [`lock_environment_boundary.md`](lock_environment_boundary.md);
+- [`implementation_safety_contract.md`](implementation_safety_contract.md);
 - [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md);
 - [`prune_connector_day_gate.md`](prune_connector_day_gate.md);
 - [`connector_gate_file_identity.md`](connector_gate_file_identity.md).
@@ -98,7 +102,8 @@ The current observation-content-hash and verification-status contracts are joint
 
 - [`integrity.md`](integrity.md) for source normalisation, comparison, fault classification, planning, repair and post-repair verification;
 - [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md) for the normal Phase B writer, canonical Parquet schema and manifest publication;
-- [`history_writer_coordination.md`](history_writer_coordination.md) for shared writer ownership and concurrent live mutation.
+- [`history_writer_coordination.md`](history_writer_coordination.md) for shared writer ownership and concurrent live mutation;
+- [`implementation_safety_contract.md`](implementation_safety_contract.md) for the requirement that both live mutation paths use the same canonical builders and validators rather than only a common lock wrapper.
 
 Required behaviour includes:
 
@@ -117,7 +122,8 @@ Required behaviour includes:
 The authoritative coordination contracts are:
 
 - [`history_writer_coordination.md`](history_writer_coordination.md);
-- [`lock_environment_boundary.md`](lock_environment_boundary.md), which supersedes any older requirement to include an environment label in the lock key.
+- [`lock_environment_boundary.md`](lock_environment_boundary.md), which supersedes any older requirement to include an environment label in the lock key;
+- [`implementation_safety_contract.md`](implementation_safety_contract.md), which supersedes conflicting implementation assumptions and defines exact affected-day finalisation.
 
 Required behaviour includes:
 
@@ -132,11 +138,13 @@ Required behaviour includes:
 - TEST and LIVE isolation is provided by their separate Supabase projects;
 - environment labels are diagnostic only and are not advisory-lock key input;
 - locks are acquired sequentially and are not nested across those three scopes;
-- day finalisation preserves connectors already present in R2 and does not rebuild a day solely from the current run's connector set.
+- day finalisation preserves connectors already present in R2 and does not rebuild a day solely from the current run's connector set;
+- sparse affected-day sets remain exact and are not expanded into all intervening calendar days;
+- a shared lock wrapper around caller-owned write implementations is not a substitute for one canonical writer implementation.
 
 ## Prune deletion gate model
 
-The authoritative gate split is defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md). Physical Parquet identity validation is defined in [`connector_gate_file_identity.md`](connector_gate_file_identity.md).
+The authoritative gate split is defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md). Physical Parquet identity validation is defined in [`connector_gate_file_identity.md`](connector_gate_file_identity.md). Deletion-time evidence requirements are tightened by [`implementation_safety_contract.md`](implementation_safety_contract.md).
 
 Required behaviour includes:
 
@@ -145,11 +153,14 @@ Required behaviour includes:
 - the existing day gate remains the aggregate whole-day completion gate;
 - a day gate cannot substitute for missing connector-level evidence;
 - only Prune Daily may establish, invalidate or complete connector-day prune gates;
+- deletion authority requires `completion_source=prune_daily_phase_b` and complete valid manifest/count evidence selected and checked at deletion time;
+- Integrity-created, legacy or adoption gate rows are ineligible for deletion even when `history_done=true`;
 - Integrity, migration and generic shared-writer code never update prune gates;
 - historical R2 connector-days with no corresponding IngestDB rows require no prune gate;
 - every referenced Parquet must match its required physical identity before Prune Daily completes the connector gate;
 - AQI success is not required for connector observation pruning;
-- check-only and dry-run Integrity modes cannot change prune eligibility.
+- check-only and dry-run Integrity modes cannot change prune eligibility;
+- if the aggregate day gate is retained, its totals must describe the complete merged day manifest rather than only the current run's candidates.
 
 ## AQI writer source boundary
 
@@ -162,6 +173,7 @@ Required behaviour includes:
 - ObsAQIDB materialised AQI is not a Phase B source or fallback;
 - context rows are not written into the target-day observation partition or previous-day AQI output;
 - the legacy AQI RPC/export selector, aliases, v1 AQI output path and fallback implementation are retired;
+- the active Phase B AQI path requires `UK_AQ_R2_HISTORY_VERSION=v2` and fails closed rather than executing a v1 branch;
 - incomplete or truncated context fails AQI for the affected connector-day;
 - an AQI-only failure does not block or revoke a verified connector observation deletion gate;
 - AQI data, debug, manifest and index completion remain separate aggregate outcomes.
