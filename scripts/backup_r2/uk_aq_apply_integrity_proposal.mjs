@@ -17,11 +17,17 @@ import {
   validateObservationContentHashMetadata,
 } from "../../workers/shared/uk_aq_observation_content_hash.mjs";
 import {
-  connectorDayGateKey,
-  setConnectorDayGateIncomplete,
-  withConnectorDayGateClient,
-} from "../../workers/shared/uk_aq_connector_day_gate.mjs";
-import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_history_index.mjs";
+  runCanonicalConnectorDayWriter,
+  runCanonicalDayFinalizer,
+  runCanonicalGlobalIndexFinalizer,
+  withHistoryWriterClient,
+  mergeConnectorManifestReferences,
+} from "../../workers/shared/uk_aq_r2_history_writer.mjs";
+import { buildHistoryV2DayManifest } from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+import {
+  resolveR2HistoryIndexConfig,
+  updateR2HistoryIndexesTargeted,
+} from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import {
   compressors,
   parquetMetadataAsync,
@@ -459,6 +465,72 @@ async function verifyLiveObservationPartition({
   atomicWriteJson(runStatePath, runState);
 }
 
+async function prepareMergedDayManifest({ r2, object, adapters }) {
+  if (!/\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(object.key)) return;
+  const proposed = JSON.parse(object.body.toString("utf8"));
+  let currentReferences = null;
+  try {
+    const current = JSON.parse((await adapters.getObject({ r2, key: object.key })).body.toString("utf8"));
+    const values = Array.isArray(current?.connector_manifests)
+      ? current.connector_manifests
+      : Array.isArray(current?.child_manifests) ? current.child_manifests : null;
+    if (!values) throw new Error("Current day manifest has no connector references");
+    currentReferences = values.map((entry) => ({
+      connector_id: Number(entry.connector_id),
+      manifest_key: String(entry.manifest_key || ""),
+    }));
+    const dayPrefix = object.key.slice(0, -"manifest.json".length);
+    if (currentReferences.some((entry) =>
+      !Number.isInteger(entry.connector_id) || entry.connector_id <= 0 ||
+      !entry.manifest_key.startsWith(dayPrefix) ||
+      !entry.manifest_key.endsWith(`/connector_id=${entry.connector_id}/manifest.json`)
+    )) {
+      throw new Error("Current day manifest has invalid connector references");
+    }
+  } catch (_error) {
+    const dayPrefix = object.key.slice(0, -"manifest.json".length);
+    const discovered = await adapters.listAllObjects({ r2, prefix: dayPrefix, max_keys: 10_000 });
+    currentReferences = discovered.flatMap((entry) => {
+      const key = String(entry.key || "");
+      const match = key.match(/\/connector_id=([1-9]\d*)\/manifest\.json$/);
+      return match ? [{ connector_id: Number(match[1]), manifest_key: key }] : [];
+    });
+  }
+  const references = (manifest) => {
+    const values = Array.isArray(manifest?.connector_manifests)
+      ? manifest.connector_manifests
+      : Array.isArray(manifest?.child_manifests) ? manifest.child_manifests : [];
+    return values.map((entry) => ({ connector_id: Number(entry.connector_id), manifest_key: String(entry.manifest_key || "") }));
+  };
+  const mergedReferences = mergeConnectorManifestReferences(currentReferences, references(proposed));
+  const connectorManifests = [];
+  for (const reference of mergedReferences) {
+    const child = JSON.parse((await adapters.getObject({ r2, key: reference.manifest_key })).body.toString("utf8"));
+    if (Number(child.connector_id) !== reference.connector_id || child.day_utc !== proposed.day_utc) {
+      throw new Error(`Live connector manifest scope mismatch during day merge: ${reference.manifest_key}`);
+    }
+    connectorManifests.push({ ...child, manifest_key: reference.manifest_key });
+  }
+  const merged = buildHistoryV2DayManifest({
+    domain: proposed.domain,
+    grain: proposed.grain ?? null,
+    profile: proposed.profile ?? null,
+    dayUtc: proposed.day_utc,
+    runId: proposed.run_id,
+    manifestKey: object.key,
+    connectorManifests,
+    writerGitSha: proposed.writer_git_sha ?? null,
+    backedUpAtUtc: proposed.backed_up_at_utc ?? new Date().toISOString(),
+  });
+  object.body = Buffer.from(JSON.stringify(merged, null, 2), "utf8");
+  Object.assign(object.entry, {
+    bytes: object.body.byteLength,
+    sha256: sha256Hex(object.body),
+    day_finalizer_regenerated_from_live_connectors: true,
+    merged_connector_ids: mergedReferences.map((entry) => entry.connector_id),
+  });
+}
+
 export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }) {
   const resolvedAdapters = {
     deleteObjects: adapters.deleteObjects || r2DeleteObjects,
@@ -470,47 +542,44 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
   const proposal = validateLocalProposal(runState);
   const counts = { planned_deletions: proposal.prefixes.length, planned_writes: proposal.objects.length, deleted_objects: 0, completed_deletions: 0, completed_writes: 0, get_verified_writes: 0 };
   runState.apply = { status: "running", started_at_utc: new Date().toISOString(), ...counts };
+  runState.writer_locks = [];
   atomicWriteJson(runStatePath, runState);
   try {
-    const affectedObservationConnectorDays = new Map();
-    for (const item of [...proposal.objects, ...proposal.prefixes]) {
-      if (item.domain !== "observations") continue;
-      const key = String(item.key || item.prefix || "");
-      const match = key.match(/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)/);
-      if (!match) continue;
-      const pair = { day_utc: match[1], connector_id: Number(match[2]) };
-      affectedObservationConnectorDays.set(
-        connectorDayGateKey(pair.day_utc, pair.connector_id),
-        pair,
-      );
-    }
-    if (affectedObservationConnectorDays.size > 0) {
-      if (!adapters.connectorGateClient) {
-        throw new Error("canonical apply requires an IngestDB connector-day gate client");
-      }
-      await adapters.connectorGateClient.query("begin");
-      try {
-        for (const pair of affectedObservationConnectorDays.values()) {
-          await setConnectorDayGateIncomplete(adapters.connectorGateClient, pair);
-        }
-        await adapters.connectorGateClient.query("commit");
-      } catch (error) {
-        await adapters.connectorGateClient.query("rollback");
-        throw error;
-      }
-      runState.connector_day_gate = {
-        status: "invalidated_before_r2_mutation",
-        affected_connector_days: Array.from(affectedObservationConnectorDays.values()),
-        updated_at_utc: new Date().toISOString(),
-      };
-      atomicWriteJson(runStatePath, runState);
-    }
+    const historyWriterClient = adapters.historyWriterClient;
+    if (!historyWriterClient) throw new Error("canonical apply requires one retained PostgreSQL history-writer session");
+    const operations = [];
     for (const domain of ["observations", "aqilevels"]) {
       for (const prefixEntry of proposal.prefixes.filter((entry) => entry.domain === domain)) {
-        counts.deleted_objects += await deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, adapters: resolvedAdapters });
-        counts.completed_deletions += 1;
+        operations.push({ kind: "delete", key: prefixEntry.prefix, prefixEntry });
       }
       for (const object of proposal.objects.filter((entry) => entry.domain === domain)) {
+        operations.push({ kind: "put", key: object.key, object });
+      }
+    }
+    const connectorGroups = new Map();
+    const dayGroups = new Map();
+    const globalOperations = [];
+    for (const operation of operations) {
+      const connectorMatch = operation.key.match(/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)/);
+      const dayMatch = operation.key.match(/day_utc=(\d{4}-\d{2}-\d{2})/);
+      if (connectorMatch) {
+        const groupKey = `${connectorMatch[1]}|${connectorMatch[2]}`;
+        if (!connectorGroups.has(groupKey)) connectorGroups.set(groupKey, { day_utc: connectorMatch[1], connector_id: Number(connectorMatch[2]), operations: [] });
+        connectorGroups.get(groupKey).operations.push(operation);
+      } else if (dayMatch) {
+        if (!dayGroups.has(dayMatch[1])) dayGroups.set(dayMatch[1], []);
+        dayGroups.get(dayMatch[1]).push(operation);
+      } else {
+        globalOperations.push(operation);
+      }
+    }
+    const executeOperation = async (operation) => {
+      if (operation.kind === "delete") {
+        const { prefixEntry } = operation;
+        counts.deleted_objects += await deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, adapters: resolvedAdapters });
+        counts.completed_deletions += 1;
+      } else {
+        const { object } = operation;
         await verifyLiveObservationPartition({
           r2,
           runState,
@@ -522,6 +591,67 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         counts.completed_writes += 1;
         counts.get_verified_writes += 1;
       }
+      atomicWriteJson(runStatePath, runState);
+    };
+    for (const group of Array.from(connectorGroups.values()).sort((left, right) =>
+      left.day_utc.localeCompare(right.day_utc) || left.connector_id - right.connector_id)) {
+      await runCanonicalConnectorDayWriter({
+        client: historyWriterClient,
+        dayUtc: group.day_utc,
+        connectorId: group.connector_id,
+        diagnosticEnvironment: runState.environment,
+        diagnostics: runState.writer_locks,
+        write: async () => {
+          for (const operation of group.operations) await executeOperation(operation);
+          return { operation_count: group.operations.length };
+        },
+        verify: async (written) => ({ ...written, get_verified: true }),
+      });
+    }
+    for (const [dayUtc, dayOperations] of Array.from(dayGroups.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+      await runCanonicalDayFinalizer({
+        client: historyWriterClient,
+        dayUtc,
+        diagnosticEnvironment: runState.environment,
+        diagnostics: runState.writer_locks,
+        finalize: async () => {
+        for (const operation of dayOperations) {
+          if (operation.kind === "put") {
+            await prepareMergedDayManifest({ r2, object: operation.object, adapters: resolvedAdapters });
+          }
+          await executeOperation(operation);
+        }
+          return { operation_count: dayOperations.length };
+        },
+      });
+    }
+    const affectedDays = Array.from(new Set([
+      ...Array.from(connectorGroups.values()).map((group) => group.day_utc),
+      ...dayGroups.keys(),
+    ])).sort();
+    if (globalOperations.length || affectedDays.length) {
+      await runCanonicalGlobalIndexFinalizer({
+        client: historyWriterClient,
+        diagnosticEnvironment: runState.environment,
+        diagnostics: runState.writer_locks,
+        finalize: async () => {
+        for (const operation of globalOperations) await executeOperation(operation);
+        if (affectedDays.length) {
+          runState.global_index_finalization = await updateR2HistoryIndexesTargeted({
+            env: process.env,
+            r2,
+            historyVersion: "v2",
+            domains: ["observations", "aqilevels"],
+            fromDayUtc: affectedDays[0],
+            toDayUtc: affectedDays[affectedDays.length - 1],
+            connectorId: null,
+            updateLatestIndex: true,
+            strictMissingTimeseriesCounts: true,
+            writeR2: true,
+          });
+        }
+        },
+      });
     }
     runState.apply = { ...runState.apply, ...counts, status: "succeeded", finished_at_utc: new Date().toISOString() };
     atomicWriteJson(runStatePath, runState);
@@ -540,13 +670,14 @@ async function main() {
   const config = resolveR2HistoryIndexConfig(process.env);
   if (!hasRequiredR2Config(config.r2)) throw new Error("canonical apply requires complete R2 configuration");
   if (config.r2.bucket !== TEST_BUCKET) throw new Error(`Refusing canonical apply for non-TEST bucket: ${config.r2.bucket || "(unset)"}`);
-  return await withConnectorDayGateClient(
+  return await withHistoryWriterClient(
     process.env.SUPABASE_DB_URL || process.env.DATABASE_URL,
-    async (connectorGateClient) => await applyValidatedProposal({
+    async (historyWriterClient) => await applyValidatedProposal({
       runStatePath,
       r2: config.r2,
-      adapters: { connectorGateClient },
+      adapters: { historyWriterClient },
     }),
+    { applicationName: "uk-aq-integrity-history-writer" },
   );
 }
 

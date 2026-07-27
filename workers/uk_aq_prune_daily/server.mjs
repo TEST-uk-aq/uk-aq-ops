@@ -10,7 +10,6 @@ import {
 import { connectorDayGateKey } from "../shared/uk_aq_connector_day_gate.mjs";
 import { groupFingerprintRechecksByHour } from "./fingerprint_recheck.mjs";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
-import { rebuildR2HistoryIndexes } from "../shared/uk_aq_r2_history_index.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -36,10 +35,6 @@ const LATE_ARRIVAL_DISCOVERY_PAGE_SIZE = 1000;
 const MAX_LATE_ARRIVAL_DISCOVERY_PAGES = 100;
 const MAX_LATE_ARRIVAL_WINDOWS_PER_RUN = 14;
 const RPC_SCHEMA = "uk_aq_public";
-const DEFAULT_CHART_METRICS_RETENTION_DAYS = 90;
-const DEFAULT_CHART_METRICS_DAILY_REFRESH_DAYS = 7;
-const DEFAULT_CHART_METRICS_CLEANUP_RPC = "uk_aq_rpc_chart_load_metrics_cleanup";
-const DEFAULT_CHART_METRICS_DAILY_REFRESH_RPC = "uk_aq_rpc_chart_load_metrics_daily_refresh";
 
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
 const RPC_DELETE_HOUR_BUCKET = "uk_aq_rpc_observations_delete_hour_bucket";
@@ -172,15 +167,6 @@ function compactPruneHealthSummary(summary = {}) {
         status: summary.phase_b_history.status,
         stopped_for_budget: summary.phase_b_history.stopped_for_budget,
         error_count: summary.phase_b_history.error_count,
-      }
-      : undefined,
-    chart_load_metrics: summary.chart_load_metrics
-      ? {
-        enabled: summary.chart_load_metrics.enabled,
-        skipped: summary.chart_load_metrics.skipped,
-        raw_rows_deleted: summary.chart_load_metrics.raw_rows_deleted,
-        daily_rows_upserted: summary.chart_load_metrics.daily_rows_upserted,
-        error: summary.chart_load_metrics.error,
       }
       : undefined,
     late_arrival: summary.late_arrival
@@ -2033,68 +2019,6 @@ async function runPhaseARecent(config) {
   return aggregateSummary;
 }
 
-async function runChartLoadMetricsMaintenance(config) {
-  if (config.dryRun) {
-    return {
-      enabled: false,
-      skipped: true,
-      reason: "dry_run",
-    };
-  }
-
-  const retentionDays = parsePositiveInt(
-    process.env.UK_AQ_CHART_METRICS_RETENTION_DAYS,
-    DEFAULT_CHART_METRICS_RETENTION_DAYS,
-    1,
-    3650,
-  );
-  const refreshDays = parsePositiveInt(
-    process.env.UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS,
-    DEFAULT_CHART_METRICS_DAILY_REFRESH_DAYS,
-    1,
-    31,
-  );
-  const cleanupRpc = (process.env.UK_AQ_CHART_METRICS_CLEANUP_RPC || DEFAULT_CHART_METRICS_CLEANUP_RPC).trim();
-  const dailyRefreshRpc = (process.env.UK_AQ_CHART_METRICS_DAILY_REFRESH_RPC || DEFAULT_CHART_METRICS_DAILY_REFRESH_RPC)
-    .trim();
-
-  const observsClient = createClient(config.observsSupabaseUrl, config.observsSecretKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-    db: { schema: RPC_SCHEMA },
-  });
-
-  const cleanupResult = await observsClient.schema(RPC_SCHEMA).rpc(cleanupRpc, {
-    p_retention_days: retentionDays,
-  });
-  if (cleanupResult.error) {
-    throw new Error(`chart metrics cleanup RPC failed: ${cleanupResult.error.message}`);
-  }
-  const cleanupRowsDeleted = Number(cleanupResult.data?.[0]?.rows_deleted ?? 0);
-
-  const refreshResult = await observsClient.schema(RPC_SCHEMA).rpc(dailyRefreshRpc, {
-    p_recent_days: refreshDays,
-  });
-  if (refreshResult.error) {
-    throw new Error(`chart metrics daily refresh RPC failed: ${refreshResult.error.message}`);
-  }
-  const refreshRow = refreshResult.data?.[0] || {};
-  const summary = {
-    enabled: true,
-    skipped: false,
-    retention_days: retentionDays,
-    refresh_days: refreshDays,
-    cleanup_rpc: cleanupRpc,
-    daily_refresh_rpc: dailyRefreshRpc,
-    raw_rows_deleted: Number.isFinite(cleanupRowsDeleted) ? cleanupRowsDeleted : 0,
-    daily_rows_upserted: Number(refreshRow.rows_upserted ?? 0),
-    daily_days_refreshed: Number(refreshRow.days_refreshed ?? refreshDays),
-    daily_refreshed_from_day_utc: refreshRow.refreshed_from_day_utc ?? null,
-    daily_refreshed_to_day_utc: refreshRow.refreshed_to_day_utc ?? null,
-  };
-  logStructured("INFO", "chart_load_metrics_maintenance_summary", summary);
-  return summary;
-}
-
 async function discoverLateArrivalDays(ingestClient, overallWindow) {
   const cutoffWindowStart = toIso(overallWindow.window_start, "late_arrival.window_start");
   const distinctDaySet = new Set();
@@ -2431,17 +2355,9 @@ async function runLateArrivalCleanup(config, overallWindow) {
   return summary;
 }
 
-export function shouldRebuildPhaseBHistoryIndexesForTest({ dryRun, phaseBHistorySummary }) {
-  return !dryRun
-    && phaseBHistorySummary?.enabled === true
-    && phaseBHistorySummary?.status !== "stopped_budget";
-}
-
 async function runPrune(config, adapters = {}) {
   const runPhaseARecentAdapter = adapters.runPhaseARecent || runPhaseARecent;
   const runPhaseBBackupAdapter = adapters.runPhaseBBackup || runPhaseBBackup;
-  const rebuildR2HistoryIndexesAdapter = adapters.rebuildR2HistoryIndexes || rebuildR2HistoryIndexes;
-  const runChartLoadMetricsMaintenanceAdapter = adapters.runChartLoadMetricsMaintenance || runChartLoadMetricsMaintenance;
   const runPruneSingleWindowAdapter = adapters.runPruneSingleWindow || runPruneSingleWindow;
   const runLateArrivalCleanupAdapter = adapters.runLateArrivalCleanup || runLateArrivalCleanup;
 
@@ -2476,8 +2392,6 @@ async function runPrune(config, adapters = {}) {
       normal_prune: skipped({ deletion_attempted: false }),
       phase_a_recent: phaseARecentSummary,
       phase_b_history: phaseBHistorySummary,
-      phase_b_history_index: skipped({ rebuilt: false }),
-      chart_load_metrics: skipped(),
       late_arrival: skipped(),
     };
     logStructured("WARNING", "ingestdb_prune_stopped_after_phase_b_budget", {
@@ -2488,71 +2402,6 @@ async function runPrune(config, adapters = {}) {
     });
     return summary;
   }
-  let phaseBHistoryIndexSummary = {
-    enabled: false,
-    rebuilt: false,
-    reason: "phase_b_not_completed",
-  };
-  if (shouldRebuildPhaseBHistoryIndexesForTest({
-    dryRun: config.dryRun,
-    phaseBHistorySummary,
-  })) {
-    try {
-      const indexSummary = await rebuildR2HistoryIndexesAdapter({
-        env: process.env,
-        historyVersion: config.phaseB.history_write_version,
-      });
-      phaseBHistoryIndexSummary = {
-        enabled: true,
-        rebuilt: true,
-        ...indexSummary,
-      };
-      logStructured("INFO", "phase_b_history_index_rebuild_complete", {
-        run_id: phaseBRunId,
-        bucket: indexSummary.bucket,
-        history_version: indexSummary.history_version,
-        index_prefix: indexSummary.index_prefix,
-        results: indexSummary.results,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      phaseBHistoryIndexSummary = {
-        enabled: true,
-        rebuilt: false,
-        error: message,
-      };
-      logStructured("WARNING", "phase_b_history_index_rebuild_failed", {
-        run_id: phaseBRunId,
-        error: message,
-      });
-    }
-  } else if (phaseBHistorySummary?.status === "stopped_budget") {
-    phaseBHistoryIndexSummary = {
-      enabled: true,
-      rebuilt: false,
-      reason: "phase_b_stopped_budget",
-    };
-  }
-
-  let chartLoadMetricsSummary = {
-    enabled: false,
-    skipped: true,
-    reason: "not_started",
-  };
-  try {
-    chartLoadMetricsSummary = await runChartLoadMetricsMaintenanceAdapter(config);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    chartLoadMetricsSummary = {
-      enabled: true,
-      skipped: false,
-      error: message,
-    };
-    logStructured("WARNING", "chart_load_metrics_maintenance_failed", {
-      error: message,
-    });
-  }
-
   const overallWindow = buildWindow(
     config.maxHoursPerRun,
     config.ingestDbRetentionDays,
@@ -2624,8 +2473,6 @@ async function runPrune(config, adapters = {}) {
     ...pruneWindowSummary,
     phase_a_recent: phaseARecentSummary,
     phase_b_history: phaseBHistorySummary,
-    phase_b_history_index: phaseBHistoryIndexSummary,
-    chart_load_metrics: chartLoadMetricsSummary,
     late_arrival: lateArrivalSummary,
   };
   if (batches.length > 1) {

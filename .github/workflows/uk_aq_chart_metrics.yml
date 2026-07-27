@@ -1,0 +1,41 @@
+name: UK AQ Chart Metrics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-chart-metrics
+  cancel-in-progress: false
+
+jobs:
+  chart-metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+      UK_AQ_CHART_METRICS_RETENTION_DAYS: ${{ vars.UK_AQ_CHART_METRICS_RETENTION_DAYS || '90' }}
+      UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS: ${{ vars.UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS || '7' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci --ignore-scripts
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          test -n "${OBS_AQIDB_SUPABASE_URL:-}"
+          test -n "${OBS_AQIDB_SECRET_KEY:-}"
+      - name: Run chart metrics maintenance
+        run: timeout --kill-after=30s 5m node workers/uk_aq_chart_metrics/job.mjs
+      - name: Upload chart metrics report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-chart-metrics-report
+          path: tmp/uk_aq_chart_metrics_report.json
+          if-no-files-found: warn

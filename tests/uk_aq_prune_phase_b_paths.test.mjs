@@ -275,7 +275,7 @@ test("Phase B v2 SQL uses set-based aggregation and preserves complete candidate
 });
 
 test("Phase B deploy workflow and env catalogs retire the observations history allow-list", () => {
-  const workflow = readFileSync(".github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml", "utf8");
+  const workflow = readFileSync(".github/workflows/uk_aq_prune_daily.yml", "utf8");
   const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
   const master = existsSync("env-vars-master.csv")
     ? readFileSync("env-vars-master.csv", "utf8")
@@ -283,8 +283,6 @@ test("Phase B deploy workflow and env catalogs retire the observations history a
   assert.doesNotMatch(workflow, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.doesNotMatch(targets, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.equal(master.includes("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES"), false);
-  assert.match(workflow, /workers\/shared\/uk_aq_observation_property_code\.mjs/);
-
 });
 
 test("Phase B resets a stale v2 checkpoint when cleanup already removed all partial objects", () => {
@@ -574,8 +572,6 @@ import { parquetMetadata } from "hyparquet";
 import {
   HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2,
   HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2,
-  discoverPendingAqilevelDaysForTest,
-  exportAqilevelDayToR2ForTest,
   rowsToAqilevelDataV2ParquetBufferForTest,
   rowsToAqilevelDebugV2ParquetBufferForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
@@ -601,84 +597,13 @@ test("Phase B v2 AQI debug manifests use debug profile and debug columns", () =>
   assert.deepEqual(pollutantManifest.columns, HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2);
 });
 
-test("Phase B v2 AQI discovery requires both data and debug day manifests", async () => {
-  const dataPrefix = "history/v2/aqilevels/hourly/data";
-  const debugPrefix = "history/v2/aqilevels/hourly/debug";
-  const client = { async query() { return { rows: ["2026-06-16", "2026-06-15", "2026-06-14"].map((day_utc) => ({ day_utc })) }; } };
-  const headKeys = [];
-  const existing = new Set([buildDayManifestKey(dataPrefix, "2026-06-16"), buildDayManifestKey(debugPrefix, "2026-06-16"), buildDayManifestKey(dataPrefix, "2026-06-15"), buildDayManifestKey(debugPrefix, "2026-06-14")]);
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init = {}) => {
-    assert.equal(init.method, "HEAD");
-    const key = decodeURIComponent(new URL(url).pathname.replace(/^\/bucket\//, ""));
-    headKeys.push(key);
-    return new Response(null, { status: existing.has(key) ? 200 : 404, headers: existing.has(key) ? { "content-length": "1" } : {} });
-  };
-  try {
-    const pending = await discoverPendingAqilevelDaysForTest({ client, latestEligibleDayUtc: "2026-06-16", runtime: { history_write_version: "v2", max_candidates_per_run: 10, aqilevels_prefix: dataPrefix, aqilevels_hourly_debug_prefix_v2: debugPrefix, r2: { endpoint: "https://r2.example.test", bucket: "bucket", region: "auto", access_key_id: "key", secret_access_key: "secret" } } });
-    assert.deepEqual(pending, ["2026-06-14", "2026-06-15"]);
-    assert.deepEqual(headKeys, [buildDayManifestKey(dataPrefix, "2026-06-16"), buildDayManifestKey(debugPrefix, "2026-06-16"), buildDayManifestKey(dataPrefix, "2026-06-15"), buildDayManifestKey(debugPrefix, "2026-06-15"), buildDayManifestKey(dataPrefix, "2026-06-14")]);
-  } finally { globalThis.fetch = originalFetch; }
-});
-
-test("Phase B v2 AQI export writes data and debug profile objects and manifests", async () => {
-  const dataPrefix = "history/v2/aqilevels/hourly/data";
-  const debugPrefix = "history/v2/aqilevels/hourly/debug";
-  const written = new Map();
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init = {}) => {
-    const parsed = new URL(url);
-    if (parsed.hostname === "source.example.test") {
-      const rpcName = parsed.pathname.split("/").pop();
-      if (rpcName === "connector_counts") return Response.json([{ connector_id: 7, expected_row_count: "1" }]);
-      if (rpcName === "rows") return Response.json(JSON.parse(init.body || "{}").p_after_timeseries_id === null ? [AQI_ROW] : []);
-    }
-    const key = decodeURIComponent(parsed.pathname.replace(/^\/bucket\//, ""));
-    if (init.method === "PUT") { written.set(key, Buffer.from(await new Response(init.body).arrayBuffer())); return new Response(null, { status: 200, headers: { etag: `etag-${written.size}` } }); }
-    if (init.method === "HEAD") return written.has(key) ? new Response(null, { status: 200, headers: { etag: "etag-head", "content-length": String(written.get(key).byteLength) } }) : new Response(null, { status: 404 });
-    throw new Error(`Unexpected fetch ${init.method} ${url}`);
-  };
-  try {
-    const result = await exportAqilevelDayToR2ForTest({ dayUtc: DAY, runtime: { history_write_version: "v2", run_id: "test-run", writer_git_sha: "test-sha", aqilevels_prefix: dataPrefix, aqilevels_hourly_debug_prefix_v2: debugPrefix, aqilevels_row_group_size: 1000, aqilevels_part_max_rows: 1000, aqilevels_source_max_pages: 10, cursor_fetch_rows: 1000, aqilevels_source: { base_url: "https://source.example.test", privileged_key: "secret", rpc_schema: "uk_aq_ops", connector_counts_rpc: "connector_counts", rows_rpc: "rows" }, r2: { endpoint: "https://r2.example.test", bucket: "bucket", region: "auto", access_key_id: "key", secret_access_key: "secret" } } });
-    assert.equal(written.has(buildHistoryV2PartKey(dataPrefix, DAY, 7, "pm10", 0)), true);
-    assert.equal(written.has(buildHistoryV2PartKey(debugPrefix, DAY, 7, "pm10", 0)), true);
-    assert.equal(written.has(buildHistoryV2PollutantManifestKey(dataPrefix, DAY, 7, "pm10")), true);
-    assert.equal(written.has(buildHistoryV2PollutantManifestKey(debugPrefix, DAY, 7, "pm10")), true);
-    assert.equal(written.has(buildConnectorManifestKey(dataPrefix, DAY, 7)), true);
-    assert.equal(written.has(buildConnectorManifestKey(debugPrefix, DAY, 7)), true);
-    assert.equal(written.has(buildDayManifestKey(dataPrefix, DAY)), true);
-    assert.equal(written.has(buildDayManifestKey(debugPrefix, DAY)), true);
-    assert.equal(result.file_count, 1);
-    assert.equal(result.debug_file_count, 1);
-    assert.equal(result.debug_day_manifest_key, buildDayManifestKey(debugPrefix, DAY));
-    assert.equal(JSON.parse(written.get(buildDayManifestKey(dataPrefix, DAY)).toString("utf8")).profile, "data");
-    assert.equal(JSON.parse(written.get(buildDayManifestKey(debugPrefix, DAY)).toString("utf8")).profile, "debug");
-  } finally { globalThis.fetch = originalFetch; }
-});
-
-test("Phase B requires exactly one canonical AQI writer", () => {
-  assert.throws(
-    () => resolvePhaseBRuntimeConfig({
-      UK_AQ_R2_HISTORY_VERSION: "v2",
-      UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "false",
-      UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "false",
-    }),
-    /exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/,
-  );
-  assert.throws(
-    () => resolvePhaseBRuntimeConfig({
-      UK_AQ_R2_HISTORY_VERSION: "v2",
-      UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "true",
-      UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "true",
-    }),
-    /exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/,
-  );
-  assert.equal(resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2" }).phase_b_legacy_aqi_rpc_export_enabled, true);
-  assert.equal(resolvePhaseBRuntimeConfig({
+test("Phase B exposes only the observation-derived AQI writer", () => {
+  const config = resolvePhaseBRuntimeConfig({
     UK_AQ_R2_HISTORY_VERSION: "v2",
-    UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "true",
-    UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "false",
-  }).phase_b_calculate_aqi_from_observations_enabled, true);
+  });
+  assert.equal(config.phase_b_calculate_aqi_from_observations_enabled, true);
+  assert.equal("phase_b_legacy_aqi_rpc_export_enabled" in config, false);
+  assert.equal("aqilevels_source" in config, false);
 });
 
 import {
@@ -757,7 +682,7 @@ test("Phase B AQI index verification derives pollutants from v2 connector manife
   ]);
 });
 
-test("Phase B AQI index wrappers run targeted update, preserve global latest, and verify current source", async () => {
+test("Phase B AQI connector indexes are targeted and defer global latest finalization", async () => {
   const pollutantManifestKey = `history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=7/pollutant_code=pm25/manifest.json`;
   const connectorManifest = {
     connector_id: 7,
@@ -825,9 +750,7 @@ test("Phase B AQI index wrappers run targeted update, preserve global latest, an
     const pollutantIndex = JSON.parse(fake.puts.get(indexKey));
     assert.equal(pollutantIndex.pollutant_manifest_key, pollutantManifestKey);
     assert.equal(pollutantIndex.pollutant_manifest_hash, "current-pm25-hash");
-    const latest = JSON.parse(fake.puts.get("history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"));
-    assert.deepEqual(latest.day_summaries.map((entry) => entry.day_utc), ["2026-06-13", DAY]);
-    assert.equal(latest.day_summaries.filter((entry) => entry.day_utc === DAY).length, 1);
+    assert.equal(fake.puts.has("history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"), false);
     const verification = await verifyAqilevelDayIndexesForTest({ runtime, dayUtc: DAY, connectorManifests: [connectorManifest], indexBuild });
     assert.equal(verification.required, true);
     assert.equal(verification.verified_index_manifest_count, 1);
