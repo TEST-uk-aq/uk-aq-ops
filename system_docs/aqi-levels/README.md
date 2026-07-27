@@ -12,14 +12,16 @@ Raw observations remain authoritative source data and are owned by the observati
 
 1. [`contract.md`](contract.md)
 2. [`station-history-contract.md`](station-history-contract.md) for continuity-aware chart rendering and stored-R2 validation
-3. [`data-flow.md`](data-flow.md)
-4. [`state-model.md`](state-model.md)
-5. [`interfaces.md`](interfaces.md)
-6. [`operations.md`](operations.md)
-7. [`recovery.md`](recovery.md)
-8. [`validation.md`](validation.md)
-9. [`station-history-validation.md`](station-history-validation.md)
-10. relevant records under [`decisions/`](decisions/)
+3. [`../station_charts/README.md`](../station_charts/README.md) for shared frontend ownership
+4. [`../station_charts/contract.md`](../station_charts/contract.md) for browser modules, cache, AQI-source switching, renderer and page adapters
+5. [`data-flow.md`](data-flow.md)
+6. [`state-model.md`](state-model.md)
+7. [`interfaces.md`](interfaces.md)
+8. [`operations.md`](operations.md)
+9. [`recovery.md`](recovery.md)
+10. [`validation.md`](validation.md)
+11. [`station-history-validation.md`](station-history-validation.md)
+12. relevant records under [`decisions/`](decisions/)
 
 For R2 physical/logical identity and binding publication, also read:
 
@@ -30,7 +32,7 @@ For R2 physical/logical identity and binding publication, also read:
 
 ## Specific-contract precedence
 
-[`station-history-contract.md`](station-history-contract.md) is the specific approved contract for the station-chart path.
+[`station-history-contract.md`](station-history-contract.md) is the specific approved contract for the station-chart data path.
 
 It deliberately changes one previous broad rule:
 
@@ -40,6 +42,8 @@ It deliberately changes one previous broad rule:
 - the retained separate foreground R2 AQI path is a feature-flag compatibility fallback.
 
 Where older wording in the broad contract, data flow, interfaces or validation files says committed R2 AQI must win visible station-history overlaps, this specific station-history contract governs the new calculated-response path.
+
+[`../station_charts/contract.md`](../station_charts/contract.md) governs the website architecture that consumes this data. It requires one shared controller, cache, AQI-source controller and renderer, with the compatibility source behind the same client boundary rather than a second chart implementation.
 
 All unrelated AQI rules remain unchanged.
 
@@ -64,12 +68,15 @@ The canonical Obs AQI database schema remains in:
 TEST-uk-aq/uk-aq-schema/schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql
 ```
 
-Website consumers governed by this contract include:
+Website consumers governed by this AQI contract include:
 
-- `station-history-loader.js`;
-- `hex_map/index.html`;
-- `sensors/index.html`;
+- shared modules under `station_chart/`;
+- the Hex Map station-chart adapter;
+- the Sensors station-chart adapter;
+- `station-history-loader.js` only while it remains a migration facade;
 - any other active chart consumer discovered during implementation.
+
+The frontend module boundaries and page ownership are defined by [`../station_charts/contract.md`](../station_charts/contract.md).
 
 Those files are outside this repository, but their AQI interpretation must conform to this area.
 
@@ -171,10 +178,10 @@ stored-R2 validation mode and sampling
 historical identity repair execution
 ```
 
-Disabling calculated rendering returns the website to the retained separate R2 AQI compatibility path. Disabling continuity returns station history to exact requested-timeseries behaviour.
+Disabling calculated rendering returns the shared website controller to the retained separate R2 AQI compatibility client. It must not activate a second frontend controller or renderer. Disabling continuity returns station history to exact requested-timeseries behaviour.
 
 ## Documentation boundary
 
-Older broad AQI, R2-layout, Prune Daily and backfill documents may contain useful history. They do not override the active contracts in this directory and `system_docs/r2_history/`.
+Older broad AQI, R2-layout, Prune Daily and backfill documents may contain useful history. They do not override the active contracts in this directory, `system_docs/r2_history/` and `system_docs/station_charts/`.
 
 Codex and other coding agents must read these files but must not edit `system_docs/`. Implementation differences must be reported to ChatGPT for post-implementation documentation review.
