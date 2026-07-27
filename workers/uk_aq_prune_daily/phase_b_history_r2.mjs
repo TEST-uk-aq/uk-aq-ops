@@ -21,6 +21,7 @@ import {
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
 import {
+  classifyManifestFileIdentity,
   verifyManifestFileIdentity,
 } from "../shared/uk_aq_r2_file_identity.mjs";
 import { resolveR2HistoryVersion } from "../shared/uk_aq_r2_history_version.mjs";
@@ -4643,6 +4644,31 @@ export function validateObservationPollutantManifestForGate({
   };
 }
 
+export async function verifyOpaqueObservationFileForGate({
+  r2,
+  fileKey,
+  manifestIdentity,
+  expectedBytes,
+  getObject = r2GetObject,
+  headObject = r2HeadObject,
+}) {
+  const identity = classifyManifestFileIdentity(manifestIdentity, {
+    objectKey: fileKey,
+  });
+  const liveFile = identity.type === "etag"
+    ? await headObject({ r2, key: fileKey })
+    : await getObject({ r2, key: fileKey });
+  if (liveFile?.exists === false) {
+    throw new Error(`Opaque observation Parquet object is missing: ${fileKey}`);
+  }
+  return verifyManifestFileIdentity({
+    manifestIdentity,
+    expectedBytes,
+    liveObject: liveFile,
+    objectKey: fileKey,
+  });
+}
+
 export async function verifyObservationConnectorHistory({
   runtime,
   dayUtc,
@@ -4762,13 +4788,12 @@ export async function verifyObservationConnectorHistory({
           objectKey: fileKey,
         });
       } else {
-        const liveFile = await r2HeadObject({ r2: runtime.r2, key: fileKey });
-        if (!liveFile.exists) {
-          throw new Error(`Opaque observation Parquet object is missing: ${fileKey}`);
-        }
-        if (Number(liveFile.bytes) !== fileBytes) {
-          throw new Error(`Opaque observation Parquet byte count mismatch: ${fileKey}`);
-        }
+        await verifyOpaqueObservationFileForGate({
+          r2: runtime.r2,
+          fileKey,
+          manifestIdentity: file?.etag_or_hash,
+          expectedBytes: fileBytes,
+        });
       }
       childRows += fileRows;
       childBytes += fileBytes;

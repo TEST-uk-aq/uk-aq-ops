@@ -9,6 +9,7 @@ import {
 } from "../workers/shared/uk_aq_r2_file_identity.mjs";
 import {
   validateObservationPollutantManifestForGate,
+  verifyOpaqueObservationFileForGate,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 function withManifestHash(payload) {
@@ -72,6 +73,74 @@ test("quoted legacy R2 ETag identity is compared only with the live ETag", () =>
     }),
     /ETag mismatch/,
   );
+});
+
+test("opaque quoted ETag identity uses HEAD and passes when ETag and bytes match", async () => {
+  const fileKey = "history/v2/observations/day_utc=2026-07-07/connector_id=1/pollutant_code=123c6h3ch33/part-00000.parquet";
+  let headCount = 0;
+  let getCount = 0;
+  const result = await verifyOpaqueObservationFileForGate({
+    r2: {},
+    fileKey,
+    manifestIdentity: '"0123456789abcdef0123456789abcdef"',
+    expectedBytes: 1234,
+    async headObject({ key }) {
+      headCount += 1;
+      return {
+        exists: true,
+        key,
+        bytes: 1234,
+        etag: '"0123456789ABCDEF0123456789ABCDEF"',
+      };
+    },
+    async getObject() {
+      getCount += 1;
+      throw new Error("opaque quoted ETag must not use GET");
+    },
+  });
+
+  assert.equal(result.identity_type, "etag");
+  assert.equal(headCount, 1);
+  assert.equal(getCount, 0);
+});
+
+test("opaque SHA-256 identity uses GET hashing and rejects a same-size replacement", async () => {
+  const fileKey = "history/v2/observations/day_utc=2026-07-07/connector_id=1/pollutant_code=123c6h3ch33/part-00000.parquet";
+  const expectedBody = Buffer.from("opaque parquet A");
+  const replacementBody = Buffer.from("opaque parquet B");
+  let getCount = 0;
+  let headCount = 0;
+  const makeGetObject = (body) => async ({ key }) => {
+    getCount += 1;
+    return { key, bytes: body.byteLength, body, etag: '"unrelated-r2-etag"' };
+  };
+  const headObject = async () => {
+    headCount += 1;
+    throw new Error("opaque SHA-256 must not use HEAD-only verification");
+  };
+
+  const result = await verifyOpaqueObservationFileForGate({
+    r2: {},
+    fileKey,
+    manifestIdentity: sha256Hex(expectedBody),
+    expectedBytes: expectedBody.byteLength,
+    getObject: makeGetObject(expectedBody),
+    headObject,
+  });
+  assert.equal(result.identity_type, "sha256");
+  await assert.rejects(
+    verifyOpaqueObservationFileForGate({
+      r2: {},
+      fileKey,
+      manifestIdentity: sha256Hex(expectedBody),
+      expectedBytes: expectedBody.byteLength,
+      getObject: makeGetObject(replacementBody),
+      headObject,
+    }),
+    /SHA-256 mismatch.*part-00000\.parquet/,
+  );
+  assert.equal(getCount, 2);
+  assert.equal(headCount, 0);
 });
 
 test("active pollutant hash metadata remains fail-closed", () => {
@@ -141,7 +210,7 @@ test("missing or contradictory opaque child identity remains fail-closed", () =>
   );
 });
 
-test("bounded completion marks only the successfully verified connector-day complete", async () => {
+test("opaque ETag mismatch leaves only its exact connector-day incomplete", async () => {
   const gateState = new Map([
     ["2026-07-02|1", false],
     ["2026-07-03|1", false],
@@ -163,7 +232,22 @@ test("bounded completion marks only the successfully verified connector-day comp
       },
       async verifyObservationConnectorHistory({ dayUtc, connectorId, activePollutants }) {
         assert.deepEqual(activePollutants, ["pm25", "pm10", "no2", "o3"]);
-        if (dayUtc === "2026-07-03") throw new Error("representative verification failure");
+        if (dayUtc === "2026-07-03") {
+          await verifyOpaqueObservationFileForGate({
+            r2: {},
+            fileKey: `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=123c6h3ch33/part-00000.parquet`,
+            manifestIdentity: '"0123456789abcdef0123456789abcdef"',
+            expectedBytes: 100,
+            async headObject({ key }) {
+              return {
+                exists: true,
+                key,
+                bytes: 100,
+                etag: '"fedcba9876543210fedcba9876543210"',
+              };
+            },
+          });
+        }
         return {
           history_manifest_key: `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
           history_manifest_hash: "a".repeat(64),
@@ -184,6 +268,7 @@ test("bounded completion marks only the successfully verified connector-day comp
   assert.equal(result.status, "failed");
   assert.equal(result.completed_connector_day_count, 1);
   assert.equal(result.failed_connector_day_count, 1);
+  assert.match(result.results[1].error, /ETag mismatch.*part-00000\.parquet/);
   assert.equal(gateState.get("2026-07-02|1"), true);
   assert.equal(gateState.get("2026-07-03|1"), false);
   assert.equal(gateState.get("2026-07-04|2"), true);
