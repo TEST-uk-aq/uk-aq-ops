@@ -169,6 +169,8 @@ function compactPruneHealthSummary(summary = {}) {
         enabled: summary.phase_b_history.enabled,
         ok: summary.phase_b_history.ok,
         run_id: summary.phase_b_history.run_id,
+        status: summary.phase_b_history.status,
+        stopped_for_budget: summary.phase_b_history.stopped_for_budget,
         error_count: summary.phase_b_history.error_count,
       }
       : undefined,
@@ -2426,6 +2428,12 @@ async function runLateArrivalCleanup(config, overallWindow) {
   return summary;
 }
 
+export function shouldRebuildPhaseBHistoryIndexesForTest({ dryRun, phaseBHistorySummary }) {
+  return !dryRun
+    && phaseBHistorySummary?.enabled === true
+    && phaseBHistorySummary?.status !== "stopped_budget";
+}
+
 async function runPrune(config) {
   const phaseARecentSummary = await runPhaseARecent(config);
 
@@ -2442,7 +2450,10 @@ async function runPrune(config) {
     rebuilt: false,
     reason: "phase_b_not_completed",
   };
-  if (!config.dryRun && phaseBHistorySummary?.enabled) {
+  if (shouldRebuildPhaseBHistoryIndexesForTest({
+    dryRun: config.dryRun,
+    phaseBHistorySummary,
+  })) {
     try {
       const indexSummary = await rebuildR2HistoryIndexes({
         env: process.env,
@@ -2472,6 +2483,12 @@ async function runPrune(config) {
         error: message,
       });
     }
+  } else if (phaseBHistorySummary?.status === "stopped_budget") {
+    phaseBHistoryIndexSummary = {
+      enabled: true,
+      rebuilt: false,
+      reason: "phase_b_stopped_budget",
+    };
   }
 
   let chartLoadMetricsSummary = {
