@@ -140,6 +140,24 @@ If the connector write, validation or index stage fails, the connector-day gate 
 
 A previously complete Phase B candidate may populate a missing connector-day gate only after its existing canonical connector manifest and required evidence are validated. The implementation MUST NOT bulk-copy aggregate day-gate truth into connector-day rows without connector-level validation.
 
+## Normal-run priority and existing-gate adoption
+
+The primary purpose of the normal Prune Daily Phase B path is to complete the current eligible connector-day candidates needed for safe pruning. Existing-gate adoption is secondary maintenance and MUST NOT consume the time needed to process those current candidates.
+
+The normal run MUST:
+
+1. identify and prioritise the exact current connector-days that are active Phase B candidates or are immediately required by the current prune window;
+2. limit any adoption of already-written connector history to that bounded active scope;
+3. start current candidate processing before unrelated historical gate population;
+4. leave unrelated missing historical connector-day gates incomplete for a separate explicit maintenance or Integrity operation;
+5. avoid issuing one warning per unrelated historical connector-day when a bounded summary is sufficient.
+
+A normal Prune Daily run MUST NOT scan or revalidate a broad historical backlog merely because connector-day gate rows are missing. In particular, it MUST NOT use the normal candidate limit as an implicit historical gate-migration batch that runs before live candidates.
+
+If historical gate population is required, it MUST be an explicit, bounded and resumable maintenance operation. It must preserve progress across runs and MUST NOT retry a known incompatible connector-day on every normal Prune Daily execution unless its R2 evidence, validation contract or explicit retry state has changed.
+
+A legacy connector-day that fails the active manifest, hash or object contract remains safely incomplete. That failure MUST NOT block current unrelated candidates and MUST NOT turn the normal Prune Daily workflow into a historical repair job.
+
 ## Integrity ownership
 
 A real Integrity repair may establish the connector-day gate because Integrity is an approved R2 v2 writer using the same canonical observation, hash, status, manifest and index contracts.
@@ -221,6 +239,38 @@ Set or keep `history_done=false` when:
 
 A failure for connector A on day D MUST NOT clear a valid gate for connector B on day D unless B's own content or evidence was changed or invalidated.
 
+## Phase B run budget and graceful stopping
+
+The Phase B internal run budget is the primary operational deadline. The outer shell or GitHub Actions timeout is only a final guard and MUST NOT be the normal mechanism that stops Phase B.
+
+The implementation MUST reserve enough time before the outer timeout to:
+
+- stop starting new work;
+- leave incomplete connector-day gates false;
+- perform required partial-output cleanup or preserve a safe resumable checkpoint;
+- write the Prune Daily report and task-health result;
+- close database and external-service clients cleanly.
+
+Budget checks MUST occur before every potentially long or externally bounded stage, including:
+
+- existing-gate adoption;
+- starting a connector-day candidate;
+- a large observation write segment that cannot finish within the remaining allowance;
+- AQI calculation and AQI object writes;
+- targeted index finalisation;
+- the mandatory Dropbox prune comparison.
+
+A stage MUST NOT start when the remaining budget is below its conservative minimum completion allowance. Long external operations MUST receive a deadline, abort signal or bounded timeout derived from the remaining run budget so that they cannot continue beyond the internal deadline.
+
+When the budget is exhausted, Phase B MUST stop cleanly with a controlled `stopped_budget` or equivalent partial outcome. It MUST NOT:
+
+- mark an unverified connector-day gate complete;
+- continue into another expensive stage after the internal deadline;
+- rely on exit code 124 or forced process termination;
+- lose the final structured report solely because work remains.
+
+A budget stop is retry-safe. The next normal TEST run may resume or reprocess the incomplete connector-day using the existing candidate, checkpoint and idempotency contracts.
+
 ## Existing data and migration
 
 The schema migration MUST be additive. The existing aggregate day gate remains in place.
@@ -252,6 +302,18 @@ Blocked previews include both `day_utc` and `connector_id`.
 
 Whole-day completion diagnostics remain separate and MUST NOT be reported as the reason an independently complete connector bucket was blocked.
 
+Existing-gate adoption diagnostics MUST be bounded and distinguish:
+
+```text
+active_scope_adoption_attempted
+active_scope_adoption_completed
+active_scope_adoption_blocked
+historical_adoption_skipped
+stopped_for_budget
+```
+
+Equivalent names are acceptable, but a normal run MUST make clear that unrelated historical adoption was not allowed to delay current candidates.
+
 ## Validation policy
 
 This is a deletion-safety change, so one narrow deterministic pre-deployment check is genuinely required.
@@ -265,6 +327,13 @@ The focused check MUST prove that, for the same UTC day:
 - the same separation applies to post-repair deletion candidates;
 - a failed connector-day write invalidates only the affected connector gate.
 
+The same focused check set MUST also prove that:
+
+- current active connector-day candidates are processed before unrelated historical gate adoption;
+- a broad historical backlog is not scanned by a normal run;
+- insufficient budget prevents AQI, index or Dropbox-comparison work from starting;
+- budget exhaustion leaves the connector gate incomplete and returns a controlled reportable outcome rather than requiring forced process termination.
+
 Before deployment, run only the smallest syntax, SQL-structure and directly relevant deterministic checks required to establish structural viability. Do not add a broad speculative test suite.
 
 Functional acceptance occurs through real TEST operation:
@@ -275,6 +344,8 @@ Functional acceptance occurs through real TEST operation:
 4. Confirm the incomplete connector remains present in IngestDB and is reported with the connector-specific blocked reason.
 5. Confirm the aggregate day gate remains false until all required connector and whole-day work completes.
 6. Confirm a later successful Phase B or real Integrity repair sets only the relevant connector-day gate.
+7. Confirm the normal run does not spend its live-candidate budget scanning unrelated historical connector-days.
+8. If the configured budget is reached, confirm the workflow writes its report, leaves unfinished gates false and exits through the controlled budget-stop path rather than exit code 124.
 
 ## Rollback
 
