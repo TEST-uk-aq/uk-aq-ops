@@ -197,6 +197,9 @@ function compactPruneHealthSummary(summary = {}) {
       }
       : undefined,
     warnings: [
+      summary.phase_b_history?.status === "stopped_budget"
+        ? "Phase B stopped at its controlled internal budget; downstream prune work was skipped"
+        : null,
       summary.cap_warning_count ? `delete cap warnings: ${summary.cap_warning_count}` : null,
       summary.cap_after_repair_warning_count
         ? `delete-after-repair cap warnings: ${summary.cap_after_repair_warning_count}`
@@ -2434,17 +2437,57 @@ export function shouldRebuildPhaseBHistoryIndexesForTest({ dryRun, phaseBHistory
     && phaseBHistorySummary?.status !== "stopped_budget";
 }
 
-async function runPrune(config) {
-  const phaseARecentSummary = await runPhaseARecent(config);
+async function runPrune(config, adapters = {}) {
+  const runPhaseARecentAdapter = adapters.runPhaseARecent || runPhaseARecent;
+  const runPhaseBBackupAdapter = adapters.runPhaseBBackup || runPhaseBBackup;
+  const rebuildR2HistoryIndexesAdapter = adapters.rebuildR2HistoryIndexes || rebuildR2HistoryIndexes;
+  const runChartLoadMetricsMaintenanceAdapter = adapters.runChartLoadMetricsMaintenance || runChartLoadMetricsMaintenance;
+  const runPruneSingleWindowAdapter = adapters.runPruneSingleWindow || runPruneSingleWindow;
+  const runLateArrivalCleanupAdapter = adapters.runLateArrivalCleanup || runLateArrivalCleanup;
+
+  const phaseARecentSummary = await runPhaseARecentAdapter(config);
 
   const phaseBRunId = randomUUID();
-  const phaseBHistorySummary = await runPhaseBBackup({
+  const phaseBHistorySummary = await runPhaseBBackupAdapter({
     dryRun: config.dryRun,
     phaseB: config.phaseB,
     ingestRetentionDays: config.ingestDbRetentionDays,
     logStructured,
     runId: phaseBRunId,
   });
+  if (phaseBHistorySummary?.enabled === true && phaseBHistorySummary?.status === "stopped_budget") {
+    const overallWindow = buildWindow(
+      config.maxHoursPerRun,
+      config.ingestDbRetentionDays,
+    );
+    const skipped = (extra = {}) => ({
+      enabled: false,
+      skipped: true,
+      reason: "phase_b_stopped_budget",
+      ...extra,
+    });
+    const summary = {
+      mode: config.dryRun ? "dry-run" : "delete",
+      window_start: overallWindow.window_start,
+      window_end: overallWindow.window_end,
+      skipped: true,
+      reason: "phase_b_stopped_budget",
+      deletion_attempted: false,
+      normal_prune: skipped({ deletion_attempted: false }),
+      phase_a_recent: phaseARecentSummary,
+      phase_b_history: phaseBHistorySummary,
+      phase_b_history_index: skipped({ rebuilt: false }),
+      chart_load_metrics: skipped(),
+      late_arrival: skipped(),
+    };
+    logStructured("WARNING", "ingestdb_prune_stopped_after_phase_b_budget", {
+      phase_b_history_run_id: phaseBHistorySummary.run_id || phaseBRunId,
+      phase_b_history_status: phaseBHistorySummary.status,
+      stopped_for_budget: phaseBHistorySummary.stopped_for_budget === true,
+      downstream_skip_reason: "phase_b_stopped_budget",
+    });
+    return summary;
+  }
   let phaseBHistoryIndexSummary = {
     enabled: false,
     rebuilt: false,
@@ -2455,7 +2498,7 @@ async function runPrune(config) {
     phaseBHistorySummary,
   })) {
     try {
-      const indexSummary = await rebuildR2HistoryIndexes({
+      const indexSummary = await rebuildR2HistoryIndexesAdapter({
         env: process.env,
         historyVersion: config.phaseB.history_write_version,
       });
@@ -2497,7 +2540,7 @@ async function runPrune(config) {
     reason: "not_started",
   };
   try {
-    chartLoadMetricsSummary = await runChartLoadMetricsMaintenance(config);
+    chartLoadMetricsSummary = await runChartLoadMetricsMaintenanceAdapter(config);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     chartLoadMetricsSummary = {
@@ -2522,7 +2565,7 @@ async function runPrune(config) {
 
   let pruneWindowSummary;
   if (batches.length <= 1) {
-    pruneWindowSummary = await runPruneSingleWindow(config, batches[0] ?? overallWindow);
+    pruneWindowSummary = await runPruneSingleWindowAdapter(config, batches[0] ?? overallWindow);
   } else {
     const parentRunId = randomUUID();
     logStructured("INFO", "ingestdb_prune_batch_plan", {
@@ -2541,7 +2584,7 @@ async function runPrune(config) {
 
     const batchSummaries = [];
     for (const batch of batches) {
-      const summary = await runPruneSingleWindow(config, batch, {
+      const summary = await runPruneSingleWindowAdapter(config, batch, {
         parent_run_id: parentRunId,
         batch_index: batch.batch_index,
         batch_count: batches.length,
@@ -2564,7 +2607,7 @@ async function runPrune(config) {
     reason: "not_started",
   };
   try {
-    lateArrivalSummary = await runLateArrivalCleanup(config, overallWindow);
+    lateArrivalSummary = await runLateArrivalCleanupAdapter(config, overallWindow);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     lateArrivalSummary = {
@@ -2595,8 +2638,13 @@ async function runPrune(config) {
   return combinedSummary;
 }
 
-export async function executePruneDaily(config) {
-  return withDailyTaskRun(
+export async function runPruneForTest(config, adapters = {}) {
+  return runPrune(config, adapters);
+}
+
+export async function executePruneDaily(config, adapters = {}) {
+  const withDailyTaskRunAdapter = adapters.withDailyTaskRun || withDailyTaskRun;
+  return withDailyTaskRunAdapter(
     {
       task_key: "ops.prune_daily",
       source_repo: "uk-aq-ops",
@@ -2611,7 +2659,7 @@ export async function executePruneDaily(config) {
       },
       buildFinishedSummary: compactPruneHealthSummary,
     },
-    () => runPrune(config),
+    () => runPrune(config, adapters),
   );
 }
 

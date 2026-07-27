@@ -70,6 +70,9 @@ const DEFAULT_AQILEVELS_ROW_GROUP_SIZE = DEFAULT_ROW_GROUP_SIZE;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
 const DEFAULT_MAX_SECONDS_PER_RUN = 840;
 const DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS = 60;
+const PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS = 600_000;
+const PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS = 15_000;
+const PHASE_B_PG_DEADLINE_GUARD_MS = 1_000;
 const PHASE_B_STAGE_MIN_MS = Object.freeze({
   active_scope_adoption: 180_000,
   candidate_start: 300_000,
@@ -845,21 +848,61 @@ export function defaultHistoryV2PrefixesForTest() {
   };
 }
 
-function toPgConnectionConfig(connectionString) {
+function toPgConnectionConfig(connectionString, connectionTimeoutMs) {
   return {
     connectionString,
     statement_timeout: 0,
     query_timeout: 0,
+    connectionTimeoutMillis: connectionTimeoutMs,
     application_name: "uk_aq_prune_daily_phase_b_history",
   };
 }
 
-async function withPgClient(connectionString, fn, { statementTimeoutMs = 600_000 } = {}) {
-  const client = new Client(toPgConnectionConfig(connectionString));
+export function derivePhaseBPgTimeoutsForTest(runtime) {
+  const remainingMs = remainingBudgetMs(runtime);
+  const usableMs = remainingMs === null
+    ? PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS
+    : Math.trunc(remainingMs) - PHASE_B_PG_DEADLINE_GUARD_MS;
+  if (usableMs < 1) {
+    throw new PhaseBHistoryBudgetExhaustedError(
+      "Phase B history run budget exhausted before PostgreSQL control work",
+      "control_database_connection",
+    );
+  }
+  return {
+    remaining_budget_ms: remainingMs,
+    statement_timeout_ms: Math.max(1, Math.min(PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS, usableMs)),
+    connection_timeout_ms: Math.max(1, Math.min(PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS, usableMs)),
+  };
+}
+
+function isPgStatementTimeoutError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return error?.code === "57014"
+    && /statement timeout|canceling statement due to statement timeout/i.test(message);
+}
+
+async function withPgClient(
+  connectionString,
+  fn,
+  {
+    statementTimeoutMs = PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS,
+    connectionTimeoutMs = PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS,
+    createClient = (config) => new Client(config),
+  } = {},
+) {
+  const boundedConnectionTimeoutMs = Math.max(
+    1,
+    Math.min(PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS, Math.trunc(Number(connectionTimeoutMs) || PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS)),
+  );
+  const client = createClient(toPgConnectionConfig(connectionString, boundedConnectionTimeoutMs));
   await client.connect();
   try {
     await client.query("set timezone = 'UTC'");
-    const boundedStatementTimeoutMs = Math.max(1, Math.min(600_000, Math.trunc(Number(statementTimeoutMs) || 600_000)));
+    const boundedStatementTimeoutMs = Math.max(
+      1,
+      Math.min(PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS, Math.trunc(Number(statementTimeoutMs) || PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS)),
+    );
     await client.query(`set statement_timeout = '${boundedStatementTimeoutMs}ms'`);
     return await fn(client);
   } finally {
@@ -1277,6 +1320,27 @@ with source_aggregates as (
     and op.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
   group by 1, 2
 ),
+source_changes as materialized (
+  select
+    sa.day_utc,
+    sa.connector_id,
+    hc.expected_row_count as previous_expected_row_count,
+    sa.expected_row_count as current_expected_row_count,
+    hc.min_observed_at as previous_min_observed_at,
+    sa.min_observed_at as current_min_observed_at,
+    hc.max_observed_at as previous_max_observed_at,
+    sa.max_observed_at as current_max_observed_at
+  from source_aggregates sa
+  join uk_aq_ops.history_candidates hc
+    on hc.day_utc = sa.day_utc
+   and hc.connector_id = sa.connector_id
+  where hc.status = 'complete'
+    and (
+      hc.expected_row_count is distinct from sa.expected_row_count
+      or hc.min_observed_at is distinct from sa.min_observed_at
+      or hc.max_observed_at is distinct from sa.max_observed_at
+    )
+),
 upserted as (
   insert into uk_aq_ops.history_candidates (
     day_utc,
@@ -1440,18 +1504,85 @@ upserted as (
     resume_part_index,
     resume_exported_row_count,
     resume_parts_json
+),
+invalidated_connector_gates as (
+  insert into uk_aq_ops.prune_connector_day_gates (
+    day_utc,
+    connector_id,
+    history_done,
+    updated_at
+  )
+  select
+    sc.day_utc,
+    sc.connector_id,
+    false,
+    now()
+  from source_changes sc
+  on conflict (day_utc, connector_id)
+  do update set
+    history_done = false,
+    history_run_id = null,
+    history_manifest_key = null,
+    history_manifest_hash = null,
+    history_row_count = null,
+    history_file_count = null,
+    history_total_bytes = null,
+    history_completed_at = null,
+    completion_source = null,
+    updated_at = now()
+  returning day_utc, connector_id
 )
 select
   u.*,
   u.expected_row_count::bigint as source_row_count,
   0::bigint as excluded_row_count,
-  '{}'::jsonb as excluded_pollutant_counts
+  '{}'::jsonb as excluded_pollutant_counts,
+  (ig.day_utc is not null) as source_changed_connector_gate_invalidated,
+  sc.previous_expected_row_count,
+  sc.current_expected_row_count,
+  sc.previous_min_observed_at,
+  sc.current_min_observed_at,
+  sc.previous_max_observed_at,
+  sc.current_max_observed_at
 from upserted u
+left join source_changes sc
+  on sc.day_utc = u.day_utc
+ and sc.connector_id = u.connector_id
+left join invalidated_connector_gates ig
+  on ig.day_utc = u.day_utc
+ and ig.connector_id = u.connector_id
 order by u.day_utc, u.connector_id
 `;
 
     const result = await client.query(sql, [latestEligibleWindowEndIso]);
-    return result.rows.map(toConnectorDayRow);
+    return result.rows.map((row) => {
+      const candidate = toConnectorDayRow(row);
+      const invalidated = row.source_changed_connector_gate_invalidated === true;
+      return {
+        ...candidate,
+        source_changed_connector_gate_invalidated: invalidated,
+        source_change_invalidation: invalidated
+          ? {
+            day_utc: candidate.day_utc,
+            connector_id: candidate.connector_id,
+            previous_expected_row_count: String(row.previous_expected_row_count),
+            current_expected_row_count: String(row.current_expected_row_count),
+            previous_min_observed_at: row.previous_min_observed_at
+              ? new Date(row.previous_min_observed_at).toISOString()
+              : null,
+            current_min_observed_at: row.current_min_observed_at
+              ? new Date(row.current_min_observed_at).toISOString()
+              : null,
+            previous_max_observed_at: row.previous_max_observed_at
+              ? new Date(row.previous_max_observed_at).toISOString()
+              : null,
+            current_max_observed_at: row.current_max_observed_at
+              ? new Date(row.current_max_observed_at).toISOString()
+              : null,
+          }
+          : null,
+      };
+    });
   }
 
   const sql = `
@@ -6700,6 +6831,8 @@ export async function runPhaseBBackup({
   logStructured,
   runId = randomUUID(),
   nowUtc = nowIso(),
+  nowMs = Date.now,
+  createPgClient = (config) => new Client(config),
 }) {
   const runtime = {
     ...phaseB,
@@ -6708,6 +6841,7 @@ export async function runPhaseBBackup({
     staging_prefix: `${phaseB.staging_prefix_base}/run_id=${runId}`,
     logStructured,
     run_budget: createPhaseBRunBudgetForTest({
+      nowMs,
       maxSecondsPerRun: phaseB.max_seconds_per_run,
       stopBeforeTimeoutSeconds: phaseB.stop_before_timeout_seconds,
     }),
@@ -6753,6 +6887,8 @@ export async function runPhaseBBackup({
     active_scope_adoption_completed: 0,
     active_scope_adoption_blocked: 0,
     historical_adoption_skipped: true,
+    source_changed_connector_gate_invalidated_count: 0,
+    source_changed_connector_gate_invalidated_preview: [],
     total_written_rows: "0",
     total_written_bytes: "0",
     completed_days: 0,
@@ -6761,6 +6897,7 @@ export async function runPhaseBBackup({
     completed_preview: [],
     blocked_preview: [],
     adoption_failures: [],
+    aggregate_day_failures: [],
     prune_check_dropbox_exports: 0,
     prune_check_dropbox_failures: 0,
     pm_context: {
@@ -6815,7 +6952,9 @@ export async function runPhaseBBackup({
   let totalWrittenRows = 0n;
   let totalWrittenBytes = 0n;
 
-  await withPgClient(runtime.supabase_db_url, async (controlClient) => {
+  const controlPgTimeouts = derivePhaseBPgTimeoutsForTest(runtime);
+  try {
+    await withPgClient(runtime.supabase_db_url, async (controlClient) => {
     if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
       stopPhaseBForBudget(summary, runtime, { operation: "candidate_discovery" });
       return;
@@ -6826,6 +6965,16 @@ export async function runPhaseBBackup({
       runtime,
     );
     summary.populated_candidates = upsertedCandidates.length;
+    const sourceChangedInvalidations = upsertedCandidates
+      .filter((candidate) => candidate.source_changed_connector_gate_invalidated === true)
+      .map((candidate) => candidate.source_change_invalidation);
+    summary.source_changed_connector_gate_invalidated_count = sourceChangedInvalidations.length;
+    summary.source_changed_connector_gate_invalidated_preview = sourceChangedInvalidations.slice(0, 10);
+    logStructured("INFO", "phase_b_history_source_changed_connector_gate_invalidation_summary", {
+      run_id: runId,
+      source_changed_connector_gate_invalidated_count: sourceChangedInvalidations.length,
+      source_changed_connector_gate_invalidated_preview: sourceChangedInvalidations.slice(0, 10),
+    });
     if (runtime.history_write_version === "v2" && upsertedCandidates.length > 0) {
       logStructured("INFO", "phase_b_history_candidate_eligibility_summary", {
         run_id: runId,
@@ -7118,6 +7267,30 @@ export async function runPhaseBBackup({
           });
           break;
         }
+        if (connectorGateCompleted) {
+          await updateDayGateBlocked(controlClient, candidate.day_utc);
+          dayResults.set(candidate.day_utc, {
+            day_utc: candidate.day_utc,
+            history_done: false,
+            pending_connectors: 0,
+            reason: "aggregate_day_finalization_failed",
+          });
+          summary.aggregate_day_failures.push({
+            day_utc: candidate.day_utc,
+            connector_id: candidate.connector_id,
+            error: message,
+          });
+          logStructured("ERROR", "phase_b_history_aggregate_day_finalization_failed", {
+            run_id: runId,
+            day_utc: candidate.day_utc,
+            connector_id: candidate.connector_id,
+            error: message,
+            connector_gate_preserved: true,
+            aggregate_day_gate_complete: false,
+            next_action: "targeted_aqi_history_repair",
+          });
+          continue;
+        }
         try {
           if (runtime.history_write_version === "v2" && !connectorGateCompleted) {
             await cleanupCandidatePartialOutput({
@@ -7253,7 +7426,29 @@ export async function runPhaseBBackup({
         }
       }
     }
-  });
+    }, {
+      statementTimeoutMs: controlPgTimeouts.statement_timeout_ms,
+      connectionTimeoutMs: controlPgTimeouts.connection_timeout_ms,
+      createClient: createPgClient,
+    });
+  } catch (error) {
+    if (
+      (error instanceof PhaseBHistoryBudgetExhaustedError)
+      || (isPgStatementTimeoutError(error) && !hasBudgetFor(runtime, 2_000))
+    ) {
+      stopPhaseBForBudget(summary, runtime, {
+        operation: error.operation || "control_database_statement",
+      });
+      logPhaseB(runtime, "WARNING", "phase_b_history_control_database_stopped_budget", {
+        operation: summary.budget_stop.operation,
+        postgres_error_code: error?.code || null,
+        postgres_statement_timeout_ms: controlPgTimeouts.statement_timeout_ms,
+        postgres_connection_timeout_ms: controlPgTimeouts.connection_timeout_ms,
+      });
+    } else {
+      throw error;
+    }
+  }
 
   logStructured("INFO", "phase_b_history_active_scope_adoption_summary", {
     run_id: runId,
@@ -7312,6 +7507,7 @@ export async function runPhaseBBackup({
   summary.completed_preview = dayStates.slice(0, 25);
   summary.blocked_preview = dayStates.filter((state) => state.history_done !== true).slice(0, 25);
   summary.adoption_failures = summary.adoption_failures.slice(0, 25);
+  summary.aggregate_day_failures = summary.aggregate_day_failures.slice(0, 25);
   summary.failures = summary.failures.slice(0, 25);
 
   const cleanupSummary = summary.status === "stopped_budget"
@@ -7319,15 +7515,11 @@ export async function runPhaseBBackup({
     : await cleanupStaging({ runtime, logStructured });
   summary.staging_cleanup = cleanupSummary;
 
-  try {
-    summary.run_manifest_key = await writeRunManifest({ runtime, runSummary: summary });
-  } catch (error) {
-    if (summary.status !== "stopped_budget") throw error;
+  if (summary.status === "stopped_budget") {
     summary.run_manifest_key = null;
-    summary.run_manifest_error = error instanceof Error ? error.message : String(error);
-    logPhaseB(runtime, "WARNING", "phase_b_history_run_manifest_failed_after_budget_stop", {
-      ...errorLogFields(error),
-    });
+    summary.run_manifest = { skipped: true, reason: "reserved_for_final_reporting" };
+  } else {
+    summary.run_manifest_key = await writeRunManifest({ runtime, runSummary: summary });
   }
 
   if (runtime.prune_check_dropbox?.enabled) {
