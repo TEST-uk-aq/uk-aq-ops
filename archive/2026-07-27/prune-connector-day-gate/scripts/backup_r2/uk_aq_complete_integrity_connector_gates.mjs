@@ -13,12 +13,6 @@ import {
 } from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 const TEST_BUCKET = "uk-aq-history-cic-test";
-const INTEGRITY_ACTIVE_OBSERVATION_POLLUTANTS = Object.freeze([
-  "pm25",
-  "pm10",
-  "no2",
-  "o3",
-]);
 
 async function readStdinJson() {
   const chunks = [];
@@ -30,39 +24,25 @@ async function readStdinJson() {
   return parsed;
 }
 
-export async function completeIntegrityConnectorDayGates({
-  payload,
-  runtime,
-  databaseUrl,
-  dependencies = {},
-}) {
-  const withGateClient = dependencies.withConnectorDayGateClient
-    || withConnectorDayGateClient;
-  const verifyHistory = dependencies.verifyObservationConnectorHistory
-    || verifyObservationConnectorHistory;
-  const completeGate = dependencies.setConnectorDayGateComplete
-    || setConnectorDayGateComplete;
-  const incompleteGate = dependencies.setConnectorDayGateIncomplete
-    || setConnectorDayGateIncomplete;
+export async function completeIntegrityConnectorDayGates({ payload, runtime, databaseUrl }) {
   const connectorDays = payload.connector_days.map((entry) =>
     normalizeConnectorDayPair(entry?.day_utc, entry?.connector_id)
   );
   const results = [];
-  await withGateClient(databaseUrl, async (client) => {
+  await withConnectorDayGateClient(databaseUrl, async (client) => {
     for (const pair of connectorDays) {
       try {
         const manifestKey = canonicalObservationConnectorManifestKey(
           pair.day_utc,
           pair.connector_id,
         );
-        const evidence = await verifyHistory({
+        const evidence = await verifyObservationConnectorHistory({
           runtime,
           dayUtc: pair.day_utc,
           connectorId: pair.connector_id,
           manifestKey,
-          activePollutants: INTEGRITY_ACTIVE_OBSERVATION_POLLUTANTS,
         });
-        await completeGate(client, {
+        await setConnectorDayGateComplete(client, {
           ...pair,
           history_run_id: payload.history_run_id,
           history_manifest_key: evidence.history_manifest_key,
@@ -75,7 +55,7 @@ export async function completeIntegrityConnectorDayGates({
         const { connector_manifest: _connectorManifest, ...gateEvidence } = evidence;
         results.push({ ...pair, status: "complete", ...gateEvidence });
       } catch (error) {
-        await incompleteGate(client, pair);
+        await setConnectorDayGateIncomplete(client, pair);
         results.push({
           ...pair,
           status: "failed",
