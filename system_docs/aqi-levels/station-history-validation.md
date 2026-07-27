@@ -16,10 +16,11 @@ Before editing, confirm:
 4. the station-history fetch entry point receives a Cloudflare execution context supporting `waitUntil`;
 5. the exact recent-head and older observation/AQI routes;
 6. the complete PM context range available across R2 and ingest;
-7. all active website consumers of `station-history-loader.js`;
+7. all active website consumers of the shared station-chart modules and any remaining `station-history-loader.js` facade;
 8. the current integrity repair-planning and execution gates;
-9. the current browser cache contract and separate AQI request fallback;
-10. the current R2 AQI algorithm-version and comparison fields.
+9. the current browser cache contract and compatibility AQI client;
+10. the current R2 AQI algorithm-version and comparison fields;
+11. the module and page-adapter ownership required by [`../station_charts/contract.md`](../station_charts/contract.md).
 
 These are targeted structural checks, not a pre-deployment operational test programme.
 
@@ -27,12 +28,12 @@ These are targeted structural checks, not a pre-deployment operational test prog
 
 Run only:
 
-- syntax/type checks for changed JavaScript, TypeScript and MJS files;
-- a Cloudflare Worker build or dry-run check;
-- schema migration and workflow parsing checks;
+- syntax or module-import checks for changed JavaScript, TypeScript and MJS files;
+- a Cloudflare Worker build or dry-run check when Worker code changes;
+- schema migration and workflow parsing checks when those files change;
 - the smallest existing focused binding test;
 - one targeted continuity boundary regression only if required to protect a high-risk selection rule;
-- one directly relevant existing response parser or AQI comparator check when already present.
+- one directly relevant existing response parser, AQI comparator or shared station-chart helper check when affected.
 
 Do not run:
 
@@ -167,17 +168,19 @@ A missing endpoint remains uncoloured. Neither neighbouring AQI value may span i
 
 ### Settled AQI gaps and source switching
 
-For a successfully evaluated requested interval containing missing observations, excluded invalid inputs or `insufficient_samples` AQI results:
+For a successfully evaluated, parseable and authoritative-identity-valid requested interval containing missing observations, excluded invalid inputs, insufficient samples, unfamiliar diagnostic strings or no valid AQI row for some hours:
 
 - cache all valid AQI rows;
 - preserve partial, status and missing-reason diagnostics;
+- record unfamiliar diagnostics through bounded chart diagnostics;
 - leave uncalculable hours blank;
 - record the requested interval as settled for browser request planning without labelling the response complete;
-- do not show a user-facing incomplete or error message solely for those blank hours;
+- do not use an exhaustive browser allow-list of Worker diagnostic strings as a visible-success condition;
+- do not show a chart-wide user-facing incomplete or error message for the AQI-only outcome;
 - after switching away and back, reuse the settled cache rather than issuing the same AQI request again;
 - commit the cached AQI layer once after the approximately 50 millisecond source-change transition.
 
-A request, service, parsing, identity or physical-read failure must remain unsettled and retryable. It may show an AQI update error because accurate settlement was not achieved.
+A network, HTTP, parsing, identity or unsafe replacement-conflict failure remains unsettled and retryable. When the observation chart remains usable, an AQI-only failure must leave the AQI layer blank or use an AQI-local unavailable state. It must not use the chart-wide red error banner.
 
 ## Stored-R2 validation cases
 
@@ -210,7 +213,7 @@ A validation read failure or mismatch must not alter the foreground response or 
 4. Confirm family-scoped proposed churn.
 5. Write and verify changed TEST binding objects.
 6. Deploy station-history compatibility support.
-7. Deploy the website combined-response consumer.
+7. Deploy the website combined-response consumer through the shared station-chart client/controller boundary.
 8. Enable continuity.
 9. Enable calculated historical AQI.
 10. Enable validation mode `all`.
@@ -247,7 +250,7 @@ Confirm:
 
 ### 3. Compatibility fallback
 
-Disable the calculated-history feature and confirm the retained separate R2 AQI path works without a code rollback.
+Disable the calculated-history feature and confirm the retained separate R2 AQI source works through the same shared chart controller, cache, AQI-source controller and renderer without a code rollback.
 
 Disable continuity and confirm exact requested-timeseries behaviour is restored.
 
@@ -260,12 +263,23 @@ Confirm:
 - the old AQI layer clears immediately;
 - valid bands for the new source appear in one visible commit;
 - uncalculable hours remain blank;
-- no incomplete-AQI warning is shown solely for those gaps;
+- no chart-wide incomplete-AQI or AQI-update error is shown;
 - retained observation lines are neither refetched nor repainted;
 - switching away and back reuses the settled AQI cache;
-- the repeated switch normally completes in about 50 milliseconds and does not repeat the same AQI network work.
+- the repeated switch normally completes in about 50 milliseconds and does not repeat the same AQI network work;
+- resize changes geometry only and does not create or clear AQI request ownership.
 
-Separately force or observe one genuine AQI request failure and confirm it remains retryable and uses the existing error state.
+Separately force or observe one genuine AQI-only request failure and confirm it remains retryable, leaves the observation chart usable, does not use the chart-wide red error banner and is represented only by bounded diagnostics or an AQI-local unavailable state.
+
+### 5. Shared frontend ownership
+
+Confirm:
+
+- Hex Map and Sensors use the same active station-chart controller and renderer modules;
+- compatibility mode changes only the data client;
+- one controller instance and one page-adapter listener set exist per mounted chart;
+- no old inline controller also handles the same event;
+- AQI-only switching does not activate full-chart loading state.
 
 ## Integrity enablement validation
 
@@ -292,10 +306,12 @@ Initial TEST acceptance requires:
 6. correct PM context across the identity transition;
 7. correct hour-ending band rendering;
 8. independent observation and AQI completeness;
-9. authoritative AQI gaps remain blank without a false user-facing warning;
-10. settled partial AQI intervals are reused on later source switches;
-11. historical repair still disabled until deliberately enabled;
-12. no R2 writes caused by chart requests.
+9. authoritative AQI gaps remain blank without a chart-wide user-facing warning;
+10. successfully evaluated AQI intervals are reused on later source switches;
+11. Hex Map and Sensors use the shared controller, cache and renderer;
+12. compatibility mode uses the shared frontend architecture;
+13. historical repair remains disabled until deliberately enabled;
+14. no R2 writes are caused by chart requests.
 
 ## Rollback validation
 
@@ -308,4 +324,4 @@ UK_AQ_STATION_HISTORY_CALCULATED_HISTORY_AQI_ENABLED=false
 UK_AQ_STATION_HISTORY_CONTINUITY_ENABLED=false
 ```
 
-Confirm the website returns to the retained compatibility path. Do not rewrite corrected historical R2 identity merely to roll back chart behaviour.
+Confirm the website returns to the retained compatibility data client through the same shared station-chart controller and renderer. Do not rewrite corrected historical R2 identity merely to roll back chart behaviour.
