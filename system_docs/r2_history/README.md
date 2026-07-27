@@ -9,6 +9,7 @@ This area governs:
 - v2 history Integrity detection, planning and repair;
 - scheduled Integrity daily date selection;
 - the active Prune Daily Phase B observation and AQI history write pipeline;
+- connector-day observation deletion gates and aggregate whole-day completion gates;
 - observation content hashing and verification-status preservation;
 - targeted v2 index generation and repair gates.
 
@@ -29,11 +30,13 @@ For binding and continuity changes:
 For Integrity changes, also read:
 
 - [`integrity.md`](integrity.md);
+- [`prune_connector_day_gate.md`](prune_connector_day_gate.md) where a real repair can establish or invalidate prune eligibility;
 - [`daily_profile_selection.md`](daily_profile_selection.md) where scheduled selection is involved.
 
-For Prune Daily Phase B observation/AQI writes, also read:
+For Prune Daily Phase B observation/AQI writes and IngestDB deletion safety, also read:
 
-- [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
+- [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md);
+- [`prune_connector_day_gate.md`](prune_connector_day_gate.md).
 
 For calculated station-chart AQI and website display, also read:
 
@@ -96,6 +99,19 @@ Required behaviour includes:
 - the pollutant manifest contains deterministic status counts;
 - the existing Dropbox manifest/day backup carries the data and hash without a separate hash object.
 
+## Prune deletion gate model
+
+The authoritative gate split is defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md).
+
+Required behaviour includes:
+
+- IngestDB observation deletion is authorised by the exact `day_utc + connector_id` gate;
+- one incomplete connector does not block another complete connector on the same day;
+- the existing day gate remains the aggregate whole-day completion gate;
+- a day gate cannot substitute for missing connector-level evidence;
+- Prune Daily Phase B and real Integrity repair may establish connector-level completion only after verified live R2 observation history and required observation indexes exist;
+- check-only and dry-run Integrity modes cannot change prune eligibility.
+
 ## AQI writer source boundary
 
 For the observation-derived Phase B AQI path:
@@ -103,7 +119,7 @@ For the observation-derived Phase B AQI path:
 - target-day IngestDB observations remain the source for target-day R2 observations and target-day AQI input;
 - only the preceding 23 hourly PM2.5 and PM10 aggregates are read from ObsAQIDB as context;
 - context rows are not written into the target-day observation partition or previous-day AQI output;
-- incomplete or truncated context fails closed and keeps pruning blocked.
+- incomplete or truncated context fails closed for the affected connector and keeps the aggregate day gate incomplete.
 
 ## Integrity historical rollover rule
 
@@ -123,6 +139,7 @@ Unknown, ambiguous or contradictory identity remains fail-closed.
 - `workers/uk_aq_aqi_history_r2_api_worker/`
 - `workers/uk_aq_cache_proxy/src/station_history/`
 - `workers/uk_aq_station_history/`
+- `workers/uk_aq_prune_daily/server.mjs`
 - `workers/uk_aq_prune_daily/phase_b_history_r2.mjs`
 - `workers/uk_aq_backfill_local/`
 - `lib/aqi/aqi_levels.mjs`
