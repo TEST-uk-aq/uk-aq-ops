@@ -57,6 +57,7 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 | Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current |
 | Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Authoritative for stable bindings, embedded continuity, integrity, targeted indexes and Phase B history writes |
 | Calculated hourly AQI and station-chart bands | [`aqi-levels/`](aqi-levels/) | Authoritative and current, including continuity-aware calculated chart AQI and asynchronous R2 validation |
+| Shared website station-chart frontend | [`station_charts/`](station_charts/) | Authoritative for modular chart architecture, browser cache ownership, AQI-source switching, rendering and page adapters |
 | Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending outside completed R2-history contracts |
 | Observs outbox and partition maintenance | `observs_operations/` | Migration analysis pending |
 | Public and private R2-backed APIs outside completed history/AQI boundaries | `api_services/` | Migration analysis pending |
@@ -68,11 +69,11 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 | Postcode and geography lookup products | [`geography/`](geography/) | Authoritative and current |
 | Shared runtime components and cross-area invariants | `shared/` | Migration analysis pending |
 
-Directories marked pending are proposed area boundaries. They do not override completed contracts in `r2_history/`, `aqi-levels/`, `latest_snapshot/`, `dashboards/` or `geography/`.
+Directories marked pending are proposed area boundaries. They do not override completed contracts in `r2_history/`, `aqi-levels/`, `station_charts/`, `latest_snapshot/`, `dashboards/` or `geography/`.
 
 ## R2 history and station-history reading set
 
-Any change involving timeseries identity, historical charts, R2 observations, R2 AQI or Integrity rollover repair must read:
+Any change involving timeseries identity, historical charts, R2 observations, R2 AQI, station-chart frontend behaviour or Integrity rollover repair must read:
 
 1. [`r2_history/README.md`](r2_history/README.md)
 2. [`r2_history/contract.md`](r2_history/contract.md)
@@ -83,8 +84,12 @@ Any change involving timeseries identity, historical charts, R2 observations, R2
 7. [`aqi-levels/contract.md`](aqi-levels/contract.md)
 8. [`aqi-levels/station-history-contract.md`](aqi-levels/station-history-contract.md)
 9. [`aqi-levels/station-history-validation.md`](aqi-levels/station-history-validation.md)
+10. [`station_charts/README.md`](station_charts/README.md)
+11. [`station_charts/contract.md`](station_charts/contract.md)
 
 The specific station-history contract deliberately changes visible chart AQI source precedence while preserving persisted R2 AQI as validation evidence.
+
+The shared station-chart contract governs browser architecture, cache ownership, AQI-source switching, D3 rendering and page-adapter reuse without changing the Worker or R2 data contracts.
 
 ## Current continuity decision
 
@@ -111,6 +116,8 @@ When enabled:
 - validation does not delay, fail or redraw the chart;
 - the previous separate foreground R2 AQI path remains a feature-flag fallback;
 - historical identity repair remains gated until TEST deployment succeeds.
+
+The website consumes this through one shared modular station-chart controller and renderer. The compatibility source remains a data-client adapter rather than a second chart implementation.
 
 ## Repository-wide operating rules
 
