@@ -8,7 +8,11 @@ This area governs:
 - embedded multi-member continuity families in schema-version-2 bindings;
 - v2 history Integrity detection, planning and repair;
 - scheduled Integrity daily date selection;
-- the active Prune Daily Phase B observation and AQI history write pipeline;
+- the connector-specific IngestDB-to-R2 boundary used by Integrity;
+- concurrent Prune Daily and Integrity writer coordination;
+- connector-day, day-finalisation and global-index advisory locks;
+- the shared canonical R2 v2 connector-day writer and parent finalisers;
+- the active Prune Daily Phase B observation and observation-derived AQI history write pipeline;
 - connector-day observation deletion gates and aggregate whole-day completion gates;
 - physical Parquet identity validation before connector-day deletion gates are completed;
 - observation content hashing and verification-status preservation;
@@ -31,12 +35,14 @@ For binding and continuity changes:
 For Integrity changes, also read:
 
 - [`integrity.md`](integrity.md);
-- [`prune_connector_day_gate.md`](prune_connector_day_gate.md) where a real repair can establish or invalidate prune eligibility;
-- [`connector_gate_file_identity.md`](connector_gate_file_identity.md) where a real repair or recovery operation verifies physical Parquet identity and opaque preserved children before completing a deletion gate;
+- [`history_writer_coordination.md`](history_writer_coordination.md) for the request-level IngestDB boundary, shared writer and lock hierarchy;
+- [`prune_connector_day_gate.md`](prune_connector_day_gate.md) for the Prune Daily-only observation deletion gate;
+- [`connector_gate_file_identity.md`](connector_gate_file_identity.md) for physical Parquet identity validation used by Prune Daily gate completion and explicit recovery verification;
 - [`daily_profile_selection.md`](daily_profile_selection.md) where scheduled selection is involved.
 
 For Prune Daily Phase B observation/AQI writes and IngestDB deletion safety, also read:
 
+- [`history_writer_coordination.md`](history_writer_coordination.md);
 - [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md);
 - [`prune_connector_day_gate.md`](prune_connector_day_gate.md);
 - [`connector_gate_file_identity.md`](connector_gate_file_identity.md).
@@ -88,7 +94,8 @@ The existing backup category remains `timeseries_binding_v2`; there is no separa
 The current observation-content-hash and verification-status contracts are jointly defined by:
 
 - [`integrity.md`](integrity.md) for source normalisation, comparison, fault classification, planning, repair and post-repair verification;
-- [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md) for the normal Phase B writer, canonical Parquet schema and manifest publication.
+- [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md) for the normal Phase B writer, canonical Parquet schema and manifest publication;
+- [`history_writer_coordination.md`](history_writer_coordination.md) for shared writer ownership and concurrent live mutation.
 
 Required behaviour includes:
 
@@ -102,9 +109,26 @@ Required behaviour includes:
 - the pollutant manifest contains deterministic status counts;
 - the existing Dropbox manifest/day backup carries the data and hash without a separate hash object.
 
+## Shared history writer and lock hierarchy
+
+The authoritative coordination contract is [`history_writer_coordination.md`](history_writer_coordination.md).
+
+Required behaviour includes:
+
+- each connector has one continuous boundary, with earlier days in R2 History and the earliest IngestDB day and later owned by Prune Daily;
+- if any requested connector's Integrity range reaches its earliest IngestDB day, the complete Integrity request fails immediately;
+- Integrity does not clip the range or skip only the blocking connector;
+- Prune Daily and Integrity may run concurrently on non-conflicting work;
+- no global "Prune Daily is running" exclusion is required;
+- live writers share a connector-day lock for exact `day_utc + connector_id` mutation;
+- parent day-manifest merging is serialised by a day-finalisation lock;
+- aggregate/latest index updates are serialised by a short environment-scoped global index lock;
+- locks are acquired sequentially and are not nested across those three scopes;
+- day finalisation preserves connectors already present in R2 and does not rebuild a day solely from the current run's connector set.
+
 ## Prune deletion gate model
 
-The authoritative gate split is defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md). Physical Parquet identity and opaque-child gate validation are defined in [`connector_gate_file_identity.md`](connector_gate_file_identity.md).
+The authoritative gate split is defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md). Physical Parquet identity validation is defined in [`connector_gate_file_identity.md`](connector_gate_file_identity.md).
 
 Required behaviour includes:
 
@@ -112,19 +136,27 @@ Required behaviour includes:
 - one incomplete connector does not block another complete connector on the same day;
 - the existing day gate remains the aggregate whole-day completion gate;
 - a day gate cannot substitute for missing connector-level evidence;
-- Prune Daily Phase B and real Integrity repair may establish connector-level completion only after verified live R2 observation history and required observation indexes exist;
-- every referenced Parquet must match both its recorded byte count and its unambiguous SHA-256 or quoted R2 ETag identity before the gate becomes complete;
-- Integrity applies full logical validation to `pm25`, `pm10`, `no2` and `o3`, while preserved out-of-scope children still require structural manifest, physical file identity and targeted-index proof;
+- only Prune Daily may establish, invalidate or complete connector-day prune gates;
+- Integrity, migration and generic shared-writer code never update prune gates;
+- historical R2 connector-days with no corresponding IngestDB rows require no prune gate;
+- every referenced Parquet must match its required physical identity before Prune Daily completes the connector gate;
+- AQI success is not required for connector observation pruning;
 - check-only and dry-run Integrity modes cannot change prune eligibility.
 
 ## AQI writer source boundary
 
-For the observation-derived Phase B AQI path:
+The only supported Phase B AQI implementation is the observation-derived writer defined in [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
 
-- target-day IngestDB observations remain the source for target-day R2 observations and target-day AQI input;
-- only the preceding 23 hourly PM2.5 and PM10 aggregates are read from ObsAQIDB as context;
+Required behaviour includes:
+
+- target-day IngestDB observations are the source for target-day R2 observations and target-day AQI input;
+- only the preceding 23 hourly PM2.5 and PM10 observation aggregates are read from ObsAQIDB as calculation context;
+- ObsAQIDB materialised AQI is not a Phase B source or fallback;
 - context rows are not written into the target-day observation partition or previous-day AQI output;
-- incomplete or truncated context fails closed for the affected connector and keeps the aggregate day gate incomplete.
+- the legacy AQI RPC/export selector, aliases, v1 AQI output path and fallback implementation are retired;
+- incomplete or truncated context fails AQI for the affected connector-day;
+- an AQI-only failure does not block or revoke a verified connector observation deletion gate;
+- AQI data, debug, manifest and index completion remain separate aggregate outcomes.
 
 ## Integrity historical rollover rule
 
@@ -141,6 +173,7 @@ Unknown, ambiguous or contradictory identity remains fail-closed.
 - `workers/shared/uk_aq_r2_history_index.mjs`
 - `workers/shared/uk_aq_observation_content_hash.mjs`
 - `workers/shared/uk_aq_r2_file_identity.mjs`
+- the shared history writer and lock helper introduced under the coordination contract
 - `workers/uk_aq_observs_history_r2_api_worker/`
 - `workers/uk_aq_aqi_history_r2_api_worker/`
 - `workers/uk_aq_cache_proxy/src/station_history/`
