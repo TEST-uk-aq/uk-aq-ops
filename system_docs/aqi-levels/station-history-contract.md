@@ -160,6 +160,8 @@ The website draws each DAQI and European AQI band from `n - 1 hour` to `n`.
 
 Missing hours remain blank. The final coloured band ends at the final valid endpoint and must not extend one hour beyond the final concentration value.
 
+A missing AQI value caused by absent observations, excluded invalid inputs or insufficient calculation samples is normal blank output. It must not be stretched across neighbouring hours, replaced from stored AQI or presented as a user-facing error solely because no band can be calculated for that hour.
+
 ## Combined response contract
 
 The station-series response must contain independently complete sections equivalent to:
@@ -305,13 +307,16 @@ The website loader must:
 
 - keep sending one current timeseries ID;
 - consume observations and calculated AQI from the combined response;
-- render each combined chunk progressively;
+- render each combined chunk progressively except where the atomic AQI source-switch contract explicitly suppresses incremental AQI repainting;
 - stop the normal separate historical AQI request when the new response is available and enabled;
 - retain compatibility fallback for older/disabled responses;
 - never wait for background validation;
 - never redraw because validation completes;
 - keep existing abort, stale fallback, cache and progressive loading behaviour unless explicitly changed elsewhere;
-- bump the browser storage/cache contract so old separately sourced AQI is not mixed with calculated-response AQI.
+- bump the browser storage/cache contract so old separately sourced AQI is not mixed with calculated-response AQI;
+- distinguish response completeness from whether an AQI request interval has reached an authoritative settled result;
+- reuse settled AQI intervals on later source switches even when their valid output contains blank hours;
+- avoid a user-facing incomplete warning solely because some AQI hours could not be calculated from the available source observations.
 
 The browser must not expose continuity mechanics as a requirement to users.
 
@@ -330,7 +335,13 @@ A response must be partial or incomplete when any required condition is unresolv
 - unresolved source seam;
 - malformed binding identity.
 
-A partial response must not be cached as complete.
+A partial response must not be cached or labelled as complete.
+
+Browser request planning must nevertheless distinguish response completeness from request settlement. A terminal AQI response may be recorded as settled for its requested interval when the interval was successfully evaluated and missing AQI values are authoritative consequences of source-observation gaps, excluded invalid inputs or insufficient calculation samples. Valid rows remain cached, affected hours remain blank, and all partial and missing-reason diagnostics remain preserved.
+
+A settled partial AQI interval must not be repeatedly refetched solely because those blank hours exist. It must not produce a user-facing incomplete or error message solely for those gaps.
+
+A request, service, parsing, identity or physical-read failure does not establish authoritative settlement. Cancellation, scan-budget exhaustion or another unresolved response condition remains retryable. A user-facing AQI update error is reserved for an actual failure that prevents accurate settlement.
 
 ## Feature flags
 
