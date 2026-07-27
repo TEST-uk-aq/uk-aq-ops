@@ -175,7 +175,7 @@ For a successfully evaluated requested interval containing missing observations,
 - record the requested interval as settled for browser request planning without labelling the response complete;
 - do not show a user-facing incomplete or error message solely for those blank hours;
 - after switching away and back, reuse the settled cache rather than issuing the same AQI request again;
-- commit the cached AQI layer once after the approximately 200 millisecond source-change transition.
+- commit the cached AQI layer once after the approximately 50 millisecond source-change transition.
 
 A request, service, parsing, identity or physical-read failure must remain unsettled and retryable. It may show an AQI update error because accurate settlement was not achieved.
 
@@ -263,7 +263,7 @@ Confirm:
 - no incomplete-AQI warning is shown solely for those gaps;
 - retained observation lines are neither refetched nor repainted;
 - switching away and back reuses the settled AQI cache;
-- the repeated switch normally completes in about 200 milliseconds and does not repeat the same AQI network work.
+- the repeated switch normally completes in about 50 milliseconds and does not repeat the same AQI network work.
 
 Separately force or observe one genuine AQI request failure and confirm it remains retryable and uses the existing error state.
 
