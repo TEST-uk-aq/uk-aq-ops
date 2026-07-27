@@ -264,7 +264,7 @@ When the user chooses a different selected sensor for AQI bands, the website mus
 1. leave all observation lines and retained non-AQI chart layers in place;
 2. create or advance a source-switch transition token identifying the selected sensor, requested range and current load generation;
 3. immediately remove the previous sensor's AQI bands so stale bands are never shown under the new selection;
-4. show an intentionally blank/loading AQI band area for approximately 200 milliseconds;
+4. show an intentionally blank/loading AQI band area for approximately 50 milliseconds;
 5. if calculated AQI for the new source and requested range is already settled in cache, including any authoritative blank intervals, render that cached result once after the brief transition;
 6. otherwise keep the AQI area blank/loading while unsettled AQI work is fetched using the existing bounded concurrency, priority and ordered-settlement rules;
 7. settle each valid response into AQI cache or transition staging while preserving independent response-completeness, request-settlement, gap and partial-reason metadata;
@@ -282,9 +282,9 @@ When the user chooses a different selected sensor for AQI bands, the website mus
 
 The atomic requirement applies to the visible AQI-layer commit, not to network execution. Missing chunks should continue to fetch in parallel and settle newest-to-oldest. The website must not implement this behaviour by serialising requests, adding an arbitrary long delay or recalculating AQI in browser code.
 
-The approximately 200 millisecond blank state is a user-interface transition, not a minimum network delay. It confirms that the selected AQI source changed and prevents the previous sensor's bands appearing to belong to the new sensor.
+The approximately 50 millisecond blank state is a user-interface transition, not a minimum network delay. It confirms that the selected AQI source changed and prevents the previous sensor's bands appearing to belong to the new sensor.
 
-When the selected range is already settled in AQI cache, the transition should normally finish in about 200 milliseconds even when the cached result contains authoritative blank intervals. A first uncached or genuinely retryable range may take longer while required network work completes. Once that range settles, later switches must reuse it rather than repeating the same work.
+When the selected range is already settled in AQI cache, the transition should normally finish in about 50 milliseconds even when the cached result contains authoritative blank intervals. A first uncached or genuinely retryable range may take longer while required network work completes. Once that range settles, later switches must reuse it rather than repeating the same work.
 
 This exception does not remove progressive rendering from initial chart loading, observation loading, range extension or background secondary AQI prefetch. It applies only to changing the AQI source on an already displayed chart.
 
