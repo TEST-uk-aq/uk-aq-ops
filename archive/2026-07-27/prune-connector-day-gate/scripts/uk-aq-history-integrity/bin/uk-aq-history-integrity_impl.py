@@ -20576,173 +20576,6 @@ def run_canonical_apply_executor(
     return {"status": "succeeded", "exit_code": 0, "output": output}
 
 
-def integrity_connector_gate_writes_allowed(effective_mode: str) -> bool:
-    """Connector gate writes belong only to a real canonical repair apply."""
-    return effective_mode == "repair_apply"
-
-
-def integrity_observation_apply_ready_for_connector_gate(
-    run_state: Mapping[str, Any],
-) -> bool:
-    """Allow an observation gate even when a later AQI apply stage failed."""
-    gate_state = run_state.get("connector_day_gate")
-    affected = (
-        list(gate_state.get("affected_connector_days") or [])
-        if isinstance(gate_state, Mapping)
-        else []
-    )
-    if not affected:
-        return False
-    observation_operations = 0
-    for object_key, entry in dict(run_state.get("objects") or {}).items():
-        if not isinstance(entry, Mapping) or _object_operation_domain(str(object_key)) != "observations":
-            continue
-        observation_operations += 1
-        if not entry.get("remote_completed") or not entry.get("r2_verified"):
-            return False
-    for prefix_entry in list(run_state.get("tombstone_prefixes") or []):
-        if not isinstance(prefix_entry, Mapping):
-            continue
-        prefix = str(prefix_entry.get("prefix") or "")
-        if _object_operation_domain(prefix) != "observations":
-            continue
-        observation_operations += 1
-        if not prefix_entry.get("remote_completed") or not prefix_entry.get("deletion_verified"):
-            return False
-    if any(
-        _object_operation_domain(str(object_key)) == "observations"
-        for object_key in dict(run_state.get("uncertain_r2_objects") or {})
-    ):
-        return False
-    return observation_operations > 0
-
-
-def run_integrity_connector_gate_completion(
-    *,
-    run_state: Mapping[str, Any],
-    env: Mapping[str, str],
-    history_run_id: str,
-    final_verification: Mapping[str, Any],
-    log: logging.Logger,
-) -> dict[str, Any]:
-    gate_state = run_state.get("connector_day_gate")
-    connector_days = (
-        list(gate_state.get("affected_connector_days") or [])
-        if isinstance(gate_state, Mapping)
-        else []
-    )
-    if not connector_days:
-        return {
-            "status": "skipped_noop",
-            "connector_day_count": 0,
-            "completed_connector_day_count": 0,
-            "failed_connector_day_count": 0,
-            "results": [],
-        }
-    blocked_pairs: set[tuple[str, int]] = set()
-    block_all = False
-    for scope in list(final_verification.get("remaining_scopes") or []):
-        if not isinstance(scope, Mapping):
-            continue
-        object_key = str(scope.get("object_key") or scope.get("expected_path") or "")
-        observation_scope = (
-            str(scope.get("domain") or "") == "observations"
-            or str(scope.get("stage") or "").startswith("observations_")
-            or "/observations/" in f"/{object_key}"
-            or "/observations_timeseries/" in f"/{object_key}"
-        )
-        if not observation_scope:
-            continue
-        day_utc = str(scope.get("day_utc") or "").strip()
-        try:
-            connector_id = int(scope.get("connector_id") or 0)
-        except (TypeError, ValueError):
-            connector_id = 0
-        if not day_utc or connector_id <= 0:
-            match = re.search(
-                r"day_utc=(\d{4}-\d{2}-\d{2})/connector_id=(\d+)",
-                object_key,
-            )
-            if match:
-                day_utc, connector_id = match.group(1), int(match.group(2))
-        if day_utc and connector_id > 0:
-            blocked_pairs.add((day_utc, connector_id))
-        else:
-            block_all = True
-    eligible_connector_days = [
-        entry for entry in connector_days
-        if not block_all
-        and (
-            str(entry.get("day_utc") or ""),
-            int(entry.get("connector_id") or 0),
-        ) not in blocked_pairs
-    ]
-    blocked_connector_days = [
-        entry for entry in connector_days if entry not in eligible_connector_days
-    ]
-    if not eligible_connector_days:
-        return {
-            "status": "failed",
-            "reason": "observation_final_verification_incomplete",
-            "connector_day_count": len(connector_days),
-            "completed_connector_day_count": 0,
-            "failed_connector_day_count": len(connector_days),
-            "results": [
-                {**dict(entry), "status": "failed", "error": "observation_final_verification_incomplete"}
-                for entry in blocked_connector_days
-            ],
-        }
-    repo_root = _repo_root_for_integrity_script(env)
-    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
-    command = [
-        node_bin,
-        str(repo_root / "scripts/backup_r2/uk_aq_complete_integrity_connector_gates.mjs"),
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=repo_root,
-        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        input=json.dumps({
-            "history_run_id": history_run_id,
-            "connector_days": eligible_connector_days,
-        }),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    try:
-        output = json.loads(completed.stdout) if completed.stdout.strip() else {}
-    except json.JSONDecodeError:
-        output = {}
-    if completed.returncode != 0 or output.get("status") != "succeeded":
-        error = _truncate_text(
-            completed.stderr or completed.stdout or "connector-day gate completion failed",
-            4000,
-        )
-        log.error("connector-day gate completion failed: %s", error)
-        return {
-            "status": "failed",
-            "exit_code": completed.returncode,
-            "error": error,
-            "output": output,
-            "results": output.get("results") if isinstance(output, Mapping) else [],
-        }
-    if blocked_connector_days:
-        blocked_results = [
-            {**dict(entry), "status": "failed", "error": "observation_final_verification_incomplete"}
-            for entry in blocked_connector_days
-        ]
-        return {
-            **output,
-            "status": "failed",
-            "connector_day_count": len(connector_days),
-            "failed_connector_day_count": len(blocked_results),
-            "results": [*(output.get("results") or []), *blocked_results],
-            "exit_code": 0,
-        }
-    return {**output, "exit_code": 0}
-
-
 def _first_value_at_candidates_from_evidence(
     conn: sqlite3.Connection,
     repair_entry: Mapping[str, Any],
@@ -21682,34 +21515,6 @@ def run_v2_integrity_repair_flow(
             log=log,
             require_remote_state=not dry_run,
         )
-    connector_gate_mode = "repair_dry_run" if dry_run else "repair_apply"
-    if (
-        integrity_connector_gate_writes_allowed(connector_gate_mode)
-        and (
-            apply_result.get("status") == "succeeded"
-            or integrity_observation_apply_ready_for_connector_gate(run_state)
-        )
-    ):
-        connector_gate_completion = run_integrity_connector_gate_completion(
-            run_state=run_state,
-            env=env,
-            history_run_id=run_compact,
-            final_verification=final_verification,
-            log=log,
-        )
-    else:
-        connector_gate_completion = {
-            "status": "read_only" if dry_run else "blocked_dependency",
-            "reason": (
-                "repair_dry_run"
-                if dry_run
-                else "canonical_apply_did_not_succeed"
-            ),
-            "connector_day_count": 0,
-            "completed_connector_day_count": 0,
-            "failed_connector_day_count": 0,
-            "results": [],
-        }
     stage_results = [
         {"stage": "observations_proposal", "status": "failed" if observation_failed else "validated", "result": observations},
         {"stage": "observations_metadata_proposal", "status": "failed" if observation_manifest_status in {"failed", "blocked_dependency"} or observation_index_status in {"failed", "blocked_dependency"} else "validated", "result": metadata},
@@ -21726,18 +21531,12 @@ def run_v2_integrity_repair_flow(
             "result": first_value_at_reconciliation,
         },
         {"stage": "final_verification", "status": final_verification.get("status"), "result": final_verification},
-        {
-            "stage": "connector_day_gate_completion",
-            "status": connector_gate_completion.get("status"),
-            "result": connector_gate_completion,
-        },
     ]
     coordinator_failed = (
         proposal_failed
         or apply_result.get("status") == "failed"
         or first_value_at_reconciliation.get("status") == "failed"
         or final_verification.get("status") == "failed"
-        or connector_gate_completion.get("status") == "failed"
     )
     metadata_r2_operation_counts = {
         name: sum(
@@ -21770,7 +21569,6 @@ def run_v2_integrity_repair_flow(
             for status in sorted({str(stage.get("status") or "not_run") for stage in stage_results})
         },
         "final_verification": final_verification,
-        "connector_day_gate_completion": connector_gate_completion,
         "r2_objects_written": int(final_verification.get("r2_objects_written") or 0),
         "r2_objects_deleted": int(final_verification.get("r2_objects_deleted") or 0),
         "r2_objects_changed": int(final_verification.get("r2_objects_changed") or 0),
@@ -22877,17 +22675,6 @@ def collect_preflight_errors(
                 errors.append(
                     f"--env {args.env} but UK_AQ_BACKFILL_ENV_FILE contains /{other_env}/. Refusing to run.",
                 )
-
-        if not args.dry_run and not str(
-            loaded_backfill_env.get("SUPABASE_DB_URL")
-            or loaded_backfill_env.get("DATABASE_URL")
-            or os.environ.get("SUPABASE_DB_URL")
-            or os.environ.get("DATABASE_URL")
-            or ""
-        ).strip():
-            errors.append(
-                "SUPABASE_DB_URL (or DATABASE_URL) is required for real Integrity connector-day gate ownership.",
-            )
 
         nested_wrapper = loaded_backfill_env.get("UK_AQ_BACKFILL_WRAPPER", "").strip()
         wrapper_is_integrity = Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh" if wrapper_raw else False

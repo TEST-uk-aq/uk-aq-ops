@@ -3195,8 +3195,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   fromDayUtc,
   toDayUtc,
   connectorId = null,
-  connectorManifestKey = null,
-  updateLatestIndex = true,
   additionalPollutantManifestTargets = [],
   writeR2 = true,
 }) {
@@ -3218,10 +3216,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   const normalizedConnectorId = connectorId == null ? null : parsePositiveId(connectorId);
   if (connectorId != null && !normalizedConnectorId) {
     throw new Error(`Invalid targeted v2 timeseries connector_id: ${String(connectorId || "")}`);
-  }
-  const normalizedConnectorManifestKey = String(connectorManifestKey || "").trim();
-  if (normalizedConnectorManifestKey && !normalizedConnectorId) {
-    throw new Error("A direct v2 connector manifest target requires connectorId");
   }
 
   const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
@@ -3265,29 +3259,17 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
 
   for (const dayUtc of dayList) {
     const dayManifestKey = `${normalizedDataPrefix}/day_utc=${dayUtc}/manifest.json`;
-    let dayManifestObject = null;
-    let connectorTargets;
-    if (normalizedConnectorManifestKey) {
-      const expectedConnectorManifestKey = `${normalizedDataPrefix}/day_utc=${dayUtc}/connector_id=${normalizedConnectorId}/manifest.json`;
-      if (normalizedConnectorManifestKey !== expectedConnectorManifestKey) {
-        throw new Error(`Direct v2 connector manifest target is not canonical: ${normalizedConnectorManifestKey}`);
-      }
-      connectorTargets = [{
-        connector_id: normalizedConnectorId,
-        manifest_key: normalizedConnectorManifestKey,
-      }];
-    } else {
-      const dayManifestResult = await fetchJsonObjectFromR2IfExists(r2, dayManifestKey);
-      if (!dayManifestResult.exists) {
-        throw new Error(`blocked_dependency|required_day_manifest_unreadable|${dayManifestKey}`);
-      }
-      dayManifestObject = dayManifestResult.payload;
-      connectorTargets = resolveHistoryV2ConnectorManifestTargets(
-        dayManifestObject,
-        dayUtc,
-        normalizedDataPrefix,
-      );
+    const dayManifestResult = await fetchJsonObjectFromR2IfExists(r2, dayManifestKey);
+    if (!dayManifestResult.exists) {
+      throw new Error(`blocked_dependency|required_day_manifest_unreadable|${dayManifestKey}`);
     }
+    const dayManifestObject = dayManifestResult.payload;
+
+    const connectorTargets = resolveHistoryV2ConnectorManifestTargets(
+      dayManifestObject,
+      dayUtc,
+      normalizedDataPrefix,
+    );
 
     if (normalizedConnectorId && !connectorTargets.some(t => t.connector_id === normalizedConnectorId)) {
       warnings.push(
@@ -3528,35 +3510,30 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
         toIsoOrNull(dayManifestObject?.backed_up_at_utc)
         || pickMaxIsoTimestamp(connectorResults.map((entry) => entry.backed_up_at_utc)),
     };
-    if (updateLatestIndex) {
-      daySummaryMap.set(dayUtc, normalizeHistoryV2TimeseriesLatestDaySummary(daySummary, normalizedDomain));
-    }
+    daySummaryMap.set(dayUtc, normalizeHistoryV2TimeseriesLatestDaySummary(daySummary, normalizedDomain));
   }
 
-  const latestPayload = updateLatestIndex
-    ? buildHistoryV2TimeseriesLatestPayload({
-      domain: normalizedDomain,
-      grain: normalizedDomain === "aqilevels" ? "hourly" : null,
-      profile: normalizedDomain === "aqilevels" ? "data" : null,
-      bucket: bucketName || r2.bucket,
-      generatedAt,
-      existingGeneratedAt: existingLatestPayload?.generated_at,
-      indexPrefix: normalizedIndexPrefix,
-      dataPrefix: normalizedDataPrefix,
-      timeseriesIndexPrefix: normalizedTimeseriesPrefix,
-      daySummaries: Array.from(daySummaryMap.values()),
-    })
-    : existingLatestPayload;
+  const latestPayload = buildHistoryV2TimeseriesLatestPayload({
+    domain: normalizedDomain,
+    grain: normalizedDomain === "aqilevels" ? "hourly" : null,
+    profile: normalizedDomain === "aqilevels" ? "data" : null,
+    bucket: bucketName || r2.bucket,
+    generatedAt,
+    existingGeneratedAt: existingLatestPayload?.generated_at,
+    indexPrefix: normalizedIndexPrefix,
+    dataPrefix: normalizedDataPrefix,
+    timeseriesIndexPrefix: normalizedTimeseriesPrefix,
+    daySummaries: Array.from(daySummaryMap.values()),
+  });
 
-  const latestPut = updateLatestIndex
-    ? await r2PutObjectIfChanged({
-      r2,
-      key: latestKey,
-      body: `${JSON.stringify(latestPayload, null, 2)}\n`,
-      content_type: "application/json; charset=utf-8",
-      writeR2,
-    })
-    : { bytes: null, skipped: true };
+  const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
+  const latestPut = await r2PutObjectIfChanged({
+    r2,
+    key: latestKey,
+    body: latestBody,
+    content_type: "application/json; charset=utf-8",
+    writeR2,
+  });
 
   return {
     history_version: "v2",
@@ -3577,12 +3554,11 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     latest_index_put_skipped: Boolean(latestPut.skipped),
     data_prefix: normalizedDataPrefix,
     timeseries_index_prefix: normalizedTimeseriesPrefix,
-    updated_latest_index: Boolean(updateLatestIndex),
-    indexed_day_count: latestPayload?.day_count ?? null,
-    connector_index_count: latestPayload?.connector_index_count ?? null,
-    pollutant_index_count: latestPayload?.pollutant_index_count ?? null,
-    file_count: latestPayload?.file_count ?? null,
-    indexed_file_count: latestPayload?.indexed_file_count ?? null,
+    indexed_day_count: latestPayload.day_count,
+    connector_index_count: latestPayload.connector_index_count,
+    pollutant_index_count: latestPayload.pollutant_index_count,
+    file_count: latestPayload.file_count,
+    indexed_file_count: latestPayload.indexed_file_count,
     warning_count: warnings.length,
     warnings,
     stale_pollutant_index_cleanup_count: stalePollutantIndexCleanupCount,
@@ -4031,8 +4007,6 @@ export async function updateR2HistoryIndexesTargeted({
   fromDayUtc,
   toDayUtc,
   connectorId = null,
-  connectorManifestKey = null,
-  updateLatestIndex = true,
   generatedAt = new Date().toISOString(),
   fetchConcurrency,
   computeMissingTimeseriesCounts = false,
@@ -4083,8 +4057,6 @@ export async function updateR2HistoryIndexesTargeted({
         fromDayUtc,
         toDayUtc,
         connectorId,
-        connectorManifestKey,
-        updateLatestIndex,
         additionalPollutantManifestTargets,
         writeR2,
       });
