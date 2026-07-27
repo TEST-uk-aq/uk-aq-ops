@@ -190,18 +190,20 @@ A secondary AQI prefetch chunk becomes eligible after its matching observation c
 
 ## Parallel fetching and ordered settlement
 
-Network fetching and visual rendering are separate concerns.
+Network fetching, cache settlement and visible rendering are separate concerns.
 
-The website must:
+For normal progressive station-history work, the website must:
 
 1. build missing work newest first;
 2. launch a bounded set of requests in parallel immediately;
 3. allow requests to complete in any order;
 4. hold out-of-order completions in an ordered settlement buffer;
-5. commit and render each stream from most recent to oldest;
-6. coalesce repeated commits to no more than one chart repaint per animation frame where practical.
+5. commit and render each normal progressive stream from most recent to oldest;
+6. coalesce repeated visible commits to no more than one chart repaint per animation frame where practical.
 
-The website must not wait for the newest chunk to finish before launching older chunks. The ordered settlement buffer, not serial network fetching, provides the newest-to-oldest rendering guarantee.
+The normal progressive rule applies to initial chart loading, observation-line loading, range extension and any other operation not explicitly covered by the AQI source-switching exception below.
+
+The website must not wait for the newest chunk to finish before launching older chunks. The ordered settlement buffer, not serial network fetching, provides the newest-to-oldest settlement guarantee.
 
 Example completion order:
 
@@ -211,7 +213,7 @@ chunk 1 completes
 chunk 0 completes
 ```
 
-Required commit order:
+Required settlement order:
 
 ```text
 chunk 0
@@ -219,7 +221,9 @@ chunk 1
 chunk 2
 ```
 
-Once chunk 0 completes, already-finished contiguous chunks may be committed immediately in sequence.
+Once chunk 0 completes, already-finished contiguous chunks may be settled immediately in sequence.
+
+AQI-only work for a user-initiated AQI source switch is an explicit visible-rendering exception. Its chunks still use bounded parallel fetching and ordered settlement, but they must be settled into cache or transition staging without repainting the visible AQI layer after each chunk. The visible AQI layer is committed once when the current source-switch transition reaches a terminal state as defined under **AQI source switching**.
 
 All station-history work must share a bounded global fetch cap. Per-stream concurrency limits may be used, but their combined activity must not exceed that cap.
 
@@ -231,22 +235,38 @@ Secondary calculated AQI may be retained in cache without being rendered. Select
 
 A cached observation range does not by itself prove that calculated AQI is cached. AQI completeness includes any required hidden context and must be tracked independently.
 
+A partially covered AQI cache may continue accepting valid chunks and remain retryable, but it is not eligible for incremental visible rendering during a user-initiated AQI source switch. It becomes eligible for the transition's single visible commit only when all work planned for that transition has reached a terminal state. A terminal partial response may expose all valid available intervals in one commit, with genuine gaps left blank and the incomplete state reported accurately.
+
 Requests must use stable URLs and parameters for normal traffic so Cloudflare caching can serve warm hits. Cache-buster parameters are limited to diagnostics and explicit forced refreshes.
 
 ## AQI source switching
 
-When the user chooses a different selected sensor for AQI bands, the website must:
+When the user chooses a different selected sensor for AQI bands, the website must treat the operation as one atomic visible AQI-layer transition:
 
-1. leave all observation lines and retained chart layers in place;
-2. immediately remove the previous sensor's AQI bands so stale bands are never shown under the new selection;
-3. show an intentionally blank/loading AQI band area for approximately 200 milliseconds;
-4. after that brief transition, render the new sensor's cached AQI if ready;
-5. otherwise keep the AQI area blank/loading until the required calculated response arrives;
-6. never refetch retained observation lines solely because the AQI source changed.
+1. leave all observation lines and retained non-AQI chart layers in place;
+2. create or advance a source-switch transition token identifying the selected sensor, requested range and current load generation;
+3. immediately remove the previous sensor's AQI bands so stale bands are never shown under the new selection;
+4. show an intentionally blank/loading AQI band area for approximately 200 milliseconds;
+5. if complete calculated AQI for the new source and requested range is already cached, render that complete range once after the brief transition;
+6. otherwise keep the AQI area blank/loading while missing AQI work is fetched using the existing bounded concurrency, priority and ordered-settlement rules;
+7. settle each valid response into AQI cache or transition staging while preserving independent coverage, completeness, gap and partial-reason metadata;
+8. do not repaint the visible AQI layer as individual AQI chunks settle for that transition;
+9. regard the transition as terminal only when all AQI requests planned for the current selected source and requested range have completed, failed, been cancelled or been made obsolete;
+10. when the current transition reaches a successful terminal state, commit the new source's AQI bands to the visible AQI layer once;
+11. when it reaches a terminal partial state, commit all valid available intervals once, leave genuine gaps blank and show an accurate incomplete or error state;
+12. never mix AQI points from the previous and new source in one visible AQI layer;
+13. never show the previous sensor's bands under the newly selected sensor;
+14. invalidate the visible commit of an older transition when the user changes AQI source again, changes the requested range or starts a newer incompatible load generation;
+15. allow valid obsolete responses to improve their own sensor's cache where safe, but never allow an obsolete response or transition token to become visible;
+16. never refetch or repaint retained observation lines solely because the AQI source changed.
+
+The atomic requirement applies to the visible AQI-layer commit, not to network execution. Missing chunks should continue to fetch in parallel and settle newest-to-oldest. The website must not implement this behaviour by serialising requests, adding an arbitrary long delay or recalculating AQI in browser code.
 
 The approximately 200 millisecond blank state is a user-interface transition, not a data delay requirement. It confirms that the selected AQI source changed and prevents the previous sensor's bands appearing to belong to the new sensor.
 
-When complete AQI is already cached, the transition should normally finish in about 200 milliseconds. When it is not cached, normal loading state continues until accurate data is available.
+When complete AQI is already cached, the transition should normally finish in about 200 milliseconds. When it is not cached, normal loading state continues until the current transition reaches a terminal state and its one visible AQI-layer commit can be made.
+
+This exception does not remove progressive rendering from initial chart loading, observation loading, range extension or background secondary AQI prefetch. It applies only to changing the AQI source on an already displayed chart.
 
 ## Runtime continuity routing
 
