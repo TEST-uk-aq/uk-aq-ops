@@ -2,17 +2,20 @@
 
 ## Authority and purpose
 
-This document defines the authoritative physical-file identity and opaque-child validation rules used before a connector-day deletion gate may be set complete.
+This document defines the authoritative physical-file identity and opaque-child validation rules used by Prune Daily before a connector-day observation deletion gate may be set complete.
 
 It supplements and clarifies:
 
 - [`prune_connector_day_gate.md`](prune_connector_day_gate.md);
+- [`history_writer_coordination.md`](history_writer_coordination.md);
 - [`integrity.md`](integrity.md);
 - [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
 
 Where those documents require read-back validation without defining the physical identity representation, this document is authoritative.
 
 The purpose is deletion safety. A completed connector-day gate permits removal of the corresponding observations from IngestDB, so object existence and byte length alone are not sufficient proof that the permanent R2 object is the object referenced by its manifest.
+
+Integrity and migration use the same physical-identity validator when verifying live R2 repairs, but they do not complete, invalidate or recover Prune Daily deletion gates.
 
 ## `files[].etag_or_hash` representations
 
@@ -54,7 +57,7 @@ A quoted ETag is treated as an R2 object identity token. It MUST NOT be interpre
 
 ### Unsupported or ambiguous identity
 
-The gate MUST fail closed when `files[].etag_or_hash` is:
+Validation MUST fail closed when `files[].etag_or_hash` is:
 
 - missing or blank;
 - an unquoted value that is not a lower-case 64-character SHA-256 digest;
@@ -66,7 +69,7 @@ The implementation MUST classify the representation before comparison and MUST c
 
 ## Shared implementation
 
-Prune Daily Phase B and Integrity connector-day gate completion MUST use one shared physical-file identity validator.
+Prune Daily, Integrity and migration MUST use one shared physical-file identity validator.
 
 The shared validator owns:
 
@@ -76,7 +79,9 @@ The shared validator owns:
 - quoted ETag normalisation and comparison;
 - fail-closed errors for unsupported or mismatched identities.
 
-The two gate paths MUST NOT maintain separate equivalent rules.
+The writers MUST NOT maintain separate equivalent rules.
+
+Using the same validator does not confer gate ownership. Only Prune Daily may set or clear `uk_aq_ops.prune_connector_day_gates`.
 
 ## Active and opaque observation children
 
@@ -91,13 +96,13 @@ o3
 
 AQI remains limited to `pm25`, `pm10` and `no2`.
 
-Existing observation children outside the four-pollutant Integrity scope remain opaque preserved baseline content. Integrity MUST NOT reinterpret, recalculate, modernise, delete or rewrite their logical observation data merely to establish a connector-day gate.
+Existing observation children outside the four-pollutant Integrity scope remain opaque preserved baseline content. Integrity MUST NOT reinterpret, recalculate, modernise, delete or rewrite their logical observation data merely because it is rebuilding selected active pollutants.
 
-However, a real Integrity repair that establishes a connector-day deletion gate MUST structurally prove every child referenced by the final connector manifest, including opaque preserved children. This structural gate validation does not broaden the active Integrity repair scope.
+A real Integrity repair that rebuilds a connector manifest MUST structurally preserve every unchanged child referenced by the final connector manifest, including opaque preserved children. This structural validation does not broaden the active Integrity repair scope and does not create prune-gate authority.
 
 ### Active Integrity pollutants
 
-For `pm25`, `pm10`, `no2` and `o3`, gate completion requires the full active contract, including:
+For `pm25`, `pm10`, `no2` and `o3`, real repair verification requires the full active contract, including:
 
 - canonical child-manifest identity and self `manifest_hash`;
 - exact parent-linked child `manifest_hash`;
@@ -107,22 +112,22 @@ For `pm25`, `pm10`, `no2` and `o3`, gate completion requires the full active con
 - physical Parquet identity and byte-count validation under this document;
 - required connector-targeted index identity and coverage.
 
-Any failure remains fail-closed.
+Any failure remains fail-closed for the Integrity repair.
 
 ### Opaque preserved children
 
-For an existing out-of-scope child, gate completion requires structural preservation proof only:
+For an existing out-of-scope child, preservation requires structural proof only:
 
 - the canonical child manifest exists and parses;
 - its identity fields match its canonical path, day, connector and pollutant;
 - its self `manifest_hash` verifies;
 - the connector manifest references the exact same child `manifest_hash`;
 - its file list, file keys, row counts, file counts, byte counts and aggregate arithmetic are structurally valid;
-- every referenced Parquet object exists;
-- every referenced Parquet object passes byte-count and physical identity validation under this document;
+- every referenced Parquet object exists when live validation is required;
+- every referenced Parquet object passes byte-count and physical identity validation when live validation is required;
 - the required connector-targeted index exists and remains tied to the same child manifest identity and recorded coverage.
 
-For opaque preserved children, Integrity gate completion MUST NOT:
+For opaque preserved children, Integrity MUST NOT:
 
 - require current four-pollutant `observation_content_hash` or `verification_status_counts` fields when they are legitimately absent from preserved legacy metadata;
 - parse or canonicalise Parquet observation rows;
@@ -132,43 +137,53 @@ For opaque preserved children, Integrity gate completion MUST NOT:
 
 A quoted ETag permits opaque Parquet physical identity verification through HEAD without downloading the body. An opaque child whose file identity is an unquoted SHA-256 still requires GET and byte hashing because SHA-256 cannot be proven from HEAD metadata alone.
 
-A missing child manifest, missing Parquet, malformed identity, parent/child hash conflict, byte-count mismatch, physical identity mismatch or missing/contradictory required index remains fail-closed.
+A missing child manifest, missing Parquet, malformed identity, parent/child hash conflict, byte-count mismatch, physical identity mismatch or missing/contradictory required index remains fail-closed for the applicable writer or verifier.
 
-## Normal Prune Daily versus Integrity gate completion
+## Prune Daily gate completion
 
-Normal Prune Daily Phase B is the authoritative writer for its connector-day and continues to apply the full current writer and gate validation contract to all children it writes or safely adopts.
+Normal Prune Daily Phase B is the only writer that may complete a connector-day deletion gate.
 
-Integrity connector-day gate completion supplies the explicit four-pollutant active scope. It applies full logical validation to those active children and structural opaque-preservation validation to all other existing children.
+Before Prune Daily sets the gate true, every child referenced by the final observation connector manifest must be structurally and physically tied to the live R2 objects under this document.
 
-This scoped validation MUST NOT weaken the final connector-level proof. Every child referenced by the connector manifest must still be structurally and physically tied to the live R2 objects before the gate becomes complete.
+Prune Daily applies the full current logical and physical contract to all observation children it writes. Where it deliberately preserves an existing child, that child still requires the structural and physical proof required by the active Prune Daily contract.
 
-## Bounded recovery operation
+The final verified connector manifest identity and aggregate counts are stored with the gate evidence as defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md).
 
-A bounded Integrity gate-recovery operation may verify already-repaired live connector-days and update only the listed connector-day gate rows.
+## Integrity and migration verification
 
-It MUST:
+Integrity and migration use this validator to prove that live R2 writes match their manifests during connector-scoped apply and final verification.
 
-- accept an explicit list of `day_utc + connector_id` pairs;
-- verify each pair independently against live canonical R2 history;
-- mark only a successfully verified listed pair complete;
-- leave a failed listed pair incomplete and report the exact fault;
-- leave unlisted connector-day gates untouched;
-- avoid rewriting observation Parquet, pollutant manifests or AQI data;
-- avoid deleting R2 objects.
+They MUST:
 
-Required connector-targeted index verification remains part of the gate contract. A byte-identical targeted index update may be attempted through the existing changed-only index path where that path is required to establish or confirm canonical index coverage. Any actual changed index write must be reported explicitly and must not be described as a read-only recovery.
+- use the shared connector-day lock for live mutation;
+- validate selected active pollutants under the full logical contract;
+- preserve and structurally validate unselected children;
+- verify exact affected objects after live mutation;
+- leave audit evidence in Integrity reports and SQLite.
+
+They MUST NOT:
+
+- complete or invalidate a prune connector-day gate;
+- describe repair verification as prune-gate completion;
+- run a historical gate-recovery operation;
+- backfill gate rows from valid R2 history;
+- update connector-targeted indexes solely to manufacture prune eligibility.
+
+The former bounded Integrity gate-recovery path is retired from the supported contract. `scripts/backup_r2/uk_aq_complete_integrity_connector_gates.mjs` is not a supported steady-state operation and should be removed when implementation is brought into line.
 
 ## Failure rule
 
-A connector-day gate MUST remain incomplete whenever the live object cannot be proven to match the identity and byte count recorded by the final canonical manifest chain.
+Prune Daily's connector-day gate MUST remain incomplete whenever a live object cannot be proven to match the identity and byte count recorded by the final canonical manifest chain.
 
 A same-size but different Parquet object is a physical identity mismatch and MUST fail closed.
 
 A failure for one connector-day MUST NOT alter another connector-day gate.
 
+For Integrity or migration, the same physical mismatch fails the affected repair or migration scope but does not write any prune-gate state.
+
 ## Validation policy
 
-This is deletion-safety functionality, so a narrow deterministic pre-deployment check is genuinely required.
+This is deletion-safety and live-repair functionality, so a narrow deterministic pre-deployment check is genuinely required.
 
 The focused checks must prove at least:
 
@@ -178,7 +193,8 @@ The focused checks must prove at least:
 - a same-size opaque object with a different quoted ETag fails;
 - an active pollutant with invalid content-hash metadata fails;
 - a valid opaque legacy child is preserved without applying the active logical hash contract;
-- a missing or contradictory opaque child remains incomplete;
-- only the exact successfully verified connector-day gate is completed.
+- a missing or contradictory opaque child fails the applicable writer or verifier;
+- only Prune Daily can complete the exact successfully verified connector-day gate;
+- Integrity physical verification never changes prune-gate state.
 
-Do not add a broad speculative suite. Functional acceptance occurs through a bounded real TEST gate-recovery operation after code review and a current R2 backup.
+Do not add a broad speculative suite. Functional acceptance occurs through real TEST Prune Daily and scoped Integrity operations after code review and a current R2 backup.
