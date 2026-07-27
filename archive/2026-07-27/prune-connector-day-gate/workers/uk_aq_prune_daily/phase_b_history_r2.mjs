@@ -29,7 +29,6 @@ import {
   computeObservationContentHash,
   normalizeCanonicalObservationRow,
   normalizeUkAirVerificationStatus,
-  validateObservationContentHashMetadata,
 } from "../shared/uk_aq_observation_content_hash.mjs";
 import {
   combineObservationHistoryPhysicalSchemas,
@@ -40,16 +39,8 @@ import {
 } from "../shared/uk_aq_observation_history_schema.mjs";
 import {
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey,
-  buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey,
   updateR2HistoryIndexesTargeted,
 } from "../shared/uk_aq_r2_history_index.mjs";
-import {
-  canonicalObservationConnectorManifestKey,
-  connectorDayGateKey,
-  isValidConnectorHistoryGateEvidence,
-  setConnectorDayGateComplete,
-  setConnectorDayGateIncomplete,
-} from "../shared/uk_aq_connector_day_gate.mjs";
 import {
   AQI_SUPPORTED_POLLUTANTS,
   buildAqilevelHistoryRowsForDayFromHourlyRows,
@@ -1564,36 +1555,6 @@ do update set
   await client.query(sql);
 }
 
-async function markIncompleteConnectorCandidatesAsBackupBlocked(client) {
-  await client.query(`
-insert into uk_aq_ops.prune_connector_day_gates (
-  day_utc,
-  connector_id,
-  history_done,
-  updated_at
-)
-select
-  c.day_utc,
-  c.connector_id,
-  false,
-  now()
-from uk_aq_ops.history_candidates c
-where c.status <> 'complete'
-on conflict (day_utc, connector_id)
-do update set
-  history_done = false,
-  history_run_id = null,
-  history_manifest_key = null,
-  history_manifest_hash = null,
-  history_row_count = null,
-  history_file_count = null,
-  history_total_bytes = null,
-  history_completed_at = null,
-  completion_source = null,
-  updated_at = now()
-`);
-}
-
 async function fetchPendingCandidates(client, maxCandidatesPerRun) {
   const sql = `
 select
@@ -1620,50 +1581,6 @@ limit $1
 `;
 
   const result = await client.query(sql, [maxCandidatesPerRun]);
-  return result.rows.map(toConnectorDayRow);
-}
-
-async function fetchCompleteCandidatesMissingConnectorGate(client, maxCandidatesPerRun) {
-  const result = await client.query(
-    `
-select
-  c.day_utc,
-  c.connector_id,
-  c.expected_row_count,
-  c.min_observed_at,
-  c.max_observed_at,
-  c.status,
-  c.run_id,
-  c.manifest_key,
-  c.history_row_count,
-  c.history_file_count,
-  c.history_total_bytes,
-  c.resume_last_timeseries_id,
-  c.resume_last_observed_at,
-  c.resume_part_index,
-  c.resume_exported_row_count,
-  c.resume_parts_json
-from uk_aq_ops.history_candidates c
-left join uk_aq_ops.prune_connector_day_gates g
-  on g.day_utc = c.day_utc
- and g.connector_id = c.connector_id
-where c.status = 'complete'
-  and (
-    g.day_utc is null
-    or g.history_done is not true
-    or g.history_manifest_key is distinct from (
-      'history/v2/observations/day_utc=' || c.day_utc::text
-      || '/connector_id=' || c.connector_id::text || '/manifest.json'
-    )
-    or g.history_manifest_hash is null
-    or g.history_manifest_hash !~ '^[0-9a-f]{64}$'
-    or g.history_completed_at is null
-  )
-order by c.day_utc, c.connector_id
-limit $1
-`,
-    [maxCandidatesPerRun],
-  );
   return result.rows.map(toConnectorDayRow);
 }
 
@@ -1726,45 +1643,6 @@ where day_utc = $1::date
       historyTotalBytes.toString(),
     ],
   );
-}
-
-async function markCandidateAndConnectorGateComplete(client, {
-  dayUtc,
-  connectorId,
-  runId,
-  manifestKey,
-  manifestHash,
-  historyRowCount,
-  historyFileCount,
-  historyTotalBytes,
-}) {
-  await client.query("begin");
-  try {
-    await markCandidateComplete(client, {
-      dayUtc,
-      connectorId,
-      runId,
-      manifestKey,
-      historyRowCount,
-      historyFileCount,
-      historyTotalBytes,
-    });
-    await setConnectorDayGateComplete(client, {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      history_run_id: runId,
-      history_manifest_key: manifestKey,
-      history_manifest_hash: manifestHash,
-      history_row_count: historyRowCount,
-      history_file_count: historyFileCount,
-      history_total_bytes: historyTotalBytes,
-      completion_source: "prune_daily_phase_b",
-    });
-    await client.query("commit");
-  } catch (error) {
-    await client.query("rollback");
-    throw error;
-  }
 }
 
 async function updateCandidateResumeCheckpoint(client, {
@@ -4284,219 +4162,6 @@ function validateAdoptedManifest({
   };
 }
 
-function requireManifestHash(manifest, manifestKey) {
-  const manifestHash = String(manifest?.manifest_hash || "").trim().toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(manifestHash)) {
-    throw new Error(`Manifest has an invalid manifest_hash: ${manifestKey}`);
-  }
-  const { manifest_hash: _discard, ...withoutHash } = manifest;
-  if (buildManifestHash(withoutHash) !== manifestHash) {
-    throw new Error(`Manifest hash verification failed: ${manifestKey}`);
-  }
-  return manifestHash;
-}
-
-function requireNonNegativeSafeInteger(value, fieldName, manifestKey) {
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new Error(`Manifest ${fieldName} is invalid: ${manifestKey}`);
-  }
-  return parsed;
-}
-
-function normalizedEtag(value) {
-  return String(value || "").trim().replace(/^"|"$/g, "").toLowerCase();
-}
-
-export async function verifyObservationConnectorHistory({
-  runtime,
-  dayUtc,
-  connectorId,
-  manifestKey,
-  expectedRowCount = null,
-}) {
-  const expectedConnectorKey = canonicalObservationConnectorManifestKey(dayUtc, connectorId);
-  if (manifestKey !== expectedConnectorKey || runtime.committed_prefix !== HISTORY_R2_V2_OBSERVATIONS_PREFIX) {
-    throw new Error(`Observation connector manifest is not the canonical v2 key: ${manifestKey}`);
-  }
-
-  const connectorObject = await r2GetObject({ r2: runtime.r2, key: manifestKey });
-  const connectorManifest = JSON.parse(connectorObject.body.toString("utf8"));
-  if (
-    connectorManifest?.history_version !== "v2"
-    || connectorManifest?.domain !== "observations"
-    || connectorManifest?.manifest_kind !== "connector"
-    || connectorManifest?.day_utc !== dayUtc
-    || Number(connectorManifest?.connector_id) !== connectorId
-    || connectorManifest?.manifest_key !== manifestKey
-  ) {
-    throw new Error(`Observation connector manifest identity mismatch: ${manifestKey}`);
-  }
-  const connectorManifestHash = requireManifestHash(connectorManifest, manifestKey);
-  const childReferences = Array.isArray(connectorManifest.pollutant_manifests)
-    ? connectorManifest.pollutant_manifests
-    : connectorManifest.child_manifests;
-  if (!Array.isArray(childReferences) || childReferences.length === 0) {
-    throw new Error(`Observation connector manifest has no pollutant children: ${manifestKey}`);
-  }
-
-  const seenPollutants = new Set();
-  const verifiedChildren = [];
-  for (const reference of childReferences) {
-    const pollutantCode = normalizePollutantCodeForPath(reference?.pollutant_code);
-    if (seenPollutants.has(pollutantCode)) {
-      throw new Error(`Duplicate pollutant child in connector manifest: ${manifestKey}`);
-    }
-    seenPollutants.add(pollutantCode);
-    const childKey = buildHistoryV2PollutantManifestKey(
-      HISTORY_R2_V2_OBSERVATIONS_PREFIX,
-      dayUtc,
-      connectorId,
-      pollutantCode,
-    );
-    if (reference?.manifest_key !== childKey) {
-      throw new Error(`Non-canonical pollutant child key in connector manifest: ${manifestKey}`);
-    }
-    const childObject = await r2GetObject({ r2: runtime.r2, key: childKey });
-    const childManifest = JSON.parse(childObject.body.toString("utf8"));
-    if (
-      childManifest?.history_version !== "v2"
-      || childManifest?.domain !== "observations"
-      || childManifest?.manifest_kind !== "pollutant"
-      || childManifest?.day_utc !== dayUtc
-      || Number(childManifest?.connector_id) !== connectorId
-      || childManifest?.pollutant_code !== pollutantCode
-      || childManifest?.manifest_key !== childKey
-    ) {
-      throw new Error(`Observation pollutant manifest identity mismatch: ${childKey}`);
-    }
-    const childHash = requireManifestHash(childManifest, childKey);
-    if (String(reference?.manifest_hash || "").trim().toLowerCase() !== childHash) {
-      throw new Error(`Connector child manifest hash mismatch: ${childKey}`);
-    }
-    const rowCount = requireNonNegativeSafeInteger(childManifest.source_row_count, "source_row_count", childKey);
-    const fileCount = requireNonNegativeSafeInteger(childManifest.file_count, "file_count", childKey);
-    const totalBytes = requireNonNegativeSafeInteger(childManifest.total_bytes, "total_bytes", childKey);
-    validateObservationContentHashMetadata(childManifest, { rowCount });
-    const files = Array.isArray(childManifest.files) ? childManifest.files : [];
-    if (files.length !== fileCount || files.length === 0) {
-      throw new Error(`Observation pollutant manifest file_count mismatch: ${childKey}`);
-    }
-    let childRows = 0;
-    let childBytes = 0;
-    for (const file of files) {
-      const fileKey = String(file?.key || "").trim();
-      const expectedPrefix = childKey.slice(0, -"manifest.json".length);
-      if (!fileKey.startsWith(expectedPrefix) || !fileKey.endsWith(".parquet")) {
-        throw new Error(`Observation pollutant manifest has a non-canonical Parquet key: ${childKey}`);
-      }
-      const fileRows = requireNonNegativeSafeInteger(file?.row_count, "files.row_count", childKey);
-      const fileBytes = requireNonNegativeSafeInteger(file?.bytes, "files.bytes", childKey);
-      const liveFile = await r2GetObject({ r2: runtime.r2, key: fileKey });
-      if (Number(liveFile.bytes) !== fileBytes) {
-        throw new Error(`Observation Parquet read-back verification failed: ${fileKey}`);
-      }
-      const expectedEtag = normalizedEtag(file?.etag_or_hash);
-      const actualEtag = normalizedEtag(liveFile.etag);
-      if (expectedEtag && actualEtag && expectedEtag !== actualEtag) {
-        throw new Error(`Observation Parquet identity mismatch: ${fileKey}`);
-      }
-      childRows += fileRows;
-      childBytes += fileBytes;
-    }
-    if (childRows !== rowCount || childBytes !== totalBytes) {
-      throw new Error(`Observation pollutant manifest aggregate mismatch: ${childKey}`);
-    }
-    verifiedChildren.push({
-      pollutant_code: pollutantCode,
-      manifest_key: childKey,
-      manifest_hash: childHash,
-      source_row_count: rowCount,
-      file_count: fileCount,
-      total_bytes: totalBytes,
-    });
-  }
-
-  const rowCount = requireNonNegativeSafeInteger(connectorManifest.source_row_count, "source_row_count", manifestKey);
-  const fileCount = requireNonNegativeSafeInteger(connectorManifest.file_count, "file_count", manifestKey);
-  const totalBytes = requireNonNegativeSafeInteger(connectorManifest.total_bytes, "total_bytes", manifestKey);
-  if (
-    verifiedChildren.reduce((sum, child) => sum + child.source_row_count, 0) !== rowCount
-    || verifiedChildren.reduce((sum, child) => sum + child.file_count, 0) !== fileCount
-    || verifiedChildren.reduce((sum, child) => sum + child.total_bytes, 0) !== totalBytes
-  ) {
-    throw new Error(`Observation connector manifest aggregate mismatch: ${manifestKey}`);
-  }
-  if (expectedRowCount !== null && BigInt(rowCount) !== BigInt(expectedRowCount)) {
-    throw new Error(
-      `Observation connector manifest source row count mismatch: expected=${String(expectedRowCount)} actual=${rowCount} key=${manifestKey}`,
-    );
-  }
-
-  const indexSummary = await updateR2HistoryIndexesTargeted({
-    env: {
-      ...process.env,
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: HISTORY_R2_V2_OBSERVATIONS_PREFIX,
-    },
-    r2: runtime.r2,
-    historyVersion: "v2",
-    domains: ["observations"],
-    fromDayUtc: dayUtc,
-    toDayUtc: dayUtc,
-    connectorId,
-    connectorManifestKey: manifestKey,
-    updateLatestIndex: false,
-    strictMissingTimeseriesCounts: true,
-    writeR2: true,
-  });
-  const indexResult = indexSummary.observations_timeseries;
-  if (
-    !indexResult
-    || indexResult.warning_count !== 0
-    || indexResult.rewritten_connector_index_count !== 1
-    || !Array.isArray(indexResult.affected_pollutant_indexes)
-  ) {
-    throw new Error(`Observation connector-targeted index update failed: ${manifestKey}`);
-  }
-  for (const child of verifiedChildren) {
-    const indexKey = buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
-      indexResult.timeseries_index_prefix,
-      dayUtc,
-      connectorId,
-      child.pollutant_code,
-    );
-    const affected = indexResult.affected_pollutant_indexes.find((entry) => entry?.key === indexKey);
-    const liveIndex = JSON.parse((await r2GetObject({ r2: runtime.r2, key: indexKey })).body.toString("utf8"));
-    if (
-      !affected
-      || liveIndex?.history_version !== "v2"
-      || liveIndex?.domain !== "observations"
-      || liveIndex?.day_utc !== dayUtc
-      || Number(liveIndex?.connector_id) !== connectorId
-      || liveIndex?.pollutant_code !== child.pollutant_code
-      || liveIndex?.pollutant_manifest_key !== child.manifest_key
-      || liveIndex?.pollutant_manifest_hash !== child.manifest_hash
-      || Number(liveIndex?.source_row_count) !== child.source_row_count
-      || Number(liveIndex?.file_count) !== child.file_count
-      || Number(liveIndex?.indexed_file_count) !== child.file_count
-      || liveIndex?.index_coverage !== "complete"
-      || !liveIndex?.timeseries_row_counts
-    ) {
-      throw new Error(`Observation connector-targeted index verification failed: ${indexKey}`);
-    }
-  }
-
-  return {
-    connector_manifest: connectorManifest,
-    history_manifest_key: manifestKey,
-    history_manifest_hash: connectorManifestHash,
-    history_row_count: rowCount,
-    history_file_count: fileCount,
-    history_total_bytes: totalBytes,
-    connector_index_count: verifiedChildren.length,
-  };
-}
-
 function createPruneComparisonManifest({
   baseManifest,
   canonicalManifestKey,
@@ -4874,38 +4539,6 @@ async function maybeAdoptExistingConnectorManifest({
       error: message,
     });
     throw error;
-  }
-}
-
-async function ensureConnectorPruneComparison({
-  candidate,
-  runtime,
-  manifestKey,
-  manifest,
-  existingComparison = null,
-  logStructured,
-}) {
-  if (!runtime.prune_check_dropbox?.enabled || existingComparison) {
-    return existingComparison;
-  }
-  try {
-    return await exportPruneComparisonToDropbox({
-      candidate,
-      runtime,
-      adoptedManifestKey: manifestKey,
-      adoptedManifest: manifest,
-      logStructured,
-    });
-  } catch (error) {
-    logPhaseB(runtime, "ERROR", "phase_b_history_dropbox_check_failed", {
-      day_utc: candidate.day_utc,
-      connector_id: candidate.connector_id,
-      manifest_key: manifestKey,
-      required: runtime.prune_check_dropbox?.required === true,
-      ...errorLogFields(error),
-    });
-    if (runtime.prune_check_dropbox?.required) throw error;
-    return null;
   }
 }
 
@@ -6480,9 +6113,6 @@ export async function runPhaseBBackup({
     completed_candidates: 0,
     adopted_candidates: 0,
     failed_candidates: 0,
-    connector_gate_existing_candidates_checked: 0,
-    connector_gate_existing_candidates_completed: 0,
-    connector_gate_existing_candidates_failed: 0,
     total_written_rows: "0",
     total_written_bytes: "0",
     completed_days: 0,
@@ -6579,80 +6209,6 @@ export async function runPhaseBBackup({
     }
 
     await markIncompleteDaysAsBackupBlocked(controlClient);
-    if (runtime.history_write_version === "v2") {
-      await markIncompleteConnectorCandidatesAsBackupBlocked(controlClient);
-    }
-
-    const completeCandidatesMissingGate = runtime.history_write_version === "v2"
-      ? await fetchCompleteCandidatesMissingConnectorGate(
-        controlClient,
-        runtime.max_candidates_per_run,
-      )
-      : [];
-    summary.connector_gate_existing_candidates_checked = completeCandidatesMissingGate.length;
-    if (!dryRun) {
-      for (const candidate of completeCandidatesMissingGate) {
-        try {
-          await setConnectorDayGateIncomplete(controlClient, {
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-          });
-          const manifestKey = canonicalObservationConnectorManifestKey(
-            candidate.day_utc,
-            candidate.connector_id,
-          );
-          const evidence = await verifyObservationConnectorHistory({
-            runtime,
-            dayUtc: candidate.day_utc,
-            connectorId: candidate.connector_id,
-            manifestKey,
-            expectedRowCount: candidate.expected_row_count,
-          });
-          const comparison = await ensureConnectorPruneComparison({
-            candidate,
-            runtime,
-            manifestKey,
-            manifest: evidence.connector_manifest,
-            logStructured,
-          });
-          await setConnectorDayGateComplete(controlClient, {
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            history_run_id: runId,
-            history_manifest_key: evidence.history_manifest_key,
-            history_manifest_hash: evidence.history_manifest_hash,
-            history_row_count: evidence.history_row_count,
-            history_file_count: evidence.history_file_count,
-            history_total_bytes: evidence.history_total_bytes,
-            completion_source: "prune_daily_phase_b",
-          });
-          summary.connector_gate_existing_candidates_completed += 1;
-          if (comparison) summary.prune_check_dropbox_exports += 1;
-          logStructured("INFO", "phase_b_history_existing_connector_gate_completed", {
-            run_id: runId,
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            manifest_key: evidence.history_manifest_key,
-            manifest_hash: evidence.history_manifest_hash,
-            connector_index_count: evidence.connector_index_count,
-          });
-        } catch (error) {
-          summary.connector_gate_existing_candidates_failed += 1;
-          summary.adoption_failures.push({
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            run_id: runId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          logStructured("WARNING", "phase_b_history_existing_connector_gate_blocked", {
-            run_id: runId,
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            ...errorLogFields(error),
-          });
-        }
-      }
-    }
 
     const pendingCandidates = await fetchPendingCandidates(controlClient, runtime.max_candidates_per_run);
     summary.pending_candidates = pendingCandidates.length;
@@ -6711,12 +6267,6 @@ export async function runPhaseBBackup({
 
       const startedAtMs = Date.now();
       try {
-        if (runtime.history_write_version === "v2") {
-          await setConnectorDayGateIncomplete(controlClient, {
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-          });
-        }
         logPhaseB(runtime, "INFO", "phase_b_history_candidate_start", {
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
@@ -6749,48 +6299,15 @@ export async function runPhaseBBackup({
           exportResult.adopted = false;
         }
 
-        let connectorGateEvidence = null;
-        let connectorComparison = adoptResult.comparison || null;
-        if (runtime.history_write_version === "v2") {
-          connectorGateEvidence = await verifyObservationConnectorHistory({
-            runtime,
-            dayUtc: candidate.day_utc,
-            connectorId: candidate.connector_id,
-            manifestKey: exportResult.manifest_key,
-            expectedRowCount: candidate.expected_row_count,
-          });
-          connectorComparison = await ensureConnectorPruneComparison({
-            candidate,
-            runtime,
-            manifestKey: connectorGateEvidence.history_manifest_key,
-            manifest: connectorGateEvidence.connector_manifest,
-            existingComparison: connectorComparison,
-            logStructured,
-          });
-          await markCandidateAndConnectorGateComplete(controlClient, {
-            dayUtc: candidate.day_utc,
-            connectorId: candidate.connector_id,
-            runId,
-            manifestKey: connectorGateEvidence.history_manifest_key,
-            manifestHash: connectorGateEvidence.history_manifest_hash,
-            historyRowCount: connectorGateEvidence.history_row_count,
-            historyFileCount: connectorGateEvidence.history_file_count,
-            historyTotalBytes: connectorGateEvidence.history_total_bytes,
-          });
-          exportResult.written_row_count = BigInt(connectorGateEvidence.history_row_count);
-          exportResult.file_count = connectorGateEvidence.history_file_count;
-          exportResult.total_bytes = BigInt(connectorGateEvidence.history_total_bytes);
-        } else {
-          await markCandidateComplete(controlClient, {
-            dayUtc: candidate.day_utc,
-            connectorId: candidate.connector_id,
-            runId,
-            manifestKey: exportResult.manifest_key,
-            historyRowCount: exportResult.written_row_count,
-            historyFileCount: exportResult.file_count,
-            historyTotalBytes: exportResult.total_bytes,
-          });
-        }
+        await markCandidateComplete(controlClient, {
+          dayUtc: candidate.day_utc,
+          connectorId: candidate.connector_id,
+          runId,
+          manifestKey: exportResult.manifest_key,
+          historyRowCount: exportResult.written_row_count,
+          historyFileCount: exportResult.file_count,
+          historyTotalBytes: exportResult.total_bytes,
+        });
 
         summary.completed_candidates += 1;
         if (exportResult.adopted) {
@@ -6808,9 +6325,9 @@ export async function runPhaseBBackup({
           totalWrittenRows += exportResult.written_row_count;
           totalWrittenBytes += exportResult.total_bytes;
         }
-        if (connectorComparison) {
+        if (adoptResult.adopted && adoptResult.comparison) {
           summary.prune_check_dropbox_exports += 1;
-        } else if (runtime.prune_check_dropbox?.enabled) {
+        } else if (adoptResult.adopted && runtime.prune_check_dropbox?.enabled) {
           summary.prune_check_dropbox_failures += 1;
         }
         if (exportResult.aqi?.pm_context_source === "obs_aqidb") {
@@ -6842,7 +6359,7 @@ export async function runPhaseBBackup({
           total_bytes: exportResult.total_bytes.toString(),
           manifest_key: exportResult.manifest_key,
           source_owner: exportResult.adopted ? "adopted_existing_r2_manifest" : "phase_b_export",
-          comparison_output_root: connectorComparison?.comparison_output_root || null,
+          comparison_output_root: adoptResult.comparison?.comparison_output_root || null,
           pm_context: exportResult.aqi ? {
             pm_context_source: exportResult.aqi.pm_context_source || null,
             pm_context_window_start_utc: exportResult.aqi.pm_context_window_start_utc || null,
@@ -6988,54 +6505,31 @@ export async function runPhaseBBackup({
   return summary;
 }
 
-export async function fetchBackupDoneConnectorDays({ supabaseDbUrl, connectorDays }) {
-  if (!Array.isArray(connectorDays) || connectorDays.length === 0) {
+export async function fetchBackupDoneDays({ supabaseDbUrl, dayUtcList }) {
+  if (!Array.isArray(dayUtcList) || dayUtcList.length === 0) {
     return new Map();
   }
 
-  const distinctPairs = new Map();
-  for (const entry of connectorDays) {
-    const dayUtc = String(entry?.day_utc || "").slice(0, 10);
-    const connectorId = Number(entry?.connector_id);
-    try {
-      distinctPairs.set(connectorDayGateKey(dayUtc, connectorId), {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-      });
-    } catch (_error) {
-      // Invalid bucket identities cannot acquire deletion authority.
-    }
-  }
-  if (distinctPairs.size === 0) {
+  const distinctDays = uniqueSorted(dayUtcList.map((day) => String(day).slice(0, 10)));
+  if (distinctDays.length === 0) {
     return new Map();
   }
 
   return await withPgClient(supabaseDbUrl, async (client) => {
+    const literalList = distinctDays.map((day) => `'${escapeSingleQuotes(day)}'::date`).join(", ");
     const sql = `
-with requested as (
-  select
-    r.day_utc::date as day_utc,
-    r.connector_id::integer as connector_id
-  from jsonb_to_recordset($1::jsonb) as r(day_utc text, connector_id integer)
-)
-select
-  g.day_utc::text as day_utc,
-  g.connector_id,
-  g.history_done,
-  g.history_manifest_key,
-  g.history_manifest_hash,
-  g.history_completed_at
-from uk_aq_ops.prune_connector_day_gates g
-join requested r
-  on r.day_utc = g.day_utc
- and r.connector_id = g.connector_id
+select g.day_utc::text as day_utc
+from uk_aq_ops.prune_day_gates g
+where g.day_utc in (${literalList})
+  and g.history_done is true
+  and nullif(btrim(g.history_manifest_key), '') is not null
+  and g.history_manifest_key ~ '${PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE}'
+  and g.history_completed_at is not null
 `;
-    const result = await client.query(sql, [JSON.stringify(Array.from(distinctPairs.values()))]);
+    const result = await client.query(sql);
     const map = new Map();
     for (const row of result.rows) {
-      if (isValidConnectorHistoryGateEvidence(row)) {
-        map.set(connectorDayGateKey(row.day_utc, row.connector_id), true);
-      }
+      map.set(normalizeDayUtc(row.day_utc), true);
     }
     return map;
   });

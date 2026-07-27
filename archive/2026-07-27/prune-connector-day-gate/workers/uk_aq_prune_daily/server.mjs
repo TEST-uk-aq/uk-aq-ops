@@ -3,11 +3,10 @@ import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
 import {
-  fetchBackupDoneConnectorDays,
+  fetchBackupDoneDays,
   resolvePhaseBRuntimeConfig,
   runPhaseBBackup,
 } from "./phase_b_history_r2.mjs";
-import { connectorDayGateKey } from "../shared/uk_aq_connector_day_gate.mjs";
 import { groupFingerprintRechecksByHour } from "./fingerprint_recheck.mjs";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
 import { rebuildR2HistoryIndexes } from "../shared/uk_aq_r2_history_index.mjs";
@@ -148,9 +147,10 @@ function compactPruneHealthSummary(summary = {}) {
     deleted_rows: pickCount(summary, ["total_deleted_rows", "total_deleted_after_repair_rows"]),
     mismatch_count: summary.mismatch_count,
     mismatch_after_repair_count: summary.mismatch_after_repair_count,
-    connector_history_gate_blocked_bucket_count:
-      Number(summary.connector_history_gate_blocked_bucket_count || 0)
-      + Number(summary.connector_history_gate_blocked_after_repair_bucket_count || 0),
+    backup_gate_blocked_bucket_count: pickCount(summary, [
+      "history_gate_blocked_bucket_count",
+      "history_gate_blocked_after_repair_bucket_count",
+    ]),
     delete_error_count: pickCount(summary, ["delete_error_count", "delete_after_repair_error_count"]),
     repair_replay_count: summary.repair_replay_success_count,
     repair_replay_error_count: summary.repair_replay_error_count,
@@ -602,15 +602,8 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     mismatch_count: sumIntField(batchSummaries, "mismatch_count"),
     observs_count_exceeds_ingest_count: sumIntField(batchSummaries, "observs_count_exceeds_ingest_count"),
     observs_extra_bucket_count: sumIntField(batchSummaries, "observs_extra_bucket_count"),
-    connector_history_gate_enabled: Boolean(config.phaseB?.enabled),
-    connector_history_gate_allowed_bucket_count: sumIntField(
-      batchSummaries,
-      "connector_history_gate_allowed_bucket_count",
-    ),
-    connector_history_gate_blocked_bucket_count: sumIntField(
-      batchSummaries,
-      "connector_history_gate_blocked_bucket_count",
-    ),
+    history_gate_enabled: Boolean(config.phaseB?.enabled),
+    history_gate_blocked_bucket_count: sumIntField(batchSummaries, "history_gate_blocked_bucket_count"),
     batch_count: batches.length,
     batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
     batch_windows_preview: sampleRows(batches),
@@ -624,9 +617,9 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       repair_one_mismatch_bucket_result: aggregateDryRunRepairPilot(batchSummaries),
       deletable_buckets_preview: mergePreviewField(batchSummaries, "deletable_buckets_preview"),
       mismatches_preview: mergePreviewField(batchSummaries, "mismatches_preview"),
-      connector_history_gate_blocked_buckets_preview: mergePreviewField(
+      history_gate_blocked_buckets_preview: mergePreviewField(
         batchSummaries,
-        "connector_history_gate_blocked_buckets_preview",
+        "history_gate_blocked_buckets_preview",
       ),
     };
   }
@@ -648,13 +641,9 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       batchSummaries,
       "repaired_now_deletable_bucket_count_before_history_gate",
     ),
-    connector_history_gate_allowed_after_repair_bucket_count: sumIntField(
+    history_gate_blocked_after_repair_bucket_count: sumIntField(
       batchSummaries,
-      "connector_history_gate_allowed_after_repair_bucket_count",
-    ),
-    connector_history_gate_blocked_after_repair_bucket_count: sumIntField(
-      batchSummaries,
-      "connector_history_gate_blocked_after_repair_bucket_count",
+      "history_gate_blocked_after_repair_bucket_count",
     ),
     deleted_bucket_count: sumIntField(batchSummaries, "deleted_bucket_count"),
     total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
@@ -676,9 +665,9 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       batchSummaries,
       "deleted_after_repair_buckets_preview",
     ),
-    connector_history_gate_blocked_after_repair_buckets_preview: mergePreviewField(
+    history_gate_blocked_after_repair_preview: mergePreviewField(
       batchSummaries,
-      "connector_history_gate_blocked_after_repair_buckets_preview",
+      "history_gate_blocked_after_repair_preview",
     ),
     mismatches_before_repair_preview: mergePreviewField(
       batchSummaries,
@@ -1446,20 +1435,26 @@ function toBucketDayUtc(bucket) {
   return String(bucket.hour_start || "").slice(0, 10);
 }
 
-export function filterBucketsByConnectorHistoryGate(buckets, connectorGateMap) {
+async function applyBackupGateFilter(config, runId, buckets, gateStage) {
+  if (!config.phaseB?.enabled || !Array.isArray(buckets) || buckets.length === 0) {
+    return {
+      allowedBuckets: Array.isArray(buckets) ? buckets : [],
+      blockedBuckets: [],
+      dayGateMap: new Map(),
+    };
+  }
+
+  const dayGateMap = await fetchBackupDoneDays({
+    supabaseDbUrl: config.phaseB.supabase_db_url,
+    dayUtcList: buckets.map(toBucketDayUtc),
+  });
+
   const allowedBuckets = [];
   const blockedBuckets = [];
-  for (const bucket of Array.isArray(buckets) ? buckets : []) {
+  for (const bucket of buckets) {
     const dayUtc = toBucketDayUtc(bucket);
-    let gateComplete = false;
-    try {
-      gateComplete = connectorGateMap.get(
-        connectorDayGateKey(dayUtc, bucket.connector_id),
-      ) === true;
-    } catch (_error) {
-      gateComplete = false;
-    }
-    if (gateComplete) {
+    const historyDone = dayGateMap.get(dayUtc) === true;
+    if (historyDone) {
       allowedBuckets.push(bucket);
       continue;
     }
@@ -1468,54 +1463,30 @@ export function filterBucketsByConnectorHistoryGate(buckets, connectorGateMap) {
       hour_start: bucket.hour_start,
       day_utc: dayUtc,
       observation_count: bucket.observation_count.toString(),
-      reason: "history_not_complete_for_connector_day",
+      reason: "history_not_complete_for_day",
     });
   }
-  return { allowedBuckets, blockedBuckets };
-}
-
-async function applyConnectorHistoryGateFilter(config, runId, buckets, gateStage) {
-  if (!config.phaseB?.enabled || !Array.isArray(buckets) || buckets.length === 0) {
-    return {
-      allowedBuckets: Array.isArray(buckets) ? buckets : [],
-      blockedBuckets: [],
-      connectorGateMap: new Map(),
-    };
-  }
-
-  const connectorGateMap = await fetchBackupDoneConnectorDays({
-    supabaseDbUrl: config.phaseB.supabase_db_url,
-    connectorDays: buckets.map((bucket) => ({
-      day_utc: toBucketDayUtc(bucket),
-      connector_id: bucket.connector_id,
-    })),
-  });
-
-  const { allowedBuckets, blockedBuckets } = filterBucketsByConnectorHistoryGate(
-    buckets,
-    connectorGateMap,
-  );
 
   if (blockedBuckets.length > 0) {
-    logStructured("WARNING", "connector_history_gate_blocked_buckets", {
+    logStructured("WARNING", "history_gate_blocked_buckets", {
       run_id: runId,
       gate_stage: gateStage,
-      connector_history_gate_allowed_bucket_count: allowedBuckets.length,
-      connector_history_gate_blocked_bucket_count: blockedBuckets.length,
-      connector_history_gate_blocked_buckets_preview: sampleRows(blockedBuckets),
+      blocked_count: blockedBuckets.length,
+      blocked_preview: sampleRows(blockedBuckets),
+      prune_blocked_for_day: true,
     });
   } else {
-    logStructured("INFO", "connector_history_gate_allows_all_buckets", {
+    logStructured("INFO", "history_gate_allows_all_buckets", {
       run_id: runId,
       gate_stage: gateStage,
-      connector_history_gate_allowed_bucket_count: allowedBuckets.length,
+      allowed_count: allowedBuckets.length,
     });
   }
 
   return {
     allowedBuckets,
     blockedBuckets,
-    connectorGateMap,
+    dayGateMap,
   };
 }
 
@@ -1552,7 +1523,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     delete_batch_size: config.deleteBatchSize,
     max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
     repair_one_mismatch_bucket: config.repairOneMismatchBucket,
-    connector_history_gate_enabled: historyGateEnabled,
+    history_gate_enabled: historyGateEnabled,
     delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
     delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
@@ -1565,7 +1536,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
 
   const { deletableBuckets, mismatches, observsExtraBuckets } = compareBuckets(ingestBuckets, observsBuckets);
   const preRepairBackupGate = historyGateEnabled
-    ? await applyConnectorHistoryGateFilter(
+    ? await applyBackupGateFilter(
       config,
       runId,
       deletableBuckets,
@@ -1574,7 +1545,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     : {
       allowedBuckets: deletableBuckets,
       blockedBuckets: [],
-      connectorGateMap: new Map(),
+      dayGateMap: new Map(),
     };
   const gatedDeletableBuckets = preRepairBackupGate.allowedBuckets;
   const historyGateBlockedBuckets = preRepairBackupGate.blockedBuckets;
@@ -1627,12 +1598,11 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     mismatch_count: mismatches.length,
     observs_count_exceeds_ingest_count: observsCountGreaterThanIngest.length,
     observs_extra_bucket_count: observsExtraBuckets.length,
-    connector_history_gate_enabled: historyGateEnabled,
+    history_gate_enabled: historyGateEnabled,
     delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
     delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
-    connector_history_gate_allowed_bucket_count: gatedDeletableBuckets.length,
-    connector_history_gate_blocked_bucket_count: historyGateBlockedBuckets.length,
-    connector_history_gate_blocked_buckets_preview: sampleRows(historyGateBlockedBuckets),
+    history_gate_blocked_bucket_count: historyGateBlockedBuckets.length,
+    history_gate_blocked_buckets_preview: sampleRows(historyGateBlockedBuckets),
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
   };
 
@@ -1819,7 +1789,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   }
 
   const postRepairBackupGate = historyGateEnabled
-    ? await applyConnectorHistoryGateFilter(
+    ? await applyBackupGateFilter(
       config,
       runId,
       repairedNowDeletableBuckets,
@@ -1828,7 +1798,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     : {
       allowedBuckets: repairedNowDeletableBuckets,
       blockedBuckets: [],
-      connectorGateMap: new Map(),
+      dayGateMap: new Map(),
     };
   const gatedRepairedNowDeletableBuckets = postRepairBackupGate.allowedBuckets;
   const historyGateBlockedAfterRepairBuckets = postRepairBackupGate.blockedBuckets;
@@ -1936,8 +1906,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     mismatch_after_repair_count: finalMismatchCount,
     repaired_now_deletable_bucket_count: gatedRepairedNowDeletableBuckets.length,
     repaired_now_deletable_bucket_count_before_history_gate: repairedNowDeletableBuckets.length,
-    connector_history_gate_allowed_after_repair_bucket_count: gatedRepairedNowDeletableBuckets.length,
-    connector_history_gate_blocked_after_repair_bucket_count: historyGateBlockedAfterRepairBuckets.length,
+    history_gate_blocked_after_repair_bucket_count: historyGateBlockedAfterRepairBuckets.length,
     deleted_bucket_count: deletedBucketResults.length,
     total_deleted_rows: totalDeletedRows.toString(),
     deleted_after_repair_bucket_count: deletedAfterRepairBucketResults.length,
@@ -1959,7 +1928,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     deleted_after_repair_buckets_preview: sampleRows(deletedAfterRepairBucketResults),
     mismatches_before_repair_preview: sampleRows(mismatches),
     mismatches_after_repair_preview: sampleRows(mismatchesAfterRepair),
-    connector_history_gate_blocked_after_repair_buckets_preview: sampleRows(historyGateBlockedAfterRepairBuckets),
+    history_gate_blocked_after_repair_preview: sampleRows(historyGateBlockedAfterRepairBuckets),
     repair_replay_results_preview: sampleRows(repairReplayResults),
     repair_replay_errors_preview: sampleRows(repairReplayErrors),
     delete_errors_preview: sampleRows(deleteErrors),
@@ -2310,8 +2279,8 @@ async function runLateArrivalCleanup(config, overallWindow) {
       processed_day_count: 0,
       delete_error_count: 0,
       mismatch_after_repair_count: 0,
-      connector_history_gate_blocked_bucket_count: 0,
-      connector_history_gate_blocked_after_repair_bucket_count: 0,
+      history_gate_blocked_bucket_count: 0,
+      history_gate_blocked_after_repair_bucket_count: 0,
       total_deleted_rows: "0",
       total_deleted_after_repair_rows: "0",
       alert_condition_count: 0,
@@ -2410,12 +2379,12 @@ async function runLateArrivalCleanup(config, overallWindow) {
       sumIntField(batchSummaries, "delete_error_count") +
       sumIntField(batchSummaries, "delete_after_repair_error_count"),
     mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
-    connector_history_gate_blocked_bucket_count:
-      sumIntField(batchSummaries, "connector_history_gate_blocked_bucket_count") +
-      sumIntField(batchSummaries, "connector_history_gate_blocked_after_repair_bucket_count"),
-    connector_history_gate_blocked_after_repair_bucket_count: sumIntField(
+    history_gate_blocked_bucket_count:
+      sumIntField(batchSummaries, "history_gate_blocked_bucket_count") +
+      sumIntField(batchSummaries, "history_gate_blocked_after_repair_bucket_count"),
+    history_gate_blocked_after_repair_bucket_count: sumIntField(
       batchSummaries,
-      "connector_history_gate_blocked_after_repair_bucket_count",
+      "history_gate_blocked_after_repair_bucket_count",
     ),
     total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
     total_deleted_after_repair_rows: sumBigIntField(batchSummaries, "total_deleted_after_repair_rows").toString(),

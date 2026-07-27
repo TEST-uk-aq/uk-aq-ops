@@ -16,11 +16,6 @@ import {
   resolveLegacyVerificationStatus,
   validateObservationContentHashMetadata,
 } from "../../workers/shared/uk_aq_observation_content_hash.mjs";
-import {
-  connectorDayGateKey,
-  setConnectorDayGateIncomplete,
-  withConnectorDayGateClient,
-} from "../../workers/shared/uk_aq_connector_day_gate.mjs";
 import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import {
   compressors,
@@ -472,39 +467,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
   runState.apply = { status: "running", started_at_utc: new Date().toISOString(), ...counts };
   atomicWriteJson(runStatePath, runState);
   try {
-    const affectedObservationConnectorDays = new Map();
-    for (const item of [...proposal.objects, ...proposal.prefixes]) {
-      if (item.domain !== "observations") continue;
-      const key = String(item.key || item.prefix || "");
-      const match = key.match(/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)/);
-      if (!match) continue;
-      const pair = { day_utc: match[1], connector_id: Number(match[2]) };
-      affectedObservationConnectorDays.set(
-        connectorDayGateKey(pair.day_utc, pair.connector_id),
-        pair,
-      );
-    }
-    if (affectedObservationConnectorDays.size > 0) {
-      if (!adapters.connectorGateClient) {
-        throw new Error("canonical apply requires an IngestDB connector-day gate client");
-      }
-      await adapters.connectorGateClient.query("begin");
-      try {
-        for (const pair of affectedObservationConnectorDays.values()) {
-          await setConnectorDayGateIncomplete(adapters.connectorGateClient, pair);
-        }
-        await adapters.connectorGateClient.query("commit");
-      } catch (error) {
-        await adapters.connectorGateClient.query("rollback");
-        throw error;
-      }
-      runState.connector_day_gate = {
-        status: "invalidated_before_r2_mutation",
-        affected_connector_days: Array.from(affectedObservationConnectorDays.values()),
-        updated_at_utc: new Date().toISOString(),
-      };
-      atomicWriteJson(runStatePath, runState);
-    }
     for (const domain of ["observations", "aqilevels"]) {
       for (const prefixEntry of proposal.prefixes.filter((entry) => entry.domain === domain)) {
         counts.deleted_objects += await deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, adapters: resolvedAdapters });
@@ -540,14 +502,7 @@ async function main() {
   const config = resolveR2HistoryIndexConfig(process.env);
   if (!hasRequiredR2Config(config.r2)) throw new Error("canonical apply requires complete R2 configuration");
   if (config.r2.bucket !== TEST_BUCKET) throw new Error(`Refusing canonical apply for non-TEST bucket: ${config.r2.bucket || "(unset)"}`);
-  return await withConnectorDayGateClient(
-    process.env.SUPABASE_DB_URL || process.env.DATABASE_URL,
-    async (connectorGateClient) => await applyValidatedProposal({
-      runStatePath,
-      r2: config.r2,
-      adapters: { connectorGateClient },
-    }),
-  );
+  return applyValidatedProposal({ runStatePath, r2: config.r2 });
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
