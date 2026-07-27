@@ -20,6 +20,9 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
+import {
+  verifyManifestFileIdentity,
+} from "../shared/uk_aq_r2_file_identity.mjs";
 import { resolveR2HistoryVersion } from "../shared/uk_aq_r2_history_version.mjs";
 import {
   normalizeObservationPropertyCode,
@@ -4601,8 +4604,43 @@ function requireNonNegativeSafeInteger(value, fieldName, manifestKey) {
   return parsed;
 }
 
-function normalizedEtag(value) {
-  return String(value || "").trim().replace(/^"|"$/g, "").toLowerCase();
+export function validateObservationPollutantManifestForGate({
+  childManifest,
+  childReference,
+  childKey,
+  requiresActiveValidation,
+}) {
+  const childHash = requireManifestHash(childManifest, childKey);
+  if (
+    String(childReference?.manifest_hash || "").trim().toLowerCase()
+      !== childHash
+  ) {
+    throw new Error(`Connector child manifest hash mismatch: ${childKey}`);
+  }
+  const rowCount = requireNonNegativeSafeInteger(
+    childManifest.source_row_count,
+    "source_row_count",
+    childKey,
+  );
+  const fileCount = requireNonNegativeSafeInteger(
+    childManifest.file_count,
+    "file_count",
+    childKey,
+  );
+  const totalBytes = requireNonNegativeSafeInteger(
+    childManifest.total_bytes,
+    "total_bytes",
+    childKey,
+  );
+  if (requiresActiveValidation) {
+    validateObservationContentHashMetadata(childManifest, { rowCount });
+  }
+  return {
+    child_hash: childHash,
+    row_count: rowCount,
+    file_count: fileCount,
+    total_bytes: totalBytes,
+  };
 }
 
 export async function verifyObservationConnectorHistory({
@@ -4611,6 +4649,7 @@ export async function verifyObservationConnectorHistory({
   connectorId,
   manifestKey,
   expectedRowCount = null,
+  activePollutants = null,
 }) {
   assertBudget(runtime, "observation_history_verification", {
     day_utc: dayUtc,
@@ -4640,6 +4679,12 @@ export async function verifyObservationConnectorHistory({
   if (!Array.isArray(childReferences) || childReferences.length === 0) {
     throw new Error(`Observation connector manifest has no pollutant children: ${manifestKey}`);
   }
+
+  const activePollutantSet = activePollutants === null
+    ? null
+    : new Set([...activePollutants].map((value) =>
+      normalizePollutantCodeForPath(value)
+    ));
 
   const seenPollutants = new Set();
   const verifiedChildren = [];
@@ -4676,14 +4721,18 @@ export async function verifyObservationConnectorHistory({
     ) {
       throw new Error(`Observation pollutant manifest identity mismatch: ${childKey}`);
     }
-    const childHash = requireManifestHash(childManifest, childKey);
-    if (String(reference?.manifest_hash || "").trim().toLowerCase() !== childHash) {
-      throw new Error(`Connector child manifest hash mismatch: ${childKey}`);
-    }
-    const rowCount = requireNonNegativeSafeInteger(childManifest.source_row_count, "source_row_count", childKey);
-    const fileCount = requireNonNegativeSafeInteger(childManifest.file_count, "file_count", childKey);
-    const totalBytes = requireNonNegativeSafeInteger(childManifest.total_bytes, "total_bytes", childKey);
-    validateObservationContentHashMetadata(childManifest, { rowCount });
+    const requiresActiveValidation = activePollutantSet === null
+      || activePollutantSet.has(pollutantCode);
+    const childValidation = validateObservationPollutantManifestForGate({
+      childManifest,
+      childReference: reference,
+      childKey,
+      requiresActiveValidation,
+    });
+    const childHash = childValidation.child_hash;
+    const rowCount = childValidation.row_count;
+    const fileCount = childValidation.file_count;
+    const totalBytes = childValidation.total_bytes;
     const files = Array.isArray(childManifest.files) ? childManifest.files : [];
     if (files.length !== fileCount || files.length === 0) {
       throw new Error(`Observation pollutant manifest file_count mismatch: ${childKey}`);
@@ -4704,14 +4753,22 @@ export async function verifyObservationConnectorHistory({
       }
       const fileRows = requireNonNegativeSafeInteger(file?.row_count, "files.row_count", childKey);
       const fileBytes = requireNonNegativeSafeInteger(file?.bytes, "files.bytes", childKey);
-      const liveFile = await r2GetObject({ r2: runtime.r2, key: fileKey });
-      if (Number(liveFile.bytes) !== fileBytes) {
-        throw new Error(`Observation Parquet read-back verification failed: ${fileKey}`);
-      }
-      const expectedEtag = normalizedEtag(file?.etag_or_hash);
-      const actualEtag = normalizedEtag(liveFile.etag);
-      if (expectedEtag && actualEtag && expectedEtag !== actualEtag) {
-        throw new Error(`Observation Parquet identity mismatch: ${fileKey}`);
+      if (requiresActiveValidation) {
+        const liveFile = await r2GetObject({ r2: runtime.r2, key: fileKey });
+        verifyManifestFileIdentity({
+          manifestIdentity: file?.etag_or_hash,
+          expectedBytes: fileBytes,
+          liveObject: liveFile,
+          objectKey: fileKey,
+        });
+      } else {
+        const liveFile = await r2HeadObject({ r2: runtime.r2, key: fileKey });
+        if (!liveFile.exists) {
+          throw new Error(`Opaque observation Parquet object is missing: ${fileKey}`);
+        }
+        if (Number(liveFile.bytes) !== fileBytes) {
+          throw new Error(`Opaque observation Parquet byte count mismatch: ${fileKey}`);
+        }
       }
       childRows += fileRows;
       childBytes += fileBytes;
@@ -4726,6 +4783,7 @@ export async function verifyObservationConnectorHistory({
       source_row_count: rowCount,
       file_count: fileCount,
       total_bytes: totalBytes,
+      validation_scope: requiresActiveValidation ? "active" : "opaque_preserved",
     });
   }
 
@@ -4812,6 +4870,12 @@ export async function verifyObservationConnectorHistory({
     history_file_count: fileCount,
     history_total_bytes: totalBytes,
     connector_index_count: verifiedChildren.length,
+    active_pollutant_count: verifiedChildren.filter((child) =>
+      child.validation_scope === "active"
+    ).length,
+    opaque_preserved_pollutant_count: verifiedChildren.filter((child) =>
+      child.validation_scope === "opaque_preserved"
+    ).length,
   };
 }
 
