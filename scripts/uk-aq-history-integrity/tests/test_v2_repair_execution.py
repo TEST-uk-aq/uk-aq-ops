@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ SPEC = importlib.util.spec_from_file_location("uk_aq_history_integrity_v2_repair
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Unable to load module at {MODULE_PATH}")
 MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
@@ -2277,6 +2279,152 @@ class V2RepairExecutionTests(unittest.TestCase):
         )
         self.assertNotIn("pm10", planned)
         self.assertNotIn("pm25", planned)
+
+    def test_hash_evidence_worker_receives_only_derived_pollutant_subset(self) -> None:
+        complete = {
+            "source_partition_state": "successful_non_empty",
+            "source_counts_available": True,
+            "source_skip_reason": None,
+            "unresolved_site_ref_groups": 0,
+            "unmapped_site_ref_groups": 0,
+            "ambiguous_site_ref_groups": 0,
+            "timeseries_conflict_groups": 0,
+            "required_source_file_count": 2,
+            "successful_source_file_count": 2,
+        }
+        day_utc = "2026-07-15"
+        candidates = [
+            {
+                "day_utc": day_utc,
+                "connector_id": 7,
+                "pollutant_code": "no2",
+                "source_row_count": 1,
+                "source_timeseries_row_counts": {"101": 1},
+                "source_evidence": complete,
+            },
+            {
+                "day_utc": day_utc,
+                "connector_id": 7,
+                "pollutant_code": "pm10",
+                "source_row_count": 1,
+                "source_timeseries_row_counts": {"102": 1},
+                "source_evidence": {
+                    **complete,
+                    "ambiguous_site_ref_groups": 1,
+                },
+            },
+            {
+                "day_utc": day_utc,
+                "connector_id": 7,
+                "pollutant_code": "o3",
+                "source_row_count": 0,
+                "source_timeseries_row_counts": {},
+                "source_evidence": {
+                    **complete,
+                    "source_partition_state": "successful_empty",
+                    "no_authoritative_timeseries_binding_groups": 1,
+                },
+            },
+            {
+                "day_utc": day_utc,
+                "connector_id": 7,
+                "pollutant_code": "pm25",
+                "source_row_count": 1,
+                "source_timeseries_row_counts": {"103": 1},
+                "source_evidence": complete,
+            },
+        ]
+        scopes, skipped = MODULE._derive_observation_hash_check_pollutants(
+            candidates=candidates,
+            requested_pollutants=["no2", "o3", "pm10"],
+        )
+        self.assertEqual(scopes, {(day_utc, 7): ["no2"]})
+        self.assertEqual(
+            skipped[(day_utc, 7, "pm10")],
+            "ambiguous_site_ref_groups=1",
+        )
+        self.assertEqual(skipped[(day_utc, 7, "o3")], "no_executable_source_rows")
+        self.assertEqual(
+            skipped[(day_utc, 7, "pm25")],
+            "outside_operator_requested_pollutant_scope",
+        )
+
+    def test_matching_hash_candidate_is_verified_without_observation_rewrite(self) -> None:
+        day_utc = "2026-07-15"
+        manifest_path = self.root / "manifest.json"
+        content_hash = {
+            "observation_content_hash": "a" * 64,
+            "observation_content_hash_algorithm": "sha256",
+            "observation_content_hash_contract_version": 1,
+            "observation_content_hash_row_count": 1,
+            "observation_content_hash_columns": MODULE.OBSERVATION_CONTENT_HASH_COLUMNS,
+            "verification_status_counts": {"P": 1, "R": 0, "null": 0},
+        }
+        manifest_path.write_text(json.dumps(content_hash), encoding="utf-8")
+        (self.root / "R2_history_backup").mkdir()
+        candidate = {
+            "day_utc": day_utc,
+            "connector_id": 7,
+            "pollutant_code": "no2",
+            "manifest_path": str(manifest_path),
+            "manifest_rel": "history/v2/observations/no2/manifest.json",
+            "parquet_paths": [],
+            "source_row_count": 1,
+            "source_timeseries_row_counts": {"101": 1},
+            "source_evidence": {
+                "source_partition_state": "successful_non_empty",
+                "source_counts_available": True,
+                "source_skip_reason": None,
+                "unresolved_site_ref_groups": 0,
+                "unmapped_site_ref_groups": 0,
+                "ambiguous_site_ref_groups": 0,
+                "timeseries_conflict_groups": 0,
+                "required_source_file_count": 1,
+                "successful_source_file_count": 1,
+            },
+        }
+        observations = {
+            "gaps": [],
+            "hash_check_candidates": [candidate],
+            "hash_candidates_by_pollutant": {"no2": 1},
+        }
+        captured_pollutants = []
+
+        def fake_backfill(**kwargs):
+            captured_pollutants.append(kwargs.get("repair_pollutants"))
+            return {"status": "ok"}
+
+        evidence = {"observation_content_hashes": {"no2": content_hash}}
+        with (
+            mock.patch.object(MODULE, "run_narrow_backfill", side_effect=fake_backfill),
+            mock.patch.object(
+                MODULE,
+                "_load_complete_connector_day_source_evidence",
+                return_value=(evidence, []),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_persist_complete_connector_day_source_evidence",
+            ),
+        ):
+            metrics = MODULE.run_v2_observation_content_hash_checks(
+                conn=self.conn,
+                env_name="CIC-Test",
+                run_compact="focused",
+                env=self.env,
+                v2_observations=observations,
+                source_scope={"source": "sos"},
+                log=self.log,
+                repair_pollutants=["no2", "pm10"],
+            )
+
+        self.assertEqual(captured_pollutants, [["no2"]])
+        self.assertEqual(metrics["verified"], 1)
+        self.assertEqual(observations["gaps"], [])
+        self.assertFalse(any(
+            action.get("kind") == "observation_data_repair"
+            for action in observations["repair_plan"]
+        ))
 
     def test_all_pollutant_repair_requires_complete_source_for_every_pollutant(self) -> None:
         day_utc = "2026-07-15"

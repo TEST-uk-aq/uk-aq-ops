@@ -93,6 +93,40 @@ function walkFiles(root) {
   return files.sort();
 }
 
+function discoverCanonicalPollutantDeclarations({
+  connectorDirectory,
+  connectorPrefix,
+  connectorKey,
+}) {
+  const declarations = [];
+  for (const entry of fs.readdirSync(connectorDirectory, { withFileTypes: true })) {
+    const match = entry.isDirectory()
+      ? entry.name.match(/^pollutant_code=([a-z][a-z0-9_]*)$/)
+      : null;
+    if (!match) continue;
+    const pollutantCode = match[1];
+    const directory = path.join(connectorDirectory, entry.name);
+    const manifestPath = path.join(directory, "manifest.json");
+    if (!fs.existsSync(manifestPath)) {
+      const partFiles = walkFiles(directory).filter((filePath) =>
+        /[/\\]part-[^/\\]+\.parquet$/.test(filePath));
+      if (partFiles.length) {
+        throw new Error(
+          `Blocked dependency: current canonical pollutant data has no manifest under ${connectorKey}; `
+          + `pollutant_code=${pollutantCode}`,
+        );
+      }
+      continue;
+    }
+    declarations.push({
+      pollutant_code: pollutantCode,
+      manifest_key: `${connectorPrefix}${entry.name}/manifest.json`,
+    });
+  }
+  return declarations.sort((left, right) =>
+    left.manifest_key.localeCompare(right.manifest_key));
+}
+
 function parquetIso(value) {
   if (value === null || value === undefined || value === "") return null;
   const parsed = value instanceof Date ? value : new Date(value);
@@ -275,8 +309,13 @@ export async function prepareCanonicalObservationManifestCompatibility({
       const canonicalPattern = new RegExp(
         `^${escapedPrefix}pollutant_code=([a-z][a-z0-9_]*)/manifest\\.json$`,
       );
-      const canonicalDeclarations = childEntries.filter((child) =>
+      const declaredCanonicalDeclarations = childEntries.filter((child) =>
         canonicalPattern.test(String(child?.manifest_key || "")));
+      const canonicalDeclarations = discoverCanonicalPollutantDeclarations({
+        connectorDirectory: path.dirname(connectorPath),
+        connectorPrefix,
+        connectorKey,
+      });
       if (!canonicalDeclarations.length) continue;
       if (legacyDeclarations.length) {
         throw new Error(`Blocked dependency: mixed legacy and canonical pollutant declarations in ${connectorKey}`);
@@ -404,7 +443,14 @@ export async function prepareCanonicalObservationManifestCompatibility({
           validation_failures: validation.failures,
         });
       }
-      if (!pollutantProposals.length) continue;
+      const declaredCanonicalKeys = new Set(declaredCanonicalDeclarations
+        .map((child) => String(child?.manifest_key || "").trim())
+        .filter(Boolean));
+      const discoveredCanonicalKeys = new Set(canonicalDeclarations
+        .map((child) => child.manifest_key));
+      const parentChildrenStale = declaredCanonicalKeys.size !== discoveredCanonicalKeys.size
+        || [...declaredCanonicalKeys].some((key) => !discoveredCanonicalKeys.has(key));
+      if (!pollutantProposals.length && !parentChildrenStale) continue;
 
       const parentMetadata = metadataFromExisting(parent, parent, dayUtc);
       const compatibilityParent = buildHistoryV2ConnectorManifest({

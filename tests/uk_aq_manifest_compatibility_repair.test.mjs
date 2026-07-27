@@ -396,6 +396,104 @@ test("day repair normalises legacy pollutant paths before connector and day pare
   }
 });
 
+test("stale nonexistent canonical child is removed by metadata-only parent discovery", async () => {
+  const connectorId = 7;
+  const pm10 = canonicalPollutant(connectorId, "pm10");
+  const staleC2h6 = canonicalPollutant(connectorId, "c2h6");
+  const connectorKey = `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/manifest.json`;
+  const staleConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY,
+    connectorId,
+    runId: "fixture",
+    manifestKey: connectorKey,
+    pollutantManifests: [pm10, staleC2h6],
+    writerGitSha: null,
+    backedUpAtUtc: "2026-07-17T14:07:48.000Z",
+  });
+  const dayKey = `${PREFIX}/day_utc=${DAY}/manifest.json`;
+  const staleDay = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc: DAY,
+    runId: "fixture",
+    manifestKey: dayKey,
+    connectorManifests: [staleConnector],
+    writerGitSha: null,
+    backedUpAtUtc: "2026-07-17T14:07:48.000Z",
+  });
+  const resolver = resolverFixture();
+  try {
+    writeObjects(resolver.dropboxRoot, {
+      [pm10.manifest_key]: JSON.stringify(pm10, null, 2),
+      [connectorKey]: JSON.stringify(staleConnector, null, 2),
+      [dayKey]: JSON.stringify(staleDay, null, 2),
+    });
+    const output = await runV2ObservationsRepair({
+      env: resolver.env,
+      repairPlan: dayRepairPlan(),
+    });
+    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
+    const proposalKeys = output.planning.proposals.map((proposal) => proposal.key);
+    assert.equal(proposalKeys.some((key) => key.includes("pollutant_code=c2h6")), false);
+    assert.equal(proposalKeys.some((key) => key.endsWith(".parquet")), false);
+    assert.deepEqual(
+      proposalKeys.sort(),
+      [connectorKey, dayKey].sort(),
+    );
+    const repairedConnector = JSON.parse(
+      output.planning.proposals.find((proposal) => proposal.key === connectorKey).proposed_body,
+    );
+    assert.deepEqual(repairedConnector.pollutant_codes, ["pm10"]);
+    assert.equal(
+      output.planning.proposals.some((proposal) => proposal.kind === "pollutant_manifest"),
+      false,
+    );
+  } finally {
+    resolver.cleanup();
+  }
+});
+
+test("real canonical data directory without a manifest remains fail-closed", async () => {
+  const connectorId = 7;
+  const pm10 = canonicalPollutant(connectorId, "pm10");
+  const connectorKey = `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/manifest.json`;
+  const connector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY,
+    connectorId,
+    runId: "fixture",
+    manifestKey: connectorKey,
+    pollutantManifests: [pm10],
+    writerGitSha: null,
+    backedUpAtUtc: "2026-07-17T14:07:48.000Z",
+  });
+  const dayKey = `${PREFIX}/day_utc=${DAY}/manifest.json`;
+  const day = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc: DAY,
+    runId: "fixture",
+    manifestKey: dayKey,
+    connectorManifests: [connector],
+    writerGitSha: null,
+    backedUpAtUtc: "2026-07-17T14:07:48.000Z",
+  });
+  const resolver = resolverFixture();
+  try {
+    writeObjects(resolver.dropboxRoot, {
+      [pm10.manifest_key]: JSON.stringify(pm10, null, 2),
+      [connectorKey]: JSON.stringify(connector, null, 2),
+      [dayKey]: JSON.stringify(day, null, 2),
+      [`${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/pollutant_code=c2h6/part-00000.parquet`]: "real-unrepresented-data",
+    });
+    await assert.rejects(
+      () => runV2ObservationsRepair({ env: resolver.env, repairPlan: dayRepairPlan() }),
+      /current canonical pollutant data has no manifest.*pollutant_code=c2h6/,
+    );
+  } finally {
+    resolver.cleanup();
+  }
+});
+
 test("legacy connector repair remains fail-closed when baseline data is not represented", async () => {
   const pm10 = canonicalPollutant(7, "pm10");
   const pm25 = canonicalPollutant(7, "pm25");
@@ -433,7 +531,7 @@ test("legacy connector repair remains fail-closed when baseline data is not repr
     });
     await assert.rejects(
       () => runV2ObservationsRepair({ env: resolver.env, repairPlan: dayRepairPlan() }),
-      /cannot preserve baseline objects|canonical pollutant manifest unavailable/,
+      /cannot preserve baseline objects|canonical pollutant manifest unavailable|current canonical pollutant data has no manifest/,
     );
   } finally {
     resolver.cleanup();
