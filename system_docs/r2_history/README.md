@@ -11,6 +11,7 @@ This area governs:
 - the connector-specific IngestDB-to-R2 boundary used by Integrity;
 - concurrent Prune Daily and Integrity writer coordination;
 - connector-day, day-finalisation and global-index advisory locks;
+- Supabase project isolation and database-local advisory-lock identity;
 - the shared canonical R2 v2 connector-day writer and parent finalisers;
 - the active Prune Daily Phase B observation and observation-derived AQI history write pipeline;
 - connector-day observation deletion gates and aggregate whole-day completion gates;
@@ -36,6 +37,7 @@ For Integrity changes, also read:
 
 - [`integrity.md`](integrity.md);
 - [`history_writer_coordination.md`](history_writer_coordination.md) for the request-level IngestDB boundary, shared writer and lock hierarchy;
+- [`lock_environment_boundary.md`](lock_environment_boundary.md) for the authoritative Supabase-project boundary and lock-key inputs;
 - [`prune_connector_day_gate.md`](prune_connector_day_gate.md) for the Prune Daily-only observation deletion gate;
 - [`connector_gate_file_identity.md`](connector_gate_file_identity.md) for physical Parquet identity validation used by Prune Daily gate completion and explicit recovery verification;
 - [`daily_profile_selection.md`](daily_profile_selection.md) where scheduled selection is involved.
@@ -43,6 +45,7 @@ For Integrity changes, also read:
 For Prune Daily Phase B observation/AQI writes and IngestDB deletion safety, also read:
 
 - [`history_writer_coordination.md`](history_writer_coordination.md);
+- [`lock_environment_boundary.md`](lock_environment_boundary.md);
 - [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md);
 - [`prune_connector_day_gate.md`](prune_connector_day_gate.md);
 - [`connector_gate_file_identity.md`](connector_gate_file_identity.md).
@@ -111,7 +114,10 @@ Required behaviour includes:
 
 ## Shared history writer and lock hierarchy
 
-The authoritative coordination contract is [`history_writer_coordination.md`](history_writer_coordination.md).
+The authoritative coordination contracts are:
+
+- [`history_writer_coordination.md`](history_writer_coordination.md);
+- [`lock_environment_boundary.md`](lock_environment_boundary.md), which supersedes any older requirement to include an environment label in the lock key.
 
 Required behaviour includes:
 
@@ -122,7 +128,9 @@ Required behaviour includes:
 - no global "Prune Daily is running" exclusion is required;
 - live writers share a connector-day lock for exact `day_utc + connector_id` mutation;
 - parent day-manifest merging is serialised by a day-finalisation lock;
-- aggregate/latest index updates are serialised by a short environment-scoped global index lock;
+- aggregate/latest index updates are serialised by one database-local global index lock;
+- TEST and LIVE isolation is provided by their separate Supabase projects;
+- environment labels are diagnostic only and are not advisory-lock key input;
 - locks are acquired sequentially and are not nested across those three scopes;
 - day finalisation preserves connectors already present in R2 and does not rebuild a day solely from the current run's connector set.
 
