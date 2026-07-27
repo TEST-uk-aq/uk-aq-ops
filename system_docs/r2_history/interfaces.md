@@ -163,6 +163,8 @@ Missing AQI context must not falsely mark otherwise complete visible observation
 
 The website may render complete observations while leaving an incomplete calculated-AQI interval blank. It must not invent AQI coverage or fill gaps from stored AQI silently.
 
+An absent AQI row because source observations are missing, invalid or insufficient for the required calculation is a valid blank chart interval. It is not by itself evidence that the request was not fetched or that the AQI service failed. Calculation status and missing-reason diagnostics must remain available where the response provides them.
+
 ## Website initial-load priority
 
 For selected sensors, the required user-visible priority is:
@@ -229,13 +231,29 @@ All station-history work must share a bounded global fetch cap. Per-stream concu
 
 ## Cache contract
 
-The website keeps observation and calculated-AQI coverage separately for each authoritative sensor identity, connector, pollutant and range.
+The website keeps observation and calculated-AQI state separately for each authoritative sensor identity, connector, pollutant and range.
 
-Secondary calculated AQI may be retained in cache without being rendered. Selecting that sensor as the AQI source must use the cached AQI immediately when its requested range is complete.
+For calculated AQI, browser state must distinguish:
 
-A cached observation range does not by itself prove that calculated AQI is cached. AQI completeness includes any required hidden context and must be tracked independently.
+```text
+response completeness and diagnostics
+request settlement and retry eligibility
+available calculated AQI rows
+```
 
-A partially covered AQI cache may continue accepting valid chunks and remain retryable, but it is not eligible for incremental visible rendering during a user-initiated AQI source switch. It becomes eligible for the transition's single visible commit only when all work planned for that transition has reached a terminal state. A terminal partial response may expose all valid available intervals in one commit, with genuine gaps left blank and the incomplete state reported accurately.
+A complete successful AQI response is settled for its requested interval.
+
+A terminal AQI response that successfully evaluated the requested interval may also be settled for request planning when missing AQI values are authoritative consequences of source-observation gaps, invalid excluded inputs or insufficient calculation samples, including incomplete PM rolling context. The website must cache all valid AQI rows, retain the partial and missing-reason diagnostics, and leave the affected chart intervals blank. It must not label that response complete.
+
+A settled terminal partial interval must not be repeatedly refetched solely because some AQI rows are absent. Selecting or reselecting that sensor as the AQI source must reuse the settled cache, including its authoritative blank intervals.
+
+A request, service, parsing, identity or physical-read failure remains unsettled and retryable. Cancellation, scan-budget exhaustion or another response condition that does not establish an authoritative result for the requested interval also remains unsettled and retryable.
+
+Secondary calculated AQI may be retained in cache without being rendered. Selecting that sensor as the AQI source must use settled cached AQI immediately after the required source-change transition.
+
+A cached observation range does not by itself prove that calculated AQI is settled. AQI request settlement includes any required hidden context and must be tracked independently.
+
+The website must not display a user-facing incomplete or error message solely because a settled AQI interval contains authoritative blank hours. An error message is reserved for an actual request, service or identity failure that prevents accurate settlement.
 
 Requests must use stable URLs and parameters for normal traffic so Cloudflare caching can serve warm hits. Cache-buster parameters are limited to diagnostics and explicit forced refreshes.
 
@@ -247,24 +265,26 @@ When the user chooses a different selected sensor for AQI bands, the website mus
 2. create or advance a source-switch transition token identifying the selected sensor, requested range and current load generation;
 3. immediately remove the previous sensor's AQI bands so stale bands are never shown under the new selection;
 4. show an intentionally blank/loading AQI band area for approximately 200 milliseconds;
-5. if complete calculated AQI for the new source and requested range is already cached, render that complete range once after the brief transition;
-6. otherwise keep the AQI area blank/loading while missing AQI work is fetched using the existing bounded concurrency, priority and ordered-settlement rules;
-7. settle each valid response into AQI cache or transition staging while preserving independent coverage, completeness, gap and partial-reason metadata;
+5. if calculated AQI for the new source and requested range is already settled in cache, including any authoritative blank intervals, render that cached result once after the brief transition;
+6. otherwise keep the AQI area blank/loading while unsettled AQI work is fetched using the existing bounded concurrency, priority and ordered-settlement rules;
+7. settle each valid response into AQI cache or transition staging while preserving independent response-completeness, request-settlement, gap and partial-reason metadata;
 8. do not repaint the visible AQI layer as individual AQI chunks settle for that transition;
 9. regard the transition as terminal only when all AQI requests planned for the current selected source and requested range have completed, failed, been cancelled or been made obsolete;
-10. when the current transition reaches a successful terminal state, commit the new source's AQI bands to the visible AQI layer once;
-11. when it reaches a terminal partial state, commit all valid available intervals once, leave genuine gaps blank and show an accurate incomplete or error state;
-12. never mix AQI points from the previous and new source in one visible AQI layer;
-13. never show the previous sensor's bands under the newly selected sensor;
-14. invalidate the visible commit of an older transition when the user changes AQI source again, changes the requested range or starts a newer incompatible load generation;
-15. allow valid obsolete responses to improve their own sensor's cache where safe, but never allow an obsolete response or transition token to become visible;
-16. never refetch or repaint retained observation lines solely because the AQI source changed.
+10. when the current transition reaches a terminal state with the target range settled, commit the new source's available AQI bands to the visible AQI layer once;
+11. leave every hour without a valid calculated AQI value blank, including hours with missing observations, invalid excluded inputs or insufficient rolling samples;
+12. do not show a user-facing incomplete or error message solely because settled AQI contains those authoritative blank intervals;
+13. show an AQI update error only when an actual request, service or identity failure prevents accurate settlement, and leave that failed interval retryable;
+14. never mix AQI points from the previous and new source in one visible AQI layer;
+15. never show the previous sensor's bands under the newly selected sensor;
+16. invalidate the visible commit of an older transition when the user changes AQI source again, changes the requested range or starts a newer incompatible load generation;
+17. allow valid obsolete responses to improve their own sensor's cache where safe, but never allow an obsolete response or transition token to become visible;
+18. never refetch or repaint retained observation lines solely because the AQI source changed.
 
 The atomic requirement applies to the visible AQI-layer commit, not to network execution. Missing chunks should continue to fetch in parallel and settle newest-to-oldest. The website must not implement this behaviour by serialising requests, adding an arbitrary long delay or recalculating AQI in browser code.
 
-The approximately 200 millisecond blank state is a user-interface transition, not a data delay requirement. It confirms that the selected AQI source changed and prevents the previous sensor's bands appearing to belong to the new sensor.
+The approximately 200 millisecond blank state is a user-interface transition, not a minimum network delay. It confirms that the selected AQI source changed and prevents the previous sensor's bands appearing to belong to the new sensor.
 
-When complete AQI is already cached, the transition should normally finish in about 200 milliseconds. When it is not cached, normal loading state continues until the current transition reaches a terminal state and its one visible AQI-layer commit can be made.
+When the selected range is already settled in AQI cache, the transition should normally finish in about 200 milliseconds even when the cached result contains authoritative blank intervals. A first uncached or genuinely retryable range may take longer while required network work completes. Once that range settles, later switches must reuse it rather than repeating the same work.
 
 This exception does not remove progressive rendering from initial chart loading, observation loading, range extension or background secondary AQI prefetch. It applies only to changing the AQI source on an already displayed chart.
 
@@ -315,5 +335,7 @@ The binding route and station-history consumer must fail closed or return an exp
 - a requested response part cannot be produced accurately.
 
 A gap between valid members remains a reported gap.
+
+An incomplete response may still establish authoritative blank AQI intervals when the missing values are caused by genuine source-data or calculation-sample gaps. That does not convert the response to complete, but it may make the interval settled and reusable under the cache contract above.
 
 There is no active fallback to the retired cumulative R2 metadata route.
