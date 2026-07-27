@@ -8,6 +8,8 @@ For this station-history display path, it deliberately amends the broader source
 
 Those broader files remain authoritative for breakpoints, averaging, canonical AQI rows, persisted AQI history, low-level R2 reads, timestamp semantics and behaviour not explicitly changed here.
 
+The shared browser architecture, cache ownership, AQI-source controller, renderer and page-adapter boundaries are defined by [`../station_charts/contract.md`](../station_charts/contract.md). That frontend contract deliberately replaces older assumptions that chart orchestration may live directly in page inline code or in separate calculated and compatibility chart controllers.
+
 ## Purpose
 
 The website must render one continuous station/pollutant chart even when the physical station or timeseries identity changes.
@@ -221,7 +223,7 @@ For the calculated-history station-chart path:
 
 This is the approved exception to the older rule that committed R2 AQI wins visible station-history overlaps.
 
-The older separate foreground R2 AQI path remains a compatibility fallback only while the calculated-history feature is disabled or an older response contract is received.
+The older separate foreground R2 AQI path remains a compatibility data source only while the calculated-history feature is disabled or an older response contract is received. It must use the same shared browser controller, cache, AQI-source controller and renderer.
 
 ## Stored R2 AQI validation
 
@@ -303,24 +305,28 @@ Do not log entire observation or AQI histories.
 
 ## Website consumer
 
-The website loader must:
+The website must consume this data through the shared station-chart architecture in [`../station_charts/contract.md`](../station_charts/contract.md).
+
+The shared controller and clients must:
 
 - keep sending one current timeseries ID;
 - consume observations and calculated AQI from the combined response;
 - render each combined chunk progressively except where the atomic AQI source-switch contract explicitly suppresses incremental AQI repainting;
 - stop the normal separate historical AQI request when the new response is available and enabled;
-- retain compatibility fallback for older/disabled responses;
+- retain the compatibility data source for older or disabled responses behind the same client interface;
 - never wait for background validation;
 - never redraw because validation completes;
-- keep existing abort, stale fallback, cache and progressive loading behaviour unless explicitly changed elsewhere;
-- bump the browser storage/cache contract so old separately sourced AQI is not mixed with calculated-response AQI;
-- distinguish response completeness from whether an AQI request interval has reached an authoritative settled result;
-- reuse settled AQI intervals on later source switches even when their valid output contains blank hours;
-- avoid a user-facing incomplete warning solely because some AQI hours could not be calculated from the available source observations.
+- preserve bounded abort, stale fallback, cache and progressive loading behaviour;
+- bump the browser storage/cache contract when incompatible cache semantics change;
+- distinguish response completeness from whether a successful requested interval is settled for browser source-switch planning;
+- reuse successfully evaluated AQI intervals on later source switches even when their valid output contains blank hours;
+- avoid a user-facing incomplete or chart-wide AQI error for partial, blank or unfamiliar AQI diagnostic values;
+- keep AQI-only transport, parsing, identity and replacement failures local to the AQI layer while the observation chart remains usable;
+- use one controller, cache, AQI-source controller and renderer across Hex Map, Sensors and compatibility mode.
 
 The browser must not expose continuity mechanics as a requirement to users.
 
-## Completeness
+## Completeness and browser settlement
 
 Observation and AQI completeness remain independent.
 
@@ -337,11 +343,23 @@ A response must be partial or incomplete when any required condition is unresolv
 
 A partial response must not be cached or labelled as complete.
 
-Browser request planning must nevertheless distinguish response completeness from request settlement. A terminal AQI response may be recorded as settled for its requested interval when the interval was successfully evaluated and missing AQI values are authoritative consequences of source-observation gaps, excluded invalid inputs or insufficient calculation samples. Valid rows remain cached, affected hours remain blank, and all partial and missing-reason diagnostics remain preserved.
+Browser request planning nevertheless uses a separate settlement decision.
 
-A settled partial AQI interval must not be repeatedly refetched solely because those blank hours exist. It must not produce a user-facing incomplete or error message solely for those gaps.
+A calculated AQI response is settled for its requested browser range when:
 
-A request, service, parsing, identity or physical-read failure does not establish authoritative settlement. Cancellation, scan-budget exhaustion or another unresolved response condition remains retryable. A user-facing AQI update error is reserved for an actual failure that prevents accurate settlement.
+- the HTTP request succeeded;
+- the response is parseable;
+- the authoritative identity is valid;
+- the AQI section has the required structural shape;
+- no unsafe replacement conflict exists.
+
+It may remain incomplete and retain all gap, partial, calculation-status and missing-reason diagnostics.
+
+Missing AQI values remain blank. A previously unseen calculation status, missing reason or partial reason is bounded diagnostic evidence and does not by itself make an otherwise usable successful response a browser hard failure.
+
+A successfully evaluated AQI interval must not be repeatedly refetched solely because blank hours or unfamiliar diagnostics exist. It must not produce a chart-wide user-facing AQI warning or error.
+
+A network, HTTP, parsing, identity or unsafe replacement-conflict failure does not establish authoritative browser settlement. It remains retryable. When the observation chart remains usable, it may produce an AQI-local unavailable state but not the page-wide red chart error banner.
 
 ## Feature flags
 
@@ -366,6 +384,8 @@ Safe repository defaults remain disabled unless established TEST conventions req
 
 The features must not be enabled automatically in LIVE as part of the TEST implementation.
 
+Disabling calculated rendering switches the shared station-chart controller to the compatibility data client. It must not activate a second frontend controller or renderer.
+
 ## Integrity repair dependency
 
 Historical physical-identity correction must remain disabled until this station-history contract is deployed and operationally confirmed.
@@ -387,4 +407,5 @@ This contract does not:
 - make the browser query continuity metadata;
 - introduce a second public calculation route;
 - activate daily or monthly AQI roll-ups;
+- add a second browser chart controller for compatibility mode;
 - enable historical identity repair in LIVE.
