@@ -1,11 +1,8 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import path from "node:path";
 import test from "node:test";
 import {
   createPhaseBRunBudgetForTest,
   derivePhaseBPgTimeoutsForTest,
-  fetchActiveCompleteCandidatesMissingConnectorGateForTest,
   isAcceptedPruneHistoryDayManifestKey,
   populateBackupCandidatesForTest,
   runPhaseBBackup,
@@ -16,7 +13,6 @@ import {
   executePruneDaily,
   filterBucketsByConnectorHistoryGate,
   runPruneForTest,
-  shouldRebuildPhaseBHistoryIndexesForTest,
 } from "../workers/uk_aq_prune_daily/server.mjs";
 import { runPruneDailyJob } from "../workers/uk_aq_prune_daily/job.mjs";
 import {
@@ -65,7 +61,7 @@ test("prune history day manifest gate rejects connector and pollutant manifests"
   );
 });
 
-test("connector-day gate separates deletion authority and Integrity write modes", async () => {
+test("connector-day gate is exact Prune Daily deletion authority", async () => {
   const dayUtc = "2026-06-12";
   const completeConnectorTwo = {
     day_utc: dayUtc,
@@ -127,75 +123,6 @@ test("connector-day gate separates deletion authority and Integrity write modes"
   assert.equal(simulatedGateState.get(connectorDayGateKey(dayUtc, 1)), false);
   assert.equal(simulatedGateState.get(connectorDayGateKey(dayUtc, 2)), true);
 
-  const implementationPath = path.resolve(
-    "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py",
-  );
-  const python = spawnSync("python3", [
-    "-c",
-    [
-      "import importlib.util, json, sys",
-      "spec = importlib.util.spec_from_file_location('integrity_impl', sys.argv[1])",
-      "module = importlib.util.module_from_spec(spec)",
-      "spec.loader.exec_module(module)",
-      "print(json.dumps([module.integrity_connector_gate_writes_allowed(mode) for mode in ['check_only', 'repair_dry_run', 'repair_apply']]))",
-    ].join("; "),
-    implementationPath,
-  ], { encoding: "utf8" });
-  assert.equal(python.status, 0, python.stderr);
-  assert.deepEqual(JSON.parse(python.stdout.trim()), [false, false, true]);
-});
-
-test("normal adoption query is limited to active connector-days and retains active complete adoption", async () => {
-  const activeDay = "2026-07-21";
-  const historicalDay = "2026-03-14";
-  const databaseRows = [
-    { day_utc: activeDay, connector_id: 7, expected_row_count: "10", status: "complete", resume_parts_json: [] },
-    { day_utc: historicalDay, connector_id: 2, expected_row_count: "20", status: "complete", resume_parts_json: [] },
-  ];
-  let queryCount = 0;
-  const fakeClient = {
-    async query(sql, params) {
-      queryCount += 1;
-      assert.match(sql, /join active_scope s/i);
-      const activeScope = JSON.parse(params[0]);
-      assert.deepEqual(activeScope, [{ day_utc: activeDay, connector_id: 7 }]);
-      assert.equal(params[0].includes(historicalDay), false);
-      const activeKeys = new Set(activeScope.map((row) => `${row.day_utc}:${row.connector_id}`));
-      return {
-        rows: databaseRows.filter((row) => activeKeys.has(`${row.day_utc}:${row.connector_id}`)),
-      };
-    },
-  };
-
-  const candidates = await fetchActiveCompleteCandidatesMissingConnectorGateForTest({
-    client: fakeClient,
-    activeCandidates: [{ day_utc: activeDay, connector_id: 7 }],
-    maxCandidatesPerRun: 500,
-  });
-
-  assert.equal(queryCount, 1);
-  assert.deepEqual(candidates.map((row) => [row.day_utc, row.connector_id]), [[activeDay, 7]]);
-  assert.equal(candidates.some((row) => row.day_utc === historicalDay), false);
-
-  let adopted = false;
-  const adoption = await runBudgetedPhaseBStageForTest({
-    runtime: {
-      run_budget: createPhaseBRunBudgetForTest({
-        nowMs: () => 0,
-        startedAtMs: 0,
-        maxSecondsPerRun: 840,
-        stopBeforeTimeoutSeconds: 60,
-      }),
-    },
-    operation: "active_scope_adoption",
-    minMs: 180_000,
-    adapter: async () => {
-      adopted = candidates.length === 1;
-      return candidates[0];
-    },
-  });
-  assert.equal(adoption.status, "completed");
-  assert.equal(adopted, true);
 });
 
 function completeCandidate(dayUtc, connectorId, expectedRowCount, minObservedAt, maxObservedAt) {
@@ -351,10 +278,6 @@ test("insufficient Phase B budget prevents AQI and Dropbox adapters and reports 
   assert.equal(summary.status, "stopped_budget");
   assert.equal(summary.stopped_for_budget, true);
   assert.equal(summary.budget_stop.remaining_budget_ms, 179_999);
-  assert.equal(shouldRebuildPhaseBHistoryIndexesForTest({
-    dryRun: false,
-    phaseBHistorySummary: summary,
-  }), false);
 });
 
 function phaseBConfig() {
@@ -385,7 +308,6 @@ function phaseBConfig() {
     max_seconds_per_run: 840,
     stop_before_timeout_seconds: 60,
     phase_b_calculate_aqi_from_observations_enabled: true,
-    phase_b_legacy_aqi_rpc_export_enabled: false,
     prune_check_dropbox: { enabled: false, required: false },
   };
 }
@@ -447,8 +369,6 @@ test("source-change invalidation survives a real Phase B candidate-start budget 
 
 test("top-level stopped-budget path skips every downstream adapter, finishes task health, and writes the normal report", async () => {
   const calls = {
-    index: 0,
-    chart: 0,
     prune: 0,
     late: 0,
   };
@@ -468,8 +388,6 @@ test("top-level stopped-budget path skips every downstream adapter, finishes tas
   const adapters = {
     runPhaseARecent: async () => ({ enabled: true }),
     runPhaseBBackup: async () => stoppedPhaseB,
-    rebuildR2HistoryIndexes: async () => { calls.index += 1; },
-    runChartLoadMetricsMaintenance: async () => { calls.chart += 1; },
     runPruneSingleWindow: async () => { calls.prune += 1; },
     runLateArrivalCleanup: async () => { calls.late += 1; },
     withDailyTaskRun: async (input, fn) => {
@@ -480,11 +398,9 @@ test("top-level stopped-budget path skips every downstream adapter, finishes tas
   };
 
   const summary = await executePruneDaily(config, adapters);
-  assert.deepEqual(calls, { index: 0, chart: 0, prune: 0, late: 0 });
+  assert.deepEqual(calls, { prune: 0, late: 0 });
   assert.equal(summary.deletion_attempted, false);
   assert.equal(summary.normal_prune.reason, "phase_b_stopped_budget");
-  assert.equal(summary.phase_b_history_index.reason, "phase_b_stopped_budget");
-  assert.equal(summary.chart_load_metrics.reason, "phase_b_stopped_budget");
   assert.equal(summary.late_arrival.reason, "phase_b_stopped_budget");
   assert.equal(healthSummary.phase_b_history.status, "stopped_budget");
   assert.equal(healthSummary.phase_b_history.stopped_for_budget, true);
@@ -503,7 +419,7 @@ test("top-level stopped-budget path skips every downstream adapter, finishes tas
   assert.equal(reportPayload.summary.phase_b_history.status, "stopped_budget");
 });
 
-test("completed Phase B still runs index, chart, normal prune, and late-arrival stages", async () => {
+test("completed Phase B proceeds directly to normal prune and late-arrival stages", async () => {
   const calls = [];
   const config = {
     dryRun: false,
@@ -514,14 +430,6 @@ test("completed Phase B still runs index, chart, normal prune, and late-arrival 
   const summary = await runPruneForTest(config, {
     runPhaseARecent: async () => ({ enabled: true }),
     runPhaseBBackup: async () => ({ enabled: true, status: "completed", stopped_for_budget: false }),
-    rebuildR2HistoryIndexes: async () => {
-      calls.push("index");
-      return { bucket: "test", history_version: "v2", index_prefix: "history/_index_v2", results: [] };
-    },
-    runChartLoadMetricsMaintenance: async () => {
-      calls.push("chart");
-      return { enabled: true };
-    },
     runPruneSingleWindow: async () => {
       calls.push("prune");
       return { mode: "delete", deletion_attempted: true };
@@ -531,7 +439,7 @@ test("completed Phase B still runs index, chart, normal prune, and late-arrival 
       return { enabled: true };
     },
   });
-  assert.deepEqual(calls, ["index", "chart", "prune", "late"]);
+  assert.deepEqual(calls, ["prune", "late"]);
   assert.equal(summary.deletion_attempted, true);
   assert.equal(summary.phase_b_history.status, "completed");
 });

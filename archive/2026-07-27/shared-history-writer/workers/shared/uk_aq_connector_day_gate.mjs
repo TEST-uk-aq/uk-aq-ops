@@ -2,7 +2,7 @@ import { Client } from "pg";
 
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const MANIFEST_HASH_PATTERN = /^[0-9a-f]{64}$/;
-const COMPLETION_SOURCES = new Set(["prune_daily_phase_b"]);
+const COMPLETION_SOURCES = new Set(["prune_daily_phase_b", "history_integrity"]);
 
 export function normalizeConnectorDayPair(dayUtc, connectorId) {
   const day = String(dayUtc || "").trim();

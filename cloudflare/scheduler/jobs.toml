@@ -24,6 +24,16 @@ github_ref = "main"
 dry_run = false
 notes = "Prune Daily via GitHub Actions"
 
+[jobs.uk_aq_chart_metrics]
+enabled = true
+cron_expr = "0 2 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_chart_metrics.yml"
+github_ref = "main"
+dry_run = false
+notes = "Standalone chart metrics cleanup and daily refresh"
+
 [jobs.uk_aq_r2_core_snapshot]
 enabled = true
 cron_expr = "15 4 * * *"

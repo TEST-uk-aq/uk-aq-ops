@@ -55,6 +55,13 @@ import {
   setConnectorDayGateIncomplete,
 } from "../shared/uk_aq_connector_day_gate.mjs";
 import {
+  mergeConnectorManifestReferences,
+  runCanonicalDayFinalizer,
+  runCanonicalConnectorDayWriter,
+  runCanonicalGlobalIndexFinalizer,
+  withConnectorDayHistoryLock,
+} from "../shared/uk_aq_r2_history_writer.mjs";
+import {
   AQI_SUPPORTED_POLLUTANTS,
   buildAqilevelHistoryRowsForDayFromHourlyRows,
   buildAqilevelHistoryRowsForDayFromSourceObservations,
@@ -78,7 +85,6 @@ const PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS = 600_000;
 const PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS = 15_000;
 const PHASE_B_PG_DEADLINE_GUARD_MS = 1_000;
 const PHASE_B_STAGE_MIN_MS = Object.freeze({
-  active_scope_adoption: 180_000,
   candidate_start: 300_000,
   observation_segment: 60_000,
   aqi_calculation: 180_000,
@@ -88,7 +94,6 @@ const PHASE_B_STAGE_MIN_MS = Object.freeze({
   day_finalization: 120_000,
   dropbox_comparison: 180_000,
 });
-const DEFAULT_AQILEVELS_SOURCE_MAX_PAGES = 50_000;
 const DEFAULT_STAGING_RETENTION_DAYS = 7;
 const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
 const DEFAULT_COMMITTED_PREFIX = "history/v1/observations";
@@ -97,8 +102,6 @@ const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
 const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
 const DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS = 14;
-const DEFAULT_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED = false;
-const DEFAULT_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED = true;
 const DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS = 250_000;
 const DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024;
 const DEFAULT_PHASE_B_PM_CONTEXT_RPC = "uk_aq_rpc_observs_aqi_pm_hourly_context";
@@ -117,8 +120,6 @@ const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels_hourly";
 const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
 const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v1";
 const HISTORY_AQILEVELS_GRAIN = "hourly";
-const AQILEVELS_CONNECTOR_COUNTS_RPC = "uk_aq_rpc_aqilevels_history_day_connector_counts";
-const AQILEVELS_ROWS_RPC = "uk_aq_rpc_aqilevels_history_day_rows";
 const DEFAULT_RPC_SCHEMA = "uk_aq_public";
 
 export const HISTORY_OBSERVATIONS_COLUMNS_V1 = Object.freeze([
@@ -1837,67 +1838,6 @@ limit $2
 
   const result = await client.query(sql, [activeCandidateScopeJson(activeCandidates), maxCandidatesPerRun]);
   return result.rows.map(toConnectorDayRow);
-}
-
-async function fetchActiveCompleteCandidatesMissingConnectorGate(client, activeCandidates, maxCandidatesPerRun) {
-  const result = await client.query(
-    `
-with active_scope as (
-  select
-    s.day_utc::date as day_utc,
-    s.connector_id::integer as connector_id
-  from jsonb_to_recordset($1::jsonb) as s(day_utc text, connector_id integer)
-)
-select
-  c.day_utc,
-  c.connector_id,
-  c.expected_row_count,
-  c.min_observed_at,
-  c.max_observed_at,
-  c.status,
-  c.run_id,
-  c.manifest_key,
-  c.history_row_count,
-  c.history_file_count,
-  c.history_total_bytes,
-  c.resume_last_timeseries_id,
-  c.resume_last_observed_at,
-  c.resume_part_index,
-  c.resume_exported_row_count,
-  c.resume_parts_json
-from uk_aq_ops.history_candidates c
-join active_scope s
-  on s.day_utc = c.day_utc
- and s.connector_id = c.connector_id
-left join uk_aq_ops.prune_connector_day_gates g
-  on g.day_utc = c.day_utc
- and g.connector_id = c.connector_id
-where c.status = 'complete'
-  and (
-    g.day_utc is null
-    or g.history_done is not true
-    or g.history_manifest_key is distinct from (
-      'history/v2/observations/day_utc=' || c.day_utc::text
-      || '/connector_id=' || c.connector_id::text || '/manifest.json'
-    )
-    or g.history_manifest_hash is null
-    or g.history_manifest_hash !~ '^[0-9a-f]{64}$'
-    or g.history_completed_at is null
-  )
-order by c.day_utc, c.connector_id
-limit $2
-`,
-    [activeCandidateScopeJson(activeCandidates), maxCandidatesPerRun],
-  );
-  return result.rows.map(toConnectorDayRow);
-}
-
-export async function fetchActiveCompleteCandidatesMissingConnectorGateForTest(args) {
-  return await fetchActiveCompleteCandidatesMissingConnectorGate(
-    args.client,
-    args.activeCandidates,
-    args.maxCandidatesPerRun,
-  );
 }
 
 async function markCandidateInProgress(client, dayUtc, connectorId, runId) {
@@ -4018,17 +3958,14 @@ async function writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connector
   };
 }
 
-async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
+async function exportCandidateObservationsToR2({ candidate, runtime }) {
   if (runtime.history_write_version !== "v2") {
     throw new Error("Phase B observation-derived AQI writer requires R2 history write version v2.");
   }
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
-  let temp = null;
   return await withPgClient(runtime.supabase_db_url, async (streamClient) => {
-    try {
       const staged = await stageFrozenSourceAndWriteObservations({ streamClient, candidate, runtime });
-      temp = staged.temp;
       const backedUpAtUtc = nowIso();
       const { connectorManifest, connectorManifestKey } = await writeObservationV2ConnectorManifest({
         runtime,
@@ -4037,40 +3974,6 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
         committedParts: staged.committedParts,
         backedUpAtUtc,
         canonicalRowsByPollutant: staged.canonicalRowsByPollutant,
-      });
-      const aqiBuild = await runBudgetedPhaseBStage({
-        runtime,
-        operation: "aqi_calculation",
-        fields: { day_utc: dayUtc, connector_id: connectorId },
-        minMs: PHASE_B_STAGE_MIN_MS.aqi_calculation,
-        adapter: async () => await buildAqiRowsFromFrozenSource({
-          runtime,
-          dayUtc,
-          connectorId,
-          frozenSourcePath: temp.ndjsonPath,
-        }),
-      });
-      const aqiResult = await runBudgetedPhaseBStage({
-        runtime,
-        operation: "aqi_object_write",
-        fields: { day_utc: dayUtc, connector_id: connectorId },
-        minMs: PHASE_B_STAGE_MIN_MS.aqi_object_write,
-        adapter: async () => {
-          if (aqiBuild.status !== "no_supported_aqi_source") {
-            return await exportAqilevelConnectorRowsToR2({
-              runtime,
-              dayUtc,
-              connector: {
-                connector_id: connectorId,
-                expected_row_count: BigInt(aqiBuild.rows.length),
-                min_timeseries_id: null,
-                max_timeseries_id: null,
-              },
-              rows: aqiBuild.rows,
-            });
-          }
-          return await writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc });
-        },
       });
       return {
         day_utc: dayUtc,
@@ -4082,36 +3985,65 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
         total_bytes: staged.totalBytes,
         parquet_object_keys: connectorManifest.parquet_object_keys,
         files: staged.committedParts,
-        aqi: {
-          status: aqiBuild.status,
-          frozen_source_row_count: staged.counts.frozen_source_row_count,
-          frozen_source_bytes: staged.counts.frozen_source_bytes,
-          supported_aqi_source_row_count: staged.counts.supported_aqi_source_row_count,
-          target_day_supported_aqi_source_row_count: aqiBuild.target_day_supported_source_row_count ?? staged.counts.target_day_supported_aqi_source_row_count,
-          accepted_aqi_source_row_count: aqiBuild.accepted_source_row_count ?? 0,
-          rejected_aqi_source_row_count: aqiBuild.rejected_source_row_count ?? 0,
-          supported_pollutant_counts: staged.counts.supported_pollutant_counts,
-          ...(aqiBuild.pm_context || {}),
-          context_supported_aqi_hour_count: aqiBuild.context_supported_aqi_hour_count ?? 0,
-          daqi_status_counts: aqiBuild.daqi_status_counts ?? {},
-          eaqi_status_counts: aqiBuild.eaqi_status_counts ?? {},
-          output_row_count: aqiBuild.rows.length,
-          manifest_key: aqiResult.manifest_key || aqiResult.connector_manifest?.manifest_key || null,
-          debug_manifest_key: aqiResult.debug_connector_manifest?.manifest_key || null,
-          file_count: aqiResult.file_count || 0,
-          debug_file_count: aqiResult.debug_file_count || 0,
-        },
+        frozen_source_temp: staged.temp,
+        frozen_source_counts: staged.counts,
       };
-    } finally {
-      cleanupPhaseBTargetDaySourceTemp(temp);
-    }
   }, { statementTimeoutMs: Math.max(1, (remainingBudgetMs(runtime) ?? 600_000) - 1_000) });
 }
 
+async function exportCandidateAqiFromFrozenSource({ candidate, runtime, observationResult }) {
+  const dayUtc = candidate.day_utc;
+  const connectorId = candidate.connector_id;
+  const counts = observationResult.frozen_source_counts;
+  const aqiBuild = await runBudgetedPhaseBStage({
+    runtime,
+    operation: "aqi_calculation",
+    fields: { day_utc: dayUtc, connector_id: connectorId },
+    minMs: PHASE_B_STAGE_MIN_MS.aqi_calculation,
+    adapter: async () => await buildAqiRowsFromFrozenSource({
+      runtime,
+      dayUtc,
+      connectorId,
+      frozenSourcePath: observationResult.frozen_source_temp.ndjsonPath,
+    }),
+  });
+  const aqiResult = await runBudgetedPhaseBStage({
+    runtime,
+    operation: "aqi_object_write",
+    fields: { day_utc: dayUtc, connector_id: connectorId },
+    minMs: PHASE_B_STAGE_MIN_MS.aqi_object_write,
+    adapter: async () => aqiBuild.status !== "no_supported_aqi_source"
+      ? await exportAqilevelConnectorRowsToR2({
+        runtime,
+        dayUtc,
+        connector: { connector_id: connectorId, expected_row_count: BigInt(aqiBuild.rows.length), min_timeseries_id: null, max_timeseries_id: null },
+        rows: aqiBuild.rows,
+      })
+      : await writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc: nowIso() }),
+  });
+  return {
+    status: aqiBuild.status,
+    frozen_source_row_count: counts.frozen_source_row_count,
+    frozen_source_bytes: counts.frozen_source_bytes,
+    supported_aqi_source_row_count: counts.supported_aqi_source_row_count,
+    target_day_supported_aqi_source_row_count: aqiBuild.target_day_supported_source_row_count ?? counts.target_day_supported_aqi_source_row_count,
+    accepted_aqi_source_row_count: aqiBuild.accepted_source_row_count ?? 0,
+    rejected_aqi_source_row_count: aqiBuild.rejected_source_row_count ?? 0,
+    supported_pollutant_counts: counts.supported_pollutant_counts,
+    ...(aqiBuild.pm_context || {}),
+    context_supported_aqi_hour_count: aqiBuild.context_supported_aqi_hour_count ?? 0,
+    daqi_status_counts: aqiBuild.daqi_status_counts ?? {},
+    eaqi_status_counts: aqiBuild.eaqi_status_counts ?? {},
+    output_row_count: aqiBuild.rows?.length || 0,
+    manifest_key: aqiResult.manifest_key || aqiResult.connector_manifest?.manifest_key || null,
+    debug_manifest_key: aqiResult.debug_connector_manifest?.manifest_key || null,
+    file_count: aqiResult.file_count || 0,
+    debug_file_count: aqiResult.debug_file_count || 0,
+  };
+}
+
 async function exportCandidateToR2({ candidate, runtime }) {
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    return await exportCandidateToR2WithFrozenAqi({ candidate, runtime });
-  }
+  if (runtime.phase_b_calculate_aqi_from_observations_enabled) return await exportCandidateObservationsToR2({ candidate, runtime });
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
   const dayStart = `${dayUtc}T00:00:00.000Z`;
@@ -5189,125 +5121,6 @@ async function exportPruneComparisonToDropbox({
   };
 }
 
-async function maybeAdoptExistingConnectorManifest({
-  candidate,
-  runtime,
-  logStructured,
-}) {
-  if (!runtime.adopt_existing_manifest_enabled) {
-    return { adopted: false, reason: "adoption_guard_disabled" };
-  }
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    logStructured("INFO", "phase_b_history_existing_manifest_adoption_skipped", {
-      run_id: runtime.run_id,
-      day_utc: candidate.day_utc,
-      connector_id: candidate.connector_id,
-      reason: "observation_manifest_cannot_satisfy_aqi_gate",
-    });
-    return { adopted: false, reason: "observation_manifest_cannot_satisfy_aqi_gate" };
-  }
-
-  const dayUtc = candidate.day_utc;
-  const connectorId = candidate.connector_id;
-  const connectorManifestKey = buildConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId);
-  const manifestHead = await r2HeadObject({ r2: runtime.r2, key: connectorManifestKey });
-  if (!manifestHead.exists) {
-    return { adopted: false, reason: "manifest_missing" };
-  }
-
-  logStructured("INFO", "phase_b_history_existing_manifest_found", {
-    run_id: runtime.run_id,
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    manifest_key: connectorManifestKey,
-  });
-
-  try {
-    const object = await r2GetObject({ r2: runtime.r2, key: connectorManifestKey });
-    let parsedManifest;
-    try {
-      parsedManifest = JSON.parse(object.body.toString("utf8"));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Manifest JSON parse failed for ${connectorManifestKey}: ${message}`);
-    }
-    const validated = validateAdoptedManifest({
-      manifest: parsedManifest,
-      dayUtc,
-      connectorId,
-      manifestKey: connectorManifestKey,
-    });
-
-    const probeKey = validated.parquet_keys[0];
-    const probeHead = await r2HeadObject({ r2: runtime.r2, key: probeKey });
-    if (!probeHead.exists) {
-      throw new Error(`Adopted manifest references missing parquet object: ${probeKey}`);
-    }
-
-    let comparison = null;
-    if (runtime.prune_check_dropbox?.enabled) {
-      logPhaseB(runtime, "INFO", "phase_b_history_dropbox_check_start", {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        manifest_key: connectorManifestKey,
-      });
-      try {
-        comparison = await exportPruneComparisonToDropbox({
-          candidate,
-          runtime,
-          adoptedManifestKey: connectorManifestKey,
-          adoptedManifest: validated.manifest,
-          logStructured,
-        });
-      } catch (error) {
-        rethrowIfBudgetDeadlineReached(runtime, error, "dropbox_comparison", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-        });
-        const message = error instanceof Error ? error.message : String(error);
-        logPhaseB(runtime, "ERROR", "phase_b_history_dropbox_check_failed", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          manifest_key: connectorManifestKey,
-          error: message,
-          ...errorLogFields(error),
-          required: runtime.prune_check_dropbox?.required === true,
-        });
-        if (runtime.prune_check_dropbox?.required) {
-          throw error;
-        }
-      }
-      if (comparison) {
-        logPhaseB(runtime, "INFO", "phase_b_history_dropbox_check_complete", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          manifest_key: connectorManifestKey,
-          comparison_output_root: comparison.comparison_output_root,
-        });
-      }
-    }
-
-    return {
-      adopted: true,
-      manifest_key: connectorManifestKey,
-      history_row_count: validated.manifest_row_count,
-      history_file_count: validated.manifest_file_count,
-      history_total_bytes: validated.manifest_total_bytes,
-      comparison,
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logStructured("ERROR", "phase_b_history_existing_manifest_adoption_failed", {
-      run_id: runtime.run_id,
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      manifest_key: connectorManifestKey,
-      error: message,
-    });
-    throw error;
-  }
-}
-
 async function ensureConnectorPruneComparison({
   candidate,
   runtime,
@@ -5342,39 +5155,6 @@ async function ensureConnectorPruneComparison({
     if (runtime.prune_check_dropbox?.required) throw error;
     return null;
   }
-}
-
-function toAqilevelConnectorCountRow(row) {
-  const expectedRowCountValue = row.expected_row_count === undefined
-    ? row.row_count
-    : row.expected_row_count;
-  return {
-    connector_id: Number(row.connector_id),
-    expected_row_count: parseBigInt(expectedRowCountValue, "aqi_expected_row_count"),
-    min_timeseries_id: Number.isFinite(Number(row.min_timeseries_id))
-      ? Math.max(1, Math.trunc(Number(row.min_timeseries_id)))
-      : null,
-    max_timeseries_id: Number.isFinite(Number(row.max_timeseries_id))
-      ? Math.max(1, Math.trunc(Number(row.max_timeseries_id)))
-      : null,
-    min_timestamp_hour_utc: row.min_timestamp_hour_utc
-      ? new Date(row.min_timestamp_hour_utc).toISOString()
-      : null,
-    max_timestamp_hour_utc: row.max_timestamp_hour_utc
-      ? new Date(row.max_timestamp_hour_utc).toISOString()
-      : null,
-  };
-}
-
-function hasAqilevelSourceConfig(runtime) {
-  const source = runtime?.aqilevels_source || {};
-  return Boolean(
-    String(source.base_url || "").trim()
-    && String(source.privileged_key || "").trim()
-    && String(source.rpc_schema || "").trim()
-    && String(source.connector_counts_rpc || "").trim()
-    && String(source.rows_rpc || "").trim(),
-  );
 }
 
 function normalizeAqilevelHistoryRow(row, connectorIdFallback = null) {
@@ -5439,96 +5219,10 @@ export function normalizeAqilevelHistoryRowForTest(row, connectorIdFallback = nu
   return normalizeAqilevelHistoryRow(row, connectorIdFallback);
 }
 
-async function fetchAqilevelConnectorCounts(runtime, dayUtc) {
-  const payload = await postgrestRpc({
-    baseUrl: runtime.aqilevels_source.base_url,
-    privilegedKey: runtime.aqilevels_source.privileged_key,
-    rpcSchema: runtime.aqilevels_source.rpc_schema,
-    rpcName: runtime.aqilevels_source.connector_counts_rpc,
-    payload: {
-      p_day_utc: dayUtc,
-      p_connector_ids: null,
-    },
-  });
-
-  if (!Array.isArray(payload)) {
-    return [];
+async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, rows: sourceRows }) {
+  if (runtime.history_write_version !== "v2" || !Array.isArray(sourceRows)) {
+    throw new Error("Phase B AQI connector output requires observation-derived rows and canonical v2 history");
   }
-
-  return payload
-    .map(toAqilevelConnectorCountRow)
-    .filter((row) => Number.isInteger(row.connector_id) && row.connector_id > 0 && row.expected_row_count > 0n);
-}
-
-async function fetchAqilevelRowsPage(runtime, { dayUtc, connectorId, afterTimeseriesId, afterTimestampHourUtc, limit }) {
-  const payload = await postgrestRpc({
-    baseUrl: runtime.aqilevels_source.base_url,
-    privilegedKey: runtime.aqilevels_source.privileged_key,
-    rpcSchema: runtime.aqilevels_source.rpc_schema,
-    rpcName: runtime.aqilevels_source.rows_rpc,
-    payload: {
-      p_day_utc: dayUtc,
-      p_connector_id: connectorId,
-      p_after_timeseries_id: afterTimeseriesId,
-      p_after_timestamp_hour_utc: afterTimestampHourUtc,
-      p_limit: limit,
-    },
-  });
-
-  if (!Array.isArray(payload)) {
-    return [];
-  }
-
-  const normalized = [];
-  for (const row of payload) {
-    const parsed = normalizeAqilevelHistoryRow(row, connectorId);
-    if (parsed) {
-      normalized.push(parsed);
-    }
-  }
-  return normalized;
-}
-
-async function fetchAqilevelCandidateDays(client, latestEligibleDayUtc, scanLimit) {
-  const sql = `
-select g.day_utc::text as day_utc
-from uk_aq_ops.prune_day_gates g
-where g.history_done is true
-  and g.day_utc <= $1::date
-order by g.day_utc desc
-limit $2
-`;
-  const result = await client.query(sql, [latestEligibleDayUtc, scanLimit]);
-  return result.rows.map((row) => normalizeDayUtc(row.day_utc)).filter(Boolean);
-}
-
-async function discoverPendingAqilevelDays({ client, runtime, latestEligibleDayUtc }) {
-  const scanLimit = Math.max(runtime.max_candidates_per_run * 4, runtime.max_candidates_per_run);
-  const candidates = await fetchAqilevelCandidateDays(client, latestEligibleDayUtc, scanLimit);
-  const pending = [];
-
-  for (const dayUtc of candidates) {
-    const manifestKeys = [buildDayManifestKey(runtime.aqilevels_prefix, dayUtc)];
-    if (runtime.history_write_version === "v2") {
-      manifestKeys.push(buildDayManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, dayUtc));
-    }
-
-    for (const manifestKey of manifestKeys) {
-      const head = await r2HeadObject({ r2: runtime.r2, key: manifestKey });
-      if (!head.exists) {
-        pending.push(dayUtc);
-        break;
-      }
-    }
-    if (pending.length >= runtime.max_candidates_per_run) {
-      break;
-    }
-  }
-
-  return uniqueSorted(pending);
-}
-
-async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, rows: sourceRows = null }) {
   const connectorId = Number(connector.connector_id);
   const expectedRowCount = connector.expected_row_count;
   const fileEntries = [];
@@ -5540,16 +5234,11 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
   let debugTotalBytes = 0n;
   let minTimestampHourUtc = null;
   let maxTimestampHourUtc = null;
-  let cursorAfterTimeseriesId = null;
-  let cursorAfterTimestampHourUtc = null;
-  let pageCount = 0;
-  const normalizedSourceRows = Array.isArray(sourceRows)
-    ? [...sourceRows].sort((left, right) => {
+  const normalizedSourceRows = [...sourceRows].sort((left, right) => {
       const leftKey = `${left.timeseries_id || 0}|${left.timestamp_hour_utc || ""}`;
       const rightKey = `${right.timeseries_id || 0}|${right.timestamp_hour_utc || ""}`;
       return leftKey.localeCompare(rightKey);
-    })
-    : null;
+    });
 
   const flushPart = async () => {
     if (!pendingRows.length) {
@@ -5663,8 +5352,7 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
     totalBytes += BigInt(bytes);
   };
 
-  if (normalizedSourceRows) {
-    for (const row of normalizedSourceRows) {
+  for (const row of normalizedSourceRows) {
       if (!minTimestampHourUtc || row.timestamp_hour_utc < minTimestampHourUtc) {
         minTimestampHourUtc = row.timestamp_hour_utc;
       }
@@ -5675,58 +5363,6 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
       if (pendingRows.length >= runtime.aqilevels_part_max_rows) {
         await flushPart();
       }
-    }
-  } else {
-    for (;;) {
-      pageCount += 1;
-      if (pageCount > runtime.aqilevels_source_max_pages) {
-        throw new Error(
-          `AQI source RPC exceeded max pages (${runtime.aqilevels_source_max_pages}) for day=${dayUtc} connector=${connectorId}`,
-        );
-      }
-
-      const pageRows = await fetchAqilevelRowsPage(runtime, {
-        dayUtc,
-        connectorId,
-        afterTimeseriesId: cursorAfterTimeseriesId,
-        afterTimestampHourUtc: cursorAfterTimestampHourUtc,
-        limit: runtime.cursor_fetch_rows,
-      });
-      if (!pageRows.length) {
-        break;
-      }
-
-      for (const row of pageRows) {
-        if (!minTimestampHourUtc || row.timestamp_hour_utc < minTimestampHourUtc) {
-          minTimestampHourUtc = row.timestamp_hour_utc;
-        }
-        if (!maxTimestampHourUtc || row.timestamp_hour_utc > maxTimestampHourUtc) {
-          maxTimestampHourUtc = row.timestamp_hour_utc;
-        }
-
-        pendingRows.push({
-          ...row,
-          connector_id: connectorId,
-        });
-
-        if (pendingRows.length >= runtime.aqilevels_part_max_rows) {
-          await flushPart();
-        }
-      }
-
-      const last = pageRows[pageRows.length - 1];
-      const nextAfterTimeseriesId = Number(last.timeseries_id);
-      const nextAfterTimestampHourUtc = String(last.timestamp_hour_utc);
-      const cursorUnchanged = nextAfterTimeseriesId === cursorAfterTimeseriesId
-        && nextAfterTimestampHourUtc === cursorAfterTimestampHourUtc;
-      if (cursorUnchanged) {
-        throw new Error(
-          `AQI source RPC cursor did not advance for day=${dayUtc} connector=${connectorId}`,
-        );
-      }
-      cursorAfterTimeseriesId = nextAfterTimeseriesId;
-      cursorAfterTimestampHourUtc = nextAfterTimestampHourUtc;
-    }
   }
 
   if (pendingRows.length > 0) {
@@ -5849,134 +5485,6 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
   };
 }
 
-async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
-  return await exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector });
-}
-
-export async function discoverPendingAqilevelDaysForTest(args) {
-  return await discoverPendingAqilevelDays(args);
-}
-
-export async function exportAqilevelDayToR2ForTest(args) {
-  return await exportAqilevelDayToR2(args);
-}
-
-async function exportAqilevelDayToR2({ runtime, dayUtc }) {
-  const connectorCounts = await fetchAqilevelConnectorCounts(runtime, dayUtc);
-  if (connectorCounts.length === 0) {
-    return {
-      status: "skipped_no_source_rows",
-      day_utc: dayUtc,
-      connector_count: 0,
-      source_row_count: 0n,
-      file_count: 0,
-      total_bytes: 0n,
-      day_manifest_key: null,
-    };
-  }
-
-  const connectorManifests = [];
-  const debugConnectorManifests = [];
-  let totalRows = 0n;
-  let totalBytes = 0n;
-  let totalFiles = 0;
-  let debugTotalBytes = 0n;
-  let debugTotalFiles = 0;
-
-  for (const connector of connectorCounts) {
-    const result = await exportAqilevelConnectorDayToR2({
-      runtime,
-      dayUtc,
-      connector,
-    });
-    totalRows += result.source_row_count;
-    totalBytes += result.total_bytes;
-    totalFiles += result.file_count;
-    debugTotalBytes += result.debug_total_bytes || 0n;
-    debugTotalFiles += result.debug_file_count || 0;
-    connectorManifests.push(result.connector_manifest);
-    if (result.debug_connector_manifest) {
-      debugConnectorManifests.push(result.debug_connector_manifest);
-    }
-  }
-
-  assertBudget(runtime, "aqi_day_manifest", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.aqi_index);
-  const backedUpAtUtc = nowIso();
-  const dayManifestKey = buildDayManifestKey(runtime.aqilevels_prefix, dayUtc);
-  const dayManifest = runtime.history_write_version === "v2"
-    ? createHistoryV2DayManifest({
-      domain: "aqilevels",
-      grain: HISTORY_AQILEVELS_GRAIN,
-      profile: "data",
-      dayUtc,
-      runId: runtime.run_id,
-      manifestKey: dayManifestKey,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    })
-    : createAqilevelDayManifest({
-      dayUtc,
-      runId: runtime.run_id,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
-  await r2PutObject({
-    r2: runtime.r2,
-    key: dayManifestKey,
-    body: Buffer.from(JSON.stringify(dayManifest, null, 2), "utf8"),
-    content_type: "application/json",
-  });
-
-  let debugDayManifestKey = null;
-  if (runtime.history_write_version === "v2") {
-    debugDayManifestKey = buildDayManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, dayUtc);
-    const debugDayManifest = createHistoryV2DayManifest({
-      domain: "aqilevels",
-      grain: HISTORY_AQILEVELS_GRAIN,
-      profile: "debug",
-      dayUtc,
-      runId: runtime.run_id,
-      manifestKey: debugDayManifestKey,
-      connectorManifests: debugConnectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
-    await r2PutObject({
-      r2: runtime.r2,
-      key: debugDayManifestKey,
-      body: Buffer.from(JSON.stringify(debugDayManifest, null, 2), "utf8"),
-      content_type: "application/json",
-    });
-  }
-
-  const dayHead = await r2HeadObject({ r2: runtime.r2, key: dayManifestKey });
-  if (!dayHead.exists) {
-    throw new Error(`AQI day manifest missing after upload: ${dayManifestKey}`);
-  }
-  if (runtime.history_write_version === "v2") {
-    const debugDayHead = await r2HeadObject({ r2: runtime.r2, key: debugDayManifestKey });
-    if (!debugDayHead.exists) {
-      throw new Error(`AQI debug day manifest missing after upload: ${debugDayManifestKey}`);
-    }
-  }
-
-  return {
-    status: "complete",
-    day_utc: dayUtc,
-    connector_count: connectorCounts.length,
-    source_row_count: totalRows,
-    file_count: totalFiles,
-    total_bytes: totalBytes,
-    day_manifest_key: dayManifestKey,
-    debug_file_count: debugTotalFiles,
-    debug_total_bytes: debugTotalBytes,
-    debug_day_manifest_key: debugDayManifestKey,
-  };
-}
-
-
 export function summarizeFrozenObservationSourceForAqi({ rows = [], dayUtc, maxRows = DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS } = {}) {
   const dayStart = Date.parse(`${dayUtc}T00:00:00.000Z`);
   const prevStart = dayStart - DAY_MS;
@@ -6039,164 +5547,36 @@ export function summarizeFrozenObservationSourceForAqi({ rows = [], dayUtc, maxR
   };
 }
 
-async function runAqilevelsBackup({ runtime, latestEligibleDayUtc, dryRun, logStructured }) {
-  const summary = {
-    enabled: true,
-    status: "completed",
-    stopped_for_budget: false,
-    dry_run: dryRun,
-    latest_eligible_day_utc: latestEligibleDayUtc,
-    pending_days: 0,
-    completed_days: 0,
-    skipped_days_no_source_rows: 0,
-    failed_days: 0,
-    total_written_rows: "0",
-    total_written_bytes: "0",
-    pending_preview: [],
-    completed_preview: [],
-    failures: [],
-    aqilevels_prefix: runtime.aqilevels_prefix,
-    aqilevels_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
-    aqilevels_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
-    aqilevels_grain: HISTORY_AQILEVELS_GRAIN,
-    aqilevels_writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
-  };
-
-  logStructured("INFO", "phase_b_aqilevels_run_start", {
-    run_id: runtime.run_id,
-    dry_run: dryRun,
-    latest_eligible_day_utc: latestEligibleDayUtc,
-    max_candidates_per_run: runtime.max_candidates_per_run,
-    aqilevels_prefix: runtime.aqilevels_prefix,
-    aqilevels_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
-    aqilevels_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
-    aqilevels_grain: HISTORY_AQILEVELS_GRAIN,
-    aqilevels_writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
-    aqilevels_rpc_schema: runtime.aqilevels_source?.rpc_schema || null,
-    aqilevels_rows_rpc: runtime.aqilevels_source?.rows_rpc || null,
-    aqilevels_connector_counts_rpc: runtime.aqilevels_source?.connector_counts_rpc || null,
-  });
-
-  if (!hasAqilevelSourceConfig(runtime)) {
-    throw new Error("Phase B AQI export requires OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY with AQI history RPCs.");
-  }
-
-  const pendingDays = await withPgClient(runtime.supabase_db_url, async (client) => {
-    return await discoverPendingAqilevelDays({
-      client,
-      runtime,
-      latestEligibleDayUtc,
-    });
-  }, { statementTimeoutMs: Math.max(1, (remainingBudgetMs(runtime) ?? 600_000) - 1_000) });
-
-  summary.pending_days = pendingDays.length;
-  summary.pending_preview = pendingDays.slice(0, 25);
-  if (dryRun) {
-    summary.completed_preview = summary.completed_preview.slice(0, 25);
-    summary.failures = summary.failures.slice(0, 25);
-    logStructured("INFO", "phase_b_aqilevels_run_summary", {
-      run_id: runtime.run_id,
-      ...summary,
-    });
-    return summary;
-  }
-
-  let totalRows = 0n;
-  let totalBytes = 0n;
-  for (const dayUtc of pendingDays) {
-    const startedAtMs = Date.now();
-    try {
-      assertBudget(runtime, "legacy_aqilevels_day", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
-      const dayResult = await exportAqilevelDayToR2({
-        runtime,
-        dayUtc,
-      });
-
-      if (dayResult.status === "skipped_no_source_rows") {
-        summary.skipped_days_no_source_rows += 1;
-        logStructured("INFO", "phase_b_aqilevels_day_skipped_no_source_rows", {
-          run_id: runtime.run_id,
-          day_utc: dayUtc,
-        });
-        continue;
-      }
-
-      summary.completed_days += 1;
-      totalRows += dayResult.source_row_count;
-      totalBytes += dayResult.total_bytes;
-      summary.completed_preview.push({
-        day_utc: dayUtc,
-        connector_count: dayResult.connector_count,
-        source_row_count: dayResult.source_row_count.toString(),
-        file_count: dayResult.file_count,
-        total_bytes: dayResult.total_bytes.toString(),
-        day_manifest_key: dayResult.day_manifest_key,
-      });
-      logStructured("INFO", "phase_b_aqilevels_day_complete", {
-        run_id: runtime.run_id,
-        day_utc: dayUtc,
-        connector_count: dayResult.connector_count,
-        source_row_count: dayResult.source_row_count.toString(),
-        file_count: dayResult.file_count,
-        total_bytes: dayResult.total_bytes.toString(),
-        day_manifest_key: dayResult.day_manifest_key,
-        duration_ms: Math.max(0, Date.now() - startedAtMs),
-      });
-    } catch (error) {
-      if (error instanceof PhaseBHistoryBudgetExhaustedError) {
-        summary.status = "stopped_budget";
-        summary.stopped_for_budget = true;
-        summary.budget_stop = {
-          operation: error.operation || "legacy_aqilevels_day",
-          day_utc: dayUtc,
-          ...budgetSnapshot(runtime),
-        };
-        break;
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      summary.failed_days += 1;
-      summary.failures.push({
-        day_utc: dayUtc,
-        error: message,
-        next_action: "retry_safe",
-      });
-      logStructured("ERROR", "phase_b_aqilevels_day_failed", {
-        run_id: runtime.run_id,
-        day_utc: dayUtc,
-        error: message,
-        duration_ms: Math.max(0, Date.now() - startedAtMs),
-        next_action: "retry_safe",
-      });
-    }
-  }
-
-  summary.total_written_rows = totalRows.toString();
-  summary.total_written_bytes = totalBytes.toString();
-
-  summary.completed_preview = summary.completed_preview.slice(0, 25);
-  summary.failures = summary.failures.slice(0, 25);
-  logStructured("INFO", "phase_b_aqilevels_run_summary", {
-    run_id: runtime.run_id,
-    ...summary,
-  });
-  return summary;
-}
-
-
-async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc }) {
+async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc, changedConnectorIds = [] }) {
   if (!runtime.phase_b_calculate_aqi_from_observations_enabled || runtime.history_write_version !== "v2") {
     return { required: false };
   }
   const readConnectorManifests = async (prefix) => {
-    const entries = await r2ListAllObjects({
-      r2: runtime.r2,
-      prefix: `${prefix}/day_utc=${dayUtc}/`,
-      max_keys: 10_000,
-    });
-    const manifestKeys = entries
-      .map((entry) => String(entry.key || ""))
-      .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key))
-      .sort();
+    let manifestKeys = [];
+    try {
+      const dayManifestKey = buildDayManifestKey(prefix, dayUtc);
+      const current = JSON.parse((await r2GetObject({ r2: runtime.r2, key: dayManifestKey })).body.toString("utf8"));
+      const references = Array.isArray(current.connector_manifests)
+        ? current.connector_manifests
+        : Array.isArray(current.child_manifests) ? current.child_manifests : [];
+      manifestKeys = references.map((entry) => String(entry.manifest_key || "").trim());
+      if (!manifestKeys.length || manifestKeys.some((key) => !/\/connector_id=\d+\/manifest\.json$/.test(key))) {
+        throw new Error("current AQI day manifest has invalid connector references");
+      }
+    } catch (_error) {
+      const entries = await r2ListAllObjects({
+        r2: runtime.r2,
+        prefix: `${prefix}/day_utc=${dayUtc}/`,
+        max_keys: 10_000,
+      });
+      manifestKeys = entries
+        .map((entry) => String(entry.key || ""))
+        .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key));
+    }
+    manifestKeys = uniqueSorted([
+      ...manifestKeys,
+      ...changedConnectorIds.map((connectorId) => buildConnectorManifestKey(prefix, dayUtc, connectorId)),
+    ]);
     const manifests = [];
     for (const key of manifestKeys) {
       const object = await r2GetObject({ r2: runtime.r2, key });
@@ -6369,9 +5749,6 @@ function buildAqilevelIndexEnv(runtime) {
 }
 
 export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManifests }) {
-  if (!runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    return { required: false, reason: "legacy_aqi_rpc_export" };
-  }
   const requiredTargets = requiredAqilevelDayIndexTargets({ runtime, dayUtc, connectorManifests });
   if (requiredTargets.length === 0 && (!Array.isArray(connectorManifests) || connectorManifests.length === 0 || !hasRequiredR2Config(runtime.r2))) {
     return { required: false, reason: "no_supported_aqi_source" };
@@ -6385,6 +5762,7 @@ export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManife
     fromDayUtc: dayUtc,
     toDayUtc: dayUtc,
     connectorId: null,
+    updateLatestIndex: false,
     strictMissingTimeseriesCounts: true,
     fetchConcurrency: 1,
     writeR2: true,
@@ -6409,9 +5787,6 @@ export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManife
 }
 
 export async function verifyAqilevelDayIndexes({ runtime, dayUtc, connectorManifests, indexBuild = null }) {
-  if (!runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    return { required: false, reason: "legacy_aqi_rpc_export" };
-  }
   const requiredTargets = requiredAqilevelDayIndexTargets({ runtime, dayUtc, connectorManifests });
   if (requiredTargets.length === 0) {
     return { required: false, reason: "no_supported_aqi_source" };
@@ -6489,7 +5864,7 @@ export const extractAqilevelIndexPollutantsFromConnectorManifestForTest = extrac
 export const buildAqilevelDayIndexesForTest = buildAqilevelDayIndexes;
 export const verifyAqilevelDayIndexesForTest = verifyAqilevelDayIndexes;
 
-async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
+async function finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }) {
   const dayCandidates = await fetchDayCandidates(client, dayUtc);
   const dayState = computeDayGateState(dayCandidates);
 
@@ -6504,27 +5879,62 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
 
   assertBudget(runtime, "day_finalization", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.day_finalization);
 
+  const dayManifestKey = runtime.history_write_version === "v2"
+    ? buildHistoryV2DayManifestKey(runtime.committed_prefix, dayUtc)
+    : buildDayManifestKey(runtime.committed_prefix, dayUtc);
+  let existingReferences = [];
+  try {
+    const current = JSON.parse((await r2GetObject({ r2: runtime.r2, key: dayManifestKey })).body.toString("utf8"));
+    const currentReferences = Array.isArray(current.connector_manifests)
+      ? current.connector_manifests
+      : Array.isArray(current.child_manifests) ? current.child_manifests : [];
+    existingReferences = currentReferences.map((entry) => ({
+      connector_id: Number(entry.connector_id),
+      manifest_key: String(entry.manifest_key || ""),
+    }));
+    const dayPrefix = `${runtime.committed_prefix}/day_utc=${dayUtc}/`;
+    if (existingReferences.some((entry) =>
+      !Number.isInteger(entry.connector_id) || entry.connector_id <= 0 ||
+      !entry.manifest_key.startsWith(dayPrefix) ||
+      !entry.manifest_key.endsWith(`/connector_id=${entry.connector_id}/manifest.json`)
+    )) {
+      throw new Error(`Current day manifest has invalid connector references: ${dayManifestKey}`);
+    }
+  } catch (_error) {
+    const discovered = await r2ListAllObjects({
+      r2: runtime.r2,
+      prefix: `${runtime.committed_prefix}/day_utc=${dayUtc}/`,
+      max_keys: 10_000,
+    });
+    existingReferences = discovered.flatMap((entry) => {
+      const key = String(entry.key || "");
+      const match = key.match(/\/connector_id=([1-9]\d*)\/manifest\.json$/);
+      return match ? [{ connector_id: Number(match[1]), manifest_key: key }] : [];
+    });
+  }
+  const replacementReferences = dayCandidates.map((candidate) => ({
+    connector_id: candidate.connector_id,
+    manifest_key: candidate.manifest_key,
+  }));
+  const mergedReferences = mergeConnectorManifestReferences(existingReferences, replacementReferences);
   const connectorManifests = [];
-  for (const candidate of dayCandidates) {
+  for (const reference of mergedReferences) {
     assertBudget(runtime, "day_finalization", {
       day_utc: dayUtc,
-      connector_id: candidate.connector_id,
+      connector_id: reference.connector_id,
     }, PHASE_B_STAGE_MIN_MS.day_finalization);
-    if (!candidate.manifest_key) {
-      throw new Error(`Missing connector manifest_key for day=${dayUtc} connector=${candidate.connector_id}`);
+    if (!reference.manifest_key) {
+      throw new Error(`Missing connector manifest_key for day=${dayUtc} connector=${reference.connector_id}`);
     }
-    const object = await r2GetObject({ r2: runtime.r2, key: candidate.manifest_key });
+    const object = await r2GetObject({ r2: runtime.r2, key: reference.manifest_key });
     const parsed = JSON.parse(object.body.toString("utf8"));
     connectorManifests.push({
       ...parsed,
-      manifest_key: candidate.manifest_key,
+      manifest_key: reference.manifest_key,
     });
   }
 
   const backedUpAtUtc = nowIso();
-  const dayManifestKey = runtime.history_write_version === "v2"
-    ? buildHistoryV2DayManifestKey(runtime.committed_prefix, dayUtc)
-    : buildDayManifestKey(runtime.committed_prefix, dayUtc);
   const dayManifest = runtime.history_write_version === "v2"
     ? createHistoryV2DayManifest({
       domain: "observations",
@@ -6555,7 +5965,11 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
     throw new Error(`Day manifest missing after upload: ${dayManifestKey}`);
   }
 
-  const aqiDayManifest = await writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc });
+  const aqiDayManifest = await writeAqilevelDayManifestFromConnectorOutputs({
+    runtime,
+    dayUtc,
+    changedConnectorIds: dayCandidates.map((candidate) => candidate.connector_id),
+  });
 
   const totalRows = dayCandidates.reduce(
     (sum, row) => sum + (row.history_row_count || 0n),
@@ -6589,6 +6003,16 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
     history_total_bytes: totalBytes.toString(),
     aqi_day_manifest: aqiDayManifest,
   };
+}
+
+async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
+  return await runCanonicalDayFinalizer({
+    client,
+    dayUtc,
+    diagnosticEnvironment: runtime.environment,
+    timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+    finalize: async () => await finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }),
+  });
 }
 
 async function cleanupStaging({ runtime, logStructured }) {
@@ -6737,27 +6161,11 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   );
 
   const allowedPollutantCodes = [];
-  const phaseBCalculateAqiFromObservationsEnabled = parseBoolean(
-    env.UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
-    DEFAULT_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
-  );
-  const phaseBLegacyAqiRpcExportEnabled = parseBoolean(
-    env.UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
-    DEFAULT_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
-  );
-  if (phaseBCalculateAqiFromObservationsEnabled === phaseBLegacyAqiRpcExportEnabled) {
-    throw new Error(
-      `Invalid Phase B AQI writer configuration: exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED must be true (got calculate=${phaseBCalculateAqiFromObservationsEnabled}, legacy=${phaseBLegacyAqiRpcExportEnabled}).`,
-    );
-  }
   const observsSource = {
     base_url: String(env.OBS_AQIDB_SUPABASE_URL || "").trim(),
     privileged_key: String(env.OBS_AQIDB_SECRET_KEY || "").trim(),
     rpc_schema: String(env.UK_AQ_PUBLIC_SCHEMA || DEFAULT_RPC_SCHEMA).trim() || DEFAULT_RPC_SCHEMA,
     pm_context_rpc: String(env.UK_AQ_PHASE_B_PM_CONTEXT_RPC || DEFAULT_PHASE_B_PM_CONTEXT_RPC).trim(),
-    connector_counts_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC || AQILEVELS_CONNECTOR_COUNTS_RPC)
-      .trim(),
-    rows_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC || AQILEVELS_ROWS_RPC).trim(),
   };
 
   return {
@@ -6803,8 +6211,7 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       10_000,
       2_000_000,
     ),
-    phase_b_calculate_aqi_from_observations_enabled: phaseBCalculateAqiFromObservationsEnabled,
-    phase_b_legacy_aqi_rpc_export_enabled: phaseBLegacyAqiRpcExportEnabled,
+    phase_b_calculate_aqi_from_observations_enabled: true,
     phase_b_observation_snapshot_max_rows: parsePositiveInt(
       env.UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
       DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
@@ -6848,12 +6255,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       1,
       250_000,
     ),
-    aqilevels_source_max_pages: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_AQILEVELS_SOURCE_MAX_PAGES,
-      DEFAULT_AQILEVELS_SOURCE_MAX_PAGES,
-      10,
-      1_000_000,
-    ),
     max_candidates_per_run: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN,
       DEFAULT_MAX_CANDIDATES_PER_RUN,
@@ -6891,10 +6292,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     runs_prefix: runsPrefix,
     runs_prefix_v1: writePrefixes.runs_prefix_v1,
     runs_prefix_v2: writePrefixes.runs_prefix_v2,
-    adopt_existing_manifest_enabled: parseBoolean(
-      env.UK_AQ_R2_HISTORY_ADOPT_EXISTING_MANIFEST_ENABLED,
-      true,
-    ),
     prune_check_dropbox: {
       enabled: parseBoolean(env.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_ENABLED, false),
       required: parseBoolean(env.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_REQUIRED, false),
@@ -6907,8 +6304,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       refresh_token: String(env.DROPBOX_REFRESH_TOKEN || "").trim(),
     },
     observs_source: observsSource,
-    // Legacy materialised-AQI export still reads this alias until its separate retirement.
-    aqilevels_source: observsSource,
     writer_git_sha: String(env.GITHUB_SHA || "").trim() || null,
   };
 }
@@ -6947,6 +6342,9 @@ export async function runPhaseBBackup({
   if (!runtime.supabase_db_url) {
     throw new Error("Phase B history export requires SUPABASE_DB_URL (or DATABASE_URL) for streaming Postgres extraction.");
   }
+  if (runtime.history_write_version !== "v2") {
+    throw new Error("Phase B history writes require canonical R2 history version v2");
+  }
   if (!hasRequiredR2Config(runtime.r2)) {
     throw new Error("Phase B history export requires R2 endpoint/bucket/region/access credentials.");
   }
@@ -6967,15 +6365,7 @@ export async function runPhaseBBackup({
     pending_candidates: 0,
     processed_candidates: 0,
     completed_candidates: 0,
-    adopted_candidates: 0,
     failed_candidates: 0,
-    connector_gate_existing_candidates_checked: 0,
-    connector_gate_existing_candidates_completed: 0,
-    connector_gate_existing_candidates_failed: 0,
-    active_scope_adoption_attempted: 0,
-    active_scope_adoption_completed: 0,
-    active_scope_adoption_blocked: 0,
-    historical_adoption_skipped: true,
     source_changed_connector_gate_invalidated_count: 0,
     source_changed_connector_gate_invalidated_preview: [],
     total_written_rows: "0",
@@ -6985,7 +6375,6 @@ export async function runPhaseBBackup({
     failures: [],
     completed_preview: [],
     blocked_preview: [],
-    adoption_failures: [],
     aggregate_day_failures: [],
     prune_check_dropbox_exports: 0,
     prune_check_dropbox_failures: 0,
@@ -7008,7 +6397,6 @@ export async function runPhaseBBackup({
     ingest_retention_days: window.ingest_retention_days,
     phase_b_eligible_age_days: window.phase_b_eligible_age_days,
     latest_eligible_day_utc: window.latest_eligible_day_utc,
-    adopt_existing_manifest_enabled: runtime.adopt_existing_manifest_enabled,
     prune_check_dropbox_enabled: runtime.prune_check_dropbox?.enabled === true,
     prune_check_dropbox_required: runtime.prune_check_dropbox?.required === true,
     prune_check_dropbox_dir: runtime.prune_check_dropbox?.dir || DEFAULT_PRUNE_CHECK_DROPBOX_DIR,
@@ -7029,7 +6417,6 @@ export async function runPhaseBBackup({
     r2_bucket: runtime.r2.bucket,
     observations_prefix: runtime.committed_prefix,
     aqilevels_prefix: runtime.aqilevels_prefix,
-    aqilevels_prefix_v1: runtime.aqilevels_prefix_v1,
     aqilevels_hourly_data_prefix_v2: runtime.aqilevels_hourly_data_prefix_v2,
     aqilevels_hourly_debug_prefix_v2: runtime.aqilevels_hourly_debug_prefix_v2,
     runs_prefix: runtime.runs_prefix,
@@ -7158,13 +6545,8 @@ export async function runPhaseBBackup({
 
       const startedAtMs = Date.now();
       let connectorGateCompleted = false;
+      let frozenSourceTemp = null;
       try {
-        if (runtime.history_write_version === "v2") {
-          await setConnectorDayGateIncomplete(controlClient, {
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-          });
-        }
         logPhaseB(runtime, "INFO", "phase_b_history_candidate_start", {
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
@@ -7174,47 +6556,56 @@ export async function runPhaseBBackup({
           prefix: connectorPrefix(runtime.committed_prefix, candidate.day_utc, candidate.connector_id),
           manifest_path: buildConnectorManifestKey(runtime.committed_prefix, candidate.day_utc, candidate.connector_id),
         });
-        const adoptResult = await maybeAdoptExistingConnectorManifest({
-          candidate,
-          runtime,
-          logStructured,
-        });
-
-        let exportResult;
-        if (adoptResult.adopted) {
-          exportResult = {
-            manifest_key: adoptResult.manifest_key,
-            written_row_count: adoptResult.history_row_count,
-            file_count: adoptResult.history_file_count,
-            total_bytes: adoptResult.history_total_bytes,
-            adopted: true,
-          };
-        } else {
-          exportResult = await exportCandidateToR2({
-            candidate,
-          runtime,
-        });
-          exportResult.adopted = false;
-        }
-
         let connectorGateEvidence = null;
-        let connectorComparison = adoptResult.comparison || null;
+        let connectorComparison = null;
+        const lockDiagnostics = [];
+        const connectorWrite = await runCanonicalConnectorDayWriter({
+          client: controlClient,
+          dayUtc: candidate.day_utc,
+          connectorId: candidate.connector_id,
+          diagnosticEnvironment: runtime.environment,
+          diagnostics: lockDiagnostics,
+          timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+          write: async () => {
+            if (runtime.history_write_version === "v2") {
+              await setConnectorDayGateIncomplete(controlClient, {
+                day_utc: candidate.day_utc,
+                connector_id: candidate.connector_id,
+              });
+            }
+            const result = await exportCandidateToR2({ candidate, runtime });
+            result.adopted = false;
+            frozenSourceTemp = result.frozen_source_temp || null;
+            return result;
+          },
+          verify: async (result) => {
+          if (runtime.history_write_version === "v2") {
+            connectorGateEvidence = await verifyObservationConnectorHistory({
+              runtime,
+              dayUtc: candidate.day_utc,
+              connectorId: candidate.connector_id,
+              manifestKey: result.manifest_key,
+              expectedRowCount: candidate.expected_row_count,
+            });
+            connectorComparison = await ensureConnectorPruneComparison({
+              candidate,
+              runtime,
+              manifestKey: connectorGateEvidence.history_manifest_key,
+              manifest: connectorGateEvidence.connector_manifest,
+              existingComparison: null,
+              logStructured,
+            });
+          }
+            return { connectorGateEvidence, connectorComparison };
+          },
+        });
+        const exportResult = connectorWrite.written;
+        logPhaseB(runtime, "INFO", "phase_b_history_connector_lock_complete", {
+          day_utc: candidate.day_utc,
+          connector_id: candidate.connector_id,
+          lock_diagnostics: lockDiagnostics,
+        });
         if (runtime.history_write_version === "v2") {
-          connectorGateEvidence = await verifyObservationConnectorHistory({
-            runtime,
-            dayUtc: candidate.day_utc,
-            connectorId: candidate.connector_id,
-            manifestKey: exportResult.manifest_key,
-            expectedRowCount: candidate.expected_row_count,
-          });
-          connectorComparison = await ensureConnectorPruneComparison({
-            candidate,
-            runtime,
-            manifestKey: connectorGateEvidence.history_manifest_key,
-            manifest: connectorGateEvidence.connector_manifest,
-            existingComparison: connectorComparison,
-            logStructured,
-          });
           await markCandidateAndConnectorGateComplete(controlClient, {
             dayUtc: candidate.day_utc,
             connectorId: candidate.connector_id,
@@ -7241,22 +6632,45 @@ export async function runPhaseBBackup({
           });
         }
 
-        summary.completed_candidates += 1;
-        if (exportResult.adopted) {
-          summary.adopted_candidates += 1;
-          logStructured("INFO", "phase_b_history_existing_manifest_adopted", {
-            run_id: runId,
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            manifest_key: exportResult.manifest_key,
-            history_row_count: exportResult.written_row_count.toString(),
-            history_file_count: exportResult.file_count,
-            history_total_bytes: exportResult.total_bytes.toString(),
-          });
-        } else {
-          totalWrittenRows += exportResult.written_row_count;
-          totalWrittenBytes += exportResult.total_bytes;
+        if (runtime.history_write_version === "v2") {
+          try {
+            exportResult.aqi = await withConnectorDayHistoryLock({
+              client: controlClient,
+              dayUtc: candidate.day_utc,
+              connectorId: candidate.connector_id,
+              diagnosticEnvironment: runtime.environment,
+              timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+            }, async () => await exportCandidateAqiFromFrozenSource({
+              candidate,
+              runtime,
+              observationResult: exportResult,
+            }));
+          } catch (aqiError) {
+            exportResult.aqi = {
+              status: "failed",
+              error: aqiError instanceof Error ? aqiError.message : String(aqiError),
+            };
+            summary.aggregate_day_failures.push({
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+              domain: "aqilevels",
+              error: exportResult.aqi.error,
+            });
+            logPhaseB(runtime, "ERROR", "phase_b_history_aqi_failed_gate_preserved", {
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+              connector_gate_preserved: true,
+              error: exportResult.aqi.error,
+            });
+          } finally {
+            cleanupPhaseBTargetDaySourceTemp(frozenSourceTemp);
+            frozenSourceTemp = null;
+          }
         }
+
+        summary.completed_candidates += 1;
+        totalWrittenRows += exportResult.written_row_count;
+        totalWrittenBytes += exportResult.total_bytes;
         if (connectorComparison) {
           summary.prune_check_dropbox_exports += 1;
         } else if (runtime.prune_check_dropbox?.enabled) {
@@ -7311,6 +6725,8 @@ export async function runPhaseBBackup({
           duration_ms: durationMs,
         });
       } catch (error) {
+        cleanupPhaseBTargetDaySourceTemp(frozenSourceTemp);
+        frozenSourceTemp = null;
         const message = error instanceof Error ? error.message : String(error);
         if (error instanceof PhaseBHistoryBudgetExhaustedError) {
           if (!connectorGateCompleted) {
@@ -7410,12 +6826,6 @@ export async function runPhaseBBackup({
         });
         dayResults.set(candidate.day_utc, dayState);
         summary.failed_candidates += 1;
-        summary.adoption_failures.push({
-          day_utc: candidate.day_utc,
-          connector_id: candidate.connector_id,
-          run_id: runId,
-          error: message,
-        });
         summary.failures.push({
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
@@ -7442,78 +6852,34 @@ export async function runPhaseBBackup({
       }
     }
 
-    if (runtime.history_write_version === "v2" && summary.status !== "stopped_budget") {
-      if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.active_scope_adoption)) {
-        stopPhaseBForBudget(summary, runtime, { operation: "active_scope_adoption_query" });
-      } else {
-        const activeCompleteCandidatesMissingGate = await fetchActiveCompleteCandidatesMissingConnectorGate(
-          controlClient,
-          upsertedCandidates,
-          runtime.max_candidates_per_run,
-        );
-        summary.connector_gate_existing_candidates_checked = activeCompleteCandidatesMissingGate.length;
-        summary.active_scope_adoption_attempted = activeCompleteCandidatesMissingGate.length;
-        for (const candidate of activeCompleteCandidatesMissingGate) {
-          try {
-            assertBudget(runtime, "active_scope_adoption", {
-              day_utc: candidate.day_utc,
-              connector_id: candidate.connector_id,
-            }, PHASE_B_STAGE_MIN_MS.active_scope_adoption);
-            await setConnectorDayGateIncomplete(controlClient, {
-              day_utc: candidate.day_utc,
-              connector_id: candidate.connector_id,
-            });
-            const manifestKey = canonicalObservationConnectorManifestKey(
-              candidate.day_utc,
-              candidate.connector_id,
-            );
-            const evidence = await verifyObservationConnectorHistory({
-              runtime,
-              dayUtc: candidate.day_utc,
-              connectorId: candidate.connector_id,
-              manifestKey,
-              expectedRowCount: candidate.expected_row_count,
-            });
-            const comparison = await ensureConnectorPruneComparison({
-              candidate,
-              runtime,
-              manifestKey,
-              manifest: evidence.connector_manifest,
-              logStructured,
-            });
-            await setConnectorDayGateComplete(controlClient, {
-              day_utc: candidate.day_utc,
-              connector_id: candidate.connector_id,
-              history_run_id: runId,
-              history_manifest_key: evidence.history_manifest_key,
-              history_manifest_hash: evidence.history_manifest_hash,
-              history_row_count: evidence.history_row_count,
-              history_file_count: evidence.history_file_count,
-              history_total_bytes: evidence.history_total_bytes,
-              completion_source: "prune_daily_phase_b",
-            });
-            summary.connector_gate_existing_candidates_completed += 1;
-            summary.active_scope_adoption_completed += 1;
-            if (comparison) summary.prune_check_dropbox_exports += 1;
-          } catch (error) {
-            if (error instanceof PhaseBHistoryBudgetExhaustedError) {
-              stopPhaseBForBudget(summary, runtime, {
-                operation: error.operation || "active_scope_adoption",
-                candidate,
-              });
-              break;
-            }
-            summary.connector_gate_existing_candidates_failed += 1;
-            summary.active_scope_adoption_blocked += 1;
-            summary.adoption_failures.push({
-              day_utc: candidate.day_utc,
-              connector_id: candidate.connector_id,
-              run_id: runId,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        }
-      }
+    const finalizedDays = Array.from(dayResults.values())
+      .filter((state) => state.history_done === true)
+      .map((state) => state.day_utc)
+      .sort();
+    if (runtime.history_write_version === "v2" && finalizedDays.length > 0 && summary.status !== "stopped_budget") {
+      summary.global_index_finalization = await runCanonicalGlobalIndexFinalizer({
+        client: controlClient,
+        diagnosticEnvironment: runtime.environment,
+        timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+        finalize: async () => await updateR2HistoryIndexesTargeted({
+        env: {
+          ...process.env,
+          UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: runtime.committed_prefix,
+          UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: runtime.aqilevels_prefix,
+          UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX: runtime.aqilevels_timeseries_index_prefix,
+          UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: runtime.index_prefix_v2,
+        },
+        r2: runtime.r2,
+        historyVersion: "v2",
+        domains: ["observations", "aqilevels"],
+        fromDayUtc: finalizedDays[0],
+        toDayUtc: finalizedDays[finalizedDays.length - 1],
+        connectorId: null,
+        updateLatestIndex: true,
+        strictMissingTimeseriesCounts: true,
+        writeR2: true,
+        }),
+      });
     }
     }, {
       statementTimeoutMs: controlPgTimeouts.statement_timeout_ms,
@@ -7539,16 +6905,6 @@ export async function runPhaseBBackup({
     }
   }
 
-  logStructured("INFO", "phase_b_history_active_scope_adoption_summary", {
-    run_id: runId,
-    active_scope_adoption_attempted: summary.active_scope_adoption_attempted,
-    active_scope_adoption_completed: summary.active_scope_adoption_completed,
-    active_scope_adoption_blocked: summary.active_scope_adoption_blocked,
-    stopped_for_budget: summary.status === "stopped_budget",
-    historical_adoption_skipped: true,
-    blocked_preview: summary.adoption_failures.slice(0, 10),
-  });
-
   if (summary.status === "stopped_budget") {
     summary.aqilevels = { skipped: true, reason: "phase_b_history_budget_exhausted" };
   } else if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
@@ -7556,30 +6912,11 @@ export async function runPhaseBBackup({
       enabled: true,
       source_mode: "frozen_observations_per_candidate",
       status: "completed_with_phase_b_candidates",
-      legacy_aqi_rpc_export_enabled: runtime.phase_b_legacy_aqi_rpc_export_enabled,
       snapshot_max_rows: runtime.phase_b_observation_snapshot_max_rows,
       snapshot_max_bytes: runtime.phase_b_observation_snapshot_max_bytes,
     };
-  } else if (runtime.phase_b_legacy_aqi_rpc_export_enabled && hasBudgetFor(runtime, 120_000)) {
-    summary.aqilevels = await runAqilevelsBackup({
-      runtime,
-      latestEligibleDayUtc: window.latest_eligible_day_utc,
-      dryRun,
-      logStructured,
-    });
-    if (summary.aqilevels?.status === "stopped_budget") {
-      stopPhaseBForBudget(summary, runtime, {
-        operation: summary.aqilevels.budget_stop?.operation || "legacy_aqilevels_backup",
-      });
-    }
-  } else if (!runtime.phase_b_legacy_aqi_rpc_export_enabled) {
-    summary.aqilevels = { skipped: true, reason: "legacy_aqi_rpc_export_disabled" };
   } else {
-    logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
-      operation: "aqilevels_backup_start",
-    });
-    stopPhaseBForBudget(summary, runtime, { operation: "aqilevels_backup_start" });
-    summary.aqilevels = { skipped: true, reason: "phase_b_history_budget_exhausted" };
+    summary.aqilevels = { skipped: true, reason: "phase_b_history_not_completed" };
   }
 
   if (dryRun) {
@@ -7595,7 +6932,6 @@ export async function runPhaseBBackup({
   summary.blocked_days = dayStates.filter((state) => state.history_done !== true).length;
   summary.completed_preview = dayStates.slice(0, 25);
   summary.blocked_preview = dayStates.filter((state) => state.history_done !== true).slice(0, 25);
-  summary.adoption_failures = summary.adoption_failures.slice(0, 25);
   summary.aggregate_day_failures = summary.aggregate_day_failures.slice(0, 25);
   summary.failures = summary.failures.slice(0, 25);
 
@@ -7614,7 +6950,6 @@ export async function runPhaseBBackup({
   if (runtime.prune_check_dropbox?.enabled) {
     logStructured("INFO", "phase_b_history_prune_check_summary", {
       run_id: runId,
-      adopted_candidates: summary.adopted_candidates,
       dropbox_exports: summary.prune_check_dropbox_exports,
       dropbox_failures: summary.prune_check_dropbox_failures,
       required: runtime.prune_check_dropbox?.required === true,
