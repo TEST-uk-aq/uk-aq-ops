@@ -1,19 +1,24 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import {
   createPhaseBRunBudgetForTest,
+  derivePhaseBPgTimeoutsForTest,
   fetchActiveCompleteCandidatesMissingConnectorGateForTest,
   isAcceptedPruneHistoryDayManifestKey,
+  populateBackupCandidatesForTest,
+  runPhaseBBackup,
   runBudgetedPhaseBStageForTest,
   stopPhaseBForBudgetForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
+  executePruneDaily,
   filterBucketsByConnectorHistoryGate,
+  runPruneForTest,
   shouldRebuildPhaseBHistoryIndexesForTest,
 } from "../workers/uk_aq_prune_daily/server.mjs";
+import { runPruneDailyJob } from "../workers/uk_aq_prune_daily/job.mjs";
 import {
   canonicalObservationConnectorManifestKey,
   connectorDayGateKey,
@@ -191,14 +196,108 @@ test("normal adoption query is limited to active connector-days and retains acti
   });
   assert.equal(adoption.status, "completed");
   assert.equal(adopted, true);
+});
 
-  const phaseBSource = readFileSync(
-    path.resolve("workers/uk_aq_prune_daily/phase_b_history_r2.mjs"),
-    "utf8",
-  );
-  const normalRunSource = phaseBSource.slice(phaseBSource.indexOf("export async function runPhaseBBackup"));
-  assert.ok(normalRunSource.indexOf("for (let candidateIndex") < normalRunSource.indexOf("fetchActiveCompleteCandidatesMissingConnectorGate("));
-  assert.equal(normalRunSource.includes("phase_b_history_existing_connector_gate_blocked"), false);
+function completeCandidate(dayUtc, connectorId, expectedRowCount, minObservedAt, maxObservedAt) {
+  return {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    expected_row_count: String(expectedRowCount),
+    min_observed_at: minObservedAt,
+    max_observed_at: maxObservedAt,
+    status: "complete",
+    run_id: "previous-run",
+    manifest_key: canonicalObservationConnectorManifestKey(dayUtc, connectorId),
+    history_row_count: String(expectedRowCount),
+    history_file_count: 1,
+    history_total_bytes: "100",
+    resume_last_timeseries_id: null,
+    resume_last_observed_at: null,
+    resume_part_index: 0,
+    resume_exported_row_count: "0",
+    resume_parts_json: [],
+  };
+}
+
+function candidatePopulationClient({ candidates, gates, sourceRows, afterPopulation = null }) {
+  return {
+    async query(sql) {
+      if (/select distinct op\.code/i.test(sql)) return { rows: [] };
+      assert.match(sql, /source_changes as materialized/i);
+      assert.match(sql, /invalidated_connector_gates as/i);
+      assert.match(sql, /on conflict \(day_utc, connector_id\)/i);
+      const rows = sourceRows.map((source) => {
+        const key = connectorDayGateKey(source.day_utc, source.connector_id);
+        const previous = candidates.get(key);
+        const changed = previous?.status === "complete" && (
+          String(previous.expected_row_count) !== String(source.expected_row_count)
+          || previous.min_observed_at !== source.min_observed_at
+          || previous.max_observed_at !== source.max_observed_at
+        );
+        const next = changed
+          ? {
+            ...previous,
+            ...source,
+            expected_row_count: String(source.expected_row_count),
+            status: "pending",
+            run_id: null,
+            manifest_key: null,
+            history_row_count: null,
+            history_file_count: null,
+            history_total_bytes: null,
+          }
+          : previous;
+        candidates.set(key, next);
+        if (changed) gates.set(key, false);
+        return {
+          ...next,
+          source_row_count: String(source.expected_row_count),
+          excluded_row_count: "0",
+          excluded_pollutant_counts: {},
+          source_changed_connector_gate_invalidated: changed,
+          previous_expected_row_count: previous.expected_row_count,
+          current_expected_row_count: String(source.expected_row_count),
+          previous_min_observed_at: previous.min_observed_at,
+          current_min_observed_at: source.min_observed_at,
+          previous_max_observed_at: previous.max_observed_at,
+          current_max_observed_at: source.max_observed_at,
+        };
+      });
+      afterPopulation?.();
+      return { rows };
+    },
+  };
+}
+
+test("real candidate population invalidates only the connector gate whose completed source identity changed", async () => {
+  const dayUtc = "2026-07-21";
+  const candidates = new Map([
+    [connectorDayGateKey(dayUtc, 1), completeCandidate(dayUtc, 1, 10, `${dayUtc}T00:00:00.000Z`, `${dayUtc}T23:00:00.000Z`)],
+    [connectorDayGateKey(dayUtc, 2), completeCandidate(dayUtc, 2, 20, `${dayUtc}T00:05:00.000Z`, `${dayUtc}T23:05:00.000Z`)],
+  ]);
+  const gates = new Map([
+    [connectorDayGateKey(dayUtc, 1), true],
+    [connectorDayGateKey(dayUtc, 2), true],
+  ]);
+  const sourceRows = [
+    { day_utc: dayUtc, connector_id: 1, expected_row_count: "11", min_observed_at: `${dayUtc}T00:00:00.000Z`, max_observed_at: `${dayUtc}T23:30:00.000Z` },
+    { day_utc: dayUtc, connector_id: 2, expected_row_count: "20", min_observed_at: `${dayUtc}T00:05:00.000Z`, max_observed_at: `${dayUtc}T23:05:00.000Z` },
+  ];
+
+  const populated = await populateBackupCandidatesForTest({
+    client: candidatePopulationClient({ candidates, gates, sourceRows }),
+    latestEligibleWindowEndIso: "2026-07-22T00:00:00.000Z",
+    runtime: { history_write_version: "v2" },
+  });
+
+  assert.equal(candidates.get(connectorDayGateKey(dayUtc, 1)).status, "pending");
+  assert.equal(gates.get(connectorDayGateKey(dayUtc, 1)), false);
+  assert.equal(candidates.get(connectorDayGateKey(dayUtc, 2)).status, "complete");
+  assert.equal(gates.get(connectorDayGateKey(dayUtc, 2)), true);
+  assert.equal(populated[0].source_changed_connector_gate_invalidated, true);
+  assert.equal(populated[1].source_changed_connector_gate_invalidated, false);
+  assert.equal(new Map([[dayUtc, true]]).get(dayUtc), true, "aggregate truth exists but cannot restore the exact connector gate");
+  assert.equal(gates.get(connectorDayGateKey(dayUtc, 1)), false);
 });
 
 test("insufficient Phase B budget prevents AQI and Dropbox adapters and reports a controlled stop", async () => {
@@ -258,14 +357,250 @@ test("insufficient Phase B budget prevents AQI and Dropbox adapters and reports 
   }), false);
 });
 
-test("controlled Phase B status follows the successful top-level report path", () => {
-  const jobSource = readFileSync(
-    path.resolve("workers/uk_aq_prune_daily/job.mjs"),
-    "utf8",
-  );
-  assert.match(jobSource, /const summary = await executePruneDaily\(config\);\s+await writeReport\(\{ ok: true, summary \}\);/);
-  assert.equal(shouldRebuildPhaseBHistoryIndexesForTest({
+function phaseBConfig() {
+  return {
+    enabled: true,
+    supabase_db_url: "postgresql://test.invalid/database",
+    r2: {
+      endpoint: "https://r2.invalid",
+      bucket: "test-bucket",
+      region: "auto",
+      access_key_id: "test-access-key",
+      secret_access_key: "test-secret-key",
+    },
+    history_write_version: "v2",
+    staging_prefix_base: "history/v2/_ops/observations/staging",
+    committed_prefix: "history/v2/observations",
+    committed_prefix_v1: "history/v1/observations",
+    committed_prefix_v2: "history/v2/observations",
+    aqilevels_prefix: "history/v2/aqilevels/hourly/data",
+    aqilevels_prefix_v1: "history/v1/aqilevels/hourly",
+    aqilevels_hourly_data_prefix_v2: "history/v2/aqilevels/hourly/data",
+    aqilevels_hourly_debug_prefix_v2: "history/v2/aqilevels/hourly/debug",
+    aqilevels_timeseries_index_prefix: "history/_index_v2/aqilevels_hourly_data_timeseries",
+    runs_prefix: "history/v2/_ops/observations/runs",
+    runs_prefix_v1: "history/v1/_ops/observations/runs",
+    runs_prefix_v2: "history/v2/_ops/observations/runs",
+    max_candidates_per_run: 500,
+    max_seconds_per_run: 840,
+    stop_before_timeout_seconds: 60,
+    phase_b_calculate_aqi_from_observations_enabled: true,
+    phase_b_legacy_aqi_rpc_export_enabled: false,
+    prune_check_dropbox: { enabled: false, required: false },
+  };
+}
+
+test("source-change invalidation survives a real Phase B candidate-start budget stop without R2 candidate work", async () => {
+  const dayUtc = "2026-07-21";
+  let nowMs = 0;
+  const deadlineMs = 780_000;
+  const key = connectorDayGateKey(dayUtc, 1);
+  const candidates = new Map([
+    [key, completeCandidate(dayUtc, 1, 10, `${dayUtc}T00:00:00.000Z`, `${dayUtc}T23:00:00.000Z`)],
+  ]);
+  const gates = new Map([[key, true]]);
+  const sourceRows = [
+    { day_utc: dayUtc, connector_id: 1, expected_row_count: "11", min_observed_at: `${dayUtc}T00:00:00.000Z`, max_observed_at: `${dayUtc}T23:30:00.000Z` },
+  ];
+  const populationClient = candidatePopulationClient({ candidates, gates, sourceRows });
+  let candidateClaimed = false;
+  const fakeClient = {
+    async connect() {},
+    async end() {},
+    async query(sql, params) {
+      if (/^set (timezone|statement_timeout)/i.test(sql.trim())) return { rows: [] };
+      if (/select distinct op\.code|source_changes as materialized/i.test(sql)) {
+        return populationClient.query(sql, params);
+      }
+      if (/insert into uk_aq_ops\.prune_day_gates/i.test(sql)) return { rows: [] };
+      if (/where c\.status = 'pending'/i.test(sql)) {
+        nowMs = deadlineMs - 299_999;
+        return { rows: [candidates.get(key)] };
+      }
+      if (/set status = 'in_progress'/i.test(sql)) candidateClaimed = true;
+      throw new Error(`Unexpected fake PostgreSQL query: ${sql.slice(0, 80)}`);
+    },
+  };
+
+  const summary = await runPhaseBBackup({
     dryRun: false,
-    phaseBHistorySummary: { enabled: true, status: "completed" },
-  }), true);
+    phaseB: phaseBConfig(),
+    ingestRetentionDays: 5,
+    logStructured: () => {},
+    runId: "budget-stop-run",
+    nowUtc: "2026-07-27T12:00:00.000Z",
+    nowMs: () => nowMs,
+    createPgClient: () => fakeClient,
+  });
+
+  assert.equal(candidates.get(key).status, "pending");
+  assert.equal(gates.get(key), false);
+  assert.equal(candidateClaimed, false);
+  assert.equal(summary.status, "stopped_budget");
+  assert.equal(summary.stopped_for_budget, true);
+  assert.equal(summary.budget_stop.operation, "candidate_start");
+  assert.equal(summary.source_changed_connector_gate_invalidated_count, 1);
+  assert.deepEqual(summary.run_manifest, { skipped: true, reason: "reserved_for_final_reporting" });
+  assert.equal(summary.total_written_rows, "0");
+  assert.equal(summary.total_written_bytes, "0");
+});
+
+test("top-level stopped-budget path skips every downstream adapter, finishes task health, and writes the normal report", async () => {
+  const calls = {
+    index: 0,
+    chart: 0,
+    prune: 0,
+    late: 0,
+  };
+  const stoppedPhaseB = {
+    enabled: true,
+    run_id: "stopped-run",
+    status: "stopped_budget",
+    stopped_for_budget: true,
+  };
+  let healthSummary = null;
+  const config = {
+    dryRun: false,
+    maxHoursPerRun: 24,
+    ingestDbRetentionDays: 5,
+    phaseB: { enabled: true, history_write_version: "v2" },
+  };
+  const adapters = {
+    runPhaseARecent: async () => ({ enabled: true }),
+    runPhaseBBackup: async () => stoppedPhaseB,
+    rebuildR2HistoryIndexes: async () => { calls.index += 1; },
+    runChartLoadMetricsMaintenance: async () => { calls.chart += 1; },
+    runPruneSingleWindow: async () => { calls.prune += 1; },
+    runLateArrivalCleanup: async () => { calls.late += 1; },
+    withDailyTaskRun: async (input, fn) => {
+      const result = await fn();
+      healthSummary = input.buildFinishedSummary(result);
+      return result;
+    },
+  };
+
+  const summary = await executePruneDaily(config, adapters);
+  assert.deepEqual(calls, { index: 0, chart: 0, prune: 0, late: 0 });
+  assert.equal(summary.deletion_attempted, false);
+  assert.equal(summary.normal_prune.reason, "phase_b_stopped_budget");
+  assert.equal(summary.phase_b_history_index.reason, "phase_b_stopped_budget");
+  assert.equal(summary.chart_load_metrics.reason, "phase_b_stopped_budget");
+  assert.equal(summary.late_arrival.reason, "phase_b_stopped_budget");
+  assert.equal(healthSummary.phase_b_history.status, "stopped_budget");
+  assert.equal(healthSummary.phase_b_history.stopped_for_budget, true);
+  assert.match(healthSummary.warnings[0], /controlled internal budget/i);
+
+  let reportPayload = null;
+  const jobResult = await runPruneDailyJob({
+    env: {},
+    buildRunConfigAdapter: () => config,
+    executePruneDailyAdapter: async () => summary,
+    writeReportAdapter: async (payload) => { reportPayload = payload; },
+    setExitCode: () => assert.fail("successful stopped-budget report path must not set a failure exit code"),
+  });
+  assert.equal(jobResult.ok, true);
+  assert.equal(reportPayload.ok, true);
+  assert.equal(reportPayload.summary.phase_b_history.status, "stopped_budget");
+});
+
+test("completed Phase B still runs index, chart, normal prune, and late-arrival stages", async () => {
+  const calls = [];
+  const config = {
+    dryRun: false,
+    maxHoursPerRun: 24,
+    ingestDbRetentionDays: 5,
+    phaseB: { enabled: true, history_write_version: "v2" },
+  };
+  const summary = await runPruneForTest(config, {
+    runPhaseARecent: async () => ({ enabled: true }),
+    runPhaseBBackup: async () => ({ enabled: true, status: "completed", stopped_for_budget: false }),
+    rebuildR2HistoryIndexes: async () => {
+      calls.push("index");
+      return { bucket: "test", history_version: "v2", index_prefix: "history/_index_v2", results: [] };
+    },
+    runChartLoadMetricsMaintenance: async () => {
+      calls.push("chart");
+      return { enabled: true };
+    },
+    runPruneSingleWindow: async () => {
+      calls.push("prune");
+      return { mode: "delete", deletion_attempted: true };
+    },
+    runLateArrivalCleanup: async () => {
+      calls.push("late");
+      return { enabled: true };
+    },
+  });
+  assert.deepEqual(calls, ["index", "chart", "prune", "late"]);
+  assert.equal(summary.deletion_attempted, true);
+  assert.equal(summary.phase_b_history.status, "completed");
+});
+
+test("Phase B control PostgreSQL timeout is deadline-bounded and only deadline cancellation becomes stopped_budget", async () => {
+  const runBudget = createPhaseBRunBudgetForTest({
+    nowMs: () => 0,
+    startedAtMs: 0,
+    maxSecondsPerRun: 840,
+    stopBeforeTimeoutSeconds: 60,
+  });
+  const derived = derivePhaseBPgTimeoutsForTest({ run_budget: runBudget });
+  assert.ok(derived.statement_timeout_ms <= derived.remaining_budget_ms);
+  assert.ok(derived.statement_timeout_ms > 0);
+  assert.ok(derived.connection_timeout_ms > 0);
+
+  const runWithPopulationError = async ({ errorCode, errorMessage, expireBudget }) => {
+    let nowMs = 0;
+    let connectionConfig = null;
+    let configuredStatementTimeout = null;
+    const fakeClient = {
+      async connect() {},
+      async end() {},
+      async query(sql) {
+        const normalized = sql.trim();
+        if (/^set timezone/i.test(normalized)) return { rows: [] };
+        if (/^set statement_timeout/i.test(normalized)) {
+          configuredStatementTimeout = Number(normalized.match(/'(\d+)ms'/)[1]);
+          return { rows: [] };
+        }
+        if (/select distinct op\.code/i.test(normalized)) return { rows: [] };
+        if (/source_changes as materialized/i.test(normalized)) {
+          if (expireBudget) nowMs = 779_500;
+          throw Object.assign(new Error(errorMessage), { code: errorCode });
+        }
+        throw new Error(`Unexpected fake PostgreSQL query: ${normalized.slice(0, 80)}`);
+      },
+    };
+    const promise = runPhaseBBackup({
+      dryRun: false,
+      phaseB: phaseBConfig(),
+      ingestRetentionDays: 5,
+      logStructured: () => {},
+      runId: `sql-${errorCode}`,
+      nowUtc: "2026-07-27T12:00:00.000Z",
+      nowMs: () => nowMs,
+      createPgClient: (config) => {
+        connectionConfig = config;
+        return fakeClient;
+      },
+    });
+    return { promise, getConnectionConfig: () => connectionConfig, getStatementTimeout: () => configuredStatementTimeout };
+  };
+
+  const deadlineCase = await runWithPopulationError({
+    errorCode: "57014",
+    errorMessage: "canceling statement due to statement timeout",
+    expireBudget: true,
+  });
+  const stopped = await deadlineCase.promise;
+  assert.equal(stopped.status, "stopped_budget");
+  assert.equal(stopped.budget_stop.operation, "control_database_statement");
+  assert.ok(deadlineCase.getStatementTimeout() <= 780_000);
+  assert.ok(deadlineCase.getConnectionConfig().connectionTimeoutMillis <= 15_000);
+
+  const sqlDefectCase = await runWithPopulationError({
+    errorCode: "42601",
+    errorMessage: "syntax error at or near source_aggregates",
+    expireBudget: false,
+  });
+  await assert.rejects(sqlDefectCase.promise, /syntax error/);
 });

@@ -1,5 +1,4 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
 import {
   buildRunConfig,
   executePruneDaily,
@@ -32,48 +31,32 @@ function boundedValue(value, depth = 0) {
   return String(value);
 }
 
-export async function writeReport(payload) {
+async function writeReport(payload) {
   await mkdir("tmp", { recursive: true });
   await writeFile(REPORT_PATH, `${JSON.stringify(boundedValue(payload), null, 2)}\n`, "utf8");
 }
 
-export async function runPruneDailyJob({
-  env = process.env,
-  buildRunConfigAdapter = buildRunConfig,
-  executePruneDailyAdapter = executePruneDaily,
-  reportPruneDailyErrorAdapter = reportPruneDailyError,
-  writeReportAdapter = writeReport,
-  setExitCode = (code) => {
-    process.exitCode = code;
-  },
-} = {}) {
+async function main() {
   const url = new URL("http://localhost/");
-  if (env.INPUT_DRY_RUN === "true") {
+  if (process.env.INPUT_DRY_RUN === "true") {
     url.searchParams.set("dryRun", "true");
   }
 
   try {
-    const config = buildRunConfigAdapter(url);
-    const summary = await executePruneDailyAdapter(config);
-    const payload = { ok: true, summary };
-    await writeReportAdapter(payload);
-    return payload;
+    const config = buildRunConfig(url);
+    const summary = await executePruneDaily(config);
+    await writeReport({ ok: true, summary });
   } catch (error) {
-    const errorReport = await reportPruneDailyErrorAdapter(error, {
+    const errorReport = await reportPruneDailyError(error, {
       execution_mode: "github_actions",
     });
-    const payload = {
+    await writeReport({
       ok: false,
       error: error instanceof Error ? error.message : String(error),
       ...errorReport,
-    };
-    await writeReportAdapter(payload);
-    setExitCode(1);
-    return payload;
+    });
+    process.exitCode = 1;
   }
 }
 
-const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;
-if (invokedPath === import.meta.url) {
-  await runPruneDailyJob();
-}
+await main();
