@@ -165,6 +165,20 @@ Required behaviour:
 
 A missing endpoint remains uncoloured. Neither neighbouring AQI value may span it.
 
+### Settled AQI gaps and source switching
+
+For a successfully evaluated requested interval containing missing observations, excluded invalid inputs or `insufficient_samples` AQI results:
+
+- cache all valid AQI rows;
+- preserve partial, status and missing-reason diagnostics;
+- leave uncalculable hours blank;
+- record the requested interval as settled for browser request planning without labelling the response complete;
+- do not show a user-facing incomplete or error message solely for those blank hours;
+- after switching away and back, reuse the settled cache rather than issuing the same AQI request again;
+- commit the cached AQI layer once after the approximately 200 millisecond source-change transition.
+
+A request, service, parsing, identity or physical-read failure must remain unsettled and retryable. It may show an AQI update error because accurate settlement was not achieved.
+
 ## Stored-R2 validation cases
 
 For each immutable comparable hour:
@@ -237,6 +251,22 @@ Disable the calculated-history feature and confirm the retained separate R2 AQI 
 
 Disable continuity and confirm exact requested-timeseries behaviour is restored.
 
+### 4. AQI source with authoritative blank intervals
+
+On an already displayed multi-sensor chart, choose an AQI source known to contain genuine observation or rolling-sample gaps.
+
+Confirm:
+
+- the old AQI layer clears immediately;
+- valid bands for the new source appear in one visible commit;
+- uncalculable hours remain blank;
+- no incomplete-AQI warning is shown solely for those gaps;
+- retained observation lines are neither refetched nor repainted;
+- switching away and back reuses the settled AQI cache;
+- the repeated switch normally completes in about 200 milliseconds and does not repeat the same AQI network work.
+
+Separately force or observe one genuine AQI request failure and confirm it remains retryable and uses the existing error state.
+
 ## Integrity enablement validation
 
 Only after the transition chart succeeds:
@@ -262,8 +292,10 @@ Initial TEST acceptance requires:
 6. correct PM context across the identity transition;
 7. correct hour-ending band rendering;
 8. independent observation and AQI completeness;
-9. historical repair still disabled until deliberately enabled;
-10. no R2 writes caused by chart requests.
+9. authoritative AQI gaps remain blank without a false user-facing warning;
+10. settled partial AQI intervals are reused on later source switches;
+11. historical repair still disabled until deliberately enabled;
+12. no R2 writes caused by chart requests.
 
 ## Rollback validation
 
