@@ -15,8 +15,10 @@ This area governs:
 - the shared canonical R2 v2 connector-day writer and parent finalisers;
 - exact sparse affected-day index finalisation without intervening-range expansion;
 - the active Prune Daily Phase B observation and observation-derived AQI history write pipeline;
+- the 30-minute Prune Daily worker envelope and internal Phase B budget;
 - connector-day observation deletion gates and aggregate whole-day completion gates;
-- Prune Daily-only deletion authority and deletion-time completion-source/count validation;
+- versioned canonical connector-day source identity for deletion authority;
+- Prune Daily-only deletion authority and deletion-time completion-source/count/source-identity validation;
 - physical Parquet identity validation before connector-day deletion gates are completed;
 - observation content hashing and verification-status preservation;
 - targeted v2 index generation and repair gates.
@@ -42,17 +44,20 @@ For Integrity changes, also read:
 - [`lock_environment_boundary.md`](lock_environment_boundary.md) for the authoritative Supabase-project boundary and lock-key inputs;
 - [`implementation_safety_contract.md`](implementation_safety_contract.md) for exact affected-day finalisation, shared-writer compliance, deletion-gate validation and active v2-only AQI enforcement;
 - [`prune_connector_day_gate.md`](prune_connector_day_gate.md) for the Prune Daily-only observation deletion gate;
+- [`prune_connector_source_identity.md`](prune_connector_source_identity.md) where candidate or gate evidence can affect deletion;
 - [`connector_gate_file_identity.md`](connector_gate_file_identity.md) for physical Parquet identity validation used by Prune Daily gate completion and explicit recovery verification;
 - [`daily_profile_selection.md`](daily_profile_selection.md) where scheduled selection is involved.
 
-For Prune Daily Phase B observation/AQI writes and IngestDB deletion safety, also read:
+For Prune Daily Phase B observation/AQI writes and IngestDB deletion safety, read in this order:
 
-- [`history_writer_coordination.md`](history_writer_coordination.md);
-- [`lock_environment_boundary.md`](lock_environment_boundary.md);
-- [`implementation_safety_contract.md`](implementation_safety_contract.md);
-- [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md);
-- [`prune_connector_day_gate.md`](prune_connector_day_gate.md);
-- [`connector_gate_file_identity.md`](connector_gate_file_identity.md).
+1. [`history_writer_coordination.md`](history_writer_coordination.md)
+2. [`lock_environment_boundary.md`](lock_environment_boundary.md)
+3. [`implementation_safety_contract.md`](implementation_safety_contract.md)
+4. [`prune_daily_runtime_budget.md`](prune_daily_runtime_budget.md)
+5. [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md)
+6. [`prune_connector_day_gate.md`](prune_connector_day_gate.md)
+7. [`prune_connector_source_identity.md`](prune_connector_source_identity.md)
+8. [`connector_gate_file_identity.md`](connector_gate_file_identity.md)
 
 For calculated station-chart AQI and website display, also read:
 
@@ -103,7 +108,8 @@ The current observation-content-hash and verification-status contracts are joint
 - [`integrity.md`](integrity.md) for source normalisation, comparison, fault classification, planning, repair and post-repair verification;
 - [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md) for the normal Phase B writer, canonical Parquet schema and manifest publication;
 - [`history_writer_coordination.md`](history_writer_coordination.md) for shared writer ownership and concurrent live mutation;
-- [`implementation_safety_contract.md`](implementation_safety_contract.md) for the requirement that both live mutation paths use the same canonical builders and validators rather than only a common lock wrapper.
+- [`implementation_safety_contract.md`](implementation_safety_contract.md) for the requirement that both live mutation paths use the same canonical builders and validators rather than only a common lock wrapper;
+- [`prune_connector_source_identity.md`](prune_connector_source_identity.md) for the separate connector-day operational source identity used by Prune Daily deletion authority.
 
 Required behaviour includes:
 
@@ -115,7 +121,8 @@ Required behaviour includes:
 - one deterministic `observation_content_hash` exists per non-empty v2 observation pollutant partition;
 - the hash covers every canonical row including `verification_status`;
 - the pollutant manifest contains deterministic status counts;
-- the existing Dropbox manifest/day backup carries the data and hash without a separate hash object.
+- the existing Dropbox manifest/day backup carries the data and hash without a separate hash object;
+- Prune Daily additionally persists a distinct versioned connector-day source hash built from the same canonical row encoder.
 
 ## Shared history writer and lock hierarchy
 
@@ -142,9 +149,25 @@ Required behaviour includes:
 - sparse affected-day sets remain exact and are not expanded into all intervening calendar days;
 - a shared lock wrapper around caller-owned write implementations is not a substitute for one canonical writer implementation.
 
-## Prune deletion gate model
+## Prune Daily runtime budget
 
-The authoritative gate split is defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md). Physical Parquet identity validation is defined in [`connector_gate_file_identity.md`](connector_gate_file_identity.md). Deletion-time evidence requirements are tightened by [`implementation_safety_contract.md`](implementation_safety_contract.md).
+The authoritative runtime envelope is defined in [`prune_daily_runtime_budget.md`](prune_daily_runtime_budget.md).
+
+Required active values are:
+
+```text
+UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN=1740
+UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS=60
+Phase B effective deadline=1680 seconds
+worker hard timeout=30 minutes
+GitHub Actions job timeout=40 minutes
+```
+
+The retired broad variable names are not supported as aliases.
+
+## Prune deletion gate and source identity
+
+The authoritative gate split is defined in [`prune_connector_day_gate.md`](prune_connector_day_gate.md). Physical Parquet identity validation is defined in [`connector_gate_file_identity.md`](connector_gate_file_identity.md). Deletion-time source identity is defined in [`prune_connector_source_identity.md`](prune_connector_source_identity.md). General deletion-time evidence requirements are tightened by [`implementation_safety_contract.md`](implementation_safety_contract.md).
 
 Required behaviour includes:
 
@@ -153,7 +176,10 @@ Required behaviour includes:
 - the existing day gate remains the aggregate whole-day completion gate;
 - a day gate cannot substitute for missing connector-level evidence;
 - only Prune Daily may establish, invalidate or complete connector-day prune gates;
-- deletion authority requires `completion_source=prune_daily_phase_b` and complete valid manifest/count evidence selected and checked at deletion time;
+- deletion authority requires `completion_source=prune_daily_phase_b`, complete valid manifest/count evidence and matching versioned current source identity;
+- current canonical IngestDB identity, candidate identity and gate identity must match immediately before deletion;
+- source revalidation and deletion occur in one PostgreSQL transaction and database session;
+- existing null-identity evidence is ineligible and is reprocessed rather than backfilled;
 - Integrity-created, legacy or adoption gate rows are ineligible for deletion even when `history_done=true`;
 - Integrity, migration and generic shared-writer code never update prune gates;
 - historical R2 connector-days with no corresponding IngestDB rows require no prune gate;
