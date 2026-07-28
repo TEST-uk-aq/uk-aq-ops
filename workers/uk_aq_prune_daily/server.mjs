@@ -1269,6 +1269,123 @@ async function recheckMismatchBuckets(
   };
 }
 
+function connectorDayPlanKey(dayUtc, connectorId) {
+  return `${String(dayUtc).slice(0, 10)}|${Number(connectorId)}`;
+}
+
+function bucketConnectorDayPlanKey(bucket) {
+  return connectorDayPlanKey(toBucketDayUtc(bucket), bucket.connector_id);
+}
+
+async function recheckCompleteConnectorDays(
+  ingestClient,
+  observsClient,
+  initialIngestBuckets,
+  pollutantCodes = null,
+) {
+  const connectorIdsByDay = new Map();
+  for (const bucket of initialIngestBuckets) {
+    const dayUtc = toBucketDayUtc(bucket);
+    if (!connectorIdsByDay.has(dayUtc)) connectorIdsByDay.set(dayUtc, new Set());
+    connectorIdsByDay.get(dayUtc).add(Number(bucket.connector_id));
+  }
+
+  const finalIngestBuckets = [];
+  const finalObservsBuckets = [];
+  for (const [dayUtc, connectorIds] of Array.from(connectorIdsByDay.entries()).sort()) {
+    const windowStart = `${dayUtc}T00:00:00.000Z`;
+    const windowEnd = new Date(Date.parse(windowStart) + DAY_MS).toISOString();
+    const [ingestRows, observsRows] = await Promise.all([
+      fetchHourlyFingerprints(
+        ingestClient,
+        windowStart,
+        windowEnd,
+        "ingest_final_connector_day_recheck",
+        pollutantCodes,
+      ),
+      fetchHourlyFingerprints(
+        observsClient,
+        windowStart,
+        windowEnd,
+        "observs_final_connector_day_recheck",
+        pollutantCodes,
+      ),
+    ]);
+    finalIngestBuckets.push(...ingestRows.filter((row) => connectorIds.has(Number(row.connector_id))));
+    finalObservsBuckets.push(...observsRows.filter((row) => connectorIds.has(Number(row.connector_id))));
+  }
+
+  return {
+    finalIngestBuckets,
+    finalObservsBuckets,
+    ...compareBuckets(finalIngestBuckets, finalObservsBuckets),
+  };
+}
+
+export function buildAtomicConnectorDayDeletionPlan({
+  currentBuckets,
+  eligibleBuckets,
+  unresolvedBuckets = [],
+  gateBlockedBuckets = [],
+  pollutantCodes = null,
+}) {
+  const currentGroups = new Map();
+  for (const bucket of Array.isArray(currentBuckets) ? currentBuckets : []) {
+    const key = bucketConnectorDayPlanKey(bucket);
+    if (!currentGroups.has(key)) currentGroups.set(key, []);
+    currentGroups.get(key).push(bucket);
+  }
+  const eligibleByKey = new Map(
+    (Array.isArray(eligibleBuckets) ? eligibleBuckets : [])
+      .map((bucket) => [buildBucketKey(bucket.connector_id, bucket.hour_start), bucket]),
+  );
+  const unresolvedDays = new Set(
+    (Array.isArray(unresolvedBuckets) ? unresolvedBuckets : []).map(bucketConnectorDayPlanKey),
+  );
+  const gateBlockedDays = new Set(
+    (Array.isArray(gateBlockedBuckets) ? gateBlockedBuckets : []).map(bucketConnectorDayPlanKey),
+  );
+  const hasPollutantSubset = Array.isArray(pollutantCodes) && pollutantCodes.length > 0;
+  const plannedBuckets = [];
+  const blockedBuckets = [];
+  const connectorDays = [];
+
+  for (const [key, group] of Array.from(currentGroups.entries()).sort()) {
+    const eligible = group.filter((bucket) => {
+      const planned = eligibleByKey.get(buildBucketKey(bucket.connector_id, bucket.hour_start));
+      return planned && planned.observation_count === bucket.observation_count;
+    });
+    let failureReason = null;
+    if (hasPollutantSubset) failureReason = "connector_day_scope_mismatch";
+    else if (unresolvedDays.has(key)) failureReason = "connector_day_not_fully_eligible";
+    else if (gateBlockedDays.has(key)) failureReason = "history_not_complete_for_connector_day";
+    else if (eligible.length !== group.length) failureReason = "connector_day_not_fully_eligible";
+
+    const [dayUtc, connectorId] = key.split("|");
+    connectorDays.push({
+      day_utc: dayUtc,
+      connector_id: Number(connectorId),
+      connector_day_current_bucket_count: group.length,
+      connector_day_eligible_bucket_count: eligible.length,
+      connector_day_atomic_delete_planned: failureReason === null,
+      connector_day_atomic_delete_failure_reason: failureReason,
+    });
+    if (!failureReason) {
+      plannedBuckets.push(...group);
+      continue;
+    }
+    blockedBuckets.push(...group.map((bucket) => ({
+      connector_id: bucket.connector_id,
+      hour_start: bucket.hour_start,
+      day_utc: dayUtc,
+      observation_count: bucket.observation_count.toString(),
+      reason: failureReason,
+    })));
+  }
+
+  return { plannedBuckets, blockedBuckets, connectorDays };
+}
+
 export function buildRunConfig(url) {
   const params = url.searchParams;
 
@@ -1553,6 +1670,7 @@ async function deleteBucketsWithConnectorSourceIdentity(
     blockedBuckets,
     totalDeletedRows,
     sourceIdentityInvalidatedConnectorDays,
+    transactionResults,
   };
 }
 
@@ -1751,20 +1869,6 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     };
   }
 
-  const preRepairDeletion = !repairOnlyMode
-    ? await deleteBucketsWithConnectorSourceIdentity(
-      config,
-      runId,
-      gatedDeletableBuckets,
-      deleteEligiblePollutantCodes,
-      "pre_repair",
-    )
-    : { bucketResults: [], errors: [], capWarnings: [], blockedBuckets: [], totalDeletedRows: 0n, sourceIdentityInvalidatedConnectorDays: 0 };
-  const deletedBucketResults = preRepairDeletion.bucketResults;
-  const deleteErrors = preRepairDeletion.errors;
-  const capWarnings = preRepairDeletion.capWarnings;
-  const totalDeletedRows = preRepairDeletion.totalDeletedRows;
-
   const repairReplayResults = [];
   const repairReplayErrors = [];
 
@@ -1804,7 +1908,10 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
 
   let repairedNowDeletableBuckets = [];
   let mismatchesAfterRepair = mismatches;
-  if (repairableMismatches.length > 0) {
+  let finalCurrentBuckets = [];
+  let finalEligibleBuckets = [];
+  let finalObservsBucketCount = 0;
+  if (repairOnlyMode && repairableMismatches.length > 0) {
     const recheckResult = await recheckMismatchBuckets(
       ingestClient,
       observsClient,
@@ -1813,22 +1920,48 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     );
     repairedNowDeletableBuckets = recheckResult.nowDeletableBuckets;
     mismatchesAfterRepair = recheckResult.stillMismatched;
+  } else if (!repairOnlyMode) {
+    const finalRecheck = await recheckCompleteConnectorDays(
+      ingestClient,
+      observsClient,
+      ingestBuckets,
+      deleteEligiblePollutantCodes,
+    );
+    finalCurrentBuckets = finalRecheck.finalIngestBuckets;
+    finalEligibleBuckets = finalRecheck.deletableBuckets;
+    finalObservsBucketCount = finalRecheck.finalObservsBuckets.length;
+    mismatchesAfterRepair = finalRecheck.mismatches;
+    const initiallyMismatchedKeys = new Set(
+      mismatches.map((bucket) => buildBucketKey(bucket.connector_id, bucket.hour_start)),
+    );
+    repairedNowDeletableBuckets = finalEligibleBuckets.filter((bucket) => (
+      initiallyMismatchedKeys.has(buildBucketKey(bucket.connector_id, bucket.hour_start))
+    ));
   }
 
   const postRepairBackupGate = historyGateEnabled
     ? await applyConnectorHistoryGateFilter(
       config,
       runId,
-      repairedNowDeletableBuckets,
-      "post_repair",
+      finalEligibleBuckets,
+      "final_connector_day_plan",
     )
     : {
-      allowedBuckets: repairedNowDeletableBuckets,
+      allowedBuckets: repairOnlyMode ? repairedNowDeletableBuckets : finalEligibleBuckets,
       blockedBuckets: [],
       connectorGateMap: new Map(),
     };
-  const gatedRepairedNowDeletableBuckets = postRepairBackupGate.allowedBuckets;
+  const gatedFinalEligibleBuckets = postRepairBackupGate.allowedBuckets;
   const historyGateBlockedAfterRepairBuckets = postRepairBackupGate.blockedBuckets;
+  const atomicDeletionPlan = repairOnlyMode
+    ? { plannedBuckets: [], blockedBuckets: [], connectorDays: [] }
+    : buildAtomicConnectorDayDeletionPlan({
+      currentBuckets: finalCurrentBuckets,
+      eligibleBuckets: gatedFinalEligibleBuckets,
+      unresolvedBuckets: mismatchesAfterRepair,
+      gateBlockedBuckets: historyGateBlockedAfterRepairBuckets,
+      pollutantCodes: deleteEligiblePollutantCodes,
+    });
 
   for (const mismatch of mismatchesAfterRepair) {
     logStructured("ERROR", "hour_bucket_mismatch_after_repair", {
@@ -1836,7 +1969,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
       ...mismatch,
     });
   }
-  for (const bucket of gatedRepairedNowDeletableBuckets) {
+  for (const bucket of repairedNowDeletableBuckets) {
     logStructured("INFO", "hour_bucket_repaired_and_now_deletable", {
       run_id: runId,
       connector_id: bucket.connector_id,
@@ -1845,19 +1978,44 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     });
   }
 
-  const postRepairDeletion = !repairOnlyMode
+  const finalDeletion = !repairOnlyMode
     ? await deleteBucketsWithConnectorSourceIdentity(
       config,
       runId,
-      gatedRepairedNowDeletableBuckets,
+      atomicDeletionPlan.plannedBuckets,
       deleteEligiblePollutantCodes,
-      "post_repair",
+      "final_connector_day_atomic_delete",
     )
-    : { bucketResults: [], errors: [], capWarnings: [], blockedBuckets: [], totalDeletedRows: 0n, sourceIdentityInvalidatedConnectorDays: 0 };
-  const deletedAfterRepairBucketResults = postRepairDeletion.bucketResults;
-  const deleteAfterRepairErrors = postRepairDeletion.errors;
-  const capAfterRepairWarnings = postRepairDeletion.capWarnings;
-  const totalDeletedAfterRepairRows = postRepairDeletion.totalDeletedRows;
+    : {
+      bucketResults: [],
+      errors: [],
+      capWarnings: [],
+      blockedBuckets: [],
+      totalDeletedRows: 0n,
+      sourceIdentityInvalidatedConnectorDays: 0,
+      transactionResults: [],
+    };
+  const deletedBucketResults = finalDeletion.bucketResults;
+  const deleteErrors = finalDeletion.errors;
+  const capWarnings = finalDeletion.capWarnings;
+  const totalDeletedRows = finalDeletion.totalDeletedRows;
+  const initiallyMismatchedKeys = new Set(
+    mismatches.map((bucket) => buildBucketKey(bucket.connector_id, bucket.hour_start)),
+  );
+  const deletedAfterRepairBucketResults = deletedBucketResults.filter((bucket) => (
+    initiallyMismatchedKeys.has(buildBucketKey(bucket.connector_id, bucket.hour_start))
+  ));
+  const totalDeletedAfterRepairRows = deletedAfterRepairBucketResults.reduce(
+    (total, bucket) => total + BigInt(bucket.deleted_rows),
+    0n,
+  );
+  const deleteAfterRepairErrors = deleteErrors.filter((error) => (
+    mismatches.some((bucket) => (
+      toBucketDayUtc(bucket) === error.day_utc
+      && Number(bucket.connector_id) === Number(error.connector_id)
+    ))
+  ));
+  const capAfterRepairWarnings = [];
 
   const finalMismatchCount = mismatchesAfterRepair.length;
   const totalRowsSelectedForRepair = repairReplayResults.reduce(
@@ -1882,9 +2040,14 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     repair_rows_replayed_total: totalRowsReplayedForRepair.toString(),
     repair_receipts_upserted_total: totalReceiptsUpsertedForRepair.toString(),
     mismatch_after_repair_count: finalMismatchCount,
-    repaired_now_deletable_bucket_count: gatedRepairedNowDeletableBuckets.length,
+    repaired_now_deletable_bucket_count: repairedNowDeletableBuckets.length,
     repaired_now_deletable_bucket_count_before_history_gate: repairedNowDeletableBuckets.length,
-    connector_history_gate_allowed_after_repair_bucket_count: gatedRepairedNowDeletableBuckets.length,
+    connector_history_gate_allowed_after_repair_bucket_count: repairedNowDeletableBuckets.filter((bucket) => (
+      gatedFinalEligibleBuckets.some((allowed) => (
+        buildBucketKey(allowed.connector_id, allowed.hour_start)
+          === buildBucketKey(bucket.connector_id, bucket.hour_start)
+      ))
+    )).length,
     connector_history_gate_blocked_after_repair_bucket_count: historyGateBlockedAfterRepairBuckets.length,
     deleted_bucket_count: deletedBucketResults.length,
     total_deleted_rows: totalDeletedRows.toString(),
@@ -1895,21 +2058,27 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     delete_after_repair_error_count: deleteAfterRepairErrors.length,
     cap_after_repair_warning_count: capAfterRepairWarnings.length,
     source_identity_blocked_bucket_count:
-      preRepairDeletion.blockedBuckets.length + postRepairDeletion.blockedBuckets.length,
+      finalDeletion.blockedBuckets.length,
     source_identity_invalidated_connector_days:
-      preRepairDeletion.sourceIdentityInvalidatedConnectorDays
-      + postRepairDeletion.sourceIdentityInvalidatedConnectorDays,
+      finalDeletion.sourceIdentityInvalidatedConnectorDays,
+    final_connector_day_ingest_bucket_count: finalCurrentBuckets.length,
+    final_connector_day_observs_bucket_count: finalObservsBucketCount,
+    connector_day_atomic_delete_planned_count: atomicDeletionPlan.connectorDays.filter(
+      (row) => row.connector_day_atomic_delete_planned,
+    ).length,
+    connector_day_atomic_delete_committed_count: finalDeletion.transactionResults.filter(
+      (row) => row.diagnostics.connector_day_atomic_delete_committed,
+    ).length,
+    connector_day_atomic_delete_rolled_back_count: finalDeletion.transactionResults.filter(
+      (row) => row.diagnostics.connector_day_atomic_delete_rolled_back,
+    ).length,
+    connector_day_atomic_delete_blocked_bucket_count: atomicDeletionPlan.blockedBuckets.length,
     alert_condition_count:
       finalMismatchCount +
       deleteErrors.length +
-      capWarnings.length +
       repairReplayErrors.length +
-      deleteAfterRepairErrors.length +
-      capAfterRepairWarnings.length +
-      historyGateBlockedBuckets.length +
-      historyGateBlockedAfterRepairBuckets.length +
-      preRepairDeletion.blockedBuckets.length +
-      postRepairDeletion.blockedBuckets.length,
+      atomicDeletionPlan.blockedBuckets.length +
+      finalDeletion.blockedBuckets.length,
     deleted_buckets_preview: sampleRows(deletedBucketResults),
     deleted_after_repair_buckets_preview: sampleRows(deletedAfterRepairBucketResults),
     mismatches_before_repair_preview: sampleRows(mismatches),
@@ -1922,9 +2091,15 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     delete_after_repair_errors_preview: sampleRows(deleteAfterRepairErrors),
     cap_after_repair_warnings_preview: sampleRows(capAfterRepairWarnings),
     source_identity_blocked_buckets_preview: sampleRows([
-      ...preRepairDeletion.blockedBuckets,
-      ...postRepairDeletion.blockedBuckets,
+      ...atomicDeletionPlan.blockedBuckets,
+      ...finalDeletion.blockedBuckets,
     ]),
+    connector_day_atomic_delete_plan_preview: sampleRows(atomicDeletionPlan.connectorDays),
+    connector_day_atomic_delete_result_preview: sampleRows(finalDeletion.transactionResults.map((row) => ({
+      day_utc: row.day_utc,
+      connector_id: row.connector_id,
+      ...row.diagnostics,
+    }))),
   };
   logStructured(
     "INFO",
@@ -2097,15 +2272,28 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
     ingestBuckets,
     "late_arrival_direct_delete",
   );
+  const atomicDeletionPlan = buildAtomicConnectorDayDeletionPlan({
+    currentBuckets: ingestBuckets,
+    eligibleBuckets: directDeleteGate.allowedBuckets,
+    gateBlockedBuckets: directDeleteGate.blockedBuckets,
+    pollutantCodes: deleteEligiblePollutantCodes,
+  });
   const directDeletion = !config.dryRun
     ? await deleteBucketsWithConnectorSourceIdentity(
       config,
       runId,
-      directDeleteGate.allowedBuckets,
+      atomicDeletionPlan.plannedBuckets,
       deleteEligiblePollutantCodes,
-      "late_arrival_direct_delete",
+      "late_arrival_final_connector_day_atomic_delete",
     )
-    : { bucketResults: [], errors: [], blockedBuckets: [], totalDeletedRows: 0n, sourceIdentityInvalidatedConnectorDays: 0 };
+    : {
+      bucketResults: [],
+      errors: [],
+      blockedBuckets: [],
+      totalDeletedRows: 0n,
+      sourceIdentityInvalidatedConnectorDays: 0,
+      transactionResults: [],
+    };
   const deletedBucketResults = directDeletion.bucketResults;
   const deleteErrors = directDeletion.errors;
   const totalDeletedRows = directDeletion.totalDeletedRows;
@@ -2125,19 +2313,33 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
     total_deleted_rows: totalDeletedRows.toString(),
     delete_error_count: deleteErrors.length,
     connector_history_gate_blocked_bucket_count: directDeleteGate.blockedBuckets.length,
-    source_identity_blocked_bucket_count: directDeletion.blockedBuckets.length,
+    source_identity_blocked_bucket_count:
+      atomicDeletionPlan.blockedBuckets.length + directDeletion.blockedBuckets.length,
     source_identity_invalidated_connector_days:
       directDeletion.sourceIdentityInvalidatedConnectorDays,
+    connector_day_atomic_delete_planned_count: atomicDeletionPlan.connectorDays.filter(
+      (row) => row.connector_day_atomic_delete_planned,
+    ).length,
+    connector_day_atomic_delete_committed_count: directDeletion.transactionResults.filter(
+      (row) => row.diagnostics.connector_day_atomic_delete_committed,
+    ).length,
+    connector_day_atomic_delete_rolled_back_count: directDeletion.transactionResults.filter(
+      (row) => row.diagnostics.connector_day_atomic_delete_rolled_back,
+    ).length,
     alert_condition_count:
       deleteErrors.length
-      + directDeleteGate.blockedBuckets.length
+      + atomicDeletionPlan.blockedBuckets.length
       + directDeletion.blockedBuckets.length,
     skipped: false,
     reason: "older_than_obs_aqidb_retention_cutoff",
     deleted_buckets_preview: sampleRows(deletedBucketResults),
     delete_errors_preview: sampleRows(deleteErrors),
     connector_history_gate_blocked_buckets_preview: sampleRows(directDeleteGate.blockedBuckets),
-    source_identity_blocked_buckets_preview: sampleRows(directDeletion.blockedBuckets),
+    source_identity_blocked_buckets_preview: sampleRows([
+      ...atomicDeletionPlan.blockedBuckets,
+      ...directDeletion.blockedBuckets,
+    ]),
+    connector_day_atomic_delete_plan_preview: sampleRows(atomicDeletionPlan.connectorDays),
   };
   logStructured("INFO", "ingestdb_late_arrival_direct_delete_summary", summary);
   return summary;

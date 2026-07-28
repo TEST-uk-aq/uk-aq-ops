@@ -24,50 +24,26 @@ function normalizePair(dayUtcInput, connectorIdInput) {
   ) {
     throw new Error("Invalid connector-day deletion identity");
   }
-  return {
-    dayUtc,
-    connectorId,
-    dayStart: dayStart.toISOString(),
-    dayEnd: new Date(dayStart.getTime() + 24 * HOUR_MS).toISOString(),
-  };
-}
-
-function normalizeBucket(pair, bucket) {
-  const connectorId = Number(bucket?.connector_id);
-  const hourStart = new Date(String(bucket?.hour_start || ""));
-  const observationCount = BigInt(bucket?.observation_count ?? -1);
-  if (
-    connectorId !== pair.connectorId
-    || Number.isNaN(hourStart.getTime())
-    || hourStart.toISOString() !== String(bucket?.hour_start || "")
-    || hourStart.toISOString().slice(0, 10) !== pair.dayUtc
-    || hourStart.getUTCMinutes() !== 0
-    || hourStart.getUTCSeconds() !== 0
-    || hourStart.getUTCMilliseconds() !== 0
-    || observationCount < 0n
-  ) {
-    throw new Error("Invalid connector-day deletion bucket");
-  }
-  return {
-    ...bucket,
-    connector_id: connectorId,
-    hour_start: hourStart.toISOString(),
-    observation_count: observationCount,
-  };
+  return { dayUtc, connectorId, dayStart: dayStart.toISOString() };
 }
 
 function groupBucketsByConnectorDay(buckets) {
   const groups = new Map();
   for (const bucket of Array.isArray(buckets) ? buckets : []) {
     const pair = normalizePair(String(bucket?.hour_start || "").slice(0, 10), bucket?.connector_id);
-    const normalized = normalizeBucket(pair, bucket);
+    const hourStart = new Date(String(bucket?.hour_start || ""));
+    if (
+      Number.isNaN(hourStart.getTime())
+      || hourStart.toISOString() !== String(bucket.hour_start)
+      || hourStart.toISOString().slice(0, 10) !== pair.dayUtc
+    ) {
+      throw new Error(`Invalid deletion hour_start: ${String(bucket?.hour_start || "")}`);
+    }
     const key = `${pair.dayUtc}|${pair.connectorId}`;
     if (!groups.has(key)) groups.set(key, { ...pair, buckets: [] });
-    groups.get(key).buckets.push(normalized);
+    groups.get(key).buckets.push(bucket);
   }
-  return Array.from(groups.values()).sort((left, right) => (
-    left.dayUtc.localeCompare(right.dayUtc) || left.connectorId - right.connectorId
-  ));
+  return Array.from(groups.values());
 }
 
 function identityPresent(row) {
@@ -139,11 +115,6 @@ function blockedResult({
   failureReason,
   invalidated = false,
   currentIdentity = null,
-  sourceIdentityMatch = false,
-  rolledBack = false,
-  currentBucketCount = null,
-  eligibleBucketCount = null,
-  remainingSnapshotRows = null,
 }) {
   return {
     ok: false,
@@ -159,22 +130,12 @@ function blockedResult({
     })),
     diagnostics: {
       source_identity_contract_version: PRUNE_CONNECTOR_SOURCE_CONTENT_HASH_CONTRACT_VERSION,
-      source_identity_match: sourceIdentityMatch,
+      source_identity_match: false,
       source_identity_failure_reason: failureReason,
       source_identity_rows: currentIdentity?.source_content_hash_row_count ?? null,
       candidate_source_identity_present: identityPresent(candidate),
       gate_source_identity_present: identityPresent(gate),
       source_identity_invalidated_connector_days: invalidated ? 1 : 0,
-      connector_day_atomic_delete_planned: true,
-      connector_day_atomic_delete_committed: false,
-      connector_day_atomic_delete_rolled_back: rolledBack,
-      connector_day_atomic_delete_failure_reason: failureReason,
-      connector_day_current_bucket_count: currentBucketCount,
-      connector_day_eligible_bucket_count: eligibleBucketCount ?? buckets.length,
-      connector_day_committed_deleted_rows: "0",
-      connector_day_remaining_snapshot_rows: remainingSnapshotRows === null
-        ? null
-        : String(remainingSnapshotRows),
     },
   };
 }
@@ -207,6 +168,7 @@ for update
 }
 
 async function readCurrentCanonicalRows(client, pair) {
+  const dayEnd = new Date(Date.parse(pair.dayStart) + 24 * HOUR_MS).toISOString();
   const result = await client.query(
     `
 select
@@ -225,67 +187,16 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   null::timestamptz
 )
 `,
-    [pair.connectorId, pair.dayStart, pair.dayEnd],
+    [pair.connectorId, pair.dayStart, dayEnd],
   );
   return result.rows;
 }
 
-async function readRemainingCanonicalRowCount(client, pair, windowStart, windowEnd) {
-  const result = await client.query(
-    `
-select count(*)::bigint as remaining_count
-from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
-  $1::integer,
-  $2::timestamptz,
-  $3::timestamptz,
-  null::integer,
-  null::timestamptz
-)
-`,
-    [pair.connectorId, windowStart, windowEnd],
-  );
-  return BigInt(result.rows[0]?.remaining_count ?? 0);
-}
-
-function currentHourCounts(rows) {
-  const counts = new Map();
-  for (const row of rows) {
-    const observedAt = new Date(row?.observed_at_utc ?? row?.observed_at);
-    if (Number.isNaN(observedAt.getTime())) throw new Error("Invalid current canonical timestamp");
-    observedAt.setUTCMinutes(0, 0, 0);
-    const hourStart = observedAt.toISOString();
-    counts.set(hourStart, (counts.get(hourStart) || 0n) + 1n);
-  }
-  return counts;
-}
-
-function deletionPlanCoversCurrentConnectorDay(pair, buckets, currentRows) {
-  const normalizedBuckets = buckets.map((bucket) => normalizeBucket(pair, bucket));
-  const plannedByHour = new Map();
-  let duplicateHour = false;
-  for (const bucket of normalizedBuckets) {
-    if (plannedByHour.has(bucket.hour_start)) duplicateHour = true;
-    plannedByHour.set(bucket.hour_start, bucket);
-  }
-  const currentByHour = currentHourCounts(currentRows);
-  const exactCoverage = !duplicateHour
-    && plannedByHour.size === currentByHour.size
-    && Array.from(currentByHour.entries()).every(([hourStart, count]) => (
-      plannedByHour.get(hourStart)?.observation_count === count
-    ));
-  return {
-    exactCoverage,
-    currentBucketCount: currentByHour.size,
-    eligibleBucketCount: plannedByHour.size,
-    buckets: Array.from(plannedByHour.values()).sort((left, right) => (
-      left.hour_start.localeCompare(right.hour_start)
-    )),
-  };
-}
-
-async function deleteOneHour(client, pair, bucket, deleteBatchSize, maxDeleteBatchesPerHour) {
+async function deleteOneHour(client, pair, bucket, deleteBatchSize, maxDeleteBatchesPerHour, pollutantCodes) {
   let totalDeleted = 0n;
   let batchesRun = 0;
+  let drained = false;
+  let lastDeleted = 0;
   for (let batchNumber = 1; batchNumber <= maxDeleteBatchesPerHour; batchNumber += 1) {
     batchesRun = batchNumber;
     const result = await client.query(
@@ -296,6 +207,18 @@ with target_rows as (
   where o.connector_id = $1::integer
     and o.observed_at >= $2::timestamptz
     and o.observed_at < $2::timestamptz + interval '1 hour'
+    and (
+      $4::text[] is null
+      or exists (
+        select 1
+        from uk_aq_core.timeseries ts
+        join uk_aq_core.phenomena p on p.id = ts.phenomenon_id
+        join uk_aq_core.observed_properties op on op.id = p.observed_property_id
+        where ts.id = o.timeseries_id
+          and ts.connector_id = o.connector_id
+          and lower(op.code) = any($4::text[])
+      )
+    )
   limit $3::integer
 ),
 deleted as (
@@ -306,28 +229,22 @@ deleted as (
 )
 select count(*)::integer as deleted_count from deleted
 `,
-      [pair.connectorId, bucket.hour_start, deleteBatchSize],
+      [pair.connectorId, bucket.hour_start, deleteBatchSize, pollutantCodes],
     );
-    const deletedCount = Number(result.rows[0]?.deleted_count || 0);
-    totalDeleted += BigInt(deletedCount);
-    if (deletedCount === 0) break;
+    lastDeleted = Number(result.rows[0]?.deleted_count || 0);
+    if (lastDeleted === 0) {
+      drained = true;
+      break;
+    }
+    totalDeleted += BigInt(lastDeleted);
   }
-  const hourEnd = new Date(Date.parse(bucket.hour_start) + HOUR_MS).toISOString();
-  const remainingRows = await readRemainingCanonicalRowCount(
-    client,
-    pair,
-    bucket.hour_start,
-    hourEnd,
-  );
   return {
     connector_id: bucket.connector_id,
     hour_start: bucket.hour_start,
     deleted_rows: totalDeleted,
     batches_run: batchesRun,
-    drained: remainingRows === 0n,
-    remaining_snapshot_rows: remainingRows,
-    max_batches_reached_with_remaining_rows:
-      batchesRun >= maxDeleteBatchesPerHour && remainingRows > 0n,
+    drained,
+    max_batches_reached_with_remaining_rows: !drained && lastDeleted > 0,
   };
 }
 
@@ -341,13 +258,10 @@ export async function runPruneConnectorDayDeletionTransaction({
   pollutantCodes = null,
 }) {
   const pair = normalizePair(dayUtc, connectorId);
-  const requestedBuckets = (Array.isArray(buckets) ? buckets : [])
-    .map((bucket) => normalizeBucket(pair, bucket));
   let transactionStarted = false;
   let transactionCandidate = null;
   let transactionGate = null;
   let transactionCurrentIdentity = null;
-  let currentBucketCount = null;
   try {
     await client.query("begin isolation level repeatable read");
     transactionStarted = true;
@@ -355,25 +269,26 @@ export async function runPruneConnectorDayDeletionTransaction({
     transactionCandidate = candidate;
     transactionGate = gate;
     let candidateIdentity;
+    let gateIdentity;
     let failureReason = null;
     try {
       if (candidate?.status !== "complete" || !isValidConnectorHistoryGateEvidence(gate)) {
         throw new TypeError("source_identity_missing");
       }
       candidateIdentity = normalizePruneConnectorSourceIdentity(candidate);
-      const gateIdentity = normalizePruneConnectorSourceIdentity(gate);
+      gateIdentity = normalizePruneConnectorSourceIdentity(gate);
       const candidateGateComparison = comparePruneConnectorSourceIdentities(candidateIdentity, gateIdentity);
       if (!candidateGateComparison.match) failureReason = candidateGateComparison.failure_reason;
     } catch (error) {
       failureReason = pruneConnectorSourceIdentityFailureReason(error);
     }
 
-    let currentRows = [];
     let currentIdentity = null;
     if (!failureReason) {
       try {
-        currentRows = await readCurrentCanonicalRows(client, pair);
-        currentIdentity = computePruneConnectorSourceIdentity(currentRows);
+        currentIdentity = computePruneConnectorSourceIdentity(
+          await readCurrentCanonicalRows(client, pair),
+        );
         transactionCurrentIdentity = currentIdentity;
         const currentComparison = comparePruneConnectorSourceIdentities(currentIdentity, candidateIdentity);
         if (!currentComparison.match) failureReason = currentComparison.failure_reason;
@@ -388,7 +303,7 @@ export async function runPruneConnectorDayDeletionTransaction({
       transactionStarted = false;
       return blockedResult({
         pair,
-        buckets: requestedBuckets,
+        buckets,
         candidate,
         gate,
         failureReason,
@@ -397,89 +312,19 @@ export async function runPruneConnectorDayDeletionTransaction({
       });
     }
 
-    const coverage = deletionPlanCoversCurrentConnectorDay(pair, requestedBuckets, currentRows);
-    currentBucketCount = coverage.currentBucketCount;
-    const hasPollutantSubset = Array.isArray(pollutantCodes) && pollutantCodes.length > 0;
-    if (hasPollutantSubset || !coverage.exactCoverage) {
-      const scopeFailure = hasPollutantSubset
-        ? "connector_day_scope_mismatch"
-        : "connector_day_not_fully_eligible";
-      await client.query("rollback");
-      transactionStarted = false;
-      return blockedResult({
-        pair,
-        buckets: requestedBuckets,
-        candidate,
-        gate,
-        failureReason: scopeFailure,
-        sourceIdentityMatch: true,
-        rolledBack: true,
-        currentIdentity,
-        currentBucketCount: coverage.currentBucketCount,
-        eligibleBucketCount: coverage.eligibleBucketCount,
-        remainingSnapshotRows: currentRows.length,
-      });
-    }
-
     const bucketResults = [];
-    for (const bucket of coverage.buckets) {
-      const bucketResult = await deleteOneHour(
+    for (const bucket of buckets) {
+      bucketResults.push(await deleteOneHour(
         client,
         pair,
         bucket,
         deleteBatchSize,
         maxDeleteBatchesPerHour,
-      );
-      bucketResults.push(bucketResult);
-      if (bucketResult.max_batches_reached_with_remaining_rows) {
-        await client.query("rollback");
-        transactionStarted = false;
-        return blockedResult({
-          pair,
-          buckets: requestedBuckets,
-          candidate,
-          gate,
-          failureReason: "connector_day_delete_cap_reached",
-          sourceIdentityMatch: true,
-          rolledBack: true,
-          currentIdentity,
-          currentBucketCount: coverage.currentBucketCount,
-          eligibleBucketCount: coverage.eligibleBucketCount,
-          remainingSnapshotRows: bucketResult.remaining_snapshot_rows,
-        });
-      }
+        pollutantCodes,
+      ));
     }
-
-    const remainingSnapshotRows = await readRemainingCanonicalRowCount(
-      client,
-      pair,
-      pair.dayStart,
-      pair.dayEnd,
-    );
-    if (remainingSnapshotRows !== 0n) {
-      await client.query("rollback");
-      transactionStarted = false;
-      return blockedResult({
-        pair,
-        buckets: requestedBuckets,
-        candidate,
-        gate,
-        failureReason: "connector_day_not_fully_drained",
-        sourceIdentityMatch: true,
-        rolledBack: true,
-        currentIdentity,
-        currentBucketCount: coverage.currentBucketCount,
-        eligibleBucketCount: coverage.eligibleBucketCount,
-        remainingSnapshotRows,
-      });
-    }
-
     await client.query("commit");
     transactionStarted = false;
-    const committedDeletedRows = bucketResults.reduce(
-      (total, result) => total + result.deleted_rows,
-      0n,
-    );
     return {
       ok: true,
       day_utc: pair.dayUtc,
@@ -495,14 +340,6 @@ export async function runPruneConnectorDayDeletionTransaction({
         gate_source_identity_present: true,
         source_identity_invalidated_connector_days: 0,
         source_content_hash: currentIdentity.source_content_hash,
-        connector_day_atomic_delete_planned: true,
-        connector_day_atomic_delete_committed: true,
-        connector_day_atomic_delete_rolled_back: false,
-        connector_day_atomic_delete_failure_reason: null,
-        connector_day_current_bucket_count: coverage.currentBucketCount,
-        connector_day_eligible_bucket_count: coverage.eligibleBucketCount,
-        connector_day_committed_deleted_rows: committedDeletedRows.toString(),
-        connector_day_remaining_snapshot_rows: "0",
       },
     };
   } catch (error) {
@@ -516,15 +353,12 @@ export async function runPruneConnectorDayDeletionTransaction({
     if (TRANSACTION_CONFLICT_CODES.has(String(error?.code || ""))) {
       return blockedResult({
         pair,
-        buckets: requestedBuckets,
+        buckets,
         candidate: transactionCandidate,
         gate: transactionGate,
         failureReason: "source_identity_transaction_conflict",
         invalidated: false,
         currentIdentity: transactionCurrentIdentity,
-        sourceIdentityMatch: Boolean(transactionCurrentIdentity),
-        rolledBack: true,
-        currentBucketCount,
       });
     }
     throw error;
