@@ -17,7 +17,7 @@ The canonical logical identities are now database-local and fixed:
 
 Environment labels remain optional diagnostic metadata only. TEST/LIVE separation is supplied by their different Supabase PostgreSQL projects and advisory-lock managers.
 
-Prune Daily and real Integrity mutation retain one direct PostgreSQL session for the complete protected section. They use the existing `SUPABASE_DB_URL` route, with `DATABASE_URL` retained as the existing fallback. No PostgREST/RPC lock-acquire and lock-release split is used.
+Prune Daily and real Integrity mutation retain one direct PostgreSQL session for the complete protected section. Prune Daily uses the explicit `SUPABASE_DB_URL` route without a generic database-URL fallback. No PostgREST/RPC lock-acquire and lock-release split is used.
 
 ## Phase completion
 
@@ -153,3 +153,17 @@ Use the plan's Phase 11 checks after review and deployment:
 No implementation choice remains unresolved. The primary remaining risk is operational and is intentionally deferred to TEST: lock contention, parent preservation and the separated AQI/chart failure paths have not yet been exercised against real services.
 
 Per repository policy, active `system_docs/` were not edited. Chat mode should align implementation ownership/workflow references for the new shared writer and `ops.chart_metrics` task. The R2 history README/coordination documents also reference a missing `timeseries_binding_contract.md`; the available active contract is `system_docs/r2_history/contract.md`. This link discrepancy did not change the implemented contract but should be corrected by the documentation owner.
+
+## Connector-day source-identity hardening (2026-07-28)
+
+Prune Daily Phase B now uses the clean budget-variable names `UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN` and `UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS`. Their defaults remain 1,740 and 60 seconds, producing the existing 1,680-second effective deadline; the 30-minute worker and 40-minute GitHub job limits are unchanged.
+
+The companion TEST schema change `20260728_001_ingest_prune_connector_source_identity.sql` adds nullable source hash, contract-version and row-count evidence to `uk_aq_ops.history_candidates` and `uk_aq_ops.prune_connector_day_gates`, with all-null/all-populated and value constraints. Existing rows are deliberately not backfilled and therefore fail closed until canonical reprocessing.
+
+Source identity contract v1 hashes the sorted canonical seven-field observation-row encoding with the dedicated `uk-aq-prune-connector-source-content-hash:v1` domain prefix. Phase B derives it from the exact frozen rows written to R2 and persists identical evidence on the candidate and Prune-owned connector gate in one transaction after observation verification/index work. Non-complete work clears the evidence. Candidate discovery revalidates every retained complete candidate against fresh canonical rows, so value-only and verification-status-only source changes invalidate only that connector-day.
+
+All normal pre-repair, post-repair and late-arrival observation deletion now uses the same direct `SUPABASE_DB_URL` transaction helper. For each connector-day it begins `REPEATABLE READ`, locks candidate and gate rows, reads current canonical rows on the same retained session, requires current/candidate/gate identity equality, and deletes selected buckets before commit. Mismatch or malformed evidence invalidates the exact candidate/gate and retains observations. Serialization/deadlock conflict rolls back without a weaker-isolation retry. No R2, Dropbox, ObsAQIDB or HTTP adapter is called inside the transaction.
+
+Focused structural checks cover value/status sensitivity, order independence, canonical zero handling, empty evidence, legacy/malformed gate evidence, candidate revalidation, identical completion evidence, repeatable-read deletion ordering, mismatch no-delete and conflict rollback. Real TEST validation remains deferred until both TEST repositories are deployed: mutate one value and one verification status, observe fail-closed invalidation/no deletion, allow reprocessing, confirm identical renewed evidence, and then confirm same-transaction deletion while another connector remains unaffected. No real database, R2, Dropbox, Prune, deployment or LIVE operation was performed for this change.
+
+Validation completed with syntax checks for all changed/new runtime modules, 58 passing focused Node tests (including the existing physical-identity coverage), three passing schema structural tests, and `git diff --check` in both repositories. The schema migration was not applied and functional success is not claimed from these structural checks.

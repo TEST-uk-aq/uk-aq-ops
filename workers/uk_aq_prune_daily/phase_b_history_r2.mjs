@@ -52,6 +52,12 @@ import {
   setConnectorDayGateIncomplete,
 } from "../shared/uk_aq_connector_day_gate.mjs";
 import {
+  comparePruneConnectorSourceIdentities,
+  computePruneConnectorSourceIdentity,
+  normalizePruneConnectorSourceIdentity,
+  pruneConnectorSourceIdentityFailureReason,
+} from "../shared/uk_aq_prune_connector_source_identity.mjs";
+import {
   mergeConnectorManifestReferences,
   readParentManifestForBoundedRecovery,
   runCanonicalDayFinalizer,
@@ -1230,6 +1236,15 @@ function toConnectorDayRow(row) {
     history_total_bytes: row.history_total_bytes === null || row.history_total_bytes === undefined
       ? null
       : parseBigInt(row.history_total_bytes, "history_total_bytes"),
+    source_content_hash: row.source_content_hash ? String(row.source_content_hash) : null,
+    source_content_hash_contract_version:
+      row.source_content_hash_contract_version === null || row.source_content_hash_contract_version === undefined
+        ? null
+        : Number(row.source_content_hash_contract_version),
+    source_content_hash_row_count:
+      row.source_content_hash_row_count === null || row.source_content_hash_row_count === undefined
+        ? null
+        : parseBigInt(row.source_content_hash_row_count, "source_content_hash_row_count"),
     resume_last_timeseries_id: row.resume_last_timeseries_id === null || row.resume_last_timeseries_id === undefined
       ? null
       : Number(row.resume_last_timeseries_id),
@@ -1244,6 +1259,170 @@ function toConnectorDayRow(row) {
       : parseBigInt(row.resume_exported_row_count, "resume_exported_row_count"),
     resume_parts: parseResumeParts(row.resume_parts_json),
   };
+}
+
+async function readCanonicalConnectorDaySourceRows(client, dayUtc, connectorId) {
+  const dayStart = `${dayUtc}T00:00:00.000Z`;
+  const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
+  const result = await client.query(
+    `
+select
+  connector_id,
+  station_id,
+  timeseries_id,
+  pollutant_code,
+  observed_at_utc,
+  value,
+  status
+from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
+  $1::integer,
+  $2::timestamptz,
+  $3::timestamptz,
+  null::integer,
+  null::timestamptz
+)
+`,
+    [connectorId, dayStart, dayEnd],
+  );
+  return result.rows;
+}
+
+async function invalidateCandidateAndConnectorGateSourceIdentity(
+  client,
+  candidate,
+  failureReason,
+) {
+  await client.query(
+    `
+update uk_aq_ops.history_candidates
+set
+  status = 'pending',
+  run_id = null,
+  last_error = $3,
+  manifest_key = null,
+  history_row_count = null,
+  history_file_count = null,
+  history_total_bytes = null,
+  history_completed_at = null,
+  source_content_hash = null,
+  source_content_hash_contract_version = null,
+  source_content_hash_row_count = null,
+  resume_last_timeseries_id = null,
+  resume_last_observed_at = null,
+  resume_part_index = 0,
+  resume_exported_row_count = 0,
+  resume_parts_json = '[]'::jsonb,
+  updated_at = now()
+where day_utc = $1::date
+  and connector_id = $2::integer
+  and status = 'complete'
+`,
+    [candidate.day_utc, candidate.connector_id, failureReason],
+  );
+  await setConnectorDayGateIncomplete(client, {
+    day_utc: candidate.day_utc,
+    connector_id: candidate.connector_id,
+  });
+}
+
+async function revalidateCompleteCandidateSourceIdentity(client, candidate) {
+  if (candidate.status !== "complete") return candidate;
+  await client.query("begin isolation level repeatable read");
+  try {
+    const locked = await client.query(
+      `
+select *
+from uk_aq_ops.history_candidates
+where day_utc = $1::date
+  and connector_id = $2::integer
+for update
+`,
+      [candidate.day_utc, candidate.connector_id],
+    );
+    const currentCandidate = locked.rows[0] ? toConnectorDayRow(locked.rows[0]) : candidate;
+    if (currentCandidate.status !== "complete") {
+      await client.query("commit");
+      return currentCandidate;
+    }
+    let currentIdentity;
+    let failureReason = null;
+    try {
+      currentIdentity = computePruneConnectorSourceIdentity(
+        await readCanonicalConnectorDaySourceRows(
+          client,
+          currentCandidate.day_utc,
+          currentCandidate.connector_id,
+        ),
+      );
+    } catch (error) {
+      failureReason = pruneConnectorSourceIdentityFailureReason(error);
+    }
+    if (!failureReason) {
+      try {
+        const persistedIdentity = normalizePruneConnectorSourceIdentity(currentCandidate);
+        const comparison = comparePruneConnectorSourceIdentities(
+          persistedIdentity,
+          currentIdentity,
+        );
+        if (!comparison.match) failureReason = comparison.failure_reason;
+      } catch (error) {
+        failureReason = pruneConnectorSourceIdentityFailureReason(error);
+      }
+    }
+    if (failureReason) {
+      await invalidateCandidateAndConnectorGateSourceIdentity(
+        client,
+        currentCandidate,
+        failureReason,
+      );
+      await client.query("commit");
+      return {
+        ...currentCandidate,
+        status: "pending",
+        run_id: null,
+        manifest_key: null,
+        history_row_count: null,
+        history_file_count: null,
+        history_total_bytes: null,
+        source_content_hash: null,
+        source_content_hash_contract_version: null,
+        source_content_hash_row_count: null,
+        source_changed_connector_gate_invalidated: true,
+        source_identity_match: false,
+        source_identity_failure_reason: failureReason,
+        source_identity_rows: currentIdentity?.source_content_hash_row_count ?? null,
+        candidate_source_identity_present: Boolean(
+          currentCandidate.source_content_hash
+          && currentCandidate.source_content_hash_contract_version !== null
+          && currentCandidate.source_content_hash_row_count !== null
+        ),
+        gate_source_identity_present: null,
+        source_identity_invalidated_connector_days: 1,
+        source_change_invalidation: {
+          day_utc: currentCandidate.day_utc,
+          connector_id: currentCandidate.connector_id,
+          source_identity_failure_reason: failureReason,
+        },
+      };
+    }
+    await client.query("commit");
+    return {
+      ...currentCandidate,
+      source_identity_match: true,
+      source_identity_failure_reason: null,
+      source_identity_rows: currentIdentity.source_content_hash_row_count,
+      candidate_source_identity_present: true,
+      gate_source_identity_present: null,
+      source_identity_invalidated_connector_days: 0,
+    };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  }
+}
+
+export async function revalidateCompleteCandidateSourceIdentityForTest(client, candidate) {
+  return revalidateCompleteCandidateSourceIdentity(client, candidate);
 }
 
 
@@ -1319,6 +1498,9 @@ upserted as (
     history_file_count,
     history_total_bytes,
     history_completed_at,
+    source_content_hash,
+    source_content_hash_contract_version,
+    source_content_hash_row_count,
     resume_last_timeseries_id,
     resume_last_observed_at,
     resume_part_index,
@@ -1332,6 +1514,9 @@ upserted as (
     sa.min_observed_at,
     sa.max_observed_at,
     'pending'::text,
+    null,
+    null,
+    null,
     null,
     null,
     null,
@@ -1414,6 +1599,30 @@ upserted as (
       then uk_aq_ops.history_candidates.history_completed_at
       else null
     end,
+    source_content_hash = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.source_content_hash
+      else null
+    end,
+    source_content_hash_contract_version = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.source_content_hash_contract_version
+      else null
+    end,
+    source_content_hash_row_count = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.source_content_hash_row_count
+      else null
+    end,
     resume_last_timeseries_id = case
       when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1462,6 +1671,9 @@ upserted as (
     history_row_count,
     history_file_count,
     history_total_bytes,
+    source_content_hash,
+    source_content_hash_contract_version,
+    source_content_hash_row_count,
     resume_last_timeseries_id,
     resume_last_observed_at,
     resume_part_index,
@@ -1491,6 +1703,9 @@ invalidated_connector_gates as (
     history_file_count = null,
     history_total_bytes = null,
     history_completed_at = null,
+    source_content_hash = null,
+    source_content_hash_contract_version = null,
+    source_content_hash_row_count = null,
     completion_source = null,
     updated_at = now()
   returning day_utc, connector_id
@@ -1518,7 +1733,7 @@ order by u.day_utc, u.connector_id
 `;
 
     const result = await client.query(sql, [latestEligibleWindowEndIso]);
-    return result.rows.map((row) => {
+    const candidates = result.rows.map((row) => {
       const candidate = toConnectorDayRow(row);
       const invalidated = row.source_changed_connector_gate_invalidated === true;
       return {
@@ -1546,6 +1761,18 @@ order by u.day_utc, u.connector_id
           : null,
       };
     });
+    const revalidated = [];
+    for (const candidate of candidates) {
+      const checked = await revalidateCompleteCandidateSourceIdentity(client, candidate);
+      revalidated.push({
+        ...candidate,
+        ...checked,
+        source_changed_connector_gate_invalidated:
+          candidate.source_changed_connector_gate_invalidated === true
+          || checked.source_changed_connector_gate_invalidated === true,
+      });
+    }
+    return revalidated;
   }
 
   const sql = `
@@ -1619,6 +1846,9 @@ upserted as (
     history_file_count = null,
     history_total_bytes = null,
     history_completed_at = null,
+    source_content_hash = null,
+    source_content_hash_contract_version = null,
+    source_content_hash_row_count = null,
     resume_last_timeseries_id = case
       when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1806,6 +2036,9 @@ set
   status = 'in_progress',
   run_id = $3,
   last_error = null,
+  source_content_hash = null,
+  source_content_hash_contract_version = null,
+  source_content_hash_row_count = null,
   updated_at = now()
 where day_utc = $1::date
   and connector_id = $2::integer
@@ -1825,6 +2058,7 @@ async function markCandidateComplete(client, {
   historyRowCount,
   historyFileCount,
   historyTotalBytes,
+  sourceIdentity,
 }) {
   await client.query(
     `
@@ -1837,6 +2071,9 @@ set
   history_row_count = $5,
   history_file_count = $6,
   history_total_bytes = $7,
+  source_content_hash = $8,
+  source_content_hash_contract_version = $9,
+  source_content_hash_row_count = $10,
   resume_last_timeseries_id = null,
   resume_last_observed_at = null,
   resume_part_index = 0,
@@ -1855,6 +2092,9 @@ where day_utc = $1::date
       historyRowCount.toString(),
       historyFileCount,
       historyTotalBytes.toString(),
+      sourceIdentity.source_content_hash,
+      sourceIdentity.source_content_hash_contract_version,
+      sourceIdentity.source_content_hash_row_count,
     ],
   );
 }
@@ -1868,6 +2108,7 @@ async function markCandidateAndConnectorGateComplete(client, {
   historyRowCount,
   historyFileCount,
   historyTotalBytes,
+  sourceIdentity,
 }) {
   await client.query("begin");
   try {
@@ -1879,6 +2120,7 @@ async function markCandidateAndConnectorGateComplete(client, {
       historyRowCount,
       historyFileCount,
       historyTotalBytes,
+      sourceIdentity,
     });
     await setConnectorDayGateComplete(client, {
       day_utc: dayUtc,
@@ -1889,6 +2131,7 @@ async function markCandidateAndConnectorGateComplete(client, {
       history_row_count: historyRowCount,
       history_file_count: historyFileCount,
       history_total_bytes: historyTotalBytes,
+      ...sourceIdentity,
       completion_source: "prune_daily_phase_b",
     });
     await client.query("commit");
@@ -1896,6 +2139,10 @@ async function markCandidateAndConnectorGateComplete(client, {
     await client.query("rollback");
     throw error;
   }
+}
+
+export async function markCandidateAndConnectorGateCompleteForTest(client, evidence) {
+  return markCandidateAndConnectorGateComplete(client, evidence);
 }
 
 async function updateCandidateResumeCheckpoint(client, {
@@ -1943,6 +2190,9 @@ set
   status = 'failed',
   run_id = $3,
   last_error = left($4, 4000),
+  source_content_hash = null,
+  source_content_hash_contract_version = null,
+  source_content_hash_row_count = null,
   updated_at = now()
 where day_utc = $1::date
   and connector_id = $2::integer
@@ -1965,6 +2215,9 @@ set
   status = 'pending',
   run_id = $3,
   last_error = left($4, 4000),
+  source_content_hash = null,
+  source_content_hash_contract_version = null,
+  source_content_hash_row_count = null,
   resume_last_timeseries_id = case when $5::boolean then null else resume_last_timeseries_id end,
   resume_last_observed_at = case when $5::boolean then null else resume_last_observed_at end,
   resume_part_index = case when $5::boolean then 0 else resume_part_index end,
@@ -2954,6 +3207,7 @@ async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, 
   let totalBytes = 0n;
   let partIndex = 0;
   let pendingDayRows = [];
+  const frozenSourceIdentityRows = [];
   const canonicalRowsByPollutant = new Map();
 
   const flushObservationRows = async () => {
@@ -3021,6 +3275,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
           counts.target_day_supported_aqi_source_row_count += 1;
         }
         counts.day_observation_row_count += 1;
+        frozenSourceIdentityRows.push(row);
         pendingDayRows.push(row);
         if (pendingDayRows.length >= runtime.observations_part_max_rows) await flushObservationRows();
       }
@@ -3033,6 +3288,10 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   if (observedRows !== candidate.expected_row_count) {
     throw new Error(`Row count mismatch for day=${dayUtc} connector=${connectorId}: expected=${candidate.expected_row_count.toString()} observed=${observedRows.toString()}`);
   }
+  const sourceIdentity = computePruneConnectorSourceIdentity(frozenSourceIdentityRows);
+  if (BigInt(sourceIdentity.source_content_hash_row_count) !== observedRows) {
+    throw new Error(`Source identity row count mismatch for day=${dayUtc} connector=${connectorId}`);
+  }
   return {
     temp,
     counts,
@@ -3040,6 +3299,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
     observedRows,
     totalBytes,
     canonicalRowsByPollutant,
+    sourceIdentity,
   };
 }
 
@@ -3209,6 +3469,7 @@ async function exportCandidateObservationsToR2({ candidate, runtime }) {
         files: staged.committedParts,
         frozen_source_temp: staged.temp,
         frozen_source_counts: staged.counts,
+        source_identity: staged.sourceIdentity,
       };
   }, { statementTimeoutMs: Math.max(1, (remainingBudgetMs(runtime) ?? 600_000) - 1_000) });
 }
@@ -5068,7 +5329,7 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
 
   return {
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
-    supabase_db_url: String(env.SUPABASE_DB_URL || env.DATABASE_URL || "").trim(),
+    supabase_db_url: String(env.SUPABASE_DB_URL || "").trim(),
     r2: {
       endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
       bucket: resolveR2Bucket(env),
@@ -5160,13 +5421,13 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       50_000,
     ),
     max_seconds_per_run: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN,
+      env.UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN,
       DEFAULT_MAX_SECONDS_PER_RUN,
       30,
       86_400,
     ),
     stop_before_timeout_seconds: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS,
+      env.UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS,
       DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS,
       0,
       3_600,
@@ -5235,7 +5496,7 @@ export async function runPhaseBBackup({
   }
 
   if (!runtime.supabase_db_url) {
-    throw new Error("Phase B history export requires SUPABASE_DB_URL (or DATABASE_URL) for streaming Postgres extraction.");
+    throw new Error("Phase B history export requires SUPABASE_DB_URL for streaming Postgres extraction and deletion safety.");
   }
   if (runtime.history_write_version !== "v2") {
     throw new Error("Phase B history writes require canonical R2 history version v2");
@@ -5263,6 +5524,7 @@ export async function runPhaseBBackup({
     failed_candidates: 0,
     source_changed_connector_gate_invalidated_count: 0,
     source_changed_connector_gate_invalidated_preview: [],
+    source_identity_invalidated_connector_days: 0,
     total_written_rows: "0",
     total_written_bytes: "0",
     completed_days: 0,
@@ -5339,10 +5601,13 @@ export async function runPhaseBBackup({
       .map((candidate) => candidate.source_change_invalidation);
     summary.source_changed_connector_gate_invalidated_count = sourceChangedInvalidations.length;
     summary.source_changed_connector_gate_invalidated_preview = sourceChangedInvalidations.slice(0, 10);
+    summary.source_identity_invalidated_connector_days = upsertedCandidates
+      .reduce((count, candidate) => count + Number(candidate.source_identity_invalidated_connector_days || 0), 0);
     logStructured("INFO", "phase_b_history_source_changed_connector_gate_invalidation_summary", {
       run_id: runId,
       source_changed_connector_gate_invalidated_count: sourceChangedInvalidations.length,
       source_changed_connector_gate_invalidated_preview: sourceChangedInvalidations.slice(0, 10),
+      source_identity_invalidated_connector_days: summary.source_identity_invalidated_connector_days,
     });
     if (upsertedCandidates.length > 0) {
       logStructured("INFO", "phase_b_history_candidate_eligibility_summary", {
@@ -5503,6 +5768,7 @@ export async function runPhaseBBackup({
           historyRowCount: connectorGateEvidence.history_row_count,
           historyFileCount: connectorGateEvidence.history_file_count,
           historyTotalBytes: connectorGateEvidence.history_total_bytes,
+          sourceIdentity: exportResult.source_identity,
         });
         connectorGateCompleted = true;
         exportResult.written_row_count = BigInt(connectorGateEvidence.history_row_count);
@@ -5579,6 +5845,13 @@ export async function runPhaseBBackup({
           file_count: exportResult.file_count,
           total_bytes: exportResult.total_bytes.toString(),
           manifest_key: exportResult.manifest_key,
+          source_identity_contract_version: exportResult.source_identity.source_content_hash_contract_version,
+          source_identity_match: true,
+          source_identity_failure_reason: null,
+          source_identity_rows: exportResult.source_identity.source_content_hash_row_count,
+          candidate_source_identity_present: true,
+          gate_source_identity_present: true,
+          source_content_hash: exportResult.source_identity.source_content_hash,
           source_owner: exportResult.adopted ? "adopted_existing_r2_manifest" : "phase_b_export",
           comparison_output_root: connectorComparison?.comparison_output_root || null,
           pm_context: exportResult.aqi ? {
@@ -5872,6 +6145,9 @@ select
   g.history_file_count,
   g.history_total_bytes,
   g.history_completed_at,
+  g.source_content_hash,
+  g.source_content_hash_contract_version,
+  g.source_content_hash_row_count,
   g.completion_source
 from uk_aq_ops.prune_connector_day_gates g
 join requested r
