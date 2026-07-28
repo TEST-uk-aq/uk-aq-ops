@@ -150,6 +150,18 @@ function compactPruneHealthSummary(summary = {}) {
     repair_replay_count: summary.repair_replay_success_count,
     repair_replay_error_count: summary.repair_replay_error_count,
     alert_condition_count: summary.alert_condition_count,
+    connector_day_atomic_delete_planned_count:
+      summary.connector_day_atomic_delete_planned_count,
+    connector_day_atomic_delete_committed_count:
+      summary.connector_day_atomic_delete_committed_count,
+    connector_day_atomic_delete_rolled_back_count:
+      summary.connector_day_atomic_delete_rolled_back_count,
+    connector_day_atomic_delete_blocked_bucket_count:
+      summary.connector_day_atomic_delete_blocked_bucket_count,
+    connector_day_atomic_delete_plan_preview:
+      summary.connector_day_atomic_delete_plan_preview,
+    connector_day_atomic_delete_result_preview:
+      summary.connector_day_atomic_delete_result_preview,
     phase_a_recent: summary.phase_a_recent
       ? {
         skipped: summary.phase_a_recent.skipped,
@@ -180,6 +192,18 @@ function compactPruneHealthSummary(summary = {}) {
         processed_day_count: summary.late_arrival.processed_day_count,
         obs_aqidb_cutoff_day_utc: summary.late_arrival.obs_aqidb_cutoff_day_utc,
         error_count: summary.late_arrival.error_count,
+        connector_day_atomic_delete_planned_count:
+          summary.late_arrival.connector_day_atomic_delete_planned_count,
+        connector_day_atomic_delete_committed_count:
+          summary.late_arrival.connector_day_atomic_delete_committed_count,
+        connector_day_atomic_delete_rolled_back_count:
+          summary.late_arrival.connector_day_atomic_delete_rolled_back_count,
+        connector_day_atomic_delete_blocked_bucket_count:
+          summary.late_arrival.connector_day_atomic_delete_blocked_bucket_count,
+        connector_day_atomic_delete_plan_preview:
+          summary.late_arrival.connector_day_atomic_delete_plan_preview,
+        connector_day_atomic_delete_result_preview:
+          summary.late_arrival.connector_day_atomic_delete_result_preview,
       }
       : undefined,
     warnings: [
@@ -560,6 +584,36 @@ function mergePreviewField(rows, field) {
   return merged;
 }
 
+export function aggregateAtomicDeletionSummaryForTest(rows) {
+  const summaries = Array.isArray(rows) ? rows : [];
+  return {
+    connector_day_atomic_delete_planned_count: sumIntField(
+      summaries,
+      "connector_day_atomic_delete_planned_count",
+    ),
+    connector_day_atomic_delete_committed_count: sumIntField(
+      summaries,
+      "connector_day_atomic_delete_committed_count",
+    ),
+    connector_day_atomic_delete_rolled_back_count: sumIntField(
+      summaries,
+      "connector_day_atomic_delete_rolled_back_count",
+    ),
+    connector_day_atomic_delete_blocked_bucket_count: sumIntField(
+      summaries,
+      "connector_day_atomic_delete_blocked_bucket_count",
+    ),
+    connector_day_atomic_delete_plan_preview: mergePreviewField(
+      summaries,
+      "connector_day_atomic_delete_plan_preview",
+    ),
+    connector_day_atomic_delete_result_preview: mergePreviewField(
+      summaries,
+      "connector_day_atomic_delete_result_preview",
+    ),
+  };
+}
+
 function aggregateDryRunRepairPilot(batchSummaries) {
   const pilots = batchSummaries
     .map((summary) => summary?.repair_one_mismatch_bucket_result)
@@ -602,6 +656,14 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       batchSummaries,
       "connector_history_gate_blocked_bucket_count",
     ),
+    duplicate_connector_day_skipped_count: sumIntField(
+      batchSummaries,
+      "duplicate_connector_day_skipped_count",
+    ),
+    duplicate_connector_day_skipped_preview: mergePreviewField(
+      batchSummaries,
+      "duplicate_connector_day_skipped_preview",
+    ),
     batch_count: batches.length,
     batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
     batch_windows_preview: sampleRows(batches),
@@ -624,6 +686,7 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
 
   return {
     ...summaryBase,
+    ...aggregateAtomicDeletionSummaryForTest(batchSummaries),
     repairable_mismatch_bucket_count: sumIntField(batchSummaries, "repairable_mismatch_bucket_count"),
     repair_replay_success_count: sumIntField(batchSummaries, "repair_replay_success_count"),
     repair_replay_error_count: sumIntField(batchSummaries, "repair_replay_error_count"),
@@ -1277,6 +1340,30 @@ function bucketConnectorDayPlanKey(bucket) {
   return connectorDayPlanKey(toBucketDayUtc(bucket), bucket.connector_id);
 }
 
+export function claimConnectorDaysForParentRun(buckets, processedConnectorDays = new Set()) {
+  const discoveredKeys = Array.from(new Set(
+    (Array.isArray(buckets) ? buckets : []).map(bucketConnectorDayPlanKey),
+  )).sort();
+  const claimedKeys = new Set();
+  const duplicateConnectorDays = [];
+  for (const key of discoveredKeys) {
+    if (processedConnectorDays.has(key)) {
+      const [dayUtc, connectorId] = key.split("|");
+      duplicateConnectorDays.push({ day_utc: dayUtc, connector_id: Number(connectorId) });
+      continue;
+    }
+    processedConnectorDays.add(key);
+    claimedKeys.add(key);
+  }
+  return {
+    claimedBuckets: (Array.isArray(buckets) ? buckets : []).filter((bucket) => (
+      claimedKeys.has(bucketConnectorDayPlanKey(bucket))
+    )),
+    duplicateConnectorDays,
+    processedConnectorDays,
+  };
+}
+
 async function recheckCompleteConnectorDays(
   ingestClient,
   observsClient,
@@ -1713,10 +1800,34 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
   });
 
-  const [ingestBuckets, observsBuckets] = await Promise.all([
+  let [ingestBuckets, observsBuckets] = await Promise.all([
     fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest", deleteEligiblePollutantCodes),
     fetchHourlyFingerprints(observsClient, windowStart, windowEnd, "observs", deleteEligiblePollutantCodes),
   ]);
+
+  let duplicateConnectorDaysSkipped = [];
+  if (!repairOnlyMode && !dryRunMode) {
+    const claimed = claimConnectorDaysForParentRun(
+      ingestBuckets,
+      runContext.processed_connector_days instanceof Set
+        ? runContext.processed_connector_days
+        : new Set(),
+    );
+    duplicateConnectorDaysSkipped = claimed.duplicateConnectorDays;
+    if (claimed.claimedBuckets.length > 0) {
+      const completeInitialState = await recheckCompleteConnectorDays(
+        ingestClient,
+        observsClient,
+        claimed.claimedBuckets,
+        deleteEligiblePollutantCodes,
+      );
+      ingestBuckets = completeInitialState.finalIngestBuckets;
+      observsBuckets = completeInitialState.finalObservsBuckets;
+    } else {
+      ingestBuckets = [];
+      observsBuckets = [];
+    }
+  }
 
   const { deletableBuckets, mismatches, observsExtraBuckets } = compareBuckets(ingestBuckets, observsBuckets);
   const preRepairBackupGate = historyGateEnabled
@@ -1788,6 +1899,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     connector_history_gate_allowed_bucket_count: gatedDeletableBuckets.length,
     connector_history_gate_blocked_bucket_count: historyGateBlockedBuckets.length,
     connector_history_gate_blocked_buckets_preview: sampleRows(historyGateBlockedBuckets),
+    duplicate_connector_day_skipped_count: duplicateConnectorDaysSkipped.length,
+    duplicate_connector_day_skipped_preview: sampleRows(duplicateConnectorDaysSkipped),
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
   };
 
@@ -2212,15 +2325,28 @@ async function discoverLateArrivalDays(ingestClient, overallWindow) {
   };
 }
 
-async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, runId, batchIndex, batchCount) {
+async function runLateArrivalDirectDeleteDay(
+  config,
+  ingestClient,
+  dayWindow,
+  runId,
+  batchIndex,
+  batchCount,
+  processedConnectorDays,
+) {
   const deleteEligiblePollutantCodes = observationPollutantCodesForPrune(config, false);
-  const ingestBuckets = await fetchHourlyFingerprints(
+  const discoveredIngestBuckets = await fetchHourlyFingerprints(
     ingestClient,
     dayWindow.window_start,
     dayWindow.window_end,
     "ingest",
     deleteEligiblePollutantCodes,
   );
+  const claimed = claimConnectorDaysForParentRun(
+    discoveredIngestBuckets,
+    processedConnectorDays instanceof Set ? processedConnectorDays : new Set(),
+  );
+  const ingestBuckets = claimed.claimedBuckets;
   const batchSummaryMeta = batchCount > 1
     ? {
       parent_run_id: runId,
@@ -2240,14 +2366,24 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
       window_start: dayWindow.window_start,
       window_end: dayWindow.window_end,
       ingest_bucket_count: 0,
+      duplicate_connector_day_skipped_count: claimed.duplicateConnectorDays.length,
+      duplicate_connector_day_skipped_preview: sampleRows(claimed.duplicateConnectorDays),
       delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
       delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
       deleted_bucket_count: 0,
       total_deleted_rows: "0",
       delete_error_count: 0,
       alert_condition_count: 0,
+      connector_day_atomic_delete_planned_count: 0,
+      connector_day_atomic_delete_committed_count: 0,
+      connector_day_atomic_delete_rolled_back_count: 0,
+      connector_day_atomic_delete_blocked_bucket_count: 0,
+      connector_day_atomic_delete_plan_preview: [],
+      connector_day_atomic_delete_result_preview: [],
       skipped: true,
-      reason: "no_ingest_buckets_detected",
+      reason: discoveredIngestBuckets.length === 0
+        ? "no_ingest_buckets_detected"
+        : "connector_days_already_processed_in_parent_run",
       deleted_buckets_preview: [],
       delete_errors_preview: [],
     };
@@ -2260,6 +2396,8 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
     day_utc: dayWindow.day_utc,
     mode: config.dryRun ? "dry-run" : "delete",
     ingest_bucket_count: ingestBuckets.length,
+    duplicate_connector_day_skipped_count: claimed.duplicateConnectorDays.length,
+    duplicate_connector_day_skipped_preview: sampleRows(claimed.duplicateConnectorDays),
     delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
     delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     window_start: dayWindow.window_start,
@@ -2307,6 +2445,8 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
     window_start: dayWindow.window_start,
     window_end: dayWindow.window_end,
     ingest_bucket_count: ingestBuckets.length,
+    duplicate_connector_day_skipped_count: claimed.duplicateConnectorDays.length,
+    duplicate_connector_day_skipped_preview: sampleRows(claimed.duplicateConnectorDays),
     delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
     delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     deleted_bucket_count: deletedBucketResults.length,
@@ -2326,6 +2466,7 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
     connector_day_atomic_delete_rolled_back_count: directDeletion.transactionResults.filter(
       (row) => row.diagnostics.connector_day_atomic_delete_rolled_back,
     ).length,
+    connector_day_atomic_delete_blocked_bucket_count: atomicDeletionPlan.blockedBuckets.length,
     alert_condition_count:
       deleteErrors.length
       + atomicDeletionPlan.blockedBuckets.length
@@ -2340,12 +2481,19 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
       ...directDeletion.blockedBuckets,
     ]),
     connector_day_atomic_delete_plan_preview: sampleRows(atomicDeletionPlan.connectorDays),
+    connector_day_atomic_delete_result_preview: sampleRows(
+      directDeletion.transactionResults.map((row) => ({
+        day_utc: row.day_utc,
+        connector_id: row.connector_id,
+        ...row.diagnostics,
+      })),
+    ),
   };
   logStructured("INFO", "ingestdb_late_arrival_direct_delete_summary", summary);
   return summary;
 }
 
-async function runLateArrivalCleanup(config, overallWindow) {
+async function runLateArrivalCleanup(config, overallWindow, runContext = {}) {
   const runId = randomUUID();
   const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -2394,6 +2542,14 @@ async function runLateArrivalCleanup(config, overallWindow) {
       total_deleted_rows: "0",
       total_deleted_after_repair_rows: "0",
       alert_condition_count: 0,
+      duplicate_connector_day_skipped_count: 0,
+      duplicate_connector_day_skipped_preview: [],
+      connector_day_atomic_delete_planned_count: 0,
+      connector_day_atomic_delete_committed_count: 0,
+      connector_day_atomic_delete_rolled_back_count: 0,
+      connector_day_atomic_delete_blocked_bucket_count: 0,
+      connector_day_atomic_delete_plan_preview: [],
+      connector_day_atomic_delete_result_preview: [],
       batch_summaries_preview: [],
     };
   }
@@ -2413,6 +2569,9 @@ async function runLateArrivalCleanup(config, overallWindow) {
   });
 
   const batchSummaries = [];
+  const processedConnectorDays = runContext.processed_connector_days instanceof Set
+    ? runContext.processed_connector_days
+    : new Set();
   for (const dayWindow of directDeleteDayWindows) {
     try {
       const summary = await runLateArrivalDirectDeleteDay(
@@ -2422,6 +2581,7 @@ async function runLateArrivalCleanup(config, overallWindow) {
         runId,
         batchSummaries.length + 1,
         dayWindows.length,
+        processedConnectorDays,
       );
       batchSummaries.push(summary);
     } catch (error) {
@@ -2451,6 +2611,7 @@ async function runLateArrivalCleanup(config, overallWindow) {
         parent_run_id: runId,
         batch_index: batchSummaries.length + 1,
         batch_count: dayWindows.length,
+        processed_connector_days: processedConnectorDays,
       });
       batchSummaries.push(summary);
     } catch (error) {
@@ -2499,6 +2660,15 @@ async function runLateArrivalCleanup(config, overallWindow) {
     total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
     total_deleted_after_repair_rows: sumBigIntField(batchSummaries, "total_deleted_after_repair_rows").toString(),
     alert_condition_count: sumIntField(batchSummaries, "alert_condition_count"),
+    duplicate_connector_day_skipped_count: sumIntField(
+      batchSummaries,
+      "duplicate_connector_day_skipped_count",
+    ),
+    duplicate_connector_day_skipped_preview: mergePreviewField(
+      batchSummaries,
+      "duplicate_connector_day_skipped_preview",
+    ),
+    ...aggregateAtomicDeletionSummaryForTest(batchSummaries),
     batch_summaries_preview: sampleRows(batchSummaries),
   };
   logStructured("INFO", "ingestdb_late_arrival_cleanup_summary", summary);
@@ -2561,10 +2731,13 @@ async function runPrune(config, adapters = {}) {
     overallWindow.window_end,
     DEFAULT_MAX_HOURS_PER_BATCH,
   );
+  const processedConnectorDays = new Set();
 
   let pruneWindowSummary;
   if (batches.length <= 1) {
-    pruneWindowSummary = await runPruneSingleWindowAdapter(config, batches[0] ?? overallWindow);
+    pruneWindowSummary = await runPruneSingleWindowAdapter(config, batches[0] ?? overallWindow, {
+      processed_connector_days: processedConnectorDays,
+    });
   } else {
     const parentRunId = randomUUID();
     logStructured("INFO", "ingestdb_prune_batch_plan", {
@@ -2587,6 +2760,7 @@ async function runPrune(config, adapters = {}) {
         parent_run_id: parentRunId,
         batch_index: batch.batch_index,
         batch_count: batches.length,
+        processed_connector_days: processedConnectorDays,
       });
       batchSummaries.push(summary);
     }
@@ -2606,7 +2780,9 @@ async function runPrune(config, adapters = {}) {
     reason: "not_started",
   };
   try {
-    lateArrivalSummary = await runLateArrivalCleanupAdapter(config, overallWindow);
+    lateArrivalSummary = await runLateArrivalCleanupAdapter(config, overallWindow, {
+      processed_connector_days: processedConnectorDays,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     lateArrivalSummary = {
@@ -2621,6 +2797,21 @@ async function runPrune(config, adapters = {}) {
 
   const combinedSummary = {
     ...pruneWindowSummary,
+    duplicate_connector_day_skipped_count:
+      toSafeInt(pruneWindowSummary.duplicate_connector_day_skipped_count)
+      + toSafeInt(lateArrivalSummary.duplicate_connector_day_skipped_count),
+    duplicate_connector_day_skipped_preview: sampleRows([
+      ...(Array.isArray(pruneWindowSummary.duplicate_connector_day_skipped_preview)
+        ? pruneWindowSummary.duplicate_connector_day_skipped_preview
+        : []),
+      ...(Array.isArray(lateArrivalSummary.duplicate_connector_day_skipped_preview)
+        ? lateArrivalSummary.duplicate_connector_day_skipped_preview
+        : []),
+    ]),
+    ...aggregateAtomicDeletionSummaryForTest([
+      pruneWindowSummary,
+      lateArrivalSummary,
+    ]),
     phase_a_recent: phaseARecentSummary,
     phase_b_history: phaseBHistorySummary,
     late_arrival: lateArrivalSummary,
