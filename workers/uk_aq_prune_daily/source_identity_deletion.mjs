@@ -144,6 +144,11 @@ function blockedResult({
   currentBucketCount = null,
   eligibleBucketCount = null,
   remainingSnapshotRows = null,
+  rawSnapshotRows = null,
+  canonicalSnapshotRows = null,
+  scopeMatch = null,
+  validatedPlanRows = null,
+  transactionDeletedRows = null,
 }) {
   return {
     ok: false,
@@ -175,6 +180,17 @@ function blockedResult({
       connector_day_remaining_snapshot_rows: remainingSnapshotRows === null
         ? null
         : String(remainingSnapshotRows),
+      connector_day_raw_snapshot_rows: rawSnapshotRows === null ? null : String(rawSnapshotRows),
+      connector_day_canonical_snapshot_rows: canonicalSnapshotRows === null
+        ? null
+        : String(canonicalSnapshotRows),
+      connector_day_scope_match: scopeMatch,
+      connector_day_validated_plan_rows: validatedPlanRows === null
+        ? null
+        : String(validatedPlanRows),
+      connector_day_transaction_deleted_rows: transactionDeletedRows === null
+        ? null
+        : String(transactionDeletedRows),
     },
   };
 }
@@ -247,6 +263,20 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   return BigInt(result.rows[0]?.remaining_count ?? 0);
 }
 
+async function readRawConnectorDayRowCount(client, pair) {
+  const result = await client.query(
+    `
+select count(*)::bigint as raw_snapshot_row_count
+from uk_aq_core.observations o
+where o.connector_id = $1::integer
+  and o.observed_at >= $2::timestamptz
+  and o.observed_at < $3::timestamptz
+`,
+    [pair.connectorId, pair.dayStart, pair.dayEnd],
+  );
+  return BigInt(result.rows[0]?.raw_snapshot_row_count ?? 0);
+}
+
 function currentHourCounts(rows) {
   const counts = new Map();
   for (const row of rows) {
@@ -291,17 +321,25 @@ async function deleteOneHour(client, pair, bucket, deleteBatchSize, maxDeleteBat
     const result = await client.query(
       `
 with target_rows as (
-  select o.ctid
-  from uk_aq_core.observations o
-  where o.connector_id = $1::integer
-    and o.observed_at >= $2::timestamptz
-    and o.observed_at < $2::timestamptz + interval '1 hour'
+  select
+    canonical.connector_id,
+    canonical.timeseries_id,
+    canonical.observed_at_utc
+  from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
+    $1::integer,
+    $2::timestamptz,
+    $2::timestamptz + interval '1 hour',
+    null::integer,
+    null::timestamptz
+  ) canonical
   limit $3::integer
 ),
 deleted as (
   delete from uk_aq_core.observations o
   using target_rows t
-  where o.ctid = t.ctid
+  where o.connector_id = t.connector_id
+    and o.timeseries_id = t.timeseries_id
+    and o.observed_at = t.observed_at_utc
   returning 1
 )
 select count(*)::integer as deleted_count from deleted
@@ -348,6 +386,8 @@ export async function runPruneConnectorDayDeletionTransaction({
   let transactionGate = null;
   let transactionCurrentIdentity = null;
   let currentBucketCount = null;
+  let rawSnapshotRows = null;
+  let canonicalSnapshotRows = null;
   try {
     await client.query("begin isolation level repeatable read");
     transactionStarted = true;
@@ -355,13 +395,14 @@ export async function runPruneConnectorDayDeletionTransaction({
     transactionCandidate = candidate;
     transactionGate = gate;
     let candidateIdentity;
+    let gateIdentity;
     let failureReason = null;
     try {
       if (candidate?.status !== "complete" || !isValidConnectorHistoryGateEvidence(gate)) {
         throw new TypeError("source_identity_missing");
       }
       candidateIdentity = normalizePruneConnectorSourceIdentity(candidate);
-      const gateIdentity = normalizePruneConnectorSourceIdentity(gate);
+      gateIdentity = normalizePruneConnectorSourceIdentity(gate);
       const candidateGateComparison = comparePruneConnectorSourceIdentities(candidateIdentity, gateIdentity);
       if (!candidateGateComparison.match) failureReason = candidateGateComparison.failure_reason;
     } catch (error) {
@@ -371,8 +412,30 @@ export async function runPruneConnectorDayDeletionTransaction({
     let currentRows = [];
     let currentIdentity = null;
     if (!failureReason) {
+      currentRows = await readCurrentCanonicalRows(client, pair);
+      canonicalSnapshotRows = BigInt(currentRows.length);
+      rawSnapshotRows = await readRawConnectorDayRowCount(client, pair);
+      if (currentRows.length === 0 && rawSnapshotRows > 0n) {
+        await client.query("rollback");
+        transactionStarted = false;
+        return blockedResult({
+          pair,
+          buckets: requestedBuckets,
+          candidate,
+          gate,
+          failureReason: "connector_day_scope_mismatch",
+          sourceIdentityMatch: false,
+          rolledBack: true,
+          currentIdentity,
+          currentBucketCount: 0,
+          eligibleBucketCount: requestedBuckets.length,
+          remainingSnapshotRows: 0,
+          rawSnapshotRows,
+          canonicalSnapshotRows,
+          scopeMatch: false,
+        });
+      }
       try {
-        currentRows = await readCurrentCanonicalRows(client, pair);
         currentIdentity = computePruneConnectorSourceIdentity(currentRows);
         transactionCurrentIdentity = currentIdentity;
         const currentComparison = comparePruneConnectorSourceIdentities(currentIdentity, candidateIdentity);
@@ -394,6 +457,32 @@ export async function runPruneConnectorDayDeletionTransaction({
         failureReason,
         invalidated: true,
         currentIdentity,
+        rawSnapshotRows,
+        canonicalSnapshotRows,
+        scopeMatch: rawSnapshotRows === null || canonicalSnapshotRows === null
+          ? null
+          : rawSnapshotRows === canonicalSnapshotRows,
+      });
+    }
+
+    if (rawSnapshotRows !== canonicalSnapshotRows) {
+      await client.query("rollback");
+      transactionStarted = false;
+      return blockedResult({
+        pair,
+        buckets: requestedBuckets,
+        candidate,
+        gate,
+        failureReason: "connector_day_scope_mismatch",
+        sourceIdentityMatch: true,
+        rolledBack: true,
+        currentIdentity,
+        currentBucketCount: currentHourCounts(currentRows).size,
+        eligibleBucketCount: requestedBuckets.length,
+        remainingSnapshotRows: canonicalSnapshotRows,
+        rawSnapshotRows,
+        canonicalSnapshotRows,
+        scopeMatch: false,
       });
     }
 
@@ -418,6 +507,9 @@ export async function runPruneConnectorDayDeletionTransaction({
         currentBucketCount: coverage.currentBucketCount,
         eligibleBucketCount: coverage.eligibleBucketCount,
         remainingSnapshotRows: currentRows.length,
+        rawSnapshotRows,
+        canonicalSnapshotRows,
+        scopeMatch: true,
       });
     }
 
@@ -446,6 +538,9 @@ export async function runPruneConnectorDayDeletionTransaction({
           currentBucketCount: coverage.currentBucketCount,
           eligibleBucketCount: coverage.eligibleBucketCount,
           remainingSnapshotRows: bucketResult.remaining_snapshot_rows,
+          rawSnapshotRows,
+          canonicalSnapshotRows,
+          scopeMatch: true,
         });
       }
     }
@@ -471,15 +566,76 @@ export async function runPruneConnectorDayDeletionTransaction({
         currentBucketCount: coverage.currentBucketCount,
         eligibleBucketCount: coverage.eligibleBucketCount,
         remainingSnapshotRows,
+        rawSnapshotRows,
+        canonicalSnapshotRows,
+        scopeMatch: true,
+      });
+    }
+
+    const remainingRawSnapshotRows = await readRawConnectorDayRowCount(client, pair);
+    if (remainingRawSnapshotRows !== 0n) {
+      await client.query("rollback");
+      transactionStarted = false;
+      return blockedResult({
+        pair,
+        buckets: requestedBuckets,
+        candidate,
+        gate,
+        failureReason: "connector_day_scope_mismatch",
+        sourceIdentityMatch: true,
+        rolledBack: true,
+        currentIdentity,
+        currentBucketCount: coverage.currentBucketCount,
+        eligibleBucketCount: coverage.eligibleBucketCount,
+        remainingSnapshotRows,
+        rawSnapshotRows,
+        canonicalSnapshotRows,
+        scopeMatch: false,
+      });
+    }
+
+    const transactionDeletedRows = bucketResults.reduce(
+      (total, result) => total + result.deleted_rows,
+      0n,
+    );
+    const validatedPlanRows = coverage.buckets.reduce(
+      (total, bucket) => total + bucket.observation_count,
+      0n,
+    );
+    const currentIdentityRows = BigInt(currentIdentity.source_content_hash_row_count);
+    const candidateIdentityRows = BigInt(candidateIdentity.source_content_hash_row_count);
+    const gateIdentityRows = BigInt(gateIdentity.source_content_hash_row_count);
+    if (![
+      currentIdentityRows,
+      candidateIdentityRows,
+      gateIdentityRows,
+      validatedPlanRows,
+    ].every((count) => count === transactionDeletedRows)) {
+      await client.query("rollback");
+      transactionStarted = false;
+      return blockedResult({
+        pair,
+        buckets: requestedBuckets,
+        candidate,
+        gate,
+        failureReason: "connector_day_deleted_row_count_mismatch",
+        sourceIdentityMatch: true,
+        rolledBack: true,
+        currentIdentity,
+        currentBucketCount: coverage.currentBucketCount,
+        eligibleBucketCount: coverage.eligibleBucketCount,
+        remainingSnapshotRows,
+        rawSnapshotRows,
+        canonicalSnapshotRows,
+        scopeMatch: true,
+        validatedPlanRows,
+        transactionDeletedRows,
       });
     }
 
     await client.query("commit");
     transactionStarted = false;
-    const committedDeletedRows = bucketResults.reduce(
-      (total, result) => total + result.deleted_rows,
-      0n,
-    );
+    const committedDeletedRows = transactionDeletedRows;
     return {
       ok: true,
       day_utc: pair.dayUtc,
@@ -503,6 +659,11 @@ export async function runPruneConnectorDayDeletionTransaction({
         connector_day_eligible_bucket_count: coverage.eligibleBucketCount,
         connector_day_committed_deleted_rows: committedDeletedRows.toString(),
         connector_day_remaining_snapshot_rows: "0",
+        connector_day_raw_snapshot_rows: rawSnapshotRows.toString(),
+        connector_day_canonical_snapshot_rows: canonicalSnapshotRows.toString(),
+        connector_day_scope_match: true,
+        connector_day_validated_plan_rows: validatedPlanRows.toString(),
+        connector_day_transaction_deleted_rows: transactionDeletedRows.toString(),
       },
     };
   } catch (error) {
@@ -525,6 +686,11 @@ export async function runPruneConnectorDayDeletionTransaction({
         sourceIdentityMatch: Boolean(transactionCurrentIdentity),
         rolledBack: true,
         currentBucketCount,
+        rawSnapshotRows,
+        canonicalSnapshotRows,
+        scopeMatch: rawSnapshotRows === null || canonicalSnapshotRows === null
+          ? null
+          : rawSnapshotRows === canonicalSnapshotRows,
       });
     }
     throw error;

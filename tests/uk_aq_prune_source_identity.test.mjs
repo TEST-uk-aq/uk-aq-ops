@@ -9,7 +9,11 @@ import {
   deletePruneBucketsWithSourceIdentity,
   runPruneConnectorDayDeletionTransaction,
 } from "../workers/uk_aq_prune_daily/source_identity_deletion.mjs";
-import { buildAtomicConnectorDayDeletionPlan } from "../workers/uk_aq_prune_daily/server.mjs";
+import {
+  buildAtomicConnectorDayDeletionPlan,
+  claimConnectorDaysForParentRun,
+  executePruneDaily,
+} from "../workers/uk_aq_prune_daily/server.mjs";
 
 function row(overrides = {}) {
   return {
@@ -100,10 +104,13 @@ function transactionClient({
   conflictOnDelete = false,
   deleteCounts = null,
   remainingCounts = null,
+  rawCounts = null,
 }) {
   const queries = [];
   const pendingDeleteCounts = deleteCounts ? [...deleteCounts] : null;
   const pendingRemainingCounts = remainingCounts ? [...remainingCounts] : null;
+  const pendingRawCounts = rawCounts ? [...rawCounts] : null;
+  let rawCountReads = 0;
   return {
     queries,
     async query(sql) {
@@ -117,7 +124,11 @@ function transactionClient({
       if (/select count\(\*\)::bigint as remaining_count/i.test(sql)) {
         return { rows: [{ remaining_count: pendingRemainingCounts?.shift() ?? 0 }] };
       }
-      if (/uk_aq_phase_b_history_rows_v2/i.test(sql)) return { rows: currentRows };
+      if (/select count\(\*\)::bigint as raw_snapshot_row_count/i.test(sql)) {
+        const fallback = rawCountReads === 0 ? currentRows.length : 0;
+        rawCountReads += 1;
+        return { rows: [{ raw_snapshot_row_count: pendingRawCounts?.shift() ?? fallback }] };
+      }
       if (/^with target_rows as/im.test(sql)) {
         if (conflictOnDelete) {
           const error = new Error("serialization conflict");
@@ -126,6 +137,7 @@ function transactionClient({
         }
         return { rows: [{ deleted_count: pendingDeleteCounts?.shift() ?? currentRows.length }] };
       }
+      if (/uk_aq_phase_b_history_rows_v2/i.test(sql)) return { rows: currentRows };
       return { rows: [], rowCount: 1 };
     },
   };
@@ -207,13 +219,35 @@ test("normal Prune has one final atomic deletion stage and late arrivals use the
   assert.doesNotMatch(server, /deleteBucketsWithConnectorSourceIdentity\([\s\S]{0,300}?"pre_repair"/);
   assert.doesNotMatch(server, /deleteBucketsWithConnectorSourceIdentity\([\s\S]{0,300}?"post_repair"/);
   assert.match(server, /const finalDeletion = !repairOnlyMode\s+\? await deleteBucketsWithConnectorSourceIdentity/);
+  assert.match(server, /claimConnectorDaysForParentRun\([\s\S]+?completeInitialState = await recheckCompleteConnectorDays/);
   const helper = readFileSync("workers/uk_aq_prune_daily/source_identity_deletion.mjs", "utf8");
   assert.match(helper, /begin isolation level repeatable read/i);
   assert.match(helper, /await readLockedEvidence\(client, pair\)/);
   assert.match(helper, /await readCurrentCanonicalRows\(client, pair\)/);
   assert.match(helper, /await deleteOneHour\([\s\S]+?client/);
   assert.match(helper, /remainingSnapshotRows !== 0n/);
+  assert.match(helper, /with target_rows as \([\s\S]+from uk_aq_ops\.uk_aq_phase_b_history_rows_v2\(/);
+  assert.match(helper, /o\.connector_id = t\.connector_id[\s\S]+o\.timeseries_id = t\.timeseries_id[\s\S]+o\.observed_at = t\.observed_at_utc/);
+  assert.doesNotMatch(helper, /select o\.ctid|o\.ctid = t\.ctid/);
   assert.doesNotMatch(helper, /fetch\(|createClient\(|r2|dropbox|observsClient/i);
+});
+
+test("raw rows outside canonical metadata scope block before delete and preserve evidence", async () => {
+  const sourceRows = [row()];
+  const client = transactionClient({
+    evidenceRows: transactionEvidence(sourceRows),
+    currentRows: sourceRows,
+    rawCounts: [2],
+  });
+  const result = await runTransaction(client);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics.connector_day_atomic_delete_failure_reason, "connector_day_scope_mismatch");
+  assert.equal(result.diagnostics.connector_day_raw_snapshot_rows, "2");
+  assert.equal(result.diagnostics.connector_day_canonical_snapshot_rows, "1");
+  assert.equal(result.diagnostics.connector_day_scope_match, false);
+  assert.equal(client.queries.some((sql) => /^with target_rows as/im.test(sql)), false);
+  assert.equal(client.queries.some((sql) => /^update uk_aq_ops\./im.test(sql)), false);
+  assert.match(client.queries.at(-1), /rollback/i);
 });
 
 test("final plan combines initially matched and repaired buckets into one connector-day", async () => {
@@ -289,6 +323,40 @@ test("one remaining mismatch blocks the whole connector-day before deletion", ()
   );
 });
 
+test("duplicate, missing, extra and count-different hour plans fail before deletion", async () => {
+  const sourceRows = [
+    row(),
+    row({ timeseries_id: 20, observed_at_utc: "2026-07-21T02:00:00.000Z" }),
+  ];
+  const hourOne = { connector_id: 7, hour_start: "2026-07-21T01:00:00.000Z", observation_count: 1n };
+  const hourTwo = { connector_id: 7, hour_start: "2026-07-21T02:00:00.000Z", observation_count: 1n };
+  const variants = [
+    [hourOne, hourOne, hourTwo],
+    [hourOne],
+    [hourOne, hourTwo, { connector_id: 7, hour_start: "2026-07-21T03:00:00.000Z", observation_count: 1n }],
+    [hourOne, { ...hourTwo, observation_count: 2n }],
+  ];
+  for (const buckets of variants) {
+    const client = transactionClient({
+      evidenceRows: transactionEvidence(sourceRows),
+      currentRows: sourceRows,
+    });
+    const result = await runPruneConnectorDayDeletionTransaction({
+      client,
+      dayUtc: "2026-07-21",
+      connectorId: 7,
+      buckets,
+      deleteBatchSize: 50_000,
+      maxDeleteBatchesPerHour: 1,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.diagnostics.connector_day_atomic_delete_failure_reason, "connector_day_not_fully_eligible");
+    assert.equal(client.queries.some((sql) => /^with target_rows as/im.test(sql)), false);
+    assert.equal(client.queries.some((sql) => /^update uk_aq_ops\./im.test(sql)), false);
+    assert.match(client.queries.at(-1), /rollback/i);
+  }
+});
+
 test("batch cap with remaining rows rolls back the whole connector-day and retains evidence", async () => {
   const sourceRows = [
     row(),
@@ -333,6 +401,7 @@ test("non-empty final snapshot rolls back and an empty final snapshot commits", 
   assert.equal(retained.diagnostics.source_identity_failure_reason, "connector_day_not_fully_drained");
   assert.equal(retained.diagnostics.connector_day_remaining_snapshot_rows, "1");
   assert.match(retainedClient.queries.at(-1), /rollback/i);
+  assert.equal(retainedClient.queries.some((sql) => /^update uk_aq_ops\./im.test(sql)), false);
 
   const drainedClient = transactionClient({
     evidenceRows: transactionEvidence(sourceRows),
@@ -344,6 +413,29 @@ test("non-empty final snapshot rolls back and an empty final snapshot commits", 
   assert.equal(drained.ok, true);
   assert.equal(drained.diagnostics.connector_day_remaining_snapshot_rows, "0");
   assert.match(drainedClient.queries.at(-1), /commit/i);
+});
+
+test("actual deleted-row mismatch rolls back with zero committed rows and preserves evidence", async () => {
+  const sourceRows = [row()];
+  const client = transactionClient({
+    evidenceRows: transactionEvidence(sourceRows),
+    currentRows: sourceRows,
+    deleteCounts: [0],
+    remainingCounts: [0, 0],
+    rawCounts: [1, 0],
+  });
+  const result = await runTransaction(client);
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.diagnostics.connector_day_atomic_delete_failure_reason,
+    "connector_day_deleted_row_count_mismatch",
+  );
+  assert.equal(result.diagnostics.connector_day_committed_deleted_rows, "0");
+  assert.equal(result.diagnostics.connector_day_transaction_deleted_rows, "0");
+  assert.equal(result.diagnostics.connector_day_validated_plan_rows, "1");
+  assert.equal(result.diagnostics.connector_day_atomic_delete_rolled_back, true);
+  assert.equal(client.queries.some((sql) => /^update uk_aq_ops\./im.test(sql)), false);
+  assert.match(client.queries.at(-1), /rollback/i);
 });
 
 test("pollutant-scoped plan rolls back before deleting under full connector-day identity", async () => {
@@ -368,6 +460,7 @@ test("pollutant-scoped plan rolls back before deleting under full connector-day 
   assert.equal(result.ok, false);
   assert.equal(result.diagnostics.source_identity_failure_reason, "connector_day_scope_mismatch");
   assert.equal(client.queries.some((sql) => /^with target_rows as/im.test(sql)), false);
+  assert.equal(client.queries.some((sql) => /^update uk_aq_ops\./im.test(sql)), false);
   assert.match(client.queries.at(-1), /rollback/i);
 });
 
@@ -404,6 +497,118 @@ test("source mismatch blocks only its connector-day while another connector comm
   assert.match(clients[1].queries.at(-1), /commit/i);
 });
 
+test("non-day-aligned parent batches claim a connector-day once and retain atomic top-level health reporting", async () => {
+  const config = {
+    dryRun: false,
+    maxHoursPerRun: 25,
+    ingestDbRetentionDays: 5,
+    repairOneMismatchBucket: false,
+    phaseB: { enabled: true, history_write_version: "v2" },
+  };
+  const repeatedBucket = {
+    connector_id: 7,
+    hour_start: "2026-07-21T23:00:00.000Z",
+    observation_count: 1n,
+  };
+  let batchCalls = 0;
+  let normalDeletionDecisions = 0;
+  let lateDuplicateConnectorDays = 0;
+  let healthSummary = null;
+  const summary = await executePruneDaily(config, {
+    runPhaseARecent: async () => ({ enabled: false, skipped: true }),
+    runPhaseBBackup: async () => ({ enabled: true, status: "completed" }),
+    runPruneSingleWindow: async (_config, _batch, runContext) => {
+      batchCalls += 1;
+      const claimed = claimConnectorDaysForParentRun(
+        [repeatedBucket],
+        runContext.processed_connector_days,
+      );
+      if (claimed.claimedBuckets.length === 0) {
+        return {
+          run_id: `batch-${batchCalls}`,
+          duplicate_connector_day_skipped_count: claimed.duplicateConnectorDays.length,
+          duplicate_connector_day_skipped_preview: claimed.duplicateConnectorDays,
+          connector_day_atomic_delete_planned_count: 0,
+          connector_day_atomic_delete_committed_count: 0,
+          connector_day_atomic_delete_rolled_back_count: 0,
+          connector_day_atomic_delete_blocked_bucket_count: 0,
+          connector_day_atomic_delete_plan_preview: [],
+          connector_day_atomic_delete_result_preview: [],
+        };
+      }
+      normalDeletionDecisions += 1;
+      return {
+        run_id: `batch-${batchCalls}`,
+        duplicate_connector_day_skipped_count: 0,
+        duplicate_connector_day_skipped_preview: [],
+        connector_day_atomic_delete_planned_count: 1,
+        connector_day_atomic_delete_committed_count: 1,
+        connector_day_atomic_delete_rolled_back_count: 0,
+        connector_day_atomic_delete_blocked_bucket_count: 0,
+        connector_day_atomic_delete_plan_preview: [{
+          day_utc: "2026-07-21",
+          connector_id: 7,
+          connector_day_atomic_delete_planned: true,
+        }],
+        connector_day_atomic_delete_result_preview: [{
+          day_utc: "2026-07-21",
+          connector_id: 7,
+          connector_day_atomic_delete_committed: true,
+        }],
+      };
+    },
+    runLateArrivalCleanup: async (_config, _window, runContext) => {
+      const duplicate = claimConnectorDaysForParentRun(
+        [repeatedBucket],
+        runContext.processed_connector_days,
+      );
+      lateDuplicateConnectorDays = duplicate.duplicateConnectorDays.length;
+      return {
+        enabled: true,
+        skipped: false,
+        duplicate_connector_day_skipped_count: lateDuplicateConnectorDays,
+        duplicate_connector_day_skipped_preview: duplicate.duplicateConnectorDays,
+        connector_day_atomic_delete_planned_count: 1,
+        connector_day_atomic_delete_committed_count: 0,
+        connector_day_atomic_delete_rolled_back_count: 1,
+        connector_day_atomic_delete_blocked_bucket_count: 2,
+        connector_day_atomic_delete_plan_preview: [{
+          day_utc: "2026-07-20",
+          connector_id: 8,
+          connector_day_atomic_delete_planned: true,
+        }],
+        connector_day_atomic_delete_result_preview: [{
+          day_utc: "2026-07-20",
+          connector_id: 8,
+          connector_day_atomic_delete_rolled_back: true,
+          connector_day_atomic_delete_failure_reason: "connector_day_delete_cap_reached",
+        }],
+      };
+    },
+    withDailyTaskRun: async (input, fn) => {
+      const result = await fn();
+      healthSummary = input.buildFinishedSummary(result);
+      return result;
+    },
+  });
+
+  assert.equal(batchCalls, 2);
+  assert.equal(normalDeletionDecisions, 1);
+  assert.equal(lateDuplicateConnectorDays, 1);
+  assert.equal(summary.duplicate_connector_day_skipped_count, 2);
+  assert.equal(summary.connector_day_atomic_delete_planned_count, 2);
+  assert.equal(summary.connector_day_atomic_delete_committed_count, 1);
+  assert.equal(summary.connector_day_atomic_delete_rolled_back_count, 1);
+  assert.equal(summary.connector_day_atomic_delete_blocked_bucket_count, 2);
+  assert.equal(summary.connector_day_atomic_delete_plan_preview.length, 2);
+  assert.equal(summary.connector_day_atomic_delete_result_preview.length, 2);
+  assert.equal(healthSummary.connector_day_atomic_delete_planned_count, 2);
+  assert.equal(healthSummary.connector_day_atomic_delete_committed_count, 1);
+  assert.equal(healthSummary.connector_day_atomic_delete_rolled_back_count, 1);
+  assert.equal(healthSummary.connector_day_atomic_delete_blocked_bucket_count, 2);
+  assert.equal(healthSummary.connector_day_atomic_delete_result_preview.length, 2);
+});
+
 test("source-identity transaction conflict rolls back and retains observations", async () => {
   const sourceRows = [row()];
   const client = transactionClient({
@@ -414,5 +619,6 @@ test("source-identity transaction conflict rolls back and retains observations",
   const result = await runTransaction(client);
   assert.equal(result.ok, false);
   assert.equal(result.diagnostics.source_identity_failure_reason, "source_identity_transaction_conflict");
+  assert.equal(client.queries.some((sql) => /^update uk_aq_ops\./im.test(sql)), false);
   assert.match(client.queries.at(-1), /rollback/i);
 });
