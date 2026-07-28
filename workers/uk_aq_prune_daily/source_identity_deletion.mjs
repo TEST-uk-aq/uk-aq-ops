@@ -1,5 +1,8 @@
 import { Client } from "pg";
-import { isValidConnectorHistoryGateEvidence } from "../shared/uk_aq_connector_day_gate.mjs";
+import {
+  isValidConnectorHistoryGateEvidence,
+  normalizeConnectorDayPair,
+} from "../shared/uk_aq_connector_day_gate.mjs";
 import {
   comparePruneConnectorSourceIdentities,
   computePruneConnectorSourceIdentity,
@@ -198,7 +201,13 @@ function blockedResult({
 async function readLockedEvidence(client, pair) {
   const candidateResult = await client.query(
     `
-select *
+select
+  day_utc::text as day_utc,
+  connector_id,
+  status,
+  source_content_hash,
+  source_content_hash_contract_version,
+  source_content_hash_row_count
 from uk_aq_ops.history_candidates
 where day_utc = $1::date
   and connector_id = $2::integer
@@ -208,7 +217,20 @@ for update
   );
   const gateResult = await client.query(
     `
-select *
+select
+  day_utc::text as day_utc,
+  connector_id,
+  history_done,
+  history_manifest_key,
+  history_manifest_hash,
+  history_row_count,
+  history_file_count,
+  history_total_bytes,
+  history_completed_at,
+  completion_source,
+  source_content_hash,
+  source_content_hash_contract_version,
+  source_content_hash_row_count
 from uk_aq_ops.prune_connector_day_gates
 where day_utc = $1::date
   and connector_id = $2::integer
@@ -219,6 +241,67 @@ for update
   return {
     candidate: candidateResult.rows[0] || null,
     gate: gateResult.rows[0] || null,
+  };
+}
+
+function evidencePairMatches(row, pair) {
+  const evidencePair = normalizeConnectorDayPair(row.day_utc, row.connector_id);
+  return evidencePair.day_utc === pair.dayUtc && evidencePair.connector_id === pair.connectorId;
+}
+
+function classifyLockedEvidence(candidate, gate, pair) {
+  if (!candidate) {
+    return { failureReason: "candidate_evidence_missing", preserveEvidence: false };
+  }
+  if (!gate) {
+    return { failureReason: "gate_evidence_missing", preserveEvidence: false };
+  }
+  try {
+    if (!evidencePairMatches(candidate, pair)) {
+      return { failureReason: "candidate_evidence_invalid", preserveEvidence: true };
+    }
+  } catch (_error) {
+    return { failureReason: "candidate_evidence_invalid", preserveEvidence: true };
+  }
+  try {
+    if (!evidencePairMatches(gate, pair)) {
+      return { failureReason: "gate_evidence_invalid", preserveEvidence: true };
+    }
+  } catch (_error) {
+    return { failureReason: "gate_evidence_invalid", preserveEvidence: true };
+  }
+  if (candidate.status !== "complete") {
+    return { failureReason: "candidate_not_complete", preserveEvidence: false };
+  }
+
+  let candidateIdentity;
+  try {
+    candidateIdentity = normalizePruneConnectorSourceIdentity(candidate);
+  } catch (error) {
+    return {
+      failureReason: pruneConnectorSourceIdentityFailureReason(error),
+      preserveEvidence: false,
+    };
+  }
+
+  let gateIdentity;
+  try {
+    gateIdentity = normalizePruneConnectorSourceIdentity(gate);
+  } catch (error) {
+    return {
+      failureReason: pruneConnectorSourceIdentityFailureReason(error),
+      preserveEvidence: false,
+    };
+  }
+  if (!isValidConnectorHistoryGateEvidence(gate)) {
+    return { failureReason: "gate_evidence_invalid", preserveEvidence: false };
+  }
+  const comparison = comparePruneConnectorSourceIdentities(candidateIdentity, gateIdentity);
+  return {
+    failureReason: comparison.match ? null : comparison.failure_reason,
+    preserveEvidence: false,
+    candidateIdentity,
+    gateIdentity,
   };
 }
 
@@ -394,19 +477,23 @@ export async function runPruneConnectorDayDeletionTransaction({
     const { candidate, gate } = await readLockedEvidence(client, pair);
     transactionCandidate = candidate;
     transactionGate = gate;
-    let candidateIdentity;
-    let gateIdentity;
-    let failureReason = null;
-    try {
-      if (candidate?.status !== "complete" || !isValidConnectorHistoryGateEvidence(gate)) {
-        throw new TypeError("source_identity_missing");
-      }
-      candidateIdentity = normalizePruneConnectorSourceIdentity(candidate);
-      gateIdentity = normalizePruneConnectorSourceIdentity(gate);
-      const candidateGateComparison = comparePruneConnectorSourceIdentities(candidateIdentity, gateIdentity);
-      if (!candidateGateComparison.match) failureReason = candidateGateComparison.failure_reason;
-    } catch (error) {
-      failureReason = pruneConnectorSourceIdentityFailureReason(error);
+    const evidenceValidation = classifyLockedEvidence(candidate, gate, pair);
+    const { candidateIdentity, gateIdentity } = evidenceValidation;
+    let { failureReason } = evidenceValidation;
+
+    if (failureReason && evidenceValidation.preserveEvidence) {
+      await client.query("rollback");
+      transactionStarted = false;
+      return blockedResult({
+        pair,
+        buckets: requestedBuckets,
+        candidate,
+        gate,
+        failureReason,
+        invalidated: false,
+        sourceIdentityMatch: false,
+        rolledBack: true,
+      });
     }
 
     let currentRows = [];
