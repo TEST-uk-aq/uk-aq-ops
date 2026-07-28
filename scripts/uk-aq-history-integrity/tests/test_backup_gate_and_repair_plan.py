@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import json
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ SPEC = importlib.util.spec_from_file_location("uk_aq_history_integrity_backup_ga
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Unable to load module at {MODULE_PATH}")
 MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
@@ -44,6 +46,37 @@ class DummyResponse:
 
 
 class BackupGateAndRepairPlanTests(unittest.TestCase):
+    def test_daily_scope_discovery_reads_direct_child_names_without_child_stat_calls(self) -> None:
+        class Child:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def is_dir(self) -> bool:
+                raise AssertionError("pre-boundary discovery must not stat child entries")
+
+        class PrefixRoot:
+            def __truediv__(self, _value: str) -> "PrefixRoot":
+                return self
+
+            def is_dir(self) -> bool:
+                return True
+
+            def iterdir(self) -> tuple[Child, ...]:
+                return (
+                    Child("day_utc=2026-07-28"),
+                    Child("day_utc=2026-02-30"),
+                    Child("connector_id=1"),
+                )
+
+        with mock.patch.dict(
+            MODULE.discover_observations_days.__globals__,
+            {"Path": lambda _value: PrefixRoot()},
+        ):
+            days = MODULE.discover_observations_days(
+                "/dropbox", "history/v2/observations"
+            )
+        self.assertEqual(days, (MODULE.dt.date(2026, 7, 28),))
+
     def _finished_payload(self, *, finished_at: str = "2026-07-11T02:00:00Z") -> dict:
         return {
             "backup_ready": True,
@@ -279,7 +312,7 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         self.assertTrue(result["allow_stale_dropbox"])
         self.assertEqual(result["blocked_reason"], "allow_stale_dropbox_override")
 
-    def test_scheduled_main_stops_before_dropbox_preflight_when_gate_blocks(self) -> None:
+    def test_daily_boundary_failure_allows_only_name_and_state_scope_discovery(self) -> None:
         args = SimpleNamespace(
             env="CIC-Test",
             profile="daily",
@@ -292,6 +325,7 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
             check_only=True,
             run_backfill=False,
             allow_stale_dropbox=False,
+            logical_run_date="2026-07-28",
         )
         env = {
             "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": "/tmp/logs",
@@ -299,27 +333,56 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
             "UK_AQ_HISTORY_INTEGRITY_DB_PATH": "/tmp/integrity.sqlite3",
         }
         blocked = {
-            "backup_gate_checked": True,
-            "backup_ready": False,
-            "allow_stale_dropbox": False,
-            "blocked_reason": "latest_task_not_finished",
+            "allowed": False,
+            "requested_start_day": "2026-07-22",
+            "requested_end_day": "2026-07-28",
+            "blocked_reason": "integrity_range_overlaps_ingestdb_boundary",
+            "blockers": [{"connector_id": 1, "earliest_ingestdb_day": "2026-07-27"}],
+        }
+        events: list[str] = []
+        history_paths = {
+            "v2": SimpleNamespace(observations_data_prefix="history/v2/observations"),
         }
         with (
             mock.patch.object(MODULE, "parse_args", return_value=args),
             mock.patch.object(MODULE, "load_env_or_die", return_value=env),
             mock.patch.object(MODULE, "resolve_history_version_mode", return_value="v2"),
             mock.patch.object(MODULE, "expand_history_versions", return_value=("v2",)),
-            mock.patch.object(MODULE, "resolve_history_path_configs", return_value={}),
+            mock.patch.object(MODULE, "resolve_history_path_configs", return_value=history_paths),
             mock.patch.object(MODULE, "serialize_history_path_configs", return_value={}),
             mock.patch.object(MODULE, "setup_logging", return_value=Path("/tmp/test.log")),
             mock.patch.object(MODULE, "_resolve_daily_task_health_config", return_value={"enabled": False, "strict": False}),
-            mock.patch.object(MODULE, "run_scheduled_backup_gate", return_value=blocked),
+            mock.patch.object(MODULE, "resolve_r2_history_root", return_value="/dropbox"),
+            mock.patch.object(
+                MODULE,
+                "discover_observations_days",
+                side_effect=lambda *_args: events.append("direct_day_names") or (
+                    MODULE.dt.date(2026, 7, 28),
+                ),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_read_daily_profile_missed_logical_dates_readonly",
+                side_effect=lambda *_args, **_kwargs: events.append("daily_profile_state_read") or [],
+            ),
+            mock.patch.object(
+                MODULE,
+                "run_integrity_ingest_boundary_check",
+                side_effect=lambda **_kwargs: events.append("boundary") or blocked,
+            ),
+            mock.patch.object(MODULE, "run_scheduled_backup_gate") as backup_gate,
             mock.patch.object(MODULE, "run_preflight_or_die") as preflight,
+            mock.patch.object(MODULE, "open_db") as open_db,
+            mock.patch.object(MODULE, "_upsert_daily_profile_state") as state_transition,
             mock.patch.object(MODULE, "write_reports") as write_reports,
         ):
             exit_code = MODULE.main([])
         self.assertEqual(exit_code, 2)
+        self.assertEqual(events, ["direct_day_names", "daily_profile_state_read", "boundary"])
+        backup_gate.assert_not_called()
         preflight.assert_not_called()
+        open_db.assert_not_called()
+        state_transition.assert_not_called()
         write_reports.assert_called_once()
 
     def test_repair_plan_queues_aqi_only_for_aqi_enabled_pollutants(self) -> None:

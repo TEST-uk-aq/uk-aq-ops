@@ -39,41 +39,17 @@ export function isValidConnectorHistoryGateEvidence(row) {
   } catch (_error) {
     return false;
   }
-  const manifestHash = String(row.history_manifest_hash || "").trim();
+  const manifestHash = String(row.history_manifest_hash || "").trim().toLowerCase();
   const completedAt = String(row.history_completed_at || "").trim();
-  const completionSource = String(row.completion_source || "").trim();
-  let historyRowCount;
-  let historyFileCount;
-  let historyTotalBytes;
-  try {
-    historyRowCount = normalizeNonNegativeInteger(row.history_row_count, "history_row_count");
-    historyFileCount = normalizeNonNegativeInteger(row.history_file_count, "history_file_count");
-    historyTotalBytes = normalizeNonNegativeInteger(row.history_total_bytes, "history_total_bytes");
-  } catch (_error) {
-    return false;
-  }
-  const countsAreConsistent = historyRowCount === 0
-    ? historyFileCount === 0 && historyTotalBytes === 0
-    : historyFileCount > 0 && historyTotalBytes > 0;
   return (
     String(row.history_manifest_key || "").trim() === expectedKey
     && MANIFEST_HASH_PATTERN.test(manifestHash)
     && completedAt.length > 0
     && !Number.isNaN(Date.parse(completedAt))
-    && completionSource === "prune_daily_phase_b"
-    && countsAreConsistent
   );
 }
 
 function normalizeNonNegativeInteger(value, fieldName) {
-  if (
-    value === null
-    || value === undefined
-    || typeof value === "boolean"
-    || (typeof value === "string" && value.trim() === "")
-  ) {
-    throw new Error(`Invalid ${fieldName}: ${String(value)}`);
-  }
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 0) {
     throw new Error(`Invalid ${fieldName}: ${String(value)}`);
@@ -88,7 +64,7 @@ export function normalizeConnectorGateCompletionEvidence(evidence) {
   if (manifestKey !== expectedKey) {
     throw new Error(`Connector gate manifest key is not canonical: ${manifestKey || "(missing)"}`);
   }
-  const manifestHash = String(evidence?.history_manifest_hash || "").trim();
+  const manifestHash = String(evidence?.history_manifest_hash || "").trim().toLowerCase();
   if (!MANIFEST_HASH_PATTERN.test(manifestHash)) {
     throw new Error("Connector gate manifest hash must be a lowercase SHA-256 hex digest");
   }
@@ -96,23 +72,14 @@ export function normalizeConnectorGateCompletionEvidence(evidence) {
   if (!COMPLETION_SOURCES.has(completionSource)) {
     throw new Error(`Invalid connector gate completion_source: ${completionSource || "(missing)"}`);
   }
-  const historyRowCount = normalizeNonNegativeInteger(evidence?.history_row_count, "history_row_count");
-  const historyFileCount = normalizeNonNegativeInteger(evidence?.history_file_count, "history_file_count");
-  const historyTotalBytes = normalizeNonNegativeInteger(evidence?.history_total_bytes, "history_total_bytes");
-  if (
-    (historyRowCount === 0 && (historyFileCount !== 0 || historyTotalBytes !== 0))
-    || (historyRowCount > 0 && (historyFileCount === 0 || historyTotalBytes === 0))
-  ) {
-    throw new Error("Connector gate row, file and byte counts are internally inconsistent");
-  }
   return {
     ...pair,
     history_run_id: String(evidence?.history_run_id || "").trim() || null,
     history_manifest_key: manifestKey,
     history_manifest_hash: manifestHash,
-    history_row_count: historyRowCount,
-    history_file_count: historyFileCount,
-    history_total_bytes: historyTotalBytes,
+    history_row_count: normalizeNonNegativeInteger(evidence?.history_row_count, "history_row_count"),
+    history_file_count: normalizeNonNegativeInteger(evidence?.history_file_count, "history_file_count"),
+    history_total_bytes: normalizeNonNegativeInteger(evidence?.history_total_bytes, "history_total_bytes"),
     completion_source: completionSource,
   };
 }

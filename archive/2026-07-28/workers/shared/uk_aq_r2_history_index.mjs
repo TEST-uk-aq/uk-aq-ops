@@ -287,7 +287,7 @@ function parseIsoDay(value) {
     return null;
   }
   const ms = Date.parse(`${trimmed}T00:00:00.000Z`);
-  if (Number.isNaN(ms) || new Date(ms).toISOString().slice(0, 10) !== trimmed) {
+  if (Number.isNaN(ms)) {
     return null;
   }
   return trimmed;
@@ -1932,20 +1932,6 @@ function enumerateIsoDaysInclusive(fromDayUtc, toDayUtc) {
   return out;
 }
 
-export function resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc = null } = {}) {
-  if (affectedDaysUtc !== null && affectedDaysUtc !== undefined) {
-    if (!Array.isArray(affectedDaysUtc) || affectedDaysUtc.length === 0) {
-      throw new Error("Targeted R2 history index update requires a non-empty affectedDaysUtc array");
-    }
-    const normalized = affectedDaysUtc.map((value) => parseIsoDay(value));
-    if (normalized.some((value) => !value)) {
-      throw new Error("Targeted R2 history index update received an invalid affectedDaysUtc value");
-    }
-    return Array.from(new Set(normalized)).sort();
-  }
-  return enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
-}
-
 function normalizeTimeseriesLatestDaySummary(entry) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     return null;
@@ -3208,7 +3194,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   strictMissingTimeseriesCounts = false,
   fromDayUtc,
   toDayUtc,
-  affectedDaysUtc = null,
   connectorId = null,
   connectorManifestKey = null,
   updateLatestIndex = true,
@@ -3239,7 +3224,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     throw new Error("A direct v2 connector manifest target requires connectorId");
   }
 
-  const dayList = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
+  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
   const additionalTargets = (normalizedDomain === "observations" ? additionalPollutantManifestTargets : [])
     .map((target) => {
       const dayUtc = parseIsoDay(target?.day_utc);
@@ -3614,7 +3599,6 @@ async function updateR2HistoryIndexForDomainTargeted({
   generatedAt = new Date().toISOString(),
   fromDayUtc,
   toDayUtc,
-  affectedDaysUtc = null,
   writeR2 = true,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
@@ -3626,7 +3610,7 @@ async function updateR2HistoryIndexForDomainTargeted({
   }
 
   const normalizedPrefix = normalizePrefix(domainPrefix);
-  const dayList = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
+  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
   const warnings = [];
   const indexKey = buildR2HistoryIndexKey(indexPrefix, normalizedDomain);
   const existingIndex = await fetchJsonObjectFromR2IfExists(r2, indexKey);
@@ -3701,7 +3685,6 @@ async function updateR2HistoryObservationsTimeseriesIndexesTargeted({
   computeMissingTimeseriesCounts = false,
   fromDayUtc,
   toDayUtc,
-  affectedDaysUtc = null,
   connectorId = null,
   writeR2 = true,
 }) {
@@ -3716,7 +3699,7 @@ async function updateR2HistoryObservationsTimeseriesIndexesTargeted({
     throw new Error(`Invalid targeted observations connector_id: ${String(connectorId || "")}`);
   }
 
-  const dayList = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
+  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
   const warnings = [];
   const latestKey = buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix);
   const existingLatest = await fetchJsonObjectFromR2IfExists(r2, latestKey);
@@ -3882,7 +3865,6 @@ async function updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
   fromDayUtc,
   toDayUtc,
-  affectedDaysUtc = null,
   connectorId = null,
   writeR2 = true,
 }) {
@@ -3897,7 +3879,7 @@ async function updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
     throw new Error(`Invalid targeted aqilevels connector_id: ${String(connectorId || "")}`);
   }
 
-  const dayList = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
+  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
   const warnings = [];
   const latestKey = buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix);
   const existingLatest = await fetchJsonObjectFromR2IfExists(r2, latestKey);
@@ -4048,7 +4030,6 @@ export async function updateR2HistoryIndexesTargeted({
   domains = ["observations"],
   fromDayUtc,
   toDayUtc,
-  affectedDaysUtc = null,
   connectorId = null,
   connectorManifestKey = null,
   updateLatestIndex = true,
@@ -4101,7 +4082,6 @@ export async function updateR2HistoryIndexesTargeted({
         strictMissingTimeseriesCounts: strictMissingTimeseriesCounts ?? config.strict_missing_timeseries_counts,
         fromDayUtc,
         toDayUtc,
-        affectedDaysUtc,
         connectorId,
         connectorManifestKey,
         updateLatestIndex,
@@ -4127,7 +4107,6 @@ export async function updateR2HistoryIndexesTargeted({
         generatedAt,
         fromDayUtc,
         toDayUtc,
-        affectedDaysUtc,
         writeR2,
       }));
 
@@ -4143,7 +4122,6 @@ export async function updateR2HistoryIndexesTargeted({
           computeMissingTimeseriesCounts,
           fromDayUtc,
           toDayUtc,
-          affectedDaysUtc,
           connectorId,
           writeR2,
         });
@@ -4159,7 +4137,6 @@ export async function updateR2HistoryIndexesTargeted({
           fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
           fromDayUtc,
           toDayUtc,
-          affectedDaysUtc,
           connectorId,
           writeR2,
         });
@@ -4183,7 +4160,6 @@ export async function updateR2HistoryIndexesTargeted({
     ? config.aqilevels_hourly_data_prefix_v2
     : config.aqilevels_prefix;
 
-  const targetedDays = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
   return {
     mode: "targeted",
     history_version: normalizedHistoryVersion,
@@ -4194,9 +4170,8 @@ export async function updateR2HistoryIndexesTargeted({
     aqilevels_timeseries_index_prefix: responseAqilevelsTimeseriesIndexPrefix,
     observations_prefix: responseObservationsPrefix,
     aqilevels_prefix: responseAqilevelsPrefix,
-    from_day_utc: targetedDays[0],
-    to_day_utc: targetedDays[targetedDays.length - 1],
-    affected_days_utc: targetedDays,
+    from_day_utc: parseIsoDay(fromDayUtc),
+    to_day_utc: parseIsoDay(toDayUtc),
     connector_id: connectorId == null ? null : parsePositiveId(connectorId),
     results,
     observations_timeseries: observationsTimeseries,

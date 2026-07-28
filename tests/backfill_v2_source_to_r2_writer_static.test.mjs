@@ -19,9 +19,9 @@ function bodyOf(functionName) {
 
 test("v2 observations writer classifies pollutant codes before grouping", () => {
   const body = bodyOf("exportObsConnectorRowsToR2V2");
-  assert.match(body, /classifyObservationRowsForV2PollutantPartitions\(args\.rows\)/);
+  assert.match(body, /classifyObservationRowsForV2PollutantPartitions\(rowsForWrite\)/);
   assert.ok(
-    body.indexOf("classifyObservationRowsForV2PollutantPartitions(args.rows)") <
+    body.indexOf("classifyObservationRowsForV2PollutantPartitions(rowsForWrite)") <
       body.indexOf("groupObservationRowsByPollutant(sortedRows)"),
     "classification happens before pollutant grouping",
   );
@@ -33,7 +33,7 @@ test("v2 observations writer classifies pollutant codes before grouping", () => 
 
 test("v2 observations writer fails clearly when every row lacks a valid pollutant code", () => {
   const body = bodyOf("exportObsConnectorRowsToR2V2");
-  assert.match(body, /args\.rows\.length > 0 && classification\.valid_rows\.length === 0/);
+  assert.match(body, /rowsForWrite\.length > 0 && classification\.valid_rows\.length === 0/);
   assert.match(body, /No valid pollutant_code rows for v2 observation R2 write/);
 });
 
@@ -44,20 +44,20 @@ test("v2 observations writer writes pollutant partitions and not connector-level
   assert.doesNotMatch(body, /part-\$\{String\(partIndex\)/);
 });
 
-test("v1 observations writer still uses connector-level part keys", () => {
-  const body = bodyOf("exportObsConnectorRowsToR2");
-  assert.match(body, /if \(HISTORY_R2_WRITE_VERSION === "v2"\)/);
-  assert.match(body, /buildObsPartKey\(args\.day_utc, args\.connector_id, partIndex\)/);
+test("direct live source-to-R2 routes fail closed outside Integrity proposal apply", () => {
+  const body = bodyOf("assertSharedCanonicalMutationRoute");
+  assert.match(body, /DIRECT_R2_MUTATION_MODES\.has\(runMode\)/);
+  assert.match(body, /!dryRun && !integrityProposalMode/);
+  assert.match(body, /direct live R2 mutation is retired/);
 });
 
-test("OpenAQ mapping keeps pollutant_code from source parameter if binding code is blank", () => {
+test("OpenAQ mapping fails closed when a binding lacks a canonical pollutant", () => {
   const body = bodyOf("parseOpenaqCsvObservations");
   assert.match(body, /const parameterRaw = String\(columns\[parameterIndex\]/);
   assert.match(body, /const pollutantCode = parseSourcePollutantCode\(parameterRaw\)/);
-  assert.match(
-    body,
-    /pollutant_code: parseSourcePollutantCode\(String\(binding\.pollutant_code \|\| ""\)\) \|\| pollutantCode/,
-  );
+  assert.match(body, /const canonicalPollutant = parseSourcePollutantCode\(String\(binding\.pollutant_code \|\| ""\)\)/);
+  assert.match(body, /openaq_mapping_missing_canonical_pollutant/);
+  assert.match(body, /pollutant_code: canonicalPollutant/);
   assert.match(body, /source_parameter: parameterRaw/);
 });
 
@@ -85,36 +85,30 @@ test("UK-AIR observation status is canonicalised for new R2 v2 writes", () => {
     source,
     /HISTORY_OBSERVATIONS_COLUMNS_R2_V2[\s\S]*"verification_status"/,
   );
-  assert.match(
-    source,
-    /verification_status: textVector\([\s\S]*row\.verification_status/,
-  );
+  assert.match(source, /serializeCanonicalObservationV2Parquet/);
   assert.match(source, /normalizeUkAirVerificationStatus/);
 });
 
-test("AQI writer carries part timeseries counts into v1 and v2 manifest builders", () => {
+test("AQI writer delegates v2 manifests and Parquet to the canonical implementation", () => {
   const summaryBody = bodyOf("summarizeAqilevelsPartRows");
   assert.match(summaryBody, /timeseries_row_counts: Record<string, number>/);
   assert.match(summaryBody, /timeseriesRowCounts\[key\] = \(timeseriesRowCounts\[key\] \|\| 0\) \+ 1/);
 
   const v2PollutantBody = bodyOf("createAqiV2PollutantManifest");
-  assert.match(v2PollutantBody, /timeseriesRowCounts = aggregateTimeseriesRowCounts\(filesWithCounts\)/);
-  assert.match(v2PollutantBody, /timeseries_row_counts: timeseriesRowCounts/);
-  assert.match(v2PollutantBody, /stripTimeseriesCountsFromFileEntries\(filesWithCounts\)/);
+  assert.match(v2PollutantBody, /buildCanonicalHistoryV2PollutantManifest/);
+  assert.match(v2PollutantBody, /validateCanonicalHistoryV2Manifest/);
 
   const v2ConnectorBody = bodyOf("createAqiV2ConnectorManifest");
-  assert.match(v2ConnectorBody, /timeseriesRowCounts = aggregateTimeseriesRowCounts/);
-  assert.match(v2ConnectorBody, /timeseries_row_counts: timeseriesRowCounts/);
-
-  const v1ConnectorBody = bodyOf("createAqiConnectorManifest");
-  assert.match(v1ConnectorBody, /stripTimeseriesCountsFromFileEntries\(args\.fileEntries\)/);
-  assert.match(v1ConnectorBody, /timeseries_row_counts: timeseriesRowCounts/);
+  assert.match(v2ConnectorBody, /buildCanonicalHistoryV2ConnectorManifest/);
+  assert.match(v2ConnectorBody, /validateCanonicalHistoryV2Manifest/);
+  assert.match(bodyOf("rowsToAqiDataV2ParquetBuffer"), /serializeCanonicalAqilevelDataV2Parquet/);
+  assert.match(bodyOf("rowsToAqiDebugV2ParquetBuffer"), /serializeCanonicalAqilevelDebugV2Parquet/);
 });
 
 test("local backfill wrapper adds targeted v2 AQI timeseries-count repair flags only when requested", () => {
   assert.match(wrapperSource, /UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS:-false/);
   assert.match(wrapperSource, /UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS:-false/);
-  assert.match(wrapperSource, /refreshes v2 timeseries metadata/);
+  assert.match(wrapperSource, /refreshes v2 daily indexes/);
   assert.match(wrapperSource, /--history-version v2/);
   assert.match(wrapperSource, /--targeted/);
   assert.match(wrapperSource, /--domain aqilevels/);

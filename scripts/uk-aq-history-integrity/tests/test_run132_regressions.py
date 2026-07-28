@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ SPEC = importlib.util.spec_from_file_location("uk_aq_history_integrity_run132", 
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Unable to load module at {MODULE_PATH}")
 MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
@@ -46,11 +48,12 @@ class Run132RegressionTests(unittest.TestCase):
             escaped.symlink_to(outside)
             self.assertIsNone(MODULE._resolve_canonical_history_object_key(view, "history/v2/escaped.parquet"))
 
-    def test_manual_write_repair_stops_before_preflight_when_backup_gate_blocks(self) -> None:
+    def test_explicit_boundary_failure_calls_no_dropbox_source_or_r2_adapter(self) -> None:
         args = SimpleNamespace(
             env="CIC-Test", profile="manual", source="sos", from_day="2026-05-17",
             to_day="2026-05-17", history_version="v2", verbose=False, dry_run=False,
             check_only=False, run_backfill=True, allow_stale_dropbox=False,
+            logical_run_date=None,
         )
         env = {
             "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": "/tmp/logs",
@@ -58,10 +61,11 @@ class Run132RegressionTests(unittest.TestCase):
             "UK_AQ_HISTORY_INTEGRITY_DB_PATH": "/tmp/integrity.sqlite3",
         }
         blocked = {
-            "backup_gate_checked": True,
-            "backup_ready": False,
-            "allow_stale_dropbox": False,
-            "blocked_reason": "backup_not_ready",
+            "allowed": False,
+            "requested_start_day": "2026-05-17",
+            "requested_end_day": "2026-05-17",
+            "blocked_reason": "integrity_range_overlaps_ingestdb_boundary",
+            "blockers": [{"connector_id": 1, "earliest_ingestdb_day": "2026-05-17"}],
         }
         with (
             mock.patch.object(MODULE, "parse_args", return_value=args),
@@ -72,12 +76,17 @@ class Run132RegressionTests(unittest.TestCase):
             mock.patch.object(MODULE, "serialize_history_path_configs", return_value={}),
             mock.patch.object(MODULE, "setup_logging", return_value=Path("/tmp/test.log")),
             mock.patch.object(MODULE, "_resolve_daily_task_health_config", return_value={"enabled": False, "strict": False}),
-            mock.patch.object(MODULE, "run_scheduled_backup_gate", return_value=blocked),
+            mock.patch.object(MODULE, "run_integrity_ingest_boundary_check", return_value=blocked) as boundary,
+            mock.patch.object(MODULE, "run_scheduled_backup_gate") as backup_gate,
             mock.patch.object(MODULE, "run_preflight_or_die") as preflight,
+            mock.patch.object(MODULE, "open_db") as open_db,
             mock.patch.object(MODULE, "write_reports") as write_reports,
         ):
             self.assertEqual(MODULE.main([]), 2)
+        boundary.assert_called_once()
+        backup_gate.assert_not_called()
         preflight.assert_not_called()
+        open_db.assert_not_called()
         write_reports.assert_called_once()
 
 

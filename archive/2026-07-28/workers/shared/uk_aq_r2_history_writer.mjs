@@ -3,21 +3,6 @@ import { Client } from "pg";
 
 import { normalizeConnectorDayPair } from "./uk_aq_connector_day_gate.mjs";
 
-// Keep the canonical object construction surface on the shared writer API.
-// Source adapters may prepare rows independently, but every production writer
-// uses these implementations for bytes, keys, manifests and validation.
-export {
-  buildHistoryV2ConnectorManifest,
-  buildHistoryV2DayManifest,
-  buildHistoryV2PartKey,
-  buildHistoryV2PollutantManifest,
-  buildHistoryV2PollutantManifestKey,
-  serializeCanonicalAqilevelDataV2Parquet,
-  serializeCanonicalAqilevelDebugV2Parquet,
-  serializeCanonicalObservationV2Parquet,
-  validateCanonicalHistoryV2Manifest,
-} from "./uk_aq_r2_history_canonical.mjs";
-
 export const HISTORY_LOCK_NAMESPACES = Object.freeze({
   connectorDay: "connector_day",
   dayFinalization: "day_finalisation",
