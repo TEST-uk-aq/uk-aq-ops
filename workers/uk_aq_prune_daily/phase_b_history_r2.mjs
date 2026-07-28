@@ -53,6 +53,7 @@ import {
 } from "../shared/uk_aq_connector_day_gate.mjs";
 import {
   mergeConnectorManifestReferences,
+  readParentManifestForBoundedRecovery,
   runCanonicalDayFinalizer,
   runCanonicalConnectorDayWriter,
   runCanonicalGlobalIndexFinalizer,
@@ -89,7 +90,7 @@ const DEFAULT_ROW_GROUP_SIZE = 100_000;
 const DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE = 50_000;
 const DEFAULT_AQILEVELS_ROW_GROUP_SIZE = DEFAULT_ROW_GROUP_SIZE;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
-const DEFAULT_MAX_SECONDS_PER_RUN = 840;
+const DEFAULT_MAX_SECONDS_PER_RUN = 1_740;
 const DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS = 60;
 const PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS = 600_000;
 const PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS = 15_000;
@@ -4392,18 +4393,34 @@ async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc, c
     throw new Error("Phase B AQI day finalisation requires the canonical observation-derived v2 writer");
   }
   const readConnectorManifests = async (prefix) => {
-    let manifestKeys = [];
-    try {
-      const dayManifestKey = buildDayManifestKey(prefix, dayUtc);
-      const current = JSON.parse((await r2GetObject({ r2: runtime.r2, key: dayManifestKey })).body.toString("utf8"));
-      const references = Array.isArray(current.connector_manifests)
-        ? current.connector_manifests
-        : Array.isArray(current.child_manifests) ? current.child_manifests : [];
-      manifestKeys = references.map((entry) => String(entry.manifest_key || "").trim());
-      if (!manifestKeys.length || manifestKeys.some((key) => !/\/connector_id=\d+\/manifest\.json$/.test(key))) {
-        throw new Error("current AQI day manifest has invalid connector references");
-      }
-    } catch (_error) {
+    const dayManifestKey = buildDayManifestKey(prefix, dayUtc);
+    const profile = prefix === runtime.aqilevels_hourly_debug_prefix_v2 ? "debug" : "data";
+    const currentRead = await readParentManifestForBoundedRecovery({
+      getObject: r2GetObject,
+      r2: runtime.r2,
+      key: dayManifestKey,
+      validate: (current) => {
+        validateCanonicalHistoryV2Manifest(current, {
+          history_version: "v2",
+          domain: "aqilevels",
+          grain: HISTORY_AQILEVELS_GRAIN,
+          profile,
+          manifest_kind: "day",
+          day_utc: dayUtc,
+          manifest_key: dayManifestKey,
+        });
+        const references = Array.isArray(current.connector_manifests)
+          ? current.connector_manifests
+          : Array.isArray(current.child_manifests) ? current.child_manifests : [];
+        const manifestKeys = references.map((entry) => String(entry.manifest_key || "").trim());
+        if (!manifestKeys.length || manifestKeys.some((key) => !/\/connector_id=\d+\/manifest\.json$/.test(key))) {
+          throw new Error("current AQI day manifest has invalid connector references");
+        }
+        return manifestKeys;
+      },
+    });
+    let manifestKeys = currentRead.state === "valid" ? currentRead.value : [];
+    if (currentRead.state !== "valid") {
       const entries = await r2ListAllObjects({
         r2: runtime.r2,
         prefix: `${prefix}/day_utc=${dayUtc}/`,
@@ -4756,28 +4773,41 @@ async function finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }) {
   assertBudget(runtime, "day_finalization", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.day_finalization);
 
   const dayManifestKey = buildHistoryV2DayManifestKey(runtime.committed_prefix, dayUtc);
-  let existingReferences = [];
-  try {
-    const current = JSON.parse((await r2GetObject({ r2: runtime.r2, key: dayManifestKey })).body.toString("utf8"));
-    const currentReferences = Array.isArray(current.connector_manifests)
-      ? current.connector_manifests
-      : Array.isArray(current.child_manifests) ? current.child_manifests : [];
-    existingReferences = currentReferences.map((entry) => ({
-      connector_id: Number(entry.connector_id),
-      manifest_key: String(entry.manifest_key || ""),
-    }));
-    const dayPrefix = `${runtime.committed_prefix}/day_utc=${dayUtc}/`;
-    if (existingReferences.some((entry) =>
-      !Number.isInteger(entry.connector_id) || entry.connector_id <= 0 ||
-      !entry.manifest_key.startsWith(dayPrefix) ||
-      !entry.manifest_key.endsWith(`/connector_id=${entry.connector_id}/manifest.json`)
-    )) {
-      throw new Error(`Current day manifest has invalid connector references: ${dayManifestKey}`);
-    }
-  } catch (_error) {
+  const dayPrefix = `${runtime.committed_prefix}/day_utc=${dayUtc}/`;
+  const currentRead = await readParentManifestForBoundedRecovery({
+    getObject: r2GetObject,
+    r2: runtime.r2,
+    key: dayManifestKey,
+    validate: (current) => {
+      validateCanonicalHistoryV2Manifest(current, {
+        history_version: "v2",
+        domain: "observations",
+        manifest_kind: "day",
+        day_utc: dayUtc,
+        manifest_key: dayManifestKey,
+      });
+      const currentReferences = Array.isArray(current.connector_manifests)
+        ? current.connector_manifests
+        : Array.isArray(current.child_manifests) ? current.child_manifests : [];
+      const references = currentReferences.map((entry) => ({
+        connector_id: Number(entry.connector_id),
+        manifest_key: String(entry.manifest_key || ""),
+      }));
+      if (references.some((entry) =>
+        !Number.isInteger(entry.connector_id) || entry.connector_id <= 0 ||
+        !entry.manifest_key.startsWith(dayPrefix) ||
+        !entry.manifest_key.endsWith(`/connector_id=${entry.connector_id}/manifest.json`)
+      )) {
+        throw new Error(`Current day manifest has invalid connector references: ${dayManifestKey}`);
+      }
+      return references;
+    },
+  });
+  let existingReferences = currentRead.state === "valid" ? currentRead.value : [];
+  if (currentRead.state !== "valid") {
     const discovered = await r2ListAllObjects({
       r2: runtime.r2,
-      prefix: `${runtime.committed_prefix}/day_utc=${dayUtc}/`,
+      prefix: dayPrefix,
       max_keys: 10_000,
     });
     existingReferences = discovered.flatMap((entry) => {

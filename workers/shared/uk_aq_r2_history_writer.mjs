@@ -190,6 +190,65 @@ export async function runCanonicalDayFinalizer({ client, dayUtc, finalize, verif
   });
 }
 
+export function isConfirmedR2ObjectAbsentError(error) {
+  const rawStatus = error?.status ?? error?.statusCode ?? error?.response?.status;
+  if (rawStatus !== undefined && rawStatus !== null && rawStatus !== "") {
+    return Number(rawStatus) === 404;
+  }
+
+  const code = String(error?.code || error?.name || "").trim().toLowerCase();
+  if (["nosuchkey", "no_such_key", "notfound", "not_found"].includes(code)) return true;
+
+  const message = String(error instanceof Error ? error.message : error || "").trim();
+  return /^R2 GET failed \(404\) key=/.test(message);
+}
+
+export async function readParentManifestForBoundedRecovery({
+  getObject,
+  r2,
+  key,
+  validate,
+}) {
+  if (typeof getObject !== "function") throw new Error("Parent-manifest reader requires a getObject adapter");
+  if (typeof validate !== "function") throw new Error("Parent-manifest reader requires a structural validator");
+
+  let object;
+  try {
+    object = await getObject({ r2, key });
+  } catch (error) {
+    if (isConfirmedR2ObjectAbsentError(error)) {
+      return {
+        state: "absent",
+        manifest: null,
+        value: null,
+        validation_error: error,
+      };
+    }
+    throw error;
+  }
+
+  try {
+    if (object?.body === undefined || object?.body === null) {
+      throw new Error(`Parent manifest body is missing: ${key}`);
+    }
+    const manifest = JSON.parse(Buffer.from(object.body).toString("utf8"));
+    const value = await validate(manifest);
+    return {
+      state: "valid",
+      manifest,
+      value,
+      validation_error: null,
+    };
+  } catch (error) {
+    return {
+      state: "structurally_invalid",
+      manifest: null,
+      value: null,
+      validation_error: error,
+    };
+  }
+}
+
 export function withGlobalIndexHistoryLock(options, callback) {
   return withHistoryWriterLock({ ...options, namespace: HISTORY_LOCK_NAMESPACES.globalIndex }, callback);
 }

@@ -285,6 +285,22 @@ test("Phase B deploy workflow and env catalogs retire the observations history a
   assert.equal(master.includes("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES"), false);
 });
 
+test("Prune Daily timeout hierarchy matches the 30-minute runtime contract", () => {
+  const workflow = readFileSync(".github/workflows/uk_aq_prune_daily.yml", "utf8");
+  const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
+  const resolved = resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2" });
+
+  assert.match(workflow, /timeout-minutes:\s*40/);
+  assert.match(workflow, /timeout --kill-after=30s 30m node workers\/uk_aq_prune_daily\/job\.mjs/);
+  assert.match(workflow, /UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN:.*'1740'/);
+  assert.match(workflow, /UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS:.*'60'/);
+  assert.match(workflow, /Upload Prune Daily report\s+if: always\(\)/);
+  assert.match(targets, /^UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN,variable$/m);
+  assert.match(targets, /^UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS,variable$/m);
+  assert.equal(resolved.max_seconds_per_run, 1_740);
+  assert.equal(resolved.stop_before_timeout_seconds, 60);
+});
+
 test("Phase B resets a stale v2 checkpoint when cleanup already removed all partial objects", () => {
   assert.equal(shouldResetManifestlessV2ResumeForTest({
     connectorManifestExists: false,

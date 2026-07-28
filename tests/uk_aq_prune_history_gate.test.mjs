@@ -325,10 +325,13 @@ test("insufficient Phase B budget prevents AQI and Dropbox adapters and reports 
   const runBudget = createPhaseBRunBudgetForTest({
     nowMs: () => nowMs,
     startedAtMs: nowMs,
-    maxSecondsPerRun: 840,
+    maxSecondsPerRun: 1_740,
     stopBeforeTimeoutSeconds: 60,
   });
   const runtime = { run_budget: runBudget };
+  assert.equal(runBudget.max_ms, 1_740_000);
+  assert.equal(runBudget.stop_before_timeout_ms, 60_000);
+  assert.equal(runBudget.deadline_ms - runBudget.started_at_ms, 1_680_000);
   nowMs = runBudget.deadline_ms - 179_999;
   let aqiCalls = 0;
   let dropboxCalls = 0;
@@ -398,7 +401,7 @@ function phaseBConfig() {
     runs_prefix_v1: "history/v1/_ops/observations/runs",
     runs_prefix_v2: "history/v2/_ops/observations/runs",
     max_candidates_per_run: 500,
-    max_seconds_per_run: 840,
+    max_seconds_per_run: 1_740,
     stop_before_timeout_seconds: 60,
     phase_b_calculate_aqi_from_observations_enabled: true,
     prune_check_dropbox: { enabled: false, required: false },
@@ -408,7 +411,7 @@ function phaseBConfig() {
 test("source-change invalidation survives a real Phase B candidate-start budget stop without R2 candidate work", async () => {
   const dayUtc = "2026-07-21";
   let nowMs = 0;
-  const deadlineMs = 780_000;
+  const deadlineMs = 1_680_000;
   const key = connectorDayGateKey(dayUtc, 1);
   const candidates = new Map([
     [key, completeCandidate(dayUtc, 1, 10, `${dayUtc}T00:00:00.000Z`, `${dayUtc}T23:00:00.000Z`)],
@@ -541,7 +544,7 @@ test("Phase B control PostgreSQL timeout is deadline-bounded and only deadline c
   const runBudget = createPhaseBRunBudgetForTest({
     nowMs: () => 0,
     startedAtMs: 0,
-    maxSecondsPerRun: 840,
+    maxSecondsPerRun: 1_740,
     stopBeforeTimeoutSeconds: 60,
   });
   const derived = derivePhaseBPgTimeoutsForTest({ run_budget: runBudget });
@@ -565,7 +568,7 @@ test("Phase B control PostgreSQL timeout is deadline-bounded and only deadline c
         }
         if (/select distinct op\.code/i.test(normalized)) return { rows: [] };
         if (/source_changes as materialized/i.test(normalized)) {
-          if (expireBudget) nowMs = 779_500;
+          if (expireBudget) nowMs = 1_679_500;
           throw Object.assign(new Error(errorMessage), { code: errorCode });
         }
         throw new Error(`Unexpected fake PostgreSQL query: ${normalized.slice(0, 80)}`);
@@ -595,7 +598,7 @@ test("Phase B control PostgreSQL timeout is deadline-bounded and only deadline c
   const stopped = await deadlineCase.promise;
   assert.equal(stopped.status, "stopped_budget");
   assert.equal(stopped.budget_stop.operation, "control_database_statement");
-  assert.ok(deadlineCase.getStatementTimeout() <= 780_000);
+  assert.ok(deadlineCase.getStatementTimeout() <= 1_680_000);
   assert.ok(deadlineCase.getConnectionConfig().connectionTimeoutMillis <= 15_000);
 
   const sqlDefectCase = await runWithPopulationError({

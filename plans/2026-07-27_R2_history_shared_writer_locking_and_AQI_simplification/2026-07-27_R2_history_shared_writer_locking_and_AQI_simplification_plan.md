@@ -33,7 +33,7 @@ Required reading order:
 5. `system_docs/r2_history/aqi_history_write_pipeline.md`
 6. `system_docs/r2_history/integrity.md`
 7. `system_docs/r2_history/connector_gate_file_identity.md`
-8. `system_docs/r2_history/timeseries_binding_contract.md`
+8. `system_docs/r2_history/contract.md`
 9. Other linked system documents relevant to files being changed.
 
 Where active code, old comments, tests, plans or legacy documentation conflict with the current `system_docs`, the current `system_docs` win.
