@@ -15,6 +15,15 @@ This contract governs the `Highest sensor readings` dashboard on the TEST websit
 
 It does not govern the WHO summary card or the hex map refresh lifecycle.
 
+## Active-page definition
+
+For this contract, the homepage is active only when:
+
+- the document is visible, meaning `document.hidden` is false; and
+- the browser window has focus, meaning `document.hasFocus()` is true.
+
+A visible tab in an unfocused browser window is not active and MUST NOT perform the periodic dashboard refresh.
+
 ## Data behaviour
 
 The homepage dashboard MUST continue to:
@@ -35,9 +44,9 @@ The dashboard MUST perform its normal data load when the homepage is initialised
 
 The initial load establishes the latest completed dashboard request-cycle time used by the browser-focus freshness rule.
 
-## Visible-page automatic refresh cadence
+## Active-page automatic refresh cadence
 
-While the document is visible, the dashboard MUST automatically start a refresh on wall-clock five-minute boundaries, equivalent to cron `*/5 * * * *`.
+While the homepage is active, the dashboard MUST automatically start a refresh on wall-clock five-minute boundaries, equivalent to cron `*/5 * * * *`.
 
 Examples include `10:00`, `10:05`, `10:10` and `10:15`.
 
@@ -45,7 +54,7 @@ The scheduler MUST:
 
 - calculate the next five-minute boundary from the current clock;
 - use a recalculated one-shot schedule rather than relying on a drifting five-minute interval;
-- avoid starting an automatic refresh while `document.hidden` is true;
+- avoid starting an automatic refresh when the document is hidden or the browser window is not focused;
 - continue to target the next wall-clock boundary after every scheduled, manual or focus-triggered refresh;
 - prevent overlapping request cycles.
 
@@ -53,15 +62,17 @@ A manual or focus-triggered refresh at an off-boundary time MUST NOT move or sup
 
 ## Hidden-page and browser-focus behaviour
 
-The homepage MUST NOT perform periodic dashboard refresh requests while the document is hidden.
+The homepage MUST NOT perform periodic dashboard refresh requests while the document is hidden or the browser window is not focused.
 
-When the document becomes visible again:
+The implementation MUST respond to both document visibility changes and browser window focus events.
+
+When the homepage becomes active again:
 
 - if more than five minutes have elapsed since the most recent completed dashboard request cycle, refresh immediately;
 - otherwise, do not refresh immediately;
 - in both cases, schedule the next normal wall-clock five-minute boundary.
 
-A boundary missed while the page was hidden does not require a separate catch-up queue. The visibility rule provides the single immediate catch-up when the data cycle is older than five minutes.
+A boundary missed while the page was inactive does not require a separate catch-up queue. The active-page rule provides the single immediate catch-up when the data cycle is older than five minutes.
 
 ## Manual refresh control
 
@@ -108,7 +119,7 @@ This change MUST NOT:
 - change highest-reading, area-summary or active-sensor calculations;
 - change network selection semantics;
 - change connector refresh-metadata meaning;
-- add background fetching while the page is hidden;
+- add background fetching while the page is hidden or the browser window is unfocused;
 - add a service worker, WebSocket, polling Worker or new backend endpoint;
 - change WHO summary refresh behaviour;
 - change the hex map implementation.
@@ -120,13 +131,14 @@ Before deployment, only the smallest structural checks are required, including J
 Functional acceptance MUST happen through normal TEST website operation:
 
 1. initial homepage load succeeds;
-2. a visible page refreshes at the next minute ending in `0` or `5`;
+2. an active page refreshes at the next minute ending in `0` or `5`;
 3. a hidden page does not make periodic dashboard requests;
-4. returning after more than five minutes triggers one immediate refresh;
-5. returning within five minutes does not trigger an unnecessary immediate refresh;
-6. manual refresh works at an arbitrary minute without shifting the next boundary refresh;
-7. network selection remains unchanged through every refresh path;
-8. a refresh failure leaves the previous usable readings visible and permits a later retry.
+4. a visible page in an unfocused browser window does not make periodic dashboard requests;
+5. returning focus after more than five minutes triggers one immediate refresh;
+6. returning focus within five minutes does not trigger an unnecessary immediate refresh;
+7. manual refresh works at an arbitrary minute without shifting the next boundary refresh;
+8. network selection remains unchanged through every refresh path;
+9. a refresh failure leaves the previous usable readings visible and permits a later retry.
 
 ## Implementation status
 
