@@ -24,9 +24,30 @@ import {
   canonicalObservationConnectorManifestKey,
   connectorDayGateKey,
   isValidConnectorHistoryGateEvidence,
+  normalizeConnectorDayPair,
   setConnectorDayGateIncomplete,
 } from "../workers/shared/uk_aq_connector_day_gate.mjs";
 import { computePruneConnectorSourceIdentity } from "../workers/shared/uk_aq_prune_connector_source_identity.mjs";
+
+test("connector-day pairs accept canonical text and UTC-midnight Date values only", () => {
+  assert.deepEqual(
+    normalizeConnectorDayPair("2026-07-23", "2"),
+    { day_utc: "2026-07-23", connector_id: 2 },
+  );
+  assert.deepEqual(
+    normalizeConnectorDayPair(new Date("2026-07-23T00:00:00.000Z"), 2),
+    { day_utc: "2026-07-23", connector_id: 2 },
+  );
+  assert.throws(
+    () => normalizeConnectorDayPair(new Date("2026-07-22T23:00:00.000Z"), 2),
+    /Invalid connector-day UTC date/,
+  );
+  assert.throws(
+    () => normalizeConnectorDayPair("Thu Jul 23 2026 00:00:00 GMT+0100", 2),
+    /Invalid connector-day UTC date/,
+  );
+  assert.throws(() => normalizeConnectorDayPair("2026-07-23", "two"), /Invalid.*connector_id/);
+});
 
 test("prune history day manifest gate accepts v1 observation day manifests", () => {
   assert.equal(

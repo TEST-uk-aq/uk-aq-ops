@@ -171,6 +171,99 @@ test("source-identity deletion reads evidence/current rows and deletes in one re
   assert.match(client.queries.at(-1), /commit/i);
 });
 
+test("locked candidate and gate evidence use explicit canonical date projections", () => {
+  const helper = readFileSync("workers/uk_aq_prune_daily/source_identity_deletion.mjs", "utf8");
+  assert.doesNotMatch(helper, /select \*\s+from uk_aq_ops\.(?:history_candidates|prune_connector_day_gates)/i);
+  assert.match(
+    helper,
+    /select\s+day_utc::text as day_utc,[\s\S]+from uk_aq_ops\.history_candidates[\s\S]+for update/i,
+  );
+  assert.match(
+    helper,
+    /select\s+day_utc::text as day_utc,[\s\S]+from uk_aq_ops\.prune_connector_day_gates[\s\S]+for update/i,
+  );
+});
+
+test("canonical text and UTC-midnight Date evidence reach current-source comparison", async () => {
+  for (const dayUtc of ["2026-07-21", new Date("2026-07-21T00:00:00.000Z")]) {
+    const sourceRows = [row()];
+    const evidenceRows = transactionEvidence(sourceRows);
+    evidenceRows.candidate.day_utc = dayUtc;
+    evidenceRows.gate.day_utc = dayUtc;
+    const client = transactionClient({ evidenceRows, currentRows: sourceRows });
+    const result = await runTransaction(client);
+    assert.equal(result.ok, true);
+    assert.equal(result.diagnostics.source_identity_failure_reason, null);
+    assert.equal(result.diagnostics.source_identity_match, true);
+    assert.equal(client.queries.some((sql) => /uk_aq_phase_b_history_rows_v2/i.test(sql)), true);
+  }
+});
+
+test("evidence diagnostics distinguish absent, incomplete, invalid and unsupported cases", async () => {
+  const sourceRows = [row()];
+  const baseline = transactionEvidence(sourceRows);
+  const variants = [
+    {
+      evidenceRows: { ...baseline, candidate: null },
+      reason: "candidate_evidence_missing",
+    },
+    {
+      evidenceRows: { ...baseline, gate: null },
+      reason: "gate_evidence_missing",
+    },
+    {
+      evidenceRows: { ...baseline, candidate: { ...baseline.candidate, status: "pending" } },
+      reason: "candidate_not_complete",
+    },
+    {
+      evidenceRows: {
+        ...baseline,
+        gate: { ...baseline.gate, history_manifest_hash: "invalid" },
+      },
+      reason: "gate_evidence_invalid",
+    },
+    {
+      evidenceRows: {
+        candidate: {
+          ...baseline.candidate,
+          source_content_hash_contract_version: 2,
+        },
+        gate: {
+          ...baseline.gate,
+          source_content_hash_contract_version: 2,
+        },
+      },
+      reason: "source_identity_contract_unsupported",
+    },
+  ];
+  for (const variant of variants) {
+    const client = transactionClient({ evidenceRows: variant.evidenceRows, currentRows: sourceRows });
+    const result = await runTransaction(client);
+    assert.equal(result.ok, false);
+    assert.equal(result.diagnostics.source_identity_failure_reason, variant.reason);
+    assert.equal(client.queries.some((sql) => /^with target_rows as/im.test(sql)), false);
+  }
+});
+
+test("unparseable returned dates roll back without invalidating valid identity evidence", async () => {
+  const sourceRows = [row()];
+  for (const field of ["candidate", "gate"]) {
+    const evidenceRows = transactionEvidence(sourceRows);
+    evidenceRows[field].day_utc = new Date("2026-07-20T23:00:00.000Z");
+    const client = transactionClient({ evidenceRows, currentRows: sourceRows });
+    const result = await runTransaction(client);
+    assert.equal(result.ok, false);
+    assert.equal(result.diagnostics.source_identity_failure_reason, `${field}_evidence_invalid`);
+    assert.equal(result.diagnostics.candidate_source_identity_present, true);
+    assert.equal(result.diagnostics.gate_source_identity_present, true);
+    assert.equal(result.diagnostics.source_identity_invalidated_connector_days, 0);
+    assert.equal(result.diagnostics.connector_day_atomic_delete_rolled_back, true);
+    assert.equal(client.queries.some((sql) => /^update uk_aq_ops\./im.test(sql)), false);
+    assert.equal(client.queries.some((sql) => /^with target_rows as/im.test(sql)), false);
+    assert.match(client.queries.at(-1), /rollback/i);
+  }
+});
+
 test("source-identity mismatch invalidates only the connector-day and performs no delete", async () => {
   const evidenceRows = [row()];
   const client = transactionClient({

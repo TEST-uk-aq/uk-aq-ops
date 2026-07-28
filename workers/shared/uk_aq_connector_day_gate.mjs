@@ -6,7 +6,23 @@ const MANIFEST_HASH_PATTERN = /^[0-9a-f]{64}$/;
 const COMPLETION_SOURCES = new Set(["prune_daily_phase_b"]);
 
 export function normalizeConnectorDayPair(dayUtc, connectorId) {
-  const day = String(dayUtc || "").trim();
+  let day;
+  if (dayUtc instanceof Date) {
+    if (
+      Number.isNaN(dayUtc.getTime())
+      || dayUtc.getUTCHours() !== 0
+      || dayUtc.getUTCMinutes() !== 0
+      || dayUtc.getUTCSeconds() !== 0
+      || dayUtc.getUTCMilliseconds() !== 0
+    ) {
+      throw new Error(`Invalid connector-day UTC date: ${String(dayUtc || "")}`);
+    }
+    day = dayUtc.toISOString().slice(0, 10);
+  } else if (typeof dayUtc === "string") {
+    day = dayUtc.trim();
+  } else {
+    throw new Error(`Invalid connector-day UTC date: ${String(dayUtc || "")}`);
+  }
   const parsedDay = new Date(`${day}T00:00:00.000Z`);
   const connector = Number(connectorId);
   if (
