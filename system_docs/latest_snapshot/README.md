@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This directory is the authoritative documentation for the UK AQ latest-snapshot pipeline used by the website map and station search.
+This directory is the authoritative documentation for the UK AQ latest-snapshot pipeline used by the website homepage, map and station search.
 
 The system consumes observation messages through a dedicated Pub/Sub subscription, maintains latest-valid-per-timeseries state in R2, publishes one physical `window=all` snapshot per supported pollutant, and serves the public finite windows through the private R2 API Worker. The cache proxy exposes the unchanged v2 API to the website.
 
@@ -11,13 +11,14 @@ The Cloud Run builder may reuse validated container-local copies of its durable 
 ## Authoritative reading order
 
 1. [`contract.md`](contract.md)
-2. [`data_flow.md`](data_flow.md)
-3. [`state_model.md`](state_model.md)
-4. [`interfaces.md`](interfaces.md)
-5. [`operations.md`](operations.md)
-6. [`recovery.md`](recovery.md)
-7. [`validation.md`](validation.md)
-8. Relevant files under [`decisions/`](decisions/)
+2. [`homepage-consumer-contract.md`](homepage-consumer-contract.md) for the public homepage `Highest sensor readings` refresh and layout behaviour
+3. [`data_flow.md`](data_flow.md)
+4. [`state_model.md`](state_model.md)
+5. [`interfaces.md`](interfaces.md)
+6. [`operations.md`](operations.md)
+7. [`recovery.md`](recovery.md)
+8. [`validation.md`](validation.md)
+9. Relevant files under [`decisions/`](decisions/)
 
 ## Implementation ownership
 
@@ -32,7 +33,8 @@ This area governs the behaviour of:
 - the `/api/aq/latest-snapshot` boundary in `workers/uk_aq_cache_proxy/src/index.ts`;
 - `.github/workflows/uk_aq_latest_snapshot_cloud_run_deploy.yml`;
 - `.github/workflows/uk_aq_latest_snapshot_r2_api_worker_deploy.yml`;
-- latest-snapshot state seed, repair and rebuild scripts under `scripts/backup_r2/`.
+- latest-snapshot state seed, repair and rebuild scripts under `scripts/backup_r2/`;
+- the public homepage latest-readings consumer in `TEST-uk-aq/TEST-uk-aq.github.io/index.html` and `dashboard.js`, within the limits defined by [`homepage-consumer-contract.md`](homepage-consumer-contract.md).
 
 The raw observation publisher and raw observation-history writer are upstream systems. They are not owned by this area and MUST continue preserving source observations, including invalid or sentinel values.
 
@@ -44,6 +46,15 @@ The raw observation publisher and raw observation-history writer are upstream sy
 - Windows: `3h`, `6h`, `1d`, `7d`, `all`
 - Network group: `all`
 - Public snapshot contract: `v2`
+
+### Homepage consumer
+
+- The `Highest sensor readings` dashboard uses the existing six-hour finite latest-snapshot responses.
+- While visible, its automatic refreshes align to wall-clock five-minute boundaries.
+- It does not perform periodic refreshes while hidden.
+- It performs one immediate catch-up refresh on becoming visible when the previous dashboard request cycle is older than five minutes.
+- Manual and focus-triggered refreshes may occur off-boundary without changing the next normal boundary.
+- The top-right refresh control reuses the hex map button treatment, while the network selector sits in a lower controls row.
 
 ### Physical R2 matrix
 
@@ -100,7 +111,7 @@ Old finite-window R2 objects may remain from the previous architecture. They are
 
 ## Current implementation status
 
-As of 17 July 2026:
+As of 28 July 2026:
 
 - decoded observations are resolved and checked against the latest-current-value policy before they can replace state;
 - invalid or sentinel pollutant values do not create or replace latest state;
@@ -111,7 +122,8 @@ As of 17 July 2026:
 - R2 remains the durable authority and local cache failures remain non-authoritative;
 - the default run-report mode is `failures`, so successful scheduled runs do not create per-minute `_runs` objects;
 - the public v2 route, parameters and response fields remain unchanged;
-- the TEST implementation is reported complete.
+- the TEST backend implementation is reported complete;
+- the homepage consumer refresh and layout behaviour is approved in [`homepage-consumer-contract.md`](homepage-consumer-contract.md) and is pending implementation.
 
 ## Decisions
 
