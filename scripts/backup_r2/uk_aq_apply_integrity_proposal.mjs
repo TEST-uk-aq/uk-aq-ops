@@ -22,6 +22,7 @@ import {
   runCanonicalGlobalIndexFinalizer,
   withHistoryWriterClient,
   mergeConnectorManifestReferences,
+  readParentManifestForBoundedRecovery,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
   buildHistoryV2DayManifest,
@@ -471,27 +472,41 @@ async function verifyLiveObservationPartition({
 async function prepareMergedDayManifest({ r2, object, adapters }) {
   if (!/\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(object.key)) return;
   const proposed = JSON.parse(object.body.toString("utf8"));
-  let currentReferences = null;
-  try {
-    const current = JSON.parse((await adapters.getObject({ r2, key: object.key })).body.toString("utf8"));
-    const values = Array.isArray(current?.connector_manifests)
-      ? current.connector_manifests
-      : Array.isArray(current?.child_manifests) ? current.child_manifests : null;
-    if (!values) throw new Error("Current day manifest has no connector references");
-    currentReferences = values.map((entry) => ({
-      connector_id: Number(entry.connector_id),
-      manifest_key: String(entry.manifest_key || ""),
-    }));
-    const dayPrefix = object.key.slice(0, -"manifest.json".length);
-    if (currentReferences.some((entry) =>
-      !Number.isInteger(entry.connector_id) || entry.connector_id <= 0 ||
-      !entry.manifest_key.startsWith(dayPrefix) ||
-      !entry.manifest_key.endsWith(`/connector_id=${entry.connector_id}/manifest.json`)
-    )) {
-      throw new Error("Current day manifest has invalid connector references");
-    }
-  } catch (_error) {
-    const dayPrefix = object.key.slice(0, -"manifest.json".length);
+  const dayPrefix = object.key.slice(0, -"manifest.json".length);
+  const currentRead = await readParentManifestForBoundedRecovery({
+    getObject: adapters.getObject,
+    r2,
+    key: object.key,
+    validate: (current) => {
+      validateCanonicalHistoryV2Manifest(current, {
+        history_version: "v2",
+        domain: proposed.domain,
+        grain: proposed.grain ?? null,
+        profile: proposed.profile ?? null,
+        manifest_kind: "day",
+        day_utc: proposed.day_utc,
+        manifest_key: object.key,
+      });
+      const values = Array.isArray(current?.connector_manifests)
+        ? current.connector_manifests
+        : Array.isArray(current?.child_manifests) ? current.child_manifests : null;
+      if (!values) throw new Error("Current day manifest has no connector references");
+      const references = values.map((entry) => ({
+        connector_id: Number(entry.connector_id),
+        manifest_key: String(entry.manifest_key || ""),
+      }));
+      if (references.some((entry) =>
+        !Number.isInteger(entry.connector_id) || entry.connector_id <= 0 ||
+        !entry.manifest_key.startsWith(dayPrefix) ||
+        !entry.manifest_key.endsWith(`/connector_id=${entry.connector_id}/manifest.json`)
+      )) {
+        throw new Error("Current day manifest has invalid connector references");
+      }
+      return references;
+    },
+  });
+  let currentReferences = currentRead.state === "valid" ? currentRead.value : [];
+  if (currentRead.state !== "valid") {
     const discovered = await adapters.listAllObjects({ r2, prefix: dayPrefix, max_keys: 10_000 });
     currentReferences = discovered.flatMap((entry) => {
       const key = String(entry.key || "");

@@ -5,7 +5,9 @@ import {
   HISTORY_LOCK_NAMESPACES,
   evaluateIntegrityIngestBoundary,
   historyWriterLockIdentity,
+  isConfirmedR2ObjectAbsentError,
   mergeConnectorManifestReferences,
+  readParentManifestForBoundedRecovery,
   withHistoryWriterLock,
 } from "../workers/shared/uk_aq_r2_history_writer.mjs";
 
@@ -83,6 +85,61 @@ test("day-manifest merge preserves existing connectors and replaces changed conn
     { connector_id: 2, manifest_key: "new-2" },
     { connector_id: 3, manifest_key: "new-3" },
   ]);
+});
+
+test("parent-manifest recovery is limited to confirmed absence or structural invalidity", async () => {
+  const key = "history/v2/observations/day_utc=2026-07-26/manifest.json";
+  const validate = (manifest) => {
+    if (!Array.isArray(manifest.connector_manifests)) throw new Error("invalid parent structure");
+    return manifest.connector_manifests;
+  };
+
+  const absent = await readParentManifestForBoundedRecovery({
+    getObject: async () => { throw new Error(`R2 GET failed (404) key=${key}: NoSuchKey`); },
+    key,
+    validate,
+  });
+  assert.equal(absent.state, "absent");
+
+  const malformedJson = await readParentManifestForBoundedRecovery({
+    getObject: async () => ({ body: Buffer.from("{not-json", "utf8") }),
+    key,
+    validate,
+  });
+  assert.equal(malformedJson.state, "structurally_invalid");
+
+  const invalidStructure = await readParentManifestForBoundedRecovery({
+    getObject: async () => ({ body: Buffer.from(JSON.stringify({ connector_manifests: null }), "utf8") }),
+    key,
+    validate,
+  });
+  assert.equal(invalidStructure.state, "structurally_invalid");
+
+  const valid = await readParentManifestForBoundedRecovery({
+    getObject: async () => ({
+      body: Buffer.from(JSON.stringify({ connector_manifests: [{ connector_id: 1 }] }), "utf8"),
+    }),
+    key,
+    validate,
+  });
+  assert.equal(valid.state, "valid");
+  assert.deepEqual(valid.value, [{ connector_id: 1 }]);
+
+  for (const error of [
+    Object.assign(new Error("R2 GET failed (403): AccessDenied"), { status: 403 }),
+    new Error("GET request timed out after 30000ms"),
+    new TypeError("fetch failed"),
+    Object.assign(new Error("R2 service unavailable"), { status: 503 }),
+  ]) {
+    await assert.rejects(readParentManifestForBoundedRecovery({
+      getObject: async () => { throw error; },
+      key,
+      validate,
+    }), (caught) => caught === error);
+  }
+  assert.equal(isConfirmedR2ObjectAbsentError(Object.assign(new Error("missing"), { statusCode: 404 })), true);
+  assert.equal(isConfirmedR2ObjectAbsentError(Object.assign(new Error("denied"), { statusCode: 403 })), false);
+  assert.equal(isConfirmedR2ObjectAbsentError(Object.assign(new Error("contradictory"), { statusCode: 403, code: "NoSuchKey" })), false);
 });
 
 test("Integrity boundary reports every overlapping connector and permits connectors without rows", () => {
