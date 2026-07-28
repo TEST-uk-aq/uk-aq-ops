@@ -17,6 +17,7 @@ Where older wording conflicts with this document, this document is authoritative
 - what qualifies as the shared canonical connector-day writer;
 - exact affected-day index finalisation;
 - deletion-time connector-gate validation;
+- current connector-day source identity, as detailed by [`prune_connector_source_identity.md`](prune_connector_source_identity.md);
 - aggregate day-gate totals;
 - active Phase B AQI history version;
 - Integrity boundary-preflight call order.
@@ -107,6 +108,9 @@ history_file_count
 history_total_bytes
 history_completed_at
 completion_source
+source_content_hash
+source_content_hash_contract_version
+source_content_hash_row_count
 ```
 
 A gate authorises deletion only when:
@@ -117,11 +121,14 @@ A gate authorises deletion only when:
 - the manifest hash is valid and matches the verified final connector manifest;
 - completion time is valid;
 - row, file and byte counts are present, non-negative and internally consistent with the verified manifest evidence;
-- the gate still represents the current frozen Prune Daily source identity for that connector-day.
+- the versioned source identity is present, valid and supported;
+- the gate source identity matches the candidate source identity;
+- both persisted identities match a fresh current canonical IngestDB identity immediately before deletion;
+- source revalidation and deletion occur within the same transaction and database session under [`prune_connector_source_identity.md`](prune_connector_source_identity.md).
 
-A gate with missing completion source, `completion_source=history_integrity`, another legacy/adoption source, missing counts or malformed counts MUST fail closed even when `history_done=true` and the key/hash/timestamp look plausible.
+A gate with missing completion source, `completion_source=history_integrity`, another legacy/adoption source, missing counts, malformed counts, missing source identity, unsupported source-identity version or current source mismatch MUST fail closed even when `history_done=true` and the key/hash/timestamp look plausible.
 
-Historical Integrity-created gate rows do not need to be bulk-deleted solely for this correction. They MUST simply be ineligible as deletion authority. Integrity, migration and the shared writer MUST NOT create or update them.
+Historical Integrity-created gate rows and existing null-identity gate rows do not need to be bulk-deleted solely for this correction. They MUST simply be ineligible as deletion authority. Integrity, migration and the shared writer MUST NOT create or update them.
 
 Focused deletion-gate checks MUST explicitly prove rejection of:
 
@@ -129,7 +136,51 @@ Focused deletion-gate checks MUST explicitly prove rejection of:
 - missing completion source;
 - missing count fields;
 - negative or malformed counts;
+- missing or malformed source identity;
+- unsupported source-identity contract version;
+- candidate/gate source-identity mismatch;
+- fresh current source mismatch caused by a value-only change;
+- fresh current source mismatch caused by a `verification_status`-only change;
 - a plausible historical manifest identity that was not completed by Prune Daily.
+
+## Current source identity and deletion atomicity
+
+The full authoritative connector-day source identity contract is [`prune_connector_source_identity.md`](prune_connector_source_identity.md).
+
+Count and minimum/maximum timestamp aggregates MAY remain an initial change detector. They MUST NOT preserve completed candidate status or deletion authority without a complete matching versioned source identity.
+
+The connector-day identity MUST use the shared canonical observation row encoder and cover:
+
+```text
+connector_id
+station_id
+timeseries_id
+pollutant_code
+observed_at_utc
+value
+verification_status
+```
+
+The identity is persisted on both:
+
+```text
+uk_aq_ops.history_candidates
+uk_aq_ops.prune_connector_day_gates
+```
+
+Existing rows with null identity fail closed and are reprocessed when matching IngestDB observations remain. They are not backfilled from R2 or aggregate evidence.
+
+Both deletion paths require:
+
+```text
+fresh current source identity
+=
+candidate source identity
+=
+gate source identity
+```
+
+That revalidation and deletion MUST occur in one PostgreSQL transaction and database session at `REPEATABLE READ` isolation or stronger. External R2, Dropbox or HTTP work MUST NOT occur inside that transaction.
 
 ## Aggregate day gate
 
@@ -216,7 +267,8 @@ Before deployment, only the smallest directly relevant deterministic checks are 
 - shared resource namespaces remain distinct;
 - the real Prune Daily and Integrity mutation paths use the same canonical builders and validators, not merely the same lock wrapper;
 - sparse affected days do not expand into intervening calendar days;
-- deletion-gate reads require `completion_source=prune_daily_phase_b` and complete count evidence;
+- deletion-gate reads require `completion_source=prune_daily_phase_b`, complete count evidence and complete source identity;
+- current, candidate and gate source identities are compared in one deletion transaction;
 - aggregate day totals are derived from the final merged connector set when the day gate is retained;
 - the active Phase B AQI path cannot execute a v1 writer branch;
 - an explicitly scoped boundary failure exits before any Dropbox, source or R2 adapter is called;
@@ -235,6 +287,7 @@ After deployment, validate through real TEST operation:
 4. confirm a same-connector-day conflict fails closed through the shared lock;
 5. confirm an existing connector is preserved when another connector is added to the same day;
 6. confirm only exact affected days and connector/pollutant indexes are updated;
-7. confirm only a valid `prune_daily_phase_b` connector gate authorises IngestDB deletion;
-8. confirm AQI failure remains separate from verified observation pruning;
-9. confirm retained aggregate day metadata matches the complete merged day manifest.
+7. confirm only a valid `prune_daily_phase_b` connector gate with matching current source identity authorises IngestDB deletion;
+8. confirm a value-only or `verification_status`-only source change invalidates old evidence and retains observations;
+9. confirm AQI failure remains separate from verified observation pruning;
+10. confirm retained aggregate day metadata matches the complete merged day manifest.
