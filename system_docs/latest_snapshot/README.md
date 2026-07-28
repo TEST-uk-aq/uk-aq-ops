@@ -50,9 +50,9 @@ The raw observation publisher and raw observation-history writer are upstream sy
 ### Homepage consumer
 
 - The `Highest sensor readings` dashboard uses the existing six-hour finite latest-snapshot responses.
-- While visible, its automatic refreshes align to wall-clock five-minute boundaries.
-- It does not perform periodic refreshes while hidden.
-- It performs one immediate catch-up refresh on becoming visible when the previous dashboard request cycle is older than five minutes.
+- Its automatic refreshes align to wall-clock five-minute boundaries only while the document is visible and the browser window is focused.
+- It does not perform periodic refreshes while hidden or unfocused.
+- It performs one immediate catch-up refresh on becoming active when the previous dashboard request cycle is older than five minutes.
 - Manual and focus-triggered refreshes may occur off-boundary without changing the next normal boundary.
 - The top-right refresh control reuses the hex map button treatment, while the network selector sits in a lower controls row.
 
