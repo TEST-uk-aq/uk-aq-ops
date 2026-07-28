@@ -36,7 +36,15 @@ test("Prune verifies opaque quoted ETag identity with HEAD and no body GET", asy
 });
 
 test("Prune preserves parent-linked opaque children but keeps active hash metadata fail-closed", () => {
-  const base = { manifest_schema_version: 2, source_row_count: 24, file_count: 1, total_bytes: 1234 };
+  const base = {
+    history_version: "v2",
+    manifest_schema_version: 2,
+    source_row_count: 24,
+    row_count: 24,
+    file_count: 1,
+    total_bytes: 1234,
+    files: [{ bytes: 1234 }],
+  };
   const opaque = { ...base, manifest_hash: sha256Hex(JSON.stringify(base)) };
   assert.equal(validateObservationPollutantManifestForGate({
     childManifest: opaque,

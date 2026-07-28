@@ -1,4 +1,5 @@
 import { Client } from "pg";
+import { normalizePruneConnectorSourceIdentity } from "./uk_aq_prune_connector_source_identity.mjs";
 
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const MANIFEST_HASH_PATTERN = /^[0-9a-f]{64}$/;
@@ -45,10 +46,12 @@ export function isValidConnectorHistoryGateEvidence(row) {
   let historyRowCount;
   let historyFileCount;
   let historyTotalBytes;
+  let sourceIdentity;
   try {
     historyRowCount = normalizeNonNegativeInteger(row.history_row_count, "history_row_count");
     historyFileCount = normalizeNonNegativeInteger(row.history_file_count, "history_file_count");
     historyTotalBytes = normalizeNonNegativeInteger(row.history_total_bytes, "history_total_bytes");
+    sourceIdentity = normalizePruneConnectorSourceIdentity(row);
   } catch (_error) {
     return false;
   }
@@ -62,6 +65,7 @@ export function isValidConnectorHistoryGateEvidence(row) {
     && !Number.isNaN(Date.parse(completedAt))
     && completionSource === "prune_daily_phase_b"
     && countsAreConsistent
+    && sourceIdentity.source_content_hash_row_count === historyRowCount
   );
 }
 
@@ -99,11 +103,15 @@ export function normalizeConnectorGateCompletionEvidence(evidence) {
   const historyRowCount = normalizeNonNegativeInteger(evidence?.history_row_count, "history_row_count");
   const historyFileCount = normalizeNonNegativeInteger(evidence?.history_file_count, "history_file_count");
   const historyTotalBytes = normalizeNonNegativeInteger(evidence?.history_total_bytes, "history_total_bytes");
+  const sourceIdentity = normalizePruneConnectorSourceIdentity(evidence);
   if (
     (historyRowCount === 0 && (historyFileCount !== 0 || historyTotalBytes !== 0))
     || (historyRowCount > 0 && (historyFileCount === 0 || historyTotalBytes === 0))
   ) {
     throw new Error("Connector gate row, file and byte counts are internally inconsistent");
+  }
+  if (sourceIdentity.source_content_hash_row_count !== historyRowCount) {
+    throw new Error("Connector gate source identity row count must equal history_row_count");
   }
   return {
     ...pair,
@@ -113,6 +121,7 @@ export function normalizeConnectorGateCompletionEvidence(evidence) {
     history_row_count: historyRowCount,
     history_file_count: historyFileCount,
     history_total_bytes: historyTotalBytes,
+    ...sourceIdentity,
     completion_source: completionSource,
   };
 }
@@ -138,6 +147,9 @@ do update set
   history_file_count = null,
   history_total_bytes = null,
   history_completed_at = null,
+  source_content_hash = null,
+  source_content_hash_contract_version = null,
+  source_content_hash_row_count = null,
   completion_source = null,
   updated_at = now()
 `,
@@ -161,6 +173,9 @@ insert into uk_aq_ops.prune_connector_day_gates (
   history_file_count,
   history_total_bytes,
   history_completed_at,
+  source_content_hash,
+  source_content_hash_contract_version,
+  source_content_hash_row_count,
   completion_source,
   updated_at
 )
@@ -176,6 +191,9 @@ values (
   $8::bigint,
   now(),
   $9,
+  $10::integer,
+  $11::bigint,
+  $12,
   now()
 )
 on conflict (day_utc, connector_id)
@@ -188,6 +206,9 @@ do update set
   history_file_count = excluded.history_file_count,
   history_total_bytes = excluded.history_total_bytes,
   history_completed_at = excluded.history_completed_at,
+  source_content_hash = excluded.source_content_hash,
+  source_content_hash_contract_version = excluded.source_content_hash_contract_version,
+  source_content_hash_row_count = excluded.source_content_hash_row_count,
   completion_source = excluded.completion_source,
   updated_at = now()
 `,
@@ -200,6 +221,9 @@ do update set
       evidence.history_row_count,
       evidence.history_file_count,
       evidence.history_total_bytes,
+      evidence.source_content_hash,
+      evidence.source_content_hash_contract_version,
+      evidence.source_content_hash_row_count,
       evidence.completion_source,
     ],
   );

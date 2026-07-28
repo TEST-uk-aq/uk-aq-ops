@@ -7,6 +7,7 @@ import {
   buildHistoryV2PollutantManifest,
   derivePhaseBPgTimeoutsForTest,
   isAcceptedPruneHistoryDayManifestKey,
+  markCandidateAndConnectorGateCompleteForTest,
   populateBackupCandidatesForTest,
   runPhaseBBackup,
   runBudgetedPhaseBStageForTest,
@@ -25,6 +26,7 @@ import {
   isValidConnectorHistoryGateEvidence,
   setConnectorDayGateIncomplete,
 } from "../workers/shared/uk_aq_connector_day_gate.mjs";
+import { computePruneConnectorSourceIdentity } from "../workers/shared/uk_aq_prune_connector_source_identity.mjs";
 
 test("prune history day manifest gate accepts v1 observation day manifests", () => {
   assert.equal(
@@ -77,6 +79,9 @@ test("connector-day gate is exact Prune Daily deletion authority", async () => {
     history_file_count: 1,
     history_total_bytes: 100,
     history_completed_at: "2026-06-13T01:02:03.000Z",
+    source_content_hash: "b".repeat(64),
+    source_content_hash_contract_version: 1,
+    source_content_hash_row_count: 10,
     completion_source: "prune_daily_phase_b",
   };
   assert.equal(isValidConnectorHistoryGateEvidence(completeConnectorTwo), true);
@@ -87,6 +92,9 @@ test("connector-day gate is exact Prune Daily deletion authority", async () => {
     "history_row_count",
     "history_file_count",
     "history_total_bytes",
+    "source_content_hash",
+    "source_content_hash_contract_version",
+    "source_content_hash_row_count",
     "completion_source",
   ]) {
     assert.equal(
@@ -218,7 +226,68 @@ test("aggregate day-gate totals include connectors preserved in the merged day m
   assert.equal(totals.history_total_bytes, 300n);
 });
 
+test("candidate and connector gate completion persist identical source identity", async () => {
+  const dayUtc = "2026-07-21";
+  const sourceIdentity = computePruneConnectorSourceIdentity(
+    canonicalCandidateRows(dayUtc, 7, 2),
+  );
+  const calls = [];
+  const client = {
+    async query(sql, params = []) {
+      calls.push({ sql, params });
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  await markCandidateAndConnectorGateCompleteForTest(client, {
+    dayUtc,
+    connectorId: 7,
+    runId: "run-1",
+    manifestKey: canonicalObservationConnectorManifestKey(dayUtc, 7),
+    manifestHash: "a".repeat(64),
+    historyRowCount: 2n,
+    historyFileCount: 1,
+    historyTotalBytes: 100n,
+    sourceIdentity,
+  });
+  const candidateWrite = calls.find(({ sql }) => /update uk_aq_ops\.history_candidates/i.test(sql));
+  const gateWrite = calls.find(({ sql }) => /insert into uk_aq_ops\.prune_connector_day_gates/i.test(sql));
+  assert.deepEqual(candidateWrite.params.slice(7, 10), [
+    sourceIdentity.source_content_hash,
+    sourceIdentity.source_content_hash_contract_version,
+    sourceIdentity.source_content_hash_row_count,
+  ]);
+  assert.deepEqual(gateWrite.params.slice(8, 11), candidateWrite.params.slice(7, 10));
+});
+
+test("incomplete connector gate clears all source identity fields", async () => {
+  let statement = "";
+  await setConnectorDayGateIncomplete({
+    async query(sql) {
+      statement = sql;
+      return { rows: [], rowCount: 1 };
+    },
+  }, { day_utc: "2026-07-21", connector_id: 7 });
+  assert.match(statement, /source_content_hash = null/);
+  assert.match(statement, /source_content_hash_contract_version = null/);
+  assert.match(statement, /source_content_hash_row_count = null/);
+});
+
+function canonicalCandidateRows(dayUtc, connectorId, count) {
+  return Array.from({ length: count }, (_, index) => ({
+    connector_id: connectorId,
+    station_id: connectorId * 10,
+    timeseries_id: connectorId * 1000 + index + 1,
+    pollutant_code: "no2",
+    observed_at_utc: `${dayUtc}T${String(index % 24).padStart(2, "0")}:00:00.000Z`,
+    value: index + 0.5,
+    status: index % 2 === 0 ? "P" : "R",
+  }));
+}
+
 function completeCandidate(dayUtc, connectorId, expectedRowCount, minObservedAt, maxObservedAt) {
+  const sourceIdentity = computePruneConnectorSourceIdentity(
+    canonicalCandidateRows(dayUtc, connectorId, expectedRowCount),
+  );
   return {
     day_utc: dayUtc,
     connector_id: connectorId,
@@ -231,6 +300,7 @@ function completeCandidate(dayUtc, connectorId, expectedRowCount, minObservedAt,
     history_row_count: String(expectedRowCount),
     history_file_count: 1,
     history_total_bytes: "100",
+    ...sourceIdentity,
     resume_last_timeseries_id: null,
     resume_last_observed_at: null,
     resume_part_index: 0,
@@ -241,8 +311,20 @@ function completeCandidate(dayUtc, connectorId, expectedRowCount, minObservedAt,
 
 function candidatePopulationClient({ candidates, gates, sourceRows, afterPopulation = null }) {
   return {
-    async query(sql) {
+    async query(sql, params = []) {
       if (/select distinct op\.code/i.test(sql)) return { rows: [] };
+      if (/^begin isolation level repeatable read$/i.test(sql.trim()) || /^(commit|rollback)$/i.test(sql.trim())) {
+        return { rows: [] };
+      }
+      if (/select \*\s+from uk_aq_ops\.history_candidates/i.test(sql)) {
+        return { rows: [candidates.get(connectorDayGateKey(params[0], params[1]))] };
+      }
+      if (/uk_aq_phase_b_history_rows_v2/i.test(sql)) {
+        return { rows: canonicalCandidateRows(String(params[1]).slice(0, 10), Number(params[0]), Number(candidates.get(connectorDayGateKey(String(params[1]).slice(0, 10), params[0])).expected_row_count)) };
+      }
+      if (/^update uk_aq_ops\.(history_candidates|prune_connector_day_gates)/im.test(sql)) {
+        return { rows: [], rowCount: 1 };
+      }
       assert.match(sql, /source_changes as materialized/i);
       assert.match(sql, /invalidated_connector_gates as/i);
       assert.match(sql, /on conflict \(day_utc, connector_id\)/i);

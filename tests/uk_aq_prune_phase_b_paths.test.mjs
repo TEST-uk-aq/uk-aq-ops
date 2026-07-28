@@ -22,6 +22,7 @@ import {
   normalizeObservationPropertyCode,
   OBSERVATION_PROPERTY_CODE_SQL_PATTERN,
 } from "../workers/shared/uk_aq_observation_property_code.mjs";
+import { computePruneConnectorSourceIdentity } from "../workers/shared/uk_aq_prune_connector_source_identity.mjs";
 
 const DAY = "2026-06-14";
 const RUN_ID = "test-run";
@@ -215,32 +216,43 @@ test("Phase B v2 still rejects blank and unsafe observation property paths", asy
 
 test("Phase B v2 SQL uses set-based aggregation and preserves complete candidates", async () => {
   const queries = [];
+  const canonicalRows = Array.from({ length: 100 }, (_, index) => ({
+    connector_id: 7,
+    station_id: 70,
+    timeseries_id: index + 1,
+    pollutant_code: "no2",
+    observed_at_utc: `${DAY}T${String(index % 24).padStart(2, "0")}:00:00.000Z`,
+    value: index + 0.25,
+    status: index % 2 === 0 ? "P" : "R",
+  }));
+  const sourceIdentity = computePruneConnectorSourceIdentity(canonicalRows);
+  const completedRow = {
+    day_utc: DAY,
+    connector_id: 7,
+    expected_row_count: "100",
+    source_row_count: "100",
+    excluded_row_count: "0",
+    excluded_pollutant_counts: {},
+    min_observed_at: `${DAY}T00:00:00.000Z`,
+    max_observed_at: `${DAY}T23:59:59.999Z`,
+    status: "complete",
+    run_id: "previous-run",
+    manifest_key: "history/v2/observations/day_utc=2026-06-14/connector_id=7/manifest.json",
+    history_row_count: 100,
+    history_file_count: 1,
+    history_total_bytes: 12345,
+    history_completed_at: "2026-06-15T01:00:00.000Z",
+    ...sourceIdentity,
+  };
   const client = {
     async query(sql) {
       queries.push(sql);
       if (sql.includes("select distinct op.code")) {
         return { rows: [] };
       }
-      // Return a complete candidate that should remain complete
-      return {
-        rows: [{
-          day_utc: DAY,
-          connector_id: 7,
-          expected_row_count: "100",
-          source_row_count: "100",
-          excluded_row_count: "0",
-          excluded_pollutant_counts: {},
-          min_observed_at: `${DAY}T00:00:00.000Z`,
-          max_observed_at: `${DAY}T23:59:59.999Z`,
-          status: "complete",
-          run_id: "previous-run",
-          manifest_key: "history/v2/observations/day_utc=2026-06-14/connector_id=7/manifest.json",
-          history_row_count: 100,
-          history_file_count: 1,
-          history_total_bytes: 12345,
-          history_completed_at: "2026-06-15T01:00:00.000Z",
-        }],
-      };
+      if (sql.includes("uk_aq_phase_b_history_rows_v2")) return { rows: canonicalRows };
+      if (/^begin isolation level repeatable read$|^commit$|^rollback$/i.test(sql.trim())) return { rows: [] };
+      return { rows: [completedRow] };
     },
   };
 
@@ -251,21 +263,21 @@ test("Phase B v2 SQL uses set-based aggregation and preserves complete candidate
   });
 
   // Verify SQL structure
-  assert.equal(queries.length, 2);
-  assert.equal(queries[1].includes("source_aggregates"), true);
-  assert.equal(queries[1].includes("group by 1, 2"), true);
-  assert.equal(queries[1].includes("count(*)::bigint as expected_row_count"), true);
-  assert.equal(queries[1].includes("min(o.observed_at) as min_observed_at"), true);
-  assert.equal(queries[1].includes("max(o.observed_at) as max_observed_at"), true);
+  const candidateSql = queries.find((sql) => sql.includes("source_aggregates"));
+  assert.ok(candidateSql);
+  assert.equal(candidateSql.includes("group by 1, 2"), true);
+  assert.equal(candidateSql.includes("count(*)::bigint as expected_row_count"), true);
+  assert.equal(candidateSql.includes("min(o.observed_at) as min_observed_at"), true);
+  assert.equal(candidateSql.includes("max(o.observed_at) as max_observed_at"), true);
   
   // Verify no correlated subquery
-  assert.equal(queries[1].includes("select count(*)::bigint"), false);
-  assert.equal(queries[1].includes("where o2.connector_id = o.connector_id"), false);
+  assert.equal(candidateSql.includes("select count(*)::bigint"), false);
+  assert.equal(candidateSql.includes("where o2.connector_id = o.connector_id"), false);
 
   // Verify complete candidate preservation logic
-  assert.equal(queries[1].includes("status = case"), true);
-  assert.equal(queries[1].includes("when uk_aq_ops.history_candidates.status = 'complete'"), true);
-  assert.equal(queries[1].includes("is not distinct from"), true);
+  assert.equal(candidateSql.includes("status = case"), true);
+  assert.equal(candidateSql.includes("when uk_aq_ops.history_candidates.status = 'complete'"), true);
+  assert.equal(candidateSql.includes("is not distinct from"), true);
 
   // Verify candidate preservation
   assert.equal(candidates.length, 1);
@@ -292,13 +304,17 @@ test("Prune Daily timeout hierarchy matches the 30-minute runtime contract", () 
 
   assert.match(workflow, /timeout-minutes:\s*40/);
   assert.match(workflow, /timeout --kill-after=30s 30m node workers\/uk_aq_prune_daily\/job\.mjs/);
-  assert.match(workflow, /UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN:.*'1740'/);
-  assert.match(workflow, /UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS:.*'60'/);
+  assert.match(workflow, /UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN:.*'1740'/);
+  assert.match(workflow, /UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS:.*'60'/);
   assert.match(workflow, /Upload Prune Daily report\s+if: always\(\)/);
-  assert.match(targets, /^UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN,variable$/m);
-  assert.match(targets, /^UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS,variable$/m);
+  assert.match(targets, /^UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN,variable$/m);
+  assert.match(targets, /^UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS,variable$/m);
   assert.equal(resolved.max_seconds_per_run, 1_740);
   assert.equal(resolved.stop_before_timeout_seconds, 60);
+  assert.equal(resolvePhaseBRuntimeConfig({
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+    DATABASE_URL: "postgresql://retired-fallback.invalid/db",
+  }).supabase_db_url, "");
 });
 
 test("Phase B resets a stale v2 checkpoint when cleanup already removed all partial objects", () => {
