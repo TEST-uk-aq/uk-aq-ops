@@ -76,8 +76,8 @@ def discover_observations_days(
         return ()
     days: set[dt.date] = set()
     for entry in prefix_root.iterdir():
-        # Pre-boundary discovery is deliberately name-only.  Do not stat the
-        # child or inspect anything below this top-level observations scope.
+        if not entry.is_dir():
+            continue
         match = _DAY_DIRECTORY.fullmatch(entry.name)
         if not match:
             continue

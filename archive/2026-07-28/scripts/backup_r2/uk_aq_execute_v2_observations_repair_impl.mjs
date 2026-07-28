@@ -19,7 +19,7 @@ import {
   buildHistoryV2PollutantManifest,
   buildHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest,
-} from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
+} from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
   combineObservationHistoryPhysicalSchemas,
   observationHistoryPhysicalSchemaForColumns,

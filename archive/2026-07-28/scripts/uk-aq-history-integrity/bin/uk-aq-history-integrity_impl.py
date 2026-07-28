@@ -23293,33 +23293,6 @@ def _daily_profile_missed_logical_dates(
     return missed
 
 
-def _read_daily_profile_missed_logical_dates_readonly(
-    db_path: str,
-    *,
-    env_name: str,
-    logical_run_date: dt.date,
-) -> list[dt.date]:
-    """Read only the catch-up state permitted before the Integrity boundary."""
-    path = Path(db_path)
-    if not path.is_file():
-        return []
-    uri = f"{path.resolve().as_uri()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    try:
-        table_exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'daily_profile_state'"
-        ).fetchone()
-        if not table_exists:
-            return []
-        return _daily_profile_missed_logical_dates(
-            conn,
-            env_name=env_name,
-            logical_run_date=logical_run_date,
-        )
-    finally:
-        conn.close()
-
-
 def _upsert_daily_profile_state(
     conn: sqlite3.Connection,
     *,
@@ -24463,10 +24436,38 @@ def main(argv: list[str]) -> int:
     logical_run_date_source = "cli_logical_run_date" if args.logical_run_date else "current_utc_date"
     daily_task_scheduled_for_date = logical_run_date.isoformat()
     daily_task_platform_run_id = f"{args.env}:{run_compact}"
-    backup_gate_summary: dict[str, Any] = {
-        "backup_gate_checked": False,
-        "blocked_reason": "awaiting_ingestdb_boundary",
-    }
+    backup_gate_required = True
+    backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
+    if backup_gate_required:
+        log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
+        if not backup_gate_summary.get("backup_ready"):
+            log.error("backup gate blocked before Dropbox history scan: %s", backup_gate_summary.get("blocked_reason"))
+            summary = {
+                "env": args.env,
+                "profile": args.profile,
+                "source": args.source,
+                "from_day": args.from_day,
+                "to_day": args.to_day,
+                "started_at_utc": started_iso,
+                "finished_at_utc": fmt_iso(utc_now()),
+                "status": "blocked_backup_not_ready",
+                "dry_run": bool(args.dry_run),
+                "check_only": bool(args.check_only),
+                "run_backfill": bool(args.run_backfill),
+                "effective_mode": effective_mode,
+                "dropbox_baseline": resolve_r2_history_root(os.environ),
+                "repair_mode": bool(args.run_backfill),
+                "allow_stale_dropbox": bool(args.allow_stale_dropbox),
+                "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+                "log_path": str(log_path),
+                "history_version_mode": history_version_mode,
+                "checked_versions": checked_history_versions,
+                "history_path_configs": serialized_history_path_configs,
+                "backup_readiness": backup_gate_summary,
+                "metrics": {},
+            }
+            write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
+            return 2
 
     preflight_summary: dict[str, Any] | None = None
     repair_overlay: dict[str, Any] | None = None
@@ -24489,19 +24490,31 @@ def main(argv: list[str]) -> int:
             "manual profile without --from-day/--to-day; window is open-ended"
         )
 
+    conn = open_db(env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
+    normalize_source_key_sensorcommunity(conn, log)
     daily_selection: DailyProfileSelection | None = None
     selected_day_values: tuple[str, ...] | None = None
     selection_summary: dict[str, Any] | None = None
 
     def fail_daily_selection(selection_error: str) -> int:
-        """Report a pre-boundary selection failure without changing SQLite state."""
+        """Write a terminal report before daily task-health has started."""
+        try:
+            state_row_status = _upsert_failed_daily_profile_state(
+                conn,
+                env_name=args.env,
+                logical_run_date=logical_run_date,
+                started_at_utc=started_iso,
+                error_message=selection_error,
+            )
+        except Exception as state_exc:
+            state_row_status = "failed_state_record_error"
+            log.exception("daily selection failure state record failed: %s", state_exc)
         failed_selection = {
             "selection_mode": "daily_explicit",
             "logical_run_date": logical_run_date.isoformat(),
             "logical_run_date_source": logical_run_date_source,
             "logical_run_timezone": "UTC",
-            "state_row_status": "unchanged_pre_boundary",
-            "pre_boundary_scope_discovery_only": True,
+            "state_row_status": state_row_status,
             "error": selection_error,
         }
         summary = {
@@ -24530,6 +24543,7 @@ def main(argv: list[str]) -> int:
             "notes": selection_error,
         }
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
+        conn.close()
         return 1
 
     if args.profile == "daily" and not args.from_day and not args.to_day:
@@ -24551,10 +24565,8 @@ def main(argv: list[str]) -> int:
             )
             return fail_daily_selection(selection_error)
         try:
-            catch_up_logical_dates = _read_daily_profile_missed_logical_dates_readonly(
-                env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
-                env_name=args.env,
-                logical_run_date=logical_run_date,
+            catch_up_logical_dates = _daily_profile_missed_logical_dates(
+                conn, env_name=args.env, logical_run_date=logical_run_date,
             )
             daily_selection = build_daily_selection(
                 logical_run_date=logical_run_date,
@@ -24568,12 +24580,18 @@ def main(argv: list[str]) -> int:
             )
             from_day, to_day = daily_selection.from_day, daily_selection.to_day
             selection_summary = daily_selection.to_dict()
+            _upsert_daily_profile_state(
+                conn,
+                env_name=args.env,
+                selection=daily_selection,
+                integrity_run_id=None,
+                status="planned",
+            )
         except Exception as exc:
             return fail_daily_selection(f"daily date selection failed: {exc}")
         selection_summary = {
             **selection_summary,
-            "state_row_status": "unchanged_pre_boundary",
-            "pre_boundary_scope_discovery_only": True,
+            "state_row_status": "planned",
         }
         log.info(
             "daily explicit selection logical_run_date=%s latest_r2_observations_day=%s "
@@ -24641,60 +24659,14 @@ def main(argv: list[str]) -> int:
             "metrics": {},
         }
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
+        conn.close()
         return 2
 
-    backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
-    log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
-    if not backup_gate_summary.get("backup_ready"):
-        log.error("backup gate blocked after the IngestDB boundary: %s", backup_gate_summary.get("blocked_reason"))
-        summary = {
-            "env": args.env,
-            "profile": args.profile,
-            "source": args.source,
-            "from_day": from_day,
-            "to_day": to_day,
-            "date_selection": selection_summary,
-            "started_at_utc": started_iso,
-            "finished_at_utc": fmt_iso(utc_now()),
-            "status": "blocked_backup_not_ready",
-            "dry_run": bool(args.dry_run),
-            "check_only": bool(args.check_only),
-            "run_backfill": bool(args.run_backfill),
-            "effective_mode": effective_mode,
-            "dropbox_baseline": resolve_r2_history_root(os.environ),
-            "repair_mode": bool(args.run_backfill),
-            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
-            "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
-            "log_path": str(log_path),
-            "history_version_mode": history_version_mode,
-            "checked_versions": checked_history_versions,
-            "history_path_configs": serialized_history_path_configs,
-            "backup_readiness": backup_gate_summary,
-            "ingestdb_boundary": ingest_boundary,
-            "metrics": {},
-        }
-        write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
-        return 2
-
-    # Only after the request-wide boundary and backup readiness pass may
-    # normal Dropbox inspection and mutable local run state begin.
+    # Only after the request-wide boundary passes may preflight inspect the
+    # configured Dropbox roots used by later comparison stages.
     preflight_summary = run_preflight_or_die(args, env)
     log.info("preflight summary=%s", preflight_summary)
     log.info("window compatibility bounds from=%s to=%s", from_day, to_day)
-    conn = open_db(env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
-    normalize_source_key_sensorcommunity(conn, log)
-    if daily_selection is not None:
-        _upsert_daily_profile_state(
-            conn,
-            env_name=args.env,
-            selection=daily_selection,
-            integrity_run_id=None,
-            status="planned",
-        )
-        selection_summary = {
-            **(selection_summary or {}),
-            "state_row_status": "planned",
-        }
     run_id: int | None = None
     try:
         cur = conn.execute(

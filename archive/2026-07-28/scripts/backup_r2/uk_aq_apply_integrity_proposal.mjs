@@ -23,10 +23,7 @@ import {
   withHistoryWriterClient,
   mergeConnectorManifestReferences,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
-import {
-  buildHistoryV2DayManifest,
-  validateCanonicalHistoryV2Manifest,
-} from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
+import { buildHistoryV2DayManifest } from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
   resolveR2HistoryIndexConfig,
   updateR2HistoryIndexesTargeted,
@@ -509,14 +506,9 @@ async function prepareMergedDayManifest({ r2, object, adapters }) {
   const connectorManifests = [];
   for (const reference of mergedReferences) {
     const child = JSON.parse((await adapters.getObject({ r2, key: reference.manifest_key })).body.toString("utf8"));
-    validateCanonicalHistoryV2Manifest(child, {
-      history_version: "v2",
-      domain: proposed.domain,
-      manifest_kind: "connector",
-      day_utc: proposed.day_utc,
-      connector_id: reference.connector_id,
-      manifest_key: reference.manifest_key,
-    });
+    if (Number(child.connector_id) !== reference.connector_id || child.day_utc !== proposed.day_utc) {
+      throw new Error(`Live connector manifest scope mismatch during day merge: ${reference.manifest_key}`);
+    }
     connectorManifests.push({ ...child, manifest_key: reference.manifest_key });
   }
   const merged = buildHistoryV2DayManifest({
@@ -529,11 +521,6 @@ async function prepareMergedDayManifest({ r2, object, adapters }) {
     connectorManifests,
     writerGitSha: proposed.writer_git_sha ?? null,
     backedUpAtUtc: proposed.backed_up_at_utc ?? new Date().toISOString(),
-  });
-  validateCanonicalHistoryV2Manifest(merged, {
-    domain: proposed.domain,
-    manifest_kind: "day",
-    day_utc: proposed.day_utc,
   });
   object.body = Buffer.from(JSON.stringify(merged, null, 2), "utf8");
   Object.assign(object.entry, {
@@ -655,7 +642,8 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
             r2,
             historyVersion: "v2",
             domains: ["observations", "aqilevels"],
-            affectedDaysUtc: affectedDays,
+            fromDayUtc: affectedDays[0],
+            toDayUtc: affectedDays[affectedDays.length - 1],
             connectorId: null,
             updateLatestIndex: true,
             strictMissingTimeseriesCounts: true,

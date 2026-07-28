@@ -17,12 +17,24 @@ import {
   normalizeObservationPropertyCode,
   normalizeAqiPollutantCode,
   resolveR2HistoryIndexConfig,
+  resolveTargetedIsoDays,
   updateR2HistoryIndexesTargeted,
 } from "../workers/shared/uk_aq_r2_history_index.mjs";
 import {
   main as runHistoryIndexBuildCommand,
   runHistoryIndexBuild,
 } from "../scripts/backup_r2/uk_aq_build_r2_history_index.mjs";
+
+test("targeted index finalisation preserves an exact sparse affected-day set", () => {
+  assert.deepEqual(
+    resolveTargetedIsoDays({
+      fromDayUtc: "2025-07-27",
+      toDayUtc: "2026-07-21",
+      affectedDaysUtc: ["2026-07-21", "2025-07-27", "2026-06-27", "2026-07-21"],
+    }),
+    ["2025-07-27", "2026-06-27", "2026-07-21"],
+  );
+});
 
 test("buildDaySummaryFromManifest keeps connector row counts from observations day manifest", () => {
   const summary = buildDaySummaryFromManifest({

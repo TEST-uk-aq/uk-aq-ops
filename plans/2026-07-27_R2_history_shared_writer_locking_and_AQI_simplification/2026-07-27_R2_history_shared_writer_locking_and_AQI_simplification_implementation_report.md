@@ -1,6 +1,6 @@
 # R2 history shared writer locking and AQI simplification implementation report
 
-Date: 2026-07-27  
+Date: 2026-07-27; follow-up corrections completed 2026-07-28
 Scope: Codex phases 1 to 9  
 Repository: `TEST-uk-aq-ops`  
 Live operations performed: none
@@ -63,6 +63,61 @@ Removed:
 - legacy AQI RPC/export selection and fallback handling
 - Prune's second routine full history-index rebuild
 - chart-metrics execution from the Prune server
+
+## Follow-up review findings and corrections (2026-07-28)
+
+The follow-up review was performed against `main` at `97e082084089c7771483c4037aea122d33a953e9`, which includes the recorded daily-profile decision. The original six findings and the adjacent direct-writer issue were resolved as follows.
+
+| Finding | Review result | Implemented correction |
+| --- | --- | --- |
+| 1. Deletion gate could accept incomplete or non-Prune evidence | Confirmed | Deletion-time SQL now selects the completion source and all row/file/byte totals. Validation requires exact canonical connector-day identity, lowercase manifest SHA-256, valid completion time, `completion_source=prune_daily_phase_b`, present non-negative counts and internally consistent zero/non-zero totals. Integrity, adoption and malformed evidence fail closed. |
+| 2. The shared writer was chiefly a lock/callback wrapper while object construction remained duplicated | Confirmed | Added shared canonical v2 key, Parquet, physical-schema, pollutant/connector/day manifest and manifest-validation implementations. Prune Daily, the Integrity proposal/apply path, local proposal construction and the v2 observations migration/repair implementation now import those shared implementations. Source acquisition remains caller-specific. The shared writer module exposes the canonical construction/validation surface alongside its retained-session lock lifecycle. |
+| 3. Sparse routine affected days expanded to the inclusive minimum/maximum range | Confirmed | Added the exact `affectedDaysUtc` interface and threaded it through v1/v2 targeted domain and timeseries index finalisation. Prune Daily and Integrity apply now pass the exact de-duplicated day set; the continuous range interface remains available only to explicit range callers. |
+| 4. Active Phase B retained executable v1 AQI output | Confirmed | Active Phase B configuration now requires v2 and fails closed otherwise. Its v1 AQI prefixes, manifest builders, Parquet writer and fallback branches were removed. The active outputs are only the v2 hourly data and debug trees. Separate shared legacy reader/index support was not removed. |
+| 5. Aggregate day-gate totals omitted preserved connectors | Confirmed | Day finalisation now validates every fetched connector manifest, builds the merged day manifest from existing plus replacement connectors, GET-verifies the written day manifest, and derives retained `prune_day_gates` totals from that complete verified parent. |
+| 6. Integrity boundary ordering was neither correct for all modes nor directly proven | Confirmed | Explicit scopes run the request-wide IngestDB boundary before any Dropbox readiness/preflight or mutable Integrity state. Automatic daily performs only direct child-name discovery, a read-only `daily_profile_state` query and exact date selection before the boundary. Normal readiness, Dropbox inspection and state transitions start only after the boundary succeeds. |
+| Adjacent issue: direct live local source-to-R2 routes could remain a competing writer | Confirmed | Non-dry-run `source_to_r2`, `obs_aqi_to_r2` and `r2_history_obs_to_aqilevels` execution now fails closed unless it is constructing an Integrity proposal. Live publication remains the proposal apply path protected by the shared connector/day/global advisory-lock lifecycle. |
+
+### Daily-profile decision adopted
+
+The authoritative option 1 decision, including its SQLite refinement, is implemented. Automatic daily scope construction may inspect only direct names under the configured v2 observations prefix, strictly parse `day_utc=YYYY-MM-DD`, read only the required local `daily_profile_state` rows through SQLite `mode=ro`, calculate/de-duplicate the exact selected dates and derive their minimum/maximum boundary. It does not stat child entries, traverse connector/pollutant children, inspect content, change daily state, run readiness or access source/R2 adapters before the request-wide boundary succeeds.
+
+### Follow-up files changed
+
+Added:
+
+- `workers/shared/uk_aq_r2_history_canonical.mjs`
+- `workers/shared/uk_aq_r2_history_manifest_validation.mjs`
+- dated pre-change archives under `archive/2026-07-28/` for each substantial active non-test file changed
+
+Changed:
+
+- `workers/shared/uk_aq_r2_history_writer.mjs`
+- `workers/shared/uk_aq_connector_day_gate.mjs`
+- `workers/shared/uk_aq_r2_history_index.mjs`
+- `workers/uk_aq_prune_daily/phase_b_history_r2.mjs`
+- `workers/uk_aq_backfill_local/run_job.ts`
+- `scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`
+- `scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs`
+- `scripts/uk-aq-history-integrity/bin/daily_profile.py`
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
+- focused gate, path, index, backfill-route and Integrity call-order tests
+
+No file under `system_docs/` was changed, and tests/system documents were not archived.
+
+### Follow-up structural validation
+
+- `npm run check`: passed.
+- `deno check workers/uk_aq_backfill_local/run_job.ts`: passed.
+- Focused Node tests for writer coordination, canonical manifest compatibility/declarations, direct-route retirement, connector deletion evidence, merged day totals, v2-only Phase B and sparse index finalisation: 87 passed, 0 failed.
+- Focused Python call-order checks: explicit boundary failure, automatic daily direct-name-only discovery and automatic daily boundary failure all passed.
+- Python compilation of the changed Integrity modules: passed.
+- `git diff --check`: passed.
+- No real R2 access/write, Integrity repair, migration, prune, database mutation, Dropbox write, deployment or LIVE operation was performed.
+
+### Follow-up TEST operations still deferred
+
+After review and deployment, observe one automatic daily boundary rejection and confirm its report has no readiness/source/R2 work or pre-boundary daily-state transition. Then run one permitted automatic daily request and inspect the resulting exact sparse affected-day index updates. Also exercise one normal Prune connector-day with a preserved connector in the day parent, confirm the connector deletion gate contains complete Prune-owned evidence, and confirm only v2 observation-derived AQI outputs are produced. Direct local live source-to-R2 modes should be confirmed to fail closed while the Integrity proposal/apply route remains operational under the retained PostgreSQL advisory-lock session.
 
 ## Deployment changes
 

@@ -447,19 +447,10 @@ test("Phase B v2 resolves run manifests to the v2 ops prefix even when legacy ru
   );
 });
 
-test("Phase B v1 keeps existing v1 AQI levels and run manifest prefixes", () => {
-  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v1" });
-
-  assert.equal(resolved.history_write_version, "v1");
-  assert.equal(resolved.aqilevels_prefix, "history/v1/aqilevels/hourly");
-  assert.equal(resolved.runs_prefix, "history/v1/_ops/observations/runs");
-  assert.equal(
-    buildDayManifestKey(resolved.aqilevels_prefix, DAY),
-    "history/v1/aqilevels/hourly/day_utc=2026-06-14/manifest.json",
-  );
-  assert.equal(
-    runManifestKey(resolved.runs_prefix),
-    "history/v1/_ops/observations/runs/run_id=test-run/run_manifest.json",
+test("Phase B fails closed instead of resolving a v1 AQI writer", () => {
+  assert.throws(
+    () => resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v1" }),
+    /require canonical history version v2/,
   );
 });
 

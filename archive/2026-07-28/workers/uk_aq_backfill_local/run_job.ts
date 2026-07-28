@@ -76,19 +76,6 @@ import {
 import {
   reconcileIntegritySourceAdapterBlockedRows,
 } from "./source_integrity/blocked_rows.ts";
-import {
-  buildHistoryV2ConnectorManifest as buildCanonicalHistoryV2ConnectorManifest,
-  buildHistoryV2DayManifest as buildCanonicalHistoryV2DayManifest,
-  buildHistoryV2PollutantManifest as buildCanonicalHistoryV2PollutantManifest,
-  buildHistoryV2ConnectorManifestKey as buildCanonicalHistoryV2ConnectorManifestKey,
-  buildHistoryV2DayManifestKey as buildCanonicalHistoryV2DayManifestKey,
-  buildHistoryV2PartKey as buildCanonicalHistoryV2PartKey,
-  buildHistoryV2PollutantManifestKey as buildCanonicalHistoryV2PollutantManifestKey,
-  serializeCanonicalAqilevelDataV2Parquet,
-  serializeCanonicalAqilevelDebugV2Parquet,
-  serializeCanonicalObservationV2Parquet,
-  validateCanonicalHistoryV2Manifest,
-} from "../shared/uk_aq_r2_history_canonical.mjs";
 type RunMode =
   | "local_to_aqilevels"
   | "obs_aqi_to_r2"
@@ -2186,7 +2173,7 @@ function buildHistoryV2PollutantPrefix(
 }
 
 function buildHistoryV2DayManifestKey(basePrefix: string, dayUtc: string): string {
-  return buildCanonicalHistoryV2DayManifestKey(basePrefix, dayUtc);
+  return `${basePrefix}/day_utc=${dayUtc}/manifest.json`;
 }
 
 function buildHistoryV2ConnectorManifestKey(
@@ -2194,7 +2181,7 @@ function buildHistoryV2ConnectorManifestKey(
   dayUtc: string,
   connectorId: number,
 ): string {
-  return buildCanonicalHistoryV2ConnectorManifestKey(basePrefix, dayUtc, connectorId);
+  return `${buildHistoryV2ConnectorPrefix(basePrefix, dayUtc, connectorId)}/manifest.json`;
 }
 
 function buildHistoryV2PollutantManifestKey(
@@ -2203,7 +2190,7 @@ function buildHistoryV2PollutantManifestKey(
   connectorId: number,
   pollutantCode: string,
 ): string {
-  return buildCanonicalHistoryV2PollutantManifestKey(basePrefix, dayUtc, connectorId, pollutantCode);
+  return `${buildHistoryV2PollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/manifest.json`;
 }
 
 function buildHistoryV2PartKey(
@@ -2213,7 +2200,9 @@ function buildHistoryV2PartKey(
   pollutantCode: string,
   partIndex: number,
 ): string {
-  return buildCanonicalHistoryV2PartKey(basePrefix, dayUtc, connectorId, pollutantCode, partIndex);
+  return `${buildHistoryV2PollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/part-${
+    String(partIndex).padStart(5, "0")
+  }.parquet`;
 }
 
 function resolveIntegrityProposalStageDir(
@@ -3323,19 +3312,41 @@ function createObservationV2PollutantManifest(args: {
   backedUpAtUtc: string;
   observationContentHash: Record<string, unknown>;
 }) {
-  const manifest = buildCanonicalHistoryV2PollutantManifest({
-    domain: "observations",
-    ...args,
-    observationContentHash: args.observationContentHash,
-  });
-  validateCanonicalHistoryV2Manifest(manifest, {
-    domain: "observations",
+  const files = args.fileEntries.map((entry) => ({
+    ...entry,
+    pollutant_code: args.pollutantCode,
+  }));
+  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  return withManifestHash({
+    manifest_schema_version: HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION,
+    history_version: "v2",
     manifest_kind: "pollutant",
+    domain: "observations",
     day_utc: args.dayUtc,
     connector_id: args.connectorId,
     pollutant_code: args.pollutantCode,
+    pollutant_codes: [args.pollutantCode],
+    run_id: args.runId,
+    manifest_key: args.manifestKey,
+    source_row_count: args.sourceRowCount,
+    row_count: args.sourceRowCount,
+    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
+    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
+    min_observed_at_utc: minFileEntryString(files, "min_observed_at"),
+    max_observed_at_utc: maxFileEntryString(files, "max_observed_at"),
+    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
+    file_count: files.length,
+    total_bytes: totalBytes,
+    files,
+    child_manifests: [],
+    columns: HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
+    writer_version: HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
+    writer_git_sha: args.writerGitSha,
+    ...statsFromFileEntries(files, args.sourceRowCount),
+    ...args.observationContentHash,
+    backed_up_at_utc: args.backedUpAtUtc,
   });
-  return manifest;
 }
 
 function createObservationV2ConnectorManifest(args: {
@@ -3347,17 +3358,57 @@ function createObservationV2ConnectorManifest(args: {
   writerGitSha: string | null;
   backedUpAtUtc: string;
 }) {
-  const manifest = buildCanonicalHistoryV2ConnectorManifest({
-    domain: "observations",
-    ...args,
-  });
-  validateCanonicalHistoryV2Manifest(manifest, {
-    domain: "observations",
+  const files = args.pollutantManifests.flatMap((manifest) =>
+    Array.isArray(manifest.files) ? manifest.files as ObsHistoryFileEntry[] : []
+  );
+  const pollutantCodes = Array.from(new Set(args.pollutantManifests
+    .map((manifest) => String(manifest.pollutant_code || "").trim())
+    .filter(Boolean))).sort();
+  const totalRows = args.pollutantManifests.reduce((sum, manifest) => sum + toSafeInt(manifest.source_row_count), 0);
+  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  const childManifests = args.pollutantManifests.map((manifest) => ({
+    pollutant_code: manifest.pollutant_code,
+    manifest_key: manifest.manifest_key,
+    manifest_hash: manifest.manifest_hash,
+    source_row_count: manifest.source_row_count,
+    row_count: manifest.row_count,
+    file_count: manifest.file_count,
+    total_bytes: manifest.total_bytes,
+    min_timeseries_id: manifest.min_timeseries_id ?? null,
+    max_timeseries_id: manifest.max_timeseries_id ?? null,
+    min_observed_at_utc: manifest.min_observed_at_utc ?? null,
+    max_observed_at_utc: manifest.max_observed_at_utc ?? null,
+  }));
+  return withManifestHash({
+    manifest_schema_version: HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION,
+    history_version: "v2",
     manifest_kind: "connector",
+    domain: "observations",
     day_utc: args.dayUtc,
     connector_id: args.connectorId,
+    pollutant_code: null,
+    pollutant_codes: pollutantCodes,
+    run_id: args.runId,
+    manifest_key: args.manifestKey,
+    source_row_count: totalRows,
+    row_count: totalRows,
+    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
+    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
+    min_observed_at_utc: minFileEntryString(files, "min_observed_at"),
+    max_observed_at_utc: maxFileEntryString(files, "max_observed_at"),
+    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
+    file_count: files.length,
+    total_bytes: totalBytes,
+    files,
+    child_manifests: childManifests,
+    pollutant_manifests: childManifests,
+    columns: HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
+    writer_version: HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
+    writer_git_sha: args.writerGitSha,
+    ...statsFromFileEntries(files, totalRows),
+    backed_up_at_utc: args.backedUpAtUtc,
   });
-  return manifest;
 }
 
 export function createAqiConnectorManifest(args: {
@@ -3616,17 +3667,45 @@ export function createAqiV2PollutantManifest(args: {
   writerGitSha: string | null;
   backedUpAtUtc: string;
 }) {
-  const manifest = buildCanonicalHistoryV2PollutantManifest({
+  const filesWithCounts = args.fileEntries.map((entry) => ({
+    ...entry,
+    pollutant_code: args.pollutantCode,
+  }));
+  const files = stripTimeseriesCountsFromFileEntries(filesWithCounts);
+  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  const timeseriesRowCounts = aggregateTimeseriesRowCounts(filesWithCounts);
+  return withManifestHash({
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_version: "v2",
+    manifest_kind: "pollutant",
     domain: "aqilevels",
     grain: "hourly",
-    ...args,
-  });
-  validateCanonicalHistoryV2Manifest(manifest, {
-    domain: "aqilevels",
-    manifest_kind: "pollutant",
     profile: args.profile,
+    day_utc: args.dayUtc,
+    connector_id: args.connectorId,
+    pollutant_code: args.pollutantCode,
+    pollutant_codes: [args.pollutantCode],
+    run_id: args.runId,
+    manifest_key: args.manifestKey,
+    source_row_count: args.sourceRowCount,
+    row_count: args.sourceRowCount,
+    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
+    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
+    min_timestamp_hour_utc: minFileEntryString(files, "min_timestamp_hour_utc"),
+    max_timestamp_hour_utc: maxFileEntryString(files, "max_timestamp_hour_utc"),
+    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
+    file_count: files.length,
+    total_bytes: totalBytes,
+    files,
+    child_manifests: [],
+    columns: historyV2AqiColumns(args.profile),
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
+    writer_git_sha: args.writerGitSha,
+    ...statsFromFileEntries(files, args.sourceRowCount),
+    timeseries_row_counts: timeseriesRowCounts,
+    backed_up_at_utc: args.backedUpAtUtc,
   });
-  return manifest;
 }
 
 export function createAqiV2ConnectorManifest(args: {
@@ -3639,17 +3718,66 @@ export function createAqiV2ConnectorManifest(args: {
   writerGitSha: string | null;
   backedUpAtUtc: string;
 }) {
-  const manifest = buildCanonicalHistoryV2ConnectorManifest({
+  const files = args.pollutantManifests.flatMap((manifest) =>
+    Array.isArray(manifest.files) ? manifest.files as ObsHistoryFileEntry[] : []
+  );
+  const pollutantCodes = Array.from(new Set(args.pollutantManifests
+    .map((manifest) => String(manifest.pollutant_code || "").trim())
+    .filter(Boolean))).sort();
+  const totalRows = args.pollutantManifests.reduce(
+    (sum, manifest) => sum + toSafeInt(manifest.source_row_count),
+    0,
+  );
+  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  const timeseriesRowCounts = aggregateTimeseriesRowCounts(
+    args.pollutantManifests as Array<{ timeseries_row_counts?: Record<string, number> | null | undefined }>,
+  );
+  const childManifests = args.pollutantManifests.map((manifest) => ({
+    pollutant_code: manifest.pollutant_code,
+    manifest_key: manifest.manifest_key,
+    manifest_hash: manifest.manifest_hash,
+    source_row_count: manifest.source_row_count,
+    row_count: manifest.row_count,
+    file_count: manifest.file_count,
+    total_bytes: manifest.total_bytes,
+    min_timeseries_id: manifest.min_timeseries_id ?? null,
+    max_timeseries_id: manifest.max_timeseries_id ?? null,
+    min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
+    max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
+  }));
+  return withManifestHash({
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_version: "v2",
+    manifest_kind: "connector",
     domain: "aqilevels",
     grain: "hourly",
-    ...args,
-  });
-  validateCanonicalHistoryV2Manifest(manifest, {
-    domain: "aqilevels",
-    manifest_kind: "connector",
     profile: args.profile,
+    day_utc: args.dayUtc,
+    connector_id: args.connectorId,
+    pollutant_code: null,
+    pollutant_codes: pollutantCodes,
+    run_id: args.runId,
+    manifest_key: args.manifestKey,
+    source_row_count: totalRows,
+    row_count: totalRows,
+    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
+    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
+    min_timestamp_hour_utc: minFileEntryString(files, "min_timestamp_hour_utc"),
+    max_timestamp_hour_utc: maxFileEntryString(files, "max_timestamp_hour_utc"),
+    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
+    file_count: files.length,
+    total_bytes: totalBytes,
+    files,
+    child_manifests: childManifests,
+    pollutant_manifests: childManifests,
+    columns: historyV2AqiColumns(args.profile),
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
+    writer_git_sha: args.writerGitSha,
+    ...statsFromFileEntries(files, totalRows),
+    timeseries_row_counts: timeseriesRowCounts,
+    backed_up_at_utc: args.backedUpAtUtc,
   });
-  return manifest;
 }
 
 function createAqiV2DayManifest(args: {
@@ -3661,17 +3789,69 @@ function createAqiV2DayManifest(args: {
   writerGitSha: string | null;
   backedUpAtUtc: string;
 }) {
-  const manifest = buildCanonicalHistoryV2DayManifest({
+  const files = args.connectorManifests.flatMap((manifest) =>
+    Array.isArray(manifest.files) ? manifest.files as ObsHistoryFileEntry[] : []
+  );
+  const connectorIds = args.connectorManifests
+    .map((manifest) => Number(manifest.connector_id))
+    .filter((value) => Number.isInteger(value))
+    .sort((left, right) => left - right);
+  const pollutantCodes = Array.from(new Set(args.connectorManifests
+    .flatMap((manifest) => Array.isArray(manifest.pollutant_codes) ? manifest.pollutant_codes : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean))).sort();
+  const totalRows = args.connectorManifests.reduce(
+    (sum, manifest) => sum + toSafeInt(manifest.source_row_count),
+    0,
+  );
+  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  const childManifests = args.connectorManifests.map((manifest) => ({
+    connector_id: manifest.connector_id,
+    manifest_key: manifest.manifest_key,
+    manifest_hash: manifest.manifest_hash,
+    source_row_count: manifest.source_row_count,
+    row_count: manifest.row_count,
+    file_count: manifest.file_count,
+    total_bytes: manifest.total_bytes,
+    pollutant_codes: manifest.pollutant_codes,
+    min_timeseries_id: manifest.min_timeseries_id ?? null,
+    max_timeseries_id: manifest.max_timeseries_id ?? null,
+    min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
+    max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
+  }));
+  return withManifestHash({
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_version: "v2",
+    manifest_kind: "day",
     domain: "aqilevels",
     grain: "hourly",
-    ...args,
-  });
-  validateCanonicalHistoryV2Manifest(manifest, {
-    domain: "aqilevels",
-    manifest_kind: "day",
     profile: args.profile,
+    day_utc: args.dayUtc,
+    connector_id: null,
+    connector_ids: connectorIds,
+    pollutant_code: null,
+    pollutant_codes: pollutantCodes,
+    run_id: args.runId,
+    manifest_key: args.manifestKey,
+    source_row_count: totalRows,
+    row_count: totalRows,
+    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
+    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
+    min_timestamp_hour_utc: minFileEntryString(files, "min_timestamp_hour_utc"),
+    max_timestamp_hour_utc: maxFileEntryString(files, "max_timestamp_hour_utc"),
+    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
+    file_count: files.length,
+    total_bytes: totalBytes,
+    files,
+    child_manifests: childManifests,
+    connector_manifests: childManifests,
+    columns: historyV2AqiColumns(args.profile),
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
+    writer_git_sha: args.writerGitSha,
+    ...statsFromFileEntries(files, totalRows),
+    backed_up_at_utc: args.backedUpAtUtc,
   });
-  return manifest;
 }
 
 function ensureParquetWasmInitialized(): void {
@@ -3843,15 +4023,104 @@ function writeArrowTableToParquet(table: unknown, writerProperties: unknown): Ui
 }
 
 function rowsToObservationV2ParquetBuffer(rows: ObsHistoryV2ParquetRow[]): Uint8Array {
-  return serializeCanonicalObservationV2Parquet(rows, { rowGroupSize: OBS_R2_ROW_GROUP_SIZE });
+  ensureParquetWasmInitialized();
+  const int32Vector = (values: Array<number | null>) =>
+    arrow.vectorFromArray(values, new arrow.Int32());
+  const textVector = (values: Array<string | null>) =>
+    arrow.vectorFromArray(values, new arrow.Utf8());
+  const timestampVector = (values: Array<Date | null>) =>
+    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
+  const table = (arrow as unknown as {
+    tableFromArrays: (data: Record<string, unknown>) => unknown;
+  }).tableFromArrays({
+    connector_id: int32Vector(rows.map((row) => row.connector_id)),
+    station_id: int32Vector(rows.map((row) => row.station_id)),
+    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
+    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
+    observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at))),
+    value: rows.map((row) => row.value === null || row.value === undefined ? null : Number(row.value)),
+    verification_status: textVector(
+      rows.map((row) => row.verification_status ?? null),
+    ),
+  });
+  return writeArrowTableToParquet(
+    table,
+    parquetWriterProperties(
+      OBS_R2_ROW_GROUP_SIZE,
+      HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
+    ),
+  );
 }
 
 function rowsToAqiDataV2ParquetBuffer(rows: AqilevelsHistoryParquetRow[]): Uint8Array {
-  return serializeCanonicalAqilevelDataV2Parquet(rows, { rowGroupSize: AQI_R2_ROW_GROUP_SIZE });
+  ensureParquetWasmInitialized();
+  const int32Vector = (values: Array<number | null>) =>
+    arrow.vectorFromArray(values, new arrow.Int32());
+  const textVector = (values: Array<string | null>) =>
+    arrow.vectorFromArray(values, new arrow.Utf8());
+  const timestampVector = (values: Array<Date | null>) =>
+    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
+  const table = (arrow as unknown as {
+    tableFromArrays: (data: Record<string, unknown>) => unknown;
+  }).tableFromArrays({
+    connector_id: int32Vector(rows.map((row) => row.connector_id)),
+    station_id: int32Vector(rows.map((row) => row.station_id)),
+    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
+    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
+    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
+    daqi_index_level: int32Vector(rows.map((row) => row.daqi_index_level)),
+    eaqi_index_level: int32Vector(rows.map((row) => row.eaqi_index_level)),
+    daqi_calculation_status: textVector(rows.map((row) => row.daqi_calculation_status)),
+    daqi_missing_reason: textVector(rows.map((row) => row.daqi_missing_reason)),
+    eaqi_calculation_status: textVector(rows.map((row) => row.eaqi_calculation_status)),
+    eaqi_missing_reason: textVector(rows.map((row) => row.eaqi_missing_reason)),
+  });
+  return writeArrowTableToParquet(
+    table,
+    parquetWriterProperties(AQI_R2_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
+  );
 }
 
 function rowsToAqiDebugV2ParquetBuffer(rows: AqilevelsHistoryParquetRow[]): Uint8Array {
-  return serializeCanonicalAqilevelDebugV2Parquet(rows, { rowGroupSize: AQI_R2_ROW_GROUP_SIZE });
+  ensureParquetWasmInitialized();
+  const int32Vector = (values: Array<number | null>) =>
+    arrow.vectorFromArray(values, new arrow.Int32());
+  const float64Vector = (values: Array<number | null>) =>
+    arrow.vectorFromArray(values, new arrow.Float64());
+  const textVector = (values: Array<string | null>) =>
+    arrow.vectorFromArray(values, new arrow.Utf8());
+  const timestampVector = (values: Array<Date | null>) =>
+    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
+  const table = (arrow as unknown as {
+    tableFromArrays: (data: Record<string, unknown>) => unknown;
+  }).tableFromArrays({
+    connector_id: int32Vector(rows.map((row) => row.connector_id)),
+    station_id: int32Vector(rows.map((row) => row.station_id)),
+    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
+    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
+    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
+    daqi_input_value_ugm3: float64Vector(rows.map((row) => row.daqi_input_value_ugm3)),
+    daqi_input_averaging_code: textVector(rows.map((row) => row.daqi_input_averaging_code)),
+    daqi_index_level: int32Vector(rows.map((row) => row.daqi_index_level)),
+    daqi_source_observation_count: int32Vector(rows.map((row) => row.daqi_source_observation_count)),
+    daqi_required_observation_count: int32Vector(rows.map((row) => row.daqi_required_observation_count)),
+    daqi_calculation_status: textVector(rows.map((row) => row.daqi_calculation_status)),
+    daqi_missing_reason: textVector(rows.map((row) => row.daqi_missing_reason)),
+    eaqi_input_value_ugm3: float64Vector(rows.map((row) => row.eaqi_input_value_ugm3)),
+    eaqi_input_averaging_code: textVector(rows.map((row) => row.eaqi_input_averaging_code)),
+    eaqi_index_level: int32Vector(rows.map((row) => row.eaqi_index_level)),
+    eaqi_source_observation_count: int32Vector(rows.map((row) => row.eaqi_source_observation_count)),
+    eaqi_required_observation_count: int32Vector(rows.map((row) => row.eaqi_required_observation_count)),
+    eaqi_calculation_status: textVector(rows.map((row) => row.eaqi_calculation_status)),
+    eaqi_missing_reason: textVector(rows.map((row) => row.eaqi_missing_reason)),
+    hourly_sample_count: int32Vector(rows.map((row) => row.hourly_sample_count)),
+    algorithm_version: textVector(rows.map((row) => row.algorithm_version)),
+    computed_at_utc: timestampVector(rows.map((row) => row.computed_at_utc ? new Date(row.computed_at_utc) : null)),
+  });
+  return writeArrowTableToParquet(
+    table,
+    parquetWriterProperties(AQI_R2_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
+  );
 }
 
 async function deleteR2Keys(keys: string[]): Promise<number> {
@@ -16323,37 +16592,10 @@ async function runSourceToAll(
   };
 }
 
-const DIRECT_R2_MUTATION_MODES = new Set<RunMode>([
-  "source_to_r2",
-  "obs_aqi_to_r2",
-  "r2_history_obs_to_aqilevels",
-]);
-
-export function assertSharedCanonicalMutationRoute({
-  runMode,
-  dryRun,
-  integrityProposalMode,
-}: {
-  runMode: RunMode;
-  dryRun: boolean;
-  integrityProposalMode: boolean;
-}): void {
-  if (DIRECT_R2_MUTATION_MODES.has(runMode) && !dryRun && !integrityProposalMode) {
-    throw new Error(
-      `${runMode} direct live R2 mutation is retired; build an Integrity proposal and apply it through the shared advisory-lock lifecycle`,
-    );
-  }
-}
-
 async function main(): Promise<void> {
   const runId = crypto.randomUUID();
   const startedAtMs = Date.now();
   validateRunModeOutputScope();
-  assertSharedCanonicalMutationRoute({
-    runMode: RUN_MODE,
-    dryRun: DRY_RUN,
-    integrityProposalMode: INTEGRITY_PROPOSAL_MODE,
-  });
   resetRunCaches();
   const window = resolveRunWindow();
   await resolveRequestedStationFilters();

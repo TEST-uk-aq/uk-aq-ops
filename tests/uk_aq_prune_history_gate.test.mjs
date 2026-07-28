@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createPhaseBRunBudgetForTest,
+  buildHistoryV2ConnectorManifest,
+  buildHistoryV2DayManifest,
+  buildHistoryV2PollutantManifest,
   derivePhaseBPgTimeoutsForTest,
   isAcceptedPruneHistoryDayManifestKey,
   populateBackupCandidatesForTest,
   runPhaseBBackup,
   runBudgetedPhaseBStageForTest,
   stopPhaseBForBudgetForTest,
+  summarizeVerifiedMergedDayManifestForGate,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
   executePruneDaily,
@@ -69,18 +73,62 @@ test("connector-day gate is exact Prune Daily deletion authority", async () => {
     history_done: true,
     history_manifest_key: canonicalObservationConnectorManifestKey(dayUtc, 2),
     history_manifest_hash: "a".repeat(64),
+    history_row_count: 10,
+    history_file_count: 1,
+    history_total_bytes: 100,
     history_completed_at: "2026-06-13T01:02:03.000Z",
+    completion_source: "prune_daily_phase_b",
   };
   assert.equal(isValidConnectorHistoryGateEvidence(completeConnectorTwo), true);
   for (const missingField of [
     "history_manifest_key",
     "history_manifest_hash",
     "history_completed_at",
+    "history_row_count",
+    "history_file_count",
+    "history_total_bytes",
+    "completion_source",
   ]) {
     assert.equal(
       isValidConnectorHistoryGateEvidence({ ...completeConnectorTwo, [missingField]: null }),
       false,
       `${missingField} must fail closed`,
+    );
+  }
+  assert.equal(
+    isValidConnectorHistoryGateEvidence({ ...completeConnectorTwo, completion_source: "history_integrity" }),
+    false,
+    "Integrity-created evidence must not authorise deletion",
+  );
+  assert.equal(
+    isValidConnectorHistoryGateEvidence({ ...completeConnectorTwo, completion_source: "historical_adoption" }),
+    false,
+    "legacy/adoption evidence must not authorise deletion",
+  );
+  for (const malformedCounts of [
+    { history_row_count: -1 },
+    { history_file_count: "one" },
+    { history_total_bytes: "" },
+    { history_row_count: 10, history_file_count: 0 },
+    { history_row_count: 0, history_file_count: 1, history_total_bytes: 100 },
+  ]) {
+    assert.equal(
+      isValidConnectorHistoryGateEvidence({ ...completeConnectorTwo, ...malformedCounts }),
+      false,
+      `malformed count evidence must fail closed: ${JSON.stringify(malformedCounts)}`,
+    );
+  }
+  for (const missingZeroCount of ["history_row_count", "history_file_count", "history_total_bytes"]) {
+    assert.equal(
+      isValidConnectorHistoryGateEvidence({
+        ...completeConnectorTwo,
+        history_row_count: 0,
+        history_file_count: 0,
+        history_total_bytes: 0,
+        [missingZeroCount]: null,
+      }),
+      false,
+      `${missingZeroCount} must not be coerced to zero`,
     );
   }
 
@@ -123,6 +171,51 @@ test("connector-day gate is exact Prune Daily deletion authority", async () => {
   assert.equal(simulatedGateState.get(connectorDayGateKey(dayUtc, 1)), false);
   assert.equal(simulatedGateState.get(connectorDayGateKey(dayUtc, 2)), true);
 
+});
+
+test("aggregate day-gate totals include connectors preserved in the merged day manifest", () => {
+  const dayUtc = "2026-07-21";
+  const connectorManifests = [
+    { connectorId: 1, rows: 10, bytes: 100 },
+    { connectorId: 2, rows: 20, bytes: 200 },
+  ].map(({ connectorId, rows, bytes }) => {
+    const pollutantCode = "no2";
+    const pollutantManifest = buildHistoryV2PollutantManifest({
+      domain: "observations",
+      dayUtc,
+      connectorId,
+      pollutantCode,
+      manifestKey: `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`,
+      sourceRowCount: rows,
+      fileEntries: [{
+        key: `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/part-00000.parquet`,
+        row_count: rows,
+        bytes,
+      }],
+      observationContentHash: { observation_content_hash_row_count: rows },
+      backedUpAtUtc: "2026-07-22T00:00:00.000Z",
+    });
+    return buildHistoryV2ConnectorManifest({
+      domain: "observations",
+      dayUtc,
+      connectorId,
+      manifestKey: canonicalObservationConnectorManifestKey(dayUtc, connectorId),
+      pollutantManifests: [pollutantManifest],
+      backedUpAtUtc: "2026-07-22T00:00:00.000Z",
+    });
+  });
+  const manifestKey = `history/v2/observations/day_utc=${dayUtc}/manifest.json`;
+  const dayManifest = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc,
+    manifestKey,
+    connectorManifests,
+    backedUpAtUtc: "2026-07-22T00:00:00.000Z",
+  });
+  const totals = summarizeVerifiedMergedDayManifestForGate({ manifest: dayManifest, manifestKey, dayUtc });
+  assert.equal(totals.history_row_count, 30n);
+  assert.equal(totals.history_file_count, 2);
+  assert.equal(totals.history_total_bytes, 300n);
 });
 
 function completeCandidate(dayUtc, connectorId, expectedRowCount, minObservedAt, maxObservedAt) {
