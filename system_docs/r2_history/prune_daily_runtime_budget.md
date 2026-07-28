@@ -27,8 +27,8 @@ GitHub Actions job timeout          40 minutes
 The required implementation values are:
 
 ```text
-UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN=1740
-UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS=60
+UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN=1740
+UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS=60
 shell worker timeout=30m
 timeout --kill-after=30s 30m node workers/uk_aq_prune_daily/job.mjs
 GitHub Actions timeout-minutes=40
@@ -46,6 +46,28 @@ effective Phase B deadline
 The 60-second Phase B stop-before reserve and the additional 60 seconds between the internal maximum and the worker hard timeout provide a total two-minute controlled shutdown runway before forced termination.
 
 The GitHub Actions job timeout is deliberately longer than the worker timeout so checkout, dependency installation, report writing and artifact upload remain possible even when the worker uses its complete 30-minute hard envelope.
+
+## Phase B budget variable names
+
+The budget variables are owned by Prune Daily Phase B, not by every R2 history writer. Their names MUST therefore include the complete operational scope:
+
+```text
+UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN
+UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS
+```
+
+The recently introduced broad names are retired:
+
+```text
+UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN
+UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS
+```
+
+Because the broad names have not yet become an established deployed interface, the implementation MUST perform a clean rename and MUST NOT retain them as aliases or fallbacks.
+
+Module-local constants may remain concise where their enclosing Phase B module makes scope unambiguous.
+
+This rename does not create authority to rename every older `UK_AQ_R2_HISTORY_*` or `UK_AQ_PHASE_B_*` setting in the same change. Wider environment-variable naming consolidation is separate work.
 
 ## Phase B budget behaviour
 
@@ -73,11 +95,20 @@ A budget stop MUST NOT rely on exit code `124` or the shell timeout as normal co
 The active GitHub workflow MUST pass explicit defaults for both Phase B budget variables rather than relying only on source-code defaults:
 
 ```text
-UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN
-UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS
+UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN
+UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS
 ```
 
 Both variables MUST also be present in the repository's environment-variable catalogue with the correct GitHub variable target.
+
+The retired broad names MUST be absent from:
+
+- the active workflow;
+- runtime environment parsing;
+- environment-variable catalogues;
+- README configuration lists;
+- focused tests;
+- current implementation documentation.
 
 Source-code defaults, workflow defaults, configuration catalogues, focused tests and operational documentation MUST agree on the values in this contract.
 
@@ -96,7 +127,7 @@ The following are separate safety or service limits and MUST be reviewed for str
 
 Per-stage minimum completion allowances express the minimum remaining time required to begin a stage. They are not stage maximum durations. They MUST remain conservative and internally consistent with the new 1,680-second effective budget, but MUST NOT be blindly doubled.
 
-`UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN` remains an independent work-volume bound. It MUST NOT be increased merely because the runtime envelope increased.
+`UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN` remains an independent work-volume bound. It MUST NOT be increased or renamed merely because the runtime envelope increased.
 
 ## Failure and reporting
 
@@ -117,7 +148,8 @@ Before deployment, only narrow deterministic checks are required. They MUST prov
 
 - the workflow worker command uses a 30-minute hard timeout;
 - the workflow job timeout is 40 minutes;
-- workflow and source defaults use `1740` and `60`;
+- workflow and source defaults use `1740` and `60` through the Prune Daily Phase B variable names;
+- the retired broad variable names are absent from active code and configuration;
 - the calculated effective Phase B deadline is 1,680 seconds;
 - a stage is not started when its minimum allowance exceeds the remaining budget;
 - a budget stop returns a controlled retry-safe result and does not depend on forced termination;
@@ -135,4 +167,4 @@ After deployment:
 3. confirm Phase B stops safely before the 30-minute worker hard limit when its internal budget is exhausted;
 4. confirm the final report and task-health outcome are written;
 5. confirm any incomplete connector-day remains unpruned with its gate false;
-6. confirm completed connector-day deletion authority remains governed by the existing source-identity, manifest and index contracts.
+6. confirm completed connector-day deletion authority remains governed by [`prune_connector_source_identity.md`](prune_connector_source_identity.md), manifest and index contracts.
