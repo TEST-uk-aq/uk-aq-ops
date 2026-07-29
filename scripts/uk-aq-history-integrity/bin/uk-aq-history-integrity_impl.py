@@ -59,6 +59,35 @@ from daily_profile import (
     historical_target_days_json,
     selected_days_json,
 )
+from integrity.repair import (
+    decide_observation_repair,
+    suggested_repair_from_decision,
+)
+from integrity.current_state.auth import (
+    acquire_identity_token,
+    preflight_latest_snapshot_auth,
+    should_preflight_latest_snapshot_auth,
+    validate_latest_snapshot_auth_config,
+)
+from integrity.current_state.audit import (
+    ensure_audit_schema,
+    finish_target_attempt,
+    identity_sha256,
+    latest_target_attempt,
+    load_candidate_set,
+    persist_candidate_set,
+    record_target_attempt,
+    start_target_attempt,
+)
+from integrity.current_state.resume import (
+    parse_integrity_run_id,
+    prepare_current_state_resume,
+)
+from integrity.cli import (
+    add_current_state_resume_arguments,
+    validate_current_state_resume_arguments,
+)
+from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
 
 
 REQUIRED_ENV_VARS = (
@@ -114,15 +143,6 @@ DAILY_TASK_HEALTH_SOURCE_REPO = "uk-aq-ops"
 DAILY_TASK_HEALTH_SOURCE_WORKER = "uk-aq-history-integrity"
 DAILY_TASK_HEALTH_RPC_SCHEMA = "uk_aq_public"
 DAILY_TASK_HEALTH_ERROR_LIMIT = 1200
-CANONICAL_REPAIR_STAGE_ORDER = (
-    "observations_proposal",
-    "observations_metadata_proposal",
-    "aqi_proposal",
-    "canonical_apply",
-    "first_value_at_reconciliation",
-    "final_verification",
-    "current_state_reconciliation",
-)
 FIRST_VALUE_AT_RECONCILE_RPC = "uk_aq_rpc_timeseries_first_value_at_reconcile"
 FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE = 1000
 FIRST_VALUE_AT_RECONCILE_REPORT_SCOPE_LIMIT = 50
@@ -9027,180 +9047,21 @@ def _enrich_v2_observations_repair_plans(
 ) -> None:
     source_name = str((source_scope or {}).get("source") or "").strip().lower()
     sos_scope = source_name == "sos"
-    index_gap_types = {
-        "connector_manifest_invalid_json",
-        "connector_manifest_pollutant_codes_missing_child",
-        "connector_manifest_pollutant_codes_stale_child",
-        "connector_manifest_child_manifests_missing_child",
-        "connector_manifest_child_manifests_stale_child",
-        "connector_manifest_pollutant_manifests_missing_child",
-        "connector_manifest_pollutant_manifests_stale_child",
-        "connector_manifest_files_missing_child",
-        "connector_manifest_files_stale_child",
-        "day_manifest_invalid_json",
-        "day_manifest_connector_ids_missing_child",
-        "day_manifest_connector_ids_stale_child",
-        "day_manifest_child_manifests_missing_child",
-        "day_manifest_child_manifests_stale_child",
-        "day_manifest_connector_manifests_missing_child",
-        "day_manifest_connector_manifests_stale_child",
-        "day_manifest_files_missing_child",
-        "day_manifest_files_stale_child",
-        "index_day_dir_missing",
-        "index_connector_dir_missing",
-        "index_pollutant_dir_missing",
-        "index_manifest_missing",
-        "index_manifest_invalid_json",
-        "index_manifest_missing_timeseries_counts",
-        "index_manifest_empty_timeseries_counts",
-        "latest_index_missing",
-        "latest_index_invalid_json",
-        "latest_index_stale_or_incomplete",
-    }
-    data_gap_types = {
-        "day_dir_missing",
-        "connector_dir_missing",
-        "pollutant_dir_missing",
-        "data_manifest_missing",
-        "data_manifest_invalid_json",
-        "data_manifest_schema_mismatch",
-        "data_manifest_empty",
-        "data_manifest_file_count_mismatch",
-        "data_manifest_listed_parquet_missing",
-        "data_manifest_unlisted_parquet",
-        "data_manifest_duplicate_file_key",
-        "data_manifest_timeseries_row_count_mismatch",
-        "data_manifest_total_bytes_mismatch",
-        "data_manifest_empty_timeseries_counts",
-        "parquet_null_timeseries_id_rows",
-        "data_partition_zero_rows",
-        "parquet_missing",
-        "parquet_empty_or_placeholder",
-        "parquet_unreadable",
-        "row_count_mismatch",
-        "data_manifest_row_count_mismatch",
-        "source_r2_timeseries_row_mismatch",
-        "pollutant_missing",
-        "orphan_parquet_without_manifest",
-        "missing_pollutant_partitions",
-        "unexpected_connector_level_part_file",
-        "observation_content_hash_mismatch",
-        "observation_content_hash_invalid_contract",
-        "observation_content_hash_missing",
-    }
     for gap in gaps:
-        gap_type = str(gap.get("gap_type") or "")
-        day_utc = gap.get("day_utc")
-        connector_id = gap.get("connector_id")
-        if gap.get("fault_class") == "pollutant manifest-only fault":
-            gap["suggested_repair"] = {
-                "kind": "observation_pollutant_manifest_repair",
-                "requires_index_rebuild": True,
-                "commands": [],
-                "executes": False,
-                "steps": ["Rebuild the pollutant manifest from the readable parquet files."],
-                "notes": "The parquet content is readable; do not rewrite observation data.",
-            }
-            continue
-        if gap_type.startswith("connector_manifest_"):
-            gap["suggested_repair"] = {
-                "kind": "observation_connector_manifest_repair",
-                "requires_index_rebuild": False,
-                "commands": [],
-                "steps": [
-                    "Rebuild the connector manifest from the live pollutant child manifests.",
-                    "Keep any sibling pollutant partitions that are already present.",
-                ],
-                "notes": "Connector-level hierarchy gaps are repairable by rebuilding the parent manifest only.",
-            }
-            continue
-        if gap_type.startswith("day_manifest_"):
-            gap["suggested_repair"] = {
-                "kind": "observation_day_manifest_repair",
-                "requires_index_rebuild": False,
-                "commands": [],
-                "steps": [
-                    "Rebuild the day manifest from the live connector child manifests.",
-                    "Keep any sibling connector partitions that are already present.",
-                ],
-                "notes": "Day-level hierarchy gaps are repairable by rebuilding the parent manifest only.",
-            }
-            continue
-        if gap_type in index_gap_types:
-            gap["suggested_repair"] = {
-                "kind": "rebuild_v2_observations_index_only",
-                "requires_index_rebuild": True,
-                "commands": [],
-                "steps": [
-                    "Confirm the v2 observations data partition exists for the finding.",
-                    "Rebuild only the v2 observations _index_v2 timeseries manifest for the affected day/connector/pollutant.",
-                ],
-                "notes": (
-                    "No exact _index_v2 rebuild command is emitted because the index rebuild "
-                    "command contract remains unresolved."
-                ),
-            }
-        elif gap_type in data_gap_types:
-            gap["suggested_repair"] = {
-                "kind": (
-                    "observation_pollutant_manifest_repair"
-                    if gap_type in {
-                        "data_manifest_file_count_mismatch",
-                        "data_manifest_listed_parquet_missing",
-                        "data_manifest_unlisted_parquet",
-                        "data_manifest_duplicate_file_key",
-                        "data_manifest_timeseries_row_count_mismatch",
-                        "data_manifest_total_bytes_mismatch",
-                    }
-                    else (
-                        "uk_air_csv_to_v2_observations_backfill_required"
-                        if sos_scope
-                        else "source_to_v2_observations_backfill_required"
-                    )
-                ),
-                "requires_index_rebuild": True,
-                "commands": [],
-                "executes": False,
-                "operator_action_required": False,
-                "write_risk": "writes_to_r2_when_run_backfill_is_enabled",
-                "steps": [
-                    (
-                        "Use the cached annual UK-AIR CSV as the SOS observation source."
-                        if sos_scope
-                        else (
-                            "Repair the pollutant manifest so it matches the live parquet set and row counts."
-                            if gap_type in {
-                                "data_manifest_file_count_mismatch",
-                                "data_manifest_listed_parquet_missing",
-                                "data_manifest_unlisted_parquet",
-                                "data_manifest_duplicate_file_key",
-                                "data_manifest_timeseries_row_count_mismatch",
-                                "data_manifest_total_bytes_mismatch",
-                            }
-                            else "Use the current connector source cache as the observation source."
-                        )
-                    ),
-                    "Write the affected v2 observation partition through the existing source-to-R2 writer.",
-                    "Rebuild the affected v2 observations _index_v2 manifests and verify source parity before AQI rebuild.",
-                ],
-                "notes": (
-                    "The executable --run-backfill path reads the cached UK-AIR annual CSV "
-                    "as the sole SOS historical observation source."
-                    if sos_scope
-                    else (
-                        "Pollutant manifest gaps are repaired by rebuilding the manifest from live parquet files."
-                        if gap_type in {
-                            "data_manifest_file_count_mismatch",
-                            "data_manifest_listed_parquet_missing",
-                            "data_manifest_unlisted_parquet",
-                            "data_manifest_duplicate_file_key",
-                            "data_manifest_timeseries_row_count_mismatch",
-                            "data_manifest_total_bytes_mismatch",
-                        }
-                        else "The executable --run-backfill path uses the current connector source adapter."
-                    )
-                ),
-            }
+        decision = decide_observation_repair(
+            gap,
+            source_partition_unavailable=(
+                _source_partition_state_from_gap(gap)
+                in _SOURCE_PARTITION_UNAVAILABLE_STATES
+            ),
+            reconstructible_manifest=_reconstructible_observation_manifest_gap(
+                gap, gaps
+            ),
+        )
+        gap["repair_decision"] = decision.as_dict()
+        gap["suggested_repair"] = suggested_repair_from_decision(
+            decision, sos_scope=sos_scope
+        )
 
 
 def _manifest_codes_from_child_list(payload: Mapping[str, Any], field: str, id_key: str) -> set[str]:
@@ -12756,6 +12617,9 @@ def build_v2_repair_plan(
                 "commands": [],
                 "notes": notes or "",
             }
+            repair_decision = gap.get("repair_decision")
+            if isinstance(repair_decision, Mapping):
+                entry["repair_decision"] = dict(repair_decision)
             if kind == "aqi_rebuild":
                 entry["aqi_rebuild_origins"] = _normalize_aqi_rebuild_origins([aqi_rebuild_origin or "unspecified"])
             actions[key] = entry
@@ -12803,178 +12667,45 @@ def build_v2_repair_plan(
             ]
 
     for gap in observation_gaps:
-        gap_type = str(gap.get("gap_type") or "")
-        fault_class = str(gap.get("fault_class") or "")
         source_partition_state = _source_partition_state_from_gap(gap)
-        source_partition_unavailable = source_partition_state in _SOURCE_PARTITION_UNAVAILABLE_STATES
-        suggested = gap.get("suggested_repair")
-        suggested_kind = str(suggested.get("kind") or "") if isinstance(suggested, Mapping) else ""
         if not active_observation_pollutant(gap.get("pollutant_code")):
             continue
-        sos_missing_scope_repair = (
-            gap_type in {"day_dir_missing", "connector_dir_missing"}
-            or (
-                gap_type == "pollutant_dir_missing"
-                and str(gap.get("pollutant_code") or "").strip().lower()
-                in V2_OBSERVATION_INTEGRITY_POLLUTANTS
-            )
+        decision = decide_observation_repair(
+            gap,
+            source_partition_unavailable=(
+                source_partition_state in _SOURCE_PARTITION_UNAVAILABLE_STATES
+            ),
+            reconstructible_manifest=_reconstructible_observation_manifest_gap(
+                gap, observation_gaps
+            ),
+        )
+        if decision.repair_kind == "unclassified":
+            continue
+        repair_gap = dict(gap)
+        repair_gap["pollutant_code"] = decision.pollutant_code
+        repair_gap["repair_decision"] = decision.as_dict()
+        add_action(
+            decision.repair_kind,
+            gap=repair_gap,
+            requires_index_rebuild=decision.requires_index_rebuild,
+            operator_action_required=(
+                decision.executability_policy == "operator_action_required"
+            ),
+            data_changes_required=decision.data_changes_required,
+            notes=decision.reason,
         )
         if (
-            suggested_kind
-            == "uk_air_csv_to_v2_observations_backfill_required"
-            and sos_missing_scope_repair
+            decision.aqi_policy == "observation_dependency"
+            and eligible_for(decision.connector_id, decision.pollutant_code)
         ):
-            repair_gap = dict(gap)
-            if gap_type in {"day_dir_missing", "connector_dir_missing"}:
-                repair_gap["pollutant_code"] = None
             add_action(
-                "observation_data_repair",
+                "aqi_rebuild",
                 gap=repair_gap,
                 requires_index_rebuild=True,
                 data_changes_required=True,
-                notes="Repair the missing SOS observation connector-day from authoritative UK-AIR CSV source evidence.",
+                aqi_rebuild_origin="observation_dependency",
+                notes="Queue AQI rebuilding only because the observation data changed for an AQI-enabled pollutant.",
             )
-            continue
-        if (
-            source_partition_unavailable
-            and gap_type in {
-                "data_manifest_missing",
-                "data_manifest_invalid_json",
-                "data_manifest_schema_mismatch",
-                "data_manifest_empty",
-                "data_manifest_file_count_mismatch",
-                "data_manifest_listed_parquet_missing",
-                "data_manifest_unlisted_parquet",
-                "data_manifest_duplicate_file_key",
-                "data_manifest_timeseries_row_count_mismatch",
-                "data_manifest_total_bytes_mismatch",
-                "data_manifest_row_count_mismatch",
-                "parquet_missing",
-                "parquet_empty_or_placeholder",
-                "parquet_unreadable",
-                "row_count_mismatch",
-                "source_r2_timeseries_row_mismatch",
-                "pollutant_missing",
-                "missing_pollutant_partitions",
-                "unexpected_connector_level_part_file",
-                "orphan_parquet_without_manifest",
-            }
-            and not _reconstructible_observation_manifest_gap(gap, observation_gaps)
-        ):
-            add_action(
-                "source_mapping_issue",
-                gap=gap,
-                operator_action_required=True,
-                data_changes_required=False,
-                notes="Source evidence is unavailable for this scope; review the source mapping before choosing a repair.",
-            )
-            continue
-        if gap_type.startswith("connector_manifest_"):
-            add_action(
-                "observation_connector_manifest_repair",
-                gap=gap,
-                requires_index_rebuild=False,
-                notes="Rebuild the connector manifest from all valid live-R2 pollutant children without dropping siblings.",
-            )
-        elif gap_type.startswith("day_manifest_"):
-            add_action(
-                "observation_day_manifest_repair",
-                gap=gap,
-                requires_index_rebuild=False,
-                notes="Rebuild the day manifest from all valid live-R2 connector children without dropping siblings.",
-            )
-        elif gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
-            add_action(
-                "observation_index_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Rebuild the observation index metadata for the affected day/connector/pollutant.",
-            )
-        elif gap_type in {
-            "data_manifest_file_count_mismatch",
-            "data_manifest_unlisted_parquet",
-            "data_manifest_listed_parquet_missing",
-            "data_manifest_duplicate_file_key",
-            "data_manifest_timeseries_row_count_mismatch",
-            "data_manifest_total_bytes_mismatch",
-            "data_manifest_row_count_mismatch",
-            "observation_content_hash_missing",
-            "observation_content_hash_invalid_contract",
-        }:
-            if (
-                gap_type.startswith("observation_content_hash_")
-                and gap.get("hash_content_verified") is not True
-            ):
-                add_action(
-                    "observation_data_repair",
-                    gap=gap,
-                    requires_index_rebuild=True,
-                    data_changes_required=True,
-                    notes="Repair the complete observation pollutant partition because semantic content is not verified.",
-                )
-            else:
-                add_action(
-                    "observation_pollutant_manifest_repair",
-                    gap=gap,
-                    requires_index_rebuild=True,
-                    notes="Repair the pollutant manifest so it matches verified Parquet content and source hash evidence.",
-                )
-        elif fault_class == "pollutant manifest-only fault" and (
-            gap_type.startswith("data_manifest_") or gap_type == "orphan_parquet_without_manifest"
-        ):
-            add_action(
-                "observation_pollutant_manifest_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                data_changes_required=False,
-                notes="Rebuild the pollutant manifest from readable parquet without rewriting observation data.",
-            )
-        elif gap_type in {
-            "data_manifest_missing",
-            "data_manifest_invalid_json",
-            "data_manifest_schema_mismatch",
-            "data_manifest_empty",
-            "data_partition_zero_rows",
-            "parquet_missing",
-            "parquet_empty_or_placeholder",
-            "parquet_unreadable",
-            "row_count_mismatch",
-            "source_r2_timeseries_row_mismatch",
-            "pollutant_missing",
-            "orphan_parquet_without_manifest",
-            "missing_pollutant_partitions",
-            "unexpected_connector_level_part_file",
-            "observation_content_hash_mismatch",
-        }:
-            add_action(
-                "observation_data_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                data_changes_required=True,
-                notes="Repair the underlying observation data partition before rebuilding manifests and indexes.",
-            )
-            if eligible_for(gap.get("connector_id"), gap.get("pollutant_code")) and gap_type in {
-                "data_manifest_missing",
-                "data_manifest_invalid_json",
-                "data_manifest_schema_mismatch",
-                "data_manifest_empty",
-                "parquet_missing",
-                "parquet_empty_or_placeholder",
-                "parquet_unreadable",
-                "row_count_mismatch",
-                "data_manifest_row_count_mismatch",
-                "source_r2_timeseries_row_mismatch",
-                "pollutant_missing",
-                "orphan_parquet_without_manifest",
-            }:
-                add_action(
-                    "aqi_rebuild",
-                    gap=gap,
-                    requires_index_rebuild=True,
-                    data_changes_required=True,
-                    aqi_rebuild_origin="observation_dependency",
-                    notes="Queue AQI rebuilding only because the observation data changed for an AQI-enabled pollutant.",
-                )
 
     for gap in aqi_gaps:
         gap_type = str(gap.get("gap_type") or "")
@@ -17013,29 +16744,20 @@ def _derive_executable_observation_repair_pollutants(
             )
             for action_day, action_connector, action_pollutant in explicit_actions
         )
-        suggested = gap.get("suggested_repair")
-        suggested_kind = (
-            str(suggested.get("kind") or "")
-            if isinstance(suggested, Mapping) else ""
-        )
-        metadata_gap = (
-            gap_type.startswith((
-                "data_manifest_", "connector_manifest_", "day_manifest_",
-                "index_", "latest_index_",
-            ))
-            or gap_type == "orphan_parquet_without_manifest"
-        )
+        decision = decide_observation_repair(gap)
         if repair_plan_present:
-            explicit = action_matches
-        else:
             explicit = (
-                suggested_kind in {
-                    "source_to_v2_observations_backfill",
-                    "source_to_v2_observations_backfill_required",
-                    "uk_air_csv_to_v2_observations_backfill_required",
-                    "source_to_v2_observations_backfill_planned",
-                }
-                or not metadata_gap
+                action_matches
+                and decision.repair_kind == "observation_data_repair"
+                and decision.data_changes_required
+            )
+        else:
+            # Compatibility callers that have not attached a plan still use
+            # the same authoritative classification; they do not infer a
+            # destructive repair merely because a gap is non-metadata.
+            explicit = (
+                decision.repair_kind == "observation_data_repair"
+                and decision.data_changes_required
             )
         if not explicit:
             skip(
@@ -17818,13 +17540,6 @@ def run_v2_gap_backfills(
     gaps = list(v2_observations.get("gaps") or [])
     if not gaps:
         return metrics
-    metadata_gap_kinds = {
-        "observation_pollutant_manifest_repair",
-        "observation_connector_manifest_repair",
-        "observation_day_manifest_repair",
-        "observation_index_repair",
-        "rebuild_v2_observations_index_only",
-    }
     def gap_partition(gap: Mapping[str, Any]) -> tuple[str, int, str | None] | None:
         day_iso = str(gap.get("day_utc") or "").strip()
         try:
@@ -17856,18 +17571,13 @@ def run_v2_gap_backfills(
         if partition is None:
             continue
         day_iso, connector_id, pollutant_code = partition
-        if (
-            str(gap.get("gap_type") or "").startswith("index_")
-            or str((gap.get("suggested_repair") or {}).get("kind") or "")
-            == "rebuild_v2_observations_index_only"
-        ):
+        decision = decide_observation_repair(gap)
+        if decision.repair_kind == "observation_index_repair":
             index_only_keys.add((day_iso, connector_id))
             continue
         if gap_index not in executable_gap_indexes:
-            suggested = gap.get("suggested_repair")
-            suggested_kind = str(suggested.get("kind") or "") if isinstance(suggested, Mapping) else ""
             if (
-                suggested_kind in metadata_gap_kinds or gap.get("gap_type")
+                decision.repair_kind != "observation_data_repair"
             ) and not any(
                 int(item.get("gap_index", -1)) == gap_index
                 for item in skipped_metadata_gaps
@@ -17878,7 +17588,7 @@ def run_v2_gap_backfills(
                     "connector_id": connector_id,
                     "pollutant_code": pollutant_code,
                     "gap_type": gap.get("gap_type"),
-                    "suggested_repair_kind": suggested_kind or None,
+                    "suggested_repair_kind": decision.repair_kind,
                     "reason": "not_explicit_observation_data_repair",
                 })
             continue
@@ -20892,6 +20602,7 @@ def _current_state_candidates_from_verified_evidence(
     conn: sqlite3.Connection,
     env_name: str,
     scope_entries: Iterable[Mapping[str, Any]],
+    require_unambiguous_history: bool = False,
 ) -> dict[str, Any]:
     """Derive current-state inputs only from immutable verified source rows."""
     scopes = sorted({
@@ -20909,23 +20620,30 @@ def _current_state_candidates_from_verified_evidence(
     for day_utc, connector_id in scopes:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc) or connector_id <= 0:
             raise ValueError("verified current-state scope is invalid")
-        evidence_row = conn.execute(
+        evidence_rows = conn.execute(
             """
-            SELECT canonical_rows_json
+            SELECT canonical_rows_json, canonical_rows_sha256
             FROM source_connector_day_evidence
             WHERE env_name = ? AND day_utc = ? AND connector_id = ?
             ORDER BY id DESC
-            LIMIT 1
             """,
             (env_name, day_utc, connector_id),
-        ).fetchone()
-        if evidence_row is None:
+        ).fetchall()
+        if not evidence_rows:
             missing_evidence.append({
                 "day_utc": day_utc,
                 "connector_id": connector_id,
                 "reason": "immutable_canonical_source_evidence_unavailable",
             })
             continue
+        if require_unambiguous_history and len({
+            str(row[1]) for row in evidence_rows
+        }) != 1:
+            raise RuntimeError(
+                "legacy current-state source evidence is ambiguous for "
+                f"day={day_utc} connector_id={connector_id}"
+            )
+        evidence_row = evidence_rows[0]
         rows = json.loads(str(evidence_row[0] or "[]"))
         if not isinstance(rows, list):
             raise ValueError("verified current-state canonical rows are invalid")
@@ -21011,66 +20729,23 @@ def _current_state_candidates_from_verified_evidence(
 
 
 def _google_cloud_run_identity_token(audience: str) -> str:
-    resolved_audience = str(audience or "").strip()
-    if not resolved_audience:
-        raise RuntimeError(
-            "Google Cloud identity token audience is required for Latest Snapshot invocation"
-        )
-
-    command = ["gcloud", "auth", "print-identity-token"]
-    account = str(os.environ.get("CLOUDSDK_CORE_ACCOUNT") or "").strip()
-    if account:
-        command.append(f"--account={account}")
-    impersonated_service_account = str(
-        os.environ.get("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT") or ""
-    ).strip()
-    if impersonated_service_account:
-        command.append(
-            f"--impersonate-service-account={impersonated_service_account}"
-        )
-    command.append(f"--audiences={resolved_audience}")
-
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        detail = " ".join(str(exc).split())
-        if len(detail) > 500:
-            detail = detail[:497].rstrip() + "..."
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(
-            "Google Cloud identity token acquisition could not run gcloud"
-            f"{suffix}"
-        ) from exc
-
-    stderr = " ".join(str(completed.stderr or "").split())
-    if len(stderr) > 500:
-        stderr = stderr[:497].rstrip() + "..."
-    if completed.returncode != 0:
-        suffix = f": {stderr}" if stderr else ""
-        raise RuntimeError(
-            "Google Cloud identity token acquisition failed for Latest Snapshot "
-            f"invocation (gcloud exit {completed.returncode}){suffix}"
-        )
-
-    token = str(completed.stdout or "").strip()
-    if not token:
-        suffix = f": {stderr}" if stderr else ""
-        raise RuntimeError(
-            "Google Cloud identity token acquisition returned an empty token for "
-            f"Latest Snapshot invocation{suffix}"
-        )
-    return token
+    return acquire_identity_token(audience, settings=os.environ)
 
 
 def _post_cloud_run_reconciliation(
     *, url: str, audience: str, body: dict[str, Any], timeout_seconds: int,
+    settings: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    token = _google_cloud_run_identity_token(audience)
+    resolved_settings = settings or os.environ
+    config = validate_latest_snapshot_auth_config({
+        **{str(key): str(value) for key, value in resolved_settings.items()},
+        "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_URL": url,
+        "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_AUDIENCE": audience,
+        "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_TIMEOUT_SECONDS": str(
+            timeout_seconds
+        ),
+    })
+    token = acquire_identity_token(config.audience, settings=resolved_settings)
     request = urllib.request.Request(
         url,
         data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
@@ -21111,6 +20786,9 @@ def run_current_state_reconciliation(
     dry_run: bool,
     final_verification: Mapping[str, Any],
     log: logging.Logger,
+    selected_targets: Iterable[str] = ("timeseries", "latest_snapshot"),
+    candidate_sets: Mapping[str, Mapping[str, Any]] | None = None,
+    invocation_kind: str = "initial",
 ) -> dict[str, Any]:
     settings = {**os.environ, **{str(key): str(value) for key, value in env.items()}}
     enabled = _is_truthy(settings.get(
@@ -21145,13 +20823,57 @@ def run_current_state_reconciliation(
         result["failures"].append("final R2 verification did not succeed")
         return result
 
-    derived = _current_state_candidates_from_verified_evidence(
-        conn=conn,
-        env_name=env_name,
-        scope_entries=scope_entries,
-    )
-    raw_candidates = list(derived["raw_candidates"])
-    snapshot_candidates = list(derived["latest_snapshot_candidates"])
+    target_selection = set(selected_targets)
+    if not target_selection or not target_selection.issubset(
+        {"timeseries", "latest_snapshot"}
+    ):
+        raise RuntimeError("current-state target selection is invalid")
+    if candidate_sets is None:
+        selected_scope = {
+            "scopes": sorted({
+                (
+                    str(entry.get("day_utc") or "").strip(),
+                    int(entry.get("connector_id") or 0),
+                )
+                for entry in scope_entries
+                if isinstance(entry, Mapping)
+            })
+        }
+        derived = _current_state_candidates_from_verified_evidence(
+            conn=conn,
+            env_name=env_name,
+            scope_entries=[
+                {"day_utc": day_utc, "connector_id": connector_id}
+                for day_utc, connector_id in selected_scope["scopes"]
+            ],
+        )
+        raw_candidates = list(derived["raw_candidates"])
+        snapshot_candidates = list(derived["latest_snapshot_candidates"])
+    else:
+        raw_candidates = list(
+            (candidate_sets.get("timeseries") or {}).get("candidates") or []
+        )
+        snapshot_candidates = list(
+            (candidate_sets.get("latest_snapshot") or {}).get("candidates") or []
+        )
+        derived = {
+            "candidate_observed_at_min": (
+                candidate_sets.get("timeseries") or {}
+            ).get("candidate_observed_at_min"),
+            "candidate_observed_at_max": (
+                candidate_sets.get("timeseries") or {}
+            ).get("candidate_observed_at_max"),
+            "missing_evidence": [],
+        }
+        selected_scope = dict(
+            (candidate_sets.get("timeseries") or {}).get("selected_scope") or {}
+        )
+    try:
+        audit_run_id = int(str(integrity_run_id).rsplit(":", 1)[-1])
+    except ValueError as exc:
+        raise RuntimeError(
+            "current-state reconciliation requires a numeric linked Integrity run ID"
+        ) from exc
     result.update({
         "planned": True,
         "candidate_count": len(raw_candidates),
@@ -21167,6 +20889,42 @@ def run_current_state_reconciliation(
         result["overall_status"] = "failed"
         result["failures"].append("verified canonical source evidence is incomplete")
         return result
+    candidate_identities = (
+        {
+            "timeseries": str(candidate_sets["timeseries"]["candidate_identity_sha256"]),
+            "latest_snapshot": str(candidate_sets["latest_snapshot"]["candidate_identity_sha256"]),
+        }
+        if candidate_sets is not None
+        else {
+            "timeseries": persist_candidate_set(
+                conn, integrity_run_id=audit_run_id, target="timeseries",
+                candidates=raw_candidates, final_verification=final_verification,
+                env_name=env_name, selected_scope=selected_scope,
+            ),
+            "latest_snapshot": persist_candidate_set(
+                conn, integrity_run_id=audit_run_id, target="latest_snapshot",
+                candidates=snapshot_candidates, final_verification=final_verification,
+                env_name=env_name, selected_scope=selected_scope,
+            ),
+        }
+    )
+    candidate_audit_evidence = (
+        candidate_sets
+        if candidate_sets is not None
+        else {
+            target: load_candidate_set(
+                conn, integrity_run_id=audit_run_id, target=target
+            )
+            for target in ("timeseries", "latest_snapshot")
+        }
+    )
+    result["candidate_identities"] = candidate_identities
+    result["final_verification_identity_sha256"] = (
+        str(candidate_sets["timeseries"]["final_verification_identity_sha256"])
+        if candidate_sets is not None
+        else identity_sha256(dict(final_verification))
+    )
+    result["target_audit_statuses"] = {}
     if dry_run:
         result["timeseries_reconciliation_status"] = "planned"
         result["latest_snapshot_reconciliation_status"] = "planned"
@@ -21190,106 +20948,246 @@ def run_current_state_reconciliation(
             "skipped_older_count", "missing_timeseries_count", "failed_count",
         )
     }
-    try:
-        for offset in range(0, len(raw_candidates), CURRENT_STATE_TIMESERIES_CHUNK_SIZE):
-            chunk = raw_candidates[offset:offset + CURRENT_STATE_TIMESERIES_CHUNK_SIZE]
-            response = _http_post_json(
-                url=endpoint,
-                headers=_supabase_rest_headers(
-                    str(supabase.get("supabase_key") or ""), "uk_aq_public"
-                ),
-                body={
-                    "p_integrity_run_id": integrity_run_id,
-                    "p_candidates": chunk,
-                },
-            )
-            row = response[0] if isinstance(response, list) and len(response) == 1 else None
-            if not isinstance(row, Mapping):
-                raise RuntimeError("timeseries reconciliation RPC response is invalid")
-            counts = {key: int(row.get(key) or 0) for key in timeseries_summary}
-            if (
-                min(counts.values(), default=0) < 0
-                or counts["candidate_count"] != len(chunk)
-                or sum(counts[key] for key in (
-                    "updated_newer_count",
-                    "updated_same_timestamp_correction_count",
-                    "skipped_equal_count", "skipped_older_count",
-                    "missing_timeseries_count", "failed_count",
-                )) != len(chunk)
-            ):
-                raise RuntimeError("timeseries reconciliation RPC counts are invalid")
-            for key, value in counts.items():
-                timeseries_summary[key] += value
-        result["timeseries"] = timeseries_summary
-        result["timeseries_reconciliation_status"] = (
-            "failed" if timeseries_summary["missing_timeseries_count"]
-            or timeseries_summary["failed_count"] else "ok"
+    timeseries_error: str | None = None
+    result["target_attempts"] = {}
+    if "timeseries" not in target_selection:
+        result["timeseries_reconciliation_status"] = "skipped_not_selected"
+    elif not raw_candidates:
+        result["timeseries_reconciliation_status"] = "skipped_not_applicable"
+        result["target_attempts"]["timeseries"] = record_target_attempt(
+            conn, integrity_run_id=audit_run_id, env_name=env_name,
+            target="timeseries", invocation_kind=invocation_kind,
+            status="skipped_not_applicable",
+            candidate_identity_sha256=candidate_identities["timeseries"],
+            candidate_count=0, outcome_counts=timeseries_summary,
+            candidate_observed_at_min=candidate_audit_evidence[
+                "timeseries"
+            ].get("candidate_observed_at_min"),
+            candidate_observed_at_max=candidate_audit_evidence[
+                "timeseries"
+            ].get("candidate_observed_at_max"),
+            final_verification_identity_sha256=result[
+                "final_verification_identity_sha256"
+            ],
         )
-    except Exception as exc:
-        result["timeseries_reconciliation_status"] = "failed"
-        result["failures"].append(f"timeseries reconciliation failed: {exc}")
+        result["target_audit_statuses"]["timeseries"] = (
+            "skipped_not_applicable"
+        )
+    else:
+        timeseries_attempt = start_target_attempt(
+            conn, integrity_run_id=audit_run_id, env_name=env_name,
+            target="timeseries", invocation_kind=invocation_kind,
+            candidate_identity_sha256=candidate_identities["timeseries"],
+            candidate_count=len(raw_candidates),
+            candidate_observed_at_min=candidate_audit_evidence[
+                "timeseries"
+            ].get("candidate_observed_at_min"),
+            candidate_observed_at_max=candidate_audit_evidence[
+                "timeseries"
+            ].get("candidate_observed_at_max"),
+            final_verification_identity_sha256=result[
+                "final_verification_identity_sha256"
+            ],
+        )
+        try:
+            for offset in range(0, len(raw_candidates), CURRENT_STATE_TIMESERIES_CHUNK_SIZE):
+                chunk = raw_candidates[offset:offset + CURRENT_STATE_TIMESERIES_CHUNK_SIZE]
+                response = _http_post_json(
+                    url=endpoint,
+                    headers=_supabase_rest_headers(
+                        str(supabase.get("supabase_key") or ""), "uk_aq_public"
+                    ),
+                    body={
+                        "p_integrity_run_id": integrity_run_id,
+                        "p_candidates": chunk,
+                    },
+                )
+                row = response[0] if isinstance(response, list) and len(response) == 1 else None
+                if not isinstance(row, Mapping):
+                    raise RuntimeError("timeseries reconciliation RPC response is invalid")
+                counts = {key: int(row.get(key) or 0) for key in timeseries_summary}
+                if (
+                    min(counts.values(), default=0) < 0
+                    or counts["candidate_count"] != len(chunk)
+                    or sum(counts[key] for key in (
+                        "updated_newer_count",
+                        "updated_same_timestamp_correction_count",
+                        "skipped_equal_count", "skipped_older_count",
+                        "missing_timeseries_count", "failed_count",
+                    )) != len(chunk)
+                ):
+                    raise RuntimeError("timeseries reconciliation RPC counts are invalid")
+                for key, value in counts.items():
+                    timeseries_summary[key] += value
+            result["timeseries"] = timeseries_summary
+            result["timeseries_reconciliation_status"] = (
+                "failed" if timeseries_summary["missing_timeseries_count"]
+                or timeseries_summary["failed_count"] else "ok"
+            )
+            if result["timeseries_reconciliation_status"] == "failed":
+                timeseries_error = (
+                    "timeseries reconciliation returned missing or failed candidates"
+                )
+        except Exception as exc:
+            timeseries_error = str(exc)
+            result["timeseries_reconciliation_status"] = "failed"
+            result["failures"].append(f"timeseries reconciliation failed: {exc}")
+        timeseries_audit_status = (
+            "succeeded"
+            if result["timeseries_reconciliation_status"] == "ok"
+            else "failed_terminal"
+            if int(timeseries_summary.get("missing_timeseries_count") or 0) > 0
+            else "failed_retryable"
+        )
+        result["target_attempts"]["timeseries"] = finish_target_attempt(
+            conn, attempt_id=int(timeseries_attempt["attempt_id"]),
+            status=timeseries_audit_status,
+            outcome_counts=result.get("timeseries") or timeseries_summary,
+            error=timeseries_error,
+        )
+        result["target_audit_statuses"]["timeseries"] = timeseries_audit_status
 
     latest_calls: list[dict[str, Any]] = []
     aggregate_latest = Counter()
     latest_failed = False
-    try:
-        reconcile_url = str(settings.get(
-            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_URL", ""
-        )).strip()
-        audience = str(settings.get(
-            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_AUDIENCE", ""
-        )).strip()
-        timeout_seconds = int(str(settings.get(
-            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_TIMEOUT_SECONDS", "300"
-        )))
-        for offset in range(0, len(snapshot_candidates), CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE):
-            chunk = snapshot_candidates[
-                offset:offset + CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE
-            ]
-            response = _post_cloud_run_reconciliation(
-                url=reconcile_url,
-                audience=audience,
-                timeout_seconds=timeout_seconds,
-                body={
-                    "schema_version": 1,
-                    "integrity_run_id": integrity_run_id,
-                    "candidates": chunk,
-                },
-            )
-            latest_calls.append(dict(response))
-            for key in (
-                "candidate_count", "eligible_count", "applied_new_count",
-                "applied_newer_count",
-                "applied_same_timestamp_correction_count",
-                "skipped_equal_count", "skipped_older_count",
-                "skipped_invalid_current_value_count",
-                "skipped_unsupported_pollutant_count",
-                "skipped_metadata_unresolved_count", "changed_product_count",
-                "skipped_unchanged_product_count",
-            ):
-                aggregate_latest[key] += int(response.get(key) or 0)
-            if response.get("ok") is not True:
-                latest_failed = True
-        result["latest_snapshot"] = {
-            **dict(aggregate_latest),
-            "call_count": len(latest_calls),
-            "state_changed": any(bool(call.get("state_changed")) for call in latest_calls),
-            "last_product_success_count": int(latest_calls[-1].get("product_success_count") or 0) if latest_calls else 0,
-            "last_product_failure_count": int(latest_calls[-1].get("product_failure_count") or 0) if latest_calls else 0,
-            "manifest_key": latest_calls[-1].get("manifest_key") if latest_calls else None,
-            "call_results_sample": latest_calls[:CURRENT_STATE_REPORT_CALL_LIMIT],
-            "call_results_truncated": max(0, len(latest_calls) - CURRENT_STATE_REPORT_CALL_LIMIT),
-        }
-        result["latest_snapshot_reconciliation_status"] = (
-            "failed" if latest_failed else "ok"
+    latest_error: str | None = None
+    if "latest_snapshot" not in target_selection:
+        result["latest_snapshot_reconciliation_status"] = "skipped_not_selected"
+    elif not snapshot_candidates:
+        result["latest_snapshot_reconciliation_status"] = "skipped_not_applicable"
+        result["target_attempts"]["latest_snapshot"] = record_target_attempt(
+            conn, integrity_run_id=audit_run_id, env_name=env_name,
+            target="latest_snapshot", invocation_kind=invocation_kind,
+            status="skipped_not_applicable",
+            candidate_identity_sha256=candidate_identities["latest_snapshot"],
+            candidate_count=0, outcome_counts={},
+            candidate_observed_at_min=candidate_audit_evidence[
+                "latest_snapshot"
+            ].get("candidate_observed_at_min"),
+            candidate_observed_at_max=candidate_audit_evidence[
+                "latest_snapshot"
+            ].get("candidate_observed_at_max"),
+            final_verification_identity_sha256=result[
+                "final_verification_identity_sha256"
+            ],
         )
-    except Exception as exc:
-        result["latest_snapshot_reconciliation_status"] = "failed"
-        result["failures"].append(f"Latest Snapshot reconciliation failed: {exc}")
+        result["target_audit_statuses"]["latest_snapshot"] = (
+            "skipped_not_applicable"
+        )
+    else:
+        latest_attempt = start_target_attempt(
+            conn, integrity_run_id=audit_run_id, env_name=env_name,
+            target="latest_snapshot", invocation_kind=invocation_kind,
+            candidate_identity_sha256=candidate_identities["latest_snapshot"],
+            candidate_count=len(snapshot_candidates),
+            candidate_observed_at_min=candidate_audit_evidence[
+                "latest_snapshot"
+            ].get("candidate_observed_at_min"),
+            candidate_observed_at_max=candidate_audit_evidence[
+                "latest_snapshot"
+            ].get("candidate_observed_at_max"),
+            final_verification_identity_sha256=result[
+                "final_verification_identity_sha256"
+            ],
+        )
+        try:
+            reconcile_url = str(settings.get(
+                "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_URL", ""
+            )).strip()
+            audience = str(settings.get(
+                "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_AUDIENCE", ""
+            )).strip()
+            timeout_seconds = int(str(settings.get(
+                "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_TIMEOUT_SECONDS", "300"
+            )))
+            for offset in range(
+                0, len(snapshot_candidates),
+                CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE,
+            ):
+                chunk = snapshot_candidates[
+                    offset:offset + CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE
+                ]
+                response = _post_cloud_run_reconciliation(
+                    url=reconcile_url,
+                    audience=audience,
+                    timeout_seconds=timeout_seconds,
+                    settings=settings,
+                    body={
+                        "schema_version": 1,
+                        "integrity_run_id": integrity_run_id,
+                        "candidates": chunk,
+                    },
+                )
+                latest_calls.append(dict(response))
+                for key in (
+                    "candidate_count", "eligible_count", "applied_new_count",
+                    "applied_newer_count",
+                    "applied_same_timestamp_correction_count",
+                    "skipped_equal_count", "skipped_older_count",
+                    "skipped_invalid_current_value_count",
+                    "skipped_unsupported_pollutant_count",
+                    "skipped_metadata_unresolved_count", "changed_product_count",
+                    "skipped_unchanged_product_count",
+                ):
+                    aggregate_latest[key] += int(response.get(key) or 0)
+                if response.get("ok") is not True:
+                    latest_failed = True
+                    latest_error = str(
+                        response.get("error")
+                        or response.get("message")
+                        or "Latest Snapshot owner service returned ok=false"
+                    )
+            result["latest_snapshot"] = {
+                **dict(aggregate_latest),
+                "call_count": len(latest_calls),
+                "state_changed": any(
+                    bool(call.get("state_changed")) for call in latest_calls
+                ),
+                "last_product_success_count": int(
+                    latest_calls[-1].get("product_success_count") or 0
+                ) if latest_calls else 0,
+                "last_product_failure_count": int(
+                    latest_calls[-1].get("product_failure_count") or 0
+                ) if latest_calls else 0,
+                "manifest_key": (
+                    latest_calls[-1].get("manifest_key") if latest_calls else None
+                ),
+                "call_results_sample": latest_calls[
+                    :CURRENT_STATE_REPORT_CALL_LIMIT
+                ],
+                "call_results_truncated": max(
+                    0, len(latest_calls) - CURRENT_STATE_REPORT_CALL_LIMIT
+                ),
+            }
+            result["latest_snapshot_reconciliation_status"] = (
+                "failed" if latest_failed else "ok"
+            )
+        except Exception as exc:
+            latest_error = str(exc)
+            result["latest_snapshot_reconciliation_status"] = "failed"
+            result["failures"].append(
+                f"Latest Snapshot reconciliation failed: {exc}"
+            )
+        latest_audit_status = (
+            "succeeded"
+            if result["latest_snapshot_reconciliation_status"] == "ok"
+            else "failed_retryable"
+        )
+        result["target_attempts"]["latest_snapshot"] = finish_target_attempt(
+            conn, attempt_id=int(latest_attempt["attempt_id"]),
+            status=latest_audit_status,
+            outcome_counts=result.get("latest_snapshot") or {},
+            error=latest_error,
+        )
+        result["target_audit_statuses"]["latest_snapshot"] = latest_audit_status
 
     result["overall_status"] = (
-        "ok" if result["timeseries_reconciliation_status"] == "ok"
-        and result["latest_snapshot_reconciliation_status"] == "ok"
+        "ok" if all(
+            result[f"{target}_reconciliation_status"] in {
+                "ok", "skipped_not_applicable"
+            }
+            for target in target_selection
+        )
         else "failed"
     )
     log.info(
@@ -21305,6 +21203,10 @@ def persist_current_state_reconciliation_audit(
     run_id: int,
     result: Mapping[str, Any],
 ) -> None:
+    # Focused compatibility callers may supply a deliberately minimal SQLite
+    # connection. Operational runs always use open_db and own integrity_runs.
+    if not _table_exists(conn, "integrity_runs"):
+        return
     conn.execute(
         """
         UPDATE integrity_runs
@@ -21328,6 +21230,254 @@ def persist_current_state_reconciliation_audit(
         ),
     )
     conn.commit()
+
+
+def _seed_legacy_current_state_target_attempts(
+    conn: sqlite3.Connection, *, run_id: int, env_name: str,
+) -> None:
+    row = conn.execute(
+        "SELECT current_state_reconciliation_json FROM integrity_runs WHERE id=?",
+        (int(run_id),),
+    ).fetchone()
+    try:
+        previous = json.loads(str(row[0] or "{}")) if row else {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("legacy current-state audit JSON is invalid") from exc
+    for target in ("timeseries", "latest_snapshot"):
+        if latest_target_attempt(conn, integrity_run_id=run_id, target=target):
+            continue
+        candidate_set = load_candidate_set(
+            conn, integrity_run_id=run_id, target=target
+        )
+        status = str(previous.get(f"{target}_reconciliation_status") or "pending")
+        failures = list(previous.get("failures") or [])
+        target_error = next(
+            (str(value) for value in failures if target.replace("_", " ").lower()
+             in str(value).replace("_", " ").lower()),
+            None,
+        )
+        record_target_attempt(
+            conn, integrity_run_id=run_id, env_name=env_name, target=target,
+            invocation_kind="initial", status=status,
+            candidate_identity_sha256=candidate_set["candidate_identity_sha256"],
+            candidate_count=candidate_set["candidate_count"],
+            outcome_counts=(previous.get(target) or {}), error=target_error,
+            candidate_observed_at_min=candidate_set[
+                "candidate_observed_at_min"
+            ],
+            candidate_observed_at_max=candidate_set[
+                "candidate_observed_at_max"
+            ],
+            final_verification_identity_sha256=candidate_set[
+                "final_verification_identity_sha256"
+            ],
+        )
+
+
+def _materialize_legacy_current_state_candidate_sets(
+    conn: sqlite3.Connection, *, run_id: int, env_name: str,
+) -> None:
+    """Reproduce deterministic candidates for a pre-ledger verified run."""
+    existing = int(conn.execute(
+        "SELECT COUNT(*) FROM current_state_candidate_sets WHERE integrity_run_id=?",
+        (int(run_id),),
+    ).fetchone()[0])
+    if existing == 2:
+        _seed_legacy_current_state_target_attempts(
+            conn, run_id=run_id, env_name=env_name
+        )
+        return
+    operation_rows = conn.execute(
+        """SELECT object_key, operation_kind, local_sha256, get_verified,
+                  delete_verified
+           FROM integrity_object_operations
+           WHERE run_id=? AND planned=1 AND domain='observations'
+           ORDER BY object_key, operation_kind""",
+        (int(run_id),),
+    ).fetchall()
+    if not operation_rows:
+        raise RuntimeError(
+            "final verified R2 object evidence is missing; run a new scoped Integrity operation"
+        )
+    scopes: set[tuple[str, int]] = set()
+    for row in operation_rows:
+        match = re.search(
+            r"/day_utc=(\d{4}-\d{2}-\d{2})/connector_id=(\d+)(?:/|$)",
+            str(row[0]),
+        )
+        if match:
+            scopes.add((match.group(1), int(match.group(2))))
+    if not scopes:
+        raise RuntimeError(
+            "verified R2 scope cannot be reproduced; run a new scoped Integrity operation"
+        )
+    derived = _current_state_candidates_from_verified_evidence(
+        conn=conn, env_name=env_name,
+        scope_entries=[
+            {"day_utc": day_utc, "connector_id": connector_id}
+            for day_utc, connector_id in sorted(scopes)
+        ],
+        require_unambiguous_history=True,
+    )
+    if derived["missing_evidence"]:
+        raise RuntimeError(
+            "immutable candidate evidence is incomplete; run a new scoped Integrity operation"
+        )
+    verification_proof = {
+        "status": "ok",
+        "remaining_gap_count": 0,
+        "integrity_run_id": run_id,
+        "verified_object_operations": [
+            {
+                "object_key": str(row[0]), "operation_kind": str(row[1]),
+                "local_sha256": row[2], "get_verified": bool(row[3]),
+                "delete_verified": bool(row[4]),
+            }
+            for row in operation_rows
+        ],
+    }
+    persist_candidate_set(
+        conn, integrity_run_id=run_id, target="timeseries",
+        candidates=derived["raw_candidates"], final_verification=verification_proof,
+        env_name=env_name,
+        selected_scope={
+            "scopes": [list(scope) for scope in sorted(scopes)],
+        },
+    )
+    persist_candidate_set(
+        conn, integrity_run_id=run_id, target="latest_snapshot",
+        candidates=derived["latest_snapshot_candidates"],
+        final_verification=verification_proof,
+        env_name=env_name,
+        selected_scope={
+            "scopes": [list(scope) for scope in sorted(scopes)],
+        },
+    )
+    current_row = conn.execute(
+        "SELECT current_state_reconciliation_json FROM integrity_runs WHERE id=?",
+        (int(run_id),),
+    ).fetchone()
+    try:
+        current_audit = json.loads(str(current_row[0] or "{}")) if current_row else {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("legacy current-state audit JSON is invalid") from exc
+    current_audit["final_verification_identity_sha256"] = identity_sha256(
+        verification_proof
+    )
+    conn.execute(
+        "UPDATE integrity_runs SET current_state_reconciliation_json=? WHERE id=?",
+        (json.dumps(current_audit, sort_keys=True, separators=(",", ":")), int(run_id)),
+    )
+    conn.commit()
+    _seed_legacy_current_state_target_attempts(
+        conn, run_id=run_id, env_name=env_name
+    )
+
+
+def run_current_state_resume(
+    *, conn: sqlite3.Connection, env_name: str, run_id_text: str,
+    requested_target: str, env: Mapping[str, str], log: logging.Logger,
+) -> dict[str, Any]:
+    settings = {**os.environ, **{str(key): str(value) for key, value in env.items()}}
+    if not _is_truthy(settings.get(
+        "UK_AQ_INTEGRITY_CURRENT_STATE_RECONCILIATION_ENABLED"
+    )):
+        raise RuntimeError("current-state reconciliation is not enabled")
+    run_id = parse_integrity_run_id(run_id_text, env_name=env_name)
+    _materialize_legacy_current_state_candidate_sets(
+        conn, run_id=run_id, env_name=env_name
+    )
+    prepared = prepare_current_state_resume(
+        conn, env_name=env_name, run_id=run_id,
+        requested_target=requested_target,
+    )
+    if prepared["selected_targets"]:
+        result = run_current_state_reconciliation(
+            conn=conn, env_name=env_name,
+            integrity_run_id=f"{env_name}:{run_id}", env=env,
+            scope_entries=(), dry_run=False, final_verification={"status": "ok"},
+            log=log, selected_targets=prepared["selected_targets"],
+            candidate_sets=prepared["candidate_sets"], invocation_kind="resume",
+        )
+    else:
+        result = {
+            "enabled": True,
+            "planned": False,
+            "attempted": False,
+            "dry_run": False,
+            "r2_history_status": "ok",
+            "timeseries_reconciliation_status": "not_run",
+            "latest_snapshot_reconciliation_status": "not_run",
+            "overall_status": "not_run",
+            "candidate_count": prepared["candidate_sets"]["timeseries"][
+                "candidate_count"
+            ],
+            "latest_snapshot_candidate_count": prepared["candidate_sets"][
+                "latest_snapshot"
+            ]["candidate_count"],
+            "target_audit_statuses": {},
+            "target_attempts": {},
+            "timeseries": {},
+            "latest_snapshot": {},
+            "warnings": [],
+            "failures": [],
+        }
+    audit_to_public = {
+        "succeeded": "ok",
+        "failed_retryable": "failed",
+        "failed_terminal": "failed",
+        "pending": "pending",
+        "running": "failed",
+        "blocked_dependency": "blocked_dependency",
+        "skipped_not_applicable": "skipped_not_applicable",
+        "superseded": "superseded",
+    }
+    for target in {"timeseries", "latest_snapshot"} - set(prepared["selected_targets"]):
+        previous = prepared["previous_attempts"].get(target)
+        result[f"{target}_reconciliation_status"] = (
+            audit_to_public.get(str(previous.get("status")), "not_run")
+            if previous else "not_run"
+        )
+        if previous:
+            result[target] = dict(previous.get("outcome_counts") or {})
+            result["target_audit_statuses"][target] = str(
+                previous.get("status")
+            )
+    successful_public_statuses = {"ok", "skipped_not_applicable"}
+    result["overall_status"] = (
+        "ok" if result["timeseries_reconciliation_status"]
+        in successful_public_statuses
+        and result["latest_snapshot_reconciliation_status"]
+        in successful_public_statuses
+        else "partial" if "ok" in {
+            result["timeseries_reconciliation_status"],
+            result["latest_snapshot_reconciliation_status"],
+        } else "failed"
+    )
+    selected_succeeded = all(
+        str(result["target_audit_statuses"].get(target))
+        in {"succeeded", "skipped_not_applicable"}
+        for target in prepared["selected_targets"]
+    )
+    result["resume_operation_status"] = (
+        "ok"
+        if selected_succeeded
+        and (
+            requested_target in {"timeseries", "latest_snapshot"}
+            or result["overall_status"] == "ok"
+        )
+        else "failed"
+    )
+    result["resume"] = {
+        "source_integrity_run_id": run_id,
+        "requested_target": requested_target,
+        "selected_targets": prepared["selected_targets"],
+        "already_satisfied_targets": prepared["already_satisfied_targets"],
+        "scope": prepared["scope"],
+        "repeated_source_or_r2_stages": False,
+    }
+    persist_current_state_reconciliation_audit(conn, run_id=run_id, result=result)
+    return result
 
 
 def run_first_value_at_reconciliation(
@@ -22057,10 +22207,72 @@ def run_v2_integrity_repair_flow(
         int(planned_operation_counts.get("planned_writes") or 0) > 0
         or int(planned_operation_counts.get("planned_deletions") or 0) > 0
     )
+    auth_settings = {
+        **os.environ,
+        **{str(key): str(value) for key, value in env.items()},
+    }
+    proposed_observation_pollutants = {
+        str(code).strip().lower()
+        for scope in list(
+            (run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or []
+        )
+        if isinstance(scope, Mapping)
+        for code in list(scope.get("pollutant_codes") or [])
+    }
+    latest_snapshot_capable = bool(
+        proposed_observation_pollutants & {"pm25", "pm10", "no2"}
+    )
+    current_state_enabled = _is_truthy(auth_settings.get(
+        "UK_AQ_INTEGRITY_CURRENT_STATE_RECONCILIATION_ENABLED"
+    ))
+    auth_preflight: dict[str, Any] = {
+        "required": should_preflight_latest_snapshot_auth(
+            current_state_enabled=current_state_enabled,
+            selected_pollutants=proposed_observation_pollutants,
+            canonical_mutation_planned=has_planned_r2_operations,
+            proposals_validated=not proposal_failed,
+            check_only=False,
+            dry_run=dry_run,
+        ),
+        "attempted": False,
+        "status": "skipped_not_required",
+        "token_retained": False,
+    }
+    validate_auth_shape = bool(
+        current_state_enabled
+        and latest_snapshot_capable
+        and has_planned_r2_operations
+        and not proposal_failed
+    )
+    if validate_auth_shape:
+        try:
+            config = validate_latest_snapshot_auth_config(auth_settings)
+            auth_preflight["audience"] = config.audience
+            if not auth_preflight["required"]:
+                auth_preflight["status"] = "configuration_valid"
+            else:
+                auth_preflight = preflight_latest_snapshot_auth(auth_settings)
+        except RuntimeError as exc:
+            detail = " ".join(str(exc).split())
+            auth_preflight.update({
+                "attempted": not dry_run,
+                "status": "failed",
+                "error": detail[:500],
+            })
+            proposal_failed = True
+            record_blocked_scope(run_state, {
+                "stage": "latest_snapshot_auth_preflight",
+                "reason": "latest_snapshot_auth_preflight_failed",
+                "error": detail[:500],
+            })
     if proposal_failed:
         apply_result: dict[str, Any] = {
             "status": "blocked_dependency",
-            "reason": "local_proposal_validation_failed",
+            "reason": (
+                "latest_snapshot_auth_preflight_failed"
+                if auth_preflight.get("status") == "failed"
+                else "local_proposal_validation_failed"
+            ),
         }
     elif not has_planned_r2_operations:
         apply_result = {
@@ -22215,6 +22427,9 @@ def run_v2_integrity_repair_flow(
         final_verification=final_verification,
         log=log,
     )
+    current_state_reconciliation["latest_snapshot_auth_preflight"] = dict(
+        auth_preflight
+    )
     persist_current_state_reconciliation_audit(
         conn,
         run_id=run_id,
@@ -22224,6 +22439,11 @@ def run_v2_integrity_repair_flow(
         {"stage": "observations_proposal", "status": "failed" if observation_failed else "validated", "result": observations},
         {"stage": "observations_metadata_proposal", "status": "failed" if observation_manifest_status in {"failed", "blocked_dependency"} or observation_index_status in {"failed", "blocked_dependency"} else "validated", "result": metadata},
         {"stage": "aqi_proposal", "status": "failed" if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) else "validated", "result": aqi_result, "source_mode": "combined_local"},
+        {
+            "stage": "latest_snapshot_auth_preflight",
+            "status": auth_preflight.get("status"),
+            "result": auth_preflight,
+        },
         {
             "stage": "canonical_apply",
             "status": apply_result.get("status"),
@@ -22237,9 +22457,18 @@ def run_v2_integrity_repair_flow(
         },
         {"stage": "final_verification", "status": final_verification.get("status"), "result": final_verification},
         {
-            "stage": "current_state_reconciliation",
-            "status": current_state_reconciliation.get("overall_status"),
-            "result": current_state_reconciliation,
+            "stage": "timeseries_reconciliation",
+            "status": current_state_reconciliation.get(
+                "timeseries_reconciliation_status"
+            ),
+            "result": current_state_reconciliation.get("timeseries") or {},
+        },
+        {
+            "stage": "latest_snapshot_reconciliation",
+            "status": current_state_reconciliation.get(
+                "latest_snapshot_reconciliation_status"
+            ),
+            "result": current_state_reconciliation.get("latest_snapshot") or {},
         },
     ]
     coordinator_failed = (
@@ -22273,6 +22502,7 @@ def run_v2_integrity_repair_flow(
         "r2_write_attempted": bool(not dry_run and apply_result.get("status") in {"succeeded", "failed"}),
         "planned_object_operation_counts": planned_operation_counts,
         "canonical_apply": apply_result,
+        "latest_snapshot_auth_preflight": auth_preflight,
         "first_value_at_reconciliation": first_value_at_reconciliation,
         "metadata_executor_r2_operation_counts": metadata_r2_operation_counts,
         "stage_order": list(CANONICAL_REPAIR_STAGE_ORDER),
@@ -22347,6 +22577,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="",
         help="Explicit pollutant-scoped observation repair list: pm25,pm10,no2,o3.",
     )
+    add_current_state_resume_arguments(p)
     p.add_argument(
         "--enable-historical-identity-repair",
         action="store_true",
@@ -22438,13 +22669,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         )
     if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
         p.error("historical identity repair must remain disabled in LIVE")
+    validate_current_state_resume_arguments(p, parsed)
     return parsed
 
 
 def resolve_effective_mode(args: argparse.Namespace) -> Literal[
-    "check_only", "repair_dry_run", "repair_apply"
+    "check_only", "repair_dry_run", "repair_apply", "current_state_resume"
 ]:
     """Map the compatible CLI flags onto the three Integrity modes."""
+    if getattr(args, "resume_current_state_run_id", None):
+        return "current_state_resume"
     if args.run_backfill:
         return "repair_dry_run" if args.dry_run else "repair_apply"
     return "check_only"
@@ -23518,45 +23752,16 @@ def collect_preflight_errors(
         rpc_name = str(os.environ.get(
             "UK_AQ_INTEGRITY_TIMESERIES_RECONCILIATION_RPC", ""
         )).strip()
-        reconcile_url = str(os.environ.get(
-            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_URL", ""
-        )).strip()
-        reconcile_audience = str(os.environ.get(
-            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_AUDIENCE", ""
-        )).strip()
-        timeout_raw = str(os.environ.get(
-            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_TIMEOUT_SECONDS", ""
-        )).strip()
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,126}", rpc_name):
             errors.append(
                 "UK_AQ_INTEGRITY_TIMESERIES_RECONCILIATION_RPC is required "
                 "and must be an unqualified RPC name when current-state "
                 "reconciliation is enabled."
             )
-        parsed_url = urllib.parse.urlparse(reconcile_url)
-        if parsed_url.scheme != "https" or not parsed_url.netloc or (
-            parsed_url.path.rstrip("/")
-            != "/internal/integrity-reconcile"
-        ):
-            errors.append(
-                "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_URL must be the "
-                "HTTPS /internal/integrity-reconcile route."
-            )
-        audience_url = urllib.parse.urlparse(reconcile_audience)
-        if audience_url.scheme != "https" or not audience_url.netloc:
-            errors.append(
-                "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_AUDIENCE must be "
-                "the HTTPS Cloud Run service audience."
-            )
         try:
-            reconcile_timeout = int(timeout_raw)
-        except ValueError:
-            reconcile_timeout = 0
-        if reconcile_timeout <= 0 or reconcile_timeout > 900:
-            errors.append(
-                "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_TIMEOUT_SECONDS "
-                "must be between 1 and 900."
-            )
+            validate_latest_snapshot_auth_config(os.environ)
+        except RuntimeError as exc:
+            errors.append(str(exc))
         if not _resolve_ingestdb_supabase_rest_config(
             os.environ
         ).get("supabase_key"):
@@ -23781,6 +23986,7 @@ def open_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _prepare_source_connector_day_evidence_migration(conn)
+    ensure_audit_schema(conn)
     legacy_sftc_rows = _prepare_source_file_timeseries_counts_migration(conn)
     conn.executescript(SCHEMA_SQL)
     if legacy_sftc_rows is not None:
@@ -24465,6 +24671,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- Timeseries status: {current_state.get('timeseries_reconciliation_status') or '(none)'}",
                 f"- Latest Snapshot status: {current_state.get('latest_snapshot_reconciliation_status') or '(none)'}",
                 f"- Overall status: {current_state.get('overall_status') or '(none)'}",
+                f"- Durable target statuses: {json.dumps(current_state.get('target_audit_statuses') or {}, sort_keys=True)}",
                 f"- Raw latest candidates: {int(current_state.get('candidate_count') or 0)}",
                 f"- Latest Snapshot source rows: {int(current_state.get('latest_snapshot_candidate_count') or 0)}",
                 f"- Candidate range: {current_state.get('candidate_observed_at_min') or '(none)'} to {current_state.get('candidate_observed_at_max') or '(none)'}",
@@ -24473,16 +24680,30 @@ def format_summary_md(s: dict[str, Any]) -> str:
     reported_current_state = s.get("current_state_reconciliation") or {}
     if reported_current_state and not repair_flow.get("current_state_reconciliation"):
         lines.extend([
-            "## Current-state reconciliation plan",
+            "## Current-state reconciliation",
             "",
             f"- Enabled: {bool(reported_current_state.get('enabled'))}",
             f"- Planned: {bool(reported_current_state.get('planned'))}",
             f"- Attempted: {bool(reported_current_state.get('attempted'))}",
+            f"- R2 history status: {reported_current_state.get('r2_history_status') or '(none)'}",
+            f"- Timeseries status: {reported_current_state.get('timeseries_reconciliation_status') or '(none)'}",
+            f"- Latest Snapshot status: {reported_current_state.get('latest_snapshot_reconciliation_status') or '(none)'}",
             f"- Overall status: {reported_current_state.get('overall_status') or '(none)'}",
+            f"- Durable target statuses: {json.dumps(reported_current_state.get('target_audit_statuses') or {}, sort_keys=True)}",
             f"- Raw latest candidates: {int(reported_current_state.get('candidate_count') or 0)}",
             f"- Latest Snapshot source rows: {int(reported_current_state.get('latest_snapshot_candidate_count') or 0)}",
             "",
         ])
+        resume = reported_current_state.get("resume") or {}
+        if resume:
+            lines.extend([
+                f"- Resume source Integrity run: {resume.get('source_integrity_run_id') or '(none)'}",
+                f"- Resume requested target: {resume.get('requested_target') or '(none)'}",
+                f"- Resume selected targets: {','.join(resume.get('selected_targets') or []) or '(none)'}",
+                f"- Resume already satisfied targets: {','.join(resume.get('already_satisfied_targets') or []) or '(none)'}",
+                f"- Repeated source or R2 stages: {bool(resume.get('repeated_source_or_r2_stages'))}",
+                "",
+            ])
     lookup_counts = s.get("lookup_source_counts") or {}
     if lookup_counts:
         lines.extend([
@@ -25105,6 +25326,55 @@ def main(argv: list[str]) -> int:
     )
     log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
     log.info("log_file=%s", log_path)
+    if args.resume_current_state_run_id:
+        conn = open_db(env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
+        try:
+            resume_result = run_current_state_resume(
+                conn=conn, env_name=args.env,
+                run_id_text=args.resume_current_state_run_id,
+                requested_target=args.resume_current_state_target,
+                env=env, log=log,
+            )
+            summary = {
+                "env": args.env,
+                "profile": "current_state_resume",
+                "source": "durable_integrity_audit",
+                "started_at_utc": started_iso,
+                "finished_at_utc": fmt_iso(utc_now()),
+                "status": (
+                    "ok"
+                    if resume_result.get("resume_operation_status") == "ok"
+                    else "failed"
+                ),
+                "effective_mode": "current_state_resume",
+                "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+                "log_path": str(log_path),
+                "current_state_reconciliation": resume_result,
+                "metrics": {},
+            }
+            json_path, md_path = write_reports(
+                env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary
+            )
+            log.info("current-state resume report json=%s markdown=%s", json_path, md_path)
+            return 0 if summary["status"] == "ok" else 1
+        except Exception as exc:
+            log.exception("current-state resume failed")
+            summary = {
+                "env": args.env,
+                "profile": "current_state_resume",
+                "started_at_utc": started_iso,
+                "finished_at_utc": fmt_iso(utc_now()),
+                "status": "failed",
+                "effective_mode": "current_state_resume",
+                "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+                "log_path": str(log_path),
+                "notes": str(exc),
+                "metrics": {},
+            }
+            write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
+            return 1
+        finally:
+            conn.close()
     daily_task_health_config = _resolve_daily_task_health_config(env_name=args.env)
     daily_task_health_enabled = bool(daily_task_health_config.get("enabled"))
     daily_task_health_strict = bool(daily_task_health_config.get("strict"))
