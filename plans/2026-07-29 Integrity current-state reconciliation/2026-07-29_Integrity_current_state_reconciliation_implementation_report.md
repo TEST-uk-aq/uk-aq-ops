@@ -66,12 +66,16 @@ The exact names and behaviour to record are those in this report.
 - A normal scheduled Latest Snapshot operation completed after deployment at
   `2026-07-29T10:06:10.759Z`: manifest build status `ok`, three pollutant
   products successful, zero failed, and all configured windows present.
-- This workstation's active Google user can obtain only a user token with the
-  OAuth client ID as its audience, not the Cloud Run service audience, and it
-  cannot impersonate the TEST operations service account. Consequently an
-  authenticated empty-candidate route call still needs to be made from the
-  operations service-account runtime (or by an operator with token-creation
-  permission).
+- On 29 July 2026, an authenticated empty-candidate call using an
+  audience-specific token from the impersonated TEST operations service
+  account returned HTTP 200. All three products succeeded, no durable state or
+  product content changed, and all three unchanged products were skipped.
+- The local Integrity token helper required explicit service-account
+  impersonation when requesting the configured audience. It now constructs one
+  audience-specific `gcloud` command from the standard Cloud SDK account and
+  impersonation environment variables, and the incorrect audience-less
+  fallback has been removed. No Cloud Run, IAM or schema redeployment was
+  required for this correction.
 - A repair-bearing Integrity run was deliberately not invented: real
   reconciliation still requires an operator-selected authoritative source/day
   scope. Once supplied, the normal CIC-Test Integrity command will exercise
