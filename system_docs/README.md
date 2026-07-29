@@ -62,14 +62,14 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 | Observs outbox and partition maintenance | `observs_operations/` | Migration analysis pending |
 | Public and private R2-backed APIs outside completed history/AQI boundaries | `api_services/` | Migration analysis pending |
 | Cache proxy and website routing outside completed history/AQI boundaries | `cache_proxy/` | Migration analysis pending |
-| R2 and database backups, restore and repair outside completed contracts | `backup_and_recovery/` | Migration analysis pending |
+| R2 and database backups, restore and repair outside completed contracts | [`backup_and_recovery/`](backup_and_recovery/) | Authoritative for the Supabase logical database dump backup; broader migration remains pending |
 | Cloudflare and GCP scheduling | `scheduling/` | Migration analysis pending |
 | Task health, metrics and operational dashboards | `monitoring/` | Migration analysis pending |
 | Hosted and local administrative dashboards | [`dashboards/`](dashboards/) | Authoritative and current |
 | Postcode and geography lookup products | [`geography/`](geography/) | Authoritative and current |
 | Shared runtime components and cross-area invariants | `shared/` | Migration analysis pending |
 
-Directories marked pending are proposed area boundaries. They do not override completed contracts in `r2_history/`, `aqi-levels/`, `station_charts/`, `latest_snapshot/`, `dashboards/` or `geography/`.
+Directories marked pending are proposed area boundaries. They do not override completed contracts in `r2_history/`, `aqi-levels/`, `station_charts/`, `latest_snapshot/`, `dashboards/`, `geography/` or the completed Supabase logical backup scope in `backup_and_recovery/`.
 
 ## R2 history and station-history reading set
 
