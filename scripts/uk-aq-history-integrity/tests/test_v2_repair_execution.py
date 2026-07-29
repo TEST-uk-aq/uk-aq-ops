@@ -2488,6 +2488,95 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(executable_indexes, {0})
         self.assertEqual(skipped, [])
 
+    def test_missing_connector_day_uses_pollutant_scoped_source_evidence(self) -> None:
+        day_utc = "2026-07-27"
+        connector_id = 1
+
+        def source_counts(*_args, **kwargs):
+            pollutant_code = kwargs["pollutant_code"]
+            timeseries_id = {
+                "no2": 101,
+                "o3": 102,
+                "pm10": 103,
+                "pm25": 104,
+            }[pollutant_code]
+            return ({timeseries_id: 24}, {
+                "source_partition_state": "successful_non_empty",
+                "source_counts_present": True,
+                "source_counts_available": True,
+                "source_skip_reason": None,
+                "source_rows": 24,
+                "unresolved_site_ref_groups": 0,
+                "unmapped_site_ref_groups": 0,
+                "ambiguous_site_ref_groups": 0,
+                "timeseries_conflict_groups": 0,
+                "required_source_file_count": 1,
+                "successful_source_file_count": 1,
+            })
+
+        config = MODULE.resolve_history_path_config("v2", {})
+        with mock.patch.object(
+            MODULE,
+            "_current_source_counts_for_v2_partition",
+            side_effect=source_counts,
+        ) as source_counts_mock:
+            observations = MODULE.run_v2_observations_integrity_checks(
+                r2_history_root=self.root,
+                config=config,
+                from_day=day_utc,
+                to_day=day_utc,
+                conn=self.conn,
+                env_name="CIC-Test",
+                allowed_connector_ids={connector_id},
+                source_scope={
+                    "source": "sos",
+                    "connector_ids": [connector_id],
+                    "scope": "source",
+                },
+            )
+
+        gap = next(
+            item for item in observations["gaps"]
+            if item["gap_type"] == "day_dir_missing"
+        )
+        self.assertIsNone(gap.get("pollutant_code"))
+        self.assertEqual(
+            sorted(gap["source_evidence_by_pollutant"]),
+            ["no2", "o3", "pm10", "pm25"],
+        )
+        self.assertEqual(source_counts_mock.call_count, 4)
+
+        scopes, executable_indexes, skipped = (
+            MODULE._derive_executable_observation_repair_pollutants(
+                v2_observations=observations,
+                requested_pollutants=["no2", "pm25"],
+            )
+        )
+        self.assertEqual(
+            scopes,
+            {(day_utc, connector_id): ["no2", "pm25"]},
+        )
+        self.assertEqual(executable_indexes, {
+            observations["gaps"].index(gap),
+        })
+        self.assertEqual(skipped, [])
+        planned = MODULE._planned_backfill_command(
+            self.env,
+            [],
+            MODULE.dt.date.fromisoformat(day_utc),
+            connector_ids=[connector_id],
+            output_scope="observations_only",
+            history_version="v2",
+            env_name="CIC-Test",
+            complete_connector_day=True,
+            repair_pollutants=scopes[(day_utc, connector_id)],
+        )
+        self.assertIn(
+            "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS=no2,pm25",
+            planned,
+        )
+        self.assertNotIn("source_evidence_missing", planned)
+
     def test_v2_missing_day_gap_repairs_instead_of_skipping(self) -> None:
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
