@@ -183,6 +183,103 @@ class CurrentStateResumeTests(unittest.TestCase):
             "superseded_by_attempt_id",
         }.issubset(attempt_columns))
 
+    def test_legacy_candidate_reconstruction_ignores_aqi_only_scope(self) -> None:
+        cursor = self.conn.execute(
+            """INSERT INTO integrity_runs (
+                 started_at_utc, env_name, profile, source_filter, from_day,
+                 to_day, status, r2_history_status
+               ) VALUES ('2026-07-24T00:00:00Z', 'CIC-Test', 'manual', 'sos',
+                         '2026-07-24', '2026-07-25', 'fail', 'ok')"""
+        )
+        legacy_run_id = int(cursor.lastrowid)
+        operations = (
+            (
+                "history/v2/observations/day_utc=2026-07-24/connector_id=1/"
+                "pollutant_code=no2/part-00000.parquet",
+                "observations",
+            ),
+            (
+                "history/v2/aqilevels/hourly/data/day_utc=2026-07-25/"
+                "connector_id=2/pollutant_code=pm25/part-00000.parquet",
+                "aqilevels",
+            ),
+        )
+        self.conn.executemany(
+            """INSERT INTO integrity_object_operations (
+                 run_id, object_key, domain, operation_kind, planned,
+                 remote_completed, get_verified, delete_verified, status,
+                 updated_at_utc
+               ) VALUES (?, ?, ?, 'put', 1, 1, 1, 0, 'get_verified',
+                         '2026-07-25T00:01:00Z')""",
+            [
+                (legacy_run_id, object_key, domain)
+                for object_key, domain in operations
+            ],
+        )
+
+        evidence_scopes = (
+            ("2026-07-24", 1, 10, "no2"),
+            ("2026-07-25", 2, 20, "pm25"),
+        )
+        for day_utc, connector_id, timeseries_id, pollutant_code in evidence_scopes:
+            canonical_rows = [{
+                "connector_id": connector_id,
+                "timeseries_id": timeseries_id,
+                "observed_at": f"{day_utc}T12:00:00Z",
+                "value": float(timeseries_id),
+                "pollutant_code": pollutant_code,
+            }]
+            canonical_rows_json = json.dumps(
+                canonical_rows, separators=(",", ":"), sort_keys=True
+            )
+            scope_identity = MODULE.identity_sha256(
+                [day_utc, connector_id, timeseries_id]
+            )
+            self.conn.execute(
+                """INSERT INTO source_connector_day_evidence (
+                     env_name, day_utc, connector_id, source_adapter,
+                     source_file_identities_sha256,
+                     source_evidence_input_sha256, canonical_rows_sha256,
+                     canonical_rows_bytes, evidence_sha256, evidence_json,
+                     canonical_rows_json, created_at_utc
+                   ) VALUES ('CIC-Test', ?, ?, 'sos', ?, ?, ?, ?, ?, '{}', ?,
+                             '2026-07-25T00:00:00Z')""",
+                (
+                    day_utc,
+                    connector_id,
+                    scope_identity,
+                    scope_identity,
+                    MODULE.identity_sha256(canonical_rows),
+                    len(canonical_rows_json.encode("utf-8")),
+                    scope_identity,
+                    canonical_rows_json,
+                ),
+            )
+        self.conn.commit()
+
+        MODULE._materialize_legacy_current_state_candidate_sets(
+            self.conn, run_id=legacy_run_id, env_name="CIC-Test"
+        )
+
+        candidate_sets = {
+            target: MODULE.load_candidate_set(
+                self.conn, integrity_run_id=legacy_run_id, target=target
+            )
+            for target in ("timeseries", "latest_snapshot")
+        }
+        for candidate_set in candidate_sets.values():
+            self.assertEqual(
+                candidate_set["selected_scope"],
+                {"scopes": [["2026-07-24", 1]]},
+            )
+            self.assertEqual(
+                {
+                    (candidate["connector_id"], candidate["timeseries_id"])
+                    for candidate in candidate_set["candidates"]
+                },
+                {(1, 10)},
+            )
+
     def test_timeseries_success_survives_retryable_latest_snapshot_failure(self) -> None:
         candidate_evidence = {
             target: MODULE.load_candidate_set(
