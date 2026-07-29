@@ -139,11 +139,16 @@ def record_target_attempt(
     target: str, invocation_kind: str, status: str,
     candidate_identity_sha256: str, candidate_count: int,
     outcome_counts: Mapping[str, Any], error: str | None = None,
+    failure_class: str | None = None,
 ) -> dict[str, Any]:
     previous = latest_target_attempt(conn, integrity_run_id=integrity_run_id, target=target)
     attempt_number = int(previous["attempt_number"] if previous else 0) + 1
-    failure_class = ("none" if status in {"ok", "planned", "skipped_empty"}
-                     else "retryable" if status in RETRYABLE_STATUSES else "terminal")
+    resolved_failure_class = failure_class or (
+        "none" if status in {"ok", "planned", "skipped_empty"}
+        else "retryable" if status in RETRYABLE_STATUSES else "terminal"
+    )
+    if resolved_failure_class not in {"none", "retryable", "terminal"}:
+        raise ValueError("invalid current-state target failure class")
     bounded_error = " ".join(str(error or "").split())[:500] or None
     now = _utc_now()
     cursor = conn.execute(
@@ -154,11 +159,10 @@ def record_target_attempt(
           finished_at_utc
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (int(integrity_run_id), previous["id"] if previous else None, env_name,
-         target, attempt_number, invocation_kind, status, failure_class,
+         target, attempt_number, invocation_kind, status, resolved_failure_class,
          candidate_identity_sha256, int(candidate_count),
          canonical_json(dict(outcome_counts)), bounded_error, now, now),
     )
     conn.commit()
     return {"attempt_id": int(cursor.lastrowid), "attempt_number": attempt_number,
-            "status": status, "failure_class": failure_class}
-
+            "status": status, "failure_class": resolved_failure_class}

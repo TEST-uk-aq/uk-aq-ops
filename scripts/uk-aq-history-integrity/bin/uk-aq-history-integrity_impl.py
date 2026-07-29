@@ -59,7 +59,10 @@ from daily_profile import (
     historical_target_days_json,
     selected_days_json,
 )
-from integrity.repair import decide_observation_repair
+from integrity.repair import (
+    decide_observation_repair,
+    suggested_repair_from_decision,
+)
 from integrity.current_state.auth import (
     acquire_identity_token,
     preflight_latest_snapshot_auth,
@@ -9053,26 +9056,9 @@ def _enrich_v2_observations_repair_plans(
             ),
         )
         gap["repair_decision"] = decision.as_dict()
-        suggested_kind = decision.repair_kind
-        if decision.data_changes_required:
-            suggested_kind = (
-                "uk_air_csv_to_v2_observations_backfill_required"
-                if sos_scope else "source_to_v2_observations_backfill_required"
-            )
-        gap["suggested_repair"] = {
-            "kind": suggested_kind,
-            "requires_index_rebuild": decision.requires_index_rebuild,
-            "commands": [],
-            "executes": False,
-            "operator_action_required": (
-                decision.executability_policy == "operator_action_required"
-            ),
-            "write_risk": (
-                "writes_to_r2_when_run_backfill_is_enabled"
-                if decision.data_changes_required else "metadata_only"
-            ),
-            "notes": decision.reason,
-        }
+        gap["suggested_repair"] = suggested_repair_from_decision(
+            decision, sos_scope=sos_scope
+        )
 
 
 def _manifest_codes_from_child_list(payload: Mapping[str, Any], field: str, id_key: str) -> set[str]:
@@ -20957,6 +20943,10 @@ def run_current_state_reconciliation(
                 "failed" if timeseries_summary["missing_timeseries_count"]
                 or timeseries_summary["failed_count"] else "ok"
             )
+            if result["timeseries_reconciliation_status"] == "failed":
+                timeseries_error = (
+                    "timeseries reconciliation returned missing or failed candidates"
+                )
         except Exception as exc:
             timeseries_error = str(exc)
             result["timeseries_reconciliation_status"] = "failed"
@@ -21008,6 +20998,11 @@ def run_current_state_reconciliation(
                 aggregate_latest[key] += int(response.get(key) or 0)
             if response.get("ok") is not True:
                 latest_failed = True
+                latest_error = str(
+                    response.get("error")
+                    or response.get("message")
+                    or "Latest Snapshot owner service returned ok=false"
+                )
         result["latest_snapshot"] = {
             **dict(aggregate_latest),
             "call_count": len(latest_calls),
@@ -21037,6 +21032,13 @@ def run_current_state_reconciliation(
             candidate_identity_sha256=candidate_identities["timeseries"],
             candidate_count=len(raw_candidates),
             outcome_counts=result.get("timeseries") or {}, error=timeseries_error,
+            failure_class=(
+                "terminal"
+                if int((result.get("timeseries") or {}).get(
+                    "missing_timeseries_count"
+                ) or 0) > 0
+                else None
+            ),
         )
     if "latest_snapshot" in target_selection:
         result["target_attempts"]["latest_snapshot"] = record_target_attempt(
