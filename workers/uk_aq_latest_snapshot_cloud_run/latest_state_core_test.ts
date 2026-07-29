@@ -4,6 +4,7 @@ import {
 } from "./latest_value_policy.mjs";
 import {
   applyEligibleRowsToLatestState,
+  applyIntegrityCandidatesToLatestState,
   latestStateKey,
   serializeLatestState,
 } from "./latest_state_core.mjs";
@@ -112,4 +113,44 @@ Deno.test("an invalid-only batch leaves the persisted latest state unchanged", (
   assert.deepEqual(invalidOnly.acknowledgementIds, ["ack-null", "ack-negative", "ack-unknown"]);
   assert.equal(after, before);
   assert.equal(state.get(latestStateKey(10, 101))?.ingested_at, originalIngestedAt);
+});
+
+Deno.test("Integrity reconciliation is monotonic and applies a correction once", () => {
+  const state = new Map([["1:10", {
+    connector_id: 1,
+    timeseries_id: 10,
+    observed_at: "2026-07-29T10:00:00.000Z",
+    value: 10,
+    value_float8_hex: "4024000000000000",
+    status: "P",
+    ingested_at: "2026-07-29T10:01:00.000Z",
+  }]]);
+  const at = "2026-07-29T12:00:00.000Z";
+  const row = (observed_at: string, value: number, value_float8_hex: string) => ({
+    connector_id: 1,
+    timeseries_id: 10,
+    observed_at,
+    value,
+    value_float8_hex,
+    status: "P",
+  });
+
+  assert.equal(applyIntegrityCandidatesToLatestState(state, [
+    row("2026-07-29T11:00:00.000Z", 11, "4026000000000000"),
+  ], at).applied_newer_count, 1);
+  assert.equal(state.get("1:10")?.value, 11);
+  assert.equal(applyIntegrityCandidatesToLatestState(state, [
+    row("2026-07-29T10:00:00.000Z", 99, "4058c00000000000"),
+  ], at).skipped_older_count, 1);
+  assert.equal(applyIntegrityCandidatesToLatestState(state, [
+    row("2026-07-29T11:00:00.000Z", 11, "4026000000000000"),
+  ], at).skipped_equal_count, 1);
+  assert.equal(applyIntegrityCandidatesToLatestState(state, [
+    row("2026-07-29T11:00:00.000Z", 12, "4028000000000000"),
+  ], at).applied_same_timestamp_correction_count, 1);
+  assert.equal(state.get("1:10")?.value, 12);
+  assert.equal(applyIntegrityCandidatesToLatestState(state, [
+    row("2026-07-29T11:00:00.000Z", 12, "4028000000000000"),
+  ], "2026-07-29T13:00:00.000Z").skipped_equal_count, 1);
+  assert.equal(state.get("1:10")?.ingested_at, at);
 });

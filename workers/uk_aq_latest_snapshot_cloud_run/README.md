@@ -67,6 +67,22 @@ The service accepts `POST` and sets:
 
 The run report includes this trigger mode.
 
+## Integrity reconciliation route
+
+The same private Cloud Run service accepts `POST
+/internal/integrity-reconcile`. Cloud Run IAM remains the authentication
+boundary (`--no-allow-unauthenticated`); the Integrity caller sends a Google
+identity token whose audience is the service URL. No application shared secret
+or public cache route is used.
+
+The version 1 request contains `integrity_run_id` and bounded canonical
+observation candidates. This mode strictly loads durable state, resolves each
+timeseries through core metadata, applies the normal current-value eligibility
+policy, supports idempotent same-timestamp corrections, and rebuilds the normal
+three physical `window=all` products and manifest. It does not pull or
+acknowledge Pub/Sub messages. Overlap uses the same in-process guard and
+single-instance deployment boundary as scheduled processing.
+
 ## Runtime and overlap safety
 
 - Cloud Run must use exactly one maximum instance. The overlap lock is deliberately in memory and is authoritative only with `max-instances=1`.

@@ -14,7 +14,6 @@ import {
 } from "./latest_value_policy.mjs";
 import {
   applyEligibleRowsToLatestState,
-  applyIntegrityCandidatesToLatestState,
   latestStateKey,
   serializeLatestState,
 } from "./latest_state_core.mjs";
@@ -153,16 +152,6 @@ type ObservationMessageRow = {
 
 type EligibleObservationMessageRow = ObservationMessageRow & {
   value: number;
-};
-
-type IntegrityReconciliationCandidate = ObservationMessageRow & {
-  pollutant_code: string;
-};
-
-type IntegrityReconciliationRequest = {
-  schema_version: 1;
-  integrity_run_id: string;
-  candidates: IntegrityReconciliationCandidate[];
 };
 
 type DecodedMessage = {
@@ -893,7 +882,7 @@ function decodeMessageRow(message: PubsubPullMessage): DecodedMessage {
   }
 }
 
-async function loadState(strict = false): Promise<LoadedState> {
+async function loadState(): Promise<LoadedState> {
   try {
     const existing = await loadDurableR2Object(UK_AQ_LATEST_SNAPSHOT_STATE_KEY);
     const text = new TextDecoder().decode(existing.body);
@@ -902,44 +891,28 @@ async function loadState(strict = false): Promise<LoadedState> {
     try {
       parsed = JSON.parse(text);
     } catch {
-      if (strict) throw new Error("Durable latest-state object is not valid JSON.");
       parsed = null;
     }
-    const parsedRecord = asRecord(parsed);
-    if (strict && (
-      parsedRecord?.schema_version !== 1 || !Array.isArray(parsedRecord.entries)
-    )) {
-      throw new Error("Durable latest-state object does not match state schema version 1.");
-    }
     const stateMap = new Map<string, LatestStateEntry>();
-    const rows = Array.isArray(parsedRecord?.entries)
-      ? parsedRecord.entries as unknown[]
+    const rows = Array.isArray((parsed as Record<string, unknown> | null)?.entries)
+      ? ((parsed as Record<string, unknown>).entries as unknown[])
       : [];
     for (const row of rows) {
       const record = asRecord(row);
-      if (!record) {
-        if (strict) throw new Error("Durable latest-state object contains a non-object entry.");
-        continue;
-      }
+      if (!record) continue;
       const connectorId = Number(record.connector_id);
       const timeseriesId = Number(record.timeseries_id);
       const observedAt = normalizeTimestamp(record.observed_at);
-      const value = record.value === null || record.value === undefined ? null : Number(record.value);
-      if (
-        !Number.isInteger(connectorId) || connectorId <= 0 ||
-        !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
-        !observedAt || typeof value !== "number" || !Number.isFinite(value)
-      ) {
-        if (strict) throw new Error("Durable latest-state object contains an invalid entry.");
-        continue;
-      }
+      if (!Number.isInteger(connectorId) || connectorId <= 0) continue;
+      if (!Number.isInteger(timeseriesId) || timeseriesId <= 0) continue;
+      if (!observedAt) continue;
       stateMap.set(
         latestStateKey(Math.trunc(connectorId), Math.trunc(timeseriesId)),
         {
           connector_id: Math.trunc(connectorId),
           timeseries_id: Math.trunc(timeseriesId),
           observed_at: observedAt,
-          value,
+          value: record.value === null || record.value === undefined ? null : Number(record.value),
           value_float8_hex: record.value_float8_hex === null || record.value_float8_hex === undefined
             ? null
             : String(record.value_float8_hex),
@@ -953,30 +926,13 @@ async function loadState(strict = false): Promise<LoadedState> {
       existingHash: sha256Hex(existing.body),
       existingBytes: bytes,
     };
-  } catch (error) {
-    if (strict) throw error;
+  } catch {
     return {
       stateMap: new Map<string, LatestStateEntry>(),
       existingHash: null,
       existingBytes: 0,
     };
   }
-}
-
-async function loadIntegrityReconciliationRequest(): Promise<IntegrityReconciliationRequest | null> {
-  const path = (Deno.env.get("UK_AQ_LATEST_SNAPSHOT_RECONCILE_REQUEST_FILE") || "").trim();
-  if (!path) return null;
-  const parsed = JSON.parse(await Deno.readTextFile(path));
-  const record = asRecord(parsed);
-  if (
-    record?.schema_version !== 1 ||
-    typeof record.integrity_run_id !== "string" ||
-    !record.integrity_run_id.trim() ||
-    !Array.isArray(record.candidates)
-  ) {
-    throw new Error("Integrity reconciliation request is invalid.");
-  }
-  return parsed as IntegrityReconciliationRequest;
 }
 
 function decodeCoreTableText(body: Uint8Array, tableKey: string): string {
@@ -1350,90 +1306,6 @@ function resolveEligibleStateRows(
   return { rows: eligibleRows, summary };
 }
 
-function resolveIntegrityReconciliationCandidates(
-  rows: IntegrityReconciliationCandidate[],
-  metadata: MetadataIndex,
-): {
-  rows: EligibleObservationMessageRow[];
-  eligible_count: number;
-  skipped_invalid_current_value_count: number;
-  skipped_unsupported_pollutant_count: number;
-  skipped_metadata_unresolved_count: number;
-} {
-  const eligibleRows: EligibleObservationMessageRow[] = [];
-  const summary = {
-    eligible_count: 0,
-    skipped_invalid_current_value_count: 0,
-    skipped_unsupported_pollutant_count: 0,
-    skipped_metadata_unresolved_count: 0,
-  };
-
-  for (const row of rows) {
-    const requestedPollutant = normalizeMatrixPollutant(row.pollutant_code);
-    if (!requestedPollutant) {
-      summary.skipped_unsupported_pollutant_count += 1;
-      continue;
-    }
-    const series = metadata.timeseriesById.get(row.timeseries_id);
-    if (!series) {
-      summary.skipped_metadata_unresolved_count += 1;
-      continue;
-    }
-    if (series.connector_id !== row.connector_id) {
-      throw new Error(
-        `Integrity candidate connector mismatch for timeseries_id=${row.timeseries_id}.`,
-      );
-    }
-    const phenomenon = series.phenomenon_id
-      ? metadata.phenomenaById.get(series.phenomenon_id) || null
-      : null;
-    const observedProperty = phenomenon?.observed_property_id
-      ? metadata.observedPropertyById.get(phenomenon.observed_property_id) || null
-      : null;
-    const resolvedPollutant = normalizeMatrixPollutant(normalizePollutant(
-      observedProperty?.code ??
-        phenomenon?.notation ??
-        phenomenon?.pollutant_label ??
-        phenomenon?.label ??
-        null,
-    ));
-    if (!resolvedPollutant) {
-      summary.skipped_unsupported_pollutant_count += 1;
-      continue;
-    }
-    if (resolvedPollutant !== requestedPollutant) {
-      throw new Error(
-        `Integrity candidate pollutant mismatch for timeseries_id=${row.timeseries_id}.`,
-      );
-    }
-    const decision = evaluateLatestCurrentValue({
-      matrixPollutant: resolvedPollutant,
-      value: row.value,
-    });
-    if (!decision.eligible || typeof row.value !== "number") {
-      summary.skipped_invalid_current_value_count += 1;
-      continue;
-    }
-    eligibleRows.push({
-      connector_id: row.connector_id,
-      timeseries_id: row.timeseries_id,
-      observed_at: row.observed_at,
-      value: row.value,
-      value_float8_hex: row.value_float8_hex,
-      status: row.status,
-    });
-    summary.eligible_count += 1;
-  }
-  eligibleRows.sort((a, b) =>
-    a.connector_id - b.connector_id ||
-    a.timeseries_id - b.timeseries_id ||
-    Date.parse(a.observed_at) - Date.parse(b.observed_at) ||
-    String(a.value_float8_hex ?? "").localeCompare(String(b.value_float8_hex ?? "")) ||
-    String(a.status ?? "").localeCompare(String(b.status ?? ""))
-  );
-  return { rows: eligibleRows, ...summary };
-}
-
 function deriveNextCursor(rows: LatestItem[]): { since: string | null; sinceId: number | null } {
   let bestSince: string | null = null;
   let bestId: number | null = null;
@@ -1647,8 +1519,6 @@ async function loadExistingManifest(): Promise<SnapshotManifest | null> {
 }
 
 async function main(): Promise<void> {
-  const reconciliationRequest = await loadIntegrityReconciliationRequest();
-  const isReconciliation = reconciliationRequest !== null;
   if (!hasRequiredR2Config(R2_CONFIG)) {
     throw new Error("Missing required R2 configuration (CFLARE_R2_*).");
   }
@@ -1663,22 +1533,20 @@ async function main(): Promise<void> {
     { name: "UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY", value: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY },
     { name: "UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX", value: UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX },
   ]);
-  if (!isReconciliation && !PUBSUB_PROJECT_ID) {
+  if (!PUBSUB_PROJECT_ID) {
     throw new Error("Missing GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT).");
   }
-  if (!isReconciliation && !PUBSUB_SUBSCRIPTION) {
+  if (!PUBSUB_SUBSCRIPTION) {
     throw new Error("UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION resolved empty.");
   }
-  if (!isReconciliation && OBSERVS_BASE_SUBSCRIPTION && OBSERVS_BASE_SUBSCRIPTION === PUBSUB_SUBSCRIPTION) {
+  if (OBSERVS_BASE_SUBSCRIPTION && OBSERVS_BASE_SUBSCRIPTION === PUBSUB_SUBSCRIPTION) {
     throw new Error("Snapshot Pub/Sub subscription must be dedicated (must not equal OBSERVS_PUBSUB_SUBSCRIPTION).");
   }
   if (UK_AQ_LATEST_SNAPSHOT_POLLUTANTS.length === 0) {
     throw new Error("UK_AQ_LATEST_SNAPSHOT_POLLUTANTS resolved empty.");
   }
 
-  const triggerMode = isReconciliation
-    ? "integrity_reconciliation"
-    : (Deno.env.get("UK_AQ_LATEST_SNAPSHOT_TRIGGER_MODE") || "manual").trim().toLowerCase() || "manual";
+  const triggerMode = (Deno.env.get("UK_AQ_LATEST_SNAPSHOT_TRIGGER_MODE") || "manual").trim().toLowerCase() || "manual";
   const startedAt = utcNowIso();
   const startedMs = Date.now();
   const warnings: string[] = [];
@@ -1689,53 +1557,22 @@ async function main(): Promise<void> {
     if (entry && typeof entry.id === "string") previousById.set(entry.id, entry as SnapshotManifestEntry);
   }
 
-  const stateLoaded = await loadState(isReconciliation);
+  const stateLoaded = await loadState();
   // Resolve metadata before pulling so an unavailable metadata source cannot
   // consume or acknowledge Pub/Sub messages.
   const metadataResult = await loadMetadataIndex();
 
+  const pulled = await flushPubsubRows();
+  const eligible = resolveEligibleStateRows(pulled.rows, metadataResult.metadata);
   const ingestedAt = utcNowIso();
-  const pulled = isReconciliation ? {
-    rows: [] as ObservationMessageRow[],
-    validAckIds: [] as string[],
-    summary: {
-      pull_requests: 0,
-      ack_requests: 0,
-      pulled_messages: 0,
-      decoded_rows: 0,
-      malformed_messages: 0,
-      acked_messages: 0,
-      payload_bytes: 0,
-      duration_ms: 0,
-    } satisfies PullSummary,
-  } : await flushPubsubRows();
-  const reconciliationEligible = isReconciliation
-    ? resolveIntegrityReconciliationCandidates(
-      reconciliationRequest.candidates,
-      metadataResult.metadata,
-    )
-    : null;
-  const scheduledEligible = isReconciliation
-    ? null
-    : resolveEligibleStateRows(pulled.rows, metadataResult.metadata);
-  const eligibleRows = reconciliationEligible?.rows || scheduledEligible?.rows || [];
-  const reconciliationStateApply = isReconciliation
-    ? applyIntegrityCandidatesToLatestState(stateLoaded.stateMap, eligibleRows, ingestedAt)
-    : null;
-  const scheduledStateApply = isReconciliation
-    ? null
-    : applyEligibleRowsToLatestState(stateLoaded.stateMap, eligibleRows, ingestedAt);
-  const stateApply = reconciliationStateApply || scheduledStateApply;
+  const stateApply = applyEligibleRowsToLatestState(stateLoaded.stateMap, eligible.rows, ingestedAt);
   if (stateLoaded.stateMap.size > UK_AQ_LATEST_SNAPSHOT_MAX_STATE_ENTRIES) {
     throw new Error(
       `Latest snapshot state exceeded max entries (${stateLoaded.stateMap.size} > ${UK_AQ_LATEST_SNAPSHOT_MAX_STATE_ENTRIES}).`,
     );
   }
 
-  const stateTransitionCount = isReconciliation
-    ? reconciliationStateApply!.applied_new_count + reconciliationStateApply!.applied_newer_count +
-      reconciliationStateApply!.applied_same_timestamp_correction_count
-    : scheduledStateApply!.applied_new + scheduledStateApply!.applied_newer;
+  const stateTransitionCount = stateApply.applied_new + stateApply.applied_newer;
   if (stateTransitionCount > 0) {
     const stateBytes = TEXT_ENCODER.encode(serializeLatestState(stateLoaded.stateMap, ingestedAt));
     const nextStateHash = sha256Hex(stateBytes);
@@ -1754,7 +1591,7 @@ async function main(): Promise<void> {
     }
   }
 
-  if (!isReconciliation && pulled.validAckIds.length) {
+  if (pulled.validAckIds.length) {
     pulled.summary.ack_requests += await ackPubsubMessages(pulled.validAckIds);
     pulled.summary.acked_messages += pulled.validAckIds.length;
   }
@@ -1765,14 +1602,8 @@ async function main(): Promise<void> {
     timestamp: utcNowIso(),
     pull: pulled.summary,
     state_apply: stateApply,
-    state_policy: isReconciliation ? {
-      eligible_count: reconciliationEligible!.eligible_count,
-      skipped_invalid_current_value_count: reconciliationEligible!.skipped_invalid_current_value_count,
-      skipped_unsupported_pollutant_count: reconciliationEligible!.skipped_unsupported_pollutant_count,
-      skipped_metadata_unresolved_count: reconciliationEligible!.skipped_metadata_unresolved_count,
-    } : scheduledEligible!.summary,
+    state_policy: eligible.summary,
     state_transition_count: stateTransitionCount,
-    integrity_run_id: reconciliationRequest?.integrity_run_id ?? null,
   }));
 
   const sourceRows = buildSourceRows(stateLoaded.stateMap, metadataResult.metadata);
@@ -1941,24 +1772,17 @@ async function main(): Promise<void> {
   };
 
   const manifestBody = TEXT_ENCODER.encode(`${toStableJson(manifest)}\n`);
-  let manifestFailed = false;
-  try {
-    const manifestPut = await r2PutObject({
-      r2: R2_CONFIG,
-      key: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY,
-      body: manifestBody,
-      content_type: "application/json; charset=utf-8",
-    });
-    await updateLocalR2CacheAfterPut(
-      UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY,
-      manifestBody,
-      manifestPut.etag,
-    );
-  } catch (error) {
-    if (!isReconciliation) throw error;
-    manifestFailed = true;
-    warnings.push(`manifest: ${error instanceof Error ? error.message : String(error)}`);
-  }
+  const manifestPut = await r2PutObject({
+    r2: R2_CONFIG,
+    key: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY,
+    body: manifestBody,
+    content_type: "application/json; charset=utf-8",
+  });
+  await updateLocalR2CacheAfterPut(
+    UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY,
+    manifestBody,
+    manifestPut.etag,
+  );
 
   let reportKey: string | null = null;
   const runReportDecision = resolveRunReportDecision(
@@ -1966,7 +1790,7 @@ async function main(): Promise<void> {
     triggerMode,
     failureCount,
   );
-  if (runReportDecision.write && UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX && !manifestFailed) {
+  if (runReportDecision.write && UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX) {
     reportKey = `${UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX}/${compactTimestamp(finishedAt)}.json`;
     const report: BuildReport = {
       ok: failureCount === 0,
@@ -1980,18 +1804,12 @@ async function main(): Promise<void> {
       skipped_unchanged_count: skippedUnchangedCount,
       warnings,
     };
-    try {
-      await r2PutObject({
-        r2: R2_CONFIG,
-        key: reportKey,
-        body: TEXT_ENCODER.encode(`${toStableJson(report)}\n`),
-        content_type: "application/json; charset=utf-8",
-      });
-    } catch (error) {
-      if (!isReconciliation) throw error;
-      warnings.push(`run_report: ${error instanceof Error ? error.message : String(error)}`);
-      reportKey = null;
-    }
+    await r2PutObject({
+      r2: R2_CONFIG,
+      key: reportKey,
+      body: TEXT_ENCODER.encode(`${toStableJson(report)}\n`),
+      content_type: "application/json; charset=utf-8",
+    });
   }
 
   const report: BuildReport = {
@@ -2018,40 +1836,6 @@ async function main(): Promise<void> {
       reason: runReportDecision.reason,
     },
   }));
-
-  if (isReconciliation) {
-    const reconciliationResponse = {
-      ok: failureCount === 0 && !manifestFailed,
-      trigger_mode: triggerMode,
-      integrity_run_id: reconciliationRequest.integrity_run_id,
-      candidate_count: reconciliationRequest.candidates.length,
-      eligible_count: reconciliationEligible!.eligible_count,
-      applied_new_count: reconciliationStateApply!.applied_new_count,
-      applied_newer_count: reconciliationStateApply!.applied_newer_count,
-      applied_same_timestamp_correction_count:
-        reconciliationStateApply!.applied_same_timestamp_correction_count,
-      skipped_equal_count: reconciliationStateApply!.skipped_equal_count,
-      skipped_older_count: reconciliationStateApply!.skipped_older_count,
-      skipped_invalid_current_value_count:
-        reconciliationEligible!.skipped_invalid_current_value_count,
-      skipped_unsupported_pollutant_count:
-        reconciliationEligible!.skipped_unsupported_pollutant_count,
-      skipped_metadata_unresolved_count:
-        reconciliationEligible!.skipped_metadata_unresolved_count,
-      state_changed: stateTransitionCount > 0,
-      product_success_count: successCount,
-      product_failure_count: failureCount,
-      changed_product_count: changedCount,
-      skipped_unchanged_product_count: skippedUnchangedCount,
-      manifest_key: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY,
-      manifest_written: !manifestFailed,
-      warnings,
-    };
-    console.log(`UK_AQ_LATEST_SNAPSHOT_RECONCILE_RESULT ${JSON.stringify(reconciliationResponse)}`);
-    if (!reconciliationResponse.ok) {
-      throw new Error("Integrity reconciliation completed with a partial durable outcome.");
-    }
-  }
 
   if (failureCount > 0) {
     throw new Error(`Snapshot build completed with ${failureCount} failed matrix item(s).`);

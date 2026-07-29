@@ -60,58 +60,6 @@ export function applyEligibleRowsToLatestState(stateMap, rows, ingestedAt) {
   return summary;
 }
 
-/**
- * Applies final verified Integrity candidates. Unlike normal Pub/Sub handling,
- * equal timestamps compare canonical content before the wall-clock tie-break.
- *
- * @param {Map<string, any>} stateMap
- * @param {Array<{ connector_id: number, timeseries_id: number, observed_at: string, value: number, value_float8_hex: string | null, status: string | null }>} rows
- * @param {string} reconciledAt
- */
-export function applyIntegrityCandidatesToLatestState(stateMap, rows, reconciledAt) {
-  const summary = {
-    applied_new_count: 0,
-    applied_newer_count: 0,
-    applied_same_timestamp_correction_count: 0,
-    skipped_equal_count: 0,
-    skipped_older_count: 0,
-  };
-
-  for (const row of rows) {
-    const key = latestStateKey(row.connector_id, row.timeseries_id);
-    const current = stateMap.get(key);
-    const next = { ...row, ingested_at: reconciledAt };
-    if (!current) {
-      stateMap.set(key, next);
-      summary.applied_new_count += 1;
-      continue;
-    }
-
-    const observedDifference = Date.parse(row.observed_at) - Date.parse(current.observed_at);
-    if (observedDifference > 0) {
-      stateMap.set(key, next);
-      summary.applied_newer_count += 1;
-      continue;
-    }
-    if (observedDifference < 0) {
-      summary.skipped_older_count += 1;
-      continue;
-    }
-
-    const canonicalContentEqual = Object.is(row.value, current.value) &&
-      row.value_float8_hex === current.value_float8_hex &&
-      row.status === current.status;
-    if (canonicalContentEqual) {
-      summary.skipped_equal_count += 1;
-      continue;
-    }
-    stateMap.set(key, next);
-    summary.applied_same_timestamp_correction_count += 1;
-  }
-
-  return summary;
-}
-
 /** @param {unknown} value */
 function stableSort(value) {
   if (Array.isArray(value)) return value.map((item) => stableSort(item));
