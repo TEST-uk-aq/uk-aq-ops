@@ -8,17 +8,25 @@ The system consumes observation messages through a dedicated Pub/Sub subscriptio
 
 The Cloud Run builder may reuse validated container-local copies of its durable state, metadata-cache and manifest objects while a container remains warm. R2 remains the durable authority. Successful scheduled builds do not create a permanent R2 run-report object by default, while structured logging remains available for every completed run.
 
+R2 History Integrity may also supply final verified observation candidates through the authenticated owner-service boundary defined in [`integrity_reconciliation.md`](integrity_reconciliation.md). Integrity does not write Latest Snapshot R2 state or products directly.
+
 ## Authoritative reading order
 
 1. [`contract.md`](contract.md)
-2. [`homepage-consumer-contract.md`](homepage-consumer-contract.md) for the public homepage `Highest sensor readings` refresh and layout behaviour
-3. [`data_flow.md`](data_flow.md)
-4. [`state_model.md`](state_model.md)
-5. [`interfaces.md`](interfaces.md)
-6. [`operations.md`](operations.md)
-7. [`recovery.md`](recovery.md)
-8. [`validation.md`](validation.md)
-9. Relevant files under [`decisions/`](decisions/)
+2. [`integrity_reconciliation.md`](integrity_reconciliation.md) for final verified candidates supplied by R2 History Integrity
+3. [`homepage-consumer-contract.md`](homepage-consumer-contract.md) for the public homepage `Highest sensor readings` refresh and layout behaviour
+4. [`data_flow.md`](data_flow.md)
+5. [`state_model.md`](state_model.md)
+6. [`interfaces.md`](interfaces.md)
+7. [`operations.md`](operations.md)
+8. [`recovery.md`](recovery.md)
+9. [`validation.md`](validation.md)
+10. Relevant files under [`decisions/`](decisions/)
+
+For Integrity reconciliation changes, also read:
+
+- [`../r2_history/current_state_reconciliation.md`](../r2_history/current_state_reconciliation.md);
+- [`decisions/0004-integrity-reconciliation-through-owner-service.md`](decisions/0004-integrity-reconciliation-through-owner-service.md).
 
 ## Implementation ownership
 
@@ -34,6 +42,7 @@ This area governs the behaviour of:
 - `.github/workflows/uk_aq_latest_snapshot_cloud_run_deploy.yml`;
 - `.github/workflows/uk_aq_latest_snapshot_r2_api_worker_deploy.yml`;
 - latest-snapshot state seed, repair and rebuild scripts under `scripts/backup_r2/`;
+- the authenticated Integrity reconciliation operation in the existing Latest Snapshot Cloud Run service;
 - the public homepage latest-readings consumer in `TEST-uk-aq/TEST-uk-aq.github.io/index.html` and `dashboard.js`, within the limits defined by [`homepage-consumer-contract.md`](homepage-consumer-contract.md).
 
 The raw observation publisher and raw observation-history writer are upstream systems. They are not owned by this area and MUST continue preserving source observations, including invalid or sentinel values.
@@ -69,6 +78,17 @@ latest_snapshots/v2/network_group=all/pollutant=no2/window=all.json
 The R2 API Worker reads the relevant physical `all` object for every request. It returns `window=all` directly and derives `3h`, `6h`, `1d` and `7d` responses from `last_value_at`.
 
 The physical manifest describes only the three stored objects. Public finite responses are virtual API representations and are not manifest entries.
+
+### Integrity reconciliation
+
+- Integrity supplies only final verified canonical candidates after the R2 History verification boundary.
+- The existing Latest Snapshot Cloud Run service remains the sole durable-state and product writer.
+- Reconciliation applies only to `pm25`, `pm10` and `no2`.
+- Older candidates cannot replace newer state.
+- Identical same-timestamp canonical content is a no-op.
+- A different final verified same-timestamp value, binary value identity or status may be applied once as a correction.
+- Retrying the same correction is a no-op.
+- Public v2 routes, fields and finite-window behaviour do not change.
 
 ### Durable authority and warm local cache
 
@@ -111,7 +131,7 @@ Old finite-window R2 objects may remain from the previous architecture. They are
 
 ## Current implementation status
 
-As of 28 July 2026:
+As of 29 July 2026:
 
 - decoded observations are resolved and checked against the latest-current-value policy before they can replace state;
 - invalid or sentinel pollutant values do not create or replace latest state;
@@ -123,13 +143,15 @@ As of 28 July 2026:
 - the default run-report mode is `failures`, so successful scheduled runs do not create per-minute `_runs` objects;
 - the public v2 route, parameters and response fields remain unchanged;
 - the TEST backend implementation is reported complete;
-- the homepage consumer refresh and layout behaviour is approved in [`homepage-consumer-contract.md`](homepage-consumer-contract.md) and is pending implementation.
+- the homepage consumer refresh and layout behaviour is approved in [`homepage-consumer-contract.md`](homepage-consumer-contract.md) and is pending implementation;
+- Integrity reconciliation through the owner service is approved in [`integrity_reconciliation.md`](integrity_reconciliation.md) and is pending implementation.
 
 ## Decisions
 
 - [`0001-latest-valid-observation-state.md`](decisions/0001-latest-valid-observation-state.md): state retains the latest valid pollutant observation.
 - [`0002-finite-windows-from-all-snapshot.md`](decisions/0002-finite-windows-from-all-snapshot.md): finite public windows are derived from the physical `all` snapshot.
 - [`0003-warm-local-cache-and-run-report-policy.md`](decisions/0003-warm-local-cache-and-run-report-policy.md): validated container-local copies reduce R2 body reads and successful scheduled run reports are omitted by default.
+- [`0004-integrity-reconciliation-through-owner-service.md`](decisions/0004-integrity-reconciliation-through-owner-service.md): final verified Integrity candidates are applied only by the existing Latest Snapshot owner service.
 
 ## Documentation migration
 
