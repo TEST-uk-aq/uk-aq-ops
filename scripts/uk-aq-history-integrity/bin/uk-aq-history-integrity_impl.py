@@ -12811,10 +12811,25 @@ def build_v2_repair_plan(
         suggested_kind = str(suggested.get("kind") or "") if isinstance(suggested, Mapping) else ""
         if not active_observation_pollutant(gap.get("pollutant_code")):
             continue
-        if suggested_kind == "uk_air_csv_to_v2_observations_backfill_required" and gap_type == "day_dir_missing":
+        sos_missing_scope_repair = (
+            gap_type in {"day_dir_missing", "connector_dir_missing"}
+            or (
+                gap_type == "pollutant_dir_missing"
+                and str(gap.get("pollutant_code") or "").strip().lower()
+                in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+            )
+        )
+        if (
+            suggested_kind
+            == "uk_air_csv_to_v2_observations_backfill_required"
+            and sos_missing_scope_repair
+        ):
+            repair_gap = dict(gap)
+            if gap_type in {"day_dir_missing", "connector_dir_missing"}:
+                repair_gap["pollutant_code"] = None
             add_action(
                 "observation_data_repair",
-                gap=gap,
+                gap=repair_gap,
                 requires_index_rebuild=True,
                 data_changes_required=True,
                 notes="Repair the missing SOS observation connector-day from authoritative UK-AIR CSV source evidence.",
@@ -17068,9 +17083,15 @@ def _derive_executable_observation_repair_pollutants(
 
         # A connector/day-wide repair is allowed only when every explicitly
         # requested pollutant has complete authoritative source evidence.
-        wildcard_pollutants = (
-            requested or set(V2_OBSERVATION_INTEGRITY_POLLUTANTS)
-        )
+        if not requested:
+            skip(
+                index=index, day_utc=day_utc,
+                connector_id=connector_id, pollutant_code=None,
+                gap_type=gap_type,
+                reason="explicit_repair_pollutants_required_for_wildcard_repair",
+            )
+            continue
+        wildcard_pollutants = requested
         if repair_plan_present:
             gap_source_resolution = gap.get(
                 "source_evidence_by_pollutant"
