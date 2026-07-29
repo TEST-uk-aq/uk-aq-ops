@@ -7,6 +7,7 @@ This area governs:
 - stable v2 physical timeseries binding identity and routing;
 - embedded multi-member continuity families in schema-version-2 bindings;
 - v2 history Integrity detection, planning and repair;
+- post-verification reconciliation of `timeseries` freshness and Latest Snapshot current state;
 - scheduled Integrity daily date selection;
 - the connector-specific IngestDB-to-R2 boundary used by Integrity;
 - concurrent Prune Daily and Integrity writer coordination;
@@ -40,6 +41,8 @@ For binding and continuity changes:
 For Integrity changes, also read:
 
 - [`integrity.md`](integrity.md);
+- [`current_state_reconciliation.md`](current_state_reconciliation.md) where a verified history repair can affect `timeseries` freshness or Latest Snapshot;
+- [`../latest_snapshot/integrity_reconciliation.md`](../latest_snapshot/integrity_reconciliation.md) for the Latest Snapshot owner-service boundary;
 - [`history_writer_coordination.md`](history_writer_coordination.md) for the request-level IngestDB boundary, shared writer and lock hierarchy;
 - [`lock_environment_boundary.md`](lock_environment_boundary.md) for the authoritative Supabase-project boundary and lock-key inputs;
 - [`implementation_safety_contract.md`](implementation_safety_contract.md) for exact affected-day finalisation, shared-writer compliance, deletion-gate validation and active v2-only AQI enforcement;
@@ -123,6 +126,24 @@ Required behaviour includes:
 - the pollutant manifest contains deterministic status counts;
 - the existing Dropbox manifest/day backup carries the data and hash without a separate hash object;
 - Prune Daily additionally persists a distinct versioned connector-day source hash built from the same canonical row encoder.
+
+## Current-state reconciliation
+
+The authoritative reconciliation contract is [`current_state_reconciliation.md`](current_state_reconciliation.md).
+
+Required behaviour includes:
+
+- reconciliation runs only after final verified R2 observation evidence exists;
+- `timeseries.last_value_at` and `timeseries.last_value` are updated only through a private schema-owned monotonic RPC;
+- Latest Snapshot state and products are updated only through the existing authenticated Latest Snapshot owner service;
+- Integrity never writes Latest Snapshot R2 objects directly;
+- O3 may update timeseries freshness but remains outside Latest Snapshot;
+- older candidates cannot move current state backwards;
+- identical same-timestamp content is a no-op;
+- a different final verified same-timestamp value or status may be applied once as a correction;
+- check-only and dry-run modes remain non-mutating;
+- R2 history, timeseries reconciliation and Latest Snapshot reconciliation retain separate component statuses;
+- the line chart continues using its normal recent-head and R2 history routes without a browser-side SOS fallback.
 
 ## Shared history writer and lock hierarchy
 
@@ -224,9 +245,11 @@ Unknown, ambiguous or contradictory identity remains fail-closed.
 - `workers/uk_aq_aqi_history_r2_api_worker/`
 - `workers/uk_aq_cache_proxy/src/station_history/`
 - `workers/uk_aq_station_history/`
+- `workers/uk_aq_latest_snapshot_cloud_run/` for the owner-service reconciliation operation
 - `workers/uk_aq_prune_daily/server.mjs`
 - `workers/uk_aq_prune_daily/phase_b_history_r2.mjs`
 - `workers/uk_aq_backfill_local/`
+- the private schema migration and RPC used for monotonic timeseries reconciliation
 - `lib/aqi/aqi_levels.mjs`
 - `scripts/backup_r2/`
 - `scripts/uk-aq-history-integrity/`
