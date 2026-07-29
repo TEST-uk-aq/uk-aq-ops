@@ -44,6 +44,9 @@ github_ref = "main"
 dry_run = false
 notes = "Supabase logical database dumps to Dropbox"
 
+[jobs.uk_aq_supabase_db_dump_backup.github_inputs]
+trigger_mode = "scheduler"
+
 [jobs.uk_aq_r2_core_snapshot]
 enabled = true
 cron_expr = "15 4 * * *"

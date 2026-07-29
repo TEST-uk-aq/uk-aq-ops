@@ -19,16 +19,19 @@ Cloudflare cron scheduler
   -> Dropbox
 ```
 
-The scheduler entry in `cloudflare/scheduler/jobs.toml` runs at `00:55 UTC` and
-does not provide a database input. A blank selection makes `job.mjs` identify
-the run as scheduled and back up both databases in this order:
+The scheduler entry in `cloudflare/scheduler/jobs.toml` runs at `00:55 UTC`,
+provides `trigger_mode=scheduler`, and does not provide a database input. The
+workflow defaults `trigger_mode` to `manual` for UI dispatches. Trigger source
+is resolved independently of database selection, and a blank selection backs up
+both databases in this order:
 
 1. `ingestdb`
 2. `obs_aqidb`
 
-Manual workflow dispatch accepts `ingestdb`, `obs_aqidb`,
-`ingestdb,obs_aqidb`, or a blank value for both. GitHub Actions concurrency
-queues overlapping scheduled or manual runs rather than cancelling either run.
+Manual workflow dispatch keeps the default trigger mode and accepts `ingestdb`,
+`obs_aqidb`, `ingestdb,obs_aqidb`, or a blank value for both. GitHub Actions
+concurrency queues overlapping scheduled or manual runs rather than cancelling
+either run.
 
 The retired GCP scheduler and compute runtimes are not a fallback. If the
 GitHub path fails, disable the Cloudflare scheduler job, fix and manually rerun

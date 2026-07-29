@@ -3,6 +3,11 @@ name: UK AQ Supabase DB Dump Backup
 on:
   workflow_dispatch:
     inputs:
+      trigger_mode:
+        description: "Trigger source supplied by the Cloudflare scheduler. Manual runs should keep the default."
+        required: false
+        default: "manual"
+        type: string
       databases:
         description: "Optional database selection: ingestdb, obs_aqidb, or ingestdb,obs_aqidb. Blank backs up both."
         required: false
@@ -34,6 +39,7 @@ jobs:
       UK_AQ_DB_DUMP_INSERT_SPLIT_THRESHOLD_ROWS: ${{ vars.UK_AQ_DB_DUMP_INSERT_SPLIT_THRESHOLD_ROWS || '10000' }}
       UK_AQ_DB_DUMP_INSERT_CHUNK_ROWS: ${{ vars.UK_AQ_DB_DUMP_INSERT_CHUNK_ROWS || '5000' }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
+      UK_AQ_SUPABASE_DB_DUMP_TRIGGER_MODE: ${{ github.event.inputs.trigger_mode || 'manual' }}
       UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES: ${{ github.event.inputs.databases || '' }}
 
     steps:
@@ -93,6 +99,14 @@ jobs:
           if [ "${missing}" -ne 0 ]; then
             exit 1
           fi
+
+          case "${UK_AQ_SUPABASE_DB_DUMP_TRIGGER_MODE}" in
+            manual|scheduler) ;;
+            *)
+              echo "Unsupported trigger_mode input. Use manual or scheduler." >&2
+              exit 2
+              ;;
+          esac
 
           case "${UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES}" in
             ""|ingestdb|obs_aqidb|ingestdb,obs_aqidb) ;;

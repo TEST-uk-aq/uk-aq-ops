@@ -16,6 +16,7 @@ const workflowText = readFileSync(
   ".github/workflows/uk_aq_supabase_db_dump_backup.yml",
   "utf8",
 );
+const schedulerText = readFileSync("cloudflare/scheduler/jobs.toml", "utf8");
 
 function successfulReport() {
   return {
@@ -52,23 +53,56 @@ function successfulReport() {
   };
 }
 
-test("Job defaults to scheduler mode and both databases", () => {
+test("Job defaults to manual mode and both databases", () => {
   assert.equal(JOB_NAME, "uk-aq-supabase-db-dump-backup");
   assert.deepEqual(resolveJobSelection({}), {
-    triggerMode: "scheduler",
+    triggerMode: "manual",
     requestedDatabases: ["ingestdb", "obs_aqidb"],
   });
+});
+
+test("Job accepts scheduler mode with a blank database selection", () => {
+  assert.deepEqual(
+    resolveJobSelection({
+      UK_AQ_SUPABASE_DB_DUMP_TRIGGER_MODE: "scheduler",
+      UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES: "",
+    }),
+    {
+      triggerMode: "scheduler",
+      requestedDatabases: ["ingestdb", "obs_aqidb"],
+    },
+  );
 });
 
 test("Job accepts an explicit manual database selection", () => {
   assert.deepEqual(
     resolveJobSelection({
+      UK_AQ_SUPABASE_DB_DUMP_TRIGGER_MODE: "manual",
       UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES: "obs_aqidb",
     }),
     {
       triggerMode: "manual",
       requestedDatabases: ["obs_aqidb"],
     },
+  );
+});
+
+test("Job rejects unsupported trigger modes", () => {
+  assert.throws(
+    () => resolveJobSelection({
+      UK_AQ_SUPABASE_DB_DUMP_TRIGGER_MODE: "automatic",
+    }),
+    /Unsupported trigger mode: automatic/,
+  );
+});
+
+test("Job rejects unsupported database selections", () => {
+  assert.throws(
+    () => resolveJobSelection({
+      UK_AQ_SUPABASE_DB_DUMP_TRIGGER_MODE: "manual",
+      UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES: "unknown_db",
+    }),
+    /Unsupported database selection: unknown_db/,
   );
 });
 
@@ -123,7 +157,10 @@ test("shared wrapper records failed report and leaves it for Job exit handling",
       {
         database: "obs_aqidb",
         ok: false,
-        dumps: [],
+        dumps: [
+          { gzip_bytes: 500 },
+          { gzip_bytes: 600 },
+        ],
       },
     ],
   };
@@ -143,7 +180,12 @@ test("shared wrapper records failed report and leaves it for Job exit handling",
   assert.equal(calls.length, 1);
   assert.equal(calls[0][0], "failed");
   assert.equal(calls[0][1], "health-run-2");
-  assert.equal(calls[0][3].summary.failed_database_count, 1);
+  const summary = calls[0][3].summary;
+  assert.deepEqual(summary.databases_backed_up, ["ingestdb"]);
+  assert.equal(summary.successful_dump_count, 6);
+  assert.equal(summary.failed_dump_count, 2);
+  assert.equal(summary.successful_database_count, 1);
+  assert.equal(summary.failed_database_count, 1);
 });
 
 test("shared wrapper records an unhandled exception and rethrows it", async () => {
@@ -189,6 +231,15 @@ test("GitHub workflow queues direct backup runs with the required toolchain", ()
   assert.match(
     workflowText,
     /UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES: \$\{\{ github\.event\.inputs\.databases \|\| '' \}\}/,
+  );
+  assert.match(
+    workflowText,
+    /UK_AQ_SUPABASE_DB_DUMP_TRIGGER_MODE: \$\{\{ github\.event\.inputs\.trigger_mode \|\| 'manual' \}\}/,
+  );
+  assert.match(workflowText, /manual\|scheduler\) ;;/);
+  assert.match(
+    schedulerText,
+    /\[jobs\.uk_aq_supabase_db_dump_backup\.github_inputs\]\ntrigger_mode = "scheduler"/,
   );
   assert.doesNotMatch(workflowText, /gcloud|google-github-actions|schedule:/);
 });
