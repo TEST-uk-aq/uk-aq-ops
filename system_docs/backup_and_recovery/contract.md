@@ -83,16 +83,24 @@ Unsupported database names MUST fail before backup work begins.
 
 ## Required secrets and variables
 
-The GitHub workflow MUST read these secrets:
+The GitHub workflow MUST read these repository secrets:
 
 ```text
-UK_AQ_INGESTDB_DB_URL
+SUPABASE_DB_URL
 OBS_AQIDB_SUPABASE_DB_URL
 OBS_AQIDB_SECRET_KEY
 DROPBOX_APP_KEY
 DROPBOX_APP_SECRET
 DROPBOX_REFRESH_TOKEN
 ```
+
+The authoritative GitHub secret name for the `ingestdb` direct PostgreSQL connection is `SUPABASE_DB_URL`. The workflow MUST expose that secret to the existing worker through this runtime environment mapping:
+
+```yaml
+UK_AQ_INGESTDB_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+```
+
+`UK_AQ_INGESTDB_DB_URL` is an internal worker environment-variable name, not a required GitHub repository secret. The workflow MUST NOT require a GitHub secret named `UK_AQ_INGESTDB_DB_URL`.
 
 The workflow MUST read these variables:
 
@@ -249,6 +257,7 @@ Pre-deployment validation MUST remain minimal. It MUST establish only that:
 - changed JavaScript parses;
 - the focused INSERT-splitting checks pass;
 - manual database selection maps correctly into `UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES`;
+- `SUPABASE_DB_URL` is mapped into the worker runtime as `UK_AQ_INGESTDB_DB_URL`;
 - obsolete active GCP references are absent from the retired backup path.
 
 A targeted deterministic splitter check is required because malformed commas or semicolons can create an unrestorable backup while the backup run itself appears successful.
