@@ -7,7 +7,7 @@ This document is authoritative for the scheduled logical backups of:
 - `ingestdb`
 - `obs_aqidb`
 
-It governs scheduling, GitHub Actions execution, backup contents, Dropbox layout, retention, task-health reporting, failure behaviour and the bounded-memory SQL post-processing requirement.
+It governs scheduling, GitHub Actions execution, concurrent per-database processing, backup contents, Dropbox layout, retention, task-health reporting, failure behaviour and the bounded-memory SQL post-processing requirement.
 
 Where older code, workflows, plans or documentation conflict with this document, this document is authoritative for this backup path.
 
@@ -22,10 +22,11 @@ Cloudflare Worker cron scheduler
   -> D1 scheduler job claim
   -> GitHub workflow_dispatch
   -> .github/workflows/uk_aq_supabase_db_dump_backup.yml
-  -> GitHub-hosted ubuntu-latest runner
+  -> one GitHub-hosted ubuntu-latest job
   -> workers/uk_aq_supabase_db_dump_backup_service/job.mjs
-  -> daily task health lifecycle
+  -> one daily task health lifecycle
   -> workers/uk_aq_supabase_db_dump_backup_service/core.mjs
+  -> concurrent ingestdb and obs_aqidb backup branches
   -> dated Dropbox backup files
 ```
 
@@ -54,7 +55,7 @@ The workflow MUST:
 - install PostgreSQL client 17;
 - install Supabase CLI version `2.79.0`, matching the previously deployed runtime;
 - install repository dependencies with `npm ci --ignore-scripts`;
-- set `timeout-minutes: 90`;
+- set `timeout-minutes: 150`;
 - use a dedicated concurrency group;
 - set `cancel-in-progress: false`;
 - run `node workers/uk_aq_supabase_db_dump_backup_service/job.mjs`;
@@ -63,7 +64,18 @@ The workflow MUST:
 - obtain non-secret configuration from GitHub repository variables;
 - preserve structured logs and the existing daily task-health lifecycle.
 
-The concurrency group MUST prevent overlapping scheduled or manual backup runs. A newly dispatched run MUST queue rather than cancel an active run.
+The concurrency group MUST prevent overlapping scheduled or manual backup workflow runs. A newly dispatched workflow run MUST queue rather than cancel an active run.
+
+A normal two-database execution MUST run the `ingestdb` and `obs_aqidb` database backup branches concurrently inside the same Node.js process and the same GitHub Actions job. It MUST NOT use a GitHub Actions matrix or separate database jobs. This preserves one workflow result, one health lifecycle and one combined report.
+
+Concurrent database execution MUST:
+
+- be bounded to the requested databases, with a maximum concurrency of two;
+- give each database its own temporary working directory and dated Dropbox path;
+- keep the four dump stages within each individual database sequential;
+- allow both database branches to reach a settled success or failure result before finalising the combined report;
+- avoid shared mutable state that can corrupt credentials, temporary files, uploads, retention or summaries;
+- preserve canonical database result order as `ingestdb`, then `obs_aqidb`, regardless of completion order.
 
 ## Required workflow inputs
 
@@ -75,11 +87,18 @@ obs_aqidb
 ingestdb,obs_aqidb
 ```
 
-Blank selection MUST back up both databases in the canonical order.
+Blank database selection MUST back up both databases.
 
-The Cloudflare scheduled dispatch MUST provide no database override so that `job.mjs` identifies the execution as a scheduler run and selects both databases.
+The workflow MUST also support an explicit trigger mode with exactly these accepted values:
 
-Unsupported database names MUST fail before backup work begins.
+```text
+manual
+scheduler
+```
+
+Manual workflow dispatch MUST default to `manual`. The Cloudflare scheduled dispatch MUST provide `trigger_mode = "scheduler"` through the existing scheduler `github_inputs` mechanism and MUST provide no database override. Blank database selection MUST NOT by itself be used to infer scheduler mode.
+
+Unsupported trigger modes or database names MUST fail before backup work begins.
 
 ## Required secrets and variables
 
@@ -128,10 +147,20 @@ No GCP authentication, project, service-account, Artifact Registry, Cloud Run or
 
 ## Backup contents and order
 
-A normal scheduled run MUST back up both databases sequentially in this order:
+A normal scheduled run MUST request both databases in this canonical result order:
 
 1. `ingestdb`
 2. `obs_aqidb`
+
+The two databases execute concurrently. Canonical order applies to selection, combined reporting and summaries, not to which database finishes first.
+
+Within each database, the backup stages MUST remain sequential in this order:
+
+1. roles
+2. schema
+3. data
+4. cron jobs
+5. retention
 
 Each successful database backup MUST produce exactly these four gzip files:
 
@@ -196,6 +225,8 @@ With a retention value of `7`, the current run date plus the preceding six UTC d
 
 A database that fails before completion MUST NOT have its retention step reported as successful.
 
+Concurrent retention operations are permitted because each database uses a separate Dropbox database root. They MUST NOT inspect or delete the other database's folders.
+
 ## Task-health contract
 
 The task-health identity MUST remain:
@@ -206,17 +237,29 @@ source_repo: uk-aq-ops
 source_worker: uk_aq_supabase_db_dump_backup_service
 ```
 
-The health lifecycle MUST record started and final success or failure states. The compact summary MUST continue to report, where available:
+The task definition metadata MUST describe the active runtime as GitHub:
+
+```text
+platform: github
+source_workflow: .github/workflows/uk_aq_supabase_db_dump_backup.yml
+source_service: null
+```
+
+The health lifecycle MUST record one started state and one final success or failure state for the combined workflow. It MUST NOT create an independent daily task run for each database.
+
+The compact summary MUST continue to report, where available:
 
 - trigger mode;
 - requested databases;
-- databases backed up;
+- successfully completed databases;
 - successful and failed database counts;
-- dump counts;
+- successful and failed dump counts, using four expected dumps per requested database;
 - compressed bytes written;
 - elapsed time;
 - Dropbox destination root;
 - errors and warnings.
+
+`databases_backed_up` MUST include only database results with `ok === true`. `successful_dump_count` MUST include every completed dump present in database result `dumps` arrays, including completed uploads from a database that later fails. `failed_dump_count` MUST be the non-negative difference between four expected dumps per requested database and the completed dump count.
 
 GitHub context may be added to the health summary, but it MUST NOT replace the stable task identity above.
 
@@ -224,9 +267,11 @@ GitHub context may be added to the health summary, but it MUST NOT replace the s
 
 The overall workflow MUST fail if either requested database fails.
 
-A run may have already uploaded a complete backup for the first database when the second database fails. This partial success MUST remain visible in structured logs and task-health summary.
+A failure in one database branch MUST NOT deliberately cancel the other branch. The implementation MUST wait for both requested database branches to settle, then retain each branch's success or failure result in canonical database order.
 
-A rerun for the same UTC date MUST safely overwrite already uploaded files and complete the missing or failed database backup.
+Either database may upload a complete or partial backup while the other database fails. This partial success MUST remain visible in structured logs and the combined task-health summary.
+
+A rerun for the same UTC date MUST safely overwrite already uploaded files and complete any missing or failed database backup.
 
 Automatic workflow retries MUST NOT be added by creating a second schedule or overlapping dispatch. Operational retries are manual workflow dispatches unless a later scheduler contract explicitly defines bounded retry behaviour.
 
@@ -252,11 +297,13 @@ The implementation directory may retain the `_service` suffix to avoid an unnece
 
 Pre-deployment validation MUST remain minimal. It MUST establish only that:
 
-- the workflow YAML is structurally valid;
+- the workflow YAML is structurally valid and sets `timeout-minutes: 150`;
 - the scheduler TOML and generated D1 sync payload are structurally valid;
 - changed JavaScript parses;
 - the focused INSERT-splitting checks pass;
 - manual database selection maps correctly into `UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES`;
+- trigger mode maps independently from database selection and the scheduler supplies `trigger_mode = "scheduler"`;
+- a focused test proves that a two-database request starts both database operations before either is allowed to resolve, waits for both results and returns them in canonical order;
 - `SUPABASE_DB_URL` is mapped into the worker runtime as `UK_AQ_INGESTDB_DB_URL`;
 - obsolete active GCP references are absent from the retired backup path.
 
@@ -269,14 +316,15 @@ Do not add a broad speculative test suite or run the full repository test suite 
 After the code reaches `main` and the scheduler configuration is synced:
 
 1. run the workflow manually for both databases;
-2. confirm the GitHub job completes within the 90-minute envelope;
-3. confirm daily task health records a successful `ops.supabase_db_dump_backup` run;
-4. confirm both database summaries report four dump files;
-5. confirm all eight dated Dropbox files exist and have non-zero compressed sizes;
-6. inspect the generated `data.sql.gz` files sufficiently to confirm split INSERT statements have valid chunk boundaries;
-7. confirm the Cloudflare D1 scheduler row is enabled with cron `55 0 * * *` and `dry_run = false`;
-8. allow the next scheduled operation to run and confirm it dispatches exactly one GitHub workflow;
-9. confirm no active GCP backup scheduler, Cloud Run Job or Cloud Run Service remains.
+2. confirm logs show both database branches start before either database branch finishes;
+3. confirm the GitHub job completes within the 150-minute envelope;
+4. confirm daily task health records one successful `ops.supabase_db_dump_backup` run;
+5. confirm both database summaries report four dump files in canonical result order;
+6. confirm all eight dated Dropbox files exist and have non-zero compressed sizes;
+7. inspect the generated `data.sql.gz` files sufficiently to confirm split INSERT statements have valid chunk boundaries;
+8. confirm the Cloudflare D1 scheduler row is enabled with cron `55 0 * * *`, `trigger_mode = "scheduler"` in `github_inputs_json` and `dry_run = false`;
+9. allow the next scheduled operation to run and confirm it dispatches exactly one GitHub workflow;
+10. confirm no active GCP backup scheduler, Cloud Run Job or Cloud Run Service remains.
 
 A full restore exercise is not required for this TEST migration unless the focused SQL checks or real backup output reveal a specific restore-risk concern.
 
