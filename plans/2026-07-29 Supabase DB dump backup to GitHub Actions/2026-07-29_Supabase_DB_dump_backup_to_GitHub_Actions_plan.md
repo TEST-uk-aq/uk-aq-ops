@@ -159,16 +159,26 @@ Use the previous Dockerfile only as a reference for compatible installation step
 
 ### 2.3 Environment
 
-Map these GitHub secrets directly into the runner:
+Read these GitHub repository secrets:
 
 ```text
-UK_AQ_INGESTDB_DB_URL
+SUPABASE_DB_URL
 OBS_AQIDB_SUPABASE_DB_URL
 OBS_AQIDB_SECRET_KEY
 DROPBOX_APP_KEY
 DROPBOX_APP_SECRET
 DROPBOX_REFRESH_TOKEN
 ```
+
+Map the existing ingest database secret into the worker's current runtime environment name:
+
+```yaml
+UK_AQ_INGESTDB_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+```
+
+Do not require or create a GitHub repository secret named `UK_AQ_INGESTDB_DB_URL`. That name remains internal to the worker runtime only.
+
+Map the remaining secrets to their same-named worker environment variables.
 
 Map these repository variables with the active contract defaults:
 
@@ -256,7 +266,7 @@ Update active references, including as applicable:
   - retain backup contents, configuration, manual workflow use and TEST validation;
 - `config/uk_aq_github_env_targets.csv`:
   - remove backup-specific GCP-only entries that no longer have another active consumer;
-  - retain or add the GitHub secrets and variables needed by the new workflow;
+  - retain or add `SUPABASE_DB_URL` and the other GitHub secrets and variables needed by the new workflow;
 - root README or active non-system operational docs only where they contain an active GCP description for this backup.
 
 Do not edit `system_docs/` or `system_docs_legacy/`.
@@ -279,6 +289,14 @@ python3 cloudflare/scheduler/scripts/sync_jobs.py \
 ```
 
 Also parse or inspect the new workflow with the smallest existing repository mechanism available. Do not install a new validation framework solely for this workflow.
+
+Confirm that the workflow maps:
+
+```yaml
+UK_AQ_INGESTDB_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+```
+
+and does not reference `secrets.UK_AQ_INGESTDB_DB_URL`.
 
 Use `grep` to confirm there are no active references to:
 
@@ -361,10 +379,11 @@ Implement all phases in order:
 1. follow the dated pre-change archive requirement for affected active non-test code;
 2. replace the current unbounded large-INSERT arrays with a bounded-memory spool/stream implementation that honours write backpressure and preserves valid restore SQL;
 3. create the workflow_dispatch-only GitHub Actions backup workflow using ubuntu-latest, Node 20, PostgreSQL client 17, Supabase CLI 2.79.0, a 90-minute timeout and queued concurrency;
-4. add the 00:55 UTC GitHub workflow job to cloudflare/scheduler/jobs.toml with no scheduled database override;
-5. delete the retired GCP workflow, Dockerfile, HTTP server and backup-specific GCP deploy/scheduler scripts;
-6. update package.json, the worker README, the GitHub environment catalogue and any other active references required by the plan;
-7. run only the focused structural checks listed in the plan.
+4. use the existing GitHub secret SUPABASE_DB_URL and map it into the worker as UK_AQ_INGESTDB_DB_URL; do not require a GitHub secret named UK_AQ_INGESTDB_DB_URL;
+5. add the 00:55 UTC GitHub workflow job to cloudflare/scheduler/jobs.toml with no scheduled database override;
+6. delete the retired GCP workflow, Dockerfile, HTTP server and backup-specific GCP deploy/scheduler scripts;
+7. update package.json, the worker README, the GitHub environment catalogue and any other active references required by the plan;
+8. run only the focused structural checks listed in the plan.
 
 Use grep, not rg. Use Level 1 only. Do not commit, push, deploy, sync remote D1, dispatch workflows, access cloud services or change repository settings.
 
