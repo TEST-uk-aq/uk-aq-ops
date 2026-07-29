@@ -601,7 +601,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             "cross_check": cross_check,
         }
 
-    def test_v2_dry_run_plans_direct_source_to_v2_repair_and_index(self) -> None:
+    def test_v2_dry_run_plans_connector_repair_with_explicit_pollutants(self) -> None:
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
             run_id=1,
@@ -613,6 +613,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             run_backfill=True,
             limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
             log=self.log,
+            repair_pollutants=["pm25"],
         )
         repair = metrics["planned_v2_observation_repairs"][0]
         self.assertIn("UK_AQ_R2_HISTORY_VERSION=v2", repair)
@@ -620,12 +621,17 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertNotIn("UK_AQ_R2_HISTORY_WRITE_VERSION", repair)
         self.assertNotIn("UK_AQ_R2_HISTORY_BACKUP_VERSION", repair)
         self.assertIn("UK_AQ_BACKFILL_CONNECTOR_IDS=6", repair)
-        self.assertIn("UK_AQ_BACKFILL_TIMESERIES_IDS=101,102", repair)
+        self.assertIn(
+            "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS=pm25",
+            repair,
+        )
+        self.assertNotIn("UK_AQ_BACKFILL_TIMESERIES_IDS", repair)
         self.assertNotIn("v1_dropbox_to_v2_observations_backfill_plan", repair)
         self.assertIn("--history-version v2 --targeted --kind observations", metrics["planned_v2_observation_index_rebuilds"][0])
-        self.assertIn("planned_after_obs_repair", metrics["planned_aqi_rebuilds"][0])
-        self.assertNotIn("reason=obs_repaired", metrics["planned_aqi_rebuilds"][0])
-        self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
+        self.assertFalse(any(
+            item.get("reason") == "not_explicit_observation_data_repair"
+            for item in metrics["skipped_v2_observation_metadata_gaps"]
+        ))
 
     def test_v2_mismatch_uses_complete_sorted_valid_repair_ids(self) -> None:
         full_ids = list(range(1, 44))
@@ -2488,7 +2494,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(executable_indexes, {0})
         self.assertEqual(skipped, [])
 
-    def test_missing_connector_day_uses_pollutant_scoped_source_evidence(self) -> None:
+    def test_sos_missing_connector_enters_explicit_pollutant_scoped_repair(self) -> None:
         day_utc = "2026-07-27"
         connector_id = 1
 
@@ -2515,6 +2521,12 @@ class V2RepairExecutionTests(unittest.TestCase):
             })
 
         config = MODULE.resolve_history_path_config("v2", {})
+        day_dir = (
+            self.root
+            / config.observations_data_prefix.strip("/")
+            / f"day_utc={day_utc}"
+        )
+        day_dir.mkdir(parents=True)
         with mock.patch.object(
             MODULE,
             "_current_source_counts_for_v2_partition",
@@ -2537,29 +2549,44 @@ class V2RepairExecutionTests(unittest.TestCase):
 
         gap = next(
             item for item in observations["gaps"]
-            if item["gap_type"] == "day_dir_missing"
+            if item["gap_type"] == "connector_dir_missing"
         )
         self.assertIsNone(gap.get("pollutant_code"))
+        self.assertEqual(
+            gap["suggested_repair"]["kind"],
+            "uk_air_csv_to_v2_observations_backfill_required",
+        )
         self.assertEqual(
             sorted(gap["source_evidence_by_pollutant"]),
             ["no2", "o3", "pm10", "pm25"],
         )
         self.assertEqual(source_counts_mock.call_count, 4)
+        action = next(
+            item for item in observations["repair_plan"]
+            if item["kind"] == "observation_data_repair"
+        )
+        self.assertEqual(action["day_utc"], day_utc)
+        self.assertEqual(action["connector_id"], connector_id)
+        self.assertIsNone(action["pollutant_code"])
 
         scopes, executable_indexes, skipped = (
             MODULE._derive_executable_observation_repair_pollutants(
                 v2_observations=observations,
-                requested_pollutants=["no2", "pm25"],
+                requested_pollutants=["pm25", "pm10", "no2", "o3"],
             )
         )
         self.assertEqual(
             scopes,
-            {(day_utc, connector_id): ["no2", "pm25"]},
+            {(day_utc, connector_id): ["no2", "o3", "pm10", "pm25"]},
         )
         self.assertEqual(executable_indexes, {
             observations["gaps"].index(gap),
         })
         self.assertEqual(skipped, [])
+        self.assertFalse(any(
+            item["reason"] == "not_explicit_observation_data_repair"
+            for item in skipped
+        ))
         planned = MODULE._planned_backfill_command(
             self.env,
             [],
@@ -2572,12 +2599,71 @@ class V2RepairExecutionTests(unittest.TestCase):
             repair_pollutants=scopes[(day_utc, connector_id)],
         )
         self.assertIn(
-            "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS=no2,pm25",
+            "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS=no2,o3,pm10,pm25",
             planned,
         )
         self.assertNotIn("source_evidence_missing", planned)
 
-    def test_v2_missing_day_gap_repairs_instead_of_skipping(self) -> None:
+        no_scope, no_indexes, no_scope_skips = (
+            MODULE._derive_executable_observation_repair_pollutants(
+                v2_observations=observations,
+                requested_pollutants=[],
+            )
+        )
+        self.assertEqual(no_scope, {})
+        self.assertEqual(no_indexes, set())
+        self.assertEqual(
+            no_scope_skips[0]["reason"],
+            "explicit_repair_pollutants_required_for_wildcard_repair",
+        )
+
+        exact_pollutant_plan = MODULE.build_v2_repair_plan(
+            observation_gaps=[{
+                "gap_type": "pollutant_dir_missing",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": "pm25",
+                "suggested_repair": {
+                    "kind": "uk_air_csv_to_v2_observations_backfill_required",
+                },
+            }],
+        )
+        exact_action = next(
+            item for item in exact_pollutant_plan
+            if item["kind"] == "observation_data_repair"
+        )
+        self.assertEqual(exact_action["pollutant_code"], "pm25")
+        ambiguous_pollutant_plan = MODULE.build_v2_repair_plan(
+            observation_gaps=[{
+                "gap_type": "pollutant_dir_missing",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "suggested_repair": {
+                    "kind": "uk_air_csv_to_v2_observations_backfill_required",
+                },
+            }],
+        )
+        self.assertFalse(any(
+            item["kind"] == "observation_data_repair"
+            for item in ambiguous_pollutant_plan
+        ))
+
+        current_state = MODULE.run_current_state_reconciliation(
+            conn=self.conn,
+            env_name="CIC-Test",
+            integrity_run_id="CIC-Test:focused-missing-connector",
+            env={
+                "UK_AQ_INTEGRITY_CURRENT_STATE_RECONCILIATION_ENABLED": "true",
+            },
+            scope_entries=[],
+            dry_run=False,
+            final_verification={"status": "fail"},
+            log=self.log,
+        )
+        self.assertFalse(current_state["attempted"])
+        self.assertEqual(current_state["overall_status"], "blocked_dependency")
+
+    def test_v2_missing_day_gap_is_planned_with_explicit_pollutant_scope(self) -> None:
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
             run_id=3,
@@ -2594,11 +2680,15 @@ class V2RepairExecutionTests(unittest.TestCase):
             run_backfill=True,
             limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
             log=self.log,
+            repair_pollutants=["pm25"],
         )
 
         self.assertEqual(len(metrics["planned_v2_observation_repairs"]), 1)
         self.assertIn("UK_AQ_BACKFILL_CONNECTOR_IDS=6", metrics["planned_v2_observation_repairs"][0])
-        self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
+        self.assertIn(
+            "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS=pm25",
+            metrics["planned_v2_observation_repairs"][0],
+        )
 
     def test_v2_post_repair_recheck_reports_fixed_observations_and_failed_aqi(self) -> None:
         config = MODULE.resolve_history_path_config("v2", {})
