@@ -30,4 +30,3 @@ def validate_current_state_resume_arguments(
         parser.error("current-state resume does not accept --repair-pollutants")
     if args.profile != "manual" or args.from_day or args.to_day:
         parser.error("current-state resume does not accept profile or date selection")
-

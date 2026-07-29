@@ -164,4 +164,3 @@ def preflight_latest_snapshot_auth(settings: Mapping[str, str]) -> dict[str, obj
         "audience": config.audience,
         "token_retained": False,
     }
-
