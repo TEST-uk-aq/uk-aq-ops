@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -22,6 +23,7 @@ SPEC = importlib.util.spec_from_file_location("uk_aq_history_integrity", MODULE_
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Unable to load module at {MODULE_PATH}")
 MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
