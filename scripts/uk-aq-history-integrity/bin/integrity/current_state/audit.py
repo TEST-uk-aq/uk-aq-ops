@@ -20,7 +20,6 @@ TARGET_STATUSES = frozenset({
     "superseded",
 })
 RETRYABLE_STATUSES = frozenset({"failed_retryable", "pending"})
-SUCCESS_STATUSES = frozenset({"succeeded", "skipped_not_applicable"})
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS current_state_candidate_sets (
@@ -317,7 +316,7 @@ def latest_target_attempt(
 
 def start_target_attempt(
     conn: sqlite3.Connection, *, integrity_run_id: int, env_name: str,
-    target: str, invocation_kind: str, candidate_identity_sha256: str,
+    target: str, candidate_identity_sha256: str,
     candidate_count: int, candidate_observed_at_min: str | None,
     candidate_observed_at_max: str | None,
     final_verification_identity_sha256: str,
@@ -325,8 +324,6 @@ def start_target_attempt(
     """Append and durably mark a target attempt before its side effect."""
     if target not in TARGETS:
         raise ValueError(f"unsupported current-state target: {target}")
-    if invocation_kind not in {"initial", "resume"}:
-        raise ValueError("invalid current-state invocation kind")
     previous = latest_target_attempt(
         conn, integrity_run_id=integrity_run_id, target=target
     )
@@ -350,7 +347,7 @@ def start_target_attempt(
                   NULL, ?, ?)""",
         (
             int(integrity_run_id), previous["id"] if previous else None,
-            env_name, target, attempt_number, invocation_kind,
+            env_name, target, attempt_number, "initial",
             candidate_identity_sha256, int(candidate_count),
             candidate_observed_at_min, candidate_observed_at_max,
             final_verification_identity_sha256, now, initial_finished_at,
@@ -408,29 +405,9 @@ def finish_target_attempt(
     }
 
 
-def recover_interrupted_target_attempt(
-    conn: sqlite3.Connection, *, integrity_run_id: int, target: str,
-) -> dict[str, Any] | None:
-    latest = latest_target_attempt(
-        conn, integrity_run_id=integrity_run_id, target=target
-    )
-    if latest is None or latest["status"] != "running":
-        return latest
-    finish_target_attempt(
-        conn,
-        attempt_id=int(latest["id"]),
-        status="failed_retryable",
-        outcome_counts=latest["outcome_counts"],
-        error="previous target attempt ended without a completion record",
-    )
-    return latest_target_attempt(
-        conn, integrity_run_id=integrity_run_id, target=target
-    )
-
-
 def record_target_attempt(
     conn: sqlite3.Connection, *, integrity_run_id: int, env_name: str,
-    target: str, invocation_kind: str, status: str,
+    target: str, status: str,
     candidate_identity_sha256: str, candidate_count: int,
     outcome_counts: Mapping[str, Any], error: str | None = None,
     failure_class: str | None = None,
@@ -454,7 +431,6 @@ def record_target_attempt(
         integrity_run_id=integrity_run_id,
         env_name=env_name,
         target=target,
-        invocation_kind=invocation_kind,
         candidate_identity_sha256=candidate_identity_sha256,
         candidate_count=candidate_count,
         candidate_observed_at_min=candidate_observed_at_min,
