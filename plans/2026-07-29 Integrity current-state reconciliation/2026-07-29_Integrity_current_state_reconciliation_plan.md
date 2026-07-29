@@ -15,6 +15,7 @@
 Use GPT-5.6 Codex with High reasoning.
 
 Implement the complete Integrity current-state reconciliation plan in CIC-Test.
+/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/plans/2026-07-29 Integrity current-state reconciliation/2026-07-29_Integrity_current_state_reconciliation_plan.md
 
 Work in these TEST repositories only:
 
