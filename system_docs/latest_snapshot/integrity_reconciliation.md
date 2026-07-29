@@ -11,17 +11,18 @@ It supplements:
 - [`interfaces.md`](interfaces.md);
 - [`operations.md`](operations.md);
 - [`validation.md`](validation.md);
-- [`../r2_history/current_state_reconciliation.md`](../r2_history/current_state_reconciliation.md).
+- [`../r2_history/current_state_reconciliation.md`](../r2_history/current_state_reconciliation.md);
+- [`../r2_history/integrity_modularisation.md`](../r2_history/integrity_modularisation.md).
 
 The existing Latest Snapshot contract remains authoritative for public-current-value eligibility, state identity, metadata eligibility, physical products, finite-window derivation and public v2 compatibility.
 
 ## Purpose
 
-Normal Latest Snapshot state is advanced from a dedicated Pub/Sub observation subscription.
+Normal Latest Snapshot state advances from a dedicated Pub/Sub observation subscription.
 
-R2 History Integrity may establish final verified canonical observations that did not pass through that subscription, for example when the UK-AIR SOS gateway is unavailable but authoritative annual flat files are available.
+R2 History Integrity may establish final verified canonical observations that did not pass through that subscription, for example when the UK-AIR SOS gateway is unavailable but authoritative annual flat files remain available.
 
-This interface allows the existing Latest Snapshot owner service to reconcile those observations without creating a second R2 state writer.
+This interface allows the existing Latest Snapshot owner service to reconcile those observations without creating a second state writer.
 
 ## Ownership invariant
 
@@ -37,53 +38,76 @@ latest_snapshots/v2/manifest.json
 
 Integrity must not write those objects directly.
 
-The reconciliation operation must run inside the existing Latest Snapshot Cloud Run service and use the same durable-state and product-building implementation as scheduled processing.
+The reconciliation operation runs inside the existing Latest Snapshot Cloud Run service and uses the same durable-state and product-building implementation as scheduled processing.
 
 ## Private reconciliation interface
 
-The service must expose one authenticated internal POST operation for Integrity reconciliation.
-
-The current implementation route is:
+The service exposes:
 
 ```text
 POST /internal/integrity-reconcile
 ```
 
-It must:
+The route must:
 
 - be accepted only by the Latest Snapshot service;
-- not be exposed through the public R2 API Worker;
-- not be exposed through the website cache API;
+- not be exposed through public Workers or website APIs;
 - require Cloud Run IAM authentication or a narrower approved equivalent;
 - reject unauthenticated or malformed requests;
 - identify the trigger mode as Integrity reconciliation in structured logs and build metadata where compatible.
 
 ## Caller authentication contract
 
-The request must carry a Google-signed identity token accepted by the private Cloud Run service.
+The request carries a Google-signed identity token accepted by the private Cloud Run service.
 
-The token audience must be exactly the configured Cloud Run service origin URL. It must not include the reconciliation route path.
+The token audience is exactly the configured Cloud Run service origin URL. It must not include `/internal/integrity-reconcile`.
 
 For local or operator-run Integrity using service-account impersonation:
 
-- the authenticated base principal must hold `roles/iam.serviceAccountTokenCreator` on the configured caller service account;
-- the caller service account must hold `roles/run.invoker` on the Latest Snapshot Cloud Run service;
-- token generation must explicitly select the configured impersonated service account when requesting an audience-specific identity token;
-- the configured service audience must always be supplied;
-- failure to obtain that audience-specific impersonated token must block Latest Snapshot reconciliation.
+- the base principal holds `roles/iam.serviceAccountTokenCreator` on the caller service account;
+- the caller service account holds `roles/run.invoker` on the Latest Snapshot service;
+- token generation explicitly selects the configured impersonated service account;
+- the configured service audience is always supplied;
+- failure to obtain that token blocks the target.
 
-For the `gcloud auth print-identity-token` implementation, service-account impersonation must be supplied through the explicit `--impersonate-service-account` command flag when `--audiences` is used. A configured base account may also be supplied explicitly where the workstation has several authenticated accounts.
+For `gcloud auth print-identity-token`, the command is equivalent to:
 
-The Integrity client must not fall back to:
+```text
+gcloud auth print-identity-token
+  --account=<configured base account>
+  --impersonate-service-account=<configured caller service account>
+  --audiences=<configured service origin>
+```
 
-- a token for the active user account;
-- a token without the configured Cloud Run audience;
+The client must not fall back to:
+
+- a different active user identity;
+- a token without the configured audience;
+- a token whose audience is the route URL;
 - an empty token after a failed command;
 - unauthenticated invocation.
 
-Such a fallback is not equivalent authentication and must be reported as reconciliation failure.
+Native service-account runtimes may use their established credential path when the resulting token has the same audience and authorised caller identity.
 
-Native service-account runtimes may use their established credential path, provided the resulting token has the same service audience and IAM-authorised caller identity.
+## Integrity-side authentication preflight
+
+Before a real Integrity operation performs canonical R2 mutation for a scope that can affect PM2.5, PM10 or NO2 Latest Snapshot state, the Integrity client performs an authentication capability preflight.
+
+The preflight:
+
+1. validates URL and audience configuration;
+2. invokes the same audience-specific identity-token helper used for the final call;
+3. uses the configured account and impersonated service account explicitly where configured;
+4. discards the token without logging it;
+5. blocks canonical mutation when token acquisition fails.
+
+The preflight does not call the mutating reconciliation route and does not retain a token for later use.
+
+The final request obtains a fresh identity token after final R2 verification. This protects against token expiry and credential changes between preflight and invocation.
+
+A successful preflight does not convert a later IAM, network or service failure into success. The target remains independently retryable.
+
+O3-only repairs do not require this preflight because O3 is outside Latest Snapshot scope.
 
 ## Request contract
 
@@ -111,19 +135,18 @@ pollutant_code
 
 Required structural rules:
 
-- `connector_id` is a positive integer;
-- `timeseries_id` is a positive integer;
+- `connector_id` and `timeseries_id` are positive integers;
 - `observed_at` is a valid UTC timestamp;
 - `value` is finite or null before policy evaluation;
 - `value_float8_hex` is a string or null;
 - `status` is a string or null;
 - `pollutant_code` is a string;
 - request size and candidate count are bounded;
-- duplicate candidate identities within one request are resolved deterministically or rejected clearly.
+- duplicate candidate identities are resolved deterministically or rejected clearly.
 
 ## Supported pollutant scope
 
-Only the current Latest Snapshot matrix is accepted:
+Only:
 
 ```text
 pm25
@@ -131,36 +154,32 @@ pm10
 no2
 ```
 
-O3 and all other observed properties are outside this interface.
+are supported.
 
-Unsupported candidates are counted and skipped or rejected according to the existing policy boundary. They must not create state.
+O3 and all other observed properties are outside this interface and must not create state.
 
 ## Metadata and eligibility
 
-The owner service must resolve candidates through the existing core metadata cache and normal metadata eligibility rules.
+The owner service resolves candidates through the existing core metadata cache and normal eligibility rules.
 
-The service must not trust caller-supplied pollutant identity as a replacement for metadata resolution. `pollutant_code` is request evidence that must agree with the resolved timeseries identity.
+Caller-supplied `pollutant_code` is request evidence, not a replacement for metadata identity.
 
-The service must apply the existing authoritative latest-current-value policy, including:
+The service applies existing public-current-value policy, including:
 
 - numeric finite value requirement;
 - non-negative value requirement;
 - PM2.5 maximum `500`;
 - PM10 maximum `600`;
 - current NO2 behaviour;
-- existing supported pollutant aliases and normalisation.
+- existing aliases and normalisation.
 
 A newer invalid candidate must not remove, replace or refresh a previously retained valid row.
 
 ## Durable-state read behaviour
 
-Reconciliation must load the durable R2 state through the established validated local-cache and R2 path.
+Reconciliation loads durable R2 state through the established validated local-cache and R2 path.
 
-An unexpected durable-state read, parse or validation failure must fail the reconciliation operation.
-
-Reconciliation must not treat an unreadable existing state object as an authoritative empty state.
-
-The existing normal scheduled behaviour may be tightened separately if required, but this operation must fail closed before applying candidates when durable state cannot be loaded reliably.
+Unexpected read, parse or validation failure blocks the operation. An unreadable existing state object must not be treated as authoritative empty state.
 
 ## State identity and ordering
 
@@ -170,14 +189,12 @@ State identity remains:
 connector_id + timeseries_id
 ```
 
-For different observation timestamps:
+For different timestamps:
 
-- a newer eligible candidate replaces older state;
-- an older candidate does not replace newer state.
+- newer eligible candidate replaces older state;
+- older candidate does not replace newer state.
 
-For equal observation timestamps, canonical content must be compared before the wall-clock `ingested_at` tie-break.
-
-Canonical same-timestamp content contains:
+For equal timestamps, compare:
 
 ```text
 value
@@ -185,75 +202,61 @@ value_float8_hex
 status
 ```
 
-Required behaviour is:
+Required behaviour:
 
 ```text
 same canonical content
   -> no-op
 
 different final verified canonical content
-  -> correction may replace retained content
+  -> one correction may replace stale content
 ```
 
-When a correction is applied, the state entry may record the current reconciliation time in `ingested_at` under the existing schema.
+Retrying the same correction is a no-op. A later execution time alone must not rewrite state.
 
-Retrying the same already applied correction must be a no-op and must not rewrite durable state solely because the retry occurs later.
-
-Normal Pub/Sub same-timestamp ordering must remain unchanged unless a separate contract change explicitly unifies it with this correction rule.
+Normal Pub/Sub same-timestamp ordering remains unchanged unless a separate contract change explicitly unifies it.
 
 ## State persistence
 
-When at least one candidate changes state:
+When candidates change state:
 
-1. serialise the complete state through the shared stable state serializer;
-2. apply the existing maximum-entry protection;
+1. serialise the complete state through the shared stable serializer;
+2. apply maximum-entry protection;
 3. hash-gate unchanged state;
-4. PUT the durable R2 state object;
-5. update the local cache only after the R2 PUT succeeds.
+4. PUT durable R2 state;
+5. update local cache only after the R2 PUT succeeds.
 
 A local-cache write is never durable success.
 
-When no candidate changes state, the operation must not rewrite durable state merely to update `updated_at`.
+When no candidate changes state, do not rewrite state merely to update timestamps.
 
 ## Product and manifest rebuild
 
-After candidate application, the service must run the normal state-to-product build path.
+After candidate application, the service runs the normal state-to-product path.
 
 It must:
 
 - build only the three physical `window=all` products;
-- use existing metadata eligibility and network visibility rules;
-- preserve deterministic row ordering;
-- preserve existing cursor meaning;
-- preserve stable JSON and SHA-256 hash gating;
-- skip unchanged object writes;
-- preserve previous manifest entries on existing partial-failure rules;
-- write the physical manifest through the normal path;
-- leave finite public responses owned by the R2 API Worker.
+- use existing metadata and network visibility rules;
+- preserve deterministic row ordering and cursor meaning;
+- preserve stable JSON and SHA-256 gating;
+- skip unchanged writes;
+- preserve existing partial-failure behaviour;
+- write the physical manifest through the normal path.
 
-Integrity reconciliation must not create separate physical finite-window objects or a separate manifest family.
+Integrity reconciliation must not create a separate snapshot family.
 
 ## Single-writer and overlap safety
 
-Scheduled Pub/Sub processing and Integrity reconciliation must use the same service-level overlap protection and single-writer runtime assumptions.
+Scheduled processing and Integrity reconciliation use the same service-level overlap protection and single-writer assumptions.
 
-The implementation must preserve the current maximum-instance and concurrency safety boundary unless an approved architecture change replaces it with a stronger durable lock.
+The implementation preserves maximum-instance and concurrency safety unless an approved architecture change introduces a stronger durable lock.
 
-A reconciliation request must not run a separate child process or code path that can write state concurrently with a scheduled build.
-
-The service may serialise, queue or reject an overlapping reconciliation request, but it must report the result clearly and must not permit concurrent state mutation.
-
-## Acknowledgement separation
-
-Integrity reconciliation has no Pub/Sub acknowledgement responsibility.
-
-It must not acknowledge, consume or publish messages on the Latest Snapshot or raw observation subscriptions.
-
-Normal scheduled message acknowledgement rules remain unchanged.
+A reconciliation request must not create a separate writer that can overlap scheduled state mutation.
 
 ## Response contract
 
-The successful response must include at least:
+A successful response includes at least:
 
 ```text
 ok
@@ -278,60 +281,55 @@ manifest_key
 warnings
 ```
 
-A partial product or manifest failure must return a non-successful operation result even when durable state was already advanced.
+A partial product or manifest failure returns a non-successful operation result even when durable state already advanced.
 
-The response and structured logs must make that partial durable outcome clear so Integrity can report and retry safely.
+The response and structured logs make partial durable outcomes explicit so Integrity can retry safely.
 
-## Run reports and logs
+## Retry and resume behaviour
 
-Every reconciliation operation must emit a structured completion summary.
+The operation is idempotent.
 
-The existing R2 run-report policy remains in force. A reconciliation operation may be treated like a manual run for report selection, provided the existing schema can represent it without misleading fields.
-
-Reconciliation success must not depend on writing a `_runs` object.
-
-The summary must include the Integrity run ID and bounded candidate outcome counts.
-
-## Retry behaviour
-
-The operation must be idempotent.
-
-A retry after:
-
-- a complete success;
-- a client timeout after durable success;
-- a state success followed by product failure;
-- a later normal scheduled build
-
-must safely reload current durable state, compare candidates and avoid moving backwards.
+A retry after complete success, client timeout, state success followed by product failure, or a later normal scheduled build reloads current durable state and cannot move backwards.
 
 When state is already correct but products or the manifest are stale, a retry may rebuild products without rewriting state.
+
+Integrity owns the operator resume interface and target audit. The owner service does not require the observation repair, source scan or R2 apply stages to repeat before accepting the same final verified candidates.
+
+Every resumed invocation:
+
+- uses a fresh audience-specific token;
+- reuses the same stable `integrity_run_id` or records a linked retry attempt;
+- remains bounded and authenticated;
+- relies on monotonic and idempotent owner-service rules;
+- returns sufficient counts for Integrity to mark only this target successful.
 
 ## Failure behaviour
 
 The operation fails clearly when:
 
 - authentication fails;
-- the request is malformed or exceeds bounds;
-- durable state cannot be read reliably;
+- request shape or bounds are invalid;
+- durable state cannot be read;
 - required metadata cannot be loaded;
-- candidate identity contradicts resolved metadata;
+- candidate identity contradicts metadata;
 - durable state persistence fails;
-- physical product generation fails;
+- product generation fails;
 - manifest persistence fails;
 - overlap safety cannot be preserved.
 
-A failure must not be hidden by a stale local cache or old physical object.
+A failure must not be hidden by stale local cache or old physical objects.
+
+Authentication failure must be distinguishable from owner-service candidate, state, product and manifest failures.
 
 ## Public compatibility
 
 This work must not change:
 
 - the public pollutant matrix;
-- accepted public windows;
+- public windows;
 - physical `all` object keys;
 - the public manifest key;
-- public row fields or meanings;
+- public row fields;
 - finite-window cutoff semantics;
 - public ETag identity;
 - cache-proxy routes;
@@ -342,54 +340,45 @@ This work must not change:
 
 This interface must not:
 
-- make Integrity an R2 state writer;
-- add O3 or another pollutant;
+- make Integrity a direct Latest Snapshot R2 writer;
+- add O3;
 - insert observations into IngestDB;
 - change raw observation history;
 - change AQI or WHO calculations;
 - change connector checkpoints;
 - create missing metadata identities;
 - expose a public mutation endpoint;
-- depend on container-local cache as durable authority;
-- require a new physical snapshot family.
+- depend on local cache as durable authority.
 
 ## Validation model
 
-Before implementation, only one targeted deterministic state-transition check is required.
+Before implementation, only targeted deterministic checks genuinely required for authentication command construction, preflight ordering, monotonic state transition, same-timestamp correction and idempotent retry are permitted.
 
-It must prove:
+Do not add a broad speculative pre-deployment test suite.
 
-- newer eligible candidate replaces older state;
-- older candidate cannot replace newer state;
-- identical same-timestamp content is a no-op;
-- different final verified same-timestamp content replaces stale content once;
-- retrying that correction is a no-op.
+After deployment, functional validation occurs through real CIC-Test operations:
 
-After deployment, functional validation occurs through real CIC-Test operation:
-
-1. one authenticated reconciliation with a recent SOS candidate;
-2. one public finite response showing the advanced row;
-3. one identical retry with no state or product rewrite;
+1. authenticated preflight before a real supported-pollutant repair;
+2. one reconciliation that advances state and products;
+3. one identical retry with no rewrite;
 4. one older candidate with no rollback;
-5. one normal scheduled Latest Snapshot run after reconciliation.
-
-Do not add a broad speculative pre-implementation test suite.
+5. one failed-target-only resume;
+6. one normal scheduled Latest Snapshot run after reconciliation.
 
 ## Implementation status
 
 Implemented and deployed in CIC-Test on 29 July 2026:
 
 - private `POST /internal/integrity-reconcile` route;
-- Cloud Run IAM authentication with the TEST operations service account as an authorised invoker;
+- Cloud Run IAM authentication using the TEST operations service account;
 - bounded request validation;
 - owner-service state, product and manifest reconciliation;
-- deterministic same-timestamp correction and retry behaviour.
+- deterministic same-timestamp correction and retry behaviour;
+- explicit audience-specific impersonated token acquisition in the Integrity helper.
 
-An authenticated empty-candidate request using an audience-specific identity token from the impersonated TEST operations service account returned HTTP `200`, reported `product_success_count=3`, `product_failure_count=0`, `changed_product_count=0`, and preserved all three unchanged products.
+An authenticated empty-candidate call returned HTTP `200`, with three successful unchanged products.
 
-The Integrity client token-acquisition helper still requires correction so local operator runs explicitly pass the impersonated service account with the configured service audience and fail closed instead of falling back to an audience-less token.
-
-Repair-bearing, idempotent-repeat and older-range operational validation remain pending.
+A real 24 July SOS repair later reached this target after successful R2 final verification and successful timeseries reconciliation, but the local base-account `gcloud` credentials had expired. The owner route was therefore not invoked. Authentication capability preflight and failed-target-only resume remain pending implementation.
 
 ## Related decision
 
