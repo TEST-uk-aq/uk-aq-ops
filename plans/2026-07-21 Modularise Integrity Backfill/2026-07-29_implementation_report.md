@@ -1,6 +1,6 @@
 # Integrity modularisation implementation report
 
-Date: 2026-07-29  
+Date: 2026-07-29
 Branch: `codex/2026-07-29-integrity-modularisation`
 
 ## Outcome
@@ -117,4 +117,3 @@ Record the exact resume CLI above, the two SQLite table names, the preflight sta
 ## Residual operational evidence
 
 The original 24 July numeric Integrity run ID and a complete source day for the real SOS validation are not stored in this checkout. The operator must supply them from the retained TEST report when running the post-deployment commands.
-

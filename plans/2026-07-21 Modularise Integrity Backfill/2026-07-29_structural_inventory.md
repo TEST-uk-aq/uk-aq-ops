@@ -1,6 +1,6 @@
 # Integrity modularisation structural inventory
 
-Date: 2026-07-29  
+Date: 2026-07-29
 Branch: `codex/2026-07-29-integrity-modularisation`
 
 ## Stable entrypoints and compatibility boundaries
@@ -30,4 +30,3 @@ Branch: `codex/2026-07-29-integrity-modularisation`
 - Existing CLI and environment names, R2 keys, Parquet and manifest schemas, event names, source acquisition ordering, AQI calculations, backup gate and public entrypoint paths.
 - No module import may acquire credentials, access SQLite, call a network service, mutate R2, take a lock or write a report.
 - Active code must never fall back to `archive/` paths.
-

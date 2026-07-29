@@ -11,4 +11,3 @@ CANONICAL_REPAIR_STAGE_ORDER = (
     "timeseries_reconciliation",
     "latest_snapshot_reconciliation",
 )
-
