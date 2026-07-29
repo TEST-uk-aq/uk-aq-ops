@@ -4,9 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { once } from "node:events";
 import readline from "node:readline";
-import { finished } from "node:stream/promises";
 import { Client as PgClient } from "pg";
 
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
@@ -587,6 +585,13 @@ export function normalizeInsertRowDelimiter(rowLine, delimiter) {
   return `${match[1]}${delimiter}${match[3]}`;
 }
 
+function canRewriteInsertRows(rowLines) {
+  if (!Array.isArray(rowLines) || rowLines.length === 0) {
+    return false;
+  }
+  return rowLines.every((rowLine) => /[;,]\s*$/.test(String(rowLine)));
+}
+
 function summarizeTablesSplit(tableMap) {
   const rows = Array.from(tableMap.values());
   rows.sort((left, right) => {
@@ -598,33 +603,6 @@ function summarizeTablesSplit(tableMap) {
   const tableEntries = rows.slice(0, MAX_TABLES_SPLIT_LOG_ENTRIES);
   const truncatedCount = Math.max(0, rows.length - tableEntries.length);
   return { tableEntries, truncatedCount };
-}
-
-async function writeWithBackpressure(stream, text) {
-  if (stream.errored) {
-    throw stream.errored;
-  }
-  if (stream.destroyed) {
-    throw new Error("Cannot write to a destroyed SQL rewrite stream.");
-  }
-  if (!stream.write(text)) {
-    await once(stream, "drain");
-  }
-}
-
-async function forEachSpooledLine(spoolPath, callback) {
-  const spoolReadStream = createReadStream(spoolPath, { encoding: "utf8" });
-  const spoolLineReader = readline.createInterface({
-    input: spoolReadStream,
-    crlfDelay: Infinity,
-  });
-  try {
-    for await (const line of spoolLineReader) {
-      await callback(line);
-    }
-  } finally {
-    spoolLineReader.close();
-  }
 }
 
 export async function splitLargeDataInsertsInFile({
@@ -670,106 +648,75 @@ export async function splitLargeDataInsertsInFile({
     return summary;
   }
 
-  const tempFilePath = `${filePath}.split-${randomUUID()}.tmp`;
+  const tempFilePath = `${filePath}.split.tmp`;
   const readStream = createReadStream(filePath, { encoding: "utf8" });
   const writeStream = createWriteStream(tempFilePath, { encoding: "utf8", mode: 0o600 });
-  // Keep stream errors observable until an awaited write or finished() reports them.
-  writeStream.on("error", () => {});
   const lineReader = readline.createInterface({
     input: readStream,
     crlfDelay: Infinity,
   });
   const tablesSplitMap = new Map();
 
-  const writeLine = async (line) => writeWithBackpressure(writeStream, `${line}\n`);
+  const writeLine = (line) => {
+    writeStream.write(`${line}\n`);
+  };
 
   let currentInsert = null;
 
-  const startCurrentInsert = async (headerLine) => {
-    const spoolPath = `${filePath}.insert-spool-${randomUUID()}.tmp`;
-    const spoolStream = createWriteStream(spoolPath, {
-      encoding: "utf8",
-      flags: "wx",
-      mode: 0o600,
-    });
-    spoolStream.on("error", () => {});
-    currentInsert = {
-      headerLine,
-      expectedFormat: isExpectedMultiLineInsertHeader(headerLine),
-      tableName: formatTableNameFromInsertHeader(headerLine) || "unknown",
-      rowCount: 0,
-      hasValidDelimiters: true,
-      spoolPath,
-      spoolStream,
-    };
-  };
-
-  const flushCurrentInsert = async () => {
+  const flushCurrentInsert = () => {
     if (!currentInsert) {
       return;
     }
-    const insert = currentInsert;
-    currentInsert = null;
+    const {
+      headerLine,
+      rowLines,
+      originalLines,
+      expectedFormat,
+      tableName,
+    } = currentInsert;
+    const inputRowCount = rowLines.length;
+    summary.input_rows_total += inputRowCount;
+    summary.max_input_rows_per_insert = Math.max(summary.max_input_rows_per_insert, inputRowCount);
 
-    try {
-      insert.spoolStream.end();
-      await finished(insert.spoolStream);
-      insert.spoolStream = null;
+    const shouldSplit =
+      expectedFormat
+      && inputRowCount > summary.threshold_rows
+      && canRewriteInsertRows(rowLines);
 
-      const inputRowCount = insert.rowCount;
-      summary.input_rows_total += inputRowCount;
-      summary.max_input_rows_per_insert = Math.max(
-        summary.max_input_rows_per_insert,
-        inputRowCount,
-      );
-
-      const shouldSplit =
-        insert.expectedFormat
-        && inputRowCount > summary.threshold_rows
-        && insert.hasValidDelimiters;
-
-      if (!shouldSplit) {
-        summary.output_insert_statements += 1;
-        await writeLine(insert.headerLine);
-        await forEachSpooledLine(insert.spoolPath, writeLine);
-        return;
+    if (!shouldSplit) {
+      summary.output_insert_statements += 1;
+      for (const originalLine of originalLines) {
+        writeLine(originalLine);
       }
-
-      const outputStatements = Math.ceil(inputRowCount / summary.chunk_rows);
-      summary.insert_statements_split += 1;
-      summary.output_insert_statements += outputStatements;
-      const existingTableStats = tablesSplitMap.get(insert.tableName) || {
-        table: insert.tableName,
-        input_rows: 0,
-        output_insert_statements: 0,
-      };
-      existingTableStats.input_rows += inputRowCount;
-      existingTableStats.output_insert_statements += outputStatements;
-      tablesSplitMap.set(insert.tableName, existingTableStats);
-
-      let rowIndex = 0;
-      await forEachSpooledLine(insert.spoolPath, async (rowLine) => {
-        if (rowIndex % summary.chunk_rows === 0) {
-          await writeLine(insert.headerLine);
-        }
-        const isFinalChunkRow =
-          (rowIndex + 1) % summary.chunk_rows === 0
-          || rowIndex + 1 === inputRowCount;
-        const delimiter = isFinalChunkRow ? ";" : ",";
-        const normalized = normalizeInsertRowDelimiter(rowLine, delimiter);
-        await writeLine(normalized ?? rowLine);
-        rowIndex += 1;
-        if (isFinalChunkRow) {
-          await writeLine("");
-        }
-      });
-    } finally {
-      if (insert.spoolStream) {
-        insert.spoolStream.destroy();
-        await finished(insert.spoolStream).catch(() => {});
-      }
-      await fs.rm(insert.spoolPath, { force: true });
+      currentInsert = null;
+      return;
     }
+
+    const outputStatements = Math.ceil(inputRowCount / summary.chunk_rows);
+    summary.insert_statements_split += 1;
+    summary.output_insert_statements += outputStatements;
+    const existingTableStats = tablesSplitMap.get(tableName) || {
+      table: tableName,
+      input_rows: 0,
+      output_insert_statements: 0,
+    };
+    existingTableStats.input_rows += inputRowCount;
+    existingTableStats.output_insert_statements += outputStatements;
+    tablesSplitMap.set(tableName, existingTableStats);
+
+    for (let start = 0; start < rowLines.length; start += summary.chunk_rows) {
+      const chunk = rowLines.slice(start, start + summary.chunk_rows);
+      writeLine(headerLine);
+      for (let index = 0; index < chunk.length; index += 1) {
+        const rowLine = chunk[index];
+        const delimiter = index === chunk.length - 1 ? ";" : ",";
+        const normalized = normalizeInsertRowDelimiter(rowLine, delimiter);
+        writeLine(normalized ?? rowLine);
+      }
+      writeLine("");
+    }
+
+    currentInsert = null;
   };
 
   try {
@@ -779,40 +726,43 @@ export async function splitLargeDataInsertsInFile({
           summary.insert_statements_seen += 1;
           if (/;\s*$/.test(line)) {
             summary.output_insert_statements += 1;
-            await writeLine(line);
+            writeLine(line);
             continue;
           }
-          await startCurrentInsert(line);
+          currentInsert = {
+            headerLine: line,
+            expectedFormat: isExpectedMultiLineInsertHeader(line),
+            tableName: formatTableNameFromInsertHeader(line) || "unknown",
+            rowLines: [],
+            originalLines: [line],
+          };
           continue;
         }
-        await writeLine(line);
+        writeLine(line);
         continue;
       }
 
-      currentInsert.rowCount += 1;
-      if (!/[;,]\s*$/.test(line)) {
-        currentInsert.hasValidDelimiters = false;
-      }
-      await writeWithBackpressure(currentInsert.spoolStream, `${line}\n`);
+      currentInsert.originalLines.push(line);
+      currentInsert.rowLines.push(line);
 
       if (/;\s*$/.test(line)) {
-        await flushCurrentInsert();
+        flushCurrentInsert();
       }
     }
 
-    await flushCurrentInsert();
-    writeStream.end();
-    await finished(writeStream);
+    flushCurrentInsert();
+    await new Promise((resolve, reject) => {
+      writeStream.end((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
     await fs.rename(tempFilePath, filePath);
   } catch (error) {
     writeStream.destroy();
-    if (currentInsert?.spoolStream) {
-      currentInsert.spoolStream.destroy();
-      await finished(currentInsert.spoolStream).catch(() => {});
-    }
-    if (currentInsert?.spoolPath) {
-      await fs.rm(currentInsert.spoolPath, { force: true }).catch(() => {});
-    }
     await fs.rm(tempFilePath, { force: true });
     throw error;
   } finally {

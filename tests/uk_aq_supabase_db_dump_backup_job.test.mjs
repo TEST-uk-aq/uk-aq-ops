@@ -13,7 +13,7 @@ import {
 } from "../workers/uk_aq_supabase_db_dump_backup_service/job.mjs";
 
 const workflowText = readFileSync(
-  ".github/workflows/uk_aq_supabase_db_dump_backup_service_deploy.yml",
+  ".github/workflows/uk_aq_supabase_db_dump_backup.yml",
   "utf8",
 );
 
@@ -53,7 +53,7 @@ function successfulReport() {
 }
 
 test("Job defaults to scheduler mode and both databases", () => {
-  assert.equal(JOB_NAME, "uk-aq-supabase-db-dump-backup-job");
+  assert.equal(JOB_NAME, "uk-aq-supabase-db-dump-backup");
   assert.deepEqual(resolveJobSelection({}), {
     triggerMode: "scheduler",
     requestedDatabases: ["ingestdb", "obs_aqidb"],
@@ -172,17 +172,23 @@ test("shared wrapper records an unhandled exception and rethrows it", async () =
   assert.equal(calls[0][2], failure);
 });
 
-test("deployment targets Jobs API and protects the old Scheduler", () => {
-  assert.match(workflowText, /gcloud run jobs deploy "\$\{JOB_NAME\}"/);
-  assert.match(workflowText, /--tasks "1"/);
-  assert.match(workflowText, /--parallelism "1"/);
-  assert.match(workflowText, /--max-retries "\$\{JOB_MAX_RETRIES\}"/);
-  assert.match(workflowText, /jobs\/\$\{JOB_NAME\}:run/);
-  assert.match(workflowText, /--oauth-service-account-email/);
-  assert.match(workflowText, /roles\/run\.invoker/);
-  assert.match(workflowText, /Old service Scheduler trigger must remain PAUSED/);
-  assert.doesNotMatch(
+test("GitHub workflow queues direct backup runs with the required toolchain", () => {
+  assert.match(workflowText, /workflow_dispatch:/);
+  assert.match(workflowText, /group: uk-aq-supabase-db-dump-backup/);
+  assert.match(workflowText, /cancel-in-progress: false/);
+  assert.match(workflowText, /runs-on: ubuntu-latest/);
+  assert.match(workflowText, /timeout-minutes: 90/);
+  assert.match(workflowText, /node-version: "20"/);
+  assert.match(workflowText, /postgresql-client-17/);
+  assert.match(workflowText, /supabase_2\.79\.0_linux_amd64\.deb/);
+  assert.match(
     workflowText,
-    /--uri "\$\{service_uri\}\/run-backup"/,
+    /UK_AQ_INGESTDB_DB_URL: \$\{\{ secrets\.SUPABASE_DB_URL \}\}/,
   );
+  assert.doesNotMatch(workflowText, /secrets\.UK_AQ_INGESTDB_DB_URL/);
+  assert.match(
+    workflowText,
+    /UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES: \$\{\{ github\.event\.inputs\.databases \|\| '' \}\}/,
+  );
+  assert.doesNotMatch(workflowText, /gcloud|google-github-actions|schedule:/);
 });

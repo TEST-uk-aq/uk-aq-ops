@@ -8,7 +8,7 @@ import {
 } from "./core.mjs";
 import { runBackupWithDailyTaskHealth } from "./health.mjs";
 
-export const JOB_NAME = "uk-aq-supabase-db-dump-backup";
+export const JOB_NAME = "uk-aq-supabase-db-dump-backup-job";
 const DATABASE_ENV = "UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES";
 
 export function resolveJobSelection(env = process.env) {
@@ -38,9 +38,8 @@ export async function main(env = process.env) {
     job: JOB_NAME,
     trigger_mode: triggerMode,
     requested_databases: requestedDatabases,
-    github_run_id: env.GITHUB_RUN_ID || null,
-    github_run_attempt: env.GITHUB_RUN_ATTEMPT || null,
-    github_workflow: env.GITHUB_WORKFLOW || null,
+    cloud_run_execution: env.CLOUD_RUN_EXECUTION || null,
+    cloud_run_task_index: env.CLOUD_RUN_TASK_INDEX || null,
   });
 
   try {

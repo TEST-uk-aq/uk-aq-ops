@@ -299,6 +299,7 @@ test("ensurePgCronExtensionAtTopOfSchemaFile does not duplicate existing stateme
 });
 
 test("splitLargeDataInsertsInFile rewrites 25,001-row INSERT into 6 statements", async () => {
+  const header = "INSERT INTO \"uk_aq_core\".\"uk_aq_ingest_runs\" (\"id\", \"payload\") VALUES";
   const sql = [
     "-- preface",
     "SET statement_timeout = 0;",
@@ -316,9 +317,43 @@ test("splitLargeDataInsertsInFile rewrites 25,001-row INSERT into 6 statements",
       enabled: true,
     });
     const output = await fs.readFile(filePath, "utf8");
-    const insertCount = (output.match(/INSERT INTO "uk_aq_core"\."uk_aq_ingest_runs"/g) || []).length;
+    const statements = [];
+    let currentRows = null;
+    for (const line of output.split("\n")) {
+      if (line === header) {
+        currentRows = [];
+        continue;
+      }
+      if (currentRows) {
+        currentRows.push(line);
+        if (/;\s*$/.test(line)) {
+          statements.push(currentRows);
+          currentRows = null;
+        }
+      }
+    }
 
-    assert.equal(insertCount, 6);
+    assert.deepEqual(statements.map((rows) => rows.length), [5_000, 5_000, 5_000, 5_000, 5_000, 1]);
+    for (const rows of statements) {
+      assert.equal(rows.filter((line) => /;\s*$/.test(line)).length, 1);
+      assert.ok(rows.slice(0, -1).every((line) => /,\s*$/.test(line)));
+      assert.match(rows.at(-1), /;\s*$/);
+    }
+    const ids = statements
+      .flat()
+      .map((line) => Number(line.match(/^\s*\((\d+),/)?.[1]));
+    assert.deepEqual(ids, Array.from({ length: 25_001 }, (_, index) => index + 1));
+
+    const tempEntries = await fs.readdir(path.dirname(filePath));
+    assert.equal(
+      tempEntries.some((entry) => (
+        entry.startsWith("data.sql.insert-spool-")
+        || entry.startsWith("data.sql.split-")
+      )),
+      false,
+    );
+
+    assert.equal(statements.length, 6);
     assert.equal(summary.insert_statements_seen, 1);
     assert.equal(summary.insert_statements_split, 1);
     assert.equal(summary.output_insert_statements, 6);
