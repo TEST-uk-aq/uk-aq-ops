@@ -56,6 +56,7 @@ class CloudRunIdentityTokenTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            timeout=60,
         )
 
     def test_audience_is_always_present_without_optional_identity_flags(self) -> None:
@@ -78,6 +79,7 @@ class CloudRunIdentityTokenTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            timeout=60,
         )
 
     def test_nonzero_result_fails_once_with_bounded_stderr(self) -> None:
@@ -118,6 +120,19 @@ class CloudRunIdentityTokenTests(unittest.TestCase):
             MODULE._google_cloud_run_identity_token("  ")
 
         run.assert_not_called()
+
+    def test_route_and_audience_must_share_an_origin(self) -> None:
+        settings = {
+            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_URL": (
+                "https://service.example.test/internal/integrity-reconcile"
+            ),
+            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_AUDIENCE": (
+                "https://different.example.test"
+            ),
+            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_TIMEOUT_SECONDS": "300",
+        }
+        with self.assertRaisesRegex(RuntimeError, "same service origin"):
+            MODULE.validate_latest_snapshot_auth_config(settings)
 
 
 if __name__ == "__main__":
