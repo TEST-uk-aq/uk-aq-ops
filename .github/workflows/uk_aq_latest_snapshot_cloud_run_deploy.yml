@@ -27,6 +27,7 @@ jobs:
       REPO: ${{ vars.GCP_ARTIFACT_REPO || 'uk-aq' }}
       SERVICE_NAME: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_NAME || 'uk-aq-latest-snapshot-builder' }}
       LATEST_SNAPSHOT_SERVICE_ACCOUNT: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || '' }}
+      INTEGRITY_INVOKER_PRINCIPAL: ${{ vars.GCP_LATEST_SNAPSHOT_INTEGRITY_INVOKER_PRINCIPAL || '' }}
       RESOURCE_LABEL: uk-aq-latest-snapshot-service
       SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_TIMEOUT_SECONDS || '300' }}
       SERVICE_CPU: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_CPU || '0.25' }}
@@ -90,6 +91,11 @@ jobs:
           fi
           if [[ "${LATEST_SNAPSHOT_SERVICE_ACCOUNT}" == *"-compute@developer.gserviceaccount.com" ]]; then
             echo "Invalid runtime service account: default compute service account is not allowed."
+            exit 1
+          fi
+          if [ -n "${INTEGRITY_INVOKER_PRINCIPAL:-}" ] \
+            && [[ ! "${INTEGRITY_INVOKER_PRINCIPAL}" =~ ^(user|serviceAccount|group):[^[:space:]]+$ ]]; then
+            echo "GCP_LATEST_SNAPSHOT_INTEGRITY_INVOKER_PRINCIPAL must be a user:, serviceAccount:, or group: IAM principal."
             exit 1
           fi
           if [ "${SERVICE_MAX_INSTANCES}" != "1" ]; then
@@ -425,6 +431,16 @@ jobs:
             exit 1
           fi
           echo "Verified label job_name=${job_name_label}"
+
+      - name: Grant Integrity caller private invocation
+        if: env.INTEGRITY_INVOKER_PRINCIPAL != ''
+        run: |
+          set -euo pipefail
+          gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+            --region "${REGION}" \
+            --member "${INTEGRITY_INVOKER_PRINCIPAL}" \
+            --role "roles/run.invoker" >/dev/null
+          echo "Granted roles/run.invoker to the configured Integrity caller."
 
       - name: Ensure Cloud Scheduler trigger exists
         run: |

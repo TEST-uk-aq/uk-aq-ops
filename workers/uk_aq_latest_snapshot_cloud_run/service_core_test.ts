@@ -85,3 +85,46 @@ Deno.test("timeout response clears in-flight state so the next run can start", a
   assert.equal(recoveryPayload.trigger_mode, "manual");
   assert.equal(runCount, 2);
 });
+
+Deno.test("private Integrity route validates and forwards a bounded request", async () => {
+  let forwarded: Record<string, unknown> | undefined;
+  const handler = createLatestSnapshotHandler({
+    logger: silentLogger,
+    runJob: async (triggerMode, request) => {
+      assert.equal(triggerMode, "integrity_reconciliation");
+      forwarded = request;
+      return {
+        success: true,
+        code: 0,
+        result: {
+          ok: true,
+          trigger_mode: triggerMode,
+          integrity_run_id: request?.integrity_run_id,
+        },
+      };
+    },
+  });
+  const response = await handler(new Request(
+    "http://localhost/internal/integrity-reconcile",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        integrity_run_id: "integrity-42",
+        candidates: [{
+          connector_id: 1,
+          timeseries_id: 10,
+          observed_at: "2026-07-29T10:00:00.000Z",
+          value: 12.5,
+          value_float8_hex: "4029000000000000",
+          status: "P",
+          pollutant_code: "PM2.5",
+        }],
+      }),
+    },
+  ));
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).integrity_run_id, "integrity-42");
+  assert.equal((forwarded?.candidates as Array<Record<string, unknown>>)[0].pollutant_code, "pm2.5");
+});
