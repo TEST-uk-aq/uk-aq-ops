@@ -167,3 +167,53 @@ def decide_observation_repair(
         reason="observation_gap_has_no_authorised_repair_policy",
     )
 
+
+def suggested_repair_from_decision(
+    decision: ObservationRepairDecision, *, sos_scope: bool,
+) -> dict[str, Any]:
+    """Render the established suggested-repair shape from the policy result."""
+    public_kind = decision.repair_kind
+    if public_kind == "observation_index_repair":
+        public_kind = "rebuild_v2_observations_index_only"
+    elif decision.data_changes_required:
+        public_kind = (
+            "uk_air_csv_to_v2_observations_backfill_required"
+            if sos_scope else "source_to_v2_observations_backfill_required"
+        )
+    steps_by_kind = {
+        "observation_connector_manifest_repair": [
+            "Rebuild the connector manifest from the live pollutant child manifests.",
+            "Keep any sibling pollutant partitions that are already present.",
+        ],
+        "observation_day_manifest_repair": [
+            "Rebuild the day manifest from the live connector child manifests.",
+            "Keep any sibling connector partitions that are already present.",
+        ],
+        "observation_pollutant_manifest_repair": [
+            "Rebuild the pollutant manifest from the readable parquet files.",
+        ],
+        "observation_index_repair": [
+            "Confirm the v2 observations data partition exists for the finding.",
+            "Rebuild only the affected v2 observations _index_v2 manifest.",
+        ],
+        "observation_data_repair": [
+            "Use authoritative connector source evidence for the selected pollutant scope.",
+            "Write the affected v2 observation partition through the existing source-to-R2 writer.",
+            "Rebuild affected manifests and indexes before final verification.",
+        ],
+    }
+    return {
+        "kind": public_kind,
+        "requires_index_rebuild": decision.requires_index_rebuild,
+        "commands": [],
+        "executes": False,
+        "operator_action_required": (
+            decision.executability_policy == "operator_action_required"
+        ),
+        "write_risk": (
+            "writes_to_r2_when_run_backfill_is_enabled"
+            if decision.data_changes_required else "metadata_only"
+        ),
+        "steps": list(steps_by_kind.get(decision.repair_kind, [])),
+        "notes": decision.reason,
+    }
