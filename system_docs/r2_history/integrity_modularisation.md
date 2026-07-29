@@ -19,15 +19,15 @@ Where this document conflicts with an implementation plan or code comment, this 
 
 ## Purpose
 
-The existing Python and TypeScript orchestration files contain detection, policy classification, source evidence, repair planning, execution, reporting and external-target logic in the same modules.
+The Python and TypeScript orchestration files historically contained detection, policy classification, source evidence, repair planning, execution, reporting and external-target logic in the same modules.
 
 The modularisation must reduce regression risk by ensuring that:
 
 - one module owns each policy decision;
 - later stages consume typed decisions rather than repeating string and gap-type condition sets;
 - external side effects occur only through explicit stage boundaries;
-- completed stages are recorded independently;
-- a retryable late-stage failure does not require successful source, R2 or database work to repeat;
+- completed stages and target outcomes are recorded independently;
+- a new run can safely re-evaluate a failed scope without rewriting already-correct R2 or current state;
 - the public entrypoints and operational contracts remain stable.
 
 This is not a cosmetic file split. Moving duplicated policy into several smaller modules without centralising ownership does not satisfy this contract.
@@ -44,7 +44,9 @@ workers/uk_aq_backfill_local/run_job.ts
 
 The local dispatcher and repository runner continue invoking the same Python entrypoint.
 
-Existing CLI arguments, environment variables, exit status meanings, structured log event names, report fields, R2 keys, manifest schemas, Parquet schemas and SQLite meanings remain unchanged except for separately approved additions required by authentication preflight and current-state resume.
+Existing supported CLI arguments, environment variables, exit status meanings, structured log event names, report fields, R2 keys, manifest schemas, Parquet schemas and SQLite meanings remain unchanged except for separately approved additions.
+
+Old-run resume arguments are not part of the supported public CLI.
 
 ## Architectural principles
 
@@ -109,11 +111,11 @@ A broad dependency-injection framework is not required. Context objects must rem
 
 ### Fail closed
 
-Extraction must preserve all current fail-closed rules. An unresolved import, missing evidence field, ambiguous decision or incomplete resume record blocks execution rather than broadening scope.
+Extraction must preserve all current fail-closed rules. An unresolved import, missing evidence field, ambiguous decision or invalid target result blocks execution rather than broadening scope.
 
 ## Python target ownership
 
-The exact filenames may adjust where the existing implementation reveals a clearer boundary, but ownership must be recognisable.
+The exact filenames may adjust where the implementation reveals a clearer boundary, but ownership must be recognisable.
 
 Recommended structure:
 
@@ -151,7 +153,6 @@ scripts/uk-aq-history-integrity/bin/
     │   ├── timeseries.py
     │   ├── latest_snapshot.py
     │   ├── audit.py
-    │   ├── resume.py
     │   └── coordinator.py
     ├── reporting.py
     ├── daily_profile.py
@@ -159,6 +160,8 @@ scripts/uk-aq-history-integrity/bin/
 ```
 
 Do not create empty modules solely to match this diagram. Each extracted module must own a coherent responsibility and remove real implementation from the orchestration file.
+
+No module owns replay or resumption of an earlier Integrity run.
 
 ## Authoritative observation repair decision
 
@@ -279,34 +282,23 @@ The current-state coordinator:
 
 A target module must not invoke source acquisition, R2 repair or another target.
 
-## Resume ownership
+Existing candidate-set and target-attempt SQLite tables may remain for historical compatibility or normal-run audit. They must not provide an old-run replay interface.
 
-The resume module owns failed-target-only recovery.
+## Failure recovery ownership
 
-It loads durable Integrity SQLite evidence, validates environment and final R2 verification identity, reproduces or loads deterministic candidates, and retries only failed or pending current-state targets by default.
+A failed Integrity run remains an immutable audit record.
 
-Resume must not repeat successful:
+Recovery is owned by the normal coordinator through a new appropriately scoped run. The new run must:
 
-- source acquisition;
-- repair decisions;
-- proposals;
-- canonical R2 apply;
-- manifest or index repair;
-- final verification, except the minimal proof needed to confirm that recorded verified R2 evidence is still valid;
-- current-state targets.
+- reacquire current authoritative source evidence;
+- use current mappings and configuration;
+- derive a new explicit repair plan;
+- skip already-correct canonical R2 objects;
+- apply normal final verification;
+- reconcile current-state targets through monotonic and idempotent rules;
+- record outcomes under a new Integrity run identifier.
 
-A missing, inconsistent or superseded audit record blocks resume.
-
-The public CLI addition required by this contract must be narrow and explicit. The preferred interface is:
-
-```text
---resume-current-state-run-id <integrity run id>
---resume-current-state-target failed|timeseries|latest_snapshot|all
-```
-
-The target defaults to `failed`.
-
-If existing parser or audit structures make another name materially safer, implementation may choose it only when the system docs and plan are updated consistently before deployment.
+The system must not reconstruct and replay candidates from an earlier run. There is no supported `--resume-current-state-run-id` or `--resume-current-state-target` interface.
 
 ## TypeScript backfill target ownership
 
@@ -356,13 +348,13 @@ The wrapper must not hide duplicate live implementations. Each compatibility nam
 
 ## Branch and implementation model
 
-All authorised modularisation phases may be implemented in one local feature branch and one Codex session.
+Authorised modularisation phases may be implemented in one local feature branch and one Codex session.
 
 The work must still be divided into coherent commits, for example:
 
 1. structural inventory and package viability;
 2. central repair decision and explicit pollutant gate;
-3. authentication preflight and current-state resume;
+3. authentication preflight and independent target audit;
 4. Python domain extraction;
 5. TypeScript domain extraction;
 6. orchestration slimming and documentation ownership map.
@@ -393,8 +385,9 @@ Targeted deterministic checks are limited to:
 - exact and wildcard explicit pollutant gates;
 - authentication command construction and preflight ordering;
 - independent target audit persistence;
-- failed-target-only resume;
-- monotonic and idempotent target retry.
+- monotonic timeseries and Latest Snapshot behaviour;
+- failure reporting that preserves the original error;
+- absence of old-run resume CLI and runtime symbols when that removal is implemented.
 
 Do not add a broad speculative pre-deployment functional suite.
 
@@ -410,11 +403,12 @@ Required coverage includes:
 - final R2 verification;
 - authentication preflight before canonical mutation;
 - timeseries and Latest Snapshot reconciliation;
-- one idempotent repeat;
-- one failed-target-only resume;
-- one older-range no-rollback operation;
+- one later new scoped run that safely skips or no-ops already-correct state;
+- one older-range no-rollback operation where genuinely needed;
 - normal scheduled processing after reconciliation;
 - report and task-health comparison with the pre-refactor baseline.
+
+A failed earlier run is not resumed as part of validation.
 
 ## Completion criteria
 
@@ -424,7 +418,7 @@ The modularisation is complete when:
 - one authoritative repair decision feeds reporting, planning and execution;
 - authentication command construction has one owner;
 - current-state targets are separate and independently audited;
-- a late retryable target failure can resume without repeating successful R2 work;
+- a failed scope can be processed by a new run without rewriting already-correct R2 or current state;
 - module imports have no side effects;
 - existing public runtime contracts remain stable;
 - real CIC-Test operations show no unexplained behavioural drift;
@@ -442,4 +436,5 @@ This contract does not authorise:
 - replacing SQLite;
 - introducing a broad dependency-injection framework;
 - creating a second Latest Snapshot writer;
-- adding a speculative pre-deployment functional test suite.
+- adding a speculative pre-deployment functional test suite;
+- replaying or resuming an earlier Integrity run.
