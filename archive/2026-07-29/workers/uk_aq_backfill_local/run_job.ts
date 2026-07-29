@@ -77,42 +77,18 @@ import {
   reconcileIntegritySourceAdapterBlockedRows,
 } from "./source_integrity/blocked_rows.ts";
 import {
+  buildHistoryV2ConnectorManifest as buildCanonicalHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest as buildCanonicalHistoryV2DayManifest,
+  buildHistoryV2PollutantManifest as buildCanonicalHistoryV2PollutantManifest,
+  buildHistoryV2ConnectorManifestKey as buildCanonicalHistoryV2ConnectorManifestKey,
+  buildHistoryV2DayManifestKey as buildCanonicalHistoryV2DayManifestKey,
+  buildHistoryV2PartKey as buildCanonicalHistoryV2PartKey,
+  buildHistoryV2PollutantManifestKey as buildCanonicalHistoryV2PollutantManifestKey,
   serializeCanonicalAqilevelDataV2Parquet,
   serializeCanonicalAqilevelDebugV2Parquet,
   serializeCanonicalObservationV2Parquet,
   validateCanonicalHistoryV2Manifest,
 } from "../shared/uk_aq_r2_history_canonical.mjs";
-import {
-  buildHistoryV2ConnectorManifestKey,
-  buildHistoryV2ConnectorPrefix,
-  buildHistoryV2DayManifestKey,
-  buildHistoryV2PartKey,
-  buildHistoryV2PollutantManifestKey,
-  buildHistoryV2PollutantPrefix,
-  normalizePollutantCodeForR2Path,
-} from "./r2/history_paths.ts";
-import {
-  canonicalSemanticJson as canonicalRegistryJson,
-  deterministicSemanticHash,
-} from "./integrity/source_evidence.ts";
-import {
-  createObservationV2ConnectorManifest,
-  createObservationV2PollutantManifest,
-} from "./observations/manifests.ts";
-import {
-  createAqiV2ConnectorManifest,
-  createAqiV2PollutantManifest,
-} from "./aqilevels/manifests.ts";
-import {
-  resolveSourceAdapterRegistry,
-  type SourceAdapterKind,
-} from "./source_adapters/registry.ts";
-export { normalizePollutantCodeForR2Path } from "./r2/history_paths.ts";
-export {
-  createAqiV2ConnectorManifest,
-  createAqiV2PollutantManifest,
-} from "./aqilevels/manifests.ts";
 type RunMode =
   | "local_to_aqilevels"
   | "obs_aqi_to_r2"
@@ -201,6 +177,12 @@ type SourceConnectorLookup = {
   ambiguous_timeseries_ref_keys: Set<string>;
   ambiguous_timeseries_ref_pollutant_keys: Set<string>;
 };
+
+type SourceAdapterKind =
+  | "breathelondon"
+  | "sensorcommunity"
+  | "openaq"
+  | "sos";
 
 type StationRefsLookup = {
   station_refs: Set<string>;
@@ -2176,6 +2158,64 @@ function activeAqiHistoryDebugPrefix(): string {
     : AQI_R2_HISTORY_PREFIX;
 }
 
+export function normalizePollutantCodeForR2Path(pollutantCode: string): string {
+  const value = String(pollutantCode || "").trim().toLowerCase();
+  if (!/^[a-z0-9_]+$/.test(value)) {
+    throw new Error(`Invalid pollutant_code for R2 path: ${pollutantCode}`);
+  }
+  return value;
+}
+
+function buildHistoryV2ConnectorPrefix(
+  basePrefix: string,
+  dayUtc: string,
+  connectorId: number,
+): string {
+  return `${basePrefix}/day_utc=${dayUtc}/connector_id=${connectorId}`;
+}
+
+function buildHistoryV2PollutantPrefix(
+  basePrefix: string,
+  dayUtc: string,
+  connectorId: number,
+  pollutantCode: string,
+): string {
+  return `${buildHistoryV2ConnectorPrefix(basePrefix, dayUtc, connectorId)}/pollutant_code=${
+    normalizePollutantCodeForR2Path(pollutantCode)
+  }`;
+}
+
+function buildHistoryV2DayManifestKey(basePrefix: string, dayUtc: string): string {
+  return buildCanonicalHistoryV2DayManifestKey(basePrefix, dayUtc);
+}
+
+function buildHistoryV2ConnectorManifestKey(
+  basePrefix: string,
+  dayUtc: string,
+  connectorId: number,
+): string {
+  return buildCanonicalHistoryV2ConnectorManifestKey(basePrefix, dayUtc, connectorId);
+}
+
+function buildHistoryV2PollutantManifestKey(
+  basePrefix: string,
+  dayUtc: string,
+  connectorId: number,
+  pollutantCode: string,
+): string {
+  return buildCanonicalHistoryV2PollutantManifestKey(basePrefix, dayUtc, connectorId, pollutantCode);
+}
+
+function buildHistoryV2PartKey(
+  basePrefix: string,
+  dayUtc: string,
+  connectorId: number,
+  pollutantCode: string,
+  partIndex: number,
+): string {
+  return buildCanonicalHistoryV2PartKey(basePrefix, dayUtc, connectorId, pollutantCode, partIndex);
+}
+
 function resolveIntegrityProposalStageDir(
   dayUtc: string,
   connectorId: number,
@@ -3271,6 +3311,55 @@ function createObsDayManifest(args: {
   });
 }
 
+function createObservationV2PollutantManifest(args: {
+  dayUtc: string;
+  connectorId: number;
+  pollutantCode: string;
+  runId: string;
+  manifestKey: string;
+  sourceRowCount: number;
+  fileEntries: ObsHistoryFileEntry[];
+  writerGitSha: string | null;
+  backedUpAtUtc: string;
+  observationContentHash: Record<string, unknown>;
+}) {
+  const manifest = buildCanonicalHistoryV2PollutantManifest({
+    domain: "observations",
+    ...args,
+    observationContentHash: args.observationContentHash,
+  });
+  validateCanonicalHistoryV2Manifest(manifest, {
+    domain: "observations",
+    manifest_kind: "pollutant",
+    day_utc: args.dayUtc,
+    connector_id: args.connectorId,
+    pollutant_code: args.pollutantCode,
+  });
+  return manifest;
+}
+
+function createObservationV2ConnectorManifest(args: {
+  dayUtc: string;
+  connectorId: number;
+  runId: string;
+  manifestKey: string;
+  pollutantManifests: Array<Record<string, unknown>>;
+  writerGitSha: string | null;
+  backedUpAtUtc: string;
+}) {
+  const manifest = buildCanonicalHistoryV2ConnectorManifest({
+    domain: "observations",
+    ...args,
+  });
+  validateCanonicalHistoryV2Manifest(manifest, {
+    domain: "observations",
+    manifest_kind: "connector",
+    day_utc: args.dayUtc,
+    connector_id: args.connectorId,
+  });
+  return manifest;
+}
+
 export function createAqiConnectorManifest(args: {
   dayUtc: string;
   connectorId: number;
@@ -3513,6 +3602,54 @@ function historyV2AqiColumns(profile: "data" | "debug"): readonly string[] {
   return profile === "data"
     ? HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2
     : HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2;
+}
+
+export function createAqiV2PollutantManifest(args: {
+  profile: "data" | "debug";
+  dayUtc: string;
+  connectorId: number;
+  pollutantCode: "no2" | "pm25" | "pm10";
+  runId: string;
+  manifestKey: string;
+  sourceRowCount: number;
+  fileEntries: ObsHistoryFileEntry[];
+  writerGitSha: string | null;
+  backedUpAtUtc: string;
+}) {
+  const manifest = buildCanonicalHistoryV2PollutantManifest({
+    domain: "aqilevels",
+    grain: "hourly",
+    ...args,
+  });
+  validateCanonicalHistoryV2Manifest(manifest, {
+    domain: "aqilevels",
+    manifest_kind: "pollutant",
+    profile: args.profile,
+  });
+  return manifest;
+}
+
+export function createAqiV2ConnectorManifest(args: {
+  profile: "data" | "debug";
+  dayUtc: string;
+  connectorId: number;
+  runId: string;
+  manifestKey: string;
+  pollutantManifests: Array<Record<string, unknown>>;
+  writerGitSha: string | null;
+  backedUpAtUtc: string;
+}) {
+  const manifest = buildCanonicalHistoryV2ConnectorManifest({
+    domain: "aqilevels",
+    grain: "hourly",
+    ...args,
+  });
+  validateCanonicalHistoryV2Manifest(manifest, {
+    domain: "aqilevels",
+    manifest_kind: "connector",
+    profile: args.profile,
+  });
+  return manifest;
 }
 
 function createAqiV2DayManifest(args: {
@@ -9158,7 +9295,22 @@ type SosSourceLabelRegistrySnapshot = {
   entries: Map<string, SosSourceLabelRegistryEntry>;
 };
 
+function canonicalRegistryJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalRegistryJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalRegistryJson(record[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 const SOURCE_EVIDENCE_CONTRACT_VERSION = 4;
+
+function deterministicSemanticHash(value: unknown): string {
+  return sha256Hex(canonicalRegistryJson(value));
+}
 
 let sosSourceLabelRegistrySnapshot: SosSourceLabelRegistrySnapshot | null | undefined;
 
@@ -13487,44 +13639,124 @@ async function runSourceToAll(
   const sourceAcquisitionPendingDaySet = new Set<string>();
   const sourceProcessedDaySet = new Set<string>();
   const sourceFailedDaySet = new Set<string>();
+  const sourceAdapterByConnectorId = new Map<number, SourceAdapterKind>();
   let cachedBreatheLondonSensors: Record<string, unknown>[] | null = null;
-  const resolvedSourceAdapters = await resolveSourceAdapterRegistry([
-    {
-      kind: "breathelondon", enabled: BREATHELONDON_SOURCE_ENABLED,
-      connectorCode: BREATHELONDON_CONNECTOR_CODE,
-      fallbackConnectorId: BREATHELONDON_CONNECTOR_ID_FALLBACK,
-      prerequisiteAvailable: Boolean(BREATHELONDON_API_KEY),
-      disabledWarning: "Breathe London source adapter is disabled by UK_AQ_BACKFILL_BREATHELONDON_SOURCE_ENABLED=false.",
-      missingPrerequisiteWarning: "Breathe London source adapter enabled, but BREATHELONDON_API_KEY is missing; skipping Breathe London source adapter.",
-      fallbackWarning: (id) => `Could not resolve connector_code=${BREATHELONDON_CONNECTOR_CODE}; using fallback connector_id=${id}.`,
-      unresolvedWarning: `Breathe London source adapter enabled, but connector_id could not be resolved from connector_code=${BREATHELONDON_CONNECTOR_CODE}; skipping Breathe London source adapter.`,
-    },
-    {
-      kind: "sos", enabled: SOS_SOURCE_ENABLED,
-      connectorCode: SOS_CONNECTOR_CODE,
-      fallbackConnectorId: SOS_CONNECTOR_ID_FALLBACK,
-      disabledWarning: "UK-AIR SOS source adapter is disabled by UK_AQ_BACKFILL_SOS_SOURCE_ENABLED=false.",
-      fallbackWarning: (id) => `Could not resolve connector_code=${SOS_CONNECTOR_CODE}; using fallback connector_id=${id}.`,
-      unresolvedWarning: `UK-AIR SOS source adapter enabled, but connector_id could not be resolved from connector_code=${SOS_CONNECTOR_CODE}; skipping UK-AIR SOS source adapter.`,
-    },
-    {
-      kind: "sensorcommunity", enabled: SCOMM_SOURCE_ENABLED,
-      connectorCode: SCOMM_CONNECTOR_CODE, fallbackConnectorId: 7,
-      disabledWarning: "Sensor.Community source adapter is disabled by UK_AQ_BACKFILL_SCOMM_SOURCE_ENABLED=false.",
-      fallbackWarning: (id) => `Could not resolve connector_code=${SCOMM_CONNECTOR_CODE} from core metadata; using fallback connector_id=${id}.`,
-      unresolvedWarning: `Sensor.Community source adapter enabled, but connector_id could not be resolved from connector_code=${SCOMM_CONNECTOR_CODE}.`,
-    },
-    {
-      kind: "openaq", enabled: OPENAQ_SOURCE_ENABLED,
-      connectorCode: OPENAQ_CONNECTOR_CODE,
-      fallbackConnectorId: OPENAQ_CONNECTOR_ID_FALLBACK,
-      disabledWarning: "OpenAQ source adapter is disabled by UK_AQ_BACKFILL_OPENAQ_SOURCE_ENABLED=false.",
-      fallbackWarning: (id) => `Could not resolve connector_code=${OPENAQ_CONNECTOR_CODE}; using fallback connector_id=${id}.`,
-      unresolvedWarning: `OpenAQ source adapter enabled, but connector_id could not be resolved from connector_code=${OPENAQ_CONNECTOR_CODE}; skipping OpenAQ source adapter.`,
-    },
-  ], resolveConnectorIdByCode);
-  const sourceAdapterByConnectorId = resolvedSourceAdapters.registry;
-  warnings.push(...resolvedSourceAdapters.warnings);
+
+  if (BREATHELONDON_SOURCE_ENABLED) {
+    if (!BREATHELONDON_API_KEY) {
+      warnings.push(
+        "Breathe London source adapter enabled, but BREATHELONDON_API_KEY is missing; skipping Breathe London source adapter.",
+      );
+    } else {
+      const resolvedBreatheLondonConnectorId = await resolveConnectorIdByCode(
+        BREATHELONDON_CONNECTOR_CODE,
+      );
+      let breatheLondonConnectorId: number | null = null;
+      if (resolvedBreatheLondonConnectorId) {
+        breatheLondonConnectorId = resolvedBreatheLondonConnectorId;
+      } else if (
+        Number.isInteger(BREATHELONDON_CONNECTOR_ID_FALLBACK) &&
+        BREATHELONDON_CONNECTOR_ID_FALLBACK > 0
+      ) {
+        breatheLondonConnectorId = BREATHELONDON_CONNECTOR_ID_FALLBACK;
+        warnings.push(
+          `Could not resolve connector_code=${BREATHELONDON_CONNECTOR_CODE}; using fallback connector_id=${BREATHELONDON_CONNECTOR_ID_FALLBACK}.`,
+        );
+      } else {
+        warnings.push(
+          `Breathe London source adapter enabled, but connector_id could not be resolved from connector_code=${BREATHELONDON_CONNECTOR_CODE}; skipping Breathe London source adapter.`,
+        );
+      }
+      if (breatheLondonConnectorId) {
+        sourceAdapterByConnectorId.set(
+          breatheLondonConnectorId,
+          "breathelondon",
+        );
+      }
+    }
+  } else {
+    warnings.push(
+      "Breathe London source adapter is disabled by UK_AQ_BACKFILL_BREATHELONDON_SOURCE_ENABLED=false.",
+    );
+  }
+
+  if (SOS_SOURCE_ENABLED) {
+    const resolvedSosConnectorId = await resolveConnectorIdByCode(
+      SOS_CONNECTOR_CODE,
+    );
+    let sosConnectorId: number | null = null;
+    if (resolvedSosConnectorId) {
+      sosConnectorId = resolvedSosConnectorId;
+    } else if (
+      Number.isInteger(SOS_CONNECTOR_ID_FALLBACK) &&
+      SOS_CONNECTOR_ID_FALLBACK > 0
+    ) {
+      sosConnectorId = SOS_CONNECTOR_ID_FALLBACK;
+      warnings.push(
+        `Could not resolve connector_code=${SOS_CONNECTOR_CODE}; using fallback connector_id=${SOS_CONNECTOR_ID_FALLBACK}.`,
+      );
+    } else {
+      warnings.push(
+        `UK-AIR SOS source adapter enabled, but connector_id could not be resolved from connector_code=${SOS_CONNECTOR_CODE}; skipping UK-AIR SOS source adapter.`,
+      );
+    }
+    if (sosConnectorId) {
+      sourceAdapterByConnectorId.set(sosConnectorId, "sos");
+    }
+  } else {
+    warnings.push(
+      "UK-AIR SOS source adapter is disabled by UK_AQ_BACKFILL_SOS_SOURCE_ENABLED=false.",
+    );
+  }
+
+  if (SCOMM_SOURCE_ENABLED) {
+    const resolvedSensorcommunityConnectorId = await resolveConnectorIdByCode(
+      SCOMM_CONNECTOR_CODE,
+    );
+    const sensorcommunityConnectorId = resolvedSensorcommunityConnectorId || 7;
+    if (!resolvedSensorcommunityConnectorId) {
+      warnings.push(
+        `Could not resolve connector_code=${SCOMM_CONNECTOR_CODE} from core metadata; using fallback connector_id=7.`,
+      );
+    }
+    sourceAdapterByConnectorId.set(
+      sensorcommunityConnectorId,
+      "sensorcommunity",
+    );
+  } else {
+    warnings.push(
+      "Sensor.Community source adapter is disabled by UK_AQ_BACKFILL_SCOMM_SOURCE_ENABLED=false.",
+    );
+  }
+
+  if (OPENAQ_SOURCE_ENABLED) {
+    const resolvedOpenaqConnectorId = await resolveConnectorIdByCode(
+      OPENAQ_CONNECTOR_CODE,
+    );
+    let openaqConnectorId: number | null = null;
+    if (resolvedOpenaqConnectorId) {
+      openaqConnectorId = resolvedOpenaqConnectorId;
+    } else if (
+      Number.isInteger(OPENAQ_CONNECTOR_ID_FALLBACK) &&
+      OPENAQ_CONNECTOR_ID_FALLBACK > 0
+    ) {
+      openaqConnectorId = OPENAQ_CONNECTOR_ID_FALLBACK;
+      warnings.push(
+        `Could not resolve connector_code=${OPENAQ_CONNECTOR_CODE}; using fallback connector_id=${OPENAQ_CONNECTOR_ID_FALLBACK}.`,
+      );
+    } else {
+      warnings.push(
+        `OpenAQ source adapter enabled, but connector_id could not be resolved from connector_code=${OPENAQ_CONNECTOR_CODE}; skipping OpenAQ source adapter.`,
+      );
+    }
+    if (openaqConnectorId) {
+      sourceAdapterByConnectorId.set(openaqConnectorId, "openaq");
+    }
+  } else {
+    warnings.push(
+      "OpenAQ source adapter is disabled by UK_AQ_BACKFILL_OPENAQ_SOURCE_ENABLED=false.",
+    );
+  }
 
   const defaultConnectors = Array.from(sourceAdapterByConnectorId.keys()).sort((
     left,
