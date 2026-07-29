@@ -19,11 +19,6 @@ import {
 import {
   observationContentHashFromLocalParquet,
 } from "../../../scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs";
-import {
-  compareProposalCollision,
-  inspectSourceDerivedObservationManifestOwner,
-  SOURCE_DERIVED_OWNER,
-} from "./proposal_ownership.mjs";
 
 const DEFAULT_OBSERVATIONS_PREFIX = "history/v2/observations";
 const CANONICAL_CODE = /^[a-z][a-z0-9_]*$/;
@@ -287,28 +282,6 @@ export async function prepareLegacyObservationManifestCompatibility({
       const pollutantProposals = [];
       for (const child of [...legacyChildren.values()]
         .sort((left, right) => left.pollutant_code.localeCompare(right.pollutant_code))) {
-        const canonicalKey = `${dayKeyPrefix}/${entry.name}/pollutant_code=${child.pollutant_code}/manifest.json`;
-        const owned = await inspectSourceDerivedObservationManifestOwner({
-          state,
-          manifestKey: canonicalKey,
-          overlayRoot,
-        });
-        if (owned) {
-          pollutantPayloads.push(owned.payload);
-          pollutantProposals.push({
-            key: canonicalKey,
-            body: owned.body,
-            file_entries: owned.file_entries,
-            dependency_identities: owned.dependency_identities,
-            source_manifest_key: child.source_manifest_key,
-            raw_pollutant_code: child.raw_pollutant_code,
-            pollutant_code: child.pollutant_code,
-            overlay_path: state.objects[canonicalKey].local_path,
-            proposal_owner: owned.owner,
-            compatibility_source: "dropbox_legacy_manifest",
-          });
-          continue;
-        }
         const sourceManifestPath = localPathForKey(dropboxRoot, child.source_manifest_key);
         const sourceManifest = fs.existsSync(sourceManifestPath)
           ? readJsonFile(sourceManifestPath, child.source_manifest_key)
@@ -343,6 +316,7 @@ export async function prepareLegacyObservationManifestCompatibility({
           );
         }
         const metadata = metadataFromLegacy(sourceManifest, parent, dayUtc);
+        const canonicalKey = `${dayKeyPrefix}/${entry.name}/pollutant_code=${child.pollutant_code}/manifest.json`;
         const observationContentHash =
           await observationContentHashFromLocalParquet({
             filePaths: partKeys.map((key) =>
@@ -435,16 +409,12 @@ function proposalForPollutant(prepared) {
     changed: true,
     status: "planned",
     dependencies,
-    dependency_identities: prepared.dependency_identities || Object.fromEntries(
-      prepared.file_entries.map((entry) => [
-        entry.key,
-        { sha256: entry.etag_or_hash, bytes: entry.bytes, source: "dropbox" },
-      ]),
-    ),
+    dependency_identities: Object.fromEntries(prepared.file_entries.map((entry) => [
+      entry.key,
+      { sha256: entry.etag_or_hash, bytes: entry.bytes, source: "dropbox" },
+    ])),
     provenance: {
-      source: prepared.proposal_owner === SOURCE_DERIVED_OWNER
-        ? SOURCE_DERIVED_OWNER
-        : "legacy_pollutant_layout_normalisation",
+      source: "legacy_pollutant_layout_normalisation",
       source_manifest_key: prepared.source_manifest_key,
       raw_pollutant_code: prepared.raw_pollutant_code,
       canonical_pollutant_code: prepared.pollutant_code,
@@ -469,7 +439,6 @@ export function finaliseLegacyObservationManifestCompatibility({
   state.objects = isPlainObject(state.objects) ? state.objects : {};
   const proposals = new Map(output.planning.proposals.map((proposal) => [proposal.key, proposal]));
   const byDay = new Map();
-  const collisions = [];
 
   for (const prepared of preparation.prepared) {
     const connectorProposal = proposals.get(prepared.connector_key);
@@ -491,33 +460,7 @@ export function finaliseLegacyObservationManifestCompatibility({
     );
     const dayKeys = byDay.get(prepared.day_utc) || [];
     for (const pollutant of prepared.pollutant_proposals) {
-      const candidate = proposalForPollutant(pollutant);
-      const existing = proposals.get(pollutant.key);
-      if (existing) {
-        const comparison = compareProposalCollision(existing, candidate);
-        if (!comparison.identical) {
-          throw new Error(
-            `Integrity proposal collision: key=${pollutant.key} owners=${String(existing?.provenance?.source || "metadata_planner")},${String(candidate?.provenance?.source || "compatibility")} differing_fields=${comparison.differing_fields.join(",")} compatibility_source=${pollutant.compatibility_source || "dropbox"}`,
-          );
-        }
-        collisions.push({
-          key: pollutant.key,
-          status: "accepted_identical",
-          retained_owner: String(existing?.provenance?.source || "metadata_planner"),
-          duplicate_owner: String(candidate?.provenance?.source || "compatibility"),
-          compatibility_source: pollutant.compatibility_source || "dropbox",
-          differing_fields: [],
-        });
-      } else {
-        proposals.set(pollutant.key, candidate);
-        collisions.push({
-          key: pollutant.key,
-          status: "filled_missing_key",
-          retained_owner: String(candidate?.provenance?.source || "compatibility"),
-          compatibility_source: pollutant.compatibility_source || "dropbox",
-          differing_fields: [],
-        });
-      }
+      proposals.set(pollutant.key, proposalForPollutant(pollutant));
       dayKeys.push(pollutant.key);
     }
     byDay.set(prepared.day_utc, dayKeys);
@@ -545,8 +488,6 @@ export function finaliseLegacyObservationManifestCompatibility({
       (total, item) => total + item.pollutant_proposals.length,
       0,
     ),
-    collision_count: collisions.length,
-    collisions,
     connectors: preparation.prepared.map((item) => ({
       day_utc: item.day_utc,
       connector_id: item.connector_id,

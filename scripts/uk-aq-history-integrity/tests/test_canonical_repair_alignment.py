@@ -481,6 +481,13 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
                         "proposed": True, "built": True, "structurally_validated": True,
                         "local_path": str(replacement_manifest), "sha256": connector_sha,
                         "bytes": connector_bytes, "dependencies": [replacement_key],
+                        "dependency_identities": {
+                            replacement_key: {
+                                "sha256": replacement_sha,
+                                "bytes": replacement_bytes,
+                                "source": "overlay",
+                            },
+                        },
                     },
                 },
                 "tombstones": {},

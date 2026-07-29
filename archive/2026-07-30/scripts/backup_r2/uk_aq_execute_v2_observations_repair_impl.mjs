@@ -320,25 +320,16 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
     if (isProposedAbsent(key)) dropboxPaths.delete(key);
   }
   const overlayPaths = new Map();
-  const overlayOwners = new Map();
   for (const [key, entry] of Object.entries(state?.objects || {})) {
     if (entry?.structurally_validated === true && typeof entry.local_path === "string" && fs.existsSync(entry.local_path)) {
       overlayPaths.set(safeLocalKey(key), entry.local_path);
-      if (typeof entry.proposal_owner === "string" && entry.proposal_owner) {
-        overlayOwners.set(safeLocalKey(key), entry.proposal_owner);
-      } else if (entry.stage === "observations_data") {
-        overlayOwners.set(safeLocalKey(key), "source_derived_observation_repair");
-      }
     }
   }
   function localObject(key, source) {
     const localPath = (source === "overlay" ? overlayPaths : dropboxPaths).get(key);
     if (!localPath) return null;
     const body = fs.readFileSync(localPath);
-    return {
-      ...objectFromBody({ key, body, source, content_sha256: sha256Hex(body) }),
-      proposal_owner: source === "overlay" ? overlayOwners.get(key) || null : null,
-    };
+    return objectFromBody({ key, body, source, content_sha256: sha256Hex(body) });
   }
 
   function objectFor(key) {
@@ -457,20 +448,6 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
   const indexProposalKind = (key) => key.endsWith("_latest.json")
       ? "latest_timeseries_index"
       : "pollutant_timeseries_index";
-  const indexDependencies = (key) => {
-    const observation = String(key).match(
-      /^history\/_index_v2\/observations_timeseries\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/,
-    );
-    if (observation) {
-      return [`history/v2/observations/day_utc=${observation[1]}/connector_id=${observation[2]}/pollutant_code=${observation[3]}/manifest.json`];
-    }
-    const aqi = String(key).match(
-      /^history\/_index_v2\/aqilevels_hourly_data_timeseries\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/,
-    );
-    return aqi
-      ? [`history/v2/aqilevels/hourly/data/day_utc=${aqi[1]}/connector_id=${aqi[2]}/pollutant_code=${aqi[3]}/manifest.json`]
-      : [];
-  };
 
   function resolveDependencyIdentities(dependencies) {
     return Object.fromEntries(dependencies.map((dependencyKey) => {
@@ -533,13 +510,7 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
   const stagedR2 = {
     ...r2,
     proposal_sink: async ({ key, body, content_type }) => {
-      await stage({
-        key,
-        body,
-        contentType: content_type,
-        kind: indexProposalKind(key),
-        dependencies: indexDependencies(key),
-      });
+      await stage({ key, body, contentType: content_type, kind: indexProposalKind(key) });
     },
     adapter: {
       getObject: async ({ key }) => {
@@ -578,13 +549,7 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
         return [...prefixes].sort();
       },
       putObject: async ({ key, body, content_type }) => {
-        const proposal = await stage({
-          key,
-          body,
-          contentType: content_type,
-          kind: indexProposalKind(key),
-          dependencies: indexDependencies(key),
-        });
+        const proposal = await stage({ key, body, contentType: content_type, kind: indexProposalKind(key) });
         return { key, bytes: proposal.bytes, etag: proposal.new_sha256 };
       },
     },
@@ -793,7 +758,7 @@ function sourceManifestMetadata(store, source, label, manifestKey, expectation) 
         run_id: metadata.run_id === null ? "schema_nullable" : label,
         writer_git_sha: metadata.writer_git_sha === null ? "schema_nullable" : label,
         backed_up_at_utc: label,
-        source: object.proposal_owner || label,
+        source: label,
       },
     };
   } catch {

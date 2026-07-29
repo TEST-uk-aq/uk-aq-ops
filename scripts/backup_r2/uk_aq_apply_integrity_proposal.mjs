@@ -12,6 +12,7 @@ import {
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
   computeObservationContentHash,
+  encodeCanonicalObservationRow,
   normalizeCanonicalObservationRow,
   resolveLegacyVerificationStatus,
   validateObservationContentHashMetadata,
@@ -79,15 +80,122 @@ function objectDomain(key) {
   return "observations";
 }
 
-function objectRank(key) {
-  const domainOffset = objectDomain(key) === "aqilevels" ? 100 : 0;
-  if (key.endsWith(".parquet")) return domainOffset + 10;
-  if (/\/pollutant_code=[^/]+\/manifest\.json$/.test(key)) return domainOffset + 20;
-  if (/\/connector_id=\d+\/manifest\.json$/.test(key)) return domainOffset + 30;
-  if (/\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key)) return domainOffset + 40;
-  if (/\/pollutant_code=[^/]+\.json$/.test(key)) return domainOffset + 50;
-  if (key.endsWith("/latest.json")) return domainOffset + 60;
-  return domainOffset + 55;
+export function publicationRank(key) {
+  const value = String(key || "");
+  if (/^history\/v2\/observations\/.+\.parquet$/.test(value)) return 10;
+  if (/^history\/v2\/observations\/.+\/pollutant_code=[^/]+\/manifest\.json$/.test(value)) return 20;
+  if (/^history\/v2\/observations\/.+\/connector_id=\d+\/manifest\.json$/.test(value)) return 30;
+  if (/^history\/_index_v2\/observations_.+/.test(value)) return 40;
+  if (/^history\/v2\/aqilevels\/.+\.parquet$/.test(value)) return 50;
+  if (/^history\/v2\/aqilevels\/.+\/pollutant_code=[^/]+\/manifest\.json$/.test(value)) return 60;
+  if (/^history\/v2\/aqilevels\/.+\/connector_id=\d+\/manifest\.json$/.test(value)) return 70;
+  if (/^history\/_index_v2\/aqilevels_.+/.test(value)) return 80;
+  if (/^history\/v2\/observations\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 90;
+  if (/^history\/v2\/aqilevels\/.+\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 100;
+  if (value.includes("latest") || value.startsWith("history/_index_v2/")) return 120;
+  return 110;
+}
+
+export const VERIFIED_GET_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+export const VERIFIED_GET_CACHE_MAX_ENTRIES = 32;
+
+export function createVerifiedGetBodyCache({
+  maxBytes = VERIFIED_GET_CACHE_MAX_BYTES,
+  maxEntries = VERIFIED_GET_CACHE_MAX_ENTRIES,
+} = {}) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0
+    || !Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+    throw new Error("Verified GET cache bounds must be positive integers");
+  }
+  const entries = new Map();
+  const events = [];
+  let totalBytes = 0;
+  let peakBytes = 0;
+  let peakEntries = 0;
+  const record = (event) => {
+    events.push(event);
+    if (events.length > 50) events.shift();
+  };
+  const invalidateKey = (key, reason) => {
+    let removed = 0;
+    for (const [cacheKey, entry] of entries) {
+      if (entry.key !== key) continue;
+      entries.delete(cacheKey);
+      totalBytes -= entry.body.byteLength;
+      removed += 1;
+    }
+    if (removed) record({ key, reason, invalidated_entries: removed });
+    return removed;
+  };
+  const evictOldest = (reason) => {
+    const oldest = entries.entries().next().value;
+    if (!oldest) return false;
+    const [cacheKey, entry] = oldest;
+    entries.delete(cacheKey);
+    totalBytes -= entry.body.byteLength;
+    record({ key: entry.key, verified_sha256: entry.sha256, reason });
+    return true;
+  };
+  return {
+    maxBytes,
+    maxEntries,
+    store({ key, sha256, body }) {
+      const normalizedKey = safeKey(key);
+      const normalizedSha = String(sha256 || "").toLowerCase();
+      const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body);
+      if (!/^[a-f0-9]{64}$/.test(normalizedSha) || sha256Hex(buffer) !== normalizedSha) {
+        throw new Error(`Refusing unverified body cache entry: ${normalizedKey}`);
+      }
+      invalidateKey(normalizedKey, "later_put_same_key");
+      if (buffer.byteLength > maxBytes) {
+        record({ key: normalizedKey, verified_sha256: normalizedSha, reason: "body_exceeds_cache_bound" });
+        return false;
+      }
+      while (entries.size >= maxEntries || totalBytes + buffer.byteLength > maxBytes) {
+        if (!evictOldest("bounded_cache_eviction")) break;
+      }
+      entries.set(`${normalizedKey}\u0000${normalizedSha}`, {
+        key: normalizedKey,
+        sha256: normalizedSha,
+        body: buffer,
+      });
+      totalBytes += buffer.byteLength;
+      peakBytes = Math.max(peakBytes, totalBytes);
+      peakEntries = Math.max(peakEntries, entries.size);
+      return true;
+    },
+    get(key, expectedSha256) {
+      const normalizedKey = safeKey(key);
+      const normalizedSha = String(expectedSha256 || "").toLowerCase();
+      const entry = entries.get(`${normalizedKey}\u0000${normalizedSha}`);
+      return entry && sha256Hex(entry.body) === normalizedSha ? entry.body : null;
+    },
+    invalidateKey,
+    invalidatePrefix(prefix, reason) {
+      const normalizedPrefix = `${safeKey(prefix).replace(/\/+$/, "")}/`;
+      let removed = 0;
+      for (const entry of [...entries.values()]) {
+        if (entry.key.startsWith(normalizedPrefix)) {
+          removed += invalidateKey(entry.key, reason);
+        }
+      }
+      return removed;
+    },
+    clear(reason = "connector_day_scope_complete") {
+      for (const entry of [...entries.values()]) invalidateKey(entry.key, reason);
+    },
+    snapshot() {
+      return {
+        max_bytes: maxBytes,
+        max_entries: maxEntries,
+        current_bytes: totalBytes,
+        current_entries: entries.size,
+        peak_bytes: peakBytes,
+        peak_entries: peakEntries,
+        recent_events: [...events],
+      };
+    },
+  };
 }
 
 const OBSERVATION_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
@@ -160,7 +268,9 @@ function dependencyIdentity(entry, dependencyKey) {
   const sha256 = String(identity.sha256 || "").trim().toLowerCase();
   const bytes = Number(identity.bytes);
   if (!/^[a-f0-9]{64}$/.test(sha256) || !Number.isSafeInteger(bytes) || bytes < 0) return null;
-  return { sha256, bytes };
+  const source = String(identity.source || "");
+  if (!source) return null;
+  return { sha256, bytes, source };
 }
 
 export function validateLocalProposal(runState) {
@@ -200,9 +310,17 @@ export function validateLocalProposal(runState) {
           || !fs.statSync(String(stagedDependency.local_path || ""), { throwIfNoEntry: false })?.isFile()) {
           throw new Error(`Local proposal dependency is not structurally validated: ${key} -> ${dependencyKey}`);
         }
+        const expectedIdentity = dependencyIdentity(entry, dependencyKey);
+        const dependencyBody = fs.readFileSync(String(stagedDependency.local_path));
+        if (!expectedIdentity
+          || !["planned_overlay", "overlay"].includes(expectedIdentity.source)
+          || dependencyBody.byteLength !== expectedIdentity.bytes
+          || sha256Hex(dependencyBody) !== expectedIdentity.sha256) {
+          throw new Error(`Staged current-run dependency identity is invalid: ${key} -> ${dependencyKey}`);
+        }
       } else {
         const expectedIdentity = dependencyIdentity(entry, dependencyKey);
-        if (!expectedIdentity) {
+        if (!expectedIdentity || expectedIdentity.source !== "dropbox") {
           throw new Error(`Dropbox baseline dependency identity is not pinned: ${key} -> ${dependencyKey}`);
         }
         if (proposedPrefixes.some((prefix) => dependencyKey.startsWith(prefix))) {
@@ -252,13 +370,14 @@ export function validateLocalProposal(runState) {
     }
   }
   return {
-    objects: normalizedObjects.sort((left, right) => objectRank(left.key) - objectRank(right.key) || left.key.localeCompare(right.key)),
+    objects: normalizedObjects.sort((left, right) => publicationRank(left.key) - publicationRank(right.key) || left.key.localeCompare(right.key)),
     prefixes: normalizedPrefixes.sort((left, right) => left.domain.localeCompare(right.domain) || left.prefix.localeCompare(right.prefix)),
   };
 }
 
-async function deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, adapters }) {
+async function deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, adapters, verifiedBodyCache = null }) {
   const prefix = `${prefixEntry.prefix}/`;
+  verifiedBodyCache?.invalidatePrefix(prefixEntry.prefix, "delete_prefix");
   prefixEntry.entry.remote_attempted = true;
   prefixEntry.entry.status = "deleting";
   atomicWriteJson(runStatePath, runState);
@@ -295,8 +414,9 @@ async function deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, 
   }
 }
 
-async function putAndVerifyObject({ r2, runState, runStatePath, object, adapters }) {
+async function putAndVerifyObject({ r2, runState, runStatePath, object, adapters, verifiedBodyCache = null }) {
   const entry = object.entry;
+  verifiedBodyCache?.invalidateKey(object.key, "later_put_same_key");
   Object.assign(entry, { remote_attempted: true, status: "uploading" });
   atomicWriteJson(runStatePath, runState);
   try {
@@ -313,6 +433,18 @@ async function putAndVerifyObject({ r2, runState, runStatePath, object, adapters
       remote_completed: true,
       status: "get_verified",
     });
+    if (/^history\/v2\/observations\/.+\.parquet$/.test(object.key)) {
+      const cached = verifiedBodyCache?.store({
+        key: object.key,
+        sha256: entry.sha256,
+        body: fresh.body,
+      }) || false;
+      Object.assign(entry, {
+        verified_get_body_cached: cached,
+        verified_get_cache_key: cached ? object.key : null,
+        verified_get_cache_sha256: cached ? entry.sha256 : null,
+      });
+    }
     atomicWriteJson(runStatePath, runState);
   } catch (error) {
     Object.assign(entry, {
@@ -402,12 +534,456 @@ async function readCanonicalObservationRows({ body, connectorId }) {
   });
 }
 
-async function verifyLiveObservationPartition({
+function timeseriesRowCounts(rows) {
+  const counts = {};
+  for (const row of rows) {
+    const key = String(row.timeseries_id);
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => Number(left) - Number(right)));
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function semanticMetadata(value) {
+  return {
+    observation_content_hash: value.observation_content_hash,
+    observation_content_hash_algorithm: value.observation_content_hash_algorithm,
+    observation_content_hash_contract_version: value.observation_content_hash_contract_version,
+    observation_content_hash_row_count: value.observation_content_hash_row_count,
+    observation_content_hash_columns: value.observation_content_hash_columns,
+    verification_status_counts: value.verification_status_counts,
+  };
+}
+
+function semanticDifferences(left, right) {
+  const fields = [
+    "observation_content_hash",
+    "observation_content_hash_algorithm",
+    "observation_content_hash_contract_version",
+    "observation_content_hash_row_count",
+    "observation_content_hash_columns",
+    "verification_status_counts",
+  ];
+  return fields.filter((field) => !sameJson(left?.[field], right?.[field]));
+}
+
+function proposalOwners(object) {
+  const values = [
+    object?.entry?.proposal_owner,
+    object?.entry?.source,
+    object?.entry?.provenance?.source,
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  return [...new Set(values.length ? values : ["final_metadata_proposal"])];
+}
+
+function finalProposalError({ key, object, differingFields, compatibilitySource = null }) {
+  const suffix = compatibilitySource ? ` compatibility_source=${compatibilitySource}` : "";
+  return new Error(
+    `Final Integrity proposal graph mismatch: key=${key} owners=${proposalOwners(object).join(",")} differing_fields=${[...new Set(differingFields)].join(",")}${suffix}`,
+  );
+}
+
+function parseFinalJsonBody({ key, object, body, differingField }) {
+  try {
+    return JSON.parse(body.toString("utf8"));
+  } catch {
+    throw finalProposalError({ key, object, differingFields: [differingField] });
+  }
+}
+
+function sourceEvidencePaths(runState, dayUtc, connectorId) {
+  const configuredRoot = String(runState.overlay_root || "").trim();
+  if (!configuredRoot) throw new Error("Final proposal graph has no overlay root");
+  const root = path.resolve(configuredRoot);
+  const directory = path.join(root, `day_utc=${dayUtc}`, `connector_id=${connectorId}`);
+  return {
+    evidencePath: path.join(directory, "source-evidence.json"),
+    rowsPath: path.join(directory, "obs_history_rows.json"),
+  };
+}
+
+function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutantCode }) {
+  const { evidencePath, rowsPath } = sourceEvidencePaths(runState, dayUtc, connectorId);
+  const evidenceBody = fs.readFileSync(evidencePath);
+  const rowsBody = fs.readFileSync(rowsPath);
+  const evidence = JSON.parse(evidenceBody.toString("utf8"));
+  const rows = JSON.parse(rowsBody.toString("utf8"));
+  if (evidence?.schema_version !== 1
+    || evidence?.enumeration_complete !== true
+    || evidence?.day_utc !== dayUtc
+    || Number(evidence?.connector_id) !== connectorId
+    || !Array.isArray(rows)
+    || rowsBody.byteLength !== Number(evidence.canonical_rows_bytes)
+    || sha256Hex(rowsBody) !== evidence.canonical_rows_sha256
+    || rows.length !== Number(evidence.total_rows)) {
+    throw new Error(`Immutable source evidence identity is invalid: day=${dayUtc} connector=${connectorId}`);
+  }
+  const selectedRows = rows
+    .filter((row) => String(row?.pollutant_code || "") === pollutantCode)
+    .map(normalizeCanonicalObservationRow);
+  if (!selectedRows.length) {
+    throw new Error(`Immutable source evidence has no selected rows: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode}`);
+  }
+  const computed = computeObservationContentHash(selectedRows);
+  const recorded = evidence?.observation_content_hashes?.[pollutantCode];
+  validateObservationContentHashMetadata(recorded, { rowCount: selectedRows.length });
+  const differingFields = semanticDifferences(computed, recorded);
+  if (differingFields.length
+    || Number(evidence?.per_pollutant_counts?.[pollutantCode]) !== selectedRows.length) {
+    throw new Error(
+      `Immutable source evidence semantic identity changed: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${[...differingFields, "per_pollutant_counts"].join(",")}`,
+    );
+  }
+  return {
+    evidence,
+    evidencePath,
+    rowsPath,
+    evidenceSha256: sha256Hex(evidenceBody),
+    rowsSha256: sha256Hex(rowsBody),
+    rows: selectedRows,
+    encodedRows: selectedRows.map(encodeCanonicalObservationRow).sort(),
+    metadata: semanticMetadata(computed),
+    timeseriesRowCounts: timeseriesRowCounts(selectedRows),
+  };
+}
+
+function parseManifestObject(object, expectedKind) {
+  const payload = parseFinalJsonBody({
+    key: object.key,
+    object,
+    body: object.body,
+    differingField: "manifest_json",
+  });
+  try {
+    validateCanonicalHistoryV2Manifest(payload, {
+      history_version: "v2",
+      domain: payload.domain,
+      grain: payload.grain ?? null,
+      profile: payload.profile ?? null,
+      manifest_kind: expectedKind,
+      day_utc: payload.day_utc,
+      connector_id: payload.connector_id ?? undefined,
+      pollutant_code: payload.pollutant_code ?? undefined,
+      manifest_key: object.key,
+    });
+  } catch {
+    throw finalProposalError({ key: object.key, object, differingFields: ["manifest_contract"] });
+  }
+  return payload;
+}
+
+function validateFinalParentReferences({ proposal, runState }) {
+  const objects = new Map(proposal.objects.map((object) => [object.key, object]));
+  for (const object of proposal.objects) {
+    if (!object.key.endsWith("/manifest.json") || object.key.startsWith("history/_index_v2/")) continue;
+    const expectedParentKind = /\/connector_id=\d+\/manifest\.json$/.test(object.key)
+      ? "connector"
+      : /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(object.key)
+      ? "day"
+      : null;
+    if (!expectedParentKind) continue;
+    const payload = parseManifestObject(object, expectedParentKind);
+    const rawReferences = payload.manifest_kind === "connector"
+      ? [...(payload.pollutant_manifests || []), ...(payload.child_manifests || [])]
+      : [...(payload.connector_manifests || []), ...(payload.child_manifests || [])];
+    const references = new Map();
+    for (const reference of rawReferences) {
+      const key = String(reference?.manifest_key || "");
+      if (!key) continue;
+      const prior = references.get(key);
+      if (prior && prior.manifest_hash !== reference.manifest_hash) {
+        throw finalProposalError({ key: object.key, object, differingFields: [`duplicate_child_identity:${key}`] });
+      }
+      references.set(key, reference);
+    }
+    const dependencies = new Set((object.entry.dependencies || []).map(String));
+    const expectedChildKeys = object.entry?.local_dependency_snapshot?.expected_child_keys;
+    if (Array.isArray(expectedChildKeys)
+      && !sameJson([...new Set(expectedChildKeys.map(String))].sort(), [...references.keys()].sort())) {
+      throw finalProposalError({
+        key: object.key,
+        object,
+        differingFields: ["preserved_child_accounting"],
+      });
+    }
+    for (const [key, reference] of references) {
+      if (!dependencies.has(key)) {
+        throw finalProposalError({ key: object.key, object, differingFields: [`missing_child_dependency:${key}`] });
+      }
+      const child = objects.get(key);
+      const identity = dependencyIdentity(object.entry, key);
+      let childPayload;
+      if (child) {
+        childPayload = parseFinalJsonBody({
+          key: child.key,
+          object: child,
+          body: child.body,
+          differingField: "child_manifest_json",
+        });
+      } else {
+        const baselinePath = path.join(String(runState.base_dropbox_root || ""), key);
+        const baselineBody = fs.readFileSync(baselinePath);
+        childPayload = parseFinalJsonBody({
+          key,
+          object,
+          body: baselineBody,
+          differingField: `preserved_child_json:${key}`,
+        });
+        if (!identity || identity.source !== "dropbox"
+          || identity.sha256 !== sha256Hex(baselineBody)
+          || identity.bytes !== baselineBody.byteLength) {
+          throw finalProposalError({ key: object.key, object, differingFields: [`preserved_child_identity:${key}`] });
+        }
+      }
+      if (reference.manifest_hash !== childPayload.manifest_hash) {
+        throw finalProposalError({ key: object.key, object, differingFields: [`child_manifest_hash:${key}`] });
+      }
+      if (child && (!identity || identity.sha256 !== child.entry.sha256 || identity.bytes !== child.body.byteLength
+        || !["overlay", "planned_overlay"].includes(identity.source))) {
+        throw finalProposalError({ key: object.key, object, differingFields: [`child_dependency_identity:${key}`] });
+      }
+    }
+    for (const dependency of dependencies) {
+      if (dependency.endsWith("/manifest.json") && !references.has(dependency)) {
+        throw finalProposalError({ key: object.key, object, differingFields: [`unrepresented_child_dependency:${dependency}`] });
+      }
+    }
+  }
+  for (const object of proposal.objects.filter((candidate) => candidate.key.startsWith("history/_index_v2/")
+    && candidate.key.includes("/day_utc=") && candidate.key.includes("/connector_id=")
+    && candidate.key.includes("/pollutant_code="))) {
+    const observation = object.key.match(/^history\/_index_v2\/observations_timeseries\/day_utc=([^/]+)\/connector_id=([^/]+)\/pollutant_code=([^/]+)\/manifest\.json$/);
+    const aqi = object.key.match(/^history\/_index_v2\/aqilevels_hourly_data_timeseries\/day_utc=([^/]+)\/connector_id=([^/]+)\/pollutant_code=([^/]+)\/manifest\.json$/);
+    const match = observation || aqi;
+    if (!match) continue;
+    const manifestKey = observation
+      ? `history/v2/observations/day_utc=${match[1]}/connector_id=${match[2]}/pollutant_code=${match[3]}/manifest.json`
+      : `history/v2/aqilevels/hourly/data/day_utc=${match[1]}/connector_id=${match[2]}/pollutant_code=${match[3]}/manifest.json`;
+    if (!(object.entry.dependencies || []).includes(manifestKey)) {
+      throw finalProposalError({ key: object.key, object, differingFields: [`missing_index_manifest_dependency:${manifestKey}`] });
+    }
+    const stagedManifest = runState.objects?.[manifestKey];
+    const identity = dependencyIdentity(object.entry, manifestKey);
+    let manifestBody;
+    if (stagedManifest) {
+      manifestBody = fs.readFileSync(String(stagedManifest.local_path));
+      if (!identity || identity.sha256 !== stagedManifest.sha256
+        || identity.bytes !== Number(stagedManifest.bytes)
+        || !["overlay", "planned_overlay"].includes(identity.source)) {
+        throw finalProposalError({ key: object.key, object, differingFields: [`index_manifest_identity:${manifestKey}`] });
+      }
+    } else {
+      manifestBody = fs.readFileSync(path.join(String(runState.base_dropbox_root || ""), manifestKey));
+      if (!identity || identity.source !== "dropbox"
+        || identity.sha256 !== sha256Hex(manifestBody)
+        || identity.bytes !== manifestBody.byteLength) {
+        throw finalProposalError({ key: object.key, object, differingFields: [`index_manifest_identity:${manifestKey}`] });
+      }
+    }
+    const manifest = parseFinalJsonBody({
+      key: manifestKey,
+      object,
+      body: manifestBody,
+      differingField: `index_source_manifest_json:${manifestKey}`,
+    });
+    const indexPayload = parseFinalJsonBody({
+      key: object.key,
+      object,
+      body: object.body,
+      differingField: "scoped_index_json",
+    });
+    const indexDifferences = [];
+    const declaredManifestKeys = [
+      indexPayload.pollutant_manifest_key,
+      indexPayload.connector_pollutant_manifest_key,
+    ].filter(Boolean);
+    if (!declaredManifestKeys.length || declaredManifestKeys.some((key) => key !== manifestKey)) {
+      indexDifferences.push("pollutant_manifest_key");
+    }
+    if (indexPayload.pollutant_manifest_hash !== manifest.manifest_hash) {
+      indexDifferences.push("pollutant_manifest_hash");
+    }
+    if (Number(indexPayload.source_row_count) !== Number(manifest.source_row_count)
+      || !sameJson(indexPayload.timeseries_row_counts, manifest.timeseries_row_counts)) {
+      indexDifferences.push("manifest_counts");
+    }
+    const fileIdentity = (entry) => ({
+      key: String(entry?.key || ""),
+      row_count: Number(entry?.row_count),
+      bytes: Number(entry?.bytes),
+      etag_or_hash: String(entry?.etag_or_hash || ""),
+    });
+    const indexFiles = (indexPayload.files || []).map(fileIdentity).sort((left, right) => left.key.localeCompare(right.key));
+    const manifestFiles = (manifest.files || []).map(fileIdentity).sort((left, right) => left.key.localeCompare(right.key));
+    if (!sameJson(indexFiles, manifestFiles)) indexDifferences.push("manifest_file_identities");
+    if (indexDifferences.length) {
+      throw finalProposalError({ key: object.key, object, differingFields: indexDifferences });
+    }
+  }
+}
+
+export async function validateFinalProposalGraph({ runState, proposal, runStatePath = null }) {
+  const audit = {
+    status: "running",
+    started_at_utc: new Date().toISOString(),
+    selected_partition_count: 0,
+    validated_partition_count: 0,
+    partitions: [],
+  };
+  runState.final_proposal_graph_validation = audit;
+  if (runStatePath) atomicWriteJson(runStatePath, runState);
+  try {
+    const selectedPrefixes = proposal.prefixes.filter((item) =>
+      CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(item.prefix));
+    audit.selected_partition_count = selectedPrefixes.length;
+    const objects = new Map(proposal.objects.map((object) => [object.key, object]));
+    for (const selected of selectedPrefixes) {
+      const match = selected.prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
+      const [, dayUtc, connectorIdRaw, pollutantCode] = match;
+      const connectorId = Number(connectorIdRaw);
+      const manifestKey = `${selected.prefix}/manifest.json`;
+      const manifestObject = objects.get(manifestKey);
+      if (!manifestObject) {
+        throw finalProposalError({ key: manifestKey, object: null, differingFields: ["missing_final_pollutant_manifest"] });
+      }
+      const partObjects = proposal.objects.filter((object) =>
+        object.key.startsWith(`${selected.prefix}/`) && object.key.endsWith(".parquet"));
+      if (!partObjects.length) {
+        throw finalProposalError({ key: manifestKey, object: manifestObject, differingFields: ["missing_final_staged_parquet"] });
+      }
+      let source;
+      try {
+        source = loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutantCode });
+      } catch (error) {
+        throw finalProposalError({
+          key: manifestKey,
+          object: manifestObject,
+          differingFields: [`immutable_source_evidence:${error instanceof Error ? error.message : String(error)}`],
+        });
+      }
+      const stagedRows = [];
+      const partRows = new Map();
+      for (const part of partObjects) {
+        let rows;
+        try {
+          rows = await readCanonicalObservationRows({ body: part.body, connectorId });
+        } catch (error) {
+          throw finalProposalError({
+            key: part.key,
+            object: part,
+            differingFields: [`staged_parquet:${error instanceof Error ? error.message : String(error)}`],
+          });
+        }
+        if (rows.some((row) => row.connector_id !== connectorId || row.pollutant_code !== pollutantCode)) {
+          throw finalProposalError({ key: part.key, object: part, differingFields: ["parquet_scope_identity"] });
+        }
+        partRows.set(part.key, rows);
+        stagedRows.push(...rows);
+      }
+      const staged = computeObservationContentHash(stagedRows);
+      const stagedEncodedRows = stagedRows.map(encodeCanonicalObservationRow).sort();
+      const stagedDifferences = semanticDifferences(source.metadata, staged);
+      if (!sameJson(source.encodedRows, stagedEncodedRows)) stagedDifferences.push("canonical_row_identity_and_duplicate_multiplicity");
+      if (stagedDifferences.length) {
+        throw finalProposalError({ key: manifestKey, object: manifestObject, differingFields: stagedDifferences });
+      }
+      const manifest = parseManifestObject(manifestObject, "pollutant");
+      const manifestDifferences = semanticDifferences(source.metadata, manifest);
+      if (manifest.day_utc !== dayUtc || Number(manifest.connector_id) !== connectorId
+        || manifest.pollutant_code !== pollutantCode || manifest.manifest_key !== manifestKey) {
+        manifestDifferences.push("manifest_scope_identity");
+      }
+      if (Number(manifest.source_row_count) !== source.rows.length
+        || Number(manifest.row_count) !== source.rows.length) {
+        manifestDifferences.push("manifest_row_count");
+      }
+      if (!sameJson(manifest.timeseries_row_counts, source.timeseriesRowCounts)) {
+        manifestDifferences.push("manifest_timeseries_row_counts");
+      }
+      const manifestPartKeys = [...new Set((manifest.parquet_object_keys || []).map(String))].sort();
+      const stagedPartKeys = partObjects.map((part) => part.key).sort();
+      if (!sameJson(manifestPartKeys, stagedPartKeys)) manifestDifferences.push("manifest_parquet_object_keys");
+      const fileEntries = new Map((manifest.files || []).map((entry) => [String(entry?.key || ""), entry]));
+      if (fileEntries.size !== partObjects.length) manifestDifferences.push("manifest_files");
+      for (const part of partObjects) {
+        const fileEntry = fileEntries.get(part.key);
+        const expectedPartCounts = timeseriesRowCounts(partRows.get(part.key));
+        if (!fileEntry || Number(fileEntry.bytes) !== part.body.byteLength
+          || String(fileEntry.etag_or_hash || "") !== part.entry.sha256
+          || Number(fileEntry.row_count) !== partRows.get(part.key).length
+          || !sameJson(fileEntry.timeseries_row_counts, expectedPartCounts)) {
+          manifestDifferences.push(`manifest_part_identity:${part.key}`);
+        }
+      }
+      if (manifestDifferences.length) {
+        throw finalProposalError({
+          key: manifestKey,
+          object: manifestObject,
+          differingFields: manifestDifferences,
+          compatibilitySource: manifestObject.entry?.dependency_identities
+            && Object.values(manifestObject.entry.dependency_identities).some((identity) => identity?.source === "dropbox")
+            ? "dropbox"
+            : null,
+        });
+      }
+      Object.assign(manifestObject.entry, {
+        proposal_owner: "source_derived_observation_repair",
+        final_proposal_graph_validated: true,
+        immutable_source_evidence_path: source.evidencePath,
+        immutable_source_rows_path: source.rowsPath,
+        immutable_source_evidence_sha256: source.evidenceSha256,
+        immutable_source_rows_sha256: source.rowsSha256,
+        immutable_source_content_hash: source.metadata.observation_content_hash,
+        immutable_source_row_count: source.rows.length,
+        immutable_source_verification_status_counts: source.metadata.verification_status_counts,
+      });
+      for (const part of partObjects) {
+        Object.assign(part.entry, {
+          proposal_owner: "source_derived_observation_repair",
+          final_proposal_graph_validated: true,
+        });
+      }
+      audit.partitions.push({
+        manifest_key: manifestKey,
+        proposal_owner: "source_derived_observation_repair",
+        source_content_hash: source.metadata.observation_content_hash,
+        staged_content_hash: staged.observation_content_hash,
+        proposed_manifest_content_hash: manifest.observation_content_hash,
+        row_count: source.rows.length,
+        status: "validated",
+      });
+      audit.validated_partition_count += 1;
+    }
+    validateFinalParentReferences({ proposal, runState });
+    Object.assign(audit, {
+      status: "succeeded",
+      finished_at_utc: new Date().toISOString(),
+      parent_and_index_dependencies_validated: true,
+      tombstones_validated: true,
+    });
+    if (runStatePath) atomicWriteJson(runStatePath, runState);
+    return audit;
+  } catch (error) {
+    Object.assign(audit, {
+      status: "failed",
+      finished_at_utc: new Date().toISOString(),
+      error: error instanceof Error ? error.message : String(error),
+    });
+    if (runStatePath) atomicWriteJson(runStatePath, runState);
+    throw error;
+  }
+}
+
+export async function verifyLiveObservationPartition({
   r2,
   runState,
   runStatePath,
   object,
   adapters,
+  verifiedBodyCache = null,
 }) {
   const match = object.key.match(CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN);
   if (!match) return;
@@ -429,6 +1005,12 @@ async function verifyLiveObservationPartition({
   validateObservationContentHashMetadata(manifest, {
     rowCount: Number(manifest.source_row_count),
   });
+  const source = loadImmutableSourcePartition({
+    runState,
+    dayUtc,
+    connectorId,
+    pollutantCode,
+  });
   const partKeys = Array.isArray(manifest.parquet_object_keys)
     ? manifest.parquet_object_keys.map(safeKey)
     : [];
@@ -439,33 +1021,72 @@ async function verifyLiveObservationPartition({
     throw new Error(`Proposed observation pollutant manifest has invalid Parquet keys: ${object.key}`);
   }
   const canonicalRows = [];
+  const bodySources = [];
   for (const key of partKeys) {
-    const live = await adapters.getObject({ r2, key });
+    const stagedEntry = runState.objects?.[key];
+    const expectedSha = String(stagedEntry?.sha256 || "");
+    if (!stagedEntry?.r2_verified || !/^[a-f0-9]{64}$/.test(expectedSha)) {
+      throw new Error(`Live semantic verification requires a GET-verified staged Parquet: ${key}`);
+    }
+    let body = verifiedBodyCache?.get(key, expectedSha) || null;
+    let sourceKind = "verified_get_cache";
+    if (!body) {
+      const live = await adapters.getObject({ r2, key });
+      body = live.body;
+      sourceKind = "fresh_get";
+      if (Number(live.bytes) !== Number(stagedEntry.bytes) || sha256Hex(body) !== expectedSha) {
+        throw new Error(`Live semantic verification R2 identity mismatch: ${key}`);
+      }
+    }
+    bodySources.push({ key, verified_sha256: expectedSha, source: sourceKind });
     canonicalRows.push(...await readCanonicalObservationRows({
-      body: live.body,
+      body,
       connectorId,
     }));
   }
   const liveMetadata = computeObservationContentHash(canonicalRows);
-  if (
-    liveMetadata.observation_content_hash !== manifest.observation_content_hash ||
-    liveMetadata.observation_content_hash_row_count !==
-      manifest.observation_content_hash_row_count ||
-    ["P", "R", "null"].some((key) =>
-      liveMetadata.verification_status_counts[key] !==
-        manifest.verification_status_counts[key]
-    )
-  ) {
+  const liveSourceDifferences = semanticDifferences(source.metadata, liveMetadata);
+  Object.assign(object.entry, {
+    live_observation_body_sources: bodySources,
+    live_observation_content_hash: liveMetadata.observation_content_hash,
+    live_verification_status_counts: liveMetadata.verification_status_counts,
+    live_observation_source_evidence_hash: source.metadata.observation_content_hash,
+    live_observation_content_verified_against_source: liveSourceDifferences.length === 0,
+  });
+  atomicWriteJson(runStatePath, runState);
+  if (liveSourceDifferences.length) {
+    object.entry.live_observation_failure_classification = "live_observation_content_mismatch";
+    atomicWriteJson(runStatePath, runState);
     throw new Error(
-      `Live repaired observation content does not match source truth: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode}`,
+      `Live repaired observation content does not match immutable source evidence: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${liveSourceDifferences.join(",")}`,
+    );
+  }
+  const manifestDifferences = semanticDifferences(liveMetadata, manifest);
+  if (Number(manifest.source_row_count) !== liveMetadata.observation_content_hash_row_count
+    || Number(manifest.row_count) !== liveMetadata.observation_content_hash_row_count) {
+    manifestDifferences.push("manifest_row_count");
+  }
+  if (manifestDifferences.length) {
+    Object.assign(object.entry, {
+      live_observation_content_verified: true,
+      proposed_manifest_matches_live_observation: false,
+      live_observation_failure_classification: "proposal_manifest_defect",
+      proposal_manifest_differing_fields: [...new Set(manifestDifferences)],
+    });
+    atomicWriteJson(runStatePath, runState);
+    throw new Error(
+      `Proposed observation manifest does not match verified live source content: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${[...new Set(manifestDifferences)].join(",")}`,
     );
   }
   Object.assign(object.entry, {
     live_observation_content_verified: true,
     live_observation_content_verified_at_utc: new Date().toISOString(),
-    live_observation_content_hash: liveMetadata.observation_content_hash,
-    live_verification_status_counts: liveMetadata.verification_status_counts,
+    proposed_manifest_matches_live_observation: true,
+    live_observation_failure_classification: null,
   });
+  for (const key of partKeys) {
+    verifiedBodyCache?.invalidateKey(key, "semantic_verification_complete");
+  }
   atomicWriteJson(runStatePath, runState);
 }
 
@@ -559,6 +1180,15 @@ async function prepareMergedDayManifest({ r2, object, adapters }) {
   });
 }
 
+export function assertPublicationDependenciesVerified({ object, runState }) {
+  for (const dependencyKey of object?.entry?.dependencies || []) {
+    const dependency = runState?.objects?.[dependencyKey];
+    if (dependency?.proposed && dependency?.structurally_validated && dependency.r2_verified !== true) {
+      throw new Error(`Publication dependency is not GET-verified: ${object.key} -> ${dependencyKey}`);
+    }
+  }
+}
+
 export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }) {
   const resolvedAdapters = {
     deleteObjects: adapters.deleteObjects || r2DeleteObjects,
@@ -568,8 +1198,15 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
   };
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   const proposal = validateLocalProposal(runState);
+  await validateFinalProposalGraph({ runState, proposal, runStatePath });
   const counts = { planned_deletions: proposal.prefixes.length, planned_writes: proposal.objects.length, deleted_objects: 0, completed_deletions: 0, completed_writes: 0, get_verified_writes: 0 };
-  runState.apply = { status: "running", started_at_utc: new Date().toISOString(), ...counts };
+  runState.apply = {
+    status: "running",
+    started_at_utc: new Date().toISOString(),
+    final_proposal_graph_validation: "succeeded",
+    connector_day_publication: {},
+    ...counts,
+  };
   runState.writer_locks = [];
   atomicWriteJson(runStatePath, runState);
   try {
@@ -601,21 +1238,37 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         globalOperations.push(operation);
       }
     }
-    const executeOperation = async (operation) => {
+    const executeOperation = async (operation, verifiedBodyCache = null) => {
       if (operation.kind === "delete") {
         const { prefixEntry } = operation;
-        counts.deleted_objects += await deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, adapters: resolvedAdapters });
+        counts.deleted_objects += await deleteAndVerifyPrefix({
+          r2,
+          runState,
+          runStatePath,
+          prefixEntry,
+          adapters: resolvedAdapters,
+          verifiedBodyCache,
+        });
         counts.completed_deletions += 1;
       } else {
         const { object } = operation;
+        assertPublicationDependenciesVerified({ object, runState });
         await verifyLiveObservationPartition({
           r2,
           runState,
           runStatePath,
           object,
           adapters: resolvedAdapters,
+          verifiedBodyCache,
         });
-        await putAndVerifyObject({ r2, runState, runStatePath, object, adapters: resolvedAdapters });
+        await putAndVerifyObject({
+          r2,
+          runState,
+          runStatePath,
+          object,
+          adapters: resolvedAdapters,
+          verifiedBodyCache,
+        });
         counts.completed_writes += 1;
         counts.get_verified_writes += 1;
       }
@@ -623,6 +1276,14 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     };
     for (const group of Array.from(connectorGroups.values()).sort((left, right) =>
       left.day_utc.localeCompare(right.day_utc) || left.connector_id - right.connector_id)) {
+      const groupKey = `${group.day_utc}|${group.connector_id}`;
+      const verifiedBodyCache = createVerifiedGetBodyCache();
+      runState.apply.connector_day_publication[groupKey] = {
+        day_utc: group.day_utc,
+        connector_id: group.connector_id,
+        status: "running",
+        completed_publication_level: "none",
+      };
       await runCanonicalConnectorDayWriter({
         client: historyWriterClient,
         dayUtc: group.day_utc,
@@ -630,8 +1291,40 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         diagnosticEnvironment: runState.environment,
         diagnostics: runState.writer_locks,
         write: async () => {
-          for (const operation of group.operations) await executeOperation(operation);
-          return { operation_count: group.operations.length };
+          try {
+            for (const operation of group.operations) {
+              await executeOperation(operation, verifiedBodyCache);
+              const publication = runState.apply.connector_day_publication[groupKey];
+              publication.completed_publication_level = operation.kind === "delete"
+                ? "selected_prefix_deletion"
+                : publicationRank(operation.key) <= 10
+                ? "observation_parquet"
+                : publicationRank(operation.key) <= 20
+                ? "observation_pollutant_manifest"
+                : publicationRank(operation.key) <= 30
+                ? "observation_connector_manifest"
+                : publicationRank(operation.key) <= 40
+                ? "observation_indexes"
+                : publicationRank(operation.key) <= 70
+                ? "aqi_manifests_and_data"
+                : "aqi_indexes";
+              atomicWriteJson(runStatePath, runState);
+            }
+            runState.apply.connector_day_publication[groupKey].status = "succeeded";
+            return { operation_count: group.operations.length };
+          } catch (error) {
+            runState.apply.connector_day_publication[groupKey].status = "failed";
+            runState.apply.connector_day_publication[groupKey].error = error instanceof Error ? error.message : String(error);
+            throw error;
+          } finally {
+            verifiedBodyCache.clear(
+              runState.apply.connector_day_publication[groupKey].status === "succeeded"
+                ? "connector_day_scope_complete"
+                : "connector_day_scope_failed",
+            );
+            runState.apply.connector_day_publication[groupKey].verified_get_cache = verifiedBodyCache.snapshot();
+            atomicWriteJson(runStatePath, runState);
+          }
         },
         verify: async (written) => ({ ...written, get_verified: true }),
       });
