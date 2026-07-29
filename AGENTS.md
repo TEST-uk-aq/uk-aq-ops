@@ -43,6 +43,14 @@ When database or deployment work is needed, Codex should stop after producing:
 5. rollback notes,
 6. post-deploy validation checklist.
 
+## Existing configuration reuse
+
+- Prefer reusing existing repository secrets, variables, environment variables, configuration keys, service names, workflow inputs and shared settings whenever their current meaning and scope fit the new work.
+- Before introducing a new configuration name, search the active repository configuration, workflows, environment catalogues and relevant system contracts for an existing equivalent.
+- Do not create a new secret or variable merely to give an existing value a task-specific name. Map an existing repository value to the runtime environment name expected by the code where needed.
+- Introduce a new configuration name only when no suitable existing value exists, the existing value has materially different semantics or scope, or reuse would create ambiguity or unsafe coupling.
+- When a new name is genuinely required, explain why the existing configuration cannot be reused and update the relevant catalogues, workflows and active system contract together.
+
 ## TEST System Validation Policy
 
 - This repository is part of the UK AQ TEST system. It is intended for development and real operational testing before changes are transferred to LIVE.
