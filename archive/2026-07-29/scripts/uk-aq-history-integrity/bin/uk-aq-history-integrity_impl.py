@@ -11565,70 +11565,6 @@ def _classify_v2_gaps(gaps: Iterable[dict[str, Any]]) -> None:
         gap["fault_class"] = fault_class
 
 
-def _v2_observation_repair_source_evidence_summary(
-    evidence: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Keep the fail-closed partition evidence needed by repair planning."""
-    scalar_fields = (
-        "source_partition_state",
-        "source_counts_present",
-        "source_counts_available",
-        "source_skip_reason",
-        "identity_resolution",
-        "bridge_table",
-        "bridge_sha256",
-        "source_count_mapping_identity",
-        "source_count_mapping_hash",
-        "required_source_file_count",
-        "successful_source_file_count",
-        "identity_classification",
-    )
-    count_fields = (
-        "source_rows",
-        "source_file_count",
-        "bridge_row_count",
-        "source_group_count",
-        "expected_site_ref_groups",
-        "processed_site_ref_groups",
-        "source_groups_examined",
-        "canonical_source_groups",
-        "resolved_site_ref_groups",
-        "unresolved_site_ref_groups",
-        "unmapped_site_ref_groups",
-        "ambiguous_site_ref_groups",
-        "timeseries_conflict_groups",
-        "legitimate_empty_groups",
-        "no_authoritative_timeseries_binding_groups",
-        "no_authoritative_timeseries_binding_rows",
-        "r2_timeseries_without_bridge_count",
-        "r2_date_invalid_timeseries_count",
-        "historical_identity_rollover_groups",
-    )
-    list_fields = (
-        ("mapping_issue_samples", 25),
-        ("no_authoritative_timeseries_binding_warnings", 50),
-        ("r2_timeseries_without_bridge_sample", 50),
-        ("r2_date_invalid_timeseries_sample", 50),
-        ("historical_identity_rollovers", None),
-    )
-    summary = {
-        field: evidence.get(field)
-        for field in scalar_fields
-        if field in evidence
-    }
-    for field in count_fields:
-        if field in evidence:
-            try:
-                summary[field] = int(evidence.get(field) or 0)
-            except (TypeError, ValueError):
-                summary[field] = evidence.get(field)
-    for field, limit in list_fields:
-        if field in evidence:
-            values = list(evidence.get(field) or [])
-            summary[field] = values if limit is None else values[:limit]
-    return summary
-
-
 def run_v2_observations_integrity_checks(
     *,
     r2_history_root: str | Path | None,
@@ -11655,9 +11591,6 @@ def run_v2_observations_integrity_checks(
     gaps: list[dict[str, Any]] = []
     hash_check_candidates: list[dict[str, Any]] = []
     source_resolution_by_pollutant: dict[str, dict[str, Any]] = {}
-    connector_day_source_evidence: dict[
-        tuple[str, int], dict[str, dict[str, Any]]
-    ] = {}
     checked = 0
     verified_first_value_at_minima: dict[
         tuple[str, int],
@@ -11666,48 +11599,6 @@ def run_v2_observations_integrity_checks(
     data_prefix = config.observations_data_prefix.strip("/")
     index_prefix = config.observations_timeseries_index_prefix.strip("/")
     latest_key = config.observations_latest_index_key.strip("/")
-
-    def source_evidence_for_connector_day(
-        day_utc: str,
-        connector_id: int,
-    ) -> dict[str, dict[str, Any]]:
-        key = (day_utc, connector_id)
-        cached = connector_day_source_evidence.get(key)
-        if cached is not None:
-            return cached
-        resolved: dict[str, dict[str, Any]] = {}
-        for pollutant_code in sorted(V2_OBSERVATION_INTEGRITY_POLLUTANTS):
-            _, evidence = _current_source_counts_for_v2_partition(
-                conn,
-                env_name=env_name,
-                source_scope=source_scope,
-                day_utc=day_utc,
-                connector_id=connector_id,
-                pollutant_code=pollutant_code,
-            )
-            resolved[pollutant_code] = (
-                _v2_observation_repair_source_evidence_summary(evidence)
-            )
-        connector_day_source_evidence[key] = resolved
-        return resolved
-
-    def connector_scoped_gap(
-        gap_type: str,
-        *,
-        day_utc: str,
-        connector_id: int,
-        expected_path: str,
-    ) -> dict[str, Any]:
-        gap = _v2_obs_gap(
-            gap_type,
-            day_utc=day_utc,
-            connector_id=connector_id,
-            expected_path=expected_path,
-        )
-        gap["source_evidence_by_pollutant"] = (
-            source_evidence_for_connector_day(day_utc, connector_id)
-        )
-        return gap
 
     latest_path = root / latest_key
     if not latest_path.is_file():
@@ -11727,7 +11618,7 @@ def run_v2_observations_integrity_checks(
                 gaps.append(_v2_obs_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
             else:
                 for connector_id in _expected_connector_ids(allowed_connector_ids):
-                    gaps.append(connector_scoped_gap(
+                    gaps.append(_v2_obs_gap(
                         "day_dir_missing",
                         day_utc=day_utc,
                         connector_id=connector_id,
@@ -11744,7 +11635,7 @@ def run_v2_observations_integrity_checks(
             }
             for connector_id in _expected_connector_ids(allowed_connector_ids):
                 if connector_id not in existing_allowed_ids:
-                    gaps.append(connector_scoped_gap(
+                    gaps.append(_v2_obs_gap(
                         "connector_dir_missing",
                         day_utc=day_utc,
                         connector_id=connector_id,
@@ -11772,19 +11663,7 @@ def run_v2_observations_integrity_checks(
                     related_paths=[str(p.relative_to(root)) for p in connector_level_parts],
                 ))
             if not pollutant_dirs:
-                try:
-                    connector_id_for_source = int(connector_raw)
-                except (TypeError, ValueError):
-                    connector_id_for_source = None
-                if connector_id_for_source is None:
-                    gaps.append(_v2_obs_gap("missing_pollutant_partitions", day_utc=day_utc, connector_id=connector_raw, expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*"))
-                else:
-                    gaps.append(connector_scoped_gap(
-                        "missing_pollutant_partitions",
-                        day_utc=day_utc,
-                        connector_id=connector_id_for_source,
-                        expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*",
-                    ))
+                gaps.append(_v2_obs_gap("missing_pollutant_partitions", day_utc=day_utc, connector_id=connector_raw, expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*"))
                 continue
             for pollutant_dir in pollutant_dirs:
                 pollutant = pollutant_dir.name.split("=", 1)[1].strip().lower()
@@ -12018,11 +11897,116 @@ def run_v2_observations_integrity_checks(
                     and source_partition_evidence.get("identity_resolution")
                     == "uk_air_site_ref_to_sos_timeseries_bridge"
                 ):
-                    source_resolution_by_pollutant[pollutant] = (
-                        _v2_observation_repair_source_evidence_summary(
-                            source_partition_evidence
-                        )
-                    )
+                    source_resolution_by_pollutant[pollutant] = {
+                        "bridge_row_count": int(
+                            source_partition_evidence.get("bridge_row_count")
+                            or 0
+                        ),
+                        "bridge_sha256":
+                            source_partition_evidence.get("bridge_sha256"),
+                        "source_group_count": int(
+                            source_partition_evidence.get("source_group_count")
+                            or 0
+                        ),
+                        "resolved_site_ref_groups": int(
+                            source_partition_evidence.get(
+                                "resolved_site_ref_groups"
+                            )
+                            or 0
+                        ),
+                        "unresolved_site_ref_groups": int(
+                            source_partition_evidence.get(
+                                "unresolved_site_ref_groups"
+                            )
+                            or 0
+                        ),
+                        "source_rows": int(
+                            source_partition_evidence.get("source_rows") or 0
+                        ),
+                        "source_partition_state":
+                            source_partition_evidence.get(
+                                "source_partition_state"
+                            ),
+                        "source_skip_reason":
+                            source_partition_evidence.get("source_skip_reason"),
+                        "expected_site_ref_groups": int(
+                            source_partition_evidence.get(
+                                "expected_site_ref_groups"
+                            ) or 0
+                        ),
+                        "processed_site_ref_groups": int(
+                            source_partition_evidence.get(
+                                "processed_site_ref_groups"
+                            ) or 0
+                        ),
+                        "legitimate_empty_groups": int(
+                            source_partition_evidence.get(
+                                "legitimate_empty_groups"
+                            ) or 0
+                        ),
+                        "unmapped_site_ref_groups": int(
+                            source_partition_evidence.get(
+                                "unmapped_site_ref_groups"
+                            ) or 0
+                        ),
+                        "ambiguous_site_ref_groups": int(
+                            source_partition_evidence.get(
+                                "ambiguous_site_ref_groups"
+                            ) or 0
+                        ),
+                        "timeseries_conflict_groups": int(
+                            source_partition_evidence.get(
+                                "timeseries_conflict_groups"
+                            ) or 0
+                        ),
+                        "source_count_mapping_identity":
+                            source_partition_evidence.get(
+                                "source_count_mapping_identity"
+                            ),
+                        "source_count_mapping_hash":
+                            source_partition_evidence.get(
+                                "source_count_mapping_hash"
+                            ),
+                        "mapping_issue_samples": list(
+                            source_partition_evidence.get(
+                                "mapping_issue_samples"
+                            ) or []
+                        )[:25],
+                        "r2_timeseries_without_bridge_count": int(
+                            source_partition_evidence.get(
+                                "r2_timeseries_without_bridge_count"
+                            ) or 0
+                        ),
+                        "r2_timeseries_without_bridge_sample": list(
+                            source_partition_evidence.get(
+                                "r2_timeseries_without_bridge_sample"
+                            ) or []
+                        )[:50],
+                        "r2_date_invalid_timeseries_count": int(
+                            source_partition_evidence.get(
+                                "r2_date_invalid_timeseries_count"
+                            ) or 0
+                        ),
+                        "r2_date_invalid_timeseries_sample": list(
+                            source_partition_evidence.get(
+                                "r2_date_invalid_timeseries_sample"
+                            ) or []
+                        )[:50],
+                        "historical_identity_rollover_groups": int(
+                            source_partition_evidence.get(
+                                "historical_identity_rollover_groups"
+                            ) or 0
+                        ),
+                        "historical_identity_rollovers": list(
+                            source_partition_evidence.get(
+                                "historical_identity_rollovers"
+                            ) or []
+                        ),
+                        "identity_classification":
+                            source_partition_evidence.get(
+                                "identity_classification"
+                            ),
+                    }
                     source_state = str(
                         source_partition_evidence.get(
                             "source_partition_state"
@@ -17065,19 +17049,11 @@ def _derive_executable_observation_repair_pollutants(
             requested or set(V2_OBSERVATION_INTEGRITY_POLLUTANTS)
         )
         if repair_plan_present:
-            gap_source_resolution = gap.get(
-                "source_evidence_by_pollutant"
-            )
-            scoped_source_resolution = (
-                gap_source_resolution
-                if isinstance(gap_source_resolution, Mapping)
-                else source_resolution
-            )
             failures = []
             for code in sorted(wildcard_pollutants):
                 suitable, reason = _observation_repair_source_evidence_is_complete(
-                    scoped_source_resolution.get(code)
-                    if isinstance(scoped_source_resolution.get(code), Mapping)
+                    source_resolution.get(code)
+                    if isinstance(source_resolution.get(code), Mapping)
                     else None
                 )
                 if not suitable:
