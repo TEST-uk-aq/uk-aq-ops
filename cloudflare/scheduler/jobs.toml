@@ -34,6 +34,16 @@ github_ref = "main"
 dry_run = false
 notes = "Standalone chart metrics cleanup and daily refresh"
 
+[jobs.uk_aq_supabase_db_dump_backup]
+enabled = true
+cron_expr = "55 0 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_supabase_db_dump_backup.yml"
+github_ref = "main"
+dry_run = false
+notes = "Supabase logical database dumps to Dropbox"
+
 [jobs.uk_aq_r2_core_snapshot]
 enabled = true
 cron_expr = "15 4 * * *"
