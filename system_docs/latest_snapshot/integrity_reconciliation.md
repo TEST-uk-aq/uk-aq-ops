@@ -43,14 +43,47 @@ The reconciliation operation must run inside the existing Latest Snapshot Cloud 
 
 The service must expose one authenticated internal POST operation for Integrity reconciliation.
 
-The exact route name is implementation-owned, but it must:
+The current implementation route is:
+
+```text
+POST /internal/integrity-reconcile
+```
+
+It must:
 
 - be accepted only by the Latest Snapshot service;
 - not be exposed through the public R2 API Worker;
 - not be exposed through the website cache API;
-- require the established private service authentication model or a narrower equivalent;
+- require Cloud Run IAM authentication or a narrower approved equivalent;
 - reject unauthenticated or malformed requests;
 - identify the trigger mode as Integrity reconciliation in structured logs and build metadata where compatible.
+
+## Caller authentication contract
+
+The request must carry a Google-signed identity token accepted by the private Cloud Run service.
+
+The token audience must be exactly the configured Cloud Run service origin URL. It must not include the reconciliation route path.
+
+For local or operator-run Integrity using service-account impersonation:
+
+- the authenticated base principal must hold `roles/iam.serviceAccountTokenCreator` on the configured caller service account;
+- the caller service account must hold `roles/run.invoker` on the Latest Snapshot Cloud Run service;
+- token generation must explicitly select the configured impersonated service account when requesting an audience-specific identity token;
+- the configured service audience must always be supplied;
+- failure to obtain that audience-specific impersonated token must block Latest Snapshot reconciliation.
+
+For the `gcloud auth print-identity-token` implementation, service-account impersonation must be supplied through the explicit `--impersonate-service-account` command flag when `--audiences` is used. A configured base account may also be supplied explicitly where the workstation has several authenticated accounts.
+
+The Integrity client must not fall back to:
+
+- a token for the active user account;
+- a token without the configured Cloud Run audience;
+- an empty token after a failed command;
+- unauthenticated invocation.
+
+Such a fallback is not equivalent authentication and must be reported as reconciliation failure.
+
+Native service-account runtimes may use their established credential path, provided the resulting token has the same service audience and IAM-authorised caller identity.
 
 ## Request contract
 
@@ -344,7 +377,19 @@ Do not add a broad speculative pre-implementation test suite.
 
 ## Implementation status
 
-Approved for CIC-Test implementation as of 29 July 2026. The private service interface and runtime changes are pending.
+Implemented and deployed in CIC-Test on 29 July 2026:
+
+- private `POST /internal/integrity-reconcile` route;
+- Cloud Run IAM authentication with the TEST operations service account as an authorised invoker;
+- bounded request validation;
+- owner-service state, product and manifest reconciliation;
+- deterministic same-timestamp correction and retry behaviour.
+
+An authenticated empty-candidate request using an audience-specific identity token from the impersonated TEST operations service account returned HTTP `200`, reported `product_success_count=3`, `product_failure_count=0`, `changed_product_count=0`, and preserved all three unchanged products.
+
+The Integrity client token-acquisition helper still requires correction so local operator runs explicitly pass the impersonated service account with the configured service audience and fail closed instead of falling back to an audience-less token.
+
+Repair-bearing, idempotent-repeat and older-range operational validation remain pending.
 
 ## Related decision
 
