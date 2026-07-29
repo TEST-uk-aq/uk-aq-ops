@@ -16,8 +16,8 @@ The public entrypoints remain:
 
 - `integrity/repair/decisions.py`: authoritative pure observation repair decision, including scope grain, source-evidence requirement, explicit pollutant permission, AQI policy and fail-closed executability.
 - `integrity/current_state/auth.py`: URL/audience validation, the sole identity-token command builder, bounded token acquisition and capability preflight.
-- `integrity/current_state/audit.py`: deterministic candidate identities, candidate persistence and independent target-attempt audit.
-- `integrity/current_state/resume.py`: environment/scope/evidence/supersession proof and failed-target-only selection.
+- `integrity/current_state/audit.py`: additive SQLite migration, immutable candidate/final-verification evidence, and append-only independent target attempts written before each side effect.
+- `integrity/current_state/resume.py`: environment, selected-scope, final-R2 evidence and supersession proof plus strict failed/pending target selection.
 - `integrity/cli.py`: additive resume CLI composition and validation.
 - `integrity/runtime.py`: explicit coordinator stage order.
 - `uk-aq-history-integrity_impl.py`: compatibility exports and established orchestration, delegating the extracted policy and recovery owners.
@@ -42,6 +42,8 @@ The pre-change `run_job.ts` is preserved at `archive/2026-07-29/workers/uk_aq_ba
 - Every exact or wildcard destructive observation repair requires non-empty `--repair-pollutants`. Exact scope cannot widen; O3 remains observation-only for AQI and Latest Snapshot.
 - Real PM2.5/PM10/NO2-capable repairs with current-state reconciliation enabled acquire and discard an audience-specific identity token after proposal validation and before canonical mutation. A failure blocks canonical apply. Dry-run validates shape only. The final owner-service request acquires a new token.
 - Timeseries and Latest Snapshot outcomes are persisted independently. One target failure does not overwrite the other target's success.
+- Durable target statuses are `pending`, `running`, `succeeded`, `failed_retryable`, `failed_terminal`, `blocked_dependency`, `skipped_not_applicable` and `superseded`. Existing public report fields retain their compatible `ok`/`failed` values; `target_audit_statuses` exposes the more precise durable status additively.
+- A target attempt is committed as `running` before its RPC or Cloud Run call. Completion updates only that attempt; later retries append linked attempts. A process-interrupted `running` attempt becomes `failed_retryable` after the normal environment lock is reacquired.
 - Resume CLI:
 
   ```text
@@ -53,12 +55,14 @@ The pre-change `run_job.ts` is preserved at `archive/2026-07-29/workers/uk_aq_ba
 
 ## SQLite additions
 
-`open_db` creates two additive local audit tables:
+`open_db` creates and additively migrates two local audit tables:
 
-- `current_state_candidate_sets`: target-specific canonical candidate JSON, SHA-256 identity, count and linked final-verification identity.
-- `current_state_target_attempts`: linked attempts with target, attempt number, invocation kind, status, retryability class, bounded error, counts and source Integrity run.
+- `current_state_candidate_sets`: environment, target-specific canonical candidate JSON, SHA-256 identity, count, timestamp bounds, immutable selected-scope evidence, complete final-verification evidence and identity, and optional superseding run.
+- `current_state_target_attempts`: source Integrity run, environment, target, linked attempt and attempt number, invocation kind, durable status, explicit retryability, candidate identity/count/bounds, final-verification identity, outcome counts, bounded error and start/finish timestamps.
 
-For a verified run produced before these tables existed, resume reconstructs candidates from immutable `source_connector_day_evidence` and the verified object-operation scope. It fails closed if the run, environment, R2 verification flags, source evidence, candidate hash or supersession proof is inconsistent.
+Candidate rows are immutable once persisted; a changed candidate, selected scope or final-verification payload for the same run/target fails closed. For a verified run produced before these tables existed, resume reconstructs candidates from `source_connector_day_evidence` only when every historical row for a connector/day has one unambiguous canonical identity, and links that evidence to the verified object-operation scope. It fails closed if the run, environment, R2 verification flags, source evidence, candidate hash, selected scope, final-verification identity or supersession proof is inconsistent.
+
+`failed` and `all` retry only `failed_retryable` or `pending` targets. Explicit `timeseries` and `latest_snapshot` use the same eligibility rule. Successful and not-applicable targets are proven and skipped without invocation; terminal, blocked and superseded targets are not retried. The repository runner's existing per-environment lock covers both normal Integrity and current-state resume.
 
 ## Preserved contracts
 
@@ -71,7 +75,8 @@ No change was made to R2 keys or retention, Parquet schemas or ordering, manifes
 - Existing focused preflight checks.
 - Focused identity-token configuration and command checks.
 - Focused connector-missing and exact-pollutant decision/execution checks.
-- Focused independent target audit and failed-target selection check.
+- Focused independent target audit, append-only attempts, bounded errors, additive schema, all four selection modes, final-verification mismatch, failed-target-only execution and idempotent repeat checks.
+- The existing deterministic Latest Snapshot newer/older/equal/same-timestamp-correction state-transition check.
 - One existing canonical coordinator ordering check.
 - `deno check workers/uk_aq_backfill_local/run_job.ts`.
 - Import-direction and stale-policy searches.
@@ -94,12 +99,12 @@ Refresh the configured base account before the first authenticated operation:
 gcloud auth login info@ukaq.co.uk
 ```
 
-Resume the failed 24 July target using the original numeric run ID from its report:
+The retained 24 July report identifies Integrity run `229`. Confirm that ID in the dedicated machine's SQLite database, then resume its failed target:
 
 ```bash
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
   --env CIC-Test \
-  --resume-current-state-run-id <original-integrity-run-id>
+  --resume-current-state-run-id 229
 ```
 
 The default must select only `latest_snapshot` when Timeseries is already successful. Then perform the one scoped SOS repair and operational comparisons specified in the authoritative plan.
@@ -116,4 +121,4 @@ Record the exact resume CLI above, the two SQLite table names, the preflight sta
 
 ## Residual operational evidence
 
-The original 24 July numeric Integrity run ID and a complete source day for the real SOS validation are not stored in this checkout. The operator must supply them from the retained TEST report when running the post-deployment commands.
+The retained checkout report identifies run `229`, but the operator must confirm that it is the same row in the dedicated machine's active SQLite database before operational resume. A complete source day for a later real SOS validation remains an operator choice after deployment.

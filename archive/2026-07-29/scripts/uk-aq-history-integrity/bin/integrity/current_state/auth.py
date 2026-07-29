@@ -10,7 +10,6 @@ from urllib.parse import urlparse
 
 IDENTITY_TOKEN_TIMEOUT_SECONDS = 60
 PRIVATE_RECONCILIATION_PATH = "/internal/integrity-reconcile"
-LATEST_SNAPSHOT_POLLUTANTS = frozenset({"pm25", "pm10", "no2"})
 
 
 @dataclass(frozen=True)
@@ -20,26 +19,6 @@ class LatestSnapshotAuthConfig:
     timeout_seconds: int
     account: str | None
     impersonated_service_account: str | None
-
-
-def should_preflight_latest_snapshot_auth(
-    *,
-    current_state_enabled: bool,
-    selected_pollutants: set[str] | frozenset[str],
-    canonical_mutation_planned: bool,
-    proposals_validated: bool,
-    check_only: bool,
-    dry_run: bool,
-) -> bool:
-    """Return whether a real mutation must prove token capability first."""
-    return bool(
-        current_state_enabled
-        and set(selected_pollutants) & LATEST_SNAPSHOT_POLLUTANTS
-        and canonical_mutation_planned
-        and proposals_validated
-        and not check_only
-        and not dry_run
-    )
 
 
 def validate_latest_snapshot_auth_config(

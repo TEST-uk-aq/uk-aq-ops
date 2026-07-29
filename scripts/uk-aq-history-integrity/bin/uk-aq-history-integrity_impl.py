@@ -66,15 +66,18 @@ from integrity.repair import (
 from integrity.current_state.auth import (
     acquire_identity_token,
     preflight_latest_snapshot_auth,
+    should_preflight_latest_snapshot_auth,
     validate_latest_snapshot_auth_config,
 )
 from integrity.current_state.audit import (
     ensure_audit_schema,
+    finish_target_attempt,
     identity_sha256,
     latest_target_attempt,
     load_candidate_set,
     persist_candidate_set,
     record_target_attempt,
+    start_target_attempt,
 )
 from integrity.current_state.resume import (
     parse_integrity_run_id,
@@ -20599,6 +20602,7 @@ def _current_state_candidates_from_verified_evidence(
     conn: sqlite3.Connection,
     env_name: str,
     scope_entries: Iterable[Mapping[str, Any]],
+    require_unambiguous_history: bool = False,
 ) -> dict[str, Any]:
     """Derive current-state inputs only from immutable verified source rows."""
     scopes = sorted({
@@ -20616,23 +20620,30 @@ def _current_state_candidates_from_verified_evidence(
     for day_utc, connector_id in scopes:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc) or connector_id <= 0:
             raise ValueError("verified current-state scope is invalid")
-        evidence_row = conn.execute(
+        evidence_rows = conn.execute(
             """
-            SELECT canonical_rows_json
+            SELECT canonical_rows_json, canonical_rows_sha256
             FROM source_connector_day_evidence
             WHERE env_name = ? AND day_utc = ? AND connector_id = ?
             ORDER BY id DESC
-            LIMIT 1
             """,
             (env_name, day_utc, connector_id),
-        ).fetchone()
-        if evidence_row is None:
+        ).fetchall()
+        if not evidence_rows:
             missing_evidence.append({
                 "day_utc": day_utc,
                 "connector_id": connector_id,
                 "reason": "immutable_canonical_source_evidence_unavailable",
             })
             continue
+        if require_unambiguous_history and len({
+            str(row[1]) for row in evidence_rows
+        }) != 1:
+            raise RuntimeError(
+                "legacy current-state source evidence is ambiguous for "
+                f"day={day_utc} connector_id={connector_id}"
+            )
+        evidence_row = evidence_rows[0]
         rows = json.loads(str(evidence_row[0] or "[]"))
         if not isinstance(rows, list):
             raise ValueError("verified current-state canonical rows are invalid")
@@ -20818,10 +20829,23 @@ def run_current_state_reconciliation(
     ):
         raise RuntimeError("current-state target selection is invalid")
     if candidate_sets is None:
+        selected_scope = {
+            "scopes": sorted({
+                (
+                    str(entry.get("day_utc") or "").strip(),
+                    int(entry.get("connector_id") or 0),
+                )
+                for entry in scope_entries
+                if isinstance(entry, Mapping)
+            })
+        }
         derived = _current_state_candidates_from_verified_evidence(
             conn=conn,
             env_name=env_name,
-            scope_entries=scope_entries,
+            scope_entries=[
+                {"day_utc": day_utc, "connector_id": connector_id}
+                for day_utc, connector_id in selected_scope["scopes"]
+            ],
         )
         raw_candidates = list(derived["raw_candidates"])
         snapshot_candidates = list(derived["latest_snapshot_candidates"])
@@ -20833,10 +20857,17 @@ def run_current_state_reconciliation(
             (candidate_sets.get("latest_snapshot") or {}).get("candidates") or []
         )
         derived = {
-            "candidate_observed_at_min": None,
-            "candidate_observed_at_max": None,
+            "candidate_observed_at_min": (
+                candidate_sets.get("timeseries") or {}
+            ).get("candidate_observed_at_min"),
+            "candidate_observed_at_max": (
+                candidate_sets.get("timeseries") or {}
+            ).get("candidate_observed_at_max"),
             "missing_evidence": [],
         }
+        selected_scope = dict(
+            (candidate_sets.get("timeseries") or {}).get("selected_scope") or {}
+        )
     try:
         audit_run_id = int(str(integrity_run_id).rsplit(":", 1)[-1])
     except ValueError as exc:
@@ -20868,11 +20899,23 @@ def run_current_state_reconciliation(
             "timeseries": persist_candidate_set(
                 conn, integrity_run_id=audit_run_id, target="timeseries",
                 candidates=raw_candidates, final_verification=final_verification,
+                env_name=env_name, selected_scope=selected_scope,
             ),
             "latest_snapshot": persist_candidate_set(
                 conn, integrity_run_id=audit_run_id, target="latest_snapshot",
                 candidates=snapshot_candidates, final_verification=final_verification,
+                env_name=env_name, selected_scope=selected_scope,
             ),
+        }
+    )
+    candidate_audit_evidence = (
+        candidate_sets
+        if candidate_sets is not None
+        else {
+            target: load_candidate_set(
+                conn, integrity_run_id=audit_run_id, target=target
+            )
+            for target in ("timeseries", "latest_snapshot")
         }
     )
     result["candidate_identities"] = candidate_identities
@@ -20881,6 +20924,7 @@ def run_current_state_reconciliation(
         if candidate_sets is not None
         else identity_sha256(dict(final_verification))
     )
+    result["target_audit_statuses"] = {}
     if dry_run:
         result["timeseries_reconciliation_status"] = "planned"
         result["latest_snapshot_reconciliation_status"] = "planned"
@@ -20905,9 +20949,46 @@ def run_current_state_reconciliation(
         )
     }
     timeseries_error: str | None = None
+    result["target_attempts"] = {}
     if "timeseries" not in target_selection:
         result["timeseries_reconciliation_status"] = "skipped_not_selected"
+    elif not raw_candidates:
+        result["timeseries_reconciliation_status"] = "skipped_not_applicable"
+        result["target_attempts"]["timeseries"] = record_target_attempt(
+            conn, integrity_run_id=audit_run_id, env_name=env_name,
+            target="timeseries", invocation_kind=invocation_kind,
+            status="skipped_not_applicable",
+            candidate_identity_sha256=candidate_identities["timeseries"],
+            candidate_count=0, outcome_counts=timeseries_summary,
+            candidate_observed_at_min=candidate_audit_evidence[
+                "timeseries"
+            ].get("candidate_observed_at_min"),
+            candidate_observed_at_max=candidate_audit_evidence[
+                "timeseries"
+            ].get("candidate_observed_at_max"),
+            final_verification_identity_sha256=result[
+                "final_verification_identity_sha256"
+            ],
+        )
+        result["target_audit_statuses"]["timeseries"] = (
+            "skipped_not_applicable"
+        )
     else:
+        timeseries_attempt = start_target_attempt(
+            conn, integrity_run_id=audit_run_id, env_name=env_name,
+            target="timeseries", invocation_kind=invocation_kind,
+            candidate_identity_sha256=candidate_identities["timeseries"],
+            candidate_count=len(raw_candidates),
+            candidate_observed_at_min=candidate_audit_evidence[
+                "timeseries"
+            ].get("candidate_observed_at_min"),
+            candidate_observed_at_max=candidate_audit_evidence[
+                "timeseries"
+            ].get("candidate_observed_at_max"),
+            final_verification_identity_sha256=result[
+                "final_verification_identity_sha256"
+            ],
+        )
         try:
             for offset in range(0, len(raw_candidates), CURRENT_STATE_TIMESERIES_CHUNK_SIZE):
                 chunk = raw_candidates[offset:offset + CURRENT_STATE_TIMESERIES_CHUNK_SIZE]
@@ -20951,108 +21032,160 @@ def run_current_state_reconciliation(
             timeseries_error = str(exc)
             result["timeseries_reconciliation_status"] = "failed"
             result["failures"].append(f"timeseries reconciliation failed: {exc}")
+        timeseries_audit_status = (
+            "succeeded"
+            if result["timeseries_reconciliation_status"] == "ok"
+            else "failed_terminal"
+            if int(timeseries_summary.get("missing_timeseries_count") or 0) > 0
+            else "failed_retryable"
+        )
+        result["target_attempts"]["timeseries"] = finish_target_attempt(
+            conn, attempt_id=int(timeseries_attempt["attempt_id"]),
+            status=timeseries_audit_status,
+            outcome_counts=result.get("timeseries") or timeseries_summary,
+            error=timeseries_error,
+        )
+        result["target_audit_statuses"]["timeseries"] = timeseries_audit_status
 
     latest_calls: list[dict[str, Any]] = []
     aggregate_latest = Counter()
     latest_failed = False
     latest_error: str | None = None
-    try:
-        if "latest_snapshot" not in target_selection:
-            result["latest_snapshot_reconciliation_status"] = "skipped_not_selected"
-            raise StopIteration
-        reconcile_url = str(settings.get(
-            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_URL", ""
-        )).strip()
-        audience = str(settings.get(
-            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_AUDIENCE", ""
-        )).strip()
-        timeout_seconds = int(str(settings.get(
-            "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_TIMEOUT_SECONDS", "300"
-        )))
-        for offset in range(0, len(snapshot_candidates), CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE):
-            chunk = snapshot_candidates[
-                offset:offset + CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE
-            ]
-            response = _post_cloud_run_reconciliation(
-                url=reconcile_url,
-                audience=audience,
-                timeout_seconds=timeout_seconds,
-                settings=settings,
-                body={
-                    "schema_version": 1,
-                    "integrity_run_id": integrity_run_id,
-                    "candidates": chunk,
-                },
-            )
-            latest_calls.append(dict(response))
-            for key in (
-                "candidate_count", "eligible_count", "applied_new_count",
-                "applied_newer_count",
-                "applied_same_timestamp_correction_count",
-                "skipped_equal_count", "skipped_older_count",
-                "skipped_invalid_current_value_count",
-                "skipped_unsupported_pollutant_count",
-                "skipped_metadata_unresolved_count", "changed_product_count",
-                "skipped_unchanged_product_count",
-            ):
-                aggregate_latest[key] += int(response.get(key) or 0)
-            if response.get("ok") is not True:
-                latest_failed = True
-                latest_error = str(
-                    response.get("error")
-                    or response.get("message")
-                    or "Latest Snapshot owner service returned ok=false"
-                )
-        result["latest_snapshot"] = {
-            **dict(aggregate_latest),
-            "call_count": len(latest_calls),
-            "state_changed": any(bool(call.get("state_changed")) for call in latest_calls),
-            "last_product_success_count": int(latest_calls[-1].get("product_success_count") or 0) if latest_calls else 0,
-            "last_product_failure_count": int(latest_calls[-1].get("product_failure_count") or 0) if latest_calls else 0,
-            "manifest_key": latest_calls[-1].get("manifest_key") if latest_calls else None,
-            "call_results_sample": latest_calls[:CURRENT_STATE_REPORT_CALL_LIMIT],
-            "call_results_truncated": max(0, len(latest_calls) - CURRENT_STATE_REPORT_CALL_LIMIT),
-        }
-        result["latest_snapshot_reconciliation_status"] = (
-            "failed" if latest_failed else "ok"
-        )
-    except StopIteration:
-        pass
-    except Exception as exc:
-        latest_error = str(exc)
-        result["latest_snapshot_reconciliation_status"] = "failed"
-        result["failures"].append(f"Latest Snapshot reconciliation failed: {exc}")
-
-    result["target_attempts"] = {}
-    if "timeseries" in target_selection:
-        result["target_attempts"]["timeseries"] = record_target_attempt(
-            conn, integrity_run_id=audit_run_id, env_name=env_name,
-            target="timeseries", invocation_kind=invocation_kind,
-            status=str(result["timeseries_reconciliation_status"]),
-            candidate_identity_sha256=candidate_identities["timeseries"],
-            candidate_count=len(raw_candidates),
-            outcome_counts=result.get("timeseries") or {}, error=timeseries_error,
-            failure_class=(
-                "terminal"
-                if int((result.get("timeseries") or {}).get(
-                    "missing_timeseries_count"
-                ) or 0) > 0
-                else None
-            ),
-        )
-    if "latest_snapshot" in target_selection:
+    if "latest_snapshot" not in target_selection:
+        result["latest_snapshot_reconciliation_status"] = "skipped_not_selected"
+    elif not snapshot_candidates:
+        result["latest_snapshot_reconciliation_status"] = "skipped_not_applicable"
         result["target_attempts"]["latest_snapshot"] = record_target_attempt(
             conn, integrity_run_id=audit_run_id, env_name=env_name,
             target="latest_snapshot", invocation_kind=invocation_kind,
-            status=str(result["latest_snapshot_reconciliation_status"]),
+            status="skipped_not_applicable",
+            candidate_identity_sha256=candidate_identities["latest_snapshot"],
+            candidate_count=0, outcome_counts={},
+            candidate_observed_at_min=candidate_audit_evidence[
+                "latest_snapshot"
+            ].get("candidate_observed_at_min"),
+            candidate_observed_at_max=candidate_audit_evidence[
+                "latest_snapshot"
+            ].get("candidate_observed_at_max"),
+            final_verification_identity_sha256=result[
+                "final_verification_identity_sha256"
+            ],
+        )
+        result["target_audit_statuses"]["latest_snapshot"] = (
+            "skipped_not_applicable"
+        )
+    else:
+        latest_attempt = start_target_attempt(
+            conn, integrity_run_id=audit_run_id, env_name=env_name,
+            target="latest_snapshot", invocation_kind=invocation_kind,
             candidate_identity_sha256=candidate_identities["latest_snapshot"],
             candidate_count=len(snapshot_candidates),
-            outcome_counts=result.get("latest_snapshot") or {}, error=latest_error,
+            candidate_observed_at_min=candidate_audit_evidence[
+                "latest_snapshot"
+            ].get("candidate_observed_at_min"),
+            candidate_observed_at_max=candidate_audit_evidence[
+                "latest_snapshot"
+            ].get("candidate_observed_at_max"),
+            final_verification_identity_sha256=result[
+                "final_verification_identity_sha256"
+            ],
         )
+        try:
+            reconcile_url = str(settings.get(
+                "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_URL", ""
+            )).strip()
+            audience = str(settings.get(
+                "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_AUDIENCE", ""
+            )).strip()
+            timeout_seconds = int(str(settings.get(
+                "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_TIMEOUT_SECONDS", "300"
+            )))
+            for offset in range(
+                0, len(snapshot_candidates),
+                CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE,
+            ):
+                chunk = snapshot_candidates[
+                    offset:offset + CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE
+                ]
+                response = _post_cloud_run_reconciliation(
+                    url=reconcile_url,
+                    audience=audience,
+                    timeout_seconds=timeout_seconds,
+                    settings=settings,
+                    body={
+                        "schema_version": 1,
+                        "integrity_run_id": integrity_run_id,
+                        "candidates": chunk,
+                    },
+                )
+                latest_calls.append(dict(response))
+                for key in (
+                    "candidate_count", "eligible_count", "applied_new_count",
+                    "applied_newer_count",
+                    "applied_same_timestamp_correction_count",
+                    "skipped_equal_count", "skipped_older_count",
+                    "skipped_invalid_current_value_count",
+                    "skipped_unsupported_pollutant_count",
+                    "skipped_metadata_unresolved_count", "changed_product_count",
+                    "skipped_unchanged_product_count",
+                ):
+                    aggregate_latest[key] += int(response.get(key) or 0)
+                if response.get("ok") is not True:
+                    latest_failed = True
+                    latest_error = str(
+                        response.get("error")
+                        or response.get("message")
+                        or "Latest Snapshot owner service returned ok=false"
+                    )
+            result["latest_snapshot"] = {
+                **dict(aggregate_latest),
+                "call_count": len(latest_calls),
+                "state_changed": any(
+                    bool(call.get("state_changed")) for call in latest_calls
+                ),
+                "last_product_success_count": int(
+                    latest_calls[-1].get("product_success_count") or 0
+                ) if latest_calls else 0,
+                "last_product_failure_count": int(
+                    latest_calls[-1].get("product_failure_count") or 0
+                ) if latest_calls else 0,
+                "manifest_key": (
+                    latest_calls[-1].get("manifest_key") if latest_calls else None
+                ),
+                "call_results_sample": latest_calls[
+                    :CURRENT_STATE_REPORT_CALL_LIMIT
+                ],
+                "call_results_truncated": max(
+                    0, len(latest_calls) - CURRENT_STATE_REPORT_CALL_LIMIT
+                ),
+            }
+            result["latest_snapshot_reconciliation_status"] = (
+                "failed" if latest_failed else "ok"
+            )
+        except Exception as exc:
+            latest_error = str(exc)
+            result["latest_snapshot_reconciliation_status"] = "failed"
+            result["failures"].append(
+                f"Latest Snapshot reconciliation failed: {exc}"
+            )
+        latest_audit_status = (
+            "succeeded"
+            if result["latest_snapshot_reconciliation_status"] == "ok"
+            else "failed_retryable"
+        )
+        result["target_attempts"]["latest_snapshot"] = finish_target_attempt(
+            conn, attempt_id=int(latest_attempt["attempt_id"]),
+            status=latest_audit_status,
+            outcome_counts=result.get("latest_snapshot") or {},
+            error=latest_error,
+        )
+        result["target_audit_statuses"]["latest_snapshot"] = latest_audit_status
 
     result["overall_status"] = (
         "ok" if all(
-            result[f"{target}_reconciliation_status"] == "ok"
+            result[f"{target}_reconciliation_status"] in {
+                "ok", "skipped_not_applicable"
+            }
             for target in target_selection
         )
         else "failed"
@@ -21129,6 +21262,15 @@ def _seed_legacy_current_state_target_attempts(
             candidate_identity_sha256=candidate_set["candidate_identity_sha256"],
             candidate_count=candidate_set["candidate_count"],
             outcome_counts=(previous.get(target) or {}), error=target_error,
+            candidate_observed_at_min=candidate_set[
+                "candidate_observed_at_min"
+            ],
+            candidate_observed_at_max=candidate_set[
+                "candidate_observed_at_max"
+            ],
+            final_verification_identity_sha256=candidate_set[
+                "final_verification_identity_sha256"
+            ],
         )
 
 
@@ -21174,6 +21316,7 @@ def _materialize_legacy_current_state_candidate_sets(
             {"day_utc": day_utc, "connector_id": connector_id}
             for day_utc, connector_id in sorted(scopes)
         ],
+        require_unambiguous_history=True,
     )
     if derived["missing_evidence"]:
         raise RuntimeError(
@@ -21181,6 +21324,7 @@ def _materialize_legacy_current_state_candidate_sets(
         )
     verification_proof = {
         "status": "ok",
+        "remaining_gap_count": 0,
         "integrity_run_id": run_id,
         "verified_object_operations": [
             {
@@ -21194,11 +21338,19 @@ def _materialize_legacy_current_state_candidate_sets(
     persist_candidate_set(
         conn, integrity_run_id=run_id, target="timeseries",
         candidates=derived["raw_candidates"], final_verification=verification_proof,
+        env_name=env_name,
+        selected_scope={
+            "scopes": [list(scope) for scope in sorted(scopes)],
+        },
     )
     persist_candidate_set(
         conn, integrity_run_id=run_id, target="latest_snapshot",
         candidates=derived["latest_snapshot_candidates"],
         final_verification=verification_proof,
+        env_name=env_name,
+        selected_scope={
+            "scopes": [list(scope) for scope in sorted(scopes)],
+        },
     )
     current_row = conn.execute(
         "SELECT current_state_reconciliation_json FROM integrity_runs WHERE id=?",
@@ -21238,32 +21390,88 @@ def run_current_state_resume(
         conn, env_name=env_name, run_id=run_id,
         requested_target=requested_target,
     )
-    result = run_current_state_reconciliation(
-        conn=conn, env_name=env_name,
-        integrity_run_id=f"{env_name}:{run_id}", env=env,
-        scope_entries=(), dry_run=False, final_verification={"status": "ok"},
-        log=log, selected_targets=prepared["selected_targets"],
-        candidate_sets=prepared["candidate_sets"], invocation_kind="resume",
-    )
+    if prepared["selected_targets"]:
+        result = run_current_state_reconciliation(
+            conn=conn, env_name=env_name,
+            integrity_run_id=f"{env_name}:{run_id}", env=env,
+            scope_entries=(), dry_run=False, final_verification={"status": "ok"},
+            log=log, selected_targets=prepared["selected_targets"],
+            candidate_sets=prepared["candidate_sets"], invocation_kind="resume",
+        )
+    else:
+        result = {
+            "enabled": True,
+            "planned": False,
+            "attempted": False,
+            "dry_run": False,
+            "r2_history_status": "ok",
+            "timeseries_reconciliation_status": "not_run",
+            "latest_snapshot_reconciliation_status": "not_run",
+            "overall_status": "not_run",
+            "candidate_count": prepared["candidate_sets"]["timeseries"][
+                "candidate_count"
+            ],
+            "latest_snapshot_candidate_count": prepared["candidate_sets"][
+                "latest_snapshot"
+            ]["candidate_count"],
+            "target_audit_statuses": {},
+            "target_attempts": {},
+            "timeseries": {},
+            "latest_snapshot": {},
+            "warnings": [],
+            "failures": [],
+        }
+    audit_to_public = {
+        "succeeded": "ok",
+        "failed_retryable": "failed",
+        "failed_terminal": "failed",
+        "pending": "pending",
+        "running": "failed",
+        "blocked_dependency": "blocked_dependency",
+        "skipped_not_applicable": "skipped_not_applicable",
+        "superseded": "superseded",
+    }
     for target in {"timeseries", "latest_snapshot"} - set(prepared["selected_targets"]):
         previous = prepared["previous_attempts"].get(target)
         result[f"{target}_reconciliation_status"] = (
-            str(previous.get("status")) if previous else "not_run"
+            audit_to_public.get(str(previous.get("status")), "not_run")
+            if previous else "not_run"
         )
         if previous:
             result[target] = dict(previous.get("outcome_counts") or {})
+            result["target_audit_statuses"][target] = str(
+                previous.get("status")
+            )
+    successful_public_statuses = {"ok", "skipped_not_applicable"}
     result["overall_status"] = (
-        "ok" if result["timeseries_reconciliation_status"] == "ok"
-        and result["latest_snapshot_reconciliation_status"] == "ok"
+        "ok" if result["timeseries_reconciliation_status"]
+        in successful_public_statuses
+        and result["latest_snapshot_reconciliation_status"]
+        in successful_public_statuses
         else "partial" if "ok" in {
             result["timeseries_reconciliation_status"],
             result["latest_snapshot_reconciliation_status"],
         } else "failed"
     )
+    selected_succeeded = all(
+        str(result["target_audit_statuses"].get(target))
+        in {"succeeded", "skipped_not_applicable"}
+        for target in prepared["selected_targets"]
+    )
+    result["resume_operation_status"] = (
+        "ok"
+        if selected_succeeded
+        and (
+            requested_target in {"timeseries", "latest_snapshot"}
+            or result["overall_status"] == "ok"
+        )
+        else "failed"
+    )
     result["resume"] = {
         "source_integrity_run_id": run_id,
         "requested_target": requested_target,
         "selected_targets": prepared["selected_targets"],
+        "already_satisfied_targets": prepared["already_satisfied_targets"],
         "scope": prepared["scope"],
         "repeated_source_or_r2_stages": False,
     }
@@ -22017,20 +22225,29 @@ def run_v2_integrity_repair_flow(
         "UK_AQ_INTEGRITY_CURRENT_STATE_RECONCILIATION_ENABLED"
     ))
     auth_preflight: dict[str, Any] = {
-        "required": bool(
-            current_state_enabled
-            and latest_snapshot_capable
-            and has_planned_r2_operations
+        "required": should_preflight_latest_snapshot_auth(
+            current_state_enabled=current_state_enabled,
+            selected_pollutants=proposed_observation_pollutants,
+            canonical_mutation_planned=has_planned_r2_operations,
+            proposals_validated=not proposal_failed,
+            check_only=False,
+            dry_run=dry_run,
         ),
         "attempted": False,
         "status": "skipped_not_required",
         "token_retained": False,
     }
-    if auth_preflight["required"] and not proposal_failed:
+    validate_auth_shape = bool(
+        current_state_enabled
+        and latest_snapshot_capable
+        and has_planned_r2_operations
+        and not proposal_failed
+    )
+    if validate_auth_shape:
         try:
             config = validate_latest_snapshot_auth_config(auth_settings)
             auth_preflight["audience"] = config.audience
-            if dry_run:
+            if not auth_preflight["required"]:
                 auth_preflight["status"] = "configuration_valid"
             else:
                 auth_preflight = preflight_latest_snapshot_auth(auth_settings)
@@ -24453,6 +24670,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- Timeseries status: {current_state.get('timeseries_reconciliation_status') or '(none)'}",
                 f"- Latest Snapshot status: {current_state.get('latest_snapshot_reconciliation_status') or '(none)'}",
                 f"- Overall status: {current_state.get('overall_status') or '(none)'}",
+                f"- Durable target statuses: {json.dumps(current_state.get('target_audit_statuses') or {}, sort_keys=True)}",
                 f"- Raw latest candidates: {int(current_state.get('candidate_count') or 0)}",
                 f"- Latest Snapshot source rows: {int(current_state.get('latest_snapshot_candidate_count') or 0)}",
                 f"- Candidate range: {current_state.get('candidate_observed_at_min') or '(none)'} to {current_state.get('candidate_observed_at_max') or '(none)'}",
@@ -24461,16 +24679,30 @@ def format_summary_md(s: dict[str, Any]) -> str:
     reported_current_state = s.get("current_state_reconciliation") or {}
     if reported_current_state and not repair_flow.get("current_state_reconciliation"):
         lines.extend([
-            "## Current-state reconciliation plan",
+            "## Current-state reconciliation",
             "",
             f"- Enabled: {bool(reported_current_state.get('enabled'))}",
             f"- Planned: {bool(reported_current_state.get('planned'))}",
             f"- Attempted: {bool(reported_current_state.get('attempted'))}",
+            f"- R2 history status: {reported_current_state.get('r2_history_status') or '(none)'}",
+            f"- Timeseries status: {reported_current_state.get('timeseries_reconciliation_status') or '(none)'}",
+            f"- Latest Snapshot status: {reported_current_state.get('latest_snapshot_reconciliation_status') or '(none)'}",
             f"- Overall status: {reported_current_state.get('overall_status') or '(none)'}",
+            f"- Durable target statuses: {json.dumps(reported_current_state.get('target_audit_statuses') or {}, sort_keys=True)}",
             f"- Raw latest candidates: {int(reported_current_state.get('candidate_count') or 0)}",
             f"- Latest Snapshot source rows: {int(reported_current_state.get('latest_snapshot_candidate_count') or 0)}",
             "",
         ])
+        resume = reported_current_state.get("resume") or {}
+        if resume:
+            lines.extend([
+                f"- Resume source Integrity run: {resume.get('source_integrity_run_id') or '(none)'}",
+                f"- Resume requested target: {resume.get('requested_target') or '(none)'}",
+                f"- Resume selected targets: {','.join(resume.get('selected_targets') or []) or '(none)'}",
+                f"- Resume already satisfied targets: {','.join(resume.get('already_satisfied_targets') or []) or '(none)'}",
+                f"- Repeated source or R2 stages: {bool(resume.get('repeated_source_or_r2_stages'))}",
+                "",
+            ])
     lookup_counts = s.get("lookup_source_counts") or {}
     if lookup_counts:
         lines.extend([
@@ -25109,7 +25341,9 @@ def main(argv: list[str]) -> int:
                 "started_at_utc": started_iso,
                 "finished_at_utc": fmt_iso(utc_now()),
                 "status": (
-                    "ok" if resume_result.get("overall_status") == "ok" else "failed"
+                    "ok"
+                    if resume_result.get("resume_operation_status") == "ok"
+                    else "failed"
                 ),
                 "effective_mode": "current_state_resume",
                 "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
