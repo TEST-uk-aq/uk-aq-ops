@@ -31,7 +31,23 @@ Integrity must reconcile those derived records without:
 - moving current state backwards;
 - bypassing Latest Snapshot eligibility or metadata rules;
 - writing Latest Snapshot objects directly;
-- repeating successful R2 repair stages solely because a later current-state target failed.
+- making a failed downstream target look like an R2 repair failure.
+
+## Operational recovery rule
+
+Integrity runs are immutable operational records and are not resumed.
+
+After correcting a failure, the operator starts a new appropriately scoped Integrity operation. The new run uses current source evidence, mappings, configuration, authentication and R2 state.
+
+Normal repair and current-state reconciliation must remain idempotent or monotonic so that a new run:
+
+- skips already-correct canonical R2 objects;
+- does not move timeseries current state backwards;
+- does not move Latest Snapshot state backwards;
+- treats identical same-timestamp content as a no-op;
+- may apply one final verified same-timestamp correction when canonical content differs.
+
+There is no supported CLI or hidden entrypoint for replaying candidates from an earlier Integrity run. Failed runs remain unchanged as historical audit evidence.
 
 ## State ownership
 
@@ -169,6 +185,8 @@ For a real repair run, Integrity must perform an authentication capability prefl
 
 - current-state reconciliation is enabled;
 - the selected repair scope can produce PM2.5, PM10 or NO2 Latest Snapshot candidates;
+- canonical R2 mutation is genuinely planned;
+- proposal validation succeeded;
 - the Latest Snapshot target is enabled.
 
 The preflight must:
@@ -183,9 +201,9 @@ The preflight is a capability check, not reusable authentication state. The fina
 
 An O3-only run does not require Latest Snapshot authentication preflight.
 
-Check-only and dry-run validate configuration shape but must not require an interactive credential refresh or invoke a mutating target.
+Check-only and dry-run may validate configuration shape but must not require an interactive credential refresh or invoke a mutating target.
 
-A successful preflight cannot guarantee that credentials or IAM remain valid later. A final target failure must therefore remain safely resumable.
+A successful preflight cannot guarantee that credentials, IAM, network access or the owner service remain available later. A later target failure is recorded independently, and recovery is a new scoped Integrity run.
 
 ## Timeseries candidate and mutation contract
 
@@ -209,7 +227,7 @@ For an existing timeseries, the RPC atomically:
 
 1. updates when `last_value_at` is null;
 2. updates when the candidate is newer;
-3. corrects `last_value` when timestamp is equal but canonical value differs;
+3. corrects `last_value` when the timestamp is equal but canonical value differs;
 4. skips equal timestamp and value;
 5. skips an older candidate;
 6. returns deterministic outcome counts.
@@ -281,8 +299,8 @@ Failure of either target:
 - does not roll back verified R2 observation history;
 - does not roll back a successful update to the other target;
 - prevents full run success;
-- must be represented as a partial result rather than implying that earlier stages failed;
-- remains safely retryable.
+- must be represented without implying that earlier stages failed;
+- remains visible in the immutable run record.
 
 Reports must distinguish:
 
@@ -295,6 +313,8 @@ overall_status
 
 Correct verified R2 history remains successful even when `overall_status` is failed or partial because a current-state target failed.
 
+A later new scoped run may safely reconcile the same state again through normal monotonic and idempotent rules.
+
 ## Durable stage audit
 
 Integrity SQLite owns durable stage and target audit evidence.
@@ -303,50 +323,20 @@ For each reconciliation-capable run, persist at least:
 
 ```text
 integrity_run_id
-source run identifier
 selected connector and pollutant scope
 final-verification status and identity
-candidate derivation identity or deterministic candidate evidence
+candidate identity or deterministic candidate evidence
 timeseries target status and outcome counts
 Latest Snapshot target status and outcome counts
-attempt count per target
-retryable or terminal classification
-last bounded error
+bounded target errors
 started and finished timestamps
 ```
 
+Timeseries and Latest Snapshot target outcomes are recorded independently. A successful target remains recorded as successful when another target fails.
+
+Existing candidate-set or target-attempt tables may remain for historical compatibility. They must not provide an active replay or resume interface.
+
 Large candidate detail may remain in bounded SQLite tables or attachments rather than the normal Markdown report.
-
-A successful target must remain recorded as successful when another target fails.
-
-## Resume and retry contract
-
-Integrity must provide an operator-supported current-state resume path for an existing Integrity run.
-
-The default resume behaviour is to retry only failed or pending current-state targets. It must not repeat a successful target unless the operator explicitly requests it.
-
-Before resuming, Integrity must prove that:
-
-1. the referenced run exists;
-2. its selected scope and environment match the requested resume;
-3. final verified R2 evidence still exists and remains valid;
-4. candidate derivation can be reproduced deterministically or persisted candidate evidence is intact;
-5. the target has not been superseded by a newer successful reconciliation.
-
-When those checks pass, resume must not repeat:
-
-- source downloads;
-- source comparison;
-- observation or AQI proposal generation;
-- canonical R2 writes;
-- manifest or index repair;
-- successful current-state targets.
-
-A resume attempt must obtain fresh credentials and reapply normal monotonic and idempotency checks.
-
-If final verified R2 evidence cannot be established, resume fails closed and instructs the operator to run a new scoped Integrity operation.
-
-No permanent reconciliation receipt is required in R2. Integrity SQLite and normal reports own retry evidence.
 
 ## Check-only and dry-run
 
@@ -372,7 +362,7 @@ different final verified canonical content
   -> one correction may apply
 ```
 
-Retrying an already applied correction is a no-op. A later execution time alone must not cause rewrites.
+Repeating an already applied correction in a later new run is a no-op. A later execution time alone must not cause rewrites.
 
 An older candidate never replaces newer current state.
 
@@ -392,8 +382,6 @@ same-timestamp corrections
 older and equal candidates skipped
 missing identities
 preflight status
-attempt counts
-retryability
 warnings
 failures
 component statuses
@@ -401,64 +389,48 @@ component statuses
 
 Authentication failures must be identifiable separately from source, R2, RPC, owner-service application and product-build failures.
 
+A report-generation error must never mask the original Integrity failure. Early-failure summaries must use safe defaults for fields that may not yet be available.
+
 ## Line-chart relationship
 
 Current-state reconciliation is not required for station-history workers to read canonical R2 history when the sensor identity is known.
 
 Latest Snapshot reconciliation is required for discovery and map/list visibility where stale finite-window state could hide a sensor.
 
-This contract introduces no browser-side direct R2 fallback, SOS-specific chart path or duplicate IngestDB insert.
-
-## Explicit non-goals
-
-This work must not:
-
-- republish repaired observations through the raw observation topic;
-- insert repaired observations into IngestDB solely for chart availability;
-- change R2 history retention;
-- change Prune Daily deletion ownership;
-- add O3 to Latest Snapshot;
-- change AQI or WHO contracts;
-- create missing core identities;
-- rewrite connector checkpoints;
-- claim a successful source poll;
-- turn Integrity into a general current-data ingestion service.
+This contract introduces no browser-side direct R2 fallback.
 
 ## Validation model
 
-Before implementation, validate structural viability only, plus targeted deterministic checks that are genuinely required for:
+Before deployment, use only the smallest structural and targeted deterministic checks required to establish:
 
-- explicit repair-decision scope;
-- authentication preflight ordering before canonical mutation;
-- independent target status persistence;
-- failed-target-only resume;
-- idempotent and monotonic retry.
+- authentication command construction;
+- preflight ordering;
+- independent target status handling;
+- monotonic timeseries updates;
+- Latest Snapshot same-timestamp correction and idempotency;
+- failure reporting that preserves the original error.
 
-Do not create a broad speculative pre-deployment test suite.
+Functional validation occurs through real CIC-Test operations.
 
-Functional validation occurs after deployment through real CIC-Test operations:
+A representative successful operation must cover:
 
-1. refresh local Google credentials;
-2. run one recent scoped SOS repair;
-3. confirm authentication preflight succeeds before R2 mutation;
-4. confirm R2, timeseries and Latest Snapshot all advance as required;
-5. repeat the same scope and confirm no rewrites;
-6. force or safely simulate a target-only retry condition and confirm only the failed target resumes;
-7. run one older-range no-rollback operation;
-8. verify a repaired sensor through the normal website route.
+- a real supported-pollutant repair;
+- authentication preflight before canonical mutation;
+- final R2 verification;
+- timeseries reconciliation;
+- Latest Snapshot reconciliation;
+- a later new run that safely skips or no-ops already-correct state where applicable.
+
+Do not require replaying or resuming an earlier failed run.
 
 ## Implementation status
 
-As of 29 July 2026:
+Implemented and exercised in CIC-Test on 29 July 2026:
 
-- the timeseries reconciliation RPC is deployed in CIC-Test;
-- the private Latest Snapshot owner-service reconciliation route is deployed in CIC-Test;
-- explicit audience-specific impersonated token acquisition is implemented;
-- a real 24 July SOS repair successfully repaired and finally verified R2 observations and AQI history;
-- that operation successfully updated 522 timeseries freshness records;
-- its Latest Snapshot target failed because the local base-account `gcloud` credentials had expired;
-- authentication capability preflight, independent target resume and the modular ownership defined in `integrity_modularisation.md` remain to be implemented.
+- explicit audience-specific impersonated identity-token acquisition;
+- authentication capability preflight before canonical R2 mutation;
+- fresh token acquisition for the actual Latest Snapshot invocation;
+- independent Timeseries and Latest Snapshot outcome recording;
+- successful end-to-end SOS repair through final current-state reconciliation.
 
-## Contract-change rule
-
-Changes to current-state ownership, candidate derivation, authentication, preflight ordering, target retry semantics, monotonic ordering, Latest Snapshot identity or same-timestamp correction require coordinated updates to this document and the owning area contract.
+The attempted legacy run-resume path added disproportionate evidence-reconstruction complexity and was rejected as an operational requirement. Recovery is now a new appropriately scoped Integrity run.
