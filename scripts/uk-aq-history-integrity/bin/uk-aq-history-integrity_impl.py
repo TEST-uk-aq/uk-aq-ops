@@ -21291,7 +21291,8 @@ def _materialize_legacy_current_state_candidate_sets(
         """SELECT object_key, operation_kind, local_sha256, get_verified,
                   delete_verified
            FROM integrity_object_operations
-           WHERE run_id=? AND planned=1 ORDER BY object_key, operation_kind""",
+           WHERE run_id=? AND planned=1 AND domain='observations'
+           ORDER BY object_key, operation_kind""",
         (int(run_id),),
     ).fetchall()
     if not operation_rows:
