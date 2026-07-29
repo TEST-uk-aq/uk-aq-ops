@@ -20983,24 +20983,58 @@ def _current_state_candidates_from_verified_evidence(
 
 
 def _google_cloud_run_identity_token(audience: str) -> str:
-    command = ["gcloud", "auth", "print-identity-token", "--audiences", audience]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0 or not completed.stdout.strip():
+    resolved_audience = str(audience or "").strip()
+    if not resolved_audience:
+        raise RuntimeError(
+            "Google Cloud identity token audience is required for Latest Snapshot invocation"
+        )
+
+    command = ["gcloud", "auth", "print-identity-token"]
+    account = str(os.environ.get("CLOUDSDK_CORE_ACCOUNT") or "").strip()
+    if account:
+        command.append(f"--account={account}")
+    impersonated_service_account = str(
+        os.environ.get("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT") or ""
+    ).strip()
+    if impersonated_service_account:
+        command.append(
+            f"--impersonate-service-account={impersonated_service_account}"
+        )
+    command.append(f"--audiences={resolved_audience}")
+
+    try:
         completed = subprocess.run(
-            ["gcloud", "auth", "print-identity-token"],
+            command,
             capture_output=True,
             text=True,
             check=False,
         )
-    token = completed.stdout.strip() if completed.returncode == 0 else ""
-    if not token:
+    except OSError as exc:
+        detail = " ".join(str(exc).split())
+        if len(detail) > 500:
+            detail = detail[:497].rstrip() + "..."
+        suffix = f": {detail}" if detail else ""
         raise RuntimeError(
-            "Google Cloud identity token acquisition failed for Latest Snapshot invocation"
+            "Google Cloud identity token acquisition could not run gcloud"
+            f"{suffix}"
+        ) from exc
+
+    stderr = " ".join(str(completed.stderr or "").split())
+    if len(stderr) > 500:
+        stderr = stderr[:497].rstrip() + "..."
+    if completed.returncode != 0:
+        suffix = f": {stderr}" if stderr else ""
+        raise RuntimeError(
+            "Google Cloud identity token acquisition failed for Latest Snapshot "
+            f"invocation (gcloud exit {completed.returncode}){suffix}"
+        )
+
+    token = str(completed.stdout or "").strip()
+    if not token:
+        suffix = f": {stderr}" if stderr else ""
+        raise RuntimeError(
+            "Google Cloud identity token acquisition returned an empty token for "
+            f"Latest Snapshot invocation{suffix}"
         )
     return token
 
