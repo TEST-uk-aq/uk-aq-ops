@@ -18,8 +18,19 @@ import {
   resolveInsertSplitConfig,
   resolveOldestKeptDate,
   resolveRequestedDatabases,
+  runRequestedDatabaseBackups,
   splitLargeDataInsertsInFile,
 } from "../workers/uk_aq_supabase_db_dump_backup_service/core.mjs";
+
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 test("normalizeDropboxPath adds a leading slash and trims trailing slashes", () => {
   assert.equal(normalizeDropboxPath("CIC-Test/"), "/CIC-Test");
@@ -55,6 +66,135 @@ test("resolveRequestedDatabases rejects unsupported selections", () => {
   assert.throws(
     () => resolveRequestedDatabases("manual", "unknown_db"),
     /Unsupported database selection/,
+  );
+});
+
+test("requested database backups start together, wait for both, and retain canonical order", async () => {
+  const deferredByDatabase = {
+    ingestdb: createDeferred(),
+    obs_aqidb: createDeferred(),
+  };
+  const started = [];
+  let combinedSettled = false;
+
+  const combinedPromise = runRequestedDatabaseBackups({
+    databaseNames: ["ingestdb", "obs_aqidb"],
+    databaseRunner: (databaseName) => {
+      started.push(databaseName);
+      return deferredByDatabase[databaseName].promise;
+    },
+  });
+  combinedPromise.then(() => {
+    combinedSettled = true;
+  });
+
+  await Promise.resolve();
+  assert.deepEqual(started, ["ingestdb", "obs_aqidb"]);
+
+  deferredByDatabase.obs_aqidb.resolve({
+    database: "obs_aqidb",
+    ok: true,
+    dumps: [{ dump_kind: "roles" }],
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(combinedSettled, false);
+
+  deferredByDatabase.ingestdb.resolve({
+    database: "ingestdb",
+    ok: true,
+    dumps: [{ dump_kind: "roles" }],
+  });
+  const combined = await combinedPromise;
+
+  assert.equal(combined.ok, true);
+  assert.equal(combined.error, null);
+  assert.deepEqual(
+    combined.databases.map((entry) => entry.database),
+    ["ingestdb", "obs_aqidb"],
+  );
+});
+
+test("a failed database retains partial dumps and does not discard the other result", async () => {
+  const deferredByDatabase = {
+    ingestdb: createDeferred(),
+    obs_aqidb: createDeferred(),
+  };
+  const combinedPromise = runRequestedDatabaseBackups({
+    databaseNames: ["ingestdb", "obs_aqidb"],
+    databaseRunner: (databaseName) => deferredByDatabase[databaseName].promise,
+  });
+
+  await Promise.resolve();
+  deferredByDatabase.ingestdb.resolve({
+    database: "ingestdb",
+    ok: false,
+    dumps: [
+      { dump_kind: "roles" },
+      { dump_kind: "schema" },
+    ],
+    error: "data dump failed",
+  });
+  deferredByDatabase.obs_aqidb.resolve({
+    database: "obs_aqidb",
+    ok: true,
+    dumps: [
+      { dump_kind: "roles" },
+      { dump_kind: "schema" },
+      { dump_kind: "data" },
+      { dump_kind: "cron_jobs" },
+    ],
+  });
+
+  const combined = await combinedPromise;
+  assert.equal(combined.ok, false);
+  assert.equal(combined.error, "One or more database backups failed.");
+  assert.deepEqual(
+    combined.databases.map((entry) => [entry.database, entry.ok, entry.dumps.length]),
+    [
+      ["ingestdb", false, 2],
+      ["obs_aqidb", true, 4],
+    ],
+  );
+});
+
+test("an unexpected database rejection becomes a failed database result", async () => {
+  const failure = new Error("unexpected branch failure");
+  const combined = await runRequestedDatabaseBackups({
+    databaseNames: ["ingestdb", "obs_aqidb"],
+    databaseRunner: async (databaseName) => {
+      if (databaseName === "ingestdb") {
+        throw failure;
+      }
+      return { database: databaseName, ok: true, dumps: [] };
+    },
+  });
+
+  assert.equal(combined.ok, false);
+  assert.deepEqual(
+    combined.databases.map((entry) => entry.database),
+    ["ingestdb", "obs_aqidb"],
+  );
+  assert.equal(combined.databases[0].ok, false);
+  assert.equal(combined.databases[0].error, failure.message);
+  assert.equal(combined.databases[1].ok, true);
+});
+
+test("a single-database backup starts only the selected database", async () => {
+  const started = [];
+  const combined = await runRequestedDatabaseBackups({
+    databaseNames: ["obs_aqidb"],
+    databaseRunner: async (databaseName) => {
+      started.push(databaseName);
+      return { database: databaseName, ok: true, dumps: [] };
+    },
+  });
+
+  assert.deepEqual(started, ["obs_aqidb"]);
+  assert.equal(combined.ok, true);
+  assert.deepEqual(
+    combined.databases.map((entry) => entry.database),
+    ["obs_aqidb"],
   );
 });
 
