@@ -103,9 +103,9 @@ The preflight:
 
 The preflight does not call the mutating reconciliation route and does not retain a token for later use.
 
-The final request obtains a fresh identity token after final R2 verification. This protects against token expiry and credential changes between preflight and invocation.
+The final request obtains a fresh identity token after final R2 verification.
 
-A successful preflight does not convert a later IAM, network or service failure into success. The target remains independently retryable.
+A successful preflight does not convert a later IAM, network or service failure into success. The failed target remains visible in that immutable run, and recovery is a new scoped Integrity operation.
 
 O3-only repairs do not require this preflight because O3 is outside Latest Snapshot scope.
 
@@ -212,7 +212,7 @@ different final verified canonical content
   -> one correction may replace stale content
 ```
 
-Retrying the same correction is a no-op. A later execution time alone must not rewrite state.
+Repeating the same correction in a later new run is a no-op. A later execution time alone must not rewrite state.
 
 Normal Pub/Sub same-timestamp ordering remains unchanged unless a separate contract change explicitly unifies it.
 
@@ -283,25 +283,25 @@ warnings
 
 A partial product or manifest failure returns a non-successful operation result even when durable state already advanced.
 
-The response and structured logs make partial durable outcomes explicit so Integrity can retry safely.
+The response and structured logs make partial durable outcomes explicit.
 
-## Retry and resume behaviour
+## Recovery and idempotency
 
-The operation is idempotent.
+The owner operation is idempotent and monotonic.
 
-A retry after complete success, client timeout, state success followed by product failure, or a later normal scheduled build reloads current durable state and cannot move backwards.
+After any failed Integrity run, the operator corrects the cause and launches a new appropriately scoped Integrity operation. Integrity does not replay or resume the earlier run.
 
-When state is already correct but products or the manifest are stale, a retry may rebuild products without rewriting state.
+A later new run:
 
-Integrity owns the operator resume interface and target audit. The owner service does not require the observation repair, source scan or R2 apply stages to repeat before accepting the same final verified candidates.
+- obtains a fresh audience-specific token;
+- derives candidates again from current final verified evidence;
+- may safely send candidates already applied by an earlier partial attempt;
+- cannot move state backwards;
+- skips identical equal or older candidates;
+- may rebuild stale products without rewriting unchanged state;
+- records outcomes under the new Integrity run identifier.
 
-Every resumed invocation:
-
-- uses a fresh audience-specific token;
-- reuses the same stable `integrity_run_id` or records a linked retry attempt;
-- remains bounded and authenticated;
-- relies on monotonic and idempotent owner-service rules;
-- returns sufficient counts for Integrity to mark only this target successful.
+The owner service does not require a special replay protocol, candidate receipt or previous-run state.
 
 ## Failure behaviour
 
@@ -348,11 +348,12 @@ This interface must not:
 - change connector checkpoints;
 - create missing metadata identities;
 - expose a public mutation endpoint;
-- depend on local cache as durable authority.
+- depend on local cache as durable authority;
+- provide an old-run replay or resume interface.
 
 ## Validation model
 
-Before implementation, only targeted deterministic checks genuinely required for authentication command construction, preflight ordering, monotonic state transition, same-timestamp correction and idempotent retry are permitted.
+Before implementation, only targeted deterministic checks genuinely required for authentication command construction, preflight ordering, monotonic state transition, same-timestamp correction and idempotency are permitted.
 
 Do not add a broad speculative pre-deployment test suite.
 
@@ -360,25 +361,26 @@ After deployment, functional validation occurs through real CIC-Test operations:
 
 1. authenticated preflight before a real supported-pollutant repair;
 2. one reconciliation that advances state and products;
-3. one identical retry with no rewrite;
-4. one older candidate with no rollback;
-5. one failed-target-only resume;
-6. one normal scheduled Latest Snapshot run after reconciliation.
+3. one later new scoped run that safely skips equal or older state where applicable;
+4. one normal scheduled Latest Snapshot run after reconciliation.
+
+A failed earlier Integrity run is not resumed as part of validation.
 
 ## Implementation status
 
-Implemented and deployed in CIC-Test on 29 July 2026:
+Implemented and exercised in CIC-Test on 29 July 2026:
 
 - private `POST /internal/integrity-reconcile` route;
 - Cloud Run IAM authentication using the TEST operations service account;
 - bounded request validation;
 - owner-service state, product and manifest reconciliation;
-- deterministic same-timestamp correction and retry behaviour;
-- explicit audience-specific impersonated token acquisition in the Integrity helper.
+- deterministic same-timestamp correction and idempotent behaviour;
+- explicit audience-specific impersonated token acquisition;
+- authentication capability preflight before canonical R2 mutation;
+- fresh token acquisition for the final invocation;
+- a successful full SOS repair through Latest Snapshot state and product reconciliation.
 
-An authenticated empty-candidate call returned HTTP `200`, with three successful unchanged products.
-
-A real 24 July SOS repair later reached this target after successful R2 final verification and successful timeseries reconciliation, but the local base-account `gcloud` credentials had expired. The owner route was therefore not invoked. Authentication capability preflight and failed-target-only resume remain pending implementation.
+Operational recovery uses a new appropriately scoped Integrity run rather than replaying an earlier failed run.
 
 ## Related decision
 
