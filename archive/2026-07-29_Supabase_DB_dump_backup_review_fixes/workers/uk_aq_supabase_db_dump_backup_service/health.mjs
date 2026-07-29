@@ -8,7 +8,6 @@ import {
 export const DB_DUMP_HEALTH_TASK_KEY = "ops.supabase_db_dump_backup";
 export const DB_DUMP_HEALTH_SOURCE_REPO = "uk-aq-ops";
 export const DB_DUMP_HEALTH_SOURCE_WORKER = "uk_aq_supabase_db_dump_backup_service";
-const EXPECTED_DUMPS_PER_DATABASE = 4;
 
 export function compactDbDumpHealthSummary(report = {}) {
   const databases = Array.isArray(report.databases) ? report.databases : [];
@@ -18,9 +17,6 @@ export function compactDbDumpHealthSummary(report = {}) {
   );
   const successfulDatabases = databases.filter((entry) => entry.ok).length;
   const failedDatabases = databases.filter((entry) => !entry.ok).length;
-  const expectedDumpCount =
-    (report.requested_databases?.length || databases.length)
-    * EXPECTED_DUMPS_PER_DATABASE;
   const totalBytes = databases.reduce((dbTotal, entry) => {
     const dumps = Array.isArray(entry.dumps) ? entry.dumps : [];
     return dbTotal + dumps.reduce(
@@ -34,13 +30,23 @@ export function compactDbDumpHealthSummary(report = {}) {
   return {
     ok: report.ok,
     trigger_mode: report.trigger_mode,
-    databases_backed_up: databases
-      .filter((entry) => entry.ok)
-      .map((entry) => entry.database),
+    databases_backed_up: databases.map((entry) => entry.database),
     requested_databases: report.requested_databases,
     dump_count: dumpCount,
-    successful_dump_count: dumpCount,
-    failed_dump_count: Math.max(0, expectedDumpCount - dumpCount),
+    successful_dump_count: report.ok
+      ? dumpCount
+      : databases
+        .filter((entry) => entry.ok)
+        .reduce(
+          (total, entry) => total + (Array.isArray(entry.dumps) ? entry.dumps.length : 0),
+          0,
+        ),
+    failed_dump_count: report.ok
+      ? 0
+      : Math.max(
+        0,
+        (report.requested_databases?.length || databases.length) * 3 - dumpCount,
+      ),
     successful_database_count: successfulDatabases,
     failed_database_count: failedDatabases,
     bytes_written: totalBytes,

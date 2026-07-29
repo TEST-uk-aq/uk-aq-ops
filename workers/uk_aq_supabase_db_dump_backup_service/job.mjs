@@ -10,23 +10,25 @@ import { runBackupWithDailyTaskHealth } from "./health.mjs";
 
 export const JOB_NAME = "uk-aq-supabase-db-dump-backup";
 const DATABASE_ENV = "UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES";
+const TRIGGER_MODE_ENV = "UK_AQ_SUPABASE_DB_DUMP_TRIGGER_MODE";
+const ALLOWED_TRIGGER_MODES = new Set(["manual", "scheduler"]);
 
 export function resolveJobSelection(env = process.env) {
-  const rawSelection = String(env[DATABASE_ENV] || "").trim();
-  if (!rawSelection) {
-    return {
-      triggerMode: "scheduler",
-      requestedDatabases: resolveRequestedDatabases("scheduler"),
-    };
+  const triggerMode = String(env[TRIGGER_MODE_ENV] || "manual").trim();
+  if (!ALLOWED_TRIGGER_MODES.has(triggerMode)) {
+    throw new Error(`Unsupported trigger mode: ${triggerMode || "blank"}`);
   }
 
+  const rawSelection = String(env[DATABASE_ENV] || "").trim();
   const requested = rawSelection
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+    ? rawSelection
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+    : null;
 
   return {
-    triggerMode: "manual",
+    triggerMode,
     requestedDatabases: resolveRequestedDatabases("manual", requested),
   };
 }
