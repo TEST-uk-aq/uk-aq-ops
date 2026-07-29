@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """UK-AQ History Integrity entrypoint with durable progress checkpoints.
 
-The full implementation remains byte-identical in the sibling
-``uk-aq-history-integrity_impl.py`` file. It is executed in this module's
-namespace so the established command path, imports, monkeypatches and public
-symbols continue to behave as before.
+The implementation lives in the sibling ``uk-aq-history-integrity_impl.py``
+file. It is executed in this module's namespace so the established command
+path, imports, monkeypatches and public symbols continue to behave as before.
 """
 
 from pathlib import Path as _WrapperPath
