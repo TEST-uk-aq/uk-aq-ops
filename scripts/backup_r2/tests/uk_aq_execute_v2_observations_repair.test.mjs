@@ -9,6 +9,9 @@ import {
   buildHistoryV2ConnectorManifest,
   buildHistoryV2PollutantManifest,
 } from "../../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+import {
+  computeObservationContentHash,
+} from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 
 test("connector child discovery retains a valid unchanged O3 manifest", async () => {
   const prefix = "history/v2/observations/day_utc=2026-05-17/connector_id=1/pollutant_code=";
@@ -23,6 +26,16 @@ test("connector child discovery retains a valid unchanged O3 manifest", async ()
   const manifests = new Map(keys.map((key) => {
     const pollutantCode = key.match(/pollutant_code=([^/]+)/)?.[1];
     const partKey = key.replace("manifest.json", "part-00001.parquet");
+    const { canonical_rows: _canonicalRows, ...observationContentHash } =
+      computeObservationContentHash([{
+        connector_id: connectorId,
+        station_id: 1,
+        timeseries_id: 1,
+        pollutant_code: pollutantCode,
+        observed_at_utc: "2026-05-17T00:00:00.000Z",
+        value: 1,
+        verification_status: null,
+      }]);
     const payload = buildHistoryV2PollutantManifest({
       domain: "observations",
       dayUtc,
@@ -42,6 +55,7 @@ test("connector child discovery retains a valid unchanged O3 manifest", async ()
       }],
       writerGitSha: "test",
       backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+      observationContentHash,
     });
     return [key, payload];
   }));

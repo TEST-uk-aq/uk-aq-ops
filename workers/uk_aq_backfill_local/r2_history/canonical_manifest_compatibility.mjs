@@ -22,6 +22,9 @@ import {
 import {
   observationContentHashFromLocalParquet,
 } from "../../../scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs";
+import {
+  inspectSourceDerivedObservationManifestOwner,
+} from "./proposal_ownership.mjs";
 
 const DEFAULT_OBSERVATIONS_PREFIX = "history/v2/observations";
 const CANONICAL_CODE = /^[a-z][a-z0-9_]*$/;
@@ -339,6 +342,27 @@ export async function prepareCanonicalObservationManifestCompatibility({
           throw new Error(`Blocked dependency: duplicate canonical pollutant ${declaredCode} in ${connectorKey}`);
         }
         seenCodes.add(declaredCode);
+        const owned = await inspectSourceDerivedObservationManifestOwner({
+          state,
+          manifestKey: childKey,
+          overlayRoot,
+        });
+        if (owned) {
+          finalPayloads.push(owned.payload);
+          pollutantProposals.push({
+            key: childKey,
+            body: owned.body,
+            file_entries: owned.file_entries,
+            dependency_identities: owned.dependency_identities,
+            source_manifest_key: childKey,
+            raw_pollutant_code: declaredCode,
+            pollutant_code: declaredCode,
+            overlay_path: state.objects[childKey].local_path,
+            proposal_owner: owned.owner,
+            compatibility_source: "dropbox_canonical_manifest",
+          });
+          continue;
+        }
         const childPath = localPathForKey(dropboxRoot, childKey);
         if (!fs.existsSync(childPath)) {
           throw new Error(`Blocked dependency: canonical pollutant manifest unavailable: ${childKey}`);
