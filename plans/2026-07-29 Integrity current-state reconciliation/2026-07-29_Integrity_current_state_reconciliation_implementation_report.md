@@ -2,8 +2,8 @@
 
 Implementation date: 29 July 2026
 
-Status: implementation complete; deployment and real CIC-Test validation are
-recorded below after execution.
+Status: implementation and deployment complete; the bounded real CIC-Test
+validation completed from this workstation is recorded below.
 
 ## Implemented interface
 
@@ -42,10 +42,43 @@ does not consume or acknowledge Pub/Sub.
 
 Repository rules reserve `system_docs/` edits for Chat mode, so no authoritative
 contract file was modified. The pending-implementation wording in the listed
-R2 History and Latest Snapshot contracts should be changed to implemented only
-after the deployment and validation status below is final. The exact names and
-behaviour to record are those in this report.
+R2 History and Latest Snapshot contracts can now be changed to implemented.
+The exact names and behaviour to record are those in this report.
 
 ## Deployment and validation
 
-Pending execution.
+- Schema commit `c927d80` was pushed to TEST schema `main` and migration
+  `20260729_001_ingest_timeseries_current_state_reconcile.sql` was applied to
+  the TEST IngestDB. The function is security-definer with an empty
+  `search_path`; `anon` and `authenticated` have no execute privilege and
+  `service_role` does.
+- Operations commit `0eba5e7` was pushed to TEST operations `main`.
+- GitHub Actions run `30441785749` deployed the Latest Snapshot service and
+  scheduler successfully. Run `30442003052` repeated the deployment and
+  completed the new Cloud Run invoker IAM step successfully.
+- Repository variable `GCP_LATEST_SNAPSHOT_INTEGRITY_INVOKER_PRINCIPAL` is set
+  to the existing TEST operations service account
+  `uk-aq-ops-job@project-53835517-a266-48e3-8d9.iam.gserviceaccount.com`.
+- The deployed private route rejects unauthenticated calls with HTTP 403.
+- A service-role call to the deployed TEST RPC with an empty candidate array
+  returned HTTP 200 and all zero counts. This was a real, non-mutating endpoint
+  check.
+- A normal scheduled Latest Snapshot operation completed after deployment at
+  `2026-07-29T10:06:10.759Z`: manifest build status `ok`, three pollutant
+  products successful, zero failed, and all configured windows present.
+- This workstation's active Google user can obtain only a user token with the
+  OAuth client ID as its audience, not the Cloud Run service audience, and it
+  cannot impersonate the TEST operations service account. Consequently an
+  authenticated empty-candidate route call still needs to be made from the
+  operations service-account runtime (or by an operator with token-creation
+  permission).
+- A repair-bearing Integrity run was deliberately not invented: real
+  reconciliation still requires an operator-selected authoritative source/day
+  scope. Once supplied, the normal CIC-Test Integrity command will exercise
+  both reconciliation targets after its final R2 verification phase.
+
+Pre-deployment validation was deliberately narrow: Python compilation, Deno
+type checking, workflow YAML parsing, whitespace checks, the existing focused
+Latest Snapshot tests, and one deterministic newer/older/equal/
+same-timestamp-correction transition check. No browser, mock-environment, broad
+or speculative test suite was added or run.
