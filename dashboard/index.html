@@ -1963,8 +1963,14 @@
           aqiColor: "#015FA4",
         },
         {
+          connectorId: 2,
+          title: "Breathe London Nodes",
+          observsColor: "#4B443A",
+          aqiColor: "#A08D74",
+        },
+        {
           connectorId: 3,
-          title: "Breathe London",
+          title: "Breathe London Communities",
           observsColor: "#007A6C",
           aqiColor: "#279F8D",
         },
@@ -4570,7 +4576,7 @@
             aqiColor: "#A08D74",
           });
         });
-        return resolved;
+        return resolved.sort((a, b) => Number(a.connectorId) - Number(b.connectorId));
       }
 
       function buildEmptyConnectorBuckets(request) {
