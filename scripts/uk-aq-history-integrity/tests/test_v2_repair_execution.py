@@ -2663,6 +2663,98 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertFalse(current_state["attempted"])
         self.assertEqual(current_state["overall_status"], "blocked_dependency")
 
+    def test_exact_pollutant_repair_requires_explicit_matching_scope(self) -> None:
+        day_utc = "2026-07-27"
+        connector_id = 1
+        gap = {
+            "gap_type": "pollutant_dir_missing",
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "pollutant_code": "pm25",
+            "source_evidence": {
+                "source_partition_state": "successful_non_empty",
+                "source_counts_available": True,
+                "source_skip_reason": None,
+                "unresolved_site_ref_groups": 0,
+                "unmapped_site_ref_groups": 0,
+                "ambiguous_site_ref_groups": 0,
+                "timeseries_conflict_groups": 0,
+                "required_source_file_count": 1,
+                "successful_source_file_count": 1,
+            },
+            "suggested_repair": {
+                "kind": "uk_air_csv_to_v2_observations_backfill_required",
+            },
+        }
+        repair_plan = MODULE.build_v2_repair_plan(
+            observation_gaps=[gap],
+        )
+        action = next(
+            item for item in repair_plan
+            if item["kind"] == "observation_data_repair"
+        )
+        self.assertEqual(action["pollutant_code"], "pm25")
+        observations = {"gaps": [gap], "repair_plan": repair_plan}
+
+        scopes, executable_indexes, skipped = (
+            MODULE._derive_executable_observation_repair_pollutants(
+                v2_observations=observations,
+                requested_pollutants=[],
+            )
+        )
+        self.assertEqual(scopes, {})
+        self.assertEqual(executable_indexes, set())
+        self.assertEqual(
+            skipped[0]["reason"],
+            "explicit_repair_pollutants_required_for_exact_repair",
+        )
+        metrics = MODULE.run_v2_gap_backfills(
+            conn=self.conn,
+            run_id=4,
+            env_name="CIC-Test",
+            run_compact="run",
+            env=self.env,
+            v2_observations=observations,
+            dry_run=True,
+            run_backfill=True,
+            limits=MODULE.LimitTracker(
+                max_download_mb=0,
+                max_runtime_minutes=0,
+                started_mono=0.0,
+            ),
+            log=self.log,
+            repair_pollutants=[],
+        )
+        self.assertEqual(metrics["planned_v2_observation_repairs"], [])
+        self.assertEqual(metrics["observation_backfill_candidate_days"], 0)
+        self.assertEqual(
+            metrics["skipped_v2_observation_metadata_gaps"][0]["reason"],
+            "explicit_repair_pollutants_required_for_exact_repair",
+        )
+
+        scopes, executable_indexes, skipped = (
+            MODULE._derive_executable_observation_repair_pollutants(
+                v2_observations=observations,
+                requested_pollutants=["pm25"],
+            )
+        )
+        self.assertEqual(scopes, {(day_utc, connector_id): ["pm25"]})
+        self.assertEqual(executable_indexes, {0})
+        self.assertEqual(skipped, [])
+
+        scopes, executable_indexes, skipped = (
+            MODULE._derive_executable_observation_repair_pollutants(
+                v2_observations=observations,
+                requested_pollutants=["no2"],
+            )
+        )
+        self.assertEqual(scopes, {})
+        self.assertEqual(executable_indexes, set())
+        self.assertEqual(
+            skipped[0]["reason"],
+            "outside_operator_requested_pollutant_scope",
+        )
+
     def test_v2_missing_day_gap_is_planned_with_explicit_pollutant_scope(self) -> None:
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,

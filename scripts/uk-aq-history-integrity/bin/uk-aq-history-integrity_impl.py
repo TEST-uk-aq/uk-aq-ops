@@ -17053,7 +17053,14 @@ def _derive_executable_observation_repair_pollutants(
                     reason="unsupported_observation_repair_pollutant",
                 )
                 continue
-            if requested and pollutant_code not in requested:
+            if not requested:
+                skip(
+                    index=index, day_utc=day_utc, connector_id=connector_id,
+                    pollutant_code=pollutant_code, gap_type=gap_type,
+                    reason="explicit_repair_pollutants_required_for_exact_repair",
+                )
+                continue
+            if pollutant_code not in requested:
                 skip(
                     index=index, day_utc=day_utc, connector_id=connector_id,
                     pollutant_code=pollutant_code, gap_type=gap_type,
