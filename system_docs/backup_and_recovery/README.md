@@ -13,7 +13,7 @@ Before changing the Supabase logical database dump backup, read:
 1. [`../README.md`](../README.md)
 2. [`contract.md`](contract.md)
 3. [`../../AGENTS.md`](../../AGENTS.md)
-4. [`../scheduling/`](../scheduling/) when an active scheduling contract exists for the shared Cloudflare scheduler
+4. `system_docs/scheduling/` when an active scheduling contract is later created for the shared Cloudflare scheduler
 5. `cloudflare/scheduler/README.md`
 6. `cloudflare/scheduler/jobs.toml`
 7. `workers/uk_aq_supabase_db_dump_backup_service/README.md`
