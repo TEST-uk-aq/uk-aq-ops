@@ -22854,6 +22854,87 @@ def _daily_task_health_error_payload(exc: Exception) -> dict[str, Any]:
     }
 
 
+def _compact_daily_task_health_error_payload(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep task-health failures diagnostic without copying repair evidence."""
+    repair_flow = value.get("repair_flow")
+    if not isinstance(repair_flow, Mapping):
+        compact: dict[str, Any] = {}
+        for key in ("name", "status", "message", "stack_preview"):
+            if key not in value:
+                continue
+            raw = value.get(key)
+            compact[key] = (
+                _truncate_text(raw, 1800 if key == "stack_preview" else 1200)
+                if raw is not None else None
+            )
+        return compact
+
+    compact = {
+        "status": _truncate_text(value.get("status"), 120),
+        "repair_flow_status": _truncate_text(repair_flow.get("status"), 120),
+    }
+    for key in (
+        "r2_history_status",
+        "timeseries_reconciliation_status",
+        "latest_snapshot_reconciliation_status",
+        "overall_status",
+    ):
+        raw = repair_flow.get(key)
+        if raw is not None:
+            compact[key] = _truncate_text(raw, 120)
+
+    stage_counts = repair_flow.get("stage_result_counts")
+    if isinstance(stage_counts, Mapping):
+        compact["stage_result_counts"] = {
+            key: int(stage_counts.get(key) or 0)
+            for key in (
+                "validated",
+                "planned",
+                "succeeded",
+                "ok",
+                "failed",
+                "blocked_dependency",
+                "skipped",
+                "not_run",
+            )
+            if key in stage_counts
+        }
+
+    failed_stages: list[dict[str, Any]] = []
+    for stage in list(repair_flow.get("stage_results") or []):
+        if not isinstance(stage, Mapping):
+            continue
+        stage_status = str(stage.get("status") or "")
+        if stage_status not in {"fail", "failed", "error", "blocked_dependency"}:
+            continue
+        result = stage.get("result")
+        result_mapping = result if isinstance(result, Mapping) else {}
+        detail = (
+            result_mapping.get("error")
+            or result_mapping.get("reason")
+            or stage.get("error")
+            or stage.get("reason")
+        )
+        failed_stages.append({
+            "stage": _truncate_text(stage.get("stage"), 160),
+            "status": _truncate_text(stage_status, 120),
+            "error": _truncate_text(detail) if detail is not None else None,
+        })
+    compact["failed_stage_count"] = len(failed_stages)
+    compact["failed_stages"] = failed_stages[:20]
+
+    current_state = repair_flow.get("current_state_reconciliation")
+    if isinstance(current_state, Mapping):
+        current_state_failures = list(current_state.get("failures") or [])
+        if current_state_failures:
+            compact["current_state_failures"] = [
+                _truncate_text(item) for item in current_state_failures[:10]
+            ]
+    return compact
+
+
 def _resolve_daily_task_health_config(
     *,
     env_name: str,
@@ -23017,11 +23098,12 @@ def _daily_task_health_fail(
     platform_run_id: str | None,
     log_url: str | None,
 ) -> None:
+    compact_error = _compact_daily_task_health_error_payload(error_payload)
     payload = {
         "summary": summary,
         "failed_at": failed_at_utc,
         "error_message": _truncate_text(error_message),
-        "error": error_payload,
+        "error": compact_error,
         "source_repo": DAILY_TASK_HEALTH_SOURCE_REPO,
         "source_worker": DAILY_TASK_HEALTH_SOURCE_WORKER,
         "platform_run_id": platform_run_id,
@@ -23045,7 +23127,7 @@ def _daily_task_health_fail(
                     "failed_at": failed_at_utc,
                     "summary": summary,
                     "error_message": _truncate_text(error_message),
-                    "error": error_payload,
+                    "error": compact_error,
                     "source_repo": DAILY_TASK_HEALTH_SOURCE_REPO,
                     "source_worker": DAILY_TASK_HEALTH_SOURCE_WORKER,
                     "platform_run_id": platform_run_id,

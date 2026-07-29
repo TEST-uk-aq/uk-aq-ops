@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -369,6 +370,62 @@ class PreflightTests(unittest.TestCase):
             self.assertTrue(config["enabled"])
             self.assertEqual(config["supabase_url"], "https://example.supabase.co")
             self.assertEqual(config["supabase_key"], "example-service-role-key")
+
+    def test_daily_task_failure_compacts_repair_flow_before_rpc(self) -> None:
+        oversized_evidence = "must-not-be-sent" * 100_000
+        repair_flow = {
+            "status": "failed",
+            "r2_history_status": "blocked_dependency",
+            "timeseries_reconciliation_status": "blocked_dependency",
+            "latest_snapshot_reconciliation_status": "blocked_dependency",
+            "overall_status": "blocked_dependency",
+            "stage_result_counts": {"failed": 1, "blocked_dependency": 1},
+            "stage_results": [{
+                "stage": "canonical_apply",
+                "status": "failed",
+                "result": {
+                    "error": "canonical content mismatch",
+                    "full_evidence": oversized_evidence,
+                },
+            }],
+            "full_repair_evidence": oversized_evidence,
+        }
+        with mock.patch.object(MODULE, "_daily_task_health_call_rpc") as rpc:
+            MODULE._daily_task_health_fail(
+                {"enabled": True},
+                run_id="task-run-id",
+                scheduled_for_date="2026-07-29",
+                failed_at_utc="2026-07-29T21:42:29Z",
+                summary={
+                    "integrity_run_id": 230,
+                    "status": "fail",
+                    "report_json_path": "/reports/summary.json",
+                },
+                error_message="Integrity final verification failed",
+                error_payload={"status": "fail", "repair_flow": repair_flow},
+                platform_run_id="CIC-Test:2026-07-29T204828Z",
+                log_url="/logs/integrity.log",
+            )
+
+        self.assertEqual(rpc.call_count, 2)
+        failure_call = rpc.call_args_list[0]
+        self.assertEqual(
+            failure_call.kwargs["rpc_name"], "uk_aq_rpc_daily_task_failed"
+        )
+        body = failure_call.kwargs["body"]
+        compact_error = body["p"]["error"]
+        self.assertNotIn("repair_flow", compact_error)
+        self.assertNotIn("must-not-be-sent", json.dumps(body))
+        self.assertEqual(compact_error["failed_stage_count"], 1)
+        self.assertEqual(
+            compact_error["failed_stages"],
+            [{
+                "stage": "canonical_apply",
+                "status": "failed",
+                "error": "canonical content mismatch",
+            }],
+        )
+        self.assertLess(len(json.dumps(body).encode("utf-8")), 25_000)
 
 
 if __name__ == "__main__":
