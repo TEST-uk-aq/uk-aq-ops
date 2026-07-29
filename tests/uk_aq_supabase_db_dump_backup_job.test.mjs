@@ -219,7 +219,8 @@ test("GitHub workflow queues direct backup runs with the required toolchain", ()
   assert.match(workflowText, /group: uk-aq-supabase-db-dump-backup/);
   assert.match(workflowText, /cancel-in-progress: false/);
   assert.match(workflowText, /runs-on: ubuntu-latest/);
-  assert.match(workflowText, /timeout-minutes: 90/);
+  assert.match(workflowText, /timeout-minutes: 150/);
+  assert.doesNotMatch(workflowText, /strategy:|matrix:/);
   assert.match(workflowText, /node-version: "20"/);
   assert.match(workflowText, /postgresql-client-17/);
   assert.match(workflowText, /supabase_2\.79\.0_linux_amd64\.deb/);

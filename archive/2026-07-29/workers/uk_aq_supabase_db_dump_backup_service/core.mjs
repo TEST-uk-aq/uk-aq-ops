@@ -1222,7 +1222,7 @@ async function runDatabaseBackup({
   }
 
   const startedAt = nowIso();
-  let workingDir = null;
+  const workingDir = await fs.mkdtemp(path.join(tempRoot, `${databaseName}-`));
   const result = {
     database: databaseName,
     ok: false,
@@ -1240,7 +1240,6 @@ async function runDatabaseBackup({
   });
 
   try {
-    workingDir = await fs.mkdtemp(path.join(tempRoot, `${databaseName}-`));
     for (const dumpKind of DEFAULT_DUMP_KINDS) {
       const dumpResult = await runSingleDump({
         config,
@@ -1284,9 +1283,7 @@ async function runDatabaseBackup({
     return result;
   } finally {
     result.finished_at = nowIso();
-    if (workingDir) {
-      await fs.rm(workingDir, { recursive: true, force: true });
-    }
+    await fs.rm(workingDir, { recursive: true, force: true });
     logStructured(
       result.ok ? "INFO" : "ERROR",
       "supabase_db_backup_database_finished",
@@ -1301,55 +1298,6 @@ async function runDatabaseBackup({
   }
 }
 
-export async function runRequestedDatabaseBackups({
-  databaseNames,
-  databaseRunner,
-}) {
-  const requestedNames = Array.isArray(databaseNames) ? databaseNames : [];
-  const canonicalNames = DEFAULT_DATABASE_ORDER.filter((databaseName) =>
-    requestedNames.includes(databaseName)
-  );
-  const uniqueRequestedNames = [...new Set(requestedNames)];
-
-  if (
-    canonicalNames.length !== uniqueRequestedNames.length
-    || canonicalNames.length < 1
-    || canonicalNames.length > 2
-  ) {
-    throw new Error("Database concurrency selection must contain one or two supported databases.");
-  }
-  if (typeof databaseRunner !== "function") {
-    throw new Error("Database runner must be a function.");
-  }
-
-  const operations = canonicalNames.map((databaseName) =>
-    Promise.resolve().then(() => databaseRunner(databaseName))
-  );
-  const settledOperations = await Promise.allSettled(operations);
-  const databases = settledOperations.map((operation, index) => {
-    if (operation.status === "fulfilled") {
-      return operation.value;
-    }
-
-    return {
-      database: canonicalNames[index],
-      ok: false,
-      started_at: null,
-      finished_at: nowIso(),
-      dumps: [],
-      retention: null,
-      error: sanitizeErrorMessage(operation.reason),
-    };
-  });
-  const ok = databases.every((entry) => entry?.ok === true);
-
-  return {
-    ok,
-    databases,
-    error: ok ? null : "One or more database backups failed.",
-  };
-}
-
 export async function runBackupWorkflow({
   triggerMode = "manual",
   requestedDatabases = null,
@@ -1360,6 +1308,7 @@ export async function runBackupWorkflow({
   const runDate = formatUtcDate(startedAt);
   const databases = resolveRequestedDatabases(triggerMode, requestedDatabases);
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "uk-aq-supabase-db-dump-"));
+  const dropboxClient = new DropboxClient(config.dropbox);
 
   const report = {
     ok: false,
@@ -1383,20 +1332,22 @@ export async function runBackupWorkflow({
   });
 
   try {
-    const combinedResult = await runRequestedDatabaseBackups({
-      databaseNames: databases,
-      databaseRunner: (databaseName) => runDatabaseBackup({
+    for (const databaseName of databases) {
+      const databaseResult = await runDatabaseBackup({
         config,
-        dropboxClient: new DropboxClient(config.dropbox),
+        dropboxClient,
         databaseName,
         runId,
         runDate,
         tempRoot,
-      }),
-    });
-    report.databases = combinedResult.databases;
-    report.ok = combinedResult.ok;
-    report.error = combinedResult.error;
+      });
+      report.databases.push(databaseResult);
+    }
+
+    report.ok = report.databases.every((entry) => entry.ok);
+    if (!report.ok) {
+      report.error = "One or more database backups failed.";
+    }
     return report;
   } catch (error) {
     report.ok = false;

@@ -14,8 +14,9 @@ Cloudflare cron scheduler
   -> GitHub workflow_dispatch
   -> .github/workflows/uk_aq_supabase_db_dump_backup.yml
   -> job.mjs
-  -> daily task health lifecycle
+  -> one daily task health lifecycle
   -> core.mjs
+  -> concurrent per-database branches
   -> Dropbox
 ```
 
@@ -27,6 +28,12 @@ both databases in this order:
 
 1. `ingestdb`
 2. `obs_aqidb`
+
+Normal two-database runs start both database branches concurrently in the same
+Node.js process and GitHub Actions job. Combined results remain in the canonical
+order above regardless of which database finishes first. A one-database manual
+run starts only the selected branch. Each branch has its own temporary working
+directory, Dropbox client, and database-specific Dropbox root.
 
 Manual workflow dispatch keeps the default trigger mode and accepts `ingestdb`,
 `obs_aqidb`, `ingestdb,obs_aqidb`, or a blank value for both. GitHub Actions
@@ -46,13 +53,17 @@ Each successful database backup writes these four gzip files:
 - `data.sql.gz`
 - `cron_jobs.sql.gz`
 
+Within each database branch, roles, schema, data, cron jobs, and retention remain
+strictly sequential. The two branches may interleave, but retention is scoped to
+that database's own Dropbox root.
+
 The Dropbox layout is:
 
 ```text
 /<UK_AQ_DROPBOX_ROOT>/<UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR>/<database>/YYYY-MM-DD/<file>
 ```
 
-Same-day reruns overwrite the dated files. Restore order is roles, schema,
+Same-day reruns safely overwrite the dated files. Restore order is roles, schema,
 data, then cron jobs. The implementation retains `cron` in dump scope, enables
 `pg_cron` in schema output, preserves the `obs_aqidb` `authenticator` PostgREST
 schemas, and serializes `cron.job` separately.
@@ -94,6 +105,9 @@ Local command overrides remain available for `SUPABASE_BIN`, `GZIP_BIN`, and
 `BASH_BIN`. The GitHub runner installs Node.js 20, PostgreSQL client 17, and
 Supabase CLI 2.79.0.
 
+The GitHub Actions job timeout is 150 minutes. Workflow-level concurrency still
+queues overlapping workflow runs with `cancel-in-progress: false`.
+
 ## Task health and failure behavior
 
 The stable task identity is:
@@ -102,9 +116,11 @@ The stable task identity is:
 - source repo `uk-aq-ops`
 - source worker `uk_aq_supabase_db_dump_backup_service`
 
-Started and final success/failure states include the trigger mode, requested
+One combined health lifecycle covers both concurrent database branches. Its
+started and final success/failure states include the trigger mode, requested
 databases, dump and database counts, bytes, elapsed time, destination, errors,
-and warnings. The process exits non-zero if any requested database fails. A
+and warnings. Database results remain in canonical order. The process exits
+non-zero if any requested database fails, after both branches have settled. A
 same-date manual rerun safely overwrites files already uploaded by a partial run.
 
 ## Manual TEST operation
@@ -115,10 +131,11 @@ accepted values for a targeted rerun.
 
 After deployment, verify:
 
-1. the workflow succeeds within 90 minutes;
-2. task health records a successful `ops.supabase_db_dump_backup` run;
-3. both database summaries contain four dumps;
-4. all eight dated Dropbox files exist and have non-zero compressed sizes;
-5. decompressed data SQL has valid INSERT chunk delimiters;
-6. the D1 job is enabled at `55 0 * * *`, has `dry_run = false`, and dispatches
+1. logs show both database branches start before either finishes;
+2. the workflow succeeds within 150 minutes;
+3. task health records one successful `ops.supabase_db_dump_backup` run;
+4. both database summaries contain four dumps in canonical order;
+5. all eight dated Dropbox files exist and have non-zero compressed sizes;
+6. decompressed data SQL has valid INSERT chunk delimiters;
+7. the D1 job is enabled at `55 0 * * *`, has `dry_run = false`, and dispatches
    exactly one workflow on the next scheduled operation.
