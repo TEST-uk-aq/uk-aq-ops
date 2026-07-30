@@ -621,9 +621,65 @@ function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutant
     || rows.length !== Number(evidence.total_rows)) {
     throw new Error(`Immutable source evidence identity is invalid: day=${dayUtc} connector=${connectorId}`);
   }
-  const selectedRows = rows
-    .filter((row) => String(row?.pollutant_code || "") === pollutantCode)
-    .map(normalizeCanonicalObservationRow);
+  const reconstructedRows = rows.map((row, index) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new Error(`Immutable source evidence row is invalid: day=${dayUtc} connector=${connectorId} row=${index}`);
+    }
+    if (Object.hasOwn(row, "connector_id") && Number(row.connector_id) !== connectorId) {
+      throw new Error(`Immutable source evidence row has conflicting connector_id: day=${dayUtc} connector=${connectorId} row=${index}`);
+    }
+    if (typeof row.observed_at !== "string" || !row.observed_at.trim()) {
+      throw new Error(`Immutable source evidence observed_at is missing or invalid: day=${dayUtc} connector=${connectorId} row=${index}`);
+    }
+    const observedAt = new Date(row.observed_at);
+    if (Number.isNaN(observedAt.getTime())) {
+      throw new Error(`Immutable source evidence observed_at is missing or invalid: day=${dayUtc} connector=${connectorId} row=${index}`);
+    }
+    const observedAtUtc = observedAt.toISOString();
+    if (observedAtUtc.slice(0, 10) !== dayUtc) {
+      throw new Error(`Immutable source evidence observed_at is outside selected UTC day: day=${dayUtc} connector=${connectorId} row=${index}`);
+    }
+    return normalizeCanonicalObservationRow({
+      connector_id: connectorId,
+      station_id: row.station_id,
+      timeseries_id: row.timeseries_id,
+      pollutant_code: row.pollutant_code,
+      observed_at_utc: observedAtUtc,
+      value: row.value,
+      verification_status: row.verification_status,
+    });
+  });
+  const reconstructedByPollutant = new Map();
+  for (const row of reconstructedRows) {
+    const partitionRows = reconstructedByPollutant.get(row.pollutant_code) || [];
+    partitionRows.push(row);
+    reconstructedByPollutant.set(row.pollutant_code, partitionRows);
+  }
+  const reconstructedCounts = Object.fromEntries([...reconstructedByPollutant.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([code, partitionRows]) => [code, partitionRows.length]));
+  const recordedCounts = Object.fromEntries(Object.entries(evidence?.per_pollutant_counts || {})
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([code, count]) => [code, Number(count)]));
+  if (!sameJson(reconstructedCounts, recordedCounts)) {
+    throw new Error(`Immutable source evidence per-pollutant counts changed: day=${dayUtc} connector=${connectorId}`);
+  }
+  const recordedHashCodes = Object.keys(evidence?.observation_content_hashes || {}).sort();
+  if (!sameJson(Object.keys(reconstructedCounts), recordedHashCodes)) {
+    throw new Error(`Immutable source evidence content-hash partitions changed: day=${dayUtc} connector=${connectorId}`);
+  }
+  for (const [code, partitionRows] of reconstructedByPollutant) {
+    const computedPartition = computeObservationContentHash(partitionRows);
+    const recordedPartition = evidence?.observation_content_hashes?.[code];
+    validateObservationContentHashMetadata(recordedPartition, { rowCount: partitionRows.length });
+    const partitionDifferences = semanticDifferences(computedPartition, recordedPartition);
+    if (partitionDifferences.length) {
+      throw new Error(
+        `Immutable source evidence semantic identity changed: day=${dayUtc} connector=${connectorId} pollutant=${code} differing_fields=${partitionDifferences.join(",")}`,
+      );
+    }
+  }
+  const selectedRows = reconstructedByPollutant.get(pollutantCode) || [];
   if (!selectedRows.length) {
     throw new Error(`Immutable source evidence has no selected rows: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode}`);
   }
@@ -631,10 +687,9 @@ function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutant
   const recorded = evidence?.observation_content_hashes?.[pollutantCode];
   validateObservationContentHashMetadata(recorded, { rowCount: selectedRows.length });
   const differingFields = semanticDifferences(computed, recorded);
-  if (differingFields.length
-    || Number(evidence?.per_pollutant_counts?.[pollutantCode]) !== selectedRows.length) {
+  if (differingFields.length) {
     throw new Error(
-      `Immutable source evidence semantic identity changed: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${[...differingFields, "per_pollutant_counts"].join(",")}`,
+      `Immutable source evidence semantic identity changed: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${differingFields.join(",")}`,
     );
   }
   return {
@@ -840,6 +895,43 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
       CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(item.prefix));
     audit.selected_partition_count = selectedPrefixes.length;
     const objects = new Map(proposal.objects.map((object) => [object.key, object]));
+    const tombstoneCounts = new Map();
+    for (const selected of selectedPrefixes) {
+      tombstoneCounts.set(selected.prefix, (tombstoneCounts.get(selected.prefix) || 0) + 1);
+    }
+    const sourceDerivedPrefixes = new Map();
+    for (const object of proposal.objects) {
+      if (!object.key.endsWith(".parquet")
+        || object.entry?.stage !== "observations_data") continue;
+      const partitionPrefix = object.key.slice(0, object.key.lastIndexOf("/"));
+      if (!CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(partitionPrefix)) continue;
+      if (!sourceDerivedPrefixes.has(partitionPrefix)) sourceDerivedPrefixes.set(partitionPrefix, object);
+    }
+    for (const [partitionPrefix, partObject] of sourceDerivedPrefixes) {
+      if (tombstoneCounts.get(partitionPrefix) !== 1) {
+        throw finalProposalError({
+          key: `${partitionPrefix}/manifest.json`,
+          object: partObject,
+          differingFields: ["matching_pollutant_prefix_tombstone"],
+        });
+      }
+    }
+    for (const selected of selectedPrefixes) {
+      const manifestKey = `${selected.prefix}/manifest.json`;
+      const manifestObject = objects.get(manifestKey);
+      const stagedParts = proposal.objects.filter((object) =>
+        object.key.startsWith(`${selected.prefix}/`) && object.key.endsWith(".parquet"));
+      if (!manifestObject || !stagedParts.length) {
+        throw finalProposalError({
+          key: manifestKey,
+          object: manifestObject,
+          differingFields: [
+            ...(!manifestObject ? ["matching_staged_pollutant_manifest"] : []),
+            ...(!stagedParts.length ? ["matching_staged_parquet"] : []),
+          ],
+        });
+      }
+    }
     for (const selected of selectedPrefixes) {
       const match = selected.prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
       const [, dayUtc, connectorIdRaw, pollutantCode] = match;

@@ -21,6 +21,7 @@ import {
 } from "../../../scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs";
 import {
   compareProposalCollision,
+  compareSourceDerivedManifestContent,
   inspectSourceDerivedObservationManifestOwner,
   SOURCE_DERIVED_OWNER,
 } from "./proposal_ownership.mjs";
@@ -297,8 +298,9 @@ export async function prepareLegacyObservationManifestCompatibility({
           pollutantPayloads.push(owned.payload);
           pollutantProposals.push({
             key: canonicalKey,
-            body: owned.body,
-            file_entries: owned.file_entries,
+            retained_source_derived: true,
+            content_facts: owned.content_facts,
+            dependencies: owned.dependencies,
             dependency_identities: owned.dependency_identities,
             source_manifest_key: child.source_manifest_key,
             raw_pollutant_code: child.raw_pollutant_code,
@@ -491,8 +493,35 @@ export function finaliseLegacyObservationManifestCompatibility({
     );
     const dayKeys = byDay.get(prepared.day_utc) || [];
     for (const pollutant of prepared.pollutant_proposals) {
-      const candidate = proposalForPollutant(pollutant);
       const existing = proposals.get(pollutant.key);
+      if (pollutant.retained_source_derived) {
+        if (!existing || existing?.provenance?.source !== SOURCE_DERIVED_OWNER) {
+          throw new Error(
+            `Integrity proposal collision: key=${pollutant.key} owners=${String(existing?.provenance?.source || "metadata_planner")},${SOURCE_DERIVED_OWNER} differing_fields=proposal_owner compatibility_source=${pollutant.compatibility_source || "dropbox"}`,
+          );
+        }
+        const comparison = compareSourceDerivedManifestContent(
+          existing,
+          pollutant.content_facts,
+        );
+        if (!comparison.identical) {
+          throw new Error(
+            `Integrity proposal collision: key=${pollutant.key} owners=${String(existing.provenance.source)},${SOURCE_DERIVED_OWNER} differing_fields=${comparison.differing_fields.join(",")} compatibility_source=${pollutant.compatibility_source || "dropbox"}`,
+          );
+        }
+        collisions.push({
+          key: pollutant.key,
+          status: "retained_source_derived",
+          retained_owner: existing.provenance.source,
+          compatibility_source: pollutant.compatibility_source || "dropbox",
+          differing_fields: [],
+          content_facts_validated_from_staged_parquet: true,
+          dependency_identities_validated: true,
+        });
+        dayKeys.push(pollutant.key);
+        continue;
+      }
+      const candidate = proposalForPollutant(pollutant);
       if (existing) {
         const comparison = compareProposalCollision(existing, candidate);
         if (!comparison.identical) {

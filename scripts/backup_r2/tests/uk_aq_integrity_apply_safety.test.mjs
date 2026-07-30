@@ -107,7 +107,15 @@ async function observationFixture({ wrongManifest = false } = {}) {
   const manifestPath = writeObject(overlay, manifestKey, manifestBody);
   const evidenceDirectory = path.join(overlay, `day_utc=${dayUtc}`, `connector_id=${connectorId}`);
   fs.mkdirSync(evidenceDirectory, { recursive: true });
-  const sourceRowsBody = Buffer.from(JSON.stringify(rows));
+  const storedRows = rows.map((row) => ({
+    timeseries_id: row.timeseries_id,
+    station_id: row.station_id,
+    pollutant_code: row.pollutant_code,
+    observed_at: row.observed_at_utc,
+    value: row.value,
+    verification_status: row.verification_status,
+  }));
+  const sourceRowsBody = Buffer.from(JSON.stringify(storedRows));
   const rowsPath = path.join(evidenceDirectory, "obs_history_rows.json");
   fs.writeFileSync(rowsPath, sourceRowsBody);
   const evidence = {
@@ -131,7 +139,7 @@ async function observationFixture({ wrongManifest = false } = {}) {
     ...stateEntry(manifestPath, manifestKey, [partKey], {
       [partKey]: { sha256: partEntry.sha256, bytes: partEntry.bytes, source: "overlay" },
     }),
-    stage: "observs_manifests",
+    stage: "observations_data",
     proposal_owner: "source_derived_observation_repair",
   };
   const runState = {
@@ -147,24 +155,58 @@ async function observationFixture({ wrongManifest = false } = {}) {
   };
   const runStatePath = path.join(root, "run-state.json");
   fs.writeFileSync(runStatePath, JSON.stringify(runState));
-  return { root, runState, runStatePath, partKey, partBody, manifestKey, manifestBody };
+  return {
+    root,
+    runState,
+    runStatePath,
+    partKey,
+    partBody,
+    manifestKey,
+    manifestBody,
+    rowsPath,
+    evidencePath: path.join(evidenceDirectory, "source-evidence.json"),
+    storedRows,
+  };
 }
 
-function compatibilityFixture({ candidateBody = '{"value":1}', existingBody = '{"value":1}' } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-integrity-collision-"));
-  const statePath = path.join(root, "run-state.json");
+function replaceStoredEvidenceRows(fixture, storedRows) {
+  const body = Buffer.from(JSON.stringify(storedRows));
+  fs.writeFileSync(fixture.rowsPath, body);
+  const evidence = JSON.parse(fs.readFileSync(fixture.evidencePath, "utf8"));
+  evidence.canonical_rows_bytes = body.byteLength;
+  evidence.canonical_rows_sha256 = sha256Hex(body);
+  evidence.total_rows = storedRows.length;
+  fs.writeFileSync(fixture.evidencePath, JSON.stringify(evidence));
+}
+
+async function compatibilityFixture({ contentMismatch = false, dependencyMismatch = false } = {}) {
+  const fixture = await observationFixture();
+  const owned = await inspectSourceDerivedObservationManifestOwner({
+    state: fixture.runState,
+    manifestKey: fixture.manifestKey,
+    overlayRoot: fixture.runState.overlay_root,
+  });
+  fs.writeFileSync(fixture.runStatePath, JSON.stringify(fixture.runState));
+  const root = fixture.root;
   const connectorPath = path.join(root, "connector-manifest.json");
-  fs.writeFileSync(statePath, JSON.stringify({ objects: {} }));
-  const key = "history/v2/observations/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json";
+  const key = fixture.manifestKey;
   const connectorKey = "history/v2/observations/day_utc=2026-06-17/connector_id=1/manifest.json";
-  const partKey = key.replace("manifest.json", "part-00000.parquet");
-  const identity = { sha256: "a".repeat(64), bytes: 10, source: "overlay" };
+  const payload = {
+    ...owned.payload,
+    run_id: "different-planner-run",
+    backed_up_at_utc: "2026-06-19T00:00:00.000Z",
+    writer_git_sha: "different-writer-sha",
+    manifest_hash: "operationally-different-derived-hash",
+    ...(contentMismatch ? { source_row_count: owned.payload.source_row_count + 1 } : {}),
+  };
+  const dependencyIdentities = structuredClone(owned.dependency_identities);
+  if (dependencyMismatch) dependencyIdentities[fixture.partKey].sha256 = "a".repeat(64);
   const existing = {
     key,
     kind: "pollutant_manifest",
-    proposed_body: existingBody,
-    dependencies: [partKey],
-    dependency_identities: { [partKey]: identity },
+    proposed_body: JSON.stringify(payload),
+    dependencies: owned.dependencies,
+    dependency_identities: dependencyIdentities,
     provenance: { source: "source_derived_observation_repair" },
   };
   return {
@@ -181,7 +223,7 @@ function compatibilityFixture({ candidateBody = '{"value":1}', existingBody = '{
       results: [],
     },
     preparation: {
-      run_state_path: statePath,
+      run_state_path: fixture.runStatePath,
       prepared: [{
         day_utc: "2026-06-17",
         connector_id: 1,
@@ -189,9 +231,10 @@ function compatibilityFixture({ candidateBody = '{"value":1}', existingBody = '{
         connector_overlay_path: connectorPath,
         pollutant_proposals: [{
           key,
-          body: candidateBody,
-          file_entries: [{ key: partKey, etag_or_hash: identity.sha256, bytes: identity.bytes }],
-          dependency_identities: { [partKey]: identity },
+          retained_source_derived: true,
+          content_facts: owned.content_facts,
+          dependencies: owned.dependencies,
+          dependency_identities: owned.dependency_identities,
           source_manifest_key: key,
           raw_pollutant_code: "pm25",
           pollutant_code: "pm25",
@@ -203,22 +246,28 @@ function compatibilityFixture({ candidateBody = '{"value":1}', existingBody = '{
   };
 }
 
-test("compatibility accepts an identical duplicate and rejects a non-identical owned proposal", () => {
-  const identical = compatibilityFixture();
-  const finalised = finaliseLegacyObservationManifestCompatibility(identical);
-  assert.equal(finalised.planning.proposals.find((proposal) => proposal.key === identical.key), identical.existing);
-  assert.equal(finalised.planning.compatibility_preparation.collisions[0].status, "accepted_identical");
+test("compatibility retains an owned source-derived manifest across operational metadata differences", async () => {
+  const compatible = await compatibilityFixture();
+  const finalised = finaliseLegacyObservationManifestCompatibility(compatible);
+  assert.equal(finalised.planning.proposals.find((proposal) => proposal.key === compatible.key), compatible.existing);
+  assert.equal(finalised.planning.compatibility_preparation.collisions[0].status, "retained_source_derived");
+});
 
-  const conflicting = compatibilityFixture({ candidateBody: '{"value":2}' });
+test("compatibility rejects exact source-derived content and dependency mismatches", async () => {
+  const contentMismatch = await compatibilityFixture({ contentMismatch: true });
   assert.throws(
-    () => finaliseLegacyObservationManifestCompatibility(conflicting),
-    /Integrity proposal collision:.*differing_fields=substantive_body.*compatibility_source=dropbox_canonical_manifest/,
+    () => finaliseLegacyObservationManifestCompatibility(contentMismatch),
+    /Integrity proposal collision:.*differing_fields=source_row_count.*compatibility_source=dropbox_canonical_manifest/,
+  );
+  const dependencyMismatch = await compatibilityFixture({ dependencyMismatch: true });
+  assert.throws(
+    () => finaliseLegacyObservationManifestCompatibility(dependencyMismatch),
+    /Integrity proposal collision:.*differing_fields=dependency_identities\..*\.sha256.*compatibility_source=dropbox_canonical_manifest/,
   );
 });
 
 test("compatibility ownership is independently derived from final staged Parquet", async () => {
   const fixture = await observationFixture();
-  fixture.runState.objects[fixture.manifestKey].stage = "observations_data";
   const originalManifest = fs.readFileSync(
     fixture.runState.objects[fixture.manifestKey].local_path,
   );
@@ -257,6 +306,50 @@ test("final proposal graph requires immutable source, staged Parquet and final m
   assert.equal(remoteCalls, 0);
   const persisted = JSON.parse(fs.readFileSync(invalid.runStatePath, "utf8"));
   assert.equal(persisted.final_proposal_graph_validation.status, "failed");
+});
+
+async function assertApplyFailsBeforeRemote(fixture, expected) {
+  let remoteCalls = 0;
+  const remote = async () => {
+    remoteCalls += 1;
+    throw new Error("remote adapter must not run");
+  };
+  fs.writeFileSync(fixture.runStatePath, JSON.stringify(fixture.runState));
+  await assert.rejects(applyValidatedProposal({
+    runStatePath: fixture.runStatePath,
+    r2: {},
+    adapters: { deleteObjects: remote, getObject: remote, listAllObjects: remote, putObject: remote },
+  }), expected);
+  assert.equal(remoteCalls, 0);
+}
+
+test("immutable source adapter rejects invalid, out-of-day, and conflicting-connector stored rows", async () => {
+  const invalidTimestamp = await observationFixture();
+  assert.equal(Object.hasOwn(invalidTimestamp.storedRows[0], "connector_id"), false);
+  assert.equal(Object.hasOwn(invalidTimestamp.storedRows[0], "observed_at_utc"), false);
+  invalidTimestamp.storedRows[0].observed_at = "not-a-timestamp";
+  replaceStoredEvidenceRows(invalidTimestamp, invalidTimestamp.storedRows);
+  await assertApplyFailsBeforeRemote(invalidTimestamp, /observed_at is missing or invalid/);
+
+  const outOfDay = await observationFixture();
+  outOfDay.storedRows[0].observed_at = "2026-06-18T00:00:00.000Z";
+  replaceStoredEvidenceRows(outOfDay, outOfDay.storedRows);
+  await assertApplyFailsBeforeRemote(outOfDay, /observed_at is outside selected UTC day/);
+
+  const conflictingConnector = await observationFixture();
+  conflictingConnector.storedRows[0].connector_id = 7;
+  replaceStoredEvidenceRows(conflictingConnector, conflictingConnector.storedRows);
+  await assertApplyFailsBeforeRemote(conflictingConnector, /conflicting connector_id/);
+});
+
+test("final proposal graph requires source-derived partitions and pollutant tombstones in both directions", async () => {
+  const missingTombstone = await observationFixture();
+  missingTombstone.runState.tombstone_prefixes = [];
+  await assertApplyFailsBeforeRemote(missingTombstone, /matching_pollutant_prefix_tombstone/);
+
+  const unmatchedTombstone = await observationFixture();
+  delete unmatchedTombstone.runState.objects[unmatchedTombstone.manifestKey];
+  await assertApplyFailsBeforeRemote(unmatchedTombstone, /matching_staged_pollutant_manifest/);
 });
 
 test("live semantic verification trusts immutable source evidence and classifies a wrong manifest separately", async () => {
