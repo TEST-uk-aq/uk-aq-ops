@@ -6,10 +6,18 @@ Qualifying real CIC-Test SOS v2 repairs now select the dedicated observation-his
 
 The dedicated path is selected only for `--source sos --run-backfill --history-version v2` with explicit `--from-day`, `--to-day`, `--repair-pollutants`, and a resolved mutation scope of connector `1`. A qualifying SOS scope that resolves outside connector `1` fails before source acquisition begins.
 
+The dedicated path now derives every executable replacement partition directly from the inclusive selected dates, connector `1`, and the explicit repair-pollutant set. It does not use observation gaps, mismatch classifications, Dropbox comparison results, or observation content-hash comparisons to decide whether a selected partition is rebuilt. A selected partition therefore reaches the existing complete source-evidence and replacement owners even when the Dropbox baseline already matches the authoritative source.
+
+For this route, observation gap detection and source-versus-Dropbox content-hash comparison are recorded as bypassed. The run records `target_authority=explicit_selected_scope`, the selected partition count, dates, pollutants, per-partition outcomes, complete and authoritative-no-data replacement counts, all-unmapped skips, source-invalid blocks, and exact tombstone count. Success depends on every explicit partition outcome and the ordered apply verification, not on a zero gap count.
+
 ## Files changed
+
+This direct-selection correction changes only the Python Integrity implementation, its focused Python test file, and this report. The JavaScript apply and shared index modules listed below remain the unchanged owners delivered by the original implementation.
 
 - `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
   - strict route selection and run-summary audit;
+  - direct explicit selected-partition target ownership for the dedicated route;
+  - dedicated observation gap and Dropbox content-hash comparison bypass;
   - all-unmapped partition preservation;
   - legacy R2-only identity diagnostic handling;
   - AQI detection/proposal bypass;
@@ -23,7 +31,7 @@ The dedicated path is selected only for `--source sos --run-backfill --history-v
 - `workers/shared/uk_aq_r2_history_index.mjs`
   - narrow `writePollutantIndexes` option so the global finaliser can merge and verify the live observations latest index without rewriting already verified scoped indexes.
 - `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`
-  - focused route, all-unmapped, legacy-ID and AQI-bypass checks.
+  - focused route, direct matching-baseline replacement, all-unmapped, legacy-ID and AQI-bypass checks.
 - `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`
   - focused exact-tombstone, connector-scope and GET-once checks.
 
@@ -49,6 +57,10 @@ dedicated_sos_historical_observation_replacement
 ```
 
 In this mode the coordinator does not call AQI integrity detection, AQI queueing, AQI generation, AQI metadata/index planning or AQI debug work. It also does not call the generic broad final-verification scan. Existing AQI objects remain untouched.
+
+`build_dedicated_sos_selected_partitions()` owns the dedicated executable target set. It expands the inclusive selected day scope across connector `1` and every explicit repair pollutant, then feeds each selected partition independently into the existing immutable source-evidence, canonical proposal and exact-tombstone owners. `run_v2_gap_backfills()` retains its original gap-derived branch for every non-dedicated caller; only the dedicated branch accepts the explicit target list.
+
+The dedicated entrypoint does not call `run_v2_observations_integrity_checks()` or `run_v2_observation_content_hash_checks()` as repair prerequisites. Their dedicated report entries are bypass records. Check-only, dry-run, non-SOS and generic Integrity execution still use the existing comparison and gap-derived logic unchanged.
 
 ## Replacement and legacy identity behaviour
 
@@ -76,7 +88,7 @@ The ordered apply audit becomes the final R2 history evidence. `second_broad_r2_
 - Public Python entrypoint import and `--help`: passed; supported arguments are unchanged.
 - Repository dispatcher and runner shell syntax: passed.
 - Repository runner `--help`: passed and still identifies the established local dispatcher path.
-- Focused Python dedicated SOS checks: 4 passed.
+- Focused Python dedicated SOS checks: 5 passed, including a matching Dropbox-baseline case that still produces the complete replacement proposal and one exact pollutant-prefix tombstone.
 - Focused canonical apply safety checks: 13 passed.
 - Existing focused observation metadata repair check: 1 passed.
 - `git diff --check`: passed.

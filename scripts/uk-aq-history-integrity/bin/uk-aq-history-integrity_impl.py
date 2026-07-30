@@ -16629,6 +16629,36 @@ def _normalise_repair_pollutants(values: Iterable[Any] | None) -> list[str]:
     return normalized
 
 
+def build_dedicated_sos_selected_partitions(
+    *,
+    from_day: str,
+    to_day: str,
+    selected_days: Iterable[str] | None,
+    repair_pollutants: Iterable[str] | None,
+) -> list[dict[str, Any]]:
+    """Build the authoritative direct-replacement scope for dedicated SOS."""
+    pollutants = _normalise_repair_pollutants(repair_pollutants)
+    if not pollutants:
+        raise ValueError(
+            "dedicated SOS historical replacement requires repair pollutants"
+        )
+    days = _selected_dates_or_range(from_day, to_day, selected_days)
+    if not days:
+        raise ValueError(
+            "dedicated SOS historical replacement requires selected days"
+        )
+    return [
+        {
+            "day_utc": day.isoformat(),
+            "connector_id": 1,
+            "pollutant_code": pollutant_code,
+            "target_authority": "explicit_selected_scope",
+        }
+        for day in days
+        for pollutant_code in pollutants
+    ]
+
+
 def _parse_repair_pollutants_arg(raw: str | None) -> list[str]:
     return _normalise_repair_pollutants((raw or "").split(","))
 
@@ -17598,6 +17628,7 @@ def run_v2_gap_backfills(
     queue_aqi_from_observation_repairs: bool = True,
     repair_pollutants: Iterable[str] | None = None,
     source_scope: Mapping[str, Any] | None = None,
+    explicit_selected_partitions: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute direct source -> v2 observation repairs for missing v2 gaps.
 
@@ -17631,10 +17662,26 @@ def run_v2_gap_backfills(
         "planned_aqi_rebuild_connector_days": [],
         "unsupported_v2_backfill": False,
     }
+    if explicit_selected_partitions is not None:
+        metrics.update({
+            "target_authority": "explicit_selected_scope",
+            "gap_detection_bypassed": True,
+            "selected_partition_outcomes": [],
+            "complete_replacements": 0,
+            "authoritative_no_data_replacements": 0,
+            "all_unmapped_partitions_left_unchanged": 0,
+            "source_invalid_partitions_blocked_before_mutation": 0,
+            "exact_tombstones_created": 0,
+        })
     if not run_backfill:
         return metrics
     gaps = list(v2_observations.get("gaps") or [])
-    if not gaps:
+    normalized_direct_targets: list[tuple[str, int, str]] = []
+    direct_targets = (
+        list(explicit_selected_partitions)
+        if explicit_selected_partitions is not None else None
+    )
+    if direct_targets is None and not gaps:
         return metrics
     def gap_partition(gap: Mapping[str, Any]) -> tuple[str, int, str | None] | None:
         day_iso = str(gap.get("day_utc") or "").strip()
@@ -17647,14 +17694,69 @@ def run_v2_gap_backfills(
         pollutant = str(gap.get("pollutant_code") or "").strip().lower() or None
         return day_iso, connector_id, pollutant
 
-    (
-        executable_pollutants_by_key,
-        executable_gap_indexes,
-        skipped_nonexecutable_gaps,
-    ) = _derive_executable_observation_repair_pollutants(
-        v2_observations=v2_observations,
-        requested_pollutants=repair_pollutants,
-    )
+    if direct_targets is None:
+        (
+            executable_pollutants_by_key,
+            executable_gap_indexes,
+            skipped_nonexecutable_gaps,
+        ) = _derive_executable_observation_repair_pollutants(
+            v2_observations=v2_observations,
+            requested_pollutants=repair_pollutants,
+        )
+    else:
+        executable_pollutants_by_key = {}
+        executable_gap_indexes = set()
+        skipped_nonexecutable_gaps = []
+        for target in direct_targets:
+            day_utc = str(target.get("day_utc") or "").strip()
+            try:
+                connector_id = int(target.get("connector_id"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "dedicated SOS selected partition has invalid connector"
+                ) from exc
+            pollutant_code = str(
+                target.get("pollutant_code") or ""
+            ).strip().lower()
+            if connector_id != 1:
+                raise ValueError(
+                    "dedicated SOS selected partition requires connector_id=1"
+                )
+            try:
+                dt.date.fromisoformat(day_utc)
+            except ValueError as exc:
+                raise ValueError(
+                    "dedicated SOS selected partition has invalid day_utc"
+                ) from exc
+            if pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS:
+                raise ValueError(
+                    "dedicated SOS selected partition has invalid pollutant"
+                )
+            normalized_direct_targets.append(
+                (day_utc, connector_id, pollutant_code)
+            )
+        normalized_direct_targets = sorted(set(normalized_direct_targets))
+        if not normalized_direct_targets:
+            raise ValueError(
+                "dedicated SOS selected partition scope is empty"
+            )
+        requested = set(_normalise_repair_pollutants(repair_pollutants))
+        if requested and {
+            pollutant for _day, _connector, pollutant in normalized_direct_targets
+        } != requested:
+            raise ValueError(
+                "dedicated SOS selected partitions disagree with repair pollutants"
+            )
+        metrics["explicit_selected_partition_count"] = len(
+            normalized_direct_targets
+        )
+        metrics["selected_dates"] = sorted({
+            day for day, _connector, _pollutant in normalized_direct_targets
+        })
+        metrics["selected_pollutants"] = sorted({
+            pollutant
+            for _day, _connector, pollutant in normalized_direct_targets
+        })
 
     by_key_sets: dict[tuple[str, int], set[int]] = {}
     gaps_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
@@ -17662,54 +17764,69 @@ def run_v2_gap_backfills(
     skipped_metadata_gaps: list[dict[str, Any]] = list(
         skipped_nonexecutable_gaps
     )
-    for gap_index, gap in enumerate(gaps):
-        partition = gap_partition(gap)
-        if partition is None:
-            continue
-        day_iso, connector_id, pollutant_code = partition
-        decision = decide_observation_repair(gap)
-        if decision.repair_kind == "observation_index_repair":
-            index_only_keys.add((day_iso, connector_id))
-            continue
-        if gap_index not in executable_gap_indexes:
-            if (
-                decision.repair_kind != "observation_data_repair"
-            ) and not any(
-                int(item.get("gap_index", -1)) == gap_index
-                for item in skipped_metadata_gaps
-            ):
-                skipped_metadata_gaps.append({
-                    "gap_index": gap_index,
-                    "day_utc": day_iso,
-                    "connector_id": connector_id,
-                    "pollutant_code": pollutant_code,
-                    "gap_type": gap.get("gap_type"),
-                    "suggested_repair_kind": decision.repair_kind,
-                    "reason": "not_explicit_observation_data_repair",
-                })
-            continue
-        ts_ids = _timeseries_ids_for_v2_observation_gap(
-            conn,
-            connector_id=connector_id,
-            gap=gap,
-        )
-        by_key_sets.setdefault((day_iso, connector_id), set()).update(ts_ids)
-        gaps_by_key.setdefault((day_iso, connector_id), []).append(gap)
+    if direct_targets is None:
+        for gap_index, gap in enumerate(gaps):
+            partition = gap_partition(gap)
+            if partition is None:
+                continue
+            day_iso, connector_id, pollutant_code = partition
+            decision = decide_observation_repair(gap)
+            if decision.repair_kind == "observation_index_repair":
+                index_only_keys.add((day_iso, connector_id))
+                continue
+            if gap_index not in executable_gap_indexes:
+                if (
+                    decision.repair_kind != "observation_data_repair"
+                ) and not any(
+                    int(item.get("gap_index", -1)) == gap_index
+                    for item in skipped_metadata_gaps
+                ):
+                    skipped_metadata_gaps.append({
+                        "gap_index": gap_index,
+                        "day_utc": day_iso,
+                        "connector_id": connector_id,
+                        "pollutant_code": pollutant_code,
+                        "gap_type": gap.get("gap_type"),
+                        "suggested_repair_kind": decision.repair_kind,
+                        "reason": "not_explicit_observation_data_repair",
+                    })
+                continue
+            ts_ids = _timeseries_ids_for_v2_observation_gap(
+                conn,
+                connector_id=connector_id,
+                gap=gap,
+            )
+            by_key_sets.setdefault((day_iso, connector_id), set()).update(ts_ids)
+            gaps_by_key.setdefault((day_iso, connector_id), []).append(gap)
     targeted_mismatch_ids = {key: sorted(values) for key, values in by_key_sets.items()}
     by_key: dict[tuple[str, int], list[int]] = {
         key: targeted_mismatch_ids[key] for key in sorted(by_key_sets)
     }
     standalone_index_keys = sorted(index_only_keys - set(by_key))
-    metrics["observation_backfill_candidate_days"] = len(by_key)
+    direct_work = [
+        (day_utc, connector_id, [], [pollutant_code])
+        for day_utc, connector_id, pollutant_code in normalized_direct_targets
+    ]
+    metrics["observation_backfill_candidate_days"] = (
+        len(direct_work) if direct_targets is not None else len(by_key)
+    )
     metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
     metrics["observation_backfill_scope"] = "complete_source_derived_selected_pollutants"
-    metrics["executable_repair_pollutants_by_connector_day"] = {
-        f"{day_utc}/connector_id={connector_id}": list(pollutants)
-        for (day_utc, connector_id), pollutants in sorted(
-            executable_pollutants_by_key.items()
-        )
-        if (day_utc, connector_id) in by_key
-    }
+    metrics["executable_repair_pollutants_by_connector_day"] = (
+        {
+            f"{day_utc}/connector_id={connector_id}/pollutant_code={pollutant}":
+                [pollutant]
+            for day_utc, connector_id, pollutant in normalized_direct_targets
+        }
+        if direct_targets is not None else
+        {
+            f"{day_utc}/connector_id={connector_id}": list(pollutants)
+            for (day_utc, connector_id), pollutants in sorted(
+                executable_pollutants_by_key.items()
+            )
+            if (day_utc, connector_id) in by_key
+        }
+    )
     metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     metrics["skipped_v2_observation_metadata_gaps"] = skipped_metadata_gaps
@@ -17718,10 +17835,22 @@ def run_v2_gap_backfills(
     for day_iso, connector_id in standalone_index_keys:
         idx_cmd = _v2_observations_index_rebuild_command(day_iso, connector_id)
         metrics["planned_v2_observation_index_rebuilds"].append(" ".join(idx_cmd))
-    for (day_iso, connector_id), ts_ids in sorted(by_key.items()):
-        selected_repair_pollutants = list(
-            executable_pollutants_by_key.get((day_iso, connector_id)) or []
-        )
+    work_items = (
+        direct_work
+        if direct_targets is not None else
+        [
+            (
+                day_iso,
+                connector_id,
+                ts_ids,
+                list(executable_pollutants_by_key.get(
+                    (day_iso, connector_id)
+                ) or []),
+            )
+            for (day_iso, connector_id), ts_ids in sorted(by_key.items())
+        ]
+    )
+    for day_iso, connector_id, ts_ids, selected_repair_pollutants in work_items:
         if not selected_repair_pollutants:
             metrics["skipped_v2_observation_repairs"].append({
                 "day_utc": day_iso,
@@ -17730,6 +17859,15 @@ def run_v2_gap_backfills(
             })
             continue
         day_obj = dt.date.fromisoformat(day_iso)
+        partition_pollutant = (
+            selected_repair_pollutants[0]
+            if len(selected_repair_pollutants) == 1 else None
+        )
+        tombstones_before = {
+            str(entry.get("prefix") or "")
+            for entry in list((run_state or {}).get("tombstone_prefixes") or [])
+            if isinstance(entry, Mapping)
+        }
         chunks = [[]]
         planned_cmds = [_planned_backfill_command(
             env, [], day_obj, connector_ids=[connector_id],
@@ -17740,7 +17878,19 @@ def run_v2_gap_backfills(
         first_cmd = planned_cmds[0] if planned_cmds else None
         idx_cmd = " ".join(_v2_observations_index_rebuild_command(day_iso, connector_id))
         if limits.should_stop():
-            break
+            if direct_targets is None:
+                break
+            metrics["v2_observation_repairs_failed"] += 1
+            metrics["observation_backfills_failed"] += 1
+            metrics["selected_partition_outcomes"].append({
+                "day_utc": day_iso,
+                "connector_id": connector_id,
+                "pollutant_code": partition_pollutant,
+                "outcome": "blocked_before_mutation",
+                "reason": "operation_limit_reached",
+                "tombstone_created": False,
+            })
+            continue
         source_cache_status = {
             "status": "pending_immutable_detector_source_evidence",
             "reason": "complete canonical source evidence must be captured before proposal",
@@ -17866,6 +18016,55 @@ def run_v2_gap_backfills(
             "reason": "complete canonical source rows and source-file hashes were persisted before proposal"
             if detector_evidence_error is None else detector_evidence_error,
         }
+        all_unmapped_selected_partition = bool(
+            direct_targets is not None
+            and detector_evidence_error is None
+            and int(detector_evidence.get("canonical_rows_mapped") or 0) == 0
+            and int(detector_evidence.get("missing_binding_rows") or 0) > 0
+            and int(detector_evidence.get("source_records_examined") or 0)
+            == int(detector_evidence.get("missing_binding_rows") or 0)
+        )
+        if all_unmapped_selected_partition:
+            outcome = {
+                "day_utc": day_iso,
+                "connector_id": connector_id,
+                "pollutant_code": partition_pollutant,
+                "outcome": "all_groups_excluded_no_authoritative_binding",
+                "selected_partition_left_unchanged": True,
+                "tombstone_created": False,
+                "source_records_examined": int(
+                    detector_evidence.get("source_records_examined") or 0
+                ),
+                "missing_binding_groups": int(
+                    detector_evidence.get("missing_binding_groups") or 0
+                ),
+                "missing_binding_rows": int(
+                    detector_evidence.get("missing_binding_rows") or 0
+                ),
+            }
+            metrics["selected_partition_outcomes"].append(outcome)
+            metrics["all_unmapped_partitions_left_unchanged"] += 1
+            metrics["skipped_v2_observation_repairs"].append({
+                **outcome,
+                "reason": "all_groups_excluded_no_authoritative_binding",
+            })
+            metrics["v2_observation_repair_results"].append({
+                **outcome,
+                "history_version": "v2",
+                "status": "skipped_all_unmapped",
+                "immutable_detector_source_evidence": detector_evidence,
+                "immutable_detector_source_evidence_persistence":
+                    detector_evidence_persistence,
+            })
+            log.warning(
+                "dedicated SOS selected partition left unchanged day=%s "
+                "connector_id=%s pollutant=%s reason=%s",
+                day_iso,
+                connector_id,
+                partition_pollutant,
+                "all_groups_excluded_no_authoritative_binding",
+            )
+            continue
         for gap in gaps_by_key.get((day_iso, connector_id), []):
             _set_v2_source_repair_plan(
                 gap,
@@ -18220,6 +18419,39 @@ def run_v2_gap_backfills(
                     "object_keys": validated_overlay_keys,
                     "stage": "observs",
                 })
+                tombstones_after = {
+                    str(entry.get("prefix") or "")
+                    for entry in list(
+                        run_state.get("tombstone_prefixes") or []
+                    )
+                    if isinstance(entry, Mapping)
+                }
+                exact_tombstones_created = len(
+                    tombstones_after - tombstones_before
+                )
+                metrics["exact_tombstones_created"] += (
+                    exact_tombstones_created
+                )
+                authoritative_no_data = (
+                    int(source_evidence.get("total_rows") or 0) == 0
+                )
+                outcome_name = (
+                    "authoritative_no_data_replacement"
+                    if authoritative_no_data else "complete_replacement"
+                )
+                metrics["selected_partition_outcomes"].append({
+                    "day_utc": day_iso,
+                    "connector_id": connector_id,
+                    "pollutant_code": partition_pollutant,
+                    "outcome": outcome_name,
+                    "tombstone_created": exact_tombstones_created == 1,
+                    "exact_tombstone_count": exact_tombstones_created,
+                    "replacement_object_keys": list(validated_overlay_keys),
+                })
+                if authoritative_no_data:
+                    metrics["authoritative_no_data_replacements"] += 1
+                else:
+                    metrics["complete_replacements"] += 1
             if queue_aqi_from_observation_repairs:
                 action = _queue_aqi_rebuild_from_obs_repair(conn=conn, run_id=run_id, env_name=env_name, connector_id=connector_id, day_utc=day_iso, requested_timeseries_ids=sorted(expected_timeseries_row_counts), queue_note="queued_from_complete_source_connector_day_repair", log=log, history_version="v2")
                 if action in {"inserted", "merged"}:
@@ -18269,6 +18501,22 @@ def run_v2_gap_backfills(
                 repair_entry["exit_code"],
                 repair_entry["error"],
             )
+        if direct_targets is not None and not repair_ok:
+            metrics[
+                "source_invalid_partitions_blocked_before_mutation"
+            ] += 1
+            metrics["selected_partition_outcomes"].append({
+                "day_utc": day_iso,
+                "connector_id": connector_id,
+                "pollutant_code": partition_pollutant,
+                "outcome": "source_invalid_blocked_before_mutation",
+                "reason": (
+                    detector_evidence_error
+                    or manifest_guard_reason
+                    or repair_status
+                ),
+                "tombstone_created": False,
+            })
     metrics["aqi_rebuilds_queued_from_obs_repair"] = len(queued)
     return metrics
 
@@ -21783,6 +22031,7 @@ def run_v2_integrity_repair_flow(
     dedicated_sos_historical_replacement: bool = False,
 ) -> dict[str, Any]:
     """Build one canonical local proposal, then optionally apply and verify it."""
+    explicit_selected_partitions: list[dict[str, Any]] | None = None
     if dedicated_sos_historical_replacement:
         if dry_run:
             raise RuntimeError(
@@ -21795,11 +22044,30 @@ def run_v2_integrity_repair_flow(
                 "dedicated SOS historical replacement requires source=sos and "
                 "connector_id=1 only"
             )
+        explicit_selected_partitions = build_dedicated_sos_selected_partitions(
+            from_day=from_day,
+            to_day=to_day,
+            selected_days=selected_days,
+            repair_pollutants=repair_pollutants,
+        )
         run_state.update({
             "execution_path": SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH,
             "dedicated_sos_historical_replacement": True,
             "mutation_connector_ids": [1],
             "aqi_policy": "bypassed_observation_history_only",
+            "target_authority": "explicit_selected_scope",
+            "explicit_selected_partitions": explicit_selected_partitions,
+            "explicit_selected_partition_count": len(
+                explicit_selected_partitions
+            ),
+            "gap_detection": {
+                "status": "bypassed",
+                "reason": "explicit_selected_scope_is_replacement_authority",
+            },
+            "observation_content_hash_comparison": {
+                "status": "bypassed",
+                "reason": "explicit_selected_scope_is_replacement_authority",
+            },
         })
         write_run_state(run_state)
     observations = run_v2_gap_backfills(
@@ -21811,6 +22079,7 @@ def run_v2_integrity_repair_flow(
         queue_aqi_from_observation_repairs=False,
         repair_pollutants=repair_pollutants,
         source_scope=source_scope,
+        explicit_selected_partitions=explicit_selected_partitions,
     )
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
@@ -22513,6 +22782,8 @@ def run_v2_integrity_repair_flow(
         "mutation_connector_ids": [1] if dedicated_sos_historical_replacement else None,
         "bypassed_stages": (
             [
+                "observation_gap_detection",
+                "observation_content_hash_comparison",
                 "aqi_detection",
                 "aqi_proposal",
                 "aqi_metadata",
@@ -22525,6 +22796,28 @@ def run_v2_integrity_repair_flow(
         "write_enabled": not dry_run,
         "r2_write_attempted": bool(not dry_run and apply_result.get("status") in {"succeeded", "failed"}),
         "planned_object_operation_counts": planned_operation_counts,
+        "target_authority": observations.get("target_authority"),
+        "explicit_selected_partition_count": observations.get(
+            "explicit_selected_partition_count"
+        ),
+        "selected_dates": observations.get("selected_dates"),
+        "selected_pollutants": observations.get("selected_pollutants"),
+        "selected_partition_outcomes": observations.get(
+            "selected_partition_outcomes"
+        ),
+        "complete_replacements": observations.get("complete_replacements"),
+        "authoritative_no_data_replacements": observations.get(
+            "authoritative_no_data_replacements"
+        ),
+        "all_unmapped_partitions_left_unchanged": observations.get(
+            "all_unmapped_partitions_left_unchanged"
+        ),
+        "source_invalid_partitions_blocked_before_mutation": observations.get(
+            "source_invalid_partitions_blocked_before_mutation"
+        ),
+        "exact_tombstones_created": observations.get(
+            "exact_tombstones_created"
+        ),
         "canonical_apply": apply_result,
         "latest_snapshot_auth_preflight": auth_preflight,
         "first_value_at_reconciliation": first_value_at_reconciliation,
@@ -25970,35 +26263,89 @@ def main(argv: list[str]) -> int:
             }
             log.warning("cross-check: skipped — %s", cross_check_metrics["skipped_reason"])
         else:
-            r2_history_root = resolve_r2_history_root(os.environ)
-            v2_obs = run_v2_observations_integrity_checks(
-                r2_history_root=r2_history_root,
-                config=history_path_configs["v2"],
-                from_day=from_day,
-                to_day=to_day,
-                selected_days=selected_day_values,
-                conn=conn,
-                env_name=args.env,
-                allowed_connector_ids=v2_allowed_connector_ids,
-                source_scope=v2_source_scope,
-                log=log,
-                dedicated_sos_historical_replacement=(
-                    dedicated_sos_historical_replacement
-                ),
-            )
-            observation_hash_metrics = run_v2_observation_content_hash_checks(
-                conn=conn,
-                env_name=args.env,
-                run_compact=run_compact,
-                env=env,
-                v2_observations=v2_obs,
-                source_scope=v2_source_scope,
-                log=log,
-                repair_pollutants=args.repair_pollutants,
-                verified_first_value_at_scope_sink=(
-                    verified_first_value_at_connector_days
-                ),
-            )
+            if dedicated_sos_historical_replacement:
+                direct_selected_partitions = (
+                    build_dedicated_sos_selected_partitions(
+                        from_day=from_day,
+                        to_day=to_day,
+                        selected_days=selected_day_values,
+                        repair_pollutants=args.repair_pollutants,
+                    )
+                )
+                v2_obs = {
+                    "status": "bypassed",
+                    "reason":
+                        "dedicated_sos_direct_selected_partition_replacement",
+                    "storage_source": "not_compared",
+                    "checked_partitions": 0,
+                    "gap_count": 0,
+                    "gaps": [],
+                    "repair_plan": [],
+                    "target_authority": "explicit_selected_scope",
+                    "explicit_selected_partition_count": len(
+                        direct_selected_partitions
+                    ),
+                    "explicit_selected_partitions":
+                        direct_selected_partitions,
+                    "selected_dates": sorted({
+                        str(item["day_utc"])
+                        for item in direct_selected_partitions
+                    }),
+                    "selected_pollutants": sorted({
+                        str(item["pollutant_code"])
+                        for item in direct_selected_partitions
+                    }),
+                    "gap_detection": {
+                        "status": "bypassed",
+                        "reason":
+                            "explicit_selected_scope_is_replacement_authority",
+                    },
+                    "all_unmapped_partitions_left_unchanged": [],
+                    "first_value_at_candidate_scopes": [],
+                }
+                observation_hash_metrics = {
+                    "status": "bypassed",
+                    "reason":
+                        "explicit_selected_scope_is_replacement_authority",
+                    "checked_partitions": 0,
+                }
+                v2_obs["observation_content_hash_checks"] = dict(
+                    observation_hash_metrics
+                )
+                log.info(
+                    "dedicated SOS observation gap and content-hash "
+                    "comparison bypassed; explicit_selected_partitions=%s",
+                    len(direct_selected_partitions),
+                )
+            else:
+                r2_history_root = resolve_r2_history_root(os.environ)
+                v2_obs = run_v2_observations_integrity_checks(
+                    r2_history_root=r2_history_root,
+                    config=history_path_configs["v2"],
+                    from_day=from_day,
+                    to_day=to_day,
+                    selected_days=selected_day_values,
+                    conn=conn,
+                    env_name=args.env,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    source_scope=v2_source_scope,
+                    log=log,
+                )
+                observation_hash_metrics = (
+                    run_v2_observation_content_hash_checks(
+                        conn=conn,
+                        env_name=args.env,
+                        run_compact=run_compact,
+                        env=env,
+                        v2_observations=v2_obs,
+                        source_scope=v2_source_scope,
+                        log=log,
+                        repair_pollutants=args.repair_pollutants,
+                        verified_first_value_at_scope_sink=(
+                            verified_first_value_at_connector_days
+                        ),
+                    )
+                )
             if dedicated_sos_historical_replacement:
                 v2_aqi = {
                     "status": "bypassed",
