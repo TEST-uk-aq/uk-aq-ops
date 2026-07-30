@@ -35,6 +35,39 @@ The evidence MUST include, or deterministically identify:
 
 Later proposal, compatibility, metadata, apply and verification stages MUST NOT modify or replace this evidence.
 
+### Source-evidence row storage and canonical loading
+
+The established `obs_history_rows.json` row format remains:
+
+```text
+timeseries_id
+station_id
+pollutant_code
+observed_at
+value
+verification_status
+```
+
+The file MUST NOT be changed merely to duplicate `connector_id` into every row or to rename `observed_at` to `observed_at_utc` for the apply verifier.
+
+The immutable-source loader already knows the connector and day from the enclosing evidence partition and `source-evidence.json`. It MUST reconstruct each canonical observation row by:
+
+1. taking `connector_id` from the validated enclosing `day_utc + connector_id` evidence scope;
+2. preserving `station_id`, `timeseries_id`, `pollutant_code`, `value` and `verification_status` from the stored row;
+3. mapping stored `observed_at` to canonical `observed_at_utc`;
+4. normalising the timestamp to the exact UTC millisecond format required by the canonical observation-content-hash contract;
+5. validating the reconstructed row through the shared canonical observation-row normaliser.
+
+The loader MUST fail closed when:
+
+- the enclosing connector or day identity disagrees with `source-evidence.json`;
+- a stored row contains a conflicting embedded connector identity if a future schema adds one;
+- `observed_at` is absent, invalid or outside the selected UTC day;
+- any other canonical row field is invalid;
+- the reconstructed rows do not match the counts and content hashes recorded in `source-evidence.json`.
+
+Tests and fixtures for this path MUST use the real stored `obs_history_rows.json` schema. They MUST NOT use already-expanded canonical rows containing `connector_id` and `observed_at_utc` as a substitute for testing the loader adapter.
+
 ## Proposal ownership and compatibility metadata
 
 A structurally validated source-derived observation repair owns its canonical selected-pollutant Parquet and pollutant-manifest keys for the current run.
@@ -43,21 +76,53 @@ A legacy or canonical compatibility stage MAY create a proposal only when the ca
 
 A compatibility proposal MUST NOT unconditionally replace, rewrite or take precedence over an existing source-derived repair proposal.
 
-When a compatibility stage encounters a canonical key already proposed by the source-derived repair, it MUST do one of the following:
+### Existing source-derived manifest
 
-1. independently derive the expected metadata from the final staged Parquet and confirm that its substantive body and dependency identities are identical to the existing source-derived proposal; or
-2. fail closed with an explicit proposal-collision error.
+When a compatibility or metadata stage encounters a pollutant-manifest key already owned by a structurally validated source-derived repair, it MUST NOT build a second complete manifest and require complete JSON equality.
 
-It MUST NOT rebuild a replacement from stale Dropbox baseline metadata and then overwrite the current-run proposal.
+Instead, it MUST:
+
+1. independently derive the content-defining manifest facts from the final staged Parquet;
+2. verify that those facts agree with the existing source-derived manifest;
+3. verify that the existing manifest's dependency identities agree with the final staged Parquet objects;
+4. retain the existing source-derived manifest body and ownership unchanged when those checks pass;
+5. fail closed before any R2 mutation when a content-defining field or dependency identity differs.
+
+The semantic comparison MUST include at least:
+
+- history version, domain, manifest kind, day, connector and pollutant identity;
+- canonical Parquet object keys;
+- per-part byte sizes, SHA-256 identities and row counts;
+- total row count and source row count;
+- required per-timeseries row counts;
+- `observation_content_hash`;
+- observation-content-hash algorithm, contract version, row count and columns;
+- `verification_status_counts`;
+- physical schema fields where they describe the staged Parquet contract;
+- all dependency identities used by parent manifests or scoped indexes.
+
+Differences only in run-scoped or operational metadata MUST NOT create a proposal collision when the content-defining facts and dependencies agree. Examples include:
+
+- `run_id`;
+- `backed_up_at_utc`;
+- `writer_git_sha`;
+- a derived `manifest_hash` that changes only because one of those operational fields differs;
+- other explicitly documented non-content operational metadata.
+
+These operational fields MUST remain whatever the authoritative source-derived manifest builder produced. The compatibility stage MUST NOT rewrite them.
+
+A collision failure MUST report the exact differing content-defining fields and the competing proposal owners. A generic `substantive_body` or complete-body mismatch is insufficient for this path.
+
+The compatibility stage MUST NOT rebuild a replacement from stale Dropbox baseline metadata and then overwrite the current-run proposal.
 
 For canonical-key resolution during planning and finalisation, precedence is:
 
-1. a structurally validated current-run source-derived replacement;
-2. a compatible current-run proposal whose substantive body is proven identical;
+1. a structurally validated current-run source-derived replacement whose staged-Parquet semantics have been verified;
+2. a compatibility proposal only when no current-run source-derived owner exists;
 3. a current-run exact tombstone where applicable;
 4. otherwise the chosen Dropbox baseline.
 
-A disagreement between two producers for the same canonical key is a blocking planning defect, not a last-writer-wins condition.
+A disagreement between producers over a content-defining field for the same canonical key is a blocking planning defect, not a last-writer-wins condition.
 
 ## Final proposal graph validation before R2 mutation
 
@@ -86,13 +151,15 @@ The comparison MUST include at least:
 
 The final proposal validator MUST also require that:
 
+- every source-derived repaired pollutant partition has exactly one matching exact pollutant-prefix tombstone where replacement requires prefix deletion;
+- every exact pollutant-prefix tombstone has its matching staged Parquet and pollutant manifest;
 - every parent manifest references the final validated child manifest identity;
 - every scoped index is derived from final validated child metadata;
 - a staged current-run key is not unexpectedly resolved from Dropbox;
 - all exact tombstones remain limited to the selected pollutant prefixes;
 - preserved unselected and out-of-scope children remain structurally accounted for.
 
-Any mismatch MUST fail the run before any live R2 mutation. The report MUST identify the canonical key, competing proposal owners and differing fields.
+Any mismatch MUST fail the run before any live R2 mutation. The report MUST identify the canonical key, competing proposal owners and exact differing fields.
 
 Structural validation performed before a later finaliser modifies the proposal is not sufficient. The validation applies to the final immutable proposal that will be sent to the R2 apply stage.
 
@@ -112,7 +179,7 @@ verified live R2 Parquet semantic result
 proposed and written pollutant manifest
 ```
 
-The checks MUST establish exact agreement for the canonical content hash, row count, status counts and all other required manifest fields.
+The checks MUST establish exact agreement for the canonical content hash, row count, status counts and all other required content-defining manifest fields.
 
 A correct live R2 Parquet paired with an incorrect proposed manifest MUST be reported as a manifest or proposal defect. It MUST NOT be reported as incorrect live observation data.
 
@@ -191,7 +258,10 @@ A real Integrity repair report MUST distinguish:
 
 - final proposal-graph validation status;
 - canonical proposal ownership for every changed manifest key;
-- compatibility collisions and whether identical proposals were accepted;
+- compatibility encounters with existing source-derived owners;
+- whether an existing source-derived manifest was retained after semantic validation;
+- exact content-defining collision fields when validation fails;
+- source-evidence row-adapter validation status;
 - source evidence hash and status counts;
 - staged Parquet semantic hash and status counts;
 - live R2 byte verification;
@@ -207,9 +277,15 @@ The audit MUST keep byte verification, semantic verification and manifest verifi
 
 Before deployment, run only the smallest directly relevant deterministic checks needed to prove structural viability. They MUST prove:
 
-- compatibility metadata cannot overwrite a non-identical source-derived manifest;
-- identical duplicate proposals for one canonical key may be accepted deterministically;
-- a non-identical proposal collision fails before the first R2 mutation;
+- compatibility metadata cannot overwrite a source-derived manifest;
+- an existing source-derived manifest is retained when its content-defining fields and dependencies match the final staged Parquet;
+- differences only in `run_id`, timestamps, `writer_git_sha` or derived operational hash fields do not create a collision;
+- a content-defining difference reports the exact differing field and fails before the first R2 mutation;
+- the source-evidence loader accepts the real stored `obs_history_rows.json` schema;
+- the loader injects the validated enclosing `connector_id` and maps `observed_at` to canonical `observed_at_utc`;
+- a conflicting embedded connector identity or invalid timestamp fails closed;
+- the reconstructed source rows match the recorded evidence counts and hashes;
+- every repaired staged pollutant partition has its required exact tombstone and vice versa;
 - final staged Parquet, immutable source evidence and final manifest must all agree;
 - live semantic verification compares against immutable source evidence rather than trusting the proposed manifest;
 - an incorrect manifest is classified separately from correct live Parquet content;
@@ -226,11 +302,13 @@ Do not add a broad speculative pre-deployment test suite.
 After deployment, validate through real TEST operation:
 
 1. run a scoped repair containing at least one genuine source-to-R2 observation mismatch;
-2. confirm the final proposal graph passes before the first R2 mutation;
-3. confirm live R2 Parquet semantic content equals immutable source evidence;
-4. confirm the written pollutant manifest equals the verified live result;
-5. confirm publication follows the required child-to-parent order;
-6. confirm the bounded cache reuses the already verified GET body without a second GET where eligible;
-7. confirm the next successful Dropbox backup and later check-only run report the repaired scope as valid.
+2. confirm an existing source-derived manifest is retained after compatibility semantic validation;
+3. confirm the real stored source-evidence rows are reconstructed into canonical rows successfully;
+4. confirm the final proposal graph passes before the first R2 mutation;
+5. confirm live R2 Parquet semantic content equals immutable source evidence;
+6. confirm the written pollutant manifest equals the verified live result;
+7. confirm publication follows the required child-to-parent order;
+8. confirm the bounded cache reuses the already verified GET body without a second GET where eligible;
+9. confirm the next successful Dropbox backup and later check-only run report the repaired scope as valid.
 
 Functional acceptance occurs through the real CIC-Test operation. Pre-deployment checks remain structural and narrowly targeted.
