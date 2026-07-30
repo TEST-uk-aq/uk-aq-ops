@@ -7,6 +7,7 @@ This area governs:
 - stable v2 physical timeseries binding identity and routing;
 - embedded multi-member continuity families in schema-version-2 bindings;
 - v2 history Integrity detection, planning and repair;
+- the dedicated SOS historical complete-partition replacement path;
 - post-verification reconciliation of `timeseries` freshness and Latest Snapshot current state;
 - scheduled Integrity daily date selection;
 - the connector-specific IngestDB-to-R2 boundary used by Integrity;
@@ -41,6 +42,8 @@ For binding and continuity changes:
 For Integrity changes, also read:
 
 - [`integrity.md`](integrity.md);
+- [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md) for write-enabled SOS historical complete-partition replacement;
+- [`integrity_apply_safety_contract.md`](integrity_apply_safety_contract.md) for proposal ownership and generic apply safety, subject to the SOS mode-specific amendment above;
 - [`current_state_reconciliation.md`](current_state_reconciliation.md) where a verified history repair can affect `timeseries` freshness or Latest Snapshot;
 - [`../latest_snapshot/integrity_reconciliation.md`](../latest_snapshot/integrity_reconciliation.md) for the Latest Snapshot owner-service boundary;
 - [`history_writer_coordination.md`](history_writer_coordination.md) for the request-level IngestDB boundary, shared writer and lock hierarchy;
@@ -109,6 +112,7 @@ The existing backup category remains `timeseries_binding_v2`; there is no separa
 The current observation-content-hash and verification-status contracts are jointly defined by:
 
 - [`integrity.md`](integrity.md) for source normalisation, comparison, fault classification, planning, repair and post-repair verification;
+- [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md) for the dedicated write-enabled SOS complete-replacement and single ordered live-verification path;
 - [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md) for the normal Phase B writer, canonical Parquet schema and manifest publication;
 - [`history_writer_coordination.md`](history_writer_coordination.md) for shared writer ownership and concurrent live mutation;
 - [`implementation_safety_contract.md`](implementation_safety_contract.md) for the requirement that both live mutation paths use the same canonical builders and validators rather than only a common lock wrapper;
@@ -143,6 +147,7 @@ Required behaviour includes:
 - a different final verified same-timestamp value or status may be applied once as a correction;
 - check-only and dry-run modes remain non-mutating;
 - R2 history, timeseries reconciliation and Latest Snapshot reconciliation retain separate component statuses;
+- the dedicated SOS historical path retains both Timeseries and Latest Snapshot reconciliation after its ordered live R2 verification succeeds;
 - the line chart continues using its normal recent-head and R2 history routes without a browser-side SOS fallback.
 
 ## Shared history writer and lock hierarchy
@@ -209,6 +214,8 @@ Required behaviour includes:
 - check-only and dry-run Integrity modes cannot change prune eligibility;
 - if the aggregate day gate is retained, its totals must describe the complete merged day manifest rather than only the current run's candidates.
 
+Prune Daily MUST NOT use Dropbox as a source, planning baseline, verification source or deletion authority.
+
 ## AQI writer source boundary
 
 The only supported Phase B AQI implementation is the observation-derived writer defined in [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
@@ -223,15 +230,16 @@ Required behaviour includes:
 - the active Phase B AQI path requires `UK_AQ_R2_HISTORY_VERSION=v2` and fails closed rather than executing a v1 branch;
 - incomplete or truncated context fails AQI for the affected connector-day;
 - an AQI-only failure does not block or revoke a verified connector observation deletion gate;
-- AQI data, debug, manifest and index completion remain separate aggregate outcomes.
+- AQI data, debug, manifest and index completion remain separate aggregate outcomes;
+- the dedicated SOS historical replacement path does not invoke or validate AQI data, AQI debug, AQI manifests or AQI indexes.
 
 ## Integrity historical rollover rule
 
 Integrity must distinguish a date-invalid R2 member of a known continuity family from a genuinely unknown timeseries.
 
-For a bridge-known rollover, source mapping remains available and physical source/R2 mismatch evidence must be emitted. Repair execution remains gated until continuity-aware station history has been deployed and confirmed in TEST.
+For the generic Integrity path, a bridge-known rollover retains its existing continuity-aware handling. For the dedicated SOS complete-replacement path, legacy R2-only identities inside the selected partition are diagnostic and do not require continuity mapping when complete current SOS evidence and valid replacement identities are available.
 
-Unknown, ambiguous or contradictory identity remains fail-closed.
+Unknown, ambiguous or contradictory identity in fresh selected SOS source evidence remains fail-closed. The established warning-only `no_authoritative_timeseries_binding` case is excluded consistently and does not block other valid rows.
 
 ## Implementation ownership
 
@@ -249,6 +257,7 @@ Unknown, ambiguous or contradictory identity remains fail-closed.
 - `workers/uk_aq_prune_daily/server.mjs`
 - `workers/uk_aq_prune_daily/phase_b_history_r2.mjs`
 - `workers/uk_aq_backfill_local/`
+- the dedicated SOS historical replacement route selected inside the existing repository-owned Integrity execution path
 - the private schema migration and RPC used for monotonic timeseries reconciliation
 - `lib/aqi/aqi_levels.mjs`
 - `scripts/backup_r2/`
