@@ -8,7 +8,9 @@ import {
   applyValidatedProposal,
   assertPublicationDependenciesVerified,
   createVerifiedGetBodyCache,
+  putAndVerifyObject,
   publicationRank,
+  validateDedicatedSosHistoricalProposal,
   validateFinalProposalGraph,
   validateLocalProposal,
   verifyLiveObservationPartition,
@@ -28,8 +30,13 @@ import {
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import {
   buildHistoryV2PollutantManifest,
+  buildHistoryV2ConnectorManifest,
+  buildHistoryV2DayManifest,
   serializeCanonicalObservationV2Parquet,
 } from "../../../workers/shared/uk_aq_r2_history_canonical.mjs";
+import {
+  updateR2HistoryIndexesTargeted,
+} from "../../../workers/shared/uk_aq_r2_history_index.mjs";
 
 function writeObject(root, key, body) {
   const filePath = path.join(root, ...key.split("/"));
@@ -507,4 +514,158 @@ test("verified GET cache requires exact key and SHA, invalidates on mutation, an
   cache.clear("connector_day_scope_complete");
   assert.equal(cache.snapshot().current_entries, 0);
   assert.equal(cache.snapshot().current_bytes, 0);
+});
+
+test("dedicated SOS proposal accepts one exact connector-1 observation tombstone and rejects broader scope", async () => {
+  const fixture = await observationFixture();
+  Object.assign(fixture.runState, {
+    execution_path: "dedicated_sos_historical_observation_replacement",
+    mutation_connector_ids: [1],
+    aqi_policy: "bypassed_observation_history_only",
+    changed_scopes: {
+      AQILEVELS_CHANGED: [],
+      AQI_MANIFESTS_CHANGED: [],
+      AQI_INDEXES_CHANGED: [],
+    },
+  });
+  const proposal = validateLocalProposal(fixture.runState);
+  const validated = validateDedicatedSosHistoricalProposal({
+    runState: fixture.runState,
+    proposal,
+  });
+  assert.equal(validated.dedicated, true);
+  assert.equal(validated.connector_id, 1);
+  assert.equal(validated.exact_pollutant_prefix_count, 1);
+
+  fixture.runState.mutation_connector_ids = [2];
+  assert.throws(
+    () => validateDedicatedSosHistoricalProposal({
+      runState: fixture.runState,
+      proposal,
+    }),
+    /invalid execution-scope evidence/,
+  );
+});
+
+test("changed-object apply records exactly one post-PUT verification GET", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-integrity-get-once-"));
+  const runStatePath = path.join(root, "run-state.json");
+  const key = "history/_index_v2/observations_timeseries_latest.json";
+  const body = Buffer.from('{"ok":true}');
+  const entry = { bytes: body.byteLength, sha256: sha256Hex(body) };
+  const runState = { objects: { [key]: entry } };
+  fs.writeFileSync(runStatePath, JSON.stringify(runState));
+  let putCount = 0;
+  let getCount = 0;
+  const adapters = {
+    putObject: async () => { putCount += 1; },
+    getObject: async () => {
+      getCount += 1;
+      return { body, bytes: body.byteLength };
+    },
+  };
+  const object = { key, body, entry };
+  await putAndVerifyObject({
+    r2: {},
+    runState,
+    runStatePath,
+    object,
+    adapters,
+  });
+  assert.equal(putCount, 1);
+  assert.equal(getCount, 1);
+  assert.equal(entry.post_put_verification_get_attempt_count, 1);
+  assert.equal(entry.post_put_verification_get_count, 1);
+  await assert.rejects(
+    putAndVerifyObject({
+      r2: {},
+      runState,
+      runStatePath,
+      object,
+      adapters,
+    }),
+    /already has post-PUT GET bookkeeping/,
+  );
+  assert.equal(putCount, 1);
+  assert.equal(getCount, 1);
+});
+
+test("dedicated global finalization updates only live observations latest metadata", async () => {
+  const fixture = await observationFixture();
+  const pollutant = JSON.parse(fixture.manifestBody.toString("utf8"));
+  const dayUtc = pollutant.day_utc;
+  const connectorId = pollutant.connector_id;
+  const connectorKey = `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
+  const dayKey = `history/v2/observations/day_utc=${dayUtc}/manifest.json`;
+  const connector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    grain: null,
+    profile: null,
+    dayUtc,
+    connectorId,
+    runId: null,
+    manifestKey: connectorKey,
+    pollutantManifests: [pollutant],
+    writerGitSha: null,
+    backedUpAtUtc: pollutant.backed_up_at_utc,
+  });
+  const day = buildHistoryV2DayManifest({
+    domain: "observations",
+    grain: null,
+    profile: null,
+    dayUtc,
+    runId: null,
+    manifestKey: dayKey,
+    connectorManifests: [connector],
+    writerGitSha: null,
+    backedUpAtUtc: connector.backed_up_at_utc,
+  });
+  const objects = new Map([
+    [fixture.manifestKey, fixture.manifestBody],
+    [connectorKey, Buffer.from(JSON.stringify(connector))],
+    [dayKey, Buffer.from(JSON.stringify(day))],
+  ]);
+  const putKeys = [];
+  const r2 = {
+    endpoint: "https://example.invalid",
+    region: "auto",
+    access_key_id: "test",
+    secret_access_key: "test",
+    bucket: "uk-aq-history-cic-test",
+    adapter: {
+      getObject: async ({ key }) => {
+        const body = objects.get(key);
+        if (!body) {
+          const error = new Error(`missing ${key}`);
+          error.code = "OBJECT_NOT_FOUND";
+          throw error;
+        }
+        return { key, body, bytes: body.byteLength };
+      },
+      headObject: async ({ key }) => ({ exists: objects.has(key), key, etag: null }),
+      putObject: async ({ key, body }) => {
+        putKeys.push(key);
+        objects.set(key, Buffer.isBuffer(body) ? body : Buffer.from(body));
+        return { key };
+      },
+      listAllObjects: async () => {
+        throw new Error("scoped pollutant indexes must not be listed or rewritten");
+      },
+    },
+  };
+  const result = await updateR2HistoryIndexesTargeted({
+    env: {},
+    r2,
+    historyVersion: "v2",
+    domains: ["observations"],
+    affectedDaysUtc: [dayUtc],
+    updateLatestIndex: true,
+    writePollutantIndexes: false,
+    strictMissingTimeseriesCounts: true,
+    writeR2: true,
+  });
+  assert.deepEqual(putKeys, ["history/_index_v2/observations_timeseries_latest.json"]);
+  assert.equal(result.observations_timeseries.wrote_pollutant_indexes, false);
+  assert.equal(result.observations_timeseries.latest_index_verified, true);
+  assert.equal(result.observations_timeseries.latest_index_put_skipped, false);
 });

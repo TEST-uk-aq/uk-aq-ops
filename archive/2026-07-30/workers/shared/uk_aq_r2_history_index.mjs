@@ -3212,7 +3212,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   connectorId = null,
   connectorManifestKey = null,
   updateLatestIndex = true,
-  writePollutantIndexes = true,
   additionalPollutantManifestTargets = [],
   writeR2 = true,
 }) {
@@ -3357,8 +3356,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
               pollutantTarget.pollutant_code,
             )
         ));
-        const shouldWriteConnector = writePollutantIndexes
-          && (!normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId);
+        const shouldWriteConnector = !normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId;
         const stalePollutantIndexes = [];
         if (shouldWriteConnector) {
           const connectorIndexPrefix = `${normalizedTimeseriesPrefix}/day_utc=${dayUtc}/connector_id=${connectorTarget.connector_id}/`;
@@ -3395,8 +3393,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
                 r2,
                 pollutantTarget.manifest_key,
               );
-              const shouldWrite = writePollutantIndexes
-                && (!normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId);
+              const shouldWrite = !normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId;
               if (computeMissingTimeseriesCounts && shouldWrite) {
                 pollutantManifestObject = await maybePatchHistoryV2PollutantManifestWithCounts({
                   r2,
@@ -3566,14 +3563,11 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     })
     : existingLatestPayload;
 
-  const latestBody = updateLatestIndex
-    ? `${JSON.stringify(latestPayload, null, 2)}\n`
-    : null;
   const latestPut = updateLatestIndex
     ? await r2PutObjectIfChanged({
       r2,
       key: latestKey,
-      body: latestBody,
+      body: `${JSON.stringify(latestPayload, null, 2)}\n`,
       content_type: "application/json; charset=utf-8",
       writeR2,
     })
@@ -3596,10 +3590,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     latest_index_key: latestKey,
     latest_index_bytes: latestPut.bytes,
     latest_index_put_skipped: Boolean(latestPut.skipped),
-    latest_index_status: latestPut.status,
-    latest_index_verified: Boolean(latestPut.verified),
-    latest_index_sha256: latestBody == null ? null : sha256Hex(latestBody),
-    wrote_pollutant_indexes: Boolean(writePollutantIndexes),
     data_prefix: normalizedDataPrefix,
     timeseries_index_prefix: normalizedTimeseriesPrefix,
     updated_latest_index: Boolean(updateLatestIndex),
@@ -4062,7 +4052,6 @@ export async function updateR2HistoryIndexesTargeted({
   connectorId = null,
   connectorManifestKey = null,
   updateLatestIndex = true,
-  writePollutantIndexes = true,
   generatedAt = new Date().toISOString(),
   fetchConcurrency,
   computeMissingTimeseriesCounts = false,
@@ -4116,7 +4105,6 @@ export async function updateR2HistoryIndexesTargeted({
         connectorId,
         connectorManifestKey,
         updateLatestIndex,
-        writePollutantIndexes,
         additionalPollutantManifestTargets,
         writeR2,
       });
