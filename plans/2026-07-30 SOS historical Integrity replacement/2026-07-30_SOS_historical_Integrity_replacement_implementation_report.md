@@ -10,20 +10,35 @@ The dedicated path now derives every executable replacement partition directly f
 
 For this route, observation gap detection and source-versus-Dropbox content-hash comparison are recorded as bypassed. The run records `target_authority=explicit_selected_scope`, the selected partition count, dates, pollutants, per-partition outcomes, complete and authoritative-no-data replacement counts, all-unmapped skips, source-invalid blocks, and exact tombstone count. Success depends on every explicit partition outcome and the ordered apply verification, not on a zero gap count.
 
+The suspected same-day multi-pollutant source-evidence collision was confirmed in commit `f5b5ed4`. Each pollutant worker wrote and later removed the same connector-day `source-evidence.json` and `obs_history_rows.json` paths, while the final JavaScript proposal validator also resolved evidence only by day and connector. The last pollutant therefore replaced the earlier files, and final proposal validation would compare earlier pollutant objects with the last pollutant's evidence. That mismatch failed closed before the apply executor could issue an R2 DELETE or PUT.
+
+Dedicated SOS evidence is now retained immutably under:
+
+```text
+<overlay>/source-evidence/day_utc=<day>/connector_id=1/pollutant_code=<pollutant>/
+  source-evidence.json
+  obs_history_rows.json
+```
+
+Run state records each `day_utc + connector_id + pollutant_code` identity with its exact evidence and rows paths and SHA-256 values. The final proposal and live semantic validators require that exact mapping and verify the retained hashes before comparing the pollutant's staged or live content. A later pollutant can still reuse the worker's temporary connector-day directory, but it cannot remove or mutate an earlier pollutant's retained evidence.
+
 ## Files changed
 
-This direct-selection correction changes only the Python Integrity implementation, its focused Python test file, and this report. The JavaScript apply and shared index modules listed below remain the unchanged owners delivered by the original implementation.
+The source-evidence collision correction changes the Python Integrity implementation and focused test, the JavaScript apply validator and focused safety test, the shared observation-content-hash helper's explicit empty-evidence function, and this report. The shared index module remains unchanged from the original implementation.
 
 - `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
   - strict route selection and run-summary audit;
   - direct explicit selected-partition target ownership for the dedicated route;
   - dedicated observation gap and Dropbox content-hash comparison bypass;
+  - immutable pollutant-scoped evidence retention and run-state identity records;
   - all-unmapped partition preservation;
   - legacy R2-only identity diagnostic handling;
   - AQI detection/proposal bypass;
   - ordered-apply evidence accepted without a second broad final scan;
   - existing Timeseries and Latest Snapshot reconciliation retained.
 - `scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`
+  - exact pollutant-scoped source-evidence resolution and retained-hash checks;
+  - dedicated authoritative no-data evidence validation without weakening generic empty-partition rejection;
   - connector-1 observation-only proposal guard;
   - verified-body cache capacity preflight;
   - exact post-PUT GET bookkeeping;
@@ -31,11 +46,13 @@ This direct-selection correction changes only the Python Integrity implementatio
 - `workers/shared/uk_aq_r2_history_index.mjs`
   - narrow `writePollutantIndexes` option so the global finaliser can merge and verify the live observations latest index without rewriting already verified scoped indexes.
 - `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`
-  - focused route, direct matching-baseline replacement, all-unmapped, legacy-ID and AQI-bypass checks.
+  - focused route, single-pollutant matching-baseline, same-day two-pollutant evidence retention, all-unmapped, legacy-ID and AQI-bypass checks.
 - `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`
-  - focused exact-tombstone, connector-scope and GET-once checks.
+  - focused two-pollutant evidence-to-proposal validation, authoritative no-data, exact-tombstone, connector-scope and GET-once checks.
+- `workers/shared/uk_aq_observation_content_hash.mjs`
+  - an explicit empty-partition metadata owner used only by proven authoritative no-data handling; normal content-hash calls still reject empty partitions.
 
-Required pre-change archive snapshots were retained under `archive/2026-07-30/`. No file under `system_docs/` was changed.
+Required pre-change archive snapshots from the original implementation remain under `archive/2026-07-30/`. As explicitly requested for this correction, no additional full-file archive copy was created. No file under `system_docs/` was changed.
 
 ## Existing modules reused
 
@@ -59,6 +76,8 @@ dedicated_sos_historical_observation_replacement
 In this mode the coordinator does not call AQI integrity detection, AQI queueing, AQI generation, AQI metadata/index planning or AQI debug work. It also does not call the generic broad final-verification scan. Existing AQI objects remain untouched.
 
 `build_dedicated_sos_selected_partitions()` owns the dedicated executable target set. It expands the inclusive selected day scope across connector `1` and every explicit repair pollutant, then feeds each selected partition independently into the existing immutable source-evidence, canonical proposal and exact-tombstone owners. `run_v2_gap_backfills()` retains its original gap-derived branch for every non-dedicated caller; only the dedicated branch accepts the explicit target list.
+
+Immediately after each dedicated detector result is validated and persisted, `_retain_dedicated_sos_partition_source_evidence()` copies its evidence and canonical rows once into the pollutant-scoped immutable layout and records the identity in `source_evidence_partitions`. Generic Integrity continues to use the existing connector-day worker paths and evidence loading semantics.
 
 The dedicated entrypoint does not call `run_v2_observations_integrity_checks()` or `run_v2_observation_content_hash_checks()` as repair prerequisites. Their dedicated report entries are bypass records. Check-only, dry-run, non-SOS and generic Integrity execution still use the existing comparison and gap-derived logic unchanged.
 
@@ -88,8 +107,8 @@ The ordered apply audit becomes the final R2 history evidence. `second_broad_r2_
 - Public Python entrypoint import and `--help`: passed; supported arguments are unchanged.
 - Repository dispatcher and runner shell syntax: passed.
 - Repository runner `--help`: passed and still identifies the established local dispatcher path.
-- Focused Python dedicated SOS checks: 5 passed, including a matching Dropbox-baseline case that still produces the complete replacement proposal and one exact pollutant-prefix tombstone.
-- Focused canonical apply safety checks: 13 passed.
+- Focused Python dedicated SOS checks: 6 passed, including the retained single-pollutant matching-baseline case and a same-day `no2,pm25` case with two evidence identities, tombstones and replacement object sets.
+- Focused canonical apply safety checks: 15 passed, including successful final proposal validation of two same-day pollutants against their own evidence and authoritative no-data evidence.
 - Existing focused observation metadata repair check: 1 passed.
 - `git diff --check`: passed.
 
@@ -118,6 +137,8 @@ Intended 1-16 June range for the full supported SOS observation subset:
 ```
 
 For each run, confirm the report selects the dedicated path, names connector `1`, records no AQI invocation, reports exact selected-prefix tombstones, shows one post-PUT verification GET per changed object, records no broad final scan, and separates R2 history, Timeseries, Latest Snapshot and overall outcomes.
+
+Both the single-pollutant command and the multi-pollutant range command are now structurally supported: every selected pollutant retains a separate immutable evidence identity through final proposal validation, ordered apply and live verification.
 
 ## Deployment and operator handover
 

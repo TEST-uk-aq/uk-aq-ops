@@ -11,6 +11,7 @@ import {
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
+  computeEmptyObservationContentHash,
   computeObservationContentHash,
   encodeCanonicalObservationRow,
   normalizeCanonicalObservationRow,
@@ -653,21 +654,70 @@ function parseFinalJsonBody({ key, object, body, differingField }) {
   }
 }
 
-function sourceEvidencePaths(runState, dayUtc, connectorId) {
+function sourceEvidencePaths(runState, dayUtc, connectorId, pollutantCode) {
   const configuredRoot = String(runState.overlay_root || "").trim();
   if (!configuredRoot) throw new Error("Final proposal graph has no overlay root");
   const root = path.resolve(configuredRoot);
+  const identity = `day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
+  const retained = runState.source_evidence_partitions?.[identity];
+  if (retained) {
+    const expectedDirectory = path.join(
+      root,
+      "source-evidence",
+      `day_utc=${dayUtc}`,
+      `connector_id=${connectorId}`,
+      `pollutant_code=${pollutantCode}`,
+    );
+    const evidencePath = path.resolve(String(retained.evidence_path || ""));
+    const rowsPath = path.resolve(String(retained.rows_path || ""));
+    if (retained.identity !== identity
+      || retained.day_utc !== dayUtc
+      || Number(retained.connector_id) !== connectorId
+      || retained.pollutant_code !== pollutantCode
+      || evidencePath !== path.join(expectedDirectory, "source-evidence.json")
+      || rowsPath !== path.join(expectedDirectory, "obs_history_rows.json")) {
+      throw new Error(`Pollutant-scoped source evidence identity is invalid: ${identity}`);
+    }
+    return {
+      evidencePath,
+      rowsPath,
+      identity,
+      pollutantScoped: true,
+      retainedEvidenceSha256: String(retained.evidence_sha256 || ""),
+      retainedRowsSha256: String(retained.rows_sha256 || ""),
+    };
+  }
+  if (runState.execution_path === "dedicated_sos_historical_observation_replacement") {
+    throw new Error(`Pollutant-scoped source evidence is missing: ${identity}`);
+  }
   const directory = path.join(root, `day_utc=${dayUtc}`, `connector_id=${connectorId}`);
   return {
     evidencePath: path.join(directory, "source-evidence.json"),
     rowsPath: path.join(directory, "obs_history_rows.json"),
+    identity: `day_utc=${dayUtc}/connector_id=${connectorId}`,
+    pollutantScoped: false,
+    retainedEvidenceSha256: null,
+    retainedRowsSha256: null,
   };
 }
 
 function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutantCode }) {
-  const { evidencePath, rowsPath } = sourceEvidencePaths(runState, dayUtc, connectorId);
+  const {
+    evidencePath,
+    rowsPath,
+    identity,
+    pollutantScoped,
+    retainedEvidenceSha256,
+    retainedRowsSha256,
+  } = sourceEvidencePaths(runState, dayUtc, connectorId, pollutantCode);
   const evidenceBody = fs.readFileSync(evidencePath);
   const rowsBody = fs.readFileSync(rowsPath);
+  if (pollutantScoped && (
+    sha256Hex(evidenceBody) !== retainedEvidenceSha256
+    || sha256Hex(rowsBody) !== retainedRowsSha256
+  )) {
+    throw new Error(`Pollutant-scoped source evidence changed after capture: ${identity}`);
+  }
   const evidence = JSON.parse(evidenceBody.toString("utf8"));
   const rows = JSON.parse(rowsBody.toString("utf8"));
   if (evidence?.schema_version !== 1
@@ -679,6 +729,12 @@ function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutant
     || sha256Hex(rowsBody) !== evidence.canonical_rows_sha256
     || rows.length !== Number(evidence.total_rows)) {
     throw new Error(`Immutable source evidence identity is invalid: day=${dayUtc} connector=${connectorId}`);
+  }
+  if (pollutantScoped && !sameJson(
+    [...new Set((evidence.requested_pollutant_set || []).map(String))].sort(),
+    [pollutantCode],
+  )) {
+    throw new Error(`Immutable source evidence selected pollutant is invalid: ${identity}`);
   }
   const reconstructedRows = rows.map((row, index) => {
     if (!row || typeof row !== "object" || Array.isArray(row)) {
@@ -739,17 +795,22 @@ function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutant
     }
   }
   const selectedRows = reconstructedByPollutant.get(pollutantCode) || [];
-  if (!selectedRows.length) {
-    throw new Error(`Immutable source evidence has no selected rows: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode}`);
+  const missingBindingRows = Number(evidence.missing_binding_rows || 0);
+  if (!selectedRows.length && missingBindingRows > 0) {
+    throw new Error(`Immutable source evidence is all-unmapped rather than authoritative no-data: ${identity}`);
   }
-  const computed = computeObservationContentHash(selectedRows);
+  const computed = selectedRows.length
+    ? computeObservationContentHash(selectedRows)
+    : computeEmptyObservationContentHash();
   const recorded = evidence?.observation_content_hashes?.[pollutantCode];
-  validateObservationContentHashMetadata(recorded, { rowCount: selectedRows.length });
-  const differingFields = semanticDifferences(computed, recorded);
-  if (differingFields.length) {
-    throw new Error(
-      `Immutable source evidence semantic identity changed: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${differingFields.join(",")}`,
-    );
+  if (selectedRows.length || recorded != null) {
+    validateObservationContentHashMetadata(recorded, { rowCount: selectedRows.length });
+    const differingFields = semanticDifferences(computed, recorded);
+    if (differingFields.length) {
+      throw new Error(
+        `Immutable source evidence semantic identity changed: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${differingFields.join(",")}`,
+      );
+    }
   }
   return {
     evidence,
@@ -758,6 +819,7 @@ function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutant
     evidenceSha256: sha256Hex(evidenceBody),
     rowsSha256: sha256Hex(rowsBody),
     rows: selectedRows,
+    identity,
     encodedRows: selectedRows.map(encodeCanonicalObservationRow).sort(),
     metadata: semanticMetadata(computed),
     timeseriesRowCounts: timeseriesRowCounts(selectedRows),
@@ -980,13 +1042,16 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
       const manifestObject = objects.get(manifestKey);
       const stagedParts = proposal.objects.filter((object) =>
         object.key.startsWith(`${selected.prefix}/`) && object.key.endsWith(".parquet"));
-      if (!manifestObject || !stagedParts.length) {
+      const dedicatedEmptyAllowed = runState.execution_path
+        === "dedicated_sos_historical_observation_replacement";
+      if (!manifestObject || (!stagedParts.length && !dedicatedEmptyAllowed)) {
         throw finalProposalError({
           key: manifestKey,
           object: manifestObject,
           differingFields: [
             ...(!manifestObject ? ["matching_staged_pollutant_manifest"] : []),
-            ...(!stagedParts.length ? ["matching_staged_parquet"] : []),
+            ...(!stagedParts.length && !dedicatedEmptyAllowed
+              ? ["matching_staged_parquet"] : []),
           ],
         });
       }
@@ -1002,9 +1067,6 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
       }
       const partObjects = proposal.objects.filter((object) =>
         object.key.startsWith(`${selected.prefix}/`) && object.key.endsWith(".parquet"));
-      if (!partObjects.length) {
-        throw finalProposalError({ key: manifestKey, object: manifestObject, differingFields: ["missing_final_staged_parquet"] });
-      }
       let source;
       try {
         source = loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutantCode });
@@ -1013,6 +1075,13 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
           key: manifestKey,
           object: manifestObject,
           differingFields: [`immutable_source_evidence:${error instanceof Error ? error.message : String(error)}`],
+        });
+      }
+      if (!partObjects.length && source.rows.length) {
+        throw finalProposalError({
+          key: manifestKey,
+          object: manifestObject,
+          differingFields: ["missing_final_staged_parquet"],
         });
       }
       const stagedRows = [];
@@ -1034,7 +1103,9 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
         partRows.set(part.key, rows);
         stagedRows.push(...rows);
       }
-      const staged = computeObservationContentHash(stagedRows);
+      const staged = stagedRows.length
+        ? computeObservationContentHash(stagedRows)
+        : computeEmptyObservationContentHash();
       const stagedEncodedRows = stagedRows.map(encodeCanonicalObservationRow).sort();
       const stagedDifferences = semanticDifferences(source.metadata, staged);
       if (!sameJson(source.encodedRows, stagedEncodedRows)) stagedDifferences.push("canonical_row_identity_and_duplicate_multiplicity");
@@ -1051,7 +1122,9 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
         || Number(manifest.row_count) !== source.rows.length) {
         manifestDifferences.push("manifest_row_count");
       }
-      if (!sameJson(manifest.timeseries_row_counts, source.timeseriesRowCounts)) {
+      const manifestTimeseriesRowCounts = manifest.timeseries_row_counts
+        ?? (source.rows.length === 0 ? {} : null);
+      if (!sameJson(manifestTimeseriesRowCounts, source.timeseriesRowCounts)) {
         manifestDifferences.push("manifest_timeseries_row_counts");
       }
       const manifestPartKeys = [...new Set((manifest.parquet_object_keys || []).map(String))].sort();
@@ -1165,7 +1238,10 @@ export async function verifyLiveObservationPartition({
   const partKeys = Array.isArray(manifest.parquet_object_keys)
     ? manifest.parquet_object_keys.map(safeKey)
     : [];
-  if (!partKeys.length || partKeys.some((key) =>
+  const dedicatedEmptyAllowed = runState.execution_path
+    === "dedicated_sos_historical_observation_replacement";
+  if ((!partKeys.length && (source.rows.length > 0 || !dedicatedEmptyAllowed))
+    || partKeys.some((key) =>
     !key.startsWith(object.key.slice(0, -"/manifest.json".length) + "/") ||
     !key.endsWith(".parquet")
   )) {
@@ -1200,7 +1276,9 @@ export async function verifyLiveObservationPartition({
       connectorId,
     }));
   }
-  const liveMetadata = computeObservationContentHash(canonicalRows);
+  const liveMetadata = canonicalRows.length
+    ? computeObservationContentHash(canonicalRows)
+    : computeEmptyObservationContentHash();
   const liveSourceDifferences = semanticDifferences(source.metadata, liveMetadata);
   Object.assign(object.entry, {
     live_observation_body_sources: bodySources,

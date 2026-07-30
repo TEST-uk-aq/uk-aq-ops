@@ -16315,6 +16315,79 @@ def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _dedicated_sos_source_evidence_identity(
+    *, day_utc: str, connector_id: int, pollutant_code: str,
+) -> str:
+    return (
+        f"day_utc={day_utc}/connector_id={int(connector_id)}/"
+        f"pollutant_code={pollutant_code}"
+    )
+
+
+def _retain_dedicated_sos_partition_source_evidence(
+    *,
+    run_state: dict[str, Any],
+    worker_stage_root: Path,
+    day_utc: str,
+    connector_id: int,
+    pollutant_code: str,
+) -> dict[str, Any]:
+    """Retain one immutable pollutant-scoped copy for final apply validation."""
+    identity = _dedicated_sos_source_evidence_identity(
+        day_utc=day_utc,
+        connector_id=connector_id,
+        pollutant_code=pollutant_code,
+    )
+    worker_directory = (
+        worker_stage_root / f"day_utc={day_utc}"
+        / f"connector_id={int(connector_id)}"
+    )
+    source_paths = {
+        "evidence_path": worker_directory / "source-evidence.json",
+        "rows_path": worker_directory / "obs_history_rows.json",
+    }
+    if not all(path.is_file() for path in source_paths.values()):
+        raise FileNotFoundError(
+            "dedicated SOS pollutant source evidence is unavailable"
+        )
+    target_directory = (
+        Path(str(run_state["overlay_root"])) / "source-evidence"
+        / f"day_utc={day_utc}" / f"connector_id={int(connector_id)}"
+        / f"pollutant_code={pollutant_code}"
+    )
+    target_directory.mkdir(parents=True, exist_ok=True)
+    retained: dict[str, Any] = {
+        "identity": identity,
+        "day_utc": day_utc,
+        "connector_id": int(connector_id),
+        "pollutant_code": pollutant_code,
+    }
+    for field, source_path in source_paths.items():
+        body = source_path.read_bytes()
+        target_path = target_directory / source_path.name
+        if target_path.exists():
+            if target_path.read_bytes() != body:
+                raise RuntimeError(
+                    "immutable dedicated SOS pollutant source evidence changed: "
+                    f"{identity}"
+                )
+        else:
+            target_path.write_bytes(body)
+        retained[field] = str(target_path)
+        retained[field.replace("_path", "_sha256")] = (
+            hashlib.sha256(body).hexdigest()
+        )
+    entries = run_state.setdefault("source_evidence_partitions", {})
+    existing = entries.get(identity)
+    if existing is not None and existing != retained:
+        raise RuntimeError(
+            "dedicated SOS pollutant source-evidence identity was reused"
+        )
+    entries[identity] = retained
+    write_run_state(run_state)
+    return retained
+
+
 def _load_complete_connector_day_source_evidence(
     *,
     stage_root: Path,
@@ -17035,6 +17108,7 @@ def _compute_observation_hash_with_shared_javascript(
     rows: list[dict[str, Any]],
     is_sos: bool,
     env: Mapping[str, str],
+    allow_empty: bool = False,
 ) -> dict[str, Any]:
     repo_root = _repo_root_for_integrity_script(env)
     helper = repo_root / "workers/shared/uk_aq_observation_content_hash.mjs"
@@ -17046,6 +17120,7 @@ def _compute_observation_hash_with_shared_javascript(
         input=json.dumps({
             "rows": rows,
             "legacy_status_mode": "sos" if is_sos else "non_sos",
+            "allow_empty": bool(allow_empty),
         }),
         text=True,
         stdout=subprocess.PIPE,
@@ -17945,6 +18020,7 @@ def run_v2_gap_backfills(
         detector_stage_root = stage_root / "detector-source-evidence"
         detector_evidence: dict[str, Any] = {}
         detector_evidence_persistence: dict[str, Any] = {}
+        partition_source_evidence: dict[str, Any] = {}
         detector_evidence_error: str | None = None
         detector_result: dict[str, Any] | None = None
         shutil.rmtree(
@@ -18002,6 +18078,20 @@ def run_v2_gap_backfills(
             # The proposal must never be able to outlive the independent
             # evidence on which its destructive scope depends.
             conn.commit()
+            if direct_targets is not None:
+                if not partition_pollutant:
+                    raise ValueError(
+                        "dedicated SOS source evidence requires one pollutant"
+                    )
+                partition_source_evidence = (
+                    _retain_dedicated_sos_partition_source_evidence(
+                        run_state=run_state,
+                        worker_stage_root=detector_stage_root,
+                        day_utc=day_iso,
+                        connector_id=connector_id,
+                        pollutant_code=partition_pollutant,
+                    )
+                )
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             detector_evidence_error = f"immutable_detector_source_evidence_failed:{exc}"
             log.warning(
@@ -18055,6 +18145,7 @@ def run_v2_gap_backfills(
                 "immutable_detector_source_evidence": detector_evidence,
                 "immutable_detector_source_evidence_persistence":
                     detector_evidence_persistence,
+                "partition_source_evidence": partition_source_evidence,
             })
             log.warning(
                 "dedicated SOS selected partition left unchanged day=%s "
@@ -18245,10 +18336,14 @@ def run_v2_gap_backfills(
                     str(value) for value in list(source_evidence.get("pollutant_set") or [])
                 ]
                 expected_min_manifest_rows = int(source_evidence.get("total_rows") or 0)
-                evidence_path = (
-                    stage_root / f"day_utc={day_iso}" /
-                    f"connector_id={connector_id}" / "source-evidence.json"
-                )
+                evidence_path = Path(str(
+                    partition_source_evidence.get("evidence_path")
+                    or (
+                        stage_root / f"day_utc={day_iso}" /
+                        f"connector_id={connector_id}" /
+                        "source-evidence.json"
+                    )
+                ))
                 manifest_guard_details["source_evidence_path"] = str(evidence_path)
                 manifest_guard_details["source_evidence_sha256"] = hashlib.sha256(
                     evidence_path.read_bytes()
@@ -18345,6 +18440,7 @@ def run_v2_gap_backfills(
             "source_cache": source_cache_status,
             "immutable_detector_source_evidence": detector_evidence,
             "immutable_detector_source_evidence_persistence": detector_evidence_persistence,
+            "partition_source_evidence": partition_source_evidence,
             "immutable_detector_source_evidence_error": detector_evidence_error,
             "complete_source_evidence": source_evidence,
             "validated_overlay_object_keys": validated_overlay_keys,
@@ -18416,6 +18512,15 @@ def run_v2_gap_backfills(
                     "pollutant_codes": proposal_pollutants,
                     "affected_pollutant_codes": affected_pollutants,
                     "repair_pollutants": requested_repair_pollutants,
+                    "source_evidence_identity": partition_source_evidence.get(
+                        "identity"
+                    ),
+                    "source_evidence_path": partition_source_evidence.get(
+                        "evidence_path"
+                    ),
+                    "source_rows_path": partition_source_evidence.get(
+                        "rows_path"
+                    ),
                     "object_keys": validated_overlay_keys,
                     "stage": "observs",
                 })
@@ -19536,28 +19641,40 @@ def _capture_local_v2_observation_scope(
     )
     for pollutant_code in selected_hash_pollutants:
         source_hash = source_hashes.get(pollutant_code)
-        if not isinstance(source_hash, Mapping):
-            raise ValueError(
-                f"source observation content hash is missing: {pollutant_code}"
-            )
         pollutant_paths = [
             str(path)
             for path in parquet_paths
             if path.parent.name == f"pollutant_code={pollutant_code}"
         ]
-        parquet_rows = _observation_rows_from_local_parquet_for_shared_hash(
-            parquet_paths=pollutant_paths,
+        authoritative_no_data = (
+            run_state.get("execution_path")
+            == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
+            and len(selected_pollutants) == 1
+            and int(evidence.get("total_rows") or 0) == 0
+            and int(evidence.get("missing_binding_rows") or 0) == 0
+        )
+        if not isinstance(source_hash, Mapping) and not authoritative_no_data:
+            raise ValueError(
+                f"source observation content hash is missing: {pollutant_code}"
+            )
+        parquet_rows = (
+            _observation_rows_from_local_parquet_for_shared_hash(
+                parquet_paths=pollutant_paths,
+            )
+            if pollutant_paths else []
         )
         parquet_hash = _compute_observation_hash_with_shared_javascript(
             rows=parquet_rows,
             is_sos=is_sos,
             env=os.environ,
+            allow_empty=authoritative_no_data,
         )
+        expected_hash = source_hash if isinstance(source_hash, Mapping) else parquet_hash
         if (
             parquet_hash["observation_content_hash"]
-            != source_hash.get("observation_content_hash")
+            != expected_hash.get("observation_content_hash")
             or parquet_hash["verification_status_counts"]
-            != source_hash.get("verification_status_counts")
+            != expected_hash.get("verification_status_counts")
         ):
             raise ValueError(
                 "canonical connector Parquet hash does not match authoritative "
@@ -19575,9 +19692,9 @@ def _capture_local_v2_observation_scope(
         )
         if (
             manifest_hash["observation_content_hash"]
-            != source_hash.get("observation_content_hash")
+            != expected_hash.get("observation_content_hash")
             or manifest_hash["verification_status_counts"]
-            != source_hash.get("verification_status_counts")
+            != expected_hash.get("verification_status_counts")
         ):
             raise ValueError(
                 "canonical pollutant manifest hash does not match authoritative "

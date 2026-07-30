@@ -25,6 +25,7 @@ import {
   inspectSourceDerivedObservationManifestOwner,
 } from "../../../workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs";
 import {
+  computeEmptyObservationContentHash,
   computeObservationContentHash,
 } from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
@@ -176,6 +177,138 @@ async function observationFixture({ wrongManifest = false } = {}) {
   };
 }
 
+function retainScopedEvidence(fixture, { dayUtc, connectorId, pollutantCode, evidencePath, rowsPath }) {
+  const identity = `day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
+  const directory = path.join(
+    fixture.runState.overlay_root,
+    "source-evidence",
+    `day_utc=${dayUtc}`,
+    `connector_id=${connectorId}`,
+    `pollutant_code=${pollutantCode}`,
+  );
+  fs.mkdirSync(directory, { recursive: true });
+  const scopedEvidencePath = path.join(directory, "source-evidence.json");
+  const scopedRowsPath = path.join(directory, "obs_history_rows.json");
+  const evidence = JSON.parse(fs.readFileSync(evidencePath, "utf8"));
+  evidence.requested_pollutant_set = [pollutantCode];
+  evidence.missing_binding_rows = 0;
+  fs.writeFileSync(scopedEvidencePath, JSON.stringify(evidence));
+  fs.copyFileSync(rowsPath, scopedRowsPath);
+  fixture.runState.source_evidence_partitions ||= {};
+  fixture.runState.source_evidence_partitions[identity] = {
+    identity,
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    pollutant_code: pollutantCode,
+    evidence_path: scopedEvidencePath,
+    rows_path: scopedRowsPath,
+    evidence_sha256: sha256Hex(fs.readFileSync(scopedEvidencePath)),
+    rows_sha256: sha256Hex(fs.readFileSync(scopedRowsPath)),
+  };
+  return fixture.runState.source_evidence_partitions[identity];
+}
+
+function appendObservationPartition(fixture, { dayUtc, connectorId, pollutantCode, timeseriesId }) {
+  const prefix = `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
+  const partKey = `${prefix}/part-00000.parquet`;
+  const manifestKey = `${prefix}/manifest.json`;
+  const rows = [{
+    connector_id: connectorId,
+    station_id: 20,
+    timeseries_id: timeseriesId,
+    pollutant_code: pollutantCode,
+    observed_at_utc: `${dayUtc}T00:00:00.000Z`,
+    value: 21.5,
+    verification_status: "P",
+  }];
+  const partBody = serializeCanonicalObservationV2Parquet(rows);
+  const partPath = writeObject(fixture.runState.overlay_root, partKey, partBody);
+  const { canonical_rows: _rows, ...metadata } = computeObservationContentHash(rows);
+  const manifest = buildHistoryV2PollutantManifest({
+    domain: "observations",
+    grain: null,
+    profile: null,
+    dayUtc,
+    connectorId,
+    pollutantCode,
+    runId: "test-run",
+    manifestKey,
+    sourceRowCount: rows.length,
+    fileEntries: [{
+      key: partKey,
+      row_count: rows.length,
+      bytes: partBody.byteLength,
+      etag_or_hash: sha256Hex(partBody),
+      pollutant_codes: [pollutantCode],
+      min_timeseries_id: timeseriesId,
+      max_timeseries_id: timeseriesId,
+      min_observed_at_utc: rows[0].observed_at_utc,
+      max_observed_at_utc: rows[0].observed_at_utc,
+      timeseries_row_counts: { [String(timeseriesId)]: rows.length },
+    }],
+    writerGitSha: "test",
+    backedUpAtUtc: "2026-06-18T00:00:00.000Z",
+    observationContentHash: metadata,
+  });
+  const manifestPath = writeObject(
+    fixture.runState.overlay_root,
+    manifestKey,
+    Buffer.from(JSON.stringify(manifest, null, 2)),
+  );
+  const storedRows = rows.map((row) => ({
+    timeseries_id: row.timeseries_id,
+    station_id: row.station_id,
+    pollutant_code: row.pollutant_code,
+    observed_at: row.observed_at_utc,
+    value: row.value,
+    verification_status: row.verification_status,
+  }));
+  const rowsBody = Buffer.from(JSON.stringify(storedRows));
+  const evidenceDirectory = fs.mkdtempSync(path.join(fixture.root, "evidence-"));
+  const rowsPath = path.join(evidenceDirectory, "obs_history_rows.json");
+  const evidencePath = path.join(evidenceDirectory, "source-evidence.json");
+  fs.writeFileSync(rowsPath, rowsBody);
+  fs.writeFileSync(evidencePath, JSON.stringify({
+    schema_version: 1,
+    enumeration_complete: true,
+    requested_pollutant_set: [pollutantCode],
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    canonical_rows_bytes: rowsBody.byteLength,
+    canonical_rows_sha256: sha256Hex(rowsBody),
+    total_rows: rows.length,
+    missing_binding_rows: 0,
+    per_pollutant_counts: { [pollutantCode]: rows.length },
+    observation_content_hashes: { [pollutantCode]: metadata },
+  }));
+  const partEntry = {
+    ...stateEntry(partPath, partKey),
+    stage: "observations_data",
+    proposal_owner: "source_derived_observation_repair",
+  };
+  fixture.runState.objects[partKey] = partEntry;
+  fixture.runState.objects[manifestKey] = {
+    ...stateEntry(manifestPath, manifestKey, [partKey], {
+      [partKey]: { sha256: partEntry.sha256, bytes: partEntry.bytes, source: "overlay" },
+    }),
+    stage: "observations_data",
+    proposal_owner: "source_derived_observation_repair",
+  };
+  fixture.runState.tombstone_prefixes.push({
+    prefix,
+    proposed: true,
+    repair_pollutants: [pollutantCode],
+  });
+  return {
+    prefix,
+    partKey,
+    manifestKey,
+    evidence: retainScopedEvidence(fixture, {
+      dayUtc, connectorId, pollutantCode, evidencePath, rowsPath,
+    }),
+  };
+}
+
 function replaceStoredEvidenceRows(fixture, storedRows) {
   const body = Buffer.from(JSON.stringify(storedRows));
   fs.writeFileSync(fixture.rowsPath, body);
@@ -313,6 +446,149 @@ test("final proposal graph requires immutable source, staged Parquet and final m
   assert.equal(remoteCalls, 0);
   const persisted = JSON.parse(fs.readFileSync(invalid.runStatePath, "utf8"));
   assert.equal(persisted.final_proposal_graph_validation.status, "failed");
+});
+
+test("dedicated same-day pollutants validate against distinct immutable source evidence", async () => {
+  const fixture = await observationFixture();
+  const dayUtc = "2026-06-17";
+  const connectorId = 1;
+  const firstEvidence = retainScopedEvidence(fixture, {
+    dayUtc,
+    connectorId,
+    pollutantCode: "pm25",
+    evidencePath: fixture.evidencePath,
+    rowsPath: fixture.rowsPath,
+  });
+  const second = appendObservationPartition(fixture, {
+    dayUtc,
+    connectorId,
+    pollutantCode: "no2",
+    timeseriesId: 200,
+  });
+  Object.assign(fixture.runState, {
+    execution_path: "dedicated_sos_historical_observation_replacement",
+    mutation_connector_ids: [1],
+    aqi_policy: "bypassed_observation_history_only",
+    changed_scopes: {
+      AQILEVELS_CHANGED: [],
+      AQI_MANIFESTS_CHANGED: [],
+      AQI_INDEXES_CHANGED: [],
+    },
+  });
+  fs.writeFileSync(fixture.runStatePath, JSON.stringify(fixture.runState));
+  const proposal = validateLocalProposal(fixture.runState);
+  const audit = await validateFinalProposalGraph({
+    runState: fixture.runState,
+    proposal,
+    runStatePath: fixture.runStatePath,
+  });
+  assert.equal(audit.status, "succeeded");
+  assert.equal(audit.validated_partition_count, 2);
+  assert.notEqual(firstEvidence.evidence_path, second.evidence.evidence_path);
+  assert.notEqual(firstEvidence.rows_path, second.evidence.rows_path);
+  assert.equal(fs.existsSync(firstEvidence.evidence_path), true);
+  assert.equal(fs.existsSync(second.evidence.evidence_path), true);
+  assert.deepEqual(
+    fixture.runState.tombstone_prefixes.map((entry) => entry.prefix).sort(),
+    [
+      "history/v2/observations/day_utc=2026-06-17/connector_id=1/pollutant_code=no2",
+      "history/v2/observations/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25",
+    ],
+  );
+  assert.ok(fixture.runState.objects[fixture.partKey]);
+  assert.ok(fixture.runState.objects[second.partKey]);
+  assert.equal(
+    fixture.runState.objects[fixture.manifestKey].immutable_source_evidence_path,
+    firstEvidence.evidence_path,
+  );
+  assert.equal(
+    fixture.runState.objects[second.manifestKey].immutable_source_evidence_path,
+    second.evidence.evidence_path,
+  );
+});
+
+test("dedicated pollutant-scoped evidence accepts authoritative no-data", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-integrity-empty-source-"));
+  const overlay = path.join(root, "overlay");
+  const dropbox = path.join(root, "dropbox");
+  fs.mkdirSync(dropbox, { recursive: true });
+  const dayUtc = "2026-06-17";
+  const connectorId = 1;
+  const pollutantCode = "o3";
+  const prefix = `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
+  const manifestKey = `${prefix}/manifest.json`;
+  const { canonical_rows: _rows, ...emptyMetadata } = computeEmptyObservationContentHash();
+  const manifestPath = writeObject(overlay, manifestKey, Buffer.from(JSON.stringify(
+    buildHistoryV2PollutantManifest({
+      domain: "observations",
+      grain: null,
+      profile: null,
+      dayUtc,
+      connectorId,
+      pollutantCode,
+      runId: "test-run",
+      manifestKey,
+      sourceRowCount: 0,
+      fileEntries: [],
+      writerGitSha: "test",
+      backedUpAtUtc: "2026-06-18T00:00:00.000Z",
+      observationContentHash: emptyMetadata,
+    }), null, 2,
+  )));
+  const rowsBody = Buffer.from("[]");
+  const temporaryEvidenceDirectory = fs.mkdtempSync(path.join(root, "evidence-"));
+  const rowsPath = path.join(temporaryEvidenceDirectory, "obs_history_rows.json");
+  const evidencePath = path.join(temporaryEvidenceDirectory, "source-evidence.json");
+  fs.writeFileSync(rowsPath, rowsBody);
+  fs.writeFileSync(evidencePath, JSON.stringify({
+    schema_version: 1,
+    enumeration_complete: true,
+    requested_pollutant_set: [pollutantCode],
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    canonical_rows_bytes: rowsBody.byteLength,
+    canonical_rows_sha256: sha256Hex(rowsBody),
+    total_rows: 0,
+    missing_binding_rows: 0,
+    per_pollutant_counts: {},
+    observation_content_hashes: {},
+  }));
+  const runState = {
+    environment: "CIC-Test",
+    execution_path: "dedicated_sos_historical_observation_replacement",
+    mutation_connector_ids: [1],
+    aqi_policy: "bypassed_observation_history_only",
+    overlay_root: overlay,
+    base_dropbox_root: dropbox,
+    objects: {
+      [manifestKey]: {
+        ...stateEntry(manifestPath, manifestKey),
+        stage: "observations_data",
+        proposal_owner: "source_derived_observation_repair",
+      },
+    },
+    tombstone_prefixes: [{
+      prefix,
+      proposed: true,
+      repair_pollutants: [pollutantCode],
+    }],
+    changed_scopes: {
+      AQILEVELS_CHANGED: [],
+      AQI_MANIFESTS_CHANGED: [],
+      AQI_INDEXES_CHANGED: [],
+    },
+  };
+  const fixture = { root, runState };
+  retainScopedEvidence(fixture, {
+    dayUtc, connectorId, pollutantCode, evidencePath, rowsPath,
+  });
+  const audit = await validateFinalProposalGraph({
+    runState,
+    proposal: validateLocalProposal(runState),
+  });
+  assert.equal(audit.status, "succeeded");
+  assert.equal(audit.validated_partition_count, 1);
+  assert.equal(audit.partitions[0].row_count, 0);
 });
 
 async function assertApplyFailsBeforeRemote(fixture, expected) {
