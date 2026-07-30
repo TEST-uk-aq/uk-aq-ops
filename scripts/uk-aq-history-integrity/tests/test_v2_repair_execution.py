@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import importlib.util
 import json
 import logging
@@ -3582,6 +3583,224 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             MODULE.select_sos_historical_replacement_route(
                 self._args(), mutation_connector_ids={1, 2},
             )
+
+    def test_matching_baseline_still_builds_direct_replacement_and_tombstone(
+        self,
+    ) -> None:
+        day_utc = "2026-06-01"
+        pollutant_code = "no2"
+        row = {
+            "connector_id": 1,
+            "station_id": 10,
+            "timeseries_id": 101,
+            "pollutant_code": pollutant_code,
+            "observed_at": f"{day_utc}T00:00:00.000Z",
+            "value": 12.5,
+            "verification_status": "P",
+        }
+        rows = [row]
+        rows_body = json.dumps(rows).encode("utf-8")
+        hash_evidence = {
+            "observation_content_hash": "a" * 64,
+            "verification_status_counts": {"P": 1},
+        }
+        evidence = {
+            "schema_version": 1,
+            "evidence_contract_version": MODULE.SOURCE_EVIDENCE_CONTRACT_VERSION,
+            "contract": "pollutant_scoped_authoritative_connector_day_source_rows",
+            "requested_pollutant_set": [pollutant_code],
+            "enumeration_complete": True,
+            "day_utc": day_utc,
+            "connector_id": 1,
+            "source_adapter": "sos",
+            "files_required": [],
+            "files_read": [],
+            "files_authoritatively_absent": [],
+            "canonical_rows_sha256": hashlib.sha256(rows_body).hexdigest(),
+            "canonical_rows_bytes": len(rows_body),
+            "total_rows": 1,
+            "canonical_rows_mapped": 1,
+            "source_records_examined": 1,
+            "missing_binding_groups": 0,
+            "missing_binding_rows": 0,
+            "blocked_row_count": 0,
+            "inactive_identity_rows_skipped": 0,
+            "per_timeseries_counts": {"101": 1},
+            "per_pollutant_counts": {pollutant_code: 1},
+            "pollutant_set": [pollutant_code],
+            "observation_content_hashes": {
+                pollutant_code: hash_evidence,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dropbox = root / "dropbox"
+            dropbox.mkdir()
+            run_state = MODULE.create_run_overlay(
+                tmp_dir=root / "tmp",
+                run_id="direct-matching-baseline",
+                environment="CIC-Test",
+                base_dropbox_root=dropbox,
+            )
+            env = {
+                "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": str(root / "logs"),
+                "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR": str(root / "cache"),
+                "UK_AQ_HISTORY_INTEGRITY_TMP_DIR": str(root / "tmp"),
+                "UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK": "1",
+            }
+            (root / "logs").mkdir()
+            (root / "cache").mkdir()
+
+            def fake_backfill(**kwargs):
+                if "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY" not in (
+                    kwargs.get("extra_env") or {}
+                ):
+                    stage_root = Path(
+                        kwargs["extra_env"][
+                            "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT"
+                        ]
+                    )
+                    source_dir = (
+                        stage_root / f"day_utc={day_utc}" / "connector_id=1"
+                    )
+                    source_dir.mkdir(parents=True, exist_ok=True)
+                    (source_dir / "obs_history_rows.json").write_bytes(rows_body)
+                    (source_dir / "source-evidence.json").write_text(
+                        json.dumps(evidence), encoding="utf-8"
+                    )
+                    generated = (
+                        stage_root / "generated-objects"
+                        / MODULE.R2_HISTORY_V2_OBSERVATIONS_PREFIX
+                        / f"day_utc={day_utc}" / "connector_id=1"
+                    )
+                    pollutant_root = (
+                        generated / f"pollutant_code={pollutant_code}"
+                    )
+                    pollutant_root.mkdir(parents=True, exist_ok=True)
+                    (pollutant_root / "part-00000.parquet").write_bytes(b"PAR1")
+                    (pollutant_root / "manifest.json").write_text(
+                        json.dumps(hash_evidence), encoding="utf-8"
+                    )
+                    generated.mkdir(parents=True, exist_ok=True)
+                    (generated / "manifest.json").write_text(json.dumps({
+                        "history_version": "v2",
+                        "domain": "observations",
+                        "day_utc": day_utc,
+                        "connector_id": 1,
+                    }), encoding="utf-8")
+                return {
+                    "status": "ok",
+                    "rows_observations": 1,
+                    "source_connector_day_complete_events": 1,
+                    "source_connector_day_skipped_events": 0,
+                    "source_connector_day_pending_events": 0,
+                    "source_connector_day_failed_events": 0,
+                    "source_mapped_rows": 1,
+                    "source_timeseries_row_counts": {"101": 1},
+                    "source_pollutant_codes": [pollutant_code],
+                    "backfill_run_status": "complete",
+                }
+
+            direct_targets = MODULE.build_dedicated_sos_selected_partitions(
+                from_day=day_utc,
+                to_day=day_utc,
+                selected_days=None,
+                repair_pollutants=[pollutant_code],
+            )
+            conn = sqlite3.connect(":memory:")
+            try:
+                with mock.patch.object(
+                    MODULE, "run_narrow_backfill", side_effect=fake_backfill,
+                ), mock.patch.object(
+                    MODULE,
+                    "_load_complete_connector_day_source_evidence",
+                    return_value=(evidence, rows),
+                ), mock.patch.object(
+                    MODULE,
+                    "_persist_complete_connector_day_source_evidence",
+                    return_value={"evidence_id": 1, "evidence_sha256": "b" * 64},
+                ), mock.patch.object(
+                    MODULE,
+                    "write_uk_air_source_label_registry_snapshot",
+                    return_value={"path": str(root / "registry.json"), "inventory": {}},
+                ), mock.patch.object(
+                    MODULE,
+                    "write_sos_site_ref_bridge_snapshot",
+                    return_value={"path": str(root / "bridge.json")},
+                ), mock.patch.object(
+                    MODULE,
+                    "_validate_chunked_v2_observation_repair_for_aqi",
+                    return_value=(True, None),
+                ), mock.patch.object(
+                    MODULE,
+                    "_observation_rows_from_local_parquet_for_shared_hash",
+                    return_value=rows,
+                ), mock.patch.object(
+                    MODULE,
+                    "_compute_observation_hash_with_shared_javascript",
+                    return_value=hash_evidence,
+                ), mock.patch.object(
+                    MODULE,
+                    "_validate_observation_content_hash_metadata",
+                    return_value=hash_evidence,
+                ), mock.patch.object(
+                    MODULE,
+                    "_v2_observation_manifest_evidence_mismatches",
+                    return_value=({}, []),
+                ), mock.patch.object(
+                    MODULE,
+                    "resolve_integrity_backfill_wrapper",
+                    return_value=str(root / "backfill.sh"),
+                ):
+                    metrics = MODULE.run_v2_gap_backfills(
+                        conn=conn,
+                        run_id=1,
+                        env_name="CIC-Test",
+                        run_compact="run",
+                        env=env,
+                        v2_observations={
+                            "status": "ok",
+                            "gap_count": 0,
+                            "gaps": [],
+                            "comparison_result": "matches_authoritative_source",
+                        },
+                        dry_run=False,
+                        run_backfill=True,
+                        limits=MODULE.LimitTracker(
+                            max_download_mb=0,
+                            max_runtime_minutes=0,
+                            started_mono=0.0,
+                        ),
+                        log=logging.getLogger("dedicated-direct-target-test"),
+                        run_state=run_state,
+                        queue_aqi_from_observation_repairs=False,
+                        repair_pollutants=[pollutant_code],
+                        source_scope={"source": "sos", "connector_ids": [1]},
+                        explicit_selected_partitions=direct_targets,
+                    )
+            finally:
+                conn.close()
+
+        expected_prefix = (
+            f"{MODULE.R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
+            f"connector_id=1/pollutant_code={pollutant_code}"
+        )
+        self.assertEqual(metrics["target_authority"], "explicit_selected_scope")
+        self.assertTrue(metrics["gap_detection_bypassed"])
+        self.assertEqual(metrics["complete_replacements"], 1)
+        self.assertEqual(metrics["exact_tombstones_created"], 1)
+        self.assertEqual(
+            [entry["prefix"] for entry in run_state["tombstone_prefixes"]],
+            [expected_prefix],
+        )
+        self.assertTrue(
+            any(
+                key.startswith(expected_prefix + "/")
+                for outcome in metrics["selected_partition_outcomes"]
+                for key in outcome.get("replacement_object_keys", [])
+            )
+        )
 
     def test_all_unmapped_non_empty_sos_partitions_are_left_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
