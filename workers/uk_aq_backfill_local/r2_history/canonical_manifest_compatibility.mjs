@@ -351,8 +351,9 @@ export async function prepareCanonicalObservationManifestCompatibility({
           finalPayloads.push(owned.payload);
           pollutantProposals.push({
             key: childKey,
-            body: owned.body,
-            file_entries: owned.file_entries,
+            retained_source_derived: true,
+            content_facts: owned.content_facts,
+            dependencies: owned.dependencies,
             dependency_identities: owned.dependency_identities,
             source_manifest_key: childKey,
             raw_pollutant_code: declaredCode,
