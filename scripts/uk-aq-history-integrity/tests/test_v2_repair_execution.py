@@ -3546,6 +3546,300 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertTrue(all("--connector-id" in cmd for cmd in metrics["planned_aqi_rebuild_commands"]))
 
 
+class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
+    def _args(self, **overrides):
+        values = {
+            "source": "sos",
+            "run_backfill": True,
+            "dry_run": False,
+            "history_version": "v2",
+            "from_day": "2026-06-01",
+            "to_day": "2026-06-01",
+            "repair_pollutants": ["no2"],
+        }
+        values.update(overrides)
+        return MODULE.argparse.Namespace(**values)
+
+    def test_route_selection_is_strict_and_rejects_non_connector_1_scope(self) -> None:
+        selected = MODULE.select_sos_historical_replacement_route(
+            self._args(), mutation_connector_ids={1},
+        )
+        self.assertTrue(selected["selected"])
+        self.assertEqual(
+            selected["execution_path"],
+            MODULE.SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH,
+        )
+        self.assertFalse(MODULE.select_sos_historical_replacement_route(
+            self._args(source="openaq"), mutation_connector_ids={6},
+        )["selected"])
+        self.assertFalse(MODULE.select_sos_historical_replacement_route(
+            self._args(dry_run=True), mutation_connector_ids={1},
+        )["selected"])
+        self.assertFalse(MODULE.select_sos_historical_replacement_route(
+            self._args(run_backfill=False), mutation_connector_ids={1},
+        )["selected"])
+        with self.assertRaisesRegex(RuntimeError, "connector_id=1"):
+            MODULE.select_sos_historical_replacement_route(
+                self._args(), mutation_connector_ids={1, 2},
+            )
+
+    def test_all_unmapped_non_empty_sos_partitions_are_left_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = MODULE.resolve_history_path_config("v2", {})
+            day_utc = "2026-06-01"
+            (root / config.observations_data_prefix / f"day_utc={day_utc}").mkdir(
+                parents=True
+            )
+
+            def all_unmapped(*_args, **kwargs):
+                pollutant = kwargs["pollutant_code"]
+                return {}, {
+                    "source_partition_state": "successful_empty",
+                    "source_counts_present": False,
+                    "source_counts_available": True,
+                    "source_rows": 0,
+                    "source_skip_reason": None,
+                    "identity_resolution": "uk_air_site_ref_to_sos_timeseries_bridge",
+                    "all_source_groups_excluded_no_authoritative_binding": True,
+                    "no_authoritative_timeseries_binding_groups": 1,
+                    "no_authoritative_timeseries_binding_rows": 24,
+                    "no_authoritative_timeseries_binding_warnings": [{
+                        "day_utc": day_utc,
+                        "pollutant_code": pollutant,
+                    }],
+                    "partition": {
+                        "state": "successful_empty",
+                        "source_counts_present": False,
+                        "source_counts_available": True,
+                    },
+                }
+
+            with mock.patch.object(
+                MODULE,
+                "_current_source_counts_for_v2_partition",
+                side_effect=all_unmapped,
+            ):
+                observations = MODULE.run_v2_observations_integrity_checks(
+                    r2_history_root=root,
+                    config=config,
+                    from_day=day_utc,
+                    to_day=day_utc,
+                    conn=None,
+                    env_name="CIC-Test",
+                    allowed_connector_ids={1},
+                    source_scope={"source": "sos", "connector_ids": [1]},
+                    dedicated_sos_historical_replacement=True,
+                )
+            self.assertEqual(
+                len(observations["all_unmapped_partitions_left_unchanged"]),
+                4,
+            )
+            scopes, _indexes, skipped = (
+                MODULE._derive_executable_observation_repair_pollutants(
+                    v2_observations=observations,
+                    requested_pollutants=["pm25", "pm10", "no2", "o3"],
+                )
+            )
+            self.assertEqual(scopes, {})
+            self.assertTrue(skipped)
+
+    def test_legacy_r2_only_identity_is_diagnostic_for_complete_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = MODULE.resolve_history_path_config("v2", {})
+            day_utc = "2026-06-01"
+            prefix = (
+                root / config.observations_data_prefix
+                / f"day_utc={day_utc}" / "connector_id=1"
+                / "pollutant_code=no2"
+            )
+            prefix.mkdir(parents=True)
+            part_key = (
+                f"{config.observations_data_prefix}/day_utc={day_utc}/"
+                "connector_id=1/pollutant_code=no2/part-00000.parquet"
+            )
+            (root / part_key).write_bytes(b"PAR1")
+            (prefix / "manifest.json").write_text(json.dumps({
+                "history_version": "v2",
+                "domain": "observations",
+                "manifest_kind": "pollutant",
+                "day_utc": day_utc,
+                "connector_id": 1,
+                "pollutant_code": "no2",
+                "row_count": 2,
+                "source_row_count": 2,
+                "timeseries_row_counts": {"100": 2},
+                "files": [{"key": part_key, "bytes": 4, "row_count": 2}],
+            }))
+            latest = root / config.observations_latest_index_key
+            latest.parent.mkdir(parents=True)
+            latest.write_text("{}")
+            source_evidence = {
+                "source_partition_state": "successful_non_empty",
+                "source_counts_present": True,
+                "source_counts_available": True,
+                "source_rows": 2,
+                "source_skip_reason": None,
+                "expected_timeseries_ids": [200],
+                "identity_resolution": "uk_air_site_ref_to_sos_timeseries_bridge",
+                "partition": {
+                    "state": "successful_non_empty",
+                    "source_counts_present": True,
+                    "source_counts_available": True,
+                },
+            }
+            unresolved = [{
+                "existing_r2_timeseries_id": 100,
+                "reason": "r2_timeseries_not_in_authoritative_continuity_family",
+            }]
+            stats = {
+                "row_count": 2,
+                "timeseries_row_counts": {100: 2},
+                "timeseries_min_timestamp_utc": {
+                    100: f"{day_utc}T00:00:00.000Z"
+                },
+            }
+            with mock.patch.object(
+                MODULE,
+                "_current_source_counts_for_v2_partition",
+                return_value=({200: 2}, source_evidence),
+            ), mock.patch.object(
+                MODULE,
+                "_append_actual_parquet_gaps",
+                return_value=(stats, None),
+            ), mock.patch.object(
+                MODULE,
+                "_classify_sos_r2_historical_identity_rollovers",
+                return_value=([], unresolved),
+            ):
+                observations = MODULE.run_v2_observations_integrity_checks(
+                    r2_history_root=root,
+                    config=config,
+                    from_day=day_utc,
+                    to_day=day_utc,
+                    conn=None,
+                    env_name="CIC-Test",
+                    allowed_connector_ids={1},
+                    source_scope={"source": "sos", "connector_ids": [1]},
+                    dedicated_sos_historical_replacement=True,
+                )
+            mismatch = next(
+                gap for gap in observations["gaps"]
+                if gap["gap_type"] == "source_r2_timeseries_row_mismatch"
+            )
+            self.assertEqual(
+                mismatch["source_evidence"]["legacy_r2_only_identity_handling"],
+                "diagnostic_only_complete_partition_replacement",
+            )
+            self.assertFalse(any(
+                gap["gap_type"] == "source_mapping_issue"
+                for gap in observations["gaps"]
+            ))
+
+    def test_dedicated_flow_bypasses_aqi_and_broad_final_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_state = MODULE.create_run_overlay(
+                tmp_dir=root,
+                run_id="dedicated-sos",
+                environment="CIC-Test",
+                base_dropbox_root=root / "dropbox",
+            )
+            conn = sqlite3.connect(":memory:")
+            current_state = {
+                "overall_status": "complete",
+                "r2_history_status": "complete",
+                "timeseries_reconciliation_status": "complete",
+                "latest_snapshot_reconciliation_status": "complete",
+                "timeseries": {},
+                "latest_snapshot": {},
+            }
+            metadata_ok = {
+                "status": "ok",
+                "manifest_status": "ok",
+                "index_status": "ok",
+                "results": [],
+            }
+            first_value = {
+                "status": "skipped_empty",
+                "attempted": False,
+                "connector_day_count": 0,
+            }
+            forbidden = AssertionError("AQI or broad final verification was invoked")
+            try:
+                with mock.patch.object(MODULE, "run_v2_gap_backfills", return_value={
+                    "v2_observation_repairs_failed": 0,
+                    "v2_observation_repairs_guard_failed": 0,
+                    "v2_observation_repair_results": [],
+                }), mock.patch.object(
+                    MODULE, "_run_v2_observation_metadata_executor", return_value=metadata_ok,
+                ) as metadata_executor, mock.patch.object(
+                    MODULE, "_record_metadata_executor_overlay",
+                ), mock.patch.object(
+                    MODULE, "record_integrity_object_operations", return_value={
+                        "planned_writes": 0,
+                        "planned_deletions": 0,
+                        "completed_writes": 0,
+                        "completed_deletions": 0,
+                    },
+                ), mock.patch.object(
+                    MODULE, "run_first_value_at_reconciliation", return_value=first_value,
+                ), mock.patch.object(
+                    MODULE, "run_current_state_reconciliation", return_value=current_state,
+                ), mock.patch.object(
+                    MODULE, "persist_current_state_reconciliation_audit",
+                ), mock.patch.object(
+                    MODULE, "_phase4_aqi_work", side_effect=forbidden,
+                ), mock.patch.object(
+                    MODULE, "queue_v2_aqi_rebuilds_from_integrity_gaps", side_effect=forbidden,
+                ), mock.patch.object(
+                    MODULE, "run_aqi_rebuild_queue_execution", side_effect=forbidden,
+                ), mock.patch.object(
+                    MODULE, "run_v2_final_verification", side_effect=forbidden,
+                ):
+                    result = MODULE.run_v2_integrity_repair_flow(
+                        run_state=run_state,
+                        conn=conn,
+                        run_id=1,
+                        env_name="CIC-Test",
+                        run_compact="run",
+                        env={"UK_AQ_INTEGRITY_CURRENT_STATE_RECONCILIATION_ENABLED": "false"},
+                        v2_observations={"repair_plan": []},
+                        v2_aqilevels={"status": "bypassed", "repair_plan": []},
+                        final_verification_config=MODULE.resolve_history_path_config("v2", {}),
+                        from_day="2026-06-01",
+                        to_day="2026-06-01",
+                        allowed_connector_ids={1},
+                        source_scope={"source": "sos", "connector_ids": [1]},
+                        check_aqi_debug=False,
+                        require_aqi_debug=False,
+                        limits=MODULE.LimitTracker(
+                            max_download_mb=0,
+                            max_runtime_minutes=0,
+                            started_mono=0.0,
+                        ),
+                        dry_run=False,
+                        log=logging.getLogger("dedicated-sos-test"),
+                        repair_pollutants=["no2"],
+                        dedicated_sos_historical_replacement=True,
+                    )
+            finally:
+                conn.close()
+            self.assertEqual(metadata_executor.call_count, 1)
+            self.assertEqual(result["status"], "succeeded")
+            self.assertTrue(result["dedicated_sos_historical_replacement"])
+            self.assertEqual(result["final_verification"]["status"], "ok")
+            self.assertFalse(
+                result["final_verification"]["second_broad_r2_scan_invoked"]
+            )
+            aqi_stage = next(
+                stage for stage in result["stage_results"]
+                if stage["stage"] == "aqi_proposal"
+            )
+            self.assertEqual(aqi_stage["status"], "bypassed")
+
+
 class RepoRootTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

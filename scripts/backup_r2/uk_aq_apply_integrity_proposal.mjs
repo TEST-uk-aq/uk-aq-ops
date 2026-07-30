@@ -375,6 +375,58 @@ export function validateLocalProposal(runState) {
   };
 }
 
+export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
+  if (runState?.execution_path !== "dedicated_sos_historical_observation_replacement") {
+    return { dedicated: false };
+  }
+  if (runState.environment !== "CIC-Test"
+    || JSON.stringify(runState.mutation_connector_ids) !== "[1]"
+    || runState.aqi_policy !== "bypassed_observation_history_only") {
+    throw new Error("Dedicated SOS proposal has invalid execution-scope evidence");
+  }
+  const aqiScopeSets = ["AQILEVELS_CHANGED", "AQI_MANIFESTS_CHANGED", "AQI_INDEXES_CHANGED"];
+  if (aqiScopeSets.some((scope) => (runState.changed_scopes?.[scope] || []).length > 0)) {
+    throw new Error("Dedicated SOS proposal must not contain AQI changed scopes");
+  }
+  for (const item of proposal.prefixes) {
+    const match = item.prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
+    if (!match || Number(match[2]) !== 1 || item.domain !== "observations") {
+      throw new Error(`Dedicated SOS deletion is outside connector-1 observations: ${item.prefix}`);
+    }
+  }
+  const connectorDayParquet = new Map();
+  for (const object of proposal.objects) {
+    if (object.domain !== "observations" || object.key.includes("aqilevels")) {
+      throw new Error(`Dedicated SOS proposal contains an AQI object: ${object.key}`);
+    }
+    const connectorMatch = object.key.match(/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)/);
+    if (connectorMatch && Number(connectorMatch[2]) !== 1) {
+      throw new Error(`Dedicated SOS proposal contains a non-connector-1 mutation: ${object.key}`);
+    }
+    if (connectorMatch && object.key.endsWith(".parquet")) {
+      const groupKey = `${connectorMatch[1]}|${connectorMatch[2]}`;
+      const group = connectorDayParquet.get(groupKey) || { bytes: 0, entries: 0 };
+      group.bytes += object.body.byteLength;
+      group.entries += 1;
+      connectorDayParquet.set(groupKey, group);
+    }
+  }
+  for (const [groupKey, group] of connectorDayParquet) {
+    if (group.bytes > VERIFIED_GET_CACHE_MAX_BYTES || group.entries > VERIFIED_GET_CACHE_MAX_ENTRIES) {
+      throw new Error(
+        `Dedicated SOS verified-body cache capacity exceeded before mutation: ${groupKey} bytes=${group.bytes} entries=${group.entries}`,
+      );
+    }
+  }
+  return {
+    dedicated: true,
+    connector_id: 1,
+    observation_object_count: proposal.objects.length,
+    exact_pollutant_prefix_count: proposal.prefixes.length,
+    verified_body_cache_capacity_preflight: "succeeded",
+  };
+}
+
 async function deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, adapters, verifiedBodyCache = null }) {
   const prefix = `${prefixEntry.prefix}/`;
   verifiedBodyCache?.invalidatePrefix(prefixEntry.prefix, "delete_prefix");
@@ -414,14 +466,20 @@ async function deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, 
   }
 }
 
-async function putAndVerifyObject({ r2, runState, runStatePath, object, adapters, verifiedBodyCache = null }) {
+export async function putAndVerifyObject({ r2, runState, runStatePath, object, adapters, verifiedBodyCache = null }) {
   const entry = object.entry;
+  if (Number(entry.post_put_verification_get_attempt_count || 0) !== 0
+    || Number(entry.post_put_verification_get_count || 0) !== 0) {
+    throw new Error(`Changed object already has post-PUT GET bookkeeping: ${object.key}`);
+  }
   verifiedBodyCache?.invalidateKey(object.key, "later_put_same_key");
   Object.assign(entry, { remote_attempted: true, status: "uploading" });
   atomicWriteJson(runStatePath, runState);
   try {
     await adapters.putObject({ r2, key: object.key, body: object.body, content_type: contentTypeForKey(object.key) });
     Object.assign(entry, { uploaded: true, uploaded_at_utc: new Date().toISOString(), status: "uploaded" });
+    atomicWriteJson(runStatePath, runState);
+    entry.post_put_verification_get_attempt_count = 1;
     atomicWriteJson(runStatePath, runState);
     const fresh = await adapters.getObject({ r2, key: object.key });
     if (Number(fresh.bytes) !== object.body.byteLength || sha256Hex(fresh.body) !== entry.sha256) {
@@ -432,6 +490,7 @@ async function putAndVerifyObject({ r2, runState, runStatePath, object, adapters
       r2_verified_at_utc: new Date().toISOString(),
       remote_completed: true,
       status: "get_verified",
+      post_put_verification_get_count: 1,
     });
     if (/^history\/v2\/observations\/.+\.parquet$/.test(object.key)) {
       const cached = verifiedBodyCache?.store({
@@ -1123,6 +1182,11 @@ export async function verifyLiveObservationPartition({
     let body = verifiedBodyCache?.get(key, expectedSha) || null;
     let sourceKind = "verified_get_cache";
     if (!body) {
+      if (runState?.execution_path === "dedicated_sos_historical_observation_replacement") {
+        throw new Error(
+          `Dedicated SOS semantic verification refuses a second GET for changed Parquet: ${key}`,
+        );
+      }
       const live = await adapters.getObject({ r2, key });
       body = live.body;
       sourceKind = "fresh_get";
@@ -1290,12 +1354,17 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
   };
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   const proposal = validateLocalProposal(runState);
+  const dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
+    runState,
+    proposal,
+  });
   await validateFinalProposalGraph({ runState, proposal, runStatePath });
   const counts = { planned_deletions: proposal.prefixes.length, planned_writes: proposal.objects.length, deleted_objects: 0, completed_deletions: 0, completed_writes: 0, get_verified_writes: 0 };
   runState.apply = {
     status: "running",
     started_at_utc: new Date().toISOString(),
     final_proposal_graph_validation: "succeeded",
+    dedicated_sos_historical_proposal: dedicatedSosProposal,
     connector_day_publication: {},
     ...counts,
   };
@@ -1305,11 +1374,22 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     const historyWriterClient = adapters.historyWriterClient;
     if (!historyWriterClient) throw new Error("canonical apply requires one retained PostgreSQL history-writer session");
     const operations = [];
-    for (const domain of ["observations", "aqilevels"]) {
+    const applyDomains = dedicatedSosProposal.dedicated
+      ? ["observations"]
+      : ["observations", "aqilevels"];
+    for (const domain of applyDomains) {
       for (const prefixEntry of proposal.prefixes.filter((entry) => entry.domain === domain)) {
         operations.push({ kind: "delete", key: prefixEntry.prefix, prefixEntry });
       }
       for (const object of proposal.objects.filter((entry) => entry.domain === domain)) {
+        if (dedicatedSosProposal.dedicated
+          && /\/observations_timeseries_latest\.json$/.test(object.key)) {
+          Object.assign(object.entry, {
+            delegated_global_latest_finalization: true,
+            status: "delegated_global_latest_finalization",
+          });
+          continue;
+        }
         operations.push({ kind: "put", key: object.key, object });
       }
     }
@@ -1449,7 +1529,7 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         diagnostics: runState.writer_locks,
         finalize: async () => {
         for (const operation of globalOperations) await executeOperation(operation);
-        if (affectedDays.length) {
+        if (affectedDays.length && !dedicatedSosProposal.dedicated) {
           runState.global_index_finalization = await updateR2HistoryIndexesTargeted({
             env: process.env,
             r2,
@@ -1461,6 +1541,44 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
             strictMissingTimeseriesCounts: true,
             writeR2: true,
           });
+        } else if (affectedDays.length) {
+          runState.global_index_finalization = await updateR2HistoryIndexesTargeted({
+            env: process.env,
+            r2,
+            historyVersion: "v2",
+            domains: ["observations"],
+            affectedDaysUtc: affectedDays,
+            connectorId: null,
+            updateLatestIndex: true,
+            writePollutantIndexes: false,
+            strictMissingTimeseriesCounts: true,
+            writeR2: true,
+          });
+          const latest = runState.global_index_finalization?.observations_timeseries;
+          const latestKey = String(latest?.latest_index_key || "");
+          const latestEntry = runState.objects?.[latestKey];
+          if (!latestKey || !latestEntry?.delegated_global_latest_finalization
+            || latest?.latest_index_verified !== true) {
+            throw new Error("Dedicated SOS live observation latest finalization was not verified");
+          }
+          Object.assign(latestEntry, {
+            remote_attempted: !latest.latest_index_put_skipped,
+            remote_completed: true,
+            uploaded: !latest.latest_index_put_skipped,
+            r2_verified: true,
+            r2_verified_at_utc: new Date().toISOString(),
+            post_put_verification_get_attempt_count: latest.latest_index_put_skipped ? 0 : 1,
+            post_put_verification_get_count: latest.latest_index_put_skipped ? 0 : 1,
+            skipped_unchanged: Boolean(latest.latest_index_put_skipped),
+            final_live_sha256: latest.latest_index_sha256,
+            final_live_bytes: latest.latest_index_bytes,
+            status: latest.latest_index_put_skipped ? "skipped_unchanged" : "get_verified",
+          });
+          if (!latest.latest_index_put_skipped) {
+            counts.completed_writes += 1;
+            counts.get_verified_writes += 1;
+          }
+          atomicWriteJson(runStatePath, runState);
         }
         },
       });

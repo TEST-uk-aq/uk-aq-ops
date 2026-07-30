@@ -128,18 +128,6 @@ DROPBOX_APP_ROOT = Path(
 DEFAULT_R2_HISTORY_DROPBOX_DIR = "R2_history_backup"
 CURRENT_INTEGRITY_HISTORY_VERSION = "v2"
 CURRENT_INTEGRITY_CORE_PREFIX = "history/v2/core"
-SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH = (
-    "dedicated_sos_historical_observation_replacement"
-)
-SOS_HISTORICAL_REPLACEMENT_STAGE_ORDER = (
-    "observations_proposal",
-    "observations_metadata_proposal",
-    "latest_snapshot_auth_preflight",
-    "canonical_apply_and_ordered_verification",
-    "first_value_at_reconciliation",
-    "timeseries_reconciliation",
-    "latest_snapshot_reconciliation",
-)
 
 DAILY_TASK_HEALTH_TASK_KEY = "ops.history_integrity"
 DAILY_TASK_HEALTH_SOURCE_REPO = "uk-aq-ops"
@@ -10706,9 +10694,6 @@ def _sos_source_counts_for_v2_partition(
     )
     evidence["source_group_count"] = len(counts)
     evidence["legitimate_empty_groups"] = empty_groups
-    evidence["all_source_groups_excluded_no_authoritative_binding"] = bool(
-        missing_binding_warnings and not candidates_by_site
-    )
     return finish(
         "successful_non_empty" if counts else "successful_empty",
         None,
@@ -11456,9 +11441,6 @@ def _v2_observation_repair_source_evidence_summary(
         "required_source_file_count",
         "successful_source_file_count",
         "identity_classification",
-        "all_source_groups_excluded_no_authoritative_binding",
-        "selected_partition_left_unchanged",
-        "legacy_r2_only_identity_handling",
     )
     count_fields = (
         "source_rows",
@@ -11520,7 +11502,6 @@ def run_v2_observations_integrity_checks(
     log: logging.Logger | None = None,
     allowed_real_roots: Iterable[Path] = (),
     verified_first_value_at_scope_sink: list[dict[str, Any]] | None = None,
-    dedicated_sos_historical_replacement: bool = False,
 ) -> dict[str, Any]:
     if not r2_history_root:
         raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
@@ -11533,7 +11514,6 @@ def run_v2_observations_integrity_checks(
     gaps: list[dict[str, Any]] = []
     hash_check_candidates: list[dict[str, Any]] = []
     source_resolution_by_pollutant: dict[str, dict[str, Any]] = {}
-    all_unmapped_partitions_left_unchanged: list[dict[str, Any]] = []
     connector_day_source_evidence: dict[
         tuple[str, int], dict[str, dict[str, Any]]
     ] = {}
@@ -11564,37 +11544,6 @@ def run_v2_observations_integrity_checks(
                 connector_id=connector_id,
                 pollutant_code=pollutant_code,
             )
-            if (
-                dedicated_sos_historical_replacement
-                and evidence.get(
-                    "all_source_groups_excluded_no_authoritative_binding"
-                )
-            ):
-                evidence.update({
-                    "source_partition_state":
-                        "all_groups_excluded_no_authoritative_binding",
-                    "source_counts_present": False,
-                    "source_counts_available": False,
-                    "source_skip_reason":
-                        "all_source_groups_excluded_no_authoritative_binding",
-                    "selected_partition_left_unchanged": True,
-                })
-                partition = evidence.get("partition")
-                if isinstance(partition, dict):
-                    partition.update({
-                        "state": "all_groups_excluded_no_authoritative_binding",
-                        "source_counts_present": False,
-                        "source_counts_available": False,
-                        "source_skip_reason":
-                            "all_source_groups_excluded_no_authoritative_binding",
-                        "selected_partition_left_unchanged": True,
-                    })
-                all_unmapped_partitions_left_unchanged.append({
-                    "day_utc": day_utc,
-                    "connector_id": int(connector_id),
-                    "pollutant_code": pollutant_code,
-                    "reason": "all_source_groups_excluded_no_authoritative_binding",
-                })
             resolved[pollutant_code] = (
                 _v2_observation_repair_source_evidence_summary(evidence)
             )
@@ -11792,39 +11741,6 @@ def run_v2_observations_integrity_checks(
                         connector_id=connector_id_for_source,
                         pollutant_code=pollutant,
                     )
-                    if (
-                        dedicated_sos_historical_replacement
-                        and source_partition_evidence.get(
-                            "all_source_groups_excluded_no_authoritative_binding"
-                        )
-                    ):
-                        source_partition_evidence.update({
-                            "source_partition_state":
-                                "all_groups_excluded_no_authoritative_binding",
-                            "source_counts_present": False,
-                            "source_counts_available": False,
-                            "source_skip_reason":
-                                "all_source_groups_excluded_no_authoritative_binding",
-                            "selected_partition_left_unchanged": True,
-                        })
-                        partition = source_partition_evidence.get("partition")
-                        if isinstance(partition, dict):
-                            partition.update({
-                                "state":
-                                    "all_groups_excluded_no_authoritative_binding",
-                                "source_counts_present": False,
-                                "source_counts_available": False,
-                                "source_skip_reason":
-                                    "all_source_groups_excluded_no_authoritative_binding",
-                                "selected_partition_left_unchanged": True,
-                            })
-                        all_unmapped_partitions_left_unchanged.append({
-                            "day_utc": day_utc,
-                            "connector_id": int(connector_id_for_source),
-                            "pollutant_code": pollutant,
-                            "reason":
-                                "all_source_groups_excluded_no_authoritative_binding",
-                        })
                 parquet_stats, parquet_error = _append_actual_parquet_gaps(
                     gaps,
                     domain="observations",
@@ -11889,18 +11805,13 @@ def run_v2_observations_integrity_checks(
                             ],
                             "unresolved_r2_timeseries_mapping_issues":
                                 unresolved_r2_ids,
-                            "legacy_r2_only_identity_handling": (
-                                "diagnostic_only_complete_partition_replacement"
-                                if dedicated_sos_historical_replacement
-                                else "continuity_mapping_required"
-                            ),
                         }
                         if historical_rollovers:
                             rollover_updates["identity_classification"] = (
                                 "bridge_known_historical_identity_rollover"
                             )
                         source_partition_evidence.update(rollover_updates)
-                        if unresolved_r2_ids and not dedicated_sos_historical_replacement:
+                        if unresolved_r2_ids:
                             source_partition_evidence.update({
                                 "source_partition_state": "mapping_unavailable",
                                 "source_counts_available": False,
@@ -11910,7 +11821,7 @@ def run_v2_observations_integrity_checks(
                         partition = source_partition_evidence.get("partition")
                         if isinstance(partition, dict):
                             partition.update(rollover_updates)
-                            if unresolved_r2_ids and not dedicated_sos_historical_replacement:
+                            if unresolved_r2_ids:
                                 partition.update({
                                     "state": "mapping_unavailable",
                                     "source_counts_available": False,
@@ -11980,7 +11891,6 @@ def run_v2_observations_integrity_checks(
                     if parquet_readable and source_state not in {
                         "successful_non_empty",
                         "successful_empty",
-                        "all_groups_excluded_no_authoritative_binding",
                     }:
                         mapping_failure = source_state == "mapping_unavailable"
                         gap = _v2_obs_gap(
@@ -12169,21 +12079,6 @@ def run_v2_observations_integrity_checks(
             for pollutant in sorted(V2_OBSERVATION_INTEGRITY_POLLUTANTS)
         },
         "source_resolution_by_pollutant": source_resolution_by_pollutant,
-        "all_unmapped_partitions_left_unchanged": sorted(
-            {
-                (
-                    str(entry["day_utc"]),
-                    int(entry["connector_id"]),
-                    str(entry["pollutant_code"]),
-                ): entry
-                for entry in all_unmapped_partitions_left_unchanged
-            }.values(),
-            key=lambda entry: (
-                entry["day_utc"],
-                entry["connector_id"],
-                entry["pollutant_code"],
-            ),
-        ),
         "first_value_at_candidate_scopes": verified_first_value_at_scopes,
         "first_value_at_evidence": {
             "status": "pending_observation_content_hash_checks",
@@ -21668,95 +21563,6 @@ def run_first_value_at_reconciliation(
     return aggregate
 
 
-def summarize_ordered_apply_verification(
-    *,
-    run_state: Mapping[str, Any],
-    apply_result: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Accept dedicated SOS history from the ordered per-object apply audit."""
-    remaining_scopes: list[dict[str, Any]] = []
-    written_keys: list[str] = []
-    verification_evidence: list[dict[str, Any]] = []
-    for object_key, raw_entry in sorted(dict(run_state.get("objects") or {}).items()):
-        if not isinstance(raw_entry, Mapping) or not raw_entry.get("proposed"):
-            continue
-        entry = dict(raw_entry)
-        get_count = int(entry.get("post_put_verification_get_count") or 0)
-        evidence = {
-            "object_key": object_key,
-            "bytes": entry.get("bytes"),
-            "sha256": entry.get("sha256"),
-            "uploaded": bool(entry.get("uploaded")),
-            "r2_verified": bool(entry.get("r2_verified")),
-            "post_put_verification_get_count": get_count,
-            "delegated_global_latest_finalization": bool(
-                entry.get("delegated_global_latest_finalization")
-            ),
-            "skipped_unchanged": bool(entry.get("skipped_unchanged")),
-            "final_live_sha256": entry.get("final_live_sha256"),
-        }
-        verification_evidence.append(evidence)
-        if (
-            evidence["delegated_global_latest_finalization"]
-            and evidence["skipped_unchanged"]
-            and evidence["r2_verified"]
-            and get_count == 0
-        ):
-            continue
-        if evidence["uploaded"] and evidence["r2_verified"] and get_count == 1:
-            written_keys.append(str(object_key))
-        else:
-            remaining_scopes.append({
-                "stage": "ordered_apply_verification",
-                "object_key": object_key,
-                "gap_type": "changed_object_missing_single_post_put_get_verification",
-                "evidence": evidence,
-            })
-    deletion_evidence: list[dict[str, Any]] = []
-    deleted_object_count = 0
-    for raw_prefix in list(run_state.get("tombstone_prefixes") or []):
-        if not isinstance(raw_prefix, Mapping) or not raw_prefix.get("proposed"):
-            continue
-        evidence = {
-            "prefix": str(raw_prefix.get("prefix") or ""),
-            "deletion_verified": bool(raw_prefix.get("deletion_verified")),
-            "deleted_object_count": int(raw_prefix.get("deleted_object_count") or 0),
-        }
-        deletion_evidence.append(evidence)
-        if evidence["deletion_verified"]:
-            deleted_object_count += evidence["deleted_object_count"]
-        else:
-            remaining_scopes.append({
-                "stage": "ordered_apply_verification",
-                "object_key": f"{evidence['prefix']}/",
-                "gap_type": "selected_prefix_deletion_not_verified",
-            })
-    apply_status = str(apply_result.get("status") or "")
-    if apply_status not in {"succeeded", "skipped_noop"}:
-        remaining_scopes.append({
-            "stage": "canonical_apply",
-            "gap_type": "ordered_apply_not_successful",
-            "apply_status": apply_status,
-        })
-    return {
-        "ran": True,
-        "status": "ok" if not remaining_scopes else "failed",
-        "verification_mode": "ordered_changed_objects_single_post_put_get",
-        "source_truth": "immutable_current_run_sos_source_evidence",
-        "local_object_resolution":
-            "validated_overlay_then_exact_tombstone_then_dropbox_baseline",
-        "second_broad_r2_scan_invoked": False,
-        "r2_get_verification_evidence": verification_evidence,
-        "r2_delete_verification_evidence": deletion_evidence,
-        "global_index_finalization": run_state.get("global_index_finalization"),
-        "r2_objects_written": len(written_keys),
-        "r2_objects_deleted": deleted_object_count,
-        "r2_objects_changed": len(written_keys) + deleted_object_count,
-        "remaining_gap_count": len(remaining_scopes),
-        "remaining_scopes": remaining_scopes,
-    }
-
-
 def run_v2_integrity_repair_flow(
     *,
     run_state: dict[str, Any],
@@ -21780,28 +21586,8 @@ def run_v2_integrity_repair_flow(
     log: logging.Logger,
     selected_days: Iterable[str] | None = None,
     repair_pollutants: Iterable[str] | None = None,
-    dedicated_sos_historical_replacement: bool = False,
 ) -> dict[str, Any]:
     """Build one canonical local proposal, then optionally apply and verify it."""
-    if dedicated_sos_historical_replacement:
-        if dry_run:
-            raise RuntimeError(
-                "dedicated SOS historical replacement is write-enabled only"
-            )
-        if allowed_connector_ids != {1} or str(
-            (source_scope or {}).get("source") or ""
-        ) != "sos":
-            raise RuntimeError(
-                "dedicated SOS historical replacement requires source=sos and "
-                "connector_id=1 only"
-            )
-        run_state.update({
-            "execution_path": SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH,
-            "dedicated_sos_historical_replacement": True,
-            "mutation_connector_ids": [1],
-            "aqi_policy": "bypassed_observation_history_only",
-        })
-        write_run_state(run_state)
     observations = run_v2_gap_backfills(
         conn=conn, run_id=run_id, env_name=env_name, run_compact=run_compact,
         env=env, v2_observations=v2_observations, dry_run=dry_run,
@@ -21814,50 +21600,6 @@ def run_v2_integrity_repair_flow(
     )
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
-    if dedicated_sos_historical_replacement:
-        unchanged_by_connector_day: dict[tuple[str, int], set[str]] = {}
-        for entry in list(
-            v2_observations.get("all_unmapped_partitions_left_unchanged") or []
-        ):
-            if not isinstance(entry, Mapping):
-                continue
-            connector_day = (
-                str(entry.get("day_utc") or ""),
-                int(entry.get("connector_id") or 0),
-            )
-            unchanged_by_connector_day.setdefault(connector_day, set()).add(
-                str(entry.get("pollutant_code") or "").strip().lower()
-            )
-        requested_set = set(_normalise_repair_pollutants(repair_pollutants))
-        changed_connector_days = {
-            (str(scope.get("day_utc") or ""), int(scope.get("connector_id") or 0))
-            for scope in list(
-                (run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or []
-            )
-            if isinstance(scope, Mapping)
-        }
-
-        def suppress_all_unmapped_action(action: Mapping[str, Any]) -> bool:
-            connector_day = (
-                str(action.get("day_utc") or ""),
-                int(action.get("connector_id") or 1),
-            )
-            pollutant_code = str(
-                action.get("pollutant_code") or ""
-            ).strip().lower()
-            unchanged = unchanged_by_connector_day.get(connector_day, set())
-            if pollutant_code:
-                return pollutant_code in unchanged
-            return bool(
-                requested_set
-                and requested_set.issubset(unchanged)
-                and connector_day not in changed_connector_days
-            )
-
-        metadata_actions = [
-            action for action in metadata_actions
-            if not suppress_all_unmapped_action(action)
-        ]
     empty_replacement_scopes = {
         (str(scope.get("day_utc") or ""), int(scope.get("connector_id") or 0))
         for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or [])
@@ -21926,13 +21668,9 @@ def run_v2_integrity_repair_flow(
     } and observation_index_status not in {
         "failed", "blocked_dependency",
     }
-    if dedicated_sos_historical_replacement:
-        aqi_work: list[dict[str, Any]] = []
-        aqi_blocked: list[dict[str, Any]] = []
-    else:
-        aqi_work, aqi_blocked = _phase4_aqi_work(
-            conn=conn, run_state=run_state, v2_aqilevels=v2_aqilevels,
-        )
+    aqi_work, aqi_blocked = _phase4_aqi_work(
+        conn=conn, run_state=run_state, v2_aqilevels=v2_aqilevels,
+    )
     aqi_bridge_metrics: dict[str, Any] = {
         "v2_aqi_integrity_rebuild_bridge_ran": False,
         "v2_aqi_rebuilds_queued_from_integrity": 0,
@@ -21940,7 +21678,7 @@ def run_v2_integrity_repair_flow(
         "planned_aqi_rebuild_connector_days": [],
         "queued_aqi_only_connector_days": [],
     }
-    if observation_stages_verified and not dedicated_sos_historical_replacement:
+    if observation_stages_verified:
         # The canonical coordinator owns the executable bridge.  The
         # pre-coordinator check-only path deliberately does not queue work;
         # doing so here makes observation-backed AQI coverage gaps available
@@ -21985,18 +21723,6 @@ def run_v2_integrity_repair_flow(
                 "reason": "observation_stages_not_verified",
                 "scope_count": len(aqi_work),
             })
-    elif dedicated_sos_historical_replacement:
-        aqi_result = {
-            **aqi_bridge_metrics,
-            "status": "bypassed",
-            "reason": "dedicated_sos_observation_history_only",
-            "aqi_rebuilds_queued": 0,
-            "aqi_rebuilds_queued_total": 0,
-            "aqi_rebuilds_attempted": 0,
-            "aqi_rebuilds_complete": 0,
-            "aqi_rebuilds_failed": 0,
-            "aqi_rebuild_results": [],
-        }
     else:
         combined_observations_root = _create_final_verification_view(
             run_state,
@@ -22084,11 +21810,7 @@ def run_v2_integrity_repair_flow(
                 "stage": "aqilevels",
             })
 
-    aqi_metadata_actions = (
-        []
-        if dedicated_sos_historical_replacement
-        else _v2_aqi_metadata_actions(v2_aqilevels)
-    )
+    aqi_metadata_actions = _v2_aqi_metadata_actions(v2_aqilevels)
     # The AQI writer emits manifests, but they are not trusted as the final
     # metadata layer. Rebuild and verify pollutant, connector and day manifests
     # from the final combined view before the targeted index is rebuilt.
@@ -22144,12 +21866,6 @@ def run_v2_integrity_repair_flow(
             {**day_base, "kind": "aqi_day_manifest_repair"},
         ])
     aqi_metadata = (
-        {
-            "status": "bypassed",
-            "reason": "dedicated_sos_observation_history_only",
-            "results": [],
-        }
-        if dedicated_sos_historical_replacement else
         {"status": "blocked_dependency", "reason": "aqi_data_repair_failed", "results": []}
         if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0 else
         _run_v2_observation_metadata_executor(
@@ -22157,12 +21873,11 @@ def run_v2_integrity_repair_flow(
             dry_run=dry_run, log=log, run_state=run_state, conn=conn,
         )
     )
-    if not dedicated_sos_historical_replacement:
-        _record_metadata_executor_overlay(
-            run_state=run_state, executor_result=aqi_metadata, dry_run=dry_run,
-            manifest_scope_set="AQI_MANIFESTS_CHANGED", index_scope_set="AQI_INDEXES_CHANGED",
-            manifest_stage="aqilevels_manifests", index_stage="aqilevels_indexes",
-        )
+    _record_metadata_executor_overlay(
+        run_state=run_state, executor_result=aqi_metadata, dry_run=dry_run,
+        manifest_scope_set="AQI_MANIFESTS_CHANGED", index_scope_set="AQI_INDEXES_CHANGED",
+        manifest_stage="aqilevels_manifests", index_stage="aqilevels_indexes",
+    )
     aqi_manifest_status = str(aqi_metadata.get("manifest_status") or aqi_metadata.get("status") or "not_run")
     aqi_index_status = str(aqi_metadata.get("index_status") or aqi_metadata.get("status") or "not_run")
     proposal_failed = (
@@ -22357,11 +22072,6 @@ def run_v2_integrity_repair_flow(
             "r2_objects_deleted": 0,
             "r2_objects_changed": 0,
         }
-    elif dedicated_sos_historical_replacement:
-        final_verification = summarize_ordered_apply_verification(
-            run_state=run_state,
-            apply_result=apply_result,
-        )
     else:
         final_verification = run_v2_final_verification(
             run_state=run_state,
@@ -22418,19 +22128,7 @@ def run_v2_integrity_repair_flow(
     stage_results = [
         {"stage": "observations_proposal", "status": "failed" if observation_failed else "validated", "result": observations},
         {"stage": "observations_metadata_proposal", "status": "failed" if observation_manifest_status in {"failed", "blocked_dependency"} or observation_index_status in {"failed", "blocked_dependency"} else "validated", "result": metadata},
-        {
-            "stage": "aqi_proposal",
-            "status": (
-                "bypassed"
-                if dedicated_sos_historical_replacement
-                else "failed"
-                if aqi_capture_failures
-                or int(aqi_result.get("aqi_rebuilds_failed") or 0)
-                else "validated"
-            ),
-            "result": aqi_result,
-            "source_mode": "combined_local",
-        },
+        {"stage": "aqi_proposal", "status": "failed" if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) else "validated", "result": aqi_result, "source_mode": "combined_local"},
         {
             "stage": "latest_snapshot_auth_preflight",
             "status": auth_preflight.get("status"),
@@ -22447,15 +22145,7 @@ def run_v2_integrity_repair_flow(
             "status": first_value_at_reconciliation.get("status"),
             "result": first_value_at_reconciliation,
         },
-        {
-            "stage": (
-                "ordered_apply_verification"
-                if dedicated_sos_historical_replacement
-                else "final_verification"
-            ),
-            "status": final_verification.get("status"),
-            "result": final_verification,
-        },
+        {"stage": "final_verification", "status": final_verification.get("status"), "result": final_verification},
         {
             "stage": "timeseries_reconciliation",
             "status": current_state_reconciliation.get(
@@ -22493,33 +22183,9 @@ def run_v2_integrity_repair_flow(
             "r2_get_after_put_verification_count",
         )
     }
-    stage_order = (
-        list(SOS_HISTORICAL_REPLACEMENT_STAGE_ORDER)
-        if dedicated_sos_historical_replacement
-        else list(CANONICAL_REPAIR_STAGE_ORDER)
-    )
     result = {
         "status": "failed" if coordinator_failed else (
             "planned" if dry_run else "succeeded"
-        ),
-        "execution_path": (
-            SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
-            if dedicated_sos_historical_replacement
-            else "generic_integrity"
-        ),
-        "dedicated_sos_historical_replacement": bool(
-            dedicated_sos_historical_replacement
-        ),
-        "mutation_connector_ids": [1] if dedicated_sos_historical_replacement else None,
-        "bypassed_stages": (
-            [
-                "aqi_detection",
-                "aqi_proposal",
-                "aqi_metadata",
-                "aqi_indexes",
-                "broad_final_r2_scan",
-            ]
-            if dedicated_sos_historical_replacement else []
         ),
         "dry_run": bool(dry_run),
         "write_enabled": not dry_run,
@@ -22529,7 +22195,7 @@ def run_v2_integrity_repair_flow(
         "latest_snapshot_auth_preflight": auth_preflight,
         "first_value_at_reconciliation": first_value_at_reconciliation,
         "metadata_executor_r2_operation_counts": metadata_r2_operation_counts,
-        "stage_order": stage_order,
+        "stage_order": list(CANONICAL_REPAIR_STAGE_ORDER),
         "stage_results": stage_results,
         "stage_result_counts": {
             status: sum(1 for stage in stage_results if stage.get("status") == status)
@@ -22559,7 +22225,7 @@ def run_v2_integrity_repair_flow(
     log.info(
         "v2 repair coordinator %s: stages=%s r2_write_attempted=%s",
         result["status"],
-        ",".join(stage_order),
+        ",".join(CANONICAL_REPAIR_STAGE_ORDER),
         result["r2_write_attempted"],
     )
     return result
@@ -22702,54 +22368,6 @@ def resolve_effective_mode(args: argparse.Namespace) -> Literal[
     if args.run_backfill:
         return "repair_dry_run" if args.dry_run else "repair_apply"
     return "check_only"
-
-
-def select_sos_historical_replacement_route(
-    args: argparse.Namespace,
-    *,
-    mutation_connector_ids: Iterable[int] | None = None,
-) -> dict[str, Any]:
-    """Select only the explicit real SOS connector-1 replacement contract."""
-    requirements = {
-        "source_sos": str(getattr(args, "source", "")) == "sos",
-        "real_run_backfill": resolve_effective_mode(args) == "repair_apply",
-        "history_version_v2": str(getattr(args, "history_version", "")) == "v2",
-        "explicit_from_day": bool(str(getattr(args, "from_day", "") or "").strip()),
-        "explicit_to_day": bool(str(getattr(args, "to_day", "") or "").strip()),
-        "explicit_repair_pollutants": bool(
-            list(getattr(args, "repair_pollutants", None) or [])
-        ),
-    }
-    arguments_qualify = all(requirements.values())
-    result: dict[str, Any] = {
-        "selected": False,
-        "execution_path": (
-            SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
-            if arguments_qualify else "generic_integrity"
-        ),
-        "arguments_qualify": arguments_qualify,
-        "requirements": requirements,
-        "mutation_connector_ids": None,
-        "reason": None,
-    }
-    if not arguments_qualify:
-        result["reason"] = "qualifying_arguments_not_satisfied"
-        return result
-    if mutation_connector_ids is None:
-        result["reason"] = "awaiting_resolved_connector_scope"
-        return result
-    connector_ids = sorted({int(value) for value in mutation_connector_ids})
-    result["mutation_connector_ids"] = connector_ids
-    if connector_ids != [1]:
-        raise RuntimeError(
-            "dedicated SOS historical replacement refuses mutation outside "
-            f"connector_id=1; resolved_connector_ids={connector_ids}"
-        )
-    result.update({
-        "selected": True,
-        "reason": "qualifying_real_sos_connector_1_repair",
-    })
-    return result
 
 
 def mode_creates_repair_overlay(effective_mode: str) -> bool:
@@ -24741,8 +24359,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             "## V2 repair coordinator",
             "",
             f"- Status: {repair_flow.get('status') or '(none)'}",
-            f"- Execution path: {repair_flow.get('execution_path') or 'generic_integrity'}",
-            f"- Dedicated SOS replacement: {bool(repair_flow.get('dedicated_sos_historical_replacement'))}",
             f"- R2 write attempted: {bool(repair_flow.get('r2_write_attempted'))}",
             f"- Overlay root: {repair_flow.get('overlay_root') or '(none)'}",
             f"- Run state: {repair_flow.get('run_state_path') or '(none)'}",
@@ -25454,8 +25070,6 @@ def write_reports(
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     effective_mode = resolve_effective_mode(args)
-    sos_historical_route = select_sos_historical_replacement_route(args)
-    dedicated_sos_historical_replacement = False
     env = load_env_or_die()
     history_version_mode = resolve_history_version_mode(args)
     checked_history_versions = expand_history_versions(history_version_mode)
@@ -25546,11 +25160,6 @@ def main(argv: list[str]) -> int:
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
             "effective_mode": effective_mode,
-            "execution_path": sos_historical_route.get("execution_path"),
-            "sos_historical_route": sos_historical_route,
-            "dedicated_sos_historical_replacement": bool(
-                dedicated_sos_historical_replacement
-            ),
             "dropbox_baseline": resolve_r2_history_root(os.environ),
             "repair_mode": bool(args.run_backfill),
             "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
@@ -25862,35 +25471,6 @@ def main(argv: list[str]) -> int:
         if "v2" in checked_history_versions and snapshot_ok:
             v2_allowed_connector_ids, v2_source_scope = resolve_v2_source_scope(conn, args.source)
             log.info("v2 source scope: %s", v2_source_scope)
-            sos_historical_route = select_sos_historical_replacement_route(
-                args,
-                mutation_connector_ids=v2_allowed_connector_ids,
-            )
-            dedicated_sos_historical_replacement = bool(
-                sos_historical_route.get("selected")
-            )
-            if dedicated_sos_historical_replacement:
-                log.info(
-                    "selected execution_path=%s connector_ids=%s pollutants=%s",
-                    SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH,
-                    sos_historical_route.get("mutation_connector_ids"),
-                    ",".join(args.repair_pollutants),
-                )
-                conn.execute(
-                    """
-                    UPDATE integrity_runs
-                    SET notes = COALESCE(notes, '') || ?
-                    WHERE id = ?
-                    """,
-                    (
-                        " execution_path="
-                        f"{SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH};"
-                        " mutation_connector_ids=1;"
-                        f" repair_pollutants={','.join(args.repair_pollutants)}.",
-                        int(run_id),
-                    ),
-                )
-                conn.commit()
         sos_counts = lookup_source_counts.get("sos", {})
         source_adapter_history_version = adapter_backfill_history_version(history_version_mode)
         log.info(
@@ -25982,9 +25562,6 @@ def main(argv: list[str]) -> int:
                 allowed_connector_ids=v2_allowed_connector_ids,
                 source_scope=v2_source_scope,
                 log=log,
-                dedicated_sos_historical_replacement=(
-                    dedicated_sos_historical_replacement
-                ),
             )
             observation_hash_metrics = run_v2_observation_content_hash_checks(
                 conn=conn,
@@ -25999,35 +25576,19 @@ def main(argv: list[str]) -> int:
                     verified_first_value_at_connector_days
                 ),
             )
-            if dedicated_sos_historical_replacement:
-                v2_aqi = {
-                    "status": "bypassed",
-                    "reason": "dedicated_sos_observation_history_only",
-                    "checked_partitions": 0,
-                    "gap_count": 0,
-                    "gaps": [],
-                    "debug": {
-                        "checked": False,
-                        "required": False,
-                        "status": "bypassed",
-                        "gap_count": 0,
-                        "gaps": [],
-                    },
-                }
-            else:
-                v2_aqi = run_v2_aqilevels_integrity_checks(
-                    r2_history_root=r2_history_root,
-                    config=history_path_configs["v2"],
-                    from_day=from_day,
-                    to_day=to_day,
-                    selected_days=selected_day_values,
-                    allowed_connector_ids=v2_allowed_connector_ids,
-                    source_scope=v2_source_scope,
-                    conn=conn,
-                    check_aqi_debug=bool(args.check_aqi_debug),
-                    require_aqi_debug=bool(args.require_aqi_debug),
-                    log=log,
-                )
+            v2_aqi = run_v2_aqilevels_integrity_checks(
+                r2_history_root=r2_history_root,
+                config=history_path_configs["v2"],
+                from_day=from_day,
+                to_day=to_day,
+                selected_days=selected_day_values,
+                allowed_connector_ids=v2_allowed_connector_ids,
+                source_scope=v2_source_scope,
+                conn=conn,
+                check_aqi_debug=bool(args.check_aqi_debug),
+                require_aqi_debug=bool(args.require_aqi_debug),
+                log=log,
+            )
             cross_check_metrics = {
                 "ran": True,
                 "history_version": "v2",
@@ -26060,34 +25621,17 @@ def main(argv: list[str]) -> int:
                 for gap in list((cross_check_metrics.get("v2_observations") or {}).get("gaps") or [])
                 if str(gap.get("day_utc") or "") and int(gap.get("connector_id") or 0) > 0
             }
-            v2_aqi_integrity_queue_metrics = (
-                {
-                    "v2_aqi_integrity_rebuild_bridge_ran": False,
-                    "v2_aqi_rebuilds_queued_from_integrity": 0,
-                    "planned_v2_aqi_rebuilds_from_integrity": [],
-                    "planned_aqi_rebuild_connector_days": [],
-                    "queued_aqi_only_connector_days": [],
-                    "aqi_rebuilds_queued": 0,
-                    "aqi_rebuilds_queued_total": 0,
-                    "aqi_rebuilds_attempted": 0,
-                    "aqi_rebuilds_complete": 0,
-                    "aqi_rebuilds_failed": 0,
-                    "aqi_rebuild_skipped_reason":
-                        "dedicated_sos_observation_history_only",
-                }
-                if dedicated_sos_historical_replacement else
-                queue_v2_aqi_rebuilds_from_integrity_gaps(
-                    conn=conn,
-                    run_id=int(run_id),
-                    env_name=args.env,
-                    env=env,
-                    v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
-                    dry_run=args.dry_run,
-                    run_backfill=False,
-                    log=log,
-                    allowed_connector_ids=v2_allowed_connector_ids,
-                    blocked_connector_days=observation_gap_keys,
-                )
+            v2_aqi_integrity_queue_metrics = queue_v2_aqi_rebuilds_from_integrity_gaps(
+                conn=conn,
+                run_id=int(run_id),
+                env_name=args.env,
+                env=env,
+                v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
+                dry_run=args.dry_run,
+                run_backfill=False,
+                log=log,
+                allowed_connector_ids=v2_allowed_connector_ids,
+                blocked_connector_days=observation_gap_keys,
             )
             cross_check_metrics.update(v2_aqi_integrity_queue_metrics)
 
@@ -26122,15 +25666,6 @@ def main(argv: list[str]) -> int:
             repair_overlay["effective_mode"] = effective_mode
             repair_overlay["dropbox_baseline"] = str(dropbox_root)
             repair_overlay["allow_stale_dropbox"] = bool(args.allow_stale_dropbox)
-            repair_overlay["execution_path"] = sos_historical_route.get(
-                "execution_path"
-            )
-            repair_overlay["sos_historical_route"] = dict(sos_historical_route)
-            repair_overlay["requested_from_day"] = from_day
-            repair_overlay["requested_to_day"] = to_day
-            repair_overlay["requested_repair_pollutants"] = list(
-                args.repair_pollutants
-            )
             write_run_state(repair_overlay)
             log.info(
                 "created v2 repair overlay after detection and planning run_state=%s overlay=%s",
@@ -26142,7 +25677,6 @@ def main(argv: list[str]) -> int:
             if (
                 mode_allows_remote_apply(effective_mode)
                 and historical_rollover_planned
-                and not dedicated_sos_historical_replacement
                 and not args.enable_historical_identity_repair
             ):
                 repair_flow = {
@@ -26178,11 +25712,8 @@ def main(argv: list[str]) -> int:
                 require_aqi_debug=bool(args.require_aqi_debug),
                 limits=limits,
                 dry_run=not mode_allows_remote_apply(effective_mode),
-                    log=log,
+                log=log,
                     repair_pollutants=args.repair_pollutants,
-                    dedicated_sos_historical_replacement=(
-                        dedicated_sos_historical_replacement
-                    ),
                 )
             aqi_stage = next(
                 (
@@ -26739,11 +26270,6 @@ def main(argv: list[str]) -> int:
             "check_only": args.check_only,
             "run_backfill": args.run_backfill,
             "effective_mode": effective_mode,
-            "execution_path": sos_historical_route.get("execution_path"),
-            "sos_historical_route": sos_historical_route,
-            "dedicated_sos_historical_replacement": bool(
-                dedicated_sos_historical_replacement
-            ),
             "dropbox_baseline": resolve_r2_history_root(os.environ),
             "repair_mode": args.run_backfill,
             "force_snapshot_import": args.force_snapshot_import,
@@ -26815,10 +26341,6 @@ def main(argv: list[str]) -> int:
                 "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill),
                 "effective_mode": effective_mode,
-                "execution_path": sos_historical_route.get("execution_path"),
-                "dedicated_sos_historical_replacement": bool(
-                    dedicated_sos_historical_replacement
-                ),
                 "dropbox_baseline": resolve_r2_history_root(os.environ),
                 "repair_mode": bool(args.run_backfill),
                 "skip_cross_check": bool(args.skip_cross_check),
