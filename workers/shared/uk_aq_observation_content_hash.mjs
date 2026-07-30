@@ -173,6 +173,21 @@ export function computeObservationContentHash(rows) {
   };
 }
 
+export function computeEmptyObservationContentHash() {
+  const hash = createHash("sha256");
+  hash.update(OBSERVATION_CONTENT_HASH_PREFIX, "utf8");
+  return {
+    observation_content_hash: hash.digest("hex"),
+    observation_content_hash_algorithm: OBSERVATION_CONTENT_HASH_ALGORITHM,
+    observation_content_hash_contract_version:
+      OBSERVATION_CONTENT_HASH_CONTRACT_VERSION,
+    observation_content_hash_row_count: 0,
+    observation_content_hash_columns: [...OBSERVATION_CONTENT_HASH_COLUMNS],
+    verification_status_counts: { P: 0, R: 0, null: 0 },
+    canonical_rows: [],
+  };
+}
+
 export function validateObservationContentHashMetadata(
   metadata,
   { rowCount = null } = {},
@@ -258,7 +273,9 @@ if (isMain) {
         }),
       }))
       : inputRows;
-    const result = computeObservationContentHash(rows);
+    const result = Array.isArray(rows) && rows.length === 0 && input?.allow_empty
+      ? computeEmptyObservationContentHash()
+      : computeObservationContentHash(rows);
     const { canonical_rows: _canonicalRows, ...output } = result;
     process.stdout.write(`${JSON.stringify(output)}\n`);
   } catch (error) {
