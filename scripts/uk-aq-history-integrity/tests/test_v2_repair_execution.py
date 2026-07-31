@@ -3820,6 +3820,32 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
         self.assertEqual(metrics["complete_replacements"], 1)
         self.assertEqual(metrics["exact_tombstones_created"], 1)
         self.assertEqual(worker_source_modes, ["acquire", "consume", "consume"])
+        self.assertEqual(metrics["source_acquisition_invocation_count"], 1)
+        self.assertEqual(metrics["source_acquisition_root_creation_count"], 1)
+        self.assertEqual(
+            metrics["source_acquisition_complete_from_day_utc"], day_utc,
+        )
+        self.assertEqual(
+            metrics["source_acquisition_complete_to_day_utc"], day_utc,
+        )
+        self.assertEqual(
+            metrics["source_acquisition_selected_pollutants"],
+            [pollutant_code],
+        )
+        self.assertEqual(metrics["source_acquisition_selected_day_count"], 1)
+        self.assertEqual(
+            metrics["source_acquisition_selected_pollutant_count"], 1,
+        )
+        self.assertEqual(
+            metrics["source_acquisition_selected_partition_dataset_count"], 1,
+        )
+        self.assertEqual(metrics["source_acquisition_source_years"], [2026])
+        self.assertFalse(
+            metrics["source_acquisition_crossed_calendar_month_boundary"]
+        )
+        self.assertFalse(
+            metrics["source_acquisition_crossed_calendar_year_boundary"]
+        )
         self.assertEqual(
             [entry["prefix"] for entry in run_state["tombstone_prefixes"]],
             [expected_prefix],

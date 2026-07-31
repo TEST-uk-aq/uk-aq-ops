@@ -37,7 +37,6 @@ Optional env vars:
   UK_AQ_BACKFILL_PAUSE_SECONDS              legacy alias for run interval
   UK_AQ_BACKFILL_DENO_BIN                   optional full path override for deno binary
   UK_AQ_BACKFILL_NODE_BIN                   optional full path override for node binary
-  UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE acquire bypasses monthly splitting for one complete-range worker invocation
 
 Notes:
   - This script is local/manual-only and always sets UK_AQ_BACKFILL_TRIGGER_MODE=manual.
@@ -388,7 +387,6 @@ REBUILD_R2_HISTORY_INDEX_RAW="$(trim "${UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX:
 REPAIR_MISSING_TIMESERIES_COUNTS_RAW="$(trim "${UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS:-false}")"
 INDEX_STRICT_MISSING_TIMESERIES_COUNTS_RAW="$(trim "${UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS:-false}")"
 INDEX_HISTORY_VERSION_RAW="$(trim "${UK_AQ_R2_HISTORY_VERSION:-}")"
-SOS_SOURCE_ACQUISITION_MODE="$(trim "${UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE:-}")"
 
 case "${RUN_MODE}" in
   local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels) ;;
@@ -504,11 +502,7 @@ if [[ -n "$(trim "${UK_AQ_BACKFILL_CONNECTOR_IDS:-}")" ]]; then
   echo "Info: unset it to process all available source adapters/connectors."
 fi
 
-if [[ "${SOS_SOURCE_ACQUISITION_MODE}" == "acquire" ]]; then
-  execution_ranges="${REQUESTED_FROM_DAY_UTC} ${REQUESTED_TO_DAY_UTC}"
-  echo "Info: dedicated SOS source acquisition will use one complete-range worker invocation."
-else
-  execution_ranges="$(python3 - "${FROM_DAY_UTC}" "${TO_DAY_UTC}" <<'PY'
+month_ranges="$(python3 - "${FROM_DAY_UTC}" "${TO_DAY_UTC}" <<'PY'
 import calendar
 import datetime as dt
 import sys
@@ -528,25 +522,24 @@ while cursor <= to_day:
         cursor = dt.date(cursor.year, cursor.month + 1, 1)
 PY
 )"
-fi
 
 declare -a failures=()
 declare -a RUN_START_EPOCHS=()
-window_count=0
+month_count=0
 
-while IFS=' ' read -r window_from window_to; do
-  if [[ -z "${window_from:-}" || -z "${window_to:-}" ]]; then
+while IFS=' ' read -r month_from month_to; do
+  if [[ -z "${month_from:-}" || -z "${month_to:-}" ]]; then
     continue
   fi
-  window_count=$((window_count + 1))
-  log_file="${LOG_DIR}/${RUN_MODE}_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${window_from}_to_${window_to}.log"
+  month_count=$((month_count + 1))
+  log_file="${LOG_DIR}/${RUN_MODE}_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${month_from}_to_${month_to}.log"
 
   echo ""
-  echo "=== Window ${window_count}: ${window_from} -> ${window_to} ==="
+  echo "=== Window ${month_count}: ${month_from} -> ${month_to} ==="
   echo "Log: ${log_file}"
   echo "Run mode: ${RUN_MODE}"
   echo "Requested window: ${REQUESTED_FROM_DAY_UTC} -> ${REQUESTED_TO_DAY_UTC}"
-  echo "Actual window: ${window_from} -> ${window_to}"
+  echo "Actual window: ${month_from} -> ${month_to}"
   echo "Connector filter: ${UK_AQ_BACKFILL_CONNECTOR_IDS:-all}"
   echo "Force replace: ${FORCE_REPLACE}"
   echo "Output scope: ${OUTPUT_SCOPE}"
@@ -563,8 +556,8 @@ while IFS=' ' read -r window_from window_to; do
   export UK_AQ_BACKFILL_FORCE_REPLACE="${FORCE_REPLACE}"
   export UK_AQ_BACKFILL_OUTPUT_SCOPE="${OUTPUT_SCOPE}"
   export UK_AQ_BACKFILL_ENABLE_R2_FALLBACK="${ENABLE_R2_FALLBACK}"
-  export UK_AQ_BACKFILL_FROM_DAY_UTC="${window_from}"
-  export UK_AQ_BACKFILL_TO_DAY_UTC="${window_to}"
+  export UK_AQ_BACKFILL_FROM_DAY_UTC="${month_from}"
+  export UK_AQ_BACKFILL_TO_DAY_UTC="${month_to}"
 
   enforce_run_rate_limit "${MAX_RUNS_PER_MINUTE}" 60 "local-backfill per-minute"
   enforce_run_rate_limit "${MAX_RUNS_PER_HOUR}" 3600 "local-backfill per-hour"
@@ -572,10 +565,10 @@ while IFS=' ' read -r window_from window_to; do
 
   if "${DENO_BIN}" run --allow-env --allow-net --allow-read --allow-write --allow-run \
     "${RUN_JOB_PATH}" 2>&1 | tee "${log_file}"; then
-    echo "Window ${window_from} -> ${window_to}: ok"
+    echo "Window ${month_from} -> ${month_to}: ok"
   else
-    echo "Window ${window_from} -> ${window_to}: failed" >&2
-    failures+=("${window_from}..${window_to}")
+    echo "Window ${month_from} -> ${month_to}: failed" >&2
+    failures+=("${month_from}..${month_to}")
     if [[ "${STOP_ON_ERROR}" == "true" ]]; then
       break
     fi
@@ -584,11 +577,11 @@ while IFS=' ' read -r window_from window_to; do
   if [[ "${RUN_INTERVAL_SECONDS}" -gt 0 ]]; then
     sleep "${RUN_INTERVAL_SECONDS}"
   fi
-done <<< "${execution_ranges}"
+done <<< "${month_ranges}"
 
 echo ""
 echo "=== Local Backfill Summary ==="
-echo "Windows attempted: ${window_count}"
+echo "Windows attempted: ${month_count}"
 echo "Failures: ${#failures[@]}"
 if [[ "${#failures[@]}" -gt 0 ]]; then
   printf '%s\n' "${failures[@]}" | sed 's/^/ - /'
