@@ -142,7 +142,8 @@ Required structural rules:
 - `status` is a string or null;
 - `pollutant_code` is a string;
 - request size and candidate count are bounded;
-- duplicate candidate identities are resolved deterministically or rejected clearly.
+- the Integrity caller supplies at most one compacted candidate for each `connector_id + timeseries_id` identity;
+- duplicate candidate identities are rejected clearly or resolved only through the existing deterministic owner rule.
 
 ## Supported pollutant scope
 
@@ -157,6 +158,46 @@ no2
 are supported.
 
 O3 and all other observed properties are outside this interface and must not create state.
+
+## Integrity-side candidate derivation and compaction
+
+Integrity must derive Latest Snapshot candidates only after the selected R2 history scope has completed final verification.
+
+For partition-scoped direct replacement, the input is the union of all successfully verified canonical evidence partitions across the complete selected run scope. Integrity must not derive candidates from only the last processed pollutant, from a mutable connector-day staging directory, or from failed, unverified or all-unmapped partitions.
+
+For each supported `connector_id + timeseries_id`, Integrity must submit exactly one latest eligible candidate.
+
+The compaction procedure is:
+
+1. consider every final verified canonical PM2.5, PM10 and NO2 observation for the timeseries across all successful selected partitions;
+2. apply the shared Latest Snapshot public-current-value eligibility semantics used by the system;
+3. exclude ineligible observations from candidate ordering;
+4. select the eligible observation with the greatest `observed_at`;
+5. preserve deterministic same-timestamp correction identity using `value`, `value_float8_hex` and `status`;
+6. submit only that candidate to the owner service.
+
+Integrity must not send every historical row merely so that the owner service can find the latest one.
+
+If the raw latest observation is ineligible but an earlier observation is eligible, the earlier eligible observation is the Latest Snapshot candidate. A newer invalid observation must not hide the earlier valid candidate.
+
+An authoritative no-data partition contributes no candidate. An all-unmapped partition left unchanged contributes no candidate because that operation did not verify replacement history for it.
+
+The Integrity-side eligibility calculation exists only to compact the request. The Latest Snapshot owner service remains the final authority and must reapply metadata resolution, pollutant support and value eligibility to every submitted candidate.
+
+## Independence from Timeseries reconciliation
+
+Latest Snapshot is a separate durable target from the database Timeseries current-state fields.
+
+Integrity must submit each compacted Latest Snapshot candidate regardless of:
+
+- the stored `timeseries.last_value_at` value;
+- whether the Timeseries candidate is older, equal or newer than stored Timeseries state;
+- whether Timeseries reconciliation updated or skipped the row;
+- whether the Timeseries target succeeded or failed.
+
+A later Timeseries timestamp does not prove that Latest Snapshot received or retained the equivalent publicly eligible observation.
+
+Timeseries reconciliation must not be used as a gate for Latest Snapshot candidate derivation or submission.
 
 ## Metadata and eligibility
 
@@ -281,6 +322,10 @@ manifest_key
 warnings
 ```
 
+For Integrity reconciliation, `candidate_count` is the compacted request count, normally no more than one candidate per supported timeseries. It is not the number of historical rows examined by Integrity.
+
+Integrity audit must separately record rows examined, ineligible rows excluded, latest-raw-ineligible fallbacks and candidate count after compaction.
+
 A partial product or manifest failure returns a non-successful operation result even when durable state already advanced.
 
 The response and structured logs make partial durable outcomes explicit.
@@ -353,16 +398,28 @@ This interface must not:
 
 ## Validation model
 
-Before implementation, only targeted deterministic checks genuinely required for authentication command construction, preflight ordering, monotonic state transition, same-timestamp correction and idempotency are permitted.
+Before implementation, only targeted deterministic checks genuinely required for these behaviours are permitted:
+
+- all successful verified pollutant-scoped evidence contributes to candidate derivation;
+- failed, unverified and all-unmapped partitions do not contribute candidates;
+- one latest eligible candidate is produced per supported timeseries;
+- O3 is excluded;
+- a newer ineligible raw observation does not hide an earlier eligible observation;
+- Timeseries current state and Timeseries reconciliation outcomes do not gate submission;
+- authentication command construction;
+- preflight ordering;
+- monotonic state transition;
+- same-timestamp correction and idempotency.
 
 Do not add a broad speculative pre-deployment test suite.
 
 After deployment, functional validation occurs through real CIC-Test operations:
 
 1. authenticated preflight before a real supported-pollutant repair;
-2. one reconciliation that advances state and products;
-3. one later new scoped run that safely skips equal or older state where applicable;
-4. one normal scheduled Latest Snapshot run after reconciliation.
+2. one multi-pollutant reconciliation whose candidate count equals supported timeseries count rather than historical row count;
+3. one reconciliation that advances state and products where applicable;
+4. one later new scoped run that safely skips equal or older state where applicable;
+5. one normal scheduled Latest Snapshot run after reconciliation.
 
 A failed earlier Integrity run is not resumed as part of validation.
 
@@ -379,6 +436,14 @@ Implemented and exercised in CIC-Test on 29 July 2026:
 - authentication capability preflight before canonical R2 mutation;
 - fresh token acquisition for the final invocation;
 - a successful full SOS repair through Latest Snapshot state and product reconciliation.
+
+Contract clarified on 31 July 2026:
+
+- Integrity must union all successful verified partition evidence;
+- Integrity must send one latest eligible candidate per supported timeseries;
+- a newer ineligible raw row must not hide an earlier eligible row;
+- Timeseries state and outcome must not gate Latest Snapshot submission;
+- the owner service remains the final eligibility and durable-state authority.
 
 Operational recovery uses a new appropriately scoped Integrity run rather than replaying an earlier failed run.
 
