@@ -25,7 +25,7 @@ This SOS sub-area defines current observation-polling and Cloud Run behaviour fo
 
 The parent [`../contract.md`](../contract.md) remains authoritative for cross-connector Daily Stations and reference-discovery behaviour.
 
-The source documents moved into this directory do not contain a complete contract for SOS source discovery, station metadata, site-register loading, archive mapping or network assignment. Those subjects must be consolidated into this Ops area before an intentional behavioural change is made to them. Existing broad documents in `uk-aq-ingest/system_docs/` may be consulted as implementation history, but they do not override this Ops contract.
+The source documents moved into this directory do not contain a complete contract for SOS source discovery, station metadata, site-register loading, archive mapping or network assignment. Existing broad SOS documents in `uk-aq-ingest/system_docs/` remain temporarily authoritative only for those explicitly non-overlapping subjects until they are separately consolidated into this Ops area. They do not override the polling, Cloud Run, interface, operations or validation contracts here.
 
 ## Implementation ownership
 
