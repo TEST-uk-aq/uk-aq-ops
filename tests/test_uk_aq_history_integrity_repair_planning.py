@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py"
@@ -17,6 +18,37 @@ SPEC.loader.exec_module(integrity)
 
 
 class V2RepairPlanningTest(unittest.TestCase):
+    def test_protected_connector_configuration_is_strict_and_deterministic(self):
+        self.assertEqual(integrity.resolve_protected_connector_ids({}), [1])
+        self.assertEqual(
+            integrity.resolve_protected_connector_ids({
+                integrity.PROTECTED_CONNECTOR_IDS_ENV: "3,1,2",
+            }),
+            [1, 2, 3],
+        )
+        for value in ("", "1,,2", "0", "one", "1,1"):
+            with self.subTest(value=value):
+                with self.assertRaises(RuntimeError):
+                    integrity.resolve_protected_connector_ids({
+                        integrity.PROTECTED_CONNECTOR_IDS_ENV: value,
+                    })
+
+        args = SimpleNamespace(
+            source="sos",
+            run_backfill=True,
+            dry_run=False,
+            history_version="v2",
+            from_day="2026-06-17",
+            to_day="2026-07-30",
+            repair_pollutants=["pm25"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "outside protected set"):
+            integrity.select_sos_historical_replacement_route(
+                args,
+                mutation_connector_ids=[1],
+                protected_connector_ids=[2],
+            )
+
     def test_observation_index_gap_plans_index_only_without_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

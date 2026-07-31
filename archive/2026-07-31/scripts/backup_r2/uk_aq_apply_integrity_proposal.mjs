@@ -380,27 +380,11 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
   if (runState?.execution_path !== "dedicated_sos_historical_observation_replacement") {
     return { dedicated: false };
   }
-  const preservation = runState.protected_connector_preservation;
-  const protectedConnectorIds = preservation?.protected_connector_ids;
-  const selectedMutationConnectorIds = preservation?.selected_mutation_connector_ids;
   if (runState.environment !== "CIC-Test"
     || JSON.stringify(runState.mutation_connector_ids) !== "[1]"
-    || JSON.stringify(runState.selected_mutation_connector_ids) !== "[1]"
-    || !Array.isArray(protectedConnectorIds)
-    || !protectedConnectorIds.length
-    || JSON.stringify([...new Set(protectedConnectorIds)].sort((a, b) => a - b)) !== JSON.stringify(protectedConnectorIds)
-    || protectedConnectorIds.some((value) => !Number.isInteger(value) || value <= 0)
-    || JSON.stringify(selectedMutationConnectorIds) !== "[1]"
-    || !selectedMutationConnectorIds.every((connectorId) => protectedConnectorIds.includes(connectorId))
-    || preservation?.protected_connector_validation_status !== "validated_pre_mutation"
     || runState.aqi_policy !== "bypassed_observation_history_only") {
     throw new Error("Dedicated SOS proposal has invalid execution-scope evidence");
   }
-  const permittedParentRewrites = new Set(
-    Array.isArray(preservation.permitted_parent_metadata_rewrites)
-      ? preservation.permitted_parent_metadata_rewrites.map(String)
-      : [],
-  );
   const aqiScopeSets = ["AQILEVELS_CHANGED", "AQI_MANIFESTS_CHANGED", "AQI_INDEXES_CHANGED"];
   if (aqiScopeSets.some((scope) => (runState.changed_scopes?.[scope] || []).length > 0)) {
     throw new Error("Dedicated SOS proposal must not contain AQI changed scopes");
@@ -418,11 +402,7 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
     }
     const connectorMatch = object.key.match(/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)/);
     if (connectorMatch && Number(connectorMatch[2]) !== 1) {
-      const permittedUnprotectedParent = permittedParentRewrites.has(object.key)
-        && /\/connector_id=[1-9]\d*\/manifest\.json$/.test(object.key);
-      if (!permittedUnprotectedParent) {
-        throw new Error(`Dedicated SOS proposal contains a non-connector-1 mutation: ${object.key}`);
-      }
+      throw new Error(`Dedicated SOS proposal contains a non-connector-1 mutation: ${object.key}`);
     }
     if (connectorMatch && object.key.endsWith(".parquet")) {
       const groupKey = `${connectorMatch[1]}|${connectorMatch[2]}`;
@@ -431,57 +411,6 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
       group.entries += 1;
       connectorDayParquet.set(groupKey, group);
     }
-  }
-  const omissions = Array.isArray(preservation.unprotected_omissions)
-    ? preservation.unprotected_omissions : [];
-  const proposedKeys = new Set(proposal.objects.map((object) => object.key));
-  const parentRewritesFromOmissions = new Set();
-  for (const omission of omissions) {
-    const objectKey = String(omission?.object_key || "");
-    const connectorId = Number(omission?.connector_id);
-    const dayUtc = String(omission?.day_utc || "");
-    const pollutantCode = String(omission?.pollutant_code || "").trim().toLowerCase();
-    const expectedOmittedKey = omission?.omission_level === "pollutant"
-      ? `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`
-      : omission?.omission_level === "connector"
-      ? `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`
-      : omission?.omission_level === "day"
-      ? `history/v2/observations/day_utc=${dayUtc}/manifest.json`
-      : "";
-    if (!objectKey || !Number.isInteger(connectorId) || connectorId <= 0
-      || objectKey !== expectedOmittedKey
-      || protectedConnectorIds.includes(connectorId)
-      || omission.child_deleted !== false
-      || omission.child_overwritten !== false
-      || omission.child_tombstoned !== false
-      || proposedKeys.has(objectKey)
-      || proposal.prefixes.some((item) => objectKey.startsWith(`${item.prefix}/`))) {
-      throw new Error(`Dedicated SOS proposal has invalid unprotected omission evidence: ${objectKey}`);
-    }
-    for (const parentKey of omission.parent_keys_rebuilt || []) {
-      parentRewritesFromOmissions.add(parentKey);
-      if (!permittedParentRewrites.has(parentKey) || !proposedKeys.has(parentKey)) {
-        throw new Error(`Dedicated SOS omission parent rewrite is not proposed: ${parentKey}`);
-      }
-    }
-    for (const object of proposal.objects) {
-      if (object.body.includes(objectKey)) {
-        throw new Error(`Dedicated SOS rebuilt parent retains omitted child reference: ${objectKey}`);
-      }
-    }
-  }
-  if (JSON.stringify([...parentRewritesFromOmissions].sort())
-      !== JSON.stringify([...permittedParentRewrites].sort())) {
-    throw new Error("Dedicated SOS proposal contains an undeclared permitted parent rewrite");
-  }
-  if (Number(preservation.unprotected_pollutant_omission_count || 0)
-      !== omissions.filter((item) => item?.omission_level === "pollutant").length
-    || Number(preservation.unprotected_connector_omission_count || 0)
-      !== omissions.filter((item) => item?.omission_level === "connector").length
-    || Number(preservation.unprotected_day_omission_count || 0)
-      !== omissions.filter((item) => item?.omission_level === "day").length
-    || preservation.omitted_unprotected_children_mutated !== false) {
-    throw new Error("Dedicated SOS proposal has contradictory unprotected omission accounting");
   }
   for (const [groupKey, group] of connectorDayParquet) {
     if (group.bytes > VERIFIED_GET_CACHE_MAX_BYTES || group.entries > VERIFIED_GET_CACHE_MAX_ENTRIES) {
@@ -496,11 +425,6 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
     observation_object_count: proposal.objects.length,
     exact_pollutant_prefix_count: proposal.prefixes.length,
     verified_body_cache_capacity_preflight: "succeeded",
-    protected_connector_ids: protectedConnectorIds,
-    selected_mutation_connector_ids: selectedMutationConnectorIds,
-    protected_connector_validation_status: "validated_pre_mutation",
-    unprotected_omission_count: omissions.length,
-    omitted_unprotected_children_mutated: false,
   };
 }
 
@@ -1400,12 +1324,11 @@ export async function verifyLiveObservationPartition({
   atomicWriteJson(runStatePath, runState);
 }
 
-export async function prepareMergedDayManifest({ r2, object, adapters, exactProposedConnectorSet = false }) {
+async function prepareMergedDayManifest({ r2, object, adapters }) {
   if (!/\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(object.key)) return;
   const proposed = JSON.parse(object.body.toString("utf8"));
   const dayPrefix = object.key.slice(0, -"manifest.json".length);
-  const currentRead = exactProposedConnectorSet ? { state: "not_read", value: [] }
-    : await readParentManifestForBoundedRecovery({
+  const currentRead = await readParentManifestForBoundedRecovery({
     getObject: adapters.getObject,
     r2,
     key: object.key,
@@ -1438,7 +1361,7 @@ export async function prepareMergedDayManifest({ r2, object, adapters, exactProp
     },
   });
   let currentReferences = currentRead.state === "valid" ? currentRead.value : [];
-  if (!exactProposedConnectorSet && currentRead.state !== "valid") {
+  if (currentRead.state !== "valid") {
     const discovered = await adapters.listAllObjects({ r2, prefix: dayPrefix, max_keys: 10_000 });
     currentReferences = discovered.flatMap((entry) => {
       const key = String(entry.key || "");
@@ -1452,9 +1375,7 @@ export async function prepareMergedDayManifest({ r2, object, adapters, exactProp
       : Array.isArray(manifest?.child_manifests) ? manifest.child_manifests : [];
     return values.map((entry) => ({ connector_id: Number(entry.connector_id), manifest_key: String(entry.manifest_key || "") }));
   };
-  const mergedReferences = exactProposedConnectorSet
-    ? references(proposed)
-    : mergeConnectorManifestReferences(currentReferences, references(proposed));
+  const mergedReferences = mergeConnectorManifestReferences(currentReferences, references(proposed));
   const connectorManifests = [];
   for (const reference of mergedReferences) {
     const child = JSON.parse((await adapters.getObject({ r2, key: reference.manifest_key })).body.toString("utf8"));
@@ -1667,12 +1588,7 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         finalize: async () => {
         for (const operation of dayOperations) {
           if (operation.kind === "put") {
-            await prepareMergedDayManifest({
-              r2,
-              object: operation.object,
-              adapters: resolvedAdapters,
-              exactProposedConnectorSet: dedicatedSosProposal.dedicated,
-            });
+            await prepareMergedDayManifest({ r2, object: operation.object, adapters: resolvedAdapters });
           }
           await executeOperation(operation);
         }

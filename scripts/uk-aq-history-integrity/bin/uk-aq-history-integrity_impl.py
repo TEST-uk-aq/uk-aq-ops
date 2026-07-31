@@ -131,6 +131,10 @@ CURRENT_INTEGRITY_CORE_PREFIX = "history/v2/core"
 SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH = (
     "dedicated_sos_historical_observation_replacement"
 )
+PROTECTED_CONNECTOR_IDS_ENV = (
+    "UK_AQ_HISTORY_INTEGRITY_PROTECTED_CONNECTOR_IDS"
+)
+DEFAULT_PROTECTED_CONNECTOR_IDS = (1,)
 SOS_HISTORICAL_REPLACEMENT_STAGE_ORDER = (
     "observations_proposal",
     "observations_metadata_proposal",
@@ -19860,6 +19864,15 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning") if isinstance(output, Mapping) else None
     if not isinstance(planning, Mapping):
         return
+    preservation = planning.get("protected_connector_preservation")
+    if isinstance(preservation, Mapping):
+        run_state["protected_connector_preservation"] = dict(preservation)
+        for field in (
+            "protected_connector_ids",
+            "selected_mutation_connector_ids",
+            "protected_connector_validation_status",
+        ):
+            run_state[field] = preservation.get(field)
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
@@ -22917,6 +22930,12 @@ def summarize_ordered_apply_verification(
         "r2_objects_changed": len(written_keys) + deleted_object_count,
         "remaining_gap_count": len(remaining_scopes),
         "remaining_scopes": remaining_scopes,
+        "final_protected_connector_r2_verification_status": (
+            ("succeeded" if not remaining_scopes else "failed")
+            if run_state.get("execution_path")
+            == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
+            else "not_applicable"
+        ),
     }
 
 
@@ -22944,6 +22963,7 @@ def run_v2_integrity_repair_flow(
     selected_days: Iterable[str] | None = None,
     repair_pollutants: Iterable[str] | None = None,
     dedicated_sos_historical_replacement: bool = False,
+    protected_connector_ids: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Build one canonical local proposal, then optionally apply and verify it."""
     explicit_selected_partitions: list[dict[str, Any]] | None = None
@@ -22959,6 +22979,16 @@ def run_v2_integrity_repair_flow(
                 "dedicated SOS historical replacement requires source=sos and "
                 "connector_id=1 only"
             )
+        resolved_protected_connector_ids = sorted({
+            int(value) for value in (protected_connector_ids or [])
+        })
+        if not resolved_protected_connector_ids or not (
+            allowed_connector_ids <= set(resolved_protected_connector_ids)
+        ):
+            raise RuntimeError(
+                "dedicated SOS historical replacement requires every selected "
+                "mutation connector to be protected"
+            )
         explicit_selected_partitions = build_dedicated_sos_selected_partitions(
             from_day=from_day,
             to_day=to_day,
@@ -22969,6 +22999,9 @@ def run_v2_integrity_repair_flow(
             "execution_path": SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH,
             "dedicated_sos_historical_replacement": True,
             "mutation_connector_ids": [1],
+            "protected_connector_ids": resolved_protected_connector_ids,
+            "selected_mutation_connector_ids": [1],
+            "protected_connector_validation_status": "pending_proposal_graph",
             "aqi_policy": "bypassed_observation_history_only",
             "target_authority": "explicit_selected_scope",
             "explicit_selected_partitions": explicit_selected_partitions,
@@ -23690,6 +23723,10 @@ def run_v2_integrity_repair_flow(
         if dedicated_sos_historical_replacement
         else list(CANONICAL_REPAIR_STAGE_ORDER)
     )
+    protected_preservation = (
+        dict(run_state.get("protected_connector_preservation") or {})
+        if dedicated_sos_historical_replacement else {}
+    )
     result = {
         "status": "failed" if coordinator_failed else (
             "planned" if dry_run else "succeeded"
@@ -23703,6 +23740,45 @@ def run_v2_integrity_repair_flow(
             dedicated_sos_historical_replacement
         ),
         "mutation_connector_ids": [1] if dedicated_sos_historical_replacement else None,
+        "protected_connector_ids": (
+            list(run_state.get("protected_connector_ids") or [])
+            if dedicated_sos_historical_replacement else None
+        ),
+        "selected_mutation_connector_ids": (
+            [1] if dedicated_sos_historical_replacement else None
+        ),
+        "protected_connector_preservation": (
+            protected_preservation
+            if dedicated_sos_historical_replacement else None
+        ),
+        "protected_connector_validation_status": (
+            protected_preservation.get("protected_connector_validation_status")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "healthy_unprotected_children_preserved": (
+            protected_preservation.get("healthy_unprotected_children_preserved")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "unprotected_pollutant_omission_count": (
+            protected_preservation.get("unprotected_pollutant_omission_count")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "unprotected_connector_omission_count": (
+            protected_preservation.get("unprotected_connector_omission_count")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "unprotected_day_omission_count": (
+            protected_preservation.get("unprotected_day_omission_count")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "unprotected_omissions": (
+            protected_preservation.get("unprotected_omissions")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "permitted_parent_metadata_rewrites": (
+            protected_preservation.get("permitted_parent_metadata_rewrites")
+            if dedicated_sos_historical_replacement else None
+        ),
         "bypassed_stages": (
             [
                 "observation_gap_detection",
@@ -24002,10 +24078,40 @@ def resolve_effective_mode(args: argparse.Namespace) -> Literal[
     return "check_only"
 
 
+def resolve_protected_connector_ids(
+    values: Mapping[str, str] | None = None,
+) -> list[int]:
+    """Resolve the explicit dedicated-replacement protection policy."""
+    source = os.environ if values is None else values
+    if PROTECTED_CONNECTOR_IDS_ENV not in source:
+        return list(DEFAULT_PROTECTED_CONNECTOR_IDS)
+    raw = str(source.get(PROTECTED_CONNECTOR_IDS_ENV) or "").strip()
+    if not raw:
+        raise RuntimeError(
+            f"{PROTECTED_CONNECTOR_IDS_ENV} must not be explicitly empty"
+        )
+    parts = [part.strip() for part in raw.split(",")]
+    if any(not part or not re.fullmatch(r"[1-9]\d*", part) for part in parts):
+        raise RuntimeError(
+            f"{PROTECTED_CONNECTOR_IDS_ENV} must be a comma-separated list "
+            "of positive integer connector IDs"
+        )
+    parsed_ids = [int(part) for part in parts]
+    if len(set(parsed_ids)) != len(parsed_ids):
+        raise RuntimeError(
+            f"{PROTECTED_CONNECTOR_IDS_ENV} must contain unique connector IDs"
+        )
+    connector_ids = sorted(parsed_ids)
+    if not connector_ids:
+        raise RuntimeError(f"{PROTECTED_CONNECTOR_IDS_ENV} resolved empty")
+    return connector_ids
+
+
 def select_sos_historical_replacement_route(
     args: argparse.Namespace,
     *,
     mutation_connector_ids: Iterable[int] | None = None,
+    protected_connector_ids: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Select only the explicit real SOS connector-1 replacement contract."""
     requirements = {
@@ -24028,6 +24134,10 @@ def select_sos_historical_replacement_route(
         "arguments_qualify": arguments_qualify,
         "requirements": requirements,
         "mutation_connector_ids": None,
+        "protected_connector_ids": (
+            sorted({int(value) for value in protected_connector_ids})
+            if protected_connector_ids is not None else None
+        ),
         "reason": None,
     }
     if not arguments_qualify:
@@ -24042,6 +24152,19 @@ def select_sos_historical_replacement_route(
         raise RuntimeError(
             "dedicated SOS historical replacement refuses mutation outside "
             f"connector_id=1; resolved_connector_ids={connector_ids}"
+        )
+    protected_ids = result["protected_connector_ids"]
+    if not protected_ids:
+        raise RuntimeError(
+            "dedicated SOS historical replacement requires a non-empty "
+            "protected connector set"
+        )
+    unprotected_selected = sorted(set(connector_ids) - set(protected_ids))
+    if unprotected_selected:
+        raise RuntimeError(
+            "dedicated SOS historical replacement selected mutation connector "
+            f"outside protected set; selected={connector_ids}; "
+            f"protected={protected_ids}"
         )
     result.update({
         "selected": True,
@@ -25900,6 +26023,51 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "",
     ]
 
+    preservation = (s.get("repair_flow") or {}).get(
+        "protected_connector_preservation"
+    ) or {}
+    if preservation:
+        omissions = list(preservation.get("unprotected_omissions") or [])
+        lines.extend([
+            "## Protected connector preservation",
+            "",
+            "- Protected connector IDs: "
+            + json.dumps(preservation.get("protected_connector_ids") or []),
+            "- Selected mutation connector IDs: "
+            + json.dumps(
+                preservation.get("selected_mutation_connector_ids") or []
+            ),
+            "- Protected validation: "
+            + str(preservation.get("protected_connector_validation_status")),
+            "- Healthy unprotected children preserved: "
+            + str(preservation.get("healthy_unprotected_children_preserved") or 0),
+            "- Unprotected pollutant omissions: "
+            + str(preservation.get("unprotected_pollutant_omission_count") or 0),
+            "- Unprotected connector omissions: "
+            + str(preservation.get("unprotected_connector_omission_count") or 0),
+            "- Unprotected day omissions: "
+            + str(preservation.get("unprotected_day_omission_count") or 0),
+            "- Omitted unprotected children mutated: "
+            + str(bool(preservation.get("omitted_unprotected_children_mutated"))),
+            "- Permitted parent metadata rewrites: "
+            + (", ".join(
+                preservation.get("permitted_parent_metadata_rewrites") or []
+            ) or "(none)"),
+        ])
+        if omissions:
+            lines.extend(["", "### Unprotected omission warnings", ""])
+            for omission in omissions:
+                lines.append(
+                    "- WARNING "
+                    f"day={omission.get('day_utc')} "
+                    f"connector={omission.get('connector_id')} "
+                    f"pollutant={omission.get('pollutant_code') or '(connector)'} "
+                    f"key={omission.get('object_key')} "
+                    f"classification={omission.get('classification')} "
+                    f"reason={omission.get('reason')}"
+                )
+        lines.append("")
+
     selection = s.get("date_selection") or {}
     if selection:
         lines.extend([
@@ -26802,6 +26970,11 @@ def main(argv: list[str]) -> int:
     sos_historical_route = select_sos_historical_replacement_route(args)
     dedicated_sos_historical_replacement = False
     env = load_env_or_die()
+    protected_connector_ids = (
+        resolve_protected_connector_ids(os.environ)
+        if sos_historical_route.get("arguments_qualify") else None
+    )
+    sos_historical_route["protected_connector_ids"] = protected_connector_ids
     history_version_mode = resolve_history_version_mode(args)
     checked_history_versions = expand_history_versions(history_version_mode)
     history_path_configs = resolve_history_path_configs(history_version_mode)
@@ -27210,6 +27383,7 @@ def main(argv: list[str]) -> int:
             sos_historical_route = select_sos_historical_replacement_route(
                 args,
                 mutation_connector_ids=v2_allowed_connector_ids,
+                protected_connector_ids=protected_connector_ids,
             )
             dedicated_sos_historical_replacement = bool(
                 sos_historical_route.get("selected")
@@ -27525,6 +27699,14 @@ def main(argv: list[str]) -> int:
                 "execution_path"
             )
             repair_overlay["sos_historical_route"] = dict(sos_historical_route)
+            if dedicated_sos_historical_replacement:
+                repair_overlay["protected_connector_ids"] = list(
+                    protected_connector_ids or []
+                )
+                repair_overlay["selected_mutation_connector_ids"] = [1]
+                repair_overlay["protected_connector_validation_status"] = (
+                    "pending_proposal_graph"
+                )
             repair_overlay["requested_from_day"] = from_day
             repair_overlay["requested_to_day"] = to_day
             repair_overlay["requested_repair_pollutants"] = list(
@@ -27582,6 +27764,7 @@ def main(argv: list[str]) -> int:
                     dedicated_sos_historical_replacement=(
                         dedicated_sos_historical_replacement
                     ),
+                    protected_connector_ids=protected_connector_ids,
                 )
             aqi_stage = next(
                 (
@@ -27895,6 +28078,11 @@ def main(argv: list[str]) -> int:
             sos_metrics.get(
                 "no_authoritative_timeseries_binding_groups"
             ) or 0
+        )
+        warnings_count_total += int(
+            ((repair_flow.get("protected_connector_preservation") or {}).get(
+                "warning_count"
+            )) or 0
         )
 
         metrics: dict[str, Any] = {

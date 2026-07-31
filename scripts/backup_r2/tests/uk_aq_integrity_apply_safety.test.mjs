@@ -8,6 +8,7 @@ import {
   applyValidatedProposal,
   assertPublicationDependenciesVerified,
   createVerifiedGetBodyCache,
+  prepareMergedDayManifest,
   putAndVerifyObject,
   publicationRank,
   validateDedicatedSosHistoricalProposal,
@@ -58,6 +59,26 @@ function stateEntry(filePath, key, dependencies = [], dependencyIdentities = {})
     sha256: sha256Hex(body),
     dependencies,
     dependency_identities: dependencyIdentities,
+  };
+}
+
+function dedicatedProtectedConnectorEvidence() {
+  return {
+    protected_connector_ids: [1],
+    selected_mutation_connector_ids: [1],
+    protected_connector_validation_status: "validated_pre_mutation",
+    protected_connector_preservation: {
+      protected_connector_ids: [1],
+      selected_mutation_connector_ids: [1],
+      protected_connector_validation_status: "validated_pre_mutation",
+      healthy_unprotected_children_preserved: 0,
+      unprotected_pollutant_omission_count: 0,
+      unprotected_connector_omission_count: 0,
+      unprotected_day_omission_count: 0,
+      unprotected_omissions: [],
+      permitted_parent_metadata_rewrites: [],
+      omitted_unprotected_children_mutated: false,
+    },
   };
 }
 
@@ -467,6 +488,7 @@ test("dedicated same-day pollutants validate against distinct immutable source e
   });
   Object.assign(fixture.runState, {
     execution_path: "dedicated_sos_historical_observation_replacement",
+    ...dedicatedProtectedConnectorEvidence(),
     mutation_connector_ids: [1],
     aqi_policy: "bypassed_observation_history_only",
     changed_scopes: {
@@ -556,6 +578,7 @@ test("dedicated pollutant-scoped evidence accepts authoritative no-data", async 
   const runState = {
     environment: "CIC-Test",
     execution_path: "dedicated_sos_historical_observation_replacement",
+    ...dedicatedProtectedConnectorEvidence(),
     mutation_connector_ids: [1],
     aqi_policy: "bypassed_observation_history_only",
     overlay_root: overlay,
@@ -796,6 +819,7 @@ test("dedicated SOS proposal accepts one exact connector-1 observation tombstone
   const fixture = await observationFixture();
   Object.assign(fixture.runState, {
     execution_path: "dedicated_sos_historical_observation_replacement",
+    ...dedicatedProtectedConnectorEvidence(),
     mutation_connector_ids: [1],
     aqi_policy: "bypassed_observation_history_only",
     changed_scopes: {
@@ -813,6 +837,31 @@ test("dedicated SOS proposal accepts one exact connector-1 observation tombstone
   assert.equal(validated.connector_id, 1);
   assert.equal(validated.exact_pollutant_prefix_count, 1);
 
+  const omittedKey = "history/v2/observations/day_utc=2026-07-12/connector_id=7/pollutant_code=humidity/manifest.json";
+  Object.assign(fixture.runState.protected_connector_preservation, {
+    unprotected_pollutant_omission_count: 1,
+    unprotected_omissions: [{
+      day_utc: "2026-07-12",
+      connector_id: 7,
+      pollutant_code: "humidity",
+      object_key: omittedKey,
+      classification: "unprotected_pollutant_manifest_unreadable_or_invalid",
+      reason: "404 NoSuchKey",
+      omission_level: "pollutant",
+      parent_keys_rebuilt: [],
+      child_deleted: false,
+      child_overwritten: false,
+      child_tombstoned: false,
+    }],
+  });
+  const omissionValidated = validateDedicatedSosHistoricalProposal({
+    runState: fixture.runState,
+    proposal,
+  });
+  assert.equal(omissionValidated.unprotected_omission_count, 1);
+  assert.equal(proposal.objects.some((object) => object.key === omittedKey), false);
+  assert.equal(proposal.prefixes.some((item) => omittedKey.startsWith(`${item.prefix}/`)), false);
+
   fixture.runState.mutation_connector_ids = [2];
   assert.throws(
     () => validateDedicatedSosHistoricalProposal({
@@ -821,6 +870,84 @@ test("dedicated SOS proposal accepts one exact connector-1 observation tombstone
     }),
     /invalid execution-scope evidence/,
   );
+});
+
+test("dedicated day finalizer retains the exact validated connector set", async () => {
+  const dayUtc = "2026-07-12";
+  const pollutantCode = "pm25";
+  const connectorId = 1;
+  const pollutantKey = `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
+  const { canonical_rows: _rows, ...contentHash } = computeObservationContentHash([{
+    connector_id: connectorId,
+    station_id: 1,
+    timeseries_id: 1,
+    pollutant_code: pollutantCode,
+    observed_at_utc: `${dayUtc}T00:00:00.000Z`,
+    value: 1,
+    verification_status: null,
+  }]);
+  const pollutant = buildHistoryV2PollutantManifest({
+    domain: "observations",
+    dayUtc,
+    connectorId,
+    pollutantCode,
+    manifestKey: pollutantKey,
+    sourceRowCount: 1,
+    fileEntries: [{
+      key: pollutantKey.replace("manifest.json", "part-00000.parquet"),
+      row_count: 1,
+      bytes: 1,
+      min_timeseries_id: 1,
+      max_timeseries_id: 1,
+      min_observed_at_utc: `${dayUtc}T00:00:00.000Z`,
+      max_observed_at_utc: `${dayUtc}T00:00:00.000Z`,
+      timeseries_row_counts: { "1": 1 },
+    }],
+    writerGitSha: "test",
+    backedUpAtUtc: `${dayUtc}T23:00:00.000Z`,
+    observationContentHash: contentHash,
+  });
+  const connectorKey = `history/v2/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`;
+  const connector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc,
+    connectorId,
+    manifestKey: connectorKey,
+    pollutantManifests: [pollutant],
+    writerGitSha: "test",
+    backedUpAtUtc: `${dayUtc}T23:00:00.000Z`,
+  });
+  const dayKey = `history/v2/observations/day_utc=${dayUtc}/manifest.json`;
+  const proposed = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc,
+    manifestKey: dayKey,
+    connectorManifests: [connector],
+    writerGitSha: "test",
+    backedUpAtUtc: `${dayUtc}T23:00:00.000Z`,
+  });
+  const object = {
+    key: dayKey,
+    body: Buffer.from(JSON.stringify(proposed)),
+    entry: {},
+  };
+  let listCalls = 0;
+  await prepareMergedDayManifest({
+    r2: {},
+    object,
+    exactProposedConnectorSet: true,
+    adapters: {
+      getObject: async ({ key }) => {
+        assert.equal(key, connectorKey);
+        return { body: Buffer.from(JSON.stringify(connector)) };
+      },
+      listAllObjects: async () => { listCalls += 1; return []; },
+    },
+  });
+  const finalDay = JSON.parse(object.body.toString("utf8"));
+  assert.deepEqual(finalDay.connector_ids, [1]);
+  assert.equal(finalDay.connector_manifests.some((item) => item.connector_id === 7), false);
+  assert.equal(listCalls, 0);
 });
 
 test("changed-object apply records exactly one post-PUT verification GET", async () => {

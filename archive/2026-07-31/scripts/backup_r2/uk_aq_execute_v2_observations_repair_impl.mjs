@@ -99,16 +99,13 @@ export async function readChildren({
   kind,
   domain = "observations",
   identityOnlyKeys = new Set(),
-  omitKeys = new Set(),
   allowEmpty = false,
 }) {
   const entries = await store.listAllObjects({ prefix });
   const keyPattern = kind === "connector"
     ? /\/connector_id=\d+\/manifest\.json$/
     : /\/pollutant_code=[^/]+\/manifest\.json$/;
-  const keys = entries.map((entry) => entry.key)
-    .filter((key) => keyPattern.test(key) && !omitKeys.has(key))
-    .sort();
+  const keys = entries.map((entry) => entry.key).filter((key) => keyPattern.test(key)).sort();
   if (!keys.length && identityOnlyKeys.size === 0 && !allowEmpty) {
     throw new Error(`Blocked dependency: no ${kind} manifests under ${prefix}`);
   }
@@ -276,299 +273,6 @@ async function stageRepairableObservationConnectorDependencies({
       proposalKeys.push(key);
     }
   }
-}
-
-function canonicalConnectorReferences(payload, { base, connectorId }) {
-  const references = new Map();
-  const raw = [
-    ...(Array.isArray(payload?.pollutant_manifests) ? payload.pollutant_manifests : []),
-    ...(Array.isArray(payload?.child_manifests) ? payload.child_manifests : []),
-  ];
-  for (const reference of raw) {
-    const pollutantCode = String(reference?.pollutant_code || "").trim().toLowerCase();
-    const manifestKey = String(reference?.manifest_key || "").trim();
-    const expectedKey = pollutantCode
-      ? `${base}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`
-      : null;
-    if (!pollutantCode || manifestKey !== expectedKey) {
-      throw new Error(`invalid_pollutant_reference:${manifestKey || "missing_key"}`);
-    }
-    const previous = references.get(manifestKey);
-    if (previous && previous.manifest_hash !== reference.manifest_hash) {
-      throw new Error(`contradictory_pollutant_reference:${manifestKey}`);
-    }
-    references.set(manifestKey, { ...reference, pollutant_code: pollutantCode, manifest_key: manifestKey });
-  }
-  return [...references.values()].sort((left, right) => left.manifest_key.localeCompare(right.manifest_key));
-}
-
-function newProtectedConnectorPreservationAudit({ protectedConnectorIds, selectedMutationConnectorIds }) {
-  return {
-    protected_connector_ids: [...protectedConnectorIds],
-    selected_mutation_connector_ids: [...selectedMutationConnectorIds],
-    protected_connector_validation_status: "pending",
-    healthy_unprotected_children_preserved: 0,
-    unprotected_pollutant_omission_count: 0,
-    unprotected_connector_omission_count: 0,
-    unprotected_day_omission_count: 0,
-    unprotected_omissions: [],
-    permitted_parent_metadata_rewrites: [],
-    omitted_unprotected_children_mutated: false,
-    warning_count: 0,
-    warning_samples: [],
-  };
-}
-
-function addUnprotectedOmission(audit, omission) {
-  audit.unprotected_omissions.push({
-    ...omission,
-    child_deleted: false,
-    child_overwritten: false,
-    child_tombstoned: false,
-  });
-  if (omission.omission_level === "pollutant") audit.unprotected_pollutant_omission_count += 1;
-  else if (omission.omission_level === "connector") audit.unprotected_connector_omission_count += 1;
-  else if (omission.omission_level === "day") audit.unprotected_day_omission_count += 1;
-}
-
-export async function stageProtectedConnectorPreservationDependencies({
-  staged,
-  base,
-  dayUtc,
-  proposalKeys,
-  protectedConnectorIds,
-  selectedMutationConnectorIds,
-  latestIndexKey,
-  audit,
-}) {
-  const protectedSet = new Set(protectedConnectorIds);
-  const selectedSet = new Set(selectedMutationConnectorIds);
-  if (!protectedSet.size || !selectedSet.size
-    || [...selectedSet].some((connectorId) => !protectedSet.has(connectorId))) {
-    throw new Error("Blocked dependency: invalid protected connector preservation scope");
-  }
-  const entries = await staged.stagedR2.adapter.listAllObjects({
-    prefix: `${base}/connector_id=`,
-  });
-  const connectorKeys = new Set(entries
-    .map((entry) => entry.key)
-    .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key))
-    .sort());
-  try {
-    const existingDay = await staged.stagedR2.adapter.getObject({ key: `${base}/manifest.json` });
-    const existingDayPayload = jsonObject(existingDay, `${base}/manifest.json`);
-    for (const reference of [
-      ...(Array.isArray(existingDayPayload?.connector_manifests) ? existingDayPayload.connector_manifests : []),
-      ...(Array.isArray(existingDayPayload?.child_manifests) ? existingDayPayload.child_manifests : []),
-    ]) {
-      const key = String(reference?.manifest_key || "").trim();
-      if (/\/connector_id=\d+\/manifest\.json$/.test(key)) connectorKeys.add(key);
-    }
-  } catch {
-    // The selected day parent is rebuilt from validated connector parents.
-    // Its unreadable predecessor is not a child-preservation authority.
-  }
-  const omittedConnectorKeys = new Set();
-
-  for (const key of [...connectorKeys].sort()) {
-    const match = key.match(/\/connector_id=(\d+)\/manifest\.json$/);
-    const connectorId = Number(match?.[1]);
-    if (!Number.isInteger(connectorId) || connectorId <= 0) {
-      throw new Error(`Blocked dependency: invalid connector manifest key ${key}`);
-    }
-    const isProtected = protectedSet.has(connectorId);
-    let existingPayload;
-    try {
-      const stagedProposal = staged.proposals.get(key);
-      const body = stagedProposal?.old_body ?? (await staged.stagedR2.adapter.getObject({ key })).body;
-      existingPayload = JSON.parse(Buffer.isBuffer(body) ? body.toString("utf8") : String(body));
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      if (isProtected) {
-        throw new Error(`Blocked dependency: protected connector manifest unreadable ${key}: ${reason}`);
-      }
-      omittedConnectorKeys.add(key);
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: null,
-        object_key: key,
-        classification: "unprotected_connector_manifest_unreadable",
-        reason,
-        omission_level: "connector",
-        parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-      });
-      continue;
-    }
-    const classification = classifyRepairableV2ObservationsConnectorManifest(
-      existingPayload,
-      { key, dayUtc, connectorId },
-    );
-    if (isProtected && !selectedSet.has(connectorId) && !classification.ok) {
-      throw new Error(`Blocked dependency: preserved protected connector manifest invalid ${key}`);
-    }
-    if (!classification.ok && !classification.repairable) {
-      if (isProtected) {
-        throw new Error(`Blocked dependency: protected connector manifest invalid ${key}`);
-      }
-      omittedConnectorKeys.add(key);
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: null,
-        object_key: key,
-        classification: "unprotected_connector_manifest_invalid",
-        reason: classification.identity_failures.join(",") || classification.failures.join(","),
-        omission_level: "connector",
-        parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-      });
-      continue;
-    }
-    let references;
-    try {
-      references = canonicalConnectorReferences(existingPayload, { base, connectorId });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      if (isProtected) throw new Error(`Blocked dependency: protected connector references invalid ${key}: ${reason}`);
-      omittedConnectorKeys.add(key);
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: null,
-        object_key: key,
-        classification: "unprotected_connector_references_invalid",
-        reason,
-        omission_level: "connector",
-        parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-      });
-      continue;
-    }
-    const children = [];
-    const childIdentities = new Map();
-    const pollutantOmissions = [];
-    for (const reference of references) {
-      try {
-        const childObject = await staged.stagedR2.adapter.getObject({ key: reference.manifest_key });
-        const childPayload = jsonObject(childObject, reference.manifest_key);
-        assertV2ObservationsChildManifest(childPayload, {
-          key: reference.manifest_key,
-          kind: "pollutant",
-          dayUtc,
-          connectorId,
-        });
-        const selectedChildReplacement = selectedSet.has(connectorId)
-          && staged.proposals.has(reference.manifest_key);
-        if (!selectedChildReplacement
-          && reference.manifest_hash !== childPayload.manifest_hash) {
-          throw new Error("parent_child_manifest_hash_mismatch");
-        }
-        children.push(childPayload);
-        childIdentities.set(reference.manifest_key, {
-          content_sha256: childObject.content_sha256 || sha256Hex(childObject.body),
-          source: childObject.source || "combined_local",
-        });
-        if (!isProtected) audit.healthy_unprotected_children_preserved += 1;
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        if (isProtected) {
-          throw new Error(`Blocked dependency: protected pollutant manifest unreadable ${reference.manifest_key}: ${reason}`);
-        }
-        pollutantOmissions.push({ reference, reason });
-      }
-    }
-    if (!pollutantOmissions.length && classification.ok) continue;
-    if (!children.length) {
-      omittedConnectorKeys.add(key);
-      for (const { reference, reason } of pollutantOmissions) {
-        addUnprotectedOmission(audit, {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          pollutant_code: reference.pollutant_code,
-          object_key: reference.manifest_key,
-          classification: "unprotected_pollutant_manifest_unreadable_or_invalid",
-          reason,
-          omission_level: "pollutant",
-          parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-        });
-      }
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: null,
-        object_key: key,
-        classification: "unprotected_connector_not_safely_rebuildable",
-        reason: "no readable valid referenced pollutant children remain",
-        omission_level: "connector",
-        parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-      });
-      continue;
-    }
-    for (const { reference, reason } of pollutantOmissions) {
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: reference.pollutant_code,
-        object_key: reference.manifest_key,
-        classification: "unprotected_pollutant_manifest_unreadable_or_invalid",
-        reason,
-        omission_level: "pollutant",
-        parent_keys_rebuilt: [key, `${base}/manifest.json`, latestIndexKey],
-      });
-    }
-    const childBackups = children
-      .map((payload) => payload.backed_up_at_utc)
-      .filter((value) => typeof value === "string" && !Number.isNaN(Date.parse(value)))
-      .sort();
-    const existingBackup = typeof existingPayload.backed_up_at_utc === "string"
-        && !Number.isNaN(Date.parse(existingPayload.backed_up_at_utc))
-      ? existingPayload.backed_up_at_utc
-      : null;
-    const runId = typeof existingPayload.run_id === "string" || existingPayload.run_id === null
-      ? existingPayload.run_id
-      : null;
-    const writerGitSha = typeof existingPayload.writer_git_sha === "string"
-        || existingPayload.writer_git_sha === null
-      ? existingPayload.writer_git_sha
-      : null;
-    const payload = buildHistoryV2ConnectorManifest({
-      domain: "observations",
-      grain: null,
-      profile: null,
-      dayUtc,
-      connectorId,
-      runId,
-      manifestKey: key,
-      pollutantManifests: children,
-      writerGitSha,
-      backedUpAtUtc: existingBackup || childBackups.at(-1) || `${dayUtc}T00:00:00.000Z`,
-    });
-    await staged.stage({
-      key,
-      body: JSON.stringify(payload, null, 2),
-      kind: "connector_manifest",
-      dayUtc,
-      dependencies: [...childIdentities.keys()],
-      localDependencySnapshot: localDependencySnapshot({
-        child: { children, identities: childIdentities },
-        proposals: staged.proposals,
-        prefix: `${base}/connector_id=${connectorId}/pollutant_code=`,
-        dayUtc,
-        connectorId,
-        kind: "pollutant",
-        domain: "observations",
-      }),
-      provenance: {
-        source: pollutantOmissions.length
-          ? "protected_connector_unprotected_child_quarantine"
-          : "legacy_connector_normalisation",
-        validation_failures: classification.failures,
-        unprotected_omitted_child_keys: pollutantOmissions.map(({ reference }) => reference.manifest_key),
-        immutable_scope_identity_verified: true,
-      },
-    });
-    proposalKeys.push(key);
-  }
-  return { omittedConnectorKeys };
 }
 
 function safeLocalKey(key) {
@@ -1555,33 +1259,6 @@ export async function runV2ObservationsRepair({
       : fs.readFileSync(args.repairPlanJson, "utf8"),
   );
   const { inputKind, domain, scopes } = normalizePlan(input); // Validate all actions before the first R2 request.
-  const runState = JSON.parse(fs.readFileSync(args.runStateJson, "utf8"));
-  const dedicatedProtectedReplacement = runState?.execution_path
-    === "dedicated_sos_historical_observation_replacement";
-  const normalizedPositiveIds = (value, field) => {
-    if (!Array.isArray(value) || !value.length
-      || value.some((item) => !Number.isInteger(item) || item <= 0)) {
-      throw new Error(`Blocked dependency: ${field} must be a non-empty positive-integer array`);
-    }
-    const normalized = [...new Set(value)].sort((left, right) => left - right);
-    if (JSON.stringify(normalized) !== JSON.stringify(value)) {
-      throw new Error(`Blocked dependency: ${field} must be unique and sorted`);
-    }
-    return normalized;
-  };
-  const protectedConnectorIds = dedicatedProtectedReplacement
-    ? normalizedPositiveIds(runState.protected_connector_ids, "protected_connector_ids")
-    : [];
-  const selectedMutationConnectorIds = dedicatedProtectedReplacement
-    ? normalizedPositiveIds(
-      runState.selected_mutation_connector_ids || runState.mutation_connector_ids,
-      "selected_mutation_connector_ids",
-    )
-    : [];
-  if (dedicatedProtectedReplacement
-    && selectedMutationConnectorIds.some((connectorId) => !protectedConnectorIds.includes(connectorId))) {
-    throw new Error("Blocked dependency: selected mutation connector is not protected");
-  }
   reportProgress({ phase: "metadata_planning_start", total_objects: scopes.length });
   const config = resolveR2HistoryIndexConfig(env);
   if (args.writeR2) {
@@ -1640,9 +1317,6 @@ export async function runV2ObservationsRepair({
   const blockedScopes = [];
   const blockedConnectorScopes = new Set();
   const plannedStageStatus = args.writeR2 ? "not_run" : "planned";
-  const preservationAudit = dedicatedProtectedReplacement
-    ? newProtectedConnectorPreservationAudit({ protectedConnectorIds, selectedMutationConnectorIds })
-    : null;
   const manifestStageStatus = (proposalKeys) => proposalKeys.some((key) =>
     String(staged.proposals.get(key)?.kind || "").endsWith("manifest")
   ) ? plannedStageStatus : "not_run";
@@ -1776,29 +1450,15 @@ export async function runV2ObservationsRepair({
       continue;
     }
     if (needsDay) {
-      let omittedConnectorKeys = new Set();
       if (domain === "observations") {
-        if (dedicatedProtectedReplacement) {
-          ({ omittedConnectorKeys } = await stageProtectedConnectorPreservationDependencies({
-            staged,
-            base,
-            dayUtc,
-            proposalKeys,
-            protectedConnectorIds,
-            selectedMutationConnectorIds,
-            latestIndexKey,
-            audit: preservationAudit,
-          }));
-        } else {
-          await stageRepairableObservationConnectorDependencies({
-            staged,
-            base,
-            dayUtc,
-            proposalKeys,
-          });
-        }
+        await stageRepairableObservationConnectorDependencies({
+          staged,
+          base,
+          dayUtc,
+          proposalKeys,
+        });
       }
-      const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain, omitKeys: omittedConnectorKeys });
+      const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain });
       dayManifest = buildHistoryV2DayManifest({ domain, grain: domain === "aqilevels" ? "hourly" : null, profile: domain === "aqilevels" ? "data" : null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key: dayManifestKey,
@@ -1942,23 +1602,6 @@ export async function runV2ObservationsRepair({
   for (const proposal of staged.proposals.values()) {
     proposal.dependency_identities = staged.resolveDependencyIdentities(proposal.dependencies || []);
   }
-  if (preservationAudit) {
-    const rewritten = new Set();
-    for (const omission of preservationAudit.unprotected_omissions) {
-      for (const key of omission.parent_keys_rebuilt || []) {
-        if (staged.proposals.get(key)?.changed) rewritten.add(key);
-      }
-    }
-    preservationAudit.permitted_parent_metadata_rewrites = [...rewritten].sort();
-    for (const omission of preservationAudit.unprotected_omissions) {
-      omission.parent_keys_rebuilt = (omission.parent_keys_rebuilt || [])
-        .filter((key) => rewritten.has(key))
-        .sort();
-    }
-    preservationAudit.warning_count = preservationAudit.unprotected_omissions.length;
-    preservationAudit.warning_samples = preservationAudit.unprotected_omissions.slice(0, 10);
-    preservationAudit.protected_connector_validation_status = "validated_pre_mutation";
-  }
   for (const proposal of staged.proposals.values()) assertCanonicalProposal(proposal);
   for (const proposal of staged.proposals.values()) {
     assertCanonicalProposalRelationships(proposal, staged.proposals);
@@ -1979,7 +1622,7 @@ export async function runV2ObservationsRepair({
     manifest_status: reduceRepairStatus(dayPlans.map((plan) => plan.manifest_status || "not_run"), "not_run"),
     index_status: reduceRepairStatus(dayPlans.map((plan) => plan.index_status || "not_run"), "not_run"),
     bucket: config.r2.bucket,
-    planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes, protected_connector_preservation: preservationAudit },
+    planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes },
     execution: { status: "not_run" },
     verification: { status: "not_run" },
     application_failure: null,
