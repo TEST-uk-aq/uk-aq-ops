@@ -297,11 +297,6 @@
         animation: rise-in 0.55s ease both;
       }
 
-      .dispatch-panel {
-        position: relative;
-        z-index: 2;
-      }
-
       .panel h2 {
         margin: 0 0 14px;
         font-size: 22px;
@@ -3095,7 +3090,7 @@
         });
 
         const panel = document.createElement("section");
-        panel.className = "panel dispatch-panel";
+        panel.className = "panel";
         panel.innerHTML = `
           <h2 class="panel-heading">
             <span>Dispatcher Feed</span>
