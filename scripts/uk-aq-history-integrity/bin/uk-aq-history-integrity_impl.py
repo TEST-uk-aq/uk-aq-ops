@@ -129,7 +129,7 @@ DEFAULT_R2_HISTORY_DROPBOX_DIR = "R2_history_backup"
 CURRENT_INTEGRITY_HISTORY_VERSION = "v2"
 CURRENT_INTEGRITY_CORE_PREFIX = "history/v2/core"
 SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH = (
-    "dedicated_sos_historical_observation_replacement"
+    "sos_light"
 )
 PROTECTED_CONNECTOR_IDS_ENV = (
     "UK_AQ_HISTORY_INTEGRITY_PROTECTED_CONNECTOR_IDS"
@@ -19864,15 +19864,9 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning") if isinstance(output, Mapping) else None
     if not isinstance(planning, Mapping):
         return
-    preservation = planning.get("protected_connector_preservation")
-    if isinstance(preservation, Mapping):
-        run_state["protected_connector_preservation"] = dict(preservation)
-        for field in (
-            "protected_connector_ids",
-            "selected_mutation_connector_ids",
-            "protected_connector_validation_status",
-        ):
-            run_state[field] = preservation.get(field)
+    sos_light = planning.get("sos_light")
+    if isinstance(sos_light, Mapping):
+        run_state["sos_light"] = dict(sos_light)
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
@@ -19897,6 +19891,11 @@ def _record_metadata_executor_overlay(
                     else None
                 ),
             )
+        snapshot = proposal.get("local_dependency_snapshot")
+        if isinstance(snapshot, Mapping):
+            _overlay_object_entry(run_state, object_key)[
+                "local_dependency_snapshot"
+            ] = dict(snapshot)
         mark_overlay_structurally_validated(run_state, object_key)
         scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
         record_changed_scope(run_state, scope_set, {
@@ -19905,6 +19904,184 @@ def _record_metadata_executor_overlay(
             "provenance": proposal.get("provenance") or "repair_generated",
         })
     write_run_state(run_state)
+
+
+def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any]:
+    """Materialise the source-plus-Dropbox day proposal, then select full-day deletion."""
+    audit = run_state.get("sos_light")
+    if not isinstance(audit, dict) or audit.get("validation_status") != "validated_local_assembly":
+        raise ValueError("SOS-light local assembly audit is unavailable or invalid")
+    if audit.get("old_live_r2_observation_bodies_used") is not False:
+        raise ValueError("SOS-light planning authority boundary is not explicit")
+    day_entries = [entry for entry in list(audit.get("days") or []) if isinstance(entry, Mapping)]
+    if not day_entries:
+        raise ValueError("SOS-light local assembly contains no selected days")
+    old_prefixes = [
+        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
+        for entry in list(run_state.get("tombstone_prefixes") or [])
+        if isinstance(entry, Mapping) and entry.get("proposed")
+    ]
+    dropbox_root = Path(str(run_state["base_dropbox_root"]))
+    overlay_root = Path(str(run_state["overlay_root"]))
+    objects = run_state.get("objects")
+    if not isinstance(objects, dict):
+        raise ValueError("SOS-light overlay objects mapping is unavailable")
+    total_day_uploads = 0
+    for raw_day in day_entries:
+        day = dict(raw_day)
+        day_utc = str(day.get("day_utc") or "")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc):
+            raise ValueError(f"SOS-light day identity is invalid: {day_utc!r}")
+        day_prefix = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
+        baseline_day = dropbox_root / day_prefix
+        if not baseline_day.is_dir():
+            raise FileNotFoundError(f"SOS-light Dropbox baseline day is unavailable: {day_prefix}")
+        omitted_prefixes = [
+            _normalise_overlay_object_key(str(value)).rstrip("/")
+            for value in list(day.get("omitted_dropbox_connector_prefixes") or [])
+        ]
+        for source in sorted(path for path in baseline_day.rglob("*") if path.is_file()):
+            object_key = source.relative_to(dropbox_root).as_posix()
+            if object_key in objects:
+                continue
+            if any(object_key.startswith(f"{prefix}/") for prefix in old_prefixes):
+                continue
+            if any(object_key.startswith(f"{prefix}/") for prefix in omitted_prefixes):
+                continue
+            target = overlay_root / object_key
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            payload = target.read_bytes()
+            objects[object_key] = {
+                "object_key": object_key,
+                "local_path": str(target),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "bytes": len(payload),
+                "stage": "sos_light_dropbox_baseline",
+                "proposal_owner": "dropbox_day_baseline",
+                "dependencies": [],
+                "dependency_identities": {},
+                "proposed": True,
+                "built": True,
+                "structurally_validated": True,
+                "structurally_validated_at_utc": fmt_iso(utc_now()),
+                "uploaded": False,
+                "uploaded_at_utc": None,
+                "r2_verified": False,
+                "r2_verified_at_utc": None,
+            }
+        day_keys = sorted(
+            key for key in objects if key.startswith(f"{day_prefix}/")
+        )
+        if f"{day_prefix}/manifest.json" not in day_keys:
+            raise ValueError(f"SOS-light assembled day parent is unavailable: {day_utc}")
+        connector1_parent = f"{day_prefix}/connector_id=1/manifest.json"
+        if connector1_parent not in day_keys:
+            raise ValueError(f"SOS-light connector 1 parent is unavailable: {day_utc}")
+        for parent_key, reference_fields in (
+            (connector1_parent, ("pollutant_manifests", "child_manifests")),
+            (f"{day_prefix}/manifest.json", ("connector_manifests", "child_manifests")),
+        ):
+            parent_entry = objects[parent_key]
+            parent_payload = json.loads(
+                Path(str(parent_entry["local_path"])).read_text(encoding="utf-8")
+            )
+            references = {
+                str(reference.get("manifest_key") or "")
+                for field in reference_fields
+                for reference in list(parent_payload.get(field) or [])
+                if isinstance(reference, Mapping)
+                and str(reference.get("manifest_key") or "")
+            }
+            missing = sorted(reference for reference in references if reference not in objects)
+            if missing:
+                raise ValueError(
+                    f"SOS-light final parent has an unstaged child: {parent_key} -> {missing[0]}"
+                )
+            parent_entry["dependencies"] = sorted(references)
+            parent_entry["dependency_identities"] = {
+                reference: {
+                    "sha256": objects[reference]["sha256"],
+                    "bytes": objects[reference]["bytes"],
+                    "source": "overlay",
+                }
+                for reference in sorted(references)
+            }
+            parent_entry["local_dependency_snapshot"] = {
+                "source": "complete_local_sos_light_assembly",
+                "expected_child_keys": sorted(references),
+            }
+        connector1_children = list(
+            objects[connector1_parent]["dependencies"]
+        )
+        if connector1_children != sorted(
+            str(value) for value in list(day.get("final_connector_1_child_set") or [])
+        ):
+            raise ValueError(
+                f"SOS-light connector 1 final child-set evidence changed: {day_utc}"
+            )
+        day["complete_day_upload_count"] = len(day_keys)
+        day["complete_day_delete_prefix"] = f"{day_prefix}/"
+        total_day_uploads += len(day_keys)
+        raw_day.update(day)
+
+    # Every dependency below a deleted day is now an explicitly staged object.
+    for entry in objects.values():
+        if not isinstance(entry, dict):
+            continue
+        identities = entry.get("dependency_identities")
+        if not isinstance(identities, dict):
+            continue
+        for dependency, identity in identities.items():
+            staged = objects.get(dependency)
+            if not isinstance(staged, Mapping) or not isinstance(identity, dict):
+                continue
+            identity.update({
+                "sha256": staged.get("sha256"),
+                "bytes": staged.get("bytes"),
+                "source": "overlay",
+            })
+
+    run_state["tombstone_prefixes"] = [
+        {
+            "prefix": (
+                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
+                f"day_utc={str(entry['day_utc'])}"
+            ),
+            "proposed": True,
+            "deleted": False,
+            "deletion_verified": False,
+            "stage": "sos_light_complete_day",
+            "replacement_authorities": [
+                "current_run_sos_source", "chosen_dropbox_baseline"
+            ],
+        }
+        for entry in sorted(day_entries, key=lambda value: str(value["day_utc"]))
+    ]
+    audit.update({
+        "mode": "sos-light",
+        "validation_status": "complete_local_days_validated",
+        "selected_days": sorted(str(entry["day_utc"]) for entry in day_entries),
+        "selected_connector_1_pollutants": sorted({
+            match.group(1)
+            for identity in dict(run_state.get("source_evidence_partitions") or {})
+            if (match := re.search(r"/pollutant_code=([a-z0-9_]+)$", str(identity)))
+        }),
+        "chosen_dropbox_baseline": str(dropbox_root),
+        "source_identities": sorted(
+            str(identity)
+            for identity in dict(run_state.get("source_evidence_partitions") or {})
+        ),
+        "complete_day_count": len(day_entries),
+        "complete_day_upload_count": total_day_uploads,
+        "complete_day_deletion_count": len(day_entries),
+        "assembly_authority_confirmation":
+            "current-run SOS source plus chosen Dropbox baseline only",
+        "no_old_live_r2_body_planning_or_preservation": True,
+    })
+    run_state["mode"] = "sos-light"
+    write_run_state(run_state)
+    return dict(audit)
 
 def _capture_local_v2_observation_scope(
     *,
@@ -22905,7 +23082,7 @@ def summarize_ordered_apply_verification(
             remaining_scopes.append({
                 "stage": "ordered_apply_verification",
                 "object_key": f"{evidence['prefix']}/",
-                "gap_type": "selected_prefix_deletion_not_verified",
+                "gap_type": "complete_day_deletion_not_verified",
             })
     apply_status = str(apply_result.get("status") or "")
     if apply_status not in {"succeeded", "skipped_noop"}:
@@ -22930,7 +23107,7 @@ def summarize_ordered_apply_verification(
         "r2_objects_changed": len(written_keys) + deleted_object_count,
         "remaining_gap_count": len(remaining_scopes),
         "remaining_scopes": remaining_scopes,
-        "final_protected_connector_r2_verification_status": (
+        "final_sos_light_r2_verification_status": (
             ("succeeded" if not remaining_scopes else "failed")
             if run_state.get("execution_path")
             == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
@@ -22982,12 +23159,9 @@ def run_v2_integrity_repair_flow(
         resolved_protected_connector_ids = sorted({
             int(value) for value in (protected_connector_ids or [])
         })
-        if not resolved_protected_connector_ids or not (
-            allowed_connector_ids <= set(resolved_protected_connector_ids)
-        ):
+        if resolved_protected_connector_ids != [1]:
             raise RuntimeError(
-                "dedicated SOS historical replacement requires every selected "
-                "mutation connector to be protected"
+                "SOS-light currently requires protected connector IDs exactly [1]"
             )
         explicit_selected_partitions = build_dedicated_sos_selected_partitions(
             from_day=from_day,
@@ -22997,11 +23171,11 @@ def run_v2_integrity_repair_flow(
         )
         run_state.update({
             "execution_path": SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH,
+            "mode": "sos-light",
             "dedicated_sos_historical_replacement": True,
             "mutation_connector_ids": [1],
             "protected_connector_ids": resolved_protected_connector_ids,
             "selected_mutation_connector_ids": [1],
-            "protected_connector_validation_status": "pending_proposal_graph",
             "aqi_policy": "bypassed_observation_history_only",
             "target_authority": "explicit_selected_scope",
             "explicit_selected_partitions": explicit_selected_partitions,
@@ -23136,6 +23310,10 @@ def run_v2_integrity_repair_flow(
     if observation_failed:
         record_blocked_scope(run_state, {"stage": "observs_manifests", "reason": "observation_repair_failed"})
     _record_metadata_executor_overlay(run_state=run_state, executor_result=metadata, dry_run=dry_run)
+    if dedicated_sos_historical_replacement and not observation_failed and str(
+        metadata.get("status") or ""
+    ) not in {"failed", "blocked_dependency"}:
+        assemble_sos_light_complete_days(run_state)
     observation_manifest_status = str(metadata.get("manifest_status") or metadata.get("status") or "not_run")
     observation_index_status = str(metadata.get("index_status") or metadata.get("status") or "not_run")
     observation_stages_verified = not observation_failed and observation_manifest_status not in {
@@ -23723,8 +23901,8 @@ def run_v2_integrity_repair_flow(
         if dedicated_sos_historical_replacement
         else list(CANONICAL_REPAIR_STAGE_ORDER)
     )
-    protected_preservation = (
-        dict(run_state.get("protected_connector_preservation") or {})
+    sos_light = (
+        dict(run_state.get("sos_light") or {})
         if dedicated_sos_historical_replacement else {}
     )
     result = {
@@ -23739,6 +23917,7 @@ def run_v2_integrity_repair_flow(
         "dedicated_sos_historical_replacement": bool(
             dedicated_sos_historical_replacement
         ),
+        "mode": "sos-light" if dedicated_sos_historical_replacement else None,
         "mutation_connector_ids": [1] if dedicated_sos_historical_replacement else None,
         "protected_connector_ids": (
             list(run_state.get("protected_connector_ids") or [])
@@ -23747,36 +23926,8 @@ def run_v2_integrity_repair_flow(
         "selected_mutation_connector_ids": (
             [1] if dedicated_sos_historical_replacement else None
         ),
-        "protected_connector_preservation": (
-            protected_preservation
-            if dedicated_sos_historical_replacement else None
-        ),
-        "protected_connector_validation_status": (
-            protected_preservation.get("protected_connector_validation_status")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "healthy_unprotected_children_preserved": (
-            protected_preservation.get("healthy_unprotected_children_preserved")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "unprotected_pollutant_omission_count": (
-            protected_preservation.get("unprotected_pollutant_omission_count")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "unprotected_connector_omission_count": (
-            protected_preservation.get("unprotected_connector_omission_count")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "unprotected_day_omission_count": (
-            protected_preservation.get("unprotected_day_omission_count")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "unprotected_omissions": (
-            protected_preservation.get("unprotected_omissions")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "permitted_parent_metadata_rewrites": (
-            protected_preservation.get("permitted_parent_metadata_rewrites")
+        "sos_light": (
+            sos_light
             if dedicated_sos_historical_replacement else None
         ),
         "bypassed_stages": (
@@ -24154,10 +24305,9 @@ def select_sos_historical_replacement_route(
             f"connector_id=1; resolved_connector_ids={connector_ids}"
         )
     protected_ids = result["protected_connector_ids"]
-    if not protected_ids:
+    if protected_ids != [1]:
         raise RuntimeError(
-            "dedicated SOS historical replacement requires a non-empty "
-            "protected connector set"
+            "SOS-light currently requires protected connector IDs exactly [1]"
         )
     unprotected_selected = sorted(set(connector_ids) - set(protected_ids))
     if unprotected_selected:
@@ -26023,48 +26173,35 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "",
     ]
 
-    preservation = (s.get("repair_flow") or {}).get(
-        "protected_connector_preservation"
-    ) or {}
-    if preservation:
-        omissions = list(preservation.get("unprotected_omissions") or [])
+    sos_light = (s.get("repair_flow") or {}).get("sos_light") or {}
+    if sos_light:
+        warnings = list(sos_light.get("dropbox_warnings") or [])
         lines.extend([
-            "## Protected connector preservation",
+            "## SOS-light complete-day replacement",
             "",
-            "- Protected connector IDs: "
-            + json.dumps(preservation.get("protected_connector_ids") or []),
-            "- Selected mutation connector IDs: "
-            + json.dumps(
-                preservation.get("selected_mutation_connector_ids") or []
-            ),
-            "- Protected validation: "
-            + str(preservation.get("protected_connector_validation_status")),
-            "- Healthy unprotected children preserved: "
-            + str(preservation.get("healthy_unprotected_children_preserved") or 0),
-            "- Unprotected pollutant omissions: "
-            + str(preservation.get("unprotected_pollutant_omission_count") or 0),
-            "- Unprotected connector omissions: "
-            + str(preservation.get("unprotected_connector_omission_count") or 0),
-            "- Unprotected day omissions: "
-            + str(preservation.get("unprotected_day_omission_count") or 0),
-            "- Omitted unprotected children mutated: "
-            + str(bool(preservation.get("omitted_unprotected_children_mutated"))),
-            "- Permitted parent metadata rewrites: "
-            + (", ".join(
-                preservation.get("permitted_parent_metadata_rewrites") or []
-            ) or "(none)"),
+            "- Mode: sos-light",
+            "- Assembly authorities: "
+            + ", ".join(sos_light.get("assembly_authorities") or []),
+            "- Old live R2 observation bodies used: "
+            + str(bool(sos_light.get("old_live_r2_observation_bodies_used"))),
+            "- Complete days: " + str(sos_light.get("complete_day_count") or 0),
+            "- Complete-day uploads: "
+            + str(sos_light.get("complete_day_upload_count") or 0),
+            "- Dropbox warnings: "
+            + str(sos_light.get("dropbox_warning_count") or 0),
+            "- Dropbox omissions: "
+            + str(sos_light.get("dropbox_omission_count") or 0),
         ])
-        if omissions:
-            lines.extend(["", "### Unprotected omission warnings", ""])
-            for omission in omissions:
+        if warnings:
+            lines.extend(["", "### Dropbox warning-only omissions", ""])
+            for warning in warnings:
                 lines.append(
                     "- WARNING "
-                    f"day={omission.get('day_utc')} "
-                    f"connector={omission.get('connector_id')} "
-                    f"pollutant={omission.get('pollutant_code') or '(connector)'} "
-                    f"key={omission.get('object_key')} "
-                    f"classification={omission.get('classification')} "
-                    f"reason={omission.get('reason')}"
+                    f"day={warning.get('day_utc')} "
+                    f"connector={warning.get('connector_id')} "
+                    f"key={warning.get('object_key')} "
+                    f"classification={warning.get('classification')} "
+                    f"reason={warning.get('reason')}"
                 )
         lines.append("")
 
@@ -27700,13 +27837,11 @@ def main(argv: list[str]) -> int:
             )
             repair_overlay["sos_historical_route"] = dict(sos_historical_route)
             if dedicated_sos_historical_replacement:
+                repair_overlay["mode"] = "sos-light"
                 repair_overlay["protected_connector_ids"] = list(
                     protected_connector_ids or []
                 )
                 repair_overlay["selected_mutation_connector_ids"] = [1]
-                repair_overlay["protected_connector_validation_status"] = (
-                    "pending_proposal_graph"
-                )
             repair_overlay["requested_from_day"] = from_day
             repair_overlay["requested_to_day"] = to_day
             repair_overlay["requested_repair_pollutants"] = list(
@@ -28080,9 +28215,7 @@ def main(argv: list[str]) -> int:
             ) or 0
         )
         warnings_count_total += int(
-            ((repair_flow.get("protected_connector_preservation") or {}).get(
-                "warning_count"
-            )) or 0
+            ((repair_flow.get("sos_light") or {}).get("warning_count")) or 0
         )
 
         metrics: dict[str, Any] = {
