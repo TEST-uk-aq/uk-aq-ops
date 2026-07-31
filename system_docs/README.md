@@ -54,7 +54,7 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 
 | Area | Authoritative directory | Current status |
 |---|---|---|
-| Connector ingest and Daily Stations reference discovery | [`ingest/`](ingest/) | Authoritative for Daily Stations and Breathe London Nodes deterministic reference discovery |
+| Connector ingest and Daily Stations reference discovery | [`ingest/`](ingest/) | Authoritative for Daily Stations, Breathe London Nodes deterministic reference discovery and UK-AIR SOS polling/Cloud Run behaviour |
 | Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current |
 | Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Authoritative for stable bindings, embedded continuity, integrity, targeted indexes and Phase B history writes |
 | Calculated hourly AQI and station-chart bands | [`aqi-levels/`](aqi-levels/) | Authoritative and current, including continuity-aware calculated chart AQI and asynchronous R2 validation |
