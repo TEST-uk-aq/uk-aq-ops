@@ -4275,11 +4275,17 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                 "connector_day_count": 0,
             }
             forbidden = AssertionError("AQI or broad final verification was invoked")
+            verified_partition_entry = {
+                "day_utc": "2026-06-01",
+                "connector_id": 1,
+                "pollutant_code": "no2",
+                "status": "ok",
+            }
             try:
                 with mock.patch.object(MODULE, "run_v2_gap_backfills", return_value={
                     "v2_observation_repairs_failed": 0,
                     "v2_observation_repairs_guard_failed": 0,
-                    "v2_observation_repair_results": [],
+                    "v2_observation_repair_results": [verified_partition_entry],
                 }), mock.patch.object(
                     MODULE, "_run_v2_observation_metadata_executor", return_value=metadata_ok,
                 ) as metadata_executor, mock.patch.object(
@@ -4295,7 +4301,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                     MODULE, "run_first_value_at_reconciliation", return_value=first_value,
                 ), mock.patch.object(
                     MODULE, "run_current_state_reconciliation", return_value=current_state,
-                ), mock.patch.object(
+                ) as current_state_runner, mock.patch.object(
                     MODULE, "persist_current_state_reconciliation_audit",
                 ), mock.patch.object(
                     MODULE, "_phase4_aqi_work", side_effect=forbidden,
@@ -4340,6 +4346,12 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             self.assertEqual(result["final_verification"]["status"], "ok")
             self.assertFalse(
                 result["final_verification"]["second_broad_r2_scan_invoked"]
+            )
+            self.assertEqual(
+                current_state_runner.call_args.kwargs[
+                    "dedicated_partition_entries"
+                ],
+                [verified_partition_entry],
             )
             aqi_stage = next(
                 stage for stage in result["stage_results"]

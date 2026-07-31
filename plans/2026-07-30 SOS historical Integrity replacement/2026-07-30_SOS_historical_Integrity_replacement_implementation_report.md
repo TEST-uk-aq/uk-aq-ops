@@ -1,5 +1,101 @@
 # SOS historical Integrity replacement implementation report
 
+## 31 July 2026 current-state reconciliation correction
+
+### Confirmed root cause
+
+The successful 1–16 June four-pollutant run exposed two coordinator-side defects after ordered R2 verification:
+
+1. `_current_state_candidates_from_verified_evidence()` grouped scope only by `day_utc + connector_id`, queried `source_connector_day_evidence ORDER BY id DESC`, and consumed only the first row. Dedicated SOS persists one immutable evidence row for each pollutant operation, so the last persisted pollutant won for every connector-day. PM2.5 ran last, which explains the exact 147 Timeseries candidates.
+2. The same function compacted raw Timeseries rows by timeseries but appended every distinct supported historical row to the Latest Snapshot payload. The retained PM2.5 evidence contained 55,761 canonical rows, so all 55,761 were submitted in 112 owner-service calls rather than one candidate per timeseries.
+
+All successful dedicated entries already retained their pollutant-scoped evidence path, row path, identity and SHA-256 in `partition_source_evidence` and `source_evidence_partitions`; candidate derivation ignored that available evidence. The final ordered-apply result establishes the verified R2 state for the complete dedicated scope, so no broad R2 rescan is needed.
+
+No Integrity-side Timeseries state gate was present: the coordinator already submitted Timeseries candidates directly to `uk_aq_rpc_timeseries_current_state_reconcile`. That RPC owns newer, older, equal and same-timestamp correction decisions atomically. Latest Snapshot submission also already ran after the Timeseries attempt regardless of its result. The Latest Snapshot owner service re-applies `evaluateLatestCurrentValue()` and `applyIntegrityCandidatesToLatestState()`, which own public eligibility, monotonic ordering, identical no-op and same-timestamp correction behaviour.
+
+### Corrected candidate assembly
+
+For the dedicated SOS path, `run_current_state_reconciliation()` now receives every selected partition result after successful ordered R2 verification. It:
+
+- includes only `status=ok` partitions with immutable pollutant-scoped evidence whose identity, paths, retained hashes, canonical-row hash, byte count, row count, day, connector and pollutant scope all validate;
+- excludes all-unmapped unchanged partitions and failed or unverified partitions;
+- accepts authoritative no-data as verified zero-row evidence;
+- unions the retained canonical rows across every successful selected day and pollutant;
+- derives one latest raw candidate per Timeseries identity across PM2.5, PM10, NO2 and O3;
+- uses the existing Latest Snapshot `evaluateLatestCurrentValue()` helper to exclude ineligible values, then derives one latest eligible candidate per supported PM2.5, PM10 and NO2 Timeseries;
+- selects an earlier eligible Latest Snapshot row when a newer raw row is negative or otherwise ineligible;
+- fails closed if verified evidence contains irreconcilable content for the same timeseries and timestamp;
+- submits both compacted candidate sets independently to their existing owners without reading or gating on `timeseries.last_value_at`.
+
+The Timeseries payload retains raw finite negative values. O3 remains excluded from Latest Snapshot. Source acquisition, the run-scoped source cache, R2 replacement, tombstones, Parquet/manifests/indexes, ordered apply and GET-once verification are unchanged.
+
+### Reconciliation audit
+
+The durable current-state result and Markdown report now record:
+
+- verified partition evidence count and identities;
+- verified partitions, canonical rows and represented timeseries by pollutant;
+- authoritative no-data, all-unmapped and failed/unverified partition counts;
+- raw/supported rows examined and candidate counts before and after compaction;
+- Timeseries and Latest Snapshot candidates by pollutant;
+- ineligible Latest Snapshot rows by reason;
+- latest-raw-ineligible fallbacks to an earlier eligible candidate;
+- equal-timestamp/duplicate resolutions;
+- planned payload chunk counts, actual submitted counts and owner outcome counts.
+
+For unchanged authoritative evidence and mappings from the known successful run, acceptance is:
+
+```text
+Timeseries candidates: 531
+Latest Snapshot candidates: 436
+```
+
+Expected pollutant coverage is Timeseries `no2=154, o3=95, pm10=135, pm25=147` and Latest Snapshot `no2=154, pm10=135, pm25=147`, with no O3 Latest Snapshot candidate.
+
+### Files changed for this correction
+
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
+  - loads all verified dedicated pollutant-scoped evidence;
+  - compacts Timeseries and Latest Snapshot independently;
+  - retains independent owner submission and adds reconciliation audit metrics.
+- `scripts/uk-aq-history-integrity/bin/integrity/current_state/latest_snapshot_policy.mjs`
+  - provides the Python coordinator with one local batch invocation of the existing owner-service eligibility helper; it adds no second policy implementation.
+- `scripts/uk-aq-history-integrity/tests/test_current_state_reconciliation.py`
+  - adds focused two-day, four-pollutant evidence, compaction, ineligible-fallback, verified-only and independent-target regressions.
+- this implementation report.
+
+No owner-service implementation, schema, RPC, operator configuration or external dependency changed. No additional full-file archive copy was created.
+
+### Focused validation
+
+- Python compilation for the touched Integrity implementation and focused test: passed.
+- JavaScript syntax for the local eligibility-policy bridge: passed.
+- Focused current-state reconciliation tests: 4 passed.
+- Existing dedicated SOS evidence-selection tests: passed.
+- Existing Timeseries owner-submission regression: passed.
+- Existing Latest Snapshot eligibility and same-timestamp correction regressions: passed.
+- `git diff --check`: passed.
+
+### CIC-Test acceptance command and metrics
+
+Run the existing four-pollutant command on the dedicated Integrity machine:
+
+```bash
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh --env CIC-Test --profile manual --source sos --from-day 2026-06-01 --to-day 2026-06-16 --history-version v2 --run-backfill --repair-pollutants pm25,pm10,no2,o3 --allow-stale-dropbox
+```
+
+Inspect the `Current-state reconciliation` report section and durable JSON. Confirm:
+
+- `verified_partition_evidence_count=64`, with 16 verified partitions for each pollutant unless a partition is legitimately authoritative no-data;
+- canonical row and represented-timeseries counts cover all four pollutants;
+- `Timeseries candidates=531` and `candidate_count_after_compaction=531`;
+- `Latest Snapshot candidates=436` and `candidate_count_after_compaction=436`;
+- Timeseries includes all four pollutants while Latest Snapshot has no O3;
+- submitted counts equal compacted counts and payload chunks are compact rather than a full historical replay;
+- Timeseries owner outcomes do not suppress Latest Snapshot submission;
+- the existing SOS source-acquisition audit still reports one open per annual CSV;
+- ordered apply still reports one post-PUT verification GET and no broad final R2 scan.
+
 ## 31 July 2026 source-acquisition optimisation
 
 The dedicated SOS route now performs one run-scoped annual-CSV acquisition before any selected partition is built. The acquisition owner receives the complete inclusive date range, connector `1` and the complete explicit pollutant set. It opens every relevant annual CSV once, parses its CSV/timestamp structure once, derives the selected partition rows and warning evidence from that immutable structure, and completes a run-local spool before detector or proposal work can continue.

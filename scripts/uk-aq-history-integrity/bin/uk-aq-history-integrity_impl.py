@@ -155,6 +155,10 @@ CURRENT_STATE_RECONCILE_RPC_DEFAULT = (
 CURRENT_STATE_TIMESERIES_CHUNK_SIZE = 1000
 CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE = 500
 CURRENT_STATE_REPORT_CALL_LIMIT = 20
+CURRENT_STATE_LATEST_SNAPSHOT_POLICY_HELPER = (
+    "scripts/uk-aq-history-integrity/bin/integrity/current_state/"
+    "latest_snapshot_policy.mjs"
+)
 OVERLAY_CHANGED_SCOPE_SETS = (
     "OBSERVS_CHANGED",
     "OBS_MANIFESTS_CHANGED",
@@ -18673,6 +18677,7 @@ def run_v2_gap_backfills(
         repair_entry = {
             "day_utc": day_iso,
             "connector_id": connector_id,
+            "pollutant_code": partition_pollutant,
             "history_version": "v2",
             "status": repair_status,
             "wrapper_status": combined.get("status"),
@@ -21482,6 +21487,423 @@ def _current_state_candidates_from_verified_evidence(
     }
 
 
+def _evaluate_latest_snapshot_candidate_eligibility(
+    *, rows: Iterable[Mapping[str, Any]], env: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Apply the owner service's shared public-current-value policy once."""
+    materialized = [
+        {
+            "pollutant_code": str(row.get("pollutant_code") or ""),
+            "value": row.get("value"),
+        }
+        for row in rows
+    ]
+    if not materialized:
+        return []
+    repo_root = _repo_root_for_integrity_script(env)
+    helper_path = repo_root / CURRENT_STATE_LATEST_SNAPSHOT_POLICY_HELPER
+    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
+    completed = subprocess.run(
+        [node_bin, str(helper_path)],
+        cwd=repo_root,
+        input=json.dumps(materialized, separators=(",", ":"), ensure_ascii=False),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Latest Snapshot eligibility policy failed: "
+            + _truncate_text(
+                completed.stderr or completed.stdout or "unknown policy error",
+                1000,
+            )
+        )
+    try:
+        parsed = json.loads(completed.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Latest Snapshot eligibility policy returned invalid JSON"
+        ) from exc
+    allowed_reasons = {
+        "eligible", "unsupported_pollutant", "missing_or_non_finite_value",
+        "negative_value", "above_pm25_maximum", "above_pm10_maximum",
+    }
+    if (
+        not isinstance(parsed, list)
+        or len(parsed) != len(materialized)
+        or any(
+            not isinstance(decision, Mapping)
+            or not isinstance(decision.get("eligible"), bool)
+            or str(decision.get("reason") or "") not in allowed_reasons
+            for decision in parsed
+        )
+    ):
+        raise RuntimeError(
+            "Latest Snapshot eligibility policy returned invalid decisions"
+        )
+    return [dict(decision) for decision in parsed]
+
+
+def _load_verified_dedicated_sos_current_state_rows(
+    partition_entries: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Load only successful, immutable pollutant-scoped replacement evidence."""
+    rows: list[dict[str, Any]] = []
+    verified_identities: list[str] = []
+    verified_by_pollutant: Counter[str] = Counter()
+    rows_by_pollutant: Counter[str] = Counter()
+    timeseries_by_pollutant: dict[str, set[tuple[int, int]]] = {}
+    skipped_all_unmapped = 0
+    skipped_failed_or_unverified = 0
+    authoritative_no_data = 0
+    seen_identities: set[str] = set()
+
+    for raw_entry in partition_entries:
+        if not isinstance(raw_entry, Mapping):
+            skipped_failed_or_unverified += 1
+            continue
+        status = str(raw_entry.get("status") or "").strip()
+        outcome = str(raw_entry.get("outcome") or "").strip()
+        if status == "skipped_all_unmapped" or outcome == (
+            "all_groups_excluded_no_authoritative_binding"
+        ):
+            skipped_all_unmapped += 1
+            continue
+        if status != "ok":
+            skipped_failed_or_unverified += 1
+            continue
+        retained = raw_entry.get("partition_source_evidence")
+        if not isinstance(retained, Mapping):
+            raise ValueError(
+                "verified dedicated SOS partition evidence identity is unavailable"
+            )
+        day_utc = str(retained.get("day_utc") or raw_entry.get("day_utc") or "")
+        try:
+            connector_id = int(
+                retained.get("connector_id") or raw_entry.get("connector_id") or 0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "verified dedicated SOS partition connector identity is invalid"
+            ) from exc
+        pollutant_code = str(
+            retained.get("pollutant_code")
+            or raw_entry.get("pollutant_code")
+            or ""
+        ).strip().lower()
+        identity = _dedicated_sos_source_evidence_identity(
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+        )
+        if (
+            not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc)
+            or connector_id != 1
+            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+            or str(retained.get("identity") or "") != identity
+            or identity in seen_identities
+        ):
+            raise ValueError(
+                "verified dedicated SOS partition evidence identity is invalid"
+            )
+        seen_identities.add(identity)
+        evidence_path = Path(str(retained.get("evidence_path") or ""))
+        rows_path = Path(str(retained.get("rows_path") or ""))
+        if not evidence_path.is_file() or not rows_path.is_file():
+            raise FileNotFoundError(
+                f"verified dedicated SOS partition evidence is unavailable: {identity}"
+            )
+        evidence_bytes = evidence_path.read_bytes()
+        rows_bytes = rows_path.read_bytes()
+        if (
+            hashlib.sha256(evidence_bytes).hexdigest()
+            != str(retained.get("evidence_sha256") or "")
+            or hashlib.sha256(rows_bytes).hexdigest()
+            != str(retained.get("rows_sha256") or "")
+        ):
+            raise ValueError(
+                f"verified dedicated SOS partition evidence hash mismatch: {identity}"
+            )
+        evidence = json.loads(evidence_bytes)
+        partition_rows = json.loads(rows_bytes)
+        if not isinstance(evidence, Mapping) or not isinstance(partition_rows, list):
+            raise ValueError(
+                f"verified dedicated SOS partition evidence is invalid: {identity}"
+            )
+        if (
+            evidence.get("enumeration_complete") is not True
+            or str(evidence.get("day_utc") or "") != day_utc
+            or int(evidence.get("connector_id") or 0) != connector_id
+            or list(evidence.get("requested_pollutant_set") or [])
+            != [pollutant_code]
+            or str(evidence.get("canonical_rows_sha256") or "")
+            != hashlib.sha256(rows_bytes).hexdigest()
+            or _require_nonnegative_evidence_int(
+                evidence, "canonical_rows_bytes"
+            ) != len(rows_bytes)
+            or _require_nonnegative_evidence_int(
+                evidence, "total_rows"
+            ) != len(partition_rows)
+            or _require_nonnegative_evidence_int(
+                evidence, "blocked_row_count"
+            ) != 0
+        ):
+            raise ValueError(
+                f"verified dedicated SOS partition semantic identity is invalid: {identity}"
+            )
+        verified_identities.append(identity)
+        verified_by_pollutant[pollutant_code] += 1
+        if not partition_rows:
+            authoritative_no_data += 1
+            continue
+        pollutant_timeseries = timeseries_by_pollutant.setdefault(
+            pollutant_code, set()
+        )
+        for raw_row in partition_rows:
+            if not isinstance(raw_row, Mapping):
+                raise ValueError(
+                    f"verified dedicated SOS partition contains a non-object row: {identity}"
+                )
+            row = dict(raw_row)
+            row["_verified_partition_identity"] = identity
+            rows.append(row)
+            rows_by_pollutant[pollutant_code] += 1
+            try:
+                pollutant_timeseries.add(
+                    (connector_id, int(raw_row.get("timeseries_id")))
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"verified dedicated SOS partition has an invalid timeseries: {identity}"
+                ) from exc
+
+    return {
+        "rows": rows,
+        "audit": {
+            "evidence_source": "verified_pollutant_scoped_replacement_partitions",
+            "verified_partition_evidence_count": len(verified_identities),
+            "verified_partition_identities": sorted(verified_identities),
+            "verified_partitions_by_pollutant": dict(sorted(verified_by_pollutant.items())),
+            "canonical_rows_examined_by_pollutant": dict(sorted(rows_by_pollutant.items())),
+            "timeseries_represented_by_pollutant": {
+                pollutant: len(identities)
+                for pollutant, identities in sorted(timeseries_by_pollutant.items())
+            },
+            "skipped_all_unmapped_partitions": skipped_all_unmapped,
+            "skipped_failed_or_unverified_partitions": skipped_failed_or_unverified,
+            "authoritative_no_data_partitions": authoritative_no_data,
+        },
+    }
+
+
+def _dedicated_sos_current_state_candidates(
+    *, partition_entries: Iterable[Mapping[str, Any]], env: Mapping[str, str],
+) -> dict[str, Any]:
+    loaded = _load_verified_dedicated_sos_current_state_rows(partition_entries)
+    canonical_rows = list(loaded["rows"])
+    normalized: list[dict[str, Any]] = []
+    observed_values: list[dt.datetime] = []
+    for raw in canonical_rows:
+        partition_identity = str(raw.get("_verified_partition_identity") or "")
+        match = re.fullmatch(
+            r"day_utc=(\d{4}-\d{2}-\d{2})/connector_id=(\d+)/"
+            r"pollutant_code=([a-z0-9_]+)",
+            partition_identity,
+        )
+        if match is None:
+            raise ValueError("verified current-state partition identity is invalid")
+        day_utc, connector_text, partition_pollutant = match.groups()
+        connector_id = int(connector_text)
+        try:
+            row_connector_id = int(raw.get("connector_id", connector_id))
+            timeseries_id = int(raw.get("timeseries_id"))
+            value = float(raw.get("value"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("verified current-state row identity is invalid") from exc
+        observed_at = _parse_required_timestamp_value(raw.get("observed_at"))
+        pollutant_code = str(raw.get("pollutant_code") or "").strip().lower()
+        if (
+            row_connector_id != connector_id
+            or timeseries_id <= 0
+            or observed_at is None
+            or observed_at.tzinfo is None
+            or not _timestamp_is_in_utc_day(observed_at, day_utc)
+            or not math.isfinite(value)
+            or pollutant_code != partition_pollutant
+        ):
+            raise ValueError("verified current-state canonical row is invalid")
+        observed_at = observed_at.astimezone(dt.timezone.utc)
+        status = (
+            raw.get("verification_status")
+            if "verification_status" in raw
+            else raw.get("status") if "status" in raw else None
+        )
+        if status is not None:
+            status = str(status)
+        normalized.append({
+            "connector_id": connector_id,
+            "timeseries_id": timeseries_id,
+            "observed_at": _format_utc_timestamp(observed_at),
+            "value": value,
+            "value_float8_hex": struct.pack(">d", value).hex(),
+            "status": status,
+            "pollutant_code": pollutant_code,
+        })
+        observed_values.append(observed_at)
+
+    raw_latest: dict[tuple[int, int], dict[str, Any]] = {}
+    timeseries_equal_timestamp_resolutions = 0
+    for row in normalized:
+        identity = (int(row["connector_id"]), int(row["timeseries_id"]))
+        current = raw_latest.get(identity)
+        if current is None or str(row["observed_at"]) > str(current["observed_at"]):
+            raw_latest[identity] = row
+            continue
+        if str(row["observed_at"]) < str(current["observed_at"]):
+            continue
+        content = (
+            row["value_float8_hex"], row.get("status"), row["pollutant_code"]
+        )
+        current_content = (
+            current["value_float8_hex"], current.get("status"),
+            current["pollutant_code"],
+        )
+        if content != current_content:
+            raise ValueError(
+                "verified current-state evidence contains irreconcilable "
+                "same-timestamp canonical rows"
+            )
+        timeseries_equal_timestamp_resolutions += 1
+
+    supported_rows = [
+        row for row in normalized
+        if row["pollutant_code"] in {"pm25", "pm10", "no2"}
+    ]
+    eligibility = _evaluate_latest_snapshot_candidate_eligibility(
+        rows=supported_rows,
+        env=env,
+    )
+    eligible_rows: list[dict[str, Any]] = []
+    ineligible_by_reason: Counter[str] = Counter()
+    for row, decision in zip(supported_rows, eligibility, strict=True):
+        if decision["eligible"]:
+            eligible_rows.append(row)
+        else:
+            ineligible_by_reason[str(decision["reason"])] += 1
+
+    snapshot_latest: dict[tuple[int, int], dict[str, Any]] = {}
+    snapshot_equal_timestamp_resolutions = 0
+    for row in eligible_rows:
+        identity = (int(row["connector_id"]), int(row["timeseries_id"]))
+        current = snapshot_latest.get(identity)
+        if current is None or str(row["observed_at"]) > str(current["observed_at"]):
+            snapshot_latest[identity] = row
+            continue
+        if str(row["observed_at"]) < str(current["observed_at"]):
+            continue
+        content = (
+            row["value_float8_hex"], row.get("status"), row["pollutant_code"]
+        )
+        current_content = (
+            current["value_float8_hex"], current.get("status"),
+            current["pollutant_code"],
+        )
+        if content != current_content:
+            raise ValueError(
+                "verified Latest Snapshot evidence contains irreconcilable "
+                "same-timestamp canonical rows"
+            )
+        snapshot_equal_timestamp_resolutions += 1
+
+    raw_candidates = [
+        {
+            "connector_id": row["connector_id"],
+            "timeseries_id": row["timeseries_id"],
+            "observed_at": row["observed_at"],
+            "value": row["value"],
+        }
+        for _, row in sorted(raw_latest.items())
+    ]
+    snapshot_candidates = [
+        dict(row) for _, row in sorted(snapshot_latest.items())
+    ]
+    raw_by_pollutant = Counter(
+        row["pollutant_code"] for row in raw_latest.values()
+    )
+    snapshot_by_pollutant = Counter(
+        row["pollutant_code"] for row in snapshot_latest.values()
+    )
+    supported_timeseries = {
+        (int(row["connector_id"]), int(row["timeseries_id"]))
+        for row in supported_rows
+    }
+    latest_raw_ineligible_fallbacks = sum(
+        1
+        for identity, snapshot_row in snapshot_latest.items()
+        if identity in raw_latest
+        and str(snapshot_row["observed_at"])
+        < str(raw_latest[identity]["observed_at"])
+    )
+    return {
+        "scope_count": int(
+            loaded["audit"]["verified_partition_evidence_count"]
+        ),
+        "raw_candidates": raw_candidates,
+        "latest_snapshot_candidates": snapshot_candidates,
+        "candidate_observed_at_min": (
+            _format_utc_timestamp(min(observed_values)) if observed_values else None
+        ),
+        "candidate_observed_at_max": (
+            _format_utc_timestamp(max(observed_values)) if observed_values else None
+        ),
+        "missing_evidence": [],
+        "evidence_audit": loaded["audit"],
+        "timeseries_candidate_audit": {
+            "raw_rows_examined": len(normalized),
+            "candidate_count_before_compaction": len(normalized),
+            "candidate_count_after_compaction": len(raw_candidates),
+            "candidates_by_pollutant": dict(sorted(raw_by_pollutant.items())),
+            "duplicate_or_equal_timestamp_resolutions": (
+                timeseries_equal_timestamp_resolutions
+            ),
+            "payload_chunk_count": (
+                math.ceil(len(raw_candidates) / CURRENT_STATE_TIMESERIES_CHUNK_SIZE)
+                if raw_candidates else 0
+            ),
+            "rpc_submitted_count": 0,
+        },
+        "latest_snapshot_candidate_audit": {
+            "supported_rows_examined": len(supported_rows),
+            "unsupported_pollutant_rows_excluded": (
+                len(normalized) - len(supported_rows)
+            ),
+            "ineligible_rows_excluded_by_reason": dict(
+                sorted(ineligible_by_reason.items())
+            ),
+            "supported_timeseries_represented": len(supported_timeseries),
+            "candidate_count_before_compaction": len(eligible_rows),
+            "candidate_count_after_compaction": len(snapshot_candidates),
+            "candidates_by_pollutant": dict(
+                sorted(snapshot_by_pollutant.items())
+            ),
+            "latest_raw_ineligible_earlier_candidate_selected": (
+                latest_raw_ineligible_fallbacks
+            ),
+            "duplicate_or_equal_timestamp_resolutions": (
+                snapshot_equal_timestamp_resolutions
+            ),
+            "payload_chunk_count": (
+                math.ceil(
+                    len(snapshot_candidates)
+                    / CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE
+                ) if snapshot_candidates else 0
+            ),
+            "owner_service_submitted_count": 0,
+        },
+    }
+
+
 def _google_cloud_run_identity_token(audience: str) -> str:
     return acquire_identity_token(audience, settings=os.environ)
 
@@ -21540,6 +21962,7 @@ def run_current_state_reconciliation(
     dry_run: bool,
     final_verification: Mapping[str, Any],
     log: logging.Logger,
+    dedicated_partition_entries: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     settings = {**os.environ, **{str(key): str(value) for key, value in env.items()}}
     enabled = _is_truthy(settings.get(
@@ -21560,6 +21983,9 @@ def run_current_state_reconciliation(
         "candidate_observed_at_max": None,
         "timeseries": {},
         "latest_snapshot": {},
+        "evidence_audit": {},
+        "timeseries_candidate_audit": {},
+        "latest_snapshot_candidate_audit": {},
         "warnings": [],
         "failures": [],
     }
@@ -21574,24 +22000,37 @@ def run_current_state_reconciliation(
         result["failures"].append("final R2 verification did not succeed")
         return result
 
-    selected_scope = {
-        "scopes": sorted({
-            (
-                str(entry.get("day_utc") or "").strip(),
-                int(entry.get("connector_id") or 0),
+    if dedicated_partition_entries is not None:
+        derived = _dedicated_sos_current_state_candidates(
+            partition_entries=dedicated_partition_entries,
+            env=settings,
+        )
+        selected_scope = {
+            "verified_partitions": list(
+                derived.get("evidence_audit", {}).get(
+                    "verified_partition_identities", []
+                )
             )
-            for entry in scope_entries
-            if isinstance(entry, Mapping)
-        })
-    }
-    derived = _current_state_candidates_from_verified_evidence(
-        conn=conn,
-        env_name=env_name,
-        scope_entries=[
-            {"day_utc": day_utc, "connector_id": connector_id}
-            for day_utc, connector_id in selected_scope["scopes"]
-        ],
-    )
+        }
+    else:
+        selected_scope = {
+            "scopes": sorted({
+                (
+                    str(entry.get("day_utc") or "").strip(),
+                    int(entry.get("connector_id") or 0),
+                )
+                for entry in scope_entries
+                if isinstance(entry, Mapping)
+            })
+        }
+        derived = _current_state_candidates_from_verified_evidence(
+            conn=conn,
+            env_name=env_name,
+            scope_entries=[
+                {"day_utc": day_utc, "connector_id": connector_id}
+                for day_utc, connector_id in selected_scope["scopes"]
+            ],
+        )
     raw_candidates = list(derived["raw_candidates"])
     snapshot_candidates = list(derived["latest_snapshot_candidates"])
     try:
@@ -21608,6 +22047,13 @@ def run_current_state_reconciliation(
         "candidate_observed_at_max": derived["candidate_observed_at_max"],
         "missing_evidence_count": len(derived["missing_evidence"]),
         "missing_evidence_sample": list(derived["missing_evidence"])[:20],
+        "evidence_audit": dict(derived.get("evidence_audit") or {}),
+        "timeseries_candidate_audit": dict(
+            derived.get("timeseries_candidate_audit") or {}
+        ),
+        "latest_snapshot_candidate_audit": dict(
+            derived.get("latest_snapshot_candidate_audit") or {}
+        ),
     })
     if derived["missing_evidence"]:
         result["timeseries_reconciliation_status"] = "failed"
@@ -21743,6 +22189,12 @@ def run_current_state_reconciliation(
             timeseries_error = str(exc)
             result["timeseries_reconciliation_status"] = "failed"
             result["failures"].append(f"timeseries reconciliation failed: {exc}")
+        result["timeseries_candidate_audit"]["rpc_submitted_count"] = int(
+            timeseries_summary["candidate_count"]
+        )
+        result["timeseries_candidate_audit"]["owner_rpc_outcomes"] = dict(
+            timeseries_summary
+        )
         timeseries_audit_status = (
             "succeeded"
             if result["timeseries_reconciliation_status"] == "ok"
@@ -21836,7 +22288,8 @@ def run_current_state_reconciliation(
                     "skipped_invalid_current_value_count",
                     "skipped_unsupported_pollutant_count",
                     "skipped_metadata_unresolved_count", "changed_product_count",
-                    "skipped_unchanged_product_count",
+                    "skipped_unchanged_product_count", "product_success_count",
+                    "product_failure_count",
                 ):
                     aggregate_latest[key] += int(response.get(key) or 0)
                 if response.get("ok") is not True:
@@ -21877,6 +22330,15 @@ def run_current_state_reconciliation(
             result["failures"].append(
                 f"Latest Snapshot reconciliation failed: {exc}"
             )
+        result["latest_snapshot_candidate_audit"][
+            "owner_service_submitted_count"
+        ] = int(aggregate_latest.get("candidate_count") or 0)
+        result["latest_snapshot_candidate_audit"][
+            "owner_service_outcomes"
+        ] = {
+            key: int(value)
+            for key, value in sorted(aggregate_latest.items())
+        }
         latest_audit_status = (
             "succeeded"
             if result["latest_snapshot_reconciliation_status"] == "ok"
@@ -23065,13 +23527,17 @@ def run_v2_integrity_repair_flow(
             log=log,
             require_remote_state=not dry_run,
         )
-    repaired_current_state_scopes = [
+    all_observation_repair_entries = [
         entry
         for entry in list(
             observations.get("v2_observation_repair_results") or []
         )
         if isinstance(entry, Mapping)
-        and str(entry.get("status") or "") == "ok"
+    ]
+    repaired_current_state_scopes = [
+        entry
+        for entry in all_observation_repair_entries
+        if str(entry.get("status") or "") == "ok"
     ]
     repaired_current_state_keys = {
         (str(entry.get("day_utc") or ""), int(entry.get("connector_id") or 0))
@@ -23093,6 +23559,10 @@ def run_v2_integrity_repair_flow(
         dry_run=dry_run,
         final_verification=final_verification,
         log=log,
+        dedicated_partition_entries=(
+            all_observation_repair_entries
+            if dedicated_sos_historical_replacement else None
+        ),
     )
     current_state_reconciliation["latest_snapshot_auth_preflight"] = dict(
         auth_preflight
@@ -25589,8 +26059,11 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- Latest Snapshot status: {current_state.get('latest_snapshot_reconciliation_status') or '(none)'}",
                 f"- Overall status: {current_state.get('overall_status') or '(none)'}",
                 f"- Durable target statuses: {json.dumps(current_state.get('target_audit_statuses') or {}, sort_keys=True)}",
-                f"- Raw latest candidates: {int(current_state.get('candidate_count') or 0)}",
-                f"- Latest Snapshot source rows: {int(current_state.get('latest_snapshot_candidate_count') or 0)}",
+                f"- Timeseries candidates: {int(current_state.get('candidate_count') or 0)}",
+                f"- Latest Snapshot candidates: {int(current_state.get('latest_snapshot_candidate_count') or 0)}",
+                f"- Verified evidence: {json.dumps(current_state.get('evidence_audit') or {}, sort_keys=True)}",
+                f"- Timeseries candidate audit: {json.dumps(current_state.get('timeseries_candidate_audit') or {}, sort_keys=True)}",
+                f"- Latest Snapshot candidate audit: {json.dumps(current_state.get('latest_snapshot_candidate_audit') or {}, sort_keys=True)}",
                 f"- Candidate range: {current_state.get('candidate_observed_at_min') or '(none)'} to {current_state.get('candidate_observed_at_max') or '(none)'}",
                 f"- Failures: {json.dumps(current_state.get('failures') or [], sort_keys=True)}",
                 *(
@@ -25612,8 +26085,11 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Latest Snapshot status: {reported_current_state.get('latest_snapshot_reconciliation_status') or '(none)'}",
             f"- Overall status: {reported_current_state.get('overall_status') or '(none)'}",
             f"- Durable target statuses: {json.dumps(reported_current_state.get('target_audit_statuses') or {}, sort_keys=True)}",
-            f"- Raw latest candidates: {int(reported_current_state.get('candidate_count') or 0)}",
-            f"- Latest Snapshot source rows: {int(reported_current_state.get('latest_snapshot_candidate_count') or 0)}",
+            f"- Timeseries candidates: {int(reported_current_state.get('candidate_count') or 0)}",
+            f"- Latest Snapshot candidates: {int(reported_current_state.get('latest_snapshot_candidate_count') or 0)}",
+            f"- Verified evidence: {json.dumps(reported_current_state.get('evidence_audit') or {}, sort_keys=True)}",
+            f"- Timeseries candidate audit: {json.dumps(reported_current_state.get('timeseries_candidate_audit') or {}, sort_keys=True)}",
+            f"- Latest Snapshot candidate audit: {json.dumps(reported_current_state.get('latest_snapshot_candidate_audit') or {}, sort_keys=True)}",
             f"- Failures: {json.dumps(reported_current_state.get('failures') or [], sort_keys=True)}",
             *(
                 ["- Recovery: correct the cause and start a new appropriately scoped Integrity run."]
