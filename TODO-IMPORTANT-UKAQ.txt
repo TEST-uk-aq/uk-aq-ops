@@ -1,0 +1,397 @@
+Yes. The Google Cloud Scheduler triggers can now be retired from the five TEST connector-ingest deployment workflows.
+
+Four workflows default their scheduler flag to `true`; Sensor.Community creates or updates its trigger unconditionally. Merely setting repository variables to `false` would therefore be incomplete, particularly for Sensor.Community.
+
+## 1. Deployment workflows to amend
+
+### `.github/workflows/uk_aq_blondon_nodes_cloud_run_deploy.yml`
+
+Delete these environment entries:
+
+```yaml
+SCHEDULER_ENABLED:
+SCHEDULER_JOB_NAME:
+SCHEDULER_CRON:
+SCHEDULER_TIMEZONE:
+SCHEDULER_MAX_RETRY_ATTEMPTS:
+SCHEDULER_ATTEMPT_DEADLINE:
+SCHEDULER_SERVICE_ACCOUNT:
+```
+
+Delete the entire step beginning:
+
+```yaml
+- name: Ensure Cloud Scheduler trigger exists
+```
+
+and ending immediately before:
+
+```yaml
+- name: Reconcile Cloud Run URL in ingest scheduler D1
+```
+
+Keep the D1 reconciliation step. It now represents the real scheduler ownership.
+
+### `.github/workflows/uk_aq_blondon_communities_cloud_run_deploy.yml`
+
+Make the same change:
+
+```yaml
+SCHEDULER_ENABLED:
+SCHEDULER_JOB_NAME:
+SCHEDULER_CRON:
+SCHEDULER_TIMEZONE:
+SCHEDULER_MAX_RETRY_ATTEMPTS:
+SCHEDULER_ATTEMPT_DEADLINE:
+SCHEDULER_SERVICE_ACCOUNT:
+```
+
+Delete:
+
+```yaml
+- name: Ensure Cloud Scheduler trigger exists
+```
+
+Keep:
+
+```yaml
+- name: Reconcile Cloud Run URL in ingest scheduler D1
+```
+
+### `.github/workflows/uk_aq_sos_cloud_run_deploy.yml`
+
+Delete these entries:
+
+```yaml
+SCHEDULER_ENABLED:
+SCHEDULER_JOB_NAME:
+SCHEDULER_CRON:
+SCHEDULER_TIMEZONE:
+SCHEDULER_MAX_RETRY_ATTEMPTS:
+SCHEDULER_SERVICE_ACCOUNT:
+```
+
+Delete:
+
+```yaml
+- name: Ensure Cloud Scheduler trigger exists
+```
+
+Keep the D1 reconciliation step.
+
+### `.github/workflows/uk_aq_openaq_cloud_run_deploy.yml`
+
+Delete:
+
+```yaml
+SCHEDULER_ENABLED:
+SCHEDULER_JOB_NAME:
+SCHEDULER_CRON:
+SCHEDULER_TIMEZONE:
+SCHEDULER_MAX_RETRY_ATTEMPTS:
+SCHEDULER_SERVICE_ACCOUNT:
+```
+
+Delete the entire:
+
+```yaml
+- name: Ensure Cloud Scheduler safety trigger exists
+```
+
+OpenAQ has one additional amendment. Change:
+
+```bash
+task_invoker_sa="${TASK_INVOKER_SERVICE_ACCOUNT:-${SCHEDULER_SERVICE_ACCOUNT:-${JOB_SERVICE_ACCOUNT}}}"
+```
+
+to:
+
+```bash
+task_invoker_sa="${TASK_INVOKER_SERVICE_ACCOUNT:-${JOB_SERVICE_ACCOUNT}}"
+```
+
+Before removing the scheduler service-account variable, check whether its current value is deliberately being used for Cloud Tasks. If so, copy that value into:
+
+```text
+GCP_OPENAQ_TASK_INVOKER_SERVICE_ACCOUNT
+```
+
+The OpenAQ Cloud Tasks queue and self-created one-off tasks must remain. Only the redundant GCP **safety scheduler** is being retired. Cloudflare already owns the 30-minute safety trigger.
+
+### `.github/workflows/uk_aq_scomm_cloud_run_deploy.yml`
+
+This workflow has no scheduler variables. Its scheduler settings are hardcoded.
+
+Delete the entire step:
+
+```yaml
+- name: Ensure Cloud Scheduler trigger exists
+```
+
+That block hardcodes:
+
+```text
+job:     uk-aq-scomm-trigger
+cron:    */2 * * * *
+timezone: Etc/UTC
+```
+
+Keep the D1 reconciliation step immediately following it.
+
+## 2. Configuration file to amend
+
+Amend:
+
+```text
+config/uk_aq_github_env_targets.csv
+```
+
+Remove only rows matching these prefixes:
+
+```text
+GCP_BLONDON_NODES_SCHEDULER_
+GCP_BLONDON_COMMUNITIES_SCHEDULER_
+GCP_SOS_SCHEDULER_
+GCP_OPENAQ_SCHEDULER_
+```
+
+An efficient local command would be:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+
+path = Path("config/uk_aq_github_env_targets.csv")
+prefixes = (
+    "GCP_BLONDON_NODES_SCHEDULER_",
+    "GCP_BLONDON_COMMUNITIES_SCHEDULER_",
+    "GCP_SOS_SCHEDULER_",
+    "GCP_OPENAQ_SCHEDULER_",
+)
+
+lines = path.read_text(encoding="utf-8").splitlines()
+kept = [
+    line for line in lines
+    if not any(line.startswith(prefix) for prefix in prefixes)
+]
+path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+PY
+```
+
+Do not broadly remove all `GCP_*_SCHEDULER_*` rows because the same file also contains unrelated maintenance and operational services.
+
+No change is needed to:
+
+```text
+scripts/uk_aq_sync_github_secrets.sh
+```
+
+It reads the target CSV generically and does not hardcode the connector scheduler variables.
+
+## 3. Documentation to amend
+
+This changes scheduling ownership, so the system contract should record it.
+
+### `TEST-uk-aq/uk-aq-ops/system_docs/ingest/contract.md`
+
+Add a section such as:
+
+```markdown
+## Connector ingest scheduler ownership
+
+For TEST Cloud Run connector-ingest services, recurring external dispatch is
+owned by the Cloudflare ingest scheduler and its D1 job configuration.
+
+Cloud Run deployment workflows MUST:
+
+- deploy and configure the service;
+- preserve authenticated application-level dispatch through the shared secret;
+- reconcile the deployed Cloud Run URL into the corresponding D1 job.
+
+Cloud Run deployment workflows MUST NOT:
+
+- create, update, resume or otherwise manage Google Cloud Scheduler jobs for
+  connector ingestion.
+
+The database value `scheduler_backend = 'google_cloud_run'` identifies the
+execution backend. It does not mean that Google Cloud Scheduler owns dispatch.
+
+OpenAQ retains its worker-created one-off Cloud Tasks as its primary
+self-scheduling path. The Cloudflare OpenAQ safety job remains the external
+recovery trigger.
+```
+
+The current contract does not yet define external scheduler ownership.
+
+### `TEST-uk-aq/uk-aq-ops/system_docs/ingest/sos/operations.md`
+
+Change the workflow ownership list from:
+
+```text
+Cloud Scheduler creation or update
+Cloud Run invocation permissions
+```
+
+to something such as:
+
+```text
+Cloudflare scheduler D1 service-URL reconciliation
+Cloud Run transport and application-level dispatch configuration
+```
+
+Replace the scheduling path:
+
+```text
+Google Cloud Scheduler
+  -> Cloud Run service
+```
+
+with:
+
+```text
+Cloudflare ingest scheduler
+  -> D1 job configuration
+  -> Cloud Run service
+```
+
+The current authoritative SOS operations document explicitly assigns scheduling to Google Cloud Scheduler, so it would become inaccurate without this amendment.
+
+### `TEST-uk-aq/uk-aq-ops/system_docs/ingest/README.md`
+
+Recommended small update:
+
+* list all five connector Cloud Run deployment workflows;
+* list `scripts/cloudflare/uk_aq_reconcile_ingest_scheduler_url.sh`;
+* state that Cloudflare owns recurring dispatch while the ingest repo owns service deployment.
+
+The current inventory lists only the SOS deployment workflow.
+
+### `workers/uk_aq_blondon_nodes_cloud_run/README.md`
+
+Change:
+
+```text
+The normal Cloud Scheduler request body is {}
+```
+
+to:
+
+```text
+The normal Cloudflare scheduler request body is {}
+```
+
+That is the only worker README I found with a directly stale provider reference.
+
+## 4. GCP resources to delete
+
+After the amended workflows are on `main`, delete these five Cloud Scheduler jobs:
+
+```text
+uk-aq-blondon-nodes-trigger
+uk-aq-blondon-communities-trigger
+uk-aq-sos-trigger
+uk-aq-openaq-safety-trigger
+uk-aq-scomm-trigger
+```
+
+First confirm the actual names, because four can be overridden by repository variables:
+
+```bash
+PROJECT_ID="your-test-gcp-project"
+REGION="europe-west2"
+
+gcloud scheduler jobs list \
+  --project "${PROJECT_ID}" \
+  --location "${REGION}" \
+  --format='table(name.basename(),state,schedule,httpTarget.uri)'
+```
+
+Then delete:
+
+```bash
+for job in \
+  uk-aq-blondon-nodes-trigger \
+  uk-aq-blondon-communities-trigger \
+  uk-aq-sos-trigger \
+  uk-aq-openaq-safety-trigger \
+  uk-aq-scomm-trigger
+do
+  gcloud scheduler jobs delete "${job}" \
+    --project "${PROJECT_ID}" \
+    --location "${REGION}" \
+    --quiet
+done
+```
+
+## 5. GitHub repository variables to delete
+
+Only after the workflow code no longer references them, delete:
+
+```text
+GCP_BLONDON_NODES_SCHEDULER_ATTEMPT_DEADLINE
+GCP_BLONDON_NODES_SCHEDULER_CRON
+GCP_BLONDON_NODES_SCHEDULER_ENABLED
+GCP_BLONDON_NODES_SCHEDULER_JOB_NAME
+GCP_BLONDON_NODES_SCHEDULER_MAX_RETRY_ATTEMPTS
+GCP_BLONDON_NODES_SCHEDULER_SERVICE_ACCOUNT
+GCP_BLONDON_NODES_SCHEDULER_TIMEZONE
+
+GCP_BLONDON_COMMUNITIES_SCHEDULER_ATTEMPT_DEADLINE
+GCP_BLONDON_COMMUNITIES_SCHEDULER_CRON
+GCP_BLONDON_COMMUNITIES_SCHEDULER_ENABLED
+GCP_BLONDON_COMMUNITIES_SCHEDULER_JOB_NAME
+GCP_BLONDON_COMMUNITIES_SCHEDULER_MAX_RETRY_ATTEMPTS
+GCP_BLONDON_COMMUNITIES_SCHEDULER_SERVICE_ACCOUNT
+GCP_BLONDON_COMMUNITIES_SCHEDULER_TIMEZONE
+
+GCP_SOS_SCHEDULER_CRON
+GCP_SOS_SCHEDULER_ENABLED
+GCP_SOS_SCHEDULER_JOB_NAME
+GCP_SOS_SCHEDULER_MAX_RETRY_ATTEMPTS
+GCP_SOS_SCHEDULER_SERVICE_ACCOUNT
+GCP_SOS_SCHEDULER_TIMEZONE
+
+GCP_OPENAQ_SCHEDULER_CRON
+GCP_OPENAQ_SCHEDULER_ENABLED
+GCP_OPENAQ_SCHEDULER_JOB_NAME
+GCP_OPENAQ_SCHEDULER_MAX_RETRY_ATTEMPTS
+GCP_OPENAQ_SCHEDULER_SERVICE_ACCOUNT
+GCP_OPENAQ_SCHEDULER_TIMEZONE
+```
+
+Also remove these keys from your local `.env` and Ops environment master catalogue where present, otherwise they remain misleading even though the target CSV no longer syncs them.
+
+## Do not delete
+
+Keep all of these:
+
+* the five Cloud Run services;
+* their runtime service accounts;
+* `GCP_OPENAQ_TASK_QUEUE_ID` and the OpenAQ Cloud Tasks queue;
+* `GCP_OPENAQ_TASK_INVOKER_SERVICE_ACCOUNT`;
+* `SCHEDULER_D1_JOB_KEY` in each workflow;
+* all five Cloudflare D1 jobs;
+* `CLOUDFLARE_ACCOUNT_ID`;
+* `CLOUDFLARE_API_TOKEN`;
+* `UK_AQ_EDGE_UPSTREAM_SECRET`;
+* `scripts/cloudflare/uk_aq_reconcile_ingest_scheduler_url.sh`;
+* Pub/Sub topics and publisher permissions;
+* Artifact Registry and Secret Manager resources;
+* `scheduler_backend='google_cloud_run'` in the connectors table.
+
+Do not delete service accounts merely because they were used by GCP Scheduler. The workflows normally fall back to the Cloud Run runtime account, and OpenAQ may also have reused its scheduler account for Cloud Tasks.
+
+## Recommended order
+
+1. Confirm the five Cloudflare D1 jobs are enabled and have current Cloud Run URLs.
+2. Amend the five deployment workflows.
+3. Amend the target CSV and documentation.
+4. Push to TEST `main`.
+5. Allow all five deployment workflows to complete. Changing each workflow file will itself match that workflow’s push path and cause a redeployment.
+6. Confirm each workflow completes its D1 URL reconciliation.
+7. Delete the five GCP Cloud Scheduler jobs.
+8. Delete the obsolete GitHub variables.
+9. Observe one normal Cloudflare scheduling cycle for each connector.
+10. Confirm Cloud Run request logs no longer contain `Google-Cloud-Scheduler` requests.
+
+No archive copy is required for these workflow, CSV or documentation edits. Under the project rules, Git history is sufficient for this small configuration change.

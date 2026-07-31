@@ -366,3 +366,84 @@ Both the single-pollutant command and the multi-pollutant range command are now 
 - Run the three functional acceptance commands in order.
 - Take a fresh Dropbox history backup after meaningful repair work as the normal recovery copy.
 - Do not deploy or run this path against LIVE as part of this change.
+
+## 31 July 2026 protected-connector preservation amendment
+
+The 17 June through 30 July CIC-Test SOS run completed construction of all 176 selected connector `1` partitions, then failed during local canonical proposal preparation before the first R2 mutation. The observation metadata planner rebuilt the shared day hierarchy and passed it to the targeted index builder. That builder correctly traversed every connector advertised by the day and failed closed when the existing connector `7` parent referenced this missing child:
+
+```text
+history/v2/observations/day_utc=2026-07-12/connector_id=7/pollutant_code=humidity/manifest.json
+```
+
+The failure surfaced as `required_pollutant_index_unreadable`. Catching that final error would have left a dangling reference in the proposal, so the correction is earlier in the dedicated preservation graph.
+
+### Protected connector configuration
+
+`UK_AQ_HISTORY_INTEGRITY_PROTECTED_CONNECTOR_IDS` now owns the dedicated-route protection policy. Its repository default is `1`. An explicit value is parsed as a unique comma-separated set of positive integer connector IDs and sorted deterministically, so a deliberate future value of `1,2,3` needs no preservation-algorithm change. Explicit empty, duplicate or invalid values fail. A write-enabled dedicated replacement also fails before mutation if any selected mutation connector is outside the protected set.
+
+The resolved `protected_connector_ids` and `selected_mutation_connector_ids` are recorded in route evidence, run state, the JSON report and the human-readable report.
+
+### Omission and mutation behaviour
+
+Only `dedicated_sos_historical_observation_replacement` uses the warning-and-quarantine policy. Generic Integrity and the shared targeted index builder retain their existing fail-closed behaviour.
+
+For each affected dedicated day, the planner now inspects the existing referenced connector graph before mutation. Protected connector children remain strict. For an unreadable or invalid unprotected pollutant child, it records a structured warning, rebuilds that connector parent from its remaining readable and valid referenced children, and rebuilds the shared day and latest discovery metadata without the broken reference. If no safe connector parent can be produced, the existing connector parent is left untouched and that connector is omitted from the exact dedicated day publication set.
+
+The dedicated day finalizer publishes the exact prevalidated proposed connector set. It does not union quarantined connectors back in from the old live day and does not fall back to a broad connector listing. Generic day finalisation still uses its existing bounded merge behaviour.
+
+An omitted unprotected child is never a deletion authority. The final dedicated apply guard proves that each omitted child has no proposed object overwrite and is outside every exact tombstone prefix, that every declared parent rewrite is present and permitted, and that no proposed parent body contains the omitted object key. Connector `7` humidity Parquet, its missing/broken manifest location and all other child objects remain untouched. Healthy connector `7` siblings remain dependencies of the rebuilt connector parent.
+
+Machine-readable audit fields are:
+
+```text
+protected_connector_ids
+selected_mutation_connector_ids
+protected_connector_validation_status
+healthy_unprotected_children_preserved
+unprotected_pollutant_omission_count
+unprotected_connector_omission_count
+unprotected_day_omission_count
+unprotected_omissions
+permitted_parent_metadata_rewrites
+```
+
+Each omission records the known day, connector, pollutant and object key, classification, reason, omission level, actual parent metadata rewrites, and explicit `child_deleted=false`, `child_overwritten=false`, and `child_tombstoned=false` evidence. The human-readable report presents these as prominent warnings. These warnings increase `warnings_count` without making an otherwise fully verified run fail.
+
+### Files changed for this amendment
+
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`: protected-set parsing, pre-mutation scope validation, run-state/report propagation, warning accounting and human-readable omission reporting.
+- `scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs`: dedicated referenced-graph inspection, narrow unprotected pollutant/connector quarantine, deterministic parent rebuilding and complete preservation audit.
+- `scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`: final no-mutation/no-dangling-reference proof and exact dedicated day finalisation.
+- `env-vars-master.csv`: repository default and operational meaning for the protected connector setting.
+- `tests/test_uk_aq_history_integrity_repair_planning.py`: compact default/custom/empty/invalid/outside-protected configuration checks.
+- `scripts/backup_r2/tests/uk_aq_execute_v2_observations_repair.test.mjs`: missing unprotected child warning/omission with healthy sibling retention and protected equivalent blocking.
+- `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`: protected audit scope and exact dedicated day-publication safety.
+
+The active non-test implementation snapshots taken before this amendment are under `archive/2026-07-31/`. No `system_docs/` file was changed.
+
+### Focused validation
+
+- Python compilation of the touched implementation and focused Python test: passed.
+- Dedicated preservation test: passed for connector `7` humidity omission, healthy connector `7` sibling retention, false delete/overwrite/tombstone evidence, and equivalent connector `1` failure.
+- Protected configuration test: passed for default `[1]`, deterministic `1,2,3`, explicit empty/invalid/duplicate rejection and selected-outside-protected rejection.
+- Direct canonical apply safety checks: passed for the dedicated proposal scope and exact day finalizer with no broad listing.
+- `git diff --check`: passed.
+
+No Integrity process, R2, Dropbox, Supabase, GCP or other external service was accessed during implementation or validation.
+
+### Exact CIC-Test rerun
+
+```bash
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
+  --env CIC-Test \
+  --profile manual \
+  --source sos \
+  --from-day 2026-06-17 \
+  --to-day 2026-07-30 \
+  --history-version v2 \
+  --run-backfill \
+  --repair-pollutants pm25,pm10,no2,o3 \
+  --allow-stale-dropbox
+```
+
+Expected audit: protected connector IDs `[1]`; connector `7` humidity reported as an unprotected pollutant omission warning; its child objects untouched; connector `1` completes ordered apply and final verification; Timeseries and Latest Snapshot reconciliation run; overall status may be `ok` with a non-zero warning count.
