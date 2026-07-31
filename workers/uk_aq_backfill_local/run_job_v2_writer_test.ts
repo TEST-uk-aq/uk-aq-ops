@@ -110,7 +110,7 @@ Deno.test("UK-AIR concentration-unit aliases preserve scale and reject a differe
   );
 });
 
-Deno.test("dedicated SOS acquisition opens one annual CSV once for a 2-day x 2-pollutant scope", async () => {
+Deno.test("dedicated SOS acquisition crosses a month once for a 3-day x 2-pollutant scope", async () => {
   const tempDir = await Deno.makeTempDir();
   const acquisitionRoot = `${tempDir}/sos-source-cache`;
   const no2Label = "Nitrogen dioxide (Hourly measured)";
@@ -118,8 +118,9 @@ Deno.test("dedicated SOS acquisition opens one annual CSV once for a 2-day x 2-p
   const csvText = [
     "All Data GMT hour ending",
     `Date,time,"${no2Label}",status,unit,"${pm25Label}",status,unit`,
-    "01-06-2026,01:00,10,P,ugm-3,20,R,ugm-3",
-    "02-06-2026,01:00,,,,21,P,ugm-3",
+    "30-06-2026,01:00,10,P,ugm-3,20,R,ugm-3",
+    "01-07-2026,01:00,,,,21,P,ugm-3",
+    "02-07-2026,01:00,12,P,ugm-3,,,,",
   ].join("\n");
   const sourceReads = new Map<string, number>();
   const registryEntries = new Map([
@@ -165,14 +166,14 @@ Deno.test("dedicated SOS acquisition opens one annual CSV once for a 2-day x 2-p
       station_ref: "station-abc",
       timeseries_ref: "timeseries-abc-pm25",
       valid_from_day_utc: "2020-01-01",
-      valid_to_day_utc: "2026-06-01",
+      valid_to_day_utc: "2026-06-30",
     },
   ];
   try {
     const manifest = await buildDedicatedSosSourceAcquisition({
       root: acquisitionRoot,
       runId: "focused-run",
-      requestedDays: ["2026-06-01", "2026-06-02"],
+      requestedDays: ["2026-06-30", "2026-07-01", "2026-07-02"],
       requestedPollutants: ["no2", "pm25"],
       sourceRoot: "/virtual-sos",
       sourceReader: (sourcePath) => {
@@ -199,26 +200,38 @@ Deno.test("dedicated SOS acquisition opens one annual CSV once for a 2-day x 2-p
       registryEntries,
     });
     assertEquals(manifest.acquisition_status, "complete");
-    assertEquals(manifest.partition_dataset_count, 4);
+    assertEquals(manifest.selected_from_day, "2026-06-30");
+    assertEquals(manifest.selected_to_day, "2026-07-02");
+    assertEquals(manifest.selected_days, [
+      "2026-06-30",
+      "2026-07-01",
+      "2026-07-02",
+    ]);
+    assertEquals(manifest.requested_pollutants, ["no2", "pm25"]);
+    assertEquals(manifest.partition_dataset_count, 6);
     assertEquals(manifest.unique_source_file_count, 1);
     assertEquals(manifest.source_files_opened, 1);
     assertEquals(manifest.maximum_source_file_open_count, 1);
     assertEquals(Array.from(sourceReads.values()), [1]);
     assertEquals(manifest.partition_row_counts, {
-      "2026-06-01|no2": 1,
-      "2026-06-01|pm25": 1,
-      "2026-06-02|no2": 0,
-      "2026-06-02|pm25": 0,
+      "2026-06-30|no2": 1,
+      "2026-06-30|pm25": 1,
+      "2026-07-01|no2": 0,
+      "2026-07-01|pm25": 0,
+      "2026-07-02|no2": 1,
+      "2026-07-02|pm25": 0,
     });
-    const partitionFiles = manifest.partition_files as Array<Record<string, unknown>>;
-    assertEquals(new Set(partitionFiles.map((entry) => entry.path)).size, 4);
-    assertEquals(new Set(partitionFiles.map((entry) => entry.sha256)).size, 4);
+    const partitionFiles = manifest.partition_files as Array<
+      Record<string, unknown>
+    >;
+    assertEquals(new Set(partitionFiles.map((entry) => entry.path)).size, 6);
+    assertEquals(new Set(partitionFiles.map((entry) => entry.sha256)).size, 6);
     const emptyPartition = partitionFiles.find((entry) =>
-      entry.day_utc === "2026-06-02" && entry.pollutant_code === "no2"
+      entry.day_utc === "2026-07-01" && entry.pollutant_code === "no2"
     );
     assertEquals(emptyPartition?.row_count, 0);
     const unmappedPartition = partitionFiles.find((entry) =>
-      entry.day_utc === "2026-06-02" && entry.pollutant_code === "pm25"
+      entry.day_utc === "2026-07-01" && entry.pollutant_code === "pm25"
     );
     const unmappedPayload = JSON.parse(
       await Deno.readTextFile(String(unmappedPartition?.path)),
@@ -228,8 +241,51 @@ Deno.test("dedicated SOS acquisition opens one annual CSV once for a 2-day x 2-p
       unmappedPayload.source_file_results[0].parsed.missing_binding_rows,
       1,
     );
-    assertEquals(manifest.detector_rescans_avoided, 4);
-    assertEquals(manifest.proposal_builder_rescans_avoided, 4);
+    assertEquals(manifest.detector_rescans_avoided, 6);
+    assertEquals(manifest.proposal_builder_rescans_avoided, 6);
+    assertEquals(
+      (await Array.fromAsync(Deno.readDir(acquisitionRoot)))
+        .filter((entry) => entry.name === "acquisition-manifest.json").length,
+      1,
+    );
+    let secondAcquisitionError = "";
+    try {
+      await buildDedicatedSosSourceAcquisition({
+        root: acquisitionRoot,
+        runId: "focused-run",
+        requestedDays: ["2026-06-30", "2026-07-01", "2026-07-02"],
+        requestedPollutants: ["no2", "pm25"],
+        sourceRoot: "/virtual-sos",
+        sourceReader: () => csvText,
+        sourceStat: () => ({ size: csvText.length, mtimeMs: 1 }),
+        bridge: {
+          connector_id: 1,
+          mapping_identity: "sos_station_timeseries_site_refs_snapshot",
+          mapping_hash: "a".repeat(64),
+          content_hash: "b".repeat(64),
+          bridge_artifact_row_count: 2,
+          selected_bridge_row_count: 2,
+          rows: bridgeRows,
+        },
+        propertyMappings: [
+          propertyMapping(no2Label, "no2"),
+          propertyMapping(pm25Label, "pm25"),
+        ],
+        registryEntries,
+      });
+    } catch (error) {
+      secondAcquisitionError = String(error);
+    }
+    if (
+      !secondAcquisitionError.includes(
+        "sos_source_acquisition_root_already_exists",
+      )
+    ) {
+      throw new Error(
+        `expected existing-root guard, got: ${secondAcquisitionError}`,
+      );
+    }
+    assertEquals(Array.from(sourceReads.values()), [1]);
   } finally {
     await Deno.remove(tempDir, { recursive: true });
   }

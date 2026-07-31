@@ -1,5 +1,53 @@
 # SOS historical Integrity replacement implementation report
 
+## 31 July 2026 cross-month run-scoped acquisition correction
+
+### Confirmed root cause and correction
+
+The dedicated SOS coordinator already issued one acquisition request for the complete selected range, but `scripts/uk_aq_backfill_local.sh` unconditionally divided every request into calendar-month windows. The first worker invocation created and completed the immutable run-owned acquisition root; a second invocation for the next month then correctly failed with `sos_source_acquisition_root_already_exists`. The worker root guard, exclusive partition writes and completed-manifest hash behaviour were correct and remain unchanged.
+
+The local wrapper now recognizes `UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE=acquire` and supplies exactly one execution window containing the complete requested `from` and `to` dates. Every non-acquisition mode continues to use the existing calendar-month generator. A calendar-year boundary requires no special case because acquisition mode bypasses the generator for the whole range.
+
+The durable dedicated-run audit and Markdown summary now explicitly record the complete range and pollutant set, acquisition invocation and root-creation counts, acquisition run/root/manifest identity and status, selected day/pollutant/partition counts, source years, and calendar-month/year boundary flags. These values are derived only after the existing completed acquisition manifest has passed its scope, identity, file, partition and completion-hash validation; the hashed manifest schema was not redesigned.
+
+### Focused regression evidence
+
+The focused `2026-06-30` through `2026-07-02`, `no2,pm25` regression establishes:
+
+- acquisition mode invokes the worker once with the complete three-day range;
+- the acquisition owner creates one completed manifest containing all three selected days and six day/pollutant partition datasets;
+- the one relevant annual source CSV is opened once;
+- a second acquisition against that root is rejected by the unchanged existing-root guard before reopening the source;
+- acquisition-only wrapper execution uses a no-write runner and reports `objects_written_r2=0`;
+- the same ordinary non-acquisition range still invokes two windows: `2026-06-30..2026-06-30` and `2026-07-01..2026-07-02`.
+
+### Files changed for this correction
+
+- `scripts/uk_aq_backfill_local.sh`
+  - bypasses monthly window splitting only for dedicated SOS acquisition mode.
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
+  - adds the contract-required run audit fields and summary output after validated acquisition completion.
+- `tests/uk_aq_backfill_local_acquisition_windows.test.mjs`
+  - covers the acquisition and ordinary wrapper window contracts without external writes.
+- `workers/uk_aq_backfill_local/run_job_v2_writer_test.ts`
+  - extends the existing acquisition regression across the June/July boundary and verifies one manifest, six partitions, one source open and the retained root guard.
+- `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`
+  - verifies the new successful-acquisition audit fields through the existing dedicated replacement path.
+- this implementation report.
+
+Repository-required pre-edit snapshots were added under `archive/2026-07-31/` for the two changed active implementation files. No active `system_docs/` file, schema, worker acquisition implementation, cloud resource or operational configuration changed.
+
+### Focused validation
+
+- Wrapper Bash syntax: passed.
+- Integrity coordinator Python compilation: passed.
+- Cross-month wrapper acquisition/ordinary-window regression: passed.
+- Cross-month acquisition worker regression: passed (`1` test; `17` filtered out).
+- Existing dedicated replacement coordinator regression with audit assertions: passed (`1` test).
+- `git diff --check`: passed.
+
+An optional whole-file `deno fmt --check` was not used as a gate because the existing worker test file contains broad pre-existing formatting differences. The new block was aligned locally; no unrelated bulk reformat was applied.
+
 ## 31 July 2026 current-state reconciliation correction
 
 ### Confirmed root cause

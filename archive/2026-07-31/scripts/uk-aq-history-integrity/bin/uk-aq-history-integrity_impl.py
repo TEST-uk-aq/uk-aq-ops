@@ -18161,43 +18161,8 @@ def run_v2_gap_backfills(
                 selected_pollutants=selected_pollutants,
             )
         )
-        selected_day_values = [
-            dt.date.fromisoformat(value) for value in selected_dates
-        ]
-        selected_months = {
-            (value.year, value.month) for value in selected_day_values
-        }
-        selected_years = sorted({value.year for value in selected_day_values})
         metrics["source_acquisition"] = dedicated_source_acquisition
         metrics.update({
-            "source_acquisition_invocation_count": 1,
-            "source_acquisition_root_creation_count": 1,
-            "source_acquisition_run_id": run_id,
-            "source_acquisition_root": str(acquisition_root),
-            "source_acquisition_manifest_status": (
-                dedicated_source_acquisition.get("acquisition_status")
-            ),
-            "source_acquisition_manifest_path": (
-                dedicated_source_acquisition.get("path")
-            ),
-            "source_acquisition_complete_from_day_utc": selected_dates[0],
-            "source_acquisition_complete_to_day_utc": selected_dates[-1],
-            "source_acquisition_selected_pollutants": selected_pollutants,
-            "source_acquisition_selected_day_count": len(selected_dates),
-            "source_acquisition_selected_pollutant_count": len(
-                selected_pollutants
-            ),
-            "source_acquisition_selected_partition_dataset_count": int(
-                dedicated_source_acquisition.get("partition_dataset_count")
-                or 0
-            ),
-            "source_acquisition_source_years": selected_years,
-            "source_acquisition_crossed_calendar_month_boundary": (
-                len(selected_months) > 1
-            ),
-            "source_acquisition_crossed_calendar_year_boundary": (
-                len(selected_years) > 1
-            ),
             "source_acquisition_strategy": dedicated_source_acquisition.get(
                 "acquisition_strategy"
             ),
@@ -23729,57 +23694,6 @@ def run_v2_integrity_repair_flow(
         "source_acquisition_strategy": observations.get(
             "source_acquisition_strategy"
         ),
-        "source_acquisition_invocation_count": observations.get(
-            "source_acquisition_invocation_count"
-        ),
-        "source_acquisition_root_creation_count": observations.get(
-            "source_acquisition_root_creation_count"
-        ),
-        "source_acquisition_run_id": observations.get(
-            "source_acquisition_run_id"
-        ),
-        "source_acquisition_root": observations.get(
-            "source_acquisition_root"
-        ),
-        "source_acquisition_manifest_status": observations.get(
-            "source_acquisition_manifest_status"
-        ),
-        "source_acquisition_manifest_path": observations.get(
-            "source_acquisition_manifest_path"
-        ),
-        "source_acquisition_complete_from_day_utc": observations.get(
-            "source_acquisition_complete_from_day_utc"
-        ),
-        "source_acquisition_complete_to_day_utc": observations.get(
-            "source_acquisition_complete_to_day_utc"
-        ),
-        "source_acquisition_selected_pollutants": observations.get(
-            "source_acquisition_selected_pollutants"
-        ),
-        "source_acquisition_selected_day_count": observations.get(
-            "source_acquisition_selected_day_count"
-        ),
-        "source_acquisition_selected_pollutant_count": observations.get(
-            "source_acquisition_selected_pollutant_count"
-        ),
-        "source_acquisition_selected_partition_dataset_count": (
-            observations.get(
-                "source_acquisition_selected_partition_dataset_count"
-            )
-        ),
-        "source_acquisition_source_years": observations.get(
-            "source_acquisition_source_years"
-        ),
-        "source_acquisition_crossed_calendar_month_boundary": (
-            observations.get(
-                "source_acquisition_crossed_calendar_month_boundary"
-            )
-        ),
-        "source_acquisition_crossed_calendar_year_boundary": (
-            observations.get(
-                "source_acquisition_crossed_calendar_year_boundary"
-            )
-        ),
         "unique_source_file_count": observations.get(
             "unique_source_file_count"
         ),
@@ -26059,24 +25973,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 "### SOS source acquisition",
                 "",
                 f"- Strategy: {repair_flow.get('source_acquisition_strategy') or '(none)'}",
-                f"- Invocation count: {int(repair_flow.get('source_acquisition_invocation_count') or 0)}",
-                f"- Root creation count: {int(repair_flow.get('source_acquisition_root_creation_count') or 0)}",
-                f"- Run identity: {repair_flow.get('source_acquisition_run_id') or '(none)'}",
-                f"- Complete requested range: {repair_flow.get('source_acquisition_complete_from_day_utc') or '(none)'} -> {repair_flow.get('source_acquisition_complete_to_day_utc') or '(none)'}",
-                "- Complete pollutant set: " + json.dumps(
-                    repair_flow.get("source_acquisition_selected_pollutants") or []
-                ),
-                f"- Selected days: {int(repair_flow.get('source_acquisition_selected_day_count') or 0)}",
-                f"- Selected pollutants: {int(repair_flow.get('source_acquisition_selected_pollutant_count') or 0)}",
-                f"- Selected partition datasets: {int(repair_flow.get('source_acquisition_selected_partition_dataset_count') or 0)}",
-                "- Source years: " + json.dumps(
-                    repair_flow.get("source_acquisition_source_years") or []
-                ),
-                f"- Crossed calendar-month boundary: {bool(repair_flow.get('source_acquisition_crossed_calendar_month_boundary'))}",
-                f"- Crossed calendar-year boundary: {bool(repair_flow.get('source_acquisition_crossed_calendar_year_boundary'))}",
-                f"- Acquisition root: {repair_flow.get('source_acquisition_root') or '(none)'}",
-                f"- Manifest: {repair_flow.get('source_acquisition_manifest_path') or '(none)'}",
-                f"- Manifest status: {repair_flow.get('source_acquisition_manifest_status') or '(none)'}",
                 f"- Unique source files: {int(repair_flow.get('unique_source_file_count') or 0)}",
                 f"- Source files opened: {int(repair_flow.get('source_files_opened') or 0)}",
                 f"- Maximum opens per source file: {int(repair_flow.get('maximum_source_file_open_count') or 0)}",
