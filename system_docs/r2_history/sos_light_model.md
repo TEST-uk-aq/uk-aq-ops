@@ -101,9 +101,15 @@ chosen Dropbox day snapshot
 + current-run connector 1 source-built replacements
 ```
 
+The chosen Dropbox baseline identifies the preservation source for any other-connector content that is available. It does not require a selected-day directory or any selected-day object to exist in Dropbox.
+
+If the complete selected day is absent from Dropbox, SOS-light MUST treat the Dropbox contribution for that day as an empty baseline and continue assembling the day from current-run connector `1` source evidence. The final assembled day may therefore contain connector `1` only. Absence of the Dropbox day MUST be recorded as warning or audit evidence, but MUST NOT block a valid connector `1` replacement.
+
+SOS-light MUST NOT invent other connectors or recover their content from live R2 when the Dropbox day is absent.
+
 The assembly order is:
 
-1. start with the available Dropbox observation objects for the selected day;
+1. start with the available Dropbox observation objects for the selected day, or an empty local day when Dropbox has no selected-day objects;
 2. remove the selected connector `1` pollutant subtrees from that local assembly;
 3. insert the complete current-run source-built connector `1` pollutant subtrees;
 4. rebuild connector `1` parent metadata from the final connector `1` child manifests actually present in the assembled tree;
@@ -154,6 +160,8 @@ Where Dropbox contains a usable connector parent, SOS-light MAY carry it into th
 Where a Dropbox connector parent is missing or unusable, SOS-light MAY omit that connector from the rebuilt day parent and record a warning.
 
 Where a Dropbox child is missing or unusable but a parent can be rebuilt safely from the remaining Dropbox children, SOS-light MAY rebuild that parent from the usable local Dropbox children.
+
+Where the entire selected day is absent from Dropbox, there are no other connectors to preserve for that day. This is warning-only and the assembled day may consist solely of the final connector `1` tree.
 
 This best-effort behaviour exists only to produce a complete publishable day around a correct connector `1`. It does not certify other connectors as correct.
 
@@ -208,12 +216,15 @@ The run MUST stop before deletion when connector `1` has any unresolved problem 
 - local proposal consistency;
 - safe complete-day replacement planning.
 
+A missing selected-day directory in Dropbox is not a connector `1` failure and is not blocking.
+
 ### Warning-only
 
 Problems belonging solely to other connectors MUST be warnings.
 
 Examples include:
 
+- an entire selected day being absent from Dropbox;
 - missing Dropbox connector metadata;
 - unusable Dropbox child metadata;
 - incomplete Dropbox content for an unprotected connector;
@@ -260,6 +271,7 @@ Every SOS-light run MUST report:
 - confirmation that no existing live R2 body was used for planning or preservation;
 - complete final connector `1` child set by day;
 - complete final connector set by day;
+- Dropbox selected-day presence or absence by day;
 - Dropbox-only warning and omission counts for other connectors;
 - complete-day delete count and uploaded object count;
 - changed-object verification results;
@@ -272,14 +284,15 @@ Warnings for other connectors MUST be prominent but MAY coexist with overall `st
 
 Before operational CIC-Test execution, use only the smallest targeted checks needed to prove:
 
-1. a selected day is assembled from source plus Dropbox without reading existing live R2 bodies;
-2. the full selected R2 day prefix is the deletion target;
-3. a newly created connector `1` O3 child is included in the rebuilt connector `1` parent even when the old Dropbox parent omitted O3;
-4. connector `1` parent body and dependency evidence describe the same complete final child set;
-5. an unusable other-connector Dropbox item produces a warning and does not block connector `1`;
-6. the final day parent uses the assembled local connector set;
-7. affected indexes are built from the Dropbox baseline plus assembled day, not live R2;
-8. current-state reconciliation starts only after successful replacement verification.
+1. a selected day is assembled from source plus available Dropbox content without reading existing live R2 bodies;
+2. a selected day absent from Dropbox is assembled successfully from connector `1` source evidence and records warning or audit evidence rather than blocking;
+3. the full selected R2 day prefix is the deletion target;
+4. a newly created connector `1` O3 child is included in the rebuilt connector `1` parent even when the old Dropbox parent omitted O3;
+5. connector `1` parent body and dependency evidence describe the same complete final child set;
+6. an unusable other-connector Dropbox item produces a warning and does not block connector `1`;
+7. the final day parent uses the assembled local connector set;
+8. affected indexes are built from the Dropbox baseline plus assembled day, not live R2;
+9. current-state reconciliation starts only after successful replacement verification.
 
 Do not create a broad speculative test suite. Functional validation belongs in real CIC-Test operation.
 
