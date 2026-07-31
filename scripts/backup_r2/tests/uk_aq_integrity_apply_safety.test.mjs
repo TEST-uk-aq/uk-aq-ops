@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   applyValidatedProposal,
+  applySosLightPerDayUnits,
   assertPublicationDependenciesVerified,
   createVerifiedGetBodyCache,
   prepareMergedDayManifest,
@@ -902,6 +903,83 @@ test("SOS-light proposal requires one complete-day tombstone and complete local 
     adapters: { deleteObjects: remote, getObject: remote, listAllObjects: remote, putObject: remote },
   }), /dependency identity is invalid|manifest_contract/);
   assert.equal(remoteCalls, 0);
+});
+
+test("SOS-light first-day upload failure leaves every later day undeleted", async () => {
+  const days = ["2026-07-29", "2026-07-30"];
+  const dayGroups = new Map(days.map((dayUtc) => [dayUtc, [
+    { kind: "delete", key: `history/v2/observations/day_utc=${dayUtc}` },
+    { kind: "put", key: `history/v2/observations/day_utc=${dayUtc}/manifest.json` },
+  ]]));
+  const connectorGroups = new Map(days.map((dayUtc) => [`${dayUtc}|1`, {
+    day_utc: dayUtc,
+    connector_id: 1,
+    operations: [{ kind: "put", key: `history/v2/observations/day_utc=${dayUtc}/connector_id=1/manifest.json` }],
+  }]));
+  const events = [];
+  const publicationState = {};
+  await assert.rejects(applySosLightPerDayUnits({
+    selectedDays: days,
+    dayGroups,
+    connectorGroups,
+    publicationState,
+    applyDeletion: async ({ dayUtc }) => events.push(`delete ${dayUtc}`),
+    applyConnectorGroup: async (group) => {
+      events.push(`upload ${group.day_utc}`);
+      throw new Error("simulated first-day upload failure");
+    },
+    applyDayFinalization: async ({ dayUtc }) => events.push(`day-parent ${dayUtc}`),
+    publishAffectedIndexes: async () => events.push("publish indexes"),
+  }), /simulated first-day upload failure/);
+  assert.deepEqual(events, [
+    "delete 2026-07-29",
+    "upload 2026-07-29",
+  ]);
+  assert.equal(publicationState["2026-07-29"].deletion_verified, true);
+  assert.equal(publicationState["2026-07-29"].status, "failed");
+  assert.equal(publicationState["2026-07-29"].completed_publication_level,
+    "complete_day_deletion_verified");
+  assert.equal(Object.hasOwn(publicationState, "2026-07-30"), false);
+});
+
+test("SOS-light completes and verifies each day before deleting the next and publishes indexes last", async () => {
+  const days = ["2026-07-29", "2026-07-30"];
+  const dayGroups = new Map(days.map((dayUtc) => [dayUtc, [
+    { kind: "delete", key: `history/v2/observations/day_utc=${dayUtc}` },
+    { kind: "put", key: `history/v2/observations/day_utc=${dayUtc}/manifest.json` },
+  ]]));
+  const connectorGroups = new Map(days.map((dayUtc) => [`${dayUtc}|1`, {
+    day_utc: dayUtc,
+    connector_id: 1,
+    operations: [{ kind: "put", key: `history/v2/observations/day_utc=${dayUtc}/connector_id=1/manifest.json` }],
+  }]));
+  const events = [];
+  const publicationState = {};
+  await applySosLightPerDayUnits({
+    selectedDays: days,
+    dayGroups,
+    connectorGroups,
+    publicationState,
+    applyDeletion: async ({ dayUtc }) => events.push(`delete ${dayUtc}`),
+    applyConnectorGroup: async (group) => events.push(`publish children ${group.day_utc}`),
+    applyDayFinalization: async ({ dayUtc }) => events.push(`publish and verify day ${dayUtc}`),
+    publishAffectedIndexes: async () => events.push("publish affected indexes"),
+  });
+  assert.deepEqual(events, [
+    "delete 2026-07-29",
+    "publish children 2026-07-29",
+    "publish and verify day 2026-07-29",
+    "delete 2026-07-30",
+    "publish children 2026-07-30",
+    "publish and verify day 2026-07-30",
+    "publish affected indexes",
+  ]);
+  for (const dayUtc of days) {
+    assert.equal(publicationState[dayUtc].status, "succeeded");
+    assert.equal(publicationState[dayUtc].deletion_verified, true);
+    assert.equal(publicationState[dayUtc].day_parent_verified, true);
+    assert.equal(publicationState[dayUtc].completed_publication_level, "day_parent_verified");
+  }
 });
 
 test("SOS-light connector 1 parent uses every final local child and warns on unusable Dropbox peers", async () => {

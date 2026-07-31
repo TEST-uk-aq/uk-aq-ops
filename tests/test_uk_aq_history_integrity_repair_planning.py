@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py"
@@ -145,6 +146,115 @@ class V2RepairPlanningTest(unittest.TestCase):
             )
             self.assertTrue(result["no_old_live_r2_body_planning_or_preservation"])
             self.assertEqual(result["complete_day_deletion_count"], 1)
+
+    def test_sos_light_absent_dropbox_day_uses_connector_1_only_without_live_r2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dropbox = root / "dropbox"
+            source = root / "source"
+            dropbox.mkdir()
+            day = "2026-07-30"
+            day_prefix = f"history/v2/observations/day_utc={day}"
+            run_state = integrity.create_run_overlay(
+                tmp_dir=root / "runs",
+                run_id="sos-light-absent-dropbox-day-test",
+                environment="CIC-Test",
+                base_dropbox_root=dropbox,
+            )
+
+            def stage(key: str, body: bytes) -> None:
+                path = source / key
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(body)
+                integrity.stage_overlay_object(
+                    run_state,
+                    object_key=key,
+                    source_path=path,
+                    stage="observations_data",
+                )
+                integrity.mark_overlay_structurally_validated(run_state, key)
+
+            selected_part = (
+                f"{day_prefix}/connector_id=1/pollutant_code=o3/part-00000.parquet"
+            )
+            selected_manifest = (
+                f"{day_prefix}/connector_id=1/pollutant_code=o3/manifest.json"
+            )
+            connector_1_parent = f"{day_prefix}/connector_id=1/manifest.json"
+            day_parent = f"{day_prefix}/manifest.json"
+            stage(selected_part, b"fresh-sos-o3")
+            stage(
+                selected_manifest,
+                json.dumps({
+                    "manifest_key": selected_manifest,
+                    "manifest_hash": "a" * 64,
+                }).encode(),
+            )
+            stage(
+                connector_1_parent,
+                json.dumps({
+                    "pollutant_manifests": [{"manifest_key": selected_manifest}],
+                    "child_manifests": [],
+                }).encode(),
+            )
+            stage(
+                day_parent,
+                json.dumps({
+                    "connector_manifests": [{"manifest_key": connector_1_parent}],
+                    "child_manifests": [],
+                }).encode(),
+            )
+            run_state["tombstone_prefixes"] = [{
+                "prefix": f"{day_prefix}/connector_id=1/pollutant_code=o3",
+                "proposed": True,
+            }]
+            run_state["sos_light"] = {
+                "mode": "sos-light",
+                "validation_status": "validated_local_assembly",
+                "old_live_r2_observation_bodies_used": False,
+                "dropbox_warning_count": 0,
+                "dropbox_warnings": [],
+                "days": [{
+                    "day_utc": day,
+                    "final_connector_1_child_set": [selected_manifest],
+                    "final_assembled_connector_ids": [1],
+                    "omitted_dropbox_connector_prefixes": [],
+                }],
+            }
+
+            with mock.patch.object(
+                integrity,
+                "run_r2_cross_checks",
+                side_effect=AssertionError("live-R2 planning adapter must not run"),
+            ) as live_r2_adapter:
+                result = integrity.assemble_sos_light_complete_days(run_state)
+
+            live_r2_adapter.assert_not_called()
+            self.assertEqual(result["dropbox_day_absent_days"], [day])
+            self.assertEqual(result["dropbox_day_absent_count"], 1)
+            self.assertEqual(result["dropbox_day_warning_count"], 1)
+            self.assertEqual(result["dropbox_warning_count"], 1)
+            self.assertEqual(result["days"][0]["dropbox_day_present"], False)
+            self.assertEqual(result["days"][0]["dropbox_day_absent"], True)
+            self.assertEqual(
+                result["days"][0]["final_assembled_connector_ids"], [1]
+            )
+            self.assertEqual(
+                run_state["objects"][connector_1_parent]["dependencies"],
+                [selected_manifest],
+            )
+            self.assertEqual(
+                run_state["objects"][day_parent]["dependencies"],
+                [connector_1_parent],
+            )
+            self.assertEqual(
+                result["dropbox_warnings"][0]["classification"],
+                "dropbox_selected_day_absent",
+            )
+            self.assertEqual(
+                [entry["prefix"] for entry in run_state["tombstone_prefixes"]],
+                [day_prefix],
+            )
 
     def test_observation_index_gap_plans_index_only_without_command(self):
         with tempfile.TemporaryDirectory() as tmp:

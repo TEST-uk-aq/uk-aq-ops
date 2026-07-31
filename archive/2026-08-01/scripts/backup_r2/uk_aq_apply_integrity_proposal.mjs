@@ -1464,88 +1464,6 @@ export function assertPublicationDependenciesVerified({ object, runState }) {
   }
 }
 
-export async function applySosLightPerDayUnits({
-  selectedDays,
-  dayGroups,
-  connectorGroups,
-  applyDeletion,
-  applyConnectorGroup,
-  applyDayFinalization,
-  publishAffectedIndexes,
-  publicationState = {},
-  persist = async () => {},
-}) {
-  const units = [...selectedDays].sort().map((dayUtc) => {
-    const dayOperations = dayGroups.get(dayUtc) || [];
-    const deletionOperations = dayOperations.filter((operation) => operation.kind === "delete");
-    const parentOperations = dayOperations.filter((operation) => operation.kind !== "delete");
-    const expectedDayParent = `history/v2/observations/day_utc=${dayUtc}/manifest.json`;
-    if (deletionOperations.length !== 1) {
-      throw new Error(`SOS-light requires one complete-day deletion before upload: ${dayUtc}`);
-    }
-    if (parentOperations.length !== 1
-      || parentOperations[0].kind !== "put"
-      || parentOperations[0].key !== expectedDayParent) {
-      throw new Error(`SOS-light requires one final assembled day parent: ${dayUtc}`);
-    }
-    const dayConnectorGroups = Array.from(connectorGroups.values())
-      .filter((group) => group.day_utc === dayUtc)
-      .sort((left, right) => left.connector_id - right.connector_id);
-    if (!dayConnectorGroups.some((group) => group.connector_id === 1)) {
-      throw new Error(`SOS-light requires a connector 1 publication group: ${dayUtc}`);
-    }
-    return {
-      dayUtc,
-      deletionOperation: deletionOperations[0],
-      parentOperations,
-      dayConnectorGroups,
-    };
-  });
-
-  for (const { dayUtc, deletionOperation, parentOperations, dayConnectorGroups } of units) {
-    const state = publicationState[dayUtc] = {
-      day_utc: dayUtc,
-      status: "running",
-      completed_publication_level: "none",
-      deletion_verified: false,
-      connector_group_count: dayConnectorGroups.length,
-      completed_connector_group_count: 0,
-      day_parent_verified: false,
-    };
-    await persist();
-    try {
-      state.status = "deleting_complete_day";
-      await persist();
-      await applyDeletion({ dayUtc, operation: deletionOperation });
-      state.deletion_verified = true;
-      state.completed_publication_level = "complete_day_deletion_verified";
-      state.status = "publishing_connectors";
-      await persist();
-      for (const group of dayConnectorGroups) {
-        await applyConnectorGroup(group);
-        state.completed_connector_group_count += 1;
-        state.completed_publication_level = "connector_parents_verified";
-        await persist();
-      }
-      state.status = "publishing_day_parent";
-      await persist();
-      await applyDayFinalization({ dayUtc, operations: parentOperations });
-      state.day_parent_verified = true;
-      state.completed_publication_level = "day_parent_verified";
-      state.status = "succeeded";
-      state.completed_at_utc = new Date().toISOString();
-      await persist();
-    } catch (error) {
-      state.status = "failed";
-      state.error = error instanceof Error ? error.message : String(error);
-      state.failed_at_utc = new Date().toISOString();
-      await persist();
-      throw error;
-    }
-  }
-  await publishAffectedIndexes();
-}
-
 export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }) {
   const resolvedAdapters = {
     deleteObjects: adapters.deleteObjects || r2DeleteObjects,
@@ -1643,7 +1561,27 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       }
       atomicWriteJson(runStatePath, runState);
     };
-    const executeConnectorGroup = async (group) => {
+    if (dedicatedSosProposal.dedicated) {
+      for (const [dayUtc, dayOperations] of Array.from(dayGroups.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+        const deletionOperations = dayOperations.filter((operation) => operation.kind === "delete");
+        if (deletionOperations.length !== 1) {
+          throw new Error(`SOS-light requires one complete-day deletion before upload: ${dayUtc}`);
+        }
+        await runCanonicalDayFinalizer({
+          client: historyWriterClient,
+          dayUtc,
+          diagnosticEnvironment: runState.environment,
+          diagnostics: runState.writer_locks,
+          finalize: async () => {
+            await executeOperation(deletionOperations[0]);
+            return { operation_count: 1, complete_day_deleted: true };
+          },
+        });
+        dayGroups.set(dayUtc, dayOperations.filter((operation) => operation.kind !== "delete"));
+      }
+    }
+    for (const group of Array.from(connectorGroups.values()).sort((left, right) =>
+      left.day_utc.localeCompare(right.day_utc) || left.connector_id - right.connector_id)) {
       const groupKey = `${group.day_utc}|${group.connector_id}`;
       const verifiedBodyCache = dedicatedSosProposal.dedicated && group.connector_id !== 1
         ? null : createVerifiedGetBodyCache();
@@ -1697,101 +1635,65 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         },
         verify: async (written) => ({ ...written, get_verified: true }),
       });
-    };
-    const executeDayFinalization = async ({ dayUtc, operations: dayOperations }) => {
+    }
+    for (const [dayUtc, dayOperations] of Array.from(dayGroups.entries()).sort(([left], [right]) => left.localeCompare(right))) {
       await runCanonicalDayFinalizer({
         client: historyWriterClient,
         dayUtc,
         diagnosticEnvironment: runState.environment,
         diagnostics: runState.writer_locks,
         finalize: async () => {
-          for (const operation of dayOperations) {
-            if (operation.kind === "put" && !dedicatedSosProposal.dedicated) {
-              await prepareMergedDayManifest({
-                r2,
-                object: operation.object,
-                adapters: resolvedAdapters,
-                exactProposedConnectorSet: false,
-              });
-            }
-            await executeOperation(operation);
+        for (const operation of dayOperations) {
+          if (operation.kind === "put" && !dedicatedSosProposal.dedicated) {
+            await prepareMergedDayManifest({
+              r2,
+              object: operation.object,
+              adapters: resolvedAdapters,
+              exactProposedConnectorSet: dedicatedSosProposal.dedicated,
+            });
           }
+          await executeOperation(operation);
+        }
           return { operation_count: dayOperations.length };
         },
       });
-    };
+    }
     const affectedDays = Array.from(new Set([
       ...Array.from(connectorGroups.values()).map((group) => group.day_utc),
       ...dayGroups.keys(),
     ])).sort();
-    const publishAffectedIndexes = async () => {
-      if (!globalOperations.length && !affectedDays.length) return;
+    if (globalOperations.length || affectedDays.length) {
       await runCanonicalGlobalIndexFinalizer({
-          client: historyWriterClient,
-          diagnosticEnvironment: runState.environment,
-          diagnostics: runState.writer_locks,
-          finalize: async () => {
-            for (const operation of globalOperations) await executeOperation(operation);
-            if (affectedDays.length && !dedicatedSosProposal.dedicated) {
-              runState.global_index_finalization = await updateR2HistoryIndexesTargeted({
-                env: process.env,
-                r2,
-                historyVersion: "v2",
-                domains: ["observations", "aqilevels"],
-                affectedDaysUtc: affectedDays,
-                connectorId: null,
-                updateLatestIndex: true,
-                strictMissingTimeseriesCounts: true,
-                writeR2: true,
-              });
-            } else if (affectedDays.length) {
-              runState.global_index_finalization = {
-                status: "succeeded",
-                mode: "sos-light",
-                authority: "planned_dropbox_baseline_plus_assembled_days",
-                affected_days_utc: affectedDays,
-                planned_index_object_count: globalOperations.length,
-                live_observation_body_rebuild_used: false,
-              };
-              atomicWriteJson(runStatePath, runState);
-            }
-          },
-        });
-    };
-    if (dedicatedSosProposal.dedicated) {
-      runState.apply.sos_light_day_publication = {};
-      await applySosLightPerDayUnits({
-        selectedDays: dedicatedSosProposal.selected_days,
-        dayGroups,
-        connectorGroups,
-        applyDeletion: async ({ dayUtc, operation }) => {
-          await runCanonicalDayFinalizer({
-            client: historyWriterClient,
-            dayUtc,
-            diagnosticEnvironment: runState.environment,
-            diagnostics: runState.writer_locks,
-            finalize: async () => {
-              await executeOperation(operation);
-              return { operation_count: 1, complete_day_deleted: true };
-            },
+        client: historyWriterClient,
+        diagnosticEnvironment: runState.environment,
+        diagnostics: runState.writer_locks,
+        finalize: async () => {
+        for (const operation of globalOperations) await executeOperation(operation);
+        if (affectedDays.length && !dedicatedSosProposal.dedicated) {
+          runState.global_index_finalization = await updateR2HistoryIndexesTargeted({
+            env: process.env,
+            r2,
+            historyVersion: "v2",
+            domains: ["observations", "aqilevels"],
+            affectedDaysUtc: affectedDays,
+            connectorId: null,
+            updateLatestIndex: true,
+            strictMissingTimeseriesCounts: true,
+            writeR2: true,
           });
+        } else if (affectedDays.length) {
+          runState.global_index_finalization = {
+            status: "succeeded",
+            mode: "sos-light",
+            authority: "planned_dropbox_baseline_plus_assembled_days",
+            affected_days_utc: affectedDays,
+            planned_index_object_count: globalOperations.length,
+            live_observation_body_rebuild_used: false,
+          };
+          atomicWriteJson(runStatePath, runState);
+        }
         },
-        applyConnectorGroup: executeConnectorGroup,
-        applyDayFinalization: executeDayFinalization,
-        publishAffectedIndexes,
-        publicationState: runState.apply.sos_light_day_publication,
-        persist: async () => atomicWriteJson(runStatePath, runState),
       });
-    } else {
-      for (const group of Array.from(connectorGroups.values()).sort((left, right) =>
-        left.day_utc.localeCompare(right.day_utc) || left.connector_id - right.connector_id)) {
-        await executeConnectorGroup(group);
-      }
-      for (const [dayUtc, dayOperations] of Array.from(dayGroups.entries())
-        .sort(([left], [right]) => left.localeCompare(right))) {
-        await executeDayFinalization({ dayUtc, operations: dayOperations });
-      }
-      await publishAffectedIndexes();
     }
     if (dedicatedSosProposal.dedicated) {
       Object.assign(runState.sos_light, {

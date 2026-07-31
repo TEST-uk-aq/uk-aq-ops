@@ -19927,7 +19927,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
     if not isinstance(objects, dict):
         raise ValueError("SOS-light overlay objects mapping is unavailable")
     total_day_uploads = 0
-    dropbox_day_absent_days: list[str] = []
     for raw_day in day_entries:
         day = dict(raw_day)
         day_utc = str(day.get("day_utc") or "")
@@ -19935,43 +19934,13 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
             raise ValueError(f"SOS-light day identity is invalid: {day_utc!r}")
         day_prefix = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
         baseline_day = dropbox_root / day_prefix
-        dropbox_day_present = baseline_day.is_dir()
-        day["dropbox_day_present"] = dropbox_day_present
-        day["dropbox_day_absent"] = not dropbox_day_present
-        if not dropbox_day_present:
-            dropbox_day_absent_days.append(day_utc)
-            warning = {
-                "day_utc": day_utc,
-                "object_key": day_prefix,
-                "classification": "dropbox_selected_day_absent",
-                "reason": (
-                    "chosen Dropbox baseline has no selected observation-day directory; "
-                    "continuing with current-run connector 1 source-built objects only"
-                ),
-                "omitted": False,
-            }
-            warnings = audit.setdefault("dropbox_warnings", [])
-            if not isinstance(warnings, list):
-                raise ValueError("SOS-light Dropbox warning audit is invalid")
-            if not any(
-                isinstance(existing, Mapping)
-                and existing.get("classification") == warning["classification"]
-                and existing.get("day_utc") == day_utc
-                for existing in warnings
-            ):
-                warnings.append(warning)
-                audit["dropbox_warning_count"] = int(
-                    audit.get("dropbox_warning_count") or 0
-                ) + 1
+        if not baseline_day.is_dir():
+            raise FileNotFoundError(f"SOS-light Dropbox baseline day is unavailable: {day_prefix}")
         omitted_prefixes = [
             _normalise_overlay_object_key(str(value)).rstrip("/")
             for value in list(day.get("omitted_dropbox_connector_prefixes") or [])
         ]
-        for source in (
-            sorted(path for path in baseline_day.rglob("*") if path.is_file())
-            if dropbox_day_present
-            else []
-        ):
+        for source in sorted(path for path in baseline_day.rglob("*") if path.is_file()):
             object_key = source.relative_to(dropbox_root).as_posix()
             if object_key in objects:
                 continue
@@ -20089,12 +20058,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         }
         for entry in sorted(day_entries, key=lambda value: str(value["day_utc"]))
     ]
-    dropbox_day_warning_count = sum(
-        1
-        for warning in list(audit.get("dropbox_warnings") or [])
-        if isinstance(warning, Mapping)
-        and warning.get("classification") == "dropbox_selected_day_absent"
-    )
     audit.update({
         "mode": "sos-light",
         "validation_status": "complete_local_days_validated",
@@ -20112,11 +20075,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         "complete_day_count": len(day_entries),
         "complete_day_upload_count": total_day_uploads,
         "complete_day_deletion_count": len(day_entries),
-        "dropbox_day_absent_days": sorted(dropbox_day_absent_days),
-        "dropbox_day_absent_count": len(dropbox_day_absent_days),
-        "dropbox_day_warning_count": dropbox_day_warning_count,
-        "warning_count": len(list(audit.get("dropbox_warnings") or [])),
-        "warning_samples": list(audit.get("dropbox_warnings") or [])[:10],
         "assembly_authority_confirmation":
             "current-run SOS source plus chosen Dropbox baseline only",
         "no_old_live_r2_body_planning_or_preservation": True,
@@ -26231,17 +26189,11 @@ def format_summary_md(s: dict[str, Any]) -> str:
             + str(sos_light.get("complete_day_upload_count") or 0),
             "- Dropbox warnings: "
             + str(sos_light.get("dropbox_warning_count") or 0),
-            "- Dropbox selected days absent: "
-            + str(sos_light.get("dropbox_day_absent_count") or 0),
-            "- Dropbox absent-day warnings: "
-            + str(sos_light.get("dropbox_day_warning_count") or 0),
-            "- Dropbox absent days: "
-            + (", ".join(sos_light.get("dropbox_day_absent_days") or []) or "(none)"),
             "- Dropbox omissions: "
             + str(sos_light.get("dropbox_omission_count") or 0),
         ])
         if warnings:
-            lines.extend(["", "### Dropbox warnings", ""])
+            lines.extend(["", "### Dropbox warning-only omissions", ""])
             for warning in warnings:
                 lines.append(
                     "- WARNING "
