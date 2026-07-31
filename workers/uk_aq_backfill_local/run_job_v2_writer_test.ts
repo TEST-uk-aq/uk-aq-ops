@@ -1,4 +1,5 @@
 import {
+  buildDedicatedSosSourceAcquisition,
   classifyObservationRowsForV2PollutantPartitions,
   createAqiV2ConnectorManifest,
   createAqiV2PollutantManifest,
@@ -107,6 +108,131 @@ Deno.test("UK-AIR concentration-unit aliases preserve scale and reject a differe
       normaliseConcentrationUnitForComparison("ug/m3"),
     false,
   );
+});
+
+Deno.test("dedicated SOS acquisition opens one annual CSV once for a 2-day x 2-pollutant scope", async () => {
+  const tempDir = await Deno.makeTempDir();
+  const acquisitionRoot = `${tempDir}/sos-source-cache`;
+  const no2Label = "Nitrogen dioxide (Hourly measured)";
+  const pm25Label = "PM2.5 particulate matter (Hourly measured)";
+  const csvText = [
+    "All Data GMT hour ending",
+    `Date,time,"${no2Label}",status,unit,"${pm25Label}",status,unit`,
+    "01-06-2026,01:00,10,P,ugm-3,20,R,ugm-3",
+    "02-06-2026,01:00,,,,21,P,ugm-3",
+  ].join("\n");
+  const sourceReads = new Map<string, number>();
+  const registryEntries = new Map([
+    [no2Label.toLowerCase(), {
+      normalised_source_label: no2Label.toLowerCase(),
+      status: "mapped" as const,
+      pollutant_code: "no2",
+      expected_uom: "ug/m3",
+      raw_label_variants: [no2Label],
+      observed_units: ["ugm-3"],
+      reviewed_at_utc: "2026-07-31T00:00:00Z",
+      review_notes: null,
+    }],
+    [pm25Label.toLowerCase(), {
+      normalised_source_label: pm25Label.toLowerCase(),
+      status: "mapped" as const,
+      pollutant_code: "pm25",
+      expected_uom: "ug/m3",
+      raw_label_variants: [pm25Label],
+      observed_units: ["ugm-3"],
+      reviewed_at_utc: "2026-07-31T00:00:00Z",
+      review_notes: null,
+    }],
+  ]);
+  const bridgeRows = [
+    {
+      site_ref: "ABC",
+      uk_air_ref: "ABC",
+      pollutant_code: "no2" as const,
+      station_id: 10,
+      timeseries_id: 101,
+      station_ref: "station-abc",
+      timeseries_ref: "timeseries-abc-no2",
+      valid_from_day_utc: "2020-01-01",
+      valid_to_day_utc: null,
+    },
+    {
+      site_ref: "ABC",
+      uk_air_ref: "ABC",
+      pollutant_code: "pm25" as const,
+      station_id: 10,
+      timeseries_id: 102,
+      station_ref: "station-abc",
+      timeseries_ref: "timeseries-abc-pm25",
+      valid_from_day_utc: "2020-01-01",
+      valid_to_day_utc: "2026-06-01",
+    },
+  ];
+  try {
+    const manifest = await buildDedicatedSosSourceAcquisition({
+      root: acquisitionRoot,
+      runId: "focused-run",
+      requestedDays: ["2026-06-01", "2026-06-02"],
+      requestedPollutants: ["no2", "pm25"],
+      sourceRoot: "/virtual-sos",
+      sourceReader: (sourcePath) => {
+        sourceReads.set(sourcePath, (sourceReads.get(sourcePath) || 0) + 1);
+        return csvText;
+      },
+      sourceStat: () => ({
+        size: new TextEncoder().encode(csvText).length,
+        mtimeMs: 1_786_000_000_000,
+      }),
+      bridge: {
+        connector_id: 1,
+        mapping_identity: "sos_station_timeseries_site_refs_snapshot",
+        mapping_hash: "a".repeat(64),
+        content_hash: "b".repeat(64),
+        bridge_artifact_row_count: 2,
+        selected_bridge_row_count: 2,
+        rows: bridgeRows,
+      },
+      propertyMappings: [
+        propertyMapping(no2Label, "no2"),
+        propertyMapping(pm25Label, "pm25"),
+      ],
+      registryEntries,
+    });
+    assertEquals(manifest.acquisition_status, "complete");
+    assertEquals(manifest.partition_dataset_count, 4);
+    assertEquals(manifest.unique_source_file_count, 1);
+    assertEquals(manifest.source_files_opened, 1);
+    assertEquals(manifest.maximum_source_file_open_count, 1);
+    assertEquals(Array.from(sourceReads.values()), [1]);
+    assertEquals(manifest.partition_row_counts, {
+      "2026-06-01|no2": 1,
+      "2026-06-01|pm25": 1,
+      "2026-06-02|no2": 0,
+      "2026-06-02|pm25": 0,
+    });
+    const partitionFiles = manifest.partition_files as Array<Record<string, unknown>>;
+    assertEquals(new Set(partitionFiles.map((entry) => entry.path)).size, 4);
+    assertEquals(new Set(partitionFiles.map((entry) => entry.sha256)).size, 4);
+    const emptyPartition = partitionFiles.find((entry) =>
+      entry.day_utc === "2026-06-02" && entry.pollutant_code === "no2"
+    );
+    assertEquals(emptyPartition?.row_count, 0);
+    const unmappedPartition = partitionFiles.find((entry) =>
+      entry.day_utc === "2026-06-02" && entry.pollutant_code === "pm25"
+    );
+    const unmappedPayload = JSON.parse(
+      await Deno.readTextFile(String(unmappedPartition?.path)),
+    );
+    assertEquals(unmappedPayload.source_file_results[0].parsed.rows, []);
+    assertEquals(
+      unmappedPayload.source_file_results[0].parsed.missing_binding_rows,
+      1,
+    );
+    assertEquals(manifest.detector_rescans_avoided, 4);
+    assertEquals(manifest.proposal_builder_rescans_avoided, 4);
+  } finally {
+    await Deno.remove(tempDir, { recursive: true });
+  }
 });
 
 Deno.test("v2 classifier skips blank, null, and invalid pollutant_code rows", () => {

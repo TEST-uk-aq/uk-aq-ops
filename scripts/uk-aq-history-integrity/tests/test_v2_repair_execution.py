@@ -3651,8 +3651,19 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             }
             (root / "logs").mkdir()
             (root / "cache").mkdir()
+            worker_source_modes: list[str] = []
 
             def fake_backfill(**kwargs):
+                worker_source_modes.append(
+                    (kwargs.get("extra_env") or {}).get(
+                        "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE",
+                        "none",
+                    )
+                )
+                if (kwargs.get("extra_env") or {}).get(
+                    "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE"
+                ) == "acquire":
+                    return {"status": "ok"}
                 stage_root = Path(
                     kwargs["extra_env"][
                         "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT"
@@ -3712,6 +3723,24 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             try:
                 with mock.patch.object(
                     MODULE, "run_narrow_backfill", side_effect=fake_backfill,
+                ), mock.patch.object(
+                    MODULE,
+                    "_load_dedicated_sos_source_acquisition_manifest",
+                    return_value={
+                        "acquisition_strategy":
+                            "single_run_scoped_sos_annual_csv_pass",
+                        "unique_source_file_count": 1,
+                        "source_files_opened": 1,
+                        "maximum_source_file_open_count": 1,
+                        "total_source_bytes_read": 10,
+                        "total_source_rows_scanned": 1,
+                        "selected_range_rows": 1,
+                        "partition_dataset_count": 1,
+                        "partition_row_counts": {
+                            f"{day_utc}|{pollutant_code}": 1,
+                        },
+                        "acquisition_completion_sha256": "c" * 64,
+                    },
                 ), mock.patch.object(
                     MODULE,
                     "_load_complete_connector_day_source_evidence",
@@ -3790,6 +3819,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
         self.assertTrue(metrics["gap_detection_bypassed"])
         self.assertEqual(metrics["complete_replacements"], 1)
         self.assertEqual(metrics["exact_tombstones_created"], 1)
+        self.assertEqual(worker_source_modes, ["acquire", "consume", "consume"])
         self.assertEqual(
             [entry["prefix"] for entry in run_state["tombstone_prefixes"]],
             [expected_prefix],
@@ -3860,8 +3890,19 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             }
             (root / "logs").mkdir()
             (root / "cache").mkdir()
+            worker_source_modes: list[str] = []
 
             def fake_backfill(**kwargs):
+                worker_source_modes.append(
+                    (kwargs.get("extra_env") or {}).get(
+                        "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE",
+                        "none",
+                    )
+                )
+                if (kwargs.get("extra_env") or {}).get(
+                    "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE"
+                ) == "acquire":
+                    return {"status": "ok"}
                 pollutant_code = kwargs["repair_pollutants"][0]
                 evidence, rows, rows_body = evidence_by_pollutant[pollutant_code]
                 stage_root = Path(
@@ -3945,6 +3986,25 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                     MODULE, "run_narrow_backfill", side_effect=fake_backfill,
                 ), mock.patch.object(
                     MODULE,
+                    "_load_dedicated_sos_source_acquisition_manifest",
+                    return_value={
+                        "acquisition_strategy":
+                            "single_run_scoped_sos_annual_csv_pass",
+                        "unique_source_file_count": 1,
+                        "source_files_opened": 1,
+                        "maximum_source_file_open_count": 1,
+                        "total_source_bytes_read": 10,
+                        "total_source_rows_scanned": 2,
+                        "selected_range_rows": 2,
+                        "partition_dataset_count": 2,
+                        "partition_row_counts": {
+                            f"{day_utc}|{pollutant}": 1
+                            for pollutant in pollutants
+                        },
+                        "acquisition_completion_sha256": "c" * 64,
+                    },
+                ), mock.patch.object(
+                    MODULE,
                     "_load_complete_connector_day_source_evidence",
                     side_effect=fake_load,
                 ), mock.patch.object(
@@ -4018,6 +4078,10 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
         self.assertEqual(metrics["explicit_selected_partition_count"], 2)
         self.assertEqual(metrics["complete_replacements"], 2)
         self.assertEqual(metrics["exact_tombstones_created"], 2)
+        self.assertEqual(
+            worker_source_modes,
+            ["acquire", "consume", "consume", "consume", "consume"],
+        )
         self.assertEqual(len(run_state["tombstone_prefixes"]), 2)
         replacement_keys = {
             key
