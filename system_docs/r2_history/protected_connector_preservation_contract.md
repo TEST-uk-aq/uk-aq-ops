@@ -87,7 +87,7 @@ When metadata belonging solely to an unprotected connector is missing, unreadabl
 1. classify the defect as an unprotected preservation warning;
 2. omit the broken item at the narrowest safe metadata level;
 3. rebuild affected parent manifests and indexes without the omitted broken reference;
-4. leave all underlying unprotected R2 objects untouched;
+4. leave the omitted unprotected child data and child manifest untouched;
 5. continue the protected-connector replacement when the complete protected publication graph remains valid;
 6. record the omission in immutable run audit evidence.
 
@@ -108,23 +108,35 @@ A selected day containing a valid selected protected connector MUST still publis
 
 The implementation MUST NOT create a parent reference to a child known to return 404 or fail structural validation.
 
-## No-delete rule for omitted unprotected objects
+## Mutation boundary for omitted unprotected items
 
-Warning-only omission is a metadata quarantine action, not deletion authority.
+Warning-only omission is a metadata quarantine action, not authority to alter the omitted child data.
 
-Integrity MUST NOT delete, overwrite, tombstone or otherwise mutate an omitted unprotected connector's existing:
+Integrity MUST NOT delete, overwrite, tombstone or otherwise mutate the omitted unprotected item's existing:
 
 - Parquet parts;
-- pollutant manifests;
-- connector manifests;
-- connector-specific indexes;
-- other child objects.
+- unreadable or invalid pollutant manifest;
+- other data or child objects below the parent metadata being rebuilt.
 
-Only parent manifests or shared discovery indexes that must be rebuilt for the selected protected connector may stop advertising the broken unprotected item.
+Integrity MAY rewrite only the parent and discovery metadata required to publish the selected protected connector correctly. This permitted metadata-only rewrite includes, where necessary:
 
-Orphaned or undiscoverable unprotected objects MAY remain in R2 for later diagnosis and repair.
+- the affected unprotected connector manifest, rebuilt from its remaining readable valid pollutant children;
+- connector-scoped indexes rebuilt from remaining readable valid children;
+- the shared day manifest;
+- shared pollutant, day, global or latest discovery indexes.
 
-A separate explicit repair or deletion operation is required to change those underlying unprotected objects.
+Those permitted parent metadata writes MUST do no more than:
+
+- remove references to known-broken omitted children;
+- retain references to readable valid children;
+- add or update the final verified selected protected-connector children;
+- publish deterministic counts and identities derived from the retained valid children.
+
+If an unprotected connector parent cannot be rebuilt safely, Integrity MUST leave that connector parent object untouched, omit the connector from the shared day parent and shared discovery indexes, and continue when the protected connector remains complete.
+
+Orphaned or undiscoverable unprotected child objects MAY remain in R2 for later diagnosis and repair.
+
+A separate explicit repair or deletion operation is required to alter or remove those underlying unprotected child objects.
 
 ## Parent manifests and indexes
 
@@ -149,7 +161,8 @@ Before the first live R2 DELETE or PUT, the final proposal assessment MUST:
 - inspect the required preservation graph for affected shared parents;
 - collect all unprotected preservation defects it encounters rather than stopping at the first one where practical;
 - calculate the exact narrowest omissions;
-- prove that no planned delete or overwrite targets an omitted unprotected object;
+- prove that no planned delete, tombstone or overwrite targets an omitted unprotected child object;
+- identify every permitted parent metadata object that will be rebuilt because of an omission;
 - prove that all proposed parent manifests and indexes contain no references to known-broken omitted children;
 - fail if an omission would make a selected protected connector incomplete or undiscoverable.
 
@@ -170,7 +183,8 @@ Every dedicated protected-connector run MUST report:
 - missing or invalid R2 key;
 - failure classification and concise reason;
 - parent manifests and indexes rebuilt without the item;
-- confirmation that underlying omitted objects were not deleted or overwritten;
+- confirmation that omitted unprotected child objects were not deleted, overwritten or tombstoned;
+- every permitted parent metadata object rewritten because of the omission;
 - warning samples and a complete machine-readable omission list;
 - final protected-connector R2 verification status.
 
@@ -179,7 +193,7 @@ A run may finish successfully with warnings when:
 - every selected protected connector partition is complete and verified;
 - every required protected parent and index is correct;
 - every unprotected omission follows this contract;
-- no omitted unprotected underlying object was mutated.
+- no omitted unprotected child object was mutated outside the permitted parent metadata rewrites.
 
 The overall status MAY remain `ok` with a non-zero warnings count, but the report MUST make unprotected omissions prominent and machine-readable.
 
@@ -196,10 +210,11 @@ Required behaviour:
 
 1. connector 1 remains strictly validated and replaced;
 2. connector 7 humidity is reported as an unprotected preservation warning;
-3. connector 7 humidity is omitted from rebuilt parent metadata and derived shared indexes;
-4. connector 7 humidity underlying objects are not deleted or overwritten;
-5. any other readable valid connector 7 children are preserved;
-6. the run continues through protected connector verification and current-state reconciliation.
+3. connector 7 humidity is omitted from rebuilt parent metadata and derived indexes;
+4. connector 7 humidity child objects are not deleted, overwritten or tombstoned;
+5. connector 7 parent metadata MAY be deterministically rebuilt from any remaining readable valid connector 7 children;
+6. if connector 7 parent metadata cannot be rebuilt safely, connector 7 is omitted from the shared day parent and shared indexes while its existing connector parent is left untouched;
+7. the run continues through protected connector verification and current-state reconciliation.
 
 ## Future expansion to Breathe London
 
@@ -217,8 +232,9 @@ Before deployment, run only the smallest focused checks needed to prove:
 
 - a missing unprotected pollutant manifest becomes a warning and narrow pollutant omission;
 - the selected protected connector proposal still reaches mutation planning;
-- the rebuilt connector/day/index metadata does not reference the omitted child;
-- no planned delete, tombstone or overwrite targets the omitted unprotected objects;
+- rebuilt parent metadata does not reference the omitted child;
+- no planned delete, tombstone or overwrite targets the omitted unprotected child objects;
+- only permitted parent metadata is rewritten because of the omission;
 - a missing equivalent child for a protected connector remains blocking;
 - healthy unprotected siblings remain preserved;
 - an invalid or empty protected connector configuration fails before mutation.
