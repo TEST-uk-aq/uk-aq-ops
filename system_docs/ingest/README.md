@@ -45,8 +45,23 @@ The active implementation is primarily in `TEST-uk-aq/uk-aq-ingest`, including:
 - `workers/uk_aq_sos_cloud_run/`;
 - `.github/workflows/uk_aq_sos_cloud_run_deploy.yml`.
 
+TEST-uk-aq/uk-aq-ingest/.github/workflows/uk_aq_blondon_nodes_cloud_run_deploy.yml
+
+TEST-uk-aq/uk-aq-ingest/scripts/blondon_nodes/blondon_nodes_discover_timeseries.py
+TEST-uk-aq/uk-aq-ingest/scripts/blondon_nodes/blondon_nodes_reference_data.py
+
+
 Canonical table, function and seed definitions remain owned by `TEST-uk-aq/uk-aq-schema`.
 
 ## Change ownership
 
 Codex and other coding agents must treat this area as read-only authority. They may change implementation in the owning repositories, but must not edit `system_docs/`. Behavioural changes require a handover to ChatGPT for any necessary contract update.
+
+
+
+blondon_nodes_reference_data.py owns the shared species definitions and deterministic timeseries-row construction.
+blondon_nodes_discover_timeseries.py establishes and verifies the complete active reference set without fetching observations.
+blondon_nodes_ingest.py reuses the same shared definitions for its defensive timeseries upsert.
+Daily Stations runs discovery immediately after the Nodes station import and before the ObsAQIDB reference mirror.
+Successful discovery emits DISCOVERY_SUMMARY_JSON.
+The Nodes Cloud Run deployment path filter includes the new shared module.
