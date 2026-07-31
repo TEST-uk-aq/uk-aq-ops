@@ -1,5 +1,56 @@
 # SOS historical Integrity replacement implementation report
 
+## 1 August 2026 absent-Dropbox-day and per-day apply corrections
+
+### Root causes and corrected behaviour
+
+The SOS-light metadata planner already allowed a selected day with no Dropbox observation objects and could build the strict connector `1` and day parents from current-run source evidence. The later Python materialisation step contradicted that result by requiring the selected Dropbox day directory to exist and raising `FileNotFoundError`. It now treats an absent directory as an empty baseline, copies the existing best-effort Dropbox content only when the directory is present, and continues with the staged connector `1` objects. It does not inspect or recover any other connector from live R2. The durable JSON and Markdown audit record per-day `dropbox_day_present` / `dropbox_day_absent`, the absent-day list and count, a dedicated absent-day warning count, and the existing bounded warning detail.
+
+Connector `1` remains strict. Every selected source-built child must already be staged and structurally validated; its final parent dependencies must equal the complete final child set, including O3; the final day parent must depend on the connector parents actually present; and the complete local proposal, source evidence, parent graph, dependencies, deletion scope and preplanned indexes still validate before the first remote mutation. Index planning continues to use the chosen Dropbox index baseline plus the assembled selected-day result and does not require a Dropbox observation-day directory.
+
+The canonical SOS-light apply path previously completed the deletion loop for every selected day before entering the upload loop. A later upload failure could therefore leave all selected days deleted. Apply now pre-validates every per-day operation unit before any remote callback, then processes selected days in ascending order:
+
+```text
+acquire day-finalisation coordination
+delete the complete observation day and verify deletion
+release day-finalisation coordination
+acquire each required connector-day writer lock
+upload and GET-verify Parquet children, pollutant manifests and connector parents
+release each connector-day writer lock
+acquire day-finalisation coordination
+publish and GET-verify the prevalidated day parent
+release day-finalisation coordination
+continue to the next selected day
+
+after every selected day succeeds:
+acquire global-index coordination
+publish and GET-verify the preplanned affected observation indexes
+```
+
+If a day fails, its deletion and object entries plus `apply.sos_light_day_publication[day]` retain the completed publication level and failure detail. The exception stops the ascending loop, so the next day is not deleted and affected indexes are not published. Previously completed days remain fully published and verified. Timeseries and Latest Snapshot reconciliation remains downstream of successful complete R2 replacement and index verification.
+
+### Files changed
+
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`: accepts an absent Dropbox day as an audited empty baseline and exposes the absent-day evidence in the run summary.
+- `scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`: applies SOS-light as prevalidated ascending per-day units and publishes affected indexes only after all units succeed; generic Integrity ordering is unchanged.
+- `tests/test_uk_aq_history_integrity_repair_planning.py`: covers connector-1-only absent-day assembly, strict parent dependencies, warning evidence and no live-R2 cross-check call.
+- `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`: covers first-day upload failure stopping later deletion and successful two-day day-complete-before-next-delete/indexes-last ordering.
+- this implementation report.
+
+The two changed active runtime files were snapshotted under `archive/2026-08-01/` before editing. No `system_docs/`, schema, shared writer/index module, generic Integrity, Prune Daily, AQI or `TODO-IMPORTANT-UKAQ.txt` file changed.
+
+### Focused structural validation
+
+- Python syntax compilation: passed.
+- JavaScript syntax checks: passed.
+- Absent-Dropbox-day connector-1-only assembly and warning/audit regression: passed.
+- Two-day first-upload-failure regression: passed; day 2 was never deleted and indexes were not published.
+- Successful two-day ordering regression: passed; each day was deleted, published and verified before the next deletion, with affected indexes last.
+- Existing focused O3 final-child-set, exact `[1]` scope, complete-day deletion, invalid connector `1` pre-mutation and generic apply-safety checks: retained and passed.
+- `git diff --check`: passed.
+
+No real Integrity command was run. No R2, Supabase, Dropbox, GCP or other external operation, deployment, commit or push was performed.
+
 ## 31 July 2026 cross-month run-scoped acquisition correction
 
 ### Confirmed root cause and correction
