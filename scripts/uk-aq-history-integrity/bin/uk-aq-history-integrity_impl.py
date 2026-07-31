@@ -5091,6 +5091,7 @@ def run_narrow_backfill(
     timeseries_ids: list[int],
     connector_ids: list[int] | None = None,
     day: dt.date,
+    to_day: dt.date | None = None,
     log: logging.Logger,
     timeout_seconds: int = BACKFILL_DEFAULT_TIMEOUT_SECONDS,
     log_dir: Path | None = None,
@@ -5101,7 +5102,7 @@ def run_narrow_backfill(
     complete_connector_day: bool = False,
     repair_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Invoke `uk_aq_backfill_local.sh` for one (timeseries-ids, day).
+    """Invoke `uk_aq_backfill_local.sh` for one scope (single day by default).
 
     Returns a result dict suitable for recording on the source_file_events
     row: status in {ok, error, no_wrapper, no_env_file, no_timeseries_ids,
@@ -5135,7 +5136,14 @@ def run_narrow_backfill(
         return result
 
     sub_env: dict[str, str] = {**os.environ}
-    sub_env.pop("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS", None)
+    internal_scope_keys = (
+        "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS",
+        "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE",
+        "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT",
+        "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_RUN_ID",
+    )
+    for key in internal_scope_keys:
+        sub_env.pop(key, None)
     if env_file_path:
         if not Path(env_file_path).is_file():
             result["status"] = "no_env_file"
@@ -5149,10 +5157,14 @@ def run_narrow_backfill(
             len(loaded),
             interesting_keys,
         )
-        loaded.pop("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS", None)
+        for key in internal_scope_keys:
+            loaded.pop(key, None)
         sub_env.update(loaded)
 
     iso = day.isoformat()
+    to_iso = (to_day or day).isoformat()
+    if to_iso < iso:
+        raise ValueError("narrow backfill to_day must not precede day")
 
     sub_env.update({
         "UK_AQ_BACKFILL_RUN_MODE": "source_to_r2",
@@ -5162,7 +5174,7 @@ def run_narrow_backfill(
         "UK_AQ_R2_HISTORY_VERSION": history_version,
         "UK_AQ_R2_HISTORY_INDEX_VERSION": history_version,
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
-        "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
+        "UK_AQ_BACKFILL_TO_DAY_UTC": to_iso,
         # Always force trigger_mode=manual (wrapper enforces this anyway).
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
     })
@@ -5210,9 +5222,10 @@ def run_narrow_backfill(
 
     started = time.monotonic()
     log.info(
-        "backfill invoke wrapper=%s day=%s connector_ids=%s timeseries_ids=%s",
+        "backfill invoke wrapper=%s day=%s..%s connector_ids=%s timeseries_ids=%s",
         wrapper_path,
         iso,
+        to_iso,
         sub_env.get("UK_AQ_BACKFILL_CONNECTOR_IDS", "all"),
         sub_env.get("UK_AQ_BACKFILL_TIMESERIES_IDS", "complete_connector_day"),
     )
@@ -5231,7 +5244,7 @@ def run_narrow_backfill(
             "--from-day",
             iso,
             "--to-day",
-            iso,
+            to_iso,
         ]
         if complete_connector_day:
             cmd.append("--complete-connector-day")
@@ -16732,6 +16745,132 @@ def build_dedicated_sos_selected_partitions(
     ]
 
 
+def _load_dedicated_sos_source_acquisition_manifest(
+    *,
+    acquisition_root: Path,
+    run_id: int,
+    selected_days: Iterable[str],
+    selected_pollutants: Iterable[str],
+) -> dict[str, Any]:
+    """Validate the completed run-owned SOS source-acquisition manifest."""
+    manifest_path = acquisition_root / "acquisition-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("dedicated SOS source acquisition manifest is invalid")
+    completion_hash = str(
+        manifest.get("acquisition_completion_sha256") or ""
+    )
+    semantic = dict(manifest)
+    semantic.pop("acquisition_completion_sha256", None)
+    actual_hash = hashlib.sha256(
+        json.dumps(
+            semantic,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    expected_days = sorted({str(value) for value in selected_days})
+    expected_pollutants = sorted({str(value) for value in selected_pollutants})
+    partition_files = manifest.get("partition_files")
+    source_identities = manifest.get("source_file_identities")
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("acquisition_status") != "complete"
+        or str(manifest.get("run_id") or "") != str(run_id)
+        or int(manifest.get("connector_id") or 0) != 1
+        or list(manifest.get("selected_days") or []) != expected_days
+        or list(manifest.get("requested_pollutants") or [])
+        != expected_pollutants
+        or not isinstance(partition_files, list)
+        or not isinstance(source_identities, list)
+        or int(manifest.get("partition_dataset_count") or -1)
+        != len(expected_days) * len(expected_pollutants)
+        or int(manifest.get("unique_source_file_count") or -1)
+        != len(source_identities)
+        or int(manifest.get("source_files_opened") or -1)
+        != len(source_identities)
+        or int(manifest.get("maximum_source_file_open_count") or -1) != 1
+        or not re.fullmatch(r"[0-9a-f]{64}", completion_hash)
+        or completion_hash != actual_hash
+    ):
+        raise ValueError(
+            "dedicated SOS source acquisition manifest is incomplete or changed"
+        )
+    source_files_seen: set[str] = set()
+    identity_bytes = 0
+    for identity in source_identities:
+        if not isinstance(identity, Mapping):
+            raise ValueError(
+                "dedicated SOS source acquisition file identity is invalid"
+            )
+        source_file = str(identity.get("source_file") or "")
+        try:
+            byte_count = int(identity.get("bytes"))
+            modification_time = int(identity.get("mtime_ms"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "dedicated SOS source acquisition file metadata is invalid"
+            ) from exc
+        if (
+            not source_file
+            or str(identity.get("source_path") or "") != source_file
+            or source_file in source_files_seen
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(identity.get("sha256") or "")
+            )
+            or byte_count <= 0
+            or modification_time < 0
+        ):
+            raise ValueError(
+                "dedicated SOS source acquisition file identity changed"
+            )
+        source_files_seen.add(source_file)
+        identity_bytes += byte_count
+    if identity_bytes != int(manifest.get("total_source_bytes_read") or -1):
+        raise ValueError(
+            "dedicated SOS source acquisition byte accounting is invalid"
+        )
+    expected_partitions = {
+        (day_utc, pollutant_code)
+        for day_utc in expected_days
+        for pollutant_code in expected_pollutants
+    }
+    actual_partitions: set[tuple[str, str]] = set()
+    for entry in partition_files:
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                "dedicated SOS source acquisition partition is invalid"
+            )
+        day_utc = str(entry.get("day_utc") or "")
+        pollutant_code = str(entry.get("pollutant_code") or "")
+        partition_path = Path(str(entry.get("path") or ""))
+        expected_path = (
+            acquisition_root
+            / "partitions"
+            / f"day_utc={day_utc}"
+            / "connector_id=1"
+            / f"pollutant_code={pollutant_code}"
+            / "source-partition.json"
+        )
+        body = partition_path.read_bytes()
+        if (
+            int(entry.get("connector_id") or 0) != 1
+            or partition_path != expected_path
+            or hashlib.sha256(body).hexdigest()
+            != str(entry.get("sha256") or "")
+        ):
+            raise ValueError(
+                "dedicated SOS source acquisition partition changed"
+            )
+        actual_partitions.add((day_utc, pollutant_code))
+    if actual_partitions != expected_partitions:
+        raise ValueError(
+            "dedicated SOS source acquisition partition scope is incomplete"
+        )
+    return {**manifest, "path": str(manifest_path)}
+
+
 def _parse_repair_pollutants_arg(raw: str | None) -> list[str]:
     return _normalise_repair_pollutants((raw or "").split(","))
 
@@ -17925,6 +18064,149 @@ def run_v2_gap_backfills(
             for (day_iso, connector_id), ts_ids in sorted(by_key.items())
         ]
     )
+    dedicated_registry_snapshot: dict[str, Any] | None = None
+    dedicated_bridge_snapshot: dict[str, Any] | None = None
+    dedicated_source_acquisition: dict[str, Any] | None = None
+    if direct_targets is not None:
+        if limits.should_stop():
+            raise RuntimeError(
+                "dedicated SOS source acquisition blocked by operation limit"
+            )
+        if run_state is None:
+            raise ValueError(
+                "dedicated SOS source acquisition requires run state"
+            )
+        selected_dates = list(metrics["selected_dates"])
+        selected_pollutants = list(metrics["selected_pollutants"])
+        acquisition_root = (
+            Path(str(run_state["run_root"])) / "sos-source-cache"
+        )
+        registry_root = (
+            Path(str(run_state["run_root"])) / "sos-source-label-registry"
+        )
+        snapshot_day = selected_dates[0]
+        dedicated_registry_snapshot = write_uk_air_source_label_registry_snapshot(
+            conn=conn,
+            connector_id=1,
+            cache_root=Path(
+                env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]
+            ) / SOS_SOURCE_KEY,
+            snapshot_path=(
+                registry_root / "acquisition" / "connector_id=1.json"
+            ),
+        )
+        dedicated_bridge_snapshot = write_sos_site_ref_bridge_snapshot(
+            conn=conn,
+            connector_id=1,
+            snapshot_path=(
+                registry_root.parent
+                / "sos-site-ref-bridge"
+                / "acquisition"
+                / "connector_id=1.json"
+            ),
+        )
+        acquisition_result = run_narrow_backfill(
+            wrapper_path=resolve_integrity_backfill_wrapper(),
+            env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+            env_name=env_name,
+            timeseries_ids=[],
+            connector_ids=[1],
+            day=dt.date.fromisoformat(selected_dates[0]),
+            to_day=dt.date.fromisoformat(selected_dates[-1]),
+            log=log,
+            log_dir=backfill_log_dir,
+            log_label=(
+                f"v2_sos_source_acquisition_{selected_dates[0]}_"
+                f"to_{selected_dates[-1]}"
+            ),
+            output_scope="observations_only",
+            history_version="v2",
+            extra_env={
+                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(
+                    run_state["overlay_root"]
+                ),
+                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
+                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
+                "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE": "acquire",
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT": str(
+                    acquisition_root
+                ),
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_RUN_ID": str(run_id),
+                "UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": str(
+                    dedicated_registry_snapshot["path"]
+                ),
+                "UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": str(
+                    dedicated_bridge_snapshot["path"]
+                ),
+            },
+            complete_connector_day=True,
+            repair_pollutants=selected_pollutants,
+        )
+        if acquisition_result.get("status") != "ok":
+            raise RuntimeError(
+                "dedicated_sos_source_acquisition_failed:"
+                f"{acquisition_result.get('error') or acquisition_result.get('exit_code')}"
+            )
+        dedicated_source_acquisition = (
+            _load_dedicated_sos_source_acquisition_manifest(
+                acquisition_root=acquisition_root,
+                run_id=run_id,
+                selected_days=selected_dates,
+                selected_pollutants=selected_pollutants,
+            )
+        )
+        metrics["source_acquisition"] = dedicated_source_acquisition
+        metrics.update({
+            "source_acquisition_strategy": dedicated_source_acquisition.get(
+                "acquisition_strategy"
+            ),
+            "unique_source_file_count": int(
+                dedicated_source_acquisition.get("unique_source_file_count")
+                or 0
+            ),
+            "source_files_opened": int(
+                dedicated_source_acquisition.get("source_files_opened") or 0
+            ),
+            "maximum_source_file_open_count": int(
+                dedicated_source_acquisition.get(
+                    "maximum_source_file_open_count"
+                ) or 0
+            ),
+            "total_source_bytes_read": int(
+                dedicated_source_acquisition.get("total_source_bytes_read")
+                or 0
+            ),
+            "total_source_rows_scanned": int(
+                dedicated_source_acquisition.get("total_source_rows_scanned")
+                or 0
+            ),
+            "selected_range_rows": int(
+                dedicated_source_acquisition.get("selected_range_rows") or 0
+            ),
+            "partition_datasets_created": int(
+                dedicated_source_acquisition.get("partition_dataset_count")
+                or 0
+            ),
+            "partition_row_counts": dict(
+                dedicated_source_acquisition.get("partition_row_counts") or {}
+            ),
+            "source_cache_path": str(acquisition_root),
+            "source_cache_complete": True,
+            "source_cache_sha256": dedicated_source_acquisition.get(
+                "acquisition_completion_sha256"
+            ),
+            "detector_rescans_avoided": len(normalized_direct_targets),
+            "proposal_builder_rescans_avoided": len(
+                normalized_direct_targets
+            ),
+        })
+        run_state["sos_source_acquisition"] = dedicated_source_acquisition
+        run_state.setdefault("sos_source_label_registry_snapshots", {})[
+            f"{snapshot_day}/connector_id=1/acquisition"
+        ] = dedicated_registry_snapshot
+        write_run_state(run_state)
     for day_iso, connector_id, ts_ids, selected_repair_pollutants in work_items:
         if not selected_repair_pollutants:
             metrics["skipped_v2_observation_repairs"].append({
@@ -17980,26 +18262,33 @@ def run_v2_gap_backfills(
             else backfill_log_dir / "_integrity_proposal" / f"v2_run_{run_id}"
         )
         sos_connector_id = int(str(env.get("UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK") or "1"))
-        registry_snapshot: dict[str, Any] | None = None
-        bridge_snapshot: dict[str, Any] | None = None
+        registry_snapshot: dict[str, Any] | None = (
+            dedicated_registry_snapshot
+            if direct_targets is not None else None
+        )
+        bridge_snapshot: dict[str, Any] | None = (
+            dedicated_bridge_snapshot
+            if direct_targets is not None else None
+        )
         if connector_id == sos_connector_id and str((source_scope or {}).get("source") or "") in {"sos", "all"}:
-            registry_root = (
-                Path(str(run_state["run_root"])) / "sos-source-label-registry"
-                if run_state is not None
-                else stage_root / "sos-source-label-registry"
-            )
-            registry_snapshot = write_uk_air_source_label_registry_snapshot(
-                conn=conn,
-                connector_id=connector_id,
-                cache_root=Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY,
-                snapshot_path=registry_root / f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
-            )
-            bridge_snapshot = write_sos_site_ref_bridge_snapshot(
-                conn=conn,
-                connector_id=connector_id,
-                snapshot_path=registry_root.parent / "sos-site-ref-bridge" /
-                    f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
-            )
+            if registry_snapshot is None or bridge_snapshot is None:
+                registry_root = (
+                    Path(str(run_state["run_root"])) / "sos-source-label-registry"
+                    if run_state is not None
+                    else stage_root / "sos-source-label-registry"
+                )
+                registry_snapshot = write_uk_air_source_label_registry_snapshot(
+                    conn=conn,
+                    connector_id=connector_id,
+                    cache_root=Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY,
+                    snapshot_path=registry_root / f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
+                )
+                bridge_snapshot = write_sos_site_ref_bridge_snapshot(
+                    conn=conn,
+                    connector_id=connector_id,
+                    snapshot_path=registry_root.parent / "sos-site-ref-bridge" /
+                        f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
+                )
             optional_scan_errors = list((registry_snapshot.get("inventory") or {}).get("scan_errors") or [])
             if optional_scan_errors:
                 log.warning(
@@ -18023,6 +18312,16 @@ def run_v2_gap_backfills(
         partition_source_evidence: dict[str, Any] = {}
         detector_evidence_error: str | None = None
         detector_result: dict[str, Any] | None = None
+        source_acquisition_consumer_env = (
+            {
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE": "consume",
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT": str(
+                    metrics["source_cache_path"]
+                ),
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_RUN_ID": str(run_id),
+            }
+            if direct_targets is not None else {}
+        )
         shutil.rmtree(
             detector_stage_root / f"day_utc={day_iso}" / f"connector_id={connector_id}",
             ignore_errors=True,
@@ -18047,6 +18346,7 @@ def run_v2_gap_backfills(
                     "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
                     "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
                     "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                    **source_acquisition_consumer_env,
                     **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
                     **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
                 },
@@ -18182,6 +18482,7 @@ def run_v2_gap_backfills(
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
                 "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
+                **source_acquisition_consumer_env,
                 **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
                 **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
             }
@@ -22919,6 +23220,37 @@ def run_v2_integrity_repair_flow(
         ),
         "selected_dates": observations.get("selected_dates"),
         "selected_pollutants": observations.get("selected_pollutants"),
+        "source_acquisition": observations.get("source_acquisition"),
+        "source_acquisition_strategy": observations.get(
+            "source_acquisition_strategy"
+        ),
+        "unique_source_file_count": observations.get(
+            "unique_source_file_count"
+        ),
+        "source_files_opened": observations.get("source_files_opened"),
+        "maximum_source_file_open_count": observations.get(
+            "maximum_source_file_open_count"
+        ),
+        "total_source_bytes_read": observations.get(
+            "total_source_bytes_read"
+        ),
+        "total_source_rows_scanned": observations.get(
+            "total_source_rows_scanned"
+        ),
+        "selected_range_rows": observations.get("selected_range_rows"),
+        "partition_datasets_created": observations.get(
+            "partition_datasets_created"
+        ),
+        "partition_row_counts": observations.get("partition_row_counts"),
+        "source_cache_path": observations.get("source_cache_path"),
+        "source_cache_complete": observations.get("source_cache_complete"),
+        "source_cache_sha256": observations.get("source_cache_sha256"),
+        "detector_rescans_avoided": observations.get(
+            "detector_rescans_avoided"
+        ),
+        "proposal_builder_rescans_avoided": observations.get(
+            "proposal_builder_rescans_avoided"
+        ),
         "selected_partition_outcomes": observations.get(
             "selected_partition_outcomes"
         ),
@@ -25166,6 +25498,29 @@ def format_summary_md(s: dict[str, Any]) -> str:
             )
         if repair_flow.get("stage_results"):
             lines.append("")
+        if repair_flow.get("dedicated_sos_historical_replacement"):
+            lines.extend([
+                "### SOS source acquisition",
+                "",
+                f"- Strategy: {repair_flow.get('source_acquisition_strategy') or '(none)'}",
+                f"- Unique source files: {int(repair_flow.get('unique_source_file_count') or 0)}",
+                f"- Source files opened: {int(repair_flow.get('source_files_opened') or 0)}",
+                f"- Maximum opens per source file: {int(repair_flow.get('maximum_source_file_open_count') or 0)}",
+                f"- Source bytes read: {int(repair_flow.get('total_source_bytes_read') or 0)}",
+                f"- Source rows scanned: {int(repair_flow.get('total_source_rows_scanned') or 0)}",
+                f"- Selected-range rows: {int(repair_flow.get('selected_range_rows') or 0)}",
+                f"- Partition datasets: {int(repair_flow.get('partition_datasets_created') or 0)}",
+                "- Partition row counts: " + json.dumps(
+                    repair_flow.get("partition_row_counts") or {},
+                    sort_keys=True,
+                ),
+                f"- Source cache: {repair_flow.get('source_cache_path') or '(none)'}",
+                f"- Source cache complete: {bool(repair_flow.get('source_cache_complete'))}",
+                f"- Source cache SHA-256: {repair_flow.get('source_cache_sha256') or '(none)'}",
+                f"- Detector rescans avoided: {int(repair_flow.get('detector_rescans_avoided') or 0)}",
+                f"- Proposal-builder rescans avoided: {int(repair_flow.get('proposal_builder_rescans_avoided') or 0)}",
+                "",
+            ])
         reconciliation = repair_flow.get("first_value_at_reconciliation") or {}
         if reconciliation:
             lines.extend([

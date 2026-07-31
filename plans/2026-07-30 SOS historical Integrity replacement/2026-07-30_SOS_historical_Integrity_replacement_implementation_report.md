@@ -1,5 +1,77 @@
 # SOS historical Integrity replacement implementation report
 
+## 31 July 2026 source-acquisition optimisation
+
+The dedicated SOS route now performs one run-scoped annual-CSV acquisition before any selected partition is built. The acquisition owner receives the complete inclusive date range, connector `1` and the complete explicit pollutant set. It opens every relevant annual CSV once, parses its CSV/timestamp structure once, derives the selected partition rows and warning evidence from that immutable structure, and completes a run-local spool before detector or proposal work can continue.
+
+### Confirmed previous scan pattern
+
+`build_dedicated_sos_selected_partitions()` creates one work item per explicit `day_utc + connector_id=1 + pollutant_code`. Before this optimisation, `run_v2_gap_backfills()` launched two complete-connector-day source workers for every work item:
+
+1. the detector worker enumerated, opened, parsed and canonicalised all annual SOS files relevant to that partition;
+2. the proposal worker independently repeated the same enumeration, file reads, parsing and canonicalisation.
+
+The 1–16 June four-pollutant scope therefore created 64 partition operations and 128 full source-worker scans. A source file relevant to every selected partition could be opened up to 128 times in that run. The detector's canonical rows, source identities, classifications, counts and warnings were safe to reuse; none depends on mutable proposal or apply state. Mutable state begins with proposal staging, tombstone recording and later apply bookkeeping.
+
+### New cache owner, format and lifecycle
+
+The acquisition owner is `buildDedicatedSosSourceAcquisition()` in `workers/uk_aq_backfill_local/run_job.ts`, invoked once by the dedicated branch of `run_v2_gap_backfills()`. Its run-owned layout is:
+
+```text
+<run-root>/sos-source-cache/
+  acquisition-manifest.json
+  partitions/
+    day_utc=<day>/
+      connector_id=1/
+        pollutant_code=<pollutant>/
+          source-partition.json
+```
+
+The manifest is written first with `acquisition_status=building`. Partition files are then created exclusively and hashed. Only after every requested partition exists does the owner replace the manifest with `acquisition_status=complete` and a deterministic completion SHA-256. The cache is never reused across Integrity runs. A pre-existing cache root, incomplete manifest, run/scope mismatch, partition-path mismatch or hash mismatch fails closed.
+
+The manifest records the Integrity run ID, selected dates, connector and pollutants; source paths, sizes, modification times and SHA-256 identities; unique file count, files opened, maximum opens per file, bytes read and source rows scanned; selected-range rows; warning count and bounded samples; partition paths, hashes and row counts; and avoided detector/proposal rescans.
+
+Each partition file contains only that exact day/connector/pollutant's canonical source rows plus its file-scoped counts, classifications, units, missing-binding warnings and pinned source identity. It can therefore represent all three non-failure outcomes independently:
+
+- non-empty canonical replacement evidence;
+- authoritative empty evidence when no selected source observation exists;
+- non-empty source evidence with zero canonical rows and positive missing-binding counts for the existing all-unmapped skip.
+
+Detector and proposal workers run in `consume` mode and read only the completed, hash-validated partition dataset. They do not stat, open or parse annual CSV files. The existing detector persists and retains its pollutant-scoped `source-evidence.json` and `obs_history_rows.json`; the proposal worker independently rebuilds and validates the selected replacement from the same immutable partition input. Final Python agreement checks and the final JavaScript pollutant-scoped evidence validator remain unchanged.
+
+### Files changed for this optimisation
+
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
+  - invokes one range-scoped acquisition before the partition loop;
+  - validates the completion manifest and every partition hash/path;
+  - supplies acquisition identity to detector and proposal consumers;
+  - adds dedicated acquisition audit fields and report output.
+- `scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh`
+  - preserves the run-scoped acquisition mode, root and run ID across the existing repository `.env` load.
+- `workers/uk_aq_backfill_local/run_job.ts`
+  - separates one annual-CSV structural parse from partition canonicalisation;
+  - builds the immutable run-scoped acquisition spool;
+  - consumes cached partition results without reopening annual CSV files.
+- `workers/uk_aq_backfill_local/run_job_v2_writer_test.ts`
+  - adds the deterministic 2-day × 2-pollutant single-read regression, including authoritative no-data and all-unmapped evidence.
+- `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`
+  - retains direct-selection/multi-pollutant regressions and proves detector and proposal calls use acquisition `consume` mode.
+- this implementation report.
+
+No JavaScript apply module, shared manifest/index writer, Timeseries reconciliation, Latest Snapshot reconciliation, generic Integrity, check-only/dry-run path or Prune Daily code changed. No new external dependency, service, schema, environment configuration or operator argument was added. As requested, no additional archived full-file copy was created.
+
+### Focused validation
+
+- Python compilation for the touched Integrity implementation and focused test: passed.
+- Shell syntax for the touched repository backfill wrapper: passed.
+- Deno type checking for the touched source worker and focused test: passed.
+- New 2-day × 2-pollutant acquisition regression: passed; four independent partition files were produced, one annual CSV was opened once, distinct paths and hashes were retained, authoritative empty and all-unmapped evidence were represented, and four detector plus four proposal rescans were reported avoided.
+- Existing dedicated SOS Python regressions: 6 passed, including direct selection, exact tombstone behaviour, distinct pollutant evidence, all-unmapped preservation, legacy diagnostics and AQI/broad-scan bypass.
+- Existing final JavaScript proposal validator regression for distinct pollutant-scoped evidence: passed.
+- `git diff --check`: passed.
+
+The direct replacement unit remains `day + connector + pollutant`. Exact tombstones, complete replacement, ordered live apply, GET-once verification and downstream Timeseries/Latest Snapshot boundaries are unchanged.
+
 ## Outcome
 
 Qualifying real CIC-Test SOS v2 repairs now select the dedicated observation-history replacement path automatically. Check-only, dry-run, non-SOS and generic repair paths retain their existing routing.
@@ -137,6 +209,8 @@ Intended 1-16 June range for the full supported SOS observation subset:
 ```
 
 For each run, confirm the report selects the dedicated path, names connector `1`, records no AQI invocation, reports exact selected-prefix tombstones, shows one post-PUT verification GET per changed object, records no broad final scan, and separates R2 history, Timeseries, Latest Snapshot and overall outcomes.
+
+Also inspect the new `SOS source acquisition` audit section. It must report `single_run_scoped_sos_annual_csv_pass`, `source_files_opened == unique_source_file_count`, `maximum opens per source file == 1`, a complete cache SHA-256, the expected date × pollutant partition count and row-count map, and detector/proposal rescans avoided equal to the explicit selected partition count.
 
 Both the single-pollutant command and the multi-pollutant range command are now structurally supported: every selected pollutant retains a separate immutable evidence identity through final proposal validation, ordered apply and live verification.
 

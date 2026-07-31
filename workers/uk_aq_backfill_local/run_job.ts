@@ -689,6 +689,7 @@ type SourceToAllSummary = {
     };
   };
   warnings: string[];
+  sos_source_acquisition?: Record<string, unknown>;
 };
 
 type StubModeSummary = {
@@ -1296,6 +1297,15 @@ const INTEGRITY_SOURCE_EVIDENCE_ONLY = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
   false,
 );
+const SOS_SOURCE_ACQUISITION_ROOT = optionalEnv(
+  "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT",
+);
+const SOS_SOURCE_ACQUISITION_MODE = optionalEnv(
+  "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE",
+)?.toLowerCase() || "";
+const SOS_SOURCE_ACQUISITION_RUN_ID = optionalEnv(
+  "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_RUN_ID",
+);
 const INTEGRITY_OBSERVATION_REPAIR_POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
 const INTEGRITY_REPAIR_POLLUTANTS = new Set(
   (Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS") || "")
@@ -1310,6 +1320,26 @@ for (const pollutant of INTEGRITY_REPAIR_POLLUTANTS) {
 }
 const INTEGRITY_POLLUTANT_SCOPED_REPAIR =
   INTEGRITY_COMPLETE_CONNECTOR_DAY && INTEGRITY_REPAIR_POLLUTANTS.size > 0;
+if (
+  SOS_SOURCE_ACQUISITION_MODE &&
+  !["acquire", "consume"].includes(SOS_SOURCE_ACQUISITION_MODE)
+) {
+  throw new Error(
+    `unsupported_sos_source_acquisition_mode mode=${SOS_SOURCE_ACQUISITION_MODE}`,
+  );
+}
+if (
+  SOS_SOURCE_ACQUISITION_MODE &&
+  (!SOS_SOURCE_ACQUISITION_ROOT || !SOS_SOURCE_ACQUISITION_RUN_ID)
+) {
+  throw new Error("sos_source_acquisition_identity_is_incomplete");
+}
+if (
+  SOS_SOURCE_ACQUISITION_MODE === "consume" &&
+  INTEGRITY_REPAIR_POLLUTANTS.size !== 1
+) {
+  throw new Error("sos_source_acquisition_consumer_requires_one_pollutant");
+}
 const IS_LOCAL_RUN = !optionalEnv("K_SERVICE") && !optionalEnv("K_REVISION");
 
 function nowIso(): string {
@@ -9264,6 +9294,111 @@ export type UkAirFlatFileParseResult = {
   units: string[];
 };
 
+type ParsedUkAirFlatFileEntry = {
+  line_number: number;
+  raw_line: string;
+  cells: string[];
+  is_header: boolean;
+  observed_at: string | null;
+  observed_at_error: string | null;
+};
+
+export type ParsedUkAirFlatFile = {
+  expected_time_basis_present: boolean;
+  source_record_count: number;
+  source_record_count_by_day: Record<string, number>;
+  entries: ParsedUkAirFlatFileEntry[];
+};
+
+export function parseUkAirFlatFileStructure(csvText: string): ParsedUkAirFlatFile {
+  const expectedTimeBasisDeclaration = "All Data GMT hour ending";
+  const entries: ParsedUkAirFlatFileEntry[] = [];
+  let insideDataSection = false;
+  for (const [lineIndex, rawLine] of csvText.split(/\r?\n/).entries()) {
+    if (!rawLine.trim()) continue;
+    const cells = parseCsvRow(rawLine, ",").map((cell) => cell.trim());
+    const isHeader =
+      String(cells[0] || "").toLowerCase() === "date" &&
+      String(cells[1] || "").toLowerCase() === "time";
+    if (isHeader) insideDataSection = true;
+    let observedAt: string | null = null;
+    let observedAtError: string | null = null;
+    if (insideDataSection && !isHeader) {
+      try {
+        observedAt = parseUkAirObservedAtUtc(cells[0] || "", cells[1] || "");
+      } catch (error) {
+        observedAtError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    entries.push({
+      line_number: lineIndex + 1,
+      raw_line: rawLine,
+      cells,
+      is_header: isHeader,
+      observed_at: observedAt,
+      observed_at_error: observedAtError,
+    });
+  }
+  return {
+    expected_time_basis_present: entries.some((entry) =>
+      entry.raw_line.replace(/^\uFEFF/, "").trim().includes(
+        expectedTimeBasisDeclaration,
+      )
+    ),
+    source_record_count: entries.filter((entry) =>
+      !entry.is_header && entry.observed_at !== null
+    ).length,
+    source_record_count_by_day: entries.reduce<Record<string, number>>(
+      (counts, entry) => {
+        const dayUtc = entry.observed_at?.slice(0, 10);
+        if (dayUtc) counts[dayUtc] = (counts[dayUtc] || 0) + 1;
+        return counts;
+      },
+      {},
+    ),
+    entries,
+  };
+}
+
+export function compactParsedUkAirFlatFileForDays(
+  structure: ParsedUkAirFlatFile,
+  selectedDays: ReadonlySet<string>,
+): ParsedUkAirFlatFile {
+  const entries: ParsedUkAirFlatFileEntry[] = [];
+  const retainedUnitEvidence = new Set<string>();
+  let headerSectionIndex = 0;
+  for (const entry of structure.entries) {
+    if (entry.is_header) {
+      headerSectionIndex += 1;
+      entries.push(entry);
+      continue;
+    }
+    if (entry.observed_at_error) {
+      entries.push(entry);
+      continue;
+    }
+    const dayUtc = entry.observed_at?.slice(0, 10) || "";
+    let retain = selectedDays.has(dayUtc);
+    for (let valueIndex = 2; valueIndex < entry.cells.length; valueIndex += 3) {
+      if (toFiniteUkAirCsvNumber(entry.cells[valueIndex]) === null) continue;
+      const unit = String(entry.cells[valueIndex + 2] || "").trim();
+      if (!unit) continue;
+      const evidenceKey = `${headerSectionIndex}|${valueIndex}|${unit}`;
+      if (!retainedUnitEvidence.has(evidenceKey)) {
+        retainedUnitEvidence.add(evidenceKey);
+        retain = true;
+      }
+    }
+    if (retain) entries.push(entry);
+  }
+  return {
+    expected_time_basis_present: structure.expected_time_basis_present,
+    source_record_count: structure.source_record_count,
+    source_record_count_by_day: { ...structure.source_record_count_by_day },
+    entries,
+  };
+}
+
 export function parseUkAirFlatFileObservations(args: {
   dayUtc: string;
   siteRef: string;
@@ -9273,15 +9408,28 @@ export function parseUkAirFlatFileObservations(args: {
   propertyMappings: ObservedPropertyMapping[];
   registryEntries?: ReadonlyMap<string, SosSourceLabelRegistryEntry> | null;
 }): UkAirFlatFileParseResult {
+  return parseUkAirFlatFileObservationsFromStructure({
+    ...args,
+    structure: parseUkAirFlatFileStructure(args.csvText),
+  });
+}
+
+export function parseUkAirFlatFileObservationsFromStructure(args: {
+  dayUtc: string;
+  siteRef: string;
+  sourceFile?: string;
+  structure: ParsedUkAirFlatFile;
+  mappings: SosSiteTimeseriesRef[];
+  propertyMappings: ObservedPropertyMapping[];
+  registryEntries?: ReadonlyMap<string, SosSourceLabelRegistryEntry> | null;
+  selectedPollutants?: ReadonlySet<string> | null;
+}): UkAirFlatFileParseResult {
   // This is intentionally lazy: non-SOS adapters never read an SOS snapshot.
   const registryEntries = args.registryEntries === undefined
     ? loadSosSourceLabelRegistrySnapshot()?.entries
     : args.registryEntries;
-  const lines = args.csvText.split(/\r?\n/);
   const expectedTimeBasisDeclaration = "All Data GMT hour ending";
-  if (!lines.some((line) =>
-    line.replace(/^\uFEFF/, "").trim().includes(expectedTimeBasisDeclaration)
-  )) {
+  if (!args.structure.expected_time_basis_present) {
     logStructured("warning", "sos_uk_air_csv_time_basis_warning", {
       site_ref: args.siteRef,
       source_file: args.sourceFile || args.siteRef,
@@ -9369,13 +9517,15 @@ export function parseUkAirFlatFileObservations(args: {
   let missingBindingSourceLabelColumns: MissingBindingSourceLabelColumn[] = [];
   const allMissingBindingSourceLabelColumns: MissingBindingSourceLabelColumn[] = [];
 
-  for (const [lineIndex, line] of lines.entries()) {
-    if (!line.trim()) continue;
-    const cells = parseCsvRow(line, ",").map((cell) => cell.trim());
-    if (
-      String(cells[0] || "").toLowerCase() === "date" &&
-      String(cells[1] || "").toLowerCase() === "time"
-    ) {
+  const selectedPollutants = args.selectedPollutants === undefined
+    ? (INTEGRITY_POLLUTANT_SCOPED_REPAIR
+      ? INTEGRITY_REPAIR_POLLUTANTS
+      : null)
+    : args.selectedPollutants;
+  for (const entry of args.structure.entries) {
+    const lineIndex = entry.line_number - 1;
+    const cells = entry.cells;
+    if (entry.is_header) {
       headerSectionIndex += 1;
       columnBindings = [];
       unselectedPollutantValueIndexes = [];
@@ -9458,8 +9608,8 @@ export function parseUkAirFlatFileObservations(args: {
           throw new Error(`invalid_observed_property_code source_label=${JSON.stringify(sourceLabel)} observed_property_code=${JSON.stringify(pollutantCode)}`);
         }
         if (
-          INTEGRITY_POLLUTANT_SCOPED_REPAIR &&
-          !INTEGRITY_REPAIR_POLLUTANTS.has(pollutantCode)
+          selectedPollutants &&
+          !selectedPollutants.has(pollutantCode)
         ) {
           unselectedPollutantValueIndexes.push(valueIndex);
           skipSourceLabel("mapped_out_of_scope");
@@ -9517,17 +9667,15 @@ export function parseUkAirFlatFileObservations(args: {
       !unselectedPollutantValueIndexes.length
     ) continue;
 
-    let observedAt: string;
-    try {
-      observedAt = parseUkAirObservedAtUtc(cells[0] || "", cells[1] || "");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+    if (!entry.observed_at) {
+      const message = entry.observed_at_error || "timestamp was not parsed";
       throw new Error(
         `invalid_uk_air_observation_timestamp site_ref=${args.siteRef} ` +
           `source_file=${JSON.stringify(args.sourceFile || null)} ` +
           `line_number=${lineIndex + 1} ${message}`,
       );
     }
+    const observedAt = entry.observed_at;
     const partitionDayUtc = observedAt.slice(0, 10);
     result.source_records += 1;
     // Unit evidence belongs to the header section, not only to the target
@@ -9691,6 +9839,378 @@ function ukAirFlatFilePath(root: string, siteRef: string, year: number): string 
     `year=${year}`,
     `${siteRef.toUpperCase()}_${year}.csv`,
   );
+}
+
+type SosSourceAcquisitionFileIdentity = {
+  source_file: string;
+  source_path: string;
+  sha256: string;
+  bytes: number;
+  mtime_ms: number;
+};
+
+type SosSourceAcquisitionPartition = {
+  schema_version: 1;
+  day_utc: string;
+  connector_id: 1;
+  pollutant_code: string;
+  source_file_results: Array<{
+    site_ref: string;
+    source_year: number;
+    source_file_identity: SosSourceAcquisitionFileIdentity;
+    parsed: UkAirFlatFileParseResult;
+  }>;
+};
+
+function sosSourceAcquisitionPartitionPath(
+  root: string,
+  dayUtc: string,
+  pollutantCode: string,
+): string {
+  return path.join(
+    root,
+    "partitions",
+    `day_utc=${dayUtc}`,
+    "connector_id=1",
+    `pollutant_code=${pollutantCode}`,
+    "source-partition.json",
+  );
+}
+
+function sosSourceAcquisitionManifestHash(
+  manifest: Record<string, unknown>,
+): string {
+  const semantic = { ...manifest };
+  delete semantic.acquisition_completion_sha256;
+  return deterministicSemanticHash(semantic);
+}
+
+function writeExclusiveJson(filePath: string, value: unknown): string {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const body = JSON.stringify(value);
+  fs.writeFileSync(filePath, body, { encoding: "utf8", flag: "wx" });
+  return sha256Hex(body);
+}
+
+export async function buildDedicatedSosSourceAcquisition(args: {
+  root: string;
+  runId: string;
+  requestedDays: string[];
+  requestedPollutants: string[];
+  sourceRoot?: string;
+  sourceReader?: (sourcePath: string) => string;
+  sourceStat?: (sourcePath: string) => { size: number; mtimeMs: number };
+  bridge?: SosSiteRefBridgeSnapshot;
+  propertyMappings?: ObservedPropertyMapping[];
+  registryEntries?: ReadonlyMap<string, SosSourceLabelRegistryEntry> | null;
+}): Promise<Record<string, unknown>> {
+  const root = path.resolve(args.root);
+  const requestedDays = Array.from(new Set(args.requestedDays.map((day) => {
+    const parsed = parseIsoDayUtc(day);
+    if (!parsed) throw new Error(`invalid_sos_acquisition_day day_utc=${day}`);
+    return parsed;
+  }))).sort(compareIsoDay);
+  const requestedPollutants = Array.from(new Set(
+    args.requestedPollutants.map((value) => value.trim().toLowerCase()),
+  )).sort();
+  if (
+    !args.runId.trim() || !requestedDays.length || !requestedPollutants.length ||
+    requestedPollutants.some((value) =>
+      !INTEGRITY_OBSERVATION_REPAIR_POLLUTANTS.has(value)
+    )
+  ) {
+    throw new Error("invalid_dedicated_sos_source_acquisition_scope");
+  }
+  if (fs.existsSync(root)) {
+    throw new Error(`sos_source_acquisition_root_already_exists path=${root}`);
+  }
+  const sourceRoot = args.sourceRoot || SOS_FLAT_FILE_ROOT;
+  if (!sourceRoot) {
+    throw new Error(
+      "UK_AQ_BACKFILL_SOS_FLAT_FILE_ROOT is required for SOS source acquisition",
+    );
+  }
+  const bridge = args.bridge || loadSosSiteRefBridgeSnapshot();
+  if (!bridge || bridge.connector_id !== 1) {
+    throw new Error("sos_source_acquisition_bridge_snapshot_required");
+  }
+  const propertyMappings = args.propertyMappings ||
+    await loadR2CoreObservedPropertyMappings();
+  const registryEntries = args.registryEntries === undefined
+    ? loadSosSourceLabelRegistrySnapshot()?.entries
+    : args.registryEntries;
+  if (!registryEntries) {
+    throw new Error("sos_source_acquisition_registry_snapshot_required");
+  }
+
+  fs.mkdirSync(root, { recursive: true });
+  const manifestPath = path.join(root, "acquisition-manifest.json");
+  fs.writeFileSync(manifestPath, JSON.stringify({
+    schema_version: 1,
+    run_id: args.runId,
+    acquisition_status: "building",
+  }), { encoding: "utf8", flag: "wx" });
+
+  const partitionResults = new Map<string, SosSourceAcquisitionPartition>();
+  for (const dayUtc of requestedDays) {
+    for (const pollutantCode of requestedPollutants) {
+      partitionResults.set(`${dayUtc}|${pollutantCode}`, {
+        schema_version: 1,
+        day_utc: dayUtc,
+        connector_id: 1,
+        pollutant_code: pollutantCode,
+        source_file_results: [],
+      });
+    }
+  }
+  const sourceYearSelection = requiredUkAirAnnualSourceYears(requestedDays);
+  const relevantMappings = bridge.rows.filter((mapping) =>
+    INTEGRITY_OBSERVATION_REPAIR_POLLUTANTS.has(mapping.pollutant_code) &&
+    requestedDays.some((dayUtc) => isSosMappingValidForDay(mapping, dayUtc))
+  );
+  const siteRefs = Array.from(new Set(
+    relevantMappings.map((mapping) => mapping.site_ref.toUpperCase()),
+  )).sort();
+  if (!siteRefs.length) {
+    throw new Error("sos_source_acquisition_has_no_relevant_site_refs");
+  }
+
+  const readSource = args.sourceReader || ((sourcePath: string) =>
+    fs.readFileSync(sourcePath, "utf8"));
+  const statSource = args.sourceStat || ((sourcePath: string) => {
+    const stat = fs.statSync(sourcePath);
+    return { size: stat.size, mtimeMs: stat.mtimeMs };
+  });
+  const sourceFileIdentities: SosSourceAcquisitionFileIdentity[] = [];
+  const sourceReadCounts = new Map<string, number>();
+  let totalSourceBytesRead = 0;
+  let totalSourceRowsScanned = 0;
+  let selectedRangeRows = 0;
+  let warningCount = 0;
+  const warningSamples: Record<string, unknown>[] = [];
+
+  for (const siteRef of siteRefs) {
+    for (const sourceYear of sourceYearSelection.years) {
+      const sourcePath = ukAirFlatFilePath(sourceRoot, siteRef, sourceYear);
+      const stat = statSource(sourcePath);
+      if (!Number.isFinite(stat.size) || stat.size <= 0) {
+        throw new Error(`UK-AIR annual CSV cache is missing or empty: ${sourcePath}`);
+      }
+      const csvText = readSource(sourcePath);
+      sourceReadCounts.set(sourcePath, (sourceReadCounts.get(sourcePath) || 0) + 1);
+      const bytes = Buffer.byteLength(csvText, "utf8");
+      if (bytes <= 0 || bytes !== stat.size) {
+        throw new Error(`UK-AIR annual CSV identity changed while reading: ${sourcePath}`);
+      }
+      const identity: SosSourceAcquisitionFileIdentity = {
+        source_file: sourcePath,
+        source_path: sourcePath,
+        sha256: sha256Hex(csvText),
+        bytes,
+        mtime_ms: Math.trunc(stat.mtimeMs),
+      };
+      sourceFileIdentities.push(identity);
+      totalSourceBytesRead += bytes;
+      const fullStructure = parseUkAirFlatFileStructure(csvText);
+      totalSourceRowsScanned += fullStructure.source_record_count;
+      const structure = compactParsedUkAirFlatFileForDays(
+        fullStructure,
+        new Set(requestedDays),
+      );
+
+      for (const dayUtc of requestedDays) {
+        for (const pollutantCode of requestedPollutants) {
+          if (!requiredUkAirAnnualSourceYears([dayUtc]).years.includes(sourceYear)) {
+            continue;
+          }
+          const partitionMappings = relevantMappings.filter((mapping) =>
+            mapping.site_ref.toUpperCase() === siteRef &&
+            mapping.pollutant_code === pollutantCode &&
+            isSosMappingValidForDay(mapping, dayUtc)
+          );
+          const parsed = parseUkAirFlatFileObservationsFromStructure({
+            dayUtc,
+            siteRef,
+            sourceFile: path.basename(sourcePath),
+            structure,
+            mappings: partitionMappings,
+            propertyMappings,
+            registryEntries,
+            selectedPollutants: new Set([pollutantCode]),
+          });
+          const canonical = inspectIntegritySourceRowsForBlockingEvidence(
+            parsed.rows,
+            1,
+          );
+          if (
+            parsed.blocked_target_day_rows > 0 ||
+            canonical.duplicate_canonical_row_count > 0 ||
+            canonical.uncanonicalisable_source_row_count > 0
+          ) {
+            throw new Error(
+              "dedicated_sos_source_acquisition_partition_invalid " +
+                `day_utc=${dayUtc} pollutant_code=${pollutantCode}`,
+            );
+          }
+          parsed.rows = canonical.canonical_observation_rows.map((row) => ({
+            ...row,
+            status: normalizeUkAirVerificationStatus(row.status ?? null),
+          }));
+          parsed.mapped_records = parsed.rows.length;
+          parsed.source_records = structure.source_record_count;
+          parsed.skipped_other_days = Math.max(
+            0,
+            structure.source_record_count -
+              Number(structure.source_record_count_by_day[dayUtc] || 0),
+          );
+          selectedRangeRows += parsed.selected_source_records_examined;
+          for (const classification of parsed.source_label_classifications) {
+            if (
+              ["review", "unregistered", "no_authoritative_timeseries_binding"]
+                .includes(String(classification.classification || "")) &&
+              Number(classification.target_day_non_null_row_count || 0) > 0
+            ) {
+              warningCount += 1;
+              if (warningSamples.length < INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT) {
+                warningSamples.push({ day_utc: dayUtc, pollutant_code: pollutantCode, ...classification });
+              }
+            }
+          }
+          partitionResults.get(`${dayUtc}|${pollutantCode}`)!
+            .source_file_results.push({
+              site_ref: siteRef,
+              source_year: sourceYear,
+              source_file_identity: identity,
+              parsed,
+            });
+        }
+      }
+    }
+  }
+
+  const maximumReadCount = Math.max(...sourceReadCounts.values(), 0);
+  if (
+    sourceReadCounts.size !== sourceFileIdentities.length ||
+    maximumReadCount !== 1
+  ) {
+    throw new Error("sos_source_acquisition_source_file_read_count_invalid");
+  }
+  const partitionFiles: Array<Record<string, unknown>> = [];
+  const partitionRowCounts: Record<string, number> = {};
+  for (const [identity, partition] of Array.from(partitionResults.entries()).sort()) {
+    if (!partition.source_file_results.length) {
+      throw new Error(`sos_source_acquisition_partition_files_missing partition=${identity}`);
+    }
+    const partitionPath = sosSourceAcquisitionPartitionPath(
+      root,
+      partition.day_utc,
+      partition.pollutant_code,
+    );
+    const partitionSha256 = writeExclusiveJson(partitionPath, partition);
+    const rowCount = partition.source_file_results.reduce(
+      (total, entry) => total + entry.parsed.rows.length,
+      0,
+    );
+    partitionRowCounts[identity] = rowCount;
+    partitionFiles.push({
+      day_utc: partition.day_utc,
+      connector_id: 1,
+      pollutant_code: partition.pollutant_code,
+      path: partitionPath,
+      sha256: partitionSha256,
+      row_count: rowCount,
+    });
+  }
+  sourceFileIdentities.sort((left, right) =>
+    left.source_file.localeCompare(right.source_file)
+  );
+  const completedManifest: Record<string, unknown> = {
+    schema_version: 1,
+    run_id: args.runId,
+    acquisition_status: "complete",
+    acquisition_strategy: "single_run_scoped_sos_annual_csv_pass",
+    selected_from_day: requestedDays[0],
+    selected_to_day: requestedDays[requestedDays.length - 1],
+    selected_days: requestedDays,
+    connector_id: 1,
+    requested_pollutants: requestedPollutants,
+    source_file_identities: sourceFileIdentities,
+    unique_source_file_count: sourceFileIdentities.length,
+    source_files_opened: sourceReadCounts.size,
+    maximum_source_file_open_count: maximumReadCount,
+    total_source_bytes_read: totalSourceBytesRead,
+    total_source_rows_scanned: totalSourceRowsScanned,
+    selected_range_rows: selectedRangeRows,
+    partition_dataset_count: partitionFiles.length,
+    partition_row_counts: partitionRowCounts,
+    partition_files: partitionFiles,
+    warning_count: warningCount,
+    warnings: warningSamples,
+    detector_rescans_avoided: partitionFiles.length,
+    proposal_builder_rescans_avoided: partitionFiles.length,
+  };
+  completedManifest.acquisition_completion_sha256 =
+    sosSourceAcquisitionManifestHash(completedManifest);
+  fs.writeFileSync(manifestPath, JSON.stringify(completedManifest), "utf8");
+  return completedManifest;
+}
+
+function loadDedicatedSosSourceAcquisitionPartition(args: {
+  root: string;
+  runId: string;
+  dayUtc: string;
+  pollutantCode: string;
+}): SosSourceAcquisitionPartition {
+  const manifestPath = path.join(args.root, "acquisition-manifest.json");
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error(`sos_source_acquisition_manifest_missing path=${manifestPath}`);
+  }
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+  const completionHash = String(manifest.acquisition_completion_sha256 || "");
+  if (
+    manifest.schema_version !== 1 ||
+    manifest.acquisition_status !== "complete" ||
+    String(manifest.run_id || "") !== args.runId ||
+    Number(manifest.connector_id) !== 1 ||
+    !Array.isArray(manifest.selected_days) ||
+    !manifest.selected_days.includes(args.dayUtc) ||
+    !Array.isArray(manifest.requested_pollutants) ||
+    !manifest.requested_pollutants.includes(args.pollutantCode) ||
+    !/^[a-f0-9]{64}$/.test(completionHash) ||
+    completionHash !== sosSourceAcquisitionManifestHash(manifest)
+  ) {
+    throw new Error("sos_source_acquisition_manifest_invalid_or_incomplete");
+  }
+  const partitionEntry = (manifest.partition_files as Array<Record<string, unknown>>)
+    .find((entry) =>
+      entry.day_utc === args.dayUtc &&
+      Number(entry.connector_id) === 1 &&
+      entry.pollutant_code === args.pollutantCode
+    );
+  if (!partitionEntry) {
+    throw new Error("sos_source_acquisition_partition_manifest_missing");
+  }
+  const partitionPath = sosSourceAcquisitionPartitionPath(
+    args.root,
+    args.dayUtc,
+    args.pollutantCode,
+  );
+  if (String(partitionEntry.path || "") !== partitionPath) {
+    throw new Error("sos_source_acquisition_partition_path_invalid");
+  }
+  const body = fs.readFileSync(partitionPath, "utf8");
+  if (sha256Hex(body) !== String(partitionEntry.sha256 || "")) {
+    throw new Error("sos_source_acquisition_partition_hash_invalid");
+  }
+  const partition = JSON.parse(body) as SosSourceAcquisitionPartition;
+  if (
+    partition.schema_version !== 1 || partition.day_utc !== args.dayUtc ||
+    partition.connector_id !== 1 || partition.pollutant_code !== args.pollutantCode ||
+    !Array.isArray(partition.source_file_results)
+  ) {
+    throw new Error("sos_source_acquisition_partition_invalid");
+  }
+  return partition;
 }
 
 type OpenaqCsvParseResult = {
@@ -14616,8 +15136,23 @@ async function runSourceToAll(
           );
 
           const flatFileRows: SourceObservationRow[] = [];
+          const acquisitionPartition =
+            SOS_SOURCE_ACQUISITION_MODE === "consume"
+              ? loadDedicatedSosSourceAcquisitionPartition({
+                root: String(SOS_SOURCE_ACQUISITION_ROOT || ""),
+                runId: String(SOS_SOURCE_ACQUISITION_RUN_ID || ""),
+                dayUtc,
+                pollutantCode: Array.from(INTEGRITY_REPAIR_POLLUTANTS)[0] || "",
+              })
+              : null;
           const flatFileSiteRefs = Array.from(
-            new Set(validFlatFileMappings.map((row) => row.site_ref.toUpperCase())),
+            new Set(
+              acquisitionPartition
+                ? acquisitionPartition.source_file_results.map((entry) =>
+                  entry.site_ref.toUpperCase()
+                )
+                : validFlatFileMappings.map((row) => row.site_ref.toUpperCase()),
+            ),
           ).sort();
           const flatFileSourceYearSelection =
             requiredUkAirAnnualSourceYears([dayUtc]);
@@ -14644,6 +15179,13 @@ async function runSourceToAll(
           const flatFileSourceLabelClassifications: Array<Record<string, unknown>> = [];
           const flatFileBlockedTargetDayRowSamples: Record<string, unknown>[] = [];
           const flatFileUnits = new Set<string>();
+          const acquisitionResultsByFile = new Map(
+            (acquisitionPartition?.source_file_results || []).map((entry) => [
+              entry.source_file_identity.source_file,
+              entry,
+            ]),
+          );
+          const consumedAcquisitionFiles = new Set<string>();
           for (const siteRef of flatFileSiteRefs) {
             for (const sourceYear of flatFileSourceYears) {
               const csvPath = ukAirFlatFilePath(
@@ -14653,22 +15195,50 @@ async function runSourceToAll(
               );
               sourceFilesEnumerated.push(csvPath);
               sourceFilesRequired.push(csvPath);
-              if (!fs.existsSync(csvPath) || fs.statSync(csvPath).size <= 0) {
-                throw new Error(
-                  `UK-AIR annual CSV cache is missing or empty: ${csvPath}`,
-                );
+              let parsed: UkAirFlatFileParseResult;
+              const acquired = acquisitionResultsByFile.get(csvPath);
+              if (acquisitionPartition) {
+                if (!acquired) {
+                  throw new Error(
+                    `sos_source_acquisition_required_partition_file_missing file=${csvPath}`,
+                  );
+                }
+                const identity = acquired.source_file_identity;
+                if (
+                  identity.source_file !== csvPath ||
+                  !/^[a-f0-9]{64}$/.test(identity.sha256) ||
+                  !Number.isInteger(identity.bytes) || identity.bytes <= 0
+                ) {
+                  throw new Error(
+                    `sos_source_acquisition_partition_file_identity_invalid file=${csvPath}`,
+                  );
+                }
+                sourceFilesRead.push(csvPath);
+                sourceFileIdentities.set(csvPath, {
+                  source_file: csvPath,
+                  sha256: identity.sha256,
+                  bytes: identity.bytes,
+                });
+                parsed = acquired.parsed;
+                consumedAcquisitionFiles.add(csvPath);
+              } else {
+                if (!fs.existsSync(csvPath) || fs.statSync(csvPath).size <= 0) {
+                  throw new Error(
+                    `UK-AIR annual CSV cache is missing or empty: ${csvPath}`,
+                  );
+                }
+                const csvText = fs.readFileSync(csvPath, "utf8");
+                sourceFilesRead.push(csvPath);
+                recordSourceFileRead(csvPath, csvText);
+                parsed = parseUkAirFlatFileObservations({
+                  dayUtc,
+                  siteRef,
+                  sourceFile: path.basename(csvPath),
+                  csvText,
+                  mappings: validFlatFileMappings,
+                  propertyMappings: observedPropertyMappings,
+                });
               }
-              const csvText = fs.readFileSync(csvPath, "utf8");
-              sourceFilesRead.push(csvPath);
-              recordSourceFileRead(csvPath, csvText);
-              const parsed = parseUkAirFlatFileObservations({
-                dayUtc,
-                siteRef,
-                sourceFile: path.basename(csvPath),
-                csvText,
-                mappings: validFlatFileMappings,
-                propertyMappings: observedPropertyMappings,
-              });
               appendRowsSafe(flatFileRows, parsed.rows);
               flatFileSourceRecords += parsed.source_records;
               flatFileSkippedOtherDays += parsed.skipped_other_days;
@@ -14692,6 +15262,12 @@ async function runSourceToAll(
               }
               parsed.units.forEach((unit) => flatFileUnits.add(unit));
             }
+          }
+          if (
+            acquisitionPartition &&
+            consumedAcquisitionFiles.size !== acquisitionResultsByFile.size
+          ) {
+            throw new Error("sos_source_acquisition_partition_file_scope_mismatch");
           }
           const sourceLabelClassificationSummary = new Map<string, {
             classification: string;
@@ -16192,6 +16768,66 @@ async function main(): Promise<void> {
       } else {
         runStatus = DRY_RUN ? "dry_run" : "ok";
       }
+    } else if (SOS_SOURCE_ACQUISITION_MODE === "acquire") {
+      if (
+        !SOS_SOURCE_ACQUISITION_ROOT || !SOS_SOURCE_ACQUISITION_RUN_ID ||
+        CONNECTOR_IDS?.length !== 1 || CONNECTOR_IDS[0] !== 1 ||
+        !INTEGRITY_POLLUTANT_SCOPED_REPAIR
+      ) {
+        throw new Error("dedicated_sos_source_acquisition_configuration_invalid");
+      }
+      const requestedDays = buildBackwardDayRange(
+        window.from_day_utc,
+        window.to_day_utc,
+      );
+      const acquisition = await buildDedicatedSosSourceAcquisition({
+        root: SOS_SOURCE_ACQUISITION_ROOT,
+        runId: SOS_SOURCE_ACQUISITION_RUN_ID,
+        requestedDays,
+        requestedPollutants: Array.from(INTEGRITY_REPAIR_POLLUTANTS),
+      });
+      const zeroTarget = {
+        submitted_count: 0,
+        rpc_call_count: 0,
+        matched_count: 0,
+        would_update_count: 0,
+        updated_count: 0,
+        unchanged_count: 0,
+      };
+      summary = {
+        mode: "source_to_r2",
+        run_id: runId,
+        dry_run: false,
+        from_day_utc: window.from_day_utc,
+        to_day_utc: window.to_day_utc,
+        days_planned: requestedDays.length,
+        days_processed: requestedDays.length,
+        source_connector_day_complete: Number(
+          acquisition.partition_dataset_count || 0,
+        ),
+        source_connector_day_skipped: 0,
+        source_connector_day_error: 0,
+        source_processed_days: requestedDays,
+        source_failed_days: [],
+        rows_read: Number(acquisition.selected_range_rows || 0),
+        rows_written_aqilevels: 0,
+        objects_written_r2: 0,
+        retention_window: {},
+        local_to_aqilevels_days: [],
+        source_acquisition_pending_days: [],
+        local_to_aqilevels_summary: null,
+        first_value_at_reconciliation: {
+          connector_day_count: 0,
+          failed_connector_day_count: 0,
+          candidate_timeseries_count: 0,
+          payload_chunk_count: 0,
+          ingestdb: { ...zeroTarget },
+          obs_aqidb: { ...zeroTarget },
+        },
+        warnings: [],
+        sos_source_acquisition: acquisition,
+      };
+      runStatus = "ok";
     } else {
       summary = await runSourceToAll(runId, window, ledgerEnabled);
       if (summary.source_connector_day_error > 0) {
