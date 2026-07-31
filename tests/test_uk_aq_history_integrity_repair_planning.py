@@ -42,12 +42,109 @@ class V2RepairPlanningTest(unittest.TestCase):
             to_day="2026-07-30",
             repair_pollutants=["pm25"],
         )
-        with self.assertRaisesRegex(RuntimeError, "outside protected set"):
+        with self.assertRaisesRegex(RuntimeError, r"exactly \[1\]"):
             integrity.select_sos_historical_replacement_route(
                 args,
                 mutation_connector_ids=[1],
                 protected_connector_ids=[2],
             )
+        with self.assertRaisesRegex(RuntimeError, r"exactly \[1\]"):
+            integrity.select_sos_historical_replacement_route(
+                args,
+                mutation_connector_ids=[1],
+                protected_connector_ids=[1, 2, 3],
+            )
+
+    def test_sos_light_materialises_source_plus_dropbox_complete_day(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dropbox = root / "dropbox"
+            source = root / "source"
+            day = "2026-07-12"
+            day_prefix = f"history/v2/observations/day_utc={day}"
+            dropbox_peer = dropbox / day_prefix / "connector_id=7/pollutant_code=humidity/part-00000.parquet"
+            dropbox_peer.parent.mkdir(parents=True)
+            dropbox_peer.write_bytes(b"dropbox-humidity")
+            old_selected = dropbox / day_prefix / "connector_id=1/pollutant_code=pm25/part-00000.parquet"
+            old_selected.parent.mkdir(parents=True)
+            old_selected.write_bytes(b"old-dropbox-pm25")
+            run_state = integrity.create_run_overlay(
+                tmp_dir=root / "runs",
+                run_id="sos-light-test",
+                environment="CIC-Test",
+                base_dropbox_root=dropbox,
+            )
+
+            def stage(key: str, body: bytes) -> None:
+                path = source / key
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(body)
+                integrity.stage_overlay_object(
+                    run_state,
+                    object_key=key,
+                    source_path=path,
+                    stage="observations_data",
+                )
+                integrity.mark_overlay_structurally_validated(run_state, key)
+
+            selected_part = f"{day_prefix}/connector_id=1/pollutant_code=pm25/part-00000.parquet"
+            selected_manifest = f"{day_prefix}/connector_id=1/pollutant_code=pm25/manifest.json"
+            connector_1_parent = f"{day_prefix}/connector_id=1/manifest.json"
+            connector_7_parent = f"{day_prefix}/connector_id=7/manifest.json"
+            day_parent = f"{day_prefix}/manifest.json"
+            dropbox_connector_7_parent = dropbox / connector_7_parent
+            dropbox_connector_7_parent.parent.mkdir(parents=True, exist_ok=True)
+            dropbox_connector_7_parent.write_text(
+                json.dumps({"child_manifests": []}), encoding="utf-8"
+            )
+            stage(selected_part, b"fresh-sos-pm25")
+            stage(selected_manifest, json.dumps({"manifest_key": selected_manifest, "manifest_hash": "a" * 64}).encode())
+            stage(connector_1_parent, json.dumps({
+                "pollutant_manifests": [{"manifest_key": selected_manifest}],
+                "child_manifests": [],
+            }).encode())
+            stage(day_parent, json.dumps({
+                "connector_manifests": [
+                    {"manifest_key": connector_1_parent},
+                    {"manifest_key": connector_7_parent},
+                ],
+                "child_manifests": [],
+            }).encode())
+            run_state["tombstone_prefixes"] = [{
+                "prefix": f"{day_prefix}/connector_id=1/pollutant_code=pm25",
+                "proposed": True,
+            }]
+            run_state["sos_light"] = {
+                "mode": "sos-light",
+                "validation_status": "validated_local_assembly",
+                "old_live_r2_observation_bodies_used": False,
+                "days": [{
+                    "day_utc": day,
+                    "final_connector_1_child_set": [selected_manifest],
+                    "final_assembled_connector_ids": [1, 7],
+                    "omitted_dropbox_connector_prefixes": [],
+                }],
+            }
+            result = integrity.assemble_sos_light_complete_days(run_state)
+            self.assertEqual(run_state["mode"], "sos-light")
+            self.assertEqual(
+                [entry["prefix"] for entry in run_state["tombstone_prefixes"]],
+                [day_prefix],
+            )
+            self.assertEqual(
+                Path(run_state["objects"][str(dropbox_peer.relative_to(dropbox))]["local_path"]).read_bytes(),
+                b"dropbox-humidity",
+            )
+            self.assertEqual(
+                run_state["objects"][connector_7_parent]["proposal_owner"],
+                "dropbox_day_baseline",
+            )
+            self.assertEqual(
+                Path(run_state["objects"][selected_part]["local_path"]).read_bytes(),
+                b"fresh-sos-pm25",
+            )
+            self.assertTrue(result["no_old_live_r2_body_planning_or_preservation"])
+            self.assertEqual(result["complete_day_deletion_count"], 1)
 
     def test_observation_index_gap_plans_index_only_without_command(self):
         with tempfile.TemporaryDirectory() as tmp:

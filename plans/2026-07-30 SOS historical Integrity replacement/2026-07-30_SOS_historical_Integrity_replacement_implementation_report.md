@@ -447,3 +447,51 @@ No Integrity process, R2, Dropbox, Supabase, GCP or other external service was a
 ```
 
 Expected audit: protected connector IDs `[1]`; connector `7` humidity reported as an unprotected pollutant omission warning; its child objects untouched; connector `1` completes ordered apply and final verification; Timeseries and Latest Snapshot reconciliation run; overall status may be `ok` with a non-zero warning count.
+
+## 31 July 2026 SOS-light correction
+
+This section supersedes the protected-preservation amendment above. That design was retired because it treated the previous live R2 graph as preservation input and allowed unrelated connector defects to veto connector `1`. The operator-facing mode and run-state value is now `sos-light`.
+
+For every selected day, the only local assembly authorities are the current run's identity-pinned SOS source for selected connector `1` pollutants and the chosen Dropbox history baseline for the rest of the day. Planning does not GET, compare, merge, or preserve old live R2 observation bodies. Connector `1` remains strict; other connectors are Dropbox-only and warning-only. A usable Dropbox connector parent may be retained without certifying every descendant. An unusable unprotected connector parent is warned and omitted locally without blocking connector `1`.
+
+The planner constructs connector `1` from every final pollutant manifest actually present in the assembled local tree, not from the old Dropbox parent child list. Therefore a source-built O3 child is included in the final connector body, `pollutant_codes`, hashes, counts, proposal dependencies and local dependency snapshot alongside PM2.5, PM10 and NO2. The day parent is then rebuilt from the final assembled connector parents.
+
+Python materialises the complete replacement day in the proposal: source-built selected connector `1` objects plus every retained Dropbox day object. Only after that complete local graph and the Dropbox-baseline-derived affected index proposal pass validation are the selected pollutant tombstones replaced with one destructive target per day:
+
+```text
+history/v2/observations/day_utc=<day>/
+```
+
+Apply acquires the existing writer locks, lists and deletes the complete day, verifies deletion, uploads the assembled child objects and connector parents, publishes the prevalidated day parent, and publishes the preplanned affected observation indexes last. Every object written by the run receives one post-PUT verification GET. SOS-light does not recompute the index proposal from live observation bodies and does not perform a final broad R2 scan. AQI data and indexes remain outside this route.
+
+Current-state reconciliation remains downstream of verified R2 publication. Timeseries and Latest Snapshot candidates come only from final verified connector `1` source evidence; Latest Snapshot remains limited to PM2.5, PM10 and NO2, with O3 excluded.
+
+### SOS-light files changed
+
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`: `mode=sos-light`, exact protected/selected `[1]` enforcement, complete source-plus-Dropbox day materialisation, full-day destructive scope, audit/report fields and verification accounting.
+- `scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs`: final connector `1` child-set construction and warning-only Dropbox parent selection, with no live planning adapter.
+- `scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`: complete-day validation/deletion ordering, local final-graph validation, complete-day publication and planned-index-last application.
+- `tests/test_uk_aq_history_integrity_repair_planning.py` and `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`: focused SOS-light scope, O3 child-set, Dropbox warning and pre-mutation validation coverage.
+
+No shared writer or shared index implementation was changed. Generic Integrity and Prune Daily retain their existing behaviour. No `system_docs/` file was changed.
+
+### Focused structural validation
+
+Passed locally on 31 July 2026: old connector `1` PM2.5/PM10/NO2 parent versus a final four-child PM2.5/PM10/NO2/O3 parent; identical four-child body/dependency evidence; an unusable Dropbox connector warning and omission without blocking connector `1`; source-plus-Dropbox complete-day materialisation; complete-day deletion scope; invalid connector `1` source/parent failure before remote adapters; exact `[1]` protection enforcement; and one existing generic-path apply-safety check. Python compilation, JavaScript syntax checks and `git diff --check` also passed. The actual Integrity command and all external services remained outside structural validation.
+
+### CIC-Test rerun
+
+```bash
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
+  --env CIC-Test \
+  --profile manual \
+  --source sos \
+  --from-day 2026-06-17 \
+  --to-day 2026-07-30 \
+  --history-version v2 \
+  --run-backfill \
+  --repair-pollutants pm25,pm10,no2,o3 \
+  --allow-stale-dropbox
+```
+
+Expected audit fields include `mode=sos-light`, selected days and pollutants, Dropbox baseline, source identities, the two assembly authorities, `old_live_r2_observation_bodies_used=false`, final connector `1` child sets, final assembled connector sets, Dropbox warning/omission counts, complete-day deletion/upload counts, changed-object verification, affected index results, and separate R2, Timeseries, Latest Snapshot and overall statuses.

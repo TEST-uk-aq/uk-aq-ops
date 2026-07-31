@@ -208,6 +208,8 @@ const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
 ]);
 const CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN =
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
+const CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN =
+  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
 const CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN =
   /^history\/v2\/aqilevels\/hourly\/(data|debug)\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN =
@@ -225,6 +227,16 @@ function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
 }
 
 function assertCanonicalDeletionPrefix(prefix, entry) {
+  const observationDayMatch = prefix.match(CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN);
+  if (observationDayMatch) {
+    const dayUtc = observationDayMatch[1];
+    const parsedDay = new Date(`${dayUtc}T00:00:00.000Z`);
+    if (Number.isNaN(parsedDay.getTime()) || parsedDay.toISOString().slice(0, 10) !== dayUtc
+      || entry?.stage !== "sos_light_complete_day") {
+      throw new Error(`SOS-light complete-day deletion evidence is invalid: ${prefix}`);
+    }
+    return;
+  }
   const observationPollutantMatch = prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
   const aqiPollutantMatch = prefix.match(CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN);
   const pollutantMatch = observationPollutantMatch || aqiPollutantMatch;
@@ -377,130 +389,60 @@ export function validateLocalProposal(runState) {
 }
 
 export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
-  if (runState?.execution_path !== "dedicated_sos_historical_observation_replacement") {
+  if (runState?.execution_path !== "sos_light") {
     return { dedicated: false };
   }
-  const preservation = runState.protected_connector_preservation;
-  const protectedConnectorIds = preservation?.protected_connector_ids;
-  const selectedMutationConnectorIds = preservation?.selected_mutation_connector_ids;
+  const audit = runState.sos_light;
   if (runState.environment !== "CIC-Test"
+    || runState.mode !== "sos-light"
     || JSON.stringify(runState.mutation_connector_ids) !== "[1]"
     || JSON.stringify(runState.selected_mutation_connector_ids) !== "[1]"
-    || !Array.isArray(protectedConnectorIds)
-    || !protectedConnectorIds.length
-    || JSON.stringify([...new Set(protectedConnectorIds)].sort((a, b) => a - b)) !== JSON.stringify(protectedConnectorIds)
-    || protectedConnectorIds.some((value) => !Number.isInteger(value) || value <= 0)
-    || JSON.stringify(selectedMutationConnectorIds) !== "[1]"
-    || !selectedMutationConnectorIds.every((connectorId) => protectedConnectorIds.includes(connectorId))
-    || preservation?.protected_connector_validation_status !== "validated_pre_mutation"
+    || JSON.stringify(runState.protected_connector_ids) !== "[1]"
+    || audit?.mode !== "sos-light"
+    || audit?.validation_status !== "complete_local_days_validated"
+    || audit?.old_live_r2_observation_bodies_used !== false
+    || audit?.no_old_live_r2_body_planning_or_preservation !== true
     || runState.aqi_policy !== "bypassed_observation_history_only") {
-    throw new Error("Dedicated SOS proposal has invalid execution-scope evidence");
+    throw new Error("SOS-light proposal has invalid execution-scope or authority evidence");
   }
-  const permittedParentRewrites = new Set(
-    Array.isArray(preservation.permitted_parent_metadata_rewrites)
-      ? preservation.permitted_parent_metadata_rewrites.map(String)
-      : [],
-  );
   const aqiScopeSets = ["AQILEVELS_CHANGED", "AQI_MANIFESTS_CHANGED", "AQI_INDEXES_CHANGED"];
   if (aqiScopeSets.some((scope) => (runState.changed_scopes?.[scope] || []).length > 0)) {
-    throw new Error("Dedicated SOS proposal must not contain AQI changed scopes");
+    throw new Error("SOS-light proposal must not contain AQI changed scopes");
   }
-  for (const item of proposal.prefixes) {
-    const match = item.prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
-    if (!match || Number(match[2]) !== 1 || item.domain !== "observations") {
-      throw new Error(`Dedicated SOS deletion is outside connector-1 observations: ${item.prefix}`);
+  const selectedDays = [...new Set((audit.days || []).map((entry) => String(entry?.day_utc || "")))].sort();
+  const deletionDays = proposal.prefixes.map((item) => {
+    const match = item.prefix.match(CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN);
+    if (!match || item.domain !== "observations") {
+      throw new Error(`SOS-light deletion is not a complete observation day: ${item.prefix}`);
     }
+    return match[1];
+  }).sort();
+  if (!selectedDays.length || JSON.stringify(selectedDays) !== JSON.stringify(deletionDays)) {
+    throw new Error("SOS-light requires exactly one complete-day deletion per assembled day");
   }
-  const connectorDayParquet = new Map();
-  for (const object of proposal.objects) {
-    if (object.domain !== "observations" || object.key.includes("aqilevels")) {
-      throw new Error(`Dedicated SOS proposal contains an AQI object: ${object.key}`);
-    }
-    const connectorMatch = object.key.match(/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)/);
-    if (connectorMatch && Number(connectorMatch[2]) !== 1) {
-      const permittedUnprotectedParent = permittedParentRewrites.has(object.key)
-        && /\/connector_id=[1-9]\d*\/manifest\.json$/.test(object.key);
-      if (!permittedUnprotectedParent) {
-        throw new Error(`Dedicated SOS proposal contains a non-connector-1 mutation: ${object.key}`);
-      }
-    }
-    if (connectorMatch && object.key.endsWith(".parquet")) {
-      const groupKey = `${connectorMatch[1]}|${connectorMatch[2]}`;
-      const group = connectorDayParquet.get(groupKey) || { bytes: 0, entries: 0 };
-      group.bytes += object.body.byteLength;
-      group.entries += 1;
-      connectorDayParquet.set(groupKey, group);
-    }
-  }
-  const omissions = Array.isArray(preservation.unprotected_omissions)
-    ? preservation.unprotected_omissions : [];
   const proposedKeys = new Set(proposal.objects.map((object) => object.key));
-  const parentRewritesFromOmissions = new Set();
-  for (const omission of omissions) {
-    const objectKey = String(omission?.object_key || "");
-    const connectorId = Number(omission?.connector_id);
-    const dayUtc = String(omission?.day_utc || "");
-    const pollutantCode = String(omission?.pollutant_code || "").trim().toLowerCase();
-    const expectedOmittedKey = omission?.omission_level === "pollutant"
-      ? `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`
-      : omission?.omission_level === "connector"
-      ? `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`
-      : omission?.omission_level === "day"
-      ? `history/v2/observations/day_utc=${dayUtc}/manifest.json`
-      : "";
-    if (!objectKey || !Number.isInteger(connectorId) || connectorId <= 0
-      || objectKey !== expectedOmittedKey
-      || protectedConnectorIds.includes(connectorId)
-      || omission.child_deleted !== false
-      || omission.child_overwritten !== false
-      || omission.child_tombstoned !== false
-      || proposedKeys.has(objectKey)
-      || proposal.prefixes.some((item) => objectKey.startsWith(`${item.prefix}/`))) {
-      throw new Error(`Dedicated SOS proposal has invalid unprotected omission evidence: ${objectKey}`);
-    }
-    for (const parentKey of omission.parent_keys_rebuilt || []) {
-      parentRewritesFromOmissions.add(parentKey);
-      if (!permittedParentRewrites.has(parentKey) || !proposedKeys.has(parentKey)) {
-        throw new Error(`Dedicated SOS omission parent rewrite is not proposed: ${parentKey}`);
-      }
-    }
-    for (const object of proposal.objects) {
-      if (object.body.includes(objectKey)) {
-        throw new Error(`Dedicated SOS rebuilt parent retains omitted child reference: ${objectKey}`);
-      }
+  for (const day of selectedDays) {
+    const dayPrefix = `history/v2/observations/day_utc=${day}`;
+    if (!proposedKeys.has(`${dayPrefix}/manifest.json`)
+      || !proposedKeys.has(`${dayPrefix}/connector_id=1/manifest.json`)) {
+      throw new Error(`SOS-light complete assembled day is missing required parents: ${day}`);
     }
   }
-  if (JSON.stringify([...parentRewritesFromOmissions].sort())
-      !== JSON.stringify([...permittedParentRewrites].sort())) {
-    throw new Error("Dedicated SOS proposal contains an undeclared permitted parent rewrite");
-  }
-  if (Number(preservation.unprotected_pollutant_omission_count || 0)
-      !== omissions.filter((item) => item?.omission_level === "pollutant").length
-    || Number(preservation.unprotected_connector_omission_count || 0)
-      !== omissions.filter((item) => item?.omission_level === "connector").length
-    || Number(preservation.unprotected_day_omission_count || 0)
-      !== omissions.filter((item) => item?.omission_level === "day").length
-    || preservation.omitted_unprotected_children_mutated !== false) {
-    throw new Error("Dedicated SOS proposal has contradictory unprotected omission accounting");
-  }
-  for (const [groupKey, group] of connectorDayParquet) {
-    if (group.bytes > VERIFIED_GET_CACHE_MAX_BYTES || group.entries > VERIFIED_GET_CACHE_MAX_ENTRIES) {
-      throw new Error(
-        `Dedicated SOS verified-body cache capacity exceeded before mutation: ${groupKey} bytes=${group.bytes} entries=${group.entries}`,
-      );
-    }
+  if (proposal.objects.some((object) => object.domain !== "observations" || object.key.includes("aqilevels"))) {
+    throw new Error("SOS-light proposal contains an AQI object");
   }
   return {
     dedicated: true,
+    mode: "sos-light",
     connector_id: 1,
     observation_object_count: proposal.objects.length,
-    exact_pollutant_prefix_count: proposal.prefixes.length,
-    verified_body_cache_capacity_preflight: "succeeded",
-    protected_connector_ids: protectedConnectorIds,
-    selected_mutation_connector_ids: selectedMutationConnectorIds,
-    protected_connector_validation_status: "validated_pre_mutation",
-    unprotected_omission_count: omissions.length,
-    omitted_unprotected_children_mutated: false,
+    complete_day_prefix_count: proposal.prefixes.length,
+    selected_days: selectedDays,
+    protected_connector_ids: [1],
+    selected_mutation_connector_ids: [1],
+    dropbox_warning_count: Number(audit.dropbox_warning_count || 0),
+    dropbox_omission_count: Number(audit.dropbox_omission_count || 0),
+    old_live_r2_observation_bodies_used: false,
   };
 }
 
@@ -569,7 +511,8 @@ export async function putAndVerifyObject({ r2, runState, runStatePath, object, a
       status: "get_verified",
       post_put_verification_get_count: 1,
     });
-    if (/^history\/v2\/observations\/.+\.parquet$/.test(object.key)) {
+    if (/^history\/v2\/observations\/.+\.parquet$/.test(object.key)
+      && (runState.execution_path !== "sos_light" || entry.stage === "observations_data")) {
       const cached = verifiedBodyCache?.store({
         key: object.key,
         sha256: entry.sha256,
@@ -763,7 +706,7 @@ function sourceEvidencePaths(runState, dayUtc, connectorId, pollutantCode) {
       retainedRowsSha256: String(retained.rows_sha256 || ""),
     };
   }
-  if (runState.execution_path === "dedicated_sos_historical_observation_replacement") {
+  if (runState.execution_path === "sos_light") {
     throw new Error(`Pollutant-scoped source evidence is missing: ${identity}`);
   }
   const directory = path.join(root, `day_utc=${dayUtc}`, `connector_id=${connectorId}`);
@@ -938,6 +881,13 @@ function validateFinalParentReferences({ proposal, runState }) {
       : null;
     if (!expectedParentKind) continue;
     const payload = parseManifestObject(object, expectedParentKind);
+    if (runState.execution_path === "sos_light"
+      && expectedParentKind === "connector"
+      && Number(payload.connector_id) !== 1) {
+      // Dropbox is warning-only preservation authority for unprotected
+      // connectors; a usable parent does not require descendant certification.
+      continue;
+    }
     const rawReferences = payload.manifest_kind === "connector"
       ? [...(payload.pollutant_manifests || []), ...(payload.child_manifests || [])]
       : [...(payload.connector_manifests || []), ...(payload.child_manifests || [])];
@@ -1088,12 +1038,17 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
   runState.final_proposal_graph_validation = audit;
   if (runStatePath) atomicWriteJson(runStatePath, runState);
   try {
-    const selectedPrefixes = proposal.prefixes.filter((item) =>
-      CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(item.prefix));
+    const sosLight = runState.execution_path === "sos_light";
+    const selectedPrefixes = sosLight
+      ? Object.keys(runState.source_evidence_partitions || {}).map((identity) => ({
+        prefix: `history/v2/observations/${identity}`,
+      }))
+      : proposal.prefixes.filter((item) =>
+        CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(item.prefix));
     audit.selected_partition_count = selectedPrefixes.length;
     const objects = new Map(proposal.objects.map((object) => [object.key, object]));
     const tombstoneCounts = new Map();
-    for (const selected of selectedPrefixes) {
+    for (const selected of proposal.prefixes) {
       tombstoneCounts.set(selected.prefix, (tombstoneCounts.get(selected.prefix) || 0) + 1);
     }
     const sourceDerivedPrefixes = new Map();
@@ -1105,11 +1060,17 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
       if (!sourceDerivedPrefixes.has(partitionPrefix)) sourceDerivedPrefixes.set(partitionPrefix, object);
     }
     for (const [partitionPrefix, partObject] of sourceDerivedPrefixes) {
-      if (tombstoneCounts.get(partitionPrefix) !== 1) {
+      const partitionDayPrefix = partitionPrefix.slice(0, partitionPrefix.indexOf("/connector_id="));
+      const hasRequiredTombstone = sosLight
+        ? tombstoneCounts.get(partitionDayPrefix) === 1
+        : tombstoneCounts.get(partitionPrefix) === 1;
+      if (!hasRequiredTombstone) {
         throw finalProposalError({
           key: `${partitionPrefix}/manifest.json`,
           object: partObject,
-          differingFields: ["matching_pollutant_prefix_tombstone"],
+          differingFields: [sosLight
+            ? "matching_complete_day_prefix_tombstone"
+            : "matching_pollutant_prefix_tombstone"],
         });
       }
     }
@@ -1118,8 +1079,7 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
       const manifestObject = objects.get(manifestKey);
       const stagedParts = proposal.objects.filter((object) =>
         object.key.startsWith(`${selected.prefix}/`) && object.key.endsWith(".parquet"));
-      const dedicatedEmptyAllowed = runState.execution_path
-        === "dedicated_sos_historical_observation_replacement";
+      const dedicatedEmptyAllowed = runState.execution_path === "sos_light";
       if (!manifestObject || (!stagedParts.length && !dedicatedEmptyAllowed)) {
         throw finalProposalError({
           key: manifestKey,
@@ -1288,6 +1248,9 @@ export async function verifyLiveObservationPartition({
   const match = object.key.match(CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN);
   if (!match) return;
   const [, dayUtc, connectorIdRaw, pollutantCode] = match;
+  const sourceIdentity = `day_utc=${dayUtc}/connector_id=${connectorIdRaw}/pollutant_code=${pollutantCode}`;
+  if (runState.execution_path === "sos_light"
+    && !Object.hasOwn(runState.source_evidence_partitions || {}, sourceIdentity)) return;
   let manifest;
   try {
     manifest = JSON.parse(new TextDecoder().decode(object.body));
@@ -1314,8 +1277,7 @@ export async function verifyLiveObservationPartition({
   const partKeys = Array.isArray(manifest.parquet_object_keys)
     ? manifest.parquet_object_keys.map(safeKey)
     : [];
-  const dedicatedEmptyAllowed = runState.execution_path
-    === "dedicated_sos_historical_observation_replacement";
+  const dedicatedEmptyAllowed = runState.execution_path === "sos_light";
   if ((!partKeys.length && (source.rows.length > 0 || !dedicatedEmptyAllowed))
     || partKeys.some((key) =>
     !key.startsWith(object.key.slice(0, -"/manifest.json".length) + "/") ||
@@ -1334,7 +1296,7 @@ export async function verifyLiveObservationPartition({
     let body = verifiedBodyCache?.get(key, expectedSha) || null;
     let sourceKind = "verified_get_cache";
     if (!body) {
-      if (runState?.execution_path === "dedicated_sos_historical_observation_replacement") {
+      if (runState?.execution_path === "sos_light") {
         throw new Error(
           `Dedicated SOS semantic verification refuses a second GET for changed Parquet: ${key}`,
         );
@@ -1539,14 +1501,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         operations.push({ kind: "delete", key: prefixEntry.prefix, prefixEntry });
       }
       for (const object of proposal.objects.filter((entry) => entry.domain === domain)) {
-        if (dedicatedSosProposal.dedicated
-          && /\/observations_timeseries_latest\.json$/.test(object.key)) {
-          Object.assign(object.entry, {
-            delegated_global_latest_finalization: true,
-            status: "delegated_global_latest_finalization",
-          });
-          continue;
-        }
         operations.push({ kind: "put", key: object.key, object });
       }
     }
@@ -1554,6 +1508,10 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     const dayGroups = new Map();
     const globalOperations = [];
     for (const operation of operations) {
+      if (dedicatedSosProposal.dedicated && operation.key.startsWith("history/_index_v2/")) {
+        globalOperations.push(operation);
+        continue;
+      }
       const connectorMatch = operation.key.match(/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)/);
       const dayMatch = operation.key.match(/day_utc=(\d{4}-\d{2}-\d{2})/);
       if (connectorMatch) {
@@ -1603,10 +1561,30 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       }
       atomicWriteJson(runStatePath, runState);
     };
+    if (dedicatedSosProposal.dedicated) {
+      for (const [dayUtc, dayOperations] of Array.from(dayGroups.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+        const deletionOperations = dayOperations.filter((operation) => operation.kind === "delete");
+        if (deletionOperations.length !== 1) {
+          throw new Error(`SOS-light requires one complete-day deletion before upload: ${dayUtc}`);
+        }
+        await runCanonicalDayFinalizer({
+          client: historyWriterClient,
+          dayUtc,
+          diagnosticEnvironment: runState.environment,
+          diagnostics: runState.writer_locks,
+          finalize: async () => {
+            await executeOperation(deletionOperations[0]);
+            return { operation_count: 1, complete_day_deleted: true };
+          },
+        });
+        dayGroups.set(dayUtc, dayOperations.filter((operation) => operation.kind !== "delete"));
+      }
+    }
     for (const group of Array.from(connectorGroups.values()).sort((left, right) =>
       left.day_utc.localeCompare(right.day_utc) || left.connector_id - right.connector_id)) {
       const groupKey = `${group.day_utc}|${group.connector_id}`;
-      const verifiedBodyCache = createVerifiedGetBodyCache();
+      const verifiedBodyCache = dedicatedSosProposal.dedicated && group.connector_id !== 1
+        ? null : createVerifiedGetBodyCache();
       runState.apply.connector_day_publication[groupKey] = {
         day_utc: group.day_utc,
         connector_id: group.connector_id,
@@ -1646,12 +1624,12 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
             runState.apply.connector_day_publication[groupKey].error = error instanceof Error ? error.message : String(error);
             throw error;
           } finally {
-            verifiedBodyCache.clear(
+            verifiedBodyCache?.clear(
               runState.apply.connector_day_publication[groupKey].status === "succeeded"
                 ? "connector_day_scope_complete"
                 : "connector_day_scope_failed",
             );
-            runState.apply.connector_day_publication[groupKey].verified_get_cache = verifiedBodyCache.snapshot();
+            runState.apply.connector_day_publication[groupKey].verified_get_cache = verifiedBodyCache?.snapshot() || null;
             atomicWriteJson(runStatePath, runState);
           }
         },
@@ -1666,7 +1644,7 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         diagnostics: runState.writer_locks,
         finalize: async () => {
         for (const operation of dayOperations) {
-          if (operation.kind === "put") {
+          if (operation.kind === "put" && !dedicatedSosProposal.dedicated) {
             await prepareMergedDayManifest({
               r2,
               object: operation.object,
@@ -1704,45 +1682,33 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
             writeR2: true,
           });
         } else if (affectedDays.length) {
-          runState.global_index_finalization = await updateR2HistoryIndexesTargeted({
-            env: process.env,
-            r2,
-            historyVersion: "v2",
-            domains: ["observations"],
-            affectedDaysUtc: affectedDays,
-            connectorId: null,
-            updateLatestIndex: true,
-            writePollutantIndexes: false,
-            strictMissingTimeseriesCounts: true,
-            writeR2: true,
-          });
-          const latest = runState.global_index_finalization?.observations_timeseries;
-          const latestKey = String(latest?.latest_index_key || "");
-          const latestEntry = runState.objects?.[latestKey];
-          if (!latestKey || !latestEntry?.delegated_global_latest_finalization
-            || latest?.latest_index_verified !== true) {
-            throw new Error("Dedicated SOS live observation latest finalization was not verified");
-          }
-          Object.assign(latestEntry, {
-            remote_attempted: !latest.latest_index_put_skipped,
-            remote_completed: true,
-            uploaded: !latest.latest_index_put_skipped,
-            r2_verified: true,
-            r2_verified_at_utc: new Date().toISOString(),
-            post_put_verification_get_attempt_count: latest.latest_index_put_skipped ? 0 : 1,
-            post_put_verification_get_count: latest.latest_index_put_skipped ? 0 : 1,
-            skipped_unchanged: Boolean(latest.latest_index_put_skipped),
-            final_live_sha256: latest.latest_index_sha256,
-            final_live_bytes: latest.latest_index_bytes,
-            status: latest.latest_index_put_skipped ? "skipped_unchanged" : "get_verified",
-          });
-          if (!latest.latest_index_put_skipped) {
-            counts.completed_writes += 1;
-            counts.get_verified_writes += 1;
-          }
+          runState.global_index_finalization = {
+            status: "succeeded",
+            mode: "sos-light",
+            authority: "planned_dropbox_baseline_plus_assembled_days",
+            affected_days_utc: affectedDays,
+            planned_index_object_count: globalOperations.length,
+            live_observation_body_rebuild_used: false,
+          };
           atomicWriteJson(runStatePath, runState);
         }
         },
+      });
+    }
+    if (dedicatedSosProposal.dedicated) {
+      Object.assign(runState.sos_light, {
+        complete_day_deletion_prefix_count: proposal.prefixes.length,
+        complete_day_deleted_object_count: counts.deleted_objects,
+        complete_day_uploaded_object_count: proposal.objects.filter((object) =>
+          proposal.prefixes.some((item) => object.key.startsWith(`${item.prefix}/`))
+            && object.entry.r2_verified === true
+        ).length,
+        changed_object_verification_status:
+          counts.get_verified_writes === counts.completed_writes ? "succeeded" : "failed",
+        affected_observation_index_object_count: globalOperations.length,
+        affected_observation_index_status: globalOperations.every((operation) =>
+          operation.kind === "put" && operation.object.entry.r2_verified === true
+        ) ? "succeeded" : "failed",
       });
     }
     runState.apply = { ...runState.apply, ...counts, status: "succeeded", finished_at_utc: new Date().toISOString() };

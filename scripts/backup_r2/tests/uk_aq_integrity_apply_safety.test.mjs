@@ -17,6 +17,7 @@ import {
   verifyLiveObservationPartition,
 } from "../uk_aq_apply_integrity_proposal.mjs";
 import {
+  assembleSosLightDayParents,
   createStagedObjectMap,
 } from "../uk_aq_execute_v2_observations_repair_impl.mjs";
 import {
@@ -62,22 +63,19 @@ function stateEntry(filePath, key, dependencies = [], dependencyIdentities = {})
   };
 }
 
-function dedicatedProtectedConnectorEvidence() {
+function sosLightEvidence(dayUtc = "2026-06-17") {
   return {
+    mode: "sos-light",
     protected_connector_ids: [1],
     selected_mutation_connector_ids: [1],
-    protected_connector_validation_status: "validated_pre_mutation",
-    protected_connector_preservation: {
-      protected_connector_ids: [1],
-      selected_mutation_connector_ids: [1],
-      protected_connector_validation_status: "validated_pre_mutation",
-      healthy_unprotected_children_preserved: 0,
-      unprotected_pollutant_omission_count: 0,
-      unprotected_connector_omission_count: 0,
-      unprotected_day_omission_count: 0,
-      unprotected_omissions: [],
-      permitted_parent_metadata_rewrites: [],
-      omitted_unprotected_children_mutated: false,
+    sos_light: {
+      mode: "sos-light",
+      validation_status: "complete_local_days_validated",
+      old_live_r2_observation_bodies_used: false,
+      no_old_live_r2_body_planning_or_preservation: true,
+      dropbox_warning_count: 0,
+      dropbox_omission_count: 0,
+      days: [{ day_utc: dayUtc }],
     },
   };
 }
@@ -469,7 +467,7 @@ test("final proposal graph requires immutable source, staged Parquet and final m
   assert.equal(persisted.final_proposal_graph_validation.status, "failed");
 });
 
-test("dedicated same-day pollutants validate against distinct immutable source evidence", async () => {
+test("SOS-light same-day pollutants validate against distinct immutable source evidence", async () => {
   const fixture = await observationFixture();
   const dayUtc = "2026-06-17";
   const connectorId = 1;
@@ -487,8 +485,8 @@ test("dedicated same-day pollutants validate against distinct immutable source e
     timeseriesId: 200,
   });
   Object.assign(fixture.runState, {
-    execution_path: "dedicated_sos_historical_observation_replacement",
-    ...dedicatedProtectedConnectorEvidence(),
+    execution_path: "sos_light",
+    ...sosLightEvidence(dayUtc),
     mutation_connector_ids: [1],
     aqi_policy: "bypassed_observation_history_only",
     changed_scopes: {
@@ -497,6 +495,11 @@ test("dedicated same-day pollutants validate against distinct immutable source e
       AQI_INDEXES_CHANGED: [],
     },
   });
+  fixture.runState.tombstone_prefixes = [{
+    prefix: `history/v2/observations/day_utc=${dayUtc}`,
+    proposed: true,
+    stage: "sos_light_complete_day",
+  }];
   fs.writeFileSync(fixture.runStatePath, JSON.stringify(fixture.runState));
   const proposal = validateLocalProposal(fixture.runState);
   const audit = await validateFinalProposalGraph({
@@ -512,10 +515,7 @@ test("dedicated same-day pollutants validate against distinct immutable source e
   assert.equal(fs.existsSync(second.evidence.evidence_path), true);
   assert.deepEqual(
     fixture.runState.tombstone_prefixes.map((entry) => entry.prefix).sort(),
-    [
-      "history/v2/observations/day_utc=2026-06-17/connector_id=1/pollutant_code=no2",
-      "history/v2/observations/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25",
-    ],
+    ["history/v2/observations/day_utc=2026-06-17"],
   );
   assert.ok(fixture.runState.objects[fixture.partKey]);
   assert.ok(fixture.runState.objects[second.partKey]);
@@ -529,7 +529,7 @@ test("dedicated same-day pollutants validate against distinct immutable source e
   );
 });
 
-test("dedicated pollutant-scoped evidence accepts authoritative no-data", async () => {
+test("SOS-light pollutant-scoped evidence accepts authoritative no-data", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-integrity-empty-source-"));
   const overlay = path.join(root, "overlay");
   const dropbox = path.join(root, "dropbox");
@@ -577,8 +577,8 @@ test("dedicated pollutant-scoped evidence accepts authoritative no-data", async 
   }));
   const runState = {
     environment: "CIC-Test",
-    execution_path: "dedicated_sos_historical_observation_replacement",
-    ...dedicatedProtectedConnectorEvidence(),
+    execution_path: "sos_light",
+    ...sosLightEvidence(dayUtc),
     mutation_connector_ids: [1],
     aqi_policy: "bypassed_observation_history_only",
     overlay_root: overlay,
@@ -591,9 +591,9 @@ test("dedicated pollutant-scoped evidence accepts authoritative no-data", async 
       },
     },
     tombstone_prefixes: [{
-      prefix,
+      prefix: `history/v2/observations/day_utc=${dayUtc}`,
       proposed: true,
-      repair_pollutants: [pollutantCode],
+      stage: "sos_light_complete_day",
     }],
     changed_scopes: {
       AQILEVELS_CHANGED: [],
@@ -815,11 +815,38 @@ test("verified GET cache requires exact key and SHA, invalidates on mutation, an
   assert.equal(cache.snapshot().current_bytes, 0);
 });
 
-test("dedicated SOS proposal accepts one exact connector-1 observation tombstone and rejects broader scope", async () => {
+test("SOS-light proposal requires one complete-day tombstone and complete local parents", async () => {
   const fixture = await observationFixture();
+  const dayUtc = "2026-06-17";
+  const connectorKey = `history/v2/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`;
+  const dayKey = `history/v2/observations/day_utc=${dayUtc}/manifest.json`;
+  const pollutant = JSON.parse(fs.readFileSync(fixture.runState.objects[fixture.manifestKey].local_path));
+  const connector = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc, connectorId: 1, runId: "test-run",
+    manifestKey: connectorKey, pollutantManifests: [pollutant], writerGitSha: "test",
+    backedUpAtUtc: "2026-06-18T00:00:00.000Z",
+  });
+  const connectorPath = writeObject(fixture.runState.overlay_root, connectorKey, Buffer.from(JSON.stringify(connector, null, 2)));
+  const connectorEntry = stateEntry(connectorPath, connectorKey, [fixture.manifestKey], {
+    [fixture.manifestKey]: {
+      sha256: fixture.runState.objects[fixture.manifestKey].sha256,
+      bytes: fixture.runState.objects[fixture.manifestKey].bytes,
+      source: "overlay",
+    },
+  });
+  const day = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc, runId: "test-run", manifestKey: dayKey,
+    connectorManifests: [connector], writerGitSha: "test",
+    backedUpAtUtc: "2026-06-18T00:00:00.000Z",
+  });
+  const dayPath = writeObject(fixture.runState.overlay_root, dayKey, Buffer.from(JSON.stringify(day, null, 2)));
+  const dayEntry = stateEntry(dayPath, dayKey, [connectorKey], {
+    [connectorKey]: { sha256: connectorEntry.sha256, bytes: connectorEntry.bytes, source: "overlay" },
+  });
+  Object.assign(fixture.runState.objects, { [connectorKey]: connectorEntry, [dayKey]: dayEntry });
   Object.assign(fixture.runState, {
-    execution_path: "dedicated_sos_historical_observation_replacement",
-    ...dedicatedProtectedConnectorEvidence(),
+    execution_path: "sos_light",
+    ...sosLightEvidence(dayUtc),
     mutation_connector_ids: [1],
     aqi_policy: "bypassed_observation_history_only",
     changed_scopes: {
@@ -828,6 +855,11 @@ test("dedicated SOS proposal accepts one exact connector-1 observation tombstone
       AQI_INDEXES_CHANGED: [],
     },
   });
+  fixture.runState.tombstone_prefixes = [{
+    prefix: `history/v2/observations/day_utc=${dayUtc}`,
+    proposed: true,
+    stage: "sos_light_complete_day",
+  }];
   const proposal = validateLocalProposal(fixture.runState);
   const validated = validateDedicatedSosHistoricalProposal({
     runState: fixture.runState,
@@ -835,44 +867,124 @@ test("dedicated SOS proposal accepts one exact connector-1 observation tombstone
   });
   assert.equal(validated.dedicated, true);
   assert.equal(validated.connector_id, 1);
-  assert.equal(validated.exact_pollutant_prefix_count, 1);
-
-  const omittedKey = "history/v2/observations/day_utc=2026-07-12/connector_id=7/pollutant_code=humidity/manifest.json";
-  Object.assign(fixture.runState.protected_connector_preservation, {
-    unprotected_pollutant_omission_count: 1,
-    unprotected_omissions: [{
-      day_utc: "2026-07-12",
-      connector_id: 7,
-      pollutant_code: "humidity",
-      object_key: omittedKey,
-      classification: "unprotected_pollutant_manifest_unreadable_or_invalid",
-      reason: "404 NoSuchKey",
-      omission_level: "pollutant",
-      parent_keys_rebuilt: [],
-      child_deleted: false,
-      child_overwritten: false,
-      child_tombstoned: false,
-    }],
-  });
-  const omissionValidated = validateDedicatedSosHistoricalProposal({
-    runState: fixture.runState,
-    proposal,
-  });
-  assert.equal(omissionValidated.unprotected_omission_count, 1);
-  assert.equal(proposal.objects.some((object) => object.key === omittedKey), false);
-  assert.equal(proposal.prefixes.some((item) => omittedKey.startsWith(`${item.prefix}/`)), false);
-
-  fixture.runState.mutation_connector_ids = [2];
+  assert.equal(validated.complete_day_prefix_count, 1);
+  fixture.runState.tombstone_prefixes[0] = {
+    prefix: `${fixture.runState.tombstone_prefixes[0].prefix}/connector_id=1/pollutant_code=pm25`,
+    proposed: true,
+    stage: "observations_data",
+    repair_pollutants: ["pm25"],
+  };
+  const invalidProposal = validateLocalProposal(fixture.runState);
   assert.throws(
     () => validateDedicatedSosHistoricalProposal({
       runState: fixture.runState,
-      proposal,
+      proposal: invalidProposal,
     }),
-    /invalid execution-scope evidence/,
+    /not a complete observation day/,
   );
+
+  fixture.runState.tombstone_prefixes[0] = {
+    prefix: `history/v2/observations/day_utc=${dayUtc}`,
+    proposed: true,
+    stage: "sos_light_complete_day",
+  };
+  fs.writeFileSync(connectorPath, "{}");
+  Object.assign(fixture.runState.objects[connectorKey], {
+    bytes: 2,
+    sha256: sha256Hex(Buffer.from("{}")),
+  });
+  fs.writeFileSync(fixture.runStatePath, JSON.stringify(fixture.runState));
+  let remoteCalls = 0;
+  const remote = async () => { remoteCalls += 1; throw new Error("remote must not run"); };
+  await assert.rejects(applyValidatedProposal({
+    runStatePath: fixture.runStatePath,
+    r2: {},
+    adapters: { deleteObjects: remote, getObject: remote, listAllObjects: remote, putObject: remote },
+  }), /dependency identity is invalid|manifest_contract/);
+  assert.equal(remoteCalls, 0);
 });
 
-test("dedicated day finalizer retains the exact validated connector set", async () => {
+test("SOS-light connector 1 parent uses every final local child and warns on unusable Dropbox peers", async () => {
+  const dayUtc = "2026-07-12";
+  const base = `history/v2/observations/day_utc=${dayUtc}`;
+  const contentHash = computeEmptyObservationContentHash();
+  delete contentHash.canonical_rows;
+  const pollutants = ["pm25", "pm10", "no2", "o3"].map((pollutantCode) => {
+    const manifestKey = `${base}/connector_id=1/pollutant_code=${pollutantCode}/manifest.json`;
+    return buildHistoryV2PollutantManifest({
+      domain: "observations", dayUtc, connectorId: 1, pollutantCode,
+      runId: "test-run", manifestKey, sourceRowCount: 0, fileEntries: [],
+      writerGitSha: "test", backedUpAtUtc: "2026-07-13T00:00:00.000Z",
+      observationContentHash: contentHash,
+    });
+  });
+  const connectorKey = `${base}/connector_id=1/manifest.json`;
+  const oldConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc, connectorId: 1, runId: "old-dropbox",
+    manifestKey: connectorKey, pollutantManifests: pollutants.slice(0, 3),
+    writerGitSha: "old", backedUpAtUtc: "2026-07-13T00:00:00.000Z",
+  });
+  const objects = new Map(pollutants.map((payload) => {
+    const body = Buffer.from(JSON.stringify(payload));
+    return [payload.manifest_key, {
+      key: payload.manifest_key, body, bytes: body.byteLength,
+      source: "overlay", content_sha256: sha256Hex(body),
+    }];
+  }));
+  const oldBody = Buffer.from(JSON.stringify(oldConnector));
+  objects.set(connectorKey, {
+    key: connectorKey, body: oldBody, bytes: oldBody.byteLength,
+    source: "dropbox", content_sha256: sha256Hex(oldBody),
+  });
+  const invalidKey = `${base}/connector_id=7/manifest.json`;
+  const invalidBody = Buffer.from("{\"not\":\"canonical\"}");
+  objects.set(invalidKey, {
+    key: invalidKey, body: invalidBody, bytes: invalidBody.byteLength,
+    source: "dropbox", content_sha256: sha256Hex(invalidBody),
+  });
+  const store = {
+    getObjectIfExists: (key) => objects.get(key) || null,
+    listAllObjects: ({ prefix }) => [...objects.values()]
+      .filter((object) => object.key.startsWith(prefix))
+      .map((object) => ({ key: object.key, size: object.bytes, source: object.source })),
+  };
+  const staged = createStagedObjectMap({ r2: {}, store });
+  const finalConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc, connectorId: 1, runId: "test-run",
+    manifestKey: connectorKey, pollutantManifests: pollutants,
+    writerGitSha: "test", backedUpAtUtc: "2026-07-13T00:00:00.000Z",
+  });
+  await staged.stage({
+    key: connectorKey,
+    body: JSON.stringify(finalConnector, null, 2),
+    kind: "connector_manifest",
+    dayUtc,
+    dependencies: pollutants.map((payload) => payload.manifest_key),
+  });
+  const audit = {
+    days: [], dropbox_warnings: [], dropbox_warning_count: 0,
+    dropbox_omission_count: 0,
+  };
+  const assembled = await assembleSosLightDayParents({
+    staged, base, dayUtc, protectedConnectorIds: [1],
+    selectedMutationConnectorIds: [1], audit,
+  });
+  assert.deepEqual(
+    assembled.children[0].pollutant_codes,
+    ["no2", "o3", "pm10", "pm25"],
+  );
+  assert.deepEqual(
+    staged.proposals.get(connectorKey).dependencies,
+    pollutants.map((payload) => payload.manifest_key).sort(),
+  );
+  assert.deepEqual(audit.days[0].final_connector_1_child_set,
+    pollutants.map((payload) => payload.manifest_key).sort());
+  assert.deepEqual(audit.days[0].final_assembled_connector_ids, [1]);
+  assert.deepEqual(audit.days[0].omitted_dropbox_connector_ids, [7]);
+  assert.equal(audit.dropbox_warning_count, 1);
+});
+
+test("day finalizer can retain an exact validated connector set for generic callers", async () => {
   const dayUtc = "2026-07-12";
   const pollutantCode = "pm25";
   const connectorId = 1;
@@ -993,7 +1105,7 @@ test("changed-object apply records exactly one post-PUT verification GET", async
   assert.equal(getCount, 1);
 });
 
-test("dedicated global finalization updates only live observations latest metadata", async () => {
+test("shared index builder retains its existing latest-only option for generic callers", async () => {
   const fixture = await observationFixture();
   const pollutant = JSON.parse(fixture.manifestBody.toString("utf8"));
   const dayUtc = pollutant.day_utc;

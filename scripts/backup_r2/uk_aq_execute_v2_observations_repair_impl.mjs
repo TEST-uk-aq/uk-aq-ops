@@ -25,6 +25,7 @@ import {
   observationHistoryPhysicalSchemaForColumns,
 } from "../../workers/shared/uk_aq_observation_history_schema.mjs";
 import {
+  buildHistoryV2TimeseriesLatestPayload,
   resolveR2HistoryIndexConfig,
   updateR2HistoryIndexesTargeted,
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
@@ -302,273 +303,110 @@ function canonicalConnectorReferences(payload, { base, connectorId }) {
   return [...references.values()].sort((left, right) => left.manifest_key.localeCompare(right.manifest_key));
 }
 
-function newProtectedConnectorPreservationAudit({ protectedConnectorIds, selectedMutationConnectorIds }) {
+function newSosLightAudit({ protectedConnectorIds, selectedMutationConnectorIds }) {
   return {
+    mode: "sos-light",
     protected_connector_ids: [...protectedConnectorIds],
     selected_mutation_connector_ids: [...selectedMutationConnectorIds],
-    protected_connector_validation_status: "pending",
-    healthy_unprotected_children_preserved: 0,
-    unprotected_pollutant_omission_count: 0,
-    unprotected_connector_omission_count: 0,
-    unprotected_day_omission_count: 0,
-    unprotected_omissions: [],
-    permitted_parent_metadata_rewrites: [],
-    omitted_unprotected_children_mutated: false,
+    validation_status: "pending",
+    assembly_authorities: ["current_run_sos_source", "chosen_dropbox_baseline"],
+    old_live_r2_observation_bodies_used: false,
+    days: [],
+    dropbox_warning_count: 0,
+    dropbox_omission_count: 0,
+    dropbox_warnings: [],
     warning_count: 0,
     warning_samples: [],
   };
 }
 
-function addUnprotectedOmission(audit, omission) {
-  audit.unprotected_omissions.push({
-    ...omission,
-    child_deleted: false,
-    child_overwritten: false,
-    child_tombstoned: false,
-  });
-  if (omission.omission_level === "pollutant") audit.unprotected_pollutant_omission_count += 1;
-  else if (omission.omission_level === "connector") audit.unprotected_connector_omission_count += 1;
-  else if (omission.omission_level === "day") audit.unprotected_day_omission_count += 1;
+function addSosLightDropboxWarning(audit, warning) {
+  audit.dropbox_warnings.push(warning);
+  audit.dropbox_warning_count += 1;
+  if (warning.omitted === true) audit.dropbox_omission_count += 1;
 }
 
-export async function stageProtectedConnectorPreservationDependencies({
+export async function assembleSosLightDayParents({
   staged,
   base,
   dayUtc,
-  proposalKeys,
   protectedConnectorIds,
   selectedMutationConnectorIds,
-  latestIndexKey,
   audit,
 }) {
-  const protectedSet = new Set(protectedConnectorIds);
-  const selectedSet = new Set(selectedMutationConnectorIds);
-  if (!protectedSet.size || !selectedSet.size
-    || [...selectedSet].some((connectorId) => !protectedSet.has(connectorId))) {
-    throw new Error("Blocked dependency: invalid protected connector preservation scope");
+  if (JSON.stringify(protectedConnectorIds) !== "[1]"
+    || JSON.stringify(selectedMutationConnectorIds) !== "[1]") {
+    throw new Error("Blocked dependency: SOS-light currently supports selected/protected connector IDs [1] only");
   }
   const entries = await staged.stagedR2.adapter.listAllObjects({
     prefix: `${base}/connector_id=`,
   });
-  const connectorKeys = new Set(entries
+  const connectorKeys = [...new Set(entries
     .map((entry) => entry.key)
-    .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key))
-    .sort());
-  try {
-    const existingDay = await staged.stagedR2.adapter.getObject({ key: `${base}/manifest.json` });
-    const existingDayPayload = jsonObject(existingDay, `${base}/manifest.json`);
-    for (const reference of [
-      ...(Array.isArray(existingDayPayload?.connector_manifests) ? existingDayPayload.connector_manifests : []),
-      ...(Array.isArray(existingDayPayload?.child_manifests) ? existingDayPayload.child_manifests : []),
-    ]) {
-      const key = String(reference?.manifest_key || "").trim();
-      if (/\/connector_id=\d+\/manifest\.json$/.test(key)) connectorKeys.add(key);
-    }
-  } catch {
-    // The selected day parent is rebuilt from validated connector parents.
-    // Its unreadable predecessor is not a child-preservation authority.
-  }
-  const omittedConnectorKeys = new Set();
-
-  for (const key of [...connectorKeys].sort()) {
+    .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key)))].sort();
+  const children = [];
+  const identities = new Map();
+  const includedConnectorIds = [];
+  const omittedConnectorIds = [];
+  const omittedConnectorPrefixes = [];
+  let connector1ChildKeys = [];
+  for (const key of connectorKeys) {
     const match = key.match(/\/connector_id=(\d+)\/manifest\.json$/);
     const connectorId = Number(match?.[1]);
     if (!Number.isInteger(connectorId) || connectorId <= 0) {
       throw new Error(`Blocked dependency: invalid connector manifest key ${key}`);
     }
-    const isProtected = protectedSet.has(connectorId);
-    let existingPayload;
     try {
-      const stagedProposal = staged.proposals.get(key);
-      const body = stagedProposal?.old_body ?? (await staged.stagedR2.adapter.getObject({ key })).body;
-      existingPayload = JSON.parse(Buffer.isBuffer(body) ? body.toString("utf8") : String(body));
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      if (isProtected) {
-        throw new Error(`Blocked dependency: protected connector manifest unreadable ${key}: ${reason}`);
+      const object = await staged.stagedR2.adapter.getObject({ key });
+      if (connectorId !== 1 && object.source !== "dropbox") {
+        throw new Error(`unprotected connector parent is not Dropbox-backed: ${object.source}`);
       }
-      omittedConnectorKeys.add(key);
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: null,
-        object_key: key,
-        classification: "unprotected_connector_manifest_unreadable",
-        reason,
-        omission_level: "connector",
-        parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-      });
-      continue;
-    }
-    const classification = classifyRepairableV2ObservationsConnectorManifest(
-      existingPayload,
-      { key, dayUtc, connectorId },
-    );
-    if (isProtected && !selectedSet.has(connectorId) && !classification.ok) {
-      throw new Error(`Blocked dependency: preserved protected connector manifest invalid ${key}`);
-    }
-    if (!classification.ok && !classification.repairable) {
-      if (isProtected) {
-        throw new Error(`Blocked dependency: protected connector manifest invalid ${key}`);
-      }
-      omittedConnectorKeys.add(key);
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: null,
-        object_key: key,
-        classification: "unprotected_connector_manifest_invalid",
-        reason: classification.identity_failures.join(",") || classification.failures.join(","),
-        omission_level: "connector",
-        parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-      });
-      continue;
-    }
-    let references;
-    try {
-      references = canonicalConnectorReferences(existingPayload, { base, connectorId });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      if (isProtected) throw new Error(`Blocked dependency: protected connector references invalid ${key}: ${reason}`);
-      omittedConnectorKeys.add(key);
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: null,
-        object_key: key,
-        classification: "unprotected_connector_references_invalid",
-        reason,
-        omission_level: "connector",
-        parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-      });
-      continue;
-    }
-    const children = [];
-    const childIdentities = new Map();
-    const pollutantOmissions = [];
-    for (const reference of references) {
-      try {
-        const childObject = await staged.stagedR2.adapter.getObject({ key: reference.manifest_key });
-        const childPayload = jsonObject(childObject, reference.manifest_key);
-        assertV2ObservationsChildManifest(childPayload, {
-          key: reference.manifest_key,
-          kind: "pollutant",
-          dayUtc,
-          connectorId,
-        });
-        const selectedChildReplacement = selectedSet.has(connectorId)
-          && staged.proposals.has(reference.manifest_key);
-        if (!selectedChildReplacement
-          && reference.manifest_hash !== childPayload.manifest_hash) {
-          throw new Error("parent_child_manifest_hash_mismatch");
-        }
-        children.push(childPayload);
-        childIdentities.set(reference.manifest_key, {
-          content_sha256: childObject.content_sha256 || sha256Hex(childObject.body),
-          source: childObject.source || "combined_local",
-        });
-        if (!isProtected) audit.healthy_unprotected_children_preserved += 1;
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        if (isProtected) {
-          throw new Error(`Blocked dependency: protected pollutant manifest unreadable ${reference.manifest_key}: ${reason}`);
-        }
-        pollutantOmissions.push({ reference, reason });
-      }
-    }
-    if (!pollutantOmissions.length && classification.ok) continue;
-    if (!children.length) {
-      omittedConnectorKeys.add(key);
-      for (const { reference, reason } of pollutantOmissions) {
-        addUnprotectedOmission(audit, {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          pollutant_code: reference.pollutant_code,
-          object_key: reference.manifest_key,
-          classification: "unprotected_pollutant_manifest_unreadable_or_invalid",
-          reason,
-          omission_level: "pollutant",
-          parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-        });
-      }
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: null,
-        object_key: key,
-        classification: "unprotected_connector_not_safely_rebuildable",
-        reason: "no readable valid referenced pollutant children remain",
-        omission_level: "connector",
-        parent_keys_rebuilt: [`${base}/manifest.json`, latestIndexKey],
-      });
-      continue;
-    }
-    for (const { reference, reason } of pollutantOmissions) {
-      addUnprotectedOmission(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: reference.pollutant_code,
-        object_key: reference.manifest_key,
-        classification: "unprotected_pollutant_manifest_unreadable_or_invalid",
-        reason,
-        omission_level: "pollutant",
-        parent_keys_rebuilt: [key, `${base}/manifest.json`, latestIndexKey],
-      });
-    }
-    const childBackups = children
-      .map((payload) => payload.backed_up_at_utc)
-      .filter((value) => typeof value === "string" && !Number.isNaN(Date.parse(value)))
-      .sort();
-    const existingBackup = typeof existingPayload.backed_up_at_utc === "string"
-        && !Number.isNaN(Date.parse(existingPayload.backed_up_at_utc))
-      ? existingPayload.backed_up_at_utc
-      : null;
-    const runId = typeof existingPayload.run_id === "string" || existingPayload.run_id === null
-      ? existingPayload.run_id
-      : null;
-    const writerGitSha = typeof existingPayload.writer_git_sha === "string"
-        || existingPayload.writer_git_sha === null
-      ? existingPayload.writer_git_sha
-      : null;
-    const payload = buildHistoryV2ConnectorManifest({
-      domain: "observations",
-      grain: null,
-      profile: null,
-      dayUtc,
-      connectorId,
-      runId,
-      manifestKey: key,
-      pollutantManifests: children,
-      writerGitSha,
-      backedUpAtUtc: existingBackup || childBackups.at(-1) || `${dayUtc}T00:00:00.000Z`,
-    });
-    await staged.stage({
-      key,
-      body: JSON.stringify(payload, null, 2),
-      kind: "connector_manifest",
-      dayUtc,
-      dependencies: [...childIdentities.keys()],
-      localDependencySnapshot: localDependencySnapshot({
-        child: { children, identities: childIdentities },
-        proposals: staged.proposals,
-        prefix: `${base}/connector_id=${connectorId}/pollutant_code=`,
+      const payload = jsonObject(object, key);
+      assertV2ObservationsChildManifest(payload, {
+        key,
+        kind: "connector",
         dayUtc,
         connectorId,
-        kind: "pollutant",
-        domain: "observations",
-      }),
-      provenance: {
-        source: pollutantOmissions.length
-          ? "protected_connector_unprotected_child_quarantine"
-          : "legacy_connector_normalisation",
-        validation_failures: classification.failures,
-        unprotected_omitted_child_keys: pollutantOmissions.map(({ reference }) => reference.manifest_key),
-        immutable_scope_identity_verified: true,
-      },
-    });
-    proposalKeys.push(key);
+      });
+      children.push(payload);
+      identities.set(key, {
+        content_sha256: object.content_sha256 || sha256Hex(object.body),
+        source: object.source || "combined_local",
+      });
+      includedConnectorIds.push(connectorId);
+      if (connectorId === 1) {
+        connector1ChildKeys = canonicalConnectorReferences(payload, { base, connectorId })
+          .map((reference) => reference.manifest_key);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (connectorId === 1) {
+        throw new Error(`Blocked dependency: final SOS-light connector 1 parent is unusable ${key}: ${reason}`);
+      }
+      omittedConnectorIds.push(connectorId);
+      omittedConnectorPrefixes.push(`${base}/connector_id=${connectorId}`);
+      addSosLightDropboxWarning(audit, {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        object_key: key,
+        classification: "dropbox_unprotected_connector_parent_unusable",
+        reason,
+        omitted: true,
+      });
+    }
   }
-  return { omittedConnectorKeys };
+  if (!includedConnectorIds.includes(1)) {
+    throw new Error(`Blocked dependency: SOS-light assembled day has no final connector 1 parent: ${dayUtc}`);
+  }
+  const dayAudit = {
+    day_utc: dayUtc,
+    final_connector_1_child_set: connector1ChildKeys,
+    final_assembled_connector_ids: includedConnectorIds.sort((left, right) => left - right),
+    omitted_dropbox_connector_ids: omittedConnectorIds.sort((left, right) => left - right),
+    omitted_dropbox_connector_prefixes: omittedConnectorPrefixes.sort(),
+  };
+  audit.days.push(dayAudit);
+  return { children, identities, dayAudit };
 }
 
 function safeLocalKey(key) {
@@ -892,6 +730,102 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
 function stableGeneratedAt({ dayUtc, dayManifest }) {
   const backedUpAt = String(dayManifest?.backed_up_at_utc || "");
   return /^\d{4}-\d{2}-\d{2}T/.test(backedUpAt) ? backedUpAt : `${dayUtc}T00:00:00.000Z`;
+}
+
+async function stageSosLightLatestIndex({ staged, config, latestIndexKey, audit }) {
+  const existingObject = await staged.stagedR2.adapter.getObject({ key: latestIndexKey });
+  const existing = jsonObject(existingObject, latestIndexKey);
+  const summaries = new Map((existing.day_summaries || [])
+    .filter((entry) => entry?.day_utc)
+    .map((entry) => [String(entry.day_utc), entry]));
+  const dependencies = [];
+  for (const dayAudit of audit.days) {
+    const dayUtc = String(dayAudit.day_utc);
+    const included = new Set(dayAudit.final_assembled_connector_ids || []);
+    const entries = await staged.stagedR2.adapter.listAllObjects({
+      prefix: `${config.observations_timeseries_index_prefix_v2}/day_utc=${dayUtc}/connector_id=`,
+    });
+    const connectorMap = new Map([...included].map((connectorId) => [connectorId, {
+      connector_id: connectorId,
+      row_count: 0,
+      file_count: 0,
+      indexed_file_count: 0,
+      pollutant_codes: new Set(),
+      backed_up_at_utc: [],
+      pollutant_index_count: 0,
+    }]));
+    for (const entry of entries) {
+      const match = entry.key.match(/\/connector_id=([1-9]\d*)\/pollutant_code=([^/]+)\/manifest\.json$/);
+      const connectorId = Number(match?.[1]);
+      if (!included.has(connectorId)) continue;
+      try {
+        const object = await staged.stagedR2.adapter.getObject({ key: entry.key });
+        const payload = jsonObject(object, entry.key);
+        const rowCount = Number(payload.source_row_count);
+        const fileCount = Number(payload.file_count);
+        const indexedFileCount = Number(payload.indexed_file_count);
+        if (![rowCount, fileCount, indexedFileCount].every(Number.isSafeInteger)
+          || [rowCount, fileCount, indexedFileCount].some((value) => value < 0)) {
+          throw new Error("index counts are invalid");
+        }
+        const connector = connectorMap.get(connectorId);
+        connector.row_count += rowCount;
+        connector.file_count += fileCount;
+        connector.indexed_file_count += indexedFileCount;
+        connector.pollutant_codes.add(String(payload.pollutant_code || match[2]));
+        connector.pollutant_index_count += 1;
+        if (typeof payload.backed_up_at_utc === "string") connector.backed_up_at_utc.push(payload.backed_up_at_utc);
+        dependencies.push(entry.key);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (connectorId === 1) {
+          throw new Error(`Blocked dependency: SOS-light connector 1 index is unusable ${entry.key}: ${reason}`);
+        }
+        addSosLightDropboxWarning(audit, {
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          object_key: entry.key,
+          classification: "dropbox_unprotected_index_unusable",
+          reason,
+          omitted: true,
+        });
+      }
+    }
+    const connectors = [...connectorMap.values()].sort((left, right) => left.connector_id - right.connector_id);
+    const pollutantCodes = [...new Set(connectors.flatMap((entry) => [...entry.pollutant_codes]))].sort();
+    summaries.set(dayUtc, {
+      day_utc: dayUtc,
+      connector_count: connectors.length,
+      connector_ids: connectors.map((entry) => entry.connector_id),
+      connectors: connectors.map((entry) => ({ connector_id: entry.connector_id, row_count: entry.row_count })),
+      total_rows: connectors.reduce((sum, entry) => sum + entry.row_count, 0),
+      pollutant_codes: pollutantCodes,
+      pollutant_index_count: connectors.reduce((sum, entry) => sum + entry.pollutant_index_count, 0),
+      file_count: connectors.reduce((sum, entry) => sum + entry.file_count, 0),
+      indexed_file_count: connectors.reduce((sum, entry) => sum + entry.indexed_file_count, 0),
+      backed_up_at_utc: connectors.flatMap((entry) => entry.backed_up_at_utc).sort().at(-1) || `${dayUtc}T00:00:00.000Z`,
+    });
+  }
+  const payload = buildHistoryV2TimeseriesLatestPayload({
+    domain: "observations",
+    bucket: config.r2.bucket,
+    generatedAt: existing.generated_at,
+    existingGeneratedAt: existing.generated_at,
+    indexPrefix: config.index_prefix_v2,
+    dataPrefix: config.observations_prefix_v2,
+    timeseriesIndexPrefix: config.observations_timeseries_index_prefix_v2,
+    daySummaries: [...summaries.values()],
+  });
+  await staged.stage({
+    key: latestIndexKey,
+    body: `${JSON.stringify(payload, null, 2)}\n`,
+    kind: "latest_timeseries_index",
+    dependencies: [...new Set(dependencies)].sort(),
+    provenance: {
+      source: "sos_light_dropbox_index_baseline_plus_assembled_days",
+      old_live_r2_observation_bodies_used: false,
+    },
+  });
 }
 
 function parquetIso(value) {
@@ -1556,8 +1490,7 @@ export async function runV2ObservationsRepair({
   );
   const { inputKind, domain, scopes } = normalizePlan(input); // Validate all actions before the first R2 request.
   const runState = JSON.parse(fs.readFileSync(args.runStateJson, "utf8"));
-  const dedicatedProtectedReplacement = runState?.execution_path
-    === "dedicated_sos_historical_observation_replacement";
+  const sosLightReplacement = runState?.execution_path === "sos_light";
   const normalizedPositiveIds = (value, field) => {
     if (!Array.isArray(value) || !value.length
       || value.some((item) => !Number.isInteger(item) || item <= 0)) {
@@ -1569,18 +1502,19 @@ export async function runV2ObservationsRepair({
     }
     return normalized;
   };
-  const protectedConnectorIds = dedicatedProtectedReplacement
+  const protectedConnectorIds = sosLightReplacement
     ? normalizedPositiveIds(runState.protected_connector_ids, "protected_connector_ids")
     : [];
-  const selectedMutationConnectorIds = dedicatedProtectedReplacement
+  const selectedMutationConnectorIds = sosLightReplacement
     ? normalizedPositiveIds(
       runState.selected_mutation_connector_ids || runState.mutation_connector_ids,
       "selected_mutation_connector_ids",
     )
     : [];
-  if (dedicatedProtectedReplacement
-    && selectedMutationConnectorIds.some((connectorId) => !protectedConnectorIds.includes(connectorId))) {
-    throw new Error("Blocked dependency: selected mutation connector is not protected");
+  if (sosLightReplacement
+    && (JSON.stringify(protectedConnectorIds) !== "[1]"
+      || JSON.stringify(selectedMutationConnectorIds) !== "[1]")) {
+    throw new Error("Blocked dependency: SOS-light currently requires selected/protected connector IDs [1]");
   }
   reportProgress({ phase: "metadata_planning_start", total_objects: scopes.length });
   const config = resolveR2HistoryIndexConfig(env);
@@ -1640,8 +1574,8 @@ export async function runV2ObservationsRepair({
   const blockedScopes = [];
   const blockedConnectorScopes = new Set();
   const plannedStageStatus = args.writeR2 ? "not_run" : "planned";
-  const preservationAudit = dedicatedProtectedReplacement
-    ? newProtectedConnectorPreservationAudit({ protectedConnectorIds, selectedMutationConnectorIds })
+  const sosLightAudit = sosLightReplacement
+    ? newSosLightAudit({ protectedConnectorIds, selectedMutationConnectorIds })
     : null;
   const manifestStageStatus = (proposalKeys) => proposalKeys.some((key) =>
     String(staged.proposals.get(key)?.kind || "").endsWith("manifest")
@@ -1776,20 +1710,8 @@ export async function runV2ObservationsRepair({
       continue;
     }
     if (needsDay) {
-      let omittedConnectorKeys = new Set();
       if (domain === "observations") {
-        if (dedicatedProtectedReplacement) {
-          ({ omittedConnectorKeys } = await stageProtectedConnectorPreservationDependencies({
-            staged,
-            base,
-            dayUtc,
-            proposalKeys,
-            protectedConnectorIds,
-            selectedMutationConnectorIds,
-            latestIndexKey,
-            audit: preservationAudit,
-          }));
-        } else {
+        if (!sosLightReplacement) {
           await stageRepairableObservationConnectorDependencies({
             staged,
             base,
@@ -1798,7 +1720,16 @@ export async function runV2ObservationsRepair({
           });
         }
       }
-      const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain, omitKeys: omittedConnectorKeys });
+      const child = sosLightReplacement
+        ? await assembleSosLightDayParents({
+          staged,
+          base,
+          dayUtc,
+          protectedConnectorIds,
+          selectedMutationConnectorIds,
+          audit: sosLightAudit,
+        })
+        : await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain });
       dayManifest = buildHistoryV2DayManifest({ domain, grain: domain === "aqilevels" ? "hourly" : null, profile: domain === "aqilevels" ? "data" : null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key: dayManifestKey,
@@ -1865,6 +1796,10 @@ export async function runV2ObservationsRepair({
             fromDayUtc: dayUtc,
             toDayUtc: dayUtc,
             connectorId,
+            connectorManifestKey: sosLightReplacement
+              ? `${base}/connector_id=${connectorId}/manifest.json`
+              : null,
+            updateLatestIndex: !sosLightReplacement,
             generatedAt: stableGeneratedAt({ dayUtc, dayManifest }),
             strictMissingTimeseriesCounts: true,
             writeR2: false,
@@ -1909,6 +1844,15 @@ export async function runV2ObservationsRepair({
     });
   }
 
+  if (sosLightAudit && !blockedScopes.length) {
+    await stageSosLightLatestIndex({
+      staged,
+      config,
+      latestIndexKey,
+      audit: sosLightAudit,
+    });
+  }
+
   // The shared builder plans a latest summary while it is constructing the
   // targeted merge. Apply it last, after all lower-level index
   // proposals have completed their PUT-and-GET verification.
@@ -1942,22 +1886,10 @@ export async function runV2ObservationsRepair({
   for (const proposal of staged.proposals.values()) {
     proposal.dependency_identities = staged.resolveDependencyIdentities(proposal.dependencies || []);
   }
-  if (preservationAudit) {
-    const rewritten = new Set();
-    for (const omission of preservationAudit.unprotected_omissions) {
-      for (const key of omission.parent_keys_rebuilt || []) {
-        if (staged.proposals.get(key)?.changed) rewritten.add(key);
-      }
-    }
-    preservationAudit.permitted_parent_metadata_rewrites = [...rewritten].sort();
-    for (const omission of preservationAudit.unprotected_omissions) {
-      omission.parent_keys_rebuilt = (omission.parent_keys_rebuilt || [])
-        .filter((key) => rewritten.has(key))
-        .sort();
-    }
-    preservationAudit.warning_count = preservationAudit.unprotected_omissions.length;
-    preservationAudit.warning_samples = preservationAudit.unprotected_omissions.slice(0, 10);
-    preservationAudit.protected_connector_validation_status = "validated_pre_mutation";
+  if (sosLightAudit) {
+    sosLightAudit.warning_count = sosLightAudit.dropbox_warnings.length;
+    sosLightAudit.warning_samples = sosLightAudit.dropbox_warnings.slice(0, 10);
+    sosLightAudit.validation_status = "validated_local_assembly";
   }
   for (const proposal of staged.proposals.values()) assertCanonicalProposal(proposal);
   for (const proposal of staged.proposals.values()) {
@@ -1979,7 +1911,7 @@ export async function runV2ObservationsRepair({
     manifest_status: reduceRepairStatus(dayPlans.map((plan) => plan.manifest_status || "not_run"), "not_run"),
     index_status: reduceRepairStatus(dayPlans.map((plan) => plan.index_status || "not_run"), "not_run"),
     bucket: config.r2.bucket,
-    planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes, protected_connector_preservation: preservationAudit },
+    planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes, sos_light: sosLightAudit },
     execution: { status: "not_run" },
     verification: { status: "not_run" },
     application_failure: null,
