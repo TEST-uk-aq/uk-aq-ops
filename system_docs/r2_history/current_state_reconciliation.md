@@ -84,7 +84,9 @@ Integrity must not write, patch or delete those objects directly.
 
 ### Final verified canonical observations
 
-The canonical observation collection that passed source comparison, proposal validation, real R2 apply verification and final source-to-R2 verification for the selected scope.
+The canonical observation collection that passed source comparison or direct selected-partition source validation, proposal validation, real R2 apply verification and final source-to-R2 verification for the selected scope.
+
+For partition-scoped direct replacement, this collection is the union of every successfully verified selected partition. It is not the contents of a mutable connector-day staging directory and is not limited to the last processed pollutant.
 
 ### Raw latest candidate
 
@@ -92,7 +94,9 @@ The final verified canonical observation with the greatest `observed_at` for one
 
 ### Latest valid candidate
 
-The final verified canonical observation with the greatest `observed_at` for one affected timeseries after the Latest Snapshot owner policy has applied pollutant and value eligibility.
+The final verified canonical observation with the greatest `observed_at` for one affected timeseries after Latest Snapshot public-value eligibility has been applied.
+
+The latest valid candidate may be earlier than the raw latest candidate when the raw latest observation is not publicly eligible.
 
 ### Same-timestamp correction
 
@@ -101,6 +105,38 @@ A candidate whose `observed_at` equals stored current state but whose canonical 
 ### Monotonic update
 
 An update that never replaces current state with an earlier observation.
+
+## Authoritative candidate-evidence contract
+
+Current-state candidates must be derived from final verified canonical evidence, not from incidental staging state.
+
+For the dedicated SOS direct-replacement path, Integrity must:
+
+1. enumerate every selected `day_utc + connector_id + pollutant_code` partition;
+2. include canonical rows only from partitions whose complete replacement passed proposal validation, ordered R2 apply and final changed-object verification;
+3. union the successful verified partitions across the complete selected run scope;
+4. compact that union independently for Timeseries and Latest Snapshot.
+
+Integrity must not derive candidates from:
+
+- only the last processed pollutant;
+- a shared connector-day source-evidence directory that is overwritten between partitions;
+- an unverified proposal;
+- a failed or blocked partition;
+- an all-unmapped partition that was deliberately left unchanged;
+- generic gap results when the dedicated direct-replacement route is active.
+
+An authoritative no-data replacement is a successful verified partition with zero canonical rows. It contributes no current-state candidate and does not make candidate derivation fail.
+
+A selected partition that is skipped because all source rows lack authoritative bindings contributes no candidate because its existing R2 contents were not replaced or verified by that operation.
+
+The verified evidence identity for the dedicated path remains:
+
+```text
+day_utc + connector_id + pollutant_code
+```
+
+Candidate derivation must not introduce a broad live R2 rescan.
 
 ## Reconciliation trigger boundary
 
@@ -207,7 +243,11 @@ A successful preflight cannot guarantee that credentials, IAM, network access or
 
 ## Timeseries candidate and mutation contract
 
-For each affected timeseries, Integrity derives one raw latest candidate containing:
+Across the complete successful verified repair scope, Integrity must derive exactly one raw latest candidate per affected timeseries.
+
+Candidate compaction considers all supported verified rows for that timeseries across every successful selected day and pollutant partition, then selects the greatest `observed_at` using deterministic canonical tie handling.
+
+Each candidate contains:
 
 ```text
 integrity_run_id
@@ -222,6 +262,8 @@ The value is the exact finite canonical source value. Finite negative values are
 Integrity must not create a missing timeseries, station, phenomenon, connector or observed-property identity.
 
 Timeseries reconciliation must use one private schema-owned RPC. Integrity must not issue unrestricted direct updates to `timeseries`.
+
+Integrity must submit the compacted candidate to the owner RPC even when a preliminary read suggests that stored `last_value_at` is later or equal. Integrity must not duplicate the RPC's durable-state comparison or use current Timeseries state as a submission gate.
 
 For an existing timeseries, the RPC atomically:
 
@@ -250,7 +292,19 @@ A missing target is reported and prevents full target success. It is not created
 
 ## Latest Snapshot candidate and mutation contract
 
-For each supported affected timeseries, Integrity supplies final verified candidate data to the Latest Snapshot owner service:
+Across the complete successful verified repair scope, Integrity must derive exactly one latest valid candidate per supported affected timeseries.
+
+Integrity must not send every historical observation to the owner service. For each supported timeseries it must:
+
+1. consider all verified canonical rows across all successful selected partitions;
+2. apply the shared Latest Snapshot public-current-value eligibility semantics used for candidate compaction;
+3. select the greatest eligible `observed_at`;
+4. retain deterministic same-timestamp correction evidence;
+5. send only that compacted candidate.
+
+When the raw latest observation is ineligible but an earlier observation is eligible, Timeseries receives the raw latest observation and Latest Snapshot receives the earlier latest eligible observation.
+
+Integrity supplies each compacted candidate to the Latest Snapshot owner service as:
 
 ```text
 integrity_run_id
@@ -269,7 +323,9 @@ Source status is resolved in this order:
 2. legacy `status`;
 3. null.
 
-The owner service applies authoritative metadata resolution, pollutant aliases, upper bounds, public eligibility, state identity, ordering, physical product construction and manifest writing.
+The owner service remains the final authority for metadata resolution, pollutant aliases, upper bounds, public eligibility, state identity, ordering, physical product construction and manifest writing. It must revalidate every submitted candidate.
+
+Integrity must submit the compacted Latest Snapshot candidate independently of Timeseries state and independently of the Timeseries reconciliation outcome. A later or equal `timeseries.last_value_at` must not suppress Latest Snapshot submission.
 
 Integrity must call the authenticated private owner-service route and must not mutate Latest Snapshot R2 objects directly.
 
@@ -278,15 +334,16 @@ Integrity must call the authenticated private owner-service route and must not m
 For a real repair that can affect Latest Snapshot, the required stage order is:
 
 1. acquire and validate source evidence;
-2. detect gaps and build explicit repair decisions;
+2. establish the explicit selected-partition repair scope and decisions;
 3. create and validate local proposals;
 4. perform Latest Snapshot authentication capability preflight;
 5. perform canonical R2 apply;
 6. perform final R2 verification;
-7. derive current-state candidates;
-8. reconcile timeseries freshness;
-9. reconcile Latest Snapshot through the owner service;
-10. persist independent target results and calculate overall status.
+7. assemble all successful verified partition evidence;
+8. derive and compact current-state candidates;
+9. reconcile timeseries freshness;
+10. reconcile Latest Snapshot through the owner service;
+11. persist independent target results and calculate overall status.
 
 The preflight occurs before canonical apply, but the actual Latest Snapshot call occurs only after final R2 verification.
 
@@ -325,12 +382,20 @@ For each reconciliation-capable run, persist at least:
 integrity_run_id
 selected connector and pollutant scope
 final-verification status and identity
+verified partition count and identities
+verified canonical rows examined by pollutant
 candidate identity or deterministic candidate evidence
+candidate counts before and after compaction
+candidate counts by pollutant
 timeseries target status and outcome counts
 Latest Snapshot target status and outcome counts
 bounded target errors
 started and finished timestamps
 ```
+
+Timeseries audit must distinguish raw rows examined from compacted candidate count.
+
+Latest Snapshot audit must distinguish supported rows examined, ineligible rows excluded, latest-raw-ineligible fallbacks and compacted candidate count.
 
 Timeseries and Latest Snapshot target outcomes are recorded independently. A successful target remains recorded as successful when another target fails.
 
@@ -362,6 +427,8 @@ different final verified canonical content
   -> one correction may apply
 ```
 
+Candidate compaction must retain the authoritative corrected content. If final verified evidence contains irreconcilable competing canonical content for one timeseries and timestamp, candidate derivation fails closed for that target scope.
+
 Repeating an already applied correction in a later new run is a no-op. A later execution time alone must not cause rewrites.
 
 An older candidate never replaces newer current state.
@@ -375,11 +442,15 @@ enabled
 mode
 integrity_run_id
 selected scope
-candidate count and timestamp bounds
+verified partition evidence count and pollutant coverage
+raw and supported rows examined
+candidate count before and after compaction
+candidate counts by pollutant and timestamp bounds
 timeseries outcomes
 Latest Snapshot outcomes
 same-timestamp corrections
 older and equal candidates skipped
+latest-raw-ineligible fallback count
 missing identities
 preflight status
 warnings
@@ -403,6 +474,12 @@ This contract introduces no browser-side direct R2 fallback.
 
 Before deployment, use only the smallest structural and targeted deterministic checks required to establish:
 
+- all successful verified pollutant partitions contribute candidates;
+- failed, unverified and all-unmapped partitions do not contribute candidates;
+- one latest raw Timeseries candidate is produced per timeseries;
+- one latest eligible Latest Snapshot candidate is produced per supported timeseries;
+- a later ineligible raw row does not hide an earlier eligible Latest Snapshot candidate;
+- Timeseries state does not gate Latest Snapshot submission;
 - authentication command construction;
 - preflight ordering;
 - independent target status handling;
@@ -414,9 +491,12 @@ Functional validation occurs through real CIC-Test operations.
 
 A representative successful operation must cover:
 
-- a real supported-pollutant repair;
+- a real multi-pollutant supported repair;
 - authentication preflight before canonical mutation;
 - final R2 verification;
+- Timeseries candidate coverage for PM2.5, PM10, NO2 and O3;
+- Latest Snapshot candidate coverage for PM2.5, PM10 and NO2 only;
+- one compacted candidate per timeseries for each target;
 - timeseries reconciliation;
 - Latest Snapshot reconciliation;
 - a later new run that safely skips or no-ops already-correct state where applicable.
@@ -432,5 +512,12 @@ Implemented and exercised in CIC-Test on 29 July 2026:
 - fresh token acquisition for the actual Latest Snapshot invocation;
 - independent Timeseries and Latest Snapshot outcome recording;
 - successful end-to-end SOS repair through final current-state reconciliation.
+
+Contract clarified on 31 July 2026 for dedicated partition-scoped repair:
+
+- all successful verified pollutant-scoped evidence must be consumed;
+- Timeseries must receive one latest raw candidate per timeseries;
+- Latest Snapshot must receive one latest eligible candidate per supported timeseries;
+- Timeseries state and outcome must not gate Latest Snapshot submission.
 
 The attempted legacy run-resume path added disproportionate evidence-reconstruction complexity and was rejected as an operational requirement. Recovery is now a new appropriately scoped Integrity run.
