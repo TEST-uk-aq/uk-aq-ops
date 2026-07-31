@@ -54,6 +54,7 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 
 | Area | Authoritative directory | Current status |
 |---|---|---|
+| Connector ingest and Daily Stations reference discovery | [`ingest/`](ingest/) | Authoritative for Daily Stations and Breathe London Nodes deterministic reference discovery |
 | Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current |
 | Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Authoritative for stable bindings, embedded continuity, integrity, targeted indexes and Phase B history writes |
 | Calculated hourly AQI and station-chart bands | [`aqi-levels/`](aqi-levels/) | Authoritative and current, including continuity-aware calculated chart AQI and asynchronous R2 validation |
@@ -69,7 +70,7 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 | Postcode and geography lookup products | [`geography/`](geography/) | Authoritative and current |
 | Shared runtime components and cross-area invariants | `shared/` | Migration analysis pending |
 
-Directories marked pending are proposed area boundaries. They do not override completed contracts in `r2_history/`, `aqi-levels/`, `station_charts/`, `latest_snapshot/`, `dashboards/`, `geography/` or the completed Supabase logical backup scope in `backup_and_recovery/`.
+Directories marked pending are proposed area boundaries. They do not override completed contracts in `ingest/`, `r2_history/`, `aqi-levels/`, `station_charts/`, `latest_snapshot/`, `dashboards/`, `geography/` or the completed Supabase logical backup scope in `backup_and_recovery/`.
 
 ## R2 history and station-history reading set
 
