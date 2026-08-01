@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   applyValidatedProposal,
   applySosLightPerDayUnits,
+  assertFrozenScheduleOperation,
   assertPublicationDependenciesVerified,
   buildFrozenPublicationSchedule,
   canonicalMutationEventHashInput,
@@ -121,19 +122,47 @@ test("frozen publication schedule topologically reverses parent-first input and 
 });
 
 test("frozen publication schedule accepts pinned external roots and rejects incomplete graphs", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-frozen-external-"));
+  const dropbox = path.join(root, "dropbox");
+  const overlay = path.join(root, "overlay");
   const externalKey = "history/v2/observations/day_utc=2026-07-01/connector_id=1/pollutant_code=pm25/manifest.json";
+  const externalBody = Buffer.from("pinned external body");
+  writeObject(dropbox, externalKey, externalBody);
   const parent = graphObject("history/_index_v2/scoped.json", { pollutant_manifest_key: externalKey }, {
     dependencies: [externalKey],
     dependencyIdentities: {
-      [externalKey]: { source: "dropbox", sha256: "a".repeat(64), bytes: 42 },
+      [externalKey]: { source: "dropbox", sha256: sha256Hex(externalBody), bytes: externalBody.byteLength },
     },
   });
-  const schedule = buildFrozenPublicationSchedule({ proposal: { objects: [parent] } });
+  const runState = { base_dropbox_root: dropbox, overlay_root: overlay, objects: {}, tombstone_prefixes: [] };
+  const schedule = buildFrozenPublicationSchedule({ proposal: { objects: [parent] }, runState });
   assert.deepEqual(schedule.external_dependency_counts, { dropbox: 1 });
+
+  writeObject(overlay, externalKey, externalBody);
+  parent.entry.dependency_identities[externalKey].source = "overlay";
+  assert.deepEqual(
+    buildFrozenPublicationSchedule({ proposal: { objects: [parent] }, runState }).external_dependency_counts,
+    { overlay: 1 },
+  );
+  runState.changed_scopes = { INDEXES_CHANGED: [externalKey] };
+  assert.throws(
+    () => buildFrozenPublicationSchedule({ proposal: { objects: [parent] }, runState }),
+    /omitted from the write set/,
+  );
+  runState.changed_scopes = {};
+  runState.tombstone_prefixes = [{
+    prefix: externalKey.slice(0, -"/manifest.json".length),
+    proposed: true,
+  }];
+  assert.throws(
+    () => buildFrozenPublicationSchedule({ proposal: { objects: [parent] }, runState }),
+    /deletion would remove an unstaged dependency/,
+  );
+  runState.tombstone_prefixes = [];
 
   parent.entry.dependency_identities[externalKey].source = "planned_overlay";
   assert.throws(
-    () => buildFrozenPublicationSchedule({ proposal: { objects: [parent] } }),
+    () => buildFrozenPublicationSchedule({ proposal: { objects: [parent] }, runState }),
     /missing from write set/,
   );
   parent.entry.dependencies = [];
@@ -177,10 +206,91 @@ test("frozen publication schedule preserves day barriers and places a changed la
   const schedule = buildFrozenPublicationSchedule({
     proposal: { objects: [snapshot, day2Child, globalIndex, day1Parent, day1Child] },
     selectedDays: ["2026-07-01", "2026-07-02"],
+    publicationMode: "sos_light",
   });
   assert.deepEqual(schedule.entries.map((entry) => entry.canonical_key), [
     day1Child.key, day1Parent.key, day2Child.key, globalIndex.key, snapshot.key,
   ]);
+});
+
+test("frozen execution rejects every dependency identity tamper", async (t) => {
+  const makeFixture = () => {
+    const child = graphObject("history/_index_v2/identity-child.json", { child: true });
+    const parent = graphObject("history/_index_v2/identity-parent.json", { parent: true }, {
+      dependencies: [child.key],
+      dependencyIdentities: {
+        [child.key]: {
+          sha256: child.entry.sha256,
+          bytes: child.entry.bytes,
+          source: "planned_overlay",
+          provenance_version: 2,
+        },
+      },
+      stage: "latest_timeseries_index",
+    });
+    const schedule = buildFrozenPublicationSchedule({ proposal: { objects: [child, parent] } });
+    return {
+      child,
+      parent,
+      scheduled: schedule.entries.find((entry) => entry.canonical_key === parent.key),
+    };
+  };
+  const cases = [
+    ["sha256", (fixture) => { fixture.parent.entry.dependency_identities[fixture.child.key].sha256 = "f".repeat(64); }],
+    ["bytes", (fixture) => { fixture.parent.entry.dependency_identities[fixture.child.key].bytes += 1; }],
+    ["provenance", (fixture) => { fixture.parent.entry.dependency_identities[fixture.child.key].source = "overlay"; }],
+    ["omitted", (fixture) => { delete fixture.parent.entry.dependency_identities[fixture.child.key]; }],
+    ["duplicate", (fixture) => { fixture.parent.entry.dependencies.push(fixture.child.key); }],
+    ["added", (fixture) => {
+      fixture.parent.entry.dependency_identities["history/_index_v2/unexpected.json"] = {
+        sha256: "a".repeat(64), bytes: 1, source: "overlay",
+      };
+    }],
+  ];
+  for (const [name, tamper] of cases) {
+    await t.test(name, () => {
+      const fixture = makeFixture();
+      tamper(fixture);
+      assert.throws(
+        () => assertFrozenScheduleOperation({ object: fixture.parent, scheduled: fixture.scheduled }),
+        /dependency identity|schedule identity/,
+      );
+    });
+  }
+});
+
+test("generated-index callback cannot spoof frozen dependency identities", async () => {
+  const child = graphObject("history/_index_v2/callback-child.json", { child: true });
+  const parent = graphObject("history/_index_v2/callback-parent.json", { parent: true }, {
+    dependencies: [child.key],
+    dependencyIdentities: {
+      [child.key]: { sha256: child.entry.sha256, bytes: child.entry.bytes, source: "planned_overlay" },
+    },
+    stage: "latest_timeseries_index",
+  });
+  const schedule = buildFrozenPublicationSchedule({ proposal: { objects: [child, parent] } });
+  const runState = {
+    objects: { [child.key]: child.entry, [parent.key]: parent.entry },
+    apply: { publication_schedule: schedule },
+  };
+  let executed = false;
+  const { r2 } = createCanonicalGeneratedIndexMutationAdapter({
+    r2: {},
+    runState,
+    persistence: { flush: () => {} },
+    executeOperation: async () => { executed = true; },
+  });
+  await assert.rejects(r2.canonical_mutation_sink({
+    key: parent.key,
+    body: parent.body.toString("utf8"),
+    bytes: parent.body.byteLength,
+    sha256: parent.entry.sha256,
+    dependencies: [child.key],
+    dependency_identities: {
+      [child.key]: { sha256: "e".repeat(64), bytes: child.entry.bytes, source: "planned_overlay" },
+    },
+  }), /schedule identity mismatch/);
+  assert.equal(executed, false);
 });
 
 function sosLightEvidence(dayUtc = "2026-06-17") {
@@ -284,7 +394,7 @@ async function observationFixture({ wrongManifest = false } = {}) {
   };
   const manifestEntry = {
     ...stateEntry(manifestPath, manifestKey, [partKey], {
-      [partKey]: { sha256: partEntry.sha256, bytes: partEntry.bytes, source: "overlay" },
+      [partKey]: { sha256: partEntry.sha256, bytes: partEntry.bytes, source: "planned_overlay" },
     }),
     stage: "observations_data",
     proposal_owner: "source_derived_observation_repair",
@@ -428,7 +538,7 @@ function appendObservationPartition(fixture, { dayUtc, connectorId, pollutantCod
   fixture.runState.objects[partKey] = partEntry;
   fixture.runState.objects[manifestKey] = {
     ...stateEntry(manifestPath, manifestKey, [partKey], {
-      [partKey]: { sha256: partEntry.sha256, bytes: partEntry.bytes, source: "overlay" },
+      [partKey]: { sha256: partEntry.sha256, bytes: partEntry.bytes, source: "planned_overlay" },
     }),
     stage: "observations_data",
     proposal_owner: "source_derived_observation_repair",
@@ -446,6 +556,162 @@ function appendObservationPartition(fixture, { dayUtc, connectorId, pollutantCod
       dayUtc, connectorId, pollutantCode, evidencePath, rowsPath,
     }),
   };
+}
+
+function addObservationParents(fixture, { dayUtc, connectorId, pollutantManifestKey }) {
+  const pollutant = JSON.parse(fs.readFileSync(
+    fixture.runState.objects[pollutantManifestKey].local_path,
+    "utf8",
+  ));
+  const connectorKey = `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
+  const connector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc,
+    connectorId,
+    runId: "test-run",
+    manifestKey: connectorKey,
+    pollutantManifests: [pollutant],
+    writerGitSha: "test",
+    backedUpAtUtc: "2026-06-18T00:00:00.000Z",
+  });
+  const connectorPath = writeObject(
+    fixture.runState.overlay_root,
+    connectorKey,
+    Buffer.from(JSON.stringify(connector, null, 2)),
+  );
+  const pollutantEntry = fixture.runState.objects[pollutantManifestKey];
+  const connectorEntry = {
+    ...stateEntry(connectorPath, connectorKey, [pollutantManifestKey], {
+      [pollutantManifestKey]: {
+        sha256: pollutantEntry.sha256,
+        bytes: pollutantEntry.bytes,
+        source: "planned_overlay",
+      },
+    }),
+    stage: "observation_connector_manifest",
+  };
+  fixture.runState.objects[connectorKey] = connectorEntry;
+
+  const dayKey = `history/v2/observations/day_utc=${dayUtc}/manifest.json`;
+  const day = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc,
+    runId: "test-run",
+    manifestKey: dayKey,
+    connectorManifests: [connector],
+    writerGitSha: "test",
+    backedUpAtUtc: "2026-06-18T00:00:00.000Z",
+  });
+  const dayPath = writeObject(
+    fixture.runState.overlay_root,
+    dayKey,
+    Buffer.from(JSON.stringify(day, null, 2)),
+  );
+  fixture.runState.objects[dayKey] = {
+    ...stateEntry(dayPath, dayKey, [connectorKey], {
+      [connectorKey]: {
+        sha256: connectorEntry.sha256,
+        bytes: connectorEntry.bytes,
+        source: "planned_overlay",
+      },
+    }),
+    stage: "day_parent",
+  };
+  return { connectorKey, connector, dayKey, day };
+}
+
+function createInMemoryApplyAdapters() {
+  const remoteObjects = new Map();
+  const mutationEvents = [];
+  return {
+    remoteObjects,
+    mutationEvents,
+    adapters: {
+      historyWriterClient: {
+        query: async (sql) => ({
+          rows: [{
+            acquired: String(sql).includes("pg_try_advisory_lock") ? true : undefined,
+            released: String(sql).includes("pg_advisory_unlock") ? true : undefined,
+          }],
+        }),
+      },
+      listAllObjects: async ({ prefix }) => [...remoteObjects.keys()]
+        .filter((key) => key.startsWith(prefix))
+        .sort()
+        .map((key) => ({ key })),
+      deleteObjects: async ({ keys }) => {
+        mutationEvents.push(...keys.map((key) => `DELETE ${key}`));
+        for (const key of keys) remoteObjects.delete(key);
+        return { errors: [] };
+      },
+      putObject: async ({ key, body }) => {
+        mutationEvents.push(`PUT ${key}`);
+        remoteObjects.set(key, Buffer.from(body));
+      },
+      getObject: async ({ key }) => {
+        const body = remoteObjects.get(key);
+        if (!body) throw new Error(`Missing in-memory R2 object: ${key}`);
+        return { body, bytes: body.byteLength };
+      },
+      progressLog: () => {},
+    },
+  };
+}
+
+async function genericTwoDayApplyFixture({ externalOverlay = false } = {}) {
+  const fixture = await observationFixture();
+  retainScopedEvidence(fixture, {
+    dayUtc: "2026-06-17",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    evidencePath: fixture.evidencePath,
+    rowsPath: fixture.rowsPath,
+  });
+  const second = appendObservationPartition(fixture, {
+    dayUtc: "2026-06-18",
+    connectorId: 1,
+    pollutantCode: "no2",
+    timeseriesId: 200,
+  });
+  const firstParents = addObservationParents(fixture, {
+    dayUtc: "2026-06-17",
+    connectorId: 1,
+    pollutantManifestKey: fixture.manifestKey,
+  });
+  const secondParents = addObservationParents(fixture, {
+    dayUtc: "2026-06-18",
+    connectorId: 1,
+    pollutantManifestKey: second.manifestKey,
+  });
+  const globalKey = "history/_index_v2/review-global-parent.json";
+  const globalBody = Buffer.from(JSON.stringify({ complete_days: ["2026-06-17", "2026-06-18"] }));
+  const globalPath = writeObject(fixture.runState.overlay_root, globalKey, globalBody);
+  const globalDependencies = [firstParents.dayKey, secondParents.dayKey];
+  const globalIdentities = Object.fromEntries(globalDependencies.map((key) => [key, {
+    sha256: fixture.runState.objects[key].sha256,
+    bytes: fixture.runState.objects[key].bytes,
+    source: "planned_overlay",
+  }]));
+  let externalKey = null;
+  if (externalOverlay) {
+    externalKey = "history/_index_v2/unchanged-overlay-root.json";
+    const externalBody = Buffer.from('{"unchanged":true}\n');
+    writeObject(fixture.runState.overlay_root, externalKey, externalBody);
+    globalDependencies.push(externalKey);
+    globalIdentities[externalKey] = {
+      sha256: sha256Hex(externalBody),
+      bytes: externalBody.byteLength,
+      source: "overlay",
+      validation: "immutable_local_overlay",
+    };
+  }
+  fixture.runState.objects[globalKey] = {
+    ...stateEntry(globalPath, globalKey, globalDependencies, globalIdentities),
+    stage: "global_index",
+  };
+  fixture.runState.run_id = externalOverlay ? "external-overlay-apply" : "generic-two-day-apply";
+  fs.writeFileSync(fixture.runStatePath, JSON.stringify(fixture.runState));
+  return { fixture, second, firstParents, secondParents, globalKey, externalKey };
 }
 
 function replaceStoredEvidenceRows(fixture, storedRows) {
@@ -585,6 +851,58 @@ test("final proposal graph requires immutable source, staged Parquet and final m
   assert.equal(remoteCalls, 0);
   const persisted = JSON.parse(fs.readFileSync(invalid.runStatePath, "utf8"));
   assert.equal(persisted.final_proposal_graph_validation.status, "failed");
+});
+
+test("full generic two-day apply follows connector groups, day parents, then global parents", async () => {
+  const { fixture, second, firstParents, secondParents, globalKey } = await genericTwoDayApplyFixture();
+  const remote = createInMemoryApplyAdapters();
+  const result = await applyValidatedProposal({
+    runStatePath: fixture.runStatePath,
+    r2: {},
+    adapters: remote.adapters,
+  });
+  assert.equal(result.status, "succeeded");
+  const persisted = JSON.parse(fs.readFileSync(fixture.runStatePath, "utf8"));
+  const expectedPutOrder = [
+    fixture.partKey,
+    fixture.manifestKey,
+    firstParents.connectorKey,
+    second.partKey,
+    second.manifestKey,
+    secondParents.connectorKey,
+    firstParents.dayKey,
+    secondParents.dayKey,
+    globalKey,
+  ];
+  assert.equal(persisted.apply.publication_schedule.publication_mode, "generic");
+  assert.deepEqual(
+    persisted.apply.publication_schedule.entries.map((entry) => [entry.position, entry.canonical_key]),
+    expectedPutOrder.map((key, index) => [index + 1, key]),
+  );
+  assert.deepEqual(
+    remote.mutationEvents.filter((event) => event.startsWith("PUT ")),
+    expectedPutOrder.map((key) => `PUT ${key}`),
+  );
+  assert.equal(persisted.apply.last_completed_schedule_position, expectedPutOrder.length);
+});
+
+test("full apply accepts an exact unchanged external overlay root without mutating it", async () => {
+  const { fixture, externalKey, globalKey } = await genericTwoDayApplyFixture({ externalOverlay: true });
+  const remote = createInMemoryApplyAdapters();
+  const result = await applyValidatedProposal({
+    runStatePath: fixture.runStatePath,
+    r2: {},
+    adapters: remote.adapters,
+  });
+  assert.equal(result.status, "succeeded");
+  const persisted = JSON.parse(fs.readFileSync(fixture.runStatePath, "utf8"));
+  assert.equal(persisted.apply.publication_schedule.external_dependency_counts.overlay, 1);
+  assert.equal(persisted.apply.publication_schedule.entries.some(
+    (entry) => entry.canonical_key === externalKey,
+  ), false);
+  assert.equal(remote.mutationEvents.includes(`PUT ${externalKey}`), false);
+  assert.equal(remote.mutationEvents.includes(`DELETE ${externalKey}`), false);
+  assert.equal(remote.mutationEvents.includes(`PUT ${globalKey}`), true);
 });
 
 test("SOS-light same-day pollutants validate against distinct immutable source evidence", async () => {
@@ -953,7 +1271,7 @@ test("mixed changed and unchanged latest-index dependencies retain strict final 
   runState.objects[latestKey].dependency_identities[unchangedKey].source = "planned_overlay";
   assert.throws(
     () => validateLocalProposal(runState),
-    /Dropbox baseline dependency identity is not pinned/,
+    /missing from write set/,
   );
 });
 
@@ -998,7 +1316,7 @@ test("SOS-light proposal requires one complete-day tombstone and complete local 
     [fixture.manifestKey]: {
       sha256: fixture.runState.objects[fixture.manifestKey].sha256,
       bytes: fixture.runState.objects[fixture.manifestKey].bytes,
-      source: "overlay",
+      source: "planned_overlay",
     },
   });
   const day = buildHistoryV2DayManifest({
@@ -1008,7 +1326,7 @@ test("SOS-light proposal requires one complete-day tombstone and complete local 
   });
   const dayPath = writeObject(fixture.runState.overlay_root, dayKey, Buffer.from(JSON.stringify(day, null, 2)));
   const dayEntry = stateEntry(dayPath, dayKey, [connectorKey], {
-    [connectorKey]: { sha256: connectorEntry.sha256, bytes: connectorEntry.bytes, source: "overlay" },
+    [connectorKey]: { sha256: connectorEntry.sha256, bytes: connectorEntry.bytes, source: "planned_overlay" },
   });
   Object.assign(fixture.runState.objects, { [connectorKey]: connectorEntry, [dayKey]: dayEntry });
   Object.assign(fixture.runState, {
@@ -1069,6 +1387,97 @@ test("SOS-light proposal requires one complete-day tombstone and complete local 
     adapters: { deleteObjects: remote, getObject: remote, listAllObjects: remote, putObject: remote },
   }), /dependency identity is invalid|manifest_contract/);
   assert.equal(remoteCalls, 0);
+});
+
+test("SOS-light complete-day preflight carries an unchanged connector 2 parent without mutating it", async () => {
+  const fixture = await observationFixture();
+  const dayUtc = "2026-06-17";
+  retainScopedEvidence(fixture, {
+    dayUtc,
+    connectorId: 1,
+    pollutantCode: "pm25",
+    evidencePath: fixture.evidencePath,
+    rowsPath: fixture.rowsPath,
+  });
+  const connector1 = addObservationParents(fixture, {
+    dayUtc,
+    connectorId: 1,
+    pollutantManifestKey: fixture.manifestKey,
+  });
+  const connector2Key = `history/v2/observations/day_utc=${dayUtc}/connector_id=2/manifest.json`;
+  const connector2 = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc,
+    connectorId: 2,
+    runId: "baseline-run",
+    manifestKey: connector2Key,
+    pollutantManifests: [],
+    writerGitSha: "baseline",
+    backedUpAtUtc: "2026-06-16T23:00:00.000Z",
+  });
+  const connector2Body = Buffer.from(JSON.stringify(connector2, null, 2));
+  const baselineConnector2Path = writeObject(fixture.runState.base_dropbox_root, connector2Key, connector2Body);
+  const carriedConnector2Path = writeObject(fixture.runState.overlay_root, connector2Key, connector2Body);
+  assert.deepEqual(fs.readFileSync(carriedConnector2Path), fs.readFileSync(baselineConnector2Path));
+  fixture.runState.objects[connector2Key] = {
+    ...stateEntry(carriedConnector2Path, connector2Key),
+    stage: "observation_connector_manifest",
+    carried_unchanged_from: "dropbox",
+  };
+  const dayKey = connector1.dayKey;
+  const day = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc,
+    runId: "test-run",
+    manifestKey: dayKey,
+    connectorManifests: [connector1.connector, connector2],
+    writerGitSha: "test",
+    backedUpAtUtc: "2026-06-18T00:00:00.000Z",
+  });
+  const dayPath = writeObject(fixture.runState.overlay_root, dayKey, Buffer.from(JSON.stringify(day, null, 2)));
+  const connectorDependencies = [connector1.connectorKey, connector2Key];
+  fixture.runState.objects[dayKey] = {
+    ...stateEntry(dayPath, dayKey, connectorDependencies, Object.fromEntries(
+      connectorDependencies.map((key) => [key, {
+        sha256: fixture.runState.objects[key].sha256,
+        bytes: fixture.runState.objects[key].bytes,
+        source: "planned_overlay",
+      }]),
+    )),
+    stage: "day_parent",
+  };
+  Object.assign(fixture.runState, {
+    run_id: "sos-multi-connector-structural",
+    execution_path: "sos_light",
+    ...sosLightEvidence(dayUtc),
+    mutation_connector_ids: [1],
+    aqi_policy: "bypassed_observation_history_only",
+    changed_scopes: {
+      AQILEVELS_CHANGED: [],
+      AQI_MANIFESTS_CHANGED: [],
+      AQI_INDEXES_CHANGED: [],
+    },
+  });
+  fixture.runState.tombstone_prefixes = [{
+    prefix: `history/v2/observations/day_utc=${dayUtc}`,
+    proposed: true,
+    stage: "sos_light_complete_day",
+  }];
+  const proposal = validateLocalProposal(fixture.runState);
+  const dedicated = validateDedicatedSosHistoricalProposal({ runState: fixture.runState, proposal });
+  const graph = await validateFinalProposalGraph({ runState: fixture.runState, proposal });
+  const schedule = buildFrozenPublicationSchedule({
+    proposal,
+    selectedDays: dedicated.selected_days,
+    publicationMode: "sos_light",
+    runState: fixture.runState,
+  });
+  assert.equal(graph.status, "succeeded");
+  assert.equal(schedule.publication_mode, "sos_light");
+  assert.ok(schedule.entries.find((entry) => entry.canonical_key === connector2Key));
+  assert.ok(schedule.entries.find((entry) => entry.canonical_key === dayKey).dependencies.includes(connector2Key));
+  assert.equal(fixture.runState.objects[connector2Key].remote_attempted, undefined);
+  assert.equal(fixture.runState.objects[connector2Key].r2_verified, undefined);
 });
 
 test("SOS-light first-day upload failure leaves every later day undeleted", async () => {
