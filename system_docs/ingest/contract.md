@@ -16,6 +16,34 @@ This contract is authoritative even though:
 
 Implementation and schema changes must preserve this contract unless the contract is intentionally amended first or in the assigned ChatGPT documentation phase.
 
+## Connector ingest scheduler ownership
+
+For TEST Cloud Run connector-ingest services, recurring external dispatch is owned by the Cloudflare ingest scheduler and its D1 job configuration.
+
+This applies to:
+
+- Breathe London Nodes;
+- Breathe London Communities;
+- UK-AIR SOS;
+- Sensor.Community;
+- the OpenAQ external safety trigger.
+
+Cloud Run deployment workflows MUST:
+
+- deploy and configure the connector service;
+- preserve authenticated application-level dispatch through the shared upstream secret;
+- reconcile the deployed Cloud Run service URL into the corresponding Cloudflare scheduler D1 job.
+
+Cloud Run deployment workflows MUST NOT:
+
+- create, update, resume or otherwise manage Google Cloud Scheduler jobs for connector ingestion.
+
+The database value `scheduler_backend = 'google_cloud_run'` identifies the execution backend. It does not mean that Google Cloud Scheduler owns dispatch.
+
+OpenAQ retains its worker-created one-off Cloud Tasks as its primary self-scheduling path. The Cloudflare OpenAQ safety job remains the external recovery trigger. Removing Google Cloud Scheduler MUST NOT remove or disable the OpenAQ Cloud Tasks queue, task creation, task invoker identity or associated IAM permissions.
+
+This scheduler-ownership change MUST NOT alter connector poll intervals, due-state checks, dispatch claims, overlap protection, retry behaviour or connector-specific work selection.
+
 ## Daily Stations general contract
 
 Daily Stations MUST:
