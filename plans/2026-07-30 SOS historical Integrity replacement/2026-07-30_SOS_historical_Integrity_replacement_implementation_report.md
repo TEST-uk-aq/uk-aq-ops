@@ -1,5 +1,90 @@
 # SOS historical Integrity replacement implementation report
 
+## 1 August 2026 proposal dependency provenance correction
+
+### Failure and root cause
+
+The 44-day SOS-light run completed its single source acquisition, all 176 selected connector `1` partition builds, complete-day assembly including the absent 30 July Dropbox day, and metadata planning. Final local proposal validation then correctly stopped before the first R2 mutation because the changed latest Timeseries index claimed this unchanged dependency was staged:
+
+```text
+history/_index_v2/observations_timeseries_latest.json
+->
+history/_index_v2/observations_timeseries/day_utc=2026-07-07/connector_id=1/pollutant_code=123c6h3ch33/manifest.json
+source=planned_overlay
+```
+
+The child index had a byte-identical `changed=false` planning record and therefore was not copied into the mutation overlay. `createStagedObjectMap()` nevertheless treated every record in its `proposals` map as a staged object when resolving dependencies, exact GET/HEAD lookup, listings and local dependency snapshots. The resulting graph contradicted itself: `planned_overlay` provenance named an object absent from the changed write set. The existing validator rejected that contradiction as designed, which is why the run recorded zero day deletions, PUTs, changed objects and post-PUT verification GETs.
+
+### Corrected planning and mutation distinction
+
+Proposal existence and mutation staging are now separate:
+
+```text
+proposal.changed=true
+-> planned_overlay
+-> proposed SHA-256 and bytes
+-> included in metadata write set
+
+proposal.changed=false
+-> planning/audit record only
+-> exact underlying combined-local source, SHA-256 and bytes
+-> status=skipped_unchanged
+-> excluded from metadata write set
+```
+
+`resolveDependencyIdentities()` and `stagedObject()` now use a proposal body only when `changed === true`. Unchanged records fall through to the combined-local store and retain the real source, which is Dropbox for the failed index but may legitimately be `overlay` for another object. GET, HEAD and listing use the same rule; a changed proposal replaces its baseline listing entry, while an unchanged record leaves the single baseline entry and provenance intact.
+
+`localDependencySnapshot()` now marks `staged=true` only for a changed proposal and records every child's source, SHA-256 and bytes. Snapshot validation checks that this identity equals the parent dependency identity, that every `planned_overlay` child has a changed proposal, and that an unchanged child cannot be labelled `planned_overlay`. Diagnostic proposal entries expose `changed`, `status`, `included_in_write_set`, dependency identities and detailed child snapshots.
+
+A latest index may therefore depend on both:
+
+```text
+changed child index   -> planned_overlay -> written and GET-verified
+unchanged child index -> dropbox         -> skipped, no PUT or post-PUT GET
+```
+
+The latest index remains publishable only after every changed dependency succeeds. Planning audit now records changed/skipped proposal counts, changed/baseline dependency-edge counts, metadata mutation-write count, zero planning-time verification operations and the expected changed-object verification count. Runtime write and post-PUT GET counts continue to use the existing canonical apply and final-verification evidence; no duplicate apply counter or validator fallback was added.
+
+The final transition into `runState.objects` was traced and retained: `_record_metadata_executor_overlay()` already stages only proposals with `changed=true`. A focused behavioral check proves the unchanged planning record remains visible as `skipped_unchanged` but is absent from the mutation overlay. Complete-day observation objects remain unchanged: they are still all written after their day prefix is deleted.
+
+### Files changed
+
+- `scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs`: truthful changed-only proposal shadowing, exact baseline fallback, mixed dependency provenance, strengthened snapshots and proposal-graph audit.
+- `scripts/backup_r2/tests/uk_aq_execute_v2_observations_repair.test.mjs`: mixed changed/unchanged dependency, GET, HEAD, listing, snapshot, baseline-source and write-set coverage.
+- `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`: strict final local validation for the correct mixed graph and the original false-`planned_overlay` contradiction.
+- `tests/test_uk_aq_history_integrity_repair_planning.py`: actual metadata planning-to-`runState.objects` changed-only transition coverage.
+- this implementation report.
+
+The changed active planner was snapshotted at `archive/2026-08-01/scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs` before editing. The apply validator, complete-day apply implementation, `system_docs/`, `TODO-IMPORTANT-UKAQ.txt`, source acquisition, reconciliation, generic Integrity, Prune Daily and AQI paths were not changed.
+
+### Focused structural validation
+
+- JavaScript syntax checks: passed.
+- Mixed latest-index dependency provenance, exact lookup, HEAD, listing, snapshot, actual baseline-source and metadata write-set regression: passed.
+- Strict final local proposal validation accepts the correct mixed graph and still rejects an unstaged dependency falsely labelled `planned_overlay`: passed.
+- Python changed-only metadata overlay transition regression: passed.
+- Directly relevant existing absent-Dropbox-day, O3 child-set, ascending per-day apply, later-day protection, indexes-last and generic proposal-safety checks: retained and passed.
+- `git diff --check`: passed.
+
+No actual Integrity command, R2/Dropbox/Supabase/GCP/SOS access, deployment, commit, push or pull request was performed.
+
+### CIC-Test operator rerun
+
+```bash
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
+  --env CIC-Test \
+  --profile manual \
+  --source sos \
+  --from-day 2026-06-17 \
+  --to-day 2026-07-30 \
+  --history-version v2 \
+  --run-backfill \
+  --repair-pollutants pm25,pm10,no2,o3 \
+  --allow-stale-dropbox
+```
+
+Acceptance requires changed child indexes to appear as `planned_overlay` and enter the write set; unchanged child indexes to retain pinned Dropbox provenance, remain `skipped_unchanged`, and receive no PUT or post-PUT GET; and the changed latest index to retain both dependency classes and publish only after all changed child indexes verify.
+
 ## 1 August 2026 absent-Dropbox-day and per-day apply corrections
 
 ### Root causes and corrected behaviour

@@ -791,6 +791,53 @@ test("publication order and dependencies prevent indexes preceding manifests", a
   }), /manifest_counts/);
 });
 
+test("mixed changed and unchanged latest-index dependencies retain strict final validation", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-integrity-mixed-index-provenance-"));
+  const overlay = path.join(root, "overlay");
+  const dropbox = path.join(root, "dropbox");
+  const prefix = "history/_index_v2/observations_timeseries/";
+  const changedKey = `${prefix}day_utc=2026-07-07/connector_id=1/pollutant_code=pm25/manifest.json`;
+  const unchangedKey = `${prefix}day_utc=2026-07-07/connector_id=1/pollutant_code=123c6h3ch33/manifest.json`;
+  const latestKey = "history/_index_v2/observations_timeseries_latest.json";
+  const changedPath = writeObject(overlay, changedKey, Buffer.from(JSON.stringify({ version: "new" })));
+  const unchangedPath = writeObject(dropbox, unchangedKey, Buffer.from(JSON.stringify({ version: "same" })));
+  const latestPath = writeObject(overlay, latestKey, Buffer.from(JSON.stringify({ version: "new-latest" })));
+  const changedEntry = stateEntry(changedPath, changedKey);
+  const unchangedBody = fs.readFileSync(unchangedPath);
+  const latestEntry = stateEntry(latestPath, latestKey, [changedKey, unchangedKey], {
+    [changedKey]: {
+      source: "planned_overlay",
+      sha256: changedEntry.sha256,
+      bytes: changedEntry.bytes,
+    },
+    [unchangedKey]: {
+      source: "dropbox",
+      sha256: sha256Hex(unchangedBody),
+      bytes: unchangedBody.byteLength,
+    },
+  });
+  const runState = {
+    environment: "CIC-Test",
+    base_dropbox_root: dropbox,
+    objects: {
+      [changedKey]: changedEntry,
+      [latestKey]: latestEntry,
+    },
+    tombstone_prefixes: [],
+  };
+
+  const proposal = validateLocalProposal(runState);
+  assert.deepEqual(proposal.objects.map((object) => object.key).sort(),
+    [changedKey, latestKey].sort());
+  assert.equal(proposal.objects.some((object) => object.key === unchangedKey), false);
+
+  runState.objects[latestKey].dependency_identities[unchangedKey].source = "planned_overlay";
+  assert.throws(
+    () => validateLocalProposal(runState),
+    /Dropbox baseline dependency identity is not pinned/,
+  );
+});
+
 test("verified GET cache requires exact key and SHA, invalidates on mutation, and stays bounded to its scope", () => {
   const cache = createVerifiedGetBodyCache({ maxBytes: 8, maxEntries: 2 });
   const first = Buffer.from("1234");
