@@ -1,5 +1,68 @@
 # SOS historical Integrity replacement implementation report
 
+## 1 August 2026 proposal-to-run-state provenance transition correction
+
+### Root cause and affected transition
+
+The JavaScript metadata planner correctly emitted `planned_overlay` for every changed current-run dependency. `_record_metadata_executor_overlay()` also passed those identities into `stage_overlay_object()` without changing their source. The contradiction was introduced later by Python in `assemble_sos_light_complete_days()` while converting the planner-backed local assembly into final `runState.objects`.
+
+Two coordinator rewrites were responsible. The connector 1/day-parent rebuild assigned `source=overlay` to references that were already present in the final staged write set. A following blanket normalisation pass then relabelled every dependency with a child in `runState.objects` to `overlay`, affecting pollutant-to-Parquet, connector-to-pollutant, day-to-connector, scoped-index-to-pollutant and latest-index-to-scoped-index edges. That pass inferred provenance from local overlay availability rather than the planner identity and final changed write set. The existing Node final validator rejected the contradiction before R2 mutation, as required.
+
+### Corrected transition and coordinator validation
+
+Python now snapshots the authoritative planner dependencies and identities when each changed metadata proposal is staged. Unchanged planner proposals are recorded as compact key evidence and remain outside `runState.objects`. SOS complete-day assembly preserves an existing planner identity without reconstruction. Only a Dropbox-carried parent that has no planner identity receives an explicitly resolved identity, and because every referenced child is part of the complete-day replacement write set, that identity is `planned_overlay` with the final child SHA-256 and byte count. The blanket physical-overlay provenance rewrite was removed.
+
+Immediately before launching `uk_aq_apply_integrity_proposal.mjs`, Python now validates the complete final transition. It proves that:
+
+- every final object is a built, structurally validated changed write object whose declared SHA-256 and bytes match its local body;
+- every dependency present in the final write set is `planned_overlay` and matches the final staged child;
+- every `planned_overlay` dependency is present in the final write set;
+- external dependencies remain exact pinned `dropbox` or immutable `overlay` bodies and are outside proposed deletion prefixes;
+- planner and final dependency keys, source, SHA-256 and bytes remain identical where planner evidence exists;
+- unchanged planner records are absent from the final changed write set.
+
+Failure is classified as `coordinator_proposal_transition_validation_failed`, records parent/dependency keys plus planner, final and expected identities, writes local failure evidence, and returns before `subprocess.Popen`. Node apply therefore cannot perform an R2 DELETE or PUT. The existing Node validator remains unchanged as the independent final safety boundary.
+
+### Files changed
+
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`: preserves planner transition evidence, removes both provenance rewrites, explicitly resolves only missing carried-parent identities, adds the final coordinator transition validator and gates the Node child-process launch.
+- `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`: adds a production-path planner-to-Python-to-SOS-assembly regression, invokes the real Node local validator on the generated run state, covers all affected graph levels and external provenance, and verifies fail-closed launch prevention.
+- this implementation report.
+
+The existing `workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs` correction that labels staged Parquet dependencies `planned_overlay` is retained. The wrapper, JavaScript planner and Node apply validator required no change. The coordinator implementation already has a 1 August pre-change archive under `archive/2026-08-01/`; repository policy prohibits making a duplicate same-day archive.
+
+### Focused checks
+
+- Python compilation for the coordinator and focused test module: passed.
+- Real coordinator-transition regression, including Node `validateLocalProposal()` acceptance: passed.
+- Coordinator rejection checks for staged `overlay`, missing staged children, changed SHA-256, changed bytes and an unchanged planner record entering the write set: passed.
+- Node-apply launch prevention after transition failure: passed; `subprocess.Popen` was not called and the result records that R2 mutation was impossible.
+- Focused coordinator-transition plus existing Python apply-persistence and child-process boundary checks: passed (`18` tests).
+- Existing JavaScript planner provenance checks: passed (`2` tests).
+- Existing Node apply-safety checks: passed (`46` tests).
+- `git diff --check`: passed.
+
+No Integrity operation, R2, Dropbox, Supabase or other external service was accessed. No deployment, commit, push or pull request was performed. `system_docs/` and `TODO-IMPORTANT-UKAQ.txt` were not modified.
+
+### Remaining CIC-Test validation
+
+Functional resolution is not claimed from structural checks alone. After deployment, rerun manually:
+
+```bash
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
+  --env CIC-Test \
+  --profile manual \
+  --source sos \
+  --from-day 2026-06-17 \
+  --to-day 2026-07-30 \
+  --history-version v2 \
+  --run-backfill \
+  --repair-pollutants pm25,pm10,no2,o3 \
+  --allow-stale-dropbox
+```
+
+The remaining operational risk is whether the full real planner output contains an untraced producer or merge shape not represented by the focused production-path fixture, and whether the complete CIC-Test run passes later external writer-lock, R2 publication, verification and current-state reconciliation stages. Confirm `proposal_transition_validation.status=succeeded`, unchanged external roots remain outside the write set, Node final proposal validation passes before the first deletion, and normal SOS-light per-day publication completes.
+
 ## 1 August 2026 preflight-generated graph and frozen publication schedule correction
 
 ### Confirmed root cause

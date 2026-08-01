@@ -19364,6 +19364,32 @@ def _overlay_object_entry(run_state: Mapping[str, Any], object_key: str) -> dict
     return entry
 
 
+PROPOSAL_TRANSITION_EXTERNAL_SOURCES = frozenset({"dropbox", "overlay"})
+PROPOSAL_TRANSITION_DEPENDENCY_SOURCES = frozenset({
+    "planned_overlay", *PROPOSAL_TRANSITION_EXTERNAL_SOURCES,
+})
+
+
+def _normalise_proposal_dependency_identity(
+    *, parent_key: str, dependency_key: str, identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    sha256 = str(identity.get("sha256") or "").strip().lower()
+    try:
+        byte_count = int(identity.get("bytes"))
+    except (TypeError, ValueError):
+        byte_count = -1
+    source = str(identity.get("source") or "").strip()
+    if (
+        not re.fullmatch(r"[a-f0-9]{64}", sha256)
+        or byte_count < 0
+        or source not in PROPOSAL_TRANSITION_DEPENDENCY_SOURCES
+    ):
+        raise ValueError(
+            f"overlay dependency identity is invalid: {parent_key} -> {dependency_key}"
+        )
+    return {"sha256": sha256, "bytes": byte_count, "source": source}
+
+
 def _record_coordinator_complete_run_state_write(
     run_state: Mapping[str, Any],
 ) -> None:
@@ -19511,25 +19537,11 @@ def stage_overlay_object(
             raise ValueError(
                 f"overlay dependency identity is unavailable: {normalized_key} -> {dependency}"
             )
-        sha256 = str(identity.get("sha256") or "").strip().lower()
-        try:
-            byte_count = int(identity.get("bytes"))
-        except (TypeError, ValueError):
-            byte_count = -1
-        source_kind = str(identity.get("source") or "").strip()
-        if (
-            not re.fullmatch(r"[a-f0-9]{64}", sha256)
-            or byte_count < 0
-            or source_kind not in {"planned_overlay", "overlay", "dropbox"}
-        ):
-            raise ValueError(
-                f"overlay dependency identity is invalid: {normalized_key} -> {dependency}"
-            )
-        normalized_identities[dependency] = {
-            "sha256": sha256,
-            "bytes": byte_count,
-            "source": source_kind,
-        }
+        normalized_identities[dependency] = _normalise_proposal_dependency_identity(
+            parent_key=normalized_key,
+            dependency_key=dependency,
+            identity=identity,
+        )
     objects[normalized_key] = {
         "object_key": normalized_key,
         "local_path": str(target),
@@ -19910,14 +19922,29 @@ def _record_metadata_executor_overlay(
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
+    planner_unchanged_keys = {
+        _normalise_overlay_object_key(str(value))
+        for value in list(
+            run_state.get("proposal_transition_planner_unchanged_keys") or []
+        )
+    }
     for proposal in sorted(
         (item for item in list(planning.get("proposals") or []) if isinstance(item, Mapping)),
         key=lambda item: str(item.get("key") or ""),
     ):
         object_key = str(proposal.get("key") or "").strip()
         body = proposal.get("proposed_body")
-        if not object_key or not proposal.get("changed") or not isinstance(body, str):
+        if not object_key:
             continue
+        normalized_object_key = _normalise_overlay_object_key(object_key)
+        if proposal.get("changed") is not True:
+            planner_unchanged_keys.add(normalized_object_key)
+            continue
+        planner_unchanged_keys.discard(normalized_object_key)
+        if not isinstance(body, str):
+            raise ValueError(
+                f"changed planner proposal body is unavailable: {normalized_object_key}"
+            )
         with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-proposal-") as temp_dir:
             source = Path(temp_dir) / "generated-object"
             source.write_text(body, encoding="utf-8")
@@ -19936,10 +19963,23 @@ def _record_metadata_executor_overlay(
                 ),
             )
         snapshot = proposal.get("local_dependency_snapshot")
+        staged_entry = _overlay_object_entry(run_state, object_key)
+        staged_entry["planner_changed"] = True
+        staged_entry["planner_status"] = str(proposal.get("status") or "planned")
+        staged_entry["planner_included_in_write_set"] = bool(
+            proposal.get("included_in_write_set", True)
+        )
+        staged_entry["planner_dependencies"] = list(
+            staged_entry.get("dependencies") or []
+        )
+        staged_entry["planner_dependency_identities"] = {
+            key: dict(value)
+            for key, value in dict(
+                staged_entry.get("dependency_identities") or {}
+            ).items()
+        }
         if isinstance(snapshot, Mapping):
-            _overlay_object_entry(run_state, object_key)[
-                "local_dependency_snapshot"
-            ] = dict(snapshot)
+            staged_entry["local_dependency_snapshot"] = dict(snapshot)
         mark_overlay_structurally_validated(run_state, object_key)
         scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
         record_changed_scope(run_state, scope_set, {
@@ -19947,6 +19987,9 @@ def _record_metadata_executor_overlay(
             "stage": stage,
             "provenance": proposal.get("provenance") or "repair_generated",
         })
+    run_state["proposal_transition_planner_unchanged_keys"] = sorted(
+        planner_unchanged_keys
+    )
     write_run_state(run_state)
 
 
@@ -19970,6 +20013,39 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
     objects = run_state.get("objects")
     if not isinstance(objects, dict):
         raise ValueError("SOS-light overlay objects mapping is unavailable")
+
+    def preserve_or_resolve_staged_identities(
+        *, parent_key: str, references: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        parent_entry = objects[parent_key]
+        existing_identities = parent_entry.get("dependency_identities")
+        if not isinstance(existing_identities, Mapping):
+            existing_identities = {}
+        resolved: dict[str, dict[str, Any]] = {}
+        for reference in sorted(references):
+            staged = objects.get(reference)
+            if not isinstance(staged, Mapping):
+                raise ValueError(
+                    f"SOS-light generated parent has an unstaged child: "
+                    f"{parent_key} -> {reference}"
+                )
+            existing = existing_identities.get(reference)
+            if isinstance(existing, Mapping):
+                # Preserve planner provenance exactly.  The final coordinator
+                # transition validator below rejects any contradiction rather
+                # than silently repairing it from the physical overlay path.
+                resolved[reference] = dict(existing)
+            else:
+                # Dropbox-carried parent bodies do not have planner identities.
+                # Their children are all in the complete-day replacement write
+                # set, so this is an explicit staged-object reconstruction.
+                resolved[reference] = {
+                    "sha256": staged.get("sha256"),
+                    "bytes": staged.get("bytes"),
+                    "source": "planned_overlay",
+                }
+        return resolved
+
     total_day_uploads = 0
     dropbox_day_absent_days: list[str] = []
     for raw_day in day_entries:
@@ -20098,14 +20174,10 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
                     f"SOS-light generated parent has an unstaged child: {object_key} -> {missing[0]}"
                 )
             entry["dependencies"] = sorted(references)
-            entry["dependency_identities"] = {
-                reference: {
-                    "sha256": objects[reference]["sha256"],
-                    "bytes": objects[reference]["bytes"],
-                    "source": "planned_overlay",
-                }
-                for reference in sorted(references)
-            }
+            entry["dependency_identities"] = preserve_or_resolve_staged_identities(
+                parent_key=object_key,
+                references=references,
+            )
         for parent_key, reference_fields in (
             (connector1_parent, ("pollutant_manifests", "child_manifests")),
             (f"{day_prefix}/manifest.json", ("connector_manifests", "child_manifests")),
@@ -20127,14 +20199,10 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
                     f"SOS-light final parent has an unstaged child: {parent_key} -> {missing[0]}"
                 )
             parent_entry["dependencies"] = sorted(references)
-            parent_entry["dependency_identities"] = {
-                reference: {
-                    "sha256": objects[reference]["sha256"],
-                    "bytes": objects[reference]["bytes"],
-                    "source": "overlay",
-                }
-                for reference in sorted(references)
-            }
+            parent_entry["dependency_identities"] = preserve_or_resolve_staged_identities(
+                parent_key=parent_key,
+                references=references,
+            )
             parent_entry["local_dependency_snapshot"] = {
                 "source": "complete_local_sos_light_assembly",
                 "expected_child_keys": sorted(references),
@@ -20152,23 +20220,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         day["complete_day_delete_prefix"] = f"{day_prefix}/"
         total_day_uploads += len(day_keys)
         raw_day.update(day)
-
-    # Every dependency below a deleted day is now an explicitly staged object.
-    for entry in objects.values():
-        if not isinstance(entry, dict):
-            continue
-        identities = entry.get("dependency_identities")
-        if not isinstance(identities, dict):
-            continue
-        for dependency, identity in identities.items():
-            staged = objects.get(dependency)
-            if not isinstance(staged, Mapping) or not isinstance(identity, dict):
-                continue
-            identity.update({
-                "sha256": staged.get("sha256"),
-                "bytes": staged.get("bytes"),
-                "source": "overlay",
-            })
 
     run_state["tombstone_prefixes"] = [
         {
@@ -21979,12 +22030,433 @@ def record_integrity_object_operations(
     return counts
 
 
+def _proposal_transition_error(
+    *,
+    reason: str,
+    parent_key: str,
+    dependency_key: str,
+    planner_identity: Mapping[str, Any] | None,
+    final_identity: Mapping[str, Any] | None,
+    expected_source: str | None,
+    expected_sha256: str | None,
+    expected_bytes: int | None,
+    dependency_in_final_write_set: bool,
+) -> ValueError:
+    evidence = {
+        "reason": reason,
+        "parent_object_key": parent_key,
+        "dependency_object_key": dependency_key,
+        "planner_source": (
+            str(planner_identity.get("source") or "")
+            if isinstance(planner_identity, Mapping) else None
+        ),
+        "final_source": (
+            str(final_identity.get("source") or "")
+            if isinstance(final_identity, Mapping) else None
+        ),
+        "expected_source": expected_source,
+        "expected_sha256": expected_sha256,
+        "expected_bytes": expected_bytes,
+        "actual_sha256": (
+            str(final_identity.get("sha256") or "")
+            if isinstance(final_identity, Mapping) else None
+        ),
+        "actual_bytes": (
+            final_identity.get("bytes")
+            if isinstance(final_identity, Mapping) else None
+        ),
+        "dependency_in_final_changed_write_set": dependency_in_final_write_set,
+    }
+    return ValueError(
+        "coordinator proposal-transition validation failed: "
+        + json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    )
+
+
+def validate_proposal_run_state_transition(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    objects = run_state.get("objects")
+    if objects is None:
+        objects = {}
+    if not isinstance(objects, Mapping):
+        raise ValueError(
+            "coordinator proposal-transition validation failed: "
+            "final run-state objects mapping is invalid"
+        )
+    changed_keys = {
+        _normalise_overlay_object_key(str(key)) for key in objects
+    }
+    unchanged_planner_keys = {
+        _normalise_overlay_object_key(str(key))
+        for key in list(
+            run_state.get("proposal_transition_planner_unchanged_keys") or []
+        )
+    }
+    unexpected_unchanged = sorted(changed_keys & unchanged_planner_keys)
+    if unexpected_unchanged:
+        key = unexpected_unchanged[0]
+        raise _proposal_transition_error(
+            reason="unchanged_planner_proposal_entered_final_write_set",
+            parent_key=key,
+            dependency_key=key,
+            planner_identity=None,
+            final_identity=objects.get(key) if isinstance(objects.get(key), Mapping) else None,
+            expected_source=None,
+            expected_sha256=None,
+            expected_bytes=None,
+            dependency_in_final_write_set=True,
+        )
+
+    proposed_prefixes = [
+        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
+        for entry in list(run_state.get("tombstone_prefixes") or [])
+        if isinstance(entry, Mapping) and entry.get("proposed")
+    ]
+    staged_edge_count = 0
+    external_edge_counts = {source: 0 for source in sorted(
+        PROPOSAL_TRANSITION_EXTERNAL_SOURCES
+    )}
+    planner_identity_comparison_count = 0
+    for parent_key in sorted(changed_keys):
+        raw_entry = objects.get(parent_key)
+        if not isinstance(raw_entry, Mapping):
+            raise _proposal_transition_error(
+                reason="final_changed_object_entry_invalid",
+                parent_key=parent_key,
+                dependency_key=parent_key,
+                planner_identity=None,
+                final_identity=None,
+                expected_source="planned_overlay",
+                expected_sha256=None,
+                expected_bytes=None,
+                dependency_in_final_write_set=True,
+            )
+        entry = raw_entry
+        if (
+            entry.get("proposed") is not True
+            or entry.get("built") is not True
+            or entry.get("structurally_validated") is not True
+            or entry.get("changed") is False
+            or entry.get("included_in_write_set") is False
+            or entry.get("planner_changed") is False
+            or entry.get("planner_included_in_write_set") is False
+            or str(entry.get("status") or "") == "skipped_unchanged"
+            or str(entry.get("planner_status") or "") == "skipped_unchanged"
+        ):
+            raise _proposal_transition_error(
+                reason="final_write_set_contains_non_changed_or_unvalidated_object",
+                parent_key=parent_key,
+                dependency_key=parent_key,
+                planner_identity=None,
+                final_identity=entry,
+                expected_source="planned_overlay",
+                expected_sha256=str(entry.get("sha256") or "") or None,
+                expected_bytes=(
+                    int(entry.get("bytes"))
+                    if isinstance(entry.get("bytes"), int) else None
+                ),
+                dependency_in_final_write_set=True,
+            )
+        local_path = Path(str(entry.get("local_path") or ""))
+        body = local_path.read_bytes() if local_path.is_file() else None
+        declared_sha256 = str(entry.get("sha256") or "").strip().lower()
+        declared_bytes = entry.get("bytes")
+        if (
+            body is None
+            or not re.fullmatch(r"[a-f0-9]{64}", declared_sha256)
+            or not isinstance(declared_bytes, int)
+            or isinstance(declared_bytes, bool)
+            or declared_bytes < 0
+            or len(body) != declared_bytes
+            or hashlib.sha256(body).hexdigest() != declared_sha256
+        ):
+            raise _proposal_transition_error(
+                reason="final_staged_object_identity_invalid",
+                parent_key=parent_key,
+                dependency_key=parent_key,
+                planner_identity=None,
+                final_identity={
+                    "source": "planned_overlay",
+                    "sha256": declared_sha256,
+                    "bytes": declared_bytes,
+                },
+                expected_source="planned_overlay",
+                expected_sha256=(hashlib.sha256(body).hexdigest() if body is not None else None),
+                expected_bytes=(len(body) if body is not None else None),
+                dependency_in_final_write_set=True,
+            )
+
+        raw_dependencies = entry.get("dependencies") or []
+        if not isinstance(raw_dependencies, list):
+            raise _proposal_transition_error(
+                reason="final_dependency_list_invalid",
+                parent_key=parent_key,
+                dependency_key=parent_key,
+                planner_identity=None,
+                final_identity=None,
+                expected_source=None,
+                expected_sha256=None,
+                expected_bytes=None,
+                dependency_in_final_write_set=True,
+            )
+        dependencies = [
+            _normalise_overlay_object_key(str(value))
+            for value in raw_dependencies
+        ]
+        if len(set(dependencies)) != len(dependencies):
+            duplicate = next(
+                key for key in dependencies if dependencies.count(key) > 1
+            )
+            raise _proposal_transition_error(
+                reason="duplicate_final_dependency",
+                parent_key=parent_key,
+                dependency_key=duplicate,
+                planner_identity=None,
+                final_identity=None,
+                expected_source=None,
+                expected_sha256=None,
+                expected_bytes=None,
+                dependency_in_final_write_set=duplicate in changed_keys,
+            )
+        raw_identities = entry.get("dependency_identities") or {}
+        if not isinstance(raw_identities, Mapping):
+            raw_identities = {}
+        identity_keys = {
+            _normalise_overlay_object_key(str(key)) for key in raw_identities
+        }
+        if identity_keys != set(dependencies):
+            dependency_key = sorted(identity_keys ^ set(dependencies))[0]
+            raise _proposal_transition_error(
+                reason="final_dependency_identity_set_mismatch",
+                parent_key=parent_key,
+                dependency_key=dependency_key,
+                planner_identity=None,
+                final_identity=(
+                    raw_identities.get(dependency_key)
+                    if isinstance(raw_identities.get(dependency_key), Mapping)
+                    else None
+                ),
+                expected_source=None,
+                expected_sha256=None,
+                expected_bytes=None,
+                dependency_in_final_write_set=dependency_key in changed_keys,
+            )
+
+        planner_dependencies_raw = entry.get("planner_dependencies")
+        planner_identities_raw = entry.get("planner_dependency_identities")
+        if planner_dependencies_raw is not None or planner_identities_raw is not None:
+            planner_dependencies = [
+                _normalise_overlay_object_key(str(value))
+                for value in list(planner_dependencies_raw or [])
+            ]
+            planner_identities = (
+                planner_identities_raw
+                if isinstance(planner_identities_raw, Mapping) else {}
+            )
+            if set(planner_dependencies) != set(dependencies):
+                dependency_key = sorted(set(planner_dependencies) ^ set(dependencies))[0]
+                planner_identity = planner_identities.get(dependency_key)
+                final_identity = raw_identities.get(dependency_key)
+                raise _proposal_transition_error(
+                    reason="planner_dependency_set_changed_during_transition",
+                    parent_key=parent_key,
+                    dependency_key=dependency_key,
+                    planner_identity=(planner_identity if isinstance(planner_identity, Mapping) else None),
+                    final_identity=(final_identity if isinstance(final_identity, Mapping) else None),
+                    expected_source=(str(planner_identity.get("source") or "") if isinstance(planner_identity, Mapping) else None),
+                    expected_sha256=(str(planner_identity.get("sha256") or "") if isinstance(planner_identity, Mapping) else None),
+                    expected_bytes=(planner_identity.get("bytes") if isinstance(planner_identity, Mapping) else None),
+                    dependency_in_final_write_set=dependency_key in changed_keys,
+                )
+
+        for dependency_key in dependencies:
+            final_identity_raw = raw_identities.get(dependency_key)
+            planner_identity_raw = (
+                planner_identities_raw.get(dependency_key)
+                if isinstance(planner_identities_raw, Mapping) else None
+            )
+            if not isinstance(final_identity_raw, Mapping):
+                raise _proposal_transition_error(
+                    reason="final_dependency_identity_missing",
+                    parent_key=parent_key,
+                    dependency_key=dependency_key,
+                    planner_identity=(planner_identity_raw if isinstance(planner_identity_raw, Mapping) else None),
+                    final_identity=None,
+                    expected_source=None,
+                    expected_sha256=None,
+                    expected_bytes=None,
+                    dependency_in_final_write_set=dependency_key in changed_keys,
+                )
+            try:
+                final_identity = _normalise_proposal_dependency_identity(
+                    parent_key=parent_key,
+                    dependency_key=dependency_key,
+                    identity=final_identity_raw,
+                )
+            except ValueError:
+                raise _proposal_transition_error(
+                    reason="final_dependency_identity_invalid",
+                    parent_key=parent_key,
+                    dependency_key=dependency_key,
+                    planner_identity=(planner_identity_raw if isinstance(planner_identity_raw, Mapping) else None),
+                    final_identity=final_identity_raw,
+                    expected_source=None,
+                    expected_sha256=None,
+                    expected_bytes=None,
+                    dependency_in_final_write_set=dependency_key in changed_keys,
+                ) from None
+
+            if isinstance(planner_identity_raw, Mapping):
+                try:
+                    planner_identity = _normalise_proposal_dependency_identity(
+                        parent_key=parent_key,
+                        dependency_key=dependency_key,
+                        identity=planner_identity_raw,
+                    )
+                except ValueError:
+                    raise _proposal_transition_error(
+                        reason="planner_dependency_identity_invalid",
+                        parent_key=parent_key,
+                        dependency_key=dependency_key,
+                        planner_identity=planner_identity_raw,
+                        final_identity=final_identity,
+                        expected_source=None,
+                        expected_sha256=None,
+                        expected_bytes=None,
+                        dependency_in_final_write_set=dependency_key in changed_keys,
+                    ) from None
+                planner_identity_comparison_count += 1
+                if planner_identity != final_identity:
+                    raise _proposal_transition_error(
+                        reason="planner_dependency_identity_changed_during_transition",
+                        parent_key=parent_key,
+                        dependency_key=dependency_key,
+                        planner_identity=planner_identity,
+                        final_identity=final_identity,
+                        expected_source=planner_identity["source"],
+                        expected_sha256=planner_identity["sha256"],
+                        expected_bytes=planner_identity["bytes"],
+                        dependency_in_final_write_set=dependency_key in changed_keys,
+                    )
+
+            dependency_in_write_set = dependency_key in changed_keys
+            if dependency_in_write_set:
+                child = objects[dependency_key]
+                expected_source = "planned_overlay"
+                expected_sha256 = str(child.get("sha256") or "")
+                expected_bytes = child.get("bytes")
+                staged_edge_count += 1
+            else:
+                expected_source = final_identity["source"]
+                if expected_source not in PROPOSAL_TRANSITION_EXTERNAL_SOURCES:
+                    raise _proposal_transition_error(
+                        reason="planned_overlay_dependency_missing_from_final_write_set",
+                        parent_key=parent_key,
+                        dependency_key=dependency_key,
+                        planner_identity=(planner_identity_raw if isinstance(planner_identity_raw, Mapping) else None),
+                        final_identity=final_identity,
+                        expected_source="dropbox_or_overlay",
+                        expected_sha256=None,
+                        expected_bytes=None,
+                        dependency_in_final_write_set=False,
+                    )
+                if any(
+                    dependency_key.startswith(f"{prefix}/")
+                    for prefix in proposed_prefixes
+                ):
+                    raise _proposal_transition_error(
+                        reason="external_dependency_is_under_proposed_deletion",
+                        parent_key=parent_key,
+                        dependency_key=dependency_key,
+                        planner_identity=(planner_identity_raw if isinstance(planner_identity_raw, Mapping) else None),
+                        final_identity=final_identity,
+                        expected_source=expected_source,
+                        expected_sha256=final_identity["sha256"],
+                        expected_bytes=final_identity["bytes"],
+                        dependency_in_final_write_set=False,
+                    )
+                root_name = (
+                    "base_dropbox_root" if expected_source == "dropbox"
+                    else "overlay_root"
+                )
+                root = Path(str(run_state.get(root_name) or ""))
+                external_path = root / dependency_key
+                external_body = (
+                    external_path.read_bytes() if root.is_dir() and external_path.is_file()
+                    else None
+                )
+                expected_sha256 = (
+                    hashlib.sha256(external_body).hexdigest()
+                    if external_body is not None else None
+                )
+                expected_bytes = len(external_body) if external_body is not None else None
+                external_edge_counts[expected_source] += 1
+            if (
+                final_identity["source"] != expected_source
+                or final_identity["sha256"] != expected_sha256
+                or final_identity["bytes"] != expected_bytes
+            ):
+                raise _proposal_transition_error(
+                    reason=(
+                        "staged_dependency_identity_mismatch"
+                        if dependency_in_write_set
+                        else "external_dependency_identity_mismatch"
+                    ),
+                    parent_key=parent_key,
+                    dependency_key=dependency_key,
+                    planner_identity=(planner_identity_raw if isinstance(planner_identity_raw, Mapping) else None),
+                    final_identity=final_identity,
+                    expected_source=expected_source,
+                    expected_sha256=expected_sha256,
+                    expected_bytes=(
+                        int(expected_bytes) if isinstance(expected_bytes, int) else None
+                    ),
+                    dependency_in_final_write_set=dependency_in_write_set,
+                )
+
+    return {
+        "status": "succeeded",
+        "changed_object_count": len(changed_keys),
+        "dependency_edge_count": staged_edge_count + sum(external_edge_counts.values()),
+        "staged_dependency_edge_count": staged_edge_count,
+        "external_dependency_edge_counts": external_edge_counts,
+        "planner_identity_comparison_count": planner_identity_comparison_count,
+        "unchanged_planner_object_count": len(unchanged_planner_keys),
+        "node_apply_launch_permitted": True,
+    }
+
+
 def run_canonical_apply_executor(
     *,
     run_state: dict[str, Any],
     env: Mapping[str, str],
     log: logging.Logger,
 ) -> dict[str, Any]:
+    try:
+        transition_validation = validate_proposal_run_state_transition(run_state)
+    except (OSError, TypeError, ValueError) as exc:
+        error = str(exc)
+        run_state["proposal_transition_validation"] = {
+            "status": "failed",
+            "error": error,
+            "node_apply_launch_permitted": False,
+            "validated_at_utc": fmt_iso(utc_now()),
+        }
+        write_run_state(run_state)
+        log.error("%s", error)
+        return {
+            "status": "failed",
+            "reason": "coordinator_proposal_transition_validation_failed",
+            "error": error,
+            "node_apply_launched": False,
+            "r2_mutation_possible": False,
+        }
+    run_state["proposal_transition_validation"] = {
+        **transition_validation,
+        "validated_at_utc": fmt_iso(utc_now()),
+    }
+    write_run_state(run_state)
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
     command = [
