@@ -19368,7 +19368,6 @@ PROPOSAL_TRANSITION_EXTERNAL_SOURCES = frozenset({"dropbox", "overlay"})
 PROPOSAL_TRANSITION_DEPENDENCY_SOURCES = frozenset({
     "planned_overlay", *PROPOSAL_TRANSITION_EXTERNAL_SOURCES,
 })
-FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX = "exact_prefix_replacement"
 
 
 def _normalise_proposal_dependency_identity(
@@ -19389,20 +19388,6 @@ def _normalise_proposal_dependency_identity(
             f"overlay dependency identity is invalid: {parent_key} -> {dependency_key}"
         )
     return {"sha256": sha256, "bytes": byte_count, "source": source}
-
-
-def _is_forced_republication_entry(entry: Mapping[str, Any]) -> bool:
-    """Return whether an entry has the complete forced-republication audit."""
-    planner_source = str(entry.get("planner_source") or "").strip()
-    return (
-        entry.get("proposal_changed") is False
-        and planner_source in PROPOSAL_TRANSITION_EXTERNAL_SOURCES
-        and str(entry.get("baseline_source") or "").strip() == planner_source
-        and entry.get("included_in_final_staged_write_set") is True
-        and str(entry.get("promotion_reason") or "").strip()
-        == FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX
-        and str(entry.get("final_source") or "").strip() == "planned_overlay"
-    )
 
 
 def _record_coordinator_complete_run_state_write(
@@ -20008,120 +19993,6 @@ def _record_metadata_executor_overlay(
     write_run_state(run_state)
 
 
-def _finalise_staged_write_set_provenance(
-    run_state: dict[str, Any],
-) -> dict[str, Any]:
-    """Freeze dependency ownership from complete final staged membership."""
-    objects = run_state.get("objects")
-    if not isinstance(objects, dict):
-        raise ValueError("final staged write-set objects mapping is unavailable")
-    proposed_prefixes = [
-        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
-        for entry in list(run_state.get("tombstone_prefixes") or [])
-        if isinstance(entry, Mapping) and entry.get("proposed")
-    ]
-
-    forced_republication_keys: list[str] = []
-    for object_key in sorted(objects):
-        entry = objects[object_key]
-        if not isinstance(entry, dict):
-            raise ValueError(
-                f"final staged write-set object entry is invalid: {object_key}"
-            )
-        if entry.get("proposal_owner") == "dropbox_day_baseline":
-            if not any(
-                object_key.startswith(f"{prefix}/")
-                for prefix in proposed_prefixes
-            ):
-                raise ValueError(
-                    "Dropbox baseline object is outside every exact replacement "
-                    f"prefix: {object_key}"
-                )
-            entry.update({
-                "proposal_changed": False,
-                "planner_source": "dropbox",
-                "baseline_source": "dropbox",
-                "included_in_final_staged_write_set": True,
-                "promotion_reason":
-                    FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX,
-                "final_source": "planned_overlay",
-            })
-        if entry.get("promotion_reason") is not None:
-            if not _is_forced_republication_entry(entry):
-                raise ValueError(
-                    f"forced-republication audit is invalid: {object_key}"
-                )
-            forced_republication_keys.append(object_key)
-
-    rebuilt_identity_count = 0
-    staged_dependency_edge_count = 0
-    external_dependency_edge_counts = {
-        source: 0 for source in sorted(PROPOSAL_TRANSITION_EXTERNAL_SOURCES)
-    }
-    for parent_key in sorted(objects):
-        entry = objects[parent_key]
-        dependencies = [
-            _normalise_overlay_object_key(str(value))
-            for value in list(entry.get("dependencies") or [])
-        ]
-        raw_identities = entry.get("dependency_identities")
-        if not isinstance(raw_identities, Mapping):
-            raw_identities = {}
-        final_identities: dict[str, dict[str, Any]] = {}
-        for dependency_key in dependencies:
-            child = objects.get(dependency_key)
-            if isinstance(child, Mapping):
-                final_identity = {
-                    "sha256": str(child.get("sha256") or "").strip().lower(),
-                    "bytes": child.get("bytes"),
-                    "source": "planned_overlay",
-                }
-                final_identity = _normalise_proposal_dependency_identity(
-                    parent_key=parent_key,
-                    dependency_key=dependency_key,
-                    identity=final_identity,
-                )
-                staged_dependency_edge_count += 1
-            else:
-                raw_identity = raw_identities.get(dependency_key)
-                if not isinstance(raw_identity, Mapping):
-                    raise ValueError(
-                        "final external dependency identity is unavailable: "
-                        f"{parent_key} -> {dependency_key}"
-                    )
-                final_identity = _normalise_proposal_dependency_identity(
-                    parent_key=parent_key,
-                    dependency_key=dependency_key,
-                    identity=raw_identity,
-                )
-                if final_identity["source"] not in PROPOSAL_TRANSITION_EXTERNAL_SOURCES:
-                    raise ValueError(
-                        "unstaged dependency has current-run ownership: "
-                        f"{parent_key} -> {dependency_key}"
-                    )
-                external_dependency_edge_counts[final_identity["source"]] += 1
-            if raw_identities.get(dependency_key) != final_identity:
-                rebuilt_identity_count += 1
-            final_identities[dependency_key] = final_identity
-        entry["dependency_identities"] = final_identities
-
-    audit = {
-        "status": "finalised",
-        "final_staged_object_count": len(objects),
-        "forced_republication_count": len(forced_republication_keys),
-        "forced_republication_keys": forced_republication_keys,
-        "promotion_reason_counts": {
-            FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX:
-                len(forced_republication_keys),
-        },
-        "rebuilt_dependency_identity_count": rebuilt_identity_count,
-        "staged_dependency_edge_count": staged_dependency_edge_count,
-        "external_dependency_edge_counts": external_dependency_edge_counts,
-    }
-    run_state["final_staged_write_set_provenance"] = audit
-    return audit
-
-
 def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any]:
     """Materialise the source-plus-Dropbox day proposal, then select full-day deletion."""
     audit = run_state.get("sos_light")
@@ -20160,10 +20031,9 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
                 )
             existing = existing_identities.get(reference)
             if isinstance(existing, Mapping):
-                # Preserve initial planner provenance as the input to the
-                # explicit final-write-set ownership pass.  That later pass
-                # rebuilds current-run ownership only after the full forced-
-                # republication closure is known.
+                # Preserve planner provenance exactly.  The final coordinator
+                # transition validator below rejects any contradiction rather
+                # than silently repairing it from the physical overlay path.
                 resolved[reference] = dict(existing)
             else:
                 # Dropbox-carried parent bodies do not have planner identities.
@@ -20367,7 +20237,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         }
         for entry in sorted(day_entries, key=lambda value: str(value["day_utc"]))
     ]
-    final_provenance = _finalise_staged_write_set_provenance(run_state)
     dropbox_day_warning_count = sum(
         1
         for warning in list(audit.get("dropbox_warnings") or [])
@@ -20391,9 +20260,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         "complete_day_count": len(day_entries),
         "complete_day_upload_count": total_day_uploads,
         "complete_day_deletion_count": len(day_entries),
-        "forced_republication_count": final_provenance[
-            "forced_republication_count"
-        ],
         "dropbox_day_absent_days": sorted(dropbox_day_absent_days),
         "dropbox_day_absent_count": len(dropbox_day_absent_days),
         "dropbox_day_warning_count": dropbox_day_warning_count,
@@ -22175,7 +22041,6 @@ def _proposal_transition_error(
     expected_sha256: str | None,
     expected_bytes: int | None,
     dependency_in_final_write_set: bool,
-    promotion_reason: str | None = None,
 ) -> ValueError:
     evidence = {
         "reason": reason,
@@ -22200,8 +22065,7 @@ def _proposal_transition_error(
             final_identity.get("bytes")
             if isinstance(final_identity, Mapping) else None
         ),
-        "dependency_in_final_staged_write_set": dependency_in_final_write_set,
-        "promotion_reason": promotion_reason,
+        "dependency_in_final_changed_write_set": dependency_in_final_write_set,
     }
     return ValueError(
         "coordinator proposal-transition validation failed: "
@@ -22229,20 +22093,9 @@ def validate_proposal_run_state_transition(
             run_state.get("proposal_transition_planner_unchanged_keys") or []
         )
     }
-    proposed_prefixes = [
-        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
-        for entry in list(run_state.get("tombstone_prefixes") or [])
-        if isinstance(entry, Mapping) and entry.get("proposed")
-    ]
     unexpected_unchanged = sorted(changed_keys & unchanged_planner_keys)
-    invalid_unchanged = [
-        key for key in unexpected_unchanged
-        if not isinstance(objects.get(key), Mapping)
-        or not _is_forced_republication_entry(objects[key])
-        or not any(key.startswith(f"{prefix}/") for prefix in proposed_prefixes)
-    ]
-    if invalid_unchanged:
-        key = invalid_unchanged[0]
+    if unexpected_unchanged:
+        key = unexpected_unchanged[0]
         raise _proposal_transition_error(
             reason="unchanged_planner_proposal_entered_final_write_set",
             parent_key=key,
@@ -22255,13 +22108,16 @@ def validate_proposal_run_state_transition(
             dependency_in_final_write_set=True,
         )
 
+    proposed_prefixes = [
+        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
+        for entry in list(run_state.get("tombstone_prefixes") or [])
+        if isinstance(entry, Mapping) and entry.get("proposed")
+    ]
     staged_edge_count = 0
     external_edge_counts = {source: 0 for source in sorted(
         PROPOSAL_TRANSITION_EXTERNAL_SOURCES
     )}
     planner_identity_comparison_count = 0
-    planner_identity_promotion_count = 0
-    forced_republication_count = 0
     for parent_key in sorted(changed_keys):
         raw_entry = objects.get(parent_key)
         if not isinstance(raw_entry, Mapping):
@@ -22277,46 +22133,16 @@ def validate_proposal_run_state_transition(
                 dependency_in_final_write_set=True,
             )
         entry = raw_entry
-        forced_republication = (
-            _is_forced_republication_entry(entry)
-            and any(
-                parent_key.startswith(f"{prefix}/")
-                for prefix in proposed_prefixes
-            )
-        )
-        if entry.get("promotion_reason") is not None and not forced_republication:
-            raise _proposal_transition_error(
-                reason="forced_republication_audit_invalid",
-                parent_key=parent_key,
-                dependency_key=parent_key,
-                planner_identity=None,
-                final_identity=entry,
-                expected_source="planned_overlay",
-                expected_sha256=str(entry.get("sha256") or "") or None,
-                expected_bytes=(
-                    int(entry.get("bytes"))
-                    if isinstance(entry.get("bytes"), int) else None
-                ),
-                dependency_in_final_write_set=True,
-                promotion_reason=str(entry.get("promotion_reason") or "") or None,
-            )
-        if forced_republication:
-            forced_republication_count += 1
         if (
             entry.get("proposed") is not True
             or entry.get("built") is not True
             or entry.get("structurally_validated") is not True
-            or (
-                not forced_republication
-                and (
-                    entry.get("changed") is False
-                    or entry.get("included_in_write_set") is False
-                    or entry.get("planner_changed") is False
-                    or entry.get("planner_included_in_write_set") is False
-                    or str(entry.get("status") or "") == "skipped_unchanged"
-                    or str(entry.get("planner_status") or "") == "skipped_unchanged"
-                )
-            )
+            or entry.get("changed") is False
+            or entry.get("included_in_write_set") is False
+            or entry.get("planner_changed") is False
+            or entry.get("planner_included_in_write_set") is False
+            or str(entry.get("status") or "") == "skipped_unchanged"
+            or str(entry.get("planner_status") or "") == "skipped_unchanged"
         ):
             raise _proposal_transition_error(
                 reason="final_write_set_contains_non_changed_or_unvalidated_object",
@@ -22502,34 +22328,17 @@ def validate_proposal_run_state_transition(
                     ) from None
                 planner_identity_comparison_count += 1
                 if planner_identity != final_identity:
-                    child = objects.get(dependency_key)
-                    promoted_dependency = (
-                        dependency_key in changed_keys
-                        and isinstance(child, Mapping)
-                        and _is_forced_republication_entry(child)
-                        and planner_identity["source"]
-                            == str(child.get("planner_source") or "")
-                        and planner_identity["sha256"] == final_identity["sha256"]
-                        and planner_identity["bytes"] == final_identity["bytes"]
-                        and final_identity["source"] == "planned_overlay"
+                    raise _proposal_transition_error(
+                        reason="planner_dependency_identity_changed_during_transition",
+                        parent_key=parent_key,
+                        dependency_key=dependency_key,
+                        planner_identity=planner_identity,
+                        final_identity=final_identity,
+                        expected_source=planner_identity["source"],
+                        expected_sha256=planner_identity["sha256"],
+                        expected_bytes=planner_identity["bytes"],
+                        dependency_in_final_write_set=dependency_key in changed_keys,
                     )
-                    if not promoted_dependency:
-                        raise _proposal_transition_error(
-                            reason="planner_dependency_identity_changed_during_transition",
-                            parent_key=parent_key,
-                            dependency_key=dependency_key,
-                            planner_identity=planner_identity,
-                            final_identity=final_identity,
-                            expected_source=planner_identity["source"],
-                            expected_sha256=planner_identity["sha256"],
-                            expected_bytes=planner_identity["bytes"],
-                            dependency_in_final_write_set=dependency_key in changed_keys,
-                            promotion_reason=(
-                                str(child.get("promotion_reason") or "") or None
-                                if isinstance(child, Mapping) else None
-                            ),
-                        )
-                    planner_identity_promotion_count += 1
 
             dependency_in_write_set = dependency_key in changed_keys
             if dependency_in_write_set:
@@ -22604,13 +22413,6 @@ def validate_proposal_run_state_transition(
                         int(expected_bytes) if isinstance(expected_bytes, int) else None
                     ),
                     dependency_in_final_write_set=dependency_in_write_set,
-                    promotion_reason=(
-                        str(objects[dependency_key].get("promotion_reason") or "")
-                        or None
-                        if dependency_in_write_set
-                        and isinstance(objects.get(dependency_key), Mapping)
-                        else None
-                    ),
                 )
 
     return {
@@ -22620,8 +22422,6 @@ def validate_proposal_run_state_transition(
         "staged_dependency_edge_count": staged_edge_count,
         "external_dependency_edge_counts": external_edge_counts,
         "planner_identity_comparison_count": planner_identity_comparison_count,
-        "planner_identity_promotion_count": planner_identity_promotion_count,
-        "forced_republication_count": forced_republication_count,
         "unchanged_planner_object_count": len(unchanged_planner_keys),
         "node_apply_launch_permitted": True,
     }

@@ -1,5 +1,146 @@
 # SOS historical Integrity replacement implementation report
 
+## 2 August 2026 final staged write-set provenance correction
+
+### Failed run and exact provenance trace
+
+The supplied CIC-Test run `2026-08-01T215912Z` requested `2026-07-17` through `2026-07-29` inclusive. It is not a 31 July run; the separately reported IngestDB boundary did not cause this failure.
+
+The first rejected edge was:
+
+```text
+parent:
+history/v2/observations/day_utc=2026-07-17/connector_id=1/manifest.json
+
+dependency:
+history/v2/observations/day_utc=2026-07-17/connector_id=1/pollutant_code=123c6h3ch33/manifest.json
+
+planner/final source in failed graph: dropbox
+required final source: planned_overlay
+SHA-256: c4370f5de8a5cc9b35082a9896319a8b9892a8fc22378db9d45e674d1cec2c00
+bytes: 2090
+```
+
+The exact production trace was:
+
+1. The metadata planner emitted a byte-identical scoped Timeseries-index proposal for the pollutant manifest. That proposal had `changed=false`, `status=skipped_unchanged`, `included_in_write_set=false`, `baseline_source=dropbox`; its dependency identity for the manifest above was `dropbox`, 2,090 bytes and the exact SHA-256 above. The pollutant manifest was not itself a direct metadata proposal key.
+2. `_record_metadata_executor_overlay()` correctly left that unchanged scoped index outside `runState.objects`. It separately staged the changed connector parent and retained its initial planner dependency identity as `dropbox` audit evidence.
+3. `assemble_sos_light_complete_days()` selected one exact replacement tombstone for each of the 13 requested days. In the archived pre-edit implementation, the baseline-copy loop added the byte-identical pollutant manifest to the final staged set at line 20106 with `proposal_owner=dropbox_day_baseline` and exact baseline bytes/SHA-256.
+4. The first stale-ownership survival point was the nested `preserve_or_resolve_staged_identities()` function in `assemble_sos_light_complete_days()`, archived line 20037. It copied the connector parent's existing `dropbox` planner identity unchanged even though the dependency was now in `runState.objects`.
+5. No later final-write-set ownership pass existed. `validate_proposal_run_state_transition()` therefore encountered the exact-body but wrong-owner edge and failed with `reason=staged_dependency_identity_mismatch`, `final_source=dropbox`, `expected_source=planned_overlay`.
+6. `node_apply_launched=false` and `r2_mutation_possible=false`. All 2,245 object records remained `uploaded=false` and `r2_verified=false`; all 13 prefix tombstones remained `deleted=false` and `deletion_verified=false`. The 27 extracted per-day/acquisition logs also report `objects_written_r2=0`.
+
+The failed bundle contained 131 initially changed and 33 initially unchanged metadata proposals. Complete-day assembly produced 2,245 final staged objects. Of those, 2,062 were byte-identical Dropbox bodies forced into the write set so they would survive exact day-prefix replacement:
+
+| Classification | Count |
+|---|---:|
+| Observation Parquet bodies | 1,893 |
+| Pollutant manifests | 139 |
+| Connector manifests | 30 |
+| Total forced republications | 2,062 |
+
+They cover the chosen Dropbox baseline beneath the selected day prefixes: 337 objects on 17 July; 24 each on 18, 19 and 20 July; 269 on 21 July; 38 on 22 July; 269 on 23 July; 270 each on 24, 25 and 26 July; and 267 on 27 July. The source-built objects already occupied the required keys on 28 and 29 July. The final run-state audit now records every promoted key explicitly in `final_staged_write_set_provenance.forced_republication_keys` rather than reducing this evidence to the first pollutant.
+
+Most parents without planner identities had already been reconstructed as `planned_overlay`. The actual stale subset was 63 final dependency edges to 63 promoted manifests:
+
+- 33 connector-1-parent to retained pollutant-manifest edges on 17 July;
+- 30 day-parent to Dropbox-carried connector-parent edges: three on 17 July, two each on 18-20 July, and three each on 21-27 July.
+
+### Ownership-finalisation correction
+
+`_finalise_staged_write_set_provenance()` now runs only after source-derived proposals, metadata proposals, Dropbox preservation closure and all exact day tombstones are complete. It performs the authoritative final transition in two parts.
+
+First, every `dropbox_day_baseline` object under a proposed exact replacement prefix receives separate, explicit promotion audit fields without changing its body:
+
+```json
+{
+  "proposal_changed": false,
+  "planner_source": "dropbox",
+  "baseline_source": "dropbox",
+  "included_in_final_staged_write_set": true,
+  "promotion_reason": "exact_prefix_replacement",
+  "final_source": "planned_overlay"
+}
+```
+
+The finaliser rejects a purported Dropbox forced republication outside every proposed exact-replacement prefix. It records the complete promoted-key set, promotion counts, final staged-object count and dependency-edge counts.
+
+Second, it rebuilds every final dependency identity from complete staged membership. A dependency key in `runState.objects` becomes `planned_overlay` with the exact staged child's SHA-256 and byte count. A key absent from `runState.objects` must retain a valid pinned `dropbox` or immutable `overlay` identity. For the supplied graph this rebuilt all 63 stale edges, produced 4,141 staged dependency edges and retained 139 external Dropbox edges; no external overlay edge was present.
+
+The initial planner dependency maps remain unchanged in `planner_dependency_identities`. The Python transition validator now permits a planner/final difference only for an exact, fully audited forced republication whose source changes from its recorded external planner source to `planned_overlay` while SHA-256 and bytes remain identical. Every other planner-identity change still fails closed. It also continues to reject:
+
+- a staged dependency labelled `dropbox` or `overlay`, including exact-body matches;
+- a `planned_overlay` dependency absent from the final staged set;
+- an incomplete or out-of-prefix promotion audit;
+- changed dependency keys, bytes or SHA-256;
+- an unchanged planner record entering the write set without a valid later promotion.
+
+The JavaScript planner, Node `validateLocalProposal()`, frozen publication schedule, journal, writer locks, mutation ordering and post-PUT GET verification are unchanged. No live R2 read was added to SOS-light planning or preservation.
+
+### Failed-bundle regression and counts
+
+The primary regression reads all four supplied `2026-08-01T215912Z` evidence files and inspects the extracted ZIP member set for every day from 17 through 29 July. Its complete-graph phase starts from the real failed `run-state.json`, proves the exact first failure and pre-mutation state, identifies all 2,062 Dropbox-carried objects and all 63 stale edges, then runs the production final-write-set ownership finaliser across all 2,245 recorded objects. It asserts every one of the 4,141 staged edges is `planned_overlay` with exact child identity and every one of the 139 unstaged edges remains a valid external source. It also proves all 2,062 promoted bodies retain their recorded SHA-256 and byte count.
+
+The production-path phase begins with the bundle's real unchanged proposal shape and stale `dropbox` planner identity. It calls `_record_metadata_executor_overlay()` and `assemble_sos_light_complete_days()` rather than constructing a corrected final proposal. Before assembly the byte-identical baseline object is absent and the parent identity is `dropbox`; assembly copies the exact local baseline body, creates the exact-prefix replacement, records forced-republication audit, and invokes the new finaliser. Python transition validation and the unchanged Node `validateLocalProposal()` then succeed. Reintroducing `dropbox` on the staged edge still fails with `staged_dependency_identity_mismatch` and includes `promotion_reason=exact_prefix_replacement`. A patched live-R2 adapter proves it is never called.
+
+The earlier one-day `2026-08-01T192854Z` regression exercised the opposite transition: source-derived changed Parquet physically stored in the overlay had been mislabelled `overlay` instead of `planned_overlay`. Its corrected fixture contained only 15 final changed objects for four selected pollutants and did not include the longer-range legacy/unselected Dropbox child set that complete-day deletion forced to be republished. It therefore could not exercise this `unchanged dropbox -> forced staged ownership` transition. The earlier source-derived invariant remains covered by the existing four-test JavaScript planner/provenance suite; its old ZIP-specific Python test is skipped locally because that older archive is not present in this checkout.
+
+Final supplied-run structural counts are:
+
+| Evidence | Count |
+|---|---:|
+| Initially changed metadata proposals | 131 |
+| Initially unchanged metadata proposals | 33 |
+| Forced-republication promotions | 2,062 |
+| Final staged objects | 2,245 |
+| Staged dependency edges | 4,141 |
+| External dependency edges | 139 (`dropbox=139`, `overlay=0`) |
+| Planner identity comparisons represented in the graph | 423 |
+| Planner identities requiring the authorised promotion transition | 63 |
+
+### Files, archive and focused validation
+
+Changed files:
+
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
+- `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`
+- this implementation report
+
+Non-overwriting pre-edit production snapshot:
+
+- `archive/2026-08-02/integrity-final-write-set-provenance-fix/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
+
+Focused structural validation:
+
+- Python compilation for all three changed/relevant Python files: passed.
+- Supplied failed-bundle complete-graph and real promotion/assembly regression: 2 passed.
+- Existing Python proposal-transition tests plus focused SOS-light changed/unchanged checks: 6 passed.
+- Combined focused Python command: 8 passed and 1 skipped; the skip is only the unavailable older `2026-08-01T192854Z` ZIP regression.
+- Existing JavaScript planner/provenance tests: 4 passed.
+- Existing unchanged Node apply-safety tests: 47 passed.
+- `git diff --check`: passed.
+
+No real Integrity operation, Dropbox source, R2, Supabase or other external service was accessed. No deployment, stage, commit, push or pull request was performed. `system_docs/` and `TODO-IMPORTANT-UKAQ.txt` were not modified.
+
+### Remaining CIC-Test acceptance
+
+Structural checks do not prove operational success. After review and deployment, the required functional acceptance remains a real CIC-Test rerun for exactly 17 through 29 July 2026:
+
+```bash
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
+  --env CIC-Test \
+  --profile manual \
+  --source sos \
+  --from-day 2026-07-17 \
+  --to-day 2026-07-29 \
+  --history-version v2 \
+  --run-backfill \
+  --repair-pollutants pm25,pm10,no2,o3 \
+  --allow-stale-dropbox
+```
+
+Acceptance must confirm final transition validation passes before Node launch; all byte-identical forced republications are written and GET-verified after their day deletion; dependent parents and indexes publish only after their children; all 13 days complete; remaining gaps reach zero; and the following Dropbox backup and check-only Integrity run validate the completed graph. Until that run succeeds, this correction is structurally validated but not operationally resolved.
+
 ## 1 August 2026 source-derived metadata provenance correction
 
 ### Failed run and first incorrect producer
