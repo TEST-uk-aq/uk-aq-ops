@@ -21141,6 +21141,138 @@ def _validate_v2_timeseries_bindings(
     return gaps
 
 
+def _resolve_run_scoped_apply_artifact(
+    run_state: Mapping[str, Any], raw_path: Any,
+) -> Path:
+    artifact_path = Path(str(raw_path or "")).resolve()
+    run_root = Path(str(run_state.get("run_root") or "")).resolve()
+    if not str(raw_path or "").strip() or not run_root.is_dir():
+        raise ValueError("run-scoped apply artifact path is unavailable")
+    try:
+        artifact_path.relative_to(run_root)
+    except ValueError as exc:
+        raise ValueError("apply artifact is outside the current run directory") from exc
+    if not artifact_path.is_file():
+        raise FileNotFoundError(f"apply artifact is missing: {artifact_path}")
+    return artifact_path
+
+
+def _verified_deleted_object_keys(
+    run_state: Mapping[str, Any], prefix_entry: Mapping[str, Any],
+) -> list[str]:
+    sidecar_path_raw = prefix_entry.get("deleted_keys_sidecar_path")
+    if sidecar_path_raw:
+        sidecar_path = _resolve_run_scoped_apply_artifact(
+            run_state, sidecar_path_raw,
+        )
+        body = sidecar_path.read_bytes()
+        expected_bytes = int(prefix_entry.get("deleted_keys_sidecar_bytes") or -1)
+        expected_sha256 = str(
+            prefix_entry.get("deleted_keys_sha256") or ""
+        ).strip().lower()
+        if len(body) != expected_bytes or hashlib.sha256(body).hexdigest() != expected_sha256:
+            raise ValueError(
+                f"deleted-key sidecar identity mismatch: {sidecar_path}"
+            )
+        payload = json.loads(body.decode("utf-8"))
+        if not isinstance(payload, list) or any(
+            not isinstance(value, str) or not value for value in payload
+        ):
+            raise ValueError(f"deleted-key sidecar payload is invalid: {sidecar_path}")
+        keys = list(payload)
+        prefix = str(prefix_entry.get("prefix") or "").rstrip("/") + "/"
+        if keys != sorted(keys) or len(keys) != len(set(keys)) or any(
+            not key.startswith(prefix) for key in keys
+        ):
+            raise ValueError(f"deleted-key sidecar key scope is invalid: {sidecar_path}")
+        if len(keys) != int(prefix_entry.get("deleted_object_count") or 0):
+            raise ValueError(f"deleted-key sidecar count mismatch: {sidecar_path}")
+        return keys
+    return sorted({
+        str(value) for value in list(prefix_entry.get("deleted_object_keys") or [])
+        if str(value)
+    })
+
+
+def verify_apply_persistence_artifacts(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    persistence = ((run_state.get("apply") or {}).get("persistence") or {})
+    journal_path_raw = persistence.get("mutation_journal_path")
+    if not journal_path_raw:
+        return {"status": "not_available", "reason": "mutation_journal_not_recorded"}
+    journal_path = _resolve_run_scoped_apply_artifact(run_state, journal_path_raw)
+    body = journal_path.read_bytes()
+    expected_bytes = int(persistence.get("mutation_journal_bytes") or -1)
+    expected_sha256 = str(
+        persistence.get("mutation_journal_sha256") or ""
+    ).strip().lower()
+    if len(body) != expected_bytes or hashlib.sha256(body).hexdigest() != expected_sha256:
+        raise ValueError(f"mutation journal identity mismatch: {journal_path}")
+    lines = [line for line in body.splitlines() if line]
+    expected_events = int(persistence.get("mutation_journal_event_count") or 0)
+    if len(lines) != expected_events:
+        raise ValueError(f"mutation journal event-count mismatch: {journal_path}")
+    previous_sha256: str | None = None
+    run_id = str(run_state.get("run_id") or "")
+    event_types: dict[str, int] = {}
+    for raw_line in lines:
+        event = json.loads(raw_line.decode("utf-8"))
+        if not isinstance(event, Mapping):
+            raise ValueError(f"mutation journal event is not an object: {journal_path}")
+        if str(event.get("run_id") or "") != run_id:
+            raise ValueError(f"mutation journal run identity mismatch: {journal_path}")
+        if event.get("previous_event_sha256") != previous_sha256:
+            raise ValueError(f"mutation journal chain mismatch: {journal_path}")
+        event_sha256 = str(event.get("event_sha256") or "").strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", event_sha256):
+            raise ValueError(f"mutation journal event identity is invalid: {journal_path}")
+        previous_sha256 = event_sha256
+        event_type = str(event.get("event_type") or "")
+        event_types[event_type] = event_types.get(event_type, 0) + 1
+    expected_tail = persistence.get("mutation_journal_tail_event_sha256")
+    if previous_sha256 != expected_tail:
+        raise ValueError(f"mutation journal tail identity mismatch: {journal_path}")
+    sidecars: list[dict[str, Any]] = []
+    for raw_prefix in list(run_state.get("tombstone_prefixes") or []):
+        if not isinstance(raw_prefix, Mapping):
+            continue
+        if raw_prefix.get("deletion_verified") and not raw_prefix.get(
+            "deleted_keys_sidecar_path"
+        ):
+            raise ValueError("verified deletion is missing its deleted-key sidecar")
+        if not raw_prefix.get("deleted_keys_sidecar_path"):
+            continue
+        keys = _verified_deleted_object_keys(run_state, raw_prefix)
+        sidecars.append({
+            "prefix": str(raw_prefix.get("prefix") or ""),
+            "path": str(raw_prefix.get("deleted_keys_sidecar_path") or ""),
+            "bytes": int(raw_prefix.get("deleted_keys_sidecar_bytes") or 0),
+            "sha256": str(raw_prefix.get("deleted_keys_sha256") or ""),
+            "deleted_object_count": len(keys),
+        })
+    if len(sidecars) != int(persistence.get("deleted_key_sidecar_count") or 0):
+        raise ValueError("deleted-key sidecar-count mismatch")
+    return {
+        "status": "verified",
+        "mutation_journal_path": str(journal_path),
+        "mutation_journal_bytes": len(body),
+        "mutation_journal_sha256": expected_sha256,
+        "mutation_journal_event_count": len(lines),
+        "event_type_counts": event_types,
+        "deleted_key_sidecars": sidecars,
+        "compact_checkpoint_count": int(
+            persistence.get("compact_checkpoint_count") or 0
+        ),
+        "complete_run_state_write_count": int(
+            persistence.get("complete_run_state_write_count") or 0
+        ),
+        "mutation_journal_flush_count": int(
+            persistence.get("mutation_journal_flush_count") or 0
+        ),
+    }
+
+
 def run_v2_final_verification(
     *,
     run_state: dict[str, Any],
@@ -21181,6 +21313,19 @@ def run_v2_final_verification(
         ),
     )
     remaining_scopes: list[dict[str, Any]] = []
+    try:
+        apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        apply_persistence_artifacts = {
+            "status": "failed",
+            "error": str(exc),
+        }
+    if require_remote_state and apply_persistence_artifacts.get("status") != "verified":
+        remaining_scopes.append({
+            "stage": "canonical_apply_persistence",
+            "gap_type": "apply_persistence_artifact_verification_failed",
+            "evidence": apply_persistence_artifacts,
+        })
     remaining_scopes.extend(_validate_v2_timeseries_bindings(
         conn=conn, view_root=view_root, config=config,
     ))
@@ -21287,10 +21432,13 @@ def run_v2_final_verification(
             "object_key": f"{prefix}/",
             "r2_delete_verified": bool(prefix_entry.get("deletion_verified")),
             "deleted_object_count": int(prefix_entry.get("deleted_object_count") or 0),
-            "deleted_object_keys": sorted({
-                str(value) for value in list(prefix_entry.get("deleted_object_keys") or [])
-                if str(value)
-            }),
+            "deleted_keys_sha256": prefix_entry.get("deleted_keys_sha256"),
+            "deleted_keys_sidecar_path": prefix_entry.get(
+                "deleted_keys_sidecar_path"
+            ),
+            "deleted_keys_sidecar_bytes": prefix_entry.get(
+                "deleted_keys_sidecar_bytes"
+            ),
             "superseded_by_verified_write": False,
         }
         r2_delete_verification_evidence.append(delete_evidence)
@@ -21312,6 +21460,7 @@ def run_v2_final_verification(
         "local_object_resolution": "structurally_validated_overlay_then_proposed_tombstone_then_dropbox",
         "r2_get_verification_evidence": verification_evidence,
         "r2_delete_verification_evidence": r2_delete_verification_evidence,
+        "apply_persistence_artifacts": apply_persistence_artifacts,
         "application_failures": application_failures,
         "r2_objects_written": len(r2_written_keys),
         "r2_objects_deleted": sum(
@@ -21425,11 +21574,7 @@ def record_integrity_object_operations(
                 str(prefix_entry.get("status") or "planned"), prefix_entry.get("error"), now_iso,
             ),
         )
-        for deleted_key in sorted({
-            str(value)
-            for value in list(prefix_entry.get("deleted_object_keys") or [])
-            if str(value)
-        }):
+        for deleted_key in _verified_deleted_object_keys(run_state, prefix_entry):
             conn.execute(
                 """
                 INSERT INTO integrity_object_operations (
@@ -21465,26 +21610,105 @@ def run_canonical_apply_executor(
         "--run-state-json", str(run_state["run_state_path"]),
         "--write-r2",
     ]
-    completed = subprocess.run(
+    process = subprocess.Popen(
         command,
         cwd=repo_root,
         env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
     )
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def _drain_apply_output(
+        stream: Any, destination: list[str], *, emit_progress: bool,
+    ) -> None:
+        for line in iter(stream.readline, ""):
+            destination.append(line)
+            if emit_progress:
+                log.info("canonical apply %s", line.rstrip())
+        stream.close()
+
+    stdout_thread = threading.Thread(
+        target=_drain_apply_output,
+        args=(process.stdout, stdout_lines),
+        kwargs={"emit_progress": False},
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_apply_output,
+        args=(process.stderr, stderr_lines),
+        kwargs={"emit_progress": True},
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    process.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
     try:
-        output = json.loads(completed.stdout) if completed.stdout.strip() else {}
+        output = json.loads(stdout) if stdout.strip() else {}
     except json.JSONDecodeError:
         output = {}
     refreshed = json.loads(Path(str(run_state["run_state_path"])).read_text(encoding="utf-8"))
     run_state.clear()
     run_state.update(refreshed)
-    if completed.returncode != 0:
-        error = _truncate_text(completed.stderr or completed.stdout or "canonical apply failed", 4000)
-        log.error("canonical apply executor failed exit_code=%s error=%s", completed.returncode, error)
-        return {"status": "failed", "exit_code": completed.returncode, "error": error, "output": output}
+    if process.returncode != 0:
+        error = _tail_bytes(stderr or stdout or "canonical apply failed", 4000)
+        log.error("canonical apply executor failed exit_code=%s error=%s", process.returncode, error)
+        return {"status": "failed", "exit_code": process.returncode, "error": error, "output": output}
     return {"status": "succeeded", "exit_code": 0, "output": output}
+
+
+def checkpoint_apply_progress_from_python(
+    run_state: dict[str, Any], *, reason: str, current_phase: str,
+    status: str | None = None,
+) -> bool:
+    progress_path_raw = ((run_state.get("apply") or {}).get("persistence") or {}).get(
+        "apply_progress_path"
+    )
+    if not progress_path_raw:
+        return False
+    progress_path = _resolve_run_scoped_apply_artifact(run_state, progress_path_raw)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    if not isinstance(progress, dict):
+        raise ValueError("apply progress checkpoint is not a JSON object")
+    progress["current_phase"] = current_phase
+    progress["current_publication_stage"] = current_phase
+    if status is not None:
+        progress["status"] = status
+    progress["last_checkpoint_reason"] = reason
+    progress["last_checkpoint_at_utc"] = fmt_iso(utc_now())
+    progress["compact_checkpoint_count"] = int(
+        progress.get("compact_checkpoint_count") or 0
+    ) + 1
+    temporary_path = progress_path.with_name(progress_path.name + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as handle:
+        json.dump(progress, handle, indent=2, sort_keys=True, default=str)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary_path.replace(progress_path)
+    directory_descriptor = os.open(progress_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    persistence = (run_state.get("apply") or {}).get("persistence")
+    if isinstance(persistence, dict):
+        persistence["compact_checkpoint_count"] = progress[
+            "compact_checkpoint_count"
+        ]
+    run_state["apply_progress"] = {
+        "path": str(progress_path),
+        "status": progress.get("status"),
+        "current_phase": current_phase,
+        "last_completed_day_utc": progress.get("last_completed_day_utc"),
+    }
+    return True
 
 
 def resolve_history_writer_database_url(env: Mapping[str, str]) -> str:
@@ -23070,6 +23294,20 @@ def summarize_ordered_apply_verification(
 ) -> dict[str, Any]:
     """Accept dedicated SOS history from the ordered per-object apply audit."""
     remaining_scopes: list[dict[str, Any]] = []
+    apply_status = str(apply_result.get("status") or "")
+    try:
+        apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        apply_persistence_artifacts = {"status": "failed", "error": str(exc)}
+    if (
+        apply_status == "succeeded"
+        and apply_persistence_artifacts.get("status") != "verified"
+    ):
+        remaining_scopes.append({
+            "stage": "canonical_apply_persistence",
+            "gap_type": "apply_persistence_artifact_verification_failed",
+            "evidence": apply_persistence_artifacts,
+        })
     written_keys: list[str] = []
     verification_evidence: list[dict[str, Any]] = []
     for object_key, raw_entry in sorted(dict(run_state.get("objects") or {}).items()):
@@ -23116,6 +23354,13 @@ def summarize_ordered_apply_verification(
             "prefix": str(raw_prefix.get("prefix") or ""),
             "deletion_verified": bool(raw_prefix.get("deletion_verified")),
             "deleted_object_count": int(raw_prefix.get("deleted_object_count") or 0),
+            "deleted_keys_sha256": raw_prefix.get("deleted_keys_sha256"),
+            "deleted_keys_sidecar_path": raw_prefix.get(
+                "deleted_keys_sidecar_path"
+            ),
+            "deleted_keys_sidecar_bytes": raw_prefix.get(
+                "deleted_keys_sidecar_bytes"
+            ),
         }
         deletion_evidence.append(evidence)
         if evidence["deletion_verified"]:
@@ -23126,7 +23371,6 @@ def summarize_ordered_apply_verification(
                 "object_key": f"{evidence['prefix']}/",
                 "gap_type": "complete_day_deletion_not_verified",
             })
-    apply_status = str(apply_result.get("status") or "")
     if apply_status not in {"succeeded", "skipped_noop"}:
         remaining_scopes.append({
             "stage": "canonical_apply",
@@ -23143,6 +23387,7 @@ def summarize_ordered_apply_verification(
         "second_broad_r2_scan_invoked": False,
         "r2_get_verification_evidence": verification_evidence,
         "r2_delete_verification_evidence": deletion_evidence,
+        "apply_persistence_artifacts": apply_persistence_artifacts,
         "global_index_finalization": run_state.get("global_index_finalization"),
         "r2_objects_written": len(written_keys),
         "r2_objects_deleted": deleted_object_count,
@@ -23838,20 +24083,57 @@ def run_v2_integrity_repair_flow(
             int(entry.get("connector_id") or 0),
         ) not in repaired_current_state_keys
     ]
-    current_state_reconciliation = run_current_state_reconciliation(
-        conn=conn,
-        env_name=env_name,
-        integrity_run_id=f"{env_name}:{run_id}",
-        env=env,
-        scope_entries=current_state_scopes,
-        dry_run=dry_run,
-        final_verification=final_verification,
-        log=log,
-        dedicated_partition_entries=(
-            all_observation_repair_entries
-            if dedicated_sos_historical_replacement else None
-        ),
-    )
+    canonical_apply_succeeded = apply_result.get("status") == "succeeded"
+    if canonical_apply_succeeded:
+        checkpoint_apply_progress_from_python(
+            run_state,
+            reason="before_current_state_reconciliation",
+            current_phase="current_state_reconciliation",
+            status="running",
+        )
+        log.info("canonical apply current-state reconciliation started")
+    try:
+        current_state_reconciliation = run_current_state_reconciliation(
+            conn=conn,
+            env_name=env_name,
+            integrity_run_id=f"{env_name}:{run_id}",
+            env=env,
+            scope_entries=current_state_scopes,
+            dry_run=dry_run,
+            final_verification=final_verification,
+            log=log,
+            dedicated_partition_entries=(
+                all_observation_repair_entries
+                if dedicated_sos_historical_replacement else None
+            ),
+        )
+    except Exception:
+        if canonical_apply_succeeded:
+            checkpoint_apply_progress_from_python(
+                run_state,
+                reason="current_state_reconciliation_failure",
+                current_phase="current_state_reconciliation_failed",
+                status="failed",
+            )
+            log.exception("canonical apply current-state reconciliation failed")
+        raise
+    if canonical_apply_succeeded:
+        reconciliation_failed = current_state_reconciliation.get(
+            "overall_status"
+        ) in {"failed", "partial_failure", "blocked_dependency"}
+        checkpoint_apply_progress_from_python(
+            run_state,
+            reason="after_current_state_reconciliation",
+            current_phase="current_state_reconciliation_completed",
+            status="failed" if reconciliation_failed else "succeeded",
+        )
+        final_verification["apply_persistence_artifacts"] = (
+            verify_apply_persistence_artifacts(run_state)
+        )
+        log.info(
+            "canonical apply current-state reconciliation completed status=%s",
+            current_state_reconciliation.get("overall_status"),
+        )
     current_state_reconciliation["latest_snapshot_auth_preflight"] = dict(
         auth_preflight
     )
@@ -26497,6 +26779,21 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- Remaining gap count: {final_verification.get('remaining_gap_count', '(not run)')}",
                 "",
             ])
+            persistence_artifacts = final_verification.get(
+                "apply_persistence_artifacts"
+            ) or {}
+            if persistence_artifacts:
+                lines.extend([
+                    f"- Apply persistence evidence: {persistence_artifacts.get('status') or '(none)'}",
+                    f"- Mutation journal: {persistence_artifacts.get('mutation_journal_path') or '(none)'}",
+                    f"- Mutation journal SHA-256: {persistence_artifacts.get('mutation_journal_sha256') or '(none)'}",
+                    f"- Mutation journal events: {int(persistence_artifacts.get('mutation_journal_event_count') or 0)}",
+                    f"- Mutation journal flushes: {int(persistence_artifacts.get('mutation_journal_flush_count') or 0)}",
+                    f"- Compact checkpoints: {int(persistence_artifacts.get('compact_checkpoint_count') or 0)}",
+                    f"- Complete run-state writes: {int(persistence_artifacts.get('complete_run_state_write_count') or 0)}",
+                    f"- Deleted-key sidecars: {len(list(persistence_artifacts.get('deleted_key_sidecars') or []))}",
+                    "",
+                ])
             for scope in list(final_verification.get("remaining_scopes") or [])[:100]:
                 lines.append(
                     "- Remaining: " + json.dumps(scope, sort_keys=True, default=str)

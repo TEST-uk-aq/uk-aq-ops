@@ -8,7 +8,12 @@ import {
   applyValidatedProposal,
   applySosLightPerDayUnits,
   assertPublicationDependenciesVerified,
+  createApplyPersistence,
+  createBoundedProgressReporter,
+  createInitialApplyProgressState,
   createVerifiedGetBodyCache,
+  deleteAndVerifyPrefix,
+  enforcePublicationDependencyDurability,
   prepareMergedDayManifest,
   putAndVerifyObject,
   publicationRank,
@@ -977,10 +982,19 @@ test("SOS-light first-day upload failure leaves every later day undeleted", asyn
     },
     applyDayFinalization: async ({ dayUtc }) => events.push(`day-parent ${dayUtc}`),
     publishAffectedIndexes: async () => events.push("publish indexes"),
+    appendEvent: (event) => events.push(`journal ${event.event_type}`),
+    durabilityBarrier: async (reason) => events.push(`flush ${reason}`),
+    persist: async (reason) => events.push(`checkpoint ${reason}`),
   }), /simulated first-day upload failure/);
   assert.deepEqual(events, [
+    "checkpoint before_day_deletion",
     "delete 2026-07-29",
+    "flush day_deletion_verified",
+    "checkpoint after_deletion_verification",
     "upload 2026-07-29",
+    "journal sos_light_day_failed",
+    "flush day_failure",
+    "checkpoint day_failed",
   ]);
   assert.equal(publicationState["2026-07-29"].deletion_verified, true);
   assert.equal(publicationState["2026-07-29"].status, "failed");
@@ -1022,7 +1036,7 @@ test("SOS-light completes and verifies each day before deleting the next and pub
     "publish affected indexes",
   ]);
   for (const dayUtc of days) {
-    assert.equal(publicationState[dayUtc].status, "succeeded");
+    assert.equal(publicationState[dayUtc].status, "day_parent_verified");
     assert.equal(publicationState[dayUtc].deletion_verified, true);
     assert.equal(publicationState[dayUtc].day_parent_verified, true);
     assert.equal(publicationState[dayUtc].completed_publication_level, "day_parent_verified");
@@ -1228,6 +1242,238 @@ test("changed-object apply records exactly one post-PUT verification GET", async
   );
   assert.equal(putCount, 1);
   assert.equal(getCount, 1);
+});
+
+test("multiple object transitions append detailed events without rewriting complete run state", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-apply-persistence-"));
+  const runStatePath = path.join(root, "run-state.json");
+  const originalState = '{"proposal":"large-and-immutable-during-transitions"}\n';
+  fs.writeFileSync(runStatePath, originalState);
+  const progressState = { run_id: "persistence-test", status: "running" };
+  const persistence = createApplyPersistence({
+    runStatePath,
+    runId: "persistence-test",
+    progressState,
+  });
+  let getCount = 0;
+  for (let index = 0; index < 3; index += 1) {
+    const key = `history/_index_v2/object-${index}.json`;
+    const body = Buffer.from(JSON.stringify({ index }));
+    const entry = { bytes: body.byteLength, sha256: sha256Hex(body) };
+    await putAndVerifyObject({
+      r2: {},
+      runState: { objects: { [key]: entry } },
+      object: { key, body, entry },
+      persistence,
+      adapters: {
+        putObject: async () => {},
+        getObject: async () => {
+          getCount += 1;
+          return { body, bytes: body.byteLength };
+        },
+      },
+    });
+  }
+  persistence.close();
+  const events = fs.readFileSync(persistence.journalPath, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(getCount, 3);
+  assert.equal(events.length, 12);
+  assert.deepEqual([...new Set(events.map((event) => event.event_type))], [
+    "put_started",
+    "put_completed",
+    "post_put_get_started",
+    "post_put_get_verified",
+  ]);
+  assert.equal(fs.readFileSync(runStatePath, "utf8"), originalState);
+  assert.equal(persistence.snapshot().compact_checkpoint_count, 0);
+});
+
+test("compact checkpoint schema exposes aggregate and per-day progress without object entries", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-progress-schema-"));
+  const counts = {
+    planned_deletions: 2,
+    completed_deletions: 0,
+    planned_writes: 100,
+    completed_writes: 0,
+    planned_post_put_verifications: 100,
+    completed_post_put_verifications: 0,
+    failed_operations: 0,
+  };
+  const { progressState, perDayStatus } = createInitialApplyProgressState({
+    runStatePath: path.join(root, "run-state.json"),
+    runId: "progress-schema-test",
+    counts,
+    selectedDays: ["2026-07-29", "2026-07-30"],
+  });
+  assert.equal(progressState.current_phase, "final_proposal_validated");
+  assert.equal(progressState.current_day_utc, null);
+  assert.equal(progressState.last_completed_day_utc, null);
+  assert.equal(progressState.planned_writes, 100);
+  assert.equal(progressState.planned_post_put_verifications, 100);
+  assert.equal(progressState.index_publication_started, false);
+  assert.equal(progressState.index_publication_completed, false);
+  assert.equal(progressState.mutation_journal_event_count, 0);
+  assert.deepEqual(Object.keys(perDayStatus), ["2026-07-29", "2026-07-30"]);
+  assert.ok(Object.values(perDayStatus).every((day) => day.status === "not_started"));
+  assert.equal(Object.hasOwn(progressState, "objects"), false);
+});
+
+test("dependent parent publication requires a successful journal durability barrier", async () => {
+  const childKey = "history/v2/observations/day_utc=2026-07-29/connector_id=1/pollutant_code=pm25/part-00000.parquet";
+  const parentKey = "history/v2/observations/day_utc=2026-07-29/connector_id=1/pollutant_code=pm25/manifest.json";
+  const runState = { objects: { [childKey]: { proposed: true, structurally_validated: true, r2_verified: true } } };
+  const object = { key: parentKey, entry: { dependencies: [childKey] } };
+  const events = ["child verification journal append"];
+  enforcePublicationDependencyDurability({
+    object,
+    runState,
+    persistence: { flush: () => events.push("journal durability barrier") },
+  });
+  events.push("parent PUT");
+  assert.deepEqual(events, [
+    "child verification journal append",
+    "journal durability barrier",
+    "parent PUT",
+  ]);
+  let parentPutCalled = false;
+  const publishParent = () => {
+    enforcePublicationDependencyDurability({
+      object,
+      runState,
+      persistence: { flush: () => { throw new Error("simulated fsync failure"); } },
+    });
+    parentPutCalled = true;
+  };
+  assert.throws(publishParent, /simulated fsync failure/);
+  assert.equal(parentPutCalled, false);
+});
+
+test("deleted keys are sorted into an identity-pinned sidecar before deletion", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-deletion-sidecar-"));
+  const runStatePath = path.join(root, "run-state.json");
+  fs.writeFileSync(runStatePath, "{}\n");
+  const progressState = { run_id: "deletion-test", status: "running" };
+  const persistence = createApplyPersistence({
+    runStatePath,
+    runId: "deletion-test",
+    progressState,
+  });
+  const prefix = "history/v2/observations/day_utc=2026-07-29";
+  const prefixEntry = { prefix, entry: { stage: "sos_light_complete_day" } };
+  const deletedBatches = [];
+  let listCount = 0;
+  await deleteAndVerifyPrefix({
+    r2: {},
+    prefixEntry,
+    persistence,
+    checkpoint: async () => persistence.checkpoint("before_destructive_deletion"),
+    adapters: {
+      listAllObjects: async () => {
+        listCount += 1;
+        return listCount === 1
+          ? [{ key: `${prefix}/z.json` }, { key: `${prefix}/a.json` }]
+          : [];
+      },
+      deleteObjects: async ({ keys }) => { deletedBatches.push(keys); return { errors: [] }; },
+    },
+  });
+  persistence.close();
+  assert.deepEqual(deletedBatches, [[`${prefix}/a.json`, `${prefix}/z.json`]]);
+  assert.equal(Object.hasOwn(prefixEntry.entry, "deleted_object_keys"), false);
+  assert.equal(prefixEntry.entry.deleted_object_count, 2);
+  assert.ok(/^[a-f0-9]{64}$/.test(prefixEntry.entry.deleted_keys_sha256));
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(prefixEntry.entry.deleted_keys_sidecar_path, "utf8")),
+    [`${prefix}/a.json`, `${prefix}/z.json`],
+  );
+  assert.equal(
+    fs.readFileSync(prefixEntry.entry.deleted_keys_sidecar_path).byteLength,
+    prefixEntry.entry.deleted_keys_sidecar_bytes,
+  );
+});
+
+test("deleted-key sidecar failure prevents remote deletion", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-deletion-sidecar-fail-"));
+  const runStatePath = path.join(root, "run-state.json");
+  fs.writeFileSync(runStatePath, "{}\n");
+  const persistence = createApplyPersistence({
+    runStatePath,
+    runId: "deletion-failure-test",
+    progressState: { run_id: "deletion-failure-test", status: "running" },
+    io: { atomicWriteBuffer: () => { throw new Error("simulated sidecar write failure"); } },
+  });
+  let deleteCalled = false;
+  await assert.rejects(deleteAndVerifyPrefix({
+    r2: {},
+    prefixEntry: {
+      prefix: "history/v2/observations/day_utc=2026-07-29",
+      entry: { stage: "sos_light_complete_day" },
+    },
+    persistence,
+    checkpoint: async () => {},
+    adapters: {
+      listAllObjects: async () => [{ key: "history/v2/observations/day_utc=2026-07-29/a.json" }],
+      deleteObjects: async () => { deleteCalled = true; },
+    },
+  }), /simulated sidecar write failure/);
+  persistence.closeAfterFailure();
+  assert.equal(deleteCalled, false);
+});
+
+test("day completion checkpoint failure prevents the next SOS-light deletion", async () => {
+  const days = ["2026-07-29", "2026-07-30"];
+  const dayGroups = new Map(days.map((dayUtc) => [dayUtc, [
+    { kind: "delete", key: `history/v2/observations/day_utc=${dayUtc}` },
+    { kind: "put", key: `history/v2/observations/day_utc=${dayUtc}/manifest.json` },
+  ]]));
+  const connectorGroups = new Map(days.map((dayUtc) => [`${dayUtc}|1`, {
+    day_utc: dayUtc,
+    connector_id: 1,
+    operations: [],
+  }]));
+  const events = [];
+  await assert.rejects(applySosLightPerDayUnits({
+    selectedDays: days,
+    dayGroups,
+    connectorGroups,
+    applyDeletion: async ({ dayUtc }) => events.push(`delete ${dayUtc}`),
+    applyConnectorGroup: async (group) => events.push(`children ${group.day_utc}`),
+    applyDayFinalization: async ({ dayUtc }) => events.push(`day-parent ${dayUtc}`),
+    publishAffectedIndexes: async () => events.push("indexes"),
+    durabilityBarrier: async (reason) => events.push(`flush ${reason}`),
+    persist: async (reason) => {
+      events.push(`checkpoint ${reason}`);
+      if (reason === "after_day_parent_verified") {
+        throw new Error("simulated day checkpoint failure");
+      }
+    },
+  }), /simulated day checkpoint failure/);
+  assert.equal(events.includes("delete 2026-07-30"), false);
+  assert.deepEqual(events.slice(0, 6), [
+    "checkpoint before_day_deletion",
+    "delete 2026-07-29",
+    "flush day_deletion_verified",
+    "checkpoint after_deletion_verification",
+    "children 2026-07-29",
+    "day-parent 2026-07-29",
+  ]);
+});
+
+test("within-day progress output is bounded while still exposing movement", () => {
+  const messages = [];
+  let now = 0;
+  const report = createBoundedProgressReporter({
+    log: (message) => messages.push(message),
+    now: () => now,
+    objectInterval: 25,
+    elapsedMs: 1_000,
+  });
+  for (let completed = 1; completed <= 100; completed += 1) {
+    now += 10;
+    report({ message: `completed=${completed}`, completedObjects: completed });
+  }
+  assert.deepEqual(messages, ["completed=25", "completed=50", "completed=75", "completed=100"]);
+  assert.ok(messages.length < 100);
 });
 
 test("shared index builder retains its existing latest-only option for generic callers", async () => {

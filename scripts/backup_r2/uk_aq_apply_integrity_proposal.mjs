@@ -65,9 +65,42 @@ function safeKey(rawKey) {
 }
 
 function atomicWriteJson(filePath, value) {
+  atomicWriteBuffer(filePath, Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8"));
+}
+
+function atomicWriteBuffer(filePath, body) {
   const temporaryPath = `${filePath}.tmp`;
-  fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  fs.renameSync(temporaryPath, filePath);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(temporaryPath, "w", 0o600);
+    let offset = 0;
+    while (offset < body.byteLength) {
+      const written = fs.writeSync(descriptor, body, offset, body.byteLength - offset);
+      if (!Number.isSafeInteger(written) || written <= 0) {
+        throw new Error(`Atomic write made no progress: ${filePath}`);
+      }
+      offset += written;
+    }
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(temporaryPath, filePath);
+    const directoryDescriptor = fs.openSync(path.dirname(filePath), "r");
+    try {
+      fs.fsyncSync(directoryDescriptor);
+    } finally {
+      fs.closeSync(directoryDescriptor);
+    }
+  } catch (error) {
+    if (descriptor !== null) fs.closeSync(descriptor);
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch (cleanupError) {
+      if (cleanupError?.code !== "ENOENT") throw cleanupError;
+    }
+    throw error;
+  }
 }
 
 function contentTypeForKey(key) {
@@ -95,6 +128,298 @@ export function publicationRank(key) {
   if (/^history\/v2\/aqilevels\/.+\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 100;
   if (value.includes("latest") || value.startsWith("history/_index_v2/")) return 120;
   return 110;
+}
+
+export const APPLY_PROGRESS_CHECKPOINT_OBJECT_INTERVAL = 50;
+export const APPLY_PROGRESS_CHECKPOINT_ELAPSED_MS = 30_000;
+export const APPLY_PROGRESS_LOG_OBJECT_INTERVAL = 50;
+export const APPLY_PROGRESS_LOG_ELAPSED_MS = 30_000;
+
+export function createInitialApplyProgressState({ runStatePath, runId, counts, selectedDays }) {
+  const perDayStatus = Object.fromEntries(selectedDays.map((dayUtc) => [dayUtc, {
+    day_utc: dayUtc,
+    status: "not_started",
+    completed_publication_level: "none",
+    deletion_verified: false,
+    day_parent_verified: false,
+  }]));
+  return {
+    perDayStatus,
+    progressState: {
+      schema_version: 1,
+      run_id: runId,
+      status: "running",
+      current_phase: "final_proposal_validated",
+      current_day_utc: null,
+      last_completed_day_utc: null,
+      ...counts,
+      current_object_key: null,
+      current_deletion_prefix: null,
+      current_publication_stage: "final_proposal_validation",
+      index_publication_started: false,
+      index_publication_completed: false,
+      last_checkpoint_at_utc: null,
+      mutation_journal_path: path.join(
+        path.dirname(path.resolve(runStatePath)),
+        "apply-mutation-events.jsonl",
+      ),
+      mutation_journal_event_count: 0,
+      per_day_high_level_publication_status: perDayStatus,
+      deletions: [],
+    },
+  };
+}
+
+function mutationContext(keyOrPrefix, stage = null) {
+  const value = String(keyOrPrefix || "");
+  const dayMatch = value.match(/day_utc=(\d{4}-\d{2}-\d{2})/);
+  const connectorMatch = value.match(/connector_id=([1-9]\d*)/);
+  return {
+    day_utc: dayMatch ? dayMatch[1] : null,
+    connector_id: connectorMatch ? Number(connectorMatch[1]) : null,
+    publication_stage: stage || null,
+  };
+}
+
+function objectPublicationStage(object) {
+  const configured = String(object?.entry?.stage || "").trim();
+  if (configured) return configured;
+  const rank = publicationRank(object?.key);
+  if (rank <= 10) return "observation_parquet";
+  if (rank <= 20) return "observation_pollutant_manifest";
+  if (rank <= 30) return "observation_connector_manifest";
+  if (rank <= 40) return "observation_index";
+  if (rank <= 50) return "aqi_parquet";
+  if (rank <= 70) return "aqi_manifest";
+  if (rank <= 100) return "day_parent";
+  return "global_index";
+}
+
+export function createApplyPersistence({
+  runStatePath,
+  runId,
+  progressState,
+  io = {},
+}) {
+  if (!String(runId ?? "").trim()) throw new Error("Apply persistence requires run_id");
+  const runRoot = path.dirname(path.resolve(runStatePath));
+  const progressPath = path.join(runRoot, "apply-progress.json");
+  const journalPath = path.join(runRoot, "apply-mutation-events.jsonl");
+  const deletionDirectory = path.join(runRoot, "apply-evidence", "deletions");
+  const openSync = io.openSync || fs.openSync;
+  const writeSync = io.writeSync || fs.writeSync;
+  const fsyncSync = io.fsyncSync || fs.fsyncSync;
+  const closeSync = io.closeSync || fs.closeSync;
+  const atomicJson = io.atomicWriteJson || atomicWriteJson;
+  const atomicBuffer = io.atomicWriteBuffer || atomicWriteBuffer;
+  const readFileSync = io.readFileSync || fs.readFileSync;
+  fs.mkdirSync(deletionDirectory, { recursive: true });
+  const descriptor = openSync(journalPath, "wx", 0o600);
+  let journalDescriptor = descriptor;
+  let eventCount = 0;
+  let durableEventCount = 0;
+  let journalBytes = 0;
+  let durableJournalBytes = 0;
+  let tailEventSha256 = null;
+  let durableTailEventSha256 = null;
+  let flushCount = 0;
+  let checkpointCount = 0;
+  let sidecarCount = 0;
+  let journalFailure = null;
+  let finalJournalSha256 = null;
+  const sidecars = [];
+
+  const snapshot = () => ({
+    compact_checkpoint_count: checkpointCount,
+    complete_run_state_write_count: 0,
+    mutation_journal_event_count: eventCount,
+    mutation_journal_flush_count: flushCount,
+    deleted_key_sidecar_count: sidecarCount,
+    mutation_journal_path: journalPath,
+    mutation_journal_bytes: journalBytes,
+    mutation_journal_sha256: finalJournalSha256,
+    mutation_journal_tail_event_sha256: tailEventSha256,
+    mutation_journal_durable_event_count: durableEventCount,
+    mutation_journal_durable_bytes: durableJournalBytes,
+    mutation_journal_durable_tail_event_sha256: durableTailEventSha256,
+    mutation_journal_failure: journalFailure,
+    apply_progress_path: progressPath,
+    deletion_sidecars: sidecars.map((entry) => ({ ...entry })),
+  });
+
+  const appendEvent = (event) => {
+    if (journalDescriptor === null) throw new Error("Mutation journal is closed");
+    if (journalFailure) throw new Error(`Mutation journal is unusable: ${journalFailure}`);
+    const baseEvent = {
+      run_id: runId,
+      event_type: String(event?.event_type || ""),
+      timestamp_utc: new Date().toISOString(),
+      ...event,
+      previous_event_sha256: tailEventSha256,
+    };
+    if (!baseEvent.event_type) throw new Error("Mutation journal event_type is required");
+    const identityBody = Buffer.from(JSON.stringify(baseEvent), "utf8");
+    const eventSha256 = sha256Hex(identityBody);
+    const line = Buffer.from(`${JSON.stringify({ ...baseEvent, event_sha256: eventSha256 })}\n`, "utf8");
+    try {
+      let offset = 0;
+      while (offset < line.byteLength) {
+        const written = writeSync(journalDescriptor, line, offset, line.byteLength - offset);
+        if (!Number.isSafeInteger(written) || written <= 0) {
+          throw new Error("Mutation journal append made no progress");
+        }
+        offset += written;
+      }
+    } catch (error) {
+      journalFailure = error instanceof Error ? error.message : String(error);
+      throw new Error(`Mutation journal append failed: ${journalFailure}`, { cause: error });
+    }
+    eventCount += 1;
+    journalBytes += line.byteLength;
+    tailEventSha256 = eventSha256;
+    return { event_count: eventCount, event_sha256: eventSha256 };
+  };
+
+  const flush = () => {
+    if (journalDescriptor === null) throw new Error("Mutation journal is closed");
+    if (journalFailure) throw new Error(`Mutation journal is unusable: ${journalFailure}`);
+    try {
+      fsyncSync(journalDescriptor);
+    } catch (error) {
+      journalFailure = error instanceof Error ? error.message : String(error);
+      throw new Error(`Mutation journal durability barrier failed: ${journalFailure}`, { cause: error });
+    }
+    flushCount += 1;
+    durableEventCount = eventCount;
+    durableJournalBytes = journalBytes;
+    durableTailEventSha256 = tailEventSha256;
+    return snapshot();
+  };
+
+  const checkpoint = (reason) => {
+    const nextCheckpointCount = checkpointCount + 1;
+    progressState.last_checkpoint_at_utc = new Date().toISOString();
+    progressState.last_checkpoint_reason = String(reason || "progress");
+    Object.assign(progressState, {
+      mutation_journal_path: journalPath,
+      mutation_journal_event_count: eventCount,
+      mutation_journal_bytes: journalBytes,
+      mutation_journal_sha256: finalJournalSha256,
+      mutation_journal_tail_event_sha256: tailEventSha256,
+      mutation_journal_durable_event_count: durableEventCount,
+      mutation_journal_durable_bytes: durableJournalBytes,
+      mutation_journal_durable_tail_event_sha256: durableTailEventSha256,
+      compact_checkpoint_count: nextCheckpointCount,
+      mutation_journal_flush_count: flushCount,
+      deleted_key_sidecar_count: sidecarCount,
+      deletion_sidecars: sidecars.map((entry) => ({ ...entry })),
+    });
+    atomicJson(progressPath, progressState);
+    checkpointCount = nextCheckpointCount;
+    return progressState;
+  };
+
+  const writeDeletedKeysSidecar = ({ prefix, keys }) => {
+    const sortedKeys = [...keys].map(safeKey).sort();
+    const prefixHash = sha256Hex(Buffer.from(String(prefix), "utf8")).slice(0, 16);
+    const day = mutationContext(prefix).day_utc || "no-day";
+    const sidecarPath = path.join(deletionDirectory, `${day}-${prefixHash}.json`);
+    const body = Buffer.from(`${JSON.stringify(sortedKeys)}\n`, "utf8");
+    atomicBuffer(sidecarPath, body);
+    const persisted = readFileSync(sidecarPath);
+    const identity = {
+      prefix: String(prefix).replace(/\/+$/, ""),
+      deleted_object_count: sortedKeys.length,
+      deleted_keys_sha256: sha256Hex(body),
+      deleted_keys_sidecar_path: sidecarPath,
+      deleted_keys_sidecar_bytes: body.byteLength,
+    };
+    if (persisted.byteLength !== identity.deleted_keys_sidecar_bytes
+      || sha256Hex(persisted) !== identity.deleted_keys_sha256) {
+      throw new Error(`Deleted-key sidecar verification failed: ${prefix}`);
+    }
+    sidecars.push(identity);
+    sidecarCount += 1;
+    return identity;
+  };
+
+  const close = () => {
+    if (journalDescriptor === null) return snapshot();
+    flush();
+    const descriptorToClose = journalDescriptor;
+    journalDescriptor = null;
+    try {
+      closeSync(descriptorToClose);
+    } catch (error) {
+      journalFailure = error instanceof Error ? error.message : String(error);
+      throw new Error(`Mutation journal close failed: ${journalFailure}`, { cause: error });
+    }
+    const journalBody = readFileSync(journalPath);
+    if (journalBody.byteLength !== journalBytes) {
+      throw new Error(`Mutation journal byte-length verification failed: ${journalPath}`);
+    }
+    finalJournalSha256 = sha256Hex(journalBody);
+    return snapshot();
+  };
+
+  const closeAfterFailure = () => {
+    if (journalDescriptor !== null) {
+      if (!journalFailure) {
+        try {
+          flush();
+        } catch {
+          // Continue to close and retain whatever journal bytes reached disk.
+        }
+      }
+      const descriptorToClose = journalDescriptor;
+      journalDescriptor = null;
+      try {
+        closeSync(descriptorToClose);
+      } catch (error) {
+        journalFailure ||= error instanceof Error ? error.message : String(error);
+      }
+    }
+    try {
+      const journalBody = readFileSync(journalPath);
+      finalJournalSha256 = sha256Hex(journalBody);
+      journalBytes = journalBody.byteLength;
+    } catch (error) {
+      journalFailure ||= error instanceof Error ? error.message : String(error);
+    }
+    return snapshot();
+  };
+
+  return {
+    progressPath,
+    journalPath,
+    appendEvent,
+    flush,
+    checkpoint,
+    writeDeletedKeysSidecar,
+    close,
+    closeAfterFailure,
+    snapshot,
+  };
+}
+
+export function createBoundedProgressReporter({
+  log,
+  now = () => Date.now(),
+  objectInterval = APPLY_PROGRESS_LOG_OBJECT_INTERVAL,
+  elapsedMs = APPLY_PROGRESS_LOG_ELAPSED_MS,
+} = {}) {
+  let lastLoggedCompleted = 0;
+  let lastLoggedAt = now();
+  return ({ message, completedObjects = 0, force = false }) => {
+    const currentTime = now();
+    if (!force
+      && completedObjects - lastLoggedCompleted < objectInterval
+      && currentTime - lastLoggedAt < elapsedMs) return false;
+    (log || ((line) => process.stderr.write(`[canonical-apply] ${line}\n`)))(message);
+    lastLoggedCompleted = completedObjects;
+    lastLoggedAt = currentTime;
+    return true;
+  };
 }
 
 export const VERIFIED_GET_CACHE_MAX_BYTES = 64 * 1024 * 1024;
@@ -446,15 +771,44 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
   };
 }
 
-async function deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, adapters, verifiedBodyCache = null }) {
+export async function deleteAndVerifyPrefix({
+  r2,
+  prefixEntry,
+  adapters,
+  persistence,
+  checkpoint,
+  verifiedBodyCache = null,
+}) {
   const prefix = `${prefixEntry.prefix}/`;
+  const context = mutationContext(prefixEntry.prefix, prefixEntry.entry?.stage || "prefix_deletion");
   verifiedBodyCache?.invalidatePrefix(prefixEntry.prefix, "delete_prefix");
-  prefixEntry.entry.remote_attempted = true;
-  prefixEntry.entry.status = "deleting";
-  atomicWriteJson(runStatePath, runState);
   try {
     const entries = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
     const keys = entries.map((entry) => safeKey(entry.key)).filter((key) => key.startsWith(prefix)).sort();
+    const sidecar = persistence.writeDeletedKeysSidecar({ prefix: prefixEntry.prefix, keys });
+    delete prefixEntry.entry.deleted_object_keys;
+    const startedAt = new Date().toISOString();
+    Object.assign(prefixEntry.entry, {
+      ...sidecar,
+      remote_attempted: false,
+      deletion_started_at_utc: startedAt,
+      deletion_completed_at_utc: null,
+      deletion_verified: false,
+      status: "deletion_prepared",
+    });
+    persistence.appendEvent({
+      event_type: "deletion_started",
+      prefix: prefixEntry.prefix,
+      ...context,
+      bytes: sidecar.deleted_keys_sidecar_bytes,
+      sha256: sidecar.deleted_keys_sha256,
+      status: "started",
+      ...sidecar,
+    });
+    persistence.flush();
+    await checkpoint("before_destructive_deletion");
+    prefixEntry.entry.remote_attempted = true;
+    prefixEntry.entry.status = "deleting";
     for (let index = 0; index < keys.length; index += 1000) {
       const batch = keys.slice(index, index + 1000);
       const result = await adapters.deleteObjects({ r2, keys: batch });
@@ -462,44 +816,115 @@ async function deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, 
         throw new Error(`R2 prefix delete returned errors for ${prefixEntry.prefix}: ${JSON.stringify(result.errors)}`);
       }
     }
+    const completedAt = new Date().toISOString();
+    prefixEntry.entry.deletion_completed_at_utc = completedAt;
+    persistence.appendEvent({
+      event_type: "deletion_completed",
+      prefix: prefixEntry.prefix,
+      ...context,
+      bytes: prefixEntry.entry.deleted_keys_sidecar_bytes,
+      sha256: prefixEntry.entry.deleted_keys_sha256,
+      status: "completed",
+      deleted_object_count: keys.length,
+      deleted_keys_sidecar_path: prefixEntry.entry.deleted_keys_sidecar_path,
+    });
     const remaining = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
     if (remaining.length) throw new Error(`R2 prefix deletion verification failed: ${prefixEntry.prefix}`);
     Object.assign(prefixEntry.entry, {
       deleted: true,
       deletion_verified: true,
       remote_completed: true,
-      completed_at_utc: new Date().toISOString(),
+      completed_at_utc: completedAt,
       deleted_object_count: keys.length,
-      deleted_object_keys: keys,
       status: "deletion_verified",
     });
-    atomicWriteJson(runStatePath, runState);
+    persistence.appendEvent({
+      event_type: "deletion_verified",
+      prefix: prefixEntry.prefix,
+      ...context,
+      bytes: prefixEntry.entry.deleted_keys_sidecar_bytes,
+      sha256: prefixEntry.entry.deleted_keys_sha256,
+      status: "verified",
+      deleted_object_count: keys.length,
+      deleted_keys_sidecar_path: prefixEntry.entry.deleted_keys_sidecar_path,
+      remaining_object_count: 0,
+    });
+    persistence.flush();
     return keys.length;
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     Object.assign(prefixEntry.entry, {
       status: "failed",
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
     });
-    atomicWriteJson(runStatePath, runState);
+    try {
+      persistence.appendEvent({
+        event_type: "deletion_failed",
+        prefix: prefixEntry.prefix,
+        ...context,
+        bytes: prefixEntry.entry.deleted_keys_sidecar_bytes ?? null,
+        sha256: prefixEntry.entry.deleted_keys_sha256 ?? null,
+        status: "failed",
+        failure_message: message,
+        deleted_object_count: prefixEntry.entry.deleted_object_count ?? null,
+        deleted_keys_sidecar_path: prefixEntry.entry.deleted_keys_sidecar_path ?? null,
+      });
+      persistence.flush();
+    } catch {
+      // The outer failure checkpoint records an unusable journal explicitly.
+    }
     throw error;
   }
 }
 
-export async function putAndVerifyObject({ r2, runState, runStatePath, object, adapters, verifiedBodyCache = null }) {
+export async function putAndVerifyObject({
+  r2,
+  runState,
+  object,
+  adapters,
+  persistence = null,
+  verifiedBodyCache = null,
+}) {
   const entry = object.entry;
+  const context = mutationContext(object.key, objectPublicationStage(object));
   if (Number(entry.post_put_verification_get_attempt_count || 0) !== 0
     || Number(entry.post_put_verification_get_count || 0) !== 0) {
     throw new Error(`Changed object already has post-PUT GET bookkeeping: ${object.key}`);
   }
   verifiedBodyCache?.invalidateKey(object.key, "later_put_same_key");
   Object.assign(entry, { remote_attempted: true, status: "uploading" });
-  atomicWriteJson(runStatePath, runState);
+  persistence?.appendEvent({
+    event_type: "put_started",
+    canonical_key: object.key,
+    ...context,
+    bytes: object.body.byteLength,
+    sha256: entry.sha256,
+    status: "started",
+    post_put_verification_count: 0,
+  });
   try {
     await adapters.putObject({ r2, key: object.key, body: object.body, content_type: contentTypeForKey(object.key) });
     Object.assign(entry, { uploaded: true, uploaded_at_utc: new Date().toISOString(), status: "uploaded" });
-    atomicWriteJson(runStatePath, runState);
+    persistence?.appendEvent({
+      event_type: "put_completed",
+      canonical_key: object.key,
+      ...context,
+      bytes: object.body.byteLength,
+      sha256: entry.sha256,
+      status: "completed",
+      post_put_verification_count: 0,
+    });
     entry.post_put_verification_get_attempt_count = 1;
-    atomicWriteJson(runStatePath, runState);
+    persistence?.appendEvent({
+      event_type: "post_put_get_started",
+      canonical_key: object.key,
+      ...context,
+      bytes: object.body.byteLength,
+      sha256: entry.sha256,
+      status: "started",
+      post_put_verification_count: 0,
+      post_put_verification_attempt_count: 1,
+    });
     const fresh = await adapters.getObject({ r2, key: object.key });
     if (Number(fresh.bytes) !== object.body.byteLength || sha256Hex(fresh.body) !== entry.sha256) {
       throw new Error(`R2 GET verification identity mismatch: ${object.key}`);
@@ -524,13 +949,39 @@ export async function putAndVerifyObject({ r2, runState, runStatePath, object, a
         verified_get_cache_sha256: cached ? entry.sha256 : null,
       });
     }
-    atomicWriteJson(runStatePath, runState);
+    persistence?.appendEvent({
+      event_type: "post_put_get_verified",
+      canonical_key: object.key,
+      ...context,
+      bytes: object.body.byteLength,
+      sha256: entry.sha256,
+      status: "verified",
+      post_put_verification_count: 1,
+      post_put_verification_attempt_count: 1,
+    });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     Object.assign(entry, {
       status: "failed",
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
     });
-    atomicWriteJson(runStatePath, runState);
+    try {
+      persistence?.appendEvent({
+        event_type: "put_or_verification_failed",
+        canonical_key: object.key,
+        ...context,
+        bytes: object.body.byteLength,
+        sha256: entry.sha256,
+        status: "failed",
+        failure_message: message,
+        put_completed: entry.uploaded === true,
+        post_put_verification_count: Number(entry.post_put_verification_get_count || 0),
+        post_put_verification_attempt_count: Number(entry.post_put_verification_get_attempt_count || 0),
+      });
+      persistence?.flush();
+    } catch {
+      // The outer failure checkpoint records an unusable journal explicitly.
+    }
     throw error;
   }
 }
@@ -1240,9 +1691,9 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
 export async function verifyLiveObservationPartition({
   r2,
   runState,
-  runStatePath,
   object,
   adapters,
+  persistence = null,
   verifiedBodyCache = null,
 }) {
   const match = object.key.match(CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN);
@@ -1325,10 +1776,20 @@ export async function verifyLiveObservationPartition({
     live_observation_source_evidence_hash: source.metadata.observation_content_hash,
     live_observation_content_verified_against_source: liveSourceDifferences.length === 0,
   });
-  atomicWriteJson(runStatePath, runState);
   if (liveSourceDifferences.length) {
     object.entry.live_observation_failure_classification = "live_observation_content_mismatch";
-    atomicWriteJson(runStatePath, runState);
+    persistence?.appendEvent({
+      event_type: "semantic_verification_failed",
+      canonical_key: object.key,
+      ...mutationContext(object.key, "observation_semantic_verification"),
+      bytes: object.body.byteLength,
+      sha256: object.entry.sha256,
+      status: "failed",
+      failure_message: `immutable_source_mismatch:${liveSourceDifferences.join(",")}`,
+      live_observation_content_hash: liveMetadata.observation_content_hash,
+      immutable_source_content_hash: source.metadata.observation_content_hash,
+    });
+    persistence?.flush();
     throw new Error(
       `Live repaired observation content does not match immutable source evidence: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${liveSourceDifferences.join(",")}`,
     );
@@ -1345,7 +1806,18 @@ export async function verifyLiveObservationPartition({
       live_observation_failure_classification: "proposal_manifest_defect",
       proposal_manifest_differing_fields: [...new Set(manifestDifferences)],
     });
-    atomicWriteJson(runStatePath, runState);
+    persistence?.appendEvent({
+      event_type: "semantic_verification_failed",
+      canonical_key: object.key,
+      ...mutationContext(object.key, "observation_semantic_verification"),
+      bytes: object.body.byteLength,
+      sha256: object.entry.sha256,
+      status: "failed",
+      failure_message: `proposal_manifest_mismatch:${[...new Set(manifestDifferences)].join(",")}`,
+      live_observation_content_hash: liveMetadata.observation_content_hash,
+      immutable_source_content_hash: source.metadata.observation_content_hash,
+    });
+    persistence?.flush();
     throw new Error(
       `Proposed observation manifest does not match verified live source content: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${[...new Set(manifestDifferences)].join(",")}`,
     );
@@ -1359,7 +1831,18 @@ export async function verifyLiveObservationPartition({
   for (const key of partKeys) {
     verifiedBodyCache?.invalidateKey(key, "semantic_verification_complete");
   }
-  atomicWriteJson(runStatePath, runState);
+  persistence?.appendEvent({
+    event_type: "semantic_verification_completed",
+    canonical_key: object.key,
+    ...mutationContext(object.key, "observation_semantic_verification"),
+    bytes: object.body.byteLength,
+    sha256: object.entry.sha256,
+    status: "verified",
+    live_observation_content_hash: liveMetadata.observation_content_hash,
+    immutable_source_content_hash: source.metadata.observation_content_hash,
+    proposed_manifest_matches_live_observation: true,
+    body_sources: bodySources,
+  });
 }
 
 export async function prepareMergedDayManifest({ r2, object, adapters, exactProposedConnectorSet = false }) {
@@ -1464,6 +1947,11 @@ export function assertPublicationDependenciesVerified({ object, runState }) {
   }
 }
 
+export function enforcePublicationDependencyDurability({ object, runState, persistence }) {
+  assertPublicationDependenciesVerified({ object, runState });
+  if ((object?.entry?.dependencies || []).length > 0) persistence.flush();
+}
+
 export async function applySosLightPerDayUnits({
   selectedDays,
   dayGroups,
@@ -1474,6 +1962,9 @@ export async function applySosLightPerDayUnits({
   publishAffectedIndexes,
   publicationState = {},
   persist = async () => {},
+  durabilityBarrier = async () => {},
+  appendEvent = () => {},
+  reportProgress = () => {},
 }) {
   const units = [...selectedDays].sort().map((dayUtc) => {
     const dayOperations = dayGroups.get(dayUtc) || [];
@@ -1502,44 +1993,73 @@ export async function applySosLightPerDayUnits({
     };
   });
 
-  for (const { dayUtc, deletionOperation, parentOperations, dayConnectorGroups } of units) {
+  for (let dayIndex = 0; dayIndex < units.length; dayIndex += 1) {
+    const { dayUtc, deletionOperation, parentOperations, dayConnectorGroups } = units[dayIndex];
     const state = publicationState[dayUtc] = {
       day_utc: dayUtc,
-      status: "running",
+      status: "not_started",
       completed_publication_level: "none",
       deletion_verified: false,
       connector_group_count: dayConnectorGroups.length,
       completed_connector_group_count: 0,
       day_parent_verified: false,
     };
-    await persist();
     try {
-      state.status = "deleting_complete_day";
-      await persist();
+      state.status = "deleting";
+      reportProgress(`day deletion started day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
+      await persist("before_day_deletion");
       await applyDeletion({ dayUtc, operation: deletionOperation });
       state.deletion_verified = true;
       state.completed_publication_level = "complete_day_deletion_verified";
-      state.status = "publishing_connectors";
-      await persist();
+      state.status = "deletion_verified";
+      await durabilityBarrier("day_deletion_verified");
+      await persist("after_deletion_verification");
+      reportProgress(`day deletion verified day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
+      state.status = "publishing_children";
+      reportProgress(`day publication started day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
       for (const group of dayConnectorGroups) {
         await applyConnectorGroup(group);
         state.completed_connector_group_count += 1;
         state.completed_publication_level = "connector_parents_verified";
-        await persist();
+        state.status = "publishing_connector_parents";
       }
       state.status = "publishing_day_parent";
-      await persist();
       await applyDayFinalization({ dayUtc, operations: parentOperations });
       state.day_parent_verified = true;
       state.completed_publication_level = "day_parent_verified";
-      state.status = "succeeded";
+      state.status = "day_parent_verified";
       state.completed_at_utc = new Date().toISOString();
-      await persist();
+      appendEvent({
+        event_type: "sos_light_day_completed",
+        day_utc: dayUtc,
+        connector_id: 1,
+        publication_stage: "day_parent",
+        status: "verified",
+        completed_publication_level: "day_parent_verified",
+      });
+      await durabilityBarrier("day_parent_verified");
+      await persist("after_day_parent_verified");
+      reportProgress(`day parent verified day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
+      reportProgress(`day completed day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
     } catch (error) {
       state.status = "failed";
       state.error = error instanceof Error ? error.message : String(error);
       state.failed_at_utc = new Date().toISOString();
-      await persist();
+      try {
+        appendEvent({
+          event_type: "sos_light_day_failed",
+          day_utc: dayUtc,
+          connector_id: 1,
+          publication_stage: state.completed_publication_level,
+          status: "failed",
+          failure_message: state.error,
+          completed_publication_level: state.completed_publication_level,
+        });
+        await durabilityBarrier("day_failure");
+        await persist("day_failed");
+      } catch {
+        // The canonical outer failure handler records the checkpoint failure.
+      }
       throw error;
     }
   }
@@ -1559,8 +2079,48 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     runState,
     proposal,
   });
-  await validateFinalProposalGraph({ runState, proposal, runStatePath });
-  const counts = { planned_deletions: proposal.prefixes.length, planned_writes: proposal.objects.length, deleted_objects: 0, completed_deletions: 0, completed_writes: 0, get_verified_writes: 0 };
+  try {
+    await validateFinalProposalGraph({ runState, proposal });
+  } catch (error) {
+    runState.apply = {
+      status: "failed",
+      current_phase: "final_proposal_validation",
+      error: error instanceof Error ? error.message : String(error),
+      finished_at_utc: new Date().toISOString(),
+      persistence: {
+        compact_checkpoint_count: 0,
+        complete_run_state_write_count: 1,
+        mutation_journal_event_count: 0,
+        mutation_journal_flush_count: 0,
+        deleted_key_sidecar_count: 0,
+      },
+    };
+    atomicWriteJson(runStatePath, runState);
+    throw error;
+  }
+  const counts = {
+    planned_deletions: proposal.prefixes.length,
+    planned_writes: proposal.objects.length,
+    planned_post_put_verifications: proposal.objects.length,
+    deleted_objects: 0,
+    completed_deletions: 0,
+    completed_writes: 0,
+    get_verified_writes: 0,
+    completed_post_put_verifications: 0,
+    failed_operations: 0,
+  };
+  const selectedDays = dedicatedSosProposal.dedicated
+    ? dedicatedSosProposal.selected_days
+    : [...new Set([
+      ...proposal.prefixes.map((entry) => mutationContext(entry.prefix).day_utc),
+      ...proposal.objects.map((entry) => mutationContext(entry.key).day_utc),
+    ].filter(Boolean))].sort();
+  const { progressState, perDayStatus } = createInitialApplyProgressState({
+    runStatePath,
+    runId: runState.run_id,
+    counts,
+    selectedDays,
+  });
   runState.apply = {
     status: "running",
     started_at_utc: new Date().toISOString(),
@@ -1570,8 +2130,121 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     ...counts,
   };
   runState.writer_locks = [];
-  atomicWriteJson(runStatePath, runState);
+  let persistence;
   try {
+    persistence = createApplyPersistence({
+      runStatePath,
+      runId: runState.run_id,
+      progressState,
+      io: adapters.persistenceIo || {},
+    });
+  } catch (error) {
+    runState.apply = {
+      ...runState.apply,
+      status: "failed",
+      current_phase: "apply_persistence_initialization",
+      error: error instanceof Error ? error.message : String(error),
+      finished_at_utc: new Date().toISOString(),
+      persistence: {
+        compact_checkpoint_count: 0,
+        complete_run_state_write_count: 1,
+        mutation_journal_event_count: 0,
+        mutation_journal_flush_count: 0,
+        deleted_key_sidecar_count: 0,
+        mutation_journal_failure: error instanceof Error ? error.message : String(error),
+      },
+    };
+    atomicWriteJson(runStatePath, runState);
+    throw error;
+  }
+  let completeRunStateWriteCount = 0;
+  const syncProgress = () => {
+    Object.assign(progressState, counts);
+    const completedDays = selectedDays.filter((dayUtc) =>
+      perDayStatus[dayUtc]?.status === "day_parent_verified");
+    progressState.last_completed_day_utc = completedDays.at(-1) || null;
+    const activeDay = selectedDays.find((dayUtc) =>
+      !["not_started", "day_parent_verified"].includes(perDayStatus[dayUtc]?.status));
+    if (activeDay && progressState.status === "running") {
+      progressState.current_day_utc = activeDay;
+      progressState.current_phase = perDayStatus[activeDay].status;
+    }
+    progressState.deletions = proposal.prefixes.map(({ entry, prefix }) => ({
+      prefix,
+      deleted_object_count: Number(entry.deleted_object_count || 0),
+      deleted_keys_sha256: entry.deleted_keys_sha256 || null,
+      deleted_keys_sidecar_path: entry.deleted_keys_sidecar_path || null,
+      deleted_keys_sidecar_bytes: Number(entry.deleted_keys_sidecar_bytes || 0),
+      deletion_started_at_utc: entry.deletion_started_at_utc || null,
+      deletion_completed_at_utc: entry.deletion_completed_at_utc || null,
+      deletion_verified: entry.deletion_verified === true,
+      status: entry.status || "planned",
+    }));
+  };
+  const syncPersistenceDiagnostics = () => {
+    runState.apply.persistence = {
+      ...persistence.snapshot(),
+      complete_run_state_write_count: completeRunStateWriteCount,
+    };
+    runState.apply_progress = {
+      path: persistence.progressPath,
+      status: progressState.status,
+      current_phase: progressState.current_phase,
+      last_completed_day_utc: progressState.last_completed_day_utc,
+    };
+  };
+  const writeCompleteRunState = () => {
+    const nextWriteCount = completeRunStateWriteCount + 1;
+    syncPersistenceDiagnostics();
+    runState.apply.persistence.complete_run_state_write_count = nextWriteCount;
+    atomicWriteJson(runStatePath, runState);
+    completeRunStateWriteCount = nextWriteCount;
+  };
+  const checkpoint = async (reason) => {
+    syncProgress();
+    persistence.checkpoint(reason);
+    syncPersistenceDiagnostics();
+  };
+  const startedAtMs = Date.now();
+  const report = createBoundedProgressReporter({ log: adapters.progressLog });
+  const elapsedSeconds = () => Math.max(0, Math.round((Date.now() - startedAtMs) / 1000));
+  const progressMessage = (label) => `${label} completed_objects=${counts.completed_writes}/${counts.planned_writes} `
+    + `completed_verifications=${counts.completed_post_put_verifications}/${counts.planned_post_put_verifications} `
+    + `elapsed_seconds=${elapsedSeconds()}`;
+  let lastOptionalCheckpointAt = Date.now();
+  let lastOptionalCheckpointWrites = 0;
+  const maybeCheckpointAndLog = async () => {
+    const now = Date.now();
+    const objectThresholdReached = counts.completed_writes - lastOptionalCheckpointWrites
+      >= APPLY_PROGRESS_CHECKPOINT_OBJECT_INTERVAL;
+    const timeThresholdReached = now - lastOptionalCheckpointAt
+      >= APPLY_PROGRESS_CHECKPOINT_ELAPSED_MS;
+    if (objectThresholdReached || timeThresholdReached) {
+      await checkpoint("bounded_within_scope_progress");
+      lastOptionalCheckpointAt = now;
+      lastOptionalCheckpointWrites = counts.completed_writes;
+    }
+    const progressLabel = progressState.current_phase === "publishing_affected_indexes"
+      ? "bounded index progress"
+      : "within-day object progress";
+    report({
+      message: progressMessage(progressLabel),
+      completedObjects: counts.completed_writes,
+    });
+  };
+  try {
+    writeCompleteRunState();
+    persistence.appendEvent({
+      event_type: "canonical_apply_started",
+      publication_stage: "final_proposal_validated",
+      status: "started",
+      planned_deletions: counts.planned_deletions,
+      planned_writes: counts.planned_writes,
+      planned_post_put_verifications: counts.planned_post_put_verifications,
+    });
+    persistence.flush();
+    await checkpoint("final_proposal_validated_before_first_mutation");
+    report({ message: progressMessage("canonical apply started"), completedObjects: 0, force: true });
     const historyWriterClient = adapters.historyWriterClient;
     if (!historyWriterClient) throw new Error("canonical apply requires one retained PostgreSQL history-writer session");
     const operations = [];
@@ -1608,40 +2281,49 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       }
     }
     const executeOperation = async (operation, verifiedBodyCache = null) => {
+      progressState.current_object_key = operation.kind === "put" ? operation.key : null;
+      progressState.current_deletion_prefix = operation.kind === "delete" ? operation.key : null;
+      progressState.current_day_utc = mutationContext(operation.key).day_utc;
+      progressState.current_publication_stage = operation.kind === "put"
+        ? objectPublicationStage(operation.object)
+        : operation.prefixEntry.entry?.stage || "prefix_deletion";
       if (operation.kind === "delete") {
         const { prefixEntry } = operation;
         counts.deleted_objects += await deleteAndVerifyPrefix({
           r2,
-          runState,
-          runStatePath,
           prefixEntry,
           adapters: resolvedAdapters,
+          persistence,
+          checkpoint,
           verifiedBodyCache,
         });
         counts.completed_deletions += 1;
+        if (!dedicatedSosProposal.dedicated) await checkpoint("after_deletion_verification");
       } else {
         const { object } = operation;
         assertPublicationDependenciesVerified({ object, runState });
         await verifyLiveObservationPartition({
           r2,
           runState,
-          runStatePath,
           object,
           adapters: resolvedAdapters,
+          persistence,
           verifiedBodyCache,
         });
+        enforcePublicationDependencyDurability({ object, runState, persistence });
         await putAndVerifyObject({
           r2,
           runState,
-          runStatePath,
           object,
           adapters: resolvedAdapters,
+          persistence,
           verifiedBodyCache,
         });
         counts.completed_writes += 1;
         counts.get_verified_writes += 1;
+        counts.completed_post_put_verifications += 1;
+        await maybeCheckpointAndLog();
       }
-      atomicWriteJson(runStatePath, runState);
     };
     const executeConnectorGroup = async (group) => {
       const groupKey = `${group.day_utc}|${group.connector_id}`;
@@ -1677,7 +2359,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
                 : publicationRank(operation.key) <= 70
                 ? "aqi_manifests_and_data"
                 : "aqi_indexes";
-              atomicWriteJson(runStatePath, runState);
             }
             runState.apply.connector_day_publication[groupKey].status = "succeeded";
             return { operation_count: group.operations.length };
@@ -1692,7 +2373,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
                 : "connector_day_scope_failed",
             );
             runState.apply.connector_day_publication[groupKey].verified_get_cache = verifiedBodyCache?.snapshot() || null;
-            atomicWriteJson(runStatePath, runState);
           }
         },
         verify: async (written) => ({ ...written, get_verified: true }),
@@ -1726,6 +2406,19 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     ])).sort();
     const publishAffectedIndexes = async () => {
       if (!globalOperations.length && !affectedDays.length) return;
+      progressState.current_phase = "publishing_affected_indexes";
+      progressState.current_day_utc = null;
+      progressState.current_publication_stage = "affected_indexes";
+      progressState.index_publication_started = true;
+      persistence.appendEvent({
+        event_type: "index_publication_started",
+        publication_stage: "affected_indexes",
+        status: "started",
+        planned_index_object_count: globalOperations.length,
+      });
+      persistence.flush();
+      await checkpoint("before_affected_index_publication");
+      report({ message: progressMessage("index publication started"), completedObjects: counts.completed_writes, force: true });
       await runCanonicalGlobalIndexFinalizer({
           client: historyWriterClient,
           diagnosticEnvironment: runState.environment,
@@ -1753,13 +2446,23 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
                 planned_index_object_count: globalOperations.length,
                 live_observation_body_rebuild_used: false,
               };
-              atomicWriteJson(runStatePath, runState);
             }
           },
         });
+      progressState.index_publication_completed = true;
+      progressState.current_publication_stage = "affected_indexes_verified";
+      persistence.appendEvent({
+        event_type: "index_publication_completed",
+        publication_stage: "affected_indexes",
+        status: "verified",
+        completed_index_object_count: globalOperations.length,
+      });
+      persistence.flush();
+      await checkpoint("after_affected_index_publication");
+      report({ message: progressMessage("index publication completed"), completedObjects: counts.completed_writes, force: true });
     };
     if (dedicatedSosProposal.dedicated) {
-      runState.apply.sos_light_day_publication = {};
+      runState.apply.sos_light_day_publication = perDayStatus;
       await applySosLightPerDayUnits({
         selectedDays: dedicatedSosProposal.selected_days,
         dayGroups,
@@ -1780,7 +2483,14 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         applyDayFinalization: executeDayFinalization,
         publishAffectedIndexes,
         publicationState: runState.apply.sos_light_day_publication,
-        persist: async () => atomicWriteJson(runStatePath, runState),
+        persist: checkpoint,
+        durabilityBarrier: async () => persistence.flush(),
+        appendEvent: persistence.appendEvent,
+        reportProgress: (message) => report({
+          message: progressMessage(message),
+          completedObjects: counts.completed_writes,
+          force: true,
+        }),
       });
     } else {
       for (const group of Array.from(connectorGroups.values()).sort((left, right) =>
@@ -1809,13 +2519,79 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         ) ? "succeeded" : "failed",
       });
     }
-    runState.apply = { ...runState.apply, ...counts, status: "succeeded", finished_at_utc: new Date().toISOString() };
-    atomicWriteJson(runStatePath, runState);
-    return { ok: true, status: "succeeded", ...counts };
+    progressState.status = "succeeded";
+    progressState.current_phase = "canonical_apply_completed";
+    progressState.current_day_utc = null;
+    progressState.current_object_key = null;
+    progressState.current_deletion_prefix = null;
+    progressState.current_publication_stage = "complete";
+    persistence.appendEvent({
+      event_type: "canonical_apply_completed",
+      publication_stage: "complete",
+      status: "succeeded",
+      ...counts,
+    });
+    persistence.close();
+    await checkpoint("canonical_apply_successful_completion");
+    runState.apply = {
+      ...runState.apply,
+      ...counts,
+      status: "succeeded",
+      finished_at_utc: new Date().toISOString(),
+    };
+    writeCompleteRunState();
+    report({ message: progressMessage("canonical apply completed"), completedObjects: counts.completed_writes, force: true });
+    return {
+      ok: true,
+      status: "succeeded",
+      ...counts,
+      persistence: runState.apply.persistence,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    runState.apply = { ...runState.apply, ...counts, status: "failed", error: message, finished_at_utc: new Date().toISOString() };
-    atomicWriteJson(runStatePath, runState);
+    counts.failed_operations += 1;
+    progressState.status = "failed";
+    progressState.current_phase = "canonical_apply_failed";
+    progressState.failed_operations = counts.failed_operations;
+    try {
+      persistence.appendEvent({
+        event_type: "canonical_apply_failed",
+        canonical_key: progressState.current_object_key,
+        prefix: progressState.current_deletion_prefix,
+        day_utc: progressState.current_day_utc,
+        connector_id: mutationContext(
+          progressState.current_object_key || progressState.current_deletion_prefix,
+        ).connector_id,
+        publication_stage: progressState.current_publication_stage,
+        status: "failed",
+        failure_message: message,
+        last_completed_day_utc: progressState.last_completed_day_utc,
+      });
+      persistence.flush();
+    } catch {
+      // The compact failure checkpoint exposes the journal failure.
+    }
+    persistence.closeAfterFailure();
+    try {
+      await checkpoint("canonical_apply_failure");
+    } catch (checkpointError) {
+      progressState.checkpoint_failure = checkpointError instanceof Error
+        ? checkpointError.message : String(checkpointError);
+    }
+    runState.apply = {
+      ...runState.apply,
+      ...counts,
+      status: "failed",
+      error: message,
+      finished_at_utc: new Date().toISOString(),
+      last_completed_day_utc: progressState.last_completed_day_utc,
+      later_selected_days_untouched: dedicatedSosProposal.dedicated,
+      untouched_later_selected_days: dedicatedSosProposal.dedicated
+        ? selectedDays.filter((dayUtc) => perDayStatus[dayUtc]?.status === "not_started")
+        : [],
+    };
+    writeCompleteRunState();
+    report({ message: progressMessage(`canonical apply failed error=${message}`), completedObjects: counts.completed_writes, force: true });
     throw error;
   }
 }
