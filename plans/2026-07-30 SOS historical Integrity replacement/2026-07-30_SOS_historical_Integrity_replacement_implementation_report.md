@@ -1,5 +1,77 @@
 # SOS historical Integrity replacement implementation report
 
+## 1 August 2026 canonical-apply persistence follow-up correction
+
+### Generic targeted indexes now use canonical mutation persistence
+
+The non-SOS targeted index finaliser no longer allows a changed generated object to continue through the shared index helper's internal direct PUT/GET path. The shared put-if-changed boundary retains its existing deterministic HEAD/MD5 unchanged check and proposal audit, but when canonical apply supplies `canonical_mutation_sink`, every changed generated body is returned to the apply executor with its canonical key, bytes, SHA-256 and content type.
+
+Canonical apply records the generated object as built, structurally validated and included in the write set, increments planned write and post-PUT-verification counts, appends `generic_index_write_planned`, and then uses the existing `executeOperation()` path. The resulting object receives `put_started`, `put_completed`, exactly one `post_put_get_started`/GET, `post_put_get_verified`, bounded progress accounting and a journal flush before the index helper can proceed to a dependent object or return successfully. A byte-identical `skipped_unchanged` proposal never calls the mutation sink and remains excluded from planned/completed writes and verification counts. SOS-light continues to use its preplanned `globalOperations` and retains indexes-last ordering.
+
+### Deterministic event hashing and successful-run reconciliation
+
+Every new mutation event records:
+
+```text
+event_hash_contract_version=integrity-apply-mutation-event-v1
+```
+
+JavaScript and Python share the same hash-input rules: remove `event_sha256`, retain `previous_event_sha256`, recursively sort every object key, preserve array order, encode compact JSON as UTF-8 with unescaped Unicode, and SHA-256 the resulting bytes. A fixed nested-object vector is asserted in both languages. Python now validates the contract version, recomputes every event hash, links the next event to the preceding recomputed hash and requires the final recomputed hash to equal the recorded tail.
+
+Whole-file byte/SHA identity, event count, event-chain linkage, per-event hash, tail identity and successful count failures have distinct diagnostics. For a successful apply, Python also requires:
+
+```text
+put_completed
+= post_put_get_verified
+= completed_writes
+= completed_post_put_verifications
+
+deletion_verified
+= completed_deletions
+```
+
+The verified artifact result exposes final journal bytes, SHA-256, event count, per-event-type counts and the recomputed tail. Remote object and deletion evidence remain independently required; counters are not treated as mutation proof.
+
+### Complete-state write diagnostics and failure checkpoint evidence
+
+Complete `run-state.json` writes are reported separately as:
+
+```text
+node_complete_run_state_write_count
+coordinator_complete_run_state_write_count
+total_complete_run_state_write_count
+```
+
+The total is always recomputed as Node plus coordinator. Python increments the coordinator count only when it writes the complete state after a Node apply state exists; compact `apply-progress.json` checkpoints do not enter these counts. The normal coordinator-finalisation write and the later successful post-report cleanup write are both counted. After that cleanup write, the JSON and Markdown reports are refreshed so final reporting and final run state expose the same total without adding another complete-state write.
+
+The Node failure path now preserves the original apply error as primary and records compact failure-checkpoint evidence separately: attempted/succeeded status, exact checkpoint error, the previous successfully written checkpoint path/reason/timestamp/count when the failure checkpoint cannot be written, failed key/prefix/day/stage, last completed publication level, and untouched later SOS-light days. Checkpoint construction no longer overwrites the in-memory last-successful identity before its atomic write succeeds. Python carries this failure evidence into the final coordinator result and report.
+
+### Files changed
+
+- `scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`: canonical generated-index mutation adapter, deterministic journal hashing, split complete-state diagnostics and retained failure-checkpoint evidence.
+- `workers/shared/uk_aq_r2_history_index.mjs`: one optional canonical mutation callback at the existing put-if-changed boundary; deterministic payload construction is unchanged.
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`: event-hash recomputation, journal/count reconciliation, coordinator write accounting, report output and failure evidence propagation.
+- `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`: generated-index persistence, unchanged-index exclusion, cross-language hash vector and failed-checkpoint identity checks.
+- `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`: intact/tampered journal cases, count reconciliation, split write counts and final failure evidence checks.
+- this implementation report.
+
+The apply and Python implementations already had 1 August pre-change snapshots. The shared index implementation was snapshotted once at `archive/2026-08-01/workers/shared/uk_aq_r2_history_index.mjs` before its focused change. No `system_docs/` or `TODO-IMPORTANT-UKAQ.txt` file changed.
+
+### Focused validation and compatibility
+
+- JavaScript syntax checks: passed.
+- Python compilation checks: passed.
+- JavaScript apply-safety, proposal provenance and directly related SOS-light regressions: passed (`32` tests).
+- Python persistence/hash/count/failure-report checks: passed (`12` tests).
+- Python absent-Dropbox-day/source-plus-Dropbox checks: passed (`2` tests).
+- `git diff --check`: passed.
+
+No real Integrity command or external service was used. Operational success and performance remain unclaimed pending a new authorised CIC-Test run.
+
+Compatibility concern: mutation journals created before this correction do not contain `event_hash_contract_version` and were hashed using producer insertion order. They remain immutable historical evidence but cannot satisfy the new per-event v1 verifier; new successful canonical applies use the versioned contract.
+
+An incidental run of the broader seven-test planning module exposed three existing current-main expectation mismatches in unrelated legacy suggested-repair labels/notes. The two requested SOS-light planning checks pass, and no unrelated planning implementation or expectation was changed.
+
 ## 1 August 2026 bounded canonical-apply persistence correction
 
 ### Real-run incident and confirmed cause

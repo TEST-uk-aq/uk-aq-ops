@@ -4395,6 +4395,82 @@ class ApplyPersistenceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def _journal_state(
+        self,
+        event_types: list[str],
+        *,
+        completed_writes: int = 0,
+        completed_gets: int = 0,
+        completed_deletions: int = 0,
+    ) -> tuple[dict[str, object], Path, list[dict[str, object]]]:
+        previous: str | None = None
+        events: list[dict[str, object]] = []
+        for index, event_type in enumerate(event_types):
+            event: dict[str, object] = {
+                "run_id": "test-run",
+                "event_hash_contract_version": (
+                    MODULE.MUTATION_EVENT_HASH_CONTRACT_VERSION
+                ),
+                "event_type": event_type,
+                "timestamp_utc": f"2026-08-01T00:00:{index:02d}Z",
+                "previous_event_sha256": previous,
+                "nested": {"z": index, "a": ["stable", index]},
+            }
+            event_sha256 = hashlib.sha256(
+                MODULE.canonical_mutation_event_hash_input(event)
+            ).hexdigest()
+            event["event_sha256"] = event_sha256
+            previous = event_sha256
+            events.append(event)
+        journal_path = self.root / "apply-mutation-events.jsonl"
+        body = b"".join(
+            json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            ) + b"\n"
+            for event in events
+        )
+        journal_path.write_bytes(body)
+        state: dict[str, object] = {
+            "run_id": "test-run",
+            "run_root": str(self.root),
+            "apply": {
+                "status": "succeeded",
+                "completed_writes": completed_writes,
+                "completed_post_put_verifications": completed_gets,
+                "completed_deletions": completed_deletions,
+                "persistence": {
+                    "mutation_journal_path": str(journal_path),
+                    "mutation_journal_bytes": len(body),
+                    "mutation_journal_sha256": hashlib.sha256(body).hexdigest(),
+                    "mutation_journal_event_count": len(events),
+                    "mutation_journal_tail_event_sha256": previous,
+                    "deleted_key_sidecar_count": 0,
+                    "node_complete_run_state_write_count": 2,
+                    "coordinator_complete_run_state_write_count": 1,
+                    "total_complete_run_state_write_count": 3,
+                },
+            },
+            "tombstone_prefixes": [],
+        }
+        return state, journal_path, events
+
+    def _rewrite_journal_identity(
+        self,
+        state: dict[str, object],
+        journal_path: Path,
+        events: list[dict[str, object]],
+    ) -> None:
+        body = b"".join(
+            json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            ) + b"\n"
+            for event in events
+        )
+        journal_path.write_bytes(body)
+        persistence = state["apply"]["persistence"]  # type: ignore[index]
+        persistence["mutation_journal_bytes"] = len(body)
+        persistence["mutation_journal_sha256"] = hashlib.sha256(body).hexdigest()
+
     def test_journal_and_deleted_key_sidecar_identities_are_verified(self) -> None:
         prefix = "history/v2/observations/day_utc=2026-07-29"
         evidence_dir = self.root / "apply-evidence" / "deletions"
@@ -4403,13 +4479,18 @@ class ApplyPersistenceTests(unittest.TestCase):
         sidecar_body = json.dumps([f"{prefix}/a.json"], separators=(",", ":")).encode() + b"\n"
         sidecar_path.write_bytes(sidecar_body)
         journal_path = self.root / "apply-mutation-events.jsonl"
-        tail_sha256 = "a" * 64
         event = {
             "run_id": "test-run",
+            "event_hash_contract_version": (
+                MODULE.MUTATION_EVENT_HASH_CONTRACT_VERSION
+            ),
             "event_type": "deletion_verified",
             "previous_event_sha256": None,
-            "event_sha256": tail_sha256,
         }
+        tail_sha256 = hashlib.sha256(
+            MODULE.canonical_mutation_event_hash_input(event)
+        ).hexdigest()
+        event["event_sha256"] = tail_sha256
         journal_body = json.dumps(event, separators=(",", ":")).encode() + b"\n"
         journal_path.write_bytes(journal_body)
         run_state = {
@@ -4423,7 +4504,9 @@ class ApplyPersistenceTests(unittest.TestCase):
                 "mutation_journal_tail_event_sha256": tail_sha256,
                 "deleted_key_sidecar_count": 1,
                 "compact_checkpoint_count": 4,
-                "complete_run_state_write_count": 2,
+                "node_complete_run_state_write_count": 2,
+                "coordinator_complete_run_state_write_count": 0,
+                "total_complete_run_state_write_count": 2,
                 "mutation_journal_flush_count": 3,
             }},
             "tombstone_prefixes": [{
@@ -4438,6 +4521,123 @@ class ApplyPersistenceTests(unittest.TestCase):
         self.assertEqual(result["status"], "verified")
         self.assertEqual(result["mutation_journal_event_count"], 1)
         self.assertEqual(result["deleted_key_sidecars"][0]["deleted_object_count"], 1)
+
+    def test_intact_multi_event_journal_recomputes_and_reconciles(self) -> None:
+        fixture = {
+            "z": {"b": 2, "a": [3, {"y": "✓", "x": None}]},
+            "event_hash_contract_version": (
+                MODULE.MUTATION_EVENT_HASH_CONTRACT_VERSION
+            ),
+            "previous_event_sha256": None,
+            "event_type": "fixture",
+            "run_id": "r",
+        }
+        self.assertEqual(
+            hashlib.sha256(
+                MODULE.canonical_mutation_event_hash_input(fixture)
+            ).hexdigest(),
+            "5937c9d8669a5da38e4d9170b4962b050997ff31f4df47d54f90785d853f65aa",
+        )
+        state, _path, _events = self._journal_state(
+            ["put_completed", "post_put_get_verified"],
+            completed_writes=1,
+            completed_gets=1,
+        )
+        result = MODULE.verify_apply_persistence_artifacts(state)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["event_type_counts"]["put_completed"], 1)
+        self.assertEqual(result["total_complete_run_state_write_count"], 3)
+
+    def test_modified_event_body_with_updated_file_identity_fails_hash(self) -> None:
+        state, path, events = self._journal_state(["canonical_apply_started"])
+        events[0]["nested"] = {"changed": True}
+        self._rewrite_journal_identity(state, path, events)
+        with self.assertRaisesRegex(ValueError, "event-hash mismatch"):
+            MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_unrelated_declared_event_hash_fails_recomputation(self) -> None:
+        state, path, events = self._journal_state(["canonical_apply_started"])
+        events[0]["event_sha256"] = "b" * 64
+        state["apply"]["persistence"][  # type: ignore[index]
+            "mutation_journal_tail_event_sha256"
+        ] = "b" * 64
+        self._rewrite_journal_identity(state, path, events)
+        with self.assertRaisesRegex(ValueError, "event-hash mismatch"):
+            MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_broken_previous_event_hash_fails_chain_linkage(self) -> None:
+        state, path, events = self._journal_state(
+            ["canonical_apply_started", "canonical_apply_completed"]
+        )
+        events[1]["previous_event_sha256"] = "c" * 64
+        self._rewrite_journal_identity(state, path, events)
+        with self.assertRaisesRegex(ValueError, "event-chain linkage mismatch"):
+            MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_event_chain_tail_mismatch_is_distinct(self) -> None:
+        state, _path, _events = self._journal_state(["canonical_apply_started"])
+        state["apply"]["persistence"][  # type: ignore[index]
+            "mutation_journal_tail_event_sha256"
+        ] = "d" * 64
+        with self.assertRaisesRegex(ValueError, "event-chain tail mismatch"):
+            MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_journal_event_count_mismatch_is_distinct(self) -> None:
+        state, _path, _events = self._journal_state(["canonical_apply_started"])
+        state["apply"]["persistence"][  # type: ignore[index]
+            "mutation_journal_event_count"
+        ] = 2
+        with self.assertRaisesRegex(ValueError, "event-count mismatch"):
+            MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_successful_put_get_count_mismatch_fails_reconciliation(self) -> None:
+        state, _path, _events = self._journal_state(
+            ["put_completed", "post_put_get_verified"],
+            completed_writes=2,
+            completed_gets=2,
+        )
+        with self.assertRaisesRegex(ValueError, "successful PUT/GET count mismatch"):
+            MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_successful_deletion_count_mismatch_fails_reconciliation(self) -> None:
+        state, _path, _events = self._journal_state(
+            ["canonical_apply_started"], completed_deletions=1
+        )
+        with self.assertRaisesRegex(ValueError, "successful deletion count mismatch"):
+            MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_complete_state_write_counts_separate_node_and_coordinator(self) -> None:
+        run_state_path = self.root / "run-state.json"
+        artifacts = {
+            "node_complete_run_state_write_count": 2,
+            "coordinator_complete_run_state_write_count": 0,
+            "total_complete_run_state_write_count": 2,
+            "compact_checkpoint_count": 9,
+        }
+        run_state = {
+            "run_state_path": str(run_state_path),
+            "apply": {"persistence": dict(artifacts)},
+            "coordinator": {
+                "final_verification": {
+                    "apply_persistence_artifacts": dict(artifacts)
+                }
+            },
+        }
+        MODULE.write_run_state(run_state)
+        MODULE.write_run_state(run_state)
+        persistence = run_state["apply"]["persistence"]
+        self.assertEqual(persistence["node_complete_run_state_write_count"], 2)
+        self.assertEqual(
+            persistence["coordinator_complete_run_state_write_count"], 2
+        )
+        self.assertEqual(persistence["total_complete_run_state_write_count"], 4)
+        self.assertEqual(persistence["compact_checkpoint_count"], 9)
+        self.assertEqual(
+            run_state["coordinator"]["final_verification"]
+            ["apply_persistence_artifacts"]
+            ["total_complete_run_state_write_count"],
+            4,
+        )
 
     def test_canonical_apply_executor_streams_stderr_and_retains_stdout_json(self) -> None:
         run_state_path = self.root / "run-state.json"
@@ -4468,7 +4668,31 @@ class ApplyPersistenceTests(unittest.TestCase):
 
     def test_canonical_apply_executor_retains_final_error_after_progress(self) -> None:
         run_state_path = self.root / "run-state.json"
-        run_state = {"run_state_path": str(run_state_path), "run_root": str(self.root)}
+        run_state = {
+            "run_state_path": str(run_state_path),
+            "run_root": str(self.root),
+            "apply": {
+                "status": "failed",
+                "error": "ORIGINAL APPLY ERROR",
+                "failure_checkpoint": {
+                    "attempted": True,
+                    "succeeded": False,
+                    "error": "COMPACT CHECKPOINT ERROR",
+                    "last_successfully_written_checkpoint": {
+                        "reason": "after_deletion_verification",
+                        "timestamp_utc": "2026-08-01T00:00:00Z",
+                    },
+                },
+                "failed_operation": {
+                    "canonical_key": "history/_index_v2/failed.json",
+                    "day_utc": "2026-07-29",
+                    "publication_stage": "generic_targeted_index",
+                },
+                "last_completed_publication_level": "day_parent_verified",
+                "later_selected_days_untouched": True,
+                "untouched_later_selected_days": ["2026-07-30"],
+            },
+        }
         run_state_path.write_text(json.dumps(run_state), encoding="utf-8")
 
         class FakeProcess:
@@ -4492,6 +4716,35 @@ class ApplyPersistenceTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "failed")
         self.assertIn("FINAL NODE ERROR", result["error"])
+        self.assertEqual(result["original_apply_error"], "ORIGINAL APPLY ERROR")
+        self.assertEqual(
+            result["failure_checkpoint"]["error"], "COMPACT CHECKPOINT ERROR"
+        )
+        self.assertEqual(
+            result["failed_operation"]["canonical_key"],
+            "history/_index_v2/failed.json",
+        )
+        self.assertEqual(result["untouched_later_selected_days"], ["2026-07-30"])
+        report = MODULE.format_summary_md({
+            "env": "CIC-Test",
+            "profile": "manual",
+            "started_at_utc": "2026-08-01T00:00:00Z",
+            "status": "failed",
+            "source": "sos",
+            "dry_run": False,
+            "check_only": False,
+            "run_backfill": True,
+            "db_path": str(self.root / "state.sqlite"),
+            "log_path": str(self.root / "run.log"),
+            "repair_flow": {
+                "status": "failed",
+                "canonical_apply": result,
+                "final_verification": {"status": "blocked_dependency"},
+            }
+        })
+        self.assertIn("ORIGINAL APPLY ERROR", report)
+        self.assertIn("COMPACT CHECKPOINT ERROR", report)
+        self.assertIn("history/_index_v2/failed.json", report)
 
 
 class RepoRootTests(unittest.TestCase):

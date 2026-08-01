@@ -1,0 +1,2090 @@
+diff --git a/plans/2026-07-30 SOS historical Integrity replacement/2026-07-30_SOS_historical_Integrity_replacement_implementation_report.md b/plans/2026-07-30 SOS historical Integrity replacement/2026-07-30_SOS_historical_Integrity_replacement_implementation_report.md
+index 95372c6..c919ebf 100644
+--- a/plans/2026-07-30 SOS historical Integrity replacement/2026-07-30_SOS_historical_Integrity_replacement_implementation_report.md	
++++ b/plans/2026-07-30 SOS historical Integrity replacement/2026-07-30_SOS_historical_Integrity_replacement_implementation_report.md	
+@@ -1,5 +1,72 @@
+ # SOS historical Integrity replacement implementation report
+ 
++## 1 August 2026 bounded canonical-apply persistence correction
++
++### Real-run incident and confirmed cause
++
++The active 44-day CIC-Test SOS-light operation planned 7,244 objects. At the observed point it had GET-verified 2,665 objects, had 4,578 objects not yet started, was processing one upload, and had no failed objects. `run-state.json` had grown beyond 10 MB. The Node process was still making remote progress, but process sampling showed substantial time in `JSON.stringify` while the outer Integrity log remained unchanged.
++
++The canonical apply path rewrote the complete and growing run state around individual status transitions: upload start, PUT completion, GET-attempt bookkeeping, GET verification, semantic verification, connector publication progress, and then the same operation again from `executeOperation()`. Complete deleted-key arrays were also embedded under `tombstone_prefixes[].deleted_object_keys`. The resulting persistence work was effectively the number of transitions multiplied by the multi-megabyte proposal state.
++
++### Persistence architecture
++
++Canonical apply now separates four artifacts within the immutable run directory:
++
++```text
++run-state.json
++  complete validated proposal plus bounded initial/final apply summary writes
++
++apply-progress.json
++  compact operator-visible counters, current phase/day/key/stage,
++  index state, per-day high-level state and evidence identities
++
++apply-mutation-events.jsonl
++  single-writer append-only PUT, GET, semantic, deletion, day and index events
++
++apply-evidence/deletions/*.json
++  sorted complete deleted-key lists, one identity-pinned sidecar per prefix
++```
++
++Ordinary object transitions no longer call `atomicWriteJson(runStatePath, runState)`. The complete run state is written once after final proposal validation and once at canonical-apply success or failure. Detailed object status remains in memory for the existing final report and is serialised only at finalisation. Diagnostic evidence records compact checkpoint, complete run-state write, mutation-event, journal-flush and deletion-sidecar counts.
++
++The compact checkpoint is forced after final validation, before actual destructive deletion, after deletion verification, after each SOS-light day parent verifies, before and after affected-index publication, on failure and on successful canonical-apply completion. The Python coordinator adds compact checkpoints before and after current-state reconciliation. Optional within-scope checkpoints and logs use named 50-object or 30-second thresholds, whichever occurs first; they never serialise the complete proposal.
++
++### Durability, deletion evidence and failure ordering
++
++The JSONL writer uses one exclusive descriptor, handles short writes explicitly and calls `fsync` at dependency barriers. A child verification event must pass a journal durability barrier before its dependent parent can PUT. Deletion-start evidence includes the verified sidecar identity and is flushed before the delete. Deletion-complete and absence-verification events are flushed before replacement publication. A completed SOS-light day event and compact checkpoint must both succeed before the next selected day can be deleted. Index publication has explicit pre/post flush and checkpoint boundaries, and success closes and verifies the journal before the final compact and complete-state writes.
++
++Each deletion sidecar is compact JSON containing the sorted key array. Its absolute run-scoped path, byte length, SHA-256 and key count are retained in the tombstone and compact checkpoint; the full list is absent from the mutation journal, checkpoint and run state. Sidecar write/read-back failure occurs before `remote_attempted` and prevents any DELETE. Python final verification and SQLite operation recording now resolve the sidecar only within the current run root and verify its bytes, SHA-256, sorted uniqueness, prefix scope and count before using its keys.
++
++On failure, the journal records the current key or prefix, day, connector, publication stage, exact message and last completed day, then attempts a forced durability barrier and close. The compact failure checkpoint and final run state retain journal failure details even when the journal itself becomes unusable. SOS-light remains sequential: later not-started days are recorded and remain untouched, and affected indexes are unreachable after an incomplete day. No resume path was added.
++
++### Apply progress visibility
++
++Node emits bounded progress to stderr for canonical start/completion/failure, day deletion and verification, day publication and parent verification, bounded within-day object movement, and index start/completion. Counts include completed/planned objects and post-PUT verifications plus elapsed apply seconds. Python now drains stdout and stderr concurrently, streams stderr lines directly into the main Integrity logger, retains all output for failure diagnosis, and continues to parse the final structured result exclusively from stdout.
++
++### Files changed
++
++- `scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`: durable journal/checkpoint/sidecar implementation, bounded full-state persistence, dependency/day/index barriers and progress logging.
++- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`: streamed child output, sidecar and journal identity verification, current-state checkpoint boundaries and final-report persistence evidence.
++- `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`: focused transition, barrier, sidecar, day-boundary and bounded-log checks alongside the existing apply regressions.
++- `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`: focused artifact-verification and subprocess-streaming checks.
++- this implementation report.
++
++The two changed active implementation files already had pre-change snapshots at `archive/2026-08-01/`; no duplicate archive was created. `system_docs/`, `TODO-IMPORTANT-UKAQ.txt`, schema, R2 index payload construction, Prune Daily and AQI bypass behaviour were not changed.
++
++### Focused validation and CIC-Test acceptance
++
++- JavaScript syntax checks: passed.
++- Python syntax compilation: passed.
++- JavaScript apply-safety, compact checkpoint schema, final proposal graph, strict false-`planned_overlay`, absent-day/O3 construction, per-day failure/order, GET-once and bounded-cache checks: passed (`27` tests).
++- Python apply-artifact identity, child-output streaming and final-error retention checks: passed (`3` tests).
++- Python absent-Dropbox-day and source-plus-Dropbox assembly checks: passed (`2` tests).
++- Required JavaScript dependencies were installed from the existing local npm cache with `npm ci --offline --ignore-scripts`; no dependency was fetched from the network.
++- `git diff --check`: passed.
++
++No actual Integrity command and no R2, Dropbox operational data, Supabase, PostgreSQL, SOS, GCP, Cloudflare or other external service was accessed. No deployment, commit, push or pull request was performed.
++
++Functional timing is deliberately not claimed here. The next real CIC-Test multi-day SOS-light operation must confirm ongoing log movement, bounded checkpoint size, durable journal/sidecar identities, one post-PUT GET per changed object, day-before-next-delete ordering, indexes last, and improved apply duration/CPU behaviour relative to the 7,244-object incident.
++
+ ## 1 August 2026 proposal dependency provenance correction
+ 
+ ### Failure and root cause
+diff --git a/scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs b/scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs
+index d771fd7..3765b8c 100644
+--- a/scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs
++++ b/scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs
+@@ -8,7 +8,12 @@ import {
+   applyValidatedProposal,
+   applySosLightPerDayUnits,
+   assertPublicationDependenciesVerified,
++  createApplyPersistence,
++  createBoundedProgressReporter,
++  createInitialApplyProgressState,
+   createVerifiedGetBodyCache,
++  deleteAndVerifyPrefix,
++  enforcePublicationDependencyDurability,
+   prepareMergedDayManifest,
+   putAndVerifyObject,
+   publicationRank,
+@@ -977,10 +982,19 @@ test("SOS-light first-day upload failure leaves every later day undeleted", asyn
+     },
+     applyDayFinalization: async ({ dayUtc }) => events.push(`day-parent ${dayUtc}`),
+     publishAffectedIndexes: async () => events.push("publish indexes"),
++    appendEvent: (event) => events.push(`journal ${event.event_type}`),
++    durabilityBarrier: async (reason) => events.push(`flush ${reason}`),
++    persist: async (reason) => events.push(`checkpoint ${reason}`),
+   }), /simulated first-day upload failure/);
+   assert.deepEqual(events, [
++    "checkpoint before_day_deletion",
+     "delete 2026-07-29",
++    "flush day_deletion_verified",
++    "checkpoint after_deletion_verification",
+     "upload 2026-07-29",
++    "journal sos_light_day_failed",
++    "flush day_failure",
++    "checkpoint day_failed",
+   ]);
+   assert.equal(publicationState["2026-07-29"].deletion_verified, true);
+   assert.equal(publicationState["2026-07-29"].status, "failed");
+@@ -1022,7 +1036,7 @@ test("SOS-light completes and verifies each day before deleting the next and pub
+     "publish affected indexes",
+   ]);
+   for (const dayUtc of days) {
+-    assert.equal(publicationState[dayUtc].status, "succeeded");
++    assert.equal(publicationState[dayUtc].status, "day_parent_verified");
+     assert.equal(publicationState[dayUtc].deletion_verified, true);
+     assert.equal(publicationState[dayUtc].day_parent_verified, true);
+     assert.equal(publicationState[dayUtc].completed_publication_level, "day_parent_verified");
+@@ -1230,6 +1244,238 @@ test("changed-object apply records exactly one post-PUT verification GET", async
+   assert.equal(getCount, 1);
+ });
+ 
++test("multiple object transitions append detailed events without rewriting complete run state", async () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-apply-persistence-"));
++  const runStatePath = path.join(root, "run-state.json");
++  const originalState = '{"proposal":"large-and-immutable-during-transitions"}\n';
++  fs.writeFileSync(runStatePath, originalState);
++  const progressState = { run_id: "persistence-test", status: "running" };
++  const persistence = createApplyPersistence({
++    runStatePath,
++    runId: "persistence-test",
++    progressState,
++  });
++  let getCount = 0;
++  for (let index = 0; index < 3; index += 1) {
++    const key = `history/_index_v2/object-${index}.json`;
++    const body = Buffer.from(JSON.stringify({ index }));
++    const entry = { bytes: body.byteLength, sha256: sha256Hex(body) };
++    await putAndVerifyObject({
++      r2: {},
++      runState: { objects: { [key]: entry } },
++      object: { key, body, entry },
++      persistence,
++      adapters: {
++        putObject: async () => {},
++        getObject: async () => {
++          getCount += 1;
++          return { body, bytes: body.byteLength };
++        },
++      },
++    });
++  }
++  persistence.close();
++  const events = fs.readFileSync(persistence.journalPath, "utf8").trim().split("\n").map(JSON.parse);
++  assert.equal(getCount, 3);
++  assert.equal(events.length, 12);
++  assert.deepEqual([...new Set(events.map((event) => event.event_type))], [
++    "put_started",
++    "put_completed",
++    "post_put_get_started",
++    "post_put_get_verified",
++  ]);
++  assert.equal(fs.readFileSync(runStatePath, "utf8"), originalState);
++  assert.equal(persistence.snapshot().compact_checkpoint_count, 0);
++});
++
++test("compact checkpoint schema exposes aggregate and per-day progress without object entries", () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-progress-schema-"));
++  const counts = {
++    planned_deletions: 2,
++    completed_deletions: 0,
++    planned_writes: 100,
++    completed_writes: 0,
++    planned_post_put_verifications: 100,
++    completed_post_put_verifications: 0,
++    failed_operations: 0,
++  };
++  const { progressState, perDayStatus } = createInitialApplyProgressState({
++    runStatePath: path.join(root, "run-state.json"),
++    runId: "progress-schema-test",
++    counts,
++    selectedDays: ["2026-07-29", "2026-07-30"],
++  });
++  assert.equal(progressState.current_phase, "final_proposal_validated");
++  assert.equal(progressState.current_day_utc, null);
++  assert.equal(progressState.last_completed_day_utc, null);
++  assert.equal(progressState.planned_writes, 100);
++  assert.equal(progressState.planned_post_put_verifications, 100);
++  assert.equal(progressState.index_publication_started, false);
++  assert.equal(progressState.index_publication_completed, false);
++  assert.equal(progressState.mutation_journal_event_count, 0);
++  assert.deepEqual(Object.keys(perDayStatus), ["2026-07-29", "2026-07-30"]);
++  assert.ok(Object.values(perDayStatus).every((day) => day.status === "not_started"));
++  assert.equal(Object.hasOwn(progressState, "objects"), false);
++});
++
++test("dependent parent publication requires a successful journal durability barrier", async () => {
++  const childKey = "history/v2/observations/day_utc=2026-07-29/connector_id=1/pollutant_code=pm25/part-00000.parquet";
++  const parentKey = "history/v2/observations/day_utc=2026-07-29/connector_id=1/pollutant_code=pm25/manifest.json";
++  const runState = { objects: { [childKey]: { proposed: true, structurally_validated: true, r2_verified: true } } };
++  const object = { key: parentKey, entry: { dependencies: [childKey] } };
++  const events = ["child verification journal append"];
++  enforcePublicationDependencyDurability({
++    object,
++    runState,
++    persistence: { flush: () => events.push("journal durability barrier") },
++  });
++  events.push("parent PUT");
++  assert.deepEqual(events, [
++    "child verification journal append",
++    "journal durability barrier",
++    "parent PUT",
++  ]);
++  let parentPutCalled = false;
++  const publishParent = () => {
++    enforcePublicationDependencyDurability({
++      object,
++      runState,
++      persistence: { flush: () => { throw new Error("simulated fsync failure"); } },
++    });
++    parentPutCalled = true;
++  };
++  assert.throws(publishParent, /simulated fsync failure/);
++  assert.equal(parentPutCalled, false);
++});
++
++test("deleted keys are sorted into an identity-pinned sidecar before deletion", async () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-deletion-sidecar-"));
++  const runStatePath = path.join(root, "run-state.json");
++  fs.writeFileSync(runStatePath, "{}\n");
++  const progressState = { run_id: "deletion-test", status: "running" };
++  const persistence = createApplyPersistence({
++    runStatePath,
++    runId: "deletion-test",
++    progressState,
++  });
++  const prefix = "history/v2/observations/day_utc=2026-07-29";
++  const prefixEntry = { prefix, entry: { stage: "sos_light_complete_day" } };
++  const deletedBatches = [];
++  let listCount = 0;
++  await deleteAndVerifyPrefix({
++    r2: {},
++    prefixEntry,
++    persistence,
++    checkpoint: async () => persistence.checkpoint("before_destructive_deletion"),
++    adapters: {
++      listAllObjects: async () => {
++        listCount += 1;
++        return listCount === 1
++          ? [{ key: `${prefix}/z.json` }, { key: `${prefix}/a.json` }]
++          : [];
++      },
++      deleteObjects: async ({ keys }) => { deletedBatches.push(keys); return { errors: [] }; },
++    },
++  });
++  persistence.close();
++  assert.deepEqual(deletedBatches, [[`${prefix}/a.json`, `${prefix}/z.json`]]);
++  assert.equal(Object.hasOwn(prefixEntry.entry, "deleted_object_keys"), false);
++  assert.equal(prefixEntry.entry.deleted_object_count, 2);
++  assert.ok(/^[a-f0-9]{64}$/.test(prefixEntry.entry.deleted_keys_sha256));
++  assert.deepEqual(
++    JSON.parse(fs.readFileSync(prefixEntry.entry.deleted_keys_sidecar_path, "utf8")),
++    [`${prefix}/a.json`, `${prefix}/z.json`],
++  );
++  assert.equal(
++    fs.readFileSync(prefixEntry.entry.deleted_keys_sidecar_path).byteLength,
++    prefixEntry.entry.deleted_keys_sidecar_bytes,
++  );
++});
++
++test("deleted-key sidecar failure prevents remote deletion", async () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-deletion-sidecar-fail-"));
++  const runStatePath = path.join(root, "run-state.json");
++  fs.writeFileSync(runStatePath, "{}\n");
++  const persistence = createApplyPersistence({
++    runStatePath,
++    runId: "deletion-failure-test",
++    progressState: { run_id: "deletion-failure-test", status: "running" },
++    io: { atomicWriteBuffer: () => { throw new Error("simulated sidecar write failure"); } },
++  });
++  let deleteCalled = false;
++  await assert.rejects(deleteAndVerifyPrefix({
++    r2: {},
++    prefixEntry: {
++      prefix: "history/v2/observations/day_utc=2026-07-29",
++      entry: { stage: "sos_light_complete_day" },
++    },
++    persistence,
++    checkpoint: async () => {},
++    adapters: {
++      listAllObjects: async () => [{ key: "history/v2/observations/day_utc=2026-07-29/a.json" }],
++      deleteObjects: async () => { deleteCalled = true; },
++    },
++  }), /simulated sidecar write failure/);
++  persistence.closeAfterFailure();
++  assert.equal(deleteCalled, false);
++});
++
++test("day completion checkpoint failure prevents the next SOS-light deletion", async () => {
++  const days = ["2026-07-29", "2026-07-30"];
++  const dayGroups = new Map(days.map((dayUtc) => [dayUtc, [
++    { kind: "delete", key: `history/v2/observations/day_utc=${dayUtc}` },
++    { kind: "put", key: `history/v2/observations/day_utc=${dayUtc}/manifest.json` },
++  ]]));
++  const connectorGroups = new Map(days.map((dayUtc) => [`${dayUtc}|1`, {
++    day_utc: dayUtc,
++    connector_id: 1,
++    operations: [],
++  }]));
++  const events = [];
++  await assert.rejects(applySosLightPerDayUnits({
++    selectedDays: days,
++    dayGroups,
++    connectorGroups,
++    applyDeletion: async ({ dayUtc }) => events.push(`delete ${dayUtc}`),
++    applyConnectorGroup: async (group) => events.push(`children ${group.day_utc}`),
++    applyDayFinalization: async ({ dayUtc }) => events.push(`day-parent ${dayUtc}`),
++    publishAffectedIndexes: async () => events.push("indexes"),
++    durabilityBarrier: async (reason) => events.push(`flush ${reason}`),
++    persist: async (reason) => {
++      events.push(`checkpoint ${reason}`);
++      if (reason === "after_day_parent_verified") {
++        throw new Error("simulated day checkpoint failure");
++      }
++    },
++  }), /simulated day checkpoint failure/);
++  assert.equal(events.includes("delete 2026-07-30"), false);
++  assert.deepEqual(events.slice(0, 6), [
++    "checkpoint before_day_deletion",
++    "delete 2026-07-29",
++    "flush day_deletion_verified",
++    "checkpoint after_deletion_verification",
++    "children 2026-07-29",
++    "day-parent 2026-07-29",
++  ]);
++});
++
++test("within-day progress output is bounded while still exposing movement", () => {
++  const messages = [];
++  let now = 0;
++  const report = createBoundedProgressReporter({
++    log: (message) => messages.push(message),
++    now: () => now,
++    objectInterval: 25,
++    elapsedMs: 1_000,
++  });
++  for (let completed = 1; completed <= 100; completed += 1) {
++    now += 10;
++    report({ message: `completed=${completed}`, completedObjects: completed });
++  }
++  assert.deepEqual(messages, ["completed=25", "completed=50", "completed=75", "completed=100"]);
++  assert.ok(messages.length < 100);
++});
++
+ test("shared index builder retains its existing latest-only option for generic callers", async () => {
+   const fixture = await observationFixture();
+   const pollutant = JSON.parse(fixture.manifestBody.toString("utf8"));
+diff --git a/scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs b/scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs
+index deade94..791f364 100644
+--- a/scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs
++++ b/scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs
+@@ -65,9 +65,42 @@ function safeKey(rawKey) {
+ }
+ 
+ function atomicWriteJson(filePath, value) {
++  atomicWriteBuffer(filePath, Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8"));
++}
++
++function atomicWriteBuffer(filePath, body) {
+   const temporaryPath = `${filePath}.tmp`;
+-  fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+-  fs.renameSync(temporaryPath, filePath);
++  fs.mkdirSync(path.dirname(filePath), { recursive: true });
++  let descriptor = null;
++  try {
++    descriptor = fs.openSync(temporaryPath, "w", 0o600);
++    let offset = 0;
++    while (offset < body.byteLength) {
++      const written = fs.writeSync(descriptor, body, offset, body.byteLength - offset);
++      if (!Number.isSafeInteger(written) || written <= 0) {
++        throw new Error(`Atomic write made no progress: ${filePath}`);
++      }
++      offset += written;
++    }
++    fs.fsyncSync(descriptor);
++    fs.closeSync(descriptor);
++    descriptor = null;
++    fs.renameSync(temporaryPath, filePath);
++    const directoryDescriptor = fs.openSync(path.dirname(filePath), "r");
++    try {
++      fs.fsyncSync(directoryDescriptor);
++    } finally {
++      fs.closeSync(directoryDescriptor);
++    }
++  } catch (error) {
++    if (descriptor !== null) fs.closeSync(descriptor);
++    try {
++      fs.unlinkSync(temporaryPath);
++    } catch (cleanupError) {
++      if (cleanupError?.code !== "ENOENT") throw cleanupError;
++    }
++    throw error;
++  }
+ }
+ 
+ function contentTypeForKey(key) {
+@@ -97,6 +130,298 @@ export function publicationRank(key) {
+   return 110;
+ }
+ 
++export const APPLY_PROGRESS_CHECKPOINT_OBJECT_INTERVAL = 50;
++export const APPLY_PROGRESS_CHECKPOINT_ELAPSED_MS = 30_000;
++export const APPLY_PROGRESS_LOG_OBJECT_INTERVAL = 50;
++export const APPLY_PROGRESS_LOG_ELAPSED_MS = 30_000;
++
++export function createInitialApplyProgressState({ runStatePath, runId, counts, selectedDays }) {
++  const perDayStatus = Object.fromEntries(selectedDays.map((dayUtc) => [dayUtc, {
++    day_utc: dayUtc,
++    status: "not_started",
++    completed_publication_level: "none",
++    deletion_verified: false,
++    day_parent_verified: false,
++  }]));
++  return {
++    perDayStatus,
++    progressState: {
++      schema_version: 1,
++      run_id: runId,
++      status: "running",
++      current_phase: "final_proposal_validated",
++      current_day_utc: null,
++      last_completed_day_utc: null,
++      ...counts,
++      current_object_key: null,
++      current_deletion_prefix: null,
++      current_publication_stage: "final_proposal_validation",
++      index_publication_started: false,
++      index_publication_completed: false,
++      last_checkpoint_at_utc: null,
++      mutation_journal_path: path.join(
++        path.dirname(path.resolve(runStatePath)),
++        "apply-mutation-events.jsonl",
++      ),
++      mutation_journal_event_count: 0,
++      per_day_high_level_publication_status: perDayStatus,
++      deletions: [],
++    },
++  };
++}
++
++function mutationContext(keyOrPrefix, stage = null) {
++  const value = String(keyOrPrefix || "");
++  const dayMatch = value.match(/day_utc=(\d{4}-\d{2}-\d{2})/);
++  const connectorMatch = value.match(/connector_id=([1-9]\d*)/);
++  return {
++    day_utc: dayMatch ? dayMatch[1] : null,
++    connector_id: connectorMatch ? Number(connectorMatch[1]) : null,
++    publication_stage: stage || null,
++  };
++}
++
++function objectPublicationStage(object) {
++  const configured = String(object?.entry?.stage || "").trim();
++  if (configured) return configured;
++  const rank = publicationRank(object?.key);
++  if (rank <= 10) return "observation_parquet";
++  if (rank <= 20) return "observation_pollutant_manifest";
++  if (rank <= 30) return "observation_connector_manifest";
++  if (rank <= 40) return "observation_index";
++  if (rank <= 50) return "aqi_parquet";
++  if (rank <= 70) return "aqi_manifest";
++  if (rank <= 100) return "day_parent";
++  return "global_index";
++}
++
++export function createApplyPersistence({
++  runStatePath,
++  runId,
++  progressState,
++  io = {},
++}) {
++  if (!String(runId ?? "").trim()) throw new Error("Apply persistence requires run_id");
++  const runRoot = path.dirname(path.resolve(runStatePath));
++  const progressPath = path.join(runRoot, "apply-progress.json");
++  const journalPath = path.join(runRoot, "apply-mutation-events.jsonl");
++  const deletionDirectory = path.join(runRoot, "apply-evidence", "deletions");
++  const openSync = io.openSync || fs.openSync;
++  const writeSync = io.writeSync || fs.writeSync;
++  const fsyncSync = io.fsyncSync || fs.fsyncSync;
++  const closeSync = io.closeSync || fs.closeSync;
++  const atomicJson = io.atomicWriteJson || atomicWriteJson;
++  const atomicBuffer = io.atomicWriteBuffer || atomicWriteBuffer;
++  const readFileSync = io.readFileSync || fs.readFileSync;
++  fs.mkdirSync(deletionDirectory, { recursive: true });
++  const descriptor = openSync(journalPath, "wx", 0o600);
++  let journalDescriptor = descriptor;
++  let eventCount = 0;
++  let durableEventCount = 0;
++  let journalBytes = 0;
++  let durableJournalBytes = 0;
++  let tailEventSha256 = null;
++  let durableTailEventSha256 = null;
++  let flushCount = 0;
++  let checkpointCount = 0;
++  let sidecarCount = 0;
++  let journalFailure = null;
++  let finalJournalSha256 = null;
++  const sidecars = [];
++
++  const snapshot = () => ({
++    compact_checkpoint_count: checkpointCount,
++    complete_run_state_write_count: 0,
++    mutation_journal_event_count: eventCount,
++    mutation_journal_flush_count: flushCount,
++    deleted_key_sidecar_count: sidecarCount,
++    mutation_journal_path: journalPath,
++    mutation_journal_bytes: journalBytes,
++    mutation_journal_sha256: finalJournalSha256,
++    mutation_journal_tail_event_sha256: tailEventSha256,
++    mutation_journal_durable_event_count: durableEventCount,
++    mutation_journal_durable_bytes: durableJournalBytes,
++    mutation_journal_durable_tail_event_sha256: durableTailEventSha256,
++    mutation_journal_failure: journalFailure,
++    apply_progress_path: progressPath,
++    deletion_sidecars: sidecars.map((entry) => ({ ...entry })),
++  });
++
++  const appendEvent = (event) => {
++    if (journalDescriptor === null) throw new Error("Mutation journal is closed");
++    if (journalFailure) throw new Error(`Mutation journal is unusable: ${journalFailure}`);
++    const baseEvent = {
++      run_id: runId,
++      event_type: String(event?.event_type || ""),
++      timestamp_utc: new Date().toISOString(),
++      ...event,
++      previous_event_sha256: tailEventSha256,
++    };
++    if (!baseEvent.event_type) throw new Error("Mutation journal event_type is required");
++    const identityBody = Buffer.from(JSON.stringify(baseEvent), "utf8");
++    const eventSha256 = sha256Hex(identityBody);
++    const line = Buffer.from(`${JSON.stringify({ ...baseEvent, event_sha256: eventSha256 })}\n`, "utf8");
++    try {
++      let offset = 0;
++      while (offset < line.byteLength) {
++        const written = writeSync(journalDescriptor, line, offset, line.byteLength - offset);
++        if (!Number.isSafeInteger(written) || written <= 0) {
++          throw new Error("Mutation journal append made no progress");
++        }
++        offset += written;
++      }
++    } catch (error) {
++      journalFailure = error instanceof Error ? error.message : String(error);
++      throw new Error(`Mutation journal append failed: ${journalFailure}`, { cause: error });
++    }
++    eventCount += 1;
++    journalBytes += line.byteLength;
++    tailEventSha256 = eventSha256;
++    return { event_count: eventCount, event_sha256: eventSha256 };
++  };
++
++  const flush = () => {
++    if (journalDescriptor === null) throw new Error("Mutation journal is closed");
++    if (journalFailure) throw new Error(`Mutation journal is unusable: ${journalFailure}`);
++    try {
++      fsyncSync(journalDescriptor);
++    } catch (error) {
++      journalFailure = error instanceof Error ? error.message : String(error);
++      throw new Error(`Mutation journal durability barrier failed: ${journalFailure}`, { cause: error });
++    }
++    flushCount += 1;
++    durableEventCount = eventCount;
++    durableJournalBytes = journalBytes;
++    durableTailEventSha256 = tailEventSha256;
++    return snapshot();
++  };
++
++  const checkpoint = (reason) => {
++    const nextCheckpointCount = checkpointCount + 1;
++    progressState.last_checkpoint_at_utc = new Date().toISOString();
++    progressState.last_checkpoint_reason = String(reason || "progress");
++    Object.assign(progressState, {
++      mutation_journal_path: journalPath,
++      mutation_journal_event_count: eventCount,
++      mutation_journal_bytes: journalBytes,
++      mutation_journal_sha256: finalJournalSha256,
++      mutation_journal_tail_event_sha256: tailEventSha256,
++      mutation_journal_durable_event_count: durableEventCount,
++      mutation_journal_durable_bytes: durableJournalBytes,
++      mutation_journal_durable_tail_event_sha256: durableTailEventSha256,
++      compact_checkpoint_count: nextCheckpointCount,
++      mutation_journal_flush_count: flushCount,
++      deleted_key_sidecar_count: sidecarCount,
++      deletion_sidecars: sidecars.map((entry) => ({ ...entry })),
++    });
++    atomicJson(progressPath, progressState);
++    checkpointCount = nextCheckpointCount;
++    return progressState;
++  };
++
++  const writeDeletedKeysSidecar = ({ prefix, keys }) => {
++    const sortedKeys = [...keys].map(safeKey).sort();
++    const prefixHash = sha256Hex(Buffer.from(String(prefix), "utf8")).slice(0, 16);
++    const day = mutationContext(prefix).day_utc || "no-day";
++    const sidecarPath = path.join(deletionDirectory, `${day}-${prefixHash}.json`);
++    const body = Buffer.from(`${JSON.stringify(sortedKeys)}\n`, "utf8");
++    atomicBuffer(sidecarPath, body);
++    const persisted = readFileSync(sidecarPath);
++    const identity = {
++      prefix: String(prefix).replace(/\/+$/, ""),
++      deleted_object_count: sortedKeys.length,
++      deleted_keys_sha256: sha256Hex(body),
++      deleted_keys_sidecar_path: sidecarPath,
++      deleted_keys_sidecar_bytes: body.byteLength,
++    };
++    if (persisted.byteLength !== identity.deleted_keys_sidecar_bytes
++      || sha256Hex(persisted) !== identity.deleted_keys_sha256) {
++      throw new Error(`Deleted-key sidecar verification failed: ${prefix}`);
++    }
++    sidecars.push(identity);
++    sidecarCount += 1;
++    return identity;
++  };
++
++  const close = () => {
++    if (journalDescriptor === null) return snapshot();
++    flush();
++    const descriptorToClose = journalDescriptor;
++    journalDescriptor = null;
++    try {
++      closeSync(descriptorToClose);
++    } catch (error) {
++      journalFailure = error instanceof Error ? error.message : String(error);
++      throw new Error(`Mutation journal close failed: ${journalFailure}`, { cause: error });
++    }
++    const journalBody = readFileSync(journalPath);
++    if (journalBody.byteLength !== journalBytes) {
++      throw new Error(`Mutation journal byte-length verification failed: ${journalPath}`);
++    }
++    finalJournalSha256 = sha256Hex(journalBody);
++    return snapshot();
++  };
++
++  const closeAfterFailure = () => {
++    if (journalDescriptor !== null) {
++      if (!journalFailure) {
++        try {
++          flush();
++        } catch {
++          // Continue to close and retain whatever journal bytes reached disk.
++        }
++      }
++      const descriptorToClose = journalDescriptor;
++      journalDescriptor = null;
++      try {
++        closeSync(descriptorToClose);
++      } catch (error) {
++        journalFailure ||= error instanceof Error ? error.message : String(error);
++      }
++    }
++    try {
++      const journalBody = readFileSync(journalPath);
++      finalJournalSha256 = sha256Hex(journalBody);
++      journalBytes = journalBody.byteLength;
++    } catch (error) {
++      journalFailure ||= error instanceof Error ? error.message : String(error);
++    }
++    return snapshot();
++  };
++
++  return {
++    progressPath,
++    journalPath,
++    appendEvent,
++    flush,
++    checkpoint,
++    writeDeletedKeysSidecar,
++    close,
++    closeAfterFailure,
++    snapshot,
++  };
++}
++
++export function createBoundedProgressReporter({
++  log,
++  now = () => Date.now(),
++  objectInterval = APPLY_PROGRESS_LOG_OBJECT_INTERVAL,
++  elapsedMs = APPLY_PROGRESS_LOG_ELAPSED_MS,
++} = {}) {
++  let lastLoggedCompleted = 0;
++  let lastLoggedAt = now();
++  return ({ message, completedObjects = 0, force = false }) => {
++    const currentTime = now();
++    if (!force
++      && completedObjects - lastLoggedCompleted < objectInterval
++      && currentTime - lastLoggedAt < elapsedMs) return false;
++    (log || ((line) => process.stderr.write(`[canonical-apply] ${line}\n`)))(message);
++    lastLoggedCompleted = completedObjects;
++    lastLoggedAt = currentTime;
++    return true;
++  };
++}
++
+ export const VERIFIED_GET_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+ export const VERIFIED_GET_CACHE_MAX_ENTRIES = 32;
+ 
+@@ -446,15 +771,44 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
+   };
+ }
+ 
+-async function deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry, adapters, verifiedBodyCache = null }) {
++export async function deleteAndVerifyPrefix({
++  r2,
++  prefixEntry,
++  adapters,
++  persistence,
++  checkpoint,
++  verifiedBodyCache = null,
++}) {
+   const prefix = `${prefixEntry.prefix}/`;
++  const context = mutationContext(prefixEntry.prefix, prefixEntry.entry?.stage || "prefix_deletion");
+   verifiedBodyCache?.invalidatePrefix(prefixEntry.prefix, "delete_prefix");
+-  prefixEntry.entry.remote_attempted = true;
+-  prefixEntry.entry.status = "deleting";
+-  atomicWriteJson(runStatePath, runState);
+   try {
+     const entries = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
+     const keys = entries.map((entry) => safeKey(entry.key)).filter((key) => key.startsWith(prefix)).sort();
++    const sidecar = persistence.writeDeletedKeysSidecar({ prefix: prefixEntry.prefix, keys });
++    delete prefixEntry.entry.deleted_object_keys;
++    const startedAt = new Date().toISOString();
++    Object.assign(prefixEntry.entry, {
++      ...sidecar,
++      remote_attempted: false,
++      deletion_started_at_utc: startedAt,
++      deletion_completed_at_utc: null,
++      deletion_verified: false,
++      status: "deletion_prepared",
++    });
++    persistence.appendEvent({
++      event_type: "deletion_started",
++      prefix: prefixEntry.prefix,
++      ...context,
++      bytes: sidecar.deleted_keys_sidecar_bytes,
++      sha256: sidecar.deleted_keys_sha256,
++      status: "started",
++      ...sidecar,
++    });
++    persistence.flush();
++    await checkpoint("before_destructive_deletion");
++    prefixEntry.entry.remote_attempted = true;
++    prefixEntry.entry.status = "deleting";
+     for (let index = 0; index < keys.length; index += 1000) {
+       const batch = keys.slice(index, index + 1000);
+       const result = await adapters.deleteObjects({ r2, keys: batch });
+@@ -462,44 +816,115 @@ async function deleteAndVerifyPrefix({ r2, runState, runStatePath, prefixEntry,
+         throw new Error(`R2 prefix delete returned errors for ${prefixEntry.prefix}: ${JSON.stringify(result.errors)}`);
+       }
+     }
++    const completedAt = new Date().toISOString();
++    prefixEntry.entry.deletion_completed_at_utc = completedAt;
++    persistence.appendEvent({
++      event_type: "deletion_completed",
++      prefix: prefixEntry.prefix,
++      ...context,
++      bytes: prefixEntry.entry.deleted_keys_sidecar_bytes,
++      sha256: prefixEntry.entry.deleted_keys_sha256,
++      status: "completed",
++      deleted_object_count: keys.length,
++      deleted_keys_sidecar_path: prefixEntry.entry.deleted_keys_sidecar_path,
++    });
+     const remaining = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
+     if (remaining.length) throw new Error(`R2 prefix deletion verification failed: ${prefixEntry.prefix}`);
+     Object.assign(prefixEntry.entry, {
+       deleted: true,
+       deletion_verified: true,
+       remote_completed: true,
+-      completed_at_utc: new Date().toISOString(),
++      completed_at_utc: completedAt,
+       deleted_object_count: keys.length,
+-      deleted_object_keys: keys,
+       status: "deletion_verified",
+     });
+-    atomicWriteJson(runStatePath, runState);
++    persistence.appendEvent({
++      event_type: "deletion_verified",
++      prefix: prefixEntry.prefix,
++      ...context,
++      bytes: prefixEntry.entry.deleted_keys_sidecar_bytes,
++      sha256: prefixEntry.entry.deleted_keys_sha256,
++      status: "verified",
++      deleted_object_count: keys.length,
++      deleted_keys_sidecar_path: prefixEntry.entry.deleted_keys_sidecar_path,
++      remaining_object_count: 0,
++    });
++    persistence.flush();
+     return keys.length;
+   } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
+     Object.assign(prefixEntry.entry, {
+       status: "failed",
+-      error: error instanceof Error ? error.message : String(error),
++      error: message,
+     });
+-    atomicWriteJson(runStatePath, runState);
++    try {
++      persistence.appendEvent({
++        event_type: "deletion_failed",
++        prefix: prefixEntry.prefix,
++        ...context,
++        bytes: prefixEntry.entry.deleted_keys_sidecar_bytes ?? null,
++        sha256: prefixEntry.entry.deleted_keys_sha256 ?? null,
++        status: "failed",
++        failure_message: message,
++        deleted_object_count: prefixEntry.entry.deleted_object_count ?? null,
++        deleted_keys_sidecar_path: prefixEntry.entry.deleted_keys_sidecar_path ?? null,
++      });
++      persistence.flush();
++    } catch {
++      // The outer failure checkpoint records an unusable journal explicitly.
++    }
+     throw error;
+   }
+ }
+ 
+-export async function putAndVerifyObject({ r2, runState, runStatePath, object, adapters, verifiedBodyCache = null }) {
++export async function putAndVerifyObject({
++  r2,
++  runState,
++  object,
++  adapters,
++  persistence = null,
++  verifiedBodyCache = null,
++}) {
+   const entry = object.entry;
++  const context = mutationContext(object.key, objectPublicationStage(object));
+   if (Number(entry.post_put_verification_get_attempt_count || 0) !== 0
+     || Number(entry.post_put_verification_get_count || 0) !== 0) {
+     throw new Error(`Changed object already has post-PUT GET bookkeeping: ${object.key}`);
+   }
+   verifiedBodyCache?.invalidateKey(object.key, "later_put_same_key");
+   Object.assign(entry, { remote_attempted: true, status: "uploading" });
+-  atomicWriteJson(runStatePath, runState);
++  persistence?.appendEvent({
++    event_type: "put_started",
++    canonical_key: object.key,
++    ...context,
++    bytes: object.body.byteLength,
++    sha256: entry.sha256,
++    status: "started",
++    post_put_verification_count: 0,
++  });
+   try {
+     await adapters.putObject({ r2, key: object.key, body: object.body, content_type: contentTypeForKey(object.key) });
+     Object.assign(entry, { uploaded: true, uploaded_at_utc: new Date().toISOString(), status: "uploaded" });
+-    atomicWriteJson(runStatePath, runState);
++    persistence?.appendEvent({
++      event_type: "put_completed",
++      canonical_key: object.key,
++      ...context,
++      bytes: object.body.byteLength,
++      sha256: entry.sha256,
++      status: "completed",
++      post_put_verification_count: 0,
++    });
+     entry.post_put_verification_get_attempt_count = 1;
+-    atomicWriteJson(runStatePath, runState);
++    persistence?.appendEvent({
++      event_type: "post_put_get_started",
++      canonical_key: object.key,
++      ...context,
++      bytes: object.body.byteLength,
++      sha256: entry.sha256,
++      status: "started",
++      post_put_verification_count: 0,
++      post_put_verification_attempt_count: 1,
++    });
+     const fresh = await adapters.getObject({ r2, key: object.key });
+     if (Number(fresh.bytes) !== object.body.byteLength || sha256Hex(fresh.body) !== entry.sha256) {
+       throw new Error(`R2 GET verification identity mismatch: ${object.key}`);
+@@ -524,13 +949,39 @@ export async function putAndVerifyObject({ r2, runState, runStatePath, object, a
+         verified_get_cache_sha256: cached ? entry.sha256 : null,
+       });
+     }
+-    atomicWriteJson(runStatePath, runState);
++    persistence?.appendEvent({
++      event_type: "post_put_get_verified",
++      canonical_key: object.key,
++      ...context,
++      bytes: object.body.byteLength,
++      sha256: entry.sha256,
++      status: "verified",
++      post_put_verification_count: 1,
++      post_put_verification_attempt_count: 1,
++    });
+   } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
+     Object.assign(entry, {
+       status: "failed",
+-      error: error instanceof Error ? error.message : String(error),
++      error: message,
+     });
+-    atomicWriteJson(runStatePath, runState);
++    try {
++      persistence?.appendEvent({
++        event_type: "put_or_verification_failed",
++        canonical_key: object.key,
++        ...context,
++        bytes: object.body.byteLength,
++        sha256: entry.sha256,
++        status: "failed",
++        failure_message: message,
++        put_completed: entry.uploaded === true,
++        post_put_verification_count: Number(entry.post_put_verification_get_count || 0),
++        post_put_verification_attempt_count: Number(entry.post_put_verification_get_attempt_count || 0),
++      });
++      persistence?.flush();
++    } catch {
++      // The outer failure checkpoint records an unusable journal explicitly.
++    }
+     throw error;
+   }
+ }
+@@ -1240,9 +1691,9 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
+ export async function verifyLiveObservationPartition({
+   r2,
+   runState,
+-  runStatePath,
+   object,
+   adapters,
++  persistence = null,
+   verifiedBodyCache = null,
+ }) {
+   const match = object.key.match(CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN);
+@@ -1325,10 +1776,20 @@ export async function verifyLiveObservationPartition({
+     live_observation_source_evidence_hash: source.metadata.observation_content_hash,
+     live_observation_content_verified_against_source: liveSourceDifferences.length === 0,
+   });
+-  atomicWriteJson(runStatePath, runState);
+   if (liveSourceDifferences.length) {
+     object.entry.live_observation_failure_classification = "live_observation_content_mismatch";
+-    atomicWriteJson(runStatePath, runState);
++    persistence?.appendEvent({
++      event_type: "semantic_verification_failed",
++      canonical_key: object.key,
++      ...mutationContext(object.key, "observation_semantic_verification"),
++      bytes: object.body.byteLength,
++      sha256: object.entry.sha256,
++      status: "failed",
++      failure_message: `immutable_source_mismatch:${liveSourceDifferences.join(",")}`,
++      live_observation_content_hash: liveMetadata.observation_content_hash,
++      immutable_source_content_hash: source.metadata.observation_content_hash,
++    });
++    persistence?.flush();
+     throw new Error(
+       `Live repaired observation content does not match immutable source evidence: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${liveSourceDifferences.join(",")}`,
+     );
+@@ -1345,7 +1806,18 @@ export async function verifyLiveObservationPartition({
+       live_observation_failure_classification: "proposal_manifest_defect",
+       proposal_manifest_differing_fields: [...new Set(manifestDifferences)],
+     });
+-    atomicWriteJson(runStatePath, runState);
++    persistence?.appendEvent({
++      event_type: "semantic_verification_failed",
++      canonical_key: object.key,
++      ...mutationContext(object.key, "observation_semantic_verification"),
++      bytes: object.body.byteLength,
++      sha256: object.entry.sha256,
++      status: "failed",
++      failure_message: `proposal_manifest_mismatch:${[...new Set(manifestDifferences)].join(",")}`,
++      live_observation_content_hash: liveMetadata.observation_content_hash,
++      immutable_source_content_hash: source.metadata.observation_content_hash,
++    });
++    persistence?.flush();
+     throw new Error(
+       `Proposed observation manifest does not match verified live source content: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${[...new Set(manifestDifferences)].join(",")}`,
+     );
+@@ -1359,7 +1831,18 @@ export async function verifyLiveObservationPartition({
+   for (const key of partKeys) {
+     verifiedBodyCache?.invalidateKey(key, "semantic_verification_complete");
+   }
+-  atomicWriteJson(runStatePath, runState);
++  persistence?.appendEvent({
++    event_type: "semantic_verification_completed",
++    canonical_key: object.key,
++    ...mutationContext(object.key, "observation_semantic_verification"),
++    bytes: object.body.byteLength,
++    sha256: object.entry.sha256,
++    status: "verified",
++    live_observation_content_hash: liveMetadata.observation_content_hash,
++    immutable_source_content_hash: source.metadata.observation_content_hash,
++    proposed_manifest_matches_live_observation: true,
++    body_sources: bodySources,
++  });
+ }
+ 
+ export async function prepareMergedDayManifest({ r2, object, adapters, exactProposedConnectorSet = false }) {
+@@ -1464,6 +1947,11 @@ export function assertPublicationDependenciesVerified({ object, runState }) {
+   }
+ }
+ 
++export function enforcePublicationDependencyDurability({ object, runState, persistence }) {
++  assertPublicationDependenciesVerified({ object, runState });
++  if ((object?.entry?.dependencies || []).length > 0) persistence.flush();
++}
++
+ export async function applySosLightPerDayUnits({
+   selectedDays,
+   dayGroups,
+@@ -1474,6 +1962,9 @@ export async function applySosLightPerDayUnits({
+   publishAffectedIndexes,
+   publicationState = {},
+   persist = async () => {},
++  durabilityBarrier = async () => {},
++  appendEvent = () => {},
++  reportProgress = () => {},
+ }) {
+   const units = [...selectedDays].sort().map((dayUtc) => {
+     const dayOperations = dayGroups.get(dayUtc) || [];
+@@ -1502,44 +1993,73 @@ export async function applySosLightPerDayUnits({
+     };
+   });
+ 
+-  for (const { dayUtc, deletionOperation, parentOperations, dayConnectorGroups } of units) {
++  for (let dayIndex = 0; dayIndex < units.length; dayIndex += 1) {
++    const { dayUtc, deletionOperation, parentOperations, dayConnectorGroups } = units[dayIndex];
+     const state = publicationState[dayUtc] = {
+       day_utc: dayUtc,
+-      status: "running",
++      status: "not_started",
+       completed_publication_level: "none",
+       deletion_verified: false,
+       connector_group_count: dayConnectorGroups.length,
+       completed_connector_group_count: 0,
+       day_parent_verified: false,
+     };
+-    await persist();
+     try {
+-      state.status = "deleting_complete_day";
+-      await persist();
++      state.status = "deleting";
++      reportProgress(`day deletion started day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
++      await persist("before_day_deletion");
+       await applyDeletion({ dayUtc, operation: deletionOperation });
+       state.deletion_verified = true;
+       state.completed_publication_level = "complete_day_deletion_verified";
+-      state.status = "publishing_connectors";
+-      await persist();
++      state.status = "deletion_verified";
++      await durabilityBarrier("day_deletion_verified");
++      await persist("after_deletion_verification");
++      reportProgress(`day deletion verified day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
++      state.status = "publishing_children";
++      reportProgress(`day publication started day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
+       for (const group of dayConnectorGroups) {
+         await applyConnectorGroup(group);
+         state.completed_connector_group_count += 1;
+         state.completed_publication_level = "connector_parents_verified";
+-        await persist();
++        state.status = "publishing_connector_parents";
+       }
+       state.status = "publishing_day_parent";
+-      await persist();
+       await applyDayFinalization({ dayUtc, operations: parentOperations });
+       state.day_parent_verified = true;
+       state.completed_publication_level = "day_parent_verified";
+-      state.status = "succeeded";
++      state.status = "day_parent_verified";
+       state.completed_at_utc = new Date().toISOString();
+-      await persist();
++      appendEvent({
++        event_type: "sos_light_day_completed",
++        day_utc: dayUtc,
++        connector_id: 1,
++        publication_stage: "day_parent",
++        status: "verified",
++        completed_publication_level: "day_parent_verified",
++      });
++      await durabilityBarrier("day_parent_verified");
++      await persist("after_day_parent_verified");
++      reportProgress(`day parent verified day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
++      reportProgress(`day completed day=${dayUtc} day_progress=${dayIndex + 1}/${units.length}`);
+     } catch (error) {
+       state.status = "failed";
+       state.error = error instanceof Error ? error.message : String(error);
+       state.failed_at_utc = new Date().toISOString();
+-      await persist();
++      try {
++        appendEvent({
++          event_type: "sos_light_day_failed",
++          day_utc: dayUtc,
++          connector_id: 1,
++          publication_stage: state.completed_publication_level,
++          status: "failed",
++          failure_message: state.error,
++          completed_publication_level: state.completed_publication_level,
++        });
++        await durabilityBarrier("day_failure");
++        await persist("day_failed");
++      } catch {
++        // The canonical outer failure handler records the checkpoint failure.
++      }
+       throw error;
+     }
+   }
+@@ -1559,8 +2079,48 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
+     runState,
+     proposal,
+   });
+-  await validateFinalProposalGraph({ runState, proposal, runStatePath });
+-  const counts = { planned_deletions: proposal.prefixes.length, planned_writes: proposal.objects.length, deleted_objects: 0, completed_deletions: 0, completed_writes: 0, get_verified_writes: 0 };
++  try {
++    await validateFinalProposalGraph({ runState, proposal });
++  } catch (error) {
++    runState.apply = {
++      status: "failed",
++      current_phase: "final_proposal_validation",
++      error: error instanceof Error ? error.message : String(error),
++      finished_at_utc: new Date().toISOString(),
++      persistence: {
++        compact_checkpoint_count: 0,
++        complete_run_state_write_count: 1,
++        mutation_journal_event_count: 0,
++        mutation_journal_flush_count: 0,
++        deleted_key_sidecar_count: 0,
++      },
++    };
++    atomicWriteJson(runStatePath, runState);
++    throw error;
++  }
++  const counts = {
++    planned_deletions: proposal.prefixes.length,
++    planned_writes: proposal.objects.length,
++    planned_post_put_verifications: proposal.objects.length,
++    deleted_objects: 0,
++    completed_deletions: 0,
++    completed_writes: 0,
++    get_verified_writes: 0,
++    completed_post_put_verifications: 0,
++    failed_operations: 0,
++  };
++  const selectedDays = dedicatedSosProposal.dedicated
++    ? dedicatedSosProposal.selected_days
++    : [...new Set([
++      ...proposal.prefixes.map((entry) => mutationContext(entry.prefix).day_utc),
++      ...proposal.objects.map((entry) => mutationContext(entry.key).day_utc),
++    ].filter(Boolean))].sort();
++  const { progressState, perDayStatus } = createInitialApplyProgressState({
++    runStatePath,
++    runId: runState.run_id,
++    counts,
++    selectedDays,
++  });
+   runState.apply = {
+     status: "running",
+     started_at_utc: new Date().toISOString(),
+@@ -1570,8 +2130,121 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
+     ...counts,
+   };
+   runState.writer_locks = [];
+-  atomicWriteJson(runStatePath, runState);
++  let persistence;
+   try {
++    persistence = createApplyPersistence({
++      runStatePath,
++      runId: runState.run_id,
++      progressState,
++      io: adapters.persistenceIo || {},
++    });
++  } catch (error) {
++    runState.apply = {
++      ...runState.apply,
++      status: "failed",
++      current_phase: "apply_persistence_initialization",
++      error: error instanceof Error ? error.message : String(error),
++      finished_at_utc: new Date().toISOString(),
++      persistence: {
++        compact_checkpoint_count: 0,
++        complete_run_state_write_count: 1,
++        mutation_journal_event_count: 0,
++        mutation_journal_flush_count: 0,
++        deleted_key_sidecar_count: 0,
++        mutation_journal_failure: error instanceof Error ? error.message : String(error),
++      },
++    };
++    atomicWriteJson(runStatePath, runState);
++    throw error;
++  }
++  let completeRunStateWriteCount = 0;
++  const syncProgress = () => {
++    Object.assign(progressState, counts);
++    const completedDays = selectedDays.filter((dayUtc) =>
++      perDayStatus[dayUtc]?.status === "day_parent_verified");
++    progressState.last_completed_day_utc = completedDays.at(-1) || null;
++    const activeDay = selectedDays.find((dayUtc) =>
++      !["not_started", "day_parent_verified"].includes(perDayStatus[dayUtc]?.status));
++    if (activeDay && progressState.status === "running") {
++      progressState.current_day_utc = activeDay;
++      progressState.current_phase = perDayStatus[activeDay].status;
++    }
++    progressState.deletions = proposal.prefixes.map(({ entry, prefix }) => ({
++      prefix,
++      deleted_object_count: Number(entry.deleted_object_count || 0),
++      deleted_keys_sha256: entry.deleted_keys_sha256 || null,
++      deleted_keys_sidecar_path: entry.deleted_keys_sidecar_path || null,
++      deleted_keys_sidecar_bytes: Number(entry.deleted_keys_sidecar_bytes || 0),
++      deletion_started_at_utc: entry.deletion_started_at_utc || null,
++      deletion_completed_at_utc: entry.deletion_completed_at_utc || null,
++      deletion_verified: entry.deletion_verified === true,
++      status: entry.status || "planned",
++    }));
++  };
++  const syncPersistenceDiagnostics = () => {
++    runState.apply.persistence = {
++      ...persistence.snapshot(),
++      complete_run_state_write_count: completeRunStateWriteCount,
++    };
++    runState.apply_progress = {
++      path: persistence.progressPath,
++      status: progressState.status,
++      current_phase: progressState.current_phase,
++      last_completed_day_utc: progressState.last_completed_day_utc,
++    };
++  };
++  const writeCompleteRunState = () => {
++    const nextWriteCount = completeRunStateWriteCount + 1;
++    syncPersistenceDiagnostics();
++    runState.apply.persistence.complete_run_state_write_count = nextWriteCount;
++    atomicWriteJson(runStatePath, runState);
++    completeRunStateWriteCount = nextWriteCount;
++  };
++  const checkpoint = async (reason) => {
++    syncProgress();
++    persistence.checkpoint(reason);
++    syncPersistenceDiagnostics();
++  };
++  const startedAtMs = Date.now();
++  const report = createBoundedProgressReporter({ log: adapters.progressLog });
++  const elapsedSeconds = () => Math.max(0, Math.round((Date.now() - startedAtMs) / 1000));
++  const progressMessage = (label) => `${label} completed_objects=${counts.completed_writes}/${counts.planned_writes} `
++    + `completed_verifications=${counts.completed_post_put_verifications}/${counts.planned_post_put_verifications} `
++    + `elapsed_seconds=${elapsedSeconds()}`;
++  let lastOptionalCheckpointAt = Date.now();
++  let lastOptionalCheckpointWrites = 0;
++  const maybeCheckpointAndLog = async () => {
++    const now = Date.now();
++    const objectThresholdReached = counts.completed_writes - lastOptionalCheckpointWrites
++      >= APPLY_PROGRESS_CHECKPOINT_OBJECT_INTERVAL;
++    const timeThresholdReached = now - lastOptionalCheckpointAt
++      >= APPLY_PROGRESS_CHECKPOINT_ELAPSED_MS;
++    if (objectThresholdReached || timeThresholdReached) {
++      await checkpoint("bounded_within_scope_progress");
++      lastOptionalCheckpointAt = now;
++      lastOptionalCheckpointWrites = counts.completed_writes;
++    }
++    const progressLabel = progressState.current_phase === "publishing_affected_indexes"
++      ? "bounded index progress"
++      : "within-day object progress";
++    report({
++      message: progressMessage(progressLabel),
++      completedObjects: counts.completed_writes,
++    });
++  };
++  try {
++    writeCompleteRunState();
++    persistence.appendEvent({
++      event_type: "canonical_apply_started",
++      publication_stage: "final_proposal_validated",
++      status: "started",
++      planned_deletions: counts.planned_deletions,
++      planned_writes: counts.planned_writes,
++      planned_post_put_verifications: counts.planned_post_put_verifications,
++    });
++    persistence.flush();
++    await checkpoint("final_proposal_validated_before_first_mutation");
++    report({ message: progressMessage("canonical apply started"), completedObjects: 0, force: true });
+     const historyWriterClient = adapters.historyWriterClient;
+     if (!historyWriterClient) throw new Error("canonical apply requires one retained PostgreSQL history-writer session");
+     const operations = [];
+@@ -1608,40 +2281,49 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
+       }
+     }
+     const executeOperation = async (operation, verifiedBodyCache = null) => {
++      progressState.current_object_key = operation.kind === "put" ? operation.key : null;
++      progressState.current_deletion_prefix = operation.kind === "delete" ? operation.key : null;
++      progressState.current_day_utc = mutationContext(operation.key).day_utc;
++      progressState.current_publication_stage = operation.kind === "put"
++        ? objectPublicationStage(operation.object)
++        : operation.prefixEntry.entry?.stage || "prefix_deletion";
+       if (operation.kind === "delete") {
+         const { prefixEntry } = operation;
+         counts.deleted_objects += await deleteAndVerifyPrefix({
+           r2,
+-          runState,
+-          runStatePath,
+           prefixEntry,
+           adapters: resolvedAdapters,
++          persistence,
++          checkpoint,
+           verifiedBodyCache,
+         });
+         counts.completed_deletions += 1;
++        if (!dedicatedSosProposal.dedicated) await checkpoint("after_deletion_verification");
+       } else {
+         const { object } = operation;
+         assertPublicationDependenciesVerified({ object, runState });
+         await verifyLiveObservationPartition({
+           r2,
+           runState,
+-          runStatePath,
+           object,
+           adapters: resolvedAdapters,
++          persistence,
+           verifiedBodyCache,
+         });
++        enforcePublicationDependencyDurability({ object, runState, persistence });
+         await putAndVerifyObject({
+           r2,
+           runState,
+-          runStatePath,
+           object,
+           adapters: resolvedAdapters,
++          persistence,
+           verifiedBodyCache,
+         });
+         counts.completed_writes += 1;
+         counts.get_verified_writes += 1;
++        counts.completed_post_put_verifications += 1;
++        await maybeCheckpointAndLog();
+       }
+-      atomicWriteJson(runStatePath, runState);
+     };
+     const executeConnectorGroup = async (group) => {
+       const groupKey = `${group.day_utc}|${group.connector_id}`;
+@@ -1677,7 +2359,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
+                 : publicationRank(operation.key) <= 70
+                 ? "aqi_manifests_and_data"
+                 : "aqi_indexes";
+-              atomicWriteJson(runStatePath, runState);
+             }
+             runState.apply.connector_day_publication[groupKey].status = "succeeded";
+             return { operation_count: group.operations.length };
+@@ -1692,7 +2373,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
+                 : "connector_day_scope_failed",
+             );
+             runState.apply.connector_day_publication[groupKey].verified_get_cache = verifiedBodyCache?.snapshot() || null;
+-            atomicWriteJson(runStatePath, runState);
+           }
+         },
+         verify: async (written) => ({ ...written, get_verified: true }),
+@@ -1726,6 +2406,19 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
+     ])).sort();
+     const publishAffectedIndexes = async () => {
+       if (!globalOperations.length && !affectedDays.length) return;
++      progressState.current_phase = "publishing_affected_indexes";
++      progressState.current_day_utc = null;
++      progressState.current_publication_stage = "affected_indexes";
++      progressState.index_publication_started = true;
++      persistence.appendEvent({
++        event_type: "index_publication_started",
++        publication_stage: "affected_indexes",
++        status: "started",
++        planned_index_object_count: globalOperations.length,
++      });
++      persistence.flush();
++      await checkpoint("before_affected_index_publication");
++      report({ message: progressMessage("index publication started"), completedObjects: counts.completed_writes, force: true });
+       await runCanonicalGlobalIndexFinalizer({
+           client: historyWriterClient,
+           diagnosticEnvironment: runState.environment,
+@@ -1753,13 +2446,23 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
+                 planned_index_object_count: globalOperations.length,
+                 live_observation_body_rebuild_used: false,
+               };
+-              atomicWriteJson(runStatePath, runState);
+             }
+           },
+         });
++      progressState.index_publication_completed = true;
++      progressState.current_publication_stage = "affected_indexes_verified";
++      persistence.appendEvent({
++        event_type: "index_publication_completed",
++        publication_stage: "affected_indexes",
++        status: "verified",
++        completed_index_object_count: globalOperations.length,
++      });
++      persistence.flush();
++      await checkpoint("after_affected_index_publication");
++      report({ message: progressMessage("index publication completed"), completedObjects: counts.completed_writes, force: true });
+     };
+     if (dedicatedSosProposal.dedicated) {
+-      runState.apply.sos_light_day_publication = {};
++      runState.apply.sos_light_day_publication = perDayStatus;
+       await applySosLightPerDayUnits({
+         selectedDays: dedicatedSosProposal.selected_days,
+         dayGroups,
+@@ -1780,7 +2483,14 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
+         applyDayFinalization: executeDayFinalization,
+         publishAffectedIndexes,
+         publicationState: runState.apply.sos_light_day_publication,
+-        persist: async () => atomicWriteJson(runStatePath, runState),
++        persist: checkpoint,
++        durabilityBarrier: async () => persistence.flush(),
++        appendEvent: persistence.appendEvent,
++        reportProgress: (message) => report({
++          message: progressMessage(message),
++          completedObjects: counts.completed_writes,
++          force: true,
++        }),
+       });
+     } else {
+       for (const group of Array.from(connectorGroups.values()).sort((left, right) =>
+@@ -1809,13 +2519,79 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
+         ) ? "succeeded" : "failed",
+       });
+     }
+-    runState.apply = { ...runState.apply, ...counts, status: "succeeded", finished_at_utc: new Date().toISOString() };
+-    atomicWriteJson(runStatePath, runState);
+-    return { ok: true, status: "succeeded", ...counts };
++    progressState.status = "succeeded";
++    progressState.current_phase = "canonical_apply_completed";
++    progressState.current_day_utc = null;
++    progressState.current_object_key = null;
++    progressState.current_deletion_prefix = null;
++    progressState.current_publication_stage = "complete";
++    persistence.appendEvent({
++      event_type: "canonical_apply_completed",
++      publication_stage: "complete",
++      status: "succeeded",
++      ...counts,
++    });
++    persistence.close();
++    await checkpoint("canonical_apply_successful_completion");
++    runState.apply = {
++      ...runState.apply,
++      ...counts,
++      status: "succeeded",
++      finished_at_utc: new Date().toISOString(),
++    };
++    writeCompleteRunState();
++    report({ message: progressMessage("canonical apply completed"), completedObjects: counts.completed_writes, force: true });
++    return {
++      ok: true,
++      status: "succeeded",
++      ...counts,
++      persistence: runState.apply.persistence,
++    };
+   } catch (error) {
+     const message = error instanceof Error ? error.message : String(error);
+-    runState.apply = { ...runState.apply, ...counts, status: "failed", error: message, finished_at_utc: new Date().toISOString() };
+-    atomicWriteJson(runStatePath, runState);
++    counts.failed_operations += 1;
++    progressState.status = "failed";
++    progressState.current_phase = "canonical_apply_failed";
++    progressState.failed_operations = counts.failed_operations;
++    try {
++      persistence.appendEvent({
++        event_type: "canonical_apply_failed",
++        canonical_key: progressState.current_object_key,
++        prefix: progressState.current_deletion_prefix,
++        day_utc: progressState.current_day_utc,
++        connector_id: mutationContext(
++          progressState.current_object_key || progressState.current_deletion_prefix,
++        ).connector_id,
++        publication_stage: progressState.current_publication_stage,
++        status: "failed",
++        failure_message: message,
++        last_completed_day_utc: progressState.last_completed_day_utc,
++      });
++      persistence.flush();
++    } catch {
++      // The compact failure checkpoint exposes the journal failure.
++    }
++    persistence.closeAfterFailure();
++    try {
++      await checkpoint("canonical_apply_failure");
++    } catch (checkpointError) {
++      progressState.checkpoint_failure = checkpointError instanceof Error
++        ? checkpointError.message : String(checkpointError);
++    }
++    runState.apply = {
++      ...runState.apply,
++      ...counts,
++      status: "failed",
++      error: message,
++      finished_at_utc: new Date().toISOString(),
++      last_completed_day_utc: progressState.last_completed_day_utc,
++      later_selected_days_untouched: dedicatedSosProposal.dedicated,
++      untouched_later_selected_days: dedicatedSosProposal.dedicated
++        ? selectedDays.filter((dayUtc) => perDayStatus[dayUtc]?.status === "not_started")
++        : [],
++    };
++    writeCompleteRunState();
++    report({ message: progressMessage(`canonical apply failed error=${message}`), completedObjects: counts.completed_writes, force: true });
+     throw error;
+   }
+ }
+diff --git a/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py b/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py
+index 66838b4..41f046d 100755
+--- a/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py
++++ b/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py
+@@ -21141,6 +21141,138 @@ def _validate_v2_timeseries_bindings(
+     return gaps
+ 
+ 
++def _resolve_run_scoped_apply_artifact(
++    run_state: Mapping[str, Any], raw_path: Any,
++) -> Path:
++    artifact_path = Path(str(raw_path or "")).resolve()
++    run_root = Path(str(run_state.get("run_root") or "")).resolve()
++    if not str(raw_path or "").strip() or not run_root.is_dir():
++        raise ValueError("run-scoped apply artifact path is unavailable")
++    try:
++        artifact_path.relative_to(run_root)
++    except ValueError as exc:
++        raise ValueError("apply artifact is outside the current run directory") from exc
++    if not artifact_path.is_file():
++        raise FileNotFoundError(f"apply artifact is missing: {artifact_path}")
++    return artifact_path
++
++
++def _verified_deleted_object_keys(
++    run_state: Mapping[str, Any], prefix_entry: Mapping[str, Any],
++) -> list[str]:
++    sidecar_path_raw = prefix_entry.get("deleted_keys_sidecar_path")
++    if sidecar_path_raw:
++        sidecar_path = _resolve_run_scoped_apply_artifact(
++            run_state, sidecar_path_raw,
++        )
++        body = sidecar_path.read_bytes()
++        expected_bytes = int(prefix_entry.get("deleted_keys_sidecar_bytes") or -1)
++        expected_sha256 = str(
++            prefix_entry.get("deleted_keys_sha256") or ""
++        ).strip().lower()
++        if len(body) != expected_bytes or hashlib.sha256(body).hexdigest() != expected_sha256:
++            raise ValueError(
++                f"deleted-key sidecar identity mismatch: {sidecar_path}"
++            )
++        payload = json.loads(body.decode("utf-8"))
++        if not isinstance(payload, list) or any(
++            not isinstance(value, str) or not value for value in payload
++        ):
++            raise ValueError(f"deleted-key sidecar payload is invalid: {sidecar_path}")
++        keys = list(payload)
++        prefix = str(prefix_entry.get("prefix") or "").rstrip("/") + "/"
++        if keys != sorted(keys) or len(keys) != len(set(keys)) or any(
++            not key.startswith(prefix) for key in keys
++        ):
++            raise ValueError(f"deleted-key sidecar key scope is invalid: {sidecar_path}")
++        if len(keys) != int(prefix_entry.get("deleted_object_count") or 0):
++            raise ValueError(f"deleted-key sidecar count mismatch: {sidecar_path}")
++        return keys
++    return sorted({
++        str(value) for value in list(prefix_entry.get("deleted_object_keys") or [])
++        if str(value)
++    })
++
++
++def verify_apply_persistence_artifacts(
++    run_state: Mapping[str, Any],
++) -> dict[str, Any]:
++    persistence = ((run_state.get("apply") or {}).get("persistence") or {})
++    journal_path_raw = persistence.get("mutation_journal_path")
++    if not journal_path_raw:
++        return {"status": "not_available", "reason": "mutation_journal_not_recorded"}
++    journal_path = _resolve_run_scoped_apply_artifact(run_state, journal_path_raw)
++    body = journal_path.read_bytes()
++    expected_bytes = int(persistence.get("mutation_journal_bytes") or -1)
++    expected_sha256 = str(
++        persistence.get("mutation_journal_sha256") or ""
++    ).strip().lower()
++    if len(body) != expected_bytes or hashlib.sha256(body).hexdigest() != expected_sha256:
++        raise ValueError(f"mutation journal identity mismatch: {journal_path}")
++    lines = [line for line in body.splitlines() if line]
++    expected_events = int(persistence.get("mutation_journal_event_count") or 0)
++    if len(lines) != expected_events:
++        raise ValueError(f"mutation journal event-count mismatch: {journal_path}")
++    previous_sha256: str | None = None
++    run_id = str(run_state.get("run_id") or "")
++    event_types: dict[str, int] = {}
++    for raw_line in lines:
++        event = json.loads(raw_line.decode("utf-8"))
++        if not isinstance(event, Mapping):
++            raise ValueError(f"mutation journal event is not an object: {journal_path}")
++        if str(event.get("run_id") or "") != run_id:
++            raise ValueError(f"mutation journal run identity mismatch: {journal_path}")
++        if event.get("previous_event_sha256") != previous_sha256:
++            raise ValueError(f"mutation journal chain mismatch: {journal_path}")
++        event_sha256 = str(event.get("event_sha256") or "").strip().lower()
++        if not re.fullmatch(r"[a-f0-9]{64}", event_sha256):
++            raise ValueError(f"mutation journal event identity is invalid: {journal_path}")
++        previous_sha256 = event_sha256
++        event_type = str(event.get("event_type") or "")
++        event_types[event_type] = event_types.get(event_type, 0) + 1
++    expected_tail = persistence.get("mutation_journal_tail_event_sha256")
++    if previous_sha256 != expected_tail:
++        raise ValueError(f"mutation journal tail identity mismatch: {journal_path}")
++    sidecars: list[dict[str, Any]] = []
++    for raw_prefix in list(run_state.get("tombstone_prefixes") or []):
++        if not isinstance(raw_prefix, Mapping):
++            continue
++        if raw_prefix.get("deletion_verified") and not raw_prefix.get(
++            "deleted_keys_sidecar_path"
++        ):
++            raise ValueError("verified deletion is missing its deleted-key sidecar")
++        if not raw_prefix.get("deleted_keys_sidecar_path"):
++            continue
++        keys = _verified_deleted_object_keys(run_state, raw_prefix)
++        sidecars.append({
++            "prefix": str(raw_prefix.get("prefix") or ""),
++            "path": str(raw_prefix.get("deleted_keys_sidecar_path") or ""),
++            "bytes": int(raw_prefix.get("deleted_keys_sidecar_bytes") or 0),
++            "sha256": str(raw_prefix.get("deleted_keys_sha256") or ""),
++            "deleted_object_count": len(keys),
++        })
++    if len(sidecars) != int(persistence.get("deleted_key_sidecar_count") or 0):
++        raise ValueError("deleted-key sidecar-count mismatch")
++    return {
++        "status": "verified",
++        "mutation_journal_path": str(journal_path),
++        "mutation_journal_bytes": len(body),
++        "mutation_journal_sha256": expected_sha256,
++        "mutation_journal_event_count": len(lines),
++        "event_type_counts": event_types,
++        "deleted_key_sidecars": sidecars,
++        "compact_checkpoint_count": int(
++            persistence.get("compact_checkpoint_count") or 0
++        ),
++        "complete_run_state_write_count": int(
++            persistence.get("complete_run_state_write_count") or 0
++        ),
++        "mutation_journal_flush_count": int(
++            persistence.get("mutation_journal_flush_count") or 0
++        ),
++    }
++
++
+ def run_v2_final_verification(
+     *,
+     run_state: dict[str, Any],
+@@ -21181,6 +21313,19 @@ def run_v2_final_verification(
+         ),
+     )
+     remaining_scopes: list[dict[str, Any]] = []
++    try:
++        apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
++    except (OSError, ValueError, json.JSONDecodeError) as exc:
++        apply_persistence_artifacts = {
++            "status": "failed",
++            "error": str(exc),
++        }
++    if require_remote_state and apply_persistence_artifacts.get("status") != "verified":
++        remaining_scopes.append({
++            "stage": "canonical_apply_persistence",
++            "gap_type": "apply_persistence_artifact_verification_failed",
++            "evidence": apply_persistence_artifacts,
++        })
+     remaining_scopes.extend(_validate_v2_timeseries_bindings(
+         conn=conn, view_root=view_root, config=config,
+     ))
+@@ -21287,10 +21432,13 @@ def run_v2_final_verification(
+             "object_key": f"{prefix}/",
+             "r2_delete_verified": bool(prefix_entry.get("deletion_verified")),
+             "deleted_object_count": int(prefix_entry.get("deleted_object_count") or 0),
+-            "deleted_object_keys": sorted({
+-                str(value) for value in list(prefix_entry.get("deleted_object_keys") or [])
+-                if str(value)
+-            }),
++            "deleted_keys_sha256": prefix_entry.get("deleted_keys_sha256"),
++            "deleted_keys_sidecar_path": prefix_entry.get(
++                "deleted_keys_sidecar_path"
++            ),
++            "deleted_keys_sidecar_bytes": prefix_entry.get(
++                "deleted_keys_sidecar_bytes"
++            ),
+             "superseded_by_verified_write": False,
+         }
+         r2_delete_verification_evidence.append(delete_evidence)
+@@ -21312,6 +21460,7 @@ def run_v2_final_verification(
+         "local_object_resolution": "structurally_validated_overlay_then_proposed_tombstone_then_dropbox",
+         "r2_get_verification_evidence": verification_evidence,
+         "r2_delete_verification_evidence": r2_delete_verification_evidence,
++        "apply_persistence_artifacts": apply_persistence_artifacts,
+         "application_failures": application_failures,
+         "r2_objects_written": len(r2_written_keys),
+         "r2_objects_deleted": sum(
+@@ -21425,11 +21574,7 @@ def record_integrity_object_operations(
+                 str(prefix_entry.get("status") or "planned"), prefix_entry.get("error"), now_iso,
+             ),
+         )
+-        for deleted_key in sorted({
+-            str(value)
+-            for value in list(prefix_entry.get("deleted_object_keys") or [])
+-            if str(value)
+-        }):
++        for deleted_key in _verified_deleted_object_keys(run_state, prefix_entry):
+             conn.execute(
+                 """
+                 INSERT INTO integrity_object_operations (
+@@ -21465,28 +21610,107 @@ def run_canonical_apply_executor(
+         "--run-state-json", str(run_state["run_state_path"]),
+         "--write-r2",
+     ]
+-    completed = subprocess.run(
++    process = subprocess.Popen(
+         command,
+         cwd=repo_root,
+         env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
+-        capture_output=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
+         text=True,
+-        check=False,
+     )
++    stdout_lines: list[str] = []
++    stderr_lines: list[str] = []
++
++    def _drain_apply_output(
++        stream: Any, destination: list[str], *, emit_progress: bool,
++    ) -> None:
++        for line in iter(stream.readline, ""):
++            destination.append(line)
++            if emit_progress:
++                log.info("canonical apply %s", line.rstrip())
++        stream.close()
++
++    stdout_thread = threading.Thread(
++        target=_drain_apply_output,
++        args=(process.stdout, stdout_lines),
++        kwargs={"emit_progress": False},
++        daemon=True,
++    )
++    stderr_thread = threading.Thread(
++        target=_drain_apply_output,
++        args=(process.stderr, stderr_lines),
++        kwargs={"emit_progress": True},
++        daemon=True,
++    )
++    stdout_thread.start()
++    stderr_thread.start()
++    process.wait()
++    stdout_thread.join()
++    stderr_thread.join()
++    stdout = "".join(stdout_lines)
++    stderr = "".join(stderr_lines)
+     try:
+-        output = json.loads(completed.stdout) if completed.stdout.strip() else {}
++        output = json.loads(stdout) if stdout.strip() else {}
+     except json.JSONDecodeError:
+         output = {}
+     refreshed = json.loads(Path(str(run_state["run_state_path"])).read_text(encoding="utf-8"))
+     run_state.clear()
+     run_state.update(refreshed)
+-    if completed.returncode != 0:
+-        error = _truncate_text(completed.stderr or completed.stdout or "canonical apply failed", 4000)
+-        log.error("canonical apply executor failed exit_code=%s error=%s", completed.returncode, error)
+-        return {"status": "failed", "exit_code": completed.returncode, "error": error, "output": output}
++    if process.returncode != 0:
++        error = _tail_bytes(stderr or stdout or "canonical apply failed", 4000)
++        log.error("canonical apply executor failed exit_code=%s error=%s", process.returncode, error)
++        return {"status": "failed", "exit_code": process.returncode, "error": error, "output": output}
+     return {"status": "succeeded", "exit_code": 0, "output": output}
+ 
+ 
++def checkpoint_apply_progress_from_python(
++    run_state: dict[str, Any], *, reason: str, current_phase: str,
++    status: str | None = None,
++) -> bool:
++    progress_path_raw = ((run_state.get("apply") or {}).get("persistence") or {}).get(
++        "apply_progress_path"
++    )
++    if not progress_path_raw:
++        return False
++    progress_path = _resolve_run_scoped_apply_artifact(run_state, progress_path_raw)
++    progress = json.loads(progress_path.read_text(encoding="utf-8"))
++    if not isinstance(progress, dict):
++        raise ValueError("apply progress checkpoint is not a JSON object")
++    progress["current_phase"] = current_phase
++    progress["current_publication_stage"] = current_phase
++    if status is not None:
++        progress["status"] = status
++    progress["last_checkpoint_reason"] = reason
++    progress["last_checkpoint_at_utc"] = fmt_iso(utc_now())
++    progress["compact_checkpoint_count"] = int(
++        progress.get("compact_checkpoint_count") or 0
++    ) + 1
++    temporary_path = progress_path.with_name(progress_path.name + ".tmp")
++    with temporary_path.open("w", encoding="utf-8") as handle:
++        json.dump(progress, handle, indent=2, sort_keys=True, default=str)
++        handle.write("\n")
++        handle.flush()
++        os.fsync(handle.fileno())
++    temporary_path.replace(progress_path)
++    directory_descriptor = os.open(progress_path.parent, os.O_RDONLY)
++    try:
++        os.fsync(directory_descriptor)
++    finally:
++        os.close(directory_descriptor)
++    persistence = (run_state.get("apply") or {}).get("persistence")
++    if isinstance(persistence, dict):
++        persistence["compact_checkpoint_count"] = progress[
++            "compact_checkpoint_count"
++        ]
++    run_state["apply_progress"] = {
++        "path": str(progress_path),
++        "status": progress.get("status"),
++        "current_phase": current_phase,
++        "last_completed_day_utc": progress.get("last_completed_day_utc"),
++    }
++    return True
++
++
+ def resolve_history_writer_database_url(env: Mapping[str, str]) -> str:
+     """Resolve the existing direct/session-mode IngestDB route for locks and boundaries."""
+     resolved = {**os.environ, **{str(key): str(value) for key, value in env.items()}}
+@@ -23070,6 +23294,20 @@ def summarize_ordered_apply_verification(
+ ) -> dict[str, Any]:
+     """Accept dedicated SOS history from the ordered per-object apply audit."""
+     remaining_scopes: list[dict[str, Any]] = []
++    apply_status = str(apply_result.get("status") or "")
++    try:
++        apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
++    except (OSError, ValueError, json.JSONDecodeError) as exc:
++        apply_persistence_artifacts = {"status": "failed", "error": str(exc)}
++    if (
++        apply_status == "succeeded"
++        and apply_persistence_artifacts.get("status") != "verified"
++    ):
++        remaining_scopes.append({
++            "stage": "canonical_apply_persistence",
++            "gap_type": "apply_persistence_artifact_verification_failed",
++            "evidence": apply_persistence_artifacts,
++        })
+     written_keys: list[str] = []
+     verification_evidence: list[dict[str, Any]] = []
+     for object_key, raw_entry in sorted(dict(run_state.get("objects") or {}).items()):
+@@ -23116,6 +23354,13 @@ def summarize_ordered_apply_verification(
+             "prefix": str(raw_prefix.get("prefix") or ""),
+             "deletion_verified": bool(raw_prefix.get("deletion_verified")),
+             "deleted_object_count": int(raw_prefix.get("deleted_object_count") or 0),
++            "deleted_keys_sha256": raw_prefix.get("deleted_keys_sha256"),
++            "deleted_keys_sidecar_path": raw_prefix.get(
++                "deleted_keys_sidecar_path"
++            ),
++            "deleted_keys_sidecar_bytes": raw_prefix.get(
++                "deleted_keys_sidecar_bytes"
++            ),
+         }
+         deletion_evidence.append(evidence)
+         if evidence["deletion_verified"]:
+@@ -23126,7 +23371,6 @@ def summarize_ordered_apply_verification(
+                 "object_key": f"{evidence['prefix']}/",
+                 "gap_type": "complete_day_deletion_not_verified",
+             })
+-    apply_status = str(apply_result.get("status") or "")
+     if apply_status not in {"succeeded", "skipped_noop"}:
+         remaining_scopes.append({
+             "stage": "canonical_apply",
+@@ -23143,6 +23387,7 @@ def summarize_ordered_apply_verification(
+         "second_broad_r2_scan_invoked": False,
+         "r2_get_verification_evidence": verification_evidence,
+         "r2_delete_verification_evidence": deletion_evidence,
++        "apply_persistence_artifacts": apply_persistence_artifacts,
+         "global_index_finalization": run_state.get("global_index_finalization"),
+         "r2_objects_written": len(written_keys),
+         "r2_objects_deleted": deleted_object_count,
+@@ -23838,20 +24083,57 @@ def run_v2_integrity_repair_flow(
+             int(entry.get("connector_id") or 0),
+         ) not in repaired_current_state_keys
+     ]
+-    current_state_reconciliation = run_current_state_reconciliation(
+-        conn=conn,
+-        env_name=env_name,
+-        integrity_run_id=f"{env_name}:{run_id}",
+-        env=env,
+-        scope_entries=current_state_scopes,
+-        dry_run=dry_run,
+-        final_verification=final_verification,
+-        log=log,
+-        dedicated_partition_entries=(
+-            all_observation_repair_entries
+-            if dedicated_sos_historical_replacement else None
+-        ),
+-    )
++    canonical_apply_succeeded = apply_result.get("status") == "succeeded"
++    if canonical_apply_succeeded:
++        checkpoint_apply_progress_from_python(
++            run_state,
++            reason="before_current_state_reconciliation",
++            current_phase="current_state_reconciliation",
++            status="running",
++        )
++        log.info("canonical apply current-state reconciliation started")
++    try:
++        current_state_reconciliation = run_current_state_reconciliation(
++            conn=conn,
++            env_name=env_name,
++            integrity_run_id=f"{env_name}:{run_id}",
++            env=env,
++            scope_entries=current_state_scopes,
++            dry_run=dry_run,
++            final_verification=final_verification,
++            log=log,
++            dedicated_partition_entries=(
++                all_observation_repair_entries
++                if dedicated_sos_historical_replacement else None
++            ),
++        )
++    except Exception:
++        if canonical_apply_succeeded:
++            checkpoint_apply_progress_from_python(
++                run_state,
++                reason="current_state_reconciliation_failure",
++                current_phase="current_state_reconciliation_failed",
++                status="failed",
++            )
++            log.exception("canonical apply current-state reconciliation failed")
++        raise
++    if canonical_apply_succeeded:
++        reconciliation_failed = current_state_reconciliation.get(
++            "overall_status"
++        ) in {"failed", "partial_failure", "blocked_dependency"}
++        checkpoint_apply_progress_from_python(
++            run_state,
++            reason="after_current_state_reconciliation",
++            current_phase="current_state_reconciliation_completed",
++            status="failed" if reconciliation_failed else "succeeded",
++        )
++        final_verification["apply_persistence_artifacts"] = (
++            verify_apply_persistence_artifacts(run_state)
++        )
++        log.info(
++            "canonical apply current-state reconciliation completed status=%s",
++            current_state_reconciliation.get("overall_status"),
++        )
+     current_state_reconciliation["latest_snapshot_auth_preflight"] = dict(
+         auth_preflight
+     )
+@@ -26497,6 +26779,21 @@ def format_summary_md(s: dict[str, Any]) -> str:
+                 f"- Remaining gap count: {final_verification.get('remaining_gap_count', '(not run)')}",
+                 "",
+             ])
++            persistence_artifacts = final_verification.get(
++                "apply_persistence_artifacts"
++            ) or {}
++            if persistence_artifacts:
++                lines.extend([
++                    f"- Apply persistence evidence: {persistence_artifacts.get('status') or '(none)'}",
++                    f"- Mutation journal: {persistence_artifacts.get('mutation_journal_path') or '(none)'}",
++                    f"- Mutation journal SHA-256: {persistence_artifacts.get('mutation_journal_sha256') or '(none)'}",
++                    f"- Mutation journal events: {int(persistence_artifacts.get('mutation_journal_event_count') or 0)}",
++                    f"- Mutation journal flushes: {int(persistence_artifacts.get('mutation_journal_flush_count') or 0)}",
++                    f"- Compact checkpoints: {int(persistence_artifacts.get('compact_checkpoint_count') or 0)}",
++                    f"- Complete run-state writes: {int(persistence_artifacts.get('complete_run_state_write_count') or 0)}",
++                    f"- Deleted-key sidecars: {len(list(persistence_artifacts.get('deleted_key_sidecars') or []))}",
++                    "",
++                ])
+             for scope in list(final_verification.get("remaining_scopes") or [])[:100]:
+                 lines.append(
+                     "- Remaining: " + json.dumps(scope, sort_keys=True, default=str)
+diff --git a/scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py b/scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py
+index ed8e10b..16b71ed 100644
+--- a/scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py
++++ b/scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ import gzip
+ import hashlib
+ import importlib.util
++import io
+ import json
+ import logging
+ import os
+@@ -4386,6 +4387,113 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
+             self.assertEqual(aqi_stage["status"], "bypassed")
+ 
+ 
++class ApplyPersistenceTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++
++    def tearDown(self) -> None:
++        self.tmp.cleanup()
++
++    def test_journal_and_deleted_key_sidecar_identities_are_verified(self) -> None:
++        prefix = "history/v2/observations/day_utc=2026-07-29"
++        evidence_dir = self.root / "apply-evidence" / "deletions"
++        evidence_dir.mkdir(parents=True)
++        sidecar_path = evidence_dir / "2026-07-29-test.json"
++        sidecar_body = json.dumps([f"{prefix}/a.json"], separators=(",", ":")).encode() + b"\n"
++        sidecar_path.write_bytes(sidecar_body)
++        journal_path = self.root / "apply-mutation-events.jsonl"
++        tail_sha256 = "a" * 64
++        event = {
++            "run_id": "test-run",
++            "event_type": "deletion_verified",
++            "previous_event_sha256": None,
++            "event_sha256": tail_sha256,
++        }
++        journal_body = json.dumps(event, separators=(",", ":")).encode() + b"\n"
++        journal_path.write_bytes(journal_body)
++        run_state = {
++            "run_id": "test-run",
++            "run_root": str(self.root),
++            "apply": {"persistence": {
++                "mutation_journal_path": str(journal_path),
++                "mutation_journal_bytes": len(journal_body),
++                "mutation_journal_sha256": hashlib.sha256(journal_body).hexdigest(),
++                "mutation_journal_event_count": 1,
++                "mutation_journal_tail_event_sha256": tail_sha256,
++                "deleted_key_sidecar_count": 1,
++                "compact_checkpoint_count": 4,
++                "complete_run_state_write_count": 2,
++                "mutation_journal_flush_count": 3,
++            }},
++            "tombstone_prefixes": [{
++                "prefix": prefix,
++                "deleted_object_count": 1,
++                "deleted_keys_sidecar_path": str(sidecar_path),
++                "deleted_keys_sidecar_bytes": len(sidecar_body),
++                "deleted_keys_sha256": hashlib.sha256(sidecar_body).hexdigest(),
++            }],
++        }
++        result = MODULE.verify_apply_persistence_artifacts(run_state)
++        self.assertEqual(result["status"], "verified")
++        self.assertEqual(result["mutation_journal_event_count"], 1)
++        self.assertEqual(result["deleted_key_sidecars"][0]["deleted_object_count"], 1)
++
++    def test_canonical_apply_executor_streams_stderr_and_retains_stdout_json(self) -> None:
++        run_state_path = self.root / "run-state.json"
++        run_state = {"run_state_path": str(run_state_path), "run_root": str(self.root)}
++        run_state_path.write_text(json.dumps(run_state), encoding="utf-8")
++
++        class FakeProcess:
++            def __init__(self) -> None:
++                self.stdout = io.StringIO('{"ok":true}\n')
++                self.stderr = io.StringIO('[canonical-apply] completed_objects=50/100\n')
++                self.returncode = 0
++
++            def wait(self) -> int:
++                return self.returncode
++
++        logger = logging.getLogger("canonical-apply-stream-test")
++        with mock.patch.object(MODULE, "_repo_root_for_integrity_script", return_value=self.root), \
++             mock.patch.object(MODULE.subprocess, "Popen", return_value=FakeProcess()), \
++             self.assertLogs(logger, level="INFO") as captured:
++            result = MODULE.run_canonical_apply_executor(
++                run_state=run_state,
++                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
++                log=logger,
++            )
++        self.assertEqual(result["status"], "succeeded")
++        self.assertEqual(result["output"], {"ok": True})
++        self.assertTrue(any("completed_objects=50/100" in line for line in captured.output))
++
++    def test_canonical_apply_executor_retains_final_error_after_progress(self) -> None:
++        run_state_path = self.root / "run-state.json"
++        run_state = {"run_state_path": str(run_state_path), "run_root": str(self.root)}
++        run_state_path.write_text(json.dumps(run_state), encoding="utf-8")
++
++        class FakeProcess:
++            def __init__(self) -> None:
++                self.stdout = io.StringIO("")
++                self.stderr = io.StringIO(("progress\n" * 1_000) + "FINAL NODE ERROR\n")
++                self.returncode = 1
++
++            def wait(self) -> int:
++                return self.returncode
++
++        logger = logging.getLogger("canonical-apply-error-tail-test")
++        logger.addHandler(logging.NullHandler())
++        logger.propagate = False
++        with mock.patch.object(MODULE, "_repo_root_for_integrity_script", return_value=self.root), \
++             mock.patch.object(MODULE.subprocess, "Popen", return_value=FakeProcess()):
++            result = MODULE.run_canonical_apply_executor(
++                run_state=run_state,
++                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
++                log=logger,
++            )
++        self.assertEqual(result["status"], "failed")
++        self.assertIn("FINAL NODE ERROR", result["error"])
++
++
+ class RepoRootTests(unittest.TestCase):
+     def setUp(self) -> None:
+         self.tmp = tempfile.TemporaryDirectory()
