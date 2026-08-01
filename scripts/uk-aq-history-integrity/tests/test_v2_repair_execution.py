@@ -26,6 +26,15 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 FAILED_RUN_BUNDLE = MODULE_PATH.parents[3] / "logs" / "run-2026-08-01T192854Z.zip"
+FINAL_WRITE_SET_FAILED_RUN_FILES = {
+    name: MODULE_PATH.parents[3] / "logs" / name
+    for name in (
+        "2026-08-01T215912Z-summary.json",
+        "run-state.json",
+        "run-2026-08-01T215912Z.log",
+        "2026-08-01T215912Z.zip",
+    )
+}
 
 
 class DummyProgress:
@@ -4722,6 +4731,358 @@ class ProposalRunStateTransitionTests(unittest.TestCase):
             "remote_attempted" not in entry
             for entry in run_state["objects"].values()
         ))
+
+
+@unittest.skipUnless(
+    all(path.is_file() for path in FINAL_WRITE_SET_FAILED_RUN_FILES.values()),
+    "supplied failed run 2026-08-01T215912Z evidence is unavailable",
+)
+class FailedFinalWriteSetBundleRegressionTests(unittest.TestCase):
+    RUN_ID = "2026-08-01T215912Z"
+    FROM_DAY = "2026-07-17"
+    TO_DAY = "2026-07-29"
+    PARENT_KEY = (
+        "history/v2/observations/day_utc=2026-07-17/"
+        "connector_id=1/manifest.json"
+    )
+    PROMOTED_KEY = (
+        "history/v2/observations/day_utc=2026-07-17/connector_id=1/"
+        "pollutant_code=123c6h3ch33/manifest.json"
+    )
+    PROMOTED_SHA256 = (
+        "c4370f5de8a5cc9b35082a9896319a8b9892a8fc22378db9d45e674d1cec2c00"
+    )
+    PROMOTED_BYTES = 2090
+
+    def _failed_state(self) -> dict:
+        return json.loads(
+            FINAL_WRITE_SET_FAILED_RUN_FILES["run-state.json"].read_text()
+        )
+
+    @staticmethod
+    def _metadata_proposals(state: dict) -> list[dict]:
+        return next(
+            result["result"]["output"]["planning"]["proposals"]
+            for result in state["coordinator"]["stage_results"]
+            if result["stage"] == "observations_metadata_proposal"
+        )
+
+    def test_failed_bundle_complete_graph_is_finalised_from_staged_membership(
+        self,
+    ) -> None:
+        state = self._failed_state()
+        self.assertEqual(state["run_id"], self.RUN_ID)
+        self.assertEqual(
+            [state[key] for key in ("requested_from_day", "requested_to_day")],
+            [self.FROM_DAY, self.TO_DAY],
+        )
+        proposals = self._metadata_proposals(state)
+        self.assertEqual(sum(item.get("changed") is True for item in proposals), 131)
+        self.assertEqual(sum(item.get("changed") is False for item in proposals), 33)
+
+        unchanged = next(
+            item for item in proposals
+            if item.get("changed") is False
+            and self.PROMOTED_KEY in list(item.get("dependencies") or [])
+        )
+        planner_identity = unchanged["dependency_identities"][self.PROMOTED_KEY]
+        self.assertEqual(planner_identity, {
+            "source": "dropbox",
+            "sha256": self.PROMOTED_SHA256,
+            "bytes": self.PROMOTED_BYTES,
+        })
+        failed_identity = state["objects"][self.PARENT_KEY][
+            "dependency_identities"
+        ][self.PROMOTED_KEY]
+        self.assertEqual(failed_identity, planner_identity)
+        canonical_apply = state["coordinator"]["canonical_apply"]
+        self.assertFalse(canonical_apply["node_apply_launched"])
+        self.assertFalse(canonical_apply["r2_mutation_possible"])
+        self.assertIn("staged_dependency_identity_mismatch", canonical_apply["error"])
+        self.assertTrue(all(
+            entry.get("uploaded") is False and entry.get("r2_verified") is False
+            for entry in state["objects"].values()
+        ))
+        self.assertTrue(all(
+            entry.get("deleted") is False
+            and entry.get("deletion_verified") is False
+            for entry in state["tombstone_prefixes"]
+        ))
+
+        original_identities = {
+            key: (entry["sha256"], entry["bytes"])
+            for key, entry in state["objects"].items()
+            if entry.get("proposal_owner") == "dropbox_day_baseline"
+        }
+        stale_edges = [
+            (parent_key, dependency_key)
+            for parent_key, entry in state["objects"].items()
+            for dependency_key, identity in (
+                entry.get("dependency_identities") or {}
+            ).items()
+            if dependency_key in state["objects"]
+            and identity.get("source") == "dropbox"
+        ]
+        self.assertEqual(len(original_identities), 2062)
+        self.assertEqual(len(stale_edges), 63)
+        self.assertEqual(len(set(dependency for _, dependency in stale_edges)), 63)
+
+        audit = MODULE._finalise_staged_write_set_provenance(state)
+        self.assertEqual(audit["status"], "finalised")
+        self.assertEqual(audit["forced_republication_count"], 2062)
+        self.assertEqual(audit["final_staged_object_count"], 2245)
+        self.assertEqual(audit["rebuilt_dependency_identity_count"], 63)
+        self.assertEqual(audit["staged_dependency_edge_count"], 4141)
+        self.assertEqual(
+            audit["external_dependency_edge_counts"],
+            {"dropbox": 139, "overlay": 0},
+        )
+        self.assertEqual(
+            sum(
+                len(entry.get("planner_dependency_identities") or {})
+                for entry in state["objects"].values()
+            ),
+            423,
+        )
+        for object_key, identity in original_identities.items():
+            with self.subTest(promoted_object=object_key):
+                entry = state["objects"][object_key]
+                self.assertEqual((entry["sha256"], entry["bytes"]), identity)
+                self.assertIs(entry["proposal_changed"], False)
+                self.assertEqual(entry["planner_source"], "dropbox")
+                self.assertEqual(entry["baseline_source"], "dropbox")
+                self.assertTrue(entry["included_in_final_staged_write_set"])
+                self.assertEqual(
+                    entry["promotion_reason"], "exact_prefix_replacement"
+                )
+                self.assertEqual(entry["final_source"], "planned_overlay")
+        for parent_key, entry in state["objects"].items():
+            for dependency_key, identity in (
+                entry.get("dependency_identities") or {}
+            ).items():
+                with self.subTest(
+                    parent=parent_key, dependency=dependency_key,
+                ):
+                    child = state["objects"].get(dependency_key)
+                    if child is None:
+                        self.assertIn(identity["source"], {"dropbox", "overlay"})
+                    else:
+                        self.assertEqual(identity["source"], "planned_overlay")
+                        self.assertEqual(identity["sha256"], child["sha256"])
+                        self.assertEqual(identity["bytes"], child["bytes"])
+
+        with zipfile.ZipFile(
+            FINAL_WRITE_SET_FAILED_RUN_FILES["2026-08-01T215912Z.zip"]
+        ) as bundle:
+            names = set(bundle.namelist())
+        for day in range(17, 30):
+            self.assertIn(
+                f"2026-08-01T215912Z/v2_obs_day_2026-07-{day:02d}_connector_1.log",
+                names,
+            )
+
+    def test_failed_bundle_shape_runs_real_promotion_and_assembly_path(
+        self,
+    ) -> None:
+        failed_state = self._failed_state()
+        proposals = self._metadata_proposals(failed_state)
+        unchanged = next(
+            item for item in proposals
+            if item.get("changed") is False
+            and self.PROMOTED_KEY in list(item.get("dependencies") or [])
+        )
+        baseline_body = unchanged["proposed_body"].encode()
+        baseline_sha256 = hashlib.sha256(baseline_body).hexdigest()
+        baseline_payload = json.loads(baseline_body)
+        part_key = baseline_payload["files"][0]["key"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dropbox = root / "dropbox"
+            promoted_path = dropbox / self.PROMOTED_KEY
+            promoted_path.parent.mkdir(parents=True)
+            promoted_path.write_bytes(baseline_body)
+            part_path = dropbox / part_key
+            part_path.parent.mkdir(parents=True, exist_ok=True)
+            part_path.write_bytes(b"failed-bundle-production-shape-part")
+
+            connector_body = json.dumps({
+                "manifest_kind": "connector",
+                "pollutant_manifests": [
+                    {"manifest_key": self.PROMOTED_KEY}
+                ],
+                "child_manifests": [],
+            }, separators=(",", ":"))
+            day_key = (
+                "history/v2/observations/day_utc=2026-07-17/manifest.json"
+            )
+            day_body = json.dumps({
+                "manifest_kind": "day",
+                "connector_manifests": [
+                    {"manifest_key": self.PARENT_KEY}
+                ],
+                "child_manifests": [],
+            }, separators=(",", ":"))
+            connector_bytes = connector_body.encode()
+            run_state = MODULE.create_run_overlay(
+                tmp_dir=root / "runs",
+                run_id="failed-bundle-final-write-set-replay",
+                environment="CIC-Test",
+                base_dropbox_root=dropbox,
+            )
+            replay_unchanged = {
+                **unchanged,
+                "dependency_identities": {
+                    self.PROMOTED_KEY: {
+                        "source": "dropbox",
+                        "sha256": baseline_sha256,
+                        "bytes": len(baseline_body),
+                    }
+                },
+            }
+            executor_result = {"output": {"planning": {
+                "proposals": [
+                    replay_unchanged,
+                    {
+                        "key": self.PARENT_KEY,
+                        "kind": "connector_manifest",
+                        "publication_stage": "connector_manifest",
+                        "changed": True,
+                        "status": "planned",
+                        "included_in_write_set": True,
+                        "dependencies": [self.PROMOTED_KEY],
+                        "dependency_identities": {
+                            self.PROMOTED_KEY: {
+                                "source": "dropbox",
+                                "sha256": baseline_sha256,
+                                "bytes": len(baseline_body),
+                            }
+                        },
+                        "proposed_body": connector_body,
+                    },
+                    {
+                        "key": day_key,
+                        "kind": "day_manifest",
+                        "publication_stage": "day_parent",
+                        "changed": True,
+                        "status": "planned",
+                        "included_in_write_set": True,
+                        "dependencies": [self.PARENT_KEY],
+                        "dependency_identities": {
+                            self.PARENT_KEY: {
+                                "source": "planned_overlay",
+                                "sha256": hashlib.sha256(
+                                    connector_bytes
+                                ).hexdigest(),
+                                "bytes": len(connector_bytes),
+                            }
+                        },
+                        "proposed_body": day_body,
+                    },
+                ],
+                "blocked_scopes": [],
+                "sos_light": {
+                    "validation_status": "validated_local_assembly",
+                    "old_live_r2_observation_bodies_used": False,
+                    "days": [{
+                        "day_utc": self.FROM_DAY,
+                        "final_connector_1_child_set": [self.PROMOTED_KEY],
+                        "omitted_dropbox_connector_prefixes": [],
+                    }],
+                },
+            }}}
+            MODULE._record_metadata_executor_overlay(
+                run_state=run_state,
+                executor_result=executor_result,
+                dry_run=False,
+            )
+            self.assertNotIn(self.PROMOTED_KEY, run_state["objects"])
+            self.assertEqual(
+                run_state["objects"][self.PARENT_KEY][
+                    "dependency_identities"
+                ][self.PROMOTED_KEY]["source"],
+                "dropbox",
+            )
+
+            with mock.patch.object(
+                MODULE,
+                "run_r2_cross_checks",
+                side_effect=AssertionError("live R2 must not be planning input"),
+            ) as live_r2_adapter:
+                MODULE.assemble_sos_light_complete_days(run_state)
+            live_r2_adapter.assert_not_called()
+
+            promoted = run_state["objects"][self.PROMOTED_KEY]
+            self.assertEqual(
+                Path(promoted["local_path"]).read_bytes(), baseline_body
+            )
+            self.assertEqual(promoted["sha256"], baseline_sha256)
+            self.assertEqual(promoted["bytes"], len(baseline_body))
+            self.assertIs(promoted["proposal_changed"], False)
+            self.assertEqual(promoted["planner_source"], "dropbox")
+            self.assertEqual(promoted["baseline_source"], "dropbox")
+            self.assertTrue(promoted["included_in_final_staged_write_set"])
+            self.assertEqual(
+                promoted["promotion_reason"], "exact_prefix_replacement"
+            )
+            self.assertEqual(promoted["final_source"], "planned_overlay")
+            final_identity = run_state["objects"][self.PARENT_KEY][
+                "dependency_identities"
+            ][self.PROMOTED_KEY]
+            self.assertEqual(final_identity, {
+                "source": "planned_overlay",
+                "sha256": baseline_sha256,
+                "bytes": len(baseline_body),
+            })
+            self.assertEqual(
+                run_state["objects"][self.PARENT_KEY][
+                    "planner_dependency_identities"
+                ][self.PROMOTED_KEY]["source"],
+                "dropbox",
+            )
+            transition = MODULE.validate_proposal_run_state_transition(run_state)
+            self.assertEqual(transition["status"], "succeeded")
+            self.assertEqual(transition["forced_republication_count"], 2)
+            self.assertEqual(transition["planner_identity_promotion_count"], 1)
+
+            stale = json.loads(json.dumps(run_state))
+            stale["objects"][self.PARENT_KEY]["dependency_identities"][
+                self.PROMOTED_KEY
+            ]["source"] = "dropbox"
+            with self.assertRaisesRegex(
+                ValueError, "staged_dependency_identity_mismatch",
+            ) as raised:
+                MODULE.validate_proposal_run_state_transition(stale)
+            self.assertIn('"promotion_reason":"exact_prefix_replacement"', str(
+                raised.exception
+            ))
+
+            apply_module = (
+                MODULE_PATH.parents[3]
+                / "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"
+            ).as_uri()
+            node_result = MODULE.subprocess.run(
+                [
+                    "node", "--input-type=module", "--eval",
+                    (
+                        "import fs from 'node:fs';"
+                        f"import {{validateLocalProposal}} from {json.dumps(apply_module)};"
+                        "const state=JSON.parse(fs.readFileSync("
+                        f"{json.dumps(run_state['run_state_path'])},'utf8'));"
+                        "const proposal=validateLocalProposal(state);"
+                        "process.stdout.write(JSON.stringify({objects:proposal.objects.length}));"
+                    ),
+                ],
+                cwd=MODULE_PATH.parents[3],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(node_result.returncode, 0, node_result.stderr)
+            self.assertEqual(
+                json.loads(node_result.stdout)["objects"],
+                len(run_state["objects"]),
+            )
 
 
 @unittest.skipUnless(
