@@ -1,5 +1,7 @@
 # UK-AIR SOS operations
 
+The authoritative behavioural contract is [`../contract.md`](../contract.md), including the connector ingest scheduler ownership rules. This document is the operational runbook for SOS deployment and runtime inspection.
+
 ## Deployment ownership
 
 The authoritative deployment path for the SOS Cloud Run service is:
@@ -24,9 +26,10 @@ Use the workflow rather than a bare `gcloud run deploy` command. The workflow ow
 - environment variables;
 - Secret Manager bindings;
 - service labels;
-- Cloud Scheduler creation or update;
-- Cloud Run invocation permissions;
+- Cloud Run transport and application-level dispatch configuration;
 - reconciliation of the deployed service URL into the Cloudflare scheduler D1 configuration.
+
+The workflow does not create, update or manage a Google Cloud Scheduler job for SOS ingestion.
 
 A direct `gcloud run deploy` command that omits these settings does not reproduce the repository deployment contract.
 
@@ -47,17 +50,22 @@ Do not redeploy an unchanged component solely because another component uses the
 
 ## Scheduling
 
-The default path is:
+The normal external dispatch path is:
 
 ```text
-Google Cloud Scheduler
+Cloudflare ingest scheduler
+  -> D1 job configuration
   -> Cloud Run service
   -> run_service.ts
   -> run_job.ts
   -> local ingest_sos server
 ```
 
-Cloud Scheduler may invoke the service more frequently than the connector interval. Effective polling cadence remains controlled by `connectors.poll_interval_minutes` and the worker's due-state and claim-state checks.
+The D1 job configuration identifies the SOS job and stores the current deployed Cloud Run service URL. The deployment workflow refreshes that URL after deployment through `scripts/cloudflare/uk_aq_reconcile_ingest_scheduler_url.sh`.
+
+The Cloudflare scheduler may invoke the service more frequently than the connector interval. Effective polling cadence remains controlled by `connectors.poll_interval_minutes` and the worker's due-state and claim-state checks.
+
+The database value `scheduler_backend = 'google_cloud_run'` describes the execution backend and does not assign dispatch ownership to Google Cloud Scheduler.
 
 The Cloud Run service allows one in-flight child run per container. The connector claim adds database-backed overlap protection.
 
