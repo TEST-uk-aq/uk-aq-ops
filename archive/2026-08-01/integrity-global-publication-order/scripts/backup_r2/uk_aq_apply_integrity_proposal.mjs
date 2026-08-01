@@ -32,6 +32,7 @@ import {
 } from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
   resolveR2HistoryIndexConfig,
+  updateR2HistoryIndexesTargeted,
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import {
   compressors,
@@ -134,7 +135,6 @@ export const APPLY_PROGRESS_CHECKPOINT_ELAPSED_MS = 30_000;
 export const APPLY_PROGRESS_LOG_OBJECT_INTERVAL = 50;
 export const APPLY_PROGRESS_LOG_ELAPSED_MS = 30_000;
 export const MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1";
-export const PUBLICATION_SCHEDULE_CONTRACT_VERSION = "integrity-apply-publication-schedule-v1";
 
 function recursivelySortJsonValue(value) {
   if (Array.isArray(value)) {
@@ -147,161 +147,6 @@ function recursivelySortJsonValue(value) {
   return value;
 }
 
-function bytewiseKeyCompare(left, right) {
-  return Buffer.compare(Buffer.from(String(left), "utf8"), Buffer.from(String(right), "utf8"));
-}
-
-function publicationStageRank(stage) {
-  const value = String(stage || "");
-  if (value === "latest_snapshot") return 1000;
-  if (value.includes("index")) return 900;
-  if (value === "day_parent" || value.includes("day_manifest")) return 800;
-  if (value.includes("connector") && value.includes("manifest")) return 700;
-  if (value.includes("pollutant") && value.includes("manifest")) return 600;
-  if (value.includes("parquet") || value.includes("data") || value.includes("baseline")) return 500;
-  return 750;
-}
-
-function scheduleScope(object, selectedDays) {
-  if (objectPublicationStage(object) === "latest_snapshot") return [selectedDays.length, 3, 0];
-  if (object.key.startsWith("history/_index_v2/")) return [selectedDays.length, 2, 0];
-  const context = mutationContext(object.key);
-  const dayUtc = context.day_utc;
-  const dayIndex = dayUtc ? selectedDays.indexOf(dayUtc) : -1;
-  if (dayIndex < 0) return [selectedDays.length, 1, 0];
-  if (context.connector_id) return [dayIndex, 0, context.connector_id];
-  return [dayIndex, 1, 0];
-}
-
-function compareScheduleScope(left, right) {
-  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
-    const difference = Number(left[index] || 0) - Number(right[index] || 0);
-    if (difference) return difference;
-  }
-  return 0;
-}
-
-function assertNoPlaceholderGeneratedParent(object) {
-  if ((object.entry.dependencies || []).length > 0) return;
-  let payload;
-  try {
-    payload = JSON.parse(object.body.toString("utf8"));
-  } catch {
-    return;
-  }
-  const containsParentReferences = [
-    payload?.day_summaries,
-    payload?.child_manifests,
-    payload?.connector_manifests,
-    payload?.pollutant_manifests,
-  ].some((value) => Array.isArray(value) && value.length > 0)
-    || typeof payload?.pollutant_manifest_key === "string"
-    || typeof payload?.connector_pollutant_manifest_key === "string";
-  if (containsParentReferences) {
-    throw new Error(`Generated parent has placeholder dependencies: ${object.key}`);
-  }
-}
-
-export function canonicalPublicationScheduleHashInput(schedule) {
-  if (!schedule || typeof schedule !== "object" || Array.isArray(schedule)) {
-    throw new Error("Publication schedule hash input must be an object");
-  }
-  const { schedule_sha256: _excludedScheduleSha256, ...hashFields } = schedule;
-  return Buffer.from(JSON.stringify(recursivelySortJsonValue(hashFields)), "utf8");
-}
-
-export function buildFrozenPublicationSchedule({ proposal, selectedDays = [] }) {
-  const objects = proposal?.objects || [];
-  const byKey = new Map(objects.map((object) => [object.key, object]));
-  if (byKey.size !== objects.length) throw new Error("Publication schedule contains duplicate object keys");
-  const dayOrder = [...new Set(selectedDays)].sort();
-  const indegree = new Map(objects.map((object) => [object.key, 0]));
-  const outgoing = new Map(objects.map((object) => [object.key, []]));
-  const externalDependencyCounts = {};
-  let edgeCount = 0;
-  for (const object of objects) {
-    assertNoPlaceholderGeneratedParent(object);
-    const dependencies = [...new Set(object.entry.dependencies || [])].sort(bytewiseKeyCompare);
-    for (const dependencyKey of dependencies) {
-      const dependency = byKey.get(dependencyKey);
-      const identity = dependencyIdentity(object.entry, dependencyKey);
-      if (!identity) throw new Error(`Publication dependency identity is unresolved: ${object.key} -> ${dependencyKey}`);
-      if (!dependency) {
-        if (!['dropbox', 'overlay'].includes(identity.source)) {
-          throw new Error(`Changed publication dependency is missing from write set: ${object.key} -> ${dependencyKey}`);
-        }
-        externalDependencyCounts[identity.source] = (externalDependencyCounts[identity.source] || 0) + 1;
-        continue;
-      }
-      const dependencyStage = objectPublicationStage(dependency);
-      const parentStage = objectPublicationStage(object);
-      const dependencyScope = scheduleScope(dependency, dayOrder);
-      const parentScope = scheduleScope(object, dayOrder);
-      const scopeComparison = compareScheduleScope(dependencyScope, parentScope);
-      if (scopeComparison > 0
-        || (scopeComparison === 0
-          && publicationStageRank(dependencyStage) > publicationStageRank(parentStage))) {
-        throw new Error(`Publication stage conflict: ${dependencyKey} (${dependencyStage}) -> ${object.key} (${parentStage})`);
-      }
-      outgoing.get(dependencyKey).push(object.key);
-      indegree.set(object.key, indegree.get(object.key) + 1);
-      edgeCount += 1;
-    }
-  }
-  const ordered = [];
-  const scheduledKeys = new Set();
-  const eligibleCompare = (left, right) => compareScheduleScope(scheduleScope(left, dayOrder), scheduleScope(right, dayOrder))
-      || publicationStageRank(objectPublicationStage(left)) - publicationStageRank(objectPublicationStage(right))
-      || bytewiseKeyCompare(left.key, right.key);
-  const eligible = objects.filter((object) => indegree.get(object.key) === 0);
-  eligible.sort((left, right) => -eligibleCompare(left, right));
-  while (eligible.length) {
-    const next = eligible.pop();
-    ordered.push(next);
-    scheduledKeys.add(next.key);
-    let addedEligible = false;
-    for (const parentKey of outgoing.get(next.key)) {
-      indegree.set(parentKey, indegree.get(parentKey) - 1);
-      if (indegree.get(parentKey) === 0) {
-        eligible.push(byKey.get(parentKey));
-        addedEligible = true;
-      }
-    }
-    if (addedEligible) eligible.sort((left, right) => -eligibleCompare(left, right));
-  }
-  if (ordered.length !== objects.length) {
-    const cycleKeys = objects.filter((object) => !scheduledKeys.has(object.key)).map((object) => object.key).sort(bytewiseKeyCompare);
-    throw new Error(`Publication dependency cycle: ${cycleKeys.join(" -> ")}`);
-  }
-  const perStageCounts = {};
-  const entries = ordered.map((object, index) => {
-    const stage = objectPublicationStage(object);
-    perStageCounts[stage] = (perStageCounts[stage] || 0) + 1;
-    const dependencies = [...new Set(object.entry.dependencies || [])].sort(bytewiseKeyCompare);
-    return {
-      position: index + 1,
-      canonical_key: object.key,
-      proposed_sha256: object.entry.sha256,
-      proposed_bytes: Number(object.entry.bytes),
-      publication_stage: stage,
-      direct_changed_dependencies: dependencies.filter((key) => byKey.has(key)),
-      dependencies,
-      dependency_identities: Object.fromEntries(dependencies.map((key) => [key, dependencyIdentity(object.entry, key)])),
-    };
-  });
-  const schedule = {
-    contract_version: PUBLICATION_SCHEDULE_CONTRACT_VERSION,
-    tie_breaker: "bytewise_utf8_key_among_eligible_nodes",
-    day_barrier_order: dayOrder,
-    total_positions: entries.length,
-    changed_dependency_edge_count: edgeCount,
-    external_dependency_counts: externalDependencyCounts,
-    per_stage_counts: perStageCounts,
-    entries,
-  };
-  return { ...schedule, schedule_sha256: sha256Hex(canonicalPublicationScheduleHashInput(schedule)) };
-}
-
 export function canonicalMutationEventHashInput(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) {
     throw new Error("Mutation journal event hash input must be an object");
@@ -310,7 +155,7 @@ export function canonicalMutationEventHashInput(event) {
   return Buffer.from(JSON.stringify(recursivelySortJsonValue(hashFields)), "utf8");
 }
 
-export function createInitialApplyProgressState({ runStatePath, runId, counts, selectedDays, schedule = null }) {
+export function createInitialApplyProgressState({ runStatePath, runId, counts, selectedDays }) {
   const perDayStatus = Object.fromEntries(selectedDays.map((dayUtc) => [dayUtc, {
     day_utc: dayUtc,
     status: "not_started",
@@ -331,11 +176,6 @@ export function createInitialApplyProgressState({ runStatePath, runId, counts, s
       current_object_key: null,
       current_deletion_prefix: null,
       current_publication_stage: "final_proposal_validation",
-      publication_schedule_sha256: schedule?.schedule_sha256 || null,
-      scheduled_changed_object_count: Number(schedule?.total_positions || 0),
-      completed_scheduled_object_count: 0,
-      last_completed_schedule_position: 0,
-      next_schedule_position: Number(schedule?.total_positions || 0) ? 1 : null,
       index_publication_started: false,
       index_publication_completed: false,
       last_checkpoint_at_utc: null,
@@ -411,7 +251,6 @@ export function createApplyPersistence({
 
   const snapshot = () => ({
     compact_checkpoint_count: checkpointCount,
-    complete_run_state_write_count: 0,
     node_complete_run_state_write_count: 0,
     coordinator_complete_run_state_write_count: 0,
     total_complete_run_state_write_count: 0,
@@ -611,12 +450,12 @@ export function createBoundedProgressReporter({
 export function createCanonicalGeneratedIndexMutationAdapter({
   r2,
   runState,
+  counts,
+  syncProgress,
   persistence,
   executeOperation,
 }) {
   const audit = runState.apply.generated_generic_index_objects ||= {};
-  const schedule = runState.apply.publication_schedule;
-  const scheduleByKey = new Map((schedule?.entries || []).map((entry) => [entry.canonical_key, entry]));
   return {
     audit,
     r2: {
@@ -624,21 +463,17 @@ export function createCanonicalGeneratedIndexMutationAdapter({
       proposal_sink: async (generated) => {
         const key = safeKey(generated?.key);
         const body = Buffer.from(String(generated?.body ?? ""), "utf8");
-        const changed = generated?.status !== "skipped_unchanged";
-        if (changed && !scheduleByKey.has(key)) {
-          throw new Error(`Generated callback attempted unscheduled changed key: ${key}`);
-        }
         audit[key] = {
           proposed: true,
           built: true,
           structurally_validated: true,
-          changed,
+          changed: generated?.status !== "skipped_unchanged",
           status: String(generated?.status || "planned"),
           bytes: body.byteLength,
           sha256: sha256Hex(body),
           content_type: String(generated?.content_type || contentTypeForKey(key)),
-          included_in_write_set: changed,
-          publication_stage: scheduleByKey.get(key)?.publication_stage || null,
+          included_in_write_set: generated?.status !== "skipped_unchanged",
+          publication_stage: "generic_targeted_index",
         };
         await r2?.proposal_sink?.(generated);
       },
@@ -646,24 +481,45 @@ export function createCanonicalGeneratedIndexMutationAdapter({
         const key = safeKey(generated?.key);
         const body = Buffer.from(String(generated?.body ?? ""), "utf8");
         const sha256 = sha256Hex(body);
-        const scheduled = scheduleByKey.get(key);
-        if (!scheduled) throw new Error(`Generated callback attempted unscheduled changed key: ${key}`);
-        const dependencies = [...new Set(generated?.dependencies || [])].sort(bytewiseKeyCompare);
-        if (body.byteLength !== Number(generated?.bytes) || sha256 !== generated?.sha256
-          || body.byteLength !== scheduled.proposed_bytes || sha256 !== scheduled.proposed_sha256
-          || JSON.stringify(dependencies) !== JSON.stringify(scheduled.dependencies)) {
+        if (body.byteLength !== Number(generated?.bytes) || sha256 !== generated?.sha256) {
           throw new Error(`Generated generic index identity mismatch: ${key}`);
         }
         if (audit[key]?.status === "succeeded") {
           throw new Error(`Generated generic index was published more than once: ${key}`);
         }
-        const entry = runState.objects?.[key];
-        if (!entry) throw new Error(`Frozen generated proposal is unavailable: ${key}`);
+        const entry = {
+          proposed: true,
+          built: true,
+          structurally_validated: true,
+          changed: true,
+          status: "planned",
+          stage: "generic_targeted_index",
+          bytes: body.byteLength,
+          sha256,
+          content_type: String(generated?.content_type || contentTypeForKey(key)),
+          dependencies: [],
+          dependency_identities: {},
+          post_put_verification_get_attempt_count: 0,
+          post_put_verification_get_count: 0,
+        };
         Object.assign(audit[key] ||= {}, entry, { included_in_write_set: true });
+        counts.planned_writes += 1;
+        counts.planned_post_put_verifications += 1;
+        syncProgress();
+        persistence.appendEvent({
+          event_type: "generic_index_write_planned",
+          canonical_key: key,
+          ...mutationContext(key, "generic_targeted_index"),
+          bytes: body.byteLength,
+          sha256,
+          status: "planned",
+          planned_writes: counts.planned_writes,
+          planned_post_put_verifications: counts.planned_post_put_verifications,
+        });
         await executeOperation({
           kind: "put",
           key,
-          object: { key, entry, body, domain: objectDomain(key), schedule: scheduled },
+          object: { key, entry, body, domain: objectDomain(key) },
         });
         persistence.flush();
         Object.assign(audit[key], {
@@ -883,7 +739,7 @@ export function validateLocalProposal(runState) {
   if (runState.environment !== "CIC-Test") {
     throw new Error(`Refusing canonical apply outside CIC-Test: ${runState.environment || "(unset)"}`);
   }
-  const objects = Object.entries(runState.objects || {}).sort(([left], [right]) => bytewiseKeyCompare(left, right));
+  const objects = Object.entries(runState.objects || {}).sort(([left], [right]) => left.localeCompare(right));
   const prefixes = Array.isArray(runState.tombstone_prefixes) ? runState.tombstone_prefixes : [];
   if (!objects.length && !prefixes.length) throw new Error("canonical proposal has no planned operations");
   const normalizedObjects = [];
@@ -975,7 +831,7 @@ export function validateLocalProposal(runState) {
     }
   }
   return {
-    objects: normalizedObjects.sort((left, right) => bytewiseKeyCompare(left.key, right.key)),
+    objects: normalizedObjects.sort((left, right) => publicationRank(left.key) - publicationRank(right.key) || left.key.localeCompare(right.key)),
     prefixes: normalizedPrefixes.sort((left, right) => left.domain.localeCompare(right.domain) || left.prefix.localeCompare(right.prefix)),
   };
 }
@@ -1154,16 +1010,6 @@ export async function putAndVerifyObject({
 }) {
   const entry = object.entry;
   const context = mutationContext(object.key, objectPublicationStage(object));
-  const scheduleEvidence = {
-    publication_schedule_sha256: runState?.apply?.publication_schedule?.schedule_sha256 || null,
-    schedule_position: Number(object?.schedule?.position || 0),
-    total_schedule_positions: Number(runState?.apply?.publication_schedule?.total_positions || 0),
-  };
-  if (!scheduleEvidence.publication_schedule_sha256
-    || scheduleEvidence.schedule_position <= 0
-    || scheduleEvidence.total_schedule_positions <= 0) {
-    throw new Error(`Scheduled PUT evidence is unavailable: ${object.key}`);
-  }
   if (Number(entry.post_put_verification_get_attempt_count || 0) !== 0
     || Number(entry.post_put_verification_get_count || 0) !== 0) {
     throw new Error(`Changed object already has post-PUT GET bookkeeping: ${object.key}`);
@@ -1174,7 +1020,6 @@ export async function putAndVerifyObject({
     event_type: "put_started",
     canonical_key: object.key,
     ...context,
-    ...scheduleEvidence,
     bytes: object.body.byteLength,
     sha256: entry.sha256,
     status: "started",
@@ -1187,7 +1032,6 @@ export async function putAndVerifyObject({
       event_type: "put_completed",
       canonical_key: object.key,
       ...context,
-      ...scheduleEvidence,
       bytes: object.body.byteLength,
       sha256: entry.sha256,
       status: "completed",
@@ -1198,7 +1042,6 @@ export async function putAndVerifyObject({
       event_type: "post_put_get_started",
       canonical_key: object.key,
       ...context,
-      ...scheduleEvidence,
       bytes: object.body.byteLength,
       sha256: entry.sha256,
       status: "started",
@@ -1233,7 +1076,6 @@ export async function putAndVerifyObject({
       event_type: "post_put_get_verified",
       canonical_key: object.key,
       ...context,
-      ...scheduleEvidence,
       bytes: object.body.byteLength,
       sha256: entry.sha256,
       status: "verified",
@@ -1251,7 +1093,6 @@ export async function putAndVerifyObject({
         event_type: "put_or_verification_failed",
         canonical_key: object.key,
         ...context,
-        ...scheduleEvidence,
         bytes: object.body.byteLength,
         sha256: entry.sha256,
         status: "failed",
@@ -2355,6 +2196,8 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     listAllObjects: adapters.listAllObjects || r2ListAllObjects,
     putObject: adapters.putObject || r2PutObject,
   };
+  const targetedIndexUpdater = adapters.updateR2HistoryIndexesTargeted
+    || updateR2HistoryIndexesTargeted;
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   const proposal = validateLocalProposal(runState);
   const dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
@@ -2371,37 +2214,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       finished_at_utc: new Date().toISOString(),
       persistence: {
         compact_checkpoint_count: 0,
-        complete_run_state_write_count: 1,
-        node_complete_run_state_write_count: 1,
-        coordinator_complete_run_state_write_count: 0,
-        total_complete_run_state_write_count: 1,
-        mutation_journal_event_count: 0,
-        mutation_journal_flush_count: 0,
-        deleted_key_sidecar_count: 0,
-      },
-    };
-    atomicWriteJson(runStatePath, runState);
-    throw error;
-  }
-  const selectedDays = dedicatedSosProposal.dedicated
-    ? dedicatedSosProposal.selected_days
-    : [...new Set([
-      ...proposal.prefixes.map((entry) => mutationContext(entry.prefix).day_utc),
-      ...proposal.objects.map((entry) => mutationContext(entry.key).day_utc),
-    ].filter(Boolean))].sort();
-  let publicationSchedule;
-  try {
-    publicationSchedule = buildFrozenPublicationSchedule({ proposal, selectedDays });
-  } catch (error) {
-    runState.apply = {
-      status: "failed",
-      current_phase: "publication_schedule_validation",
-      publication_schedule_validation: "failed",
-      error: error instanceof Error ? error.message : String(error),
-      finished_at_utc: new Date().toISOString(),
-      persistence: {
-        compact_checkpoint_count: 0,
-        complete_run_state_write_count: 1,
         node_complete_run_state_write_count: 1,
         coordinator_complete_run_state_write_count: 0,
         total_complete_run_state_write_count: 1,
@@ -2415,11 +2227,8 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
   }
   const counts = {
     planned_deletions: proposal.prefixes.length,
-    planned_writes: publicationSchedule.total_positions,
-    planned_post_put_verifications: publicationSchedule.total_positions,
-    scheduled_changed_objects: publicationSchedule.total_positions,
-    completed_scheduled_objects: 0,
-    last_completed_schedule_position: 0,
+    planned_writes: proposal.objects.length,
+    planned_post_put_verifications: proposal.objects.length,
     deleted_objects: 0,
     completed_deletions: 0,
     completed_writes: 0,
@@ -2427,19 +2236,22 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     completed_post_put_verifications: 0,
     failed_operations: 0,
   };
+  const selectedDays = dedicatedSosProposal.dedicated
+    ? dedicatedSosProposal.selected_days
+    : [...new Set([
+      ...proposal.prefixes.map((entry) => mutationContext(entry.prefix).day_utc),
+      ...proposal.objects.map((entry) => mutationContext(entry.key).day_utc),
+    ].filter(Boolean))].sort();
   const { progressState, perDayStatus } = createInitialApplyProgressState({
     runStatePath,
     runId: runState.run_id,
     counts,
     selectedDays,
-    schedule: publicationSchedule,
   });
   runState.apply = {
     status: "running",
     started_at_utc: new Date().toISOString(),
     final_proposal_graph_validation: "succeeded",
-    publication_schedule_validation: "succeeded",
-    publication_schedule: publicationSchedule,
     dedicated_sos_historical_proposal: dedicatedSosProposal,
     connector_day_publication: {},
     ...counts,
@@ -2462,7 +2274,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       finished_at_utc: new Date().toISOString(),
       persistence: {
         compact_checkpoint_count: 0,
-        complete_run_state_write_count: 1,
         node_complete_run_state_write_count: 1,
         coordinator_complete_run_state_write_count: 0,
         total_complete_run_state_write_count: 1,
@@ -2505,7 +2316,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     );
     runState.apply.persistence = {
       ...persistence.snapshot(),
-      complete_run_state_write_count: completeRunStateWriteCount + coordinatorWriteCount,
       node_complete_run_state_write_count: completeRunStateWriteCount,
       coordinator_complete_run_state_write_count: coordinatorWriteCount,
       total_complete_run_state_write_count:
@@ -2524,8 +2334,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     runState.apply.persistence.node_complete_run_state_write_count = nextWriteCount;
     runState.apply.persistence.total_complete_run_state_write_count = nextWriteCount
       + Number(runState.apply.persistence.coordinator_complete_run_state_write_count || 0);
-    runState.apply.persistence.complete_run_state_write_count =
-      runState.apply.persistence.total_complete_run_state_write_count;
     atomicWriteJson(runStatePath, runState);
     completeRunStateWriteCount = nextWriteCount;
   };
@@ -2567,8 +2375,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       event_type: "canonical_apply_started",
       publication_stage: "final_proposal_validated",
       status: "started",
-      publication_schedule_sha256: publicationSchedule.schedule_sha256,
-      total_schedule_positions: publicationSchedule.total_positions,
       planned_deletions: counts.planned_deletions,
       planned_writes: counts.planned_writes,
       planned_post_put_verifications: counts.planned_post_put_verifications,
@@ -2579,21 +2385,22 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     const historyWriterClient = adapters.historyWriterClient;
     if (!historyWriterClient) throw new Error("canonical apply requires one retained PostgreSQL history-writer session");
     const operations = [];
-    for (const prefixEntry of proposal.prefixes) {
-      operations.push({ kind: "delete", key: prefixEntry.prefix, prefixEntry });
-    }
-    const objectByKey = new Map(proposal.objects.map((object) => [object.key, object]));
-    for (const scheduleEntry of publicationSchedule.entries) {
-      const object = objectByKey.get(scheduleEntry.canonical_key);
-      if (!object) throw new Error(`Scheduled object is unavailable during apply setup: ${scheduleEntry.canonical_key}`);
-      object.schedule = scheduleEntry;
-      operations.push({ kind: "put", key: object.key, object });
+    const applyDomains = dedicatedSosProposal.dedicated
+      ? ["observations"]
+      : ["observations", "aqilevels"];
+    for (const domain of applyDomains) {
+      for (const prefixEntry of proposal.prefixes.filter((entry) => entry.domain === domain)) {
+        operations.push({ kind: "delete", key: prefixEntry.prefix, prefixEntry });
+      }
+      for (const object of proposal.objects.filter((entry) => entry.domain === domain)) {
+        operations.push({ kind: "put", key: object.key, object });
+      }
     }
     const connectorGroups = new Map();
     const dayGroups = new Map();
     const globalOperations = [];
     for (const operation of operations) {
-      if (operation.key.startsWith("history/_index_v2/")) {
+      if (dedicatedSosProposal.dedicated && operation.key.startsWith("history/_index_v2/")) {
         globalOperations.push(operation);
         continue;
       }
@@ -2610,8 +2417,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         globalOperations.push(operation);
       }
     }
-    const scheduleByKey = new Map(publicationSchedule.entries.map((entry) => [entry.canonical_key, entry]));
-    let nextSchedulePosition = 1;
     const executeOperation = async (operation, verifiedBodyCache = null) => {
       progressState.current_object_key = operation.kind === "put" ? operation.key : null;
       progressState.current_deletion_prefix = operation.kind === "delete" ? operation.key : null;
@@ -2633,18 +2438,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         if (!dedicatedSosProposal.dedicated) await checkpoint("after_deletion_verification");
       } else {
         const { object } = operation;
-        const scheduled = scheduleByKey.get(object.key);
-        const actualDependencies = [...new Set(object.entry.dependencies || [])].sort(bytewiseKeyCompare);
-        if (!scheduled) throw new Error(`Unscheduled changed PUT rejected: ${object.key}`);
-        if (scheduled.position !== nextSchedulePosition) {
-          throw new Error(`Out-of-order scheduled PUT rejected: expected position ${nextSchedulePosition}, received ${scheduled.position} (${object.key})`);
-        }
-        if (object.body.byteLength !== scheduled.proposed_bytes
-          || object.entry.sha256 !== scheduled.proposed_sha256
-          || objectPublicationStage(object) !== scheduled.publication_stage
-          || JSON.stringify(actualDependencies) !== JSON.stringify(scheduled.dependencies)) {
-          throw new Error(`Frozen publication schedule identity mismatch: ${object.key}`);
-        }
         assertPublicationDependenciesVerified({ object, runState });
         await verifyLiveObservationPartition({
           r2,
@@ -2666,13 +2459,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         counts.completed_writes += 1;
         counts.get_verified_writes += 1;
         counts.completed_post_put_verifications += 1;
-        counts.completed_scheduled_objects += 1;
-        counts.last_completed_schedule_position = scheduled.position;
-        progressState.completed_scheduled_object_count = counts.completed_scheduled_objects;
-        progressState.last_completed_schedule_position = scheduled.position;
-        nextSchedulePosition += 1;
-        progressState.next_schedule_position = nextSchedulePosition <= publicationSchedule.total_positions
-          ? nextSchedulePosition : null;
         await maybeCheckpointAndLog();
       }
     };
@@ -2737,6 +2523,14 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         diagnostics: runState.writer_locks,
         finalize: async () => {
           for (const operation of dayOperations) {
+            if (operation.kind === "put" && !dedicatedSosProposal.dedicated) {
+              await prepareMergedDayManifest({
+                r2,
+                object: operation.object,
+                adapters: resolvedAdapters,
+                exactProposedConnectorSet: false,
+              });
+            }
             await executeOperation(operation);
           }
           return { operation_count: dayOperations.length };
@@ -2768,15 +2562,34 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
           diagnostics: runState.writer_locks,
           finalize: async () => {
             for (const operation of globalOperations) await executeOperation(operation);
-            if (affectedDays.length) {
+            if (affectedDays.length && !dedicatedSosProposal.dedicated) {
+              const { r2: canonicalIndexR2 } = createCanonicalGeneratedIndexMutationAdapter({
+                r2,
+                runState,
+                counts,
+                syncProgress,
+                persistence,
+                executeOperation,
+              });
+              runState.global_index_finalization = await targetedIndexUpdater({
+                env: process.env,
+                r2: canonicalIndexR2,
+                historyVersion: "v2",
+                domains: ["observations", "aqilevels"],
+                affectedDaysUtc: affectedDays,
+                connectorId: null,
+                updateLatestIndex: true,
+                strictMissingTimeseriesCounts: true,
+                writeR2: true,
+              });
+            } else if (affectedDays.length) {
               runState.global_index_finalization = {
                 status: "succeeded",
-                mode: dedicatedSosProposal.dedicated ? "sos-light" : "canonical-preflight",
-                authority: "frozen_preflight_publication_schedule",
+                mode: "sos-light",
+                authority: "planned_dropbox_baseline_plus_assembled_days",
                 affected_days_utc: affectedDays,
                 planned_index_object_count: globalOperations.length,
-                live_generated_object_discovery_used: false,
-                publication_schedule_sha256: publicationSchedule.schedule_sha256,
+                live_observation_body_rebuild_used: false,
               };
             }
           },
@@ -2787,8 +2600,9 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         event_type: "index_publication_completed",
         publication_stage: "affected_indexes",
         status: "verified",
-        completed_index_object_count: globalOperations.length,
-        publication_schedule_sha256: publicationSchedule.schedule_sha256,
+        completed_index_object_count: globalOperations.length + Object.values(
+          runState.apply.generated_generic_index_objects || {},
+        ).filter((entry) => entry?.status === "succeeded").length,
       });
       persistence.flush();
       await checkpoint("after_affected_index_publication");
@@ -2852,10 +2666,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         ) ? "succeeded" : "failed",
       });
     }
-    if (counts.completed_scheduled_objects !== publicationSchedule.total_positions
-      || nextSchedulePosition !== publicationSchedule.total_positions + 1) {
-      throw new Error(`Publication schedule execution incomplete: completed ${counts.completed_scheduled_objects}/${publicationSchedule.total_positions}`);
-    }
     progressState.status = "succeeded";
     progressState.current_phase = "canonical_apply_completed";
     progressState.current_day_utc = null;
@@ -2866,8 +2676,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       event_type: "canonical_apply_completed",
       publication_stage: "complete",
       status: "succeeded",
-      publication_schedule_sha256: publicationSchedule.schedule_sha256,
-      last_completed_schedule_position: counts.last_completed_schedule_position,
       ...counts,
     });
     persistence.close();
@@ -2915,10 +2723,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         publication_stage: progressState.current_publication_stage,
         status: "failed",
         failure_message: message,
-        publication_schedule_sha256: publicationSchedule.schedule_sha256,
-        last_completed_schedule_position: counts.last_completed_schedule_position,
-        next_schedule_position: nextSchedulePosition <= publicationSchedule.total_positions
-          ? nextSchedulePosition : null,
         last_completed_day_utc: progressState.last_completed_day_utc,
       });
       persistence.flush();

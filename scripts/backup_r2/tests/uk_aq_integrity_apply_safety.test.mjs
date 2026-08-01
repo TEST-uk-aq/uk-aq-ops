@@ -9,6 +9,7 @@ import {
   applyValidatedProposal,
   applySosLightPerDayUnits,
   assertPublicationDependenciesVerified,
+  buildFrozenPublicationSchedule,
   canonicalMutationEventHashInput,
   createApplyPersistence,
   createBoundedProgressReporter,
@@ -73,6 +74,114 @@ function stateEntry(filePath, key, dependencies = [], dependencyIdentities = {})
     dependency_identities: dependencyIdentities,
   };
 }
+
+function attachTestSchedule(runState, objects) {
+  const schedule = buildFrozenPublicationSchedule({ proposal: { objects }, selectedDays: [] });
+  runState.apply = { ...(runState.apply || {}), publication_schedule: schedule };
+  for (const object of objects) {
+    object.schedule = schedule.entries.find((entry) => entry.canonical_key === object.key);
+  }
+  return schedule;
+}
+
+function graphObject(key, bodyValue, {
+  dependencies = [], dependencyIdentities = {}, stage = "scoped_timeseries_index",
+} = {}) {
+  const body = Buffer.from(JSON.stringify(bodyValue));
+  return {
+    key,
+    body,
+    entry: {
+      bytes: body.byteLength,
+      sha256: sha256Hex(body),
+      dependencies,
+      dependency_identities: dependencyIdentities,
+      stage,
+    },
+  };
+}
+
+test("frozen publication schedule topologically reverses parent-first input and uses bytewise eligible ties", () => {
+  const childKey = "history/_index_v2/z-child.json";
+  const siblingKey = "history/_index_v2/a-independent.json";
+  const parentKey = "history/_index_v2/parent.json";
+  const child = graphObject(childKey, { leaf: true });
+  const sibling = graphObject(siblingKey, { leaf: true });
+  const parent = graphObject(parentKey, { day_summaries: [{ day_utc: "2026-07-01" }] }, {
+    dependencies: [childKey],
+    dependencyIdentities: {
+      [childKey]: { source: "planned_overlay", sha256: child.entry.sha256, bytes: child.entry.bytes },
+    },
+    stage: "latest_timeseries_index",
+  });
+  const schedule = buildFrozenPublicationSchedule({ proposal: { objects: [parent, child, sibling] } });
+  assert.deepEqual(schedule.entries.map((entry) => entry.canonical_key), [siblingKey, childKey, parentKey]);
+  assert.deepEqual(schedule.entries[2].direct_changed_dependencies, [childKey]);
+  assert.match(schedule.schedule_sha256, /^[a-f0-9]{64}$/);
+});
+
+test("frozen publication schedule accepts pinned external roots and rejects incomplete graphs", () => {
+  const externalKey = "history/v2/observations/day_utc=2026-07-01/connector_id=1/pollutant_code=pm25/manifest.json";
+  const parent = graphObject("history/_index_v2/scoped.json", { pollutant_manifest_key: externalKey }, {
+    dependencies: [externalKey],
+    dependencyIdentities: {
+      [externalKey]: { source: "dropbox", sha256: "a".repeat(64), bytes: 42 },
+    },
+  });
+  const schedule = buildFrozenPublicationSchedule({ proposal: { objects: [parent] } });
+  assert.deepEqual(schedule.external_dependency_counts, { dropbox: 1 });
+
+  parent.entry.dependency_identities[externalKey].source = "planned_overlay";
+  assert.throws(
+    () => buildFrozenPublicationSchedule({ proposal: { objects: [parent] } }),
+    /missing from write set/,
+  );
+  parent.entry.dependencies = [];
+  parent.entry.dependency_identities = {};
+  assert.throws(
+    () => buildFrozenPublicationSchedule({ proposal: { objects: [parent] } }),
+    /placeholder dependencies/,
+  );
+});
+
+test("frozen publication schedule rejects cycles and publication-stage conflicts", () => {
+  const a = graphObject("history/_index_v2/a.json", { leaf: true });
+  const b = graphObject("history/_index_v2/b.json", { leaf: true });
+  a.entry.dependencies = [b.key];
+  a.entry.dependency_identities = { [b.key]: { source: "planned_overlay", sha256: b.entry.sha256, bytes: b.entry.bytes } };
+  b.entry.dependencies = [a.key];
+  b.entry.dependency_identities = { [a.key]: { source: "planned_overlay", sha256: a.entry.sha256, bytes: a.entry.bytes } };
+  assert.throws(
+    () => buildFrozenPublicationSchedule({ proposal: { objects: [a, b] } }),
+    /dependency cycle/,
+  );
+
+  const late = graphObject("history/_index_v2/late.json", { leaf: true }, { stage: "latest_snapshot" });
+  const early = graphObject("history/_index_v2/early.json", { leaf: true }, {
+    dependencies: [late.key],
+    dependencyIdentities: { [late.key]: { source: "planned_overlay", sha256: late.entry.sha256, bytes: late.entry.bytes } },
+    stage: "scoped_timeseries_index",
+  });
+  assert.throws(
+    () => buildFrozenPublicationSchedule({ proposal: { objects: [early, late] } }),
+    /Publication stage conflict/,
+  );
+});
+
+test("frozen publication schedule preserves day barriers and places a changed latest snapshot last", () => {
+  const day1Child = graphObject("history/v2/observations/day_utc=2026-07-01/connector_id=1/a.parquet", { leaf: 1 }, { stage: "observations_data" });
+  const day1Parent = graphObject("history/v2/observations/day_utc=2026-07-01/manifest.json", { leaf: 1 }, { stage: "day_parent" });
+  const day2Child = graphObject("history/v2/observations/day_utc=2026-07-02/connector_id=1/a.parquet", { leaf: 2 }, { stage: "observations_data" });
+  const globalIndex = graphObject("history/_index_v2/global.json", { leaf: 3 });
+  const snapshot = graphObject("latest_snapshots/v2/manifest.json", { leaf: 4 }, { stage: "latest_snapshot" });
+  const schedule = buildFrozenPublicationSchedule({
+    proposal: { objects: [snapshot, day2Child, globalIndex, day1Parent, day1Child] },
+    selectedDays: ["2026-07-01", "2026-07-02"],
+  });
+  assert.deepEqual(schedule.entries.map((entry) => entry.canonical_key), [
+    day1Child.key, day1Parent.key, day2Child.key, globalIndex.key, snapshot.key,
+  ]);
+});
 
 function sosLightEvidence(dayUtc = "2026-06-17") {
   return {
@@ -1224,6 +1333,7 @@ test("changed-object apply records exactly one post-PUT verification GET", async
     },
   };
   const object = { key, body, entry };
+  attachTestSchedule(runState, [object]);
   await putAndVerifyObject({
     r2: {},
     runState,
@@ -1261,14 +1371,22 @@ test("multiple object transitions append detailed events without rewriting compl
     progressState,
   });
   let getCount = 0;
+  const runState = { objects: {}, apply: {} };
+  const objects = [];
   for (let index = 0; index < 3; index += 1) {
     const key = `history/_index_v2/object-${index}.json`;
     const body = Buffer.from(JSON.stringify({ index }));
-    const entry = { bytes: body.byteLength, sha256: sha256Hex(body) };
+    const entry = { bytes: body.byteLength, sha256: sha256Hex(body), dependencies: [], dependency_identities: {} };
+    runState.objects[key] = entry;
+    objects.push({ key, body, entry });
+  }
+  attachTestSchedule(runState, objects);
+  for (const object of objects) {
+    const { key, body, entry } = object;
     await putAndVerifyObject({
       r2: {},
-      runState: { objects: { [key]: entry } },
-      object: { key, body, entry },
+      runState,
+      object,
       persistence,
       adapters: {
         putObject: async () => {},
@@ -1293,6 +1411,54 @@ test("multiple object transitions append detailed events without rewriting compl
   assert.equal(persistence.snapshot().compact_checkpoint_count, 0);
 });
 
+test("a failed scheduled PUT preserves the completed position and leaves later positions untouched", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-schedule-boundary-"));
+  const runStatePath = path.join(root, "run-state.json");
+  fs.writeFileSync(runStatePath, "{}\n");
+  const persistence = createApplyPersistence({
+    runStatePath,
+    runId: "schedule-boundary-test",
+    progressState: { run_id: "schedule-boundary-test", status: "running" },
+  });
+  const runState = { objects: {}, apply: {} };
+  const objects = [1, 2, 3].map((position) => {
+    const key = `history/_index_v2/boundary-${position}.json`;
+    const body = Buffer.from(JSON.stringify({ position }));
+    const entry = { bytes: body.byteLength, sha256: sha256Hex(body), dependencies: [], dependency_identities: {} };
+    runState.objects[key] = entry;
+    return { key, body, entry };
+  });
+  attachTestSchedule(runState, objects);
+  const attempted = [];
+  let lastCompletedPosition = 0;
+  for (const object of objects) {
+    try {
+      await putAndVerifyObject({
+        r2: {}, runState, object, persistence,
+        adapters: {
+          putObject: async () => {
+            attempted.push(object.key);
+            if (object.schedule.position === 2) throw new Error("simulated position-2 PUT failure");
+          },
+          getObject: async () => ({ body: object.body, bytes: object.body.byteLength }),
+        },
+      });
+      lastCompletedPosition = object.schedule.position;
+    } catch (error) {
+      assert.match(error.message, /position-2 PUT failure/);
+      break;
+    }
+  }
+  persistence.closeAfterFailure();
+  assert.equal(lastCompletedPosition, 1);
+  assert.deepEqual(attempted, [objects[0].key, objects[1].key]);
+  assert.equal(objects[2].entry.remote_attempted, undefined);
+  const events = fs.readFileSync(persistence.journalPath, "utf8").trim().split("\n").map(JSON.parse);
+  const failure = events.find((event) => event.event_type === "put_or_verification_failed");
+  assert.equal(failure.schedule_position, 2);
+  assert.equal(failure.publication_schedule_sha256, runState.apply.publication_schedule.schedule_sha256);
+});
+
 test("mutation event hash canonicalization has the cross-language nested-object vector", () => {
   const fixture = {
     z: { b: 2, a: [3, { y: "✓", x: null }] },
@@ -1312,9 +1478,9 @@ test("generic generated index writes use canonical persistence and unchanged ind
   const runStatePath = path.join(root, "run-state.json");
   fs.writeFileSync(runStatePath, "{}\n");
   const counts = {
-    planned_writes: 4,
+    planned_writes: 5,
     completed_writes: 4,
-    planned_post_put_verifications: 4,
+    planned_post_put_verifications: 5,
     completed_post_put_verifications: 4,
   };
   const progressState = { run_id: "generic-index-test", status: "running" };
@@ -1323,12 +1489,24 @@ test("generic generated index writes use canonical persistence and unchanged ind
     runId: "generic-index-test",
     progressState,
   });
-  const runState = { apply: {} };
+  const runState = { apply: {}, objects: {} };
   let putCount = 0;
   let getCount = 0;
   const unchangedBody = "{}\n";
   const unchangedEtag = createHash("md5").update(unchangedBody).digest("hex");
   const unchangedKey = "history/_index_v2/observations_timeseries/unchanged.json";
+  const changedKey = "history/_index_v2/observations_timeseries/changed.json";
+  const changedBody = "{\"changed\":true}\n";
+  const changedBuffer = Buffer.from(changedBody);
+  const changedEntry = {
+    bytes: changedBuffer.byteLength,
+    sha256: sha256Hex(changedBuffer),
+    dependencies: [],
+    dependency_identities: {},
+  };
+  const changedObject = { key: changedKey, body: changedBuffer, entry: changedEntry };
+  runState.objects[changedKey] = changedEntry;
+  attachTestSchedule(runState, [changedObject]);
   const { r2: generatedR2, audit } = createCanonicalGeneratedIndexMutationAdapter({
     r2: {
       head_object: async ({ key }) => key === unchangedKey
@@ -1357,6 +1535,24 @@ test("generic generated index writes use canonical persistence and unchanged ind
       counts.completed_post_put_verifications += 1;
     },
   });
+  await assert.rejects(
+    generatedR2.proposal_sink({
+      key: "history/_index_v2/unscheduled.json",
+      body: "{}\n",
+      status: "planned",
+    }),
+    /unscheduled changed key/,
+  );
+  await assert.rejects(
+    generatedR2.canonical_mutation_sink({
+      key: changedKey,
+      body: "{\"changed\":false}\n",
+      bytes: Buffer.byteLength("{\"changed\":false}\n"),
+      sha256: sha256Hex("{\"changed\":false}\n"),
+      dependencies: [],
+    }),
+    /identity mismatch/,
+  );
   await r2PutObjectIfChanged({
     r2: generatedR2,
     key: unchangedKey,
@@ -1364,8 +1560,6 @@ test("generic generated index writes use canonical persistence and unchanged ind
     content_type: "application/json; charset=utf-8",
     writeR2: true,
   });
-  const changedKey = "history/_index_v2/observations_timeseries/changed.json";
-  const changedBody = "{\"changed\":true}\n";
   await r2PutObjectIfChanged({
     r2: generatedR2,
     key: changedKey,
@@ -1386,7 +1580,6 @@ test("generic generated index writes use canonical persistence and unchanged ind
   assert.ok(persistence.snapshot().mutation_journal_flush_count >= 1);
   const events = fs.readFileSync(persistence.journalPath, "utf8").trim().split("\n").map(JSON.parse);
   assert.deepEqual(events.map((event) => event.event_type), [
-    "generic_index_write_planned",
     "put_started",
     "put_completed",
     "post_put_get_started",
@@ -1395,6 +1588,9 @@ test("generic generated index writes use canonical persistence and unchanged ind
   for (const event of events) {
     assert.equal(event.event_hash_contract_version, MUTATION_EVENT_HASH_CONTRACT_VERSION);
     assert.equal(sha256Hex(canonicalMutationEventHashInput(event)), event.event_sha256);
+    assert.equal(event.publication_schedule_sha256, runState.apply.publication_schedule.schedule_sha256);
+    assert.equal(event.schedule_position, 1);
+    assert.equal(event.total_schedule_positions, 1);
   }
 });
 

@@ -4403,6 +4403,50 @@ class ApplyPersistenceTests(unittest.TestCase):
         completed_gets: int = 0,
         completed_deletions: int = 0,
     ) -> tuple[dict[str, object], Path, list[dict[str, object]]]:
+        scheduled_types = {
+            "put_started", "put_completed", "post_put_get_started",
+            "post_put_get_verified", "put_or_verification_failed",
+        }
+        per_type_positions: dict[str, int] = {}
+        scheduled_event_count = max(
+            [event_types.count(value) for value in scheduled_types] or [0]
+        )
+        schedule_count = max(completed_writes, completed_gets, scheduled_event_count)
+        objects: dict[str, object] = {}
+        schedule_entries: list[dict[str, object]] = []
+        for position in range(1, schedule_count + 1):
+            key = f"history/_index_v2/test-{position}.json"
+            body = f'{{"position":{position}}}'.encode()
+            sha256 = hashlib.sha256(body).hexdigest()
+            objects[key] = {
+                "sha256": sha256,
+                "bytes": len(body),
+                "stage": "global_index",
+                "dependencies": [],
+            }
+            schedule_entries.append({
+                "position": position,
+                "canonical_key": key,
+                "proposed_sha256": sha256,
+                "proposed_bytes": len(body),
+                "publication_stage": "global_index",
+                "direct_changed_dependencies": [],
+                "dependencies": [],
+                "dependency_identities": {},
+            })
+        schedule: dict[str, object] = {
+            "contract_version": MODULE.PUBLICATION_SCHEDULE_CONTRACT_VERSION,
+            "tie_breaker": "bytewise_utf8_key_among_eligible_nodes",
+            "day_barrier_order": [],
+            "total_positions": schedule_count,
+            "changed_dependency_edge_count": 0,
+            "external_dependency_counts": {},
+            "per_stage_counts": ({"global_index": schedule_count} if schedule_count else {}),
+            "entries": schedule_entries,
+        }
+        schedule["schedule_sha256"] = hashlib.sha256(
+            MODULE.canonical_publication_schedule_hash_input(schedule)
+        ).hexdigest()
         previous: str | None = None
         events: list[dict[str, object]] = []
         for index, event_type in enumerate(event_types):
@@ -4416,6 +4460,18 @@ class ApplyPersistenceTests(unittest.TestCase):
                 "previous_event_sha256": previous,
                 "nested": {"z": index, "a": ["stable", index]},
             }
+            if event_type in scheduled_types:
+                position = per_type_positions.get(event_type, 0) + 1
+                per_type_positions[event_type] = position
+                scheduled = schedule_entries[position - 1]
+                event.update({
+                    "canonical_key": scheduled["canonical_key"],
+                    "sha256": scheduled["proposed_sha256"],
+                    "publication_stage": scheduled["publication_stage"],
+                    "publication_schedule_sha256": schedule["schedule_sha256"],
+                    "schedule_position": position,
+                    "total_schedule_positions": schedule_count,
+                })
             event_sha256 = hashlib.sha256(
                 MODULE.canonical_mutation_event_hash_input(event)
             ).hexdigest()
@@ -4434,10 +4490,17 @@ class ApplyPersistenceTests(unittest.TestCase):
             "run_id": "test-run",
             "run_root": str(self.root),
             "apply": {
-                "status": "succeeded",
+                "status": (
+                    "succeeded"
+                    if completed_writes or completed_gets or completed_deletions
+                    else "failed"
+                ),
                 "completed_writes": completed_writes,
                 "completed_post_put_verifications": completed_gets,
                 "completed_deletions": completed_deletions,
+                "completed_scheduled_objects": completed_writes,
+                "last_completed_schedule_position": completed_writes,
+                "publication_schedule": schedule,
                 "persistence": {
                     "mutation_journal_path": str(journal_path),
                     "mutation_journal_bytes": len(body),
@@ -4448,8 +4511,10 @@ class ApplyPersistenceTests(unittest.TestCase):
                     "node_complete_run_state_write_count": 2,
                     "coordinator_complete_run_state_write_count": 1,
                     "total_complete_run_state_write_count": 3,
+                    "complete_run_state_write_count": 3,
                 },
             },
+            "objects": objects,
             "tombstone_prefixes": [],
         }
         return state, journal_path, events
@@ -4470,6 +4535,30 @@ class ApplyPersistenceTests(unittest.TestCase):
         persistence = state["apply"]["persistence"]  # type: ignore[index]
         persistence["mutation_journal_bytes"] = len(body)
         persistence["mutation_journal_sha256"] = hashlib.sha256(body).hexdigest()
+
+    def _rehash_schedule(self, state: dict[str, object]) -> None:
+        schedule = state["apply"]["publication_schedule"]  # type: ignore[index]
+        schedule["schedule_sha256"] = hashlib.sha256(
+            MODULE.canonical_publication_schedule_hash_input(schedule)
+        ).hexdigest()
+
+    def _rehash_events(
+        self,
+        state: dict[str, object],
+        journal_path: Path,
+        events: list[dict[str, object]],
+    ) -> None:
+        previous: str | None = None
+        for event in events:
+            event["previous_event_sha256"] = previous
+            event["event_sha256"] = hashlib.sha256(
+                MODULE.canonical_mutation_event_hash_input(event)
+            ).hexdigest()
+            previous = str(event["event_sha256"])
+        state["apply"]["persistence"][  # type: ignore[index]
+            "mutation_journal_tail_event_sha256"
+        ] = previous
+        self._rewrite_journal_identity(state, journal_path, events)
 
     def test_journal_and_deleted_key_sidecar_identities_are_verified(self) -> None:
         prefix = "history/v2/observations/day_utc=2026-07-29"
@@ -4539,7 +4628,10 @@ class ApplyPersistenceTests(unittest.TestCase):
             "5937c9d8669a5da38e4d9170b4962b050997ff31f4df47d54f90785d853f65aa",
         )
         state, _path, _events = self._journal_state(
-            ["put_completed", "post_put_get_verified"],
+            [
+                "put_started", "put_completed", "post_put_get_started",
+                "post_put_get_verified", "canonical_apply_completed",
+            ],
             completed_writes=1,
             completed_gets=1,
         )
@@ -4563,6 +4655,14 @@ class ApplyPersistenceTests(unittest.TestCase):
         ] = "b" * 64
         self._rewrite_journal_identity(state, path, events)
         with self.assertRaisesRegex(ValueError, "event-hash mismatch"):
+            MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_pre_v1_journal_is_classified_as_unsupported_legacy(self) -> None:
+        state, path, events = self._journal_state(["canonical_apply_started"])
+        events[0].pop("event_hash_contract_version")
+        events[0].pop("event_sha256")
+        self._rewrite_journal_identity(state, path, events)
+        with self.assertRaisesRegex(ValueError, "unsupported legacy mutation journal contract"):
             MODULE.verify_apply_persistence_artifacts(state)
 
     def test_broken_previous_event_hash_fails_chain_linkage(self) -> None:
@@ -4601,9 +4701,55 @@ class ApplyPersistenceTests(unittest.TestCase):
 
     def test_successful_deletion_count_mismatch_fails_reconciliation(self) -> None:
         state, _path, _events = self._journal_state(
-            ["canonical_apply_started"], completed_deletions=1
+            ["canonical_apply_started", "canonical_apply_completed"],
+            completed_deletions=1,
         )
         with self.assertRaisesRegex(ValueError, "successful deletion count mismatch"):
+            MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_python_rejects_missing_duplicate_reordered_and_inconsistent_schedule_positions(self) -> None:
+        event_types = [
+            "put_started", "put_completed", "post_put_get_started",
+            "post_put_get_verified",
+            "put_started", "put_completed", "post_put_get_started",
+            "post_put_get_verified",
+            "canonical_apply_completed",
+        ]
+        base, _path, _events = self._journal_state(
+            event_types, completed_writes=2, completed_gets=2
+        )
+        mutations = {
+            "missing": lambda state: state["apply"]["publication_schedule"]["entries"].pop(),  # type: ignore[index]
+            "duplicate": lambda state: state["apply"]["publication_schedule"]["entries"][1].update({"position": 1}),  # type: ignore[index]
+            "reordered": lambda state: state["apply"]["publication_schedule"]["entries"].reverse(),  # type: ignore[index]
+            "inconsistent": lambda state: state["objects"]["history/_index_v2/test-1.json"].update({"bytes": 999}),  # type: ignore[index]
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                state = json.loads(json.dumps(base))
+                mutate(state)
+                self._rehash_schedule(state)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "position count mismatch|missing, duplicate or reordered|identity is inconsistent",
+                ):
+                    MODULE.verify_apply_persistence_artifacts(state)
+
+    def test_python_rejects_reordered_journal_schedule_execution(self) -> None:
+        event_types = [
+            "put_started", "put_completed", "post_put_get_started",
+            "post_put_get_verified",
+            "put_started", "put_completed", "post_put_get_started",
+            "post_put_get_verified", "canonical_apply_completed",
+        ]
+        state, path, events = self._journal_state(
+            event_types, completed_writes=2, completed_gets=2
+        )
+        events[0], events[4] = events[4], events[0]
+        self._rehash_events(state, path, events)
+        with self.assertRaisesRegex(
+            ValueError, "positions are missing, duplicate or reordered|execution order mismatch"
+        ):
             MODULE.verify_apply_persistence_artifacts(state)
 
     def test_complete_state_write_counts_separate_node_and_coordinator(self) -> None:

@@ -539,17 +539,9 @@ function objectFromBody({ key, body, source = "unknown", content_sha256 = null, 
 }
 
 export function proposalView(proposal) {
-  const publicationStage = {
-    pollutant_manifest: "pollutant_manifest",
-    connector_manifest: "connector_manifest",
-    day_manifest: "day_parent",
-    pollutant_timeseries_index: "scoped_timeseries_index",
-    latest_timeseries_index: "latest_timeseries_index",
-  }[proposal.kind] || "generated_object";
   return {
     key: proposal.key,
     kind: proposal.kind,
-    publication_stage: publicationStage,
     day_utc: proposal.day_utc,
     bytes: proposal.bytes,
     old_sha256: proposal.old_sha256,
