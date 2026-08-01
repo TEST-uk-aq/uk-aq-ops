@@ -19364,7 +19364,48 @@ def _overlay_object_entry(run_state: Mapping[str, Any], object_key: str) -> dict
     return entry
 
 
+def _record_coordinator_complete_run_state_write(
+    run_state: Mapping[str, Any],
+) -> None:
+    apply_summary = run_state.get("apply")
+    if not isinstance(apply_summary, dict):
+        return
+    persistence = apply_summary.get("persistence")
+    if not isinstance(persistence, dict):
+        return
+    node_count_raw = persistence.get("node_complete_run_state_write_count")
+    if node_count_raw is None:
+        node_count_raw = persistence.get("complete_run_state_write_count")
+    if node_count_raw is None:
+        return
+    node_count = int(node_count_raw or 0)
+    coordinator_count = int(
+        persistence.get("coordinator_complete_run_state_write_count") or 0
+    ) + 1
+    persistence.pop("complete_run_state_write_count", None)
+    persistence.update({
+        "node_complete_run_state_write_count": node_count,
+        "coordinator_complete_run_state_write_count": coordinator_count,
+        "total_complete_run_state_write_count": node_count + coordinator_count,
+    })
+    coordinator = run_state.get("coordinator")
+    if isinstance(coordinator, dict):
+        final_verification = coordinator.get("final_verification")
+        if isinstance(final_verification, dict):
+            artifacts = final_verification.get("apply_persistence_artifacts")
+            if isinstance(artifacts, dict):
+                artifacts.update({
+                    "node_complete_run_state_write_count": node_count,
+                    "coordinator_complete_run_state_write_count": coordinator_count,
+                    "total_complete_run_state_write_count": (
+                        node_count + coordinator_count
+                    ),
+                })
+                artifacts.pop("complete_run_state_write_count", None)
+
+
 def write_run_state(run_state: Mapping[str, Any]) -> Path:
+    _record_coordinator_complete_run_state_write(run_state)
     state_path = Path(str(run_state["run_state_path"]))
     state_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = state_path.with_name(state_path.name + ".tmp")
@@ -21194,6 +21235,22 @@ def _verified_deleted_object_keys(
     })
 
 
+MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1"
+
+
+def canonical_mutation_event_hash_input(event: Mapping[str, Any]) -> bytes:
+    hash_fields = {
+        str(key): value for key, value in event.items() if key != "event_sha256"
+    }
+    return json.dumps(
+        hash_fields,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 def verify_apply_persistence_artifacts(
     run_state: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -21213,7 +21270,7 @@ def verify_apply_persistence_artifacts(
     expected_events = int(persistence.get("mutation_journal_event_count") or 0)
     if len(lines) != expected_events:
         raise ValueError(f"mutation journal event-count mismatch: {journal_path}")
-    previous_sha256: str | None = None
+    previous_recomputed_sha256: str | None = None
     run_id = str(run_state.get("run_id") or "")
     event_types: dict[str, int] = {}
     for raw_line in lines:
@@ -21222,17 +21279,60 @@ def verify_apply_persistence_artifacts(
             raise ValueError(f"mutation journal event is not an object: {journal_path}")
         if str(event.get("run_id") or "") != run_id:
             raise ValueError(f"mutation journal run identity mismatch: {journal_path}")
-        if event.get("previous_event_sha256") != previous_sha256:
-            raise ValueError(f"mutation journal chain mismatch: {journal_path}")
+        if event.get("event_hash_contract_version") != MUTATION_EVENT_HASH_CONTRACT_VERSION:
+            raise ValueError(
+                f"mutation journal event-hash contract mismatch: {journal_path}"
+            )
+        if event.get("previous_event_sha256") != previous_recomputed_sha256:
+            raise ValueError(
+                f"mutation journal event-chain linkage mismatch: {journal_path}"
+            )
         event_sha256 = str(event.get("event_sha256") or "").strip().lower()
         if not re.fullmatch(r"[a-f0-9]{64}", event_sha256):
             raise ValueError(f"mutation journal event identity is invalid: {journal_path}")
-        previous_sha256 = event_sha256
+        recomputed_sha256 = hashlib.sha256(
+            canonical_mutation_event_hash_input(event)
+        ).hexdigest()
+        if event_sha256 != recomputed_sha256:
+            raise ValueError(
+                f"mutation journal event-hash mismatch: {journal_path}"
+            )
+        previous_recomputed_sha256 = recomputed_sha256
         event_type = str(event.get("event_type") or "")
         event_types[event_type] = event_types.get(event_type, 0) + 1
     expected_tail = persistence.get("mutation_journal_tail_event_sha256")
-    if previous_sha256 != expected_tail:
-        raise ValueError(f"mutation journal tail identity mismatch: {journal_path}")
+    if previous_recomputed_sha256 != expected_tail:
+        raise ValueError(
+            f"mutation journal event-chain tail mismatch: {journal_path}"
+        )
+    apply_summary = run_state.get("apply") or {}
+    if apply_summary.get("status") == "succeeded":
+        completed_writes = int(apply_summary.get("completed_writes") or 0)
+        completed_gets = int(
+            apply_summary.get("completed_post_put_verifications") or 0
+        )
+        put_completed = int(event_types.get("put_completed") or 0)
+        get_verified = int(event_types.get("post_put_get_verified") or 0)
+        if not (
+            put_completed == get_verified == completed_writes == completed_gets
+        ):
+            raise ValueError(
+                "mutation journal successful PUT/GET count mismatch: "
+                f"put_completed={put_completed} "
+                f"post_put_get_verified={get_verified} "
+                f"completed_writes={completed_writes} "
+                f"completed_post_put_verifications={completed_gets}"
+            )
+        deletion_verified = int(event_types.get("deletion_verified") or 0)
+        completed_deletions = int(
+            apply_summary.get("completed_deletions") or 0
+        )
+        if deletion_verified != completed_deletions:
+            raise ValueError(
+                "mutation journal successful deletion count mismatch: "
+                f"deletion_verified={deletion_verified} "
+                f"completed_deletions={completed_deletions}"
+            )
     sidecars: list[dict[str, Any]] = []
     for raw_prefix in list(run_state.get("tombstone_prefixes") or []):
         if not isinstance(raw_prefix, Mapping):
@@ -21259,13 +21359,33 @@ def verify_apply_persistence_artifacts(
         "mutation_journal_bytes": len(body),
         "mutation_journal_sha256": expected_sha256,
         "mutation_journal_event_count": len(lines),
+        "mutation_journal_tail_event_sha256": previous_recomputed_sha256,
         "event_type_counts": event_types,
         "deleted_key_sidecars": sidecars,
         "compact_checkpoint_count": int(
             persistence.get("compact_checkpoint_count") or 0
         ),
-        "complete_run_state_write_count": int(
-            persistence.get("complete_run_state_write_count") or 0
+        "node_complete_run_state_write_count": int(
+            persistence.get("node_complete_run_state_write_count")
+            or persistence.get("complete_run_state_write_count")
+            or 0
+        ),
+        "coordinator_complete_run_state_write_count": int(
+            persistence.get("coordinator_complete_run_state_write_count") or 0
+        ),
+        "total_complete_run_state_write_count": int(
+            persistence.get("total_complete_run_state_write_count")
+            or (
+                int(
+                    persistence.get("node_complete_run_state_write_count")
+                    or persistence.get("complete_run_state_write_count")
+                    or 0
+                )
+                + int(
+                    persistence.get("coordinator_complete_run_state_write_count")
+                    or 0
+                )
+            )
         ),
         "mutation_journal_flush_count": int(
             persistence.get("mutation_journal_flush_count") or 0
@@ -21659,7 +21779,28 @@ def run_canonical_apply_executor(
     if process.returncode != 0:
         error = _tail_bytes(stderr or stdout or "canonical apply failed", 4000)
         log.error("canonical apply executor failed exit_code=%s error=%s", process.returncode, error)
-        return {"status": "failed", "exit_code": process.returncode, "error": error, "output": output}
+        apply_failure = run_state.get("apply") or {}
+        return {
+            "status": "failed",
+            "exit_code": process.returncode,
+            "error": error,
+            "output": output,
+            "original_apply_error": apply_failure.get("error"),
+            "failure_checkpoint": apply_failure.get("failure_checkpoint"),
+            "failed_operation": apply_failure.get("failed_operation"),
+            "last_completed_day_utc": apply_failure.get(
+                "last_completed_day_utc"
+            ),
+            "last_completed_publication_level": apply_failure.get(
+                "last_completed_publication_level"
+            ),
+            "later_selected_days_untouched": apply_failure.get(
+                "later_selected_days_untouched"
+            ),
+            "untouched_later_selected_days": apply_failure.get(
+                "untouched_later_selected_days"
+            ),
+        }
     return {"status": "succeeded", "exit_code": 0, "output": output}
 
 
@@ -26765,6 +26906,34 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     f"- Error: {database_result.get('error') or '(none)'}",
                     "",
                 ])
+        canonical_apply = repair_flow.get("canonical_apply") or {}
+        if canonical_apply.get("status") == "failed":
+            failure_checkpoint = canonical_apply.get("failure_checkpoint") or {}
+            lines.extend([
+                "### Canonical apply failure evidence",
+                "",
+                f"- Original apply error: {canonical_apply.get('original_apply_error') or canonical_apply.get('error') or '(none)'}",
+                f"- Failure checkpoint attempted: {bool(failure_checkpoint.get('attempted'))}",
+                f"- Failure checkpoint succeeded: {bool(failure_checkpoint.get('succeeded'))}",
+                f"- Failure checkpoint error: {failure_checkpoint.get('error') or '(none)'}",
+                "- Last successful checkpoint: " + json.dumps(
+                    failure_checkpoint.get("last_successfully_written_checkpoint"),
+                    sort_keys=True,
+                    default=str,
+                ),
+                "- Failed operation: " + json.dumps(
+                    canonical_apply.get("failed_operation"),
+                    sort_keys=True,
+                    default=str,
+                ),
+                f"- Last completed publication level: {canonical_apply.get('last_completed_publication_level') or '(none)'}",
+                f"- Later selected days remained untouched: {bool(canonical_apply.get('later_selected_days_untouched'))}",
+                "- Untouched later selected days: " + json.dumps(
+                    canonical_apply.get("untouched_later_selected_days") or [],
+                    sort_keys=True,
+                ),
+                "",
+            ])
         final_verification = repair_flow.get("final_verification") or {}
         if final_verification:
             lines.extend([
@@ -26786,11 +26955,15 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 lines.extend([
                     f"- Apply persistence evidence: {persistence_artifacts.get('status') or '(none)'}",
                     f"- Mutation journal: {persistence_artifacts.get('mutation_journal_path') or '(none)'}",
+                    f"- Mutation journal bytes: {int(persistence_artifacts.get('mutation_journal_bytes') or 0)}",
                     f"- Mutation journal SHA-256: {persistence_artifacts.get('mutation_journal_sha256') or '(none)'}",
                     f"- Mutation journal events: {int(persistence_artifacts.get('mutation_journal_event_count') or 0)}",
+                    f"- Mutation journal tail event SHA-256: {persistence_artifacts.get('mutation_journal_tail_event_sha256') or '(none)'}",
                     f"- Mutation journal flushes: {int(persistence_artifacts.get('mutation_journal_flush_count') or 0)}",
                     f"- Compact checkpoints: {int(persistence_artifacts.get('compact_checkpoint_count') or 0)}",
-                    f"- Complete run-state writes: {int(persistence_artifacts.get('complete_run_state_write_count') or 0)}",
+                    f"- Node complete run-state writes: {int(persistence_artifacts.get('node_complete_run_state_write_count') or 0)}",
+                    f"- Coordinator complete run-state writes: {int(persistence_artifacts.get('coordinator_complete_run_state_write_count') or 0)}",
+                    f"- Total complete run-state writes: {int(persistence_artifacts.get('total_complete_run_state_write_count') or 0)}",
                     f"- Deleted-key sidecars: {len(list(persistence_artifacts.get('deleted_key_sidecars') or []))}",
                     "",
                 ])
@@ -28864,6 +29037,16 @@ def main(argv: list[str]) -> int:
         log.info("report_md=%s", md_path)
         if repair_overlay is not None and status == "ok" and not args.dry_run:
             cleanup = cleanup_successful_repair_overlay(repair_overlay)
+            summary["repair_overlay_cleanup"] = cleanup
+            json_path, md_path = write_reports(
+                env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary
+            )
+            log.info(
+                "reports refreshed after final complete-state cleanup write "
+                "report_json=%s report_md=%s",
+                json_path,
+                md_path,
+            )
             log.info("successful repair overlay cleanup=%s", json.dumps(cleanup, sort_keys=True))
         log.info("done status=%s runtime_seconds=%s", status, runtime_seconds)
         if daily_task_health_enabled:

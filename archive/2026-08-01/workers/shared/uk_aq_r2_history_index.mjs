@@ -51,7 +51,7 @@ function stripEtagQuotes(etag) {
 // once `generated_at` is data-driven). Saves R2 PUT operations *and* keeps
 // downstream consumers — like the Dropbox backup builder — fast by not
 // churning their etag-skip baseline.
-export async function r2PutObjectIfChanged({
+async function r2PutObjectIfChanged({
   r2,
   key,
   body,
@@ -68,8 +68,7 @@ export async function r2PutObjectIfChanged({
 
   let existingEtag = null;
   try {
-    const headObject = r2?.head_object || r2HeadObject;
-    const head = await headObject({ r2, key });
+    const head = await r2HeadObject({ r2, key });
     if (head?.exists) {
       existingEtag = stripEtagQuotes(head.etag);
     }
@@ -121,16 +120,6 @@ export async function r2PutObjectIfChanged({
     content_type,
     status: "planned",
   });
-  if (typeof r2?.canonical_mutation_sink === "function") {
-    return await r2.canonical_mutation_sink({
-      key,
-      body: bodyText,
-      content_type,
-      bytes: bodyBytes,
-      sha256: sha256Hex(bodyText),
-      status: "planned",
-    });
-  }
   const result = await r2PutObject({ r2, key, body, content_type });
   const liveObject = await r2GetObject({ r2, key });
   const liveBodyText = liveObject.body.toString("utf8");

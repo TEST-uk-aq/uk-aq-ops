@@ -134,6 +134,26 @@ export const APPLY_PROGRESS_CHECKPOINT_OBJECT_INTERVAL = 50;
 export const APPLY_PROGRESS_CHECKPOINT_ELAPSED_MS = 30_000;
 export const APPLY_PROGRESS_LOG_OBJECT_INTERVAL = 50;
 export const APPLY_PROGRESS_LOG_ELAPSED_MS = 30_000;
+export const MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1";
+
+function recursivelySortJsonValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => item === undefined ? null : recursivelySortJsonValue(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().filter((key) => value[key] !== undefined)
+      .map((key) => [key, recursivelySortJsonValue(value[key])]));
+  }
+  return value;
+}
+
+export function canonicalMutationEventHashInput(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    throw new Error("Mutation journal event hash input must be an object");
+  }
+  const { event_sha256: _excludedEventSha256, ...hashFields } = event;
+  return Buffer.from(JSON.stringify(recursivelySortJsonValue(hashFields)), "utf8");
+}
 
 export function createInitialApplyProgressState({ runStatePath, runId, counts, selectedDays }) {
   const perDayStatus = Object.fromEntries(selectedDays.map((dayUtc) => [dayUtc, {
@@ -231,7 +251,9 @@ export function createApplyPersistence({
 
   const snapshot = () => ({
     compact_checkpoint_count: checkpointCount,
-    complete_run_state_write_count: 0,
+    node_complete_run_state_write_count: 0,
+    coordinator_complete_run_state_write_count: 0,
+    total_complete_run_state_write_count: 0,
     mutation_journal_event_count: eventCount,
     mutation_journal_flush_count: flushCount,
     deleted_key_sidecar_count: sidecarCount,
@@ -251,14 +273,15 @@ export function createApplyPersistence({
     if (journalDescriptor === null) throw new Error("Mutation journal is closed");
     if (journalFailure) throw new Error(`Mutation journal is unusable: ${journalFailure}`);
     const baseEvent = {
-      run_id: runId,
       event_type: String(event?.event_type || ""),
       timestamp_utc: new Date().toISOString(),
       ...event,
+      run_id: runId,
+      event_hash_contract_version: MUTATION_EVENT_HASH_CONTRACT_VERSION,
       previous_event_sha256: tailEventSha256,
     };
     if (!baseEvent.event_type) throw new Error("Mutation journal event_type is required");
-    const identityBody = Buffer.from(JSON.stringify(baseEvent), "utf8");
+    const identityBody = canonicalMutationEventHashInput(baseEvent);
     const eventSha256 = sha256Hex(identityBody);
     const line = Buffer.from(`${JSON.stringify({ ...baseEvent, event_sha256: eventSha256 })}\n`, "utf8");
     try {
@@ -298,9 +321,10 @@ export function createApplyPersistence({
 
   const checkpoint = (reason) => {
     const nextCheckpointCount = checkpointCount + 1;
-    progressState.last_checkpoint_at_utc = new Date().toISOString();
-    progressState.last_checkpoint_reason = String(reason || "progress");
-    Object.assign(progressState, {
+    const checkpointState = {
+      ...progressState,
+      last_checkpoint_at_utc: new Date().toISOString(),
+      last_checkpoint_reason: String(reason || "progress"),
       mutation_journal_path: journalPath,
       mutation_journal_event_count: eventCount,
       mutation_journal_bytes: journalBytes,
@@ -313,8 +337,9 @@ export function createApplyPersistence({
       mutation_journal_flush_count: flushCount,
       deleted_key_sidecar_count: sidecarCount,
       deletion_sidecars: sidecars.map((entry) => ({ ...entry })),
-    });
-    atomicJson(progressPath, progressState);
+    };
+    atomicJson(progressPath, checkpointState);
+    Object.assign(progressState, checkpointState);
     checkpointCount = nextCheckpointCount;
     return progressState;
   };
@@ -419,6 +444,104 @@ export function createBoundedProgressReporter({
     lastLoggedCompleted = completedObjects;
     lastLoggedAt = currentTime;
     return true;
+  };
+}
+
+export function createCanonicalGeneratedIndexMutationAdapter({
+  r2,
+  runState,
+  counts,
+  syncProgress,
+  persistence,
+  executeOperation,
+}) {
+  const audit = runState.apply.generated_generic_index_objects ||= {};
+  return {
+    audit,
+    r2: {
+      ...r2,
+      proposal_sink: async (generated) => {
+        const key = safeKey(generated?.key);
+        const body = Buffer.from(String(generated?.body ?? ""), "utf8");
+        audit[key] = {
+          proposed: true,
+          built: true,
+          structurally_validated: true,
+          changed: generated?.status !== "skipped_unchanged",
+          status: String(generated?.status || "planned"),
+          bytes: body.byteLength,
+          sha256: sha256Hex(body),
+          content_type: String(generated?.content_type || contentTypeForKey(key)),
+          included_in_write_set: generated?.status !== "skipped_unchanged",
+          publication_stage: "generic_targeted_index",
+        };
+        await r2?.proposal_sink?.(generated);
+      },
+      canonical_mutation_sink: async (generated) => {
+        const key = safeKey(generated?.key);
+        const body = Buffer.from(String(generated?.body ?? ""), "utf8");
+        const sha256 = sha256Hex(body);
+        if (body.byteLength !== Number(generated?.bytes) || sha256 !== generated?.sha256) {
+          throw new Error(`Generated generic index identity mismatch: ${key}`);
+        }
+        if (audit[key]?.status === "succeeded") {
+          throw new Error(`Generated generic index was published more than once: ${key}`);
+        }
+        const entry = {
+          proposed: true,
+          built: true,
+          structurally_validated: true,
+          changed: true,
+          status: "planned",
+          stage: "generic_targeted_index",
+          bytes: body.byteLength,
+          sha256,
+          content_type: String(generated?.content_type || contentTypeForKey(key)),
+          dependencies: [],
+          dependency_identities: {},
+          post_put_verification_get_attempt_count: 0,
+          post_put_verification_get_count: 0,
+        };
+        Object.assign(audit[key] ||= {}, entry, { included_in_write_set: true });
+        counts.planned_writes += 1;
+        counts.planned_post_put_verifications += 1;
+        syncProgress();
+        persistence.appendEvent({
+          event_type: "generic_index_write_planned",
+          canonical_key: key,
+          ...mutationContext(key, "generic_targeted_index"),
+          bytes: body.byteLength,
+          sha256,
+          status: "planned",
+          planned_writes: counts.planned_writes,
+          planned_post_put_verifications: counts.planned_post_put_verifications,
+        });
+        await executeOperation({
+          kind: "put",
+          key,
+          object: { key, entry, body, domain: objectDomain(key) },
+        });
+        persistence.flush();
+        Object.assign(audit[key], {
+          status: "succeeded",
+          remote_completed: true,
+          r2_verified: true,
+          post_put_verification_get_attempt_count:
+            entry.post_put_verification_get_attempt_count,
+          post_put_verification_get_count: entry.post_put_verification_get_count,
+        });
+        return {
+          key,
+          bytes: body.byteLength,
+          sha256,
+          skipped: false,
+          status: "succeeded",
+          write_r2: true,
+          verified: true,
+          verification_status: "succeeded",
+        };
+      },
+    },
   };
 }
 
@@ -2073,6 +2196,8 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     listAllObjects: adapters.listAllObjects || r2ListAllObjects,
     putObject: adapters.putObject || r2PutObject,
   };
+  const targetedIndexUpdater = adapters.updateR2HistoryIndexesTargeted
+    || updateR2HistoryIndexesTargeted;
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   const proposal = validateLocalProposal(runState);
   const dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
@@ -2089,7 +2214,9 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       finished_at_utc: new Date().toISOString(),
       persistence: {
         compact_checkpoint_count: 0,
-        complete_run_state_write_count: 1,
+        node_complete_run_state_write_count: 1,
+        coordinator_complete_run_state_write_count: 0,
+        total_complete_run_state_write_count: 1,
         mutation_journal_event_count: 0,
         mutation_journal_flush_count: 0,
         deleted_key_sidecar_count: 0,
@@ -2147,7 +2274,9 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       finished_at_utc: new Date().toISOString(),
       persistence: {
         compact_checkpoint_count: 0,
-        complete_run_state_write_count: 1,
+        node_complete_run_state_write_count: 1,
+        coordinator_complete_run_state_write_count: 0,
+        total_complete_run_state_write_count: 1,
         mutation_journal_event_count: 0,
         mutation_journal_flush_count: 0,
         deleted_key_sidecar_count: 0,
@@ -2182,9 +2311,15 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     }));
   };
   const syncPersistenceDiagnostics = () => {
+    const coordinatorWriteCount = Number(
+      runState.apply.persistence?.coordinator_complete_run_state_write_count || 0,
+    );
     runState.apply.persistence = {
       ...persistence.snapshot(),
-      complete_run_state_write_count: completeRunStateWriteCount,
+      node_complete_run_state_write_count: completeRunStateWriteCount,
+      coordinator_complete_run_state_write_count: coordinatorWriteCount,
+      total_complete_run_state_write_count:
+        completeRunStateWriteCount + coordinatorWriteCount,
     };
     runState.apply_progress = {
       path: persistence.progressPath,
@@ -2196,7 +2331,9 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
   const writeCompleteRunState = () => {
     const nextWriteCount = completeRunStateWriteCount + 1;
     syncPersistenceDiagnostics();
-    runState.apply.persistence.complete_run_state_write_count = nextWriteCount;
+    runState.apply.persistence.node_complete_run_state_write_count = nextWriteCount;
+    runState.apply.persistence.total_complete_run_state_write_count = nextWriteCount
+      + Number(runState.apply.persistence.coordinator_complete_run_state_write_count || 0);
     atomicWriteJson(runStatePath, runState);
     completeRunStateWriteCount = nextWriteCount;
   };
@@ -2426,9 +2563,17 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
           finalize: async () => {
             for (const operation of globalOperations) await executeOperation(operation);
             if (affectedDays.length && !dedicatedSosProposal.dedicated) {
-              runState.global_index_finalization = await updateR2HistoryIndexesTargeted({
-                env: process.env,
+              const { r2: canonicalIndexR2 } = createCanonicalGeneratedIndexMutationAdapter({
                 r2,
+                runState,
+                counts,
+                syncProgress,
+                persistence,
+                executeOperation,
+              });
+              runState.global_index_finalization = await targetedIndexUpdater({
+                env: process.env,
+                r2: canonicalIndexR2,
                 historyVersion: "v2",
                 domains: ["observations", "aqilevels"],
                 affectedDaysUtc: affectedDays,
@@ -2455,7 +2600,9 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
         event_type: "index_publication_completed",
         publication_stage: "affected_indexes",
         status: "verified",
-        completed_index_object_count: globalOperations.length,
+        completed_index_object_count: globalOperations.length + Object.values(
+          runState.apply.generated_generic_index_objects || {},
+        ).filter((entry) => entry?.status === "succeeded").length,
       });
       persistence.flush();
       await checkpoint("after_affected_index_publication");
@@ -2549,6 +2696,17 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const failedKey = progressState.current_object_key;
+    const failedPrefix = progressState.current_deletion_prefix;
+    const failedDayUtc = progressState.current_day_utc;
+    const failedStage = progressState.current_publication_stage;
+    const activeDayState = failedDayUtc ? perDayStatus[failedDayUtc] : null;
+    let lastSuccessfulCheckpoint = progressState.last_checkpoint_at_utc ? {
+      path: persistence.progressPath,
+      reason: progressState.last_checkpoint_reason || null,
+      timestamp_utc: progressState.last_checkpoint_at_utc,
+      checkpoint_count: Number(progressState.compact_checkpoint_count || 0),
+    } : null;
     counts.failed_operations += 1;
     progressState.status = "failed";
     progressState.current_phase = "canonical_apply_failed";
@@ -2572,19 +2730,45 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       // The compact failure checkpoint exposes the journal failure.
     }
     persistence.closeAfterFailure();
+    let failureCheckpointError = null;
+    let failureCheckpointSucceeded = false;
     try {
       await checkpoint("canonical_apply_failure");
+      failureCheckpointSucceeded = true;
+      lastSuccessfulCheckpoint = {
+        path: persistence.progressPath,
+        reason: progressState.last_checkpoint_reason || null,
+        timestamp_utc: progressState.last_checkpoint_at_utc,
+        checkpoint_count: Number(progressState.compact_checkpoint_count || 0),
+      };
     } catch (checkpointError) {
-      progressState.checkpoint_failure = checkpointError instanceof Error
+      failureCheckpointError = checkpointError instanceof Error
         ? checkpointError.message : String(checkpointError);
+      progressState.checkpoint_failure = failureCheckpointError;
     }
+    const failureCheckpoint = {
+      attempted: true,
+      succeeded: failureCheckpointSucceeded,
+      error: failureCheckpointError,
+      last_successfully_written_checkpoint: lastSuccessfulCheckpoint,
+    };
     runState.apply = {
       ...runState.apply,
       ...counts,
       status: "failed",
       error: message,
+      failure_checkpoint: failureCheckpoint,
+      failed_operation: {
+        canonical_key: failedKey,
+        prefix: failedPrefix,
+        day_utc: failedDayUtc,
+        publication_stage: failedStage,
+      },
       finished_at_utc: new Date().toISOString(),
       last_completed_day_utc: progressState.last_completed_day_utc,
+      last_completed_publication_level:
+        activeDayState?.completed_publication_level
+        || (progressState.index_publication_completed ? "affected_indexes_verified" : "none"),
       later_selected_days_untouched: dedicatedSosProposal.dedicated,
       untouched_later_selected_days: dedicatedSosProposal.dedicated
         ? selectedDays.filter((dayUtc) => perDayStatus[dayUtc]?.status === "not_started")

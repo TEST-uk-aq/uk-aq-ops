@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,8 +9,10 @@ import {
   applyValidatedProposal,
   applySosLightPerDayUnits,
   assertPublicationDependenciesVerified,
+  canonicalMutationEventHashInput,
   createApplyPersistence,
   createBoundedProgressReporter,
+  createCanonicalGeneratedIndexMutationAdapter,
   createInitialApplyProgressState,
   createVerifiedGetBodyCache,
   deleteAndVerifyPrefix,
@@ -17,6 +20,7 @@ import {
   prepareMergedDayManifest,
   putAndVerifyObject,
   publicationRank,
+  MUTATION_EVENT_HASH_CONTRACT_VERSION,
   validateDedicatedSosHistoricalProposal,
   validateFinalProposalGraph,
   validateLocalProposal,
@@ -44,6 +48,7 @@ import {
   serializeCanonicalObservationV2Parquet,
 } from "../../../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
+  r2PutObjectIfChanged,
   updateR2HistoryIndexesTargeted,
 } from "../../../workers/shared/uk_aq_r2_history_index.mjs";
 
@@ -1286,6 +1291,141 @@ test("multiple object transitions append detailed events without rewriting compl
   ]);
   assert.equal(fs.readFileSync(runStatePath, "utf8"), originalState);
   assert.equal(persistence.snapshot().compact_checkpoint_count, 0);
+});
+
+test("mutation event hash canonicalization has the cross-language nested-object vector", () => {
+  const fixture = {
+    z: { b: 2, a: [3, { y: "✓", x: null }] },
+    event_hash_contract_version: MUTATION_EVENT_HASH_CONTRACT_VERSION,
+    previous_event_sha256: null,
+    event_type: "fixture",
+    run_id: "r",
+  };
+  assert.equal(
+    sha256Hex(canonicalMutationEventHashInput(fixture)),
+    "5937c9d8669a5da38e4d9170b4962b050997ff31f4df47d54f90785d853f65aa",
+  );
+});
+
+test("generic generated index writes use canonical persistence and unchanged indexes stay out of counts", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-generic-index-persistence-"));
+  const runStatePath = path.join(root, "run-state.json");
+  fs.writeFileSync(runStatePath, "{}\n");
+  const counts = {
+    planned_writes: 4,
+    completed_writes: 4,
+    planned_post_put_verifications: 4,
+    completed_post_put_verifications: 4,
+  };
+  const progressState = { run_id: "generic-index-test", status: "running" };
+  const persistence = createApplyPersistence({
+    runStatePath,
+    runId: "generic-index-test",
+    progressState,
+  });
+  const runState = { apply: {} };
+  let putCount = 0;
+  let getCount = 0;
+  const unchangedBody = "{}\n";
+  const unchangedEtag = createHash("md5").update(unchangedBody).digest("hex");
+  const unchangedKey = "history/_index_v2/observations_timeseries/unchanged.json";
+  const { r2: generatedR2, audit } = createCanonicalGeneratedIndexMutationAdapter({
+    r2: {
+      head_object: async ({ key }) => key === unchangedKey
+        ? { exists: true, etag: unchangedEtag }
+        : { exists: false },
+    },
+    runState,
+    counts,
+    syncProgress: () => Object.assign(progressState, counts),
+    persistence,
+    executeOperation: async ({ object }) => {
+      await putAndVerifyObject({
+        r2: {},
+        runState,
+        object,
+        persistence,
+        adapters: {
+          putObject: async () => { putCount += 1; },
+          getObject: async () => {
+            getCount += 1;
+            return { body: object.body, bytes: object.body.byteLength };
+          },
+        },
+      });
+      counts.completed_writes += 1;
+      counts.completed_post_put_verifications += 1;
+    },
+  });
+  await r2PutObjectIfChanged({
+    r2: generatedR2,
+    key: unchangedKey,
+    body: unchangedBody,
+    content_type: "application/json; charset=utf-8",
+    writeR2: true,
+  });
+  const changedKey = "history/_index_v2/observations_timeseries/changed.json";
+  const changedBody = "{\"changed\":true}\n";
+  await r2PutObjectIfChanged({
+    r2: generatedR2,
+    key: changedKey,
+    body: changedBody,
+    content_type: "application/json; charset=utf-8",
+    writeR2: true,
+  });
+  persistence.close();
+
+  assert.equal(putCount, 1);
+  assert.equal(getCount, 1);
+  assert.equal(counts.planned_writes, 5);
+  assert.equal(counts.completed_writes, 5);
+  assert.equal(counts.planned_post_put_verifications, 5);
+  assert.equal(counts.completed_post_put_verifications, 5);
+  assert.equal(audit[unchangedKey].included_in_write_set, false);
+  assert.equal(audit[changedKey].post_put_verification_get_count, 1);
+  assert.ok(persistence.snapshot().mutation_journal_flush_count >= 1);
+  const events = fs.readFileSync(persistence.journalPath, "utf8").trim().split("\n").map(JSON.parse);
+  assert.deepEqual(events.map((event) => event.event_type), [
+    "generic_index_write_planned",
+    "put_started",
+    "put_completed",
+    "post_put_get_started",
+    "post_put_get_verified",
+  ]);
+  for (const event of events) {
+    assert.equal(event.event_hash_contract_version, MUTATION_EVENT_HASH_CONTRACT_VERSION);
+    assert.equal(sha256Hex(canonicalMutationEventHashInput(event)), event.event_sha256);
+  }
+});
+
+test("failed compact checkpoint preserves the preceding successful checkpoint identity", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-checkpoint-failure-"));
+  const runStatePath = path.join(root, "run-state.json");
+  fs.writeFileSync(runStatePath, "{}\n");
+  const progressState = { run_id: "checkpoint-failure-test", status: "running" };
+  const persistence = createApplyPersistence({
+    runStatePath,
+    runId: "checkpoint-failure-test",
+    progressState,
+    io: {
+      atomicWriteJson: (filePath, value) => {
+        if (value.last_checkpoint_reason === "canonical_apply_failure") {
+          throw new Error("simulated compact failure checkpoint error");
+        }
+        fs.writeFileSync(filePath, `${JSON.stringify(value)}\n`);
+      },
+    },
+  });
+  persistence.checkpoint("after_deletion_verification");
+  const lastSuccessfulAt = progressState.last_checkpoint_at_utc;
+  assert.throws(
+    () => persistence.checkpoint("canonical_apply_failure"),
+    /simulated compact failure checkpoint error/,
+  );
+  assert.equal(progressState.last_checkpoint_reason, "after_deletion_verification");
+  assert.equal(progressState.last_checkpoint_at_utc, lastSuccessfulAt);
+  assert.equal(persistence.snapshot().compact_checkpoint_count, 1);
+  persistence.closeAfterFailure();
 });
 
 test("compact checkpoint schema exposes aggregate and per-day progress without object entries", () => {
