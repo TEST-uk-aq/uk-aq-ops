@@ -4,6 +4,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -4384,6 +4385,113 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                 if stage["stage"] == "aqi_proposal"
             )
             self.assertEqual(aqi_stage["status"], "bypassed")
+
+
+class ApplyPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_journal_and_deleted_key_sidecar_identities_are_verified(self) -> None:
+        prefix = "history/v2/observations/day_utc=2026-07-29"
+        evidence_dir = self.root / "apply-evidence" / "deletions"
+        evidence_dir.mkdir(parents=True)
+        sidecar_path = evidence_dir / "2026-07-29-test.json"
+        sidecar_body = json.dumps([f"{prefix}/a.json"], separators=(",", ":")).encode() + b"\n"
+        sidecar_path.write_bytes(sidecar_body)
+        journal_path = self.root / "apply-mutation-events.jsonl"
+        tail_sha256 = "a" * 64
+        event = {
+            "run_id": "test-run",
+            "event_type": "deletion_verified",
+            "previous_event_sha256": None,
+            "event_sha256": tail_sha256,
+        }
+        journal_body = json.dumps(event, separators=(",", ":")).encode() + b"\n"
+        journal_path.write_bytes(journal_body)
+        run_state = {
+            "run_id": "test-run",
+            "run_root": str(self.root),
+            "apply": {"persistence": {
+                "mutation_journal_path": str(journal_path),
+                "mutation_journal_bytes": len(journal_body),
+                "mutation_journal_sha256": hashlib.sha256(journal_body).hexdigest(),
+                "mutation_journal_event_count": 1,
+                "mutation_journal_tail_event_sha256": tail_sha256,
+                "deleted_key_sidecar_count": 1,
+                "compact_checkpoint_count": 4,
+                "complete_run_state_write_count": 2,
+                "mutation_journal_flush_count": 3,
+            }},
+            "tombstone_prefixes": [{
+                "prefix": prefix,
+                "deleted_object_count": 1,
+                "deleted_keys_sidecar_path": str(sidecar_path),
+                "deleted_keys_sidecar_bytes": len(sidecar_body),
+                "deleted_keys_sha256": hashlib.sha256(sidecar_body).hexdigest(),
+            }],
+        }
+        result = MODULE.verify_apply_persistence_artifacts(run_state)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["mutation_journal_event_count"], 1)
+        self.assertEqual(result["deleted_key_sidecars"][0]["deleted_object_count"], 1)
+
+    def test_canonical_apply_executor_streams_stderr_and_retains_stdout_json(self) -> None:
+        run_state_path = self.root / "run-state.json"
+        run_state = {"run_state_path": str(run_state_path), "run_root": str(self.root)}
+        run_state_path.write_text(json.dumps(run_state), encoding="utf-8")
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = io.StringIO('{"ok":true}\n')
+                self.stderr = io.StringIO('[canonical-apply] completed_objects=50/100\n')
+                self.returncode = 0
+
+            def wait(self) -> int:
+                return self.returncode
+
+        logger = logging.getLogger("canonical-apply-stream-test")
+        with mock.patch.object(MODULE, "_repo_root_for_integrity_script", return_value=self.root), \
+             mock.patch.object(MODULE.subprocess, "Popen", return_value=FakeProcess()), \
+             self.assertLogs(logger, level="INFO") as captured:
+            result = MODULE.run_canonical_apply_executor(
+                run_state=run_state,
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                log=logger,
+            )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["output"], {"ok": True})
+        self.assertTrue(any("completed_objects=50/100" in line for line in captured.output))
+
+    def test_canonical_apply_executor_retains_final_error_after_progress(self) -> None:
+        run_state_path = self.root / "run-state.json"
+        run_state = {"run_state_path": str(run_state_path), "run_root": str(self.root)}
+        run_state_path.write_text(json.dumps(run_state), encoding="utf-8")
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = io.StringIO("")
+                self.stderr = io.StringIO(("progress\n" * 1_000) + "FINAL NODE ERROR\n")
+                self.returncode = 1
+
+            def wait(self) -> int:
+                return self.returncode
+
+        logger = logging.getLogger("canonical-apply-error-tail-test")
+        logger.addHandler(logging.NullHandler())
+        logger.propagate = False
+        with mock.patch.object(MODULE, "_repo_root_for_integrity_script", return_value=self.root), \
+             mock.patch.object(MODULE.subprocess, "Popen", return_value=FakeProcess()):
+            result = MODULE.run_canonical_apply_executor(
+                run_state=run_state,
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                log=logger,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("FINAL NODE ERROR", result["error"])
 
 
 class RepoRootTests(unittest.TestCase):

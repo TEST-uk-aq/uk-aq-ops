@@ -1,5 +1,72 @@
 # SOS historical Integrity replacement implementation report
 
+## 1 August 2026 bounded canonical-apply persistence correction
+
+### Real-run incident and confirmed cause
+
+The active 44-day CIC-Test SOS-light operation planned 7,244 objects. At the observed point it had GET-verified 2,665 objects, had 4,578 objects not yet started, was processing one upload, and had no failed objects. `run-state.json` had grown beyond 10 MB. The Node process was still making remote progress, but process sampling showed substantial time in `JSON.stringify` while the outer Integrity log remained unchanged.
+
+The canonical apply path rewrote the complete and growing run state around individual status transitions: upload start, PUT completion, GET-attempt bookkeeping, GET verification, semantic verification, connector publication progress, and then the same operation again from `executeOperation()`. Complete deleted-key arrays were also embedded under `tombstone_prefixes[].deleted_object_keys`. The resulting persistence work was effectively the number of transitions multiplied by the multi-megabyte proposal state.
+
+### Persistence architecture
+
+Canonical apply now separates four artifacts within the immutable run directory:
+
+```text
+run-state.json
+  complete validated proposal plus bounded initial/final apply summary writes
+
+apply-progress.json
+  compact operator-visible counters, current phase/day/key/stage,
+  index state, per-day high-level state and evidence identities
+
+apply-mutation-events.jsonl
+  single-writer append-only PUT, GET, semantic, deletion, day and index events
+
+apply-evidence/deletions/*.json
+  sorted complete deleted-key lists, one identity-pinned sidecar per prefix
+```
+
+Ordinary object transitions no longer call `atomicWriteJson(runStatePath, runState)`. The complete run state is written once after final proposal validation and once at canonical-apply success or failure. Detailed object status remains in memory for the existing final report and is serialised only at finalisation. Diagnostic evidence records compact checkpoint, complete run-state write, mutation-event, journal-flush and deletion-sidecar counts.
+
+The compact checkpoint is forced after final validation, before actual destructive deletion, after deletion verification, after each SOS-light day parent verifies, before and after affected-index publication, on failure and on successful canonical-apply completion. The Python coordinator adds compact checkpoints before and after current-state reconciliation. Optional within-scope checkpoints and logs use named 50-object or 30-second thresholds, whichever occurs first; they never serialise the complete proposal.
+
+### Durability, deletion evidence and failure ordering
+
+The JSONL writer uses one exclusive descriptor, handles short writes explicitly and calls `fsync` at dependency barriers. A child verification event must pass a journal durability barrier before its dependent parent can PUT. Deletion-start evidence includes the verified sidecar identity and is flushed before the delete. Deletion-complete and absence-verification events are flushed before replacement publication. A completed SOS-light day event and compact checkpoint must both succeed before the next selected day can be deleted. Index publication has explicit pre/post flush and checkpoint boundaries, and success closes and verifies the journal before the final compact and complete-state writes.
+
+Each deletion sidecar is compact JSON containing the sorted key array. Its absolute run-scoped path, byte length, SHA-256 and key count are retained in the tombstone and compact checkpoint; the full list is absent from the mutation journal, checkpoint and run state. Sidecar write/read-back failure occurs before `remote_attempted` and prevents any DELETE. Python final verification and SQLite operation recording now resolve the sidecar only within the current run root and verify its bytes, SHA-256, sorted uniqueness, prefix scope and count before using its keys.
+
+On failure, the journal records the current key or prefix, day, connector, publication stage, exact message and last completed day, then attempts a forced durability barrier and close. The compact failure checkpoint and final run state retain journal failure details even when the journal itself becomes unusable. SOS-light remains sequential: later not-started days are recorded and remain untouched, and affected indexes are unreachable after an incomplete day. No resume path was added.
+
+### Apply progress visibility
+
+Node emits bounded progress to stderr for canonical start/completion/failure, day deletion and verification, day publication and parent verification, bounded within-day object movement, and index start/completion. Counts include completed/planned objects and post-PUT verifications plus elapsed apply seconds. Python now drains stdout and stderr concurrently, streams stderr lines directly into the main Integrity logger, retains all output for failure diagnosis, and continues to parse the final structured result exclusively from stdout.
+
+### Files changed
+
+- `scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`: durable journal/checkpoint/sidecar implementation, bounded full-state persistence, dependency/day/index barriers and progress logging.
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`: streamed child output, sidecar and journal identity verification, current-state checkpoint boundaries and final-report persistence evidence.
+- `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`: focused transition, barrier, sidecar, day-boundary and bounded-log checks alongside the existing apply regressions.
+- `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`: focused artifact-verification and subprocess-streaming checks.
+- this implementation report.
+
+The two changed active implementation files already had pre-change snapshots at `archive/2026-08-01/`; no duplicate archive was created. `system_docs/`, `TODO-IMPORTANT-UKAQ.txt`, schema, R2 index payload construction, Prune Daily and AQI bypass behaviour were not changed.
+
+### Focused validation and CIC-Test acceptance
+
+- JavaScript syntax checks: passed.
+- Python syntax compilation: passed.
+- JavaScript apply-safety, compact checkpoint schema, final proposal graph, strict false-`planned_overlay`, absent-day/O3 construction, per-day failure/order, GET-once and bounded-cache checks: passed (`27` tests).
+- Python apply-artifact identity, child-output streaming and final-error retention checks: passed (`3` tests).
+- Python absent-Dropbox-day and source-plus-Dropbox assembly checks: passed (`2` tests).
+- Required JavaScript dependencies were installed from the existing local npm cache with `npm ci --offline --ignore-scripts`; no dependency was fetched from the network.
+- `git diff --check`: passed.
+
+No actual Integrity command and no R2, Dropbox operational data, Supabase, PostgreSQL, SOS, GCP, Cloudflare or other external service was accessed. No deployment, commit, push or pull request was performed.
+
+Functional timing is deliberately not claimed here. The next real CIC-Test multi-day SOS-light operation must confirm ongoing log movement, bounded checkpoint size, durable journal/sidecar identities, one post-PUT GET per changed object, day-before-next-delete ordering, indexes last, and improved apply duration/CPU behaviour relative to the 7,244-object incident.
+
 ## 1 August 2026 proposal dependency provenance correction
 
 ### Failure and root cause
