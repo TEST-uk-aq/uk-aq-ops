@@ -4387,6 +4387,339 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             self.assertEqual(aqi_stage["status"], "bypassed")
 
 
+class ProposalRunStateTransitionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _identity(entry: dict[str, object], source: str) -> dict[str, object]:
+        return {
+            "source": source,
+            "sha256": entry["sha256"],
+            "bytes": entry["bytes"],
+        }
+
+    def _build_production_transition(self) -> tuple[dict, dict[str, str]]:
+        dropbox = self.root / "dropbox"
+        dropbox.mkdir()
+        run_state = MODULE.create_run_overlay(
+            tmp_dir=self.root / "tmp",
+            run_id="proposal-transition",
+            environment="CIC-Test",
+            base_dropbox_root=dropbox,
+        )
+        day_utc = "2026-06-17"
+        day_prefix = (
+            f"{MODULE.R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
+        )
+        keys = {
+            "part": (
+                f"{day_prefix}/connector_id=1/pollutant_code=pm25/"
+                "part-00000.parquet"
+            ),
+            "pollutant": (
+                f"{day_prefix}/connector_id=1/pollutant_code=pm25/manifest.json"
+            ),
+            "connector": f"{day_prefix}/connector_id=1/manifest.json",
+            "day": f"{day_prefix}/manifest.json",
+            "scoped": (
+                "history/_index_v2/observations_timeseries/"
+                f"day_utc={day_utc}/connector_id=1/"
+                "pollutant_code=pm25/manifest.json"
+            ),
+            "latest": "history/_index_v2/observations_timeseries_latest.json",
+            "dropbox": "history/_index_v2/unchanged-dropbox.json",
+            "overlay": "history/_index_v2/unchanged-overlay.json",
+        }
+        part_source = self.root / "part.parquet"
+        part_source.write_bytes(b"PAR1-transition-fixture")
+        MODULE.stage_overlay_object(
+            run_state,
+            object_key=keys["part"],
+            source_path=part_source,
+            stage="observations_data",
+            dependencies=(),
+        )
+        MODULE.mark_overlay_structurally_validated(run_state, keys["part"])
+        part_entry = run_state["objects"][keys["part"]]
+
+        dropbox_body = b'{"unchanged":"dropbox"}\n'
+        dropbox_path = dropbox / keys["dropbox"]
+        dropbox_path.parent.mkdir(parents=True, exist_ok=True)
+        dropbox_path.write_bytes(dropbox_body)
+        overlay_body = b'{"unchanged":"overlay"}\n'
+        overlay_path = Path(run_state["overlay_root"]) / keys["overlay"]
+        overlay_path.parent.mkdir(parents=True, exist_ok=True)
+        overlay_path.write_bytes(overlay_body)
+
+        proposal_specs = [
+            (
+                keys["pollutant"],
+                "pollutant_manifest",
+                "pollutant_manifest",
+                {
+                    "manifest_kind": "pollutant",
+                    "parquet_object_keys": [keys["part"]],
+                    "files": [{"key": keys["part"]}],
+                },
+                [keys["part"]],
+                {keys["part"]: self._identity(part_entry, "planned_overlay")},
+            ),
+            (
+                keys["connector"],
+                "connector_manifest",
+                "connector_manifest",
+                {
+                    "manifest_kind": "connector",
+                    "pollutant_manifests": [{"manifest_key": keys["pollutant"]}],
+                },
+                [keys["pollutant"]],
+                None,
+            ),
+            (
+                keys["day"],
+                "day_manifest",
+                "day_parent",
+                {
+                    "manifest_kind": "day",
+                    "connector_manifests": [{"manifest_key": keys["connector"]}],
+                },
+                [keys["connector"]],
+                None,
+            ),
+            (
+                keys["scoped"],
+                "pollutant_timeseries_index",
+                "scoped_timeseries_index",
+                {"pollutant_manifest_key": keys["pollutant"]},
+                [keys["pollutant"]],
+                None,
+            ),
+        ]
+        proposals: list[dict[str, object]] = []
+        staged_identities: dict[str, dict[str, object]] = {
+            keys["part"]: self._identity(part_entry, "planned_overlay")
+        }
+        for key, kind, stage, payload, dependencies, supplied in proposal_specs:
+            identities = supplied or {
+                dependency: staged_identities[dependency]
+                for dependency in dependencies
+            }
+            body = json.dumps(payload, separators=(",", ":"))
+            body_bytes = body.encode()
+            staged_identities[key] = {
+                "source": "planned_overlay",
+                "sha256": hashlib.sha256(body_bytes).hexdigest(),
+                "bytes": len(body_bytes),
+            }
+            proposals.append({
+                "key": key,
+                "kind": kind,
+                "publication_stage": stage,
+                "changed": True,
+                "status": "planned",
+                "included_in_write_set": True,
+                "dependencies": dependencies,
+                "dependency_identities": identities,
+                "proposed_body": body,
+            })
+
+        latest_dependencies = [keys["scoped"], keys["dropbox"], keys["overlay"]]
+        latest_body = json.dumps({
+            "child_manifests": [
+                {"manifest_key": key} for key in latest_dependencies
+            ]
+        }, separators=(",", ":"))
+        proposals.append({
+            "key": keys["latest"],
+            "kind": "latest_timeseries_index",
+            "publication_stage": "latest_timeseries_index",
+            "changed": True,
+            "status": "planned",
+            "included_in_write_set": True,
+            "dependencies": latest_dependencies,
+            "dependency_identities": {
+                keys["scoped"]: staged_identities[keys["scoped"]],
+                keys["dropbox"]: {
+                    "source": "dropbox",
+                    "sha256": hashlib.sha256(dropbox_body).hexdigest(),
+                    "bytes": len(dropbox_body),
+                },
+                keys["overlay"]: {
+                    "source": "overlay",
+                    "sha256": hashlib.sha256(overlay_body).hexdigest(),
+                    "bytes": len(overlay_body),
+                },
+            },
+            "proposed_body": latest_body,
+        })
+        proposals.extend([
+            {
+                "key": keys["dropbox"],
+                "kind": "scoped_timeseries_index",
+                "changed": False,
+                "status": "skipped_unchanged",
+                "included_in_write_set": False,
+                "dependencies": [],
+                "dependency_identities": {},
+                "proposed_body": dropbox_body.decode(),
+            },
+            {
+                "key": keys["overlay"],
+                "kind": "scoped_timeseries_index",
+                "changed": False,
+                "status": "skipped_unchanged",
+                "included_in_write_set": False,
+                "dependencies": [],
+                "dependency_identities": {},
+                "proposed_body": overlay_body.decode(),
+            },
+        ])
+        MODULE._record_metadata_executor_overlay(
+            run_state=run_state,
+            executor_result={
+                "output": {"planning": {
+                    "proposals": proposals,
+                    "blocked_scopes": [],
+                    "sos_light": {
+                        "validation_status": "validated_local_assembly",
+                        "old_live_r2_observation_bodies_used": False,
+                        "dropbox_warnings": [],
+                        "dropbox_warning_count": 0,
+                        "dropbox_omission_count": 0,
+                        "days": [{
+                            "day_utc": day_utc,
+                            "final_connector_1_child_set": [keys["pollutant"]],
+                        }],
+                    },
+                }},
+            },
+            dry_run=False,
+        )
+        MODULE.assemble_sos_light_complete_days(run_state)
+        return run_state, keys
+
+    def test_real_planner_transition_preserves_all_provenance_and_node_accepts(
+        self,
+    ) -> None:
+        run_state, keys = self._build_production_transition()
+        edges = [
+            (keys["pollutant"], keys["part"]),
+            (keys["connector"], keys["pollutant"]),
+            (keys["day"], keys["connector"]),
+            (keys["scoped"], keys["pollutant"]),
+            (keys["latest"], keys["scoped"]),
+        ]
+        for parent_key, dependency_key in edges:
+            with self.subTest(parent=parent_key, dependency=dependency_key):
+                parent = run_state["objects"][parent_key]
+                child = run_state["objects"][dependency_key]
+                identity = parent["dependency_identities"][dependency_key]
+                self.assertEqual(identity["source"], "planned_overlay")
+                self.assertEqual(identity["sha256"], child["sha256"])
+                self.assertEqual(identity["bytes"], child["bytes"])
+        latest_identities = run_state["objects"][keys["latest"]][
+            "dependency_identities"
+        ]
+        self.assertEqual(latest_identities[keys["dropbox"]]["source"], "dropbox")
+        self.assertEqual(latest_identities[keys["overlay"]]["source"], "overlay")
+        self.assertNotIn(keys["dropbox"], run_state["objects"])
+        self.assertNotIn(keys["overlay"], run_state["objects"])
+        audit = MODULE.validate_proposal_run_state_transition(run_state)
+        self.assertEqual(audit["status"], "succeeded")
+        self.assertEqual(audit["planner_identity_comparison_count"], 7)
+
+        repo_root = MODULE_PATH.parents[3]
+        apply_module = (
+            repo_root / "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"
+        ).as_uri()
+        node_result = MODULE.subprocess.run(
+            [
+                "node", "--input-type=module", "--eval",
+                (
+                    "import fs from 'node:fs';"
+                    f"import {{validateLocalProposal}} from {json.dumps(apply_module)};"
+                    f"const state=JSON.parse(fs.readFileSync({json.dumps(run_state['run_state_path'])},'utf8'));"
+                    "const proposal=validateLocalProposal(state);"
+                    "process.stdout.write(JSON.stringify({objects:proposal.objects.length}));"
+                ),
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(node_result.returncode, 0, node_result.stderr)
+        self.assertEqual(
+            json.loads(node_result.stdout)["objects"], len(run_state["objects"])
+        )
+
+    def test_coordinator_validator_rejects_transition_contradictions(self) -> None:
+        run_state, keys = self._build_production_transition()
+        cases = {
+            "staged_source": lambda state: state["objects"][keys["pollutant"]]
+                ["dependency_identities"][keys["part"]].update({"source": "overlay"}),
+            "missing_staged": lambda state: state["objects"].pop(keys["scoped"]),
+            "staged_sha256": lambda state: state["objects"][keys["connector"]]
+                ["dependency_identities"][keys["pollutant"]].update({"sha256": "f" * 64}),
+            "staged_bytes": lambda state: state["objects"][keys["day"]]
+                ["dependency_identities"][keys["connector"]].update({"bytes": 999999}),
+            "unchanged_in_write_set": lambda state: state["objects"].update({
+                keys["dropbox"]: {
+                    "object_key": keys["dropbox"],
+                    "local_path": str(Path(state["base_dropbox_root"]) / keys["dropbox"]),
+                    "sha256": hashlib.sha256(b'{"unchanged":"dropbox"}\n').hexdigest(),
+                    "bytes": len(b'{"unchanged":"dropbox"}\n'),
+                    "dependencies": [],
+                    "dependency_identities": {},
+                    "proposed": True,
+                    "built": True,
+                    "structurally_validated": True,
+                },
+            }),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                state = json.loads(json.dumps(run_state))
+                mutate(state)
+                with self.assertRaisesRegex(
+                    ValueError, "coordinator proposal-transition validation failed",
+                ) as raised:
+                    MODULE.validate_proposal_run_state_transition(state)
+                self.assertIn("parent_object_key", str(raised.exception))
+                self.assertIn("dependency_object_key", str(raised.exception))
+                self.assertIn("expected_sha256", str(raised.exception))
+                self.assertIn("actual_sha256", str(raised.exception))
+
+    def test_transition_failure_prevents_node_apply_launch(self) -> None:
+        run_state, keys = self._build_production_transition()
+        run_state["objects"][keys["pollutant"]]["dependency_identities"][
+            keys["part"]
+        ]["source"] = "overlay"
+        logger = logging.getLogger("proposal-transition-launch-test")
+        with mock.patch.object(MODULE.subprocess, "Popen") as popen:
+            result = MODULE.run_canonical_apply_executor(
+                run_state=run_state,
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                log=logger,
+            )
+        popen.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            result["reason"], "coordinator_proposal_transition_validation_failed"
+        )
+        self.assertFalse(result["node_apply_launched"])
+        self.assertFalse(result["r2_mutation_possible"])
+        self.assertTrue(all(
+            "remote_attempted" not in entry
+            for entry in run_state["objects"].values()
+        ))
+
+
 class ApplyPersistenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
