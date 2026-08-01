@@ -36,6 +36,7 @@ import {
   finaliseLegacyObservationManifestCompatibility,
 } from "../../../workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs";
 import {
+  compareProposalCollision,
   inspectSourceDerivedObservationManifestOwner,
 } from "../../../workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs";
 import {
@@ -724,7 +725,11 @@ function replaceStoredEvidenceRows(fixture, storedRows) {
   fs.writeFileSync(fixture.evidencePath, JSON.stringify(evidence));
 }
 
-async function compatibilityFixture({ contentMismatch = false, dependencyMismatch = false } = {}) {
+async function compatibilityFixture({
+  contentMismatch = false,
+  dependencyMismatch = false,
+  dependencySource = "planned_overlay",
+} = {}) {
   const fixture = await observationFixture();
   const owned = await inspectSourceDerivedObservationManifestOwner({
     state: fixture.runState,
@@ -746,6 +751,7 @@ async function compatibilityFixture({ contentMismatch = false, dependencyMismatc
   };
   const dependencyIdentities = structuredClone(owned.dependency_identities);
   if (dependencyMismatch) dependencyIdentities[fixture.partKey].sha256 = "a".repeat(64);
+  dependencyIdentities[fixture.partKey].source = dependencySource;
   const existing = {
     key,
     kind: "pollutant_manifest",
@@ -777,6 +783,7 @@ async function compatibilityFixture({ contentMismatch = false, dependencyMismatc
         pollutant_proposals: [{
           key,
           retained_source_derived: true,
+          body: owned.body,
           content_facts: owned.content_facts,
           dependencies: owned.dependencies,
           dependency_identities: owned.dependency_identities,
@@ -788,14 +795,55 @@ async function compatibilityFixture({ contentMismatch = false, dependencyMismatc
         }],
       }],
     },
+    owned,
   };
 }
 
 test("compatibility retains an owned source-derived manifest across operational metadata differences", async () => {
   const compatible = await compatibilityFixture();
   const finalised = finaliseLegacyObservationManifestCompatibility(compatible);
-  assert.equal(finalised.planning.proposals.find((proposal) => proposal.key === compatible.key), compatible.existing);
-  assert.equal(finalised.planning.compatibility_preparation.collisions[0].status, "retained_source_derived");
+  const winner = finalised.planning.proposals.find((proposal) => proposal.key === compatible.key);
+  const collision = finalised.planning.compatibility_preparation.collisions[0];
+  assert.notEqual(winner, compatible.existing);
+  assert.equal(winner.proposed_body, compatible.owned.body.toString("utf8"));
+  assert.deepEqual(winner.dependencies, compatible.owned.dependencies);
+  assert.deepEqual(winner.dependency_identities, compatible.owned.dependency_identities);
+  assert.equal(winner.proposal_owner, "source_derived_observation_repair");
+  assert.equal(winner.proposal_provenance, "current_run_source_derived_staged_parquet");
+  assert.equal(collision.status, "retained_source_derived");
+  assert.equal(collision.collision_decision, "source_derived_owner_won");
+});
+
+test("compatibility rejects overlay provenance and replaces the whole candidate with the source-derived winner", async () => {
+  const compatible = await compatibilityFixture({ dependencySource: "overlay" });
+  const comparison = compareProposalCollision(compatible.existing, {
+    ...compatible.existing,
+    proposed_body: compatible.owned.body.toString("utf8"),
+    dependency_identities: compatible.owned.dependency_identities,
+  });
+  assert.equal(comparison.identical, false);
+  assert.deepEqual(comparison.differing_fields, [
+    `dependency_identities.${compatible.owned.dependencies[0]}.source`,
+  ]);
+
+  const finalised = finaliseLegacyObservationManifestCompatibility(compatible);
+  const winner = finalised.planning.proposals.find((proposal) => proposal.key === compatible.key);
+  const collision = finalised.planning.compatibility_preparation.collisions[0];
+  assert.equal(
+    winner.dependency_identities[compatible.owned.dependencies[0]].source,
+    "planned_overlay",
+  );
+  assert.equal(winner.proposed_body, compatible.owned.body.toString("utf8"));
+  assert.equal(winner.new_sha256, sha256Hex(compatible.owned.body));
+  assert.equal(winner.bytes, Buffer.byteLength(compatible.owned.body, "utf8"));
+  assert.equal(collision.collision_decision, "source_derived_owner_won");
+  assert.deepEqual(collision.rejected_dependency_source_fields, [
+    `dependency_identities.${compatible.owned.dependencies[0]}.source`,
+  ]);
+  assert.equal(
+    collision.winner_dependency_identities[compatible.owned.dependencies[0]].source,
+    "planned_overlay",
+  );
 });
 
 test("compatibility rejects exact source-derived content and dependency mismatches", async () => {
@@ -828,6 +876,11 @@ test("compatibility ownership is independently derived from final staged Parquet
     originalManifest,
   );
   assert.equal(fixture.runState.objects[fixture.partKey].proposal_owner, "source_derived_observation_repair");
+  assert.equal(owned.dependency_identities[fixture.partKey].source, "planned_overlay");
+  assert.deepEqual(
+    fixture.runState.objects[fixture.manifestKey].dependency_identities,
+    owned.dependency_identities,
+  );
 });
 
 test("final proposal graph requires immutable source, staged Parquet and final manifest equality before remote mutation", async () => {

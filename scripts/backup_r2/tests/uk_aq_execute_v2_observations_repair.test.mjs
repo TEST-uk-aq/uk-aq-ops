@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
+  createCombinedLocalStore,
   createStagedObjectMap,
   localDependencySnapshot,
   proposalGraphAudit,
   proposalView,
   readChildren,
+  validateFinalPlannerProposalGraph,
 } from "../uk_aq_execute_v2_observations_repair.mjs";
 import {
   buildHistoryV2ConnectorManifest,
@@ -42,6 +47,115 @@ function localObject(key, body, source = "dropbox") {
     content_sha256: sha256Hex(buffer),
   };
 }
+
+test("combined local store classifies current-run objects independently of their overlay path", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-planner-provenance-"));
+  try {
+    const overlayRoot = path.join(root, "overlay");
+    const dropboxRoot = path.join(root, "dropbox");
+    const key = "history/v2/observations/day_utc=2026-07-30/connector_id=1/pollutant_code=no2/part-00000.parquet";
+    const externalKey = "history/v2/observations/day_utc=2026-07-30/connector_id=2/pollutant_code=no2/part-00000.parquet";
+    const localPath = path.join(overlayRoot, ...key.split("/"));
+    const externalPath = path.join(overlayRoot, ...externalKey.split("/"));
+    fs.mkdirSync(path.dirname(localPath), { recursive: true });
+    fs.writeFileSync(localPath, "current-run-part");
+    fs.mkdirSync(path.dirname(externalPath), { recursive: true });
+    fs.writeFileSync(externalPath, "immutable-overlay-part");
+    const body = fs.readFileSync(localPath);
+    const externalBody = fs.readFileSync(externalPath);
+    const runStatePath = path.join(root, "run-state.json");
+    fs.writeFileSync(runStatePath, JSON.stringify({
+      objects: {
+        [key]: {
+          local_path: localPath,
+          proposed: true,
+          built: true,
+          structurally_validated: true,
+          bytes: body.byteLength,
+          sha256: sha256Hex(body),
+          stage: "observations_data",
+        },
+        [externalKey]: {
+          local_path: externalPath,
+          proposed: false,
+          changed: false,
+          included_in_write_set: false,
+          status: "skipped_unchanged",
+          structurally_validated: true,
+          bytes: externalBody.byteLength,
+          sha256: sha256Hex(externalBody),
+        },
+      },
+      tombstones: {},
+      tombstone_prefixes: [],
+    }));
+    fs.mkdirSync(dropboxRoot, { recursive: true });
+    const store = createCombinedLocalStore({
+      overlayRoot,
+      dropboxRoot,
+      runStateJson: runStatePath,
+      prefixes: ["history/v2/observations/day_utc=2026-07-30"],
+    });
+    const resolved = store.getObject(key);
+    assert.equal(resolved.source, "planned_overlay");
+    assert.equal(resolved.content_sha256, sha256Hex(body));
+    assert.equal(resolved.bytes, body.byteLength);
+    const external = store.getObject(externalKey);
+    assert.equal(external.source, "overlay");
+    assert.equal(external.content_sha256, sha256Hex(externalBody));
+    assert.equal(external.bytes, externalBody.byteLength);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("final planner validation rejects staged overlay provenance before Python", () => {
+  const childKey = "history/v2/observations/day_utc=2026-07-30/connector_id=1/pollutant_code=no2/part-00000.parquet";
+  const parentKey = childKey.replace("part-00000.parquet", "manifest.json");
+  const childSha256 = "a".repeat(64);
+  const output = {
+    planning: {
+      proposals: [{
+        key: parentKey,
+        changed: true,
+        bytes: 100,
+        new_sha256: "b".repeat(64),
+        dependencies: [childKey],
+        dependency_identities: {
+          [childKey]: { source: "overlay", sha256: childSha256, bytes: 25 },
+        },
+        proposal_owner: "source_derived_observation_repair",
+        proposal_provenance: "current_run_source_derived_staged_parquet",
+      }],
+      compatibility_preparation: {
+        collisions: [{ key: parentKey, collision_decision: "source_derived_owner_won" }],
+      },
+    },
+  };
+  const runState = {
+    objects: {
+      [childKey]: {
+        proposed: true,
+        structurally_validated: true,
+        sha256: childSha256,
+        bytes: 25,
+      },
+    },
+  };
+  assert.throws(
+    () => validateFinalPlannerProposalGraph(structuredClone(output), { runState }),
+    /JavaScript final planner proposal validation failed:.*staged_dependency_identity_mismatch.*"actual_source":"overlay".*"expected_source":"planned_overlay".*source_derived_owner_won/,
+  );
+  output.planning.proposals[0].dependency_identities[childKey].source = "planned_overlay";
+  const audit = validateFinalPlannerProposalGraph(output, { runState });
+  assert.equal(audit.status, "succeeded");
+  assert.equal(audit.staged_dependency_edge_count, 1);
+  delete runState.objects[childKey];
+  assert.throws(
+    () => validateFinalPlannerProposalGraph(structuredClone(output), { runState }),
+    /planned_overlay_dependency_missing_from_changed_write_set/,
+  );
+});
 
 test("mixed changed and unchanged index proposals retain exact staged and baseline provenance", async () => {
   const prefix = "history/_index_v2/observations_timeseries/";
