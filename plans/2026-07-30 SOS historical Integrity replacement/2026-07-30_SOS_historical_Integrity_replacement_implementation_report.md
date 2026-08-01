@@ -1,5 +1,101 @@
 # SOS historical Integrity replacement implementation report
 
+## 1 August 2026 source-derived metadata provenance correction
+
+### Failed run and first incorrect producer
+
+The supplied CIC-Test run `2026-08-01T192854Z` failed closed before Node apply. Python reported `reason=staged_dependency_identity_mismatch`, `planner_source=overlay`, and `expected_source=planned_overlay`; `node_apply_launched=false`, `r2_mutation_possible=false`, and no R2 DELETE or PUT occurred.
+
+All four source-derived pollutant-manifest edges were already wrong in the JavaScript metadata result:
+
+| Pollutant | Staged child | Wrong planner source | SHA-256 | Bytes |
+|---|---|---:|---|---:|
+| `no2` | `history/v2/observations/day_utc=2026-07-30/connector_id=1/pollutant_code=no2/part-00000.parquet` | `overlay` | `e4dae7c2444ef62af7ecee1c4c7abb9b61bbf764ef9a9b7cf0ed636305fb1b99` | 8,334 |
+| `o3` | `history/v2/observations/day_utc=2026-07-30/connector_id=1/pollutant_code=o3/part-00000.parquet` | `overlay` | `a7ad81c11b23656b4ac90ce2b5d6fb6db3af94f191521d85723a9dff279bcbbd` | 8,330 |
+| `pm10` | `history/v2/observations/day_utc=2026-07-30/connector_id=1/pollutant_code=pm10/part-00000.parquet` | `overlay` | `5fab69c8e64e410521dd213375159c2706dec7a5c12d65dece6039e8a217dca8` | 8,339 |
+| `pm25` | `history/v2/observations/day_utc=2026-07-30/connector_id=1/pollutant_code=pm25/part-00000.parquet` | `overlay` | `918219b7f385fe1e5bd3da9f1fc6cad9d0097a7e3c7adc0d7b76e2cde98a65e5` | 7,581 |
+
+The first incorrect producer was `createCombinedLocalStore().localObject()` in the pre-edit `scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs`, archived lines 470-476. `objectFor()` selected a current-run object from `overlayPaths`, then `localObject()` passed the physical storage label `overlay` directly into `objectFromBody()`. The metadata leaf builder subsequently reconstructed the dependency identity from that combined-store object. This conflated two distinct semantic classes sharing the same physical overlay workspace: current-run changed objects and immutable external overlay objects.
+
+The complete failed identity trace was:
+
+1. `inspectSourceDerivedObservationManifestOwner()` independently derived the staged Parquet SHA-256/bytes and returned `source=planned_overlay` for all four children.
+2. Canonical compatibility preparation retained that source-derived owner result.
+3. `createCombinedLocalStore().localObject()` re-read the same current-run files by physical location and returned `source=overlay`; the metadata pollutant builder used that reconstructed identity.
+4. Collision handling accepted both `overlay` and `planned_overlay` as equivalent source-derived content and retained the metadata candidate, while recording the source-derived label. It therefore retained a body/identity candidate whose staged dependency source was wrong.
+5. The final JavaScript metadata proposal contained `overlay`; Python `_record_metadata_executor_overlay()` correctly preserved that planner evidence rather than relabelling it.
+6. `validate_proposal_run_state_transition()` correctly rejected the first `no2` edge before launching Node.
+7. `validateLocalProposal()` was not reached in the failed run. Had Python been bypassed, its unchanged final graph checks would also have rejected the staged-source contradiction.
+
+The existing focused tests missed this because the direct owner test supplied the already-correct `planned_overlay` identity and the collision fixture also began with `planned_overlay`. They did not pass a real current-run state object through `createCombinedLocalStore()`, the metadata leaf builder, compatibility finalisation, Python staging and Node validation as one production path. They therefore tested the correct endpoints without exercising the physical-overlay provenance reconstruction between them.
+
+### Implementation correction
+
+`createCombinedLocalStore()` now separates storage location from dependency provenance. Qualifying current-run `runState.objects` remain physically read from the overlay workspace but are exposed semantically as `planned_overlay`; structurally validated immutable objects outside the changed write set remain `overlay`. Qualification is fail-closed on proposed, structurally validated, included changed objects. The metadata leaf planner preserves the exact authoritative source-derived manifest body, owner, provenance, dependencies and identities instead of combining a rebuilt body with another candidate's identities.
+
+Source-derived ownership comparison now requires exactly `planned_overlay`; `overlay` is a recorded difference, not an accepted synonym. Canonical and legacy compatibility preparations carry the exact owned body. Collision finalisation creates one coherent source-derived winner containing that body, owner, provenance, dependency set and exact dependency identities. It records `collision_decision=source_derived_owner_won`, winner/loser ownership, differing fields, rejected source fields and winner identities. A non-source semantic difference still fails closed.
+
+Immediately before the wrapper returns a successful final proposal set to Python, `validateFinalPlannerProposalGraph()` independently validates the complete JavaScript graph. It builds the final changed write set from source-derived run-state objects plus changed metadata proposals. Every dependency within that set must be `planned_overlay` with exact child SHA-256/bytes; external dependencies must be exact `dropbox` or immutable `overlay` roots. Duplicate keys, dependency/identity-set disagreement, malformed identities, staged identity mismatches and orphaned `planned_overlay` references fail the JavaScript stage. Failure evidence includes parent, dependency, actual/expected source, SHA-256 and bytes, owner, provenance and collision decision. The Python transition validator and Node final proposal validator are unchanged independent boundaries.
+
+### Real failed-run regression
+
+The primary regression extracts the supplied `logs/run-2026-08-01T192854Z.zip` into a temporary run root. It first proves the archived real result contains `overlay` for all four pollutant-to-Parquet edges and proves the recorded Python failure expected `planned_overlay`, did not launch Node and made R2 mutation impossible. It then uses the bundle's real generated Parquet/manifests and baseline metadata through the actual JavaScript CLI wrapper, source-owner inspection, canonical compatibility preparation, collision finalisation and final planner invariant.
+
+The corrected result contains 11 changed metadata proposals over the eight source-derived Parquet/manifest objects. All four pollutant edges are `planned_overlay` with the exact SHA-256/bytes above, and every dependency whose key is in the 15-object final changed write set is scanned for `planned_overlay`. The JavaScript audit succeeds with 15 changed write objects and 17 staged dependency edges. The regression then calls the actual Python `_record_metadata_executor_overlay()`, SOS-light complete-day assembly and `validate_proposal_run_state_transition()`; Python accepts 15 objects and all 17 planner identity comparisons. Finally, the unchanged Node `validateLocalProposal()` accepts all 15 objects. Dummy R2 configuration is supplied only to satisfy structural planner configuration; proposal-only local adapters perform no network request.
+
+Focused collision checks additionally prove that an `overlay` source is not identical to `planned_overlay`, cannot replace the source-derived owner, cannot survive in a final changed-child edge, and cannot cause body/identity mixing. The selected winner retains its exact authoritative body, owner, dependencies and identities.
+
+### Files, archives and focused validation
+
+Changed files:
+
+- `scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs`
+- `scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs`
+- `workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs`
+- `workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs`
+- `workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs`
+- `scripts/backup_r2/tests/uk_aq_execute_v2_observations_repair.test.mjs`
+- `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`
+- `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`
+- this implementation report
+
+Non-overwriting pre-edit production snapshots:
+
+- `archive/2026-08-01/integrity-source-derived-provenance-fix/scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs`
+- `archive/2026-08-01/integrity-source-derived-provenance-fix/scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs`
+- `archive/2026-08-01/integrity-source-derived-provenance-fix/workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs`
+- `archive/2026-08-01/integrity-source-derived-provenance-fix/workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs`
+- `archive/2026-08-01/integrity-source-derived-provenance-fix/workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs`
+
+Focused validation:
+
+- JavaScript syntax checks for all five changed production `.mjs` files: passed.
+- Python compilation for the changed regression module: passed.
+- JavaScript planner, ownership, collision, frozen-schedule and Node apply-safety tests: passed (`51` tests).
+- Real failed-run JavaScript-to-Python-to-Node regression plus existing Python proposal-transition tests: passed (`4` tests).
+- `git diff --check`: passed.
+
+No real Integrity operation, R2, Supabase or other external service was accessed. No deployment, stage, commit, push or pull request was performed. `system_docs/` and `TODO-IMPORTANT-UKAQ.txt` were not modified.
+
+### Remaining one-day CIC-Test validation
+
+Structural tests do not prove functional CIC-Test success, so this issue is not claimed as operationally resolved. After review and deployment, rerun only the affected day manually:
+
+```bash
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
+  --env CIC-Test \
+  --profile manual \
+  --source sos \
+  --from-day 2026-07-30 \
+  --to-day 2026-07-30 \
+  --history-version v2 \
+  --run-backfill \
+  --repair-pollutants pm25,pm10,no2,o3 \
+  --allow-stale-dropbox
+```
+
+Confirm all three independent graph validations succeed before the first mutation, the four pollutant edges retain their exact `planned_overlay` identities, the frozen schedule and journal checks pass, SOS-light publication and post-PUT GET verification complete, and remaining gaps reach zero. The remaining risk is external operational behaviour after proposal validation: writer-lock acquisition, real R2 publication/read-back, mutation-journal durability, final verification and downstream current-state reconciliation.
+
 ## 1 August 2026 proposal-to-run-state provenance transition correction
 
 ### Root cause and affected transition

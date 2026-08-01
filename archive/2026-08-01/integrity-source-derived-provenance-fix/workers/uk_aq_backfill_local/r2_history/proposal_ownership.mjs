@@ -165,7 +165,7 @@ export function compareSourceDerivedManifestContent(proposal, contentFacts) {
     if (Number(actual?.bytes) !== expected.bytes) {
       differingFields.push(`dependency_identities.${key}.bytes`);
     }
-    if (String(actual?.source || "") !== "planned_overlay") {
+    if (!["overlay", "planned_overlay"].includes(String(actual?.source || ""))) {
       differingFields.push(`dependency_identities.${key}.source`);
     }
   }

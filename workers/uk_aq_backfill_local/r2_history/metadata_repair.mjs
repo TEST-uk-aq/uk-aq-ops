@@ -299,6 +299,7 @@ export async function prepareLegacyObservationManifestCompatibility({
           pollutantProposals.push({
             key: canonicalKey,
             retained_source_derived: true,
+            body: owned.body,
             content_facts: owned.content_facts,
             dependencies: owned.dependencies,
             dependency_identities: owned.dependency_identities,
@@ -459,6 +460,49 @@ function proposalForPollutant(prepared) {
   };
 }
 
+function proposalForRetainedSourceDerived(prepared, existing) {
+  const body = String(prepared.body || "");
+  if (!body) {
+    throw new Error(
+      `Source-derived proposal body is unavailable during collision finalisation: ${prepared.key}`,
+    );
+  }
+  const dependencies = [...new Set((prepared.dependencies || []).map(String))].sort();
+  const dependencyIdentities = Object.fromEntries(dependencies.map((key) => {
+    const identity = prepared.dependency_identities?.[key];
+    if (!identity || identity.source !== "planned_overlay") {
+      throw new Error(
+        `Source-derived proposal dependency provenance is invalid during collision finalisation: ${prepared.key} -> ${key}`,
+      );
+    }
+    return [key, {
+      source: identity.source,
+      sha256: String(identity.sha256 || ""),
+      bytes: Number(identity.bytes),
+    }];
+  }));
+  return {
+    ...existing,
+    key: prepared.key,
+    kind: "pollutant_manifest",
+    bytes: Buffer.byteLength(body, "utf8"),
+    new_sha256: sha256Hex(body),
+    changed: true,
+    status: "planned",
+    included_in_write_set: true,
+    dependencies,
+    dependency_identities: dependencyIdentities,
+    provenance: {
+      source: SOURCE_DERIVED_OWNER,
+      compatibility_source: prepared.compatibility_source || "dropbox",
+      collision_role: "authoritative_winner",
+    },
+    proposal_owner: SOURCE_DERIVED_OWNER,
+    proposal_provenance: "current_run_source_derived_staged_parquet",
+    proposed_body: body,
+  };
+}
+
 export function finaliseLegacyObservationManifestCompatibility({
   output,
   preparation,
@@ -495,28 +539,44 @@ export function finaliseLegacyObservationManifestCompatibility({
     for (const pollutant of prepared.pollutant_proposals) {
       const existing = proposals.get(pollutant.key);
       if (pollutant.retained_source_derived) {
-        if (!existing || existing?.provenance?.source !== SOURCE_DERIVED_OWNER) {
+        if (!existing) {
           throw new Error(
-            `Integrity proposal collision: key=${pollutant.key} owners=${String(existing?.provenance?.source || "metadata_planner")},${SOURCE_DERIVED_OWNER} differing_fields=proposal_owner compatibility_source=${pollutant.compatibility_source || "dropbox"}`,
+            `Integrity proposal collision: key=${pollutant.key} owners=missing,${SOURCE_DERIVED_OWNER} differing_fields=missing_metadata_candidate compatibility_source=${pollutant.compatibility_source || "dropbox"}`,
           );
         }
         const comparison = compareSourceDerivedManifestContent(
           existing,
           pollutant.content_facts,
         );
-        if (!comparison.identical) {
+        const nonProvenanceDifferences = comparison.differing_fields.filter((field) =>
+          !field.endsWith(".source")
+        );
+        if (nonProvenanceDifferences.length) {
           throw new Error(
-            `Integrity proposal collision: key=${pollutant.key} owners=${String(existing.provenance.source)},${SOURCE_DERIVED_OWNER} differing_fields=${comparison.differing_fields.join(",")} compatibility_source=${pollutant.compatibility_source || "dropbox"}`,
+            `Integrity proposal collision: key=${pollutant.key} owners=${String(existing?.provenance?.source || "metadata_planner")},${SOURCE_DERIVED_OWNER} differing_fields=${nonProvenanceDifferences.join(",")} compatibility_source=${pollutant.compatibility_source || "dropbox"}`,
           );
         }
+        const winner = proposalForRetainedSourceDerived(pollutant, existing);
+        const collisionComparison = compareProposalCollision(existing, winner);
+        proposals.set(pollutant.key, winner);
         collisions.push({
           key: pollutant.key,
           status: "retained_source_derived",
-          retained_owner: existing.provenance.source,
+          collision_decision: "source_derived_owner_won",
+          retained_owner: SOURCE_DERIVED_OWNER,
+          winning_owner: SOURCE_DERIVED_OWNER,
+          losing_owner: String(existing?.provenance?.source || "metadata_planner"),
           compatibility_source: pollutant.compatibility_source || "dropbox",
-          differing_fields: [],
+          differing_fields: collisionComparison.differing_fields,
+          rejected_dependency_source_fields: comparison.differing_fields.filter((field) =>
+            field.endsWith(".source")
+          ),
           content_facts_validated_from_staged_parquet: true,
           dependency_identities_validated: true,
+          winner_dependencies: winner.dependencies,
+          winner_dependency_identities: winner.dependency_identities,
+          winner_proposed_sha256: winner.new_sha256,
+          loser_proposed_sha256: existing.new_sha256 || null,
         });
         dayKeys.push(pollutant.key);
         continue;

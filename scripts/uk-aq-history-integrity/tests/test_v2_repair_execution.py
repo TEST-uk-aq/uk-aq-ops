@@ -8,10 +8,12 @@ import io
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -22,6 +24,8 @@ if SPEC is None or SPEC.loader is None:
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+FAILED_RUN_BUNDLE = MODULE_PATH.parents[3] / "logs" / "run-2026-08-01T192854Z.zip"
 
 
 class DummyProgress:
@@ -4718,6 +4722,304 @@ class ProposalRunStateTransitionTests(unittest.TestCase):
             "remote_attempted" not in entry
             for entry in run_state["objects"].values()
         ))
+
+
+@unittest.skipUnless(
+    FAILED_RUN_BUNDLE.is_file(),
+    "supplied failed run 2026-08-01T192854Z bundle is unavailable",
+)
+class FailedRunBundlePlannerRegressionTests(unittest.TestCase):
+    POLLUTANTS = ("no2", "o3", "pm10", "pm25")
+    DAY_UTC = "2026-07-30"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _replace_path(value: object, old_root: str, new_root: str) -> object:
+        if isinstance(value, str):
+            return value.replace(old_root, new_root)
+        if isinstance(value, list):
+            return [
+                FailedRunBundlePlannerRegressionTests._replace_path(
+                    item, old_root, new_root,
+                )
+                for item in value
+            ]
+        if isinstance(value, dict):
+            return {
+                key: FailedRunBundlePlannerRegressionTests._replace_path(
+                    item, old_root, new_root,
+                )
+                for key, item in value.items()
+            }
+        return value
+
+    @staticmethod
+    def _action(
+        kind: str,
+        *,
+        pollutant_code: str | None = None,
+        connector_id: int | None = None,
+    ) -> dict[str, object]:
+        action: dict[str, object] = {
+            "kind": kind,
+            "day_utc": FailedRunBundlePlannerRegressionTests.DAY_UTC,
+            "status": "planned",
+            "executes": False,
+            "data_changes_required": False,
+            "operator_action_required": False,
+            "requires_index_rebuild": kind == "observation_index_repair",
+            "gap_types": ["failed_run_2026-08-01T192854Z"],
+        }
+        if pollutant_code is not None:
+            action["pollutant_code"] = pollutant_code
+        if connector_id is not None:
+            action["connector_id"] = connector_id
+        return action
+
+    def test_failed_bundle_full_production_path_preserves_all_four_pollutants(
+        self,
+    ) -> None:
+        extracted = self.root / "extracted"
+        with zipfile.ZipFile(FAILED_RUN_BUNDLE) as bundle:
+            bundle.extractall(extracted)
+        original_root = extracted / "run-2026-08-01T192854Z"
+        original_state = json.loads(
+            (original_root / "run-state.json").read_text()
+        )
+
+        original_metadata = next(
+            item["result"]["output"]
+            for item in original_state["coordinator"]["stage_results"]
+            if isinstance(item.get("result", {}).get("output"), dict)
+            and isinstance(
+                item["result"]["output"].get("planning", {}).get("proposals"),
+                list,
+            )
+        )
+        original_proposals = {
+            proposal["key"]: proposal
+            for proposal in original_metadata["planning"]["proposals"]
+        }
+        for pollutant_code in self.POLLUTANTS:
+            prefix = (
+                f"history/v2/observations/day_utc={self.DAY_UTC}/"
+                f"connector_id=1/pollutant_code={pollutant_code}"
+            )
+            identity = original_proposals[f"{prefix}/manifest.json"][
+                "dependency_identities"
+            ][f"{prefix}/part-00000.parquet"]
+            self.assertEqual(identity["source"], "overlay")
+        original_failure = original_state["coordinator"]["canonical_apply"]
+        self.assertFalse(original_failure["node_apply_launched"])
+        self.assertFalse(original_failure["r2_mutation_possible"])
+        self.assertIn("staged_dependency_identity_mismatch", original_failure["error"])
+        self.assertIn('"planner_source":"overlay"', original_failure["error"])
+        self.assertIn('"expected_source":"planned_overlay"', original_failure["error"])
+
+        run_root = self.root / "run"
+        overlay_root = run_root / "overlay"
+        dropbox_root = self.root / "dropbox"
+        shutil.copytree(original_root / "overlay", overlay_root)
+        shutil.copytree(original_root / "overlay" / "history", dropbox_root / "history")
+        state = self._replace_path(
+            original_state,
+            str(Path(original_state["run_root"])),
+            str(run_root),
+        )
+        assert isinstance(state, dict)
+        run_state_path = run_root / "run-state.json"
+        state["run_root"] = str(run_root)
+        state["overlay_root"] = str(overlay_root)
+        state["base_dropbox_root"] = str(dropbox_root)
+        state["run_state_path"] = str(run_state_path)
+        source_objects: dict[str, dict[str, object]] = {}
+        for pollutant_code in self.POLLUTANTS:
+            prefix = (
+                f"history/v2/observations/day_utc={self.DAY_UTC}/"
+                f"connector_id=1/pollutant_code={pollutant_code}"
+            )
+            for suffix, stage in (
+                ("part-00000.parquet", "observations_data"),
+                ("manifest.json", "observations_data"),
+            ):
+                key = f"{prefix}/{suffix}"
+                local_path = overlay_root / "generated-objects" / key
+                body = local_path.read_bytes()
+                entry = {
+                    "object_key": key,
+                    "local_path": str(local_path),
+                    "proposed": True,
+                    "built": True,
+                    "structurally_validated": True,
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "bytes": len(body),
+                    "stage": stage,
+                    "dependencies": [],
+                    "dependency_identities": {},
+                }
+                source_objects[key] = entry
+        state["objects"] = source_objects
+        state["changed_scopes"] = {}
+        state.pop("coordinator", None)
+        state.pop("proposal_transition_validation", None)
+        state.pop("proposal_transition_planner_unchanged_keys", None)
+        run_root.mkdir(parents=True, exist_ok=True)
+        run_state_path.write_text(json.dumps(state, indent=2) + "\n")
+
+        actions = []
+        for pollutant_code in self.POLLUTANTS:
+            actions.extend([
+                self._action(
+                    "observation_pollutant_manifest_repair",
+                    pollutant_code=pollutant_code,
+                    connector_id=1,
+                ),
+                self._action(
+                    "observation_index_repair",
+                    pollutant_code=pollutant_code,
+                    connector_id=1,
+                ),
+            ])
+        actions.extend([
+            self._action("observation_connector_manifest_repair", connector_id=1),
+            self._action("observation_day_manifest_repair"),
+        ])
+        repair_plan_path = self.root / "repair-plan.json"
+        repair_plan_path.write_text(json.dumps({
+            "history_version": "v2",
+            "domain": "observations",
+            "repair_plan": actions,
+        }))
+        repo_root = MODULE_PATH.parents[3]
+        planner = repo_root / "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs"
+        planner_env = {
+            **os.environ,
+            "UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT": str(overlay_root),
+            "UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(dropbox_root),
+            "UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON": str(run_state_path),
+            "UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX": "history/v2/observations",
+            "UK_AQ_R2_HISTORY_INDEX_V2_PREFIX": "history/_index_v2",
+            "CFLARE_R2_ENDPOINT": "https://example.invalid",
+            "CFLARE_R2_BUCKET": "test-fixture",
+            "CFLARE_R2_ACCESS_KEY_ID": "test-fixture",
+            "CFLARE_R2_SECRET_ACCESS_KEY": "test-fixture",
+        }
+        planner_result = MODULE.subprocess.run(
+            [
+                "node", str(planner),
+                "--repair-plan-json", str(repair_plan_path),
+                "--overlay-root", str(overlay_root),
+                "--dropbox-root", str(dropbox_root),
+                "--run-state-json", str(run_state_path),
+            ],
+            cwd=repo_root,
+            env=planner_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            planner_result.returncode,
+            0,
+            f"{planner_result.stderr}\n{planner_result.stdout}",
+        )
+        output = json.loads(planner_result.stdout)
+        self.assertTrue(output["ok"])
+        proposals = {
+            proposal["key"]: proposal
+            for proposal in output["planning"]["proposals"]
+            if proposal.get("changed") is True
+        }
+        self.assertEqual(len(proposals), 11)
+        for pollutant_code in self.POLLUTANTS:
+            prefix = (
+                f"history/v2/observations/day_utc={self.DAY_UTC}/"
+                f"connector_id=1/pollutant_code={pollutant_code}"
+            )
+            part_key = f"{prefix}/part-00000.parquet"
+            manifest = proposals[f"{prefix}/manifest.json"]
+            identity = manifest["dependency_identities"][part_key]
+            source_entry = source_objects[part_key]
+            self.assertEqual(identity["source"], "planned_overlay")
+            self.assertEqual(identity["sha256"], source_entry["sha256"])
+            self.assertEqual(identity["bytes"], source_entry["bytes"])
+            self.assertEqual(
+                manifest["proposal_owner"],
+                "source_derived_observation_repair",
+                json.dumps({
+                    "proposal": {
+                        key: manifest.get(key)
+                        for key in (
+                            "proposal_owner", "proposal_provenance", "provenance",
+                            "baseline_source", "new_sha256", "bytes",
+                        )
+                    },
+                    "compatibility": output["planning"].get(
+                        "compatibility_preparation"
+                    ),
+                }, indent=2),
+            )
+        final_write_keys = set(source_objects) | set(proposals)
+        for proposal in proposals.values():
+            for dependency_key, identity in proposal["dependency_identities"].items():
+                if dependency_key in final_write_keys:
+                    self.assertEqual(identity["source"], "planned_overlay")
+        final_audit = output["planning"]["final_planner_proposal_validation"]
+        self.assertEqual(final_audit["status"], "succeeded")
+        self.assertEqual(final_audit["final_changed_write_object_count"], 15)
+        self.assertEqual(final_audit["staged_dependency_edge_count"], 17)
+
+        state = json.loads(run_state_path.read_text())
+        MODULE._record_metadata_executor_overlay(
+            run_state=state,
+            executor_result={"output": output},
+            dry_run=False,
+        )
+        MODULE.assemble_sos_light_complete_days(state)
+        transition = MODULE.validate_proposal_run_state_transition(state)
+        self.assertEqual(transition["status"], "succeeded")
+        self.assertEqual(transition["changed_object_count"], 15)
+        self.assertEqual(transition["planner_identity_comparison_count"], 17)
+        for pollutant_code in self.POLLUTANTS:
+            prefix = (
+                f"history/v2/observations/day_utc={self.DAY_UTC}/"
+                f"connector_id=1/pollutant_code={pollutant_code}"
+            )
+            part_key = f"{prefix}/part-00000.parquet"
+            identity = state["objects"][f"{prefix}/manifest.json"][
+                "dependency_identities"
+            ][part_key]
+            self.assertEqual(identity["source"], "planned_overlay")
+            self.assertEqual(identity["sha256"], state["objects"][part_key]["sha256"])
+            self.assertEqual(identity["bytes"], state["objects"][part_key]["bytes"])
+
+        apply_module = (
+            repo_root / "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"
+        ).as_uri()
+        node_result = MODULE.subprocess.run(
+            [
+                "node", "--input-type=module", "--eval",
+                (
+                    "import fs from 'node:fs';"
+                    f"import {{validateLocalProposal}} from {json.dumps(apply_module)};"
+                    f"const state=JSON.parse(fs.readFileSync({json.dumps(str(run_state_path))},'utf8'));"
+                    "const proposal=validateLocalProposal(state);"
+                    "process.stdout.write(JSON.stringify({objects:proposal.objects.length}));"
+                ),
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(node_result.returncode, 0, node_result.stderr)
+        self.assertEqual(json.loads(node_result.stdout)["objects"], 15)
 
 
 class ApplyPersistenceTests(unittest.TestCase):

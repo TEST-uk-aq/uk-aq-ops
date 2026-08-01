@@ -46,7 +46,6 @@ const SUPPORTED_ACTIONS = new Set([
   "aqi_index_repair",
   "rebuild_v2_aqi_index_only",
 ]);
-const SOURCE_DERIVED_OWNER = "source_derived_observation_repair";
 
 // Scope is part of the repair-action contract.  In particular, a day
 // manifest is above the connector hierarchy: giving it a connector ID would
@@ -458,42 +457,23 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
   }
   const overlayPaths = new Map();
   const overlayOwners = new Map();
-  const overlayProvenance = new Map();
   for (const [key, entry] of Object.entries(state?.objects || {})) {
-    const locallyValidatedObject = entry?.structurally_validated === true
-      && typeof entry.local_path === "string"
-      && fs.existsSync(entry.local_path);
-    const changedCurrentRunObject = entry?.structurally_validated === true
-      && entry?.proposed === true
-      && entry?.changed !== false
-      && entry?.included_in_write_set !== false
-      && entry?.status !== "skipped_unchanged";
-    if (locallyValidatedObject) {
-      const normalizedKey = safeLocalKey(key);
-      overlayPaths.set(normalizedKey, entry.local_path);
-      // The run workspace can contain both current-run changed objects and
-      // immutable external overlay roots. Physical location does not decide
-      // dependency provenance; membership in the changed write set does.
-      if (changedCurrentRunObject) {
-        overlayProvenance.set(normalizedKey, "planned_overlay");
-      }
+    if (entry?.structurally_validated === true && typeof entry.local_path === "string" && fs.existsSync(entry.local_path)) {
+      overlayPaths.set(safeLocalKey(key), entry.local_path);
       if (typeof entry.proposal_owner === "string" && entry.proposal_owner) {
-        overlayOwners.set(normalizedKey, entry.proposal_owner);
-      } else if (changedCurrentRunObject && entry.stage === "observations_data") {
-        overlayOwners.set(normalizedKey, "source_derived_observation_repair");
+        overlayOwners.set(safeLocalKey(key), entry.proposal_owner);
+      } else if (entry.stage === "observations_data") {
+        overlayOwners.set(safeLocalKey(key), "source_derived_observation_repair");
       }
     }
   }
-  function localObject(key, storageSource) {
-    const localPath = (storageSource === "overlay" ? overlayPaths : dropboxPaths).get(key);
+  function localObject(key, source) {
+    const localPath = (source === "overlay" ? overlayPaths : dropboxPaths).get(key);
     if (!localPath) return null;
     const body = fs.readFileSync(localPath);
-    const source = storageSource === "overlay"
-      ? overlayProvenance.get(key) || "overlay"
-      : "dropbox";
     return {
       ...objectFromBody({ key, body, source, content_sha256: sha256Hex(body) }),
-      proposal_owner: storageSource === "overlay" ? overlayOwners.get(key) || null : null,
+      proposal_owner: source === "overlay" ? overlayOwners.get(key) || null : null,
     };
   }
 
@@ -579,8 +559,6 @@ export function proposalView(proposal) {
     included_in_write_set: proposal.changed === true,
     dependencies: proposal.dependencies,
     dependency_identities: proposal.dependency_identities,
-    proposal_owner: proposal.proposal_owner || null,
-    proposal_provenance: proposal.proposal_provenance || null,
     provenance: proposal.provenance || null,
     baseline_source: proposal.baseline_source || null,
     local_dependency_snapshot: proposal.local_dependency_snapshot ? {
@@ -689,22 +667,15 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
     }));
   }
 
-  async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], localDependencySnapshot = null, provenance = null, proposalOwner = null, proposalProvenance = null }) {
+  async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], localDependencySnapshot = null, provenance = null }) {
     const bodyText = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
     const previous = proposals.get(key);
     const proposalKind = previous?.kind || kind;
     // Planning has no live-R2 read path. The verified overlay wins over the
     // Dropbox baseline; staged objects win over both for dependent builders.
     const existing = previous ? null : store.getObjectIfExists(key);
-    const existingIsCurrentRun = existing?.source === "planned_overlay";
-    const oldBody = previous
-      ? previous.old_body
-      : existingIsCurrentRun
-      ? null
-      : existing?.body?.toString("utf8") ?? null;
-    const changed = previous?.changed === true
-      || existingIsCurrentRun
-      || oldBody !== bodyText;
+    const oldBody = previous ? previous.old_body : existing?.body?.toString("utf8") ?? null;
+    const changed = oldBody !== bodyText;
     const allDependencies = [...new Set([...(previous?.dependencies || []), ...dependencies])].sort();
     const proposal = {
       key,
@@ -722,8 +693,6 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
       baseline_source: previous?.baseline_source || existing?.source || null,
       local_dependency_snapshot: previous?.local_dependency_snapshot || localDependencySnapshot,
       provenance: previous?.provenance || provenance || null,
-      proposal_owner: previous?.proposal_owner || proposalOwner || null,
-      proposal_provenance: previous?.proposal_provenance || proposalProvenance || null,
     };
     proposals.set(key, proposal);
     return proposal;
@@ -1729,29 +1698,13 @@ export async function runV2ObservationsRepair({
           observationContentHash,
           physicalSchema,
         });
-        let proposedBody = JSON.stringify(rebuilt, null, 2);
-        let proposalOwner = null;
-        let proposalProvenance = null;
-        if (provenance?.source === SOURCE_DERIVED_OWNER) {
-          const ownedObject = localStore.getObjectIfExists(manifestKey);
-          if (!ownedObject || ownedObject.proposal_owner !== SOURCE_DERIVED_OWNER) {
-            throw new Error(
-              `Source-derived metadata proposal lost its authoritative owner: ${manifestKey}`,
-            );
-          }
-          proposedBody = ownedObject.body.toString("utf8");
-          proposalOwner = SOURCE_DERIVED_OWNER;
-          proposalProvenance = "current_run_source_derived_staged_parquet";
-        }
         await staged.stage({
           key: manifestKey,
-          body: proposedBody,
+          body: JSON.stringify(rebuilt, null, 2),
           kind: "pollutant_manifest",
           dayUtc,
           dependencies: files.map((entry) => String(entry?.key || "")).filter(Boolean),
           provenance,
-          proposalOwner,
-          proposalProvenance,
         });
         proposalKeys.push(manifestKey);
       }
