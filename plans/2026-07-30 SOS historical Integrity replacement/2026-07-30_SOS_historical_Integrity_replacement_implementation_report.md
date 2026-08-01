@@ -1,5 +1,69 @@
 # SOS historical Integrity replacement implementation report
 
+## 1 August 2026 preflight-generated graph and frozen publication schedule correction
+
+### Confirmed root cause
+
+The metadata planner already generated scoped and latest Timeseries index bytes against the combined local overlay with `writeR2=false`. Canonical apply nevertheless performed a second generic `updateR2HistoryIndexesTargeted(..., writeR2=true)` pass after day mutation had begun. That pass could discover new changed keys, created entries with placeholder `dependencies: []`, increased planned counts during apply and published through a callback rather than a pre-mutation graph. Generic day parents could also be rebuilt from live connector objects immediately before PUT, changing their preflight bytes. Finally, the proposal list was ordered by publication rank plus locale-aware key sorting, so a dependency-sensitive parent and child in the same index stage could be offered parent-first.
+
+### Complete preflight graph
+
+The local metadata adapter remains the only generated-index builder. It records changed and unchanged proposals, but Python stages only `changed=true` objects into `runState.objects`. Generated proposal views now retain an explicit publication stage. Scoped Timeseries indexes depend directly on their pollutant manifests. Latest Timeseries indexes depend on every scoped index proposal that contributed to the targeted merge; changed children use their proposed overlay SHA-256/bytes, while byte-identical children remain pinned Dropbox or overlay external roots and stay outside the write set.
+
+SOS-light complete-day materialisation now derives every direct local edge for source-built and Dropbox-derived objects before apply: pollutant manifests point to their Parquet files, connector manifests point to pollutant manifests, and day parents point to connector manifests. Every edge carries the exact proposed SHA-256, byte count and `planned_overlay` provenance. A generated JSON parent with child references but empty placeholder dependencies is rejected before persistence initialisation or an R2 callback.
+
+The live generic index-generation pass and live day-parent regeneration have been removed from canonical apply. Unchanged generated records remain planning/audit-only: they receive no schedule position, PUT, post-PUT GET, journal event or mutation count. The retained generated callback adapter is now a fail-closed compatibility boundary: it accepts only a key, body identity and dependency set already present in the frozen schedule and cannot expand planned counts or introduce a new key.
+
+### Deterministic schedule and day barriers
+
+After final graph validation and before persistence initialisation or the first DELETE/PUT, Node constructs `integrity-apply-publication-schedule-v1`. Kahn topological sorting creates an edge from each changed dependency to its parent. Unchanged identity-pinned Dropbox/overlay dependencies are counted as external satisfied roots. Missing changed dependencies, unresolved identities, duplicate keys, cycles and dependency/stage conflicts fail before mutation.
+
+The eligible-node order is constrained first by the existing writer-lock scopes: selected days in ascending order, connector-day groups in ascending connector order, the day parent after all connector groups, global indexes after all selected days, and an explicitly staged `latest_snapshot` last. Within a scope, broad child-to-parent stages apply; bytewise UTF-8 key comparison is used only between currently eligible independent nodes. Thus each SOS-light day remains delete, complete connector publication, verified day parent, durability checkpoint, then the next day; the single frozen schedule still describes every changed PUT across those barriers.
+
+The canonical schedule contains its contract version, tie-break rule, ordered day barriers, total positions, changed-edge count, external-root counts by provenance, per-stage counts and ordered entries. Each entry contains position, canonical key, proposed SHA-256/bytes, publication stage, all direct dependencies, changed dependencies and pinned dependency identities. `schedule_sha256` is SHA-256 over recursively key-sorted compact UTF-8 JSON with only `schedule_sha256` excluded.
+
+### Exact execution and independent reconciliation
+
+Canonical apply builds operations from the frozen schedule rather than re-sorting the proposal. Immediately before every PUT it requires the next exact position and rechecks key, bytes, SHA-256, stage and dependency set. The existing dependency GET-verification and durability barrier remains mandatory. A failure leaves `last_completed_schedule_position` at the preceding verified object, records the failed position and prevents later operations.
+
+Every scheduled PUT transition records schedule SHA-256, position, total positions, stage, key and object SHA-256. Compact progress retains scheduled/completed counts, the last completed and next positions and schedule identity. Successful Node state requires scheduled count, PUT count and post-PUT GET count to agree. Complete-state counts remain split into Node, coordinator and total; `complete_run_state_write_count` is retained only as an exact alias of total.
+
+Python independently recomputes the schedule SHA-256, validates contiguous unique positions, object identities/stages/dependencies, child-before-parent edges and an explicitly changed latest snapshot at the final position. It then recomputes every `integrity-apply-mutation-event-v1` hash and chain link, requires each PUT/GET event to match its scheduled identity, enforces the exact per-position transition order, reconciles PUT/GET/deletion and complete-state totals, and requires successful journals to end at canonical apply completion. Journals lacking v1 hash fields are reported as unsupported legacy contracts.
+
+### Files and pre-edit archives
+
+Changed implementation and focused-test files:
+
+- `scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`
+- `scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs`
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
+- `scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs`
+- `scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py`
+- this implementation report
+
+Pre-edit production snapshots:
+
+- `archive/2026-08-01/integrity-global-publication-order/scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs`
+- `archive/2026-08-01/integrity-global-publication-order/scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs`
+- `archive/2026-08-01/integrity-global-publication-order/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py`
+
+`workers/shared/uk_aq_r2_history_index.mjs` did not require a change: its existing proposal sink and local adapter already produce deterministic preflight bodies. No `system_docs/`, TODO, workflow, schema or environment file changed.
+
+### Focused validation and compatibility
+
+- JavaScript syntax and Python compilation checks: passed.
+- JavaScript apply, provenance and SOS-light suites: passed (`37` tests).
+- Python persistence, schedule, hash, count and failure suite: passed (`15` tests).
+- Directly relevant SOS-light replacement/provenance plus persistence selection: passed (`19` tests).
+- Focused complete-day, absent-Dropbox-day and changed-only metadata-overlay planning checks: passed (`3` tests).
+- `git diff --check`: passed.
+
+The broader six-test dedicated SOS class has four passing cases and two unchanged legacy fixture errors because those fixtures omit the active contract's required protected connector IDs `[1]`. They are outside this correction and were not weakened or rewritten.
+
+Compatibility boundary: the Latest Snapshot owner-service reconciliation remains downstream of verified history publication rather than a direct `history/` canonical apply object. The scheduler supports an explicit `latest_snapshot` stage and Python requires it to be last whenever such an object is in a future write set, but this change does not move owner-service snapshot mutation into the R2 history apply executor.
+
+No Integrity operation, deployment, external service, production-data mutation, commit, stage, push or pull request was performed. Functional CIC-Test success is not claimed.
+
 ## 1 August 2026 canonical-apply persistence follow-up correction
 
 ### Generic targeted indexes now use canonical mutation persistence

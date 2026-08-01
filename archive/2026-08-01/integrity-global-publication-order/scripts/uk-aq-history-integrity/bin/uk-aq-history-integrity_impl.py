@@ -19382,12 +19382,11 @@ def _record_coordinator_complete_run_state_write(
     coordinator_count = int(
         persistence.get("coordinator_complete_run_state_write_count") or 0
     ) + 1
-    total_count = node_count + coordinator_count
+    persistence.pop("complete_run_state_write_count", None)
     persistence.update({
         "node_complete_run_state_write_count": node_count,
         "coordinator_complete_run_state_write_count": coordinator_count,
-        "total_complete_run_state_write_count": total_count,
-        "complete_run_state_write_count": total_count,
+        "total_complete_run_state_write_count": node_count + coordinator_count,
     })
     coordinator = run_state.get("coordinator")
     if isinstance(coordinator, dict):
@@ -19398,9 +19397,11 @@ def _record_coordinator_complete_run_state_write(
                 artifacts.update({
                     "node_complete_run_state_write_count": node_count,
                     "coordinator_complete_run_state_write_count": coordinator_count,
-                    "total_complete_run_state_write_count": total_count,
-                    "complete_run_state_write_count": total_count,
+                    "total_complete_run_state_write_count": (
+                        node_count + coordinator_count
+                    ),
                 })
+                artifacts.pop("complete_run_state_write_count", None)
 
 
 def write_run_state(run_state: Mapping[str, Any]) -> Path:
@@ -19921,11 +19922,7 @@ def _record_metadata_executor_overlay(
         with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-proposal-") as temp_dir:
             source = Path(temp_dir) / "generated-object"
             source.write_text(body, encoding="utf-8")
-            stage = str(proposal.get("publication_stage") or "").strip() or (
-                manifest_stage
-                if "manifest" in str(proposal.get("kind") or "")
-                else index_stage
-            )
+            stage = manifest_stage if "manifest" in str(proposal.get("kind") or "") else index_stage
             stage_overlay_object(
                 run_state, object_key=object_key, source_path=source, stage=stage,
                 dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
@@ -19944,7 +19941,7 @@ def _record_metadata_executor_overlay(
         scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
         record_changed_scope(run_state, scope_set, {
             "object_key": object_key,
-            "stage": stage,
+            "stage": manifest_stage if scope_set == manifest_scope_set else index_stage,
             "provenance": proposal.get("provenance") or "repair_generated",
         })
     write_run_state(run_state)
@@ -20053,59 +20050,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         connector1_parent = f"{day_prefix}/connector_id=1/manifest.json"
         if connector1_parent not in day_keys:
             raise ValueError(f"SOS-light connector 1 parent is unavailable: {day_utc}")
-        # Freeze every direct child edge for the complete replacement day,
-        # including Dropbox-derived sibling connectors.  These identities are
-        # part of the preflight graph; apply must never rediscover them live.
-        for object_key in day_keys:
-            entry = objects[object_key]
-            if object_key.endswith(".parquet"):
-                entry["stage"] = "observations_data"
-                continue
-            if not object_key.endswith(".json"):
-                continue
-            payload = json.loads(Path(str(entry["local_path"])).read_text(encoding="utf-8"))
-            manifest_kind = str(payload.get("manifest_kind") or "")
-            if manifest_kind == "pollutant":
-                entry["stage"] = "pollutant_manifest"
-            elif manifest_kind == "connector":
-                entry["stage"] = "connector_manifest"
-            elif manifest_kind == "day":
-                entry["stage"] = "day_parent"
-            references = {
-                str(value)
-                for value in list(payload.get("parquet_object_keys") or [])
-                if str(value)
-            }
-            references.update(
-                str(value.get("key") or "")
-                for value in list(payload.get("files") or [])
-                if isinstance(value, Mapping) and str(value.get("key") or "")
-            )
-            for field in (
-                "pollutant_manifests",
-                "connector_manifests",
-                "child_manifests",
-            ):
-                references.update(
-                    str(value.get("manifest_key") or "")
-                    for value in list(payload.get(field) or [])
-                    if isinstance(value, Mapping)
-                    and str(value.get("manifest_key") or "")
-                )
-            missing = sorted(reference for reference in references if reference not in objects)
-            if missing:
-                raise ValueError(
-                    f"SOS-light generated parent has an unstaged child: {object_key} -> {missing[0]}"
-                )
-            entry["dependencies"] = sorted(references)
-            entry["dependency_identities"] = {
-                reference: {
-                    "sha256": objects[reference]["sha256"],
-                    "bytes": objects[reference]["bytes"],
-                    "source": "planned_overlay",
-                }
-                for reference in sorted(references)
-            }
         for parent_key, reference_fields in (
             (connector1_parent, ("pollutant_manifests", "child_manifests")),
             (f"{day_prefix}/manifest.json", ("connector_manifests", "child_manifests")),
@@ -21292,7 +21236,6 @@ def _verified_deleted_object_keys(
 
 
 MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1"
-PUBLICATION_SCHEDULE_CONTRACT_VERSION = "integrity-apply-publication-schedule-v1"
 
 
 def canonical_mutation_event_hash_input(event: Mapping[str, Any]) -> bytes:
@@ -21306,90 +21249,6 @@ def canonical_mutation_event_hash_input(event: Mapping[str, Any]) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
-
-
-def canonical_publication_schedule_hash_input(
-    schedule: Mapping[str, Any],
-) -> bytes:
-    hash_fields = {
-        str(key): value
-        for key, value in schedule.items()
-        if key != "schedule_sha256"
-    }
-    return json.dumps(
-        hash_fields,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def verify_publication_schedule(
-    run_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    apply_summary = run_state.get("apply") or {}
-    schedule = apply_summary.get("publication_schedule")
-    if not isinstance(schedule, Mapping):
-        raise ValueError("publication schedule is unavailable")
-    if schedule.get("contract_version") != PUBLICATION_SCHEDULE_CONTRACT_VERSION:
-        raise ValueError("publication schedule contract mismatch")
-    expected_sha256 = str(schedule.get("schedule_sha256") or "").strip().lower()
-    recomputed_sha256 = hashlib.sha256(
-        canonical_publication_schedule_hash_input(schedule)
-    ).hexdigest()
-    if expected_sha256 != recomputed_sha256:
-        raise ValueError("publication schedule identity mismatch")
-    entries = list(schedule.get("entries") or [])
-    total_positions = int(schedule.get("total_positions") or 0)
-    if len(entries) != total_positions:
-        raise ValueError("publication schedule position count mismatch")
-    objects = run_state.get("objects") or {}
-    positions_by_key: dict[str, int] = {}
-    stages: list[str] = []
-    for expected_position, raw_entry in enumerate(entries, 1):
-        if not isinstance(raw_entry, Mapping):
-            raise ValueError("publication schedule entry is invalid")
-        position = int(raw_entry.get("position") or 0)
-        key = str(raw_entry.get("canonical_key") or "")
-        if position != expected_position:
-            raise ValueError("publication schedule has a missing, duplicate or reordered position")
-        if not key or key in positions_by_key:
-            raise ValueError("publication schedule has a duplicate or invalid object key")
-        object_entry = objects.get(key) if isinstance(objects, Mapping) else None
-        if not isinstance(object_entry, Mapping):
-            raise ValueError(f"scheduled object is unavailable: {key}")
-        dependencies = sorted({str(value) for value in object_entry.get("dependencies") or []})
-        scheduled_dependencies = list(raw_entry.get("dependencies") or [])
-        if (
-            str(object_entry.get("sha256") or "")
-            != str(raw_entry.get("proposed_sha256") or "")
-            or int(object_entry.get("bytes") or 0)
-            != int(raw_entry.get("proposed_bytes") or -1)
-            or dependencies != scheduled_dependencies
-            or str(object_entry.get("stage") or "")
-            != str(raw_entry.get("publication_stage") or "")
-        ):
-            raise ValueError(f"scheduled object identity is inconsistent: {key}")
-        for dependency in list(raw_entry.get("direct_changed_dependencies") or []):
-            dependency_position = positions_by_key.get(str(dependency))
-            if dependency_position is None or dependency_position >= position:
-                raise ValueError(
-                    f"publication schedule dependency order is invalid: {dependency} -> {key}"
-                )
-        positions_by_key[key] = position
-        stages.append(str(raw_entry.get("publication_stage") or ""))
-    latest_snapshot_positions = [
-        index for index, stage in enumerate(stages, 1) if stage == "latest_snapshot"
-    ]
-    if latest_snapshot_positions and latest_snapshot_positions != [total_positions]:
-        raise ValueError("changed latest snapshot is not the final schedule position")
-    return {
-        "schedule_sha256": expected_sha256,
-        "total_positions": total_positions,
-        "entries": entries,
-        "positions_by_key": positions_by_key,
-    }
 
 
 def verify_apply_persistence_artifacts(
@@ -21414,47 +21273,15 @@ def verify_apply_persistence_artifacts(
     previous_recomputed_sha256: str | None = None
     run_id = str(run_state.get("run_id") or "")
     event_types: dict[str, int] = {}
-    schedule_available = isinstance(
-        (run_state.get("apply") or {}).get("publication_schedule"), Mapping
-    )
-    if schedule_available:
-        schedule_verification = verify_publication_schedule(run_state)
-    elif (run_state.get("apply") or {}).get("status") == "succeeded":
-        raise ValueError("publication schedule is unavailable")
-    else:
-        schedule_verification = {
-            "schedule_sha256": "",
-            "total_positions": 0,
-            "entries": [],
-            "positions_by_key": {},
-        }
-    schedule_sha256 = schedule_verification["schedule_sha256"]
-    total_schedule_positions = schedule_verification["total_positions"]
-    schedule_entries = schedule_verification["entries"]
-    scheduled_event_types = {
-        "put_started",
-        "put_completed",
-        "post_put_get_started",
-        "post_put_get_verified",
-        "put_or_verification_failed",
-    }
-    scheduled_events: dict[str, list[tuple[int, str, str]]] = {
-        event_type: [] for event_type in scheduled_event_types
-    }
-    parsed_events: list[Mapping[str, Any]] = []
     for raw_line in lines:
         event = json.loads(raw_line.decode("utf-8"))
         if not isinstance(event, Mapping):
             raise ValueError(f"mutation journal event is not an object: {journal_path}")
         if str(event.get("run_id") or "") != run_id:
             raise ValueError(f"mutation journal run identity mismatch: {journal_path}")
-        if not event.get("event_hash_contract_version") or not event.get("event_sha256"):
-            raise ValueError(
-                f"unsupported legacy mutation journal contract: {journal_path}"
-            )
         if event.get("event_hash_contract_version") != MUTATION_EVENT_HASH_CONTRACT_VERSION:
             raise ValueError(
-                f"unsupported legacy mutation journal contract: {journal_path}"
+                f"mutation journal event-hash contract mismatch: {journal_path}"
             )
         if event.get("previous_event_sha256") != previous_recomputed_sha256:
             raise ValueError(
@@ -21473,33 +21300,6 @@ def verify_apply_persistence_artifacts(
         previous_recomputed_sha256 = recomputed_sha256
         event_type = str(event.get("event_type") or "")
         event_types[event_type] = event_types.get(event_type, 0) + 1
-        parsed_events.append(event)
-        if event_type in scheduled_event_types:
-            event_schedule_sha256 = str(
-                event.get("publication_schedule_sha256") or ""
-            )
-            position = int(event.get("schedule_position") or 0)
-            total = int(event.get("total_schedule_positions") or 0)
-            key = str(event.get("canonical_key") or "")
-            proposed_sha256 = str(event.get("sha256") or "")
-            if (
-                event_schedule_sha256 != schedule_sha256
-                or total != total_schedule_positions
-                or position <= 0
-                or position > total_schedule_positions
-            ):
-                raise ValueError("mutation journal schedule evidence mismatch")
-            scheduled = schedule_entries[position - 1]
-            if (
-                key != str(scheduled.get("canonical_key") or "")
-                or proposed_sha256 != str(scheduled.get("proposed_sha256") or "")
-                or str(event.get("publication_stage") or "")
-                != str(scheduled.get("publication_stage") or "")
-            ):
-                raise ValueError(
-                    f"mutation journal scheduled object mismatch at position {position}"
-                )
-            scheduled_events[event_type].append((position, key, proposed_sha256))
     expected_tail = persistence.get("mutation_journal_tail_event_sha256")
     if previous_recomputed_sha256 != expected_tail:
         raise ValueError(
@@ -21523,51 +21323,6 @@ def verify_apply_persistence_artifacts(
                 f"completed_writes={completed_writes} "
                 f"completed_post_put_verifications={completed_gets}"
             )
-        expected_sequence = list(range(1, total_schedule_positions + 1))
-        for event_type in (
-            "put_started",
-            "put_completed",
-            "post_put_get_started",
-            "post_put_get_verified",
-        ):
-            positions = [position for position, _key, _sha in scheduled_events[event_type]]
-            if positions != expected_sequence:
-                raise ValueError(
-                    f"mutation journal schedule positions are missing, duplicate or reordered: {event_type}"
-                )
-        actual_execution_order = [
-            (int(event.get("schedule_position") or 0), str(event.get("event_type") or ""))
-            for event in parsed_events
-            if str(event.get("event_type") or "") in {
-                "put_started", "put_completed", "post_put_get_started",
-                "post_put_get_verified",
-            }
-        ]
-        expected_execution_order = [
-            (position, event_type)
-            for position in expected_sequence
-            for event_type in (
-                "put_started", "put_completed", "post_put_get_started",
-                "post_put_get_verified",
-            )
-        ]
-        if actual_execution_order != expected_execution_order:
-            raise ValueError("mutation journal scheduled execution order mismatch")
-        completed_scheduled = int(
-            apply_summary.get("completed_scheduled_objects") or 0
-        )
-        last_completed_position = int(
-            apply_summary.get("last_completed_schedule_position") or 0
-        )
-        if (
-            completed_scheduled != total_schedule_positions
-            or last_completed_position != total_schedule_positions
-            or completed_writes != total_schedule_positions
-            or completed_gets != total_schedule_positions
-        ):
-            raise ValueError("publication schedule completion totals mismatch")
-        if not parsed_events or parsed_events[-1].get("event_type") != "canonical_apply_completed":
-            raise ValueError("mutation journal final publication stage is incomplete")
         deletion_verified = int(event_types.get("deletion_verified") or 0)
         completed_deletions = int(
             apply_summary.get("completed_deletions") or 0
@@ -21598,22 +21353,6 @@ def verify_apply_persistence_artifacts(
         })
     if len(sidecars) != int(persistence.get("deleted_key_sidecar_count") or 0):
         raise ValueError("deleted-key sidecar-count mismatch")
-    node_writes = int(
-        persistence.get("node_complete_run_state_write_count") or 0
-    )
-    coordinator_writes = int(
-        persistence.get("coordinator_complete_run_state_write_count") or 0
-    )
-    total_writes = int(
-        persistence.get("total_complete_run_state_write_count") or 0
-    )
-    legacy_total = int(
-        persistence.get("complete_run_state_write_count") or 0
-    )
-    if total_writes != node_writes + coordinator_writes:
-        raise ValueError("complete run-state write count mismatch")
-    if "complete_run_state_write_count" in persistence and legacy_total != total_writes:
-        raise ValueError("legacy complete run-state write count is not an exact total alias")
     return {
         "status": "verified",
         "mutation_journal_path": str(journal_path),
@@ -21622,8 +21361,6 @@ def verify_apply_persistence_artifacts(
         "mutation_journal_event_count": len(lines),
         "mutation_journal_tail_event_sha256": previous_recomputed_sha256,
         "event_type_counts": event_types,
-        "publication_schedule_sha256": schedule_sha256,
-        "scheduled_changed_object_count": total_schedule_positions,
         "deleted_key_sidecars": sidecars,
         "compact_checkpoint_count": int(
             persistence.get("compact_checkpoint_count") or 0
