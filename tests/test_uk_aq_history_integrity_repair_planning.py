@@ -256,6 +256,80 @@ class V2RepairPlanningTest(unittest.TestCase):
                 [day_prefix],
             )
 
+    def test_metadata_overlay_stages_only_changed_planning_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_state = integrity.create_run_overlay(
+                tmp_dir=root / "runs",
+                run_id="metadata-write-set-test",
+                environment="CIC-Test",
+                base_dropbox_root=root / "dropbox",
+            )
+            changed_key = (
+                "history/_index_v2/observations_timeseries/day_utc=2026-07-07/"
+                "connector_id=1/pollutant_code=pm25/manifest.json"
+            )
+            unchanged_key = (
+                "history/_index_v2/observations_timeseries/day_utc=2026-07-07/"
+                "connector_id=1/pollutant_code=123c6h3ch33/manifest.json"
+            )
+            proposals = [
+                {
+                    "key": changed_key,
+                    "kind": "pollutant_timeseries_index",
+                    "changed": True,
+                    "status": "planned",
+                    "included_in_write_set": True,
+                    "proposed_body": '{"version":"changed"}',
+                    "dependencies": [],
+                    "dependency_identities": {},
+                },
+                {
+                    "key": unchanged_key,
+                    "kind": "pollutant_timeseries_index",
+                    "changed": False,
+                    "status": "skipped_unchanged",
+                    "included_in_write_set": False,
+                    "proposed_body": '{"version":"unchanged"}',
+                    "dependencies": [],
+                    "dependency_identities": {},
+                },
+            ]
+            proposal_audit = {
+                "changed_proposal_count": 1,
+                "skipped_unchanged_proposal_count": 1,
+                "changed_dependency_count": 0,
+                "unchanged_baseline_dependency_count": 0,
+                "mutation_write_count": 1,
+            }
+            executor_result = {
+                "output": {
+                    "planning": {
+                        "proposals": proposals,
+                        "blocked_scopes": [],
+                        "sos_light": {
+                            "mode": "sos-light",
+                            "proposal_graph_audit": proposal_audit,
+                        },
+                    }
+                }
+            }
+
+            integrity._record_metadata_executor_overlay(
+                run_state=run_state,
+                executor_result=executor_result,
+                dry_run=False,
+            )
+
+            self.assertEqual(set(run_state["objects"]), {changed_key})
+            self.assertNotIn(unchanged_key, run_state["objects"])
+            self.assertEqual(
+                run_state["sos_light"]["proposal_graph_audit"],
+                proposal_audit,
+            )
+            self.assertEqual(proposals[1]["status"], "skipped_unchanged")
+            self.assertFalse(proposals[1]["included_in_write_set"])
+
     def test_observation_index_gap_plans_index_only_without_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

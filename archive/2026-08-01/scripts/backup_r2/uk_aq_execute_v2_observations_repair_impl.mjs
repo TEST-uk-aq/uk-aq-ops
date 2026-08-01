@@ -121,7 +121,6 @@ export async function readChildren({
     const object = await store.getObject({ key });
     identities.set(key, {
       content_sha256: object.content_sha256 || sha256Hex(object.body),
-      bytes: object.bytes ?? Buffer.byteLength(object.body),
       r2_etag: object.r2_etag || object.etag || null,
       source: object.source || "combined_local",
       last_modified: object.last_modified || null,
@@ -372,7 +371,6 @@ export async function assembleSosLightDayParents({
       children.push(payload);
       identities.set(key, {
         content_sha256: object.content_sha256 || sha256Hex(object.body),
-        bytes: object.bytes ?? Buffer.byteLength(object.body),
         source: object.source || "combined_local",
       });
       includedConnectorIds.push(connectorId);
@@ -538,7 +536,7 @@ function objectFromBody({ key, body, source = "unknown", content_sha256 = null, 
   };
 }
 
-export function proposalView(proposal) {
+function proposalView(proposal) {
   return {
     key: proposal.key,
     kind: proposal.kind,
@@ -548,7 +546,6 @@ export function proposalView(proposal) {
     new_sha256: proposal.new_sha256,
     changed: proposal.changed,
     status: proposal.changed ? "planned" : "skipped_unchanged",
-    included_in_write_set: proposal.changed === true,
     dependencies: proposal.dependencies,
     dependency_identities: proposal.dependency_identities,
     provenance: proposal.provenance || null,
@@ -556,39 +553,13 @@ export function proposalView(proposal) {
     local_dependency_snapshot: proposal.local_dependency_snapshot ? {
       source: proposal.local_dependency_snapshot.source,
       expected_child_keys: proposal.local_dependency_snapshot.expected_children.map((child) => child.key),
-      expected_children: proposal.local_dependency_snapshot.expected_children.map((child) => ({
-        key: child.key,
-        source: child.source,
-        sha256: child.content_sha256,
-        bytes: child.bytes,
-        staged: child.staged,
-      })),
     } : null,
     expected_verification: proposal.changed ? "exact_body_and_bytes" : "not_required",
     proposed_body: proposal.body,
   };
 }
 
-export function proposalGraphAudit(proposals) {
-  const entries = proposals instanceof Map ? [...proposals.values()] : [...proposals];
-  const changedProposalCount = entries.filter((proposal) => proposal.changed === true).length;
-  const dependencyIdentities = entries.flatMap((proposal) =>
-    Object.values(proposal.dependency_identities || {}));
-  return {
-    changed_proposal_count: changedProposalCount,
-    skipped_unchanged_proposal_count: entries.length - changedProposalCount,
-    changed_dependency_count: dependencyIdentities.filter((identity) =>
-      identity?.source === "planned_overlay").length,
-    unchanged_baseline_dependency_count: dependencyIdentities.filter((identity) =>
-      identity?.source === "dropbox" || identity?.source === "overlay").length,
-    mutation_write_count: changedProposalCount,
-    planning_post_put_verification_count: 0,
-    expected_post_put_verification_count: changedProposalCount,
-    dependency_count_semantics: "proposal_dependency_edges",
-  };
-}
-
-export function localDependencySnapshot({ child, proposals, prefix, dayUtc, connectorId, kind, domain = "observations" }) {
+function localDependencySnapshot({ child, proposals, prefix, dayUtc, connectorId, kind, domain = "observations" }) {
   return {
     prefix,
     dayUtc,
@@ -597,15 +568,13 @@ export function localDependencySnapshot({ child, proposals, prefix, dayUtc, conn
     domain,
     expected_children: child.children.map((payload) => {
       const key = payload.manifest_key;
-      const proposal = proposals.get(key);
-      const staged = proposal?.changed === true;
+      const staged = proposals.get(key);
       const identity = child.identities.get(key);
       return {
         key,
-        content_sha256: staged ? proposal.new_sha256 : identity.content_sha256,
-        bytes: staged ? proposal.bytes : identity.bytes,
+        content_sha256: staged?.new_sha256 || identity.content_sha256,
         source: staged ? "planned_overlay" : identity.source,
-        staged,
+        staged: Boolean(staged),
       };
     }).sort((left, right) => left.key.localeCompare(right.key)),
     source: "combined_local_snapshot",
@@ -639,11 +608,11 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
 
   function resolveDependencyIdentities(dependencies) {
     return Object.fromEntries(dependencies.map((dependencyKey) => {
-      const proposal = proposals.get(dependencyKey);
-      if (proposal?.changed === true) {
+      const staged = proposals.get(dependencyKey);
+      if (staged) {
         return [dependencyKey, {
-          sha256: proposal.new_sha256,
-          bytes: proposal.bytes,
+          sha256: staged.new_sha256,
+          bytes: staged.bytes,
           source: "planned_overlay",
         }];
       }
@@ -692,9 +661,7 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
 
   function stagedObject(key) {
     const proposal = proposals.get(key);
-    return proposal?.changed === true
-      ? objectFromBody({ key, body: proposal.body, source: "planned_overlay", content_sha256: proposal.new_sha256 })
-      : null;
+    return proposal ? objectFromBody({ key, body: proposal.body, source: "planned_overlay", content_sha256: proposal.new_sha256 }) : null;
   }
 
   const stagedR2 = {
@@ -720,15 +687,15 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
       },
       headObject: async ({ key }) => {
         const staged = stagedObject(key);
-        if (staged) return { exists: true, key, bytes: staged.bytes, etag: null, content_sha256: staged.content_sha256, source: staged.source };
+        if (staged) return { exists: true, key, bytes: staged.bytes, etag: null, content_sha256: staged.content_sha256 };
         const object = store.getObjectIfExists(key);
-        return object ? { exists: true, key, bytes: object.bytes, etag: null, content_sha256: object.content_sha256, source: object.source } : { exists: false, key };
+        return object ? { exists: true, key, bytes: object.bytes, etag: null, content_sha256: object.content_sha256 } : { exists: false, key };
       },
       listAllObjects: async ({ prefix, max_keys }) => {
         const entries = store.listAllObjects({ prefix, max_keys });
         const byKey = new Map(entries.map((entry) => [entry.key, entry]));
         for (const proposal of proposals.values()) {
-          if (proposal.changed === true && proposal.key.startsWith(prefix)) {
+          if (proposal.key.startsWith(prefix)) {
             byKey.set(proposal.key, { key: proposal.key, size: proposal.bytes, source: "planned_overlay", content_sha256: proposal.new_sha256, r2_etag: null });
           }
         }
@@ -1303,11 +1270,8 @@ function assertCanonicalProposal(proposal) {
     assertCanonicalObjectKey(proposal.local_dependency_snapshot.prefix, "local dependency snapshot prefix");
     for (const child of proposal.local_dependency_snapshot.expected_children) {
       assertCanonicalObjectKey(child?.key, "local dependency snapshot child key");
-      if (!/^[a-f0-9]{64}$/.test(String(child?.content_sha256 || ""))
-        || !Number.isSafeInteger(child?.bytes) || child.bytes < 0
-        || !["planned_overlay", "overlay", "dropbox"].includes(child?.source)
-        || typeof child?.staged !== "boolean") {
-        throw new Error(`Invalid proposal local dependency snapshot identity: ${proposal.key}`);
+      if (!/^[a-f0-9]{64}$/.test(String(child?.content_sha256 || ""))) {
+        throw new Error(`Invalid proposal local dependency snapshot hash: ${proposal.key}`);
       }
     }
   }
@@ -1332,27 +1296,16 @@ function assertCanonicalProposalRelationships(proposal, proposals) {
     connector: "connector_manifest",
   }[guard.kind];
   for (const child of guard.expected_children) {
+    if (!child?.staged) continue;
     const staged = proposals.get(child.key);
-    const dependencyIdentity = proposal.dependency_identities?.[child.key];
-    const commonInvalid = !child.key.startsWith(guard.prefix)
-      || !(proposal.dependencies || []).includes(child.key)
-      || !dependencyIdentity
-      || dependencyIdentity.source !== child.source
-      || dependencyIdentity.sha256 !== child.content_sha256
-      || dependencyIdentity.bytes !== child.bytes;
-    const stagedInvalid = child.staged && (
-      !stagedKind
+    if (!stagedKind
+      || !child.key.startsWith(guard.prefix)
       || child.source !== "planned_overlay"
-      || staged?.changed !== true
+      || !staged
       || staged.kind !== stagedKind
+      || !/^[a-f0-9]{64}$/.test(String(child.content_sha256 || ""))
       || staged.new_sha256 !== child.content_sha256
-      || staged.bytes !== child.bytes
-    );
-    const baselineInvalid = !child.staged && (
-      child.source === "planned_overlay"
-      || staged?.changed === true
-    );
-    if (commonInvalid || stagedInvalid || baselineInvalid) {
+      || !(proposal.dependencies || []).includes(child.key)) {
       throw new Error(`Invalid staged child proposal dependency: ${proposal.key} -> ${child?.key || "(missing)"}`);
     }
   }
@@ -1942,8 +1895,6 @@ export async function runV2ObservationsRepair({
   for (const proposal of staged.proposals.values()) {
     assertCanonicalProposalRelationships(proposal, staged.proposals);
   }
-  const proposalAudit = proposalGraphAudit(staged.proposals);
-  if (sosLightAudit) sosLightAudit.proposal_graph_audit = proposalAudit;
   const proposalViews = [...staged.proposals.values()]
     .map(proposalView)
     .sort((left, right) => left.key.localeCompare(right.key));
@@ -1960,7 +1911,7 @@ export async function runV2ObservationsRepair({
     manifest_status: reduceRepairStatus(dayPlans.map((plan) => plan.manifest_status || "not_run"), "not_run"),
     index_status: reduceRepairStatus(dayPlans.map((plan) => plan.index_status || "not_run"), "not_run"),
     bucket: config.r2.bucket,
-    planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, proposal_graph_audit: proposalAudit, blocked_scopes: blockedScopes, sos_light: sosLightAudit },
+    planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes, sos_light: sosLightAudit },
     execution: { status: "not_run" },
     verification: { status: "not_run" },
     application_failure: null,
