@@ -9,6 +9,7 @@ import {
   isAcceptedPruneHistoryDayManifestKey,
   markCandidateAndConnectorGateCompleteForTest,
   populateBackupCandidatesForTest,
+  runCandidateAqilevelsStageForTest,
   runPhaseBBackup,
   runBudgetedPhaseBStageForTest,
   stopPhaseBForBudgetForTest,
@@ -278,6 +279,19 @@ test("candidate and connector gate completion persist identical source identity"
     sourceIdentity.source_content_hash_row_count,
   ]);
   assert.deepEqual(gateWrite.params.slice(8, 11), candidateWrite.params.slice(7, 10));
+
+  const completedGateCallCount = calls.length;
+  const aqiResult = await runCandidateAqilevelsStageForTest({
+    client,
+    runtime: { phase_b_calculate_aqi_from_observations_enabled: false },
+    candidate: { day_utc: dayUtc, connector_id: 7 },
+    observationResult: { verified: true },
+    summary: { aggregate_day_failures: [] },
+    withConnectorDayHistoryLockAdapter: async () => assert.fail("disabled AQI must not acquire its connector lock"),
+    exportCandidateAqiAdapter: async () => assert.fail("disabled AQI must not run after connector-gate completion"),
+  });
+  assert.deepEqual(aqiResult, { status: "skipped", reason: "aqilevels_disabled" });
+  assert.equal(calls.length, completedGateCallCount, "disabled AQI must not revoke the completed observation gate");
 });
 
 test("incomplete connector gate clears all source identity fields", async () => {

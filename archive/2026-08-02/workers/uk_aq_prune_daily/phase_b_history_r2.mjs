@@ -190,7 +190,6 @@ export const HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2 = Object.freeze([
 const HISTORY_R2_V2_OBSERVATIONS_PREFIX = "history/v2/observations";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug";
-const AQILEVELS_DISABLED_REASON = "aqilevels_disabled";
 const HISTORY_R2_V2_SCHEMA_VERSION = 2;
 const HISTORY_R2_V2_OBSERVATIONS_MANIFEST_SCHEMA_VERSION = 3;
 const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
@@ -3526,65 +3525,6 @@ async function exportCandidateAqiFromFrozenSource({ candidate, runtime, observat
   };
 }
 
-async function runCandidateAqilevelsStage({
-  client,
-  runtime,
-  candidate,
-  observationResult,
-  summary,
-  withConnectorDayHistoryLockAdapter = withConnectorDayHistoryLock,
-  exportCandidateAqiAdapter = exportCandidateAqiFromFrozenSource,
-}) {
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled === false) {
-    const skipped = {
-      status: "skipped",
-      reason: AQILEVELS_DISABLED_REASON,
-    };
-    logPhaseB(runtime, "INFO", "phase_b_history_aqi_skipped", {
-      day_utc: candidate.day_utc,
-      connector_id: candidate.connector_id,
-      ...skipped,
-    });
-    return skipped;
-  }
-
-  try {
-    return await withConnectorDayHistoryLockAdapter({
-      client,
-      dayUtc: candidate.day_utc,
-      connectorId: candidate.connector_id,
-      diagnosticEnvironment: runtime.environment,
-      timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-    }, async () => await exportCandidateAqiAdapter({
-      candidate,
-      runtime,
-      observationResult,
-    }));
-  } catch (aqiError) {
-    const failed = {
-      status: "failed",
-      error: aqiError instanceof Error ? aqiError.message : String(aqiError),
-    };
-    summary.aggregate_day_failures.push({
-      day_utc: candidate.day_utc,
-      connector_id: candidate.connector_id,
-      domain: "aqilevels",
-      error: failed.error,
-    });
-    logPhaseB(runtime, "ERROR", "phase_b_history_aqi_failed_gate_preserved", {
-      day_utc: candidate.day_utc,
-      connector_id: candidate.connector_id,
-      connector_gate_preserved: true,
-      error: failed.error,
-    });
-    return failed;
-  }
-}
-
-export async function runCandidateAqilevelsStageForTest(args) {
-  return await runCandidateAqilevelsStage(args);
-}
-
 async function exportCandidateToR2({ candidate, runtime }) {
   if (runtime.history_write_version !== "v2") {
     throw new Error("Phase B connector-day export requires canonical R2 history version v2");
@@ -4823,53 +4763,6 @@ async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc, c
   };
 }
 
-async function completeObservationDayFinalization({
-  client,
-  runtime,
-  dayUtc,
-  changedConnectorIds,
-  dayManifestKey,
-  verifiedDayTotals,
-  writeAqilevelDayManifestAdapter = writeAqilevelDayManifestFromConnectorOutputs,
-  updateDayGateCompleteAdapter = updateDayGateComplete,
-}) {
-  const aqiDayManifest = runtime.phase_b_calculate_aqi_from_observations_enabled === false
-    ? {
-      required: false,
-      skipped: true,
-      reason: AQILEVELS_DISABLED_REASON,
-    }
-    : await writeAqilevelDayManifestAdapter({
-      runtime,
-      dayUtc,
-      changedConnectorIds,
-    });
-
-  await updateDayGateCompleteAdapter(client, {
-    dayUtc,
-    runId: runtime.run_id,
-    manifestKey: dayManifestKey,
-    rowCount: verifiedDayTotals.history_row_count,
-    fileCount: verifiedDayTotals.history_file_count,
-    totalBytes: verifiedDayTotals.history_total_bytes,
-  });
-
-  return {
-    day_utc: dayUtc,
-    history_done: true,
-    pending_connectors: 0,
-    history_manifest_key: dayManifestKey,
-    history_row_count: verifiedDayTotals.history_row_count.toString(),
-    history_file_count: verifiedDayTotals.history_file_count,
-    history_total_bytes: verifiedDayTotals.history_total_bytes.toString(),
-    aqi_day_manifest: aqiDayManifest,
-  };
-}
-
-export async function completeObservationDayFinalizationForTest(args) {
-  return await completeObservationDayFinalization(args);
-}
-
 export function validateAqilevelDataDebugConnectorManifests({ runtime, dayUtc, dataConnectorManifests, debugConnectorManifests }) {
   const expectedByProfile = {
     data: runtime.aqilevels_prefix,
@@ -5241,14 +5134,35 @@ async function finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }) {
     dayUtc,
   });
 
-  return await completeObservationDayFinalization({
-    client,
+  const aqiDayManifest = await writeAqilevelDayManifestFromConnectorOutputs({
     runtime,
     dayUtc,
     changedConnectorIds: dayCandidates.map((candidate) => candidate.connector_id),
-    dayManifestKey,
-    verifiedDayTotals,
   });
+
+  const totalRows = verifiedDayTotals.history_row_count;
+  const totalFiles = verifiedDayTotals.history_file_count;
+  const totalBytes = verifiedDayTotals.history_total_bytes;
+
+  await updateDayGateComplete(client, {
+    dayUtc,
+    runId: runtime.run_id,
+    manifestKey: dayManifestKey,
+    rowCount: totalRows,
+    fileCount: totalFiles,
+    totalBytes,
+  });
+
+  return {
+    day_utc: dayUtc,
+    history_done: true,
+    pending_connectors: 0,
+    history_manifest_key: dayManifestKey,
+    history_row_count: totalRows.toString(),
+    history_file_count: totalFiles,
+    history_total_bytes: totalBytes.toString(),
+    aqi_day_manifest: aqiDayManifest,
+  };
 }
 
 async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
@@ -5456,7 +5370,7 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       10_000,
       2_000_000,
     ),
-    phase_b_calculate_aqi_from_observations_enabled: false,
+    phase_b_calculate_aqi_from_observations_enabled: true,
     phase_b_observation_snapshot_max_rows: parsePositiveInt(
       env.UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
       DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
@@ -5661,8 +5575,6 @@ export async function runPhaseBBackup({
     aqilevels_prefix: runtime.aqilevels_prefix,
     aqilevels_hourly_data_prefix_v2: runtime.aqilevels_hourly_data_prefix_v2,
     aqilevels_hourly_debug_prefix_v2: runtime.aqilevels_hourly_debug_prefix_v2,
-    phase_b_calculate_aqi_from_observations_enabled:
-      runtime.phase_b_calculate_aqi_from_observations_enabled,
     runs_prefix: runtime.runs_prefix,
     runs_prefix_v2: runtime.runs_prefix_v2,
   });
@@ -5864,13 +5776,34 @@ export async function runPhaseBBackup({
         exportResult.total_bytes = BigInt(connectorGateEvidence.history_total_bytes);
 
         try {
-          exportResult.aqi = await runCandidateAqilevelsStage({
-            client: controlClient,
-            runtime,
-            candidate,
-            observationResult: exportResult,
-            summary,
-          });
+            exportResult.aqi = await withConnectorDayHistoryLock({
+              client: controlClient,
+              dayUtc: candidate.day_utc,
+              connectorId: candidate.connector_id,
+              diagnosticEnvironment: runtime.environment,
+              timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+            }, async () => await exportCandidateAqiFromFrozenSource({
+              candidate,
+              runtime,
+              observationResult: exportResult,
+            }));
+        } catch (aqiError) {
+            exportResult.aqi = {
+              status: "failed",
+              error: aqiError instanceof Error ? aqiError.message : String(aqiError),
+            };
+            summary.aggregate_day_failures.push({
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+              domain: "aqilevels",
+              error: exportResult.aqi.error,
+            });
+            logPhaseB(runtime, "ERROR", "phase_b_history_aqi_failed_gate_preserved", {
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+              connector_gate_preserved: true,
+              error: exportResult.aqi.error,
+            });
         } finally {
             cleanupPhaseBTargetDaySourceTemp(frozenSourceTemp);
             frozenSourceTemp = null;
@@ -5921,10 +5854,6 @@ export async function runPhaseBBackup({
           source_content_hash: exportResult.source_identity.source_content_hash,
           source_owner: exportResult.adopted ? "adopted_existing_r2_manifest" : "phase_b_export",
           comparison_output_root: connectorComparison?.comparison_output_root || null,
-          aqi_history_outcome: {
-            status: exportResult.aqi?.status || null,
-            reason: exportResult.aqi?.reason || null,
-          },
           pm_context: exportResult.aqi ? {
             pm_context_source: exportResult.aqi.pm_context_source || null,
             pm_context_window_start_utc: exportResult.aqi.pm_context_window_start_utc || null,
@@ -6078,10 +6007,22 @@ export async function runPhaseBBackup({
         client: controlClient,
         diagnosticEnvironment: runtime.environment,
         timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-        finalize: async () => await updateFinalizedHistoryIndexes({
-          runtime,
-          finalizedDays,
-          updateIndexesAdapter: updateR2HistoryIndexesTargeted,
+        finalize: async () => await updateR2HistoryIndexesTargeted({
+        env: {
+          ...process.env,
+          UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: runtime.committed_prefix,
+          UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: runtime.aqilevels_prefix,
+          UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX: runtime.aqilevels_timeseries_index_prefix,
+          UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: runtime.index_prefix_v2,
+        },
+        r2: runtime.r2,
+        historyVersion: "v2",
+        domains: ["observations", "aqilevels"],
+        affectedDaysUtc: finalizedDays,
+        connectorId: null,
+        updateLatestIndex: true,
+        strictMissingTimeseriesCounts: true,
+        writeR2: true,
         }),
       });
     }
@@ -6109,7 +6050,19 @@ export async function runPhaseBBackup({
     }
   }
 
-  summary.aqilevels = buildPhaseBAqilevelsSummary({ runtime, summary });
+  if (summary.status === "stopped_budget") {
+    summary.aqilevels = { skipped: true, reason: "phase_b_history_budget_exhausted" };
+  } else if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
+    summary.aqilevels = {
+      enabled: true,
+      source_mode: "frozen_observations_per_candidate",
+      status: "completed_with_phase_b_candidates",
+      snapshot_max_rows: runtime.phase_b_observation_snapshot_max_rows,
+      snapshot_max_bytes: runtime.phase_b_observation_snapshot_max_bytes,
+    };
+  } else {
+    summary.aqilevels = { skipped: true, reason: "phase_b_history_not_completed" };
+  }
 
   if (dryRun) {
     logStructured("INFO", "phase_b_history_run_summary", summary);
@@ -6150,53 +6103,6 @@ export async function runPhaseBBackup({
 
   logStructured("INFO", "phase_b_history_run_summary", summary);
   return summary;
-}
-
-async function updateFinalizedHistoryIndexes({ runtime, finalizedDays, updateIndexesAdapter }) {
-  const aqilevelsEnabled = runtime.phase_b_calculate_aqi_from_observations_enabled !== false;
-  return await updateIndexesAdapter({
-    env: {
-      ...process.env,
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: runtime.committed_prefix,
-      UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: runtime.index_prefix_v2,
-      ...(aqilevelsEnabled ? {
-        UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: runtime.aqilevels_prefix,
-        UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX: runtime.aqilevels_timeseries_index_prefix,
-      } : {}),
-    },
-    r2: runtime.r2,
-    historyVersion: "v2",
-    domains: aqilevelsEnabled ? ["observations", "aqilevels"] : ["observations"],
-    affectedDaysUtc: finalizedDays,
-    connectorId: null,
-    updateLatestIndex: true,
-    strictMissingTimeseriesCounts: true,
-    writeR2: true,
-  });
-}
-
-export async function updateFinalizedHistoryIndexesForTest(args) {
-  return await updateFinalizedHistoryIndexes(args);
-}
-
-function buildPhaseBAqilevelsSummary({ runtime, summary }) {
-  if (summary.status === "stopped_budget") {
-    return { skipped: true, reason: "phase_b_history_budget_exhausted" };
-  }
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled === false) {
-    return { skipped: true, reason: AQILEVELS_DISABLED_REASON };
-  }
-  return {
-    enabled: true,
-    source_mode: "frozen_observations_per_candidate",
-    status: "completed_with_phase_b_candidates",
-    snapshot_max_rows: runtime.phase_b_observation_snapshot_max_rows,
-    snapshot_max_bytes: runtime.phase_b_observation_snapshot_max_bytes,
-  };
-}
-
-export function buildPhaseBAqilevelsSummaryForTest(args) {
-  return buildPhaseBAqilevelsSummary(args);
 }
 
 export async function fetchBackupDoneConnectorDays({ supabaseDbUrl, connectorDays }) {
