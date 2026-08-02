@@ -61,9 +61,10 @@ For Prune Daily Phase B observation/AQI writes and IngestDB deletion safety, rea
 3. [`implementation_safety_contract.md`](implementation_safety_contract.md)
 4. [`prune_daily_runtime_budget.md`](prune_daily_runtime_budget.md)
 5. [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md)
-6. [`prune_connector_day_gate.md`](prune_connector_day_gate.md)
-7. [`prune_connector_source_identity.md`](prune_connector_source_identity.md)
-8. [`connector_gate_file_identity.md`](connector_gate_file_identity.md)
+6. [`prune_daily_observation_only_phase_b_contract.md`](prune_daily_observation_only_phase_b_contract.md)
+7. [`prune_connector_day_gate.md`](prune_connector_day_gate.md)
+8. [`prune_connector_source_identity.md`](prune_connector_source_identity.md)
+9. [`connector_gate_file_identity.md`](connector_gate_file_identity.md)
 
 For calculated station-chart AQI and website display, also read:
 
