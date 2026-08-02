@@ -1,5 +1,5 @@
 name = "uk-aq-db-r2-metrics-api"
-main = "worker.mjs"
+main = "worker_entry.mjs"
 compatibility_date = "2026-03-04"
 compatibility_flags = ["nodejs_compat"]
 
