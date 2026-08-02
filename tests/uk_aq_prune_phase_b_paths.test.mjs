@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
   buildConnectorManifestKey,
+  buildPhaseBAqilevelsSummaryForTest,
   buildDayManifestKey,
   buildHistoryV2ConnectorManifestForTest,
   buildHistoryV2DayManifestForTest,
@@ -10,11 +11,14 @@ import {
   buildHistoryV2PollutantManifestForTest,
   buildHistoryV2PollutantManifestKey,
   buildPruneComparisonRowsQueryForTest,
+  completeObservationDayFinalizationForTest,
   populateBackupCandidatesForTest,
   resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
+  runCandidateAqilevelsStageForTest,
   shouldResetManifestlessV2ResumeForTest,
   summarizeFrozenObservationSourceForAqi,
+  updateFinalizedHistoryIndexesForTest,
   validateAqilevelDataDebugConnectorManifests,
   writeCommittedV2PartAndCheckpointForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
@@ -620,13 +624,265 @@ test("Phase B v2 AQI debug manifests use debug profile and debug columns", () =>
   assert.deepEqual(pollutantManifest.columns, HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2);
 });
 
-test("Phase B exposes only the observation-derived AQI writer", () => {
+test("Phase B resolves the internal observation-derived AQI switch to false", () => {
   const config = resolvePhaseBRuntimeConfig({
     UK_AQ_R2_HISTORY_VERSION: "v2",
   });
-  assert.equal(config.phase_b_calculate_aqi_from_observations_enabled, true);
+  assert.equal(config.phase_b_calculate_aqi_from_observations_enabled, false);
   assert.equal("phase_b_legacy_aqi_rpc_export_enabled" in config, false);
   assert.equal("aqilevels_source" in config, false);
+});
+
+test("Phase B disabled candidate skips AQI context, objects and indexes without recording a failure", async () => {
+  const calls = {
+    connectorLock: 0,
+    exporter: 0,
+    pmContext: 0,
+    objectWrite: 0,
+    connectorIndex: 0,
+  };
+  const logEvents = [];
+  const summary = { aggregate_day_failures: [] };
+  const result = await runCandidateAqilevelsStageForTest({
+    client: {},
+    runtime: {
+      phase_b_calculate_aqi_from_observations_enabled: false,
+      logStructured(severity, event, fields) {
+        logEvents.push({ severity, event, fields });
+      },
+    },
+    candidate: { day_utc: DAY, connector_id: 7 },
+    observationResult: { verified: true },
+    summary,
+    withConnectorDayHistoryLockAdapter: async (_options, adapter) => {
+      calls.connectorLock += 1;
+      return await adapter();
+    },
+    exportCandidateAqiAdapter: async () => {
+      calls.exporter += 1;
+      calls.pmContext += 1;
+      calls.objectWrite += 1;
+      calls.connectorIndex += 1;
+      return { status: "complete" };
+    },
+  });
+
+  assert.deepEqual(result, { status: "skipped", reason: "aqilevels_disabled" });
+  assert.deepEqual(calls, {
+    connectorLock: 0,
+    exporter: 0,
+    pmContext: 0,
+    objectWrite: 0,
+    connectorIndex: 0,
+  });
+  assert.deepEqual(summary.aggregate_day_failures, []);
+  assert.equal(logEvents[0].event, "phase_b_history_aqi_skipped");
+  assert.equal(logEvents[0].fields.reason, "aqilevels_disabled");
+});
+
+test("Phase B directly constructed enabled runtime still reaches candidate AQI work", async () => {
+  const calls = {
+    connectorLock: 0,
+    exporter: 0,
+    pmContext: 0,
+    objectWrite: 0,
+    connectorIndex: 0,
+  };
+  const summary = { aggregate_day_failures: [] };
+  const result = await runCandidateAqilevelsStageForTest({
+    client: {},
+    runtime: { phase_b_calculate_aqi_from_observations_enabled: true },
+    candidate: { day_utc: DAY, connector_id: 7 },
+    observationResult: { verified: true },
+    summary,
+    withConnectorDayHistoryLockAdapter: async (_options, adapter) => {
+      calls.connectorLock += 1;
+      return await adapter();
+    },
+    exportCandidateAqiAdapter: async () => {
+      calls.exporter += 1;
+      calls.pmContext += 1;
+      calls.objectWrite += 1;
+      calls.connectorIndex += 1;
+      return { status: "complete", output_row_count: 24 };
+    },
+  });
+
+  assert.deepEqual(result, { status: "complete", output_row_count: 24 });
+  assert.deepEqual(calls, {
+    connectorLock: 1,
+    exporter: 1,
+    pmContext: 1,
+    objectWrite: 1,
+    connectorIndex: 1,
+  });
+  assert.deepEqual(summary.aggregate_day_failures, []);
+});
+
+test("Phase B enabled AQI failure remains isolated from a verified observation connector gate", async () => {
+  let connectorGateComplete = true;
+  let connectorGateMutationCalls = 0;
+  const summary = { aggregate_day_failures: [] };
+  const result = await runCandidateAqilevelsStageForTest({
+    client: {
+      async query() {
+        connectorGateMutationCalls += 1;
+        connectorGateComplete = false;
+        throw new Error("AQI stage must not mutate connector-gate evidence");
+      },
+    },
+    runtime: { phase_b_calculate_aqi_from_observations_enabled: true },
+    candidate: { day_utc: DAY, connector_id: 7 },
+    observationResult: { verified: true },
+    summary,
+    withConnectorDayHistoryLockAdapter: async (_options, adapter) => await adapter(),
+    exportCandidateAqiAdapter: async () => {
+      throw new Error("injected AQI failure");
+    },
+  });
+
+  assert.deepEqual(result, { status: "failed", error: "injected AQI failure" });
+  assert.equal(connectorGateComplete, true);
+  assert.equal(connectorGateMutationCalls, 0);
+  assert.deepEqual(summary.aggregate_day_failures, [{
+    day_utc: DAY,
+    connector_id: 7,
+    domain: "aqilevels",
+    error: "injected AQI failure",
+  }]);
+});
+
+test("Phase B disabled day finalisation skips AQI and still completes observation day evidence", async () => {
+  let aqiFinalizerCalls = 0;
+  const dayGateCalls = [];
+  const result = await completeObservationDayFinalizationForTest({
+    client: {},
+    runtime: {
+      run_id: RUN_ID,
+      phase_b_calculate_aqi_from_observations_enabled: false,
+    },
+    dayUtc: DAY,
+    changedConnectorIds: [2, 7],
+    dayManifestKey: `history/v2/observations/day_utc=${DAY}/manifest.json`,
+    verifiedDayTotals: {
+      history_row_count: 30n,
+      history_file_count: 2,
+      history_total_bytes: 300n,
+    },
+    writeAqilevelDayManifestAdapter: async () => {
+      aqiFinalizerCalls += 1;
+      return { required: true };
+    },
+    updateDayGateCompleteAdapter: async (_client, evidence) => {
+      dayGateCalls.push(evidence);
+    },
+  });
+
+  assert.equal(aqiFinalizerCalls, 0);
+  assert.equal(dayGateCalls.length, 1);
+  assert.equal(dayGateCalls[0].rowCount, 30n);
+  assert.equal(dayGateCalls[0].fileCount, 2);
+  assert.equal(dayGateCalls[0].totalBytes, 300n);
+  assert.equal(result.history_done, true);
+  assert.deepEqual(result.aqi_day_manifest, {
+    required: false,
+    skipped: true,
+    reason: "aqilevels_disabled",
+  });
+});
+
+test("Phase B directly constructed enabled runtime still reaches AQI day finalisation", async () => {
+  let aqiFinalizerCalls = 0;
+  let dayGateCalls = 0;
+  const result = await completeObservationDayFinalizationForTest({
+    client: {},
+    runtime: {
+      run_id: RUN_ID,
+      phase_b_calculate_aqi_from_observations_enabled: true,
+    },
+    dayUtc: DAY,
+    changedConnectorIds: [7],
+    dayManifestKey: `history/v2/observations/day_utc=${DAY}/manifest.json`,
+    verifiedDayTotals: {
+      history_row_count: 24n,
+      history_file_count: 1,
+      history_total_bytes: 240n,
+    },
+    writeAqilevelDayManifestAdapter: async ({ changedConnectorIds }) => {
+      aqiFinalizerCalls += 1;
+      assert.deepEqual(changedConnectorIds, [7]);
+      return { required: true, data_day_manifest_key: "aqi-data-day" };
+    },
+    updateDayGateCompleteAdapter: async () => {
+      dayGateCalls += 1;
+    },
+  });
+
+  assert.equal(aqiFinalizerCalls, 1);
+  assert.equal(dayGateCalls, 1);
+  assert.equal(result.history_done, true);
+  assert.deepEqual(result.aqi_day_manifest, {
+    required: true,
+    data_day_manifest_key: "aqi-data-day",
+  });
+});
+
+test("Phase B disabled global finalisation updates only observation indexes", async () => {
+  const calls = [];
+  await updateFinalizedHistoryIndexesForTest({
+    runtime: {
+      phase_b_calculate_aqi_from_observations_enabled: false,
+      committed_prefix: "history/v2/observations",
+      r2: {},
+    },
+    finalizedDays: [DAY],
+    updateIndexesAdapter: async (options) => {
+      calls.push(options);
+      return { ok: true };
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].domains, ["observations"]);
+  assert.equal(Object.hasOwn(calls[0].env, "UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX"), false);
+  assert.equal(Object.hasOwn(calls[0].env, "UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX"), false);
+
+  await updateFinalizedHistoryIndexesForTest({
+    runtime: {
+      phase_b_calculate_aqi_from_observations_enabled: true,
+      committed_prefix: "history/v2/observations",
+      r2: {},
+    },
+    finalizedDays: [DAY],
+    updateIndexesAdapter: async (options) => {
+      calls.push(options);
+      return { ok: true };
+    },
+  });
+  assert.deepEqual(calls[1].domains, ["observations", "aqilevels"]);
+  assert.equal(Object.hasOwn(calls[1].env, "UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX"), true);
+  assert.equal(Object.hasOwn(calls[1].env, "UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX"), true);
+});
+
+test("Phase B run summaries distinguish AQI disablement from budget exhaustion", () => {
+  assert.deepEqual(buildPhaseBAqilevelsSummaryForTest({
+    runtime: { phase_b_calculate_aqi_from_observations_enabled: false },
+    summary: { status: "completed" },
+  }), { skipped: true, reason: "aqilevels_disabled" });
+  assert.deepEqual(buildPhaseBAqilevelsSummaryForTest({
+    runtime: { phase_b_calculate_aqi_from_observations_enabled: false },
+    summary: { status: "stopped_budget" },
+  }), { skipped: true, reason: "phase_b_history_budget_exhausted" });
+});
+
+test("Phase B observation-only mode adds no environment selector or fallback AQI writer", () => {
+  const implementation = readFileSync("workers/uk_aq_prune_daily/phase_b_history_r2.mjs", "utf8");
+  const workflow = readFileSync(".github/workflows/uk_aq_prune_daily.yml", "utf8");
+  const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
+  for (const content of [implementation, workflow, targets]) {
+    assert.doesNotMatch(content, /UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED/);
+    assert.doesNotMatch(content, /UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/);
+    assert.doesNotMatch(content, /runAqilevelsBackup/);
+  }
 });
 
 import {
