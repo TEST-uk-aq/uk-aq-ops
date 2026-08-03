@@ -1034,9 +1034,6 @@ export function validateExternalDependencyRoot({
 
 export function validateLocalProposal(runState) {
   if (!runState || typeof runState !== "object") throw new Error("run state must be an object");
-  if (runState.environment !== "CIC-Test") {
-    throw new Error(`Refusing canonical apply outside CIC-Test: ${runState.environment || "(unset)"}`);
-  }
   const objects = Object.entries(runState.objects || {}).sort(([left], [right]) => bytewiseKeyCompare(left, right));
   const prefixes = Array.isArray(runState.tombstone_prefixes) ? runState.tombstone_prefixes : [];
   if (!objects.length && !prefixes.length) throw new Error("canonical proposal has no planned operations");
@@ -1126,7 +1123,7 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
     return { dedicated: false };
   }
   const audit = runState.sos_light;
-  if (runState.environment !== "CIC-Test"
+  if (!["CIC-Test", "LIVE"].includes(runState.environment)
     || runState.mode !== "sos-light"
     || JSON.stringify(runState.mutation_connector_ids) !== "[1]"
     || JSON.stringify(runState.selected_mutation_connector_ids) !== "[1]"
