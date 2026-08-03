@@ -244,6 +244,7 @@ jobs:
             cmd+=(--dry-run)
           fi
           if [ "${INPUT_FORCE_PRUNE_RECHECK}" = "true" ]; then
+            cmd+=(--prune-scope all)  
             cmd+=(--force-prune-recheck)
           fi
 
