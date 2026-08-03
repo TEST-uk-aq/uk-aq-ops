@@ -23,6 +23,23 @@ export const R2_OBSERVATION_COLUMNS = [
   "value",
 ] as const;
 
+const R2_OBSERVATION_SUPPORTED_COLUMN_SETS = [
+  [...R2_OBSERVATION_COLUMNS],
+  [...R2_OBSERVATION_COLUMNS, "status"],
+  [...R2_OBSERVATION_COLUMNS, "verification_status"],
+] as const;
+
+function hasSupportedObservationColumns(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+
+  const columns = value.map(String);
+
+  return R2_OBSERVATION_SUPPORTED_COLUMN_SETS.some((expected) =>
+    columns.length === expected.length &&
+    expected.every((column) => columns.includes(column))
+  );
+}
+
 export type R2ObjectReader = (key: string) => Promise<R2ReadResult>;
 
 export type PreparedDailyRow = {
@@ -451,14 +468,41 @@ function validateManifestIdentity(
   }
 }
 
-function validateColumns(manifest: JsonRecord, key: string): void {
-  const columns = asArray(manifest.columns, `${key}.columns`).map(String);
-  if (
-    columns.length !== R2_OBSERVATION_COLUMNS.length ||
-    R2_OBSERVATION_COLUMNS.some((column) => !columns.includes(column))
-  ) {
+function validateColumns(
+  manifest: JsonRecord,
+  key: string,
+): void {
+  if (manifest.columns === null) {
+    const physicalSchemas = asArray(
+      manifest.physical_schemas,
+      `${key}.physical_schemas`,
+    );
+
+    if (physicalSchemas.length < 2) {
+      throw new Error(
+        `${key}.columns is null but physical_schemas does not describe a mixed schema`,
+      );
+    }
+
+    physicalSchemas.forEach((value, index) => {
+      const schema = asRecord(
+        value,
+        `${key}.physical_schemas[${index}]`,
+      );
+
+      if (!hasSupportedObservationColumns(schema.columns)) {
+        throw new Error(
+          `${key}.physical_schemas[${index}].columns is not a supported canonical observation schema`,
+        );
+      }
+    });
+
+    return;
+  }
+
+  if (!hasSupportedObservationColumns(manifest.columns)) {
     throw new Error(
-      `${key}.columns must be exactly ${R2_OBSERVATION_COLUMNS.join(",")}`,
+      `${key}.columns is not a supported canonical observation schema`,
     );
   }
 }
@@ -572,14 +616,12 @@ async function readParquetRows(
   const columns = parquetSchema(metadata).children.map((column) =>
     column.element.name
   );
-  if (
-    columns.length !== R2_OBSERVATION_COLUMNS.length ||
-    R2_OBSERVATION_COLUMNS.some((column) => !columns.includes(column))
-  ) {
+  if (!hasSupportedObservationColumns(columns)) {
     throw new Error(
       `Parquet schema mismatch for ${file.key}: ${columns.join(",")}`,
     );
   }
+
   let rawRows: unknown[][] = [];
   await parquetRead({
     file: arrayBuffer,
