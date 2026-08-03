@@ -84,7 +84,7 @@ dry_run = false
 notes = "R2 history Dropbox backup"
 
 [jobs.uk_aq_r2_history_dropbox_backup_force_prune_recheck]
-enabled = true
+enabled = false
 cron_expr = "0 22 * * SUN"
 target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-ops"
