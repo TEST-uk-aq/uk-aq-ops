@@ -40,8 +40,6 @@ import {
   parquetSchema,
 } from "./lib/uk_aq_parquet_dependencies.mjs";
 
-const TEST_BUCKET = "uk-aq-history-cic-test";
-
 function parseArgs(argv) {
   const args = { runStateJson: "", writeR2: false };
   for (let index = 0; index < argv.length; index += 1) {
@@ -3120,7 +3118,6 @@ async function main() {
   const runStatePath = path.resolve(args.runStateJson);
   const config = resolveR2HistoryIndexConfig(process.env);
   if (!hasRequiredR2Config(config.r2)) throw new Error("canonical apply requires complete R2 configuration");
-  if (config.r2.bucket !== TEST_BUCKET) throw new Error(`Refusing canonical apply for non-TEST bucket: ${config.r2.bucket || "(unset)"}`);
   return await withHistoryWriterClient(
     process.env.SUPABASE_DB_URL || process.env.DATABASE_URL,
     async (historyWriterClient) => await applyValidatedProposal({
