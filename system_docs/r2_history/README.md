@@ -7,6 +7,7 @@ This area governs:
 - stable v2 physical timeseries binding identity and routing;
 - embedded multi-member continuity families in schema-version-2 bindings;
 - v2 history Integrity detection, planning and repair;
+- one immutable run-scoped core snapshot identity for every Integrity invocation;
 - the dedicated SOS historical complete-partition replacement path;
 - post-verification reconciliation of `timeseries` freshness and Latest Snapshot current state;
 - scheduled Integrity daily date selection;
@@ -42,6 +43,7 @@ For binding and continuity changes:
 For Integrity changes, also read:
 
 - [`integrity.md`](integrity.md);
+- [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md) for one immutable coordinator-selected core snapshot across every detector, proposal, apply and verification process boundary;
 - [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md) for write-enabled SOS historical complete-partition replacement;
 - [`integrity_apply_safety_contract.md`](integrity_apply_safety_contract.md) for proposal ownership and generic apply safety, subject to the SOS mode-specific amendment above;
 - [`current_state_reconciliation.md`](current_state_reconciliation.md) where a verified history repair can affect `timeseries` freshness or Latest Snapshot;
@@ -71,6 +73,22 @@ For calculated station-chart AQI and website display, also read:
 - [`../aqi-levels/README.md`](../aqi-levels/README.md);
 - [`../aqi-levels/station-history-contract.md`](../aqi-levels/station-history-contract.md);
 - [`../aqi-levels/station-history-validation.md`](../aqi-levels/station-history-validation.md).
+
+## Integrity core snapshot identity
+
+The authoritative contract is [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md).
+
+Required behaviour includes:
+
+- the top-level Integrity coordinator selects and validates one exact committed v2 core snapshot at run initialisation;
+- the run-scoped identity includes the canonical core manifest key and its immutable manifest identity where available;
+- every detector, proposal, apply and final-verification child receives and validates that same identity explicitly;
+- no child may derive a new core snapshot from the current clock or independently select the newest locally visible snapshot;
+- crossing midnight UTC does not change the snapshot used by an existing invocation;
+- missing, contradictory or unavailable pinned identity fails before proposal construction or live R2 mutation;
+- check-only, dry-run, generic repair and SOS-light share the same selection and propagation rules;
+- a later separate invocation may independently select a newer committed snapshot;
+- JSON, Markdown and log audit evidence records the pinned identity and process-boundary agreement.
 
 ## Stable binding and continuity summary
 
