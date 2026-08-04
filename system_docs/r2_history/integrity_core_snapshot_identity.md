@@ -38,18 +38,25 @@ At top-level run initialisation, Integrity MUST:
 1. discover the available committed v2 core snapshot candidates;
 2. order candidates by `day_utc` newest first;
 3. validate candidates in that order;
-4. select the first candidate that is complete and structurally valid;
+4. select the first candidate that is physically complete and structurally valid;
 5. fail the run if no complete committed candidate exists.
 
 A candidate is complete only when:
 
-- its canonical day manifest exists and is readable;
-- the manifest is structurally valid;
-- every required object referenced by the manifest is available in the chosen baseline or combined-local view;
-- the required connector, station, timeseries and observed-property identity inputs can be loaded and structurally validated;
-- any existing immutable manifest identity or hash agrees with the selected bytes.
+- its canonical day manifest exists, is readable and has the expected v2 shape;
+- the manifest day, prefix and immutable manifest identity agree with its directory and bytes;
+- every required object referenced by the manifest exists in the chosen Dropbox baseline;
+- every referenced object matches its declared compressed and uncompressed byte counts and SHA-256 identities;
+- required compressed objects can be decompressed and parsed;
+- declared row counts match the parsed rows;
+- all required connector, station, timeseries, phenomenon and observed-property identity tables are present and loadable;
+- the committed checksum file exists and agrees exactly with the manifest and referenced object bytes.
 
-A newer incomplete, partial or unreadable candidate is not eligible. Integrity MAY continue to the next older candidate, but MUST record the skipped candidate and the reason it was ineligible.
+Snapshot eligibility is deliberately limited to physical completeness and structural validity. Cross-table semantic relationship findings MUST NOT make an otherwise complete snapshot ineligible. Examples include a timeseries connector that differs from its station connector, a missing related identity row, or a phenomenon without an observed-property mapping. Integrity MUST record these findings as warnings for diagnosis, but MUST keep the candidate eligible and MUST NOT fall back to an older snapshot solely because of them.
+
+Semantic relationship checks may still be used by later Integrity diagnostics or repair logic where relevant. They are not a completion marker for selecting the run-scoped core snapshot.
+
+A newer physically incomplete, partial, unreadable or byte-invalid candidate is not eligible. Integrity MAY continue to the next older candidate, but MUST record the skipped candidate and the structural reason it was ineligible.
 
 This fallback is only between already available committed core snapshots during top-level selection. It MUST NOT be used later by a child process to replace the pinned snapshot.
 
@@ -132,7 +139,7 @@ Changing Integrity mode MUST NOT change the meaning or lifetime of the selected 
 
 Integrity MUST fail before proposal construction or live R2 mutation when:
 
-- no complete committed core snapshot is available at run initialisation;
+- no physically complete and structurally valid committed core snapshot is available at run initialisation;
 - no run-scoped core identity was established;
 - a child receives no identity;
 - a child receives an identity different from the coordinator identity;
@@ -141,6 +148,8 @@ Integrity MUST fail before proposal construction or live R2 mutation when:
 - a stage attempts to construct or select a different core snapshot;
 - detector and proposal stages cannot prove they used the same snapshot.
 
+A semantic relationship warning inside a physically complete snapshot is not one of these selection failures.
+
 The error report MUST include the coordinator identity, the child or requested identity, the affected stage and the failed validation. It MUST NOT expose credentials or unrelated environment values.
 
 ## Audit contract
@@ -148,11 +157,12 @@ The error report MUST include the coordinator identity, the child or requested i
 Every Integrity JSON report, Markdown summary and main run log MUST record the pinned core snapshot identity, including at least:
 
 - discovered candidate days;
-- any newer ineligible candidates and their rejection reasons;
+- any newer structurally ineligible candidates and their rejection reasons;
 - selected core snapshot day;
 - canonical manifest key;
 - immutable manifest hash or equivalent identity where available;
-- confirmation that the selected snapshot was the latest complete committed candidate;
+- confirmation that the selected snapshot was the latest physically complete committed candidate;
+- semantic relationship warnings found in the selected snapshot, including check name and row count;
 - confirmation that detector, proposal and apply consumers used the same identity;
 - any mismatch or missing-identity failure;
 - whether the invocation crossed midnight UTC after selection.
@@ -166,14 +176,15 @@ Before deployment, perform only the smallest deterministic regression required t
 The focused check MUST prove:
 
 1. no snapshot exists for the simulated current day;
-2. the coordinator selects the newest earlier complete committed snapshot;
-3. a newer incomplete candidate is skipped and recorded before an older complete candidate is selected;
-4. the simulated clock advances after selection;
-5. the child still resolves the pinned manifest key;
-6. no current-day or newly advanced-day core path is constructed for that invocation;
-7. missing or contradictory child identity fails before proposal or apply;
-8. check-only, dry-run and write-enabled modes receive the same run-scoped identity;
-9. a later separate invocation may independently select a newer snapshot after it becomes complete.
+2. the coordinator selects the newest earlier physically complete committed snapshot;
+3. a newer structurally incomplete candidate is skipped and recorded before an older complete candidate is selected;
+4. a physically complete candidate with semantic relationship warnings remains eligible and records those warnings;
+5. the simulated clock advances after selection;
+6. the child still resolves the pinned manifest key;
+7. no current-day or newly advanced-day core path is constructed for that invocation;
+8. missing or contradictory child identity fails before proposal or apply;
+9. check-only, dry-run and write-enabled modes receive the same run-scoped identity;
+10. a later separate invocation may independently select a newer snapshot after it becomes complete.
 
 This targeted regression is genuinely required because the fault depends on date-derived path selection and long-running processes crossing UTC midnight. Do not add a broad speculative pre-deployment test suite.
 
@@ -183,8 +194,9 @@ After deployment, functional validation occurs through a real CIC-Test Integrity
 
 Acceptance requires:
 
-- the latest available complete committed core snapshot selected at run initialisation;
+- the latest available physically complete committed core snapshot selected at run initialisation;
 - no requirement for a current-day snapshot;
+- semantic relationship findings recorded as warnings without rejecting the selected snapshot;
 - every child stage reporting the same manifest key and immutable identity;
 - no clock-derived replacement core path after midnight;
 - proposal and apply validation using the pinned snapshot;
