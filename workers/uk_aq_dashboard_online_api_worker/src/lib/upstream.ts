@@ -1,5 +1,24 @@
 import { errorEnvelope, withCorsAndCacheControl, withCorsAndNoStore } from "./http";
 
+export type R2ObjectBodyBinding = {
+  text(): Promise<string>;
+};
+
+export type R2BucketBinding = {
+  get(key: string): Promise<R2ObjectBodyBinding | null>;
+  list(options?: {
+    prefix?: string;
+    delimiter?: string;
+    cursor?: string;
+    limit?: number;
+  }): Promise<{
+    objects: Array<{ key: string }>;
+    truncated: boolean;
+    cursor?: string;
+    delimitedPrefixes?: string[];
+  }>;
+};
+
 export type WorkerEnv = {
   DASHBOARD_UPSTREAM_BASE_URL?: string;
   DASHBOARD_UPSTREAM_BEARER_TOKEN?: string;
@@ -20,6 +39,8 @@ export type WorkerEnv = {
   UK_AQ_R2_HISTORY_COUNTS_API_URL?: string;
   UK_AQ_R2_HISTORY_COUNTS_API_TOKEN?: string;
   UK_AQ_R2_HISTORY_VERSION?: string;
+  UK_AQ_R2_HISTORY_BUCKET?: string;
+  R2_HISTORY?: R2BucketBinding;
   UK_AQ_OBSERVS_HISTORY_R2_API_URL?: string;
   UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN?: string;
   UK_AQ_AQI_HISTORY_R2_API_URL?: string;
