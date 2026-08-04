@@ -7,19 +7,40 @@ window.UKAQ_OPS_CONFIG = {
 };
 
 (() => {
+  const DROPBOX_ICON_PATH = "assets/dropbox-icon.svg";
+
   const state = {
-    payload: null,
+    coveragePayload: null,
+    r2CountPresence: {
+      observations: new Set(),
+      aqilevels: new Set(),
+      fromDay: null,
+      toDay: null,
+    },
     revision: 0,
     scheduled: false,
   };
 
-  function isStorageCoverageRequest(input) {
+  function requestUrl(input) {
     const rawUrl = typeof input === "string"
       ? input
       : input && typeof input.url === "string"
         ? input.url
         : "";
-    return rawUrl.includes("storage_coverage");
+    if (!rawUrl) return null;
+    try {
+      return new URL(rawUrl, window.location.href);
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function isStorageCoverageRequest(url) {
+    return Boolean(url && url.pathname.includes("/storage_coverage"));
+  }
+
+  function isR2ConnectorCountsRequest(url) {
+    return Boolean(url && url.pathname.includes("/r2_connector_counts"));
   }
 
   function scheduleEnhancement() {
@@ -36,27 +57,48 @@ window.UKAQ_OPS_CONFIG = {
     const style = document.createElement("style");
     style.id = "ukaq-storage-coverage-patch-styles";
     style.textContent = `
-      .coverage-bar-slot.ukaq-dual-storage {
-        gap: 4px;
+      .coverage-bar-slot.ukaq-storage-slot {
+        width: 100%;
+        gap: 0;
       }
 
-      .coverage-bar-slot.ukaq-dual-storage > .coverage-bar {
-        width: auto;
+      .coverage-bar-slot.ukaq-storage-slot > .coverage-bar {
+        width: 100% !important;
         min-width: 0;
       }
 
-      .coverage-bar-slot.ukaq-dual-storage > .coverage-bar-r2-observs {
-        flex: 2 1 0;
+      .ukaq-storage-row-split {
+        display: flex;
+        width: 100%;
+        height: 100%;
+        min-height: 12px;
+        gap: 4px;
       }
 
-      .coverage-bar-slot.ukaq-dual-storage > .ukaq-dual-ingest-bar {
+      .ukaq-storage-row-split > .coverage-bar {
         flex: 1 1 0;
+        width: auto !important;
+        min-width: 0;
+        justify-content: center;
       }
 
-      .ukaq-dual-ingest-bar .coverage-bar-label-primary {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+      .ukaq-storage-row-split .coverage-bar-label {
+        justify-content: center;
+      }
+
+      .ukaq-split-dropbox-icon {
+        display: block;
+        width: 15px;
+        height: 15px;
+        object-fit: contain;
+      }
+
+      .ukaq-year-dropbox-icon {
+        display: block;
+        width: 70%;
+        height: 70%;
+        margin: 15%;
+        object-fit: contain;
       }
 
       .ukaq-coverage-meta {
@@ -87,6 +129,12 @@ window.UKAQ_OPS_CONFIG = {
     return `${formatter.format(parsed)} UTC`;
   }
 
+  function normaliseDayKey(value) {
+    const text = String(value || "").trim();
+    const match = text.match(/^(\d{4}-\d{2}-\d{2})/);
+    return match ? match[1] : "";
+  }
+
   function rowMap(payload) {
     const rows = payload && Array.isArray(payload.storage_coverage_days)
       ? payload.storage_coverage_days
@@ -94,43 +142,278 @@ window.UKAQ_OPS_CONFIG = {
     return new Map(
       rows
         .filter((row) => row && typeof row.date === "string")
-        .map((row) => [row.date, row]),
+        .map((row) => [normaliseDayKey(row.date), row]),
     );
   }
 
   function cellDateKey(cell) {
     const title = String(cell.getAttribute("title") || "");
-    const match = title.match(/^(\d{4}-\d{2}-\d{2})/);
-    return match ? match[1] : "";
+    const titleKey = normaliseDayKey(title);
+    if (titleKey) return titleKey;
+
+    const explicitKey = normaliseDayKey(cell.dataset.date || cell.dataset.day || "");
+    return explicitKey;
   }
 
-  function addMonthDualStorageMarker(cell) {
-    const topSlot = cell.querySelector(".coverage-bar-slot");
-    if (!topSlot || topSlot.querySelector(".ukaq-dual-ingest-bar")) return;
+  function updateR2CountPresence(payload, url) {
+    if (!payload || !Array.isArray(payload.connectors) || !url) return;
 
-    const ingestBar = document.createElement("span");
-    ingestBar.className = "coverage-bar coverage-bar-ingest ukaq-dual-ingest-bar";
-    ingestBar.title = "Ingest DB (also present)";
-    ingestBar.setAttribute("aria-label", "Ingest DB also present");
-    ingestBar.innerHTML = `
-      <span class="coverage-bar-label">
-        <span class="coverage-bar-label-primary">Ingest</span>
+    const grain = String(url.searchParams.get("grain") || "day").toLowerCase();
+    if (grain !== "day") return;
+
+    const observations = new Set();
+    const aqilevels = new Set();
+
+    payload.connectors.forEach((connector) => {
+      const buckets = Array.isArray(connector && connector.buckets)
+        ? connector.buckets
+        : [];
+      buckets.forEach((bucket) => {
+        const dayKey = normaliseDayKey(
+          bucket && (bucket.bucket_start_day_utc || bucket.day_utc || bucket.bucket_key),
+        );
+        if (!dayKey) return;
+
+        if (Number(bucket && bucket.observations_rows || 0) > 0) {
+          observations.add(dayKey);
+        }
+        if (Number(bucket && bucket.aqilevels_rows || 0) > 0) {
+          aqilevels.add(dayKey);
+        }
+      });
+    });
+
+    state.r2CountPresence = {
+      observations,
+      aqilevels,
+      fromDay: normaliseDayKey(url.searchParams.get("from_day")),
+      toDay: normaliseDayKey(url.searchParams.get("to_day")),
+    };
+  }
+
+  function effectiveRow(rawRow, dateKey) {
+    const row = { ...(rawRow || {}) };
+    if (state.r2CountPresence.observations.has(dateKey)) {
+      row.r2_observs = true;
+      row.r2 = true;
+    }
+    if (state.r2CountPresence.aqilevels.has(dateKey)) {
+      row.r2_aqilevels = true;
+    }
+    return row;
+  }
+
+  function hasObsAqiObservs(row) {
+    return row && row.obs_aqi_observs !== undefined
+      ? Boolean(row.obs_aqi_observs)
+      : Boolean(row && row.observs);
+  }
+
+  function hasR2Observs(row) {
+    return Boolean(
+      row
+      && (
+        row.r2_observs
+        || row.r2
+        || row.dropbox_observs
+      )
+    );
+  }
+
+  function hasR2Aqilevels(row) {
+    return Boolean(row && (row.r2_aqilevels || row.dropbox_aqilevels));
+  }
+
+  function buildLayers(row) {
+    const layers = [];
+
+    if (row && row.ingest) {
+      layers.push({
+        key: "ingest",
+        label: "IngestDB",
+        className: "coverage-bar-ingest",
+        backup: false,
+        backupOnly: false,
+      });
+    }
+
+    if (hasObsAqiObservs(row)) {
+      layers.push({
+        key: "obsaqi-observs",
+        label: "ObsAQIDB - Obs",
+        className: "coverage-bar-obsaqi-observs",
+        backup: false,
+        backupOnly: false,
+      });
+    }
+
+    if (hasR2Observs(row)) {
+      const r2Present = Boolean(row && (row.r2_observs || row.r2));
+      const backup = Boolean(row && row.dropbox_observs);
+      layers.push({
+        key: "r2-observs",
+        label: r2Present ? "R2 History - Obs" : "Backup - Obs",
+        className: r2Present
+          ? "coverage-bar-r2-observs"
+          : "coverage-bar-dropbox-only-observs",
+        backup,
+        backupOnly: !r2Present && backup,
+      });
+    }
+
+    if (hasR2Aqilevels(row)) {
+      const r2Present = Boolean(row && row.r2_aqilevels);
+      const backup = Boolean(row && row.dropbox_aqilevels);
+      layers.push({
+        key: "r2-aqilevels",
+        label: r2Present ? "R2 History - AQI" : "Backup - AQI",
+        className: r2Present
+          ? "coverage-bar-r2-aqilevels"
+          : "coverage-bar-dropbox-only-aqilevels",
+        backup,
+        backupOnly: !r2Present && backup,
+      });
+    }
+
+    return layers;
+  }
+
+  function backupIconMarkup(className = "coverage-bar-label-secondary-icon is-dropbox-blue") {
+    return `<img class="${className}" src="${DROPBOX_ICON_PATH}" alt="" aria-hidden="true">`;
+  }
+
+  function renderFullBar(layer) {
+    const title = layer.backup
+      ? `${layer.label} • Dropbox backup`
+      : layer.label;
+
+    let labelMarkup = `<span class="coverage-bar-label-primary">${layer.label}</span>`;
+    if (layer.backupOnly) {
+      labelMarkup = `
+        <span class="coverage-bar-label-primary with-icon">
+          ${backupIconMarkup("coverage-bar-label-primary-icon is-dropbox-blue")}
+          <span class="coverage-bar-label-primary-text">${layer.label}</span>
+        </span>
+      `;
+    } else if (layer.backup) {
+      labelMarkup += `
+        <span class="coverage-bar-label-secondary is-dropbox-badge">
+          ${backupIconMarkup()}
+          Backup
+        </span>
+      `;
+    }
+
+    return `
+      <span class="coverage-bar ${layer.className}" title="${title}">
+        <span class="coverage-bar-label${layer.backup && !layer.backupOnly ? " has-secondary" : ""}">
+          ${labelMarkup}
+        </span>
       </span>
     `;
-
-    topSlot.classList.add("ukaq-dual-storage");
-    topSlot.insertBefore(ingestBar, topSlot.firstChild);
   }
 
-  function addYearDualStorageMarker(cell) {
-    const squareGrid = cell.querySelector(".coverage-square-grid");
-    if (!squareGrid || squareGrid.querySelector(".ukaq-dual-ingest-square")) return;
+  function renderSplitBar(layer) {
+    const title = layer.backup
+      ? `${layer.label} • Dropbox backup`
+      : layer.label;
+    const icon = layer.backup
+      ? backupIconMarkup("ukaq-split-dropbox-icon")
+      : "";
+    return `
+      <span class="coverage-bar ${layer.className}" title="${title}" aria-label="${title}">
+        ${icon}
+      </span>
+    `;
+  }
 
-    const square = document.createElement("span");
-    square.className = "coverage-square coverage-bar-ingest ukaq-dual-ingest-square";
-    square.title = "Ingest DB (also present)";
-    square.setAttribute("aria-label", "Ingest DB also present");
-    squareGrid.insertBefore(square, squareGrid.firstChild);
+  function sourceSummary(row) {
+    const summary = [];
+    if (row && row.ingest) summary.push("IngestDB");
+    if (hasObsAqiObservs(row)) summary.push("ObsAQIDB - Obs");
+    if (hasR2Observs(row)) {
+      summary.push(row && row.r2_observs || row && row.r2
+        ? "R2 History - Obs"
+        : "Backup - Obs");
+    }
+    if (hasR2Aqilevels(row)) {
+      summary.push(row && row.r2_aqilevels
+        ? "R2 History - AQI"
+        : "Backup - AQI");
+    }
+    return summary;
+  }
+
+  function renderMonthCell(cell, row, dateKey) {
+    const bars = cell.querySelector(".coverage-bars");
+    if (!bars) return;
+
+    const slots = Array.from(
+      bars.querySelectorAll(":scope > .coverage-bar-slot"),
+    ).slice(0, 3);
+    if (slots.length !== 3) return;
+
+    slots.forEach((slot) => {
+      slot.classList.remove("ukaq-dual-storage");
+      slot.classList.add("ukaq-storage-slot");
+      slot.replaceChildren();
+    });
+
+    const layers = buildLayers(row);
+
+    if (layers.length === 4) {
+      slots[0].innerHTML = renderFullBar(layers[0]);
+      slots[1].innerHTML = renderFullBar(layers[1]);
+      slots[2].innerHTML = `
+        <span class="ukaq-storage-row-split">
+          ${renderSplitBar(layers[2])}
+          ${renderSplitBar(layers[3])}
+        </span>
+      `;
+    } else {
+      layers.slice(0, 3).forEach((layer, index) => {
+        slots[index].innerHTML = renderFullBar(layer);
+      });
+    }
+
+    const sources = sourceSummary(row);
+    cell.title = sources.length
+      ? `${dateKey} • Sources: ${sources.join(", ")}`
+      : `${dateKey} • No data in storage layers`;
+  }
+
+  function renderYearCell(cell, row, dateKey) {
+    const grid = cell.querySelector(".coverage-square-grid");
+    if (!grid) return;
+
+    if (row && row.isToday) {
+      return;
+    }
+
+    const layers = buildLayers(row);
+    const slots = Array.from({ length: 4 }, (_, index) => layers[index] || null);
+
+    grid.innerHTML = slots.map((layer) => {
+      if (!layer) {
+        return '<span class="coverage-square is-empty"></span>';
+      }
+      const title = layer.backup
+        ? `${layer.label} • Dropbox backup`
+        : layer.label;
+      const icon = layer.backup
+        ? backupIconMarkup("ukaq-year-dropbox-icon")
+        : "";
+      return `
+        <span class="coverage-square ${layer.className}" title="${title}" aria-label="${title}">
+          ${icon}
+        </span>
+      `;
+    }).join("");
+
+    const sources = sourceSummary(row);
+    cell.title = sources.length
+      ? `${dateKey} • Sources: ${sources.join(", ")}`
+      : `${dateKey} • No data in storage layers`;
   }
 
   function appendCoverageDiagnostics(panel, payload) {
@@ -167,17 +450,18 @@ window.UKAQ_OPS_CONFIG = {
     const footnotes = Array.from(panel.querySelectorAll(":scope > .footnote"))
       .filter((node) => !node.classList.contains("ukaq-coverage-meta"));
     const primaryFootnote = footnotes[0];
-    if (!primaryFootnote || primaryFootnote.dataset.ukaqDualStorageUpdated === "1") return;
+    if (!primaryFootnote) return;
 
-    primaryFootnote.textContent = primaryFootnote.textContent.replace(
-      "Top: Ingest DB (red), R2 History - Obs (orange), or Backup - Obs (orange filled).",
-      "Top: Ingest DB (red), R2 History - Obs (orange), or both shown side by side; Backup - Obs is orange filled.",
-    );
-    primaryFootnote.dataset.ukaqDualStorageUpdated = "1";
+    primaryFootnote.textContent =
+      "Rows: IngestDB (red), ObsAQIDB - Obs (blue), R2 History - Obs (orange), "
+      + "then R2 History - AQI (yellow). When all four are present, the orange "
+      + "and yellow R2 layers share the third row. A blue Dropbox icon marks a "
+      + "Dropbox copy of the corresponding R2 layer. All bars are full width, "
+      + "including today.";
   }
 
   function enhanceCoveragePanel() {
-    const payload = state.payload;
+    const payload = state.coveragePayload;
     if (!payload) return;
 
     injectStyles();
@@ -189,13 +473,15 @@ window.UKAQ_OPS_CONFIG = {
 
       panel.querySelectorAll(".coverage-day-cell, .coverage-year-day").forEach((cell) => {
         const dateKey = cellDateKey(cell);
-        const row = rowsByDate.get(dateKey);
-        if (!row || !row.ingest || !row.r2_observs) return;
+        if (!dateKey) return;
+
+        const rawRow = rowsByDate.get(dateKey) || { date: dateKey };
+        const row = effectiveRow(rawRow, dateKey);
 
         if (cell.classList.contains("coverage-year-day")) {
-          addYearDualStorageMarker(cell);
+          renderYearCell(cell, row, dateKey);
         } else {
-          addMonthDualStorageMarker(cell);
+          renderMonthCell(cell, row, dateKey);
         }
       });
 
@@ -207,17 +493,31 @@ window.UKAQ_OPS_CONFIG = {
 
   const originalFetch = window.fetch.bind(window);
   window.fetch = async (...args) => {
+    const url = requestUrl(args[0]);
     const response = await originalFetch(...args);
-    if (isStorageCoverageRequest(args[0])) {
+
+    if (isStorageCoverageRequest(url)) {
       response.clone().json().then((payload) => {
         if (!payload || typeof payload !== "object") return;
-        state.payload = payload;
+        state.coveragePayload = payload;
         state.revision += 1;
         scheduleEnhancement();
       }).catch(() => {
         // The dashboard's normal error handling remains authoritative.
       });
     }
+
+    if (isR2ConnectorCountsRequest(url)) {
+      response.clone().json().then((payload) => {
+        if (!payload || typeof payload !== "object") return;
+        updateR2CountPresence(payload, url);
+        state.revision += 1;
+        scheduleEnhancement();
+      }).catch(() => {
+        // The dashboard's normal error handling remains authoritative.
+      });
+    }
+
     return response;
   };
 
@@ -227,4 +527,3 @@ window.UKAQ_OPS_CONFIG = {
     subtree: true,
   });
 })();
-
