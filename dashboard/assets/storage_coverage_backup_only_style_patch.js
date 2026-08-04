@@ -17,13 +17,22 @@
       .coverage-bar-dropbox-only-observs {
         background: #fff !important;
         border: 2px solid var(--color-r2-observs) !important;
-        color: var(--ink) !important;
       }
 
       .coverage-bar-dropbox-only-aqilevels {
         background: #fff !important;
         border: 2px solid var(--color-r2-aqilevels) !important;
-        color: var(--ink) !important;
+      }
+
+      .coverage-bar-dropbox-only-observs,
+      .coverage-bar-dropbox-only-observs .coverage-bar-label,
+      .coverage-bar-dropbox-only-observs .coverage-bar-label-primary,
+      .coverage-bar-dropbox-only-observs .coverage-bar-label-primary-text,
+      .coverage-bar-dropbox-only-aqilevels,
+      .coverage-bar-dropbox-only-aqilevels .coverage-bar-label,
+      .coverage-bar-dropbox-only-aqilevels .coverage-bar-label-primary,
+      .coverage-bar-dropbox-only-aqilevels .coverage-bar-label-primary-text {
+        color: #111 !important;
       }
 
       .coverage-square.coverage-bar-dropbox-only-observs,
