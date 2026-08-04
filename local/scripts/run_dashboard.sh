@@ -91,6 +91,6 @@ generate_dashboard_config
 
 export DASHBOARD_UPSTREAM_BEARER_TOKEN=""
 
-exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_api_patch.py \
+exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_inventory_patch.py \
   --host "${HOST:-127.0.0.1}" \
   --port "${PORT:-8000}"
