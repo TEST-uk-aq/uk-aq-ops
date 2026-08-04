@@ -9,12 +9,13 @@ The complete authoritative behaviour is defined in:
 - [`sos_light_model.md`](sos_light_model.md);
 - [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md);
 - [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md);
+- [`integrity_connector_observation_totals.md`](integrity_connector_observation_totals.md);
 - [`current_state_reconciliation.md`](current_state_reconciliation.md);
 - [`../latest_snapshot/integrity_reconciliation.md`](../latest_snapshot/integrity_reconciliation.md).
 
 Where older plans, reports or implementation names refer to “dedicated SOS historical replacement”, “direct selected-partition replacement” or “protected-connector preservation”, those names describe implementation history. The active operational model is SOS-light.
 
-The generic Integrity path, check-only mode, dry-run mode, Prune Daily and non-SOS paths remain unchanged except where the run-scoped core-snapshot contract explicitly applies to every Integrity mode.
+The generic Integrity path, check-only mode, dry-run mode, Prune Daily and non-SOS paths remain unchanged except where the run-scoped core-snapshot or connector-observation-total contracts explicitly apply.
 
 ## Operator entrypoint
 
@@ -179,6 +180,40 @@ After the complete assembled R2 day and affected observation indexes are success
 
 Other connectors carried from Dropbox do not generate current-state candidates in a connector `1` SOS-light run.
 
+## Connector observation totals
+
+A successful real SOS-light run MUST expose connector-level totals under the structured Integrity JSON report according to [`integrity_connector_observation_totals.md`](integrity_connector_observation_totals.md).
+
+Only connector `1` is emitted for an SOS-light request because it is the only selected connector. Other connectors copied from the Dropbox baseline into the assembled day are not included.
+
+The totals cover only:
+
+```text
+connector_id=1
+x
+requested inclusive date range
+x
+requested repair-pollutant set
+```
+
+The required values are:
+
+```text
+Total Observs before
+Total Observs added
+Total Observs after
+```
+
+Because SOS-light deletes and republishes the complete selected observation day, every final canonical connector `1` row in the requested pollutant scope is written by the run. Therefore, on success:
+
+```text
+Total Observs added = Total Observs after
+```
+
+The totals MUST be derived from existing validated baseline, publication and final-verification evidence. They MUST NOT trigger another live-R2 query, broad Dropbox traversal or Parquet rescan solely for reporting.
+
+A failed, interrupted, check-only or dry-run operation MUST NOT claim completed added or after totals. Operational wrappers print these totals only for successful real repairs.
+
 ## Failure and rerun behaviour
 
 Local assembly must complete before the first live R2 mutation.
@@ -208,6 +243,8 @@ Each run records at least:
 - final assembled connector set per day;
 - final publication-schedule object count and required-parent count per day;
 - confirmation that unchanged but required assembled-day objects remained scheduled for upload;
+- connector `1` before, added and after observation totals for the exact requested range and pollutant scope on successful real repair;
+- confirmation that added equals after for successful SOS-light connector totals;
 - warnings and omissions for Dropbox-backed other connectors;
 - complete-day deletion and upload counts;
 - changed-object verification results;
@@ -216,7 +253,7 @@ Each run records at least:
 
 ## Minimal structural validation
 
-Before operational CIC-Test execution, perform only the smallest targeted checks required by [`sos_light_model.md`](sos_light_model.md) and [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md), especially:
+Before operational CIC-Test execution, perform only the smallest targeted checks required by [`sos_light_model.md`](sos_light_model.md), [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md) and [`integrity_connector_observation_totals.md`](integrity_connector_observation_totals.md), especially:
 
 - no current-day snapshot being required when a complete earlier snapshot exists;
 - a newer incomplete candidate being skipped and recorded before the next older complete candidate is selected;
@@ -229,6 +266,11 @@ Before operational CIC-Test execution, perform only the smallest targeted checks
 - connector `1` parent body and dependency evidence using the same final child set;
 - every required assembled-day object remaining in the publication schedule even when unchanged;
 - exactly one final day manifest being scheduled after all required children;
+- only connector `1` appearing in connector observation totals;
+- the requested date and pollutant scope being used for all totals;
+- successful SOS-light totals satisfying added equals after;
+- failed, check-only and dry-run results not claiming completed after totals;
+- no extra R2 query or broad Parquet scan being added solely to calculate totals;
 - unprotected Dropbox issues remaining warning-only.
 
 Functional validation belongs in the real CIC-Test SOS-light run. Do not add a broad speculative pre-deployment test suite.
