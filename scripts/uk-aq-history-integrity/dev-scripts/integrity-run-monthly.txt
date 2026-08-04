@@ -22,7 +22,7 @@ nohup /Users/mikehinford/uk-aq-history-integrity/bin/integrity-run-monthly.sh \
   > /Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/logs/integrity-run-monthly-$(date -u +%Y%m%dT%H%M%SZ).log \
   2>&1 &
 
-nohup /Users/mikehinford/uk-aq-history-integrity/bin/integrity-run-monthly.sh \
+nohup /Users/mikehinford/uk-aq-history-integrity/bin/integrity-run-monthly-LIVE.sh \
   > /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/integrity-run-monthly-$(date -u +%Y%m%dT%H%M%SZ).log \
   2>&1 &
   
