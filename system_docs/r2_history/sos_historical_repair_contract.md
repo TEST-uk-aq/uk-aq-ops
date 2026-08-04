@@ -8,12 +8,13 @@ The complete authoritative behaviour is defined in:
 
 - [`sos_light_model.md`](sos_light_model.md);
 - [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md);
+- [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md);
 - [`current_state_reconciliation.md`](current_state_reconciliation.md);
 - [`../latest_snapshot/integrity_reconciliation.md`](../latest_snapshot/integrity_reconciliation.md).
 
 Where older plans, reports or implementation names refer to “dedicated SOS historical replacement”, “direct selected-partition replacement” or “protected-connector preservation”, those names describe implementation history. The active operational model is SOS-light.
 
-The generic Integrity path, check-only mode, dry-run mode, Prune Daily and non-SOS paths remain unchanged.
+The generic Integrity path, check-only mode, dry-run mode, Prune Daily and non-SOS paths remain unchanged except where the run-scoped core-snapshot contract explicitly applies to every Integrity mode.
 
 ## Operator entrypoint
 
@@ -32,6 +33,18 @@ A real run selects SOS-light when all of these are true:
 - an explicit supported pollutant subset.
 
 The selected source connector is connector `1` only.
+
+## Run-scoped core snapshot identity
+
+SOS-light MUST use the one exact committed v2 core snapshot selected by the top-level Integrity coordinator at run initialisation.
+
+The coordinator-selected identity MUST be passed explicitly to source mapping, detector, proposal, local assembly, apply and final-verification stages. Every child stage MUST validate that it received the same canonical core manifest key and immutable manifest identity.
+
+No SOS-light child may independently derive a core snapshot day from the current UTC clock, select the newest locally visible core snapshot or refresh the snapshot part-way through the run.
+
+A run that crosses midnight UTC continues to use the snapshot selected when that Integrity invocation began. A missing, contradictory or unavailable pinned identity fails before proposal construction and before deleting any R2 day prefix.
+
+The complete cross-mode behaviour is defined by [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md).
 
 ## Supported source-built pollutants
 
@@ -168,7 +181,7 @@ Other connectors carried from Dropbox do not generate current-state candidates i
 
 Local assembly must complete before the first live R2 mutation.
 
-If connector `1` or the local replacement graph is invalid, the run fails before deleting the day.
+If connector `1`, the pinned core identity or the local replacement graph is invalid, the run fails before deleting the day.
 
 If a live write or post-PUT verification fails after deletion has begun, the run records the highest publication level reached and must be rerun from the beginning. It is not resumed.
 
@@ -183,6 +196,9 @@ Each run records at least:
 - connector `1` as the selected protected connector;
 - source identities and source-enumeration results;
 - chosen Dropbox baseline identity;
+- pinned core snapshot day, canonical manifest key and immutable manifest identity;
+- confirmation that detector, proposal, assembly, apply and final verification used the same pinned core identity;
+- whether the invocation crossed midnight UTC after core-snapshot selection;
 - confirmation that source plus Dropbox were the only assembly authorities;
 - final connector `1` child set per day;
 - final assembled connector set per day;
@@ -196,8 +212,11 @@ Each run records at least:
 
 ## Minimal structural validation
 
-Before operational CIC-Test execution, perform only the smallest targeted checks required by [`sos_light_model.md`](sos_light_model.md), especially:
+Before operational CIC-Test execution, perform only the smallest targeted checks required by [`sos_light_model.md`](sos_light_model.md) and [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md), especially:
 
+- one coordinator-selected core snapshot remaining pinned when a simulated child starts after midnight UTC;
+- every SOS-light child receiving and validating that same core manifest key and immutable identity;
+- missing or contradictory child core identity failing before proposal or R2 deletion;
 - complete-day deletion targeting;
 - no existing live R2 body reads during assembly;
 - source-built O3 appearing in the final connector `1` parent;
