@@ -1,5 +1,6 @@
 import { errorEnvelope } from "../lib/http";
 import { handleDirectCompatRoute } from "../lib/direct";
+import { enrichStorageCoverageResponse } from "../lib/storage_coverage_enrichment";
 import { proxyToUpstream, shouldUseUpstream, type WorkerEnv } from "../lib/upstream";
 
 const GET_ROUTES = new Set([
@@ -62,17 +63,22 @@ export async function handleCompatRoute(
     if (method !== "GET") {
       return errorEnvelope("METHOD_NOT_ALLOWED", "Only GET is supported for this route", 405);
     }
-    if (!useUpstream) {
-      return handleDirectCompatRoute(request, env, pathname);
+
+    const response = !useUpstream
+      ? await handleDirectCompatRoute(request, env, pathname)
+      : await proxyToUpstream(request, env, pathname, {
+          cacheTtlSeconds: GET_ROUTE_CACHE_SECONDS[pathname] ?? 0,
+          staleWhileRevalidateSeconds: 60,
+          bypassCache: shouldBypassCache(request, pathname),
+          ignoredCacheSearchParams: pathname === "/api/dashboard"
+            ? ["t", "ts", "dispatch_cursor"]
+            : undefined,
+        });
+
+    if (pathname === "/api/storage_coverage" || pathname === "/api/dashboard") {
+      return enrichStorageCoverageResponse(response, request, env);
     }
-    return proxyToUpstream(request, env, pathname, {
-      cacheTtlSeconds: GET_ROUTE_CACHE_SECONDS[pathname] ?? 0,
-      staleWhileRevalidateSeconds: 60,
-      bypassCache: shouldBypassCache(request, pathname),
-      ignoredCacheSearchParams: pathname === "/api/dashboard"
-        ? ["t", "ts", "dispatch_cursor"]
-        : undefined,
-    });
+    return response;
   }
 
   if (POST_ROUTES.has(pathname)) {
