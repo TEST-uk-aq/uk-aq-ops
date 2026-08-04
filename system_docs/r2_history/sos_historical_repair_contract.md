@@ -102,6 +102,20 @@ SOS-light MUST:
 4. rebuild affected observation indexes from the Dropbox baseline plus assembled day;
 5. verify changed objects written by the run.
 
+### Complete publication schedule
+
+Because the complete day prefix is deleted before upload, the apply publication schedule MUST contain every object required to reconstruct the final assembled day.
+
+This requirement applies even when an assembled object is byte-for-byte identical to the chosen Dropbox baseline or to the object that existed in live R2 before deletion. In particular:
+
+- every preserved or rebuilt child object required by the assembled day MUST be uploaded;
+- every final connector manifest required by the assembled day MUST be uploaded;
+- exactly one final day manifest MUST be uploaded for each selected day;
+- an unchanged day manifest is still a mandatory upload because deletion removes the existing copy;
+- change detection or unchanged-object deduplication MAY be used for diagnostics and audit, but MUST NOT remove any required assembled-day object from the publication schedule.
+
+Before the first live R2 mutation, validation MUST prove that the final publication schedule is a complete, dependency-ordered representation of the assembled day. It MUST fail closed when a required object is absent, duplicated or ordered before one of its required children.
+
 The old live R2 day is not merged back into the replacement.
 
 ## Dropbox authority for other connectors
@@ -172,6 +186,8 @@ Each run records at least:
 - confirmation that source plus Dropbox were the only assembly authorities;
 - final connector `1` child set per day;
 - final assembled connector set per day;
+- final publication-schedule object count and required-parent count per day;
+- confirmation that unchanged but required assembled-day objects remained scheduled for upload;
 - warnings and omissions for Dropbox-backed other connectors;
 - complete-day deletion and upload counts;
 - changed-object verification results;
@@ -186,6 +202,8 @@ Before operational CIC-Test execution, perform only the smallest targeted checks
 - no existing live R2 body reads during assembly;
 - source-built O3 appearing in the final connector `1` parent;
 - connector `1` parent body and dependency evidence using the same final child set;
+- every required assembled-day object remaining in the publication schedule even when unchanged;
+- exactly one final day manifest being scheduled after all required children;
 - unprotected Dropbox issues remaining warning-only.
 
 Functional validation belongs in the real CIC-Test SOS-light run. Do not add a broad speculative pre-deployment test suite.
