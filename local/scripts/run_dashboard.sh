@@ -63,16 +63,23 @@ config = {
 }
 
 out_path = Path(str(os.getenv("UKAQ_CONFIG_OUT_PATH", "dashboard/assets/config.js")))
-patch_path = Path("dashboard/assets/storage_coverage_patch.js")
-if not patch_path.is_file():
-    raise SystemExit(f"Missing dashboard storage coverage patch: {patch_path}")
+patch_paths = [
+    Path("dashboard/assets/storage_coverage_patch.js"),
+    Path("dashboard/assets/storage_coverage_missing_r2_hotfix.js"),
+]
+for patch_path in patch_paths:
+    if not patch_path.is_file():
+        raise SystemExit(f"Missing dashboard storage coverage patch: {patch_path}")
 
 out_path.parent.mkdir(parents=True, exist_ok=True)
 out_path.write_text(
     "window.UKAQ_OPS_CONFIG = "
     + json.dumps(config, indent=2)
     + ";\n\n"
-    + patch_path.read_text(encoding="utf-8")
+    + "\n\n".join(
+        patch_path.read_text(encoding="utf-8")
+        for patch_path in patch_paths
+    )
     + "\n",
     encoding="utf-8",
 )
