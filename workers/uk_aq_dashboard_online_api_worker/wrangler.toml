@@ -5,12 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 UKAQ_PROXY_ROUTE_PREFIX = "/api"
-UK_AQ_R2_HISTORY_BUCKET = "uk-aq-history-cic-test"
 # DASHBOARD_UPSTREAM_BASE_URL = "https://example.internal"
-
-[[r2_buckets]]
-binding = "R2_HISTORY"
-bucket_name = "uk-aq-history-cic-test"
 
 [[routes]]
 pattern = "__UK_AQ_OPS_ADMIN_HOSTNAME__/api/*"
