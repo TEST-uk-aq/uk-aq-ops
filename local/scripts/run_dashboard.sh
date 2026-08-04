@@ -64,6 +64,7 @@ config = {
 
 out_path = Path(str(os.getenv("UKAQ_CONFIG_OUT_PATH", "dashboard/assets/config.js")))
 patch_paths = [
+    Path("dashboard/assets/dashboard_api_error_patch.js"),
     Path("dashboard/assets/storage_coverage_patch.js"),
     Path("dashboard/assets/storage_coverage_missing_r2_hotfix.js"),
     Path("dashboard/assets/storage_coverage_backup_only_style_patch.js"),
