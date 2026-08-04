@@ -41,7 +41,29 @@ const config = {
       : 300,
 };
 
-const output = `window.UKAQ_OPS_CONFIG = ${JSON.stringify(config, null, 2)};\n`;
+const patchPaths = [
+  "dashboard/assets/dashboard_api_error_patch.js",
+  "dashboard/assets/storage_coverage_patch.js",
+  "dashboard/assets/storage_coverage_missing_r2_hotfix.js",
+  "dashboard/assets/storage_coverage_backup_only_style_patch.js",
+];
+
+for (const patchPath of patchPaths) {
+  if (!fs.existsSync(patchPath)) {
+    throw new Error(`Missing dashboard patch: ${patchPath}`);
+  }
+}
+
+const patchSource = patchPaths
+  .map((patchPath) => fs.readFileSync(patchPath, "utf8").trim())
+  .join("\n\n");
+
+const output = [
+  `window.UKAQ_OPS_CONFIG = ${JSON.stringify(config, null, 2)};`,
+  patchSource,
+  "",
+].join("\n\n");
+
 const absoluteOutPath = path.resolve(process.cwd(), outPath);
 fs.mkdirSync(path.dirname(absoluteOutPath), { recursive: true });
 fs.writeFileSync(absoluteOutPath, output, "utf8");
