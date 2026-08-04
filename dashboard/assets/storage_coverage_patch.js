@@ -9,6 +9,7 @@
       fromDay: null,
       toDay: null,
     },
+    r2RequestToken: 0,
     revision: 0,
     scheduled: false,
   };
@@ -59,12 +60,20 @@
         min-width: 0;
       }
 
+      .coverage-bar-slot.ukaq-storage-slot > .coverage-bar.ukaq-today-bar {
+        width: 50% !important;
+      }
+
       .ukaq-storage-row-split {
         display: flex;
         width: 100%;
         height: 100%;
         min-height: 12px;
         gap: 4px;
+      }
+
+      .ukaq-storage-row-split.ukaq-today-split {
+        width: 50%;
       }
 
       .ukaq-storage-row-split > .coverage-bar {
@@ -78,7 +87,8 @@
         justify-content: center;
       }
 
-      .ukaq-split-dropbox-icon {
+      .ukaq-split-dropbox-icon,
+      .ukaq-today-dropbox-icon {
         display: block;
         width: 15px;
         height: 15px;
@@ -127,6 +137,42 @@
     return match ? match[1] : "";
   }
 
+  function parseDayKey(value) {
+    const key = normaliseDayKey(value);
+    if (!key) return null;
+    const parsed = new Date(`${key}T00:00:00.000Z`);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  function dayKey(value) {
+    return value instanceof Date && !Number.isNaN(value.getTime())
+      ? value.toISOString().slice(0, 10)
+      : "";
+  }
+
+  function addUtcDays(value, count) {
+    const next = new Date(value.getTime());
+    next.setUTCDate(next.getUTCDate() + count);
+    return next;
+  }
+
+  function calendarGridRange(fromDay, toDay) {
+    const from = parseDayKey(fromDay);
+    const to = parseDayKey(toDay);
+    if (!from || !to) return null;
+
+    const fromMondayOffset = (from.getUTCDay() + 6) % 7;
+    const toMondayOffset = (to.getUTCDay() + 6) % 7;
+    return {
+      fromDay: dayKey(addUtcDays(from, -fromMondayOffset)),
+      toDay: dayKey(addUtcDays(to, 6 - toMondayOffset)),
+    };
+  }
+
+  function todayUtcKey() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
   function rowMap(payload) {
     const rows = payload && Array.isArray(payload.storage_coverage_days)
       ? payload.storage_coverage_days
@@ -143,44 +189,100 @@
     const titleKey = normaliseDayKey(title);
     if (titleKey) return titleKey;
 
-    const explicitKey = normaliseDayKey(cell.dataset.date || cell.dataset.day || "");
-    return explicitKey;
+    return normaliseDayKey(cell.dataset.date || cell.dataset.day || "");
   }
 
-  function updateR2CountPresence(payload, url) {
-    if (!payload || !Array.isArray(payload.connectors) || !url) return;
-
-    const grain = String(url.searchParams.get("grain") || "day").toLowerCase();
-    if (grain !== "day") return;
-
+  function presenceFromPayload(payload) {
     const observations = new Set();
     const aqilevels = new Set();
+
+    if (!payload || !Array.isArray(payload.connectors)) {
+      return { observations, aqilevels };
+    }
 
     payload.connectors.forEach((connector) => {
       const buckets = Array.isArray(connector && connector.buckets)
         ? connector.buckets
         : [];
       buckets.forEach((bucket) => {
-        const dayKey = normaliseDayKey(
+        const key = normaliseDayKey(
           bucket && (bucket.bucket_start_day_utc || bucket.day_utc || bucket.bucket_key),
         );
-        if (!dayKey) return;
+        if (!key) return;
 
         if (Number(bucket && bucket.observations_rows || 0) > 0) {
-          observations.add(dayKey);
+          observations.add(key);
         }
         if (Number(bucket && bucket.aqilevels_rows || 0) > 0) {
-          aqilevels.add(dayKey);
+          aqilevels.add(key);
         }
       });
     });
 
+    return { observations, aqilevels };
+  }
+
+  function mergePresence(target, source) {
+    source.observations.forEach((key) => target.observations.add(key));
+    source.aqilevels.forEach((key) => target.aqilevels.add(key));
+  }
+
+  async function fetchAuxiliaryR2Presence(baseUrl, fromDay, toDay, token) {
+    if (!fromDay || !toDay || fromDay > toDay) return;
+
+    const url = new URL(baseUrl.toString());
+    url.searchParams.set("from_day", fromDay);
+    url.searchParams.set("to_day", toDay);
+    url.searchParams.set("grain", "day");
+    url.searchParams.set("t", String(Date.now()));
+
+    try {
+      const response = await originalFetch(url.toString(), { cache: "no-store" });
+      if (!response.ok || token !== state.r2RequestToken) return;
+      const payload = await response.json();
+      if (!payload || typeof payload !== "object" || token !== state.r2RequestToken) return;
+      mergePresence(state.r2CountPresence, presenceFromPayload(payload));
+      state.revision += 1;
+      scheduleEnhancement();
+    } catch (_err) {
+      // The main calendar still uses the normal storage-coverage response.
+    }
+  }
+
+  function updateR2CountPresence(payload, url) {
+    if (!payload || !url) return;
+
+    const grain = String(url.searchParams.get("grain") || "day").toLowerCase();
+    if (grain !== "day") return;
+
+    const fromDay = normaliseDayKey(url.searchParams.get("from_day"));
+    const toDay = normaliseDayKey(url.searchParams.get("to_day"));
+    const token = state.r2RequestToken + 1;
+    state.r2RequestToken = token;
+
+    const mainPresence = presenceFromPayload(payload);
     state.r2CountPresence = {
-      observations,
-      aqilevels,
-      fromDay: normaliseDayKey(url.searchParams.get("from_day")),
-      toDay: normaliseDayKey(url.searchParams.get("to_day")),
+      observations: mainPresence.observations,
+      aqilevels: mainPresence.aqilevels,
+      fromDay,
+      toDay,
     };
+
+    const gridRange = calendarGridRange(fromDay, toDay);
+    if (gridRange) {
+      const parsedFromDay = parseDayKey(fromDay);
+      const parsedToDay = parseDayKey(toDay);
+      if (!parsedFromDay || !parsedToDay) return;
+      const previousDay = dayKey(addUtcDays(parsedFromDay, -1));
+      const nextDay = dayKey(addUtcDays(parsedToDay, 1));
+
+      if (gridRange.fromDay < fromDay) {
+        void fetchAuxiliaryR2Presence(url, gridRange.fromDay, previousDay, token);
+      }
+      if (gridRange.toDay > toDay) {
+        void fetchAuxiliaryR2Presence(url, nextDay, gridRange.toDay, token);
+      }
+    }
   }
 
   function effectiveRow(rawRow, dateKey) {
@@ -202,14 +304,7 @@
   }
 
   function hasR2Observs(row) {
-    return Boolean(
-      row
-      && (
-        row.r2_observs
-        || row.r2
-        || row.dropbox_observs
-      )
-    );
+    return Boolean(row && (row.r2_observs || row.r2 || row.dropbox_observs));
   }
 
   function hasR2Aqilevels(row) {
@@ -274,12 +369,14 @@
     return `<img class="${className}" src="${DROPBOX_ICON_PATH}" alt="" aria-hidden="true">`;
   }
 
-  function renderFullBar(layer) {
-    const title = layer.backup
-      ? `${layer.label} • Dropbox backup`
-      : layer.label;
+  function layerTitle(layer) {
+    return layer.backup ? `${layer.label} • Dropbox backup` : layer.label;
+  }
 
+  function renderFullBar(layer) {
+    const title = layerTitle(layer);
     let labelMarkup = `<span class="coverage-bar-label-primary">${layer.label}</span>`;
+
     if (layer.backupOnly) {
       labelMarkup = `
         <span class="coverage-bar-label-primary with-icon">
@@ -305,10 +402,20 @@
     `;
   }
 
+  function renderCompactBar(layer, className = "") {
+    const title = layerTitle(layer);
+    const icon = layer.backup
+      ? backupIconMarkup("ukaq-today-dropbox-icon")
+      : "";
+    return `
+      <span class="coverage-bar ${layer.className} ${className}" title="${title}" aria-label="${title}">
+        ${icon}
+      </span>
+    `;
+  }
+
   function renderSplitBar(layer) {
-    const title = layer.backup
-      ? `${layer.label} • Dropbox backup`
-      : layer.label;
+    const title = layerTitle(layer);
     const icon = layer.backup
       ? backupIconMarkup("ukaq-split-dropbox-icon")
       : "";
@@ -324,7 +431,7 @@
     if (row && row.ingest) summary.push("IngestDB");
     if (hasObsAqiObservs(row)) summary.push("ObsAQIDB - Obs");
     if (hasR2Observs(row)) {
-      summary.push(row && row.r2_observs || row && row.r2
+      summary.push(row && (row.r2_observs || row.r2)
         ? "R2 History - Obs"
         : "Backup - Obs");
     }
@@ -352,8 +459,24 @@
     });
 
     const layers = buildLayers(row);
+    const isToday = Boolean(row && row.isToday) || dateKey === todayUtcKey();
 
-    if (layers.length === 4) {
+    if (isToday) {
+      if (layers.length === 4) {
+        slots[0].innerHTML = renderCompactBar(layers[0], "ukaq-today-bar");
+        slots[1].innerHTML = renderCompactBar(layers[1], "ukaq-today-bar");
+        slots[2].innerHTML = `
+          <span class="ukaq-storage-row-split ukaq-today-split">
+            ${renderSplitBar(layers[2])}
+            ${renderSplitBar(layers[3])}
+          </span>
+        `;
+      } else {
+        layers.slice(0, 3).forEach((layer, index) => {
+          slots[index].innerHTML = renderCompactBar(layer, "ukaq-today-bar");
+        });
+      }
+    } else if (layers.length === 4) {
       slots[0].innerHTML = renderFullBar(layers[0]);
       slots[1].innerHTML = renderFullBar(layers[1]);
       slots[2].innerHTML = `
@@ -378,7 +501,7 @@
     const grid = cell.querySelector(".coverage-square-grid");
     if (!grid) return;
 
-    if (row && row.isToday) {
+    if ((row && row.isToday) || dateKey === todayUtcKey()) {
       return;
     }
 
@@ -389,9 +512,7 @@
       if (!layer) {
         return '<span class="coverage-square is-empty"></span>';
       }
-      const title = layer.backup
-        ? `${layer.label} • Dropbox backup`
-        : layer.label;
+      const title = layerTitle(layer);
       const icon = layer.backup
         ? backupIconMarkup("ukaq-year-dropbox-icon")
         : "";
@@ -448,8 +569,8 @@
       "Rows: IngestDB (red), ObsAQIDB - Obs (blue), R2 History - Obs (orange), "
       + "then R2 History - AQI (yellow). When all four are present, the orange "
       + "and yellow R2 layers share the third row. A blue Dropbox icon marks a "
-      + "Dropbox copy of the corresponding R2 layer. All bars are full width, "
-      + "including today.";
+      + "Dropbox copy of the corresponding R2 layer. Today uses half-width bars "
+      + "without text.";
   }
 
   function enhanceCoveragePanel() {
