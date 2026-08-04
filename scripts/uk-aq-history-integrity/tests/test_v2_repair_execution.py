@@ -4416,6 +4416,138 @@ class ProposalRunStateTransitionTests(unittest.TestCase):
             "bytes": entry["bytes"],
         }
 
+    def test_sos_light_stages_required_unchanged_complete_day_graph(self) -> None:
+        dropbox = self.root / "dropbox"
+        dropbox.mkdir()
+        run_state = MODULE.create_run_overlay(
+            tmp_dir=self.root / "tmp",
+            run_id="unchanged-complete-day",
+            environment="CIC-Test",
+            base_dropbox_root=dropbox,
+        )
+        day_utc = "2025-01-07"
+        day_prefix = (
+            f"{MODULE.R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
+        )
+        part_key = (
+            f"{day_prefix}/connector_id=1/pollutant_code=pm25/"
+            "part-00000.parquet"
+        )
+        pollutant_key = (
+            f"{day_prefix}/connector_id=1/pollutant_code=pm25/manifest.json"
+        )
+        connector_key = f"{day_prefix}/connector_id=1/manifest.json"
+        day_key = f"{day_prefix}/manifest.json"
+        bodies = {
+            part_key: "PAR1-unchanged-complete-day",
+            pollutant_key: json.dumps({
+                "manifest_kind": "pollutant",
+                "parquet_object_keys": [part_key],
+                "files": [{"key": part_key}],
+            }, separators=(",", ":")),
+            connector_key: json.dumps({
+                "manifest_kind": "connector",
+                "pollutant_manifests": [{"manifest_key": pollutant_key}],
+            }, separators=(",", ":")),
+            day_key: json.dumps({
+                "manifest_kind": "day",
+                "connector_manifests": [{"manifest_key": connector_key}],
+            }, separators=(",", ":")),
+        }
+        dependencies = {
+            part_key: [],
+            pollutant_key: [part_key],
+            connector_key: [pollutant_key],
+            day_key: [connector_key],
+        }
+        identities = {
+            key: {
+                "source": "dropbox",
+                "sha256": hashlib.sha256(body.encode()).hexdigest(),
+                "bytes": len(body.encode()),
+            }
+            for key, body in bodies.items()
+        }
+        proposals = []
+        for key in (part_key, pollutant_key, connector_key, day_key):
+            body_bytes = bodies[key].encode()
+            body_sha256 = hashlib.sha256(body_bytes).hexdigest()
+            proposals.append({
+                "key": key,
+                "kind": (
+                    "observations_data" if key == part_key
+                    else "pollutant_manifest" if key == pollutant_key
+                    else "connector_manifest" if key == connector_key
+                    else "day_manifest"
+                ),
+                "publication_stage": (
+                    "observations_data" if key == part_key
+                    else "pollutant_manifest" if key == pollutant_key
+                    else "connector_manifest" if key == connector_key
+                    else "day_parent"
+                ),
+                "changed": False,
+                "status": "skipped_unchanged",
+                "included_in_write_set": False,
+                "bytes": len(body_bytes),
+                "old_sha256": body_sha256,
+                "new_sha256": body_sha256,
+                "dependencies": dependencies[key],
+                "dependency_identities": {
+                    dependency: identities[dependency]
+                    for dependency in dependencies[key]
+                },
+                "baseline_source": "dropbox",
+                "proposed_body": bodies[key],
+            })
+        MODULE._record_metadata_executor_overlay(
+            run_state=run_state,
+            executor_result={"output": {"planning": {
+                "proposals": proposals,
+                "blocked_scopes": [],
+                "sos_light": {
+                    "validation_status": "validated_local_assembly",
+                    "old_live_r2_observation_bodies_used": False,
+                    "dropbox_warnings": [],
+                    "dropbox_warning_count": 0,
+                    "dropbox_omission_count": 0,
+                    "days": [{
+                        "day_utc": day_utc,
+                        "final_connector_1_child_set": [pollutant_key],
+                    }],
+                },
+            }}},
+            dry_run=False,
+        )
+        MODULE.assemble_sos_light_complete_days(run_state)
+
+        required_keys = [part_key, pollutant_key, connector_key, day_key]
+        self.assertEqual(sorted(run_state["objects"]), sorted(required_keys))
+        self.assertEqual(
+            run_state["proposal_transition_planner_unchanged_keys"],
+            sorted(required_keys),
+        )
+        for key in required_keys:
+            with self.subTest(key=key):
+                entry = run_state["objects"][key]
+                self.assertIs(entry["proposal_changed"], False)
+                self.assertEqual(entry["planner_source"], "dropbox")
+                self.assertTrue(entry["included_in_final_staged_write_set"])
+                self.assertEqual(entry["promotion_reason"], "exact_prefix_replacement")
+                self.assertEqual(entry["final_source"], "planned_overlay")
+        self.assertEqual(
+            run_state["sos_light"]["days"][0]["complete_day_object_keys"],
+            sorted(required_keys),
+        )
+        self.assertEqual(
+            run_state["sos_light"]["days"][0][
+                "required_unchanged_object_keys"
+            ],
+            sorted(required_keys),
+        )
+        transition = MODULE.validate_proposal_run_state_transition(run_state)
+        self.assertEqual(transition["status"], "succeeded")
+
     def _build_production_transition(self) -> tuple[dict, dict[str, str]]:
         dropbox = self.root / "dropbox"
         dropbox.mkdir()
