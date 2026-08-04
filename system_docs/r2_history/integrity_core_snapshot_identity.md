@@ -19,13 +19,39 @@ Where an older document or implementation permits a child stage to select a new 
 
 ## Core invariant
 
-One Integrity invocation MUST use exactly one committed v2 core snapshot identity from initialisation through final reporting.
+At run initialisation, each Integrity invocation MUST select the latest available complete committed v2 core snapshot from the chosen Dropbox baseline.
 
-The top-level Integrity coordinator selects and validates the snapshot once. Every later stage MUST use the exact selected identity supplied by the coordinator.
+That exact snapshot is then pinned for the whole invocation, from initialisation through final reporting. Every later stage MUST use the identity supplied by the top-level coordinator.
 
-A run that begins before midnight UTC and continues after midnight UTC MUST continue using the snapshot selected at run initialisation. Crossing a UTC day, month or year boundary MUST NOT change the core snapshot used by that invocation.
+Integrity MUST NOT require a core snapshot for the current UTC date. If today's snapshot does not yet exist, the latest earlier complete committed snapshot is selected.
 
-A later, separate Integrity invocation MAY select a newer committed core snapshot.
+A run that begins before midnight UTC and continues after midnight UTC MUST continue using the snapshot selected at run initialisation. Crossing a UTC day, month or year boundary MUST NOT trigger another selection.
+
+A later, separate Integrity invocation repeats the same latest-complete selection and may therefore choose a newer snapshot.
+
+## Latest complete selection
+
+Selection is based on snapshots that actually exist in the chosen Dropbox baseline, not on an expected path derived from the current date.
+
+At top-level run initialisation, Integrity MUST:
+
+1. discover the available committed v2 core snapshot candidates;
+2. order candidates by `day_utc` newest first;
+3. validate candidates in that order;
+4. select the first candidate that is complete and structurally valid;
+5. fail the run if no complete committed candidate exists.
+
+A candidate is complete only when:
+
+- its canonical day manifest exists and is readable;
+- the manifest is structurally valid;
+- every required object referenced by the manifest is available in the chosen baseline or combined-local view;
+- the required connector, station, timeseries and observed-property identity inputs can be loaded and structurally validated;
+- any existing immutable manifest identity or hash agrees with the selected bytes.
+
+A newer incomplete, partial or unreadable candidate is not eligible. Integrity MAY continue to the next older candidate, but MUST record the skipped candidate and the reason it was ineligible.
+
+This fallback is only between already available committed core snapshots during top-level selection. It MUST NOT be used later by a child process to replace the pinned snapshot.
 
 ## Exact identity
 
@@ -44,17 +70,15 @@ history/v2/core/day_utc=<core_snapshot_day_utc>/manifest.json
 
 Where an authoritative manifest hash, SHA-256 value or equivalent immutable byte identity is already available, the run-scoped identity MUST also carry and validate it. The implementation MUST NOT invent a weaker synthetic identity when a stronger existing manifest identity is available.
 
-The requested historical observation range is not part of the core-snapshot selector. A repair for an old observation day still uses the one current committed core snapshot selected for that Integrity invocation.
+The requested historical observation range is not part of the core-snapshot selector. A repair for an old observation day still uses the latest complete committed core snapshot selected for that Integrity invocation.
 
 ## Selection and pinning
 
-At top-level run initialisation, Integrity MUST:
+After selecting the latest complete candidate, the top-level coordinator MUST:
 
-1. select one eligible committed v2 core snapshot from the chosen Dropbox baseline;
-2. validate that its manifest and required identity objects are structurally readable;
-3. construct the immutable run-scoped identity;
-4. record that identity before detector or proposal work starts;
-5. make that same identity available to every child process and helper that consumes core data.
+1. construct the immutable run-scoped identity;
+2. record the selected identity and any newer ineligible candidates before detector or proposal work starts;
+3. make that same identity available to every child process and helper that consumes core data.
 
 After this point, no stage may independently perform latest-snapshot discovery or derive a core snapshot day from the current UTC clock.
 
@@ -77,7 +101,7 @@ A child process MUST NOT treat the supplied identity as optional when it reads c
 
 1. require the run-scoped identity;
 2. validate the canonical manifest-key format;
-3. require the manifest to exist in the chosen combined-local or Dropbox-backed view;
+3. require the pinned manifest to exist in the chosen combined-local or Dropbox-backed view;
 4. validate the supplied immutable manifest identity where present;
 5. require exact equality with the coordinator identity recorded for the run;
 6. fail before proposal construction or live R2 mutation when any check fails.
@@ -90,11 +114,11 @@ When Integrity creates a combined-local object view, it MUST expose the exact pi
 
 Every detector, proposal builder and SOS-light assembly stage MUST resolve core objects through that pinned manifest key. A child MUST NOT request a second core day merely because the wall-clock date has advanced.
 
-If the pinned manifest or a required child object is unavailable in the combined-local view, the affected Integrity invocation fails closed. It MUST NOT attempt another core date.
+If the pinned manifest or a required child object is unavailable after selection, the affected Integrity invocation fails closed. It MUST NOT attempt another core date.
 
 ## Mode consistency
 
-Check-only, dry-run and write-enabled modes MUST use the same snapshot-selection and propagation contract.
+Check-only, dry-run and write-enabled modes MUST use the same latest-complete selection and propagation contract.
 
 Changing Integrity mode MUST NOT change the meaning or lifetime of the selected core identity. In particular:
 
@@ -108,10 +132,11 @@ Changing Integrity mode MUST NOT change the meaning or lifetime of the selected 
 
 Integrity MUST fail before proposal construction or live R2 mutation when:
 
+- no complete committed core snapshot is available at run initialisation;
 - no run-scoped core identity was established;
 - a child receives no identity;
 - a child receives an identity different from the coordinator identity;
-- the pinned manifest key is unavailable;
+- the pinned manifest key becomes unavailable;
 - the manifest identity does not match the pinned value;
 - a stage attempts to construct or select a different core snapshot;
 - detector and proposal stages cannot prove they used the same snapshot.
@@ -122,10 +147,12 @@ The error report MUST include the coordinator identity, the child or requested i
 
 Every Integrity JSON report, Markdown summary and main run log MUST record the pinned core snapshot identity, including at least:
 
+- discovered candidate days;
+- any newer ineligible candidates and their rejection reasons;
 - selected core snapshot day;
 - canonical manifest key;
 - immutable manifest hash or equivalent identity where available;
-- selection stage;
+- confirmation that the selected snapshot was the latest complete committed candidate;
 - confirmation that detector, proposal and apply consumers used the same identity;
 - any mismatch or missing-identity failure;
 - whether the invocation crossed midnight UTC after selection.
@@ -134,19 +161,21 @@ For subprocesses, the audit evidence MUST make it possible to correlate the chil
 
 ## Minimal structural validation
 
-Before deployment, perform only the smallest deterministic regression required to validate the process boundary.
+Before deployment, perform only the smallest deterministic regression required to validate selection and the process boundary.
 
 The focused check MUST prove:
 
-1. the coordinator selects a snapshot such as `2026-08-03`;
-2. the simulated clock advances to `2026-08-04` before a child starts;
-3. the child still resolves `history/v2/core/day_utc=2026-08-03/manifest.json`;
-4. no `2026-08-04` core path is constructed for that invocation;
-5. missing or contradictory child identity fails before proposal or apply;
-6. check-only, dry-run and write-enabled modes receive the same run-scoped identity;
-7. a later separate invocation may independently select `2026-08-04` or another newer committed snapshot.
+1. no snapshot exists for the simulated current day;
+2. the coordinator selects the newest earlier complete committed snapshot;
+3. a newer incomplete candidate is skipped and recorded before an older complete candidate is selected;
+4. the simulated clock advances after selection;
+5. the child still resolves the pinned manifest key;
+6. no current-day or newly advanced-day core path is constructed for that invocation;
+7. missing or contradictory child identity fails before proposal or apply;
+8. check-only, dry-run and write-enabled modes receive the same run-scoped identity;
+9. a later separate invocation may independently select a newer snapshot after it becomes complete.
 
-This targeted regression is genuinely required because the fault depends on a long-running process crossing UTC midnight. Do not add a broad speculative pre-deployment test suite.
+This targeted regression is genuinely required because the fault depends on date-derived path selection and long-running processes crossing UTC midnight. Do not add a broad speculative pre-deployment test suite.
 
 ## CIC-Test functional acceptance
 
@@ -154,7 +183,8 @@ After deployment, functional validation occurs through a real CIC-Test Integrity
 
 Acceptance requires:
 
-- one exact core snapshot selected at run initialisation;
+- the latest available complete committed core snapshot selected at run initialisation;
+- no requirement for a current-day snapshot;
 - every child stage reporting the same manifest key and immutable identity;
 - no clock-derived replacement core path after midnight;
 - proposal and apply validation using the pinned snapshot;
