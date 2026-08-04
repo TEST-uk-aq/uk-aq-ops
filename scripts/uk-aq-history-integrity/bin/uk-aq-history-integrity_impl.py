@@ -838,6 +838,49 @@ def _core_manifest_content_hash(manifest: Mapping[str, Any]) -> str:
     ).encode("utf-8")).hexdigest()
 
 
+
+def _core_snapshot_identity_relationship_warnings(
+    validation_conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Return semantic identity anomalies without rejecting a physical snapshot."""
+    relationship_checks = {
+        "station_connector": """
+            SELECT COUNT(*)
+            FROM core_stations_snapshot s
+            LEFT JOIN core_connectors_snapshot c ON c.id = s.connector_id
+            WHERE s.id IS NULL OR s.connector_id IS NULL OR c.id IS NULL
+        """,
+        "timeseries_station_connector_phenomenon": """
+            SELECT COUNT(*)
+            FROM core_timeseries_snapshot t
+            LEFT JOIN core_stations_snapshot s ON s.id = t.station_id
+            LEFT JOIN core_connectors_snapshot c ON c.id = t.connector_id
+            LEFT JOIN core_phenomena_snapshot p ON p.id = t.phenomenon_id
+            WHERE t.id IS NULL OR t.station_id IS NULL
+               OR t.connector_id IS NULL OR t.phenomenon_id IS NULL
+               OR s.id IS NULL OR c.id IS NULL OR p.id IS NULL
+               OR s.connector_id != t.connector_id
+        """,
+        "phenomenon_observed_property_mapping": """
+            SELECT COUNT(*)
+            FROM core_phenomena_snapshot p
+            WHERE p.id IS NULL OR p.connector_id IS NULL
+               OR p.observed_property_id IS NULL
+               OR NOT EXISTS (
+                   SELECT 1
+                   FROM core_observed_property_mappings_snapshot m
+                   WHERE m.connector_id = p.connector_id
+                     AND m.observed_property_id = p.observed_property_id
+               )
+        """,
+    }
+    warnings: list[dict[str, Any]] = []
+    for label, query in relationship_checks.items():
+        count = int(validation_conn.execute(query).fetchone()[0] or 0)
+        if count:
+            warnings.append({"check": label, "row_count": count})
+    return warnings
+
 def _validate_complete_core_snapshot_candidate(
     day_dir: Path,
     *,
@@ -1025,44 +1068,16 @@ def _validate_complete_core_snapshot_candidate(
                     f"validated={validated_tables[table]['row_count']} "
                     f"loaded={loaded_rows}"
                 )
-        orphan_checks = {
-            "station_connector": """
-                SELECT COUNT(*)
-                FROM core_stations_snapshot s
-                LEFT JOIN core_connectors_snapshot c ON c.id = s.connector_id
-                WHERE s.id IS NULL OR s.connector_id IS NULL OR c.id IS NULL
-            """,
-            "timeseries_station_connector_phenomenon": """
-                SELECT COUNT(*)
-                FROM core_timeseries_snapshot t
-                LEFT JOIN core_stations_snapshot s ON s.id = t.station_id
-                LEFT JOIN core_connectors_snapshot c ON c.id = t.connector_id
-                LEFT JOIN core_phenomena_snapshot p ON p.id = t.phenomenon_id
-                WHERE t.id IS NULL OR t.station_id IS NULL
-                   OR t.connector_id IS NULL OR t.phenomenon_id IS NULL
-                   OR s.id IS NULL OR c.id IS NULL OR p.id IS NULL
-                   OR s.connector_id != t.connector_id
-            """,
-            "phenomenon_observed_property_mapping": """
-                SELECT COUNT(*)
-                FROM core_phenomena_snapshot p
-                WHERE p.id IS NULL OR p.connector_id IS NULL
-                   OR p.observed_property_id IS NULL
-                   OR NOT EXISTS (
-                       SELECT 1
-                       FROM core_observed_property_mappings_snapshot m
-                       WHERE m.connector_id = p.connector_id
-                         AND m.observed_property_id = p.observed_property_id
-                   )
-            """,
-        }
-        for label, query in orphan_checks.items():
-            count = int(validation_conn.execute(query).fetchone()[0] or 0)
-            if count:
-                raise ValueError(
-                    f"core snapshot identity relationship is invalid: "
-                    f"check={label}; row_count={count}"
-                )
+        identity_relationship_warnings = (
+            _core_snapshot_identity_relationship_warnings(validation_conn)
+        )
+        for warning in identity_relationship_warnings:
+            log.warning(
+                "core snapshot identity relationship warning check=%s "
+                "row_count=%s; snapshot remains structurally eligible",
+                warning["check"],
+                warning["row_count"],
+            )
         lookup_rows = _build_lookup(validation_conn, log)
         if lookup_rows <= 0:
             raise ValueError(
@@ -1086,6 +1101,7 @@ def _validate_complete_core_snapshot_candidate(
         "snapshot_day_dir": str(day_dir),
         "validated_tables": validated_tables,
         "checksums_sha256": checksums_sha256,
+        "identity_relationship_warnings": identity_relationship_warnings,
     }
 
 
@@ -1139,6 +1155,7 @@ def select_latest_complete_core_snapshot(
             "snapshot_day_dir": validated["snapshot_day_dir"],
             "validated_tables": validated["validated_tables"],
             "checksums_sha256": validated["checksums_sha256"],
+            "identity_relationship_warnings": validated["identity_relationship_warnings"],
             "manifest": manifest,
         }
         log.info(
