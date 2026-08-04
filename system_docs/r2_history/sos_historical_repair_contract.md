@@ -36,9 +36,11 @@ The selected source connector is connector `1` only.
 
 ## Run-scoped core snapshot identity
 
-SOS-light MUST use the one exact committed v2 core snapshot selected by the top-level Integrity coordinator at run initialisation.
+At top-level Integrity run initialisation, SOS-light MUST use the latest available complete committed v2 core snapshot from the chosen Dropbox baseline.
 
-The coordinator-selected identity MUST be passed explicitly to source mapping, detector, proposal, local assembly, apply and final-verification stages. Every child stage MUST validate that it received the same canonical core manifest key and immutable manifest identity.
+A current-day core snapshot is not required. If today's snapshot does not yet exist, the newest earlier complete snapshot is selected. A newer incomplete or unreadable candidate may be skipped in favour of the next older complete candidate, with that decision recorded before proposal work begins.
+
+The selected coordinator identity MUST then be passed explicitly to source mapping, detector, proposal, local assembly, apply and final-verification stages. Every child stage MUST validate that it received the same canonical core manifest key and immutable manifest identity.
 
 No SOS-light child may independently derive a core snapshot day from the current UTC clock, select the newest locally visible core snapshot or refresh the snapshot part-way through the run.
 
@@ -196,6 +198,8 @@ Each run records at least:
 - connector `1` as the selected protected connector;
 - source identities and source-enumeration results;
 - chosen Dropbox baseline identity;
+- discovered core snapshot candidates and any newer ineligible candidates;
+- confirmation that the selected core was the latest available complete committed snapshot;
 - pinned core snapshot day, canonical manifest key and immutable manifest identity;
 - confirmation that detector, proposal, assembly, apply and final verification used the same pinned core identity;
 - whether the invocation crossed midnight UTC after core-snapshot selection;
@@ -214,6 +218,8 @@ Each run records at least:
 
 Before operational CIC-Test execution, perform only the smallest targeted checks required by [`sos_light_model.md`](sos_light_model.md) and [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md), especially:
 
+- no current-day snapshot being required when a complete earlier snapshot exists;
+- a newer incomplete candidate being skipped and recorded before the next older complete candidate is selected;
 - one coordinator-selected core snapshot remaining pinned when a simulated child starts after midnight UTC;
 - every SOS-light child receiving and validating that same core manifest key and immutable identity;
 - missing or contradictory child core identity failing before proposal or R2 deletion;
