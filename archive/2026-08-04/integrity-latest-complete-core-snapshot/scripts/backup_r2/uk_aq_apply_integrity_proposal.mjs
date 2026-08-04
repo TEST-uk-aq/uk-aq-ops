@@ -39,9 +39,6 @@ import {
   parquetRead,
   parquetSchema,
 } from "./lib/uk_aq_parquet_dependencies.mjs";
-import {
-  validateIntegrityCoreSnapshotIdentity,
-} from "./lib/uk_aq_integrity_core_snapshot_identity.mjs";
 
 function parseArgs(argv) {
   const args = { runStateJson: "", writeR2: false };
@@ -2650,12 +2647,7 @@ export async function applySosLightPerDayUnits({
   await publishAffectedIndexes();
 }
 
-export async function applyValidatedProposal({
-  runStatePath,
-  r2,
-  adapters = {},
-  env = process.env,
-}) {
+export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }) {
   const resolvedAdapters = {
     deleteObjects: adapters.deleteObjects || r2DeleteObjects,
     getObject: adapters.getObject || r2GetObject,
@@ -2663,28 +2655,6 @@ export async function applyValidatedProposal({
     putObject: adapters.putObject || r2PutObject,
   };
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
-  let coreSnapshotIdentityValidation;
-  try {
-    coreSnapshotIdentityValidation = validateIntegrityCoreSnapshotIdentity({
-      env,
-      runState,
-      dropboxRoot: runState.base_dropbox_root,
-      stage: "canonical_apply_child",
-    });
-    const consumerAudit = runState.core_snapshot_consumer_audit ||= [];
-    consumerAudit.push(coreSnapshotIdentityValidation);
-  } catch (error) {
-    runState.apply = {
-      status: "failed",
-      current_phase: "core_snapshot_identity_validation",
-      core_snapshot_identity_validation: "failed",
-      r2_mutation_possible: false,
-      error: error instanceof Error ? error.message : String(error),
-      finished_at_utc: new Date().toISOString(),
-    };
-    atomicWriteJson(runStatePath, runState);
-    throw error;
-  }
   const proposal = validateLocalProposal(runState);
   const dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
     runState,
@@ -2780,7 +2750,6 @@ export async function applyValidatedProposal({
   runState.apply = {
     status: "running",
     started_at_utc: new Date().toISOString(),
-    core_snapshot_identity_validation: coreSnapshotIdentityValidation,
     final_proposal_graph_validation: "succeeded",
     publication_schedule_validation: "succeeded",
     publication_schedule: publicationSchedule,

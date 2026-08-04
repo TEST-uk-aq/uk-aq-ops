@@ -430,6 +430,38 @@ function sosLightEvidence(dayUtc = "2026-06-17") {
   };
 }
 
+function installCoreSnapshotIdentity(runState, root) {
+  const dayUtc = "2026-08-03";
+  const manifestHash = "a".repeat(64);
+  const manifestKey = `history/v2/core/day_utc=${dayUtc}/manifest.json`;
+  const manifestBody = Buffer.from(JSON.stringify({
+    day_utc: dayUtc,
+    manifest_hash: manifestHash,
+  }));
+  const manifestPath = path.join(
+    runState.base_dropbox_root,
+    ...manifestKey.split("/"),
+  );
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, manifestBody);
+  const identity = {
+    core_snapshot_day_utc: dayUtc,
+    core_snapshot_manifest_key: manifestKey,
+    core_snapshot_manifest_hash: manifestHash,
+    core_snapshot_manifest_sha256: sha256Hex(manifestBody),
+  };
+  const identityFile = path.join(root, "core-snapshot-identity.json");
+  fs.writeFileSync(identityFile, JSON.stringify(identity));
+  runState.core_snapshot_identity = identity;
+  runState.core_snapshot_consumer_audit = [];
+  return {
+    UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON: JSON.stringify(identity),
+    UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE: identityFile,
+    UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT: runState.base_dropbox_root,
+    UK_AQ_INTEGRITY_INVOCATION: "true",
+  };
+}
+
 async function observationFixture({ wrongManifest = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-integrity-apply-safety-"));
   const overlay = path.join(root, "overlay");
@@ -530,6 +562,7 @@ async function observationFixture({ wrongManifest = false } = {}) {
       repair_pollutants: [pollutantCode],
     }],
   };
+  const integrityEnv = installCoreSnapshotIdentity(runState, root);
   const runStatePath = path.join(root, "run-state.json");
   fs.writeFileSync(runStatePath, JSON.stringify(runState));
   return {
@@ -543,6 +576,7 @@ async function observationFixture({ wrongManifest = false } = {}) {
     rowsPath,
     evidencePath: path.join(evidenceDirectory, "source-evidence.json"),
     storedRows,
+    integrityEnv,
   };
 }
 
@@ -1016,6 +1050,7 @@ test("final proposal graph requires immutable source, staged Parquet and final m
     applyValidatedProposal({
       runStatePath: invalid.runStatePath,
       r2: {},
+      env: invalid.integrityEnv,
       adapters: { deleteObjects: remote, getObject: remote, listAllObjects: remote, putObject: remote },
     }),
     /Final Integrity proposal graph mismatch:.*observation_content_hash/,
@@ -1025,12 +1060,37 @@ test("final proposal graph requires immutable source, staged Parquet and final m
   assert.equal(persisted.final_proposal_graph_validation.status, "failed");
 });
 
+test("canonical apply rejects a missing coordinator core identity before remote mutation", async () => {
+  const fixture = await observationFixture();
+  let remoteCalls = 0;
+  const remote = async () => {
+    remoteCalls += 1;
+    throw new Error("remote adapter must not run");
+  };
+  await assert.rejects(applyValidatedProposal({
+    runStatePath: fixture.runStatePath,
+    r2: {},
+    env: {},
+    adapters: {
+      deleteObjects: remote,
+      getObject: remote,
+      listAllObjects: remote,
+      putObject: remote,
+    },
+  }), /coordinator_identity_missing/);
+  assert.equal(remoteCalls, 0);
+  const persisted = JSON.parse(fs.readFileSync(fixture.runStatePath, "utf8"));
+  assert.equal(persisted.apply.current_phase, "core_snapshot_identity_validation");
+  assert.equal(persisted.apply.r2_mutation_possible, false);
+});
+
 test("full generic two-day apply follows connector groups, day parents, then global parents", async () => {
   const { fixture, second, firstParents, secondParents, globalKey } = await genericTwoDayApplyFixture();
   const remote = createInMemoryApplyAdapters();
   const result = await applyValidatedProposal({
     runStatePath: fixture.runStatePath,
     r2: {},
+    env: fixture.integrityEnv,
     adapters: remote.adapters,
   });
   assert.equal(result.status, "succeeded");
@@ -1064,6 +1124,7 @@ test("full apply accepts an exact unchanged external overlay root without mutati
   const result = await applyValidatedProposal({
     runStatePath: fixture.runStatePath,
     r2: {},
+    env: fixture.integrityEnv,
     adapters: remote.adapters,
   });
   assert.equal(result.status, "succeeded");
@@ -1234,6 +1295,7 @@ async function assertApplyFailsBeforeRemote(fixture, expected) {
   await assert.rejects(applyValidatedProposal({
     runStatePath: fixture.runStatePath,
     r2: {},
+    env: fixture.integrityEnv,
     adapters: { deleteObjects: remote, getObject: remote, listAllObjects: remote, putObject: remote },
   }), expected);
   assert.equal(remoteCalls, 0);
@@ -1556,6 +1618,7 @@ test("SOS-light proposal requires one complete-day tombstone and complete local 
   await assert.rejects(applyValidatedProposal({
     runStatePath: fixture.runStatePath,
     r2: {},
+    env: fixture.integrityEnv,
     adapters: { deleteObjects: remote, getObject: remote, listAllObjects: remote, putObject: remote },
   }), /dependency identity is invalid|manifest_contract/);
   assert.equal(remoteCalls, 0);

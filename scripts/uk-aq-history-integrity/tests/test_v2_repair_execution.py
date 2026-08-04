@@ -6021,6 +6021,126 @@ class ApplyPersistenceTests(unittest.TestCase):
         self.assertIn("history/_index_v2/failed.json", report)
 
 
+class ConnectorObservationTotalsTests(unittest.TestCase):
+    def test_requested_scope_sos_rule_and_completion_gates(self) -> None:
+        before = [
+            {
+                "day_utc": day,
+                "connector_id": connector_id,
+                "pollutant_code": pollutant_code,
+                "row_count": row_count,
+            }
+            for day, connector_id, pollutant_code, row_count in (
+                ("2026-07-01", 1, "pm25", 10),
+                ("2026-07-01", 1, "no2", 20),
+                ("2026-07-02", 1, "pm25", 30),
+                ("2026-07-02", 1, "no2", 40),
+                ("2026-07-01", 2, "pm25", 900),
+                ("2026-07-01", 1, "o3", 800),
+                ("2026-06-30", 1, "pm25", 700),
+            )
+        ]
+        after = [
+            {
+                "day_utc": day,
+                "connector_id": connector_id,
+                "pollutant_code": pollutant_code,
+                "row_count": row_count,
+            }
+            for day, connector_id, pollutant_code, row_count in (
+                ("2026-07-01", 1, "pm25", 11),
+                ("2026-07-01", 1, "no2", 21),
+                ("2026-07-02", 1, "pm25", 31),
+                ("2026-07-02", 1, "no2", 41),
+                ("2026-07-01", 2, "pm25", 901),
+                ("2026-07-01", 1, "o3", 801),
+                ("2026-07-03", 1, "pm25", 701),
+            )
+        ]
+        common = {
+            "run_backfill": True,
+            "dry_run": False,
+            "check_only": False,
+            "selected_connector_ids": [1],
+            "from_day": "2026-07-01",
+            "to_day": "2026-07-02",
+            "repair_pollutants": ["pm25", "no2"],
+            "before_partition_rows": before,
+            "after_partition_rows": after,
+        }
+        generic = MODULE.build_connector_observation_totals(
+            successful_real_repair=True,
+            published_observation_scopes=[{
+                "day_utc": "2026-07-01",
+                "connector_id": 1,
+                "pollutant_codes": ["pm25"],
+            }],
+            sos_light=False,
+            **common,
+        )
+        self.assertEqual(generic, {
+            "1": {
+                "total_observations_before": 100,
+                "total_observations_added": 11,
+                "total_observations_after": 104,
+            }
+        })
+
+        sos = MODULE.build_connector_observation_totals(
+            successful_real_repair=True,
+            sos_light=True,
+            **common,
+        )
+        self.assertEqual(
+            sos["1"]["total_observations_added"],
+            sos["1"]["total_observations_after"],
+        )
+        for mode_override in (
+            {"successful_real_repair": False},
+            {"successful_real_repair": True, "run_backfill": False},
+            {"successful_real_repair": True, "dry_run": True},
+            {"successful_real_repair": True, "check_only": True},
+        ):
+            with self.subTest(mode_override=mode_override):
+                mode_args = {**common, **mode_override}
+                completed = mode_args.pop("successful_real_repair")
+                self.assertEqual(
+                    MODULE.build_connector_observation_totals(
+                        successful_real_repair=completed,
+                        sos_light=False,
+                        **mode_args,
+                    ),
+                    {},
+                )
+        self.assertEqual(
+            MODULE.build_connector_observation_totals(
+                successful_real_repair=True,
+                sos_light=False,
+                **{**common, "after_partition_rows": after[:-4]},
+            ),
+            {},
+        )
+
+        markdown = MODULE.format_summary_md({
+            "env": "CIC-Test",
+            "profile": "manual",
+            "started_at_utc": "2026-07-01T00:00:00Z",
+            "finished_at_utc": "2026-07-01T00:01:00Z",
+            "status": "ok",
+            "source": "sos",
+            "from_day": "2026-07-01",
+            "to_day": "2026-07-02",
+            "dry_run": False,
+            "check_only": False,
+            "run_backfill": True,
+            "db_path": "/tmp/integrity.sqlite",
+            "log_path": "/tmp/integrity.log",
+            "connector_observation_totals": sos,
+        })
+        self.assertIn("## Connector observation totals", markdown)
+        self.assertIn("Total Observs after: 104", markdown)
+
+
 class RepoRootTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
