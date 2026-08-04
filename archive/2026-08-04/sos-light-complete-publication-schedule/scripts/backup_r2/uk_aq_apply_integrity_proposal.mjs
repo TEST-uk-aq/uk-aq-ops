@@ -326,160 +326,6 @@ export function buildFrozenPublicationSchedule({
   return { ...schedule, schedule_sha256: sha256Hex(canonicalPublicationScheduleHashInput(schedule)) };
 }
 
-export function validateSosLightCompletePublicationSchedule({
-  runState,
-  proposal,
-  schedule,
-  selectedDays = [],
-}) {
-  if (schedule?.publication_mode !== "sos_light") {
-    throw new Error("SOS-light complete publication schedule has the wrong mode");
-  }
-  const entries = Array.isArray(schedule.entries) ? schedule.entries : [];
-  const proposalObjects = Array.isArray(proposal?.objects) ? proposal.objects : [];
-  const proposalByKey = new Map(proposalObjects.map((object) => [object.key, object]));
-  const auditDays = new Map((runState?.sos_light?.days || [])
-    .filter((entry) => entry && typeof entry === "object")
-    .map((entry) => [String(entry.day_utc || ""), entry]));
-  const entryKeys = entries.map((entry) => safeKey(entry?.canonical_key));
-  const perDay = [];
-
-  for (const day of [...new Set(selectedDays)].sort()) {
-    const dayPrefix = `history/v2/observations/day_utc=${day}`;
-    const expectedDayParent = `${dayPrefix}/manifest.json`;
-    const relevantDayLevelKeys = entryKeys.filter((key) => {
-      if (!key.startsWith(`${dayPrefix}/`)) return false;
-      return !key.slice(dayPrefix.length + 1).includes("/");
-    });
-    const finalDayParentKeys = entryKeys.filter((key) => key === expectedDayParent);
-    if (finalDayParentKeys.length !== 1) {
-      throw new Error(
-        `SOS-light requires one final assembled day parent: ${day}; `
-        + `actual_count=${finalDayParentKeys.length}; `
-        + `expected_key=${expectedDayParent}; `
-        + `relevant_keys=${JSON.stringify(relevantDayLevelKeys)}`,
-      );
-    }
-  }
-
-  const duplicateKeys = [...new Set(entryKeys.filter((key, index) => entryKeys.indexOf(key) !== index))]
-    .sort(bytewiseKeyCompare);
-  if (duplicateKeys.length) {
-    throw new Error(`SOS-light publication schedule has duplicate canonical object keys: ${JSON.stringify(duplicateKeys)}`);
-  }
-  if (Number(schedule.total_positions) !== entries.length) {
-    throw new Error(
-      `SOS-light publication schedule position count mismatch: `
-      + `declared=${schedule.total_positions}; actual=${entries.length}`,
-    );
-  }
-  const positionByKey = new Map(entries.map((entry) => [
-    safeKey(entry.canonical_key),
-    Number(entry.position),
-  ]));
-
-  for (const day of [...new Set(selectedDays)].sort()) {
-    const dayPrefix = `history/v2/observations/day_utc=${day}`;
-    const dayAudit = auditDays.get(day);
-    const proposedDayKeys = proposalObjects
-      .map((object) => object.key)
-      .filter((key) => key.startsWith(`${dayPrefix}/`))
-      .sort(bytewiseKeyCompare);
-    const declaredDayKeys = Array.isArray(dayAudit?.complete_day_object_keys)
-      ? dayAudit.complete_day_object_keys.map((key) => safeKey(key)).sort(bytewiseKeyCompare)
-      : proposedDayKeys;
-    const duplicateDeclaredKeys = [...new Set(declaredDayKeys
-      .filter((key, index) => declaredDayKeys.indexOf(key) !== index))]
-      .sort(bytewiseKeyCompare);
-    if (duplicateDeclaredKeys.length) {
-      throw new Error(
-        `SOS-light assembled day graph has duplicate canonical object keys: ${day}; `
-        + `keys=${JSON.stringify(duplicateDeclaredKeys)}`,
-      );
-    }
-    if (JSON.stringify(declaredDayKeys) !== JSON.stringify(proposedDayKeys)) {
-      const missingFromProposal = declaredDayKeys.filter((key) => !proposalByKey.has(key));
-      const undeclaredProposalKeys = proposedDayKeys.filter((key) => !declaredDayKeys.includes(key));
-      throw new Error(
-        `SOS-light final proposal differs from the validated assembled day graph: ${day}; `
-        + `missing=${JSON.stringify(missingFromProposal)}; `
-        + `undeclared=${JSON.stringify(undeclaredProposalKeys)}`,
-      );
-    }
-    const scheduledDayKeys = entryKeys
-      .filter((key) => key.startsWith(`${dayPrefix}/`))
-      .sort(bytewiseKeyCompare);
-    if (JSON.stringify(scheduledDayKeys) !== JSON.stringify(declaredDayKeys)) {
-      const missing = declaredDayKeys.filter((key) => !positionByKey.has(key));
-      const extra = scheduledDayKeys.filter((key) => !declaredDayKeys.includes(key));
-      throw new Error(
-        `SOS-light publication schedule is incomplete for assembled day: ${day}; `
-        + `required_count=${declaredDayKeys.length}; scheduled_count=${scheduledDayKeys.length}; `
-        + `missing=${JSON.stringify(missing)}; extra=${JSON.stringify(extra)}`,
-      );
-    }
-    const connectorParentKeys = declaredDayKeys.filter((key) =>
-      /^history\/v2\/observations\/day_utc=\d{4}-\d{2}-\d{2}\/connector_id=[1-9]\d*\/manifest\.json$/.test(key));
-    const connectorOneParent = `${dayPrefix}/connector_id=1/manifest.json`;
-    if (!connectorParentKeys.includes(connectorOneParent)) {
-      throw new Error(`SOS-light publication schedule is missing connector 1 parent: ${day}`);
-    }
-    for (const key of declaredDayKeys) {
-      const object = proposalByKey.get(key);
-      if (!object?.entry?.structurally_validated) {
-        throw new Error(`SOS-light scheduled object is not structurally validated: ${key}`);
-      }
-      const parentPosition = positionByKey.get(key);
-      for (const dependencyKey of object.entry.dependencies || []) {
-        const childPosition = positionByKey.get(dependencyKey);
-        if (!childPosition) {
-          throw new Error(`SOS-light scheduled parent references an unscheduled child: ${key} -> ${dependencyKey}`);
-        }
-        if (childPosition >= parentPosition) {
-          throw new Error(`SOS-light publication dependency order is invalid: ${dependencyKey} -> ${key}`);
-        }
-      }
-    }
-    const requiredUnchangedKeys = Array.isArray(dayAudit?.required_unchanged_object_keys)
-      ? dayAudit.required_unchanged_object_keys.map((key) => safeKey(key)).sort(bytewiseKeyCompare)
-      : declaredDayKeys.filter((key) => {
-        const entry = proposalByKey.get(key)?.entry;
-        return entry?.proposal_changed === false
-          || entry?.planner_changed === false
-          || entry?.promotion_reason === "exact_prefix_replacement";
-      });
-    const missingUnchangedKeys = requiredUnchangedKeys.filter((key) => !positionByKey.has(key));
-    if (missingUnchangedKeys.length) {
-      throw new Error(
-        `SOS-light required unchanged objects are missing from publication schedule: ${day}; `
-        + `keys=${JSON.stringify(missingUnchangedKeys)}`,
-      );
-    }
-    perDay.push({
-      day_utc: day,
-      required_object_count: declaredDayKeys.length,
-      scheduled_object_count: scheduledDayKeys.length,
-      connector_manifest_count: connectorParentKeys.length,
-      final_day_manifest_count: 1,
-      required_unchanged_object_count: requiredUnchangedKeys.length,
-    });
-  }
-
-  return {
-    status: "succeeded",
-    selected_day_count: perDay.length,
-    complete_day_scheduled_object_count: perDay.reduce(
-      (total, day) => total + day.scheduled_object_count,
-      0,
-    ),
-    required_unchanged_object_count: perDay.reduce(
-      (total, day) => total + day.required_unchanged_object_count,
-      0,
-    ),
-    days: perDay,
-  };
-}
-
 export function canonicalMutationEventHashInput(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) {
     throw new Error("Mutation journal event hash input must be an object");
@@ -2549,16 +2395,10 @@ export async function applySosLightPerDayUnits({
     if (deletionOperations.length !== 1) {
       throw new Error(`SOS-light requires one complete-day deletion before upload: ${dayUtc}`);
     }
-    const eligibleDayParents = parentOperations.filter((operation) =>
-      operation.kind === "put" && operation.key === expectedDayParent);
-    if (eligibleDayParents.length !== 1 || parentOperations.length !== 1) {
-      throw new Error(
-        `SOS-light requires one final assembled day parent: ${dayUtc}; `
-        + `actual_count=${eligibleDayParents.length}; `
-        + `day_operation_count=${parentOperations.length}; `
-        + `expected_key=${expectedDayParent}; `
-        + `relevant_keys=${JSON.stringify(parentOperations.map((operation) => operation.key))}`,
-      );
+    if (parentOperations.length !== 1
+      || parentOperations[0].kind !== "put"
+      || parentOperations[0].key !== expectedDayParent) {
+      throw new Error(`SOS-light requires one final assembled day parent: ${dayUtc}`);
     }
     const dayConnectorGroups = Array.from(connectorGroups.values())
       .filter((group) => group.day_utc === dayUtc)
@@ -2689,7 +2529,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       ...proposal.objects.map((entry) => mutationContext(entry.key).day_utc),
     ].filter(Boolean))].sort();
   let publicationSchedule;
-  let sosLightPublicationScheduleValidation = null;
   try {
     publicationSchedule = buildFrozenPublicationSchedule({
       proposal,
@@ -2697,14 +2536,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       publicationMode: dedicatedSosProposal.dedicated ? "sos_light" : "generic",
       runState,
     });
-    if (dedicatedSosProposal.dedicated) {
-      sosLightPublicationScheduleValidation = validateSosLightCompletePublicationSchedule({
-        runState,
-        proposal,
-        schedule: publicationSchedule,
-        selectedDays,
-      });
-    }
   } catch (error) {
     runState.apply = {
       status: "failed",
@@ -2753,8 +2584,6 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     final_proposal_graph_validation: "succeeded",
     publication_schedule_validation: "succeeded",
     publication_schedule: publicationSchedule,
-    sos_light_complete_publication_schedule_validation:
-      sosLightPublicationScheduleValidation,
     dedicated_sos_historical_proposal: dedicatedSosProposal,
     connector_day_publication: {},
     ...counts,

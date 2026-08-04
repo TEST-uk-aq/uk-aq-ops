@@ -26,6 +26,7 @@ import {
   validateDedicatedSosHistoricalProposal,
   validateFinalProposalGraph,
   validateLocalProposal,
+  validateSosLightCompletePublicationSchedule,
   verifyLiveObservationPartition,
 } from "../uk_aq_apply_integrity_proposal.mjs";
 import {
@@ -212,6 +213,124 @@ test("frozen publication schedule preserves day barriers and places a changed la
   assert.deepEqual(schedule.entries.map((entry) => entry.canonical_key), [
     day1Child.key, day1Parent.key, day2Child.key, globalIndex.key, snapshot.key,
   ]);
+});
+
+test("SOS-light complete publication schedule retains required unchanged objects and validates final parents", () => {
+  const dayUtc = "2025-01-07";
+  const dayPrefix = `history/v2/observations/day_utc=${dayUtc}`;
+  const part = graphObject(
+    `${dayPrefix}/connector_id=1/pollutant_code=pm25/part-00000.parquet`,
+    { rows: "unchanged" },
+    { stage: "observations_data" },
+  );
+  const pollutant = graphObject(
+    `${dayPrefix}/connector_id=1/pollutant_code=pm25/manifest.json`,
+    { manifest_kind: "pollutant" },
+    {
+      stage: "pollutant_manifest",
+      dependencies: [part.key],
+      dependencyIdentities: {
+        [part.key]: { source: "planned_overlay", sha256: part.entry.sha256, bytes: part.entry.bytes },
+      },
+    },
+  );
+  const connector = graphObject(
+    `${dayPrefix}/connector_id=1/manifest.json`,
+    { manifest_kind: "connector" },
+    {
+      stage: "connector_manifest",
+      dependencies: [pollutant.key],
+      dependencyIdentities: {
+        [pollutant.key]: { source: "planned_overlay", sha256: pollutant.entry.sha256, bytes: pollutant.entry.bytes },
+      },
+    },
+  );
+  const day = graphObject(
+    `${dayPrefix}/manifest.json`,
+    { manifest_kind: "day" },
+    {
+      stage: "day_parent",
+      dependencies: [connector.key],
+      dependencyIdentities: {
+        [connector.key]: { source: "planned_overlay", sha256: connector.entry.sha256, bytes: connector.entry.bytes },
+      },
+    },
+  );
+  const objects = [day, connector, pollutant, part];
+  for (const object of objects) {
+    Object.assign(object.entry, {
+      structurally_validated: true,
+      proposal_changed: false,
+      planner_changed: false,
+      promotion_reason: "exact_prefix_replacement",
+    });
+  }
+  const requiredKeys = objects.map((object) => object.key).sort();
+  const proposal = { objects };
+  const runState = {
+    objects: Object.fromEntries(objects.map((object) => [object.key, object.entry])),
+    sos_light: {
+      days: [{
+        day_utc: dayUtc,
+        complete_day_object_keys: requiredKeys,
+        required_unchanged_object_keys: requiredKeys,
+      }],
+    },
+  };
+  const schedule = buildFrozenPublicationSchedule({
+    proposal,
+    selectedDays: [dayUtc],
+    publicationMode: "sos_light",
+    runState,
+  });
+  const audit = validateSosLightCompletePublicationSchedule({
+    runState,
+    proposal,
+    schedule,
+    selectedDays: [dayUtc],
+  });
+  assert.deepEqual(schedule.entries.map((entry) => entry.canonical_key), [
+    part.key,
+    pollutant.key,
+    connector.key,
+    day.key,
+  ]);
+  assert.equal(audit.status, "succeeded");
+  assert.equal(audit.complete_day_scheduled_object_count, 4);
+  assert.equal(audit.required_unchanged_object_count, 4);
+  assert.equal(audit.days[0].final_day_manifest_count, 1);
+
+  const missingDayParent = structuredClone(schedule);
+  missingDayParent.entries = missingDayParent.entries.filter((entry) =>
+    entry.canonical_key !== day.key);
+  assert.throws(
+    () => validateSosLightCompletePublicationSchedule({
+      runState, proposal, schedule: missingDayParent, selectedDays: [dayUtc],
+    }),
+    /actual_count=0.*expected_key=.*2025-01-07\/manifest\.json.*relevant_keys=\[\]/,
+  );
+
+  const duplicateDayParent = structuredClone(schedule);
+  duplicateDayParent.entries.push(structuredClone(
+    duplicateDayParent.entries.find((entry) => entry.canonical_key === day.key),
+  ));
+  assert.throws(
+    () => validateSosLightCompletePublicationSchedule({
+      runState, proposal, schedule: duplicateDayParent, selectedDays: [dayUtc],
+    }),
+    /actual_count=2.*relevant_keys=.*manifest\.json/,
+  );
+
+  const missingConnectorParent = structuredClone(schedule);
+  missingConnectorParent.entries = missingConnectorParent.entries.filter((entry) =>
+    entry.canonical_key !== connector.key);
+  missingConnectorParent.total_positions -= 1;
+  assert.throws(
+    () => validateSosLightCompletePublicationSchedule({
+      runState, proposal, schedule: missingConnectorParent, selectedDays: [dayUtc],
+    }),
+    /publication schedule is incomplete.*missing=.*connector_id=1\/manifest\.json/,
+  );
 });
 
 test("frozen execution rejects every dependency identity tamper", async (t) => {

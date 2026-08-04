@@ -19932,20 +19932,8 @@ def _record_metadata_executor_overlay(
     if not isinstance(planning, Mapping):
         return
     sos_light = planning.get("sos_light")
-    sos_light_day_prefixes: tuple[str, ...] = ()
     if isinstance(sos_light, Mapping):
         run_state["sos_light"] = dict(sos_light)
-        sos_light_day_prefixes = tuple(sorted({
-            (
-                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
-                f"day_utc={str(day.get('day_utc') or '')}"
-            )
-            for day in list(sos_light.get("days") or [])
-            if isinstance(day, Mapping)
-            and re.fullmatch(
-                r"\d{4}-\d{2}-\d{2}", str(day.get("day_utc") or "")
-            )
-        }))
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
@@ -19964,39 +19952,14 @@ def _record_metadata_executor_overlay(
         if not object_key:
             continue
         normalized_object_key = _normalise_overlay_object_key(object_key)
-        planner_changed = proposal.get("changed") is True
-        required_sos_light_day_object = any(
-            normalized_object_key.startswith(f"{prefix}/")
-            for prefix in sos_light_day_prefixes
-        )
-        if not planner_changed:
+        if proposal.get("changed") is not True:
             planner_unchanged_keys.add(normalized_object_key)
-            if not required_sos_light_day_object:
-                continue
-        else:
-            planner_unchanged_keys.discard(normalized_object_key)
+            continue
+        planner_unchanged_keys.discard(normalized_object_key)
         if not isinstance(body, str):
             raise ValueError(
-                "required planner proposal body is unavailable: "
-                f"{normalized_object_key}"
+                f"changed planner proposal body is unavailable: {normalized_object_key}"
             )
-        body_bytes = body.encode("utf-8")
-        if required_sos_light_day_object and not planner_changed:
-            old_sha256 = str(proposal.get("old_sha256") or "").strip().lower()
-            new_sha256 = str(proposal.get("new_sha256") or "").strip().lower()
-            declared_bytes = proposal.get("bytes")
-            actual_sha256 = hashlib.sha256(body_bytes).hexdigest()
-            if (
-                old_sha256 != new_sha256
-                or new_sha256 != actual_sha256
-                or not isinstance(declared_bytes, int)
-                or isinstance(declared_bytes, bool)
-                or declared_bytes != len(body_bytes)
-            ):
-                raise ValueError(
-                    "SOS-light unchanged required object identity is invalid: "
-                    f"{normalized_object_key}"
-                )
         with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-proposal-") as temp_dir:
             source = Path(temp_dir) / "generated-object"
             source.write_text(body, encoding="utf-8")
@@ -20016,16 +19979,7 @@ def _record_metadata_executor_overlay(
             )
         snapshot = proposal.get("local_dependency_snapshot")
         staged_entry = _overlay_object_entry(run_state, object_key)
-        staged_entry["changed"] = planner_changed
-        staged_entry["included_in_write_set"] = bool(
-            proposal.get("included_in_write_set", planner_changed)
-        )
-        staged_entry["status"] = str(
-            proposal.get("status") or (
-                "planned" if planner_changed else "skipped_unchanged"
-            )
-        )
-        staged_entry["planner_changed"] = planner_changed
+        staged_entry["planner_changed"] = True
         staged_entry["planner_status"] = str(proposal.get("status") or "planned")
         staged_entry["planner_included_in_write_set"] = bool(
             proposal.get("included_in_write_set", True)
@@ -20041,30 +19995,13 @@ def _record_metadata_executor_overlay(
         }
         if isinstance(snapshot, Mapping):
             staged_entry["local_dependency_snapshot"] = dict(snapshot)
-        if required_sos_light_day_object and not planner_changed:
-            planner_source = str(proposal.get("baseline_source") or "").strip()
-            if planner_source not in PROPOSAL_TRANSITION_EXTERNAL_SOURCES:
-                raise ValueError(
-                    "SOS-light unchanged required object has no pinned external "
-                    f"baseline source: {normalized_object_key}"
-                )
-            staged_entry.update({
-                "proposal_changed": False,
-                "planner_source": planner_source,
-                "baseline_source": planner_source,
-                "included_in_final_staged_write_set": True,
-                "promotion_reason":
-                    FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX,
-                "final_source": "planned_overlay",
-            })
         mark_overlay_structurally_validated(run_state, object_key)
-        if planner_changed:
-            scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
-            record_changed_scope(run_state, scope_set, {
-                "object_key": object_key,
-                "stage": stage,
-                "provenance": proposal.get("provenance") or "repair_generated",
-            })
+        scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
+        record_changed_scope(run_state, scope_set, {
+            "object_key": object_key,
+            "stage": stage,
+            "provenance": proposal.get("provenance") or "repair_generated",
+        })
     run_state["proposal_transition_planner_unchanged_keys"] = sorted(
         planner_unchanged_keys
     )
@@ -20410,7 +20347,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
                 f"SOS-light connector 1 final child-set evidence changed: {day_utc}"
             )
         day["complete_day_upload_count"] = len(day_keys)
-        day["complete_day_object_keys"] = day_keys
         day["complete_day_delete_prefix"] = f"{day_prefix}/"
         total_day_uploads += len(day_keys)
         raw_day.update(day)
@@ -20432,19 +20368,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         for entry in sorted(day_entries, key=lambda value: str(value["day_utc"]))
     ]
     final_provenance = _finalise_staged_write_set_provenance(run_state)
-    forced_republication_keys = set(
-        final_provenance["forced_republication_keys"]
-    )
-    for raw_day in day_entries:
-        complete_day_object_keys = sorted(
-            str(key) for key in list(
-                raw_day.get("complete_day_object_keys") or []
-            )
-        )
-        raw_day["required_unchanged_object_keys"] = [
-            key for key in complete_day_object_keys
-            if key in forced_republication_keys
-        ]
     dropbox_day_warning_count = sum(
         1
         for warning in list(audit.get("dropbox_warnings") or [])
@@ -20471,10 +20394,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         "forced_republication_count": final_provenance[
             "forced_republication_count"
         ],
-        "required_unchanged_publication_count": sum(
-            len(list(entry.get("required_unchanged_object_keys") or []))
-            for entry in day_entries
-        ),
         "dropbox_day_absent_days": sorted(dropbox_day_absent_days),
         "dropbox_day_absent_count": len(dropbox_day_absent_days),
         "dropbox_day_warning_count": dropbox_day_warning_count,
