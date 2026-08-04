@@ -1,6 +1,11 @@
 import worker from "./worker.mjs";
+import { enrichR2HistoryDaysResponse } from "./history_days_enrichment.mjs";
 import { normaliseOptionalAqilevelsCountsPayload } from "./optional_aqilevels.mjs";
 
+const R2_HISTORY_DAYS_PATHS = new Set([
+  "/r2-history-days",
+  "/v1/r2-history-days",
+]);
 const R2_HISTORY_COUNTS_PATHS = new Set([
   "/r2-history-counts",
   "/v1/r2-history-counts",
@@ -42,10 +47,14 @@ export default {
     if (request.method.toUpperCase() !== "GET") {
       return response;
     }
+
     const pathname = new URL(request.url).pathname;
-    if (!R2_HISTORY_COUNTS_PATHS.has(pathname)) {
-      return response;
+    if (R2_HISTORY_DAYS_PATHS.has(pathname)) {
+      return enrichR2HistoryDaysResponse(response, env);
     }
-    return normaliseR2HistoryCountsResponse(response);
+    if (R2_HISTORY_COUNTS_PATHS.has(pathname)) {
+      return normaliseR2HistoryCountsResponse(response);
+    }
+    return response;
   },
 };
