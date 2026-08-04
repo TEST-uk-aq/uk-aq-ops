@@ -17,9 +17,6 @@ import {
 import {
   validateLegacyObservationManifestCompatibilityInputs,
 } from "../../workers/uk_aq_backfill_local/r2_history/metadata_repair_guard.mjs";
-import {
-  validateIntegrityCoreSnapshotIdentity,
-} from "./lib/uk_aq_integrity_core_snapshot_identity.mjs";
 
 function argvValue(argv, flag) {
   const index = argv.indexOf(flag);
@@ -261,21 +258,6 @@ export async function runV2ObservationsRepair(options = {}) {
     argv,
     repairPlan: options.repairPlan || null,
   });
-  const runStatePath = String(
-    env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON || "",
-  ).trim();
-  if (!runStatePath) {
-    throw new Error(
-      "Integrity core snapshot identity validation failed: metadata proposal child has no run-state path",
-    );
-  }
-  const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
-  const coreSnapshotIdentityValidation = validateIntegrityCoreSnapshotIdentity({
-    env,
-    runState,
-    dropboxRoot: env.UK_AQ_R2_HISTORY_DROPBOX_ROOT,
-    stage: "metadata_proposal_child",
-  });
   const inputValidation = validateLegacyObservationManifestCompatibilityInputs({
     env,
     repairPlan,
@@ -311,15 +293,12 @@ export async function runV2ObservationsRepair(options = {}) {
     };
   }
   if (finalised?.ok === true) {
-    const preparedRunStatePath = preparation.run_state_path || runStatePath;
-    if (preparedRunStatePath !== runStatePath) {
-      throw new Error(
-        "Integrity core snapshot identity validation failed: metadata preparation changed the coordinator run-state path",
-      );
-    }
+    const runStatePath = preparation.run_state_path
+      || String(env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON || "");
+    const runState = runStatePath
+      ? JSON.parse(fs.readFileSync(runStatePath, "utf8"))
+      : null;
     validateFinalPlannerProposalGraph(finalised, { runState });
-    finalised.planning.core_snapshot_identity_validation =
-      coreSnapshotIdentityValidation;
   }
   return finalised;
 }

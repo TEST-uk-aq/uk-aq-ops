@@ -267,13 +267,6 @@ type CoreSnapshotManifest = {
   manifest_hash: string | null;
 };
 
-export type IntegrityCoreSnapshotIdentity = {
-  core_snapshot_day_utc: string;
-  core_snapshot_manifest_key: string;
-  core_snapshot_manifest_hash: string;
-  core_snapshot_manifest_sha256: string;
-};
-
 type StationIdsLookup = {
   station_ids: number[];
   source: "station_filter" | "r2_core" | "ingestdb" | "none";
@@ -5798,191 +5791,9 @@ function findCoreTableKey(
   return null;
 }
 
-function parseIntegrityCoreSnapshotIdentityValue(
-  raw: unknown,
-  stage: string,
-): IntegrityCoreSnapshotIdentity {
-  let parsed: unknown = raw;
-  if (typeof raw === "string") {
-    const text = raw.trim();
-    if (!text) {
-      throw new Error(
-        `integrity_core_snapshot_identity_missing stage=${stage}`,
-      );
-    }
-    try {
-      parsed = JSON.parse(text);
-    } catch (error) {
-      throw new Error(
-        `integrity_core_snapshot_identity_json_invalid stage=${stage} error=${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(
-      `integrity_core_snapshot_identity_invalid stage=${stage}`,
-    );
-  }
-  const record = parsed as Record<string, unknown>;
-  const dayUtc = String(record.core_snapshot_day_utc || "").trim();
-  if (!parseIsoDayUtc(dayUtc)) {
-    throw new Error(
-      `integrity_core_snapshot_identity_day_invalid stage=${stage} day=${dayUtc}`,
-    );
-  }
-  const manifestKey = String(
-    record.core_snapshot_manifest_key || "",
-  ).trim();
-  const expectedManifestKey = buildCoreDayManifestKey(dayUtc);
-  if (manifestKey !== expectedManifestKey) {
-    throw new Error(
-      `integrity_core_snapshot_manifest_key_noncanonical stage=${stage} requested=${manifestKey} expected=${expectedManifestKey}`,
-    );
-  }
-  const manifestHash = String(
-    record.core_snapshot_manifest_hash || "",
-  ).trim().toLowerCase();
-  const manifestSha256 = String(
-    record.core_snapshot_manifest_sha256 || "",
-  ).trim().toLowerCase();
-  if (!/^[a-f0-9]{64}$/.test(manifestHash)) {
-    throw new Error(
-      `integrity_core_snapshot_manifest_hash_invalid stage=${stage} value=${manifestHash}`,
-    );
-  }
-  if (!/^[a-f0-9]{64}$/.test(manifestSha256)) {
-    throw new Error(
-      `integrity_core_snapshot_manifest_sha256_invalid stage=${stage} value=${manifestSha256}`,
-    );
-  }
-  return {
-    core_snapshot_day_utc: dayUtc,
-    core_snapshot_manifest_key: manifestKey,
-    core_snapshot_manifest_hash: manifestHash,
-    core_snapshot_manifest_sha256: manifestSha256,
-  };
-}
-
-export function validateIntegrityCoreSnapshotIdentityPayload(args: {
-  coordinatorIdentity: unknown;
-  recordedIdentity: unknown;
-  manifestBody: Uint8Array;
-  stage: string;
-}): IntegrityCoreSnapshotIdentity {
-  const coordinator = parseIntegrityCoreSnapshotIdentityValue(
-    args.coordinatorIdentity,
-    `${args.stage}:coordinator`,
-  );
-  const recorded = parseIntegrityCoreSnapshotIdentityValue(
-    args.recordedIdentity,
-    `${args.stage}:recorded`,
-  );
-  if (JSON.stringify(coordinator) !== JSON.stringify(recorded)) {
-    throw new Error(
-      `integrity_core_snapshot_identity_mismatch stage=${args.stage} coordinator_identity=${JSON.stringify(coordinator)} child_identity=${JSON.stringify(recorded)}`,
-    );
-  }
-  const actualManifestSha256 = sha256Hex(args.manifestBody);
-  if (actualManifestSha256 !== coordinator.core_snapshot_manifest_sha256) {
-    throw new Error(
-      `integrity_core_snapshot_manifest_byte_identity_mismatch stage=${args.stage} key=${coordinator.core_snapshot_manifest_key} expected=${coordinator.core_snapshot_manifest_sha256} actual=${actualManifestSha256}`,
-    );
-  }
-  const manifest = parseCoreSnapshotManifest(
-    new TextDecoder().decode(args.manifestBody),
-    coordinator.core_snapshot_manifest_key,
-  );
-  if (
-    manifest.day_utc !== coordinator.core_snapshot_day_utc ||
-    manifest.manifest_hash !== coordinator.core_snapshot_manifest_hash
-  ) {
-    throw new Error(
-      `integrity_core_snapshot_manifest_identity_mismatch stage=${args.stage} coordinator_identity=${JSON.stringify(coordinator)} manifest_day=${manifest.day_utc} manifest_hash=${manifest.manifest_hash}`,
-    );
-  }
-  return coordinator;
-}
-
-const INTEGRITY_INVOCATION = ["1", "true", "yes", "on"].includes(
-  String(Deno.env.get("UK_AQ_INTEGRITY_INVOCATION") || "").trim()
-    .toLowerCase(),
-);
-const validatedIntegrityCoreSnapshotStages = new Set<string>();
-
-function loadPinnedIntegrityCoreSnapshotManifestInfo(stage: string): {
-  day_utc: string;
-  manifest_key: string;
-  source: "dropbox";
-} {
-  const coordinatorJson = String(
-    Deno.env.get("UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON") || "",
-  ).trim();
-  const identityFile = String(
-    Deno.env.get("UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE") || "",
-  ).trim();
-  const pinnedDropboxRoot = String(
-    Deno.env.get("UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT") || "",
-  ).trim();
-  if (!coordinatorJson || !identityFile || !pinnedDropboxRoot) {
-    throw new Error(
-      `integrity_core_snapshot_identity_missing stage=${stage} coordinator_identity_present=${Boolean(coordinatorJson)} identity_file=${identityFile || "(missing)"} pinned_dropbox_root=${pinnedDropboxRoot || "(missing)"}`,
-    );
-  }
-  if (!fs.existsSync(identityFile)) {
-    throw new Error(
-      `integrity_core_snapshot_identity_file_unavailable stage=${stage} path=${identityFile}`,
-    );
-  }
-  const recordedJson = fs.readFileSync(identityFile, "utf8");
-  const preliminary = parseIntegrityCoreSnapshotIdentityValue(
-    coordinatorJson,
-    `${stage}:coordinator`,
-  );
-  const manifestPath = path.join(
-    pinnedDropboxRoot,
-    preliminary.core_snapshot_manifest_key,
-  );
-  if (!manifestPath || !fs.existsSync(manifestPath)) {
-    throw new Error(
-      `integrity_core_snapshot_pinned_manifest_unavailable stage=${stage} coordinator_identity=${JSON.stringify(preliminary)} local_path=${manifestPath || "(unresolved)"}`,
-    );
-  }
-  const manifestBody = fs.readFileSync(manifestPath);
-  const identity = validateIntegrityCoreSnapshotIdentityPayload({
-    coordinatorIdentity: coordinatorJson,
-    recordedIdentity: recordedJson,
-    manifestBody,
-    stage,
-  });
-  if (!validatedIntegrityCoreSnapshotStages.has(stage)) {
-    validatedIntegrityCoreSnapshotStages.add(stage);
-    logStructured("info", "integrity_core_snapshot_identity_validated", {
-      stage,
-      ...identity,
-      coordinator_identity_match: true,
-      manifest_source: "dropbox",
-      identity_file: identityFile,
-    });
-  }
-  return {
-    day_utc: identity.core_snapshot_day_utc,
-    manifest_key: identity.core_snapshot_manifest_key,
-    source: "dropbox",
-  };
-}
-
 async function findLatestCoreSnapshotManifestInfo(): Promise<
   { day_utc: string; manifest_key: string; source: "dropbox" | "r2" } | null
 > {
-  if (INTEGRITY_INVOCATION) {
-    const stage = String(
-      Deno.env.get("UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE") ||
-        "integrity_core_consumer",
-    ).trim() || "integrity_core_consumer";
-    return loadPinnedIntegrityCoreSnapshotManifestInfo(stage);
-  }
   if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
     return null;
   }
@@ -16881,14 +16692,6 @@ export function assertSharedCanonicalMutationRoute({
 async function main(): Promise<void> {
   const runId = crypto.randomUUID();
   const startedAtMs = Date.now();
-  if (INTEGRITY_PROPOSAL_MODE && !INTEGRITY_INVOCATION) {
-    throw new Error(
-      "integrity_core_snapshot_identity_missing stage=worker_startup proposal_mode=true",
-    );
-  }
-  if (INTEGRITY_INVOCATION) {
-    loadPinnedIntegrityCoreSnapshotManifestInfo("worker_startup");
-  }
   validateRunModeOutputScope();
   assertSharedCanonicalMutationRoute({
     runMode: RUN_MODE,

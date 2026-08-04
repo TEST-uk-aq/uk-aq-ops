@@ -8,6 +8,7 @@ import {
   parseOpenaqCsvObservations,
   parseUkAirFlatFileObservations,
   summarizeAqilevelsPartRows,
+  validateIntegrityCoreSnapshotIdentityPayload,
 } from "./run_job.ts";
 
 const propertyMapping = (sourceLabel: string, code: string, sourceUom = "ug/m3") => ({
@@ -48,6 +49,39 @@ async function testSha256(value: string): Promise<string> {
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 }
+
+Deno.test("Integrity worker keeps the coordinator core snapshot pin after UTC midnight", async () => {
+  const selectedAtUtc = "2026-08-03T23:59:00.000Z";
+  const childStartedAtUtc = "2026-08-04T00:01:00.000Z";
+  const manifestHash = "a".repeat(64);
+  const manifestBody = new TextEncoder().encode(JSON.stringify({
+    day_utc: "2026-08-03",
+    manifest_hash: manifestHash,
+    tables: [],
+  }));
+  const identity = {
+    core_snapshot_day_utc: "2026-08-03",
+    core_snapshot_manifest_key:
+      "history/v2/core/day_utc=2026-08-03/manifest.json",
+    core_snapshot_manifest_hash: manifestHash,
+    core_snapshot_manifest_sha256: await testSha256(
+      new TextDecoder().decode(manifestBody),
+    ),
+  };
+
+  const requested = validateIntegrityCoreSnapshotIdentityPayload({
+    coordinatorIdentity: identity,
+    recordedIdentity: identity,
+    manifestBody,
+    stage: `worker_after_midnight:${selectedAtUtc}:${childStartedAtUtc}`,
+  });
+
+  assertEquals(requested.core_snapshot_day_utc, "2026-08-03");
+  assertEquals(
+    requested.core_snapshot_manifest_key,
+    "history/v2/core/day_utc=2026-08-03/manifest.json",
+  );
+});
 
 Deno.test("v2 SOS bridge snapshot preserves imported mapping identity", async () => {
   const tempDir = await Deno.makeTempDir();

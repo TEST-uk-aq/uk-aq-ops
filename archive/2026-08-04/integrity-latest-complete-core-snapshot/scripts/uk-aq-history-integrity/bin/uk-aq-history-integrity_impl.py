@@ -827,632 +827,29 @@ def validate_v2_core_snapshot_manifest(
     return None
 
 
-def _core_manifest_content_hash(manifest: Mapping[str, Any]) -> str:
-    without_hash = {
-        key: value for key, value in manifest.items() if key != "manifest_hash"
-    }
-    return hashlib.sha256(json.dumps(
-        without_hash,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")).hexdigest()
-
-
-def _validate_complete_core_snapshot_candidate(
-    day_dir: Path,
-    *,
-    expected_prefix: str,
-    log: logging.Logger,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    manifest_path = day_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError(f"core snapshot manifest is missing: {manifest_path}")
-    try:
-        manifest_bytes = manifest_path.read_bytes()
-    except OSError as exc:
-        raise ValueError(
-            f"core snapshot manifest is unreadable: {manifest_path}: {exc}"
-        ) from exc
-    try:
-        manifest = json.loads(manifest_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"core snapshot manifest JSON is invalid: {manifest_path}: {exc}"
-        ) from exc
-    if not isinstance(manifest, dict):
-        raise ValueError(f"core snapshot manifest must be an object: {manifest_path}")
-    validation_error = validate_v2_core_snapshot_manifest(
-        manifest,
-        day_dir=day_dir,
-        expected_prefix=expected_prefix,
-    )
-    if validation_error is not None:
-        raise ValueError(validation_error)
-
-    declared_manifest_hash = str(manifest.get("manifest_hash") or "").strip().lower()
-    actual_manifest_hash = _core_manifest_content_hash(manifest)
-    if not re.fullmatch(r"[a-f0-9]{64}", declared_manifest_hash):
-        raise ValueError("core snapshot manifest_hash is invalid")
-    if declared_manifest_hash != actual_manifest_hash:
-        raise ValueError(
-            "core snapshot manifest_hash mismatch: "
-            f"expected={declared_manifest_hash} actual={actual_manifest_hash}"
-        )
-
-    manifest_entries = [
-        entry for entry in list(manifest.get("tables") or [])
-        if isinstance(entry, Mapping)
-    ]
-    entries = {
-        str(entry.get("table") or ""): entry
-        for entry in manifest_entries
-    }
-    if len(entries) != len(manifest_entries):
-        raise ValueError("core snapshot manifest contains duplicate table identities")
-    expected_checksum_lines: list[str] = []
-    validated_tables: dict[str, dict[str, Any]] = {}
-    for entry in manifest_entries:
-        table = str(entry.get("table") or "")
-        relative_path = str(entry.get("relative_path") or "")
-        table_path = day_dir / relative_path
-        if not table_path.is_file():
-            raise ValueError(f"snapshot file missing: {table_path}")
-        try:
-            compressed = table_path.read_bytes()
-        except OSError as exc:
-            raise ValueError(f"snapshot file unreadable: {table_path}: {exc}") from exc
-        compressed_sha256 = hashlib.sha256(compressed).hexdigest()
-        expected_sha256 = str(entry.get("sha256") or "").strip().lower()
-        if compressed_sha256 != expected_sha256:
-            raise ValueError(
-                f"sha256 mismatch for {table_path}: expected {expected_sha256} "
-                f"got {compressed_sha256}"
-            )
-        declared_compressed_bytes = entry.get("compressed_bytes")
-        if (
-            not isinstance(declared_compressed_bytes, int)
-            or isinstance(declared_compressed_bytes, bool)
-            or declared_compressed_bytes != len(compressed)
-        ):
-            raise ValueError(
-                f"compressed byte count mismatch for {table_path}: "
-                f"expected={declared_compressed_bytes} actual={len(compressed)}"
-            )
-        try:
-            uncompressed = gzip.decompress(compressed)
-        except (OSError, EOFError) as exc:
-            raise ValueError(f"snapshot gzip is invalid: {table_path}: {exc}") from exc
-        declared_uncompressed_bytes = entry.get("uncompressed_bytes")
-        if (
-            not isinstance(declared_uncompressed_bytes, int)
-            or isinstance(declared_uncompressed_bytes, bool)
-            or declared_uncompressed_bytes != len(uncompressed)
-        ):
-            raise ValueError(
-                f"uncompressed byte count mismatch for {table_path}: "
-                f"expected={declared_uncompressed_bytes} actual={len(uncompressed)}"
-            )
-        expected_uncompressed_sha256 = str(
-            entry.get("sha256_uncompressed") or ""
-        ).strip().lower()
-        actual_uncompressed_sha256 = hashlib.sha256(uncompressed).hexdigest()
-        if expected_uncompressed_sha256 != actual_uncompressed_sha256:
-            raise ValueError(
-                f"uncompressed sha256 mismatch for {table_path}: "
-                f"expected={expected_uncompressed_sha256} "
-                f"actual={actual_uncompressed_sha256}"
-            )
-        row_count = 0
-        for line_number, line in enumerate(uncompressed.splitlines(), start=1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError(
-                    f"snapshot row JSON is invalid: {table_path}:{line_number}: {exc}"
-                ) from exc
-            if not isinstance(row, dict):
-                raise ValueError(
-                    f"snapshot row must be an object: {table_path}:{line_number}"
-                )
-            row_count += 1
-        declared_row_count = entry.get("row_count")
-        if (
-            not isinstance(declared_row_count, int)
-            or isinstance(declared_row_count, bool)
-            or declared_row_count != row_count
-        ):
-            raise ValueError(
-                f"snapshot row count mismatch for {table_path}: "
-                f"expected={declared_row_count} actual={row_count}"
-            )
-        if (
-            table in CORE_TABLES_TO_IMPORT
-            and table != "sos_station_timeseries_site_refs"
-            and row_count <= 0
-        ):
-            raise ValueError(
-                f"required core identity table is empty: {table_path}"
-            )
-        expected_checksum_lines.append(f"{compressed_sha256}  {relative_path}")
-        validated_tables[table] = {
-            "row_count": row_count,
-            "sha256": compressed_sha256,
-            "bytes": len(compressed),
-        }
-
-    checksums = manifest.get("checksums")
-    if not isinstance(checksums, Mapping):
-        raise ValueError("core snapshot checksums identity is missing")
-    day_utc = day_dir.name.removeprefix("day_utc=")
-    expected_checksums_key = (
-        f"{expected_prefix}/day_utc={day_utc}/checksums.sha256"
-    )
-    if checksums.get("key") != expected_checksums_key:
-        raise ValueError(
-            f"core snapshot checksums key must be {expected_checksums_key}"
-        )
-    if checksums.get("algorithm") != "sha256":
-        raise ValueError("core snapshot checksums algorithm must be sha256")
-    checksums_path = day_dir / "checksums.sha256"
-    if not checksums_path.is_file():
-        raise ValueError(f"snapshot file missing: {checksums_path}")
-    checksums_bytes = checksums_path.read_bytes()
-    checksums_sha256 = hashlib.sha256(checksums_bytes).hexdigest()
-    if checksums_sha256 != str(checksums.get("sha256") or "").strip().lower():
-        raise ValueError(f"core snapshot checksums hash mismatch: {checksums_path}")
-    expected_checksums_bytes = (
-        "\n".join(expected_checksum_lines) + "\n"
-    ).encode("utf-8")
-    if checksums_bytes != expected_checksums_bytes:
-        raise ValueError(
-            f"core snapshot checksums content mismatch: {checksums_path}"
-        )
-
-    validation_conn = open_db(":memory:")
-    try:
-        for table in CORE_TABLES_TO_IMPORT:
-            loaded_rows, _bytes_read = _verify_and_load_table(
-                validation_conn,
-                day_dir,
-                dict(entries[table]),
-                log,
-            )
-            if loaded_rows != validated_tables[table]["row_count"]:
-                raise ValueError(
-                    f"core snapshot loaded row count changed for table={table}: "
-                    f"validated={validated_tables[table]['row_count']} "
-                    f"loaded={loaded_rows}"
-                )
-        orphan_checks = {
-            "station_connector": """
-                SELECT COUNT(*)
-                FROM core_stations_snapshot s
-                LEFT JOIN core_connectors_snapshot c ON c.id = s.connector_id
-                WHERE s.id IS NULL OR s.connector_id IS NULL OR c.id IS NULL
-            """,
-            "timeseries_station_connector_phenomenon": """
-                SELECT COUNT(*)
-                FROM core_timeseries_snapshot t
-                LEFT JOIN core_stations_snapshot s ON s.id = t.station_id
-                LEFT JOIN core_connectors_snapshot c ON c.id = t.connector_id
-                LEFT JOIN core_phenomena_snapshot p ON p.id = t.phenomenon_id
-                WHERE t.id IS NULL OR t.station_id IS NULL
-                   OR t.connector_id IS NULL OR t.phenomenon_id IS NULL
-                   OR s.id IS NULL OR c.id IS NULL OR p.id IS NULL
-                   OR s.connector_id != t.connector_id
-            """,
-            "phenomenon_observed_property_mapping": """
-                SELECT COUNT(*)
-                FROM core_phenomena_snapshot p
-                WHERE p.id IS NULL OR p.connector_id IS NULL
-                   OR p.observed_property_id IS NULL
-                   OR NOT EXISTS (
-                       SELECT 1
-                       FROM core_observed_property_mappings_snapshot m
-                       WHERE m.connector_id = p.connector_id
-                         AND m.observed_property_id = p.observed_property_id
-                   )
-            """,
-        }
-        for label, query in orphan_checks.items():
-            count = int(validation_conn.execute(query).fetchone()[0] or 0)
-            if count:
-                raise ValueError(
-                    f"core snapshot identity relationship is invalid: "
-                    f"check={label}; row_count={count}"
-                )
-        lookup_rows = _build_lookup(validation_conn, log)
-        if lookup_rows <= 0:
-            raise ValueError(
-                "core snapshot connector/station/timeseries identity lookup is empty"
-            )
-    finally:
-        validation_conn.close()
-
-    identity = {
-        "core_snapshot_day_utc": day_utc,
-        "core_snapshot_manifest_key": (
-            f"{expected_prefix}/day_utc={day_utc}/manifest.json"
-        ),
-        "core_snapshot_manifest_hash": declared_manifest_hash,
-        "core_snapshot_manifest_sha256": hashlib.sha256(
-            manifest_bytes
-        ).hexdigest(),
-    }
-    return manifest, {
-        "identity": identity,
-        "snapshot_day_dir": str(day_dir),
-        "validated_tables": validated_tables,
-        "checksums_sha256": checksums_sha256,
-    }
-
-
-def select_latest_complete_core_snapshot(
-    root: Path,
-    log: logging.Logger,
-    *,
-    expected_prefix: str = CURRENT_INTEGRITY_CORE_PREFIX,
-    selected_at_utc: str | None = None,
-) -> dict[str, Any]:
-    """Select the newest actually present complete committed v2 core snapshot."""
-    candidate_dirs = list_snapshot_day_dirs(root)
-    candidate_days = [
-        day_dir.name.removeprefix("day_utc=") for day_dir in candidate_dirs
-    ]
-    skipped_candidates: list[dict[str, str]] = []
-    for day_dir in candidate_dirs:
-        day_utc = day_dir.name.removeprefix("day_utc=")
-        manifest_key = (
-            f"{expected_prefix}/day_utc={day_utc}/manifest.json"
-        )
-        try:
-            manifest, validated = _validate_complete_core_snapshot_candidate(
-                day_dir,
-                expected_prefix=expected_prefix,
-                log=log,
-            )
-        except (OSError, TypeError, ValueError) as exc:
-            reason = str(exc)
-            skipped_candidates.append({
-                "day_utc": day_utc,
-                "manifest_key": manifest_key,
-                "reason": reason,
-            })
-            log.warning(
-                "core snapshot candidate skipped day=%s manifest_key=%s reason=%s",
-                day_utc,
-                manifest_key,
-                reason,
-            )
-            continue
-        selected_at = selected_at_utc or fmt_iso(utc_now())
-        selection = {
-            "status": "selected",
-            "selection_policy": "latest_complete_committed_dropbox_snapshot",
-            "selected_at_utc": selected_at,
-            "candidate_days": candidate_days,
-            "skipped_candidates": skipped_candidates,
-            "selected_is_latest_complete_committed_candidate": True,
-            "identity": validated["identity"],
-            "snapshot_day_dir": validated["snapshot_day_dir"],
-            "validated_tables": validated["validated_tables"],
-            "checksums_sha256": validated["checksums_sha256"],
-            "manifest": manifest,
-        }
-        log.info(
-            "core snapshot selected policy=%s day=%s manifest_key=%s "
-            "manifest_hash=%s manifest_sha256=%s skipped_newer=%s",
-            selection["selection_policy"],
-            day_utc,
-            validated["identity"]["core_snapshot_manifest_key"],
-            validated["identity"]["core_snapshot_manifest_hash"],
-            validated["identity"]["core_snapshot_manifest_sha256"],
-            len(skipped_candidates),
-        )
-        return selection
-    raise ValueError(
-        "no complete committed v2 core snapshot exists under "
-        f"{root}; candidate_days={json.dumps(candidate_days)}; "
-        f"skipped_candidates={json.dumps(skipped_candidates, sort_keys=True)}"
-    )
-
-
-def _normalise_core_snapshot_identity(
-    identity: Mapping[str, Any] | None,
-    *,
-    stage: str,
-) -> dict[str, str]:
-    if not isinstance(identity, Mapping):
-        raise ValueError(
-            f"core snapshot identity is required: stage={stage}; requested_identity=null"
-        )
-    day_utc = str(identity.get("core_snapshot_day_utc") or "").strip()
-    try:
-        dt.date.fromisoformat(day_utc)
-    except ValueError as exc:
-        raise ValueError(
-            f"core snapshot identity day is invalid: stage={stage}; day={day_utc!r}"
-        ) from exc
-    manifest_key = str(
-        identity.get("core_snapshot_manifest_key") or ""
-    ).strip()
-    expected_key = (
-        f"{CURRENT_INTEGRITY_CORE_PREFIX}/day_utc={day_utc}/manifest.json"
-    )
-    if manifest_key != expected_key:
-        raise ValueError(
-            "core snapshot manifest key is not canonical: "
-            f"stage={stage}; requested={manifest_key!r}; expected={expected_key!r}"
-        )
-    normalised = {
-        "core_snapshot_day_utc": day_utc,
-        "core_snapshot_manifest_key": manifest_key,
-        "core_snapshot_manifest_hash": str(
-            identity.get("core_snapshot_manifest_hash") or ""
-        ).strip().lower(),
-        "core_snapshot_manifest_sha256": str(
-            identity.get("core_snapshot_manifest_sha256") or ""
-        ).strip().lower(),
-    }
-    for field in (
-        "core_snapshot_manifest_hash",
-        "core_snapshot_manifest_sha256",
-    ):
-        if not re.fullmatch(r"[a-f0-9]{64}", normalised[field]):
-            raise ValueError(
-                f"core snapshot immutable identity is invalid: stage={stage}; "
-                f"field={field}; value={normalised[field]!r}"
-            )
-    return normalised
-
-
-def validate_pinned_core_snapshot_identity(
-    *,
-    coordinator_identity: Mapping[str, Any] | None,
-    requested_identity: Mapping[str, Any] | None,
-    snapshot_root: Path,
-    stage: str,
-) -> dict[str, Any]:
-    coordinator = _normalise_core_snapshot_identity(
-        coordinator_identity,
-        stage=f"{stage}:coordinator",
-    )
-    requested = _normalise_core_snapshot_identity(
-        requested_identity,
-        stage=f"{stage}:requested",
-    )
-    if requested != coordinator:
-        raise ValueError(
-            "core snapshot identity mismatch: "
-            f"stage={stage}; coordinator_identity="
-            f"{json.dumps(coordinator, sort_keys=True)}; requested_identity="
-            f"{json.dumps(requested, sort_keys=True)}"
-        )
-    relative_manifest = Path(*requested["core_snapshot_manifest_key"].split("/"))
-    manifest_path = snapshot_root.parents[2] / relative_manifest
-    expected_root_manifest = (
-        snapshot_root
-        / f"day_utc={requested['core_snapshot_day_utc']}"
-        / "manifest.json"
-    )
-    if manifest_path.resolve(strict=False) != expected_root_manifest.resolve(strict=False):
-        raise ValueError(
-            "core snapshot pinned path does not resolve under coordinator root: "
-            f"stage={stage}; manifest_path={manifest_path}; "
-            f"expected_path={expected_root_manifest}"
-        )
-    if not manifest_path.is_file():
-        raise ValueError(
-            "pinned core snapshot manifest is unavailable: "
-            f"stage={stage}; coordinator_identity="
-            f"{json.dumps(coordinator, sort_keys=True)}; path={manifest_path}"
-        )
-    manifest_bytes = manifest_path.read_bytes()
-    actual_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-    if actual_sha256 != requested["core_snapshot_manifest_sha256"]:
-        raise ValueError(
-            "pinned core snapshot manifest byte identity mismatch: "
-            f"stage={stage}; expected={requested['core_snapshot_manifest_sha256']}; "
-            f"actual={actual_sha256}; key={requested['core_snapshot_manifest_key']}"
-        )
-    try:
-        manifest = json.loads(manifest_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"pinned core snapshot manifest JSON is invalid: stage={stage}; {exc}"
-        ) from exc
-    if (
-        not isinstance(manifest, Mapping)
-        or manifest.get("day_utc") != requested["core_snapshot_day_utc"]
-        or str(manifest.get("manifest_hash") or "").strip().lower()
-        != requested["core_snapshot_manifest_hash"]
-    ):
-        raise ValueError(
-            "pinned core snapshot manifest identity fields mismatch: "
-            f"stage={stage}; coordinator_identity="
-            f"{json.dumps(coordinator, sort_keys=True)}"
-        )
-    return {
-        "status": "validated",
-        "stage": stage,
-        **requested,
-        "manifest_path": str(manifest_path),
-        "coordinator_identity_match": True,
-    }
-
-
-def write_core_snapshot_identity_file(
-    path: Path,
-    identity: Mapping[str, Any],
-) -> None:
-    normalised = _normalise_core_snapshot_identity(
-        identity,
-        stage="coordinator_identity_file",
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(normalised, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-
-
-def core_snapshot_child_environment(
-    *,
-    identity: Mapping[str, Any],
-    identity_file: Path,
-    snapshot_root: Path,
-    mode: str,
-    stage: str,
-) -> dict[str, str]:
-    normalised = _normalise_core_snapshot_identity(
-        identity,
-        stage=f"{stage}:child_environment",
-    )
-    if not identity_file.is_file():
-        raise ValueError(
-            f"coordinator core snapshot identity file is unavailable: {identity_file}"
-        )
-    try:
-        recorded = json.loads(identity_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"coordinator core snapshot identity file is invalid: {identity_file}: {exc}"
-        ) from exc
-    if _normalise_core_snapshot_identity(
-        recorded,
-        stage=f"{stage}:recorded_identity",
-    ) != normalised:
-        raise ValueError(
-            "coordinator core snapshot identity file mismatch: "
-            f"stage={stage}; file={identity_file}"
-        )
-    return {
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON": json.dumps(
-            normalised,
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE": str(identity_file),
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT": str(
-            snapshot_root.parents[2]
-        ),
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE": stage,
-        "UK_AQ_INTEGRITY_EFFECTIVE_MODE": str(mode),
-        "UK_AQ_INTEGRITY_INVOCATION": "true",
-    }
-
-
-def validate_run_state_core_snapshot_identity(
-    run_state: dict[str, Any],
-    *,
-    stage: str,
-) -> dict[str, Any]:
-    """Fail closed unless a child consumes the coordinator's exact snapshot."""
-    coordinator_json = os.environ.get(
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON", ""
-    ).strip()
-    identity_file_raw = os.environ.get(
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE", ""
-    ).strip()
-    coordinator_dropbox_root_raw = os.environ.get(
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT", ""
-    ).strip()
-    if (
-        not coordinator_json
-        or not identity_file_raw
-        or not coordinator_dropbox_root_raw
-    ):
-        raise ValueError(
-            "core snapshot coordinator identity is unavailable: "
-            f"stage={stage}; identity_json_present={bool(coordinator_json)}; "
-            f"identity_file={identity_file_raw or None}; "
-            f"dropbox_root={coordinator_dropbox_root_raw or None}"
-        )
-    try:
-        coordinator = json.loads(coordinator_json)
-        identity_file = Path(identity_file_raw)
-        recorded = json.loads(identity_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            "core snapshot coordinator identity record is invalid: "
-            f"stage={stage}; identity_file={identity_file_raw}; error={exc}"
-        ) from exc
-    coordinator_normalised = _normalise_core_snapshot_identity(
-        coordinator,
-        stage=f"{stage}:coordinator_environment",
-    )
-    recorded_normalised = _normalise_core_snapshot_identity(
-        recorded,
-        stage=f"{stage}:coordinator_file",
-    )
-    if recorded_normalised != coordinator_normalised:
-        raise ValueError(
-            "core snapshot coordinator environment/file identity mismatch: "
-            f"stage={stage}; coordinator_identity="
-            f"{json.dumps(coordinator_normalised, sort_keys=True)}; "
-            f"recorded_identity={json.dumps(recorded_normalised, sort_keys=True)}"
-        )
-    run_state_dropbox_root = Path(
-        str(run_state.get("base_dropbox_root") or "")
-    ).resolve(strict=False)
-    coordinator_dropbox_root = Path(
-        coordinator_dropbox_root_raw
-    ).resolve(strict=False)
-    if coordinator_dropbox_root != run_state_dropbox_root:
-        raise ValueError(
-            "core snapshot Dropbox baseline mismatch: "
-            f"stage={stage}; coordinator_root={coordinator_dropbox_root}; "
-            f"run_state_root={run_state_dropbox_root}"
-        )
-    snapshot_root = run_state_dropbox_root / CURRENT_INTEGRITY_CORE_PREFIX
-    audit = validate_pinned_core_snapshot_identity(
-        coordinator_identity=coordinator_normalised,
-        requested_identity=run_state.get("core_snapshot_identity"),
-        snapshot_root=snapshot_root,
-        stage=stage,
-    )
-    audit["identity_file"] = str(identity_file)
-    consumer_audit = run_state.setdefault("core_snapshot_consumer_audit", [])
-    if not isinstance(consumer_audit, list):
-        raise ValueError(
-            f"core snapshot consumer audit is invalid: stage={stage}"
-        )
-    if not any(
-        isinstance(entry, Mapping)
-        and entry.get("stage") == stage
-        and all(
-            entry.get(field) == audit.get(field)
-            for field in (
-                "core_snapshot_day_utc",
-                "core_snapshot_manifest_key",
-                "core_snapshot_manifest_hash",
-                "core_snapshot_manifest_sha256",
-            )
-        )
-        for entry in consumer_audit
-    ):
-        consumer_audit.append(audit)
-    return audit
-
-
 def find_latest_snapshot(
     root: Path,
     log: logging.Logger,
     *,
     expected_prefix: str = CURRENT_INTEGRITY_CORE_PREFIX,
 ) -> tuple[Path, dict[str, Any]] | None:
-    """Compatibility view of the authoritative latest-complete selector."""
-    try:
-        selection = select_latest_complete_core_snapshot(
-            root,
-            log,
+    """Find the newest v2 core day whose manifest matches the writer layout."""
+    candidates = list_snapshot_day_dirs(root)
+    for day_dir in candidates:
+        manifest = read_manifest(day_dir)
+        if manifest is None:
+            log.warning("snapshot %s: missing or invalid manifest.json — skipping", day_dir.name)
+            continue
+        validation_error = validate_v2_core_snapshot_manifest(
+            manifest,
+            day_dir=day_dir,
             expected_prefix=expected_prefix,
         )
-    except ValueError:
-        return None
-    return Path(str(selection["snapshot_day_dir"])), dict(selection["manifest"])
+        if validation_error is not None:
+            log.warning("snapshot %s: invalid v2 core manifest: %s", day_dir.name, validation_error)
+            continue
+        return day_dir, manifest
+    return None
 
 
 def latest_successful_import(
@@ -1893,11 +1290,13 @@ def classify_core_snapshot_status(
     history_version: str,
     expected_day: str | None,
 ) -> str:
-    del expected_day
     version = str(history_version or "v1").strip().lower()
     status = str(snapshot_result.get("status") or "")
     if version == "v2" and status in {"missing_root", "no_snapshot"}:
         return "v2_core_snapshot_missing"
+    day = str(snapshot_result.get("snapshot_day_utc") or "").strip()
+    if version == "v2" and status in {"imported", "reused", "dry_run"} and expected_day and day and day < expected_day:
+        return "v2_core_snapshot_stale"
     if status in {"imported", "reused", "dry_run"}:
         return "ok"
     if status in {"missing_root", "no_snapshot"}:
@@ -1946,7 +1345,6 @@ def import_core_snapshot(
     force: bool,
     dry_run: bool,
     log: logging.Logger,
-    selected_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Full Phase 2 import workflow. Always returns a result dict; the caller
     uses `status` to decide how to surface this in the run summary.
@@ -1965,9 +1363,6 @@ def import_core_snapshot(
         "snapshot_day_dir": None,
         "snapshot_day_utc": None,
         "manifest_hash": None,
-        "manifest_sha256": None,
-        "core_snapshot_identity": None,
-        "core_snapshot_selection": None,
         "previous_manifest_hash": None,
         "tables": {},
         "rows_lookup": 0,
@@ -1992,35 +1387,19 @@ def import_core_snapshot(
         log.warning("snapshot import skipped: %s", result["error"])
         return result
 
-    try:
-        selection = (
-            dict(selected_snapshot)
-            if isinstance(selected_snapshot, Mapping)
-            else select_latest_complete_core_snapshot(snapshot_root, log)
-        )
-    except ValueError as exc:
+    found = find_latest_snapshot(snapshot_root, log)
+    if found is None:
         result["status"] = "no_snapshot"
-        result["error"] = str(exc)
+        result["error"] = f"no valid snapshot manifest under {snapshot_root}"
         log.warning("snapshot import: %s", result["error"])
         return result
-    day_dir = Path(str(selection["snapshot_day_dir"]))
-    manifest = dict(selection["manifest"])
-    identity = _normalise_core_snapshot_identity(
-        selection.get("identity"),
-        stage="coordinator_import_selection",
-    )
+
+    day_dir, manifest = found
     manifest_hash = manifest["manifest_hash"]
     day_utc = manifest["day_utc"]
     result["snapshot_day_dir"] = str(day_dir)
     result["snapshot_day_utc"] = day_utc
     result["manifest_hash"] = manifest_hash
-    result["manifest_sha256"] = identity["core_snapshot_manifest_sha256"]
-    result["core_snapshot_identity"] = identity
-    result["core_snapshot_selection"] = {
-        key: value
-        for key, value in selection.items()
-        if key != "manifest"
-    }
     bridge_entry = next(
         entry
         for entry in manifest["tables"]
@@ -5416,8 +4795,7 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "source_connector_day_first_error": None,
                 "backfill_run_status": None,
                 "source_acquisition_pending_days": [],
-                "first_value_at_reconciliation": None,
-                "core_snapshot_identity_validations": []}
+                "first_value_at_reconciliation": None}
     if len(results) == 1:
         return results[0]
     ranked = sorted(
@@ -5482,56 +4860,7 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             for r in results
             if r.get("first_value_at_reconciliation")
         ), None),
-        "core_snapshot_identity_validations": [
-            validation
-            for result in results
-            for validation in (
-                result.get("core_snapshot_identity_validations") or []
-            )
-        ],
     }
-
-
-def _record_backfill_core_snapshot_identity_audits(
-    run_state: dict[str, Any],
-    result: Mapping[str, Any],
-    *,
-    stage: str,
-) -> None:
-    validations = list(result.get("core_snapshot_identity_validations") or [])
-    if result.get("status") == "ok" and not validations:
-        raise ValueError(
-            "successful Integrity backfill child did not report core snapshot "
-            f"identity validation: stage={stage}"
-        )
-    expected = _normalise_core_snapshot_identity(
-        run_state.get("core_snapshot_identity"),
-        stage=f"{stage}:run_state",
-    )
-    consumer_audit = run_state.setdefault("core_snapshot_consumer_audit", [])
-    if not isinstance(consumer_audit, list):
-        raise ValueError("core snapshot consumer audit is invalid")
-    for validation in validations:
-        actual = _normalise_core_snapshot_identity(
-            validation if isinstance(validation, Mapping) else None,
-            stage=f"{stage}:worker_event",
-        )
-        if (
-            actual != expected
-            or not isinstance(validation, Mapping)
-            or validation.get("coordinator_identity_match") is not True
-        ):
-            raise ValueError(
-                "Integrity backfill child core snapshot identity mismatch: "
-                f"stage={stage}; expected={json.dumps(expected, sort_keys=True)}; "
-                f"actual={json.dumps(actual, sort_keys=True)}"
-            )
-        consumer_audit.append({
-            **dict(validation),
-            "stage": str(validation.get("stage") or stage),
-            "status": "validated",
-            "worker_invocation": stage,
-        })
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -5652,7 +4981,6 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
         "backfill_run_status": None,
         "source_acquisition_pending_days": [],
         "first_value_at_reconciliation": None,
-        "core_snapshot_identity_validations": [],
     }
     source_timeseries_row_counts: dict[int, int] = {}
     source_pollutant_codes: set[str] = set()
@@ -5667,20 +4995,6 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
         if not isinstance(event, dict):
             continue
         event_name = event.get("event")
-        if event_name == "integrity_core_snapshot_identity_validated":
-            status["core_snapshot_identity_validations"].append({
-                key: event.get(key)
-                for key in (
-                    "stage",
-                    "core_snapshot_day_utc",
-                    "core_snapshot_manifest_key",
-                    "core_snapshot_manifest_hash",
-                    "core_snapshot_manifest_sha256",
-                    "coordinator_identity_match",
-                    "manifest_source",
-                )
-            })
-            continue
         try:
             timeseries_id = int(event.get("timeseries_id"))
         except (TypeError, ValueError):
@@ -5830,28 +5144,11 @@ def run_narrow_backfill(
         return result
 
     sub_env: dict[str, str] = {**os.environ}
-    protected_core_snapshot_environment = {
-        key: value
-        for key in (
-            "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON",
-            "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE",
-            "UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT",
-            "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
-            "UK_AQ_INTEGRITY_INVOCATION",
-        )
-        if (value := os.environ.get(key)) is not None
-    }
     internal_scope_keys = (
         "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS",
         "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE",
         "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT",
         "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_RUN_ID",
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON",
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE",
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT",
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE",
-        "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
-        "UK_AQ_INTEGRITY_INVOCATION",
     )
     for key in internal_scope_keys:
         sub_env.pop(key, None)
@@ -5907,10 +5204,6 @@ def run_narrow_backfill(
         for key, value in extra_env.items():
             if key and value is not None:
                 sub_env[str(key)] = str(value)
-    sub_env.update(protected_core_snapshot_environment)
-    sub_env["UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE"] = (
-        log_label or "integrity_backfill_child"
-    )
     # Reuse integrity OpenAQ local source-cache as the backfill mirror root
     # unless backfill-specific mirror root is already explicitly set.
     integrity_cache_root = (
@@ -5948,16 +5241,6 @@ def run_narrow_backfill(
     wrapper_name = Path(wrapper_path).name
     cmd = ["bash", wrapper_path]
     if wrapper_name == "uk_aq_integrity_backfill.sh":
-        for required_identity_key in (
-            "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON",
-            "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE",
-        ):
-            if not str(sub_env.get(required_identity_key) or "").strip():
-                raise ValueError(
-                    "Integrity backfill child core snapshot identity is "
-                    f"required: stage={sub_env['UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE']}; "
-                    f"missing={required_identity_key}"
-                )
         cmd = [
             "bash",
             wrapper_path,
@@ -9688,23 +8971,7 @@ def resolve_v2_source_scope(
 ) -> tuple[set[int] | None, dict[str, Any]]:
     source = str(source_filter or "all").strip() or "all"
     if source == "all":
-        rows = conn.execute(
-            """
-            SELECT DISTINCT connector_id
-            FROM source_station_timeseries_lookup
-            WHERE connector_id IS NOT NULL
-            ORDER BY connector_id
-            """
-        ).fetchall()
-        connector_ids = sorted({
-            int(row[0]) for row in rows
-            if row[0] is not None and int(row[0]) > 0
-        })
-        return None, {
-            "source": "all",
-            "connector_ids": connector_ids,
-            "scope": "all",
-        }
+        return None, {"source": "all", "connector_ids": None, "scope": "all"}
     rows = conn.execute(
         """
         SELECT DISTINCT connector_id
@@ -12275,8 +11542,6 @@ def run_v2_observations_integrity_checks(
     allowed_real_roots: Iterable[Path] = (),
     verified_first_value_at_scope_sink: list[dict[str, Any]] | None = None,
     dedicated_sos_historical_replacement: bool = False,
-    observation_total_connector_ids: Iterable[int] | None = None,
-    observation_total_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     if not r2_history_root:
         raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
@@ -12293,25 +11558,6 @@ def run_v2_observations_integrity_checks(
     connector_day_source_evidence: dict[
         tuple[str, int], dict[str, dict[str, Any]]
     ] = {}
-    selected_date_values = _selected_dates_or_range(
-        from_day, to_day, selected_days
-    )
-    total_connector_ids = sorted({
-        int(value)
-        for value in (observation_total_connector_ids or [])
-        if int(value) > 0
-    })
-    total_pollutants = _normalise_repair_pollutants(
-        observation_total_pollutants
-    )
-    connector_observation_partition_rows: dict[
-        tuple[str, int, str], int
-    ] = {
-        (day.isoformat(), connector_id, pollutant_code): 0
-        for day in selected_date_values
-        for connector_id in total_connector_ids
-        for pollutant_code in total_pollutants
-    }
     checked = 0
     verified_first_value_at_minima: dict[
         tuple[str, int],
@@ -12403,7 +11649,7 @@ def run_v2_observations_integrity_checks(
         except Exception:
             gaps.append(_v2_obs_gap("latest_index_invalid_json", expected_path=latest_key))
 
-    for day in selected_date_values:
+    for day in _selected_dates_or_range(from_day, to_day, selected_days):
         day_utc = day.isoformat()
         day_rel = f"{data_prefix}/day_utc={day_utc}"
         day_dir = root / day_rel
@@ -12611,19 +11857,6 @@ def run_v2_observations_integrity_checks(
                     parquet_files=local_parquets,
                 )
                 parquet_readable = parquet_stats is not None and parquet_error is None and bool(local_parquets)
-                partition_total_key = (
-                    day_utc,
-                    int(connector_id_for_source or 0),
-                    pollutant,
-                )
-                if (
-                    partition_total_key in connector_observation_partition_rows
-                    and parquet_stats is not None
-                    and parquet_error is None
-                ):
-                    connector_observation_partition_rows[partition_total_key] = int(
-                        parquet_stats.get("row_count") or 0
-                    )
                 if (
                     parquet_readable
                     and source_partition_evidence is not None
@@ -12979,17 +12212,6 @@ def run_v2_observations_integrity_checks(
             "blocked_scopes": blocked_first_value_at_scopes,
         },
         "repair_plan": build_v2_repair_plan(observation_gaps=gaps, conn=conn),
-        "connector_observation_partition_rows": [
-            {
-                "day_utc": day_utc,
-                "connector_id": connector_id,
-                "pollutant_code": pollutant_code,
-                "row_count": row_count,
-            }
-            for (
-                day_utc, connector_id, pollutant_code
-            ), row_count in sorted(connector_observation_partition_rows.items())
-        ],
     }
     if source_scope is not None:
         result["source_scope"] = source_scope
@@ -14106,8 +13328,6 @@ def run_v2_post_repair_integrity_rechecks(
     log: logging.Logger,
     selected_days: Iterable[str] | None = None,
     allowed_real_roots: Iterable[Path] = (),
-    observation_total_connector_ids: Iterable[int] | None = None,
-    observation_total_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Re-run v2 integrity checks after repairs so final status reflects reality."""
     post_obs = run_v2_observations_integrity_checks(
@@ -14122,8 +13342,6 @@ def run_v2_post_repair_integrity_rechecks(
         source_scope=source_scope,
         log=log,
         allowed_real_roots=allowed_real_roots,
-        observation_total_connector_ids=observation_total_connector_ids,
-        observation_total_pollutants=observation_total_pollutants,
     )
     post_aqi = run_v2_aqilevels_integrity_checks(
         r2_history_root=r2_history_root,
@@ -16561,22 +15779,9 @@ def run_aqi_rebuild_backfill(
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE": str(
-            log_label or f"aqi_day_{iso}_connector_{connector_id or 'all'}"
-        ),
     })
     if extra_env:
         sub_env.update({str(key): str(value) for key, value in extra_env.items()})
-    for protected_key in (
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON",
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE",
-        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT",
-        "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
-        "UK_AQ_INTEGRITY_INVOCATION",
-    ):
-        protected_value = os.environ.get(protected_key)
-        if protected_value is not None:
-            sub_env[protected_key] = protected_value
     if connector_id is not None and int(connector_id) > 0:
         sub_env["UK_AQ_BACKFILL_CONNECTOR_IDS"] = str(int(connector_id))
     else:
@@ -16646,7 +15851,6 @@ def run_aqi_rebuild_backfill(
 
     result["stdout_tail"] = _tail_bytes(stdout_text)
     result["stderr_tail"] = _tail_bytes(stderr_text)
-    result.update(_extract_source_to_r2_observation_status(stdout_text))
 
     if log_dir is not None and (stdout_text or stderr_text or result["status"]):
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -17517,135 +16721,6 @@ def _normalise_repair_pollutants(values: Iterable[Any] | None) -> list[str]:
     if invalid:
         raise ValueError(f"unsupported repair pollutant(s): {','.join(invalid)}")
     return normalized
-
-
-def _scoped_observation_partition_rows(
-    entries: Iterable[Mapping[str, Any]] | None,
-    *,
-    connector_ids: set[int],
-    from_day: str,
-    to_day: str,
-    pollutants: set[str],
-) -> dict[tuple[str, int, str], int]:
-    scoped: dict[tuple[str, int, str], int] = {}
-    for entry in entries or []:
-        if not isinstance(entry, Mapping):
-            continue
-        day_utc = str(entry.get("day_utc") or "").strip()
-        pollutant_code = str(
-            entry.get("pollutant_code") or ""
-        ).strip().lower()
-        try:
-            connector_id = int(entry.get("connector_id"))
-        except (TypeError, ValueError):
-            continue
-        row_count = _manifest_exact_nonnegative_int(entry.get("row_count"))
-        if (
-            connector_id not in connector_ids
-            or pollutant_code not in pollutants
-            or not (from_day <= day_utc <= to_day)
-            or row_count is None
-        ):
-            continue
-        key = (day_utc, connector_id, pollutant_code)
-        if key in scoped and scoped[key] != row_count:
-            raise ValueError(
-                "conflicting connector observation partition counts: "
-                f"{day_utc}/connector_id={connector_id}/"
-                f"pollutant_code={pollutant_code}"
-            )
-        scoped[key] = row_count
-    return scoped
-
-
-def build_connector_observation_totals(
-    *,
-    successful_real_repair: bool,
-    run_backfill: bool,
-    dry_run: bool,
-    check_only: bool,
-    selected_connector_ids: Iterable[int] | None,
-    from_day: str,
-    to_day: str,
-    repair_pollutants: Iterable[str] | None,
-    before_partition_rows: Iterable[Mapping[str, Any]] | None,
-    after_partition_rows: Iterable[Mapping[str, Any]] | None,
-    published_observation_scopes: Iterable[Mapping[str, Any]] | None = None,
-    sos_light: bool = False,
-) -> dict[str, dict[str, int]]:
-    """Aggregate completed connector totals from retained partition evidence."""
-    if (
-        not successful_real_repair
-        or not run_backfill
-        or dry_run
-        or check_only
-    ):
-        return {}
-    connector_ids = {
-        int(value)
-        for value in (selected_connector_ids or [])
-        if int(value) > 0
-    }
-    pollutants = set(_normalise_repair_pollutants(repair_pollutants))
-    if not connector_ids or not pollutants:
-        return {}
-    selected_days = _date_range_inclusive(from_day, to_day)
-    requested_keys = {
-        (day.isoformat(), connector_id, pollutant_code)
-        for day in selected_days
-        for connector_id in connector_ids
-        for pollutant_code in pollutants
-    }
-    before = _scoped_observation_partition_rows(
-        before_partition_rows,
-        connector_ids=connector_ids,
-        from_day=from_day,
-        to_day=to_day,
-        pollutants=pollutants,
-    )
-    after = _scoped_observation_partition_rows(
-        after_partition_rows,
-        connector_ids=connector_ids,
-        from_day=from_day,
-        to_day=to_day,
-        pollutants=pollutants,
-    )
-    if set(before) != requested_keys or set(after) != requested_keys:
-        return {}
-
-    published_keys: set[tuple[str, int, str]] = set()
-    for scope in published_observation_scopes or []:
-        if not isinstance(scope, Mapping):
-            continue
-        day_utc = str(scope.get("day_utc") or "").strip()
-        try:
-            connector_id = int(scope.get("connector_id"))
-        except (TypeError, ValueError):
-            continue
-        for raw_pollutant in list(scope.get("pollutant_codes") or []):
-            pollutant_code = str(raw_pollutant or "").strip().lower()
-            key = (day_utc, connector_id, pollutant_code)
-            if key in requested_keys:
-                published_keys.add(key)
-
-    totals: dict[str, dict[str, int]] = {}
-    for connector_id in sorted(connector_ids):
-        connector_keys = {
-            key for key in requested_keys if key[1] == connector_id
-        }
-        total_after = sum(after[key] for key in connector_keys)
-        totals[str(connector_id)] = {
-            "total_observations_before": sum(
-                before[key] for key in connector_keys
-            ),
-            "total_observations_added": (
-                total_after
-                if sos_light
-                else sum(after[key] for key in connector_keys & published_keys)
-            ),
-            "total_observations_after": total_after,
-        }
-    return totals
 
 
 def build_dedicated_sos_selected_partitions(
@@ -19077,11 +18152,6 @@ def run_v2_gap_backfills(
             complete_connector_day=True,
             repair_pollutants=selected_pollutants,
         )
-        _record_backfill_core_snapshot_identity_audits(
-            run_state,
-            acquisition_result,
-            stage="sos_source_acquisition_worker",
-        )
         if acquisition_result.get("status") != "ok":
             raise RuntimeError(
                 "dedicated_sos_source_acquisition_failed:"
@@ -19326,14 +18396,6 @@ def run_v2_gap_backfills(
                 complete_connector_day=True,
                 repair_pollutants=selected_repair_pollutants,
             )
-            if run_state is not None:
-                _record_backfill_core_snapshot_identity_audits(
-                    run_state,
-                    detector_result,
-                    stage=(
-                        f"detector_worker:{day_iso}:connector={connector_id}"
-                    ),
-                )
             if detector_result.get("status") != "ok":
                 worker_error = str(
                     detector_result.get("source_connector_day_first_error")
@@ -19483,15 +18545,6 @@ def run_v2_gap_backfills(
                 complete_connector_day=True,
                 repair_pollutants=selected_repair_pollutants,
             )
-            if run_state is not None:
-                _record_backfill_core_snapshot_identity_audits(
-                    run_state,
-                    bf,
-                    stage=(
-                        f"proposal_worker:{day_iso}:connector={connector_id}:"
-                        f"chunk={chunk_index}"
-                    ),
-                )
             chunk_results.append(bf)
             metrics["v2_observation_repairs_attempted"] += 1
             metrics["observation_backfills_attempted"] += 1
@@ -20271,9 +19324,6 @@ def run_aqi_rebuild_queue_execution(
             "error": error_text,
             "log_path": bf.get("log_path"),
             "post_rebuild_validation_gaps": post_validation_gaps,
-            "core_snapshot_identity_validations": list(
-                bf.get("core_snapshot_identity_validations") or []
-            ),
         })
 
     metrics["aqi_rebuild_ran"] = True
@@ -20881,14 +19931,6 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning") if isinstance(output, Mapping) else None
     if not isinstance(planning, Mapping):
         return
-    core_identity_audit = planning.get("core_snapshot_identity_validation")
-    if isinstance(core_identity_audit, Mapping):
-        consumer_audit = run_state.setdefault(
-            "core_snapshot_consumer_audit", []
-        )
-        if not isinstance(consumer_audit, list):
-            raise ValueError("core snapshot consumer audit is invalid")
-        consumer_audit.append(dict(core_identity_audit))
     sos_light = planning.get("sos_light")
     sos_light_day_prefixes: tuple[str, ...] = ()
     if isinstance(sos_light, Mapping):
@@ -21143,47 +20185,8 @@ def _finalise_staged_write_set_provenance(
     return audit
 
 
-def _validated_observation_pollutant_manifest_row_count(
-    payload: Any,
-    *,
-    day_utc: str,
-    connector_id: int,
-    pollutant_code: str,
-    manifest_key: str,
-) -> int:
-    """Return an already-loaded canonical pollutant-manifest row count."""
-    if not isinstance(payload, Mapping):
-        raise ValueError(
-            f"observation pollutant manifest is invalid: {manifest_key}"
-        )
-    expected = {
-        "manifest_kind": "pollutant",
-        "history_version": "v2",
-        "domain": "observations",
-        "day_utc": day_utc,
-        "connector_id": str(int(connector_id)),
-        "pollutant_code": pollutant_code,
-        "manifest_key": manifest_key,
-    }
-    mismatches = [
-        field for field, value in expected.items()
-        if field not in payload or str(payload.get(field)) != str(value)
-    ]
-    row_count = _manifest_declared_row_count(payload)
-    if mismatches or row_count is None:
-        raise ValueError(
-            "observation pollutant manifest count evidence is invalid: "
-            f"{manifest_key}; fields={','.join(mismatches) or 'row_count'}"
-        )
-    return row_count
-
-
 def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any]:
     """Materialise the source-plus-Dropbox day proposal, then select full-day deletion."""
-    validate_run_state_core_snapshot_identity(
-        run_state,
-        stage="sos_light_final_assembly",
-    )
     audit = run_state.get("sos_light")
     if not isinstance(audit, dict) or audit.get("validation_status") != "validated_local_assembly":
         raise ValueError("SOS-light local assembly audit is unavailable or invalid")
@@ -21202,11 +20205,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
     objects = run_state.get("objects")
     if not isinstance(objects, dict):
         raise ValueError("SOS-light overlay objects mapping is unavailable")
-    requested_pollutants = _normalise_repair_pollutants(
-        run_state.get("requested_repair_pollutants")
-    )
-    baseline_partition_rows: dict[tuple[str, int, str], int] = {}
-    final_partition_rows: dict[tuple[str, int, str], int] = {}
 
     def preserve_or_resolve_staged_identities(
         *, parent_key: str, references: Iterable[str],
@@ -21250,16 +20248,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
             raise ValueError(f"SOS-light day identity is invalid: {day_utc!r}")
         day_prefix = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
         baseline_day = dropbox_root / day_prefix
-        requested_baseline_manifest_keys = {
-            (
-                f"{day_prefix}/connector_id=1/"
-                f"pollutant_code={pollutant_code}/manifest.json"
-            ): pollutant_code
-            for pollutant_code in requested_pollutants
-        }
-        for pollutant_code in requested_pollutants:
-            baseline_partition_rows[(day_utc, 1, pollutant_code)] = 0
-            final_partition_rows[(day_utc, 1, pollutant_code)] = 0
         dropbox_day_present = baseline_day.is_dir()
         day["dropbox_day_present"] = dropbox_day_present
         day["dropbox_day_absent"] = not dropbox_day_present
@@ -21298,20 +20286,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
             else []
         ):
             object_key = source.relative_to(dropbox_root).as_posix()
-            baseline_pollutant = requested_baseline_manifest_keys.get(
-                object_key
-            )
-            if baseline_pollutant is not None:
-                baseline_payload = json.loads(source.read_text(encoding="utf-8"))
-                baseline_partition_rows[
-                    (day_utc, 1, baseline_pollutant)
-                ] = _validated_observation_pollutant_manifest_row_count(
-                    baseline_payload,
-                    day_utc=day_utc,
-                    connector_id=1,
-                    pollutant_code=baseline_pollutant,
-                    manifest_key=object_key,
-                )
             if object_key in objects:
                 continue
             if any(object_key.startswith(f"{prefix}/") for prefix in old_prefixes):
@@ -21362,25 +20336,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
             manifest_kind = str(payload.get("manifest_kind") or "")
             if manifest_kind == "pollutant":
                 entry["stage"] = "pollutant_manifest"
-                pollutant_match = re.fullmatch(
-                    re.escape(f"{day_prefix}/connector_id=1/")
-                    + r"pollutant_code=([a-z0-9_]+)/manifest\.json",
-                    object_key,
-                )
-                if (
-                    pollutant_match is not None
-                    and pollutant_match.group(1) in requested_pollutants
-                ):
-                    pollutant_code = pollutant_match.group(1)
-                    final_partition_rows[
-                        (day_utc, 1, pollutant_code)
-                    ] = _validated_observation_pollutant_manifest_row_count(
-                        payload,
-                        day_utc=day_utc,
-                        connector_id=1,
-                        pollutant_code=pollutant_code,
-                        manifest_key=object_key,
-                    )
             elif manifest_kind == "connector":
                 entry["stage"] = "connector_manifest"
             elif manifest_kind == "day":
@@ -21513,28 +20468,6 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         "complete_day_count": len(day_entries),
         "complete_day_upload_count": total_day_uploads,
         "complete_day_deletion_count": len(day_entries),
-        "connector_observation_partition_rows_before": [
-            {
-                "day_utc": day_utc,
-                "connector_id": connector_id,
-                "pollutant_code": pollutant_code,
-                "row_count": row_count,
-            }
-            for (
-                day_utc, connector_id, pollutant_code
-            ), row_count in sorted(baseline_partition_rows.items())
-        ],
-        "connector_observation_partition_rows_after": [
-            {
-                "day_utc": day_utc,
-                "connector_id": connector_id,
-                "pollutant_code": pollutant_code,
-                "row_count": row_count,
-            }
-            for (
-                day_utc, connector_id, pollutant_code
-            ), row_count in sorted(final_partition_rows.items())
-        ],
         "forced_republication_count": final_provenance[
             "forced_republication_count"
         ],
@@ -23004,13 +21937,8 @@ def run_v2_final_verification(
     log: logging.Logger,
     selected_days: Iterable[str] | None = None,
     require_remote_state: bool = True,
-    repair_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """One read-only final pass over source cache and final local objects."""
-    validate_run_state_core_snapshot_identity(
-        run_state,
-        stage="final_verification",
-    )
     view_root = _create_final_verification_view(
         run_state, config=config, from_day=from_day, to_day=to_day,
         selected_days=selected_days,
@@ -23032,12 +21960,6 @@ def run_v2_final_verification(
             Path(str(run_state["overlay_root"])),
             Path(str(run_state["base_dropbox_root"])),
         ),
-        observation_total_connector_ids=(
-            (source_scope.get("connector_ids") or allowed_connector_ids or [])
-            if isinstance(source_scope, Mapping)
-            else (allowed_connector_ids or [])
-        ),
-        observation_total_pollutants=repair_pollutants,
     )
     remaining_scopes: list[dict[str, Any]] = []
     try:
@@ -23792,30 +22714,6 @@ def run_canonical_apply_executor(
     env: Mapping[str, str],
     log: logging.Logger,
 ) -> dict[str, Any]:
-    try:
-        validate_run_state_core_snapshot_identity(
-            run_state,
-            stage="canonical_apply_coordinator",
-        )
-    except (OSError, TypeError, ValueError) as exc:
-        error = str(exc)
-        run_state["proposal_transition_validation"] = {
-            "status": "failed",
-            "stage": "core_snapshot_identity_validation",
-            "error": error,
-            "node_apply_launch_permitted": False,
-            "r2_mutation_possible": False,
-            "validated_at_utc": fmt_iso(utc_now()),
-        }
-        write_run_state(run_state)
-        log.error("%s", error)
-        return {
-            "status": "failed",
-            "reason": "core_snapshot_identity_validation_failed",
-            "error": error,
-            "node_apply_launched": False,
-            "r2_mutation_possible": False,
-        }
     try:
         transition_validation = validate_proposal_run_state_transition(run_state)
     except (OSError, TypeError, ValueError) as exc:
@@ -25689,11 +24587,6 @@ def run_v2_integrity_repair_flow(
     protected_connector_ids: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Build one canonical local proposal, then optionally apply and verify it."""
-    validate_run_state_core_snapshot_identity(
-        run_state,
-        stage="proposal_coordinator",
-    )
-    write_run_state(run_state)
     explicit_selected_partitions: list[dict[str, Any]] | None = None
     if dedicated_sos_historical_replacement:
         if dry_run:
@@ -25981,29 +24874,6 @@ def run_v2_integrity_repair_flow(
             ),
         }
         aqi_result["planned_phase4_aqi_work"] = planned_aqi_work
-
-    for rebuild_result in list(aqi_result.get("aqi_rebuild_results") or []):
-        if not isinstance(rebuild_result, Mapping):
-            continue
-        if str(rebuild_result.get("status") or "") in {
-            "proposal_validated", "complete",
-        }:
-            _record_backfill_core_snapshot_identity_audits(
-                run_state,
-                {
-                    "status": "ok",
-                    "core_snapshot_identity_validations": list(
-                        rebuild_result.get(
-                            "core_snapshot_identity_validations"
-                        ) or []
-                    ),
-                },
-                stage=(
-                    "aqi_worker:"
-                    f"{rebuild_result.get('day_utc')}:"
-                    f"connector={rebuild_result.get('connector_id')}"
-                ),
-            )
 
     rebuilt_aqi_scopes: set[tuple[str, int]] = set()
     aqi_capture_failures = 0
@@ -26327,10 +25197,6 @@ def run_v2_integrity_repair_flow(
             "r2_objects_changed": 0,
         }
     elif dedicated_sos_historical_replacement:
-        validate_run_state_core_snapshot_identity(
-            run_state,
-            stage="ordered_apply_verification",
-        )
         final_verification = summarize_ordered_apply_verification(
             run_state=run_state,
             apply_result=apply_result,
@@ -26350,7 +25216,6 @@ def run_v2_integrity_repair_flow(
             require_aqi_debug=require_aqi_debug,
             log=log,
             require_remote_state=not dry_run,
-            repair_pollutants=repair_pollutants,
         )
     all_observation_repair_entries = [
         entry
@@ -28789,28 +27654,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "",
     ]
 
-    connector_totals = s.get("connector_observation_totals") or {}
-    if connector_totals:
-        lines.extend([
-            "## Connector observation totals",
-            "",
-        ])
-        for connector_key in sorted(
-            connector_totals, key=lambda value: int(value)
-        ):
-            total = connector_totals[connector_key]
-            lines.extend([
-                f"### Connector {connector_key}",
-                "",
-                "- Total Observs before: "
-                f"{int(total['total_observations_before']):,}",
-                "- Total Observs added: "
-                f"{int(total['total_observations_added']):,}",
-                "- Total Observs after: "
-                f"{int(total['total_observations_after']):,}",
-                "",
-            ])
-
     sos_light = (s.get("repair_flow") or {}).get("sos_light") or {}
     if sos_light:
         warnings = list(sos_light.get("dropbox_warnings") or [])
@@ -28918,11 +27761,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
 
     snap = s.get("snapshot") or {}
     if snap:
-        core_selection = snap.get("core_snapshot_selection") or {}
-        core_identity = snap.get("core_snapshot_identity") or {}
-        consumer_audit = list(
-            snap.get("core_snapshot_consumer_audit") or []
-        )
         lines.extend([
             "## Core snapshot",
             "",
@@ -28933,26 +27771,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Core snapshot status: {snap.get('core_snapshot_status') or '(unset)'}",
             f"- Snapshot day:  {snap.get('snapshot_day_utc') or '(none)'}",
             f"- Manifest hash: {snap.get('manifest_hash') or '(none)'}",
-            "- Manifest key:  "
-            f"{core_identity.get('core_snapshot_manifest_key') or '(none)'}",
-            "- Manifest bytes SHA-256: "
-            f"{core_identity.get('core_snapshot_manifest_sha256') or '(none)'}",
-            "- Selection policy: "
-            f"{core_selection.get('selection_policy') or '(none)'}",
-            "- Candidate days: "
-            + (", ".join(core_selection.get("candidate_days") or []) or "(none)"),
-            "- Selected latest complete committed candidate: "
-            + str(bool(
-                core_selection.get(
-                    "selected_is_latest_complete_committed_candidate"
-                )
-            )),
-            "- Skipped incomplete/invalid candidates: "
-            + str(len(core_selection.get("skipped_candidates") or [])),
-            "- Consumer identity agreement: "
-            + str(bool(snap.get("consumer_identity_agreement"))),
-            "- Crossed midnight UTC: "
-            + str(bool(snap.get("crossed_midnight_utc"))),
             f"- Previous hash: {snap.get('previous_manifest_hash') or '(none)'}",
             f"- Snapshot dir:  {snap.get('snapshot_day_dir') or '(none)'}",
             f"- Bytes read:    {snap.get('bytes_read', 0)}",
@@ -28962,23 +27780,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"sha256={(snap.get('sos_site_ref_bridge') or {}).get('sha256') or '(none)'} "
             f"source_schema={(snap.get('sos_site_ref_bridge') or {}).get('source_schema') or '(none)'}",
         ])
-        for skipped in list(core_selection.get("skipped_candidates") or []):
-            if isinstance(skipped, Mapping):
-                lines.append(
-                    "  - Skipped "
-                    f"{skipped.get('day_utc') or '(unknown)'}: "
-                    f"{skipped.get('reason') or '(no reason)'}"
-                )
-        if consumer_audit:
-            lines.append("- Validated consumers:")
-            for audit in consumer_audit:
-                if isinstance(audit, Mapping):
-                    lines.append(
-                        "  - "
-                        f"{audit.get('stage') or '(unknown stage)'}: "
-                        f"day={audit.get('core_snapshot_day_utc') or '(none)'} "
-                        f"match={bool(audit.get('coordinator_identity_match'))}"
-                    )
         tables = snap.get("tables") or {}
         if tables:
             lines.append("- Table rows:")
@@ -30181,75 +28982,17 @@ def main(argv: list[str]) -> int:
         # Phase 2: import the core snapshot from Dropbox R2 backup.
         snapshot_result: dict[str, Any]
         warnings_delta = 0
-        core_snapshot_root = Path(resolve_core_snapshot_root(
-            resolve_core_history_version_for_mode(history_version_mode),
-            os.environ,
-        ))
-        core_snapshot_selection = select_latest_complete_core_snapshot(
-            core_snapshot_root,
-            log,
-            selected_at_utc=started_iso,
-        )
-        core_snapshot_identity = _normalise_core_snapshot_identity(
-            core_snapshot_selection.get("identity"),
-            stage="coordinator_selection",
-        )
-        core_snapshot_identity_path = (
-            Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"])
-            / "core-snapshot-identities"
-            / f"{run_compact}.json"
-        )
-        write_core_snapshot_identity_file(
-            core_snapshot_identity_path,
-            core_snapshot_identity,
-        )
-        coordinator_core_audit = validate_pinned_core_snapshot_identity(
-            coordinator_identity=core_snapshot_identity,
-            requested_identity=core_snapshot_identity,
-            snapshot_root=core_snapshot_root,
-            stage="coordinator_initialisation",
-        )
-        core_snapshot_consumer_audit: list[dict[str, Any]] = [
-            coordinator_core_audit,
-        ]
-        os.environ.update(core_snapshot_child_environment(
-            identity=core_snapshot_identity,
-            identity_file=core_snapshot_identity_path,
-            snapshot_root=core_snapshot_root,
-            mode=effective_mode,
-            stage="coordinator",
-        ))
-        log.info(
-            "pinned core snapshot identity=%s identity_file=%s",
-            json.dumps(core_snapshot_identity, sort_keys=True),
-            core_snapshot_identity_path,
-        )
         if args.skip_snapshot_import:
             log.warning("--skip-snapshot-import: skipping core snapshot import")
             snapshot_result = {
                 "status": "skipped",
                 "error": "skipped by --skip-snapshot-import",
-                "snapshot_root": str(core_snapshot_root),
+                "snapshot_root": resolve_core_snapshot_root(resolve_core_history_version_for_mode(history_version_mode), os.environ),
                 "core_history_version": resolve_core_history_version_for_mode(history_version_mode),
                 "core_prefix": resolve_core_snapshot_prefix(resolve_core_history_version_for_mode(history_version_mode), os.environ),
-                "snapshot_day_dir": core_snapshot_selection["snapshot_day_dir"],
-                "snapshot_day_utc": core_snapshot_identity[
-                    "core_snapshot_day_utc"
-                ],
-                "manifest_hash": core_snapshot_identity[
-                    "core_snapshot_manifest_hash"
-                ],
-                "manifest_sha256": core_snapshot_identity[
-                    "core_snapshot_manifest_sha256"
-                ],
-                "core_snapshot_identity": core_snapshot_identity,
-                "core_snapshot_selection": {
-                    key: value
-                    for key, value in core_snapshot_selection.items()
-                    if key != "manifest"
-                },
-                "core_snapshot_identity_file": str(core_snapshot_identity_path),
-                "core_snapshot_consumer_audit": core_snapshot_consumer_audit,
+                "snapshot_day_dir": None,
+                "snapshot_day_utc": None,
+                "manifest_hash": None,
                 "previous_manifest_hash": None,
                 "tables": {},
                 "rows_lookup": 0,
@@ -30266,17 +29009,10 @@ def main(argv: list[str]) -> int:
             snapshot_result = import_core_snapshot(
                 conn=conn,
                 env_name=args.env,
-                snapshot_root_str=str(core_snapshot_root),
+                snapshot_root_str=resolve_core_snapshot_root(resolve_core_history_version_for_mode(history_version_mode), os.environ),
                 force=args.force_snapshot_import,
                 dry_run=False,
                 log=log,
-                selected_snapshot=core_snapshot_selection,
-            )
-            snapshot_result["core_snapshot_identity_file"] = str(
-                core_snapshot_identity_path
-            )
-            snapshot_result["core_snapshot_consumer_audit"] = (
-                core_snapshot_consumer_audit
             )
             snapshot_result["core_history_version"] = resolve_core_history_version_for_mode(history_version_mode)
             snapshot_result["core_prefix"] = resolve_core_snapshot_prefix(snapshot_result["core_history_version"], os.environ)
@@ -30300,16 +29036,6 @@ def main(argv: list[str]) -> int:
             snapshot_result["core_prefix"] = resolve_core_snapshot_prefix(snapshot_result["core_history_version"], os.environ)
             snapshot_result["core_snapshot_status"] = classify_core_snapshot_status(snapshot_result, history_version=snapshot_result["core_history_version"], expected_day=to_day)
         snapshot_ok = snapshot_result["status"] in {"imported", "reused"} and snapshot_result.get("core_snapshot_status") == "ok"
-        if snapshot_ok:
-            detector_core_audit = validate_pinned_core_snapshot_identity(
-                coordinator_identity=core_snapshot_identity,
-                requested_identity=json.loads(os.environ[
-                    "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON"
-                ]),
-                snapshot_root=core_snapshot_root,
-                stage="detector_and_source_mapping_initialisation",
-            )
-            core_snapshot_consumer_audit.append(detector_core_audit)
 
         empty_metrics = {"ran": False, "skipped_reason": None}
         openaq_metrics: dict[str, Any] = dict(empty_metrics)
@@ -30501,10 +29227,6 @@ def main(argv: list[str]) -> int:
                     allowed_connector_ids=v2_allowed_connector_ids,
                     source_scope=v2_source_scope,
                     log=log,
-                    observation_total_connector_ids=(
-                        v2_source_scope.get("connector_ids") or []
-                    ),
-                    observation_total_pollutants=args.repair_pollutants,
                 )
                 observation_hash_metrics = (
                     run_v2_observation_content_hash_checks(
@@ -30658,20 +29380,6 @@ def main(argv: list[str]) -> int:
             repair_overlay["requested_to_day"] = to_day
             repair_overlay["requested_repair_pollutants"] = list(
                 args.repair_pollutants
-            )
-            repair_overlay["core_snapshot_identity"] = dict(
-                core_snapshot_identity
-            )
-            repair_overlay["core_snapshot_selection"] = {
-                key: value
-                for key, value in core_snapshot_selection.items()
-                if key != "manifest"
-            }
-            repair_overlay["core_snapshot_identity_file"] = str(
-                core_snapshot_identity_path
-            )
-            repair_overlay["core_snapshot_consumer_audit"] = list(
-                core_snapshot_consumer_audit
             )
             write_run_state(repair_overlay)
             log.info(
@@ -31135,47 +29843,6 @@ def main(argv: list[str]) -> int:
         finished_iso = fmt_iso(finished_at)
         runtime_seconds = round(time.monotonic() - started_mono, 3)
         metrics["runtime_seconds"] = runtime_seconds
-        if repair_overlay is not None:
-            for audit_entry in list(
-                repair_overlay.get("core_snapshot_consumer_audit") or []
-            ):
-                if (
-                    isinstance(audit_entry, Mapping)
-                    and dict(audit_entry) not in core_snapshot_consumer_audit
-                ):
-                    core_snapshot_consumer_audit.append(dict(audit_entry))
-        snapshot_result["core_snapshot_consumer_audit"] = list(
-            core_snapshot_consumer_audit
-        )
-        snapshot_result["consumer_identity_agreement"] = bool(
-            core_snapshot_consumer_audit
-        ) and all(
-            isinstance(entry, Mapping)
-            and _normalise_core_snapshot_identity(
-                entry,
-                stage=(
-                    "summary_consumer_audit:"
-                    f"{entry.get('stage') if isinstance(entry, Mapping) else 'invalid'}"
-                ),
-            ) == core_snapshot_identity
-            and entry.get("coordinator_identity_match") is True
-            for entry in core_snapshot_consumer_audit
-        )
-        snapshot_result["crossed_midnight_utc"] = (
-            started_at.date() != finished_at.date()
-        )
-        log.info(
-            "core snapshot final audit identity=%s consumers=%s agreement=%s "
-            "crossed_midnight_utc=%s",
-            json.dumps(core_snapshot_identity, sort_keys=True),
-            [
-                entry.get("stage")
-                for entry in core_snapshot_consumer_audit
-                if isinstance(entry, Mapping)
-            ],
-            snapshot_result["consumer_identity_agreement"],
-            snapshot_result["crossed_midnight_utc"],
-        )
 
         conn.execute(
             """
@@ -31307,54 +29974,6 @@ def main(argv: list[str]) -> int:
                 "overall_status": "not_run",
             }
         )
-        sos_light_totals_evidence = repair_flow.get("sos_light") or {}
-        final_observation_check = (
-            (final_result.get("recheck") or {}).get("observations") or {}
-        )
-        selected_total_connector_ids = (
-            [1]
-            if dedicated_sos_historical_replacement
-            else list(v2_source_scope.get("connector_ids") or [])
-        )
-        connector_observation_totals = build_connector_observation_totals(
-            successful_real_repair=bool(
-                status == "ok"
-                and real_repair_verified
-                and repair_flow.get("r2_write_attempted") is True
-                and args.run_backfill
-                and not args.dry_run
-                and not args.check_only
-            ),
-            run_backfill=args.run_backfill,
-            dry_run=args.dry_run,
-            check_only=args.check_only,
-            selected_connector_ids=selected_total_connector_ids,
-            from_day=from_day,
-            to_day=to_day,
-            repair_pollutants=args.repair_pollutants,
-            before_partition_rows=(
-                sos_light_totals_evidence.get(
-                    "connector_observation_partition_rows_before"
-                )
-                if dedicated_sos_historical_replacement
-                else v2_obs.get("connector_observation_partition_rows")
-            ),
-            after_partition_rows=(
-                sos_light_totals_evidence.get(
-                    "connector_observation_partition_rows_after"
-                )
-                if dedicated_sos_historical_replacement
-                else final_observation_check.get(
-                    "connector_observation_partition_rows"
-                )
-            ),
-            published_observation_scopes=(
-                ((repair_overlay or {}).get("changed_scopes") or {}).get(
-                    "OBSERVS_CHANGED"
-                )
-            ),
-            sos_light=dedicated_sos_historical_replacement,
-        )
         summary: dict[str, Any] = {
             "env": args.env,
             "profile": args.profile,
@@ -31365,7 +29984,6 @@ def main(argv: list[str]) -> int:
             "history_path_configs": serialized_history_path_configs,
             "history_version_results": history_version_results,
             "source_scope": v2_source_scope if "v2" in checked_history_versions else None,
-            "requested_repair_pollutants": list(args.repair_pollutants),
             "site_read_version": site_read_version,
             "backfill_env_file": LAST_BACKFILL_ENV_LOAD_RESULT,
             "from_day": from_day,
@@ -31414,10 +30032,6 @@ def main(argv: list[str]) -> int:
             "metrics": metrics,
             "notes": notes,
         }
-        if connector_observation_totals:
-            summary["connector_observation_totals"] = (
-                connector_observation_totals
-            )
         # Dropbox DB copy on any non-error exit. Failures here are warnings,
         # not run failures — the local DB is the source of truth.
         db_copy = _copy_db_to_dropbox(env, conn, log)
