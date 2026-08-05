@@ -180,7 +180,7 @@ observations-root manifest
 
 The observations-root manifest is written last and is the highest-level completed view of the hierarchy.
 
-A failed run may leave a newer child beneath an older parent. That is an incomplete derived hierarchy, not permission to discard the changed child. High-level Integrity must detect and queue that mismatch.
+A failed run may leave a newer child beneath an older parent. That is an incomplete derived hierarchy, not permission to discard the changed child. The explicit hierarchy audit must detect that mismatch.
 
 ## Deletion and missing-child behaviour
 
@@ -188,11 +188,11 @@ Aggregate manifests describe the current authoritative committed child set.
 
 When a committed day is deliberately removed, its month entry must be removed. Empty months must not remain as active children unless a separate tombstone contract is introduced.
 
-Unexpected missing, extra, malformed or hash-mismatched children are Integrity findings. Writers and finders must fail closed rather than silently invent missing child identity.
+Unexpected missing, extra, malformed or hash-mismatched children are hierarchy validation failures. Writers and validation tools must fail closed rather than silently invent missing child identity.
 
-## High-level Integrity ownership
+## Hierarchy validation ownership
 
-`integrity_highlevel_find` validates this hierarchy across all available observation history on every scheduled daily Integrity run.
+The initial active implementation uses an explicit lightweight hierarchy audit across all available observation history.
 
 It compares:
 
@@ -202,7 +202,7 @@ actual month manifests <-> year manifest entries
 actual year manifests <-> observations-root entries
 ```
 
-This is a lightweight manifest and metadata check. It does not read observation Parquet bodies.
+This audit reads manifest objects and metadata only. It does not read observation Parquet bodies.
 
 It must detect at least:
 
@@ -216,7 +216,13 @@ It must detect at least:
 - duplicate child identity;
 - non-canonical ordering or non-byte-stable output where observable.
 
-Find-only operation and repair queuing are governed by [`integrity_factory_contract.md`](integrity_factory_contract.md).
+Integration of this audit into a future split Integrity Factory is intentionally deferred. The non-authoritative design draft is stored at:
+
+```text
+system_docs/drafts/r2_history/integrity_factory_contract.md
+```
+
+The draft does not govern current Integrity implementation.
 
 ## Full rebuild and audit
 
@@ -241,7 +247,7 @@ The backup inventory must not rely exclusively on the hierarchy until:
 
 - all represented months and years have valid manifests;
 - the root is valid;
-- high-level Integrity has completed successfully on TEST;
+- the explicit hierarchy audit has completed successfully on TEST;
 - the explicit full-scan comparison agrees with the hierarchy.
 
 ## Versioning decision
@@ -266,4 +272,4 @@ Before implementation is deployed, validate only that:
 - bottom-up reconstruction preserves every existing child entry;
 - malformed or missing child identity fails closed.
 
-Functional acceptance occurs through real TEST writer, high-level Integrity, inventory and Dropbox backup operation after deployment.
+Functional acceptance occurs through real TEST writer, hierarchy audit, inventory and Dropbox backup operation after deployment.
