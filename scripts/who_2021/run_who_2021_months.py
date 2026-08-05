@@ -243,7 +243,7 @@ def find_new_run(
                 "--limit",
                 "20",
                 "--json",
-                "databaseId,createdAt,status,conclusion,url,displayTitle,headBranch",
+                "databaseId,number,createdAt,status,conclusion,url,displayTitle,headBranch",
             ],
         )
 
@@ -287,7 +287,7 @@ def view_run(repo: str, run_id: int) -> Dict[str, Any]:
             str(run_id),
             "--json",
             (
-                "databaseId,status,conclusion,url,displayTitle,workflowName,"
+                "databaseId,number,status,conclusion,url,displayTitle,workflowName,"
                 "createdAt,startedAt,updatedAt"
             ),
         ],
@@ -388,7 +388,12 @@ def wait_for_run(
 
         if status != last_status:
             suffix = f", conclusion={conclusion}" if conclusion else ""
-            print(f"  GitHub run {run_id}: status={status}{suffix}", flush=True)
+            run_number = run.get("number")
+            if run_number is not None:
+                label = f"GitHub run #{run_number} (ID {run_id})"
+            else:
+                label = f"GitHub run ID {run_id}"
+            print(f"  {label}: status={status}{suffix}", flush=True)
             last_status = status
 
         if status == "completed":
@@ -502,6 +507,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "workflow",
                 "view",
                 args.workflow,
+                "--yaml",
                 "--ref",
                 args.ref,
             ],
@@ -552,6 +558,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "endDayUtc": month.end_day_utc,
                 "dispatchStartedAt": utc_iso(),
                 "runId": None,
+                "runNumber": None,
                 "url": None,
                 "status": "dispatching",
                 "conclusion": None,
@@ -568,9 +575,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 run_mode,
             )
             run_id = int(dispatched["databaseId"])
+            run_number = dispatched.get("number")
+            if run_number is not None:
+                run_number = int(run_number)
             record.update(
                 {
                     "runId": run_id,
+                    "runNumber": run_number,
                     "url": dispatched.get("url"),
                     "status": dispatched.get("status") or "queued",
                     "displayTitle": dispatched.get("displayTitle"),
@@ -580,6 +591,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             atomic_write_json(log_path, state)
 
+            if run_number is not None:
+                print(f"  Run #:  #{run_number}")
             print(f"  Run ID: {run_id}")
             if record["url"]:
                 print(f"  URL:    {record['url']}")
@@ -590,6 +603,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 {
                     "status": completed.get("status"),
                     "conclusion": conclusion,
+                    "runNumber": completed.get("number") or record.get("runNumber"),
                     "url": completed.get("url") or record.get("url"),
                     "githubStartedAt": completed.get("startedAt"),
                     "githubUpdatedAt": completed.get("updatedAt"),

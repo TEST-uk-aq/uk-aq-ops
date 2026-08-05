@@ -1,0 +1,142 @@
+
+## Run selected months
+
+```bash
+python scripts/who_2021/run_who_2021_months.py \
+  --months 2025-01 2025-03 2025-06
+```
+
+Months are sorted chronologically and duplicates are removed.
+
+## Run a continuous range
+
+```bash
+python scripts/who_2021/run_who_2021_months.py \
+  --from-month 2025-01 \
+  --to-month 2025-06
+```
+
+## WHO dry-run mode
+
+```bash
+python scripts/who_2021/run_who_2021_months.py \
+  --from-month 2025-01 \
+  --to-month 2025-12 
+
+```
+
+
+  --dry-run
+
+Without `--dry-run`, it dispatches:
+
+```text
+run_mode=backfill
+```
+
+With `--dry-run`, it dispatches:
+
+```text
+run_mode=dry_run
+```
+
+It takes the repository from:
+
+```bash
+UK_AQ_GITHUB_REPO
+```
+
+and uses these fixed workflow inputs:
+
+```text
+trigger_mode=manual
+refresh_summaries=mode_default
+publish_json=false
+write_parquet=false
+```
+
+For each month it:
+
+1. Calculates the first and last calendar day.
+2. Dispatches `uk_aq_who_2021_daily.yml`.
+3. Captures the exact GitHub run ID and URL.
+4. Polls that run until completion.
+5. Starts the next month only after `conclusion=success`.
+6. Stops immediately following a failed, cancelled or timed-out run.
+7. Writes a JSON record under:
+
+```text
+logs/who_2021/
+```
+
+The GitHub CLI can return the newly created workflow-run URL when available. The script parses that first, with a `gh run list` fallback, then polls the exact run through `gh run view` JSON output. ([GitHub CLI][1])
+
+I validated the Python syntax and ran mocked success and failure sequences. The failure test confirmed that no subsequent month is dispatched after a failed run. No real GitHub workflow was triggered during testing.
+
+One intentional restriction is that it accepts only completed calendar months, so it rejects the current and future months.
+
+
+
+
+
+Yes. Once the **real, non-dry-run** daily WHO records exist, that sequence will calculate everything the current homepage card needs.
+
+Run the completed 2026 months:
+
+```bash
+python scripts/who_2021/run_who_2021_months.py \
+  --from-month 2026-01 \
+  --to-month 2026-07
+```
+
+Then backfill 1 to 4 August directly, because the monthly script intentionally rejects partial months:
+
+```bash
+gh workflow run uk_aq_who_2021_daily.yml \
+  --repo "$UK_AQ_GITHUB_REPO" \
+  --ref main \
+  -f run_mode=backfill \
+  -f trigger_mode=manual \
+  -f start_day_utc=2026-08-01 \
+  -f end_day_utc=2026-08-04 \
+  -f refresh_summaries=false \
+  -f publish_json=false \
+  -f write_parquet=false
+```
+
+Wait for that to succeed, then run the final summary/publication job:
+
+```bash
+gh workflow run uk_aq_who_2021_daily.yml \
+  --repo "$UK_AQ_GITHUB_REPO" \
+  --ref main \
+  -f run_mode=daily \
+  -f trigger_mode=manual \
+  -f refresh_summaries=true \
+  -f publish_json=true \
+  -f write_parquet=false
+```
+
+Because today is 5 August 2026, daily mode treats **4 August 2026 as the latest complete day**. It will refresh the latest two daily dates, then calculate:
+
+* rolling daily-guideline results for the latest 365 days
+* rolling yearly-average results for the latest 365 days
+* the full calendar-year results for 2025
+* the homepage `cards` payload
+* the latest website JSON at `history/v2/who_2021/latest_who_2021.json`
+
+The workflow’s daily mode derives its end date as yesterday, and summary refresh uses that publication date.  The JSON publication path requires summary refresh to have produced `homepage_summary`, which is then written as both a dated JSON and the latest JSON.
+
+
+
+So the full real-data order is:
+
+```text
+2025-01 to 2025-12 real backfill
+2026-01 to 2026-07 real backfill
+2026-08-01 to 2026-08-04 real backfill
+one daily run with refresh_summaries=true and publish_json=true
+```
+
+You do not need a special December run, and you do not need parquet for the current homepage card.
+

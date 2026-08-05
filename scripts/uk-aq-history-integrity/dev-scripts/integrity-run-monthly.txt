@@ -29,6 +29,8 @@ nohup /Users/mikehinford/uk-aq-history-integrity/bin/integrity-run-monthly-LIVE.
   2>&1 &
   
 
+ps -Ao pid,etime,command | grep -E "integrity-run-monthly" | grep -v grep
+
 
 ```
 
