@@ -56,21 +56,21 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 |---|---|---|
 | Connector ingest and Daily Stations reference discovery | [`ingest/`](ingest/) | Authoritative for Daily Stations, Breathe London Nodes deterministic reference discovery and UK-AIR SOS polling/Cloud Run behaviour |
 | Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current |
-| Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Authoritative for stable bindings, embedded continuity, integrity, targeted indexes and Phase B history writes |
+| Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Authoritative for stable bindings, embedded continuity, integrity, targeted indexes, Phase B history writes, observations aggregate manifests and the Integrity Factory |
 | Calculated hourly AQI and station-chart bands | [`aqi-levels/`](aqi-levels/) | Authoritative and current, including continuity-aware calculated chart AQI and asynchronous R2 validation |
 | Shared website station-chart frontend | [`station_charts/`](station_charts/) | Authoritative for modular chart architecture, browser cache ownership, AQI-source switching, rendering and page adapters |
 | Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending outside completed R2-history contracts |
 | Observs outbox and partition maintenance | `observs_operations/` | Migration analysis pending |
 | Public and private R2-backed APIs outside completed history/AQI boundaries | `api_services/` | Migration analysis pending |
 | Cache proxy and website routing outside completed history/AQI boundaries | `cache_proxy/` | Migration analysis pending |
-| R2 and database backups, restore and repair outside completed contracts | [`backup_and_recovery/`](backup_and_recovery/) | Authoritative for the Supabase logical database dump backup; broader migration remains pending |
+| R2 and database backups, restore and repair outside completed contracts | [`backup_and_recovery/`](backup_and_recovery/) | Authoritative for the Supabase logical database dump backup and R2 v2 history Dropbox backup inventory/checkpoint contract; broader migration remains pending |
 | Cloudflare and GCP scheduling | `scheduling/` | Migration analysis pending |
 | Task health, metrics and operational dashboards | `monitoring/` | Migration analysis pending |
 | Hosted and local administrative dashboards | [`dashboards/`](dashboards/) | Authoritative and current |
 | Postcode and geography lookup products | [`geography/`](geography/) | Authoritative and current |
 | Shared runtime components and cross-area invariants | `shared/` | Migration analysis pending |
 
-Directories marked pending are proposed area boundaries. They do not override completed contracts in `ingest/`, `r2_history/`, `aqi-levels/`, `station_charts/`, `latest_snapshot/`, `dashboards/`, `geography/` or the completed Supabase logical backup scope in `backup_and_recovery/`.
+Directories marked pending are proposed area boundaries. They do not override completed contracts in `ingest/`, `r2_history/`, `aqi-levels/`, `station_charts/`, `latest_snapshot/`, `dashboards/`, `geography/` or the completed Supabase logical and R2 history Dropbox backup scopes in `backup_and_recovery/`.
 
 ## R2 history and station-history reading set
 
@@ -81,16 +81,24 @@ Any change involving timeseries identity, historical charts, R2 observations, R2
 3. [`r2_history/continuity.md`](r2_history/continuity.md)
 4. [`r2_history/interfaces.md`](r2_history/interfaces.md)
 5. [`r2_history/operations.md`](r2_history/operations.md)
-6. [`aqi-levels/README.md`](aqi-levels/README.md)
-7. [`aqi-levels/contract.md`](aqi-levels/contract.md)
-8. [`aqi-levels/station-history-contract.md`](aqi-levels/station-history-contract.md)
-9. [`aqi-levels/station-history-validation.md`](aqi-levels/station-history-validation.md)
-10. [`station_charts/README.md`](station_charts/README.md)
-11. [`station_charts/contract.md`](station_charts/contract.md)
+6. [`r2_history/observations_manifest_hierarchy_contract.md`](r2_history/observations_manifest_hierarchy_contract.md)
+7. [`r2_history/observations_run_exclusion_contract.md`](r2_history/observations_run_exclusion_contract.md)
+8. [`r2_history/integrity_factory_contract.md`](r2_history/integrity_factory_contract.md)
+9. [`aqi-levels/README.md`](aqi-levels/README.md)
+10. [`aqi-levels/contract.md`](aqi-levels/contract.md)
+11. [`aqi-levels/station-history-contract.md`](aqi-levels/station-history-contract.md)
+12. [`aqi-levels/station-history-validation.md`](aqi-levels/station-history-validation.md)
+13. [`station_charts/README.md`](station_charts/README.md)
+14. [`station_charts/contract.md`](station_charts/contract.md)
 
 The specific station-history contract deliberately changes visible chart AQI source precedence while preserving persisted R2 AQI as validation evidence.
 
 The shared station-chart contract governs browser architecture, cache ownership, AQI-source switching, D3 rendering and page-adapter reuse without changing the Worker or R2 data contracts.
+
+Before changing the R2 history Dropbox inventory or checkpoint layout, also read:
+
+1. [`backup_and_recovery/README.md`](backup_and_recovery/README.md)
+2. [`backup_and_recovery/r2_history_dropbox_backup_contract.md`](backup_and_recovery/r2_history_dropbox_backup_contract.md)
 
 ## Current continuity decision
 
