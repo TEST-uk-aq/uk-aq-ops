@@ -1,0 +1,75 @@
+
+## Run selected months
+
+```bash
+python scripts/who_2021/run_who_2021_months.py \
+  --months 2025-01 2025-03 2025-06
+```
+
+Months are sorted chronologically and duplicates are removed.
+
+## Run a continuous range
+
+```bash
+python scripts/who_2021/run_who_2021_months.py \
+  --from-month 2025-01 \
+  --to-month 2025-06
+```
+
+## WHO dry-run mode
+
+```bash
+python scripts/who_2021/run_who_2021_months.py \
+  --from-month 2025-01 \
+  --to-month 2025-06 \
+  --dry-run
+```
+
+Without `--dry-run`, it dispatches:
+
+```text
+run_mode=backfill
+```
+
+With `--dry-run`, it dispatches:
+
+```text
+run_mode=dry_run
+```
+
+It takes the repository from:
+
+```bash
+UK_AQ_GITHUB_REPO
+```
+
+and uses these fixed workflow inputs:
+
+```text
+trigger_mode=manual
+refresh_summaries=mode_default
+publish_json=false
+write_parquet=false
+```
+
+For each month it:
+
+1. Calculates the first and last calendar day.
+2. Dispatches `uk_aq_who_2021_daily.yml`.
+3. Captures the exact GitHub run ID and URL.
+4. Polls that run until completion.
+5. Starts the next month only after `conclusion=success`.
+6. Stops immediately following a failed, cancelled or timed-out run.
+7. Writes a JSON record under:
+
+```text
+logs/who_2021/
+```
+
+The GitHub CLI can return the newly created workflow-run URL when available. The script parses that first, with a `gh run list` fallback, then polls the exact run through `gh run view` JSON output. ([GitHub CLI][1])
+
+I validated the Python syntax and ran mocked success and failure sequences. The failure test confirmed that no subsequent month is dispatched after a failed run. No real GitHub workflow was triggered during testing.
+
+One intentional restriction is that it accepts only completed calendar months, so it rejects the current and future months.
+
+[1]: https://cli.github.com/manual/gh_workflow_run?utm_source=chatgpt.com "GitHub CLI | Take GitHub to the command line"

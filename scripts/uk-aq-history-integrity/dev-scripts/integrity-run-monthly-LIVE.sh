@@ -1,7 +1,9 @@
 #!/bin/bash
 
-set -u
-set -o pipefail
+set -euo pipefail
+
+# Always provide a valid detached stdin to Python and child processes.
+exec </dev/null
 
 INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh"
 LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/integrity-run-monthly"
@@ -101,7 +103,9 @@ run_batch() {
     --run-backfill \
     --repair-pollutants pm25,pm10,no2,o3 \
     --allow-stale-dropbox \
-    --verbose >"$LOG" 2>&1
+    --verbose \
+    </dev/null \
+    >"$LOG" 2>&1
   then
     touch "$OK_MARKER"
     echo "$(date -u +%FT%TZ) SUCCESS $LABEL" | tee -a "$SUMMARY"
@@ -118,9 +122,15 @@ run_batch() {
   fi
 }
 
-run_batch 2026-05-01 2026-05-31 2026-05
-run_batch 2026-06-01 2026-06-30 2026-06
-run_batch 2026-07-01 2026-07-31 2026-07
+run_batch 2025-05-01 2025-05-31 2025-06
+run_batch 2025-06-01 2025-06-30 2025-06
+run_batch 2025-07-01 2025-07-31 2025-07
+run_batch 2025-08-01 2025-08-31 2025-08
+run_batch 2025-09-01 2025-09-30 2025-09
+run_batch 2025-10-01 2025-10-31 2025-10
+run_batch 2025-11-01 2025-11-30 2025-11
+run_batch 2025-12-01 2025-12-31 2025-12
+run_batch 2026-01-01 2026-01-31 2026-01
 
 
 echo "$(date -u +%FT%TZ) ALL BATCHES ATTEMPTED" | tee -a "$SUMMARY"
