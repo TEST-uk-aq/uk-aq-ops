@@ -1,0 +1,77 @@
+Yes. **Monthly sequential batches are a good fit here.**
+
+They give you:
+
+* separate logs for each month;
+* a failed month does not prevent later months running;
+* easier reruns of only the failed month;
+* smaller proposals and apply operations;
+* an optional pause between months so the MacBook Pro can cool down.
+
+It does not make an individual month atomic. Integrity publishes day by day, so some days in a failed month might already have completed. Re-running that month is still the correct recovery approach.
+
+
+chmod +x /Users/mikehinford/uk-aq-history-integrity/bin/run-live-2025-monthly.sh
+```
+
+## Start it overnight
+
+```bash
+
+nohup /Users/mikehinford/uk-aq-history-integrity/bin/integrity-run-monthly-CIC-Test.sh \
+  > /Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/logs/integrity-run-monthly-$(date -u +%Y%m%dT%H%M%SZ).log \
+  </dev/null \
+  2>&1 &
+
+nohup /Users/mikehinford/uk-aq-history-integrity/bin/integrity-run-monthly-LIVE.sh \
+  > /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/integrity-run-monthly-$(date -u +%Y%m%dT%H%M%SZ).log \
+  </dev/null \
+  2>&1 &
+  
+
+
+```
+
+The script deliberately does **not** use `set -e`, so one failed month is recorded and the next month starts after the cooling pause.
+
+## Monitor it
+
+```bash
+tail -f /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/monthly-2025-launch.log
+```
+
+For the more useful summary:
+
+```bash
+tail -f "$(ls -t \
+  /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/monthly-2025/run-summary-*.log \
+  | head -1)"
+```
+
+## Rerunning failures
+
+Successful batches receive marker files such as:
+
+```text
+2025-01.ok
+2025-02.ok
+```
+
+Running the script again automatically skips those months and retries only batches without an `.ok` marker:
+
+```bash
+nohup /Users/mikehinford/uk-aq-history-integrity/bin/run-live-2025-monthly.sh \
+  > /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/monthly-2025-retry.log \
+  2>&1 &
+```
+
+To deliberately rerun every month:
+
+```bash
+FORCE=1 nohup \
+  /Users/mikehinford/uk-aq-history-integrity/bin/run-live-2025-monthly.sh \
+  > /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/monthly-2025-forced.log \
+  2>&1 &
+```
+
+The `nice -n 10`, Low Power Mode and five-minute pauses should also make this quieter than one uninterrupted year-long process.
