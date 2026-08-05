@@ -180,21 +180,12 @@ run_batch() {
   fi
 }
 
-run_batch 2025-01-01 2025-01-31 2025-01
-run_batch 2025-02-01 2025-02-28 2025-02
-run_batch 2025-03-01 2025-03-31 2025-03
-run_batch 2025-04-01 2025-04-30 2025-04
-run_batch 2025-05-01 2025-05-31 2025-05
-run_batch 2025-06-01 2025-06-30 2025-06
-run_batch 2025-07-01 2025-07-31 2025-07
-run_batch 2025-08-01 2025-08-31 2025-08
-run_batch 2025-09-01 2025-09-30 2025-09
-run_batch 2025-10-01 2025-10-31 2025-10
-run_batch 2025-11-01 2025-11-30 2025-11
-run_batch 2025-12-01 2025-12-31 2025-12
-
-# Required as the D+1 boundary for WHO calculations on 31/12/2025.
-run_batch 2026-01-01 2026-01-31 2026-01
+run_batch 2026-02-01 2026-02-28 2026-02
+run_batch 2026-03-01 2026-03-31 2026-03
+run_batch 2026-04-01 2026-04-30 2026-04
+run_batch 2026-05-01 2026-05-31 2026-05
+run_batch 2026-06-01 2026-06-30 2026-06
+run_batch 2026-07-01 2026-07-31 2026-07
 
 echo "$(date -u +%FT%TZ) ALL BATCHES ATTEMPTED" | tee -a "$SUMMARY"
 echo "Summary: $SUMMARY"
