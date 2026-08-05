@@ -6,6 +6,8 @@ Human-readable Markdown is the source of truth for people and coding agents. The
 
 `system_docs/` is the sole active system-documentation root. Historical and superseded broad documents belong under `system_docs_legacy/` and do not override active contracts.
 
+Files under [`drafts/`](drafts/) are non-authoritative design drafts. They are not part of the required reading order and must not constrain current implementation unless the user explicitly asks to promote and implement a named draft.
+
 ## Authority and document types
 
 Documents in an area directory normally have these roles:
@@ -23,7 +25,7 @@ Documents in an area directory normally have these roles:
 
 Worker-local README files remain implementation guides. They do not override system contracts.
 
-Plans describe proposed work. Archives and `system_docs_legacy/` describe historical implementations. They are not current runtime authority unless an active contract explicitly incorporates a decision.
+Plans, files under `system_docs/drafts/`, archives and `system_docs_legacy/` are not current runtime authority unless an active contract explicitly incorporates a decision from them.
 
 ## Required reading order
 
@@ -46,7 +48,7 @@ If code and documentation disagree, do not silently choose one. Report whether t
 
 An intentional behavioural change must update the authoritative documents in the same branch or through the explicitly assigned ChatGPT documentation phase.
 
-Codex and other coding agents must not edit `system_docs/`. They read it as authority and provide a handover for ChatGPT after implementation.
+Codex and other coding agents must not edit `system_docs/`. They read active contracts as authority and provide a handover for ChatGPT after implementation. They must ignore `system_docs/drafts/` unless the user explicitly names a draft for promotion or implementation.
 
 See [`documentation_contract.md`](documentation_contract.md) for full maintenance rules.
 
@@ -56,7 +58,7 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 |---|---|---|
 | Connector ingest and Daily Stations reference discovery | [`ingest/`](ingest/) | Authoritative for Daily Stations, Breathe London Nodes deterministic reference discovery and UK-AIR SOS polling/Cloud Run behaviour |
 | Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current |
-| Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Authoritative for stable bindings, embedded continuity, integrity, targeted indexes, Phase B history writes, observations aggregate manifests and the Integrity Factory |
+| Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Authoritative for stable bindings, embedded continuity, current Integrity, targeted indexes, Phase B history writes and observations aggregate manifests |
 | Calculated hourly AQI and station-chart bands | [`aqi-levels/`](aqi-levels/) | Authoritative and current, including continuity-aware calculated chart AQI and asynchronous R2 validation |
 | Shared website station-chart frontend | [`station_charts/`](station_charts/) | Authoritative for modular chart architecture, browser cache ownership, AQI-source switching, rendering and page adapters |
 | Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending outside completed R2-history contracts |
@@ -83,13 +85,12 @@ Any change involving timeseries identity, historical charts, R2 observations, R2
 5. [`r2_history/operations.md`](r2_history/operations.md)
 6. [`r2_history/observations_manifest_hierarchy_contract.md`](r2_history/observations_manifest_hierarchy_contract.md)
 7. [`r2_history/observations_run_exclusion_contract.md`](r2_history/observations_run_exclusion_contract.md)
-8. [`r2_history/integrity_factory_contract.md`](r2_history/integrity_factory_contract.md)
-9. [`aqi-levels/README.md`](aqi-levels/README.md)
-10. [`aqi-levels/contract.md`](aqi-levels/contract.md)
-11. [`aqi-levels/station-history-contract.md`](aqi-levels/station-history-contract.md)
-12. [`aqi-levels/station-history-validation.md`](aqi-levels/station-history-validation.md)
-13. [`station_charts/README.md`](station_charts/README.md)
-14. [`station_charts/contract.md`](station_charts/contract.md)
+8. [`aqi-levels/README.md`](aqi-levels/README.md)
+9. [`aqi-levels/contract.md`](aqi-levels/contract.md)
+10. [`aqi-levels/station-history-contract.md`](aqi-levels/station-history-contract.md)
+11. [`aqi-levels/station-history-validation.md`](aqi-levels/station-history-validation.md)
+12. [`station_charts/README.md`](station_charts/README.md)
+13. [`station_charts/contract.md`](station_charts/contract.md)
 
 The specific station-history contract deliberately changes visible chart AQI source precedence while preserving persisted R2 AQI as validation evidence.
 
@@ -99,6 +100,8 @@ Before changing the R2 history Dropbox inventory or checkpoint layout, also read
 
 1. [`backup_and_recovery/README.md`](backup_and_recovery/README.md)
 2. [`backup_and_recovery/r2_history_dropbox_backup_contract.md`](backup_and_recovery/r2_history_dropbox_backup_contract.md)
+
+The proposed Integrity Factory is retained only as a non-authoritative draft at [`drafts/r2_history/integrity_factory_contract.md`](drafts/r2_history/integrity_factory_contract.md).
 
 ## Current continuity decision
 
