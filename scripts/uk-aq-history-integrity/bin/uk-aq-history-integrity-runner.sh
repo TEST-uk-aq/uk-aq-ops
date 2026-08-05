@@ -199,6 +199,26 @@ printf '%s\n' "$$" > "${RUNNER_LOCK}"
 cleanup() { rm -f -- "${RUNNER_LOCK}"; }
 trap cleanup EXIT INT TERM
 
+remove_ignored_macos_metadata() {
+  local root="$1"
+  local removed=0
+  local metadata_path
+
+  while IFS= read -r -d '' metadata_path; do
+    rm -f -- "${metadata_path}"
+    removed=$((removed + 1))
+  done < <(
+    find "${root}" -type f \
+      \( -name '.DS_Store' -o -name '._*' \) \
+      -print0
+  )
+
+  printf '%s\n' "${removed}"
+}
+
+IGNORED_MACOS_METADATA_REMOVED="$(remove_ignored_macos_metadata "${R2_ROOT}")"
+echo "Integrity preflight removed ${IGNORED_MACOS_METADATA_REMOVED} ignored macOS metadata files from ${R2_ROOT}"
+
 HAS_CHECK_ONLY=false
 HAS_RUN_BACKFILL=false
 for ((i = 0; i < ${#REMAINING_ARGS[@]}; i++)); do
