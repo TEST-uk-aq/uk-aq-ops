@@ -169,5 +169,63 @@ ConsoleNoiseFilter = ProgressAwareConsoleNoiseFilter
 SingleLineProgress = DurableSingleLineProgress
 
 
+_ORIGINAL_ASSEMBLE_SOS_LIGHT_COMPLETE_DAYS = assemble_sos_light_complete_days
+_ORIGINAL_PATH_RGLOB = Path.rglob
+
+
+def _is_ignored_macos_metadata_path(candidate: Path) -> bool:
+    """Return true only for known Finder/AppleDouble metadata files."""
+    return candidate.name == ".DS_Store" or candidate.name.startswith("._")
+
+
+def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any]:
+    """Exclude known macOS metadata while assembling the Dropbox baseline."""
+    ignored_count = 0
+
+    def filtered_rglob(
+        path_instance: Path,
+        pattern: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Iterable[Path]:
+        nonlocal ignored_count
+        for candidate in _ORIGINAL_PATH_RGLOB(
+            path_instance,
+            pattern,
+            *args,
+            **kwargs,
+        ):
+            if _is_ignored_macos_metadata_path(candidate):
+                ignored_count += 1
+                continue
+            yield candidate
+
+    Path.rglob = filtered_rglob
+    try:
+        result = _ORIGINAL_ASSEMBLE_SOS_LIGHT_COMPLETE_DAYS(run_state)
+    finally:
+        Path.rglob = _ORIGINAL_PATH_RGLOB
+
+    ignored_audit = {
+        "ignored_local_filesystem_metadata_count": ignored_count,
+        "ignored_local_filesystem_metadata_patterns": [
+            ".DS_Store",
+            "._*",
+        ],
+    }
+    result.update(ignored_audit)
+    audit = run_state.get("sos_light")
+    if isinstance(audit, dict):
+        audit.update(ignored_audit)
+        write_run_state(run_state)
+
+    if ignored_count:
+        logging.getLogger("uk-aq-history-integrity").info(
+            "SOS-light ignored %d known macOS metadata files from the Dropbox baseline",
+            ignored_count,
+        )
+    return result
+
+
 if _PUBLIC_MODULE_NAME == "__main__":
     _wrapper_sys.exit(main(_wrapper_sys.argv[1:]))
