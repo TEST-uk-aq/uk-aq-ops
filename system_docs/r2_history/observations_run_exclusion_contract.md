@@ -7,8 +7,8 @@ This document defines the authoritative run-level exclusion contract for process
 It applies to:
 
 - Prune Daily;
-- every Integrity mode, including find-only, check-only, dry-run and write-enabled repair;
-- Integrity Factory builders;
+- every current Integrity mode, including check-only, dry-run and write-enabled repair;
+- current or future Integrity repair workers;
 - observation structure migration;
 - explicit observation repair, rebuild or maintenance commands;
 - any future process that reads the observation hierarchy as a stable snapshot or mutates it.
@@ -22,6 +22,8 @@ For observations, this document supersedes the concurrent Prune Daily and Integr
 Prune Daily and Integrity must not run against R2 observations at the same time, even when their intended days, connectors or pollutants differ.
 
 The finer connector-day, day-finalisation and global-index locks in older contracts must not be relied upon as the cross-run safety boundary between Prune Daily and Integrity. They may remain as temporary internal implementation safeguards until deliberately retired, and internal same-run finalisation must still prevent lost updates.
+
+This contract does not require the draft Integrity Factory architecture. The current Integrity implementation may retain its present internal stages provided the complete covered run obeys this exclusion contract.
 
 ## One global observations lease
 
@@ -61,23 +63,24 @@ Two processes must not both receive a successful acquisition result for the same
 
 Acquisition uses a bounded retry or fail-fast policy. It must never wait indefinitely.
 
-A process that cannot acquire the lease must perform no covered observation discovery, queue production, repair or R2 mutation. Its report must identify the current lease owner and expiry where available without exposing credentials.
+A process that cannot acquire the lease must perform no covered observation discovery, comparison, repair planning or R2 mutation. Its report must identify the current lease owner and expiry where available without exposing credentials.
 
 ## Protected lifetime
 
 The protected period begins before the process reads mutable observation hierarchy state that must remain consistent.
 
-For Integrity, the lease covers:
+For current Integrity, the lease covers:
 
 ```text
 run initialisation
-high-level and low-level finding
-finder completion barrier
-queue claiming and coalescing
-all builders
-parent propagation
-final verification
+selected-scope discovery and comparison
+finding and repair planning
+all write-enabled repair stages
+parent-manifest propagation
+final verification and audit persistence
 ```
+
+A future split finder-and-builder implementation must remain within the same one-run lease, but that internal architecture is not required by this contract.
 
 For Prune Daily, the lease covers its complete observation-history operation, including candidate preparation that depends on current R2 observation state, observation writes, manifest finalisation, verification, prune-gate completion and the associated safe deletion decision.
 
@@ -109,16 +112,13 @@ Release must prove the current `run_id`. One run must not release another run's 
 
 Failure to release is recoverable through expiry, but must be reported.
 
-## Finder parallelism
+## Integrity internal parallelism
 
-Within one Integrity run holding the lease:
+Read-only Integrity checking stages may run concurrently inside one Integrity invocation holding the lease, provided they inspect the same pinned stable baseline.
 
-- `integrity_highlevel_find` and `integrity_lowlevel_find` may run concurrently;
-- both are read-only;
-- they inspect the same stable observation state;
-- no builder may begin until the finder completion barrier is satisfied.
+No write-enabled repair stage may begin until every read-only stage whose results are required for that repair has completed successfully.
 
-This is internal parallelism inside one lease owner. It does not permit Prune Daily or another Integrity run to overlap.
+This is internal parallelism inside one lease owner. It does not permit Prune Daily or another Integrity run to overlap and does not require the proposed draft finder names, queue tables or factory completion barrier.
 
 ## Writer and finaliser behaviour under the global lease
 
@@ -139,7 +139,7 @@ If implementation-internal parallel workers can target the same parent, the impl
 
 Normal public and private R2 readers do not acquire this lease. They continue reading committed objects according to their existing contracts.
 
-The lease is required for Integrity finders because their purpose is to compare a stable hierarchy and create durable repair orders. It is not a general read lock for website or API traffic.
+Integrity acquires the lease because its comparisons and any later repair decisions require a stable observations hierarchy. It is not a general read lock for website or API traffic.
 
 ## Failure behaviour
 
@@ -147,9 +147,9 @@ A failed writer can leave lower-level children newer than their parents. The lea
 
 After the failed lease expires or is released:
 
-- high-level Integrity detects aggregate hierarchy mismatches;
-- low-level Integrity detects selected-day file and manifest mismatches;
-- repair work is queued and rebuilt bottom-up.
+- the explicit hierarchy audit detects aggregate hierarchy mismatches;
+- current Integrity detects selected-day file and manifest mismatches under its active scope;
+- repairs follow the active Integrity contracts until any future factory draft is deliberately promoted.
 
 No process may hide a failed partial write by advancing parent hashes without validating the required children.
 
@@ -168,6 +168,6 @@ Before deployment, validate only that:
 - renewal and release require the owning `run_id`;
 - expiry can be reclaimed safely;
 - a second process cannot enter the protected section while the lease is active;
-- finders may share one owning run while builders remain blocked until completion.
+- all child processes of one run use the same owning `run_id` and cannot outlive the lease.
 
 Functional acceptance occurs through real TEST operation by demonstrating that overlapping Prune Daily and Integrity invocations cannot both enter the observations operation.
