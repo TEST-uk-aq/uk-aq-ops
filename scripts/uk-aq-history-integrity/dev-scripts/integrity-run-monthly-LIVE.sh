@@ -18,34 +18,90 @@ SUMMARY="$LOG_ROOT/run-summary-${RUN_STARTED}.log"
 append_connector_totals() {
   LOG_FILE="$1"
 
-  REPORT_JSON="$(
-    sed -n 's/^.*report_json=//p' "$LOG_FILE" 2>/dev/null | tail -n 1
-  )"
-
-  if [ -z "$REPORT_JSON" ] || [ ! -f "$REPORT_JSON" ]; then
-    echo "Connector observation totals unavailable" | tee -a "$SUMMARY"
-    return 0
-  fi
-
-  "$PYTHON_BIN" - "$REPORT_JSON" <<'PY' | tee -a "$SUMMARY"
+  "$PYTHON_BIN" - "$LOG_FILE" <<'PY' | tee -a "$SUMMARY"
 import json
+import re
 import sys
 from pathlib import Path
 
-report_path = Path(sys.argv[1])
+log_path = Path(sys.argv[1])
 
 try:
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-except Exception:
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+except OSError:
     print("Connector observation totals unavailable")
     raise SystemExit(0)
 
-totals = report.get("connector_observation_totals")
+
+def last_existing_report_path(field: str):
+    candidates = re.findall(rf"\b{re.escape(field)}=(\S+)", log_text)
+    for candidate in reversed(candidates):
+        path = Path(candidate)
+        if path.is_file():
+            return path
+    return None
+
+
+def totals_from_json(report_path):
+    if report_path is None:
+        return None
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    totals = report.get("connector_observation_totals")
+    return totals if isinstance(totals, dict) and totals else None
+
+
+def totals_from_markdown(report_path):
+    if report_path is None:
+        return None
+    try:
+        lines = report_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+
+    try:
+        start = lines.index("## Connector observation totals") + 1
+    except ValueError:
+        return None
+
+    totals = {}
+    connector_id = None
+    labels = {
+        "Total Observs before": "total_observations_before",
+        "Total Observs added": "total_observations_added",
+        "Total Observs after": "total_observations_after",
+    }
+
+    for line in lines[start:]:
+        if line.startswith("## "):
+            break
+        connector_match = re.fullmatch(r"### Connector (.+)", line)
+        if connector_match:
+            connector_id = connector_match.group(1).strip()
+            totals.setdefault(connector_id, {})
+            continue
+        value_match = re.fullmatch(
+            r"- (Total Observs (?:before|added|after)): ([0-9,]+)",
+            line,
+        )
+        if connector_id and value_match:
+            totals[connector_id][labels[value_match.group(1)]] = int(
+                value_match.group(2).replace(",", "")
+            )
+
+    return totals or None
+
+
+report_json = last_existing_report_path("report_json")
+report_md = last_existing_report_path("report_md")
+totals = totals_from_json(report_json) or totals_from_markdown(report_md)
+
 if not isinstance(totals, dict) or not totals:
     print("Connector observation totals unavailable")
     raise SystemExit(0)
 
-printed = False
 
 def connector_sort_key(item):
     connector_id = str(item[0])
@@ -54,6 +110,8 @@ def connector_sort_key(item):
     except ValueError:
         return (1, connector_id)
 
+
+printed = False
 for connector_id, values in sorted(totals.items(), key=connector_sort_key):
     if not isinstance(values, dict):
         continue
@@ -122,7 +180,7 @@ run_batch() {
   fi
 }
 
-run_batch 2025-05-01 2025-05-31 2025-06
+run_batch 2025-05-01 2025-05-31 2025-05
 run_batch 2025-06-01 2025-06-30 2025-06
 run_batch 2025-07-01 2025-07-31 2025-07
 run_batch 2025-08-01 2025-08-31 2025-08
