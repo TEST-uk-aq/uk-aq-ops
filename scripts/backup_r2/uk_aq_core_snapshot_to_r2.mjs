@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import zlib from "node:zlib";
@@ -912,7 +913,7 @@ let reportOutPath = DEFAULT_REPORT_OUT;
 
 function isMainModule(moduleUrl) {
   if (!process.argv[1]) return false;
-  return path.resolve(process.argv[1]) === new URL(moduleUrl).pathname;
+  return path.resolve(process.argv[1]) === fileURLToPath(moduleUrl);
 }
 
 if (isMainModule(import.meta.url)) {
