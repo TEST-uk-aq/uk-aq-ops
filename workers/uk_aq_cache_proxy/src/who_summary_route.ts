@@ -5,6 +5,7 @@ const CACHE_CONTRACT_VERSION = "1";
 const UPSTREAM_AUTH_HEADER = "X-UK-AQ-Upstream-Auth";
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const VALID_FRESHNESS = new Set(["current", "behind", "ahead"]);
+const BROWSER_CACHE_CONTROL = "no-store";
 
 type ExecutionContextLike = {
   waitUntil(promise: Promise<unknown>): void;
@@ -20,7 +21,7 @@ function jsonError(status: number, code: string, message: string): Response {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
+      "Cache-Control": BROWSER_CACHE_CONTROL,
       "X-Content-Type-Options": "nosniff",
     },
   });
@@ -50,8 +51,13 @@ function responseForMethod(request: Request, response: Response): Response {
   });
 }
 
-function withCacheStatus(response: Response, cacheStatus: "HIT" | "MISS"): Response {
+function browserResponse(response: Response, cacheStatus: "HIT" | "MISS"): Response {
   const headers = new Headers(response.headers);
+  const workerCacheControl = String(headers.get("Cache-Control") || "").trim();
+  if (workerCacheControl) {
+    headers.set("X-UK-AQ-WHO-Worker-Cache-Control", workerCacheControl);
+  }
+  headers.set("Cache-Control", BROWSER_CACHE_CONTROL);
   headers.set("X-UK-AQ-Cache", cacheStatus);
   return new Response(response.body, {
     status: response.status,
@@ -99,7 +105,7 @@ export async function handleWhoSummaryProxyRequest(
         Allow: "GET, HEAD, OPTIONS",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
         "Access-Control-Allow-Headers": "Accept",
-        "Cache-Control": "no-store",
+        "Cache-Control": BROWSER_CACHE_CONTROL,
       },
     });
   }
@@ -107,7 +113,7 @@ export async function handleWhoSummaryProxyRequest(
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Method Not Allowed", {
       status: 405,
-      headers: { Allow: "GET, HEAD, OPTIONS", "Cache-Control": "no-store" },
+      headers: { Allow: "GET, HEAD, OPTIONS", "Cache-Control": BROWSER_CACHE_CONTROL },
     });
   }
 
@@ -120,7 +126,7 @@ export async function handleWhoSummaryProxyRequest(
   const cacheRequest = canonicalCacheRequest(request, requestedAsOfDayUtc);
   const cached = await (caches as CacheStorage & { default: Cache }).default.match(cacheRequest);
   if (cached) {
-    return responseForMethod(request, withCacheStatus(cached, "HIT"));
+    return responseForMethod(request, browserResponse(cached, "HIT"));
   }
 
   const targetUrl = upstreamUrl(env, requestedAsOfDayUtc);
@@ -143,21 +149,20 @@ export async function handleWhoSummaryProxyRequest(
     return jsonError(502, "who_upstream_failed", "WHO summary upstream request failed");
   }
 
-  const headers = new Headers(upstreamResponse.headers);
-  headers.set("X-UK-AQ-Cache", "MISS");
-  const response = new Response(upstreamResponse.body, {
+  const cacheHeaders = new Headers(upstreamResponse.headers);
+  const cacheResponse = new Response(upstreamResponse.body, {
     status: upstreamResponse.status,
     statusText: upstreamResponse.statusText,
-    headers,
+    headers: cacheHeaders,
   });
 
-  if (isCacheableWhoResponse(response)) {
+  if (isCacheableWhoResponse(cacheResponse)) {
     ctx.waitUntil(
       (caches as CacheStorage & { default: Cache }).default
-        .put(cacheRequest, response.clone())
+        .put(cacheRequest, cacheResponse.clone())
         .catch((error) => console.warn("WHO summary cache-proxy cache write failed", error)),
     );
   }
 
-  return responseForMethod(request, response);
+  return responseForMethod(request, browserResponse(cacheResponse, "MISS"));
 }
