@@ -1,5 +1,5 @@
 name = "uk-aq-observs-history-r2-api"
-main = "worker.mjs"
+main = "entry.mjs"
 compatibility_date = "2026-03-09"
 
 [vars]
