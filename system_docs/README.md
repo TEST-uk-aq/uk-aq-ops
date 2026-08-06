@@ -60,6 +60,7 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 | Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current |
 | Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Authoritative for stable bindings, embedded continuity, current Integrity, targeted indexes, Phase B history writes and observations aggregate manifests |
 | Calculated hourly AQI and station-chart bands | [`aqi-levels/`](aqi-levels/) | Authoritative and current, including continuity-aware calculated chart AQI and asynchronous R2 validation |
+| WHO 2021 daily, rolling-year and calendar-year derived data | [`who_2021/`](who_2021/) | Authoritative for calculation completeness, readiness, source fallback, correction-day recalculation and publication ordering |
 | Shared website station-chart frontend | [`station_charts/`](station_charts/) | Authoritative for modular chart architecture, browser cache ownership, AQI-source switching, rendering and page adapters |
 | Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending outside completed R2-history contracts |
 | Observs outbox and partition maintenance | `observs_operations/` | Migration analysis pending |
@@ -72,7 +73,19 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 | Postcode and geography lookup products | [`geography/`](geography/) | Authoritative and current |
 | Shared runtime components and cross-area invariants | `shared/` | Migration analysis pending |
 
-Directories marked pending are proposed area boundaries. They do not override completed contracts in `ingest/`, `r2_history/`, `aqi-levels/`, `station_charts/`, `latest_snapshot/`, `dashboards/`, `geography/` or the completed Supabase logical and R2 history Dropbox backup scopes in `backup_and_recovery/`.
+Directories marked pending are proposed area boundaries. They do not override completed contracts in `ingest/`, `r2_history/`, `aqi-levels/`, `who_2021/`, `station_charts/`, `latest_snapshot/`, `dashboards/`, `geography/` or the completed Supabase logical and R2 history Dropbox backup scopes in `backup_and_recovery/`.
+
+## WHO 2021 reading set
+
+Any change involving WHO daily means, readiness, correction-day processing, rolling-year or calendar-year status, source fallback or WHO summary publication must read:
+
+1. [`who_2021/README.md`](who_2021/README.md)
+2. [`who_2021/contract.md`](who_2021/contract.md)
+3. [`who_2021/interfaces.md`](who_2021/interfaces.md)
+4. [`who_2021/operations.md`](who_2021/operations.md)
+5. [`cache_proxy/who-summary-contract.md`](cache_proxy/who-summary-contract.md) when the public homepage route or cache behaviour is also in scope
+
+The WHO calculation contract deliberately separates the weak operational readiness gate from the 18-valid-hour daily and configured valid-day scientific-completeness rules.
 
 ## R2 history and station-history reading set
 
