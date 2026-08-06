@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  AQI_ALGORITHM_VERSION,
   AQI_V1_NORMALIZED_COLUMNS,
   buildAqilevelHistoryRowsForDayFromSourceObservations,
 } from "../lib/aqi/aqi_levels.mjs";
@@ -97,9 +98,87 @@ test("PM2.5 rolling 24h DAQI uses previous-day context", () => {
   assert.equal(rows[0].timestamp_hour_utc, "2025-01-02T00:00:00.000Z");
   assert.equal(rows[0].daqi_input_averaging_code, "rolling_24h_mean");
   assert.equal(rows[0].daqi_source_observation_count, 24);
-  assert.equal(rows[0].daqi_required_observation_count, 24);
+  assert.equal(rows[0].daqi_required_observation_count, 18);
   assert.equal(rows[0].daqi_calculation_status, "ok");
   assert.equal(rows[0].daqi_index_level, 2);
+  assert.equal(rows[0].algorithm_version, AQI_ALGORITHM_VERSION);
+  assert.equal(AQI_ALGORITHM_VERSION, "aqilevels_hourly_v2");
+});
+
+test("PM DAQI accepts 18 of 24 valid hourly means and rejects 17", () => {
+  const eighteenRows = buildAqilevelHistoryRowsForDayFromSourceObservations(
+    hourlyRows({
+      timeseriesId: 2101,
+      stationId: 211,
+      connectorId: 7,
+      pollutantCode: "pm25",
+      startIso: "2025-01-01T07:00:00.000Z",
+      hours: 18,
+      value: 12,
+    }),
+    "2025-01-02",
+  );
+  const eighteenEndpoint = eighteenRows.find((row) => row.timestamp_hour_utc === "2025-01-02T00:00:00.000Z");
+  assert.ok(eighteenEndpoint);
+  assert.equal(eighteenEndpoint.daqi_source_observation_count, 18);
+  assert.equal(eighteenEndpoint.daqi_required_observation_count, 18);
+  assert.equal(eighteenEndpoint.daqi_calculation_status, "ok");
+
+  const seventeenRows = buildAqilevelHistoryRowsForDayFromSourceObservations(
+    hourlyRows({
+      timeseriesId: 2102,
+      stationId: 212,
+      connectorId: 7,
+      pollutantCode: "pm25",
+      startIso: "2025-01-01T08:00:00.000Z",
+      hours: 17,
+      value: 12,
+    }),
+    "2025-01-02",
+  );
+  const seventeenEndpoint = seventeenRows.find((row) => row.timestamp_hour_utc === "2025-01-02T00:00:00.000Z");
+  assert.ok(seventeenEndpoint);
+  assert.equal(seventeenEndpoint.daqi_source_observation_count, 17);
+  assert.equal(seventeenEndpoint.daqi_required_observation_count, 18);
+  assert.equal(seventeenEndpoint.daqi_calculation_status, "insufficient_samples");
+  assert.equal(seventeenEndpoint.daqi_index_level, null);
+});
+
+test("PM DAQI continues across two missing hourly readings while EAQI remains hourly", () => {
+  const missingHours = new Set([
+    "2025-01-02T02:00:00.000Z",
+    "2025-01-02T03:00:00.000Z",
+  ]);
+  const sourceRows = hourlyRows({
+    timeseriesId: 2201,
+    stationId: 221,
+    connectorId: 1,
+    pollutantCode: "pm25",
+    startIso: "2025-01-01T00:00:00.000Z",
+    hours: 30,
+    value: 12,
+  }).filter((row) => !missingHours.has(row.observed_at));
+
+  const rows = buildAqilevelHistoryRowsForDayFromSourceObservations(sourceRows, "2025-01-02");
+  const gapRows = [...missingHours].map((timestamp) => rows.find((row) => row.timestamp_hour_utc === timestamp));
+  assert.ok(gapRows.every(Boolean));
+  for (const row of gapRows) {
+    assert.equal(row.daqi_calculation_status, "ok");
+    assert.equal(row.daqi_required_observation_count, 18);
+    assert.ok(row.daqi_source_observation_count >= 18);
+    assert.notEqual(row.daqi_index_level, null);
+    assert.equal(row.eaqi_input_averaging_code, "hourly_mean");
+    assert.equal(row.eaqi_required_observation_count, 1);
+    assert.equal(row.eaqi_source_observation_count, null);
+    assert.equal(row.eaqi_calculation_status, "missing_input");
+    assert.equal(row.eaqi_index_level, null);
+    assert.equal(row.hourly_sample_count, null);
+  }
+
+  const nextObservedRow = rows.find((row) => row.timestamp_hour_utc === "2025-01-02T04:00:00.000Z");
+  assert.ok(nextObservedRow);
+  assert.equal(nextObservedRow.eaqi_calculation_status, "ok");
+  assert.notEqual(nextObservedRow.eaqi_index_level, null);
 });
 
 test("PM10 rolling DAQI reports insufficient samples when previous context is incomplete", () => {
@@ -119,6 +198,7 @@ test("PM10 rolling DAQI reports insufficient samples when previous context is in
   assert.equal(rows.length, 1);
   assert.equal(rows[0].daqi_input_averaging_code, "rolling_24h_mean");
   assert.equal(rows[0].daqi_source_observation_count, 1);
+  assert.equal(rows[0].daqi_required_observation_count, 18);
   assert.equal(rows[0].daqi_calculation_status, "insufficient_samples");
   assert.equal(rows[0].daqi_missing_reason, "insufficient_rolling_24h_hours");
   assert.equal(rows[0].daqi_index_level, null);
