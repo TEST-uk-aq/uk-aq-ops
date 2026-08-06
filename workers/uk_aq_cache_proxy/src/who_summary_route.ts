@@ -1,11 +1,14 @@
 export const WHO_SUMMARY_API_PATH = "/api/aq/who-summary";
 
 const WHO_SUMMARY_UPSTREAM_PATH = "/v1/who-summary";
-const CACHE_CONTRACT_VERSION = "1";
+const CACHE_CONTRACT_VERSION = "2";
 const UPSTREAM_AUTH_HEADER = "X-UK-AQ-Upstream-Auth";
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const VALID_FRESHNESS = new Set(["current", "behind", "ahead"]);
 const BROWSER_CACHE_CONTROL = "no-store";
+const CURRENT_TTL_SECONDS = 86_400;
+const BEHIND_TTL_SECONDS = 1_800;
+const STALE_IF_ERROR_SECONDS = 86_400;
 
 type ExecutionContextLike = {
   waitUntil(promise: Promise<unknown>): void;
@@ -80,6 +83,11 @@ function upstreamUrl(env: WhoSummaryProxyEnv, requestedAsOfDayUtc: string): URL 
   }
 }
 
+function internalCacheControlFor(freshness: string): string {
+  const ttl = freshness === "behind" ? BEHIND_TTL_SECONDS : CURRENT_TTL_SECONDS;
+  return `public, max-age=${ttl}, s-maxage=${ttl}, stale-if-error=${STALE_IF_ERROR_SECONDS}`;
+}
+
 function isCacheableWhoResponse(response: Response): boolean {
   if (!response.ok) return false;
   const freshness = String(response.headers.get("X-UK-AQ-WHO-Freshness") || "").trim();
@@ -150,6 +158,10 @@ export async function handleWhoSummaryProxyRequest(
   }
 
   const cacheHeaders = new Headers(upstreamResponse.headers);
+  const freshness = String(cacheHeaders.get("X-UK-AQ-WHO-Freshness") || "").trim();
+  if (VALID_FRESHNESS.has(freshness)) {
+    cacheHeaders.set("Cache-Control", internalCacheControlFor(freshness));
+  }
   const cacheResponse = new Response(upstreamResponse.body, {
     status: upstreamResponse.status,
     statusText: upstreamResponse.statusText,
