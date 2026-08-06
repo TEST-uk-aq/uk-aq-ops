@@ -1,5 +1,5 @@
 name = "uk-aq-cache-proxy"
-main = "src/index.ts"
+main = "src/entry.ts"
 compatibility_date = "2026-02-22"
 compatibility_flags = ["global_fetch_strictly_public"]
 

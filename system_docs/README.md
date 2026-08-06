@@ -64,7 +64,7 @@ See [`documentation_contract.md`](documentation_contract.md) for full maintenanc
 | Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending outside completed R2-history contracts |
 | Observs outbox and partition maintenance | `observs_operations/` | Migration analysis pending |
 | Public and private R2-backed APIs outside completed history/AQI boundaries | `api_services/` | Migration analysis pending |
-| Cache proxy and website routing outside completed history/AQI boundaries | `cache_proxy/` | Migration analysis pending |
+| Cache proxy and website routing outside completed history/AQI boundaries | [`cache_proxy/`](cache_proxy/) | Authoritative for the WHO homepage summary route and UTC-day browser/edge cache; broader cache-proxy migration remains pending |
 | R2 and database backups, restore and repair outside completed contracts | [`backup_and_recovery/`](backup_and_recovery/) | Authoritative for the Supabase logical database dump backup and R2 v2 history Dropbox backup inventory/checkpoint contract; broader migration remains pending |
 | Cloudflare and GCP scheduling | `scheduling/` | Migration analysis pending |
 | Task health, metrics and operational dashboards | `monitoring/` | Migration analysis pending |
