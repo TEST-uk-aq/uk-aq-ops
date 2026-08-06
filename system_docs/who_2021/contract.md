@@ -54,7 +54,7 @@ It MUST be applied separately to every configured pollutant.
 
 For each pollutant:
 
-1. Determine the eligible timeseries at the end of the target day.
+1. Determine the timeseries eligible during the final six-hour window. A timeseries is eligible when it has started by the inclusive window end and has not ended before or at the exclusive window start.
 2. Count the eligible timeseries with at least one non-null, non-negative observation in the final six-hour hour-ending window.
 3. Compare that count with the configured minimum coverage ratio.
 
