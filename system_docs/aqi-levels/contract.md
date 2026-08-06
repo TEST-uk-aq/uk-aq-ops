@@ -20,6 +20,7 @@ The active product is:
 - grain: hourly;
 - indices: UK DAQI and European AQI;
 - output: normalized per-timeseries, per-pollutant hourly rows;
+- algorithm version: `aqilevels_hourly_v2`;
 - historical persistence: R2 AQI levels history;
 - recent values: calculated on demand where committed R2 AQI is not yet available;
 - website use: coloured hourly DAQI and European AQI bands.
@@ -98,13 +99,15 @@ Before changing bucket assignment, verify the timestamp convention for every act
 - PM2.5 uses the rolling 24-hour mean ending at `n`.
 - PM10 uses the rolling 24-hour mean ending at `n`.
 
-For PM, the rolling input contains the hourly values whose endpoints are:
+For PM, the rolling window contains the possible hourly endpoints:
 
 ```text
 n - 23 hours, ..., n - 1 hour, n
 ```
 
-A PM DAQI result is valid only when all 24 required hourly values are available. Fewer than 24 valid hours produces:
+A PM DAQI result is valid when at least 18 of those 24 possible hourly values are valid and available. The rolling mean is calculated from the available valid hourly values only. Missing hours are not interpolated, carried forward or assigned a replacement concentration.
+
+Fewer than 18 valid hours produces:
 
 ```text
 daqi_calculation_status = insufficient_samples
@@ -112,13 +115,23 @@ daqi_index_level = null
 daqi_missing_reason = insufficient_rolling_24h_hours
 ```
 
+The PM source and required counts are therefore:
+
+```text
+daqi_source_observation_count   = number of valid hourly means in the rolling window
+daqi_required_observation_count = 18
+```
+
 ### European AQI
 
 NO2, PM2.5 and PM10 use the hourly mean ending at `n`.
 
-European AQI is independent of PM DAQI rolling-window completeness. A row may therefore contain a valid European AQI level while its PM DAQI level is null because fewer than 24 rolling hours are available.
+European AQI is independent of PM DAQI rolling-window completeness. A row may therefore contain:
 
-A valid European AQI result MUST NOT be suppressed solely because DAQI is unavailable.
+- a valid European AQI level while PM DAQI is unavailable because fewer than 18 rolling hours are valid; or
+- a valid PM DAQI level while European AQI is unavailable because the hourly value at `n` is missing but at least 18 other valid hourly values remain in the PM rolling window.
+
+A valid result for either index MUST NOT be suppressed solely because the other index is unavailable.
 
 ## Breakpoint boundary rule
 
@@ -241,12 +254,21 @@ The final coloured AQI section must end at the final valid AQI endpoint. It must
 
 ### Missing hours
 
-A missing hour remains blank. Readers and renderers MUST NOT:
+Missing output is index-specific.
 
-- stretch the previous level into the missing hour;
-- stretch a later level backwards across the gap;
+When the hourly observation at PM endpoint `n` is missing:
+
+- European AQI at `n` is missing and its band remains blank;
+- PM DAQI at `n` may still be valid when at least 18 of the 24 rolling hourly values are available;
+- PM DAQI at `n` is missing when fewer than 18 rolling hourly values are available.
+
+Readers and renderers MUST NOT:
+
+- stretch the previous level into an index-specific missing hour;
+- stretch a later level backwards across a gap;
 - infer a level from visual continuity;
-- treat a missing DAQI level as permission to discard a valid European AQI level.
+- discard a valid DAQI value because European AQI is missing;
+- discard a valid European AQI value because DAQI is missing.
 
 ### UTC day storage
 
@@ -301,7 +323,7 @@ For each index row ending at `n`:
 - the marker or concentration endpoint at `n` aligns with the right edge of the rectangle;
 - the renderer clips to the requested chart interval;
 - the final rectangle does not extend to `n + 1 hour`;
-- DAQI and European AQI use the same time boundaries even though their values may differ.
+- DAQI and European AQI use the same time boundaries even though their values and availability may differ.
 
 ## Daily and monthly roll-ups
 
@@ -348,7 +370,7 @@ These behaviours do not override this contract.
 
 ## Contract-change rule
 
-Any future change to pollutant support, breakpoint boundaries, averaging windows, endpoint semantics, row identity, R2 precedence, completeness, data/debug profiles, website interval rendering or roll-up activation requires:
+Any future change to pollutant support, breakpoint boundaries, averaging windows, minimum valid sample count, endpoint semantics, row identity, R2 precedence, completeness, data/debug profiles, website interval rendering or roll-up activation requires:
 
 1. an update to this contract;
 2. an update or new decision record;
