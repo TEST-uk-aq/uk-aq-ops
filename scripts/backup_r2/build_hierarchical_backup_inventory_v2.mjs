@@ -24,6 +24,9 @@ import {
   validateObservationRunManifestInventoryShard,
 } from "./lib/hierarchical_backup_v2.mjs";
 import {
+  buildTimeseriesBindingInventory,
+} from "./lib/timeseries_binding_ranges_v2.mjs";
+import {
   OBSERVATIONS_AGGREGATE_MANIFEST_KINDS,
   validateR2HistoryV2ObservationsAggregateManifest,
 } from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
@@ -34,18 +37,23 @@ const DEFAULT_OBSERVATIONS_PREFIX = normalizePrefix(
   process.env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || "history/v2/observations",
 );
 const DEFAULT_RUNS_PREFIX = normalizePrefix(
-  process.env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX
-  || "history/v2/_ops/observations/runs",
+  process.env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || "history/v2/_ops/observations/runs",
+);
+const DEFAULT_INDEX_V2_PREFIX = normalizePrefix(
+  process.env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || "history/_index_v2",
+);
+const DEFAULT_TIMESERIES_BINDING_PREFIX = normalizePrefix(
+  process.env.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX
+  || `${DEFAULT_INDEX_V2_PREFIX}/timeseries_binding`,
 );
 const DEFAULT_INVENTORY_ROOT_PREFIX = normalizePrefix(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
   || "history/_index_v2/backup_inventory_v2",
 );
-const DEFAULT_LEGACY_INVENTORY_KEY =
-  String(
-    process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH
-    || "history/_index_v2/backup_inventory_v2.json",
-  ).trim().replace(/^\/+/, "");
+const DEFAULT_LEGACY_INVENTORY_KEY = String(
+  process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH
+  || "history/_index_v2/backup_inventory_v2.json",
+).trim().replace(/^\/+/, "");
 const DEFAULT_REPORT_OUT = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_REPORT_OUT || "",
 ).trim();
@@ -62,10 +70,11 @@ function usage() {
     "Options:",
     `  --observations-prefix <p>    Default: ${DEFAULT_OBSERVATIONS_PREFIX}`,
     `  --runs-prefix <p>            Default: ${DEFAULT_RUNS_PREFIX}`,
+    `  --timeseries-binding-prefix <p> Default: ${DEFAULT_TIMESERIES_BINDING_PREFIX}`,
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
     `  --legacy-inventory-key <p>   Default: ${DEFAULT_LEGACY_INVENTORY_KEY}`,
     `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
-    "  --full-scan                  Independently enumerate and verify every day manifest",
+    "  --full-scan                  Independently hash all observation days and bindings",
     "  --dry-run                    Build and compare only; do not write inventory objects",
     "  --report-out <file>          Write JSON report",
     "  -h, --help",
@@ -77,6 +86,7 @@ function parseArgs(argv) {
     source_root: "",
     observations_prefix: DEFAULT_OBSERVATIONS_PREFIX,
     runs_prefix: DEFAULT_RUNS_PREFIX,
+    timeseries_binding_prefix: DEFAULT_TIMESERIES_BINDING_PREFIX,
     inventory_root_prefix: DEFAULT_INVENTORY_ROOT_PREFIX,
     legacy_inventory_key: DEFAULT_LEGACY_INVENTORY_KEY,
     rclone_bin: DEFAULT_RCLONE_BIN,
@@ -84,691 +94,378 @@ function parseArgs(argv) {
     dry_run: false,
     report_out: DEFAULT_REPORT_OUT,
   };
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === "--source-root") {
-      args.source_root = String(argv[index + 1] || "").trim();
-      index += 1;
-      continue;
-    }
-    if (arg === "--observations-prefix") {
-      args.observations_prefix = normalizePrefix(argv[index + 1]);
-      index += 1;
-      continue;
-    }
-    if (arg === "--runs-prefix") {
-      args.runs_prefix = normalizePrefix(argv[index + 1]);
-      index += 1;
-      continue;
-    }
-    if (arg === "--inventory-root-prefix") {
-      args.inventory_root_prefix = normalizePrefix(argv[index + 1]);
-      index += 1;
-      continue;
-    }
-    if (arg === "--legacy-inventory-key") {
-      args.legacy_inventory_key = String(argv[index + 1] || "")
-        .trim().replace(/^\/+/, "");
-      index += 1;
-      continue;
-    }
-    if (arg === "--rclone-bin") {
-      args.rclone_bin = String(argv[index + 1] || "").trim() || DEFAULT_RCLONE_BIN;
-      index += 1;
-      continue;
-    }
-    if (arg === "--full-scan") {
-      args.full_scan = true;
-      continue;
-    }
-    if (arg === "--dry-run") {
-      args.dry_run = true;
-      continue;
-    }
-    if (arg === "--report-out") {
-      args.report_out = String(argv[index + 1] || "").trim();
-      index += 1;
-      continue;
-    }
-    if (arg === "-h" || arg === "--help") {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const next = () => String(argv[++i] || "").trim();
+    if (arg === "--source-root") args.source_root = next();
+    else if (arg === "--observations-prefix") args.observations_prefix = normalizePrefix(next());
+    else if (arg === "--runs-prefix") args.runs_prefix = normalizePrefix(next());
+    else if (arg === "--timeseries-binding-prefix") {
+      args.timeseries_binding_prefix = normalizePrefix(next());
+    } else if (arg === "--inventory-root-prefix") {
+      args.inventory_root_prefix = normalizePrefix(next());
+    } else if (arg === "--legacy-inventory-key") {
+      args.legacy_inventory_key = next().replace(/^\/+/, "");
+    } else if (arg === "--rclone-bin") args.rclone_bin = next() || DEFAULT_RCLONE_BIN;
+    else if (arg === "--report-out") args.report_out = next();
+    else if (arg === "--full-scan") args.full_scan = true;
+    else if (arg === "--dry-run") args.dry_run = true;
+    else if (arg === "-h" || arg === "--help") {
       usage();
       process.exit(0);
-    }
-    throw new Error(`Unknown argument: ${arg}`);
+    } else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!args.source_root) throw new Error("--source-root is required");
   if (!args.observations_prefix) throw new Error("--observations-prefix is required");
-  if (!args.inventory_root_prefix) {
-    throw new Error("--inventory-root-prefix is required");
+  if (!args.timeseries_binding_prefix) {
+    throw new Error("--timeseries-binding-prefix is required");
   }
-  if (!args.legacy_inventory_key) {
-    throw new Error("--legacy-inventory-key is required");
-  }
+  if (!args.inventory_root_prefix) throw new Error("--inventory-root-prefix is required");
+  if (!args.legacy_inventory_key) throw new Error("--legacy-inventory-key is required");
   return args;
 }
 
-function readJson(rcloneBin, sourceRoot, relativePath) {
-  const text = rcloneCat(
-    rcloneBin,
-    joinTargetPath(sourceRoot, relativePath),
-  );
-  let parsed;
+function readJson(rcloneBin, root, relativePath) {
+  const text = rcloneCat(rcloneBin, joinTargetPath(root, relativePath));
   try {
-    parsed = JSON.parse(text);
+    return { text, parsed: JSON.parse(text) };
   } catch (error) {
-    throw new Error(
-      `Invalid JSON at ${relativePath}: ${error?.message || error}`,
-    );
+    throw new Error(`Invalid JSON at ${relativePath}: ${error?.message || error}`);
   }
-  return { text, parsed };
 }
 
-function readJsonMaybe(rcloneBin, sourceRoot, relativePath) {
-  const normalizedPath = String(relativePath || "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^\/+/, "");
-  const parentRelativePath = path.posix.dirname(normalizedPath);
-  const fileName = path.posix.basename(normalizedPath);
-  const parentPath = joinTargetPath(
-    sourceRoot,
-    parentRelativePath === "." ? "" : parentRelativePath,
+function readJsonMaybe(rcloneBin, root, relativePath) {
+  const rel = String(relativePath || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  const dir = path.posix.dirname(rel);
+  const entry = rcloneLsjsonFile(
+    rcloneBin,
+    joinTargetPath(root, dir === "." ? "" : dir),
+    path.posix.basename(rel),
   );
-  const entry = rcloneLsjsonFile(rcloneBin, parentPath, fileName);
-  if (!entry) return null;
-  return readJson(rcloneBin, sourceRoot, normalizedPath);
+  return entry ? readJson(rcloneBin, root, rel) : null;
 }
 
-function writeReport(reportOut, payload) {
-  if (!reportOut) return;
-  const output = path.resolve(reportOut);
-  fs.mkdirSync(path.dirname(output), { recursive: true });
-  fs.writeFileSync(output, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-}
-
-function writeRemoteJson({
-  rcloneBin,
-  sourceRoot,
-  relativePath,
-  payload,
-  dryRun,
-}) {
+function writeRemoteJson(rcloneBin, root, relativePath, payload, dryRun) {
   const text = stableJson(payload);
-  const targetPath = joinTargetPath(sourceRoot, relativePath);
-  const existing = rcloneCatMaybe(rcloneBin, targetPath);
+  const target = joinTargetPath(root, relativePath);
+  const existing = rcloneCatMaybe(rcloneBin, target);
   const changed = !existing.found || existing.text !== text;
   if (changed && !dryRun) {
-    uploadFromTempFile(
-      rcloneBin,
-      targetPath,
-      text,
-      "uk_aq_hierarchical_inventory_",
-    );
+    uploadFromTempFile(rcloneBin, target, text, "uk_aq_hierarchical_inventory_");
   }
   return {
     changed,
     written: changed && !dryRun,
     hash: sha256Hex(text),
-    size: Buffer.byteLength(text, "utf8"),
   };
 }
 
-function entryRelativePath(entry) {
-  return String(entry?.Path || entry?.Name || "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^\/+/, "");
+function writeReport(filename, report) {
+  if (!filename) return;
+  const output = path.resolve(filename);
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  fs.writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 }
 
-function entryMetadata(entry) {
-  const hashes = entry?.Hashes && typeof entry.Hashes === "object"
-    ? entry.Hashes
-    : {};
-  const size = Number(entry?.Size);
-  return {
-    size: Number.isFinite(size) ? Math.max(0, Math.trunc(size)) : null,
-    r2_md5: String(hashes.md5 || hashes.MD5 || "").trim() || null,
-    r2_modtime: String(entry?.ModTime || "").trim() || null,
-  };
-}
-
-function previousRunUnitMap(previousRunShard) {
-  return new Map(
-    (previousRunShard?.units || [])
-      .map((entry) => [String(entry.unit_key || ""), entry]),
+function validateAggregate(raw, expectedKind, observationsPrefix, identity = {}) {
+  const manifest = validateR2HistoryV2ObservationsAggregateManifest(
+    raw,
+    { basePrefix: observationsPrefix },
   );
+  if (manifest.kind !== expectedKind) {
+    throw new Error(`Unexpected aggregate manifest kind ${manifest.kind}`);
+  }
+  if (identity.year !== undefined && String(manifest.year) !== String(identity.year)) {
+    throw new Error(`Observation year identity mismatch: ${manifest.year}`);
+  }
+  if (
+    identity.month !== undefined
+    && String(manifest.month).padStart(2, "0") !== String(identity.month).padStart(2, "0")
+  ) {
+    throw new Error(`Observation month identity mismatch: ${manifest.year}-${manifest.month}`);
+  }
+  return manifest;
 }
 
-function scanRunManifestUnits({
-  rcloneBin,
-  sourceRoot,
-  runsPrefix,
-  previousRunShard,
-}) {
-  const previous = previousRunUnitMap(previousRunShard);
+function dayManifestRecord(rcloneBin, sourceRoot, manifestKey, expectedHash = null) {
+  const { text, parsed } = readJson(rcloneBin, sourceRoot, manifestKey);
+  const manifestHash = String(parsed?.manifest_hash || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(manifestHash)) {
+    throw new Error(`Day manifest has invalid manifest_hash: ${manifestKey}`);
+  }
+  if (expectedHash && manifestHash !== expectedHash) {
+    throw new Error(`Day manifest hash mismatch at ${manifestKey}`);
+  }
+  const match = /day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/.exec(manifestKey);
+  if (!match) throw new Error(`Invalid observation day manifest path: ${manifestKey}`);
+  return {
+    day_utc: match[1],
+    manifest_key: manifestKey,
+    manifest_hash: manifestHash,
+    manifest_file_hash: sha256Hex(text),
+    manifest_size: Buffer.byteLength(text, "utf8"),
+  };
+}
+
+function fullScanObservationDays(args) {
   const entries = rcloneLsjsonRecursive(
-    rcloneBin,
-    joinTargetPath(sourceRoot, runsPrefix),
+    args.rclone_bin,
+    joinTargetPath(args.source_root, args.observations_prefix),
+    { hash: false, maxDepth: 2 },
+  );
+  const days = new Map();
+  for (const entry of entries) {
+    const rel = String(entry?.Path || entry?.Name || "").replace(/\\/g, "/");
+    const match = /^day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/.exec(rel);
+    if (!match) continue;
+    const key = `${args.observations_prefix}/${rel}`;
+    days.set(match[1], dayManifestRecord(args.rclone_bin, args.source_root, key));
+  }
+  return days;
+}
+
+function scanRunManifests(args, previousShard) {
+  const previous = new Map(
+    (previousShard?.units || []).map((unit) => [unit.unit_key, unit]),
+  );
+  const entries = rcloneLsjsonRecursive(
+    args.rclone_bin,
+    joinTargetPath(args.source_root, args.runs_prefix),
     { hash: true, maxDepth: 2 },
   );
   const units = [];
   let reused = 0;
   let read = 0;
   for (const entry of entries) {
-    const relative = entryRelativePath(entry);
-    const match = /^(run_id=[^/]+\/run_manifest\.json)$/.exec(relative);
+    const rel = String(entry?.Path || entry?.Name || "").replace(/\\/g, "/");
+    const match = /^(run_id=[^/]+\/run_manifest\.json)$/.exec(rel);
     if (!match) continue;
     const unitKey = match[1];
-    const relativePath = `${runsPrefix}/${unitKey}`;
-    const metadata = entryMetadata(entry);
+    const hashes = entry?.Hashes || {};
+    const md5 = String(hashes.md5 || hashes.MD5 || "").trim() || null;
+    const size = Number(entry?.Size);
     const prior = previous.get(unitKey);
-    const metadataMatches = prior
-      && Number(prior.size) === metadata.size
-      && metadata.r2_md5
-      && prior.r2_md5 === metadata.r2_md5;
-    if (metadataMatches && prior.hash) {
+    if (
+      prior
+      && prior.hash
+      && md5
+      && prior.r2_md5 === md5
+      && Number(prior.size) === size
+    ) {
       units.push({ ...prior });
       reused += 1;
       continue;
     }
+    const relativePath = `${args.runs_prefix}/${unitKey}`;
     const text = rcloneCat(
-      rcloneBin,
-      joinTargetPath(sourceRoot, relativePath),
+      args.rclone_bin,
+      joinTargetPath(args.source_root, relativePath),
     );
     units.push({
       unit_key: unitKey,
       relative_path: relativePath,
       hash: sha256Hex(text),
       size: Buffer.byteLength(text, "utf8"),
-      r2_md5: metadata.r2_md5,
+      r2_md5: md5,
     });
     read += 1;
   }
-  units.sort((left, right) => left.unit_key.localeCompare(right.unit_key));
+  units.sort((a, b) => a.unit_key.localeCompare(b.unit_key));
   return { units, listed: units.length, reused, read };
-}
-
-function previousYearMap(previousRoot) {
-  return new Map(
-    (previousRoot?.observations?.years || [])
-      .map((entry) => [String(entry.year), entry]),
-  );
-}
-
-function previousMonthMap(yearEntry) {
-  return new Map(
-    (yearEntry?.months || [])
-      .map((entry) => [String(entry.month), entry]),
-  );
-}
-
-function parseDayManifestHash(manifest, relativePath) {
-  const hash = String(manifest?.manifest_hash || "").trim().toLowerCase();
-  if (!/^[a-f0-9]{64}$/.test(hash)) {
-    throw new Error(`Day manifest has invalid manifest_hash: ${relativePath}`);
-  }
-  return hash;
-}
-
-function fullScanDayManifestMap({
-  rcloneBin,
-  sourceRoot,
-  observationsPrefix,
-}) {
-  const entries = rcloneLsjsonRecursive(
-    rcloneBin,
-    joinTargetPath(sourceRoot, observationsPrefix),
-    { hash: false, maxDepth: 2 },
-  );
-  const days = new Map();
-  for (const entry of entries) {
-    const relative = entryRelativePath(entry);
-    const match = /^day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/.exec(relative);
-    if (!match) continue;
-    const dayUtc = match[1];
-    const manifestKey = `${observationsPrefix}/${relative}`;
-    const { text, parsed } = readJson(rcloneBin, sourceRoot, manifestKey);
-    days.set(dayUtc, {
-      day_utc: dayUtc,
-      manifest_key: manifestKey,
-      manifest_hash: parseDayManifestHash(parsed, manifestKey),
-      manifest_file_hash: sha256Hex(text),
-      manifest_size: Buffer.byteLength(text, "utf8"),
-    });
-  }
-  return days;
-}
-
-
-function readDayInventoryEntries({
-  rcloneBin,
-  sourceRoot,
-  hierarchyDays,
-  fullScanDays = null,
-}) {
-  return hierarchyDays.map((day) => {
-    const cached = fullScanDays?.get(day.day_utc) || null;
-    let actual = cached;
-    if (!actual) {
-      const { text, parsed } = readJson(
-        rcloneBin,
-        sourceRoot,
-        day.manifest_key,
-      );
-      actual = {
-        day_utc: day.day_utc,
-        manifest_key: day.manifest_key,
-        manifest_hash: parseDayManifestHash(parsed, day.manifest_key),
-        manifest_file_hash: sha256Hex(text),
-        manifest_size: Buffer.byteLength(text, "utf8"),
-      };
-    }
-    if (actual.manifest_key !== day.manifest_key) {
-      throw new Error(
-        `Day ${day.day_utc} manifest path mismatch: hierarchy=${day.manifest_key} `
-        + `actual=${actual.manifest_key}`,
-      );
-    }
-    if (actual.manifest_hash !== day.manifest_hash) {
-      throw new Error(
-        `Day ${day.day_utc} manifest hash mismatch: hierarchy=${day.manifest_hash} `
-        + `actual=${actual.manifest_hash}`,
-      );
-    }
-    return {
-      ...day,
-      manifest_file_hash: actual.manifest_file_hash,
-      manifest_size: actual.manifest_size,
-    };
-  });
-}
-
-function assertFullScanAgrees(hierarchyDays, fullScanDays) {
-  const hierarchyMap = new Map(
-    hierarchyDays.map((entry) => [entry.day_utc, entry]),
-  );
-  const errors = [];
-  for (const [dayUtc, actual] of fullScanDays.entries()) {
-    const expected = hierarchyMap.get(dayUtc);
-    if (!expected) {
-      errors.push(`unexpected committed day manifest ${dayUtc}`);
-      continue;
-    }
-    if (expected.manifest_key !== actual.manifest_key) {
-      errors.push(
-        `${dayUtc} manifest path mismatch hierarchy=${expected.manifest_key} `
-        + `actual=${actual.manifest_key}`,
-      );
-    }
-    if (expected.manifest_hash !== actual.manifest_hash) {
-      errors.push(
-        `${dayUtc} manifest hash mismatch hierarchy=${expected.manifest_hash} `
-        + `actual=${actual.manifest_hash}`,
-      );
-    }
-  }
-  for (const dayUtc of hierarchyMap.keys()) {
-    if (!fullScanDays.has(dayUtc)) {
-      errors.push(`hierarchy references missing committed day manifest ${dayUtc}`);
-    }
-  }
-  if (errors.length > 0) {
-    throw new Error(
-      `Full-scan hierarchy comparison failed (${errors.length} finding(s)): `
-      + errors.slice(0, 20).join("; "),
-    );
-  }
-}
-
-
-
-function validateSourceRootManifest(raw, observationsPrefix) {
-  const canonical = validateR2HistoryV2ObservationsAggregateManifest(
-    raw,
-    { basePrefix: observationsPrefix },
-  );
-  if (canonical.kind !== OBSERVATIONS_AGGREGATE_MANIFEST_KINDS.root) {
-    throw new Error(
-      `Expected observations root aggregate manifest, got ${canonical.kind}`,
-    );
-  }
-  return {
-    manifest: canonical,
-    content_hash: canonical.content_hash,
-    years: canonical.children.map((entry) => ({
-      year: String(entry.year),
-      manifest_key: entry.manifest_key,
-      content_hash: entry.content_hash,
-    })),
-  };
-}
-
-function validateSourceYearManifest(raw, expectedYear, observationsPrefix) {
-  const canonical = validateR2HistoryV2ObservationsAggregateManifest(
-    raw,
-    { basePrefix: observationsPrefix },
-  );
-  if (canonical.kind !== OBSERVATIONS_AGGREGATE_MANIFEST_KINDS.year) {
-    throw new Error(
-      `Expected observations year aggregate manifest, got ${canonical.kind}`,
-    );
-  }
-  if (String(canonical.year) !== String(expectedYear)) {
-    throw new Error(
-      `Observations year manifest identity mismatch: expected ${expectedYear}, `
-      + `got ${canonical.year}`,
-    );
-  }
-  return {
-    manifest: canonical,
-    year: String(canonical.year),
-    content_hash: canonical.content_hash,
-    months: canonical.children.map((entry) => ({
-      month: entry.month,
-      manifest_key: entry.manifest_key,
-      content_hash: entry.content_hash,
-    })),
-  };
-}
-
-function validateSourceMonthManifest(
-  raw,
-  expectedYear,
-  expectedMonth,
-  observationsPrefix,
-) {
-  const canonical = validateR2HistoryV2ObservationsAggregateManifest(
-    raw,
-    { basePrefix: observationsPrefix },
-  );
-  if (canonical.kind !== OBSERVATIONS_AGGREGATE_MANIFEST_KINDS.month) {
-    throw new Error(
-      `Expected observations month aggregate manifest, got ${canonical.kind}`,
-    );
-  }
-  if (
-    String(canonical.year) !== String(expectedYear)
-    || canonical.month !== String(expectedMonth).padStart(2, "0")
-  ) {
-    throw new Error(
-      `Observations month manifest identity mismatch: expected `
-      + `${expectedYear}-${String(expectedMonth).padStart(2, "0")}`,
-    );
-  }
-  return {
-    manifest: canonical,
-    year: String(canonical.year),
-    month: canonical.month,
-    content_hash: canonical.content_hash,
-    days: canonical.children.map((entry) => ({ ...entry })),
-  };
-}
-
-function assertHierarchyPaths({
-  observationsPrefix,
-  sourceRoot,
-  yearManifests,
-  monthManifests,
-}) {
-  for (const year of sourceRoot.years) {
-    const expectedYearKey =
-      `${observationsPrefix}/_manifests/year=${year.year}/manifest.json`;
-    if (year.manifest_key !== expectedYearKey) {
-      throw new Error(
-        `Observations root has non-canonical year path for ${year.year}: `
-        + `${year.manifest_key}; expected ${expectedYearKey}`,
-      );
-    }
-  }
-  for (const yearManifest of yearManifests) {
-    for (const month of yearManifest.months) {
-      const expectedMonthKey =
-        `${observationsPrefix}/_manifests/year=${yearManifest.year}`
-        + `/month=${month.month}/manifest.json`;
-      if (month.manifest_key !== expectedMonthKey) {
-        throw new Error(
-          `Observations year has non-canonical month path for `
-          + `${yearManifest.year}-${month.month}: ${month.manifest_key}; `
-          + `expected ${expectedMonthKey}`,
-        );
-      }
-    }
-  }
-  for (const monthManifest of monthManifests) {
-    for (const day of monthManifest.days) {
-      const expectedDayKey =
-        `${observationsPrefix}/day_utc=${day.day_utc}/manifest.json`;
-      if (day.manifest_key !== expectedDayKey) {
-        throw new Error(
-          `Observations month has non-canonical day path for ${day.day_utc}: `
-          + `${day.manifest_key}; expected ${expectedDayKey}`,
-        );
-      }
-    }
-  }
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const startedAt = new Date().toISOString();
   const inventoryRootKey = `${args.inventory_root_prefix}/root.json`;
-  const observationsRootManifestKey =
-    `${args.observations_prefix}/_manifests/manifest.json`;
+  const observationsRootKey = `${args.observations_prefix}/_manifests/manifest.json`;
 
-  const previousResult = readJsonMaybe(
-    args.rclone_bin,
-    args.source_root,
-    inventoryRootKey,
-  );
-  const previousRoot = previousResult
-    ? validateHierarchicalInventoryRoot(previousResult.parsed)
+  const previousRaw = readJsonMaybe(args.rclone_bin, args.source_root, inventoryRootKey);
+  const previousRoot = previousRaw
+    ? validateHierarchicalInventoryRoot(previousRaw.parsed)
     : null;
 
-  const { parsed: rootManifestRaw } = readJson(
-    args.rclone_bin,
-    args.source_root,
-    observationsRootManifestKey,
-  );
-  const sourceRoot = validateSourceRootManifest(
-    rootManifestRaw,
+  const sourceRoot = validateAggregate(
+    readJson(args.rclone_bin, args.source_root, observationsRootKey).parsed,
+    OBSERVATIONS_AGGREGATE_MANIFEST_KINDS.root,
     args.observations_prefix,
   );
-  const sourceRootUnchanged = previousRoot
-    && previousRoot.observations.source_root_hash === sourceRoot.content_hash;
-  const runManifestInventoryShardKey =
-    `${args.inventory_root_prefix}/global/observation_run_manifests.json`;
-  const previousRunShardResult = previousRoot
-    ? readJsonMaybe(
-      args.rclone_bin,
-      args.source_root,
-      previousRoot.global_units.observation_run_manifests.inventory_shard_key,
-    )
-    : null;
-  const previousRunShard = previousRunShardResult
-    ? validateObservationRunManifestInventoryShard(
-      previousRunShardResult.parsed,
-    )
-    : null;
+  const sourceRootUnchanged = Boolean(
+    previousRoot?.observations?.source_root_hash === sourceRoot.content_hash,
+  );
+  const fullScanDays = args.full_scan ? fullScanObservationDays(args) : null;
+  const fullScanSeen = new Set();
+  const previousYears = new Map(
+    (previousRoot?.observations?.years || []).map((year) => [String(year.year), year]),
+  );
 
-
-  const fullScanDays = args.full_scan
-    ? fullScanDayManifestMap({
-      rcloneBin: args.rclone_bin,
-      sourceRoot: args.source_root,
-      observationsPrefix: args.observations_prefix,
-    })
-    : null;
-
-  const previousYears = previousYearMap(previousRoot);
   const years = [];
   const changedMonthShards = [];
-  const hierarchyDaysForAudit = [];
-  const yearManifestsForPathCheck = [];
-  const monthManifestsForPathCheck = [];
   let yearsInspected = 0;
   let yearsSkipped = 0;
   let monthsInspected = 0;
   let monthsSkipped = 0;
 
-  for (const sourceYearEntry of sourceRoot.years) {
-    const priorYear = previousYears.get(sourceYearEntry.year);
-    if (
-      !args.full_scan
-      && priorYear
-      && priorYear.content_hash === sourceYearEntry.content_hash
-    ) {
+  for (const rootYear of sourceRoot.children) {
+    const yearId = String(rootYear.year);
+    const priorYear = previousYears.get(yearId);
+    if (!args.full_scan && priorYear?.content_hash === rootYear.content_hash) {
       years.push({ ...priorYear });
       yearsSkipped += 1;
       continue;
     }
 
     yearsInspected += 1;
-    const { parsed: yearManifestRaw } = readJson(
-      args.rclone_bin,
-      args.source_root,
-      sourceYearEntry.manifest_key,
-    );
-    const yearManifest = validateSourceYearManifest(
-      yearManifestRaw,
-      sourceYearEntry.year,
+    const yearManifest = validateAggregate(
+      readJson(args.rclone_bin, args.source_root, rootYear.manifest_key).parsed,
+      OBSERVATIONS_AGGREGATE_MANIFEST_KINDS.year,
       args.observations_prefix,
+      { year: yearId },
     );
-    yearManifestsForPathCheck.push(yearManifest);
-    if (yearManifest.content_hash !== sourceYearEntry.content_hash) {
-      throw new Error(
-        `Year ${sourceYearEntry.year} content_hash differs from root child identity`,
-      );
+    if (yearManifest.content_hash !== rootYear.content_hash) {
+      throw new Error(`Year ${yearId} content_hash differs from root`);
     }
-
-    const priorMonths = previousMonthMap(priorYear);
+    const priorMonths = new Map(
+      (priorYear?.months || []).map((month) => [String(month.month), month]),
+    );
     const months = [];
-    for (const sourceMonthEntry of yearManifest.months) {
-      const priorMonth = priorMonths.get(sourceMonthEntry.month);
-      if (
-        !args.full_scan
-        && priorMonth
-        && priorMonth.content_hash === sourceMonthEntry.content_hash
-      ) {
+
+    for (const yearMonth of yearManifest.children) {
+      const monthId = String(yearMonth.month).padStart(2, "0");
+      const priorMonth = priorMonths.get(monthId);
+      if (!args.full_scan && priorMonth?.content_hash === yearMonth.content_hash) {
         months.push({ ...priorMonth });
         monthsSkipped += 1;
         continue;
       }
 
       monthsInspected += 1;
-      const { parsed: monthManifestRaw } = readJson(
-        args.rclone_bin,
-        args.source_root,
-        sourceMonthEntry.manifest_key,
-      );
-      const monthManifest = validateSourceMonthManifest(
-        monthManifestRaw,
-        sourceYearEntry.year,
-        sourceMonthEntry.month,
+      const monthManifest = validateAggregate(
+        readJson(args.rclone_bin, args.source_root, yearMonth.manifest_key).parsed,
+        OBSERVATIONS_AGGREGATE_MANIFEST_KINDS.month,
         args.observations_prefix,
+        { year: yearId, month: monthId },
       );
-      monthManifestsForPathCheck.push(monthManifest);
-      if (monthManifest.content_hash !== sourceMonthEntry.content_hash) {
-        throw new Error(
-          `Month ${sourceYearEntry.year}-${sourceMonthEntry.month} `
-          + "content_hash differs from year child identity",
-        );
+      if (monthManifest.content_hash !== yearMonth.content_hash) {
+        throw new Error(`Month ${yearId}-${monthId} content_hash differs from year`);
       }
-      const inventoryDays = readDayInventoryEntries({
-        rcloneBin: args.rclone_bin,
-        sourceRoot: args.source_root,
-        hierarchyDays: monthManifest.days,
-        fullScanDays,
-      });
-      hierarchyDaysForAudit.push(...inventoryDays);
 
+      const inventoryDays = monthManifest.children.map((day) => {
+        const cached = fullScanDays?.get(day.day_utc) || null;
+        const record = cached || dayManifestRecord(
+          args.rclone_bin,
+          args.source_root,
+          day.manifest_key,
+          day.manifest_hash,
+        );
+        if (record.manifest_hash !== day.manifest_hash) {
+          throw new Error(`Day ${day.day_utc} differs from month hierarchy`);
+        }
+        fullScanSeen.add(day.day_utc);
+        return record;
+      });
       const shardKey = observationMonthInventoryShardKey(
         args.inventory_root_prefix,
-        sourceYearEntry.year,
-        sourceMonthEntry.month,
+        yearId,
+        monthId,
       );
       const shard = buildObservationMonthInventoryShard({
         observationsPrefix: args.observations_prefix,
-        year: sourceYearEntry.year,
-        month: sourceMonthEntry.month,
-        sourceMonthManifestKey: sourceMonthEntry.manifest_key,
-        sourceMonthHash: sourceMonthEntry.content_hash,
+        year: yearId,
+        month: monthId,
+        sourceMonthManifestKey: yearMonth.manifest_key,
+        sourceMonthHash: yearMonth.content_hash,
         days: inventoryDays,
       });
-      const writeResult = writeRemoteJson({
-        rcloneBin: args.rclone_bin,
-        sourceRoot: args.source_root,
-        relativePath: shardKey,
-        payload: shard,
-        dryRun: args.dry_run,
-      });
+      const write = writeRemoteJson(
+        args.rclone_bin,
+        args.source_root,
+        shardKey,
+        shard,
+        args.dry_run,
+      );
       changedMonthShards.push({
-        year: sourceYearEntry.year,
-        month: sourceMonthEntry.month,
+        year: yearId,
+        month: monthId,
         shard_key: shardKey,
-        changed: writeResult.changed,
-        written: writeResult.written,
+        changed: write.changed,
+        written: write.written,
         day_count: shard.days.length,
       });
       months.push({
-        month: sourceMonthEntry.month,
-        manifest_key: sourceMonthEntry.manifest_key,
-        content_hash: sourceMonthEntry.content_hash,
+        month: monthId,
+        manifest_key: yearMonth.manifest_key,
+        content_hash: yearMonth.content_hash,
         inventory_shard_key: shardKey,
       });
     }
 
     years.push({
-      year: sourceYearEntry.year,
-      manifest_key: sourceYearEntry.manifest_key,
-      content_hash: sourceYearEntry.content_hash,
+      year: yearId,
+      manifest_key: rootYear.manifest_key,
+      content_hash: rootYear.content_hash,
       months,
     });
   }
 
-  assertHierarchyPaths({
-    observationsPrefix: args.observations_prefix,
-    sourceRoot,
-    yearManifests: yearManifestsForPathCheck,
-    monthManifests: monthManifestsForPathCheck,
-  });
-
   if (args.full_scan) {
-    assertFullScanAgrees(hierarchyDaysForAudit, fullScanDays);
+    if (fullScanSeen.size !== fullScanDays.size) {
+      const extras = [...fullScanDays.keys()].filter((day) => !fullScanSeen.has(day));
+      throw new Error(
+        `Full observation scan disagrees with hierarchy: ${extras.length} unrepresented day(s)`,
+      );
+    }
   }
 
-  const runScan = scanRunManifestUnits({
-    rcloneBin: args.rclone_bin,
-    sourceRoot: args.source_root,
-    runsPrefix: args.runs_prefix,
-    previousRunShard,
-  });
+  const runShardKey = `${args.inventory_root_prefix}/global/observation_run_manifests.json`;
+  const previousRunRaw = previousRoot
+    ? readJsonMaybe(
+      args.rclone_bin,
+      args.source_root,
+      previousRoot.global_units.observation_run_manifests.inventory_shard_key,
+    )
+    : null;
+  const previousRunShard = previousRunRaw
+    ? validateObservationRunManifestInventoryShard(previousRunRaw.parsed)
+    : null;
+  const runScan = scanRunManifests(args, previousRunShard);
+  const runShard = buildObservationRunManifestInventoryShard(runScan.units);
+  const runWrite = writeRemoteJson(
+    args.rclone_bin,
+    args.source_root,
+    runShardKey,
+    runShard,
+    args.dry_run,
+  );
 
-  const runManifestInventoryShard =
-    buildObservationRunManifestInventoryShard(runScan.units);
-  const runManifestShardWrite = writeRemoteJson({
+  const bindingInventory = buildTimeseriesBindingInventory({
     rcloneBin: args.rclone_bin,
     sourceRoot: args.source_root,
-    relativePath: runManifestInventoryShardKey,
-    payload: runManifestInventoryShard,
+    sourcePrefix: args.timeseries_binding_prefix,
+    inventoryRootPrefix: args.inventory_root_prefix,
+    previousRootReference: previousRoot?.timeseries_binding || null,
+    legacyInventoryKey: args.legacy_inventory_key,
+    fullScan: args.full_scan,
     dryRun: args.dry_run,
   });
 
   const root = buildHierarchicalInventoryRoot({
-    observationsRootManifestKey,
+    observationsRootManifestKey: observationsRootKey,
     observationsRootHash: sourceRoot.content_hash,
     years,
-    runManifestInventoryShardKey,
-    runManifestInventoryShardHash: runManifestShardWrite.hash,
+    runManifestInventoryShardKey: runShardKey,
+    runManifestInventoryShardHash: runWrite.hash,
     runManifestUnitCount: runScan.units.length,
     legacyInventoryKey: args.legacy_inventory_key,
   });
-  const rootWrite = writeRemoteJson({
-    rcloneBin: args.rclone_bin,
-    sourceRoot: args.source_root,
-    relativePath: inventoryRootKey,
-    payload: root,
-    dryRun: args.dry_run,
-  });
+  root.timeseries_binding = bindingInventory.root_reference;
+  const rootWrite = writeRemoteJson(
+    args.rclone_bin,
+    args.source_root,
+    inventoryRootKey,
+    root,
+    args.dry_run,
+  );
 
   const report = {
     ok: true,
@@ -777,11 +474,10 @@ async function main() {
     inventory_mode: args.full_scan ? "full_scan" : "hierarchical",
     source_root: args.source_root,
     observations_prefix: args.observations_prefix,
-    observations_root_manifest_key: observationsRootManifestKey,
+    observations_root_manifest_key: observationsRootKey,
     observations_source_root_hash: sourceRoot.content_hash,
-    previous_source_root_hash:
-      previousRoot?.observations?.source_root_hash || null,
-    source_root_unchanged: Boolean(sourceRootUnchanged),
+    previous_source_root_hash: previousRoot?.observations?.source_root_hash || null,
+    source_root_unchanged: sourceRootUnchanged,
     inventory_root_key: inventoryRootKey,
     inventory_root_changed: rootWrite.changed,
     inventory_root_written: rootWrite.written,
@@ -798,13 +494,14 @@ async function main() {
     month_shards: changedMonthShards,
     full_scan_day_count: fullScanDays?.size ?? null,
     full_scan_hierarchy_agreed: args.full_scan ? true : null,
+    timeseries_binding: bindingInventory.report,
     run_manifests: {
       listed: runScan.listed,
       reused_by_metadata: runScan.reused,
       read_and_hashed: runScan.read,
-      inventory_shard_key: runManifestInventoryShardKey,
-      inventory_shard_changed: runManifestShardWrite.changed,
-      inventory_shard_written: runManifestShardWrite.written,
+      inventory_shard_key: runShardKey,
+      inventory_shard_changed: runWrite.changed,
+      inventory_shard_written: runWrite.written,
     },
     compatibility: {
       legacy_inventory_key: args.legacy_inventory_key,
@@ -816,15 +513,16 @@ async function main() {
 }
 
 function isMainModule(moduleUrl) {
-  if (!process.argv[1]) return false;
-  return path.resolve(process.argv[1]) === fileURLToPath(moduleUrl);
+  return Boolean(process.argv[1])
+    && path.resolve(process.argv[1]) === fileURLToPath(moduleUrl);
 }
 
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    const payload = { ok: false, error: message };
-    console.error(JSON.stringify(payload, null, 2));
+    console.error(JSON.stringify({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    }, null, 2));
     process.exit(1);
   });
 }
