@@ -9,7 +9,7 @@ This contract governs:
 - the public cache-proxy route used by the website homepage WHO guideline card;
 - the authenticated history R2 API route that reads the fixed WHO object;
 - UTC-day request identity;
-- edge and browser cache behaviour;
+- Worker edge-cache and browser local-cache behaviour;
 - stale-data retry behaviour;
 - failure and website fallback behaviour.
 
@@ -74,24 +74,35 @@ Unrelated query parameters MUST NOT create request-by-request cache variants.
 
 Timestamp or random cache busters MUST NOT be used for normal website traffic.
 
-## Freshness and TTL
+## Freshness and Worker cache TTL
 
 Freshness is determined by comparing the payload's `data_as_of_day_utc` with the requested `as_of` day.
+
+The authenticated R2 reader and public cache proxy MUST retain their cacheable internal response before creating the browser-facing response. The browser-facing response MUST then use:
+
+```text
+Cache-Control: no-store
+```
+
+This separation prevents a zone-wide Cloudflare Browser Cache TTL override from extending WHO staleness beyond the website's UTC-day local-storage policy.
 
 ### Current or newer payload
 
 When `data_as_of_day_utc` is equal to or newer than `as_of`:
 
 - the response is current for that request;
-- browser and Worker cache TTL MUST be 86,400 seconds;
-- the stable per-day URL means the next UTC day uses a different cache key.
+- both Worker cache layers MUST use a TTL of 86,400 seconds;
+- the stable per-day URL means the next UTC day uses a different cache key;
+- the browser-facing response MUST remain `Cache-Control: no-store`;
+- the website's current local-storage payload suppresses further network requests for that expected UTC day.
 
 ### Behind payload
 
 When `data_as_of_day_utc` is older than `as_of`:
 
 - the response MUST remain HTTP 200 so the newest available data can be displayed;
-- browser and Worker cache TTL MUST be 1,800 seconds;
+- both Worker cache layers MUST use a TTL of 1,800 seconds;
+- the browser-facing response MUST remain `Cache-Control: no-store`;
 - the response MUST identify that it is behind;
 - the response MUST advertise a 1,800-second retry interval through `X-UK-AQ-WHO-Retry-After-Seconds`.
 
@@ -104,7 +115,8 @@ Successful public responses MUST include:
 - `X-UK-AQ-WHO-Requested-As-Of`;
 - `X-UK-AQ-WHO-Data-As-Of`;
 - `X-UK-AQ-WHO-Freshness` with `current`, `behind` or `ahead`;
-- `X-UK-AQ-Cache` with `HIT` or `MISS` for the public cache-proxy layer.
+- `X-UK-AQ-Cache` with `HIT` or `MISS` for the public cache-proxy layer;
+- `X-UK-AQ-WHO-Worker-Cache-Control` containing the internal cache policy that was used before the browser-facing response was changed to `no-store`.
 
 The authenticated R2 reader SHOULD also expose `X-UK-AQ-WHO-Origin-Cache` with `HIT` or `MISS`.
 
@@ -116,7 +128,7 @@ X-UK-AQ-WHO-Retry-After-Seconds: 1800
 
 ## Website browser cache
 
-The website MUST retain the newest usable WHO payload in local storage.
+The website MUST retain the newest usable WHO payload in local storage. HTTP browser caching MUST NOT control WHO freshness.
 
 On a normal homepage load:
 
@@ -152,13 +164,15 @@ Before deployment:
 
 - the new JavaScript and TypeScript entry points MUST be structurally checkable;
 - both resolved Wrangler configurations MUST retain their existing bindings and contain no unresolved placeholders;
-- no direct R2 binding may be added to the cache-proxy Worker.
+- no direct R2 binding may be added to the cache-proxy Worker;
+- the public route MUST store a cacheable internal response before returning a separate `Cache-Control: no-store` browser response.
 
 Functional validation occurs after deployment on TEST:
 
 1. request the public route with the expected UTC day;
-2. confirm current data receives the daily TTL;
-3. where a behind object is available, confirm it receives the 1,800-second TTL and retry header;
-4. reload the homepage and confirm a current local payload causes no WHO network request;
-5. confirm cached/static fallback remains visible during a forced route failure;
-6. confirm an existing observations-history route still responds normally through the unchanged implementation.
+2. confirm the browser-facing `Cache-Control` is `no-store`;
+3. confirm `X-UK-AQ-WHO-Worker-Cache-Control` reports the current 86,400-second or behind 1,800-second internal policy;
+4. where a behind object is available, confirm it retains the 1,800-second retry header;
+5. reload the homepage and confirm a current local payload causes no WHO network request;
+6. confirm cached/static fallback remains visible during a forced route failure;
+7. confirm an existing observations-history route still responds normally through the unchanged implementation.
