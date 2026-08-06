@@ -58,13 +58,13 @@ dry_run = false
 notes = "R2 core snapshot"
 
 [jobs.uk_aq_who_2021_daily]
-enabled = false
+enabled = true
 cron_expr = "0 4-9 * * *"
 target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-ops"
 github_workflow_file = "uk_aq_who_2021_daily.yml"
 github_ref = "main"
-dry_run = true
+dry_run = false
 notes = "WHO 2021 hourly recalculation and readiness window via GitHub Actions"
 
 [jobs.uk_aq_who_2021_daily.github_inputs]
