@@ -1,26 +1,38 @@
-# R2 v2 hierarchical observations backup migration
+# R2 v2 hierarchical backup runbook
 
 ## Purpose
 
-This runbook introduces the contract-backed hierarchical observations inventory and matching Dropbox checkpoint shards for TEST.
+This runbook implements the contract-backed hierarchical v2 backup inventory for TEST.
 
-It does not remove the existing flat inventory or flat Dropbox checkpoint. Those files remain migration and rollback inputs until the new path has completed real TEST inventory and backup runs successfully.
+The long-term inventory covers:
 
-The implementation applies first to:
+- observation history through root -> year -> month -> day manifests;
+- timeseries-binding objects through stable 1,000-ID inventory ranges;
+- small global units such as observation run manifests.
+
+The physical timeseries-binding objects remain unchanged at:
 
 ```text
-history/v2/observations
+history/_index_v2/timeseries_binding/timeseries_id=<id>.json
 ```
 
-Existing backup coverage for AQI, AQI debug, core and index trees continues through the existing inventory and sync scripts during migration.
+Only the backup inventory groups those objects into stable ranges.
 
-## New inventory paths
+## Inventory paths
 
 ```text
 history/_index_v2/backup_inventory_v2/root.json
 history/_index_v2/backup_inventory_v2/observations/year=YYYY/month=MM.json
+history/_index_v2/backup_inventory_v2/timeseries_binding/root.json
+history/_index_v2/backup_inventory_v2/timeseries_binding/range=000000-000999.json
+history/_index_v2/backup_inventory_v2/timeseries_binding/range=001000-001999.json
+...
 history/_index_v2/backup_inventory_v2/global/observation_run_manifests.json
 ```
+
+The fixed binding range size is 1,000 IDs. Range boundaries must not change without a separately documented migration.
+
+## Observations traversal
 
 The root follows the authoritative observations aggregate hierarchy:
 
@@ -31,116 +43,93 @@ history/v2/observations/_manifests/manifest.json
       -> existing day manifests
 ```
 
-The monthly inventory shard records both:
+The monthly inventory shard records both the authoritative day `manifest_hash` and the physical SHA-256 of the day manifest file.
 
-- the authoritative day `manifest_hash` from the aggregate hierarchy;
-- the physical SHA-256 of the day manifest file, used to adopt the existing flat Dropbox checkpoint without recopying already verified days.
+Normal inventory runs compare the observations root hash first. Unchanged years and months are skipped.
 
-## New Dropbox state paths
+## Timeseries-binding traversal
+
+The builder lists the current binding objects under:
+
+```text
+history/_index_v2/timeseries_binding
+```
+
+Each binding is assigned to a fixed range. A range shard records:
+
+- range start and end;
+- each `timeseries_id`;
+- source relative path;
+- source file SHA-256;
+- source size;
+- R2 MD5 and modification-time metadata when available;
+- the stable logical `source_range_hash` for the complete current range.
+
+The binding inventory root records all current ranges and derives one stable `source_root_hash` from those range identities.
+
+On a normal run, existing unit hashes are reused when R2 metadata still matches. On the first hierarchical binding build, the builder can adopt matching identities from the legacy flat inventory `history/_index_v2/backup_inventory_v2.json`, avoiding unnecessary re-reading of every binding object.
+
+`--full-scan` deliberately disables metadata reuse and independently hashes all binding objects.
+
+## Dropbox state layout
+
+The final matching Dropbox checkpoint layout is:
 
 ```text
 _ops/checkpoints/r2_history_backup_state_v2/root.json
 _ops/checkpoints/r2_history_backup_state_v2/observations/year=YYYY/month=MM.json
+_ops/checkpoints/r2_history_backup_state_v2/timeseries_binding/range=000000-000999.json
+_ops/checkpoints/r2_history_backup_state_v2/timeseries_binding/range=001000-001999.json
+...
 _ops/checkpoints/r2_history_backup_state_v2/global/observation_run_manifests.json
 ```
 
-Monthly state shards record individual completed day identities and only advance `processed_source_month_hash` after every required day in the month is complete.
+Observation monthly state shards record individual completed day identities. Binding range state shards record individual copied binding identities and only advance `processed_source_range_hash` once every required binding in that range is complete.
 
-Year and observations-root processed hashes advance bottom-up. The Dropbox root is written after dirty monthly shards.
+The Dropbox sync implementation is the next stage. The inventory and state helper primitives already use the final range paths and fixed range size.
 
 ## Initial TEST inventory build
 
-Run from the TEST Ops repository after sourcing the TEST environment:
+The observations hierarchy has already been full-scan validated. After deploying the binding-range code, run a normal inventory build first so matching binding identities can be adopted from the existing legacy inventory:
 
 ```bash
 mkdir -p tmp logs
 
 node scripts/backup_r2/build_hierarchical_backup_inventory_v2.mjs \
   --source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
-  --full-scan \
   --report-out "tmp/r2_hierarchical_inventory_v2_report.json" \
   2>&1 | tee "logs/r2_hierarchical_inventory_v2.log"
 ```
 
-`--full-scan` independently enumerates every committed observation day manifest and verifies that it agrees with the root, year and month hierarchy.
+Expected binding report behaviour on the first run:
 
-The first successful run creates the monthly inventory shards and writes the inventory root last.
-
-## Initial Dropbox migration dry run
-
-```bash
-node scripts/backup_r2/sync_hierarchical_observations_to_dropbox_v2.mjs \
-  --source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
-  --dest-root "uk_aq_dropbox:CIC-Test/R2_history_backup" \
-  --dry-run \
-  --report-out "tmp/r2_hierarchical_dropbox_v2_dry_run.json" \
-  2>&1 | tee "logs/r2_hierarchical_dropbox_v2_dry_run.log"
-```
-
-The migration reads the existing flat checkpoint:
-
-```text
-_ops/checkpoints/r2_history_backup_state_v2.json
-```
-
-Matching legacy day-manifest file hashes are adopted into monthly state shards. A correct migration should therefore plan few or no historical day-folder copies.
-
-## Initial real Dropbox migration
-
-After reviewing the dry-run report:
-
-```bash
-node scripts/backup_r2/sync_hierarchical_observations_to_dropbox_v2.mjs \
-  --source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
-  --dest-root "uk_aq_dropbox:CIC-Test/R2_history_backup" \
-  --report-out "tmp/r2_hierarchical_dropbox_v2_report.json" \
-  2>&1 | tee "logs/r2_hierarchical_dropbox_v2.log"
-```
-
-The sync:
-
-1. adopts matching existing day state;
-2. copies only changed or missing observation day folders;
-3. verifies the copied destination day manifest identity;
-4. retains manifest-guided stale Parquet pruning;
-5. copies month, year and root aggregate manifests after their children are complete;
-6. writes monthly state shards before the small Dropbox state root;
-7. copies changed observations run manifests.
+- `previous_unit_source` is `legacy` when legacy binding identities are available;
+- most or all unchanged bindings are counted in `reused_from_legacy`;
+- one inventory range shard is created for each populated 1,000-ID range;
+- `timeseries_binding/root.json` is created;
+- the top-level `root.json` is rewritten last to reference the binding root and ranges.
 
 ## Subsequent normal inventory runs
 
-Do not use `--full-scan` for normal daily operation:
+Use the same command without `--full-scan`.
+
+A normal unchanged run should:
+
+- skip unchanged observation years and months;
+- list binding metadata but reuse unchanged binding hashes;
+- read and hash only binding objects whose metadata changed;
+- leave unchanged range shards byte-stable;
+- leave the binding inventory root and top-level root unchanged when no binding identity changed.
+
+## Explicit full scan
+
+Use only for an independent audit or recovery:
 
 ```bash
 node scripts/backup_r2/build_hierarchical_backup_inventory_v2.mjs \
   --source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
-  --report-out "tmp/r2_hierarchical_inventory_v2_report.json"
+  --full-scan \
+  --report-out "tmp/r2_hierarchical_inventory_v2_full_scan.json"
 ```
 
-When the observations-root content hash is unchanged, historical years and months are not traversed. When it changes, only changed years and months are opened.
-
-## Existing non-observation backup during migration
-
-Continue using the existing flat inventory and sync for AQI, AQI debug, core and existing index coverage. Exclude the observations day domain after the hierarchical observations path has been accepted on TEST.
-
-Do not switch the scheduled workflow until:
-
-- the full-scan inventory agrees with the source hierarchy;
-- the dry run adopts the existing checkpoint without mass recopy;
-- a real TEST sync succeeds;
-- a second unchanged inventory and sync run is fast and copies no observation days;
-- Dropbox contains the root, year and month aggregate manifests;
-- the old flat inventory and checkpoint remain available for rollback.
-
-## Rollback
-
-The new implementation is additive.
-
-To roll back, stop invoking the hierarchical builder and sync and return to:
-
-```text
-scripts/backup_r2/build_backup_inventory.mjs
-scripts/backup_r2/sync_history_to_dropbox.mjs
-```
-
-Do not delete the old flat inventory or checkpoint during TEST migration.
+This independently reads all committed observation day manifests and all timeseries-binding objects rather than trusting metadata reuse.
