@@ -781,6 +781,18 @@ function createInMemoryApplyAdapters() {
     remoteObjects,
     mutationEvents,
     adapters: {
+      observationsHierarchyFinalizer: async ({ affectedDaysUtc }) => {
+        const days = [...new Set(affectedDaysUtc)].sort();
+        return {
+          ok: true,
+          status: "up_to_date",
+          affected_days_utc: days,
+          affected_months: [...new Set(days.map((day) => day.slice(0, 7)))].sort(),
+          affected_years: [...new Set(days.map((day) => day.slice(0, 4)))].sort(),
+          objects: [],
+          execution: { wrote_object_count: 0, writes: [] },
+        };
+      },
       historyWriterClient: {
         query: async (sql) => ({
           rows: [{
