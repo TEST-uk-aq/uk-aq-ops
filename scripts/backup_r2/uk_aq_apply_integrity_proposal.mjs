@@ -3109,6 +3109,7 @@ export async function applyValidatedProposal({
         observationsPrefix: indexConfig.observations_prefix_v2,
         affectedDaysUtc: affectedDays,
         maxKeys: indexConfig.max_keys || 1000,
+        hierarchyFinalizerAdapter: adapters.observationsHierarchyFinalizer,
         finalizeExistingIndexes: async () => {
           for (const operation of globalOperations) await executeOperation(operation);
           return {
