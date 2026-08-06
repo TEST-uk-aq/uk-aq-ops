@@ -85,7 +85,9 @@ Those files are outside this repository, but their AQI interpretation must confo
 - Pollutants: `pm25`, `pm10`, `no2`
 - Grain: hourly
 - Indices: UK DAQI and European AQI
+- Algorithm version: `aqilevels_hourly_v2`
 - DAQI PM averaging: rolling 24-hour mean
+- DAQI PM minimum valid hours: 18 of 24
 - DAQI NO2 averaging: hourly mean
 - European AQI averaging: hourly mean
 - Canonical timestamp: hour endpoint
@@ -117,6 +119,8 @@ When enabled, the shared AQI library calculates DAQI and European AQI from that 
 
 For PM, the preceding 23 endpoint hours may cross a physical timeseries transition. Calculation happens after logical merging so the transition does not reset rolling context.
 
+PM DAQI uses the available valid hourly means when at least 18 of the 24 rolling hours are present. A missing hourly PM observation therefore leaves European AQI blank for that endpoint but does not automatically remove a valid rolling DAQI result.
+
 Observations and calculated AQI are returned together.
 
 ### Stored R2 AQI validation
@@ -127,7 +131,9 @@ After preparing the foreground response, the Worker compares calculated and stor
 
 ### Persisted historical AQI
 
-Prune Daily Phase B continues writing hourly AQI history to R2. The v2 data and debug profiles and their manifests/indexes remain operational evidence and repair targets.
+Prune Daily Phase B and any future Integrity or rebuild path that creates AQI use the same shared helper. They therefore inherit the 18-of-24 PM DAQI threshold, index-specific missing-hour output and `aqilevels_hourly_v2` algorithm version without a separate calculation implementation.
+
+The v2 data and debug profiles and their manifests/indexes remain operational evidence and repair targets.
 
 ### Low-level read path
 
@@ -151,7 +157,7 @@ represented interval = (period_start_utc, period_end_utc]
 
 A row ending at `07:00` colours `06:00` to `07:00`.
 
-It must not colour `07:00` to `08:00`, extend through a missing hour or continue beyond the final plotted concentration endpoint.
+It must not colour `07:00` to `08:00`, extend through an index-specific missing hour or continue beyond the final valid endpoint for that index.
 
 ## Continuity and identity rule
 
