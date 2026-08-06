@@ -21,11 +21,13 @@ import {
 import {
   runCanonicalConnectorDayWriter,
   runCanonicalDayFinalizer,
-  runCanonicalGlobalIndexFinalizer,
   withHistoryWriterClient,
   mergeConnectorManifestReferences,
   readParentManifestForBoundedRecovery,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
+import {
+  runCanonicalObservationsGlobalFinalizer,
+} from "../../workers/shared/uk_aq_r2_observations_global_finalizer.mjs";
 import {
   buildHistoryV2DayManifest,
   validateCanonicalHistoryV2Manifest,
@@ -2662,6 +2664,7 @@ export async function applyValidatedProposal({
     listAllObjects: adapters.listAllObjects || r2ListAllObjects,
     putObject: adapters.putObject || r2PutObject,
   };
+  const indexConfig = resolveR2HistoryIndexConfig(env);
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   let coreSnapshotIdentityValidation;
   try {
@@ -3098,25 +3101,26 @@ export async function applyValidatedProposal({
       persistence.flush();
       await checkpoint("before_affected_index_publication");
       report({ message: progressMessage("index publication started"), completedObjects: counts.completed_writes, force: true });
-      await runCanonicalGlobalIndexFinalizer({
-          client: historyWriterClient,
-          diagnosticEnvironment: runState.environment,
-          diagnostics: runState.writer_locks,
-          finalize: async () => {
-            for (const operation of globalOperations) await executeOperation(operation);
-            if (affectedDays.length) {
-              runState.global_index_finalization = {
-                status: "succeeded",
-                mode: dedicatedSosProposal.dedicated ? "sos-light" : "canonical-preflight",
-                authority: "frozen_preflight_publication_schedule",
-                affected_days_utc: affectedDays,
-                planned_index_object_count: globalOperations.length,
-                live_generated_object_discovery_used: false,
-                publication_schedule_sha256: publicationSchedule.schedule_sha256,
-              };
-            }
-          },
-        });
+      runState.global_index_finalization = await runCanonicalObservationsGlobalFinalizer({
+        client: historyWriterClient,
+        diagnosticEnvironment: runState.environment,
+        diagnostics: runState.writer_locks,
+        r2,
+        observationsPrefix: indexConfig.observations_prefix_v2,
+        affectedDaysUtc: affectedDays,
+        maxKeys: indexConfig.max_keys || 1000,
+        finalizeExistingIndexes: async () => {
+          for (const operation of globalOperations) await executeOperation(operation);
+          return {
+            status: "succeeded",
+            mode: dedicatedSosProposal.dedicated ? "sos-light" : "canonical-preflight",
+            authority: "frozen_preflight_publication_schedule",
+            planned_index_object_count: globalOperations.length,
+            live_generated_object_discovery_used: false,
+            publication_schedule_sha256: publicationSchedule.schedule_sha256,
+          };
+        },
+      });
       progressState.index_publication_completed = true;
       progressState.current_publication_stage = "affected_indexes_verified";
       persistence.appendEvent({
