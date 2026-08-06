@@ -122,19 +122,22 @@ The calculated chart path must preserve:
 - current breakpoint values and inclusive upper-bound rule;
 - NO2 hourly DAQI;
 - PM2.5 and PM10 rolling 24-hour DAQI;
+- the 18-of-24 minimum valid-hour rule for PM DAQI;
 - hourly European AQI;
 - independent DAQI and European AQI statuses;
 - negative/invalid input exclusion;
-- existing `algorithm_version`;
+- algorithm version `aqilevels_hourly_v2`;
 - deterministic sorting and calculation.
 
 ## PM context across identity transitions
 
-For a PM AQI endpoint `n`, the required rolling input endpoints are:
+For a PM AQI endpoint `n`, the possible rolling input endpoints are:
 
 ```text
 n - 23 hours, ..., n - 1 hour, n
 ```
+
+At least 18 valid hourly values are required. The mean uses the available valid values only. Missing hours are not imputed.
 
 Those observations may span two physical family members.
 
@@ -160,7 +163,13 @@ S < n <= E
 
 The website draws each DAQI and European AQI band from `n - 1 hour` to `n`.
 
-Missing hours remain blank. The final coloured band ends at the final valid endpoint and must not extend one hour beyond the final concentration value.
+Missing output is index-specific. At a PM endpoint with no hourly observation:
+
+- European AQI is missing and its band remains blank;
+- PM DAQI may remain valid when at least 18 of the 24 rolling hourly values are available;
+- PM DAQI is missing when fewer than 18 valid rolling hours are available.
+
+A valid band for one index must not be stretched into a neighbouring hour and must not be removed merely because the other index is unavailable. The final coloured band for each index ends at its final valid endpoint and must not extend one hour beyond that endpoint.
 
 A missing AQI value caused by absent observations, excluded invalid inputs or insufficient calculation samples is normal blank output. It must not be stretched across neighbouring hours, replaced from stored AQI or presented as a user-facing error solely because no band can be calculated for that hour.
 
@@ -195,7 +204,7 @@ The station-series response must contain independently complete sections equival
   "aqi": {
     "enabled": true,
     "calculation_source": "calculated_from_observations",
-    "algorithm_version": "aqilevels_hourly_v1",
+    "algorithm_version": "aqilevels_hourly_v2",
     "rows": [],
     "response_complete": true,
     "has_gap": false,
@@ -337,7 +346,7 @@ A response must be partial or incomplete when any required condition is unresolv
 - overlapping conflicting members;
 - missing exact physical R2 index context;
 - scan-budget exhaustion;
-- incomplete PM rolling context;
+- fewer than 18 valid hourly values for a required PM rolling endpoint;
 - unresolved source seam;
 - malformed binding identity.
 
@@ -401,7 +410,7 @@ This contract does not:
 - make stored R2 AQI disposable;
 - recreate AQI rows in Supabase;
 - let chart requests write R2;
-- change AQI breakpoints or averaging rules;
+- change AQI breakpoints;
 - add pollutants;
 - make low-level R2 APIs continuity-aware;
 - make the browser query continuity metadata;
