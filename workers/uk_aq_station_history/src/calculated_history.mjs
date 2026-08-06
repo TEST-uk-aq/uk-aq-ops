@@ -58,7 +58,13 @@ function calculateLogicalAqi(observationRows, request, continuity, outputStartMs
     timeseries_id: request.timeseriesId,
   }));
   return helperRowsToNormalizedAqiV1Rows(
-    pivotNarrowRowsToHelperRows(sourceObservationsToNarrowRows(logicalRows)),
+    pivotNarrowRowsToHelperRows(
+      sourceObservationsToNarrowRows(logicalRows),
+      {
+        rangeStartUtc: new Date(outputStartMs + HOUR_MS).toISOString(),
+        rangeEndUtc: new Date(outputEndMs + HOUR_MS).toISOString(),
+      },
+    ),
     { computedAtUtc: null },
   ).filter((row) => {
     const endpoint = Date.parse(row.timestamp_hour_utc);
