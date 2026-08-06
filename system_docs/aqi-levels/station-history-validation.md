@@ -157,14 +157,21 @@ For a PM endpoint shortly after the physical identity changes, the rolling input
 
 Required behaviour:
 
-- 24 valid hourly means ending at `n` produce DAQI status `ok`;
-- 23 valid hourly means produce DAQI `insufficient_samples`;
-- a valid hourly mean at `n` may still produce European AQI `ok`;
+- 24 valid hourly means ending at `n` produce DAQI status `ok`, source count 24 and required count 18;
+- 18 valid hourly means produce DAQI status `ok`, source count 18 and required count 18;
+- 17 valid hourly means produce DAQI `insufficient_samples`;
+- a valid hourly mean at `n` may still produce European AQI `ok` when DAQI is insufficient;
+- a missing hourly mean at `n` produces European AQI `missing_input`, while DAQI may remain `ok` with at least 18 valid rolling values;
 - the physical transition itself must not reset logical rolling context.
 
-### Missing hour
+### Missing hourly PM observation
 
-A missing endpoint remains uncoloured. Neither neighbouring AQI value may span it.
+For a missing PM hourly observation at endpoint `n`:
+
+- the European AQI interval ending at `n` remains uncoloured;
+- PM DAQI remains coloured when at least 18 valid values are present in the rolling 24-hour window;
+- PM DAQI remains uncoloured when fewer than 18 values are present;
+- no value from either index may be stretched from a neighbouring interval.
 
 ### Settled AQI gaps and source switching
 
@@ -173,7 +180,8 @@ For a successfully evaluated, parseable and authoritative-identity-valid request
 - cache all valid AQI rows;
 - preserve partial, status and missing-reason diagnostics;
 - record unfamiliar diagnostics through bounded chart diagnostics;
-- leave uncalculable hours blank;
+- leave uncalculable index intervals blank;
+- retain a valid PM DAQI interval when European AQI for the same endpoint is missing;
 - record the requested interval as settled for browser request planning without labelling the response complete;
 - do not use an exhaustive browser allow-list of Worker diagnostic strings as a visible-success condition;
 - do not show a chart-wide user-facing incomplete or error message for the AQI-only outcome;
@@ -189,9 +197,10 @@ For each immutable comparable hour:
 1. resolve the physical timeseries valid for that hour;
 2. compare the calculated row with stored R2 AQI under that physical ID;
 3. compare algorithm version before values;
-4. compare exact discrete fields;
-5. apply only the approved numeric tolerance;
-6. report missing and mismatched rows separately.
+4. classify `aqilevels_hourly_v1` versus `aqilevels_hourly_v2` as `not_comparable_algorithm_version`;
+5. compare exact discrete fields only when versions match;
+6. apply only the approved numeric tolerance;
+7. report missing and mismatched rows separately.
 
 Expected matching summary:
 
@@ -207,6 +216,16 @@ A validation read failure or mismatch must not alter the foreground response or 
 
 ## TEST deployment order
 
+For the DAQI completeness correction on an already established continuity/calculated-history TEST deployment:
+
+1. deploy the updated station-history Worker bundle containing the shared helper;
+2. leave cache-proxy routing and feature flags unchanged;
+3. confirm the response reports `algorithm_version=aqilevels_hourly_v2`;
+4. validate one real PM observation gap in the chart;
+5. keep any historical AQI rebuild separate.
+
+For a new continuity deployment, retain the broader order:
+
 1. Apply the service-only continuity view.
 2. Deploy schema-version-2 binding producer and readers with continuity disabled.
 3. Run binding reconciliation dry-run.
@@ -221,7 +240,21 @@ A validation read failure or mismatch must not alter the foreground response or 
 
 ## Real TEST operational validation
 
-### 1. Known transition
+### 1. Known PM observation gap
+
+Open the Peterborough Garton End PM2.5 chart across the short observation gap on 2 August 2026.
+
+Confirm:
+
+- the concentration line retains its real missing observations;
+- European AQI has the corresponding hourly gap;
+- PM DAQI remains present throughout hours where at least 18 of the preceding 24 hourly means are valid;
+- the first endpoint with fewer than 18 valid rolling values, if any, is blank for DAQI;
+- no DAQI or European AQI value is carried into a neighbouring interval;
+- the response reports `algorithm_version=aqilevels_hourly_v2`;
+- PM rows report `daqi_required_observation_count=18`.
+
+### 2. Known transition
 
 Open a PM2.5 chart spanning the BPLE transition.
 
@@ -236,25 +269,27 @@ Confirm:
 - PM rolling context crosses the transition;
 - calculated DAQI and European AQI arrive with the observation response;
 - no normal blocking historical AQI request is made for the combined chunk;
-- the final coloured band aligns with the final concentration endpoint;
+- the final coloured band aligns with its final valid endpoint;
 - one bounded validation event is emitted.
 
-### 2. Normal single-member series
+### 3. Normal single-member series
 
 Confirm:
 
 - schema-version-1 exact binding still works;
 - no continuity lookup behaviour is required;
-- chart and AQI values remain unchanged except for the approved combined-response/rendering change;
+- unrelated chart and AQI values remain unchanged;
 - no broad binding churn occurred.
 
-### 3. Compatibility fallback
+### 4. Compatibility fallback
 
 Disable the calculated-history feature and confirm the retained separate R2 AQI source works through the same shared chart controller, cache, AQI-source controller and renderer without a code rollback.
 
+Existing R2 rows may remain algorithm version v1 until rebuilt. They must not be compared as ordinary matching v2 rows.
+
 Disable continuity and confirm exact requested-timeseries behaviour is restored.
 
-### 4. AQI source with authoritative blank intervals
+### 5. AQI source with authoritative blank intervals
 
 On an already displayed multi-sensor chart, choose an AQI source known to contain genuine observation or rolling-sample gaps.
 
@@ -262,7 +297,8 @@ Confirm:
 
 - the old AQI layer clears immediately;
 - valid bands for the new source appear in one visible commit;
-- uncalculable hours remain blank;
+- uncalculable index intervals remain blank;
+- valid DAQI can coexist with a blank European AQI interval;
 - no chart-wide incomplete-AQI or AQI-update error is shown;
 - retained observation lines are neither refetched nor repainted;
 - switching away and back reuses the settled AQI cache;
@@ -271,7 +307,7 @@ Confirm:
 
 Separately force or observe one genuine AQI-only request failure and confirm it remains retryable, leaves the observation chart usable, does not use the chart-wide red error banner and is represented only by bounded diagnostics or an AQI-local unavailable state.
 
-### 5. Shared frontend ownership
+### 6. Shared frontend ownership
 
 Confirm:
 
@@ -294,24 +330,27 @@ Only after the transition chart succeeds:
 7. re-run integrity;
 8. confirm the website still returns complete logical history while old rows now retain the correct physical identity.
 
+The PM DAQI completeness change itself does not require an Integrity run before deployment. Any historical AQI rebuild or repair remains a separate operation.
+
 ## Acceptance criteria
 
 Initial TEST acceptance requires:
 
-1. one successful multi-member transition chart;
-2. one successful ordinary single-member chart;
-3. one matching or bounded actionable R2 validation event;
-4. no broad binding ETag churn;
-5. no blocking stored-R2 AQI request on the calculated path;
-6. correct PM context across the identity transition;
-7. correct hour-ending band rendering;
-8. independent observation and AQI completeness;
-9. authoritative AQI gaps remain blank without a chart-wide user-facing warning;
-10. successfully evaluated AQI intervals are reused on later source switches;
-11. Hex Map and Sensors use the shared controller, cache and renderer;
-12. compatibility mode uses the shared frontend architecture;
-13. historical repair remains disabled until deliberately enabled;
-14. no R2 writes are caused by chart requests.
+1. one successful PM gap chart showing DAQI retained where at least 18 rolling values exist and European AQI blank at missing hourly endpoints;
+2. one successful multi-member transition chart where continuity is in scope;
+3. one successful ordinary single-member chart;
+4. one matching or bounded actionable R2 validation event, with algorithm-version differences classified as not comparable;
+5. no broad binding ETag churn;
+6. no blocking stored-R2 AQI request on the calculated path;
+7. correct PM context across identity transitions;
+8. correct hour-ending band rendering;
+9. independent observation, DAQI and European AQI availability;
+10. authoritative index-specific gaps remain blank without a chart-wide user-facing warning;
+11. successfully evaluated AQI intervals are reused on later source switches;
+12. Hex Map and Sensors use the shared controller, cache and renderer;
+13. compatibility mode uses the shared frontend architecture;
+14. historical repair remains disabled until deliberately enabled;
+15. no R2 writes are caused by chart requests.
 
 ## Rollback validation
 
@@ -323,5 +362,7 @@ UK_AQ_STATION_HISTORY_AQI_VALIDATION_MODE=off
 UK_AQ_STATION_HISTORY_CALCULATED_HISTORY_AQI_ENABLED=false
 UK_AQ_STATION_HISTORY_CONTINUITY_ENABLED=false
 ```
+
+A code rollback restores the archived v1 helper and station-history calculator together. Do not mix the v1 calculator with the v2 contract or validation expectations.
 
 Confirm the website returns to the retained compatibility data client through the same shared station-chart controller and renderer. Do not rewrite corrected historical R2 identity merely to roll back chart behaviour.
