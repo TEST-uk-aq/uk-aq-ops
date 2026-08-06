@@ -4,11 +4,11 @@
 
 This file protects the normalized AQI row, R2 object, private Worker and website-consumer interfaces used by the active AQI levels system.
 
-A timestamp correction must be coordinated across these interfaces. It must not silently change only one producer or consumer.
+A timestamp or calculation-semantics correction must be coordinated across these interfaces. It must not silently change only one producer or consumer.
 
 ## Shared normalized hourly row
 
-The shared calculation library emits one normalized row per canonical AQI key.
+The shared calculation library emits one normalized row per canonical AQI key where at least one calculated index result is valid or where a real hourly observation requires an explicit status row.
 
 Core columns are:
 
@@ -23,21 +23,23 @@ Core columns are:
 | `daqi_input_averaging_code` | string | `hourly_mean` or `rolling_24h_mean` |
 | `daqi_index_level` | integer 1–10 or null | UK DAQI level |
 | `daqi_source_observation_count` | integer or null | Source count used |
-| `daqi_required_observation_count` | integer | Required count, normally 1 or 24 |
+| `daqi_required_observation_count` | integer | Required count, 1 for NO2 or 18 for PM rolling DAQI |
 | `daqi_calculation_status` | string | Normalized status |
 | `daqi_missing_reason` | string or null | Stable diagnostic reason |
 | `eaqi_input_value_ugm3` | number or null | European AQI hourly input |
 | `eaqi_input_averaging_code` | `hourly_mean` | European AQI averaging |
 | `eaqi_index_level` | integer 1–6 or null | European AQI level |
 | `eaqi_source_observation_count` | integer or null | Source count used |
-| `eaqi_required_observation_count` | integer | Required count, normally 1 |
+| `eaqi_required_observation_count` | integer | Required count, 1 |
 | `eaqi_calculation_status` | string | Normalized status |
 | `eaqi_missing_reason` | string or null | Stable diagnostic reason |
 | `hourly_sample_count` | integer or null | Samples contributing to hourly mean |
-| `algorithm_version` | string | Calculation algorithm identifier |
+| `algorithm_version` | string | Calculation algorithm identifier, currently `aqilevels_hourly_v2` |
 | `computed_at_utc` | timestamp or null | Calculation time where persisted |
 
 Compatibility fields for pollutant-specific hourly and rolling values may also exist in database/debug rows. They must remain consistent with the normalized fields.
+
+For PM, a row may have valid DAQI fields while the hourly and European AQI fields are null because the endpoint observation is missing but at least 18 valid hourly means remain in the rolling 24-hour window.
 
 ## Required timestamp meaning
 
@@ -122,6 +124,15 @@ Canonical debug columns add:
 
 Debug rows use the same canonical key and index outcomes as data rows.
 
+For `aqilevels_hourly_v2`, PM debug rows must report:
+
+```text
+daqi_required_observation_count = 18
+0 <= daqi_source_observation_count <= 24
+```
+
+A valid PM DAQI row at a missing hourly endpoint has null hourly and European AQI inputs and counts, but retains the valid rolling DAQI input, source count and index.
+
 ## v2 object hierarchy
 
 Typical pollutant-part path:
@@ -164,17 +175,15 @@ Typical metadata key:
 
 ```text
 history/_index_v2/timeseries/timeseries_id=NN.json
+```
 
-Stable timeseries binding prefix (Phase 1 primary routing lookup):
+Stable timeseries binding prefix:
 
 ```text
 history/_index_v2/timeseries_binding/timeseries_id=NN.json
 ```
 
-Bindings contain only authoritative core identity/routing fields and no daily
-observation or AQI coverage. The retired cumulative metadata tree is not an
-active API fallback.
-```
+Bindings contain only authoritative core identity/routing fields and no daily observation or AQI coverage. The retired cumulative metadata tree is not an active API fallback.
 
 Required-index mode must fail boundedly with structured partial diagnostics when index context is absent. It must not fall back to scanning every connector and parquet object.
 
@@ -326,6 +335,8 @@ The `observations` section has independent rows, completeness, gaps, source coun
 
 AQI and observations must not be collapsed into one completeness flag internally.
 
+DAQI and European AQI availability must also remain independent within each AQI row. A missing PM hourly endpoint may have a valid DAQI result and a missing European AQI result.
+
 ## History chunk interface
 
 Older AQI chunks:
@@ -351,7 +362,7 @@ The cache proxy owns:
 - stale-fallback policy;
 - upstream error normalization.
 
-The AQI timestamp correction must not bypass the private station-history Service Binding or create a second public AQI calculation path.
+The AQI calculation change must not bypass the private station-history Service Binding or create a second public AQI calculation path.
 
 ## Website loader interface
 
@@ -364,6 +375,8 @@ The AQI timestamp correction must not bypass the private station-history Service
 After the interval correction, the loader must retain explicit start and end boundaries or derive them from the canonical endpoint. It must not continue treating the endpoint as the period start.
 
 Stable-head precedence, older-chunk no-replacement behaviour and independent observation merging must remain unchanged.
+
+The loader must retain a valid PM DAQI value when the same row has a null European AQI value, and vice versa.
 
 ## Website rendering interface
 
@@ -379,8 +392,10 @@ rectangle x2 = n
 
 A renderer must not calculate `x2=n+1 hour` for an hour-ending row.
 
+A null European AQI at a missing hourly PM endpoint remains blank even when PM DAQI for the same interval is valid.
+
 ## Compatibility rule
 
-A change to any field, route, path, authentication header, source-precedence rule, completeness field, endpoint meaning or website interval boundary in this file requires an explicit compatibility review.
+A change to any field, route, path, authentication header, source-precedence rule, completeness field, endpoint meaning, required sample count, algorithm version or website interval boundary in this file requires an explicit compatibility review.
 
-A coordinated timestamp correction may deliberately amend timestamp fields, but it must preserve all unrelated interface behaviour.
+A coordinated correction may deliberately amend calculation or timestamp fields, but it must preserve all unrelated interface behaviour.
