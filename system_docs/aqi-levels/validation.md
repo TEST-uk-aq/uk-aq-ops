@@ -21,10 +21,11 @@ Before changing AQI calculation, timestamp handling, R2 storage, API projection 
 - `timestamp_hour_utc` remains the canonical interval endpoint;
 - a row ending at `n` represents `(n - 1 hour, n]`;
 - represented request interval `S` to `E` selects endpoints `S < n <= E`;
-- R2 remains authoritative over live calculation for the same canonical row;
-- PM DAQI rolling context remains 24 hourly values ending at `n`;
-- European AQI remains independently available when PM DAQI has insufficient context;
-- missing endpoints remain gaps rather than being forward-filled or back-filled;
+- R2 remains authoritative over live calculation for the same canonical row except for the approved calculated station-chart foreground source contract;
+- PM DAQI rolling context remains the 24 possible hourly endpoints ending at `n`;
+- PM DAQI requires at least 18 valid hourly means within that rolling window;
+- European AQI remains independently hourly and requires the hourly value at `n`;
+- index-specific missing values remain blank rather than being forward-filled or back-filled;
 - data and debug R2 profiles remain aligned;
 - manifest and index rebuild ordering remains bottom-up;
 - partial source or scan results remain explicitly partial;
@@ -93,31 +94,35 @@ Given concentration and AQI rows whose final endpoint is 07:00:
 - the concentration marker ends at 07:00;
 - the DAQI colour ends at 07:00;
 - the European AQI colour ends at 07:00;
-- the area after 07:00 remains uncoloured.
+- the area after 07:00 remains uncoloured for each index unless that index has its own later valid endpoint.
 
-### Missing hour
+### Missing hourly PM observation
 
-Given AQI endpoints at 07:00 and 09:00 with no row at 08:00:
+Given no hourly PM observation at endpoint 08:00:
 
-- 06:00 to 07:00 may be coloured from the 07:00 row;
-- 07:00 to 08:00 remains blank;
-- 08:00 to 09:00 may be coloured from the 09:00 row;
-- neither neighbouring row spans the missing interval.
+- European AQI from 07:00 to 08:00 remains blank;
+- PM DAQI from 07:00 to 08:00 is present when at least 18 of the 24 rolling hourly values ending at 08:00 are valid;
+- PM DAQI from 07:00 to 08:00 remains blank when fewer than 18 rolling hourly values are valid;
+- neither neighbouring index value is stretched into an index-specific blank interval.
 
 ### PM rolling context
 
 For a PM endpoint `n`:
 
-- 24 valid hourly means ending from `n - 23 hours` through `n` produce DAQI status `ok`;
-- 23 valid hourly means produce DAQI status `insufficient_samples` and a null DAQI level;
-- a valid hourly mean at `n` may still produce European AQI status `ok` in the 23-hour case.
+- 24 valid hourly means produce DAQI status `ok` with source count 24 and required count 18;
+- 18 valid hourly means produce DAQI status `ok` with source count 18 and required count 18;
+- 17 valid hourly means produce DAQI status `insufficient_samples` and a null DAQI level;
+- the mean uses only available valid hourly means and does not impute missing hours;
+- a valid hourly mean at `n` may still produce European AQI status `ok` when PM DAQI has only 17 valid rolling hours;
+- a missing hourly mean at `n` produces European AQI status `missing_input`, while PM DAQI may remain `ok` with at least 18 valid rolling hours.
 
 ### Source precedence
 
 For the same canonical key:
 
-- one R2 row and one matching live row produce one retained R2 row;
-- one R2 row and one conflicting live row retain R2 and report the mismatch;
+- one R2 row and one matching live row produce one retained R2 row on persisted/compatibility paths;
+- one R2 row and one conflicting live row retain R2 and report the mismatch on those paths;
+- calculated station-chart foreground AQI uses the authoritative observation stream and validates stored R2 asynchronously;
 - an older history chunk cannot replace an accepted stable-head row.
 
 ### Midnight endpoint
@@ -173,8 +178,9 @@ Confirm there are no unintended changes to:
 - breakpoint values or inclusivity;
 - supported pollutants;
 - DAQI or European AQI averaging codes;
-- PM rolling source count;
-- algorithm version;
+- the 24-hour PM rolling window;
+- the 18-hour PM minimum valid count;
+- algorithm version beyond the approved `aqilevels_hourly_v2` change;
 - canonical row identity;
 - R2 data or debug columns;
 - R2 prefixes and manifest hierarchy;
@@ -202,7 +208,8 @@ Confirm:
 - authoritative connector, station and pollutant identity resolve;
 - the direct ingest read covers the reported interval or the response is correctly marked incomplete;
 - on-the-fly rows use endpoint timestamps;
-- PM rows show the expected rolling source count;
+- PM rows report source counts from 0 to 24 and required count 18;
+- PM DAQI becomes valid at source count 18;
 - DAQI and European AQI statuses are independently correct;
 - no negative source values contribute;
 - source diagnostics contain no unexpected identity conflicts.
@@ -213,10 +220,10 @@ Use a request spanning committed R2 AQI and recent live calculation.
 
 Confirm:
 
-- R2 rows remain source `r2`;
+- R2 rows remain source `r2` on the compatibility path;
 - live rows occur only for R2-missing eligible endpoints;
 - overlap counts are plausible;
-- mismatches are reported and R2 is retained;
+- mismatches are reported and R2 is retained on that path;
 - no seam endpoint is omitted or duplicated;
 - expected endpoint selection follows `S < n <= E`;
 - the response is cacheable only when complete.
@@ -227,12 +234,13 @@ After the normal TEST Prune Daily run processes a suitable closed day, confirm:
 
 - the active writer branch is reported or otherwise identifiable;
 - target-day AQI rows use the correct canonical endpoints;
-- PM context comes from the required preceding endpoints;
+- PM context comes from the preceding 24 possible endpoints;
+- PM required count is 18 and source count reflects the valid hourly means actually used;
+- a missing hourly PM endpoint can retain valid DAQI while European AQI remains missing;
 - data and debug profile row counts and keys agree;
 - calculation statuses and missing reasons are retained;
 - pollutant, connector and day manifests exist and agree with child objects;
-- targeted indexes reflect the committed rows; stable bindings are validated
-  independently against the committed core snapshot;
+- targeted indexes reflect the committed rows; stable bindings are validated independently against the committed core snapshot;
 - no unrelated observation deletion or history gate behaviour changed.
 
 ## 4. Private AQI History R2 API
@@ -244,7 +252,7 @@ For a known historical interval, confirm:
 - the first and final endpoints match `S < n <= E`;
 - explicit period boundaries match `(n - 1 hour, n]`;
 - row source is `r2` for committed history;
-- completeness is true only when every expected endpoint is present;
+- completeness and index-specific null values are represented according to the active interface contract;
 - a deliberately missing or inaccessible index produces structured partial behaviour rather than a broad scan.
 
 ## 5. Private station-history Worker
@@ -255,6 +263,7 @@ Confirm:
 - older AQI chunks extend backwards only;
 - a fresh stable head replaces only its own interval;
 - older history cannot replace that head;
+- a PM observation gap leaves European AQI blank but retains DAQI where the 18-of-24 threshold is met;
 - partial AQI does not suppress valid observations;
 - partial observations do not certify AQI completeness;
 - no public route or custom domain has been introduced.
@@ -275,12 +284,13 @@ Check both active station chart implementations.
 
 For a visible row ending at `n`, confirm:
 
-- the concentration point is plotted at `n`;
-- the DAQI rectangle starts at `n - 1 hour` and ends at `n`;
-- the European AQI rectangle starts at `n - 1 hour` and ends at `n`;
-- the final rectangles line up with the final concentration endpoint;
-- no colour extends one hour past the last value;
-- a missing AQI hour remains blank;
+- the concentration point is plotted at `n` when the observation exists;
+- the DAQI rectangle starts at `n - 1 hour` and ends at `n` when DAQI is valid;
+- the European AQI rectangle starts at `n - 1 hour` and ends at `n` when European AQI is valid;
+- the final rectangles line up with their final valid endpoints;
+- no colour extends one hour past the last valid value for that index;
+- a missing hourly PM observation leaves the European AQI hour blank;
+- PM DAQI remains visible across that hour when at least 18 rolling values are valid;
 - valid European AQI remains visible when PM DAQI is unavailable;
 - changing chart range does not alter the interval meaning.
 
@@ -293,31 +303,36 @@ Compare representative responses before and after deployment.
 Confirm all unrelated fields and meanings remain unchanged, including:
 
 - identity fields;
-- DAQI and European AQI values and statuses;
+- breakpoint-derived levels;
 - source and source-coverage fields;
 - partial diagnostics;
 - stable-head cursors;
 - cache markers;
 - observation rows and guideline data.
 
-Where the timestamp response contract is deliberately corrected, confirm every deployed consumer uses the new unambiguous start/end semantics before considering the deployment complete.
+Confirm the deliberate changes are present:
+
+- `algorithm_version = aqilevels_hourly_v2`;
+- `daqi_required_observation_count = 18` for PM;
+- eligible PM DAQI rows exist at missing hourly observation endpoints;
+- European AQI remains missing at those endpoints.
 
 ## Acceptance criteria
 
-An AQI timestamp and interval correction is complete only when:
+The change is complete only when:
 
 1. `timestamp_hour_utc` remains the canonical endpoint;
 2. every returned and rendered row represents `(n - 1 hour, n]`;
 3. request interval `S` to `E` selects exactly `S < n <= E`;
-4. the final coloured bands end at the final valid endpoint;
-5. missing hours remain blank;
-6. PM rolling context and source counts remain correct;
-7. European AQI remains independent of PM DAQI completeness;
-8. R2 remains authoritative over live calculation;
+4. the final coloured bands end at their final valid endpoints;
+5. PM DAQI uses a 24-hour rolling window and requires at least 18 valid hourly values;
+6. missing PM hourly observations leave European AQI blank while eligible rolling DAQI remains available;
+7. no index value is carried forward or backward;
+8. R2 and calculated source precedence follow their respective active contracts;
 9. data and debug history remain aligned;
 10. manifest and index hierarchy remains consistent and bounded;
 11. partial sources remain explicitly partial and non-cacheable as required;
 12. midnight endpoint rows are read from the correct endpoint-day partition;
 13. raw observation history is unchanged;
 14. daily and monthly roll-ups remain inactive unless separately approved;
-15. both website chart implementations show the corrected interval with no unrelated regression.
+15. TEST operation confirms the chart behaviour without unrelated regression.
