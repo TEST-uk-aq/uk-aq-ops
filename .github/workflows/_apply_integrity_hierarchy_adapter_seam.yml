@@ -1,0 +1,73 @@
+name: Apply Integrity hierarchy adapter seam
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/dev/_apply_integrity_hierarchy_adapter_seam.mjs
+      - .github/workflows/_apply_integrity_hierarchy_adapter_seam.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-integrity-hierarchy-adapter-seam
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply guarded adapter seam
+        run: node scripts/dev/_apply_integrity_hierarchy_adapter_seam.mjs
+
+      - name: Check JavaScript structure
+        run: |
+          node --check scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs
+          node --check scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs
+
+      - name: Run shared hierarchy checks
+        run: |
+          node --test \
+            tests/uk_aq_r2_observations_global_finalizer.test.mjs \
+            tests/uk_aq_prune_daily_hierarchy_integration.test.mjs
+
+      - name: Run Integrity apply safety checks
+        run: node --test scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs
+
+      - name: Commit guarded adapter seam
+        run: |
+          git diff --check
+          git rm -- \
+            scripts/dev/_apply_integrity_hierarchy_adapter_seam.mjs \
+            .github/workflows/_apply_integrity_hierarchy_adapter_seam.yml
+          git add -- \
+            scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs \
+            scripts/backup_r2/tests/uk_aq_integrity_apply_safety.test.mjs
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "No adapter-seam changes were produced" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "test: preserve Integrity hierarchy adapter seam"
+          git push origin HEAD:main
