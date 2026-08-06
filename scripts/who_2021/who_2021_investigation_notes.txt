@@ -1,0 +1,39 @@
+WHO 2021 January 2025 investigation
+
+Known chronology
+- LIVE integrity, 2025-01-01 only: 03/08/2026 21:22:31 to 21:27:12 UTC.
+- first_value_at reconciliation completed in both IngestDB and Obs AQIDB.
+- 505 IDs were submitted, matched and updated in each database.
+- LIVE WHO backfill failed later, at 03/08/2026 22:38:54 UTC.
+- WHO prepared 537 IDs for 2025-01-01 and the prepared-upsert RPC rejected at least one.
+- The full January integrity run occurred afterwards, on 04/08/2026 00:08:06 to 00:58:18 UTC.
+
+Important scope difference
+- WHO uses the hour-ending window (day 00:00, D+1 00:00], reading both the requested day and D+1 R2 partitions.
+- A one-day integrity repair may reconcile IDs evidenced in the requested source day but not every D+1 midnight boundary ID.
+- The prepared-upsert RPC also checks more than first_value_at: timeseries existence, connector, non-null station, pollutant relationship and ended_at.
+- The integrity report says timeseries_reconciliation and current-state reconciliation were disabled, so the run did not repair all of those possible causes.
+
+Use build_who_2021_timeseries_diagnostic.sh from a shell where the LIVE R2 variables are loaded. It generates SQL which classifies the exact R2 IDs against LIVE Obs AQIDB without changing persistent data.
+
+
+
+
+psql "$OBS_AQIDB_SUPABASE_DB_URL" \
+  -X \
+  -v ON_ERROR_STOP=1 \
+  -P pager=off \
+  -f tmp/who_2021_diagnostic_2025-01-01/who_obs_aqidb_diagnostic_2025-01-01.sql
+  
+  
+  
+To save the results as well as display them:  
+  
+set -o pipefail
+
+psql "$OBS_AQIDB_SUPABASE_DB_URL" \
+  -X \
+  -v ON_ERROR_STOP=1 \
+  -P pager=off \
+  -f tmp/who_2021_diagnostic_2025-01-01/who_obs_aqidb_diagnostic_2025-01-01.sql \
+  2>&1 | tee tmp/who_2021_diagnostic_2025-01-01/who_obs_aqidb_diagnostic_2025-01-01-output.log
