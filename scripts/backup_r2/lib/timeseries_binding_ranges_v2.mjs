@@ -24,6 +24,8 @@ export const TIMESERIES_BINDING_RANGE_STATE_KIND =
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const BINDING_FILE_PATTERN = /^timeseries_id=([1-9]\d*)\.json$/;
+const RANGE_SHARD_PATTERN = /^range=(\d+)-(\d+)\.json$/;
+const PROGRESS_INTERVAL = 250;
 
 function assertSha256(value, label) {
   const normalized = String(value || "").trim().toLowerCase();
@@ -41,17 +43,7 @@ function normalizeTimeseriesId(value) {
   return id;
 }
 
-export function timeseriesBindingRangeBounds(timeseriesId) {
-  const id = normalizeTimeseriesId(timeseriesId);
-  const rangeStart = Math.floor(id / TIMESERIES_BINDING_RANGE_SIZE)
-    * TIMESERIES_BINDING_RANGE_SIZE;
-  return {
-    range_start: rangeStart,
-    range_end: rangeStart + TIMESERIES_BINDING_RANGE_SIZE - 1,
-  };
-}
-
-export function timeseriesBindingRangeKey(rangeStart, rangeEnd = null) {
+function normalizeRangeBounds(rangeStart, rangeEnd = null) {
   const start = Number(rangeStart);
   const expectedEnd = start + TIMESERIES_BINDING_RANGE_SIZE - 1;
   const end = rangeEnd === null ? expectedEnd : Number(rangeEnd);
@@ -64,7 +56,23 @@ export function timeseriesBindingRangeKey(rangeStart, rangeEnd = null) {
   ) {
     throw new Error(`Invalid timeseries binding range ${rangeStart}-${rangeEnd}`);
   }
-  return `range=${String(start).padStart(6, "0")}-${String(end).padStart(6, "0")}`;
+  return { range_start: start, range_end: end };
+}
+
+export function timeseriesBindingRangeBounds(timeseriesId) {
+  const id = normalizeTimeseriesId(timeseriesId);
+  const rangeStart = Math.floor(id / TIMESERIES_BINDING_RANGE_SIZE)
+    * TIMESERIES_BINDING_RANGE_SIZE;
+  return {
+    range_start: rangeStart,
+    range_end: rangeStart + TIMESERIES_BINDING_RANGE_SIZE - 1,
+  };
+}
+
+export function timeseriesBindingRangeKey(rangeStart, rangeEnd = null) {
+  const bounds = normalizeRangeBounds(rangeStart, rangeEnd);
+  return `range=${String(bounds.range_start).padStart(6, "0")}`
+    + `-${String(bounds.range_end).padStart(6, "0")}`;
 }
 
 export function timeseriesBindingRangeInventoryShardKey(
@@ -161,15 +169,17 @@ export function buildTimeseriesBindingRangeInventoryShard({
   rangeEnd,
   units,
 }) {
-  const key = timeseriesBindingRangeKey(rangeStart, rangeEnd);
-  const start = Number(key.slice(6, 12));
-  const end = Number(key.slice(13, 19));
+  const bounds = normalizeRangeBounds(rangeStart, rangeEnd);
+  const key = timeseriesBindingRangeKey(bounds.range_start, bounds.range_end);
   const normalizedUnits = [...units]
     .map(normalizeInventoryUnit)
     .sort((left, right) => left.timeseries_id - right.timeseries_id);
   const seen = new Set();
   for (const unit of normalizedUnits) {
-    if (unit.timeseries_id < start || unit.timeseries_id > end) {
+    if (
+      unit.timeseries_id < bounds.range_start
+      || unit.timeseries_id > bounds.range_end
+    ) {
       throw new Error(`Timeseries binding ${unit.timeseries_id} is outside ${key}`);
     }
     if (seen.has(unit.timeseries_id)) {
@@ -182,8 +192,8 @@ export function buildTimeseriesBindingRangeInventoryShard({
     kind: TIMESERIES_BINDING_RANGE_INVENTORY_KIND,
     backup_version: "v2",
     range_size: TIMESERIES_BINDING_RANGE_SIZE,
-    range_start: start,
-    range_end: end,
+    range_start: bounds.range_start,
+    range_end: bounds.range_end,
     source_prefix: normalizeRelativePath(sourcePrefix, "timeseries binding prefix"),
     source_range_hash: rangeSourceHash(normalizedUnits),
     units: normalizedUnits,
@@ -216,20 +226,20 @@ export function validateTimeseriesBindingRangeInventoryShard(shard) {
 
 export function buildTimeseriesBindingRootInventory({ sourcePrefix, ranges }) {
   const normalizedRanges = [...ranges]
-    .map((entry) => ({
-      range_start: Number(entry.range_start),
-      range_end: Number(entry.range_end),
-      source_range_hash: assertSha256(
-        entry.source_range_hash,
-        "timeseries binding source_range_hash",
-      ),
-      inventory_shard_key: normalizeRelativePath(entry.inventory_shard_key),
-      unit_count: Math.max(0, Math.trunc(Number(entry.unit_count) || 0)),
-    }))
+    .map((entry) => {
+      const bounds = normalizeRangeBounds(entry.range_start, entry.range_end);
+      return {
+        range_start: bounds.range_start,
+        range_end: bounds.range_end,
+        source_range_hash: assertSha256(
+          entry.source_range_hash,
+          "timeseries binding source_range_hash",
+        ),
+        inventory_shard_key: normalizeRelativePath(entry.inventory_shard_key),
+        unit_count: Math.max(0, Math.trunc(Number(entry.unit_count) || 0)),
+      };
+    })
     .sort((left, right) => left.range_start - right.range_start);
-  for (const range of normalizedRanges) {
-    timeseriesBindingRangeKey(range.range_start, range.range_end);
-  }
   return {
     schema_version: 1,
     kind: TIMESERIES_BINDING_ROOT_INVENTORY_KIND,
@@ -283,16 +293,19 @@ export function validateTimeseriesBindingRootReference(reference) {
       "timeseries binding source_root_hash",
     ),
     ranges: Array.isArray(reference.ranges)
-      ? reference.ranges.map((entry) => ({
-        range_start: Number(entry.range_start),
-        range_end: Number(entry.range_end),
-        source_range_hash: assertSha256(
-          entry.source_range_hash,
-          "timeseries binding source_range_hash",
-        ),
-        inventory_shard_key: normalizeRelativePath(entry.inventory_shard_key),
-        unit_count: Math.max(0, Math.trunc(Number(entry.unit_count) || 0)),
-      })).sort((left, right) => left.range_start - right.range_start)
+      ? reference.ranges.map((entry) => {
+        const bounds = normalizeRangeBounds(entry.range_start, entry.range_end);
+        return {
+          range_start: bounds.range_start,
+          range_end: bounds.range_end,
+          source_range_hash: assertSha256(
+            entry.source_range_hash,
+            "timeseries binding source_range_hash",
+          ),
+          inventory_shard_key: normalizeRelativePath(entry.inventory_shard_key),
+          unit_count: Math.max(0, Math.trunc(Number(entry.unit_count) || 0)),
+        };
+      }).sort((left, right) => left.range_start - right.range_start)
       : [],
   };
 }
@@ -396,15 +409,44 @@ function groupByRange(units) {
   return groups;
 }
 
+function discoverExistingRangeShards({ rcloneBin, sourceRoot, inventoryRootPrefix }) {
+  const rangeRoot = `${normalizeRelativePath(inventoryRootPrefix)}/timeseries_binding`;
+  const entries = rcloneLsjsonRecursive(
+    rcloneBin,
+    joinTargetPath(sourceRoot, rangeRoot),
+    { hash: false, maxDepth: 1 },
+  );
+  const shards = [];
+  for (const entry of entries) {
+    const relative = entryRelativePath(entry);
+    const match = RANGE_SHARD_PATTERN.exec(relative);
+    if (!match) continue;
+    const bounds = normalizeRangeBounds(Number(match[1]), Number(match[2]));
+    const shardKey = `${rangeRoot}/${relative}`;
+    const raw = readJsonMaybe(rcloneBin, sourceRoot, shardKey);
+    if (!raw) continue;
+    const shard = validateTimeseriesBindingRangeInventoryShard(raw);
+    if (
+      shard.range_start !== bounds.range_start
+      || shard.range_end !== bounds.range_end
+    ) {
+      throw new Error(`Timeseries binding range filename/content mismatch: ${shardKey}`);
+    }
+    shards.push(shard);
+  }
+  shards.sort((left, right) => left.range_start - right.range_start);
+  return shards;
+}
+
 export function buildTimeseriesBindingRangeStateSkeleton(rangeStart, rangeEnd) {
-  const key = timeseriesBindingRangeKey(rangeStart, rangeEnd);
+  const bounds = normalizeRangeBounds(rangeStart, rangeEnd);
   return {
     schema_version: 1,
     kind: TIMESERIES_BINDING_RANGE_STATE_KIND,
     backup_version: "v2",
     range_size: TIMESERIES_BINDING_RANGE_SIZE,
-    range_start: Number(key.slice(6, 12)),
-    range_end: Number(key.slice(13, 19)),
+    range_start: bounds.range_start,
+    range_end: bounds.range_end,
     processed_source_range_hash: null,
     units: [],
   };
@@ -423,7 +465,9 @@ export function buildTimeseriesBindingInventory({
   const previousReference = validateTimeseriesBindingRootReference(
     previousRootReference,
   );
-  const previousRangeShards = [];
+  let previousRangeShards = [];
+  let previousUnitSource = null;
+
   if (previousReference) {
     for (const range of previousReference.ranges) {
       const raw = readJsonMaybe(
@@ -440,10 +484,19 @@ export function buildTimeseriesBindingInventory({
         validateTimeseriesBindingRangeInventoryShard(raw),
       );
     }
+    if (previousRangeShards.length > 0) previousUnitSource = "hierarchical";
+  } else {
+    previousRangeShards = discoverExistingRangeShards({
+      rcloneBin,
+      sourceRoot,
+      inventoryRootPrefix,
+    });
+    if (previousRangeShards.length > 0) {
+      previousUnitSource = "hierarchical_recovery";
+    }
   }
 
   let previousUnits = rangeUnitMap(previousRangeShards);
-  let previousUnitSource = previousUnits.size > 0 ? "hierarchical" : null;
   if (previousUnits.size === 0 && legacyInventoryKey) {
     const legacy = readJsonMaybe(rcloneBin, sourceRoot, legacyInventoryKey);
     previousUnits = legacyUnitMap(legacy);
@@ -459,6 +512,7 @@ export function buildTimeseriesBindingInventory({
   let reused = 0;
   let reusedFromLegacy = 0;
   let readAndHashed = 0;
+  let processed = 0;
 
   for (const entry of entries) {
     const relative = entryRelativePath(entry);
@@ -479,21 +533,28 @@ export function buildTimeseriesBindingInventory({
       });
       reused += 1;
       if (previousUnitSource === "legacy") reusedFromLegacy += 1;
-      continue;
+    } else {
+      const text = rcloneCat(
+        rcloneBin,
+        joinTargetPath(sourceRoot, relativePath),
+      );
+      units.push({
+        timeseries_id: timeseriesId,
+        relative_path: relativePath,
+        hash: sha256Hex(text),
+        size: Buffer.byteLength(text, "utf8"),
+        r2_md5: metadata.r2_md5,
+        r2_modtime: metadata.r2_modtime,
+      });
+      readAndHashed += 1;
     }
-    const text = rcloneCat(
-      rcloneBin,
-      joinTargetPath(sourceRoot, relativePath),
-    );
-    units.push({
-      timeseries_id: timeseriesId,
-      relative_path: relativePath,
-      hash: sha256Hex(text),
-      size: Buffer.byteLength(text, "utf8"),
-      r2_md5: metadata.r2_md5,
-      r2_modtime: metadata.r2_modtime,
-    });
-    readAndHashed += 1;
+    processed += 1;
+    if (processed % PROGRESS_INTERVAL === 0) {
+      console.error(
+        `timeseries-binding inventory progress: processed=${processed} `
+        + `reused=${reused} read_and_hashed=${readAndHashed}`,
+      );
+    }
   }
   units.sort((left, right) => left.timeseries_id - right.timeseries_id);
 
@@ -562,6 +623,10 @@ export function buildTimeseriesBindingInventory({
       source_prefix: sourcePrefix,
       range_size: TIMESERIES_BINDING_RANGE_SIZE,
       previous_unit_source: previousUnitSource,
+      recovered_range_shard_count:
+        previousUnitSource === "hierarchical_recovery"
+          ? previousRangeShards.length
+          : 0,
       listed: units.length,
       reused_by_metadata: reused,
       reused_from_legacy: reusedFromLegacy,
