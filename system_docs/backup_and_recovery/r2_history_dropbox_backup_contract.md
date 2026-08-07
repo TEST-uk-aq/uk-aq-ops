@@ -47,6 +47,10 @@ The observations run-level mutation exclusion contract is defined in:
 
 - [`../r2_history/observations_run_exclusion_contract.md`](../r2_history/observations_run_exclusion_contract.md).
 
+The authoritative physical timeseries-binding and binding source-manifest hierarchy is defined in:
+
+- [`../r2_history/contract.md`](../r2_history/contract.md).
+
 ## Direct replacement rule
 
 The hierarchical backup is a direct replacement for the previous flat inventory and checkpoint implementation.
@@ -80,6 +84,8 @@ Dropbox is the independent backup destination.
 The R2 backup inventory describes the current source objects and their stable source identities. The Dropbox backup state records which source identities have been copied and verified successfully.
 
 The Dropbox state is not a second source inventory and must not be used to author or repair R2.
+
+Authoritative source hierarchies such as the observations aggregate manifests and timeseries-binding `_manifests` tree belong to the R2 source data contract. The backup inventory consumes those source hierarchies; it does not author or repair them during a normal backup inventory run.
 
 ## Previous flat files
 
@@ -115,7 +121,7 @@ Observation date-based inventory shards are stored as:
 history/_index_v2/backup_inventory_v2/observations/year=YYYY/month=MM.json
 ```
 
-Timeseries-binding inventory shards are stored as fixed ID ranges:
+Timeseries-binding backup inventory shards are stored as fixed ID ranges:
 
 ```text
 history/_index_v2/backup_inventory_v2/timeseries_binding/root.json
@@ -124,7 +130,16 @@ history/_index_v2/backup_inventory_v2/timeseries_binding/range=001000-001999.jso
 ...
 ```
 
-The fixed binding range size is 1,000 timeseries IDs. Range boundaries must remain stable after deployment unless a separately documented migration changes them.
+Those backup inventory shards are derived from the authoritative binding source hierarchy:
+
+```text
+history/_index_v2/timeseries_binding/_manifests/root.json
+history/_index_v2/timeseries_binding/_manifests/range=000000-000999.json
+history/_index_v2/timeseries_binding/_manifests/range=001000-001999.json
+...
+```
+
+The fixed binding range size is 1,000 timeseries IDs in both source and backup hierarchies. Range boundaries must remain stable after deployment unless a separately documented migration changes them.
 
 Observation run manifests use a small stable global inventory shard, for example:
 
@@ -145,8 +160,9 @@ The inventory root records at least:
 - observations source-root content hash;
 - each observation year source hash;
 - each observation month source hash and inventory shard path;
-- the timeseries-binding inventory root identity;
-- each timeseries-binding range source hash and inventory shard path, directly or through the binding root;
+- the authoritative timeseries-binding source-manifest root identity;
+- the timeseries-binding backup inventory root identity;
+- each timeseries-binding range source hash and backup inventory shard path, directly or through the binding root;
 - observation run-manifest shard identity;
 - current core backup identity and any core shard path when a separate core shard is used;
 - stable source-derived generation evidence where required.
@@ -182,13 +198,33 @@ Physical binding objects remain at:
 history/_index_v2/timeseries_binding/timeseries_id=<id>.json
 ```
 
-The backup inventory groups those objects into stable 1,000-ID ranges without moving or renaming the physical binding objects.
+Normal backup inventory traversal must use the authoritative binding source hierarchy, not a full listing of the physical binding prefix.
 
-Each range records the complete current set of binding identities in that range and a stable `source_range_hash`.
+The normal path is:
 
-The binding inventory root records the current ranges and one stable `source_root_hash` derived from those range identities.
+```text
+read binding source root
+    -> source_root_hash matches previous backup inventory source identity
+        -> reuse complete previous binding backup inventory root/ranges
+        -> do not list physical bindings
+        -> do not read range manifests
 
-A normal inventory run may reuse a binding object's prior SHA-256 when current R2 metadata proves the object is unchanged. A changed binding must affect only its fixed range and the necessary parent root identities.
+source root changed
+    -> compare source range hashes with previous backup range identities
+        -> unchanged range hash
+            -> reuse previous backup range shard without opening physical bindings
+        -> changed/new range hash
+            -> read authoritative source range manifest
+            -> rebuild/write only that backup inventory range shard
+```
+
+A normal hierarchical inventory run must therefore perform **zero complete physical binding-prefix listings** when the authoritative source hierarchy is valid. It must not list all `timeseries_id=<id>.json` objects merely to prove that unchanged source range hashes are unchanged.
+
+A changed source range manifest already contains the complete current physical binding identities for that fixed range. The backup builder may copy those stable identities into its own range representation without re-reading the physical binding JSON files.
+
+The binding backup inventory root records the current ranges and one stable `source_root_hash` corresponding to the authoritative binding source root. A changed binding must affect only its fixed source range, corresponding backup range and necessary parent roots.
+
+If the authoritative binding source root or a referenced range manifest is missing, malformed or contradictory, normal hierarchical mode must fail clearly. It must not silently fall back to a 6,000+ object physical listing. Recovery is an explicit binding source-hierarchy bootstrap/rebuild or full-scan verification operation.
 
 ## Core inventory traversal
 
@@ -206,9 +242,13 @@ The inventory builder must retain an explicit full-scan mode that independently:
 
 - enumerates all committed observation day manifests;
 - rebuilds or compares every observation month shard;
-- reads and hashes every current timeseries-binding object;
+- enumerates every physical timeseries-binding object;
+- reads and hashes every current physical timeseries-binding object;
+- independently rebuilds the expected binding source range/root identities and compares them with the authoritative binding source hierarchy;
 - enumerates and verifies the current in-scope core backup objects;
-- validates the resulting inventory roots.
+- validates the resulting backup inventory roots.
+
+A dedicated binding source-hierarchy bootstrap/rebuild operation may perform the same expensive physical binding enumeration without running the complete backup full scan.
 
 Normal hierarchical mode must fail clearly rather than silently trust malformed or contradictory parent manifests.
 
@@ -465,13 +505,15 @@ The active workflow must never run both the flat and hierarchical syncs for diff
 
 The old flat implementation survives only in the repository archive and Git history for rollback/reference. The old flat remote state may remain untouched as historical evidence but is not an active checkpoint after successful hierarchical cutover.
 
-## Interaction with observation writers
+## Interaction with observation and binding writers
 
 Prune Daily and Integrity do not edit the backup inventory or Dropbox state while writing R2 observations.
 
 They maintain the authoritative observation manifests, including month, year and observations-root hierarchy according to the observations hierarchy contract.
 
-The inventory builder later discovers committed hierarchy state independently and updates its own backup inventory shards. This preserves separation between data writing and backup discovery.
+Timeseries-binding reconciliation maintains the authoritative binding physical objects and source range/root manifests according to the stable binding contract. It does not edit the Dropbox backup inventory or Dropbox state.
+
+The inventory builder later consumes those committed source hierarchies independently and updates its own backup inventory shards. This preserves separation between data writing and backup discovery.
 
 The Dropbox backup is a read-only R2 consumer. It does not require the observations mutation lease merely to copy already committed R2 objects.
 
@@ -487,8 +529,10 @@ Each backup report records at least:
 - stale observation Parquet files removed;
 - whether forced observation prune recheck was requested;
 - observation days audited by a forced prune recheck, stale files removed and any failed day audits;
-- timeseries-binding source root hash;
-- binding ranges inspected and skipped;
+- authoritative timeseries-binding source-manifest root key and source root hash;
+- whether the complete physical binding listing was skipped;
+- binding source ranges inspected and skipped by matching hash;
+- binding backup inventory range shards changed/written;
 - binding files copied;
 - observation run manifests copied;
 - core units listed, skipped and copied;
@@ -508,7 +552,12 @@ At minimum the implementation structure must preserve these invariants:
 
 - unchanged source hierarchy produces unchanged inventory root and shards;
 - a one-day observation change affects only its month shard and necessary ancestor identities;
-- a binding change affects only its fixed range and necessary ancestor identities;
+- an unchanged authoritative binding source-root hash causes zero complete physical binding-prefix listings in normal inventory mode;
+- a binding change affects only its fixed source range, matching backup range and necessary ancestor identities;
+- unchanged binding source ranges are not opened or rewritten merely because another range changed;
+- a missing or contradictory binding source hierarchy fails normal inventory clearly instead of falling back to a complete physical listing;
+- explicit binding bootstrap/full-scan remains capable of enumerating and hashing every physical binding independently;
+- retained stale physical binding objects remain represented by the authoritative binding source hierarchy until explicitly removed under a separate contract;
 - a core change does not force observation month or binding-range rewrites;
 - a partial observation month does not advance its processed month hash;
 - a partial binding range does not advance its processed range hash;
