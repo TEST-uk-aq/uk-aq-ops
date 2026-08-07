@@ -12,6 +12,7 @@ The active Dropbox backup scope is deliberately limited to:
 history/v2/observations
 history/v2/_ops/observations/runs
 history/_index_v2/timeseries_binding
+history/v2/core
 ```
 
 This means the Dropbox history backup must cover:
@@ -19,7 +20,8 @@ This means the Dropbox history backup must cover:
 - committed v2 observation day folders, including their manifests and Parquet objects;
 - the v2 observations month, year and root aggregate manifest hierarchy;
 - v2 observation run manifests;
-- v2 timeseries-binding JSON objects.
+- v2 timeseries-binding JSON objects;
+- v2 core history objects under `history/v2/core`.
 
 The following are explicitly out of scope for this Dropbox history backup and must not be copied, inventoried or checkpointed by the active backup implementation:
 
@@ -27,10 +29,13 @@ The following are explicitly out of scope for this Dropbox history backup and mu
 history/v2/aqilevels
 history/v2/aqilevels/hourly/data
 history/v2/aqilevels/hourly/debug
-history/v2/core
 ```
 
-Derived AQI levels and AQI debug history are no longer part of the Dropbox backup requirement. R2 core snapshots are also outside this Dropbox backup requirement. This decision is specific to the Dropbox history backup and does not delete those R2 objects or redefine their separate runtime contracts.
+Derived AQI levels and AQI debug history are no longer part of the Dropbox backup requirement.
+
+R2 core history remains part of the Dropbox backup requirement. Core does not require observation month sharding or timeseries-ID range sharding. It may remain represented as a compact non-range inventory/state section or one stable dedicated core shard, provided core changes do not force unchanged observation month shards or timeseries-binding range shards to be rewritten.
+
+Core pruning is intentionally deferred. The active backup must continue preserving core coverage, but this contract does not yet authorise deletion of stale Dropbox core objects. A later contract update must define the authoritative core pruning rule before the backup implementation deletes destination core objects.
 
 The only `_index_v2` data objects in active Dropbox backup scope are the physical timeseries-binding objects required to preserve observation timeseries identity. Other historical index trees are not part of this backup unless a later contract explicitly adds them.
 
@@ -127,7 +132,9 @@ Observation run manifests use a small stable global inventory shard, for example
 history/_index_v2/backup_inventory_v2/global/observation_run_manifests.json
 ```
 
-Small global units must not force unchanged observation month shards or binding range shards to be rewritten.
+Core does not use timeseries-ID ranges. Its current backup inventory may remain a compact non-range section of the root or one stable dedicated core shard. Core inventory identity must be source-derived and byte-stable when the underlying core backup objects have not changed.
+
+Small global or core units must not force unchanged observation month shards or binding range shards to be rewritten.
 
 ## Inventory root contents
 
@@ -141,6 +148,7 @@ The inventory root records at least:
 - the timeseries-binding inventory root identity;
 - each timeseries-binding range source hash and inventory shard path, directly or through the binding root;
 - observation run-manifest shard identity;
+- current core backup identity and any core shard path when a separate core shard is used;
 - stable source-derived generation evidence where required.
 
 No wall-clock-only field may cause an unchanged inventory root or shard to change bytes.
@@ -182,6 +190,14 @@ The binding inventory root records the current ranges and one stable `source_roo
 
 A normal inventory run may reuse a binding object's prior SHA-256 when current R2 metadata proves the object is unchanged. A changed binding must affect only its fixed range and the necessary parent root identities.
 
+## Core inventory traversal
+
+Core remains a backed-up domain but is not large enough to require binding-style range partitioning.
+
+The inventory builder must retain the current source identities needed to determine which core objects are unchanged, changed or missing in Dropbox. It may reuse previous verified hashes when current R2 metadata proves an object is unchanged.
+
+A core change must update only the compact core inventory representation and the necessary parent root identity. It must not rewrite observation month inventory shards or timeseries-binding range inventory shards.
+
 ## Independent full-scan mode
 
 The hierarchy is an optimisation, not the only verification method.
@@ -191,6 +207,7 @@ The inventory builder must retain an explicit full-scan mode that independently:
 - enumerates all committed observation day manifests;
 - rebuilds or compares every observation month shard;
 - reads and hashes every current timeseries-binding object;
+- enumerates and verifies the current in-scope core backup objects;
 - validates the resulting inventory roots.
 
 Normal hierarchical mode must fail clearly rather than silently trust malformed or contradictory parent manifests.
@@ -223,7 +240,9 @@ Observation run-manifest state uses a small stable global shard, for example:
 _ops/checkpoints/r2_history_backup_state_v2/global/observation_run_manifests.json
 ```
 
-No AQI-level, AQI-debug or core state shard belongs in the active hierarchical Dropbox checkpoint tree.
+Core may use a compact `core` section in the small root or one stable dedicated core state shard. It must not be split into timeseries-ID ranges and it must not cause observation month or binding range state shards to be rewritten.
+
+No AQI-level or AQI-debug state shard belongs in the active hierarchical Dropbox checkpoint tree.
 
 ## Source and state hashes
 
@@ -245,7 +264,9 @@ processed_source_range_hash
 
 That hash may advance only when every binding required by the current R2 range has a matching successfully copied identity in the range state.
 
-The Dropbox root records fully processed source hashes for observation years, the observations root and the timeseries-binding root as appropriate.
+Core state must retain enough stable source identity to distinguish a completely processed current core inventory from a partial or older one. If a compact core source hash is used, its processed hash must advance only after every required current core unit has copied successfully.
+
+The Dropbox root records fully processed source hashes for observation years, the observations root, the timeseries-binding root and core as appropriate.
 
 A separate hash of a Dropbox state shard itself may be recorded in the Dropbox root for checkpoint integrity. That state-shard hash is a Dropbox concern and need not be written back to R2.
 
@@ -273,6 +294,12 @@ A binding range state shard records at least:
 - checkpoint schema version.
 
 The range state must be sufficient to resume a partial range without recopying bindings whose current source hashes already match.
+
+## Core state contents
+
+Core state records the successfully copied current identities for in-scope core objects and enough completion evidence to resume after interruption without recopying unchanged core objects.
+
+Core state may remain compact because core does not require range sharding. Its representation must nevertheless be deterministic and must not trigger unrelated observation or binding checkpoint rewrites.
 
 ## Observation copy planning
 
@@ -324,13 +351,48 @@ binding differs or is missing
 
 A changed range must not cause unchanged ranges or unchanged binding files within the changed range to be recopied.
 
+## Core copy planning
+
+Core remains incremental and inventory-driven.
+
+For core:
+
+```text
+current core identity matches processed core state
+    -> skip core copy work
+
+core identity differs
+    -> compare current core units with recorded Dropbox state
+
+core unit matches
+    -> skip unit
+
+core unit differs or is missing
+    -> copy that core unit
+```
+
+A core change must not cause observation days, observation run manifests or timeseries-binding files to be recopied.
+
+## Core pruning is deferred
+
+The replacement described by this contract does not implement core pruning.
+
+Until a later contract defines safe core retention and deletion rules:
+
+- existing core Dropbox backup coverage must be preserved;
+- changed or missing core units may be copied according to the current inventory;
+- the active backup must not delete destination core objects merely because they are absent from the latest core inventory;
+- no generic stale-file pruning rule may be applied to core by analogy with observation Parquet pruning.
+
+This deferred pruning work must be treated separately from the current hierarchical direct replacement.
+
 ## Observation run manifests
 
 Observation run manifests remain in active backup scope because they are operational evidence for the backed-up observation history.
 
 The sync compares the stable run-manifest inventory shard with its Dropbox state shard and copies only changed or missing run-manifest JSON files.
 
-Run-manifest state changes must not force observation month or binding range state shards to be rewritten.
+Run-manifest state changes must not force observation month, binding range or core state shards to be rewritten unnecessarily.
 
 ## Failure and completion ordering
 
@@ -342,7 +404,9 @@ A binding range state shard may record individual binding successes as they occu
 
 It must not advance `processed_source_range_hash` until every current binding required for that range succeeds.
 
-Year, observations-root and binding-root processed hashes advance only after all required child state is complete.
+Core state may record individual unit successes as they occur, but any aggregate processed core identity must not advance until every required changed or missing core unit succeeds.
+
+Year, observations-root, binding-root and core processed identities advance only after all required child state is complete.
 
 State shards are written before their parent root. The small Dropbox root is updated last.
 
@@ -360,7 +424,7 @@ Checkpoint updates are accumulated and flushed:
 - before a controlled failure exit when dirty state can be saved safely;
 - at successful completion.
 
-The implementation may configure different bounded batch sizes for observation days and timeseries-binding files when their unit sizes and run characteristics differ.
+The implementation may configure different bounded batch sizes for observation days and timeseries-binding files when their unit sizes and run characteristics differ. Core is compact and may normally flush at its phase boundary, but it must not reintroduce repeated whole-root uploads after individual units.
 
 Once sharded state is active, only dirty shards and the small parent root are written. Unchanged historical shards are untouched.
 
@@ -370,7 +434,7 @@ Cutover is a direct replacement, not a hybrid operating period.
 
 Before substantial code replacement, archive the current active implementation according to `AGENTS.md`.
 
-The first hierarchical run may read the previous flat v2 inventory and Dropbox state solely to adopt existing verified source identities into the new shards.
+The first hierarchical run may read the previous flat v2 inventory and Dropbox state solely to adopt existing verified source identities into the new state representation, including valid existing core identities.
 
 Adoption must be restartable and non-destructive. It must not force R2 data objects or Dropbox history data to be recopied merely because checkpoint representation changed.
 
@@ -379,7 +443,7 @@ The cutover sequence is:
 1. deploy the hierarchical implementation under the established active production filenames;
 2. read and validate the hierarchical R2 inventory;
 3. where hierarchical Dropbox state is missing, adopt structurally matching identities from the previous flat state;
-4. write required child state shards;
+4. write required child state shards or compact core state;
 5. write the hierarchical Dropbox root last;
 6. from that point, use only the hierarchical inventory and state for normal backup operation.
 
@@ -406,17 +470,19 @@ Each backup report records at least:
 - years and months inspected;
 - years and months skipped by matching hash;
 - changed observation days sent to rclone;
-- stale Parquet files removed;
+- stale observation Parquet files removed;
 - timeseries-binding source root hash;
 - binding ranges inspected and skipped;
 - binding files copied;
 - observation run manifests copied;
+- core units listed, skipped and copied;
+- core source/processed identity where used;
 - dirty state shards written;
 - checkpoint flush count;
-- incomplete month, year, observations-root, binding-range or binding-root hashes;
+- incomplete month, year, observations-root, binding-range, binding-root or core identities;
 - first-run legacy adoption mode when applicable.
 
-The report must make it possible to distinguish source changes, copied units and checkpoint-only writes without reading the large state shards manually.
+The report must make it possible to distinguish source changes, copied units and checkpoint-only writes without reading the state shards manually.
 
 ## Structural validation policy
 
@@ -427,12 +493,15 @@ At minimum the implementation structure must preserve these invariants:
 - unchanged source hierarchy produces unchanged inventory root and shards;
 - a one-day observation change affects only its month shard and necessary ancestor identities;
 - a binding change affects only its fixed range and necessary ancestor identities;
+- a core change does not force observation month or binding-range rewrites;
 - a partial observation month does not advance its processed month hash;
 - a partial binding range does not advance its processed range hash;
+- incomplete core copy work does not advance a current aggregate core processed identity;
 - successful flushed unit progress survives restart;
 - batching prevents per-unit whole-checkpoint uploads;
 - first-run adoption preserves structurally valid existing verified identities without recopying data;
-- the active workflow contains no AQI-level, AQI-debug or core backup path;
+- the active workflow contains no AQI-level or AQI-debug backup path;
+- the active workflow retains core backup coverage without implementing core pruning;
 - the active workflow invokes one hierarchical builder and one hierarchical sync only.
 
 Functional acceptance occurs through real TEST inventory and Dropbox backup operation after deployment. Broad pre-deployment test suites are not required by this contract.
