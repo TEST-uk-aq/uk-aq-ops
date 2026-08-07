@@ -227,5 +227,182 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
     return result
 
 
+_ORIGINAL_FORMAT_SUMMARY_MD = format_summary_md
+_GLOBAL_FINALISATION_LOGGED_RESULT_IDS: set[int] = set()
+
+
+def _v2_global_index_finalisation(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the v2 global index finalisation audit object when present."""
+    history_results = result.get("history_version_results")
+    if isinstance(history_results, dict):
+        v2_result = history_results.get("v2")
+        if isinstance(v2_result, dict):
+            final_verification = v2_result.get("final_verification")
+            if isinstance(final_verification, dict):
+                global_finalisation = final_verification.get("global_index_finalization")
+                if isinstance(global_finalisation, dict):
+                    return global_finalisation
+
+    final_verification = result.get("final_verification")
+    if isinstance(final_verification, dict):
+        global_finalisation = final_verification.get("global_index_finalization")
+        if isinstance(global_finalisation, dict):
+            return global_finalisation
+    return None
+
+
+def _markdown_value_list(values: Any) -> str:
+    if not isinstance(values, list) or not values:
+        return "none"
+    return ", ".join(f"`{value}`" for value in values)
+
+
+def _render_global_index_finalisation_md(result: dict[str, Any]) -> list[str]:
+    global_finalisation = _v2_global_index_finalisation(result)
+    if global_finalisation is None:
+        return []
+
+    affected_days = global_finalisation.get("affected_days_utc")
+    if not isinstance(affected_days, list):
+        affected_days = []
+
+    index_finalisation = global_finalisation.get("index_finalization")
+    if not isinstance(index_finalisation, dict):
+        index_finalisation = {}
+
+    hierarchy = global_finalisation.get("observations_manifest_hierarchy")
+    if not isinstance(hierarchy, dict):
+        hierarchy = {}
+
+    execution = hierarchy.get("execution")
+    if not isinstance(execution, dict):
+        execution = {}
+    writes = execution.get("writes")
+    if not isinstance(writes, list):
+        writes = []
+    wrote_object_count = execution.get("wrote_object_count")
+    if not isinstance(wrote_object_count, int):
+        wrote_object_count = len(writes)
+
+    lines = [
+        "#### Global index finalisation",
+        "",
+        f"- Status: `{global_finalisation.get('status', 'unknown')}`",
+        f"- Affected days: {len(affected_days)} ({_markdown_value_list(affected_days)})",
+        f"- Index finalisation: `{index_finalisation.get('status', 'unknown')}`",
+    ]
+
+    if hierarchy:
+        lines.extend(
+            [
+                f"- Observations hierarchy: `{hierarchy.get('status', 'unknown')}`",
+                f"- Affected months: {_markdown_value_list(hierarchy.get('affected_months'))}",
+                f"- Affected years: {_markdown_value_list(hierarchy.get('affected_years'))}",
+                f"- Hierarchy manifests written: {wrote_object_count}",
+            ]
+        )
+
+    error_value = global_finalisation.get("error") or hierarchy.get("error") or hierarchy.get("reason")
+    if error_value:
+        lines.append(f"- Error: `{str(error_value).replace(chr(10), ' ')[:500]}`")
+
+    manifest_rows = [row for row in writes if isinstance(row, dict) and row.get("key")]
+    if manifest_rows:
+        lines.extend(["- Hierarchy manifest objects:"])
+        for row in manifest_rows:
+            details = [str(row.get("action", "write"))]
+            if "verified" in row:
+                details.append("verified" if row.get("verified") else "not verified")
+            lines.append(f"  - `{row['key']}` ({', '.join(details)})")
+
+    return lines
+
+
+def _insert_finalisation_markdown(markdown: str, block: list[str]) -> str:
+    if not block or "#### Global index finalisation" in markdown:
+        return markdown
+
+    lines = markdown.splitlines()
+    try:
+        final_verification_index = lines.index("### Final verification")
+    except ValueError:
+        suffix = "\n" if markdown.endswith("\n") else ""
+        return f"{markdown.rstrip()}\n\n" + "\n".join(block) + suffix
+
+    insert_at = len(lines)
+    for index in range(final_verification_index + 1, len(lines)):
+        if lines[index].startswith("### "):
+            insert_at = index
+            break
+
+    updated_lines = lines[:insert_at] + [""] + block + [""] + lines[insert_at:]
+    rendered = "\n".join(updated_lines)
+    if markdown.endswith("\n"):
+        rendered += "\n"
+    return rendered
+
+
+def _log_global_index_finalisation(result: dict[str, Any]) -> None:
+    result_identity = id(result)
+    if result_identity in _GLOBAL_FINALISATION_LOGGED_RESULT_IDS:
+        return
+
+    global_finalisation = _v2_global_index_finalisation(result)
+    if global_finalisation is None:
+        return
+
+    hierarchy = global_finalisation.get("observations_manifest_hierarchy")
+    if not isinstance(hierarchy, dict):
+        hierarchy = {}
+    execution = hierarchy.get("execution")
+    if not isinstance(execution, dict):
+        execution = {}
+    writes = execution.get("writes")
+    if not isinstance(writes, list):
+        writes = []
+    wrote_object_count = execution.get("wrote_object_count")
+    if not isinstance(wrote_object_count, int):
+        wrote_object_count = len(writes)
+
+    affected_days = global_finalisation.get("affected_days_utc")
+    affected_day_count = len(affected_days) if isinstance(affected_days, list) else 0
+    index_finalisation = global_finalisation.get("index_finalization")
+    index_status = (
+        index_finalisation.get("status", "unknown")
+        if isinstance(index_finalisation, dict)
+        else "unknown"
+    )
+
+    message = (
+        "global index finalisation status=%s affected_days=%d "
+        "index_status=%s hierarchy_status=%s hierarchy_writes=%d"
+    )
+    values: list[Any] = [
+        global_finalisation.get("status", "unknown"),
+        affected_day_count,
+        index_status,
+        hierarchy.get("status", "not_reported"),
+        wrote_object_count,
+    ]
+
+    error_value = global_finalisation.get("error") or hierarchy.get("error") or hierarchy.get("reason")
+    if error_value:
+        message += " error=%s"
+        values.append(str(error_value).replace("\n", " ")[:500])
+
+    logging.getLogger("uk-aq-history-integrity").info(message, *values)
+    _GLOBAL_FINALISATION_LOGGED_RESULT_IDS.add(result_identity)
+
+
+def format_summary_md(result: dict[str, Any], *args: Any, **kwargs: Any) -> str:
+    """Add global finalisation evidence to the established Markdown summary."""
+    rendered = _ORIGINAL_FORMAT_SUMMARY_MD(result, *args, **kwargs)
+    block = _render_global_index_finalisation_md(result)
+    if block:
+        _log_global_index_finalisation(result)
+        return _insert_finalisation_markdown(rendered, block)
+    return rendered
+
+
 if _PUBLIC_MODULE_NAME == "__main__":
     _wrapper_sys.exit(main(_wrapper_sys.argv[1:]))
