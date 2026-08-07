@@ -27,6 +27,9 @@ import {
   buildTimeseriesBindingInventory,
 } from "./lib/timeseries_binding_ranges_v2.mjs";
 import {
+  buildCoreInventory,
+} from "./lib/hierarchical_core_backup_v2.mjs";
+import {
   OBSERVATIONS_AGGREGATE_MANIFEST_KINDS,
   validateR2HistoryV2ObservationsAggregateManifest,
 } from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
@@ -38,6 +41,9 @@ const DEFAULT_OBSERVATIONS_PREFIX = normalizePrefix(
 );
 const DEFAULT_RUNS_PREFIX = normalizePrefix(
   process.env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || "history/v2/_ops/observations/runs",
+);
+const DEFAULT_CORE_PREFIX = normalizePrefix(
+  process.env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || "history/v2/core",
 );
 const DEFAULT_INDEX_V2_PREFIX = normalizePrefix(
   process.env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || "history/_index_v2",
@@ -70,11 +76,12 @@ function usage() {
     "Options:",
     `  --observations-prefix <p>    Default: ${DEFAULT_OBSERVATIONS_PREFIX}`,
     `  --runs-prefix <p>            Default: ${DEFAULT_RUNS_PREFIX}`,
+    `  --core-prefix <p>            Default: ${DEFAULT_CORE_PREFIX}`,
     `  --timeseries-binding-prefix <p> Default: ${DEFAULT_TIMESERIES_BINDING_PREFIX}`,
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
     `  --legacy-inventory-key <p>   Default: ${DEFAULT_LEGACY_INVENTORY_KEY}`,
     `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
-    "  --full-scan                  Independently hash all observation days and bindings",
+    "  --full-scan                  Independently hash observations, bindings and core",
     "  --dry-run                    Build and compare only; do not write inventory objects",
     "  --report-out <file>          Write JSON report",
     "  -h, --help",
@@ -86,6 +93,7 @@ function parseArgs(argv) {
     source_root: "",
     observations_prefix: DEFAULT_OBSERVATIONS_PREFIX,
     runs_prefix: DEFAULT_RUNS_PREFIX,
+    core_prefix: DEFAULT_CORE_PREFIX,
     timeseries_binding_prefix: DEFAULT_TIMESERIES_BINDING_PREFIX,
     inventory_root_prefix: DEFAULT_INVENTORY_ROOT_PREFIX,
     legacy_inventory_key: DEFAULT_LEGACY_INVENTORY_KEY,
@@ -100,6 +108,7 @@ function parseArgs(argv) {
     if (arg === "--source-root") args.source_root = next();
     else if (arg === "--observations-prefix") args.observations_prefix = normalizePrefix(next());
     else if (arg === "--runs-prefix") args.runs_prefix = normalizePrefix(next());
+    else if (arg === "--core-prefix") args.core_prefix = normalizePrefix(next());
     else if (arg === "--timeseries-binding-prefix") {
       args.timeseries_binding_prefix = normalizePrefix(next());
     } else if (arg === "--inventory-root-prefix") {
@@ -117,6 +126,7 @@ function parseArgs(argv) {
   }
   if (!args.source_root) throw new Error("--source-root is required");
   if (!args.observations_prefix) throw new Error("--observations-prefix is required");
+  if (!args.core_prefix) throw new Error("--core-prefix is required");
   if (!args.timeseries_binding_prefix) {
     throw new Error("--timeseries-binding-prefix is required");
   }
@@ -449,6 +459,17 @@ async function main() {
     dryRun: args.dry_run,
   });
 
+  const coreInventory = buildCoreInventory({
+    rcloneBin: args.rclone_bin,
+    sourceRoot: args.source_root,
+    sourcePrefix: args.core_prefix,
+    inventoryRootPrefix: args.inventory_root_prefix,
+    previousRootReference: previousRoot?.core || null,
+    legacyInventoryKey: args.legacy_inventory_key,
+    fullScan: args.full_scan,
+    dryRun: args.dry_run,
+  });
+
   const root = buildHierarchicalInventoryRoot({
     observationsRootManifestKey: observationsRootKey,
     observationsRootHash: sourceRoot.content_hash,
@@ -459,6 +480,7 @@ async function main() {
     legacyInventoryKey: args.legacy_inventory_key,
   });
   root.timeseries_binding = bindingInventory.root_reference;
+  root.core = coreInventory.root_reference;
   const rootWrite = writeRemoteJson(
     args.rclone_bin,
     args.source_root,
@@ -474,6 +496,7 @@ async function main() {
     inventory_mode: args.full_scan ? "full_scan" : "hierarchical",
     source_root: args.source_root,
     observations_prefix: args.observations_prefix,
+    core_prefix: args.core_prefix,
     observations_root_manifest_key: observationsRootKey,
     observations_source_root_hash: sourceRoot.content_hash,
     previous_source_root_hash: previousRoot?.observations?.source_root_hash || null,
@@ -495,6 +518,7 @@ async function main() {
     full_scan_day_count: fullScanDays?.size ?? null,
     full_scan_hierarchy_agreed: args.full_scan ? true : null,
     timeseries_binding: bindingInventory.report,
+    core: coreInventory.report,
     run_manifests: {
       listed: runScan.listed,
       reused_by_metadata: runScan.reused,
