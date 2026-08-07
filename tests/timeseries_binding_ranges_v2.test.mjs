@@ -30,6 +30,10 @@ test("timeseries binding ranges use fixed 1000-ID boundaries", () => {
     range_start: 1000,
     range_end: 1999,
   });
+  assert.deepEqual(timeseriesBindingRangeBounds(1040433), {
+    range_start: 1040000,
+    range_end: 1040999,
+  });
 });
 
 test("inventory and state range paths are stable", () => {
@@ -40,6 +44,14 @@ test("inventory and state range paths are stable", () => {
       1999,
     ),
     "history/_index_v2/backup_inventory_v2/timeseries_binding/range=001000-001999.json",
+  );
+  assert.equal(
+    timeseriesBindingRangeInventoryShardKey(
+      "history/_index_v2/backup_inventory_v2",
+      1040000,
+      1040999,
+    ),
+    "history/_index_v2/backup_inventory_v2/timeseries_binding/range=1040000-1040999.json",
   );
   assert.equal(
     timeseriesBindingInventoryRootKey(
@@ -88,6 +100,27 @@ test("range inventory hash is stable and excludes metadata-only changes", () => 
   );
 });
 
+test("seven-digit range inventory retains numeric bounds", () => {
+  const shard = buildTimeseriesBindingRangeInventoryShard({
+    sourcePrefix: "history/_index_v2/timeseries_binding",
+    rangeStart: 1040000,
+    rangeEnd: 1040999,
+    units: [{
+      timeseries_id: 1040433,
+      relative_path:
+        "history/_index_v2/timeseries_binding/timeseries_id=1040433.json",
+      hash: h("c"),
+      size: 333,
+      r2_md5: "md5",
+      r2_modtime: "2026-08-07T00:00:00Z",
+    }],
+  });
+  assert.equal(shard.range_start, 1040000);
+  assert.equal(shard.range_end, 1040999);
+  assert.equal(shard.units[0].timeseries_id, 1040433);
+  assert.deepEqual(validateTimeseriesBindingRangeInventoryShard(shard), shard);
+});
+
 test("binding root hash is stable across input order", () => {
   const ranges = [
     {
@@ -129,6 +162,19 @@ test("range state skeleton uses the same fixed identity", () => {
       range_size: 1000,
       range_start: 0,
       range_end: 999,
+      processed_source_range_hash: null,
+      units: [],
+    },
+  );
+  assert.deepEqual(
+    buildTimeseriesBindingRangeStateSkeleton(1040000, 1040999),
+    {
+      schema_version: 1,
+      kind: "uk_aq_r2_history_backup_state_timeseries_binding_range",
+      backup_version: "v2",
+      range_size: 1000,
+      range_start: 1040000,
+      range_end: 1040999,
       processed_source_range_hash: null,
       units: [],
     },
