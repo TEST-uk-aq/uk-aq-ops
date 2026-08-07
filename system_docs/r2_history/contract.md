@@ -66,6 +66,57 @@ Example:
 
 `site_ref` is retained and validated as corroborating identity, but it is not part of the continuity key. A corrected site code must not unnecessarily change the logical key.
 
+## Authoritative source manifest hierarchy
+
+The physical binding objects remain flat and immutable-by-identity under:
+
+```text
+history/_index_v2/timeseries_binding/timeseries_id=<id>.json
+```
+
+To make source discovery incremental without listing every physical object on every consumer run, the binding writer also maintains an authoritative source manifest hierarchy:
+
+```text
+history/_index_v2/timeseries_binding/_manifests/root.json
+history/_index_v2/timeseries_binding/_manifests/range=000000-000999.json
+history/_index_v2/timeseries_binding/_manifests/range=001000-001999.json
+...
+```
+
+The range size is fixed at 1,000 timeseries IDs and uses the same stable numeric boundaries as the Dropbox backup inventory/state hierarchy.
+
+Each range manifest records the complete current physical binding set for that range, including at least:
+
+```text
+timeseries_id
+relative_path
+sha256
+size
+```
+
+It may also record source metadata such as the current R2 MD5/ETag when useful for verification or safe hash reuse. Metadata-only values must not determine the substantive `source_range_hash`.
+
+Each range has a stable `source_range_hash` derived only from the sorted current physical binding identities in that range. The root records every current range, its manifest key, range hash and unit count, plus one stable `source_root_hash` derived from those range identities.
+
+The hierarchy represents the complete physical binding prefix, including retained stale binding objects. A binding reported as stale by reconciliation remains part of the source hierarchy for as long as the physical object remains in R2. The source hierarchy must never silently make an existing physical binding disappear merely because it is no longer in the current core snapshot.
+
+`reconcileR2HistoryV2TimeseriesBindings()` is the normal writer/maintainer of this hierarchy. Binding reconciliation already performs physical-prefix discovery when its authoritative source fingerprint changes; that work must also produce the current range manifests and root without requiring a second full listing.
+
+When reconciliation proposes current authoritative binding bodies, their SHA-256 and byte size may be calculated directly from the deterministic proposed body. For retained stale bindings, a prior valid source-range identity may be reused only when current R2 metadata proves the physical object is unchanged; otherwise the physical object must be read and hashed before its source-range identity is published.
+
+Changed physical binding objects affect only their fixed range manifests and the source root. Unchanged range manifest bytes must remain unchanged and must not be rewritten merely because another range changed.
+
+Publication ordering is mandatory:
+
+1. complete and verify required physical binding writes;
+2. build/write every changed range manifest;
+3. verify those range manifests where a write occurred;
+4. write the source root last.
+
+The source root must never advance to a range hash that has not been published successfully. A failed or partial reconciliation must leave the previous valid root authoritative.
+
+An explicit rebuild/bootstrap operation may enumerate the complete physical binding prefix to create or independently verify this hierarchy. That expensive operation is exceptional, not the normal consumer path.
+
 ## Churn and byte-stability rules
 
 Binding objects must contain no:
@@ -95,6 +146,8 @@ A monthly bridge refresh with unchanged substantive identities, references and v
 
 `station_ref` and `timeseries_ref` are permitted inside continuity members. A genuine change to either may rewrite the small affected family. Broad unrelated binding churn is not permitted.
 
+The source range/root manifests obey the same byte-stability rule: unchanged physical binding content must produce unchanged range and root bytes.
+
 ## Validation and fail-closed rules
 
 Before publishing schema version 2, the builder must establish that:
@@ -109,6 +162,14 @@ Before publishing schema version 2, the builder must establish that:
 - ambiguous or contradictory bridge evidence is rejected rather than guessed.
 
 A gap between validity intervals is retained as a gap. The builder must not invent coverage.
+
+The source manifest hierarchy must additionally fail closed if:
+
+- a range identity does not match its fixed 1,000-ID boundary;
+- one physical binding appears in more than one range;
+- a range manifest hash does not match its current units;
+- the root references a missing or contradictory range manifest;
+- a physical binding that is known to exist cannot be assigned a trustworthy content identity.
 
 ## Retired index
 
