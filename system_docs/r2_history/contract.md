@@ -74,7 +74,7 @@ The physical binding objects remain flat and immutable-by-identity under:
 history/_index_v2/timeseries_binding/timeseries_id=<id>.json
 ```
 
-To make source discovery incremental without listing every physical object on every consumer run, the binding writer also maintains an authoritative source manifest hierarchy:
+To make source discovery incremental without listing every physical object on every consumer run, the binding publication path also maintains an authoritative source manifest hierarchy:
 
 ```text
 history/_index_v2/timeseries_binding/_manifests/root.json
@@ -100,9 +100,11 @@ Each range has a stable `source_range_hash` derived only from the sorted current
 
 The hierarchy represents the complete physical binding prefix, including retained stale binding objects. A binding reported as stale by reconciliation remains part of the source hierarchy for as long as the physical object remains in R2. The source hierarchy must never silently make an existing physical binding disappear merely because it is no longer in the current core snapshot.
 
-`reconcileR2HistoryV2TimeseriesBindings()` is the normal writer/maintainer of this hierarchy. Binding reconciliation already performs physical-prefix discovery when its authoritative source fingerprint changes; that work must also produce the current range manifests and root without requiring a second full listing.
+The normal operational maintainer is the v2 core-snapshot binding publication chain: `reconcileR2HistoryV2TimeseriesBindings()` first completes and verifies physical binding reconciliation, then `uk_aq_refresh_timeseries_binding_source_hierarchy.mjs` immediately publishes or confirms the corresponding source range/root hierarchy. The core-snapshot workflow must not treat a v2 binding publication as operationally complete without running that hierarchy refresh after a successful non-dry-run snapshot.
 
-When reconciliation proposes current authoritative binding bodies, their SHA-256 and byte size may be calculated directly from the deterministic proposed body. For retained stale bindings, a prior valid source-range identity may be reused only when current R2 metadata proves the physical object is unchanged; otherwise the physical object must be read and hashed before its source-range identity is published.
+A future direct caller of `reconcileR2HistoryV2TimeseriesBindings()` that writes physical binding objects must also invoke the source-hierarchy refresh before treating its binding publication as complete. The physical reconciliation already performs complete prefix discovery when its authoritative source fingerprint changes; the subsequent hierarchy refresh may perform its own complete listing only on that binding-publication path, never on routine backup inventory reads.
+
+When the source hierarchy is first bootstrapped, existing verified backup-inventory SHA-256 identities may be adopted when current R2 metadata proves the corresponding physical object is unchanged. On later hierarchy refreshes, existing source-range identities may be reused under the same metadata rule. Otherwise the physical binding must be read and hashed before its source-range identity is published.
 
 Changed physical binding objects affect only their fixed range manifests and the source root. Unchanged range manifest bytes must remain unchanged and must not be rewritten merely because another range changed.
 
@@ -113,7 +115,7 @@ Publication ordering is mandatory:
 3. verify those range manifests where a write occurred;
 4. write the source root last.
 
-The source root must never advance to a range hash that has not been published successfully. A failed or partial reconciliation must leave the previous valid root authoritative.
+The source root must never advance to a range hash that has not been published successfully. A failed or partial reconciliation/publication chain must leave the previous valid root authoritative.
 
 An explicit rebuild/bootstrap operation may enumerate the complete physical binding prefix to create or independently verify this hierarchy. That expensive operation is exceptional, not the normal consumer path.
 
