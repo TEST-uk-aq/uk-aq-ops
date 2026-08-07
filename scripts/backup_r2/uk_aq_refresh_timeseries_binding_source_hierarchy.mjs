@@ -40,6 +40,15 @@ function r2FromEnv(env = process.env) {
   };
 }
 
+function normalizeFingerprint(value, label = "source fingerprint") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return null;
+  if (!/^[a-f0-9]{64}$/.test(normalized)) {
+    throw new Error(`${label} must be a lowercase SHA-256 hex string`);
+  }
+  return normalized;
+}
+
 function usage() {
   console.log([
     "Usage:",
@@ -48,6 +57,7 @@ function usage() {
     "Options:",
     `  --binding-prefix <p>          Default: ${DEFAULT_BINDING_PREFIX}`,
     `  --backup-inventory-prefix <p> Default: ${DEFAULT_BACKUP_INVENTORY_PREFIX}`,
+    "  --source-fingerprint <sha>    Optional authoritative reconciliation fingerprint",
     "  --force-rebuild               Enumerate/rebuild even when refresh state matches",
     "  --dry-run                     Plan only; do not write source hierarchy objects",
     "  --report-out <file>           Write JSON report",
@@ -59,6 +69,7 @@ function parseArgs(argv) {
   const args = {
     binding_prefix: DEFAULT_BINDING_PREFIX,
     backup_inventory_prefix: DEFAULT_BACKUP_INVENTORY_PREFIX,
+    source_fingerprint: null,
     force_rebuild: false,
     dry_run: false,
     report_out: DEFAULT_REPORT_OUT,
@@ -72,6 +83,14 @@ function parseArgs(argv) {
     }
     if (arg === "--backup-inventory-prefix") {
       args.backup_inventory_prefix = normalizePrefix(argv[index + 1]);
+      index += 1;
+      continue;
+    }
+    if (arg === "--source-fingerprint") {
+      args.source_fingerprint = normalizeFingerprint(
+        argv[index + 1],
+        "--source-fingerprint",
+      );
       index += 1;
       continue;
     }
@@ -114,13 +133,13 @@ async function readJsonMaybe(r2, key) {
 
 function sourceFingerprintFromState(state, bindingPrefix) {
   if (!state || typeof state !== "object" || Array.isArray(state)) return null;
-  const fingerprint = String(state.source_fingerprint || "").trim().toLowerCase();
+  const fingerprint = normalizeFingerprint(state.source_fingerprint);
   if (
     Number(state.schema_version) !== 1
     || state.history_version !== "v2"
     || state.state_kind !== "timeseries_binding_source_state"
     || state.timeseries_binding_index_prefix !== bindingPrefix
-    || !/^[a-f0-9]{64}$/.test(fingerprint)
+    || !fingerprint
   ) return null;
   return fingerprint;
 }
@@ -140,13 +159,13 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const sourceStateKey = `${args.binding_prefix}/_source_state.json`;
   const sourceState = await readJsonMaybe(r2, sourceStateKey);
-  const sourceFingerprint = sourceFingerprintFromState(
-    sourceState,
-    args.binding_prefix,
-  );
-  if (sourceState && !sourceFingerprint) {
+  const sourceStateFingerprint = sourceState
+    ? sourceFingerprintFromState(sourceState, args.binding_prefix)
+    : null;
+  if (sourceState && !sourceStateFingerprint && !args.source_fingerprint) {
     throw new Error(`Invalid timeseries binding source state: ${sourceStateKey}`);
   }
+  const sourceFingerprint = args.source_fingerprint || sourceStateFingerprint;
 
   const startedAt = new Date().toISOString();
   const hierarchy = await refreshTimeseriesBindingSourceHierarchy({
@@ -168,6 +187,11 @@ export async function main(argv = process.argv.slice(2)) {
     backup_inventory_prefix: args.backup_inventory_prefix,
     source_state_key: sourceStateKey,
     source_fingerprint: sourceFingerprint,
+    source_fingerprint_source: args.source_fingerprint
+      ? "argument"
+      : sourceStateFingerprint
+        ? "source_state"
+        : null,
     hierarchy,
   };
   writeReport(args.report_out, report);
