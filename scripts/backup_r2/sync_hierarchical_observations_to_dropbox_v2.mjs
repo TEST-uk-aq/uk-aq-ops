@@ -36,6 +36,9 @@ import {
   validateObservationRunManifestInventoryShard,
   validateObservationRunManifestStateShard,
 } from "./lib/hierarchical_backup_v2.mjs";
+import {
+  syncTimeseriesBindingsToDropbox,
+} from "./lib/hierarchical_timeseries_binding_sync_v2.mjs";
 import { pruneStaleParquetForUnit } from "./sync_history_to_dropbox.mjs";
 
 const DEFAULT_RCLONE_BIN =
@@ -482,7 +485,6 @@ function inventoryRootKey(args) {
   return `${args.inventory_root_prefix}/root.json`;
 }
 
-
 function runManifestStateShardKey(args, stateRoot) {
   return stateRoot?.global_units?.observation_run_manifests?.state_shard_key
     || `${args.state_root_prefix}/global/observation_run_manifests.json`;
@@ -574,7 +576,7 @@ async function main() {
     existingStateResult?.parsed || emptyHierarchicalStateRoot(args.legacy_state_key),
     args.legacy_state_key,
   );
-  const legacyState = legacyStateOrNull(args);
+  const legacyState = existingStateResult ? null : legacyStateOrNull(args);
 
   const report = {
     ok: true,
@@ -607,6 +609,7 @@ async function main() {
       incomplete_months: [],
       incomplete_years: [],
     },
+    timeseries_binding: null,
     run_manifests: {
       listed: runManifestInventoryShard.units.length,
       candidates: 0,
@@ -784,7 +787,6 @@ async function main() {
 
       const write = flushMonthState({ force: true });
       if (!write && monthStateResult === null) {
-        // A migrated empty/new shard must still exist before any parent root.
         const migrationWrite = uploadJson({
           rcloneBin: args.rclone_bin,
           root: args.dest_root,
@@ -836,6 +838,56 @@ async function main() {
     } else if (!yearIsComplete(stateRoot, inventoryYear)) {
       report.observations.incomplete_years.push(inventoryYear.year);
     }
+  }
+
+  try {
+    const bindingSync = syncTimeseriesBindingsToDropbox({
+      inventoryRoot,
+      stateRoot,
+      legacyState,
+      stateRootPrefix: args.state_root_prefix,
+      dryRun: args.dry_run,
+      checkpointBatchUnits: args.checkpoint_batch_units,
+      checkpointFlushSeconds: args.checkpoint_flush_seconds,
+      readInventoryJson: (relativePath) => readJsonRequired(
+        args.rclone_bin,
+        args.source_root,
+        relativePath,
+      ).parsed,
+      readStateJsonMaybe: (relativePath) => readJsonMaybe(
+        args.rclone_bin,
+        args.dest_root,
+        relativePath,
+        DROPBOX_READ_RETRY,
+      ),
+      writeStateJson: (relativePath, payload) => uploadJson({
+        rcloneBin: args.rclone_bin,
+        root: args.dest_root,
+        relativePath,
+        payload,
+        dryRun: args.dry_run,
+      }),
+      copyAndVerifyFile: (relativePath) => copyAndVerifyJsonFile({
+        rcloneBin: args.rclone_bin,
+        sourceRoot: args.source_root,
+        destRoot: args.dest_root,
+        relativePath,
+        dryRun: args.dry_run,
+      }),
+    });
+    report.timeseries_binding = bindingSync.report;
+    stateRootDirty = stateRootDirty || bindingSync.state_root_dirty;
+  } catch (error) {
+    if (!args.dry_run) {
+      uploadJson({
+        rcloneBin: args.rclone_bin,
+        root: args.dest_root,
+        relativePath: stateRootKey(args),
+        payload: stateRoot,
+        dryRun: false,
+      });
+    }
+    throw error;
   }
 
   const runStateRelativePath = runManifestStateShardKey(args, stateRoot);
@@ -933,7 +985,8 @@ async function main() {
     stateRoot.observations.processed_source_root_hash;
   report.completed_at = new Date().toISOString();
   report.complete = report.observations.incomplete_months.length === 0
-    && report.observations.incomplete_years.length === 0;
+    && report.observations.incomplete_years.length === 0
+    && report.timeseries_binding.incomplete_ranges.length === 0;
   report.ok = true;
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));
