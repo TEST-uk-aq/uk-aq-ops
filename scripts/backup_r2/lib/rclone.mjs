@@ -68,7 +68,8 @@ function sleepMs(delayMs) {
 }
 
 function defaultRetryMatcher(error) {
-  return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return /invalid character ['"]<['"] looking for beginning of value/i.test(message);
 }
 
 export function runRcloneWithRetry(rcloneBin, rcloneArgs, options = {}) {
@@ -100,7 +101,7 @@ export function runRcloneWithRetry(rcloneBin, rcloneArgs, options = {}) {
     try {
       return runRclone(rcloneBin, rcloneArgs, options);
     } catch (error) {
-      const matchedRetryableError = shouldRetry(error);
+      const matchedRetryableError = defaultRetryMatcher(error) || shouldRetry(error);
       if (!matchedRetryableError || attempt >= maxAttempts) {
         if (matchedRetryableError && onRetryExhausted) {
           try {
