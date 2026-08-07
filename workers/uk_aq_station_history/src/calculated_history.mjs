@@ -67,15 +67,13 @@ function calculateLogicalAqi(observationRows, request, continuity, outputStartMs
     ),
     { computedAtUtc: null },
   ).filter((row) => {
-    const bucketStart = Date.parse(row.timestamp_hour_utc);
-    const endpoint = bucketStart + HOUR_MS;
-    return endpoint > outputStartMs && bucketStart <= outputEndMs;
+    const endpoint = Date.parse(row.timestamp_hour_utc);
+    return endpoint > outputStartMs && endpoint <= outputEndMs;
   }).map((row) => {
-    const bucketStart = Date.parse(row.timestamp_hour_utc);
-    const endpoint = bucketStart + HOUR_MS;
-    // The AQI helper timestamp identifies the start of the observation hour.
-    // Publish station-history AQI as an hour-ending interval so the website
-    // renders the band over the hour that supplied those observations.
+    const endpoint = Date.parse(row.timestamp_hour_utc);
+    // AQI timestamps are hour-ending endpoints.  Attribute the interval to
+    // the physical member that supplied the observation immediately before
+    // that endpoint, including at a midnight continuity boundary.
     const physical = memberAt(continuity, endpoint - 1);
     if (!physical) throw new Error("station_history_continuity_aqi_identity_missing");
     return {
@@ -83,7 +81,7 @@ function calculateLogicalAqi(observationRows, request, continuity, outputStartMs
       connector_id: physical.connectorId,
       station_id: physical.stationId,
       timeseries_id: physical.timeseriesId,
-      period_start_utc: new Date(bucketStart).toISOString(),
+      period_start_utc: new Date(endpoint - HOUR_MS).toISOString(),
       period_end_utc: new Date(endpoint).toISOString(),
       timestamp_hour_utc: new Date(endpoint).toISOString(),
       source: "calculated_from_observations",
