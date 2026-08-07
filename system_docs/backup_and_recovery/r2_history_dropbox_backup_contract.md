@@ -331,6 +331,20 @@ Rclone compares individual files. Unchanged connector, pollutant, manifest and P
 
 After a changed day copy, manifest-guided stale Parquet pruning remains required so Dropbox removes superseded Parquet files no longer referenced by the copied manifests.
 
+## Forced observation prune recheck
+
+The active backup must retain a `force_prune_recheck` operator input for an explicit observation-only destination integrity sweep.
+
+A forced prune recheck is independent of normal hierarchical copy planning. When `force_prune_recheck=true`, the sync must inspect current observation days represented by the authoritative hierarchical inventory even when the year, month and day source hashes already match Dropbox state.
+
+For each audited observation day, the sync compares the authoritative current observation manifests with the actual Parquet files present in the corresponding Dropbox day prefix and removes stale destination Parquet files that are no longer referenced by those manifests.
+
+The forced sweep must not recopy an otherwise unchanged observation day merely to perform the prune audit, and it must not invalidate or advance observation processed hashes solely because an audit ran. Normal changed-day copy-and-prune behaviour remains unchanged.
+
+The forced sweep is observations-only. It must not prune, recopy or reinterpret timeseries-binding, observation run-manifest or core objects. In particular, `force_prune_recheck` does not authorise core pruning; core pruning remains deferred under this contract.
+
+A forced prune sweep failure must make the workflow/report unsuccessful and identify the affected observation day, but successfully completed backup copy state from earlier phases remains valid.
+
 ## Timeseries-binding copy planning
 
 For bindings:
@@ -471,6 +485,8 @@ Each backup report records at least:
 - years and months skipped by matching hash;
 - changed observation days sent to rclone;
 - stale observation Parquet files removed;
+- whether forced observation prune recheck was requested;
+- observation days audited by a forced prune recheck, stale files removed and any failed day audits;
 - timeseries-binding source root hash;
 - binding ranges inspected and skipped;
 - binding files copied;
@@ -482,7 +498,7 @@ Each backup report records at least:
 - incomplete month, year, observations-root, binding-range, binding-root or core identities;
 - first-run legacy adoption mode when applicable.
 
-The report must make it possible to distinguish source changes, copied units and checkpoint-only writes without reading the state shards manually.
+The report must make it possible to distinguish source changes, copied units, forced prune-only work and checkpoint-only writes without reading the state shards manually.
 
 ## Structural validation policy
 
@@ -500,6 +516,8 @@ At minimum the implementation structure must preserve these invariants:
 - successful flushed unit progress survives restart;
 - batching prevents per-unit whole-checkpoint uploads;
 - first-run adoption preserves structurally valid existing verified identities without recopying data;
+- `force_prune_recheck` can audit hash-matching observation days without recopying them or changing processed source hashes solely because of the audit;
+- `force_prune_recheck` does not prune timeseries bindings, run manifests or core;
 - the active workflow contains no AQI-level or AQI-debug backup path;
 - the active workflow retains core backup coverage without implementing core pruning;
 - the active workflow invokes one hierarchical builder and one hierarchical sync only.
