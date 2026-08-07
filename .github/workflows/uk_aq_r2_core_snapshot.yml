@@ -167,10 +167,31 @@ jobs:
             exit 0
           fi
 
-          node scripts/backup_r2/uk_aq_refresh_timeseries_binding_source_hierarchy.mjs \
-            --binding-prefix "${UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX}" \
-            --backup-inventory-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}" \
+          source_fingerprint="$(python3 - <<'PY'
+          import json
+          with open('tmp/uk_aq_core_snapshot_to_r2_report.json', 'r', encoding='utf-8') as handle:
+              report = json.load(handle)
+          reconciliation = report.get('timeseries_binding_reconciliation') or {}
+          print(str(reconciliation.get('current_source_fingerprint') or '').strip())
+          PY
+          )"
+
+          cmd=(
+            node scripts/backup_r2/uk_aq_refresh_timeseries_binding_source_hierarchy.mjs
+            --binding-prefix "${UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX}"
+            --backup-inventory-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
             --report-out "tmp/uk_aq_timeseries_binding_source_hierarchy_report.json"
+          )
+          if [ -n "${source_fingerprint}" ]; then
+            if ! printf "%s" "${source_fingerprint}" | grep -Eq '^[a-f0-9]{64}$'; then
+              echo "Invalid binding reconciliation source fingerprint in core snapshot report." >&2
+              exit 1
+            fi
+            cmd+=(--source-fingerprint "${source_fingerprint}")
+          fi
+
+          echo "Running: ${cmd[*]}"
+          "${cmd[@]}"
 
       - name: Upload snapshot report artifact
         if: always()
