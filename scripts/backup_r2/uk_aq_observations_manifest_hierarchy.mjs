@@ -130,7 +130,7 @@ function dayManifestReference(payload, key, observationsPrefix) {
     throw new Error(`Day manifest domain mismatch for ${key}`);
   }
   if (payload.manifest_kind !== undefined && payload.manifest_kind !== "day") {
-    throw new Error(`Day manifest manifest_kind mismatch for ${key}`);
+    throw new Error(`Day manifest kind mismatch for ${key}`);
   }
   const manifestHash = String(payload.manifest_hash || "").trim().toLowerCase();
   if (!SHA256_PATTERN.test(manifestHash)) {
