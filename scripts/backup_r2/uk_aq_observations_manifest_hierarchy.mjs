@@ -23,7 +23,6 @@ import {
 } from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 
 const DEFAULT_OBSERVATIONS_PREFIX = "history/v2/observations";
-const TEST_R2_BUCKET = "uk-aq-history-cic-test";
 const DAY_MANIFEST_SUFFIX_PATTERN = /^day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -44,7 +43,7 @@ function usage() {
     "  --max-keys <n>                  R2 list page size",
     "  --report-out <file>             Write the JSON report to a local file",
     "  --dry-run                       Explicit no-write mode (default)",
-    "  --write-r2                      Write changed aggregate manifests to TEST R2",
+    "  --write-r2                      Write changed aggregate manifests to the configured R2 bucket",
     "  -h, --help",
   ].join("\n"));
 }
@@ -131,7 +130,7 @@ function dayManifestReference(payload, key, observationsPrefix) {
     throw new Error(`Day manifest domain mismatch for ${key}`);
   }
   if (payload.manifest_kind !== undefined && payload.manifest_kind !== "day") {
-    throw new Error(`Day manifest kind mismatch for ${key}`);
+    throw new Error(`Day manifest manifest_kind mismatch for ${key}`);
   }
   const manifestHash = String(payload.manifest_hash || "").trim().toLowerCase();
   if (!SHA256_PATTERN.test(manifestHash)) {
@@ -269,10 +268,16 @@ function writeReport(reportOut, payload) {
   fs.writeFileSync(outputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
-function assertTestWriteTarget(r2) {
+function assertR2WriteTarget(r2, configuredBucket) {
   const bucket = String(r2?.bucket || "").trim();
-  if (bucket !== TEST_R2_BUCKET) {
-    throw new Error(`Refusing --write-r2 for non-TEST bucket: ${bucket || "(empty)"}`);
+  const expectedBucket = String(configuredBucket || "").trim();
+  if (!expectedBucket) {
+    throw new Error("CFLARE_R2_BUCKET is required for --write-r2");
+  }
+  if (bucket !== expectedBucket) {
+    throw new Error(
+      `Refusing --write-r2 because resolved R2 bucket ${bucket || "(empty)"} does not match CFLARE_R2_BUCKET ${expectedBucket}`,
+    );
   }
 }
 
@@ -281,10 +286,11 @@ export async function executeObservationsManifestHierarchy({
   observationsPrefix = DEFAULT_OBSERVATIONS_PREFIX,
   maxKeys = 1000,
   mode = "dry-run",
+  configuredBucket = "",
 }) {
   const basePrefix = normalizePrefix(observationsPrefix);
   const writeR2 = mode === "write-r2";
-  if (writeR2) assertTestWriteTarget(r2);
+  if (writeR2) assertR2WriteTarget(r2, configuredBucket);
 
   const topLevelPrefixes = await r2ListAllCommonPrefixes({
     r2,
@@ -442,6 +448,7 @@ export async function runObservationsManifestHierarchy({
     observationsPrefix,
     maxKeys: args.maxKeys || config.max_keys || 1000,
     mode: args.mode,
+    configuredBucket: env.CFLARE_R2_BUCKET,
   });
   writeReport(args.reportOut, report);
   return report;
