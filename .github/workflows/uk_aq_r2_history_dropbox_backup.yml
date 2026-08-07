@@ -3,28 +3,20 @@ name: UK AQ R2 History Dropbox Backup
 on:
   # Intended external schedule:
   #   04:35 UTC daily via Cloudflare Worker
-  # Previous GitHub cron:
-  #   schedule:
-  #     - cron: "35 4 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Run without writing copy/checkpoint changes"
+        description: "Run without writing Dropbox copy/checkpoint/prune changes"
         required: false
         default: false
         type: boolean
       max_days_per_run:
-        description: "Override max new days copied per domain (0 = unlimited)"
-        required: false
-        default: ""
-        type: string
-      history_version:
-        description: "R2 history backup version (v1 or v2). Blank = repo variable UK_AQ_R2_HISTORY_VERSION."
+        description: "Override max observation days copied per run (0 = unlimited)"
         required: false
         default: ""
         type: string
       force_prune_recheck:
-        description: "Ignore the v2 Dropbox prune checkpoint and recheck selected prune units"
+        description: "Audit all current observation days for stale Dropbox Parquet"
         required: false
         default: false
         type: boolean
@@ -51,21 +43,23 @@ jobs:
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
 
-      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
-      UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels/hourly' }}
-      UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
-      UK_AQ_R2_HISTORY_VERSION: ${{ github.event.inputs.history_version || vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
-      UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || 'history/v2/aqilevels/hourly/data' }}
-      UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || 'history/v2/aqilevels/hourly/debug' }}
+      UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || 'history/v2/_ops/observations/runs' }}
       UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
-      UK_AQ_R2_HISTORY_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_PREFIX || 'history/_index' }}
       UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
+      UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || 'history/_index_v2/timeseries_binding' }}
+      UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || 'history/_index_v2/backup_inventory_v2' }}
+      UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || '_ops/checkpoints/r2_history_backup_state_v2' }}
+
+      # Previous flat files are adoption inputs only. The hierarchical backup never rewrites them.
+      UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || 'history/_index_v2/backup_inventory_v2.json' }}
+      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '_ops/checkpoints/r2_history_backup_state_v2.json' }}
+
+      UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
+      UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS || '10' }}
+      UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS || '60' }}
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
-      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '' }}
-      UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || '' }}
-      UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
@@ -107,7 +101,14 @@ jobs:
             DROPBOX_REFRESH_TOKEN
             UK_AQ_DROPBOX_ROOT
             UK_AQ_R2_HISTORY_DROPBOX_DIR
-            UK_AQ_R2_HISTORY_VERSION
+            UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX
+            UK_AQ_R2_HISTORY_V2_RUNS_PREFIX
+            UK_AQ_R2_HISTORY_V2_CORE_PREFIX
+            UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX
+            UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
+            UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
+            UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH
+            UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH
           )
 
           missing=0
@@ -122,10 +123,9 @@ jobs:
             exit 1
           fi
 
-          case "${UK_AQ_R2_HISTORY_VERSION}" in
-            v1|v2) ;;
-            *)
-              echo "UK_AQ_R2_HISTORY_VERSION must be v1 or v2." >&2
+          case "${UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN}" in
+            ''|*[!0-9]*)
+              echo "UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN must be a non-negative integer." >&2
               exit 1
               ;;
           esac
@@ -171,15 +171,11 @@ jobs:
           } > "${RCLONE_CONFIG}"
 
           chmod 600 "${RCLONE_CONFIG}"
-
-          # shellcheck disable=SC2016
           echo "RCLONE_CONFIG=${RCLONE_CONFIG}" >> "$GITHUB_ENV"
 
-      - name: Build R2 history backup inventory
-        # Always runs (no --dry-run) even when the workflow's dry_run input is
-        # true. The inventory is a single small control file in R2, not user
-        # data — and the sync step needs a fresh inventory to produce an
-        # accurate dry-run plan. Writing the inventory is idempotent.
+      - name: Build hierarchical R2 history backup inventory
+        # Always writes current small inventory control files, including when the
+        # Dropbox sync itself is a dry run. This keeps the dry-run plan current.
         run: |
           set -euo pipefail
           mkdir -p tmp
@@ -187,18 +183,19 @@ jobs:
           cmd=(
             node scripts/backup_r2/build_backup_inventory.mjs
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
-            --index-prefix "${UK_AQ_R2_HISTORY_INDEX_PREFIX}"
-            --index-v2-prefix "${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}"
+            --observations-prefix "${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX}"
+            --runs-prefix "${UK_AQ_R2_HISTORY_V2_RUNS_PREFIX}"
+            --core-prefix "${UK_AQ_R2_HISTORY_V2_CORE_PREFIX}"
+            --timeseries-binding-prefix "${UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX}"
+            --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
+            --legacy-inventory-key "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}"
             --report-out "tmp/r2_backup_inventory_report.json"
           )
-          if [ -n "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}" ]; then
-            cmd+=(--inventory-rel-path "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}")
-          fi
 
           echo "Running: ${cmd[*]}"
           "${cmd[@]}"
 
-      - name: Run inventory-driven Dropbox sync
+      - name: Run hierarchical Dropbox sync
         run: |
           set -euo pipefail
           mkdir -p tmp
@@ -207,12 +204,15 @@ jobs:
           if [ -z "${max_days}" ]; then
             max_days="${UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN}"
           fi
+          case "${max_days}" in
+            ''|*[!0-9]*)
+              echo "max_days_per_run must be a non-negative integer" >&2
+              exit 1
+              ;;
+          esac
 
           dropbox_root="${UK_AQ_DROPBOX_ROOT%/}"
-          # Dropbox app-folder tokens use app-relative paths; leading slash causes
-          # "path root is not supported for sandbox app" for some operations.
           dropbox_root="${dropbox_root#/}"
-
           dropbox_dir="${UK_AQ_R2_HISTORY_DROPBOX_DIR#/}"
           dropbox_dir="${dropbox_dir%/}"
           if [ -z "${dropbox_dir}" ]; then
@@ -230,21 +230,19 @@ jobs:
             node scripts/backup_r2/sync_history_to_dropbox.mjs
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
             --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
+            --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
+            --state-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX}"
+            --legacy-state-key "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}"
             --max-days-per-run "${max_days}"
+            --checkpoint-batch-units "${UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS}"
+            --checkpoint-flush-seconds "${UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS}"
             --report-out "tmp/r2_history_dropbox_backup_report.json"
           )
-          if [ -n "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}" ]; then
-            cmd+=(--inventory-rel-path "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}")
-          fi
-          if [ -n "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}" ]; then
-            cmd+=(--state-rel-path "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}")
-          fi
 
           if [ "${INPUT_DRY_RUN}" = "true" ]; then
             cmd+=(--dry-run)
           fi
           if [ "${INPUT_FORCE_PRUNE_RECHECK}" = "true" ]; then
-            cmd+=(--prune-scope all)  
             cmd+=(--force-prune-recheck)
           fi
 
