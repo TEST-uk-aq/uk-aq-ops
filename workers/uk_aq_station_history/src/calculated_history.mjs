@@ -2,7 +2,6 @@ import {
   AQI_ALGORITHM_VERSION,
   helperRowsToNormalizedAqiV1Rows,
   pivotNarrowRowsToHelperRows,
-  sourceObservationsToNarrowRows,
 } from "../../../lib/aqi/aqi_levels.mjs";
 import { readR2Observations } from "./r2_observations.mjs";
 import { publicContinuity, selectContinuitySegments } from "./continuity.mjs";
@@ -51,6 +50,62 @@ function mergePhysicalObservations(r2Rows, ingestRows, continuity) {
   return [...rows.values()].sort((left, right) => left.observed_at.localeCompare(right.observed_at));
 }
 
+function sourceObservationsToHourEndingNarrowRows(rows) {
+  const grouped = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const observedMs = Date.parse(String(row?.observed_at || ""));
+    const value = Number(row?.value);
+    const timeseriesId = Number(row?.timeseries_id);
+    const stationId = Number(row?.station_id);
+    const pollutantCode = String(row?.pollutant_code || "").trim().toLowerCase();
+    if (
+      !Number.isFinite(observedMs)
+      || !Number.isFinite(value)
+      || value < 0
+      || !Number.isInteger(timeseriesId)
+      || timeseriesId <= 0
+      || !Number.isInteger(stationId)
+      || stationId <= 0
+      || !pollutantCode
+    ) continue;
+
+    // Station-history AQI intervals are hour-ending. An observation exactly
+    // on the hour keeps that timestamp as its endpoint; an observation inside
+    // the hour belongs to the next clock-hour endpoint. This makes the bucket
+    // represent (previous endpoint, endpoint] without collapsing raw readings.
+    const endpointMs = Math.ceil(observedMs / HOUR_MS) * HOUR_MS;
+    const endpointIso = new Date(endpointMs).toISOString();
+    const key = `${timeseriesId}|${endpointIso}`;
+    const current = grouped.get(key) || {
+      timeseries_id: timeseriesId,
+      station_id: stationId,
+      connector_id: row?.connector_id == null ? null : Number(row.connector_id),
+      pollutant_code: pollutantCode,
+      timestamp_hour_utc: endpointIso,
+      sum: 0,
+      count: 0,
+    };
+    current.sum += value;
+    current.count += 1;
+    grouped.set(key, current);
+  }
+
+  return Array.from(grouped.values()).map((row) => ({
+    timeseries_id: row.timeseries_id,
+    station_id: row.station_id,
+    connector_id: row.connector_id,
+    timestamp_hour_utc: row.timestamp_hour_utc,
+    pollutant_code: row.pollutant_code,
+    hourly_mean_ugm3: row.count ? row.sum / row.count : null,
+    sample_count: row.count || null,
+  })).sort((left, right) => {
+    if (left.timestamp_hour_utc !== right.timestamp_hour_utc) {
+      return left.timestamp_hour_utc.localeCompare(right.timestamp_hour_utc);
+    }
+    return left.timeseries_id - right.timeseries_id;
+  });
+}
+
 function calculateLogicalAqi(observationRows, request, continuity, outputStartMs, outputEndMs) {
   const logicalRows = observationRows.map((row) => ({
     ...row,
@@ -59,7 +114,7 @@ function calculateLogicalAqi(observationRows, request, continuity, outputStartMs
   }));
   return helperRowsToNormalizedAqiV1Rows(
     pivotNarrowRowsToHelperRows(
-      sourceObservationsToNarrowRows(logicalRows),
+      sourceObservationsToHourEndingNarrowRows(logicalRows),
       {
         rangeStartUtc: new Date(outputStartMs + HOUR_MS).toISOString(),
         rangeEndUtc: new Date(outputEndMs + HOUR_MS).toISOString(),
@@ -71,7 +126,7 @@ function calculateLogicalAqi(observationRows, request, continuity, outputStartMs
     return endpoint > outputStartMs && endpoint <= outputEndMs;
   }).map((row) => {
     const endpoint = Date.parse(row.timestamp_hour_utc);
-    // AQI timestamps are hour-ending endpoints.  Attribute the interval to
+    // AQI timestamps are hour-ending endpoints. Attribute the interval to
     // the physical member that supplied the observation immediately before
     // that endpoint, including at a midnight continuity boundary.
     const physical = memberAt(continuity, endpoint - 1);
@@ -118,7 +173,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const expected = hourEndpoints(outputStartMs, outputEndMs);
   const observationPresent = new Set(visibleRows.map((row) => Date.parse(row.observed_at)).filter(Number.isFinite));
   const aqiPresent = new Set(aqiRows.map((row) => Date.parse(row.timestamp_hour_utc)).filter(Number.isFinite));
-  // Hidden PM context affects AQI only.  A continuity gap before the visible
+  // Hidden PM context affects AQI only. A continuity gap before the visible
   // range must never make an otherwise complete observation response partial.
   const observationGaps = includeObservations
     ? [...visibleSelection.gaps, ...missingRanges(expected, observationPresent)]
