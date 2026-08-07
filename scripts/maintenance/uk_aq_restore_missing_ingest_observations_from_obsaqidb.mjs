@@ -161,7 +161,7 @@ function parseArgs(argv) {
     } else if (arg === "--to-day") {
       args.toDay = validateIsoDay(argv[++index], "--to-day");
     } else if (arg === "--max-missing") {
-      args.maxMissing = parsePositiveInteger(argv[++index], "--max-missing", { max: 30_000 });
+      args.maxMissing = parsePositiveInteger(argv[++index], "--max-missing", { max: 10_000 });
     } else if (arg === "--batch-size") {
       args.batchSize = parsePositiveInteger(argv[++index], "--batch-size", { max: 1_000 });
     } else {
