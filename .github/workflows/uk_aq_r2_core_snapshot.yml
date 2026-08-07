@@ -50,6 +50,8 @@ jobs:
       UK_AQ_R2_HISTORY_VERSION: ${{ github.event.inputs.history_version || vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
       UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
+      UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || 'history/_index_v2/timeseries_binding' }}
+      UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || 'history/_index_v2/backup_inventory_v2' }}
       UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS: ${{ vars.UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS || '5000' }}
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
@@ -89,6 +91,8 @@ jobs:
             UK_AQ_R2_HISTORY_VERSION
             UK_AQ_R2_HISTORY_CORE_PREFIX
             UK_AQ_R2_HISTORY_V2_CORE_PREFIX
+            UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
+            UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
           )
 
           missing=0
@@ -149,12 +153,33 @@ jobs:
           echo "Running: ${cmd[*]}"
           "${cmd[@]}"
 
+      - name: Refresh timeseries binding source hierarchy
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+
+          if [ "${UK_AQ_R2_HISTORY_VERSION}" != "v2" ]; then
+            echo "Skipping binding source hierarchy refresh for ${UK_AQ_R2_HISTORY_VERSION}."
+            exit 0
+          fi
+          if [ "${INPUT_DRY_RUN}" = "true" ]; then
+            echo "Skipping binding source hierarchy refresh during core snapshot dry run."
+            exit 0
+          fi
+
+          node scripts/backup_r2/uk_aq_refresh_timeseries_binding_source_hierarchy.mjs \
+            --binding-prefix "${UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX}" \
+            --backup-inventory-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}" \
+            --report-out "tmp/uk_aq_timeseries_binding_source_hierarchy_report.json"
+
       - name: Upload snapshot report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: uk-aq-r2-core-snapshot-report
-          path: tmp/uk_aq_core_snapshot_to_r2_report.json
+          path: |
+            tmp/uk_aq_core_snapshot_to_r2_report.json
+            tmp/uk_aq_timeseries_binding_source_hierarchy_report.json
           if-no-files-found: ignore
 
       - name: Report daily task health
