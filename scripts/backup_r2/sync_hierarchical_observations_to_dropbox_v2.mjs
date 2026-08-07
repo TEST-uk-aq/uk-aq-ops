@@ -39,7 +39,12 @@ import {
 import {
   syncTimeseriesBindingsToDropbox,
 } from "./lib/hierarchical_timeseries_binding_sync_v2.mjs";
-import { pruneStaleParquetForUnit } from "./sync_history_to_dropbox.mjs";
+import {
+  syncCoreToDropbox,
+} from "./lib/hierarchical_core_backup_v2.mjs";
+import {
+  pruneStaleParquetForUnit,
+} from "./lib/stale_parquet_prune.mjs";
 
 const DEFAULT_RCLONE_BIN =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "").trim() || "rclone";
@@ -124,8 +129,9 @@ function usage() {
     `  --checkpoint-batch-units <N> Default: ${DEFAULT_CHECKPOINT_BATCH_UNITS}`,
     `  --checkpoint-flush-seconds <N> Default: ${DEFAULT_CHECKPOINT_FLUSH_SECONDS}`,
     `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
-    "  --no-prune-stale-parquet     Disable post-copy stale Parquet pruning",
-    "  --dry-run                    Plan and rclone dry-run only",
+    "  --no-prune-stale-parquet     Disable post-copy stale observation Parquet pruning",
+    "  --force-prune-recheck        Audit all current observation days for stale Dropbox Parquet",
+    "  --dry-run                    Plan/copy/prune dry-run only",
     "  --report-out <file>          Write JSON report",
     "  -h, --help",
   ].join("\n"));
@@ -143,6 +149,7 @@ function parseArgs(argv) {
     checkpoint_flush_seconds: DEFAULT_CHECKPOINT_FLUSH_SECONDS,
     rclone_bin: DEFAULT_RCLONE_BIN,
     prune_stale_parquet: true,
+    force_prune_recheck: false,
     dry_run: false,
     report_out: DEFAULT_REPORT_OUT,
   };
@@ -212,6 +219,10 @@ function parseArgs(argv) {
       args.prune_stale_parquet = false;
       continue;
     }
+    if (arg === "--force-prune-recheck") {
+      args.force_prune_recheck = true;
+      continue;
+    }
     if (arg === "--dry-run") {
       args.dry_run = true;
       continue;
@@ -234,6 +245,9 @@ function parseArgs(argv) {
   }
   if (!args.state_root_prefix) throw new Error("--state-root-prefix is required");
   if (!args.legacy_state_key) throw new Error("--legacy-state-key is required");
+  if (args.force_prune_recheck && !args.prune_stale_parquet) {
+    throw new Error("--force-prune-recheck cannot be combined with --no-prune-stale-parquet");
+  }
   return args;
 }
 
@@ -403,10 +417,7 @@ function parseDayManifestHash(text, relativePath) {
   return hash;
 }
 
-function copyAndVerifyObservationDay({
-  args,
-  day,
-}) {
+function copyAndVerifyObservationDay({ args, day }) {
   const sourceDayPath = joinTargetPath(args.source_root, day.relative_path);
   const destDayPath = joinTargetPath(args.dest_root, day.relative_path);
   copyWithRetry(
@@ -431,10 +442,9 @@ function copyAndVerifyObservationDay({
       destUnitPath: destDayPath,
       unitRelativePath: day.relative_path,
       dryRun: args.dry_run,
-      manifestReadListRetryOptions: args.dry_run
-        ? null
-        : DROPBOX_READ_RETRY,
+      manifestReadListRetryOptions: args.dry_run ? null : DROPBOX_READ_RETRY,
       destinationReadListRetryOptions: DROPBOX_READ_RETRY,
+      deleteRetryOptions: DROPBOX_WRITE_RETRY,
     });
   }
 
@@ -461,6 +471,45 @@ function copyAndVerifyObservationDay({
     );
   }
   return { verified: true, dry_run: false, prune };
+}
+
+function copyAndVerifyCoreDay({ args, day }) {
+  const sourceDayPath = joinTargetPath(args.source_root, day.relative_path);
+  const destDayPath = joinTargetPath(args.dest_root, day.relative_path);
+  const sourceManifestText = rcloneCat(
+    args.rclone_bin,
+    joinTargetPath(args.source_root, day.manifest_key),
+  );
+  const sourceHash = sha256Hex(sourceManifestText);
+  copyWithRetry(
+    args.rclone_bin,
+    [
+      "copy",
+      sourceDayPath,
+      destDayPath,
+      "--check-first",
+      "--transfers", "8",
+      "--checkers", "16",
+      "--fast-list",
+    ],
+    args.dry_run,
+  );
+  if (args.dry_run) {
+    return { source_hash: sourceHash, verified: false, dry_run: true };
+  }
+  const destinationManifestText = rcloneCat(
+    args.rclone_bin,
+    joinTargetPath(args.dest_root, day.manifest_key),
+    DROPBOX_READ_RETRY,
+  );
+  const destinationHash = sha256Hex(destinationManifestText);
+  if (destinationHash !== sourceHash) {
+    throw new Error(
+      `Copied core day verification failed for ${day.day_utc}: `
+      + `source=${sourceHash} destination=${destinationHash}`,
+    );
+  }
+  return { source_hash: sourceHash, verified: true, dry_run: false };
 }
 
 function legacyStateOrNull(args) {
@@ -530,6 +579,53 @@ function allYearsComplete(stateRoot, inventoryRoot) {
     (year) => stateYearEntry(stateRoot, year.year)
       ?.processed_source_year_hash === year.content_hash,
   );
+}
+
+function runForcedObservationPruneRecheck(args, inventoryRoot, report) {
+  if (!args.force_prune_recheck) return;
+  const failures = [];
+  for (const inventoryYear of inventoryRoot.observations.years) {
+    for (const inventoryMonth of inventoryYear.months) {
+      const inventoryShard = validateObservationMonthInventoryShard(
+        readJsonRequired(
+          args.rclone_bin,
+          args.source_root,
+          inventoryMonth.inventory_shard_key,
+        ).parsed,
+      );
+      if (inventoryShard.source_month_hash !== inventoryMonth.content_hash) {
+        failures.push({
+          day_utc: `${inventoryYear.year}-${inventoryMonth.month}`,
+          error: "inventory month shard hash mismatch during forced prune recheck",
+        });
+        continue;
+      }
+      for (const day of inventoryShard.days) {
+        try {
+          const result = pruneStaleParquetForUnit({
+            rcloneBin: args.rclone_bin,
+            manifestRootPath: joinTargetPath(args.source_root, day.relative_path),
+            destUnitPath: joinTargetPath(args.dest_root, day.relative_path),
+            unitRelativePath: day.relative_path,
+            dryRun: args.dry_run,
+            manifestReadListRetryOptions: null,
+            destinationReadListRetryOptions: DROPBOX_READ_RETRY,
+            deleteRetryOptions: DROPBOX_WRITE_RETRY,
+          });
+          report.prune.forced_days_audited += 1;
+          report.prune.deleted_count += Number(result.prune_deleted_count || 0);
+          report.prune.dry_run_delete_count += Number(
+            result.prune_dry_run_delete_count || 0,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          failures.push({ day_utc: day.day_utc, error: message });
+        }
+      }
+    }
+  }
+  report.prune.forced_failures = failures;
+  report.prune.forced_failed_days = failures.length;
 }
 
 async function main() {
@@ -610,6 +706,7 @@ async function main() {
       incomplete_years: [],
     },
     timeseries_binding: null,
+    core: null,
     run_manifests: {
       listed: runManifestInventoryShard.units.length,
       candidates: 0,
@@ -618,8 +715,12 @@ async function main() {
     },
     prune: {
       enabled: args.prune_stale_parquet,
+      force_recheck: args.force_prune_recheck,
       deleted_count: 0,
       dry_run_delete_count: 0,
+      forced_days_audited: 0,
+      forced_failed_days: 0,
+      forced_failures: [],
     },
   };
 
@@ -890,6 +991,50 @@ async function main() {
     throw error;
   }
 
+  try {
+    const coreSync = syncCoreToDropbox({
+      inventoryRoot,
+      stateRoot,
+      legacyState,
+      stateRootPrefix: args.state_root_prefix,
+      dryRun: args.dry_run,
+      checkpointBatchUnits: args.checkpoint_batch_units,
+      checkpointFlushSeconds: args.checkpoint_flush_seconds,
+      readInventoryJson: (relativePath) => readJsonRequired(
+        args.rclone_bin,
+        args.source_root,
+        relativePath,
+      ).parsed,
+      readStateJsonMaybe: (relativePath) => readJsonMaybe(
+        args.rclone_bin,
+        args.dest_root,
+        relativePath,
+        DROPBOX_READ_RETRY,
+      ),
+      writeStateJson: (relativePath, payload) => uploadJson({
+        rcloneBin: args.rclone_bin,
+        root: args.dest_root,
+        relativePath,
+        payload,
+        dryRun: args.dry_run,
+      }),
+      copyAndVerifyDay: (day) => copyAndVerifyCoreDay({ args, day }),
+    });
+    report.core = coreSync.report;
+    stateRootDirty = stateRootDirty || coreSync.state_root_dirty;
+  } catch (error) {
+    if (!args.dry_run) {
+      uploadJson({
+        rcloneBin: args.rclone_bin,
+        root: args.dest_root,
+        relativePath: stateRootKey(args),
+        payload: stateRoot,
+        dryRun: false,
+      });
+    }
+    throw error;
+  }
+
   const runStateRelativePath = runManifestStateShardKey(args, stateRoot);
   const runStateResult = readJsonMaybe(
     args.rclone_bin,
@@ -981,16 +1126,21 @@ async function main() {
     });
   }
 
+  runForcedObservationPruneRecheck(args, inventoryRoot, report);
+
   report.observations.processed_source_root_hash =
     stateRoot.observations.processed_source_root_hash;
   report.completed_at = new Date().toISOString();
   report.complete = report.observations.incomplete_months.length === 0
     && report.observations.incomplete_years.length === 0
-    && report.timeseries_binding.incomplete_ranges.length === 0;
-  report.ok = true;
+    && report.timeseries_binding.incomplete_ranges.length === 0
+    && report.core.complete;
+  report.ok = report.prune.forced_failed_days === 0;
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));
-  if (!report.complete && !args.dry_run && args.max_days_per_run === 0) {
+  if (!report.ok) {
+    process.exitCode = 1;
+  } else if (!report.complete && !args.dry_run && args.max_days_per_run === 0) {
     process.exitCode = 1;
   }
 }
