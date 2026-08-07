@@ -392,7 +392,18 @@ export function syncCoreToDropbox({
 
   if (state.processed_source_hash === inventory.source_hash) {
     report.complete = true;
-    return { report, state_root_dirty: false };
+    if (stateResult !== null || dryRun) {
+      return { report, state_root_dirty: false };
+    }
+    const adoptedWrite = writeStateJson(stateShardKey, state);
+    report.checkpoint_flush_count += 1;
+    if (adoptedWrite.written) report.state_shards_written += 1;
+    stateRoot.core = {
+      state_shard_key: stateShardKey,
+      processed_source_hash: state.processed_source_hash,
+      state_shard_hash: adoptedWrite.hash,
+    };
+    return { report, state_root_dirty: true };
   }
 
   const stateMap = new Map(state.days.map((entry) => [entry.day_utc, entry]));
