@@ -22,7 +22,9 @@ This area owns:
 - correction-day recalculation;
 - rolling 365-day and last-complete-calendar-year summaries;
 - the meaning of rolling-year provisional status;
-- source priority between Obs AQI DB and exact-day R2 fallback;
+- normal daily source priority between Obs AQI DB and exact-day R2 fallback;
+- backfill source selection across the validated R2 and Obs AQI DB storage boundary, including the following-day `00:00` hour-ending observation;
+- the distinction between an R2 partition that is absent and an R2 partition that exists but fails integrity validation;
 - summary and derived Parquet publication ordering;
 - the worker-to-database RPC and configuration contract.
 
@@ -41,4 +43,4 @@ Canonical tables, functions, permissions and migrations are owned by `TEST-uk-aq
 
 ## Change ownership
 
-Codex and other coding agents must treat this area as read-only authority. They may change implementation in the owning repositories, but must not edit `system_docs/`. Behavioural changes require a handover to ChatGPT for any necessary contract update.
+Codex and other coding agents must treat this area as read-only authority. They may inspect and cite these files and may change implementation in the owning repositories, but must not edit any file under `system_docs/`. Behavioural changes require a handover to ChatGPT for any necessary contract update.
