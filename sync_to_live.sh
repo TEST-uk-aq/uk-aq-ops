@@ -180,6 +180,7 @@ COMMON_EXCLUDES=(
 
   # TEST-side planning / local helper files
   --exclude='archive/'
+  --exclude='Archive/'
   --exclude='plans/'
   --exclude='AGENTS.md'
   --exclude='README_CROSS_REPO.md'
