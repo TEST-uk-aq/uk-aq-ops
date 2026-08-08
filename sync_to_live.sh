@@ -137,9 +137,10 @@ COMMON_EXCLUDES=(
   # CI scanning configuration is kept environment-owned.
   --exclude='.github/codeql/'
 
-  # Installed dependencies and generated caches
+  # Installed dependencies and generated caches. Any .venv* directory is
+  # local-only, including backup virtual environments such as .venv-python39-*.
   --exclude='node_modules/'
-  --exclude='.venv/'
+  --exclude='.venv*/'
   --exclude='__pycache__/'
   --exclude='*.pyc'
   --exclude='.pytest_cache/'
@@ -150,6 +151,10 @@ COMMON_EXCLUDES=(
   --exclude='*_test.*'
   --exclude='*.test.*'
   --exclude='test_*.py'
+
+  # Working/reference artefacts do not need promotion to LIVE.
+  --exclude='*.numbers'
+  --exclude='*.zip'
 
   # Runtime, investigation and local output
   --exclude='logs/'
@@ -243,7 +248,6 @@ sync_repo() {
 
         # Environment/local-machine owned files.
         --exclude='env-vars-master.csv'
-        --exclude='*.numbers'
         --exclude='local/launchd/'
         --exclude='dashboard/assets/config.js'
 
@@ -322,15 +326,16 @@ if [[ "${APPLY}" -eq 0 ]]; then
   echo " CONFIRMED: nothing was transferred, written or deleted."
 else
   echo " MODE: APPLY"
-  if [[ "${#SUCCESS_REPOS[@]}" -gt 0 ]]; then
-    echo " CONFIRMED: LIVE sync was applied for: ${SUCCESS_REPOS[*]}"
-  fi
 fi
 
 if [[ "${ERRORS}" -gt 0 ]]; then
   echo " FAILED REPOS (${ERRORS}): ${FAILED_REPOS[*]}"
   if [[ "${APPLY}" -eq 1 ]]; then
-    echo " APPLY MODE COMPLETED WITH ERRORS: successful repos were synced; failed repos were not."
+    if [[ "${#SUCCESS_REPOS[@]}" -gt 0 ]]; then
+      echo " COMPLETED REPOS: ${SUCCESS_REPOS[*]}"
+    fi
+    echo " WARNING: one or more rsync commands failed after they may already have modified LIVE."
+    echo " Failed repos may be partially applied. Review the rsync output and retry after correcting the error."
   else
     echo " DRY RUN COMPLETED WITH ERRORS: no files were transferred despite the errors."
   fi
@@ -341,6 +346,7 @@ fi
 if [[ "${APPLY}" -eq 0 ]]; then
   echo " DRY RUN COMPLETE - add --apply to make these changes"
 else
+  echo " CONFIRMED: LIVE sync was applied successfully for: ${SUCCESS_REPOS[*]}"
   echo " SYNC COMPLETE - all selected repos were applied successfully"
 fi
 echo "==================================================================="
