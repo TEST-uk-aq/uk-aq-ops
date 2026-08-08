@@ -25,6 +25,8 @@ observed_at <= day_end
 
 For a UTC day, this corresponds to hour-ending timestamps `01:00` through the following `00:00`.
 
+The following-day `00:00` hour-ending observation is part of the target WHO day. Source selection for that boundary observation MUST therefore be correct even when the target day and following day currently live in different storage layers.
+
 ## Daily scientific completeness
 
 Each eligible timeseries-day MUST be assessed independently.
@@ -79,9 +81,9 @@ The gate MUST NOT require an observation at exactly midnight. A timeseries with 
 
 The gate is deliberately weak. Passing it means the recent ingest is sufficiently present to attempt the normal daily calculation. It does not assert that every station is complete or that every daily result will meet the 18-hour rule.
 
-## Source priority and fallback
+## Normal daily source priority and fallback
 
-For daily operation, source priority MUST be:
+For normal daily operation, source priority MUST be:
 
 1. Obs AQI DB when the readiness gate passes;
 2. exact-day R2 v2 observation fallback when readiness fails, the readiness RPC fails, the Obs AQI DB refresh fails or the database calculation returns no usable daily rows;
@@ -92,6 +94,72 @@ A failed readiness gate MUST NOT cause the worker to calculate the latest day fr
 An unavailable latest day MUST NOT prevent a usable correction day from being recalculated and selected for publication.
 
 The report MUST retain the readiness counts, percentages, source decision, fallback result and reasons for each attempted day.
+
+## Backfill source selection
+
+Backfill source selection MUST follow storage authority rather than assuming that every requested day has already reached R2.
+
+For a requested WHO day `D`:
+
+1. The worker MUST first determine whether the top-level R2 v2 observation day manifest for `D` exists.
+2. If that top-level manifest exists, validated R2 is authoritative for the target day. The worker MUST NOT replace an existing but unhealthy R2 partition with Obs AQI DB data.
+3. If the top-level R2 day manifest for `D` is genuinely absent, the worker MAY use Obs AQI DB for the full WHO day when that database still contains the required observation window.
+4. Source availability for the following-day boundary MUST be resolved independently because the target WHO day includes the following `00:00` hour-ending observation.
+5. If `D` is read from validated R2 and the top-level R2 day manifest for `D+1` also exists, the required boundary observation MUST come through the validated R2 path.
+6. If `D` is read from validated R2 but the top-level R2 day manifest for `D+1` is genuinely absent, the worker MAY obtain only the required `D+1 00:00` boundary observations from Obs AQI DB and combine them with the validated R2 target-day observations.
+7. If neither storage layer can provide the complete required WHO observation window, the day MUST be reported as unavailable or failed with a clear reason. The worker MUST NOT fabricate, duplicate or silently omit the boundary observation.
+
+Backfill processing order does not change raw observation storage authority. Reverse chronological processing MUST NOT be used as a substitute for correct source selection.
+
+### R2 absence versus R2 integrity failure
+
+Only failure to find the initial top-level day manifest being probed for `D` or `D+1` may be treated as an R2 source-availability condition.
+
+The top-level observation manifest path is:
+
+```text
+history/v2/observations/day_utc=<DAY>/manifest.json
+```
+
+Once that top-level day manifest has been read successfully, R2 has declared the partition to exist. All referenced R2 content MUST then validate through the existing integrity rules.
+
+The following MUST remain hard R2 failures and MUST NOT trigger Obs AQI DB fallback:
+
+- invalid JSON in an existing manifest;
+- manifest schema or identity failure;
+- incomplete or partial coverage state;
+- manifest hash mismatch;
+- a connector manifest referenced by an existing parent manifest being missing;
+- a pollutant manifest referenced by an existing parent manifest being missing;
+- a Parquet object referenced by an existing manifest being missing;
+- connector, pollutant or day identity mismatch;
+- row-count, file-count or byte-count mismatch;
+- Parquet hash mismatch;
+- unsupported or invalid Parquet schema;
+- any other existing R2 integrity or validation failure.
+
+In short:
+
+```text
+top-level day manifest absent -> that day may not have reached R2; another source may be considered
+
+top-level day manifest exists -> the declared R2 partition is authoritative and all referenced content must validate
+```
+
+Fallback logic MUST NOT weaken existing R2 validation.
+
+## Backfill reporting
+
+The report MUST make the observation source decision clear for every attempted backfill day.
+
+It MUST distinguish at least these cases:
+
+- full WHO day from validated R2;
+- full WHO day from Obs AQI DB because the target R2 day manifest is absent;
+- target day from validated R2 with the following `00:00` boundary supplied by Obs AQI DB;
+- unavailable or failed source selection.
+
+The representation MAY preserve the existing `source` field, but a mixed-source day MUST expose the boundary source explicitly or through an equally clear structured field. Report consumers must not be left to infer mixed-source behaviour from warnings or error text.
 
 ## Correction day
 
@@ -122,7 +190,7 @@ Calendar-year status MAY retain an explicit `is_final` field because it represen
 
 ## Summary publication
 
-The newest publication day MUST be the newest attempted day that produced usable daily rows from either source.
+The newest publication day MUST be the newest attempted day that produced usable daily rows from an authorised source path.
 
 Summary refresh MUST use that publication day, not an unavailable newer day.
 
@@ -138,15 +206,16 @@ A run with no usable publication day MUST defer summary and R2 publication rathe
 
 ## Preserved behaviour
 
-This readiness change MUST preserve:
+Implementations MUST preserve:
 
 - the configured pollutants PM2.5, PM10 and NO2;
 - the hour-ending daily window;
 - the 18-valid-hour daily rule;
 - the configured rolling-year valid-day rule;
 - correction-day recalculation;
-- exact-day R2 fallback;
-- the existing WHO R2 object paths and payload schema;
+- normal daily Obs AQI DB readiness and exact-day R2 fallback behaviour;
+- existing R2 manifest and Parquet integrity validation;
+- the existing WHO R2 object paths and payload schema unless a separately approved contract change requires otherwise;
 - the cache-proxy and website behaviour defined by the WHO summary cache contract;
 - the absence of a rolling-year `is_final` field.
 
