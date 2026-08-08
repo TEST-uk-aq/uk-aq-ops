@@ -9,7 +9,6 @@ import { addDays, assertIsoDay } from "./who_2021_daily_core.ts";
 import {
   getR2Object,
   R2Config,
-  R2ObjectNotFoundError,
   R2ReadResult,
   sha256Hex,
 } from "./r2_objects.ts";
@@ -84,8 +83,6 @@ export class R2ObservationReadError extends Error {
 
 type JsonRecord = Record<string, unknown>;
 
-export type R2ManifestCache = Map<string, JsonRecord>;
-
 type ManifestFile = {
   key: string;
   rowCount: number;
@@ -110,23 +107,6 @@ export function createR2ReadMetrics(): R2ReadMetrics {
     bytesRead: 0,
     parquetRowCount: 0,
   };
-}
-
-export function createR2ManifestCache(): R2ManifestCache {
-  return new Map<string, JsonRecord>();
-}
-
-export function r2ObservationDayManifestKey(dayUtc: string): string {
-  assertIsoDay(dayUtc, "dayUtc");
-  return `${R2_OBSERVATION_PREFIX}/day_utc=${dayUtc}/manifest.json`;
-}
-
-export function isAbsentR2ObservationDayManifest(
-  error: unknown,
-  dayUtc: string,
-): boolean {
-  return error instanceof R2ObjectNotFoundError &&
-    error.objectKey === r2ObservationDayManifestKey(dayUtc);
 }
 
 function asRecord(value: unknown, label: string): JsonRecord {
@@ -407,25 +387,6 @@ async function readJsonManifest(
   await validateManifestHash(manifest, key, metrics);
   cache?.set(key, manifest);
   return manifest;
-}
-
-export async function probeValidatedObservationDayManifest(args: {
-  readObject: R2ObjectReader;
-  dayUtc: string;
-  metrics?: R2ReadMetrics;
-  manifestCache?: R2ManifestCache;
-}): Promise<void> {
-  assertIsoDay(args.dayUtc, "dayUtc");
-  const metrics = args.metrics || createR2ReadMetrics();
-  const dayKey = r2ObservationDayManifestKey(args.dayUtc);
-  const dayManifest = await readJsonManifest(
-    args.readObject,
-    dayKey,
-    metrics,
-    args.manifestCache,
-  );
-  validateManifestIdentity(dayManifest, dayKey, args.dayUtc);
-  validateColumns(dayManifest, dayKey);
 }
 
 function exactChild(
@@ -740,7 +701,8 @@ export async function readValidatedObservationPollutantPartition(args: {
     throw new Error(`Unsupported WHO pollutant: ${pollutantCode}`);
   }
   const metrics = args.metrics || createR2ReadMetrics();
-  const dayKey = r2ObservationDayManifestKey(args.dayUtc);
+  const dayKey =
+    `${R2_OBSERVATION_PREFIX}/day_utc=${args.dayUtc}/manifest.json`;
   const dayManifest = await readJsonManifest(
     args.readObject,
     dayKey,
@@ -896,9 +858,6 @@ export async function prepareWhoDailyRowsFromR2(args: {
   connectorId: number;
   pollutantCodes: string[];
   minValidHoursPerDay: number;
-  boundaryRows?: R2ObservationRow[];
-  metrics?: R2ReadMetrics;
-  manifestCache?: R2ManifestCache;
 }): Promise<R2PreparedDay> {
   assertIsoDay(args.dayUtc, "dayUtc");
   if (
@@ -922,33 +881,11 @@ export async function prepareWhoDailyRowsFromR2(args: {
       "R2 WHO processing requires exactly pm25, pm10 and no2",
     );
   }
-  const metrics = args.metrics || createR2ReadMetrics();
+  const metrics = createR2ReadMetrics();
   const preparedRows: PreparedDailyRow[] = [];
   const seenTimeseries = new Set<number>();
   const boundaryDay = addDays(args.dayUtc, 1);
-  const manifestCache = args.manifestCache || createR2ManifestCache();
-
-  if (args.boundaryRows) {
-    const boundaryAt = `${boundaryDay}T00:00:00.000Z`;
-    const identities = new Set<string>();
-    for (const [index, row] of args.boundaryRows.entries()) {
-      if (
-        row.connectorId !== args.connectorId ||
-        row.observedAtUtc !== boundaryAt ||
-        !pollutants.includes(row.pollutantCode)
-      ) {
-        throw new Error(
-          `Invalid Obs AQI DB boundary row ${index} for ${boundaryAt}`,
-        );
-      }
-      const identity =
-        `${row.connectorId}:${row.timeseriesId}:${row.pollutantCode}:${row.observedAtUtc}`;
-      if (identities.has(identity)) {
-        throw new Error(`Duplicate Obs AQI DB boundary row: ${identity}`);
-      }
-      identities.add(identity);
-    }
-  }
+  const manifestCache = new Map<string, JsonRecord>();
 
   try {
     for (const pollutantCode of pollutants) {
@@ -970,30 +907,21 @@ export async function prepareWhoDailyRowsFromR2(args: {
         );
       }
       let boundaryRows: R2ObservationRow[];
-      if (args.boundaryRows) {
-        boundaryRows = args.boundaryRows.filter((row) =>
-          row.pollutantCode === pollutantCode
+      try {
+        boundaryRows = await readValidatedObservationPollutantPartition({
+          readObject: args.readObject,
+          dayUtc: boundaryDay,
+          connectorId: args.connectorId,
+          pollutantCode,
+          metrics,
+          manifestCache,
+        });
+      } catch (error) {
+        throw new Error(
+          `WHO D+1 boundary partition ${boundaryDay} missing or incomplete for ${pollutantCode}: ${
+            String(error instanceof Error ? error.message : error).slice(0, 320)
+          }`,
         );
-      } else {
-        try {
-          boundaryRows = await readValidatedObservationPollutantPartition({
-            readObject: args.readObject,
-            dayUtc: boundaryDay,
-            connectorId: args.connectorId,
-            pollutantCode,
-            metrics,
-            manifestCache,
-          });
-        } catch (error) {
-          throw new Error(
-            `WHO D+1 boundary partition ${boundaryDay} missing or incomplete for ${pollutantCode}: ${
-              String(error instanceof Error ? error.message : error).slice(
-                0,
-                320,
-              )
-            }`,
-          );
-        }
       }
       const pollutantPrepared = aggregatePollutantRows({
         dayUtc: args.dayUtc,

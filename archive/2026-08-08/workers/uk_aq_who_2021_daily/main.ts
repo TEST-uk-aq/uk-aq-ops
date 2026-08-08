@@ -31,15 +31,9 @@ import {
   sha256Hex,
 } from "./r2_objects.ts";
 import {
-  createR2ManifestCache,
   createR2ObjectReader,
-  createR2ReadMetrics,
-  isAbsentR2ObservationDayManifest,
   prepareWhoDailyRowsFromR2,
-  probeValidatedObservationDayManifest,
-  R2ObjectReader,
   R2ObservationReadError,
-  R2ObservationRow,
   R2PreparedDay,
   R2ReadMetrics,
 } from "./r2_observations.ts";
@@ -70,12 +64,6 @@ type PublishSummary = {
   results: R2ObjectResult[];
   bytesUpdated: number;
 };
-
-const OBS_HISTORY_DAY_ROWS_RPC = "uk_aq_rpc_observs_history_day_rows";
-const TIMESERIES_AQI_HOURLY_SOURCE_RPC =
-  "uk_aq_rpc_timeseries_aqi_hourly_source";
-const OBS_BOUNDARY_PAGE_LIMIT = 20_000;
-const OBS_BOUNDARY_MAX_PAGES = 100;
 
 function optionalEnv(name: string): string | null {
   const value = (Deno.env.get(name) || "").trim();
@@ -417,7 +405,6 @@ type DailySourceMode = "obs_aqidb" | "r2_v2" | "unavailable";
 type DailySourceResult = {
   day_utc: string;
   source: DailySourceMode;
-  boundary_source: "obs_aqidb" | "r2_v2" | null;
   calculation_status: "usable" | "unusable" | "failed";
   valid_timeseries_days: number;
   not_enough_data_timeseries_days: number;
@@ -458,17 +445,6 @@ class R2PreparedRpcError extends Error {
   constructor(message: string, readonly prepared: R2PreparedDay) {
     super(message);
     this.name = "R2PreparedRpcError";
-  }
-}
-
-class ObsBackfillSourceError extends Error {
-  constructor(
-    message: string,
-    readonly metrics: R2ReadMetrics,
-    readonly reason: "database_full_day_failed" | "database_boundary_failed",
-  ) {
-    super(message);
-    this.name = "ObsBackfillSourceError";
   }
 }
 
@@ -537,213 +513,6 @@ async function refreshObsDay(
   return row;
 }
 
-type ObsHistoryRow = {
-  timeseriesId: number;
-  observedAtUtc: string;
-  value: number | null;
-};
-
-function parseObsHistoryRows(
-  payload: unknown,
-  dayUtc: string,
-): ObsHistoryRow[] {
-  if (!Array.isArray(payload)) {
-    throw new Error(
-      `Obs AQI DB history RPC returned no row array for ${dayUtc}`,
-    );
-  }
-  const startMs = Date.parse(`${dayUtc}T00:00:00.000Z`);
-  const endMs = startMs + 24 * 60 * 60 * 1000;
-  return payload.map((value, index) => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error(
-        `Obs AQI DB history RPC row ${index} is not an object for ${dayUtc}`,
-      );
-    }
-    const row = value as Record<string, unknown>;
-    const timeseriesId = Number(row.timeseries_id);
-    const observedMs = Date.parse(String(row.observed_at || ""));
-    const numericValue = row.value === null || row.value === undefined
-      ? null
-      : Number(row.value);
-    if (
-      !Number.isSafeInteger(timeseriesId) ||
-      timeseriesId <= 0 ||
-      !Number.isFinite(observedMs) ||
-      observedMs < startMs ||
-      observedMs >= endMs ||
-      (numericValue !== null && !Number.isFinite(numericValue))
-    ) {
-      throw new Error(
-        `Obs AQI DB history RPC row ${index} is invalid for ${dayUtc}`,
-      );
-    }
-    return {
-      timeseriesId,
-      observedAtUtc: new Date(observedMs).toISOString(),
-      value: numericValue,
-    };
-  });
-}
-
-function compareObsHistoryRows(
-  left: Pick<ObsHistoryRow, "timeseriesId" | "observedAtUtc">,
-  right: Pick<ObsHistoryRow, "timeseriesId" | "observedAtUtc">,
-): number {
-  if (left.timeseriesId !== right.timeseriesId) {
-    return left.timeseriesId - right.timeseriesId;
-  }
-  return left.observedAtUtc.localeCompare(right.observedAtUtc);
-}
-
-async function readObsBoundaryRows(
-  settings: RuntimeSettings,
-  boundaryDayUtc: string,
-): Promise<R2ObservationRow[]> {
-  const boundaryAt = `${boundaryDayUtc}T00:00:00.000Z`;
-  let cursor: Pick<ObsHistoryRow, "timeseriesId" | "observedAtUtc"> | null =
-    null;
-  const exactRows: ObsHistoryRow[] = [];
-
-  for (let page = 0; page < OBS_BOUNDARY_MAX_PAGES; page += 1) {
-    const response = await settings.client.post<unknown>(
-      OBS_HISTORY_DAY_ROWS_RPC,
-      {
-        p_day_utc: boundaryDayUtc,
-        p_connector_id: settings.config.connectorId,
-        p_after_timeseries_id: cursor?.timeseriesId || null,
-        p_after_observed_at: cursor?.observedAtUtc || null,
-        p_limit: OBS_BOUNDARY_PAGE_LIMIT,
-      },
-    );
-    if (response.error) {
-      throw new Error(
-        `Obs AQI DB boundary history RPC failed for ${boundaryDayUtc}: ${response.error.message}`,
-      );
-    }
-    const rows = parseObsHistoryRows(response.data, boundaryDayUtc);
-    if (!rows.length) {
-      return await identifyObsBoundaryRows(
-        settings,
-        boundaryAt,
-        exactRows,
-      );
-    }
-    for (const row of rows) {
-      if (cursor && compareObsHistoryRows(row, cursor) <= 0) {
-        throw new Error(
-          `Obs AQI DB boundary history RPC did not advance for ${boundaryDayUtc}`,
-        );
-      }
-      cursor = row;
-      if (row.observedAtUtc === boundaryAt) exactRows.push(row);
-    }
-    if (rows.length < OBS_BOUNDARY_PAGE_LIMIT) {
-      return await identifyObsBoundaryRows(settings, boundaryAt, exactRows);
-    }
-  }
-  throw new Error(
-    `Obs AQI DB boundary history RPC exceeded ${OBS_BOUNDARY_MAX_PAGES} pages for ${boundaryDayUtc}`,
-  );
-}
-
-async function identifyObsBoundaryRows(
-  settings: RuntimeSettings,
-  boundaryAt: string,
-  rows: ObsHistoryRow[],
-): Promise<R2ObservationRow[]> {
-  const timeseriesIds = [...new Set(rows.map((row) => row.timeseriesId))];
-  if (!timeseriesIds.length) return [];
-  const boundaryEnd = new Date(Date.parse(boundaryAt) + 60 * 60 * 1000)
-    .toISOString();
-  const response = await settings.client.post<unknown>(
-    TIMESERIES_AQI_HOURLY_SOURCE_RPC,
-    {
-      p_window_start: boundaryAt,
-      p_window_end: boundaryEnd,
-      p_timeseries_ids: timeseriesIds,
-    },
-  );
-  if (response.error) {
-    throw new Error(
-      `Obs AQI DB boundary identity RPC failed for ${boundaryAt}: ${response.error.message}`,
-    );
-  }
-  if (!Array.isArray(response.data)) {
-    throw new Error(
-      `Obs AQI DB boundary identity RPC returned no row array for ${boundaryAt}`,
-    );
-  }
-
-  const identities = new Map<
-    number,
-    { stationId: number | null; pollutantCode: string }
-  >();
-  for (const [index, value] of response.data.entries()) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error(
-        `Obs AQI DB boundary identity row ${index} is not an object for ${boundaryAt}`,
-      );
-    }
-    const row = value as Record<string, unknown>;
-    const timeseriesId = Number(row.timeseries_id);
-    const connectorId = Number(row.connector_id);
-    const pollutantCode = String(row.pollutant_code || "").trim()
-      .toLowerCase();
-    const timestampMs = Date.parse(String(row.timestamp_hour_utc || ""));
-    const stationId = row.station_id === null || row.station_id === undefined
-      ? null
-      : Number(row.station_id);
-    if (
-      !Number.isSafeInteger(timeseriesId) ||
-      timeseriesId <= 0 ||
-      !Number.isSafeInteger(connectorId) ||
-      !Number.isFinite(timestampMs) ||
-      new Date(timestampMs).toISOString() !== boundaryAt ||
-      (
-        stationId !== null &&
-        (!Number.isSafeInteger(stationId) || stationId <= 0)
-      )
-    ) {
-      throw new Error(
-        `Obs AQI DB boundary identity row ${index} is invalid for ${boundaryAt}`,
-      );
-    }
-    if (
-      connectorId !== settings.config.connectorId ||
-      !settings.config.pollutantCodes.includes(pollutantCode)
-    ) {
-      continue;
-    }
-    const existing = identities.get(timeseriesId);
-    if (
-      existing &&
-      (
-        existing.stationId !== stationId ||
-        existing.pollutantCode !== pollutantCode
-      )
-    ) {
-      throw new Error(
-        `Obs AQI DB boundary identity is contradictory for timeseries_id ${timeseriesId}`,
-      );
-    }
-    identities.set(timeseriesId, { stationId, pollutantCode });
-  }
-
-  return rows.flatMap((row) => {
-    const identity = identities.get(row.timeseriesId);
-    if (!identity) return [];
-    return [{
-      connectorId: settings.config.connectorId,
-      stationId: identity.stationId,
-      timeseriesId: row.timeseriesId,
-      pollutantCode: identity.pollutantCode,
-      observedAtUtc: boundaryAt,
-      value: row.value,
-    }];
-  });
-}
-
 async function readinessForDay(
   settings: RuntimeSettings,
   dayUtc: string,
@@ -775,17 +544,6 @@ async function refreshR2Day(
     pollutantCodes: settings.config.pollutantCodes,
     minValidHoursPerDay: settings.config.minValidHoursPerDay,
   });
-  return {
-    prepared,
-    rpc: await upsertPreparedDay(settings, dayUtc, prepared),
-  };
-}
-
-async function upsertPreparedDay(
-  settings: RuntimeSettings,
-  dayUtc: string,
-  prepared: R2PreparedDay,
-): Promise<DailyRefreshRpcRow> {
   const response = await settings.client.post<unknown>(
     settings.preparedUpsertRpc,
     {
@@ -811,7 +569,7 @@ async function upsertPreparedDay(
       prepared,
     );
   }
-  return preparedRowAsDailyRefresh(row);
+  return { prepared, rpc: preparedRowAsDailyRefresh(row) };
 }
 
 export async function runWho2021Daily(): Promise<void> {
@@ -858,179 +616,29 @@ export async function runWho2021Daily(): Promise<void> {
           config.endDayUtc,
         )
       ) {
-        const metrics = createR2ReadMetrics();
-        const manifestCache = createR2ManifestCache();
-        let attemptedTargetSource: DailySourceMode = "unavailable";
-        let attemptedBoundarySource: "obs_aqidb" | "r2_v2" | null = null;
         try {
-          if (!settings.r2) {
-            throw new Error(
-              "R2 source selection is unavailable because R2 is not configured",
-            );
-          }
-          const readObject: R2ObjectReader = createR2ObjectReader(settings.r2);
-          attemptedTargetSource = "r2_v2";
-          try {
-            await probeValidatedObservationDayManifest({
-              readObject,
-              dayUtc,
-              metrics,
-              manifestCache,
-            });
-          } catch (error) {
-            if (isAbsentR2ObservationDayManifest(error, dayUtc)) {
-              attemptedTargetSource = "obs_aqidb";
-              attemptedBoundarySource = "obs_aqidb";
-              let row: DailyRefreshRpcRow;
-              try {
-                row = await refreshObsDay(settings, dayUtc);
-              } catch (databaseError) {
-                throw new ObsBackfillSourceError(
-                  `Obs AQI DB full-day source failed for ${dayUtc}: ${
-                    String(
-                      databaseError instanceof Error
-                        ? databaseError.message
-                        : databaseError,
-                    ).slice(0, 320)
-                  }`,
-                  metrics,
-                  "database_full_day_failed",
-                );
-              }
-              dailyRows.push(row);
-              completedDays.push(dayUtc);
-              dailySources.push({
-                day_utc: dayUtc,
-                source: "obs_aqidb",
-                boundary_source: "obs_aqidb",
-                calculation_status: row.valid_timeseries_days > 0
-                  ? "usable"
-                  : "unusable",
-                valid_timeseries_days: row.valid_timeseries_days,
-                not_enough_data_timeseries_days:
-                  row.not_enough_data_timeseries_days,
-                rows_upserted: row.rows_upserted,
-                prepared_daily_row_count: 0,
-                reasons: row.valid_timeseries_days > 0
-                  ? [
-                    "r2_target_manifest_absent",
-                    "database_backfill_used",
-                  ]
-                  : [
-                    "r2_target_manifest_absent",
-                    "database_backfill_zero_valid_days",
-                  ],
-                error: null,
-              });
-              continue;
-            }
-            throw new R2ObservationReadError(
-              `WHO target day manifest ${dayUtc} failed validation: ${
-                String(error instanceof Error ? error.message : error).slice(
-                  0,
-                  320,
-                )
-              }`,
-              {
-                ...metrics,
-                manifestKeys: [...new Set(metrics.manifestKeys)],
-              },
-            );
-          }
-
-          const boundaryDayUtc = addDays(dayUtc, 1);
-          let boundarySource: "r2_v2" | "obs_aqidb" = "r2_v2";
-          attemptedBoundarySource = boundarySource;
-          let boundaryRows: R2ObservationRow[] | undefined;
-          try {
-            await probeValidatedObservationDayManifest({
-              readObject,
-              dayUtc: boundaryDayUtc,
-              metrics,
-              manifestCache,
-            });
-          } catch (error) {
-            if (isAbsentR2ObservationDayManifest(error, boundaryDayUtc)) {
-              boundarySource = "obs_aqidb";
-              attemptedBoundarySource = boundarySource;
-              try {
-                boundaryRows = await readObsBoundaryRows(
-                  settings,
-                  boundaryDayUtc,
-                );
-              } catch (boundaryError) {
-                throw new ObsBackfillSourceError(
-                  `Obs AQI DB boundary source failed for ${boundaryDayUtc}: ${
-                    String(
-                      boundaryError instanceof Error
-                        ? boundaryError.message
-                        : boundaryError,
-                    ).slice(0, 320)
-                  }`,
-                  metrics,
-                  "database_boundary_failed",
-                );
-              }
-            } else {
-              throw new R2ObservationReadError(
-                `WHO boundary day manifest ${boundaryDayUtc} failed validation: ${
-                  String(error instanceof Error ? error.message : error).slice(
-                    0,
-                    320,
-                  )
-                }`,
-                {
-                  ...metrics,
-                  manifestKeys: [...new Set(metrics.manifestKeys)],
-                },
-              );
-            }
-          }
-
-          const prepared = await prepareWhoDailyRowsFromR2({
-            readObject,
-            dayUtc,
-            connectorId: settings.config.connectorId,
-            pollutantCodes: settings.config.pollutantCodes,
-            minValidHoursPerDay: settings.config.minValidHoursPerDay,
-            boundaryRows,
-            metrics,
-            manifestCache,
-          });
-          const rpc = await upsertPreparedDay(settings, dayUtc, prepared);
-          dailyRows.push(rpc);
+          const result = await refreshR2Day(settings, dayUtc);
+          dailyRows.push(result.rpc);
           accumulateR2Evidence(
             r2Evidence,
-            prepared.metrics,
-            prepared.preparedRows.length,
+            result.prepared.metrics,
+            result.prepared.preparedRows.length,
           );
           completedDays.push(dayUtc);
           dailySources.push({
             day_utc: dayUtc,
             source: "r2_v2",
-            boundary_source: boundarySource,
-            calculation_status: rpc.valid_timeseries_days > 0
+            calculation_status: result.rpc.valid_timeseries_days > 0
               ? "usable"
               : "unusable",
-            valid_timeseries_days: rpc.valid_timeseries_days,
+            valid_timeseries_days: result.rpc.valid_timeseries_days,
             not_enough_data_timeseries_days:
-              rpc.not_enough_data_timeseries_days,
-            rows_upserted: rpc.rows_upserted,
-            prepared_daily_row_count: prepared.preparedRows.length,
-            reasons: rpc.valid_timeseries_days > 0
-              ? [
-                "r2_target_used",
-                boundarySource === "r2_v2"
-                  ? "r2_boundary_used"
-                  : "database_boundary_used",
-              ]
-              : [
-                "r2_target_used",
-                boundarySource === "r2_v2"
-                  ? "r2_boundary_used"
-                  : "database_boundary_used",
-                "backfill_zero_valid_days",
-              ],
+              result.rpc.not_enough_data_timeseries_days,
+            rows_upserted: result.rpc.rows_upserted,
+            prepared_daily_row_count: result.prepared.preparedRows.length,
+            reasons: result.rpc.valid_timeseries_days > 0
+              ? ["r2_backfill_used"]
+              : ["r2_backfill_zero_valid_days"],
             error: null,
           });
         } catch (error) {
@@ -1044,23 +652,18 @@ export async function runWho2021Daily(): Promise<void> {
           } else if (error instanceof R2ObservationReadError) {
             accumulateR2Evidence(r2Evidence, error.metrics, 0);
             r2ValidationFailed = true;
-          } else if (error instanceof ObsBackfillSourceError) {
-            accumulateR2Evidence(r2Evidence, error.metrics, 0);
           } else {
             r2ValidationFailed = true;
           }
           dailySources.push({
             day_utc: dayUtc,
-            source: attemptedTargetSource,
-            boundary_source: attemptedBoundarySource,
+            source: "unavailable",
             calculation_status: "failed",
             valid_timeseries_days: 0,
             not_enough_data_timeseries_days: 0,
             rows_upserted: 0,
             prepared_daily_row_count: 0,
-            reasons: error instanceof ObsBackfillSourceError
-              ? [error.reason]
-              : ["r2_backfill_failed"],
+            reasons: ["r2_backfill_failed"],
             error: String(error instanceof Error ? error.message : error)
               .slice(0, 500),
           });
@@ -1126,7 +729,6 @@ export async function runWho2021Daily(): Promise<void> {
               dailySources.push({
                 day_utc: dayUtc,
                 source: "obs_aqidb",
-                boundary_source: "obs_aqidb",
                 calculation_status: "usable",
                 valid_timeseries_days: row.valid_timeseries_days,
                 not_enough_data_timeseries_days:
@@ -1168,7 +770,6 @@ export async function runWho2021Daily(): Promise<void> {
             dailySources.push({
               day_utc: dayUtc,
               source: "r2_v2",
-              boundary_source: "r2_v2",
               calculation_status: "usable",
               valid_timeseries_days: result.rpc.valid_timeseries_days,
               not_enough_data_timeseries_days:
@@ -1182,7 +783,6 @@ export async function runWho2021Daily(): Promise<void> {
             dailySources.push({
               day_utc: dayUtc,
               source: "unavailable",
-              boundary_source: "r2_v2",
               calculation_status: "unusable",
               valid_timeseries_days: 0,
               not_enough_data_timeseries_days:
@@ -1218,7 +818,6 @@ export async function runWho2021Daily(): Promise<void> {
           dailySources.push({
             day_utc: dayUtc,
             source: "unavailable",
-            boundary_source: null,
             calculation_status: sourceReasons.includes(
                 "database_ready_but_zero_valid_days",
               )
@@ -1261,7 +860,6 @@ export async function runWho2021Daily(): Promise<void> {
           dailySources.push({
             day_utc: row.end_day_utc,
             source: "obs_aqidb",
-            boundary_source: "obs_aqidb",
             calculation_status: Number(row.valid_timeseries_days) > 0
               ? "usable"
               : "unusable",
@@ -1360,7 +958,7 @@ export async function runWho2021Daily(): Promise<void> {
     correction_day_utc: correctionDay,
     readiness: readinessByDay,
     source_mode: settings?.config.runMode === "backfill"
-      ? "source_aware_backfill"
+      ? "r2_v2"
       : "source_priority",
     daily_sources: dailySources,
     completed_days: completedDays,
@@ -1449,7 +1047,7 @@ export async function runWho2021Daily(): Promise<void> {
     last_completed_day: completedDays.at(-1) || null,
     failed_day: failedDay,
     source_mode: settings?.config.runMode === "backfill"
-      ? "source_aware_backfill"
+      ? "r2_v2"
       : "source_priority",
     daily_sources: dailySources,
     readiness: readinessByDay,
