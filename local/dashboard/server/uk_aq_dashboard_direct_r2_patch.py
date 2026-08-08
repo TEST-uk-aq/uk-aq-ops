@@ -3,7 +3,8 @@
 
 R2 presence and Dropbox backup presence remain independent:
 - R2 presence comes from the normal history-days source plus direct R2 listings.
-- Dropbox presence comes from backup_inventory_v1/v2.json via the inventory patch.
+- Dropbox presence comes from the hierarchical v2 backup state provided by
+  uk_aq_dashboard_api.
 
 The direct listing runs at most once per six-hour coverage cache period, unless
 Force Refresh explicitly requests a current result.
@@ -19,6 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Set, Tuple
 
 import uk_aq_dashboard_api as dashboard
+import uk_aq_dashboard_api_patch as coverage_patch
 import uk_aq_dashboard_inventory_patch as inventory_patch
 
 
@@ -232,7 +234,7 @@ def _get_r2_history_days_cached(
 
 def main() -> None:
     dashboard._get_r2_history_days_cached = _get_r2_history_days_cached
-    inventory_patch.main()
+    coverage_patch.main()
 
 
 if __name__ == "__main__":
