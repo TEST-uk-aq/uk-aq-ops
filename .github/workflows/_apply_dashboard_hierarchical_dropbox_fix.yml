@@ -1,7 +1,7 @@
 name: Apply dashboard hierarchical Dropbox fix
 
 on:
-  issues:
+  pull_request:
     types: [opened]
 
 permissions:
@@ -9,11 +9,12 @@ permissions:
 
 jobs:
   apply-fix:
-    if: github.event.issue.title == 'internal: apply dashboard hierarchical Dropbox fix'
+    if: github.event.pull_request.title == 'internal: apply dashboard hierarchical Dropbox fix'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
 
       - uses: actions/setup-node@v4
@@ -92,7 +93,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm .github/workflows/_apply_dashboard_hierarchical_dropbox_fix.yml
           git rm scripts/dashboard/_apply_hierarchical_dropbox_dashboard_fix.py
+          git rm .github/_dashboard_fix_trigger.txt
           git add local/dashboard/server/uk_aq_dashboard_api.py
           git add workers/uk_aq_dashboard_online_api_worker/src/lib/storage_coverage_http_enrichment.ts
           git commit -m "Read hierarchical Dropbox backup state in dashboard"
-          git push origin HEAD:main
+          git push origin HEAD:${GITHUB_HEAD_REF}
