@@ -25,6 +25,27 @@ const DEFAULT_BACKUP_INVENTORY_PREFIX = normalizePrefix(
 const DEFAULT_REPORT_OUT = String(
   process.env.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_SOURCE_HIERARCHY_REPORT_OUT || "",
 ).trim();
+const TRANSIENT_R2_OPERATION_MAX_ATTEMPTS = 3;
+const TRANSIENT_R2_OPERATION_RETRY_BASE_MS = 15_000;
+const TRANSIENT_R2_STATUS_PATTERN = /\bR2\b.*\bfailed \((408|429|500|502|503|504)\)/i;
+const TRANSIENT_R2_ERROR_TOKENS = [
+  "connection reset",
+  "connection closed",
+  "broken pipe",
+  "socket hang up",
+  "econnreset",
+  "econnrefused",
+  "ehostunreach",
+  "etimedout",
+  "timed out",
+  "timeout",
+  "networkerror",
+  "network error",
+  "sendrequest",
+  "temporarily unavailable",
+  "tls",
+  "eof",
+];
 
 function r2FromEnv(env = process.env) {
   return {
@@ -120,6 +141,46 @@ function parseArgs(argv) {
   return args;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientR2OperationError(error) {
+  const message = String(error instanceof Error ? error.message : error || "");
+  if (TRANSIENT_R2_STATUS_PATTERN.test(message)) return true;
+  const normalized = message.toLowerCase();
+  return TRANSIENT_R2_ERROR_TOKENS.some((token) => normalized.includes(token));
+}
+
+function transientR2OperationRetryDelayMs(attempt) {
+  return TRANSIENT_R2_OPERATION_RETRY_BASE_MS * (2 ** Math.max(0, attempt - 1));
+}
+
+async function refreshHierarchyWithTransientRetry(options) {
+  for (let attempt = 1; attempt <= TRANSIENT_R2_OPERATION_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await refreshTimeseriesBindingSourceHierarchy(options);
+    } catch (error) {
+      if (
+        !isTransientR2OperationError(error)
+        || attempt === TRANSIENT_R2_OPERATION_MAX_ATTEMPTS
+      ) {
+        throw error;
+      }
+      const delayMs = transientR2OperationRetryDelayMs(attempt);
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `Transient R2 error during timeseries binding source hierarchy refresh `
+        + `(attempt ${attempt}/${TRANSIENT_R2_OPERATION_MAX_ATTEMPTS}): ${message}`,
+      );
+      console.warn(`Retrying hierarchy refresh in ${delayMs / 1000}s.`);
+      await sleep(delayMs);
+    }
+  }
+
+  throw new Error("Timeseries binding source hierarchy retry loop exhausted unexpectedly.");
+}
+
 async function readJsonMaybe(r2, key) {
   const head = await r2HeadObject({ r2, key });
   if (!head?.exists) return null;
@@ -168,7 +229,7 @@ export async function main(argv = process.argv.slice(2)) {
   const sourceFingerprint = args.source_fingerprint || sourceStateFingerprint;
 
   const startedAt = new Date().toISOString();
-  const hierarchy = await refreshTimeseriesBindingSourceHierarchy({
+  const hierarchy = await refreshHierarchyWithTransientRetry({
     r2,
     bindingPrefix: args.binding_prefix,
     backupInventoryRootPrefix: args.backup_inventory_prefix,
