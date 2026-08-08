@@ -8,7 +8,11 @@ The batch:
 - recalculates yesterday and the day before yesterday on every normal daily run;
 - uses Obs AQI DB first for each daily target and validated R2 v2
   observations as the exact-day fallback;
-- uses validated R2 v2 observations exclusively for historical backfill;
+- selects historical backfill sources from actual storage authority: validated
+  R2 when a target day manifest exists, or Obs AQI DB when that top-level
+  manifest is absent;
+- selects the following `00:00` boundary independently, including mixed
+  validated-R2/Obs-AQI-DB crossover days;
 - preserves the 18-valid-hour daily rule and 274-valid-day period rule;
 - refreshes rolling-year and last-complete-year status through the existing
   service-role RPCs;
@@ -38,15 +42,18 @@ Cloudflare Scheduler is the only schedule authority.
 
 - `daily`: always targets yesterday and the day before yesterday.
 - `backfill`: requires `UK_AQ_WHO_2021_START_DAY_UTC` and
-  `UK_AQ_WHO_2021_END_DAY_UTC`, reads R2 v2, commits one day at a time, and
-  rejects ranges longer than 31 inclusive days.
+  `UK_AQ_WHO_2021_END_DAY_UTC`, resolves validated R2 and Obs AQI DB authority
+  per day, commits one day at a time, and rejects ranges longer than 31
+  inclusive days.
 - `dry_run`: calculates RPC counts without database upserts or R2 writes.
 
 For hour-ending GOV.UK AURN data, a `day_utc` window is
 `(day 00:00, next day 00:00]`.
-The R2 partition for `day` contributes only `01:00` through `23:00`; the
-partition for `day + 1` contributes only its `00:00` boundary. Both partitions
-must pass the v2 day/connector/pollutant manifest and parquet checks.
+When R2 is authoritative, its partition for `day` contributes only `01:00`
+through `23:00`; the following `00:00` boundary comes from validated R2 when
+the `day + 1` top-level manifest exists, or from Obs AQI DB when that initial
+manifest is absent. Any R2 partition whose top-level manifest exists must pass
+the existing v2 day/connector/pollutant manifest and parquet checks.
 
 ## Required runtime configuration
 

@@ -21,13 +21,6 @@ export type R2ReadResult = {
   contentLength: number;
 };
 
-export class R2ObjectNotFoundError extends Error {
-  constructor(readonly objectKey: string) {
-    super(`R2 object not found: ${objectKey}`);
-    this.name = "R2ObjectNotFoundError";
-  }
-}
-
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
 const LOGICAL_HASH_HEADER = "x-amz-meta-uk-aq-logical-sha256";
@@ -196,7 +189,7 @@ export async function getR2Object(
 ): Promise<R2ReadResult> {
   const response = await fetchR2(config, "GET", objectKey);
   if (response.status === 404) {
-    throw new R2ObjectNotFoundError(objectKey);
+    throw new Error(`R2 object not found: ${objectKey}`);
   }
   if (!response.ok) {
     throw new Error(`R2 GET failed for ${objectKey}: HTTP ${response.status}`);
