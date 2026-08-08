@@ -1,5 +1,9 @@
 import { errorEnvelope } from "../lib/http";
 import { handleDirectCompatRoute } from "../lib/direct";
+import {
+  enrichStorageCoverageFromMetrics,
+  proxyR2ConnectorCounts,
+} from "../lib/r2_metrics_service";
 import { enrichStorageCoverageResponse } from "../lib/storage_coverage_http_enrichment";
 import { proxyToUpstream, shouldUseUpstream, type WorkerEnv } from "../lib/upstream";
 
@@ -64,6 +68,11 @@ export async function handleCompatRoute(
       return errorEnvelope("METHOD_NOT_ALLOWED", "Only GET is supported for this route", 405);
     }
 
+    if (!useUpstream && pathname === "/api/r2_connector_counts") {
+      const serviceResponse = await proxyR2ConnectorCounts(request, env);
+      if (serviceResponse) return serviceResponse;
+    }
+
     const response = !useUpstream
       ? await handleDirectCompatRoute(request, env, pathname)
       : await proxyToUpstream(request, env, pathname, {
@@ -76,7 +85,8 @@ export async function handleCompatRoute(
         });
 
     if (pathname === "/api/storage_coverage" || pathname === "/api/dashboard") {
-      return enrichStorageCoverageResponse(response, request, env);
+      const httpEnriched = await enrichStorageCoverageResponse(response, request, env);
+      return enrichStorageCoverageFromMetrics(httpEnriched, request, env);
     }
     return response;
   }
