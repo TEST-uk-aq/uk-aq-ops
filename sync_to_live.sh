@@ -237,6 +237,8 @@ sync_repo() {
     --delete-delay
     --itemize-changes
     --human-readable
+    --omit-dir-times
+    --prune-empty-dirs
     "${COMMON_EXCLUDES[@]}"
   )
 
