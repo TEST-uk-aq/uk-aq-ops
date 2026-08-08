@@ -243,7 +243,7 @@ sync_repo() {
 
         # Environment/local-machine owned files.
         --exclude='env-vars-master.csv'
-        --exclude='env-vars-master*.numbers'
+        --exclude='*.numbers'
         --exclude='local/launchd/'
         --exclude='dashboard/assets/config.js'
 
@@ -273,7 +273,6 @@ sync_repo() {
         # TEST-only OpenAQ LIVE -> TEST mirror components.
         --exclude='supabase/functions/uk_aq_sync_openaq_from_live/'
         --exclude='system_docs/table_info/uk_aq_openaq_live_sync_state.md'
-        --exclude='.github/workflows/supabase_edge_deploy.yml'
         --exclude='system_docs/uk_aq_edge_functions.md'
         --exclude='system_docs/uk_aq_github_actions.md'
         --exclude='schemas/ingest_db/uk_aq_openaq_live_sync_test.sql'
