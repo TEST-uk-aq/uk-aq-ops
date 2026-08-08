@@ -62,6 +62,41 @@ The RPC returns one row for every configured pollutant with:
 
 The worker MUST derive overall readiness from all returned pollutant rows. An empty result MUST not be treated as ready.
 
+## Backfill observation interfaces
+
+Backfill source selection is defined by [`contract.md`](contract.md). Interface design MUST preserve that source authority.
+
+When the target R2 top-level day manifest is absent and Obs AQI DB still contains the complete WHO observation window, the worker MAY use the existing daily database calculation path if that path preserves the same scientific day and completeness rules.
+
+When the target day is authoritative in validated R2 but the following-day top-level R2 manifest is absent, the worker requires only the following `00:00` hour-ending boundary observations from Obs AQI DB. The implementation MUST first inspect existing database interfaces and reuse a suitable service-role interface if one already exists.
+
+If a new database interface is genuinely required for the mixed-source boundary case:
+
+- its canonical SQL and permissions MUST be owned by `TEST-uk-aq/uk-aq-schema`;
+- it MUST be restricted to the minimum observation data needed for the WHO boundary calculation rather than exposing a broad raw-observation read surface without a separate contract decision;
+- it MUST preserve connector, source-network and pollutant scoping;
+- it MUST preserve service-role-only access unless a separate contract explicitly changes that security model;
+- it MUST return enough identity information to combine each boundary observation with the correct WHO timeseries without ambiguity;
+- it MUST NOT change the hour-ending timestamp convention or scientific completeness rules.
+
+This document intentionally does not invent a new RPC name or signature before implementation inspection establishes whether a new interface is needed. A coding agent MUST stop for a decision rather than invent an architectural or schema contract that is not determined by the existing repositories.
+
+## R2 missing-object interface meaning
+
+R2 read errors MUST preserve enough structured information for the worker to distinguish an absent initial top-level day manifest from an integrity failure inside a declared partition.
+
+The only missing object that may be interpreted as source unavailability is the initial top-level manifest being probed at:
+
+```text
+history/v2/observations/day_utc=<DAY>/manifest.json
+```
+
+This rule applies independently to the target day and the following boundary day.
+
+Once the top-level day manifest has been read successfully, any missing referenced connector manifest, pollutant manifest or Parquet object is an integrity failure. It MUST NOT be converted into an Obs AQI DB fallback condition.
+
+Fallback logic MUST use a typed or otherwise structured not-found condition. It MUST NOT depend on matching human-readable error strings.
+
 ## Workflow configuration
 
 The GitHub Actions workflow MAY read this optional repository variable:
@@ -92,6 +127,8 @@ UK_AQ_WHO_2021_READINESS_GATE_ENABLED
 
 It normally defaults to `true` for daily operation.
 
+No new repository variable is required merely to distinguish R2 from Obs AQI DB during backfill. Source selection MUST derive from source availability and integrity unless a separately approved contract change introduces configuration.
+
 ## Scientific-completeness configuration
 
 The readiness ratio MUST remain separate from:
@@ -114,14 +151,18 @@ Changing the readiness ratio MUST NOT silently change either scientific-complete
 
 The run report MUST preserve per-day readiness evidence and daily source decisions.
 
-Because the RPC field names remain compatible, report consumers may continue to receive `final_hour_*` properties. Their values MUST be interpreted according to the final-six-hour meanings in this document.
+Because the readiness RPC field names remain compatible, report consumers may continue to receive `final_hour_*` properties. Their values MUST be interpreted according to the final-six-hour meanings in this document.
 
 The report MUST also identify:
 
 - attempted and completed days;
 - publication day;
 - correction day;
-- Obs AQI DB or R2 source selection;
-- fallback failure reasons;
+- target-day observation source;
+- following `00:00` boundary source when it differs from the target-day source;
+- pure Obs AQI DB, pure R2, mixed R2/Obs AQI DB and unavailable/failed backfill cases in an unambiguous structured form;
+- fallback or integrity-failure reasons;
 - daily, rolling-year and calendar-year row counts;
 - summary and R2 publication outcome.
+
+Existing report fields SHOULD be preserved where they remain meaningful. If the existing `source` field is retained for target-day authority, a mixed-source backfill day MUST add an explicit boundary-source field or an equally clear structured representation. `source_mode` or equivalent summary fields MUST NOT claim that a backfill was R2-only when one or more days used Obs AQI DB or a mixed boundary.
