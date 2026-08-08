@@ -21,7 +21,7 @@ repo_src() {
     ingest)            printf '%s\n' "${TEST_BASE}/TEST-uk-aq-ingest" ;;
     ops)               printf '%s\n' "${TEST_BASE}/TEST-uk-aq-ops" ;;
     schema)            printf '%s\n' "${TEST_BASE}/TEST-uk-aq-schema" ;;
-    webpage)           printf '%s\n' "${TEST_BASE}/TEST-uk-aq-root.github.io" ;;
+    webpage)           printf '%s\n' "${TEST_BASE}/TEST-uk-aq.github.io" ;;
     pop-ingest)        printf '%s\n' "${TEST_BASE}/TEST-uk-aq-population-ingest" ;;
     integrity-factory) printf '%s\n' "${TEST_BASE}/TEST-uk-aq-integrity-factory" ;;
     *) return 1 ;;
@@ -33,8 +33,8 @@ repo_dst() {
     ingest)            printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-ingest" ;;
     ops)               printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-ops" ;;
     schema)            printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-schema" ;;
-    webpage)           printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq" ;;
-    pop-ingest)        printf '%s\n' "${LIVE_BASE}/LIVE-uk-population-ingest" ;;
+    webpage)           printf '%s\n' "${LIVE_BASE}/LIVE-beta-uk-aq" ;;
+    pop-ingest)        printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-population-ingest" ;;
     integrity-factory) printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-integrity-factory" ;;
     *) return 1 ;;
   esac
@@ -144,6 +144,13 @@ COMMON_EXCLUDES=(
   --exclude='*.pyc'
   --exclude='.pytest_cache/'
 
+  # TEST suites stay in TEST. This covers root and nested test directories,
+  # plus the occasional test module stored beside production source.
+  --exclude='tests/'
+  --exclude='*_test.*'
+  --exclude='*.test.*'
+  --exclude='test_*.py'
+
   # Runtime, investigation and local output
   --exclude='logs/'
   --exclude='logs4GH/'
@@ -180,49 +187,6 @@ COMMON_EXCLUDES=(
   --exclude='uk_aq_copy_core_to_live*'
 )
 
-repo_excludes() {
-  local repo="$1"
-  REPO_EXCLUDES=()
-
-  case "${repo}" in
-    ops)
-      REPO_EXCLUDES+=(
-        # This promotion tool belongs in TEST, not LIVE.
-        --exclude='sync_to_live.sh'
-
-        # Environment/local-machine owned files.
-        --exclude='env-vars-master.csv'
-        --exclude='env-vars-master*.numbers'
-        --exclude='local/launchd/'
-        --exclude='dashboard/assets/config.js'
-
-        # Scheduler configuration contains LIVE/TEST repo identity, enablement
-        # choices and a different D1 database ID in each environment.
-        --exclude='cloudflare/scheduler/jobs.toml'
-        --exclude='cloudflare/scheduler/wrangler.toml'
-      )
-      ;;
-    ingest)
-      REPO_EXCLUDES+=(
-        # Scheduler configuration contains environment-specific repo identity,
-        # enablement choices and a different D1 database ID.
-        --exclude='cloudflare/scheduler/jobs.toml'
-        --exclude='cloudflare/scheduler/wrangler.toml'
-
-        # TEST-only OpenAQ LIVE -> TEST mirror components.
-        --exclude='supabase/functions/uk_aq_sync_openaq_from_live/'
-        --exclude='system_docs/table_info/uk_aq_openaq_live_sync_state.md'
-        --exclude='.github/workflows/supabase_edge_deploy.yml'
-        --exclude='system_docs/uk_aq_edge_functions.md'
-        --exclude='system_docs/uk_aq_github_actions.md'
-        --exclude='schemas/ingest_db/uk_aq_openaq_live_sync_test.sql'
-      )
-      ;;
-    schema|webpage|pop-ingest|integrity-factory)
-      ;;
-  esac
-}
-
 # ── Sync ─────────────────────────────────────────────────────────────────────
 
 ERRORS=0
@@ -258,8 +222,9 @@ sync_repo() {
     return
   fi
 
-  repo_excludes "${label}"
-
+  # Build the rsync argument list here rather than expanding a separate empty
+  # array. macOS ships Bash 3.2, where `set -u` can treat an empty array
+  # expansion as an unbound variable.
   local rsync_args=(
     -av
     --checksum
@@ -267,8 +232,56 @@ sync_repo() {
     --itemize-changes
     --human-readable
     "${COMMON_EXCLUDES[@]}"
-    "${REPO_EXCLUDES[@]}"
   )
+
+  case "${label}" in
+    ops)
+      rsync_args+=(
+        # This promotion tool belongs in TEST, not LIVE.
+        --exclude='sync_to_live.sh'
+
+        # Environment/local-machine owned files.
+        --exclude='env-vars-master.csv'
+        --exclude='env-vars-master*.numbers'
+        --exclude='local/launchd/'
+        --exclude='dashboard/assets/config.js'
+
+        # Scheduler configuration contains LIVE/TEST repo identity, enablement
+        # choices and a different D1 database ID in each environment.
+        --exclude='cloudflare/scheduler/jobs.toml'
+        --exclude='cloudflare/scheduler/wrangler.toml'
+
+        # Postcode lookup is intentionally held back until its LIVE Cloudflare
+        # resources and variables are configured on the ukaq.co.uk account.
+        --exclude='.github/workflows/uk_aq_postcode_lookup_r2_api_worker_deploy.yml'
+        --exclude='workers/uk_aq_postcode_lookup_r2_api_worker/'
+        --exclude='workers/shared/postcode_lookup.mjs'
+        --exclude='scripts/postcodes/'
+        --exclude='scripts/geography/*postcode*'
+        --exclude='docs/*postcode*'
+        --exclude='system_docs/geography/postcode_lookup.md'
+      )
+      ;;
+    ingest)
+      rsync_args+=(
+        # Scheduler configuration contains environment-specific repo identity,
+        # enablement choices and a different D1 database ID.
+        --exclude='cloudflare/scheduler/jobs.toml'
+        --exclude='cloudflare/scheduler/wrangler.toml'
+
+        # TEST-only OpenAQ LIVE -> TEST mirror components.
+        --exclude='supabase/functions/uk_aq_sync_openaq_from_live/'
+        --exclude='system_docs/table_info/uk_aq_openaq_live_sync_state.md'
+        --exclude='.github/workflows/supabase_edge_deploy.yml'
+        --exclude='system_docs/uk_aq_edge_functions.md'
+        --exclude='system_docs/uk_aq_github_actions.md'
+        --exclude='schemas/ingest_db/uk_aq_openaq_live_sync_test.sql'
+      )
+      ;;
+    schema|webpage|pop-ingest|integrity-factory)
+      # No extra repo-specific exclusions at present.
+      ;;
+  esac
 
   if [[ "${APPLY}" -eq 0 ]]; then
     rsync_args+=(--dry-run)
