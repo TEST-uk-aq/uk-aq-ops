@@ -150,6 +150,11 @@ def expand_cron_token(
     if not normalized:
         raise JobsConfigError(f"Invalid {field_name}: empty cron token")
 
+    if "," in normalized:
+        for list_token in normalized.split(","):
+            expand_cron_token(list_token, field_name, min_value, max_value, names)
+        return
+
     base = normalized
     step = 1
     if "/" in normalized:
