@@ -21,7 +21,7 @@ repo_src() {
     ingest)            printf '%s\n' "${TEST_BASE}/TEST-uk-aq-ingest" ;;
     ops)               printf '%s\n' "${TEST_BASE}/TEST-uk-aq-ops" ;;
     schema)            printf '%s\n' "${TEST_BASE}/TEST-uk-aq-schema" ;;
-    webpage)           printf '%s\n' "${TEST_BASE}/TEST-uk-aq.github.io" ;;
+    website)           printf '%s\n' "${TEST_BASE}/TEST-uk-aq.github.io" ;;
     pop-ingest)        printf '%s\n' "${TEST_BASE}/TEST-uk-aq-population-ingest" ;;
     integrity-factory) printf '%s\n' "${TEST_BASE}/TEST-uk-aq-integrity-factory" ;;
     *) return 1 ;;
@@ -33,14 +33,14 @@ repo_dst() {
     ingest)            printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-ingest" ;;
     ops)               printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-ops" ;;
     schema)            printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-schema" ;;
-    webpage)           printf '%s\n' "${LIVE_BASE}/LIVE-beta-uk-aq" ;;
+    website)           printf '%s\n' "${LIVE_BASE}/LIVE-beta-uk-aq" ;;
     pop-ingest)        printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-population-ingest" ;;
     integrity-factory) printf '%s\n' "${LIVE_BASE}/LIVE-uk-aq-integrity-factory" ;;
     *) return 1 ;;
   esac
 }
 
-ALL_REPOS=(ingest ops schema webpage pop-ingest integrity-factory)
+ALL_REPOS=(ingest ops schema website pop-ingest integrity-factory)
 
 # ── Flags / selection ────────────────────────────────────────────────────────
 
@@ -56,7 +56,7 @@ Repos:
   ingest
   ops
   schema
-  webpage
+  website
   pop-ingest
   integrity-factory
 
@@ -86,7 +86,7 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
-    ingest|ops|schema|webpage|pop-ingest|integrity-factory)
+    ingest|ops|schema|website|pop-ingest|integrity-factory)
       SELECTED_REPOS+=("$1")
       ;;
     *)
@@ -284,7 +284,7 @@ sync_repo() {
         --exclude='schemas/ingest_db/uk_aq_openaq_live_sync_test.sql'
       )
       ;;
-    schema|webpage|pop-ingest|integrity-factory)
+    schema|website|pop-ingest|integrity-factory)
       # No extra repo-specific exclusions at present.
       ;;
   esac
