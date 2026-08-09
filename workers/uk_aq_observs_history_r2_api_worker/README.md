@@ -6,6 +6,7 @@ Routes:
 
 - `GET /v1/observations`
 - `GET /v1/timeseries-binding?timeseries_id=<id>` (stable v2 identity/routing)
+- `GET /v1/who-summary?as_of=YYYY-MM-DD` (WHO homepage summary)
 - alias: `GET /`
 
 Required query params:
@@ -26,6 +27,20 @@ Auth:
 
 - requires header: `x-uk-aq-upstream-auth`
 - value must match Worker secret `UK_AQ_EDGE_UPSTREAM_SECRET`
+
+WHO summary serving rule:
+
+- reads `history/v2/who_2021/latest_who_2021.json` from the bound R2 bucket;
+- retains one validated JSON body plus its raw R2 ETag in Worker Cache API;
+- validates that cached ETag on every request through a conditional R2 `get()`;
+- returns `MISS`, `HIT_VALIDATED`, `REFRESHED`, or `STALE_R2_ERROR` in
+  `X-UK-AQ-WHO-Origin-Cache`;
+- recomputes requested-day freshness headers for every request because the
+  validated-body cache does not vary by `as_of`;
+- serves a previously validated body only when the R2 operation fails, not when
+  R2 confirms the object is missing or returns an invalid replacement;
+- returns `Cache-Control: no-store` to its caller. The internal Cache API
+  retention is an availability/body-read optimisation, not freshness authority.
 
 R2 paths expected in v1 mode:
 
