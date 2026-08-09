@@ -74,6 +74,7 @@ const TABLE_EXPORT_CONFIG = Object.freeze({
   sos_network_pollutants: Object.freeze({ order_by: "network_ref, match_type, match_value" }),
   stations: Object.freeze({ order_by: "id" }),
   station_metadata: Object.freeze({ order_by: "station_id" }),
+  station_initial_metadata: Object.freeze({ order_by: "station_id" }),
   timeseries: Object.freeze({ order_by: "id" }),
   sos_station_timeseries_site_refs: Object.freeze({
     source_schema: SOS_SITE_REF_SOURCE_SCHEMA,
@@ -98,6 +99,7 @@ export const DEFAULT_TABLES = Object.freeze([
   "timeseries",
   "sos_station_timeseries_site_refs",
 ]);
+const V2_ONLY_DEFAULT_TABLES = Object.freeze(["station_initial_metadata"]);
 export const TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION = 2;
 const TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION = 1;
 const TIMESERIES_BINDING_SOURCE_TABLES = Object.freeze(["timeseries", "phenomena", "observed_properties"]);
@@ -414,7 +416,10 @@ function parseArgs(argv) {
     throw new Error("--prefix resolved to an empty value");
   }
 
-  const requestedTables = args.tables.length ? Array.from(new Set(args.tables)) : [...DEFAULT_TABLES];
+  const defaultTables = resolveR2HistoryVersion(process.env, { context: "R2 core snapshot" }) === "v2"
+    ? [...DEFAULT_TABLES, ...V2_ONLY_DEFAULT_TABLES]
+    : [...DEFAULT_TABLES];
+  const requestedTables = args.tables.length ? Array.from(new Set(args.tables)) : defaultTables;
   const unknown = requestedTables.filter((name) => !TABLE_EXPORT_CONFIG[name]);
   if (unknown.length) {
     throw new Error(`Unknown table(s): ${unknown.join(", ")}`);
