@@ -155,7 +155,8 @@ COMMON_EXCLUDES=(
   # Working/reference artefacts do not need promotion to LIVE.
   --exclude='*.numbers'
   --exclude='*.zip'
-
+  --exclude='*.xlsx'
+  
   # Runtime, investigation and local output
   --exclude='logs/'
   --exclude='logs4GH/'
