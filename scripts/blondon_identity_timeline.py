@@ -5,7 +5,7 @@ The script is read-only. A requested reference is searched across both Breathe L
 connectors and across explicit Nodes source-lineage metadata. Matching source sites are
 resolved as one family and written to a single .xlsx workbook.
 
-Authoritative lookup evidence:
+Authoritative family lookup evidence:
   * stations.station_ref for connector 2 (Nodes) and connector 3 (Communities)
   * station_initial_metadata.attributes.SiteCode
   * station_initial_metadata.attributes.InstallationCode
@@ -13,6 +13,8 @@ Authoritative lookup evidence:
   * source_history[].InstallationCode
   * future explicit stations.match_id values prefixed blondon_installation:
 
+Nodes device/installation intervals are taken primarily from station_initial_metadata,
+including source_history. Communities device intervals use retained core station history.
 DeviceCode, station names and coordinates are never used to establish family membership.
 
 Examples:
@@ -33,7 +35,7 @@ import sys
 import zipfile
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 from xml.sax.saxutils import escape
@@ -43,6 +45,7 @@ TARGET_CONNECTOR_IDS = (2, 3)
 TARGET_POLLUTANTS = ("pm25", "no2")
 EXCEL_MIN_DATE = date(1900, 1, 1)
 INSTALLATION_MATCH_PREFIX = "blondon_installation:"
+NOT_RETAINED = "[not retained in current core]"
 
 CONNECTOR_LABELS = {2: "Breathe London Nodes", 3: "Breathe London Communities"}
 CONNECTOR_CODES = {2: "blondon_nodes", 3: "blondon_communities"}
@@ -54,6 +57,9 @@ TIMELINE_HEADERS = (
     "site_ref",
     "station_id",
     "device_ref",
+    "installation_ref",
+    "sensor_contract",
+    "identity source",
     "PM2.5 timeseries_ref",
     "NO2 timeseries_ref",
 )
@@ -67,6 +73,21 @@ FAMILY_HEADERS = (
     "lookup aliases",
     "InstallationCode refs",
     "source-history SiteCode refs",
+)
+
+LINK_HEADERS = (
+    "Nodes site_ref",
+    "Nodes station_id",
+    "record location",
+    "record SiteCode",
+    "record DeviceCode",
+    "record InstallationCode",
+    "StartDate",
+    "EndDate",
+    "SensorContract",
+    "linked Communities site_ref",
+    "linked Communities station_id",
+    "link rule",
 )
 
 
@@ -106,11 +127,14 @@ class SnapshotState:
     removed_at: date | None
 
 
-@dataclass
+@dataclass(frozen=True)
 class DeviceInterval:
     key: StationKey
     station_id: int
     device_ref: str
+    installation_ref: str
+    sensor_contract: str
+    source: str
     valid_from: date
     valid_to: date | None
 
@@ -123,6 +147,19 @@ class FamilyEvidence:
     aliases: set[str]
     installation_refs: set[str]
     source_site_refs: set[str]
+
+
+@dataclass(frozen=True)
+class LinkEvidence:
+    nodes_key: StationKey
+    record_location: str
+    site_code: str
+    device_code: str
+    installation_code: str
+    start_date: str
+    end_date: str
+    sensor_contract: str
+    communities_key: StationKey
 
 
 def clean_text(value: object) -> str:
@@ -153,6 +190,27 @@ def row_day(value: object) -> date | None:
         return None
 
 
+def parse_source_datetime(value: object) -> datetime | None:
+    text = clean_text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def end_datetime_to_last_day(end_at: datetime | None) -> date | None:
+    if end_at is None:
+        return None
+    if end_at.timetz().replace(tzinfo=None) == time(0, 0):
+        return end_at.date() - timedelta(days=1)
+    return end_at.date()
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -161,43 +219,27 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--site-ref",
-        "--site_ref",
-        dest="site_ref",
-        default="",
+        "--site-ref", "--site_ref", dest="site_ref", default="",
         help="Any Breathe London site/source reference, e.g. BL0005 or CLDP0014",
     )
     parser.add_argument(
-        "--input-csv",
-        "--input_csv",
-        dest="input_csv",
-        default="",
+        "--input-csv", "--input_csv", dest="input_csv", default="",
         help="CSV containing a site_ref column",
     )
     parser.add_argument(
-        "--root",
-        default="",
+        "--root", default="",
         help="Local R2_history_backup root; overrides environment-derived Dropbox root",
     )
     parser.add_argument(
-        "--output-dir",
-        "--output_dir",
-        dest="output_dir",
-        default=".",
+        "--output-dir", "--output_dir", dest="output_dir", default=".",
         help="Directory for generated .xlsx files",
     )
     parser.add_argument(
-        "--from-day",
-        "--from_day",
-        dest="from_day",
-        default="",
+        "--from-day", "--from_day", dest="from_day", default="",
         help="Optional inclusive report start YYYY-MM-DD",
     )
     parser.add_argument(
-        "--to-day",
-        "--to_day",
-        dest="to_day",
-        default="",
+        "--to-day", "--to_day", dest="to_day", default="",
         help="Optional inclusive report end YYYY-MM-DD",
     )
     args = parser.parse_args(argv)
@@ -388,41 +430,50 @@ def build_station_catalog(
     return catalog, by_id
 
 
-def extract_metadata_refs(attributes: Mapping[str, object]) -> tuple[set[str], set[str]]:
-    site_refs: set[str] = set()
-    installation_refs: set[str] = set()
-
-    site_code = clean_text(attributes.get("SiteCode"))
-    if site_code:
-        site_refs.add(site_code)
-    installation = clean_text(attributes.get("InstallationCode"))
-    if installation:
-        installation_refs.add(installation)
-
+def metadata_records(attributes: Mapping[str, object]) -> list[tuple[str, Mapping[str, object]]]:
+    records: list[tuple[str, Mapping[str, object]]] = []
     source_history = attributes.get("source_history")
     if isinstance(source_history, list):
-        for entry in source_history:
-            if not isinstance(entry, dict):
-                continue
-            site_code = clean_text(entry.get("SiteCode"))
-            if site_code:
-                site_refs.add(site_code)
-            installation = clean_text(entry.get("InstallationCode"))
-            if installation:
-                installation_refs.add(installation)
+        for idx, entry in enumerate(source_history):
+            if isinstance(entry, dict):
+                records.append((f"source_history[{idx}]", entry))
+    records.append(("attributes", attributes))
+    return records
 
-    return site_refs, installation_refs
+
+def load_station_initial_metadata(
+    snapshots: Sequence[tuple[date, Path, Mapping[str, object]]],
+    station_key_by_id: Mapping[int, StationKey],
+) -> tuple[dict[StationKey, Mapping[str, object]], date | None]:
+    snapshot = latest_snapshot_with_table(snapshots, "station_initial_metadata")
+    if snapshot is None:
+        return {}, None
+
+    metadata_day, snapshot_dir, manifest = snapshot
+    metadata_path = table_path(snapshot_dir, manifest, "station_initial_metadata")
+    if metadata_path is None:
+        return {}, None
+
+    result: dict[StationKey, Mapping[str, object]] = {}
+    for row in iter_ndjson_gz(metadata_path):
+        station_id = int(row.get("station_id") or 0)
+        owner = station_key_by_id.get(station_id)
+        if owner is None or owner.connector_id not in TARGET_CONNECTOR_IDS:
+            continue
+        attributes = row.get("attributes")
+        if isinstance(attributes, dict):
+            result[owner] = attributes
+    return result, metadata_day
 
 
 def build_family_index(
-    snapshots: Sequence[tuple[date, Path, Mapping[str, object]]],
     catalog: Mapping[StationKey, StationRecord],
-    station_key_by_id: Mapping[int, StationKey],
+    metadata_by_station: Mapping[StationKey, Mapping[str, object]],
 ) -> tuple[
     dict[str, set[StationKey]],
     dict[StationKey, set[StationKey]],
     dict[StationKey, FamilyEvidence],
-    date | None,
+    list[LinkEvidence],
 ]:
     lookup: dict[str, set[StationKey]] = defaultdict(set)
     graph: dict[StationKey, set[StationKey]] = defaultdict(set)
@@ -430,6 +481,7 @@ def build_family_index(
         key: FamilyEvidence(aliases={key.site_ref}, installation_refs=set(), source_site_refs=set())
         for key in catalog
     }
+    link_evidence: list[LinkEvidence] = []
 
     communities_by_ref: dict[str, list[StationKey]] = defaultdict(list)
     for key, record in catalog.items():
@@ -444,44 +496,40 @@ def build_family_index(
                 lookup[normalise_ref(alias)].add(key)
                 evidence[key].aliases.add(alias)
 
-    metadata_snapshot = latest_snapshot_with_table(snapshots, "station_initial_metadata")
-    metadata_day: date | None = None
-    if metadata_snapshot is not None:
-        metadata_day, snapshot_dir, manifest = metadata_snapshot
-        metadata_path = table_path(snapshot_dir, manifest, "station_initial_metadata")
-        if metadata_path is None:
-            raise RuntimeError("Selected station_initial_metadata snapshot has no readable table file.")
-        for row in iter_ndjson_gz(metadata_path):
-            station_id = int(row.get("station_id") or 0)
-            owner = station_key_by_id.get(station_id)
-            if owner is None or owner.connector_id not in TARGET_CONNECTOR_IDS:
-                continue
-            attributes = row.get("attributes")
-            if not isinstance(attributes, dict):
+    for owner, attributes in metadata_by_station.items():
+        for location, record in metadata_records(attributes):
+            site_code = clean_text(record.get("SiteCode"))
+            installation = clean_text(record.get("InstallationCode"))
+            if site_code:
+                lookup[normalise_ref(site_code)].add(owner)
+                evidence[owner].aliases.add(site_code)
+                evidence[owner].source_site_refs.add(site_code)
+
+            if owner.connector_id != 2 or not installation:
                 continue
 
-            source_site_refs, installation_refs = extract_metadata_refs(attributes)
-            for ref in source_site_refs:
-                lookup[normalise_ref(ref)].add(owner)
-                evidence[owner].aliases.add(ref)
-                evidence[owner].source_site_refs.add(ref)
+            lookup[normalise_ref(installation)].add(owner)
+            evidence[owner].aliases.add(installation)
+            evidence[owner].installation_refs.add(installation)
 
-            if owner.connector_id != 2:
-                continue
+            for community_key in communities_by_ref.get(normalise_ref(installation), []):
+                graph[owner].add(community_key)
+                graph[community_key].add(owner)
+                evidence[community_key].aliases.add(installation)
+                link_evidence.append(
+                    LinkEvidence(
+                        nodes_key=owner,
+                        record_location=location,
+                        site_code=site_code,
+                        device_code=clean_text(record.get("DeviceCode")),
+                        installation_code=installation,
+                        start_date=clean_text(record.get("StartDate")),
+                        end_date=clean_text(record.get("EndDate")),
+                        sensor_contract=clean_text(record.get("SensorContract")),
+                        communities_key=community_key,
+                    )
+                )
 
-            for ref in installation_refs:
-                lookup[normalise_ref(ref)].add(owner)
-                evidence[owner].aliases.add(ref)
-                evidence[owner].installation_refs.add(ref)
-
-                matched_communities = communities_by_ref.get(normalise_ref(ref), [])
-                for community_key in matched_communities:
-                    graph[owner].add(community_key)
-                    graph[community_key].add(owner)
-                    evidence[community_key].aliases.add(ref)
-
-    # If an explicit future blondon_installation match_id appears on more than one
-    # Breathe London station, treat that shared key as authoritative graph evidence.
     match_groups: dict[str, list[StationKey]] = defaultdict(list)
     for key, record in catalog.items():
         match_id = record.match_id.strip()
@@ -495,7 +543,15 @@ def build_family_index(
                 if left != right:
                     graph[left].add(right)
 
-    return lookup, graph, evidence, metadata_day
+    link_evidence.sort(
+        key=lambda item: (
+            item.nodes_key.site_ref.upper(),
+            item.start_date,
+            item.installation_code.upper(),
+            item.communities_key.site_ref.upper(),
+        )
+    )
+    return lookup, graph, evidence, link_evidence
 
 
 def resolve_family(
@@ -566,7 +622,7 @@ def scan_station_history(
     return history
 
 
-def build_device_intervals(states: Sequence[SnapshotState]) -> list[DeviceInterval]:
+def build_snapshot_device_intervals(states: Sequence[SnapshotState]) -> list[DeviceInterval]:
     if not states:
         return []
 
@@ -583,19 +639,30 @@ def build_device_intervals(states: Sequence[SnapshotState]) -> list[DeviceInterv
             and current.device_ref == state.device_ref
         )
         if same_identity:
-            if state.removed_at is not None:
-                current.valid_to = state.removed_at
             continue
 
         if current is not None:
             inferred_end = proposed_start - timedelta(days=1)
             if current.valid_to is None or inferred_end < current.valid_to:
-                current.valid_to = inferred_end
+                current = DeviceInterval(
+                    key=current.key,
+                    station_id=current.station_id,
+                    device_ref=current.device_ref,
+                    installation_ref=current.installation_ref,
+                    sensor_contract=current.sensor_contract,
+                    source=current.source,
+                    valid_from=current.valid_from,
+                    valid_to=inferred_end,
+                )
+                intervals[-1] = current
 
         current = DeviceInterval(
             key=state.key,
             station_id=state.station_id,
             device_ref=state.device_ref,
+            installation_ref="",
+            sensor_contract="",
+            source="core stations snapshots",
             valid_from=proposed_start,
             valid_to=state.removed_at,
         )
@@ -604,25 +671,119 @@ def build_device_intervals(states: Sequence[SnapshotState]) -> list[DeviceInterv
     return intervals
 
 
+def build_nodes_metadata_intervals(
+    key: StationKey,
+    station: StationRecord,
+    attributes: Mapping[str, object],
+    latest_snapshot_day: date,
+) -> list[DeviceInterval]:
+    raw: list[tuple[datetime, datetime | None, DeviceInterval]] = []
+
+    source_history = attributes.get("source_history")
+    if isinstance(source_history, list):
+        for idx, entry in enumerate(source_history):
+            if not isinstance(entry, dict):
+                continue
+            site_code = clean_text(entry.get("SiteCode"))
+            if site_code and normalise_ref(site_code) != key.normalised_ref:
+                continue
+            start_at = parse_source_datetime(entry.get("StartDate"))
+            if start_at is None:
+                continue
+            end_at = parse_source_datetime(entry.get("EndDate"))
+            valid_to = end_datetime_to_last_day(end_at)
+            interval = DeviceInterval(
+                key=key,
+                station_id=station.station_id,
+                device_ref=clean_text(entry.get("DeviceCode")),
+                installation_ref=clean_text(entry.get("InstallationCode")),
+                sensor_contract=clean_text(entry.get("SensorContract")),
+                source=f"station_initial_metadata.source_history[{idx}]",
+                valid_from=start_at.date(),
+                valid_to=valid_to,
+            )
+            raw.append((start_at, end_at, interval))
+
+    current_start = station.first_seen
+    current_device = clean_text(attributes.get("DeviceCode")) or station.device_ref
+    if current_start is not None or current_device:
+        start_day = current_start or latest_snapshot_day
+        start_at = datetime.combine(start_day, time.min, tzinfo=timezone.utc)
+        interval = DeviceInterval(
+            key=key,
+            station_id=station.station_id,
+            device_ref=current_device,
+            installation_ref=clean_text(attributes.get("InstallationCode")),
+            sensor_contract=clean_text(attributes.get("SensorContract")),
+            source="station_initial_metadata.attributes",
+            valid_from=start_day,
+            valid_to=station.removed_at,
+        )
+        raw.append((start_at, None, interval))
+
+    raw.sort(key=lambda item: (item[0], item[2].device_ref, item[2].installation_ref))
+    intervals = [item[2] for item in raw]
+
+    for idx in range(len(intervals) - 1):
+        current = intervals[idx]
+        next_interval = intervals[idx + 1]
+        if current.valid_to is None or current.valid_to >= next_interval.valid_from:
+            intervals[idx] = DeviceInterval(
+                key=current.key,
+                station_id=current.station_id,
+                device_ref=current.device_ref,
+                installation_ref=current.installation_ref,
+                sensor_contract=current.sensor_contract,
+                source=current.source,
+                valid_from=current.valid_from,
+                valid_to=next_interval.valid_from - timedelta(days=1),
+            )
+
+    return [item for item in intervals if item.valid_to is None or item.valid_from <= item.valid_to]
+
+
+def build_family_intervals(
+    snapshots: Sequence[tuple[date, Path, Mapping[str, object]]],
+    family: Sequence[StationKey],
+    catalog: Mapping[StationKey, StationRecord],
+    metadata_by_station: Mapping[StationKey, Mapping[str, object]],
+) -> dict[StationKey, list[DeviceInterval]]:
+    station_history = scan_station_history(snapshots, family)
+    latest_day = snapshots[-1][0]
+    result: dict[StationKey, list[DeviceInterval]] = {}
+
+    for key in family:
+        if key.connector_id == 2 and key in metadata_by_station:
+            intervals = build_nodes_metadata_intervals(
+                key,
+                catalog[key],
+                metadata_by_station[key],
+                latest_day,
+            )
+            if intervals:
+                result[key] = intervals
+                continue
+        result[key] = build_snapshot_device_intervals(station_history.get(key, ()))
+    return result
+
+
 def load_timeseries_refs(
     snapshots: Sequence[tuple[date, Path, Mapping[str, object]]],
     family: Sequence[StationKey],
     catalog: Mapping[StationKey, StationRecord],
-) -> dict[StationKey, dict[str, str]]:
-    station_ids = {catalog[key].station_id for key in family if key in catalog}
+) -> tuple[dict[StationKey, dict[str, str]], dict[StationKey, bool]]:
     result: dict[StationKey, dict[str, str]] = {key: {} for key in family}
-    if not station_ids:
-        return result
+    station_has_any: dict[StationKey, bool] = {key: False for key in family}
 
     snapshot = latest_snapshot_with_table(snapshots, "timeseries")
     properties_snapshot = latest_snapshot_with_table(snapshots, "observed_properties")
     if snapshot is None or properties_snapshot is None:
-        return result
+        return result, station_has_any
 
     _property_day, prop_dir, prop_manifest = properties_snapshot
     prop_path = table_path(prop_dir, prop_manifest, "observed_properties")
     if prop_path is None:
-        return result
+        return result, station_has_any
     property_codes: dict[int, str] = {}
     for row in iter_ndjson_gz(prop_path):
         try:
@@ -635,7 +796,7 @@ def load_timeseries_refs(
     _day, snapshot_dir, manifest = snapshot
     ts_path = table_path(snapshot_dir, manifest, "timeseries")
     if ts_path is None:
-        return result
+        return result, station_has_any
 
     for row in iter_ndjson_gz(ts_path):
         try:
@@ -645,6 +806,7 @@ def load_timeseries_refs(
         key = station_key_by_id.get(station_id)
         if key is None:
             continue
+        station_has_any[key] = True
         try:
             observed_property_id = int(row.get("observed_property_id"))
         except (TypeError, ValueError):
@@ -656,7 +818,7 @@ def load_timeseries_refs(
         if timeseries_ref:
             result[key][pollutant] = timeseries_ref
 
-    return result
+    return result, station_has_any
 
 
 def choose_report_range(
@@ -719,10 +881,25 @@ def interval_for_day(items: Sequence[DeviceInterval], day: date) -> DeviceInterv
     return candidates[0] if candidates else None
 
 
+def timeseries_display(
+    key: StationKey,
+    pollutant: str,
+    timeseries_refs: Mapping[StationKey, Mapping[str, str]],
+    station_has_any_timeseries: Mapping[StationKey, bool],
+) -> str:
+    ref = clean_text(timeseries_refs.get(key, {}).get(pollutant))
+    if ref:
+        return ref
+    if key.connector_id == 3 and not station_has_any_timeseries.get(key, False):
+        return NOT_RETAINED
+    return ""
+
+
 def build_timeline_rows(
     family: Sequence[StationKey],
     intervals: Mapping[StationKey, Sequence[DeviceInterval]],
     timeseries_refs: Mapping[StationKey, Mapping[str, str]],
+    station_has_any_timeseries: Mapping[StationKey, bool],
     display_days: Sequence[date],
 ) -> list[list[object]]:
     rows: list[list[object]] = []
@@ -731,7 +908,6 @@ def build_timeline_rows(
             interval = interval_for_day(intervals.get(key, ()), day)
             if interval is None:
                 continue
-            refs = timeseries_refs.get(key, {})
             rows.append(
                 [
                     day,
@@ -740,8 +916,11 @@ def build_timeline_rows(
                     key.site_ref,
                     interval.station_id,
                     interval.device_ref,
-                    refs.get("pm25", ""),
-                    refs.get("no2", ""),
+                    interval.installation_ref,
+                    interval.sensor_contract,
+                    interval.source,
+                    timeseries_display(key, "pm25", timeseries_refs, station_has_any_timeseries),
+                    timeseries_display(key, "no2", timeseries_refs, station_has_any_timeseries),
                 ]
             )
     return rows
@@ -766,6 +945,35 @@ def build_family_rows(
                 ", ".join(sorted(item.aliases, key=str.upper)),
                 ", ".join(sorted(item.installation_refs, key=str.upper)),
                 ", ".join(sorted(item.source_site_refs, key=str.upper)),
+            ]
+        )
+    return rows
+
+
+def build_link_rows(
+    family: Sequence[StationKey],
+    catalog: Mapping[StationKey, StationRecord],
+    all_links: Sequence[LinkEvidence],
+) -> list[list[object]]:
+    family_set = set(family)
+    rows: list[list[object]] = []
+    for link in all_links:
+        if link.nodes_key not in family_set or link.communities_key not in family_set:
+            continue
+        rows.append(
+            [
+                link.nodes_key.site_ref,
+                catalog[link.nodes_key].station_id,
+                link.record_location,
+                link.site_code,
+                link.device_code,
+                link.installation_code,
+                link.start_date,
+                link.end_date,
+                link.sensor_contract,
+                link.communities_key.site_ref,
+                catalog[link.communities_key].station_id,
+                "Nodes InstallationCode == Communities station_ref",
             ]
         )
     return rows
@@ -891,7 +1099,7 @@ def build_info_sheet_xml(info_rows: Sequence[tuple[str, str]]) -> str:
         '<sheetViews><sheetView workbookViewId="0"/></sheetViews>'
         '<sheetFormatPr defaultRowHeight="15"/>'
         '<cols><col min="1" max="1" width="32" customWidth="1"/>'
-        '<col min="2" max="2" width="90" customWidth="1"/></cols>'
+        '<col min="2" max="2" width="100" customWidth="1"/></cols>'
         f'<sheetData>{"".join(xml_rows)}</sheetData>'
         '<pageMargins left="0.5" right="0.5" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
         '</worksheet>'
@@ -935,6 +1143,7 @@ def write_xlsx(
     output_path: Path,
     timeline_rows: Sequence[Sequence[object]],
     family_rows: Sequence[Sequence[object]],
+    link_rows: Sequence[Sequence[object]],
     info_rows: Sequence[tuple[str, str]],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -948,6 +1157,7 @@ def write_xlsx(
   <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
   <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
   <Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/worksheets/sheet4.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
   <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
   <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
   <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
@@ -964,7 +1174,8 @@ def write_xlsx(
   <sheets>
     <sheet name="Timeline" sheetId="1" r:id="rId1"/>
     <sheet name="Family" sheetId="2" r:id="rId2"/>
-    <sheet name="Report Info" sheetId="3" r:id="rId3"/>
+    <sheet name="Link Evidence" sheetId="3" r:id="rId3"/>
+    <sheet name="Report Info" sheetId="4" r:id="rId4"/>
   </sheets>
   <calcPr calcId="191029"/>
 </workbook>'''
@@ -973,7 +1184,8 @@ def write_xlsx(
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
   <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
   <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/>
-  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet4.xml"/>
+  <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 </Relationships>'''
     core_props = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -987,14 +1199,14 @@ def write_xlsx(
   <Application>UK AQ</Application>
   <DocSecurity>0</DocSecurity>
   <ScaleCrop>false</ScaleCrop>
-  <HeadingPairs><vt:vector size="2" baseType="variant"><vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>3</vt:i4></vt:variant></vt:vector></HeadingPairs>
-  <TitlesOfParts><vt:vector size="3" baseType="lpstr"><vt:lpstr>Timeline</vt:lpstr><vt:lpstr>Family</vt:lpstr><vt:lpstr>Report Info</vt:lpstr></vt:vector></TitlesOfParts>
+  <HeadingPairs><vt:vector size="2" baseType="variant"><vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>4</vt:i4></vt:variant></vt:vector></HeadingPairs>
+  <TitlesOfParts><vt:vector size="4" baseType="lpstr"><vt:lpstr>Timeline</vt:lpstr><vt:lpstr>Family</vt:lpstr><vt:lpstr>Link Evidence</vt:lpstr><vt:lpstr>Report Info</vt:lpstr></vt:vector></TitlesOfParts>
 </Properties>'''
 
     timeline_xml = build_table_sheet_xml(
         TIMELINE_HEADERS,
         timeline_rows,
-        widths=(13, 28, 13, 16, 14, 18, 24, 24),
+        widths=(13, 28, 13, 16, 14, 18, 20, 18, 44, 28, 28),
         date_column=1,
         highlight_changes=True,
     )
@@ -1002,6 +1214,11 @@ def write_xlsx(
         FAMILY_HEADERS,
         family_rows,
         widths=(28, 13, 16, 14, 18, 42, 42, 42),
+    )
+    links_xml = build_table_sheet_xml(
+        LINK_HEADERS,
+        link_rows,
+        widths=(16, 14, 24, 16, 18, 22, 24, 24, 18, 24, 14, 44),
     )
 
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -1014,7 +1231,8 @@ def write_xlsx(
         archive.writestr("xl/styles.xml", styles_xml())
         archive.writestr("xl/worksheets/sheet1.xml", timeline_xml)
         archive.writestr("xl/worksheets/sheet2.xml", family_xml)
-        archive.writestr("xl/worksheets/sheet3.xml", build_info_sheet_xml(info_rows))
+        archive.writestr("xl/worksheets/sheet3.xml", links_xml)
+        archive.writestr("xl/worksheets/sheet4.xml", build_info_sheet_xml(info_rows))
 
 
 def generate_report(
@@ -1026,28 +1244,42 @@ def generate_report(
     lookup: Mapping[str, set[StationKey]],
     graph: Mapping[StationKey, set[StationKey]],
     evidence: Mapping[StationKey, FamilyEvidence],
+    all_links: Sequence[LinkEvidence],
+    metadata_by_station: Mapping[StationKey, Mapping[str, object]],
     metadata_day: date | None,
     from_day: date | None,
     to_day: date | None,
 ) -> Path:
     family = resolve_family(selector, lookup, graph)
-    station_history = scan_station_history(snapshots, family)
-    intervals = {key: build_device_intervals(station_history.get(key, ())) for key in family}
+    intervals = build_family_intervals(snapshots, family, catalog, metadata_by_station)
     latest_day = snapshots[-1][0]
     start, end = choose_report_range(intervals, latest_day, from_day, to_day)
     display_days = build_display_days(start, end, intervals)
-    timeseries_refs = load_timeseries_refs(snapshots, family, catalog)
-    timeline_rows = build_timeline_rows(family, intervals, timeseries_refs, display_days)
+    timeseries_refs, station_has_any_timeseries = load_timeseries_refs(snapshots, family, catalog)
+    timeline_rows = build_timeline_rows(
+        family,
+        intervals,
+        timeseries_refs,
+        station_has_any_timeseries,
+        display_days,
+    )
     family_rows = build_family_rows(family, catalog, evidence)
+    link_rows = build_link_rows(family, catalog, all_links)
 
     family_description = ", ".join(
         f"{CONNECTOR_CODES.get(key.connector_id, key.connector_id)}:{key.site_ref}"
         for key in family
     )
+    unavailable_community_refs = [
+        key.site_ref
+        for key in family
+        if key.connector_id == 3 and not station_has_any_timeseries.get(key, False)
+    ]
     info_rows = [
         ("Requested reference", selector.site_ref),
         ("Resolved family members", family_description),
         ("Family member count", str(len(family))),
+        ("Cross-connector link evidence rows", str(len(link_rows))),
         ("Latest core snapshot", latest_day.isoformat()),
         (
             "station_initial_metadata snapshot",
@@ -1060,10 +1292,22 @@ def generate_report(
             "Lookup contract",
             "station_ref + explicit SiteCode/InstallationCode source metadata; DeviceCode/name/coordinates excluded",
         ),
+        (
+            "Nodes timeline source",
+            "station_initial_metadata source_history + current attributes where available; core stations snapshots as fallback",
+        ),
+        (
+            "Communities timeseries refs not retained",
+            ", ".join(unavailable_community_refs) if unavailable_community_refs else "none",
+        ),
+        (
+            "Historical Communities ref rule",
+            f"{NOT_RETAINED} means the retained current core has no timeseries rows for that station; refs are not inferred from naming convention",
+        ),
     ]
 
     output_path = output_dir / f"BreatheLondon_{sanitise_filename(selector.site_ref)}_identity_timeline.xlsx"
-    write_xlsx(output_path, timeline_rows, family_rows, info_rows)
+    write_xlsx(output_path, timeline_rows, family_rows, link_rows, info_rows)
     return output_path
 
 
@@ -1074,11 +1318,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     snapshots = discover_core_snapshots(root)
     selectors = read_selectors(args)
     catalog, station_key_by_id = build_station_catalog(snapshots)
-    lookup, graph, evidence, metadata_day = build_family_index(
-        snapshots,
-        catalog,
-        station_key_by_id,
-    )
+    metadata_by_station, metadata_day = load_station_initial_metadata(snapshots, station_key_by_id)
+    lookup, graph, evidence, all_links = build_family_index(catalog, metadata_by_station)
 
     generated: list[Path] = []
     for selector in selectors:
@@ -1092,6 +1333,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lookup,
                 graph,
                 evidence,
+                all_links,
+                metadata_by_station,
                 metadata_day,
                 args.from_day,
                 args.to_day,
