@@ -8,6 +8,10 @@ const aggregate = {
   measured_candidate_count: 0,
   source_row_count: 0,
   pg_source_socket_bytes_received: 0,
+  deletion_revalidation_count: 0,
+  measured_deletion_revalidation_count: 0,
+  deletion_revalidation_source_row_count: 0,
+  deletion_revalidation_pg_source_socket_bytes_received: 0,
 };
 
 let aggregateLogged = false;
@@ -201,6 +205,47 @@ function wrapCursorRead(client, cursor) {
   });
 }
 
+export async function measurePhaseBDeletionRevalidationEgress({
+  client,
+  dayUtc,
+  connectorId,
+  query,
+}) {
+  const startBytes = socketBytesRead(client);
+  const result = await query();
+
+  try {
+    const endBytes = socketBytesRead(client);
+    const measured = startBytes !== null
+      && endBytes !== null
+      && endBytes >= startBytes;
+    const receivedBytes = measured ? endBytes - startBytes : null;
+    const sourceRowCount = Array.isArray(result?.rows) ? result.rows.length : 0;
+
+    aggregate.deletion_revalidation_count += 1;
+    aggregate.deletion_revalidation_source_row_count += sourceRowCount;
+    if (measured) {
+      aggregate.measured_deletion_revalidation_count += 1;
+      aggregate.deletion_revalidation_pg_source_socket_bytes_received += receivedBytes;
+    }
+
+    emitInfo("phase_b_history_pg_deletion_revalidation_egress_diagnostic", {
+      day_utc: dayUtcFromValue(dayUtc),
+      connector_id: positiveIntegerOrNull(connectorId),
+      source_row_count: sourceRowCount,
+      pg_source_socket_bytes_received: receivedBytes,
+      pg_source_socket_counter_available: measured,
+      measurement: MEASUREMENT,
+      diagnostic_scope: "phase_b_deletion_source_identity_revalidation",
+      exact_supabase_billing_meter: false,
+    });
+  } catch (_diagnosticError) {
+    // Diagnostics must never affect source-identity revalidation or deletion behaviour.
+  }
+
+  return result;
+}
+
 if (!Client.prototype[PATCH_MARKER]) {
   const originalQuery = Client.prototype.query;
   Client.prototype.query = function patchedQuery(config, ...args) {
@@ -223,10 +268,25 @@ if (!Client.prototype[PATCH_MARKER]) {
 }
 
 process.once("beforeExit", () => {
-  if (aggregateLogged || aggregate.candidate_count === 0) {
+  if (
+    aggregateLogged
+    || (aggregate.candidate_count === 0 && aggregate.deletion_revalidation_count === 0)
+  ) {
     return;
   }
   aggregateLogged = true;
+
+  const allArchiveMeasurementsAvailable =
+    aggregate.candidate_count === aggregate.measured_candidate_count;
+  const allDeletionMeasurementsAvailable =
+    aggregate.deletion_revalidation_count === aggregate.measured_deletion_revalidation_count;
+  const combinedMeasurementComplete =
+    allArchiveMeasurementsAvailable && allDeletionMeasurementsAvailable;
+  const combinedBytes = combinedMeasurementComplete
+    ? aggregate.pg_source_socket_bytes_received
+      + aggregate.deletion_revalidation_pg_source_socket_bytes_received
+    : null;
+
   emitInfo("phase_b_history_pg_source_egress_run_summary", {
     measurement: MEASUREMENT,
     candidate_count: aggregate.candidate_count,
@@ -235,6 +295,15 @@ process.once("beforeExit", () => {
     pg_source_socket_bytes_received: aggregate.measured_candidate_count > 0
       ? aggregate.pg_source_socket_bytes_received
       : null,
+    deletion_revalidation_count: aggregate.deletion_revalidation_count,
+    measured_deletion_revalidation_count: aggregate.measured_deletion_revalidation_count,
+    deletion_revalidation_source_row_count: aggregate.deletion_revalidation_source_row_count,
+    deletion_revalidation_pg_source_socket_bytes_received:
+      aggregate.measured_deletion_revalidation_count > 0
+        ? aggregate.deletion_revalidation_pg_source_socket_bytes_received
+        : null,
+    combined_pg_source_socket_bytes_received: combinedBytes,
+    combined_pg_source_socket_counter_complete: combinedMeasurementComplete,
     exact_supabase_billing_meter: false,
   });
 });
