@@ -2,6 +2,7 @@ import { Client } from "pg";
 
 const MEASUREMENT = "node_pg_connection_stream_bytes_read_delta";
 const PATCH_MARKER = Symbol.for("uk_aq.phase_b_pg_source_egress_diagnostic");
+const DELETION_APPLICATION_NAME = "uk-aq-prune-source-identity-delete";
 
 const aggregate = {
   candidate_count: 0,
@@ -72,6 +73,32 @@ function looksLikeCurrentPhaseBSourceQuery(cursor) {
     && !/\bstation_id\b/i.test(text)
     && !/\bpollutant_code\b/i.test(text);
   return (canonicalSourceQuery || compactSourceQuery) && /\bstatus\b/i.test(text);
+}
+
+function queryText(config) {
+  if (typeof config === "string") {
+    return config;
+  }
+  if (config && typeof config.text === "string") {
+    return config.text;
+  }
+  return "";
+}
+
+function queryValues(config, args) {
+  if (config && typeof config === "object" && Array.isArray(config.values)) {
+    return config.values;
+  }
+  return Array.isArray(args?.[0]) ? args[0] : [];
+}
+
+function looksLikeDeletionRevalidationQuery(client, config) {
+  const applicationName = String(client?.connectionParameters?.application_name || "").trim();
+  if (applicationName !== DELETION_APPLICATION_NAME) {
+    return false;
+  }
+  const text = queryText(config);
+  return /^\s*select\s+connector_id\s*,\s*station_id\s*,\s*timeseries_id\s*,\s*pollutant_code\s*,\s*observed_at_utc\s*,\s*value\s*,\s*status\s+from\s+uk_aq_ops\.uk_aq_phase_b_history_rows_v2\s*\(/is.test(text);
 }
 
 function classifyFromCursor(state, cursor) {
@@ -205,58 +232,71 @@ function wrapCursorRead(client, cursor) {
   });
 }
 
-export async function measurePhaseBDeletionRevalidationEgress({
-  client,
-  dayUtc,
-  connectorId,
-  query,
-}) {
-  const startBytes = socketBytesRead(client);
-  const result = await query();
+function finishDeletionRevalidationMeasurement(state, client, result) {
+  const endBytes = socketBytesRead(client);
+  const measured = state.start_bytes !== null
+    && endBytes !== null
+    && endBytes >= state.start_bytes;
+  const receivedBytes = measured ? endBytes - state.start_bytes : null;
+  const sourceRowCount = Array.isArray(result?.rows) ? result.rows.length : 0;
 
-  try {
-    const endBytes = socketBytesRead(client);
-    const measured = startBytes !== null
-      && endBytes !== null
-      && endBytes >= startBytes;
-    const receivedBytes = measured ? endBytes - startBytes : null;
-    const sourceRowCount = Array.isArray(result?.rows) ? result.rows.length : 0;
-
-    aggregate.deletion_revalidation_count += 1;
-    aggregate.deletion_revalidation_source_row_count += sourceRowCount;
-    if (measured) {
-      aggregate.measured_deletion_revalidation_count += 1;
-      aggregate.deletion_revalidation_pg_source_socket_bytes_received += receivedBytes;
-    }
-
-    emitInfo("phase_b_history_pg_deletion_revalidation_egress_diagnostic", {
-      day_utc: dayUtcFromValue(dayUtc),
-      connector_id: positiveIntegerOrNull(connectorId),
-      source_row_count: sourceRowCount,
-      pg_source_socket_bytes_received: receivedBytes,
-      pg_source_socket_counter_available: measured,
-      measurement: MEASUREMENT,
-      diagnostic_scope: "phase_b_deletion_source_identity_revalidation",
-      exact_supabase_billing_meter: false,
-    });
-  } catch (_diagnosticError) {
-    // Diagnostics must never affect source-identity revalidation or deletion behaviour.
+  aggregate.deletion_revalidation_count += 1;
+  aggregate.deletion_revalidation_source_row_count += sourceRowCount;
+  if (measured) {
+    aggregate.measured_deletion_revalidation_count += 1;
+    aggregate.deletion_revalidation_pg_source_socket_bytes_received += receivedBytes;
   }
 
-  return result;
+  emitInfo("phase_b_history_pg_deletion_revalidation_egress_diagnostic", {
+    day_utc: state.day_utc,
+    connector_id: state.connector_id,
+    source_row_count: sourceRowCount,
+    pg_source_socket_bytes_received: receivedBytes,
+    pg_source_socket_counter_available: measured,
+    measurement: MEASUREMENT,
+    diagnostic_scope: "phase_b_deletion_source_identity_revalidation",
+    exact_supabase_billing_meter: false,
+  });
 }
 
 if (!Client.prototype[PATCH_MARKER]) {
   const originalQuery = Client.prototype.query;
   Client.prototype.query = function patchedQuery(config, ...args) {
+    let deletionRevalidationState = null;
     try {
+      if (looksLikeDeletionRevalidationQuery(this, config)) {
+        const values = queryValues(config, args);
+        deletionRevalidationState = {
+          start_bytes: socketBytesRead(this),
+          connector_id: positiveIntegerOrNull(values[0]),
+          day_utc: dayUtcFromValue(values[1]),
+        };
+      }
       if (config && typeof config.read === "function" && typeof config.close === "function") {
         wrapCursorRead(this, config);
       }
     } catch (_diagnosticError) {
+      deletionRevalidationState = null;
       // Diagnostics must never affect PostgreSQL query behaviour.
     }
-    return originalQuery.call(this, config, ...args);
+
+    const result = originalQuery.call(this, config, ...args);
+    if (!deletionRevalidationState || !result || typeof result.then !== "function") {
+      return result;
+    }
+    return result.then(
+      (value) => {
+        try {
+          finishDeletionRevalidationMeasurement(deletionRevalidationState, this, value);
+        } catch (_diagnosticError) {
+          // Diagnostics must never affect source-identity revalidation or deletion behaviour.
+        }
+        return value;
+      },
+      (error) => {
+        throw error;
+      },
+    );
   };
 
   Object.defineProperty(Client.prototype, PATCH_MARKER, {
