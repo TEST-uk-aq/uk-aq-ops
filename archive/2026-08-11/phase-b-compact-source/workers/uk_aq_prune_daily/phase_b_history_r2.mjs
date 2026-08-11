@@ -3174,69 +3174,6 @@ function normalizeFrozenObservationRow(row) {
   };
 }
 
-function requirePositiveSafeInteger(value, fieldName) {
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new Error(`Phase B compact source metadata has invalid ${fieldName}: ${String(value ?? "")}`);
-  }
-  return parsed;
-}
-
-function buildPhaseBCompactSourceMetadataMap(metadataRows, connectorId) {
-  const expectedConnectorId = requirePositiveSafeInteger(connectorId, "connector_id");
-  const metadataByTimeseriesId = new Map();
-  for (const metadataRow of metadataRows) {
-    const timeseriesId = requirePositiveSafeInteger(metadataRow?.timeseries_id, "timeseries_id");
-    if (metadataByTimeseriesId.has(timeseriesId)) {
-      throw new Error(`Phase B compact source metadata mapping is ambiguous for timeseries_id=${timeseriesId}`);
-    }
-    const mappedConnectorId = requirePositiveSafeInteger(
-      metadataRow?.connector_id,
-      `connector_id for timeseries_id=${timeseriesId}`,
-    );
-    if (mappedConnectorId !== expectedConnectorId) {
-      throw new Error(`Phase B compact source metadata connector mismatch for timeseries_id=${timeseriesId}: expected=${expectedConnectorId} actual=${mappedConnectorId}`);
-    }
-    const stationId = requirePositiveSafeInteger(
-      metadataRow?.station_id,
-      `station_id for timeseries_id=${timeseriesId}`,
-    );
-    const pollutantCode = normalizePollutantCodeForPath(metadataRow?.pollutant_code);
-    metadataByTimeseriesId.set(timeseriesId, {
-      connector_id: expectedConnectorId,
-      station_id: stationId,
-      pollutant_code: pollutantCode,
-    });
-  }
-  return metadataByTimeseriesId;
-}
-
-function expandPhaseBCompactSourceRow(rawRow, connectorId, metadataByTimeseriesId) {
-  const timeseriesId = requirePositiveSafeInteger(rawRow?.timeseries_id, "timeseries_id");
-  const metadata = metadataByTimeseriesId.get(timeseriesId);
-  if (!metadata) {
-    throw new Error(`Phase B compact source metadata mapping is missing for timeseries_id=${timeseriesId}`);
-  }
-  return normalizeFrozenObservationRow({
-    connector_id: connectorId,
-    station_id: metadata.station_id,
-    timeseries_id: timeseriesId,
-    pollutant_code: metadata.pollutant_code,
-    observed_at_utc: rawRow?.observed_at_utc,
-    value: rawRow?.value,
-    status: rawRow?.status ?? null,
-  });
-}
-
-export function expandPhaseBCompactSourceRowsForTest({ connectorId, metadataRows, compactRows }) {
-  const metadataByTimeseriesId = buildPhaseBCompactSourceMetadataMap(metadataRows, connectorId);
-  return compactRows.map((row) => expandPhaseBCompactSourceRow(
-    row,
-    connectorId,
-    metadataByTimeseriesId,
-  ));
-}
-
 function isObservationRowInDay(row, dayUtc) {
   const observedMs = Date.parse(String(row?.observed_at_utc || row?.observed_at || ""));
   const startMs = Date.parse(`${dayUtc}T00:00:00.000Z`);
@@ -3253,7 +3190,7 @@ async function* readFrozenSourceRows(ndjsonPath) {
   }
 }
 
-async function acquireFrozenCompactSource({ streamClient, candidate, runtime }) {
+async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, runtime }) {
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
   const dayStart = `${dayUtc}T00:00:00.000Z`;
@@ -3268,135 +3205,12 @@ async function acquireFrozenCompactSource({ streamClient, candidate, runtime }) 
     target_day_supported_aqi_source_row_count: 0,
     supported_pollutant_counts: {},
   };
-  const frozenSourceIdentityRows = [];
-  let cursor = null;
-  let outputEnded = false;
-  let transactionStarted = false;
-
-  const metadataSql = `
-select
-  timeseries_id,
-  connector_id,
-  station_id,
-  pollutant_code
-from uk_aq_ops.uk_aq_phase_b_history_timeseries_metadata_v1(
-  $1::integer,
-  $2::timestamptz,
-  $3::timestamptz
-)
-`;
-  const compactSql = `
-select
-  timeseries_id,
-  observed_at_utc,
-  value,
-  status
-from uk_aq_ops.uk_aq_phase_b_history_compact_rows_v1(
-  $1::integer,
-  $2::timestamptz,
-  $3::timestamptz
-)
-`;
-
-  try {
-    assertBudget(runtime, "frozen_source_snapshot", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-    }, PHASE_B_STAGE_MIN_MS.observation_segment);
-    await streamClient.query("begin isolation level repeatable read");
-    transactionStarted = true;
-    const metadataResult = await streamClient.query(metadataSql, [connectorId, dayStart, dayEnd]);
-    const metadataByTimeseriesId = buildPhaseBCompactSourceMetadataMap(
-      metadataResult.rows,
-      connectorId,
-    );
-    cursor = streamClient.query(new Cursor(compactSql, [connectorId, dayStart, dayEnd]));
-    for (;;) {
-      assertBudget(runtime, "frozen_source_fetch", { day_utc: dayUtc, connector_id: connectorId }, PHASE_B_STAGE_MIN_MS.observation_segment);
-      const rows = await cursorRead(cursor, runtime.cursor_fetch_rows);
-      if (!rows.length) break;
-      for (const raw of rows) {
-        const row = expandPhaseBCompactSourceRow(
-          raw,
-          connectorId,
-          metadataByTimeseriesId,
-        );
-        if (!isObservationRowInDay(row, dayUtc)) {
-          throw new Error(`Phase B target-day source returned an out-of-range row for day=${dayUtc} connector=${connectorId}`);
-        }
-        const encoded = `${JSON.stringify(row)}\n`;
-        counts.frozen_source_row_count += 1;
-        counts.frozen_source_bytes += Buffer.byteLength(encoded);
-        if (counts.frozen_source_row_count > runtime.phase_b_observation_snapshot_max_rows) {
-          throw new Error(`Phase B frozen source row cap exceeded for day=${dayUtc} connector=${connectorId}: max=${runtime.phase_b_observation_snapshot_max_rows}`);
-        }
-        if (counts.frozen_source_bytes > runtime.phase_b_observation_snapshot_max_bytes) {
-          throw new Error(`Phase B frozen source byte cap exceeded for day=${dayUtc} connector=${connectorId}: max=${runtime.phase_b_observation_snapshot_max_bytes}`);
-        }
-        if (!output.write(encoded)) await new Promise((resolve) => output.once("drain", resolve));
-        if (AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)) {
-          counts.supported_aqi_source_row_count += 1;
-          counts.supported_pollutant_counts[row.pollutant_code] = (counts.supported_pollutant_counts[row.pollutant_code] || 0) + 1;
-          counts.target_day_supported_aqi_source_row_count += 1;
-        }
-        counts.day_observation_row_count += 1;
-        frozenSourceIdentityRows.push(row);
-      }
-    }
-    await closeCursor(cursor);
-    cursor = null;
-    await new Promise((resolve, reject) => output.end((err) => err ? reject(err) : resolve()));
-    outputEnded = true;
-    const acquiredRows = BigInt(counts.frozen_source_row_count);
-    if (acquiredRows !== candidate.expected_row_count) {
-      throw new Error(`Row count mismatch for day=${dayUtc} connector=${connectorId}: expected=${candidate.expected_row_count.toString()} observed=${acquiredRows.toString()}`);
-    }
-    const sourceIdentity = computePruneConnectorSourceIdentity(frozenSourceIdentityRows);
-    if (BigInt(sourceIdentity.source_content_hash_row_count) !== acquiredRows) {
-      throw new Error(`Source identity row count mismatch for day=${dayUtc} connector=${connectorId}`);
-    }
-    await streamClient.query("commit");
-    transactionStarted = false;
-    return {
-      temp,
-      counts,
-      sourceIdentity,
-    };
-  } catch (error) {
-    if (cursor) {
-      try {
-        await closeCursor(cursor);
-      } catch (_cursorCloseError) {
-        // Preserve the source-acquisition error.
-      }
-    }
-    if (!outputEnded) {
-      try {
-        await new Promise((resolve) => output.end(resolve));
-      } catch (_outputCloseError) {
-        // Preserve the source-acquisition error.
-      }
-    }
-    if (transactionStarted) {
-      try {
-        await streamClient.query("rollback");
-      } catch (_rollbackError) {
-        // Preserve the source-acquisition error.
-      }
-    }
-    cleanupPhaseBTargetDaySourceTemp(temp);
-    throw error;
-  }
-}
-
-async function writeFrozenSourceObservations({ streamClient, candidate, runtime, frozenSource }) {
-  const dayUtc = candidate.day_utc;
-  const connectorId = candidate.connector_id;
   let committedParts = [];
   let observedRows = 0n;
   let totalBytes = 0n;
   let partIndex = 0;
   let pendingDayRows = [];
+  const frozenSourceIdentityRows = [];
   const canonicalRowsByPollutant = new Map();
 
   const flushObservationRows = async () => {
@@ -3420,46 +3234,76 @@ async function writeFrozenSourceObservations({ streamClient, candidate, runtime,
     pendingDayRows = [];
   };
 
-  for await (const raw of readFrozenSourceRows(frozenSource.temp.ndjsonPath)) {
-    assertBudget(runtime, "frozen_source_replay", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-    }, PHASE_B_STAGE_MIN_MS.observation_segment);
-    const row = normalizeFrozenObservationRow(raw);
-    if (!isObservationRowInDay(row, dayUtc) || row.connector_id !== connectorId) {
-      throw new Error(`Phase B frozen source identity mismatch for day=${dayUtc} connector=${connectorId}`);
+  const sql = `
+select
+  connector_id,
+  station_id,
+  timeseries_id,
+  pollutant_code,
+  observed_at_utc,
+  value,
+  status
+from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
+  $1::integer,
+  $2::timestamptz,
+  $3::timestamptz,
+  null::integer,
+  null::timestamptz
+)
+`;
+  const cursor = streamClient.query(new Cursor(sql, [connectorId, dayStart, dayEnd]));
+  try {
+    for (;;) {
+      assertBudget(runtime, "frozen_source_fetch", { day_utc: dayUtc, connector_id: connectorId }, PHASE_B_STAGE_MIN_MS.observation_segment);
+      const rows = await cursorRead(cursor, runtime.cursor_fetch_rows);
+      if (!rows.length) break;
+      for (const raw of rows) {
+        const row = normalizeFrozenObservationRow(raw);
+        if (!isObservationRowInDay(row, dayUtc)) {
+          throw new Error(`Phase B target-day source returned an out-of-range row for day=${dayUtc} connector=${connectorId}`);
+        }
+        const encoded = `${JSON.stringify(row)}\n`;
+        counts.frozen_source_row_count += 1;
+        counts.frozen_source_bytes += Buffer.byteLength(encoded);
+        if (counts.frozen_source_row_count > runtime.phase_b_observation_snapshot_max_rows) {
+          throw new Error(`Phase B frozen source row cap exceeded for day=${dayUtc} connector=${connectorId}: max=${runtime.phase_b_observation_snapshot_max_rows}`);
+        }
+        if (counts.frozen_source_bytes > runtime.phase_b_observation_snapshot_max_bytes) {
+          throw new Error(`Phase B frozen source byte cap exceeded for day=${dayUtc} connector=${connectorId}: max=${runtime.phase_b_observation_snapshot_max_bytes}`);
+        }
+        if (!output.write(encoded)) await new Promise((resolve) => output.once("drain", resolve));
+        if (AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)) {
+          counts.supported_aqi_source_row_count += 1;
+          counts.supported_pollutant_counts[row.pollutant_code] = (counts.supported_pollutant_counts[row.pollutant_code] || 0) + 1;
+          counts.target_day_supported_aqi_source_row_count += 1;
+        }
+        counts.day_observation_row_count += 1;
+        frozenSourceIdentityRows.push(row);
+        pendingDayRows.push(row);
+        if (pendingDayRows.length >= runtime.observations_part_max_rows) await flushObservationRows();
+      }
     }
-    pendingDayRows.push(row);
-    if (pendingDayRows.length >= runtime.observations_part_max_rows) {
-      await flushObservationRows();
-    }
+    await flushObservationRows();
+  } finally {
+    await closeCursor(cursor);
+    await new Promise((resolve, reject) => output.end((err) => err ? reject(err) : resolve()));
   }
-  await flushObservationRows();
   if (observedRows !== candidate.expected_row_count) {
-    throw new Error(`Frozen source replay row count mismatch for day=${dayUtc} connector=${connectorId}: expected=${candidate.expected_row_count.toString()} observed=${observedRows.toString()}`);
+    throw new Error(`Row count mismatch for day=${dayUtc} connector=${connectorId}: expected=${candidate.expected_row_count.toString()} observed=${observedRows.toString()}`);
+  }
+  const sourceIdentity = computePruneConnectorSourceIdentity(frozenSourceIdentityRows);
+  if (BigInt(sourceIdentity.source_content_hash_row_count) !== observedRows) {
+    throw new Error(`Source identity row count mismatch for day=${dayUtc} connector=${connectorId}`);
   }
   return {
-    ...frozenSource,
+    temp,
+    counts,
     committedParts,
     observedRows,
     totalBytes,
     canonicalRowsByPollutant,
+    sourceIdentity,
   };
-}
-
-async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, runtime }) {
-  const frozenSource = await acquireFrozenCompactSource({ streamClient, candidate, runtime });
-  try {
-    return await writeFrozenSourceObservations({
-      streamClient,
-      candidate,
-      runtime,
-      frozenSource,
-    });
-  } catch (error) {
-    cleanupPhaseBTargetDaySourceTemp(frozenSource.temp);
-    throw error;
-  }
 }
 
 async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, frozenSourcePath }) {

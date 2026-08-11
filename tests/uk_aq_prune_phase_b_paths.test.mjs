@@ -12,6 +12,7 @@ import {
   buildHistoryV2PollutantManifestKey,
   buildPruneComparisonRowsQueryForTest,
   completeObservationDayFinalizationForTest,
+  expandPhaseBCompactSourceRowsForTest,
   populateBackupCandidatesForTest,
   resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
@@ -80,6 +81,71 @@ test("Phase B frozen AQI summary keeps D-1 context distinct from target-day supp
   assert.deepEqual(summary.day_aqi_rows, []);
   assert.equal(Object.hasOwn(summary.rows[0], "observed_at"), true);
   assert.equal(summary.rows[0].observed_at, summary.rows[0].observed_at_utc);
+});
+
+test("Phase B compact transport expands to the canonical frozen source and fails closed", () => {
+  const connectorId = 7;
+  const metadataRows = [{
+    timeseries_id: 1001,
+    connector_id: connectorId,
+    station_id: 501,
+    pollutant_code: "NO2",
+  }];
+  const compactRows = [{
+    timeseries_id: 1001,
+    observed_at_utc: `${DAY}T12:34:56.000Z`,
+    value: 18.25,
+    status: "P",
+  }];
+
+  const expandedRows = expandPhaseBCompactSourceRowsForTest({
+    connectorId,
+    metadataRows,
+    compactRows,
+  });
+  const canonicalSourceRows = [{
+    connector_id: connectorId,
+    station_id: 501,
+    timeseries_id: 1001,
+    pollutant_code: "no2",
+    observed_at: `${DAY}T12:34:56.000Z`,
+    observed_at_utc: `${DAY}T12:34:56.000Z`,
+    value: 18.25,
+    status: "P",
+  }];
+  assert.deepEqual(expandedRows, canonicalSourceRows);
+  assert.deepEqual(
+    computePruneConnectorSourceIdentity(expandedRows),
+    computePruneConnectorSourceIdentity(canonicalSourceRows),
+  );
+
+  assert.throws(
+    () => expandPhaseBCompactSourceRowsForTest({
+      connectorId,
+      metadataRows: [],
+      compactRows,
+    }),
+    /metadata mapping is missing/,
+  );
+  assert.throws(
+    () => expandPhaseBCompactSourceRowsForTest({
+      connectorId,
+      metadataRows: [
+        metadataRows[0],
+        { ...metadataRows[0], station_id: 502 },
+      ],
+      compactRows,
+    }),
+    /metadata mapping is ambiguous/,
+  );
+  assert.throws(
+    () => expandPhaseBCompactSourceRowsForTest({
+      connectorId,
+      metadataRows: [{ ...metadataRows[0], connector_id: 8 }],
+      compactRows,
+    }),
+    /metadata connector mismatch/,
+  );
 });
 
 test("Phase B data/debug AQI connector validation compares identity sets and canonical profiles", () => {

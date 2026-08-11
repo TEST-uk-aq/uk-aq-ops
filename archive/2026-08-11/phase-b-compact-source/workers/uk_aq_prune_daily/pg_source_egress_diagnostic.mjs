@@ -61,13 +61,10 @@ function looksLikeCurrentPhaseBSourceRow(row) {
 
 function looksLikeCurrentPhaseBSourceQuery(cursor) {
   const text = typeof cursor?.text === "string" ? cursor.text : "";
-  const canonicalSourceQuery = /from\s+uk_aq_ops\.uk_aq_phase_b_history_rows_v2\s*\(/i.test(text)
+  return /from\s+uk_aq_ops\.uk_aq_phase_b_history_rows_v2\s*\(/i.test(text)
     && /\bstation_id\b/i.test(text)
-    && /\bpollutant_code\b/i.test(text);
-  const compactSourceQuery = /from\s+uk_aq_ops\.uk_aq_phase_b_history_compact_rows_v1\s*\(/i.test(text)
-    && !/\bstation_id\b/i.test(text)
-    && !/\bpollutant_code\b/i.test(text);
-  return (canonicalSourceQuery || compactSourceQuery) && /\bstatus\b/i.test(text);
+    && /\bpollutant_code\b/i.test(text)
+    && /\bstatus\b/i.test(text);
 }
 
 function classifyFromCursor(state, cursor) {
