@@ -283,7 +283,8 @@ node scripts/backup_r2/download_day.mjs --day 2026-02-20 --out ./tmp/backup_down
 node scripts/backup_r2/download_day.mjs --day 2026-02-20 --connector 4 --out ./tmp/backup_download
 ```
 
-Run manifest-aware incremental R2 History -> Dropbox backup:
+Run the hierarchical R2 v2 History -> Dropbox sync against an existing current
+inventory:
 
 ```bash
 node scripts/backup_r2/sync_history_to_dropbox.mjs \
@@ -292,13 +293,13 @@ node scripts/backup_r2/sync_history_to_dropbox.mjs \
 ```
 
 Notes:
-- Dropbox layout mirrors R2 History layout exactly:
-  - `history/v1/observations/day_utc=YYYY-MM-DD/...`
-  - `history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/...`
-- No `YYYY/YYYY-MM` reshaping is applied.
-- Already-checkpointed days are re-copied if the source day `manifest.json` hash changes.
-- Checkpoint file default:
-  - `_ops/checkpoints/r2_history_backup_state_v1.json`
+- The current inventory root is `history/_index_v2/backup_inventory_v2/root.json`.
+- The current Dropbox checkpoint root is
+  `_ops/checkpoints/r2_history_backup_state_v2/root.json`.
+- In-scope data includes v2 observations, observation run manifests,
+  timeseries bindings, `observations_timeseries_latest.json`, and core.
+- AQI history and the derived `history/_index_v2/observations_timeseries/`
+  tree are not mirrored to Dropbox.
 
 ## Env + GitHub sync
 

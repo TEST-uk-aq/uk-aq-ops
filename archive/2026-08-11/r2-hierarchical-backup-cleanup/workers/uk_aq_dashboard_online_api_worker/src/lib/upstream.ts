@@ -34,7 +34,7 @@ export type WorkerEnv = {
   DROPBOX_REFRESH_TOKEN?: string;
   UK_AQ_DROPBOX_ROOT?: string;
   UK_AQ_R2_HISTORY_DROPBOX_DIR?: string;
-  UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX?: string;
+  UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH?: string;
   CLEANAIRSURB_ST_ID?: string;
 };
 

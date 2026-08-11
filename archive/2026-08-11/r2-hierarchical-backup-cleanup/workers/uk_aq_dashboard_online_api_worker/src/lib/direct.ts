@@ -70,12 +70,6 @@ type DropboxStatePathResolution = {
   readVersion: R2HistoryReadVersionResolution;
 };
 
-type DropboxMonthStateReference = {
-  year: string;
-  month: string;
-  stateKey: string;
-};
-
 const BUCKETS = ["0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days"] as const;
 const POLLUTANTS: Record<string, { label: string; tokens: string[] }> = {
   pm25: { label: "PM2.5", tokens: ["pm25", "pm2.5", "pm2-5", "pm2_5"] },
@@ -136,12 +130,10 @@ const DEPRECATED_R2_HISTORY_VERSION_ENVS = [
   "UK_AQ_R2_HISTORY_WRITE_VERSION",
   "UK_AQ_R2_HISTORY_BACKUP_VERSION",
 ];
-const DEFAULT_HIERARCHICAL_STATE_PREFIX =
-  "_ops/checkpoints/r2_history_backup_state_v2";
-const HIERARCHICAL_STATE_ROOT_KIND =
-  "uk_aq_r2_history_backup_state_v2_root";
-const HIERARCHICAL_MONTH_STATE_KIND =
-  "uk_aq_r2_history_backup_state_observations_month";
+const R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS = {
+  v1: "_ops/checkpoints/r2_history_backup_state_v1.json",
+  v2: "_ops/checkpoints/r2_history_backup_state_v2.json",
+} as const;
 
 const R2_OPS_GQL_QUERY = `
 query R2OpsMonth($accountTag: string!, $startDate: Time!, $endDate: Time!) {
@@ -1193,6 +1185,11 @@ function joinDropboxStatePath(env: WorkerEnv, stateRel: string): string {
   return `/${parts.join("/")}`;
 }
 
+function looksLikeV1DropboxStatePath(stateRel: string): boolean {
+  const normalized = stateRel.trim().toLowerCase();
+  return /(^|[/_-])v1([/_-]|\.json$)/.test(normalized) || normalized.includes("history/v1/");
+}
+
 function resolveDropboxStatePath(env: WorkerEnv): DropboxStatePathResolution {
   const readVersion = resolveR2HistoryReadVersion(env);
   if (!readVersion.valid || !readVersion.version) {
@@ -1206,44 +1203,23 @@ function resolveDropboxStatePath(env: WorkerEnv): DropboxStatePathResolution {
       readVersion,
     };
   }
-  if (readVersion.version !== "v2") {
-    const warning =
-      "Dropbox backup coverage is available only from the hierarchical v2 checkpoint.";
-    return {
-      path: "",
-      attemptedPaths: [],
-      source: "disabled_non_v2",
-      cacheKey: `dropbox:${r2HistoryReadVersionCacheKey(env)}:disabled_non_v2`,
-      warning,
-      fallbackAttempted: false,
-      readVersion,
-    };
+  const configuredRel = String(env.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || "").trim().replace(/^\/+|\/+$/g, "");
+  let stateRel = configuredRel || R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS[readVersion.version];
+  let source = configuredRel ? "env:UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH" : `default:${readVersion.version}`;
+  let warning: string | null = null;
+  if (readVersion.version === "v2" && configuredRel && looksLikeV1DropboxStatePath(configuredRel)) {
+    stateRel = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS.v2;
+    source = "default:v2_ignored_v1_env_override";
+    warning = "Ignored UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH because active R2 history read version is v2 and the configured Dropbox checkpoint path points at v1.";
   }
-  const statePrefix = String(
-    env.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
-      || DEFAULT_HIERARCHICAL_STATE_PREFIX,
-  ).trim().replace(/^\/+|\/+$/g, "");
-  if (!statePrefix) {
-    const warning = "Hierarchical Dropbox state prefix is empty.";
-    return {
-      path: "",
-      attemptedPaths: [],
-      source: "hierarchical_v2",
-      cacheKey: `dropbox:${r2HistoryReadVersionCacheKey(env)}:empty`,
-      warning,
-      fallbackAttempted: false,
-      readVersion,
-    };
-  }
-  const stateRel = `${statePrefix}/root.json`;
   const path = joinDropboxStatePath(env, stateRel);
   const attemptedPaths = path ? [`dropbox:${path}`] : [];
   return {
     path,
     attemptedPaths,
-    source: "hierarchical_v2",
+    source,
     cacheKey: `dropbox:${r2HistoryReadVersionCacheKey(env)}:${path || "none"}`,
-    warning: null,
+    warning,
     fallbackAttempted: false,
     readVersion,
   };
@@ -1302,7 +1278,7 @@ async function fetchDropboxAccessToken(env: WorkerEnv): Promise<{ token: string 
 }
 
 async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
-  days: R2DaySets;
+  state: JsonObject | null;
   path: string | null;
   error: string | null;
   source: string;
@@ -1313,13 +1289,9 @@ async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
 }> {
   const resolvedPath = resolveDropboxStatePath(env);
   const remotePath = resolvedPath.path;
-  const emptyDays = (): R2DaySets => ({
-    observations: new Set<string>(),
-    aqilevels: new Set<string>(),
-  });
   if (!remotePath) {
     return {
-      days: emptyDays(),
+      state: null,
       path: null,
       error: null,
       source: resolvedPath.source,
@@ -1332,7 +1304,7 @@ async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
   const { token, error: tokenError } = await fetchDropboxAccessToken(env);
   if (tokenError) {
     return {
-      days: emptyDays(),
+      state: null,
       path: `dropbox:${remotePath}`,
       error: tokenError,
       source: resolvedPath.source,
@@ -1344,7 +1316,7 @@ async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
   }
   if (!token) {
     return {
-      days: emptyDays(),
+      state: null,
       path: null,
       error: null,
       source: resolvedPath.source,
@@ -1354,31 +1326,44 @@ async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
       fallbackAttempted: resolvedPath.fallbackAttempted,
     };
   }
+  const headers = new Headers();
+  headers.set("Authorization", `Bearer ${token}`);
+  headers.set("Dropbox-API-Arg", JSON.stringify({ path: remotePath }));
   try {
-    const root = await fetchDropboxJson(token, remotePath);
-    const references = parseHierarchicalStateMonthReferences(root);
-    const days = emptyDays();
-    const shardErrors: string[] = [];
-    await mapWithConcurrency(references, 6, async (reference) => {
-      try {
-        const shardPath = joinDropboxStatePath(env, reference.stateKey);
-        const shard = await fetchDropboxJson(token, shardPath);
-        const shardDays = parseHierarchicalMonthStateDays(
-          shard,
-          reference.year,
-          reference.month,
-        );
-        for (const day of shardDays) days.observations.add(day);
-      } catch (error) {
-        shardErrors.push(
-          `${reference.stateKey}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+    const response = await fetch(DROPBOX_DOWNLOAD_URL, {
+      method: "POST",
+      headers,
     });
+    const text = await response.text();
+    if (!response.ok) {
+      return {
+        state: null,
+        path: `dropbox:${remotePath}`,
+        error: `Dropbox checkpoint download failed (${response.status}): ${text}`,
+        source: resolvedPath.source,
+        attemptedPaths: resolvedPath.attemptedPaths,
+        cacheKey: resolvedPath.cacheKey,
+        warning: resolvedPath.warning,
+        fallbackAttempted: resolvedPath.fallbackAttempted,
+      };
+    }
+    const parsed = text ? JSON.parse(text) : null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {
+        state: null,
+        path: `dropbox:${remotePath}`,
+        error: "Dropbox checkpoint payload is not a JSON object.",
+        source: resolvedPath.source,
+        attemptedPaths: resolvedPath.attemptedPaths,
+        cacheKey: resolvedPath.cacheKey,
+        warning: resolvedPath.warning,
+        fallbackAttempted: resolvedPath.fallbackAttempted,
+      };
+    }
     return {
-      days,
+      state: parsed as JsonObject,
       path: `dropbox:${remotePath}`,
-      error: shardErrors.length ? shardErrors.join("; ") : null,
+      error: null,
       source: resolvedPath.source,
       attemptedPaths: resolvedPath.attemptedPaths,
       cacheKey: resolvedPath.cacheKey,
@@ -1387,7 +1372,7 @@ async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
     };
   } catch (err) {
     return {
-      days: emptyDays(),
+      state: null,
       path: `dropbox:${remotePath}`,
       error: err instanceof Error ? err.message : String(err),
       source: resolvedPath.source,
@@ -1399,143 +1384,32 @@ async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
   }
 }
 
-async function fetchDropboxJson(
-  token: string,
-  remotePath: string,
-): Promise<JsonObject> {
-  const headers = new Headers();
-  headers.set("Authorization", `Bearer ${token}`);
-  headers.set("Dropbox-API-Arg", JSON.stringify({ path: remotePath }));
-  const response = await fetch(DROPBOX_DOWNLOAD_URL, {
-    method: "POST",
-    headers,
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(
-      `Dropbox checkpoint download failed (${response.status}): ${text}`,
-    );
+function parseDropboxBackupDays(state: JsonObject | null): R2DaySets {
+  const sets: R2DaySets = { observations: new Set<string>(), aqilevels: new Set<string>() };
+  if (!state) {
+    return sets;
   }
-  const parsed = text ? JSON.parse(text) : null;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Dropbox checkpoint payload is not a JSON object.");
+  const domains = state.domains;
+  if (!domains || typeof domains !== "object" || Array.isArray(domains)) {
+    return sets;
   }
-  return parsed as JsonObject;
-}
-
-function normalizeHierarchicalStateKey(value: unknown): string {
-  const key = String(value || "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^\/+|\/+$/g, "");
-  if (!key || key === "." || key === ".." || key.startsWith("../") || key.includes("/../")) {
-    throw new Error(`Invalid hierarchical Dropbox state key: ${String(value || "")}`);
-  }
-  return key;
-}
-
-function parseHierarchicalStateMonthReferences(
-  root: JsonObject,
-): DropboxMonthStateReference[] {
-  if (
-    root.kind !== HIERARCHICAL_STATE_ROOT_KIND
-    || root.backup_version !== "v2"
-  ) {
-    throw new Error("Hierarchical Dropbox state root identity mismatch");
-  }
-  const observations = root.observations;
-  if (!observations || typeof observations !== "object" || Array.isArray(observations)) {
-    throw new Error("Hierarchical Dropbox state root has no observations object");
-  }
-  const years = (observations as JsonObject).years;
-  if (!Array.isArray(years)) {
-    throw new Error("Hierarchical Dropbox state root observations.years is not an array");
-  }
-  const references: DropboxMonthStateReference[] = [];
-  for (const rawYear of years) {
-    if (!rawYear || typeof rawYear !== "object" || Array.isArray(rawYear)) continue;
-    const year = String((rawYear as JsonObject).year || "").trim();
-    if (!/^\d{4}$/.test(year)) {
-      throw new Error(`Invalid hierarchical Dropbox state year: ${year}`);
+  for (const domainName of ["observations", "aqilevels"] as const) {
+    const domain = (domains as JsonObject)[domainName];
+    if (!domain || typeof domain !== "object" || Array.isArray(domain)) {
+      continue;
     }
-    const months = (rawYear as JsonObject).months;
-    if (!Array.isArray(months)) continue;
-    for (const rawMonth of months) {
-      if (!rawMonth || typeof rawMonth !== "object" || Array.isArray(rawMonth)) continue;
-      const month = String((rawMonth as JsonObject).month || "").trim().padStart(2, "0");
-      if (!/^(0[1-9]|1[0-2])$/.test(month)) {
-        throw new Error(`Invalid hierarchical Dropbox state month: ${month}`);
+    const dayMap = (domain as JsonObject).days;
+    if (!dayMap || typeof dayMap !== "object" || Array.isArray(dayMap)) {
+      continue;
+    }
+    for (const key of Object.keys(dayMap as JsonObject)) {
+      const normalized = normalizeIsoDay(key);
+      if (normalized) {
+        sets[domainName].add(normalized);
       }
-      references.push({
-        year,
-        month,
-        stateKey: normalizeHierarchicalStateKey(
-          (rawMonth as JsonObject).state_shard_key,
-        ),
-      });
     }
   }
-  references.sort((left, right) =>
-    `${left.year}-${left.month}-${left.stateKey}`.localeCompare(
-      `${right.year}-${right.month}-${right.stateKey}`,
-    )
-  );
-  return references;
-}
-
-function parseHierarchicalMonthStateDays(
-  shard: JsonObject,
-  expectedYear: string,
-  expectedMonth: string,
-): Set<string> {
-  if (
-    shard.kind !== HIERARCHICAL_MONTH_STATE_KIND
-    || shard.backup_version !== "v2"
-    || shard.domain !== "observations"
-  ) {
-    throw new Error("Hierarchical Dropbox month state identity mismatch");
-  }
-  if (String(shard.year || "").trim() !== expectedYear) {
-    throw new Error("Hierarchical Dropbox month state year mismatch");
-  }
-  if (String(shard.month || "").trim().padStart(2, "0") !== expectedMonth) {
-    throw new Error("Hierarchical Dropbox month state month mismatch");
-  }
-  if (!Array.isArray(shard.days)) {
-    throw new Error("Hierarchical Dropbox month state days is not an array");
-  }
-  const days = new Set<string>();
-  for (const rawDay of shard.days) {
-    if (!rawDay || typeof rawDay !== "object" || Array.isArray(rawDay)) {
-      throw new Error("Hierarchical Dropbox month state contains an invalid day entry");
-    }
-    const day = normalizeIsoDay((rawDay as JsonObject).day_utc);
-    if (!day || !day.startsWith(`${expectedYear}-${expectedMonth}-`)) {
-      throw new Error("Hierarchical Dropbox month state contains an invalid day_utc");
-    }
-    days.add(day);
-  }
-  return days;
-}
-
-async function mapWithConcurrency<T>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T) => Promise<void>,
-): Promise<void> {
-  let nextIndex = 0;
-  const runners = Array.from(
-    { length: Math.min(Math.max(1, concurrency), Math.max(1, items.length)) },
-    async () => {
-      while (true) {
-        const index = nextIndex;
-        nextIndex += 1;
-        if (index >= items.length) return;
-        await worker(items[index]);
-      }
-    },
-  );
-  await Promise.all(runners);
+  return sets;
 }
 
 function daySetBounds(days: Set<string>): { earliest: string | null; latest: string | null } {
@@ -2101,8 +1975,9 @@ async function fetchDashboardBaseData(
     dropbox_backup_state_cache_key = dropboxState.cacheKey;
     dropbox_backup_state_warning = dropboxState.warning;
     dropbox_backup_state_fallback_attempted = dropboxState.fallbackAttempted;
+    const rawDropboxDays = parseDropboxBackupDays(dropboxState.state);
     const filteredDropbox = filterDropboxBackupDaysForReadVersion(
-      dropboxState.days,
+      rawDropboxDays,
       r2History.daySets,
       r2_history_read_version,
     );

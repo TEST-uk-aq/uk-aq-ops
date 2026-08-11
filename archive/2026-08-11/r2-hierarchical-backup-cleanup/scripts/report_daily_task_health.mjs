@@ -124,7 +124,7 @@ function buildBackupVersionDetails() {
 
   const inventoryRelPaths = {
     v1: "history/_index/backup_inventory_v1.json",
-    v2: "history/_index_v2/backup_inventory_v2/root.json",
+    v2: "history/_index_v2/backup_inventory_v2.json",
   };
 
   const details = {

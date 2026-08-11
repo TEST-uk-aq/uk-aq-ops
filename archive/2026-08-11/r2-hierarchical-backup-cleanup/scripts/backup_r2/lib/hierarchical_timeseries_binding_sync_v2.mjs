@@ -102,6 +102,51 @@ function stateUnitMap(state) {
   return new Map(state.units.map((entry) => [entry.timeseries_id, entry]));
 }
 
+function legacyBindingUnitMap(legacyState) {
+  const rawUnits = legacyState?.index_tree_units?.timeseries_binding_v2?.units;
+  if (!rawUnits || typeof rawUnits !== "object" || Array.isArray(rawUnits)) {
+    return new Map();
+  }
+  const out = new Map();
+  for (const [unitKey, entry] of Object.entries(rawUnits)) {
+    const candidate = String(entry?.relative_path || unitKey || "");
+    const match = /(?:^|\/)timeseries_id=([1-9]\d*)\.json$/.exec(candidate);
+    const hash = String(entry?.hash || "").trim().toLowerCase();
+    if (!match || !SHA256_PATTERN.test(hash)) continue;
+    out.set(Number(match[1]), {
+      timeseries_id: Number(match[1]),
+      hash,
+      copied_at: String(entry?.copied_at || "").trim() || null,
+    });
+  }
+  return out;
+}
+
+export function migrateLegacyTimeseriesBindingRangeState(
+  inventoryShard,
+  legacyState,
+) {
+  const inventory = validateTimeseriesBindingRangeInventoryShard(inventoryShard);
+  const legacyUnits = legacyBindingUnitMap(legacyState);
+  const state = buildTimeseriesBindingRangeStateSkeleton(
+    inventory.range_start,
+    inventory.range_end,
+  );
+  state.units = inventory.units.flatMap((unit) => {
+    const legacy = legacyUnits.get(unit.timeseries_id);
+    if (legacy?.hash !== unit.hash) return [];
+    return [{
+      timeseries_id: unit.timeseries_id,
+      hash: unit.hash,
+      copied_at: legacy.copied_at,
+    }];
+  });
+  if (timeseriesBindingRangeStateIsComplete(state, inventory)) {
+    state.processed_source_range_hash = inventory.source_range_hash;
+  }
+  return state;
+}
+
 export function planTimeseriesBindingRangeCopies(state, inventoryShard) {
   const inventory = validateTimeseriesBindingRangeInventoryShard(inventoryShard);
   const current = validateTimeseriesBindingRangeState(
@@ -300,6 +345,7 @@ function rootIsComplete(rootState, inventoryReference) {
 export function syncTimeseriesBindingsToDropbox({
   inventoryRoot,
   stateRoot,
+  legacyState,
   stateRootPrefix,
   dryRun,
   checkpointBatchUnits,
@@ -398,9 +444,9 @@ export function syncTimeseriesBindingsToDropbox({
         inventoryShard.range_start,
         inventoryShard.range_end,
       )
-      : buildTimeseriesBindingRangeStateSkeleton(
-        inventoryShard.range_start,
-        inventoryShard.range_end,
+      : migrateLegacyTimeseriesBindingRangeState(
+        inventoryShard,
+        legacyState,
       );
     const trimmed = trimTimeseriesBindingRangeState(
       rangeState,
@@ -481,15 +527,15 @@ export function syncTimeseriesBindingsToDropbox({
 
     const write = flushRangeState({ force: true });
     if (!write && stateResult === null) {
-      const initialWrite = writeStateJson(stateShardKey, rangeState);
+      const migrationWrite = writeStateJson(stateShardKey, rangeState);
       report.checkpoint_flush_count += 1;
-      if (initialWrite.written) report.state_shards_written += 1;
+      if (migrationWrite.written) report.state_shards_written += 1;
       upsertRootRangeSummary(rootState, {
         rangeStart: inventoryShard.range_start,
         rangeEnd: inventoryShard.range_end,
         stateShardKey,
         processedSourceRangeHash: rangeState.processed_source_range_hash,
-        stateShardHash: initialWrite.hash,
+        stateShardHash: migrationWrite.hash,
       });
       stateRootDirty = true;
     } else if (!write && stateResult) {

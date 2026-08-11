@@ -17,8 +17,8 @@ import {
   buildObservationRunManifestStateShard,
   completeObservationMonthState,
   emptyHierarchicalStateRoot,
-  markLatestTimeseriesProcessed,
   markObservationDayCopied,
+  migrateLegacyMonthState,
   monthStateIsComplete,
   observationMonthStateShardKey,
   planObservationMonthCopies,
@@ -31,7 +31,6 @@ import {
   upsertStateMonthSummary,
   validateHierarchicalInventoryRoot,
   validateHierarchicalStateRoot,
-  validateLatestTimeseriesState,
   validateObservationMonthInventoryShard,
   validateObservationMonthState,
   validateObservationRunManifestInventoryShard,
@@ -57,6 +56,10 @@ const DEFAULT_STATE_ROOT_PREFIX = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
   || "_ops/checkpoints/r2_history_backup_state_v2",
 ).trim().replace(/^\/+|\/+$/g, "");
+const DEFAULT_LEGACY_STATE_KEY = String(
+  process.env.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH
+  || "_ops/checkpoints/r2_history_backup_state_v2.json",
+).trim().replace(/^\/+/, "");
 const DEFAULT_REPORT_OUT = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_SYNC_REPORT_OUT || "",
 ).trim();
@@ -121,6 +124,7 @@ function usage() {
     "Options:",
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
     `  --state-root-prefix <p>      Default: ${DEFAULT_STATE_ROOT_PREFIX}`,
+    `  --legacy-state-key <p>       Default: ${DEFAULT_LEGACY_STATE_KEY}`,
     `  --max-days-per-run <N>       Default: ${DEFAULT_MAX_DAYS}; 0 = unlimited`,
     `  --checkpoint-batch-units <N> Default: ${DEFAULT_CHECKPOINT_BATCH_UNITS}`,
     `  --checkpoint-flush-seconds <N> Default: ${DEFAULT_CHECKPOINT_FLUSH_SECONDS}`,
@@ -139,6 +143,7 @@ function parseArgs(argv) {
     dest_root: "",
     inventory_root_prefix: DEFAULT_INVENTORY_ROOT_PREFIX,
     state_root_prefix: DEFAULT_STATE_ROOT_PREFIX,
+    legacy_state_key: DEFAULT_LEGACY_STATE_KEY,
     max_days_per_run: DEFAULT_MAX_DAYS,
     checkpoint_batch_units: DEFAULT_CHECKPOINT_BATCH_UNITS,
     checkpoint_flush_seconds: DEFAULT_CHECKPOINT_FLUSH_SECONDS,
@@ -169,6 +174,12 @@ function parseArgs(argv) {
     if (arg === "--state-root-prefix") {
       args.state_root_prefix = String(argv[index + 1] || "")
         .trim().replace(/^\/+|\/+$/g, "");
+      index += 1;
+      continue;
+    }
+    if (arg === "--legacy-state-key") {
+      args.legacy_state_key = String(argv[index + 1] || "")
+        .trim().replace(/^\/+/, "");
       index += 1;
       continue;
     }
@@ -233,6 +244,7 @@ function parseArgs(argv) {
     throw new Error("--inventory-root-prefix is required");
   }
   if (!args.state_root_prefix) throw new Error("--state-root-prefix is required");
+  if (!args.legacy_state_key) throw new Error("--legacy-state-key is required");
   if (args.force_prune_recheck && !args.prune_stale_parquet) {
     throw new Error("--force-prune-recheck cannot be combined with --no-prune-stale-parquet");
   }
@@ -295,28 +307,6 @@ function readJsonMaybe(
     normalizedPath,
     retryOptions,
   );
-}
-
-function remoteFileExists(
-  rcloneBin,
-  root,
-  relativePath,
-  retryOptions = null,
-) {
-  const normalizedPath = String(relativePath || "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^\/+/, "");
-  const parentRelativePath = path.posix.dirname(normalizedPath);
-  return Boolean(rcloneLsjsonFile(
-    rcloneBin,
-    joinTargetPath(
-      root,
-      parentRelativePath === "." ? "" : parentRelativePath,
-    ),
-    path.posix.basename(normalizedPath),
-    { retryOptions },
-  ));
 }
 
 function uploadJson({
@@ -385,7 +375,6 @@ function copyAndVerifyJsonFile({
     return {
       relative_path: relativePath,
       source_hash: sha256Hex(sourceText),
-      source_size: Buffer.byteLength(sourceText, "utf8"),
       verified: false,
       dry_run: true,
     };
@@ -406,7 +395,6 @@ function copyAndVerifyJsonFile({
   return {
     relative_path: relativePath,
     source_hash: sourceHash,
-    source_size: Buffer.byteLength(sourceText, "utf8"),
     verified: true,
     dry_run: false,
   };
@@ -524,6 +512,16 @@ function copyAndVerifyCoreDay({ args, day }) {
   return { source_hash: sourceHash, verified: true, dry_run: false };
 }
 
+function legacyStateOrNull(args) {
+  const result = readJsonMaybe(
+    args.rclone_bin,
+    args.dest_root,
+    args.legacy_state_key,
+    DROPBOX_READ_RETRY,
+  );
+  return result?.parsed || null;
+}
+
 function stateRootKey(args) {
   return `${args.state_root_prefix}/root.json`;
 }
@@ -539,6 +537,30 @@ function inventoryRootKey(args) {
 function runManifestStateShardKey(args, stateRoot) {
   return stateRoot?.global_units?.observation_run_manifests?.state_shard_key
     || `${args.state_root_prefix}/global/observation_run_manifests.json`;
+}
+
+function migrateLegacyRunManifestState(inventoryShard, legacyState) {
+  const legacyUnits =
+    legacyState?.run_manifest_units?.observations?.units
+    && typeof legacyState.run_manifest_units.observations.units === "object"
+      ? legacyState.run_manifest_units.observations.units
+      : {};
+  const state = buildObservationRunManifestStateShard(
+    inventoryShard.units.flatMap((unit) => {
+      const legacy = legacyUnits[unit.unit_key];
+      const legacyHash = String(legacy?.hash || "").trim().toLowerCase();
+      if (legacyHash !== unit.hash) return [];
+      return [{
+        unit_key: unit.unit_key,
+        hash: unit.hash,
+        copied_at: String(legacy?.copied_at || "").trim() || null,
+      }];
+    }),
+  );
+  if (state.units.length === inventoryShard.units.length) {
+    state.processed_source_hash = sha256Hex(stableJson(inventoryShard));
+  }
+  return state;
 }
 
 function yearIsComplete(stateRoot, inventoryYear) {
@@ -647,9 +669,10 @@ async function main() {
     DROPBOX_READ_RETRY,
   );
   let stateRoot = validateHierarchicalStateRoot(
-    existingStateResult?.parsed || emptyHierarchicalStateRoot(args.state_root_prefix),
-    args.state_root_prefix,
+    existingStateResult?.parsed || emptyHierarchicalStateRoot(args.legacy_state_key),
+    args.legacy_state_key,
   );
+  const legacyState = existingStateResult ? null : legacyStateOrNull(args);
 
   const report = {
     ok: true,
@@ -660,7 +683,8 @@ async function main() {
     dest_root: args.dest_root,
     inventory_root_key: inventoryRootKey(args),
     state_root_key: stateRootKey(args),
-    fresh_start: existingStateResult === null,
+    migration_mode: existingStateResult ? "none" : "legacy_state_adoption",
+    legacy_state_key: args.legacy_state_key,
     max_days_per_run: args.max_days_per_run,
     checkpoint_batch_units: args.checkpoint_batch_units,
     checkpoint_flush_seconds: args.checkpoint_flush_seconds,
@@ -688,23 +712,6 @@ async function main() {
       candidates: 0,
       copied: 0,
       dry_run: 0,
-      complete: false,
-    },
-    latest_timeseries: {
-      source_path:
-        inventoryRoot.global_units.observations_timeseries_latest.relative_path,
-      sha256: inventoryRoot.global_units.observations_timeseries_latest.sha256,
-      byte_size:
-        inventoryRoot.global_units.observations_timeseries_latest.byte_size,
-      candidate: false,
-      skipped: false,
-      copied: false,
-      dry_run: false,
-      destination_missing: false,
-      verification_status: "pending",
-      processed_source_identity: null,
-      incomplete: true,
-      error: null,
     },
     prune: {
       enabled: args.prune_stale_parquet,
@@ -777,11 +784,10 @@ async function main() {
           inventoryYear.year,
           inventoryMonth.month,
         )
-        : validateObservationMonthState(
-          null,
-          inventoryYear.year,
-          inventoryMonth.month,
-        );
+        : migrateLegacyMonthState({
+          inventoryShard,
+          legacyState,
+        });
 
       let monthStateDirty = monthStateResult === null;
       let dirtyUnits = 0;
@@ -939,6 +945,7 @@ async function main() {
     const bindingSync = syncTimeseriesBindingsToDropbox({
       inventoryRoot,
       stateRoot,
+      legacyState,
       stateRootPrefix: args.state_root_prefix,
       dryRun: args.dry_run,
       checkpointBatchUnits: args.checkpoint_batch_units,
@@ -988,6 +995,7 @@ async function main() {
     const coreSync = syncCoreToDropbox({
       inventoryRoot,
       stateRoot,
+      legacyState,
       stateRootPrefix: args.state_root_prefix,
       dryRun: args.dry_run,
       checkpointBatchUnits: args.checkpoint_batch_units,
@@ -1036,7 +1044,7 @@ async function main() {
   );
   let runStateShard = runStateResult
     ? validateObservationRunManifestStateShard(runStateResult.parsed)
-    : buildObservationRunManifestStateShard([]);
+    : migrateLegacyRunManifestState(runManifestInventoryShard, legacyState);
   const runStateMap = new Map(
     runStateShard.units.map((entry) => [entry.unit_key, entry]),
   );
@@ -1076,8 +1084,6 @@ async function main() {
     runStateShard.processed_source_hash =
       runManifestInventoryPointer.content_hash;
   }
-  report.run_manifests.complete =
-    runStateShard.processed_source_hash === runManifestInventoryPointer.content_hash;
   const runStateWrite = uploadJson({
     rcloneBin: args.rclone_bin,
     root: args.dest_root,
@@ -1091,85 +1097,6 @@ async function main() {
     state_shard_hash: runStateWrite.hash,
   };
   stateRootDirty = true;
-
-  const latestInventory =
-    inventoryRoot.global_units.observations_timeseries_latest;
-  const previousLatestState = validateLatestTimeseriesState(
-    stateRoot.global_units.observations_timeseries_latest,
-  );
-  const latestDestinationExists = remoteFileExists(
-    args.rclone_bin,
-    args.dest_root,
-    latestInventory.relative_path,
-    DROPBOX_READ_RETRY,
-  );
-  const latestIdentityMatches = previousLatestState.verified
-    && previousLatestState.source_relative_path === latestInventory.relative_path
-    && previousLatestState.processed_source_sha256 === latestInventory.sha256
-    && previousLatestState.byte_size === latestInventory.byte_size;
-  report.latest_timeseries.destination_missing = !latestDestinationExists;
-  report.latest_timeseries.candidate =
-    !latestIdentityMatches || !latestDestinationExists;
-
-  if (!report.latest_timeseries.candidate) {
-    report.latest_timeseries.skipped = true;
-    report.latest_timeseries.verification_status = "previously_verified";
-    report.latest_timeseries.incomplete = false;
-  } else {
-    try {
-      const copy = copyAndVerifyJsonFile({
-        rcloneBin: args.rclone_bin,
-        sourceRoot: args.source_root,
-        destRoot: args.dest_root,
-        relativePath: latestInventory.relative_path,
-        dryRun: args.dry_run,
-      });
-      if (
-        copy.source_hash !== latestInventory.sha256
-        || copy.source_size !== latestInventory.byte_size
-      ) {
-        throw new Error(
-          `Latest-timeseries source identity mismatch: `
-          + `inventory=${latestInventory.sha256}/${latestInventory.byte_size} `
-          + `source=${copy.source_hash}/${copy.source_size}`,
-        );
-      }
-      if (args.dry_run) {
-        report.latest_timeseries.dry_run = true;
-        report.latest_timeseries.verification_status = "dry_run_not_verified";
-      } else if (!copy.verified) {
-        throw new Error(
-          `Latest-timeseries verification failed: ${latestInventory.relative_path}`,
-        );
-      } else {
-        markLatestTimeseriesProcessed(
-          stateRoot,
-          latestInventory,
-          new Date().toISOString(),
-        );
-        stateRootDirty = true;
-        report.latest_timeseries.copied = true;
-        report.latest_timeseries.verification_status = "verified";
-        report.latest_timeseries.incomplete = false;
-      }
-    } catch (error) {
-      report.latest_timeseries.verification_status = "failed";
-      report.latest_timeseries.error = error instanceof Error
-        ? error.message
-        : String(error);
-    }
-  }
-
-  const processedLatestState = validateLatestTimeseriesState(
-    stateRoot.global_units.observations_timeseries_latest,
-  );
-  report.latest_timeseries.processed_source_identity = {
-    source_path: processedLatestState.source_relative_path,
-    sha256: processedLatestState.processed_source_sha256,
-    byte_size: processedLatestState.byte_size,
-    copied_at: processedLatestState.copied_at,
-    verified: processedLatestState.verified,
-  };
 
   if (!args.dry_run && allYearsComplete(stateRoot, inventoryRoot)) {
     copyAndVerifyJsonFile({
@@ -1207,11 +1134,8 @@ async function main() {
   report.complete = report.observations.incomplete_months.length === 0
     && report.observations.incomplete_years.length === 0
     && report.timeseries_binding.incomplete_ranges.length === 0
-    && report.core.complete
-    && report.run_manifests.complete
-    && !report.latest_timeseries.incomplete;
-  report.ok = report.prune.forced_failed_days === 0
-    && report.latest_timeseries.error === null;
+    && report.core.complete;
+  report.ok = report.prune.forced_failed_days === 0;
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));
   if (!report.ok) {

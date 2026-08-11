@@ -100,6 +100,12 @@ UK_AQ_DROPBOX_APP_FOLDER = str(os.getenv("UK_AQ_DROPBOX_APP_FOLDER") or "").stri
 UK_AQ_R2_HISTORY_DROPBOX_DIR = str(
     os.getenv("UK_AQ_R2_HISTORY_DROPBOX_DIR") or "R2_history_backup"
 ).strip()
+UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV = "UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH"
+R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS = {
+    "v1": "_ops/checkpoints/r2_history_backup_state_v1.json",
+    "v2": "_ops/checkpoints/r2_history_backup_state_v2.json",
+}
+UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV = "UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE"
 DROPBOX_APP_KEY = str(os.getenv("DROPBOX_APP_KEY") or "").strip()
 DROPBOX_APP_SECRET = str(os.getenv("DROPBOX_APP_SECRET") or "").strip()
 DROPBOX_REFRESH_TOKEN = str(os.getenv("DROPBOX_REFRESH_TOKEN") or "").strip()
@@ -432,6 +438,86 @@ def _resolve_r2_history_read_version() -> Dict[str, Any]:
         "warning": f"Invalid {R2_HISTORY_VERSION_ENV}={raw!r}; expected v1 or v2. R2 history checks are disabled until this is fixed.",
         "valid": False,
         "raw": raw,
+    }
+
+
+def _looks_like_v1_dropbox_state_path(value: str) -> bool:
+    normalized = value.lower()
+    return "v1" in normalized and "v2" not in normalized
+
+
+def _resolve_dropbox_state_path_info() -> Dict[str, Any]:
+    read_version_info = _resolve_r2_history_read_version()
+    if not read_version_info.get("valid"):
+        warning = str(
+            read_version_info.get("warning")
+            or "Invalid R2 history read version; Dropbox checkpoint selection disabled."
+        )
+        return {
+            "path": None,
+            "source": "disabled_invalid_read_version",
+            "cache_key": f"invalid:{read_version_info.get('raw') or ''}:dropbox_disabled",
+            "warning": warning,
+            "error": warning,
+            "fallback_attempted": False,
+            "read_version": read_version_info,
+            "attempted_paths": [],
+            "state_file_override": None,
+            "ignored_state_file_override": None,
+        }
+
+    version = str(read_version_info.get("version"))
+    raw_env = str(os.getenv(UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV) or "").strip()
+    state_file_override = str(os.getenv(UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV) or "").strip()
+
+    fallback_attempted = False
+    warnings: List[str] = []
+    source = "default"
+    attempted_paths: List[str] = []
+    ignored_state_file_override: Optional[str] = None
+
+    if raw_env:
+        source = "env"
+        attempted_paths.append(raw_env)
+        if version == "v2" and _looks_like_v1_dropbox_state_path(raw_env):
+            path = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS["v2"]
+            source = "default:v2_ignored_v1_env_override"
+            warnings.append(
+                f"{R2_HISTORY_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV} looks like a v1 path ({raw_env}). Using v2 default instead."
+            )
+            attempted_paths.append(path)
+        else:
+            path = raw_env
+    else:
+        path = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS[version]
+        attempted_paths.append(path)
+
+    if state_file_override:
+        attempted_paths.append(state_file_override)
+        if version == "v2" and _looks_like_v1_dropbox_state_path(state_file_override):
+            ignored_state_file_override = state_file_override
+            state_file_override = ""
+            if source == "default:v2_ignored_v1_env_override":
+                source = "default:v2_ignored_v1_env_and_state_file_overrides"
+            elif source == "default":
+                source = "default:v2_ignored_v1_state_file_override"
+            warnings.append(
+                f"{R2_HISTORY_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV} looks like a v1 checkpoint ({ignored_state_file_override}). Ignoring that override and using the resolved v2 checkpoint path."
+            )
+
+    cache_key = f"{version}:{path}:state_file={state_file_override or ''}"
+
+    return {
+        "path": path,
+        "source": source,
+        "cache_key": cache_key,
+        "warning": " ".join(warnings) if warnings else None,
+        "error": None,
+        "fallback_attempted": fallback_attempted,
+        "read_version": read_version_info,
+        "attempted_paths": attempted_paths,
+        "state_file_override": state_file_override or None,
+        "ignored_state_file_override": ignored_state_file_override,
     }
 
 
@@ -1761,6 +1847,29 @@ def _resolve_dropbox_state_remote_path(state_rel_path: str) -> str:
     return "/" + "/".join(path_parts)
 
 
+def _extract_dropbox_backup_days(
+    raw_state: Any,
+) -> Tuple[Dict[str, Set[date]], Optional[str]]:
+    domain_days = _empty_dropbox_backup_days()
+    if not isinstance(raw_state, dict):
+        return domain_days, "Dropbox checkpoint is not a JSON object"
+
+    raw_domains = raw_state.get("domains")
+    domains = raw_domains if isinstance(raw_domains, dict) else {}
+    for domain_name in ("observations", "aqilevels"):
+        raw_domain = domains.get(domain_name)
+        if not isinstance(raw_domain, dict):
+            continue
+        raw_day_map = raw_domain.get("days")
+        day_map = raw_day_map if isinstance(raw_day_map, dict) else {}
+        for day_text in day_map.keys():
+            parsed_day = _parse_iso_day(day_text)
+            if parsed_day is not None:
+                domain_days[domain_name].add(parsed_day)
+
+    return domain_days, None
+
+
 def _dropbox_day_bounds(days: Set[date]) -> Tuple[Optional[str], Optional[str]]:
     if not days:
         return None, None
@@ -1843,6 +1952,47 @@ def _fetch_dropbox_access_token() -> Tuple[Optional[str], Optional[str]]:
     if not token:
         return None, "Dropbox token response missing access_token"
     return token, None
+
+
+def _load_dropbox_backup_days_remote(state_rel_path: str) -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str]]:
+    domain_days = _empty_dropbox_backup_days()
+    remote_path = _resolve_dropbox_state_remote_path(state_rel_path)
+    if not remote_path:
+        return domain_days, None, None
+
+    path_ref = f"dropbox:{remote_path}"
+    access_token, token_error = _fetch_dropbox_access_token()
+    if token_error:
+        return domain_days, path_ref, token_error
+    if not access_token:
+        return domain_days, None, None
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Dropbox-API-Arg": json.dumps({"path": remote_path}),
+    }
+    try:
+        resp = requests.post(
+            DROPBOX_CONTENT_API_DOWNLOAD_URL,
+            headers=headers,
+            timeout=DROPBOX_API_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        return domain_days, path_ref, f"Dropbox checkpoint download failed ({exc.__class__.__name__})"
+
+    if not resp.ok:
+        detail = _safe_response_text(resp)
+        if detail:
+            return domain_days, path_ref, f"Dropbox checkpoint download failed ({resp.status_code}): {detail}"
+        return domain_days, path_ref, f"Dropbox checkpoint download failed ({resp.status_code})"
+
+    try:
+        raw_state = json.loads(resp.text)
+    except Exception as exc:  # noqa: BLE001
+        return domain_days, path_ref, f"Dropbox checkpoint parse failed ({exc.__class__.__name__})"
+
+    parsed_days, parse_error = _extract_dropbox_backup_days(raw_state)
+    return parsed_days, path_ref, parse_error
 
 
 def _candidate_dropbox_state_paths(
@@ -2080,6 +2230,31 @@ def _get_dropbox_history_latest_mtime_cached(
         DROPBOX_HISTORY_MTIME_CACHE_STATE["error"] = error
         DROPBOX_HISTORY_MTIME_CACHE_STATE["generated_at"] = now_utc
     return payload, error
+
+
+def _load_dropbox_backup_days() -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str], Dict[str, Any]]:
+    state_info = _resolve_dropbox_state_path_info()
+    resolved_path = state_info.get("path")
+
+    domain_days = _empty_dropbox_backup_days()
+    if not resolved_path:
+        return domain_days, None, state_info.get("error"), state_info
+
+    for candidate in _candidate_dropbox_state_paths(resolved_path, state_info=state_info):
+        if not candidate.is_file():
+            continue
+        try:
+            raw_state = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            return domain_days, str(candidate), f"Dropbox checkpoint parse failed ({exc.__class__.__name__})", state_info
+        parsed_days, parse_error = _extract_dropbox_backup_days(raw_state)
+        return parsed_days, str(candidate), parse_error, state_info
+
+    remote_days, remote_path, remote_error = _load_dropbox_backup_days_remote(resolved_path)
+    if remote_path or remote_error:
+        return remote_days, remote_path, remote_error, state_info
+
+    return domain_days, None, None, state_info
 
 
 def _latest_oldest_day_by_label(

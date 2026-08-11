@@ -14,8 +14,6 @@ export const OBSERVATION_RUN_MANIFEST_INVENTORY_KIND =
   "uk_aq_r2_history_backup_inventory_observation_run_manifests";
 export const OBSERVATION_RUN_MANIFEST_STATE_KIND =
   "uk_aq_r2_history_backup_state_observation_run_manifests";
-export const OBSERVATIONS_TIMESERIES_LATEST_PATH =
-  "history/_index_v2/observations_timeseries_latest.json";
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const ISO_DAY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -227,7 +225,7 @@ export function buildHierarchicalInventoryRoot({
   runManifestInventoryShardKey,
   runManifestInventoryShardHash,
   runManifestUnitCount,
-  latestTimeseries,
+  legacyInventoryKey,
 }) {
   const normalizedYears = [...years]
     .map((yearEntry) => ({
@@ -276,39 +274,14 @@ export function buildHierarchicalInventoryRoot({
           ? Math.max(0, Math.trunc(Number(runManifestUnitCount)))
           : 0,
       },
-      observations_timeseries_latest: validateLatestTimeseriesInventoryUnit(
-        latestTimeseries,
-      ),
+    },
+    compatibility: {
+      legacy_inventory_key: normalizeRelativePath(legacyInventoryKey),
     },
   };
 }
 
-export function validateLatestTimeseriesInventoryUnit(raw) {
-  const value = assertObject(
-    raw,
-    "inventory observations latest-timeseries unit",
-  );
-  const byteSize = Number(value.byte_size);
-  if (!Number.isSafeInteger(byteSize) || byteSize < 0) {
-    throw new Error("Inventory observations latest-timeseries byte_size is invalid");
-  }
-  return {
-    relative_path: normalizeRelativePath(
-      value.relative_path,
-      "observations latest-timeseries source path",
-    ),
-    sha256: assertSha256(
-      value.sha256,
-      "observations latest-timeseries SHA-256",
-    ),
-    byte_size: byteSize,
-  };
-}
-
-export function validateHierarchicalInventoryRoot(
-  root,
-  { requireLatestTimeseries = true } = {},
-) {
+export function validateHierarchicalInventoryRoot(root) {
   const value = assertObject(root, "hierarchical inventory root");
   if (Number(value.schema_version) !== HIERARCHICAL_INVENTORY_SCHEMA_VERSION) {
     throw new Error("Hierarchical inventory root schema_version mismatch");
@@ -362,15 +335,6 @@ export function validateHierarchicalInventoryRoot(
         : 0,
     },
   };
-  const latestTimeseriesRaw = value.global_units?.observations_timeseries_latest;
-  if (latestTimeseriesRaw) {
-    globalUnits.observations_timeseries_latest =
-      validateLatestTimeseriesInventoryUnit(latestTimeseriesRaw);
-  } else if (requireLatestTimeseries) {
-    throw new Error(
-      "Hierarchical inventory root is missing observations_timeseries_latest",
-    );
-  }
   return {
     ...value,
     observations: {
@@ -522,6 +486,35 @@ export function validateObservationMonthState(state, year, month) {
   };
 }
 
+export function migrateLegacyMonthState({
+  inventoryShard,
+  legacyState,
+}) {
+  const inventory = validateObservationMonthInventoryShard(inventoryShard);
+  const state = emptyObservationMonthState(inventory.year, inventory.month);
+  const legacyDays = legacyState?.domains?.observations?.days;
+  const sourceDays = legacyDays && typeof legacyDays === "object"
+    ? legacyDays
+    : {};
+  state.days = inventory.days.flatMap((day) => {
+    const legacy = sourceDays[day.day_utc];
+    const legacyHash = String(legacy?.manifest_hash || "").trim().toLowerCase();
+    if (
+      legacyHash !== day.manifest_file_hash
+      && legacyHash !== day.manifest_hash
+    ) return [];
+    return [{
+      day_utc: day.day_utc,
+      manifest_hash: day.manifest_hash,
+      copied_at: String(legacy?.copied_at || "").trim() || null,
+    }];
+  });
+  if (monthStateIsComplete(state, inventory)) {
+    state.processed_source_month_hash = inventory.source_month_hash;
+  }
+  return state;
+}
+
 export function monthStateDayMap(state) {
   return new Map(
     (Array.isArray(state?.days) ? state.days : [])
@@ -595,62 +588,7 @@ export function completeObservationMonthState(state, inventoryShard) {
   return current;
 }
 
-function emptyLatestTimeseriesState() {
-  return {
-    source_relative_path: OBSERVATIONS_TIMESERIES_LATEST_PATH,
-    processed_source_sha256: null,
-    byte_size: null,
-    copied_at: null,
-    verified: false,
-  };
-}
-
-export function validateLatestTimeseriesState(raw) {
-  if (!raw) return emptyLatestTimeseriesState();
-  const value = assertObject(
-    raw,
-    "state observations latest-timeseries unit",
-  );
-  const processedSha256 = value.processed_source_sha256
-    ? assertSha256(
-      value.processed_source_sha256,
-      "state observations latest-timeseries processed SHA-256",
-    )
-    : null;
-  const byteSize = value.byte_size === null || value.byte_size === undefined
-    ? null
-    : Number(value.byte_size);
-  if (byteSize !== null && (!Number.isSafeInteger(byteSize) || byteSize < 0)) {
-    throw new Error("State observations latest-timeseries byte_size is invalid");
-  }
-  return {
-    source_relative_path: normalizeRelativePath(
-      value.source_relative_path || OBSERVATIONS_TIMESERIES_LATEST_PATH,
-      "state observations latest-timeseries source path",
-    ),
-    processed_source_sha256: processedSha256,
-    byte_size: byteSize,
-    copied_at: String(value.copied_at || "").trim() || null,
-    verified: value.verified === true && processedSha256 !== null,
-  };
-}
-
-export function markLatestTimeseriesProcessed(stateRoot, inventoryUnit, copiedAt) {
-  const inventory = validateLatestTimeseriesInventoryUnit(inventoryUnit);
-  stateRoot.global_units.observations_timeseries_latest = {
-    source_relative_path: inventory.relative_path,
-    processed_source_sha256: inventory.sha256,
-    byte_size: inventory.byte_size,
-    copied_at: String(copiedAt || "").trim() || null,
-    verified: true,
-  };
-  return stateRoot;
-}
-
-export function emptyHierarchicalStateRoot(
-  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2",
-) {
-  const prefix = normalizeRelativePath(stateRootPrefix, "state root prefix");
+export function emptyHierarchicalStateRoot(legacyStateKey) {
   return {
     schema_version: HIERARCHICAL_STATE_SCHEMA_VERSION,
     kind: HIERARCHICAL_STATE_KIND,
@@ -662,20 +600,19 @@ export function emptyHierarchicalStateRoot(
     global_units: {
       observation_run_manifests: {
         state_shard_key:
-          `${prefix}/global/observation_run_manifests.json`,
+          "_ops/checkpoints/r2_history_backup_state_v2/global/observation_run_manifests.json",
         processed_source_hash: null,
         state_shard_hash: null,
       },
-      observations_timeseries_latest: emptyLatestTimeseriesState(),
+    },
+    compatibility: {
+      legacy_state_key: normalizeRelativePath(legacyStateKey),
     },
   };
 }
 
-export function validateHierarchicalStateRoot(
-  root,
-  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2",
-) {
-  if (!root) return emptyHierarchicalStateRoot(stateRootPrefix);
+export function validateHierarchicalStateRoot(root, legacyStateKey) {
+  if (!root) return emptyHierarchicalStateRoot(legacyStateKey);
   const value = assertObject(root, "hierarchical state root");
   if (Number(value.schema_version) !== HIERARCHICAL_STATE_SCHEMA_VERSION) {
     throw new Error("Hierarchical state root schema_version mismatch");
@@ -684,7 +621,6 @@ export function validateHierarchicalStateRoot(
     throw new Error("Hierarchical state root identity mismatch");
   }
   const observations = assertObject(value.observations, "state observations");
-  const { compatibility: _obsoleteCompatibility, ...currentValue } = value;
   const years = Array.isArray(observations.years)
     ? observations.years.map((yearEntry) => ({
       year: normalizeYear(yearEntry.year),
@@ -712,7 +648,7 @@ export function validateHierarchicalStateRoot(
     })).sort((left, right) => left.year.localeCompare(right.year))
     : [];
   return {
-    ...currentValue,
+    ...value,
     observations: {
       processed_source_root_hash: observations.processed_source_root_hash
         ? assertSha256(
@@ -726,7 +662,7 @@ export function validateHierarchicalStateRoot(
       observation_run_manifests: {
         state_shard_key: normalizeRelativePath(
           value.global_units?.observation_run_manifests?.state_shard_key
-          || `${normalizeRelativePath(stateRootPrefix)}/global/observation_run_manifests.json`,
+          || "_ops/checkpoints/r2_history_backup_state_v2/global/observation_run_manifests.json",
         ),
         processed_source_hash:
           value.global_units?.observation_run_manifests?.processed_source_hash
@@ -743,8 +679,10 @@ export function validateHierarchicalStateRoot(
             )
             : null,
       },
-      observations_timeseries_latest: validateLatestTimeseriesState(
-        value.global_units?.observations_timeseries_latest,
+    },
+    compatibility: {
+      legacy_state_key: normalizeRelativePath(
+        value.compatibility?.legacy_state_key || legacyStateKey,
       ),
     },
   };
@@ -760,7 +698,10 @@ export function upsertStateMonthSummary(
     stateShardHash,
   },
 ) {
-  const state = validateHierarchicalStateRoot(stateRoot);
+  const state = validateHierarchicalStateRoot(
+    stateRoot,
+    stateRoot?.compatibility?.legacy_state_key || "_ops/checkpoints/r2_history_backup_state_v2.json",
+  );
   const normalizedYear = normalizeYear(year);
   const normalizedMonth = normalizeMonth(month);
   let yearEntry = state.observations.years.find(
@@ -802,7 +743,10 @@ export function upsertStateMonthSummary(
 }
 
 export function setStateYearProcessedHash(stateRoot, year, sourceYearHash) {
-  const state = validateHierarchicalStateRoot(stateRoot);
+  const state = validateHierarchicalStateRoot(
+    stateRoot,
+    stateRoot.compatibility.legacy_state_key,
+  );
   const normalizedYear = normalizeYear(year);
   const yearEntry = state.observations.years.find(
     (entry) => entry.year === normalizedYear,
@@ -820,7 +764,10 @@ export function setStateYearProcessedHash(stateRoot, year, sourceYearHash) {
 }
 
 export function setStateRootProcessedHash(stateRoot, sourceRootHash) {
-  const state = validateHierarchicalStateRoot(stateRoot);
+  const state = validateHierarchicalStateRoot(
+    stateRoot,
+    stateRoot.compatibility.legacy_state_key,
+  );
   state.observations.processed_source_root_hash = assertSha256(
     sourceRootHash,
     "processed source root hash",

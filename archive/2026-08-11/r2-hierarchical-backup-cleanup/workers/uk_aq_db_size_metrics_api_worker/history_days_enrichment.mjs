@@ -7,7 +7,7 @@ import {
 
 const BACKUP_INVENTORY_KEYS = {
   v1: "history/_index/backup_inventory_v1.json",
-  v2: "history/_index_v2/backup_inventory_v2/root.json",
+  v2: "history/_index_v2/backup_inventory_v2.json",
 };
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const INVENTORY_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -149,69 +149,10 @@ async function readBackupInventory(r2, version) {
     throw new Error(`Backup inventory JSON is invalid: ${detail}`);
   }
 
-  let days;
-  if (version === "v2") {
-    if (
-      payload.kind !== "uk_aq_r2_history_backup_inventory_v2_root"
-      || payload.backup_version !== "v2"
-      || !Array.isArray(payload.observations?.years)
-    ) {
-      throw new Error("Hierarchical v2 backup inventory root identity is invalid");
-    }
-    const monthReferences = payload.observations.years.flatMap((yearEntry) => {
-      const year = String(yearEntry?.year || "").trim();
-      if (!/^\d{4}$/.test(year) || !Array.isArray(yearEntry?.months)) {
-        throw new Error("Hierarchical v2 backup inventory year entry is invalid");
-      }
-      return yearEntry.months.map((monthEntry) => {
-        const month = String(monthEntry?.month || "").trim().padStart(2, "0");
-        const key = String(monthEntry?.inventory_shard_key || "").trim();
-        if (!/^(0[1-9]|1[0-2])$/.test(month) || !key) {
-          throw new Error("Hierarchical v2 backup inventory month entry is invalid");
-        }
-        return { year, month, key };
-      });
-    });
-    const observations = new Set();
-    const monthPayloads = await Promise.all(monthReferences.map(async (reference) => {
-      const monthObject = await r2GetObject({ r2, key: reference.key });
-      let monthPayload;
-      try {
-        monthPayload = JSON.parse(monthObject.body.toString("utf8"));
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        throw new Error(`Backup inventory month JSON is invalid (${reference.key}): ${detail}`);
-      }
-      if (
-        monthPayload?.kind !== "uk_aq_r2_history_backup_inventory_observations_month"
-        || monthPayload?.backup_version !== "v2"
-        || String(monthPayload?.year || "") !== reference.year
-        || String(monthPayload?.month || "").padStart(2, "0") !== reference.month
-        || !Array.isArray(monthPayload?.days)
-      ) {
-        throw new Error(`Backup inventory month identity is invalid: ${reference.key}`);
-      }
-      return monthPayload;
-    }));
-    for (const monthPayload of monthPayloads) {
-      for (const entry of monthPayload.days) {
-        const day = normaliseDay(entry?.day_utc);
-        if (!day) throw new Error("Backup inventory month contains invalid day_utc");
-        observations.add(day);
-      }
-    }
-    days = {
-      observations: Array.from(observations).sort(),
-      aqilevels: [],
-    };
-  } else {
-    days = collectInventoryDays(payload, version);
-  }
+  const days = collectInventoryDays(payload, version);
   const value = {
     key,
-    source: version === "v2"
-      ? "r2_hierarchical_backup_inventory"
-      : "r2_backup_inventory",
+    source: "r2_backup_inventory",
     error: null,
     domains: {
       observations: {

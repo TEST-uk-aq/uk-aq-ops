@@ -20,7 +20,6 @@ import {
   observationMonthInventoryShardKey,
   sha256Hex,
   stableJson,
-  validateLatestTimeseriesInventoryUnit,
   validateHierarchicalInventoryRoot,
   validateObservationRunManifestInventoryShard,
 } from "./lib/hierarchical_backup_v2.mjs";
@@ -57,9 +56,10 @@ const DEFAULT_INVENTORY_ROOT_PREFIX = normalizePrefix(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
   || "history/_index_v2/backup_inventory_v2",
 );
-const DEFAULT_LATEST_TIMESERIES_KEY = normalizePrefix(
-  `${DEFAULT_INDEX_V2_PREFIX}/observations_timeseries_latest.json`,
-);
+const DEFAULT_LEGACY_INVENTORY_KEY = String(
+  process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH
+  || "history/_index_v2/backup_inventory_v2.json",
+).trim().replace(/^\/+/, "");
 const DEFAULT_REPORT_OUT = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_REPORT_OUT || "",
 ).trim();
@@ -79,7 +79,7 @@ function usage() {
     `  --core-prefix <p>            Default: ${DEFAULT_CORE_PREFIX}`,
     `  --timeseries-binding-prefix <p> Default: ${DEFAULT_TIMESERIES_BINDING_PREFIX}`,
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
-    `  --latest-timeseries-key <p>  Default: ${DEFAULT_LATEST_TIMESERIES_KEY}`,
+    `  --legacy-inventory-key <p>   Default: ${DEFAULT_LEGACY_INVENTORY_KEY}`,
     `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
     "  --full-scan                  Independently hash observations, bindings and core",
     "  --dry-run                    Build and compare only; do not write inventory objects",
@@ -96,7 +96,7 @@ function parseArgs(argv) {
     core_prefix: DEFAULT_CORE_PREFIX,
     timeseries_binding_prefix: DEFAULT_TIMESERIES_BINDING_PREFIX,
     inventory_root_prefix: DEFAULT_INVENTORY_ROOT_PREFIX,
-    latest_timeseries_key: DEFAULT_LATEST_TIMESERIES_KEY,
+    legacy_inventory_key: DEFAULT_LEGACY_INVENTORY_KEY,
     rclone_bin: DEFAULT_RCLONE_BIN,
     full_scan: false,
     dry_run: false,
@@ -113,8 +113,8 @@ function parseArgs(argv) {
       args.timeseries_binding_prefix = normalizePrefix(next());
     } else if (arg === "--inventory-root-prefix") {
       args.inventory_root_prefix = normalizePrefix(next());
-    } else if (arg === "--latest-timeseries-key") {
-      args.latest_timeseries_key = normalizePrefix(next());
+    } else if (arg === "--legacy-inventory-key") {
+      args.legacy_inventory_key = next().replace(/^\/+/, "");
     } else if (arg === "--rclone-bin") args.rclone_bin = next() || DEFAULT_RCLONE_BIN;
     else if (arg === "--report-out") args.report_out = next();
     else if (arg === "--full-scan") args.full_scan = true;
@@ -131,7 +131,7 @@ function parseArgs(argv) {
     throw new Error("--timeseries-binding-prefix is required");
   }
   if (!args.inventory_root_prefix) throw new Error("--inventory-root-prefix is required");
-  if (!args.latest_timeseries_key) throw new Error("--latest-timeseries-key is required");
+  if (!args.legacy_inventory_key) throw new Error("--legacy-inventory-key is required");
   return args;
 }
 
@@ -292,30 +292,8 @@ async function main() {
 
   const previousRaw = readJsonMaybe(args.rclone_bin, args.source_root, inventoryRootKey);
   const previousRoot = previousRaw
-    ? validateHierarchicalInventoryRoot(
-      previousRaw.parsed,
-      { requireLatestTimeseries: false },
-    )
+    ? validateHierarchicalInventoryRoot(previousRaw.parsed)
     : null;
-
-  const latestTimeseriesSource = readJson(
-    args.rclone_bin,
-    args.source_root,
-    args.latest_timeseries_key,
-  );
-  const latestTimeseriesIdentity = validateLatestTimeseriesInventoryUnit({
-    relative_path: args.latest_timeseries_key,
-    sha256: sha256Hex(latestTimeseriesSource.text),
-    byte_size: Buffer.byteLength(latestTimeseriesSource.text, "utf8"),
-  });
-  const previousLatestTimeseries =
-    previousRoot?.global_units?.observations_timeseries_latest || null;
-  const latestTimeseries = previousLatestTimeseries
-    && previousLatestTimeseries.relative_path === latestTimeseriesIdentity.relative_path
-    && previousLatestTimeseries.sha256 === latestTimeseriesIdentity.sha256
-    && previousLatestTimeseries.byte_size === latestTimeseriesIdentity.byte_size
-    ? previousLatestTimeseries
-    : latestTimeseriesIdentity;
 
   const sourceRoot = validateAggregate(
     readJson(args.rclone_bin, args.source_root, observationsRootKey).parsed,
@@ -476,6 +454,7 @@ async function main() {
     sourcePrefix: args.timeseries_binding_prefix,
     inventoryRootPrefix: args.inventory_root_prefix,
     previousRootReference: previousRoot?.timeseries_binding || null,
+    legacyInventoryKey: args.legacy_inventory_key,
     fullScan: args.full_scan,
     dryRun: args.dry_run,
   });
@@ -486,6 +465,7 @@ async function main() {
     sourcePrefix: args.core_prefix,
     inventoryRootPrefix: args.inventory_root_prefix,
     previousRootReference: previousRoot?.core || null,
+    legacyInventoryKey: args.legacy_inventory_key,
     fullScan: args.full_scan,
     dryRun: args.dry_run,
   });
@@ -497,7 +477,7 @@ async function main() {
     runManifestInventoryShardKey: runShardKey,
     runManifestInventoryShardHash: runWrite.hash,
     runManifestUnitCount: runScan.units.length,
-    latestTimeseries,
+    legacyInventoryKey: args.legacy_inventory_key,
   });
   root.timeseries_binding = bindingInventory.root_reference;
   root.core = coreInventory.root_reference;
@@ -547,11 +527,9 @@ async function main() {
       inventory_shard_changed: runWrite.changed,
       inventory_shard_written: runWrite.written,
     },
-    latest_timeseries: {
-      source_path: latestTimeseries.relative_path,
-      sha256: latestTimeseries.sha256,
-      byte_size: latestTimeseries.byte_size,
-      inventory_identity_reused: latestTimeseries === previousLatestTimeseries,
+    compatibility: {
+      legacy_inventory_key: args.legacy_inventory_key,
+      legacy_inventory_retained: true,
     },
   };
   writeReport(args.report_out, report);

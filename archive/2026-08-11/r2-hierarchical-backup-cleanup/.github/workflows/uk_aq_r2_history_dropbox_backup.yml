@@ -51,6 +51,10 @@ jobs:
       UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || 'history/_index_v2/backup_inventory_v2' }}
       UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || '_ops/checkpoints/r2_history_backup_state_v2' }}
 
+      # Previous flat files are adoption inputs only. The hierarchical backup never rewrites them.
+      UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || 'history/_index_v2/backup_inventory_v2.json' }}
+      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '_ops/checkpoints/r2_history_backup_state_v2.json' }}
+
       UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS || '10' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS || '60' }}
@@ -103,6 +107,8 @@ jobs:
             UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX
             UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
             UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
+            UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH
+            UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH
           )
 
           missing=0
@@ -181,8 +187,8 @@ jobs:
             --runs-prefix "${UK_AQ_R2_HISTORY_V2_RUNS_PREFIX}"
             --core-prefix "${UK_AQ_R2_HISTORY_V2_CORE_PREFIX}"
             --timeseries-binding-prefix "${UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX}"
-            --latest-timeseries-key "${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}/observations_timeseries_latest.json"
             --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
+            --legacy-inventory-key "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}"
             --report-out "tmp/r2_backup_inventory_report.json"
           )
 
@@ -226,6 +232,7 @@ jobs:
             --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
             --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
             --state-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX}"
+            --legacy-state-key "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}"
             --max-days-per-run "${max_days}"
             --checkpoint-batch-units "${UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS}"
             --checkpoint-flush-seconds "${UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS}"

@@ -14,15 +14,14 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import threading
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, Optional, Set, Tuple
 
 import uk_aq_dashboard_api as dashboard
 import uk_aq_dashboard_api_patch as coverage_patch
+import uk_aq_dashboard_inventory_patch as inventory_patch
 
 
 DIRECT_R2_ROOT_ENV = "UK_AQ_R2_HISTORY_DIRECT_RCLONE_ROOT"
@@ -42,20 +41,6 @@ _DIRECT_CACHE: Dict[str, Any] = {
 }
 
 _ORIGINAL_GET_R2_HISTORY_DAYS_CACHED = dashboard._get_r2_history_days_cached
-
-
-def _find_rclone() -> Optional[str]:
-    override = str(os.getenv("UK_AQ_RCLONE_BIN") or "").strip()
-    candidates = [
-        override,
-        shutil.which("rclone") or "",
-        "/opt/homebrew/bin/rclone",
-        "/usr/local/bin/rclone",
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    return None
 
 
 def _cache_ttl_seconds() -> int:
@@ -162,7 +147,7 @@ def _get_direct_r2_days(
                 root,
             )
 
-    rclone_bin = _find_rclone()
+    rclone_bin = inventory_patch._find_rclone()
     if not rclone_bin:
         error = "direct R2 day discovery unavailable because rclone was not found"
         return None, error, root

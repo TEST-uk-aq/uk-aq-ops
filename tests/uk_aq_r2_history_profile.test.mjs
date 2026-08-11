@@ -20,8 +20,6 @@ test("R2 History Profile Tests", async (t) => {
     assert.equal(p.observations_timeseries_index_prefix, "history/_index/observations_timeseries");
     assert.equal(p.aqilevels_timeseries_index_prefix, "history/_index/aqilevels_timeseries");
     assert.equal(p.timeseries_binding_index_prefix, null);
-    assert.equal(p.backup_inventory_rel_path, "history/_index/backup_inventory_v1.json");
-    assert.equal(p.backup_state_rel_path, "_ops/checkpoints/r2_history_backup_state_v1.json");
   });
 
   await t.test("exact v2 profile", () => {
@@ -36,8 +34,6 @@ test("R2 History Profile Tests", async (t) => {
     assert.equal(p.observations_timeseries_index_prefix, "history/_index_v2/observations_timeseries");
     assert.equal(p.aqilevels_timeseries_index_prefix, "history/_index_v2/aqilevels_hourly_data_timeseries");
     assert.equal(p.timeseries_binding_index_prefix, "history/_index_v2/timeseries_binding");
-    assert.equal(p.backup_inventory_rel_path, "history/_index_v2/backup_inventory_v2.json");
-    assert.equal(p.backup_state_rel_path, "_ops/checkpoints/r2_history_backup_state_v2.json");
   });
 
   await t.test("missing and invalid version", () => {

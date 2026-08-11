@@ -161,12 +161,19 @@ export function validateCoreRootReference(raw) {
   };
 }
 
+function legacyInventoryDayMap(legacyInventory) {
+  const raw = legacyInventory?.domains?.core?.days;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return new Map();
+  return new Map(Object.entries(raw));
+}
+
 export function buildCoreInventory({
   rcloneBin,
   sourceRoot,
   sourcePrefix,
   inventoryRootPrefix,
   previousRootReference = null,
+  legacyInventoryKey,
   fullScan = false,
   dryRun = false,
 }) {
@@ -181,7 +188,13 @@ export function buildCoreInventory({
   const previousDays = new Map(
     (previousShard?.days || []).map((entry) => [entry.day_utc, entry]),
   );
-  const previousSource = previousShard ? "hierarchical" : null;
+  let legacyDays = new Map();
+  let previousSource = previousShard ? "hierarchical" : null;
+  if (!previousShard && legacyInventoryKey) {
+    const legacy = readJsonMaybe(rcloneBin, sourceRoot, legacyInventoryKey);
+    legacyDays = legacyInventoryDayMap(legacy);
+    if (legacyDays.size > 0) previousSource = "legacy";
+  }
 
   const entries = rcloneLsjsonRecursive(
     rcloneBin,
@@ -199,7 +212,7 @@ export function buildCoreInventory({
     if (!match) continue;
     const dayUtc = normalizeDay(match[1], "core day_utc");
     const metadata = entryMetadata(entry);
-    const prior = previousDays.get(dayUtc) || null;
+    const prior = previousDays.get(dayUtc) || legacyDays.get(dayUtc) || null;
     if (!fullScan && metadataMatches(metadata, prior)) {
       days.push({
         day_utc: dayUtc,
@@ -293,6 +306,28 @@ export function validateCoreState(raw) {
   };
 }
 
+function migrateLegacyCoreState(inventory, legacyState) {
+  const legacyDays = legacyState?.domains?.core?.days;
+  const sourceDays = legacyDays && typeof legacyDays === "object"
+    ? legacyDays
+    : {};
+  const state = emptyCoreState();
+  state.days = inventory.days.flatMap((day) => {
+    const legacy = sourceDays[day.day_utc];
+    const legacyHash = String(legacy?.manifest_hash || "").trim().toLowerCase();
+    if (legacyHash !== day.manifest_hash) return [];
+    return [{
+      day_utc: day.day_utc,
+      manifest_hash: day.manifest_hash,
+      copied_at: String(legacy?.copied_at || "").trim() || null,
+    }];
+  });
+  if (coreStateIsComplete(state, inventory)) {
+    state.processed_source_hash = inventory.source_hash;
+  }
+  return state;
+}
+
 function coreStateIsComplete(state, inventory) {
   const map = new Map(state.days.map((entry) => [entry.day_utc, entry]));
   return inventory.days.every(
@@ -303,6 +338,7 @@ function coreStateIsComplete(state, inventory) {
 export function syncCoreToDropbox({
   inventoryRoot,
   stateRoot,
+  legacyState,
   stateRootPrefix,
   dryRun,
   checkpointBatchUnits,
@@ -333,7 +369,7 @@ export function syncCoreToDropbox({
   const stateResult = readStateJsonMaybe(stateShardKey);
   let state = stateResult
     ? validateCoreState(stateResult.parsed)
-    : validateCoreState(null);
+    : migrateLegacyCoreState(inventory, legacyState);
   const inventoryDays = new Set(inventory.days.map((entry) => entry.day_utc));
   const trimmedDays = state.days.filter((entry) => inventoryDays.has(entry.day_utc));
   let dirty = stateResult === null || trimmedDays.length !== state.days.length;
@@ -359,7 +395,15 @@ export function syncCoreToDropbox({
     if (stateResult !== null || dryRun) {
       return { report, state_root_dirty: false };
     }
-    return { report, state_root_dirty: false };
+    const adoptedWrite = writeStateJson(stateShardKey, state);
+    report.checkpoint_flush_count += 1;
+    if (adoptedWrite.written) report.state_shards_written += 1;
+    stateRoot.core = {
+      state_shard_key: stateShardKey,
+      processed_source_hash: state.processed_source_hash,
+      state_shard_hash: adoptedWrite.hash,
+    };
+    return { report, state_root_dirty: true };
   }
 
   const stateMap = new Map(state.days.map((entry) => [entry.day_utc, entry]));

@@ -98,7 +98,7 @@ Optional direct-mode data sources:
 - `UK_AQ_R2_HISTORY_COUNTS_API_URL`
 - `UK_AQ_R2_HISTORY_COUNTS_API_TOKEN`
 - `UK_AQ_R2_HISTORY_VERSION` (required `v1` or `v2`; canonical active selector deployed as a Worker secret by `.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml`; TEST uses `v2`. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
-- `UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH` (optional; defaults by read version to `_ops/checkpoints/r2_history_backup_state_v1.json` or `_ops/checkpoints/r2_history_backup_state_v2.json`)
+- `UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX` (optional; defaults to `_ops/checkpoints/r2_history_backup_state_v2`; coverage reads `root.json` and its observation month shards)
 - `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` or `CLOUDFLARE_ACCOUNT_ID`
 - `UK_AQ_R2_CLOUDFLARE_API_TOKEN` or `CFLARE_API_READ_TOKEN`
 - Dropbox optional fields (`DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN`) for `/api/operations_dropbox_mtime`
@@ -118,8 +118,9 @@ R2 history API fallback behavior:
   `dropbox_backup_observations_latest_day`,
   `dropbox_backup_aqilevels_earliest_day`,
   `dropbox_backup_aqilevels_latest_day`, and related warning fields so the
-  hosted dashboard can show `R2_v1` or `R2_v2` with the actual history-days
-  and Dropbox checkpoint source.
+  hosted dashboard can show the active R2 history source and the current
+  hierarchical v2 Dropbox checkpoint source. AQI Dropbox bounds remain empty
+  because AQI history is outside the current backup scope.
 - In `UK_AQ_R2_HISTORY_VERSION=v2`, the storage coverage calendar does not use
   version-blind Supabase R2 day/window fallbacks. If the v2 history-days API is
   unavailable, R2 presence remains false/unknown instead of being filled from

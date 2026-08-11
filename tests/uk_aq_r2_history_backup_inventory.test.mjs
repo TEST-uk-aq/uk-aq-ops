@@ -36,12 +36,15 @@ test("production backup entrypoints load under their established filenames", () 
   assert.match(builder.stdout, /build_backup_inventory\.mjs/);
   assert.match(builder.stdout, /--core-prefix/);
   assert.match(builder.stdout, /--timeseries-binding-prefix/);
+  assert.match(builder.stdout, /--latest-timeseries-key/);
+  assert.doesNotMatch(builder.stdout, /--legacy-inventory-key/);
 
   const sync = runHelp("scripts/backup_r2/sync_history_to_dropbox.mjs");
   assert.equal(sync.status, 0, sync.stderr);
   assert.match(sync.stdout, /sync_history_to_dropbox\.mjs/);
   assert.match(sync.stdout, /--force-prune-recheck/);
   assert.match(sync.stdout, /--state-root-prefix/);
+  assert.doesNotMatch(sync.stdout, /--legacy-state-key/);
 });
 
 test("core inventory identity is deterministic and non-range based", () => {
@@ -86,7 +89,7 @@ test("core state accepts compact processed identity", () => {
   assert.equal(state.days.length, 1);
 });
 
-test("complete legacy core adoption persists hierarchical checkpoint", () => {
+test("fresh core state copies and checkpoints every current unit", () => {
   const inventory = buildCoreInventoryShard("history/v2/core", [{
     day_utc: "2026-08-07",
     manifest_hash: h("a"),
@@ -111,18 +114,6 @@ test("complete legacy core adoption persists hierarchical checkpoint", () => {
       },
     },
     stateRoot,
-    legacyState: {
-      domains: {
-        core: {
-          days: {
-            "2026-08-07": {
-              manifest_hash: h("a"),
-              copied_at: "2026-08-07T12:00:00.000Z",
-            },
-          },
-        },
-      },
-    },
     stateRootPrefix: "_ops/checkpoints/r2_history_backup_state_v2",
     dryRun: false,
     checkpointBatchUnits: 10,
@@ -138,13 +129,13 @@ test("complete legacy core adoption persists hierarchical checkpoint", () => {
     },
     copyAndVerifyDay: () => {
       copyCalls += 1;
-      throw new Error("adopted core day must not be recopied");
+      return { source_hash: h("a"), verified: true, dry_run: false };
     },
   });
 
-  assert.equal(copyCalls, 0);
-  assert.equal(result.report.candidates, 0);
-  assert.equal(result.report.copied, 0);
+  assert.equal(copyCalls, 1);
+  assert.equal(result.report.candidates, 1);
+  assert.equal(result.report.copied, 1);
   assert.equal(result.report.state_shards_written, 1);
   assert.equal(result.report.checkpoint_flush_count, 1);
   assert.equal(result.report.complete, true);

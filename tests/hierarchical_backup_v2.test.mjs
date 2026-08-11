@@ -7,7 +7,7 @@ import {
   buildObservationRunManifestInventoryShard,
   completeObservationMonthState,
   emptyHierarchicalStateRoot,
-  migrateLegacyMonthState,
+  markLatestTimeseriesProcessed,
   monthStateIsComplete,
   observationMonthInventoryShardKey,
   observationMonthStateShardKey,
@@ -16,11 +16,13 @@ import {
   sha256Hex,
   stableJson,
   upsertStateMonthSummary,
+  validateLatestTimeseriesState,
+  validateObservationMonthState,
 } from "../scripts/backup_r2/lib/hierarchical_backup_v2.mjs";
 
 const h = (char) => char.repeat(64);
 
-test("month shard and state migration adopt matching legacy day hashes", () => {
+test("fresh month state plans every current inventory day", () => {
   const shard = buildObservationMonthInventoryShard({
     observationsPrefix: "history/v2/observations",
     year: "2026",
@@ -37,25 +39,13 @@ test("month shard and state migration adopt matching legacy day hashes", () => {
     }],
   });
 
-  const migrated = migrateLegacyMonthState({
-    inventoryShard: shard,
-    legacyState: {
-      domains: {
-        observations: {
-          days: {
-            "2026-08-06": {
-              manifest_hash: h("f"),
-              copied_at: "2026-08-06T20:00:00.000Z",
-            },
-          },
-        },
-      },
-    },
-  });
-
-  assert.equal(monthStateIsComplete(migrated, shard), true);
-  assert.equal(migrated.processed_source_month_hash, h("c"));
-  assert.deepEqual(planObservationMonthCopies(migrated, shard), []);
+  const fresh = validateObservationMonthState(null, "2026", "08");
+  assert.equal(monthStateIsComplete(fresh, shard), false);
+  assert.equal(fresh.processed_source_month_hash, null);
+  assert.deepEqual(
+    planObservationMonthCopies(fresh, shard).map((entry) => entry.day_utc),
+    ["2026-08-06"],
+  );
 });
 
 test("partial state cannot advance the month hash", () => {
@@ -84,26 +74,28 @@ test("partial state cannot advance the month hash", () => {
     ],
   });
 
-  const migrated = migrateLegacyMonthState({
-    inventoryShard: shard,
-    legacyState: {
-      domains: {
-        observations: {
-          days: {
-            "2026-08-05": { manifest_hash: h("f") },
-          },
-        },
-      },
-    },
-  });
+  const partial = validateObservationMonthState({
+    schema_version: 1,
+    kind: "uk_aq_r2_history_backup_state_observations_month",
+    backup_version: "v2",
+    domain: "observations",
+    year: "2026",
+    month: "08",
+    processed_source_month_hash: null,
+    days: [{
+      day_utc: "2026-08-05",
+      manifest_hash: h("d"),
+      copied_at: "2026-08-05T20:00:00.000Z",
+    }],
+  }, "2026", "08");
 
-  assert.equal(migrated.processed_source_month_hash, null);
+  assert.equal(partial.processed_source_month_hash, null);
   assert.deepEqual(
-    planObservationMonthCopies(migrated, shard).map((entry) => entry.day_utc),
+    planObservationMonthCopies(partial, shard).map((entry) => entry.day_utc),
     ["2026-08-06"],
   );
   assert.throws(
-    () => completeObservationMonthState(migrated, shard),
+    () => completeObservationMonthState(partial, shard),
     /one or more day identities are incomplete/,
   );
 });
@@ -128,9 +120,7 @@ test("inventory and state shard paths are stable", () => {
 });
 
 test("root state is updated only after the month shard identity exists", () => {
-  const root = emptyHierarchicalStateRoot(
-    "_ops/checkpoints/r2_history_backup_state_v2.json",
-  );
+  const root = emptyHierarchicalStateRoot();
   upsertStateMonthSummary(root, {
     year: "2026",
     month: "08",
@@ -145,6 +135,28 @@ test("root state is updated only after the month shard identity exists", () => {
   );
   setStateRootProcessedHash(root, h("a"));
   assert.equal(root.observations.processed_source_root_hash, h("a"));
+});
+
+test("latest-timeseries state advances only through verified completion", () => {
+  const root = emptyHierarchicalStateRoot();
+  assert.equal(
+    validateLatestTimeseriesState(
+      root.global_units.observations_timeseries_latest,
+    ).processed_source_sha256,
+    null,
+  );
+  markLatestTimeseriesProcessed(root, {
+    relative_path: "history/_index_v2/observations_timeseries_latest.json",
+    sha256: h("e"),
+    byte_size: 456,
+  }, "2026-08-11T12:00:00.000Z");
+  assert.deepEqual(root.global_units.observations_timeseries_latest, {
+    source_relative_path: "history/_index_v2/observations_timeseries_latest.json",
+    processed_source_sha256: h("e"),
+    byte_size: 456,
+    copied_at: "2026-08-11T12:00:00.000Z",
+    verified: true,
+  });
 });
 
 test("stable JSON is byte-stable for unchanged logical content", () => {
@@ -172,7 +184,11 @@ test("stable JSON is byte-stable for unchanged logical content", () => {
       "history/_index_v2/backup_inventory_v2/global/observation_run_manifests.json",
     runManifestInventoryShardHash: runShardHash,
     runManifestUnitCount: 0,
-    legacyInventoryKey: "history/_index_v2/backup_inventory_v2.json",
+    latestTimeseries: {
+      relative_path: "history/_index_v2/observations_timeseries_latest.json",
+      sha256: h("e"),
+      byte_size: 456,
+    },
   });
   const rootB = JSON.parse(JSON.stringify(rootA));
   assert.equal(stableJson(rootA), stableJson(rootB));
