@@ -14,7 +14,9 @@ Authoritative family lookup evidence:
   * future explicit stations.match_id values prefixed blondon_installation:
 
 Nodes device/installation intervals are taken primarily from station_initial_metadata,
-including source_history. Communities device intervals use retained core station history.
+including source_history. A source-history record whose InstallationCode resolves to a
+Communities station is cross-connector lineage evidence only and is not rendered as an
+active Nodes interval. Communities device intervals use retained core station history.
 DeviceCode, station names and coordinates are never used to establish family membership.
 
 Examples:
@@ -209,6 +211,10 @@ def end_datetime_to_last_day(end_at: datetime | None) -> date | None:
     if end_at.timetz().replace(tzinfo=None) == time(0, 0):
         return end_at.date() - timedelta(days=1)
     return end_at.date()
+
+
+def row_end_day(value: object) -> date | None:
+    return end_datetime_to_last_day(parse_source_datetime(value))
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -414,7 +420,7 @@ def build_station_catalog(
                 station_id=station_id,
                 device_ref=clean_text(row.get("station_device_ref")),
                 first_seen=row_day(row.get("first_seen_at")),
-                removed_at=row_day(row.get("removed_at")),
+                removed_at=row_end_day(row.get("removed_at")),
                 match_id=clean_text(row.get("match_id")),
             )
             existing_key = by_id.get(station_id)
@@ -612,7 +618,7 @@ def scan_station_history(
                 station_id=int(row.get("id")),
                 device_ref=clean_text(row.get("station_device_ref")),
                 first_seen=row_day(row.get("first_seen_at")),
-                removed_at=row_day(row.get("removed_at")),
+                removed_at=row_end_day(row.get("removed_at")),
             )
             fingerprint = (state.station_id, state.device_ref, state.first_seen, state.removed_at)
             if last_fingerprint.get(key) != fingerprint:
@@ -676,6 +682,7 @@ def build_nodes_metadata_intervals(
     station: StationRecord,
     attributes: Mapping[str, object],
     latest_snapshot_day: date,
+    linked_communities_refs: set[str],
 ) -> list[DeviceInterval]:
     raw: list[tuple[datetime, datetime | None, DeviceInterval]] = []
 
@@ -687,6 +694,13 @@ def build_nodes_metadata_intervals(
             site_code = clean_text(entry.get("SiteCode"))
             if site_code and normalise_ref(site_code) != key.normalised_ref:
                 continue
+
+            installation_ref = clean_text(entry.get("InstallationCode"))
+            if installation_ref and normalise_ref(installation_ref) in linked_communities_refs:
+                # This is the pre-Nodes source identity that establishes the cross-connector
+                # lineage. Keep it in Link Evidence, but do not render it as active Nodes.
+                continue
+
             start_at = parse_source_datetime(entry.get("StartDate"))
             if start_at is None:
                 continue
@@ -696,7 +710,7 @@ def build_nodes_metadata_intervals(
                 key=key,
                 station_id=station.station_id,
                 device_ref=clean_text(entry.get("DeviceCode")),
-                installation_ref=clean_text(entry.get("InstallationCode")),
+                installation_ref=installation_ref,
                 sensor_contract=clean_text(entry.get("SensorContract")),
                 source=f"station_initial_metadata.source_history[{idx}]",
                 valid_from=start_at.date(),
@@ -750,6 +764,9 @@ def build_family_intervals(
 ) -> dict[StationKey, list[DeviceInterval]]:
     station_history = scan_station_history(snapshots, family)
     latest_day = snapshots[-1][0]
+    linked_communities_refs = {
+        key.normalised_ref for key in family if key.connector_id == 3
+    }
     result: dict[StationKey, list[DeviceInterval]] = {}
 
     for key in family:
@@ -759,6 +776,7 @@ def build_family_intervals(
                 catalog[key],
                 metadata_by_station[key],
                 latest_day,
+                linked_communities_refs,
             )
             if intervals:
                 result[key] = intervals
@@ -1294,7 +1312,7 @@ def generate_report(
         ),
         (
             "Nodes timeline source",
-            "station_initial_metadata source_history + current attributes where available; core stations snapshots as fallback",
+            "station_initial_metadata source_history + current attributes where available; source-history rows linked to Communities are evidence only; core stations snapshots as fallback",
         ),
         (
             "Communities timeseries refs not retained",
