@@ -83,7 +83,7 @@ const POLLUTANTS: Record<string, { label: string; tokens: string[] }> = {
   no2: { label: "NO2", tokens: ["no2"] },
 };
 const EXCLUDED_CONNECTORS_BY_POLLUTANT: Record<string, Set<string>> = {
-  pm10: new Set(["breathelondon"]),
+  pm10: new Set(["breathelondon", "blondon_nodes", "blondon_communities"]),
   no2: new Set(["sensorcommunity"]),
 };
 

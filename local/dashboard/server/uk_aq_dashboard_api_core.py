@@ -37,7 +37,7 @@ POLLUTANTS = {
 }
 BUCKETS = ("0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days")
 EXCLUDED_CONNECTORS_BY_POLLUTANT = {
-    "pm10": {"breathelondon"},
+    "pm10": {"breathelondon", "blondon_nodes", "blondon_communities"},
     "no2": {"sensorcommunity"},
 }
 DISPATCH_OBSERVS_WINDOW_MINUTES = max(
