@@ -66,17 +66,16 @@ async function listDomainDays({ r2, prefix, maxKeys, maxDays }) {
   return Array.from(days).sort();
 }
 
-function domainSummary(existing, directDays) {
-  const merged = new Set();
-  for (const value of Array.isArray(existing?.days) ? existing.days : []) {
+function domainSummary(existing, directDays, directScanSucceeded) {
+  const selectedDays = directScanSucceeded
+    ? directDays
+    : (Array.isArray(existing?.days) ? existing.days : []);
+  const normalised = new Set();
+  for (const value of selectedDays || []) {
     const day = normaliseDay(value);
-    if (day) merged.add(day);
+    if (day) normalised.add(day);
   }
-  for (const value of directDays || []) {
-    const day = normaliseDay(value);
-    if (day) merged.add(day);
-  }
-  const days = Array.from(merged).sort();
+  const days = Array.from(normalised).sort();
   return {
     ...(existing && typeof existing === "object" && !Array.isArray(existing) ? existing : {}),
     days,
@@ -296,8 +295,16 @@ export async function enrichR2HistoryDaysResponse(response, env) {
   }
 
   const enrichedDomains = {
-    observations: domainSummary(domains.observations, directObservations),
-    aqilevels: domainSummary(domains.aqilevels, directAqilevels),
+    observations: domainSummary(
+      domains.observations,
+      directObservations,
+      observationsResult.status === "fulfilled",
+    ),
+    aqilevels: domainSummary(
+      domains.aqilevels,
+      directAqilevels,
+      aqilevelsResult.status === "fulfilled",
+    ),
   };
   const sources = {
     ...(payload.sources && typeof payload.sources === "object" ? payload.sources : {}),
