@@ -1,0 +1,73 @@
+name: One-off fix Breathe London PM10 freshness
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/oneoff_fix_breathe_london_pm10.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update PM10 connector exclusions
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          changes = [
+              (
+                  Path("local/dashboard/server/uk_aq_dashboard_api_core.py"),
+                  '    "pm10": {"breathelondon"},',
+                  '    "pm10": {"breathelondon", "blondon_nodes", "blondon_communities"},',
+              ),
+              (
+                  Path("workers/uk_aq_dashboard_online_api_worker/src/lib/direct.ts"),
+                  '  pm10: new Set(["breathelondon"]),',
+                  '  pm10: new Set(["breathelondon", "blondon_nodes", "blondon_communities"]),',
+              ),
+          ]
+
+          for path, old, new in changes:
+              text = path.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one old exclusion, found {count}")
+              updated = text.replace(old, new, 1)
+              if updated.count(new) != 1:
+                  raise SystemExit(f"{path}: replacement verification failed")
+              path.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Structural checks
+        run: |
+          set -euo pipefail
+          python3 -m py_compile local/dashboard/server/uk_aq_dashboard_api_core.py
+          git diff --check
+          grep -F '"pm10": {"breathelondon", "blondon_nodes", "blondon_communities"}' local/dashboard/server/uk_aq_dashboard_api_core.py
+          grep -F 'pm10: new Set(["breathelondon", "blondon_nodes", "blondon_communities"]),' workers/uk_aq_dashboard_online_api_worker/src/lib/direct.ts
+
+      - name: Type check online dashboard worker
+        working-directory: workers/uk_aq_dashboard_online_api_worker
+        run: |
+          npm ci
+          npm run check
+
+      - name: Commit correction and remove one-off workflow
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add local/dashboard/server/uk_aq_dashboard_api_core.py workers/uk_aq_dashboard_online_api_worker/src/lib/direct.ts
+          git rm .github/workflows/oneoff_fix_breathe_london_pm10.yml
+          git commit -m "Exclude Breathe London from PM10 freshness"
+          git push origin HEAD:main
