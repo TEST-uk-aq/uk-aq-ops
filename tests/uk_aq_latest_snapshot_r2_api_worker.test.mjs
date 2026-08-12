@@ -77,6 +77,7 @@ test("public finite latest snapshot derives from the canonical v2 all object", a
   assert.equal(row.network_id, 2);
   assert.equal(row.network_code, "breathelondon");
   assert.equal(row.network_label, "Breathe London");
+  assert.equal(row.connector_id, 7);
   assert.equal(row.connector_code, "blondon_nodes");
   assert.equal(Object.hasOwn(row, "station_network_memberships"), false);
   assert.equal(Object.hasOwn(row, "network_memberships"), false);

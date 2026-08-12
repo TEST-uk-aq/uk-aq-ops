@@ -26,6 +26,7 @@ type LatestItem = {
   id: number | null;
   last_value: number | null;
   last_value_at: string | null;
+  connector_id: number;
   connector_code: string | null;
   connector_label: string | null;
   station_id: number | null;
@@ -1539,6 +1540,7 @@ function buildSourceRows(
       id: series.id,
       last_value: state.value,
       last_value_at: state.observed_at,
+      connector_id: state.connector_id,
       connector_code: connector?.connector_code || null,
       connector_label: connector?.display_name || connector?.label || null,
       station_id: station?.id ?? null,

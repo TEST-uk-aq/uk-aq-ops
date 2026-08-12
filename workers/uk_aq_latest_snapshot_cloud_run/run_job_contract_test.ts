@@ -79,6 +79,7 @@ Deno.test("v2 latest rows expose scalar public network fields and no membership 
   assert.equal(item.network_id, 30);
   assert.equal(item.network_code, "breathelondon");
   assert.equal(item.network_label, "Breathe London Nodes");
+  assert.equal(item.connector_id, 10);
   assert.equal(item.connector_code, "bl");
   assert.equal(item.connector_label, "Breathe London");
 
