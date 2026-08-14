@@ -131,7 +131,6 @@ COMMON_EXCLUDES=(
   --exclude='*.env'
   --exclude='supabase/config.toml'
   --exclude='supabase/.temp/'
-  --exclude='config/uk_aq_github_env_targets.csv'
   --exclude='workers/GCP-vars/'
 
   # CI scanning configuration is kept environment-owned.
