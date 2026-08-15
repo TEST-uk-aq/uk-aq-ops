@@ -202,7 +202,6 @@ const EXTERNAL_POSTCODE_SUGGEST_UPSTREAM = "__uk_aq_postcode_suggest_r2_api__";
 const EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM = "__uk_aq_postcode_prefix_hints_r2_api__";
 
 const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
-  uk_aq_latest: "realtime",
   uk_aq_timeseries: "realtime",
   uk_aq_stations_chart: "realtime",
   uk_aq_stations: "stations_metadata",
@@ -218,7 +217,6 @@ const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
 };
 
 const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> = {
-  latest: "uk_aq_latest",
   timeseries: "uk_aq_timeseries",
   "stations-chart": "uk_aq_stations_chart",
   stations: "uk_aq_stations",
