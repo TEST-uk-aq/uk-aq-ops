@@ -217,6 +217,12 @@ type CoreSnapshotManifest = {
   tables: Array<{ table: string; key: string }>;
 };
 
+type LatestCoreManifestInfo = {
+  day_utc: string;
+  key: string;
+  last_modified: string | null;
+};
+
 type MetadataConnector = {
   id: number;
   connector_code: string | null;
@@ -1080,13 +1086,44 @@ function isMetadataCacheFresh(cache: CoreMetadataCacheFile): boolean {
   return ageMs <= UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS * 1000;
 }
 
-async function findLatestCoreManifestKey(): Promise<{ day_utc: string; key: string } | null> {
+function isCoreMetadataCacheFile(value: unknown): value is CoreMetadataCacheFile {
+  if (!value || typeof value !== "object") return false;
+  const cache = value as Record<string, unknown>;
+  return cache.schema_version === 2 &&
+    typeof cache.generated_at === "string" &&
+    (cache.source_day_utc === null || typeof cache.source_day_utc === "string") &&
+    Array.isArray(cache.connectors) &&
+    Array.isArray(cache.stations) &&
+    Array.isArray(cache.networks) &&
+    Array.isArray(cache.timeseries) &&
+    Array.isArray(cache.phenomena) &&
+    Array.isArray(cache.observed_properties);
+}
+
+function metadataCacheRepresentsLatestCoreManifest(
+  cache: CoreMetadataCacheFile,
+  latestManifestInfo: LatestCoreManifestInfo,
+): boolean {
+  if (cache.source_day_utc !== latestManifestInfo.day_utc) return false;
+  const generatedAt = normalizeTimestamp(cache.generated_at);
+  const manifestLastModified = normalizeTimestamp(latestManifestInfo.last_modified);
+  if (!generatedAt || !manifestLastModified) return false;
+  return Date.parse(generatedAt) >= Date.parse(manifestLastModified);
+}
+
+async function findLatestCoreManifestKey(): Promise<LatestCoreManifestInfo | null> {
   const todayUtc = utcNowIso().slice(0, 10);
   for (let offset = 0; offset <= UK_AQ_LATEST_SNAPSHOT_CORE_LOOKBACK_DAYS; offset += 1) {
     const dayUtc = shiftIsoDay(todayUtc, -offset);
     const key = `${UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX}/day_utc=${dayUtc}/manifest.json`;
     const head = await r2HeadObject({ r2: R2_CONFIG, key });
-    if (head.exists) return { day_utc: dayUtc, key };
+    if (head.exists) {
+      return {
+        day_utc: dayUtc,
+        key,
+        last_modified: head.last_modified,
+      };
+    }
   }
   return null;
 }
@@ -1205,13 +1242,22 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
   let objectsRead = 0;
   let bytesRead = 0;
 
+  const latestManifestInfo = await findLatestCoreManifestKey();
+  if (!latestManifestInfo) {
+    throw new Error("No core snapshot manifest found in R2 lookback window.");
+  }
+
   try {
     const cacheObject = await loadDurableR2Object(UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY);
     objectsRead += 1;
     bytesRead += cacheObject.body.byteLength;
     const text = new TextDecoder().decode(cacheObject.body);
-    const parsed = JSON.parse(text) as CoreMetadataCacheFile;
-    if (parsed && parsed.schema_version === 2 && Array.isArray(parsed.networks) && isMetadataCacheFresh(parsed)) {
+    const parsed: unknown = JSON.parse(text);
+    if (
+      isCoreMetadataCacheFile(parsed) &&
+      isMetadataCacheFresh(parsed) &&
+      metadataCacheRepresentsLatestCoreManifest(parsed, latestManifestInfo)
+    ) {
       return {
         metadata: buildMetadataIndex(parsed),
         stats: {
@@ -1226,11 +1272,6 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
     }
   } catch {
     // fall through to refresh
-  }
-
-  const latestManifestInfo = await findLatestCoreManifestKey();
-  if (!latestManifestInfo) {
-    throw new Error("No core snapshot manifest found in R2 lookback window.");
   }
 
   const manifestObject = await r2GetObject({ r2: R2_CONFIG, key: latestManifestInfo.key });
