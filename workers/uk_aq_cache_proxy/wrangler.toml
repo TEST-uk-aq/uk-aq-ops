@@ -10,6 +10,10 @@ enabled = true
 binding = "STATION_HISTORY"
 service = "__UK_AQ_STATION_HISTORY_WORKER_NAME__"
 
+# Current-reading route policy:
+# - /api/aq/latest is retired.
+# - /api/aq/latest-snapshot is the sole current-reading route.
+
 # Runtime secrets expected:
 # - SUPABASE_URL
 # - SB_PUBLISHABLE_DEFAULT_KEY
