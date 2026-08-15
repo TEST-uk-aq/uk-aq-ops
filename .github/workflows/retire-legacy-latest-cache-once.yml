@@ -17,28 +17,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Remove legacy latest route
+      - name: Diagnose legacy latest references
         shell: python
         run: |
           from pathlib import Path
           path = Path("workers/uk_aq_cache_proxy/src/index.ts")
           text = path.read_text()
-          profile = '  uk_aq_latest: "realtime",\n'
-          route = '  latest: "uk_aq_latest",\n'
-          if profile not in text:
-              raise SystemExit("Expected uk_aq_latest cache profile not found")
-          if route not in text:
-              raise SystemExit("Expected latest cache route not found")
-          text = text.replace(profile, "", 1).replace(route, "", 1)
-          if "uk_aq_latest" in text:
-              raise SystemExit("uk_aq_latest reference remains in cache proxy")
-          path.write_text(text)
-
-      - name: Commit retirement
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm .github/workflows/retire-legacy-latest-cache-once.yml
-          git add workers/uk_aq_cache_proxy/src/index.ts
-          git commit -m "refactor: remove legacy latest cache route"
-          git push
+          for n, line in enumerate(text.splitlines(), 1):
+              if "uk_aq_latest" in line or 'latest:' in line:
+                  print(f"{n}: {line}")
+          raise SystemExit("diagnostic only")
