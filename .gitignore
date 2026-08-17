@@ -21,5 +21,6 @@ system_docs_ops.zip
 sync_to_live.sh
 /.aider.tags.cache.v4
 *.xlsx
+.venv*
 venv/
 ./venv
