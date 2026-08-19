@@ -68,6 +68,7 @@ patch_paths = [
     Path("dashboard/assets/storage_coverage_patch.js"),
     Path("dashboard/assets/storage_coverage_missing_r2_hotfix.js"),
     Path("dashboard/assets/storage_coverage_backup_only_style_patch.js"),
+    Path("dashboard/assets/freshness_table_layout_patch.js"),
 ]
 for patch_path in patch_paths:
     if not patch_path.is_file():
