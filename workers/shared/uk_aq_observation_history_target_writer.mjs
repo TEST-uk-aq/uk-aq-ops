@@ -148,20 +148,15 @@ function canonicalPhysicalRows(rows) {
   };
 }
 
-function targetFileRowCapacity(limits) {
-  return Math.min(
-    limits.target_file_rows,
+function packTimeseriesAwareRowGroups(rows, limits) {
+  const hardCapacity = Math.min(
+    limits.max_row_group_rows,
     limits.max_file_rows,
-    limits.target_row_group_rows * limits.max_row_groups_per_file,
   );
-}
-
-function packTimeseriesAwareRowCandidates(rows, limits) {
-  const capacity = targetFileRowCapacity(limits);
-  const files = [];
+  const groups = [];
   let current = [];
   const flush = () => {
-    if (current.length) files.push(current);
+    if (current.length) groups.push(current);
     current = [];
   };
 
@@ -174,14 +169,17 @@ function packTimeseriesAwareRowCandidates(rows, limits) {
       end += 1;
     }
     let runStart = start;
-    while (end - runStart > capacity) {
+    while (end - runStart > hardCapacity) {
       flush();
-      files.push(rows.slice(runStart, runStart + capacity));
-      runStart += capacity;
+      groups.push(rows.slice(runStart, runStart + hardCapacity));
+      runStart += hardCapacity;
     }
     const remainder = rows.slice(runStart, end);
     if (remainder.length) {
-      if (current.length && current.length + remainder.length > capacity) {
+      if (
+        current.length &&
+        current.length + remainder.length > limits.target_row_group_rows
+      ) {
         flush();
       }
       current.push(...remainder);
@@ -189,15 +187,50 @@ function packTimeseriesAwareRowCandidates(rows, limits) {
     start = end;
   }
   flush();
-  return files;
+  return groups;
 }
 
-function rowGroupSizes(rowCount, targetRows) {
-  const sizes = [];
-  for (let start = 0; start < rowCount; start += targetRows) {
-    sizes.push(Math.min(targetRows, rowCount - start));
+function packCompatibleRowGroupsIntoFiles(rowGroups, limits) {
+  const files = [];
+  let currentGroups = [];
+  let currentRows = 0;
+  const flush = () => {
+    if (currentGroups.length) {
+      files.push({
+        rows: currentGroups.flat(),
+        rowGroups: currentGroups,
+        rowGroupRows: currentGroups[0].length,
+      });
+    }
+    currentGroups = [];
+    currentRows = 0;
+  };
+
+  for (const group of rowGroups) {
+    if (group.length > limits.max_file_rows) {
+      throw new Error("One intended row group exceeds max_file_rows");
+    }
+    if (!currentGroups.length) {
+      currentGroups.push(group);
+      currentRows = group.length;
+      continue;
+    }
+    const fixedWriterGroupRows = currentGroups[0].length;
+    const previousWasShort =
+      currentGroups[currentGroups.length - 1].length < fixedWriterGroupRows;
+    const nextRows = currentRows + group.length;
+    const compatible =
+      !previousWasShort &&
+      group.length <= fixedWriterGroupRows &&
+      currentGroups.length < limits.max_row_groups_per_file &&
+      nextRows <= limits.target_file_rows &&
+      nextRows <= limits.max_file_rows;
+    if (!compatible) flush();
+    currentGroups.push(group);
+    currentRows += group.length;
   }
-  return sizes;
+  flush();
+  return files;
 }
 
 function writerProperties(rowGroupRows) {
@@ -250,34 +283,64 @@ function serializeRows(rows, rowGroupRows) {
   return writeOnce();
 }
 
-function deterministicByteSplit(rowCount, targetRowGroupRows) {
-  const midpoint = Math.floor(rowCount / 2);
-  const aligned = Math.floor(midpoint / targetRowGroupRows) *
-    targetRowGroupRows;
-  if (aligned > 0 && aligned < rowCount) return aligned;
-  return Math.max(1, midpoint);
+function nearestBoundary(boundaries, midpoint) {
+  return boundaries.reduce((nearest, boundary) => {
+    const distance = Math.abs(boundary - midpoint);
+    const nearestDistance = Math.abs(nearest - midpoint);
+    return distance < nearestDistance ||
+        (distance === nearestDistance && boundary < nearest)
+      ? boundary
+      : nearest;
+  });
 }
 
-function serializeWithinByteBounds(rows, limits) {
-  const body = serializeRows(rows, limits.target_row_group_rows);
-  if (body.byteLength <= limits.target_file_bytes) {
-    return [{ rows, body }];
+function deterministicByteSplit(rows, rowGroups) {
+  const midpoint = rows.length / 2;
+  const timeseriesBoundaries = [];
+  for (let index = 1; index < rows.length; index += 1) {
+    if (rows[index - 1].timeseries_id !== rows[index].timeseries_id) {
+      timeseriesBoundaries.push(index);
+    }
   }
-  if (rows.length === 1) {
+  if (timeseriesBoundaries.length) {
+    return nearestBoundary(timeseriesBoundaries, midpoint);
+  }
+  const rowGroupBoundaries = [];
+  let rowCount = 0;
+  for (const group of rowGroups.slice(0, -1)) {
+    rowCount += group.length;
+    rowGroupBoundaries.push(rowCount);
+  }
+  if (rowGroupBoundaries.length) {
+    return nearestBoundary(rowGroupBoundaries, midpoint);
+  }
+  return Math.max(1, Math.floor(midpoint));
+}
+
+function buildSerializedCandidates(rows, limits) {
+  return packCompatibleRowGroupsIntoFiles(
+    packTimeseriesAwareRowGroups(rows, limits),
+    limits,
+  ).flatMap((candidate) => serializeWithinByteBounds(candidate, limits));
+}
+
+function serializeWithinByteBounds(candidate, limits) {
+  const body = serializeRows(candidate.rows, candidate.rowGroupRows);
+  if (body.byteLength <= limits.target_file_bytes) {
+    return [{ ...candidate, body }];
+  }
+  if (candidate.rows.length === 1) {
     if (body.byteLength > limits.max_file_bytes) {
       throw new Error(
         `One canonical observation row serialised to ${body.byteLength} bytes, exceeding max_file_bytes=${limits.max_file_bytes}`,
       );
     }
-    return [{ rows, body }];
+    return [{ ...candidate, body }];
   }
-  const splitAt = deterministicByteSplit(
-    rows.length,
-    limits.target_row_group_rows,
-  );
+  const splitAt = deterministicByteSplit(candidate.rows, candidate.rowGroups);
   return [
-    ...serializeWithinByteBounds(rows.slice(0, splitAt), limits),
-    ...serializeWithinByteBounds(rows.slice(splitAt), limits),
+    ...buildSerializedCandidates(candidate.rows.slice(0, splitAt), limits),
+    ...buildSerializedCandidates(candidate.rows.slice(splitAt), limits),
   ];
 }
 
@@ -379,6 +442,52 @@ function validateOptionalPageIndexes(
   return true;
 }
 
+function validateProjectedColumnChunkRange(column, label, fileByteLength) {
+  const metadata = column?.meta_data;
+  const dataPageOffset = Number(metadata?.data_page_offset);
+  const compressedSize = Number(metadata?.total_compressed_size);
+  if (
+    !column ||
+    !metadata ||
+    !Number.isSafeInteger(dataPageOffset) ||
+    dataPageOffset < 0 ||
+    !Number.isSafeInteger(compressedSize) ||
+    compressedSize <= 0
+  ) {
+    throw new Error(`Parquet ${label} column-chunk metadata is incomplete`);
+  }
+
+  const hasDictionaryPage =
+    metadata.dictionary_page_offset !== undefined &&
+    metadata.dictionary_page_offset !== null;
+  const dictionaryPageOffset = hasDictionaryPage
+    ? Number(metadata.dictionary_page_offset)
+    : null;
+  if (
+    hasDictionaryPage &&
+    (
+      !Number.isSafeInteger(dictionaryPageOffset) ||
+      dictionaryPageOffset < 0 ||
+      dictionaryPageOffset >= dataPageOffset
+    )
+  ) {
+    throw new Error(`Parquet ${label} dictionary-page offset is invalid`);
+  }
+
+  const chunkStart = hasDictionaryPage
+    ? dictionaryPageOffset
+    : dataPageOffset;
+  const chunkEnd = chunkStart + compressedSize;
+  if (
+    !Number.isSafeInteger(chunkEnd) ||
+    chunkStart >= fileByteLength ||
+    dataPageOffset >= chunkEnd ||
+    chunkEnd > fileByteLength
+  ) {
+    throw new Error(`Parquet ${label} column-chunk range is invalid`);
+  }
+}
+
 function buildIntendedSegments(rows, groupSizes) {
   const rowGroups = [];
   const segments = [];
@@ -469,6 +578,7 @@ function validateFooter({ body, rows, limits, intended }) {
   }
 
   const pageIndexAvailability = {};
+  let validatedProjectedColumnChunks = 0;
   for (const [ordinal, actual] of actualGroups.entries()) {
     const expected = intended.rowGroups[ordinal];
     const actualRows = Number(actual.num_rows);
@@ -508,21 +618,12 @@ function validateFooter({ body, rows, limits, intended }) {
 
     for (const columnName of REQUIRED_RANGED_READER_COLUMNS) {
       const column = columnChunk(actual, columnName);
-      const dataPageOffset = Number(column?.meta_data?.data_page_offset);
-      const compressedSize = Number(column?.meta_data?.total_compressed_size);
-      if (
-        !column ||
-        !Number.isSafeInteger(dataPageOffset) ||
-        dataPageOffset < 0 ||
-        !Number.isSafeInteger(compressedSize) ||
-        compressedSize <= 0 ||
-        dataPageOffset >= body.byteLength ||
-        compressedSize > body.byteLength
-      ) {
-        throw new Error(
-          `Parquet row group ${ordinal} has invalid ${columnName} column-chunk metadata`,
-        );
-      }
+      validateProjectedColumnChunkRange(
+        column,
+        `row group ${ordinal} ${columnName}`,
+        body.byteLength,
+      );
+      validatedProjectedColumnChunks += 1;
       const available = validateOptionalPageIndexes(
         column,
         `row group ${ordinal} ${columnName}`,
@@ -543,7 +644,9 @@ function validateFooter({ body, rows, limits, intended }) {
     row_group_count: actualGroups.length,
     metadata_length: Number(metadata.metadata_length),
     projected_column_page_indexes: pageIndexAvailability,
-    projected_column_chunk_fallback_supported: true,
+    projected_column_chunk_fallback_supported:
+      validatedProjectedColumnChunks ===
+        actualGroups.length * REQUIRED_RANGED_READER_COLUMNS.length,
   };
 }
 
@@ -607,10 +710,7 @@ export function buildCanonicalObservationTimeseriesBoundedFiles(rows, {
   }
   const limits = validateLimits(rawLimits);
   const { orderedRows, contentHash, partition } = canonicalPhysicalRows(rows);
-  const candidates = packTimeseriesAwareRowCandidates(orderedRows, limits)
-    .flatMap((candidateRows) =>
-      serializeWithinByteBounds(candidateRows, limits)
-    );
+  const candidates = buildSerializedCandidates(orderedRows, limits);
   const keys = new Set();
   const fileBodies = [];
   const fileMetadata = [];
@@ -628,10 +728,7 @@ export function buildCanonicalObservationTimeseriesBoundedFiles(rows, {
     ) {
       throw new Error(`Target observation file ${key} exceeds a hard bound`);
     }
-    const groupSizes = rowGroupSizes(
-      candidate.rows.length,
-      limits.target_row_group_rows,
-    );
+    const groupSizes = candidate.rowGroups.map((group) => group.length);
     const intended = buildIntendedSegments(candidate.rows, groupSizes);
     const footer = validateFooter({
       body: candidate.body,
