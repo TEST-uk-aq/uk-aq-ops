@@ -16,7 +16,6 @@ import {
   r2GetObject,
   r2HeadObject,
   r2PutObject,
-  sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
   r2PutObjectIfChanged,
@@ -27,7 +26,6 @@ import {
   buildObservationHistoryV2RestorePlan,
   buildObservationHistoryV3MigrationAuditReport,
   buildObservationHistoryV3MigrationPlan,
-  buildObservationHistoryV3MigrationPlanFromCheckpoint,
   buildObservationHistoryV3RerunVerificationPlan,
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
@@ -49,7 +47,7 @@ function usage() {
     "  node scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs [options]",
     "",
     "Modes:",
-    "  --mode plan             Build non-mutating pinned inventory/rollback authority (default)",
+    "  --mode plan             Build a non-mutating inventory/rewrite plan (default)",
     "  --mode migrate          Execute the offline rewrite and complete v3 publication",
     "  --mode verify           Rerun complete verification without mutation",
     "  --mode rollback-plan    Build the manifest-guided v2 restore plan",
@@ -72,7 +70,7 @@ function usage() {
     "  --checkpoint-out <path>  Required for migrate; atomically updated after each object",
     "",
     "Resume/verify:",
-    "  --checkpoint-in <path>   Prior checkpoint; required for verify/rollback and migrate resume",
+    "  --checkpoint-in <path>   Prior checkpoint; required for verify",
     "",
     "The command never changes configuration, scheduler state, deployments, or reader generation.",
   ].join("\n");
@@ -136,18 +134,8 @@ export function parseObservationHistoryMigrationArgs(argv) {
   if (args.mode === "migrate" && !args.checkpointOut) {
     throw new Error("migrate mode requires --checkpoint-out");
   }
-  if (
-    args.mode === "migrate" &&
-    args.checkpointIn &&
-    path.resolve(args.checkpointIn) !== path.resolve(args.checkpointOut)
-  ) {
-    throw new Error("migrate resume requires --checkpoint-in and --checkpoint-out to be the same path");
-  }
   if (args.mode === "verify" && !args.checkpointIn) {
     throw new Error("verify mode requires --checkpoint-in");
-  }
-  if (new Set(["rollback-plan", "rollback"]).has(args.mode) && !args.checkpointIn) {
-    throw new Error(`${args.mode} mode requires --checkpoint-in`);
   }
   return Object.freeze(args);
 }
@@ -290,23 +278,12 @@ function summaryForPlan(plan) {
   };
 }
 
-function buildR2Adapters({ config, checkpointOut, env, getBackupObject }) {
+function buildR2Adapters({ config, checkpointOut, env }) {
   const r2 = config.r2;
   const durableEvidence = [];
   const evidencePath = checkpointOut
     ? `${path.resolve(checkpointOut)}.publication.json`
     : null;
-  const stagingRoot = checkpointOut
-    ? `${path.resolve(checkpointOut)}.staging`
-    : null;
-  const requireStagingPath = (candidate) => {
-    if (!stagingRoot) throw new Error("Migration staging requires --checkpoint-out");
-    const resolved = path.resolve(candidate);
-    if (resolved !== stagingRoot && !resolved.startsWith(`${stagingRoot}${path.sep}`)) {
-      throw new Error("Migration staging reference escapes the checkpoint staging root");
-    }
-    return resolved;
-  };
   return {
     getObject: ({ key }) => r2GetObject({ r2, key }),
     headObject: ({ key }) => r2HeadObject({ r2, key }),
@@ -336,62 +313,6 @@ function buildR2Adapters({ config, checkpointOut, env, getBackupObject }) {
       return { durable: true };
     },
     writeCheckpoint: async (checkpoint) => atomicWriteJson(checkpointOut, checkpoint),
-    stageUnit: async ({ unitId, intents }) => {
-      if (!stagingRoot) throw new Error("Migration staging requires --checkpoint-out");
-      const unitDirectory = requireStagingPath(path.join(stagingRoot, unitId));
-      fs.mkdirSync(unitDirectory, { recursive: true, mode: 0o700 });
-      return intents.map((intent, index) => {
-        const target = requireStagingPath(
-          path.join(unitDirectory, `${String(index).padStart(5, "0")}.parquet`),
-        );
-        const body = Buffer.from(intent.body);
-        if (
-          body.byteLength !== intent.byte_size ||
-          sha256Hex(body) !== intent.sha256
-        ) {
-          throw new Error(`Prepared migration body identity is invalid: ${intent.key}`);
-        }
-        const temporary = `${target}.tmp-${process.pid}`;
-        try {
-          fs.writeFileSync(temporary, body, { mode: 0o600 });
-          fs.renameSync(temporary, target);
-        } finally {
-          if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
-        }
-        return {
-          key: intent.key,
-          byte_size: intent.byte_size,
-          sha256: intent.sha256,
-          staging_ref: target,
-        };
-      });
-    },
-    readStagedBody: async ({ staging_ref: stagingRef, key }) => {
-      if (!stagingRef) throw new Error(`Prepared migration body is unavailable: ${key}`);
-      const target = requireStagingPath(stagingRef);
-      if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
-        throw new Error(`Prepared migration body is unavailable: ${key}`);
-      }
-      return fs.readFileSync(target);
-    },
-    releaseStagedUnit: async ({ intents }) => {
-      const directories = new Set();
-      for (const intent of intents) {
-        if (!intent.staging_ref) continue;
-        const target = requireStagingPath(intent.staging_ref);
-        directories.add(path.dirname(target));
-        if (fs.existsSync(target)) fs.unlinkSync(target);
-      }
-      for (const directory of directories) {
-        if (fs.existsSync(directory) && fs.readdirSync(directory).length === 0) {
-          fs.rmdirSync(directory);
-        }
-      }
-      if (stagingRoot && fs.existsSync(stagingRoot) && fs.readdirSync(stagingRoot).length === 0) {
-        fs.rmdirSync(stagingRoot);
-      }
-    },
-    getBackupObject,
     finalizeV3Publication: (options) =>
       finalizeObservationHistoryIndexV3Publication(options),
     rebuildV2Indexes: () => runHistoryIndexBuild({
@@ -419,43 +340,21 @@ export async function runObservationHistoryMigrationV3({
   const getR2Object = ({ key }) => r2GetObject({ r2: config.r2, key });
   const startedAt = now();
   const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
-  const checkpoint = args.checkpointIn
-    ? readJsonFile(args.checkpointIn, "migration checkpoint")
-    : null;
-  const plan = checkpoint
-    ? buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint })
-    : await buildObservationHistoryV3MigrationPlan({
-        getR2Object,
-        getBackupObject,
-        repositoryRoot: path.resolve(scriptDirectory, "../.."),
-        environmentEvidence: evidence,
-        migrationRunId: args.migrationRunId,
-        writerLimits,
-        targetWriterGitSha: args.targetWriterGitSha,
-        expectedInventoryRootSha256: args.expectedInventoryRootSha256,
-        expectedStateRootSha256: args.expectedStateRootSha256,
-      });
-  if (
-    checkpoint &&
-    (
-      plan.migration_run_id !== args.migrationRunId ||
-      plan.target_writer_git_sha !== args.targetWriterGitSha ||
-      stableMigrationJson(plan.target.writer_limits) !== stableMigrationJson(writerLimits) ||
-      plan.backup_gate?.inventory_root?.sha256 !==
-        String(args.expectedInventoryRootSha256).toLowerCase() ||
-      plan.backup_gate?.state_root?.sha256 !==
-        String(args.expectedStateRootSha256).toLowerCase()
-    )
-  ) {
-    throw new Error(
-      "Checkpoint identity does not match the requested run, writer, limits or backup generation",
-    );
-  }
+  const plan = await buildObservationHistoryV3MigrationPlan({
+    getR2Object,
+    getBackupObject,
+    repositoryRoot: path.resolve(scriptDirectory, "../.."),
+    environmentEvidence: evidence,
+    migrationRunId: args.migrationRunId,
+    writerLimits,
+    targetWriterGitSha: args.targetWriterGitSha,
+    expectedInventoryRootSha256: args.expectedInventoryRootSha256,
+    expectedStateRootSha256: args.expectedStateRootSha256,
+  });
   const adapters = buildR2Adapters({
     config,
     checkpointOut: args.checkpointOut || args.checkpointIn,
     env,
-    getBackupObject,
   });
   let result;
   let rollback = null;
@@ -464,6 +363,9 @@ export async function runObservationHistoryMigrationV3({
     if (args.mode === "plan") {
       result = summaryForPlan(plan);
     } else if (args.mode === "migrate") {
+      const checkpoint = args.checkpointIn
+        ? readJsonFile(args.checkpointIn, "migration checkpoint")
+        : null;
       result = await executeObservationHistoryV3MigrationPlan({
         plan,
         apply: true,
@@ -472,12 +374,10 @@ export async function runObservationHistoryMigrationV3({
         checkpoint,
         adapters,
       });
-      reportPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
-        checkpoint: result.checkpoint,
-        requirePrepared: true,
-      });
     } else if (args.mode === "verify") {
+      const checkpoint = readJsonFile(args.checkpointIn, "migration checkpoint");
       reportPlan = buildObservationHistoryV3RerunVerificationPlan({
+        currentPlan: plan,
         checkpoint,
       });
       result = await verifyObservationHistoryV3MigrationResult({
@@ -488,7 +388,7 @@ export async function runObservationHistoryMigrationV3({
       });
     } else {
       const restorePlan = await buildObservationHistoryV2RestorePlan({
-        checkpoint,
+        migrationPlan: plan,
         getBackupObject,
       });
       if (args.mode === "rollback-plan") {

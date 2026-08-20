@@ -407,7 +407,6 @@ export function validateObservationHistoryV3MigrationEnvironment({
   indexVersion,
   integrityVersion,
   apply = false,
-  operation = "migration",
 }) {
   const requested = String(environment || "").trim();
   const configured = String(configuredEnvironment || "").trim();
@@ -422,17 +421,8 @@ export function validateObservationHistoryV3MigrationEnvironment({
   if (String(historyVersion || "").trim() !== "v2") {
     blockers.push("logical_history_version_must_remain_v2");
   }
-  const deployedIndexVersion = String(indexVersion || "").trim();
-  if (
-    operation === "rollback"
-      ? !new Set(["v2", "v3"]).has(deployedIndexVersion)
-      : deployedIndexVersion !== "v2"
-  ) {
-    blockers.push(
-      operation === "rollback"
-        ? "rollback_observation_index_must_be_v2_or_v3"
-        : "deployed_observation_index_must_remain_v2",
-    );
+  if (String(indexVersion || "").trim() !== "v2") {
+    blockers.push("deployed_observation_index_must_remain_v2");
   }
   if (!String(integrityVersion || "").trim()) {
     blockers.push("integrity_version_identity_missing");
@@ -447,7 +437,7 @@ export function validateObservationHistoryV3MigrationEnvironment({
     bucket: actualBucket,
     expected_bucket: pinnedBucket,
     history_version: String(historyVersion || "").trim(),
-    index_version: deployedIndexVersion,
+    index_version: String(indexVersion || "").trim(),
     integrity_version: String(integrityVersion || "").trim(),
     blockers: Object.freeze(blockers),
   });
@@ -1246,64 +1236,6 @@ function buildCanonicalPublicationSchedule(objects) {
   return Object.freeze(sorted);
 }
 
-function sourceUnitFromPartition({
-  sourcePartition,
-  rollbackObjectsByKey,
-  writerLimits,
-  targetWriterGitSha,
-}) {
-  const sourceFiles = sourcePartition.canonical_files.map((file) => {
-    const rollbackObject = rollbackObjectsByKey.get(file.key);
-    if (!rollbackObject || rollbackObject.stage !== "canonical_parquet") {
-      throw new Error(`Rollback authority lacks canonical Parquet: ${file.key}`);
-    }
-    return Object.freeze({
-      key: file.key,
-      byte_size: rollbackObject.byte_size,
-      sha256: rollbackObject.sha256,
-      manifest_identity_type: classifyManifestFileIdentity(
-        file.etag_or_hash,
-        { objectKey: file.key },
-      ).type,
-    });
-  });
-  return Object.freeze({
-    unit_id: sha256Hex(stableMigrationJson({
-      source_manifest: sourcePartition.manifest_identity,
-      source_files: sourceFiles,
-      writer_limits: writerLimits,
-      target_writer_git_sha: targetWriterGitSha,
-      target_schema: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
-      target_writer: OBSERVATION_HISTORY_WRITER_VERSION_V3,
-      target_layout: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-    })),
-    scope: sourcePartition.scope,
-    source_manifest: sourcePartition.manifest,
-    source_manifest_identity: sourcePartition.manifest_identity,
-    source_files: Object.freeze(sourceFiles),
-    source_row_count: sourcePartition.manifest.row_count,
-    source_observation_content_hash:
-      sourcePartition.manifest.observation_content_hash,
-    source_verification_status_counts: Object.freeze({
-      ...sourcePartition.manifest.verification_status_counts,
-    }),
-    logical_identity_verified: false,
-    target_file_count: null,
-    target_row_group_count: null,
-  });
-}
-
-function buildRollbackAuthority({ migrationRunId, environment, inventory, backupGate }) {
-  return Object.freeze({
-    schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
-    kind: "uk_aq_observation_history_v2_rollback_authority",
-    migration_run_id: migrationRunId,
-    environment,
-    inventory,
-    backup_gate: backupGate,
-  });
-}
-
 export async function buildObservationHistoryV3MigrationPlan({
   getR2Object,
   getBackupObject,
@@ -1356,220 +1288,23 @@ export async function buildObservationHistoryV3MigrationPlan({
       }`,
     );
   }
-  const rollbackAuthority = backupGate
-    ? buildRollbackAuthority({
-        migrationRunId: runId,
-        environment,
-        inventory,
-        backupGate,
-      })
-    : null;
-  let rollbackPreflight = null;
-  if (rollbackAuthority) {
-    try {
-      const restorePlan = await buildObservationHistoryV2RestorePlan({
-        rollbackAuthority,
-        getBackupObject,
-      });
-      rollbackPreflight = Object.freeze({
-        verified: restorePlan.ready === true,
-        object_count: restorePlan.objects.length,
-        objects: Object.freeze(restorePlan.objects.map((object) => ({
-          key: object.key,
-          byte_size: object.byte_size,
-          sha256: object.sha256,
-          stage: object.stage,
-        }))),
-        v2_index_strategy: restorePlan.v2_index_strategy,
-      });
-      if (!rollbackPreflight.verified) {
-        blockers.push("manifest_guided_rollback_preflight_incomplete");
-      }
-    } catch (error) {
-      blockers.push(
-        `manifest_guided_rollback_preflight_failed:${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+  const units = [];
+  for (const sourcePartition of inventory.partitions) {
+    units.push(await rewritePartition({
+      sourcePartition,
+      getR2Object,
+      writerLimits,
+      observationsPrefix: inventory.observations_prefix,
+      targetWriterGitSha,
+      sosConnectorId,
+      v3IndexRoot,
+    }));
   }
-  const rollbackObjectsByKey = new Map(
-    (rollbackPreflight?.objects || []).map((entry) => [entry.key, entry]),
-  );
-  const units = rollbackPreflight?.verified
-    ? inventory.partitions.map((sourcePartition) => sourceUnitFromPartition({
-        sourcePartition,
-        rollbackObjectsByKey,
-        writerLimits,
-        targetWriterGitSha,
-      }))
-    : [];
-  const planIdentityPayload = {
-    schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
-    environment: environment.environment,
-    bucket: environment.bucket,
-    source_root: inventory.root_manifest.payload.content_hash,
-    backup_inventory: backupGate?.inventory_root.sha256 || null,
-    backup_checkpoint: backupGate?.state_root.sha256 || null,
-    writer_limits: writerLimits,
-    target_writer_git_sha: targetWriterGitSha,
-    unit_ids: units.map((unit) => unit.unit_id),
-    source_files: units.flatMap((unit) => unit.source_files),
-    observations_prefix: inventory.observations_prefix,
-    v3_index_root: v3IndexRoot,
-    v3_latest_key: v3LatestKey,
-    rollback_objects: rollbackPreflight?.objects || null,
-  };
-  const uniqueBlockers = [...new Set(blockers)].sort();
-  return Object.freeze({
-    schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
-    kind: "uk_aq_observation_history_v3_migration_plan",
-    mode: "plan",
-    migration_run_id: runId,
-    plan_sha256: sha256Hex(stableMigrationJson(planIdentityPayload)),
-    environment,
-    target: Object.freeze({
-      history_version: "v2",
-      history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
-      writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
-      physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-      index_generation: "v3",
-      writer_limits: Object.freeze({ ...writerLimits }),
-    }),
-    target_writer_git_sha: String(targetWriterGitSha || "").trim(),
-    writer_freeze_plan: writerFreezePlan,
-    inventory,
-    backup_gate: backupGate,
-    rollback_authority: rollbackAuthority,
-    rollback_preflight: rollbackPreflight,
-    units: Object.freeze(units),
-    canonical_publication_objects: Object.freeze([]),
-    v3_latest: null,
-    v3_publication_plan: null,
-    v3_index_root: normalizePrefix(v3IndexRoot, "v3 index root"),
-    v3_latest_key: String(v3LatestKey),
-    sos_connector_id: Number(sosConnectorId),
-    blockers: Object.freeze(uniqueBlockers),
-    mutation_allowed: uniqueBlockers.length === 0,
-    estimated: Object.freeze({
-      partitions: units.length,
-      source_files: units.reduce((sum, unit) => sum + unit.source_files.length, 0),
-      source_bytes: units.reduce(
-        (sum, unit) => sum + unit.source_files.reduce((subtotal, file) => subtotal + file.byte_size, 0),
-        0,
-      ),
-      new_parquet_objects: null,
-      new_row_groups: null,
-      v3_scopes: units.length,
-      v3_child_shards: null,
-      v3_scoped_roots: units.length,
-      v3_latest_objects: 1,
-    }),
-  });
-}
-
-function checkpointObjectMap(checkpoint) {
-  return new Map(
-    Object.entries(checkpoint?.completed_objects || {}).map(([key, value]) => [key, value]),
-  );
-}
-
-function preparedUnitPlanIdentity(record) {
-  return sha256Hex(stableMigrationJson({
-    unit_id: record.unit_id,
-    scope: record.scope,
-    target_metadata: record.target_metadata,
-    target_manifest: record.target_manifest,
-    target_file_intents: (record.target_file_intents || []).map(
-      ({ key, byte_size, sha256 }) => ({ key, byte_size, sha256 }),
-    ),
-    v3_index_root: record.v3_index_root,
-  }));
-}
-
-function preparedUnitFromRecord(authorityUnit, record) {
-  if (
-    !record ||
-    record.unit_id !== authorityUnit.unit_id ||
-    !record.target_metadata ||
-    !record.target_manifest ||
-    !Array.isArray(record.target_file_intents) ||
-    record.prepared_plan_sha256 !== preparedUnitPlanIdentity(record)
-  ) {
-    throw new Error(`Prepared unit checkpoint is invalid: ${authorityUnit.unit_id}`);
-  }
-  if (
-    record.target_metadata.row_count !== authorityUnit.source_row_count ||
-    record.target_metadata.observation_content_hash !==
-      authorityUnit.source_observation_content_hash ||
-    !sameJson(
-      record.target_metadata.verification_status_counts,
-      authorityUnit.source_verification_status_counts,
-    )
-  ) {
-    throw new Error(`Prepared unit logical identity changed: ${authorityUnit.unit_id}`);
-  }
-  const targetManifestObject = canonicalJsonObject({
-    key: authorityUnit.source_manifest_identity.key,
-    payload: record.target_manifest,
-    stage: "pollutant_manifest",
-    dependencies: record.target_file_intents.map((intent) => ({
-      kind: "canonical_parquet",
-      key: intent.key,
-      byte_size: intent.byte_size,
-      sha256: intent.sha256,
-    })),
-  });
-  const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({
-    metadata: record.target_metadata,
-    canonicalManifest: canonicalManifestDescriptor(
-      targetManifestObject,
-      record.target_manifest,
-    ),
-    indexRoot: record.v3_index_root,
-  });
-  return Object.freeze({
-    ...authorityUnit,
-    target_metadata: record.target_metadata,
-    target_file_intents: Object.freeze(
-      record.target_file_intents.map((entry) => Object.freeze({ ...entry })),
-    ),
-    target_manifest: record.target_manifest,
-    target_manifest_object: targetManifestObject,
-    v3_hierarchy: hierarchy,
-    logical_identity_verified: true,
-    target_file_count: record.target_metadata.file_count,
-    target_row_group_count: record.target_metadata.files.reduce(
-      (sum, file) => sum + file.row_group_count,
-      0,
-    ),
-  });
-}
-
-export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
-  checkpoint,
-  requirePrepared = false,
-}) {
-  const authority = checkpoint?.authority;
-  if (
-    checkpoint?.kind !== "uk_aq_observation_history_v3_migration_checkpoint" ||
-    !authority ||
-    checkpoint.plan_sha256 !== authority.plan_sha256 ||
-    checkpoint.migration_run_id !== authority.migration_run_id ||
-    checkpoint.authority_sha256 !== sha256Hex(stableMigrationJson(authority))
-  ) {
-    throw new Error("Migration checkpoint immutable authority is missing or invalid");
-  }
-  if (!requirePrepared) return Object.freeze(structuredClone(authority));
-  const prepared = checkpoint.prepared_units || {};
-  const units = authority.units.map((unit) =>
-    preparedUnitFromRecord(unit, prepared[unit.unit_id])
-  );
   const parents = buildCanonicalParents({
-    inventory: authority.inventory,
+    inventory,
     units,
-    observationsPrefix: authority.inventory.observations_prefix,
-    targetWriterGitSha: authority.target_writer_git_sha,
+    observationsPrefix: inventory.observations_prefix,
+    targetWriterGitSha,
   });
   const canonicalObjects = buildCanonicalPublicationSchedule([
     ...units.map((unit) => unit.target_manifest_object),
@@ -1579,8 +1314,8 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
   ]);
   const latest = buildObservationHistoryIndexV3Latest({
     scopedHierarchies: units.map((unit) => unit.v3_hierarchy),
-    indexRoot: authority.v3_index_root,
-    latestKey: authority.v3_latest_key,
+    indexRoot: v3IndexRoot,
+    latestKey: v3LatestKey,
   });
   const v3Objects = [
     ...units.flatMap((unit) => unit.v3_hierarchy.child_shards),
@@ -1609,28 +1344,108 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
     objects: v3Objects,
     externalReferences,
   });
+  let rollbackPreflight = null;
+  if (backupGate) {
+    try {
+      const restorePlan = await buildObservationHistoryV2RestorePlan({
+        migrationPlan: {
+          migration_run_id: runId,
+          inventory,
+          units,
+          backup_gate: backupGate,
+        },
+        getBackupObject,
+      });
+      rollbackPreflight = Object.freeze({
+        verified: restorePlan.ready === true,
+        object_count: restorePlan.objects.length,
+        objects: Object.freeze(restorePlan.objects.map((object) => ({
+          key: object.key,
+          byte_size: object.byte_size,
+          sha256: object.sha256,
+          stage: object.stage,
+        }))),
+        v2_index_strategy: restorePlan.v2_index_strategy,
+      });
+      if (!rollbackPreflight.verified) {
+        blockers.push("manifest_guided_rollback_preflight_incomplete");
+      }
+    } catch (error) {
+      blockers.push(
+        `manifest_guided_rollback_preflight_failed:${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+  const planIdentityPayload = {
+    schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
+    environment: environment.environment,
+    bucket: environment.bucket,
+    source_root: inventory.root_manifest.payload.content_hash,
+    backup_inventory: backupGate?.inventory_root.sha256 || null,
+    backup_checkpoint: backupGate?.state_root.sha256 || null,
+    writer_limits: writerLimits,
+    target_writer_git_sha: targetWriterGitSha,
+    unit_ids: units.map((unit) => unit.unit_id),
+    source_files: units.flatMap((unit) => unit.source_files),
+    canonical_objects: canonicalObjects.map((object) => bodyIdentity(object.key, object.body)),
+    v3_schedule_sha256: v3PublicationPlan.schedule_sha256,
+    rollback_objects: rollbackPreflight?.objects || null,
+  };
+  const uniqueBlockers = [...new Set(blockers)].sort();
   return Object.freeze({
-    ...authority,
+    schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
+    kind: "uk_aq_observation_history_v3_migration_plan",
+    mode: "plan",
+    migration_run_id: runId,
+    plan_sha256: sha256Hex(stableMigrationJson(planIdentityPayload)),
+    environment,
+    target: Object.freeze({
+      history_version: "v2",
+      history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+      writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
+      physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
+      index_generation: "v3",
+      writer_limits: Object.freeze({ ...writerLimits }),
+    }),
+    writer_freeze_plan: writerFreezePlan,
+    inventory,
+    backup_gate: backupGate,
+    rollback_preflight: rollbackPreflight,
     units: Object.freeze(units),
     canonical_publication_objects: canonicalObjects,
     v3_latest: latest,
     v3_publication_plan: v3PublicationPlan,
+    blockers: Object.freeze(uniqueBlockers),
+    mutation_allowed: uniqueBlockers.length === 0,
     estimated: Object.freeze({
-      ...authority.estimated,
+      partitions: units.length,
+      source_files: units.reduce((sum, unit) => sum + unit.source_files.length, 0),
+      source_bytes: units.reduce(
+        (sum, unit) => sum + unit.source_files.reduce((subtotal, file) => subtotal + file.byte_size, 0),
+        0,
+      ),
       new_parquet_objects: units.reduce(
         (sum, unit) => sum + unit.target_file_intents.length,
         0,
       ),
-      new_row_groups: units.reduce(
-        (sum, unit) => sum + unit.target_row_group_count,
-        0,
-      ),
+      new_row_groups: units.reduce((sum, unit) => sum + unit.target_row_group_count, 0),
+      v3_scopes: units.length,
       v3_child_shards: units.reduce(
         (sum, unit) => sum + unit.v3_hierarchy.child_shards.length,
         0,
       ),
+      v3_scoped_roots: units.length,
+      v3_latest_objects: 1,
     }),
   });
+}
+
+function checkpointObjectMap(checkpoint) {
+  return new Map(
+    Object.entries(checkpoint?.completed_objects || {}).map(([key, value]) => [key, value]),
+  );
 }
 
 export async function verifyObservationHistoryV3CheckpointReuse({
@@ -1675,14 +1490,11 @@ export async function verifyObservationHistoryV3CheckpointReuse({
 }
 
 function emptyCheckpoint(plan) {
-  const authority = structuredClone(plan);
   return {
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
     kind: "uk_aq_observation_history_v3_migration_checkpoint",
     migration_run_id: plan.migration_run_id,
     plan_sha256: plan.plan_sha256,
-    authority,
-    authority_sha256: sha256Hex(stableMigrationJson(authority)),
     pre_state: {
       canonical_root_key: plan.inventory.root_manifest.key,
       canonical_root_content_hash: plan.inventory.root_manifest.payload.content_hash,
@@ -1712,8 +1524,6 @@ function emptyCheckpoint(plan) {
         }
       : null,
     completed_objects: {},
-    prepared_units: {},
-    preparation_order: [],
     full_verification_complete: false,
     cutover_ready: false,
   };
@@ -1747,16 +1557,10 @@ export async function executeObservationHistoryV3MigrationPlan({
       blockers: plan.blockers,
     });
   }
-  const currentEnvironment = validateObservationHistoryV3MigrationEnvironment({
+  validateObservationHistoryV3MigrationEnvironment({
     ...environmentEvidence,
     apply: true,
   });
-  if (
-    plan.environment.environment !== currentEnvironment.environment ||
-    plan.environment.bucket !== currentEnvironment.bucket
-  ) {
-    throw new Error("Migration checkpoint environment/bucket authority mismatch");
-  }
   if (writersFrozen !== true) {
     throw new Error("Migration apply requires explicit confirmation that all planned writers are frozen");
   }
@@ -1772,9 +1576,6 @@ export async function executeObservationHistoryV3MigrationPlan({
     "recordDurableEvidence",
     "writeCheckpoint",
     "finalizeV3Publication",
-    "stageUnit",
-    "readStagedBody",
-    "releaseStagedUnit",
   ]) {
     if (typeof adapters?.[name] !== "function") {
       throw new TypeError(`Migration apply adapter is missing: ${name}`);
@@ -1787,70 +1588,10 @@ export async function executeObservationHistoryV3MigrationPlan({
   ) {
     throw new Error("Migration checkpoint belongs to a different deterministic plan");
   }
-  if (rawCheckpoint) {
-    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
-  } else {
-    await adapters.writeCheckpoint(structuredClone(checkpoint));
-  }
+  const completed = checkpointObjectMap(checkpoint);
   const parquetEvidence = [];
-  for (const authorityUnit of plan.units) {
-    let record = checkpoint.prepared_units[authorityUnit.unit_id] || null;
-    if (!record) {
-      const sourcePartition = plan.inventory.partitions.find((partition) =>
-        partition.manifest_identity.key === authorityUnit.source_manifest_identity.key &&
-        partition.manifest_identity.sha256 === authorityUnit.source_manifest_identity.sha256
-      );
-      if (!sourcePartition) {
-        throw new Error(`Pinned source partition is unavailable: ${authorityUnit.unit_id}`);
-      }
-      const rewritten = await rewritePartition({
-        sourcePartition,
-        getR2Object: adapters.getObject,
-        writerLimits: plan.target.writer_limits,
-        observationsPrefix: plan.inventory.observations_prefix,
-        targetWriterGitSha: plan.target_writer_git_sha,
-        sosConnectorId: plan.sos_connector_id,
-        v3IndexRoot: plan.v3_index_root,
-      });
-      if (!sameJson(rewritten.source_files, authorityUnit.source_files)) {
-        throw new Error(`Pinned source file identity changed: ${authorityUnit.unit_id}`);
-      }
-      const staged = await adapters.stageUnit({
-        unitId: authorityUnit.unit_id,
-        intents: rewritten.target_file_intents,
-      });
-      if (!Array.isArray(staged) || staged.length !== rewritten.target_file_intents.length) {
-        throw new Error(`Prepared unit staging is incomplete: ${authorityUnit.unit_id}`);
-      }
-      for (let index = 0; index < staged.length; index += 1) {
-        const expected = rewritten.target_file_intents[index];
-        const actual = staged[index];
-        if (
-          actual.key !== expected.key ||
-          actual.byte_size !== expected.byte_size ||
-          actual.sha256 !== expected.sha256 ||
-          !actual.staging_ref
-        ) {
-          throw new Error(`Prepared unit staging identity mismatch: ${expected.key}`);
-        }
-      }
-      record = {
-        unit_id: authorityUnit.unit_id,
-        scope: authorityUnit.scope,
-        target_metadata: rewritten.target_metadata,
-        target_manifest: rewritten.target_manifest,
-        target_file_intents: staged.map((entry) => ({ ...entry })),
-        v3_index_root: plan.v3_index_root,
-        files_published: false,
-      };
-      record.prepared_plan_sha256 = preparedUnitPlanIdentity(record);
-      checkpoint.prepared_units[authorityUnit.unit_id] = record;
-      checkpoint.preparation_order.push(authorityUnit.unit_id);
-      await adapters.writeCheckpoint(structuredClone(checkpoint));
-    }
-    const preparedUnit = preparedUnitFromRecord(authorityUnit, record);
-    for (const intent of preparedUnit.target_file_intents) {
-      const completed = checkpointObjectMap(checkpoint);
+  for (const unit of plan.units) {
+    for (const intent of unit.target_file_intents) {
       const reuse = await verifyObservationHistoryV3CheckpointReuse({
         checkpointEntry: completed.get(intent.key),
         expected: intent,
@@ -1868,21 +1609,10 @@ export async function executeObservationHistoryV3MigrationPlan({
           reused: true,
         };
       } else {
-        const body = await adapters.readStagedBody(intent);
-        const publicationIntent = buildR2ChecksumAwarePutIntent({
-          key: intent.key,
-          body,
-        });
-        if (
-          publicationIntent.byte_size !== intent.byte_size ||
-          publicationIntent.sha256 !== intent.sha256
-        ) {
-          throw new Error(`Prepared Parquet staging identity changed: ${intent.key}`);
-        }
-        const putEvidence = await adapters.putChecksumObject(publicationIntent);
+        const putEvidence = await adapters.putChecksumObject(intent);
         const head = await adapters.headObject({ key: intent.key });
         evidence = {
-          ...verifyR2StoredSha256Head({ head, intent: publicationIntent }),
+          ...verifyR2StoredSha256Head({ head, intent }),
           put_status: String(putEvidence?.status || "succeeded"),
           reused: false,
         };
@@ -1894,23 +1624,8 @@ export async function executeObservationHistoryV3MigrationPlan({
         writeCheckpoint: adapters.writeCheckpoint,
       });
     }
-    record.files_published = true;
-    await adapters.writeCheckpoint(structuredClone(checkpoint));
-    await adapters.releaseStagedUnit({
-      unitId: authorityUnit.unit_id,
-      intents: record.target_file_intents,
-    });
-    record.target_file_intents = record.target_file_intents.map(
-      ({ staging_ref: _stagingRef, ...entry }) => entry,
-    );
-    await adapters.writeCheckpoint(structuredClone(checkpoint));
   }
-  const completedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
-    checkpoint,
-    requirePrepared: true,
-  });
-  for (const object of completedPlan.canonical_publication_objects) {
-    const completed = checkpointObjectMap(checkpoint);
+  for (const object of plan.canonical_publication_objects) {
     const reuse = await verifyObservationHistoryV3CheckpointReuse({
       checkpointEntry: completed.get(object.key),
       expected: object,
@@ -1935,7 +1650,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     });
   }
   const v3Publication = await adapters.finalizeV3Publication({
-    plan: completedPlan.v3_publication_plan,
+    plan: plan.v3_publication_plan,
     putIfChanged: adapters.putIfChanged,
     getObject: adapters.getObject,
     recordDurableEvidence: adapters.recordDurableEvidence,
@@ -1948,7 +1663,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     });
   }
   const verification = await verifyObservationHistoryV3MigrationResult({
-    plan: completedPlan,
+    plan,
     getObject: adapters.getObject,
     headObject: adapters.headObject,
     publicationResult: v3Publication,
@@ -2133,15 +1848,11 @@ export async function verifyObservationHistoryV3MigrationResult({
 }
 
 export function buildObservationHistoryV3RerunVerificationPlan({
-  currentPlan = null,
+  currentPlan,
   checkpoint,
 }) {
-  const pinnedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
-    checkpoint,
-    requirePrepared: true,
-  });
   if (
-    checkpoint?.migration_run_id !== pinnedPlan.migration_run_id ||
+    checkpoint?.migration_run_id !== currentPlan?.migration_run_id ||
     checkpoint?.backup_gate?.verified !== true ||
     checkpoint?.rollback_preflight?.verified !== true ||
     checkpoint?.full_verification_complete !== true
@@ -2150,13 +1861,13 @@ export function buildObservationHistoryV3RerunVerificationPlan({
       "Rerun verification requires a matching completed checkpoint with verified pre-state backup evidence",
     );
   }
-  if (
-    currentPlan &&
-    currentPlan.plan_sha256 !== pinnedPlan.plan_sha256
-  ) {
-    throw new Error("Current plan does not match the pinned migration authority");
+  const nonBackupBlockers = currentPlan.blockers.filter(
+    (entry) => !entry.startsWith("verified_dropbox_checkpoint_missing:"),
+  );
+  if (nonBackupBlockers.length) {
+    throw new Error(`Current verification plan is blocked: ${nonBackupBlockers.join(",")}`);
   }
-  for (const entry of pinnedPlan.v3_publication_plan.entries) {
+  for (const entry of currentPlan.v3_publication_plan.entries) {
     const completed = checkpoint.completed_objects?.[entry.key];
     if (
       completed?.verified !== true ||
@@ -2170,7 +1881,9 @@ export function buildObservationHistoryV3RerunVerificationPlan({
     }
   }
   return Object.freeze({
-    ...pinnedPlan,
+    ...currentPlan,
+    backup_gate: checkpoint.backup_gate,
+    rollback_preflight: checkpoint.rollback_preflight,
     blockers: Object.freeze([]),
   });
 }
@@ -2187,6 +1900,7 @@ function restoreStageForKey(key) {
 }
 
 async function addBackupObjectToRestore({ getBackupObject, objects, key, expected = null }) {
+  if (objects.has(key)) return objects.get(key);
   const object = await getRequiredObject(getBackupObject, key, "Dropbox backup");
   if (expected?.byte_size !== undefined && object.byte_size !== expected.byte_size) {
     throw new Error(`Dropbox restore object byte-size mismatch: ${key}`);
@@ -2194,8 +1908,9 @@ async function addBackupObjectToRestore({ getBackupObject, objects, key, expecte
   if (expected?.sha256 && object.sha256 !== expected.sha256) {
     throw new Error(`Dropbox restore object SHA-256 mismatch: ${key}`);
   }
-  const descriptor = Object.freeze({
+  const intent = Object.freeze({
     key,
+    body: object.body,
     byte_size: object.byte_size,
     sha256: object.sha256,
     content_type: key.endsWith(".json")
@@ -2203,50 +1918,30 @@ async function addBackupObjectToRestore({ getBackupObject, objects, key, expecte
       : "application/octet-stream",
     stage: restoreStageForKey(key),
   });
-  const existing = objects.get(key);
-  if (existing && !sameJson(existing, descriptor)) {
-    throw new Error(`Dropbox restore object identity is inconsistent: ${key}`);
-  }
-  objects.set(key, descriptor);
-  return Object.freeze({ ...descriptor, body: object.body });
+  objects.set(key, intent);
+  return intent;
 }
 
 export async function buildObservationHistoryV2RestorePlan({
-  migrationPlan = null,
-  rollbackAuthority = null,
-  checkpoint = null,
+  migrationPlan,
   getBackupObject,
 }) {
-  const checkpointPlan = checkpoint
-    ? buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint })
-    : null;
-  const authority = rollbackAuthority ||
-    checkpointPlan?.rollback_authority ||
-    migrationPlan?.rollback_authority ||
-    (migrationPlan
-      ? {
-          migration_run_id: migrationPlan.migration_run_id,
-          environment: migrationPlan.environment,
-          inventory: migrationPlan.inventory,
-          backup_gate: migrationPlan.backup_gate,
-        }
-      : null);
-  const backupGate = authority?.backup_gate;
+  const backupGate = migrationPlan?.backup_gate;
   if (!backupGate?.verified) {
     throw new Error("Rollback planning requires the verified pre-migration Dropbox checkpoint");
   }
-  if (!authority?.inventory) {
-    throw new Error("Rollback planning requires immutable pre-migration inventory authority");
-  }
   const objects = new Map();
   const preStateIdentityByKey = new Map([
-    ...authority.inventory.hierarchy_objects.map((entry) => [entry.key, entry]),
-    ...authority.inventory.day_manifests.map((entry) => [entry.key, entry]),
-    ...authority.inventory.connector_manifests.map((entry) => [entry.key, entry]),
-    ...authority.inventory.partitions.map((entry) => [
+    ...migrationPlan.inventory.hierarchy_objects.map((entry) => [entry.key, entry]),
+    ...migrationPlan.inventory.day_manifests.map((entry) => [entry.key, entry]),
+    ...migrationPlan.inventory.connector_manifests.map((entry) => [entry.key, entry]),
+    ...migrationPlan.inventory.partitions.map((entry) => [
       entry.manifest_identity.key,
       entry.manifest_identity,
     ]),
+    ...migrationPlan.units.flatMap((unit) =>
+      unit.source_files.map((entry) => [entry.key, entry])
+    ),
   ]);
   const requirePreStateIdentity = (key) => {
     const identity = preStateIdentityByKey.get(key);
@@ -2255,7 +1950,7 @@ export async function buildObservationHistoryV2RestorePlan({
     }
     return identity;
   };
-  for (const aggregate of authority.inventory.hierarchy_objects) {
+  for (const aggregate of migrationPlan.inventory.hierarchy_objects) {
     await addBackupObjectToRestore({
       getBackupObject,
       objects,
@@ -2335,12 +2030,14 @@ export async function buildObservationHistoryV2RestorePlan({
               file.etag_or_hash,
               { objectKey: file.key },
             );
+            const preStateFileIdentity = requirePreStateIdentity(file.key);
             const fileIntent = await addBackupObjectToRestore({
               getBackupObject,
               objects,
               key: file.key,
               expected: {
                 byte_size: file.bytes,
+                sha256: preStateFileIdentity.sha256,
               },
             });
             if (manifestIdentity.type === "sha256") {
@@ -2372,25 +2069,10 @@ export async function buildObservationHistoryV2RestorePlan({
     stageRank[left.stage] - stageRank[right.stage] ||
     Buffer.compare(Buffer.from(left.key), Buffer.from(right.key))
   );
-  if (checkpointPlan) {
-    const pinnedObjects = checkpointPlan.rollback_preflight?.objects || [];
-    const identities = ordered.map(({ key, byte_size, sha256, stage }) => ({
-      key,
-      byte_size,
-      sha256,
-      stage,
-    }));
-    if (!sameJson(identities, pinnedObjects)) {
-      throw new Error(
-        "Dropbox rollback objects differ from the immutable checkpoint authority",
-      );
-    }
-  }
   return Object.freeze({
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
     kind: "uk_aq_observation_history_v2_restore_plan",
-    migration_run_id: authority.migration_run_id,
-    environment: authority.environment,
+    migration_run_id: migrationPlan.migration_run_id,
     backup_checkpoint: Object.freeze({
       inventory_root: backupGate.inventory_root,
       state_root: backupGate.state_root,
@@ -2424,17 +2106,10 @@ export async function executeObservationHistoryV2Rollback({
       v2_index_strategy: restorePlan.v2_index_strategy,
     });
   }
-  const environment = validateObservationHistoryV3MigrationEnvironment({
+  validateObservationHistoryV3MigrationEnvironment({
     ...environmentEvidence,
     apply: true,
-    operation: "rollback",
   });
-  if (
-    restorePlan.environment?.environment !== environment.environment ||
-    restorePlan.environment?.bucket !== environment.bucket
-  ) {
-    throw new Error("Rollback checkpoint environment/bucket authority mismatch");
-  }
   if (writersFrozen !== true) {
     throw new Error("Rollback apply requires explicit confirmation that writers remain frozen");
   }
@@ -2444,26 +2119,13 @@ export async function executeObservationHistoryV2Rollback({
     "getObject",
     "headObject",
     "rebuildV2Indexes",
-    "getBackupObject",
   ]) {
     if (typeof adapters?.[name] !== "function") {
       throw new TypeError(`Rollback apply adapter is missing: ${name}`);
     }
   }
   const evidence = [];
-  for (const descriptor of restorePlan.objects) {
-    const backupObject = await getRequiredObject(
-      adapters.getBackupObject,
-      descriptor.key,
-      "Dropbox rollback authority",
-    );
-    if (
-      backupObject.byte_size !== descriptor.byte_size ||
-      backupObject.sha256 !== descriptor.sha256
-    ) {
-      throw new Error(`Dropbox rollback object identity changed: ${descriptor.key}`);
-    }
-    const object = { ...descriptor, body: backupObject.body };
+  for (const object of restorePlan.objects) {
     if (object.stage === "canonical_parquet") {
       const putEvidence = await adapters.putChecksumObject(object);
       const head = await adapters.headObject({ key: object.key });
@@ -2494,7 +2156,6 @@ export async function executeObservationHistoryV2Rollback({
     ok: true,
     status: "rollback_canonical_restored_v2_index_rebuilt",
     dry_run: false,
-    observed_starting_index_version: environment.index_version,
     restored_objects: Object.freeze(evidence),
     v2_index_rebuild: indexResult,
     configuration_changed: false,
@@ -2546,15 +2207,13 @@ export function buildObservationHistoryV3MigrationAuditReport({
     partition_results: plan.units.map((unit) => ({
       scope: unit.scope,
       old_row_count: unit.source_row_count,
-      new_row_count: unit.target_metadata?.row_count ?? null,
+      new_row_count: unit.target_metadata.row_count,
       old_observation_content_hash: unit.source_observation_content_hash,
-      new_observation_content_hash:
-        unit.target_metadata?.observation_content_hash ?? null,
+      new_observation_content_hash: unit.target_metadata.observation_content_hash,
       old_file_count: unit.source_files.length,
-      new_file_count: unit.target_file_count ?? null,
-      new_row_group_count: unit.target_row_group_count ?? null,
-      verification_status_counts:
-        unit.target_metadata?.verification_status_counts ?? null,
+      new_file_count: unit.target_file_count,
+      new_row_group_count: unit.target_row_group_count,
+      verification_status_counts: unit.target_metadata.verification_status_counts,
     })),
     target_writer_version: plan.target.writer_version,
     target_history_schema_version: plan.target.history_schema_version,
@@ -2572,7 +2231,5 @@ export function buildObservationHistoryV3MigrationAuditReport({
     ),
     rollback_required: rollback?.required === true,
     rollback_status: rollback?.status || "not_run",
-    rollback_observed_starting_index_version:
-      rollback?.observed_starting_index_version || null,
   };
 }

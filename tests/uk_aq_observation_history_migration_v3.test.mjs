@@ -41,6 +41,7 @@ import {
   DEFAULT_V2_LATEST_KEY,
   buildObservationHistoryV2RestorePlan,
   buildObservationHistoryV3MigrationPlan,
+  buildObservationHistoryV3MigrationPlanFromCheckpoint,
   buildObservationHistoryV3RerunVerificationPlan,
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
@@ -62,6 +63,12 @@ const LIMITS = Object.freeze({
   target_file_bytes: 1_000_000,
   max_file_bytes: 2_000_000,
   max_row_groups_per_file: 2,
+});
+const SOURCE_LIMITS = Object.freeze({
+  ...LIMITS,
+  target_row_group_rows: 4,
+  max_row_group_rows: 4,
+  max_row_groups_per_file: 1,
 });
 const ENVIRONMENT = Object.freeze({
   environment: "CIC-Test",
@@ -114,50 +121,66 @@ function mapReader(objects) {
 }
 
 async function buildFixture() {
-  const rows = [
+  const baseRows = [
     [100, "2026-01-02T00:00:00.000Z", 10, "P"],
     [100, "2026-01-02T01:00:00.000Z", 11, "R"],
     [1000, "2026-01-02T00:30:00.000Z", 20, "P"],
     [1000, "2026-01-02T01:30:00.000Z", 21, "R"],
-  ].map(([timeseriesId, observedAtUtc, value, verificationStatus]) => ({
+  ];
+  const pollutantInputs = [
+    ["pm25", baseRows],
+    ["pm10", baseRows.map(([timeseriesId, ...rest]) => [timeseriesId + 2000, ...rest])],
+  ];
+  const sources = [];
+  const pollutants = [];
+  for (const [pollutantCode, inputRows] of pollutantInputs) {
+    const rows = inputRows.map(([timeseriesId, observedAtUtc, value, verificationStatus]) => ({
     connector_id: 1,
     station_id: timeseriesId + 1,
     timeseries_id: timeseriesId,
-    pollutant_code: "pm25",
+    pollutant_code: pollutantCode,
     observed_at_utc: observedAtUtc,
     value,
     verification_status: verificationStatus,
-  }));
-  const source = buildCanonicalObservationTimeseriesBoundedFiles(rows, {
-    limits: LIMITS,
-    fileKeyForOrdinal: (ordinal) =>
-      `${PREFIX}/day_utc=${DAY}/connector_id=1/pollutant_code=pm25/part-${String(ordinal).padStart(5, "0")}.parquet`,
-  });
-  const pollutantKey = buildHistoryV2PollutantManifestKey(PREFIX, DAY, 1, "pm25");
-  const pollutant = buildHistoryV2PollutantManifest({
-    domain: "observations",
-    dayUtc: DAY,
-    connectorId: 1,
-    pollutantCode: "pm25",
-    manifestKey: pollutantKey,
-    sourceRowCount: source.metadata.row_count,
-    fileEntries: source.metadata.files.map((file) => fileEntry(file, "pm25")),
-    writerGitSha: "fixture-source",
-    backedUpAtUtc: "2026-01-03T00:00:00.000Z",
-    observationContentHash: metadataHash(source.metadata),
-    physicalSchema: {
-      history_schema_version: source.metadata.history_schema_version,
-      columns: [...source.metadata.columns],
-      writer_version: source.metadata.writer_version,
-    },
-  });
+    }));
+    const source = buildCanonicalObservationTimeseriesBoundedFiles(rows, {
+      limits: SOURCE_LIMITS,
+      fileKeyForOrdinal: (ordinal) =>
+        `${PREFIX}/day_utc=${DAY}/connector_id=1/pollutant_code=${pollutantCode}/part-${String(ordinal).padStart(5, "0")}.parquet`,
+    });
+    const pollutantKey = buildHistoryV2PollutantManifestKey(
+      PREFIX,
+      DAY,
+      1,
+      pollutantCode,
+    );
+    const pollutant = buildHistoryV2PollutantManifest({
+      domain: "observations",
+      dayUtc: DAY,
+      connectorId: 1,
+      pollutantCode,
+      manifestKey: pollutantKey,
+      sourceRowCount: source.metadata.row_count,
+      fileEntries: source.metadata.files.map((file) => fileEntry(file, pollutantCode)),
+      writerGitSha: "fixture-source",
+      backedUpAtUtc: "2026-01-03T00:00:00.000Z",
+      observationContentHash: metadataHash(source.metadata),
+      physicalSchema: {
+        history_schema_version: source.metadata.history_schema_version,
+        columns: [...source.metadata.columns],
+        writer_version: source.metadata.writer_version,
+      },
+    });
+    sources.push(source);
+    pollutants.push({ key: pollutantKey, payload: pollutant });
+  }
   const connectorKey = buildHistoryV2ConnectorManifestKey(PREFIX, DAY, 1);
   const connector = buildHistoryV2ConnectorManifest({
     domain: "observations",
     dayUtc: DAY,
     connectorId: 1,
     manifestKey: connectorKey,
-    pollutantManifests: [pollutant],
+    pollutantManifests: pollutants.map((entry) => entry.payload),
     writerGitSha: "fixture-source",
     backedUpAtUtc: "2026-01-03T00:00:00.000Z",
   });
@@ -176,18 +199,22 @@ async function buildFixture() {
   });
   const r2 = new Map();
   const backup = new Map();
-  for (const file of source.file_bodies) r2.set(file.key, Buffer.from(file.body));
+  for (const source of sources) {
+    for (const file of source.file_bodies) r2.set(file.key, Buffer.from(file.body));
+  }
   for (const [key, value] of [
-    [pollutantKey, pollutant],
+    ...pollutants.map((entry) => [entry.key, entry.payload]),
     [connectorKey, connector],
     [dayKey, day],
   ]) r2.set(key, jsonBody(value));
   for (const object of hierarchy.objects) r2.set(object.key, Buffer.from(object.body));
   r2.set(DEFAULT_V2_LATEST_KEY, jsonBody({ generation: "fixture-v2" }));
-  r2.set(
-    `history/_index_v2/observations_timeseries/day_utc=${DAY}/connector_id=1/pollutant_code=pm25/manifest.json`,
-    jsonBody({ scope: "fixture-v2" }),
-  );
+  for (const { payload } of pollutants) {
+    r2.set(
+      `history/_index_v2/observations_timeseries/day_utc=${DAY}/connector_id=1/pollutant_code=${payload.pollutant_code}/manifest.json`,
+      jsonBody({ scope: `fixture-v2-${payload.pollutant_code}` }),
+    );
+  }
   for (const [key, value] of r2) {
     if (key.startsWith(PREFIX)) backup.set(key, Buffer.from(value));
   }
@@ -274,7 +301,8 @@ async function buildFixture() {
   return {
     r2,
     backup,
-    source,
+    source: sources[0],
+    sources,
     oldCanonical: new Map(
       [...backup].filter(([key]) => key.startsWith(PREFIX)),
     ),
@@ -298,14 +326,23 @@ async function buildPlan(fixture, overrides = {}) {
   });
 }
 
-function memoryAdapters(fixture) {
+function memoryAdapters(fixture, options = {}) {
   const storedSha = new Map();
+  const stagedBodies = new Map();
+  const activeStagedUnits = new Set();
   let rebuildCalls = 0;
+  let putCalls = 0;
+  let maxStagedUnits = 0;
+  let maxStagedBodies = 0;
   const checkpoints = [];
   const getObject = mapReader(fixture.r2);
   return {
     storedSha,
     checkpoints,
+    get putCalls() { return putCalls; },
+    get maxStagedUnits() { return maxStagedUnits; },
+    get maxStagedBodies() { return maxStagedBodies; },
+    get stagedBodyCount() { return stagedBodies.size; },
     get rebuildCalls() { return rebuildCalls; },
     getObject,
     headObject: async ({ key }) => fixture.r2.has(key)
@@ -316,6 +353,10 @@ function memoryAdapters(fixture) {
         }
       : { exists: false },
     putChecksumObject: async (intent) => {
+      putCalls += 1;
+      if (options.failPutCall === putCalls) {
+        throw new Error(`fixture deliberate PUT failure ${putCalls}`);
+      }
       assert.equal(sha256Hex(intent.body), intent.sha256);
       fixture.r2.set(intent.key, Buffer.from(intent.body));
       storedSha.set(intent.key, intent.sha256);
@@ -335,7 +376,37 @@ function memoryAdapters(fixture) {
       return { ok: true, status: "written" };
     },
     recordDurableEvidence: async () => ({ durable: true }),
-    writeCheckpoint: async (checkpoint) => checkpoints.push(structuredClone(checkpoint)),
+    writeCheckpoint: async (checkpoint) => {
+      if (options.failCheckpointCall === checkpoints.length + 1) {
+        throw new Error(`fixture deliberate checkpoint failure ${checkpoints.length + 1}`);
+      }
+      checkpoints.push(structuredClone(checkpoint));
+    },
+    stageUnit: async ({ unitId, intents }) => {
+      activeStagedUnits.add(unitId);
+      const staged = intents.map((intent, index) => {
+        const stagingRef = `${unitId}:${index}`;
+        stagedBodies.set(stagingRef, Buffer.from(intent.body));
+        return {
+          key: intent.key,
+          byte_size: intent.byte_size,
+          sha256: intent.sha256,
+          staging_ref: stagingRef,
+        };
+      });
+      maxStagedUnits = Math.max(maxStagedUnits, activeStagedUnits.size);
+      maxStagedBodies = Math.max(maxStagedBodies, stagedBodies.size);
+      return staged;
+    },
+    readStagedBody: async ({ staging_ref: stagingRef }) => {
+      if (!stagedBodies.has(stagingRef)) throw new Error("fixture staged body missing");
+      return Buffer.from(stagedBodies.get(stagingRef));
+    },
+    releaseStagedUnit: async ({ unitId, intents }) => {
+      for (const intent of intents) stagedBodies.delete(intent.staging_ref);
+      activeStagedUnits.delete(unitId);
+    },
+    getBackupObject: mapReader(fixture.backup),
     finalizeV3Publication: (options) => finalizeObservationHistoryIndexV3Publication(options),
     rebuildV2Indexes: async () => {
       rebuildCalls += 1;
@@ -344,28 +415,25 @@ function memoryAdapters(fixture) {
   };
 }
 
-test("Phase 4 planner is deterministic, manifest-guided, checksum-aware and backup-gated", async () => {
+test("Phase 4 planner is deterministic, backup-gated and retains no target archive bodies", async () => {
   const fixture = await buildFixture();
   const first = await buildPlan(fixture);
   const second = await buildPlan(fixture);
   assert.equal(first.plan_sha256, second.plan_sha256);
-  assert.equal(first.units.length, 1);
+  assert.equal(first.units.length, 2);
   assert.deepEqual(first.units[0].scope, {
     day_utc: DAY,
     connector_id: 1,
-    pollutant_code: "pm25",
+    pollutant_code: "pm10",
   });
-  assert.equal(first.units[0].source_row_count, first.units[0].target_metadata.row_count);
-  assert.equal(
-    first.units[0].source_observation_content_hash,
-    first.units[0].target_metadata.observation_content_hash,
-  );
-  assert.equal(first.units[0].target_metadata.writer_version, "parquet-wasm-zstd-v3");
-  assert.ok(first.units[0].v3_hierarchy.child_shards.length >= 2);
-  for (const intent of first.units[0].target_file_intents) {
-    assert.equal(intent.sha256, sha256Hex(intent.body));
-    assert.equal(intent.byte_size, intent.body.byteLength);
-  }
+  assert.equal(first.units[0].target_metadata, undefined);
+  assert.equal(first.canonical_publication_objects.length, 0);
+  assert.equal(first.v3_publication_plan, null);
+  assert.equal(first.estimated.new_parquet_objects, null);
+  assert.ok(first.units.every((unit) =>
+    unit.source_files.every((file) => /^[0-9a-f]{64}$/.test(file.sha256))
+  ));
+  assert.ok(first.rollback_preflight.objects.every((entry) => entry.body === undefined));
   assert.equal(first.backup_gate.verified, true);
   assert.deepEqual(
     first.writer_freeze_plan.entries.map((entry) => entry.id),
@@ -384,7 +452,7 @@ test("Phase 4 planner is deterministic, manifest-guided, checksum-aware and back
   assert.ok(blocked.blockers.some((entry) => entry.startsWith("verified_dropbox_checkpoint_missing:")));
 });
 
-test("Phase 4 apply requires explicit guards, exact HEAD checksum and full v3 authority", async () => {
+test("Phase 4 persists immutable authority before the first PUT and preserves apply guards", async () => {
   const fixture = await buildFixture();
   const plan = await buildPlan(fixture);
   const dryRun = await executeObservationHistoryV3MigrationPlan({
@@ -413,6 +481,30 @@ test("Phase 4 apply requires explicit guards, exact HEAD checksum and full v3 au
     }),
     /environment guard failed/,
   );
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: { ...ENVIRONMENT, indexVersion: "v3" },
+      adapters: {},
+    }),
+    /deployed_observation_index_must_remain_v2/,
+  );
+  const checkpointFailure = memoryAdapters(fixture, { failCheckpointCall: 1 });
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters: checkpointFailure,
+    }),
+    /deliberate checkpoint failure/,
+  );
+  assert.equal(checkpointFailure.putCalls, 0);
+  assert.equal(checkpointFailure.stagedBodyCount, 0);
+
   const missingShaAdapters = memoryAdapters(fixture);
   missingShaAdapters.headObject = async ({ key }) => fixture.r2.has(key)
     ? { exists: true, bytes: fixture.r2.get(key).byteLength, sha256: null }
@@ -427,7 +519,9 @@ test("Phase 4 apply requires explicit guards, exact HEAD checksum and full v3 au
     }),
     /stored R2 SHA-256/,
   );
+});
 
+test("Phase 4 multi-partition apply is bounded, exact and byte-identical on rerun", async () => {
   const fresh = await buildFixture();
   const freshPlan = await buildPlan(fresh);
   const adapters = memoryAdapters(fresh);
@@ -441,12 +535,14 @@ test("Phase 4 apply requires explicit guards, exact HEAD checksum and full v3 au
   assert.equal(execution.verification.cutover_ready, true);
   assert.equal(execution.checkpoint.full_verification_complete, true);
   assert.ok(adapters.checkpoints.length > 0);
-  const currentPlan = await buildPlan(fresh);
-  assert.ok(currentPlan.blockers.every((entry) =>
-    entry.startsWith("verified_dropbox_checkpoint_missing:")
+  assert.equal(adapters.maxStagedUnits, 1);
+  assert.equal(adapters.maxStagedBodies, 1);
+  assert.equal(adapters.stagedBodyCount, 0);
+  assert.equal(execution.checkpoint.preparation_order.length, 2);
+  assert.ok(Object.values(execution.checkpoint.prepared_units).every((unit) =>
+    unit.target_file_intents.every((intent) => intent.staging_ref === undefined)
   ));
   const rerunPlan = buildObservationHistoryV3RerunVerificationPlan({
-    currentPlan,
     checkpoint: execution.checkpoint,
   });
   const rerun = await verifyObservationHistoryV3MigrationResult({
@@ -456,21 +552,53 @@ test("Phase 4 apply requires explicit guards, exact HEAD checksum and full v3 au
     publicationResult: { ok: true, checkpoint_evidence: true },
   });
   assert.equal(rerun.cutover_ready, true);
+  for (const unit of rerunPlan.units) {
+    assert.equal(unit.source_row_count, unit.target_metadata.row_count);
+    assert.equal(
+      unit.source_observation_content_hash,
+      unit.target_metadata.observation_content_hash,
+    );
+    assert.deepEqual(
+      unit.source_verification_status_counts,
+      unit.target_metadata.verification_status_counts,
+    );
+  }
+  const beforeRerun = new Map(
+    [...fresh.r2].map(([key, body]) => [key, Buffer.from(body)]),
+  );
+  const checksumPutsBeforeRerun = adapters.putCalls;
+  const pinnedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: execution.checkpoint,
+  });
+  const noOp = await executeObservationHistoryV3MigrationPlan({
+    plan: pinnedPlan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    checkpoint: execution.checkpoint,
+    adapters,
+  });
+  assert.equal(noOp.verification.cutover_ready, true);
+  assert.equal(adapters.putCalls, checksumPutsBeforeRerun);
+  assert.deepEqual([...fresh.r2.keys()].sort(), [...beforeRerun.keys()].sort());
+  for (const [key, expected] of beforeRerun) {
+    assert.equal(Buffer.compare(fresh.r2.get(key), expected), 0, key);
+  }
 
-  fresh.r2.delete(freshPlan.v3_latest.key);
+  fresh.r2.delete(rerunPlan.v3_latest.key);
   const incomplete = await verifyObservationHistoryV3MigrationResult({
-    plan: freshPlan,
+    plan: rerunPlan,
     getObject: adapters.getObject,
     headObject: adapters.headObject,
     publicationResult: { ok: true },
   });
   assert.equal(incomplete.cutover_ready, false);
   assert.ok(incomplete.blockers.some((entry) => entry.includes("v3_latest")));
-  fresh.r2.set(freshPlan.v3_latest.key, Buffer.from(freshPlan.v3_latest.body));
-  const child = freshPlan.units[0].v3_hierarchy.child_shards[0];
+  fresh.r2.set(rerunPlan.v3_latest.key, Buffer.from(rerunPlan.v3_latest.body));
+  const child = rerunPlan.units[0].v3_hierarchy.child_shards[0];
   fresh.r2.set(child.key, Buffer.from(`${child.body} `));
   const mismatched = await verifyObservationHistoryV3MigrationResult({
-    plan: freshPlan,
+    plan: rerunPlan,
     getObject: adapters.getObject,
     headObject: adapters.headObject,
     publicationResult: { ok: true },
@@ -479,6 +607,49 @@ test("Phase 4 apply requires explicit guards, exact HEAD checksum and full v3 au
   assert.ok(mismatched.blockers.some((entry) =>
     entry.startsWith("scoped_root_child_authority_mismatch:")
   ));
+});
+
+test("Phase 4 resumes after an early PUT failure without rereading overwritten source", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture);
+  const adapters = memoryAdapters(fixture, { failPutCall: 2 });
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters,
+    }),
+    /deliberate PUT failure 2/,
+  );
+  const interrupted = adapters.checkpoints.at(-1);
+  assert.equal(interrupted.preparation_order.length, 2);
+  assert.equal(Object.keys(interrupted.completed_objects).filter((key) =>
+    key.endsWith(".parquet")
+  ).length, 1);
+  const sourceKeys = new Set(plan.units.flatMap((unit) =>
+    unit.source_files.map((file) => file.key)
+  ));
+  let sourceReadsDuringResume = 0;
+  const originalGetObject = adapters.getObject;
+  adapters.getObject = async ({ key }) => {
+    if (sourceKeys.has(key)) sourceReadsDuringResume += 1;
+    return originalGetObject({ key });
+  };
+  const resumed = await executeObservationHistoryV3MigrationPlan({
+    plan: buildObservationHistoryV3MigrationPlanFromCheckpoint({
+      checkpoint: interrupted,
+    }),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    checkpoint: interrupted,
+    adapters,
+  });
+  assert.equal(resumed.verification.cutover_ready, true);
+  assert.equal(sourceReadsDuringResume, 0);
+  assert.equal(adapters.putCalls, 3);
 });
 
 test("Phase 4 checkpoint reuse requires exact current stored identity", async () => {
@@ -533,18 +704,76 @@ test("Phase 4 checkpoint reuse requires exact current stored identity", async ()
   assert.equal(stale.reusable, false);
 });
 
-test("Phase 4 rollback is backup-manifest driven and rebuilds observation _index_v2", async () => {
+test("Phase 4 rollback restores from the checkpoint after partial migration with index v3", async () => {
   const fixture = await buildFixture();
   const plan = await buildPlan(fixture);
+  const adapters = memoryAdapters(fixture, { failPutCall: 2 });
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters,
+    }),
+    /deliberate PUT failure 2/,
+  );
+  const checkpoint = adapters.checkpoints.at(-1);
+  const overwrittenKey = plan.units[0].source_files[0].key;
+  assert.notEqual(
+    sha256Hex(fixture.r2.get(overwrittenKey)),
+    sha256Hex(fixture.oldCanonical.get(overwrittenKey)),
+  );
+  assert.equal(
+    sha256Hex(fixture.r2.get(plan.inventory.root_manifest.key)),
+    plan.inventory.root_manifest.sha256,
+  );
   const restorePlan = await buildObservationHistoryV2RestorePlan({
-    migrationPlan: plan,
+    checkpoint,
     getBackupObject: mapReader(fixture.backup),
   });
   assert.equal(restorePlan.ready, true);
   assert.ok(restorePlan.objects.some((entry) => entry.stage === "canonical_parquet"));
   assert.ok(restorePlan.objects.some((entry) => entry.stage === "root_manifest"));
   assert.equal(restorePlan.v2_index_strategy.mode, "rebuild");
+  const rollback = await executeObservationHistoryV2Rollback({
+    restorePlan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: { ...ENVIRONMENT, indexVersion: "v3" },
+    adapters,
+  });
+  assert.equal(rollback.ok, true);
+  assert.equal(rollback.observed_starting_index_version, "v3");
+  assert.equal(adapters.rebuildCalls, 1);
+  for (const [key, expected] of fixture.oldCanonical) {
+    assert.equal(Buffer.compare(fixture.r2.get(key), expected), 0, key);
+  }
+  assert.equal(rollback.configuration_changed, false);
+  assert.equal(rollback.scheduler_changed, false);
+  assert.equal(rollback.deployment_changed, false);
+});
+
+test("Phase 4 rollback restores from the same checkpoint after completed migration", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture);
   const adapters = memoryAdapters(fixture);
+  const migration = await executeObservationHistoryV3MigrationPlan({
+    plan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  });
+  assert.equal(migration.verification.cutover_ready, true);
+  assert.notEqual(
+    sha256Hex(fixture.r2.get(plan.inventory.root_manifest.key)),
+    plan.inventory.root_manifest.sha256,
+  );
+  const restorePlan = await buildObservationHistoryV2RestorePlan({
+    checkpoint: migration.checkpoint,
+    getBackupObject: mapReader(fixture.backup),
+  });
   const rollback = await executeObservationHistoryV2Rollback({
     restorePlan,
     apply: true,
@@ -557,7 +786,54 @@ test("Phase 4 rollback is backup-manifest driven and rebuilds observation _index
   for (const [key, expected] of fixture.oldCanonical) {
     assert.equal(Buffer.compare(fixture.r2.get(key), expected), 0, key);
   }
-  assert.equal(rollback.configuration_changed, false);
-  assert.equal(rollback.scheduler_changed, false);
-  assert.equal(rollback.deployment_changed, false);
+});
+
+test("Phase 4 rejects a checkpoint whose immutable authority was tampered", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture);
+  const adapters = memoryAdapters(fixture, { failPutCall: 1 });
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters,
+    }),
+    /deliberate PUT failure 1/,
+  );
+  const tampered = structuredClone(adapters.checkpoints.at(-1));
+  const validCheckpoint = structuredClone(adapters.checkpoints.at(-1));
+  const restorePlan = await buildObservationHistoryV2RestorePlan({
+    checkpoint: validCheckpoint,
+    getBackupObject: mapReader(fixture.backup),
+  });
+  const wrongBucketAdapters = memoryAdapters(fixture);
+  await assert.rejects(
+    executeObservationHistoryV2Rollback({
+      restorePlan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: {
+        ...ENVIRONMENT,
+        bucket: "wrong-fixture-bucket",
+        expectedBucket: "wrong-fixture-bucket",
+      },
+      adapters: wrongBucketAdapters,
+    }),
+    /environment\/bucket authority mismatch/,
+  );
+  assert.equal(wrongBucketAdapters.putCalls, 0);
+  tampered.authority.inventory.root_manifest.sha256 = "0".repeat(64);
+  assert.throws(
+    () => buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: tampered }),
+    /immutable authority is missing or invalid/,
+  );
+  await assert.rejects(
+    buildObservationHistoryV2RestorePlan({
+      checkpoint: tampered,
+      getBackupObject: mapReader(fixture.backup),
+    }),
+    /immutable authority is missing or invalid/,
+  );
 });
