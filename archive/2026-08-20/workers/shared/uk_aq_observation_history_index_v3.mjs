@@ -23,7 +23,7 @@ export const DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT =
 export const DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY =
   "history/_index_v3/observations_timeseries_latest.json";
 export const OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONTRACT =
-  "observation-history-index-v3-publication-v2";
+  "observation-history-index-v3-publication-v1";
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -156,16 +156,7 @@ function identityDescriptor({ key, byte_size, sha256, kind = null }) {
   };
 }
 
-// Content dependencies are reflected in payload semantics. Publication
-// prerequisites are scheduling-only evidence and never enter body/SHA identity.
-function artifactFromPayload({
-  kind,
-  key,
-  payload,
-  dependencies,
-  publicationPrerequisites = [],
-  stage,
-}) {
+function artifactFromPayload({ kind, key, payload, dependencies, stage }) {
   const body = encodeObservationHistoryIndexV3Json(payload);
   const bodyBuffer = Buffer.from(body, "utf8");
   return Object.freeze({
@@ -179,11 +170,6 @@ function artifactFromPayload({
     publication_stage: stage,
     dependencies: Object.freeze(
       [...dependencies].sort((left, right) => bytewiseCompare(left.key, right.key)),
-    ),
-    publication_prerequisites: Object.freeze(
-      [...publicationPrerequisites].sort((left, right) =>
-        bytewiseCompare(left.key, right.key)
-      ),
     ),
   });
 }
@@ -394,54 +380,6 @@ function assertExactDependencies(artifact, expected, allowedKinds) {
     actual,
     normalizedExpected,
     `${artifact.kind} dependencies do not exactly match semantic references`,
-  );
-}
-
-function normalizeArtifactPublicationPrerequisites(artifact, allowedKinds) {
-  if (!Array.isArray(artifact.publication_prerequisites)) {
-    throw new TypeError(
-      `${artifact.kind} publication_prerequisites must be an array`,
-    );
-  }
-  const prerequisites = artifact.publication_prerequisites.map((raw) => {
-    const kind = String(raw?.kind || "").trim();
-    if (!allowedKinds.has(kind)) {
-      throw new Error(`${artifact.kind} has unsupported publication prerequisite kind`);
-    }
-    const prerequisite = identityDescriptor({ ...raw, kind });
-    assertSameJson(
-      raw,
-      prerequisite,
-      `${artifact.kind} publication prerequisite has unsupported fields`,
-    );
-    return prerequisite;
-  }).sort((left, right) => bytewiseCompare(left.key, right.key));
-  const keys = new Set();
-  for (const prerequisite of prerequisites) {
-    if (keys.has(prerequisite.key)) {
-      throw new Error(`${artifact.kind} has duplicate publication prerequisites`);
-    }
-    keys.add(prerequisite.key);
-  }
-  return prerequisites;
-}
-
-function assertExactPublicationPrerequisites(
-  artifact,
-  expected,
-  allowedKinds,
-) {
-  const actual = normalizeArtifactPublicationPrerequisites(
-    artifact,
-    allowedKinds,
-  );
-  const normalizedExpected = [...expected]
-    .map((entry) => identityDescriptor(entry))
-    .sort((left, right) => bytewiseCompare(left.key, right.key));
-  assertSameJson(
-    actual,
-    normalizedExpected,
-    `${artifact.kind} publication prerequisites do not exactly match ordering evidence`,
   );
 }
 
@@ -959,14 +897,18 @@ export function buildObservationHistoryIndexV3ChildShard({
     connector_id: normalized.scope.connector_id,
     pollutant_code: normalized.scope.pollutant_code,
     row_start_scope: "file",
+    canonical_source_manifest: source,
     coverage: null,
     files,
     timeseries,
   };
   payload.coverage = childCoverage(payload);
-  const dependencies = files.map((file) =>
-    identityDescriptor({ ...file, kind: "canonical_parquet" })
-  );
+  const dependencies = [
+    identityDescriptor({ ...source, kind: "canonical_manifest" }),
+    ...files.map((file) =>
+      identityDescriptor({ ...file, kind: "canonical_parquet" })
+    ),
+  ];
   const artifact = artifactFromPayload({
     kind: "observation_history_index_v3_child_shard",
     key: buildObservationHistoryIndexV3ChildShardKey({
@@ -976,9 +918,6 @@ export function buildObservationHistoryIndexV3ChildShard({
     }),
     payload,
     dependencies,
-    publicationPrerequisites: [
-      identityDescriptor({ ...source, kind: "canonical_manifest" }),
-    ],
     stage: "child_shard",
   });
   validateObservationHistoryIndexV3ChildShardArtifact({ artifact, indexRoot });
@@ -1140,20 +1079,10 @@ export function validateObservationHistoryIndexV3ChildShardArtifact({
   );
   const rawPayload = artifact.payload;
   const scope = normalizeScope(rawPayload);
-  const publicationPrerequisites = normalizeArtifactPublicationPrerequisites(
-    artifact,
-    new Set(["canonical_manifest"]),
+  const source = normalizeCanonicalManifestDescriptor(
+    rawPayload.canonical_source_manifest,
+    scope,
   );
-  if (publicationPrerequisites.length !== 1) {
-    throw new Error("V3 child requires one canonical-manifest publication prerequisite");
-  }
-  const canonicalPrerequisite = publicationPrerequisites[0];
-  const expectedManifestScopeToken =
-    `/day_utc=${scope.day_utc}/connector_id=${scope.connector_id}` +
-    `/pollutant_code=${scope.pollutant_code}/manifest.json`;
-  if (!canonicalPrerequisite.key.endsWith(expectedManifestScopeToken)) {
-    throw new Error("V3 child publication prerequisite disagrees with scope");
-  }
   const rangeStart = normalizeRangeStart(rawPayload.range_start);
   const rangeEnd = rangeStart + OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3 - 1;
   if (Number(rawPayload.range_end) !== rangeEnd) {
@@ -1254,6 +1183,7 @@ export function validateObservationHistoryIndexV3ChildShardArtifact({
     connector_id: scope.connector_id,
     pollutant_code: scope.pollutant_code,
     row_start_scope: "file",
+    canonical_source_manifest: source,
     coverage: childCoverage({ files, timeseries }),
     files,
     timeseries,
@@ -1271,20 +1201,18 @@ export function validateObservationHistoryIndexV3ChildShardArtifact({
   if (artifact.key !== expectedKey) throw new Error("V3 child key is non-canonical");
   assertExactDependencies(
     artifact,
-    files.map((file) =>
-      identityDescriptor({ ...file, kind: "canonical_parquet" })
-    ),
-    new Set(["canonical_parquet"]),
-  );
-  assertExactPublicationPrerequisites(
-    artifact,
-    [canonicalPrerequisite],
-    new Set(["canonical_manifest"]),
+    [
+      identityDescriptor({ ...source, kind: "canonical_manifest" }),
+      ...files.map((file) =>
+        identityDescriptor({ ...file, kind: "canonical_parquet" })
+      ),
+    ],
+    new Set(["canonical_manifest", "canonical_parquet"]),
   );
   return Object.freeze({
     artifact,
     scope,
-    canonical_prerequisite: canonicalPrerequisite,
+    source,
     range_start: rangeStart,
     range_end: rangeEnd,
     files: Object.freeze(files),
@@ -1487,7 +1415,6 @@ function validateObservationHistoryIndexV3ScopedManifestSnapshot({
     ],
     new Set(["canonical_manifest", "child_shard"]),
   );
-  assertExactPublicationPrerequisites(artifact, [], new Set());
   return Object.freeze({ artifact, scope, source, descriptors });
 }
 
@@ -1510,10 +1437,6 @@ export function validateObservationHistoryIndexV3ScopedManifestArtifact({
     rawPayload.canonical_source_manifest,
     scope,
   );
-  const sourcePublicationIdentity = identityDescriptor({
-    ...source,
-    kind: "canonical_manifest",
-  });
   const children = childShards.map((child) =>
     validateObservationHistoryIndexV3ChildShardArtifact({
       artifact: child,
@@ -1529,10 +1452,7 @@ export function validateObservationHistoryIndexV3ScopedManifestArtifact({
       throw new Error("Scoped v3 manifest has duplicate shard ranges");
     }
     seenRanges.add(child.range_start);
-    if (
-      !sameJson(child.scope, scope) ||
-      !sameJson(child.canonical_prerequisite, sourcePublicationIdentity)
-    ) {
+    if (!sameJson(child.scope, scope) || !sameJson(child.source, source)) {
       throw new Error("Scoped v3 manifest received a contradictory child shard");
     }
     for (const entry of child.timeseries) {
@@ -1638,20 +1558,16 @@ export function buildObservationHistoryIndexV3ScopedManifest({
     throw new Error("Scoped v3 manifest requires child shard dependencies");
   }
   const children = childShards.map((rawArtifact) => {
-    const validated = validateObservationHistoryIndexV3ChildShardArtifact({
+    const { artifact } = validateObservationHistoryIndexV3ChildShardArtifact({
       artifact: rawArtifact,
       indexRoot,
     });
-    const { artifact } = validated;
     const payload = artifact.payload;
     if (
       payload.day_utc !== normalized.scope.day_utc ||
       payload.connector_id !== normalized.scope.connector_id ||
       payload.pollutant_code !== normalized.scope.pollutant_code ||
-      !sameJson(
-        validated.canonical_prerequisite,
-        identityDescriptor({ ...source, kind: "canonical_manifest" }),
-      )
+      !sameJson(payload.canonical_source_manifest, source)
     ) {
       throw new Error("Scoped v3 manifest received a contradictory child shard");
     }
@@ -2003,7 +1919,6 @@ function validateObservationHistoryIndexV3LatestSnapshot({
     ),
     new Set(["scoped_manifest"]),
   );
-  assertExactPublicationPrerequisites(artifact, [], new Set());
   return Object.freeze({ artifact, roots: Object.freeze(roots) });
 }
 
@@ -2129,10 +2044,7 @@ export function updateObservationHistoryIndexV3ScopedManifest({
     }
     if (
       !sameJson(validated.scope, existing.scope) ||
-      !sameJson(
-        validated.canonical_prerequisite,
-        identityDescriptor({ ...source, kind: "canonical_manifest" }),
-      )
+      !sameJson(validated.source, source)
     ) {
       throw new Error("Targeted scoped update replacement disagrees with scope or source");
     }
@@ -2153,6 +2065,16 @@ export function updateObservationHistoryIndexV3ScopedManifest({
     }
     removals.add(rangeStart);
     byRange.delete(rangeStart);
+  }
+  if (!sameJson(source, existing.source)) {
+    const untouchedRanges = [...byRange.keys()].filter(
+      (rangeStart) => !replacementRanges.has(rangeStart),
+    );
+    if (untouchedRanges.length > 0) {
+      throw new Error(
+        "Targeted scoped update changed canonical source without replacing every retained child",
+      );
+    }
   }
   const descriptors = [...byRange.values()].sort(
     (left, right) => left.range_start - right.range_start,
@@ -2270,20 +2192,6 @@ export function updateObservationHistoryIndexV3Latest({
   return artifact;
 }
 
-function normalizePublicationReferences(raw, fieldName) {
-  const references = (Array.isArray(raw) ? raw : [])
-    .map((reference) => identityDescriptor(reference))
-    .sort((left, right) => bytewiseCompare(left.key, right.key));
-  const keys = new Set();
-  for (const reference of references) {
-    if (keys.has(reference.key)) {
-      throw new Error(`Duplicate publication ${fieldName}: ${reference.key}`);
-    }
-    keys.add(reference.key);
-  }
-  return references;
-}
-
 function normalizePublicationObject(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new TypeError("Publication object must be an artifact object");
@@ -2310,21 +2218,15 @@ function normalizePublicationObject(raw) {
   if (body.byteLength !== byteSize || sha256Hex(body) !== sha256) {
     throw new Error(`Publication object identity mismatch: ${key}`);
   }
-  const dependencies = normalizePublicationReferences(
-    raw.dependencies,
-    "dependency",
-  );
-  const publicationPrerequisites = normalizePublicationReferences(
-    raw.publication_prerequisites,
-    "prerequisite",
-  );
-  const dependencyKeys = new Set(dependencies.map((entry) => entry.key));
-  for (const prerequisite of publicationPrerequisites) {
-    if (dependencyKeys.has(prerequisite.key)) {
-      throw new Error(
-        `Publication reference cannot be both content dependency and order prerequisite: ${prerequisite.key}`,
-      );
+  const dependencies = (Array.isArray(raw.dependencies) ? raw.dependencies : [])
+    .map((dependency) => identityDescriptor(dependency))
+    .sort((left, right) => bytewiseCompare(left.key, right.key));
+  const dependencyKeys = new Set();
+  for (const dependency of dependencies) {
+    if (dependencyKeys.has(dependency.key)) {
+      throw new Error(`Duplicate publication dependency: ${dependency.key}`);
     }
+    dependencyKeys.add(dependency.key);
   }
   return {
     key,
@@ -2334,15 +2236,14 @@ function normalizePublicationObject(raw) {
     content_type: String(raw.content_type || "application/octet-stream"),
     publication_stage: stage,
     dependencies,
-    publication_prerequisites: publicationPrerequisites,
   };
 }
 
-function normalizeExternalReference(raw) {
+function normalizeExternalDependency(raw) {
   const identity = identityDescriptor(raw);
   if (raw?.verified !== true || raw?.durable !== true) {
     throw new Error(
-      `External v3 reference lacks verified durable evidence: ${identity.key}`,
+      `External v3 dependency lacks verified durable evidence: ${identity.key}`,
     );
   }
   return { ...identity, verified: true, durable: true };
@@ -2353,14 +2254,7 @@ function scheduleHashInput(plan) {
     contract_version: plan.contract_version,
     tie_breaker: plan.tie_breaker,
     changed_dependency_edge_count: plan.changed_dependency_edge_count,
-    changed_content_dependency_edge_count:
-      plan.changed_content_dependency_edge_count,
-    changed_order_prerequisite_edge_count:
-      plan.changed_order_prerequisite_edge_count,
-    external_reference_count: plan.external_reference_count,
-    external_references: plan.external_references.map((entry) =>
-      identityDescriptor(entry)
-    ),
+    external_dependency_count: plan.external_dependency_count,
     entries: plan.entries.map((entry) => ({
       position: entry.position,
       key: entry.key,
@@ -2368,20 +2262,15 @@ function scheduleHashInput(plan) {
       sha256: entry.sha256,
       publication_stage: entry.publication_stage,
       dependencies: entry.dependencies,
-      publication_prerequisites: entry.publication_prerequisites,
       changed_dependencies: entry.changed_dependencies,
       external_dependencies: entry.external_dependencies,
-      changed_publication_prerequisites:
-        entry.changed_publication_prerequisites,
-      external_publication_prerequisites:
-        entry.external_publication_prerequisites,
     })),
   });
 }
 
 export function buildObservationHistoryIndexV3PublicationPlan({
   objects,
-  externalReferences = [],
+  externalDependencies = [],
 }) {
   const normalizedObjects = (Array.isArray(objects) ? objects : [])
     .map(normalizePublicationObject);
@@ -2396,56 +2285,46 @@ export function buildObservationHistoryIndexV3PublicationPlan({
     byKey.set(object.key, object);
   }
   const externalByKey = new Map();
-  for (const raw of externalReferences) {
-    const reference = normalizeExternalReference(raw);
-    if (externalByKey.has(reference.key) || byKey.has(reference.key)) {
-      throw new Error(`Duplicate external v3 reference key: ${reference.key}`);
+  for (const raw of externalDependencies) {
+    const dependency = normalizeExternalDependency(raw);
+    if (externalByKey.has(dependency.key) || byKey.has(dependency.key)) {
+      throw new Error(`Duplicate external v3 dependency key: ${dependency.key}`);
     }
-    externalByKey.set(reference.key, reference);
+    externalByKey.set(dependency.key, dependency);
   }
   const indegree = new Map(normalizedObjects.map((object) => [object.key, 0]));
   const outgoing = new Map(normalizedObjects.map((object) => [object.key, []]));
-  let changedContentEdgeCount = 0;
-  let changedPrerequisiteEdgeCount = 0;
+  let changedEdgeCount = 0;
   for (const object of normalizedObjects) {
-    for (const [relationship, references] of [
-      ["content dependency", object.dependencies],
-      ["order prerequisite", object.publication_prerequisites],
-    ]) {
-      for (const reference of references) {
-        const changedReference = byKey.get(reference.key);
-        const externalReference = externalByKey.get(reference.key);
-        const resolved = changedReference || externalReference;
-        if (!resolved) {
-          throw new Error(
-            `Missing required v3 publication ${relationship}: ${reference.key} -> ${object.key}`,
-          );
-        }
+    for (const dependency of object.dependencies) {
+      const changedDependency = byKey.get(dependency.key);
+      const externalDependency = externalByKey.get(dependency.key);
+      const resolved = changedDependency || externalDependency;
+      if (!resolved) {
+        throw new Error(
+          `Missing required v3 publication dependency: ${dependency.key} -> ${object.key}`,
+        );
+      }
+      if (
+        resolved.byte_size !== dependency.byte_size ||
+        resolved.sha256 !== dependency.sha256
+      ) {
+        throw new Error(
+          `Contradictory v3 publication dependency identity: ${dependency.key} -> ${object.key}`,
+        );
+      }
+      if (changedDependency) {
         if (
-          resolved.byte_size !== reference.byte_size ||
-          resolved.sha256 !== reference.sha256
+          PUBLICATION_STAGE_RANK[changedDependency.publication_stage] >
+            PUBLICATION_STAGE_RANK[object.publication_stage]
         ) {
           throw new Error(
-            `Contradictory v3 publication ${relationship} identity: ${reference.key} -> ${object.key}`,
+            `V3 publication stage conflict: ${dependency.key} -> ${object.key}`,
           );
         }
-        if (changedReference) {
-          if (
-            PUBLICATION_STAGE_RANK[changedReference.publication_stage] >
-              PUBLICATION_STAGE_RANK[object.publication_stage]
-          ) {
-            throw new Error(
-              `V3 publication stage conflict: ${reference.key} -> ${object.key}`,
-            );
-          }
-          outgoing.get(reference.key).push(object.key);
-          indegree.set(object.key, indegree.get(object.key) + 1);
-          if (relationship === "content dependency") {
-            changedContentEdgeCount += 1;
-          } else {
-            changedPrerequisiteEdgeCount += 1;
-          }
-        }
+        outgoing.get(dependency.key).push(object.key);
+        indegree.set(object.key, indegree.get(object.key) + 1);
+        changedEdgeCount += 1;
       }
     }
   }
@@ -2486,12 +2365,6 @@ export function buildObservationHistoryIndexV3PublicationPlan({
     const externalDependencyKeys = object.dependencies
       .filter((dependency) => externalByKey.has(dependency.key))
       .map((dependency) => dependency.key);
-    const changedPublicationPrerequisites = object.publication_prerequisites
-      .filter((prerequisite) => byKey.has(prerequisite.key))
-      .map((prerequisite) => prerequisite.key);
-    const externalPublicationPrerequisites = object.publication_prerequisites
-      .filter((prerequisite) => externalByKey.has(prerequisite.key))
-      .map((prerequisite) => prerequisite.key);
     return {
       position: index + 1,
       key: object.key,
@@ -2501,22 +2374,16 @@ export function buildObservationHistoryIndexV3PublicationPlan({
       content_type: object.content_type,
       publication_stage: object.publication_stage,
       dependencies: object.dependencies,
-      publication_prerequisites: object.publication_prerequisites,
       changed_dependencies: changedDependencies,
       external_dependencies: externalDependencyKeys,
-      changed_publication_prerequisites: changedPublicationPrerequisites,
-      external_publication_prerequisites: externalPublicationPrerequisites,
     };
   });
   const plan = {
     contract_version: OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONTRACT,
     tie_breaker: "publication_stage_then_bytewise_utf8_key_among_eligible_nodes",
-    changed_dependency_edge_count:
-      changedContentEdgeCount + changedPrerequisiteEdgeCount,
-    changed_content_dependency_edge_count: changedContentEdgeCount,
-    changed_order_prerequisite_edge_count: changedPrerequisiteEdgeCount,
-    external_reference_count: externalByKey.size,
-    external_references: [...externalByKey.values()].sort((left, right) =>
+    changed_dependency_edge_count: changedEdgeCount,
+    external_dependency_count: externalByKey.size,
+    external_dependencies: [...externalByKey.values()].sort((left, right) =>
       bytewiseCompare(left.key, right.key)
     ),
     entries,
@@ -2532,7 +2399,6 @@ function validatePublicationPlan(plan) {
     !plan ||
     plan.contract_version !== OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONTRACT ||
     !Array.isArray(plan.entries) ||
-    !Array.isArray(plan.external_references) ||
     plan.entries.length === 0
   ) {
     throw new Error("Invalid observation-history v3 publication plan");
@@ -2542,11 +2408,7 @@ function validatePublicationPlan(plan) {
     throw new Error("Observation-history v3 publication schedule identity mismatch");
   }
   for (const [index, entry] of plan.entries.entries()) {
-    if (
-      entry.position !== index + 1 ||
-      !Array.isArray(entry.dependencies) ||
-      !Array.isArray(entry.publication_prerequisites)
-    ) {
+    if (entry.position !== index + 1) {
       throw new Error("Observation-history v3 publication positions are invalid");
     }
   }
@@ -2571,20 +2433,13 @@ export async function finalizeObservationHistoryIndexV3Publication({
   }
   const completed = new Map();
   const externalByKey = new Map(
-    plan.external_references.map((entry) => [entry.key, entry]),
+    plan.external_dependencies.map((entry) => [entry.key, entry]),
   );
   const evidence = [];
   for (const entry of plan.entries) {
-    for (const [relationship, reference] of [
-      ...entry.dependencies.map((dependency) =>
-        ["content dependency", dependency]
-      ),
-      ...entry.publication_prerequisites.map((prerequisite) =>
-        ["order prerequisite", prerequisite]
-      ),
-    ]) {
-      const completedDependency = completed.get(reference.key);
-      const externalDependency = externalByKey.get(reference.key);
+    for (const dependency of entry.dependencies) {
+      const completedDependency = completed.get(dependency.key);
+      const externalDependency = externalByKey.get(dependency.key);
       if (
         completedDependency?.verified !== true ||
         completedDependency?.durable !== true
@@ -2594,7 +2449,7 @@ export async function finalizeObservationHistoryIndexV3Publication({
           externalDependency?.durable !== true
         ) {
           throw new Error(
-            `V3 dependent publication blocked by incomplete ${relationship}: ${reference.key} -> ${entry.key}`,
+            `V3 dependent publication blocked by incomplete dependency: ${dependency.key} -> ${entry.key}`,
           );
         }
       }

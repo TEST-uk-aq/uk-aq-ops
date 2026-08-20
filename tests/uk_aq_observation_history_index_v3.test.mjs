@@ -35,7 +35,12 @@ function sha256(body) {
   return createHash("sha256").update(body).digest("hex");
 }
 
-function makeRows({ dayUtc, connectorId, definitions }) {
+function makeRows({
+  dayUtc,
+  connectorId,
+  definitions,
+  valueOffsetsByTimeseries = {},
+}) {
   return definitions.flatMap(([timeseriesId, count], definitionIndex) =>
     Array.from({ length: count }, (_, rowIndex) => ({
       connector_id: connectorId,
@@ -48,14 +53,26 @@ function makeRows({ dayUtc, connectorId, definitions }) {
         ":00:00.000Z",
         `:${String(rowIndex).padStart(2, "0")}:00.000Z`,
       ),
-      value: timeseriesId + rowIndex / 10,
+      value:
+        timeseriesId + rowIndex / 10 +
+        Number(valueOffsetsByTimeseries[timeseriesId] || 0),
       verification_status: rowIndex % 2 ? "P" : null,
     }))
   );
 }
 
-function buildPhase1({ dayUtc, connectorId, definitions }) {
-  const rows = makeRows({ dayUtc, connectorId, definitions });
+function buildPhase1({
+  dayUtc,
+  connectorId,
+  definitions,
+  valueOffsetsByTimeseries = {},
+}) {
+  const rows = makeRows({
+    dayUtc,
+    connectorId,
+    definitions,
+    valueOffsetsByTimeseries,
+  });
   return buildCanonicalObservationTimeseriesBoundedFiles(rows, {
     limits,
     fileKeyForOrdinal: (ordinal) =>
@@ -90,6 +107,40 @@ function canonicalManifestFor(metadata) {
   };
 }
 
+function canonicalManifestPublicationObject(metadata, descriptor) {
+  const payload = {
+    day_utc: metadata.partition.day_utc,
+    connector_id: metadata.partition.connector_id,
+    pollutant_code: metadata.partition.pollutant_code,
+    row_count: metadata.row_count,
+    observation_content_hash: metadata.observation_content_hash,
+    file_identities: metadata.files.map((file) => [
+      file.key,
+      file.byte_size,
+      file.sha256,
+    ]),
+  };
+  const body = `${JSON.stringify(payload)}\n`;
+  assert.equal(Buffer.byteLength(body), descriptor.byte_size);
+  assert.equal(sha256(body), descriptor.sha256);
+  return {
+    kind: "canonical_observation_manifest",
+    key: descriptor.key,
+    body,
+    byte_size: descriptor.byte_size,
+    sha256: descriptor.sha256,
+    content_type: "application/json; charset=utf-8",
+    publication_stage: "canonical_manifest",
+    dependencies: metadata.files.map((file) => ({
+      kind: "canonical_parquet",
+      key: file.key,
+      byte_size: file.byte_size,
+      sha256: file.sha256,
+    })),
+    publication_prerequisites: [],
+  };
+}
+
 function reorderPhase1Metadata(metadata) {
   const reordered = structuredClone(metadata);
   reordered.files.reverse();
@@ -115,11 +166,14 @@ function reidentifyArtifact(artifact, payload) {
   };
 }
 
-function externalDependenciesFor(objects) {
+function externalReferencesFor(objects) {
   const changedKeys = new Set(objects.map((object) => object.key));
   const byKey = new Map();
   for (const object of objects) {
-    for (const dependency of object.dependencies) {
+    for (const dependency of [
+      ...object.dependencies,
+      ...(object.publication_prerequisites || []),
+    ]) {
       if (changedKeys.has(dependency.key)) continue;
       const previous = byKey.get(dependency.key);
       if (previous) {
@@ -529,6 +583,175 @@ test("targeted v3 updates equal complete rebuilds and preserve omissions", () =>
   );
 });
 
+test("canonical source changes preserve unrelated children and explicit publication order", async () => {
+  const firstMetadata = buildPhase1({
+    dayUtc: "2026-02-04",
+    connectorId: 1,
+    definitions: [[999, 5], [1000, 5]],
+  });
+  const firstCanonicalManifest = canonicalManifestFor(firstMetadata);
+  const first = buildObservationHistoryIndexV3ScopedHierarchy({
+    metadata: firstMetadata,
+    canonicalManifest: firstCanonicalManifest,
+  });
+  const secondMetadata = buildPhase1({
+    dayUtc: "2026-02-04",
+    connectorId: 1,
+    definitions: [[999, 5], [1000, 5]],
+    valueOffsetsByTimeseries: { 1000: 1 },
+  });
+  const secondCanonicalManifest = canonicalManifestFor(secondMetadata);
+  const second = buildObservationHistoryIndexV3ScopedHierarchy({
+    metadata: secondMetadata,
+    canonicalManifest: secondCanonicalManifest,
+  });
+
+  assert.notEqual(firstCanonicalManifest.sha256, secondCanonicalManifest.sha256);
+  assert.equal(first.child_shards[0].body, second.child_shards[0].body);
+  assert.equal(first.child_shards[0].sha256, second.child_shards[0].sha256);
+  assert.notDeepEqual(
+    first.child_shards[0].publication_prerequisites,
+    second.child_shards[0].publication_prerequisites,
+  );
+  assert.equal(
+    Object.hasOwn(second.child_shards[0].payload, "canonical_source_manifest"),
+    false,
+  );
+  assert.equal(
+    second.child_shards[0].dependencies.some(
+      (dependency) => dependency.kind === "canonical_manifest",
+    ),
+    false,
+  );
+  assert.deepEqual(
+    second.child_shards[0].publication_prerequisites.map(
+      (prerequisite) => prerequisite.kind,
+    ),
+    ["canonical_manifest"],
+  );
+  assert.notEqual(first.child_shards[1].body, second.child_shards[1].body);
+
+  const targetedRoot = updateObservationHistoryIndexV3ScopedManifest({
+    existingScopedManifest: first.scoped_manifest,
+    canonicalManifest: secondCanonicalManifest,
+    replacementChildShards: [second.child_shards[1]],
+  });
+  assert.equal(targetedRoot.body, second.scoped_manifest.body);
+  assert.deepEqual(
+    targetedRoot.payload.children[0],
+    first.scoped_manifest.payload.children[0],
+  );
+
+  const inconsistentCanonicalManifest = {
+    ...secondCanonicalManifest,
+    row_count: secondCanonicalManifest.row_count + 1,
+    observation_content_hash: "f".repeat(64),
+  };
+  assert.throws(
+    () => updateObservationHistoryIndexV3ScopedManifest({
+      existingScopedManifest: first.scoped_manifest,
+      canonicalManifest: inconsistentCanonicalManifest,
+      replacementChildShards: [second.child_shards[1]],
+    }),
+    /descriptor rows disagree with canonical source/,
+  );
+
+  const firstLatest = buildObservationHistoryIndexV3Latest({
+    scopedHierarchies: [first],
+  });
+  const targetedLatest = updateObservationHistoryIndexV3Latest({
+    existingLatest: firstLatest,
+    replacementScopedManifests: [targetedRoot],
+  });
+  const canonicalObject = canonicalManifestPublicationObject(
+    secondMetadata,
+    secondCanonicalManifest,
+  );
+  const changedObjects = [
+    targetedLatest,
+    targetedRoot,
+    second.child_shards[1],
+    canonicalObject,
+  ];
+  const externalReferences = externalReferencesFor(changedObjects);
+  const plan = buildObservationHistoryIndexV3PublicationPlan({
+    objects: changedObjects,
+    externalReferences,
+  });
+  const reorderedPlan = buildObservationHistoryIndexV3PublicationPlan({
+    objects: [...changedObjects].reverse(),
+    externalReferences: [...externalReferences].reverse(),
+  });
+  assert.equal(plan.schedule_sha256, reorderedPlan.schedule_sha256);
+  assert.equal(plan.changed_order_prerequisite_edge_count, 1);
+  const positions = new Map(
+    plan.entries.map((entry) => [entry.key, entry.position]),
+  );
+  assert.ok(
+    positions.get(canonicalObject.key) <
+      positions.get(second.child_shards[1].key),
+  );
+  assert.ok(
+    positions.get(second.child_shards[1].key) < positions.get(targetedRoot.key),
+  );
+  assert.ok(positions.get(targetedRoot.key) < positions.get(targetedLatest.key));
+
+  assert.throws(
+    () => buildObservationHistoryIndexV3PublicationPlan({
+      objects: [second.child_shards[1]],
+      externalReferences: second.child_shards[1].dependencies.map(
+        (dependency) => ({ ...dependency, verified: true, durable: true }),
+      ),
+    }),
+    /Missing required v3 publication order prerequisite/,
+  );
+  const contradictoryPrerequisiteChild = {
+    ...second.child_shards[1],
+    publication_prerequisites: [{
+      ...second.child_shards[1].publication_prerequisites[0],
+      sha256: "a".repeat(64),
+    }],
+  };
+  assert.throws(
+    () => buildObservationHistoryIndexV3PublicationPlan({
+      objects: [contradictoryPrerequisiteChild, canonicalObject],
+      externalReferences: externalReferencesFor([
+        contradictoryPrerequisiteChild,
+        canonicalObject,
+      ]),
+    }),
+    /Contradictory v3 publication order prerequisite identity/,
+  );
+
+  const stored = new Map();
+  const events = [];
+  await finalizeObservationHistoryIndexV3Publication({
+    plan,
+    putIfChanged: async ({ key, body }) => {
+      events.push(`put:${key}`);
+      stored.set(key, Buffer.from(body));
+      return { ok: true, status: "succeeded" };
+    },
+    getObject: async ({ key }) => ({ body: stored.get(key) }),
+    recordDurableEvidence: async ({ key }) => {
+      events.push(`durable:${key}`);
+      return { durable: true };
+    },
+  });
+  assert.ok(
+    events.indexOf(`durable:${canonicalObject.key}`) <
+      events.indexOf(`put:${second.child_shards[1].key}`),
+  );
+  assert.ok(
+    events.indexOf(`durable:${second.child_shards[1].key}`) <
+      events.indexOf(`put:${targetedRoot.key}`),
+  );
+  assert.ok(
+    events.indexOf(`durable:${targetedRoot.key}`) <
+      events.indexOf(`put:${targetedLatest.key}`),
+  );
+});
+
 test("v3 publication plan and finaliser enforce child verification durability", async () => {
   const metadata = buildPhase1({
     dayUtc: "2026-01-02",
@@ -549,7 +772,7 @@ test("v3 publication plan and finaliser enforce child verification durability", 
   ];
   const plan = buildObservationHistoryIndexV3PublicationPlan({
     objects,
-    externalDependencies: externalDependenciesFor(objects),
+    externalReferences: externalReferencesFor(objects),
   });
   const positions = new Map(
     plan.entries.map((entry) => [entry.key, entry.position]),
