@@ -289,7 +289,13 @@ function normalizeChildDescriptor(raw, scope, indexRoot) {
   return descriptor;
 }
 
-function scopedPayload(scope, source, descriptors) {
+export function buildObservationHistoryIndexV3ScopedManifestPayload({
+  scope,
+  canonicalSource,
+  childDescriptors,
+}) {
+  const source = canonicalSource;
+  const descriptors = childDescriptors;
   const timeseriesIds = [];
   const filesByKey = new Map();
   for (const [index, descriptor] of descriptors.entries()) {
@@ -384,7 +390,11 @@ export function validateObservationHistoryIndexV3ScopedManifestBody({
   if (descriptors.length === 0) {
     throw new Error("Scoped v3 manifest requires child descriptors");
   }
-  const expectedPayload = scopedPayload(scope, source, descriptors);
+  const expectedPayload = buildObservationHistoryIndexV3ScopedManifestPayload({
+    scope,
+    canonicalSource: source,
+    childDescriptors: descriptors,
+  });
   if (!sameJson(payload, expectedPayload)) {
     throw new Error(
       "Scoped v3 manifest payload has contradictory identity, coverage, or children",

@@ -14,6 +14,7 @@ import {
 } from "./uk_aq_observation_history_target_writer.mjs";
 import { normalizeObservationPropertyCode } from "./uk_aq_observation_property_code.mjs";
 import {
+  buildObservationHistoryIndexV3ScopedManifestPayload,
   validateObservationHistoryIndexV3ScopedManifestBody,
 } from "./uk_aq_observation_history_scoped_manifest_v3.mjs";
 import { sha256Hex } from "./r2_sigv4.mjs";
@@ -2016,7 +2017,11 @@ export function updateObservationHistoryIndexV3ScopedManifest({
       scope: existing.scope,
       indexRoot,
     }),
-    payload: scopedPayloadForDescriptors(existing.scope, source, descriptors),
+    payload: buildObservationHistoryIndexV3ScopedManifestPayload({
+      scope: existing.scope,
+      canonicalSource: source,
+      childDescriptors: descriptors,
+    }),
     dependencies: [
       identityDescriptor({ ...source, kind: "canonical_manifest" }),
       ...descriptors.map((descriptor) =>
