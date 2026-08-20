@@ -13,6 +13,11 @@ import {
   encodeObservationHistoryIndexV3Json,
   finalizeObservationHistoryIndexV3Publication,
   resolveObservationHistoryIndexV3BuildConfig,
+  updateObservationHistoryIndexV3Latest,
+  updateObservationHistoryIndexV3ScopedManifest,
+  validateObservationHistoryIndexV3ChildShardArtifact,
+  validateObservationHistoryIndexV3LatestArtifact,
+  validateObservationHistoryIndexV3ScopedManifestArtifact,
   validateObservationHistoryTargetMetadataForV3,
 } from "../workers/shared/uk_aq_observation_history_index_v3.mjs";
 
@@ -225,10 +230,10 @@ test("v3 hierarchy is byte-stable and preserves cross-shard files and continuati
     canonicalManifest: canonicalManifestFor(secondMetadata),
   });
   const latest = buildObservationHistoryIndexV3Latest({
-    scopedManifests: [first.scoped_manifest, second.scoped_manifest],
+    scopedHierarchies: [first, second],
   });
   const latestReordered = buildObservationHistoryIndexV3Latest({
-    scopedManifests: [second.scoped_manifest, first.scoped_manifest],
+    scopedHierarchies: [second, first],
   });
   assert.equal(latest.body, latestReordered.body);
   assert.equal(latest.payload.day_count, 2);
@@ -291,7 +296,7 @@ test("v3 builders fail closed on file identity, overlap, shard and coverage conf
       canonicalManifest,
       childShards: [wrongShard, hierarchy.child_shards[1]],
     }),
-    /wrong or duplicate shard assignment/,
+    /out of shard or non-deterministic/,
   );
   assert.throws(
     () => buildObservationHistoryIndexV3ScopedManifest({
@@ -300,6 +305,227 @@ test("v3 builders fail closed on file identity, overlap, shard and coverage conf
       childShards: [hierarchy.child_shards[0]],
     }),
     /root\/child timeseries coverage disagreement/,
+  );
+});
+
+test("v3 semantic validators reject rehashed child, root and latest tampering", () => {
+  const metadata = buildPhase1({
+    dayUtc: "2026-01-02",
+    connectorId: 1,
+    definitions: [[999, 1], [1000, 1], [1500, 7]],
+  });
+  const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({
+    metadata,
+    canonicalManifest: canonicalManifestFor(metadata),
+  });
+  const childPayload = structuredClone(hierarchy.child_shards[1].payload);
+  childPayload.timeseries[0].row_count += 1;
+  childPayload.coverage.row_count += 1;
+  const tamperedChild = reidentifyArtifact(
+    hierarchy.child_shards[1],
+    childPayload,
+  );
+  assert.throws(
+    () => validateObservationHistoryIndexV3ChildShardArtifact({
+      artifact: tamperedChild,
+    }),
+    /timeseries totals, bounds, or fields are contradictory/,
+  );
+  assert.throws(
+    () => buildObservationHistoryIndexV3ScopedManifest({
+      metadata,
+      canonicalManifest: canonicalManifestFor(metadata),
+      childShards: [hierarchy.child_shards[0], tamperedChild],
+    }),
+    /timeseries totals, bounds, or fields are contradictory/,
+  );
+
+  const rootPayload = structuredClone(hierarchy.scoped_manifest.payload);
+  rootPayload.coverage.row_count += 1;
+  const tamperedRoot = reidentifyArtifact(
+    hierarchy.scoped_manifest,
+    rootPayload,
+  );
+  assert.throws(
+    () => validateObservationHistoryIndexV3ScopedManifestArtifact({
+      artifact: tamperedRoot,
+      childShards: hierarchy.child_shards,
+    }),
+    /contradictory identity, coverage, or children/,
+  );
+  assert.throws(
+    () => buildObservationHistoryIndexV3Latest({
+      scopedHierarchies: [{
+        child_shards: hierarchy.child_shards,
+        scoped_manifest: tamperedRoot,
+      }],
+    }),
+    /contradictory identity, coverage, or children/,
+  );
+
+  const latest = buildObservationHistoryIndexV3Latest({
+    scopedHierarchies: [hierarchy],
+  });
+  const latestPayload = structuredClone(latest.payload);
+  latestPayload.total_rows += 1;
+  const tamperedLatest = reidentifyArtifact(latest, latestPayload);
+  assert.throws(
+    () => validateObservationHistoryIndexV3LatestArtifact({
+      artifact: tamperedLatest,
+      scopedHierarchies: [hierarchy],
+    }),
+    /contradictory roots, summaries, or counters/,
+  );
+
+  const missingDependency = {
+    ...hierarchy.child_shards[0],
+    dependencies: hierarchy.child_shards[0].dependencies.slice(1),
+  };
+  assert.throws(
+    () => validateObservationHistoryIndexV3ChildShardArtifact({
+      artifact: missingDependency,
+    }),
+    /dependencies do not exactly match semantic references/,
+  );
+});
+
+test("targeted v3 updates equal complete rebuilds and preserve omissions", () => {
+  const metadata = buildPhase1({
+    dayUtc: "2026-01-02",
+    connectorId: 1,
+    definitions: [[999, 1], [1000, 1], [1500, 7]],
+  });
+  const canonicalManifest = canonicalManifestFor(metadata);
+  const first = buildObservationHistoryIndexV3ScopedHierarchy({
+    metadata,
+    canonicalManifest,
+  });
+  const secondMetadata = buildPhase1({
+    dayUtc: "2026-01-03",
+    connectorId: 2,
+    definitions: [[2000, 2]],
+  });
+  const second = buildObservationHistoryIndexV3ScopedHierarchy({
+    metadata: secondMetadata,
+    canonicalManifest: canonicalManifestFor(secondMetadata),
+  });
+  const existingLatest = buildObservationHistoryIndexV3Latest({
+    scopedHierarchies: [first, second],
+  });
+
+  const replacementPayload = structuredClone(first.child_shards[1].payload);
+  const otherKeys = new Set(first.child_shards[0].payload.files.map((file) =>
+    file.key
+  ));
+  const uniqueFile = replacementPayload.files.find((file) =>
+    !otherKeys.has(file.key)
+  );
+  assert.ok(uniqueFile);
+  uniqueFile.etag = "known-after-verification";
+  const replacementChild = reidentifyArtifact(
+    first.child_shards[1],
+    replacementPayload,
+  );
+  validateObservationHistoryIndexV3ChildShardArtifact({
+    artifact: replacementChild,
+  });
+
+  const targetedRoot = updateObservationHistoryIndexV3ScopedManifest({
+    existingScopedManifest: first.scoped_manifest,
+    replacementChildShards: [replacementChild],
+  });
+  const completeRoot = buildObservationHistoryIndexV3ScopedManifest({
+    metadata,
+    canonicalManifest,
+    childShards: [first.child_shards[0], replacementChild],
+  });
+  assert.equal(targetedRoot.body, completeRoot.body);
+  assert.deepEqual(
+    targetedRoot.payload.children[0],
+    first.scoped_manifest.payload.children[0],
+  );
+  const targetedHierarchy = {
+    child_shards: [first.child_shards[0], replacementChild],
+    scoped_manifest: targetedRoot,
+  };
+
+  const targetedLatest = updateObservationHistoryIndexV3Latest({
+    existingLatest,
+    replacementScopedManifests: [targetedRoot],
+  });
+  const completeLatest = buildObservationHistoryIndexV3Latest({
+    scopedHierarchies: [targetedHierarchy, second],
+  });
+  assert.equal(targetedLatest.body, completeLatest.body);
+  const unchangedSecondDescriptor = existingLatest.payload.day_summaries
+    .find((entry) => entry.day_utc === "2026-01-03").scoped_roots[0];
+  assert.deepEqual(
+    targetedLatest.payload.day_summaries
+      .find((entry) => entry.day_utc === "2026-01-03").scoped_roots[0],
+    unchangedSecondDescriptor,
+  );
+
+  assert.equal(
+    updateObservationHistoryIndexV3ScopedManifest({
+      existingScopedManifest: first.scoped_manifest,
+    }).body,
+    first.scoped_manifest.body,
+  );
+  assert.equal(
+    updateObservationHistoryIndexV3Latest({
+      existingLatest,
+    }).body,
+    existingLatest.body,
+  );
+  assert.equal(
+    updateObservationHistoryIndexV3Latest({
+      existingLatest,
+      removedScopes: [second.scoped_manifest.payload],
+    }).body,
+    buildObservationHistoryIndexV3Latest({
+      scopedHierarchies: [first],
+    }).body,
+  );
+
+  const reducedMetadata = buildPhase1({
+    dayUtc: "2026-01-02",
+    connectorId: 1,
+    definitions: [[1000, 1], [1500, 7]],
+  });
+  const reducedManifest = canonicalManifestFor(reducedMetadata);
+  const reducedChild = buildObservationHistoryIndexV3ScopedHierarchy({
+    metadata: reducedMetadata,
+    canonicalManifest: reducedManifest,
+  }).child_shards[0];
+  const explicitlyReducedRoot = updateObservationHistoryIndexV3ScopedManifest({
+    existingScopedManifest: first.scoped_manifest,
+    canonicalManifest: reducedManifest,
+    replacementChildShards: [reducedChild],
+    removedRangeStarts: [0],
+  });
+  assert.equal(
+    explicitlyReducedRoot.body,
+    buildObservationHistoryIndexV3ScopedManifest({
+      metadata: reducedMetadata,
+      canonicalManifest: reducedManifest,
+      childShards: [reducedChild],
+    }).body,
+  );
+  assert.throws(
+    () => updateObservationHistoryIndexV3ScopedManifest({
+      existingScopedManifest: first.scoped_manifest,
+      replacementChildShards: [replacementChild],
+      removedRangeStarts: [replacementChild.payload.range_start],
+    }),
+    /cannot replace and remove one range/,
+  );
+  assert.throws(
+    () => updateObservationHistoryIndexV3Latest({
+      existingLatest,
+      replacementScopedManifests: [targetedRoot],
+      removedScopes: [targetedRoot.payload],
+    }),
+    /cannot replace and remove one scope/,
   );
 });
 
@@ -314,7 +540,7 @@ test("v3 publication plan and finaliser enforce child verification durability", 
     canonicalManifest: canonicalManifestFor(metadata),
   });
   const latest = buildObservationHistoryIndexV3Latest({
-    scopedManifests: [hierarchy.scoped_manifest],
+    scopedHierarchies: [hierarchy],
   });
   const objects = [
     latest,

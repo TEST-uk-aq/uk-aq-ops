@@ -287,7 +287,11 @@ export function buildObservationHistoryIndexV3ScopedManifestKey({
   return `${scopePrefix(normalizeScope(scope), indexRoot)}/manifest.json`;
 }
 
-function normalizeCanonicalManifest(raw, scope, metadata) {
+function assertSameJson(actual, expected, message) {
+  if (!sameJson(actual, expected)) throw new Error(message);
+}
+
+function normalizeCanonicalManifestDescriptor(raw, scope) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new TypeError("canonical_manifest must be an object");
   }
@@ -311,6 +315,22 @@ function normalizeCanonicalManifest(raw, scope, metadata) {
       "canonical_manifest.observation_content_hash",
     ),
   };
+  const expectedScopeToken =
+    `/day_utc=${scope.day_utc}/connector_id=${scope.connector_id}` +
+    `/pollutant_code=${scope.pollutant_code}/manifest.json`;
+  if (!descriptor.key.endsWith(expectedScopeToken)) {
+    throw new Error("Canonical manifest key disagrees with partition scope");
+  }
+  assertSameJson(
+    raw,
+    descriptor,
+    "Canonical manifest descriptor has unsupported or non-canonical fields",
+  );
+  return Object.freeze(descriptor);
+}
+
+function normalizeCanonicalManifest(raw, scope, metadata) {
+  const descriptor = normalizeCanonicalManifestDescriptor(raw, scope);
   if (descriptor.row_count !== metadata.row_count) {
     throw new Error("Canonical manifest row count disagrees with Phase 1 metadata");
   }
@@ -321,13 +341,60 @@ function normalizeCanonicalManifest(raw, scope, metadata) {
       "Canonical manifest observation content hash disagrees with Phase 1 metadata",
     );
   }
-  const expectedScopeToken =
-    `/day_utc=${scope.day_utc}/connector_id=${scope.connector_id}` +
-    `/pollutant_code=${scope.pollutant_code}/manifest.json`;
-  if (!descriptor.key.endsWith(expectedScopeToken)) {
-    throw new Error("Canonical manifest key disagrees with Phase 1 partition");
+  return descriptor;
+}
+
+function normalizeArtifactDependencies(artifact, allowedKinds) {
+  if (!Array.isArray(artifact.dependencies)) {
+    throw new TypeError(`${artifact.kind} dependencies must be an array`);
   }
-  return Object.freeze(descriptor);
+  const dependencies = artifact.dependencies.map((raw) => {
+    const kind = String(raw?.kind || "").trim();
+    if (!allowedKinds.has(kind)) {
+      throw new Error(`${artifact.kind} has unsupported dependency kind`);
+    }
+    const dependency = identityDescriptor({ ...raw, kind });
+    assertSameJson(
+      raw,
+      dependency,
+      `${artifact.kind} dependency has unsupported fields`,
+    );
+    return dependency;
+  }).sort((left, right) => bytewiseCompare(left.key, right.key));
+  const keys = new Set();
+  for (const dependency of dependencies) {
+    if (keys.has(dependency.key)) {
+      throw new Error(`${artifact.kind} has duplicate dependency keys`);
+    }
+    keys.add(dependency.key);
+  }
+  return dependencies;
+}
+
+function assertExactDependencies(artifact, expected, allowedKinds) {
+  const actual = normalizeArtifactDependencies(artifact, allowedKinds);
+  const normalizedExpected = [...expected]
+    .map((entry) => identityDescriptor(entry))
+    .sort((left, right) => bytewiseCompare(left.key, right.key));
+  assertSameJson(
+    actual,
+    normalizedExpected,
+    `${artifact.kind} dependencies do not exactly match semantic references`,
+  );
+}
+
+function baseIndexPayload(kind) {
+  return {
+    schema_version: OBSERVATION_HISTORY_INDEX_SCHEMA_VERSION_V3,
+    kind,
+    index_generation: OBSERVATION_HISTORY_INDEX_GENERATION_V3,
+    history_version: "v2",
+    domain: "observations",
+    history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+    writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
+    physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
+    shard_width: OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3,
+  };
 }
 
 function normalizeSegment(raw, file, rowGroupStarts) {
@@ -842,7 +909,7 @@ export function buildObservationHistoryIndexV3ChildShard({
       identityDescriptor({ ...file, kind: "canonical_parquet" })
     ),
   ];
-  return artifactFromPayload({
+  const artifact = artifactFromPayload({
     kind: "observation_history_index_v3_child_shard",
     key: buildObservationHistoryIndexV3ChildShardKey({
       scope: normalized.scope,
@@ -853,6 +920,8 @@ export function buildObservationHistoryIndexV3ChildShard({
     dependencies,
     stage: "child_shard",
   });
+  validateObservationHistoryIndexV3ChildShardArtifact({ artifact, indexRoot });
+  return artifact;
 }
 
 function childDescriptor(artifact) {
@@ -869,7 +938,608 @@ function childDescriptor(artifact) {
     min_observed_at_utc: payload.coverage.min_observed_at_utc,
     max_observed_at_utc: payload.coverage.max_observed_at_utc,
     file_count: payload.coverage.file_count,
+    files: payload.files.map(({ key, byte_size, sha256 }) => ({
+      key,
+      byte_size,
+      sha256,
+    })),
   };
+}
+
+function normalizeChildFile(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError("V3 child file descriptor must be an object");
+  }
+  const file = {
+    key: normalizeKey(raw.key, "child.file.key"),
+    byte_size: positiveSafeInteger(raw.byte_size, "child.file.byte_size"),
+    sha256: normalizeSha256(raw.sha256, "child.file.sha256"),
+    row_count: positiveSafeInteger(raw.row_count, "child.file.row_count"),
+    row_group_count: positiveSafeInteger(
+      raw.row_group_count,
+      "child.file.row_group_count",
+    ),
+    history_schema_version: Number(raw.history_schema_version),
+    writer_version: String(raw.writer_version || ""),
+    physical_layout_version: String(raw.physical_layout_version || ""),
+    ...(raw.etag === undefined
+      ? {}
+      : { etag: String(raw.etag || "").trim() }),
+  };
+  if (
+    file.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
+    file.writer_version !== OBSERVATION_HISTORY_WRITER_VERSION_V3 ||
+    file.physical_layout_version !== OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION ||
+    (Object.hasOwn(file, "etag") && !file.etag)
+  ) {
+    throw new Error("V3 child has unsupported physical file identity");
+  }
+  assertSameJson(
+    raw,
+    file,
+    "V3 child file descriptor has unsupported or non-canonical fields",
+  );
+  return file;
+}
+
+function normalizeChildSegment(raw, timeseriesId, filesByKey, rowGroupStarts) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError("V3 child exact segment must be an object");
+  }
+  const segment = {
+    file_key: normalizeKey(raw.file_key, "child.segment.file_key"),
+    row_group_ordinal: nonNegativeSafeInteger(
+      raw.row_group_ordinal,
+      "child.segment.row_group_ordinal",
+    ),
+    row_start: nonNegativeSafeInteger(
+      raw.row_start,
+      "child.segment.row_start",
+    ),
+    row_group_row_start: nonNegativeSafeInteger(
+      raw.row_group_row_start,
+      "child.segment.row_group_row_start",
+    ),
+    row_count: positiveSafeInteger(raw.row_count, "child.segment.row_count"),
+    min_observed_at_utc: normalizeIso(
+      raw.min_observed_at_utc,
+      "child.segment.min_observed_at_utc",
+    ),
+    max_observed_at_utc: normalizeIso(
+      raw.max_observed_at_utc,
+      "child.segment.max_observed_at_utc",
+    ),
+  };
+  assertSameJson(
+    raw,
+    segment,
+    "V3 child segment has unsupported or non-canonical fields",
+  );
+  const file = filesByKey.get(segment.file_key);
+  if (!file) throw new Error("V3 child segment names an unlisted file");
+  if (
+    segment.row_group_ordinal >= file.row_group_count ||
+    segment.row_start + segment.row_count > file.row_count ||
+    segment.row_group_row_start > segment.row_start ||
+    segment.min_observed_at_utc > segment.max_observed_at_utc
+  ) {
+    throw new Error("V3 child segment has impossible physical coordinates or bounds");
+  }
+  const groupKey = `${segment.file_key}\u0000${segment.row_group_ordinal}`;
+  const inferredGroupStart = segment.row_start - segment.row_group_row_start;
+  const previousGroupStart = rowGroupStarts.get(groupKey);
+  if (
+    previousGroupStart !== undefined &&
+    previousGroupStart !== inferredGroupStart
+  ) {
+    throw new Error("V3 child segment has contradictory row-group coordinates");
+  }
+  rowGroupStarts.set(groupKey, inferredGroupStart);
+  return { ...segment, timeseries_id: timeseriesId };
+}
+
+function assertNonOverlappingPhysicalSegments(segments, filesByKey, label, {
+  requireCompleteFiles = false,
+} = {}) {
+  const byFile = new Map([...filesByKey.keys()].map((key) => [key, []]));
+  for (const segment of segments) byFile.get(segment.file_key).push(segment);
+  for (const [fileKey, fileSegments] of byFile) {
+    fileSegments.sort((left, right) =>
+      left.row_start - right.row_start ||
+      left.row_count - right.row_count ||
+      left.timeseries_id - right.timeseries_id
+    );
+    if (fileSegments.length === 0) {
+      throw new Error(`${label} lists an unreferenced physical file`);
+    }
+    let expectedStart = requireCompleteFiles ? 0 : fileSegments[0].row_start;
+    for (const segment of fileSegments) {
+      if (
+        segment.row_start < expectedStart ||
+        (requireCompleteFiles && segment.row_start !== expectedStart)
+      ) {
+        throw new Error(`${label} has overlapping or incomplete physical segments`);
+      }
+      expectedStart = segment.row_start + segment.row_count;
+    }
+    if (requireCompleteFiles && expectedStart !== filesByKey.get(fileKey).row_count) {
+      throw new Error(`${label} physical file rows do not reconcile`);
+    }
+  }
+}
+
+export function validateObservationHistoryIndexV3ChildShardArtifact({
+  artifact: rawArtifact,
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+}) {
+  const artifact = validateArtifact(
+    rawArtifact,
+    "observation_history_index_v3_child_shard",
+    "child_shard",
+  );
+  const rawPayload = artifact.payload;
+  const scope = normalizeScope(rawPayload);
+  const source = normalizeCanonicalManifestDescriptor(
+    rawPayload.canonical_source_manifest,
+    scope,
+  );
+  const rangeStart = normalizeRangeStart(rawPayload.range_start);
+  const rangeEnd = rangeStart + OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3 - 1;
+  if (Number(rawPayload.range_end) !== rangeEnd) {
+    throw new Error("V3 child range end disagrees with shard width");
+  }
+  const files = (Array.isArray(rawPayload.files) ? rawPayload.files : [])
+    .map(normalizeChildFile);
+  if (files.length === 0) throw new Error("V3 child requires physical files");
+  const filesByKey = new Map();
+  for (const [index, file] of files.entries()) {
+    if (
+      filesByKey.has(file.key) ||
+      (index > 0 && bytewiseCompare(files[index - 1].key, file.key) >= 0)
+    ) {
+      throw new Error("V3 child files are duplicate or non-deterministically ordered");
+    }
+    filesByKey.set(file.key, file);
+  }
+  const rawTimeseries = Array.isArray(rawPayload.timeseries)
+    ? rawPayload.timeseries
+    : [];
+  if (rawTimeseries.length === 0) throw new Error("V3 child cannot be empty");
+  const rowGroupStarts = new Map();
+  const allSegments = [];
+  const timeseries = rawTimeseries.map((raw, index) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new TypeError("V3 child timeseries entry must be an object");
+    }
+    const timeseriesId = positiveSafeInteger(
+      raw.timeseries_id,
+      "child.timeseries_id",
+    );
+    if (
+      timeseriesId < rangeStart ||
+      timeseriesId > rangeEnd ||
+      (index > 0 && rawTimeseries[index - 1].timeseries_id >= timeseriesId)
+    ) {
+      throw new Error("V3 child timeseries identity is out of shard or non-deterministic");
+    }
+    const segments = (Array.isArray(raw.segments) ? raw.segments : [])
+      .map((segment) =>
+        normalizeChildSegment(
+          segment,
+          timeseriesId,
+          filesByKey,
+          rowGroupStarts,
+        )
+      );
+    if (segments.length === 0) {
+      throw new Error("V3 child timeseries requires exact segments");
+    }
+    const fileOrder = new Map(files.map((file, ordinal) => [file.key, ordinal]));
+    for (let segmentIndex = 1; segmentIndex < segments.length; segmentIndex += 1) {
+      const previous = segments[segmentIndex - 1];
+      const current = segments[segmentIndex];
+      if (
+        fileOrder.get(current.file_key) < fileOrder.get(previous.file_key) ||
+        (
+          current.file_key === previous.file_key &&
+          current.row_start < previous.row_start + previous.row_count
+        ) ||
+        current.min_observed_at_utc < previous.max_observed_at_utc
+      ) {
+        throw new Error("V3 child timeseries segments overlap, regress, or are unordered");
+      }
+    }
+    const normalized = {
+      timeseries_id: timeseriesId,
+      row_count: sum(segments.map((segment) => segment.row_count)),
+      min_observed_at_utc: minValue(
+        segments.map((segment) => segment.min_observed_at_utc),
+      ),
+      max_observed_at_utc: maxValue(
+        segments.map((segment) => segment.max_observed_at_utc),
+      ),
+      segments: segments.map(({ timeseries_id: _timeseriesId, ...segment }) =>
+        segment
+      ),
+    };
+    assertSameJson(
+      raw,
+      normalized,
+      "V3 child timeseries totals, bounds, or fields are contradictory",
+    );
+    allSegments.push(...segments);
+    return normalized;
+  });
+  assertNonOverlappingPhysicalSegments(
+    allSegments,
+    filesByKey,
+    "V3 child",
+  );
+  const expectedPayload = {
+    ...baseIndexPayload("observation_timeseries_exact_shard"),
+    range_start: rangeStart,
+    range_end: rangeEnd,
+    day_utc: scope.day_utc,
+    connector_id: scope.connector_id,
+    pollutant_code: scope.pollutant_code,
+    row_start_scope: "file",
+    canonical_source_manifest: source,
+    coverage: childCoverage({ files, timeseries }),
+    files,
+    timeseries,
+  };
+  assertSameJson(
+    rawPayload,
+    expectedPayload,
+    "V3 child payload has contradictory identity, coverage, or fields",
+  );
+  const expectedKey = buildObservationHistoryIndexV3ChildShardKey({
+    scope,
+    rangeStart,
+    indexRoot,
+  });
+  if (artifact.key !== expectedKey) throw new Error("V3 child key is non-canonical");
+  assertExactDependencies(
+    artifact,
+    [
+      identityDescriptor({ ...source, kind: "canonical_manifest" }),
+      ...files.map((file) =>
+        identityDescriptor({ ...file, kind: "canonical_parquet" })
+      ),
+    ],
+    new Set(["canonical_manifest", "canonical_parquet"]),
+  );
+  return Object.freeze({
+    artifact,
+    scope,
+    source,
+    range_start: rangeStart,
+    range_end: rangeEnd,
+    files: Object.freeze(files),
+    files_by_key: filesByKey,
+    timeseries: Object.freeze(timeseries),
+    segments: Object.freeze(allSegments),
+  });
+}
+
+function normalizeScopedHierarchy(raw, fieldName = "scoped_hierarchy") {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError(`${fieldName} must be an object`);
+  }
+  if (!Array.isArray(raw.child_shards) || raw.child_shards.length === 0) {
+    throw new TypeError(`${fieldName}.child_shards must be a non-empty array`);
+  }
+  if (!raw.scoped_manifest) {
+    throw new TypeError(`${fieldName}.scoped_manifest is required`);
+  }
+  return raw;
+}
+
+function normalizeChildDescriptor(raw, scope, indexRoot) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError("Scoped v3 child descriptor must be an object");
+  }
+  const rangeStart = normalizeRangeStart(raw.range_start);
+  const rangeEnd = rangeStart + OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3 - 1;
+  const timeseriesIds = (Array.isArray(raw.timeseries_ids)
+    ? raw.timeseries_ids
+    : []).map((value) => positiveSafeInteger(value, "child.timeseries_id"));
+  for (const [index, timeseriesId] of timeseriesIds.entries()) {
+    if (
+      timeseriesId < rangeStart ||
+      timeseriesId > rangeEnd ||
+      (index > 0 && timeseriesIds[index - 1] >= timeseriesId)
+    ) {
+      throw new Error("Scoped v3 child descriptor has invalid timeseries coverage");
+    }
+  }
+  const files = (Array.isArray(raw.files) ? raw.files : []).map((file) =>
+    identityDescriptor({
+      key: file?.key,
+      byte_size: file?.byte_size,
+      sha256: file?.sha256,
+    })
+  );
+  for (const [index, file] of files.entries()) {
+    assertSameJson(
+      raw.files[index],
+      file,
+      "Scoped v3 child file identity has unsupported fields",
+    );
+    if (index > 0 && bytewiseCompare(files[index - 1].key, file.key) >= 0) {
+      throw new Error("Scoped v3 child file identities are not deterministic");
+    }
+  }
+  const descriptor = {
+    key: normalizeKey(raw.key, "child_descriptor.key"),
+    byte_size: positiveSafeInteger(
+      raw.byte_size,
+      "child_descriptor.byte_size",
+    ),
+    sha256: normalizeSha256(raw.sha256, "child_descriptor.sha256"),
+    range_start: rangeStart,
+    range_end: Number(raw.range_end),
+    timeseries_count: positiveSafeInteger(
+      raw.timeseries_count,
+      "child_descriptor.timeseries_count",
+    ),
+    timeseries_ids: timeseriesIds,
+    row_count: positiveSafeInteger(raw.row_count, "child_descriptor.row_count"),
+    min_observed_at_utc: normalizeIso(
+      raw.min_observed_at_utc,
+      "child_descriptor.min_observed_at_utc",
+    ),
+    max_observed_at_utc: normalizeIso(
+      raw.max_observed_at_utc,
+      "child_descriptor.max_observed_at_utc",
+    ),
+    file_count: positiveSafeInteger(
+      raw.file_count,
+      "child_descriptor.file_count",
+    ),
+    files,
+  };
+  if (
+    descriptor.range_end !== rangeEnd ||
+    descriptor.timeseries_count !== timeseriesIds.length ||
+    descriptor.file_count !== files.length ||
+    descriptor.min_observed_at_utc > descriptor.max_observed_at_utc ||
+    descriptor.key !== buildObservationHistoryIndexV3ChildShardKey({
+      scope,
+      rangeStart,
+      indexRoot,
+    })
+  ) {
+    throw new Error("Scoped v3 child descriptor has contradictory identity or totals");
+  }
+  assertSameJson(
+    raw,
+    descriptor,
+    "Scoped v3 child descriptor has unsupported or contradictory fields",
+  );
+  return descriptor;
+}
+
+function scopedPayloadForDescriptors(scope, source, descriptors) {
+  const timeseriesIds = [];
+  const filesByKey = new Map();
+  for (const [index, descriptor] of descriptors.entries()) {
+    if (
+      index > 0 &&
+      descriptors[index - 1].range_start >= descriptor.range_start
+    ) {
+      throw new Error("Scoped v3 child descriptors are not deterministically ordered");
+    }
+    timeseriesIds.push(...descriptor.timeseries_ids);
+    for (const file of descriptor.files) {
+      const previous = filesByKey.get(file.key);
+      if (previous && !sameJson(previous, file)) {
+        throw new Error("Scoped v3 child descriptors contradict shared file identity");
+      }
+      filesByKey.set(file.key, file);
+    }
+  }
+  const uniqueIds = new Set(timeseriesIds);
+  if (uniqueIds.size !== timeseriesIds.length) {
+    throw new Error("Scoped v3 child descriptors duplicate timeseries coverage");
+  }
+  const coverage = {
+    timeseries_count: timeseriesIds.length,
+    timeseries_ids: [...timeseriesIds].sort((left, right) => left - right),
+    row_count: sum(descriptors.map((entry) => entry.row_count)),
+    min_observed_at_utc: minValue(
+      descriptors.map((entry) => entry.min_observed_at_utc),
+    ),
+    max_observed_at_utc: maxValue(
+      descriptors.map((entry) => entry.max_observed_at_utc),
+    ),
+    child_shard_count: descriptors.length,
+    physical_file_count: filesByKey.size,
+  };
+  if (coverage.row_count !== source.row_count) {
+    throw new Error("Scoped v3 descriptor rows disagree with canonical source");
+  }
+  return {
+    ...baseIndexPayload("observation_timeseries_scoped_manifest"),
+    day_utc: scope.day_utc,
+    connector_id: scope.connector_id,
+    pollutant_code: scope.pollutant_code,
+    canonical_source_manifest: source,
+    coverage,
+    children: descriptors,
+  };
+}
+
+function validateObservationHistoryIndexV3ScopedManifestSnapshot({
+  artifact: rawArtifact,
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+}) {
+  const artifact = validateArtifact(
+    rawArtifact,
+    "observation_history_index_v3_scoped_manifest",
+    "scoped_manifest",
+  );
+  const scope = normalizeScope(artifact.payload);
+  const source = normalizeCanonicalManifestDescriptor(
+    artifact.payload.canonical_source_manifest,
+    scope,
+  );
+  const descriptors = (Array.isArray(artifact.payload.children)
+    ? artifact.payload.children
+    : []).map((descriptor) =>
+      normalizeChildDescriptor(descriptor, scope, indexRoot)
+    );
+  if (descriptors.length === 0) {
+    throw new Error("Scoped v3 manifest requires child descriptors");
+  }
+  const expectedPayload = scopedPayloadForDescriptors(scope, source, descriptors);
+  assertSameJson(
+    artifact.payload,
+    expectedPayload,
+    "Scoped v3 manifest payload has contradictory identity, coverage, or children",
+  );
+  const expectedKey = buildObservationHistoryIndexV3ScopedManifestKey({
+    scope,
+    indexRoot,
+  });
+  if (artifact.key !== expectedKey) {
+    throw new Error("Scoped v3 manifest key is non-canonical");
+  }
+  assertExactDependencies(
+    artifact,
+    [
+      identityDescriptor({ ...source, kind: "canonical_manifest" }),
+      ...descriptors.map((descriptor) =>
+        identityDescriptor({ ...descriptor, kind: "child_shard" })
+      ),
+    ],
+    new Set(["canonical_manifest", "child_shard"]),
+  );
+  return Object.freeze({ artifact, scope, source, descriptors });
+}
+
+export function validateObservationHistoryIndexV3ScopedManifestArtifact({
+  artifact: rawArtifact,
+  childShards,
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+}) {
+  const snapshot = validateObservationHistoryIndexV3ScopedManifestSnapshot({
+    artifact: rawArtifact,
+    indexRoot,
+  });
+  const { artifact } = snapshot;
+  if (!Array.isArray(childShards) || childShards.length === 0) {
+    throw new Error("Semantic scoped-manifest validation requires child artifacts");
+  }
+  const rawPayload = artifact.payload;
+  const scope = normalizeScope(rawPayload);
+  const source = normalizeCanonicalManifestDescriptor(
+    rawPayload.canonical_source_manifest,
+    scope,
+  );
+  const children = childShards.map((child) =>
+    validateObservationHistoryIndexV3ChildShardArtifact({
+      artifact: child,
+      indexRoot,
+    })
+  ).sort((left, right) => left.range_start - right.range_start);
+  const seenRanges = new Set();
+  const seenTimeseries = new Set();
+  const filesByKey = new Map();
+  const segments = [];
+  for (const child of children) {
+    if (seenRanges.has(child.range_start)) {
+      throw new Error("Scoped v3 manifest has duplicate shard ranges");
+    }
+    seenRanges.add(child.range_start);
+    if (!sameJson(child.scope, scope) || !sameJson(child.source, source)) {
+      throw new Error("Scoped v3 manifest received a contradictory child shard");
+    }
+    for (const entry of child.timeseries) {
+      if (seenTimeseries.has(entry.timeseries_id)) {
+        throw new Error("Scoped v3 manifest has duplicate timeseries coverage");
+      }
+      seenTimeseries.add(entry.timeseries_id);
+    }
+    for (const file of child.files) {
+      const previous = filesByKey.get(file.key);
+      if (previous && !sameJson(previous, file)) {
+        throw new Error("Scoped v3 manifest has contradictory shared file identity");
+      }
+      filesByKey.set(file.key, file);
+    }
+    segments.push(...child.segments);
+  }
+  assertNonOverlappingPhysicalSegments(
+    segments,
+    filesByKey,
+    "Scoped v3 manifest",
+    { requireCompleteFiles: true },
+  );
+  const descriptors = children.map(({ artifact: child }) =>
+    childDescriptor(child)
+  );
+  const timeseriesIds = [...seenTimeseries].sort((left, right) => left - right);
+  const coverage = {
+    timeseries_count: timeseriesIds.length,
+    timeseries_ids: timeseriesIds,
+    row_count: sum(descriptors.map((entry) => entry.row_count)),
+    min_observed_at_utc: minValue(
+      descriptors.map((entry) => entry.min_observed_at_utc),
+    ),
+    max_observed_at_utc: maxValue(
+      descriptors.map((entry) => entry.max_observed_at_utc),
+    ),
+    child_shard_count: descriptors.length,
+    physical_file_count: filesByKey.size,
+  };
+  if (coverage.row_count !== source.row_count) {
+    throw new Error("Scoped v3 manifest rows disagree with canonical source");
+  }
+  const expectedPayload = {
+    ...baseIndexPayload("observation_timeseries_scoped_manifest"),
+    day_utc: scope.day_utc,
+    connector_id: scope.connector_id,
+    pollutant_code: scope.pollutant_code,
+    canonical_source_manifest: source,
+    coverage,
+    children: descriptors,
+  };
+  assertSameJson(
+    rawPayload,
+    expectedPayload,
+    "Scoped v3 manifest payload has contradictory identity, coverage, or children",
+  );
+  const expectedKey = buildObservationHistoryIndexV3ScopedManifestKey({
+    scope,
+    indexRoot,
+  });
+  if (artifact.key !== expectedKey) {
+    throw new Error("Scoped v3 manifest key is non-canonical");
+  }
+  assertExactDependencies(
+    artifact,
+    [
+      identityDescriptor({ ...source, kind: "canonical_manifest" }),
+      ...children.map(({ artifact: child }) =>
+        identityDescriptor({
+          key: child.key,
+          byte_size: child.byte_size,
+          sha256: child.sha256,
+          kind: "child_shard",
+        })
+      ),
+    ],
+    new Set(["canonical_manifest", "child_shard"]),
+  );
+  return Object.freeze({
+    artifact,
+    scope,
+    source,
+    children: Object.freeze(children),
+    descriptors: Object.freeze(descriptors),
+    coverage: Object.freeze(coverage),
+  });
 }
 
 export function buildObservationHistoryIndexV3ScopedManifest({
@@ -888,11 +1558,10 @@ export function buildObservationHistoryIndexV3ScopedManifest({
     throw new Error("Scoped v3 manifest requires child shard dependencies");
   }
   const children = childShards.map((rawArtifact) => {
-    const artifact = validateArtifact(
-      rawArtifact,
-      "observation_history_index_v3_child_shard",
-      "child_shard",
-    );
+    const { artifact } = validateObservationHistoryIndexV3ChildShardArtifact({
+      artifact: rawArtifact,
+      indexRoot,
+    });
     const payload = artifact.payload;
     if (
       payload.day_utc !== normalized.scope.day_utc ||
@@ -985,7 +1654,7 @@ export function buildObservationHistoryIndexV3ScopedManifest({
       })
     ),
   ];
-  return artifactFromPayload({
+  const artifact = artifactFromPayload({
     kind: "observation_history_index_v3_scoped_manifest",
     key: buildObservationHistoryIndexV3ScopedManifestKey({
       scope: normalized.scope,
@@ -995,6 +1664,12 @@ export function buildObservationHistoryIndexV3ScopedManifest({
     dependencies,
     stage: "scoped_manifest",
   });
+  validateObservationHistoryIndexV3ScopedManifestArtifact({
+    artifact,
+    childShards,
+    indexRoot,
+  });
+  return artifact;
 }
 
 export function buildObservationHistoryIndexV3ScopedHierarchy({
@@ -1047,29 +1722,25 @@ function scopedRootDescriptor(artifact) {
   };
 }
 
-export function buildObservationHistoryIndexV3Latest({
-  scopedManifests,
-  indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
-  latestKey = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
-}) {
-  if (!Array.isArray(scopedManifests) || scopedManifests.length === 0) {
-    throw new Error("V3 latest/global metadata requires scoped dependencies");
+function normalizeScopedRoots(scopedHierarchies, indexRoot) {
+  if (!Array.isArray(scopedHierarchies) || scopedHierarchies.length === 0) {
+    throw new Error("V3 latest/global metadata requires scoped hierarchies");
   }
-  const normalizedIndexRoot = normalizePrefix(indexRoot, "index_root");
-  const roots = scopedManifests.map((rawArtifact) => {
-    const artifact = validateArtifact(
-      rawArtifact,
-      "observation_history_index_v3_scoped_manifest",
-      "scoped_manifest",
+  const roots = scopedHierarchies.map((rawHierarchy, index) => {
+    const hierarchy = normalizeScopedHierarchy(
+      rawHierarchy,
+      `scoped_hierarchies[${index}]`,
     );
-    const expectedKey = buildObservationHistoryIndexV3ScopedManifestKey({
-      scope: artifact.payload,
-      indexRoot: normalizedIndexRoot,
+    const validated = validateObservationHistoryIndexV3ScopedManifestArtifact({
+      artifact: hierarchy.scoped_manifest,
+      childShards: hierarchy.child_shards,
+      indexRoot,
     });
-    if (artifact.key !== expectedKey) {
-      throw new Error("V3 latest/global metadata received a non-canonical root");
-    }
-    return { artifact, descriptor: scopedRootDescriptor(artifact) };
+    return {
+      hierarchy,
+      artifact: validated.artifact,
+      descriptor: scopedRootDescriptor(validated.artifact),
+    };
   }).sort((left, right) =>
     bytewiseCompare(left.descriptor.day_utc, right.descriptor.day_utc) ||
     left.descriptor.connector_id - right.descriptor.connector_id ||
@@ -1091,6 +1762,10 @@ export function buildObservationHistoryIndexV3Latest({
     }
     seen.add(identity);
   }
+  return roots;
+}
+
+function latestPayloadForRoots(roots, normalizedIndexRoot, normalizedLatestKey) {
   const byDay = new Map();
   for (const { descriptor } of roots) {
     if (!byDay.has(descriptor.day_utc)) byDay.set(descriptor.day_utc, []);
@@ -1110,16 +1785,8 @@ export function buildObservationHistoryIndexV3Latest({
       scoped_roots: scopedRoots,
     }));
   const days = daySummaries.map((entry) => entry.day_utc);
-  const payload = {
-    schema_version: OBSERVATION_HISTORY_INDEX_SCHEMA_VERSION_V3,
-    kind: "observation_timeseries_latest_global",
-    index_generation: OBSERVATION_HISTORY_INDEX_GENERATION_V3,
-    history_version: "v2",
-    domain: "observations",
-    history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
-    writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
-    physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-    shard_width: OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3,
+  return {
+    ...baseIndexPayload("observation_timeseries_latest_global"),
     index_root: normalizedIndexRoot,
     min_day_utc: days[0],
     max_day_utc: days[days.length - 1],
@@ -1140,14 +1807,176 @@ export function buildObservationHistoryIndexV3Latest({
       child_shard_key_template:
         `${normalizedIndexRoot}/day_utc={day_utc}/connector_id={connector_id}` +
         "/pollutant_code={pollutant_code}/range={range_start}-{range_end}.json",
-      latest_key: normalizeKey(latestKey, "latest_key"),
+      latest_key: normalizedLatestKey,
     },
     day_summaries: daySummaries,
   };
-  return artifactFromPayload({
+}
+
+function normalizeScopedRootDescriptor(raw, indexRoot) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError("V3 latest scoped-root descriptor must be an object");
+  }
+  const scope = normalizeScope(raw);
+  const descriptor = {
+    day_utc: scope.day_utc,
+    connector_id: scope.connector_id,
+    pollutant_code: scope.pollutant_code,
+    key: normalizeKey(raw.key, "scoped_root.key"),
+    byte_size: positiveSafeInteger(raw.byte_size, "scoped_root.byte_size"),
+    sha256: normalizeSha256(raw.sha256, "scoped_root.sha256"),
+    row_count: positiveSafeInteger(raw.row_count, "scoped_root.row_count"),
+    timeseries_count: positiveSafeInteger(
+      raw.timeseries_count,
+      "scoped_root.timeseries_count",
+    ),
+    child_shard_count: positiveSafeInteger(
+      raw.child_shard_count,
+      "scoped_root.child_shard_count",
+    ),
+    physical_file_count: positiveSafeInteger(
+      raw.physical_file_count,
+      "scoped_root.physical_file_count",
+    ),
+    min_observed_at_utc: normalizeIso(
+      raw.min_observed_at_utc,
+      "scoped_root.min_observed_at_utc",
+    ),
+    max_observed_at_utc: normalizeIso(
+      raw.max_observed_at_utc,
+      "scoped_root.max_observed_at_utc",
+    ),
+  };
+  if (
+    descriptor.min_observed_at_utc > descriptor.max_observed_at_utc ||
+    descriptor.key !== buildObservationHistoryIndexV3ScopedManifestKey({
+      scope,
+      indexRoot,
+    })
+  ) {
+    throw new Error("V3 latest scoped-root descriptor is contradictory");
+  }
+  assertSameJson(
+    raw,
+    descriptor,
+    "V3 latest scoped-root descriptor has unsupported fields",
+  );
+  return descriptor;
+}
+
+function validateObservationHistoryIndexV3LatestSnapshot({
+  artifact: rawArtifact,
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+  latestKey = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
+}) {
+  const artifact = validateArtifact(
+    rawArtifact,
+    "observation_history_index_v3_latest_global",
+    "latest_global",
+  );
+  const normalizedIndexRoot = normalizePrefix(indexRoot, "index_root");
+  const normalizedLatestKey = normalizeKey(latestKey, "latest_key");
+  const rawDaySummaries = Array.isArray(artifact.payload.day_summaries)
+    ? artifact.payload.day_summaries
+    : [];
+  const descriptors = rawDaySummaries.flatMap((day) =>
+    (Array.isArray(day?.scoped_roots) ? day.scoped_roots : []).map((root) =>
+      normalizeScopedRootDescriptor(root, normalizedIndexRoot)
+    )
+  );
+  if (descriptors.length === 0) {
+    throw new Error("V3 latest/global metadata requires scoped-root descriptors");
+  }
+  const roots = descriptors.map((descriptor) => ({ descriptor }));
+  roots.sort((left, right) =>
+    bytewiseCompare(left.descriptor.day_utc, right.descriptor.day_utc) ||
+    left.descriptor.connector_id - right.descriptor.connector_id ||
+    bytewiseCompare(
+      left.descriptor.pollutant_code,
+      right.descriptor.pollutant_code,
+    )
+  );
+  const seen = new Set();
+  for (const { descriptor } of roots) {
+    const identity = scopeIdentity(descriptor);
+    if (seen.has(identity)) {
+      throw new Error("V3 latest/global metadata has duplicate scoped roots");
+    }
+    seen.add(identity);
+  }
+  assertSameJson(
+    artifact.payload,
+    latestPayloadForRoots(roots, normalizedIndexRoot, normalizedLatestKey),
+    "V3 latest/global payload has contradictory roots, summaries, or counters",
+  );
+  if (artifact.key !== normalizedLatestKey) {
+    throw new Error("V3 latest/global key is non-canonical");
+  }
+  assertExactDependencies(
+    artifact,
+    descriptors.map((descriptor) =>
+      identityDescriptor({ ...descriptor, kind: "scoped_manifest" })
+    ),
+    new Set(["scoped_manifest"]),
+  );
+  return Object.freeze({ artifact, roots: Object.freeze(roots) });
+}
+
+export function validateObservationHistoryIndexV3LatestArtifact({
+  artifact: rawArtifact,
+  scopedHierarchies,
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+  latestKey = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
+}) {
+  const snapshot = validateObservationHistoryIndexV3LatestSnapshot({
+    artifact: rawArtifact,
+    indexRoot,
+    latestKey,
+  });
+  const { artifact } = snapshot;
+  const normalizedIndexRoot = normalizePrefix(indexRoot, "index_root");
+  const normalizedLatestKey = normalizeKey(latestKey, "latest_key");
+  const roots = normalizeScopedRoots(scopedHierarchies, normalizedIndexRoot);
+  const expectedPayload = latestPayloadForRoots(
+    roots,
+    normalizedIndexRoot,
+    normalizedLatestKey,
+  );
+  assertSameJson(
+    artifact.payload,
+    expectedPayload,
+    "V3 latest/global payload has contradictory roots, summaries, or counters",
+  );
+  if (artifact.key !== normalizedLatestKey) {
+    throw new Error("V3 latest/global key is non-canonical");
+  }
+  assertExactDependencies(
+    artifact,
+    roots.map(({ artifact: root }) =>
+      identityDescriptor({
+        key: root.key,
+        byte_size: root.byte_size,
+        sha256: root.sha256,
+        kind: "scoped_manifest",
+      })
+    ),
+    new Set(["scoped_manifest"]),
+  );
+  return Object.freeze({ artifact, roots: Object.freeze(roots) });
+}
+
+export function buildObservationHistoryIndexV3Latest({
+  scopedHierarchies,
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+  latestKey = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
+}) {
+  const normalizedIndexRoot = normalizePrefix(indexRoot, "index_root");
+  const normalizedLatestKey = normalizeKey(latestKey, "latest_key");
+  const roots = normalizeScopedRoots(scopedHierarchies, normalizedIndexRoot);
+  const artifact = artifactFromPayload({
     kind: "observation_history_index_v3_latest_global",
-    key: normalizeKey(latestKey, "latest_key"),
-    payload,
+    key: normalizedLatestKey,
+    payload: latestPayloadForRoots(roots, normalizedIndexRoot, normalizedLatestKey),
     dependencies: roots.map(({ artifact }) =>
       identityDescriptor({
         key: artifact.key,
@@ -1158,6 +1987,209 @@ export function buildObservationHistoryIndexV3Latest({
     ),
     stage: "latest_global",
   });
+  validateObservationHistoryIndexV3LatestArtifact({
+    artifact,
+    scopedHierarchies,
+    indexRoot: normalizedIndexRoot,
+    latestKey: normalizedLatestKey,
+  });
+  return artifact;
+}
+
+function scopeIdentity(scope) {
+  const normalized = normalizeScope(scope);
+  return [
+    normalized.day_utc,
+    normalized.connector_id,
+    normalized.pollutant_code,
+  ].join("\u0000");
+}
+
+/**
+ * Replace or add named child ranges while trusting semantically coherent
+ * descriptors for omitted ranges in the existing scoped manifest. A range is
+ * removed only when explicitly listed in removedRangeStarts.
+ */
+export function updateObservationHistoryIndexV3ScopedManifest({
+  existingScopedManifest,
+  canonicalManifest = null,
+  replacementChildShards = [],
+  removedRangeStarts = [],
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+}) {
+  const existing = validateObservationHistoryIndexV3ScopedManifestSnapshot({
+    artifact: existingScopedManifest,
+    indexRoot,
+  });
+  if (!Array.isArray(replacementChildShards)) {
+    throw new TypeError("replacement_child_shards must be an array");
+  }
+  if (!Array.isArray(removedRangeStarts)) {
+    throw new TypeError("removed_range_starts must be an array");
+  }
+  const source = canonicalManifest === null
+    ? existing.source
+    : normalizeCanonicalManifestDescriptor(canonicalManifest, existing.scope);
+  const byRange = new Map(
+    existing.descriptors.map((descriptor) => [descriptor.range_start, descriptor]),
+  );
+  const replacementRanges = new Set();
+  for (const rawArtifact of replacementChildShards) {
+    const validated = validateObservationHistoryIndexV3ChildShardArtifact({
+      artifact: rawArtifact,
+      indexRoot,
+    });
+    if (replacementRanges.has(validated.range_start)) {
+      throw new Error("Targeted scoped update has duplicate replacement ranges");
+    }
+    if (
+      !sameJson(validated.scope, existing.scope) ||
+      !sameJson(validated.source, source)
+    ) {
+      throw new Error("Targeted scoped update replacement disagrees with scope or source");
+    }
+    replacementRanges.add(validated.range_start);
+    byRange.set(validated.range_start, childDescriptor(validated.artifact));
+  }
+  const removals = new Set();
+  for (const rawRangeStart of removedRangeStarts) {
+    const rangeStart = normalizeRangeStart(rawRangeStart);
+    if (removals.has(rangeStart)) {
+      throw new Error("Targeted scoped update has duplicate removal ranges");
+    }
+    if (replacementRanges.has(rangeStart)) {
+      throw new Error("Targeted scoped update cannot replace and remove one range");
+    }
+    if (!byRange.has(rangeStart)) {
+      throw new Error("Targeted scoped update removal range does not exist");
+    }
+    removals.add(rangeStart);
+    byRange.delete(rangeStart);
+  }
+  if (!sameJson(source, existing.source)) {
+    const untouchedRanges = [...byRange.keys()].filter(
+      (rangeStart) => !replacementRanges.has(rangeStart),
+    );
+    if (untouchedRanges.length > 0) {
+      throw new Error(
+        "Targeted scoped update changed canonical source without replacing every retained child",
+      );
+    }
+  }
+  const descriptors = [...byRange.values()].sort(
+    (left, right) => left.range_start - right.range_start,
+  );
+  if (descriptors.length === 0) {
+    throw new Error("Targeted scoped update cannot remove every child");
+  }
+  const artifact = artifactFromPayload({
+    kind: "observation_history_index_v3_scoped_manifest",
+    key: buildObservationHistoryIndexV3ScopedManifestKey({
+      scope: existing.scope,
+      indexRoot,
+    }),
+    payload: scopedPayloadForDescriptors(existing.scope, source, descriptors),
+    dependencies: [
+      identityDescriptor({ ...source, kind: "canonical_manifest" }),
+      ...descriptors.map((descriptor) =>
+        identityDescriptor({ ...descriptor, kind: "child_shard" })
+      ),
+    ],
+    stage: "scoped_manifest",
+  });
+  validateObservationHistoryIndexV3ScopedManifestSnapshot({
+    artifact,
+    indexRoot,
+  });
+  return artifact;
+}
+
+/**
+ * Replace or add named scoped roots while preserving every omitted descriptor
+ * in the existing latest object. A scope is removed only when explicitly
+ * listed in removedScopes.
+ */
+export function updateObservationHistoryIndexV3Latest({
+  existingLatest,
+  replacementScopedManifests = [],
+  removedScopes = [],
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+  latestKey = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
+}) {
+  const existing = validateObservationHistoryIndexV3LatestSnapshot({
+    artifact: existingLatest,
+    indexRoot,
+    latestKey,
+  });
+  if (!Array.isArray(replacementScopedManifests)) {
+    throw new TypeError("replacement_scoped_manifests must be an array");
+  }
+  if (!Array.isArray(removedScopes)) {
+    throw new TypeError("removed_scopes must be an array");
+  }
+  const byScope = new Map(
+    existing.roots.map(({ descriptor }) => [
+      scopeIdentity(descriptor),
+      descriptor,
+    ]),
+  );
+  const replacementScopes = new Set();
+  for (const rawArtifact of replacementScopedManifests) {
+    const validated = validateObservationHistoryIndexV3ScopedManifestSnapshot({
+      artifact: rawArtifact,
+      indexRoot,
+    });
+    const identity = scopeIdentity(validated.scope);
+    if (replacementScopes.has(identity)) {
+      throw new Error("Targeted latest update has duplicate replacement scopes");
+    }
+    replacementScopes.add(identity);
+    byScope.set(identity, scopedRootDescriptor(validated.artifact));
+  }
+  const removals = new Set();
+  for (const rawScope of removedScopes) {
+    const identity = scopeIdentity(rawScope);
+    if (removals.has(identity)) {
+      throw new Error("Targeted latest update has duplicate removal scopes");
+    }
+    if (replacementScopes.has(identity)) {
+      throw new Error("Targeted latest update cannot replace and remove one scope");
+    }
+    if (!byScope.has(identity)) {
+      throw new Error("Targeted latest update removal scope does not exist");
+    }
+    removals.add(identity);
+    byScope.delete(identity);
+  }
+  const normalizedIndexRoot = normalizePrefix(indexRoot, "index_root");
+  const normalizedLatestKey = normalizeKey(latestKey, "latest_key");
+  const roots = [...byScope.values()].map((descriptor) => ({ descriptor }));
+  roots.sort((left, right) =>
+    bytewiseCompare(left.descriptor.day_utc, right.descriptor.day_utc) ||
+    left.descriptor.connector_id - right.descriptor.connector_id ||
+    bytewiseCompare(
+      left.descriptor.pollutant_code,
+      right.descriptor.pollutant_code,
+    )
+  );
+  if (roots.length === 0) {
+    throw new Error("Targeted latest update cannot remove every scoped root");
+  }
+  const artifact = artifactFromPayload({
+    kind: "observation_history_index_v3_latest_global",
+    key: normalizedLatestKey,
+    payload: latestPayloadForRoots(roots, normalizedIndexRoot, normalizedLatestKey),
+    dependencies: roots.map(({ descriptor }) =>
+      identityDescriptor({ ...descriptor, kind: "scoped_manifest" })
+    ),
+    stage: "latest_global",
+  });
+  validateObservationHistoryIndexV3LatestSnapshot({
+    artifact,
+    indexRoot: normalizedIndexRoot,
+    latestKey: normalizedLatestKey,
+  });
+  return artifact;
 }
 
 function normalizePublicationObject(raw) {
