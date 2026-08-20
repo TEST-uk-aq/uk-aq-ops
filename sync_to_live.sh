@@ -284,7 +284,13 @@ sync_repo() {
         --exclude='schemas/ingest_db/uk_aq_openaq_live_sync_test.sql'
       )
       ;;
-    schema|website|pop-ingest|integrity-factory)
+    schema)
+      rsync_args+=(
+        # Supabase CLI state in the schema checkout is local/environment-owned.
+        --exclude='supabase/'
+      )
+      ;;
+    website|pop-ingest|integrity-factory)
       # No extra repo-specific exclusions at present.
       ;;
   esac
