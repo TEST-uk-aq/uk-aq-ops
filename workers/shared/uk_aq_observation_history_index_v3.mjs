@@ -13,6 +13,9 @@ import {
   OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
 } from "./uk_aq_observation_history_target_writer.mjs";
 import { normalizeObservationPropertyCode } from "./uk_aq_observation_property_code.mjs";
+import {
+  validateObservationHistoryIndexV3ScopedManifestBody,
+} from "./uk_aq_observation_history_scoped_manifest_v3.mjs";
 import { sha256Hex } from "./r2_sigv4.mjs";
 
 export const OBSERVATION_HISTORY_INDEX_GENERATION_V3 = "v3";
@@ -1307,141 +1310,6 @@ function normalizeScopedHierarchy(raw, fieldName = "scoped_hierarchy") {
   return raw;
 }
 
-function normalizeChildDescriptor(raw, scope, indexRoot) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new TypeError("Scoped v3 child descriptor must be an object");
-  }
-  const rangeStart = normalizeRangeStart(raw.range_start);
-  const rangeEnd = rangeStart + OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3 - 1;
-  const timeseriesIds = (Array.isArray(raw.timeseries_ids)
-    ? raw.timeseries_ids
-    : []).map((value) => positiveSafeInteger(value, "child.timeseries_id"));
-  for (const [index, timeseriesId] of timeseriesIds.entries()) {
-    if (
-      timeseriesId < rangeStart ||
-      timeseriesId > rangeEnd ||
-      (index > 0 && timeseriesIds[index - 1] >= timeseriesId)
-    ) {
-      throw new Error("Scoped v3 child descriptor has invalid timeseries coverage");
-    }
-  }
-  const files = (Array.isArray(raw.files) ? raw.files : []).map((file) =>
-    identityDescriptor({
-      key: file?.key,
-      byte_size: file?.byte_size,
-      sha256: file?.sha256,
-    })
-  );
-  for (const [index, file] of files.entries()) {
-    assertSameJson(
-      raw.files[index],
-      file,
-      "Scoped v3 child file identity has unsupported fields",
-    );
-    if (index > 0 && bytewiseCompare(files[index - 1].key, file.key) >= 0) {
-      throw new Error("Scoped v3 child file identities are not deterministic");
-    }
-  }
-  const descriptor = {
-    key: normalizeKey(raw.key, "child_descriptor.key"),
-    byte_size: positiveSafeInteger(
-      raw.byte_size,
-      "child_descriptor.byte_size",
-    ),
-    sha256: normalizeSha256(raw.sha256, "child_descriptor.sha256"),
-    range_start: rangeStart,
-    range_end: Number(raw.range_end),
-    timeseries_count: positiveSafeInteger(
-      raw.timeseries_count,
-      "child_descriptor.timeseries_count",
-    ),
-    timeseries_ids: timeseriesIds,
-    row_count: positiveSafeInteger(raw.row_count, "child_descriptor.row_count"),
-    min_observed_at_utc: normalizeIso(
-      raw.min_observed_at_utc,
-      "child_descriptor.min_observed_at_utc",
-    ),
-    max_observed_at_utc: normalizeIso(
-      raw.max_observed_at_utc,
-      "child_descriptor.max_observed_at_utc",
-    ),
-    file_count: positiveSafeInteger(
-      raw.file_count,
-      "child_descriptor.file_count",
-    ),
-    files,
-  };
-  if (
-    descriptor.range_end !== rangeEnd ||
-    descriptor.timeseries_count !== timeseriesIds.length ||
-    descriptor.file_count !== files.length ||
-    descriptor.min_observed_at_utc > descriptor.max_observed_at_utc ||
-    descriptor.key !== buildObservationHistoryIndexV3ChildShardKey({
-      scope,
-      rangeStart,
-      indexRoot,
-    })
-  ) {
-    throw new Error("Scoped v3 child descriptor has contradictory identity or totals");
-  }
-  assertSameJson(
-    raw,
-    descriptor,
-    "Scoped v3 child descriptor has unsupported or contradictory fields",
-  );
-  return descriptor;
-}
-
-function scopedPayloadForDescriptors(scope, source, descriptors) {
-  const timeseriesIds = [];
-  const filesByKey = new Map();
-  for (const [index, descriptor] of descriptors.entries()) {
-    if (
-      index > 0 &&
-      descriptors[index - 1].range_start >= descriptor.range_start
-    ) {
-      throw new Error("Scoped v3 child descriptors are not deterministically ordered");
-    }
-    timeseriesIds.push(...descriptor.timeseries_ids);
-    for (const file of descriptor.files) {
-      const previous = filesByKey.get(file.key);
-      if (previous && !sameJson(previous, file)) {
-        throw new Error("Scoped v3 child descriptors contradict shared file identity");
-      }
-      filesByKey.set(file.key, file);
-    }
-  }
-  const uniqueIds = new Set(timeseriesIds);
-  if (uniqueIds.size !== timeseriesIds.length) {
-    throw new Error("Scoped v3 child descriptors duplicate timeseries coverage");
-  }
-  const coverage = {
-    timeseries_count: timeseriesIds.length,
-    timeseries_ids: [...timeseriesIds].sort((left, right) => left - right),
-    row_count: sum(descriptors.map((entry) => entry.row_count)),
-    min_observed_at_utc: minValue(
-      descriptors.map((entry) => entry.min_observed_at_utc),
-    ),
-    max_observed_at_utc: maxValue(
-      descriptors.map((entry) => entry.max_observed_at_utc),
-    ),
-    child_shard_count: descriptors.length,
-    physical_file_count: filesByKey.size,
-  };
-  if (coverage.row_count !== source.row_count) {
-    throw new Error("Scoped v3 descriptor rows disagree with canonical source");
-  }
-  return {
-    ...baseIndexPayload("observation_timeseries_scoped_manifest"),
-    day_utc: scope.day_utc,
-    connector_id: scope.connector_id,
-    pollutant_code: scope.pollutant_code,
-    canonical_source_manifest: source,
-    coverage,
-    children: descriptors,
-  };
-}
-
 function validateObservationHistoryIndexV3ScopedManifestSnapshot({
   artifact: rawArtifact,
   indexRoot = DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
@@ -1451,32 +1319,12 @@ function validateObservationHistoryIndexV3ScopedManifestSnapshot({
     "observation_history_index_v3_scoped_manifest",
     "scoped_manifest",
   );
-  const scope = normalizeScope(artifact.payload);
-  const source = normalizeCanonicalManifestDescriptor(
-    artifact.payload.canonical_source_manifest,
-    scope,
-  );
-  const descriptors = (Array.isArray(artifact.payload.children)
-    ? artifact.payload.children
-    : []).map((descriptor) =>
-      normalizeChildDescriptor(descriptor, scope, indexRoot)
-    );
-  if (descriptors.length === 0) {
-    throw new Error("Scoped v3 manifest requires child descriptors");
-  }
-  const expectedPayload = scopedPayloadForDescriptors(scope, source, descriptors);
-  assertSameJson(
-    artifact.payload,
-    expectedPayload,
-    "Scoped v3 manifest payload has contradictory identity, coverage, or children",
-  );
-  const expectedKey = buildObservationHistoryIndexV3ScopedManifestKey({
-    scope,
+  const validatedBody = validateObservationHistoryIndexV3ScopedManifestBody({
+    key: artifact.key,
+    body: artifact.body,
     indexRoot,
   });
-  if (artifact.key !== expectedKey) {
-    throw new Error("Scoped v3 manifest key is non-canonical");
-  }
+  const { scope, source, descriptors } = validatedBody;
   assertExactDependencies(
     artifact,
     [
@@ -1488,7 +1336,13 @@ function validateObservationHistoryIndexV3ScopedManifestSnapshot({
     new Set(["canonical_manifest", "child_shard"]),
   );
   assertExactPublicationPrerequisites(artifact, [], new Set());
-  return Object.freeze({ artifact, scope, source, descriptors });
+  return Object.freeze({
+    artifact,
+    scope,
+    source,
+    descriptors,
+    coverage: validatedBody.coverage,
+  });
 }
 
 export function validateObservationHistoryIndexV3ScopedManifestArtifact({
@@ -1505,11 +1359,7 @@ export function validateObservationHistoryIndexV3ScopedManifestArtifact({
     throw new Error("Semantic scoped-manifest validation requires child artifacts");
   }
   const rawPayload = artifact.payload;
-  const scope = normalizeScope(rawPayload);
-  const source = normalizeCanonicalManifestDescriptor(
-    rawPayload.canonical_source_manifest,
-    scope,
-  );
+  const { scope, source } = snapshot;
   const sourcePublicationIdentity = identityDescriptor({
     ...source,
     kind: "canonical_manifest",

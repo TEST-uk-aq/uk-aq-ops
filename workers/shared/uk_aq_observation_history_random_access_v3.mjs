@@ -59,6 +59,14 @@ function checksumHex(value) {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+export async function sha256ObservationHistoryV3Bytes(value) {
+  const body = exactArrayBuffer(value);
+  if (!globalThis.crypto?.subtle?.digest) {
+    throw new Error("V3 index identity validation requires Web Crypto SHA-256");
+  }
+  return checksumHex(await globalThis.crypto.subtle.digest("SHA-256", body));
+}
+
 export function createObservationHistoryV3RangeBudget({
   maxRangeReads,
   maxBytesRequested,

@@ -14,9 +14,11 @@ import {
 import {
   OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS,
   buildObservationHistoryV3ChildReadKey,
+  buildObservationHistoryV3ScopedManifestReadKey,
   createObservationHistoryV3FooterCache,
   observationHistoryV3FooterCacheKey,
   readObservationHistoryExactV3,
+  validateObservationHistoryV3ChildForRead,
 } from "../workers/shared/uk_aq_observation_history_reader_v3.mjs";
 import {
   buildCanonicalObservationTimeseriesBoundedFiles,
@@ -93,9 +95,9 @@ function dayRows(dayUtc, valueOffset = 0) {
   ];
 }
 
-function buildDay(dayUtc, valueOffset = 0) {
+function buildScopedDay(dayUtc, rows) {
   const phase1 = buildCanonicalObservationTimeseriesBoundedFiles(
-    dayRows(dayUtc, valueOffset),
+    rows,
     {
       limits: WRITER_LIMITS,
       fileKeyForOrdinal: (ordinal) =>
@@ -110,8 +112,13 @@ function buildDay(dayUtc, valueOffset = 0) {
   const child = hierarchy.child_shards.find((artifact) =>
     artifact.payload.timeseries.some((entry) => entry.timeseries_id === 100)
   );
-  assert.ok(child);
   return { phase1, hierarchy, child };
+}
+
+function buildDay(dayUtc, valueOffset = 0) {
+  const built = buildScopedDay(dayUtc, dayRows(dayUtc, valueOffset));
+  assert.ok(built.child);
+  return built;
 }
 
 function buildFixture() {
@@ -120,6 +127,10 @@ function buildFixture() {
   const indexObjects = new Map();
   const files = new Map();
   for (const fixtureDay of [...days, unusedDay]) {
+    indexObjects.set(
+      fixtureDay.hierarchy.scoped_manifest.key,
+      fixtureDay.hierarchy.scoped_manifest.body,
+    );
     for (const child of fixtureDay.hierarchy.child_shards) {
       indexObjects.set(child.key, child.body);
     }
@@ -168,6 +179,40 @@ function buildFixture() {
   return { days, unusedDay, indexObjects, files, observations, source };
 }
 
+function replacePinnedChildPayload(fixture, fixtureDay, payload) {
+  const body = encodeObservationHistoryIndexV3Json(payload);
+  const scopedPayload = structuredClone(
+    fixtureDay.hierarchy.scoped_manifest.payload,
+  );
+  const descriptor = scopedPayload.children.find((entry) =>
+    entry.range_start === payload.range_start
+  );
+  assert.ok(descriptor);
+  Object.assign(descriptor, {
+    key: fixtureDay.child.key,
+    byte_size: Buffer.byteLength(body),
+    sha256: sha256(body),
+    range_start: payload.range_start,
+    range_end: payload.range_end,
+    timeseries_count: payload.coverage.timeseries_count,
+    timeseries_ids: [...payload.coverage.timeseries_ids],
+    row_count: payload.coverage.row_count,
+    min_observed_at_utc: payload.coverage.min_observed_at_utc,
+    max_observed_at_utc: payload.coverage.max_observed_at_utc,
+    file_count: payload.coverage.file_count,
+    files: payload.files.map(({ key, byte_size, sha256: fileSha256 }) => ({
+      key,
+      byte_size,
+      sha256: fileSha256,
+    })),
+  });
+  fixture.indexObjects.set(fixtureDay.child.key, body);
+  fixture.indexObjects.set(
+    fixtureDay.hierarchy.scoped_manifest.key,
+    encodeObservationHistoryIndexV3Json(scopedPayload),
+  );
+}
+
 function query(source, options = {}) {
   return readObservationHistoryExactV3({
     source,
@@ -184,6 +229,22 @@ function query(source, options = {}) {
 
 test("v3 exact reader follows Phase 1 segments across row groups, files, and days", async () => {
   const fixture = buildFixture();
+  for (const fixtureDay of fixture.days) {
+    const descriptor = fixtureDay.hierarchy.scoped_manifest.payload.children
+      .find((entry) => entry.key === fixtureDay.child.key);
+    assert.deepEqual(
+      {
+        key: descriptor?.key,
+        byte_size: descriptor?.byte_size,
+        sha256: descriptor?.sha256,
+      },
+      {
+        key: fixtureDay.child.key,
+        byte_size: fixtureDay.child.byte_size,
+        sha256: fixtureDay.child.sha256,
+      },
+    );
+  }
   const result = await query(fixture.source);
 
   assert.equal(result.response_complete, true);
@@ -212,7 +273,17 @@ test("v3 exact reader follows Phase 1 segments across row groups, files, and day
   assert.ok(result.diagnostics.range_coalesces > 0);
   assert.ok(result.diagnostics.row_groups_selected > 2);
   assert.ok(result.diagnostics.parquet_files_selected > 2);
-  assert.equal(fixture.observations.indexKeys.length, 2);
+  assert.equal(result.diagnostics.scoped_manifests_read, 2);
+  assert.equal(result.diagnostics.child_shards_read, 2);
+  assert.equal(result.diagnostics.child_identity_checks, 2);
+  assert.equal(result.diagnostics.child_identity_mismatch, 0);
+  assert.ok(result.diagnostics.scoped_manifest_bytes_read > 0);
+  assert.ok(result.diagnostics.child_shard_bytes_read > 0);
+  assert.equal(fixture.observations.indexKeys.length, 4);
+  for (let index = 0; index < fixture.observations.indexKeys.length; index += 2) {
+    assert.match(fixture.observations.indexKeys[index], /\/manifest\.json$/);
+    assert.match(fixture.observations.indexKeys[index + 1], /\/range=/);
+  }
   assert.ok(
     fixture.observations.indexKeys.every((key) => !key.includes("2026-08-20")),
   );
@@ -362,9 +433,11 @@ test("v3 reader fails closed before trusting ranges on identity, contract, and b
     });
     const childPayload = structuredClone(contradictory.days[0].child.payload);
     childPayload.files[0][field] = value;
-    contradictory.indexObjects.set(
-      childKey,
-      encodeObservationHistoryIndexV3Json(childPayload),
+    assert.equal(childKey, contradictory.days[0].child.key);
+    replacePinnedChildPayload(
+      contradictory,
+      contradictory.days[0],
+      childPayload,
     );
     await assert.rejects(query(contradictory.source), message);
     assert.equal(contradictory.observations.ranges.length, 0);
@@ -379,7 +452,8 @@ test("v3 reader fails closed before trusting ranges on identity, contract, and b
   });
   const payload = structuredClone(wrongLayout.days[0].child.payload);
   payload.physical_layout_version = "unsupported-layout";
-  wrongLayout.indexObjects.set(key, encodeObservationHistoryIndexV3Json(payload));
+  assert.equal(key, wrongLayout.days[0].child.key);
+  replacePinnedChildPayload(wrongLayout, wrongLayout.days[0], payload);
   await assert.rejects(query(wrongLayout.source), /supported generation is contradictory/);
   assert.equal(wrongLayout.observations.ranges.length, 0);
 
@@ -400,7 +474,139 @@ test("v3 reader fails closed before trusting ranges on identity, contract, and b
   );
 });
 
-test("v3 reader reports missing intersecting child shards as incomplete", async () => {
+test("v3 reader authenticates an internally valid child against the scoped manifest", async () => {
+  const fixture = buildFixture();
+  const fixtureDay = fixture.days[0];
+  const childKey = fixtureDay.child.key;
+  const replacementPayload = structuredClone(fixtureDay.child.payload);
+  const replacementFile = replacementPayload.files[0];
+  replacementFile.sha256 = replacementFile.sha256 === "a".repeat(64)
+    ? "b".repeat(64)
+    : "a".repeat(64);
+  const replacementBody = encodeObservationHistoryIndexV3Json(
+    replacementPayload,
+  );
+  assert.equal(
+    Buffer.byteLength(replacementBody),
+    fixtureDay.child.byte_size,
+  );
+  assert.notEqual(sha256(replacementBody), fixtureDay.child.sha256);
+  assert.doesNotThrow(() =>
+    validateObservationHistoryV3ChildForRead({
+      key: childKey,
+      body: replacementBody,
+      dayUtc: "2026-08-18",
+      connectorId: 7,
+      pollutantCode: "pm25",
+      timeseriesId: 100,
+    })
+  );
+  fixture.indexObjects.set(childKey, replacementBody);
+  fixture.files.get(replacementFile.key).metadata = {
+    ...fixture.files.get(replacementFile.key).metadata,
+    sha256: replacementFile.sha256,
+  };
+
+  await assert.rejects(query(fixture.source), (error) => {
+    assert.match(error.message, /pinned child SHA-256 mismatch/);
+    assert.equal(error.diagnostics.child_identity_checks, 1);
+    assert.equal(error.diagnostics.child_identity_mismatch, 1);
+    return true;
+  });
+  assert.equal(fixture.observations.opened.length, 0);
+  assert.equal(fixture.observations.ranges.length, 0);
+});
+
+test("v3 scoped manifest makes explicit child removal authoritative", async () => {
+  const fixture = buildFixture();
+  const dayUtc = "2026-08-18";
+  const orphanedChildKey = buildObservationHistoryV3ChildReadKey({
+    dayUtc,
+    connectorId: 7,
+    pollutantCode: "pm25",
+    timeseriesId: 100,
+  });
+  const replacementScope = buildScopedDay(dayUtc, [{
+    connector_id: 7,
+    station_id: 72,
+    timeseries_id: 1100,
+    pollutant_code: "pm25",
+    observed_at_utc: `${dayUtc}T00:10:00.000Z`,
+    value: 42.5,
+    verification_status: null,
+  }]);
+  assert.equal(replacementScope.child, undefined);
+  fixture.indexObjects.set(
+    replacementScope.hierarchy.scoped_manifest.key,
+    replacementScope.hierarchy.scoped_manifest.body,
+  );
+  for (const child of replacementScope.hierarchy.child_shards) {
+    fixture.indexObjects.set(child.key, child.body);
+  }
+  assert.equal(fixture.indexObjects.has(orphanedChildKey), true);
+
+  const result = await query(fixture.source);
+  assert.equal(result.response_complete, true);
+  assert.equal(result.has_gap, false);
+  assert.equal(result.rows.length, 5);
+  assert.deepEqual(result.diagnostics.authoritative_absent_days, [dayUtc]);
+  assert.equal(
+    fixture.observations.indexKeys.filter((key) => key === orphanedChildKey)
+      .length,
+    0,
+  );
+});
+
+test("v3 reader distinguishes missing scoped roots and mismatching pinned children", async () => {
+  const missingRoot = buildFixture();
+  const dayUtc = "2026-08-18";
+  const scopedKey = buildObservationHistoryV3ScopedManifestReadKey({
+    dayUtc,
+    connectorId: 7,
+    pollutantCode: "pm25",
+  });
+  const strayChildKey = buildObservationHistoryV3ChildReadKey({
+    dayUtc,
+    connectorId: 7,
+    pollutantCode: "pm25",
+    timeseriesId: 100,
+  });
+  missingRoot.indexObjects.delete(scopedKey);
+  assert.equal(missingRoot.indexObjects.has(strayChildKey), true);
+  const missingRootResult = await query(missingRoot.source);
+  assert.equal(missingRootResult.response_complete, false);
+  assert.equal(missingRootResult.has_gap, true);
+  assert.deepEqual(
+    missingRootResult.partial_reasons,
+    ["missing_v3_scoped_manifest"],
+  );
+  assert.deepEqual(
+    missingRootResult.diagnostics.missing_scoped_manifest_keys,
+    [scopedKey],
+  );
+  assert.equal(
+    missingRoot.observations.indexKeys.filter((key) => key === strayChildKey)
+      .length,
+    0,
+  );
+
+  const wrongSize = buildFixture();
+  const childKey = wrongSize.days[0].child.key;
+  wrongSize.indexObjects.set(
+    childKey,
+    `${wrongSize.indexObjects.get(childKey)} `,
+  );
+  await assert.rejects(query(wrongSize.source), (error) => {
+    assert.match(error.message, /pinned child byte-size mismatch/);
+    assert.equal(error.diagnostics.child_identity_checks, 1);
+    assert.equal(error.diagnostics.child_identity_mismatch, 1);
+    return true;
+  });
+  assert.equal(wrongSize.observations.opened.length, 0);
+  assert.equal(wrongSize.observations.ranges.length, 0);
+});
+
+test("v3 reader reports missing scoped-pinned child shards as incomplete", async () => {
   const fixture = buildFixture();
   fixture.indexObjects.delete(buildObservationHistoryV3ChildReadKey({
     dayUtc: "2026-08-19",
@@ -411,7 +617,8 @@ test("v3 reader reports missing intersecting child shards as incomplete", async 
   const result = await query(fixture.source);
   assert.equal(result.response_complete, false);
   assert.equal(result.has_gap, true);
-  assert.deepEqual(result.partial_reasons, ["missing_v3_child_shard"]);
+  assert.deepEqual(result.partial_reasons, ["missing_v3_pinned_child_shard"]);
   assert.equal(result.rows.length, 5);
   assert.equal(result.diagnostics.missing_index_keys.length, 1);
+  assert.equal(result.diagnostics.missing_child_keys.length, 1);
 });

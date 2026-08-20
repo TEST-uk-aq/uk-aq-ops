@@ -17,7 +17,11 @@ import {
   createObservationHistoryV3RangeBudget,
   createPrefetchedObservationHistoryV3AsyncBuffer,
   readObservationHistoryV3ByteRanges,
+  sha256ObservationHistoryV3Bytes,
 } from "./uk_aq_observation_history_random_access_v3.mjs";
+import {
+  validateObservationHistoryIndexV3ScopedManifestBody,
+} from "./uk_aq_observation_history_scoped_manifest_v3.mjs";
 
 export const OBSERVATION_HISTORY_V3_INDEX_GENERATION = "v3";
 export const OBSERVATION_HISTORY_V3_LOGICAL_HISTORY_VERSION = "v2";
@@ -40,7 +44,7 @@ export const OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS = Object.freeze([
 
 // Conservative structural defaults. Real TEST operation owns later tuning.
 export const DEFAULT_OBSERVATION_HISTORY_V3_READ_LIMITS = Object.freeze({
-  max_index_objects: 128,
+  max_index_objects: 256,
   max_index_object_bytes: 2 * 1024 * 1024,
   max_total_index_bytes: 8 * 1024 * 1024,
   max_distinct_files: 32,
@@ -233,6 +237,20 @@ export function buildObservationHistoryV3ChildReadKey({
   return `${root}/day_utc=${scope.day_utc}` +
     `/connector_id=${scope.connector_id}` +
     `/pollutant_code=${scope.pollutant_code}/range=${token}.json`;
+}
+
+export function buildObservationHistoryV3ScopedManifestReadKey({
+  dayUtc,
+  connectorId,
+  pollutantCode,
+  indexRoot = OBSERVATION_HISTORY_V3_INDEX_ROOT,
+}) {
+  const scope = exactScope({ dayUtc, connectorId, pollutantCode });
+  const root = String(indexRoot || "").trim().replace(/^\/+|\/+$/g, "");
+  if (!root) throw new TypeError("indexRoot is required");
+  return `${root}/day_utc=${scope.day_utc}` +
+    `/connector_id=${scope.connector_id}` +
+    `/pollutant_code=${scope.pollutant_code}/manifest.json`;
 }
 
 function normalizeChildFile(raw) {
@@ -506,6 +524,27 @@ export function validateObservationHistoryV3ChildForRead({
   });
 }
 
+function scopedDescriptorForValidatedChild(child, byteSize, sha256) {
+  return {
+    key: child.key,
+    byte_size: byteSize,
+    sha256,
+    range_start: child.payload.range_start,
+    range_end: child.payload.range_end,
+    timeseries_count: child.payload.coverage.timeseries_count,
+    timeseries_ids: [...child.payload.coverage.timeseries_ids],
+    row_count: child.payload.coverage.row_count,
+    min_observed_at_utc: child.payload.coverage.min_observed_at_utc,
+    max_observed_at_utc: child.payload.coverage.max_observed_at_utc,
+    file_count: child.payload.coverage.file_count,
+    files: child.files.map(({ key, byte_size, sha256: fileSha256 }) => ({
+      key,
+      byte_size,
+      sha256: fileSha256,
+    })),
+  };
+}
+
 function resolveLimits(raw = {}) {
   const limits = {};
   for (const [key, fallback] of Object.entries(
@@ -521,6 +560,12 @@ function createDiagnostics() {
     index_generation: OBSERVATION_HISTORY_V3_INDEX_GENERATION,
     index_objects_read: 0,
     index_bytes_read: 0,
+    scoped_manifests_read: 0,
+    scoped_manifest_bytes_read: 0,
+    child_shards_read: 0,
+    child_shard_bytes_read: 0,
+    child_identity_checks: 0,
+    child_identity_mismatch: 0,
     parquet_files_selected: 0,
     selected_segments: 0,
     footer_reads: 0,
@@ -541,6 +586,8 @@ function createDiagnostics() {
     page_selection_unavailable_reason: PAGE_SELECTION_UNAVAILABLE_REASON,
     authoritative_absent_days: [],
     missing_index_keys: [],
+    missing_scoped_manifest_keys: [],
+    missing_child_keys: [],
     partial_or_fail_closed_reason: null,
   };
 }
@@ -874,6 +921,47 @@ function assertPlanLimit(actual, maximum, label) {
   }
 }
 
+async function fetchBoundedIndexObject({
+  source,
+  key,
+  limits,
+  diagnostics,
+}) {
+  if (diagnostics.index_objects_read >= limits.max_index_objects) {
+    throw new Error("V3 index-object count budget exceeded before index GET");
+  }
+  const remainingBytes = limits.max_total_index_bytes -
+    diagnostics.index_bytes_read;
+  if (remainingBytes <= 0) {
+    throw new Error("V3 total-index-byte budget exhausted before index GET");
+  }
+  diagnostics.index_objects_read += 1;
+  const object = await source.getIndexObject({
+    key,
+    maxBytes: Math.min(limits.max_index_object_bytes, remainingBytes),
+    diagnostics,
+  });
+  if (!object) return null;
+  const byteSize = positiveSafeInteger(
+    object.byte_size,
+    "index object byte_size",
+  );
+  if (byteSize > limits.max_index_object_bytes) {
+    throw new Error("V3 index object exceeds per-object byte budget");
+  }
+  const body = exactArrayBuffer(object.body);
+  if (body.byteLength !== byteSize) {
+    throw new Error("V3 index object body disagrees with reported byte size");
+  }
+  diagnostics.index_bytes_read += byteSize;
+  assertPlanLimit(
+    diagnostics.index_bytes_read,
+    limits.max_total_index_bytes,
+    "total-index-byte",
+  );
+  return Object.freeze({ key, body, byte_size: byteSize });
+}
+
 export async function readObservationHistoryExactV3({
   source,
   indexGeneration,
@@ -919,60 +1007,124 @@ export async function readObservationHistoryExactV3({
     if (endMs <= startMs) throw new TypeError("endUtc must be after startUtc");
     const limits = resolveLimits(rawLimits);
     const days = listIntersectingUtcDays(startIso, endIso);
-    assertPlanLimit(days.length, limits.max_index_objects, "index-object count");
+    assertPlanLimit(
+      days.length * 2,
+      limits.max_index_objects,
+      "index-object count",
+    );
 
     const selectedSegments = [];
     const filesByKey = new Map();
+    const incompleteReasons = new Set();
+    const scopedManifestCache = new Map();
     for (const dayUtc of days) {
-      const key = buildObservationHistoryV3ChildReadKey({
+      const scopedKey = buildObservationHistoryV3ScopedManifestReadKey({
         dayUtc,
         connectorId: scopeBase.connector_id,
         pollutantCode: scopeBase.pollutant_code,
-        timeseriesId: normalizedTimeseriesId,
         indexRoot,
       });
-      const object = await source.getIndexObject({
-        key,
-        maxBytes: Math.min(
-          limits.max_index_object_bytes,
-          limits.max_total_index_bytes - diagnostics.index_bytes_read,
-        ),
-        diagnostics,
-      });
-      diagnostics.index_objects_read += 1;
-      if (!object) {
-        diagnostics.missing_index_keys.push(key);
-        continue;
+      let scoped = scopedManifestCache.get(scopedKey);
+      if (!scoped) {
+        const scopedObject = await fetchBoundedIndexObject({
+          source,
+          key: scopedKey,
+          limits,
+          diagnostics,
+        });
+        if (!scopedObject) {
+          diagnostics.missing_index_keys.push(scopedKey);
+          diagnostics.missing_scoped_manifest_keys.push(scopedKey);
+          incompleteReasons.add("missing_v3_scoped_manifest");
+          continue;
+        }
+        diagnostics.scoped_manifests_read += 1;
+        diagnostics.scoped_manifest_bytes_read += scopedObject.byte_size;
+        scoped = validateObservationHistoryIndexV3ScopedManifestBody({
+          key: scopedKey,
+          body: scopedObject.body,
+          indexRoot,
+        });
+        scopedManifestCache.set(scopedKey, scoped);
       }
-      const indexByteSize = positiveSafeInteger(
-        object.byte_size,
-        "index object byte_size",
+
+      const requestedRange = observationHistoryV3RangeForTimeseriesId(
+        normalizedTimeseriesId,
       );
-      if (indexByteSize > limits.max_index_object_bytes) {
-        throw new Error("V3 index object exceeds per-object byte budget");
-      }
-      const indexBody = exactArrayBuffer(object.body);
-      if (indexBody.byteLength !== indexByteSize) {
-        throw new Error("V3 index object body disagrees with reported byte size");
-      }
-      diagnostics.index_bytes_read += indexByteSize;
-      assertPlanLimit(
-        diagnostics.index_bytes_read,
-        limits.max_total_index_bytes,
-        "total-index-byte",
+      const descriptor = scoped.descriptors.find((entry) =>
+        entry.range_start === requestedRange.range_start
       );
-      const child = validateObservationHistoryV3ChildForRead({
-        key,
-        body: indexBody,
-        dayUtc,
-        connectorId: scopeBase.connector_id,
-        pollutantCode: scopeBase.pollutant_code,
-        timeseriesId: normalizedTimeseriesId,
-        indexRoot,
-      });
-      if (!child.requested_timeseries) {
+      if (
+        !descriptor ||
+        !descriptor.timeseries_ids.includes(normalizedTimeseriesId)
+      ) {
         diagnostics.authoritative_absent_days.push(dayUtc);
         continue;
+      }
+
+      const expectedChildKey = buildObservationHistoryV3ChildReadKey({
+        dayUtc,
+        connectorId: scopeBase.connector_id,
+        pollutantCode: scopeBase.pollutant_code,
+        timeseriesId: normalizedTimeseriesId,
+        indexRoot,
+      });
+      if (descriptor.key !== expectedChildKey) {
+        throw new Error("Scoped v3 manifest selected a non-canonical child key");
+      }
+      const childObject = await fetchBoundedIndexObject({
+        source,
+        key: descriptor.key,
+        limits,
+        diagnostics,
+      });
+      if (!childObject) {
+        diagnostics.missing_index_keys.push(descriptor.key);
+        diagnostics.missing_child_keys.push(descriptor.key);
+        incompleteReasons.add("missing_v3_pinned_child_shard");
+        continue;
+      }
+      diagnostics.child_shards_read += 1;
+      diagnostics.child_shard_bytes_read += childObject.byte_size;
+      diagnostics.child_identity_checks += 1;
+      if (childObject.byte_size !== descriptor.byte_size) {
+        diagnostics.child_identity_mismatch += 1;
+        throw new Error(`V3 pinned child byte-size mismatch: ${descriptor.key}`);
+      }
+      const childSha256 = await sha256ObservationHistoryV3Bytes(
+        childObject.body,
+      );
+      if (childSha256 !== descriptor.sha256) {
+        diagnostics.child_identity_mismatch += 1;
+        throw new Error(`V3 pinned child SHA-256 mismatch: ${descriptor.key}`);
+      }
+      const child = validateObservationHistoryV3ChildForRead({
+        key: descriptor.key,
+        body: childObject.body,
+        dayUtc,
+        connectorId: scopeBase.connector_id,
+        pollutantCode: scopeBase.pollutant_code,
+        timeseriesId: normalizedTimeseriesId,
+        indexRoot,
+      });
+      if (
+        !sameJson(
+          scopedDescriptorForValidatedChild(
+            child,
+            childObject.byte_size,
+            childSha256,
+          ),
+          descriptor,
+        )
+      ) {
+        throw new Error(
+          `V3 pinned child semantics disagree with scoped manifest: ${descriptor.key}`,
+        );
+      }
+      if (!child.requested_timeseries) {
+        throw new Error(
+          `V3 pinned child omits scoped timeseries_id=${normalizedTimeseriesId}`,
+        );
       }
       for (const segment of child.requested_timeseries.segments) {
         if (
@@ -1124,10 +1276,11 @@ export async function readObservationHistoryExactV3({
     const budgetSnapshot = budget.snapshot();
     diagnostics.r2_range_reads = budgetSnapshot.range_reads;
     diagnostics.r2_bytes_requested = budgetSnapshot.bytes_requested;
-    const complete = diagnostics.missing_index_keys.length === 0;
+    const partialReasons = [...incompleteReasons];
+    const complete = partialReasons.length === 0;
     diagnostics.partial_or_fail_closed_reason = complete
       ? null
-      : "missing_v3_child_shard";
+      : partialReasons.join(",");
     return Object.freeze({
       index_generation: OBSERVATION_HISTORY_V3_INDEX_GENERATION,
       history_version: OBSERVATION_HISTORY_V3_LOGICAL_HISTORY_VERSION,
@@ -1138,7 +1291,7 @@ export async function readObservationHistoryExactV3({
       end_utc: endIso,
       response_complete: complete,
       has_gap: !complete,
-      partial_reasons: complete ? [] : ["missing_v3_child_shard"],
+      partial_reasons: Object.freeze(partialReasons),
       rows: Object.freeze(rows),
       diagnostics: Object.freeze({ ...diagnostics }),
     });
