@@ -25,6 +25,8 @@ const DEFAULT_MAX_DELETE_BATCHES_PER_HOUR = 10;
 const DEFAULT_REPAIR_ONE_MISMATCH_BUCKET = true;
 const DEFAULT_MAX_HOURS_PER_BATCH = 24;
 const DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS = 14;
+const DEFAULT_FINGERPRINT_RPC_RETRIES = 1;
+const DEFAULT_FINGERPRINT_RPC_RETRY_BASE_MS = 1_000;
 const DEFAULT_OBSERVS_UPSERT_RPC_RETRIES = 3;
 const DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS = 1_000;
 const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
@@ -238,8 +240,12 @@ function githubActionsTaskRunMetadata() {
   };
 }
 
-function isObservsStatementTimeoutError(message) {
+function isStatementTimeoutError(message) {
   return /statement timeout|canceling statement due to statement timeout/i.test(message);
+}
+
+function isObservsStatementTimeoutError(message) {
+  return isStatementTimeoutError(message);
 }
 
 function isRetryableObservsUpsertError(message) {
@@ -859,18 +865,37 @@ function observationPollutantCodesForPrune(config, repairOnlyMode) {
 }
 
 async function fetchHourlyFingerprints(client, windowStart, windowEnd, sourceName, pollutantCodes = null) {
-  const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_HOURLY_FINGERPRINT, {
-    window_start: windowStart,
-    window_end: windowEnd,
-    p_pollutant_codes: pollutantCodes,
-  });
+  let retryCount = 0;
 
-  if (error) {
-    throw new Error(`${sourceName} fingerprint RPC failed: ${error.message}`);
+  while (true) {
+    const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_HOURLY_FINGERPRINT, {
+      window_start: windowStart,
+      window_end: windowEnd,
+      p_pollutant_codes: pollutantCodes,
+    });
+
+    if (!error) {
+      const rows = Array.isArray(data) ? data : [];
+      return normalizeFingerprintRows(rows, sourceName);
+    }
+
+    const message = error instanceof Error ? error.message : String(error.message || error);
+    if (!isStatementTimeoutError(message) || retryCount >= DEFAULT_FINGERPRINT_RPC_RETRIES) {
+      throw new Error(`${sourceName} fingerprint RPC failed: ${message}`);
+    }
+
+    retryCount += 1;
+    const retryDelayMs = DEFAULT_FINGERPRINT_RPC_RETRY_BASE_MS * retryCount;
+    logStructured("WARNING", "fingerprint_rpc_statement_timeout_retry", {
+      source_name: sourceName,
+      window_start: windowStart,
+      window_end: windowEnd,
+      retry_attempt: retryCount,
+      max_retries: DEFAULT_FINGERPRINT_RPC_RETRIES,
+      retry_delay_ms: retryDelayMs,
+    });
+    await sleep(retryDelayMs);
   }
-
-  const rows = Array.isArray(data) ? data : [];
-  return normalizeFingerprintRows(rows, sourceName);
 }
 
 function compareBuckets(ingestBuckets, observsBuckets) {
