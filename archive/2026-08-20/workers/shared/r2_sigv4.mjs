@@ -15,29 +15,6 @@ function awsSha256Hex(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-export function normalizeR2Sha256Checksum(value) {
-  if (value === null || value === undefined || value === "") return null;
-  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-    const bytes = value instanceof ArrayBuffer
-      ? Buffer.from(value)
-      : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-    return bytes.byteLength === 32 ? bytes.toString("hex") : null;
-  }
-  const text = String(value).trim();
-  if (/^[0-9a-f]{64}$/i.test(text)) return text.toLowerCase();
-  if (!/^[A-Za-z0-9+/]{43}=$/.test(text)) return null;
-  const bytes = Buffer.from(text, "base64");
-  return bytes.byteLength === 32 && bytes.toString("base64") === text
-    ? bytes.toString("hex")
-    : null;
-}
-
-function sha256HexToBase64(value) {
-  const normalized = normalizeR2Sha256Checksum(value);
-  if (!normalized) throw new Error("R2 SHA-256 checksum must be 64 hex characters");
-  return Buffer.from(normalized, "hex").toString("base64");
-}
-
 function awsHmac(key, value) {
   return createHmac("sha256", key).update(value).digest();
 }
@@ -305,27 +282,9 @@ async function fetchR2WithRetry({ method, buildRequest, body = undefined }) {
   throw new Error("R2 request retry loop exhausted unexpectedly.");
 }
 
-export async function r2PutObject({
-  r2,
-  key,
-  body,
-  content_type = "application/octet-stream",
-  sha256 = null,
-}) {
-  const expectedSha256 = normalizeR2Sha256Checksum(sha256);
-  if (sha256 !== null && !expectedSha256) {
-    throw new Error(`R2 PUT SHA-256 is invalid: ${key}`);
-  }
-  if (expectedSha256 && awsSha256Hex(body) !== expectedSha256) {
-    throw new Error(`R2 PUT body SHA-256 mismatch: ${key}`);
-  }
+export async function r2PutObject({ r2, key, body, content_type = "application/octet-stream" }) {
   if (r2?.adapter?.putObject) {
-    return r2.adapter.putObject({
-      key,
-      body,
-      content_type,
-      ...(expectedSha256 ? { sha256: expectedSha256 } : {}),
-    });
+    return r2.adapter.putObject({ key, body, content_type });
   }
   const bufferBody = body instanceof Uint8Array ? body : Buffer.from(body);
   const payloadHash = createHash("sha256").update(bufferBody).digest("hex");
@@ -344,9 +303,6 @@ export async function r2PutObject({
       headers: {
         "content-type": content_type,
         "content-length": String(bufferBody.byteLength),
-        ...(expectedSha256
-          ? { "x-amz-checksum-sha256": sha256HexToBase64(expectedSha256) }
-          : {}),
       },
     }),
   });
@@ -359,9 +315,6 @@ export async function r2PutObject({
     key,
     bytes: bufferBody.byteLength,
     etag: response.headers.get("etag") || null,
-    sha256: normalizeR2Sha256Checksum(
-      response.headers.get("x-amz-checksum-sha256"),
-    ) || expectedSha256,
   };
 }
 
@@ -396,11 +349,7 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
 
 export async function r2HeadObject({ r2, key }) {
   if (r2?.adapter?.headObject) {
-    const result = await r2.adapter.headObject({ key });
-    const sha256 = normalizeR2Sha256Checksum(
-      result?.sha256 ?? result?.checksums?.sha256,
-    );
-    return sha256 ? { ...result, sha256 } : result;
+    return r2.adapter.headObject({ key });
   }
   const response = await fetchR2WithRetry({
     method: "HEAD",
@@ -412,9 +361,6 @@ export async function r2HeadObject({ r2, key }) {
       secretAccessKey: r2.secret_access_key,
       bucket: r2.bucket,
       objectKey: key,
-      headers: {
-        "x-amz-checksum-mode": "ENABLED",
-      },
     }),
   });
 
@@ -437,9 +383,6 @@ export async function r2HeadObject({ r2, key }) {
     etag: response.headers.get("etag") || null,
     last_modified: response.headers.get("last-modified") || null,
     bytes: bytesHeader ? Number(bytesHeader) : null,
-    sha256: normalizeR2Sha256Checksum(
-      response.headers.get("x-amz-checksum-sha256"),
-    ),
   };
 }
 
