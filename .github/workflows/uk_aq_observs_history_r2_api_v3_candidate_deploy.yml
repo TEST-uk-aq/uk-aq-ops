@@ -1,0 +1,48 @@
+name: Deploy v3 observation-history candidate Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-candidate:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CANDIDATE_WORKER_NAME: uk-aq-observs-history-r2-api-v3-candidate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - name: Validate isolated candidate configuration
+        run: |
+          set -euo pipefail
+          test -n "${CLOUDFLARE_ACCOUNT_ID}" || { echo "Missing UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID."; exit 1; }
+          test -n "${CLOUDFLARE_API_TOKEN}" || { echo "Missing UK_AQ_R2_CLOUDFLARE_API_TOKEN."; exit 1; }
+          test -n "${CFLARE_R2_BUCKET}" || { echo "Missing CFLARE_R2_BUCKET."; exit 1; }
+          test -n "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" || { echo "Missing UK_AQ_EDGE_UPSTREAM_SECRET."; exit 1; }
+      - name: Resolve TEST R2 bucket binding
+        working-directory: workers/uk_aq_observs_history_r2_api_v3_candidate
+        run: |
+          set -euo pipefail
+          sed -i "s|__CFLARE_R2_BUCKET__|${CFLARE_R2_BUCKET}|g" wrangler.toml
+          grep -F 'UK_AQ_R2_HISTORY_VERSION = "v2"' wrangler.toml >/dev/null
+          grep -F 'UK_AQ_R2_HISTORY_INDEX_VERSION = "v3"' wrangler.toml >/dev/null
+      - name: Reuse existing upstream-auth secret
+        working-directory: workers/uk_aq_observs_history_r2_api_v3_candidate
+        run: |
+          set -euo pipefail
+          jq -n --arg UK_AQ_EDGE_UPSTREAM_SECRET "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" \
+            '{UK_AQ_EDGE_UPSTREAM_SECRET:$UK_AQ_EDGE_UPSTREAM_SECRET}' \
+            | npx --yes wrangler@4 secret bulk --name "${CANDIDATE_WORKER_NAME}"
+      - name: Deploy non-authoritative candidate
+        working-directory: workers/uk_aq_observs_history_r2_api_v3_candidate
+        run: npx --yes wrangler@4 deploy --name "${CANDIDATE_WORKER_NAME}"
+

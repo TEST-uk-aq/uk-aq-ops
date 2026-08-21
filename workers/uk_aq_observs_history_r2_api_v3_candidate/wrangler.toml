@@ -1,0 +1,26 @@
+name = "uk-aq-observs-history-r2-api-v3-candidate"
+main = "worker.mjs"
+compatibility_date = "2026-08-21"
+
+# This authenticated workers.dev endpoint has no custom/public authoritative
+# route. Only the separately named station-history candidate is configured to
+# call it before Phase 6.
+workers_dev = true
+
+[vars]
+UK_AQ_R2_HISTORY_VERSION = "v2"
+UK_AQ_R2_HISTORY_INDEX_VERSION = "v3"
+UK_AQ_R2_HISTORY_V3_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "history/_index_v3/observations_timeseries"
+UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX = "history/_index_v2/timeseries_binding"
+
+[[r2_buckets]]
+binding = "UK_AQ_HISTORY_BUCKET"
+bucket_name = "__CFLARE_R2_BUCKET__"
+preview_bucket_name = "__CFLARE_R2_BUCKET__"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
