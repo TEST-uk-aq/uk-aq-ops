@@ -863,11 +863,12 @@ export async function runObservationHistoryV3SteadyStateWriter({
       const latestExternalByKey = new Map();
       for (const reference of updatedLatest.dependencies) {
         const exact = changedScopedEvidenceByKey.get(reference.key);
+        if (exact) {
+          assertEvidence(exact, reference, "V3 latest scoped prerequisite");
+        }
         latestExternalByKey.set(
           reference.key,
-          exact
-            ? assertEvidence(exact, reference, "V3 latest scoped prerequisite")
-            : await verifiedExternalReference(reference, getObject),
+          await verifiedExternalReference(reference, getObject),
         );
       }
       const latestPlan = buildObservationHistoryIndexV3PublicationPlan({

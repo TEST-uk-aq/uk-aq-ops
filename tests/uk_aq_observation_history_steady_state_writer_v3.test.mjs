@@ -225,6 +225,8 @@ function buildFixture({
     publicationCalls,
     durableCalls,
     getCalls,
+    objects,
+    latestKey: initialLatest.key,
     unrelatedScopedKey: unrelated.v3_hierarchy.scoped_manifest.key,
     activeLocks,
     globalLockCount: () => globalLockCount,
@@ -328,7 +330,10 @@ test("run-level v3 writer releases each lock phase, merges days, and publishes l
     fixture.getCalls.some((call) => call.key === key && call.lock === "connector")
   ));
   assert.ok(changedScopedKeys.every((key) =>
-    !fixture.getCalls.some((call) => call.key === key && call.lock === "global")
+    fixture.getCalls.some((call) => call.key === key && call.lock === "global")
+  ));
+  assert.ok(fixture.getCalls.some((call) =>
+    call.key === fixture.latestKey && call.lock === "global"
   ));
   assert.ok(fixture.getCalls.some((call) =>
     call.key === fixture.unrelatedScopedKey && call.lock === "global"
@@ -341,6 +346,10 @@ test("run-level v3 writer releases each lock phase, merges days, and publishes l
     event.startsWith("v3:put:latest_global:")
   );
   assert.ok(aggregateIndex < latestPutIndex);
+  for (const key of [...changedScopedKeys, fixture.unrelatedScopedKey]) {
+    const lastDependencyGetIndex = fixture.events.lastIndexOf(`v3:get:${key}`);
+    assert.ok(lastDependencyGetIndex >= 0 && lastDependencyGetIndex < latestPutIndex);
+  }
 });
 
 test("connector exact-publication or day failure prevents later authority phases", async () => {
@@ -366,20 +375,37 @@ test("connector exact-publication or day failure prevents later authority phases
   assert.equal(dayFailure.activeLocks.size, 0);
 });
 
-test("a later connector generation cannot be followed by stale exact publication from the released run", async () => {
+test("a later connector generation blocks stale latest publication without rewriting its scoped root", async () => {
+  const replacement = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows({
+      dayUtc: "2026-08-18",
+      connectorId: 1,
+      pollutantCode: "pm25",
+      timeseriesId: 101,
+    }).map((row) => ({ ...row, value: row.value + 1 })),
+    writerLimits: LIMITS,
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: BACKED_UP_AT_UTC,
+  });
+  const replacementRoot = replacement.v3_hierarchy.scoped_manifest;
   let replacementRecorded = false;
   const fixture = buildFixture({
-    afterConnectorRelease: async ({ identity, events }) => {
+    afterConnectorRelease: async ({ identity, events, objects }) => {
       if (identity === "2026-08-18/1" && !replacementRecorded) {
         replacementRecorded = true;
+        objects.set(replacementRoot.key, Buffer.from(replacementRoot.body));
         events.push("race:generation-b:connector-replacement");
       }
     },
   });
-  await runPruneDailyObservationHistoryV3Writer({
-    ...fixture.options,
-    partitions: fixture.options.partitions.slice(0, 2),
-  });
+  await assert.rejects(
+    runPruneDailyObservationHistoryV3Writer({
+      ...fixture.options,
+      partitions: fixture.options.partitions.slice(0, 2),
+    }),
+    /V3 external publication reference identity changed/,
+  );
 
   const releaseIndex = fixture.events.indexOf(
     "lock:connector:release:2026-08-18/1",
@@ -400,10 +426,66 @@ test("a later connector generation cannot be followed by stale exact publication
   assert.ok(exactIndexes.length > 0);
   assert.ok(Math.max(...exactIndexes) < releaseIndex);
   assert.ok(releaseIndex < replacementIndex);
+  assert.ok(fixture.getCalls.some((call) =>
+    call.key === replacementRoot.key && call.lock === "global"
+  ));
+  assert.equal(
+    fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
+    0,
+  );
   assert.equal(
     exactIndexes.some((index) => index > replacementIndex),
     false,
   );
+  assert.deepEqual(fixture.objects.get(replacementRoot.key), Buffer.from(replacementRoot.body));
+  assert.equal(fixture.activeLocks.size, 0);
+});
+
+test("a stale unchanged latest dependency fails closed before latest publication", async () => {
+  const replacement = buildObservationHistoryV3SteadyStatePartition({
+    source: "integrity",
+    rows: rows({
+      dayUtc: "2026-08-01",
+      connectorId: 99,
+      pollutantCode: "o3",
+      timeseriesId: 9901,
+    }).map((row) => ({ ...row, value: row.value + 1 })),
+    writerLimits: LIMITS,
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: BACKED_UP_AT_UTC,
+  });
+  const replacementRoot = replacement.v3_hierarchy.scoped_manifest;
+  let replacementRecorded = false;
+  const fixture = buildFixture({
+    afterConnectorRelease: async ({ identity, events, objects }) => {
+      if (identity === "2026-08-18/1" && !replacementRecorded) {
+        replacementRecorded = true;
+        objects.set(replacementRoot.key, Buffer.from(replacementRoot.body));
+        events.push("race:unchanged-root:connector-replacement");
+      }
+    },
+  });
+
+  await assert.rejects(
+    runPruneDailyObservationHistoryV3Writer({
+      ...fixture.options,
+      partitions: fixture.options.partitions.slice(0, 1),
+    }),
+    /V3 external publication reference identity changed/,
+  );
+
+  assert.ok(fixture.getCalls.some((call) =>
+    call.key === fixture.unrelatedScopedKey && call.lock === "global"
+  ));
+  assert.equal(
+    fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
+    0,
+  );
+  assert.deepEqual(
+    fixture.objects.get(fixture.unrelatedScopedKey),
+    Buffer.from(replacementRoot.body),
+  );
+  assert.equal(fixture.activeLocks.size, 0);
 });
 
 test("non-Prune fixed-source adapters reject prune-eligibility reporting", async () => {
