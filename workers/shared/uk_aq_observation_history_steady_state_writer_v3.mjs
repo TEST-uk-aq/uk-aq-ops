@@ -19,11 +19,14 @@ import {
   putAndVerifyR2ObjectWithSha256,
 } from "./uk_aq_r2_checksum_publication.mjs";
 import {
+  buildHistoryV2ConnectorManifestKey,
+  buildHistoryV2DayManifestKey,
   buildHistoryV2PartKey,
   buildHistoryV2PollutantManifest,
   buildHistoryV2PollutantManifestKey,
 } from "./uk_aq_r2_history_canonical.mjs";
 import {
+  runCanonicalDayFinalizer,
   runCanonicalGlobalIndexFinalizer,
   withConnectorDayHistoryLock,
 } from "./uk_aq_r2_history_writer.mjs";
@@ -75,6 +78,53 @@ function normalizePrefix(value, fieldName) {
     throw new TypeError(`${fieldName} is invalid`);
   }
   return prefix;
+}
+
+function bytewiseCompare(left, right) {
+  return Buffer.compare(Buffer.from(String(left)), Buffer.from(String(right)));
+}
+
+function scopeIdentity(scope) {
+  return [scope.day_utc, scope.connector_id, scope.pollutant_code].join("\u0000");
+}
+
+function connectorDayIdentity(scope) {
+  return [scope.day_utc, scope.connector_id].join("\u0000");
+}
+
+function sortedUniqueConnectorIds(values, fieldName) {
+  if (!Array.isArray(values)) throw new TypeError(`${fieldName} must be an array`);
+  const ids = values.map((value) => Number(value));
+  if (ids.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+    throw new TypeError(`${fieldName} contains an invalid connector ID`);
+  }
+  const unique = [...new Set(ids)].sort((left, right) => left - right);
+  if (unique.length !== ids.length) throw new Error(`${fieldName} contains duplicate connector IDs`);
+  return unique;
+}
+
+function sameArray(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function assertDurableEvidence(value, label) {
+  const key = String(value?.key || "").trim();
+  const byteSize = Number(value?.byte_size);
+  const sha256 = String(value?.sha256 || "").trim();
+  if (
+    value?.verified !== true || value?.durable !== true || !key ||
+    !Number.isSafeInteger(byteSize) || byteSize <= 0 ||
+    !/^[0-9a-f]{64}$/.test(sha256)
+  ) {
+    throw new Error(`${label} is not exact verified durable evidence`);
+  }
+  return Object.freeze({
+    key,
+    byte_size: byteSize,
+    sha256,
+    verified: true,
+    durable: true,
+  });
 }
 
 function canonicalJsonArtifact({ key, payload, dependencies }) {
@@ -317,15 +367,222 @@ export function buildObservationHistoryV3SteadyStatePartition({
   });
 }
 
+function normalizePartitionInputs(partitions) {
+  if (!Array.isArray(partitions) || partitions.length === 0) {
+    throw new TypeError("V3 steady-state writer requires a non-empty partitions array");
+  }
+  return partitions.map((partition, index) => {
+    if (Array.isArray(partition)) return { rows: partition, backed_up_at_utc: undefined };
+    if (!partition || typeof partition !== "object" || !Array.isArray(partition.rows)) {
+      throw new TypeError(`V3 steady-state writer partition ${index} requires rows`);
+    }
+    return {
+      rows: partition.rows,
+      backed_up_at_utc: partition.backed_up_at_utc ?? partition.backedUpAtUtc,
+    };
+  });
+}
+
+function prepareRunPartitions({
+  source,
+  partitions,
+  writerLimits,
+  targetWriterGitSha,
+  backedUpAtUtc,
+  observationsPrefix,
+  indexRoot,
+}) {
+  const prepared = normalizePartitionInputs(partitions).map((partition) =>
+    buildObservationHistoryV3SteadyStatePartition({
+      source,
+      rows: partition.rows,
+      writerLimits,
+      targetWriterGitSha,
+      backedUpAtUtc: partition.backed_up_at_utc ?? backedUpAtUtc,
+      observationsPrefix,
+      indexRoot,
+    })
+  ).sort((left, right) =>
+    bytewiseCompare(left.scope.day_utc, right.scope.day_utc) ||
+    left.scope.connector_id - right.scope.connector_id ||
+    bytewiseCompare(left.scope.pollutant_code, right.scope.pollutant_code)
+  );
+  const seen = new Set();
+  for (const partition of prepared) {
+    const identity = scopeIdentity(partition.scope);
+    if (seen.has(identity)) {
+      throw new Error(
+        `V3 steady-state writer received duplicate partition scope: ${identity.replaceAll("\u0000", "/")}`,
+      );
+    }
+    seen.add(identity);
+  }
+  return prepared;
+}
+
+function groupPreparedByConnectorDay(prepared) {
+  const groups = new Map();
+  for (const partition of prepared) {
+    const identity = connectorDayIdentity(partition.scope);
+    const existing = groups.get(identity) || {
+      day_utc: partition.scope.day_utc,
+      connector_id: partition.scope.connector_id,
+      partitions: [],
+    };
+    existing.partitions.push(partition);
+    groups.set(identity, existing);
+  }
+  return [...groups.values()].sort((left, right) =>
+    bytewiseCompare(left.day_utc, right.day_utc) ||
+    left.connector_id - right.connector_id
+  );
+}
+
+function validateConnectorCanonicalResult(group, result, observationsPrefix) {
+  if (
+    result?.connector_scope_verified !== true ||
+    result?.day_utc !== group.day_utc ||
+    Number(result?.connector_id) !== group.connector_id
+  ) {
+    throw new Error(
+      `Connector-scoped canonical finalizer did not verify ${group.day_utc}/${group.connector_id}`,
+    );
+  }
+  if (result?.prune_eligibility_created === true) {
+    throw new Error("Shared v3 writer canonical stages must not create Prune Daily eligibility");
+  }
+  if (!Array.isArray(result.pollutant_manifests)) {
+    throw new TypeError("Connector-scoped canonical finalizer must return pollutant_manifests");
+  }
+  const actualByKey = new Map();
+  for (const evidence of result.pollutant_manifests) {
+    const normalized = assertDurableEvidence(evidence, "Canonical pollutant manifest");
+    if (actualByKey.has(normalized.key)) {
+      throw new Error(`Duplicate canonical pollutant manifest evidence: ${normalized.key}`);
+    }
+    actualByKey.set(normalized.key, normalized);
+  }
+  if (actualByKey.size !== group.partitions.length) {
+    throw new Error("Connector-scoped canonical finalizer returned the wrong pollutant manifest set");
+  }
+  const pollutantManifests = group.partitions.map((partition) => {
+    const expected = partition.canonical_pollutant_manifest;
+    return assertEvidence(
+      actualByKey.get(expected.key),
+      expected,
+      "Connector-scoped canonical finalizer",
+    );
+  });
+  const connectorManifest = assertDurableEvidence(
+    result.connector_manifest,
+    "Canonical connector manifest",
+  );
+  const expectedConnectorManifestKey = buildHistoryV2ConnectorManifestKey(
+    observationsPrefix,
+    group.day_utc,
+    group.connector_id,
+  );
+  if (connectorManifest.key !== expectedConnectorManifestKey) {
+    throw new Error(`Canonical connector manifest key disagrees: ${group.day_utc}/${group.connector_id}`);
+  }
+  return Object.freeze({
+    day_utc: group.day_utc,
+    connector_id: group.connector_id,
+    connector_manifest: connectorManifest,
+    pollutant_manifests: Object.freeze(pollutantManifests),
+    connector_scope_verified: true,
+  });
+}
+
+function validateDayCanonicalResult({
+  dayUtc,
+  changedConnectorIds,
+  result,
+  observationsPrefix,
+}) {
+  if (
+    result?.canonical_day_authority_verified !== true ||
+    result?.parent_state_reread_under_lock !== true ||
+    result?.day_utc !== dayUtc
+  ) {
+    throw new Error(`Canonical day finalizer did not establish locked current-parent authority: ${dayUtc}`);
+  }
+  if (result?.prune_eligibility_created === true) {
+    throw new Error("Shared v3 writer day finalization must not create Prune Daily eligibility");
+  }
+  const reportedChanged = sortedUniqueConnectorIds(
+    result.changed_connector_ids,
+    "changed_connector_ids",
+  );
+  if (!sameArray(reportedChanged, changedConnectorIds)) {
+    throw new Error(`Canonical day finalizer changed-connector evidence disagrees: ${dayUtc}`);
+  }
+  const current = sortedUniqueConnectorIds(
+    result.current_connector_ids,
+    "current_connector_ids",
+  );
+  const finalIds = sortedUniqueConnectorIds(
+    result.final_connector_ids,
+    "final_connector_ids",
+  );
+  const expectedFinal = [...new Set([...current, ...changedConnectorIds])]
+    .sort((left, right) => left - right);
+  if (!sameArray(finalIds, expectedFinal)) {
+    throw new Error(`Canonical day finalizer did not preserve the current connector set: ${dayUtc}`);
+  }
+  const dayManifest = assertDurableEvidence(result.day_manifest, "Canonical day manifest");
+  if (dayManifest.key !== buildHistoryV2DayManifestKey(observationsPrefix, dayUtc)) {
+    throw new Error(`Canonical day manifest key disagrees: ${dayUtc}`);
+  }
+  return Object.freeze({
+    day_utc: dayUtc,
+    changed_connector_ids: Object.freeze([...changedConnectorIds]),
+    current_connector_ids: Object.freeze(current),
+    final_connector_ids: Object.freeze(finalIds),
+    day_manifest: dayManifest,
+    canonical_day_authority_verified: true,
+    parent_state_reread_under_lock: true,
+  });
+}
+
+function validateAggregateCanonicalResult({ affectedDays, result }) {
+  if (
+    result?.canonical_aggregate_authority_verified !== true ||
+    result?.parent_state_reread_under_lock !== true
+  ) {
+    throw new Error("Canonical aggregate finalizer did not establish locked current-parent authority");
+  }
+  if (result?.prune_eligibility_created === true) {
+    throw new Error("Shared v3 writer aggregate finalization must not create Prune Daily eligibility");
+  }
+  const reportedDays = [...new Set(
+    (Array.isArray(result.affected_days_utc) ? result.affected_days_utc : [])
+      .map((value) => String(value || "").trim()),
+  )].sort(bytewiseCompare);
+  if (!sameArray(reportedDays, affectedDays)) {
+    throw new Error("Canonical aggregate finalizer affected-day evidence disagrees");
+  }
+  const manifests = (Array.isArray(result.aggregate_manifests)
+    ? result.aggregate_manifests
+    : []).map((entry) => assertDurableEvidence(entry, "Canonical aggregate manifest"));
+  manifests.sort((left, right) => bytewiseCompare(left.key, right.key));
+  return Object.freeze({
+    affected_days_utc: Object.freeze([...affectedDays]),
+    aggregate_manifests: Object.freeze(manifests),
+    canonical_aggregate_authority_verified: true,
+    parent_state_reread_under_lock: true,
+  });
+}
+
 /**
- * The one post-cutover publication path for Prune, Integrity, SOS and supported
- * backfills. Callers supply their existing canonical parent-manifest finalizer;
- * it must return exact durable evidence before the v3 index can advance.
+ * The one post-cutover run-level publication path for Prune, Integrity, SOS and
+ * supported backfills. Connector, day and global locks are acquired in three
+ * sequential, non-nested phases.
  */
-export async function runObservationHistoryV3SteadyStatePartitionWriter({
+export async function runObservationHistoryV3SteadyStateWriter({
   client,
   source,
-  rows,
+  partitions,
   writerLimits,
   targetWriterGitSha,
   backedUpAtUtc,
@@ -336,10 +593,16 @@ export async function runObservationHistoryV3SteadyStatePartitionWriter({
   putObject = r2PutObject,
   headObject = r2HeadObject,
   getObject,
-  publishCanonicalManifests,
+  publishConnectorScopedCanonicalManifests,
+  finalizeCanonicalDayManifests,
+  finalizeCanonicalAggregateManifests,
   putIfChanged,
   recordDurableEvidence,
   finalizeV3Publication = finalizeObservationHistoryIndexV3Publication,
+  putAndVerifyParquet = putAndVerifyR2ObjectWithSha256,
+  withConnectorDayLock = withConnectorDayHistoryLock,
+  runDayFinalizer = runCanonicalDayFinalizer,
+  runGlobalFinalizer = runCanonicalGlobalIndexFinalizer,
   diagnostics,
   diagnosticEnvironment,
   lockTimeoutMs,
@@ -348,141 +611,244 @@ export async function runObservationHistoryV3SteadyStatePartitionWriter({
   if (!r2 || typeof r2 !== "object") throw new Error("V3 steady-state writer requires R2 configuration");
   for (const [name, adapter] of Object.entries({
     getObject,
-    publishCanonicalManifests,
+    publishConnectorScopedCanonicalManifests,
+    finalizeCanonicalDayManifests,
+    finalizeCanonicalAggregateManifests,
     putIfChanged,
     recordDurableEvidence,
     finalizeV3Publication,
+    putAndVerifyParquet,
+    withConnectorDayLock,
+    runDayFinalizer,
+    runGlobalFinalizer,
   })) {
     if (typeof adapter !== "function") throw new TypeError(`V3 steady-state writer adapter is missing: ${name}`);
   }
-  const prepared = buildObservationHistoryV3SteadyStatePartition({
+  const prepared = prepareRunPartitions({
     source,
-    rows,
+    partitions,
     writerLimits,
     targetWriterGitSha,
     backedUpAtUtc,
     observationsPrefix,
     indexRoot,
   });
-  return await withConnectorDayHistoryLock({
-    client,
-    dayUtc: prepared.scope.day_utc,
-    connectorId: prepared.scope.connector_id,
-    diagnostics,
-    diagnosticEnvironment,
-    timeoutMs: lockTimeoutMs,
-  }, async () => {
-    const fileEvidence = [];
-    for (const intent of prepared.file_intents) {
-      const verified = await putAndVerifyR2ObjectWithSha256({
-        r2,
-        intent,
-        putObject,
-        headObject,
-      });
-      fileEvidence.push(Object.freeze({
-        ...verified,
-        verified: true,
-        durable: true,
-      }));
-    }
-    const expectedCanonical = prepared.canonical_pollutant_manifest;
-    const canonicalResult = await publishCanonicalManifests({
-      source: prepared.source,
-      prune_eligibility_owner: prepared.prune_eligibility_owner,
-      scope: prepared.scope,
-      pollutant_manifest: expectedCanonical,
-      file_evidence: Object.freeze(fileEvidence),
-    });
-    if (canonicalResult?.canonical_hierarchy_verified !== true) {
-      throw new Error(
-        "Canonical manifest finalizer must verify pollutant, connector, day and aggregate publication",
-      );
-    }
-    if (
-      prepared.prune_eligibility_owner !== true
-      && canonicalResult?.prune_eligibility_created === true
-    ) {
-      throw new Error(
-        `Writer source ${prepared.source} must not create Prune Daily eligibility`,
-      );
-    }
-    const canonicalEvidence = assertEvidence(
-      canonicalResult?.pollutant_manifest ?? canonicalResult,
-      expectedCanonical,
-      "Canonical manifest finalizer",
-    );
-
-    return await runCanonicalGlobalIndexFinalizer({
+  const canonicalObservationsPrefix = normalizePrefix(
+    observationsPrefix,
+    "observationsPrefix",
+  );
+  const connectorGroups = groupPreparedByConnectorDay(prepared);
+  prepared.length = 0;
+  const connectorResults = [];
+  for (const group of connectorGroups) {
+    const result = await withConnectorDayLock({
       client,
+      dayUtc: group.day_utc,
+      connectorId: group.connector_id,
+      diagnostics,
+      diagnosticEnvironment,
+      timeoutMs: lockTimeoutMs,
+    }, async () => {
+      const partitionResults = [];
+      for (const partition of group.partitions) {
+        const fileEvidence = [];
+        for (const intent of partition.file_intents) {
+          const verified = await putAndVerifyParquet({
+            r2,
+            intent,
+            putObject,
+            headObject,
+          });
+          fileEvidence.push(Object.freeze({
+            ...verified,
+            verified: true,
+            durable: true,
+          }));
+        }
+        partitionResults.push(Object.freeze({
+          scope: partition.scope,
+          target_metadata: partition.target_metadata,
+          pollutant_manifest: partition.canonical_pollutant_manifest,
+          file_evidence: Object.freeze(fileEvidence),
+          v3_hierarchy: partition.v3_hierarchy,
+        }));
+      }
+      const canonicalResult = await publishConnectorScopedCanonicalManifests({
+        source: normalizeSource(source),
+        day_utc: group.day_utc,
+        connector_id: group.connector_id,
+        partitions: Object.freeze(partitionResults),
+      });
+      const canonical = validateConnectorCanonicalResult(
+        group,
+        canonicalResult,
+        canonicalObservationsPrefix,
+      );
+      return Object.freeze({
+        day_utc: group.day_utc,
+        connector_id: group.connector_id,
+        partitions: Object.freeze(partitionResults),
+        canonical,
+      });
+    });
+    connectorResults.push(result);
+    group.partitions.length = 0;
+  }
+
+  const affectedDays = [...new Set(connectorResults.map((entry) => entry.day_utc))]
+    .sort(bytewiseCompare);
+  const dayResults = [];
+  for (const dayUtc of affectedDays) {
+    const changedConnectors = connectorResults
+      .filter((entry) => entry.day_utc === dayUtc)
+      .sort((left, right) => left.connector_id - right.connector_id);
+    const changedConnectorIds = changedConnectors.map((entry) => entry.connector_id);
+    const result = await runDayFinalizer({
+      client,
+      dayUtc,
       diagnostics,
       diagnosticEnvironment,
       timeoutMs: lockTimeoutMs,
       finalize: async () => {
-        const latestObject = await getObject({ key: latestKey });
-        if (!latestObject || latestObject.exists === false) {
-          throw new Error(`Post-cutover v3 latest object is missing: ${latestKey}`);
-        }
-        const existingLatest = latestArtifactFromStoredObject({
-          key: latestKey,
-          body: latestObject.body,
-          latestKey,
+        const finalized = await finalizeCanonicalDayManifests({
+          source: normalizeSource(source),
+          day_utc: dayUtc,
+          changed_connectors: Object.freeze(changedConnectors),
         });
-        const updatedLatest = updateObservationHistoryIndexV3Latest({
-          existingLatest,
-          replacementScopedManifests: [prepared.v3_hierarchy.scoped_manifest],
-          indexRoot,
-          latestKey,
-        });
-        const changedObjects = [
-          ...prepared.v3_hierarchy.child_shards,
-          prepared.v3_hierarchy.scoped_manifest,
-          updatedLatest,
-        ];
-        const changedKeys = new Set(changedObjects.map((object) => object.key));
-        const knownEvidence = new Map([
-          ...fileEvidence.map((entry) => [entry.key, entry]),
-          [canonicalEvidence.key, canonicalEvidence],
-        ]);
-        const externalByKey = new Map();
-        for (const object of changedObjects) {
-          for (const reference of [
-            ...(object.dependencies || []),
-            ...(object.publication_prerequisites || []),
-          ]) {
-            if (changedKeys.has(reference.key) || externalByKey.has(reference.key)) continue;
-            const known = knownEvidence.get(reference.key);
-            externalByKey.set(
-              reference.key,
-              known
-                ? assertEvidence(known, reference, "V3 publication prerequisite")
-                : await verifiedExternalReference(reference, getObject),
-            );
-          }
-        }
-        const plan = buildObservationHistoryIndexV3PublicationPlan({
-          objects: changedObjects,
-          externalReferences: [...externalByKey.values()],
-        });
-        const publication = await finalizeV3Publication({
-          plan,
-          putIfChanged,
-          getObject,
-          recordDurableEvidence,
-        });
-        return Object.freeze({
-          ok: publication.ok === true,
-          status: publication.status,
-          source: prepared.source,
-          prune_eligibility_owner: prepared.prune_eligibility_owner,
-          scope: prepared.scope,
-          target_metadata: prepared.target_metadata,
-          file_evidence: Object.freeze(fileEvidence),
-          canonical_manifest_evidence: canonicalEvidence,
-          v3_publication: publication,
+        return validateDayCanonicalResult({
+          dayUtc,
+          changedConnectorIds,
+          result: finalized,
+          observationsPrefix: canonicalObservationsPrefix,
         });
       },
     });
+    dayResults.push(result);
+  }
+
+  return await runGlobalFinalizer({
+    client,
+    diagnostics,
+    diagnosticEnvironment,
+    timeoutMs: lockTimeoutMs,
+    finalize: async () => {
+      const partitionResults = connectorResults.flatMap(
+        (connectorResult) => connectorResult.partitions,
+      );
+      const exactObjects = partitionResults.flatMap((partition) => [
+        ...partition.v3_hierarchy.child_shards,
+        partition.v3_hierarchy.scoped_manifest,
+      ]);
+      const knownEvidence = new Map();
+      for (const connectorResult of connectorResults) {
+        for (const partition of connectorResult.partitions) {
+          for (const evidence of partition.file_evidence) {
+            knownEvidence.set(evidence.key, evidence);
+          }
+        }
+        for (const evidence of connectorResult.canonical.pollutant_manifests) {
+          knownEvidence.set(evidence.key, evidence);
+        }
+      }
+      const exactKeys = new Set(exactObjects.map((object) => object.key));
+      const exactExternalByKey = new Map();
+      for (const object of exactObjects) {
+        for (const reference of [
+          ...(object.dependencies || []),
+          ...(object.publication_prerequisites || []),
+        ]) {
+          if (exactKeys.has(reference.key) || exactExternalByKey.has(reference.key)) continue;
+          const known = knownEvidence.get(reference.key);
+          exactExternalByKey.set(
+            reference.key,
+            known
+              ? assertEvidence(known, reference, "V3 publication prerequisite")
+              : await verifiedExternalReference(reference, getObject),
+          );
+        }
+      }
+      const exactPlan = buildObservationHistoryIndexV3PublicationPlan({
+        objects: exactObjects,
+        externalReferences: [...exactExternalByKey.values()],
+      });
+      const exactPublication = await finalizeV3Publication({
+        plan: exactPlan,
+        putIfChanged,
+        getObject,
+        recordDurableEvidence,
+      });
+      const exactEvidenceByKey = new Map(
+        exactPublication.objects.map((entry) => [entry.key, entry]),
+      );
+
+      const aggregateResult = validateAggregateCanonicalResult({
+        affectedDays,
+        result: await finalizeCanonicalAggregateManifests({
+          source: normalizeSource(source),
+          affected_days_utc: Object.freeze([...affectedDays]),
+          day_results: Object.freeze(dayResults),
+        }),
+      });
+
+      const latestObject = await getObject({ key: latestKey });
+      if (!latestObject || latestObject.exists === false) {
+        throw new Error(`Post-cutover v3 latest object is missing: ${latestKey}`);
+      }
+      const existingLatest = latestArtifactFromStoredObject({
+        key: latestKey,
+        body: latestObject.body,
+        latestKey,
+      });
+      const replacementScopedManifests = partitionResults.map(
+        (partition) => partition.v3_hierarchy.scoped_manifest,
+      );
+      const updatedLatest = updateObservationHistoryIndexV3Latest({
+        existingLatest,
+        replacementScopedManifests,
+        indexRoot,
+        latestKey,
+      });
+      const latestExternalByKey = new Map();
+      for (const reference of updatedLatest.dependencies) {
+        const exact = exactEvidenceByKey.get(reference.key);
+        latestExternalByKey.set(
+          reference.key,
+          exact
+            ? assertEvidence(exact, reference, "V3 latest scoped prerequisite")
+            : await verifiedExternalReference(reference, getObject),
+        );
+      }
+      const latestPlan = buildObservationHistoryIndexV3PublicationPlan({
+        objects: [updatedLatest],
+        externalReferences: [...latestExternalByKey.values()],
+      });
+      const latestPublication = await finalizeV3Publication({
+        plan: latestPlan,
+        putIfChanged,
+        getObject,
+        recordDurableEvidence,
+      });
+      return Object.freeze({
+        ok: exactPublication.ok === true && latestPublication.ok === true,
+        status: latestPublication.status,
+        source: normalizeSource(source),
+        prune_eligibility_owner:
+          normalizeSource(source) === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
+        affected_partition_count: partitionResults.length,
+        affected_connector_days: Object.freeze(connectorResults.map((entry) => ({
+          day_utc: entry.day_utc,
+          connector_id: entry.connector_id,
+        }))),
+        affected_days_utc: Object.freeze([...affectedDays]),
+        connector_results: Object.freeze(connectorResults),
+        day_results: Object.freeze(dayResults),
+        canonical_aggregate_result: aggregateResult,
+        v3_publication: Object.freeze({
+          exact_scopes: exactPublication,
+          latest_global: latestPublication,
+        }),
+      });
+    },
   });
 }
 
@@ -490,21 +856,21 @@ export async function runObservationHistoryV3SteadyStatePartitionWriter({
 // runtime writer-generation selector and prevent each caller from reimplementing
 // target construction or v3 publication semantics.
 export function runPruneDailyObservationHistoryV3Writer(options) {
-  return runObservationHistoryV3SteadyStatePartitionWriter({
+  return runObservationHistoryV3SteadyStateWriter({
     ...options,
     source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
   });
 }
 
 export function runIntegrityObservationHistoryV3Writer(options) {
-  return runObservationHistoryV3SteadyStatePartitionWriter({
+  return runObservationHistoryV3SteadyStateWriter({
     ...options,
     source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.integrity,
   });
 }
 
 export function runSosHistoricalReplacementObservationHistoryV3Writer(options) {
-  return runObservationHistoryV3SteadyStatePartitionWriter({
+  return runObservationHistoryV3SteadyStateWriter({
     ...options,
     source:
       OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
@@ -512,7 +878,7 @@ export function runSosHistoricalReplacementObservationHistoryV3Writer(options) {
 }
 
 export function runSupportedBackfillObservationHistoryV3Writer(options) {
-  return runObservationHistoryV3SteadyStatePartitionWriter({
+  return runObservationHistoryV3SteadyStateWriter({
     ...options,
     source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.supportedBackfill,
   });
