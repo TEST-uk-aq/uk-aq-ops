@@ -574,6 +574,78 @@ function validateAggregateCanonicalResult({ affectedDays, result }) {
   });
 }
 
+async function publishConnectorExactV3Scopes({
+  partitions,
+  canonical,
+  getObject,
+  putIfChanged,
+  recordDurableEvidence,
+  finalizeV3Publication,
+}) {
+  const exactObjects = partitions.flatMap((partition) => [
+    ...partition.v3_hierarchy.child_shards,
+    partition.v3_hierarchy.scoped_manifest,
+  ]);
+  const knownEvidence = new Map();
+  for (const partition of partitions) {
+    for (const evidence of partition.file_evidence) {
+      knownEvidence.set(evidence.key, evidence);
+    }
+  }
+  for (const evidence of canonical.pollutant_manifests) {
+    knownEvidence.set(evidence.key, evidence);
+  }
+  const exactKeys = new Set(exactObjects.map((object) => object.key));
+  const externalByKey = new Map();
+  for (const object of exactObjects) {
+    for (const reference of [
+      ...(object.dependencies || []),
+      ...(object.publication_prerequisites || []),
+    ]) {
+      if (exactKeys.has(reference.key) || externalByKey.has(reference.key)) continue;
+      const known = knownEvidence.get(reference.key);
+      externalByKey.set(
+        reference.key,
+        known
+          ? assertEvidence(known, reference, "V3 publication prerequisite")
+          : await verifiedExternalReference(reference, getObject),
+      );
+    }
+  }
+  const plan = buildObservationHistoryIndexV3PublicationPlan({
+    objects: exactObjects,
+    externalReferences: [...externalByKey.values()],
+  });
+  const publication = await finalizeV3Publication({
+    plan,
+    putIfChanged,
+    getObject,
+    recordDurableEvidence,
+  });
+  if (publication?.ok !== true || !Array.isArray(publication.objects)) {
+    throw new Error("Connector-scoped v3 publication did not return verified object evidence");
+  }
+  const evidenceByKey = new Map(
+    publication.objects.map((entry) => [entry.key, entry]),
+  );
+  const scopedRoots = partitions.map((partition) => {
+    const artifact = partition.v3_hierarchy.scoped_manifest;
+    return Object.freeze({
+      scope: partition.scope,
+      artifact,
+      evidence: assertEvidence(
+        evidenceByKey.get(artifact.key),
+        artifact,
+        "Connector-scoped v3 root publication",
+      ),
+    });
+  });
+  return Object.freeze({
+    publication,
+    scoped_roots: Object.freeze(scopedRoots),
+  });
+}
+
 /**
  * The one post-cutover run-level publication path for Prune, Integrity, SOS and
  * supported backfills. Connector, day and global locks are acquired in three
@@ -684,11 +756,31 @@ export async function runObservationHistoryV3SteadyStateWriter({
         canonicalResult,
         canonicalObservationsPrefix,
       );
+      const exact = await publishConnectorExactV3Scopes({
+        partitions: partitionResults,
+        canonical,
+        getObject,
+        putIfChanged,
+        recordDurableEvidence,
+        finalizeV3Publication,
+      });
+      const scopedRootByIdentity = new Map(
+        exact.scoped_roots.map((root) => [scopeIdentity(root.scope), root]),
+      );
       return Object.freeze({
         day_utc: group.day_utc,
         connector_id: group.connector_id,
-        partitions: Object.freeze(partitionResults),
+        partitions: Object.freeze(partitionResults.map((partition) =>
+          Object.freeze({
+            scope: partition.scope,
+            target_metadata: partition.target_metadata,
+            pollutant_manifest: partition.pollutant_manifest,
+            file_evidence: partition.file_evidence,
+            scoped_root: scopedRootByIdentity.get(scopeIdentity(partition.scope)),
+          })
+        )),
         canonical,
+        v3_exact_publication: exact.publication,
       });
     });
     connectorResults.push(result);
@@ -735,52 +827,6 @@ export async function runObservationHistoryV3SteadyStateWriter({
       const partitionResults = connectorResults.flatMap(
         (connectorResult) => connectorResult.partitions,
       );
-      const exactObjects = partitionResults.flatMap((partition) => [
-        ...partition.v3_hierarchy.child_shards,
-        partition.v3_hierarchy.scoped_manifest,
-      ]);
-      const knownEvidence = new Map();
-      for (const connectorResult of connectorResults) {
-        for (const partition of connectorResult.partitions) {
-          for (const evidence of partition.file_evidence) {
-            knownEvidence.set(evidence.key, evidence);
-          }
-        }
-        for (const evidence of connectorResult.canonical.pollutant_manifests) {
-          knownEvidence.set(evidence.key, evidence);
-        }
-      }
-      const exactKeys = new Set(exactObjects.map((object) => object.key));
-      const exactExternalByKey = new Map();
-      for (const object of exactObjects) {
-        for (const reference of [
-          ...(object.dependencies || []),
-          ...(object.publication_prerequisites || []),
-        ]) {
-          if (exactKeys.has(reference.key) || exactExternalByKey.has(reference.key)) continue;
-          const known = knownEvidence.get(reference.key);
-          exactExternalByKey.set(
-            reference.key,
-            known
-              ? assertEvidence(known, reference, "V3 publication prerequisite")
-              : await verifiedExternalReference(reference, getObject),
-          );
-        }
-      }
-      const exactPlan = buildObservationHistoryIndexV3PublicationPlan({
-        objects: exactObjects,
-        externalReferences: [...exactExternalByKey.values()],
-      });
-      const exactPublication = await finalizeV3Publication({
-        plan: exactPlan,
-        putIfChanged,
-        getObject,
-        recordDurableEvidence,
-      });
-      const exactEvidenceByKey = new Map(
-        exactPublication.objects.map((entry) => [entry.key, entry]),
-      );
-
       const aggregateResult = validateAggregateCanonicalResult({
         affectedDays,
         result: await finalizeCanonicalAggregateManifests({
@@ -800,7 +846,7 @@ export async function runObservationHistoryV3SteadyStateWriter({
         latestKey,
       });
       const replacementScopedManifests = partitionResults.map(
-        (partition) => partition.v3_hierarchy.scoped_manifest,
+        (partition) => partition.scoped_root.artifact,
       );
       const updatedLatest = updateObservationHistoryIndexV3Latest({
         existingLatest,
@@ -808,9 +854,15 @@ export async function runObservationHistoryV3SteadyStateWriter({
         indexRoot,
         latestKey,
       });
+      const changedScopedEvidenceByKey = new Map(
+        partitionResults.map((partition) => [
+          partition.scoped_root.evidence.key,
+          partition.scoped_root.evidence,
+        ]),
+      );
       const latestExternalByKey = new Map();
       for (const reference of updatedLatest.dependencies) {
-        const exact = exactEvidenceByKey.get(reference.key);
+        const exact = changedScopedEvidenceByKey.get(reference.key);
         latestExternalByKey.set(
           reference.key,
           exact
@@ -829,7 +881,9 @@ export async function runObservationHistoryV3SteadyStateWriter({
         recordDurableEvidence,
       });
       return Object.freeze({
-        ok: exactPublication.ok === true && latestPublication.ok === true,
+        ok: connectorResults.every((entry) =>
+          entry.v3_exact_publication?.ok === true
+        ) && latestPublication.ok === true,
         status: latestPublication.status,
         source: normalizeSource(source),
         prune_eligibility_owner:
@@ -844,7 +898,9 @@ export async function runObservationHistoryV3SteadyStateWriter({
         day_results: Object.freeze(dayResults),
         canonical_aggregate_result: aggregateResult,
         v3_publication: Object.freeze({
-          exact_scopes: exactPublication,
+          exact_scopes: Object.freeze(connectorResults.map((entry) =>
+            entry.v3_exact_publication
+          )),
           latest_global: latestPublication,
         }),
       });

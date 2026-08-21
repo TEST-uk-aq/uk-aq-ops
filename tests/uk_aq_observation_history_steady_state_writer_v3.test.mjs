@@ -62,15 +62,19 @@ function partitions() {
 }
 
 function buildFixture({
-  failConnector = false,
+  failExact = false,
   failDay = false,
   reportPruneEligibility = false,
+  afterConnectorRelease = null,
 } = {}) {
   const events = [];
   const objects = new Map();
   const activeLocks = new Set();
   const connectorCalls = [];
   const dayCalls = [];
+  const publicationCalls = [];
+  const durableCalls = [];
+  const getCalls = [];
   let globalLockCount = 0;
 
   const unrelated = buildObservationHistoryV3SteadyStatePartition({
@@ -103,6 +107,9 @@ function buildFixture({
     } finally {
       activeLocks.delete(kind);
       events.push(`lock:${kind}:release:${identity}`);
+      if (kind === "connector" && typeof afterConnectorRelease === "function") {
+        await afterConnectorRelease({ identity, events, objects });
+      }
     }
   }
 
@@ -142,9 +149,6 @@ function buildFixture({
         pollutant_count: changedPartitions.length,
       });
       events.push(`canonical:connector:${dayUtc}/${connectorId}`);
-      if (failConnector && connectorId === 2) {
-        throw new Error("fixture connector failure");
-      }
       const pollutantManifests = changedPartitions.map(({ pollutant_manifest: artifact }) => {
         objects.set(artifact.key, Buffer.from(artifact.body));
         return {
@@ -195,18 +199,21 @@ function buildFixture({
       };
     },
     putIfChanged: async ({ key, body, publication_stage: stage }) => {
+      publicationCalls.push({ key, stage, lock: [...activeLocks][0] || null });
       events.push(`v3:put:${stage}:${key}`);
       objects.set(key, Buffer.from(body));
       return { ok: true, status: "written" };
     },
     getObject: async ({ key }) => {
+      getCalls.push({ key, lock: [...activeLocks][0] || null });
       events.push(`v3:get:${key}`);
       const body = objects.get(key);
       return body ? { exists: true, body: Buffer.from(body) } : { exists: false };
     },
     recordDurableEvidence: async ({ key, publication_stage: stage }) => {
+      durableCalls.push({ key, stage, lock: [...activeLocks][0] || null });
       events.push(`v3:durable:${stage}:${key}`);
-      return { durable: true };
+      return { durable: !(failExact && stage === "child_shard") };
     },
   };
 
@@ -215,6 +222,10 @@ function buildFixture({
     options,
     connectorCalls,
     dayCalls,
+    publicationCalls,
+    durableCalls,
+    getCalls,
+    unrelatedScopedKey: unrelated.v3_hierarchy.scoped_manifest.key,
     activeLocks,
     globalLockCount: () => globalLockCount,
   };
@@ -243,41 +254,107 @@ test("run-level v3 writer releases each lock phase, merges days, and publishes l
   assert.deepEqual(acquisitions.map((event) => event.split(":")[1]), [
     "connector", "connector", "connector", "day", "day", "global",
   ]);
-  const latestPuts = fixture.events.filter((event) =>
-    event.startsWith("v3:put:latest_global:")
+  const latestPuts = fixture.publicationCalls.filter((call) =>
+    call.stage === "latest_global"
   );
   assert.equal(latestPuts.length, 1);
+  assert.equal(latestPuts[0].lock, "global");
 
-  const childDurables = fixture.events
-    .map((event, index) => [event, index])
-    .filter(([event]) => event.startsWith("v3:durable:child_shard:"));
-  const scopedPuts = fixture.events
-    .map((event, index) => [event, index])
-    .filter(([event]) => event.startsWith("v3:put:scoped_manifest:"));
-  const scopedDurables = fixture.events
-    .map((event, index) => [event, index])
-    .filter(([event]) => event.startsWith("v3:durable:scoped_manifest:"));
+  const exactPuts = fixture.publicationCalls.filter((call) =>
+    call.stage === "child_shard" || call.stage === "scoped_manifest"
+  );
+  const exactDurables = fixture.durableCalls.filter((call) =>
+    call.stage === "child_shard" || call.stage === "scoped_manifest"
+  );
+  assert.ok(exactPuts.length > 0);
+  assert.ok(exactPuts.every((call) => call.lock === "connector"));
+  assert.ok(exactDurables.every((call) => call.lock === "connector"));
+  assert.equal(
+    fixture.publicationCalls.some((call) =>
+      call.lock === "global" &&
+      (call.stage === "child_shard" || call.stage === "scoped_manifest")
+    ),
+    false,
+  );
+
+  const changedScopedKeys = result.connector_results.flatMap((connector) =>
+    connector.partitions.map((partition) => partition.scoped_root.evidence.key)
+  );
+  for (const connector of result.connector_results) {
+    const prefix = `day_utc=${connector.day_utc}/connector_id=${connector.connector_id}/`;
+    const releaseIndex = fixture.events.findIndex((event) =>
+      event === `lock:connector:release:${connector.day_utc}/${connector.connector_id}`
+    );
+    const scopedDurableIndexes = fixture.events
+      .map((event, index) => [event, index])
+      .filter(([event]) =>
+        event.startsWith("v3:durable:scoped_manifest:") && event.includes(prefix)
+      )
+      .map(([, index]) => index);
+    assert.ok(scopedDurableIndexes.length > 0);
+    assert.ok(Math.max(...scopedDurableIndexes) < releaseIndex);
+    for (const partition of connector.partitions) {
+      const scopedPutIndex = fixture.events.findIndex((event) =>
+        event === `v3:put:scoped_manifest:${partition.scoped_root.artifact.key}`
+      );
+      const childKeys = partition.scoped_root.artifact.dependencies
+        .filter((dependency) => dependency.kind === "child_shard")
+        .map((dependency) => dependency.key);
+      assert.ok(childKeys.length > 0);
+      assert.ok(childKeys.every((key) => {
+        const childDurableIndex = fixture.events.findIndex((event) =>
+          event === `v3:durable:child_shard:${key}`
+        );
+        return childDurableIndex >= 0 && childDurableIndex < scopedPutIndex;
+      }));
+    }
+  }
+
+  for (const dayUtc of result.affected_days_utc) {
+    const dayAcquireIndex = fixture.events.findIndex((event) =>
+      event === `lock:day:acquire:${dayUtc}`
+    );
+    const scopedDurableIndexes = fixture.events
+      .map((event, index) => [event, index])
+      .filter(([event]) =>
+        event.startsWith("v3:durable:scoped_manifest:") &&
+        event.includes(`day_utc=${dayUtc}/`)
+      )
+      .map(([, index]) => index);
+    assert.ok(Math.max(...scopedDurableIndexes) < dayAcquireIndex);
+  }
+
+  assert.ok(changedScopedKeys.every((key) =>
+    fixture.getCalls.some((call) => call.key === key && call.lock === "connector")
+  ));
+  assert.ok(changedScopedKeys.every((key) =>
+    !fixture.getCalls.some((call) => call.key === key && call.lock === "global")
+  ));
+  assert.ok(fixture.getCalls.some((call) =>
+    call.key === fixture.unrelatedScopedKey && call.lock === "global"
+  ));
+
   const aggregateIndex = fixture.events.findIndex((event) =>
     event.startsWith("canonical:aggregate:")
   );
   const latestPutIndex = fixture.events.findIndex((event) =>
     event.startsWith("v3:put:latest_global:")
   );
-  assert.ok(childDurables.length > 0);
-  assert.ok(scopedPuts.length > 0);
-  assert.ok(Math.max(...childDurables.map(([, index]) => index)) < Math.min(...scopedPuts.map(([, index]) => index)));
-  assert.ok(Math.max(...scopedDurables.map(([, index]) => index)) < aggregateIndex);
   assert.ok(aggregateIndex < latestPutIndex);
 });
 
-test("connector or day failure prevents later authority phases", async () => {
-  const connectorFailure = buildFixture({ failConnector: true });
+test("connector exact-publication or day failure prevents later authority phases", async () => {
+  const connectorFailure = buildFixture({ failExact: true });
   await assert.rejects(
     runPruneDailyObservationHistoryV3Writer(connectorFailure.options),
-    /fixture connector failure/,
+    /durable publication evidence failed/,
   );
   assert.equal(connectorFailure.globalLockCount(), 0);
   assert.equal(connectorFailure.events.some((event) => event.startsWith("lock:day:acquire:")), false);
+  assert.equal(
+    connectorFailure.publicationCalls.some((call) => call.stage === "child_shard"),
+    true,
+  );
   assert.equal(connectorFailure.activeLocks.size, 0);
 
   const dayFailure = buildFixture({ failDay: true });
@@ -287,6 +364,46 @@ test("connector or day failure prevents later authority phases", async () => {
   );
   assert.equal(dayFailure.globalLockCount(), 0);
   assert.equal(dayFailure.activeLocks.size, 0);
+});
+
+test("a later connector generation cannot be followed by stale exact publication from the released run", async () => {
+  let replacementRecorded = false;
+  const fixture = buildFixture({
+    afterConnectorRelease: async ({ identity, events }) => {
+      if (identity === "2026-08-18/1" && !replacementRecorded) {
+        replacementRecorded = true;
+        events.push("race:generation-b:connector-replacement");
+      }
+    },
+  });
+  await runPruneDailyObservationHistoryV3Writer({
+    ...fixture.options,
+    partitions: fixture.options.partitions.slice(0, 2),
+  });
+
+  const releaseIndex = fixture.events.indexOf(
+    "lock:connector:release:2026-08-18/1",
+  );
+  const replacementIndex = fixture.events.indexOf(
+    "race:generation-b:connector-replacement",
+  );
+  const exactIndexes = fixture.events
+    .map((event, index) => [event, index])
+    .filter(([event]) =>
+      event.startsWith("v3:put:child_shard:") ||
+      event.startsWith("v3:put:scoped_manifest:") ||
+      event.startsWith("v3:durable:child_shard:") ||
+      event.startsWith("v3:durable:scoped_manifest:")
+    )
+    .map(([, index]) => index);
+
+  assert.ok(exactIndexes.length > 0);
+  assert.ok(Math.max(...exactIndexes) < releaseIndex);
+  assert.ok(releaseIndex < replacementIndex);
+  assert.equal(
+    exactIndexes.some((index) => index > replacementIndex),
+    false,
+  );
 });
 
 test("non-Prune fixed-source adapters reject prune-eligibility reporting", async () => {
