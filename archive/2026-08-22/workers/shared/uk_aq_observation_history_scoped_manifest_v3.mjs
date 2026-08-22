@@ -187,7 +187,7 @@ function canonicalSourceDescriptor(raw, scope) {
       raw.manifest_hash,
       "canonical_source_manifest.manifest_hash",
     ),
-    row_count: nonNegativeSafeInteger(
+    row_count: positiveSafeInteger(
       raw.row_count,
       "canonical_source_manifest.row_count",
     ),
@@ -387,7 +387,7 @@ export function validateObservationHistoryIndexV3ScopedManifestBody({
     : []).map((descriptor) =>
       normalizeChildDescriptor(descriptor, scope, indexRoot)
     );
-  if (descriptors.length === 0 && source.row_count !== 0) {
+  if (descriptors.length === 0) {
     throw new Error("Scoped v3 manifest requires child descriptors");
   }
   const expectedPayload = buildObservationHistoryIndexV3ScopedManifestPayload({

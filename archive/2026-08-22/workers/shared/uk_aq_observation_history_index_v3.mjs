@@ -125,10 +125,6 @@ function normalizeIso(raw, fieldName) {
   return value;
 }
 
-function normalizeNullableIso(raw, fieldName) {
-  return raw === null ? null : normalizeIso(raw, fieldName);
-}
-
 function minValue(values) {
   return values.reduce(
     (current, value) => current === null || value < current ? value : current,
@@ -328,7 +324,7 @@ function normalizeCanonicalManifestDescriptor(raw, scope) {
       raw.manifest_hash,
       "canonical_manifest.manifest_hash",
     ),
-    row_count: nonNegativeSafeInteger(
+    row_count: positiveSafeInteger(
       raw.row_count,
       "canonical_manifest.row_count",
     ),
@@ -692,19 +688,14 @@ export function validateObservationHistoryTargetMetadataForV3(metadata) {
     throw new Error("Unsupported Phase 1 history/schema/writer/layout identity");
   }
   const scope = normalizeScope(metadata.partition);
-  const rowCount = nonNegativeSafeInteger(metadata.row_count, "metadata.row_count");
+  const rowCount = positiveSafeInteger(metadata.row_count, "metadata.row_count");
   validateObservationContentHashMetadata(metadata, { rowCount });
   const files = (Array.isArray(metadata.files) ? metadata.files : [])
     .map(normalizeFile)
     .sort((left, right) => left.file_ordinal - right.file_ordinal);
-  const fileCount = nonNegativeSafeInteger(
-    metadata.file_count,
-    "metadata.file_count",
-  );
   if (
-    files.length !== fileCount ||
-    (rowCount === 0 && files.length !== 0) ||
-    (rowCount > 0 && files.length === 0)
+    files.length === 0 ||
+    files.length !== positiveSafeInteger(metadata.file_count, "metadata.file_count")
   ) {
     throw new Error("Phase 1 file count mismatch");
   }
@@ -1311,8 +1302,8 @@ function normalizeScopedHierarchy(raw, fieldName = "scoped_hierarchy") {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new TypeError(`${fieldName} must be an object`);
   }
-  if (!Array.isArray(raw.child_shards)) {
-    throw new TypeError(`${fieldName}.child_shards must be an array`);
+  if (!Array.isArray(raw.child_shards) || raw.child_shards.length === 0) {
+    throw new TypeError(`${fieldName}.child_shards must be a non-empty array`);
   }
   if (!raw.scoped_manifest) {
     throw new TypeError(`${fieldName}.scoped_manifest is required`);
@@ -1365,13 +1356,8 @@ export function validateObservationHistoryIndexV3ScopedManifestArtifact({
     indexRoot,
   });
   const { artifact } = snapshot;
-  if (
-    !Array.isArray(childShards) ||
-    (childShards.length === 0 && snapshot.coverage.row_count !== 0)
-  ) {
-    throw new Error(
-      "Semantic scoped-manifest validation requires complete child artifacts",
-    );
+  if (!Array.isArray(childShards) || childShards.length === 0) {
+    throw new Error("Semantic scoped-manifest validation requires child artifacts");
   }
   const rawPayload = artifact.payload;
   const { scope, source } = snapshot;
@@ -1499,11 +1485,8 @@ export function buildObservationHistoryIndexV3ScopedManifest({
     normalized.scope,
     normalized,
   );
-  if (
-    !Array.isArray(childShards) ||
-    (childShards.length === 0 && normalized.row_count !== 0)
-  ) {
-    throw new Error("Scoped v3 manifest requires complete child shard dependencies");
+  if (!Array.isArray(childShards) || childShards.length === 0) {
+    throw new Error("Scoped v3 manifest requires child shard dependencies");
   }
   const children = childShards.map((rawArtifact) => {
     const validated = validateObservationHistoryIndexV3ChildShardArtifact({
@@ -1777,43 +1760,30 @@ function normalizeScopedRootDescriptor(raw, indexRoot) {
     key: normalizeKey(raw.key, "scoped_root.key"),
     byte_size: positiveSafeInteger(raw.byte_size, "scoped_root.byte_size"),
     sha256: normalizeSha256(raw.sha256, "scoped_root.sha256"),
-    row_count: nonNegativeSafeInteger(raw.row_count, "scoped_root.row_count"),
-    timeseries_count: nonNegativeSafeInteger(
+    row_count: positiveSafeInteger(raw.row_count, "scoped_root.row_count"),
+    timeseries_count: positiveSafeInteger(
       raw.timeseries_count,
       "scoped_root.timeseries_count",
     ),
-    child_shard_count: nonNegativeSafeInteger(
+    child_shard_count: positiveSafeInteger(
       raw.child_shard_count,
       "scoped_root.child_shard_count",
     ),
-    physical_file_count: nonNegativeSafeInteger(
+    physical_file_count: positiveSafeInteger(
       raw.physical_file_count,
       "scoped_root.physical_file_count",
     ),
-    min_observed_at_utc: normalizeNullableIso(
+    min_observed_at_utc: normalizeIso(
       raw.min_observed_at_utc,
       "scoped_root.min_observed_at_utc",
     ),
-    max_observed_at_utc: normalizeNullableIso(
+    max_observed_at_utc: normalizeIso(
       raw.max_observed_at_utc,
       "scoped_root.max_observed_at_utc",
     ),
   };
   if (
-    (
-      descriptor.row_count === 0
-        ? descriptor.timeseries_count !== 0 ||
-          descriptor.child_shard_count !== 0 ||
-          descriptor.physical_file_count !== 0 ||
-          descriptor.min_observed_at_utc !== null ||
-          descriptor.max_observed_at_utc !== null
-        : descriptor.timeseries_count === 0 ||
-          descriptor.child_shard_count === 0 ||
-          descriptor.physical_file_count === 0 ||
-          descriptor.min_observed_at_utc === null ||
-          descriptor.max_observed_at_utc === null ||
-          descriptor.min_observed_at_utc > descriptor.max_observed_at_utc
-    ) ||
+    descriptor.min_observed_at_utc > descriptor.max_observed_at_utc ||
     descriptor.key !== buildObservationHistoryIndexV3ScopedManifestKey({
       scope,
       indexRoot,

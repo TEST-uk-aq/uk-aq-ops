@@ -15,10 +15,6 @@ import {
   buildCanonicalObservationTimeseriesBoundedFiles,
 } from "./uk_aq_observation_history_target_writer.mjs";
 import {
-  ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
-  assertAcceptedObservationHistoryWriterLimitsV3,
-} from "./uk_aq_observation_history_writer_limits_v3.mjs";
-import {
   buildR2ChecksumAwarePutIntent,
   putAndVerifyR2ObjectWithSha256,
 } from "./uk_aq_r2_checksum_publication.mjs";
@@ -285,8 +281,7 @@ async function verifiedExternalReference(reference, getObject) {
 export function buildObservationHistoryV3SteadyStatePartition({
   source,
   rows,
-  scope = null,
-  writerLimits = ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+  writerLimits,
   targetWriterGitSha,
   backedUpAtUtc,
   observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
@@ -302,49 +297,39 @@ export function buildObservationHistoryV3SteadyStatePartition({
   if (normalizedIndexRoot !== OBSERVATION_HISTORY_V3_INDEX_ROOT) {
     throw new Error(`Steady-state v3 writer requires index root ${OBSERVATION_HISTORY_V3_INDEX_ROOT}`);
   }
-  const acceptedWriterLimits = assertAcceptedObservationHistoryWriterLimitsV3(
-    writerLimits,
-    "steady-state observation-history v3 writer limits",
-  );
-  const firstRow = rows?.[0] || null;
-  const requestedScope = scope || (firstRow ? {
-    day_utc: firstRow.day_utc || String(firstRow.observed_at_utc || "").slice(0, 10),
-    connector_id: firstRow.connector_id,
-    pollutant_code: firstRow.pollutant_code,
-  } : null);
   const target = buildCanonicalObservationTimeseriesBoundedFiles(rows, {
-    limits: acceptedWriterLimits,
-    partition: requestedScope,
+    limits: writerLimits,
     fileKeyForOrdinal: (ordinal) => {
+      const first = rows?.[0] || {};
       return buildHistoryV2PartKey(
         prefix,
-        requestedScope?.day_utc,
-        requestedScope?.connector_id,
-        requestedScope?.pollutant_code,
+        first.day_utc || String(first.observed_at_utc || "").slice(0, 10),
+        first.connector_id,
+        first.pollutant_code,
         ordinal,
       );
     },
   });
-  const partitionScope = target.metadata.partition;
+  const scope = target.metadata.partition;
   const fileIntents = target.file_bodies.map((file) =>
     buildR2ChecksumAwarePutIntent({ key: file.key, body: file.body })
   );
   const manifestKey = buildHistoryV2PollutantManifestKey(
     prefix,
-    partitionScope.day_utc,
-    partitionScope.connector_id,
-    partitionScope.pollutant_code,
+    scope.day_utc,
+    scope.connector_id,
+    scope.pollutant_code,
   );
   const manifestPayload = buildHistoryV2PollutantManifest({
     domain: "observations",
-    dayUtc: partitionScope.day_utc,
-    connectorId: partitionScope.connector_id,
-    pollutantCode: partitionScope.pollutant_code,
+    dayUtc: scope.day_utc,
+    connectorId: scope.connector_id,
+    pollutantCode: scope.pollutant_code,
     runId: null,
     manifestKey,
     sourceRowCount: target.metadata.row_count,
     fileEntries: target.metadata.files.map((file) =>
-      fileEntry(file, partitionScope.pollutant_code)
+      fileEntry(file, scope.pollutant_code)
     ),
     writerGitSha,
     backedUpAtUtc: backedUpAtUtc ?? null,
@@ -374,7 +359,7 @@ export function buildObservationHistoryV3SteadyStatePartition({
     source: normalizedSource,
     prune_eligibility_owner:
       normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
-    scope: Object.freeze({ ...partitionScope }),
+    scope: Object.freeze({ ...scope }),
     target_metadata: target.metadata,
     file_intents: Object.freeze(fileIntents),
     canonical_pollutant_manifest: manifestArtifact,
@@ -387,15 +372,12 @@ function normalizePartitionInputs(partitions) {
     throw new TypeError("V3 steady-state writer requires a non-empty partitions array");
   }
   return partitions.map((partition, index) => {
-    if (Array.isArray(partition)) {
-      return { rows: partition, scope: null, backed_up_at_utc: undefined };
-    }
+    if (Array.isArray(partition)) return { rows: partition, backed_up_at_utc: undefined };
     if (!partition || typeof partition !== "object" || !Array.isArray(partition.rows)) {
       throw new TypeError(`V3 steady-state writer partition ${index} requires rows`);
     }
     return {
       rows: partition.rows,
-      scope: partition.scope ?? null,
       backed_up_at_utc: partition.backed_up_at_utc ?? partition.backedUpAtUtc,
     };
   });
@@ -414,7 +396,6 @@ function prepareRunPartitions({
     buildObservationHistoryV3SteadyStatePartition({
       source,
       rows: partition.rows,
-      scope: partition.scope,
       writerLimits,
       targetWriterGitSha,
       backedUpAtUtc: partition.backed_up_at_utc ?? backedUpAtUtc,
@@ -460,7 +441,6 @@ function groupPreparedByConnectorDay(prepared) {
 function validateConnectorCanonicalResult(group, result, observationsPrefix) {
   if (
     result?.connector_scope_verified !== true ||
-    result?.parent_state_reread_under_lock !== true ||
     result?.day_utc !== group.day_utc ||
     Number(result?.connector_id) !== group.connector_id
   ) {
@@ -505,63 +485,12 @@ function validateConnectorCanonicalResult(group, result, observationsPrefix) {
   if (connectorManifest.key !== expectedConnectorManifestKey) {
     throw new Error(`Canonical connector manifest key disagrees: ${group.day_utc}/${group.connector_id}`);
   }
-  const changedPollutants = [...group.partitions]
-    .map((partition) => partition.scope.pollutant_code)
-    .sort(bytewiseCompare);
-  const reportedPollutantCodes = (values, fieldName) => {
-    if (!Array.isArray(values)) {
-      throw new TypeError(`Canonical connector finalizer ${fieldName} must be an array`);
-    }
-    const normalized = values.map((value) =>
-      String(value || "").trim().toLowerCase()
-    );
-    if (
-      normalized.some((value) => !/^[a-z0-9_]+$/.test(value)) ||
-      new Set(normalized).size !== normalized.length
-    ) {
-      throw new Error(
-        `Canonical connector finalizer ${fieldName} must contain unique canonical pollutant codes`,
-      );
-    }
-    return normalized.sort(bytewiseCompare);
-  };
-  const reportedChanged = reportedPollutantCodes(
-    result.changed_pollutant_codes,
-    "changed_pollutant_codes",
-  );
-  const currentPollutants = reportedPollutantCodes(
-    result.current_pollutant_codes,
-    "current_pollutant_codes",
-  );
-  const finalPollutants = reportedPollutantCodes(
-    result.final_pollutant_codes,
-    "final_pollutant_codes",
-  );
-  const expectedFinalPollutants = [...new Set([
-    ...currentPollutants,
-    ...changedPollutants,
-  ])].sort(bytewiseCompare);
-  if (!sameArray(reportedChanged, changedPollutants)) {
-    throw new Error(
-      `Canonical connector finalizer changed-pollutant evidence disagrees: ${group.day_utc}/${group.connector_id}`,
-    );
-  }
-  if (!sameArray(finalPollutants, expectedFinalPollutants)) {
-    throw new Error(
-      `Canonical connector finalizer did not preserve the current pollutant union: ${group.day_utc}/${group.connector_id}`,
-    );
-  }
   return Object.freeze({
     day_utc: group.day_utc,
     connector_id: group.connector_id,
     connector_manifest: connectorManifest,
-    connector_manifest_payload: result.connector_manifest_payload ?? null,
-    current_pollutant_codes: Object.freeze(currentPollutants),
-    changed_pollutant_codes: Object.freeze(reportedChanged),
-    final_pollutant_codes: Object.freeze(finalPollutants),
     pollutant_manifests: Object.freeze(pollutantManifests),
     connector_scope_verified: true,
-    parent_state_reread_under_lock: true,
   });
 }
 
@@ -726,7 +655,7 @@ export async function runObservationHistoryV3SteadyStateWriter({
   client,
   source,
   partitions,
-  writerLimits = ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+  writerLimits,
   targetWriterGitSha,
   backedUpAtUtc,
   observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
@@ -749,7 +678,6 @@ export async function runObservationHistoryV3SteadyStateWriter({
   diagnostics,
   diagnosticEnvironment,
   lockTimeoutMs,
-  prepareCompleteDayReplacement = null,
 }) {
   if (!client?.query) throw new Error("V3 steady-state writer requires PostgreSQL lock client");
   if (!r2 || typeof r2 !== "object") throw new Error("V3 steady-state writer requires R2 configuration");
@@ -768,19 +696,6 @@ export async function runObservationHistoryV3SteadyStateWriter({
   })) {
     if (typeof adapter !== "function") throw new TypeError(`V3 steady-state writer adapter is missing: ${name}`);
   }
-  const normalizedSource = normalizeSource(source);
-  const sosReplacement =
-    normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement;
-  if (sosReplacement && typeof prepareCompleteDayReplacement !== "function") {
-    throw new TypeError(
-      "SOS historical replacement requires complete-day deletion/reconstruction preparation",
-    );
-  }
-  if (!sosReplacement && prepareCompleteDayReplacement !== null) {
-    throw new Error(
-      "Complete-day replacement preparation is reserved for SOS historical replacement",
-    );
-  }
   const prepared = prepareRunPartitions({
     source,
     partitions,
@@ -797,38 +712,7 @@ export async function runObservationHistoryV3SteadyStateWriter({
   const connectorGroups = groupPreparedByConnectorDay(prepared);
   prepared.length = 0;
   const connectorResults = [];
-  const completeDayReplacementResults = [];
-  const replacementDaysPrepared = new Set();
   for (const group of connectorGroups) {
-    if (sosReplacement && !replacementDaysPrepared.has(group.day_utc)) {
-      const replacement = await runDayFinalizer({
-        client,
-        dayUtc: group.day_utc,
-        diagnostics,
-        diagnosticEnvironment,
-        timeoutMs: lockTimeoutMs,
-        finalize: async () => await prepareCompleteDayReplacement({
-          source: normalizedSource,
-          day_utc: group.day_utc,
-          complete_day_partitions: Object.freeze(
-            connectorGroups
-              .filter((entry) => entry.day_utc === group.day_utc)
-              .flatMap((entry) => entry.partitions),
-          ),
-        }),
-      });
-      if (
-        replacement?.complete_day_replacement_verified !== true ||
-        replacement?.day_utc !== group.day_utc ||
-        replacement?.complete_partition_set !== true
-      ) {
-        throw new Error(
-          `SOS complete-day replacement preparation was not verified: ${group.day_utc}`,
-        );
-      }
-      completeDayReplacementResults.push(Object.freeze({ ...replacement }));
-      replacementDaysPrepared.add(group.day_utc);
-    }
     const result = await withConnectorDayLock({
       client,
       dayUtc: group.day_utc,
@@ -862,7 +746,7 @@ export async function runObservationHistoryV3SteadyStateWriter({
         }));
       }
       const canonicalResult = await publishConnectorScopedCanonicalManifests({
-        source: normalizedSource,
+        source: normalizeSource(source),
         day_utc: group.day_utc,
         connector_id: group.connector_id,
         partitions: Object.freeze(partitionResults),
@@ -919,7 +803,7 @@ export async function runObservationHistoryV3SteadyStateWriter({
       timeoutMs: lockTimeoutMs,
       finalize: async () => {
         const finalized = await finalizeCanonicalDayManifests({
-          source: normalizedSource,
+          source: normalizeSource(source),
           day_utc: dayUtc,
           changed_connectors: Object.freeze(changedConnectors),
         });
@@ -946,7 +830,7 @@ export async function runObservationHistoryV3SteadyStateWriter({
       const aggregateResult = validateAggregateCanonicalResult({
         affectedDays,
         result: await finalizeCanonicalAggregateManifests({
-          source: normalizedSource,
+          source: normalizeSource(source),
           affected_days_utc: Object.freeze([...affectedDays]),
           day_results: Object.freeze(dayResults),
         }),
@@ -1002,12 +886,9 @@ export async function runObservationHistoryV3SteadyStateWriter({
           entry.v3_exact_publication?.ok === true
         ) && latestPublication.ok === true,
         status: latestPublication.status,
-        source: normalizedSource,
+        source: normalizeSource(source),
         prune_eligibility_owner:
-          normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
-        complete_day_replacement_results: Object.freeze(
-          completeDayReplacementResults,
-        ),
+          normalizeSource(source) === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
         affected_partition_count: partitionResults.length,
         affected_connector_days: Object.freeze(connectorResults.map((entry) => ({
           day_utc: entry.day_utc,

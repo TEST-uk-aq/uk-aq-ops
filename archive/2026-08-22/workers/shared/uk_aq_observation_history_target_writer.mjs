@@ -12,7 +12,6 @@ import {
 import * as parquetWasm from "parquet-wasm/esm";
 
 import {
-  computeEmptyObservationContentHash,
   computeObservationContentHash,
   encodeCanonicalObservationRow,
 } from "./uk_aq_observation_content_hash.mjs";
@@ -118,54 +117,13 @@ function compareCanonicalPhysicalRows(left, right) {
   return 0;
 }
 
-function normalizePartitionScope(scope) {
-  if (!scope || typeof scope !== "object" || Array.isArray(scope)) {
-    throw new TypeError("empty target writer input requires an explicit partition scope");
-  }
-  const dayUtc = String(scope.day_utc || "").trim();
-  const parsedDay = new Date(`${dayUtc}T00:00:00.000Z`);
-  const connectorId = Number(scope.connector_id);
-  const pollutantCode = String(scope.pollutant_code || "").trim().toLowerCase();
-  if (
-    !/^\d{4}-\d{2}-\d{2}$/.test(dayUtc) ||
-    Number.isNaN(parsedDay.getTime()) ||
-    parsedDay.toISOString().slice(0, 10) !== dayUtc
-  ) {
-    throw new TypeError("partition.day_utc must be a canonical UTC day");
-  }
-  if (!Number.isSafeInteger(connectorId) || connectorId <= 0) {
-    throw new TypeError("partition.connector_id must be a positive safe integer");
-  }
-  if (!/^[a-z0-9_]+$/.test(pollutantCode)) {
-    throw new TypeError("partition.pollutant_code is invalid");
-  }
-  return Object.freeze({
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    pollutant_code: pollutantCode,
-  });
-}
-
-function canonicalPhysicalRows(rows, explicitPartition = null) {
-  if (!Array.isArray(rows)) {
-    throw new TypeError("target writer rows must be an array");
-  }
-  if (rows.length === 0) {
-    return {
-      orderedRows: [],
-      contentHash: computeEmptyObservationContentHash(),
-      partition: normalizePartitionScope(explicitPartition),
-    };
-  }
+function canonicalPhysicalRows(rows) {
   const hashResult = computeObservationContentHash(rows);
   const orderedRows = hashResult.canonical_rows
     .map((row) => ({ row, tie_break: encodeCanonicalObservationRow(row) }))
     .sort(compareCanonicalPhysicalRows)
     .map(({ row }) => row);
   const first = orderedRows[0];
-  const requestedPartition = explicitPartition === null
-    ? null
-    : normalizePartitionScope(explicitPartition);
   const dayUtc = first.observed_at_utc.slice(0, 10);
   for (const row of orderedRows) {
     if (row.connector_id !== first.connector_id) {
@@ -178,21 +136,11 @@ function canonicalPhysicalRows(rows, explicitPartition = null) {
       throw new TypeError("target writer input must contain one UTC day");
     }
   }
-  if (
-    requestedPartition &&
-    (
-      requestedPartition.day_utc !== dayUtc ||
-      requestedPartition.connector_id !== first.connector_id ||
-      requestedPartition.pollutant_code !== first.pollutant_code
-    )
-  ) {
-    throw new TypeError("explicit target writer partition disagrees with canonical rows");
-  }
   const { canonical_rows: _canonicalRows, ...contentHash } = hashResult;
   return {
     orderedRows,
     contentHash,
-    partition: requestedPartition || Object.freeze({
+    partition: Object.freeze({
       day_utc: dayUtc,
       connector_id: first.connector_id,
       pollutant_code: first.pollutant_code,
@@ -756,17 +704,12 @@ function validateCompleteSegments(metadata, orderedRows) {
 export function buildCanonicalObservationTimeseriesBoundedFiles(rows, {
   limits: rawLimits,
   fileKeyForOrdinal,
-  partition = null,
 } = {}) {
   if (typeof fileKeyForOrdinal !== "function") {
     throw new TypeError("fileKeyForOrdinal must be a deterministic function");
   }
   const limits = validateLimits(rawLimits);
-  const {
-    orderedRows,
-    contentHash,
-    partition: canonicalPartition,
-  } = canonicalPhysicalRows(rows, partition);
+  const { orderedRows, contentHash, partition } = canonicalPhysicalRows(rows);
   const candidates = buildSerializedCandidates(orderedRows, limits);
   const keys = new Set();
   const fileBodies = [];
@@ -855,7 +798,7 @@ export function buildCanonicalObservationTimeseriesBoundedFiles(rows, {
       "observed_at_utc ASC",
       "canonical_observation_row_v1 ASC",
     ],
-    partition: canonicalPartition,
+    partition,
     limits: { ...limits },
     row_count: orderedRows.length,
     file_count: fileMetadata.length,

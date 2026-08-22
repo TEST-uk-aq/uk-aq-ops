@@ -1575,7 +1575,7 @@ function parquetIso(value) {
   return parsed.toISOString();
 }
 
-export async function readCanonicalObservationRows({ body, connectorId }) {
+async function readCanonicalObservationRows({ body, connectorId }) {
   const file = new Uint8Array(body).slice().buffer;
   const metadata = await parquetMetadataAsync(file);
   const rowCount = Number(metadata.num_rows || 0);
@@ -1750,7 +1750,7 @@ function sourceEvidencePaths(runState, dayUtc, connectorId, pollutantCode) {
   };
 }
 
-export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutantCode }) {
+function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutantCode }) {
   const {
     evidencePath,
     rowsPath,

@@ -12,16 +12,11 @@ import {
   runSosHistoricalReplacementObservationHistoryV3Writer,
   runSupportedBackfillObservationHistoryV3Writer,
 } from "../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
+import {
+  ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+} from "../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
 
-const LIMITS = Object.freeze({
-  target_row_group_rows: 2,
-  max_row_group_rows: 2,
-  target_file_rows: 4,
-  max_file_rows: 4,
-  target_file_bytes: 1_000_000,
-  max_file_bytes: 2_000_000,
-  max_row_groups_per_file: 2,
-});
+const LIMITS = ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3;
 const TARGET_GIT_SHA = "1".repeat(40);
 const BACKED_UP_AT_UTC = "2026-08-21T00:00:00.000Z";
 
@@ -159,10 +154,21 @@ function buildFixture({
           durable: true,
         };
       });
+      const changedPollutants = changedPartitions
+        .map((partition) => partition.scope.pollutant_code)
+        .sort();
+      const currentPollutants = connectorId === 1 ? ["o3"] : [];
       return {
         connector_scope_verified: true,
+        parent_state_reread_under_lock: true,
         day_utc: dayUtc,
         connector_id: connectorId,
+        current_pollutant_codes: currentPollutants,
+        changed_pollutant_codes: changedPollutants,
+        final_pollutant_codes: [...new Set([
+          ...currentPollutants,
+          ...changedPollutants,
+        ])].sort(),
         pollutant_manifests: pollutantManifests,
         connector_manifest: evidence(
           `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
@@ -496,10 +502,53 @@ test("non-Prune fixed-source adapters reject prune-eligibility reporting", async
   ]) {
     const fixture = buildFixture({ reportPruneEligibility: true });
     await assert.rejects(
-      runWriter({ ...fixture.options, partitions: fixture.options.partitions.slice(0, 1) }),
+      runWriter({
+        ...fixture.options,
+        partitions: fixture.options.partitions.slice(0, 1),
+        ...(runWriter === runSosHistoricalReplacementObservationHistoryV3Writer
+          ? {
+            prepareCompleteDayReplacement: async ({ day_utc: dayUtc }) => ({
+              day_utc: dayUtc,
+              complete_day_replacement_verified: true,
+              complete_partition_set: true,
+            }),
+          }
+          : {}),
+      }),
       /must not create Prune Daily eligibility/,
     );
     assert.equal(fixture.globalLockCount(), 0);
     assert.equal(fixture.activeLocks.size, 0);
   }
+});
+
+test("SOS complete-day preparation is day-locked before connector publication", async () => {
+  const fixture = buildFixture();
+  const result = await runSosHistoricalReplacementObservationHistoryV3Writer({
+    ...fixture.options,
+    partitions: fixture.options.partitions.slice(0, 2),
+    prepareCompleteDayReplacement: async ({ day_utc: dayUtc }) => {
+      fixture.events.push(`sos:complete-day:${dayUtc}`);
+      assert.deepEqual([...fixture.activeLocks], ["day"]);
+      return {
+        day_utc: dayUtc,
+        complete_day_replacement_verified: true,
+        complete_partition_set: true,
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.complete_day_replacement_results.length, 1);
+  const dayPreparation = fixture.events.indexOf("sos:complete-day:2026-08-18");
+  const connectorAcquire = fixture.events.indexOf(
+    "lock:connector:acquire:2026-08-18/1",
+  );
+  assert.ok(dayPreparation >= 0 && dayPreparation < connectorAcquire);
+  assert.deepEqual(
+    fixture.events
+      .filter((event) => event.includes(":acquire:"))
+      .map((event) => event.split(":")[1]),
+    ["day", "connector", "day", "global"],
+  );
 });

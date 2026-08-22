@@ -12,9 +12,6 @@ import {
   putAndVerifyR2ObjectWithSha256,
 } from "../../workers/shared/uk_aq_r2_checksum_publication.mjs";
 import {
-  assertAcceptedObservationHistoryWriterLimitsV3,
-} from "../../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
-import {
   hasRequiredR2Config,
   r2GetObject,
   r2HeadObject,
@@ -417,10 +414,7 @@ export async function runObservationHistoryMigrationV3({
     throw new Error("Complete configured R2 endpoint, bucket, region and credentials are required");
   }
   const evidence = environmentEvidence(args, env, config);
-  const writerLimits = assertAcceptedObservationHistoryWriterLimitsV3(
-    readJsonFile(args.writerLimitsPath, "writer limits"),
-    "migration --writer-limits-json",
-  );
+  const writerLimits = readJsonFile(args.writerLimitsPath, "writer limits");
   const getBackupObject = buildDropboxBackupReader(args.dropboxRoot);
   const getR2Object = ({ key }) => r2GetObject({ r2: config.r2, key });
   const startedAt = now();
