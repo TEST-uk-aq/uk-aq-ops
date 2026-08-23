@@ -7,7 +7,7 @@ import json
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -17,6 +17,32 @@ import uk_aq_dashboard_api_core as core
 HIERARCHICAL_STATE_PREFIX_DEFAULT = "_ops/checkpoints/r2_history_backup_state_v2"
 HIERARCHICAL_STATE_ROOT_KIND = "uk_aq_r2_history_backup_state_v2_root"
 HIERARCHICAL_MONTH_STATE_KIND = "uk_aq_r2_history_backup_state_observations_month"
+DROPBOX_LOCAL_STATE_FRESH_AFTER_UTC_HOUR_DEFAULT = 6
+
+
+def _dropbox_local_state_fresh_after_utc_hour() -> int:
+    raw = str(
+        os.getenv("UK_AQ_DROPBOX_LOCAL_STATE_FRESH_AFTER_UTC_HOUR")
+        or DROPBOX_LOCAL_STATE_FRESH_AFTER_UTC_HOUR_DEFAULT
+    ).strip()
+    try:
+        hour = int(raw)
+    except ValueError:
+        return DROPBOX_LOCAL_STATE_FRESH_AFTER_UTC_HOUR_DEFAULT
+    return max(0, min(23, hour))
+
+
+def _expected_local_checkpoint_day(now_utc: Optional[datetime] = None) -> date:
+    current = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cutoff = current.replace(
+        hour=_dropbox_local_state_fresh_after_utc_hour(),
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if current >= cutoff:
+        return current.date()
+    return current.date() - timedelta(days=1)
 
 
 def _resolve_dropbox_state_path_info() -> Dict[str, Any]:
@@ -188,6 +214,99 @@ def _history_root_from_state_path(state_path: Path, state_rel_path: str) -> Path
     return history_root
 
 
+def _local_hierarchical_state_freshness(
+    state_path: Path,
+    state_rel_path: str,
+    now_utc: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    current = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    expected_day = _expected_local_checkpoint_day(current)
+    result: Dict[str, Any] = {
+        "local_state_path": str(state_path),
+        "local_state_expected_day_utc": expected_day.isoformat(),
+        "local_state_fresh_after_utc_hour": _dropbox_local_state_fresh_after_utc_hour(),
+        "local_state_fresh": False,
+        "local_state_freshness_reason": None,
+        "local_state_root_modified_at": None,
+        "local_state_month_path": None,
+        "local_state_month_modified_at": None,
+    }
+
+    try:
+        root_modified = datetime.fromtimestamp(
+            state_path.stat().st_mtime,
+            tz=timezone.utc,
+        )
+        result["local_state_root_modified_at"] = root_modified.isoformat().replace("+00:00", "Z")
+    except OSError as exc:
+        result["local_state_freshness_reason"] = (
+            f"Local hierarchical Dropbox state root stat failed ({exc.__class__.__name__})"
+        )
+        return result
+
+    try:
+        raw_root = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        result["local_state_freshness_reason"] = (
+            f"Local hierarchical Dropbox state root parse failed ({exc.__class__.__name__})"
+        )
+        return result
+
+    refs, root_error = _hierarchical_state_month_refs(raw_root)
+    if root_error:
+        result["local_state_freshness_reason"] = root_error
+        return result
+
+    target_year = f"{expected_day.year:04d}"
+    target_month = f"{expected_day.month:02d}"
+    target_state_key = next(
+        (
+            state_key
+            for year, month, state_key in refs
+            if year == target_year and month == target_month
+        ),
+        None,
+    )
+    if not target_state_key:
+        result["local_state_freshness_reason"] = (
+            "Local hierarchical Dropbox state root has no checkpoint shard for "
+            f"{target_year}-{target_month}"
+        )
+        return result
+
+    history_root = _history_root_from_state_path(state_path, state_rel_path)
+    shard_path = history_root.joinpath(*target_state_key.split("/"))
+    result["local_state_month_path"] = str(shard_path)
+    if not shard_path.is_file():
+        result["local_state_freshness_reason"] = (
+            f"Local hierarchical Dropbox month state is missing: {target_state_key}"
+        )
+        return result
+
+    try:
+        shard_modified = datetime.fromtimestamp(
+            shard_path.stat().st_mtime,
+            tz=timezone.utc,
+        )
+    except OSError as exc:
+        result["local_state_freshness_reason"] = (
+            f"Local hierarchical Dropbox month state stat failed ({exc.__class__.__name__})"
+        )
+        return result
+
+    result["local_state_month_modified_at"] = shard_modified.isoformat().replace("+00:00", "Z")
+    result["local_state_fresh"] = shard_modified.date() >= expected_day
+    if result["local_state_fresh"]:
+        result["local_state_freshness_reason"] = "current"
+    else:
+        result["local_state_freshness_reason"] = (
+            "Local hierarchical Dropbox month state is stale: "
+            f"modified {shard_modified.date().isoformat()}, "
+            f"expected {expected_day.isoformat()} or later"
+        )
+    return result
+
+
 def _load_local_hierarchical_days(
     state_path: Path,
     state_rel_path: str,
@@ -254,6 +373,17 @@ def _download_hierarchical_json(access_token: str, state_rel_path: str) -> Dict[
     return payload
 
 
+def _state_info_with_warning(
+    state_info: Dict[str, Any],
+    warning: Optional[str],
+) -> Dict[str, Any]:
+    updated = dict(state_info)
+    if warning:
+        current = str(updated.get("warning") or "").strip()
+        updated["warning"] = f"{current} {warning}".strip() if current else warning
+    return updated
+
+
 def _load_dropbox_backup_days() -> Tuple[
     Dict[str, Set[date]], Optional[str], Optional[str], Dict[str, Any]
 ]:
@@ -263,38 +393,111 @@ def _load_dropbox_backup_days() -> Tuple[
     if not resolved_path:
         return domain_days, None, state_info.get("error"), state_info
 
+    stale_local: Optional[
+        Tuple[Dict[str, Set[date]], str, Optional[str], Dict[str, Any]]
+    ] = None
+
     for candidate in core._candidate_dropbox_state_paths(
         resolved_path,
         state_info=state_info,
     ):
         if not candidate.is_file():
             continue
+
         parsed_days, parse_error = _load_local_hierarchical_days(
             candidate,
             resolved_path,
         )
-        return parsed_days, str(candidate), parse_error, state_info
+        freshness = _local_hierarchical_state_freshness(
+            candidate,
+            resolved_path,
+        )
+        candidate_info = dict(state_info)
+        candidate_info.update(freshness)
+        candidate_info["attempted_paths"] = [
+            *list(candidate_info.get("attempted_paths") or []),
+            str(candidate),
+        ]
+
+        if not parse_error and freshness.get("local_state_fresh"):
+            candidate_info["source"] = "hierarchical_v2_local"
+            candidate_info["fallback_attempted"] = False
+            return parsed_days, str(candidate), None, candidate_info
+
+        local_reason = parse_error or str(
+            freshness.get("local_state_freshness_reason")
+            or "Local hierarchical Dropbox state is not current"
+        )
+        if stale_local is None:
+            stale_local = (
+                parsed_days,
+                str(candidate),
+                local_reason,
+                candidate_info,
+            )
 
     access_token, token_error = core._fetch_dropbox_access_token()
     remote_root = core._resolve_dropbox_state_remote_path(resolved_path)
     path_ref = f"dropbox:{remote_root}" if remote_root else None
-    if token_error:
-        return domain_days, path_ref, token_error, state_info
-    if not access_token:
-        return (
-            domain_days,
-            path_ref,
-            "Hierarchical Dropbox state root not found locally and Dropbox credentials are unavailable",
-            state_info,
+
+    if stale_local is not None:
+        stale_days, stale_path, local_reason, stale_info = stale_local
+        stale_info["fallback_attempted"] = True
+        stale_info["source"] = "hierarchical_v2_local_stale"
+        state_info = stale_info
+    else:
+        stale_days = None
+        stale_path = None
+        local_reason = None
+        state_info = dict(state_info)
+        state_info["source"] = "hierarchical_v2_dropbox_api"
+        state_info["fallback_attempted"] = False
+
+    if token_error or not access_token:
+        if stale_days is not None:
+            api_reason = token_error or "Dropbox credentials are unavailable"
+            error = (
+                f"{local_reason}; Dropbox API fallback unavailable: {api_reason}"
+            )
+            state_info["source"] = "hierarchical_v2_local_stale_api_unavailable"
+            state_info = _state_info_with_warning(state_info, error)
+            return stale_days, stale_path, error, state_info
+
+        error = token_error or (
+            "Hierarchical Dropbox state root not found locally and Dropbox credentials are unavailable"
         )
+        return domain_days, path_ref, error, state_info
+
+    if stale_local is not None:
+        state_info["fallback_attempted"] = True
+        state_info["attempted_paths"] = [
+            *list(state_info.get("attempted_paths") or []),
+            path_ref,
+        ]
+    elif path_ref:
+        state_info["attempted_paths"] = [
+            *list(state_info.get("attempted_paths") or []),
+            path_ref,
+        ]
 
     try:
         raw_root = _download_hierarchical_json(access_token, resolved_path)
     except Exception as exc:  # noqa: BLE001
-        return domain_days, path_ref, str(exc), state_info
+        api_error = str(exc)
+        if stale_days is not None:
+            error = f"{local_reason}; Dropbox API fallback failed: {api_error}"
+            state_info["source"] = "hierarchical_v2_local_stale_api_failed"
+            state_info = _state_info_with_warning(state_info, error)
+            return stale_days, stale_path, error, state_info
+        return domain_days, path_ref, api_error, state_info
 
     refs, root_error = _hierarchical_state_month_refs(raw_root)
     if root_error:
+        if stale_days is not None:
+            error = f"{local_reason}; Dropbox API fallback failed: {root_error}"
+            state_info["source"] = "hierarchical_v2_local_stale_api_failed"
+            state_info = _state_info_with_warning(state_info, error)
+            return stale_days, stale_path, error, state_info
         return domain_days, path_ref, root_error, state_info
 
     errors: List[str] = []
@@ -310,14 +513,40 @@ def _load_dropbox_backup_days() -> Tuple[
             continue
         domain_days["observations"].update(month_days)
 
-    return domain_days, path_ref, "; ".join(errors) if errors else None, state_info
+    remote_error = "; ".join(errors) if errors else None
+    if stale_local is not None:
+        state_info["source"] = "hierarchical_v2_dropbox_api_stale_local_fallback"
+        warning = (
+            f"{local_reason}; coverage loaded from Dropbox API instead."
+        )
+        state_info = _state_info_with_warning(state_info, warning)
+
+    return domain_days, path_ref, remote_error, state_info
+
+
+_ORIGINAL_NEXT_STORAGE_COVERAGE_REFRESH = core._next_storage_coverage_refresh
+
+
+def _next_storage_coverage_refresh(now_utc: datetime) -> datetime:
+    current = now_utc.astimezone(timezone.utc)
+    normal_refresh = _ORIGINAL_NEXT_STORAGE_COVERAGE_REFRESH(current)
+    freshness_boundary = current.replace(
+        hour=_dropbox_local_state_fresh_after_utc_hour(),
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if freshness_boundary <= current:
+        freshness_boundary += timedelta(days=1)
+    return min(normal_refresh, freshness_boundary)
 
 
 # Patch the existing dashboard implementation in-place so all existing handlers,
 # tests and callers retain the same module behaviour while Dropbox coverage uses
-# only the hierarchical v2 observation state.
+# hierarchical v2 observation state with a stale-local Dropbox API fallback.
 core._resolve_dropbox_state_path_info = _resolve_dropbox_state_path_info
 core._load_dropbox_backup_days = _load_dropbox_backup_days
+core._next_storage_coverage_refresh = _next_storage_coverage_refresh
 
 if __name__ == "__main__":
     core.main()
