@@ -64,6 +64,47 @@ def patched_env(values: dict[str, str]):
 
 
 class PreflightTests(unittest.TestCase):
+    def test_dotenv_loader_preserves_data_without_shell_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sentinel = root / "must-not-exist"
+            env_file = root / ".env"
+            env_file.write_text(
+                "\n".join([
+                    "# comment",
+                    "UKAQ_DASHBOARD_TITLE=UK AQ Dashboard - TEST",
+                    "QUOTED_VALUE=\"quoted value\"",
+                    "EQUALS_VALUE=left=right",
+                    f"SHELL_TEXT=$(touch {sentinel})",
+                    "INLINE_HASH=retained#hash",
+                    "INLINE_COMMENT=retained # comment",
+                    "",
+                ]),
+                encoding="utf-8",
+            )
+
+            loaded = MODULE.load_env_file_assignments(env_file)
+
+            self.assertEqual(loaded["UKAQ_DASHBOARD_TITLE"], "UK AQ Dashboard - TEST")
+            self.assertEqual(loaded["QUOTED_VALUE"], "quoted value")
+            self.assertEqual(loaded["EQUALS_VALUE"], "left=right")
+            self.assertEqual(loaded["SHELL_TEXT"], f"$(touch {sentinel})")
+            self.assertEqual(loaded["INLINE_HASH"], "retained#hash")
+            self.assertEqual(loaded["INLINE_COMMENT"], "retained")
+            self.assertFalse(sentinel.exists())
+
+    def test_backfill_dotenv_loader_preserves_exported_environment_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("PRECEDENCE_VALUE=from dotenv\n", encoding="utf-8")
+            with patched_env({
+                "UK_AQ_BACKFILL_ENV_FILE": str(env_file),
+                "PRECEDENCE_VALUE": "from process",
+            }):
+                result = MODULE.load_backfill_env_file_if_set()
+                self.assertEqual(os.environ["PRECEDENCE_VALUE"], "from process")
+                self.assertIn("PRECEDENCE_VALUE", result["skipped_existing_keys"])
+
     def test_parse_args_accepts_sos_source(self) -> None:
         parsed = MODULE.parse_args(
             ["--env", "TEST", "--source", "sos", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],

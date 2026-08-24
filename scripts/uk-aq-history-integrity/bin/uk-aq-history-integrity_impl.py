@@ -5552,9 +5552,7 @@ def _record_backfill_core_snapshot_identity_audits(
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
-    """Parse a bash-style KEY=VALUE env file. Strips matching surrounding
-    single or double quotes. Skips blank lines and #-comments. Tolerates an
-    optional leading 'export '."""
+    """Parse dotenv KEY=VALUE data without evaluating shell syntax."""
     def _strip_inline_comment(value: str) -> str:
         in_single = False
         in_double = False
@@ -5595,7 +5593,7 @@ def _load_env_file(path: Path) -> dict[str, str]:
         return "".join(out).strip()
 
     out: dict[str, str] = {}
-    with path.open() as fh:
+    with path.open(encoding="utf-8") as fh:
         for raw in fh:
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -5604,14 +5602,15 @@ def _load_env_file(path: Path) -> dict[str, str]:
             key = key.strip()
             if key.startswith("export "):
                 key = key[len("export "):].strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                continue
             val = _strip_inline_comment(val)
             if len(val) >= 2 and (
                 (val.startswith('"') and val.endswith('"'))
                 or (val.startswith("'") and val.endswith("'"))
             ):
                 val = val[1:-1]
-            if key:
-                out[key] = val
+            out[key] = val
     return out
 
 
@@ -27329,41 +27328,8 @@ def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dic
     )
 
 
-def _parse_env_assignment_line(raw_line: str) -> tuple[str, str] | None:
-    line = raw_line.strip()
-    if not line or line.startswith("#"):
-        return None
-    if line.startswith("export "):
-        line = line[len("export "):].lstrip()
-    if "=" not in line:
-        return None
-    key, raw_value = line.split("=", 1)
-    key = key.strip()
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
-        return None
-    value_part = raw_value.strip()
-    if not value_part:
-        return key, ""
-    try:
-        pieces = shlex.split(value_part, comments=True, posix=True)
-    except ValueError:
-        pieces = [value_part.strip().strip("'\"")]
-    if not pieces:
-        return key, ""
-    return key, pieces[0]
-
-
 def load_env_file_assignments(path: str | Path) -> dict[str, str]:
-    env_path = Path(path).expanduser()
-    values: dict[str, str] = {}
-    with env_path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            parsed = _parse_env_assignment_line(raw_line)
-            if parsed is None:
-                continue
-            key, value = parsed
-            values[key] = value
-    return values
+    return _load_env_file(Path(path).expanduser())
 
 
 def load_backfill_env_file_if_set(*, override_existing: bool = False) -> dict[str, Any]:

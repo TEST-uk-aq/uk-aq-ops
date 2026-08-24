@@ -465,8 +465,11 @@ if [[ -z "${INCOMING_CORE_SNAPSHOT_IDENTITY_JSON}" || -z "${INCOMING_CORE_SNAPSH
   echo "ERROR: Integrity child requires the coordinator core snapshot identity, identity file, and Dropbox root." >&2
   exit 4
 fi
+set -a
 # The shared repository .env is the only environment source for this wrapper.
-apply_env_file_safe "${ENV_FILE}"
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+set +a
 if [[ -n "${INCOMING_INTEGRITY_REPAIR_POLLUTANTS}" ]]; then
   export UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS="${INCOMING_INTEGRITY_REPAIR_POLLUTANTS}"
 fi
