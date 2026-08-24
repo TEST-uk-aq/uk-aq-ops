@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Starts the UK AQ dashboard API server.
-# Sources .env from this repo's root. Set PORT env var to override port (default: 8000).
+# Loads .env from this repo's root. Set PORT env var to override port (default: 8000).
 # The live dashboard launchd plist sets PORT=8001.
 set -euo pipefail
 
@@ -20,10 +20,72 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
+load_dotenv_file() {
+  local env_file="$1"
+  local line=""
+  local key value first_char last_char char previous_char quote_char
+  local line_number=0 index
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_number += 1))
+    line="${line%$'\r'}"
+
+    if [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+
+    if [[ "$line" != *=* ]]; then
+      echo "Malformed env assignment at ${env_file}:${line_number}: expected KEY=VALUE" >&2
+      return 1
+    fi
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "Malformed env assignment at ${env_file}:${line_number}: invalid environment key" >&2
+      return 1
+    fi
+
+    quote_char=""
+    if (( ${#value} > 0 )); then
+      first_char="${value:0:1}"
+      if [[ "$first_char" == '"' || "$first_char" == "'" ]]; then
+        quote_char="$first_char"
+      fi
+    fi
+    for ((index = 0; index < ${#value}; index += 1)); do
+      char="${value:index:1}"
+      if [[ -n "$quote_char" ]]; then
+        if (( index > 0 )) && [[ "$char" == "$quote_char" ]]; then
+          quote_char=""
+        fi
+        continue
+      fi
+      if [[ "$char" == "#" ]] && (( index > 0 )); then
+        previous_char="${value:index-1:1}"
+        if [[ "$previous_char" =~ [[:space:]] ]]; then
+          value="${value:0:index}"
+          while [[ "$value" =~ [[:space:]]$ ]]; do
+            value="${value%?}"
+          done
+          break
+        fi
+      fi
+    done
+
+    if (( ${#value} >= 2 )); then
+      first_char="${value:0:1}"
+      last_char="${value: -1}"
+      if [[ ( "$first_char" == '"' || "$first_char" == "'" ) && "$last_char" == "$first_char" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+
+    export "$key=$value"
+  done < "$env_file"
+}
+
+load_dotenv_file "$ENV_FILE"
 
 generate_dashboard_config() {
   "$PYTHON_BIN" - <<'PY'
