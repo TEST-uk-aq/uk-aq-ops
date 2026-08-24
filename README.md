@@ -283,13 +283,14 @@ node scripts/backup_r2/download_day.mjs --day 2026-02-20 --out ./tmp/backup_down
 node scripts/backup_r2/download_day.mjs --day 2026-02-20 --connector 4 --out ./tmp/backup_download
 ```
 
-Run the hierarchical R2 v2 History -> Dropbox sync against an existing current
-inventory:
+Plan the hierarchical R2 v2 History -> Dropbox sync against an existing current
+inventory without mutating Dropbox or backup checkpoints:
 
 ```bash
 node scripts/backup_r2/sync_history_to_dropbox.mjs \
   --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
-  --dest-root "uk_aq_dropbox:CIC-Test/R2_history_backup"
+  --dest-root "uk_aq_dropbox:CIC-Test/R2_history_backup" \
+  --dry-run
 ```
 
 Notes:

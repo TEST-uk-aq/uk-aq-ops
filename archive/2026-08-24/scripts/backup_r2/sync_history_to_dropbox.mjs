@@ -46,9 +46,6 @@ import {
 import {
   pruneStaleParquetForUnit,
 } from "./lib/stale_parquet_prune.mjs";
-import {
-  requireLockedHistoryBackupMutation,
-} from "./uk_aq_run_locked_history_backup.mjs";
 
 const DEFAULT_RCLONE_BIN =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "").trim() || "rclone";
@@ -611,10 +608,6 @@ function runForcedObservationPruneRecheck(args, inventoryRoot, report) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  requireLockedHistoryBackupMutation({
-    dryRun: args.dry_run,
-    env: process.env,
-  });
   const startedAt = new Date().toISOString();
   const inventoryResult = readJsonRequired(
     args.rclone_bin,

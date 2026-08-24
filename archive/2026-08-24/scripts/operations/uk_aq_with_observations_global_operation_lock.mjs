@@ -2,17 +2,13 @@
 
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
 import {
   OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
   withHistoryWriterClient,
   withObservationsGlobalOperationLock,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
-
-const CHILD_SUPERVISOR_PATH = fileURLToPath(
-  new URL("./uk_aq_observations_global_operation_child_supervisor.mjs", import.meta.url),
-);
 
 function requireValue(argv, index, flag) {
   const value = argv[index + 1];
@@ -55,11 +51,11 @@ export function parseLockedCommandArgs(argv) {
 }
 
 function terminateProcessGroup(child, signal) {
-  if (!child?.pid) return;
+  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
   try {
     process.kill(-child.pid, signal);
   } catch (error) {
-    if (error?.code !== "ESRCH") child.kill?.(signal);
+    if (error?.code !== "ESRCH") child.kill(signal);
   }
 }
 
@@ -72,25 +68,12 @@ export async function runChildWhileLockHeld({
   terminate = terminateProcessGroup,
 }) {
   return await new Promise((resolve, reject) => {
-    const child = spawnProcess(process.execPath, [
-      CHILD_SUPERVISOR_PATH,
-      "--",
-      command,
-      ...commandArgs,
-    ], {
+    const child = spawnProcess(command, commandArgs, {
       env,
-      stdio: ["inherit", "inherit", "inherit", "pipe", "ipc"],
+      stdio: "inherit",
       detached: true,
     });
-    const livenessPipe = child?.stdio?.[3];
-    if (!livenessPipe) {
-      terminate(child, "SIGKILL");
-      reject(new Error("Locked child supervisor liveness pipe was not created"));
-      return;
-    }
     let lossTimer = null;
-    let forwardedSignal = null;
-    let supervisorResult = null;
     const stopForLostLock = () => {
       terminate(child, "SIGTERM");
       lossTimer = setTimeout(() => terminate(child, "SIGKILL"), 10_000);
@@ -99,53 +82,25 @@ export async function runChildWhileLockHeld({
     if (lockSignal?.aborted) stopForLostLock();
     else lockSignal?.addEventListener("abort", stopForLostLock, { once: true });
 
-    const forwardSignal = (signal) => {
-      forwardedSignal = signal;
-      terminate(child, signal);
-    };
+    const forwardSignal = (signal) => terminate(child, signal);
     const onSigint = () => forwardSignal("SIGINT");
     const onSigterm = () => forwardSignal("SIGTERM");
     process.once("SIGINT", onSigint);
     process.once("SIGTERM", onSigterm);
-    const onSupervisorMessage = (message) => {
-      if (message?.type !== "uk_aq_locked_command_result" || supervisorResult) return;
-      supervisorResult = message;
-      terminate(child, "SIGKILL");
-    };
-    child.on?.("message", onSupervisorMessage);
     const cleanup = () => {
       if (lossTimer) clearTimeout(lossTimer);
-      livenessPipe.destroy?.();
       lockSignal?.removeEventListener("abort", stopForLostLock);
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
-      child.off?.("message", onSupervisorMessage);
     };
     child.once("error", (error) => {
       cleanup();
       reject(error);
     });
     child.once("exit", (code, signal) => {
-      // The supervisor is the protected process-group leader. Kill any
-      // descendants which outlived it before the PostgreSQL lock can release.
-      terminate(child, "SIGKILL");
       cleanup();
       if (lockSignal?.aborted) {
         reject(lockSignal.reason || new Error("Observations global operation lock was lost"));
-      } else if (supervisorResult?.error) {
-        const error = new Error(`Locked command supervisor failed: ${supervisorResult.error}`);
-        error.code = "UK_AQ_LOCKED_COMMAND_SUPERVISOR_FAILED";
-        reject(error);
-      } else if (supervisorResult?.stopping_signal) {
-        resolve(supervisorResult.stopping_signal === "SIGINT" ? 130 : 143);
-      } else if (supervisorResult?.target_signal) {
-        const error = new Error(`Locked command terminated by ${supervisorResult.target_signal}`);
-        error.code = "UK_AQ_LOCKED_COMMAND_SIGNAL";
-        reject(error);
-      } else if (supervisorResult) {
-        resolve(Number(supervisorResult.exit_code || 0));
-      } else if (signal && signal === forwardedSignal) {
-        resolve(signal === "SIGINT" ? 130 : 143);
       } else if (signal) {
         const error = new Error(`Locked command terminated by ${signal}`);
         error.code = "UK_AQ_LOCKED_COMMAND_SIGNAL";

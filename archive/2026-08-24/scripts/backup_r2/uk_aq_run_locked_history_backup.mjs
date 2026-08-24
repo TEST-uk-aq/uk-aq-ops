@@ -92,17 +92,6 @@ function runRequired(command, commandArgs, { env, run = spawnSync }) {
   }
 }
 
-export function requireLockedHistoryBackupMutation({
-  dryRun = false,
-  env = process.env,
-} = {}) {
-  if (dryRun) return null;
-  return requireObservationsGlobalOperationLockContext({
-    env,
-    expectedOwner: "r2_history_dropbox_backup",
-  });
-}
-
 export function runLockedHistoryBackup({
   args,
   env = process.env,
