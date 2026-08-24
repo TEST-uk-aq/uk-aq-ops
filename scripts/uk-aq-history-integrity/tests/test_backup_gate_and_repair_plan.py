@@ -314,7 +314,7 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
 
     def test_daily_boundary_failure_allows_only_name_and_state_scope_discovery(self) -> None:
         args = SimpleNamespace(
-            env="CIC-Test",
+            env="TEST",
             profile="daily",
             source="all",
             from_day=None,

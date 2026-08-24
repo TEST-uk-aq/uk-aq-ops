@@ -46,7 +46,7 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
                 INSERT INTO aqi_rebuild_queue (
                   run_id, env_name, history_version, connector_id, day_utc,
                   reason, source_mode, status, created_at_utc
-                ) VALUES (1, 'CIC-Test', 'v2', 7, '2026-07-12',
+                ) VALUES (1, 'TEST', 'v2', 7, '2026-07-12',
                           'obs_repaired', 'combined_local', 'queued',
                           '2026-07-19T00:00:00Z')
                 """
@@ -58,7 +58,7 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
             }
             try:
                 result = integrity.run_aqi_rebuild_queue_execution(
-                    conn, run_id=1, env_name="CIC-Test", run_compact="test",
+                    conn, run_id=1, env_name="TEST", run_compact="test",
                     env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": str(temp / "logs")},
                     dry_run=False, run_backfill=True,
                     limits=integrity.LimitTracker(None, None, time.monotonic()),
@@ -87,7 +87,7 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
             dropbox = temp / "dropbox"
             dropbox.mkdir()
             run_state = integrity.create_run_overlay(
-                tmp_dir=temp, run_id="exact", environment="CIC-Test",
+                tmp_dir=temp, run_id="exact", environment="TEST",
                 base_dropbox_root=dropbox,
             )
             day = "2026-07-12"
@@ -179,7 +179,7 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
             self.assertEqual(run_state["tombstone_prefixes"][0]["prefix"], connector_prefix)
 
             bad_state = integrity.create_run_overlay(
-                tmp_dir=temp, run_id="mismatch", environment="CIC-Test",
+                tmp_dir=temp, run_id="mismatch", environment="TEST",
                 base_dropbox_root=dropbox,
             )
             bad_generated = Path(bad_state["overlay_root"]) / "generated-objects" / connector_prefix
@@ -212,13 +212,13 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
     def test_repair_pollutants_accept_o3_and_reject_unsupported(self) -> None:
         integrity = load_integrity_module()
         args = integrity.parse_args([
-            "--env", "CIC-Test", "--run-backfill", "--dry-run",
+            "--env", "TEST", "--run-backfill", "--dry-run",
             "--repair-pollutants", "pm25,pm10,no2,o3",
         ])
         self.assertEqual(args.repair_pollutants, ["no2", "o3", "pm10", "pm25"])
         with self.assertRaises(SystemExit):
             integrity.parse_args([
-                "--env", "CIC-Test", "--run-backfill",
+                "--env", "TEST", "--run-backfill",
                 "--repair-pollutants", "pm25,benzene",
             ])
 
@@ -254,7 +254,7 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
                 result = integrity.run_narrow_backfill(
                     wrapper_path=str(wrapper),
                     env_file_path=str(env_file),
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     timeseries_ids=[],
                     connector_ids=[7],
                     day=__import__("datetime").date(2026, 7, 12),
@@ -327,7 +327,7 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
             run_state = integrity.create_run_overlay(
                 tmp_dir=temp,
                 run_id="aqi-scope",
-                environment="CIC-Test",
+                environment="TEST",
                 base_dropbox_root=dropbox,
             )
             config = integrity.resolve_history_path_config("v2", {})
@@ -469,7 +469,7 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
             replacement_sha, replacement_bytes = identity(replacement_part)
             connector_sha, connector_bytes = identity(replacement_manifest)
             run_state = {
-                "environment": "CIC-Test",
+                "environment": "TEST",
                 "base_dropbox_root": str(dropbox),
                 "objects": {
                     replacement_key: {
@@ -648,7 +648,7 @@ if (!scopedAqiConnectorDidReject) throw new Error("apply preflight accepted scop
             baseline_sha, baseline_bytes = identity(baseline_part)
             baseline_key = baseline_part.relative_to(dropbox).as_posix()
             metadata_only_state = {
-                "environment": "CIC-Test",
+                "environment": "TEST",
                 "base_dropbox_root": str(dropbox),
                 "objects": {
                     metadata_manifest.relative_to(overlay).as_posix(): {

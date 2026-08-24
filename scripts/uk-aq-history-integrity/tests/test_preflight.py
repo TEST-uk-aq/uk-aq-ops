@@ -30,7 +30,7 @@ SPEC.loader.exec_module(MODULE)
 
 def make_args(**overrides: object) -> Namespace:
     values = {
-        "env": "CIC-Test",
+        "env": "TEST",
         "profile": "daily",
         "source": "openaq",
         "from_day": None,
@@ -66,13 +66,13 @@ def patched_env(values: dict[str, str]):
 class PreflightTests(unittest.TestCase):
     def test_parse_args_accepts_sos_source(self) -> None:
         parsed = MODULE.parse_args(
-            ["--env", "CIC-Test", "--source", "sos", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
+            ["--env", "TEST", "--source", "sos", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
         )
         self.assertEqual(parsed.source, "sos")
 
     def test_parse_args_for_manual_v2_check_only_acceptance_leaves_backfill_disabled(self) -> None:
         parsed = MODULE.parse_args([
-            "--env", "CIC-Test",
+            "--env", "TEST",
             "--profile", "manual",
             "--source", "all",
             "--from-day", "2026-05-17",
@@ -82,7 +82,7 @@ class PreflightTests(unittest.TestCase):
             "--concurrency", "1",
             "--verbose",
         ])
-        self.assertEqual(parsed.env, "CIC-Test")
+        self.assertEqual(parsed.env, "TEST")
         self.assertEqual(parsed.profile, "manual")
         self.assertEqual(parsed.source, "all")
         self.assertEqual(parsed.from_day, "2026-05-17")
@@ -96,20 +96,20 @@ class PreflightTests(unittest.TestCase):
     def test_parse_args_rejects_v1_both_and_run_backfill_before_work(self) -> None:
         for value in ("v1", "both"):
             with self.subTest(history_version=value), self.assertRaises(SystemExit) as raised:
-                MODULE.parse_args(["--env", "CIC-Test", "--history-version", value])
+                MODULE.parse_args(["--env", "TEST", "--history-version", value])
             self.assertEqual(raised.exception.code, 2)
         with self.assertRaises(SystemExit) as raised:
-            MODULE.parse_args(["--env", "CIC-Test", "--run-backfill"])
+            MODULE.parse_args(["--env", "TEST", "--run-backfill"])
         self.assertEqual(raised.exception.code, 2)
 
     def test_parse_args_rejects_hyphenated_sos_source(self) -> None:
         with self.assertRaises(SystemExit):
             MODULE.parse_args(
-                ["--env", "CIC-Test", "--source", "sos-api", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
+                ["--env", "TEST", "--source", "sos-api", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
             )
 
     def _base_env(self, root: Path) -> tuple[dict[str, str], dict[str, str]]:
-        state = root / "state" / "CIC-Test"
+        state = root / "state" / "TEST"
         r2_root = root / "r2"
         snapshot_root = r2_root / "history" / "v2" / "core"
         snapshot_root.mkdir(parents=True, exist_ok=True)
@@ -129,7 +129,7 @@ class PreflightTests(unittest.TestCase):
             encoding="utf-8",
         )
         env = {
-            "UK_AQ_ENV_NAME": "CIC-Test",
+            "UK_AQ_ENV_NAME": "TEST",
             "UK_AQ_HISTORY_INTEGRITY_ROOT": str(root),
             "UK_AQ_HISTORY_INTEGRITY_STATE_DIR": str(state),
             "UK_AQ_HISTORY_INTEGRITY_DB_PATH": str(state / "uk_aq_history_integrity.sqlite"),
@@ -144,7 +144,7 @@ class PreflightTests(unittest.TestCase):
         os_env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"] = str(r2_root)
         os_env["UK_AQ_BACKFILL_ENV_FILE"] = str(backfill_env)
         os_env["UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH"] = str(
-            root / "dropbox" / "CIC-Test" / "uk_aq_history_integrity.sqlite",
+            root / "dropbox" / "TEST" / "uk_aq_history_integrity.sqlite",
         )
         return env, os_env
 
@@ -153,7 +153,7 @@ class PreflightTests(unittest.TestCase):
             root = Path(tmp)
             env, os_env = self._base_env(root)
             env["UK_AQ_ENV_NAME"] = "LIVE"
-            args = make_args(env="CIC-Test")
+            args = make_args(env="TEST")
             with patched_env(os_env):
                 errors, _, _ = MODULE.collect_preflight_errors(args, env)
             self.assertTrue(any("UK_AQ_ENV_NAME" in err for err in errors))
@@ -174,7 +174,7 @@ class PreflightTests(unittest.TestCase):
             root = Path(tmp)
             env, os_env = self._base_env(root)
             os_env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"] = "/tmp/state/LIVE/db.sqlite"
-            args = make_args(env="CIC-Test")
+            args = make_args(env="TEST")
             with patched_env(os_env):
                 errors, _, _ = MODULE.collect_preflight_errors(args, env)
             self.assertTrue(any("contains '/LIVE/'" in err for err in errors))
@@ -210,9 +210,9 @@ class PreflightTests(unittest.TestCase):
             root = Path(tmp)
             env, os_env = self._base_env(root)
             os_env.pop("UK_AQ_R2_HISTORY_DROPBOX_ROOT", None)
-            os_env["UK_AQ_DROPBOX_ROOT"] = "CIC-Test"
+            os_env["UK_AQ_DROPBOX_ROOT"] = "TEST"
             os_env["UK_AQ_R2_HISTORY_DROPBOX_DIR"] = "R2_history_backup"
-            backup_root = root / "dropbox-app" / "CIC-Test" / "R2_history_backup"
+            backup_root = root / "dropbox-app" / "TEST" / "R2_history_backup"
             (backup_root / "history" / "v2" / "core").mkdir(parents=True, exist_ok=True)
             (backup_root / "history" / "v2" / "core" / "manifest.json").write_text("{}", encoding="utf-8")
             os_env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"] = str(backup_root / "history" / "v2" / "core")
@@ -316,7 +316,7 @@ class PreflightTests(unittest.TestCase):
             with patched_env(os_env):
                 errors, _, summary = MODULE.collect_preflight_errors(args, env)
             self.assertEqual(errors, [])
-            self.assertEqual(summary["env"], "CIC-Test")
+            self.assertEqual(summary["env"], "TEST")
             self.assertEqual(summary["profile"], "manual")
             self.assertEqual(summary["source"], "sos")
             self.assertTrue(summary["daily_task_health_enabled"])
@@ -366,7 +366,7 @@ class PreflightTests(unittest.TestCase):
             _, os_env = self._base_env(root)
             os_env["UK_AQ_HISTORY_INTEGRITY_DAILY_TASK_HEALTH_ENABLED"] = "true"
             with patched_env(os_env):
-                config = MODULE._resolve_daily_task_health_config(env_name="CIC-Test")
+                config = MODULE._resolve_daily_task_health_config(env_name="TEST")
             self.assertTrue(config["enabled"])
             self.assertEqual(config["supabase_url"], "https://example.supabase.co")
             self.assertEqual(config["supabase_key"], "example-service-role-key")
@@ -403,7 +403,7 @@ class PreflightTests(unittest.TestCase):
                 },
                 error_message="Integrity final verification failed",
                 error_payload={"status": "fail", "repair_flow": repair_flow},
-                platform_run_id="CIC-Test:2026-07-29T204828Z",
+                platform_run_id="TEST:2026-07-29T204828Z",
                 log_url="/logs/integrity.log",
             )
 

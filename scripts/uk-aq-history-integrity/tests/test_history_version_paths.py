@@ -315,7 +315,7 @@ class V2CoreSnapshotContractTests(unittest.TestCase):
             try:
                 result = MODULE.import_core_snapshot(
                     conn,
-                    "CIC-Test",
+                    "TEST",
                     str(root),
                     force=False,
                     dry_run=True,

@@ -69,7 +69,7 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
         try:
             evidence, rows = self.evidence()
             first = MODULE._persist_complete_connector_day_source_evidence(
-                conn=conn, env_name="CIC-Test", evidence=evidence,
+                conn=conn, env_name="TEST", evidence=evidence,
                 canonical_rows=rows,
             )
             repeated_evidence = dict(evidence)
@@ -80,7 +80,7 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
                 "9" * 64
             )
             second = MODULE._persist_complete_connector_day_source_evidence(
-                conn=conn, env_name="CIC-Test", evidence=repeated_evidence,
+                conn=conn, env_name="TEST", evidence=repeated_evidence,
                 canonical_rows=rows,
             )
             self.assertEqual(first, second)
@@ -96,13 +96,13 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
         try:
             evidence, rows = self.evidence()
             MODULE._persist_complete_connector_day_source_evidence(
-                conn=conn, env_name="CIC-Test", evidence=evidence,
+                conn=conn, env_name="TEST", evidence=evidence,
                 canonical_rows=rows,
             )
             changed, changed_rows = self.evidence(rows=[{"timeseries_id": 1}])
             with self.assertRaisesRegex(RuntimeError, "identical semantic inputs"):
                 MODULE._persist_complete_connector_day_source_evidence(
-                    conn=conn, env_name="CIC-Test", evidence=changed,
+                    conn=conn, env_name="TEST", evidence=changed,
                     canonical_rows=changed_rows,
                 )
         finally:
@@ -119,7 +119,7 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             ids = []
             for evidence, rows in variants:
                 ids.append(MODULE._persist_complete_connector_day_source_evidence(
-                    conn=conn, env_name="CIC-Test", evidence=evidence,
+                    conn=conn, env_name="TEST", evidence=evidence,
                     canonical_rows=rows,
                 )["evidence_id"])
             self.assertEqual(len(set(ids)), 3)
@@ -157,7 +157,7 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
         legacy.execute(
             """
             INSERT INTO source_connector_day_evidence VALUES
-              (1, 'CIC-Test', '2026-07-18', 1, 'sos', ?, ?, 2, ?, '{}', '[]', ?)
+              (1, 'TEST', '2026-07-18', 1, 'sos', ?, ?, 2, ?, '{}', '[]', ?)
             """,
             ("4" * 64, hashlib.sha256(b"[]").hexdigest(), "7" * 64,
              "2026-07-18T00:00:00Z"),
@@ -174,7 +174,7 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             self.assertEqual(migrated, [(1, None)])
             evidence, rows = self.evidence()
             inserted = MODULE._persist_complete_connector_day_source_evidence(
-                conn=conn, env_name="CIC-Test", evidence=evidence,
+                conn=conn, env_name="TEST", evidence=evidence,
                 canonical_rows=rows,
             )
             self.assertNotEqual(inserted["evidence_id"], 1)

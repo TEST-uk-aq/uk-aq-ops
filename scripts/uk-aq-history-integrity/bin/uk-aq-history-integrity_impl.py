@@ -26728,7 +26728,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         prog="uk-aq-history-integrity",
         description="UK-AQ History Integrity entrypoint (Phase 1).",
     )
-    p.add_argument("--env", required=True, choices=["CIC-Test", "LIVE"])
+    p.add_argument("--env", required=True, choices=["TEST", "LIVE"])
     p.add_argument(
         "--profile",
         default="manual",
@@ -27279,7 +27279,7 @@ def validate_guardrails(cli_env: str, env: dict[str, str]) -> None:
         )
         sys.exit(4)
 
-    other = "LIVE" if cli_env == "CIC-Test" else "CIC-Test"
+    other = "LIVE" if cli_env == "TEST" else "TEST"
     fragment = f"/{other}/"
     for var in PATH_VARS_FOR_GUARDRAILS:
         val = os.environ.get(var, "")
@@ -27734,7 +27734,7 @@ def _collect_guardrail_errors(cli_env: str, env: dict[str, str]) -> list[str]:
         errors.append(
             f"--env={cli_env} but UK_AQ_ENV_NAME={env['UK_AQ_ENV_NAME']}. Refusing to run.",
         )
-    other = "LIVE" if cli_env == "CIC-Test" else "CIC-Test"
+    other = "LIVE" if cli_env == "TEST" else "TEST"
     fragment = f"/{other}/"
     for var in PATH_VARS_FOR_GUARDRAILS:
         val = os.environ.get(var, "")
@@ -27946,7 +27946,7 @@ def collect_preflight_errors(
                 loaded_daily_env = _load_env_file(env_file_path)
 
         if env_file_raw:
-            other_env = "LIVE" if args.env == "CIC-Test" else "CIC-Test"
+            other_env = "LIVE" if args.env == "TEST" else "TEST"
             if f"/{other_env}/" in env_file_raw:
                 errors.append(
                     f"--env {args.env} but UK_AQ_BACKFILL_ENV_FILE contains /{other_env}/. Refusing to run.",
@@ -28001,7 +28001,7 @@ def collect_preflight_errors(
                 loaded_backfill_env = _load_env_file(env_file_path)
 
         if env_file_raw:
-            other_env = "LIVE" if args.env == "CIC-Test" else "CIC-Test"
+            other_env = "LIVE" if args.env == "TEST" else "TEST"
             if f"/{other_env}/" in env_file_raw:
                 errors.append(
                     f"--env {args.env} but UK_AQ_BACKFILL_ENV_FILE contains /{other_env}/. Refusing to run.",
@@ -28038,7 +28038,7 @@ def collect_preflight_errors(
                 errors.append(
                     f"UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE is not executable: {nested_wrapper_path}",
                 )
-            if f"/{'LIVE' if args.env == 'CIC-Test' else 'CIC-Test'}/" in nested_wrapper:
+            if f"/{'LIVE' if args.env == 'TEST' else 'TEST'}/" in nested_wrapper:
                 errors.append(
                     f"--env {args.env} but nested UK_AQ_BACKFILL_WRAPPER contains the other env path: {nested_wrapper}",
                 )

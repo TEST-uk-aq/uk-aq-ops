@@ -50,7 +50,7 @@ class Run132RegressionTests(unittest.TestCase):
 
     def test_explicit_boundary_failure_calls_no_dropbox_source_or_r2_adapter(self) -> None:
         args = SimpleNamespace(
-            env="CIC-Test", profile="manual", source="sos", from_day="2026-05-17",
+            env="TEST", profile="manual", source="sos", from_day="2026-05-17",
             to_day="2026-05-17", history_version="v2", verbose=False, dry_run=False,
             check_only=False, run_backfill=True, allow_stale_dropbox=False,
             logical_run_date=None,

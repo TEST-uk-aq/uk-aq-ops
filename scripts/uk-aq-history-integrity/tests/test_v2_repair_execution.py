@@ -82,7 +82,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             )
         """)
         self.env = {
-            "UK_AQ_ENV_NAME": "CIC-Test",
+            "UK_AQ_ENV_NAME": "TEST",
             "UK_AQ_HISTORY_INTEGRITY_DB_PATH": str(self.root / "integrity.sqlite"),
             "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": str(self.root / "logs"),
             "UK_AQ_HISTORY_INTEGRITY_TMP_DIR": str(self.root / "tmp"),
@@ -114,7 +114,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             """,
             (
                 run_id,
-                "CIC-Test",
+                "TEST",
                 "v2",
                 "aqilevels",
                 "data",
@@ -175,7 +175,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             """,
             (
                 MODULE._openaq_source_file_key("42", day),
-                "CIC-Test",
+                "TEST",
                 MODULE.OPENAQ_SOURCE_KEY,
                 MODULE.OPENAQ_REMOTE_SCHEME,
                 MODULE._openaq_url("https://example.test", "42", day),
@@ -451,7 +451,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             """,
             (
                 source_file_key,
-                "CIC-Test",
+                "TEST",
                 source_key,
                 "mock",
                 "mock://source",
@@ -502,7 +502,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 from_day=day_utc,
                 to_day=day_utc,
                 conn=conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 allowed_connector_ids=set(connector_ids) if connector_ids else None,
                 source_scope={"source": source, "connector_ids": connector_ids, "scope": "source" if connector_ids else "all"},
                 log=self.log,
@@ -600,7 +600,7 @@ class V2RepairExecutionTests(unittest.TestCase):
 
     def _summary_for_cross_check(self, cross_check: dict[str, object]) -> dict[str, object]:
         return {
-            "env": "CIC-Test",
+            "env": "TEST",
             "profile": "test",
             "started_at_utc": "2026-06-20T00:00:00Z",
             "finished_at_utc": "2026-06-20T00:01:00Z",
@@ -620,7 +620,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
             run_id=1,
-            env_name="CIC-Test",
+            env_name="TEST",
             run_compact="run",
             env=self.env,
             v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6, "gap_type": "connector_dir_missing"}]},
@@ -671,7 +671,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
             run_id=1,
-            env_name="CIC-Test",
+            env_name="TEST",
             run_compact="run",
             env=self.env,
             v2_observations={"gaps": [{
@@ -712,7 +712,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             {"kind": "observation_index_repair", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3"},
         ]
         metrics = MODULE.run_v2_gap_backfills(
-            conn=self.conn, run_id=90, env_name="CIC-Test", run_compact="run", env=self.env,
+            conn=self.conn, run_id=90, env_name="TEST", run_compact="run", env=self.env,
             v2_observations={"gaps": gaps, "repair_plan": plan}, dry_run=True, run_backfill=True,
             limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0), log=self.log,
         )
@@ -723,7 +723,7 @@ class V2RepairExecutionTests(unittest.TestCase):
     def test_explicit_observation_data_repair_is_the_only_writer_eligibility(self) -> None:
         gap = {"day_utc": "2026-06-08", "connector_id": 6, "gap_type": "source_r2_timeseries_row_mismatch", "missing_timeseries_ids": [101]}
         metrics = MODULE.run_v2_gap_backfills(
-            conn=self.conn, run_id=91, env_name="CIC-Test", run_compact="run", env=self.env,
+            conn=self.conn, run_id=91, env_name="TEST", run_compact="run", env=self.env,
             v2_observations={"gaps": [gap], "repair_plan": [{
                 "kind": "observation_data_repair", "day_utc": "2026-06-08", "connector_id": 6,
                 "pollutant_code": "pm25", "data_changes_required": True,
@@ -737,7 +737,7 @@ class V2RepairExecutionTests(unittest.TestCase):
     def test_duplicate_raw_data_gaps_produce_one_writer_plan(self) -> None:
         gap = {"day_utc": "2026-06-08", "connector_id": 6, "gap_type": "source_r2_timeseries_row_mismatch", "missing_timeseries_ids": [101]}
         metrics = MODULE.run_v2_gap_backfills(
-            conn=self.conn, run_id=92, env_name="CIC-Test", run_compact="run", env=self.env,
+            conn=self.conn, run_id=92, env_name="TEST", run_compact="run", env=self.env,
             v2_observations={"gaps": [dict(gap), dict(gap)], "repair_plan": [{
                 "kind": "observation_data_repair", "day_utc": "2026-06-08", "connector_id": 6,
                 "pollutant_code": "pm25",
@@ -832,7 +832,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 run_state=run_state,
                 conn=self.conn,
                 run_id=1,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 v2_observations={"repair_plan": []},
@@ -874,7 +874,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         run_state = MODULE.create_run_overlay(
             tmp_dir=self.root / "tmp",
             run_id="canonical-aqi-bridge",
-            environment="CIC-Test",
+            environment="TEST",
             base_dropbox_root=self.root / "R2_history_backup",
         )
         gaps = []
@@ -939,7 +939,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 run_state=run_state,
                 conn=self.conn,
                 run_id=281,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 v2_observations={"repair_plan": []},
@@ -967,7 +967,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
             run_id=1,
-            env_name="CIC-Test",
+            env_name="TEST",
             run_compact="run",
             env=self.env,
             v2_observations={"gaps": [
@@ -1047,7 +1047,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             repair_metrics = MODULE.run_v2_gap_backfills(
                 conn=conn,
                 run_id=218,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 v2_observations=result,
@@ -1121,7 +1121,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         try:
             source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
                 non_empty_conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 source_scope=base_scope,
                 day_utc="2026-06-18",
                 connector_id=1,
@@ -1138,7 +1138,7 @@ class V2RepairExecutionTests(unittest.TestCase):
 
         source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
             None,
-            env_name="CIC-Test",
+            env_name="TEST",
             source_scope=base_scope,
             day_utc="2026-06-19",
             connector_id=1,
@@ -1156,7 +1156,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         try:
             source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
                 counts_unavailable_conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 source_scope=base_scope,
                 day_utc="2026-06-23",
                 connector_id=1,
@@ -1181,7 +1181,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             with mock.patch.object(MODULE, "_source_keys_for_scope", return_value=()):
                 source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
                     scope_conn,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     source_scope=base_scope,
                     day_utc="2026-06-20",
                     connector_id=1,
@@ -1209,7 +1209,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metadata_conn.commit()
             source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
                 metadata_conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 source_scope=base_scope,
                 day_utc="2026-06-21",
                 connector_id=1,
@@ -1234,7 +1234,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         try:
             source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
                 pollutant_conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 source_scope=base_scope,
                 day_utc="2026-06-22",
                 connector_id=1,
@@ -1283,7 +1283,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 from_day="2026-06-18",
                 to_day="2026-06-18",
                 conn=None,
-                env_name="CIC-Test",
+                env_name="TEST",
                 allowed_connector_ids={1},
                 source_scope={"source": "sos", "connector_ids": [1], "scope": "source"},
                 log=self.log,
@@ -1411,7 +1411,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_v2_gap_backfills(
                 conn=self.conn,
                 run_id=2,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -1446,7 +1446,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=30,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [gap]},
@@ -1484,7 +1484,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=31,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [gap]},
@@ -1539,7 +1539,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 obs_metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=1310,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -1551,7 +1551,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 aqi_metrics = MODULE.run_aqi_rebuild_queue_execution(
                     conn,
                     run_id=1310,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     dry_run=False,
@@ -1592,7 +1592,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=131,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [gap]},
@@ -1632,7 +1632,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=32,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [gap]},
@@ -1717,7 +1717,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=33,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -1764,7 +1764,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=133,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -1811,7 +1811,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=134,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -1870,7 +1870,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=201,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={
@@ -1928,7 +1928,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=202,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={
@@ -1980,7 +1980,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=135,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -2024,7 +2024,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=136,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -2072,7 +2072,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=203,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -2112,7 +2112,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=137,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -2152,7 +2152,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=34,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -2184,7 +2184,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 metrics = MODULE.run_v2_gap_backfills(
                     conn=conn,
                     run_id=35,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     run_compact="run",
                     env=self.env,
                     v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
@@ -2291,7 +2291,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             connector_ids=[connector_id],
             output_scope="observations_only",
             history_version="v2",
-            env_name="CIC-Test",
+            env_name="TEST",
             complete_connector_day=True,
             repair_pollutants=scopes[(day_utc, connector_id)],
         )
@@ -2430,7 +2430,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         ):
             metrics = MODULE.run_v2_observation_content_hash_checks(
                 conn=self.conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="focused",
                 env=self.env,
                 v2_observations=observations,
@@ -2553,7 +2553,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 from_day=day_utc,
                 to_day=day_utc,
                 conn=self.conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 allowed_connector_ids={connector_id},
                 source_scope={
                     "source": "sos",
@@ -2609,7 +2609,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             connector_ids=[connector_id],
             output_scope="observations_only",
             history_version="v2",
-            env_name="CIC-Test",
+            env_name="TEST",
             complete_connector_day=True,
             repair_pollutants=scopes[(day_utc, connector_id)],
         )
@@ -2665,8 +2665,8 @@ class V2RepairExecutionTests(unittest.TestCase):
 
         current_state = MODULE.run_current_state_reconciliation(
             conn=self.conn,
-            env_name="CIC-Test",
-            integrity_run_id="CIC-Test:focused-missing-connector",
+            env_name="TEST",
+            integrity_run_id="TEST:focused-missing-connector",
             env={
                 "UK_AQ_INTEGRITY_CURRENT_STATE_RECONCILIATION_ENABLED": "true",
             },
@@ -2726,7 +2726,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
             run_id=4,
-            env_name="CIC-Test",
+            env_name="TEST",
             run_compact="run",
             env=self.env,
             v2_observations=observations,
@@ -2774,7 +2774,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
             run_id=3,
-            env_name="CIC-Test",
+            env_name="TEST",
             run_compact="run",
             env=self.env,
             v2_observations={"gaps": [{
@@ -2884,7 +2884,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             }), mock.patch.object(MODULE, "_http_get_to_file") as http_get:
                 result = MODULE._check_one_openaq_file(
                     conn,
-                    "CIC-Test",
+                    "TEST",
                     "https://example.test",
                     "42",
                     MODULE.dt.date(2026, 6, 8),
@@ -2917,7 +2917,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                  mock.patch.object(MODULE, "_openaq_parse_per_timeseries_counts", return_value={}):
                 result = MODULE._check_one_openaq_file(
                     conn,
-                    "CIC-Test",
+                    "TEST",
                     "https://example.test",
                     "42",
                     MODULE.dt.date(2026, 6, 8),
@@ -2957,7 +2957,7 @@ class V2RepairExecutionTests(unittest.TestCase):
              mock.patch.object(MODULE, "SingleLineProgress", DummyProgress):
             metrics = MODULE.check_openaq(
                 conn=self.conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 env=self.env,
                 from_day="2026-06-08",
                 to_day="2026-06-08",
@@ -2997,7 +2997,7 @@ class V2RepairExecutionTests(unittest.TestCase):
              mock.patch.object(MODULE, "SingleLineProgress", DummyProgress):
             metrics = MODULE.check_sensor_community(
                 conn=self.conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 env=self.env,
                 from_day="2026-06-08",
                 to_day="2026-06-08",
@@ -3035,7 +3035,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=20,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 dry_run=False,
@@ -3063,7 +3063,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=25,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 dry_run=False,
@@ -3100,7 +3100,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=26,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 dry_run=False,
@@ -3133,7 +3133,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=27,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 dry_run=False,
@@ -3148,7 +3148,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(metrics["aqi_rebuild_results"][0]["post_rebuild_validation_gaps"], [])
 
     def test_v2_aqi_post_rebuild_validation_resolves_dropbox_root_and_dir_without_absolute_root(self) -> None:
-        backup_root = self.root / "dropbox-app" / "CIC-Test" / "R2_history_backup"
+        backup_root = self.root / "dropbox-app" / "TEST" / "R2_history_backup"
         self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"] = str(backup_root)
         self._insert_aqi_queue_row(run_id=2701, connector_id=6)
         self._write_v2_observation_partition(
@@ -3170,7 +3170,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         with mock.patch.object(MODULE, "DROPBOX_APP_ROOT", self.root / "dropbox-app"), \
              mock.patch.dict(os.environ, {
                  "UK_AQ_R2_HISTORY_DROPBOX_ROOT": "",
-                 "UK_AQ_DROPBOX_ROOT": "CIC-Test",
+                 "UK_AQ_DROPBOX_ROOT": "TEST",
                  "UK_AQ_R2_HISTORY_DROPBOX_DIR": "R2_history_backup",
              }, clear=False), \
              mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")), \
@@ -3178,7 +3178,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=2701,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=execution_env,
                 dry_run=False,
@@ -3206,7 +3206,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
                 conn=self.conn,
                 run_id=28,
-                env_name="CIC-Test",
+                env_name="TEST",
                 env=self.env,
                 v2_aqilevels=v2_aqi,
                 dry_run=True,
@@ -3248,7 +3248,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
                 conn=self.conn,
                 run_id=280,
-                env_name="CIC-Test",
+                env_name="TEST",
                 env=self.env,
                 v2_aqilevels={"gaps": gaps},
                 dry_run=True,
@@ -3290,7 +3290,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             queue_metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
                 conn=self.conn,
                 run_id=29,
-                env_name="CIC-Test",
+                env_name="TEST",
                 env=self.env,
                 v2_aqilevels=v2_aqi,
                 dry_run=False,
@@ -3300,7 +3300,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             exec_metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=29,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 dry_run=False,
@@ -3330,7 +3330,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=30,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 dry_run=False,
@@ -3367,7 +3367,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
                 conn=self.conn,
                 run_id=31,
-                env_name="CIC-Test",
+                env_name="TEST",
                 env=self.env,
                 v2_aqilevels=v2_aqi,
                 dry_run=False,
@@ -3393,7 +3393,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
             conn=self.conn,
             run_id=32,
-            env_name="CIC-Test",
+            env_name="TEST",
             env=self.env,
             v2_aqilevels=v2_aqi,
             dry_run=False,
@@ -3420,7 +3420,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
             conn=self.conn,
             run_id=34,
-            env_name="CIC-Test",
+            env_name="TEST",
             env=self.env,
             v2_aqilevels=v2_aqi,
             dry_run=False,
@@ -3466,7 +3466,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
                 conn=self.conn,
                 run_id=33,
-                env_name="CIC-Test",
+                env_name="TEST",
                 env=self.env,
                 v2_aqilevels=v2_aqi,
                 dry_run=True,
@@ -3485,7 +3485,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=21,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 dry_run=True,
@@ -3523,7 +3523,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=22,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 dry_run=False,
@@ -3542,7 +3542,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics = MODULE.run_aqi_rebuild_queue_execution(
                 self.conn,
                 run_id=24,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 dry_run=True,
@@ -3654,7 +3654,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             run_state = MODULE.create_run_overlay(
                 tmp_dir=root / "tmp",
                 run_id="direct-matching-baseline",
-                environment="CIC-Test",
+                environment="TEST",
                 base_dropbox_root=dropbox,
             )
             env = {
@@ -3799,7 +3799,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                     metrics = MODULE.run_v2_gap_backfills(
                         conn=conn,
                         run_id=1,
-                        env_name="CIC-Test",
+                        env_name="TEST",
                         run_compact="run",
                         env=env,
                         v2_observations={
@@ -3919,7 +3919,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             run_state = MODULE.create_run_overlay(
                 tmp_dir=root / "tmp",
                 run_id="direct-two-pollutants",
-                environment="CIC-Test",
+                environment="TEST",
                 base_dropbox_root=dropbox,
             )
             env = {
@@ -4075,7 +4075,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                     metrics = MODULE.run_v2_gap_backfills(
                         conn=conn,
                         run_id=1,
-                        env_name="CIC-Test",
+                        env_name="TEST",
                         run_compact="run",
                         env=env,
                         v2_observations={"gap_count": 0, "gaps": []},
@@ -4174,7 +4174,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                     from_day=day_utc,
                     to_day=day_utc,
                     conn=None,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     allowed_connector_ids={1},
                     source_scope={"source": "sos", "connector_ids": [1]},
                     dedicated_sos_historical_replacement=True,
@@ -4267,7 +4267,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                     from_day=day_utc,
                     to_day=day_utc,
                     conn=None,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     allowed_connector_ids={1},
                     source_scope={"source": "sos", "connector_ids": [1]},
                     dedicated_sos_historical_replacement=True,
@@ -4291,7 +4291,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             run_state = MODULE.create_run_overlay(
                 tmp_dir=root,
                 run_id="dedicated-sos",
-                environment="CIC-Test",
+                environment="TEST",
                 base_dropbox_root=root / "dropbox",
             )
             conn = sqlite3.connect(":memory:")
@@ -4356,7 +4356,7 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                         run_state=run_state,
                         conn=conn,
                         run_id=1,
-                        env_name="CIC-Test",
+                        env_name="TEST",
                         run_compact="run",
                         env={"UK_AQ_INTEGRITY_CURRENT_STATE_RECONCILIATION_ENABLED": "false"},
                         v2_observations={"repair_plan": []},
@@ -4422,7 +4422,7 @@ class ProposalRunStateTransitionTests(unittest.TestCase):
         run_state = MODULE.create_run_overlay(
             tmp_dir=self.root / "tmp",
             run_id="unchanged-complete-day",
-            environment="CIC-Test",
+            environment="TEST",
             base_dropbox_root=dropbox,
         )
         day_utc = "2025-01-07"
@@ -4554,7 +4554,7 @@ class ProposalRunStateTransitionTests(unittest.TestCase):
         run_state = MODULE.create_run_overlay(
             tmp_dir=self.root / "tmp",
             run_id="proposal-transition",
-            environment="CIC-Test",
+            environment="TEST",
             base_dropbox_root=dropbox,
         )
         day_utc = "2026-06-17"
@@ -5059,7 +5059,7 @@ class FailedFinalWriteSetBundleRegressionTests(unittest.TestCase):
             run_state = MODULE.create_run_overlay(
                 tmp_dir=root / "runs",
                 run_id="failed-bundle-final-write-set-replay",
-                environment="CIC-Test",
+                environment="TEST",
                 base_dropbox_root=dropbox,
             )
             replay_unchanged = {
@@ -6000,7 +6000,7 @@ class ApplyPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(result["untouched_later_selected_days"], ["2026-07-30"])
         report = MODULE.format_summary_md({
-            "env": "CIC-Test",
+            "env": "TEST",
             "profile": "manual",
             "started_at_utc": "2026-08-01T00:00:00Z",
             "status": "failed",
@@ -6122,7 +6122,7 @@ class ConnectorObservationTotalsTests(unittest.TestCase):
         )
 
         markdown = MODULE.format_summary_md({
-            "env": "CIC-Test",
+            "env": "TEST",
             "profile": "manual",
             "started_at_utc": "2026-07-01T00:00:00Z",
             "finished_at_utc": "2026-07-01T00:01:00Z",

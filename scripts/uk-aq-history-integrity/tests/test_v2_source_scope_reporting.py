@@ -16,7 +16,7 @@ SPEC.loader.exec_module(MODULE)
 class V2SourceScopeReportingTests(unittest.TestCase):
     def test_markdown_includes_source_scope_line(self) -> None:
         summary = {
-            "env": "CIC-Test",
+            "env": "TEST",
             "profile": "manual",
             "started_at_utc": "2026-06-20T00:00:00Z",
             "finished_at_utc": "2026-06-20T00:01:00Z",

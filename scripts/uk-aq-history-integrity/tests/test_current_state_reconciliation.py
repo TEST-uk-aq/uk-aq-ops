@@ -35,7 +35,7 @@ class CurrentStateReconciliationTests(unittest.TestCase):
             """INSERT INTO integrity_runs (
                  started_at_utc, env_name, profile, source_filter, from_day,
                  to_day, status, r2_history_status
-               ) VALUES ('2026-07-29T00:00:00Z', 'CIC-Test', 'manual', 'sos',
+               ) VALUES ('2026-07-29T00:00:00Z', 'TEST', 'manual', 'sos',
                          '2026-07-29', '2026-07-29', 'fail', 'ok')"""
         )
         self.run_id = int(cursor.lastrowid)
@@ -56,7 +56,7 @@ class CurrentStateReconciliationTests(unittest.TestCase):
                  source_file_identities_sha256, source_evidence_input_sha256,
                  canonical_rows_sha256, canonical_rows_bytes, evidence_sha256,
                  evidence_json, canonical_rows_json, created_at_utc
-               ) VALUES ('CIC-Test', '2026-07-29', 1, 'sos', ?, ?, ?, ?, ?,
+               ) VALUES ('TEST', '2026-07-29', 1, 'sos', ?, ?, ?, ?, ?,
                          '{}', ?, '2026-07-29T00:01:00Z')""",
             (
                 evidence_identity,
@@ -202,7 +202,7 @@ class CurrentStateReconciliationTests(unittest.TestCase):
         ):
             with self.subTest(option=option), redirect_stderr(StringIO()) as stderr:
                 with self.assertRaises(SystemExit) as raised:
-                    MODULE.parse_args(["--env", "CIC-Test", option, value])
+                    MODULE.parse_args(["--env", "TEST", option, value])
             self.assertEqual(raised.exception.code, 2)
             self.assertIn("unrecognized arguments", stderr.getvalue())
 
@@ -237,8 +237,8 @@ class CurrentStateReconciliationTests(unittest.TestCase):
         ):
             result = MODULE.run_current_state_reconciliation(
                 conn=self.conn,
-                env_name="CIC-Test",
-                integrity_run_id=f"CIC-Test:{self.run_id}",
+                env_name="TEST",
+                integrity_run_id=f"TEST:{self.run_id}",
                 env=env,
                 scope_entries=[{"day_utc": "2026-07-29", "connector_id": 1}],
                 dry_run=False,
@@ -286,7 +286,7 @@ class CurrentStateReconciliationTests(unittest.TestCase):
         self.assertEqual(attempts[0][3], "expired credential")
 
         markdown = MODULE.format_summary_md({
-            "env": "CIC-Test",
+            "env": "TEST",
             "profile": "manual",
             "source": "sos",
             "started_at_utc": "2026-07-29T00:00:00Z",
@@ -416,8 +416,8 @@ class CurrentStateReconciliationTests(unittest.TestCase):
         ):
             result = MODULE.run_current_state_reconciliation(
                 conn=self.conn,
-                env_name="CIC-Test",
-                integrity_run_id=f"CIC-Test:{self.run_id}",
+                env_name="TEST",
+                integrity_run_id=f"TEST:{self.run_id}",
                 env=env,
                 scope_entries=[],
                 dedicated_partition_entries=entries,

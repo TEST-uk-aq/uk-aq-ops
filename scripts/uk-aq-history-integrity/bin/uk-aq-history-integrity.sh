@@ -7,10 +7,10 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  uk-aq-history-integrity.sh --env CIC-Test|LIVE [options]
+  uk-aq-history-integrity.sh --env TEST|LIVE [options]
 
 This deployed dispatcher reads only:
-  /Users/mikehinford/uk-aq-history-integrity/env/CIC-Test.env
+  /Users/mikehinford/uk-aq-history-integrity/env/TEST.env
   /Users/mikehinford/uk-aq-history-integrity/env/LIVE.env
 
 Each selector file contains only UK_AQ_OPS_REPO_ROOT. The selected repository
@@ -54,7 +54,7 @@ ENV_NAME=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env)
-      [[ $# -ge 2 ]] || error "--env requires CIC-Test or LIVE"
+      [[ $# -ge 2 ]] || error "--env requires TEST or LIVE"
       [[ -z "${ENV_NAME}" ]] || error "--env supplied more than once"
       ENV_NAME="$2"
       shift 2
@@ -74,7 +74,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "${ENV_NAME}" == "CIC-Test" || "${ENV_NAME}" == "LIVE" ]] || error "--env must be CIC-Test or LIVE"
+[[ "${ENV_NAME}" == "TEST" || "${ENV_NAME}" == "LIVE" ]] || error "--env must be TEST or LIVE"
 SELECTOR_FILE="${LOCAL_ROOT}/env/${ENV_NAME}.env"
 [[ -f "${SELECTOR_FILE}" && -r "${SELECTOR_FILE}" ]] || error "selector file not found: ${SELECTOR_FILE}"
 

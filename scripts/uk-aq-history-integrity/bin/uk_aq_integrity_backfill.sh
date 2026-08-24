@@ -7,7 +7,7 @@ Usage:
   uk_aq_integrity_backfill.sh [options]
 
 Required:
-  --env CIC-Test|LIVE
+  --env TEST|LIVE
   --from-day YYYY-MM-DD
   --to-day YYYY-MM-DD
 
@@ -31,9 +31,9 @@ Optional:
 
 Notes:
   - Derives the repository root from this script's own location.
-  - Loads that repository's root .env; --env CIC-Test|LIVE is authoritative.
+  - Loads that repository's root .env; --env TEST|LIVE is authoritative.
   - Reasserts UK_AQ_ENV_NAME and reads UK_AQ_BACKFILL_WRAPPER from the root .env.
-  - Never reads the local CIC-Test.env or LIVE.env selector files.
+  - Never reads the local TEST.env or LIVE.env selector files.
   - Preserves observation-only and AQI-only modes.
   - Complete connector-day Integrity repairs require an explicit selected
     pollutant set and resolve its exact active timeseries IDs from Integrity SQLite.
@@ -376,9 +376,9 @@ if [[ -z "${ENV_NAME}" ]]; then
   exit 2
 fi
 case "${ENV_NAME}" in
-  CIC-Test|LIVE) ;;
+  TEST|LIVE) ;;
   *)
-    echo "ERROR: --env must be CIC-Test or LIVE (got '${ENV_NAME}')." >&2
+    echo "ERROR: --env must be TEST or LIVE (got '${ENV_NAME}')." >&2
     exit 2
     ;;
 esac
@@ -507,7 +507,7 @@ if [[ "$(trim "${UK_AQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
 fi
 
 if [[ "${ENV_NAME}" == "LIVE" ]]; then
-  OTHER_ENV="CIC-Test"
+  OTHER_ENV="TEST"
 else
   OTHER_ENV="LIVE"
 fi

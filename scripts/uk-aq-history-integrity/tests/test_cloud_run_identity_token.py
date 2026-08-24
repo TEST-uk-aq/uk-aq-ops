@@ -195,7 +195,7 @@ class CloudRunIdentityTokenTests(unittest.TestCase):
                 audience=settings[
                     "UK_AQ_INTEGRITY_LATEST_SNAPSHOT_RECONCILE_AUDIENCE"
                 ],
-                body={"schema_version": 1, "integrity_run_id": "CIC-Test:1", "candidates": []},
+                body={"schema_version": 1, "integrity_run_id": "TEST:1", "candidates": []},
                 timeout_seconds=30,
                 settings=settings,
             )

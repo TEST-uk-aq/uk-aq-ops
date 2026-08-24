@@ -17,7 +17,7 @@ DROPBOX_APPS_ROOT = Path(
     "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks"
 )
 
-ALLOWED_ENVIRONMENTS = ("CIC-Test", "LIVE")
+ALLOWED_ENVIRONMENTS = ("TEST", "LIVE")
 DIAGNOSTIC_SUFFIXES = {".log", ".txt", ".json", ".jsonl", ".csv", ".md"}
 SENSITIVE_NAME_PARTS = (
     "secret",

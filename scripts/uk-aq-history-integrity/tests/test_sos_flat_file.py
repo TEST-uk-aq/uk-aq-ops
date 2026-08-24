@@ -107,7 +107,7 @@ class SosFlatFileTests(unittest.TestCase):
             source_key=MODULE.SOS_SOURCE_KEY,
             remote_scheme="uk_air_flat_file",
             source_file_key=source_file_key,
-            env_name="CIC-Test",
+            env_name="TEST",
             remote_url_or_key="https://example.test/EA8_2026.csv",
             station_ref="EA8",
             source_location_id="EA8",
@@ -173,7 +173,7 @@ class SosFlatFileTests(unittest.TestCase):
         ):
             result = MODULE._check_one_sos_uk_air_flat_file(
                 conn=conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
                 site_ref="EA8",
                 year=2026,
@@ -229,7 +229,7 @@ class SosFlatFileTests(unittest.TestCase):
             mappings = self._flat_file_grouped_mappings()["EA8"]["pm10"]
             with mock.patch.object(MODULE, "_fetch_uk_air_flat_file_mapping_rows", return_value=mappings) as fetch:
                 MODULE.check_sos_flat_files(
-                    conn, "CIC-Test", env, "2026-05-17", "2026-05-17",
+                    conn, "TEST", env, "2026-05-17", "2026-05-17",
                     dry_run=True, run_backfill=False,
                     limits=MODULE.LimitTracker(None, None, MODULE.time.monotonic()),
                     log=logging.getLogger("test-complete-year-window"),
@@ -257,7 +257,7 @@ class SosFlatFileTests(unittest.TestCase):
                 "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
             }), mock.patch.object(MODULE, "_http_get_to_file", side_effect=lambda _url, dest: (dest.parent.mkdir(parents=True, exist_ok=True), dest.write_bytes(csv_path.read_bytes()))[1]):
                 result = MODULE._check_one_sos_uk_air_flat_file(
-                    conn, "CIC-Test", "https://example.test", "EA8", 2026,
+                    conn, "TEST", "https://example.test", "EA8", 2026,
                     mappings, ("pm10",), root / "cache", "all",
                     requested_from_day="2026-05-17", requested_to_day="2026-05-17",
                     log=logging.getLogger("test-out-window"),
@@ -287,7 +287,7 @@ class SosFlatFileTests(unittest.TestCase):
                 "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
             }), mock.patch.object(MODULE, "_http_get_to_file", side_effect=lambda _url, dest: (dest.parent.mkdir(parents=True, exist_ok=True), dest.write_bytes(csv_path.read_bytes()))[1]):
                 result = MODULE._check_one_sos_uk_air_flat_file(
-                    conn, "CIC-Test", "https://example.test", "EA8", 2026,
+                    conn, "TEST", "https://example.test", "EA8", 2026,
                     mappings, ("pm10",), root / "cache", "all",
                     log=logging.getLogger("test-target-window"),
                     requested_from_day="2026-05-18", requested_to_day="2026-05-18",
@@ -424,7 +424,7 @@ class SosFlatFileTests(unittest.TestCase):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    98, "CIC-Test", 1, "2026-05-17", 1001,
+                    98, "TEST", 1, "2026-05-17", 1001,
                     24, 23, 1, "mismatch", "2026-05-18T00:00:00Z", None,
                 ),
             )
@@ -777,7 +777,7 @@ class SosFlatFileTests(unittest.TestCase):
             ):
                 result = MODULE.check_sos_flat_files(
                     conn=conn,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     env=env,
                     from_day="2026-05-17",
                     to_day="2026-05-17",
@@ -1053,7 +1053,7 @@ class SosFlatFileTests(unittest.TestCase):
             ) as http_get:
                 result = MODULE._check_one_sos_uk_air_flat_file(
                     conn=conn,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
                     site_ref="EA8",
                     year=2026,
@@ -1130,7 +1130,7 @@ class SosFlatFileTests(unittest.TestCase):
             ) as http_get:
                 result = MODULE._check_one_sos_uk_air_flat_file(
                     conn=conn,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
                     site_ref="EA8",
                     year=2026,
@@ -1202,7 +1202,7 @@ class SosFlatFileTests(unittest.TestCase):
             ) as http_get:
                 result = MODULE._check_one_sos_uk_air_flat_file(
                     conn=conn,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
                     site_ref="EA8",
                     year=2026,
@@ -1260,7 +1260,7 @@ class SosFlatFileTests(unittest.TestCase):
             ):
                 result = MODULE._check_one_sos_uk_air_flat_file(
                     conn=conn,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
                     site_ref="EA8",
                     year=2026,

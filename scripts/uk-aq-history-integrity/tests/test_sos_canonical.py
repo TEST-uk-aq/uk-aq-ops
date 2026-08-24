@@ -217,7 +217,7 @@ class SosCanonicalTests(unittest.TestCase):
             metrics = MODULE.run_cross_check_backfills(
                 conn=conn,
                 run_id=1,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="20260518T000000Z",
                 env={
                     "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
@@ -245,7 +245,7 @@ class SosCanonicalTests(unittest.TestCase):
             metrics = MODULE.run_cross_check_backfills(
                 conn=conn,
                 run_id=1,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="20260518T000000Z",
                 env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp},
                 source_filter="sos",
@@ -282,7 +282,7 @@ class SosCanonicalTests(unittest.TestCase):
             metrics = MODULE.run_cross_check_backfills(
                 conn=conn,
                 run_id=1,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="20260518T000000Z",
                 env={
                     "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
@@ -330,8 +330,8 @@ class SosCanonicalTests(unittest.TestCase):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                (1, "CIC-Test", 6, "2026-05-11", 101, 10, 9, 1, "mismatch", "2026-05-18T00:00:00Z", None),
-                (1, "CIC-Test", 6, "2026-05-11", 102, 3, None, 3, "source_only", "2026-05-18T00:00:00Z", None),
+                (1, "TEST", 6, "2026-05-11", 101, 10, 9, 1, "mismatch", "2026-05-18T00:00:00Z", None),
+                (1, "TEST", 6, "2026-05-11", 102, 3, None, 3, "source_only", "2026-05-18T00:00:00Z", None),
             ],
         )
         MODULE._upsert_source_state(
@@ -339,7 +339,7 @@ class SosCanonicalTests(unittest.TestCase):
             source_key=MODULE.SOS_SOURCE_KEY,
             remote_scheme=MODULE.SOS_REMOTE_SCHEME,
             source_file_key="sos:test-source-evidence:2026-05-11",
-            env_name="CIC-Test",
+            env_name="TEST",
             remote_url_or_key="https://example.test/sos",
             station_ref="station-1",
             source_location_id="station-1",
@@ -368,7 +368,7 @@ class SosCanonicalTests(unittest.TestCase):
             metrics = MODULE.run_cross_check_backfills(
                 conn=conn,
                 run_id=1,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="20260518T000000Z",
                 env={
                     "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
@@ -410,7 +410,7 @@ class SosCanonicalTests(unittest.TestCase):
             }
             result = MODULE._check_one_sos_station_day(
                 conn=conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 base_url="https://example.test",
                 station_ref="station-1",
                 bindings=[{"timeseries_id": 101, "timeseries_ref": "ts-101"}],
@@ -451,7 +451,7 @@ class SosCanonicalTests(unittest.TestCase):
                 }
                 result = MODULE._check_one_sos_station_day(
                     conn=conn,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     base_url="https://example.test",
                     station_ref="station-1",
                     bindings=[{"timeseries_id": 101, "timeseries_ref": "ts-101"}],
@@ -494,7 +494,7 @@ class SosCanonicalTests(unittest.TestCase):
             }
             MODULE._check_one_sos_station_day(
                 conn=conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 base_url="https://example.test",
                 station_ref="station-1",
                 bindings=[{"timeseries_id": 101, "timeseries_ref": "ts-101"}],
@@ -514,7 +514,7 @@ class SosCanonicalTests(unittest.TestCase):
             }
             result = MODULE._check_one_sos_station_day(
                 conn=conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 base_url="https://example.test",
                 station_ref="station-1",
                 bindings=[{"timeseries_id": 101, "timeseries_ref": "ts-101"}],
@@ -548,7 +548,7 @@ class SosCanonicalTests(unittest.TestCase):
             }
             first = MODULE._check_one_sos_station_day(
                 conn=conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 base_url="https://example.test",
                 station_ref="station-1",
                 bindings=[{"timeseries_id": 101, "timeseries_ref": "ts-101"}],
@@ -566,7 +566,7 @@ class SosCanonicalTests(unittest.TestCase):
             MODULE.build_sos_canonical_snapshot = _should_not_fetch_again
             second = MODULE._check_one_sos_station_day(
                 conn=conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 base_url="https://example.test",
                 station_ref="station-1",
                 bindings=[{"timeseries_id": 101, "timeseries_ref": "ts-101"}],

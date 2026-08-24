@@ -6,7 +6,7 @@ set -euo pipefail
 exec </dev/null
 
 INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh"
-LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/logs/integrity-run-monthly"
+LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/TEST/logs/integrity-run-monthly"
 COOL_DOWN_SECONDS=300
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -153,7 +153,7 @@ run_batch() {
   echo "Log: $LOG" | tee -a "$SUMMARY"
 
   if nice -n 10 "$INTEGRITY" \
-    --env CIC-Test \
+    --env TEST \
     --profile manual \
     --source sos \
     --from-day "$FROM_DAY" \

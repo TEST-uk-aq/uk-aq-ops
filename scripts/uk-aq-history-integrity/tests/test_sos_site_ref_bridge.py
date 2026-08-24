@@ -110,7 +110,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                exists_remote, first_seen_at_utc, last_checked_at_utc,
                last_status, source_count_mapping_identity,
                source_count_mapping_hash)
-            VALUES (?, 'CIC-Test', 'sos', 'uk_air_flat_file', ?, 'ABD9',
+            VALUES (?, 'TEST', 'sos', 'uk_air_flat_file', ?, 'ABD9',
                     'ABD9', '2026-01-01', 1, ?, ?, 'unchanged', ?, ?)
             """,
             (
@@ -166,7 +166,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                    day_utc, exists_remote, first_seen_at_utc,
                    last_checked_at_utc, last_status,
                    source_count_mapping_identity, source_count_mapping_hash)
-                VALUES (?, 'CIC-Test', 'sos', 'uk_air_flat_file', ?, ?, ?,
+                VALUES (?, 'TEST', 'sos', 'uk_air_flat_file', ?, ?, ?,
                         '2026-01-01', 1, ?, ?, 'unchanged', ?, ?)
                 """,
                 (
@@ -193,7 +193,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                   (imported_at_utc, env_name, snapshot_path,
                    snapshot_manifest_hash, rows_sos_site_ref_bridge,
                    sos_site_ref_bridge_sha256, status)
-                VALUES (?, 'CIC-Test', '/snapshot', ?, ?, ?, 'ok')
+                VALUES (?, 'TEST', '/snapshot', ?, ?, ?, 'ok')
                 """,
                 (
                     "2026-07-25T00:00:00Z",
@@ -242,7 +242,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
     def _counts(self, conn):
         return MODULE._current_source_counts_for_v2_partition(
             conn,
-            env_name="CIC-Test",
+            env_name="TEST",
             source_scope={"source": "sos"},
             day_utc=self.day_utc,
             connector_id=1,
@@ -328,7 +328,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
             conn.commit()
             counts, evidence = MODULE._current_source_counts_for_v2_partition(
                 conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 source_scope={"source": "sos"},
                 day_utc=self.day_utc,
                 connector_id=1,
@@ -436,7 +436,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
             ):
                 metrics = MODULE.check_sos_flat_files(
                     conn,
-                    "CIC-Test",
+                    "TEST",
                     {},
                     self.day_utc,
                     self.day_utc,
@@ -464,7 +464,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                 "sha256": "a" * 64,
             }]
         }
-        previous = MODULE.latest_successful_import(conn, "CIC-Test")
+        previous = MODULE.latest_successful_import(conn, "TEST")
         try:
             self.assertTrue(
                 MODULE.snapshot_tables_have_rows(conn, manifest, previous)
@@ -477,7 +477,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                 ("b" * 64,),
             )
             conn.commit()
-            changed = MODULE.latest_successful_import(conn, "CIC-Test")
+            changed = MODULE.latest_successful_import(conn, "TEST")
             self.assertFalse(
                 MODULE.snapshot_tables_have_rows(conn, manifest, changed)
             )
@@ -555,7 +555,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                   source_count_mapping_identity, source_count_mapping_hash,
                   notes
                 ) VALUES (
-                  'sos:site_ref=HG4:year=2026', 'CIC-Test', 'sos',
+                  'sos:site_ref=HG4:year=2026', 'TEST', 'sos',
                   'uk_air_flat_file', 'https://example.invalid/HG4_2026.csv',
                   'HG4', 'HG4', '2026-01-01', 1,
                   '2026-07-25T00:00:00Z', '2026-07-25T00:00:00Z',
@@ -733,7 +733,7 @@ class SosSiteRefBridgeTests(unittest.TestCase):
             sink = []
             metrics = MODULE.run_v2_observation_content_hash_checks(
                 conn=conn,
-                env_name="CIC-Test",
+                env_name="TEST",
                 run_compact="test",
                 env={},
                 v2_observations=observations,

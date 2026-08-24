@@ -42,7 +42,7 @@ class SosSqlitePersistenceTests(unittest.TestCase):
             "source_key": MODULE.SOS_SOURCE_KEY,
             "remote_scheme": "uk_air_flat_file",
             "source_file_key": source_file_key,
-            "env_name": "CIC-Test",
+            "env_name": "TEST",
             "remote_url_or_key": f"https://example.test/{site_ref}_2026.csv",
             "station_ref": site_ref,
             "source_location_id": site_ref,
@@ -129,7 +129,7 @@ class SosSqlitePersistenceTests(unittest.TestCase):
                         executor.submit(
                             MODULE._check_one_sos_uk_air_flat_file_threadsafe,
                             str(db_path),
-                            "CIC-Test",
+                            "TEST",
                             "https://example.test",
                             site_ref,
                             2026,
@@ -208,7 +208,7 @@ class SosSqlitePersistenceTests(unittest.TestCase):
                     conn=db,
                     source_key=MODULE.SOS_SOURCE_KEY,
                     event_type="changed",
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     source_file_key=source_a,
                     remote_url_or_key="https://example.test/AAA_2026.csv",
                     station_ref="AAA",
@@ -265,7 +265,7 @@ class SosSqlitePersistenceTests(unittest.TestCase):
                     conn=db,
                     source_key=MODULE.SOS_SOURCE_KEY,
                     event_type="changed",
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     source_file_key=source_a,
                     remote_url_or_key="https://example.test/AAA_2026.csv",
                     station_ref="AAA",
@@ -443,7 +443,7 @@ class SosSqlitePersistenceTests(unittest.TestCase):
             ):
                 current = MODULE._check_one_sos_uk_air_flat_file_threadsafe(
                     str(db_path),
-                    "CIC-Test",
+                    "TEST",
                     "https://example.test",
                     "MAP",
                     2026,
@@ -485,7 +485,7 @@ class SosSqlitePersistenceTests(unittest.TestCase):
             ):
                 stale = MODULE._check_one_sos_uk_air_flat_file_threadsafe(
                     str(db_path),
-                    "CIC-Test",
+                    "TEST",
                     "https://example.test",
                     "MAP",
                     2026,
@@ -567,7 +567,7 @@ class SosSqlitePersistenceTests(unittest.TestCase):
             ):
                 result = MODULE.check_sos_flat_files(
                     conn=conn,
-                    env_name="CIC-Test",
+                    env_name="TEST",
                     env=env,
                     from_day="2026-07-15",
                     to_day="2026-07-15",

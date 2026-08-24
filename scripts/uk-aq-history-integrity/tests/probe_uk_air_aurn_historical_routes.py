@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--day", default="2025-12-01", help="Target UTC day.")
     parser.add_argument(
         "--out-dir",
-        default="/Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/tmp/uk_air_aurn_probe",
+        default="/Users/mikehinford/uk-aq-history-integrity/state/TEST/tmp/uk_air_aurn_probe",
         help="Directory for downloaded HTML/CSV/Atom probe files.",
     )
     parser.add_argument(

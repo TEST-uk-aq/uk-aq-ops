@@ -36,7 +36,7 @@ def print_row(row: sqlite3.Row | None) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", choices=["CIC-Test", "LIVE"], default="CIC-Test")
+    parser.add_argument("--env", choices=["TEST", "LIVE"], default="TEST")
     parser.add_argument("--db-path", type=Path, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     list_cmd = sub.add_parser("list")
