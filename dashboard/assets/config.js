@@ -1,5 +1,5 @@
 window.UKAQ_OPS_CONFIG = {
-  "envName": "CIC-Test",
+  "envName": "TEST",
   "apiBaseUrl": "/api",
   "dashboardTitle": "UK AQ Dashboard - TEST",
   "dashboardSubtitle": "Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates from your local API.",
