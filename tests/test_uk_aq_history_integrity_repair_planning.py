@@ -72,7 +72,7 @@ class V2RepairPlanningTest(unittest.TestCase):
             run_state = integrity.create_run_overlay(
                 tmp_dir=root / "runs",
                 run_id="sos-light-test",
-                environment="CIC-Test",
+                environment="TEST",
                 base_dropbox_root=dropbox,
             )
 
@@ -158,7 +158,7 @@ class V2RepairPlanningTest(unittest.TestCase):
             run_state = integrity.create_run_overlay(
                 tmp_dir=root / "runs",
                 run_id="sos-light-absent-dropbox-day-test",
-                environment="CIC-Test",
+                environment="TEST",
                 base_dropbox_root=dropbox,
             )
 
@@ -262,7 +262,7 @@ class V2RepairPlanningTest(unittest.TestCase):
             run_state = integrity.create_run_overlay(
                 tmp_dir=root / "runs",
                 run_id="metadata-write-set-test",
-                environment="CIC-Test",
+                environment="TEST",
                 base_dropbox_root=root / "dropbox",
             )
             changed_key = (

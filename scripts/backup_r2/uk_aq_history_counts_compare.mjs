@@ -21,7 +21,7 @@ const DEFAULT_MAX_DAYS = 400;
 const DEFAULT_OBSERVATIONS_PREFIX = "history/v1/observations";
 const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
 const DEFAULT_DROPBOX_LOCAL_BACKUP_ROOT =
-  "/Users/mikehinford/Library/CloudStorage/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup";
+  "/Users/mikehinford/Library/CloudStorage/Dropbox/Apps/github-uk-air-quality-networks/TEST/R2_history_backup";
 
 function usage() {
   console.log([

@@ -20,6 +20,7 @@ function identity(input) {
 
 test("history lock identity is database-local and environment labels do not affect it", () => {
   const resource = { namespace: HISTORY_LOCK_NAMESPACES.connectorDay, dayUtc: "2026-07-26", connectorId: 7 };
+  // CIC-Test is intentional legacy-label compatibility coverage, not an active environment alias.
   assert.deepEqual(identity({ ...resource, environment: "TEST" }), identity({ ...resource, environment: "CIC-Test" }));
   assert.deepEqual(identity({ ...resource, environment: "LIVE" }), identity(resource));
   assert.notDeepEqual(identity(resource), identity({ ...resource, connectorId: 8 }));

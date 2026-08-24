@@ -119,7 +119,7 @@ function usage() {
     "",
     "Required:",
     "  --source-root <root>          Example: uk_aq_r2_test:uk-aq-history-cic-test",
-    "  --dest-root <root>            Example: uk_aq_dropbox:CIC-Test/R2_history_backup",
+    "  --dest-root <root>            Example: uk_aq_dropbox:TEST/R2_history_backup",
     "",
     "Options:",
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,

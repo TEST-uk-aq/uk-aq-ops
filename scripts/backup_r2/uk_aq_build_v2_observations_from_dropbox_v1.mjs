@@ -29,7 +29,7 @@ const DEFAULT_PART_MAX_ROWS = 500_000;
 const DEFAULT_MAX_CONNECTOR_DAYS = 0;
 
 function buildDefaultDropboxLocalBackupRoot() {
-  const dropboxRoot = String(process.env.UK_AQ_DROPBOX_ROOT || "").trim() || "CIC-Test";
+  const dropboxRoot = String(process.env.UK_AQ_DROPBOX_ROOT || "").trim() || "TEST";
   return `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/${dropboxRoot}/R2_history_backup`;
 }
 
@@ -1215,7 +1215,7 @@ async function runBuild(args) {
     dropboxRoot,
     corePrefix: args.corePrefix,
     // Use the newest available core snapshot. Core timeseries metadata is used
-    // as lookup/reference data for v2 observation partitioning, and CIC-Test only
+    // as lookup/reference data for v2 observation partitioning, and TEST only
     // has local core snapshots back to 2026-03-13. Restricting this to args.toDay
     // makes older observation rebuilds fail even though the latest core snapshot
     // has the required timeseries bindings.

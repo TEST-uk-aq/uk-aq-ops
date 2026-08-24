@@ -1283,7 +1283,7 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
     return { dedicated: false };
   }
   const audit = runState.sos_light;
-  if (!["CIC-Test", "LIVE"].includes(runState.environment)
+  if (!["TEST", "LIVE"].includes(runState.environment)
     || runState.mode !== "sos-light"
     || JSON.stringify(runState.mutation_connector_ids) !== "[1]"
     || JSON.stringify(runState.selected_mutation_connector_ids) !== "[1]"

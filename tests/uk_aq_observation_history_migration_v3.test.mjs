@@ -71,8 +71,8 @@ const SOURCE_LIMITS = Object.freeze({
   max_row_groups_per_file: 1,
 });
 const ENVIRONMENT = Object.freeze({
-  environment: "CIC-Test",
-  configuredEnvironment: "CIC-Test",
+  environment: "TEST",
+  configuredEnvironment: "TEST",
   bucket: "fixture-test-bucket",
   expectedBucket: "fixture-test-bucket",
   historyVersion: "v2",

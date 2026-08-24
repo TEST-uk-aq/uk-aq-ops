@@ -289,7 +289,7 @@ inventory without mutating Dropbox or backup checkpoints:
 ```bash
 node scripts/backup_r2/sync_history_to_dropbox.mjs \
   --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
-  --dest-root "uk_aq_dropbox:CIC-Test/R2_history_backup" \
+  --dest-root "uk_aq_dropbox:TEST/R2_history_backup" \
   --dry-run
 ```
 
@@ -332,8 +332,8 @@ uk_aq_sync_github_secrets \
 
 Apply in Supabase SQL editor:
 
-- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/ingest_db/ingest_db_ops_rpcs.sql` (ingest DB)
-- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/obs_aqi_db/uk_aq_obs_aqi_db_ops_rpcs.sql` (obs_aqidb / `uk_aq_observs`)
+- `../TEST-uk-aq-schema/schemas/ingest_db/ingest_db_ops_rpcs.sql` (ingest DB)
+- `../TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_obs_aqi_db_ops_rpcs.sql` (obs_aqidb / `uk_aq_observs`)
 
 ## Deployment workflows
 

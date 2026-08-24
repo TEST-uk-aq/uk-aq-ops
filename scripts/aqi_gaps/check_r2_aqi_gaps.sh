@@ -9,7 +9,7 @@ set -euo pipefail
 # User settings
 # ─────────────────────────────────────────────
 
-BASE_DIR="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup/history"
+BASE_DIR="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/TEST/R2_history_backup/history"
 
 TIMESERIES_ID="354"
 STATION_ID="1575"

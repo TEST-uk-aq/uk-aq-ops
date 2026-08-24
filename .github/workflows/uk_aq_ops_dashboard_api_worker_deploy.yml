@@ -50,7 +50,7 @@ jobs:
       DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY || '' }}
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET || '' }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN || '' }}
-      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'TEST' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
       UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || '_ops/checkpoints/r2_history_backup_state_v2' }}
       CLEANAIRSURB_ST_ID: ${{ vars.CLEANAIRSURB_ST_ID || '' }}

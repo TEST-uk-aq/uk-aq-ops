@@ -7,7 +7,7 @@ The script only fills observed_property_code when it can make a conservative
 match. Unmatched headings are left blank for manual completion.
 
 Default source root:
-  /Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/source-cache/sos
+  /Users/mikehinford/uk-aq-history-integrity/state/TEST/source-cache/sos
 
 Expected layout:
   site_ref=<SITE_REF>/year=<YYYY>/<SITE_REF>_<YYYY>.csv
@@ -29,7 +29,7 @@ from typing import Iterable
 
 DEFAULT_ROOT = Path(
     "/Users/mikehinford/uk-aq-history-integrity/state/"
-    "CIC-Test/source-cache/sos"
+    "TEST/source-cache/sos"
 )
 
 # Conservative mappings to known UK AQ observed_property_code values.

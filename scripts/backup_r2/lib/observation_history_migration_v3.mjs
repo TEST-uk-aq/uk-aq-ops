@@ -414,7 +414,7 @@ export function validateObservationHistoryV3MigrationEnvironment({
   const actualBucket = String(bucket || "").trim();
   const pinnedBucket = String(expectedBucket || "").trim();
   const blockers = [];
-  if (requested !== "CIC-Test") blockers.push("environment_must_be_CIC-Test");
+  if (requested !== "TEST") blockers.push("environment_must_be_TEST");
   if (configured !== requested) blockers.push("configured_environment_mismatch");
   if (!actualBucket || !pinnedBucket || actualBucket !== pinnedBucket) {
     blockers.push("r2_bucket_identity_mismatch");

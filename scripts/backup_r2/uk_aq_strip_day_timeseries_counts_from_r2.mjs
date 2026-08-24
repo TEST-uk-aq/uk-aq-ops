@@ -7,7 +7,7 @@ import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_histo
 const DEFAULT_OBSERVATIONS_PREFIX = "history/v1/observations";
 
 function buildDefaultDropboxLocalBackupRoot() {
-  const dropboxRoot = String(process.env.UK_AQ_DROPBOX_ROOT || "").trim() || "CIC-Test";
+  const dropboxRoot = String(process.env.UK_AQ_DROPBOX_ROOT || "").trim() || "TEST";
   return `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/${dropboxRoot}/R2_history_backup`;
 }
 

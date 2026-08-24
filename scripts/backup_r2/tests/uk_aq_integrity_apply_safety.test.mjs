@@ -552,7 +552,7 @@ async function observationFixture({ wrongManifest = false } = {}) {
     proposal_owner: "source_derived_observation_repair",
   };
   const runState = {
-    environment: "CIC-Test",
+    environment: "TEST",
     overlay_root: overlay,
     base_dropbox_root: dropbox,
     objects: { [partKey]: partEntry, [manifestKey]: manifestEntry },
@@ -1259,7 +1259,7 @@ test("SOS-light pollutant-scoped evidence accepts authoritative no-data", async 
     observation_content_hashes: {},
   }));
   const runState = {
-    environment: "CIC-Test",
+    environment: "TEST",
     execution_path: "sos_light",
     ...sosLightEvidence(dayUtc),
     mutation_connector_ids: [1],
@@ -1449,7 +1449,7 @@ test("publication order and dependencies prevent indexes preceding manifests", a
   };
   const indexPath = writeObject(overlay, keys[3], Buffer.from(JSON.stringify(indexPayload)));
   const indexState = {
-    environment: "CIC-Test",
+    environment: "TEST",
     base_dropbox_root: dropbox,
     overlay_root: overlay,
     objects: {
@@ -1500,7 +1500,7 @@ test("mixed changed and unchanged latest-index dependencies retain strict final 
     },
   });
   const runState = {
-    environment: "CIC-Test",
+    environment: "TEST",
     base_dropbox_root: dropbox,
     objects: {
       [changedKey]: changedEntry,

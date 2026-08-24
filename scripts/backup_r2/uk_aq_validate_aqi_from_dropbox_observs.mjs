@@ -28,7 +28,7 @@ const DEFAULT_FLOAT_TOLERANCE = 1e-9;
 const DEFAULT_BACKFILL_SCRIPT_REL = "scripts/uk_aq_backfill_local.sh";
 
 function buildDefaultDropboxLocalBackupRoot() {
-  const dropboxRoot = String(process.env.UK_AQ_DROPBOX_ROOT || "").trim() || "CIC-Test";
+  const dropboxRoot = String(process.env.UK_AQ_DROPBOX_ROOT || "").trim() || "TEST";
   return `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/${dropboxRoot}/R2_history_backup`;
 }
 

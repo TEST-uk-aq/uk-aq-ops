@@ -274,7 +274,7 @@ def resolve_backup_root(override: str) -> Path:
     if explicit:
         return Path(explicit).expanduser().resolve()
 
-    dropbox_root = clean_text(os.getenv("UK_AQ_DROPBOX_ROOT")) or "CIC-Test"
+    dropbox_root = clean_text(os.getenv("UK_AQ_DROPBOX_ROOT")) or "TEST"
     history_dir = clean_text(os.getenv("UK_AQ_R2_HISTORY_DROPBOX_DIR")) or "R2_history_backup"
     candidate = Path(dropbox_root).expanduser()
     if candidate.is_absolute():

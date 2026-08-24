@@ -23,7 +23,7 @@ import {
 } from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 const DEFAULT_SOURCE_ROOT =
-  "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup";
+  "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/TEST/R2_history_backup";
 const DEFAULT_WORK_ROOT = path.join(os.homedir(), "uk-aq-work", "aqilevels-v2-rebuild");
 const DEFAULT_R2_TARGET = "uk_aq_r2:uk-aq-history-cic-test";
 const OBS_PREFIX = "history/v2/observations";
@@ -720,7 +720,7 @@ export function validateConfig(config) {
   if (config.toDayUtc < config.fromDayUtc) throw new Error("--to-day must be >= --from-day");
   if (config.r2Target.toLowerCase().includes("live")) throw new Error("Refusing to use a LIVE R2 target");
   if (!config.r2Target.includes("uk-aq-history-cic-test")) throw new Error("Refusing non TEST R2 target");
-  if (!config.sourceRoot.includes("CIC-Test") || !config.sourceRoot.includes("R2_history_backup")) throw new Error("Refusing source root unless it is the CIC-Test R2_history_backup Dropbox directory");
+  if (!config.sourceRoot.includes("/TEST/") || !config.sourceRoot.includes("R2_history_backup")) throw new Error("Refusing source root unless it is the TEST R2_history_backup Dropbox directory");
   if (!fs.existsSync(path.join(config.sourceRoot, OBS_PREFIX))) throw new Error(`Source v2 observation backup directory does not exist: ${path.join(config.sourceRoot, OBS_PREFIX)}`);
   if (isPathInsideDropbox(config.workRoot)) throw new Error(`Refusing to use a Dropbox work directory: ${config.workRoot}`);
   if (isSameOrSubpath(config.workRoot, config.sourceRoot) || isSameOrSubpath(path.join(config.workRoot, AQI_DATA_PREFIX), config.sourceRoot)) throw new Error("Refusing to write generated AQI parquet inside the Dropbox source backup");

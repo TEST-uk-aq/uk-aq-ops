@@ -10,6 +10,7 @@ test("shared observations finaliser locks once and runs indexes before hierarchy
   let lockArgs = null;
   let hierarchyArgs = null;
 
+  // CIC-Test is an intentional legacy diagnostic label: lock identity must not depend on it.
   const result = await runCanonicalObservationsGlobalFinalizer({
     client: { query: async () => ({ rows: [] }) },
     diagnosticEnvironment: "CIC-Test",

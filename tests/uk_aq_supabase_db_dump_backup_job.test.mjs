@@ -26,7 +26,7 @@ function successfulReport() {
     requested_databases: ["ingestdb", "obs_aqidb"],
     started_at: "2026-07-04T00:55:00.000Z",
     finished_at: "2026-07-04T01:10:47.000Z",
-    dropbox_backup_root: "/CIC-Test/Supabase_Backup_db_dump",
+    dropbox_backup_root: "/TEST/Supabase_Backup_db_dump",
     error: null,
     databases: [
       {

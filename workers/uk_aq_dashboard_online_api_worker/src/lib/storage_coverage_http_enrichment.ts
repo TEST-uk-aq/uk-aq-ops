@@ -171,7 +171,7 @@ function hierarchicalStateRootRelativePath(env: WorkerEnv): string {
 }
 
 function joinDropboxPath(env: WorkerEnv, relativePath: string): string {
-  const root = String(env.UK_AQ_DROPBOX_ROOT || "CIC-Test").trim().replace(/^\/+|\/+$/g, "");
+  const root = String(env.UK_AQ_DROPBOX_ROOT || "TEST").trim().replace(/^\/+|\/+$/g, "");
   const historyDir = String(env.UK_AQ_R2_HISTORY_DROPBOX_DIR || "R2_history_backup").trim().replace(/^\/+|\/+$/g, "");
   const relative = normaliseRelativeKey(relativePath);
   return `/${[root, historyDir, relative].filter(Boolean).join("/")}`;

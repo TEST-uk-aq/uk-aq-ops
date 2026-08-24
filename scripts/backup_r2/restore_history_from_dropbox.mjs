@@ -31,7 +31,7 @@ function usage() {
       "    --dest-root <rclone-r2-root> [options]",
       "",
       "Required:",
-      "  --source-root   Example: uk_aq_dropbox:CIC-Test/R2_history_backup",
+      "  --source-root   Example: uk_aq_dropbox:TEST/R2_history_backup",
       "  --dest-root     Example: uk_aq_r2:uk-aq-history-cic-test",
       "",
       "Optional:",

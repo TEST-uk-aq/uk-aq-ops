@@ -2,7 +2,7 @@
 """Dispatch UK AQ WHO 2021 GitHub Actions runs one month at a time.
 
 The repository is read from UK_AQ_GITHUB_REPO, normally supplied by the
-currently sourced CIC-Test or LIVE environment.
+currently sourced TEST or LIVE environment.
 """
 
 from __future__ import annotations
@@ -489,7 +489,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         repo = args.repo or os.environ.get("UK_AQ_GITHUB_REPO")
         if not repo:
             raise RunnerError(
-                "UK_AQ_GITHUB_REPO is not set. Source the CIC-Test or LIVE "
+                "UK_AQ_GITHUB_REPO is not set. Source the TEST or LIVE "
                 "environment, or supply --repo OWNER/REPO."
             )
         if not re.fullmatch(r"[^/\s]+/[^/\s]+", repo):

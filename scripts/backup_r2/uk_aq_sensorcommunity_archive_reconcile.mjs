@@ -11,7 +11,7 @@ const DEFAULT_ARCHIVE_BASE_URL = (
   "https://archive.sensor.community"
 ).trim().replace(/\/+$/, "");
 const DEFAULT_DROPBOX_LOCAL_BACKUP_ROOT =
-  "/Users/mikehinford/Library/CloudStorage/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup";
+  "/Users/mikehinford/Library/CloudStorage/Dropbox/Apps/github-uk-air-quality-networks/TEST/R2_history_backup";
 const DEFAULT_MIRROR_ROOT = String(
   process.env.UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT || "",
 ).trim();
@@ -48,7 +48,7 @@ function usage() {
     "  --day <YYYY-MM-DD>          Required UTC day to reconcile",
     "  --core-day <YYYY-MM-DD>     Core snapshot day to use (default: latest local core day)",
     "  --dropbox-root <path>       Local R2 history Dropbox root",
-    "                              (default: auto detect, usually CIC-Test/R2_history_backup)",
+    "                              (default: auto detect, usually TEST/R2_history_backup)",
     "  --mirror-root <path>        Optional local Sensor.Community raw mirror root",
     "                              (path layout: day_utc=YYYY-MM-DD/<archive file>)",
     "  --archive-base-url <url>    Sensor.Community archive base URL",

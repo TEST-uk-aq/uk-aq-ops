@@ -56,9 +56,11 @@ jobs:
 
           target_env="$(printf '%s' "${UK_AQ_DB_R2_METRICS_TARGET_ENV}" | tr '[:upper:]' '[:lower:]')"
           worker_name_lc="$(printf '%s' "${UK_AQ_DB_R2_METRICS_API_WORKER_NAME}" | tr '[:upper:]' '[:lower:]')"
-          if [ "${target_env}" = "test" ] || [ "${target_env}" = "cic-test" ]; then
+          if [ "${target_env}" = "test" ]; then
+            # TEST is the formal environment. The already-provisioned Worker may
+            # legitimately retain a cic-test marker in its resource name.
             if [[ "${worker_name_lc}" != *"test"* ]] && [[ "${worker_name_lc}" != *"cic-test"* ]]; then
-              echo "Refusing deploy: target env '${target_env}' requires worker name containing 'test' (current: ${UK_AQ_DB_R2_METRICS_API_WORKER_NAME})."
+              echo "Refusing deploy: target env 'TEST' requires the existing TEST Worker resource name (current: ${UK_AQ_DB_R2_METRICS_API_WORKER_NAME})."
               exit 1
             fi
           fi

@@ -97,7 +97,7 @@ OBS_AQIDB_SECRET_KEY = str(os.getenv("OBS_AQIDB_SECRET_KEY") or "").strip()
 PUBLIC_SCHEMA = os.getenv("UK_AQ_PUBLIC_SCHEMA", "uk_aq_public")
 OPS_SCHEMA = os.getenv("UK_AQ_OPS_SCHEMA", "uk_aq_ops")
 R2_BACKUP_WINDOW_RPC = os.getenv("UK_AQ_R2_HISTORY_WINDOW_RPC", "uk_aq_rpc_r2_history_window")
-UK_AQ_DROPBOX_ROOT = str(os.getenv("UK_AQ_DROPBOX_ROOT") or "CIC-Test").strip()
+UK_AQ_DROPBOX_ROOT = str(os.getenv("UK_AQ_DROPBOX_ROOT") or "TEST").strip()
 UK_AQ_DROPBOX_LOCAL_ROOT = str(os.getenv("UK_AQ_DROPBOX_LOCAL_ROOT") or "").strip()
 UK_AQ_DROPBOX_APP_FOLDER = str(os.getenv("UK_AQ_DROPBOX_APP_FOLDER") or "").strip()
 UK_AQ_R2_HISTORY_DROPBOX_DIR = str(
@@ -2078,10 +2078,10 @@ def _candidate_dropbox_state_paths(
         add_candidate(Path(*path_parts))
 
     for local_root in local_roots:
-        # Full-access Dropbox paths (for example ~/Dropbox/CIC-Test/...).
+        # Full-access Dropbox paths (for example ~/Dropbox/TEST/...).
         add_from_base(local_root)
 
-        # App-folder Dropbox paths (for example ~/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/...).
+        # App-folder Dropbox paths (for example ~/Dropbox/Apps/github-uk-air-quality-networks/TEST/...).
         apps_root = local_root / "Apps"
         if UK_AQ_DROPBOX_APP_FOLDER:
             add_from_base(apps_root / UK_AQ_DROPBOX_APP_FOLDER)

@@ -1205,7 +1205,7 @@ function latestOldestDay(rows: unknown[], selector: (row: JsonObject) => boolean
 }
 
 function joinDropboxStatePath(env: WorkerEnv, stateRel: string): string {
-  const root = String(env.UK_AQ_DROPBOX_ROOT || "CIC-Test").trim().replace(/^\/+|\/+$/g, "");
+  const root = String(env.UK_AQ_DROPBOX_ROOT || "TEST").trim().replace(/^\/+|\/+$/g, "");
   const historyDir = String(env.UK_AQ_R2_HISTORY_DROPBOX_DIR || "R2_history_backup").trim().replace(/^\/+|\/+$/g, "");
   const normalizedStateRel = stateRel.trim().replace(/^\/+|\/+$/g, "");
   const parts = [root, historyDir, normalizedStateRel].filter((part) => part.length > 0);
@@ -1277,7 +1277,7 @@ function storageCoverageCacheKey(env: WorkerEnv): string {
 }
 
 function resolveDropboxHistoryPath(env: WorkerEnv): string {
-  const root = String(env.UK_AQ_DROPBOX_ROOT || "CIC-Test").trim().replace(/^\/+|\/+$/g, "");
+  const root = String(env.UK_AQ_DROPBOX_ROOT || "TEST").trim().replace(/^\/+|\/+$/g, "");
   const historyDir = String(env.UK_AQ_R2_HISTORY_DROPBOX_DIR || "R2_history_backup").trim().replace(/^\/+|\/+$/g, "");
   const parts = [root, historyDir].filter((part) => part.length > 0);
   if (!parts.length) {

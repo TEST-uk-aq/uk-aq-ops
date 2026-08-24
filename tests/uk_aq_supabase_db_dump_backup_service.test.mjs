@@ -33,19 +33,19 @@ function createDeferred() {
 }
 
 test("normalizeDropboxPath adds a leading slash and trims trailing slashes", () => {
-  assert.equal(normalizeDropboxPath("CIC-Test/"), "/CIC-Test");
-  assert.equal(normalizeDropboxPath("/CIC-Test/path/"), "/CIC-Test/path");
+  assert.equal(normalizeDropboxPath("TEST/"), "/TEST");
+  assert.equal(normalizeDropboxPath("/TEST/path/"), "/TEST/path");
   assert.equal(normalizeDropboxPath(""), "");
 });
 
 test("buildBackupRoot and buildDatabaseBackupFolder keep the required dated layout", () => {
   assert.equal(
-    buildBackupRoot("/CIC-Test", "Supabase_Backup_db_dump"),
-    "/CIC-Test/Supabase_Backup_db_dump",
+    buildBackupRoot("/TEST", "Supabase_Backup_db_dump"),
+    "/TEST/Supabase_Backup_db_dump",
   );
   assert.equal(
-    buildDatabaseBackupFolder("/CIC-Test", "Supabase_Backup_db_dump", "ingestdb", "2026-03-16"),
-    "/CIC-Test/Supabase_Backup_db_dump/ingestdb/2026-03-16",
+    buildDatabaseBackupFolder("/TEST", "Supabase_Backup_db_dump", "ingestdb", "2026-03-16"),
+    "/TEST/Supabase_Backup_db_dump/ingestdb/2026-03-16",
   );
 });
 

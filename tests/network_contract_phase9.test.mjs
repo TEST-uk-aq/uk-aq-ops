@@ -26,9 +26,9 @@ test("active runtime and current docs do not depend on retired relations", () =>
   const retired = ["station_network_" + "memberships", "uk_aq_" + "networks"];
   const roots = [
     root,
-    path.resolve(root, "../../CIC-test-uk-aq-ingest"),
-    path.resolve(root, "../../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema"),
-    path.resolve(root, "../../CIC-UK-AQ Webpage/CIC-test-uk-aq-webpage"),
+    path.resolve(root, "../TEST-uk-aq-ingest"),
+    path.resolve(root, "../TEST-uk-aq-schema"),
+    path.resolve(root, "../TEST-uk-aq.github.io"),
   ];
   const allowed = new Set([
     "schemas/migrations/v0.2.0/ingestdb/011_remove_legacy_network_relations.sql",
