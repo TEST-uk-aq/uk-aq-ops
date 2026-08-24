@@ -648,6 +648,54 @@ class V2RepairExecutionTests(unittest.TestCase):
             for item in metrics["skipped_v2_observation_metadata_gaps"]
         ))
 
+    def test_gap_backfill_outcome_metrics_schema_is_mode_independent(self) -> None:
+        expected_outcome_metrics = {
+            "selected_partition_outcomes": [],
+            "complete_replacements": 0,
+            "authoritative_no_data_replacements": 0,
+            "all_unmapped_partitions_left_unchanged": 0,
+            "source_invalid_partitions_blocked_before_mutation": 0,
+            "exact_tombstones_created": 0,
+        }
+        for dry_run in (True, False):
+            for explicit_selected_partitions in (None, []):
+                with self.subTest(
+                    dry_run=dry_run,
+                    explicit_selected_partitions=(
+                        explicit_selected_partitions is not None
+                    ),
+                ):
+                    metrics = MODULE.run_v2_gap_backfills(
+                        conn=self.conn,
+                        run_id=1,
+                        env_name="TEST",
+                        run_compact="run",
+                        env=self.env,
+                        v2_observations={"gaps": []},
+                        dry_run=dry_run,
+                        run_backfill=False,
+                        limits=MODULE.LimitTracker(
+                            max_download_mb=0,
+                            max_runtime_minutes=0,
+                            started_mono=0.0,
+                        ),
+                        log=self.log,
+                        explicit_selected_partitions=explicit_selected_partitions,
+                    )
+                    self.assertEqual(
+                        {
+                            key: metrics[key]
+                            for key in expected_outcome_metrics
+                        },
+                        expected_outcome_metrics,
+                    )
+                    self.assertEqual(
+                        json.loads(json.dumps(metrics))[
+                            "exact_tombstones_created"
+                        ],
+                        0,
+                    )
+
     def test_v2_mismatch_uses_complete_sorted_valid_repair_ids(self) -> None:
         full_ids = list(range(1, 44))
         gap = {

@@ -18824,17 +18824,17 @@ def run_v2_gap_backfills(
         "planned_aqi_rebuilds": [],
         "planned_aqi_rebuild_connector_days": [],
         "unsupported_v2_backfill": False,
+        "selected_partition_outcomes": [],
+        "complete_replacements": 0,
+        "authoritative_no_data_replacements": 0,
+        "all_unmapped_partitions_left_unchanged": 0,
+        "source_invalid_partitions_blocked_before_mutation": 0,
+        "exact_tombstones_created": 0,
     }
     if explicit_selected_partitions is not None:
         metrics.update({
             "target_authority": "explicit_selected_scope",
             "gap_detection_bypassed": True,
-            "selected_partition_outcomes": [],
-            "complete_replacements": 0,
-            "authoritative_no_data_replacements": 0,
-            "all_unmapped_partitions_left_unchanged": 0,
-            "source_invalid_partitions_blocked_before_mutation": 0,
-            "exact_tombstones_created": 0,
         })
     if not run_backfill:
         return metrics
