@@ -43,6 +43,7 @@ const TRANSIENT_R2_ERROR_TOKENS = [
   "network error",
   "sendrequest",
   "temporarily unavailable",
+  "fetch failed",
   "tls",
   "eof",
 ];
@@ -192,6 +193,31 @@ async function readJsonMaybe(r2, key) {
   }
 }
 
+async function readJsonMaybeWithTransientRetry(r2, key) {
+  for (let attempt = 1; attempt <= TRANSIENT_R2_OPERATION_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await readJsonMaybe(r2, key);
+    } catch (error) {
+      if (
+        !isTransientR2OperationError(error)
+        || attempt === TRANSIENT_R2_OPERATION_MAX_ATTEMPTS
+      ) {
+        throw error;
+      }
+      const delayMs = transientR2OperationRetryDelayMs(attempt);
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `Transient R2 error reading ${key} `
+        + `(attempt ${attempt}/${TRANSIENT_R2_OPERATION_MAX_ATTEMPTS}): ${message}`,
+      );
+      console.warn(`Retrying source state read in ${delayMs / 1000}s.`);
+      await sleep(delayMs);
+    }
+  }
+
+  throw new Error("Timeseries binding source state retry loop exhausted unexpectedly.");
+}
+
 function sourceFingerprintFromState(state, bindingPrefix) {
   if (!state || typeof state !== "object" || Array.isArray(state)) return null;
   const fingerprint = normalizeFingerprint(state.source_fingerprint);
@@ -219,7 +245,7 @@ export async function main(argv = process.argv.slice(2)) {
     throw new Error("Missing required R2 configuration (CFLARE_R2_* / R2_*)");
   }
   const sourceStateKey = `${args.binding_prefix}/_source_state.json`;
-  const sourceState = await readJsonMaybe(r2, sourceStateKey);
+  const sourceState = await readJsonMaybeWithTransientRetry(r2, sourceStateKey);
   const sourceStateFingerprint = sourceState
     ? sourceFingerprintFromState(sourceState, args.binding_prefix)
     : null;
