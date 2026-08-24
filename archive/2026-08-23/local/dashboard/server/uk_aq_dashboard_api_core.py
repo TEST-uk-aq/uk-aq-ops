@@ -61,10 +61,7 @@ DB_SIZE_LOOKBACK_DAYS = max(
     int(os.getenv("UK_AQ_DB_SIZE_LOOKBACK_DAYS", "28")),
 )
 METRICS_VIEW_PAGE_SIZE = 1000
-SERVICE_EGRESS_MINUTE_VIEW = "uk_aq_service_egress_metrics_minute"
-SERVICE_EGRESS_DAILY_VIEW = "uk_aq_service_egress_metrics_daily"
-SERVICE_EGRESS_METRICS_RPC = "uk_aq_rpc_service_egress_metrics_batch_upsert"
-SERVICE_EGRESS_MAX_ROWS = 10000
+SERVICE_EGRESS_DASHBOARD_VIEW = "uk_aq_endpoint_egress_metrics_24h_dashboard"
 EXTERNAL_METRICS_MAX_LAG = timedelta(hours=6)
 EXTERNAL_SCHEMA_MISSING_WARNING = "External DB size API payload missing usable schema_size_metrics rows"
 EXTERNAL_SCHEMA_LAG_WARNING = "External DB size API returned lagging schema_size_metrics window"
@@ -154,8 +151,6 @@ DROPBOX_HISTORY_MTIME_CACHE_STATE: Dict[str, Any] = {
     "error": None,
     "generated_at": None,
 }
-SERVICE_EGRESS_METRICS_LOCK = threading.Lock()
-SERVICE_EGRESS_METRICS_STATE: Dict[Tuple[str, ...], Dict[str, Any]] = {}
 DISPATCH_RUNS_STATE: Dict[str, Any] = {
     "rows": [],
     "latest_created_at": None,
@@ -393,169 +388,6 @@ def _project_ref_from_base_url(base_url: str) -> Optional[str]:
 def _request_path(url: str) -> str:
     parsed = urlparse(url)
     return parsed.path or url
-
-
-def _bool_env(name: str, fallback: bool = False) -> bool:
-    raw = str(os.getenv(name) or "").strip().lower()
-    if not raw:
-        return fallback
-    return raw not in {"0", "false", "no", "n", "off"}
-
-
-def _dashboard_supabase_identity(url: str) -> Optional[Dict[str, str]]:
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return None
-    host = str(parsed.hostname or "").lower()
-    if not host:
-        return None
-
-    configured = (
-        ("ingestdb", str(os.getenv("SUPABASE_URL") or "")),
-        ("obs_aqidb", OBS_AQIDB_SUPABASE_URL),
-    )
-    source_name = ""
-    for candidate_name, candidate_url in configured:
-        try:
-            candidate_host = str(urlparse(candidate_url).hostname or "").lower()
-        except ValueError:
-            candidate_host = ""
-        if candidate_host and host == candidate_host:
-            source_name = candidate_name
-            break
-    if not source_name:
-        return None
-
-    path = parsed.path or ""
-    marker = "/rest/v1/"
-    if marker not in path:
-        return None
-    resource = path.split(marker, 1)[1].strip("/")
-    if not resource:
-        return None
-    route_name = resource if resource.startswith("rpc/") else f"table/{resource}"
-    if route_name in {
-        f"table/{SERVICE_EGRESS_MINUTE_VIEW}",
-        f"table/{SERVICE_EGRESS_DAILY_VIEW}",
-        f"rpc/{SERVICE_EGRESS_METRICS_RPC}",
-    }:
-        return None
-
-    return {
-        "project_ref": _project_ref_from_base_url(url) or "",
-        "source_name": source_name,
-        "route_name": route_name,
-    }
-
-
-def _record_dashboard_supabase_response(
-    url: str,
-    response: requests.Response,
-    duration_ms: int,
-    query_name: str = "dashboard_read",
-) -> None:
-    if not _bool_env("UK_AQ_SERVICE_EGRESS_METRICS_ENABLED", False):
-        return
-    identity = _dashboard_supabase_identity(url)
-    if identity is None:
-        return
-
-    now = datetime.now(timezone.utc)
-    bucket_minute = now.replace(second=0, microsecond=0).isoformat().replace("+00:00", "Z")
-    status = "ok" if response.ok else "error"
-    status_code = int(response.status_code)
-    status_class = f"{status_code // 100}xx" if 100 <= status_code <= 599 else "other"
-    key = (
-        bucket_minute,
-        identity["project_ref"],
-        identity["source_name"],
-        identity["route_name"],
-        query_name,
-        status,
-        str(status_code),
-    )
-    response_bytes = len(response.content or b"")
-    with SERVICE_EGRESS_METRICS_LOCK:
-        row = SERVICE_EGRESS_METRICS_STATE.get(key)
-        if row is None:
-            row = {
-                "bucket_minute": bucket_minute,
-                "env_name": str(os.getenv("UKAQ_ENV_NAME") or "TEST").strip() or "TEST",
-                "project_ref": identity["project_ref"],
-                "service_name": "dashboard.dev",
-                "source_type": "supabase_postgrest",
-                "source_name": identity["source_name"],
-                "route_name": identity["route_name"],
-                "query_name": query_name,
-                "window_label": "",
-                "status": status,
-                "request_count": 0,
-                "response_rows": 0,
-                "response_bytes_est": 0,
-                "upstream_bytes_est": 0,
-                "duration_ms": 0,
-                "error_count": 0,
-                "notes": {
-                    "measurement_method": "body_bytes",
-                    "http_status": status_code,
-                    "http_status_class": status_class,
-                },
-            }
-            SERVICE_EGRESS_METRICS_STATE[key] = row
-        row["request_count"] += 1
-        row["response_bytes_est"] += max(0, response_bytes)
-        row["duration_ms"] += max(0, int(duration_ms))
-        row["error_count"] += 0 if response.ok else 1
-
-
-def _flush_dashboard_service_egress_metrics() -> None:
-    if not _bool_env("UK_AQ_SERVICE_EGRESS_METRICS_ENABLED", False):
-        return
-    with SERVICE_EGRESS_METRICS_LOCK:
-        if not SERVICE_EGRESS_METRICS_STATE:
-            return
-        rows = list(SERVICE_EGRESS_METRICS_STATE.values())
-        SERVICE_EGRESS_METRICS_STATE.clear()
-
-    metrics_url = str(OBS_AQIDB_SUPABASE_URL or "").strip().rstrip("/")
-    metrics_key = str(OBS_AQIDB_SECRET_KEY or "").strip()
-    if not metrics_url or not metrics_key:
-        print(json.dumps({
-            "severity": "WARNING",
-            "event": "dashboard_service_egress_metrics_warning",
-            "reason": "metrics_destination_not_configured",
-            "rows": len(rows),
-        }))
-        return
-
-    try:
-        response = requests.post(
-            f"{metrics_url}/rest/v1/rpc/{SERVICE_EGRESS_METRICS_RPC}",
-            headers={
-                "apikey": metrics_key,
-                "Authorization": f"Bearer {metrics_key}",
-                "Accept-Profile": PUBLIC_SCHEMA,
-                "Content-Profile": PUBLIC_SCHEMA,
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal",
-                "x-ukaq-egress-bypass": "1",
-            },
-            json={"p_rows": rows},
-            timeout=30,
-        )
-        if not response.ok:
-            reason = f"metrics_http_{response.status_code}"
-            raise RuntimeError(reason)
-    except Exception as exc:
-        message = str(exc)
-        reason = message if re.fullmatch(r"metrics_http_\d+", message) else "metrics_request_failed"
-        print(json.dumps({
-            "severity": "WARNING",
-            "event": "dashboard_service_egress_metrics_warning",
-            "reason": reason,
-            "rows": len(rows),
-        }))
 
 
 def _resolve_r2_history_read_version() -> Dict[str, Any]:
@@ -925,13 +757,7 @@ def _fetch_r2_storage_fallback_metrics(
 
 
 def _fetch_json(url: str, headers: Dict[str, str], params: Dict[str, str]) -> List[Dict[str, Any]]:
-    started_at = datetime.now(timezone.utc)
     resp = requests.get(url, headers=headers, params=params, timeout=60)
-    _record_dashboard_supabase_response(
-        resp.url or url,
-        resp,
-        int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000),
-    )
     if not resp.ok:
         params_keys = sorted(params.keys())
         raise RuntimeError(
@@ -950,13 +776,7 @@ def _post_json_object(
     headers: Dict[str, str],
     body: Dict[str, Any],
 ) -> Dict[str, Any]:
-    started_at = datetime.now(timezone.utc)
     resp = requests.post(url, headers=headers, json=body, timeout=60)
-    _record_dashboard_supabase_response(
-        resp.url or url,
-        resp,
-        int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000),
-    )
     if not resp.ok:
         payload_keys = sorted(body.keys())
         raise RuntimeError(
@@ -977,13 +797,7 @@ def _post_json_list(
     headers: Dict[str, str],
     body: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    started_at = datetime.now(timezone.utc)
     resp = requests.post(url, headers=headers, json=body, timeout=60)
-    _record_dashboard_supabase_response(
-        resp.url or url,
-        resp,
-        int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000),
-    )
     if not resp.ok:
         payload_keys = sorted(body.keys())
         raise RuntimeError(
@@ -1265,25 +1079,35 @@ def _normalize_service_egress_metrics_rows(rows: List[Dict[str, Any]]) -> List[D
                 return 0
             return max(0, parsed)
 
+        status_class = str(row.get("status_class") or "").strip().lower()
+        if status_class not in {"2xx", "3xx", "4xx", "5xx", "other"}:
+            status_class = "other"
+        observed_requests = _to_non_negative_int(row.get("observed_requests"))
+        error_count = observed_requests if status_class in {"4xx", "5xx"} else 0
+
         normalized.append(
             {
                 "bucket_minute": bucket_minute.isoformat().replace("+00:00", "Z"),
-                "env_name": str(row.get("env_name") or "unknown").strip(),
-                "project_ref": str(row.get("project_ref") or "").strip(),
-                "service_name": str(row.get("service_name") or "unknown").strip(),
-                "source_type": str(row.get("source_type") or "other").strip(),
-                "source_name": str(row.get("source_name") or "").strip(),
-                "route_name": str(row.get("route_name") or "").strip(),
-                "query_name": str(row.get("query_name") or "").strip(),
-                "window_label": str(row.get("window_label") or "").strip(),
-                "status": str(row.get("status") or "ok").strip(),
-                "request_count": _to_non_negative_int(row.get("request_count")),
-                "response_rows": _to_non_negative_int(row.get("response_rows")),
-                "response_bytes_est": _to_non_negative_int(row.get("response_bytes_est")),
-                "upstream_bytes_est": _to_non_negative_int(row.get("upstream_bytes_est")),
-                "duration_ms": _to_non_negative_int(row.get("duration_ms")),
-                "error_count": _to_non_negative_int(row.get("error_count")),
-                "notes": row.get("notes") if isinstance(row.get("notes"), dict) else None,
+                "env_name": "unknown",
+                "project_ref": "",
+                "service_name": "supabase_endpoint",
+                "source_type": "supabase",
+                "source_name": "",
+                "route_name": str(row.get("endpoint") or "").strip(),
+                "query_name": str(row.get("method") or "").strip().upper(),
+                "window_label": status_class,
+                "status": "ok" if status_class in {"2xx", "3xx"} else "error",
+                "request_count": observed_requests,
+                "response_rows": _to_non_negative_int(row.get("estimated_requests")),
+                "response_bytes_est": _to_non_negative_int(row.get("response_bytes_sum")),
+                "upstream_bytes_est": _to_non_negative_int(row.get("response_bytes_sum")),
+                "cache_hit_count": 0,
+                "cache_miss_count": 0,
+                "objects_written_count": 0,
+                "objects_written_bytes": 0,
+                "duration_ms": _to_non_negative_int(row.get("duration_ms_sum")),
+                "error_count": error_count,
+                "notes": None,
             }
         )
 
@@ -1789,40 +1613,30 @@ def _fetch_size_metrics(
     return db_rows, schema_rows, r2_rows, db_warning, schema_warning, r2_warning
 
 
-def _fetch_service_egress_metrics() -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
-        return [], "obs_aqidb: missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY"
+def _fetch_service_egress_metrics(
+    base_url: str,
+    service_role_key: str,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not base_url or not service_role_key:
+        return [], "ingestdb: missing base URL or service key"
 
     try:
-        now = datetime.now(timezone.utc)
-        base_url = _ensure_allowed_base_url(
-            f"{OBS_AQIDB_SUPABASE_URL.rstrip('/')}/rest/v1"
-        )
-        rows, truncated = _fetch_all_limited(
+        rows = _fetch_all(
             base_url,
-            _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema=PUBLIC_SCHEMA),
-            SERVICE_EGRESS_MINUTE_VIEW,
+            _postgrest_headers(service_role_key, schema=PUBLIC_SCHEMA),
+            SERVICE_EGRESS_DASHBOARD_VIEW,
             {
                 "select": (
-                    "bucket_minute,env_name,project_ref,service_name,source_type,source_name,"
-                    "route_name,query_name,window_label,status,request_count,response_rows,"
-                    "response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes"
+                    "bucket_minute,endpoint,method,status_class,observed_requests,"
+                    "estimated_requests,response_bytes_sum,duration_ms_sum"
                 ),
-                "bucket_minute": f"gte.{_to_postgrest_ts(now - timedelta(hours=24))}",
-                "env_name": f"eq.{str(os.getenv('UKAQ_ENV_NAME') or 'TEST').strip() or 'TEST'}",
                 "order": "bucket_minute.asc",
             },
-            page_size=METRICS_VIEW_PAGE_SIZE,
-            max_rows=SERVICE_EGRESS_MAX_ROWS,
+            limit=METRICS_VIEW_PAGE_SIZE,
         )
     except Exception as exc:
         return [], str(exc)
-    warning = (
-        f"Service egress minute view reached the {SERVICE_EGRESS_MAX_ROWS}-row dashboard bound"
-        if truncated
-        else None
-    )
-    return _normalize_service_egress_metrics_rows(rows), warning
+    return _normalize_service_egress_metrics_rows(rows), None
 
 
 def _normalize_iso_date(value: Any) -> Optional[str]:
@@ -4201,6 +4015,8 @@ def _build_dashboard(
             r2_usage_future = executor.submit(_get_r2_usage_cached, force_refresh=False)
             service_egress_future = executor.submit(
                 _fetch_service_egress_metrics,
+                base_url,
+                service_role_key,
             )
             coverage_context = coverage_future.result()
             r2_usage, r2_usage_error = r2_usage_future.result()
@@ -4647,12 +4463,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if self._is_client_disconnect_error(exc):
                 return
             raise
-        finally:
-            try:
-                _flush_dashboard_service_egress_metrics()
-            except Exception:
-                # Metrics are observational and must not change dashboard responses.
-                pass
 
     def do_POST(self) -> None:
         try:
@@ -4670,12 +4480,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if self._is_client_disconnect_error(exc):
                 return
             raise
-        finally:
-            try:
-                _flush_dashboard_service_egress_metrics()
-            except Exception:
-                # Metrics are observational and must not change dashboard responses.
-                pass
 
     def log_message(self, format: str, *args: Any) -> None:
         return

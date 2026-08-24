@@ -1,4 +1,4 @@
-import { flushPhaseBServiceEgressMetrics } from "./pg_source_egress_diagnostic.mjs";
+import "./pg_source_egress_diagnostic.mjs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import {
@@ -71,12 +71,6 @@ export async function runPruneDailyJob({
     await writeReportAdapter(payload);
     setExitCode(1);
     return payload;
-  } finally {
-    try {
-      await flushPhaseBServiceEgressMetrics({ env });
-    } catch (_metricsError) {
-      // Metrics are observational and must never change Prune Daily's outcome.
-    }
   }
 }
 

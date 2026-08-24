@@ -1448,39 +1448,7 @@
       }
 
       .egress-table {
-        min-width: 980px;
-      }
-
-      .egress-summary {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-        gap: 10px;
-        margin: 12px 0 16px;
-      }
-
-      .egress-summary-card {
-        border: 1px solid var(--border);
-        border-radius: 10px;
-        padding: 10px 12px;
-        background: rgba(255, 255, 255, 0.5);
-      }
-
-      .egress-summary-label {
-        color: var(--ink-soft);
-        font-size: 12px;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-      }
-
-      .egress-summary-value {
-        margin-top: 4px;
-        font-size: 20px;
-        font-weight: 650;
-      }
-
-      .egress-subheading {
-        margin: 18px 0 6px;
-        font-size: 14px;
+        table-layout: fixed;
       }
 
       .egress-col-source {
@@ -4966,176 +4934,123 @@
         panel.dataset.panel = "service-egress";
 
         const normalizedRows = Array.isArray(rows) ? rows : [];
-        const nowMs = Date.now();
-        const hourCutoffMs = nowMs - (60 * 60 * 1000);
-        const sixHourCutoffMs = nowMs - (6 * 60 * 60 * 1000);
-        const dayCutoffMs = nowMs - (24 * 60 * 60 * 1000);
+        const cutoffMs = Date.now() - (24 * 60 * 60 * 1000);
         const latestSnapshotRows = normalizedRows.filter((row) => {
           if (!row) return false;
           const bucketMs = new Date(row.bucket_minute || "").getTime();
-          return Number.isFinite(bucketMs) && bucketMs >= dayCutoffMs;
+          return Number.isFinite(bucketMs) && bucketMs >= cutoffMs;
         });
 
-        function numeric(row, field) {
-          const value = Number(row && row[field]);
-          return Number.isFinite(value) && value >= 0 ? value : 0;
-        }
-
-        const totals = latestSnapshotRows.reduce((acc, row) => {
-          const bucketMs = new Date(row.bucket_minute || "").getTime();
-          const bytes = numeric(row, "response_bytes_est");
-          acc.dayBytes += bytes;
-          acc.dayRequests += numeric(row, "request_count");
-          acc.dayErrors += numeric(row, "error_count");
-          if (bucketMs >= sixHourCutoffMs) acc.sixHourBytes += bytes;
-          if (bucketMs >= hourCutoffMs) acc.hourBytes += bytes;
-          return acc;
-        }, { hourBytes: 0, sixHourBytes: 0, dayBytes: 0, dayRequests: 0, dayErrors: 0 });
-
-        const serviceGroups = new Map();
-        const projectGroups = new Map();
-        const routeGroups = new Map();
+        const grouped = new Map();
         latestSnapshotRows.forEach((row) => {
-          const bucketMs = new Date(row.bucket_minute || "").getTime();
-          const serviceName = String(row.service_name || "unknown");
-          const sourceName = String(row.source_name || "unknown");
-          const projectRef = String(row.project_ref || "");
-          const sourceType = String(row.source_type || "other");
-          const bytes = numeric(row, "response_bytes_est");
-          const requests = numeric(row, "request_count");
-          const errors = numeric(row, "error_count");
-
-          const serviceKey = [serviceName, sourceName, projectRef].join("|");
-          const service = serviceGroups.get(serviceKey) || {
-            service_name: serviceName,
-            source_name: sourceName,
-            project_ref: projectRef,
-            hour_bytes: 0,
-            day_bytes: 0,
-            request_count: 0,
-            error_count: 0,
-          };
-          service.day_bytes += bytes;
-          service.request_count += requests;
-          service.error_count += errors;
-          if (bucketMs >= hourCutoffMs) service.hour_bytes += bytes;
-          serviceGroups.set(serviceKey, service);
-
-          const projectKey = [sourceName, projectRef].join("|");
-          const project = projectGroups.get(projectKey) || {
-            source_name: sourceName,
-            project_ref: projectRef,
-            day_bytes: 0,
-            request_count: 0,
-          };
-          project.day_bytes += bytes;
-          project.request_count += requests;
-          projectGroups.set(projectKey, project);
-
-          const routeKey = [serviceName, sourceName, projectRef, sourceType, String(row.route_name || ""), String(row.query_name || "")].join("|");
-          const route = routeGroups.get(routeKey) || {
-            service_name: serviceName,
-            source_name: sourceName,
-            source_type: sourceType,
+          const key = [
+            String(row.source_type || "other"),
+            String(row.route_name || ""),
+            String(row.query_name || ""),
+            String(row.window_label || ""),
+          ].join("|");
+          const current = grouped.get(key) || {
+            source_type: String(row.source_type || "other"),
             route_name: String(row.route_name || ""),
             query_name: String(row.query_name || ""),
-            day_bytes: 0,
+            window_label: String(row.window_label || ""),
             request_count: 0,
+            response_rows: 0,
+            response_bytes_est: 0,
+            upstream_bytes_est: 0,
+            duration_ms: 0,
             error_count: 0,
           };
-          route.day_bytes += bytes;
-          route.request_count += requests;
-          route.error_count += errors;
-          routeGroups.set(routeKey, route);
+          current.request_count += Number(row.request_count || 0);
+          current.response_rows += Number(row.response_rows || 0);
+          current.response_bytes_est += Number(row.response_bytes_est || 0);
+          current.upstream_bytes_est += Number(row.upstream_bytes_est || 0);
+          current.duration_ms += Number(row.duration_ms || 0);
+          current.error_count += Number(row.error_count || 0);
+          grouped.set(key, current);
         });
 
-        const share = (bytes) => totals.dayBytes > 0 ? `${((bytes / totals.dayBytes) * 100).toFixed(1)}%` : "0.0%";
-        const serviceRows = Array.from(serviceGroups.values()).sort((a, b) => b.day_bytes - a.day_bytes);
-        const serviceMarkup = serviceRows.length
-          ? serviceRows.map((row) => `
+        const tableRows = Array.from(grouped.values()).sort((a, b) => {
+          const aBytes = Number(a.response_bytes_est || 0) + Number(a.upstream_bytes_est || 0);
+          const bBytes = Number(b.response_bytes_est || 0) + Number(b.upstream_bytes_est || 0);
+          return bBytes - aBytes;
+        });
+
+        const totals = tableRows.reduce((acc, row) => {
+          acc.request_count += Number(row.request_count || 0);
+          acc.response_rows += Number(row.response_rows || 0);
+          acc.response_bytes_est += Number(row.response_bytes_est || 0);
+          acc.upstream_bytes_est += Number(row.upstream_bytes_est || 0);
+          acc.duration_ms += Number(row.duration_ms || 0);
+          acc.error_count += Number(row.error_count || 0);
+          return acc;
+        }, {
+          request_count: 0,
+          response_rows: 0,
+          response_bytes_est: 0,
+          upstream_bytes_est: 0,
+          duration_ms: 0,
+          error_count: 0,
+        });
+
+        const rowsMarkup = tableRows.length
+          ? tableRows.map((row) => `
               <tr>
-                <td>${escapeHtml(row.service_name)}</td>
-                <td>${escapeHtml(row.source_name)}${row.project_ref ? `<br><span class="mono">${escapeHtml(row.project_ref)}</span>` : ""}</td>
-                <td>${formatBytesBestFit(row.hour_bytes)}</td>
-                <td>${formatBytesBestFit(row.day_bytes)}</td>
-                <td>${share(row.day_bytes)}</td>
+                <td>${escapeHtml(String(row.source_type || ""))}</td>
+                <td>${escapeHtml(String(row.window_label || "all"))}</td>
+                <td class="egress-wrap">${escapeHtml(String(row.route_name || ""))}</td>
+                <td class="egress-query">${escapeHtml(String(row.query_name || ""))}</td>
                 <td>${formatCount(row.request_count)}</td>
+                <td>${formatCompactCount(row.response_rows)}</td>
+                <td>${formatBytesBestFit(row.response_bytes_est)}</td>
+                <td>${formatBytesBestFit(row.upstream_bytes_est)}</td>
+                <td>${formatCompactCount(row.duration_ms)}</td>
                 <td>${formatCount(row.error_count)}</td>
               </tr>
             `).join("")
-          : `<tr><td colspan="7">No measured service egress rows in the last 24h.</td></tr>`;
-
-        const projectMarkup = Array.from(projectGroups.values())
-          .sort((a, b) => b.day_bytes - a.day_bytes)
-          .map((row) => `
-            <tr>
-              <td>${escapeHtml(row.source_name)}</td>
-              <td class="mono">${escapeHtml(row.project_ref || "unknown")}</td>
-              <td>${formatBytesBestFit(row.day_bytes)}</td>
-              <td>${share(row.day_bytes)}</td>
-              <td>${formatCount(row.request_count)}</td>
-            </tr>
-          `).join("") || `<tr><td colspan="5">No project/source rows in the last 24h.</td></tr>`;
-
-        const routeMarkup = Array.from(routeGroups.values())
-          .sort((a, b) => b.day_bytes - a.day_bytes)
-          .map((row) => `
-            <tr>
-              <td>${escapeHtml(row.service_name)}</td>
-              <td>${escapeHtml(row.source_name)}</td>
-              <td>${escapeHtml(row.source_type)}</td>
-              <td class="egress-wrap">${escapeHtml(row.route_name)}</td>
-              <td class="egress-query">${escapeHtml(row.query_name)}</td>
-              <td>${formatBytesBestFit(row.day_bytes)}</td>
-              <td>${share(row.day_bytes)}</td>
-              <td>${formatCount(row.request_count)}</td>
-              <td>${formatCount(row.error_count)}</td>
-            </tr>
-          `).join("") || `<tr><td colspan="9">No route/query rows in the last 24h.</td></tr>`;
+          : `<tr><td colspan="10">No Supabase endpoint egress rows in the last 24h.</td></tr>`;
 
         const warningLine = sourceError
           ? `<div class="footnote">Metrics source warning: ${escapeHtml(String(sourceError))}</div>`
           : "";
 
         panel.innerHTML = `
-          <h2>Measured Supabase Egress <span class="chip">beta</span></h2>
-          <div class="meta-note">Application-attributed Supabase response measurements. Useful for attribution; not Supabase billed egress totals.</div>
-          <div class="egress-summary">
-            <div class="egress-summary-card"><div class="egress-summary-label">Last 1 hour</div><div class="egress-summary-value">${formatBytesBestFit(totals.hourBytes)}</div></div>
-            <div class="egress-summary-card"><div class="egress-summary-label">Last 24 hours</div><div class="egress-summary-value">${formatBytesBestFit(totals.dayBytes)}</div></div>
-            <div class="egress-summary-card"><div class="egress-summary-label">Projected MB/day</div><div class="egress-summary-value">${((totals.sixHourBytes * 4) / (1024 * 1024)).toFixed(2)} MB/day</div><div class="footnote">Rolling 6h measured rate × 4</div></div>
+          <h2>Supabase Endpoint Egress (24h) <span class="chip">beta</span></h2>
+          <div class="meta-note">
+            Requests ${formatCount(totals.request_count)} · Supabase response ${formatBytesBestFit(totals.response_bytes_est)} · Upstream ${formatBytesBestFit(totals.upstream_bytes_est)} · Errors ${formatCount(totals.error_count)}
           </div>
-          <div class="meta-note">24h requests ${formatCount(totals.dayRequests)} · errors ${formatCount(totals.dayErrors)}</div>
-          <h3 class="egress-subheading">By service</h3>
           <div class="table-scroll table-scroll-egress">
             <table class="egress-table">
+              <colgroup>
+                <col class="egress-col-source">
+                <col class="egress-col-window">
+                <col class="egress-col-route">
+                <col class="egress-col-query">
+                <col class="egress-col-req">
+                <col class="egress-col-rows">
+                <col class="egress-col-resp">
+                <col class="egress-col-upstream">
+                <col class="egress-col-duration">
+                <col class="egress-col-errors">
+              </colgroup>
               <thead>
                 <tr>
-                  <th>Service</th><th>Database / project</th><th>Last 1h</th><th>Last 24h</th><th>Share of measured 24h</th><th>Requests</th><th>Errors</th>
-                </tr>
-              </thead>
-              <tbody>${serviceMarkup}</tbody>
-            </table>
-          </div>
-          <h3 class="egress-subheading">By database / project</h3>
-          <div class="table-scroll table-scroll-egress">
-            <table class="egress-table">
-              <thead><tr><th>Database</th><th>Project</th><th>Last 24h</th><th>Share of measured 24h</th><th>Requests</th></tr></thead>
-              <tbody>${projectMarkup}</tbody>
-            </table>
-          </div>
-          <h3 class="egress-subheading">By route / query</h3>
-          <div class="table-scroll table-scroll-egress">
-            <table class="egress-table">
-              <thead>
-                <tr><th>Service</th><th>Database</th><th>Transport</th><th class="egress-wrap">Route</th><th class="egress-query-head">Query</th><th>Last 24h</th><th>Share</th><th>Requests</th>
+                  <th>Source</th>
+                  <th>Window</th>
+                  <th class="egress-wrap">Route</th>
+                  <th class="egress-query-head">Query</th>
+                  <th>Req</th>
+                  <th>Rows</th>
+                  <th>Resp bytes</th>
+                  <th>Upstream bytes</th>
+                  <th>Duration ms</th>
                   <th>Errors</th>
                 </tr>
               </thead>
-              <tbody>${routeMarkup}</tbody>
+              <tbody>${rowsMarkup}</tbody>
             </table>
           </div>
-          <div class="footnote">Aggregate source: uk_aq_public.uk_aq_service_egress_metrics_minute. Totals use response_bytes_est only. Projection is a recent measured run-rate, not a billing forecast.</div>
+          <div class="footnote">Rollup source: uk_aq_public.uk_aq_endpoint_egress_metrics_24h_dashboard. Values are estimates, not Supabase billing authority.</div>
           ${warningLine}
         `;
 

@@ -8,8 +8,6 @@ export type WorkerEnv = {
   SB_SECRET_KEY?: string;
   OBS_AQIDB_SUPABASE_URL?: string;
   OBS_AQIDB_SECRET_KEY?: string;
-  UKAQ_ENV_NAME?: string;
-  UK_AQ_SERVICE_EGRESS_METRICS_ENABLED?: string;
   UK_AQ_CORE_SCHEMA?: string;
   UK_AQ_PUBLIC_SCHEMA?: string;
   UK_AQ_OPS_SCHEMA?: string;
