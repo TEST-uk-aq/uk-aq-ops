@@ -25,12 +25,6 @@ import {
   r2PutObjectIfChanged,
   resolveR2HistoryIndexConfig,
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
-import {
-  observationsGlobalOperationLockContext,
-} from "../../workers/shared/uk_aq_r2_history_writer.mjs";
-import {
-  runCommandWithObservationsGlobalOperationLock,
-} from "../operations/uk_aq_with_observations_global_operation_lock.mjs";
 import { runHistoryIndexBuild } from "./uk_aq_build_r2_history_index.mjs";
 import {
   buildObservationHistoryV2RestorePlan,
@@ -65,7 +59,7 @@ function usage() {
     "  --mode rollback         Restore canonical v2 bytes and rebuild observation _index_v2",
     "",
     "Required for every mode:",
-    "  --environment TEST",
+    "  --environment CIC-Test",
     "  --expected-bucket <exact TEST bucket>",
     "  --migration-run-id <stable operator identity>",
     "  --target-writer-git-sha <exact deployed migration code identity>",
@@ -414,7 +408,6 @@ export async function runObservationHistoryMigrationV3({
   argv = process.argv.slice(2),
   env = process.env,
   now = () => new Date().toISOString(),
-  runLockedCommand = runCommandWithObservationsGlobalOperationLock,
 } = {}) {
   const args = parseObservationHistoryMigrationArgs(argv);
   if (args.help) return { help: true, text: usage() };
@@ -428,36 +421,6 @@ export async function runObservationHistoryMigrationV3({
     readJsonFile(args.writerLimitsPath, "writer limits"),
     "migration --writer-limits-json",
   );
-  if (args.mode === "migrate") {
-    const lockContext = observationsGlobalOperationLockContext({
-      env,
-      expectedOwner: "observation_history_migration_v3",
-      expectedRunId: args.migrationRunId,
-    });
-    if (lockContext.held && !lockContext.valid) {
-      throw new Error("migrate --apply received an invalid observations global operation lock context");
-    }
-    if (!lockContext.valid) {
-      const diagnostics = [];
-      let exitCode;
-      try {
-        exitCode = await runLockedCommand({
-          databaseUrl: env.SUPABASE_DB_URL || env.DATABASE_URL,
-          owner: "observation_history_migration_v3",
-          runId: args.migrationRunId,
-          command: process.execPath,
-          commandArgs: [fileURLToPath(import.meta.url), ...argv],
-          env,
-          diagnostics,
-        });
-      } finally {
-        for (const diagnostic of diagnostics) {
-          process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
-        }
-      }
-      return { delegated: true, exitCode };
-    }
-  }
   const getBackupObject = buildDropboxBackupReader(args.dropboxRoot);
   const getR2Object = ({ key }) => r2GetObject({ r2: config.r2, key });
   const startedAt = now();
@@ -605,7 +568,6 @@ export async function runObservationHistoryMigrationV3({
 
 export async function main(options = {}) {
   const output = await runObservationHistoryMigrationV3(options);
-  if (output.delegated) return output.exitCode;
   if (output.help) {
     process.stdout.write(`${output.text}\n`);
     return 0;

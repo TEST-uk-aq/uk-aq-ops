@@ -38,6 +38,7 @@ jobs:
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
 
       DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
@@ -70,6 +71,9 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
       - name: Report daily task health (started)
         id: daily_task_health_started
         env:
@@ -92,6 +96,7 @@ jobs:
             CFLARE_R2_BUCKET
             CFLARE_R2_ACCESS_KEY_ID
             CFLARE_R2_SECRET_ACCESS_KEY
+            SUPABASE_DB_URL
             DROPBOX_APP_KEY
             DROPBOX_APP_SECRET
             DROPBOX_REFRESH_TOKEN
@@ -167,29 +172,9 @@ jobs:
           chmod 600 "${RCLONE_CONFIG}"
           echo "RCLONE_CONFIG=${RCLONE_CONFIG}" >> "$GITHUB_ENV"
 
-      - name: Build hierarchical R2 history backup inventory
-        # Always writes current small inventory control files, including when the
-        # Dropbox sync itself is a dry run. This keeps the dry-run plan current.
-        run: |
-          set -euo pipefail
-          mkdir -p tmp
-
-          cmd=(
-            node scripts/backup_r2/build_backup_inventory.mjs
-            --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
-            --observations-prefix "${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX}"
-            --runs-prefix "${UK_AQ_R2_HISTORY_V2_RUNS_PREFIX}"
-            --core-prefix "${UK_AQ_R2_HISTORY_V2_CORE_PREFIX}"
-            --timeseries-binding-prefix "${UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX}"
-            --latest-timeseries-key "${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}/observations_timeseries_latest.json"
-            --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
-            --report-out "tmp/r2_backup_inventory_report.json"
-          )
-
-          echo "Running: ${cmd[*]}"
-          "${cmd[@]}"
-
-      - name: Run hierarchical Dropbox sync
+      - name: Run locked hierarchical Dropbox backup
+        # The retained PostgreSQL session lock spans source-root inventory
+        # selection, copy/verification and checkpoint-root publication.
         run: |
           set -euo pipefail
           mkdir -p tmp
@@ -221,15 +206,25 @@ jobs:
           fi
 
           cmd=(
-            node scripts/backup_r2/sync_history_to_dropbox.mjs
+            node scripts/operations/uk_aq_with_observations_global_operation_lock.mjs
+            --owner r2_history_dropbox_backup
+            --run-id "r2-history-dropbox-backup:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+            --
+            node scripts/backup_r2/uk_aq_run_locked_history_backup.mjs
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
             --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
+            --observations-prefix "${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX}"
+            --runs-prefix "${UK_AQ_R2_HISTORY_V2_RUNS_PREFIX}"
+            --core-prefix "${UK_AQ_R2_HISTORY_V2_CORE_PREFIX}"
+            --timeseries-binding-prefix "${UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX}"
+            --latest-timeseries-key "${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}/observations_timeseries_latest.json"
             --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
             --state-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX}"
             --max-days-per-run "${max_days}"
             --checkpoint-batch-units "${UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS}"
             --checkpoint-flush-seconds "${UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS}"
-            --report-out "tmp/r2_history_dropbox_backup_report.json"
+            --inventory-report-out "tmp/r2_backup_inventory_report.json"
+            --backup-report-out "tmp/r2_history_dropbox_backup_report.json"
           )
 
           if [ "${INPUT_DRY_RUN}" = "true" ]; then

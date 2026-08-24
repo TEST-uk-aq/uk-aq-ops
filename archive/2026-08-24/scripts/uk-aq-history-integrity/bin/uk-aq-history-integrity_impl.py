@@ -43,7 +43,7 @@ import urllib.request
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Sequence
+from typing import Any, Callable, Iterable, Literal
 
 # The entrypoint is also loaded directly by focused tests, where Python does
 # not automatically place this script directory on sys.path.
@@ -23999,150 +23999,6 @@ def resolve_history_writer_database_url(env: Mapping[str, str]) -> str:
     return str(resolved.get("SUPABASE_DB_URL") or resolved.get("DATABASE_URL") or "").strip()
 
 
-def observations_global_operation_lock_context(
-    env: Mapping[str, str],
-) -> dict[str, Any]:
-    held = str(
-        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_HELD") or ""
-    ).strip().lower() == "true"
-    owner = str(
-        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_OWNER") or ""
-    ).strip()
-    run_id = str(
-        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_RUN_ID") or ""
-    ).strip()
-    logical_identity = str(
-        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_IDENTITY") or ""
-    ).strip()
-    nonce = str(
-        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_NONCE") or ""
-    ).strip()
-    acquired = str(
-        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_ACQUIRED") or ""
-    ).strip().lower() == "true"
-    try:
-        wait_ms = int(
-            env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_WAIT_MS") or "0"
-        )
-    except (TypeError, ValueError):
-        wait_ms = -1
-    outcome = str(
-        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_OUTCOME") or ""
-    ).strip()
-    valid = bool(
-        held
-        and acquired
-        and owner == "integrity"
-        and run_id
-        and nonce
-        and logical_identity
-        and wait_ms >= 0
-        and outcome == "held"
-    )
-    return {
-        "held": held,
-        "valid": valid,
-        "owner": owner or None,
-        "run_id": run_id or None,
-        "logical_identity": logical_identity or None,
-        "acquired": acquired,
-        "wait_ms": wait_ms if wait_ms >= 0 else None,
-        "outcome": outcome or ("held" if valid else "not_held"),
-    }
-
-
-def run_integrity_under_global_operation_lock(
-    *,
-    argv: Sequence[str],
-    args: argparse.Namespace,
-    env: Mapping[str, str],
-    run_compact: str,
-) -> int:
-    repo_root = _repo_root_for_integrity_script(env)
-    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
-    database_url = resolve_history_writer_database_url(env)
-    if not database_url:
-        raise RuntimeError(
-            "SUPABASE_DB_URL (or DATABASE_URL) is required for the Integrity observations global operation lock"
-        )
-    lock_run_id = f"integrity:{args.env}:{run_compact}"
-    command = [
-        node_bin,
-        str(
-            repo_root
-            / "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs"
-        ),
-        "--owner", "integrity",
-        "--run-id", lock_run_id,
-        "--",
-        sys.executable,
-        str(Path(__file__).resolve()),
-        *[str(value) for value in argv],
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=repo_root,
-        env={
-            **os.environ,
-            **{str(key): str(value) for key, value in env.items()},
-            "SUPABASE_DB_URL": database_url,
-        },
-        check=False,
-    )
-    return int(completed.returncode)
-
-
-def run_integrity_dropbox_currentness_gate(
-    *,
-    env: Mapping[str, str],
-    dropbox_root: str | Path,
-    observations_prefix: str,
-) -> dict[str, Any]:
-    repo_root = _repo_root_for_integrity_script(env)
-    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
-    command = [
-        node_bin,
-        str(
-            repo_root
-            / "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
-        ),
-        "--dropbox-root", str(dropbox_root),
-        "--state-prefix", str(
-            env.get("UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX")
-            or "_ops/checkpoints/r2_history_backup_state_v2"
-        ),
-        "--observations-prefix", observations_prefix,
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=repo_root,
-        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    try:
-        output = json.loads(completed.stdout) if completed.stdout.strip() else {}
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "Integrity Dropbox currentness gate returned invalid JSON"
-        ) from exc
-    if completed.returncode not in {0, 2}:
-        raise RuntimeError(
-            _truncate_text(
-                completed.stderr
-                or completed.stdout
-                or "Integrity Dropbox currentness gate failed",
-                4000,
-            )
-        )
-    if not isinstance(output, dict) or not isinstance(output.get("allowed"), bool):
-        raise RuntimeError(
-            "Integrity Dropbox currentness gate returned an unexpected result"
-        )
-    return output
-
-
 def run_integrity_ingest_boundary_check(
     *,
     env_name: str,
@@ -26872,7 +26728,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         prog="uk-aq-history-integrity",
         description="UK-AQ History Integrity entrypoint (Phase 1).",
     )
-    p.add_argument("--env", required=True, choices=["TEST", "LIVE"])
+    p.add_argument("--env", required=True, choices=["CIC-Test", "LIVE"])
     p.add_argument(
         "--profile",
         default="manual",
@@ -27423,7 +27279,7 @@ def validate_guardrails(cli_env: str, env: dict[str, str]) -> None:
         )
         sys.exit(4)
 
-    other = "LIVE" if cli_env == "TEST" else "TEST"
+    other = "LIVE" if cli_env == "CIC-Test" else "CIC-Test"
     fragment = f"/{other}/"
     for var in PATH_VARS_FOR_GUARDRAILS:
         val = os.environ.get(var, "")
@@ -27878,7 +27734,7 @@ def _collect_guardrail_errors(cli_env: str, env: dict[str, str]) -> list[str]:
         errors.append(
             f"--env={cli_env} but UK_AQ_ENV_NAME={env['UK_AQ_ENV_NAME']}. Refusing to run.",
         )
-    other = "LIVE" if cli_env == "TEST" else "TEST"
+    other = "LIVE" if cli_env == "CIC-Test" else "CIC-Test"
     fragment = f"/{other}/"
     for var in PATH_VARS_FOR_GUARDRAILS:
         val = os.environ.get(var, "")
@@ -28090,7 +27946,7 @@ def collect_preflight_errors(
                 loaded_daily_env = _load_env_file(env_file_path)
 
         if env_file_raw:
-            other_env = "LIVE" if args.env == "TEST" else "TEST"
+            other_env = "LIVE" if args.env == "CIC-Test" else "CIC-Test"
             if f"/{other_env}/" in env_file_raw:
                 errors.append(
                     f"--env {args.env} but UK_AQ_BACKFILL_ENV_FILE contains /{other_env}/. Refusing to run.",
@@ -28145,7 +28001,7 @@ def collect_preflight_errors(
                 loaded_backfill_env = _load_env_file(env_file_path)
 
         if env_file_raw:
-            other_env = "LIVE" if args.env == "TEST" else "TEST"
+            other_env = "LIVE" if args.env == "CIC-Test" else "CIC-Test"
             if f"/{other_env}/" in env_file_raw:
                 errors.append(
                     f"--env {args.env} but UK_AQ_BACKFILL_ENV_FILE contains /{other_env}/. Refusing to run.",
@@ -28182,7 +28038,7 @@ def collect_preflight_errors(
                 errors.append(
                     f"UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE is not executable: {nested_wrapper_path}",
                 )
-            if f"/{'LIVE' if args.env == 'TEST' else 'TEST'}/" in nested_wrapper:
+            if f"/{'LIVE' if args.env == 'CIC-Test' else 'CIC-Test'}/" in nested_wrapper:
                 errors.append(
                     f"--env {args.env} but nested UK_AQ_BACKFILL_WRAPPER contains the other env path: {nested_wrapper}",
                 )
@@ -30044,8 +29900,6 @@ def main(argv: list[str]) -> int:
         "backup_gate_checked": False,
         "blocked_reason": "awaiting_ingestdb_boundary",
     }
-    global_operation_lock = observations_global_operation_lock_context(os.environ)
-    dropbox_currentness: dict[str, Any] | None = None
 
     preflight_summary: dict[str, Any] | None = None
     repair_overlay: dict[str, Any] | None = None
@@ -30227,76 +30081,6 @@ def main(argv: list[str]) -> int:
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
         return 2
 
-    if global_operation_lock.get("held") and not global_operation_lock.get("valid"):
-        raise RuntimeError(
-            "Integrity received an invalid observations global operation lock context"
-        )
-    if not global_operation_lock.get("valid"):
-        return run_integrity_under_global_operation_lock(
-            argv=argv,
-            args=args,
-            env=env,
-            run_compact=run_compact,
-        )
-
-    # The child process is now inside the retained PostgreSQL session lock.
-    # Load the existing optional backfill environment before resolving live R2
-    # credentials, then pin the complete Dropbox checkpoint to the locked live
-    # observations root. This gate cannot be bypassed by --allow-stale-dropbox.
-    load_backfill_env_file_if_set()
-    dropbox_root = resolve_r2_history_root(os.environ)
-    if not dropbox_root:
-        dropbox_currentness = {
-            "allowed": False,
-            "status": "blocked_dropbox_root_unavailable",
-            "checkpoint_live_root_match": False,
-        }
-    else:
-        dropbox_currentness = run_integrity_dropbox_currentness_gate(
-            env={**env, **os.environ},
-            dropbox_root=dropbox_root,
-            observations_prefix=history_path_configs["v2"].observations_data_prefix,
-        )
-    log.info(
-        "observations global operation lock: %s",
-        json.dumps(global_operation_lock, sort_keys=True, default=str),
-    )
-    log.info(
-        "Dropbox checkpoint/live observations root gate: %s",
-        json.dumps(dropbox_currentness, sort_keys=True, default=str),
-    )
-    if not dropbox_currentness.get("allowed"):
-        summary = {
-            "env": args.env,
-            "profile": args.profile,
-            "source": args.source,
-            "from_day": from_day,
-            "to_day": to_day,
-            "date_selection": selection_summary,
-            "started_at_utc": started_iso,
-            "finished_at_utc": fmt_iso(utc_now()),
-            "status": "blocked_dropbox_checkpoint_not_current",
-            "dry_run": bool(args.dry_run),
-            "check_only": bool(args.check_only),
-            "run_backfill": bool(args.run_backfill),
-            "effective_mode": effective_mode,
-            "dropbox_baseline": str(dropbox_root or ""),
-            "repair_mode": bool(args.run_backfill),
-            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
-            "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
-            "log_path": str(log_path),
-            "history_version_mode": history_version_mode,
-            "checked_versions": checked_history_versions,
-            "history_path_configs": serialized_history_path_configs,
-            "observations_global_operation_lock": global_operation_lock,
-            "dropbox_currentness": dropbox_currentness,
-            "backup_readiness": backup_gate_summary,
-            "ingestdb_boundary": ingest_boundary,
-            "metrics": {},
-        }
-        write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
-        return 2
-
     backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
     log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
     if not backup_gate_summary.get("backup_ready"):
@@ -30325,8 +30109,6 @@ def main(argv: list[str]) -> int:
             "history_path_configs": serialized_history_path_configs,
             "backup_readiness": backup_gate_summary,
             "ingestdb_boundary": ingest_boundary,
-            "observations_global_operation_lock": global_operation_lock,
-            "dropbox_currentness": dropbox_currentness,
             "metrics": {},
         }
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
@@ -30879,12 +30661,6 @@ def main(argv: list[str]) -> int:
             repair_overlay["effective_mode"] = effective_mode
             repair_overlay["dropbox_baseline"] = str(dropbox_root)
             repair_overlay["allow_stale_dropbox"] = bool(args.allow_stale_dropbox)
-            repair_overlay["observations_global_operation_lock"] = dict(
-                global_operation_lock
-            )
-            repair_overlay["dropbox_currentness"] = dict(
-                dropbox_currentness or {}
-            )
             repair_overlay["execution_path"] = sos_historical_route.get(
                 "execution_path"
             )
@@ -31628,8 +31404,6 @@ def main(argv: list[str]) -> int:
             "skip_cross_check": args.skip_cross_check,
             "allow_stale_dropbox": bool(args.allow_stale_dropbox),
             "backup_readiness": backup_gate_summary,
-            "observations_global_operation_lock": global_operation_lock,
-            "dropbox_currentness": dropbox_currentness,
             "repair_flow": repair_flow,
             "current_state_reconciliation": current_state_summary,
             "r2_history_status": current_state_summary.get("r2_history_status"),
@@ -31749,8 +31523,6 @@ def main(argv: list[str]) -> int:
                 "runtime_seconds": runtime_seconds,
                 "report_json_path": str(json_path),
                 "backup_readiness": backup_gate_summary,
-                "observations_global_operation_lock": global_operation_lock,
-                "dropbox_currentness": dropbox_currentness,
                 "report_md_path": str(md_path),
                 "log_path": str(log_path),
             }

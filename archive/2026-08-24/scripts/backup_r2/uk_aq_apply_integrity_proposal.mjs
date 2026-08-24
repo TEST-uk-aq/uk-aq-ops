@@ -24,7 +24,6 @@ import {
   withHistoryWriterClient,
   mergeConnectorManifestReferences,
   readParentManifestForBoundedRecovery,
-  requireObservationsGlobalOperationLockContext,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
   runCanonicalObservationsGlobalFinalizer,
@@ -3318,26 +3317,9 @@ export async function applyValidatedProposal({
   }
 }
 
-export function requireIntegrityApplyGlobalLock({ runStatePath, env = process.env }) {
-  const coordinatorState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
-  const expectedLockRunId = String(
-    coordinatorState?.observations_global_operation_lock?.run_id || "",
-  ).trim();
-  if (!expectedLockRunId) {
-    throw new Error("canonical apply run state is missing global lock ownership");
-  }
-  requireObservationsGlobalOperationLockContext({
-    env,
-    expectedOwner: "integrity",
-    expectedRunId: expectedLockRunId,
-  });
-  return coordinatorState.observations_global_operation_lock;
-}
-
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const runStatePath = path.resolve(args.runStateJson);
-  requireIntegrityApplyGlobalLock({ runStatePath, env: process.env });
   const config = resolveR2HistoryIndexConfig(process.env);
   if (!hasRequiredR2Config(config.r2)) throw new Error("canonical apply requires complete R2 configuration");
   return await withHistoryWriterClient(

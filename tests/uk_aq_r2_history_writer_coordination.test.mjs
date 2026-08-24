@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import {
   HISTORY_LOCK_NAMESPACES,
   evaluateIntegrityIngestBoundary,
   historyWriterLockIdentity,
+  observationsGlobalOperationLockIdentity,
   isConfirmedR2ObjectAbsentError,
   mergeConnectorManifestReferences,
   readParentManifestForBoundedRecovery,
   withHistoryWriterLock,
+  withObservationsGlobalOperationLock,
 } from "../workers/shared/uk_aq_r2_history_writer.mjs";
 
 function identity(input) {
@@ -47,6 +50,91 @@ test("history lock acquisition is bounded", async () => {
     }, async () => {}),
     (error) => error.code === "UK_AQ_HISTORY_LOCK_TIMEOUT",
   );
+});
+
+test("global observations lock has one environment- and owner-independent identity", () => {
+  const expected = observationsGlobalOperationLockIdentity();
+  assert.equal(
+    expected.logical_identity,
+    "uk_aq:r2_history:v2:observations_global_operation",
+  );
+  for (const _metadata of [
+    { environment: "TEST", owner: "prune_daily" },
+    { environment: "TEST-secondary-label", owner: "integrity" },
+    { environment: "ignored", owner: "r2_history_dropbox_backup" },
+  ]) {
+    assert.deepEqual(observationsGlobalOperationLockIdentity(), expected);
+  }
+});
+
+test("global observations lock contention is bounded on retained sessions", async () => {
+  let heldBy = null;
+  let clock = 0;
+  const client = (name) => ({
+    query: async (sql) => {
+      if (sql.includes("try_advisory")) {
+        if (heldBy === null) heldBy = name;
+        return { rows: [{ acquired: heldBy === name }] };
+      }
+      if (sql.includes("pg_advisory_unlock")) {
+        const released = heldBy === name;
+        if (released) heldBy = null;
+        return { rows: [{ released }] };
+      }
+      return { rows: [{ observations_global_operation_lock_heartbeat: 1 }] };
+    },
+  });
+  let releaseFirst;
+  const first = withObservationsGlobalOperationLock({
+    client: client("first"), owner: "prune_daily", runId: "first", heartbeatMs: 60_000,
+  }, async () => await new Promise((resolve) => { releaseFirst = resolve; }));
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(
+    withObservationsGlobalOperationLock({
+      client: client("second"),
+      owner: "integrity",
+      runId: "second",
+      timeoutMs: 20,
+      retryMs: 10,
+      heartbeatMs: 60_000,
+      now: () => clock,
+      sleep: async (delay) => { clock += delay; },
+    }, async () => {}),
+    (error) => error.code === "UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_TIMEOUT",
+  );
+  releaseFirst();
+  await first;
+  assert.equal(heldBy, null);
+});
+
+test("global observations lock releases on callback failure and fails closed on session loss", async () => {
+  const queries = [];
+  const client = new EventEmitter();
+  client.query = async (sql) => {
+    queries.push(sql);
+    if (sql.includes("try_advisory")) return { rows: [{ acquired: true }] };
+    if (sql.includes("pg_advisory_unlock")) return { rows: [{ released: true }] };
+    return { rows: [{ observations_global_operation_lock_heartbeat: 1 }] };
+  };
+  await assert.rejects(
+    withObservationsGlobalOperationLock({
+      client, owner: "backup", runId: "callback-error", heartbeatMs: 60_000,
+    }, async () => { throw new Error("operation failed"); }),
+    /operation failed/,
+  );
+  assert.equal(queries.filter((sql) => sql.includes("pg_advisory_unlock")).length, 1);
+
+  queries.length = 0;
+  await assert.rejects(
+    withObservationsGlobalOperationLock({
+      client, owner: "integrity", runId: "lost", heartbeatMs: 60_000,
+    }, async (_identity, lock) => {
+      client.emit("error", new Error("connection ended"));
+      lock.assertHeld();
+    }),
+    (error) => error.code === "UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_LOST",
+  );
+  assert.equal(queries.filter((sql) => sql.includes("pg_advisory_unlock")).length, 0);
 });
 
 test("history lock is released after success, error, and cancellation", async () => {

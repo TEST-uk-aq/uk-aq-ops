@@ -20,7 +20,14 @@ import {
   filterBucketsByConnectorHistoryGate,
   runPruneForTest,
 } from "../workers/uk_aq_prune_daily/server.mjs";
-import { runPruneDailyJob } from "../workers/uk_aq_prune_daily/job.mjs";
+import {
+  runPruneDailyJob,
+  runPruneDailyJobWithGlobalLock,
+} from "../workers/uk_aq_prune_daily/job.mjs";
+import {
+  OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
+  observationsGlobalOperationLockIdentity,
+} from "../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
   canonicalObservationConnectorManifestKey,
   connectorDayGateKey,
@@ -724,4 +731,58 @@ test("Phase B control PostgreSQL timeout is deadline-bounded and only deadline c
     expireBudget: false,
   });
   await assert.rejects(sqlDefectCase.promise, /syntax error/);
+});
+
+test("Prune Daily CLI orchestration delegates the whole job to the retained global lock", async () => {
+  let lockedOptions = null;
+  let jobCalls = 0;
+  const result = await runPruneDailyJobWithGlobalLock({
+    env: {
+      SUPABASE_DB_URL: "postgresql://direct-session",
+      GITHUB_RUN_ID: "123",
+      GITHUB_RUN_ATTEMPT: "2",
+    },
+    runLockedCommand: async (options) => {
+      lockedOptions = options;
+      return 0;
+    },
+    runJob: async () => { jobCalls += 1; },
+  });
+  assert.equal(result.delegated, true);
+  assert.equal(result.exitCode, 0);
+  assert.equal(jobCalls, 0);
+  assert.equal(lockedOptions.databaseUrl, "postgresql://direct-session");
+  assert.equal(lockedOptions.owner, "prune_daily");
+  assert.equal(lockedOptions.runId, "prune-daily:123:2");
+  assert.match(lockedOptions.commandArgs[0], /workers\/uk_aq_prune_daily\/job\.mjs$/);
+});
+
+test("Prune Daily locked child executes the preserved job path without reacquiring", async () => {
+  const identity = observationsGlobalOperationLockIdentity();
+  const env = {
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: "prune_daily",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: "prune-daily:123:2",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.logicalIdentity]: identity.logical_identity,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.classId]: String(identity.class_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.objectId]: String(identity.object_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.nonce]: "test-nonce",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.acquired]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: "0",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
+  };
+  let jobCalls = 0;
+  let lockCalls = 0;
+  const result = await runPruneDailyJobWithGlobalLock({
+    env,
+    runLockedCommand: async () => { lockCalls += 1; },
+    runJob: async ({ env: receivedEnv }) => {
+      jobCalls += 1;
+      assert.equal(receivedEnv, env);
+      return { ok: true };
+    },
+  });
+  assert.deepEqual(result, { ok: true });
+  assert.equal(jobCalls, 1);
+  assert.equal(lockCalls, 0);
 });

@@ -89,6 +89,99 @@ class Run132RegressionTests(unittest.TestCase):
         open_db.assert_not_called()
         write_reports.assert_called_once()
 
+    def test_allowed_boundary_delegates_to_global_lock_before_backup_or_preflight(self) -> None:
+        args = SimpleNamespace(
+            env="TEST", profile="manual", source="sos", from_day="2026-05-17",
+            to_day="2026-05-17", history_version="v2", verbose=False, dry_run=False,
+            check_only=True, run_backfill=False, allow_stale_dropbox=False,
+            logical_run_date=None,
+        )
+        env = {
+            "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": "/tmp/logs",
+            "UK_AQ_HISTORY_INTEGRITY_REPORT_DIR": "/tmp/reports",
+            "UK_AQ_HISTORY_INTEGRITY_DB_PATH": "/tmp/integrity.sqlite3",
+        }
+        allowed = {
+            "allowed": True,
+            "requested_start_day": "2026-05-17",
+            "requested_end_day": "2026-05-17",
+            "blockers": [],
+        }
+        history_paths = {
+            "v2": SimpleNamespace(observations_data_prefix="history/v2/observations"),
+        }
+        events: list[str] = []
+        with (
+            mock.patch.object(MODULE, "parse_args", return_value=args),
+            mock.patch.object(MODULE, "load_env_or_die", return_value=env),
+            mock.patch.object(MODULE, "resolve_history_version_mode", return_value="v2"),
+            mock.patch.object(MODULE, "expand_history_versions", return_value=("v2",)),
+            mock.patch.object(MODULE, "resolve_history_path_configs", return_value=history_paths),
+            mock.patch.object(MODULE, "serialize_history_path_configs", return_value={}),
+            mock.patch.object(MODULE, "setup_logging", return_value=Path("/tmp/test.log")),
+            mock.patch.object(MODULE, "_resolve_daily_task_health_config", return_value={"enabled": False, "strict": False}),
+            mock.patch.object(MODULE, "observations_global_operation_lock_context", return_value={"held": False, "valid": False}),
+            mock.patch.object(MODULE, "run_integrity_ingest_boundary_check", side_effect=lambda **_kwargs: events.append("boundary") or allowed),
+            mock.patch.object(MODULE, "run_integrity_under_global_operation_lock", side_effect=lambda **_kwargs: events.append("global_lock") or 17),
+            mock.patch.object(MODULE, "run_integrity_dropbox_currentness_gate") as currentness,
+            mock.patch.object(MODULE, "run_scheduled_backup_gate") as backup_gate,
+            mock.patch.object(MODULE, "run_preflight_or_die") as preflight,
+        ):
+            self.assertEqual(MODULE.main([]), 17)
+        self.assertEqual(events, ["boundary", "global_lock"])
+        currentness.assert_not_called()
+        backup_gate.assert_not_called()
+        preflight.assert_not_called()
+
+    def test_locked_child_blocks_stale_checkpoint_before_old_backup_gate(self) -> None:
+        args = SimpleNamespace(
+            env="TEST", profile="manual", source="sos", from_day="2026-05-17",
+            to_day="2026-05-17", history_version="v2", verbose=False, dry_run=False,
+            check_only=True, run_backfill=False, allow_stale_dropbox=True,
+            logical_run_date=None,
+        )
+        env = {
+            "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": "/tmp/logs",
+            "UK_AQ_HISTORY_INTEGRITY_REPORT_DIR": "/tmp/reports",
+            "UK_AQ_HISTORY_INTEGRITY_DB_PATH": "/tmp/integrity.sqlite3",
+        }
+        history_paths = {
+            "v2": SimpleNamespace(observations_data_prefix="history/v2/observations"),
+        }
+        lock = {
+            "held": True,
+            "valid": True,
+            "owner": "integrity",
+            "run_id": "integrity:test",
+            "logical_identity": "uk_aq:r2_history:v2:observations_global_operation",
+        }
+        with (
+            mock.patch.object(MODULE, "parse_args", return_value=args),
+            mock.patch.object(MODULE, "load_env_or_die", return_value=env),
+            mock.patch.object(MODULE, "resolve_history_version_mode", return_value="v2"),
+            mock.patch.object(MODULE, "expand_history_versions", return_value=("v2",)),
+            mock.patch.object(MODULE, "resolve_history_path_configs", return_value=history_paths),
+            mock.patch.object(MODULE, "serialize_history_path_configs", return_value={}),
+            mock.patch.object(MODULE, "setup_logging", return_value=Path("/tmp/test.log")),
+            mock.patch.object(MODULE, "_resolve_daily_task_health_config", return_value={"enabled": False, "strict": False}),
+            mock.patch.object(MODULE, "observations_global_operation_lock_context", return_value=lock),
+            mock.patch.object(MODULE, "run_integrity_ingest_boundary_check", return_value={"allowed": True, "blockers": []}),
+            mock.patch.object(MODULE, "load_backfill_env_file_if_set"),
+            mock.patch.object(MODULE, "resolve_r2_history_root", return_value="/dropbox"),
+            mock.patch.object(MODULE, "run_integrity_dropbox_currentness_gate", return_value={
+                "allowed": False,
+                "status": "blocked_stale_dropbox_checkpoint",
+                "checkpoint_live_root_match": False,
+            }),
+            mock.patch.object(MODULE, "run_scheduled_backup_gate") as backup_gate,
+            mock.patch.object(MODULE, "run_preflight_or_die") as preflight,
+            mock.patch.object(MODULE, "write_reports") as write_reports,
+        ):
+            self.assertEqual(MODULE.main([]), 2)
+        backup_gate.assert_not_called()
+        preflight.assert_not_called()
+        write_reports.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
