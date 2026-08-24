@@ -9,6 +9,10 @@
     .freshness-table tbody tr:not(.freshness-mobile-trend-row) > td:first-child {
       width: 31%;
     }
+
+    .mode-view[data-mode="operations"] > [data-panel="service-egress"] {
+      order: 999;
+    }
   `;
   document.head.appendChild(style);
 })();
