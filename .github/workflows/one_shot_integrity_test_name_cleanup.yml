@@ -1,0 +1,182 @@
+name: One-shot Integrity TEST naming cleanup
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one_shot_integrity_test_name_cleanup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Standardise active Integrity TEST naming
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("scripts/uk-aq-history-integrity")
+          if not root.is_dir():
+              raise SystemExit(f"missing Integrity root: {root}")
+
+          # Active Integrity files only. Historical archive material is deliberately
+          # preserved as history rather than rewritten.
+          active_files = [
+              path
+              for path in root.rglob("*")
+              if path.is_file() and "archive" not in path.parts
+          ]
+          for path in active_files:
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  continue
+              updated = text.replace("CIC-Test", "TEST")
+              if updated != text:
+                  path.write_text(updated, encoding="utf-8")
+
+          # Rename active files/directories whose names still carry the old selector.
+          rename_paths = sorted(
+              (
+                  path
+                  for path in root.rglob("*")
+                  if "archive" not in path.parts and "CIC-Test" in path.name
+              ),
+              key=lambda path: len(path.parts),
+              reverse=True,
+          )
+          for path in rename_paths:
+              destination = path.with_name(path.name.replace("CIC-Test", "TEST"))
+              if destination.exists():
+                  raise SystemExit(f"rename destination already exists: {destination}")
+              path.rename(destination)
+
+          runner = root / "bin" / "uk-aq-history-integrity-runner.sh"
+          text = runner.read_text(encoding="utf-8")
+          unsafe = '''set -a
+          # shellcheck disable=SC1090
+          source "${ROOT_ENV_FILE}"
+          set +a'''
+          safe = r'''load_env_file_safe() {
+            local env_path="${1}"
+            python3 - "${env_path}" <<'PYENV'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          name_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+          def strip_inline_comment(value: str) -> str:
+              in_single = False
+              in_double = False
+              escaped = False
+              out = []
+              prev = ""
+              for i, ch in enumerate(value):
+                  if in_single:
+                      if ch == "'":
+                          in_single = False
+                      out.append(ch)
+                      prev = ch
+                      continue
+                  if in_double:
+                      if escaped:
+                          escaped = False
+                      elif ch == "\\":
+                          escaped = True
+                      elif ch == '"':
+                          in_double = False
+                      out.append(ch)
+                      prev = ch
+                      continue
+                  if ch == "'":
+                      in_single = True
+                      out.append(ch)
+                      prev = ch
+                      continue
+                  if ch == '"':
+                      in_double = True
+                      out.append(ch)
+                      prev = ch
+                      continue
+                  if ch == "#" and (i == 0 or prev.isspace()):
+                      break
+                  out.append(ch)
+                  prev = ch
+              return "".join(out).strip()
+
+          for raw in path.read_text(encoding="utf-8").splitlines():
+              line = raw.strip()
+              if not line or line.startswith("#") or "=" not in line:
+                  continue
+              key, _, val = line.partition("=")
+              key = key.strip()
+              if key.startswith("export "):
+                  key = key[len("export "):].strip()
+              if not name_re.match(key):
+                  continue
+              val = strip_inline_comment(val)
+              if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+                  val = val[1:-1]
+              sys.stdout.buffer.write(key.encode("utf-8"))
+              sys.stdout.buffer.write(b"\0")
+              sys.stdout.buffer.write(val.encode("utf-8"))
+              sys.stdout.buffer.write(b"\0")
+          PYENV
+          }
+
+          apply_env_file_safe() {
+            local env_path="${1}"
+            local key=""
+            local val=""
+            while IFS= read -r -d '' key && IFS= read -r -d '' val; do
+              printf -v "${key}" '%s' "${val}"
+              export "${key}"
+            done < <(load_env_file_safe "${env_path}")
+          }
+
+          apply_env_file_safe "${ROOT_ENV_FILE}"'''
+          if unsafe not in text:
+              raise SystemExit("expected unsafe root .env source block not found in Integrity runner")
+          runner.write_text(text.replace(unsafe, safe, 1), encoding="utf-8")
+          PY
+
+          if grep -R -n --exclude-dir=archive -- 'CIC-Test' scripts/uk-aq-history-integrity; then
+            echo 'ERROR: active Integrity CIC-Test references remain.' >&2
+            exit 1
+          fi
+
+          bash -n scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh
+          bash -n scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh
+          bash -n scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh
+          python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+          python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py
+          git diff --check
+
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/one_shot_integrity_test_name_cleanup.yml
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'ERROR: cleanup produced no repository changes.' >&2
+            exit 1
+          fi
+          git diff --cached --check
+          git commit -m "Standardise Integrity TEST environment name"
+          git push origin HEAD:main
