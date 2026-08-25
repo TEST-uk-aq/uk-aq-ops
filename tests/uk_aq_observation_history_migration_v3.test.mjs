@@ -55,6 +55,7 @@ import {
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
   inventoryAuthoritativeCanonicalObservationHistory,
+  stableMigrationJson,
   verifyObservationHistoryV2IndexCompleteness,
   verifyObservationHistoryV3CheckpointReuse,
   verifyObservationHistoryV3MigrationResult,
@@ -167,6 +168,7 @@ async function buildFixture({
   ]);
   const sources = [];
   const pollutants = [];
+  const parentReferenceHashes = new Map();
   for (const [pollutantCode, inputRows] of pollutantInputs) {
     const rows = inputRows.map(([timeseriesId, observedAtUtc, value, verificationStatus]) => ({
     connector_id: 1,
@@ -208,7 +210,10 @@ async function buildFixture({
     const manifestMode = manifestModes[pollutantCode] || "modern";
     if (
       manifestMode === "legacy_hashless" ||
-      manifestMode === "legacy_hashless_null"
+      manifestMode === "legacy_hashless_null" ||
+      manifestMode === "legacy_hashless_stale_timeseries_counts" ||
+      manifestMode === "legacy_hashless_arbitrary_stale" ||
+      manifestMode === "legacy_hashless_stale_other_field"
     ) {
       pollutant = structuredClone(pollutant);
       for (const field of [
@@ -222,6 +227,13 @@ async function buildFixture({
         if (manifestMode === "legacy_hashless_null") pollutant[field] = null;
         else delete pollutant[field];
       }
+      if (manifestMode.includes("_stale_")) {
+        delete pollutant.timeseries_row_counts;
+      }
+      pollutant = rehashManifest(pollutant);
+    } else if (manifestMode === "modern_stale_timeseries_counts") {
+      pollutant = structuredClone(pollutant);
+      delete pollutant.timeseries_row_counts;
       pollutant = rehashManifest(pollutant);
     } else if (manifestMode === "malformed_hash") {
       pollutant = rehashManifest({
@@ -233,8 +245,36 @@ async function buildFixture({
       delete pollutant.observation_content_hash_algorithm;
       pollutant = rehashManifest(pollutant);
     }
+    let parentReferenceHash = pollutant.manifest_hash;
+    if (
+      manifestMode === "legacy_hashless_stale_timeseries_counts" ||
+      manifestMode === "legacy_hashless_arbitrary_stale" ||
+      manifestMode === "modern_stale_timeseries_counts"
+    ) {
+      const preAugmentationHash = pollutant.manifest_hash;
+      const timeseriesRowCounts = {};
+      for (const [timeseriesId] of inputRows) {
+        const key = String(timeseriesId);
+        timeseriesRowCounts[key] = (timeseriesRowCounts[key] || 0) + 1;
+      }
+      pollutant = rehashManifest({
+        ...pollutant,
+        timeseries_row_counts: timeseriesRowCounts,
+      });
+      parentReferenceHash = manifestMode === "legacy_hashless_arbitrary_stale"
+        ? "a".repeat(64)
+        : preAugmentationHash;
+    } else if (manifestMode === "legacy_hashless_stale_other_field") {
+      const preAugmentationHash = pollutant.manifest_hash;
+      pollutant = rehashManifest({
+        ...pollutant,
+        unrelated_historical_metadata: { source: "fixture" },
+      });
+      parentReferenceHash = preAugmentationHash;
+    }
     sources.push(source);
     pollutants.push({ key: pollutantKey, payload: pollutant });
+    parentReferenceHashes.set(pollutantCode, parentReferenceHash);
   }
   const connectorKey = buildHistoryV2ConnectorManifestKey(PREFIX, DAY, 1);
   const connector = buildHistoryV2ConnectorManifest({
@@ -242,7 +282,10 @@ async function buildFixture({
     dayUtc: DAY,
     connectorId: 1,
     manifestKey: connectorKey,
-    pollutantManifests: pollutants.map((entry) => entry.payload),
+    pollutantManifests: pollutants.map((entry) => ({
+      ...entry.payload,
+      manifest_hash: parentReferenceHashes.get(entry.payload.pollutant_code),
+    })),
     writerGitSha: "fixture-source",
     backedUpAtUtc: "2026-01-03T00:00:00.000Z",
   });
@@ -365,6 +408,10 @@ async function buildFixture({
     backup,
     source: sources[0],
     sources,
+    connectorKey,
+    pollutantKeys: new Map(
+      pollutants.map((entry) => [entry.payload.pollutant_code, entry.key]),
+    ),
     oldCanonical: new Map(
       [...backup].filter(([key]) => key.startsWith(PREFIX)),
     ),
@@ -687,11 +734,21 @@ test("Phase 6 migration inventory keeps complete modern hash metadata strict and
     manifest: 2,
     derived_from_legacy_canonical_parquet: 0,
   });
+  assert.deepEqual(plan.source_manifest_reference_provenance_counts, {
+    exact: 2,
+    legacy_stale_after_timeseries_row_counts_patch: 0,
+    unexplained: 0,
+  });
   for (const unit of plan.units) {
     assert.equal(unit.source_observation_content_hash_provenance, "manifest");
     assert.equal(
       unit.source_observation_content_hash,
       unit.source_manifest.observation_content_hash,
+    );
+    assert.equal(unit.source_manifest_reference.provenance, "exact");
+    assert.equal(
+      unit.source_manifest_reference.referenced_child_manifest_hash,
+      unit.source_manifest_reference.current_child_manifest_hash,
     );
   }
 });
@@ -759,6 +816,115 @@ test("Phase 6 derives and pins genuine legacy hashless metadata for any canonica
   );
 });
 
+test("Phase 6 accepts only the reconstructed legacy timeseries-counts stale reference and pins its proof", async () => {
+  const fixture = await buildFixture({
+    pollutantCodes: ["pm25", "h3cch2chch32"],
+    manifestModes: {
+      h3cch2chch32: "legacy_hashless_stale_timeseries_counts",
+    },
+  });
+  const first = await buildPlan(fixture);
+  const second = await buildPlan(fixture);
+  assert.equal(first.plan_sha256, second.plan_sha256);
+  assert.deepEqual(first.source_manifest_reference_provenance_counts, {
+    exact: 1,
+    legacy_stale_after_timeseries_row_counts_patch: 1,
+    unexplained: 0,
+  });
+  const unit = first.units.find(
+    (entry) => entry.scope.pollutant_code === "h3cch2chch32",
+  );
+  const reference = unit.source_manifest_reference;
+  assert.equal(
+    reference.provenance,
+    "legacy_stale_after_timeseries_row_counts_patch",
+  );
+  assert.notEqual(
+    reference.referenced_child_manifest_hash,
+    reference.current_child_manifest_hash,
+  );
+  assert.equal(
+    reference.reconstructed_pre_augmentation_child_manifest_hash,
+    reference.referenced_child_manifest_hash,
+  );
+  assert.deepEqual(reference.historical_metadata_augmentation_fields, [
+    "timeseries_row_counts",
+  ]);
+  assert.equal(
+    unit.source_observation_content_hash_provenance,
+    "derived_from_legacy_canonical_parquet",
+  );
+  const expectedUnitId = sha256Hex(stableMigrationJson({
+    source_manifest: unit.source_manifest_identity,
+    source_files: unit.source_files,
+    source_observation_content_hash_metadata:
+      unit.source_observation_content_hash_metadata,
+    source_observation_content_hash_provenance:
+      unit.source_observation_content_hash_provenance,
+    source_manifest_reference: unit.source_manifest_reference,
+    writer_limits: first.target.writer_limits,
+    target_writer_git_sha: first.target_writer_git_sha,
+    target_schema: first.target.history_schema_version,
+    target_writer: first.target.writer_version,
+    target_layout: first.target.physical_layout_version,
+  }));
+  assert.equal(unit.unit_id, expectedUnitId);
+  const changedReference = structuredClone(unit.source_manifest_reference);
+  changedReference.provenance = "exact";
+  assert.notEqual(
+    unit.unit_id,
+    sha256Hex(stableMigrationJson({
+      source_manifest: unit.source_manifest_identity,
+      source_files: unit.source_files,
+      source_observation_content_hash_metadata:
+        unit.source_observation_content_hash_metadata,
+      source_observation_content_hash_provenance:
+        unit.source_observation_content_hash_provenance,
+      source_manifest_reference: changedReference,
+      writer_limits: first.target.writer_limits,
+      target_writer_git_sha: first.target_writer_git_sha,
+      target_schema: first.target.history_schema_version,
+      target_writer: first.target.writer_version,
+      target_layout: first.target.physical_layout_version,
+    })),
+  );
+  const audit = buildObservationHistoryV3MigrationAuditReport({
+    plan: first,
+    mode: "plan",
+  });
+  assert.deepEqual(
+    audit.source_manifest_reference_provenance_counts,
+    first.source_manifest_reference_provenance_counts,
+  );
+  const partitionAudit = audit.partition_results.find(
+    (entry) => entry.scope.pollutant_code === "h3cch2chch32",
+  );
+  assert.equal(
+    partitionAudit.source_manifest_reference_provenance,
+    reference.provenance,
+  );
+  assert.equal(
+    partitionAudit.source_reconstructed_pre_augmentation_child_manifest_hash,
+    reference.referenced_child_manifest_hash,
+  );
+});
+
+test("Phase 6 rejects arbitrary, unrelated-field and modern stale child references", async () => {
+  for (const manifestMode of [
+    "legacy_hashless_arbitrary_stale",
+    "legacy_hashless_stale_other_field",
+    "modern_stale_timeseries_counts",
+  ]) {
+    const fixture = await buildFixture({
+      manifestModes: { pm25: manifestMode },
+    });
+    await assert.rejects(
+      buildPlan(fixture),
+      /Observation connector\/pollutant identity mismatch/,
+    );
+  }
+});
+
 test("Phase 6 rejects malformed and partial non-legacy hash contracts", async () => {
   for (const [mode, expected] of [
     ["malformed_hash", /observation_content_hash must be lower-case SHA-256/],
@@ -819,6 +985,111 @@ test("Phase 6 preparation re-verifies a pinned legacy-derived logical identity a
     legacyUnit.target_manifest.observation_content_hash,
     completePlan.units.find((unit) => unit.scope.pollutant_code === "pm25")
       .source_observation_content_hash,
+  );
+});
+
+test("Phase 6 preparation rejects changed stale-reference parent, child or pinned proof before PUT", async () => {
+  for (const changedEvidence of ["parent", "child", "pinned_proof"]) {
+    const fixture = await buildFixture({
+      manifestModes: {
+        pm25: "legacy_hashless_stale_timeseries_counts",
+      },
+    });
+    const plan = await buildPlan(fixture);
+    const executionPlan = structuredClone(plan);
+    if (changedEvidence === "parent") {
+      const connector = JSON.parse(fixture.r2.get(fixture.connectorKey));
+      connector.backed_up_at_utc = "2026-01-03T00:00:01.000Z";
+      fixture.r2.set(fixture.connectorKey, jsonBody(rehashManifest(connector)));
+    } else if (changedEvidence === "child") {
+      const childKey = fixture.pollutantKeys.get("pm25");
+      const child = JSON.parse(fixture.r2.get(childKey));
+      child.timeseries_row_counts["999999"] = 1;
+      fixture.r2.set(childKey, jsonBody(rehashManifest(child)));
+    } else {
+      const partition = executionPlan.inventory.partitions.find(
+        (entry) => entry.scope.pollutant_code === "pm25",
+      );
+      partition.source_manifest_reference
+        .reconstructed_pre_augmentation_child_manifest_hash = "f".repeat(64);
+    }
+    const adapters = memoryAdapters(fixture);
+    await assert.rejects(
+      executeObservationHistoryV3MigrationPlan({
+        plan: executionPlan,
+        apply: true,
+        writersFrozen: true,
+        environmentEvidence: ENVIRONMENT,
+        adapters,
+      }),
+      /Pinned source (parent manifest identity|child manifest identity|manifest reference evidence) changed/,
+    );
+    assert.equal(adapters.putCalls, 0);
+    assert.equal(adapters.stagedBodyCount, 0);
+    assert.equal(adapters.checkpoints.length, 1);
+  }
+});
+
+test("Phase 6 stale source rewrites a consistent target hierarchy and rollback restores exact stale bytes", async () => {
+  const fixture = await buildFixture({
+    pollutantCodes: ["pm25", "h3cch2chch32"],
+    manifestModes: {
+      h3cch2chch32: "legacy_hashless_stale_timeseries_counts",
+    },
+  });
+  const plan = await buildPlan(fixture);
+  const adapters = memoryAdapters(fixture);
+  const migration = await executeObservationHistoryV3MigrationPlan({
+    plan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  });
+  assert.equal(migration.verification.cutover_ready, true);
+  const completedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: migration.checkpoint,
+    requirePrepared: true,
+  });
+  const unit = completedPlan.units.find(
+    (entry) => entry.scope.pollutant_code === "h3cch2chch32",
+  );
+  const targetConnector = completedPlan.canonical_publication_objects.find(
+    (object) => object.publication_stage === "connector_manifest",
+  ).payload;
+  const targetReference = targetConnector.pollutant_manifests.find(
+    (entry) => entry.pollutant_code === "h3cch2chch32",
+  );
+  assert.equal(targetReference.manifest_hash, unit.target_manifest.manifest_hash);
+  assert.notEqual(
+    targetReference.manifest_hash,
+    unit.source_manifest_reference.referenced_child_manifest_hash,
+  );
+
+  const restorePlan = await buildObservationHistoryV2RestorePlan({
+    checkpoint: migration.checkpoint,
+    getBackupObject: mapReader(fixture.backup),
+  });
+  const rollback = await executeObservationHistoryV2Rollback({
+    restorePlan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: { ...ENVIRONMENT, indexVersion: "v3" },
+    adapters,
+  });
+  assert.equal(rollback.ok, true);
+  for (const [key, expected] of fixture.oldCanonical) {
+    assert.equal(Buffer.compare(fixture.r2.get(key), expected), 0, key);
+  }
+  const restoredConnector = JSON.parse(fixture.r2.get(fixture.connectorKey));
+  const restoredChild = JSON.parse(
+    fixture.r2.get(fixture.pollutantKeys.get("h3cch2chch32")),
+  );
+  assert.notEqual(
+    restoredConnector.pollutant_manifests.find(
+      (entry) => entry.pollutant_code === "h3cch2chch32",
+    ).manifest_hash,
+    restoredChild.manifest_hash,
   );
 });
 

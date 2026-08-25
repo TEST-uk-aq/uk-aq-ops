@@ -100,6 +100,10 @@ const OBSERVATION_CONTENT_HASH_METADATA_FIELDS = Object.freeze([
 const SOURCE_HASH_PROVENANCE_MANIFEST = "manifest";
 const SOURCE_HASH_PROVENANCE_LEGACY_PARQUET =
   "derived_from_legacy_canonical_parquet";
+const SOURCE_MANIFEST_REFERENCE_PROVENANCE_EXACT = "exact";
+const SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_COUNTS_PATCH =
+  "legacy_stale_after_timeseries_row_counts_patch";
+const LEGACY_MANIFEST_AUGMENTATION_FIELD = "timeseries_row_counts";
 const CANONICAL_STAGE_RANK = Object.freeze({
   pollutant_manifest: 10,
   connector_manifest: 20,
@@ -304,6 +308,194 @@ function isGenuineLegacyHashlessObservationManifest(manifest) {
   return OBSERVATION_CONTENT_HASH_METADATA_FIELDS.every(
     (field) => !Object.hasOwn(manifest, field) || manifest[field] === null,
   );
+}
+
+function legacyTimeseriesRowCountsAreCanonical(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entries = Object.entries(value);
+  if (!entries.length) return false;
+  return entries.every(([key, count]) => {
+    const timeseriesId = Number(key);
+    return Number.isSafeInteger(timeseriesId) &&
+      timeseriesId > 0 &&
+      String(timeseriesId) === key &&
+      Number.isSafeInteger(count) &&
+      count > 0;
+  });
+}
+
+function sourceManifestReferenceMismatch(pollutantKey) {
+  return new Error(
+    `Observation connector/pollutant identity mismatch: ${pollutantKey}`,
+  );
+}
+
+function buildSourceManifestReferenceEvidence({
+  connectorManifest,
+  connectorManifestIdentity,
+  pollutantReference,
+  pollutantManifest,
+  pollutantManifestIdentity,
+  pollutantKey,
+}) {
+  const referencedChildHash = requireSha256(
+    pollutantReference.manifest_hash,
+    "pollutant manifest_hash",
+  );
+  const currentChildHash = requireSha256(
+    pollutantManifest.manifest_hash,
+    "current pollutant manifest_hash",
+  );
+  let provenance = SOURCE_MANIFEST_REFERENCE_PROVENANCE_EXACT;
+  let reconstructedPreAugmentationHash = null;
+  let historicalAugmentationFields = [];
+  if (currentChildHash !== referencedChildHash) {
+    const keys = Object.keys(pollutantManifest);
+    if (
+      !isGenuineLegacyHashlessObservationManifest(pollutantManifest) ||
+      !Object.hasOwn(pollutantManifest, LEGACY_MANIFEST_AUGMENTATION_FIELD) ||
+      !legacyTimeseriesRowCountsAreCanonical(
+        pollutantManifest[LEGACY_MANIFEST_AUGMENTATION_FIELD],
+      ) ||
+      keys.at(-1) !== "manifest_hash" ||
+      keys.at(-2) !== LEGACY_MANIFEST_AUGMENTATION_FIELD
+    ) {
+      throw sourceManifestReferenceMismatch(pollutantKey);
+    }
+    const {
+      manifest_hash: _currentManifestHash,
+      timeseries_row_counts: _historicalAugmentation,
+      ...preAugmentationPayload
+    } = pollutantManifest;
+    reconstructedPreAugmentationHash = sha256Hex(
+      JSON.stringify(preAugmentationPayload),
+    );
+    if (reconstructedPreAugmentationHash !== referencedChildHash) {
+      throw sourceManifestReferenceMismatch(pollutantKey);
+    }
+    provenance =
+      SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_COUNTS_PATCH;
+    historicalAugmentationFields = [LEGACY_MANIFEST_AUGMENTATION_FIELD];
+  }
+  return Object.freeze({
+    parent_manifest_identity: connectorManifestIdentity,
+    parent_manifest_hash: connectorManifest.manifest_hash,
+    referenced_child_manifest_key: pollutantKey,
+    referenced_child_manifest_hash: referencedChildHash,
+    current_child_manifest_identity: pollutantManifestIdentity,
+    current_child_manifest_hash: currentChildHash,
+    provenance,
+    reconstructed_pre_augmentation_child_manifest_hash:
+      reconstructedPreAugmentationHash,
+    historical_metadata_augmentation_fields: Object.freeze(
+      historicalAugmentationFields,
+    ),
+  });
+}
+
+async function reverifyPinnedSourceManifestReference({
+  sourcePartition,
+  getR2Object,
+}) {
+  const pinned = sourcePartition.source_manifest_reference;
+  if (!pinned) {
+    throw new Error(
+      `Pinned source manifest reference is missing: ${partitionIdentity(sourcePartition.scope)}`,
+    );
+  }
+  const connectorObject = await getRequiredObject(
+    getR2Object,
+    pinned.parent_manifest_identity.key,
+    "canonical R2",
+  );
+  const connectorIdentity = bodyIdentity(
+    pinned.parent_manifest_identity.key,
+    connectorObject.body,
+  );
+  if (!sameJson(connectorIdentity, pinned.parent_manifest_identity)) {
+    throw new Error(
+      `Pinned source parent manifest identity changed: ${partitionIdentity(sourcePartition.scope)}`,
+    );
+  }
+  const connectorManifest = parseJsonBody(
+    pinned.parent_manifest_identity.key,
+    connectorObject.body,
+  );
+  validateCanonicalHistoryV2Manifest(connectorManifest, {
+    domain: "observations",
+    manifest_kind: "connector",
+    day_utc: sourcePartition.scope.day_utc,
+    connector_id: sourcePartition.scope.connector_id,
+    manifest_key: pinned.parent_manifest_identity.key,
+  });
+  const matchingReferences = (connectorManifest.pollutant_manifests || [])
+    .filter((reference) =>
+      reference?.pollutant_code === sourcePartition.scope.pollutant_code &&
+      reference?.manifest_key === pinned.referenced_child_manifest_key
+    );
+  if (matchingReferences.length !== 1) {
+    throw sourceManifestReferenceMismatch(
+      pinned.referenced_child_manifest_key,
+    );
+  }
+  const pollutantObject = await getRequiredObject(
+    getR2Object,
+    pinned.referenced_child_manifest_key,
+    "canonical R2",
+  );
+  const pollutantIdentity = bodyIdentity(
+    pinned.referenced_child_manifest_key,
+    pollutantObject.body,
+  );
+  if (!sameJson(pollutantIdentity, pinned.current_child_manifest_identity)) {
+    throw new Error(
+      `Pinned source child manifest identity changed: ${partitionIdentity(sourcePartition.scope)}`,
+    );
+  }
+  const pollutantManifest = parseJsonBody(
+    pinned.referenced_child_manifest_key,
+    pollutantObject.body,
+  );
+  validateCanonicalHistoryV2Manifest(pollutantManifest, {
+    domain: "observations",
+    manifest_kind: "pollutant",
+    day_utc: sourcePartition.scope.day_utc,
+    connector_id: sourcePartition.scope.connector_id,
+    pollutant_code: sourcePartition.scope.pollutant_code,
+    manifest_key: pinned.referenced_child_manifest_key,
+  });
+  const currentEvidence = buildSourceManifestReferenceEvidence({
+    connectorManifest,
+    connectorManifestIdentity: connectorIdentity,
+    pollutantReference: matchingReferences[0],
+    pollutantManifest,
+    pollutantManifestIdentity: pollutantIdentity,
+    pollutantKey: pinned.referenced_child_manifest_key,
+  });
+  if (!sameJson(currentEvidence, pinned)) {
+    throw new Error(
+      `Pinned source manifest reference evidence changed: ${partitionIdentity(sourcePartition.scope)}`,
+    );
+  }
+  return currentEvidence;
+}
+
+async function reverifyPinnedLegacyManifestReferencesBeforeMutation({
+  plan,
+  getR2Object,
+}) {
+  for (const sourcePartition of plan.inventory.partitions) {
+    if (
+      sourcePartition.source_manifest_reference.provenance !==
+        SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_COUNTS_PATCH
+    ) {
+      continue;
+    }
+    await reverifyPinnedSourceManifestReference({
+      sourcePartition,
+      getR2Object,
+    });
+  }
 }
 
 function assertRowsMatchSourcePartition(rows, { scope, manifest }) {
@@ -786,8 +978,12 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
           if (connectorPayload.manifest_hash !== expectedConnectorHash) {
             throw new Error(`Observation day/connector identity mismatch: ${connectorKey}`);
           }
+          const connectorIdentity = bodyIdentity(
+            connectorKey,
+            connectorObject.body,
+          );
           connectors.push({
-            ...bodyIdentity(connectorKey, connectorObject.body),
+            ...connectorIdentity,
             day_utc: dayUtc,
             connector_id: connectorId,
             payload: connectorPayload,
@@ -830,10 +1026,24 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
               pollutant_code: pollutantCode,
               manifest_key: pollutantKey,
             });
-            if (pollutantPayload.manifest_hash !== expectedPollutantHash) {
-              throw new Error(
-                `Observation connector/pollutant identity mismatch: ${pollutantKey}`,
-              );
+            const pollutantIdentity = bodyIdentity(
+              pollutantKey,
+              pollutantObject.body,
+            );
+            const sourceManifestReference =
+              buildSourceManifestReferenceEvidence({
+                connectorManifest: connectorPayload,
+                connectorManifestIdentity: connectorIdentity,
+                pollutantReference,
+                pollutantManifest: pollutantPayload,
+                pollutantManifestIdentity: pollutantIdentity,
+                pollutantKey,
+              });
+            if (
+              sourceManifestReference.referenced_child_manifest_hash !==
+                expectedPollutantHash
+            ) {
+              throw sourceManifestReferenceMismatch(pollutantKey);
             }
             if (pollutantPayload.row_count <= 0 || pollutantPayload.file_count <= 0) {
               throw new Error(`Canonical migration partition must be non-empty: ${pollutantKey}`);
@@ -851,7 +1061,8 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
             partitions.push(Object.freeze({
               scope: Object.freeze(scope),
               manifest: pollutantPayload,
-              manifest_identity: bodyIdentity(pollutantKey, pollutantObject.body),
+              manifest_identity: pollutantIdentity,
+              source_manifest_reference: sourceManifestReference,
               source_observation_content_hash_metadata:
                 effectiveSourceHash.metadata,
               source_observation_content_hash_provenance:
@@ -1261,6 +1472,10 @@ async function rewritePartition({
   sosConnectorId,
   v3IndexRoot,
 }) {
+  await reverifyPinnedSourceManifestReference({
+    sourcePartition,
+    getR2Object,
+  });
   const rows = [];
   const sourceFiles = [];
   for (const file of [...sourcePartition.canonical_files].sort((a, b) =>
@@ -1405,6 +1620,8 @@ async function rewritePartition({
       source_observation_content_hash_metadata: effectiveSourceHash,
       source_observation_content_hash_provenance:
         sourcePartition.source_observation_content_hash_provenance,
+      source_manifest_reference:
+        sourcePartition.source_manifest_reference,
       writer_limits: writerLimits,
       target_writer_git_sha: targetWriterGitSha,
       target_schema: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
@@ -1414,6 +1631,7 @@ async function rewritePartition({
     scope: sourcePartition.scope,
     source_manifest: sourcePartition.manifest,
     source_manifest_identity: sourcePartition.manifest_identity,
+    source_manifest_reference: sourcePartition.source_manifest_reference,
     source_files: Object.freeze(sourceFiles),
     source_row_count: sourcePartition.manifest.row_count,
     source_observation_content_hash:
@@ -1626,6 +1844,8 @@ function sourceUnitFromPartition({
         sourcePartition.source_observation_content_hash_metadata,
       source_observation_content_hash_provenance:
         sourcePartition.source_observation_content_hash_provenance,
+      source_manifest_reference:
+        sourcePartition.source_manifest_reference,
       writer_limits: writerLimits,
       target_writer_git_sha: targetWriterGitSha,
       target_schema: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
@@ -1635,6 +1855,7 @@ function sourceUnitFromPartition({
     scope: sourcePartition.scope,
     source_manifest: sourcePartition.manifest,
     source_manifest_identity: sourcePartition.manifest_identity,
+    source_manifest_reference: sourcePartition.source_manifest_reference,
     source_files: Object.freeze(sourceFiles),
     source_row_count: sourcePartition.manifest.row_count,
     source_observation_content_hash:
@@ -1777,6 +1998,18 @@ export async function buildObservationHistoryV3MigrationPlan({
           SOURCE_HASH_PROVENANCE_LEGACY_PARQUET,
     ).length,
   });
+  const sourceManifestReferenceProvenanceCounts = Object.freeze({
+    exact: inventory.partitions.filter((partition) =>
+      partition.source_manifest_reference.provenance ===
+        SOURCE_MANIFEST_REFERENCE_PROVENANCE_EXACT
+    ).length,
+    legacy_stale_after_timeseries_row_counts_patch:
+      inventory.partitions.filter((partition) =>
+        partition.source_manifest_reference.provenance ===
+          SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_COUNTS_PATCH
+      ).length,
+    unexplained: 0,
+  });
   const planIdentityPayload = {
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
     environment: environment.environment,
@@ -1790,6 +2023,8 @@ export async function buildObservationHistoryV3MigrationPlan({
     source_files: units.flatMap((unit) => unit.source_files),
     source_observation_content_hash_provenance_counts:
       sourceObservationContentHashProvenanceCounts,
+    source_manifest_reference_provenance_counts:
+      sourceManifestReferenceProvenanceCounts,
     observations_prefix: inventory.observations_prefix,
     v3_index_root: v3IndexRoot,
     v3_latest_key: v3LatestKey,
@@ -1820,6 +2055,8 @@ export async function buildObservationHistoryV3MigrationPlan({
     units: Object.freeze(units),
     source_observation_content_hash_provenance_counts:
       sourceObservationContentHashProvenanceCounts,
+    source_manifest_reference_provenance_counts:
+      sourceManifestReferenceProvenanceCounts,
     canonical_publication_objects: Object.freeze([]),
     v3_latest: null,
     v3_publication_plan: null,
@@ -2166,6 +2403,10 @@ export async function executeObservationHistoryV3MigrationPlan({
     buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
   } else {
     await adapters.writeCheckpoint(structuredClone(checkpoint));
+    await reverifyPinnedLegacyManifestReferencesBeforeMutation({
+      plan,
+      getR2Object: adapters.getObject,
+    });
   }
   const parquetEvidence = [];
   for (const authorityUnit of plan.units) {
@@ -2624,6 +2865,12 @@ export async function buildObservationHistoryV2RestorePlan({
       entry.manifest_identity,
     ]),
   ]);
+  const sourcePartitionByManifestKey = new Map(
+    authority.inventory.partitions.map((partition) => [
+      partition.manifest_identity.key,
+      partition,
+    ]),
+  );
   const requirePreStateIdentity = (key) => {
     const identity = preStateIdentityByKey.get(key);
     if (!identity?.sha256 || !Number.isSafeInteger(Number(identity.byte_size))) {
@@ -2705,8 +2952,38 @@ export async function buildObservationHistoryV2RestorePlan({
               rowCount: pollutant.row_count,
             });
           }
-          if (pollutant.manifest_hash !== pollutantReference.manifest_hash) {
-            throw new Error(`Dropbox pollutant logical manifest identity mismatch: ${pollutantIntent.key}`);
+          const sourcePartition = sourcePartitionByManifestKey.get(
+            pollutantIntent.key,
+          );
+          if (!sourcePartition) {
+            throw new Error(
+              `Rollback source partition authority is missing: ${pollutantIntent.key}`,
+            );
+          }
+          const restoredReferenceEvidence =
+            buildSourceManifestReferenceEvidence({
+              connectorManifest: connector,
+              connectorManifestIdentity: bodyIdentity(
+                connectorIntent.key,
+                connectorIntent.body,
+              ),
+              pollutantReference,
+              pollutantManifest: pollutant,
+              pollutantManifestIdentity: bodyIdentity(
+                pollutantIntent.key,
+                pollutantIntent.body,
+              ),
+              pollutantKey: pollutantIntent.key,
+            });
+          if (
+            !sameJson(
+              restoredReferenceEvidence,
+              sourcePartition.source_manifest_reference,
+            )
+          ) {
+            throw new Error(
+              `Dropbox source manifest reference evidence changed: ${pollutantIntent.key}`,
+            );
           }
           for (const file of pollutant.files || []) {
             const manifestIdentity = classifyManifestFileIdentity(
@@ -2948,9 +3225,22 @@ export function buildObservationHistoryV3MigrationAuditReport({
         unit.target_metadata?.verification_status_counts ?? null,
       source_observation_content_hash_provenance:
         unit.source_observation_content_hash_provenance,
+      source_manifest_reference_provenance:
+        unit.source_manifest_reference.provenance,
+      source_parent_referenced_child_manifest_hash:
+        unit.source_manifest_reference.referenced_child_manifest_hash,
+      source_current_child_manifest_hash:
+        unit.source_manifest_reference.current_child_manifest_hash,
+      source_reconstructed_pre_augmentation_child_manifest_hash:
+        unit.source_manifest_reference
+          .reconstructed_pre_augmentation_child_manifest_hash,
+      source_historical_metadata_augmentation_fields:
+        unit.source_manifest_reference.historical_metadata_augmentation_fields,
     })),
     source_observation_content_hash_provenance_counts:
       plan.source_observation_content_hash_provenance_counts,
+    source_manifest_reference_provenance_counts:
+      plan.source_manifest_reference_provenance_counts,
     target_writer_version: plan.target.writer_version,
     target_history_schema_version: plan.target.history_schema_version,
     target_physical_layout_version: plan.target.physical_layout_version,

@@ -277,6 +277,8 @@ function summaryForPlan(plan) {
     estimated: plan.estimated,
     source_observation_content_hash_provenance_counts:
       plan.source_observation_content_hash_provenance_counts,
+    source_manifest_reference_provenance_counts:
+      plan.source_manifest_reference_provenance_counts,
     writer_freeze_plan: plan.writer_freeze_plan,
     partitions: plan.units.map((unit) => ({
       unit_id: unit.unit_id,
@@ -287,6 +289,17 @@ function summaryForPlan(plan) {
       source_observation_content_hash: unit.source_observation_content_hash,
       source_observation_content_hash_provenance:
         unit.source_observation_content_hash_provenance,
+      source_manifest_reference_provenance:
+        unit.source_manifest_reference.provenance,
+      source_parent_referenced_child_manifest_hash:
+        unit.source_manifest_reference.referenced_child_manifest_hash,
+      source_current_child_manifest_hash:
+        unit.source_manifest_reference.current_child_manifest_hash,
+      source_reconstructed_pre_augmentation_child_manifest_hash:
+        unit.source_manifest_reference
+          .reconstructed_pre_augmentation_child_manifest_hash,
+      source_historical_metadata_augmentation_fields:
+        unit.source_manifest_reference.historical_metadata_augmentation_fields,
       source_verification_status_counts: unit.source_verification_status_counts,
       target_file_count: unit.target_file_count,
       target_row_group_count: unit.target_row_group_count,
