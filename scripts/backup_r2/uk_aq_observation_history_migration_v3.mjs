@@ -275,6 +275,8 @@ function summaryForPlan(plan) {
         }
       : null,
     estimated: plan.estimated,
+    source_observation_content_hash_provenance_counts:
+      plan.source_observation_content_hash_provenance_counts,
     writer_freeze_plan: plan.writer_freeze_plan,
     partitions: plan.units.map((unit) => ({
       unit_id: unit.unit_id,
@@ -283,6 +285,8 @@ function summaryForPlan(plan) {
       source_files: unit.source_files,
       source_row_count: unit.source_row_count,
       source_observation_content_hash: unit.source_observation_content_hash,
+      source_observation_content_hash_provenance:
+        unit.source_observation_content_hash_provenance,
       source_verification_status_counts: unit.source_verification_status_counts,
       target_file_count: unit.target_file_count,
       target_row_group_count: unit.target_row_group_count,

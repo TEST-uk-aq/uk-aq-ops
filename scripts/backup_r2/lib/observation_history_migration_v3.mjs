@@ -89,6 +89,17 @@ export const DEFAULT_BACKUP_STATE_ROOT_KEY =
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const OBSERVATION_CONTENT_HASH_METADATA_FIELDS = Object.freeze([
+  "observation_content_hash",
+  "observation_content_hash_algorithm",
+  "observation_content_hash_contract_version",
+  "observation_content_hash_row_count",
+  "observation_content_hash_columns",
+  "verification_status_counts",
+]);
+const SOURCE_HASH_PROVENANCE_MANIFEST = "manifest";
+const SOURCE_HASH_PROVENANCE_LEGACY_PARQUET =
+  "derived_from_legacy_canonical_parquet";
 const CANONICAL_STAGE_RANK = Object.freeze({
   pollutant_manifest: 10,
   connector_manifest: 20,
@@ -287,6 +298,88 @@ function contentHashMetadata(metadata) {
       [...metadata.observation_content_hash_columns],
     verification_status_counts: { ...metadata.verification_status_counts },
   };
+}
+
+function isGenuineLegacyHashlessObservationManifest(manifest) {
+  return OBSERVATION_CONTENT_HASH_METADATA_FIELDS.every(
+    (field) => !Object.hasOwn(manifest, field) || manifest[field] === null,
+  );
+}
+
+function assertRowsMatchSourcePartition(rows, { scope, manifest }) {
+  if (rows.length !== manifest.row_count) {
+    throw new Error(
+      `Canonical source row count mismatch: ${partitionIdentity(scope)}`,
+    );
+  }
+  for (const row of rows) {
+    if (
+      row.connector_id !== scope.connector_id ||
+      row.pollutant_code !== scope.pollutant_code ||
+      row.observed_at_utc.slice(0, 10) !== scope.day_utc
+    ) {
+      throw new Error(
+        `Canonical source row scope mismatch: ${partitionIdentity(scope)}`,
+      );
+    }
+  }
+}
+
+async function deriveLegacyObservationContentHashMetadata({
+  getR2Object,
+  manifest,
+  scope,
+  sosConnectorId,
+}) {
+  const rows = [];
+  for (const file of [...manifest.files].sort((left, right) =>
+    String(left.key).localeCompare(String(right.key))
+  )) {
+    const object = await getRequiredObject(getR2Object, file.key, "canonical R2");
+    verifyManifestFileIdentity({
+      manifestIdentity: file.etag_or_hash,
+      expectedBytes: file.bytes,
+      liveObject: object,
+      objectKey: file.key,
+    });
+    rows.push(...await readCanonicalObservationRowsFromParquetBytes({
+      body: object.body,
+      connectorId: scope.connector_id,
+      sosConnectorId,
+    }));
+  }
+  assertRowsMatchSourcePartition(rows, { scope, manifest });
+  const metadata = contentHashMetadata(computeObservationContentHash(rows));
+  validateObservationContentHashMetadata(metadata, {
+    rowCount: manifest.row_count,
+  });
+  return Object.freeze(metadata);
+}
+
+async function effectiveSourceObservationContentHash({
+  getR2Object,
+  manifest,
+  scope,
+  sosConnectorId,
+}) {
+  if (!isGenuineLegacyHashlessObservationManifest(manifest)) {
+    validateObservationContentHashMetadata(manifest, {
+      rowCount: manifest.row_count,
+    });
+    return Object.freeze({
+      metadata: Object.freeze(contentHashMetadata(manifest)),
+      provenance: SOURCE_HASH_PROVENANCE_MANIFEST,
+    });
+  }
+  return Object.freeze({
+    metadata: await deriveLegacyObservationContentHashMetadata({
+      getR2Object,
+      manifest,
+      scope,
+      sosConnectorId,
+    }),
+    provenance: SOURCE_HASH_PROVENANCE_LEGACY_PARQUET,
+  });
 }
 
 function fileEntryFromTargetMetadata(file, pollutantCode) {
@@ -572,6 +665,7 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
   observationsPrefix = DEFAULT_OBSERVATIONS_PREFIX,
   v2IndexRoot = DEFAULT_V2_INDEX_ROOT,
   v2LatestKey = DEFAULT_V2_LATEST_KEY,
+  sosConnectorId = 1,
 }) {
   if (typeof getR2Object !== "function") {
     throw new TypeError("Canonical inventory requires getR2Object adapter");
@@ -736,9 +830,6 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
               pollutant_code: pollutantCode,
               manifest_key: pollutantKey,
             });
-            validateObservationContentHashMetadata(pollutantPayload, {
-              rowCount: pollutantPayload.row_count,
-            });
             if (pollutantPayload.manifest_hash !== expectedPollutantHash) {
               throw new Error(
                 `Observation connector/pollutant identity mismatch: ${pollutantKey}`,
@@ -748,12 +839,23 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
               throw new Error(`Canonical migration partition must be non-empty: ${pollutantKey}`);
             }
             const scope = { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode };
+            const effectiveSourceHash =
+              await effectiveSourceObservationContentHash({
+                getR2Object,
+                manifest: pollutantPayload,
+                scope,
+                sosConnectorId,
+              });
             const v2IndexKey = v2ScopedIndexKey(v2IndexRoot, scope);
             const v2IndexObject = await getOptionalObject(getR2Object, v2IndexKey);
             partitions.push(Object.freeze({
               scope: Object.freeze(scope),
               manifest: pollutantPayload,
               manifest_identity: bodyIdentity(pollutantKey, pollutantObject.body),
+              source_observation_content_hash_metadata:
+                effectiveSourceHash.metadata,
+              source_observation_content_hash_provenance:
+                effectiveSourceHash.provenance,
               canonical_files: Object.freeze(
                 pollutantPayload.files.map((file) => Object.freeze({ ...file })),
               ),
@@ -1188,17 +1290,39 @@ async function rewritePartition({
     }));
   }
   const sourceLogical = computeObservationContentHash(rows);
-  validateObservationContentHashMetadata(sourcePartition.manifest, {
+  assertRowsMatchSourcePartition(rows, {
+    scope: sourcePartition.scope,
+    manifest: sourcePartition.manifest,
+  });
+  const effectiveSourceHash =
+    sourcePartition.source_observation_content_hash_metadata;
+  validateObservationContentHashMetadata(effectiveSourceHash, {
     rowCount: sourcePartition.manifest.row_count,
   });
   if (
-    rows.length !== sourcePartition.manifest.row_count ||
-    sourceLogical.observation_content_hash !==
-      sourcePartition.manifest.observation_content_hash ||
-    !sameJson(
-      sourceLogical.verification_status_counts,
-      sourcePartition.manifest.verification_status_counts,
-    )
+    sourcePartition.source_observation_content_hash_provenance ===
+      SOURCE_HASH_PROVENANCE_MANIFEST
+  ) {
+    validateObservationContentHashMetadata(sourcePartition.manifest, {
+      rowCount: sourcePartition.manifest.row_count,
+    });
+    if (!sameJson(contentHashMetadata(sourcePartition.manifest), effectiveSourceHash)) {
+      throw new Error(
+        `Manifest source logical identity changed: ${partitionIdentity(sourcePartition.scope)}`,
+      );
+    }
+  } else if (
+    sourcePartition.source_observation_content_hash_provenance !==
+      SOURCE_HASH_PROVENANCE_LEGACY_PARQUET ||
+    !isGenuineLegacyHashlessObservationManifest(sourcePartition.manifest)
+  ) {
+    throw new Error(
+      `Canonical source hash provenance is invalid: ${partitionIdentity(sourcePartition.scope)}`,
+    );
+  }
+  const computedSourceHash = contentHashMetadata(sourceLogical);
+  if (
+    !sameJson(computedSourceHash, effectiveSourceHash)
   ) {
     throw new Error(
       `Canonical source logical identity mismatch: ${partitionIdentity(sourcePartition.scope)}`,
@@ -1215,9 +1339,7 @@ async function rewritePartition({
     ),
   });
   if (
-    target.metadata.row_count !== sourcePartition.manifest.row_count ||
-    target.metadata.observation_content_hash !==
-      sourcePartition.manifest.observation_content_hash
+    !sameJson(contentHashMetadata(target.metadata), effectiveSourceHash)
   ) {
     throw new Error(
       `Target rewrite logical identity mismatch: ${partitionIdentity(sourcePartition.scope)}`,
@@ -1279,6 +1401,10 @@ async function rewritePartition({
   return Object.freeze({
     unit_id: sha256Hex(stableMigrationJson({
       source_manifest: sourcePartition.manifest_identity,
+      source_files: sourceFiles,
+      source_observation_content_hash_metadata: effectiveSourceHash,
+      source_observation_content_hash_provenance:
+        sourcePartition.source_observation_content_hash_provenance,
       writer_limits: writerLimits,
       target_writer_git_sha: targetWriterGitSha,
       target_schema: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
@@ -1291,9 +1417,12 @@ async function rewritePartition({
     source_files: Object.freeze(sourceFiles),
     source_row_count: sourcePartition.manifest.row_count,
     source_observation_content_hash:
-      sourcePartition.manifest.observation_content_hash,
+      effectiveSourceHash.observation_content_hash,
+    source_observation_content_hash_metadata: effectiveSourceHash,
+    source_observation_content_hash_provenance:
+      sourcePartition.source_observation_content_hash_provenance,
     source_verification_status_counts: Object.freeze({
-      ...sourcePartition.manifest.verification_status_counts,
+      ...effectiveSourceHash.verification_status_counts,
     }),
     target_metadata: target.metadata,
     target_file_intents: Object.freeze(fileIntents),
@@ -1493,6 +1622,10 @@ function sourceUnitFromPartition({
     unit_id: sha256Hex(stableMigrationJson({
       source_manifest: sourcePartition.manifest_identity,
       source_files: sourceFiles,
+      source_observation_content_hash_metadata:
+        sourcePartition.source_observation_content_hash_metadata,
+      source_observation_content_hash_provenance:
+        sourcePartition.source_observation_content_hash_provenance,
       writer_limits: writerLimits,
       target_writer_git_sha: targetWriterGitSha,
       target_schema: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
@@ -1505,9 +1638,15 @@ function sourceUnitFromPartition({
     source_files: Object.freeze(sourceFiles),
     source_row_count: sourcePartition.manifest.row_count,
     source_observation_content_hash:
-      sourcePartition.manifest.observation_content_hash,
+      sourcePartition.source_observation_content_hash_metadata
+        .observation_content_hash,
+    source_observation_content_hash_metadata:
+      sourcePartition.source_observation_content_hash_metadata,
+    source_observation_content_hash_provenance:
+      sourcePartition.source_observation_content_hash_provenance,
     source_verification_status_counts: Object.freeze({
-      ...sourcePartition.manifest.verification_status_counts,
+      ...sourcePartition.source_observation_content_hash_metadata
+        .verification_status_counts,
     }),
     logical_identity_verified: false,
     target_file_count: null,
@@ -1560,6 +1699,7 @@ export async function buildObservationHistoryV3MigrationPlan({
     observationsPrefix,
     v2IndexRoot,
     v2LatestKey,
+    sosConnectorId,
   });
   let backupGate = null;
   const blockers = [...environment.blockers];
@@ -1626,6 +1766,17 @@ export async function buildObservationHistoryV3MigrationPlan({
         targetWriterGitSha,
       }))
     : [];
+  const sourceObservationContentHashProvenanceCounts = Object.freeze({
+    manifest: inventory.partitions.filter((partition) =>
+      partition.source_observation_content_hash_provenance ===
+        SOURCE_HASH_PROVENANCE_MANIFEST
+    ).length,
+    derived_from_legacy_canonical_parquet: inventory.partitions.filter(
+      (partition) =>
+        partition.source_observation_content_hash_provenance ===
+          SOURCE_HASH_PROVENANCE_LEGACY_PARQUET,
+    ).length,
+  });
   const planIdentityPayload = {
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
     environment: environment.environment,
@@ -1637,6 +1788,8 @@ export async function buildObservationHistoryV3MigrationPlan({
     target_writer_git_sha: targetWriterGitSha,
     unit_ids: units.map((unit) => unit.unit_id),
     source_files: units.flatMap((unit) => unit.source_files),
+    source_observation_content_hash_provenance_counts:
+      sourceObservationContentHashProvenanceCounts,
     observations_prefix: inventory.observations_prefix,
     v3_index_root: v3IndexRoot,
     v3_latest_key: v3LatestKey,
@@ -1665,6 +1818,8 @@ export async function buildObservationHistoryV3MigrationPlan({
     rollback_authority: rollbackAuthority,
     rollback_preflight: rollbackPreflight,
     units: Object.freeze(units),
+    source_observation_content_hash_provenance_counts:
+      sourceObservationContentHashProvenanceCounts,
     canonical_publication_objects: Object.freeze([]),
     v3_latest: null,
     v3_publication_plan: null,
@@ -1722,11 +1877,9 @@ function preparedUnitFromRecord(authorityUnit, record) {
   }
   if (
     record.target_metadata.row_count !== authorityUnit.source_row_count ||
-    record.target_metadata.observation_content_hash !==
-      authorityUnit.source_observation_content_hash ||
     !sameJson(
-      record.target_metadata.verification_status_counts,
-      authorityUnit.source_verification_status_counts,
+      contentHashMetadata(record.target_metadata),
+      authorityUnit.source_observation_content_hash_metadata,
     )
   ) {
     throw new Error(`Prepared unit logical identity changed: ${authorityUnit.unit_id}`);
@@ -2034,6 +2187,9 @@ export async function executeObservationHistoryV3MigrationPlan({
         sosConnectorId: plan.sos_connector_id,
         v3IndexRoot: plan.v3_index_root,
       });
+      if (rewritten.unit_id !== authorityUnit.unit_id) {
+        throw new Error(`Pinned source unit identity changed: ${authorityUnit.unit_id}`);
+      }
       if (!sameJson(rewritten.source_files, authorityUnit.source_files)) {
         throw new Error(`Pinned source file identity changed: ${authorityUnit.unit_id}`);
       }
@@ -2199,11 +2355,9 @@ export async function verifyObservationHistoryV3MigrationResult({
   for (const unit of plan.units) {
     if (
       unit.source_row_count !== unit.target_metadata.row_count ||
-      unit.source_observation_content_hash !==
-        unit.target_metadata.observation_content_hash ||
       !sameJson(
-        unit.source_verification_status_counts,
-        unit.target_metadata.verification_status_counts,
+        unit.source_observation_content_hash_metadata,
+        contentHashMetadata(unit.target_metadata),
       )
     ) {
       blockers.push(`logical_identity_mismatch:${partitionIdentity(unit.scope)}`);
@@ -2546,9 +2700,11 @@ export async function buildObservationHistoryV2RestorePlan({
             pollutant_code: pollutantReference.pollutant_code,
             manifest_key: pollutantReference.manifest_key,
           });
-          validateObservationContentHashMetadata(pollutant, {
-            rowCount: pollutant.row_count,
-          });
+          if (!isGenuineLegacyHashlessObservationManifest(pollutant)) {
+            validateObservationContentHashMetadata(pollutant, {
+              rowCount: pollutant.row_count,
+            });
+          }
           if (pollutant.manifest_hash !== pollutantReference.manifest_hash) {
             throw new Error(`Dropbox pollutant logical manifest identity mismatch: ${pollutantIntent.key}`);
           }
@@ -2790,7 +2946,11 @@ export function buildObservationHistoryV3MigrationAuditReport({
       new_row_group_count: unit.target_row_group_count ?? null,
       verification_status_counts:
         unit.target_metadata?.verification_status_counts ?? null,
+      source_observation_content_hash_provenance:
+        unit.source_observation_content_hash_provenance,
     })),
+    source_observation_content_hash_provenance_counts:
+      plan.source_observation_content_hash_provenance_counts,
     target_writer_version: plan.target.writer_version,
     target_history_schema_version: plan.target.history_schema_version,
     target_physical_layout_version: plan.target.physical_layout_version,

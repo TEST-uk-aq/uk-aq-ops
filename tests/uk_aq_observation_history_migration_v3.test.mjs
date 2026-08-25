@@ -12,6 +12,9 @@ import {
   buildCanonicalObservationTimeseriesBoundedFiles,
 } from "../workers/shared/uk_aq_observation_history_target_writer.mjs";
 import {
+  validateObservationContentHashMetadata,
+} from "../workers/shared/uk_aq_observation_content_hash.mjs";
+import {
   buildHistoryV2TimeseriesLatestPayload,
   buildHistoryV2TimeseriesPollutantIndexPayload,
   buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey,
@@ -45,6 +48,7 @@ import {
   DEFAULT_BACKUP_STATE_ROOT_KEY,
   DEFAULT_V2_LATEST_KEY,
   buildObservationHistoryV2RestorePlan,
+  buildObservationHistoryV3MigrationAuditReport,
   buildObservationHistoryV3MigrationPlan,
   buildObservationHistoryV3MigrationPlanFromCheckpoint,
   buildObservationHistoryV3RerunVerificationPlan,
@@ -104,6 +108,11 @@ function metadataHash(metadata) {
   };
 }
 
+function rehashManifest(manifest) {
+  const { manifest_hash: _oldHash, ...payload } = manifest;
+  return { ...payload, manifest_hash: sha256Hex(JSON.stringify(payload)) };
+}
+
 function fileEntry(file, pollutantCode) {
   return {
     key: file.key,
@@ -142,17 +151,20 @@ function realR2NotFoundError(key) {
   );
 }
 
-async function buildFixture() {
+async function buildFixture({
+  pollutantCodes = ["pm25", "pm10"],
+  manifestModes = {},
+} = {}) {
   const baseRows = [
     [100, "2026-01-02T00:00:00.000Z", 10, "P"],
     [100, "2026-01-02T01:00:00.000Z", 11, "R"],
     [1000, "2026-01-02T00:30:00.000Z", 20, "P"],
     [1000, "2026-01-02T01:30:00.000Z", 21, "R"],
   ];
-  const pollutantInputs = [
-    ["pm25", baseRows],
-    ["pm10", baseRows.map(([timeseriesId, ...rest]) => [timeseriesId + 2000, ...rest])],
-  ];
+  const pollutantInputs = pollutantCodes.map((pollutantCode, index) => [
+    pollutantCode,
+    baseRows.map(([timeseriesId, ...rest]) => [timeseriesId + (index * 2000), ...rest]),
+  ]);
   const sources = [];
   const pollutants = [];
   for (const [pollutantCode, inputRows] of pollutantInputs) {
@@ -176,7 +188,7 @@ async function buildFixture() {
       1,
       pollutantCode,
     );
-    const pollutant = buildHistoryV2PollutantManifest({
+    let pollutant = buildHistoryV2PollutantManifest({
       domain: "observations",
       dayUtc: DAY,
       connectorId: 1,
@@ -193,6 +205,34 @@ async function buildFixture() {
         writer_version: source.metadata.writer_version,
       },
     });
+    const manifestMode = manifestModes[pollutantCode] || "modern";
+    if (
+      manifestMode === "legacy_hashless" ||
+      manifestMode === "legacy_hashless_null"
+    ) {
+      pollutant = structuredClone(pollutant);
+      for (const field of [
+        "observation_content_hash",
+        "observation_content_hash_algorithm",
+        "observation_content_hash_contract_version",
+        "observation_content_hash_row_count",
+        "observation_content_hash_columns",
+        "verification_status_counts",
+      ]) {
+        if (manifestMode === "legacy_hashless_null") pollutant[field] = null;
+        else delete pollutant[field];
+      }
+      pollutant = rehashManifest(pollutant);
+    } else if (manifestMode === "malformed_hash") {
+      pollutant = rehashManifest({
+        ...pollutant,
+        observation_content_hash: "NOT-A-SHA256",
+      });
+    } else if (manifestMode === "partial_contract") {
+      pollutant = structuredClone(pollutant);
+      delete pollutant.observation_content_hash_algorithm;
+      pollutant = rehashManifest(pollutant);
+    }
     sources.push(source);
     pollutants.push({ key: pollutantKey, payload: pollutant });
   }
@@ -631,6 +671,154 @@ test("Phase 6 rollback completeness rejects missing connector/day coverage in v2
       expectedCanonicalRootIdentity: inventory.root_manifest,
     }),
     /latest index is incomplete or contradictory/,
+  );
+});
+
+test("Phase 6 migration inventory keeps complete modern hash metadata strict and manifest-provided", async () => {
+  const fixture = await buildFixture();
+  let canonicalParquetReads = 0;
+  const getR2Object = async ({ key }) => {
+    if (key.endsWith(".parquet")) canonicalParquetReads += 1;
+    return mapReader(fixture.r2)({ key });
+  };
+  const plan = await buildPlan(fixture, { getR2Object });
+  assert.equal(canonicalParquetReads, 0);
+  assert.deepEqual(plan.source_observation_content_hash_provenance_counts, {
+    manifest: 2,
+    derived_from_legacy_canonical_parquet: 0,
+  });
+  for (const unit of plan.units) {
+    assert.equal(unit.source_observation_content_hash_provenance, "manifest");
+    assert.equal(
+      unit.source_observation_content_hash,
+      unit.source_manifest.observation_content_hash,
+    );
+  }
+});
+
+test("Phase 6 derives and pins genuine legacy hashless metadata for any canonical property code", async () => {
+  const fixture = await buildFixture({
+    pollutantCodes: ["pm25", "h3cch2chch32"],
+    manifestModes: { h3cch2chch32: "legacy_hashless" },
+  });
+  let canonicalParquetReads = 0;
+  const getR2Object = async ({ key }) => {
+    if (key.endsWith(".parquet")) canonicalParquetReads += 1;
+    return mapReader(fixture.r2)({ key });
+  };
+  const first = await buildPlan(fixture, { getR2Object });
+  assert.equal(canonicalParquetReads, 1);
+  const second = await buildPlan(fixture);
+  assert.equal(first.plan_sha256, second.plan_sha256);
+  assert.deepEqual(first.source_observation_content_hash_provenance_counts, {
+    manifest: 1,
+    derived_from_legacy_canonical_parquet: 1,
+  });
+  const legacy = first.units.find(
+    (unit) => unit.scope.pollutant_code === "h3cch2chch32",
+  );
+  assert.equal(
+    legacy.source_observation_content_hash_provenance,
+    "derived_from_legacy_canonical_parquet",
+  );
+  assert.deepEqual(
+    legacy.source_observation_content_hash_metadata,
+    metadataHash(fixture.sources[1].metadata),
+  );
+  assert.equal(
+    legacy.source_observation_content_hash,
+    fixture.sources[1].metadata.observation_content_hash,
+  );
+  assert.equal(
+    first.units.find((unit) => unit.scope.pollutant_code === "pm25")
+      .source_observation_content_hash_provenance,
+    "manifest",
+  );
+  const audit = buildObservationHistoryV3MigrationAuditReport({
+    plan: first,
+    mode: "plan",
+  });
+  assert.deepEqual(
+    audit.source_observation_content_hash_provenance_counts,
+    first.source_observation_content_hash_provenance_counts,
+  );
+  assert.equal(
+    audit.partition_results.find(
+      (entry) => entry.scope.pollutant_code === "h3cch2chch32",
+    ).source_observation_content_hash_provenance,
+    "derived_from_legacy_canonical_parquet",
+  );
+  const nullFixture = await buildFixture({
+    manifestModes: { pm25: "legacy_hashless_null" },
+  });
+  const nullPlan = await buildPlan(nullFixture);
+  assert.equal(
+    nullPlan.units.find((unit) => unit.scope.pollutant_code === "pm25")
+      .source_observation_content_hash_provenance,
+    "derived_from_legacy_canonical_parquet",
+  );
+});
+
+test("Phase 6 rejects malformed and partial non-legacy hash contracts", async () => {
+  for (const [mode, expected] of [
+    ["malformed_hash", /observation_content_hash must be lower-case SHA-256/],
+    ["partial_contract", /unsupported observation content hash algorithm/],
+  ]) {
+    const fixture = await buildFixture({
+      manifestModes: { pm25: mode },
+    });
+    await assert.rejects(buildPlan(fixture), expected);
+  }
+});
+
+test("Phase 6 preparation re-verifies a pinned legacy-derived logical identity and writes modern metadata", async () => {
+  const fixture = await buildFixture({
+    manifestModes: { pm25: "legacy_hashless" },
+  });
+  const plan = await buildPlan(fixture);
+  const tampered = structuredClone(plan);
+  const tamperedPartition = tampered.inventory.partitions.find(
+    (partition) => partition.scope.pollutant_code === "pm25",
+  );
+  tamperedPartition.source_observation_content_hash_metadata
+    .observation_content_hash = "f".repeat(64);
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan: tampered,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters: memoryAdapters(fixture),
+    }),
+    /Canonical source logical identity mismatch/,
+  );
+
+  const completeFixture = await buildFixture({
+    manifestModes: { pm25: "legacy_hashless" },
+  });
+  const completePlan = await buildPlan(completeFixture);
+  const execution = await executeObservationHistoryV3MigrationPlan({
+    plan: completePlan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters: memoryAdapters(completeFixture),
+  });
+  assert.equal(execution.verification.cutover_ready, true);
+  const completedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: execution.checkpoint,
+    requirePrepared: true,
+  });
+  const legacyUnit = completedPlan.units.find(
+    (unit) => unit.scope.pollutant_code === "pm25",
+  );
+  validateObservationContentHashMetadata(legacyUnit.target_manifest, {
+    rowCount: legacyUnit.target_manifest.row_count,
+  });
+  assert.equal(
+    legacyUnit.target_manifest.observation_content_hash,
+    completePlan.units.find((unit) => unit.scope.pollutant_code === "pm25")
+      .source_observation_content_hash,
   );
 });
 
