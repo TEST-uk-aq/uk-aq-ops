@@ -397,3 +397,50 @@ test("v3 migrate --apply acquires the global lock before reading migration autho
   assert.equal(lockedOptions.databaseUrl, "postgresql://direct-session");
   assert.deepEqual(lockedOptions.commandArgs.slice(1), argv);
 });
+
+test("v2 rollback --apply delegates the complete command to the same global lock", async (t) => {
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-rollback-lock-"));
+  t.after(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }));
+  const limitsPath = path.join(temporaryRoot, "limits.json");
+  fs.writeFileSync(limitsPath, JSON.stringify(ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3));
+  const argv = [
+    "--mode", "rollback",
+    "--apply",
+    "--writers-frozen",
+    "--environment", "TEST",
+    "--expected-bucket", "test-bucket",
+    "--migration-run-id", "migration:test",
+    "--target-writer-git-sha", "0123456789abcdef",
+    "--writer-limits-json", limitsPath,
+    "--dropbox-root", path.join(temporaryRoot, "missing-dropbox-authority"),
+    "--expected-inventory-root-sha256", h("a"),
+    "--expected-state-root-sha256", h("b"),
+    "--report-out", path.join(temporaryRoot, "report.json"),
+    "--checkpoint-in", path.join(temporaryRoot, "missing-checkpoint.json"),
+  ];
+  let lockedOptions = null;
+  const result = await runObservationHistoryMigrationV3({
+    argv,
+    env: {
+      SUPABASE_DB_URL: "postgresql://direct-session",
+      CFLARE_R2_ENDPOINT: "https://example.invalid",
+      CFLARE_R2_BUCKET: "test-bucket",
+      CFLARE_R2_REGION: "auto",
+      CFLARE_R2_ACCESS_KEY_ID: "test-access",
+      CFLARE_R2_SECRET_ACCESS_KEY: "test-secret",
+      UK_AQ_ENV_NAME: "TEST",
+      UK_AQ_R2_HISTORY_VERSION: "v2",
+      UK_AQ_R2_HISTORY_INDEX_VERSION: "v2",
+      UK_AQ_R2_HISTORY_INTEGRITY_VERSION: "v2",
+    },
+    runLockedCommand: async (options) => {
+      lockedOptions = options;
+      return 75;
+    },
+  });
+  assert.deepEqual(result, { delegated: true, exitCode: 75 });
+  assert.equal(lockedOptions.owner, "observation_history_rollback_v2");
+  assert.equal(lockedOptions.runId, "migration:test");
+  assert.equal(lockedOptions.databaseUrl, "postgresql://direct-session");
+  assert.deepEqual(lockedOptions.commandArgs.slice(1), argv);
+});

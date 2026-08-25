@@ -55,13 +55,6 @@ import {
   buildR2ChecksumAwarePutIntent,
   verifyR2StoredSha256Head,
 } from "../../../workers/shared/uk_aq_r2_checksum_publication.mjs";
-import {
-  buildHistoryV2TimeseriesLatestPayload,
-  buildHistoryV2TimeseriesPollutantIndexPayload,
-} from "../../../workers/shared/uk_aq_r2_history_index.mjs";
-import {
-  isConfirmedR2ObjectAbsentError,
-} from "../../../workers/shared/uk_aq_r2_history_writer.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import {
   monthStateIsComplete,
@@ -213,7 +206,7 @@ async function getOptionalObject(getObject, key) {
       ...bodyIdentity(key, body),
     });
   } catch (error) {
-    if (isConfirmedR2ObjectAbsentError(error)) {
+    if (/not found|missing/i.test(error instanceof Error ? error.message : String(error))) {
       return null;
     }
     throw error;
@@ -782,221 +775,6 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
     existing_v2_latest_identity: latestObject
       ? bodyIdentity(v2LatestKey, latestObject.body)
       : null,
-  });
-}
-
-function maxCanonicalIso(values) {
-  const normalized = values
-    .map((value) => String(value || "").trim())
-    .filter(Boolean)
-    .sort((left, right) => left.localeCompare(right));
-  return normalized.at(-1) || null;
-}
-
-function buildObservationHistoryV2CompletenessExpectation({
-  canonicalInventory,
-  bucket,
-  v2IndexRoot,
-  v2LatestKey,
-}) {
-  const normalizedBucket = String(bucket || "").trim();
-  if (!normalizedBucket) {
-    throw new TypeError("Rollback v2 completeness verification requires the R2 bucket");
-  }
-  const connectorByScope = new Map(
-    canonicalInventory.connector_manifests.map((entry) => [
-      `${entry.day_utc}|${entry.connector_id}`,
-      entry,
-    ]),
-  );
-  const dayByDayUtc = new Map(
-    canonicalInventory.day_manifests.map((entry) => [entry.day_utc, entry]),
-  );
-  const pollutantIndexes = canonicalInventory.partitions.map((partition) => {
-    const { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode } =
-      partition.scope;
-    const key = v2ScopedIndexKey(v2IndexRoot, partition.scope);
-    const payload = buildHistoryV2TimeseriesPollutantIndexPayload({
-      domain: "observations",
-      dayUtc,
-      connectorId,
-      pollutantCode,
-      generatedAt: null,
-      bucket: normalizedBucket,
-      dataPrefix: canonicalInventory.observations_prefix,
-      pollutantManifestKey: partition.manifest_identity.key,
-      pollutantManifest: partition.manifest,
-    });
-    return Object.freeze({
-      key,
-      scope: partition.scope,
-      payload: Object.freeze(payload),
-    });
-  });
-
-  const pollutantsByConnector = new Map();
-  for (const entry of pollutantIndexes) {
-    const connectorScope = `${entry.scope.day_utc}|${entry.scope.connector_id}`;
-    const values = pollutantsByConnector.get(connectorScope) || [];
-    values.push(entry);
-    pollutantsByConnector.set(connectorScope, values);
-  }
-  const connectorsByDay = new Map();
-  for (const [connectorScope, entries] of pollutantsByConnector) {
-    const [dayUtc, connectorIdText] = connectorScope.split("|");
-    const connectorId = Number(connectorIdText);
-    const connectorManifest = connectorByScope.get(connectorScope);
-    if (!connectorManifest) {
-      throw new Error(`Canonical connector manifest is missing for ${connectorScope}`);
-    }
-    const connectorSummary = Object.freeze({
-      connector_id: connectorId,
-      row_count: entries.reduce((sum, entry) => sum + entry.payload.source_row_count, 0),
-      pollutant_indexes: Object.freeze(entries),
-      backed_up_at_utc:
-        String(connectorManifest.payload?.backed_up_at_utc || "").trim() ||
-        maxCanonicalIso(entries.map((entry) => entry.payload.backed_up_at_utc)),
-    });
-    const values = connectorsByDay.get(dayUtc) || [];
-    values.push(connectorSummary);
-    connectorsByDay.set(dayUtc, values);
-  }
-
-  const daySummaries = [...connectorsByDay]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([dayUtc, connectors]) => {
-      connectors.sort((left, right) => left.connector_id - right.connector_id);
-      const pollutantEntries = connectors.flatMap((entry) => entry.pollutant_indexes);
-      const dayManifest = dayByDayUtc.get(dayUtc);
-      if (!dayManifest) throw new Error(`Canonical day manifest is missing for ${dayUtc}`);
-      return Object.freeze({
-        day_utc: dayUtc,
-        connector_count: connectors.length,
-        connector_ids: connectors.map((entry) => entry.connector_id),
-        connectors: connectors.map((entry) => ({
-          connector_id: entry.connector_id,
-          row_count: entry.row_count,
-        })),
-        total_rows: connectors.reduce((sum, entry) => sum + entry.row_count, 0),
-        pollutant_codes: Array.from(new Set(
-          pollutantEntries.map((entry) => entry.scope.pollutant_code),
-        )).sort((left, right) => left.localeCompare(right)),
-        pollutant_index_count: pollutantEntries.length,
-        file_count: pollutantEntries.reduce(
-          (sum, entry) => sum + entry.payload.file_count,
-          0,
-        ),
-        indexed_file_count: pollutantEntries.reduce(
-          (sum, entry) => sum + entry.payload.indexed_file_count,
-          0,
-        ),
-        backed_up_at_utc:
-          String(dayManifest.payload?.backed_up_at_utc || "").trim() ||
-          maxCanonicalIso(connectors.map((entry) => entry.backed_up_at_utc)),
-      });
-    });
-
-  return Object.freeze({
-    pollutant_indexes: Object.freeze(pollutantIndexes),
-    day_summaries: Object.freeze(daySummaries),
-    latest_key: v2LatestKey,
-  });
-}
-
-export async function verifyObservationHistoryV2IndexCompleteness({
-  getR2Object,
-  bucket,
-  observationsPrefix = DEFAULT_OBSERVATIONS_PREFIX,
-  v2IndexRoot = DEFAULT_V2_INDEX_ROOT,
-  v2LatestKey = DEFAULT_V2_LATEST_KEY,
-  expectedCanonicalRootIdentity = null,
-}) {
-  const canonicalInventory = await inventoryAuthoritativeCanonicalObservationHistory({
-    getR2Object,
-    observationsPrefix,
-    v2IndexRoot,
-    v2LatestKey,
-  });
-  if (
-    expectedCanonicalRootIdentity &&
-    (
-      canonicalInventory.root_manifest.key !== expectedCanonicalRootIdentity.key ||
-      canonicalInventory.root_manifest.byte_size !== expectedCanonicalRootIdentity.byte_size ||
-      canonicalInventory.root_manifest.sha256 !== expectedCanonicalRootIdentity.sha256
-    )
-  ) {
-    throw new Error("Rollback canonical root identity changed before v2 index verification");
-  }
-  const expectation = buildObservationHistoryV2CompletenessExpectation({
-    canonicalInventory,
-    bucket,
-    v2IndexRoot,
-    v2LatestKey,
-  });
-  const verifiedPollutants = [];
-  for (const expected of expectation.pollutant_indexes) {
-    if (
-      expected.payload.index_coverage !== "complete" ||
-      expected.payload.indexed_file_count !== expected.payload.file_count
-    ) {
-      throw new Error(
-        `Restored canonical scope cannot produce complete v2 index coverage: ${expected.key}`,
-      );
-    }
-    const object = await getRequiredObject(
-      getR2Object,
-      expected.key,
-      "Rebuilt v2 observation-timeseries index",
-    );
-    const actual = parseJsonBody(expected.key, object.body);
-    const expectedPayload = expected.payload.generated_at
-      ? expected.payload
-      : { ...expected.payload, generated_at: actual.generated_at ?? null };
-    if (
-      actual.index_coverage !== "complete" ||
-      actual.indexed_file_count !== actual.file_count ||
-      stableMigrationJson(actual) !== stableMigrationJson(expectedPayload)
-    ) {
-      throw new Error(
-        `Rebuilt v2 observation-timeseries pollutant index is incomplete or contradictory: ${expected.key}`,
-      );
-    }
-    verifiedPollutants.push(bodyIdentity(expected.key, object.body));
-  }
-
-  const latestObject = await getRequiredObject(
-    getR2Object,
-    expectation.latest_key,
-    "Rebuilt v2 observation-timeseries latest index",
-  );
-  const actualLatest = parseJsonBody(expectation.latest_key, latestObject.body);
-  const expectedLatest = buildHistoryV2TimeseriesLatestPayload({
-    domain: "observations",
-    bucket,
-    generatedAt: actualLatest.generated_at,
-    indexPrefix: path.posix.dirname(expectation.latest_key),
-    dataPrefix: canonicalInventory.observations_prefix,
-    timeseriesIndexPrefix: v2IndexRoot,
-    daySummaries: expectation.day_summaries,
-  });
-  if (stableMigrationJson(actualLatest) !== stableMigrationJson(expectedLatest)) {
-    throw new Error(
-      `Rebuilt v2 observation-timeseries latest index is incomplete or contradictory: ${expectation.latest_key}`,
-    );
-  }
-  return Object.freeze({
-    ok: true,
-    complete: true,
-    canonical_root_identity: Object.freeze({
-      key: canonicalInventory.root_manifest.key,
-      byte_size: canonicalInventory.root_manifest.byte_size,
-      sha256: canonicalInventory.root_manifest.sha256,
-    }),
-    day_count: expectation.day_summaries.length,
-    connector_count: canonicalInventory.connector_manifests.length,
-    pollutant_index_count: verifiedPollutants.length,
-    pollutant_indexes: Object.freeze(verifiedPollutants),
-    latest_index: Object.freeze(bodyIdentity(expectation.latest_key, latestObject.body)),
   });
 }
 
@@ -2666,7 +2444,6 @@ export async function executeObservationHistoryV2Rollback({
     "getObject",
     "headObject",
     "rebuildV2Indexes",
-    "verifyV2IndexCompleteness",
     "getBackupObject",
   ]) {
     if (typeof adapters?.[name] !== "function") {
@@ -2713,17 +2490,6 @@ export async function executeObservationHistoryV2Rollback({
   ) {
     throw new Error("Rollback v2 observation-timeseries index rebuild failed");
   }
-  const v2IndexCompleteness = await adapters.verifyV2IndexCompleteness({
-    restorePlan,
-    indexResult,
-  });
-  if (
-    !v2IndexCompleteness ||
-    v2IndexCompleteness.ok === false ||
-    v2IndexCompleteness.complete !== true
-  ) {
-    throw new Error("Rollback v2 observation-timeseries index completeness verification failed");
-  }
   return Object.freeze({
     ok: true,
     status: "rollback_canonical_restored_v2_index_rebuilt",
@@ -2731,7 +2497,6 @@ export async function executeObservationHistoryV2Rollback({
     observed_starting_index_version: environment.index_version,
     restored_objects: Object.freeze(evidence),
     v2_index_rebuild: indexResult,
-    v2_index_completeness: v2IndexCompleteness,
     configuration_changed: false,
     scheduler_changed: false,
     deployment_changed: false,

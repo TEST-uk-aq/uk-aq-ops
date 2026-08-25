@@ -12,6 +12,11 @@ import {
   buildCanonicalObservationTimeseriesBoundedFiles,
 } from "../workers/shared/uk_aq_observation_history_target_writer.mjs";
 import {
+  buildHistoryV2TimeseriesLatestPayload,
+  buildHistoryV2TimeseriesPollutantIndexPayload,
+  buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey,
+} from "../workers/shared/uk_aq_r2_history_index.mjs";
+import {
   buildHistoryV2ConnectorManifest,
   buildHistoryV2ConnectorManifestKey,
   buildHistoryV2DayManifest,
@@ -45,6 +50,8 @@ import {
   buildObservationHistoryV3RerunVerificationPlan,
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
+  inventoryAuthoritativeCanonicalObservationHistory,
+  verifyObservationHistoryV2IndexCompleteness,
   verifyObservationHistoryV3CheckpointReuse,
   verifyObservationHistoryV3MigrationResult,
 } from "../scripts/backup_r2/lib/observation_history_migration_v3.mjs";
@@ -118,6 +125,21 @@ function mapReader(objects) {
   return async ({ key }) => objects.has(key)
     ? { exists: true, body: Buffer.from(objects.get(key)) }
     : { exists: false, body: null };
+}
+
+function readerWithFailure(objects, shouldFail, errorForKey) {
+  return async ({ key }) => {
+    if (shouldFail(key)) throw errorForKey(key);
+    return objects.has(key)
+      ? { exists: true, body: Buffer.from(objects.get(key)) }
+      : { exists: false, body: null };
+  };
+}
+
+function realR2NotFoundError(key) {
+  return new Error(
+    `R2 GET failed (404) key=${key}: <?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>`,
+  );
 }
 
 async function buildFixture() {
@@ -326,6 +348,64 @@ async function buildPlan(fixture, overrides = {}) {
   });
 }
 
+async function publishCompleteFixtureV2Indexes(fixture) {
+  const inventory = await inventoryAuthoritativeCanonicalObservationHistory({
+    getR2Object: mapReader(fixture.r2),
+  });
+  const payloads = inventory.partitions.map((partition) => {
+    const payload = buildHistoryV2TimeseriesPollutantIndexPayload({
+      domain: "observations",
+      dayUtc: partition.scope.day_utc,
+      connectorId: partition.scope.connector_id,
+      pollutantCode: partition.scope.pollutant_code,
+      generatedAt: "2026-01-03T00:00:00.000Z",
+      bucket: ENVIRONMENT.bucket,
+      dataPrefix: inventory.observations_prefix,
+      pollutantManifestKey: partition.manifest_identity.key,
+      pollutantManifest: partition.manifest,
+    });
+    const key = buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
+      "history/_index_v2/observations_timeseries",
+      partition.scope.day_utc,
+      partition.scope.connector_id,
+      partition.scope.pollutant_code,
+    );
+    fixture.r2.set(key, jsonBody(payload));
+    return { key, scope: partition.scope, payload };
+  });
+  const connector = inventory.connector_manifests[0];
+  const day = inventory.day_manifests[0];
+  const latest = buildHistoryV2TimeseriesLatestPayload({
+    domain: "observations",
+    bucket: ENVIRONMENT.bucket,
+    generatedAt: "2026-01-03T00:00:00.000Z",
+    indexPrefix: "history/_index_v2",
+    dataPrefix: inventory.observations_prefix,
+    timeseriesIndexPrefix: "history/_index_v2/observations_timeseries",
+    daySummaries: [{
+      day_utc: DAY,
+      connector_count: 1,
+      connector_ids: [1],
+      connectors: [{
+        connector_id: 1,
+        row_count: payloads.reduce((sum, entry) => sum + entry.payload.source_row_count, 0),
+      }],
+      total_rows: payloads.reduce((sum, entry) => sum + entry.payload.source_row_count, 0),
+      pollutant_codes: payloads.map((entry) => entry.scope.pollutant_code).sort(),
+      pollutant_index_count: payloads.length,
+      file_count: payloads.reduce((sum, entry) => sum + entry.payload.file_count, 0),
+      indexed_file_count: payloads.reduce(
+        (sum, entry) => sum + entry.payload.indexed_file_count,
+        0,
+      ),
+      backed_up_at_utc:
+        day.payload.backed_up_at_utc || connector.payload.backed_up_at_utc,
+    }],
+  });
+  fixture.r2.set(DEFAULT_V2_LATEST_KEY, jsonBody(latest));
+  return { inventory, payloads, latest };
+}
+
 function memoryAdapters(fixture, options = {}) {
   const storedSha = new Map();
   const stagedBodies = new Map();
@@ -410,10 +490,149 @@ function memoryAdapters(fixture, options = {}) {
     finalizeV3Publication: (options) => finalizeObservationHistoryIndexV3Publication(options),
     rebuildV2Indexes: async () => {
       rebuildCalls += 1;
-      return { ok: true, history_version: "v2", domains: ["observations"] };
+      return {
+        ok: true,
+        history_version: "v2",
+        domains: ["observations"],
+        warning_count: options.rebuildWarning ? 1 : 0,
+        warnings: options.rebuildWarning ? [options.rebuildWarning] : [],
+      };
+    },
+    verifyV2IndexCompleteness: async () => {
+      if (options.v2IndexCompletenessError) throw options.v2IndexCompletenessError;
+      return options.v2IndexCompleteness || {
+        ok: true,
+        complete: true,
+        pollutant_index_count: 2,
+      };
     },
   };
 }
+
+test("Phase 6 optional scoped v2 probes accept the real R2 404/NoSuchKey shape", async () => {
+  const fixture = await buildFixture();
+  const scopedPrefix = "history/_index_v2/observations_timeseries/day_utc=";
+  const plan = await buildPlan(fixture, {
+    getR2Object: readerWithFailure(
+      fixture.r2,
+      (key) => key.startsWith(scopedPrefix),
+      realR2NotFoundError,
+    ),
+  });
+  assert.equal(plan.units.length, 2);
+  assert.ok(plan.inventory.partitions.every(
+    (entry) => entry.existing_v2_index_identity === null,
+  ));
+});
+
+test("Phase 6 optional latest-v2 probe accepts the real R2 404/NoSuchKey shape", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture, {
+    getR2Object: readerWithFailure(
+      fixture.r2,
+      (key) => key === DEFAULT_V2_LATEST_KEY,
+      realR2NotFoundError,
+    ),
+  });
+  assert.equal(plan.units.length, 2);
+  assert.equal(plan.inventory.existing_v2_latest_identity, null);
+});
+
+test("Phase 6 optional v2 probes still fail on non-404 R2 errors", async () => {
+  const fixture = await buildFixture();
+  const scopedPrefix = "history/_index_v2/observations_timeseries/day_utc=";
+  for (const error of [
+    Object.assign(new Error("R2 GET failed (403) key=scope: AccessDenied"), { status: 403 }),
+    Object.assign(new Error("R2 GET failed (500) key=scope: InternalError"), { status: 500 }),
+    new Error("network socket disconnected"),
+  ]) {
+    await assert.rejects(
+      buildPlan(fixture, {
+        getR2Object: readerWithFailure(
+          fixture.r2,
+          (key) => key.startsWith(scopedPrefix),
+          () => error,
+        ),
+      }),
+      (actual) => actual === error,
+    );
+  }
+});
+
+test("Phase 6 stale v2 audit objects cannot alter canonical v3 migration units", async () => {
+  const fixture = await buildFixture();
+  const first = await buildPlan(fixture);
+  for (const key of [...fixture.r2.keys()]) {
+    if (key.startsWith("history/_index_v2/observations_timeseries")) {
+      fixture.r2.set(key, jsonBody({ deliberately_stale: key, rows: [999999] }));
+    }
+  }
+  const second = await buildPlan(fixture);
+  assert.deepEqual(second.units, first.units);
+  assert.notDeepEqual(second.inventory, first.inventory);
+});
+
+test("Phase 6 rollback completeness verifies every canonical pollutant and v2 latest", async () => {
+  const fixture = await buildFixture();
+  const { inventory, payloads } = await publishCompleteFixtureV2Indexes(fixture);
+  const result = await verifyObservationHistoryV2IndexCompleteness({
+    getR2Object: mapReader(fixture.r2),
+    bucket: ENVIRONMENT.bucket,
+    expectedCanonicalRootIdentity: inventory.root_manifest,
+  });
+  assert.equal(result.complete, true);
+  assert.equal(result.day_count, 1);
+  assert.equal(result.connector_count, 1);
+  assert.equal(result.pollutant_index_count, payloads.length);
+});
+
+test("Phase 6 rollback completeness rejects a missing rebuilt pollutant index", async () => {
+  const fixture = await buildFixture();
+  const { inventory, payloads } = await publishCompleteFixtureV2Indexes(fixture);
+  fixture.r2.delete(payloads[0].key);
+  await assert.rejects(
+    verifyObservationHistoryV2IndexCompleteness({
+      getR2Object: mapReader(fixture.r2),
+      bucket: ENVIRONMENT.bucket,
+      expectedCanonicalRootIdentity: inventory.root_manifest,
+    }),
+    new RegExp(`Rebuilt v2 observation-timeseries index object is missing: ${payloads[0].key}`),
+  );
+});
+
+test("Phase 6 rollback completeness rejects missing v2 latest publication", async () => {
+  const fixture = await buildFixture();
+  const { inventory } = await publishCompleteFixtureV2Indexes(fixture);
+  fixture.r2.delete(DEFAULT_V2_LATEST_KEY);
+  await assert.rejects(
+    verifyObservationHistoryV2IndexCompleteness({
+      getR2Object: mapReader(fixture.r2),
+      bucket: ENVIRONMENT.bucket,
+      expectedCanonicalRootIdentity: inventory.root_manifest,
+    }),
+    new RegExp(
+      `Rebuilt v2 observation-timeseries latest index object is missing: ${DEFAULT_V2_LATEST_KEY}`,
+    ),
+  );
+});
+
+test("Phase 6 rollback completeness rejects missing connector/day coverage in v2 latest", async () => {
+  const fixture = await buildFixture();
+  const { inventory, latest } = await publishCompleteFixtureV2Indexes(fixture);
+  const incompleteLatest = structuredClone(latest);
+  incompleteLatest.day_summaries[0].connector_ids = [];
+  incompleteLatest.day_summaries[0].connector_count = 0;
+  incompleteLatest.connector_index_count = 0;
+  fixture.r2.set(DEFAULT_V2_LATEST_KEY, jsonBody(incompleteLatest));
+  await assert.rejects(
+    verifyObservationHistoryV2IndexCompleteness({
+      getR2Object: mapReader(fixture.r2),
+      bucket: ENVIRONMENT.bucket,
+      expectedCanonicalRootIdentity: inventory.root_manifest,
+    }),
+    /latest index is incomplete or contradictory/,
+  );
+});
 
 test("Phase 4 planner is deterministic, backup-gated and retains no target archive bodies", async () => {
   const fixture = await buildFixture();
@@ -757,7 +976,9 @@ test("Phase 4 rollback restores from the checkpoint after partial migration with
 test("Phase 4 rollback restores from the same checkpoint after completed migration", async () => {
   const fixture = await buildFixture();
   const plan = await buildPlan(fixture);
-  const adapters = memoryAdapters(fixture);
+  const adapters = memoryAdapters(fixture, {
+    rebuildWarning: "Retained byte-identical existing index objects",
+  });
   const migration = await executeObservationHistoryV3MigrationPlan({
     plan,
     apply: true,
@@ -783,9 +1004,43 @@ test("Phase 4 rollback restores from the same checkpoint after completed migrati
   });
   assert.equal(rollback.ok, true);
   assert.equal(adapters.rebuildCalls, 1);
+  assert.equal(rollback.v2_index_rebuild.warning_count, 1);
+  assert.equal(rollback.v2_index_completeness.complete, true);
   for (const [key, expected] of fixture.oldCanonical) {
     assert.equal(Buffer.compare(fixture.r2.get(key), expected), 0, key);
   }
+});
+
+test("Phase 6 rollback cannot accept a soft-skipped canonical v2 index scope", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture);
+  const migrationAdapters = memoryAdapters(fixture);
+  const migration = await executeObservationHistoryV3MigrationPlan({
+    plan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters: migrationAdapters,
+  });
+  const restorePlan = await buildObservationHistoryV2RestorePlan({
+    checkpoint: migration.checkpoint,
+    getBackupObject: mapReader(fixture.backup),
+  });
+  const rollbackAdapters = memoryAdapters(fixture, {
+    rebuildWarning: "Skipped observations v2 pollutant timeseries index",
+    v2IndexCompleteness: { ok: false, complete: false },
+  });
+  await assert.rejects(
+    executeObservationHistoryV2Rollback({
+      restorePlan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters: rollbackAdapters,
+    }),
+    /completeness verification failed/,
+  );
+  assert.equal(rollbackAdapters.rebuildCalls, 1);
 });
 
 test("Phase 4 rejects a checkpoint whose immutable authority was tampered", async () => {

@@ -22,7 +22,6 @@ import {
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
-  buildR2HistoryV2ObservationsTimeseriesLatestKey,
   r2PutObjectIfChanged,
   resolveR2HistoryIndexConfig,
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
@@ -42,7 +41,6 @@ import {
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
   stableMigrationJson,
-  verifyObservationHistoryV2IndexCompleteness,
   verifyObservationHistoryV3MigrationResult,
 } from "./lib/observation_history_migration_v3.mjs";
 
@@ -409,24 +407,6 @@ function buildR2Adapters({ config, checkpointOut, env, getBackupObject }) {
       argv: ["--history-version", "v2", "--domain", "observations", "--write-r2"],
       env,
     }),
-    verifyV2IndexCompleteness: ({ restorePlan }) => {
-      const expectedCanonicalRootIdentity = restorePlan.objects.find(
-        (entry) => entry.stage === "root_manifest",
-      );
-      if (!expectedCanonicalRootIdentity) {
-        throw new Error("Rollback restore plan lacks canonical root identity");
-      }
-      return verifyObservationHistoryV2IndexCompleteness({
-        getR2Object: ({ key }) => r2GetObject({ r2: config.r2, key }),
-        bucket: config.r2.bucket,
-        observationsPrefix: config.observations_prefix_v2,
-        v2IndexRoot: config.observations_timeseries_index_prefix_v2,
-        v2LatestKey: buildR2HistoryV2ObservationsTimeseriesLatestKey(
-          config.index_prefix_v2,
-        ),
-        expectedCanonicalRootIdentity,
-      });
-    },
   };
 }
 
@@ -448,19 +428,14 @@ export async function runObservationHistoryMigrationV3({
     readJsonFile(args.writerLimitsPath, "writer limits"),
     "migration --writer-limits-json",
   );
-  if (new Set(["migrate", "rollback"]).has(args.mode)) {
-    const lockOwner = args.mode === "rollback"
-      ? "observation_history_rollback_v2"
-      : "observation_history_migration_v3";
+  if (args.mode === "migrate") {
     const lockContext = observationsGlobalOperationLockContext({
       env,
-      expectedOwner: lockOwner,
+      expectedOwner: "observation_history_migration_v3",
       expectedRunId: args.migrationRunId,
     });
     if (lockContext.held && !lockContext.valid) {
-      throw new Error(
-        `${args.mode} --apply received an invalid observations global operation lock context`,
-      );
+      throw new Error("migrate --apply received an invalid observations global operation lock context");
     }
     if (!lockContext.valid) {
       const diagnostics = [];
@@ -468,7 +443,7 @@ export async function runObservationHistoryMigrationV3({
       try {
         exitCode = await runLockedCommand({
           databaseUrl: env.SUPABASE_DB_URL || env.DATABASE_URL,
-          owner: lockOwner,
+          owner: "observation_history_migration_v3",
           runId: args.migrationRunId,
           command: process.execPath,
           commandArgs: [fileURLToPath(import.meta.url), ...argv],
