@@ -111,6 +111,10 @@ const EMPTY_CONNECTOR_ZERO_FIELDS = Object.freeze([
   "row_count",
   "file_count",
   "total_bytes",
+  "bytes_per_row_estimate",
+  "avg_file_bytes",
+  "min_file_bytes",
+  "max_file_bytes",
 ]);
 const EMPTY_CONNECTOR_ARRAY_FIELDS = Object.freeze([
   "pollutant_codes",
@@ -120,6 +124,8 @@ const EMPTY_CONNECTOR_ARRAY_FIELDS = Object.freeze([
   "parquet_object_keys",
 ]);
 const EMPTY_CONNECTOR_NULL_FIELDS = Object.freeze([
+  "pollutant_code",
+  "timeseries_row_counts",
   "min_timeseries_id",
   "max_timeseries_id",
   "min_observed_at_utc",
@@ -1379,7 +1385,27 @@ test("Phase 6 rejects every inconsistent or malformed no-child connector zero st
     });
     await assert.rejects(buildPlan(fixture));
   }
-  for (const field of EMPTY_CONNECTOR_ARRAY_FIELDS) {
+  for (const value of ["", "pm25"]) {
+    const fixture = await buildFixture({
+      emptyConnector: { overrides: { pollutant_code: value } },
+    });
+    await assert.rejects(buildPlan(fixture));
+  }
+  for (const value of [{}, { 123: 1 }]) {
+    const fixture = await buildFixture({
+      emptyConnector: { overrides: { timeseries_row_counts: value } },
+    });
+    await assert.rejects(buildPlan(fixture));
+  }
+  const nullStatistic = await buildFixture({
+    emptyConnector: { overrides: { bytes_per_row_estimate: null } },
+  });
+  await assert.rejects(buildPlan(nullStatistic));
+  for (const field of [
+    ...EMPTY_CONNECTOR_ZERO_FIELDS,
+    ...EMPTY_CONNECTOR_ARRAY_FIELDS,
+    ...EMPTY_CONNECTOR_NULL_FIELDS,
+  ]) {
     const fixture = await buildFixture({
       emptyConnector: { missingFields: [field] },
     });
@@ -1448,6 +1474,15 @@ test("Phase 6 rebuilds, orders and exactly rolls back a canonical empty connecto
     backedUpAtUtc: sourceEmpty.backed_up_at_utc,
   });
   assert.deepEqual(targetEmptyObject.payload, expectedTargetEmpty);
+  for (const field of EMPTY_CONNECTOR_ZERO_FIELDS) {
+    assert.equal(targetEmptyObject.payload[field], 0, field);
+  }
+  for (const field of EMPTY_CONNECTOR_NULL_FIELDS) {
+    assert.equal(targetEmptyObject.payload[field], null, field);
+  }
+  for (const field of EMPTY_CONNECTOR_ARRAY_FIELDS) {
+    assert.deepEqual(targetEmptyObject.payload[field], [], field);
+  }
   assert.equal(
     targetEmptyObject.payload.history_schema_version,
     completed.target.history_schema_version,
@@ -1542,6 +1577,37 @@ test("Phase 6 empty-connector preparation rejects source drift before PUT", asyn
   assert.equal(adapters.putCalls, 0);
   assert.equal(adapters.stagedBodyCount, 0);
   assert.equal(adapters.checkpoints.length, 1);
+});
+
+test("Phase 6 empty-connector preparation rejects newly pinned zero-state drift before PUT", async () => {
+  for (const [field, value] of [
+    ["pollutant_code", "pm25"],
+    ["timeseries_row_counts", {}],
+    ["bytes_per_row_estimate", 1],
+    ["avg_file_bytes", 1],
+    ["min_file_bytes", 1],
+    ["max_file_bytes", 1],
+  ]) {
+    const fixture = await buildFixture({ emptyConnector: {} });
+    const plan = await buildPlan(fixture);
+    const changed = JSON.parse(fixture.r2.get(fixture.emptyConnectorKey));
+    changed[field] = value;
+    fixture.r2.set(fixture.emptyConnectorKey, jsonBody(rehashManifest(changed)));
+    const adapters = memoryAdapters(fixture);
+    await assert.rejects(
+      executeObservationHistoryV3MigrationPlan({
+        plan,
+        apply: true,
+        writersFrozen: true,
+        environmentEvidence: ENVIRONMENT,
+        adapters,
+      }),
+      /Pinned empty source connector identity changed/,
+    );
+    assert.equal(adapters.putCalls, 0, field);
+    assert.equal(adapters.stagedBodyCount, 0, field);
+    assert.equal(adapters.checkpoints.length, 1, field);
+  }
 });
 
 test("Phase 4 planner is deterministic, backup-gated and retains no target archive bodies", async () => {

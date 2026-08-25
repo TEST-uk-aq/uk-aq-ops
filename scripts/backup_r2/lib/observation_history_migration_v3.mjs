@@ -126,6 +126,10 @@ const EMPTY_SOURCE_CONNECTOR_ZERO_FIELDS = Object.freeze([
   "row_count",
   "file_count",
   "total_bytes",
+  "bytes_per_row_estimate",
+  "avg_file_bytes",
+  "min_file_bytes",
+  "max_file_bytes",
 ]);
 const EMPTY_SOURCE_CONNECTOR_ARRAY_FIELDS = Object.freeze([
   "pollutant_codes",
@@ -135,6 +139,8 @@ const EMPTY_SOURCE_CONNECTOR_ARRAY_FIELDS = Object.freeze([
   "parquet_object_keys",
 ]);
 const EMPTY_SOURCE_CONNECTOR_NULL_FIELDS = Object.freeze([
+  "pollutant_code",
+  "timeseries_row_counts",
   "min_timeseries_id",
   "max_timeseries_id",
   "min_observed_at_utc",
