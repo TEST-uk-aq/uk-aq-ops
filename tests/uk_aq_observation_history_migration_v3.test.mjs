@@ -91,6 +91,20 @@ const ENVIRONMENT = Object.freeze({
   indexVersion: "v2",
   integrityVersion: "v2",
 });
+const STALE_PARENT_SUMMARY_IDENTITY_FIELDS = Object.freeze([
+  "pollutant_code",
+  "manifest_key",
+  "source_row_count",
+  "row_count",
+  "file_count",
+  "total_bytes",
+  "min_timeseries_id",
+  "max_timeseries_id",
+  "min_observed_at_utc",
+  "max_observed_at_utc",
+  "min_timestamp_hour_utc",
+  "max_timestamp_hour_utc",
+]);
 
 function jsonBody(value) {
   return Buffer.from(JSON.stringify(value, null, 2), "utf8");
@@ -155,6 +169,9 @@ function realR2NotFoundError(key) {
 async function buildFixture({
   pollutantCodes = ["pm25", "pm10"],
   manifestModes = {},
+  parentReferenceOverrides = {},
+  missingParentReferenceFields = {},
+  staleParentHashes = {},
 } = {}) {
   const baseRows = [
     [100, "2026-01-02T00:00:00.000Z", 10, "P"],
@@ -211,9 +228,7 @@ async function buildFixture({
     if (
       manifestMode === "legacy_hashless" ||
       manifestMode === "legacy_hashless_null" ||
-      manifestMode === "legacy_hashless_stale_timeseries_counts" ||
-      manifestMode === "legacy_hashless_arbitrary_stale" ||
-      manifestMode === "legacy_hashless_stale_other_field"
+      manifestMode === "legacy_hashless_stale_parent"
     ) {
       pollutant = structuredClone(pollutant);
       for (const field of [
@@ -227,57 +242,38 @@ async function buildFixture({
         if (manifestMode === "legacy_hashless_null") pollutant[field] = null;
         else delete pollutant[field];
       }
-      if (manifestMode.includes("_stale_")) {
-        delete pollutant.timeseries_row_counts;
-      }
       pollutant = rehashManifest(pollutant);
-    } else if (manifestMode === "modern_stale_timeseries_counts") {
-      pollutant = structuredClone(pollutant);
-      delete pollutant.timeseries_row_counts;
-      pollutant = rehashManifest(pollutant);
-    } else if (manifestMode === "malformed_hash") {
+    } else if (
+      manifestMode === "malformed_hash" ||
+      manifestMode === "malformed_hash_stale_parent"
+    ) {
       pollutant = rehashManifest({
         ...pollutant,
         observation_content_hash: "NOT-A-SHA256",
       });
-    } else if (manifestMode === "partial_contract") {
+    } else if (
+      manifestMode === "partial_contract" ||
+      manifestMode === "partial_contract_stale_parent"
+    ) {
       pollutant = structuredClone(pollutant);
       delete pollutant.observation_content_hash_algorithm;
       pollutant = rehashManifest(pollutant);
     }
     let parentReferenceHash = pollutant.manifest_hash;
     if (
-      manifestMode === "legacy_hashless_stale_timeseries_counts" ||
-      manifestMode === "legacy_hashless_arbitrary_stale" ||
-      manifestMode === "modern_stale_timeseries_counts"
+      manifestMode === "legacy_hashless_stale_parent" ||
+      manifestMode === "modern_stale_parent" ||
+      manifestMode === "malformed_hash_stale_parent" ||
+      manifestMode === "partial_contract_stale_parent"
     ) {
-      const preAugmentationHash = pollutant.manifest_hash;
-      const timeseriesRowCounts = {};
-      for (const [timeseriesId] of inputRows) {
-        const key = String(timeseriesId);
-        timeseriesRowCounts[key] = (timeseriesRowCounts[key] || 0) + 1;
-      }
-      pollutant = rehashManifest({
-        ...pollutant,
-        timeseries_row_counts: timeseriesRowCounts,
-      });
-      parentReferenceHash = manifestMode === "legacy_hashless_arbitrary_stale"
-        ? "a".repeat(64)
-        : preAugmentationHash;
-    } else if (manifestMode === "legacy_hashless_stale_other_field") {
-      const preAugmentationHash = pollutant.manifest_hash;
-      pollutant = rehashManifest({
-        ...pollutant,
-        unrelated_historical_metadata: { source: "fixture" },
-      });
-      parentReferenceHash = preAugmentationHash;
+      parentReferenceHash = staleParentHashes[pollutantCode] || "a".repeat(64);
     }
     sources.push(source);
     pollutants.push({ key: pollutantKey, payload: pollutant });
     parentReferenceHashes.set(pollutantCode, parentReferenceHash);
   }
   const connectorKey = buildHistoryV2ConnectorManifestKey(PREFIX, DAY, 1);
-  const connector = buildHistoryV2ConnectorManifest({
+  let connector = buildHistoryV2ConnectorManifest({
     domain: "observations",
     dayUtc: DAY,
     connectorId: 1,
@@ -285,10 +281,23 @@ async function buildFixture({
     pollutantManifests: pollutants.map((entry) => ({
       ...entry.payload,
       manifest_hash: parentReferenceHashes.get(entry.payload.pollutant_code),
+      ...(parentReferenceOverrides[entry.payload.pollutant_code] || {}),
     })),
     writerGitSha: "fixture-source",
     backedUpAtUtc: "2026-01-03T00:00:00.000Z",
   });
+  if (Object.keys(missingParentReferenceFields).length) {
+    connector = structuredClone(connector);
+    for (const field of ["child_manifests", "pollutant_manifests"]) {
+      for (const reference of connector[field] || []) {
+        for (const missing of
+          missingParentReferenceFields[reference.pollutant_code] || []) {
+          delete reference[missing];
+        }
+      }
+    }
+    connector = rehashManifest(connector);
+  }
   const dayKey = buildHistoryV2DayManifestKey(PREFIX, DAY);
   const day = buildHistoryV2DayManifest({
     domain: "observations",
@@ -736,7 +745,7 @@ test("Phase 6 migration inventory keeps complete modern hash metadata strict and
   });
   assert.deepEqual(plan.source_manifest_reference_provenance_counts, {
     exact: 2,
-    legacy_stale_after_timeseries_row_counts_patch: 0,
+    legacy_stale_parent_manifest_hash: 0,
     unexplained: 0,
   });
   for (const unit of plan.units) {
@@ -749,6 +758,15 @@ test("Phase 6 migration inventory keeps complete modern hash metadata strict and
     assert.equal(
       unit.source_manifest_reference.referenced_child_manifest_hash,
       unit.source_manifest_reference.current_child_manifest_hash,
+    );
+    assert.equal(
+      unit.source_manifest_reference.compatibility_contract_version,
+      null,
+    );
+    assert.equal(unit.source_manifest_reference.parent_summary_identity, null);
+    assert.equal(
+      unit.source_manifest_reference.current_child_summary_identity,
+      null,
     );
   }
 });
@@ -816,19 +834,20 @@ test("Phase 6 derives and pins genuine legacy hashless metadata for any canonica
   );
 });
 
-test("Phase 6 accepts only the reconstructed legacy timeseries-counts stale reference and pins its proof", async () => {
+test("Phase 6 accepts a generic legacy stale parent only when all summary identities match and pins the contract", async () => {
   const fixture = await buildFixture({
     pollutantCodes: ["pm25", "h3cch2chch32"],
     manifestModes: {
-      h3cch2chch32: "legacy_hashless_stale_timeseries_counts",
+      h3cch2chch32: "legacy_hashless_stale_parent",
     },
+    staleParentHashes: { h3cch2chch32: "b".repeat(64) },
   });
   const first = await buildPlan(fixture);
   const second = await buildPlan(fixture);
   assert.equal(first.plan_sha256, second.plan_sha256);
   assert.deepEqual(first.source_manifest_reference_provenance_counts, {
     exact: 1,
-    legacy_stale_after_timeseries_row_counts_patch: 1,
+    legacy_stale_parent_manifest_hash: 1,
     unexplained: 0,
   });
   const unit = first.units.find(
@@ -837,19 +856,32 @@ test("Phase 6 accepts only the reconstructed legacy timeseries-counts stale refe
   const reference = unit.source_manifest_reference;
   assert.equal(
     reference.provenance,
-    "legacy_stale_after_timeseries_row_counts_patch",
+    "legacy_stale_parent_manifest_hash",
   );
   assert.notEqual(
     reference.referenced_child_manifest_hash,
     reference.current_child_manifest_hash,
   );
+  assert.equal(reference.referenced_child_manifest_hash, "b".repeat(64));
+  assert.equal(reference.current_child_genuine_legacy_hashless, true);
   assert.equal(
-    reference.reconstructed_pre_augmentation_child_manifest_hash,
-    reference.referenced_child_manifest_hash,
+    reference.compatibility_contract_version,
+    "legacy_stale_parent_manifest_hash_v1",
   );
-  assert.deepEqual(reference.historical_metadata_augmentation_fields, [
-    "timeseries_row_counts",
-  ]);
+  assert.equal(reference.summary_identity_all_match, true);
+  assert.deepEqual(
+    reference.compatibility_summary_identity_fields,
+    STALE_PARENT_SUMMARY_IDENTITY_FIELDS,
+  );
+  assert.deepEqual(
+    reference.parent_summary_identity,
+    reference.current_child_summary_identity,
+  );
+  assert.equal(reference.parent_manifest_key, fixture.connectorKey);
+  assert.equal(
+    reference.current_child_manifest_key,
+    fixture.pollutantKeys.get("h3cch2chch32"),
+  );
   assert.equal(
     unit.source_observation_content_hash_provenance,
     "derived_from_legacy_canonical_parquet",
@@ -870,7 +902,7 @@ test("Phase 6 accepts only the reconstructed legacy timeseries-counts stale refe
   }));
   assert.equal(unit.unit_id, expectedUnitId);
   const changedReference = structuredClone(unit.source_manifest_reference);
-  changedReference.provenance = "exact";
+  changedReference.parent_summary_identity.total_bytes += 1;
   assert.notEqual(
     unit.unit_id,
     sha256Hex(stableMigrationJson({
@@ -888,6 +920,21 @@ test("Phase 6 accepts only the reconstructed legacy timeseries-counts stale refe
       target_layout: first.target.physical_layout_version,
     })),
   );
+  const alternateFixture = await buildFixture({
+    pollutantCodes: ["pm25", "h3cch2chch32"],
+    manifestModes: {
+      h3cch2chch32: "legacy_hashless_stale_parent",
+    },
+    staleParentHashes: { h3cch2chch32: "c".repeat(64) },
+  });
+  const alternate = await buildPlan(alternateFixture);
+  assert.notEqual(first.plan_sha256, alternate.plan_sha256);
+  assert.notEqual(
+    unit.unit_id,
+    alternate.units.find(
+      (entry) => entry.scope.pollutant_code === "h3cch2chch32",
+    ).unit_id,
+  );
   const audit = buildObservationHistoryV3MigrationAuditReport({
     plan: first,
     mode: "plan",
@@ -904,31 +951,101 @@ test("Phase 6 accepts only the reconstructed legacy timeseries-counts stale refe
     reference.provenance,
   );
   assert.equal(
-    partitionAudit.source_reconstructed_pre_augmentation_child_manifest_hash,
-    reference.referenced_child_manifest_hash,
+    partitionAudit.source_manifest_reference_compatibility_contract_version,
+    "legacy_stale_parent_manifest_hash_v1",
+  );
+  assert.equal(
+    partitionAudit.source_manifest_reference_summary_identity_all_match,
+    true,
+  );
+  assert.deepEqual(
+    partitionAudit.source_manifest_reference_summary_identity_fields,
+    STALE_PARENT_SUMMARY_IDENTITY_FIELDS,
+  );
+  assert.deepEqual(
+    partitionAudit.source_parent_summary_identity,
+    reference.parent_summary_identity,
+  );
+  assert.deepEqual(
+    partitionAudit.source_current_child_summary_identity,
+    reference.current_child_summary_identity,
   );
 });
 
-test("Phase 6 rejects arbitrary, unrelated-field and modern stale child references", async () => {
-  for (const manifestMode of [
-    "legacy_hashless_arbitrary_stale",
-    "legacy_hashless_stale_other_field",
-    "modern_stale_timeseries_counts",
-  ]) {
+test("Phase 6 requires every stale-parent summary field and rejects missing evidence", async () => {
+  for (const field of STALE_PARENT_SUMMARY_IDENTITY_FIELDS) {
+    const mismatchedValue = field === "pollutant_code"
+      ? "wrong_property"
+      : field === "manifest_key"
+        ? `${PREFIX}/wrong-manifest.json`
+        : field.includes("count") || field.includes("bytes") || field.includes("timeseries_id")
+          ? 999_999_999
+          : "1999-01-01T00:00:00.000Z";
     const fixture = await buildFixture({
-      manifestModes: { pm25: manifestMode },
+      manifestModes: { pm25: "legacy_hashless_stale_parent" },
+      parentReferenceOverrides: { pm25: { [field]: mismatchedValue } },
     });
     await assert.rejects(
       buildPlan(fixture),
-      /Observation connector\/pollutant identity mismatch/,
+      /(Observation connector\/pollutant identity mismatch|pollutant reference key mismatch|R2 object is missing)/,
     );
   }
+  const missing = await buildFixture({
+    manifestModes: { pm25: "legacy_hashless_stale_parent" },
+    missingParentReferenceFields: { pm25: ["total_bytes"] },
+  });
+  await assert.rejects(
+    buildPlan(missing),
+    /Observation connector\/pollutant identity mismatch/,
+  );
+});
+
+test("Phase 6 rejects wrong scope, invalid child integrity and modern stale references", async () => {
+  const wrongScope = await buildFixture({
+    manifestModes: { pm25: "legacy_hashless_stale_parent" },
+  });
+  const wrongScopeKey = wrongScope.pollutantKeys.get("pm25");
+  const wrongScopeChild = JSON.parse(wrongScope.r2.get(wrongScopeKey));
+  wrongScopeChild.day_utc = "2026-01-01";
+  wrongScope.r2.set(wrongScopeKey, jsonBody(rehashManifest(wrongScopeChild)));
+  await assert.rejects(
+    buildPlan(wrongScope),
+    /Canonical history manifest day_utc identity mismatch/,
+  );
+
+  const invalidChild = await buildFixture({
+    manifestModes: { pm25: "legacy_hashless_stale_parent" },
+  });
+  const invalidChildKey = invalidChild.pollutantKeys.get("pm25");
+  const invalidChildPayload = JSON.parse(invalidChild.r2.get(invalidChildKey));
+  invalidChildPayload.row_count += 1;
+  invalidChild.r2.set(invalidChildKey, jsonBody(invalidChildPayload));
+  await assert.rejects(
+    buildPlan(invalidChild),
+    /Canonical history manifest hash verification failed/,
+  );
+
+  const modern = await buildFixture({
+    manifestModes: { pm25: "modern_stale_parent" },
+  });
+  await assert.rejects(
+    buildPlan(modern),
+    /Observation connector\/pollutant identity mismatch/,
+  );
 });
 
 test("Phase 6 rejects malformed and partial non-legacy hash contracts", async () => {
   for (const [mode, expected] of [
     ["malformed_hash", /observation_content_hash must be lower-case SHA-256/],
     ["partial_contract", /unsupported observation content hash algorithm/],
+    [
+      "malformed_hash_stale_parent",
+      /Observation connector\/pollutant identity mismatch/,
+    ],
+    [
+      "partial_contract_stale_parent",
+      /Observation connector\/pollutant identity mismatch/,
+    ],
   ]) {
     const fixture = await buildFixture({
       manifestModes: { pm25: mode },
@@ -988,11 +1105,17 @@ test("Phase 6 preparation re-verifies a pinned legacy-derived logical identity a
   );
 });
 
-test("Phase 6 preparation rejects changed stale-reference parent, child or pinned proof before PUT", async () => {
-  for (const changedEvidence of ["parent", "child", "pinned_proof"]) {
+test("Phase 6 preparation rejects changed stale-reference parent, child, Parquet, logical identity or pinned proof before PUT", async () => {
+  for (const changedEvidence of [
+    "parent",
+    "child",
+    "parquet",
+    "logical_identity",
+    "pinned_proof",
+  ]) {
     const fixture = await buildFixture({
       manifestModes: {
-        pm25: "legacy_hashless_stale_timeseries_counts",
+        pm25: "legacy_hashless_stale_parent",
       },
     });
     const plan = await buildPlan(fixture);
@@ -1006,12 +1129,26 @@ test("Phase 6 preparation rejects changed stale-reference parent, child or pinne
       const child = JSON.parse(fixture.r2.get(childKey));
       child.timeseries_row_counts["999999"] = 1;
       fixture.r2.set(childKey, jsonBody(rehashManifest(child)));
+    } else if (changedEvidence === "parquet") {
+      const sourceKey = plan.units.find(
+        (entry) => entry.scope.pollutant_code === "pm25",
+      ).source_files[0].key;
+      fixture.r2.set(
+        sourceKey,
+        Buffer.concat([fixture.r2.get(sourceKey), Buffer.from([0])]),
+      );
+    } else if (changedEvidence === "logical_identity") {
+      const partition = executionPlan.inventory.partitions.find(
+        (entry) => entry.scope.pollutant_code === "pm25",
+      );
+      partition.source_observation_content_hash_metadata
+        .observation_content_hash = "f".repeat(64);
     } else {
       const partition = executionPlan.inventory.partitions.find(
         (entry) => entry.scope.pollutant_code === "pm25",
       );
       partition.source_manifest_reference
-        .reconstructed_pre_augmentation_child_manifest_hash = "f".repeat(64);
+        .parent_summary_identity.total_bytes += 1;
     }
     const adapters = memoryAdapters(fixture);
     await assert.rejects(
@@ -1022,7 +1159,7 @@ test("Phase 6 preparation rejects changed stale-reference parent, child or pinne
         environmentEvidence: ENVIRONMENT,
         adapters,
       }),
-      /Pinned source (parent manifest identity|child manifest identity|manifest reference evidence) changed/,
+      /(Pinned source (parent manifest identity|child manifest identity|manifest reference evidence|unit identity) changed|Canonical source logical identity mismatch|byte count mismatch)/,
     );
     assert.equal(adapters.putCalls, 0);
     assert.equal(adapters.stagedBodyCount, 0);
@@ -1034,7 +1171,7 @@ test("Phase 6 stale source rewrites a consistent target hierarchy and rollback r
   const fixture = await buildFixture({
     pollutantCodes: ["pm25", "h3cch2chch32"],
     manifestModes: {
-      h3cch2chch32: "legacy_hashless_stale_timeseries_counts",
+      h3cch2chch32: "legacy_hashless_stale_parent",
     },
   });
   const plan = await buildPlan(fixture);

@@ -101,9 +101,24 @@ const SOURCE_HASH_PROVENANCE_MANIFEST = "manifest";
 const SOURCE_HASH_PROVENANCE_LEGACY_PARQUET =
   "derived_from_legacy_canonical_parquet";
 const SOURCE_MANIFEST_REFERENCE_PROVENANCE_EXACT = "exact";
-const SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_COUNTS_PATCH =
-  "legacy_stale_after_timeseries_row_counts_patch";
-const LEGACY_MANIFEST_AUGMENTATION_FIELD = "timeseries_row_counts";
+const SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT =
+  "legacy_stale_parent_manifest_hash";
+const LEGACY_STALE_PARENT_MANIFEST_HASH_CONTRACT_VERSION =
+  "legacy_stale_parent_manifest_hash_v1";
+const LEGACY_STALE_PARENT_SUMMARY_IDENTITY_FIELDS = Object.freeze([
+  "pollutant_code",
+  "manifest_key",
+  "source_row_count",
+  "row_count",
+  "file_count",
+  "total_bytes",
+  "min_timeseries_id",
+  "max_timeseries_id",
+  "min_observed_at_utc",
+  "max_observed_at_utc",
+  "min_timestamp_hour_utc",
+  "max_timestamp_hour_utc",
+]);
 const CANONICAL_STAGE_RANK = Object.freeze({
   pollutant_manifest: 10,
   connector_manifest: 20,
@@ -310,24 +325,21 @@ function isGenuineLegacyHashlessObservationManifest(manifest) {
   );
 }
 
-function legacyTimeseriesRowCountsAreCanonical(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const entries = Object.entries(value);
-  if (!entries.length) return false;
-  return entries.every(([key, count]) => {
-    const timeseriesId = Number(key);
-    return Number.isSafeInteger(timeseriesId) &&
-      timeseriesId > 0 &&
-      String(timeseriesId) === key &&
-      Number.isSafeInteger(count) &&
-      count > 0;
-  });
-}
-
 function sourceManifestReferenceMismatch(pollutantKey) {
   return new Error(
     `Observation connector/pollutant identity mismatch: ${pollutantKey}`,
   );
+}
+
+function requiredManifestSummaryIdentity(manifest, pollutantKey) {
+  const summary = {};
+  for (const field of LEGACY_STALE_PARENT_SUMMARY_IDENTITY_FIELDS) {
+    if (!Object.hasOwn(manifest, field)) {
+      throw sourceManifestReferenceMismatch(pollutantKey);
+    }
+    summary[field] = manifest[field];
+  }
+  return Object.freeze(summary);
 }
 
 function buildSourceManifestReferenceEvidence({
@@ -346,50 +358,63 @@ function buildSourceManifestReferenceEvidence({
     pollutantManifest.manifest_hash,
     "current pollutant manifest_hash",
   );
+  if (
+    pollutantReference.manifest_key !== pollutantKey ||
+    pollutantManifest.manifest_key !== pollutantKey
+  ) {
+    throw sourceManifestReferenceMismatch(pollutantKey);
+  }
+  const currentChildLegacyHashless =
+    isGenuineLegacyHashlessObservationManifest(pollutantManifest);
   let provenance = SOURCE_MANIFEST_REFERENCE_PROVENANCE_EXACT;
-  let reconstructedPreAugmentationHash = null;
-  let historicalAugmentationFields = [];
+  let compatibilityContractVersion = null;
+  let compatibilitySummaryFields = [];
+  let parentSummaryIdentity = null;
+  let currentChildSummaryIdentity = null;
+  let summaryIdentityAllMatch = null;
   if (currentChildHash !== referencedChildHash) {
-    const keys = Object.keys(pollutantManifest);
-    if (
-      !isGenuineLegacyHashlessObservationManifest(pollutantManifest) ||
-      !Object.hasOwn(pollutantManifest, LEGACY_MANIFEST_AUGMENTATION_FIELD) ||
-      !legacyTimeseriesRowCountsAreCanonical(
-        pollutantManifest[LEGACY_MANIFEST_AUGMENTATION_FIELD],
-      ) ||
-      keys.at(-1) !== "manifest_hash" ||
-      keys.at(-2) !== LEGACY_MANIFEST_AUGMENTATION_FIELD
-    ) {
+    if (!currentChildLegacyHashless) {
       throw sourceManifestReferenceMismatch(pollutantKey);
     }
-    const {
-      manifest_hash: _currentManifestHash,
-      timeseries_row_counts: _historicalAugmentation,
-      ...preAugmentationPayload
-    } = pollutantManifest;
-    reconstructedPreAugmentationHash = sha256Hex(
-      JSON.stringify(preAugmentationPayload),
+    parentSummaryIdentity = requiredManifestSummaryIdentity(
+      pollutantReference,
+      pollutantKey,
     );
-    if (reconstructedPreAugmentationHash !== referencedChildHash) {
+    currentChildSummaryIdentity = requiredManifestSummaryIdentity(
+      pollutantManifest,
+      pollutantKey,
+    );
+    summaryIdentityAllMatch =
+      LEGACY_STALE_PARENT_SUMMARY_IDENTITY_FIELDS.every((field) =>
+        parentSummaryIdentity[field] === currentChildSummaryIdentity[field]
+      );
+    if (!summaryIdentityAllMatch) {
       throw sourceManifestReferenceMismatch(pollutantKey);
     }
-    provenance =
-      SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_COUNTS_PATCH;
-    historicalAugmentationFields = [LEGACY_MANIFEST_AUGMENTATION_FIELD];
+    provenance = SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT;
+    compatibilityContractVersion =
+      LEGACY_STALE_PARENT_MANIFEST_HASH_CONTRACT_VERSION;
+    compatibilitySummaryFields =
+      LEGACY_STALE_PARENT_SUMMARY_IDENTITY_FIELDS;
   }
   return Object.freeze({
     parent_manifest_identity: connectorManifestIdentity,
+    parent_manifest_key: connectorManifestIdentity.key,
     parent_manifest_hash: connectorManifest.manifest_hash,
     referenced_child_manifest_key: pollutantKey,
     referenced_child_manifest_hash: referencedChildHash,
     current_child_manifest_identity: pollutantManifestIdentity,
+    current_child_manifest_key: pollutantKey,
     current_child_manifest_hash: currentChildHash,
+    current_child_genuine_legacy_hashless: currentChildLegacyHashless,
     provenance,
-    reconstructed_pre_augmentation_child_manifest_hash:
-      reconstructedPreAugmentationHash,
-    historical_metadata_augmentation_fields: Object.freeze(
-      historicalAugmentationFields,
+    compatibility_contract_version: compatibilityContractVersion,
+    compatibility_summary_identity_fields: Object.freeze(
+      [...compatibilitySummaryFields],
     ),
+    parent_summary_identity: parentSummaryIdentity,
+    current_child_summary_identity: currentChildSummaryIdentity,
+    summary_identity_all_match: summaryIdentityAllMatch,
   });
 }
 
@@ -480,21 +505,41 @@ async function reverifyPinnedSourceManifestReference({
   return currentEvidence;
 }
 
-async function reverifyPinnedLegacyManifestReferencesBeforeMutation({
+async function reverifyPinnedCompatibleSourceUnitsBeforeMutation({
   plan,
   getR2Object,
 }) {
   for (const sourcePartition of plan.inventory.partitions) {
     if (
       sourcePartition.source_manifest_reference.provenance !==
-        SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_COUNTS_PATCH
+        SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT
     ) {
       continue;
     }
-    await reverifyPinnedSourceManifestReference({
+    const authorityUnit = plan.units.find((unit) =>
+      unit.source_manifest_identity.key === sourcePartition.manifest_identity.key &&
+      unit.source_manifest_identity.sha256 === sourcePartition.manifest_identity.sha256
+    );
+    if (!authorityUnit) {
+      throw new Error(
+        `Pinned compatible source unit is unavailable: ${partitionIdentity(sourcePartition.scope)}`,
+      );
+    }
+    const rewritten = await rewritePartition({
       sourcePartition,
       getR2Object,
+      writerLimits: plan.target.writer_limits,
+      observationsPrefix: plan.inventory.observations_prefix,
+      targetWriterGitSha: plan.target_writer_git_sha,
+      sosConnectorId: plan.sos_connector_id,
+      v3IndexRoot: plan.v3_index_root,
     });
+    if (rewritten.unit_id !== authorityUnit.unit_id) {
+      throw new Error(`Pinned source unit identity changed: ${authorityUnit.unit_id}`);
+    }
+    if (!sameJson(rewritten.source_files, authorityUnit.source_files)) {
+      throw new Error(`Pinned source file identity changed: ${authorityUnit.unit_id}`);
+    }
   }
 }
 
@@ -2003,10 +2048,10 @@ export async function buildObservationHistoryV3MigrationPlan({
       partition.source_manifest_reference.provenance ===
         SOURCE_MANIFEST_REFERENCE_PROVENANCE_EXACT
     ).length,
-    legacy_stale_after_timeseries_row_counts_patch:
+    legacy_stale_parent_manifest_hash:
       inventory.partitions.filter((partition) =>
         partition.source_manifest_reference.provenance ===
-          SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_COUNTS_PATCH
+          SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT
       ).length,
     unexplained: 0,
   });
@@ -2403,7 +2448,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
   } else {
     await adapters.writeCheckpoint(structuredClone(checkpoint));
-    await reverifyPinnedLegacyManifestReferencesBeforeMutation({
+    await reverifyPinnedCompatibleSourceUnitsBeforeMutation({
       plan,
       getR2Object: adapters.getObject,
     });
@@ -3227,15 +3272,26 @@ export function buildObservationHistoryV3MigrationAuditReport({
         unit.source_observation_content_hash_provenance,
       source_manifest_reference_provenance:
         unit.source_manifest_reference.provenance,
+      source_parent_manifest_key:
+        unit.source_manifest_reference.parent_manifest_key,
       source_parent_referenced_child_manifest_hash:
         unit.source_manifest_reference.referenced_child_manifest_hash,
+      source_current_child_manifest_key:
+        unit.source_manifest_reference.current_child_manifest_key,
       source_current_child_manifest_hash:
         unit.source_manifest_reference.current_child_manifest_hash,
-      source_reconstructed_pre_augmentation_child_manifest_hash:
-        unit.source_manifest_reference
-          .reconstructed_pre_augmentation_child_manifest_hash,
-      source_historical_metadata_augmentation_fields:
-        unit.source_manifest_reference.historical_metadata_augmentation_fields,
+      source_current_child_genuine_legacy_hashless:
+        unit.source_manifest_reference.current_child_genuine_legacy_hashless,
+      source_manifest_reference_compatibility_contract_version:
+        unit.source_manifest_reference.compatibility_contract_version,
+      source_manifest_reference_summary_identity_all_match:
+        unit.source_manifest_reference.summary_identity_all_match,
+      source_manifest_reference_summary_identity_fields:
+        unit.source_manifest_reference.compatibility_summary_identity_fields,
+      source_parent_summary_identity:
+        unit.source_manifest_reference.parent_summary_identity,
+      source_current_child_summary_identity:
+        unit.source_manifest_reference.current_child_summary_identity,
     })),
     source_observation_content_hash_provenance_counts:
       plan.source_observation_content_hash_provenance_counts,
