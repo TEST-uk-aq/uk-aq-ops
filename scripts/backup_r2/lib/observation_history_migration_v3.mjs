@@ -119,6 +119,29 @@ const LEGACY_STALE_PARENT_SUMMARY_IDENTITY_FIELDS = Object.freeze([
   "min_timestamp_hour_utc",
   "max_timestamp_hour_utc",
 ]);
+const EMPTY_SOURCE_CONNECTOR_CONTRACT_VERSION =
+  "canonical_empty_observation_connector_v1";
+const EMPTY_SOURCE_CONNECTOR_ZERO_FIELDS = Object.freeze([
+  "source_row_count",
+  "row_count",
+  "file_count",
+  "total_bytes",
+]);
+const EMPTY_SOURCE_CONNECTOR_ARRAY_FIELDS = Object.freeze([
+  "pollutant_codes",
+  "pollutant_manifests",
+  "child_manifests",
+  "files",
+  "parquet_object_keys",
+]);
+const EMPTY_SOURCE_CONNECTOR_NULL_FIELDS = Object.freeze([
+  "min_timeseries_id",
+  "max_timeseries_id",
+  "min_observed_at_utc",
+  "max_observed_at_utc",
+  "min_timestamp_hour_utc",
+  "max_timestamp_hour_utc",
+]);
 const CANONICAL_STAGE_RANK = Object.freeze({
   pollutant_manifest: 10,
   connector_manifest: 20,
@@ -331,6 +354,61 @@ function sourceManifestReferenceMismatch(pollutantKey) {
   );
 }
 
+function buildEmptySourceConnectorEvidence({
+  connectorManifest,
+  connectorManifestIdentity,
+  dayUtc,
+  connectorId,
+  connectorKey,
+}) {
+  const fail = () => {
+    throw new Error(
+      `Observation connector with no pollutant manifests is not canonical empty: ${connectorKey}`,
+    );
+  };
+  for (const field of EMPTY_SOURCE_CONNECTOR_ZERO_FIELDS) {
+    if (!Object.hasOwn(connectorManifest, field) || connectorManifest[field] !== 0) {
+      fail();
+    }
+  }
+  for (const field of EMPTY_SOURCE_CONNECTOR_ARRAY_FIELDS) {
+    if (
+      !Object.hasOwn(connectorManifest, field) ||
+      !Array.isArray(connectorManifest[field]) ||
+      connectorManifest[field].length !== 0
+    ) {
+      fail();
+    }
+  }
+  for (const field of EMPTY_SOURCE_CONNECTOR_NULL_FIELDS) {
+    if (!Object.hasOwn(connectorManifest, field) || connectorManifest[field] !== null) {
+      fail();
+    }
+  }
+  const zeroStateEvidence = {};
+  for (const field of EMPTY_SOURCE_CONNECTOR_ZERO_FIELDS) {
+    zeroStateEvidence[field] = connectorManifest[field];
+  }
+  for (const field of EMPTY_SOURCE_CONNECTOR_ARRAY_FIELDS) {
+    zeroStateEvidence[field] = Object.freeze([...connectorManifest[field]]);
+  }
+  for (const field of EMPTY_SOURCE_CONNECTOR_NULL_FIELDS) {
+    zeroStateEvidence[field] = connectorManifest[field];
+  }
+  return Object.freeze({
+    scope: Object.freeze({
+      day_utc: dayUtc,
+      connector_id: connectorId,
+    }),
+    source_manifest_key: connectorKey,
+    source_manifest_identity: connectorManifestIdentity,
+    source_manifest_hash: connectorManifest.manifest_hash,
+    classification: "canonical_empty_observation_connector",
+    contract_version: EMPTY_SOURCE_CONNECTOR_CONTRACT_VERSION,
+    zero_state_evidence: Object.freeze(zeroStateEvidence),
+  });
+}
+
 function requiredManifestSummaryIdentity(manifest, pollutantKey) {
   const summary = {};
   for (const field of LEGACY_STALE_PARENT_SUMMARY_IDENTITY_FIELDS) {
@@ -539,6 +617,51 @@ async function reverifyPinnedCompatibleSourceUnitsBeforeMutation({
     }
     if (!sameJson(rewritten.source_files, authorityUnit.source_files)) {
       throw new Error(`Pinned source file identity changed: ${authorityUnit.unit_id}`);
+    }
+  }
+}
+
+async function reverifyPinnedEmptySourceConnectorsBeforeMutation({
+  plan,
+  getR2Object,
+}) {
+  for (const pinned of plan.empty_source_connectors || []) {
+    const connectorObject = await getRequiredObject(
+      getR2Object,
+      pinned.source_manifest_key,
+      "canonical R2",
+    );
+    const currentIdentity = bodyIdentity(
+      pinned.source_manifest_key,
+      connectorObject.body,
+    );
+    if (!sameJson(currentIdentity, pinned.source_manifest_identity)) {
+      throw new Error(
+        `Pinned empty source connector identity changed: ${pinned.source_manifest_key}`,
+      );
+    }
+    const connectorManifest = parseJsonBody(
+      pinned.source_manifest_key,
+      connectorObject.body,
+    );
+    validateCanonicalHistoryV2Manifest(connectorManifest, {
+      domain: "observations",
+      manifest_kind: "connector",
+      day_utc: pinned.scope.day_utc,
+      connector_id: pinned.scope.connector_id,
+      manifest_key: pinned.source_manifest_key,
+    });
+    const current = buildEmptySourceConnectorEvidence({
+      connectorManifest,
+      connectorManifestIdentity: currentIdentity,
+      dayUtc: pinned.scope.day_utc,
+      connectorId: pinned.scope.connector_id,
+      connectorKey: pinned.source_manifest_key,
+    });
+    if (!sameJson(current, pinned)) {
+      throw new Error(
+        `Pinned empty source connector evidence changed: ${pinned.source_manifest_key}`,
+      );
     }
   }
 }
@@ -919,6 +1042,7 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
   ];
   const days = [];
   const connectors = [];
+  const emptyConnectors = [];
   const partitions = [];
   for (const yearReference of rootPayload.children) {
     const yearKey = buildR2HistoryV2ObservationsYearManifestKey(
@@ -1027,17 +1151,28 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
             connectorKey,
             connectorObject.body,
           );
-          connectors.push({
+          const connectorRecord = {
             ...connectorIdentity,
             day_utc: dayUtc,
             connector_id: connectorId,
             payload: connectorPayload,
-          });
-          const pollutantReferences = Array.isArray(connectorPayload.pollutant_manifests)
-            ? connectorPayload.pollutant_manifests
-            : [];
+          };
+          connectors.push(connectorRecord);
+          if (!Array.isArray(connectorPayload.pollutant_manifests)) {
+            throw new Error(
+              `Observation connector pollutant_manifests is not an array: ${connectorKey}`,
+            );
+          }
+          const pollutantReferences = connectorPayload.pollutant_manifests;
           if (!pollutantReferences.length) {
-            throw new Error(`Observation connector has no pollutant manifests: ${connectorKey}`);
+            emptyConnectors.push(buildEmptySourceConnectorEvidence({
+              connectorManifest: connectorPayload,
+              connectorManifestIdentity: connectorIdentity,
+              dayUtc,
+              connectorId,
+              connectorKey,
+            }));
+            continue;
           }
           for (const pollutantReference of pollutantReferences) {
             const pollutantCode = String(
@@ -1124,6 +1259,10 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
       }
     }
   }
+  emptyConnectors.sort((left, right) =>
+    left.scope.day_utc.localeCompare(right.scope.day_utc) ||
+    left.scope.connector_id - right.scope.connector_id
+  );
   partitions.sort((left, right) =>
     left.scope.day_utc.localeCompare(right.scope.day_utc) ||
     left.scope.connector_id - right.scope.connector_id ||
@@ -1136,6 +1275,7 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
     hierarchy_objects: Object.freeze(hierarchyObjects),
     day_manifests: Object.freeze(days),
     connector_manifests: Object.freeze(connectors),
+    empty_source_connectors: Object.freeze(emptyConnectors),
     partitions: Object.freeze(partitions),
     existing_v2_latest_identity: latestObject
       ? bodyIdentity(v2LatestKey, latestObject.body)
@@ -1714,14 +1854,27 @@ function buildCanonicalParents({ inventory, units, observationsPrefix, targetWri
     if (!unitsByDayConnector.has(key)) unitsByDayConnector.set(key, []);
     unitsByDayConnector.get(key).push(unit);
   }
+  const emptyConnectorScopes = new Set(
+    (inventory.empty_source_connectors || []).map((entry) =>
+      `${entry.scope.day_utc}|${entry.scope.connector_id}`
+    ),
+  );
   const connectorObjects = [];
-  for (const [key, scopedUnits] of [...unitsByDayConnector.entries()].sort()) {
-    const [dayUtc, connectorText] = key.split("|");
-    const connectorId = Number(connectorText);
-    const old = inventory.connector_manifests.find(
-      (entry) => entry.day_utc === dayUtc && entry.connector_id === connectorId,
-    );
-    if (!old) throw new Error(`Pre-state connector manifest is missing: ${key}`);
+  const sourceConnectors = [...inventory.connector_manifests].sort((left, right) =>
+    left.day_utc.localeCompare(right.day_utc) ||
+    left.connector_id - right.connector_id
+  );
+  const sourceConnectorScopes = new Set();
+  for (const old of sourceConnectors) {
+    const dayUtc = old.day_utc;
+    const connectorId = old.connector_id;
+    const key = `${dayUtc}|${connectorId}`;
+    sourceConnectorScopes.add(key);
+    const scopedUnits = unitsByDayConnector.get(key) || [];
+    const isEmpty = emptyConnectorScopes.has(key);
+    if ((isEmpty && scopedUnits.length) || (!isEmpty && !scopedUnits.length)) {
+      throw new Error(`Target connector source coverage is inconsistent: ${key}`);
+    }
     const manifestKey = buildHistoryV2ConnectorManifestKey(
       observationsPrefix,
       dayUtc,
@@ -1746,6 +1899,11 @@ function buildCanonicalParents({ inventory, units, observationsPrefix, targetWri
         "pollutant_manifest",
       ),
     }));
+  }
+  for (const key of unitsByDayConnector.keys()) {
+    if (!sourceConnectorScopes.has(key)) {
+      throw new Error(`Pre-state connector manifest is missing: ${key}`);
+    }
   }
   const connectorsByDay = new Map();
   for (const object of connectorObjects) {
@@ -2055,6 +2213,7 @@ export async function buildObservationHistoryV3MigrationPlan({
       ).length,
     unexplained: 0,
   });
+  const emptySourceConnectors = inventory.empty_source_connectors;
   const planIdentityPayload = {
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
     environment: environment.environment,
@@ -2070,6 +2229,7 @@ export async function buildObservationHistoryV3MigrationPlan({
       sourceObservationContentHashProvenanceCounts,
     source_manifest_reference_provenance_counts:
       sourceManifestReferenceProvenanceCounts,
+    empty_source_connectors: emptySourceConnectors,
     observations_prefix: inventory.observations_prefix,
     v3_index_root: v3IndexRoot,
     v3_latest_key: v3LatestKey,
@@ -2102,6 +2262,8 @@ export async function buildObservationHistoryV3MigrationPlan({
       sourceObservationContentHashProvenanceCounts,
     source_manifest_reference_provenance_counts:
       sourceManifestReferenceProvenanceCounts,
+    empty_source_connector_count: emptySourceConnectors.length,
+    empty_source_connectors: emptySourceConnectors,
     canonical_publication_objects: Object.freeze([]),
     v3_latest: null,
     v3_publication_plan: null,
@@ -2123,6 +2285,7 @@ export async function buildObservationHistoryV3MigrationPlan({
       v3_child_shards: null,
       v3_scoped_roots: units.length,
       v3_latest_objects: 1,
+      empty_source_connectors: emptySourceConnectors.length,
     }),
   });
 }
@@ -2448,6 +2611,10 @@ export async function executeObservationHistoryV3MigrationPlan({
     buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
   } else {
     await adapters.writeCheckpoint(structuredClone(checkpoint));
+    await reverifyPinnedEmptySourceConnectorsBeforeMutation({
+      plan,
+      getR2Object: adapters.getObject,
+    });
     await reverifyPinnedCompatibleSourceUnitsBeforeMutation({
       plan,
       getR2Object: adapters.getObject,
@@ -3256,6 +3423,15 @@ export function buildObservationHistoryV3MigrationAuditReport({
     partitions_attempted: plan.units.length,
     partitions_succeeded: plan.units.filter((unit) => unit.logical_identity_verified).length,
     partitions_failed: plan.units.filter((unit) => !unit.logical_identity_verified).length,
+    empty_source_connector_count: plan.empty_source_connector_count,
+    empty_source_connectors: plan.empty_source_connectors.map((entry) => ({
+      scope: entry.scope,
+      source_manifest_key: entry.source_manifest_key,
+      source_manifest_identity: entry.source_manifest_identity,
+      source_manifest_hash: entry.source_manifest_hash,
+      classification: entry.classification,
+      contract_version: entry.contract_version,
+    })),
     partition_results: plan.units.map((unit) => ({
       scope: unit.scope,
       old_row_count: unit.source_row_count,

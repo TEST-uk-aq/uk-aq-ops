@@ -279,6 +279,15 @@ function summaryForPlan(plan) {
       plan.source_observation_content_hash_provenance_counts,
     source_manifest_reference_provenance_counts:
       plan.source_manifest_reference_provenance_counts,
+    empty_source_connector_count: plan.empty_source_connector_count,
+    empty_source_connectors: plan.empty_source_connectors.map((entry) => ({
+      scope: entry.scope,
+      source_manifest_key: entry.source_manifest_key,
+      source_manifest_identity: entry.source_manifest_identity,
+      source_manifest_hash: entry.source_manifest_hash,
+      classification: entry.classification,
+      contract_version: entry.contract_version,
+    })),
     writer_freeze_plan: plan.writer_freeze_plan,
     partitions: plan.units.map((unit) => ({
       unit_id: unit.unit_id,

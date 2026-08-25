@@ -26,6 +26,7 @@ import {
   buildHistoryV2DayManifestKey,
   buildHistoryV2PollutantManifest,
   buildHistoryV2PollutantManifestKey,
+  validateCanonicalHistoryV2Manifest,
 } from "../workers/shared/uk_aq_r2_history_canonical.mjs";
 import { sha256Hex } from "../workers/shared/r2_sigv4.mjs";
 import {
@@ -105,6 +106,27 @@ const STALE_PARENT_SUMMARY_IDENTITY_FIELDS = Object.freeze([
   "min_timestamp_hour_utc",
   "max_timestamp_hour_utc",
 ]);
+const EMPTY_CONNECTOR_ZERO_FIELDS = Object.freeze([
+  "source_row_count",
+  "row_count",
+  "file_count",
+  "total_bytes",
+]);
+const EMPTY_CONNECTOR_ARRAY_FIELDS = Object.freeze([
+  "pollutant_codes",
+  "pollutant_manifests",
+  "child_manifests",
+  "files",
+  "parquet_object_keys",
+]);
+const EMPTY_CONNECTOR_NULL_FIELDS = Object.freeze([
+  "min_timeseries_id",
+  "max_timeseries_id",
+  "min_observed_at_utc",
+  "max_observed_at_utc",
+  "min_timestamp_hour_utc",
+  "max_timestamp_hour_utc",
+]);
 
 function jsonBody(value) {
   return Buffer.from(JSON.stringify(value, null, 2), "utf8");
@@ -172,6 +194,7 @@ async function buildFixture({
   parentReferenceOverrides = {},
   missingParentReferenceFields = {},
   staleParentHashes = {},
+  emptyConnector = null,
 } = {}) {
   const baseRows = [
     [100, "2026-01-02T00:00:00.000Z", 10, "P"],
@@ -298,12 +321,55 @@ async function buildFixture({
     }
     connector = rehashManifest(connector);
   }
+  let emptyConnectorEntry = null;
+  if (emptyConnector) {
+    const connectorId = emptyConnector.connectorId || 2;
+    const key = buildHistoryV2ConnectorManifestKey(PREFIX, DAY, connectorId);
+    let payload = buildHistoryV2ConnectorManifest({
+      domain: "observations",
+      dayUtc: DAY,
+      connectorId,
+      manifestKey: key,
+      pollutantManifests: [],
+      writerGitSha: "fixture-source",
+      backedUpAtUtc: "2026-01-03T00:00:00.000Z",
+    });
+    if (
+      Object.keys(emptyConnector.overrides || {}).length ||
+      (emptyConnector.missingFields || []).length
+    ) {
+      payload = structuredClone(payload);
+      Object.assign(payload, emptyConnector.overrides || {});
+      for (const field of emptyConnector.missingFields || []) delete payload[field];
+      payload = rehashManifest(payload);
+    }
+    if (emptyConnector.invalidManifestHash) {
+      payload = structuredClone(payload);
+      payload.backed_up_at_utc = "2026-01-03T00:00:01.000Z";
+    }
+    emptyConnectorEntry = {
+      key,
+      connectorId,
+      payload,
+      dayReference: {
+        ...payload,
+        day_utc: DAY,
+        connector_id: connectorId,
+        manifest_key: key,
+        manifest_hash:
+          emptyConnector.dayReferenceHash || payload.manifest_hash,
+      },
+    };
+  }
   const dayKey = buildHistoryV2DayManifestKey(PREFIX, DAY);
   const day = buildHistoryV2DayManifest({
     domain: "observations",
     dayUtc: DAY,
     manifestKey: dayKey,
-    connectorManifests: [connector],
+    connectorManifests: [
+      connector,
+      ...(emptyConnectorEntry ? [emptyConnectorEntry.dayReference] : []),
+    ],
     writerGitSha: "fixture-source",
     backedUpAtUtc: "2026-01-03T00:00:00.000Z",
   });
@@ -319,6 +385,9 @@ async function buildFixture({
   for (const [key, value] of [
     ...pollutants.map((entry) => [entry.key, entry.payload]),
     [connectorKey, connector],
+    ...(emptyConnectorEntry
+      ? [[emptyConnectorEntry.key, emptyConnectorEntry.payload]]
+      : []),
     [dayKey, day],
   ]) r2.set(key, jsonBody(value));
   for (const object of hierarchy.objects) r2.set(object.key, Buffer.from(object.body));
@@ -418,6 +487,7 @@ async function buildFixture({
     source: sources[0],
     sources,
     connectorKey,
+    emptyConnectorKey: emptyConnectorEntry?.key || null,
     pollutantKeys: new Map(
       pollutants.map((entry) => [entry.payload.pollutant_code, entry.key]),
     ),
@@ -748,6 +818,8 @@ test("Phase 6 migration inventory keeps complete modern hash metadata strict and
     legacy_stale_parent_manifest_hash: 0,
     unexplained: 0,
   });
+  assert.equal(plan.empty_source_connector_count, 0);
+  assert.deepEqual(plan.empty_source_connectors, []);
   for (const unit of plan.units) {
     assert.equal(unit.source_observation_content_hash_provenance, "manifest");
     assert.equal(
@@ -1228,6 +1300,248 @@ test("Phase 6 stale source rewrites a consistent target hierarchy and rollback r
     ).manifest_hash,
     restoredChild.manifest_hash,
   );
+});
+
+test("Phase 6 accepts and separately pins a canonical empty connector without creating a unit", async () => {
+  const fixture = await buildFixture({ emptyConnector: {} });
+  const first = await buildPlan(fixture);
+  const second = await buildPlan(fixture);
+  assert.equal(first.plan_sha256, second.plan_sha256);
+  assert.equal(first.inventory.connector_manifests.length, 2);
+  assert.equal(first.inventory.partitions.length, 2);
+  assert.equal(first.units.length, 2);
+  assert.equal(first.empty_source_connector_count, 1);
+  assert.equal(first.estimated.empty_source_connectors, 1);
+  assert.ok(first.units.every((unit) => unit.scope.connector_id === 1));
+  const empty = first.empty_source_connectors[0];
+  assert.deepEqual(empty.scope, { day_utc: DAY, connector_id: 2 });
+  assert.equal(empty.source_manifest_key, fixture.emptyConnectorKey);
+  assert.equal(empty.source_manifest_identity.key, fixture.emptyConnectorKey);
+  assert.equal(empty.classification, "canonical_empty_observation_connector");
+  assert.equal(
+    empty.contract_version,
+    "canonical_empty_observation_connector_v1",
+  );
+  for (const field of EMPTY_CONNECTOR_ZERO_FIELDS) {
+    assert.equal(empty.zero_state_evidence[field], 0, field);
+  }
+  for (const field of EMPTY_CONNECTOR_ARRAY_FIELDS) {
+    assert.deepEqual(empty.zero_state_evidence[field], [], field);
+  }
+  for (const field of EMPTY_CONNECTOR_NULL_FIELDS) {
+    assert.equal(empty.zero_state_evidence[field], null, field);
+  }
+  const changed = await buildFixture({
+    emptyConnector: {
+      overrides: { backed_up_at_utc: "2026-01-03T00:00:01.000Z" },
+    },
+  });
+  const changedPlan = await buildPlan(changed);
+  assert.notEqual(first.plan_sha256, changedPlan.plan_sha256);
+  assert.notEqual(
+    empty.source_manifest_identity.sha256,
+    changedPlan.empty_source_connectors[0].source_manifest_identity.sha256,
+  );
+  const audit = buildObservationHistoryV3MigrationAuditReport({
+    plan: first,
+    mode: "plan",
+  });
+  assert.equal(audit.empty_source_connector_count, 1);
+  assert.deepEqual(audit.empty_source_connectors[0].scope, empty.scope);
+  assert.equal(
+    audit.empty_source_connectors[0].contract_version,
+    "canonical_empty_observation_connector_v1",
+  );
+});
+
+test("Phase 6 rejects every inconsistent or malformed no-child connector zero state", async () => {
+  for (const field of EMPTY_CONNECTOR_ZERO_FIELDS) {
+    const overrides = field === "source_row_count"
+      ? { source_row_count: 1, row_count: 1 }
+      : { [field]: 1 };
+    const fixture = await buildFixture({ emptyConnector: { overrides } });
+    await assert.rejects(buildPlan(fixture));
+  }
+  for (const field of [
+    "pollutant_codes",
+    "child_manifests",
+    "files",
+    "parquet_object_keys",
+  ]) {
+    const fixture = await buildFixture({
+      emptyConnector: { overrides: { [field]: [{ unexpected: true }] } },
+    });
+    await assert.rejects(buildPlan(fixture));
+  }
+  for (const field of EMPTY_CONNECTOR_NULL_FIELDS) {
+    const fixture = await buildFixture({
+      emptyConnector: { overrides: { [field]: "unexpected" } },
+    });
+    await assert.rejects(buildPlan(fixture));
+  }
+  for (const field of EMPTY_CONNECTOR_ARRAY_FIELDS) {
+    const fixture = await buildFixture({
+      emptyConnector: { missingFields: [field] },
+    });
+    await assert.rejects(buildPlan(fixture));
+  }
+  const invalidHash = await buildFixture({
+    emptyConnector: { invalidManifestHash: true },
+  });
+  await assert.rejects(
+    buildPlan(invalidHash),
+    /Canonical history manifest hash verification failed/,
+  );
+  for (const overrides of [
+    { day_utc: "2026-01-01" },
+    { connector_id: 999 },
+  ]) {
+    const fixture = await buildFixture({ emptyConnector: { overrides } });
+    await assert.rejects(
+      buildPlan(fixture),
+      /Canonical history manifest (day_utc|connector_id) identity mismatch/,
+    );
+  }
+  const dayMismatch = await buildFixture({
+    emptyConnector: { dayReferenceHash: "d".repeat(64) },
+  });
+  await assert.rejects(
+    buildPlan(dayMismatch),
+    /Observation day\/connector identity mismatch/,
+  );
+});
+
+test("Phase 6 rebuilds, orders and exactly rolls back a canonical empty connector", async () => {
+  const fixture = await buildFixture({ emptyConnector: {} });
+  const sourceEmptyBody = Buffer.from(fixture.r2.get(fixture.emptyConnectorKey));
+  const sourceEmpty = JSON.parse(sourceEmptyBody);
+  const plan = await buildPlan(fixture);
+  const adapters = memoryAdapters(fixture);
+  const migration = await executeObservationHistoryV3MigrationPlan({
+    plan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  });
+  assert.equal(migration.verification.cutover_ready, true);
+  const completed = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: migration.checkpoint,
+    requirePrepared: true,
+  });
+  assert.ok(completed.units.every((unit) => unit.scope.connector_id === 1));
+  const targetEmptyObject = completed.canonical_publication_objects.find(
+    (object) =>
+      object.publication_stage === "connector_manifest" &&
+      object.payload.connector_id === 2,
+  );
+  assert.ok(targetEmptyObject);
+  assert.deepEqual(targetEmptyObject.dependencies, []);
+  const expectedTargetEmpty = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY,
+    connectorId: 2,
+    runId: null,
+    manifestKey: fixture.emptyConnectorKey,
+    pollutantManifests: [],
+    writerGitSha: "fixture-target",
+    backedUpAtUtc: sourceEmpty.backed_up_at_utc,
+  });
+  assert.deepEqual(targetEmptyObject.payload, expectedTargetEmpty);
+  assert.equal(
+    targetEmptyObject.payload.history_schema_version,
+    completed.target.history_schema_version,
+  );
+  assert.equal(
+    targetEmptyObject.payload.writer_version,
+    completed.target.writer_version,
+  );
+  validateCanonicalHistoryV2Manifest(targetEmptyObject.payload, {
+    domain: "observations",
+    manifest_kind: "connector",
+    day_utc: DAY,
+    connector_id: 2,
+    manifest_key: fixture.emptyConnectorKey,
+  });
+  const targetDayObject = completed.canonical_publication_objects.find(
+    (object) => object.publication_stage === "day_manifest",
+  );
+  const targetDayReference = targetDayObject.payload.connector_manifests.find(
+    (entry) => entry.connector_id === 2,
+  );
+  assert.equal(
+    targetDayReference.manifest_hash,
+    targetEmptyObject.payload.manifest_hash,
+  );
+  assert.ok(targetDayObject.dependencies.some(
+    (entry) => entry.key === fixture.emptyConnectorKey,
+  ));
+  const emptyPosition = completed.canonical_publication_objects.findIndex(
+    (object) => object.key === fixture.emptyConnectorKey,
+  );
+  const dayPosition = completed.canonical_publication_objects.findIndex(
+    (object) => object.key === targetDayObject.key,
+  );
+  assert.ok(emptyPosition >= 0 && emptyPosition < dayPosition);
+  const targetParquetObjects = completed.units.flatMap(
+    (unit) => unit.target_file_intents,
+  );
+  assert.equal(
+    completed.estimated.new_parquet_objects,
+    targetParquetObjects.length,
+  );
+  assert.ok(targetParquetObjects.every(
+    (entry) => !entry.key.includes("connector_id=2/"),
+  ));
+  assert.ok(completed.canonical_publication_objects.every(
+    (entry) => !entry.key.includes("connector_id=2/pollutant_code="),
+  ));
+  assert.equal(completed.estimated.v3_scopes, 2);
+
+  const restorePlan = await buildObservationHistoryV2RestorePlan({
+    checkpoint: migration.checkpoint,
+    getBackupObject: mapReader(fixture.backup),
+  });
+  assert.ok(restorePlan.objects.some(
+    (entry) => entry.key === fixture.emptyConnectorKey,
+  ));
+  assert.equal(restorePlan.objects.filter(
+    (entry) => entry.key.includes("connector_id=2/pollutant_code="),
+  ).length, 0);
+  const rollback = await executeObservationHistoryV2Rollback({
+    restorePlan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: { ...ENVIRONMENT, indexVersion: "v3" },
+    adapters,
+  });
+  assert.equal(rollback.ok, true);
+  assert.equal(
+    Buffer.compare(fixture.r2.get(fixture.emptyConnectorKey), sourceEmptyBody),
+    0,
+  );
+});
+
+test("Phase 6 empty-connector preparation rejects source drift before PUT", async () => {
+  const fixture = await buildFixture({ emptyConnector: {} });
+  const plan = await buildPlan(fixture);
+  const changed = JSON.parse(fixture.r2.get(fixture.emptyConnectorKey));
+  changed.backed_up_at_utc = "2026-01-03T00:00:01.000Z";
+  fixture.r2.set(fixture.emptyConnectorKey, jsonBody(rehashManifest(changed)));
+  const adapters = memoryAdapters(fixture);
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters,
+    }),
+    /Pinned empty source connector identity changed/,
+  );
+  assert.equal(adapters.putCalls, 0);
+  assert.equal(adapters.stagedBodyCount, 0);
+  assert.equal(adapters.checkpoints.length, 1);
 });
 
 test("Phase 4 planner is deterministic, backup-gated and retains no target archive bodies", async () => {
