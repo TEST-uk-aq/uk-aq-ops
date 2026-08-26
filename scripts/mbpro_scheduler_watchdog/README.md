@@ -14,6 +14,9 @@ per UTC minute. Calls to ingest and ops are independent. D1-backed Worker minute
 claiming remains the authority for deduplication; this watchdog does not keep or
 replace scheduler job state.
 
+Cloudflare Cron remains the normal primary trigger. The MacBook Pro watchdog
+provides scheduling continuity when Cron does not claim a minute first.
+
 The preserved request contract is:
 
 - `X-UK-AQ-Scheduler-Trigger` authentication;
@@ -39,7 +42,8 @@ watchdog.env.example
 watchdog_launchagent_common.sh
 ```
 
-No file in this package contains a TEST or LIVE scheduler URL or trigger secret.
+No file in this package contains a TEST or LIVE scheduler URL, trigger secret or
+Dropbox OAuth secret.
 
 ## Configuration boundary
 
@@ -53,21 +57,70 @@ UK_AQ_SCHEDULER_TRIGGER_SECRET=replace-with-dedicated-trigger-secret
 UK_AQ_INGEST_SCHEDULER_URL=https://replace-with-ingest-scheduler-worker
 UK_AQ_OPS_SCHEDULER_URL=https://replace-with-ops-scheduler-worker
 
+DROPBOX_APP_KEY=replace-with-dropbox-app-key
+DROPBOX_APP_SECRET=replace-with-dropbox-app-secret
+DROPBOX_REFRESH_TOKEN=replace-with-dropbox-refresh-token
+UK_AQ_DROPBOX_ROOT=/TEST
+
 UK_AQ_SCHEDULER_WATCHDOG_OFFSET_SECONDS=30
 UK_AQ_SCHEDULER_WATCHDOG_REQUEST_TIMEOUT_SECONDS=900
 UK_AQ_SCHEDULER_WATCHDOG_MAX_IN_FLIGHT_PER_WORKER=4
 ```
 
-Only the dedicated scheduler trigger secret and the two scheduler Worker URLs
-belong in this configuration, in addition to the environment and watchdog
-limits. Do not use or copy a broad `.env`, Cloudflare API credentials, D1
-credentials, GitHub PATs, downstream dispatch secrets or unrelated service
-secrets.
+In addition to the environment, scheduler trigger secret, Worker URLs and
+watchdog limits, the watchdog needs the established Dropbox app key, app secret,
+refresh token and environment-specific `UK_AQ_DROPBOX_ROOT`. Those four values
+are used only to upload sustained Cron-outage errors through the central UK AQ
+Dropbox error-log convention. Keep them in this dedicated protected file.
+
+The four Dropbox settings are validated as one group: configure all four for
+central outage reporting, or none. A partial group is rejected. If the group is
+absent, scheduler continuity still runs and a detected outage produces a local
+`scheduler_watchdog_dropbox_error_not_configured` event instead of stopping the
+watchdog.
+
+Do not use or copy a broad `.env`. Cloudflare API credentials, D1 credentials,
+GitHub PATs, downstream dispatch secrets and unrelated service secrets do not
+belong in the watchdog configuration.
 
 The shell scripts do not source or evaluate this file. They parse only the
 single `UKAQ_ENV_NAME` assignment needed to derive installation identity. The
 Python watchdog validates the complete file before installation without making
 a network request.
+
+## Cloudflare Cron health detection
+
+For ingest and ops independently, the watchdog reads the structured scheduler
+response for each canonical `minute_slot`:
+
+- `status: triggered` is definitive evidence that the watchdog supplied
+  scheduling continuity for that minute;
+- `claimed_trigger_source: cloudflare_cron` is definitive evidence that the
+  normal Cloudflare Cron source claimed that minute;
+- authentication, HTTP and network failures, malformed responses, and missing
+  or unknown trigger-source information are not treated as evidence of a Cron
+  outage.
+
+Ten contiguous watchdog-claimed minute slots produce one
+`scheduler_watchdog_cloudflare_cron_outage_detected` event in the local JSONL
+and one remote Dropbox error record under:
+
+```text
+<UK_AQ_DROPBOX_ROOT>/error_log/YYYY-MM-DD/
+```
+
+The remote filename and JSON payload follow the existing UK AQ central
+error-log convention. The condition remains active and is not reported again
+each minute. A later, newer minute definitively claimed by `cloudflare_cron`
+clears the condition and writes one
+`scheduler_watchdog_cloudflare_cron_recovered` event to the local JSONL. The
+central error-log contract has no established recovery record, so no Dropbox
+recovery file is created.
+
+Responses are ordered by `minute_slot`, not completion time, so overlapping
+requests that finish out of order cannot extend or reset the wrong sequence.
+Dropbox reporting runs separately from scheduler requests. Token or upload
+failure is logged locally and never stops or delays future scheduling.
 
 ## Derived installations
 
@@ -94,8 +147,9 @@ cp scripts/mbpro_scheduler_watchdog/watchdog.env.example "$TEST_WATCHDOG_CONFIG"
 chmod 600 "$TEST_WATCHDOG_CONFIG"
 ```
 
-Edit that file as data, retain `UKAQ_ENV_NAME=TEST`, and replace only the secret
-and Worker URL placeholders. Then install and inspect:
+Edit that file as data, retain `UKAQ_ENV_NAME=TEST`, set the TEST Worker URLs,
+dedicated scheduler trigger secret, established Dropbox OAuth values and TEST
+`UK_AQ_DROPBOX_ROOT`. Then install and inspect:
 
 ```bash
 scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
@@ -123,7 +177,9 @@ cp scripts/mbpro_scheduler_watchdog/watchdog.env.example "$LIVE_WATCHDOG_CONFIG"
 chmod 600 "$LIVE_WATCHDOG_CONFIG"
 ```
 
-Set `UKAQ_ENV_NAME=LIVE` and the LIVE-specific scheduler secret and URLs. Then:
+Set `UKAQ_ENV_NAME=LIVE`, the LIVE-specific scheduler secret, URLs and
+`UK_AQ_DROPBOX_ROOT`, plus the appropriate established Dropbox OAuth values.
+Then:
 
 ```bash
 scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
@@ -144,7 +200,7 @@ scripts/mbpro_scheduler_watchdog/uninstall_launchagent.sh \
   --config "$TEST_WATCHDOG_CONFIG"
 ```
 
-After rollback/incident review is complete and the copied secret may be removed:
+After rollback/incident review is complete and the copied secrets may be removed:
 
 ```bash
 scripts/mbpro_scheduler_watchdog/uninstall_launchagent.sh \
