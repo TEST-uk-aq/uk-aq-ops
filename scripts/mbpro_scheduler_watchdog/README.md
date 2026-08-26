@@ -23,11 +23,12 @@ The preserved request contract is:
 - `Accept: application/json`;
 - the UK AQ browser-style watchdog user-agent;
 - HTTPS Worker URLs with automatic `/run-if-due` suffix handling;
-- a 900-second request timeout;
-- at most four in-flight calls per Worker;
+- a 900-second request timeout by default;
+- at most four in-flight calls per Worker by default;
+- a Cron-outage alert after ten consecutive takeover minutes by default;
 - rotating local JSONL logging and controlled `SIGTERM`/`SIGINT` shutdown.
 
-The operational offset is 30 seconds after each UTC minute.
+The default operational offset is 30 seconds after each UTC minute.
 
 ## Package layout
 
@@ -63,9 +64,16 @@ DROPBOX_REFRESH_TOKEN=replace-with-dropbox-refresh-token
 UK_AQ_DROPBOX_ROOT=/TEST
 
 UK_AQ_SCHEDULER_WATCHDOG_OFFSET_SECONDS=30
+UK_AQ_SCHEDULER_WATCHDOG_CRON_OUTAGE_THRESHOLD_MINUTES=10
 UK_AQ_SCHEDULER_WATCHDOG_REQUEST_TIMEOUT_SECONDS=900
 UK_AQ_SCHEDULER_WATCHDOG_MAX_IN_FLIGHT_PER_WORKER=4
 ```
+
+The four watchdog limit settings are optional. Their defaults are a 30-second
+offset, a 10-minute Cron-outage threshold, a 900-second request timeout and four
+in-flight calls per Worker. The outage threshold must be a positive integer
+number of minutes; because evidence uses one-minute slots, the same value is the
+required number of consecutive watchdog takeovers.
 
 In addition to the environment, scheduler trigger secret, Worker URLs and
 watchdog limits, the watchdog needs the established Dropbox app key, app secret,
@@ -102,8 +110,8 @@ response for each canonical `minute_slot`:
   outage. Missing minute slots remain unknown.
 
 The retained 120-minute observation window is recomputed in chronological
-minute-slot order whenever definitive evidence arrives. Ten contiguous
-watchdog-claimed minute slots produce one
+minute-slot order whenever definitive evidence arrives. The configured number
+of contiguous watchdog-claimed minute slots (ten by default) produces one
 `scheduler_watchdog_cloudflare_cron_outage_detected` event in the local JSONL
 and one remote Dropbox error record under:
 
@@ -161,9 +169,11 @@ chmod 600 "$TEST_WATCHDOG_CONFIG"
 
 Edit that file as data, retain `UKAQ_ENV_NAME=TEST`, set the TEST Worker URLs,
 dedicated scheduler trigger secret, established Dropbox OAuth values and TEST
-`UK_AQ_DROPBOX_ROOT`. Then install and inspect:
+`UK_AQ_DROPBOX_ROOT`, plus any non-default watchdog limits. Then install and
+inspect:
 
 ```bash
+PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
   --config "$TEST_WATCHDOG_CONFIG"
 
@@ -177,7 +187,10 @@ The installer validates the configuration and rendered plist before unloading
 an existing job with the derived label. It then installs and starts the new
 job. For TEST this safely replaces the existing
 `uk.co.ukaq.test-scheduler-watchdog` label while pointing it at the new
-environment-specific paths.
+environment-specific paths. To apply a later configuration change, edit the
+protected source `.env` and rerun the same installer command. It validates and
+copies that file, then restarts only the LaunchAgent selected by its
+`UKAQ_ENV_NAME`.
 
 ## Install LIVE later without affecting TEST
 
@@ -194,6 +207,7 @@ Set `UKAQ_ENV_NAME=LIVE`, the LIVE-specific scheduler secret, URLs and
 Then:
 
 ```bash
+PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
   --config "$LIVE_WATCHDOG_CONFIG"
 scripts/mbpro_scheduler_watchdog/status_launchagent.sh \
@@ -246,6 +260,7 @@ maintenance, transition manually:
 3. Install the generic package with `UKAQ_ENV_NAME=TEST`:
 
    ```bash
+   PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
    scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
      --config "$TEST_WATCHDOG_CONFIG"
    ```

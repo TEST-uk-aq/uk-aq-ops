@@ -22,7 +22,7 @@ from urllib import error, parse, request
 DEFAULT_OFFSET_SECONDS = 30
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 900
 DEFAULT_MAX_IN_FLIGHT_PER_WORKER = 4
-CRON_OUTAGE_THRESHOLD_SLOTS = 10
+DEFAULT_CRON_OUTAGE_THRESHOLD_MINUTES = 10
 CRON_OBSERVATION_RETENTION_SLOTS = 120
 DROPBOX_REQUEST_TIMEOUT_SECONDS = 30
 DROPBOX_REPORT_RETRY_DELAYS_SECONDS = (120, 300, 900, 1_800)
@@ -48,6 +48,7 @@ OPTIONAL_SETTINGS = (
     "UK_AQ_SCHEDULER_WATCHDOG_OFFSET_SECONDS",
     "UK_AQ_SCHEDULER_WATCHDOG_REQUEST_TIMEOUT_SECONDS",
     "UK_AQ_SCHEDULER_WATCHDOG_MAX_IN_FLIGHT_PER_WORKER",
+    "UK_AQ_SCHEDULER_WATCHDOG_CRON_OUTAGE_THRESHOLD_MINUTES",
 )
 ALLOWED_SETTINGS = frozenset((*REQUIRED_SETTINGS, *OPTIONAL_SETTINGS))
 
@@ -134,6 +135,11 @@ def validate_watchdog_settings(settings: dict[str, str]) -> str:
         settings,
         "UK_AQ_SCHEDULER_WATCHDOG_MAX_IN_FLIGHT_PER_WORKER",
         DEFAULT_MAX_IN_FLIGHT_PER_WORKER,
+    )
+    positive_int(
+        settings,
+        "UK_AQ_SCHEDULER_WATCHDOG_CRON_OUTAGE_THRESHOLD_MINUTES",
+        DEFAULT_CRON_OUTAGE_THRESHOLD_MINUTES,
     )
     normalize_worker_url(settings["UK_AQ_INGEST_SCHEDULER_URL"])
     normalize_worker_url(settings["UK_AQ_OPS_SCHEDULER_URL"])
@@ -341,10 +347,12 @@ class CronHealthTracker:
         settings: dict[str, str],
         logger: logging.Logger,
         worker_names: tuple[str, ...],
+        outage_threshold_slots: int,
     ) -> None:
         self.settings = settings
         self.logger = logger
         self.environment = canonical_environment(settings)
+        self.outage_threshold_slots = outage_threshold_slots
         self.lock = threading.Lock()
         self.observations: dict[str, dict[int, str]] = {
             worker_name: {} for worker_name in worker_names
@@ -408,7 +416,7 @@ class CronHealthTracker:
                 "worker": worker_name,
                 "latest_minute_slot": latest_slot,
                 "consecutive_takeover_count": count,
-                "threshold": CRON_OUTAGE_THRESHOLD_SLOTS,
+                "threshold": self.outage_threshold_slots,
                 "watchdog_trigger_source": "external_watchdog",
                 "source_file": (
                     "scripts/mbpro_scheduler_watchdog/"
@@ -451,7 +459,7 @@ class CronHealthTracker:
             int | None, dict[str, int | bool | None]
         ] = {}
         for start_slot, end_slot, count in self._takeover_runs(worker_name):
-            if count < CRON_OUTAGE_THRESHOLD_SLOTS:
+            if count < self.outage_threshold_slots:
                 continue
             recovery_slot = next(
                 (slot for slot in cloudflare_slots if slot > end_slot),
@@ -640,7 +648,7 @@ class CronHealthTracker:
                 worker=worker_name,
                 minute_slot=minute_slot_text(outage["end_slot"]),
                 consecutive_takeover_count=outage["count"],
-                threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
+                threshold=self.outage_threshold_slots,
                 detection_timestamp=outage["payload"]["created_at"],
             )
         for outage in recoveries:
@@ -652,7 +660,7 @@ class CronHealthTracker:
                 minute_slot=minute_slot_text(outage["recovery_slot"]),
                 consecutive_takeover_count=0,
                 previous_consecutive_takeover_count=outage["count"],
-                threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
+                threshold=self.outage_threshold_slots,
             )
         for outage in reports_to_submit:
             try:
@@ -666,6 +674,7 @@ class CronHealthTracker:
                     environment=self.environment,
                     worker=worker_name,
                     minute_slot=minute_slot_text(outage["end_slot"]),
+                    threshold=self.outage_threshold_slots,
                     error_type=type(exc).__name__,
                     message=str(exc)[:500],
                 )
@@ -694,7 +703,7 @@ class CronHealthTracker:
                 worker=worker_name,
                 minute_slot=minute_slot,
                 consecutive_takeover_count=count,
-                threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
+                threshold=self.outage_threshold_slots,
                 error_id=error_id,
                 error_type=type(exc).__name__,
                 message=str(exc)[:500],
@@ -717,7 +726,7 @@ class CronHealthTracker:
                 worker=worker_name,
                 minute_slot=minute_slot,
                 consecutive_takeover_count=count,
-                threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
+                threshold=self.outage_threshold_slots,
                 error_id=error_id,
             )
             return
@@ -732,7 +741,7 @@ class CronHealthTracker:
             worker=worker_name,
             minute_slot=minute_slot,
             consecutive_takeover_count=count,
-            threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
+            threshold=self.outage_threshold_slots,
             error_id=error_id,
             dropbox_path=path,
         )
@@ -851,6 +860,11 @@ class SchedulerWatchdog:
             "UK_AQ_SCHEDULER_WATCHDOG_MAX_IN_FLIGHT_PER_WORKER",
             DEFAULT_MAX_IN_FLIGHT_PER_WORKER,
         )
+        self.cron_outage_threshold_minutes = positive_int(
+            settings,
+            "UK_AQ_SCHEDULER_WATCHDOG_CRON_OUTAGE_THRESHOLD_MINUTES",
+            DEFAULT_CRON_OUTAGE_THRESHOLD_MINUTES,
+        )
         self.workers = {
             "ingest": normalize_worker_url(settings["UK_AQ_INGEST_SCHEDULER_URL"]),
             "ops": normalize_worker_url(settings["UK_AQ_OPS_SCHEDULER_URL"]),
@@ -859,6 +873,7 @@ class SchedulerWatchdog:
             settings,
             logger,
             tuple(self.workers),
+            self.cron_outage_threshold_minutes,
         )
         self.stop_event = threading.Event()
         self.in_flight: dict[str, set[concurrent.futures.Future[None]]] = {
@@ -904,7 +919,7 @@ class SchedulerWatchdog:
             offset_seconds=self.offset_seconds,
             request_timeout_seconds=self.timeout_seconds,
             max_in_flight_per_worker=self.max_in_flight,
-            cron_outage_threshold_slots=CRON_OUTAGE_THRESHOLD_SLOTS,
+            cron_outage_threshold_minutes=self.cron_outage_threshold_minutes,
             dropbox_error_reporting_configured=dropbox_reporting_configured(
                 self.cron_health.settings
             ),

@@ -55,17 +55,30 @@ escape_sed() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
 }
 
+escape_xml_text() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\\&apos;/g"
+}
+
+escape_plist_replacement() {
+  escape_sed "$(escape_xml_text "$1")"
+}
+
 RENDERED_PLIST="$(mktemp "${WATCHDOG_PLIST_PATH}.tmp.XXXXXX")"
 trap 'rm -f "$RENDERED_PLIST"' EXIT
 
 sed \
-  -e "s|__LABEL__|$(escape_sed "$WATCHDOG_LABEL")|g" \
-  -e "s|__PYTHON_BIN__|$(escape_sed "${PYTHON_BIN}")|g" \
-  -e "s|__WATCHDOG_SCRIPT__|$(escape_sed "${WATCHDOG_INSTALL_DIR}/uk_aq_scheduler_watchdog.py")|g" \
-  -e "s|__CONFIG_FILE__|$(escape_sed "${WATCHDOG_SUPPORT_DIR}/watchdog.env")|g" \
-  -e "s|__LOG_FILE__|$(escape_sed "${WATCHDOG_LOG_DIR}/watchdog.jsonl")|g" \
-  -e "s|__LAUNCHD_STDOUT__|$(escape_sed "${WATCHDOG_LOG_DIR}/launchd.stdout.log")|g" \
-  -e "s|__LAUNCHD_STDERR__|$(escape_sed "${WATCHDOG_LOG_DIR}/launchd.stderr.log")|g" \
+  -e "s|__LABEL__|$(escape_plist_replacement "$WATCHDOG_LABEL")|g" \
+  -e "s|__PYTHON_BIN__|$(escape_plist_replacement "${PYTHON_BIN}")|g" \
+  -e "s|__WATCHDOG_SCRIPT__|$(escape_plist_replacement "${WATCHDOG_INSTALL_DIR}/uk_aq_scheduler_watchdog.py")|g" \
+  -e "s|__CONFIG_FILE__|$(escape_plist_replacement "${WATCHDOG_SUPPORT_DIR}/watchdog.env")|g" \
+  -e "s|__LOG_FILE__|$(escape_plist_replacement "${WATCHDOG_LOG_DIR}/watchdog.jsonl")|g" \
+  -e "s|__LAUNCHD_STDOUT__|$(escape_plist_replacement "${WATCHDOG_LOG_DIR}/launchd.stdout.log")|g" \
+  -e "s|__LAUNCHD_STDERR__|$(escape_plist_replacement "${WATCHDOG_LOG_DIR}/launchd.stderr.log")|g" \
   "${SCRIPT_DIR}/uk.co.ukaq.scheduler-watchdog.plist.template" > "$RENDERED_PLIST"
 chmod 600 "$RENDERED_PLIST"
 plutil -lint "$RENDERED_PLIST"
