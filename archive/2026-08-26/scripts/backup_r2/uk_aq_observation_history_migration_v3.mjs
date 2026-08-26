@@ -186,400 +186,6 @@ function atomicWriteJson(filePath, value) {
   }
 }
 
-const RECOVERY_PROGRESS_SCHEMA_VERSION = 1;
-const RECOVERY_IMPLEMENTATION_PATHS = Object.freeze([
-  "scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs",
-  "scripts/backup_r2/lib/observation_history_migration_v3.mjs",
-  "scripts/index_v3_migration/run_step10_resume.sh",
-]);
-
-function recoveryProgressPaths(checkpointPath) {
-  const root = `${path.resolve(checkpointPath)}.recovery`;
-  return Object.freeze({
-    root,
-    manifest: path.join(root, "manifest.json"),
-    head: path.join(root, "head.json"),
-    entries: path.join(root, "entries"),
-  });
-}
-
-function recoveryEnvelope(kind, payload) {
-  return {
-    schema_version: RECOVERY_PROGRESS_SCHEMA_VERSION,
-    kind,
-    payload,
-    payload_sha256: sha256Hex(stableMigrationJson(payload)),
-  };
-}
-
-function readRecoveryEnvelope(filePath, expectedKind) {
-  const envelope = readJsonFile(filePath, expectedKind);
-  if (
-    envelope?.schema_version !== RECOVERY_PROGRESS_SCHEMA_VERSION ||
-    envelope?.kind !== expectedKind ||
-    !envelope.payload ||
-    envelope.payload_sha256 !== sha256Hex(stableMigrationJson(envelope.payload))
-  ) {
-    throw new Error(`Recovery evidence is invalid: ${filePath}`);
-  }
-  return envelope;
-}
-
-function recoveryImplementationIdentity(repositoryRoot) {
-  const root = path.resolve(repositoryRoot);
-  const repositoryHead = spawnSync("git", ["rev-parse", "HEAD"], {
-    cwd: root,
-    encoding: "utf8",
-  });
-  if (repositoryHead.status !== 0 || !String(repositoryHead.stdout || "").trim()) {
-    throw new Error("Current recovery repository HEAD is unavailable");
-  }
-  const files = RECOVERY_IMPLEMENTATION_PATHS.map((relativePath) => {
-    const absolutePath = path.join(root, relativePath);
-    if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
-      throw new Error(`Recovery implementation file is missing: ${relativePath}`);
-    }
-    const body = fs.readFileSync(absolutePath);
-    return {
-      path: relativePath,
-      byte_size: body.byteLength,
-      sha256: sha256Hex(body),
-    };
-  });
-  return Object.freeze({
-    repository_head: String(repositoryHead.stdout).trim(),
-    files: Object.freeze(files),
-  });
-}
-
-function checkpointFileIdentity(checkpointPath) {
-  const absolutePath = path.resolve(checkpointPath);
-  const body = fs.readFileSync(absolutePath);
-  return Object.freeze({
-    path: absolutePath,
-    byte_size: body.byteLength,
-    sha256: sha256Hex(body),
-  });
-}
-
-function recoveryManifestPayload({ checkpointPath, checkpoint, repositoryRoot }) {
-  const plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
-  return Object.freeze({
-    original_checkpoint: checkpointFileIdentity(checkpointPath),
-    immutable_authority_sha256: checkpoint.authority_sha256,
-    migration_run_id: plan.migration_run_id,
-    plan_sha256: plan.plan_sha256,
-    target_writer_git_sha: plan.target_writer_git_sha,
-    recovery_implementation: recoveryImplementationIdentity(repositoryRoot),
-  });
-}
-
-function applyRecoveryUpdates(checkpoint, updates) {
-  for (const entry of updates.prepared_records || []) {
-    if (!entry?.unit_id || !entry.record || entry.record.unit_id !== entry.unit_id) {
-      throw new Error("Recovery prepared-record update is invalid");
-    }
-    if (checkpoint.prepared_units[entry.unit_id]) {
-      throw new Error(`Recovery journal redefines prepared unit: ${entry.unit_id}`);
-    }
-    checkpoint.prepared_units[entry.unit_id] = entry.record;
-  }
-  for (const entry of updates.prepared_state_updates || []) {
-    const record = checkpoint.prepared_units[entry?.unit_id];
-    if (!record) throw new Error(`Recovery state references unknown unit: ${entry?.unit_id}`);
-    if (entry.files_published === true) record.files_published = true;
-    if (entry.remove_staging_refs === true) {
-      record.target_file_intents = record.target_file_intents.map(
-        ({ staging_ref: _stagingRef, ...intent }) => intent,
-      );
-    }
-  }
-  for (const entry of updates.completed_objects || []) {
-    if (!entry?.key || !entry.evidence) {
-      throw new Error("Recovery completed-object update is invalid");
-    }
-    checkpoint.completed_objects[entry.key] = entry.evidence;
-  }
-  for (const unitId of updates.preparation_order_append || []) {
-    if (!checkpoint.prepared_units[unitId] || checkpoint.preparation_order.includes(unitId)) {
-      throw new Error(`Recovery preparation-order update is invalid: ${unitId}`);
-    }
-    checkpoint.preparation_order.push(unitId);
-  }
-  if (updates.final_state) {
-    if (typeof updates.final_state.full_verification_complete === "boolean") {
-      checkpoint.full_verification_complete = updates.final_state.full_verification_complete;
-    }
-    if (typeof updates.final_state.cutover_ready === "boolean") {
-      checkpoint.cutover_ready = updates.final_state.cutover_ready;
-    }
-  }
-}
-
-function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false }) {
-  fs.mkdirSync(paths.entries, { recursive: true, mode: 0o700 });
-  const names = fs.readdirSync(paths.entries)
-    .filter((name) => /^\d{10}\.json$/.test(name))
-    .sort();
-  let sequence = 0;
-  let entrySha256 = null;
-  const publicationEvidence = [];
-  for (const name of names) {
-    const expectedName = `${String(sequence + 1).padStart(10, "0")}.json`;
-    if (name !== expectedName) throw new Error(`Recovery journal sequence gap before ${name}`);
-    const envelope = readRecoveryEnvelope(
-      path.join(paths.entries, name),
-      "uk_aq_observation_history_v3_recovery_entry",
-    );
-    const payload = envelope.payload;
-    if (
-      payload.sequence !== sequence + 1 ||
-      payload.previous_entry_sha256 !== entrySha256 ||
-      payload.original_checkpoint_sha256 !== manifest.payload.original_checkpoint.sha256 ||
-      payload.immutable_authority_sha256 !== manifest.payload.immutable_authority_sha256
-    ) {
-      throw new Error(`Recovery journal chain is invalid: ${name}`);
-    }
-    applyRecoveryUpdates(checkpoint, payload.updates || {});
-    publicationEvidence.push(...(payload.updates?.publication_evidence || []));
-    sequence = payload.sequence;
-    entrySha256 = envelope.payload_sha256;
-  }
-  const expectedHeadPayload = {
-    original_checkpoint_sha256: manifest.payload.original_checkpoint.sha256,
-    immutable_authority_sha256: manifest.payload.immutable_authority_sha256,
-    last_sequence: sequence,
-    last_entry_sha256: entrySha256,
-  };
-  if (fs.existsSync(paths.head)) {
-    const head = readRecoveryEnvelope(
-      paths.head,
-      "uk_aq_observation_history_v3_recovery_head",
-    );
-    if (stableMigrationJson(head.payload) !== stableMigrationJson(expectedHeadPayload)) {
-      if (!repairHead) throw new Error("Recovery journal head does not match the entry chain");
-      atomicWriteJson(paths.head, recoveryEnvelope(
-        "uk_aq_observation_history_v3_recovery_head",
-        expectedHeadPayload,
-      ));
-    }
-  } else if (sequence > 0 || repairHead) {
-    atomicWriteJson(paths.head, recoveryEnvelope(
-      "uk_aq_observation_history_v3_recovery_head",
-      expectedHeadPayload,
-    ));
-  }
-  return { sequence, entrySha256, publicationEvidence };
-}
-
-function preparedProgressState(checkpoint) {
-  return new Map(Object.entries(checkpoint.prepared_units || {}).map(([unitId, record]) => [
-    unitId,
-    {
-      prepared_plan_sha256: record.prepared_plan_sha256,
-      files_published: record.files_published === true,
-      staging_ref_count: (record.target_file_intents || []).filter(
-        (intent) => Boolean(intent.staging_ref),
-      ).length,
-    },
-  ]));
-}
-
-function appendRecoveryJournalEntry(context, updates) {
-  const sequence = context.sequence + 1;
-  const payload = {
-    sequence,
-    previous_entry_sha256: context.entrySha256,
-    original_checkpoint_sha256: context.manifest.payload.original_checkpoint.sha256,
-    immutable_authority_sha256: context.manifest.payload.immutable_authority_sha256,
-    updates,
-  };
-  const envelope = recoveryEnvelope(
-    "uk_aq_observation_history_v3_recovery_entry",
-    payload,
-  );
-  const target = path.join(context.paths.entries, `${String(sequence).padStart(10, "0")}.json`);
-  if (fs.existsSync(target)) throw new Error(`Recovery journal entry already exists: ${target}`);
-  atomicWriteJson(target, envelope);
-  const headPayload = {
-    original_checkpoint_sha256: context.manifest.payload.original_checkpoint.sha256,
-    immutable_authority_sha256: context.manifest.payload.immutable_authority_sha256,
-    last_sequence: sequence,
-    last_entry_sha256: envelope.payload_sha256,
-  };
-  atomicWriteJson(context.paths.head, recoveryEnvelope(
-    "uk_aq_observation_history_v3_recovery_head",
-    headPayload,
-  ));
-  context.sequence = sequence;
-  context.entrySha256 = envelope.payload_sha256;
-}
-
-export function buildObservationHistoryV3RecoveryProgressContext({
-  checkpointPath,
-  checkpoint,
-  repositoryRoot,
-  create = false,
-  repairHead = false,
-}) {
-  const paths = recoveryProgressPaths(checkpointPath);
-  const expectedManifestPayload = recoveryManifestPayload({
-    checkpointPath,
-    checkpoint,
-    repositoryRoot,
-  });
-  if (!fs.existsSync(paths.manifest)) {
-    if (!create) throw new Error("Recovery progress manifest is missing; run resume preflight first");
-    fs.mkdirSync(paths.root, { recursive: true, mode: 0o700 });
-    atomicWriteJson(paths.manifest, recoveryEnvelope(
-      "uk_aq_observation_history_v3_recovery_manifest",
-      expectedManifestPayload,
-    ));
-  }
-  const manifest = readRecoveryEnvelope(
-    paths.manifest,
-    "uk_aq_observation_history_v3_recovery_manifest",
-  );
-  if (stableMigrationJson(manifest.payload) !== stableMigrationJson(expectedManifestPayload)) {
-    throw new Error("Recovery manifest does not match the original checkpoint or current recovery code");
-  }
-  const recoveredCheckpoint = structuredClone(checkpoint);
-  const replay = replayRecoveryJournal({
-    paths,
-    checkpoint: recoveredCheckpoint,
-    manifest,
-    repairHead,
-  });
-  buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: recoveredCheckpoint });
-  const context = {
-    paths,
-    manifest,
-    checkpoint: recoveredCheckpoint,
-    sequence: replay.sequence,
-    entrySha256: replay.entrySha256,
-    publicationEvidence: replay.publicationEvidence,
-    preparedState: preparedProgressState(recoveredCheckpoint),
-    completedKeys: new Set(Object.keys(recoveredCheckpoint.completed_objects || {})),
-    preparationOrder: [...(recoveredCheckpoint.preparation_order || [])],
-    fullVerificationComplete: recoveredCheckpoint.full_verification_complete === true,
-    cutoverReady: recoveredCheckpoint.cutover_ready === true,
-  };
-  context.persistCheckpoint = async (current) => {
-    const updates = {};
-    const preparedRecords = [];
-    const preparedStateUpdates = [];
-    for (const [unitId, record] of Object.entries(current.prepared_units || {})) {
-      const previous = context.preparedState.get(unitId);
-      const next = preparedProgressState({ prepared_units: { [unitId]: record } }).get(unitId);
-      if (!previous) {
-        preparedRecords.push({ unit_id: unitId, record });
-      } else {
-        if (previous.prepared_plan_sha256 !== next.prepared_plan_sha256) {
-          throw new Error(`Prepared recovery identity changed: ${unitId}`);
-        }
-        const stateUpdate = { unit_id: unitId };
-        let changed = false;
-        if (!previous.files_published && next.files_published) {
-          stateUpdate.files_published = true;
-          changed = true;
-        } else if (previous.files_published !== next.files_published) {
-          throw new Error(`Prepared publication state regressed: ${unitId}`);
-        }
-        if (previous.staging_ref_count > 0 && next.staging_ref_count === 0) {
-          stateUpdate.remove_staging_refs = true;
-          changed = true;
-        } else if (previous.staging_ref_count !== next.staging_ref_count) {
-          throw new Error(`Prepared staging state changed unexpectedly: ${unitId}`);
-        }
-        if (changed) preparedStateUpdates.push(stateUpdate);
-      }
-    }
-    if (preparedRecords.length) updates.prepared_records = preparedRecords;
-    if (preparedStateUpdates.length) updates.prepared_state_updates = preparedStateUpdates;
-    const completedObjects = Object.entries(current.completed_objects || {})
-      .filter(([key]) => !context.completedKeys.has(key))
-      .map(([key, evidence]) => ({ key, evidence }));
-    if (completedObjects.length) updates.completed_objects = completedObjects;
-    const currentOrder = current.preparation_order || [];
-    if (
-      context.preparationOrder.some((unitId, index) => currentOrder[index] !== unitId) ||
-      currentOrder.length < context.preparationOrder.length
-    ) {
-      throw new Error("Recovery preparation order changed or regressed");
-    }
-    const orderAppend = currentOrder.slice(context.preparationOrder.length);
-    if (orderAppend.length) updates.preparation_order_append = orderAppend;
-    if (
-      context.fullVerificationComplete !== (current.full_verification_complete === true) ||
-      context.cutoverReady !== (current.cutover_ready === true)
-    ) {
-      updates.final_state = {
-        full_verification_complete: current.full_verification_complete === true,
-        cutover_ready: current.cutover_ready === true,
-      };
-    }
-    if (!Object.keys(updates).length) return;
-    appendRecoveryJournalEntry(context, updates);
-    context.preparedState = preparedProgressState(current);
-    context.completedKeys = new Set(Object.keys(current.completed_objects || {}));
-    context.preparationOrder = [...currentOrder];
-    context.fullVerificationComplete = current.full_verification_complete === true;
-    context.cutoverReady = current.cutover_ready === true;
-  };
-  context.recordPublicationEvidence = async (entry) => {
-    appendRecoveryJournalEntry(context, { publication_evidence: [{ ...entry }] });
-    context.publicationEvidence.push({ ...entry });
-    return { durable: true };
-  };
-  return context;
-}
-
-export function initializeObservationHistoryV3RecoveryProgress({
-  checkpointPath,
-  repositoryRoot,
-  retainedStagingRoot = `${path.resolve(checkpointPath)}.staging`,
-} = {}) {
-  const checkpoint = readJsonFile(checkpointPath, "migration checkpoint");
-  const context = buildObservationHistoryV3RecoveryProgressContext({
-    checkpointPath,
-    checkpoint,
-    repositoryRoot,
-    create: true,
-    repairHead: true,
-  });
-  const stagingRoot = path.resolve(retainedStagingRoot);
-  let retainedStagingFiles = 0;
-  for (const record of Object.values(context.checkpoint.prepared_units || {})) {
-    for (const intent of record.target_file_intents || []) {
-      if (!intent.staging_ref) continue;
-      const stagingRef = path.resolve(intent.staging_ref);
-      if (stagingRef !== stagingRoot && !stagingRef.startsWith(`${stagingRoot}${path.sep}`)) {
-        throw new Error(`Retained staging reference escapes the recovery root: ${intent.key}`);
-      }
-      if (record.files_published !== true) {
-        const body = fs.readFileSync(stagingRef);
-        if (body.byteLength !== intent.byte_size || sha256Hex(body) !== intent.sha256) {
-          throw new Error(`Retained staging identity is invalid: ${intent.key}`);
-        }
-      }
-      retainedStagingFiles += 1;
-    }
-  }
-  return Object.freeze({
-    recovery_root: context.paths.root,
-    original_checkpoint: context.manifest.payload.original_checkpoint,
-    immutable_authority_sha256: context.manifest.payload.immutable_authority_sha256,
-    migration_run_id: context.manifest.payload.migration_run_id,
-    plan_sha256: context.manifest.payload.plan_sha256,
-    target_writer_git_sha: context.manifest.payload.target_writer_git_sha,
-    recovery_implementation: context.manifest.payload.recovery_implementation,
-    journal_entries: context.sequence,
-    prepared_units: Object.keys(context.checkpoint.prepared_units || {}).length,
-    completed_objects: Object.keys(context.checkpoint.completed_objects || {}).length,
-    retained_staging_files: retainedStagingFiles,
-  });
-}
-
 function isRcloneRemote(value) {
   return /^[A-Za-z0-9_.-]+:/.test(String(value || ""));
 }
@@ -724,18 +330,10 @@ function summaryForPlan(plan) {
   };
 }
 
-function buildR2Adapters({
-  config,
-  checkpointOut,
-  env,
-  getBackupObject,
-  recoveryProgress = null,
-}) {
+function buildR2Adapters({ config, checkpointOut, env, getBackupObject }) {
   const r2 = config.r2;
-  const durableEvidence = recoveryProgress
-    ? [...recoveryProgress.publicationEvidence]
-    : [];
-  const evidencePath = checkpointOut && !recoveryProgress
+  const durableEvidence = [];
+  const evidencePath = checkpointOut
     ? `${path.resolve(checkpointOut)}.publication.json`
     : null;
   const stagingRoot = checkpointOut
@@ -767,10 +365,6 @@ function buildR2Adapters({
       writeR2: true,
     }),
     recordDurableEvidence: async (entry) => {
-      if (recoveryProgress) {
-        durableEvidence.push({ ...entry });
-        return recoveryProgress.recordPublicationEvidence(entry);
-      }
       if (!evidencePath) {
         throw new Error("Durable v3 publication evidence requires --checkpoint-out");
       }
@@ -781,9 +375,7 @@ function buildR2Adapters({
       });
       return { durable: true };
     },
-    writeCheckpoint: recoveryProgress
-      ? recoveryProgress.persistCheckpoint
-      : async (checkpoint) => atomicWriteJson(checkpointOut, checkpoint),
+    writeCheckpoint: async (checkpoint) => atomicWriteJson(checkpointOut, checkpoint),
     stageUnit: async ({ unitId, intents }) => {
       if (!stagingRoot) throw new Error("Migration staging requires --checkpoint-out");
       const unitDirectory = requireStagingPath(path.join(stagingRoot, unitId));
@@ -875,13 +467,6 @@ export async function runObservationHistoryMigrationV3({
 } = {}) {
   const args = parseObservationHistoryMigrationArgs(argv);
   if (args.help) return { help: true, text: usage() };
-  if (args.mode === "migrate" && args.checkpointIn) {
-    process.on("SIGHUP", () => {
-      process.stderr.write(
-        "Recovery migration ignored SIGHUP; SIGINT/SIGTERM remain available for controlled stop.\n",
-      );
-    });
-  }
   requireCommonArgs(args);
   const config = resolveR2HistoryIndexConfig(env);
   if (!hasRequiredR2Config(config.r2)) {
@@ -915,11 +500,7 @@ export async function runObservationHistoryMigrationV3({
           owner: lockOwner,
           runId: args.migrationRunId,
           command: process.execPath,
-          commandArgs: [
-            ...(args.checkpointIn ? process.execArgv : []),
-            fileURLToPath(import.meta.url),
-            ...argv,
-          ],
+          commandArgs: [fileURLToPath(import.meta.url), ...argv],
           env,
           diagnostics,
         });
@@ -935,35 +516,15 @@ export async function runObservationHistoryMigrationV3({
   const getR2Object = ({ key }) => r2GetObject({ r2: config.r2, key });
   const startedAt = now();
   const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
-  const repositoryRoot = path.resolve(scriptDirectory, "../..");
-  let checkpoint = args.checkpointIn
+  const checkpoint = args.checkpointIn
     ? readJsonFile(args.checkpointIn, "migration checkpoint")
     : null;
-  let recoveryProgress = null;
-  if (checkpoint && args.mode === "migrate") {
-    recoveryProgress = buildObservationHistoryV3RecoveryProgressContext({
-      checkpointPath: args.checkpointIn,
-      checkpoint,
-      repositoryRoot,
-    });
-    checkpoint = recoveryProgress.checkpoint;
-  } else if (
-    checkpoint &&
-    fs.existsSync(recoveryProgressPaths(args.checkpointIn).manifest)
-  ) {
-    recoveryProgress = buildObservationHistoryV3RecoveryProgressContext({
-      checkpointPath: args.checkpointIn,
-      checkpoint,
-      repositoryRoot,
-    });
-    checkpoint = recoveryProgress.checkpoint;
-  }
   const plan = checkpoint
     ? buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint })
     : await buildObservationHistoryV3MigrationPlan({
         getR2Object,
         getBackupObject,
-        repositoryRoot,
+        repositoryRoot: path.resolve(scriptDirectory, "../.."),
         environmentEvidence: evidence,
         migrationRunId: args.migrationRunId,
         writerLimits,
@@ -992,7 +553,6 @@ export async function runObservationHistoryMigrationV3({
     checkpointOut: args.checkpointOut || args.checkpointIn,
     env,
     getBackupObject,
-    recoveryProgress,
   });
   let result;
   let rollback = null;

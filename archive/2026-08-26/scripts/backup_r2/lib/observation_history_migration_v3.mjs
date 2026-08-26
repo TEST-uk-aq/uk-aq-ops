@@ -2553,7 +2553,7 @@ async function persistCompletedObject({ checkpoint, evidence, writeCheckpoint })
     durable: true,
     stored_sha256_verified: evidence.stored_sha256_verified === true,
   };
-  await writeCheckpoint(checkpoint);
+  await writeCheckpoint(structuredClone(checkpoint));
 }
 
 export async function executeObservationHistoryV3MigrationPlan({
@@ -2616,7 +2616,7 @@ export async function executeObservationHistoryV3MigrationPlan({
   if (rawCheckpoint) {
     buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
   } else {
-    await adapters.writeCheckpoint(checkpoint);
+    await adapters.writeCheckpoint(structuredClone(checkpoint));
     await reverifyPinnedEmptySourceConnectorsBeforeMutation({
       plan,
       getR2Object: adapters.getObject,
@@ -2683,7 +2683,7 @@ export async function executeObservationHistoryV3MigrationPlan({
       record.prepared_plan_sha256 = preparedUnitPlanIdentity(record);
       checkpoint.prepared_units[authorityUnit.unit_id] = record;
       checkpoint.preparation_order.push(authorityUnit.unit_id);
-      await adapters.writeCheckpoint(checkpoint);
+      await adapters.writeCheckpoint(structuredClone(checkpoint));
     }
     const preparedUnit = preparedUnitFromRecord(authorityUnit, record);
     for (const intent of preparedUnit.target_file_intents) {
@@ -2732,7 +2732,7 @@ export async function executeObservationHistoryV3MigrationPlan({
       });
     }
     record.files_published = true;
-    await adapters.writeCheckpoint(checkpoint);
+    await adapters.writeCheckpoint(structuredClone(checkpoint));
     await adapters.releaseStagedUnit({
       unitId: authorityUnit.unit_id,
       intents: record.target_file_intents,
@@ -2740,7 +2740,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     record.target_file_intents = record.target_file_intents.map(
       ({ staging_ref: _stagingRef, ...entry }) => entry,
     );
-    await adapters.writeCheckpoint(checkpoint);
+    await adapters.writeCheckpoint(structuredClone(checkpoint));
   }
   const completedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
     checkpoint,
@@ -2792,7 +2792,7 @@ export async function executeObservationHistoryV3MigrationPlan({
   });
   checkpoint.full_verification_complete = verification.ok;
   checkpoint.cutover_ready = verification.cutover_ready;
-  await adapters.writeCheckpoint(checkpoint);
+  await adapters.writeCheckpoint(structuredClone(checkpoint));
   return Object.freeze({
     ok: verification.ok,
     status: verification.cutover_ready ? "cutover_ready" : "blocked",
