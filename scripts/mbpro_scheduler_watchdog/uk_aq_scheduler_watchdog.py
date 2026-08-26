@@ -164,6 +164,19 @@ def minute_slot_text(timestamp: float) -> str:
     return datetime.fromtimestamp(minute, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def next_watchdog_dispatch(
+    now: float,
+    offset_seconds: int,
+    last_dispatched_minute_epoch: int | None,
+) -> tuple[int, float]:
+    minute_epoch = int(now // 60) * 60
+    if minute_epoch + offset_seconds <= now:
+        minute_epoch += 60
+    if last_dispatched_minute_epoch is not None:
+        minute_epoch = max(minute_epoch, last_dispatched_minute_epoch + 60)
+    return minute_epoch, minute_epoch + offset_seconds
+
+
 def bounded_preview(value: bytes | str | None) -> str | None:
     if value is None:
         return None
@@ -876,6 +889,7 @@ class SchedulerWatchdog:
             self.cron_outage_threshold_minutes,
         )
         self.stop_event = threading.Event()
+        self.last_dispatched_minute_epoch: int | None = None
         self.in_flight: dict[str, set[concurrent.futures.Future[None]]] = {
             worker_name: set() for worker_name in self.workers
         }
@@ -926,12 +940,15 @@ class SchedulerWatchdog:
         )
         while not self.stop_event.is_set():
             now = time.time()
-            next_trigger = int(now // 60) * 60 + self.offset_seconds
-            if next_trigger <= now:
-                next_trigger += 60
+            minute_epoch, next_trigger = next_watchdog_dispatch(
+                now,
+                self.offset_seconds,
+                self.last_dispatched_minute_epoch,
+            )
             if self.stop_event.wait(max(0, next_trigger - now)):
                 break
-            self.request_minute(minute_slot_text(next_trigger - self.offset_seconds))
+            self.last_dispatched_minute_epoch = minute_epoch
+            self.request_minute(minute_slot_text(minute_epoch))
         self.shutdown(wait=False)
         log_event(
             self.logger,
