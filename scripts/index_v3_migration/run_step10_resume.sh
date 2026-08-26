@@ -84,6 +84,12 @@ if ! git cat-file -e "${TARGET_WRITER_GIT_SHA}^{commit}" 2>/dev/null ||
    ! git merge-base --is-ancestor "$TARGET_WRITER_GIT_SHA" "$CURRENT_REPOSITORY_HEAD"; then
   stop "pinned target-writer commit is unavailable or not an ancestor of current HEAD."
 fi
+if ! git ls-files --error-unmatch -- "$WRAPPER_REPO_PATH" >/dev/null 2>&1; then
+  stop "the Step 10 recovery wrapper is not tracked at its canonical path."
+fi
+if ! git diff --quiet -- "$WRAPPER_REPO_PATH"; then
+  stop "the Step 10 recovery wrapper has unreviewed local changes."
+fi
 
 # These files own deterministic target bytes, keys, manifests, schema, hashes,
 # and v3 index semantics. They must remain exactly as they were at the pinned
@@ -285,21 +291,48 @@ if [ -n "$WRITER_PROCESSES" ]; then
 fi
 
 echo
-echo "Checking TEST Prune Daily scheduler disablement (read-only)..."
-PRUNE_SCHEDULER_JSON="$(
+echo "Checking TEST migration-sensitive scheduler disablement (read-only)..."
+FROZEN_SCHEDULES_JSON="$(
   cd -- "$REPO_ROOT/cloudflare/scheduler"
   npx --yes wrangler@4 d1 execute uk_aq_cron_scheduler_ops_db \
     --remote --config wrangler.toml --json \
-    --command "SELECT job_key,enabled,cron_expr,github_workflow_file FROM scheduler_jobs WHERE job_key='uk_aq_prune_daily'"
+    --command "SELECT job_key,enabled FROM scheduler_jobs WHERE job_key IN ('uk_aq_prune_daily','uk_aq_r2_history_dropbox_backup','uk_aq_r2_history_dropbox_backup_force_prune_recheck') ORDER BY job_key"
 )"
-PRUNE_SCHEDULER_JSON="$PRUNE_SCHEDULER_JSON" node --input-type=module <<'NODE'
-const payload = JSON.parse(process.env.PRUNE_SCHEDULER_JSON);
-const rows = payload?.[0]?.results;
-if (payload?.length !== 1 || payload[0]?.success !== true || rows?.length !== 1 ||
-  rows[0]?.job_key !== "uk_aq_prune_daily" || rows[0]?.enabled !== 0) {
-  throw new Error("TEST Prune Daily scheduler row is not exactly enabled=0");
+FROZEN_SCHEDULES_JSON="$FROZEN_SCHEDULES_JSON" node --input-type=module <<'NODE'
+const expectedJobKeys = [
+  "uk_aq_prune_daily",
+  "uk_aq_r2_history_dropbox_backup",
+  "uk_aq_r2_history_dropbox_backup_force_prune_recheck",
+];
+const expectedJobKeySet = new Set(expectedJobKeys);
+const payload = JSON.parse(process.env.FROZEN_SCHEDULES_JSON);
+if (!Array.isArray(payload) || payload.length !== 1 || payload[0]?.success !== true ||
+  !Array.isArray(payload[0]?.results)) {
+  throw new Error("TEST scheduler disablement query did not succeed exactly once");
 }
-console.log("TEST Prune Daily scheduler row is exactly enabled=0.");
+const rows = payload[0].results;
+if (rows.length !== expectedJobKeys.length) {
+  throw new Error("TEST scheduler disablement query did not return exactly three rows");
+}
+const seen = new Set();
+for (const row of rows) {
+  if (!expectedJobKeySet.has(row?.job_key)) {
+    throw new Error(`TEST scheduler returned an unexpected job row: ${row?.job_key}`);
+  }
+  if (seen.has(row.job_key)) {
+    throw new Error(`TEST scheduler returned a duplicate job row: ${row.job_key}`);
+  }
+  if (row.enabled !== 0) {
+    throw new Error(`TEST scheduler job is not exactly enabled=0: ${row.job_key}`);
+  }
+  seen.add(row.job_key);
+}
+for (const jobKey of expectedJobKeys) {
+  if (!seen.has(jobKey)) {
+    throw new Error(`TEST scheduler row is missing: ${jobKey}`);
+  }
+}
+console.log("TEST Prune Daily and both history Dropbox backup schedules are exactly enabled=0.");
 NODE
 
 ACTIVE_PRUNE_JSON="$(
