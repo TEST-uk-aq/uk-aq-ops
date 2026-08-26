@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run authenticated UK AQ scheduler watchdog calls on each UTC minute."""
+"""Run authenticated UK AQ TEST scheduler watchdog calls on each UTC minute."""
 
 from __future__ import annotations
 
@@ -17,24 +17,17 @@ from typing import Any
 from urllib import error, request
 
 
-DEFAULT_OFFSET_SECONDS = 30
+DEFAULT_OFFSET_SECONDS = 10
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 900
 DEFAULT_MAX_IN_FLIGHT_PER_WORKER = 4
 RESPONSE_PREVIEW_LIMIT = 1_000
 LOG_MAX_BYTES = 1_000_000
 LOG_BACKUP_COUNT = 7
 REQUIRED_SETTINGS = (
-    "UKAQ_ENV_NAME",
     "UK_AQ_SCHEDULER_TRIGGER_SECRET",
     "UK_AQ_INGEST_SCHEDULER_URL",
     "UK_AQ_OPS_SCHEDULER_URL",
 )
-OPTIONAL_SETTINGS = (
-    "UK_AQ_SCHEDULER_WATCHDOG_OFFSET_SECONDS",
-    "UK_AQ_SCHEDULER_WATCHDOG_REQUEST_TIMEOUT_SECONDS",
-    "UK_AQ_SCHEDULER_WATCHDOG_MAX_IN_FLIGHT_PER_WORKER",
-)
-ALLOWED_SETTINGS = frozenset((*REQUIRED_SETTINGS, *OPTIONAL_SETTINGS))
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -46,21 +39,11 @@ def load_env_file(path: Path) -> dict[str, str]:
         key, separator, value = stripped.partition("=")
         if not separator or not key.strip():
             raise ValueError(f"Invalid configuration line in {path.name}")
-        normalized_key = key.strip()
-        if normalized_key in settings:
-            raise ValueError(f"Duplicate configuration key: {normalized_key}")
-        settings[normalized_key] = value.strip()
+        settings[key.strip()] = value.strip()
     missing = [key for key in REQUIRED_SETTINGS if not settings.get(key)]
     if missing:
         raise ValueError(f"Missing required configuration keys: {', '.join(missing)}")
     return settings
-
-
-def canonical_environment(settings: dict[str, str]) -> str:
-    environment = settings["UKAQ_ENV_NAME"].strip().upper()
-    if environment not in {"TEST", "LIVE"}:
-        raise ValueError("UKAQ_ENV_NAME must be TEST or LIVE")
-    return environment
 
 
 def positive_int(settings: dict[str, str], key: str, default: int) -> int:
@@ -79,36 +62,6 @@ def normalize_worker_url(value: str) -> str:
     if not url.startswith("https://"):
         raise ValueError("Scheduler Worker URLs must use https")
     return url if url.endswith("/run-if-due") else f"{url}/run-if-due"
-
-
-def validate_watchdog_settings(settings: dict[str, str]) -> str:
-    unexpected_settings = sorted(set(settings) - ALLOWED_SETTINGS)
-    if unexpected_settings:
-        raise ValueError(
-            "Unsupported configuration keys: " + ", ".join(unexpected_settings)
-        )
-
-    environment = canonical_environment(settings)
-    offset_seconds = positive_int(
-        settings,
-        "UK_AQ_SCHEDULER_WATCHDOG_OFFSET_SECONDS",
-        DEFAULT_OFFSET_SECONDS,
-    )
-    if offset_seconds >= 60:
-        raise ValueError("UK_AQ_SCHEDULER_WATCHDOG_OFFSET_SECONDS must be less than 60")
-    positive_int(
-        settings,
-        "UK_AQ_SCHEDULER_WATCHDOG_REQUEST_TIMEOUT_SECONDS",
-        DEFAULT_REQUEST_TIMEOUT_SECONDS,
-    )
-    positive_int(
-        settings,
-        "UK_AQ_SCHEDULER_WATCHDOG_MAX_IN_FLIGHT_PER_WORKER",
-        DEFAULT_MAX_IN_FLIGHT_PER_WORKER,
-    )
-    normalize_worker_url(settings["UK_AQ_INGEST_SCHEDULER_URL"])
-    normalize_worker_url(settings["UK_AQ_OPS_SCHEDULER_URL"])
-    return environment
 
 
 def minute_slot_text(timestamp: float) -> str:
@@ -149,7 +102,6 @@ def log_event(logger: logging.Logger, event: str, **fields: Any) -> None:
 
 def invoke_worker(
     logger: logging.Logger,
-    environment: str,
     worker_name: str,
     url: str,
     trigger_secret: str,
@@ -157,13 +109,7 @@ def invoke_worker(
     minute_slot: str,
 ) -> None:
     started = time.monotonic()
-    log_event(
-        logger,
-        "scheduler_watchdog_request_started",
-        environment=environment,
-        worker=worker_name,
-        minute_slot=minute_slot,
-    )
+    log_event(logger, "scheduler_watchdog_request_started", worker=worker_name, minute_slot=minute_slot)
     http_status: int | None = None
     response_preview: str | None = None
     outcome = "request_failure"
@@ -198,7 +144,6 @@ def invoke_worker(
     log_event(
         logger,
         "scheduler_watchdog_request_finished",
-        environment=environment,
         worker=worker_name,
         minute_slot=minute_slot,
         http_status=http_status,
@@ -211,7 +156,6 @@ def invoke_worker(
 class SchedulerWatchdog:
     def __init__(self, settings: dict[str, str], logger: logging.Logger) -> None:
         self.logger = logger
-        self.environment = canonical_environment(settings)
         self.trigger_secret = settings["UK_AQ_SCHEDULER_TRIGGER_SECRET"]
         self.offset_seconds = positive_int(
             settings,
@@ -251,7 +195,6 @@ class SchedulerWatchdog:
                 log_event(
                     self.logger,
                     "scheduler_watchdog_in_flight_cap_reached",
-                    environment=self.environment,
                     worker=worker_name,
                     minute_slot=minute_slot,
                     max_in_flight=self.max_in_flight,
@@ -260,7 +203,6 @@ class SchedulerWatchdog:
             future = self.executor.submit(
                 invoke_worker,
                 self.logger,
-                self.environment,
                 worker_name,
                 url,
                 self.trigger_secret,
@@ -273,7 +215,6 @@ class SchedulerWatchdog:
         log_event(
             self.logger,
             "scheduler_watchdog_started",
-            environment=self.environment,
             offset_seconds=self.offset_seconds,
             request_timeout_seconds=self.timeout_seconds,
             max_in_flight_per_worker=self.max_in_flight,
@@ -287,11 +228,7 @@ class SchedulerWatchdog:
                 break
             self.request_minute(minute_slot_text(next_trigger - self.offset_seconds))
         self.executor.shutdown(wait=False, cancel_futures=False)
-        log_event(
-            self.logger,
-            "scheduler_watchdog_stopped",
-            environment=self.environment,
-        )
+        log_event(self.logger, "scheduler_watchdog_stopped")
 
     def stop(self, *_: object) -> None:
         self.stop_event.set()
@@ -300,20 +237,11 @@ class SchedulerWatchdog:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--log-file", type=Path)
+    parser.add_argument("--log-file", required=True, type=Path)
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("--validate-config", action="store_true")
     args = parser.parse_args()
 
     settings = load_env_file(args.config)
-    environment = validate_watchdog_settings(settings)
-    if args.validate_config:
-        if args.once or args.log_file is not None:
-            parser.error("--validate-config cannot be combined with --once or --log-file")
-        print(environment)
-        return 0
-    if args.log_file is None:
-        parser.error("--log-file is required unless --validate-config is used")
     logger = configure_logger(args.log_file)
     watchdog = SchedulerWatchdog(settings, logger)
     signal.signal(signal.SIGTERM, watchdog.stop)

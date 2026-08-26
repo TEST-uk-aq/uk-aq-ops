@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>uk.co.ukaq.test-scheduler-watchdog</string>
+  <string>__LABEL__</string>
   <key>ProgramArguments</key>
   <array>
     <string>__PYTHON_BIN__</string>

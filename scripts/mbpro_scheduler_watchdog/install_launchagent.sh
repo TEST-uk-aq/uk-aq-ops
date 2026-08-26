@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LABEL="uk.co.ukaq.test-scheduler-watchdog"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SUPPORT_DIR="${HOME}/Library/Application Support/UK AQ/scheduler-watchdog"
-INSTALL_DIR="${SUPPORT_DIR}/bin"
-LOG_DIR="${HOME}/Library/Logs/UK AQ/scheduler-watchdog"
-PLIST_PATH="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+. "${SCRIPT_DIR}/watchdog_launchagent_common.sh"
+
 CONFIG_SOURCE=""
 
 usage() {
@@ -15,7 +12,11 @@ usage() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --config) CONFIG_SOURCE="${2:-}"; shift 2 ;;
+    --config)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      CONFIG_SOURCE="$2"
+      shift 2
+      ;;
     *) usage; exit 2 ;;
   esac
 done
@@ -25,38 +26,60 @@ if [ -z "${CONFIG_SOURCE}" ] || [ ! -f "${CONFIG_SOURCE}" ]; then
   exit 2
 fi
 
+watchdog_load_identity "$CONFIG_SOURCE"
+
 PYTHON_BIN="$(command -v python3)"
 if [ -z "${PYTHON_BIN}" ]; then
   echo "python3 is required." >&2
   exit 1
 fi
 
-mkdir -p "${INSTALL_DIR}" "${LOG_DIR}" "${HOME}/Library/LaunchAgents"
-chmod 700 "${SUPPORT_DIR}" "${INSTALL_DIR}" "${LOG_DIR}"
-install -m 700 "${SCRIPT_DIR}/uk_aq_scheduler_watchdog.py" "${INSTALL_DIR}/uk_aq_scheduler_watchdog.py"
-install -m 600 "${CONFIG_SOURCE}" "${SUPPORT_DIR}/watchdog.env"
+PYTHON_ENVIRONMENT="$(
+  "$PYTHON_BIN" "${SCRIPT_DIR}/uk_aq_scheduler_watchdog.py" \
+    --config "$CONFIG_SOURCE" \
+    --validate-config
+)"
+if [ "$PYTHON_ENVIRONMENT" != "$WATCHDOG_ENVIRONMENT" ]; then
+  echo "Shell/Python watchdog environment validation disagrees." >&2
+  exit 1
+fi
+
+mkdir -p "$WATCHDOG_INSTALL_DIR" "$WATCHDOG_LOG_DIR" "${HOME}/Library/LaunchAgents"
+chmod 700 "$WATCHDOG_SUPPORT_DIR" "$WATCHDOG_INSTALL_DIR" "$WATCHDOG_LOG_DIR"
+install -m 700 \
+  "${SCRIPT_DIR}/uk_aq_scheduler_watchdog.py" \
+  "${WATCHDOG_INSTALL_DIR}/uk_aq_scheduler_watchdog.py"
+install -m 600 "$CONFIG_SOURCE" "${WATCHDOG_SUPPORT_DIR}/watchdog.env"
 
 escape_sed() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
 }
 
+RENDERED_PLIST="$(mktemp "${WATCHDOG_PLIST_PATH}.tmp.XXXXXX")"
+trap 'rm -f "$RENDERED_PLIST"' EXIT
+
 sed \
+  -e "s|__LABEL__|$(escape_sed "$WATCHDOG_LABEL")|g" \
   -e "s|__PYTHON_BIN__|$(escape_sed "${PYTHON_BIN}")|g" \
-  -e "s|__WATCHDOG_SCRIPT__|$(escape_sed "${INSTALL_DIR}/uk_aq_scheduler_watchdog.py")|g" \
-  -e "s|__CONFIG_FILE__|$(escape_sed "${SUPPORT_DIR}/watchdog.env")|g" \
-  -e "s|__LOG_FILE__|$(escape_sed "${LOG_DIR}/watchdog.jsonl")|g" \
-  -e "s|__LAUNCHD_STDOUT__|$(escape_sed "${LOG_DIR}/launchd.stdout.log")|g" \
-  -e "s|__LAUNCHD_STDERR__|$(escape_sed "${LOG_DIR}/launchd.stderr.log")|g" \
-  "${SCRIPT_DIR}/${LABEL}.plist.template" > "${PLIST_PATH}"
-chmod 600 "${PLIST_PATH}"
-plutil -lint "${PLIST_PATH}"
+  -e "s|__WATCHDOG_SCRIPT__|$(escape_sed "${WATCHDOG_INSTALL_DIR}/uk_aq_scheduler_watchdog.py")|g" \
+  -e "s|__CONFIG_FILE__|$(escape_sed "${WATCHDOG_SUPPORT_DIR}/watchdog.env")|g" \
+  -e "s|__LOG_FILE__|$(escape_sed "${WATCHDOG_LOG_DIR}/watchdog.jsonl")|g" \
+  -e "s|__LAUNCHD_STDOUT__|$(escape_sed "${WATCHDOG_LOG_DIR}/launchd.stdout.log")|g" \
+  -e "s|__LAUNCHD_STDERR__|$(escape_sed "${WATCHDOG_LOG_DIR}/launchd.stderr.log")|g" \
+  "${SCRIPT_DIR}/uk.co.ukaq.scheduler-watchdog.plist.template" > "$RENDERED_PLIST"
+chmod 600 "$RENDERED_PLIST"
+plutil -lint "$RENDERED_PLIST"
 
 USER_ID="$(id -u)"
-launchctl bootout "gui/${USER_ID}" "${PLIST_PATH}" 2>/dev/null || true
-launchctl bootstrap "gui/${USER_ID}" "${PLIST_PATH}"
-launchctl kickstart -k "gui/${USER_ID}/${LABEL}"
+launchctl bootout "gui/${USER_ID}/${WATCHDOG_LABEL}" 2>/dev/null || true
+install -m 600 "$RENDERED_PLIST" "$WATCHDOG_PLIST_PATH"
+launchctl bootstrap "gui/${USER_ID}" "$WATCHDOG_PLIST_PATH"
+launchctl kickstart -k "gui/${USER_ID}/${WATCHDOG_LABEL}"
 
-echo "Installed ${LABEL}."
-echo "Status: launchctl print gui/${USER_ID}/${LABEL}"
-echo "Watchdog log: tail -f '${LOG_DIR}/watchdog.jsonl'"
-echo "LaunchAgent errors: tail -f '${LOG_DIR}/launchd.stderr.log'"
+rm -f "$RENDERED_PLIST"
+trap - EXIT
+
+echo "Installed ${WATCHDOG_LABEL} for ${WATCHDOG_ENVIRONMENT}."
+echo "Status: launchctl print gui/${USER_ID}/${WATCHDOG_LABEL}"
+echo "Watchdog log: tail -f '${WATCHDOG_LOG_DIR}/watchdog.jsonl'"
+echo "LaunchAgent errors: tail -f '${WATCHDOG_LOG_DIR}/launchd.stderr.log'"
