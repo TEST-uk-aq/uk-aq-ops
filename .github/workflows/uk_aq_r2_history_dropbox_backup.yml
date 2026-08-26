@@ -247,6 +247,15 @@ jobs:
             tmp/r2_history_dropbox_backup_report.json
           if-no-files-found: ignore
 
+      - name: Build daily task health supplemental summary
+        if: always()
+        continue-on-error: true
+        run: |
+          node scripts/backup_r2/build_history_backup_task_summary.mjs \
+            --inventory-report "tmp/r2_backup_inventory_report.json" \
+            --backup-report "tmp/r2_history_dropbox_backup_report.json" \
+            --output "tmp/r2_history_dropbox_backup_task_summary.json"
+
       - name: Report daily task health
         if: always()
         env:
@@ -255,5 +264,6 @@ jobs:
           DAILY_TASK_KEY: ops.r2_history_dropbox_backup
           DAILY_TASK_HEALTH_REPORT_STAGE: final
           DAILY_TASK_HEALTH_RUN_ID: ${{ steps.daily_task_health_started.outputs.health_run_id }}
+          DAILY_TASK_HEALTH_SUPPLEMENTAL_SUMMARY_FILE: tmp/r2_history_dropbox_backup_task_summary.json
           JOB_STATUS: ${{ job.status }}
         run: node scripts/report_daily_task_health.mjs

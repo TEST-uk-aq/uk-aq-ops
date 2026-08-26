@@ -1,9 +1,27 @@
+import { readFileSync } from "node:fs";
+
 import {
   deprecatedR2HistoryVersionVarsPresent,
   parseR2HistoryVersion,
 } from "../workers/shared/uk_aq_r2_history_version.mjs";
 
 const RPC_SCHEMA = "uk_aq_public";
+const RESERVED_SUMMARY_FIELDS = new Set([
+  "github_repository",
+  "github_workflow",
+  "github_run_id",
+  "github_run_number",
+  "github_run_attempt",
+  "github_sha",
+  "github_ref_name",
+  "github_event_name",
+  "github_actor",
+  "job_status",
+  "trigger",
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
 
 function parseBoolean(raw, fallback = false) {
   if (raw === undefined || raw === null || raw === "") {
@@ -136,6 +154,49 @@ function buildBackupVersionDetails() {
   return details;
 }
 
+function readSupplementalSummary() {
+  const filename = optionalEnv("DAILY_TASK_HEALTH_SUPPLEMENTAL_SUMMARY_FILE");
+  if (!filename) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(filename, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("top-level JSON value must be an object");
+    }
+    return parsed;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `Daily task health supplemental summary ignored (${filename}): ${message}`,
+    );
+    return null;
+  }
+}
+
+function mergeSupplementalSummary(summary) {
+  const supplemental = readSupplementalSummary();
+  if (!supplemental) {
+    return summary;
+  }
+
+  const collisions = Object.keys(supplemental).filter(
+    (key) => RESERVED_SUMMARY_FIELDS.has(key)
+      || Object.prototype.hasOwnProperty.call(summary, key),
+  );
+  if (collisions.length > 0) {
+    console.warn(
+      "Daily task health supplemental summary ignored because it contains "
+      + `reserved or existing fields: ${collisions.sort().join(", ")}`,
+    );
+    return summary;
+  }
+
+  Object.assign(summary, supplemental);
+  return summary;
+}
+
 function buildSummary(jobStatus) {
   const summary = {
     github_repository: optionalEnv("GITHUB_REPOSITORY") || null,
@@ -156,7 +217,7 @@ function buildSummary(jobStatus) {
     Object.assign(summary, backupDetails);
   }
 
-  return summary;
+  return mergeSupplementalSummary(summary);
 }
 
 function stripUndefined(input) {
