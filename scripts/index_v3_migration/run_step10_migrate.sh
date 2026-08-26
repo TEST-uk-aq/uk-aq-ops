@@ -7,8 +7,9 @@ EXPECTED_ORIGIN_HTTPS="https://github.com/TEST-uk-aq/uk-aq-ops.git"
 EXPECTED_ORIGIN_SSH="git@github.com:TEST-uk-aq/uk-aq-ops.git"
 TEST_SITE_URL="https://test-uk-aq.ukaq.co.uk"
 EXPECTED_TEST_SUPABASE_PROJECT_REF="zztjgmdiftqtdcrlfpvc"
+WRAPPER_REPO_PATH="scripts/index_v3_migration/run_step10_migrate.sh"
 
-EXPECTED_HEAD="b8858d95c42ff52558cb0fa59413162d6bc12afa"
+MIGRATION_CODE_BASE_SHA="b8858d95c42ff52558cb0fa59413162d6bc12afa"
 EXPECTED_PLAN_SHA256="a095d4e2ce3babfacf270b6eebbfb47a9f7baaf9e9fb54034cea774c481f8486"
 
 EXPECTED_SOURCE_ROOT_SHA256="46cc0b9722714e6bef223fa4700806a3c3870b603db0e075fd5e4e0e7c6210a1"
@@ -50,6 +51,13 @@ fi
 
 cd -- "$REPO_ROOT"
 
+SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
+if [ "$SCRIPT_PATH" != "$REPO_ROOT/$WRAPPER_REPO_PATH" ] ||
+   ! git ls-files --error-unmatch "$WRAPPER_REPO_PATH" >/dev/null 2>&1; then
+  echo "STOP: execute the tracked Step 10 wrapper from its canonical TEST Ops path."
+  exit 1
+fi
+
 echo
 echo "============================================================"
 echo "UK AQ Phase 6 - Step 10"
@@ -75,15 +83,10 @@ if [ "$ORIGIN_URL" != "$EXPECTED_ORIGIN_HTTPS" ] &&
   exit 1
 fi
 
-ACTUAL_HEAD="$(git rev-parse HEAD)"
+CURRENT_REPOSITORY_HEAD="$(git rev-parse HEAD)"
 
-echo "Expected HEAD: $EXPECTED_HEAD"
-echo "Actual HEAD:   $ACTUAL_HEAD"
-
-if [ "$ACTUAL_HEAD" != "$EXPECTED_HEAD" ]; then
-  echo "STOP: TEST Ops HEAD has changed."
-  exit 1
-fi
+echo "Migration code base SHA: $MIGRATION_CODE_BASE_SHA"
+echo "Current repository HEAD: $CURRENT_REPOSITORY_HEAD"
 
 BRANCH="$(git branch --show-current)"
 echo "Branch:        $BRANCH"
@@ -93,30 +96,73 @@ if [ "$BRANCH" != "main" ]; then
   exit 1
 fi
 
-CRITICAL_PATHS=(
+MIGRATION_CRITICAL_PATHS=(
   package.json
   package-lock.json
   scripts/backup_r2
   scripts/operations
   workers/shared
+  cloudflare/scheduler/jobs.toml
   cloudflare/scheduler/wrangler.toml
+  .github/workflows/uk_aq_prune_daily.yml
+  workers/uk_aq_prune_daily
+  scripts/uk-aq-history-integrity
+  scripts/uk_aq_backfill_local.sh
+  workers/uk_aq_backfill_local
 )
 
-if ! git diff --quiet -- "${CRITICAL_PATHS[@]}" ||
-   ! git diff --cached --quiet -- "${CRITICAL_PATHS[@]}"; then
-  echo "STOP: migration, lock, writer, dependency, or scheduler code differs from pinned HEAD."
-  git status --short -- "${CRITICAL_PATHS[@]}"
+if ! git cat-file -e "${MIGRATION_CODE_BASE_SHA}^{commit}" 2>/dev/null; then
+  echo "STOP: pinned migration-code base commit is unavailable."
   exit 1
 fi
 
-UNTRACKED_CRITICAL="$(git ls-files --others --exclude-standard -- "${CRITICAL_PATHS[@]}")"
-if [ -n "$UNTRACKED_CRITICAL" ]; then
-  echo "STOP: untracked files exist in migration-critical code paths."
-  echo "$UNTRACKED_CRITICAL"
+if ! git merge-base --is-ancestor \
+  "$MIGRATION_CODE_BASE_SHA" \
+  "$CURRENT_REPOSITORY_HEAD"
+then
+  echo "STOP: pinned migration-code base is not an ancestor of current HEAD."
   exit 1
 fi
 
-echo "Migration-critical code identity is clean and pinned."
+COMMITTED_CRITICAL_DRIFT="$(
+  git log \
+    -m \
+    --format= \
+    --name-only \
+    --no-renames \
+    "$MIGRATION_CODE_BASE_SHA..$CURRENT_REPOSITORY_HEAD" \
+    -- "${MIGRATION_CRITICAL_PATHS[@]}" |
+    sed '/^$/d' |
+    sort -u
+)"
+
+if [ -n "$COMMITTED_CRITICAL_DRIFT" ]; then
+  echo "STOP: committed migration-critical paths changed after the Step 9 code authority."
+  echo "$COMMITTED_CRITICAL_DRIFT"
+  exit 1
+fi
+
+LOCAL_GUARD_PATHS=(
+  "${MIGRATION_CRITICAL_PATHS[@]}"
+  "$WRAPPER_REPO_PATH"
+)
+
+if ! git diff --quiet -- "${LOCAL_GUARD_PATHS[@]}" ||
+   ! git diff --cached --quiet -- "${LOCAL_GUARD_PATHS[@]}"; then
+  echo "STOP: migration-critical code or the Step 10 wrapper has local/staged changes."
+  git status --short -- "${LOCAL_GUARD_PATHS[@]}"
+  exit 1
+fi
+
+UNTRACKED_GUARDED="$(git ls-files --others --exclude-standard -- "${LOCAL_GUARD_PATHS[@]}")"
+if [ -n "$UNTRACKED_GUARDED" ]; then
+  echo "STOP: untracked files exist in guarded migration paths."
+  echo "$UNTRACKED_GUARDED"
+  exit 1
+fi
+
+echo "Pinned migration code is unchanged in the descendant repository state."
+echo "Migration-critical paths and the tracked Step 10 wrapper are locally clean."
 
 # ------------------------------------------------------------
 # GitHub configuration
@@ -203,7 +249,7 @@ export CFLARE_R2_BUCKET="$R2_BUCKET"
 export CFLARE_R2_ENDPOINT="$R2_ENDPOINT"
 export CFLARE_R2_REGION="auto"
 
-TARGET_WRITER_GIT_SHA="$ACTUAL_HEAD"
+TARGET_WRITER_GIT_SHA="$MIGRATION_CODE_BASE_SHA"
 
 # ------------------------------------------------------------
 # Confirm maintenance and no automatic/manual canonical writer is active
@@ -607,6 +653,7 @@ echo "============================================================"
 echo "FINAL STEP 10 PINS"
 echo "============================================================"
 echo "Environment:              TEST"
+echo "Current repository HEAD:  $CURRENT_REPOSITORY_HEAD"
 echo "Migration run ID:         $MIGRATION_RUN_ID"
 echo "Target writer SHA:        $TARGET_WRITER_GIT_SHA"
 echo "Step 9 plan SHA:          $EXPECTED_PLAN_SHA256"
