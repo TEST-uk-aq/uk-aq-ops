@@ -186,7 +186,10 @@ INVENTORY_SHA256="$INVENTORY_SHA256" \
 STATE_SHA256="$STATE_SHA256" \
 node --max-old-space-size=4096 --input-type=module <<'NODE'
 import fs from "node:fs";
-import { buildObservationHistoryV3MigrationPlanFromCheckpoint } from "./scripts/backup_r2/lib/observation_history_migration_v3.mjs";
+import {
+  buildObservationHistoryV3MigrationPlanFromCheckpoint,
+  stableMigrationJson,
+} from "./scripts/backup_r2/lib/observation_history_migration_v3.mjs";
 const checkpoint = JSON.parse(fs.readFileSync(process.env.CHECKPOINT, "utf8"));
 const plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
 const limits = JSON.parse(fs.readFileSync(process.env.WRITER_LIMITS, "utf8"));
@@ -216,8 +219,8 @@ require(plan.inventory.root_manifest.payload.content_hash ===
 require(plan.backup_gate.inventory_root.sha256 === process.env.INVENTORY_SHA256 &&
   plan.backup_gate.state_root.sha256 === process.env.STATE_SHA256,
   "checkpoint rollback backup identity mismatch");
-require(JSON.stringify(plan.target.writer_limits) === JSON.stringify(limits) &&
-  JSON.stringify(limits) === JSON.stringify(expectedLimits),
+require(stableMigrationJson(plan.target.writer_limits) === stableMigrationJson(limits) &&
+  stableMigrationJson(limits) === stableMigrationJson(expectedLimits),
   "writer limits differ from checkpointed authority");
 require(checkpoint.full_verification_complete === false && checkpoint.cutover_ready === false,
   "checkpoint is not the expected interrupted pre-verification state");
