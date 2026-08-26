@@ -425,6 +425,8 @@ class CronHealthTracker:
             "start_slot": start_slot,
             "end_slot": end_slot,
             "count": count,
+            "identity_start_slot": start_slot,
+            "identity_end_slot": end_slot,
             "active": True,
             "recovery_slot": None,
             "recovery_logged": False,
@@ -436,49 +438,121 @@ class CronHealthTracker:
             "next_report_attempt": 0.0,
         }
 
+    def _qualifying_outage_episodes(
+        self, worker_name: str
+    ) -> list[dict[str, int | None]]:
+        cloudflare_slots = sorted(
+            slot
+            for slot, value in self.observations[worker_name].items()
+            if value == "cloudflare_cron"
+        )
+        episodes_by_recovery: dict[int | None, dict[str, int | None]] = {}
+        for start_slot, end_slot, count in self._takeover_runs(worker_name):
+            if count < CRON_OUTAGE_THRESHOLD_SLOTS:
+                continue
+            recovery_slot = next(
+                (slot for slot in cloudflare_slots if slot > end_slot),
+                None,
+            )
+            episode = episodes_by_recovery.get(recovery_slot)
+            if episode is None:
+                episodes_by_recovery[recovery_slot] = {
+                    "start_slot": start_slot,
+                    "end_slot": end_slot,
+                    "count": count,
+                    "identity_start_slot": start_slot,
+                    "identity_end_slot": end_slot,
+                    "recovery_slot": recovery_slot,
+                }
+                continue
+            episode["start_slot"] = min(
+                int(episode["start_slot"]), start_slot
+            )
+            episode["end_slot"] = max(int(episode["end_slot"]), end_slot)
+            episode["count"] = max(int(episode["count"]), count)
+        return sorted(
+            episodes_by_recovery.values(),
+            key=lambda episode: int(episode["start_slot"]),
+        )
+
     def _recompute_outages(
         self, worker_name: str
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         newly_detected: list[dict[str, Any]] = []
         recoveries: list[dict[str, Any]] = []
-        observations = self.observations[worker_name]
-        cloudflare_slots = sorted(
-            slot for slot, value in observations.items() if value == "cloudflare_cron"
-        )
-        for start_slot, end_slot, count in self._takeover_runs(worker_name):
-            if count < CRON_OUTAGE_THRESHOLD_SLOTS:
-                continue
+        episodes = self._qualifying_outage_episodes(worker_name)
+        existing_outages = self.outages[worker_name]
+        assigned_outage_ids: set[int] = set()
+
+        # The identity range is the qualifying run that first created the
+        # stable report payload. Recomputed interval boundaries may move, but
+        # this anchor must not move when late Cloudflare evidence splits a
+        # previously provisional episode.
+        anchored_episode_by_outage_id: dict[int, int] = {}
+        for outage in existing_outages:
+            identity_start = int(
+                outage.get("identity_start_slot", outage["start_slot"])
+            )
+            identity_end = int(
+                outage.get("identity_end_slot", outage["end_slot"])
+            )
+            for episode_index, episode in enumerate(episodes):
+                if (
+                    int(episode["start_slot"]) <= identity_start
+                    and identity_end <= int(episode["end_slot"])
+                ):
+                    anchored_episode_by_outage_id[id(outage)] = episode_index
+                    break
+
+        for episode_index, episode in enumerate(episodes):
+            start_slot = int(episode["start_slot"])
+            end_slot = int(episode["end_slot"])
+            count = int(episode["count"])
+            recovery_slot = episode["recovery_slot"]
             matching = next(
                 (
                     outage
-                    for outage in self.outages[worker_name]
-                    if (
-                        outage["recovery_slot"] is None
-                        or start_slot < outage["recovery_slot"]
-                    )
-                    and not any(
-                        min(outage["end_slot"], end_slot) < cloudflare_slot
-                        < max(outage["start_slot"], start_slot)
-                        for cloudflare_slot in cloudflare_slots
-                    )
+                    for outage in existing_outages
+                    if id(outage) not in assigned_outage_ids
+                    and anchored_episode_by_outage_id.get(id(outage))
+                    == episode_index
                 ),
                 None,
             )
             if matching is None:
+                # Support an older retained outage whose identity anchor has
+                # aged out of the observation window, without letting it steal
+                # an episode from an outage anchored to another retained
+                # chronological segment.
+                matching = next(
+                    (
+                        outage
+                        for outage in existing_outages
+                        if id(outage) not in assigned_outage_ids
+                        and id(outage) not in anchored_episode_by_outage_id
+                        and outage["start_slot"] <= end_slot
+                        and start_slot <= outage["end_slot"]
+                    ),
+                    None,
+                )
+            if matching is None:
                 matching = self._new_outage(
                     worker_name, start_slot, end_slot, count
                 )
-                self.outages[worker_name].append(matching)
+                matching["identity_start_slot"] = int(
+                    episode["identity_start_slot"]
+                )
+                matching["identity_end_slot"] = int(
+                    episode["identity_end_slot"]
+                )
+                existing_outages.append(matching)
                 newly_detected.append(matching)
             else:
-                matching["start_slot"] = min(matching["start_slot"], start_slot)
-                matching["end_slot"] = max(matching["end_slot"], end_slot)
-                matching["count"] = max(matching["count"], count)
+                matching["start_slot"] = start_slot
+                matching["end_slot"] = end_slot
+                matching["count"] = count
+            assigned_outage_ids.add(id(matching))
 
-            recovery_slot = next(
-                (slot for slot in cloudflare_slots if slot > matching["end_slot"]),
-                None,
-            )
             matching["active"] = recovery_slot is None
             matching["recovery_slot"] = recovery_slot
             if recovery_slot is not None and not matching["recovery_logged"]:
