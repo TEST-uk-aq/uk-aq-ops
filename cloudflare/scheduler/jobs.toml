@@ -74,13 +74,13 @@ publish_json = "configured"
 write_parquet = "configured"
 
 [jobs.uk_aq_r2_history_dropbox_backup]
-enabled = true
+enabled = false
 cron_expr = "35 4 * * *"
 target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-ops"
 github_workflow_file = "uk_aq_r2_history_dropbox_backup.yml"
 github_ref = "main"
-dry_run = false
+dry_run = true
 notes = "R2 history Dropbox backup"
 
 [jobs.uk_aq_r2_history_dropbox_backup_force_prune_recheck]
