@@ -99,7 +99,7 @@ response for each canonical `minute_slot`:
   normal Cloudflare Cron source claimed that minute;
 - authentication, HTTP and network failures, malformed responses, and missing
   or unknown trigger-source information are not treated as evidence of a Cron
-  outage.
+  outage. Missing minute slots remain unknown.
 
 The retained 120-minute observation window is recomputed in chronological
 minute-slot order whenever definitive evidence arrives. Ten contiguous
@@ -116,10 +116,12 @@ error-log convention. Each chronological outage interval has a stable identity,
 so late observations can complete and report a historical interval without
 creating duplicate reports. A later chronological minute definitively claimed
 by `cloudflare_cron` means that interval is recovered, including when the
-recovery response completed before a delayed takeover response. Recovery writes one
-`scheduler_watchdog_cloudflare_cron_recovered` event to the local JSONL. The
-central error-log contract has no established recovery record, so no Dropbox
-recovery file is created.
+recovery response completed before a delayed takeover response. If qualifying
+takeover runs are provisionally grouped across unresolved internal minute gaps,
+recovery is withheld until later evidence establishes the chronological outage
+boundaries. Recovery writes one `scheduler_watchdog_cloudflare_cron_recovered`
+event to the local JSONL. The central error-log contract has no established
+recovery record, so no Dropbox recovery file is created.
 
 Responses are ordered by `minute_slot`, not completion time, so overlapping
 requests that finish out of order cannot extend or reset the wrong sequence.

@@ -440,13 +440,16 @@ class CronHealthTracker:
 
     def _qualifying_outage_episodes(
         self, worker_name: str
-    ) -> list[dict[str, int | None]]:
+    ) -> list[dict[str, int | bool | None]]:
+        observations = self.observations[worker_name]
         cloudflare_slots = sorted(
             slot
-            for slot, value in self.observations[worker_name].items()
+            for slot, value in observations.items()
             if value == "cloudflare_cron"
         )
-        episodes_by_recovery: dict[int | None, dict[str, int | None]] = {}
+        episodes_by_recovery: dict[
+            int | None, dict[str, int | bool | None]
+        ] = {}
         for start_slot, end_slot, count in self._takeover_runs(worker_name):
             if count < CRON_OUTAGE_THRESHOLD_SLOTS:
                 continue
@@ -470,10 +473,18 @@ class CronHealthTracker:
             )
             episode["end_slot"] = max(int(episode["end_slot"]), end_slot)
             episode["count"] = max(int(episode["count"]), count)
-        return sorted(
+        episodes = sorted(
             episodes_by_recovery.values(),
             key=lambda episode: int(episode["start_slot"]),
         )
+        for episode in episodes:
+            start_slot = int(episode["start_slot"])
+            end_slot = int(episode["end_slot"])
+            episode["unresolved_internal_gaps"] = any(
+                slot not in observations
+                for slot in range(start_slot, end_slot + 60, 60)
+            )
+        return episodes
 
     def _recompute_outages(
         self, worker_name: str
@@ -509,6 +520,10 @@ class CronHealthTracker:
             end_slot = int(episode["end_slot"])
             count = int(episode["count"])
             recovery_slot = episode["recovery_slot"]
+            recovery_is_conclusive = (
+                recovery_slot is not None
+                and not bool(episode["unresolved_internal_gaps"])
+            )
             matching = next(
                 (
                     outage
@@ -553,9 +568,11 @@ class CronHealthTracker:
                 matching["count"] = count
             assigned_outage_ids.add(id(matching))
 
-            matching["active"] = recovery_slot is None
-            matching["recovery_slot"] = recovery_slot
-            if recovery_slot is not None and not matching["recovery_logged"]:
+            matching["active"] = not recovery_is_conclusive
+            matching["recovery_slot"] = (
+                recovery_slot if recovery_is_conclusive else None
+            )
+            if recovery_is_conclusive and not matching["recovery_logged"]:
                 matching["recovery_logged"] = True
                 recoveries.append(matching)
         return newly_detected, recoveries
