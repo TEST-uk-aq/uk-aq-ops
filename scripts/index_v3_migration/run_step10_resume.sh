@@ -22,7 +22,7 @@ EXPECTED_AUTHORITY_SHA256="52ec1bb14fafcc05241b28202793f572ff0bf78d79a5c9af42de8
 EXPECTED_CHECKPOINT_SHA256="dabab5f5fb406af461dd6355780731b4c862b1fade14b362bfc93e5ef88c1c98"
 EXPECTED_CHECKPOINT_BYTES="502003733"
 EXPECTED_RECOVERY_CLI_SHA256="99ea4508767d71640e741b434296e3823278ac726133bb8982127ddfe2fb08c2"
-EXPECTED_RECOVERY_LIBRARY_SHA256="cec8c4325c4c34c8d5015207d5e9fc49313ab7866d7544155722bcf8d095bc8d"
+EXPECTED_RECOVERY_LIBRARY_SHA256="de0422373479da9459b43199075802e452537eeedae08f8db5265abb6f0c14cf"
 
 EXPECTED_SOURCE_ROOT_SHA256="46cc0b9722714e6bef223fa4700806a3c3870b603db0e075fd5e4e0e7c6210a1"
 EXPECTED_SOURCE_ROOT_CONTENT_HASH="d0823fb50e848d0ceb923d5477b00a6aa5e16f8990b0bf544f573c0246722cd5"
@@ -130,8 +130,9 @@ if ! git diff --quiet HEAD -- "${RECOVERY_OPERATION_PATHS[@]}"; then
 fi
 
 # The shared migration library is intentionally changed only at checkpoint
-# persistence handoffs. Reinsert the six removed structuredClone calls and
-# require the complete file to become byte-identical to the pinned authority.
+# persistence handoffs and the prepared-unit logical-content comparison.
+# Reverse those exact recovery changes and require the complete file to become
+# byte-identical to the pinned authority.
 TARGET_WRITER_GIT_SHA="$TARGET_WRITER_GIT_SHA" \
 MIGRATION_LIBRARY="$MIGRATION_LIBRARY" \
 node --input-type=module <<'NODE'
@@ -144,13 +145,31 @@ const pinned = spawnSync("git", [
 if (pinned.status !== 0) throw new Error("Pinned migration library is unavailable");
 const current = fs.readFileSync(process.env.MIGRATION_LIBRARY, "utf8");
 let restored = current;
-let replacements = 0;
+let persistenceReplacements = 0;
 restored = restored.replace(/writeCheckpoint\(checkpoint\)/g, (match) => {
-  replacements += 1;
+  persistenceReplacements += 1;
   return match.replace("checkpoint", "structuredClone(checkpoint)");
 });
-if (replacements !== 6 || restored !== pinned.stdout) {
-  throw new Error("Migration library has drift beyond the six recovery persistence handoffs");
+if (persistenceReplacements !== 6) {
+  throw new Error("Migration library must contain exactly six recovery persistence handoffs");
+}
+const recoveryPreparedUnitComparison = `stableMigrationJson(contentHashMetadata(record.target_metadata)) !==
+      stableMigrationJson(authorityUnit.source_observation_content_hash_metadata)`;
+const pinnedPreparedUnitComparison = `!sameJson(
+      contentHashMetadata(record.target_metadata),
+      authorityUnit.source_observation_content_hash_metadata,
+    )`;
+const semanticComparisonReplacements =
+  restored.split(recoveryPreparedUnitComparison).length - 1;
+if (semanticComparisonReplacements !== 1) {
+  throw new Error("Migration library must contain exactly one prepared-unit semantic comparison");
+}
+restored = restored.replace(
+  recoveryPreparedUnitComparison,
+  pinnedPreparedUnitComparison,
+);
+if (restored !== pinned.stdout) {
+  throw new Error("Migration library has drift beyond the reviewed recovery-only changes");
 }
 console.log("Target generation logic is byte-identical to the pinned authority after recovery-only normalisation.");
 NODE

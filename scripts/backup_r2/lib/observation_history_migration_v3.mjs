@@ -2328,10 +2328,8 @@ function preparedUnitFromRecord(authorityUnit, record) {
   }
   if (
     record.target_metadata.row_count !== authorityUnit.source_row_count ||
-    !sameJson(
-      contentHashMetadata(record.target_metadata),
-      authorityUnit.source_observation_content_hash_metadata,
-    )
+    stableMigrationJson(contentHashMetadata(record.target_metadata)) !==
+      stableMigrationJson(authorityUnit.source_observation_content_hash_metadata)
   ) {
     throw new Error(`Prepared unit logical identity changed: ${authorityUnit.unit_id}`);
   }
