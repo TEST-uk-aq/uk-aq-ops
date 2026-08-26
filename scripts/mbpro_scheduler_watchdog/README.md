@@ -99,9 +99,11 @@ response for each canonical `minute_slot`:
   normal Cloudflare Cron source claimed that minute;
 - authentication, HTTP and network failures, malformed responses, and missing
   or unknown trigger-source information are not treated as evidence of a Cron
-  outage.
+  outage. Missing minute slots remain unknown.
 
-Ten contiguous watchdog-claimed minute slots produce one
+The retained 120-minute observation window is recomputed in chronological
+minute-slot order whenever definitive evidence arrives. Ten contiguous
+watchdog-claimed minute slots produce one
 `scheduler_watchdog_cloudflare_cron_outage_detected` event in the local JSONL
 and one remote Dropbox error record under:
 
@@ -110,17 +112,27 @@ and one remote Dropbox error record under:
 ```
 
 The remote filename and JSON payload follow the existing UK AQ central
-error-log convention. The condition remains active and is not reported again
-each minute. A later, newer minute definitively claimed by `cloudflare_cron`
-clears the condition and writes one
-`scheduler_watchdog_cloudflare_cron_recovered` event to the local JSONL. The
-central error-log contract has no established recovery record, so no Dropbox
-recovery file is created.
+error-log convention. Each chronological outage interval has a stable identity,
+so late observations can complete and report a historical interval without
+creating duplicate reports. A later chronological minute definitively claimed
+by `cloudflare_cron` means that interval is recovered, including when the
+recovery response completed before a delayed takeover response. If qualifying
+takeover runs are provisionally grouped across unresolved internal minute gaps,
+recovery is withheld until later evidence establishes the chronological outage
+boundaries. Recovery writes one `scheduler_watchdog_cloudflare_cron_recovered`
+event to the local JSONL. The central error-log contract has no established
+recovery record, so no Dropbox recovery file is created.
 
 Responses are ordered by `minute_slot`, not completion time, so overlapping
 requests that finish out of order cannot extend or reset the wrong sequence.
-Dropbox reporting runs separately from scheduler requests. Token or upload
-failure is logged locally and never stops or delays future scheduling.
+Dropbox reporting runs on its dedicated executor, separately from scheduler
+requests. A failed upload is eligible for four bounded, progressively delayed
+retries (after 2, 5, 15 and 30 minutes) as later scheduler observations arrive.
+Every attempt reuses the original error UUID, creation time, payload and
+overwrite path, so a retry is idempotent and does not create another logical
+central error. A recovered historical outage remains eligible for its pending
+report. Token or upload failure is logged locally and never stops or delays
+future scheduling.
 
 ## Derived installations
 
