@@ -68,6 +68,27 @@ escape_plist_replacement() {
   escape_sed "$(escape_xml_text "$1")"
 }
 
+bootstrap_launchagent() {
+  local domain="$1"
+  local plist_path="$2"
+  local max_attempts=3
+  local retry_delay_seconds=1
+  local attempt=1
+
+  while true; do
+    if launchctl bootstrap "$domain" "$plist_path"; then
+      return 0
+    fi
+    if [ "$attempt" -ge "$max_attempts" ]; then
+      echo "LaunchAgent ${WATCHDOG_LABEL} was not successfully bootstrapped after ${max_attempts} attempts." >&2
+      return 1
+    fi
+    echo "launchctl bootstrap attempt ${attempt} failed; retrying in ${retry_delay_seconds} second." >&2
+    sleep "$retry_delay_seconds"
+    attempt=$((attempt + 1))
+  done
+}
+
 RENDERED_PLIST="$(mktemp "${WATCHDOG_PLIST_PATH}.tmp.XXXXXX")"
 trap 'rm -f "$RENDERED_PLIST"' EXIT
 
@@ -86,7 +107,7 @@ plutil -lint "$RENDERED_PLIST"
 USER_ID="$(id -u)"
 launchctl bootout "gui/${USER_ID}/${WATCHDOG_LABEL}" 2>/dev/null || true
 install -m 600 "$RENDERED_PLIST" "$WATCHDOG_PLIST_PATH"
-launchctl bootstrap "gui/${USER_ID}" "$WATCHDOG_PLIST_PATH"
+bootstrap_launchagent "gui/${USER_ID}" "$WATCHDOG_PLIST_PATH"
 launchctl kickstart -k "gui/${USER_ID}/${WATCHDOG_LABEL}"
 
 rm -f "$RENDERED_PLIST"
