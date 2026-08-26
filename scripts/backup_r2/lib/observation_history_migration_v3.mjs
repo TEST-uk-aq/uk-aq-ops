@@ -175,6 +175,10 @@ function sameJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function sameSemanticJson(left, right) {
+  return stableMigrationJson(left) === stableMigrationJson(right);
+}
+
 function normalizePrefix(value, fieldName) {
   const normalized = String(value || "").trim().replace(/^\/+|\/+$/g, "");
   if (
@@ -521,7 +525,7 @@ async function reverifyPinnedSourceManifestReference({
     pinned.parent_manifest_identity.key,
     connectorObject.body,
   );
-  if (!sameJson(connectorIdentity, pinned.parent_manifest_identity)) {
+  if (!sameSemanticJson(connectorIdentity, pinned.parent_manifest_identity)) {
     throw new Error(
       `Pinned source parent manifest identity changed: ${partitionIdentity(sourcePartition.scope)}`,
     );
@@ -556,7 +560,7 @@ async function reverifyPinnedSourceManifestReference({
     pinned.referenced_child_manifest_key,
     pollutantObject.body,
   );
-  if (!sameJson(pollutantIdentity, pinned.current_child_manifest_identity)) {
+  if (!sameSemanticJson(pollutantIdentity, pinned.current_child_manifest_identity)) {
     throw new Error(
       `Pinned source child manifest identity changed: ${partitionIdentity(sourcePartition.scope)}`,
     );
@@ -581,7 +585,7 @@ async function reverifyPinnedSourceManifestReference({
     pollutantManifestIdentity: pollutantIdentity,
     pollutantKey: pinned.referenced_child_manifest_key,
   });
-  if (!sameJson(currentEvidence, pinned)) {
+  if (!sameSemanticJson(currentEvidence, pinned)) {
     throw new Error(
       `Pinned source manifest reference evidence changed: ${partitionIdentity(sourcePartition.scope)}`,
     );
@@ -621,7 +625,7 @@ async function reverifyPinnedCompatibleSourceUnitsBeforeMutation({
     if (rewritten.unit_id !== authorityUnit.unit_id) {
       throw new Error(`Pinned source unit identity changed: ${authorityUnit.unit_id}`);
     }
-    if (!sameJson(rewritten.source_files, authorityUnit.source_files)) {
+    if (!sameSemanticJson(rewritten.source_files, authorityUnit.source_files)) {
       throw new Error(`Pinned source file identity changed: ${authorityUnit.unit_id}`);
     }
   }
@@ -641,7 +645,7 @@ async function reverifyPinnedEmptySourceConnectorsBeforeMutation({
       pinned.source_manifest_key,
       connectorObject.body,
     );
-    if (!sameJson(currentIdentity, pinned.source_manifest_identity)) {
+    if (!sameSemanticJson(currentIdentity, pinned.source_manifest_identity)) {
       throw new Error(
         `Pinned empty source connector identity changed: ${pinned.source_manifest_key}`,
       );
@@ -664,7 +668,7 @@ async function reverifyPinnedEmptySourceConnectorsBeforeMutation({
       connectorId: pinned.scope.connector_id,
       connectorKey: pinned.source_manifest_key,
     });
-    if (!sameJson(current, pinned)) {
+    if (!sameSemanticJson(current, pinned)) {
       throw new Error(
         `Pinned empty source connector evidence changed: ${pinned.source_manifest_key}`,
       );
@@ -1712,7 +1716,7 @@ async function rewritePartition({
     validateObservationContentHashMetadata(sourcePartition.manifest, {
       rowCount: sourcePartition.manifest.row_count,
     });
-    if (!sameJson(contentHashMetadata(sourcePartition.manifest), effectiveSourceHash)) {
+    if (!sameSemanticJson(contentHashMetadata(sourcePartition.manifest), effectiveSourceHash)) {
       throw new Error(
         `Manifest source logical identity changed: ${partitionIdentity(sourcePartition.scope)}`,
       );
@@ -1728,7 +1732,7 @@ async function rewritePartition({
   }
   const computedSourceHash = contentHashMetadata(sourceLogical);
   if (
-    !sameJson(computedSourceHash, effectiveSourceHash)
+    !sameSemanticJson(computedSourceHash, effectiveSourceHash)
   ) {
     throw new Error(
       `Canonical source logical identity mismatch: ${partitionIdentity(sourcePartition.scope)}`,
@@ -1745,7 +1749,7 @@ async function rewritePartition({
     ),
   });
   if (
-    !sameJson(contentHashMetadata(target.metadata), effectiveSourceHash)
+    !sameSemanticJson(contentHashMetadata(target.metadata), effectiveSourceHash)
   ) {
     throw new Error(
       `Target rewrite logical identity mismatch: ${partitionIdentity(sourcePartition.scope)}`,
@@ -2647,7 +2651,7 @@ export async function executeObservationHistoryV3MigrationPlan({
       if (rewritten.unit_id !== authorityUnit.unit_id) {
         throw new Error(`Pinned source unit identity changed: ${authorityUnit.unit_id}`);
       }
-      if (!sameJson(rewritten.source_files, authorityUnit.source_files)) {
+      if (!sameSemanticJson(rewritten.source_files, authorityUnit.source_files)) {
         throw new Error(`Pinned source file identity changed: ${authorityUnit.unit_id}`);
       }
       const staged = await adapters.stageUnit({
@@ -2812,7 +2816,7 @@ export async function verifyObservationHistoryV3MigrationResult({
   for (const unit of plan.units) {
     if (
       unit.source_row_count !== unit.target_metadata.row_count ||
-      !sameJson(
+      !sameSemanticJson(
         unit.source_observation_content_hash_metadata,
         contentHashMetadata(unit.target_metadata),
       )
@@ -3037,7 +3041,7 @@ async function addBackupObjectToRestore({ getBackupObject, objects, key, expecte
     stage: restoreStageForKey(key),
   });
   const existing = objects.get(key);
-  if (existing && !sameJson(existing, descriptor)) {
+  if (existing && !sameSemanticJson(existing, descriptor)) {
     throw new Error(`Dropbox restore object identity is inconsistent: ${key}`);
   }
   objects.set(key, descriptor);
@@ -3192,7 +3196,7 @@ export async function buildObservationHistoryV2RestorePlan({
               pollutantKey: pollutantIntent.key,
             });
           if (
-            !sameJson(
+            !sameSemanticJson(
               restoredReferenceEvidence,
               sourcePartition.source_manifest_reference,
             )
@@ -3251,7 +3255,7 @@ export async function buildObservationHistoryV2RestorePlan({
       sha256,
       stage,
     }));
-    if (!sameJson(identities, pinnedObjects)) {
+    if (!sameSemanticJson(identities, pinnedObjects)) {
       throw new Error(
         "Dropbox rollback objects differ from the immutable checkpoint authority",
       );

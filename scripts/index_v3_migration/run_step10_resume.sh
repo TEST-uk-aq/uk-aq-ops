@@ -22,7 +22,7 @@ EXPECTED_AUTHORITY_SHA256="52ec1bb14fafcc05241b28202793f572ff0bf78d79a5c9af42de8
 EXPECTED_CHECKPOINT_SHA256="dabab5f5fb406af461dd6355780731b4c862b1fade14b362bfc93e5ef88c1c98"
 EXPECTED_CHECKPOINT_BYTES="502003733"
 EXPECTED_RECOVERY_CLI_SHA256="99ea4508767d71640e741b434296e3823278ac726133bb8982127ddfe2fb08c2"
-EXPECTED_RECOVERY_LIBRARY_SHA256="de0422373479da9459b43199075802e452537eeedae08f8db5265abb6f0c14cf"
+EXPECTED_RECOVERY_LIBRARY_SHA256="efad5cabf3fd9580fc35ee3b6bfc280d931d56f595a043afeaffbdb86b785bf0"
 
 EXPECTED_SOURCE_ROOT_SHA256="46cc0b9722714e6bef223fa4700806a3c3870b603db0e075fd5e4e0e7c6210a1"
 EXPECTED_SOURCE_ROOT_CONTENT_HASH="d0823fb50e848d0ceb923d5477b00a6aa5e16f8990b0bf544f573c0246722cd5"
@@ -130,9 +130,9 @@ if ! git diff --quiet HEAD -- "${RECOVERY_OPERATION_PATHS[@]}"; then
 fi
 
 # The shared migration library is intentionally changed only at checkpoint
-# persistence handoffs and the prepared-unit logical-content comparison.
-# Reverse those exact recovery changes and require the complete file to become
-# byte-identical to the pinned authority.
+# persistence handoffs and reviewed semantic identity/evidence comparisons.
+# Reverse those exact recovery changes in their expected code contexts and
+# require the complete file to become byte-identical to the pinned authority.
 TARGET_WRITER_GIT_SHA="$TARGET_WRITER_GIT_SHA" \
 MIGRATION_LIBRARY="$MIGRATION_LIBRARY" \
 node --input-type=module <<'NODE'
@@ -159,15 +159,129 @@ const pinnedPreparedUnitComparison = `!sameJson(
       contentHashMetadata(record.target_metadata),
       authorityUnit.source_observation_content_hash_metadata,
     )`;
-const semanticComparisonReplacements =
+const preparedUnitComparisonReplacements =
   restored.split(recoveryPreparedUnitComparison).length - 1;
-if (semanticComparisonReplacements !== 1) {
+if (preparedUnitComparisonReplacements !== 1) {
   throw new Error("Migration library must contain exactly one prepared-unit semantic comparison");
 }
 restored = restored.replace(
   recoveryPreparedUnitComparison,
   pinnedPreparedUnitComparison,
 );
+const recoverySemanticHelper = `function sameSemanticJson(left, right) {
+  return stableMigrationJson(left) === stableMigrationJson(right);
+}
+
+`;
+const semanticHelperReplacements = restored.split(recoverySemanticHelper).length - 1;
+if (semanticHelperReplacements !== 1) {
+  throw new Error("Migration library must contain exactly one semantic equality helper");
+}
+restored = restored.replace(recoverySemanticHelper, "");
+const semanticCallReversals = [
+  [
+    "if (!sameSemanticJson(connectorIdentity, pinned.parent_manifest_identity)) {",
+    "if (!sameJson(connectorIdentity, pinned.parent_manifest_identity)) {",
+    1,
+    "pinned parent manifest identity",
+  ],
+  [
+    "if (!sameSemanticJson(pollutantIdentity, pinned.current_child_manifest_identity)) {",
+    "if (!sameJson(pollutantIdentity, pinned.current_child_manifest_identity)) {",
+    1,
+    "pinned child manifest identity",
+  ],
+  [
+    "if (!sameSemanticJson(currentEvidence, pinned)) {",
+    "if (!sameJson(currentEvidence, pinned)) {",
+    1,
+    "pinned source manifest evidence",
+  ],
+  [
+    "if (!sameSemanticJson(rewritten.source_files, authorityUnit.source_files)) {",
+    "if (!sameJson(rewritten.source_files, authorityUnit.source_files)) {",
+    2,
+    "rewritten source file identities",
+  ],
+  [
+    "if (!sameSemanticJson(currentIdentity, pinned.source_manifest_identity)) {",
+    "if (!sameJson(currentIdentity, pinned.source_manifest_identity)) {",
+    1,
+    "empty connector manifest identity",
+  ],
+  [
+    "if (!sameSemanticJson(current, pinned)) {",
+    "if (!sameJson(current, pinned)) {",
+    1,
+    "empty connector evidence",
+  ],
+  [
+    "if (!sameSemanticJson(contentHashMetadata(sourcePartition.manifest), effectiveSourceHash)) {",
+    "if (!sameJson(contentHashMetadata(sourcePartition.manifest), effectiveSourceHash)) {",
+    1,
+    "manifest source logical identity",
+  ],
+  [
+    "!sameSemanticJson(computedSourceHash, effectiveSourceHash)",
+    "!sameJson(computedSourceHash, effectiveSourceHash)",
+    1,
+    "computed source logical identity",
+  ],
+  [
+    "!sameSemanticJson(contentHashMetadata(target.metadata), effectiveSourceHash)",
+    "!sameJson(contentHashMetadata(target.metadata), effectiveSourceHash)",
+    1,
+    "target rewrite logical identity",
+  ],
+  [
+    `!sameSemanticJson(
+        unit.source_observation_content_hash_metadata,
+        contentHashMetadata(unit.target_metadata),
+      )`,
+    `!sameJson(
+        unit.source_observation_content_hash_metadata,
+        contentHashMetadata(unit.target_metadata),
+      )`,
+    1,
+    "migration verification logical identity",
+  ],
+  [
+    "if (existing && !sameSemanticJson(existing, descriptor)) {",
+    "if (existing && !sameJson(existing, descriptor)) {",
+    1,
+    "Dropbox restore descriptor identity",
+  ],
+  [
+    `!sameSemanticJson(
+              restoredReferenceEvidence,
+              sourcePartition.source_manifest_reference,
+            )`,
+    `!sameJson(
+              restoredReferenceEvidence,
+              sourcePartition.source_manifest_reference,
+            )`,
+    1,
+    "Dropbox source manifest evidence",
+  ],
+  [
+    "if (!sameSemanticJson(identities, pinnedObjects)) {",
+    "if (!sameJson(identities, pinnedObjects)) {",
+    1,
+    "Dropbox rollback object identities",
+  ],
+];
+let semanticCallReplacements = 0;
+for (const [recoveryCall, pinnedCall, expectedCount, label] of semanticCallReversals) {
+  const occurrences = restored.split(recoveryCall).length - 1;
+  if (occurrences !== expectedCount) {
+    throw new Error(`Migration library semantic comparison count changed: ${label}`);
+  }
+  restored = restored.split(recoveryCall).join(pinnedCall);
+  semanticCallReplacements += occurrences;
+}
+if (semanticCallReplacements !== 14) {
+  throw new Error("Migration library must contain exactly fourteen semantic call-site changes");
+}
 if (restored !== pinned.stdout) {
   throw new Error("Migration library has drift beyond the reviewed recovery-only changes");
 }
