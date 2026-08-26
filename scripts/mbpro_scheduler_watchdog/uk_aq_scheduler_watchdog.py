@@ -25,6 +25,7 @@ DEFAULT_MAX_IN_FLIGHT_PER_WORKER = 4
 CRON_OUTAGE_THRESHOLD_SLOTS = 10
 CRON_OBSERVATION_RETENTION_SLOTS = 120
 DROPBOX_REQUEST_TIMEOUT_SECONDS = 30
+DROPBOX_REPORT_RETRY_DELAYS_SECONDS = (120, 300, 900, 1_800)
 RESPONSE_PREVIEW_LIMIT = 1_000
 LOG_MAX_BYTES = 1_000_000
 LOG_BACKUP_COUNT = 7
@@ -348,27 +349,142 @@ class CronHealthTracker:
         self.observations: dict[str, dict[int, str]] = {
             worker_name: {} for worker_name in worker_names
         }
-        self.outage_reported = {worker_name: False for worker_name in worker_names}
-        self.outage_detection_slot: dict[str, int | None] = {
-            worker_name: None for worker_name in worker_names
+        self.outages: dict[str, list[dict[str, Any]]] = {
+            worker_name: [] for worker_name in worker_names
         }
-        self.outage_detection_count = {worker_name: 0 for worker_name in worker_names}
         self.report_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="uk-aq-scheduler-watchdog-dropbox",
         )
 
-    def _consecutive_takeover_suffix(self, worker_name: str) -> tuple[int, int | None]:
+    def _takeover_runs(self, worker_name: str) -> list[tuple[int, int, int]]:
+        runs: list[tuple[int, int, int]] = []
+        start: int | None = None
+        previous: int | None = None
+        for slot, observation in sorted(self.observations[worker_name].items()):
+            if observation != "watchdog_takeover":
+                if start is not None and previous is not None:
+                    runs.append((start, previous, ((previous - start) // 60) + 1))
+                start = None
+                previous = None
+                continue
+            if previous is None or slot != previous + 60:
+                if start is not None and previous is not None:
+                    runs.append((start, previous, ((previous - start) // 60) + 1))
+                start = slot
+            previous = slot
+        if start is not None and previous is not None:
+            runs.append((start, previous, ((previous - start) // 60) + 1))
+        return runs
+
+    def _new_outage(
+        self,
+        worker_name: str,
+        start_slot: int,
+        end_slot: int,
+        count: int,
+    ) -> dict[str, Any]:
+        detected_at = utc_timestamp()
+        error_id = str(uuid.uuid4())
+        latest_slot = minute_slot_text(end_slot)
+        message = (
+            f"Cloudflare Cron did not claim the {self.environment} "
+            f"{worker_name} scheduler for {count} consecutive minutes. "
+            "The MacBook Pro scheduler watchdog supplied scheduling continuity "
+            "during this interval."
+        )
+        payload = {
+            "id": error_id,
+            "created_at": detected_at,
+            "source": "scheduler_watchdog",
+            "service": "scheduler_watchdog",
+            "severity": "error",
+            "message": message,
+            "stack": None,
+            "context": {
+                "error_type": "cloudflare_cron_sustained_outage",
+                "environment": self.environment,
+                "scheduler": worker_name,
+                "worker": worker_name,
+                "latest_minute_slot": latest_slot,
+                "consecutive_takeover_count": count,
+                "threshold": CRON_OUTAGE_THRESHOLD_SLOTS,
+                "watchdog_trigger_source": "external_watchdog",
+                "source_file": (
+                    "scripts/mbpro_scheduler_watchdog/"
+                    "uk_aq_scheduler_watchdog.py"
+                ),
+            },
+            "connector_id": None,
+            "connector_code": None,
+            "station_id": None,
+            "timeseries_id": None,
+            "dropbox_path": None,
+        }
+        return {
+            "start_slot": start_slot,
+            "end_slot": end_slot,
+            "count": count,
+            "active": True,
+            "recovery_slot": None,
+            "recovery_logged": False,
+            "payload": payload,
+            "report_attempts": 0,
+            "report_in_flight": False,
+            "report_succeeded": False,
+            "report_not_configured_logged": False,
+            "next_report_attempt": 0.0,
+        }
+
+    def _recompute_outages(
+        self, worker_name: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        newly_detected: list[dict[str, Any]] = []
+        recoveries: list[dict[str, Any]] = []
         observations = self.observations[worker_name]
-        if not observations:
-            return 0, None
-        latest_slot = max(observations)
-        count = 0
-        slot = latest_slot
-        while observations.get(slot) == "watchdog_takeover":
-            count += 1
-            slot -= 60
-        return count, latest_slot
+        cloudflare_slots = sorted(
+            slot for slot, value in observations.items() if value == "cloudflare_cron"
+        )
+        for start_slot, end_slot, count in self._takeover_runs(worker_name):
+            if count < CRON_OUTAGE_THRESHOLD_SLOTS:
+                continue
+            matching = next(
+                (
+                    outage
+                    for outage in self.outages[worker_name]
+                    if (
+                        outage["recovery_slot"] is None
+                        or start_slot < outage["recovery_slot"]
+                    )
+                    and not any(
+                        min(outage["end_slot"], end_slot) < cloudflare_slot
+                        < max(outage["start_slot"], start_slot)
+                        for cloudflare_slot in cloudflare_slots
+                    )
+                ),
+                None,
+            )
+            if matching is None:
+                matching = self._new_outage(
+                    worker_name, start_slot, end_slot, count
+                )
+                self.outages[worker_name].append(matching)
+                newly_detected.append(matching)
+            else:
+                matching["start_slot"] = min(matching["start_slot"], start_slot)
+                matching["end_slot"] = max(matching["end_slot"], end_slot)
+                matching["count"] = max(matching["count"], count)
+
+            recovery_slot = next(
+                (slot for slot in cloudflare_slots if slot > matching["end_slot"]),
+                None,
+            )
+            matching["active"] = recovery_slot is None
+            matching["recovery_slot"] = recovery_slot
+            if recovery_slot is not None and not matching["recovery_logged"]:
+                matching["recovery_logged"] = True
+                recoveries.append(matching)
+        return newly_detected, recoveries
 
     def _prune_observations(self, worker_name: str) -> None:
         observations = self.observations[worker_name]
@@ -388,8 +504,9 @@ class CronHealthTracker:
         minute_slot: str,
         observation: str,
     ) -> None:
-        recovery: dict[str, Any] | None = None
-        outage: dict[str, Any] | None = None
+        recoveries: list[dict[str, Any]] = []
+        newly_detected: list[dict[str, Any]] = []
+        reports_to_submit: list[dict[str, Any]] = []
         conflict: dict[str, Any] | None = None
         with self.lock:
             observations = self.observations[worker_name]
@@ -404,48 +521,19 @@ class CronHealthTracker:
                 }
             else:
                 observations[minute_epoch] = observation
-                detection_slot = self.outage_detection_slot[worker_name]
-                if (
-                    self.outage_reported[worker_name]
-                    and observation == "cloudflare_cron"
-                    and detection_slot is not None
-                    and minute_epoch > detection_slot
-                ):
-                    recovery = {
-                        "environment": self.environment,
-                        "worker": worker_name,
-                        "minute_slot": minute_slot,
-                        "consecutive_takeover_count": 0,
-                        "previous_consecutive_takeover_count": (
-                            self.outage_detection_count[worker_name]
-                        ),
-                        "threshold": CRON_OUTAGE_THRESHOLD_SLOTS,
-                    }
-                    self.outage_reported[worker_name] = False
-                    self.outage_detection_slot[worker_name] = None
-                    self.outage_detection_count[worker_name] = 0
-
-                count, latest_slot_epoch = self._consecutive_takeover_suffix(
-                    worker_name
-                )
-                if (
-                    not self.outage_reported[worker_name]
-                    and count >= CRON_OUTAGE_THRESHOLD_SLOTS
-                    and latest_slot_epoch is not None
-                ):
-                    latest_slot = minute_slot_text(latest_slot_epoch)
-                    outage = {
-                        "environment": self.environment,
-                        "worker": worker_name,
-                        "minute_slot": latest_slot,
-                        "consecutive_takeover_count": count,
-                        "threshold": CRON_OUTAGE_THRESHOLD_SLOTS,
-                        "detection_timestamp": utc_timestamp(),
-                    }
-                    self.outage_reported[worker_name] = True
-                    self.outage_detection_slot[worker_name] = latest_slot_epoch
-                    self.outage_detection_count[worker_name] = count
                 self._prune_observations(worker_name)
+                newly_detected, recoveries = self._recompute_outages(worker_name)
+                now = time.monotonic()
+                for outage in self.outages[worker_name]:
+                    if (
+                        not outage["report_succeeded"]
+                        and not outage["report_in_flight"]
+                        and outage["report_attempts"]
+                        <= len(DROPBOX_REPORT_RETRY_DELAYS_SECONDS)
+                        and now >= outage["next_report_attempt"]
+                    ):
+                        outage["report_in_flight"] = True
+                        reports_to_submit.append(outage)
 
         if conflict is not None:
             log_event(
@@ -453,102 +541,105 @@ class CronHealthTracker:
                 "scheduler_watchdog_cron_health_observation_conflict",
                 **conflict,
             )
-        if recovery is not None:
-            log_event(
-                self.logger,
-                "scheduler_watchdog_cloudflare_cron_recovered",
-                **recovery,
-            )
-        if outage is not None:
+        for outage in newly_detected:
             log_event(
                 self.logger,
                 "scheduler_watchdog_cloudflare_cron_outage_detected",
-                **outage,
+                environment=self.environment,
+                worker=worker_name,
+                minute_slot=minute_slot_text(outage["end_slot"]),
+                consecutive_takeover_count=outage["count"],
+                threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
+                detection_timestamp=outage["payload"]["created_at"],
             )
+        for outage in recoveries:
+            log_event(
+                self.logger,
+                "scheduler_watchdog_cloudflare_cron_recovered",
+                environment=self.environment,
+                worker=worker_name,
+                minute_slot=minute_slot_text(outage["recovery_slot"]),
+                consecutive_takeover_count=0,
+                previous_consecutive_takeover_count=outage["count"],
+                threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
+            )
+        for outage in reports_to_submit:
             try:
                 self.report_executor.submit(self._report_outage, outage)
             except Exception as exc:
+                with self.lock:
+                    outage["report_in_flight"] = False
                 log_event(
                     self.logger,
                     "scheduler_watchdog_dropbox_error_upload_failed",
                     environment=self.environment,
                     worker=worker_name,
-                    minute_slot=outage["minute_slot"],
+                    minute_slot=minute_slot_text(outage["end_slot"]),
                     error_type=type(exc).__name__,
                     message=str(exc)[:500],
                 )
 
     def _report_outage(self, outage: dict[str, Any]) -> None:
-        detected_at = str(outage["detection_timestamp"])
-        error_id = str(uuid.uuid4())
-        worker_name = str(outage["worker"])
-        count = int(outage["consecutive_takeover_count"])
-        message = (
-            f"Cloudflare Cron has not claimed the {self.environment} "
-            f"{worker_name} scheduler for {count} consecutive minutes. "
-            "The MacBook Pro scheduler watchdog is currently providing "
-            "scheduling continuity."
-        )
-        payload = {
-            "id": error_id,
-            "created_at": detected_at,
-            "source": "scheduler_watchdog",
-            "severity": "error",
-            "message": message,
-            "stack": None,
-            "context": {
-                "error_type": "cloudflare_cron_sustained_outage",
-                "environment": self.environment,
-                "scheduler": worker_name,
-                "worker": worker_name,
-                "latest_minute_slot": outage["minute_slot"],
-                "consecutive_takeover_count": count,
-                "threshold": CRON_OUTAGE_THRESHOLD_SLOTS,
-                "watchdog_trigger_source": "external_watchdog",
-                "source_file": (
-                    "scripts/mbpro_scheduler_watchdog/"
-                    "uk_aq_scheduler_watchdog.py"
-                ),
-            },
-            "connector_id": None,
-            "station_id": None,
-            "timeseries_id": None,
-            "dropbox_path": None,
-        }
+        payload = outage["payload"]
+        error_id = str(payload["id"])
+        worker_name = str(payload["context"]["worker"])
+        count = int(payload["context"]["consecutive_takeover_count"])
+        minute_slot = str(payload["context"]["latest_minute_slot"])
         try:
             path = upload_dropbox_error_record(self.settings, payload)
         except Exception as exc:
+            with self.lock:
+                outage["report_in_flight"] = False
+                outage["report_attempts"] += 1
+                attempt = outage["report_attempts"]
+                if attempt <= len(DROPBOX_REPORT_RETRY_DELAYS_SECONDS):
+                    outage["next_report_attempt"] = time.monotonic() + (
+                        DROPBOX_REPORT_RETRY_DELAYS_SECONDS[attempt - 1]
+                    )
             log_event(
                 self.logger,
                 "scheduler_watchdog_dropbox_error_upload_failed",
                 environment=self.environment,
                 worker=worker_name,
-                minute_slot=outage["minute_slot"],
+                minute_slot=minute_slot,
                 consecutive_takeover_count=count,
                 threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
                 error_id=error_id,
                 error_type=type(exc).__name__,
                 message=str(exc)[:500],
+                upload_attempt=attempt,
+                retry_scheduled=(
+                    attempt <= len(DROPBOX_REPORT_RETRY_DELAYS_SECONDS)
+                ),
             )
             return
         if path is None:
+            with self.lock:
+                outage["report_in_flight"] = False
+                outage["report_attempts"] += 1
+                outage["report_not_configured_logged"] = True
+                outage["report_succeeded"] = True
             log_event(
                 self.logger,
                 "scheduler_watchdog_dropbox_error_not_configured",
                 environment=self.environment,
                 worker=worker_name,
-                minute_slot=outage["minute_slot"],
+                minute_slot=minute_slot,
                 consecutive_takeover_count=count,
                 threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
                 error_id=error_id,
             )
             return
+        with self.lock:
+            outage["report_in_flight"] = False
+            outage["report_attempts"] += 1
+            outage["report_succeeded"] = True
         log_event(
             self.logger,
             "scheduler_watchdog_dropbox_error_uploaded",
             environment=self.environment,
             worker=worker_name,
-            minute_slot=outage["minute_slot"],
+            minute_slot=minute_slot,
             consecutive_takeover_count=count,
             threshold=CRON_OUTAGE_THRESHOLD_SLOTS,
             error_id=error_id,
