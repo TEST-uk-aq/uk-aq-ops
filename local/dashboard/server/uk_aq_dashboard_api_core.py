@@ -29,17 +29,12 @@ warnings.filterwarnings(
 )
 import requests
 
-NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 POLLUTANTS = {
-    "pm25": {"label": "PM2.5", "tokens": ("pm25", "pm2.5", "pm2-5", "pm2_5")},
-    "pm10": {"label": "PM10", "tokens": ("pm10",)},
-    "no2": {"label": "NO2", "tokens": ("no2",)},
+    "pm25": {"label": "PM2.5"},
+    "pm10": {"label": "PM10"},
+    "no2": {"label": "NO2"},
 }
 BUCKETS = ("0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days")
-EXCLUDED_CONNECTORS_BY_POLLUTANT = {
-    "pm10": {"breathelondon", "blondon_nodes", "blondon_communities"},
-    "no2": {"sensorcommunity"},
-}
 DISPATCH_OBSERVS_WINDOW_MINUTES = max(
     30,
     int(os.getenv("DISPATCH_OBSERVS_WINDOW_MINUTES", "240")),
@@ -306,16 +301,6 @@ def _invalidate_dashboard_cache(clear_storage_coverage: bool = False) -> None:
             R2_HISTORY_DAYS_CACHE_STATE["bucket"] = None
             R2_HISTORY_DAYS_CACHE_STATE["error"] = None
             R2_HISTORY_DAYS_CACHE_STATE["generated_at"] = None
-
-
-def _normalize_token(value: str) -> str:
-    return NON_ALNUM_RE.sub("", value.lower())
-
-
-NORMALIZED_POLLUTANT_TOKENS = {
-    pollutant_key: tuple(_normalize_token(token) for token in config["tokens"])
-    for pollutant_key, config in POLLUTANTS.items()
-}
 
 
 def _load_env(path: Path) -> None:
@@ -976,6 +961,8 @@ def _post_json_list(
     url: str,
     headers: Dict[str, str],
     body: Dict[str, Any],
+    *,
+    query_name: str = "dashboard_read",
 ) -> List[Dict[str, Any]]:
     started_at = datetime.now(timezone.utc)
     resp = requests.post(url, headers=headers, json=body, timeout=60)
@@ -983,6 +970,7 @@ def _post_json_list(
         resp.url or url,
         resp,
         int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000),
+        query_name=query_name,
     )
     if not resp.ok:
         payload_keys = sorted(body.keys())
@@ -3476,10 +3464,17 @@ def _postgrest_rpc_list(
     schema: str,
     rpc_name: str,
     body: Dict[str, Any],
+    *,
+    query_name: str = "dashboard_read",
 ) -> List[Dict[str, Any]]:
     headers = _postgrest_headers(api_key, write=True, schema=schema)
     headers["Content-Type"] = "application/json"
-    return _post_json_list(f"{rest_url}/rpc/{rpc_name}", headers, body)
+    return _post_json_list(
+        f"{rest_url}/rpc/{rpc_name}",
+        headers,
+        body,
+        query_name=query_name,
+    )
 
 
 def _fetch_obs_aqidb_observations_via_rpc(
@@ -3949,47 +3944,67 @@ def _get_ingest_runs_cached(
     return list(merged)
 
 
-def _is_truthy_flag(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        candidate = value.strip().lower()
-    else:
-        candidate = str(value).strip().lower()
-    return candidate in {"y", "yes", "true", "1"}
+def _dashboard_summary_count(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
 
 
-def _extract_pollutant_key(row: Dict[str, Any]) -> Optional[str]:
-    candidates: List[str] = []
-    phenomenon = row.get("phenomenon") or {}
-    for key in ("notation", "pollutant_label", "label"):
-        value = phenomenon.get(key)
-        if value:
-            candidates.append(str(value))
-    if row.get("label"):
-        candidates.append(str(row["label"]))
+def _build_pollutants_payload(
+    summary_rows: List[Dict[str, Any]],
+    connector_map: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    connectors_by_pollutant: Dict[str, List[Dict[str, Any]]] = {
+        pollutant_key: [] for pollutant_key in POLLUTANTS
+    }
+    for row in summary_rows:
+        pollutant_key = str(row.get("pollutant_code") or "")
+        connectors_payload = connectors_by_pollutant.get(pollutant_key)
+        try:
+            connector_id = int(row.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        if connectors_payload is None:
+            continue
+        connector = connector_map.get(connector_id, {})
+        connectors_payload.append(
+            {
+                "connector_code": row.get("connector_code")
+                or connector.get("connector_code")
+                or "",
+                "label": connector.get("label") or "",
+                "stations_with_pollutant": _dashboard_summary_count(
+                    row.get("stations_with_pollutant")
+                ),
+                "active_stations_with_pollutant": _dashboard_summary_count(
+                    row.get("active_stations_with_pollutant")
+                ),
+                "buckets": {
+                    "0-3 Hours": _dashboard_summary_count(row.get("bucket_0_3_hours")),
+                    "3-6 Hours": _dashboard_summary_count(row.get("bucket_3_6_hours")),
+                    "6-24 Hours": _dashboard_summary_count(row.get("bucket_6_24_hours")),
+                    "1 - 7 Days": _dashboard_summary_count(row.get("bucket_1_7_days")),
+                    "Older than 7 Days": _dashboard_summary_count(
+                        row.get("bucket_older_7_days")
+                    ),
+                },
+            }
+        )
 
-    for candidate in candidates:
-        cleaned = _normalize_token(candidate)
-        for pollutant_key, tokens in NORMALIZED_POLLUTANT_TOKENS.items():
-            for token in tokens:
-                if token in cleaned:
-                    return pollutant_key
-    return None
-
-
-def _bucket_for(latest_at: datetime, now: datetime) -> str:
-    if latest_at >= now - timedelta(hours=3):
-        return "0-3 Hours"
-    if latest_at >= now - timedelta(hours=6):
-        return "3-6 Hours"
-    if latest_at >= now - timedelta(hours=24):
-        return "6-24 Hours"
-    if latest_at >= now - timedelta(days=7):
-        return "1 - 7 Days"
-    return "Older than 7 Days"
+    pollutants_payload: List[Dict[str, Any]] = []
+    for pollutant_key, config in POLLUTANTS.items():
+        connectors_payload = connectors_by_pollutant[pollutant_key]
+        connectors_payload.sort(key=lambda row: row.get("connector_code") or "")
+        pollutants_payload.append(
+            {
+                "key": pollutant_key,
+                "label": config["label"],
+                "connectors": connectors_payload,
+            }
+        )
+    return pollutants_payload
 
 
 def _fetch_storage_coverage_context(
@@ -4122,10 +4137,11 @@ def _build_dashboard(
     headers = _postgrest_headers(service_role_key)
     project_ref = _project_ref_from_base_url(base_url)
     obs_aqidb_project_ref = _project_ref_from_base_url(OBS_AQIDB_SUPABASE_URL)
+    now = datetime.now(timezone.utc)
 
     connectors: List[Dict[str, Any]] = []
     connector_map: Dict[int, Dict[str, Any]] = {}
-    active_station_keys: Dict[Tuple[int, int], bool] = {}
+    ingest_summary_rows: List[Dict[str, Any]] = []
     if include_ingest_context:
         connectors = _fetch_all(
             base_url,
@@ -4144,48 +4160,14 @@ def _build_dashboard(
             for row in connectors
             if row.get("id") is not None
         }
-
-        stations = _fetch_all(
+        ingest_summary_rows = _postgrest_rpc_list(
             base_url,
-            headers,
-            "stations",
-            {
-                "select": "id,connector_id,service_ref,removed_at",
-            },
+            service_role_key,
+            PUBLIC_SCHEMA,
+            "uk_aq_rpc_dashboard_ingest_summary_v1",
+            {"p_as_of": now.isoformat().replace("+00:00", "Z")},
+            query_name="dashboard_ingest_summary",
         )
-        station_metadata = _fetch_all(
-            base_url,
-            headers,
-            "station_metadata",
-            {
-                "select": "station_id,attributes",
-            },
-        )
-        metadata_by_station = {
-            row.get("station_id"): row.get("attributes") or {}
-            for row in station_metadata
-            if row.get("station_id") is not None
-        }
-        for row in stations:
-            station_id = row.get("id")
-            connector_id = row.get("connector_id")
-            if station_id is None or connector_id is None:
-                continue
-            if row.get("removed_at") is not None:
-                active_station_keys[(connector_id, station_id)] = False
-                continue
-            connector_meta = connector_map.get(connector_id, {})
-            connector_code = connector_meta.get("connector_code") or ""
-            service_ref = row.get("service_ref") or ""
-            if connector_code == "breathelondon" and service_ref == "breathelondon":
-                attributes = metadata_by_station.get(station_id, {})
-                enabled_ok = _is_truthy_flag(attributes.get("enabled"))
-                active_ok = _is_truthy_flag(attributes.get("site_active"))
-                active_station_keys[(connector_id, station_id)] = enabled_ok or active_ok
-            else:
-                active_station_keys[(connector_id, station_id)] = True
-
-    now = datetime.now(timezone.utc)
     r2_usage: Optional[Dict[str, Any]] = None
     r2_usage_error: Optional[str] = None
     service_egress_metrics: List[Dict[str, Any]] = []
@@ -4327,96 +4309,11 @@ def _build_dashboard(
         reverse=True,
     )
 
-    timeseries_rows = (
-        _fetch_all(
-            base_url,
-            headers,
-            "timeseries",
-            {
-                "select": "station_id,connector_id,last_value,last_value_at,label,phenomenon:phenomena(label,notation,pollutant_label)",
-                "last_value_at": "not.is.null",
-                "last_value": "not.is.null",
-            },
-        )
+    pollutants_payload = (
+        _build_pollutants_payload(ingest_summary_rows, connector_map)
         if include_ingest_context
         else []
     )
-
-    latest_by_pollutant: Dict[str, Dict[Tuple[int, int], datetime]] = {
-        pollutant_key: {}
-        for pollutant_key in POLLUTANTS.keys()
-    }
-    active_by_pollutant: Dict[str, Dict[Tuple[int, int], bool]] = {
-        pollutant_key: {}
-        for pollutant_key in POLLUTANTS.keys()
-    }
-
-    for row in timeseries_rows:
-        station_id = row.get("station_id")
-        connector_id = row.get("connector_id")
-        if station_id is None or connector_id is None:
-            continue
-        latest_at = _parse_timestamp(row.get("last_value_at"))
-        if not latest_at:
-            continue
-        pollutant_key = _extract_pollutant_key(row)
-        if pollutant_key not in latest_by_pollutant:
-            continue
-        key = (connector_id, station_id)
-        current = latest_by_pollutant[pollutant_key].get(key)
-        if current is None or latest_at > current:
-            latest_by_pollutant[pollutant_key][key] = latest_at
-        if active_station_keys.get(key):
-            active_by_pollutant[pollutant_key][key] = True
-
-    pollutants_payload: List[Dict[str, Any]] = []
-
-    for pollutant_key, config in POLLUTANTS.items():
-        connector_counts: Dict[int, Dict[str, Any]] = {}
-        excluded_connectors = EXCLUDED_CONNECTORS_BY_POLLUTANT.get(pollutant_key, set())
-        for connector_id, meta in connector_map.items():
-            connector_code = meta.get("connector_code") or ""
-            if connector_code in excluded_connectors:
-                continue
-            connector_counts[connector_id] = {
-                "connector_code": meta.get("connector_code") or "",
-                "label": meta.get("label") or "",
-                "stations_with_pollutant": 0,
-                "active_stations_with_pollutant": 0,
-                "buckets": {bucket: 0 for bucket in BUCKETS},
-            }
-
-        for (connector_id, _station_id), latest_at in latest_by_pollutant[pollutant_key].items():
-            meta = connector_map.get(connector_id, {})
-            connector_code = meta.get("connector_code") or ""
-            if connector_code in excluded_connectors:
-                continue
-            bucket = _bucket_for(latest_at, now)
-            entry = connector_counts.setdefault(
-                connector_id,
-                {
-                    "connector_code": "",
-                    "label": "",
-                    "stations_with_pollutant": 0,
-                    "active_stations_with_pollutant": 0,
-                    "buckets": {bucket_name: 0 for bucket_name in BUCKETS},
-                },
-            )
-            entry["stations_with_pollutant"] += 1
-            entry["buckets"][bucket] += 1
-            if active_by_pollutant[pollutant_key].get((connector_id, _station_id)):
-                entry["active_stations_with_pollutant"] += 1
-
-        connectors_payload = list(connector_counts.values())
-        connectors_payload.sort(key=lambda row: row.get("connector_code") or "")
-
-        pollutants_payload.append(
-            {
-                "key": pollutant_key,
-                "label": config["label"],
-                "connectors": connectors_payload,
-            },
-        )
 
     next_dispatch_cursor: Optional[str] = None
     with CACHE_LOCK:

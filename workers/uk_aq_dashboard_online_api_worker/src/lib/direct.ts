@@ -78,14 +78,10 @@ type DropboxMonthStateReference = {
 };
 
 const BUCKETS = ["0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days"] as const;
-const POLLUTANTS: Record<string, { label: string; tokens: string[] }> = {
-  pm25: { label: "PM2.5", tokens: ["pm25", "pm2.5", "pm2-5", "pm2_5"] },
-  pm10: { label: "PM10", tokens: ["pm10"] },
-  no2: { label: "NO2", tokens: ["no2"] },
-};
-const EXCLUDED_CONNECTORS_BY_POLLUTANT: Record<string, Set<string>> = {
-  pm10: new Set(["breathelondon", "blondon_nodes", "blondon_communities"]),
-  no2: new Set(["sensorcommunity"]),
+const POLLUTANTS: Record<string, { label: string }> = {
+  pm25: { label: "PM2.5" },
+  pm10: { label: "PM10" },
+  no2: { label: "NO2" },
 };
 
 const DASHBOARD_TTL_MS = 20_000;
@@ -306,10 +302,6 @@ function toPostgrestTimestamp(value: Date): string {
   return value.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-function normalizeToken(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
 function extractProjectRef(urlValue: string): string | null {
   try {
     const hostname = new URL(urlValue).hostname.toLowerCase();
@@ -448,12 +440,13 @@ async function fetchJsonArray(
   init?: RequestInit,
   errLabel?: string,
   metricEnv?: WorkerEnv,
+  metricQueryName = "dashboard_read",
 ): Promise<unknown[]> {
   const startedAt = Date.now();
   const response = await fetch(url, init);
   const text = await response.text();
   if (metricEnv) {
-    recordDashboardSupabaseResponse(metricEnv, url, response, text, Date.now() - startedAt);
+    recordDashboardSupabaseResponse(metricEnv, url, response, text, Date.now() - startedAt, metricQueryName);
   }
   let parsed: unknown = null;
   try {
@@ -630,38 +623,48 @@ async function fetchAllRows(
   return rows;
 }
 
-function pickPollutantKey(row: JsonObject): string | null {
-  const candidates: string[] = [];
-  const phenomenon = row.phenomenon;
-  if (phenomenon && typeof phenomenon === "object" && !Array.isArray(phenomenon)) {
-    for (const key of ["notation", "pollutant_label", "label"]) {
-      const value = (phenomenon as JsonObject)[key];
-      if (value) {
-        candidates.push(String(value));
-      }
-    }
-  }
-  if (row.label) {
-    candidates.push(String(row.label));
-  }
-  for (const candidate of candidates) {
-    const cleaned = normalizeToken(candidate);
-    for (const [pollutantKey, config] of Object.entries(POLLUTANTS)) {
-      if (config.tokens.some((token) => cleaned.includes(normalizeToken(token)))) {
-        return pollutantKey;
-      }
-    }
-  }
-  return null;
+function dashboardSummaryCount(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
-function bucketFor(latestAt: Date, now: Date): string {
-  const hours = (now.getTime() - latestAt.getTime()) / 3_600_000;
-  if (hours <= 3) return "0-3 Hours";
-  if (hours <= 6) return "3-6 Hours";
-  if (hours <= 24) return "6-24 Hours";
-  if (hours <= 24 * 7) return "1 - 7 Days";
-  return "Older than 7 Days";
+function buildPollutantsPayload(
+  summaryRows: JsonObject[],
+  connectorMap: Map<number, { connector_code: string; label: string }>,
+): JsonObject[] {
+  const connectorsByPollutant = new Map<string, JsonObject[]>();
+  for (const pollutantKey of Object.keys(POLLUTANTS)) {
+    connectorsByPollutant.set(pollutantKey, []);
+  }
+  for (const row of summaryRows) {
+    const pollutantKey = String(row.pollutant_code || "");
+    const connectors = connectorsByPollutant.get(pollutantKey);
+    const connectorId = Number(row.connector_id);
+    if (!connectors || !Number.isFinite(connectorId)) {
+      continue;
+    }
+    const connector = connectorMap.get(connectorId);
+    connectors.push({
+      connector_code: String(row.connector_code || connector?.connector_code || ""),
+      label: connector?.label || "",
+      stations_with_pollutant: dashboardSummaryCount(row.stations_with_pollutant),
+      active_stations_with_pollutant: dashboardSummaryCount(row.active_stations_with_pollutant),
+      buckets: {
+        "0-3 Hours": dashboardSummaryCount(row.bucket_0_3_hours),
+        "3-6 Hours": dashboardSummaryCount(row.bucket_3_6_hours),
+        "6-24 Hours": dashboardSummaryCount(row.bucket_6_24_hours),
+        "1 - 7 Days": dashboardSummaryCount(row.bucket_1_7_days),
+        "Older than 7 Days": dashboardSummaryCount(row.bucket_older_7_days),
+      },
+    });
+  }
+  return Object.entries(POLLUTANTS).map(([pollutantKey, config]) => ({
+    key: pollutantKey,
+    label: config.label,
+    connectors: (connectorsByPollutant.get(pollutantKey) || []).sort((a, b) =>
+      String(a.connector_code || "").localeCompare(String(b.connector_code || "")),
+    ),
+  }));
 }
 
 function cacheGet<T>(entry: CacheEntry<T> | null): T | null {
@@ -1747,7 +1750,7 @@ async function fetchDashboardBaseData(
   const connectorsSettings: unknown[] = [];
   const dispatchRuns: unknown[] = [];
   const connectorMap = new Map<number, { connector_code: string; label: string }>();
-  const activeStationMap = new Map<string, boolean>();
+  const ingestSummaryRows: JsonObject[] = [];
   let dispatcherSettings: JsonObject = {
     id: 1,
     dispatcher_parallel_ingest: false,
@@ -1790,57 +1793,20 @@ async function fetchDashboardBaseData(
       });
     }
 
-    const [stations, stationMetadata] = await Promise.all([
-      fetchAllRows(
-        ingestBase,
-        "stations",
-        headersCore,
-        {
-          select: "id,connector_id,service_ref,removed_at",
-        },
-        1000,
-        env,
-      ),
-      fetchAllRows(
-        ingestBase,
-        "station_metadata",
-        headersCore,
-        {
-          select: "station_id,attributes",
-        },
-        1000,
-        env,
-      ),
-    ]);
-    const metadataByStation = new Map<number, JsonObject>();
-    for (const row of stationMetadata) {
-      const stationId = Number(row.station_id);
-      if (!Number.isFinite(stationId)) {
-        continue;
-      }
-      if (row.attributes && typeof row.attributes === "object" && !Array.isArray(row.attributes)) {
-        metadataByStation.set(stationId, row.attributes as JsonObject);
-      }
-    }
-    for (const row of stations) {
-      const stationId = Number(row.id);
-      const connectorId = Number(row.connector_id);
-      if (!Number.isFinite(stationId) || !Number.isFinite(connectorId)) {
-        continue;
-      }
-      const stationKey = `${connectorId}:${stationId}`;
-      if (row.removed_at) {
-        activeStationMap.set(stationKey, false);
-        continue;
-      }
-      const connectorMeta = connectorMap.get(connectorId);
-      const connectorCode = connectorMeta ? connectorMeta.connector_code : "";
-      const serviceRef = String(row.service_ref || "");
-      if (connectorCode === "breathelondon" && serviceRef === "breathelondon") {
-        const attrs = metadataByStation.get(stationId) || {};
-        activeStationMap.set(stationKey, asTruthy(attrs.enabled) || asTruthy(attrs.site_active));
-      } else {
-        activeStationMap.set(stationKey, true);
+    const summaryRows = await fetchJsonArray(
+      buildUrl(ingestBase, "rpc/uk_aq_rpc_dashboard_ingest_summary_v1"),
+      {
+        method: "POST",
+        headers: postgrestHeaders(serviceKey, defaultPublicSchema(env), true),
+        body: JSON.stringify({ p_as_of: now.toISOString() }),
+      },
+      "Dashboard ingest summary RPC",
+      env,
+      "dashboard_ingest_summary",
+    );
+    for (const row of summaryRows) {
+      if (row && typeof row === "object" && !Array.isArray(row)) {
+        ingestSummaryRows.push(row as JsonObject);
       }
     }
 
@@ -1981,103 +1947,7 @@ async function fetchDashboardBaseData(
 
   const pollutantsPayload: unknown[] = [];
   if (options.includeIngestContext) {
-    const timeseriesRows = await fetchAllRows(
-      ingestBase,
-      "timeseries",
-      headersCore,
-      {
-        select: "station_id,connector_id,last_value,last_value_at,label,phenomenon:phenomena(label,notation,pollutant_label)",
-        last_value_at: "not.is.null",
-        last_value: "not.is.null",
-      },
-      1000,
-      env,
-    );
-    const latestByPollutant: Record<string, Map<string, Date>> = {};
-    const activeByPollutant: Record<string, Set<string>> = {};
-    for (const key of Object.keys(POLLUTANTS)) {
-      latestByPollutant[key] = new Map<string, Date>();
-      activeByPollutant[key] = new Set<string>();
-    }
-    for (const row of timeseriesRows) {
-      const stationId = Number(row.station_id);
-      const connectorId = Number(row.connector_id);
-      if (!Number.isFinite(stationId) || !Number.isFinite(connectorId)) {
-        continue;
-      }
-      const lastValueAt = parseTimestamp(row.last_value_at);
-      if (!lastValueAt) {
-        continue;
-      }
-      const pollutantKey = pickPollutantKey(row);
-      if (!pollutantKey || !latestByPollutant[pollutantKey]) {
-        continue;
-      }
-      const stationKey = `${connectorId}:${stationId}`;
-      const current = latestByPollutant[pollutantKey].get(stationKey);
-      if (!current || lastValueAt.getTime() > current.getTime()) {
-        latestByPollutant[pollutantKey].set(stationKey, lastValueAt);
-      }
-      if (activeStationMap.get(stationKey)) {
-        activeByPollutant[pollutantKey].add(stationKey);
-      }
-    }
-
-    for (const [pollutantKey, config] of Object.entries(POLLUTANTS)) {
-      const connectorCounts = new Map<number, JsonObject>();
-      const excluded = EXCLUDED_CONNECTORS_BY_POLLUTANT[pollutantKey] || new Set<string>();
-      for (const [connectorId, meta] of connectorMap.entries()) {
-        if (excluded.has(meta.connector_code)) {
-          continue;
-        }
-        connectorCounts.set(connectorId, {
-          connector_code: meta.connector_code,
-          label: meta.label,
-          stations_with_pollutant: 0,
-          active_stations_with_pollutant: 0,
-          buckets: Object.fromEntries(BUCKETS.map((bucket) => [bucket, 0])),
-        });
-      }
-      for (const [stationKey, latestAt] of latestByPollutant[pollutantKey].entries()) {
-        const [connectorPart] = stationKey.split(":");
-        const connectorId = Number(connectorPart);
-        if (!Number.isFinite(connectorId)) {
-          continue;
-        }
-        const meta = connectorMap.get(connectorId);
-        if (meta && excluded.has(meta.connector_code)) {
-          continue;
-        }
-        if (!connectorCounts.has(connectorId)) {
-          connectorCounts.set(connectorId, {
-            connector_code: meta?.connector_code || "",
-            label: meta?.label || "",
-            stations_with_pollutant: 0,
-            active_stations_with_pollutant: 0,
-            buckets: Object.fromEntries(BUCKETS.map((bucket) => [bucket, 0])),
-          });
-        }
-        const row = connectorCounts.get(connectorId);
-        if (!row) {
-          continue;
-        }
-        row.stations_with_pollutant = Number(row.stations_with_pollutant || 0) + 1;
-        const bucket = bucketFor(latestAt, now);
-        const buckets = row.buckets as JsonObject;
-        buckets[bucket] = Number(buckets[bucket] || 0) + 1;
-        if (activeByPollutant[pollutantKey].has(stationKey)) {
-          row.active_stations_with_pollutant = Number(row.active_stations_with_pollutant || 0) + 1;
-        }
-      }
-      const connectors = Array.from(connectorCounts.values()).sort((a, b) =>
-        String(a.connector_code || "").localeCompare(String(b.connector_code || "")),
-      );
-      pollutantsPayload.push({
-        key: pollutantKey,
-        label: config.label,
-        connectors,
-      });
-    }
+    pollutantsPayload.push(...buildPollutantsPayload(ingestSummaryRows, connectorMap));
   }
 
   let db_size_metrics: unknown[] = [];
