@@ -2686,11 +2686,11 @@
       }
 
       function formatSeries(run) {
-        if (run.series_polled !== null && run.series_polled !== undefined) {
-          return formatCount(run.series_polled);
-        }
         if (run.timeseries_updated !== null && run.timeseries_updated !== undefined) {
           return formatCount(run.timeseries_updated);
+        }
+        if (run.series_polled !== null && run.series_polled !== undefined) {
+          return formatCount(run.series_polled);
         }
         return "n/a";
       }
