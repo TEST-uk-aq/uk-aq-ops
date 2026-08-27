@@ -31,7 +31,7 @@ test("active runtime and current docs do not depend on retired relations", () =>
     path.resolve(root, "../TEST-uk-aq.github.io"),
   ];
   const allowed = new Set([
-    "schemas/migrations/v0.2.0/ingestdb/011_remove_legacy_network_relations.sql",
+    "schemas/migrations/pending_existing_db_upgrades/011_remove_legacy_network_relations.sql",
     "docs/v0.2.0_schema_migration_notes.md",
     "system_docs/uk-aq-latest-snapshot.md",
     "workers/uk_aq_latest_snapshot_cloud_run/README.md",
