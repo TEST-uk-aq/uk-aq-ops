@@ -2554,38 +2554,18 @@
         if (payload && asBoolean(payload.rate_limit_stop)) {
           return "Rate-limit";
         }
-        if (payload && payload.partial === true) {
-          return "Budget Limit";
-        }
         if (budgetReasons.has(stoppedReason)) {
           return "Budget Limit";
         }
-        const gapRequestsSkippedBudget = payloadNumber(payload, ["gap_requests_skipped_budget"]);
-        if (gapRequestsSkippedBudget !== null && gapRequestsSkippedBudget > 0) {
-          return "Budget Limit";
-        }
-        const requestsTotal = payloadNumber(payload, ["requests_total"]);
-        const maxRequestsPerRun = payloadNumber(payload, ["max_requests_per_run"]);
-        if (
-          requestsTotal !== null &&
-          maxRequestsPerRun !== null &&
-          maxRequestsPerRun > 0 &&
-          requestsTotal >= maxRequestsPerRun
-        ) {
-          return "Budget Limit";
-        }
         const message = String(run && run.run_message || "").toLowerCase();
+        if (String(run && run.run_status || "").toLowerCase() === "partial" && message === "species_errors") {
+          return "Species Errors";
+        }
         if (rateLimitReasons.has(message)) {
           return "Rate-limit";
         }
         if (message.includes("rate limit")) {
           return "Rate-limit";
-        }
-        if (budgetReasons.has(message)) {
-          return "Budget Limit";
-        }
-        if (message.includes("budget limit") || message.includes("request budget")) {
-          return "Budget Limit";
         }
         return null;
       }
@@ -2629,7 +2609,7 @@
           if (partialDetail === "HTTP 502 Gateway Failure") {
             return { className: "failed", label: "Failed", detail: partialDetail };
           }
-          return { className: "partial", label: "Partial Run", detail: partialDetail || "Budget Limit" };
+          return { className: "partial", label: "Partial Run", detail: partialDetail };
         }
         if (hasHttp502GatewayFailure(run)) {
           return { className: "failed", label: "Failed", detail: "HTTP 502 Gateway Failure" };
