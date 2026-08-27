@@ -262,7 +262,12 @@ function checkpointFileIdentity(checkpointPath) {
   });
 }
 
-function recoveryManifestPayload({ checkpointPath, checkpoint, repositoryRoot }) {
+function recoveryManifestPayload({
+  checkpointPath,
+  checkpoint,
+  repositoryRoot,
+  recoveryImplementation = null,
+}) {
   const plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
   return Object.freeze({
     original_checkpoint: checkpointFileIdentity(checkpointPath),
@@ -270,7 +275,8 @@ function recoveryManifestPayload({ checkpointPath, checkpoint, repositoryRoot })
     migration_run_id: plan.migration_run_id,
     plan_sha256: plan.plan_sha256,
     target_writer_git_sha: plan.target_writer_git_sha,
-    recovery_implementation: recoveryImplementationIdentity(repositoryRoot),
+    recovery_implementation:
+      recoveryImplementation || recoveryImplementationIdentity(repositoryRoot),
   });
 }
 
@@ -421,25 +427,29 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   repositoryRoot,
   create = false,
   repairHead = false,
+  requireCurrentImplementation = true,
 }) {
   const paths = recoveryProgressPaths(checkpointPath);
-  const expectedManifestPayload = recoveryManifestPayload({
-    checkpointPath,
-    checkpoint,
-    repositoryRoot,
-  });
   if (!fs.existsSync(paths.manifest)) {
     if (!create) throw new Error("Recovery progress manifest is missing; run resume preflight first");
     fs.mkdirSync(paths.root, { recursive: true, mode: 0o700 });
     atomicWriteJson(paths.manifest, recoveryEnvelope(
       "uk_aq_observation_history_v3_recovery_manifest",
-      expectedManifestPayload,
+      recoveryManifestPayload({ checkpointPath, checkpoint, repositoryRoot }),
     ));
   }
   const manifest = readRecoveryEnvelope(
     paths.manifest,
     "uk_aq_observation_history_v3_recovery_manifest",
   );
+  const expectedManifestPayload = recoveryManifestPayload({
+    checkpointPath,
+    checkpoint,
+    repositoryRoot,
+    recoveryImplementation: requireCurrentImplementation
+      ? null
+      : manifest.payload.recovery_implementation,
+  });
   if (stableMigrationJson(manifest.payload) !== stableMigrationJson(expectedManifestPayload)) {
     throw new Error("Recovery manifest does not match the original checkpoint or current recovery code");
   }
@@ -724,6 +734,220 @@ function summaryForPlan(plan) {
   };
 }
 
+const REPORT_LIST_LIMIT = 100;
+const REPORT_STRING_LIMIT = 2_000;
+
+function compactReportString(value) {
+  const text = String(value);
+  if (text.length <= REPORT_STRING_LIMIT) return text;
+  return `${text.slice(0, REPORT_STRING_LIMIT)}...[truncated]`;
+}
+
+function boundedReportList(values) {
+  const entries = Array.isArray(values) ? values : [];
+  return {
+    entries: entries.slice(0, REPORT_LIST_LIMIT),
+    total_count: entries.length,
+    omitted_count: Math.max(0, entries.length - REPORT_LIST_LIMIT),
+  };
+}
+
+function compactVerificationReport(verification) {
+  if (!verification) return null;
+  const blockers = boundedReportList(
+    (verification.blockers || []).map(compactReportString),
+  );
+  return {
+    ok: verification.ok,
+    cutover_ready: verification.cutover_ready,
+    blockers: blockers.entries,
+    blocker_count: blockers.total_count,
+    blockers_omitted: blockers.omitted_count,
+    partition_count: verification.partition_count,
+    v3_child_count: verification.v3_child_count,
+    v3_scoped_root_count: verification.v3_scoped_root_count,
+    v3_latest_count: verification.v3_latest_count,
+    r2_stored_sha_verification: verification.r2_stored_sha_verification,
+    scoped_root_child_verification:
+      verification.scoped_root_child_verification,
+  };
+}
+
+function sumReportField(entries, field) {
+  return entries.reduce((total, entry) => {
+    const value = entry?.[field];
+    return Number.isSafeInteger(value) && value >= 0 ? total + value : total;
+  }, 0);
+}
+
+function partitionResultSummary(partitions) {
+  const entries = Array.isArray(partitions) ? partitions : [];
+  const verificationStatusCounts = {};
+  for (const entry of entries) {
+    for (const [status, count] of Object.entries(
+      entry?.verification_status_counts || {},
+    )) {
+      if (Number.isSafeInteger(count) && count >= 0) {
+        verificationStatusCounts[status] =
+          (verificationStatusCounts[status] || 0) + count;
+      }
+    }
+  }
+  return {
+    partition_count: entries.length,
+    row_count_match_count: entries.filter(
+      (entry) => entry.old_row_count === entry.new_row_count,
+    ).length,
+    observation_content_hash_match_count: entries.filter(
+      (entry) =>
+        entry.old_observation_content_hash === entry.new_observation_content_hash,
+    ).length,
+    old_row_count_total: sumReportField(entries, "old_row_count"),
+    new_row_count_total: sumReportField(entries, "new_row_count"),
+    old_file_count_total: sumReportField(entries, "old_file_count"),
+    new_file_count_total: sumReportField(entries, "new_file_count"),
+    new_row_group_count_total: sumReportField(entries, "new_row_group_count"),
+    verification_status_counts: verificationStatusCounts,
+    partition_details_excluded: true,
+  };
+}
+
+function completedObjectCounts(checkpoint) {
+  const counts = {
+    parquet: 0,
+    canonical_manifest: 0,
+    v3_child_shard: 0,
+    v3_scoped_manifest: 0,
+    v3_latest_global: 0,
+    other: 0,
+  };
+  const completed = Object.entries(checkpoint?.completed_objects || {});
+  for (const [key, evidence] of completed) {
+    const stage = evidence?.publication_stage || evidence?.stage || "";
+    if (key.endsWith(".parquet")) counts.parquet += 1;
+    else if (stage === "child_shard") counts.v3_child_shard += 1;
+    else if (stage === "scoped_manifest") counts.v3_scoped_manifest += 1;
+    else if (stage === "latest_global") counts.v3_latest_global += 1;
+    else if (key.endsWith("/manifest.json")) counts.canonical_manifest += 1;
+    else counts.other += 1;
+  }
+  return {
+    total: completed.length,
+    ...counts,
+  };
+}
+
+function parquetEvidenceSummary(parquetEvidence) {
+  const entries = Array.isArray(parquetEvidence) ? parquetEvidence : [];
+  return {
+    object_count: entries.length,
+    total_bytes: sumReportField(entries, "byte_size"),
+    stored_sha256_verified_count: entries.filter(
+      (entry) => entry.stored_sha256_verified === true,
+    ).length,
+    reused_count: entries.filter((entry) => entry.reused === true).length,
+    published_count: entries.filter((entry) => entry.reused !== true).length,
+    object_details_excluded: true,
+  };
+}
+
+function v3PublicationSummary(publication) {
+  if (!publication) return null;
+  const objects = Array.isArray(publication.objects) ? publication.objects : [];
+  const publicationStageCounts = {};
+  for (const entry of objects) {
+    const stage = String(entry?.publication_stage || "unknown");
+    publicationStageCounts[stage] = (publicationStageCounts[stage] || 0) + 1;
+  }
+  return {
+    ok: publication.ok,
+    status: publication.status,
+    schedule_sha256: publication.schedule_sha256,
+    published_object_count: publication.published_object_count,
+    publication_stage_counts: publicationStageCounts,
+    verified_object_count: objects.filter((entry) => entry.verified === true).length,
+    durable_object_count: objects.filter((entry) => entry.durable === true).length,
+    object_details_excluded: true,
+  };
+}
+
+function checkpointSummary(checkpoint) {
+  if (!checkpoint) return null;
+  return {
+    migration_run_id: checkpoint.migration_run_id,
+    authority_sha256: checkpoint.authority_sha256,
+    plan_sha256: checkpoint.plan_sha256,
+    full_verification_complete: checkpoint.full_verification_complete === true,
+    cutover_ready: checkpoint.cutover_ready === true,
+    prepared_unit_count: Object.keys(checkpoint.prepared_units || {}).length,
+    completed_object_count: Object.keys(checkpoint.completed_objects || {}).length,
+    completed_object_counts: completedObjectCounts(checkpoint),
+    checkpoint_details_excluded: true,
+  };
+}
+
+function compactMigrationResult(result, mode, checkpoint) {
+  if (mode === "verify") {
+    return {
+      ...compactVerificationReport(result),
+      checkpoint_summary: checkpointSummary(checkpoint),
+    };
+  }
+  if (result?.ok === false) {
+    return {
+      ok: false,
+      status: result.status,
+      error: compactReportString(result.error || "operation failed"),
+      verification: compactVerificationReport(result.verification),
+      checkpoint_summary: checkpointSummary(checkpoint),
+    };
+  }
+  if (mode === "migrate") {
+    return {
+      ok: result?.ok,
+      status: result?.status,
+      dry_run: result?.dry_run,
+      checkpoint_summary: checkpointSummary(result?.checkpoint || checkpoint),
+      parquet_evidence_summary: parquetEvidenceSummary(result?.parquet_evidence),
+      v3_publication: v3PublicationSummary(result?.v3_publication),
+      verification: compactVerificationReport(result?.verification),
+    };
+  }
+  return result;
+}
+
+function compactMigrationAudit(audit) {
+  const {
+    partition_results: partitionResults = [],
+    empty_source_connectors: emptySourceConnectors = [],
+    blockers: rawBlockers = [],
+    ...compact
+  } = audit;
+  const emptyConnectors = boundedReportList(emptySourceConnectors);
+  const blockers = boundedReportList(rawBlockers.map(compactReportString));
+  return {
+    ...compact,
+    empty_source_connectors: emptyConnectors.entries,
+    empty_source_connectors_omitted: emptyConnectors.omitted_count,
+    partition_result_summary: partitionResultSummary(partitionResults),
+    blockers: blockers.entries,
+    blocker_count: blockers.total_count,
+    blockers_omitted: blockers.omitted_count,
+  };
+}
+
+export function buildObservationHistoryV3ReportOutput({
+  result,
+  audit,
+  mode,
+  checkpoint = null,
+}) {
+  return {
+    result: compactMigrationResult(result, mode, checkpoint),
+    audit: compactMigrationAudit(audit),
+  };
+}
+
 function buildR2Adapters({
   config,
   checkpointOut,
@@ -955,6 +1179,7 @@ export async function runObservationHistoryMigrationV3({
       checkpointPath: args.checkpointIn,
       checkpoint,
       repositoryRoot,
+      requireCurrentImplementation: args.mode !== "verify",
     });
     checkpoint = recoveryProgress.checkpoint;
   }
@@ -1080,7 +1305,12 @@ export async function runObservationHistoryMigrationV3({
         ? { required: true, status: "failed" }
         : null,
     });
-    atomicWriteJson(args.reportOut, { result: failure, audit: failedAudit });
+    atomicWriteJson(args.reportOut, buildObservationHistoryV3ReportOutput({
+      result: failure,
+      audit: failedAudit,
+      mode: args.mode,
+      checkpoint,
+    }));
     throw error;
   }
   const completedAt = now();
@@ -1089,10 +1319,19 @@ export async function runObservationHistoryMigrationV3({
     mode: args.mode,
     startedAt,
     completedAt,
-    execution: args.mode === "migrate" ? result : null,
+    execution: args.mode === "migrate"
+      ? result
+      : args.mode === "verify"
+        ? { verification: result, v3_publication: { ok: true } }
+        : null,
     rollback,
   });
-  const output = { result, audit };
+  const output = buildObservationHistoryV3ReportOutput({
+    result,
+    audit,
+    mode: args.mode,
+    checkpoint,
+  });
   atomicWriteJson(args.reportOut, output);
   return output;
 }

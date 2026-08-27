@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -64,6 +66,10 @@ import {
 import {
   buildObservationsManifestHierarchy,
 } from "../scripts/backup_r2/uk_aq_observations_manifest_hierarchy.mjs";
+import {
+  buildObservationHistoryV3RecoveryProgressContext,
+  buildObservationHistoryV3ReportOutput,
+} from "../scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs";
 
 const REPOSITORY_ROOT = path.resolve(import.meta.dirname, "..");
 const PREFIX = "history/v2/observations";
@@ -2067,4 +2073,249 @@ test("Phase 4 rejects a checkpoint whose immutable authority was tampered", asyn
     }),
     /immutable authority is missing or invalid/,
   );
+});
+
+function syntheticMigrationAudit(partitionCount = 1, blockers = []) {
+  return {
+    schema_version: 1,
+    kind: "uk_aq_observation_history_v3_migration_audit",
+    environment: "TEST",
+    migration_run_id: "synthetic-report-run",
+    partitions_attempted: partitionCount,
+    partitions_succeeded: partitionCount,
+    partitions_failed: 0,
+    empty_source_connector_count: 0,
+    empty_source_connectors: [],
+    partition_results: Array.from({ length: partitionCount }, (_, index) => ({
+      scope: { connector_id: 1, pollutant_code: `p${index}` },
+      old_row_count: 10,
+      new_row_count: 10,
+      old_observation_content_hash: "a".repeat(64),
+      new_observation_content_hash: "a".repeat(64),
+      old_file_count: 2,
+      new_file_count: 1,
+      new_row_group_count: 1,
+      verification_status_counts: { verified: 10 },
+      deliberately_large_detail: "x".repeat(1_000),
+    })),
+    publication_verification: true,
+    cutover_ready: true,
+    rollback_ready: true,
+    blockers,
+  };
+}
+
+function syntheticMigrationResult(objectCount = 1) {
+  const checkpointEntries = Object.fromEntries(
+    Array.from({ length: objectCount }, (_, index) => [
+      `history/v2/observations/object-${index}.parquet`,
+      { byte_size: 50, deliberately_large_detail: "x".repeat(1_000) },
+    ]),
+  );
+  const preparedUnits = Object.fromEntries(
+    Array.from({ length: objectCount }, (_, index) => [
+      `unit-${index}`,
+      { deliberately_large_detail: "x".repeat(1_000) },
+    ]),
+  );
+  return {
+    ok: true,
+    status: "cutover_ready",
+    dry_run: false,
+    checkpoint: {
+      migration_run_id: "synthetic-report-run",
+      authority_sha256: "b".repeat(64),
+      plan_sha256: "c".repeat(64),
+      full_verification_complete: true,
+      cutover_ready: true,
+      prepared_units: preparedUnits,
+      completed_objects: checkpointEntries,
+    },
+    parquet_evidence: Array.from({ length: objectCount }, (_, index) => ({
+      key: `history/v2/observations/object-${index}.parquet`,
+      byte_size: 50,
+      stored_sha256_verified: true,
+      reused: index % 2 === 0,
+      deliberately_large_detail: "x".repeat(1_000),
+    })),
+    v3_publication: {
+      ok: true,
+      status: "succeeded",
+      schedule_sha256: "d".repeat(64),
+      published_object_count: objectCount,
+      objects: Array.from({ length: objectCount }, (_, index) => ({
+        key: `history/_index_v3/child-${index}.json`,
+        publication_stage: "child_shard",
+        verified: true,
+        durable: true,
+        deliberately_large_detail: "x".repeat(1_000),
+      })),
+    },
+    verification: {
+      ok: true,
+      cutover_ready: true,
+      blockers: [],
+      partition_count: objectCount,
+      v3_child_count: objectCount,
+      v3_scoped_root_count: objectCount,
+      v3_latest_count: 1,
+      r2_stored_sha_verification: "verified",
+      scoped_root_child_verification: "verified",
+    },
+  };
+}
+
+test("migration report output excludes large execution and partition detail", () => {
+  const output = buildObservationHistoryV3ReportOutput({
+    result: syntheticMigrationResult(500),
+    audit: syntheticMigrationAudit(500),
+    mode: "migrate",
+  });
+  assert.equal(Object.hasOwn(output.result, "checkpoint"), false);
+  assert.equal(Object.hasOwn(output.result, "parquet_evidence"), false);
+  assert.equal(Object.hasOwn(output.result.v3_publication, "objects"), false);
+  assert.equal(Object.hasOwn(output.audit, "partition_results"), false);
+  assert.equal(output.result.checkpoint_summary.full_verification_complete, true);
+  assert.equal(output.result.checkpoint_summary.cutover_ready, true);
+  assert.equal(output.result.checkpoint_summary.prepared_unit_count, 500);
+  assert.equal(output.result.checkpoint_summary.completed_object_count, 500);
+  assert.equal(output.result.parquet_evidence_summary.object_count, 500);
+  assert.equal(output.result.v3_publication.published_object_count, 500);
+  assert.equal(output.result.v3_publication.publication_stage_counts.child_shard, 500);
+  assert.equal(output.audit.partition_result_summary.partition_count, 500);
+  assert.equal(output.audit.partition_result_summary.row_count_match_count, 500);
+  assert.equal(
+    output.audit.partition_result_summary.observation_content_hash_match_count,
+    500,
+  );
+  assert.ok(stableMigrationJson(output).length < 20_000);
+});
+
+test("small success, failure and verify reports retain bounded evidence", () => {
+  const success = buildObservationHistoryV3ReportOutput({
+    result: syntheticMigrationResult(),
+    audit: syntheticMigrationAudit(),
+    mode: "migrate",
+  });
+  assert.equal(success.result.ok, true);
+  assert.equal(success.result.status, "cutover_ready");
+  assert.equal(success.result.verification.r2_stored_sha_verification, "verified");
+  assert.equal(success.audit.publication_verification, true);
+  assert.equal(success.audit.rollback_ready, true);
+
+  const manyBlockers = Array.from(
+    { length: 150 },
+    (_, index) => `synthetic_blocker_${index}:${"x".repeat(3_000)}`,
+  );
+  const failure = buildObservationHistoryV3ReportOutput({
+    result: {
+      ok: false,
+      status: "failed",
+      error: "x".repeat(3_000),
+      verification: { blockers: manyBlockers },
+    },
+    audit: syntheticMigrationAudit(500, manyBlockers),
+    mode: "migrate",
+  });
+  assert.equal(failure.result.error.endsWith("...[truncated]"), true);
+  assert.equal(failure.result.verification.blockers.length, 100);
+  assert.equal(failure.result.verification.blockers_omitted, 50);
+  assert.equal(failure.audit.blockers.length, 100);
+  assert.equal(failure.audit.blockers_omitted, 50);
+  assert.ok(stableMigrationJson(failure).length < 500_000);
+
+  const verify = buildObservationHistoryV3ReportOutput({
+    result: {
+      ok: false,
+      cutover_ready: false,
+      blockers: manyBlockers,
+      partition_count: 500,
+      r2_stored_sha_verification: "failed",
+    },
+    audit: syntheticMigrationAudit(500, manyBlockers),
+    mode: "verify",
+    checkpoint: syntheticMigrationResult().checkpoint,
+  });
+  assert.equal(verify.result.partition_count, 500);
+  assert.equal(verify.result.blockers.length, 100);
+  assert.equal(verify.result.blockers_omitted, 50);
+  assert.equal(verify.result.checkpoint_summary.prepared_unit_count, 1);
+  assert.equal(Object.hasOwn(verify.audit, "partition_results"), false);
+  assert.ok(stableMigrationJson(verify).length < 500_000);
+});
+
+test("recovery journal schema and final-state replay remain structurally compatible", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture);
+  const adapters = memoryAdapters(fixture, { failPutCall: 1 });
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters,
+    }),
+    /deliberate PUT failure 1/,
+  );
+  const originalCheckpoint = structuredClone(adapters.checkpoints.at(-1));
+  const temporaryRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "uk-aq-v3-report-recovery-"),
+  );
+  try {
+    const checkpointPath = path.join(temporaryRoot, "migration_checkpoint.json");
+    fs.writeFileSync(checkpointPath, stableMigrationJson(originalCheckpoint), {
+      mode: 0o600,
+    });
+    const context = buildObservationHistoryV3RecoveryProgressContext({
+      checkpointPath,
+      checkpoint: originalCheckpoint,
+      repositoryRoot: REPOSITORY_ROOT,
+      create: true,
+    });
+    const completedCheckpoint = structuredClone(context.checkpoint);
+    completedCheckpoint.full_verification_complete = true;
+    completedCheckpoint.cutover_ready = true;
+    await context.persistCheckpoint(completedCheckpoint);
+
+    const manifest = JSON.parse(fs.readFileSync(context.paths.manifest, "utf8"));
+    manifest.payload.recovery_implementation.repository_head =
+      "synthetic-prior-reporting-implementation";
+    manifest.payload_sha256 = sha256Hex(stableMigrationJson(manifest.payload));
+    fs.writeFileSync(context.paths.manifest, stableMigrationJson(manifest), {
+      mode: 0o600,
+    });
+    assert.throws(
+      () => buildObservationHistoryV3RecoveryProgressContext({
+        checkpointPath,
+        checkpoint: originalCheckpoint,
+        repositoryRoot: REPOSITORY_ROOT,
+      }),
+      /Recovery manifest does not match/,
+    );
+    const replayed = buildObservationHistoryV3RecoveryProgressContext({
+      checkpointPath,
+      checkpoint: originalCheckpoint,
+      repositoryRoot: REPOSITORY_ROOT,
+      requireCurrentImplementation: false,
+    });
+    assert.equal(replayed.sequence, 1);
+    assert.equal(replayed.checkpoint.full_verification_complete, true);
+    assert.equal(replayed.checkpoint.cutover_ready, true);
+    const journalEntry = JSON.parse(fs.readFileSync(
+      path.join(replayed.paths.entries, "0000000001.json"),
+      "utf8",
+    ));
+    assert.equal(journalEntry.schema_version, 1);
+    assert.equal(
+      journalEntry.kind,
+      "uk_aq_observation_history_v3_recovery_entry",
+    );
+    assert.deepEqual(journalEntry.payload.updates.final_state, {
+      cutover_ready: true,
+      full_verification_complete: true,
+    });
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
 });
