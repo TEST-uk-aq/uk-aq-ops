@@ -2558,9 +2558,7 @@
           return "Budget Limit";
         }
         const message = String(run && run.run_message || "").toLowerCase();
-        if (String(run && run.run_status || "").toLowerCase() === "partial" && message === "species_errors") {
-          return "Species Errors";
-        }
+		
         if (rateLimitReasons.has(message)) {
           return "Rate-limit";
         }
