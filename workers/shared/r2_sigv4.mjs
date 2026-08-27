@@ -6,6 +6,42 @@ const R2_REQUEST_MAX_ATTEMPTS = 4;
 const R2_REQUEST_RETRY_BASE_MS = 500;
 const R2_REQUEST_RETRY_MAX_MS = 5000;
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+const R2_REQUEST_ERROR_CAUSE_MAX_DEPTH = 8;
+const R2_RETRYABLE_ERROR_CODES = new Set([
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+const R2_RETRYABLE_ERROR_TOKENS = [
+  "connection reset",
+  "connection closed",
+  "broken pipe",
+  "socket hang up",
+  "socket closed",
+  "socket reset",
+  "econnreset",
+  "econnrefused",
+  "ehostunreach",
+  "enetunreach",
+  "etimedout",
+  "timed out",
+  "timeout",
+  "networkerror",
+  "network error",
+  "sendrequest",
+  "temporarily unavailable",
+  "tls",
+  "eof",
+];
 
 export function encodeRfc3986(value) {
   return encodeURIComponent(value).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
@@ -242,30 +278,55 @@ function isRetryableR2Status(status) {
   return R2_RETRYABLE_STATUS_CODES.has(status);
 }
 
-function isRetryableR2RequestError(error) {
-  const message = String(error instanceof Error ? error.message : error || "")
-    .toLowerCase();
-  if (!message) {
-    return false;
+function r2RequestErrorField(error, field) {
+  try {
+    const value = error?.[field];
+    return typeof value === "string" || typeof value === "number"
+      ? String(value).trim()
+      : "";
+  } catch {
+    return "";
   }
-  return [
-    "connection reset",
-    "connection closed",
-    "broken pipe",
-    "socket hang up",
-    "econnreset",
-    "econnrefused",
-    "ehostunreach",
-    "etimedout",
-    "timed out",
-    "timeout",
-    "networkerror",
-    "network error",
-    "sendrequest",
-    "temporarily unavailable",
-    "tls",
-    "eof",
-  ].some((token) => message.includes(token));
+}
+
+function isRetryableR2RequestError(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; depth < R2_REQUEST_ERROR_CAUSE_MAX_DEPTH; depth += 1) {
+    const isObject = (
+      current !== null &&
+      (typeof current === "object" || typeof current === "function")
+    );
+    if (isObject) {
+      if (seen.has(current)) break;
+      seen.add(current);
+    }
+    const name = isObject ? r2RequestErrorField(current, "name") : "";
+    const message = isObject
+      ? r2RequestErrorField(current, "message")
+      : String(current ?? "").trim();
+    const code = isObject ? r2RequestErrorField(current, "code") : "";
+    if (R2_RETRYABLE_ERROR_CODES.has(code.toUpperCase())) {
+      return true;
+    }
+    // Node/Undici uses this exact TypeError as its generic transport wrapper,
+    // including when the underlying cause was not preserved by the caller.
+    if (name.toLowerCase() === "typeerror" && message.toLowerCase() === "fetch failed") {
+      return true;
+    }
+    const description = `${name} ${message} ${code}`.toLowerCase();
+    if (R2_RETRYABLE_ERROR_TOKENS.some((token) => description.includes(token))) {
+      return true;
+    }
+    if (!isObject) break;
+    try {
+      current = current.cause;
+    } catch {
+      break;
+    }
+    if (current === null || current === undefined) break;
+  }
+  return false;
 }
 
 function computeR2RetryDelayMs(attempt) {

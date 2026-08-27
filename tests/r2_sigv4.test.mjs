@@ -85,6 +85,108 @@ test("r2PutObject retries a transient connection reset and succeeds", async () =
   }
 });
 
+test("r2PutObject retries nested Node fetch and Undici transport failures", async (t) => {
+  const cases = [
+    {
+      name: "fetch failed with ECONNRESET cause",
+      error: new TypeError("fetch failed", {
+        cause: Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
+      }),
+    },
+    {
+      name: "nested Undici connect timeout",
+      error: new Error("request failed", {
+        cause: Object.assign(new Error("connect timeout"), {
+          code: "UND_ERR_CONNECT_TIMEOUT",
+        }),
+      }),
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async () => {
+      const restoreSleep = installImmediateSleep();
+      const originalFetch = globalThis.fetch;
+      let attempts = 0;
+      let firstBody = null;
+      globalThis.fetch = async (_url, init) => {
+        attempts += 1;
+        if (attempts === 1) {
+          firstBody = init.body;
+          throw testCase.error;
+        }
+        assert.equal(init.body, firstBody);
+        return new Response("", { status: 200 });
+      };
+
+      try {
+        await r2PutObject({
+          r2: TEST_R2_CONFIG,
+          key: `history/v2/test/${testCase.name}.json`,
+          body: Buffer.from("deterministic-body"),
+        });
+        assert.equal(attempts, 2);
+      } finally {
+        globalThis.fetch = originalFetch;
+        restoreSleep();
+      }
+    });
+  }
+});
+
+test("r2PutObject stops after four retryable fetch failures", async () => {
+  const restoreSleep = installImmediateSleep();
+  const originalFetch = globalThis.fetch;
+  const fetchFailure = new TypeError("fetch failed");
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    throw fetchFailure;
+  };
+
+  try {
+    await assert.rejects(
+      () => r2PutObject({
+        r2: TEST_R2_CONFIG,
+        key: "history/v2/test/max-attempts.json",
+        body: "payload",
+      }),
+      (error) => error === fetchFailure,
+    );
+    assert.equal(attempts, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreSleep();
+  }
+});
+
+test("r2PutObject does not retry an unrelated cyclic programming error", async () => {
+  const restoreSleep = installImmediateSleep();
+  const originalFetch = globalThis.fetch;
+  const programmingError = new TypeError("invalid local request state");
+  programmingError.cause = programmingError;
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    throw programmingError;
+  };
+
+  try {
+    await assert.rejects(
+      () => r2PutObject({
+        r2: TEST_R2_CONFIG,
+        key: "history/v2/test/programming-error.json",
+        body: "payload",
+      }),
+      (error) => error === programmingError,
+    );
+    assert.equal(attempts, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreSleep();
+  }
+});
+
 test("r2PutObject retries retryable HTTP failures and then succeeds", async () => {
   const restoreSleep = installImmediateSleep();
   const originalFetch = globalThis.fetch;
@@ -116,27 +218,27 @@ test("r2PutObject retries retryable HTTP failures and then succeeds", async () =
   }
 });
 
-test("r2PutObject does not retry non-retryable client failures", async () => {
+test("r2PutObject does not retry ordinary non-retryable client failures", async () => {
   const restoreSleep = installImmediateSleep();
   const originalFetch = globalThis.fetch;
-  let attempts = 0;
-
-  globalThis.fetch = async () => {
-    attempts += 1;
-    return new Response("bad request", { status: 400 });
-  };
 
   try {
-    await assert.rejects(
-      () =>
-        r2PutObject({
+    for (const status of [400, 401, 403, 404]) {
+      let attempts = 0;
+      globalThis.fetch = async () => {
+        attempts += 1;
+        return new Response("client failure", { status });
+      };
+      await assert.rejects(
+        () => r2PutObject({
           r2: TEST_R2_CONFIG,
-          key: "history/v1/aqilevels/hourly/day_utc=2025-07-27/connector_id=3/part-00000.parquet",
+          key: `history/v2/test/http-${status}.json`,
           body: "payload",
         }),
-      /R2 PUT failed \(400\)/,
-    );
-    assert.equal(attempts, 1);
+        new RegExp(`R2 PUT failed \\(${status}\\)`),
+      );
+      assert.equal(attempts, 1);
+    }
   } finally {
     globalThis.fetch = originalFetch;
     restoreSleep();

@@ -108,7 +108,6 @@ TARGET_OUTPUT_PATHS=(
   workers/shared/uk_aq_r2_history_canonical.mjs
   workers/shared/uk_aq_r2_history_index.mjs
   workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs
-  workers/shared/r2_sigv4.mjs
   scripts/backup_r2/lib/hierarchical_backup_v2.mjs
   scripts/backup_r2/lib/uk_aq_parquet_dependencies.mjs
   scripts/backup_r2/uk_aq_observations_manifest_hierarchy.mjs
@@ -121,6 +120,7 @@ fi
 # byte set. Require their working-tree bytes to match the recorded repository
 # HEAD so unreviewed local drift cannot enter the recovery process.
 RECOVERY_OPERATION_PATHS=(
+  workers/shared/r2_sigv4.mjs
   workers/shared/uk_aq_r2_history_writer.mjs
   scripts/operations/uk_aq_with_observations_global_operation_lock.mjs
   scripts/backup_r2/uk_aq_build_r2_history_index.mjs
