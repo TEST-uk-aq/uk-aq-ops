@@ -39,6 +39,9 @@ import {
   buildObservationHistoryV3MigrationPlan,
   buildObservationHistoryV3MigrationPlanFromCheckpoint,
   buildObservationHistoryV3RerunVerificationPlan,
+  DEFAULT_OBSERVATIONS_PREFIX,
+  DEFAULT_V3_INDEX_ROOT,
+  DEFAULT_V3_LATEST_KEY,
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
   stableMigrationJson,
@@ -822,13 +825,23 @@ function completedObjectCounts(checkpoint) {
     other: 0,
   };
   const completed = Object.entries(checkpoint?.completed_objects || {});
-  for (const [key, evidence] of completed) {
-    const stage = evidence?.publication_stage || evidence?.stage || "";
+  const canonicalManifestPrefix = `${DEFAULT_OBSERVATIONS_PREFIX}/`;
+  const v3ScopedPrefix = `${DEFAULT_V3_INDEX_ROOT}/`;
+  for (const [key] of completed) {
     if (key.endsWith(".parquet")) counts.parquet += 1;
-    else if (stage === "child_shard") counts.v3_child_shard += 1;
-    else if (stage === "scoped_manifest") counts.v3_scoped_manifest += 1;
-    else if (stage === "latest_global") counts.v3_latest_global += 1;
-    else if (key.endsWith("/manifest.json")) counts.canonical_manifest += 1;
+    else if (key === DEFAULT_V3_LATEST_KEY) counts.v3_latest_global += 1;
+    else if (
+      key.startsWith(v3ScopedPrefix) &&
+      /\/range=\d+-\d+\.json$/.test(key)
+    ) counts.v3_child_shard += 1;
+    else if (
+      key.startsWith(v3ScopedPrefix) &&
+      key.endsWith("/manifest.json")
+    ) counts.v3_scoped_manifest += 1;
+    else if (
+      key.startsWith(canonicalManifestPrefix) &&
+      key.endsWith("/manifest.json")
+    ) counts.canonical_manifest += 1;
     else counts.other += 1;
   }
   return {

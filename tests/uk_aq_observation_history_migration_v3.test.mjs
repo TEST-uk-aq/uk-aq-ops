@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  buildObservationHistoryIndexV3ChildShardKey,
+  buildObservationHistoryIndexV3ScopedManifestKey,
   finalizeObservationHistoryIndexV3Publication,
 } from "../workers/shared/uk_aq_observation_history_index_v3.mjs";
 import {
@@ -50,6 +52,7 @@ import {
   DEFAULT_BACKUP_INVENTORY_ROOT_KEY,
   DEFAULT_BACKUP_STATE_ROOT_KEY,
   DEFAULT_V2_LATEST_KEY,
+  DEFAULT_V3_LATEST_KEY,
   buildObservationHistoryV2RestorePlan,
   buildObservationHistoryV3MigrationAuditReport,
   buildObservationHistoryV3MigrationPlan,
@@ -2189,6 +2192,56 @@ test("migration report output excludes large execution and partition detail", ()
     500,
   );
   assert.ok(stableMigrationJson(output).length < 20_000);
+});
+
+test("completed checkpoint objects are classified by deterministic key namespace", () => {
+  const scope = {
+    day_utc: DAY,
+    connector_id: 1,
+    pollutant_code: "pm25",
+  };
+  const keys = [
+    `${PREFIX}/day_utc=${DAY}/connector_id=1/pollutant_code=pm25/part-00000.parquet`,
+    buildHistoryV2PollutantManifestKey(PREFIX, DAY, 1, "pm25"),
+    buildHistoryV2ConnectorManifestKey(PREFIX, DAY, 1),
+    buildHistoryV2DayManifestKey(PREFIX, DAY),
+    buildObservationHistoryIndexV3ChildShardKey({ scope, rangeStart: 0 }),
+    buildObservationHistoryIndexV3ScopedManifestKey({ scope }),
+    DEFAULT_V3_LATEST_KEY,
+    "history/_index_v3/observations_timeseries/unknown.json",
+  ];
+  const checkpoint = {
+    ...syntheticMigrationResult().checkpoint,
+    prepared_units: {},
+    completed_objects: Object.fromEntries(keys.map((key) => [
+      key,
+      {
+        byte_size: 50,
+        sha256: "e".repeat(64),
+        verified: true,
+        durable: true,
+        stored_sha256_verified: key.endsWith(".parquet"),
+      },
+    ])),
+  };
+  const output = buildObservationHistoryV3ReportOutput({
+    result: { ok: true, cutover_ready: false, blockers: [] },
+    audit: syntheticMigrationAudit(),
+    mode: "verify",
+    checkpoint,
+  });
+  assert.deepEqual(
+    output.result.checkpoint_summary.completed_object_counts,
+    {
+      total: 8,
+      parquet: 1,
+      canonical_manifest: 3,
+      v3_child_shard: 1,
+      v3_scoped_manifest: 1,
+      v3_latest_global: 1,
+      other: 1,
+    },
+  );
 });
 
 test("small success, failure and verify reports retain bounded evidence", () => {
