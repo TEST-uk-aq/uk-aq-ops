@@ -879,14 +879,12 @@ export function validateObservationHistoryV3MigrationEnvironment({
   apply = false,
   operation = "migration",
 }) {
-  const requested = String(environment || "").trim().toUpperCase();
-  const configured = String(configuredEnvironment || "").trim().toUpperCase();
+  const requested = String(environment || "").trim();
+  const configured = String(configuredEnvironment || "").trim();
   const actualBucket = String(bucket || "").trim();
   const pinnedBucket = String(expectedBucket || "").trim();
   const blockers = [];
-  if (!new Set(["TEST", "LIVE"]).has(requested)) {
-    blockers.push("environment_must_be_TEST_or_LIVE");
-  }
+  if (requested !== "TEST") blockers.push("environment_must_be_TEST");
   if (configured !== requested) blockers.push("configured_environment_mismatch");
   if (!actualBucket || !pinnedBucket || actualBucket !== pinnedBucket) {
     blockers.push("r2_bucket_identity_mismatch");
@@ -910,7 +908,7 @@ export function validateObservationHistoryV3MigrationEnvironment({
     blockers.push("integrity_version_identity_missing");
   }
   if (apply && blockers.length) {
-    throw new Error(`Migration environment guard failed: ${blockers.join(",")}`);
+    throw new Error(`TEST migration environment guard failed: ${blockers.join(",")}`);
   }
   return Object.freeze({
     ok: blockers.length === 0,

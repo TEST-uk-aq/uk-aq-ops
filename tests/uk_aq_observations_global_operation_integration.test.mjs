@@ -368,6 +368,7 @@ test("v3 migrate --apply acquires the global lock before reading migration autho
     "--dropbox-root", path.join(temporaryRoot, "missing-dropbox-authority"),
     "--expected-inventory-root-sha256", h("a"),
     "--expected-state-root-sha256", h("b"),
+    "--expected-plan-sha256", h("c"),
     "--report-out", path.join(temporaryRoot, "report.json"),
     "--checkpoint-out", path.join(temporaryRoot, "checkpoint.json"),
   ];
@@ -415,6 +416,7 @@ test("v2 rollback --apply delegates the complete command to the same global lock
     "--dropbox-root", path.join(temporaryRoot, "missing-dropbox-authority"),
     "--expected-inventory-root-sha256", h("a"),
     "--expected-state-root-sha256", h("b"),
+    "--expected-plan-sha256", h("c"),
     "--report-out", path.join(temporaryRoot, "report.json"),
     "--checkpoint-in", path.join(temporaryRoot, "missing-checkpoint.json"),
   ];
@@ -442,5 +444,9 @@ test("v2 rollback --apply delegates the complete command to the same global lock
   assert.equal(lockedOptions.owner, "observation_history_rollback_v2");
   assert.equal(lockedOptions.runId, "migration:test");
   assert.equal(lockedOptions.databaseUrl, "postgresql://direct-session");
-  assert.deepEqual(lockedOptions.commandArgs.slice(1), argv);
+  const cliIndex = lockedOptions.commandArgs.findIndex((value) =>
+    String(value).endsWith("/uk_aq_observation_history_migration_v3.mjs")
+  );
+  assert.notEqual(cliIndex, -1);
+  assert.deepEqual(lockedOptions.commandArgs.slice(cliIndex + 1), argv);
 });

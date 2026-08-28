@@ -70,8 +70,8 @@ function usage() {
     "  --mode rollback         Restore canonical v2 bytes and rebuild observation _index_v2",
     "",
     "Required for every mode:",
-    "  --environment TEST|LIVE",
-    "  --expected-bucket <exact environment bucket>",
+    "  --environment TEST",
+    "  --expected-bucket <exact TEST bucket>",
     "  --migration-run-id <stable operator identity>",
     "  --target-writer-git-sha <exact deployed migration code identity>",
     "  --writer-limits-json <Phase 1 writer limits JSON>",
@@ -79,7 +79,6 @@ function usage() {
     "  --expected-inventory-root-sha256 <hex>",
     "  --expected-state-root-sha256 <hex>",
     "  --report-out <audit JSON path>",
-    "  --expected-plan-sha256 <hex>  Required for every non-plan mode",
     "",
     "Mutation-only requirements:",
     "  --apply                  Explicitly permit R2 mutation",
@@ -115,7 +114,6 @@ export function parseObservationHistoryMigrationArgs(argv) {
     reportOut: null,
     checkpointIn: null,
     checkpointOut: null,
-    expectedPlanSha256: null,
     help: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -137,9 +135,6 @@ export function parseObservationHistoryMigrationArgs(argv) {
     } else if (flag === "--report-out") args.reportOut = requireValue(argv, index++, flag);
     else if (flag === "--checkpoint-in") args.checkpointIn = requireValue(argv, index++, flag);
     else if (flag === "--checkpoint-out") args.checkpointOut = requireValue(argv, index++, flag);
-    else if (flag === "--expected-plan-sha256") {
-      args.expectedPlanSha256 = requireValue(argv, index++, flag);
-    }
     else throw new Error(`Unknown argument: ${flag}`);
   }
   if (!MODES.has(args.mode)) throw new Error(`Unsupported --mode: ${args.mode}`);
@@ -167,9 +162,6 @@ export function parseObservationHistoryMigrationArgs(argv) {
   }
   if (new Set(["rollback-plan", "rollback"]).has(args.mode) && !args.checkpointIn) {
     throw new Error(`${args.mode} mode requires --checkpoint-in`);
-  }
-  if (args.mode !== "plan" && !String(args.expectedPlanSha256 || "").trim()) {
-    throw new Error(`${args.mode} mode requires --expected-plan-sha256`);
   }
   return Object.freeze(args);
 }
@@ -201,7 +193,7 @@ const RECOVERY_PROGRESS_SCHEMA_VERSION = 1;
 const RECOVERY_IMPLEMENTATION_PATHS = Object.freeze([
   "scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs",
   "scripts/backup_r2/lib/observation_history_migration_v3.mjs",
-  "scripts/index_v3_migration/index_v3_migration.sh",
+  "scripts/index_v3_migration/run_step10_resume.sh",
 ]);
 
 function recoveryProgressPaths(checkpointPath) {
@@ -1217,12 +1209,6 @@ export async function runObservationHistoryMigrationV3({
         expectedInventoryRootSha256: args.expectedInventoryRootSha256,
         expectedStateRootSha256: args.expectedStateRootSha256,
       });
-  if (
-    args.expectedPlanSha256 &&
-    plan.plan_sha256 !== String(args.expectedPlanSha256).trim().toLowerCase()
-  ) {
-    throw new Error("Migration plan identity does not match --expected-plan-sha256");
-  }
   if (
     checkpoint &&
     (
