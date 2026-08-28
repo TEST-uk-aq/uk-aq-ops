@@ -57,19 +57,15 @@ require_authorization() {
   fi
 }
 
-# Complete local dependency closure loaded by read-only verify. The current-only
-# files intentionally contain compatible post-migration verifier hardening, so
-# they are authenticated against current HEAD rather than required to equal the
-# historical migration implementation. The remaining dependencies must also be
-# byte-compatible with the pinned target-writer commit.
-VERIFY_CURRENT_ONLY_DEPENDENCIES=(
+# Complete local dependency closure loaded by read-only verify. Every file is
+# trusted as current reviewed verifier machinery: it must be tracked and match
+# clean current HEAD, but it may legitimately evolve after the migration.
+VERIFY_CURRENT_TRUSTED_DEPENDENCIES=(
   scripts/index_v3_migration/index_v3_migration.sh
   scripts/index_v3_migration/index_v3_preflight.sh
   scripts/index_v3_migration/recovery_journal_authority.mjs
   scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs
   scripts/backup_r2/lib/observation_history_migration_v3.mjs
-)
-VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES=(
   package.json
   package-lock.json
   scripts/backup_r2/lib/hierarchical_backup_v2.mjs
@@ -95,9 +91,22 @@ VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES=(
   workers/shared/uk_aq_r2_history_writer.mjs
   workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs
 )
-VERIFY_READ_ONLY_DEPENDENCIES=(
-  "${VERIFY_CURRENT_ONLY_DEPENDENCIES[@]}"
-  "${VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES[@]}"
+
+# This strict subset is also historical semantic authority. Read-only verify
+# reconstructs the exact canonical/v3 JSON artifacts recorded by the completed
+# checkpoint with these deterministic builders, schemas and normalizers, so
+# their bytes must still match the pinned target-writer commit.
+VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES=(
+  scripts/backup_r2/uk_aq_observations_manifest_hierarchy.mjs
+  workers/shared/uk_aq_observation_content_hash.mjs
+  workers/shared/uk_aq_observation_history_index_v3.mjs
+  workers/shared/uk_aq_observation_history_schema.mjs
+  workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs
+  workers/shared/uk_aq_observation_history_target_writer.mjs
+  workers/shared/uk_aq_observation_history_writer_limits_v3.mjs
+  workers/shared/uk_aq_observation_property_code.mjs
+  workers/shared/uk_aq_r2_history_canonical.mjs
+  workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs
 )
 MUTATION_IMPLEMENTATION_SCOPES=(
   package.json
@@ -116,11 +125,11 @@ git_paths_are_unchanged() {
 
 current_verify_dependencies_are_trusted() {
   local repository="$1" dependency
-  for dependency in "${VERIFY_READ_ONLY_DEPENDENCIES[@]}"; do
+  for dependency in "${VERIFY_CURRENT_TRUSTED_DEPENDENCIES[@]}"; do
     git -C "$repository" ls-files --error-unmatch -- "$dependency" >/dev/null 2>&1 \
       || return 1
   done
-  git -C "$repository" diff --quiet HEAD -- "${VERIFY_READ_ONLY_DEPENDENCIES[@]}"
+  git -C "$repository" diff --quiet HEAD -- "${VERIFY_CURRENT_TRUSTED_DEPENDENCIES[@]}"
 }
 
 self_test() {
@@ -140,11 +149,11 @@ self_test() {
   UK_AQ_INDEX_V3_MIGRATION_AUTH='SELF_TEST_AUTH' "$0" --_self-test-auth >/dev/null \
     || stop "self-test: exact mutation authorisation was rejected"
   drift_repo="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-verify-drift.XXXXXX")"
-  critical_path="scripts/backup_r2/lib/hierarchical_backup_v2.mjs"
+  critical_path="workers/shared/uk_aq_observation_history_index_v3.mjs"
   git -C "$drift_repo" init -q
   git -C "$drift_repo" config user.email 'index-v3-self-test@example.invalid'
   git -C "$drift_repo" config user.name 'Index v3 self-test'
-  mkdir -p -- "$drift_repo/scripts/backup_r2/lib"
+  mkdir -p -- "$drift_repo/workers/shared" "$drift_repo/scripts/backup_r2"
   printf '%s\n' 'critical-v1' > "$drift_repo/$critical_path"
   git -C "$drift_repo" add -- "$critical_path"
   git -C "$drift_repo" commit -qm 'base'
@@ -154,7 +163,7 @@ self_test() {
   git -C "$drift_repo" commit -qm 'unrelated backup tool'
   unrelated_commit="$(git -C "$drift_repo" rev-parse HEAD)"
   git_paths_are_unchanged "$drift_repo" "$base_commit" "$unrelated_commit" \
-    "${VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES[@]}" \
+    "${VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES[@]}" \
     || stop "self-test: unrelated backup file tripped read-only verify drift"
   for mutation_mode in migrate resume; do
     if git_paths_are_unchanged "$drift_repo" "$base_commit" "$unrelated_commit" \
@@ -167,7 +176,7 @@ self_test() {
   git -C "$drift_repo" commit -qm 'critical verifier change'
   critical_commit="$(git -C "$drift_repo" rev-parse HEAD)"
   if git_paths_are_unchanged "$drift_repo" "$base_commit" "$critical_commit" \
-    "${VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES[@]}"; then
+    "${VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES[@]}"; then
     stop "self-test: verification-critical drift was accepted"
   fi
   rm -rf -- "$drift_repo"
@@ -333,7 +342,7 @@ load_authority() {
     current_verify_dependencies_are_trusted "$REPO_ROOT" \
       || stop "current read-only verification dependency set is not exact, tracked current HEAD"
     LOAD_AUTHORITY_DRIFT="$(git diff --name-only "$TARGET_WRITER_GIT_SHA" HEAD -- \
-      "${VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES[@]}")"
+      "${VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES[@]}")"
   else
     LOAD_AUTHORITY_DRIFT="$(git diff --name-only "$TARGET_WRITER_GIT_SHA" HEAD -- \
       "${MUTATION_IMPLEMENTATION_SCOPES[@]}")"

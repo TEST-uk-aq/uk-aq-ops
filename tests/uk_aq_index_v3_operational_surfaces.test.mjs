@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -36,6 +38,20 @@ function stableObject(value) {
 const stableJson = (value) => `${JSON.stringify(stableObject(value), null, 2)}\n`;
 const sha256 = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const gitHead = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).stdout.trim();
+const migrationTargetGitSha = "b8858d95c42ff52558cb0fa59413162d6bc12afa";
+
+function shellArray(source, name) {
+  const match = source.match(new RegExp(`^${name}=\\(\\n([\\s\\S]*?)^\\)$`, "m"));
+  assert.ok(match, `missing shell array: ${name}`);
+  return match[1]
+    .split("\n")
+    .map((line) => line.trim().replace(/^['"]|['"]$/g, ""))
+    .filter(Boolean);
+}
+
+function gitStatus(cwd, args) {
+  return spawnSync("git", args, { cwd, encoding: "utf8" });
+}
 const gitBlobIdentity = (role, path) => {
   const body = spawnSync("git", ["cat-file", "blob", `${gitHead}:${path}`], {
     cwd: repositoryRoot,
@@ -118,9 +134,9 @@ test("operator verification authenticates exact current dependencies under v2 or
   assert.match(migrationWrapper, /\n  v2\)/);
   assert.match(migrationWrapper, /\n  v3\)/);
   assert.match(migrationWrapper, /GitHub variable \$variable_name/);
-  assert.match(migrationWrapper, /VERIFY_READ_ONLY_DEPENDENCIES=\(/);
-  assert.match(migrationWrapper, /VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES=\(/);
-  assert.match(migrationWrapper, /scripts\/backup_r2\/lib\/hierarchical_backup_v2\.mjs/);
+  assert.match(migrationWrapper, /VERIFY_CURRENT_TRUSTED_DEPENDENCIES=\(/);
+  assert.match(migrationWrapper, /VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES=\(/);
+  assert.match(migrationWrapper, /workers\/shared\/uk_aq_observation_history_index_v3\.mjs/);
   assert.match(migrationWrapper, /current_verify_dependencies_are_trusted/);
   assert.match(migrationWrapper, /verify mode does not accept --apply/);
   assert.match(migrationWrapper, /MUTATION_IMPLEMENTATION_SCOPES=\([\s\S]*scripts\/backup_r2/);
@@ -128,6 +144,88 @@ test("operator verification authenticates exact current dependencies under v2 or
     migrationWrapper.match(/LOAD_AUTHORITY_DRIFT="\$\(git diff[\s\S]*?\n  else/)[0],
     /scripts\/backup_r2 scripts\/operations/,
   );
+});
+
+test("read-only verify dependency classes match actual migration-to-HEAD history", () => {
+  const currentTrusted = shellArray(migrationWrapper, "VERIFY_CURRENT_TRUSTED_DEPENDENCIES");
+  const historicalSemantic = shellArray(
+    migrationWrapper,
+    "VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES",
+  );
+  const mutationScopes = shellArray(migrationWrapper, "MUTATION_IMPLEMENTATION_SCOPES");
+  const currentHead = gitStatus(repositoryRoot, ["rev-parse", "HEAD"]).stdout.trim();
+
+  assert.equal(
+    gitStatus(repositoryRoot, ["merge-base", "--is-ancestor", migrationTargetGitSha, currentHead]).status,
+    0,
+    "migration target is not an ancestor of current HEAD",
+  );
+  assert.notEqual(
+    gitStatus(repositoryRoot, [
+      "diff", "--quiet", migrationTargetGitSha, currentHead, "--", "workers/shared/r2_sigv4.mjs",
+    ]).status,
+    0,
+    "real-history fixture no longer contains the reviewed r2_sigv4 evolution",
+  );
+  assert.equal(
+    gitStatus(repositoryRoot, [
+      "diff", "--quiet", migrationTargetGitSha, currentHead, "--", ...historicalSemantic,
+    ]).status,
+    0,
+    "historically pinned semantic dependencies drifted after migration",
+  );
+  for (const operationalDependency of [
+    "workers/shared/r2_sigv4.mjs",
+    "workers/shared/uk_aq_r2_history_writer.mjs",
+    "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs",
+    "scripts/backup_r2/uk_aq_build_r2_history_index.mjs",
+  ]) {
+    assert.ok(currentTrusted.includes(operationalDependency));
+    assert.ok(!historicalSemantic.includes(operationalDependency));
+  }
+  for (const dependency of historicalSemantic) {
+    assert.ok(currentTrusted.includes(dependency), `historical dependency is not current-trusted: ${dependency}`);
+  }
+
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-index-v3-history-"));
+  const cleanClone = path.join(temporaryRoot, "repo");
+  try {
+    const clone = gitStatus(repositoryRoot, ["clone", "--quiet", "--no-hardlinks", repositoryRoot, cleanClone]);
+    assert.equal(clone.status, 0, clone.stderr);
+    for (const dependency of currentTrusted) {
+      assert.equal(
+        gitStatus(cleanClone, ["ls-files", "--error-unmatch", "--", dependency]).status,
+        0,
+        `current trusted dependency is untracked: ${dependency}`,
+      );
+    }
+    assert.equal(
+      gitStatus(cleanClone, ["diff", "--quiet", "HEAD", "--", ...currentTrusted]).status,
+      0,
+      "committed current trusted dependencies are not clean against HEAD",
+    );
+    fs.appendFileSync(
+      path.join(cleanClone, "workers/shared/r2_sigv4.mjs"),
+      "\n// induced local verifier drift\n",
+    );
+    assert.notEqual(
+      gitStatus(cleanClone, ["diff", "--quiet", "HEAD", "--", ...currentTrusted]).status,
+      0,
+      "induced local current-verifier drift was accepted",
+    );
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+
+  for (const mode of ["migrate", "resume"]) {
+    assert.notEqual(
+      gitStatus(repositoryRoot, [
+        "diff", "--quiet", migrationTargetGitSha, currentHead, "--", ...mutationScopes,
+      ]).status,
+      0,
+      `${mode} broad historical drift protection was weakened`,
+    );
+  }
 });
 
 test("post-cutover verifier requires only credentials it consumes", () => {
