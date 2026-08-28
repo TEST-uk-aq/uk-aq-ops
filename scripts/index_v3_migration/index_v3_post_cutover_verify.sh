@@ -269,6 +269,7 @@ const r2 = {
   secret_access_key: process.env.CFLARE_R2_SECRET_ACCESS_KEY,
 };
 const latestKey = "history/_index_v3/observations_timeseries_latest.json";
+const supportedPollutants = new Set(["no2", "pm25", "pm10"]);
 const getBytes = async (key) => {
   const result = await r2GetObject({ r2, key });
   return Buffer.isBuffer(result.body) ? result.body : Buffer.from(result.body);
@@ -292,6 +293,8 @@ let selected = null;
 for (const day of days) {
   const roots = Array.isArray(day?.scoped_roots) ? day.scoped_roots : [];
   for (const root of roots) {
+    const pollutant = String(root?.pollutant_code || "").trim().toLowerCase();
+    if (!supportedPollutants.has(pollutant)) continue;
     const key = String(root?.key || "");
     if (!key) continue;
     const body = await getBytes(key);
@@ -303,6 +306,9 @@ for (const day of days) {
       throw new Error(`scoped-root SHA mismatch: ${key}`);
     }
     const validated = validateObservationHistoryIndexV3ScopedManifestBody({ key, body });
+    if (!supportedPollutants.has(validated.scope.pollutant_code)) {
+      throw new Error(`selected scoped root is not station-series compatible: ${key}`);
+    }
     const ids = validated.coverage?.timeseries_ids || [];
     if (ids.length > 0 && Number(validated.coverage?.row_count || 0) > 0) {
       const dayUtc = validated.scope.day_utc;
@@ -325,10 +331,10 @@ for (const day of days) {
   }
   if (selected) break;
 }
-if (!selected) throw new Error("no non-empty v3 scoped manifest could provide a live probe identity");
+if (!selected) throw new Error("no non-empty no2/pm25/pm10 v3 scoped manifest could provide a live probe identity");
 process.stdout.write(JSON.stringify(selected));
 NODE
-)" || fail "could not select a deterministic historical live-probe identity from index v3"
+)" || fail "could not select a deterministic station-series-compatible historical live-probe identity from index v3"
 
 TIMESERIES_ID="$(printf '%s' "$PROBE_JSON" | jq -r '.timeseries_id')"
 CONNECTOR_ID="$(printf '%s' "$PROBE_JSON" | jq -r '.connector_id')"
