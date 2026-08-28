@@ -60,6 +60,25 @@ is_true() {
   esac
 }
 
+read_http_header() {
+  local header_name="$1" headers_file="$2"
+  awk -v wanted="$(printf '%s' "$header_name" | tr '[:upper:]' '[:lower:]')" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      colon = index(line, ":")
+      if (colon <= 0) next
+      name = substr(line, 1, colon - 1)
+      value = substr(line, colon + 1)
+      gsub(/^[[:space:]]+/, "", value)
+      if (tolower(name) == wanted) {
+        print value
+        exit
+      }
+    }
+  ' "$headers_file"
+}
+
 PLAN_REPORT=""
 CHECKPOINT=""
 SITE_URL=""
@@ -81,7 +100,7 @@ done
 [ -n "$SITE_URL" ] || fail "--site-url is required"
 [ -n "$CACHE_URL" ] || fail "--cache-url is required"
 
-for command in git gh jq node curl shasum npx; do
+for command in git gh jq node curl shasum npx awk tr; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable: $command"
 done
 
@@ -378,9 +397,9 @@ if [ "$HTTP_STATUS" != "200" ]; then
   fail "live station-series probe returned HTTP $HTTP_STATUS instead of 200"
 fi
 
-CACHE_STATUS="$(awk 'BEGIN{IGNORECASE=1} /^X-UK-AQ-Cache:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit}' "$HEADERS_FILE")"
-STATION_ROUTE="$(awk 'BEGIN{IGNORECASE=1} /^X-UK-AQ-Station-History-Route:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit}' "$HEADERS_FILE")"
-STATION_CONTRACT="$(awk 'BEGIN{IGNORECASE=1} /^X-UK-AQ-Station-History-Contract:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit}' "$HEADERS_FILE")"
+CACHE_STATUS="$(read_http_header 'X-UK-AQ-Cache' "$HEADERS_FILE")"
+STATION_ROUTE="$(read_http_header 'X-UK-AQ-Station-History-Route' "$HEADERS_FILE")"
+STATION_CONTRACT="$(read_http_header 'X-UK-AQ-Station-History-Contract' "$HEADERS_FILE")"
 [ "$CACHE_STATUS" = "BYPASS" ] || fail "live station-series probe was not cache-bypassed (X-UK-AQ-Cache=$CACHE_STATUS)"
 [ "$STATION_ROUTE" = "/v1/station-series" ] || fail "live request did not traverse the station-history service route"
 [ "$STATION_CONTRACT" = "v2" ] || fail "station-history response contract header is not v2"
