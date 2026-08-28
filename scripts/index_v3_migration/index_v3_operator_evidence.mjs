@@ -157,11 +157,159 @@ function validateWriterFreezePayload(payload, { repositoryRoot, planReport }) {
   }
 }
 
+function validateCacheIdentity(identity, repositoryRoot, label, expectedService, expectedVersionTrigger, expectedDeploymentTrigger) {
+  exactKeys(identity, [
+    "workflow_run_id", "git_commit_sha", "worker_name", "version_id", "version_number",
+    "version_created_on", "version_source", "version_triggered_by", "actor_identity_sha256",
+    "script_etag", "script_handlers", "script_last_deployed_from", "script_runtime",
+    "binding_descriptors", "deployment_id", "deployment_created_on", "deployment_source",
+    "deployment_strategy", "deployment_triggered_by", "deployment_percentage",
+    "station_history_service",
+  ], label);
+  if (!/^[1-9][0-9]*$/.test(string(identity.workflow_run_id, `${label} workflow_run_id`))) {
+    throw new Error(`${label} workflow_run_id is invalid`);
+  }
+  const commit = requireSha(identity.git_commit_sha, `${label} git_commit_sha`, GIT_SHA);
+  if (spawnSync("git", ["cat-file", "-e", `${commit}^{commit}`], { cwd: repositoryRoot }).status !== 0) {
+    throw new Error(`${label} git commit is unavailable`);
+  }
+  const worker = string(identity.worker_name, `${label} worker_name`);
+  if (!WORKER_NAME.test(worker) || worker.endsWith("-v3-candidate") || worker.length > 63) {
+    throw new Error(`${label} stable Worker name is invalid`);
+  }
+  if (!UUID.test(string(identity.version_id, `${label} version_id`))) throw new Error(`${label} version_id is invalid`);
+  if (!Number.isInteger(identity.version_number) || identity.version_number < 1) throw new Error(`${label} version_number is invalid`);
+  timestamp(identity.version_created_on, `${label} version_created_on`);
+  if (identity.version_source !== "wrangler" || identity.version_triggered_by !== expectedVersionTrigger) {
+    throw new Error(`${label} version source/trigger is invalid`);
+  }
+  requireSha(identity.actor_identity_sha256, `${label} actor_identity_sha256`);
+  requireSha(identity.script_etag, `${label} script_etag`);
+  if (!Array.isArray(identity.script_handlers) || identity.script_handlers.length === 0
+    || identity.script_handlers.some((handler) => typeof handler !== "string" || !handler)) {
+    throw new Error(`${label} script_handlers are invalid`);
+  }
+  string(identity.script_last_deployed_from, `${label} script_last_deployed_from`);
+  exactKeys(identity.script_runtime, ["compatibility_date", "compatibility_flags", "usage_model"], `${label} script_runtime`);
+  string(identity.script_runtime.compatibility_date, `${label} compatibility_date`);
+  string(identity.script_runtime.usage_model, `${label} usage_model`);
+  if (!Array.isArray(identity.script_runtime.compatibility_flags)
+    || identity.script_runtime.compatibility_flags.some((flag) => typeof flag !== "string" || !flag)) {
+    throw new Error(`${label} compatibility_flags are invalid`);
+  }
+  if (!Array.isArray(identity.binding_descriptors) || identity.binding_descriptors.length === 0) {
+    throw new Error(`${label} binding_descriptors are missing`);
+  }
+  let serviceBindings = 0;
+  for (const binding of identity.binding_descriptors) {
+    const type = string(binding?.type, `${label} binding type`);
+    if (type === "secret_text") exactKeys(binding, ["name", "type"], `${label} secret-text binding`);
+    else if (type === "service") {
+      exactKeys(binding, ["name", "type", "service", "environment"], `${label} service binding`);
+      if (binding.name === "STATION_HISTORY" && binding.service === expectedService) serviceBindings += 1;
+    } else throw new Error(`${label} binding type is unsupported`);
+    string(binding.name, `${label} binding name`);
+  }
+  if (serviceBindings !== 1 || identity.station_history_service !== expectedService) {
+    throw new Error(`${label} STATION_HISTORY binding is invalid`);
+  }
+  if (!UUID.test(string(identity.deployment_id, `${label} deployment_id`))) throw new Error(`${label} deployment_id is invalid`);
+  timestamp(identity.deployment_created_on, `${label} deployment_created_on`);
+  if (identity.deployment_source !== "wrangler" || identity.deployment_strategy !== "percentage"
+    || identity.deployment_triggered_by !== expectedDeploymentTrigger || identity.deployment_percentage !== 100) {
+    throw new Error(`${label} deployment source/strategy/trigger/percentage is invalid`);
+  }
+  return identity;
+}
+
+function validateCacheProvenance(provenance, repositoryRoot) {
+  exactKeys(provenance, [
+    "accepted_v2_cache_baseline", "pre_cutover_v2_cache_runtime",
+    "explicit_v3_cache_cutover", "transition_proof",
+  ], "cache provenance");
+  const proof = plain(provenance.transition_proof, "cache transition_proof");
+  exactKeys(proof, [
+    "kind", "baseline_differs_from_pre_cutover_runtime", "pre_cutover_is_immediate_predecessor",
+    "script_identity_match", "script_runtime_match", "binding_descriptors_match",
+    "actor_identity_match", "version_numbers_consecutive", "workflow_correlation", "explanation",
+  ], "cache transition_proof");
+  const refresh = proof.kind === "cutover_workflow_secret_refresh";
+  if (!refresh && proof.kind !== "accepted_v2_baseline_immediate_predecessor") {
+    throw new Error("cache transition_proof kind is invalid");
+  }
+  if (proof.baseline_differs_from_pre_cutover_runtime !== refresh
+    || proof.pre_cutover_is_immediate_predecessor !== true
+    || proof.script_identity_match !== true
+    || proof.script_runtime_match !== true
+    || proof.binding_descriptors_match !== true
+    || proof.actor_identity_match !== true
+    || proof.version_numbers_consecutive !== true) {
+    throw new Error("cache transition_proof assertions are invalid");
+  }
+  string(proof.explanation, "cache transition_proof explanation");
+  const stableService = string(provenance.accepted_v2_cache_baseline?.station_history_service, "accepted v2 cache service");
+  const baseline = validateCacheIdentity(
+    provenance.accepted_v2_cache_baseline, repositoryRoot, "accepted v2 cache baseline", stableService, "version_upload", "deployment",
+  );
+  const runtime = validateCacheIdentity(
+    provenance.pre_cutover_v2_cache_runtime, repositoryRoot, "pre-cutover v2 cache runtime", stableService,
+    refresh ? "secret" : "version_upload", refresh ? "secret" : "deployment",
+  );
+  const cutover = validateCacheIdentity(
+    provenance.explicit_v3_cache_cutover, repositoryRoot, "explicit v3 cache cut-over", `${stableService}-v3-candidate`, "version_upload", "deployment",
+  );
+  if (baseline.worker_name !== runtime.worker_name || runtime.worker_name !== cutover.worker_name) {
+    throw new Error("cache provenance Worker names differ");
+  }
+  const baselineTime = Date.parse(baseline.deployment_created_on);
+  const runtimeTime = Date.parse(runtime.deployment_created_on);
+  const cutoverTime = Date.parse(cutover.deployment_created_on);
+  if (baselineTime > runtimeTime || runtimeTime >= cutoverTime) throw new Error("cache provenance chronology is invalid");
+  if (baseline.script_etag !== runtime.script_etag
+    || stableJson(baseline.script_handlers) !== stableJson(runtime.script_handlers)
+    || baseline.script_last_deployed_from !== runtime.script_last_deployed_from
+    || stableJson(baseline.script_runtime) !== stableJson(runtime.script_runtime)
+    || stableJson(baseline.binding_descriptors) !== stableJson(runtime.binding_descriptors)
+    || baseline.actor_identity_sha256 !== runtime.actor_identity_sha256
+    || runtime.actor_identity_sha256 !== cutover.actor_identity_sha256) {
+    throw new Error("cache provenance equivalence evidence is contradictory");
+  }
+  if (refresh) {
+    if (baseline.version_id === runtime.version_id || baseline.deployment_id === runtime.deployment_id
+      || runtime.workflow_run_id !== cutover.workflow_run_id
+      || runtime.version_number !== baseline.version_number + 1
+      || cutover.version_number !== runtime.version_number + 1) {
+      throw new Error("cache secret-refresh identity sequence is invalid");
+    }
+    exactKeys(proof.workflow_correlation, ["refresh_step", "deploy_step"], "cache workflow_correlation");
+    const validateStep = (step, label, expectedName) => {
+      exactKeys(step, ["name", "started_at", "completed_at"], label);
+      if (step.name !== expectedName) throw new Error(`${label} name is invalid`);
+      const started = Date.parse(timestamp(step.started_at, `${label} started_at`));
+      const completed = Date.parse(timestamp(step.completed_at, `${label} completed_at`));
+      if (started > completed) throw new Error(`${label} chronology is invalid`);
+      return { started, completed };
+    };
+    const refreshStep = validateStep(proof.workflow_correlation.refresh_step, "cache refresh step", "Apply Worker secrets to existing cache Worker");
+    const deployStep = validateStep(proof.workflow_correlation.deploy_step, "cache deploy step", "Deploy Worker");
+    if (runtimeTime < refreshStep.started || runtimeTime > refreshStep.completed
+      || cutoverTime < deployStep.started || cutoverTime > deployStep.completed
+      || refreshStep.completed > deployStep.started) {
+      throw new Error("cache workflow/deployment timestamp correlation is invalid");
+    }
+  } else if (proof.workflow_correlation !== null
+    || baseline.version_id !== runtime.version_id || baseline.deployment_id !== runtime.deployment_id
+    || baseline.workflow_run_id !== runtime.workflow_run_id) {
+    throw new Error("direct v2 cache baseline/runtime identity is invalid");
+  }
+  return provenance;
+}
+
 function validateRollbackPayload(payload, { repositoryRoot }) {
   exactKeys(payload, [
     "environment", "repository", "branch", "repository_head", "recorded_at_utc",
     "history_version", "index_authority_generation", "integrity_version", "components",
-    "artifacts", "restore_steps",
+    "cache_provenance", "artifacts", "restore_steps",
   ], "v2 runtime rollback payload");
   if (!new Set(["TEST", "LIVE"]).has(string(payload.environment, "rollback environment").toUpperCase())) {
     throw new Error("rollback environment must be TEST or LIVE");
@@ -172,6 +320,7 @@ function validateRollbackPayload(payload, { repositoryRoot }) {
     throw new Error("rollback record must identify logical history v2 and observation index authority v2");
   }
   string(payload.integrity_version, "rollback integrity_version");
+  const cacheProvenance = validateCacheProvenance(payload.cache_provenance, repositoryRoot);
   if (!Array.isArray(payload.components)) throw new Error("rollback components are missing");
   const requiredRoles = new Set(["stable_observations_worker", "stable_station_worker", "cache_worker"]);
   const roles = new Set();
@@ -195,6 +344,14 @@ function validateRollbackPayload(payload, { repositoryRoot }) {
     string(component.deployment.captured_by, `rollback ${role} captured_by`);
   }
   for (const role of requiredRoles) if (!roles.has(role)) throw new Error(`rollback component is missing: ${role}`);
+  const cacheComponent = payload.components.find(({ role }) => role === "cache_worker");
+  const exactCacheRuntime = cacheProvenance.pre_cutover_v2_cache_runtime;
+  if (cacheComponent.worker_name !== exactCacheRuntime.worker_name
+    || cacheComponent.deployment.version_id !== exactCacheRuntime.version_id
+    || cacheComponent.deployment.deployment_id !== exactCacheRuntime.deployment_id
+    || cacheComponent.git_commit_sha !== cacheProvenance.accepted_v2_cache_baseline.git_commit_sha) {
+    throw new Error("rollback cache component does not match the exact pre-cutover v2 cache runtime and accepted baseline");
+  }
   if (!Array.isArray(payload.artifacts) || payload.artifacts.length === 0) throw new Error("rollback workflow/config artifacts are missing");
   const artifactRoles = new Set();
   for (const artifact of payload.artifacts) {
@@ -206,6 +363,7 @@ function validateRollbackPayload(payload, { repositoryRoot }) {
     "observations_deploy_workflow",
     "station_deploy_workflow",
     "cache_deploy_workflow",
+    "cache_cutover_deploy_workflow",
     "observations_worker_config",
     "station_worker_config",
     "cache_worker_config",
@@ -232,6 +390,14 @@ function validateRollbackPayload(payload, { repositoryRoot }) {
     "restore_cache_worker_v2_binding",
   ]) {
     if (!restoreRoles.has(required)) throw new Error(`rollback restore step is missing: ${required}`);
+  }
+  const cacheRestore = payload.restore_steps.find(({ role }) => role === "restore_cache_worker_v2_binding");
+  const expectedCacheCommand = `npx wrangler versions deploy ${exactCacheRuntime.version_id}@100% --name ${exactCacheRuntime.worker_name} -y`;
+  if (cacheRestore.command_or_workflow !== expectedCacheCommand) {
+    throw new Error("rollback cache restore command does not pin the exact pre-cutover v2 cache runtime");
+  }
+  if (payload.restore_steps.some(({ command_or_workflow }) => command_or_workflow.includes("-v3-candidate"))) {
+    throw new Error("rollback restore command references a v3 candidate Worker");
   }
 }
 

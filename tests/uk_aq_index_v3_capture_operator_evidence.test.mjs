@@ -155,17 +155,44 @@ const ids = {
   stationVersion: uuid("2"),
   cacheV2Version: uuid("3"),
   cacheV3Version: uuid("4"),
+  cacheRefreshVersion: uuid("9"),
   observationsDeployment: uuid("5"),
   stationDeployment: uuid("6"),
   cacheV2Deployment: uuid("7"),
   cacheV3Deployment: uuid("8"),
+  cacheRefreshDeployment: uuid("a"),
 };
 
 const deployment = (id, versionId, createdOn) => ({
   id,
   created_on: createdOn,
+  source: "wrangler",
+  strategy: "percentage",
+  annotations: { "workers/triggered_by": "deployment" },
   versions: [{ percentage: 100, version_id: versionId }],
 });
+
+function cacheVersionDetail(id, number, createdOn, stationService, triggeredBy = "version_upload") {
+  return {
+    id,
+    number,
+    annotations: { "workers/triggered_by": triggeredBy },
+    metadata: {
+      author_id: "fixture-author",
+      author_email: "fixture@example.invalid",
+      created_on: createdOn,
+      source: "wrangler",
+    },
+    resources: {
+      bindings: [
+        { name: "FIXTURE_VALUE", type: "secret_text" },
+        { name: "STATION_HISTORY", type: "service", service: stationService, environment: "production" },
+      ],
+      script: { etag: "f".repeat(64), handlers: ["fetch"], last_deployed_from: "wrangler" },
+      script_runtime: { compatibility_date: "2026-02-22", compatibility_flags: ["global_fetch_strictly_public"], usage_model: "standard" },
+    },
+  };
+}
 
 function interveningDeploymentEvents(selectedVersion) {
   return [
@@ -202,6 +229,7 @@ function run(id, workflow, versionId, extras = "") {
     status: "completed",
     conclusion: "success",
     log: `Current Version ID: ${versionId}\n${extras}`,
+    jobs: [],
   };
 }
 
@@ -232,8 +260,9 @@ function rollbackFixture(overrides = {}) {
   const versionDetails = {
     observations: { id: ids.observationsVersion, resources: { bindings: [] } },
     station: { id: ids.stationVersion, resources: { bindings: [] } },
-    cacheV2: { id: ids.cacheV2Version, resources: { bindings: [{ name: "STATION_HISTORY", type: "service", service: station }] } },
-    cacheV3: { id: ids.cacheV3Version, resources: { bindings: [{ name: "STATION_HISTORY", type: "service", service: `${station}-v3-candidate` }] } },
+    cacheV2: cacheVersionDetail(ids.cacheV2Version, 10, "2026-08-28T10:00:00Z", station),
+    cachePreCutover: cacheVersionDetail(ids.cacheV2Version, 10, "2026-08-28T10:00:00Z", station),
+    cacheV3: cacheVersionDetail(ids.cacheV3Version, 11, "2026-08-28T11:00:00Z", `${station}-v3-candidate`),
     ...overrides.versionDetails,
   };
   return { workerNames, runs, deployments, versionDetails };
@@ -252,6 +281,50 @@ function rollbackPayload(overrides = {}) {
   });
 }
 
+function secretRefreshOverrides() {
+  const fixture = rollbackFixture();
+  const refreshDeployment = {
+    ...deployment(ids.cacheRefreshDeployment, ids.cacheRefreshVersion, "2026-08-28T10:50:00Z"),
+    annotations: { "workers/triggered_by": "secret" },
+  };
+  const cacheV3 = structuredClone(fixture.runs.cacheV3);
+  cacheV3.jobs = [{
+    name: "deploy-worker",
+    steps: [
+      {
+        number: 9,
+        name: "Apply Worker secrets to existing cache Worker",
+        status: "completed",
+        conclusion: "success",
+        started_at: "2026-08-28T10:49:00Z",
+        completed_at: "2026-08-28T10:51:00Z",
+      },
+      {
+        number: 10,
+        name: "Deploy Worker",
+        status: "completed",
+        conclusion: "success",
+        started_at: "2026-08-28T10:51:00Z",
+        completed_at: "2026-08-28T11:01:00Z",
+      },
+    ],
+  }];
+  return {
+    runs: { cacheV3 },
+    deployments: { cache: [fixture.deployments.cache[0], refreshDeployment, fixture.deployments.cache[1]] },
+    versionDetails: {
+      cachePreCutover: cacheVersionDetail(
+        ids.cacheRefreshVersion,
+        11,
+        refreshDeployment.created_on,
+        fixture.workerNames.station,
+        "secret",
+      ),
+      cacheV3: cacheVersionDetail(ids.cacheV3Version, 12, "2026-08-28T11:00:00Z", `${fixture.workerNames.station}-v3-candidate`),
+    },
+  };
+}
+
 test("rollback builder accepts only stable Workers and emits all exact roles and restore steps", () => {
   const payload = rollbackPayload();
   assert.deepEqual(payload.components.map(({ role }) => role), ["stable_observations_worker", "stable_station_worker", "cache_worker"]);
@@ -264,11 +337,16 @@ test("rollback builder accepts only stable Workers and emits all exact roles and
     "observations_deploy_workflow",
     "station_deploy_workflow",
     "cache_deploy_workflow",
+    "cache_cutover_deploy_workflow",
     "observations_worker_config",
     "station_worker_config",
     "cache_worker_config",
     "cache_binding_resolver",
   ]);
+  assert.equal(payload.cache_provenance.accepted_v2_cache_baseline.version_id, ids.cacheV2Version);
+  assert.equal(payload.cache_provenance.pre_cutover_v2_cache_runtime.version_id, ids.cacheV2Version);
+  assert.equal(payload.cache_provenance.explicit_v3_cache_cutover.version_id, ids.cacheV3Version);
+  assert.equal(payload.cache_provenance.transition_proof.kind, "accepted_v2_baseline_immediate_predecessor");
   assert.deepEqual(payload.restore_steps.map(({ order }) => order), [1, 2, 3, 4]);
   assert.deepEqual(payload.restore_steps.map(({ role }) => role), [
     "restore_observations_worker",
@@ -413,41 +491,62 @@ test("rollback capture rejects placeholder UUIDs and unavailable historical cach
   assert.throws(() => rollbackPayload({ deployments: { cache: [] } }), /exact Cloudflare deployment identity is unavailable/);
 });
 
-test("current v3 cache cannot be selected as v2 and v2 must immediately precede cut-over", () => {
+test("current v3 cache cannot be selected as the accepted v2 baseline", () => {
   const wrongV2 = rollbackFixture().runs.cacheV2;
   wrongV2.log = `Current Version ID: ${ids.cacheV3Version}\nResolved STATION_HISTORY Service Binding target: uk-aq-station-history-test\nDeployed cache Worker: uk-aq-cache-test\nPersistent observation-history authority: v2\n`;
   assert.throws(
     () => rollbackPayload({
       runs: { cacheV2: wrongV2 },
-      versionDetails: {
-        cacheV2: {
-          id: ids.cacheV3Version,
-          resources: { bindings: [{ name: "STATION_HISTORY", type: "service", service: "uk-aq-station-history-test" }] },
-        },
-      },
     }),
-    /v2 and v3 cache deployment identities are identical/,
+    /v2 cache Cloudflare version detail does not match the workflow UUID/,
   );
+});
 
-  const intervening = deployment(uuid("9"), uuid("9"), "2026-08-28T10:30:00Z");
-  assert.throws(() => rollbackPayload({ deployments: { cache: [...rollbackFixture().deployments.cache, intervening] } }), /not immediately before/);
+test("authorised cut-over secret refresh becomes the exact pre-cutover rollback cache runtime", () => {
+  const payload = rollbackPayload(secretRefreshOverrides());
+  assert.equal(payload.cache_provenance.accepted_v2_cache_baseline.version_id, ids.cacheV2Version);
+  assert.equal(payload.cache_provenance.pre_cutover_v2_cache_runtime.version_id, ids.cacheRefreshVersion);
+  assert.equal(payload.cache_provenance.pre_cutover_v2_cache_runtime.deployment_id, ids.cacheRefreshDeployment);
+  assert.equal(payload.cache_provenance.pre_cutover_v2_cache_runtime.workflow_run_id, "104");
+  assert.equal(payload.cache_provenance.explicit_v3_cache_cutover.version_id, ids.cacheV3Version);
+  assert.equal(payload.cache_provenance.transition_proof.kind, "cutover_workflow_secret_refresh");
+  assert.equal(payload.restore_steps[3].command_or_workflow,
+    `npx wrangler versions deploy ${ids.cacheRefreshVersion}@100% --name uk-aq-cache-test -y`);
+  assert.equal(validateIndexV3OperatorEvidence({
+    evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", payload), repositoryRoot,
+  }).ok, true);
+});
+
+test("cache secret-refresh provenance remains fail-closed for unrelated or contradictory intervening deployments", () => {
+  const random = secretRefreshOverrides();
+  random.deployments.cache[1].annotations["workers/triggered_by"] = "deployment";
+  random.versionDetails.cachePreCutover.annotations["workers/triggered_by"] = "version_upload";
+  assert.throws(() => rollbackPayload(random), /deployment trigger is not secret/);
+
+  const candidateBinding = secretRefreshOverrides();
+  candidateBinding.versionDetails.cachePreCutover.resources.bindings
+    .find(({ name }) => name === "STATION_HISTORY").service = "uk-aq-station-history-test-v3-candidate";
+  assert.throws(() => rollbackPayload(candidateBinding), /not bound to the stable station-history Worker/);
+
+  const changedCode = secretRefreshOverrides();
+  changedCode.versionDetails.cachePreCutover.resources.script.etag = "e".repeat(64);
+  assert.throws(() => rollbackPayload(changedCode), /does not retain the accepted v2 baseline code\/runtime identity/);
+
+  const badSteps = secretRefreshOverrides();
+  badSteps.runs.cacheV3.jobs[0].steps[0].conclusion = "failure";
+  assert.throws(() => rollbackPayload(badSteps), /does not contain one successful Apply Worker secrets/);
 });
 
 test("cache chronology retains exact stable-v2 and candidate-v3 Service Binding proof", () => {
   assert.throws(() => rollbackPayload({
     versionDetails: {
-      cacheV2: {
-        id: ids.cacheV2Version,
-        resources: { bindings: [{ name: "STATION_HISTORY", type: "service", service: "uk-aq-station-history-test-v3-candidate" }] },
-      },
+      cacheV2: cacheVersionDetail(ids.cacheV2Version, 10, "2026-08-28T10:00:00Z", "uk-aq-station-history-test-v3-candidate"),
+      cachePreCutover: cacheVersionDetail(ids.cacheV2Version, 10, "2026-08-28T10:00:00Z", "uk-aq-station-history-test-v3-candidate"),
     },
   }), /v2 cache version is not bound to the stable station-history Worker/);
   assert.throws(() => rollbackPayload({
     versionDetails: {
-      cacheV3: {
-        id: ids.cacheV3Version,
-        resources: { bindings: [{ name: "STATION_HISTORY", type: "service", service: "uk-aq-station-history-test" }] },
-      },
+      cacheV3: cacheVersionDetail(ids.cacheV3Version, 11, "2026-08-28T11:00:00Z", "uk-aq-station-history-test"),
     },
   }), /v3 cache cut-over version is not bound to the station-history candidate/);
 });

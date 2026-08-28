@@ -60,6 +60,16 @@ function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+function stableObject(value) {
+  if (Array.isArray(value)) return value.map(stableObject);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableObject(value[key])]));
+  }
+  return value;
+}
+
+const stableJsonValue = (value) => JSON.stringify(stableObject(value));
+
 export function gitBlobIdentity(repositoryRoot, role, relativePath, commit) {
   if (path.isAbsolute(relativePath) || relativePath.split("/").includes("..")) {
     throw new Error(`Unsafe Git artifact path: ${relativePath}`);
@@ -243,39 +253,251 @@ function serviceBinding(detail, bindingName) {
     binding?.type === "service" && binding?.name === bindingName);
 }
 
+function cacheBindingDescriptors(detail, label) {
+  const bindings = detail?.resources?.bindings;
+  if (!Array.isArray(bindings) || bindings.length === 0) throw new Error(`${label} Cloudflare bindings are missing`);
+  return bindings.map((binding) => {
+    const name = requiredString(binding?.name, `${label} binding name`);
+    const type = requiredString(binding?.type, `${label} binding type`);
+    if (type === "secret_text") return { name, type };
+    if (type === "service") {
+      return {
+        name,
+        type,
+        service: requiredString(binding?.service, `${label} service binding target`),
+        environment: requiredString(binding?.environment || "production", `${label} service binding environment`),
+      };
+    }
+    throw new Error(`${label} has an unsupported binding type: ${type}`);
+  }).sort((left, right) => `${left.type}:${left.name}`.localeCompare(`${right.type}:${right.name}`));
+}
+
+function cacheVersionIdentity(detail, expectedVersionId, label) {
+  assertVersionDetail(detail, expectedVersionId, label);
+  const number = Number(detail?.number);
+  if (!Number.isInteger(number) || number < 1) throw new Error(`${label} Cloudflare version number is invalid`);
+  const metadata = detail?.metadata;
+  const script = detail?.resources?.script;
+  const runtime = detail?.resources?.script_runtime;
+  const handlers = Array.isArray(script?.handlers) ? [...script.handlers].sort() : [];
+  if (handlers.length === 0 || handlers.some((handler) => typeof handler !== "string" || !handler)) {
+    throw new Error(`${label} Cloudflare script handlers are invalid`);
+  }
+  const actorId = requiredString(metadata?.author_id, `${label} Cloudflare author_id`);
+  const actorEmail = requiredString(metadata?.author_email, `${label} Cloudflare author_email`);
+  const versionCreatedOn = requiredString(metadata?.created_on, `${label} Cloudflare version created_on`);
+  deploymentCreatedOn({ created_on: versionCreatedOn }, `${label} version`);
+  return {
+    version_id: expectedVersionId,
+    version_number: number,
+    version_created_on: versionCreatedOn,
+    version_source: requiredString(metadata?.source, `${label} Cloudflare version source`),
+    version_triggered_by: requiredString(detail?.annotations?.["workers/triggered_by"], `${label} Cloudflare version trigger`),
+    actor_identity_sha256: sha256(`${actorId}\n${actorEmail}`),
+    script_etag: requiredString(script?.etag, `${label} Cloudflare script etag`),
+    script_handlers: handlers,
+    script_last_deployed_from: requiredString(script?.last_deployed_from, `${label} Cloudflare script deployment source`),
+    script_runtime: {
+      compatibility_date: requiredString(runtime?.compatibility_date, `${label} compatibility_date`),
+      compatibility_flags: Array.isArray(runtime?.compatibility_flags) ? [...runtime.compatibility_flags].sort() : [],
+      usage_model: requiredString(runtime?.usage_model, `${label} usage_model`),
+    },
+    binding_descriptors: cacheBindingDescriptors(detail, label),
+  };
+}
+
+function orderedDeploymentHistory(deployments, label) {
+  if (!Array.isArray(deployments) || deployments.length === 0) throw new Error(`${label} deployment history is missing`);
+  const identities = new Set();
+  const ordered = deployments.map((deployment) => {
+    const id = requiredString(deployment?.id, `${label} deployment id`);
+    if (!UUID.test(id)) throw new Error(`${label} deployment id is invalid`);
+    if (identities.has(id)) throw new Error(`${label} deployment history duplicates an identity`);
+    identities.add(id);
+    return { deployment, createdOn: deploymentCreatedOn(deployment, `${label} deployment ${id}`) };
+  }).sort((left, right) => right.createdOn - left.createdOn);
+  for (let index = 1; index < ordered.length; index += 1) {
+    if (ordered[index - 1].createdOn === ordered[index].createdOn) {
+      throw new Error(`${label} deployment chronology is ambiguous`);
+    }
+  }
+  return ordered;
+}
+
+function immediateDeploymentBefore(deployments, selectedDeployment, label) {
+  const ordered = orderedDeploymentHistory(deployments, label);
+  const selectedIndex = ordered.findIndex(({ deployment }) => deployment.id === selectedDeployment.id);
+  if (selectedIndex < 0 || selectedIndex + 1 >= ordered.length) {
+    throw new Error(`${label} has no unambiguous deployment immediately before the selected deployment`);
+  }
+  return ordered[selectedIndex + 1].deployment;
+}
+
+function assertNormalDeploymentMetadata(deployment, expectedTrigger, label) {
+  if (!isNormalFullDeployment(deployment)) throw new Error(`${label} is not a normal single-version 100% deployment`);
+  if (deployment?.source !== "wrangler" || deployment?.strategy !== "percentage") {
+    throw new Error(`${label} Cloudflare source/strategy is not the accepted normal deployment form`);
+  }
+  if (deployment?.annotations?.["workers/triggered_by"] !== expectedTrigger) {
+    throw new Error(`${label} Cloudflare deployment trigger is not ${expectedTrigger}`);
+  }
+}
+
+function successfulCutoverSteps(runRecord, preCutoverDeployment, v3Deployment) {
+  const jobs = Array.isArray(runRecord?.jobs) ? runRecord.jobs : [];
+  const steps = jobs.flatMap((job) => Array.isArray(job?.steps) ? job.steps : []);
+  const findOne = (name) => {
+    const matches = steps.filter((step) => step?.name === name);
+    if (matches.length !== 1 || matches[0].status !== "completed" || matches[0].conclusion !== "success") {
+      throw new Error(`v3 cache cut-over run does not contain one successful ${name} step`);
+    }
+    const startedOn = deploymentCreatedOn({ created_on: matches[0].started_at }, `${name} step start`);
+    const completedOn = deploymentCreatedOn({ created_on: matches[0].completed_at }, `${name} step completion`);
+    if (startedOn > completedOn) throw new Error(`${name} step chronology is invalid`);
+    return { step: matches[0], startedOn, completedOn };
+  };
+  const refresh = findOne("Apply Worker secrets to existing cache Worker");
+  const deploy = findOne("Deploy Worker");
+  if (!Number.isInteger(refresh.step.number) || deploy.step.number !== refresh.step.number + 1 || refresh.completedOn > deploy.startedOn) {
+    throw new Error("v3 cache cut-over refresh/deploy step ordering is invalid");
+  }
+  const refreshDeploymentTime = deploymentCreatedOn(preCutoverDeployment, "pre-cutover cache runtime deployment");
+  const v3DeploymentTime = deploymentCreatedOn(v3Deployment, "v3 cache cut-over deployment");
+  if (refreshDeploymentTime < refresh.startedOn || refreshDeploymentTime > refresh.completedOn) {
+    throw new Error("pre-cutover cache runtime deployment does not fall within the successful refresh step");
+  }
+  if (v3DeploymentTime < deploy.startedOn || v3DeploymentTime > deploy.completedOn) {
+    throw new Error("explicit v3 cache deployment does not fall within the successful deploy step");
+  }
+  return {
+    refresh_step: { name: refresh.step.name, started_at: refresh.step.started_at, completed_at: refresh.step.completed_at },
+    deploy_step: { name: deploy.step.name, started_at: deploy.step.started_at, completed_at: deploy.step.completed_at },
+  };
+}
+
 export function assertHistoricalCacheSelection({
   deployments,
   v2Deployment,
   v3Deployment,
   v2VersionDetail,
+  preCutoverVersionDetail,
   v3VersionDetail,
   stableStationWorker,
+  cacheWorker,
+  cacheV2Run,
+  cacheV3Run,
 }) {
   if (v2Deployment.id === v3Deployment.id) throw new Error("v2 and v3 cache deployment identities are identical");
-  const ordered = [...deployments].sort((left, right) => Date.parse(right.created_on) - Date.parse(left.created_on));
-  const v3Index = ordered.findIndex((entry) => entry.id === v3Deployment.id);
-  const v2Index = ordered.findIndex((entry) => entry.id === v2Deployment.id);
-  if (v3Index < 0 || v2Index !== v3Index + 1) {
-    throw new Error("Selected v2 cache deployment is not immediately before the explicit v3 cut-over deployment");
+  const preCutoverDeployment = immediateDeploymentBefore(deployments, v3Deployment, "cache");
+  const v2Time = deploymentCreatedOn(v2Deployment, "accepted v2 cache baseline deployment");
+  const preCutoverTime = deploymentCreatedOn(preCutoverDeployment, "pre-cutover v2 cache runtime deployment");
+  const v3Time = deploymentCreatedOn(v3Deployment, "explicit v3 cache cut-over deployment");
+  if (v2Time > preCutoverTime || preCutoverTime >= v3Time) {
+    throw new Error("Accepted v2 baseline, pre-cutover runtime, and v3 cache deployment chronology is invalid");
   }
+  assertNormalDeploymentMetadata(v2Deployment, "deployment", "Accepted v2 cache baseline deployment");
+  assertNormalDeploymentMetadata(v3Deployment, "deployment", "Explicit v3 cache cut-over deployment");
+
+  const baselineVersion = cacheVersionIdentity(v2VersionDetail, v2Deployment.versions[0].version_id, "accepted v2 cache baseline");
+  const preCutoverVersion = cacheVersionIdentity(preCutoverVersionDetail, preCutoverDeployment.versions[0].version_id, "pre-cutover v2 cache runtime");
+  const cutoverVersion = cacheVersionIdentity(v3VersionDetail, v3Deployment.versions[0].version_id, "explicit v3 cache cut-over");
   const v2Bindings = serviceBinding(v2VersionDetail, "STATION_HISTORY");
+  const preCutoverBindings = serviceBinding(preCutoverVersionDetail, "STATION_HISTORY");
   const v3Bindings = serviceBinding(v3VersionDetail, "STATION_HISTORY");
   if (v2Bindings.length !== 1 || v2Bindings[0].service !== stableStationWorker) {
     throw new Error("Historical v2 cache version is not bound to the stable station-history Worker");
   }
+  if (preCutoverBindings.length !== 1 || preCutoverBindings[0].service !== stableStationWorker) {
+    throw new Error("Pre-cutover v2 cache runtime is not bound to the stable station-history Worker");
+  }
   if (v3Bindings.length !== 1 || v3Bindings[0].service !== `${stableStationWorker}-v3-candidate`) {
     throw new Error("Explicit v3 cache cut-over version is not bound to the station-history candidate");
   }
+
+  let kind = "accepted_v2_baseline_immediate_predecessor";
+  let workflowCorrelation = null;
+  const differsFromBaseline = preCutoverDeployment.id !== v2Deployment.id;
+  if (differsFromBaseline) {
+    kind = "cutover_workflow_secret_refresh";
+    assertNormalDeploymentMetadata(preCutoverDeployment, "secret", "Pre-cutover v2 cache runtime deployment");
+    if (baselineVersion.version_source !== "wrangler" || baselineVersion.version_triggered_by !== "version_upload"
+      || preCutoverVersion.version_source !== "wrangler" || preCutoverVersion.version_triggered_by !== "secret"
+      || cutoverVersion.version_source !== "wrangler" || cutoverVersion.version_triggered_by !== "version_upload") {
+      throw new Error("Cache version source/trigger chronology does not prove a Wrangler secret refresh between deployments");
+    }
+    if (preCutoverVersion.version_number !== baselineVersion.version_number + 1
+      || cutoverVersion.version_number !== preCutoverVersion.version_number + 1) {
+      throw new Error("Cache Cloudflare version numbers are not consecutive across the secret refresh and cut-over");
+    }
+    if (baselineVersion.script_etag !== preCutoverVersion.script_etag
+      || stableJsonValue(baselineVersion.script_handlers) !== stableJsonValue(preCutoverVersion.script_handlers)
+      || baselineVersion.script_last_deployed_from !== preCutoverVersion.script_last_deployed_from
+      || stableJsonValue(baselineVersion.script_runtime) !== stableJsonValue(preCutoverVersion.script_runtime)) {
+      throw new Error("Pre-cutover cache runtime does not retain the accepted v2 baseline code/runtime identity");
+    }
+    if (stableJsonValue(baselineVersion.binding_descriptors) !== stableJsonValue(preCutoverVersion.binding_descriptors)) {
+      throw new Error("Pre-cutover cache runtime does not retain the accepted v2 non-value binding descriptors");
+    }
+    if (baselineVersion.actor_identity_sha256 !== preCutoverVersion.actor_identity_sha256
+      || preCutoverVersion.actor_identity_sha256 !== cutoverVersion.actor_identity_sha256) {
+      throw new Error("Cache version actor identity is inconsistent across baseline, refresh, and cut-over");
+    }
+    workflowCorrelation = successfulCutoverSteps(cacheV3Run, preCutoverDeployment, v3Deployment);
+  } else if (preCutoverVersion.version_id !== baselineVersion.version_id) {
+    throw new Error("Immediate pre-cutover cache deployment does not match the accepted v2 baseline version");
+  }
+
+  const identity = (runRecord, version, deployment, stationHistoryService) => ({
+    workflow_run_id: String(runRecord.id),
+    git_commit_sha: runRecord.head_sha,
+    worker_name: cacheWorker,
+    ...version,
+    deployment_id: deployment.id,
+    deployment_created_on: deployment.created_on,
+    deployment_source: deployment.source,
+    deployment_strategy: deployment.strategy,
+    deployment_triggered_by: deployment.annotations["workers/triggered_by"],
+    deployment_percentage: Number(deployment.versions[0].percentage),
+    station_history_service: stationHistoryService,
+  });
+  return {
+    accepted_v2_cache_baseline: identity(cacheV2Run, baselineVersion, v2Deployment, stableStationWorker),
+    pre_cutover_v2_cache_runtime: identity(
+      differsFromBaseline ? cacheV3Run : cacheV2Run,
+      preCutoverVersion,
+      preCutoverDeployment,
+      stableStationWorker,
+    ),
+    explicit_v3_cache_cutover: identity(cacheV3Run, cutoverVersion, v3Deployment, `${stableStationWorker}-v3-candidate`),
+    transition_proof: {
+      kind,
+      baseline_differs_from_pre_cutover_runtime: differsFromBaseline,
+      pre_cutover_is_immediate_predecessor: true,
+      script_identity_match: baselineVersion.script_etag === preCutoverVersion.script_etag,
+      script_runtime_match: stableJsonValue(baselineVersion.script_runtime) === stableJsonValue(preCutoverVersion.script_runtime),
+      binding_descriptors_match: stableJsonValue(baselineVersion.binding_descriptors) === stableJsonValue(preCutoverVersion.binding_descriptors),
+      actor_identity_match: baselineVersion.actor_identity_sha256 === preCutoverVersion.actor_identity_sha256
+        && preCutoverVersion.actor_identity_sha256 === cutoverVersion.actor_identity_sha256,
+      version_numbers_consecutive: differsFromBaseline
+        ? preCutoverVersion.version_number === baselineVersion.version_number + 1
+          && cutoverVersion.version_number === preCutoverVersion.version_number + 1
+        : true,
+      workflow_correlation: workflowCorrelation,
+      explanation: differsFromBaseline
+        ? "The exact pre-cutover v2-equivalent cache runtime was created and deployed by the successful secret-refresh step in the explicit v3 cut-over workflow; Cloudflare code/runtime and non-value binding identities remain equal to the accepted v2 baseline."
+        : "The accepted v2 cache baseline deployment is itself the immediate pre-cutover runtime.",
+    },
+  };
 }
 
-const component = (role, workerName, commit, versionId, deploymentId, runId) => ({
+const component = (role, workerName, commit, versionId, deploymentId, runId, capturedBy = "") => ({
   role,
   worker_name: workerName,
   git_commit_sha: commit,
   deployment: {
     version_id: versionId,
     deployment_id: deploymentId,
-    captured_by: `GitHub Actions run ${runId} version UUID corroborated by the read-only Cloudflare Workers deployments and version-detail APIs`,
+    captured_by: capturedBy || `GitHub Actions run ${runId} version UUID corroborated by the read-only Cloudflare Workers deployments and version-detail APIs`,
   },
 });
 
@@ -319,18 +541,24 @@ export function buildRollbackPayload({
   assertVersionDetail(versionDetails.cacheV3, cacheV3Version, "v3 cache cut-over");
   assertStableDeploymentAtCutover({ deployments: deployments.observations, selectedDeployment: observationsDeployment, cutoverDeployment: cacheV3Deployment, label: "observations" });
   assertStableDeploymentAtCutover({ deployments: deployments.station, selectedDeployment: stationDeployment, cutoverDeployment: cacheV3Deployment, label: "station" });
-  assertHistoricalCacheSelection({
+  const cacheProvenance = assertHistoricalCacheSelection({
     deployments: deployments.cache,
     v2Deployment: cacheV2Deployment,
     v3Deployment: cacheV3Deployment,
     v2VersionDetail: versionDetails.cacheV2,
+    preCutoverVersionDetail: versionDetails.cachePreCutover,
     v3VersionDetail: versionDetails.cacheV3,
     stableStationWorker: stationWorker,
+    cacheWorker,
+    cacheV2Run,
+    cacheV3Run,
   });
+  const preCutoverCacheRuntime = cacheProvenance.pre_cutover_v2_cache_runtime;
   const artifacts = [
     ["observations_deploy_workflow", WORKFLOWS.observations, observationsRun.head_sha],
     ["station_deploy_workflow", WORKFLOWS.station, stationRun.head_sha],
     ["cache_deploy_workflow", WORKFLOWS.cache, cacheV2Run.head_sha],
+    ["cache_cutover_deploy_workflow", WORKFLOWS.cache, cacheV3Run.head_sha],
     ["observations_worker_config", "workers/uk_aq_observs_history_r2_api_worker/wrangler.toml", observationsRun.head_sha],
     ["station_worker_config", "workers/uk_aq_station_history/wrangler.toml", stationRun.head_sha],
     ["cache_worker_config", "workers/uk_aq_cache_proxy/wrangler.toml", cacheV2Run.head_sha],
@@ -345,17 +573,28 @@ export function buildRollbackPayload({
     history_version: "v2",
     index_authority_generation: "v2",
     integrity_version: "v2",
+    cache_provenance: cacheProvenance,
     components: [
       component("stable_observations_worker", observationsWorker, observationsRun.head_sha, observationsVersion, observationsDeployment.id, observationsRun.id),
       component("stable_station_worker", stationWorker, stationRun.head_sha, stationVersion, stationDeployment.id, stationRun.id),
-      component("cache_worker", cacheWorker, cacheV2Run.head_sha, cacheV2Version, cacheV2Deployment.id, cacheV2Run.id),
+      component(
+        "cache_worker",
+        cacheWorker,
+        cacheV2Run.head_sha,
+        preCutoverCacheRuntime.version_id,
+        preCutoverCacheRuntime.deployment_id,
+        preCutoverCacheRuntime.workflow_run_id,
+        cacheProvenance.transition_proof.baseline_differs_from_pre_cutover_runtime
+          ? `Cloudflare secret-refresh version/deployment correlated with GitHub Actions v3 cut-over run ${preCutoverCacheRuntime.workflow_run_id}; code/runtime and non-value bindings match accepted v2 baseline run ${cacheV2Run.id}`
+          : `GitHub Actions accepted v2 baseline run ${cacheV2Run.id} version UUID corroborated by the read-only Cloudflare Workers deployments and version-detail APIs`,
+      ),
     ],
     artifacts,
     restore_steps: [
       { order: 1, role: "restore_observations_worker", kind: "command", description: "Restore the exact accepted stable observations-history Worker version to 100% using normal Cloudflare authentication loaded for an authorised rollback.", command_or_workflow: `npx wrangler versions deploy ${observationsVersion}@100% --name ${observationsWorker} -y` },
       { order: 2, role: "restore_station_worker", kind: "command", description: "Restore the exact accepted stable station-history Worker version to 100% using normal Cloudflare authentication loaded for an authorised rollback.", command_or_workflow: `npx wrangler versions deploy ${stationVersion}@100% --name ${stationWorker} -y` },
       { order: 3, role: "restore_v2_index_authority", kind: "command", description: "Restore persistent observation-history index authority to v2.", command_or_workflow: `gh variable set UK_AQ_R2_HISTORY_INDEX_VERSION --repo ${repository} --body v2` },
-      { order: 4, role: "restore_cache_worker_v2_binding", kind: "command", description: "Restore the exact accepted v2 cache Worker version to 100% using normal Cloudflare authentication loaded for an authorised rollback; its stable station-history binding is proven by this record.", command_or_workflow: `npx wrangler versions deploy ${cacheV2Version}@100% --name ${cacheWorker} -y` },
+      { order: 4, role: "restore_cache_worker_v2_binding", kind: "command", description: "Restore the exact immediate pre-cutover v2-equivalent cache Worker version to 100% using normal Cloudflare authentication loaded for an authorised rollback; its accepted baseline provenance and stable station-history binding are proven by this record.", command_or_workflow: `npx wrangler versions deploy ${preCutoverCacheRuntime.version_id}@100% --name ${cacheWorker} -y` },
     ],
   };
 }
@@ -375,6 +614,7 @@ function githubVariable(name, repository, repositoryRoot) {
 
 function githubRun(id, repository, repositoryRoot) {
   const record = JSON.parse(gh(["api", `repos/${repository}/actions/runs/${id}`], repositoryRoot));
+  const jobsResult = JSON.parse(gh(["api", `repos/${repository}/actions/runs/${id}/jobs?per_page=100`], repositoryRoot));
   return {
     id: String(record.id),
     path: record.path,
@@ -383,6 +623,7 @@ function githubRun(id, repository, repositoryRoot) {
     status: record.status,
     conclusion: record.conclusion,
     log: gh(["run", "view", String(id), "--repo", repository, "--log"], repositoryRoot),
+    jobs: Array.isArray(jobsResult?.jobs) ? jobsResult.jobs : [],
   };
 }
 
@@ -534,10 +775,17 @@ export async function main(argv = process.argv.slice(2), environment = process.e
       cacheV2: parseWorkflowVersionId(runs.cacheV2.log, "v2 cache"),
       cacheV3: parseWorkflowVersionId(runs.cacheV3.log, "v3 cache cut-over"),
     };
+    const cacheV3Deployment = selectDeployment(deployments.cache, versionIds.cacheV3, "v3 cache cut-over");
+    const cachePreCutoverDeployment = immediateDeploymentBefore(deployments.cache, cacheV3Deployment, "cache");
+    if (!isNormalFullDeployment(cachePreCutoverDeployment)) {
+      throw new Error("Cache deployment immediately before v3 cut-over is not a normal single-version 100% deployment");
+    }
+    const cachePreCutoverVersionId = cachePreCutoverDeployment.versions[0].version_id;
     const versionDetails = {
       observations: await workerVersion(credentials.observations.accountId, credentials.observations.apiToken, workerNames.observations, versionIds.observations),
       station: await workerVersion(credentials.domain.accountId, credentials.domain.apiToken, workerNames.station, versionIds.station),
       cacheV2: await workerVersion(credentials.domain.accountId, credentials.domain.apiToken, workerNames.cache, versionIds.cacheV2),
+      cachePreCutover: await workerVersion(credentials.domain.accountId, credentials.domain.apiToken, workerNames.cache, cachePreCutoverVersionId),
       cacheV3: await workerVersion(credentials.domain.accountId, credentials.domain.apiToken, workerNames.cache, versionIds.cacheV3),
     };
     payload = buildRollbackPayload({ repositoryRoot, environment: captureEnvironment, repository: github.repository, branch: state.branch, head: state.head, defaultBranch: github.defaultBranch, workerNames, runs, deployments, versionDetails });

@@ -253,6 +253,52 @@ test("post-cutover smoke does not claim cache bypass proves a fresh inner MISS",
 });
 
 test("v2 runtime rollback evidence requires exact non-secret deployment and Git identities", () => {
+  const cacheIdentity = ({ workflowRunId, versionId, versionNumber, deploymentId, createdOn, stationService }) => ({
+    workflow_run_id: workflowRunId,
+    git_commit_sha: gitHead,
+    worker_name: "uk-aq-cache-test",
+    version_id: versionId,
+    version_number: versionNumber,
+    version_created_on: createdOn,
+    version_source: "wrangler",
+    version_triggered_by: "version_upload",
+    actor_identity_sha256: "a".repeat(64),
+    script_etag: "b".repeat(64),
+    script_handlers: ["fetch"],
+    script_last_deployed_from: "wrangler",
+    script_runtime: {
+      compatibility_date: "2026-02-22",
+      compatibility_flags: ["global_fetch_strictly_public"],
+      usage_model: "standard",
+    },
+    binding_descriptors: [
+      { name: "UK_AQ_CACHE_BYPASS_SECRET", type: "secret_text" },
+      { name: "STATION_HISTORY", type: "service", service: stationService, environment: null },
+    ],
+    deployment_id: deploymentId,
+    deployment_created_on: createdOn,
+    deployment_source: "wrangler",
+    deployment_strategy: "percentage",
+    deployment_triggered_by: "deployment",
+    deployment_percentage: 100,
+    station_history_service: stationService,
+  });
+  const v2Cache = cacheIdentity({
+    workflowRunId: "100",
+    versionId: "33333333-3333-4333-8333-333333333333",
+    versionNumber: 10,
+    deploymentId: "44444444-4444-4444-8444-444444444444",
+    createdOn: "2026-08-28T10:00:00.000Z",
+    stationService: "uk-aq-station-history-test",
+  });
+  const v3Cache = cacheIdentity({
+    workflowRunId: "101",
+    versionId: "55555555-5555-4555-8555-555555555555",
+    versionNumber: 11,
+    deploymentId: "66666666-6666-4666-8666-666666666666",
+    createdOn: "2026-08-28T11:00:00.000Z",
+    stationService: "uk-aq-station-history-test-v3-candidate",
+  });
   const payload = {
     environment: "TEST",
     repository: "TEST-uk-aq/uk-aq-ops",
@@ -270,12 +316,34 @@ test("v2 runtime rollback evidence requires exact non-secret deployment and Git 
       role,
       worker_name,
       git_commit_sha: gitHead,
-      deployment: { version_id, deployment_id: `deployment-${role}`, captured_by: "read-only Cloudflare versions API" },
+      deployment: {
+        version_id,
+        deployment_id: role === "cache_worker" ? v2Cache.deployment_id : `deployment-${role}`,
+        captured_by: "read-only Cloudflare versions API",
+      },
     })),
+    cache_provenance: {
+      accepted_v2_cache_baseline: v2Cache,
+      pre_cutover_v2_cache_runtime: structuredClone(v2Cache),
+      explicit_v3_cache_cutover: v3Cache,
+      transition_proof: {
+        kind: "accepted_v2_baseline_immediate_predecessor",
+        baseline_differs_from_pre_cutover_runtime: false,
+        pre_cutover_is_immediate_predecessor: true,
+        script_identity_match: true,
+        script_runtime_match: true,
+        binding_descriptors_match: true,
+        actor_identity_match: true,
+        version_numbers_consecutive: true,
+        workflow_correlation: null,
+        explanation: "The accepted v2 deployment is the immediate predecessor to the explicit v3 cut-over.",
+      },
+    },
     artifacts: [
       gitBlobIdentity("observations_deploy_workflow", ".github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml"),
       gitBlobIdentity("station_deploy_workflow", ".github/workflows/uk_aq_station_history_deploy.yml"),
       gitBlobIdentity("cache_deploy_workflow", ".github/workflows/uk_aq_cache_proxy_deploy.yml"),
+      gitBlobIdentity("cache_cutover_deploy_workflow", ".github/workflows/uk_aq_cache_proxy_deploy.yml"),
       gitBlobIdentity("observations_worker_config", "workers/uk_aq_observs_history_r2_api_worker/wrangler.toml"),
       gitBlobIdentity("station_worker_config", "workers/uk_aq_station_history/wrangler.toml"),
       gitBlobIdentity("cache_worker_config", "workers/uk_aq_cache_proxy/wrangler.toml"),
@@ -291,7 +359,11 @@ test("v2 runtime rollback evidence requires exact non-secret deployment and Git 
       role,
       kind: index === 2 ? "command" : "github_workflow",
       description,
-      command_or_workflow: index === 2 ? "gh variable set UK_AQ_R2_HISTORY_INDEX_VERSION --body v2" : "gh workflow run ... --ref <pinned-sha>",
+      command_or_workflow: index === 2
+        ? "gh variable set UK_AQ_R2_HISTORY_INDEX_VERSION --body v2"
+        : (index === 3
+          ? `npx wrangler versions deploy ${v2Cache.version_id}@100% --name ${v2Cache.worker_name} -y`
+          : "gh workflow run ... --ref <pinned-sha>"),
     })),
   };
   const evidence = evidenceEnvelope("uk_aq_index_v3_v2_runtime_rollback_record", payload);
