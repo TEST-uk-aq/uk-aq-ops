@@ -1,5 +1,4 @@
-# The deployment workflow supplies --name after deriving the candidate identity
-# from UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME.
+name = "uk-aq-observs-history-r2-api-v3-candidate"
 main = "worker.mjs"
 compatibility_date = "2026-08-21"
 

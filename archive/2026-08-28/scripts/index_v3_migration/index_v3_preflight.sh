@@ -35,52 +35,8 @@ fail() {
   exit 1
 }
 
-candidate_worker_name() {
-  local active_name="${1:-}" candidate_name
-  case "$active_name" in
-    ''|*[!a-z0-9-]*|-*|*-) return 1 ;;
-  esac
-  candidate_name="${active_name}-v3-candidate"
-  [ "${#candidate_name}" -le 63 ] || return 1
-  printf '%s\n' "$candidate_name"
-}
-
-noncompleted_workflow_runs() {
-  jq -c '[.[] | select(.status != "completed")]'
-}
-
-maintenance_status_is_on() {
-  node -e '
-    let raw = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => { raw += chunk; });
-    process.stdin.on("end", () => {
-      let payload;
-      try {
-        payload = JSON.parse(raw);
-      } catch {
-        process.exitCode = 1;
-        return;
-      }
-      if (
-        !payload
-        || payload.schema_version !== 1
-        || payload.mode !== "on"
-        || typeof payload.deployment_id !== "string"
-        || !payload.deployment_id.trim()
-        || typeof payload.artifact_built_at_utc !== "string"
-        || Number.isNaN(Date.parse(payload.artifact_built_at_utc))
-      ) {
-        process.exitCode = 1;
-      }
-    });
-  '
-}
-
 self_test() {
-  local output status candidate legacy_workflow legacy_status fixture
-  command -v jq >/dev/null 2>&1 || fail "self-test: jq is unavailable"
-  command -v node >/dev/null 2>&1 || fail "self-test: node is unavailable"
+  local output status
   set +e
   output="$("$0" --_self-test-fail 2>&1)"
   status=$?
@@ -95,60 +51,8 @@ self_test() {
     || fail "self-test: warning stopped execution"
   printf '%s\n' "$output" | grep -Fq 'SELF_TEST_AFTER_WARNING' \
     || fail "self-test: warning did not continue"
-
-  output="$(printf '%s\n' '[{"status":"completed"}]' | noncompleted_workflow_runs)" \
-    || fail "self-test: completed workflow fixture could not be evaluated"
-  [ "$output" = '[]' ] || fail "self-test: completed workflow was treated as active"
-  for status in in_progress queued waiting; do
-    output="$(printf '[{"status":"%s"}]\n' "$status" | noncompleted_workflow_runs)" \
-      || fail "self-test: $status workflow fixture could not be evaluated"
-    [ "$output" != '[]' ] || fail "self-test: $status workflow was treated as idle"
-  done
-
-  fixture='{"schema_version":1,"mode":"on","deployment_id":"self-test","artifact_built_at_utc":"2026-08-28T00:00:00.000Z"}'
-  printf '%s\n' "$fixture" | maintenance_status_is_on \
-    || fail "self-test: valid maintenance status was rejected"
-  for fixture in \
-    '{"schema_version":1,"mode":"off","deployment_id":"self-test","artifact_built_at_utc":"2026-08-28T00:00:00.000Z"}' \
-    '{"schema_version":1,"mode":"on","deployment_id":"","artifact_built_at_utc":"2026-08-28T00:00:00.000Z"}' \
-    '{"schema_version":1,"mode":"on","deployment_id":"self-test","artifact_built_at_utc":"not-a-date"}' \
-    'not-json'
-  do
-    if printf '%s\n' "$fixture" | maintenance_status_is_on 2>/dev/null; then
-      fail "self-test: invalid maintenance status was accepted"
-    fi
-  done
-
-  candidate="$(candidate_worker_name 'uk-aq-station-history-test')" \
-    || fail "self-test: TEST station candidate name was rejected"
-  [ "$candidate" = 'uk-aq-station-history-test-v3-candidate' ] \
-    || fail "self-test: TEST station candidate name was derived incorrectly"
-  candidate="$(candidate_worker_name 'uk-aq-station-history-live')" \
-    || fail "self-test: LIVE station candidate name was rejected"
-  [ "$candidate" = 'uk-aq-station-history-live-v3-candidate' ] \
-    || fail "self-test: LIVE station candidate name was derived incorrectly"
-  candidate="$(candidate_worker_name 'uk-aq-observs-history-r2-api-test')" \
-    || fail "self-test: TEST observations candidate name was rejected"
-  [ "$candidate" = 'uk-aq-observs-history-r2-api-test-v3-candidate' ] \
-    || fail "self-test: TEST observations candidate name was derived incorrectly"
-  candidate="$(candidate_worker_name 'uk-aq-observs-history-r2-api-live')" \
-    || fail "self-test: LIVE observations candidate name was rejected"
-  [ "$candidate" = 'uk-aq-observs-history-r2-api-live-v3-candidate' ] \
-    || fail "self-test: LIVE observations candidate name was derived incorrectly"
-
-  legacy_workflow="$(printf '%s%s' 'UK AQ Edge Maintenance ' 'Deploy')"
-  legacy_status="$(printf '%s%s' '__uk_aq_site_' 'mode.json')"
-  ! grep -Fq "$legacy_workflow" "$0" \
-    || fail "self-test: obsolete maintenance workflow lookup returned"
-  ! grep -Fq "$legacy_status" "$0" \
-    || fail "self-test: obsolete maintenance status path returned"
-
   pass "induced mandatory failure stopped immediately"
   pass "induced warning continued"
-  pass "completed and non-completed workflow states remain distinguished"
-  pass "maintenance status requires valid schema-v1 ON evidence and a deployment ID"
-  pass "TEST and LIVE candidate Worker names derive from active Worker names"
-  pass "obsolete maintenance lookup strings remain absent"
 }
 
 case "${1:-}" in
@@ -238,11 +142,6 @@ done
 
 ENVIRONMENT="$(printf '%s' "$UKAQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')"
 case "$ENVIRONMENT" in TEST|LIVE) ;; *) fail "UKAQ_ENV_NAME must identify TEST or LIVE" ;; esac
-
-STATION_CANDIDATE_WORKER_NAME="$(candidate_worker_name "$UK_AQ_STATION_HISTORY_WORKER_NAME")" \
-  || fail "UK_AQ_STATION_HISTORY_WORKER_NAME cannot form a valid candidate Worker name"
-OBSERVATIONS_CANDIDATE_WORKER_NAME="$(candidate_worker_name "$UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME")" \
-  || fail "UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME cannot form a valid candidate Worker name"
 
 printf '%s\n' '============================================================'
 printf 'UK AQ INDEX V3 PREFLIGHT: %s / %s\n' "$ENVIRONMENT" "$STAGE"
@@ -456,14 +355,9 @@ WRITER_PROCESSES="$(pgrep -af 'uk_aq_observation_history_migration_v3|uk_aq_prun
 }
 pass "no local canonical-history writer or migration process is running"
 
-PRUNE_RUNS="$(gh run list --repo "$REPO_SLUG" --workflow uk_aq_prune_daily.yml --limit 50 --json databaseId,status,conclusion,event,createdAt,url 2>/dev/null)" \
-  || fail "recent Prune Daily workflow state could not be read"
-ACTIVE_PRUNE="$(printf '%s' "$PRUNE_RUNS" | noncompleted_workflow_runs)" \
-  || fail "recent Prune Daily workflow state is malformed"
-[ "$ACTIVE_PRUNE" = "[]" ] || {
-  printf '%s\n' "$ACTIVE_PRUNE" >&2
-  fail "a recent Prune Daily workflow run is not completed"
-}
+ACTIVE_PRUNE="$(gh run list --repo "$REPO_SLUG" --workflow uk_aq_prune_daily.yml --status in_progress --limit 1 --json databaseId 2>/dev/null)" \
+  || fail "active Prune Daily workflow state could not be read"
+[ "$ACTIVE_PRUNE" = "[]" ] || fail "Prune Daily workflow is currently running"
 pass "Prune Daily workflow is idle"
 
 SCHEDULER_CONFIG="cloudflare/scheduler/wrangler.toml"
@@ -485,27 +379,32 @@ printf '%s' "$D1_JSON" | jq -e '
 ' >/dev/null || fail "remote scheduler rows are not exactly the three required disabled jobs"
 pass "all migration-sensitive scheduler jobs are disabled in $D1_DATABASE"
 
+MAINTENANCE_WORKFLOW="UK AQ Edge Maintenance Deploy"
+MAINT_RUN="$(gh run list --repo "$REPO_SLUG" --workflow "$MAINTENANCE_WORKFLOW" --limit 1 --json databaseId,status,conclusion 2>/dev/null | jq '.[0] // null')" \
+  || fail "latest maintenance deployment workflow could not be read"
+[ "$MAINT_RUN" != "null" ] || fail "no maintenance deployment workflow run was found"
+printf '%s' "$MAINT_RUN" | jq -e '.status == "completed" and .conclusion == "success"' >/dev/null \
+  || fail "latest maintenance deployment workflow is not a completed success"
+MAINT_RUN_ID="$(printf '%s' "$MAINT_RUN" | jq -r '.databaseId')"
+MAINT_LOG="$(gh run view "$MAINT_RUN_ID" --repo "$REPO_SLUG" --log 2>/dev/null)" \
+  || fail "latest maintenance deployment log could not be read"
+printf '%s\n' "$MAINT_LOG" | grep -Fq 'maintenance_enabled=true' \
+  || fail "latest maintenance deployment does not prove maintenance_enabled=true"
+pass "latest maintenance deployment explicitly enabled maintenance"
+
 SITE_URL="${SITE_URL%/}"
-CACHE_BUSTER="$(date -u +%s)-$$"
-SITE_MODE="$(curl -fsSL \
-  -H 'Cache-Control: no-cache, no-store' \
-  -H 'Pragma: no-cache' \
-  "$SITE_URL/uk-aq-site-mode.json?uk_aq_site_mode_check=$CACHE_BUSTER")" \
+CACHE_BUSTER="$(date -u +%s)"
+SITE_MODE="$(curl -fsS -H 'Cache-Control: no-cache' "$SITE_URL/__uk_aq_site_mode.json?cb=$CACHE_BUSTER")" \
   || fail "public maintenance status could not be read"
-printf '%s' "$SITE_MODE" | maintenance_status_is_on \
+printf '%s' "$SITE_MODE" | jq -e '.schema_version == 1 and .mode == "on" and (.deployment_id | type == "string" and length > 0)' >/dev/null \
   || fail "public maintenance status is not positively ON"
-ROUTE_NUMBER=0
-for path in / /hex_map/ /about/ /dev-blog/ /resources/ /sensor_map/ /sensors/; do
-  ROUTE_NUMBER=$((ROUTE_NUMBER + 1))
-  PAGE="$(curl -sSL \
-    -H 'Cache-Control: no-cache, no-store' \
-    -H 'Pragma: no-cache' \
-    "$SITE_URL$path?uk_aq_site_mode_check=$CACHE_BUSTER-$ROUTE_NUMBER")" \
+for path in / /sensors/; do
+  PAGE="$(curl -fsS -H 'Cache-Control: no-cache' "$SITE_URL$path?cb=$CACHE_BUSTER")" \
     || fail "public maintenance page could not be read: $path"
-  printf '%s' "$PAGE" | grep -Fq '<meta name="uk-aq-site-maintenance" content="on">' \
+  printf '%s' "$PAGE" | grep -Fq 'System maintenance in progress.' \
     || fail "maintenance marker is absent from public path $path"
 done
-pass "public site-mode deployment and all maintenance routes are positively ON"
+pass "public site root and representative deep link show maintenance"
 
 if [ "$STAGE" = "migration-start" ]; then
   printf '\nPREFLIGHT PASS: migration-start prerequisites are satisfied.\n'
@@ -583,7 +482,7 @@ check_candidate() {
   pass "$label latest deployment is successful and current"
 }
 
-check_candidate "observations-history v3 candidate ($OBSERVATIONS_CANDIDATE_WORKER_NAME)" \
+check_candidate "observations-history v3 candidate" \
   uk_aq_observs_history_r2_api_v3_candidate_deploy.yml \
   .github/workflows/uk_aq_observs_history_r2_api_v3_candidate_deploy.yml \
   workers/uk_aq_observs_history_r2_api_v3_candidate \
@@ -592,7 +491,7 @@ check_candidate "observations-history v3 candidate ($OBSERVATIONS_CANDIDATE_WORK
   workers/shared/uk_aq_observation_history_index_v3.mjs \
   workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs
 
-check_candidate "station-history v3 candidate ($STATION_CANDIDATE_WORKER_NAME)" \
+check_candidate "station-history v3 candidate" \
   uk_aq_station_history_v3_candidate_deploy.yml \
   .github/workflows/uk_aq_station_history_v3_candidate_deploy.yml \
   workers/uk_aq_station_history_v3_candidate \
@@ -606,12 +505,6 @@ grep -Fq 'UK_AQ_R2_HISTORY_INDEX_VERSION = "v3"' workers/uk_aq_station_history_v
   || fail "station-history candidate is not fixed to index v3"
 grep -Fq 'workers_dev = false' workers/uk_aq_station_history_v3_candidate/wrangler.toml \
   || fail "station-history candidate is not private"
-grep -Fq 'UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME' .github/workflows/uk_aq_station_history_v3_candidate_deploy.yml \
-  || fail "station-history candidate deployment does not derive the observations candidate identity"
-grep -Fq 'UK_AQ_STATION_HISTORY_WORKER_NAME' .github/workflows/uk_aq_station_history_v3_candidate_deploy.yml \
-  || fail "station-history candidate deployment does not derive its Worker identity"
-grep -Fq 'UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME' .github/workflows/uk_aq_observs_history_r2_api_v3_candidate_deploy.yml \
-  || fail "observations candidate deployment does not derive its Worker identity"
 grep -Fq 'UK_AQ_STATION_HISTORY_WORKER_NAME' .github/workflows/uk_aq_cache_proxy_deploy.yml \
   || fail "cache-proxy deployment is not controlled by the station Worker variable"
 grep -Fq '__UK_AQ_STATION_HISTORY_WORKER_NAME__' workers/uk_aq_cache_proxy/wrangler.toml \

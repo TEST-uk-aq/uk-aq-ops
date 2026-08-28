@@ -3,16 +3,34 @@
 // by its manual deployment workflow; the active station Worker remains intact.
 import stationHistoryWorker from "../uk_aq_station_history/src/index.mjs";
 
-function assertV3Candidate(env) {
+export function assertV3Candidate(env) {
   if (String(env.UK_AQ_R2_HISTORY_INDEX_VERSION || "").trim().toLowerCase() !== "v3") {
     throw new Error("Station-history v3 candidate requires index generation v3");
   }
-  const url = new URL(String(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL || ""));
+  const activeObservationsWorkerName = String(
+    env.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || "",
+  ).trim();
+  if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(activeObservationsWorkerName)) {
+    throw new Error("Station-history v3 candidate requires the active observations Worker name");
+  }
+  const expectedCandidateWorkerName = `${activeObservationsWorkerName}-v3-candidate`;
+  let url;
+  try {
+    url = new URL(String(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL || ""));
+  } catch {
+    throw new Error("Station-history v3 candidate requires a valid observations candidate URL");
+  }
+  const expectedHostname = new RegExp(
+    `^${expectedCandidateWorkerName}\\.[a-z0-9-]+\\.workers\\.dev$`,
+    "i",
+  );
   if (
     url.protocol !== "https:"
-    || !/^uk-aq-observs-history-r2-api-v3-candidate\.[a-z0-9-]+\.workers\.dev$/i.test(url.hostname)
+    || !expectedHostname.test(url.hostname)
   ) {
-    throw new Error("Station-history v3 candidate requires the fixed v3 observations candidate URL");
+    throw new Error(
+      `Station-history v3 candidate requires the ${expectedCandidateWorkerName} observations URL`,
+    );
   }
 }
 

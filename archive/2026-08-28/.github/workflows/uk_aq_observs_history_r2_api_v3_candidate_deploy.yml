@@ -13,7 +13,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
-      UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || '' }}
+      CANDIDATE_WORKER_NAME: uk-aq-observs-history-r2-api-v3-candidate
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -27,14 +27,8 @@ jobs:
           test -n "${CLOUDFLARE_ACCOUNT_ID}" || { echo "Missing UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID."; exit 1; }
           test -n "${CLOUDFLARE_API_TOKEN}" || { echo "Missing UK_AQ_R2_CLOUDFLARE_API_TOKEN."; exit 1; }
           test -n "${CFLARE_R2_BUCKET}" || { echo "Missing CFLARE_R2_BUCKET."; exit 1; }
-          test -n "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" || { echo "Missing UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME."; exit 1; }
-          case "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" in
-            *[!a-z0-9-]*|-*|*-) echo "UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME is not a valid active Worker name."; exit 1 ;;
-          esac
-          test "${#UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" -le 50 || { echo "UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME is too long to derive a candidate name."; exit 1; }
-          printf 'CANDIDATE_WORKER_NAME=%s-v3-candidate\n' "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" >> "${GITHUB_ENV}"
           test -n "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" || { echo "Missing UK_AQ_EDGE_UPSTREAM_SECRET."; exit 1; }
-      - name: Resolve R2 bucket binding
+      - name: Resolve TEST R2 bucket binding
         working-directory: workers/uk_aq_observs_history_r2_api_v3_candidate
         run: |
           set -euo pipefail
@@ -51,3 +45,4 @@ jobs:
       - name: Deploy non-authoritative candidate
         working-directory: workers/uk_aq_observs_history_r2_api_v3_candidate
         run: npx --yes wrangler@4 deploy --name "${CANDIDATE_WORKER_NAME}"
+
