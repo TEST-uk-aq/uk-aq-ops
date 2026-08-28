@@ -26,6 +26,12 @@ function resolveStationHistoryService(normalService, authorityGeneration, overri
   });
 }
 
+function workflowStepIndex(stepName) {
+  const index = cacheWorkflow.indexOf(`- name: ${stepName}`);
+  assert.notEqual(index, -1, `missing workflow step: ${stepName}`);
+  return index;
+}
+
 test("maintenance preflight follows the published site-mode marker contract", () => {
   const obsoleteWorkflow = ["UK AQ Edge Maintenance ", "Deploy"].join("");
   const obsoleteStatus = ["__uk_aq_site_", "mode.json"].join("");
@@ -162,6 +168,57 @@ test("an ordinary cache-proxy push preserves persistent v3 reader authority", ()
   assert.match(cacheWorkflow, /UK_AQ_R2_HISTORY_INDEX_VERSION: \$\{\{ vars\.UK_AQ_R2_HISTORY_INDEX_VERSION \|\| '' \}\}/);
   assert.match(cacheWorkflow, /"\$\{UK_AQ_R2_HISTORY_INDEX_VERSION\}"/);
   assert.doesNotMatch(cacheWorkflow, /UK_AQ_R2_HISTORY_INDEX_VERSION[^\n]*\|\| 'v2'/);
+});
+
+test("all cache deployment prerequisites precede the authority-changing deploy", () => {
+  const orderedSteps = [
+    "Validate cache deployment identity and Cloudflare credentials",
+    "Resolve STATION_HISTORY Service Binding target",
+    "Validate required Worker secrets and vars",
+    "Prepare and validate Worker secrets payload",
+    "Validate Worker deployment package",
+    "Verify existing operational Workers",
+    "Apply Worker secrets to existing cache Worker",
+    "Deploy Worker",
+  ];
+  const positions = orderedSteps.map(workflowStepIndex);
+  for (let index = 1; index < positions.length; index += 1) {
+    assert.ok(
+      positions[index - 1] < positions[index],
+      `${orderedSteps[index - 1]} must precede ${orderedSteps[index]}`,
+    );
+  }
+
+  assert.match(cacheWorkflow, /missing_secrets=\(\)/);
+  assert.match(cacheWorkflow, /missing_vars=\(\)/);
+  assert.match(cacheWorkflow, /jq -e 'type == "object" and length > 0/);
+  assert.match(cacheWorkflow, /--dry-run/);
+  assert.match(cacheWorkflow, /versions list/);
+  assert.match(cacheWorkflow, /verify_existing_worker/);
+  assert.match(cacheWorkflow, /This operational workflow does not bootstrap Workers/);
+  assert.match(cacheWorkflow, /"\$\{STATION_HISTORY_SERVICE\}"/);
+});
+
+test("cache secrets are prepared and applied before one operational binding deploy", () => {
+  const deploymentCommand = /command: deploy --config wrangler\.deploy\.toml --name \$\{\{ env\.UK_AQ_CACHE_WORKER_NAME \}\}/g;
+  const deployments = cacheWorkflow.match(deploymentCommand) || [];
+  assert.equal(deployments.length, 1);
+  assert.doesNotMatch(cacheWorkflow, /Deploy Worker \(base\)/);
+
+  const prepareIndex = workflowStepIndex("Prepare and validate Worker secrets payload");
+  const applyIndex = workflowStepIndex("Apply Worker secrets to existing cache Worker");
+  const deployIndex = workflowStepIndex("Deploy Worker");
+  assert.ok(prepareIndex < applyIndex);
+  assert.ok(applyIndex < deployIndex);
+  assert.match(cacheWorkflow.slice(applyIndex, deployIndex), /for attempt in 1 2 3/);
+  assert.match(cacheWorkflow.slice(applyIndex, deployIndex), /wrangler@4 secret bulk/);
+});
+
+test("no prerequisite failure gate remains after the authority-changing deploy", () => {
+  const deployIndex = workflowStepIndex("Deploy Worker");
+  const afterDeploy = cacheWorkflow.slice(deployIndex);
+  assert.doesNotMatch(afterDeploy, /missing_secrets|missing_vars|jq -e|versions list|secret bulk/);
+  assert.match(afterDeploy, /Report deployed STATION_HISTORY target/);
 });
 
 test("rollback to persistent v2 authority restores the normal default", () => {

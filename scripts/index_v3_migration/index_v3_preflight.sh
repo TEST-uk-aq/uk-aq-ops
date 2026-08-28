@@ -629,6 +629,53 @@ grep -Fq "UK_AQ_R2_HISTORY_INDEX_VERSION: \${{ vars.UK_AQ_R2_HISTORY_INDEX_VERSI
   || fail "cache-proxy workflow does not load the persistent observation-index authority"
 grep -Fq 'command: deploy --name ${{ env.UK_AQ_STATION_HISTORY_WORKER_NAME }}' "$STATION_WORKFLOW" \
   || fail "normal station deployment no longer uses the stable Worker identity"
+if grep -Fq 'Deploy Worker (base)' "$CACHE_WORKFLOW"; then
+  fail "cache-proxy operational workflow still performs an unsafe bootstrap deployment"
+fi
+CACHE_DEPLOY_COMMAND='command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}'
+[ "$(grep -Fc "$CACHE_DEPLOY_COMMAND" "$CACHE_WORKFLOW")" -eq 1 ] \
+  || fail "cache-proxy workflow must contain exactly one authority-changing deployment"
+workflow_step_line() {
+  grep -nF -- "- name: $1" "$CACHE_WORKFLOW" | head -n 1 | cut -d: -f1
+}
+CACHE_IDENTITY_VALIDATE_LINE="$(workflow_step_line 'Validate cache deployment identity and Cloudflare credentials')"
+CACHE_BINDING_RESOLVE_LINE="$(workflow_step_line 'Resolve STATION_HISTORY Service Binding target')"
+CACHE_REQUIRED_VALIDATE_LINE="$(workflow_step_line 'Validate required Worker secrets and vars')"
+CACHE_SECRET_PREPARE_LINE="$(workflow_step_line 'Prepare and validate Worker secrets payload')"
+CACHE_PACKAGE_VALIDATE_LINE="$(workflow_step_line 'Validate Worker deployment package')"
+CACHE_EXISTING_WORKER_LINE="$(workflow_step_line 'Verify existing operational Workers')"
+CACHE_SECRET_APPLY_LINE="$(workflow_step_line 'Apply Worker secrets to existing cache Worker')"
+CACHE_DEPLOY_LINE="$(workflow_step_line 'Deploy Worker')"
+for line in \
+  "$CACHE_IDENTITY_VALIDATE_LINE" \
+  "$CACHE_BINDING_RESOLVE_LINE" \
+  "$CACHE_REQUIRED_VALIDATE_LINE" \
+  "$CACHE_SECRET_PREPARE_LINE" \
+  "$CACHE_PACKAGE_VALIDATE_LINE" \
+  "$CACHE_EXISTING_WORKER_LINE" \
+  "$CACHE_SECRET_APPLY_LINE" \
+  "$CACHE_DEPLOY_LINE"
+do
+  [ -n "$line" ] || fail "cache-proxy operational workflow ordering step is missing"
+done
+[ "$CACHE_IDENTITY_VALIDATE_LINE" -lt "$CACHE_BINDING_RESOLVE_LINE" ] \
+  || fail "cache-proxy binding resolves before deployment identity validation"
+[ "$CACHE_BINDING_RESOLVE_LINE" -lt "$CACHE_REQUIRED_VALIDATE_LINE" ] \
+  || fail "cache-proxy required secret/variable validation does not follow binding resolution"
+[ "$CACHE_REQUIRED_VALIDATE_LINE" -lt "$CACHE_SECRET_PREPARE_LINE" ] \
+  || fail "cache-proxy secret payload is prepared before required inputs are validated"
+[ "$CACHE_SECRET_PREPARE_LINE" -lt "$CACHE_PACKAGE_VALIDATE_LINE" ] \
+  || fail "cache-proxy deployment package is validated before secret payload validation"
+[ "$CACHE_PACKAGE_VALIDATE_LINE" -lt "$CACHE_EXISTING_WORKER_LINE" ] \
+  || fail "cache-proxy existing-Worker gate does not follow deployment-package validation"
+[ "$CACHE_EXISTING_WORKER_LINE" -lt "$CACHE_SECRET_APPLY_LINE" ] \
+  || fail "cache-proxy secrets can be applied before the existing-Worker gate"
+[ "$CACHE_SECRET_APPLY_LINE" -lt "$CACHE_DEPLOY_LINE" ] \
+  || fail "cache-proxy authority-changing deploy can occur before secret application succeeds"
+grep -Fq -- '--dry-run' "$CACHE_WORKFLOW" \
+  || fail "cache-proxy workflow lacks a non-mutating deployment-package validation"
+grep -Fq 'verify_existing_worker' "$CACHE_WORKFLOW" \
+  || fail "cache-proxy workflow does not fail closed for missing operational Workers"
 [ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v2 '')" = "$UK_AQ_STATION_HISTORY_WORKER_NAME" ] \
   || fail "persistent v2 authority does not select the normal station Worker"
 [ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v3 '')" = "$STATION_CANDIDATE_WORKER_NAME" ] \
@@ -651,7 +698,7 @@ if bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v3 "${STATION_C
 fi
 grep -Fq '__UK_AQ_STATION_HISTORY_WORKER_NAME__' workers/uk_aq_cache_proxy/wrangler.toml \
   || fail "cache-proxy station service-binding placeholder is missing"
-pass "persistent generation authority and constrained station binding override remain intact"
+pass "persistent generation authority and fail-closed single cache deployment remain intact"
 
 warn "cutover remains an explicit operator action outside this read-only script"
 printf '\nPREFLIGHT PASS: all cutover-readiness prerequisites are satisfied.\n'
