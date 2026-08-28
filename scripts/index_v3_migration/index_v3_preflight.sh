@@ -102,9 +102,12 @@ git_blob_sha256_at_commit() {
 }
 
 self_test() {
-  local output status candidate legacy_workflow legacy_status fixture recovery_fixture
+  local output status candidate legacy_workflow legacy_status fixture recovery_fixture self_test_dir
   command -v jq >/dev/null 2>&1 || fail "self-test: jq is unavailable"
   command -v node >/dev/null 2>&1 || fail "self-test: node is unavailable"
+  self_test_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+  node "$self_test_dir/recovery_post_migration_root_evidence.mjs" --self-test >/dev/null \
+    || fail "self-test: post-migration recovery-root evidence reader failed"
   set +e
   output="$("$0" --_self-test-fail 2>&1)"
   status=$?
@@ -183,6 +186,7 @@ self_test() {
   pass "completed and non-completed workflow states remain distinguished"
   pass "maintenance status requires valid schema-v1 ON evidence and a deployment ID"
   pass "immutable recovery manifest requires recovery_implementation schema"
+  pass "post-migration source-root evidence is anchored to the recovery journal head"
   pass "TEST and LIVE candidate Worker names derive from active Worker names"
   pass "obsolete maintenance lookup strings remain absent"
 }
@@ -470,10 +474,19 @@ ACTUAL_STATE_SHA="$(shasum -a 256 "$DROPBOX_STATE" | awk '{print $1}')"
 [ "$ACTUAL_STATE_SHA" = "$STATE_SHA" ] || fail "Dropbox state root no longer matches the pinned plan"
 pass "Dropbox state root matches the pinned rollback generation"
 
+DROPBOX_SOURCE="$DROPBOX_ROOT/${SOURCE_KEY#/}"
+[ -f "$DROPBOX_SOURCE" ] || fail "pinned Dropbox source root is missing: $DROPBOX_SOURCE"
+ACTUAL_DROPBOX_SOURCE_SHA="$(shasum -a 256 "$DROPBOX_SOURCE" | awk '{print $1}')"
+[ "$ACTUAL_DROPBOX_SOURCE_SHA" = "$SOURCE_SHA" ] || fail "Dropbox source root no longer matches the pinned pre-migration plan"
+[ "$(jq -r '.content_hash // empty' "$DROPBOX_SOURCE")" = "$SOURCE_CONTENT_HASH" ] \
+  || fail "Dropbox source-root content hash no longer matches the pinned pre-migration plan"
+pass "Dropbox canonical source root retains the pinned pre-migration rollback generation"
+
 require_env CFLARE_R2_ACCESS_KEY_ID
 require_env CFLARE_R2_SECRET_ACCESS_KEY
 export SOURCE_KEY SOURCE_SHA SOURCE_CONTENT_HASH INVENTORY_KEY INVENTORY_SHA
-node --input-type=module <<'NODE' || fail "current R2 source/inventory identity differs from the pinned plan"
+if [ "$STAGE" = "migration-start" ]; then
+  node --input-type=module <<'NODE' || fail "current R2 source/inventory identity differs from the pinned pre-migration plan"
 import crypto from "node:crypto";
 import { r2GetObject } from "./workers/shared/r2_sigv4.mjs";
 
@@ -494,7 +507,26 @@ if (JSON.parse(source).content_hash !== process.env.SOURCE_CONTENT_HASH) {
 }
 if (sha(inventory) !== process.env.INVENTORY_SHA) throw new Error("inventory root SHA mismatch");
 NODE
-pass "current R2 canonical source and backup inventory match the pinned plan"
+  pass "current R2 canonical source and backup inventory match the pinned pre-migration plan"
+else
+  node --input-type=module <<'NODE' || fail "current R2 backup inventory differs from the pinned rollback plan"
+import crypto from "node:crypto";
+import { r2GetObject } from "./workers/shared/r2_sigv4.mjs";
+
+const r2 = {
+  endpoint: process.env.CFLARE_R2_ENDPOINT,
+  bucket: process.env.CFLARE_R2_BUCKET,
+  region: process.env.CFLARE_R2_REGION || "auto",
+  access_key_id: process.env.CFLARE_R2_ACCESS_KEY_ID,
+  secret_access_key: process.env.CFLARE_R2_SECRET_ACCESS_KEY,
+};
+const body = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value);
+const sha = (value) => crypto.createHash("sha256").update(value).digest("hex");
+const inventory = body((await r2GetObject({ r2, key: process.env.INVENTORY_KEY })).body);
+if (sha(inventory) !== process.env.INVENTORY_SHA) throw new Error("inventory root SHA mismatch");
+NODE
+  pass "current R2 backup inventory matches the pinned rollback plan; post-migration source identity is checked from recovery evidence"
+fi
 
 LATEST_BACKUP="$(gh run list --repo "$REPO_SLUG" --workflow uk_aq_r2_history_dropbox_backup.yml --limit 1 --json status,conclusion 2>/dev/null | jq '.[0] // null')" \
   || fail "latest history Dropbox backup workflow could not be read"
@@ -573,8 +605,10 @@ jq empty "$VERIFY_REPORT" >/dev/null 2>&1 || fail "final verification report is 
 RECOVERY_ROOT="$CHECKPOINT.recovery"
 RECOVERY_HEAD="$RECOVERY_ROOT/head.json"
 RECOVERY_MANIFEST="$RECOVERY_ROOT/manifest.json"
+RECOVERY_POST_ROOT_HELPER="$SCRIPT_DIR/recovery_post_migration_root_evidence.mjs"
 [ -f "$RECOVERY_HEAD" ] || fail "recovery journal head is missing"
 [ -f "$RECOVERY_MANIFEST" ] || fail "recovery manifest is missing"
+[ -f "$RECOVERY_POST_ROOT_HELPER" ] || fail "post-migration recovery-root evidence helper is missing"
 jq empty "$RECOVERY_HEAD" >/dev/null 2>&1 || fail "recovery journal head is not valid JSON"
 jq empty "$RECOVERY_MANIFEST" >/dev/null 2>&1 || fail "recovery manifest is not valid JSON"
 recovery_manifest_implementation_is_valid < "$RECOVERY_MANIFEST" \
@@ -604,9 +638,51 @@ jq -e '
 ' "$VERIFY_REPORT" >/dev/null || fail "final v3 verification is not cutover-ready"
 [ "$(jq -r '.result.checkpoint_summary.plan_sha256' "$VERIFY_REPORT")" = "$AUTH_PLAN_SHA" ] \
   || fail "verification report plan SHA does not match authority"
-[ "$(jq -r '.result.checkpoint_summary.authority_sha256' "$VERIFY_REPORT")" = "$(jq -r '.payload.immutable_authority_sha256' "$RECOVERY_HEAD")" ] \
+IMMUTABLE_AUTHORITY_SHA="$(jq -r '.payload.immutable_authority_sha256' "$RECOVERY_HEAD")"
+[ "$(jq -r '.result.checkpoint_summary.authority_sha256' "$VERIFY_REPORT")" = "$IMMUTABLE_AUTHORITY_SHA" ] \
   || fail "verification report authority SHA does not match recovery head"
 pass "final v3 verification is complete, blocker-free, and cutover-ready"
+
+POST_ROOT_EVIDENCE="$(node "$RECOVERY_POST_ROOT_HELPER" \
+  --recovery-root "$RECOVERY_ROOT" \
+  --source-key "$SOURCE_KEY" \
+  --expected-checkpoint-sha256 "$CHECKPOINT_SHA" \
+  --expected-authority-sha256 "$IMMUTABLE_AUTHORITY_SHA")" \
+  || fail "post-migration canonical source-root evidence could not be derived from the immutable recovery journal"
+POST_SOURCE_SHA="$(printf '%s' "$POST_ROOT_EVIDENCE" | jq -r '.sha256 // empty')"
+POST_SOURCE_BYTES="$(printf '%s' "$POST_ROOT_EVIDENCE" | jq -r '.byte_size // empty')"
+printf '%s' "$POST_SOURCE_SHA" | grep -Eq '^[0-9a-f]{64}$' \
+  || fail "post-migration source-root recovery SHA is invalid"
+printf '%s' "$POST_SOURCE_BYTES" | grep -Eq '^[1-9][0-9]*$' \
+  || fail "post-migration source-root recovery byte size is invalid"
+export POST_SOURCE_SHA POST_SOURCE_BYTES
+node --input-type=module <<'NODE' || fail "current R2 canonical source root differs from the post-migration recovery evidence"
+import crypto from "node:crypto";
+import { r2GetObject } from "./workers/shared/r2_sigv4.mjs";
+
+const r2 = {
+  endpoint: process.env.CFLARE_R2_ENDPOINT,
+  bucket: process.env.CFLARE_R2_BUCKET,
+  region: process.env.CFLARE_R2_REGION || "auto",
+  access_key_id: process.env.CFLARE_R2_ACCESS_KEY_ID,
+  secret_access_key: process.env.CFLARE_R2_SECRET_ACCESS_KEY,
+};
+const source = Buffer.from((await r2GetObject({ r2, key: process.env.SOURCE_KEY })).body);
+const sourceSha = crypto.createHash("sha256").update(source).digest("hex");
+if (sourceSha !== process.env.POST_SOURCE_SHA) throw new Error("post-migration source root SHA mismatch");
+if (source.byteLength !== Number(process.env.POST_SOURCE_BYTES)) throw new Error("post-migration source root byte-size mismatch");
+const payload = JSON.parse(source.toString("utf8"));
+if (
+  payload?.kind !== "uk_aq_observations_root_manifest" ||
+  payload?.schema_version !== 1 ||
+  payload?.domain !== "observations" ||
+  typeof payload?.content_hash !== "string" ||
+  !/^[0-9a-f]{64}$/.test(payload.content_hash)
+) {
+  throw new Error("post-migration source root payload is not a valid canonical observations root manifest");
+}
+NODE
+pass "current R2 canonical source root matches the verified post-migration recovery-journal identity"
 
 RECOVERY_IMPLEMENTATION_HEAD="$(jq -r '.payload.recovery_implementation.repository_head // empty' "$RECOVERY_MANIFEST")"
 IMPLEMENTATION_OK=1
