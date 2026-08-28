@@ -57,8 +57,74 @@ require_authorization() {
   fi
 }
 
+# Complete local dependency closure loaded by read-only verify. The current-only
+# files intentionally contain compatible post-migration verifier hardening, so
+# they are authenticated against current HEAD rather than required to equal the
+# historical migration implementation. The remaining dependencies must also be
+# byte-compatible with the pinned target-writer commit.
+VERIFY_CURRENT_ONLY_DEPENDENCIES=(
+  scripts/index_v3_migration/index_v3_migration.sh
+  scripts/index_v3_migration/index_v3_preflight.sh
+  scripts/index_v3_migration/recovery_journal_authority.mjs
+  scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs
+  scripts/backup_r2/lib/observation_history_migration_v3.mjs
+)
+VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES=(
+  package.json
+  package-lock.json
+  scripts/backup_r2/lib/hierarchical_backup_v2.mjs
+  scripts/backup_r2/lib/uk_aq_parquet_dependencies.mjs
+  scripts/backup_r2/uk_aq_build_r2_history_index.mjs
+  scripts/backup_r2/uk_aq_observations_manifest_hierarchy.mjs
+  scripts/operations/uk_aq_with_observations_global_operation_lock.mjs
+  workers/shared/r2_sigv4.mjs
+  workers/shared/uk_aq_connector_day_gate.mjs
+  workers/shared/uk_aq_observation_content_hash.mjs
+  workers/shared/uk_aq_observation_history_index_v3.mjs
+  workers/shared/uk_aq_observation_history_schema.mjs
+  workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs
+  workers/shared/uk_aq_observation_history_target_writer.mjs
+  workers/shared/uk_aq_observation_history_writer_limits_v3.mjs
+  workers/shared/uk_aq_observation_property_code.mjs
+  workers/shared/uk_aq_prune_connector_source_identity.mjs
+  workers/shared/uk_aq_r2_checksum_publication.mjs
+  workers/shared/uk_aq_r2_file_identity.mjs
+  workers/shared/uk_aq_r2_history_canonical.mjs
+  workers/shared/uk_aq_r2_history_index.mjs
+  workers/shared/uk_aq_r2_history_manifest_validation.mjs
+  workers/shared/uk_aq_r2_history_writer.mjs
+  workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs
+)
+VERIFY_READ_ONLY_DEPENDENCIES=(
+  "${VERIFY_CURRENT_ONLY_DEPENDENCIES[@]}"
+  "${VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES[@]}"
+)
+MUTATION_IMPLEMENTATION_SCOPES=(
+  package.json
+  package-lock.json
+  scripts/backup_r2
+  scripts/operations
+  scripts/index_v3_migration/index_v3_migration.sh
+  workers/shared
+)
+
+git_paths_are_unchanged() {
+  local repository="$1" base="$2" current="$3"
+  shift 3
+  git -C "$repository" diff --quiet "$base" "$current" -- "$@"
+}
+
+current_verify_dependencies_are_trusted() {
+  local repository="$1" dependency
+  for dependency in "${VERIFY_READ_ONLY_DEPENDENCIES[@]}"; do
+    git -C "$repository" ls-files --error-unmatch -- "$dependency" >/dev/null 2>&1 \
+      || return 1
+  done
+  git -C "$repository" diff --quiet HEAD -- "${VERIFY_READ_ONLY_DEPENDENCIES[@]}"
+}
+
 self_test() {
-  local output status
+  local output status drift_repo base_commit unrelated_commit critical_commit critical_path mutation_mode
   set +e
   output="$("$0" 2>&1)"
   status=$?
@@ -73,8 +139,42 @@ self_test() {
   [ "$status" -ne 0 ] || stop "self-test: missing mutation authorisation did not fail"
   UK_AQ_INDEX_V3_MIGRATION_AUTH='SELF_TEST_AUTH' "$0" --_self-test-auth >/dev/null \
     || stop "self-test: exact mutation authorisation was rejected"
+  drift_repo="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-verify-drift.XXXXXX")"
+  critical_path="scripts/backup_r2/lib/hierarchical_backup_v2.mjs"
+  git -C "$drift_repo" init -q
+  git -C "$drift_repo" config user.email 'index-v3-self-test@example.invalid'
+  git -C "$drift_repo" config user.name 'Index v3 self-test'
+  mkdir -p -- "$drift_repo/scripts/backup_r2/lib"
+  printf '%s\n' 'critical-v1' > "$drift_repo/$critical_path"
+  git -C "$drift_repo" add -- "$critical_path"
+  git -C "$drift_repo" commit -qm 'base'
+  base_commit="$(git -C "$drift_repo" rev-parse HEAD)"
+  printf '%s\n' 'unrelated-later-tool' > "$drift_repo/scripts/backup_r2/unrelated_later_tool.mjs"
+  git -C "$drift_repo" add -- scripts/backup_r2/unrelated_later_tool.mjs
+  git -C "$drift_repo" commit -qm 'unrelated backup tool'
+  unrelated_commit="$(git -C "$drift_repo" rev-parse HEAD)"
+  git_paths_are_unchanged "$drift_repo" "$base_commit" "$unrelated_commit" \
+    "${VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES[@]}" \
+    || stop "self-test: unrelated backup file tripped read-only verify drift"
+  for mutation_mode in migrate resume; do
+    if git_paths_are_unchanged "$drift_repo" "$base_commit" "$unrelated_commit" \
+      "${MUTATION_IMPLEMENTATION_SCOPES[@]}"; then
+      stop "self-test: unrelated backup file escaped $mutation_mode drift protection"
+    fi
+  done
+  printf '%s\n' 'critical-v2' > "$drift_repo/$critical_path"
+  git -C "$drift_repo" add -- "$critical_path"
+  git -C "$drift_repo" commit -qm 'critical verifier change'
+  critical_commit="$(git -C "$drift_repo" rev-parse HEAD)"
+  if git_paths_are_unchanged "$drift_repo" "$base_commit" "$critical_commit" \
+    "${VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES[@]}"; then
+    stop "self-test: verification-critical drift was accepted"
+  fi
+  rm -rf -- "$drift_repo"
   printf 'PASS: no mode defaults to mutation\n'
   printf 'PASS: mutating modes retain exact explicit authorisation\n'
+  printf 'PASS: unrelated backup evolution does not trip read-only verify drift\n'
+  printf 'PASS: verification-critical drift fails while mutation drift remains broad\n'
 }
 
 case "${1:-}" in
@@ -138,7 +238,6 @@ cd -- "$REPO_ROOT"
 
 MIGRATION_CLI="scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs"
 PREFLIGHT="scripts/index_v3_migration/index_v3_preflight.sh"
-WRAPPER="scripts/index_v3_migration/index_v3_migration.sh"
 
 for command in git gh jq node; do
   command -v "$command" >/dev/null 2>&1 || stop "required command is unavailable: $command"
@@ -231,14 +330,13 @@ load_authority() {
   git merge-base --is-ancestor "$TARGET_WRITER_GIT_SHA" "$(git rev-parse HEAD)" \
     || stop "pinned target writer commit is not an ancestor of current HEAD"
   if [ "$MODE" = "verify" ]; then
+    current_verify_dependencies_are_trusted "$REPO_ROOT" \
+      || stop "current read-only verification dependency set is not exact, tracked current HEAD"
     LOAD_AUTHORITY_DRIFT="$(git diff --name-only "$TARGET_WRITER_GIT_SHA" HEAD -- \
-      package.json package-lock.json scripts/backup_r2 scripts/operations "$WRAPPER" workers/shared \
-      ':(exclude)scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs' \
-      ':(exclude)scripts/backup_r2/lib/observation_history_migration_v3.mjs' \
-      ':(exclude)scripts/index_v3_migration/index_v3_migration.sh')"
+      "${VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES[@]}")"
   else
     LOAD_AUTHORITY_DRIFT="$(git diff --name-only "$TARGET_WRITER_GIT_SHA" HEAD -- \
-      package.json package-lock.json scripts/backup_r2 scripts/operations "$WRAPPER" workers/shared)"
+      "${MUTATION_IMPLEMENTATION_SCOPES[@]}")"
   fi
   [ -z "$LOAD_AUTHORITY_DRIFT" ] \
     || stop "migration/recovery implementation differs from the pinned target writer commit"

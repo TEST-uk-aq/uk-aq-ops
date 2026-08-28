@@ -118,6 +118,33 @@ test("operator verification authenticates exact current dependencies under v2 or
   assert.match(migrationWrapper, /\n  v2\)/);
   assert.match(migrationWrapper, /\n  v3\)/);
   assert.match(migrationWrapper, /GitHub variable \$variable_name/);
+  assert.match(migrationWrapper, /VERIFY_READ_ONLY_DEPENDENCIES=\(/);
+  assert.match(migrationWrapper, /VERIFY_PINNED_COMPATIBILITY_DEPENDENCIES=\(/);
+  assert.match(migrationWrapper, /scripts\/backup_r2\/lib\/hierarchical_backup_v2\.mjs/);
+  assert.match(migrationWrapper, /current_verify_dependencies_are_trusted/);
+  assert.match(migrationWrapper, /verify mode does not accept --apply/);
+  assert.match(migrationWrapper, /MUTATION_IMPLEMENTATION_SCOPES=\([\s\S]*scripts\/backup_r2/);
+  assert.doesNotMatch(
+    migrationWrapper.match(/LOAD_AUTHORITY_DRIFT="\$\(git diff[\s\S]*?\n  else/)[0],
+    /scripts\/backup_r2 scripts\/operations/,
+  );
+});
+
+test("post-cutover verifier requires only credentials it consumes", () => {
+  assert.doesNotMatch(postCutoverVerify, /CLOUDFLARE_ACCOUNT_ID/);
+  assert.doesNotMatch(postCutoverVerify, /CLOUDFLARE_API_TOKEN/);
+  for (const name of [
+    "CFLARE_R2_ENDPOINT",
+    "CFLARE_R2_BUCKET",
+    "CFLARE_R2_ACCESS_KEY_ID",
+    "CFLARE_R2_SECRET_ACCESS_KEY",
+  ]) {
+    assert.match(postCutoverVerify, new RegExp(`\\b${name}\\b`));
+  }
+  assert.doesNotMatch(
+    postCutoverVerify,
+    /\b(?:printf|pass|warn|fail)\b[^\n]*\$(?:\{)?(?:CFLARE_R2_SECRET_ACCESS_KEY|UK_AQ_CACHE_BYPASS_SECRET)/,
+  );
 });
 
 test("post-cutover smoke does not claim cache bypass proves a fresh inner MISS", () => {
