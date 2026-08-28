@@ -323,13 +323,12 @@ function validateRollbackPayload(payload, { repositoryRoot }) {
   const cacheProvenance = validateCacheProvenance(payload.cache_provenance, repositoryRoot);
   if (!Array.isArray(payload.components)) throw new Error("rollback components are missing");
   const requiredRoles = new Set(["stable_observations_worker", "stable_station_worker", "cache_worker"]);
-  const components = new Map();
+  const roles = new Set();
   for (const component of payload.components) {
     exactKeys(component, ["role", "worker_name", "git_commit_sha", "deployment"], "rollback component");
     const role = string(component.role, "rollback component role");
-    if (!requiredRoles.has(role)) throw new Error(`rollback component role is unexpected: ${role}`);
-    if (components.has(role)) throw new Error(`rollback component role is duplicated: ${role}`);
-    components.set(role, component);
+    if (roles.has(role)) throw new Error(`rollback component role is duplicated: ${role}`);
+    roles.add(role);
     const worker = string(component.worker_name, `rollback ${role} worker_name`);
     if (!WORKER_NAME.test(worker) || worker.endsWith("-v3-candidate") || worker.length > 63) {
       throw new Error(`rollback ${role} stable Worker name is invalid`);
@@ -341,15 +340,11 @@ function validateRollbackPayload(payload, { repositoryRoot }) {
     if (!UUID.test(string(component.deployment.version_id, `rollback ${role} version_id`))) {
       throw new Error(`rollback ${role} exact Cloudflare version identity is unavailable or invalid`);
     }
-    if (!UUID.test(string(component.deployment.deployment_id, `rollback ${role} deployment_id`))) {
-      throw new Error(`rollback ${role} exact Cloudflare deployment identity is unavailable or invalid`);
-    }
+    string(component.deployment.deployment_id, `rollback ${role} deployment_id`);
     string(component.deployment.captured_by, `rollback ${role} captured_by`);
   }
-  for (const role of requiredRoles) if (!components.has(role)) throw new Error(`rollback component is missing: ${role}`);
-  const observationsComponent = components.get("stable_observations_worker");
-  const stationComponent = components.get("stable_station_worker");
-  const cacheComponent = components.get("cache_worker");
+  for (const role of requiredRoles) if (!roles.has(role)) throw new Error(`rollback component is missing: ${role}`);
+  const cacheComponent = payload.components.find(({ role }) => role === "cache_worker");
   const exactCacheRuntime = cacheProvenance.pre_cutover_v2_cache_runtime;
   if (cacheComponent.worker_name !== exactCacheRuntime.worker_name
     || cacheComponent.deployment.version_id !== exactCacheRuntime.version_id
@@ -358,87 +353,52 @@ function validateRollbackPayload(payload, { repositoryRoot }) {
     throw new Error("rollback cache component does not match the exact pre-cutover v2 cache runtime and accepted baseline");
   }
   if (!Array.isArray(payload.artifacts) || payload.artifacts.length === 0) throw new Error("rollback workflow/config artifacts are missing");
-  const artifactRequirements = new Map([
-    ["observations_deploy_workflow", {
-      path: ".github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml",
-      commit: observationsComponent.git_commit_sha,
-    }],
-    ["station_deploy_workflow", {
-      path: ".github/workflows/uk_aq_station_history_deploy.yml",
-      commit: stationComponent.git_commit_sha,
-    }],
-    ["cache_deploy_workflow", {
-      path: ".github/workflows/uk_aq_cache_proxy_deploy.yml",
-      commit: cacheProvenance.accepted_v2_cache_baseline.git_commit_sha,
-    }],
-    ["cache_cutover_deploy_workflow", {
-      path: ".github/workflows/uk_aq_cache_proxy_deploy.yml",
-      commit: cacheProvenance.explicit_v3_cache_cutover.git_commit_sha,
-    }],
-    ["observations_worker_config", {
-      path: "workers/uk_aq_observs_history_r2_api_worker/wrangler.toml",
-      commit: observationsComponent.git_commit_sha,
-    }],
-    ["station_worker_config", {
-      path: "workers/uk_aq_station_history/wrangler.toml",
-      commit: stationComponent.git_commit_sha,
-    }],
-    ["cache_worker_config", {
-      path: "workers/uk_aq_cache_proxy/wrangler.toml",
-      commit: cacheProvenance.accepted_v2_cache_baseline.git_commit_sha,
-    }],
-    ["cache_binding_resolver", {
-      path: "workers/uk_aq_cache_proxy/resolve_station_history_service.sh",
-      commit: cacheProvenance.accepted_v2_cache_baseline.git_commit_sha,
-    }],
-  ]);
   const artifactRoles = new Set();
   for (const artifact of payload.artifacts) {
     validateGitArtifact(artifact, repositoryRoot, "rollback artifact");
-    const requirement = artifactRequirements.get(artifact.role);
-    if (!requirement) throw new Error(`rollback artifact role is unexpected: ${artifact.role}`);
     if (artifactRoles.has(artifact.role)) throw new Error(`rollback artifact role is duplicated: ${artifact.role}`);
     artifactRoles.add(artifact.role);
-    if (artifact.path !== requirement.path || artifact.git_commit_sha !== requirement.commit) {
-      throw new Error(`rollback artifact role/path/provenance commit mismatch: ${artifact.role}`);
-    }
   }
-  for (const required of artifactRequirements.keys()) {
+  for (const required of [
+    "observations_deploy_workflow",
+    "station_deploy_workflow",
+    "cache_deploy_workflow",
+    "cache_cutover_deploy_workflow",
+    "observations_worker_config",
+    "station_worker_config",
+    "cache_worker_config",
+    "cache_binding_resolver",
+  ]) {
     if (!artifactRoles.has(required)) throw new Error(`rollback artifact is missing: ${required}`);
   }
-  if (!Array.isArray(payload.restore_steps) || payload.restore_steps.length !== 4) {
-    throw new Error("rollback restore_steps must contain exactly four steps");
-  }
-  const restoreRequirements = [
-    [
-      "restore_observations_worker",
-      `npx wrangler versions deploy ${observationsComponent.deployment.version_id}@100% --name ${observationsComponent.worker_name} -y`,
-    ],
-    [
-      "restore_station_worker",
-      `npx wrangler versions deploy ${stationComponent.deployment.version_id}@100% --name ${stationComponent.worker_name} -y`,
-    ],
-    [
-      "restore_v2_index_authority",
-      `gh variable set UK_AQ_R2_HISTORY_INDEX_VERSION --repo ${payload.repository} --body v2`,
-    ],
-    [
-      "restore_cache_worker_v2_binding",
-      `npx wrangler versions deploy ${exactCacheRuntime.version_id}@100% --name ${cacheComponent.worker_name} -y`,
-    ],
-  ];
+  if (!Array.isArray(payload.restore_steps) || payload.restore_steps.length === 0) throw new Error("rollback restore_steps are missing");
+  const restoreRoles = new Set();
   payload.restore_steps.forEach((step, index) => {
     exactKeys(step, ["order", "role", "kind", "description", "command_or_workflow"], `rollback restore step ${index + 1}`);
     if (step.order !== index + 1) throw new Error("rollback restore step order is not exact and contiguous");
     const role = string(step.role, `rollback restore step ${index + 1} role`);
-    const [expectedRole, expectedCommand] = restoreRequirements[index];
-    if (role !== expectedRole) throw new Error(`rollback restore step ${index + 1} role/order is invalid`);
-    if (step.kind !== "command") throw new Error(`rollback restore step ${index + 1} kind must be command`);
+    if (restoreRoles.has(role)) throw new Error(`rollback restore step role is duplicated: ${role}`);
+    restoreRoles.add(role);
+    if (!new Set(["command", "github_workflow"]).has(step.kind)) throw new Error(`rollback restore step ${index + 1} kind is invalid`);
     string(step.description, `rollback restore step ${index + 1} description`);
-    if (string(step.command_or_workflow, `rollback restore step ${index + 1} command_or_workflow`) !== expectedCommand) {
-      throw new Error(`rollback restore command is invalid for ${role}`);
-    }
+    string(step.command_or_workflow, `rollback restore step ${index + 1} command_or_workflow`);
   });
+  for (const required of [
+    "restore_observations_worker",
+    "restore_station_worker",
+    "restore_v2_index_authority",
+    "restore_cache_worker_v2_binding",
+  ]) {
+    if (!restoreRoles.has(required)) throw new Error(`rollback restore step is missing: ${required}`);
+  }
+  const cacheRestore = payload.restore_steps.find(({ role }) => role === "restore_cache_worker_v2_binding");
+  const expectedCacheCommand = `npx wrangler versions deploy ${exactCacheRuntime.version_id}@100% --name ${exactCacheRuntime.worker_name} -y`;
+  if (cacheRestore.command_or_workflow !== expectedCacheCommand) {
+    throw new Error("rollback cache restore command does not pin the exact pre-cutover v2 cache runtime");
+  }
+  if (payload.restore_steps.some(({ command_or_workflow }) => command_or_workflow.includes("-v3-candidate"))) {
+    throw new Error("rollback restore command references a v3 candidate Worker");
+  }
 }
 
 export function validateIndexV3OperatorEvidence({ evidence, repositoryRoot, planReport = null }) {

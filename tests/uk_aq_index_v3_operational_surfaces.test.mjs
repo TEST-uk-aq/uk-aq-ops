@@ -309,16 +309,16 @@ test("v2 runtime rollback evidence requires exact non-secret deployment and Git 
     index_authority_generation: "v2",
     integrity_version: "v2",
     components: [
-      ["stable_observations_worker", "uk-aq-observs-history-r2-api-test", "11111111-1111-4111-8111-111111111111"],
-      ["stable_station_worker", "uk-aq-station-history-test", "22222222-2222-4222-8222-222222222222"],
-      ["cache_worker", "uk-aq-cache-test", "33333333-3333-4333-8333-333333333333"],
-    ].map(([role, worker_name, version_id]) => ({
+      ["stable_observations_worker", "uk-aq-observs-history-r2-api-test", "11111111-1111-4111-8111-111111111111", "77777777-7777-4777-8777-777777777777"],
+      ["stable_station_worker", "uk-aq-station-history-test", "22222222-2222-4222-8222-222222222222", "88888888-8888-4888-8888-888888888888"],
+      ["cache_worker", "uk-aq-cache-test", "33333333-3333-4333-8333-333333333333", v2Cache.deployment_id],
+    ].map(([role, worker_name, version_id, deployment_id]) => ({
       role,
       worker_name,
       git_commit_sha: gitHead,
       deployment: {
         version_id,
-        deployment_id: role === "cache_worker" ? v2Cache.deployment_id : `deployment-${role}`,
+        deployment_id,
         captured_by: "read-only Cloudflare versions API",
       },
     })),
@@ -350,20 +350,16 @@ test("v2 runtime rollback evidence requires exact non-secret deployment and Git 
       gitBlobIdentity("cache_binding_resolver", "workers/uk_aq_cache_proxy/resolve_station_history_service.sh"),
     ],
     restore_steps: [
-      ["restore_observations_worker", "Deploy pinned stable observations Worker"],
-      ["restore_station_worker", "Deploy pinned stable station Worker"],
-      ["restore_v2_index_authority", "Restore persistent v2 observation authority"],
-      ["restore_cache_worker_v2_binding", "Deploy cache with stable station binding"],
-    ].map(([role, description], index) => ({
+      ["restore_observations_worker", "Deploy pinned stable observations Worker", "npx wrangler versions deploy 11111111-1111-4111-8111-111111111111@100% --name uk-aq-observs-history-r2-api-test -y"],
+      ["restore_station_worker", "Deploy pinned stable station Worker", "npx wrangler versions deploy 22222222-2222-4222-8222-222222222222@100% --name uk-aq-station-history-test -y"],
+      ["restore_v2_index_authority", "Restore persistent v2 observation authority", "gh variable set UK_AQ_R2_HISTORY_INDEX_VERSION --repo TEST-uk-aq/uk-aq-ops --body v2"],
+      ["restore_cache_worker_v2_binding", "Deploy cache with stable station binding", `npx wrangler versions deploy ${v2Cache.version_id}@100% --name ${v2Cache.worker_name} -y`],
+    ].map(([role, description, command_or_workflow], index) => ({
       order: index + 1,
       role,
-      kind: index === 2 ? "command" : "github_workflow",
+      kind: "command",
       description,
-      command_or_workflow: index === 2
-        ? "gh variable set UK_AQ_R2_HISTORY_INDEX_VERSION --body v2"
-        : (index === 3
-          ? `npx wrangler versions deploy ${v2Cache.version_id}@100% --name ${v2Cache.worker_name} -y`
-          : "gh workflow run ... --ref <pinned-sha>"),
+      command_or_workflow,
     })),
   };
   const evidence = evidenceEnvelope("uk_aq_index_v3_v2_runtime_rollback_record", payload);

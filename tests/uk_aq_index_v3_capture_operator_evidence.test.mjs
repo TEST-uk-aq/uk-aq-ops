@@ -13,6 +13,7 @@ import {
   buildRollbackPayload,
   buildWriterFreezePayload,
   cloudflareCaptureCredentials,
+  gitBlobIdentity,
   sealAndPublish,
 } from "../scripts/index_v3_migration/index_v3_capture_operator_evidence.mjs";
 import { validateIndexV3OperatorEvidence } from "../scripts/index_v3_migration/index_v3_operator_evidence.mjs";
@@ -20,6 +21,7 @@ import { validateIndexV3OperatorEvidence } from "../scripts/index_v3_migration/i
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 const source = fs.readFileSync(new URL("../scripts/index_v3_migration/index_v3_capture_operator_evidence.mjs", import.meta.url), "utf8");
 const gitHead = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).stdout.trim();
+const parentGitHead = spawnSync("git", ["rev-parse", "HEAD^"], { cwd: repositoryRoot, encoding: "utf8" }).stdout.trim();
 const uuid = (digit) => `${digit.repeat(8)}-${digit.repeat(4)}-4${digit.repeat(3)}-8${digit.repeat(3)}-${digit.repeat(12)}`;
 
 function stableObject(value) {
@@ -549,6 +551,103 @@ test("cache chronology retains exact stable-v2 and candidate-v3 Service Binding 
       cacheV3: cacheVersionDetail(ids.cacheV3Version, 11, "2026-08-28T11:00:00Z", "uk-aq-station-history-test"),
     },
   }), /v3 cache cut-over version is not bound to the station-history candidate/);
+});
+
+test("rollback validator reconstructs all four restore commands exactly", () => {
+  const base = rollbackPayload();
+  const mutations = [
+    [0, (command) => command.replace("uk-aq-observs-history-r2-api-test", "uk-aq-observs-history-r2-api-test-v3-candidate")],
+    [1, () => "npx wrangler deploy --name uk-aq-station-history-test"],
+    [2, () => "gh variable set UK_AQ_R2_HISTORY_INDEX_VERSION --repo OTHER/repository --body v3"],
+    [3, (command) => command.replace(ids.cacheV2Version, ids.cacheV3Version)],
+  ];
+  for (const [index, mutate] of mutations) {
+    const payload = structuredClone(base);
+    payload.restore_steps[index].command_or_workflow = mutate(payload.restore_steps[index].command_or_workflow);
+    assert.throws(() => validateIndexV3OperatorEvidence({
+      evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", payload), repositoryRoot,
+    }), new RegExp(`restore command is invalid for ${payload.restore_steps[index].role}`));
+  }
+
+  const extraFlag = structuredClone(base);
+  extraFlag.restore_steps[0].command_or_workflow += " --dry-run";
+  assert.throws(() => validateIndexV3OperatorEvidence({
+    evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", extraFlag), repositoryRoot,
+  }), /restore command is invalid for restore_observations_worker/);
+
+  const wrongKind = structuredClone(base);
+  wrongKind.restore_steps[0].kind = "github_workflow";
+  assert.throws(() => validateIndexV3OperatorEvidence({
+    evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", wrongKind), repositoryRoot,
+  }), /kind must be command/);
+
+  const swapped = structuredClone(base);
+  [swapped.restore_steps[0].command_or_workflow, swapped.restore_steps[1].command_or_workflow]
+    = [swapped.restore_steps[1].command_or_workflow, swapped.restore_steps[0].command_or_workflow];
+  assert.throws(() => validateIndexV3OperatorEvidence({
+    evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", swapped), repositoryRoot,
+  }), /restore command is invalid for restore_observations_worker/);
+});
+
+test("rollback validator pins every artifact role to its exact path and provenance commit", () => {
+  const base = rollbackPayload();
+
+  const wrongPath = structuredClone(base);
+  wrongPath.artifacts[0] = gitBlobIdentity(
+    repositoryRoot,
+    "observations_deploy_workflow",
+    ".github/workflows/uk_aq_station_history_deploy.yml",
+    gitHead,
+  );
+  assert.throws(() => validateIndexV3OperatorEvidence({
+    evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", wrongPath), repositoryRoot,
+  }), /role\/path\/provenance commit mismatch: observations_deploy_workflow/);
+
+  const wrongCommit = structuredClone(base);
+  wrongCommit.artifacts[0] = gitBlobIdentity(
+    repositoryRoot,
+    "observations_deploy_workflow",
+    ".github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml",
+    parentGitHead,
+  );
+  assert.throws(() => validateIndexV3OperatorEvidence({
+    evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", wrongCommit), repositoryRoot,
+  }), /role\/path\/provenance commit mismatch: observations_deploy_workflow/);
+
+  const distinctCacheCommits = rollbackPayload({
+    runs: { cacheV3: { ...rollbackFixture().runs.cacheV3, head_sha: parentGitHead } },
+  });
+  const baselineArtifact = distinctCacheCommits.artifacts.find(({ role }) => role === "cache_deploy_workflow");
+  const cutoverArtifact = distinctCacheCommits.artifacts.find(({ role }) => role === "cache_cutover_deploy_workflow");
+  [baselineArtifact.git_commit_sha, cutoverArtifact.git_commit_sha]
+    = [cutoverArtifact.git_commit_sha, baselineArtifact.git_commit_sha];
+  [baselineArtifact.sha256, cutoverArtifact.sha256] = [cutoverArtifact.sha256, baselineArtifact.sha256];
+  assert.throws(() => validateIndexV3OperatorEvidence({
+    evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", distinctCacheCommits), repositoryRoot,
+  }), /role\/path\/provenance commit mismatch: cache_deploy_workflow/);
+
+  const duplicate = structuredClone(base);
+  duplicate.artifacts.push(structuredClone(duplicate.artifacts[0]));
+  assert.throws(() => validateIndexV3OperatorEvidence({
+    evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", duplicate), repositoryRoot,
+  }), /artifact role is duplicated/);
+
+  const extra = structuredClone(base);
+  extra.artifacts.push({ ...structuredClone(extra.artifacts[0]), role: "unexpected_artifact" });
+  assert.throws(() => validateIndexV3OperatorEvidence({
+    evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", extra), repositoryRoot,
+  }), /artifact role is unexpected/);
+});
+
+test("rollback validator requires Cloudflare UUID deployment identities for every component", () => {
+  const base = rollbackPayload();
+  for (const role of ["stable_observations_worker", "stable_station_worker", "cache_worker"]) {
+    const payload = structuredClone(base);
+    payload.components.find((component) => component.role === role).deployment.deployment_id = `invalid-${role}`;
+    assert.throws(() => validateIndexV3OperatorEvidence({
+      evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", payload), repositoryRoot,
+    }), new RegExp(`rollback ${role} exact Cloudflare deployment identity is unavailable or invalid`));
+  }
 });
 
 test("rollback validator rejects artifact drift and non-contiguous restoration", () => {
