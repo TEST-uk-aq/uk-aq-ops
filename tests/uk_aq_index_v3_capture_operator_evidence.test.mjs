@@ -9,6 +9,7 @@ import test from "node:test";
 
 import {
   assertCleanWorkingTree,
+  assertStableDeploymentAtCutover,
   buildRollbackPayload,
   buildWriterFreezePayload,
   sealAndPublish,
@@ -227,6 +228,11 @@ function rollbackPayload(overrides = {}) {
 test("rollback builder accepts only stable Workers and emits all exact roles and restore steps", () => {
   const payload = rollbackPayload();
   assert.deepEqual(payload.components.map(({ role }) => role), ["stable_observations_worker", "stable_station_worker", "cache_worker"]);
+  assert.deepEqual(payload.components.map(({ deployment }) => deployment.version_id), [
+    ids.observationsVersion,
+    ids.stationVersion,
+    ids.cacheV2Version,
+  ]);
   assert.deepEqual(payload.artifacts.map(({ role }) => role), [
     "observations_deploy_workflow",
     "station_deploy_workflow",
@@ -272,6 +278,71 @@ test("rollback builder accepts only stable Workers and emits all exact roles and
   assert.throws(() => rollbackPayload({ workerNames: { cache: "uk-aq-cache-test-v3-candidate" } }), /not a stable Worker identity/);
 });
 
+test("observations deployment must be the latest stable 100% deployment at or before cut-over", () => {
+  const selected = deployment(ids.observationsDeployment, ids.observationsVersion, "2026-08-28T10:00:00Z");
+  const afterCutover = deployment(uuid("a"), uuid("a"), "2026-08-28T12:00:00Z");
+  const cutover = deployment(ids.cacheV3Deployment, ids.cacheV3Version, "2026-08-28T11:00:00Z");
+  assert.doesNotThrow(() => assertStableDeploymentAtCutover({
+    deployments: [afterCutover, selected], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
+  }));
+
+  const superseding = deployment(uuid("b"), uuid("b"), "2026-08-28T10:30:00Z");
+  assert.throws(() => assertStableDeploymentAtCutover({
+    deployments: [selected, superseding], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
+  }), /superseded before/);
+
+  assert.throws(() => assertStableDeploymentAtCutover({
+    deployments: [afterCutover], selectedDeployment: afterCutover, cutoverDeployment: cutover, label: "observations",
+  }), /after the v3 cache cut-over/);
+});
+
+test("station deployment must be the latest stable 100% deployment at or before cut-over", () => {
+  const selected = deployment(ids.stationDeployment, ids.stationVersion, "2026-08-28T10:00:00Z");
+  const afterCutover = deployment(uuid("a"), uuid("a"), "2026-08-28T12:00:00Z");
+  const cutover = deployment(ids.cacheV3Deployment, ids.cacheV3Version, "2026-08-28T11:00:00Z");
+  assert.doesNotThrow(() => assertStableDeploymentAtCutover({
+    deployments: [selected, afterCutover], selectedDeployment: selected, cutoverDeployment: cutover, label: "station",
+  }));
+
+  const superseding = deployment(uuid("b"), uuid("b"), "2026-08-28T10:30:00Z");
+  assert.throws(() => assertStableDeploymentAtCutover({
+    deployments: [superseding, selected], selectedDeployment: selected, cutoverDeployment: cutover, label: "station",
+  }), /superseded before/);
+
+  assert.throws(() => assertStableDeploymentAtCutover({
+    deployments: [afterCutover], selectedDeployment: afterCutover, cutoverDeployment: cutover, label: "station",
+  }), /after the v3 cache cut-over/);
+});
+
+test("stable deployment chronology fails closed on invalid timestamps and same-time ambiguity", () => {
+  const selected = deployment(ids.observationsDeployment, ids.observationsVersion, "2026-08-28T10:00:00Z");
+  const cutover = deployment(ids.cacheV3Deployment, ids.cacheV3Version, "2026-08-28T11:00:00Z");
+  const missingTime = deployment(uuid("a"), uuid("a"), undefined);
+  assert.throws(() => assertStableDeploymentAtCutover({
+    deployments: [selected], selectedDeployment: selected, cutoverDeployment: { ...cutover, created_on: "invalid" }, label: "observations",
+  }), /cut-over deployment created_on is invalid/);
+  assert.throws(() => assertStableDeploymentAtCutover({
+    deployments: [selected, missingTime], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
+  }), /created_on is required/);
+
+  const sameTime = deployment(uuid("b"), uuid("b"), selected.created_on);
+  assert.throws(() => assertStableDeploymentAtCutover({
+    deployments: [sameTime, selected], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
+  }), /chronology is ambiguous/);
+});
+
+test("valid but superseded observations and station workflow runs fail rollback provenance", () => {
+  const supersedingObservations = deployment(uuid("a"), uuid("a"), "2026-08-28T10:30:00Z");
+  assert.throws(() => rollbackPayload({
+    deployments: { observations: [...rollbackFixture().deployments.observations, supersedingObservations] },
+  }), /observations selected deployment was superseded/);
+
+  const supersedingStation = deployment(uuid("b"), uuid("b"), "2026-08-28T10:30:00Z");
+  assert.throws(() => rollbackPayload({
+    deployments: { station: [...rollbackFixture().deployments.station, supersedingStation] },
+  }), /station selected deployment was superseded/);
+});
+
 test("rollback capture rejects placeholder UUIDs and unavailable historical cache identity", () => {
   const invalidRun = run("101", ".github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml", "unknown");
   assert.throws(() => rollbackPayload({ runs: { observations: invalidRun } }), /exactly one explicit Cloudflare version UUID/);
@@ -296,6 +367,25 @@ test("current v3 cache cannot be selected as v2 and v2 must immediately precede 
 
   const intervening = deployment(uuid("9"), uuid("9"), "2026-08-28T10:30:00Z");
   assert.throws(() => rollbackPayload({ deployments: { cache: [...rollbackFixture().deployments.cache, intervening] } }), /not immediately before/);
+});
+
+test("cache chronology retains exact stable-v2 and candidate-v3 Service Binding proof", () => {
+  assert.throws(() => rollbackPayload({
+    versionDetails: {
+      cacheV2: {
+        id: ids.cacheV2Version,
+        resources: { bindings: [{ name: "STATION_HISTORY", type: "service", service: "uk-aq-station-history-test-v3-candidate" }] },
+      },
+    },
+  }), /v2 cache version is not bound to the stable station-history Worker/);
+  assert.throws(() => rollbackPayload({
+    versionDetails: {
+      cacheV3: {
+        id: ids.cacheV3Version,
+        resources: { bindings: [{ name: "STATION_HISTORY", type: "service", service: "uk-aq-station-history-test" }] },
+      },
+    },
+  }), /v3 cache cut-over version is not bound to the station-history candidate/);
 });
 
 test("rollback validator rejects artifact drift and non-contiguous restoration", () => {

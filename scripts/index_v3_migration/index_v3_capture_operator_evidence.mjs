@@ -172,6 +172,58 @@ export function selectDeployment(deployments, versionId, label) {
   return matches[0];
 }
 
+function deploymentCreatedOn(deployment, label) {
+  const raw = requiredString(deployment?.created_on, `${label} created_on`);
+  const timestamp = Date.parse(raw);
+  if (!Number.isFinite(timestamp)) throw new Error(`${label} created_on is invalid`);
+  return timestamp;
+}
+
+function isNormalFullDeployment(deployment) {
+  const versions = Array.isArray(deployment?.versions) ? deployment.versions : [];
+  return UUID.test(String(deployment?.id || ""))
+    && versions.length === 1
+    && UUID.test(String(versions[0]?.version_id || ""))
+    && Number(versions[0]?.percentage) === 100;
+}
+
+export function assertStableDeploymentAtCutover({
+  deployments,
+  selectedDeployment,
+  cutoverDeployment,
+  label,
+}) {
+  if (!Array.isArray(deployments) || deployments.length === 0) {
+    throw new Error(`${label} Cloudflare deployment history is missing`);
+  }
+  if (!isNormalFullDeployment(selectedDeployment)) {
+    throw new Error(`${label} selected deployment is not a normal 100% deployment`);
+  }
+  const cutoverTime = deploymentCreatedOn(cutoverDeployment, "v3 cache cut-over deployment");
+  const selectedTime = deploymentCreatedOn(selectedDeployment, `${label} selected deployment`);
+  if (selectedTime > cutoverTime) throw new Error(`${label} selected deployment is after the v3 cache cut-over`);
+
+  const fullDeployments = deployments.filter(isNormalFullDeployment);
+  const identities = new Set();
+  const eligible = [];
+  for (const deployment of fullDeployments) {
+    if (identities.has(deployment.id)) throw new Error(`${label} Cloudflare deployment history duplicates an identity`);
+    identities.add(deployment.id);
+    const createdOn = deploymentCreatedOn(deployment, `${label} deployment ${deployment.id}`);
+    if (createdOn <= cutoverTime) eligible.push({ deployment, createdOn });
+  }
+  if (!identities.has(selectedDeployment.id)) {
+    throw new Error(`${label} selected deployment is missing from Cloudflare deployment history`);
+  }
+  if (eligible.length === 0) throw new Error(`${label} has no valid 100% deployment at or before the v3 cache cut-over`);
+  const latestTime = Math.max(...eligible.map(({ createdOn }) => createdOn));
+  const latest = eligible.filter(({ createdOn }) => createdOn === latestTime);
+  if (latest.length !== 1) throw new Error(`${label} deployment chronology is ambiguous at the v3 cache cut-over`);
+  if (latest[0].deployment.id !== selectedDeployment.id) {
+    throw new Error(`${label} selected deployment was superseded before the v3 cache cut-over`);
+  }
+}
+
 function assertVersionDetail(detail, versionId, label) {
   if (!detail || detail.id !== versionId) throw new Error(`${label} Cloudflare version detail does not match the workflow UUID`);
 }
@@ -255,6 +307,8 @@ export function buildRollbackPayload({
   assertVersionDetail(versionDetails.station, stationVersion, "station");
   assertVersionDetail(versionDetails.cacheV2, cacheV2Version, "v2 cache");
   assertVersionDetail(versionDetails.cacheV3, cacheV3Version, "v3 cache cut-over");
+  assertStableDeploymentAtCutover({ deployments: deployments.observations, selectedDeployment: observationsDeployment, cutoverDeployment: cacheV3Deployment, label: "observations" });
+  assertStableDeploymentAtCutover({ deployments: deployments.station, selectedDeployment: stationDeployment, cutoverDeployment: cacheV3Deployment, label: "station" });
   assertHistoricalCacheSelection({
     deployments: deployments.cache,
     v2Deployment: cacheV2Deployment,
