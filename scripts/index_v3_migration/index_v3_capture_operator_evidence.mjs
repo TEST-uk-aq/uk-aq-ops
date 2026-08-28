@@ -203,25 +203,35 @@ export function assertStableDeploymentAtCutover({
   const selectedTime = deploymentCreatedOn(selectedDeployment, `${label} selected deployment`);
   if (selectedTime > cutoverTime) throw new Error(`${label} selected deployment is after the v3 cache cut-over`);
 
-  const fullDeployments = deployments.filter(isNormalFullDeployment);
   const identities = new Set();
-  const eligible = [];
-  for (const deployment of fullDeployments) {
-    if (identities.has(deployment.id)) throw new Error(`${label} Cloudflare deployment history duplicates an identity`);
-    identities.add(deployment.id);
-    const createdOn = deploymentCreatedOn(deployment, `${label} deployment ${deployment.id}`);
-    if (createdOn <= cutoverTime) eligible.push({ deployment, createdOn });
+  let selectedPresent = false;
+  for (const deployment of deployments) {
+    const createdOn = deploymentCreatedOn(deployment, `${label} deployment ${deployment?.id}`);
+    const identity = String(deployment?.id || "");
+    if (UUID.test(identity)) {
+      if (identities.has(identity)) throw new Error(`${label} Cloudflare deployment history duplicates an identity`);
+      identities.add(identity);
+    }
+    if (createdOn < selectedTime || createdOn > cutoverTime) continue;
+    if (!UUID.test(identity)) throw new Error(`${label} deployment identity is invalid in the relevant cut-over interval`);
+    if (identity === selectedDeployment.id) {
+      if (createdOn !== selectedTime
+        || !isNormalFullDeployment(deployment)
+        || deployment.versions[0].version_id !== selectedDeployment.versions[0].version_id) {
+        throw new Error(`${label} selected deployment does not match its Cloudflare history record`);
+      }
+      selectedPresent = true;
+      continue;
+    }
+    if (createdOn === selectedTime) {
+      throw new Error(`${label} deployment chronology is ambiguous at the selected deployment time`);
+    }
+    if (createdOn === cutoverTime) {
+      throw new Error(`${label} deployment chronology is ambiguous at the v3 cache cut-over`);
+    }
+    throw new Error(`${label} selected deployment was superseded before the v3 cache cut-over by another deployment`);
   }
-  if (!identities.has(selectedDeployment.id)) {
-    throw new Error(`${label} selected deployment is missing from Cloudflare deployment history`);
-  }
-  if (eligible.length === 0) throw new Error(`${label} has no valid 100% deployment at or before the v3 cache cut-over`);
-  const latestTime = Math.max(...eligible.map(({ createdOn }) => createdOn));
-  const latest = eligible.filter(({ createdOn }) => createdOn === latestTime);
-  if (latest.length !== 1) throw new Error(`${label} deployment chronology is ambiguous at the v3 cache cut-over`);
-  if (latest[0].deployment.id !== selectedDeployment.id) {
-    throw new Error(`${label} selected deployment was superseded before the v3 cache cut-over`);
-  }
+  if (!selectedPresent) throw new Error(`${label} selected deployment is missing from Cloudflare deployment history`);
 }
 
 function assertVersionDetail(detail, versionId, label) {

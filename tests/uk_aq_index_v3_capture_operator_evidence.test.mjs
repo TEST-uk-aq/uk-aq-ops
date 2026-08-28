@@ -166,6 +166,32 @@ const deployment = (id, versionId, createdOn) => ({
   versions: [{ percentage: 100, version_id: versionId }],
 });
 
+function interveningDeploymentEvents(selectedVersion) {
+  return [
+    {
+      id: uuid("c"),
+      created_on: "2026-08-28T10:20:00Z",
+      versions: [
+        { percentage: 50, version_id: selectedVersion },
+        { percentage: 50, version_id: uuid("d") },
+      ],
+    },
+    {
+      id: uuid("e"),
+      created_on: "2026-08-28T10:30:00Z",
+      versions: [
+        { percentage: 34, version_id: selectedVersion },
+        { percentage: 33, version_id: uuid("f") },
+        { percentage: 33, version_id: uuid("a") },
+      ],
+    },
+    {
+      ...deployment(uuid("b"), selectedVersion, "2026-08-28T10:40:00Z"),
+      source: "rollback",
+    },
+  ];
+}
+
 function run(id, workflow, versionId, extras = "") {
   return {
     id,
@@ -278,57 +304,94 @@ test("rollback builder accepts only stable Workers and emits all exact roles and
   assert.throws(() => rollbackPayload({ workerNames: { cache: "uk-aq-cache-test-v3-candidate" } }), /not a stable Worker identity/);
 });
 
-test("observations deployment must be the latest stable 100% deployment at or before cut-over", () => {
+test("observations stable deployment must have no later deployment event through cut-over", () => {
   const selected = deployment(ids.observationsDeployment, ids.observationsVersion, "2026-08-28T10:00:00Z");
   const afterCutover = deployment(uuid("a"), uuid("a"), "2026-08-28T12:00:00Z");
   const cutover = deployment(ids.cacheV3Deployment, ids.cacheV3Version, "2026-08-28T11:00:00Z");
   assert.doesNotThrow(() => assertStableDeploymentAtCutover({
     deployments: [afterCutover, selected], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
   }));
+  assert.doesNotThrow(() => assertStableDeploymentAtCutover({
+    deployments: [{ ...afterCutover, id: "invalid" }, selected], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
+  }));
 
   const superseding = deployment(uuid("b"), uuid("b"), "2026-08-28T10:30:00Z");
   assert.throws(() => assertStableDeploymentAtCutover({
     deployments: [selected, superseding], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
   }), /superseded before/);
+  for (const event of interveningDeploymentEvents(ids.observationsVersion)) {
+    assert.throws(() => assertStableDeploymentAtCutover({
+      deployments: [event, selected], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
+    }), /superseded before/);
+  }
 
   assert.throws(() => assertStableDeploymentAtCutover({
     deployments: [afterCutover], selectedDeployment: afterCutover, cutoverDeployment: cutover, label: "observations",
   }), /after the v3 cache cut-over/);
 });
 
-test("station deployment must be the latest stable 100% deployment at or before cut-over", () => {
+test("station stable deployment must have no later deployment event through cut-over", () => {
   const selected = deployment(ids.stationDeployment, ids.stationVersion, "2026-08-28T10:00:00Z");
   const afterCutover = deployment(uuid("a"), uuid("a"), "2026-08-28T12:00:00Z");
   const cutover = deployment(ids.cacheV3Deployment, ids.cacheV3Version, "2026-08-28T11:00:00Z");
   assert.doesNotThrow(() => assertStableDeploymentAtCutover({
     deployments: [selected, afterCutover], selectedDeployment: selected, cutoverDeployment: cutover, label: "station",
   }));
+  assert.doesNotThrow(() => assertStableDeploymentAtCutover({
+    deployments: [selected, { ...afterCutover, id: "invalid" }], selectedDeployment: selected, cutoverDeployment: cutover, label: "station",
+  }));
 
   const superseding = deployment(uuid("b"), uuid("b"), "2026-08-28T10:30:00Z");
   assert.throws(() => assertStableDeploymentAtCutover({
     deployments: [superseding, selected], selectedDeployment: selected, cutoverDeployment: cutover, label: "station",
   }), /superseded before/);
+  for (const event of interveningDeploymentEvents(ids.stationVersion)) {
+    assert.throws(() => assertStableDeploymentAtCutover({
+      deployments: [selected, event], selectedDeployment: selected, cutoverDeployment: cutover, label: "station",
+    }), /superseded before/);
+  }
 
   assert.throws(() => assertStableDeploymentAtCutover({
     deployments: [afterCutover], selectedDeployment: afterCutover, cutoverDeployment: cutover, label: "station",
   }), /after the v3 cache cut-over/);
 });
 
-test("stable deployment chronology fails closed on invalid timestamps and same-time ambiguity", () => {
-  const selected = deployment(ids.observationsDeployment, ids.observationsVersion, "2026-08-28T10:00:00Z");
+test("stable deployment chronology fails closed on malformed relevant records and same-time ambiguity", () => {
   const cutover = deployment(ids.cacheV3Deployment, ids.cacheV3Version, "2026-08-28T11:00:00Z");
-  const missingTime = deployment(uuid("a"), uuid("a"), undefined);
-  assert.throws(() => assertStableDeploymentAtCutover({
-    deployments: [selected], selectedDeployment: selected, cutoverDeployment: { ...cutover, created_on: "invalid" }, label: "observations",
-  }), /cut-over deployment created_on is invalid/);
-  assert.throws(() => assertStableDeploymentAtCutover({
-    deployments: [selected, missingTime], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
-  }), /created_on is required/);
+  for (const [label, selectedId, selectedVersion] of [
+    ["observations", ids.observationsDeployment, ids.observationsVersion],
+    ["station", ids.stationDeployment, ids.stationVersion],
+  ]) {
+    const selected = deployment(selectedId, selectedVersion, "2026-08-28T10:00:00Z");
+    const missingTime = deployment(uuid("a"), uuid("a"), undefined);
+    assert.throws(() => assertStableDeploymentAtCutover({
+      deployments: [selected], selectedDeployment: selected, cutoverDeployment: { ...cutover, created_on: "invalid" }, label,
+    }), /cut-over deployment created_on is invalid/);
+    assert.throws(() => assertStableDeploymentAtCutover({
+      deployments: [selected, missingTime], selectedDeployment: selected, cutoverDeployment: cutover, label,
+    }), /created_on is required/);
 
-  const sameTime = deployment(uuid("b"), uuid("b"), selected.created_on);
-  assert.throws(() => assertStableDeploymentAtCutover({
-    deployments: [sameTime, selected], selectedDeployment: selected, cutoverDeployment: cutover, label: "observations",
-  }), /chronology is ambiguous/);
+    const malformedIdentity = { ...deployment(uuid("a"), uuid("a"), "2026-08-28T10:30:00Z"), id: "invalid" };
+    assert.throws(() => assertStableDeploymentAtCutover({
+      deployments: [malformedIdentity, selected], selectedDeployment: selected, cutoverDeployment: cutover, label,
+    }), /identity is invalid in the relevant cut-over interval/);
+
+    const sameTime = deployment(uuid("b"), uuid("b"), selected.created_on);
+    assert.throws(() => assertStableDeploymentAtCutover({
+      deployments: [sameTime, selected], selectedDeployment: selected, cutoverDeployment: cutover, label,
+    }), /chronology is ambiguous/);
+
+    const atCutover = deployment(uuid("c"), uuid("c"), cutover.created_on);
+    assert.throws(() => assertStableDeploymentAtCutover({
+      deployments: [selected, atCutover], selectedDeployment: selected, cutoverDeployment: cutover, label,
+    }), /chronology is ambiguous at the v3 cache cut-over/);
+    assert.throws(() => assertStableDeploymentAtCutover({
+      deployments: [selected, null], selectedDeployment: selected, cutoverDeployment: cutover, label,
+    }), /deployment undefined created_on is required/);
+    assert.throws(() => assertStableDeploymentAtCutover({
+      deployments: [deployment(uuid("d"), uuid("d"), "2026-08-28T09:00:00Z")], selectedDeployment: selected, cutoverDeployment: cutover, label,
+    }), /selected deployment is missing/);
+  }
 });
 
 test("valid but superseded observations and station workflow runs fail rollback provenance", () => {
@@ -337,7 +400,7 @@ test("valid but superseded observations and station workflow runs fail rollback 
     deployments: { observations: [...rollbackFixture().deployments.observations, supersedingObservations] },
   }), /observations selected deployment was superseded/);
 
-  const supersedingStation = deployment(uuid("b"), uuid("b"), "2026-08-28T10:30:00Z");
+  const supersedingStation = interveningDeploymentEvents(ids.stationVersion)[0];
   assert.throws(() => rollbackPayload({
     deployments: { station: [...rollbackFixture().deployments.station, supersedingStation] },
   }), /station selected deployment was superseded/);
