@@ -77,8 +77,32 @@ maintenance_status_is_on() {
   '
 }
 
+recovery_manifest_implementation_is_valid() {
+  jq -e '
+    .schema_version == 1 and
+    .kind == "uk_aq_observation_history_v3_recovery_manifest" and
+    ((.payload.recovery_implementation.repository_head | type) == "string") and
+    (.payload.recovery_implementation.repository_head | test("^[0-9a-f]{40}$")) and
+    ((.payload.recovery_implementation.files | type) == "array") and
+    (.payload.recovery_implementation.files | length > 0) and
+    all(
+      .payload.recovery_implementation.files[];
+      ((.path | type) == "string") and
+      (.path | length > 0) and
+      ((.sha256 | type) == "string") and
+      (.sha256 | test("^[0-9a-f]{64}$"))
+    )
+  ' >/dev/null
+}
+
+git_blob_sha256_at_commit() {
+  local commit="$1" path="$2"
+  git cat-file -e "${commit}:${path}" 2>/dev/null || return 1
+  git cat-file blob "${commit}:${path}" 2>/dev/null | shasum -a 256 | awk '{print $1}'
+}
+
 self_test() {
-  local output status candidate legacy_workflow legacy_status fixture
+  local output status candidate legacy_workflow legacy_status fixture recovery_fixture
   command -v jq >/dev/null 2>&1 || fail "self-test: jq is unavailable"
   command -v node >/dev/null 2>&1 || fail "self-test: node is unavailable"
   set +e
@@ -119,6 +143,14 @@ self_test() {
     fi
   done
 
+  recovery_fixture='{"schema_version":1,"kind":"uk_aq_observation_history_v3_recovery_manifest","payload":{"recovery_implementation":{"repository_head":"0123456789abcdef0123456789abcdef01234567","files":[{"path":"scripts/example.sh","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}}}'
+  printf '%s\n' "$recovery_fixture" | recovery_manifest_implementation_is_valid \
+    || fail "self-test: valid recovery_implementation manifest shape was rejected"
+  recovery_fixture='{"schema_version":1,"kind":"uk_aq_observation_history_v3_recovery_manifest","payload":{"implementation":{"repository_head":"0123456789abcdef0123456789abcdef01234567","files":[{"path":"scripts/example.sh","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}}}'
+  if printf '%s\n' "$recovery_fixture" | recovery_manifest_implementation_is_valid 2>/dev/null; then
+    fail "self-test: obsolete payload.implementation manifest shape was accepted"
+  fi
+
   candidate="$(candidate_worker_name 'uk-aq-station-history-test')" \
     || fail "self-test: TEST station candidate name was rejected"
   [ "$candidate" = 'uk-aq-station-history-test-v3-candidate' ] \
@@ -150,6 +182,7 @@ self_test() {
   pass "induced warning continued"
   pass "completed and non-completed workflow states remain distinguished"
   pass "maintenance status requires valid schema-v1 ON evidence and a deployment ID"
+  pass "immutable recovery manifest requires recovery_implementation schema"
   pass "TEST and LIVE candidate Worker names derive from active Worker names"
   pass "obsolete maintenance lookup strings remain absent"
 }
@@ -319,6 +352,7 @@ for file in "$PLAN_REPORT"; do
   jq empty "$file" >/dev/null 2>&1 || fail "migration evidence is not valid JSON: $file"
 done
 
+RECOVERY_AUTHORITY=0
 if [ -n "$AUTHORITY_FILE" ]; then
   [ -f "$AUTHORITY_FILE" ] || fail "required migration evidence is missing: $AUTHORITY_FILE"
   jq empty "$AUTHORITY_FILE" >/dev/null 2>&1 || fail "migration evidence is not valid JSON: $AUTHORITY_FILE"
@@ -326,28 +360,33 @@ if [ -n "$AUTHORITY_FILE" ]; then
   AUTH_REPO="$(jq -r '.repository // empty' "$AUTHORITY_FILE")"
   AUTH_BRANCH="$(jq -r '.branch // empty' "$AUTHORITY_FILE")"
   AUTH_HEAD="$(jq -r '.target_writer_git_sha // empty' "$AUTHORITY_FILE")"
+  AUTH_HEAD_LABEL="target writer"
   AUTH_PLAN_SHA="$(jq -r '.plan_sha256 // empty' "$AUTHORITY_FILE")"
   AUTH_RUN_ID="$(jq -r '.migration_run_id // empty' "$AUTHORITY_FILE")"
 else
   RECOVERY_MANIFEST="$CHECKPOINT.recovery/manifest.json"
   [ -f "$RECOVERY_MANIFEST" ] || fail "recovery manifest is required when --authority-file is omitted"
   jq empty "$RECOVERY_MANIFEST" >/dev/null 2>&1 || fail "recovery manifest is not valid JSON"
+  recovery_manifest_implementation_is_valid < "$RECOVERY_MANIFEST" \
+    || fail "recovery manifest does not contain the required recovery_implementation identity"
   AUTH_ENV="$(jq -r '.result.environment.environment // empty' "$PLAN_REPORT" | tr '[:lower:]' '[:upper:]')"
   AUTH_REPO="$REPO_SLUG"
   AUTH_BRANCH="$CURRENT_BRANCH"
-  AUTH_HEAD="$(jq -r '.payload.implementation.repository_head // empty' "$RECOVERY_MANIFEST")"
+  AUTH_HEAD="$(jq -r '.payload.recovery_implementation.repository_head // empty' "$RECOVERY_MANIFEST")"
+  AUTH_HEAD_LABEL="recovery implementation"
   AUTH_PLAN_SHA="$(jq -r '.payload.plan_sha256 // empty' "$RECOVERY_MANIFEST")"
   AUTH_RUN_ID="$(jq -r '.payload.migration_run_id // empty' "$RECOVERY_MANIFEST")"
+  RECOVERY_AUTHORITY=1
   pass "operator authority was derived from the immutable recovery manifest"
 fi
 
 [ "$AUTH_ENV" = "$ENVIRONMENT" ] || fail "authority environment does not match $ENVIRONMENT"
 [ "$AUTH_REPO" = "$REPO_SLUG" ] || fail "authority repository does not match $REPO_SLUG"
 [ "$AUTH_BRANCH" = "$CURRENT_BRANCH" ] || fail "authority branch does not match $CURRENT_BRANCH"
-printf '%s' "$AUTH_HEAD" | grep -Eq '^[0-9a-f]{40}$' || fail "authority target writer Git SHA is invalid"
-git cat-file -e "${AUTH_HEAD}^{commit}" 2>/dev/null || fail "authority target writer commit is unavailable"
+printf '%s' "$AUTH_HEAD" | grep -Eq '^[0-9a-f]{40}$' || fail "$AUTH_HEAD_LABEL Git SHA is invalid"
+git cat-file -e "${AUTH_HEAD}^{commit}" 2>/dev/null || fail "$AUTH_HEAD_LABEL commit is unavailable"
 git merge-base --is-ancestor "$AUTH_HEAD" "$CURRENT_HEAD" \
-  || fail "authority target writer commit is not an ancestor of current HEAD"
+  || fail "$AUTH_HEAD_LABEL commit is not an ancestor of current HEAD"
 
 PLAN_ENV="$(jq -r '.result.environment.environment // empty' "$PLAN_REPORT" | tr '[:lower:]' '[:upper:]')"
 PLAN_RUN_ID="$(jq -r '.result.migration_run_id // empty' "$PLAN_REPORT")"
@@ -398,12 +437,24 @@ CRITICAL_PATHS=(
   scripts/uk_aq_backfill_local.sh
   workers/uk_aq_backfill_local
 )
-CRITICAL_DRIFT="$(git diff --name-only "$AUTH_HEAD" "$CURRENT_HEAD" -- "${CRITICAL_PATHS[@]}")"
+if [ "$RECOVERY_AUTHORITY" -eq 1 ]; then
+  CRITICAL_DRIFT="$(git diff --name-only "$AUTH_HEAD" "$CURRENT_HEAD" -- \
+    "${CRITICAL_PATHS[@]}" \
+    ':(exclude)scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs' \
+    ':(exclude)scripts/backup_r2/lib/observation_history_migration_v3.mjs' \
+    ':(exclude)scripts/index_v3_migration/index_v3_migration.sh')"
+else
+  CRITICAL_DRIFT="$(git diff --name-only "$AUTH_HEAD" "$CURRENT_HEAD" -- "${CRITICAL_PATHS[@]}")"
+fi
 [ -z "$CRITICAL_DRIFT" ] || {
   printf '%s\n' "$CRITICAL_DRIFT" >&2
-  fail "migration-critical code changed after the pinned writer authority"
+  fail "migration-critical code changed after the pinned authority"
 }
-pass "migration-critical code matches the pinned writer authority"
+if [ "$RECOVERY_AUTHORITY" -eq 1 ]; then
+  pass "runtime/writer-critical code matches the pinned recovery authority; superseded recovery operator tooling is excluded"
+else
+  pass "migration-critical code matches the pinned writer authority"
+fi
 
 STATE_KEY="$(jq -r '.result.backup_gate.state_root.key // empty' "$PLAN_REPORT")"
 STATE_SHA="$(jq -r '.result.backup_gate.state_root.sha256 // empty' "$PLAN_REPORT")"
@@ -526,6 +577,8 @@ RECOVERY_MANIFEST="$RECOVERY_ROOT/manifest.json"
 [ -f "$RECOVERY_MANIFEST" ] || fail "recovery manifest is missing"
 jq empty "$RECOVERY_HEAD" >/dev/null 2>&1 || fail "recovery journal head is not valid JSON"
 jq empty "$RECOVERY_MANIFEST" >/dev/null 2>&1 || fail "recovery manifest is not valid JSON"
+recovery_manifest_implementation_is_valid < "$RECOVERY_MANIFEST" \
+  || fail "recovery manifest does not contain a valid recovery_implementation identity"
 
 CHECKPOINT_SHA="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
 CHECKPOINT_BYTES="$(wc -c < "$CHECKPOINT" | tr -d ' ')"
@@ -555,17 +608,20 @@ jq -e '
   || fail "verification report authority SHA does not match recovery head"
 pass "final v3 verification is complete, blocker-free, and cutover-ready"
 
+RECOVERY_IMPLEMENTATION_HEAD="$(jq -r '.payload.recovery_implementation.repository_head // empty' "$RECOVERY_MANIFEST")"
 IMPLEMENTATION_OK=1
 while IFS=$'\t' read -r path expected_sha; do
-  if [ ! -f "$path" ] || [ "$(shasum -a 256 "$path" | awk '{print $1}')" != "$expected_sha" ]; then
-    printf 'Recovery implementation mismatch: %s\n' "$path" >&2
+  actual_sha="$(git_blob_sha256_at_commit "$RECOVERY_IMPLEMENTATION_HEAD" "$path" || true)"
+  if [ -z "$actual_sha" ] || [ "$actual_sha" != "$expected_sha" ]; then
+    printf 'Historical recovery implementation mismatch: %s at %s\n' \
+      "$path" "$RECOVERY_IMPLEMENTATION_HEAD" >&2
     IMPLEMENTATION_OK=0
     break
   fi
-done < <(jq -r '.payload.implementation.files[] | [.path,.sha256] | @tsv' "$RECOVERY_MANIFEST")
+done < <(jq -r '.payload.recovery_implementation.files[] | [.path,.sha256] | @tsv' "$RECOVERY_MANIFEST")
 [ "$IMPLEMENTATION_OK" -eq 1 ] \
-  || fail "current recovery implementation does not match the immutable recovery manifest"
-pass "current recovery implementation matches the immutable recovery manifest"
+  || fail "Git history does not match the immutable recovery implementation manifest"
+pass "historical recovery implementation in Git matches the immutable recovery manifest"
 
 check_candidate() {
   local label="$1" workflow="$2"
