@@ -288,10 +288,10 @@ export function buildRollbackPayload({
     ],
     artifacts,
     restore_steps: [
-      { order: 1, role: "restore_observations_worker", kind: "github_workflow", description: "Restore the accepted stable observations-history Worker from its pinned Git commit.", command_or_workflow: `gh workflow run ${path.basename(WORKFLOWS.observations)} --repo ${repository} --ref ${observationsRun.head_sha}` },
-      { order: 2, role: "restore_station_worker", kind: "github_workflow", description: "Restore the accepted stable station-history Worker from its pinned Git commit.", command_or_workflow: `gh workflow run ${path.basename(WORKFLOWS.station)} --repo ${repository} --ref ${stationRun.head_sha}` },
+      { order: 1, role: "restore_observations_worker", kind: "command", description: "Restore the exact accepted stable observations-history Worker version to 100% using normal Cloudflare authentication loaded for an authorised rollback.", command_or_workflow: `npx wrangler versions deploy ${observationsVersion}@100% --name ${observationsWorker} -y` },
+      { order: 2, role: "restore_station_worker", kind: "command", description: "Restore the exact accepted stable station-history Worker version to 100% using normal Cloudflare authentication loaded for an authorised rollback.", command_or_workflow: `npx wrangler versions deploy ${stationVersion}@100% --name ${stationWorker} -y` },
       { order: 3, role: "restore_v2_index_authority", kind: "command", description: "Restore persistent observation-history index authority to v2.", command_or_workflow: `gh variable set UK_AQ_R2_HISTORY_INDEX_VERSION --repo ${repository} --body v2` },
-      { order: 4, role: "restore_cache_worker_v2_binding", kind: "github_workflow", description: "Restore the accepted cache Worker version bound to stable v2 station history.", command_or_workflow: `gh workflow run ${path.basename(WORKFLOWS.cache)} --repo ${repository} --ref ${cacheV2Run.head_sha}` },
+      { order: 4, role: "restore_cache_worker_v2_binding", kind: "command", description: "Restore the exact accepted v2 cache Worker version to 100% using normal Cloudflare authentication loaded for an authorised rollback; its stable station-history binding is proven by this record.", command_or_workflow: `npx wrangler versions deploy ${cacheV2Version}@100% --name ${cacheWorker} -y` },
     ],
   };
 }

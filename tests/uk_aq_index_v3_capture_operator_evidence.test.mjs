@@ -227,6 +227,15 @@ function rollbackPayload(overrides = {}) {
 test("rollback builder accepts only stable Workers and emits all exact roles and restore steps", () => {
   const payload = rollbackPayload();
   assert.deepEqual(payload.components.map(({ role }) => role), ["stable_observations_worker", "stable_station_worker", "cache_worker"]);
+  assert.deepEqual(payload.artifacts.map(({ role }) => role), [
+    "observations_deploy_workflow",
+    "station_deploy_workflow",
+    "cache_deploy_workflow",
+    "observations_worker_config",
+    "station_worker_config",
+    "cache_worker_config",
+    "cache_binding_resolver",
+  ]);
   assert.deepEqual(payload.restore_steps.map(({ order }) => order), [1, 2, 3, 4]);
   assert.deepEqual(payload.restore_steps.map(({ role }) => role), [
     "restore_observations_worker",
@@ -234,6 +243,28 @@ test("rollback builder accepts only stable Workers and emits all exact roles and
     "restore_v2_index_authority",
     "restore_cache_worker_v2_binding",
   ]);
+  assert.deepEqual(payload.restore_steps.map(({ kind }) => kind), ["command", "command", "command", "command"]);
+  assert.equal(
+    payload.restore_steps[0].command_or_workflow,
+    `npx wrangler versions deploy ${ids.observationsVersion}@100% --name uk-aq-observs-history-r2-api-test -y`,
+  );
+  assert.equal(
+    payload.restore_steps[1].command_or_workflow,
+    `npx wrangler versions deploy ${ids.stationVersion}@100% --name uk-aq-station-history-test -y`,
+  );
+  assert.equal(
+    payload.restore_steps[2].command_or_workflow,
+    "gh variable set UK_AQ_R2_HISTORY_INDEX_VERSION --repo TEST-uk-aq/uk-aq-ops --body v2",
+  );
+  assert.equal(
+    payload.restore_steps[3].command_or_workflow,
+    `npx wrangler versions deploy ${ids.cacheV2Version}@100% --name uk-aq-cache-test -y`,
+  );
+  assert.ok(payload.restore_steps.filter(({ role }) => role !== "restore_v2_index_authority")
+    .every(({ command_or_workflow }) => command_or_workflow.includes("@100%")));
+  assert.ok(payload.restore_steps.every(({ command_or_workflow }) => !command_or_workflow.includes("-v3-candidate")));
+  assert.ok(payload.restore_steps.every(({ command_or_workflow }) => !/gh workflow run .*--ref [0-9a-f]{40}/.test(command_or_workflow)));
+  assert.ok(!payload.restore_steps[3].command_or_workflow.includes(ids.cacheV3Version));
   assert.equal(validateIndexV3OperatorEvidence({
     evidence: evidence("uk_aq_index_v3_v2_runtime_rollback_record", payload),
     repositoryRoot,
@@ -285,7 +316,8 @@ test("rollback validator rejects artifact drift and non-contiguous restoration",
 test("capture implementation exposes only read-only external operations", () => {
   assert.match(source, /method: "GET"/);
   assert.doesNotMatch(source, /method:\s*"(?:POST|PUT|PATCH|DELETE)"/);
-  assert.doesNotMatch(source, /wrangler[^\n]*(?:deploy|delete|secret|put)/i);
+  assert.doesNotMatch(source, /run\("(?:npx|wrangler)"/);
+  assert.doesNotMatch(source, /spawnSync\("(?:npx|wrangler)"/);
   assert.doesNotMatch(source, /\b(?:r2|d1)\b[^\n]*(?:put|delete|execute)/i);
   assert.doesNotMatch(source, /gh\(\["variable",\s*"set"/);
   assert.doesNotMatch(source, /gh\(\[[^\]]*(?:scheduler|maintenance)[^\]]*\]/i);
