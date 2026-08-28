@@ -11,10 +11,12 @@ usage() {
 Usage:
   index_v3_preflight.sh --stage plan
   index_v3_preflight.sh --stage migration-start \
-    --authority-file PATH --plan-report PATH --dropbox-root PATH --site-url URL
+    --authority-file PATH --plan-report PATH --dropbox-root PATH --site-url URL \
+    --writer-freeze-evidence PATH
   index_v3_preflight.sh --stage cutover \
     --plan-report PATH --dropbox-root PATH --site-url URL \
-    --checkpoint PATH --verify-report PATH
+    --checkpoint PATH --verify-report PATH \
+    --writer-freeze-evidence PATH --v2-runtime-rollback-record PATH
   index_v3_preflight.sh --self-test
 
 Stages:
@@ -214,6 +216,8 @@ DROPBOX_ROOT=""
 SITE_URL=""
 CHECKPOINT=""
 VERIFY_REPORT=""
+WRITER_FREEZE_EVIDENCE=""
+V2_RUNTIME_ROLLBACK_RECORD=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -224,6 +228,8 @@ while [ "$#" -gt 0 ]; do
     --site-url) SITE_URL="${2:-}"; shift 2 ;;
     --checkpoint) CHECKPOINT="${2:-}"; shift 2 ;;
     --verify-report) VERIFY_REPORT="${2:-}"; shift 2 ;;
+    --writer-freeze-evidence) WRITER_FREEZE_EVIDENCE="${2:-}"; shift 2 ;;
+    --v2-runtime-rollback-record) V2_RUNTIME_ROLLBACK_RECORD="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; fail "unknown argument: $1" ;;
   esac
@@ -246,9 +252,13 @@ fi
 if [ "$STAGE" = "migration-start" ]; then
   [ -n "$AUTHORITY_FILE" ] || fail "--authority-file is required for migration-start"
 fi
+if [ "$STAGE" != "plan" ]; then
+  [ -n "$WRITER_FREEZE_EVIDENCE" ] || fail "--writer-freeze-evidence is required for $STAGE"
+fi
 if [ "$STAGE" = "cutover" ]; then
   [ -n "$CHECKPOINT" ] || fail "--checkpoint is required for cutover"
   [ -n "$VERIFY_REPORT" ] || fail "--verify-report is required for cutover"
+  [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] || fail "--v2-runtime-rollback-record is required for cutover"
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -337,6 +347,7 @@ compare_repo_var() {
 
 compare_repo_var UK_AQ_R2_HISTORY_VERSION "$UK_AQ_R2_HISTORY_VERSION"
 compare_repo_var UK_AQ_R2_HISTORY_INDEX_VERSION "$UK_AQ_R2_HISTORY_INDEX_VERSION"
+compare_repo_var UK_AQ_R2_HISTORY_INTEGRITY_VERSION "$UK_AQ_R2_HISTORY_INTEGRITY_VERSION"
 compare_repo_var UK_AQ_STATION_HISTORY_WORKER_NAME "$UK_AQ_STATION_HISTORY_WORKER_NAME"
 compare_repo_var UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME "$UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME"
 compare_repo_var UK_AQ_DROPBOX_ROOT "$UK_AQ_DROPBOX_ROOT"
@@ -425,6 +436,38 @@ jq -e '
   }
 ' "$PLAN_REPORT" >/dev/null || fail "migration plan/rollback authority is not accepted"
 pass "migration plan, backup gate, rollback preflight, and writer limits are accepted"
+
+OPERATOR_EVIDENCE_HELPER="$SCRIPT_DIR/index_v3_operator_evidence.mjs"
+[ -f "$OPERATOR_EVIDENCE_HELPER" ] || fail "operator evidence validator is missing"
+[ -f "$WRITER_FREEZE_EVIDENCE" ] || fail "durable writer-freeze evidence is missing: $WRITER_FREEZE_EVIDENCE"
+FREEZE_EVIDENCE_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
+  --evidence "$WRITER_FREEZE_EVIDENCE" \
+  --plan-report "$PLAN_REPORT" \
+  --repository-root "$REPO_ROOT")" \
+  || fail "durable writer-freeze evidence is invalid"
+[ "$(printf '%s' "$FREEZE_EVIDENCE_RESULT" | jq -r '.environment // empty' | tr '[:lower:]' '[:upper:]')" = "$ENVIRONMENT" ] \
+  || fail "writer-freeze evidence environment does not match $ENVIRONMENT"
+[ "$(printf '%s' "$FREEZE_EVIDENCE_RESULT" | jq -r '.repository // empty')" = "$REPO_SLUG" ] \
+  || fail "writer-freeze evidence repository does not match $REPO_SLUG"
+[ "$(printf '%s' "$FREEZE_EVIDENCE_RESULT" | jq -r '.branch // empty')" = "$CURRENT_BRANCH" ] \
+  || fail "writer-freeze evidence branch does not match $CURRENT_BRANCH"
+pass "durable writer-freeze evidence covers every migration-plan mutation class"
+
+if [ "$STAGE" = "cutover" ]; then
+  [ -f "$V2_RUNTIME_ROLLBACK_RECORD" ] \
+    || fail "immutable v2 runtime rollback record is missing: $V2_RUNTIME_ROLLBACK_RECORD"
+  ROLLBACK_RECORD_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
+    --evidence "$V2_RUNTIME_ROLLBACK_RECORD" \
+    --repository-root "$REPO_ROOT")" \
+    || fail "immutable v2 runtime rollback record is invalid or lacks exact historical deployment identity"
+  [ "$(printf '%s' "$ROLLBACK_RECORD_RESULT" | jq -r '.environment // empty' | tr '[:lower:]' '[:upper:]')" = "$ENVIRONMENT" ] \
+    || fail "v2 runtime rollback record environment does not match $ENVIRONMENT"
+  [ "$(printf '%s' "$ROLLBACK_RECORD_RESULT" | jq -r '.repository // empty')" = "$REPO_SLUG" ] \
+    || fail "v2 runtime rollback record repository does not match $REPO_SLUG"
+  [ "$(printf '%s' "$ROLLBACK_RECORD_RESULT" | jq -r '.branch // empty')" = "$CURRENT_BRANCH" ] \
+    || fail "v2 runtime rollback record branch does not match $CURRENT_BRANCH"
+  pass "immutable v2 runtime rollback record has exact code, workflow, Worker, and deployment identities"
+fi
 
 CRITICAL_PATHS=(
   package.json
@@ -540,7 +583,7 @@ WRITER_PROCESSES="$(pgrep -af 'uk_aq_observation_history_migration_v3|uk_aq_prun
   printf '%s\n' "$WRITER_PROCESSES" >&2
   fail "a local canonical-history writer or migration process appears to be running"
 }
-pass "no local canonical-history writer or migration process is running"
+pass "no local canonical-history writer or migration process is running (local corroboration only)"
 
 PRUNE_RUNS="$(gh run list --repo "$REPO_SLUG" --workflow uk_aq_prune_daily.yml --limit 50 --json databaseId,status,conclusion,event,createdAt,url 2>/dev/null)" \
   || fail "recent Prune Daily workflow state could not be read"
@@ -561,15 +604,16 @@ require_env CLOUDFLARE_API_TOKEN
 D1_JSON="$(npx --yes wrangler@4.61.1 d1 execute "$D1_DATABASE" --config "$SCHEDULER_CONFIG" --remote --command "SELECT job_key, enabled FROM scheduler_jobs WHERE job_key IN ('uk_aq_prune_daily','uk_aq_r2_history_dropbox_backup','uk_aq_r2_history_dropbox_backup_force_prune_recheck') ORDER BY job_key;" --json 2>/dev/null)" \
   || fail "read-only remote D1 scheduler SELECT failed"
 printf '%s' "$D1_JSON" | jq -e '
-  [.. | objects | select(has("job_key") and has("enabled")) | {job_key, enabled}]
-  | unique_by(.job_key) | sort_by(.job_key)
-  == [
-    {"job_key":"uk_aq_prune_daily","enabled":0},
-    {"job_key":"uk_aq_r2_history_dropbox_backup","enabled":0},
-    {"job_key":"uk_aq_r2_history_dropbox_backup_force_prune_recheck","enabled":0}
-  ]
+  [.. | objects | select(has("job_key") and has("enabled")) | {job_key, enabled}] as $rows
+  | ($rows | length) == 3
+    and all($rows[]; (.enabled | type) == "number" and .enabled == 0)
+    and (["uk_aq_prune_daily","uk_aq_r2_history_dropbox_backup","uk_aq_r2_history_dropbox_backup_force_prune_recheck"] as $expected
+      | all($expected[] as $key; ([$rows[] | select(.job_key == $key)] | length) == 1))
+    and all($rows[]; .job_key == "uk_aq_prune_daily"
+      or .job_key == "uk_aq_r2_history_dropbox_backup"
+      or .job_key == "uk_aq_r2_history_dropbox_backup_force_prune_recheck")
 ' >/dev/null || fail "remote scheduler rows are not exactly the three required disabled jobs"
-pass "all migration-sensitive scheduler jobs are disabled in $D1_DATABASE"
+pass "all migration-sensitive scheduler jobs have exactly one disabled numeric row in $D1_DATABASE"
 
 SITE_URL="${SITE_URL%/}"
 CACHE_BUSTER="$(date -u +%s)-$$"
@@ -616,15 +660,23 @@ recovery_manifest_implementation_is_valid < "$RECOVERY_MANIFEST" \
 
 CHECKPOINT_SHA="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
 CHECKPOINT_BYTES="$(wc -c < "$CHECKPOINT" | tr -d ' ')"
+CHECKPOINT_AUTHORITY_SHA="$(jq -r '.authority_sha256 // empty' "$CHECKPOINT")"
 HEAD_CHECKPOINT_SHA="$(jq -r '.payload.original_checkpoint_sha256 // empty' "$RECOVERY_HEAD")"
 MANIFEST_CHECKPOINT_SHA="$(jq -r '.payload.original_checkpoint.sha256 // empty' "$RECOVERY_MANIFEST")"
 MANIFEST_CHECKPOINT_BYTES="$(jq -r '.payload.original_checkpoint.byte_size // empty' "$RECOVERY_MANIFEST")"
+HEAD_AUTHORITY_SHA="$(jq -r '.payload.immutable_authority_sha256 // empty' "$RECOVERY_HEAD")"
+MANIFEST_AUTHORITY_SHA="$(jq -r '.payload.immutable_authority_sha256 // empty' "$RECOVERY_MANIFEST")"
+TARGET_WRITER_GIT_SHA="$(jq -r '.payload.target_writer_git_sha // empty' "$RECOVERY_MANIFEST")"
+printf '%s' "$CHECKPOINT_AUTHORITY_SHA" | grep -Eq '^[0-9a-f]{64}$' \
+  || fail "checkpoint immutable authority SHA is malformed"
 [ "$CHECKPOINT_SHA" = "$HEAD_CHECKPOINT_SHA" ] || fail "recovery head references a different checkpoint"
 [ "$CHECKPOINT_SHA" = "$MANIFEST_CHECKPOINT_SHA" ] || fail "recovery manifest references a different checkpoint"
 [ "$CHECKPOINT_BYTES" = "$MANIFEST_CHECKPOINT_BYTES" ] || fail "checkpoint byte size differs from recovery manifest"
+[ "$CHECKPOINT_AUTHORITY_SHA" = "$HEAD_AUTHORITY_SHA" ] || fail "recovery head authority differs from the independently validated checkpoint"
+[ "$CHECKPOINT_AUTHORITY_SHA" = "$MANIFEST_AUTHORITY_SHA" ] || fail "recovery manifest authority differs from the independently validated checkpoint"
 jq -e '.payload.last_sequence > 0 and (.payload.last_entry_sha256 | test("^[0-9a-f]{64}$"))' "$RECOVERY_HEAD" >/dev/null \
   || fail "recovery journal head is malformed"
-pass "immutable checkpoint and recovery journal identities agree"
+pass "immutable checkpoint independently authenticates the recovery manifest and head identities"
 
 VERIFY_ENV="$(jq -r '.audit.environment // empty' "$VERIFY_REPORT" | tr '[:lower:]' '[:upper:]')"
 [ "$VERIFY_ENV" = "$ENVIRONMENT" ] || fail "verification report environment does not match $ENVIRONMENT"
@@ -638,16 +690,19 @@ jq -e '
 ' "$VERIFY_REPORT" >/dev/null || fail "final v3 verification is not cutover-ready"
 [ "$(jq -r '.result.checkpoint_summary.plan_sha256' "$VERIFY_REPORT")" = "$AUTH_PLAN_SHA" ] \
   || fail "verification report plan SHA does not match authority"
-IMMUTABLE_AUTHORITY_SHA="$(jq -r '.payload.immutable_authority_sha256' "$RECOVERY_HEAD")"
-[ "$(jq -r '.result.checkpoint_summary.authority_sha256' "$VERIFY_REPORT")" = "$IMMUTABLE_AUTHORITY_SHA" ] \
-  || fail "verification report authority SHA does not match recovery head"
+[ "$(jq -r '.result.checkpoint_summary.authority_sha256' "$VERIFY_REPORT")" = "$CHECKPOINT_AUTHORITY_SHA" ] \
+  || fail "verification report authority SHA does not match the independently validated checkpoint"
 pass "final v3 verification is complete, blocker-free, and cutover-ready"
 
 POST_ROOT_EVIDENCE="$(node "$RECOVERY_POST_ROOT_HELPER" \
   --recovery-root "$RECOVERY_ROOT" \
   --source-key "$SOURCE_KEY" \
   --expected-checkpoint-sha256 "$CHECKPOINT_SHA" \
-  --expected-authority-sha256 "$IMMUTABLE_AUTHORITY_SHA")" \
+  --expected-checkpoint-byte-size "$CHECKPOINT_BYTES" \
+  --expected-authority-sha256 "$CHECKPOINT_AUTHORITY_SHA" \
+  --expected-migration-run-id "$AUTH_RUN_ID" \
+  --expected-plan-sha256 "$AUTH_PLAN_SHA" \
+  --expected-target-writer-git-sha "$TARGET_WRITER_GIT_SHA")" \
   || fail "post-migration canonical source-root evidence could not be derived from the immutable recovery journal"
 POST_SOURCE_SHA="$(printf '%s' "$POST_ROOT_EVIDENCE" | jq -r '.sha256 // empty')"
 POST_SOURCE_BYTES="$(printf '%s' "$POST_ROOT_EVIDENCE" | jq -r '.byte_size // empty')"
@@ -699,23 +754,58 @@ done < <(jq -r '.payload.recovery_implementation.files[] | [.path,.sha256] | @ts
   || fail "Git history does not match the immutable recovery implementation manifest"
 pass "historical recovery implementation in Git matches the immutable recovery manifest"
 
+DEPENDENCY_VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-current-verify.XXXXXX")"
+trap 'rm -rf "$DEPENDENCY_VERIFY_DIR"' EXIT
+DEPENDENCY_WRITER_LIMITS="$DEPENDENCY_VERIFY_DIR/writer_limits.json"
+DEPENDENCY_VERIFY_REPORT="$DEPENDENCY_VERIFY_DIR/current_dependency_verify.json"
+jq '.result.target.writer_limits' "$PLAN_REPORT" > "$DEPENDENCY_WRITER_LIMITS"
+UK_AQ_ENV_NAME="$ENVIRONMENT" node --max-old-space-size=4096 \
+  scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs \
+  --mode verify \
+  --environment "$ENVIRONMENT" \
+  --expected-bucket "$CFLARE_R2_BUCKET" \
+  --migration-run-id "$AUTH_RUN_ID" \
+  --target-writer-git-sha "$TARGET_WRITER_GIT_SHA" \
+  --writer-limits-json "$DEPENDENCY_WRITER_LIMITS" \
+  --dropbox-root "$DROPBOX_ROOT" \
+  --expected-inventory-root-sha256 "$INVENTORY_SHA" \
+  --expected-state-root-sha256 "$STATE_SHA" \
+  --expected-plan-sha256 "$AUTH_PLAN_SHA" \
+  --checkpoint-in "$CHECKPOINT" \
+  --report-out "$DEPENDENCY_VERIFY_REPORT" >/dev/null \
+  || fail "current authoritative canonical/v3 dependency closure does not match completed migration evidence"
+jq -e '
+  .result.ok == true and
+  .result.cutover_ready == true and
+  .result.checkpoint_summary.full_verification_complete == true and
+  .result.checkpoint_summary.cutover_ready == true and
+  (.result.blockers | type == "array" and length == 0) and
+  (.audit.blockers | type == "array" and length == 0)
+' "$DEPENDENCY_VERIFY_REPORT" >/dev/null \
+  || fail "current dependency verifier did not produce blocker-free exact verification"
+pass "current canonical Parquet, manifest hierarchy, v3 child/scoped/latest closure exactly matches pinned completed migration authority"
+
 check_candidate() {
   local label="$1" workflow="$2"
   shift 2
   local run run_sha drift
-  run="$(gh run list --repo "$REPO_SLUG" --workflow "$workflow" --limit 1 --json status,conclusion,headSha 2>/dev/null | jq '.[0] // null')" \
+  run="$(gh run list --repo "$REPO_SLUG" --workflow "$workflow" --branch "$DEFAULT_BRANCH" --limit 1 --json status,conclusion,headSha,headBranch,event,createdAt,url 2>/dev/null | jq '.[0] // null')" \
     || fail "$label deployment workflow could not be read"
   [ "$run" != "null" ] || fail "$label has no deployment workflow run"
-  printf '%s' "$run" | jq -e '.status == "completed" and .conclusion == "success"' >/dev/null \
+  printf '%s' "$run" | jq -e --arg branch "$DEFAULT_BRANCH" '
+    .status == "completed" and .conclusion == "success" and .headBranch == $branch
+  ' >/dev/null \
     || fail "$label latest deployment is not a completed success"
   run_sha="$(printf '%s' "$run" | jq -r '.headSha')"
   git cat-file -e "${run_sha}^{commit}" 2>/dev/null || fail "$label deployment commit is unavailable locally"
+  git merge-base --is-ancestor "$run_sha" "$CURRENT_HEAD" \
+    || fail "$label deployment commit is not an ancestor of current default-branch HEAD"
   drift="$(git diff --name-only "$run_sha" "$CURRENT_HEAD" -- "$@")"
   [ -z "$drift" ] || {
     printf '%s\n' "$drift" >&2
     fail "$label is stale relative to current candidate code"
   }
-  pass "$label latest deployment is successful and current"
+  pass "$label accepted deployment is a successful default-branch run with current relevant code identity"
 }
 
 check_candidate "observations-history v3 candidate ($OBSERVATIONS_CANDIDATE_WORKER_NAME)" \

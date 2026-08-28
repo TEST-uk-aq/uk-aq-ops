@@ -898,11 +898,15 @@ export function validateObservationHistoryV3MigrationEnvironment({
   if (
     operation === "rollback"
       ? !new Set(["v2", "v3"]).has(deployedIndexVersion)
+      : operation === "verification"
+        ? !new Set(["v2", "v3"]).has(deployedIndexVersion)
       : deployedIndexVersion !== "v2"
   ) {
     blockers.push(
       operation === "rollback"
         ? "rollback_observation_index_must_be_v2_or_v3"
+        : operation === "verification"
+          ? "verification_observation_index_must_be_v2_or_v3"
         : "deployed_observation_index_must_remain_v2",
     );
   }
@@ -2971,6 +2975,10 @@ export async function verifyObservationHistoryV3MigrationResult({
   });
 }
 
+export async function verifyObservationHistoryV3CurrentDependencies(options) {
+  return verifyObservationHistoryV3MigrationResult(options);
+}
+
 export function buildObservationHistoryV3RerunVerificationPlan({
   currentPlan = null,
   checkpoint,
@@ -2995,16 +3003,28 @@ export function buildObservationHistoryV3RerunVerificationPlan({
   ) {
     throw new Error("Current plan does not match the pinned migration authority");
   }
-  for (const entry of pinnedPlan.v3_publication_plan.entries) {
+  const requiredDependencies = [
+    ...pinnedPlan.units.flatMap((unit) => unit.target_file_intents.map((entry) => ({
+      ...entry,
+      require_stored_sha256: true,
+    }))),
+    ...pinnedPlan.canonical_publication_objects,
+    ...pinnedPlan.v3_publication_plan.entries,
+  ];
+  const dependencyKeys = new Set();
+  for (const entry of requiredDependencies) {
+    if (dependencyKeys.has(entry.key)) continue;
+    dependencyKeys.add(entry.key);
     const completed = checkpoint.completed_objects?.[entry.key];
     if (
       completed?.verified !== true ||
       completed?.durable !== true ||
       completed.byte_size !== entry.byte_size ||
-      completed.sha256 !== entry.sha256
+      completed.sha256 !== entry.sha256 ||
+      (entry.require_stored_sha256 === true && completed.stored_sha256_verified !== true)
     ) {
       throw new Error(
-        `Checkpoint lacks exact durable v3 publication evidence: ${entry.key}`,
+        `Checkpoint lacks exact durable completed-object evidence: ${entry.key}`,
       );
     }
   }

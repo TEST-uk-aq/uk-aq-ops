@@ -62,6 +62,7 @@ import {
   executeObservationHistoryV3MigrationPlan,
   inventoryAuthoritativeCanonicalObservationHistory,
   stableMigrationJson,
+  validateObservationHistoryV3MigrationEnvironment,
   verifyObservationHistoryV2IndexCompleteness,
   verifyObservationHistoryV3CheckpointReuse,
   verifyObservationHistoryV3MigrationResult,
@@ -522,7 +523,7 @@ async function buildPlan(fixture, overrides = {}) {
     environmentEvidence: ENVIRONMENT,
     migrationRunId: "fixture-migration",
     writerLimits: LIMITS,
-    targetWriterGitSha: "fixture-target",
+    targetWriterGitSha: "a".repeat(40),
     expectedInventoryRootSha256: fixture.expectedInventoryRootSha256,
     expectedStateRootSha256: fixture.expectedStateRootSha256,
     ...overrides,
@@ -1479,7 +1480,7 @@ test("Phase 6 rebuilds, orders and exactly rolls back a canonical empty connecto
     runId: null,
     manifestKey: fixture.emptyConnectorKey,
     pollutantManifests: [],
-    writerGitSha: "fixture-target",
+    writerGitSha: "a".repeat(40),
     backedUpAtUtc: sourceEmpty.backed_up_at_utc,
   });
   assert.deepEqual(targetEmptyObject.payload, expectedTargetEmpty);
@@ -1746,6 +1747,19 @@ test("Phase 4 multi-partition apply is bounded, exact and byte-identical on reru
   assert.ok(Object.values(execution.checkpoint.prepared_units).every((unit) =>
     unit.target_file_intents.every((intent) => intent.staging_ref === undefined)
   ));
+  const missingCanonicalEvidence = structuredClone(execution.checkpoint);
+  delete missingCanonicalEvidence.completed_objects[
+    buildObservationHistoryV3MigrationPlanFromCheckpoint({
+      checkpoint: execution.checkpoint,
+      requirePrepared: true,
+    }).canonical_publication_objects[0].key
+  ];
+  assert.throws(
+    () => buildObservationHistoryV3RerunVerificationPlan({
+      checkpoint: missingCanonicalEvidence,
+    }),
+    /exact durable completed-object evidence/,
+  );
   const rerunPlan = buildObservationHistoryV3RerunVerificationPlan({
     checkpoint: execution.checkpoint,
   });
@@ -1811,6 +1825,24 @@ test("Phase 4 multi-partition apply is bounded, exact and byte-identical on reru
   assert.ok(mismatched.blockers.some((entry) =>
     entry.startsWith("scoped_root_child_authority_mismatch:")
   ));
+});
+
+test("current dependency verification admits only explicit v2 or v3 observation authority", () => {
+  for (const indexVersion of ["v2", "v3"]) {
+    const result = validateObservationHistoryV3MigrationEnvironment({
+      ...ENVIRONMENT,
+      indexVersion,
+      operation: "verification",
+    });
+    assert.equal(result.ok, true);
+  }
+  const invalid = validateObservationHistoryV3MigrationEnvironment({
+    ...ENVIRONMENT,
+    indexVersion: "v4",
+    operation: "verification",
+  });
+  assert.equal(invalid.ok, false);
+  assert.deepEqual(invalid.blockers, ["verification_observation_index_must_be_v2_or_v3"]);
 });
 
 test("Phase 4 resumes after an early PUT failure without rereading overwritten source", async () => {
@@ -2332,8 +2364,7 @@ test("recovery journal schema and final-state replay remain structurally compati
     await context.persistCheckpoint(completedCheckpoint);
 
     const manifest = JSON.parse(fs.readFileSync(context.paths.manifest, "utf8"));
-    manifest.payload.recovery_implementation.repository_head =
-      "synthetic-prior-reporting-implementation";
+    manifest.payload.recovery_implementation.repository_head = "f".repeat(40);
     manifest.payload_sha256 = sha256Hex(stableMigrationJson(manifest.payload));
     fs.writeFileSync(context.paths.manifest, stableMigrationJson(manifest), {
       mode: 0o600,

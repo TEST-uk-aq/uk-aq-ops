@@ -29,7 +29,7 @@ jobs:
           test -n "${CFLARE_R2_BUCKET}" || { echo "Missing CFLARE_R2_BUCKET."; exit 1; }
           test -n "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" || { echo "Missing UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME."; exit 1; }
           case "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" in
-            *[!a-z0-9-]*|-*|*-) echo "UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME is not a valid active Worker name."; exit 1 ;;
+            *[!a-z0-9-]*|-*|*-|*-v3-candidate) echo "UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME is not a valid stable Worker name."; exit 1 ;;
           esac
           test "${#UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" -le 50 || { echo "UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME is too long to derive a candidate name."; exit 1; }
           printf 'CANDIDATE_WORKER_NAME=%s-v3-candidate\n' "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" >> "${GITHUB_ENV}"

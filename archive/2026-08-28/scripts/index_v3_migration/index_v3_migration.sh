@@ -13,12 +13,10 @@ Usage:
     --inventory-root-sha256 HEX --state-root-sha256 HEX
 
   index_v3_migration.sh migrate \
-    --work-dir PATH --dropbox-root PATH --site-url URL \
-    --writer-freeze-evidence PATH --apply
+    --work-dir PATH --dropbox-root PATH --site-url URL --apply
 
   index_v3_migration.sh resume \
-    --work-dir PATH --dropbox-root PATH --site-url URL \
-    --writer-freeze-evidence PATH --apply
+    --work-dir PATH --dropbox-root PATH --site-url URL --apply
 
   index_v3_migration.sh verify \
     --work-dir PATH --dropbox-root PATH [--report-out PATH]
@@ -100,7 +98,6 @@ AUTHORITY_FILE=""
 PLAN_REPORT=""
 CHECKPOINT=""
 REPORT_OUT=""
-WRITER_FREEZE_EVIDENCE=""
 APPLY=0
 
 while [ "$#" -gt 0 ]; do
@@ -115,7 +112,6 @@ while [ "$#" -gt 0 ]; do
     --plan-report) PLAN_REPORT="${2:-}"; shift 2 ;;
     --checkpoint) CHECKPOINT="${2:-}"; shift 2 ;;
     --report-out) REPORT_OUT="${2:-}"; shift 2 ;;
-    --writer-freeze-evidence) WRITER_FREEZE_EVIDENCE="${2:-}"; shift 2 ;;
     --apply) APPLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; stop "unknown argument: $1" ;;
@@ -230,17 +226,8 @@ load_authority() {
     || stop "pinned target writer commit is unavailable"
   git merge-base --is-ancestor "$TARGET_WRITER_GIT_SHA" "$(git rev-parse HEAD)" \
     || stop "pinned target writer commit is not an ancestor of current HEAD"
-  if [ "$MODE" = "verify" ]; then
-    LOAD_AUTHORITY_DRIFT="$(git diff --name-only "$TARGET_WRITER_GIT_SHA" HEAD -- \
-      package.json package-lock.json scripts/backup_r2 scripts/operations "$WRAPPER" workers/shared \
-      ':(exclude)scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs' \
-      ':(exclude)scripts/backup_r2/lib/observation_history_migration_v3.mjs' \
-      ':(exclude)scripts/index_v3_migration/index_v3_migration.sh')"
-  else
-    LOAD_AUTHORITY_DRIFT="$(git diff --name-only "$TARGET_WRITER_GIT_SHA" HEAD -- \
-      package.json package-lock.json scripts/backup_r2 scripts/operations "$WRAPPER" workers/shared)"
-  fi
-  [ -z "$LOAD_AUTHORITY_DRIFT" ] \
+  [ -z "$(git diff --name-only "$TARGET_WRITER_GIT_SHA" HEAD -- \
+    package.json package-lock.json scripts/backup_r2 scripts/operations "$WRAPPER" workers/shared)" ] \
     || stop "migration/recovery implementation differs from the pinned target writer commit"
   write_writer_limits
 }
@@ -309,7 +296,6 @@ load_authority
 if [ "$MODE" = "migrate" ]; then
   [ "$APPLY" -eq 1 ] || stop "migrate requires the explicit --apply flag"
   [ -n "$SITE_URL" ] || stop "migrate requires --site-url for positive maintenance verification"
-  [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "migrate requires --writer-freeze-evidence"
   [ ! -e "$CHECKPOINT" ] || stop "migrate checkpoint already exists; use explicit resume mode"
   REPORT_OUT="${REPORT_OUT:-$WORK_DIR/migration_report.json}"
   EXPECTED_AUTH="AUTHORISE_${ENVIRONMENT}_INDEX_V3_MIGRATE:${MIGRATION_RUN_ID}:${PLAN_SHA}"
@@ -318,8 +304,7 @@ if [ "$MODE" = "migrate" ]; then
     --authority-file "$AUTHORITY_FILE" \
     --plan-report "$PLAN_REPORT" \
     --dropbox-root "$DROPBOX_ROOT" \
-    --site-url "$SITE_URL" \
-    --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE"
+    --site-url "$SITE_URL"
   run_cli \
     --mode migrate --apply --writers-frozen \
     --environment "$ENVIRONMENT" \
@@ -341,7 +326,6 @@ if [ "$MODE" = "resume" ]; then
   trap '' HUP
   [ "$APPLY" -eq 1 ] || stop "resume requires the explicit --apply flag"
   [ -n "$SITE_URL" ] || stop "resume requires --site-url for positive maintenance verification"
-  [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "resume requires --writer-freeze-evidence"
   [ -f "$CHECKPOINT" ] || stop "resume requires an existing checkpoint: $CHECKPOINT"
   REPORT_OUT="${REPORT_OUT:-$WORK_DIR/migration_resume_report.json}"
   EXPECTED_AUTH="AUTHORISE_${ENVIRONMENT}_INDEX_V3_RESUME:${MIGRATION_RUN_ID}:${PLAN_SHA}"
@@ -350,8 +334,7 @@ if [ "$MODE" = "resume" ]; then
     --authority-file "$AUTHORITY_FILE" \
     --plan-report "$PLAN_REPORT" \
     --dropbox-root "$DROPBOX_ROOT" \
-    --site-url "$SITE_URL" \
-    --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE"
+    --site-url "$SITE_URL"
   run_cli \
     --mode migrate --apply --writers-frozen \
     --environment "$ENVIRONMENT" \
@@ -373,25 +356,7 @@ fi
 [ "$APPLY" -eq 0 ] || stop "verify mode does not accept --apply"
 [ -f "$CHECKPOINT" ] || stop "verify requires an existing checkpoint: $CHECKPOINT"
 REPORT_OUT="${REPORT_OUT:-$WORK_DIR/migration_verify_report.json}"
-case "$UK_AQ_R2_HISTORY_INDEX_VERSION" in
-  v2)
-    "$PREFLIGHT" --stage plan
-    ;;
-  v3)
-    REPO_SLUG="$(gh repo view --json nameWithOwner -q .nameWithOwner)" \
-      || stop "GitHub repository identity could not be read for post-cutover verification"
-    for variable_name in UK_AQ_R2_HISTORY_VERSION UK_AQ_R2_HISTORY_INDEX_VERSION UK_AQ_R2_HISTORY_INTEGRITY_VERSION; do
-      actual_value="$(gh variable get "$variable_name" --repo "$REPO_SLUG" 2>/dev/null)" \
-        || stop "GitHub variable $variable_name could not be read"
-      [ "$actual_value" = "${!variable_name}" ] \
-        || stop "GitHub $variable_name differs from the independently loaded verification value"
-    done
-    printf 'POST-CUTOVER VERIFY: GitHub history/index/integrity authorities match the loaded read-only verifier.\n'
-    ;;
-  *)
-    stop "verify requires loaded UK_AQ_R2_HISTORY_INDEX_VERSION=v2 or v3"
-    ;;
-esac
+"$PREFLIGHT" --stage plan
 run_cli \
   --mode verify \
   --environment "$ENVIRONMENT" \

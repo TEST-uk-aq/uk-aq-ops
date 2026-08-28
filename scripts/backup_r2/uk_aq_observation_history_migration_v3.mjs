@@ -32,6 +32,9 @@ import {
 import {
   runCommandWithObservationsGlobalOperationLock,
 } from "../operations/uk_aq_with_observations_global_operation_lock.mjs";
+import {
+  readAndValidateRecoveryJournal,
+} from "../index_v3_migration/recovery_journal_authority.mjs";
 import { runHistoryIndexBuild } from "./uk_aq_build_r2_history_index.mjs";
 import {
   buildObservationHistoryV2RestorePlan,
@@ -45,8 +48,9 @@ import {
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
   stableMigrationJson,
+  validateObservationHistoryV3MigrationEnvironment,
   verifyObservationHistoryV2IndexCompleteness,
-  verifyObservationHistoryV3MigrationResult,
+  verifyObservationHistoryV3CurrentDependencies,
 } from "./lib/observation_history_migration_v3.mjs";
 
 const MODES = new Set([
@@ -202,6 +206,7 @@ const RECOVERY_IMPLEMENTATION_PATHS = Object.freeze([
   "scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs",
   "scripts/backup_r2/lib/observation_history_migration_v3.mjs",
   "scripts/index_v3_migration/index_v3_migration.sh",
+  "scripts/index_v3_migration/recovery_journal_authority.mjs",
 ]);
 
 function recoveryProgressPaths(checkpointPath) {
@@ -336,57 +341,39 @@ function applyRecoveryUpdates(checkpoint, updates) {
 function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false }) {
   fs.mkdirSync(paths.entries, { recursive: true, mode: 0o700 });
   const names = fs.readdirSync(paths.entries)
-    .filter((name) => /^\d{10}\.json$/.test(name))
     .sort();
-  let sequence = 0;
-  let entrySha256 = null;
-  const publicationEvidence = [];
-  for (const name of names) {
-    const expectedName = `${String(sequence + 1).padStart(10, "0")}.json`;
-    if (name !== expectedName) throw new Error(`Recovery journal sequence gap before ${name}`);
-    const envelope = readRecoveryEnvelope(
-      path.join(paths.entries, name),
-      "uk_aq_observation_history_v3_recovery_entry",
-    );
-    const payload = envelope.payload;
-    if (
-      payload.sequence !== sequence + 1 ||
-      payload.previous_entry_sha256 !== entrySha256 ||
-      payload.original_checkpoint_sha256 !== manifest.payload.original_checkpoint.sha256 ||
-      payload.immutable_authority_sha256 !== manifest.payload.immutable_authority_sha256
-    ) {
-      throw new Error(`Recovery journal chain is invalid: ${name}`);
-    }
-    applyRecoveryUpdates(checkpoint, payload.updates || {});
-    publicationEvidence.push(...(payload.updates?.publication_evidence || []));
-    sequence = payload.sequence;
-    entrySha256 = envelope.payload_sha256;
-  }
-  const expectedHeadPayload = {
-    original_checkpoint_sha256: manifest.payload.original_checkpoint.sha256,
-    immutable_authority_sha256: manifest.payload.immutable_authority_sha256,
-    last_sequence: sequence,
-    last_entry_sha256: entrySha256,
-  };
-  if (fs.existsSync(paths.head)) {
-    const head = readRecoveryEnvelope(
-      paths.head,
-      "uk_aq_observation_history_v3_recovery_head",
-    );
-    if (stableMigrationJson(head.payload) !== stableMigrationJson(expectedHeadPayload)) {
-      if (!repairHead) throw new Error("Recovery journal head does not match the entry chain");
-      atomicWriteJson(paths.head, recoveryEnvelope(
-        "uk_aq_observation_history_v3_recovery_head",
-        expectedHeadPayload,
-      ));
-    }
-  } else if (sequence > 0 || repairHead) {
+  if (!fs.existsSync(paths.head) && repairHead && names.length === 0) {
     atomicWriteJson(paths.head, recoveryEnvelope(
       "uk_aq_observation_history_v3_recovery_head",
-      expectedHeadPayload,
+      {
+        original_checkpoint_sha256: manifest.payload.original_checkpoint.sha256,
+        immutable_authority_sha256: manifest.payload.immutable_authority_sha256,
+        last_sequence: 0,
+        last_entry_sha256: null,
+      },
     ));
   }
-  return { sequence, entrySha256, publicationEvidence };
+  const replay = readAndValidateRecoveryJournal({
+    recoveryRoot: paths.root,
+    expectedCheckpointSha256: manifest.payload.original_checkpoint.sha256,
+    expectedCheckpointByteSize: manifest.payload.original_checkpoint.byte_size,
+    expectedAuthoritySha256: manifest.payload.immutable_authority_sha256,
+    expectedMigrationRunId: manifest.payload.migration_run_id,
+    expectedPlanSha256: manifest.payload.plan_sha256,
+    expectedTargetWriterGitSha: manifest.payload.target_writer_git_sha,
+    allowEmpty: true,
+  });
+  const publicationEvidence = [];
+  for (const entry of replay.entries) {
+    const payload = entry.payload;
+    applyRecoveryUpdates(checkpoint, payload.updates || {});
+    publicationEvidence.push(...(payload.updates?.publication_evidence || []));
+  }
+  return {
+    sequence: replay.last_sequence,
+    entrySha256: replay.last_entry_sha256,
+    publicationEvidence,
+  };
 }
 
 function preparedProgressState(checkpoint) {
@@ -441,6 +428,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   requireCurrentImplementation = true,
 }) {
   const paths = recoveryProgressPaths(checkpointPath);
+  let createdManifest = false;
   if (!fs.existsSync(paths.manifest)) {
     if (!create) throw new Error("Recovery progress manifest is missing; run resume preflight first");
     fs.mkdirSync(paths.root, { recursive: true, mode: 0o700 });
@@ -448,6 +436,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
       "uk_aq_observation_history_v3_recovery_manifest",
       recoveryManifestPayload({ checkpointPath, checkpoint, repositoryRoot }),
     ));
+    createdManifest = true;
   }
   const manifest = readRecoveryEnvelope(
     paths.manifest,
@@ -469,7 +458,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     paths,
     checkpoint: recoveredCheckpoint,
     manifest,
-    repairHead,
+    repairHead: repairHead || createdManifest,
   });
   buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: recoveredCheckpoint });
   const context = {
@@ -1266,10 +1255,25 @@ export async function runObservationHistoryMigrationV3({
         requirePrepared: true,
       });
     } else if (args.mode === "verify") {
+      const currentEnvironment = validateObservationHistoryV3MigrationEnvironment({
+        ...evidence,
+        operation: "verification",
+      });
+      if (
+        currentEnvironment.ok !== true ||
+        currentEnvironment.environment !== plan.environment.environment ||
+        currentEnvironment.bucket !== plan.environment.bucket ||
+        currentEnvironment.history_version !== plan.environment.history_version ||
+        currentEnvironment.integrity_version !== plan.environment.integrity_version
+      ) {
+        throw new Error(
+          `Current verification environment differs from pinned migration authority: ${currentEnvironment.blockers.join(",")}`,
+        );
+      }
       reportPlan = buildObservationHistoryV3RerunVerificationPlan({
         checkpoint,
       });
-      result = await verifyObservationHistoryV3MigrationResult({
+      result = await verifyObservationHistoryV3CurrentDependencies({
         plan: reportPlan,
         getObject: adapters.getObject,
         headObject: adapters.headObject,

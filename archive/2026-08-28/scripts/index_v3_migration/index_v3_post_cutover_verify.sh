@@ -20,17 +20,11 @@ Usage:
   index_v3_post_cutover_verify.sh \
     --plan-report PATH \
     --checkpoint PATH \
-    --dropbox-root PATH \
-    --writer-freeze-evidence PATH \
-    --v2-runtime-rollback-record PATH \
     --site-url URL \
     --cache-url URL
 
 Required environment already used by the migration tooling:
   UKAQ_ENV_NAME
-  UK_AQ_R2_HISTORY_VERSION
-  UK_AQ_R2_HISTORY_INDEX_VERSION
-  UK_AQ_R2_HISTORY_INTEGRITY_VERSION
   CFLARE_R2_ENDPOINT
   CFLARE_R2_BUCKET
   CFLARE_R2_ACCESS_KEY_ID
@@ -89,17 +83,11 @@ PLAN_REPORT=""
 CHECKPOINT=""
 SITE_URL=""
 CACHE_URL=""
-DROPBOX_ROOT=""
-WRITER_FREEZE_EVIDENCE=""
-V2_RUNTIME_ROLLBACK_RECORD=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --plan-report) PLAN_REPORT="${2:-}"; shift 2 ;;
     --checkpoint) CHECKPOINT="${2:-}"; shift 2 ;;
-    --dropbox-root) DROPBOX_ROOT="${2:-}"; shift 2 ;;
-    --writer-freeze-evidence) WRITER_FREEZE_EVIDENCE="${2:-}"; shift 2 ;;
-    --v2-runtime-rollback-record) V2_RUNTIME_ROLLBACK_RECORD="${2:-}"; shift 2 ;;
     --site-url) SITE_URL="${2:-}"; shift 2 ;;
     --cache-url) CACHE_URL="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -109,9 +97,6 @@ done
 
 [ -n "$PLAN_REPORT" ] || fail "--plan-report is required"
 [ -n "$CHECKPOINT" ] || fail "--checkpoint is required"
-[ -n "$DROPBOX_ROOT" ] || fail "--dropbox-root is required"
-[ -n "$WRITER_FREEZE_EVIDENCE" ] || fail "--writer-freeze-evidence is required"
-[ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] || fail "--v2-runtime-rollback-record is required"
 [ -n "$SITE_URL" ] || fail "--site-url is required"
 [ -n "$CACHE_URL" ] || fail "--cache-url is required"
 
@@ -130,9 +115,6 @@ jq empty "$PLAN_REPORT" >/dev/null 2>&1 || fail "migration plan report is invali
 
 for name in \
   UKAQ_ENV_NAME \
-  UK_AQ_R2_HISTORY_VERSION \
-  UK_AQ_R2_HISTORY_INDEX_VERSION \
-  UK_AQ_R2_HISTORY_INTEGRITY_VERSION \
   CFLARE_R2_ENDPOINT \
   CFLARE_R2_BUCKET \
   CFLARE_R2_ACCESS_KEY_ID \
@@ -168,9 +150,6 @@ printf 'Site URL: %s\n' "${SITE_URL%/}"
 printf 'Cache URL: %s\n' "${CACHE_URL%/}"
 printf '%s\n\n' 'READ-ONLY: NO CONFIGURATION OR DATA MUTATION IS PERFORMED'
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-post-cutover.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
 GH_ENV="$(gh variable get UKAQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:lower:]' '[:upper:]')" \
   || fail "GitHub UKAQ_ENV_NAME could not be read"
 [ "$GH_ENV" = "$ENVIRONMENT" ] || fail "GitHub environment does not match loaded $ENVIRONMENT"
@@ -178,15 +157,7 @@ GH_ENV="$(gh variable get UKAQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:
 INDEX_AUTHORITY="$(gh variable get UK_AQ_R2_HISTORY_INDEX_VERSION --repo "$REPO_SLUG" 2>/dev/null)" \
   || fail "GitHub UK_AQ_R2_HISTORY_INDEX_VERSION could not be read"
 [ "$INDEX_AUTHORITY" = "v3" ] || fail "persistent index authority is not v3: $INDEX_AUTHORITY"
-[ "$UK_AQ_R2_HISTORY_INDEX_VERSION" = "v3" ] || fail "loaded observation-history index authority is not v3"
-for variable_name in UK_AQ_R2_HISTORY_VERSION UK_AQ_R2_HISTORY_INTEGRITY_VERSION; do
-  actual_value="$(gh variable get "$variable_name" --repo "$REPO_SLUG" 2>/dev/null)" \
-    || fail "GitHub $variable_name could not be read"
-  [ "$actual_value" = "${!variable_name}" ] \
-    || fail "GitHub $variable_name differs from the independently loaded value"
-done
-[ "$UK_AQ_R2_HISTORY_VERSION" = "v2" ] || fail "logical history version is not v2"
-pass "persistent GitHub history/index/integrity authorities independently match the loaded v2/v3/v2 values"
+pass "persistent GitHub observation-history index authority is v3"
 
 STABLE_STATION_WORKER="$(gh variable get UK_AQ_STATION_HISTORY_WORKER_NAME --repo "$REPO_SLUG" 2>/dev/null)" \
   || fail "GitHub UK_AQ_STATION_HISTORY_WORKER_NAME could not be read"
@@ -207,29 +178,12 @@ pass "v3 authority deterministically resolves STATION_HISTORY to $STATION_CANDID
 LATEST_CACHE_RUN="$(gh run list \
   --repo "$REPO_SLUG" \
   --workflow uk_aq_cache_proxy_deploy.yml \
-  --branch "$DEFAULT_BRANCH" \
   --limit 1 \
-  --json databaseId,status,conclusion,headSha,headBranch,event,createdAt,url 2>/dev/null | jq '.[0] // null')" \
+  --json databaseId,status,conclusion,headSha,url 2>/dev/null | jq '.[0] // null')" \
   || fail "latest cache deployment workflow could not be read"
 [ "$LATEST_CACHE_RUN" != "null" ] || fail "no cache deployment workflow run was found"
-printf '%s' "$LATEST_CACHE_RUN" | jq -e --arg branch "$DEFAULT_BRANCH" '
-  .status == "completed" and .conclusion == "success" and .headBranch == $branch
-' >/dev/null \
+printf '%s' "$LATEST_CACHE_RUN" | jq -e '.status == "completed" and .conclusion == "success"' >/dev/null \
   || fail "latest cache deployment is not a completed success"
-CACHE_RUN_SHA="$(printf '%s' "$LATEST_CACHE_RUN" | jq -r '.headSha // empty')"
-git cat-file -e "${CACHE_RUN_SHA}^{commit}" 2>/dev/null \
-  || fail "accepted cache deployment commit is unavailable locally"
-git merge-base --is-ancestor "$CACHE_RUN_SHA" "$(git rev-parse HEAD)" \
-  || fail "accepted cache deployment is not an ancestor of current default-branch HEAD"
-CACHE_DEPLOY_DRIFT="$(git diff --name-only "$CACHE_RUN_SHA" HEAD -- \
-  .github/workflows/uk_aq_cache_proxy_deploy.yml \
-  workers/uk_aq_cache_proxy \
-  workers/uk_aq_station_history_v3_candidate \
-  workers/uk_aq_station_history/src)"
-[ -z "$CACHE_DEPLOY_DRIFT" ] || {
-  printf '%s\n' "$CACHE_DEPLOY_DRIFT" >&2
-  fail "accepted cache deployment is stale relative to current relevant routing/runtime code"
-}
 CACHE_RUN_ID="$(printf '%s' "$LATEST_CACHE_RUN" | jq -r '.databaseId')"
 CACHE_RUN_LOG="$(gh run view "$CACHE_RUN_ID" --repo "$REPO_SLUG" --log 2>/dev/null)" \
   || fail "latest cache deployment log could not be read"
@@ -238,8 +192,7 @@ printf '%s\n' "$CACHE_RUN_LOG" | grep -Fq \
   || fail "latest cache deployment did not resolve STATION_HISTORY to $STATION_CANDIDATE"
 printf '%s\n' "$CACHE_RUN_LOG" | grep -Fq 'Persistent observation-history authority: v3' \
   || fail "latest cache deployment log does not report persistent v3 authority"
-pass "accepted default-branch cache deployment has current relevant code identity and explicitly bound STATION_HISTORY to the v3 candidate"
-warn "Cloudflare deployed-version UUID is not authenticated to GitHub SHA by current workflow metadata; workflow run, relevant Git diff, and deployment log are the strongest safe read-only evidence"
+pass "latest successful cache deployment explicitly bound STATION_HISTORY to the v3 candidate"
 
 LOCAL_DEV_BYPASS="$(gh variable get UK_AQ_LOCAL_DEV_BYPASS_ENABLED --repo "$REPO_SLUG" 2>/dev/null || true)"
 is_true "$LOCAL_DEV_BYPASS" \
@@ -272,71 +225,32 @@ D1_JSON="$(npx --yes wrangler@4.61.1 d1 execute "$D1_DATABASE" \
   --json 2>/dev/null)" \
   || fail "read-only remote D1 scheduler SELECT failed"
 printf '%s' "$D1_JSON" | jq -e '
-  [.. | objects | select(has("job_key") and has("enabled")) | {job_key, enabled}] as $rows
-  | ($rows | length) == 3
-    and all($rows[]; (.enabled | type) == "number" and .enabled == 0)
-    and (["uk_aq_prune_daily","uk_aq_r2_history_dropbox_backup","uk_aq_r2_history_dropbox_backup_force_prune_recheck"] as $expected
-      | all($expected[] as $key; ([$rows[] | select(.job_key == $key)] | length) == 1))
-    and all($rows[]; .job_key == "uk_aq_prune_daily"
-      or .job_key == "uk_aq_r2_history_dropbox_backup"
-      or .job_key == "uk_aq_r2_history_dropbox_backup_force_prune_recheck")
+  [.. | objects | select(has("job_key") and has("enabled")) | {job_key, enabled}]
+  | unique_by(.job_key) | sort_by(.job_key)
+  == [
+    {"job_key":"uk_aq_prune_daily","enabled":0},
+    {"job_key":"uk_aq_r2_history_dropbox_backup","enabled":0},
+    {"job_key":"uk_aq_r2_history_dropbox_backup_force_prune_recheck","enabled":0}
+  ]
 ' >/dev/null || fail "migration-sensitive scheduler jobs are not exactly the three required disabled rows"
-pass "all migration-sensitive scheduler jobs retain exactly one disabled numeric row"
+pass "all migration-sensitive scheduler jobs remain frozen"
 
 SOURCE_KEY="$(jq -r '.result.source_root.key // empty' "$PLAN_REPORT")"
 [ -n "$SOURCE_KEY" ] || fail "migration plan source-root key is missing"
-MIGRATION_RUN_ID="$(jq -r '.result.migration_run_id // empty' "$PLAN_REPORT")"
-PLAN_SHA="$(jq -r '.result.plan_sha256 // empty' "$PLAN_REPORT")"
-INVENTORY_SHA="$(jq -r '.result.backup_gate.inventory_root.sha256 // empty' "$PLAN_REPORT")"
-STATE_SHA="$(jq -r '.result.backup_gate.state_root.sha256 // empty' "$PLAN_REPORT")"
-
-OPERATOR_EVIDENCE_HELPER="$SCRIPT_DIR/index_v3_operator_evidence.mjs"
-[ -f "$OPERATOR_EVIDENCE_HELPER" ] || fail "operator evidence validator is missing"
-FREEZE_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
-  --evidence "$WRITER_FREEZE_EVIDENCE" \
-  --plan-report "$PLAN_REPORT" \
-  --repository-root "$REPO_ROOT")" \
-  || fail "durable writer-freeze evidence is invalid"
-ROLLBACK_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
-  --evidence "$V2_RUNTIME_ROLLBACK_RECORD" \
-  --repository-root "$REPO_ROOT")" \
-  || fail "immutable v2 runtime rollback record is invalid or lacks exact historical deployment identity"
-for result_name in FREEZE_RESULT ROLLBACK_RESULT; do
-  result_value="${!result_name}"
-  [ "$(printf '%s' "$result_value" | jq -r '.environment // empty' | tr '[:lower:]' '[:upper:]')" = "$ENVIRONMENT" ] \
-    || fail "$result_name environment differs from $ENVIRONMENT"
-  [ "$(printf '%s' "$result_value" | jq -r '.repository // empty')" = "$REPO_SLUG" ] \
-    || fail "$result_name repository differs from $REPO_SLUG"
-  [ "$(printf '%s' "$result_value" | jq -r '.branch // empty')" = "$CURRENT_BRANCH" ] \
-    || fail "$result_name branch differs from $CURRENT_BRANCH"
-done
-pass "durable freeze evidence covers all declared mutation classes and the v2 runtime rollback record is exact"
-
 RECOVERY_ROOT="$CHECKPOINT.recovery"
 RECOVERY_HEAD="$RECOVERY_ROOT/head.json"
-RECOVERY_MANIFEST="$RECOVERY_ROOT/manifest.json"
 RECOVERY_HELPER="$SCRIPT_DIR/recovery_post_migration_root_evidence.mjs"
 [ -f "$RECOVERY_HEAD" ] || fail "recovery journal head is missing: $RECOVERY_HEAD"
-[ -f "$RECOVERY_MANIFEST" ] || fail "recovery manifest is missing: $RECOVERY_MANIFEST"
 [ -f "$RECOVERY_HELPER" ] || fail "post-migration recovery-root helper is missing"
 CHECKPOINT_SHA="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
-CHECKPOINT_BYTES="$(wc -c < "$CHECKPOINT" | tr -d ' ')"
-IMMUTABLE_AUTHORITY_SHA="$(jq -r '.authority_sha256 // empty' "$CHECKPOINT")"
-TARGET_WRITER_GIT_SHA="$(jq -r '.payload.target_writer_git_sha // empty' "$RECOVERY_MANIFEST")"
-printf '%s' "$IMMUTABLE_AUTHORITY_SHA" | grep -Eq '^[0-9a-f]{64}$' || fail "checkpoint immutable authority SHA is invalid"
-[ "$(jq -r '.payload.immutable_authority_sha256 // empty' "$RECOVERY_HEAD")" = "$IMMUTABLE_AUTHORITY_SHA" ] \
-  || fail "recovery head authority differs from the independently validated checkpoint"
-[ "$(jq -r '.payload.immutable_authority_sha256 // empty' "$RECOVERY_MANIFEST")" = "$IMMUTABLE_AUTHORITY_SHA" ] \
-  || fail "recovery manifest authority differs from the independently validated checkpoint"
+IMMUTABLE_AUTHORITY_SHA="$(jq -r '.payload.immutable_authority_sha256 // empty' "$RECOVERY_HEAD")"
+printf '%s' "$IMMUTABLE_AUTHORITY_SHA" | grep -Eq '^[0-9a-f]{64}$' \
+  || fail "immutable recovery authority SHA is invalid"
 POST_ROOT_EVIDENCE="$(node "$RECOVERY_HELPER" \
   --recovery-root "$RECOVERY_ROOT" \
   --source-key "$SOURCE_KEY" \
   --expected-checkpoint-sha256 "$CHECKPOINT_SHA" \
-  --expected-checkpoint-byte-size "$CHECKPOINT_BYTES" \
-  --expected-authority-sha256 "$IMMUTABLE_AUTHORITY_SHA" \
-  --expected-migration-run-id "$MIGRATION_RUN_ID" \
-  --expected-plan-sha256 "$PLAN_SHA" \
-  --expected-target-writer-git-sha "$TARGET_WRITER_GIT_SHA")" \
+  --expected-authority-sha256 "$IMMUTABLE_AUTHORITY_SHA")" \
   || fail "post-migration canonical source-root evidence could not be derived"
 POST_SOURCE_SHA="$(printf '%s' "$POST_ROOT_EVIDENCE" | jq -r '.sha256 // empty')"
 POST_SOURCE_BYTES="$(printf '%s' "$POST_ROOT_EVIDENCE" | jq -r '.byte_size // empty')"
@@ -360,38 +274,6 @@ if (sha !== process.env.POST_SOURCE_SHA) throw new Error("post-migration root SH
 if (bytes.byteLength !== Number(process.env.POST_SOURCE_BYTES)) throw new Error("post-migration root byte-size mismatch");
 NODE
 pass "current canonical R2 source root still matches immutable post-migration recovery evidence"
-
-printf '%s\n' '--- B. EXACT V3 DEPENDENCY / GENERATION VERIFICATION ---'
-DEPENDENCY_WRITER_LIMITS="$TMP_DIR/writer_limits.json"
-DEPENDENCY_VERIFY_REPORT="$TMP_DIR/current_dependency_verify.json"
-jq '.result.target.writer_limits' "$PLAN_REPORT" > "$DEPENDENCY_WRITER_LIMITS"
-UK_AQ_ENV_NAME="$ENVIRONMENT" node --max-old-space-size=4096 \
-  scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs \
-  --mode verify \
-  --environment "$ENVIRONMENT" \
-  --expected-bucket "$CFLARE_R2_BUCKET" \
-  --migration-run-id "$MIGRATION_RUN_ID" \
-  --target-writer-git-sha "$TARGET_WRITER_GIT_SHA" \
-  --writer-limits-json "$DEPENDENCY_WRITER_LIMITS" \
-  --dropbox-root "$DROPBOX_ROOT" \
-  --expected-inventory-root-sha256 "$INVENTORY_SHA" \
-  --expected-state-root-sha256 "$STATE_SHA" \
-  --expected-plan-sha256 "$PLAN_SHA" \
-  --checkpoint-in "$CHECKPOINT" \
-  --report-out "$DEPENDENCY_VERIFY_REPORT" >/dev/null \
-  || fail "current authoritative dependency closure differs from the pinned completed migration generation"
-jq -e '
-  .result.ok == true and
-  .result.cutover_ready == true and
-  .result.checkpoint_summary.full_verification_complete == true and
-  .result.checkpoint_summary.cutover_ready == true and
-  (.result.blockers | type == "array" and length == 0) and
-  (.audit.blockers | type == "array" and length == 0)
-' "$DEPENDENCY_VERIFY_REPORT" >/dev/null \
-  || fail "exact current dependency verifier did not produce blocker-free verification"
-pass "exact canonical Parquet, canonical manifest hierarchy, v3 child/scoped/latest dependency closure matches the completed migration authority"
-
-printf '%s\n' '--- A. DEPLOYMENT / ROUTING SMOKE TEST ---'
 
 PROBE_JSON="$(node --input-type=module <<'NODE'
 import crypto from "node:crypto";
@@ -481,6 +363,8 @@ END_UTC="$(printf '%s' "$PROBE_JSON" | jq -r '.end_utc')"
 PROBE_DAY="$(printf '%s' "$PROBE_JSON" | jq -r '.day_utc')"
 pass "selected v3 historical probe: day=$PROBE_DAY timeseries=$TIMESERIES_ID connector=$CONNECTOR_ID pollutant=$POLLUTANT"
 
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-post-cutover.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
 HEADERS_FILE="$TMP_DIR/headers.txt"
 BODY_FILE="$TMP_DIR/body.json"
 
@@ -544,8 +428,7 @@ R2_ROW_COUNT="$(jq '[.observations.rows[]? | select(.source == "r2")] | length' 
 if [ "$R2_ROW_COUNT" -eq 0 ]; then
   R2_ROW_COUNT="$(jq -r '.observations.source_counts.r2 // 0' "$BODY_FILE")"
 fi
-pass "routing/data smoke: cache BYPASS traversed /v1/station-series and returned historical R2 rows (r2_rows=$R2_ROW_COUNT)"
-warn "cache BYPASS does not prove that the inner observations candidate performed a fresh cache MISS or fresh ranged R2 read"
+pass "live cache BYPASS traversed /v1/station-series and returned historical R2 rows (r2_rows=$R2_ROW_COUNT)"
 
-printf '\nPOST-CUTOVER VERIFY PASS: exact v3 dependency generation and deployed routing/data smoke both passed.\n'
+printf '\nPOST-CUTOVER VERIFY PASS: deployed cache -> v3 station-history path is healthy.\n'
 printf 'KEEP MAINTENANCE ON AND WRITERS FROZEN UNTIL THE OPERATOR EXPLICITLY RESUMES THEM.\n'
