@@ -19,15 +19,15 @@ jobs:
       UK_AQ_CF_ACCOUNT_ID_UKAQ: ${{ vars.UK_AQ_CF_ACCOUNT_ID_UKAQ || vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_CF_API_TOKEN_UKAQ: ${{ secrets.UK_AQ_CF_API_TOKEN_UKAQ || secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
       UK_AQ_OPS_ADMIN_ZONE_NAME: ${{ vars.UK_AQ_OPS_ADMIN_ZONE_NAME || 'ukaq.co.uk' }}
-      UK_AQ_OPS_ADMIN_HOSTNAME: ${{ vars.UK_AQ_OPS_ADMIN_HOSTNAME || 'test-admin.ukaq.co.uk' }}
-      UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || 'uk-aq-ops-dashboard-api-test' }}
+      UK_AQ_OPS_ADMIN_HOSTNAME: ${{ vars.UK_AQ_OPS_ADMIN_HOSTNAME || '' }}
+      UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || '' }}
       DASHBOARD_UPSTREAM_BASE_URL: ${{ vars.DASHBOARD_UPSTREAM_BASE_URL || '' }}
       DASHBOARD_UPSTREAM_BEARER_TOKEN: ${{ secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
       SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY || '' }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
       OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY || '' }}
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'TEST' }}
+      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || '' }}
       UK_AQ_SERVICE_EGRESS_METRICS_ENABLED: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_ENABLED || 'false' }}
       UK_AQ_CORE_SCHEMA: ${{ vars.UK_AQ_CORE_SCHEMA || 'uk_aq_core' }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
@@ -50,7 +50,7 @@ jobs:
       DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY || '' }}
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET || '' }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN || '' }}
-      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'TEST' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
       UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || '_ops/checkpoints/r2_history_backup_state_v2' }}
       CLEANAIRSURB_ST_ID: ${{ vars.CLEANAIRSURB_ST_ID || '' }}
@@ -92,11 +92,19 @@ jobs:
             exit 1
           fi
           if [ -z "${UK_AQ_OPS_ADMIN_HOSTNAME}" ]; then
-            echo "Missing variable UK_AQ_OPS_ADMIN_HOSTNAME."
+            echo "Missing GitHub variable UK_AQ_OPS_ADMIN_HOSTNAME."
             exit 1
           fi
           if [ -z "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}" ]; then
-            echo "Missing variable UK_AQ_OPS_DASHBOARD_API_WORKER_NAME."
+            echo "Missing GitHub variable UK_AQ_OPS_DASHBOARD_API_WORKER_NAME."
+            exit 1
+          fi
+          if [ -z "${UKAQ_ENV_NAME}" ]; then
+            echo "Missing GitHub variable UKAQ_ENV_NAME."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_DROPBOX_ROOT}" ]; then
+            echo "Missing GitHub variable UK_AQ_DROPBOX_ROOT."
             exit 1
           fi
           if [ -z "${DASHBOARD_UPSTREAM_BASE_URL}" ] && { [ -z "${SUPABASE_URL}" ] || [ -z "${SB_SECRET_KEY}" ]; }; then
