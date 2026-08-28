@@ -12,6 +12,7 @@ import {
   assertStableDeploymentAtCutover,
   buildRollbackPayload,
   buildWriterFreezePayload,
+  cloudflareCaptureCredentials,
   sealAndPublish,
 } from "../scripts/index_v3_migration/index_v3_capture_operator_evidence.mjs";
 import { validateIndexV3OperatorEvidence } from "../scripts/index_v3_migration/index_v3_operator_evidence.mjs";
@@ -477,4 +478,18 @@ test("capture implementation exposes only read-only external operations", () => 
   assert.match(source, /gh\(\["variable", "get"/);
   assert.match(source, /gh\(\["api"/);
   assert.match(source, /gh\(\["run", "view"/);
+});
+
+test("rollback capture routes observations and domain Workers through their established Cloudflare accounts", () => {
+  assert.deepEqual(cloudflareCaptureCredentials({
+    CLOUDFLARE_ACCOUNT_ID: "generic-account",
+    CLOUDFLARE_API_TOKEN: "generic-token",
+    UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: "r2-account",
+    UK_AQ_R2_CLOUDFLARE_API_TOKEN: "r2-token",
+    UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID: "domain-account",
+    UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: "domain-token",
+  }), {
+    observations: { accountId: "r2-account", apiToken: "r2-token" },
+    domain: { accountId: "domain-account", apiToken: "domain-token" },
+  });
 });

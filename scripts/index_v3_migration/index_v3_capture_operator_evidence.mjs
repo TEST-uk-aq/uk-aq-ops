@@ -462,6 +462,35 @@ function requireRunId(value, flag) {
   return String(value);
 }
 
+export function cloudflareCaptureCredentials(environment) {
+  return {
+    observations: {
+      accountId: requiredString(
+        environment.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || environment.CLOUDFLARE_ACCOUNT_ID,
+        "UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_ACCOUNT_ID",
+      ),
+      apiToken: requiredString(
+        environment.UK_AQ_R2_CLOUDFLARE_API_TOKEN || environment.CLOUDFLARE_API_TOKEN,
+        "UK_AQ_R2_CLOUDFLARE_API_TOKEN or CLOUDFLARE_API_TOKEN",
+      ),
+    },
+    domain: {
+      accountId: requiredString(
+        environment.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID
+          || environment.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID
+          || environment.CLOUDFLARE_ACCOUNT_ID,
+        "UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID, UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID, or CLOUDFLARE_ACCOUNT_ID",
+      ),
+      apiToken: requiredString(
+        environment.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN
+          || environment.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN
+          || environment.CLOUDFLARE_API_TOKEN,
+        "UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN, UK_AQ_CACHE_CLOUDFLARE_API_TOKEN, or CLOUDFLARE_API_TOKEN",
+      ),
+    },
+  };
+}
+
 export async function main(argv = process.argv.slice(2), environment = process.env) {
   const args = parseArgs(argv);
   if (!new Set(["writer-freeze", "v2-runtime-rollback"]).has(args.mode)) {
@@ -482,8 +511,7 @@ export async function main(argv = process.argv.slice(2), environment = process.e
     payload = buildWriterFreezePayload({ planReport, repositoryRoot, environment: captureEnvironment, repository: github.repository, branch: state.branch, head: state.head, operator: args.operator, confirmed: args.confirmFrozen });
     kind = "uk_aq_index_v3_writer_freeze_evidence";
   } else {
-    const accountId = requiredString(environment.CLOUDFLARE_ACCOUNT_ID, "CLOUDFLARE_ACCOUNT_ID");
-    const apiToken = requiredString(environment.CLOUDFLARE_API_TOKEN, "CLOUDFLARE_API_TOKEN");
+    const credentials = cloudflareCaptureCredentials(environment);
     const workerNames = {
       observations: githubVariable("UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME", github.repository, repositoryRoot),
       station: githubVariable("UK_AQ_STATION_HISTORY_WORKER_NAME", github.repository, repositoryRoot),
@@ -496,9 +524,9 @@ export async function main(argv = process.argv.slice(2), environment = process.e
       cacheV3: githubRun(requireRunId(args.cacheV3CutoverRunId, "--cache-v3-cutover-run-id"), github.repository, repositoryRoot),
     };
     const deployments = {
-      observations: await workerDeployments(accountId, apiToken, workerNames.observations),
-      station: await workerDeployments(accountId, apiToken, workerNames.station),
-      cache: await workerDeployments(accountId, apiToken, workerNames.cache),
+      observations: await workerDeployments(credentials.observations.accountId, credentials.observations.apiToken, workerNames.observations),
+      station: await workerDeployments(credentials.domain.accountId, credentials.domain.apiToken, workerNames.station),
+      cache: await workerDeployments(credentials.domain.accountId, credentials.domain.apiToken, workerNames.cache),
     };
     const versionIds = {
       observations: parseWorkflowVersionId(runs.observations.log, "observations"),
@@ -507,10 +535,10 @@ export async function main(argv = process.argv.slice(2), environment = process.e
       cacheV3: parseWorkflowVersionId(runs.cacheV3.log, "v3 cache cut-over"),
     };
     const versionDetails = {
-      observations: await workerVersion(accountId, apiToken, workerNames.observations, versionIds.observations),
-      station: await workerVersion(accountId, apiToken, workerNames.station, versionIds.station),
-      cacheV2: await workerVersion(accountId, apiToken, workerNames.cache, versionIds.cacheV2),
-      cacheV3: await workerVersion(accountId, apiToken, workerNames.cache, versionIds.cacheV3),
+      observations: await workerVersion(credentials.observations.accountId, credentials.observations.apiToken, workerNames.observations, versionIds.observations),
+      station: await workerVersion(credentials.domain.accountId, credentials.domain.apiToken, workerNames.station, versionIds.station),
+      cacheV2: await workerVersion(credentials.domain.accountId, credentials.domain.apiToken, workerNames.cache, versionIds.cacheV2),
+      cacheV3: await workerVersion(credentials.domain.accountId, credentials.domain.apiToken, workerNames.cache, versionIds.cacheV3),
     };
     payload = buildRollbackPayload({ repositoryRoot, environment: captureEnvironment, repository: github.repository, branch: state.branch, head: state.head, defaultBranch: github.defaultBranch, workerNames, runs, deployments, versionDetails });
     kind = "uk_aq_index_v3_v2_runtime_rollback_record";
