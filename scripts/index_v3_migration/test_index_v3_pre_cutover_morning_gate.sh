@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# UK AQ Phase 6 - TEST pre-cutover morning gate v2
+# UK AQ Phase 6 - TEST pre-cutover morning gate
 #
 # READ-ONLY with respect to UK AQ runtime/data systems.
 #
@@ -74,7 +74,7 @@ done
 
 echo
 echo "============================================================"
-echo "UK AQ Phase 6 - TEST PRE-CUTOVER MORNING GATE v2"
+echo "UK AQ Phase 6 - TEST PRE-CUTOVER MORNING GATE"
 echo "READ-ONLY"
 echo "============================================================"
 echo
@@ -265,7 +265,7 @@ echo
 echo "============================================================"
 
 if [ "$failures" -eq 0 ]; then
-  echo "TEST PRE-CUTOVER MORNING GATE v2: PASS"
+  echo "TEST PRE-CUTOVER MORNING GATE: PASS"
   echo
   echo "No runtime/data changes were made."
   echo "Current repository HEAD may be newer than the reviewed baseline,"
@@ -276,7 +276,7 @@ if [ "$failures" -eq 0 ]; then
   exit 0
 fi
 
-echo "TEST PRE-CUTOVER MORNING GATE v2: STOP"
+echo "TEST PRE-CUTOVER MORNING GATE: STOP"
 echo
 echo "$failures check(s) failed."
 echo "Do NOT perform the TEST v3 cutover until reviewed."
