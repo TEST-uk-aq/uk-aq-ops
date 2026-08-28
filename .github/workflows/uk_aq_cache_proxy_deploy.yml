@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       station_history_service_override:
-        description: "Optional cutover/rollback STATION_HISTORY target: normal Worker or its derived v3 candidate only"
+        description: "Optional STATION_HISTORY target confirmation; must match the persistent index authority"
         required: false
         default: ""
         type: string
@@ -24,6 +24,7 @@ jobs:
     env:
       UK_AQ_CACHE_WORKER_NAME: ${{ vars.UK_AQ_CACHE_WORKER_NAME || 'uk-aq-cache-proxy' }}
       UK_AQ_STATION_HISTORY_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}
+      UK_AQ_R2_HISTORY_INDEX_VERSION: ${{ vars.UK_AQ_R2_HISTORY_INDEX_VERSION || '' }}
       STATION_HISTORY_SERVICE_OVERRIDE: ${{ inputs.station_history_service_override || '' }}
       UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN || '' }}
@@ -46,6 +47,13 @@ jobs:
             echo "Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME."
             exit 1
           fi
+          case "${UK_AQ_R2_HISTORY_INDEX_VERSION}" in
+            v2|v3) ;;
+            *)
+              echo "UK_AQ_R2_HISTORY_INDEX_VERSION must be the persistent v2 or v3 observation-history authority."
+              exit 1
+              ;;
+          esac
 
       - name: Resolve STATION_HISTORY Service Binding target
         working-directory: workers/uk_aq_cache_proxy
@@ -54,6 +62,7 @@ jobs:
           STATION_HISTORY_SERVICE="$(
             bash ./resolve_station_history_service.sh \
               "${UK_AQ_STATION_HISTORY_WORKER_NAME}" \
+              "${UK_AQ_R2_HISTORY_INDEX_VERSION}" \
               "${STATION_HISTORY_SERVICE_OVERRIDE}"
           )"
           echo "Resolved STATION_HISTORY Service Binding target: ${STATION_HISTORY_SERVICE}"

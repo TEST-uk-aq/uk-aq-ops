@@ -20,8 +20,8 @@ const bindingResolver = fileURLToPath(new URL(
   import.meta.url,
 ));
 
-function resolveStationHistoryService(normalService, override = "") {
-  return spawnSync("bash", [bindingResolver, normalService, override], {
+function resolveStationHistoryService(normalService, authorityGeneration, override = "") {
+  return spawnSync("bash", [bindingResolver, normalService, authorityGeneration, override], {
     encoding: "utf8",
   });
 }
@@ -69,30 +69,115 @@ test("candidate workflows derive TEST and LIVE identities from active Worker nam
   assert.doesNotMatch(observationsWrangler, /^name\s*=/m);
 });
 
-test("cache binding override is temporary, constrained and environment-specific", () => {
-  const cases = [
-    ["uk-aq-station-history-test", "", "uk-aq-station-history-test"],
-    ["uk-aq-station-history-test", "uk-aq-station-history-test", "uk-aq-station-history-test"],
-    ["uk-aq-station-history-test", "uk-aq-station-history-test-v3-candidate", "uk-aq-station-history-test-v3-candidate"],
-    ["uk-aq-station-history-live", "uk-aq-station-history-live-v3-candidate", "uk-aq-station-history-live-v3-candidate"],
-  ];
-  for (const [normalService, override, expected] of cases) {
-    const result = resolveStationHistoryService(normalService, override);
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), expected);
-  }
+test("persistent v2 authority with no override selects the normal Worker", () => {
+  const result = resolveStationHistoryService("uk-aq-station-history-test", "v2");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "uk-aq-station-history-test");
+});
 
-  for (const override of [
-    "uk-aq-arbitrary-third-worker",
-    "uk-aq-station-history-test-v3-candidate-v3-candidate",
+test("persistent v3 authority with no override selects the derived candidate", () => {
+  const result = resolveStationHistoryService("uk-aq-station-history-test", "v3");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "uk-aq-station-history-test-v3-candidate");
+});
+
+test("TEST and LIVE station-history targets derive independently", () => {
+  for (const normalService of [
+    "uk-aq-station-history-test",
+    "uk-aq-station-history-live",
   ]) {
-    const result = resolveStationHistoryService("uk-aq-station-history-test", override);
-    assert.notEqual(result.status, 0, `${override} should be rejected`);
+    const v2 = resolveStationHistoryService(normalService, "v2");
+    const v3 = resolveStationHistoryService(normalService, "v3");
+    assert.equal(v2.status, 0, v2.stderr);
+    assert.equal(v3.status, 0, v3.stderr);
+    assert.equal(v2.stdout.trim(), normalService);
+    assert.equal(v3.stdout.trim(), `${normalService}-v3-candidate`);
+  }
+});
+
+test("arbitrary station-history Worker overrides remain rejected", () => {
+  for (const authorityGeneration of ["v2", "v3"]) {
+    const result = resolveStationHistoryService(
+      "uk-aq-station-history-test",
+      authorityGeneration,
+      "uk-aq-arbitrary-third-worker",
+    );
+    assert.notEqual(result.status, 0);
+  }
+});
+
+test("double-suffixed station-history candidates remain rejected", () => {
+  const result = resolveStationHistoryService(
+    "uk-aq-station-history-test",
+    "v3",
+    "uk-aq-station-history-test-v3-candidate-v3-candidate",
+  );
+  assert.notEqual(result.status, 0);
+});
+
+test("manual station-history overrides cannot contradict persistent authority", () => {
+  const matchingSelections = [
+    ["v2", "uk-aq-station-history-test"],
+    ["v3", "uk-aq-station-history-test-v3-candidate"],
+  ];
+  for (const [authorityGeneration, override] of matchingSelections) {
+    const result = resolveStationHistoryService(
+      "uk-aq-station-history-test",
+      authorityGeneration,
+      override,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), override);
   }
 
+  const oppositeSelections = [
+    ["v2", "uk-aq-station-history-test-v3-candidate"],
+    ["v3", "uk-aq-station-history-test"],
+  ];
+  for (const [authorityGeneration, override] of oppositeSelections) {
+    const result = resolveStationHistoryService(
+      "uk-aq-station-history-test",
+      authorityGeneration,
+      override,
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /persistent authority/);
+  }
+
+  for (const authorityGeneration of ["", "v1", "v4"]) {
+    const result = resolveStationHistoryService(
+      "uk-aq-station-history-test",
+      authorityGeneration,
+    );
+    assert.notEqual(result.status, 0);
+  }
+});
+
+test("an ordinary cache-proxy push preserves persistent v3 reader authority", () => {
+  const result = resolveStationHistoryService("uk-aq-station-history-test", "v3");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "uk-aq-station-history-test-v3-candidate");
+
+  assert.match(cacheWorkflow, /push:/);
+  assert.match(cacheWorkflow, /UK_AQ_R2_HISTORY_INDEX_VERSION: \$\{\{ vars\.UK_AQ_R2_HISTORY_INDEX_VERSION \|\| '' \}\}/);
+  assert.match(cacheWorkflow, /"\$\{UK_AQ_R2_HISTORY_INDEX_VERSION\}"/);
+  assert.doesNotMatch(cacheWorkflow, /UK_AQ_R2_HISTORY_INDEX_VERSION[^\n]*\|\| 'v2'/);
+});
+
+test("rollback to persistent v2 authority restores the normal default", () => {
+  const cutover = resolveStationHistoryService("uk-aq-station-history-test", "v3");
+  const rollback = resolveStationHistoryService("uk-aq-station-history-test", "v2");
+  assert.equal(cutover.status, 0, cutover.stderr);
+  assert.equal(rollback.status, 0, rollback.stderr);
+  assert.equal(cutover.stdout.trim(), "uk-aq-station-history-test-v3-candidate");
+  assert.equal(rollback.stdout.trim(), "uk-aq-station-history-test");
+});
+
+test("the stable station-history Worker variable remains the normal deployment identity", () => {
   assert.match(cacheWorkflow, /station_history_service_override:/);
   assert.match(cacheWorkflow, /STATION_HISTORY_SERVICE_OVERRIDE: \$\{\{ inputs\.station_history_service_override \|\| '' \}\}/);
   assert.match(cacheWorkflow, /bash \.\/resolve_station_history_service\.sh/);
+  assert.match(cacheWorkflow, /UK_AQ_STATION_HISTORY_WORKER_NAME: \$\{\{ vars\.UK_AQ_STATION_HISTORY_WORKER_NAME \|\| '' \}\}/);
   assert.match(normalStationWorkflow, /command: deploy --name \$\{\{ env\.UK_AQ_STATION_HISTORY_WORKER_NAME \}\}/);
   assert.match(stationWorkflow, /CANDIDATE_WORKER_NAME="\$\{UK_AQ_STATION_HISTORY_WORKER_NAME\}-v3-candidate"/);
   assert.doesNotMatch(cacheWorkflow, /vars\.STATION_HISTORY_SERVICE_OVERRIDE|vars\.station_history_service_override/);

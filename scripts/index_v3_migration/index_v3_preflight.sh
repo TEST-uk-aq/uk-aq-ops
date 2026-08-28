@@ -625,23 +625,33 @@ grep -Fq 'bash ./resolve_station_history_service.sh' "$CACHE_WORKFLOW" \
   || fail "cache-proxy workflow does not use the constrained station binding resolver"
 grep -Fq "UK_AQ_STATION_HISTORY_WORKER_NAME: \${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}" "$CACHE_WORKFLOW" \
   || fail "cache-proxy normal station identity is not the stable repository variable"
+grep -Fq "UK_AQ_R2_HISTORY_INDEX_VERSION: \${{ vars.UK_AQ_R2_HISTORY_INDEX_VERSION || '' }}" "$CACHE_WORKFLOW" \
+  || fail "cache-proxy workflow does not load the persistent observation-index authority"
 grep -Fq 'command: deploy --name ${{ env.UK_AQ_STATION_HISTORY_WORKER_NAME }}' "$STATION_WORKFLOW" \
   || fail "normal station deployment no longer uses the stable Worker identity"
-[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" '')" = "$UK_AQ_STATION_HISTORY_WORKER_NAME" ] \
-  || fail "empty cache binding override does not preserve the normal station Worker"
-[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" "$UK_AQ_STATION_HISTORY_WORKER_NAME")" = "$UK_AQ_STATION_HISTORY_WORKER_NAME" ] \
+[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v2 '')" = "$UK_AQ_STATION_HISTORY_WORKER_NAME" ] \
+  || fail "persistent v2 authority does not select the normal station Worker"
+[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v3 '')" = "$STATION_CANDIDATE_WORKER_NAME" ] \
+  || fail "persistent v3 authority does not select the derived station candidate Worker"
+[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v2 "$UK_AQ_STATION_HISTORY_WORKER_NAME")" = "$UK_AQ_STATION_HISTORY_WORKER_NAME" ] \
   || fail "explicit normal cache binding override is not accepted"
-[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" "$STATION_CANDIDATE_WORKER_NAME")" = "$STATION_CANDIDATE_WORKER_NAME" ] \
+[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v3 "$STATION_CANDIDATE_WORKER_NAME")" = "$STATION_CANDIDATE_WORKER_NAME" ] \
   || fail "cache binding resolver does not accept the exactly derived v3 candidate"
-if bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" 'uk-aq-arbitrary-third-worker' >/dev/null 2>&1; then
+if bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v2 "$STATION_CANDIDATE_WORKER_NAME" >/dev/null 2>&1; then
+  fail "cache binding resolver permits the v3 candidate while v2 is authoritative"
+fi
+if bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v3 "$UK_AQ_STATION_HISTORY_WORKER_NAME" >/dev/null 2>&1; then
+  fail "cache binding resolver permits the normal Worker while v3 is authoritative"
+fi
+if bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v2 'uk-aq-arbitrary-third-worker' >/dev/null 2>&1; then
   fail "cache binding resolver accepts an arbitrary third Worker"
 fi
-if bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" "${STATION_CANDIDATE_WORKER_NAME}-v3-candidate" >/dev/null 2>&1; then
+if bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" v3 "${STATION_CANDIDATE_WORKER_NAME}-v3-candidate" >/dev/null 2>&1; then
   fail "cache binding resolver accepts a double-suffixed candidate"
 fi
 grep -Fq '__UK_AQ_STATION_HISTORY_WORKER_NAME__' workers/uk_aq_cache_proxy/wrangler.toml \
   || fail "cache-proxy station service-binding placeholder is missing"
-pass "stable station identity and constrained cutover/rollback binding override remain intact"
+pass "persistent generation authority and constrained station binding override remain intact"
 
 warn "cutover remains an explicit operator action outside this read-only script"
 printf '\nPREFLIGHT PASS: all cutover-readiness prerequisites are satisfied.\n'
