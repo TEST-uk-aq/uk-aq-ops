@@ -38,7 +38,7 @@ fail() {
 candidate_worker_name() {
   local active_name="${1:-}" candidate_name
   case "$active_name" in
-    ''|*[!a-z0-9-]*|-*|*-) return 1 ;;
+    ''|*[!a-z0-9-]*|-*|*-|*-v3-candidate) return 1 ;;
   esac
   candidate_name="${active_name}-v3-candidate"
   [ "${#candidate_name}" -le 63 ] || return 1
@@ -135,6 +135,9 @@ self_test() {
     || fail "self-test: LIVE observations candidate name was rejected"
   [ "$candidate" = 'uk-aq-observs-history-r2-api-live-v3-candidate' ] \
     || fail "self-test: LIVE observations candidate name was derived incorrectly"
+  if candidate_worker_name 'uk-aq-station-history-test-v3-candidate' >/dev/null; then
+    fail "self-test: candidate Worker identity was accepted as the stable station identity"
+  fi
 
   legacy_workflow="$(printf '%s%s' 'UK AQ Edge Maintenance ' 'Deploy')"
   legacy_status="$(printf '%s%s' '__uk_aq_site_' 'mode.json')"
@@ -612,11 +615,33 @@ grep -Fq 'UK_AQ_STATION_HISTORY_WORKER_NAME' .github/workflows/uk_aq_station_his
   || fail "station-history candidate deployment does not derive its Worker identity"
 grep -Fq 'UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME' .github/workflows/uk_aq_observs_history_r2_api_v3_candidate_deploy.yml \
   || fail "observations candidate deployment does not derive its Worker identity"
-grep -Fq 'UK_AQ_STATION_HISTORY_WORKER_NAME' .github/workflows/uk_aq_cache_proxy_deploy.yml \
-  || fail "cache-proxy deployment is not controlled by the station Worker variable"
+CACHE_WORKFLOW='.github/workflows/uk_aq_cache_proxy_deploy.yml'
+STATION_WORKFLOW='.github/workflows/uk_aq_station_history_deploy.yml'
+BINDING_RESOLVER='workers/uk_aq_cache_proxy/resolve_station_history_service.sh'
+[ -f "$BINDING_RESOLVER" ] || fail "cache-proxy binding resolver is missing"
+grep -Fq 'station_history_service_override:' "$CACHE_WORKFLOW" \
+  || fail "cache-proxy workflow lacks the explicit station binding override"
+grep -Fq 'bash ./resolve_station_history_service.sh' "$CACHE_WORKFLOW" \
+  || fail "cache-proxy workflow does not use the constrained station binding resolver"
+grep -Fq "UK_AQ_STATION_HISTORY_WORKER_NAME: \${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}" "$CACHE_WORKFLOW" \
+  || fail "cache-proxy normal station identity is not the stable repository variable"
+grep -Fq 'command: deploy --name ${{ env.UK_AQ_STATION_HISTORY_WORKER_NAME }}' "$STATION_WORKFLOW" \
+  || fail "normal station deployment no longer uses the stable Worker identity"
+[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" '')" = "$UK_AQ_STATION_HISTORY_WORKER_NAME" ] \
+  || fail "empty cache binding override does not preserve the normal station Worker"
+[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" "$UK_AQ_STATION_HISTORY_WORKER_NAME")" = "$UK_AQ_STATION_HISTORY_WORKER_NAME" ] \
+  || fail "explicit normal cache binding override is not accepted"
+[ "$(bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" "$STATION_CANDIDATE_WORKER_NAME")" = "$STATION_CANDIDATE_WORKER_NAME" ] \
+  || fail "cache binding resolver does not accept the exactly derived v3 candidate"
+if bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" 'uk-aq-arbitrary-third-worker' >/dev/null 2>&1; then
+  fail "cache binding resolver accepts an arbitrary third Worker"
+fi
+if bash "$BINDING_RESOLVER" "$UK_AQ_STATION_HISTORY_WORKER_NAME" "${STATION_CANDIDATE_WORKER_NAME}-v3-candidate" >/dev/null 2>&1; then
+  fail "cache binding resolver accepts a double-suffixed candidate"
+fi
 grep -Fq '__UK_AQ_STATION_HISTORY_WORKER_NAME__' workers/uk_aq_cache_proxy/wrangler.toml \
   || fail "cache-proxy station service-binding placeholder is missing"
-pass "static v3 candidate and coordinated service-binding contracts remain intact"
+pass "stable station identity and constrained cutover/rollback binding override remain intact"
 
 warn "cutover remains an explicit operator action outside this read-only script"
 printf '\nPREFLIGHT PASS: all cutover-readiness prerequisites are satisfied.\n'

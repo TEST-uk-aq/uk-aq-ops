@@ -38,7 +38,7 @@ jobs:
           for variable_name in UK_AQ_STATION_HISTORY_WORKER_NAME UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME; do
             worker_name="${!variable_name}"
             case "${worker_name}" in
-              *[!a-z0-9-]*|-*|*-) echo "${variable_name} is not a valid active Worker name."; exit 1 ;;
+              *[!a-z0-9-]*|-*|*-|*-v3-candidate) echo "${variable_name} is not a valid stable Worker name."; exit 1 ;;
             esac
             test "${#worker_name}" -le 50 || { echo "${variable_name} is too long to derive a candidate name."; exit 1; }
           done
