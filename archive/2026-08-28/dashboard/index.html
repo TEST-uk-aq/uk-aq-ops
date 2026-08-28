@@ -2453,11 +2453,8 @@
         if (isNoStationRefsRun(run)) {
           return 0;
         }
-        const payload = asObject(run && run.response_payload);
-        if (normalizeConnectorCode(run && run.connector_code) === "sos") {
-          return payloadNumber(payload, ["stations_polled"]);
-        }
         const direct = asNumber(run && run.stations_updated);
+        const payload = asObject(run && run.response_payload);
         const payloadStations = payloadNumber(payload, [
           "stations_polled",
           "stations_processed",
