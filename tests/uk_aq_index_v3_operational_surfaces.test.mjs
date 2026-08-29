@@ -130,6 +130,10 @@ test("operator verification authenticates exact current dependencies under v2 or
   }
   assert.match(preflight, /compare_repo_var UK_AQ_R2_HISTORY_INTEGRITY_VERSION/);
   assert.match(postCutoverVerify, /UK_AQ_R2_HISTORY_INTEGRITY_VERSION/);
+  assert.match(postCutoverVerify, /verification_failed_before_r2_comparison/);
+  assert.match(postCutoverVerify, /VERIFY_FAILURE_CATEGORY/);
+  assert.match(postCutoverVerify, /\.result\.failure_category/);
+  assert.match(postCutoverVerify, /recovery_reconciliation\.counts\.fail == 0/);
   assert.match(migrationWrapper, /case "\$UK_AQ_R2_HISTORY_INDEX_VERSION" in/);
   assert.match(migrationWrapper, /\n  v2\)/);
   assert.match(migrationWrapper, /\n  v3\)/);

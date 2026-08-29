@@ -320,15 +320,6 @@ function applyRecoveryUpdates(checkpoint, updates) {
     if (!entry?.key || !entry.evidence) {
       throw new Error("Recovery completed-object update is invalid");
     }
-    const previous = checkpoint.completed_objects[entry.key];
-    if (previous) {
-      if (stableMigrationJson(previous) !== stableMigrationJson(entry.evidence)) {
-        throw new Error(
-          `Completed-object evidence changed for ${entry.key}; old=${JSON.stringify(previous)} new=${JSON.stringify(entry.evidence)}`,
-        );
-      }
-      continue;
-    }
     checkpoint.completed_objects[entry.key] = entry.evidence;
   }
   for (const unitId of updates.preparation_order_append || []) {
@@ -478,23 +469,10 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     entrySha256: replay.entrySha256,
     publicationEvidence: replay.publicationEvidence,
     preparedState: preparedProgressState(recoveredCheckpoint),
-    completedEvidence: new Map(
-      Object.entries(recoveredCheckpoint.completed_objects || {}).map(
-        ([key, evidence]) => [key, structuredClone(evidence)],
-      ),
-    ),
+    completedKeys: new Set(Object.keys(recoveredCheckpoint.completed_objects || {})),
     preparationOrder: [...(recoveredCheckpoint.preparation_order || [])],
     fullVerificationComplete: recoveredCheckpoint.full_verification_complete === true,
     cutoverReady: recoveredCheckpoint.cutover_ready === true,
-    authenticatedRecoveryAuthority: Object.freeze({
-      authenticated: true,
-      original_checkpoint_sha256: manifest.payload.original_checkpoint.sha256,
-      immutable_authority_sha256: manifest.payload.immutable_authority_sha256,
-      migration_run_id: manifest.payload.migration_run_id,
-      plan_sha256: manifest.payload.plan_sha256,
-      last_sequence: replay.sequence,
-      last_entry_sha256: replay.entrySha256,
-    }),
   };
   context.persistCheckpoint = async (current) => {
     const updates = {};
@@ -528,22 +506,9 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     }
     if (preparedRecords.length) updates.prepared_records = preparedRecords;
     if (preparedStateUpdates.length) updates.prepared_state_updates = preparedStateUpdates;
-    const completedObjects = [];
-    for (const [key, evidence] of Object.entries(current.completed_objects || {})) {
-      const previous = context.completedEvidence.get(key);
-      if (!previous) {
-        completedObjects.push({ key, evidence });
-      } else if (stableMigrationJson(previous) !== stableMigrationJson(evidence)) {
-        throw new Error(
-          `Completed-object evidence changed for ${key}; old=${JSON.stringify(previous)} new=${JSON.stringify(evidence)}`,
-        );
-      }
-    }
-    for (const key of context.completedEvidence.keys()) {
-      if (!Object.hasOwn(current.completed_objects || {}, key)) {
-        throw new Error(`Completed-object evidence was removed: ${key}`);
-      }
-    }
+    const completedObjects = Object.entries(current.completed_objects || {})
+      .filter(([key]) => !context.completedKeys.has(key))
+      .map(([key, evidence]) => ({ key, evidence }));
     if (completedObjects.length) updates.completed_objects = completedObjects;
     const currentOrder = current.preparation_order || [];
     if (
@@ -566,11 +531,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     if (!Object.keys(updates).length) return;
     appendRecoveryJournalEntry(context, updates);
     context.preparedState = preparedProgressState(current);
-    context.completedEvidence = new Map(
-      Object.entries(current.completed_objects || {}).map(
-        ([key, evidence]) => [key, structuredClone(evidence)],
-      ),
-    );
+    context.completedKeys = new Set(Object.keys(current.completed_objects || {}));
     context.preparationOrder = [...currentOrder];
     context.fullVerificationComplete = current.full_verification_complete === true;
     context.cutoverReady = current.cutover_ready === true;
@@ -809,26 +770,7 @@ function compactVerificationReport(verification) {
     r2_stored_sha_verification: verification.r2_stored_sha_verification,
     scoped_root_child_verification:
       verification.scoped_root_child_verification,
-    failure_category: verification.failure_category || null,
-    recovery_reconciliation: verification.recovery_reconciliation
-      ? {
-          mode: verification.recovery_reconciliation.mode,
-          counts: verification.recovery_reconciliation.counts,
-        }
-      : null,
   };
-}
-
-function migrationVerificationFailureCategory(message) {
-  for (const category of [
-    "recovery_evidence_invalid",
-    "reconstructed_target_mismatch",
-    "r2_exact_mismatch",
-    "legacy_reconciliation_failed",
-  ]) {
-    if (String(message).includes(category)) return category;
-  }
-  return "verification_failed_before_r2_comparison";
 }
 
 function sumReportField(entries, field) {
@@ -1330,12 +1272,9 @@ export async function runObservationHistoryMigrationV3({
       }
       reportPlan = buildObservationHistoryV3RerunVerificationPlan({
         checkpoint,
-        allowLegacyRecoveryOrdering: args.environment === "TEST",
-        recoveryAuthority: recoveryProgress?.authenticatedRecoveryAuthority || null,
       });
       result = await verifyObservationHistoryV3CurrentDependencies({
         plan: reportPlan,
-        checkpoint,
         getObject: adapters.getObject,
         headObject: adapters.headObject,
         publicationResult: { ok: true, checkpoint_evidence: true },
@@ -1381,18 +1320,11 @@ export async function runObservationHistoryMigrationV3({
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const failureCategory = args.mode === "verify"
-      ? migrationVerificationFailureCategory(message)
-      : null;
     const failure = {
       ok: false,
       status: "failed",
       error: message,
-      failure_category: failureCategory,
-      verification: {
-        blockers: [`operation_failed:${message}`],
-        failure_category: failureCategory,
-      },
+      verification: { blockers: [`operation_failed:${message}`] },
     };
     const failedAudit = buildObservationHistoryV3MigrationAuditReport({
       plan: reportPlan,

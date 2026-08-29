@@ -361,7 +361,7 @@ printf '%s\n' '--- B. EXACT V3 DEPENDENCY / GENERATION VERIFICATION ---'
 DEPENDENCY_WRITER_LIMITS="$TMP_DIR/writer_limits.json"
 DEPENDENCY_VERIFY_REPORT="$TMP_DIR/current_dependency_verify.json"
 jq '.result.target.writer_limits' "$PLAN_REPORT" > "$DEPENDENCY_WRITER_LIMITS"
-if ! UK_AQ_ENV_NAME="$ENVIRONMENT" node --max-old-space-size=4096 \
+UK_AQ_ENV_NAME="$ENVIRONMENT" node --max-old-space-size=4096 \
   scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs \
   --mode verify \
   --environment "$ENVIRONMENT" \
@@ -374,20 +374,13 @@ if ! UK_AQ_ENV_NAME="$ENVIRONMENT" node --max-old-space-size=4096 \
   --expected-state-root-sha256 "$STATE_SHA" \
   --expected-plan-sha256 "$PLAN_SHA" \
   --checkpoint-in "$CHECKPOINT" \
-  --report-out "$DEPENDENCY_VERIFY_REPORT" >/dev/null; then
-  VERIFY_FAILURE_CATEGORY="$(
-    jq -r '.result.failure_category // "verification_failed_before_r2_comparison"' \
-      "$DEPENDENCY_VERIFY_REPORT" 2>/dev/null || \
-      printf '%s' 'verification_failed_before_r2_comparison'
-  )"
-  fail "current authoritative dependency closure verification failed: ${VERIFY_FAILURE_CATEGORY}"
-fi
+  --report-out "$DEPENDENCY_VERIFY_REPORT" >/dev/null \
+  || fail "current authoritative dependency closure differs from the pinned completed migration generation"
 jq -e '
   .result.ok == true and
   .result.cutover_ready == true and
   .result.checkpoint_summary.full_verification_complete == true and
   .result.checkpoint_summary.cutover_ready == true and
-  (.result.recovery_reconciliation.counts.fail == 0) and
   (.result.blockers | type == "array" and length == 0) and
   (.audit.blockers | type == "array" and length == 0)
 ' "$DEPENDENCY_VERIFY_REPORT" >/dev/null \

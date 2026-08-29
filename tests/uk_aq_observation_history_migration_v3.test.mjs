@@ -65,6 +65,7 @@ import {
   validateObservationHistoryV3MigrationEnvironment,
   verifyObservationHistoryV2IndexCompleteness,
   verifyObservationHistoryV3CheckpointReuse,
+  verifyObservationHistoryV3CurrentDependencies,
   verifyObservationHistoryV3MigrationResult,
 } from "../scripts/backup_r2/lib/observation_history_migration_v3.mjs";
 import {
@@ -594,6 +595,7 @@ function memoryAdapters(fixture, options = {}) {
   const activeStagedUnits = new Set();
   let rebuildCalls = 0;
   let putCalls = 0;
+  let jsonPutCalls = 0;
   let maxStagedUnits = 0;
   let maxStagedBodies = 0;
   const checkpoints = [];
@@ -602,6 +604,7 @@ function memoryAdapters(fixture, options = {}) {
     storedSha,
     checkpoints,
     get putCalls() { return putCalls; },
+    get jsonPutCalls() { return jsonPutCalls; },
     get maxStagedUnits() { return maxStagedUnits; },
     get maxStagedBodies() { return maxStagedBodies; },
     get stagedBodyCount() { return stagedBodies.size; },
@@ -630,6 +633,7 @@ function memoryAdapters(fixture, options = {}) {
       };
     },
     putJsonObject: async (object) => {
+      jsonPutCalls += 1;
       fixture.r2.set(object.key, Buffer.from(object.body));
       return { ok: true };
     },
@@ -688,6 +692,78 @@ function memoryAdapters(fixture, options = {}) {
         pollutant_index_count: 2,
       };
     },
+  };
+}
+
+function legacyPreparedPlanSha(record) {
+  return sha256Hex(stableMigrationJson({
+    unit_id: record.unit_id,
+    scope: record.scope,
+    target_metadata: record.target_metadata,
+    target_manifest: record.target_manifest,
+    target_file_intents: (record.target_file_intents || []).map(
+      ({ key, byte_size, sha256 }) => ({ key, byte_size, sha256 }),
+    ),
+    v3_index_root: record.v3_index_root,
+  }));
+}
+
+function planJsonObjects(plan) {
+  return [
+    ...plan.canonical_publication_objects,
+    ...plan.v3_publication_plan.entries,
+  ];
+}
+
+function authenticatedRecoveryAuthority(checkpoint) {
+  return {
+    authenticated: true,
+    original_checkpoint_sha256: "c".repeat(64),
+    immutable_authority_sha256: checkpoint.authority_sha256,
+    migration_run_id: checkpoint.migration_run_id,
+    plan_sha256: checkpoint.plan_sha256,
+    last_sequence: 1,
+    last_entry_sha256: "d".repeat(64),
+  };
+}
+
+async function buildLegacyRecoveryOrderingFixture() {
+  const fixture = await buildFixture();
+  const adapters = memoryAdapters(fixture);
+  const execution = await executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(fixture),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  });
+  const legacyCheckpoint = structuredClone(execution.checkpoint);
+  for (const record of Object.values(legacyCheckpoint.prepared_units)) {
+    delete record.target_manifest_body;
+    delete record.target_manifest_byte_size;
+    delete record.target_manifest_sha256;
+    record.prepared_plan_sha256 = legacyPreparedPlanSha(record);
+  }
+  const recoveredCheckpoint = JSON.parse(stableMigrationJson(legacyCheckpoint));
+  const recoveredPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: recoveredCheckpoint,
+    requirePrepared: true,
+    allowLegacyRecoveryOrdering: true,
+  });
+  for (const object of planJsonObjects(recoveredPlan)) {
+    fixture.r2.set(object.key, Buffer.from(object.body));
+  }
+  const verificationPlan = buildObservationHistoryV3RerunVerificationPlan({
+    checkpoint: recoveredCheckpoint,
+    allowLegacyRecoveryOrdering: true,
+    recoveryAuthority: authenticatedRecoveryAuthority(recoveredCheckpoint),
+  });
+  return {
+    fixture,
+    adapters,
+    checkpoint: recoveredCheckpoint,
+    recoveredPlan,
+    verificationPlan,
   };
 }
 
@@ -1888,6 +1964,507 @@ test("Phase 4 resumes after an early PUT failure without rereading overwritten s
   assert.equal(adapters.putCalls, 3);
 });
 
+test("prepared canonical manifest exact bytes survive stable recovery serialization", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture);
+  const adapters = memoryAdapters(fixture, { failPutCall: 2 });
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters,
+    }),
+    /deliberate PUT failure 2/,
+  );
+  const preparedCheckpoint = adapters.checkpoints.at(-1);
+  const beforeRecovery = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: preparedCheckpoint,
+    requirePrepared: true,
+  });
+  const recoveredCheckpoint = JSON.parse(stableMigrationJson(preparedCheckpoint));
+  const afterRecovery = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: recoveredCheckpoint,
+    requirePrepared: true,
+  });
+  assert.equal(
+    afterRecovery.units[0].target_manifest_object.sha256,
+    beforeRecovery.units[0].target_manifest_object.sha256,
+  );
+  assert.equal(
+    Buffer.compare(
+      afterRecovery.units[0].target_manifest_object.body,
+      beforeRecovery.units[0].target_manifest_object.body,
+    ),
+    0,
+  );
+});
+
+test("recovery persistence rejects changed evidence for an already completed key", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture);
+  const adapters = memoryAdapters(fixture, { failPutCall: 2 });
+  await assert.rejects(
+    executeObservationHistoryV3MigrationPlan({
+      plan,
+      apply: true,
+      writersFrozen: true,
+      environmentEvidence: ENVIRONMENT,
+      adapters,
+    }),
+    /deliberate PUT failure 2/,
+  );
+  const originalCheckpoint = structuredClone(adapters.checkpoints.at(-1));
+  const completedKey = Object.keys(originalCheckpoint.completed_objects)[0];
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v3-evidence-"));
+  try {
+    const checkpointPath = path.join(temporaryRoot, "migration_checkpoint.json");
+    fs.writeFileSync(checkpointPath, stableMigrationJson(originalCheckpoint), { mode: 0o600 });
+    const context = buildObservationHistoryV3RecoveryProgressContext({
+      checkpointPath,
+      checkpoint: originalCheckpoint,
+      repositoryRoot: REPOSITORY_ROOT,
+      create: true,
+    });
+    const changed = structuredClone(context.checkpoint);
+    changed.completed_objects[completedKey] = {
+      ...changed.completed_objects[completedKey],
+      sha256: "f".repeat(64),
+    };
+    await assert.rejects(
+      context.persistCheckpoint(changed),
+      new RegExp(`Completed-object evidence changed.*${completedKey}`),
+    );
+    const changedSize = structuredClone(context.checkpoint);
+    changedSize.completed_objects[completedKey].byte_size += 1;
+    await assert.rejects(
+      context.persistCheckpoint(changedSize),
+      new RegExp(`Completed-object evidence changed.*${completedKey}`),
+    );
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy recovery ordering reconciles complete dependency closure without semantic fallback", async () => {
+  const legacy = await buildLegacyRecoveryOrderingFixture();
+  const result = await verifyObservationHistoryV3CurrentDependencies({
+    plan: legacy.verificationPlan,
+    checkpoint: legacy.checkpoint,
+    getObject: legacy.adapters.getObject,
+    headObject: legacy.adapters.headObject,
+    publicationResult: { ok: true, checkpoint_evidence: true },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.recovery_reconciliation.counts.fail, 0);
+  assert.equal(
+    result.recovery_reconciliation.counts.total,
+    Object.keys(legacy.checkpoint.completed_objects).length,
+  );
+  assert.ok(result.recovery_reconciliation.counts.exact > 0);
+  assert.ok(result.recovery_reconciliation.counts.legacy_recovery_ordering > 0);
+  const legacyKeys = result.recovery_reconciliation.classifications
+    .filter((entry) => entry.classification === "LEGACY_RECOVERY_ORDERING")
+    .map((entry) => entry.key);
+  assert.ok(legacyKeys.some((key) => key.includes("/connector_id=")));
+  assert.ok(legacyKeys.some((key) => key.includes("/_manifests/")));
+  assert.ok(legacyKeys.some((key) => key.includes("/_index_v3/")));
+});
+
+test("legacy recovery ordering requires authenticated recovery authority", async () => {
+  const legacy = await buildLegacyRecoveryOrderingFixture();
+  assert.throws(
+    () => buildObservationHistoryV3RerunVerificationPlan({
+      checkpoint: legacy.checkpoint,
+      allowLegacyRecoveryOrdering: true,
+      recoveryAuthority: null,
+    }),
+    /recovery_evidence_invalid:authenticated recovery journal is required/,
+  );
+  const live = structuredClone(legacy.checkpoint);
+  live.authority.environment.environment = "LIVE";
+  assert.throws(
+    () => buildObservationHistoryV3RerunVerificationPlan({
+      checkpoint: live,
+      allowLegacyRecoveryOrdering: true,
+      recoveryAuthority: authenticatedRecoveryAuthority(live),
+    }),
+    /recovery_evidence_invalid:legacy recovery ordering is TEST-only/,
+  );
+});
+
+test("unaffected completed migration classifies every dependency EXACT", async () => {
+  const fixture = await buildFixture();
+  const adapters = memoryAdapters(fixture);
+  const execution = await executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(fixture),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  });
+  const verificationPlan = buildObservationHistoryV3RerunVerificationPlan({
+    checkpoint: execution.checkpoint,
+  });
+  const result = await verifyObservationHistoryV3CurrentDependencies({
+    plan: verificationPlan,
+    checkpoint: execution.checkpoint,
+    getObject: adapters.getObject,
+    headObject: adapters.headObject,
+    publicationResult: { ok: true, checkpoint_evidence: true },
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.recovery_reconciliation.counts, {
+    total: Object.keys(execution.checkpoint.completed_objects).length,
+    exact: Object.keys(execution.checkpoint.completed_objects).length,
+    legacy_recovery_ordering: 0,
+    fail: 0,
+  });
+  assert.equal(result.failure_category, null);
+});
+
+test("legacy recovery ordering never permits binary evidence fallback", async () => {
+  const legacy = await buildLegacyRecoveryOrderingFixture();
+  const parquetKey = Object.keys(legacy.checkpoint.completed_objects)
+    .find((key) => key.endsWith(".parquet"));
+  legacy.checkpoint.completed_objects[parquetKey].sha256 = "f".repeat(64);
+  assert.throws(
+    () => buildObservationHistoryV3RerunVerificationPlan({
+      checkpoint: legacy.checkpoint,
+      allowLegacyRecoveryOrdering: true,
+      recoveryAuthority: authenticatedRecoveryAuthority(legacy.checkpoint),
+    }),
+    new RegExp(`recovery_evidence_invalid:.*${parquetKey}`),
+  );
+});
+
+test("legacy recovery ordering rejects arbitrary semantically equal R2 JSON", async () => {
+  const legacy = await buildLegacyRecoveryOrderingFixture();
+  const key = legacy.verificationPlan.canonical_publication_objects[0].key;
+  const payload = JSON.parse(legacy.fixture.r2.get(key));
+  legacy.fixture.r2.set(key, Buffer.from(`${JSON.stringify(payload)}\n`, "utf8"));
+  const result = await verifyObservationHistoryV3CurrentDependencies({
+    plan: legacy.verificationPlan,
+    checkpoint: legacy.checkpoint,
+    getObject: legacy.adapters.getObject,
+    headObject: legacy.adapters.headObject,
+    publicationResult: { ok: true, checkpoint_evidence: true },
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.blockers.some((entry) =>
+    entry === `legacy_reconciliation_failed:${key}` ||
+    entry.startsWith(`canonical_manifest_identity_mismatch:${key}:`)
+  ));
+});
+
+test("legacy recovery ordering fails semantic, manifest-hash and Parquet-reference drift", async (t) => {
+  for (const [name, mutate] of [
+    ["semantic JSON", (payload) => { payload.row_count += 1; }],
+    ["manifest_hash", (payload) => { payload.manifest_hash = "f".repeat(64); }],
+    ["referenced Parquet", (payload) => { payload.files[0].etag_or_hash = "f".repeat(64); }],
+  ]) {
+    await t.test(name, async () => {
+      const legacy = await buildLegacyRecoveryOrderingFixture();
+      const object = legacy.verificationPlan.canonical_publication_objects.find(
+        (entry) => entry.publication_stage === "pollutant_manifest",
+      );
+      const payload = JSON.parse(legacy.fixture.r2.get(object.key));
+      mutate(payload);
+      legacy.fixture.r2.set(object.key, jsonBody(payload));
+      const result = await verifyObservationHistoryV3CurrentDependencies({
+        plan: legacy.verificationPlan,
+        checkpoint: legacy.checkpoint,
+        getObject: legacy.adapters.getObject,
+        headObject: legacy.adapters.headObject,
+        publicationResult: { ok: true, checkpoint_evidence: true },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.failure_category, "legacy_reconciliation_failed");
+      assert.ok(result.recovery_reconciliation.counts.fail > 0);
+    });
+  }
+});
+
+test("prepared canonical body byte size, SHA, JSON and semantics are fail-closed", async (t) => {
+  const fixture = await buildFixture();
+  const adapters = memoryAdapters(fixture, { failPutCall: 2 });
+  await assert.rejects(executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(fixture),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  }), /deliberate PUT failure 2/);
+  const checkpoint = adapters.checkpoints.at(-1);
+  const unitId = checkpoint.preparation_order[0];
+  for (const [name, mutate, pattern] of [
+    ["byte size", (record) => { record.target_manifest_byte_size += 1; }, /target_manifest_exact_identity_mismatch/],
+    ["SHA", (record) => { record.target_manifest_sha256 = "f".repeat(64); }, /target_manifest_exact_identity_mismatch/],
+    ["JSON", (record) => {
+      record.target_manifest_body = "{";
+      record.target_manifest_byte_size = 1;
+      record.target_manifest_sha256 = sha256Hex("{");
+    }, /target_manifest_body_invalid_json/],
+    ["semantics", (record) => {
+      const payload = JSON.parse(record.target_manifest_body);
+      payload.source_row_count += 1;
+      record.target_manifest_body = JSON.stringify(payload, null, 2);
+      record.target_manifest_byte_size = Buffer.byteLength(record.target_manifest_body);
+      record.target_manifest_sha256 = sha256Hex(record.target_manifest_body);
+    }, /target_manifest_semantic_mismatch/],
+  ]) {
+    await t.test(name, () => {
+      const changed = structuredClone(checkpoint);
+      mutate(changed.prepared_units[unitId]);
+      assert.throws(
+        () => buildObservationHistoryV3MigrationPlanFromCheckpoint({
+          checkpoint: changed,
+          requirePrepared: true,
+        }),
+        pattern,
+      );
+    });
+  }
+});
+
+test("prepared plan SHA binds exact canonical body identity and key ordering", async () => {
+  const fixture = await buildFixture();
+  const adapters = memoryAdapters(fixture, { failPutCall: 2 });
+  await assert.rejects(executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(fixture),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  }), /deliberate PUT failure 2/);
+  const changed = structuredClone(adapters.checkpoints.at(-1));
+  const record = changed.prepared_units[changed.preparation_order[0]];
+  record.target_manifest_body = stableMigrationJson(record.target_manifest);
+  record.target_manifest_byte_size = Buffer.byteLength(record.target_manifest_body);
+  record.target_manifest_sha256 = sha256Hex(record.target_manifest_body);
+  assert.throws(
+    () => buildObservationHistoryV3MigrationPlanFromCheckpoint({
+      checkpoint: changed,
+      requirePrepared: true,
+    }),
+    /prepared_plan_sha256_mismatch/,
+  );
+});
+
+test("identical completed evidence is a recovery journal no-op", async () => {
+  const fixture = await buildFixture();
+  const adapters = memoryAdapters(fixture, { failPutCall: 2 });
+  await assert.rejects(executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(fixture),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  }), /deliberate PUT failure 2/);
+  const checkpoint = structuredClone(adapters.checkpoints.at(-1));
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v3-noop-"));
+  try {
+    const checkpointPath = path.join(temporaryRoot, "migration_checkpoint.json");
+    fs.writeFileSync(checkpointPath, stableMigrationJson(checkpoint), { mode: 0o600 });
+    const context = buildObservationHistoryV3RecoveryProgressContext({
+      checkpointPath,
+      checkpoint,
+      repositoryRoot: REPOSITORY_ROOT,
+      create: true,
+    });
+    await context.persistCheckpoint(structuredClone(context.checkpoint));
+    assert.equal(context.sequence, 0);
+    assert.deepEqual(fs.readdirSync(context.paths.entries), []);
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("authenticated recovery replay rejects a later changed completion identity", async () => {
+  const fixture = await buildFixture();
+  const adapters = memoryAdapters(fixture, { failPutCall: 1 });
+  await assert.rejects(executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(fixture),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  }), /deliberate PUT failure 1/);
+  const checkpoint = structuredClone(adapters.checkpoints.at(-1));
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v3-replay-"));
+  try {
+    const checkpointPath = path.join(temporaryRoot, "migration_checkpoint.json");
+    fs.writeFileSync(checkpointPath, stableMigrationJson(checkpoint), { mode: 0o600 });
+    const context = buildObservationHistoryV3RecoveryProgressContext({
+      checkpointPath,
+      checkpoint,
+      repositoryRoot: REPOSITORY_ROOT,
+      create: true,
+    });
+    const key = "history/_index_v3/observations_timeseries/fixture.json";
+    const first = structuredClone(context.checkpoint);
+    first.completed_objects[key] = {
+      byte_size: 10,
+      sha256: "a".repeat(64),
+      verified: true,
+      durable: true,
+      stored_sha256_verified: false,
+    };
+    await context.persistCheckpoint(first);
+    const entryOne = JSON.parse(fs.readFileSync(
+      path.join(context.paths.entries, "0000000001.json"),
+      "utf8",
+    ));
+    const payload = {
+      sequence: 2,
+      previous_entry_sha256: entryOne.payload_sha256,
+      original_checkpoint_sha256: context.manifest.payload.original_checkpoint.sha256,
+      immutable_authority_sha256: context.manifest.payload.immutable_authority_sha256,
+      updates: {
+        completed_objects: [{
+          key,
+          evidence: {
+            ...first.completed_objects[key],
+            sha256: "b".repeat(64),
+          },
+        }],
+      },
+    };
+    const entryTwo = {
+      schema_version: 1,
+      kind: "uk_aq_observation_history_v3_recovery_entry",
+      payload,
+      payload_sha256: sha256Hex(stableMigrationJson(payload)),
+    };
+    fs.writeFileSync(
+      path.join(context.paths.entries, "0000000002.json"),
+      stableMigrationJson(entryTwo),
+      { mode: 0o600 },
+    );
+    const headPayload = {
+      original_checkpoint_sha256: context.manifest.payload.original_checkpoint.sha256,
+      immutable_authority_sha256: context.manifest.payload.immutable_authority_sha256,
+      last_sequence: 2,
+      last_entry_sha256: entryTwo.payload_sha256,
+    };
+    fs.writeFileSync(context.paths.head, stableMigrationJson({
+      schema_version: 1,
+      kind: "uk_aq_observation_history_v3_recovery_head",
+      payload: headPayload,
+      payload_sha256: sha256Hex(stableMigrationJson(headPayload)),
+    }), { mode: 0o600 });
+    assert.throws(
+      () => buildObservationHistoryV3RecoveryProgressContext({
+        checkpointPath,
+        checkpoint,
+        repositoryRoot: REPOSITORY_ROOT,
+      }),
+      new RegExp(`Recovery completed-object evidence changed.*${key}`),
+    );
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("local interruption seams resume after each durable migration boundary", async (t) => {
+  for (const hookName of [
+    "afterPreparation",
+    "afterParquetPublication",
+    "afterCanonicalManifestPublication",
+    "afterParentPublication",
+    "afterV3Finalization",
+  ]) {
+    await t.test(hookName, async () => {
+      const fixture = await buildFixture();
+      const adapters = memoryAdapters(fixture);
+      let interrupted = false;
+      await assert.rejects(
+        executeObservationHistoryV3MigrationPlan({
+          plan: await buildPlan(fixture),
+          apply: true,
+          writersFrozen: true,
+          environmentEvidence: ENVIRONMENT,
+          adapters,
+          testHooks: {
+            [hookName]: async () => {
+              if (interrupted) return;
+              interrupted = true;
+              throw new Error(`fixture interruption ${hookName}`);
+            },
+          },
+        }),
+        new RegExp(`fixture interruption ${hookName}`),
+      );
+      const checkpoint = adapters.checkpoints.at(-1);
+      const resumed = await executeObservationHistoryV3MigrationPlan({
+        plan: buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint }),
+        apply: true,
+        writersFrozen: true,
+        environmentEvidence: ENVIRONMENT,
+        checkpoint,
+        adapters,
+      });
+      assert.equal(resumed.ok, true);
+      assert.equal(resumed.verification.cutover_ready, true);
+      assert.equal(resumed.checkpoint.full_verification_complete, true);
+    });
+  }
+});
+
+test("interrupted resume is byte-identical to uninterrupted and reuses published canonical JSON", async () => {
+  const uninterruptedFixture = await buildFixture();
+  const uninterruptedAdapters = memoryAdapters(uninterruptedFixture);
+  const uninterrupted = await executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(uninterruptedFixture),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters: uninterruptedAdapters,
+  });
+  const resumedFixture = await buildFixture();
+  const resumedAdapters = memoryAdapters(resumedFixture);
+  let stopped = false;
+  await assert.rejects(executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(resumedFixture),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters: resumedAdapters,
+    testHooks: {
+      afterCanonicalManifestPublication: async () => {
+        if (stopped) return;
+        stopped = true;
+        throw new Error("fixture canonical stop");
+      },
+    },
+  }), /fixture canonical stop/);
+  assert.equal(resumedAdapters.jsonPutCalls, 1);
+  const checkpoint = resumedAdapters.checkpoints.at(-1);
+  const resumed = await executeObservationHistoryV3MigrationPlan({
+    plan: buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint }),
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    checkpoint,
+    adapters: resumedAdapters,
+  });
+  const uninterruptedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: uninterrupted.checkpoint,
+    requirePrepared: true,
+  });
+  const resumedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: resumed.checkpoint,
+    requirePrepared: true,
+  });
+  assert.deepEqual(
+    planJsonObjects(resumedPlan).map(({ key, byte_size, sha256 }) => ({ key, byte_size, sha256 })),
+    planJsonObjects(uninterruptedPlan).map(({ key, byte_size, sha256 }) => ({ key, byte_size, sha256 })),
+  );
+  assert.equal(resumedAdapters.jsonPutCalls, resumedPlan.canonical_publication_objects.length);
+  assert.equal(resumed.verification.cutover_ready, true);
+});
+
 test("Phase 4 checkpoint reuse requires exact current stored identity", async () => {
   const expected = {
     key: "history/v2/observations/fixture.parquet",
@@ -2327,6 +2904,22 @@ test("small success, failure and verify reports retain bounded evidence", () => 
   assert.equal(verify.result.checkpoint_summary.prepared_unit_count, 1);
   assert.equal(Object.hasOwn(verify.audit, "partition_results"), false);
   assert.ok(stableMigrationJson(verify).length < 500_000);
+});
+
+test("verify report preserves the precise pre-R2 failure category", () => {
+  const output = buildObservationHistoryV3ReportOutput({
+    result: {
+      ok: false,
+      cutover_ready: false,
+      blockers: ["operation_failed:recovery_evidence_invalid:fixture"],
+      failure_category: "recovery_evidence_invalid",
+    },
+    audit: syntheticMigrationAudit(1, ["recovery_evidence_invalid:fixture"]),
+    mode: "verify",
+    checkpoint: syntheticMigrationResult().checkpoint,
+  });
+  assert.equal(output.result.failure_category, "recovery_evidence_invalid");
+  assert.doesNotMatch(output.result.blockers.join("\n"), /R2 drift/i);
 });
 
 test("recovery journal schema and final-state replay remain structurally compatible", async () => {

@@ -257,16 +257,6 @@ export function readAndValidateRecoveryJournal({
         if (entryKeys.has(key)) throw new Error(`Recovery entry ${sequence} contains duplicate completed object ${key}`);
         entryKeys.add(key);
         requirePlainObject(completed.evidence, `recovery completed object evidence at sequence ${sequence}`);
-        const previous = completedObjects.get(key);
-        if (
-          previous &&
-          stableRecoveryJson(previous.evidence) !== stableRecoveryJson(completed.evidence)
-        ) {
-          throw new Error(
-            `Recovery completed-object evidence changed for ${key}; old=${JSON.stringify(previous.evidence)} new=${JSON.stringify(completed.evidence)}`,
-          );
-        }
-        if (previous) continue;
         completedObjects.set(key, Object.freeze({
           evidence: completed.evidence,
           recovery_sequence: sequence,
