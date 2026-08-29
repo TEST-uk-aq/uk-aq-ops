@@ -1,153 +1,88 @@
-# Agent Notes
+# UK AQ coding-agent rules
 
-## Main Repo
+## Scope
 
-- `TEST-uk-aq-ops` is the main repo for this project and the default starting point for cross-repo work.
-- Filesystem location: `/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops`.
+- This is the TEST ops repository and the default starting point for cross-repository UK AQ work.
+- Do not inspect, modify or propagate changes to any LIVE repository unless the user explicitly asks for LIVE work.
+- Work only on the bounded task requested. Do not broaden into adjacent services merely because related code exists.
 
-- `codeql-noarchive` in this repo currently scans `actions` and `javascript-typescript` only.
-- If Python source files are added outside `archive/`, update `.github/workflows/codeql-noarchive.yml` to include `python` in the language matrix.
-- Do not inspect or modify any `LIVE` repo unless the user explicitly asks.
-- Live propagation to the sibling live ops copy is handled by the sync script/workflow process outside this repo. Do not manually update the live ops copy unless the user explicitly asks for that repo to be changed.
+## System-contract routing
 
-## Authoritative System Contracts
+Before implementation:
 
-- Before analysing, planning, or changing code, schema, workflows, configuration, or non-system documentation, coding agents must read this `AGENTS.md`, any linked `AGENTS_BASE.md`, and the relevant active files under `system_docs/` in this or the related UK AQ repositories.
-- Active files under `system_docs/` define the authoritative UK AQ system contracts. Codex and other coding agents must follow those contracts and preserve the documented behaviour.
-- If a user request, the current code, or another document conflicts with `system_docs/`, stop and report the conflict. Do not silently override, reinterpret, weaken, or work around the contract.
-- `system_docs_legacy/` and archived documentation are historical references and do not override active `system_docs/`.
-- Codex and other coding agents must not create, edit, move, rename, or delete files under `system_docs/`.
-- Updating `system_docs/` is reserved for ChatGPT in Chat mode. When an implementation change requires a system-documentation update, the coding agent must provide a concise handover identifying the affected documents and summarising the implemented behaviour, files changed, schema or configuration changes, deployment implications, and validation results.
+1. read this file;
+2. read the active system map at `../TEST-uk-aq-system-docs/system_docs/SYSTEM_OVERVIEW.md`;
+3. follow the relevant area `README.md`;
+4. read only the broad/narrow contracts that router selects for the task;
+5. inspect only the implementation files needed by that bounded route.
 
-## Codex operating mode
-Default mode is code-only implementation.
-Codex should:
-- make focused code, schema, non-system documentation, and test edits requested by the task;
-- run only fast, local, non-destructive checks needed to verify the edit;
-- provide a clear manual validation and deployment plan;
-- include exact SQL, gcloud, wrangler, GitHub Actions, and Supabase commands for the user to run manually.
-Codex must not, unless explicitly asked:
-- create, amend, or otherwise modify Git commits;
-- run SQL against live/test Supabase databases;
-- apply migration files;
-- deploy Cloud Run services, Workers, or GitHub Actions workflows;
-- run backfills, reconciliations, bulk jobs, or long-running data jobs;
-- run broad external API fetches;
-- repeatedly inspect cloud logs;
-- make operational changes in GCP, Supabase, Cloudflare, R2, Dropbox, or GitHub settings.
-When database or deployment work is needed, Codex should stop after producing:
-1. files changed,
-2. tests run,
-3. exact manual commands,
-4. expected outputs,
-5. rollback notes,
-6. post-deploy validation checklist.
+Do not recursively read all of `system_docs/`, `system_docs_legacy/`, plans, drafts or archive material.
 
-## Existing configuration reuse
+Active `system_docs/` contracts are authoritative. If the user request, code or another document conflicts with an active contract, report the conflict rather than silently overriding or weakening it.
 
-- Prefer reusing existing repository secrets, variables, environment variables, configuration keys, service names, workflow inputs and shared settings whenever their current meaning and scope fit the new work.
-- Before introducing a new configuration name, search the active repository configuration, workflows, environment catalogues and relevant system contracts for an existing equivalent.
-- Do not create a new secret or variable merely to give an existing value a task-specific name. Map an existing repository value to the runtime environment name expected by the code where needed.
-- Introduce a new configuration name only when no suitable existing value exists, the existing value has materially different semantics or scope, or reuse would create ambiguity or unsafe coupling.
-- When a new name is genuinely required, explain why the existing configuration cannot be reused and update the relevant catalogues, workflows and active system contract together.
+`system_docs_legacy/`, plans, drafts and archived documentation are not current authority unless an active contract explicitly incorporates a decision from them.
 
-## TEST System Validation Policy
+Coding agents may read `system_docs/` but MUST NOT create, edit, move, rename or delete files there. When implementation requires a system-doc change, provide a concise handover for ChatGPT in Chat mode covering behaviour, files changed, schema/configuration/deployment implications and validation evidence.
 
-- This repository is part of the UK AQ TEST system. It is intended for development and real operational testing before changes are transferred to LIVE.
-- Perform as little pre-deployment testing as reasonably possible.
-- Before deployment, run only the smallest fast local check needed to establish that changed code or configuration is structurally viable, such as syntax, type checking, parsing or one directly relevant existing check.
-- Do not create new automated tests by default.
-- Add a targeted test only when it is genuinely needed to protect against a specific high-risk regression that would be difficult to detect through normal TEST operation.
-- Do not run broad test suites, exhaustive edge-case testing, large fixture programmes, shadow comparisons, soak tests or extended validation unless the user explicitly requests them.
-- Functional testing should normally happen after deployment through real operation on the TEST system.
-- For a reversible change, one successful normal operation and one representative output check are generally sufficient.
-- Data deletion, schema safety, message acknowledgement and irreversible operations may require one narrowly targeted check before execution.
-- Do not expand the task solely to improve test coverage.
+## Default operating mode
 
-## Permission levels
-Unless the prompt says otherwise, use Level 1.
-### Level 1 — Code only
-Edit files and run small local/static tests. Do not touch external services or databases.
-### Level 2 — Local validation
-Level 1 plus local-only scripts/tests that do not call Supabase, GCP, Cloudflare, R2, Dropbox, or external APIs.
-### Level 3 — Assisted operations
-Prepare SQL, deploy commands, and validation commands, but do not run them.
-### Level 4 — Execute operations
-Only when explicitly requested in the prompt. May run database, deployment, or cloud commands.
+Default is code-only implementation in TEST.
 
-## System Documentation Ownership
+Unless the user explicitly asks for the operation, do **not**:
 
-- Codex and other coding agents must not create, edit, move, rename, or delete files under `system_docs/`.
-- Coding agents may read `system_docs/` for context, but it is read-only to them.
-- When implementation changes require system documentation changes, the coding agent must identify the affected documents and provide a concise handover for ChatGPT in Chat mode.
-- The handover must summarise the implemented behaviour, files changed, schema or configuration changes, deployment implications, and validation results needed to update the documentation accurately.
-- Updating `system_docs/` is reserved for ChatGPT in Chat mode using the coding-agent handover and the implemented repository changes as source material.
+- create/amend commits, push, create branches or create PRs;
+- run SQL against TEST or LIVE databases or apply migrations;
+- deploy Cloud Run, Workers, Pages or workflows;
+- run backfills, reconciliations, bulk/long-running jobs or destructive data operations;
+- make changes in GCP, Supabase, Cloudflare, R2, Dropbox or GitHub settings;
+- run broad external-API fetches or repeatedly poll cloud logs.
 
-## Backup Policy
+When an external apply/deploy/run is required but not authorised, make the repository changes only and provide exact manual commands, expected result, rollback notes and post-deployment TEST checks.
 
-- The Phase B observations backup is mandatory in this project.
-- Never suggest disabling, skipping, or reducing Phase B backup coverage to lower egress or cost.
-- Egress optimizations must preserve full backup integrity and intended backup behavior.
+## Validation policy
 
-## Archive Execution Policy
+Before deployment, run only the smallest fast local checks needed to establish structural viability of the changed code/configuration, such as syntax/type parsing or one directly relevant existing deterministic check.
 
-- Archive paths are retired for active execution.
-- Active scripts, workers, services, and runner-path defaults must only target non-archive paths.
-- Do not add archive fallbacks for active runtime code paths.
+Do not create new automated tests or run broad suites by default. Add a targeted pre-deployment check only when it is genuinely needed for a high-risk boundary such as destructive data/schema behaviour, message acknowledgement or another failure that normal TEST operation would not safely expose.
 
-### Pre-change Archive Requirement
+Functional validation normally happens after deployment through real TEST operation. Do not add speculative fixture programmes, shadow comparisons, soak tests or exhaustive edge-case suites unless the user explicitly asks.
 
-* Archive snapshots are restricted to active, non-test implementation code.
-* Never create archive copies for documentation, including anything under `system_docs/`, tests, test fixtures, snapshots, test data, generated outputs, or other non-code files.
-* Before making a substantial or high-risk change to active non-test code, archive the current version of every in-scope code file that is expected to be changed.
-* Archive copies must be placed under a dated directory inside `archive/`, using today’s date in `YYYY-MM-DD` format.
-* Preserve the original relative path of each archived code file inside that dated archive directory where practical, so the archived copy can be traced back to its source location.
-* If additional active non-test code files are discovered during the work and need to be changed, archive those files before changing them.
-* A code file only needs to be archived once per calendar day. If the same file has already been archived in today’s archive directory, do not create another duplicate archive copy for that file.
-* Files excluded from archive snapshots rely on Git history and the project’s daily backups.
-* Archive copies are for reference and rollback only. Do not wire archive paths into active runtime code, tests, scripts, workers, services, or default runner paths.
-* Do not modify archived copies after they have been created, except to correct an accidental archive-path mistake before the main code change proceeds.
+## Archive safety
 
+- Archive paths are retired for active execution. Active scripts/workers/services/default runner paths MUST NOT execute or fall back to `archive/` content.
+- Before a substantial or high-risk change to active non-test implementation code, preserve the exact pre-change in-scope code under the repository's existing dated `archive/YYYY-MM-DD/` convention, preserving relative paths where practical.
+- Archive a code file at most once per calendar day; reuse today's copy if it already exists.
+- If additional active code becomes in scope later, archive it before changing it.
+- Do not create code-style archive copies for `system_docs/`, other documentation, tests/fixtures/test data, generated output, logs, caches, build/dependency artefacts or other non-code files.
+- Archive copies are reference/rollback only and must not be modified or wired into active execution.
 
-## Schema Placement Policy
+## Configuration and schema
 
-- Canonical SQL DDL belongs in the schema repo (`/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-schema/schemas/...`), not only in ops worker directories.
-- If ops introduces or changes Obs AQI tables, the change must also be reflected in:
-  - `schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql` (main Obs AQI schema), and
-  - a schema-repo SQL file under `schemas/obs_aqi_db/` when a targeted apply file is needed.
+- Reuse existing secrets, variables, environment keys, service names, workflow inputs and shared configuration when their current meaning fits. Search before introducing a new name.
+- Add a new configuration name only when no suitable equivalent exists or reuse would create materially different semantics/unsafe coupling. Explain the reason and update the relevant active catalogue/target mapping.
+- Keep `env-vars-master.csv` and existing environment-sync targeting/tooling aligned when repository environment configuration changes.
+- Canonical SQL DDL and existing-database migrations belong in the sibling `TEST-uk-aq-schema` repository under its active `schemas/` ownership/migration structure. Do not make an ops-local SQL file the sole canonical definition.
 
-## Source DAQI/index observations
+## Repository-specific safety
 
-- Do not treat source-provided DAQI/index observation rows as disposable derived noise. They are retained source observations and are used for later comparison against UK AQ calculated DAQI/AQI outputs.
-- Breathe London source-provided index observation codes currently use `pm25index`, `pm10index`, and `no2index`. These rows belong in Supabase observations and R2 `history/v2/observations` when included by the v2 observations allow-list.
-- Keep these source observations distinct from UK AQ calculated AQI/DAQI hourly output, which belongs under the separate aqilevels history paths.
-- Weather/metadata-style observations such as humidity, pressure, and temperature are not automatically equivalent to source DAQI/index observations and may be excluded from public/history observations unless explicitly required.
+- `codeql-noarchive` currently scans Actions and JavaScript/TypeScript. If active Python source is added outside `archive/`, update `.github/workflows/codeql-noarchive.yml` to include Python.
+- Preserve source-provided DAQI/index observations as source observations unless the relevant active ingest/R2 contract explicitly changes that behaviour. Do not confuse them with retired persisted UK AQ calculated AQI history.
+- For changes involving R2-history indexes, backup, AQI/WHO, cache behaviour or other specialised areas, follow the relevant system-doc route rather than carrying architecture rules in this file.
 
-## Environment Sync
+## Reporting
 
-- This repo has an env sync script: `scripts/uk_aq_sync_github_secrets.sh`.
-- The script syncs `.env` keys to GitHub and packages `.env.supabase` into GitHub secret `SUPABASE_SECRETS_ENV`; ingest Supabase edge deploy workflows apply that payload via `supabase secrets set`.
+After implementation, report:
 
-## Implementation Reporting
+- files changed;
+- contract behaviour changed or explicitly preserved;
+- structural checks run;
+- any manual apply/deploy/run commands;
+- post-deployment TEST validation;
+- rollback considerations;
+- system-doc handover needed, if any.
 
-- When changing code, schema, workflows, or config, always include clear implementation steps in the response.
-- Implementation steps must state what changed, which files were changed, and any required apply/deploy/run commands.
-- If no code changes were made, state that explicitly.
+If no implementation files changed, say so explicitly.
 
-## R2/Cloudflare Cache Cost Policy
+## Search
 
-- For AQI history served via R2 + Cloudflare, assume cost is primarily driven by R2 operation counts (especially Class B reads) and Worker request volume, not R2 bandwidth egress.
-- Prefer stable request URLs/params for normal traffic so Cloudflare cache can return warm-cache hits.
-- Use cache-buster/version params only for diagnostics, forced-refresh actions, or explicit bypass-cache testing.
-- When evaluating performance/cost changes, check cache-hit behavior (`CF-Cache-Status`) and distinguish cache-hit traffic from origin-fetch traffic.
-
-## R2 History Index Byte-Stability Policy
-
-- Payloads written by `workers/shared/uk_aq_r2_history_index.mjs` (the R2 history index manifests under `history/_index/...`) must be byte-identical run-to-run when the underlying source data has not changed.
-- Every field — `generated_at`, key ordering, number formatting, optional fields — must be derived from the source manifests, never from wall-clock time, run IDs, or other run-scoped state.
-- Why: any byte change rotates the R2 etag, which invalidates the etag-skip baseline in `scripts/backup_r2/build_backup_inventory.mjs`. A blanket churn forces the next inventory build to re-read every changed manifest (hours of `rclone cat` round-trips) and the Dropbox sync to re-upload every one (hours more, plus Dropbox write-rate throttling). Commit `2aa79d5` (2026-05-17) is the reference incident — moving `generated_at` to data-driven fixed it but produced a one-time multi-hour transition cost.
-- When editing the index builder: treat byte-stability as load-bearing. If you add a new field, source it from the manifests; if you need a timestamp, derive it from `max(source.backed_up_at_utc)` or similar.
-- If you have to make a non-data-driven change, expect and call out the one-time inventory + Dropbox sync cost in the PR description.
-
-## Search Tool Preference
-- Prefer `grep` for text search and file discovery; do not use `rg` unless explicitly requested.
+Prefer `grep` for text search/file discovery; do not use `rg` unless explicitly requested.
