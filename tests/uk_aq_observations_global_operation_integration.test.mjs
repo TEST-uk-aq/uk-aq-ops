@@ -194,7 +194,7 @@ test("backup child holds the coordinator context across inventory then sync", ()
     "--runs-prefix", "history/v2/_ops/observations/runs",
     "--core-prefix", "history/v2/core",
     "--timeseries-binding-prefix", "history/_index_v2/timeseries_binding",
-    "--latest-timeseries-key", "history/_index_v2/observations_timeseries_latest.json",
+    "--history-index-version", "v2",
     "--inventory-root-prefix", "history/_index_v2/backup_inventory_v2",
     "--state-root-prefix", "_ops/checkpoints/r2_history_backup_state_v2",
     "--inventory-report-out", "tmp/inventory.json",
@@ -235,7 +235,10 @@ test("backup mutation CLIs fail closed without the coordinator while dry-run rem
   const env = { ...process.env };
   for (const key of Object.values(OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV)) delete env[key];
   for (const [script, args] of [
-    ["scripts/backup_r2/build_backup_inventory.mjs", ["--source-root", "unused:test"]],
+    [
+      "scripts/backup_r2/build_backup_inventory.mjs",
+      ["--source-root", "unused:test", "--history-index-version", "v2"],
+    ],
     [
       "scripts/backup_r2/sync_history_to_dropbox.mjs",
       ["--source-root", "unused:test", "--dest-root", "unused:dropbox"],

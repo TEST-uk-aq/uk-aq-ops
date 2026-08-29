@@ -55,6 +55,7 @@ jobs:
       UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS: ${{ vars.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS || '7' }}
       UK_AQ_R2_HISTORY_STAGING_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_STAGING_PREFIX || 'history/v1/_ops/observations/staging' }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UK_AQ_R2_HISTORY_INDEX_VERSION: ${{ vars.UK_AQ_R2_HISTORY_INDEX_VERSION || '' }}
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
       UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
       UK_AQ_R2_HISTORY_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_RUNS_PREFIX || 'history/v1/_ops/observations/runs' }}
@@ -108,6 +109,7 @@ jobs:
               CFLARE_R2_BUCKET
               CFLARE_R2_ACCESS_KEY_ID
               CFLARE_R2_SECRET_ACCESS_KEY
+              UK_AQ_R2_HISTORY_INDEX_VERSION
             )
           fi
           missing=0
@@ -117,6 +119,10 @@ jobs:
               missing=1
             fi
           done
+          if [ "${UK_AQ_R2_HISTORY_PHASE_B_ENABLED}" = "true" ] && [ "${UK_AQ_R2_HISTORY_INDEX_VERSION}" != "v3" ]; then
+            echo "UK_AQ_R2_HISTORY_INDEX_VERSION must be exactly v3 for Phase B observation writes" >&2
+            missing=1
+          fi
           exit "${missing}"
 
       - name: Run Prune Daily

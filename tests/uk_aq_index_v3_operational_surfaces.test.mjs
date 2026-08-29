@@ -610,6 +610,16 @@ test("station candidate accepts only its environment-specific observations candi
     ...baseEnv,
     UK_AQ_OBSERVS_HISTORY_R2_API_URL: `https://${testWorkerName}-v3-candidate.account.workers.dev`,
   }));
+  for (const authority of ["V3", " v3", "v3 "]) {
+    assert.throws(
+      () => assertV3Candidate({
+        ...baseEnv,
+        UK_AQ_R2_HISTORY_INDEX_VERSION: authority,
+        UK_AQ_OBSERVS_HISTORY_R2_API_URL: `https://${testWorkerName}-v3-candidate.account.workers.dev`,
+      }),
+      /requires index generation v3/,
+    );
+  }
   assert.throws(
     () => assertV3Candidate({
       ...baseEnv,

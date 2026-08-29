@@ -227,7 +227,7 @@ export function resolveObservationHistoryIndexV3BuildConfig({
 } = {}) {
   const generation = String(
     requestedIndexGeneration ?? env?.UK_AQ_R2_HISTORY_INDEX_VERSION ?? "",
-  ).trim().toLowerCase();
+  );
   if (generation !== OBSERVATION_HISTORY_INDEX_GENERATION_V3) {
     throw new Error(
       `Unsupported observation-history index generation for v3 builder: ${generation || "unset"}`,

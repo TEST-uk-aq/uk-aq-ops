@@ -14,23 +14,8 @@ export const OBSERVATION_RUN_MANIFEST_INVENTORY_KIND =
   "uk_aq_r2_history_backup_inventory_observation_run_manifests";
 export const OBSERVATION_RUN_MANIFEST_STATE_KIND =
   "uk_aq_r2_history_backup_state_observation_run_manifests";
-export const OBSERVATIONS_TIMESERIES_LATEST_PATHS = Object.freeze({
-  v2: "history/_index_v2/observations_timeseries_latest.json",
-  v3: "history/_index_v3/observations_timeseries_latest.json",
-});
 export const OBSERVATIONS_TIMESERIES_LATEST_PATH =
-  OBSERVATIONS_TIMESERIES_LATEST_PATHS.v2;
-
-export function resolveObservationsTimeseriesLatestPath(indexVersion) {
-  const authority = String(indexVersion || "");
-  const path = OBSERVATIONS_TIMESERIES_LATEST_PATHS[authority];
-  if (!path) {
-    throw new Error(
-      `Observation-history backup index authority must be exactly v2 or v3: ${authority || "unset"}`,
-    );
-  }
-  return path;
-}
+  "history/_index_v2/observations_timeseries_latest.json";
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const ISO_DAY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;

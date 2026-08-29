@@ -4,7 +4,7 @@
 import stationHistoryWorker from "../uk_aq_station_history/src/index.mjs";
 
 export function assertV3Candidate(env) {
-  if (String(env.UK_AQ_R2_HISTORY_INDEX_VERSION || "").trim().toLowerCase() !== "v3") {
+  if (String(env.UK_AQ_R2_HISTORY_INDEX_VERSION || "") !== "v3") {
     throw new Error("Station-history v3 candidate requires index generation v3");
   }
   const activeObservationsWorkerName = String(

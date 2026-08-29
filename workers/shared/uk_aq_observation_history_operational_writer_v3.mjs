@@ -8,6 +8,8 @@ import {
   DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
   runIntegrityObservationHistoryV3Writer,
+  runPruneDailyObservationHistoryV3ConnectorPublication,
+  runPruneDailyObservationHistoryV3RunFinalization,
   runPruneDailyObservationHistoryV3Writer,
   runSosHistoricalReplacementObservationHistoryV3Writer,
   runSupportedBackfillObservationHistoryV3Writer,
@@ -15,9 +17,20 @@ import {
 import {
   buildHistoryV2ConnectorManifest,
   buildHistoryV2ConnectorManifestKey,
+  buildHistoryV2DayManifest,
+  buildHistoryV2DayManifestKey,
   validateCanonicalHistoryV2Manifest,
 } from "./uk_aq_r2_history_canonical.mjs";
-import { sha256Hex } from "./r2_sigv4.mjs";
+import {
+  r2GetObject,
+  sha256Hex,
+} from "./r2_sigv4.mjs";
+import {
+  r2PutObjectIfChanged,
+} from "./uk_aq_r2_history_index.mjs";
+import {
+  finalizeR2HistoryV2ObservationsManifestHierarchy,
+} from "./uk_aq_r2_observations_manifest_hierarchy_finalizer.mjs";
 import {
   ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
   assertAcceptedObservationHistoryWriterLimitsV3,
@@ -61,7 +74,9 @@ function parseCanonicalManifest({ body, key, manifestKind, scope }) {
     domain: "observations",
     manifest_kind: manifestKind,
     day_utc: scope.day_utc,
-    connector_id: scope.connector_id,
+    ...(manifestKind !== "day"
+      ? { connector_id: scope.connector_id }
+      : {}),
     ...(manifestKind === "pollutant"
       ? { pollutant_code: scope.pollutant_code }
       : {}),
@@ -70,12 +85,12 @@ function parseCanonicalManifest({ body, key, manifestKind, scope }) {
   return payload;
 }
 
-function jsonArtifact({ key, payload, stage, dependencies = [] }) {
+function jsonArtifact({ key, payload, stage, kind = null, dependencies = [] }) {
   const body = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
   return Object.freeze({
-    kind: stage === "pollutant_manifest"
+    kind: kind || (stage === "pollutant_manifest"
       ? "canonical_observation_pollutant_manifest"
-      : "canonical_observation_connector_manifest",
+      : "canonical_observation_connector_manifest"),
     key,
     payload,
     body,
@@ -86,6 +101,26 @@ function jsonArtifact({ key, payload, stage, dependencies = [] }) {
     dependencies: Object.freeze([...dependencies]),
     publication_prerequisites: Object.freeze([]),
   });
+}
+
+function isMissingObjectError(error) {
+  const status = error?.status ?? error?.statusCode ?? error?.response?.status;
+  if (status !== undefined && status !== null && status !== "") {
+    return Number(status) === 404;
+  }
+  return /NoSuchKey|not[ _-]?found|R2 GET failed \(404\)/i.test(
+    error instanceof Error ? error.message : String(error || ""),
+  );
+}
+
+async function getOptionalObject(getObject, key) {
+  try {
+    const object = await getObject({ key });
+    return object?.exists === false ? null : object;
+  } catch (error) {
+    if (isMissingObjectError(error)) return null;
+    throw error;
+  }
 }
 
 function maxBackedUpAtUtc(manifests) {
@@ -182,6 +217,38 @@ async function publishVerifiedJsonArtifact({
     verified: true,
     durable: true,
   });
+}
+
+function createR2ReadbackDurabilityRecorder(getObject) {
+  return async function recordR2ReadbackDurability(evidence) {
+    const key = String(evidence?.key || "").trim();
+    if (!key) {
+      throw new Error("Canonical observation-history durability evidence has no key");
+    }
+    const stored = await getObject({ key });
+    if (!stored || stored.exists === false) {
+      throw new Error(`Canonical observation-history durable object is missing: ${key}`);
+    }
+    const body = exactBody(stored.body, key);
+    const byteSize = Number(evidence?.byte_size);
+    const expectedSha256 = String(evidence?.sha256 || "").trim().toLowerCase();
+    if (
+      !Number.isSafeInteger(byteSize) ||
+      byteSize < 0 ||
+      !/^[0-9a-f]{64}$/.test(expectedSha256) ||
+      body.byteLength !== byteSize ||
+      sha256Hex(body) !== expectedSha256
+    ) {
+      throw new Error(`Canonical observation-history durable identity changed: ${key}`);
+    }
+    return Object.freeze({
+      durable: true,
+      key,
+      byte_size: byteSize,
+      sha256: expectedSha256,
+      evidence_kind: "r2_complete_body_readback",
+    });
+  };
 }
 
 export function createObservationHistoryV3CanonicalConnectorPublisher({
@@ -317,6 +384,228 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
   };
 }
 
+export function createObservationHistoryV3CanonicalDayPublisher({
+  getObject,
+  putIfChanged,
+  recordDurableEvidence,
+  targetWriterGitSha,
+  observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
+}) {
+  const writerGitSha = String(targetWriterGitSha || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(writerGitSha)) {
+    throw new TypeError("targetWriterGitSha must be a full lower-case Git SHA");
+  }
+  return async function finalizeCanonicalDayManifests({
+    day_utc: dayUtc,
+    changed_connectors: changedConnectors,
+  }) {
+    const dayKey = buildHistoryV2DayManifestKey(observationsPrefix, dayUtc);
+    const currentObject = await getOptionalObject(getObject, dayKey);
+    const currentManifest = currentObject
+      ? parseCanonicalManifest({
+        body: currentObject.body,
+        key: dayKey,
+        manifestKind: "day",
+        scope: { day_utc: dayUtc },
+      })
+      : null;
+    const currentReferences = Array.isArray(currentManifest?.connector_manifests)
+      ? currentManifest.connector_manifests
+      : Array.isArray(currentManifest?.child_manifests)
+        ? currentManifest.child_manifests
+        : [];
+    const currentConnectorIds = currentReferences.map((entry) => Number(entry.connector_id));
+    const changedByConnector = new Map();
+    for (const entry of changedConnectors) {
+      const connectorId = Number(entry?.connector_id);
+      if (!Number.isSafeInteger(connectorId) || connectorId <= 0) {
+        throw new Error(`Changed canonical connector ID is invalid: ${dayUtc}/${entry?.connector_id}`);
+      }
+      if (changedByConnector.has(connectorId)) {
+        throw new Error(`Changed canonical connector is duplicated: ${dayUtc}/${connectorId}`);
+      }
+      const key = buildHistoryV2ConnectorManifestKey(
+        observationsPrefix,
+        dayUtc,
+        connectorId,
+      );
+      const payload = entry?.canonical?.connector_manifest_payload;
+      const evidence = entry?.canonical?.connector_manifest;
+      if (!payload) {
+        throw new Error(`Changed canonical connector payload is missing: ${dayUtc}/${connectorId}`);
+      }
+      validateCanonicalHistoryV2Manifest(payload, {
+        history_version: "v2",
+        domain: "observations",
+        manifest_kind: "connector",
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        manifest_key: key,
+      });
+      const body = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
+      if (
+        evidence?.verified !== true || evidence?.durable !== true ||
+        evidence?.key !== key || Number(evidence?.byte_size) !== body.byteLength ||
+        evidence?.sha256 !== sha256Hex(body)
+      ) {
+        throw new Error(`Changed canonical connector evidence disagrees: ${dayUtc}/${connectorId}`);
+      }
+      changedByConnector.set(connectorId, Object.freeze({ payload, evidence, body }));
+    }
+    const finalByConnector = new Map();
+    const seenCurrentConnectorIds = new Set();
+    for (const reference of currentReferences) {
+      const connectorId = Number(reference.connector_id);
+      if (seenCurrentConnectorIds.has(connectorId)) {
+        throw new Error(`Current canonical day contains a duplicate connector: ${dayKey}`);
+      }
+      seenCurrentConnectorIds.add(connectorId);
+      const key = buildHistoryV2ConnectorManifestKey(
+        observationsPrefix,
+        dayUtc,
+        connectorId,
+      );
+      if (reference.manifest_key !== key) {
+        throw new Error(`Current canonical day child key disagrees: ${dayKey}`);
+      }
+      const object = await getObject({ key });
+      const liveBody = exactBody(object.body, key);
+      const payload = parseCanonicalManifest({
+        body: liveBody,
+        key,
+        manifestKind: "connector",
+        scope: { day_utc: dayUtc, connector_id: connectorId },
+      });
+      const changed = changedByConnector.get(connectorId);
+      if (changed) {
+        if (
+          payload.manifest_hash !== changed.payload.manifest_hash ||
+          liveBody.byteLength !== changed.evidence.byte_size ||
+          sha256Hex(liveBody) !== changed.evidence.sha256 ||
+          !liveBody.equals(changed.body)
+        ) {
+          throw new Error(`Changed canonical day child identity disagrees: ${key}`);
+        }
+        finalByConnector.set(connectorId, changed.payload);
+      } else if (payload.manifest_hash !== reference.manifest_hash) {
+        throw new Error(`Current canonical day child identity disagrees: ${key}`);
+      } else {
+        finalByConnector.set(connectorId, payload);
+      }
+    }
+    const changedConnectorIds = changedConnectors.map((entry) => Number(entry.connector_id));
+    for (const [connectorId, changed] of changedByConnector) {
+      if (seenCurrentConnectorIds.has(connectorId)) continue;
+      const key = changed.evidence.key;
+      const object = await getObject({ key });
+      const liveBody = exactBody(object.body, key);
+      const payload = parseCanonicalManifest({
+        body: liveBody,
+        key,
+        manifestKind: "connector",
+        scope: { day_utc: dayUtc, connector_id: connectorId },
+      });
+      if (
+        payload.manifest_hash !== changed.payload.manifest_hash ||
+        liveBody.byteLength !== changed.evidence.byte_size ||
+        sha256Hex(liveBody) !== changed.evidence.sha256 ||
+        !liveBody.equals(changed.body)
+      ) {
+        throw new Error(`Changed canonical day child identity disagrees: ${key}`);
+      }
+      finalByConnector.set(connectorId, changed.payload);
+    }
+    const finalManifests = [...finalByConnector.values()].sort(
+      (left, right) => Number(left.connector_id) - Number(right.connector_id),
+    );
+    const payload = buildHistoryV2DayManifest({
+      domain: "observations",
+      dayUtc,
+      runId: null,
+      manifestKey: dayKey,
+      connectorManifests: finalManifests,
+      writerGitSha,
+      backedUpAtUtc: maxBackedUpAtUtc(finalManifests),
+    });
+    const artifact = jsonArtifact({
+      key: dayKey,
+      payload,
+      stage: "canonical_day_manifest",
+      kind: "canonical_observation_day_manifest",
+      dependencies: finalManifests.map((manifest) => ({
+        kind: "canonical_observation_connector_manifest",
+        key: manifest.manifest_key,
+        manifest_hash: manifest.manifest_hash,
+      })),
+    });
+    const dayEvidence = await publishVerifiedJsonArtifact({
+      artifact,
+      putIfChanged,
+      getObject,
+      recordDurableEvidence,
+    });
+    return Object.freeze({
+      canonical_day_authority_verified: true,
+      parent_state_reread_under_lock: true,
+      prune_eligibility_created: false,
+      day_utc: dayUtc,
+      current_connector_ids: Object.freeze([...currentConnectorIds].sort((a, b) => a - b)),
+      changed_connector_ids: Object.freeze([...changedConnectorIds].sort((a, b) => a - b)),
+      final_connector_ids: Object.freeze([...finalByConnector.keys()].sort((a, b) => a - b)),
+      day_manifest: dayEvidence,
+      day_manifest_payload: payload,
+    });
+  };
+}
+
+export function createObservationHistoryV3CanonicalAggregatePublisher({
+  r2,
+  getObject,
+  recordDurableEvidence,
+  observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
+  hierarchyFinalizer = finalizeR2HistoryV2ObservationsManifestHierarchy,
+}) {
+  return async function finalizeCanonicalAggregateManifests({
+    affected_days_utc: affectedDaysUtc,
+  }) {
+    const result = await hierarchyFinalizer({
+      r2,
+      observationsPrefix,
+      affectedDaysUtc,
+      writeR2: true,
+    });
+    if (result?.ok !== true) {
+      throw new Error("Canonical observation aggregate finalisation failed");
+    }
+    const aggregateManifests = [];
+    for (const entry of result.objects || []) {
+      const key = String(entry?.key || "").trim();
+      const object = await getObject({ key });
+      const body = exactBody(object?.body, key);
+      const evidence = {
+        key,
+        byte_size: body.byteLength,
+        sha256: sha256Hex(body),
+        verified: true,
+        durable: true,
+      };
+      const durable = await recordDurableEvidence(evidence);
+      if (durable?.durable !== true) {
+        throw new Error(`Canonical aggregate manifest is not durable: ${key}`);
+      }
+      aggregateManifests.push(Object.freeze(evidence));
+    }
+    return Object.freeze({
+      canonical_aggregate_authority_verified: true,
+      parent_state_reread_under_lock: true,
+      prune_eligibility_created: false,
+      affected_days_utc: Object.freeze([...affectedDaysUtc]),
+      aggregate_manifests: Object.freeze(aggregateManifests),
+      hierarchy: result,
+    });
+  };
+}
+
 function v3OnlyOptions({
   env = typeof process !== "undefined" ? process.env : {},
   writerLimits = ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
@@ -328,24 +617,73 @@ function v3OnlyOptions({
     writerLimits,
     "disconnected operational observation-history v3 writer limits",
   );
+  const getObject = options.getObject || (({ key }) => r2GetObject({ r2: options.r2, key }));
+  const putIfChanged = options.putIfChanged || ((object) => r2PutObjectIfChanged({
+    r2: options.r2,
+    key: object.key,
+    body: object.body,
+    content_type: object.content_type,
+    writeR2: true,
+  }));
+  const recordDurableEvidence = options.recordDurableEvidence ||
+    createR2ReadbackDurabilityRecorder(getObject);
   const connectorPublisher = publishConnectorScopedCanonicalManifests ||
     createObservationHistoryV3CanonicalConnectorPublisher({
-      getObject: options.getObject,
-      putIfChanged: options.putIfChanged,
-      recordDurableEvidence: options.recordDurableEvidence,
+      getObject,
+      putIfChanged,
+      recordDurableEvidence,
       targetWriterGitSha: options.targetWriterGitSha,
+      observationsPrefix: options.observationsPrefix,
+    });
+  const dayPublisher = options.finalizeCanonicalDayManifests ||
+    createObservationHistoryV3CanonicalDayPublisher({
+      getObject,
+      putIfChanged,
+      recordDurableEvidence,
+      targetWriterGitSha: options.targetWriterGitSha,
+      observationsPrefix: options.observationsPrefix,
+    });
+  const aggregatePublisher = options.finalizeCanonicalAggregateManifests ||
+    createObservationHistoryV3CanonicalAggregatePublisher({
+      r2: options.r2,
+      getObject,
+      recordDurableEvidence,
       observationsPrefix: options.observationsPrefix,
     });
   return {
     ...options,
+    getObject,
+    putIfChanged,
+    recordDurableEvidence,
     writerLimits: acceptedLimits,
     publishConnectorScopedCanonicalManifests: connectorPublisher,
+    finalizeCanonicalDayManifests: dayPublisher,
+    finalizeCanonicalAggregateManifests: aggregatePublisher,
   };
 }
 
 export function runDisconnectedPruneDailyObservationHistoryV3Writer(options) {
   return runPruneDailyObservationHistoryV3Writer(v3OnlyOptions(options));
 }
+
+export const runOperationalPruneDailyObservationHistoryV3Writer =
+  runDisconnectedPruneDailyObservationHistoryV3Writer;
+
+export function runDisconnectedPruneDailyObservationHistoryV3ConnectorPublication(options) {
+  return runPruneDailyObservationHistoryV3ConnectorPublication(
+    v3OnlyOptions(options),
+  );
+}
+
+export const runOperationalPruneDailyObservationHistoryV3ConnectorPublication =
+  runDisconnectedPruneDailyObservationHistoryV3ConnectorPublication;
+
+export function runDisconnectedPruneDailyObservationHistoryV3RunFinalization(options) {
+  return runPruneDailyObservationHistoryV3RunFinalization(v3OnlyOptions(options));
+}
+
+export const runOperationalPruneDailyObservationHistoryV3RunFinalization =
+  runDisconnectedPruneDailyObservationHistoryV3RunFinalization;
 
 export function runDisconnectedIntegrityObservationHistoryV3Writer(options) {
   return runIntegrityObservationHistoryV3Writer(v3OnlyOptions(options));

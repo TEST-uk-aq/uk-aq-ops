@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 import {
   buildCoreInventoryShard,
@@ -36,7 +37,7 @@ test("production backup entrypoints load under their established filenames", () 
   assert.match(builder.stdout, /build_backup_inventory\.mjs/);
   assert.match(builder.stdout, /--core-prefix/);
   assert.match(builder.stdout, /--timeseries-binding-prefix/);
-  assert.match(builder.stdout, /--latest-timeseries-key/);
+  assert.match(builder.stdout, /--history-index-version <v2\|v3>/);
   assert.doesNotMatch(builder.stdout, /--legacy-inventory-key/);
 
   const sync = runHelp("scripts/backup_r2/sync_history_to_dropbox.mjs");
@@ -45,6 +46,24 @@ test("production backup entrypoints load under their established filenames", () 
   assert.match(sync.stdout, /--force-prune-recheck/);
   assert.match(sync.stdout, /--state-root-prefix/);
   assert.doesNotMatch(sync.stdout, /--legacy-state-key/);
+});
+
+test("backup workflow passes explicit observation index authority without fallback", () => {
+  const workflow = readFileSync(
+    path.join(REPO_ROOT, ".github/workflows/uk_aq_r2_history_dropbox_backup.yml"),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /UK_AQ_R2_HISTORY_INDEX_VERSION: \$\{\{ vars\.UK_AQ_R2_HISTORY_INDEX_VERSION \|\| '' \}\}/,
+  );
+  assert.match(workflow, /case "\$\{UK_AQ_R2_HISTORY_INDEX_VERSION\}" in/);
+  assert.match(workflow, /v2\|v3\)/);
+  assert.match(
+    workflow,
+    /--history-index-version "\$\{UK_AQ_R2_HISTORY_INDEX_VERSION\}"/,
+  );
+  assert.doesNotMatch(workflow, /--latest-timeseries-key/);
 });
 
 test("core inventory identity is deterministic and non-range based", () => {

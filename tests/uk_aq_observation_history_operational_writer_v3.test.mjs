@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
   createObservationHistoryV3CanonicalConnectorPublisher,
+  createObservationHistoryV3CanonicalAggregatePublisher,
+  createObservationHistoryV3CanonicalDayPublisher,
   runDisconnectedPruneDailyObservationHistoryV3Writer,
 } from "../workers/shared/uk_aq_observation_history_operational_writer_v3.mjs";
 import {
@@ -11,6 +14,8 @@ import {
 import {
   buildHistoryV2ConnectorManifest,
   buildHistoryV2ConnectorManifestKey,
+  buildHistoryV2DayManifest,
+  buildHistoryV2DayManifestKey,
 } from "../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
   ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
@@ -30,6 +35,50 @@ function rows(pollutantCode, timeseriesId) {
     value: 12.5,
     verification_status: null,
   }];
+}
+
+function rowsFor(connectorId, pollutantCode, timeseriesId, value = 12.5) {
+  return rows(pollutantCode, timeseriesId).map((row) => ({
+    ...row,
+    connector_id: connectorId,
+    station_id: connectorId * 10,
+    value,
+  }));
+}
+
+function connectorFromPartition({ connectorId, partition, backedUpAtUtc }) {
+  const key = buildHistoryV2ConnectorManifestKey(
+    "history/v2/observations",
+    DAY_UTC,
+    connectorId,
+  );
+  return buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY_UTC,
+    connectorId,
+    runId: null,
+    manifestKey: key,
+    pollutantManifests: [partition.canonical_pollutant_manifest.payload],
+    writerGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc,
+  });
+}
+
+function changedConnectorEntry(payload) {
+  const body = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
+  return {
+    connector_id: payload.connector_id,
+    canonical: {
+      connector_manifest_payload: payload,
+      connector_manifest: {
+        key: payload.manifest_key,
+        byte_size: body.byteLength,
+        sha256: createHash("sha256").update(body).digest("hex"),
+        verified: true,
+        durable: true,
+      },
+    },
+  };
 }
 
 test("accepted Phase 6 writer limits are exact and reject drift", () => {
@@ -178,6 +227,208 @@ test("connector publisher rereads and preserves unchanged pollutant union", asyn
     }),
     /SOS complete-day replacement found live connector state after deletion/,
   );
+});
+
+test("day publisher creates verified canonical parent from changed connector authority", async () => {
+  const partition = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("pm25", 102),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const connectorKey = buildHistoryV2ConnectorManifestKey(
+    "history/v2/observations",
+    DAY_UTC,
+    1,
+  );
+  const connectorPayload = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY_UTC,
+    connectorId: 1,
+    runId: null,
+    manifestKey: connectorKey,
+    pollutantManifests: [partition.canonical_pollutant_manifest.payload],
+    writerGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const objects = new Map([[connectorKey, Buffer.from(JSON.stringify(connectorPayload, null, 2))]]);
+  const publisher = createObservationHistoryV3CanonicalDayPublisher({
+    targetWriterGitSha: TARGET_GIT_SHA,
+    getObject: async ({ key }) => objects.has(key)
+      ? { exists: true, body: Buffer.from(objects.get(key)) }
+      : { exists: false },
+    putIfChanged: async ({ key, body }) => {
+      objects.set(key, Buffer.from(body));
+      return { ok: true, status: "written" };
+    },
+    recordDurableEvidence: async () => ({ durable: true }),
+  });
+  const result = await publisher({
+    day_utc: DAY_UTC,
+    changed_connectors: [changedConnectorEntry(connectorPayload)],
+  });
+  assert.equal(result.canonical_day_authority_verified, true);
+  assert.deepEqual(result.current_connector_ids, []);
+  assert.deepEqual(result.changed_connector_ids, [1]);
+  assert.deepEqual(result.final_connector_ids, [1]);
+  assert.equal(
+    result.day_manifest.key,
+    buildHistoryV2DayManifestKey("history/v2/observations", DAY_UTC),
+  );
+});
+
+test("day publisher replaces one stale parent child with exact changed evidence and retains unrelated connectors", async () => {
+  const oldOnePartition = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rowsFor(1, "pm25", 101, 10),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const newOnePartition = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rowsFor(1, "pm25", 101, 11),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const twoPartition = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rowsFor(2, "no2", 201, 20),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-21T00:00:00.000Z",
+  });
+  const oldOne = connectorFromPartition({
+    connectorId: 1,
+    partition: oldOnePartition,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const newOne = connectorFromPartition({
+    connectorId: 1,
+    partition: newOnePartition,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const unchangedTwo = connectorFromPartition({
+    connectorId: 2,
+    partition: twoPartition,
+    backedUpAtUtc: "2026-08-21T00:00:00.000Z",
+  });
+  const dayKey = buildHistoryV2DayManifestKey(
+    "history/v2/observations",
+    DAY_UTC,
+  );
+  const oldDay = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc: DAY_UTC,
+    runId: null,
+    manifestKey: dayKey,
+    connectorManifests: [oldOne, unchangedTwo],
+    writerGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-21T00:00:00.000Z",
+  });
+  const objects = new Map([
+    [dayKey, Buffer.from(JSON.stringify(oldDay, null, 2))],
+    [newOne.manifest_key, Buffer.from(JSON.stringify(newOne, null, 2))],
+    [unchangedTwo.manifest_key, Buffer.from(JSON.stringify(unchangedTwo, null, 2))],
+  ]);
+  const publisher = createObservationHistoryV3CanonicalDayPublisher({
+    targetWriterGitSha: TARGET_GIT_SHA,
+    getObject: async ({ key }) => objects.has(key)
+      ? { exists: true, body: Buffer.from(objects.get(key)) }
+      : { exists: false },
+    putIfChanged: async ({ key, body }) => {
+      objects.set(key, Buffer.from(body));
+      return { ok: true, status: "written" };
+    },
+    recordDurableEvidence: async () => ({ durable: true }),
+  });
+
+  const result = await publisher({
+    day_utc: DAY_UTC,
+    changed_connectors: [changedConnectorEntry(newOne)],
+  });
+  const nextByConnector = new Map(
+    result.day_manifest_payload.connector_manifests.map((entry) => [
+      Number(entry.connector_id),
+      entry,
+    ]),
+  );
+  assert.equal(nextByConnector.get(1).manifest_hash, newOne.manifest_hash);
+  assert.equal(nextByConnector.get(2).manifest_hash, unchangedTwo.manifest_hash);
+  assert.deepEqual(result.final_connector_ids, [1, 2]);
+});
+
+test("day publisher fails closed on changed and unchanged connector drift", async () => {
+  const partition = (connectorId, value) => buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rowsFor(connectorId, connectorId === 1 ? "pm25" : "no2", connectorId * 100 + 1, value),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const oldOne = connectorFromPartition({ connectorId: 1, partition: partition(1, 10), backedUpAtUtc: "2026-08-20T00:00:00.000Z" });
+  const newOneA = connectorFromPartition({ connectorId: 1, partition: partition(1, 11), backedUpAtUtc: "2026-08-22T00:00:00.000Z" });
+  const newOneB = connectorFromPartition({ connectorId: 1, partition: partition(1, 12), backedUpAtUtc: "2026-08-22T00:00:00.000Z" });
+  const twoA = connectorFromPartition({ connectorId: 2, partition: partition(2, 20), backedUpAtUtc: "2026-08-21T00:00:00.000Z" });
+  const twoB = connectorFromPartition({ connectorId: 2, partition: partition(2, 21), backedUpAtUtc: "2026-08-22T00:00:00.000Z" });
+  const dayKey = buildHistoryV2DayManifestKey("history/v2/observations", DAY_UTC);
+  const oldDay = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc: DAY_UTC,
+    runId: null,
+    manifestKey: dayKey,
+    connectorManifests: [oldOne, twoA],
+    writerGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-21T00:00:00.000Z",
+  });
+  const makePublisher = (liveOne, liveTwo) => createObservationHistoryV3CanonicalDayPublisher({
+    targetWriterGitSha: TARGET_GIT_SHA,
+    getObject: async ({ key }) => ({
+      exists: true,
+      body: Buffer.from(JSON.stringify(
+        key === dayKey ? oldDay : key === liveOne.manifest_key ? liveOne : liveTwo,
+        null,
+        2,
+      )),
+    }),
+    putIfChanged: async () => ({ ok: true, status: "written" }),
+    recordDurableEvidence: async () => ({ durable: true }),
+  });
+
+  await assert.rejects(
+    makePublisher(newOneB, twoA)({
+      day_utc: DAY_UTC,
+      changed_connectors: [changedConnectorEntry(newOneA)],
+    }),
+    /identity.*disagrees|connector.*drift/i,
+  );
+  await assert.rejects(
+    makePublisher(newOneA, twoB)({
+      day_utc: DAY_UTC,
+      changed_connectors: [changedConnectorEntry(newOneA)],
+    }),
+    /identity.*disagrees|connector.*drift/i,
+  );
+});
+
+test("aggregate publisher returns durable identities for hierarchy objects", async () => {
+  const key = "history/v2/observations/_manifests/manifest.json";
+  const body = Buffer.from('{"kind":"test"}', "utf8");
+  const publisher = createObservationHistoryV3CanonicalAggregatePublisher({
+    r2: { bucket: "test" },
+    getObject: async ({ key: requested }) => {
+      assert.equal(requested, key);
+      return { body };
+    },
+    recordDurableEvidence: async () => ({ durable: true }),
+    hierarchyFinalizer: async (options) => {
+      assert.deepEqual(options.affectedDaysUtc, [DAY_UTC]);
+      assert.equal(options.writeR2, true);
+      return { ok: true, objects: [{ key }] };
+    },
+  });
+  const result = await publisher({ affected_days_utc: [DAY_UTC] });
+  assert.equal(result.canonical_aggregate_authority_verified, true);
+  assert.equal(result.aggregate_manifests[0].key, key);
+  assert.equal(result.aggregate_manifests[0].byte_size, body.byteLength);
+  assert.match(result.aggregate_manifests[0].sha256, /^[0-9a-f]{64}$/);
 });
 
 test("disconnected operational entry point is v3-only", () => {

@@ -15,11 +15,21 @@ const pruneJob = fs.readFileSync(
   "utf8",
 );
 
-test("Prune Daily and Integrity use the same observations global finaliser", () => {
+test("Prune Daily delegates observation hierarchy and v3 indexes to the shared v3 writer", () => {
   const sharedImport = "uk_aq_r2_observations_global_finalizer.mjs";
-  assert.match(phaseB, new RegExp(sharedImport.replaceAll(".", "\\.")));
   assert.match(integrityApply, new RegExp(sharedImport.replaceAll(".", "\\.")));
-  assert.match(phaseB, /summary\.global_index_finalization = await runCanonicalObservationsGlobalFinalizer\(/);
+  assert.match(
+    phaseB,
+    /connectorPublisher\s*=\s*runOperationalPruneDailyObservationHistoryV3ConnectorPublication/,
+  );
+  assert.match(phaseB, /const connectorPublication = await connectorPublisher\(\{/);
+  assert.match(
+    phaseB,
+    /runFinalizer\s*=\s*runOperationalPruneDailyObservationHistoryV3RunFinalization/,
+  );
+  assert.match(phaseB, /await runFinalizer\(\{/);
+  assert.doesNotMatch(phaseB, new RegExp(sharedImport.replaceAll(".", "\\.")));
+  assert.doesNotMatch(phaseB, /summary\.global_index_finalization/);
   assert.match(integrityApply, /runState\.global_index_finalization = await runCanonicalObservationsGlobalFinalizer\(/);
   assert.doesNotMatch(phaseB, /runCanonicalGlobalIndexFinalizer\(/);
   assert.doesNotMatch(integrityApply, /runCanonicalGlobalIndexFinalizer\(/);

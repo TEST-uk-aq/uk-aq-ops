@@ -89,20 +89,17 @@ test("UK-AIR observation status is canonicalised for new R2 v2 writes", () => {
   assert.match(source, /normalizeUkAirVerificationStatus/);
 });
 
-test("AQI writer delegates v2 manifests and Parquet to the canonical implementation", () => {
-  const summaryBody = bodyOf("summarizeAqilevelsPartRows");
-  assert.match(summaryBody, /timeseries_row_counts: Record<string, number>/);
-  assert.match(summaryBody, /timeseriesRowCounts\[key\] = \(timeseriesRowCounts\[key\] \|\| 0\) \+ 1/);
-
-  const v2PollutantBody = bodyOf("createAqiV2PollutantManifest");
-  assert.match(v2PollutantBody, /buildCanonicalHistoryV2PollutantManifest/);
-  assert.match(v2PollutantBody, /validateCanonicalHistoryV2Manifest/);
-
-  const v2ConnectorBody = bodyOf("createAqiV2ConnectorManifest");
-  assert.match(v2ConnectorBody, /buildCanonicalHistoryV2ConnectorManifest/);
-  assert.match(v2ConnectorBody, /validateCanonicalHistoryV2Manifest/);
-  assert.match(bodyOf("rowsToAqiDataV2ParquetBuffer"), /serializeCanonicalAqilevelDataV2Parquet/);
-  assert.match(bodyOf("rowsToAqiDebugV2ParquetBuffer"), /serializeCanonicalAqilevelDebugV2Parquet/);
+test("retired direct AQI R2 backfill is rejected before its historical adapter can run", () => {
+  assert.match(
+    source,
+    /const DIRECT_R2_MUTATION_MODES = new Set<RunMode>\(\[[\s\S]*"r2_history_obs_to_aqilevels"[\s\S]*\]\);/,
+  );
+  const mainBody = bodyOf("main");
+  assert.ok(
+    mainBody.indexOf("assertSharedCanonicalMutationRoute") <
+      mainBody.indexOf("runR2HistoryObsToAqilevels"),
+    "direct-mutation retirement guard runs before the historical AQI adapter",
+  );
 });
 
 test("local backfill wrapper adds targeted v2 AQI timeseries-count repair flags only when requested", () => {

@@ -9,9 +9,10 @@ import {
   buildHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest,
   buildHistoryV2PollutantManifest,
-  rowsToObservationV2LegacyParquetBufferForTest,
-  rowsToObservationV2ParquetBufferForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+import {
+  serializeCanonicalObservationV2Parquet,
+} from "../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
   OBSERVATION_HISTORY_COLUMNS_V2,
   OBSERVATION_HISTORY_COLUMNS_V2_STATUS,
@@ -290,8 +291,12 @@ test("day repair normalises legacy pollutant paths before connector and day pare
     { connector_id: connectorId, station_id: 71, timeseries_id: 701, pollutant_code: "pm25", observed_at_utc: `${DAY}T00:00:00.000Z`, value: 5 },
     { connector_id: connectorId, station_id: 71, timeseries_id: 701, pollutant_code: "pm25", observed_at_utc: `${DAY}T01:00:00.000Z`, value: 6 },
   ];
-  const pm10Bytes = rowsToObservationV2LegacyParquetBufferForTest(pm10Rows);
-  const pm25Bytes = rowsToObservationV2LegacyParquetBufferForTest(pm25Rows);
+  const pm10Bytes = serializeCanonicalObservationV2Parquet(pm10Rows, {
+    includeVerificationStatus: false,
+  });
+  const pm25Bytes = serializeCanonicalObservationV2Parquet(pm25Rows, {
+    includeVerificationStatus: false,
+  });
   const legacy = {
     created_at_utc: "2026-07-17T14:07:48Z",
     current_prefix: `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/`,
@@ -356,7 +361,7 @@ test("day repair normalises legacy pollutant paths before connector and day pare
     assert.deepEqual(repairedPm10.columns, OBSERVATION_HISTORY_COLUMNS_V2);
     assert.equal(repairedPm10.writer_version, "parquet-wasm-zstd-v2");
     const v3Path = path.join(resolver.dropboxRoot, "equivalent-v3.parquet");
-    fs.writeFileSync(v3Path, rowsToObservationV2ParquetBufferForTest(pm10Rows));
+    fs.writeFileSync(v3Path, serializeCanonicalObservationV2Parquet(pm10Rows));
     const [schema2Hash, schema3Hash] = await Promise.all([
       observationContentHashFromLocalParquet({
         filePaths: [path.join(resolver.dropboxRoot, `${pm10Prefix}/part-00000.parquet`)],

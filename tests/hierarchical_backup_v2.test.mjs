@@ -12,6 +12,7 @@ import {
   observationMonthInventoryShardKey,
   observationMonthStateShardKey,
   planObservationMonthCopies,
+  resolveObservationsTimeseriesLatestPath,
   setStateRootProcessedHash,
   sha256Hex,
   stableJson,
@@ -21,6 +22,23 @@ import {
 } from "../scripts/backup_r2/lib/hierarchical_backup_v2.mjs";
 
 const h = (char) => char.repeat(64);
+
+test("latest-timeseries backup path follows explicit v2/v3 authority", () => {
+  assert.equal(
+    resolveObservationsTimeseriesLatestPath("v2"),
+    "history/_index_v2/observations_timeseries_latest.json",
+  );
+  assert.equal(
+    resolveObservationsTimeseriesLatestPath("v3"),
+    "history/_index_v3/observations_timeseries_latest.json",
+  );
+  for (const value of [undefined, "", "V1", "V2", "V3", " v2", "v3 ", "latest", "v4"]) {
+    assert.throws(
+      () => resolveObservationsTimeseriesLatestPath(value),
+      /must be exactly v2 or v3/,
+    );
+  }
+});
 
 test("fresh month state plans every current inventory day", () => {
   const shard = buildObservationMonthInventoryShard({
@@ -157,6 +175,38 @@ test("latest-timeseries state advances only through verified completion", () => 
     copied_at: "2026-08-11T12:00:00.000Z",
     verified: true,
   });
+});
+
+test("v2 and v3 latest state identities cannot satisfy each other", () => {
+  const root = emptyHierarchicalStateRoot();
+  markLatestTimeseriesProcessed(root, {
+    relative_path: resolveObservationsTimeseriesLatestPath("v2"),
+    sha256: h("e"),
+    byte_size: 456,
+  }, "2026-08-11T12:00:00.000Z");
+  const v3Unit = {
+    relative_path: resolveObservationsTimeseriesLatestPath("v3"),
+    sha256: h("e"),
+    byte_size: 456,
+  };
+  assert.notEqual(
+    root.global_units.observations_timeseries_latest.source_relative_path,
+    v3Unit.relative_path,
+  );
+  markLatestTimeseriesProcessed(root, v3Unit, "2026-08-29T12:00:00.000Z");
+  assert.equal(
+    root.global_units.observations_timeseries_latest.source_relative_path,
+    "history/_index_v3/observations_timeseries_latest.json",
+  );
+  const v2Unit = {
+    relative_path: resolveObservationsTimeseriesLatestPath("v2"),
+    sha256: h("e"),
+    byte_size: 456,
+  };
+  assert.notEqual(
+    root.global_units.observations_timeseries_latest.source_relative_path,
+    v2Unit.relative_path,
+  );
 });
 
 test("stable JSON is byte-stable for unchanged logical content", () => {

@@ -15,6 +15,7 @@ import {
   stopPhaseBForBudgetForTest,
   summarizeVerifiedMergedDayManifestForGate,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+import * as phaseBHistoryModule from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
   executePruneDaily,
   filterBucketsByConnectorHistoryGate,
@@ -500,6 +501,455 @@ test("insufficient Phase B budget prevents AQI and Dropbox adapters and reports 
   assert.equal(summary.budget_stop.remaining_budget_ms, 179_999);
 });
 
+function frozenObservationRow(overrides = {}) {
+  return {
+    connector_id: 7,
+    station_id: 71,
+    timeseries_id: 7101,
+    pollutant_code: "pm25",
+    observed_at_utc: "2026-07-21T00:00:00.000Z",
+    value: 12.5,
+    status: null,
+    ...overrides,
+  };
+}
+
+test("v3 frozen-source replay stops on the controlled Phase B budget before starting the writer", async () => {
+  assert.equal(
+    typeof phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest,
+    "function",
+    "the production replay/write boundary must expose its deterministic test seam",
+  );
+  let nowMs = 0;
+  const runtime = {
+    run_budget: createPhaseBRunBudgetForTest({
+      nowMs: () => nowMs,
+      startedAtMs: 0,
+      maxSecondsPerRun: 1_740,
+      stopBeforeTimeoutSeconds: 60,
+    }),
+    sos_connector_id: 1,
+    observation_history_index_version: "v3",
+    writer_git_sha: "4".repeat(40),
+    committed_prefix: "history/v2/observations",
+    r2: {},
+    environment: "TEST",
+  };
+  const frozen = {
+    temp: { root: "/tmp/fake-frozen-source", ndjsonPath: "/tmp/fake-frozen-source/rows.ndjson" },
+    counts: { frozen_source_row_count: 2 },
+    sourceIdentity: {},
+  };
+  let writerCalls = 0;
+  let cleanupCalls = 0;
+  async function* rows() {
+    yield frozenObservationRow();
+    nowMs = runtime.run_budget.deadline_ms - 59_999;
+    yield frozenObservationRow({
+      timeseries_id: 7102,
+      observed_at_utc: "2026-07-21T01:00:00.000Z",
+    });
+  }
+
+  await assert.rejects(
+    phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest({
+      candidate: { day_utc: "2026-07-21", connector_id: 7, expected_row_count: 2n },
+      runtime,
+      streamClient: {},
+      frozen,
+      backedUpAtUtc: "2026-07-22T00:00:00.000Z",
+      readFrozenRows: () => rows(),
+      connectorPublisher: async () => {
+        writerCalls += 1;
+        return { ok: true, connector_results: [] };
+      },
+      cleanupFrozenSource: () => { cleanupCalls += 1; },
+    }),
+    (error) => {
+      assert.equal(error.code, "PHASE_B_HISTORY_BUDGET_EXHAUSTED");
+      assert.equal(error.operation, "frozen_source_replay");
+      return true;
+    },
+  );
+  assert.equal(writerCalls, 0);
+  assert.equal(cleanupCalls, 1);
+});
+
+test("v3 writer is not invoked when its completion allowance no longer fits the Phase B budget", async () => {
+  assert.equal(
+    typeof phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest,
+    "function",
+    "the production replay/write boundary must expose its deterministic test seam",
+  );
+  let nowMs = 0;
+  const runtime = {
+    run_budget: createPhaseBRunBudgetForTest({
+      nowMs: () => nowMs,
+      startedAtMs: 0,
+      maxSecondsPerRun: 1_740,
+      stopBeforeTimeoutSeconds: 60,
+    }),
+    sos_connector_id: 1,
+    observation_history_index_version: "v3",
+    writer_git_sha: "4".repeat(40),
+    committed_prefix: "history/v2/observations",
+    r2: {},
+    environment: "TEST",
+  };
+  const candidate = { day_utc: "2026-07-21", connector_id: 7, expected_row_count: 1n };
+  const frozen = {
+    temp: { root: "/tmp/fake-frozen-source", ndjsonPath: "/tmp/fake-frozen-source/rows.ndjson" },
+    counts: { frozen_source_row_count: 1 },
+    sourceIdentity: {},
+  };
+  let writerCalls = 0;
+  let cleanupCalls = 0;
+  let connectorGateComplete = false;
+  async function* rows() {
+    yield frozenObservationRow();
+    nowMs = runtime.run_budget.deadline_ms - 179_999;
+  }
+
+  let budgetError;
+  try {
+    await phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest({
+      candidate,
+      runtime,
+      streamClient: {},
+      frozen,
+      backedUpAtUtc: "2026-07-22T00:00:00.000Z",
+      readFrozenRows: () => rows(),
+      connectorPublisher: async () => {
+        writerCalls += 1;
+        connectorGateComplete = true;
+        return { ok: true, connector_results: [] };
+      },
+      cleanupFrozenSource: () => { cleanupCalls += 1; },
+    });
+  } catch (error) {
+    budgetError = error;
+  }
+  assert.equal(budgetError?.code, "PHASE_B_HISTORY_BUDGET_EXHAUSTED");
+  assert.equal(budgetError?.operation, "observation_v3_connector_publication");
+  const summary = stopPhaseBForBudgetForTest({
+    summary: { enabled: true },
+    runtime,
+    operation: budgetError.operation,
+    candidate,
+  });
+  assert.equal(writerCalls, 0);
+  assert.equal(connectorGateComplete, false);
+  assert.equal(cleanupCalls, 1);
+  assert.equal(summary.status, "stopped_budget");
+  assert.equal(summary.stopped_for_budget, true);
+  assert.equal(summary.budget_stop.operation, "observation_v3_connector_publication");
+});
+
+async function reproduceCandidateSizedV3RunFinalization({ candidates, counts }) {
+  const runtime = {
+    run_budget: createPhaseBRunBudgetForTest({
+      nowMs: () => 0,
+      startedAtMs: 0,
+      maxSecondsPerRun: 1_740,
+      stopBeforeTimeoutSeconds: 60,
+    }),
+    sos_connector_id: 1,
+    observation_history_index_version: "v3",
+    writer_git_sha: "4".repeat(40),
+    committed_prefix: "history/v2/observations",
+    r2: {},
+    environment: "TEST",
+  };
+  const connectorPublisher = async ({ partitions }) => {
+    const { day_utc: dayUtc, connector_id: connectorId } = partitions[0].scope;
+    counts.connector_publication += 1;
+    const partitionResults = partitions.map((partition, index) => {
+      const key = `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${partition.scope.pollutant_code}/part-${index}.parquet`;
+      return {
+        scope: partition.scope,
+        target_metadata: {
+          files: [{
+            key,
+            row_count: partition.rows.length,
+            byte_size: 1,
+            sha256: "a".repeat(64),
+          }],
+        },
+      };
+    });
+    const publication = {
+      ok: true,
+      source: "prune_daily",
+      prune_eligibility_owner: true,
+      connector_publication_complete: true,
+      connector_results: [{
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        canonical: {
+          connector_manifest_payload: {
+            manifest_key: `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
+            parquet_object_keys: partitionResults.flatMap((partition) =>
+              partition.target_metadata.files.map((file) => file.key)
+            ),
+          },
+        },
+        partitions: partitionResults,
+      }],
+    };
+    publication.run_finalization_evidence = {
+      ...publication,
+      connector_results: publication.connector_results.map((result) => ({
+        day_utc: result.day_utc,
+        connector_id: result.connector_id,
+      })),
+    };
+    return publication;
+  };
+
+  const publishedCandidates = [];
+  for (const candidate of candidates) {
+    const row = frozenObservationRow({
+      connector_id: candidate.connector_id,
+      station_id: candidate.connector_id * 10,
+      timeseries_id: candidate.connector_id * 100 + 1,
+      observed_at_utc: `${candidate.day_utc}T00:00:00.000Z`,
+    });
+    const exportResult = await phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest({
+      candidate: { ...candidate, expected_row_count: 1n },
+      runtime,
+      streamClient: {},
+      frozen: {
+        temp: { root: "/tmp/fake-frozen-source", ndjsonPath: "/tmp/fake-frozen-source/rows.ndjson" },
+        counts: { frozen_source_row_count: 1 },
+        sourceIdentity: {},
+      },
+      backedUpAtUtc: "2026-08-29T00:00:00.000Z",
+      readFrozenRows: async function* () { yield row; },
+      connectorPublisher,
+      cleanupFrozenSource: () => {},
+    });
+    exportResult.v3_run_finalization_evidence =
+      exportResult.v3_connector_publication.run_finalization_evidence;
+    publishedCandidates.push({
+      candidate: { ...candidate, expected_row_count: 1n },
+      exportResult,
+      connectorGateEvidence: {
+        history_manifest_key: exportResult.manifest_key,
+        history_manifest_hash: "b".repeat(64),
+        history_row_count: 1,
+        history_file_count: 1,
+        history_total_bytes: 1,
+      },
+    });
+  }
+  const affectedDays = [...new Set(candidates.map((candidate) => candidate.day_utc))].sort();
+  await phaseBHistoryModule.finalizePublishedPhaseBV3ConnectorsForTest({
+    client: {},
+    runtime,
+    runId: "run-finalization-regression",
+    publishedCandidates,
+    runFinalizer: async () => {
+      counts.day_finalization.push(...affectedDays);
+      counts.aggregate_global_finalization += 1;
+      counts.latest_publication += 1;
+      return {
+        ok: true,
+        prune_eligibility_owner: true,
+        affected_connector_days: candidates,
+        affected_days_utc: affectedDays,
+        day_results: affectedDays.map((day_utc) => ({
+          day_utc,
+          canonical_day_authority_verified: true,
+          parent_state_reread_under_lock: true,
+        })),
+        canonical_aggregate_result: {
+          canonical_aggregate_authority_verified: true,
+        },
+        v3_publication: { latest_global: { ok: true } },
+      };
+    },
+    completeCandidateAndGate: async () => {},
+  });
+}
+
+test("one Prune v3 run finalizes two same-day connector publications only once", async () => {
+  const counts = {
+    connector_publication: 0,
+    day_finalization: [],
+    aggregate_global_finalization: 0,
+    latest_publication: 0,
+  };
+  await reproduceCandidateSizedV3RunFinalization({
+    candidates: [
+      { day_utc: "2026-08-28", connector_id: 1 },
+      { day_utc: "2026-08-28", connector_id: 2 },
+    ],
+    counts,
+  });
+  assert.deepEqual(counts, {
+    connector_publication: 2,
+    day_finalization: ["2026-08-28"],
+    aggregate_global_finalization: 1,
+    latest_publication: 1,
+  });
+});
+
+test("one Prune v3 run finalizes two affected days and shared parents once", async () => {
+  const counts = {
+    connector_publication: 0,
+    day_finalization: [],
+    aggregate_global_finalization: 0,
+    latest_publication: 0,
+  };
+  await reproduceCandidateSizedV3RunFinalization({
+    candidates: [
+      { day_utc: "2026-08-27", connector_id: 1 },
+      { day_utc: "2026-08-28", connector_id: 2 },
+    ],
+    counts,
+  });
+  assert.deepEqual(counts, {
+    connector_publication: 2,
+    day_finalization: ["2026-08-27", "2026-08-28"],
+    aggregate_global_finalization: 1,
+    latest_publication: 1,
+  });
+});
+
+function publishedCandidateForFinalizationTest(dayUtc = "2026-08-28", connectorId = 1) {
+  return {
+    candidate: { day_utc: dayUtc, connector_id: connectorId, expected_row_count: 1n },
+    exportResult: {
+      v3_run_finalization_evidence: { ok: true },
+      source_identity: {
+        source_content_hash: "c".repeat(64),
+        source_content_hash_contract_version: 1,
+        source_content_hash_row_count: 1,
+      },
+    },
+    connectorGateEvidence: {
+      history_manifest_key: `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
+      history_manifest_hash: "b".repeat(64),
+      history_row_count: 1,
+      history_file_count: 1,
+      history_total_bytes: 1,
+    },
+  };
+}
+
+test("v3 run-finalization failure cannot create connector deletion authority", async () => {
+  const runtime = {
+    run_budget: createPhaseBRunBudgetForTest({
+      nowMs: () => 0,
+      startedAtMs: 0,
+      maxSecondsPerRun: 1_740,
+      stopBeforeTimeoutSeconds: 60,
+    }),
+    observation_history_index_version: "v3",
+    writer_git_sha: "4".repeat(40),
+    committed_prefix: "history/v2/observations",
+    r2: {},
+    environment: "TEST",
+  };
+  let gateCalls = 0;
+  await assert.rejects(
+    phaseBHistoryModule.finalizePublishedPhaseBV3ConnectorsForTest({
+      client: {},
+      runtime,
+      runId: "failed-finalization",
+      publishedCandidates: [publishedCandidateForFinalizationTest()],
+      runFinalizer: async () => { throw new Error("latest publication failed"); },
+      completeCandidateAndGate: async () => { gateCalls += 1; },
+    }),
+    /latest publication failed/,
+  );
+  assert.equal(gateCalls, 0);
+});
+
+test("v3 run finalization is not invoked when its conservative allowance no longer fits", async () => {
+  let nowMs = 0;
+  const runtime = {
+    run_budget: createPhaseBRunBudgetForTest({
+      nowMs: () => nowMs,
+      startedAtMs: 0,
+      maxSecondsPerRun: 1_740,
+      stopBeforeTimeoutSeconds: 60,
+    }),
+    observation_history_index_version: "v3",
+    writer_git_sha: "4".repeat(40),
+    committed_prefix: "history/v2/observations",
+    r2: {},
+    environment: "TEST",
+  };
+  nowMs = runtime.run_budget.deadline_ms - 119_999;
+  let finalizerCalls = 0;
+  let gateCalls = 0;
+  await assert.rejects(
+    phaseBHistoryModule.finalizePublishedPhaseBV3ConnectorsForTest({
+      client: {},
+      runtime,
+      runId: "budget-finalization",
+      publishedCandidates: [publishedCandidateForFinalizationTest()],
+      runFinalizer: async () => { finalizerCalls += 1; },
+      completeCandidateAndGate: async () => { gateCalls += 1; },
+    }),
+    (error) => {
+      assert.equal(error.code, "PHASE_B_HISTORY_BUDGET_EXHAUSTED");
+      assert.equal(error.operation, "observation_v3_run_finalization");
+      return true;
+    },
+  );
+  assert.equal(finalizerCalls, 0);
+  assert.equal(gateCalls, 0);
+});
+
+test("a later connector failure does not prevent a verified earlier connector from finalizing and gating", async () => {
+  const runtime = {
+    run_budget: createPhaseBRunBudgetForTest({
+      nowMs: () => 0,
+      startedAtMs: 0,
+      maxSecondsPerRun: 1_740,
+      stopBeforeTimeoutSeconds: 60,
+    }),
+    observation_history_index_version: "v3",
+    writer_git_sha: "4".repeat(40),
+    committed_prefix: "history/v2/observations",
+    r2: {},
+    environment: "TEST",
+  };
+  const successful = publishedCandidateForFinalizationTest("2026-08-28", 1);
+  const gated = [];
+  const finalized = await phaseBHistoryModule.finalizePublishedPhaseBV3ConnectorsForTest({
+    client: {},
+    runtime,
+    runId: "partial-connector-failure",
+    publishedCandidates: [successful],
+    runFinalizer: async ({ connectorPublications }) => {
+      assert.deepEqual(connectorPublications, [successful.exportResult.v3_run_finalization_evidence]);
+      return {
+        ok: true,
+        prune_eligibility_owner: true,
+        affected_connector_days: [{ day_utc: "2026-08-28", connector_id: 1 }],
+        affected_days_utc: ["2026-08-28"],
+        day_results: [{
+          day_utc: "2026-08-28",
+          canonical_day_authority_verified: true,
+          parent_state_reread_under_lock: true,
+        }],
+        canonical_aggregate_result: {
+          canonical_aggregate_authority_verified: true,
+        },
+        v3_publication: { latest_global: { ok: true } },
+      };
+    },
+    completeCandidateAndGate: async (_client, evidence) => {
+      gated.push(evidence.connectorId);
+    },
+  });
+  assert.equal(finalized.completed.length, 1);
+  assert.deepEqual(gated, [1]);
+});
+
 function phaseBConfig() {
   return {
     enabled: true,
@@ -512,6 +962,8 @@ function phaseBConfig() {
       secret_access_key: "test-secret-key",
     },
     history_write_version: "v2",
+    observation_history_index_version: "v3",
+    writer_git_sha: "4".repeat(40),
     staging_prefix_base: "history/v2/_ops/observations/staging",
     committed_prefix: "history/v2/observations",
     committed_prefix_v1: "history/v1/observations",
@@ -527,7 +979,6 @@ function phaseBConfig() {
     max_candidates_per_run: 500,
     max_seconds_per_run: 1_740,
     stop_before_timeout_seconds: 60,
-    phase_b_calculate_aqi_from_observations_enabled: true,
     prune_check_dropbox: { enabled: false, required: false },
   };
 }

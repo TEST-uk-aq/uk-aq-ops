@@ -48,6 +48,7 @@ jobs:
       UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || 'history/v2/_ops/observations/runs' }}
       UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
       UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
+      UK_AQ_R2_HISTORY_INDEX_VERSION: ${{ vars.UK_AQ_R2_HISTORY_INDEX_VERSION || '' }}
       UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || 'history/_index_v2/timeseries_binding' }}
       UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || 'history/_index_v2/backup_inventory_v2' }}
       UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || '_ops/checkpoints/r2_history_backup_state_v2' }}
@@ -179,6 +180,14 @@ jobs:
           set -euo pipefail
           mkdir -p tmp
 
+          case "${UK_AQ_R2_HISTORY_INDEX_VERSION}" in
+            v2|v3) ;;
+            *)
+              echo "UK_AQ_R2_HISTORY_INDEX_VERSION must be exactly v2 or v3" >&2
+              exit 1
+              ;;
+          esac
+
           max_days="${INPUT_MAX_DAYS_PER_RUN:-}"
           if [ -z "${max_days}" ]; then
             max_days="${UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN}"
@@ -217,7 +226,7 @@ jobs:
             --runs-prefix "${UK_AQ_R2_HISTORY_V2_RUNS_PREFIX}"
             --core-prefix "${UK_AQ_R2_HISTORY_V2_CORE_PREFIX}"
             --timeseries-binding-prefix "${UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX}"
-            --latest-timeseries-key "${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}/observations_timeseries_latest.json"
+            --history-index-version "${UK_AQ_R2_HISTORY_INDEX_VERSION}"
             --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
             --state-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX}"
             --max-days-per-run "${max_days}"

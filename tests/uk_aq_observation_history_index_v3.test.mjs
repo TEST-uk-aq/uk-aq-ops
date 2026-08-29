@@ -854,7 +854,7 @@ test("observation-only v3 resolver rejects every unsupported generation", () => 
     }).index_generation,
     "v3",
   );
-  for (const generation of ["", "v1", "v2", "v4"]) {
+  for (const generation of ["", "v1", "v2", "v4", "V3", " v3", "v3 "]) {
     assert.throws(
       () => resolveObservationHistoryIndexV3BuildConfig({
         env: { UK_AQ_R2_HISTORY_INDEX_VERSION: generation },

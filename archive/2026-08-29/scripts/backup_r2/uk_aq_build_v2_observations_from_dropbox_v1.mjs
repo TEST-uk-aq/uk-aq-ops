@@ -13,10 +13,8 @@ import {
   buildHistoryV2PartKey,
   buildHistoryV2PollutantManifestForTest,
   buildHistoryV2PollutantManifestKey,
+  rowsToObservationV2ParquetBufferForTest,
 } from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
-import {
-  serializeCanonicalObservationV2Parquet,
-} from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
   hasRequiredR2Config,
   r2HeadObject,
@@ -594,7 +592,7 @@ async function buildConnectorDayPlan({ targetPrefix, dayUtc, connectorId, rows, 
     const fileEntries = [];
     const parts = [];
     for (const [partIndex, chunk] of chunkRows(pollutantRows, partMaxRows).entries()) {
-      const body = serializeCanonicalObservationV2Parquet(chunk);
+      const body = rowsToObservationV2ParquetBufferForTest(chunk);
       const key = buildHistoryV2PartKey(targetPrefix, dayUtc, connectorId, pollutantCode, partIndex);
       const summary = summarizePartRows(chunk);
       const entry = {

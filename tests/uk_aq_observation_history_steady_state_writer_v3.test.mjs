@@ -8,6 +8,8 @@ import {
 import {
   buildObservationHistoryV3SteadyStatePartition,
   runIntegrityObservationHistoryV3Writer,
+  runPruneDailyObservationHistoryV3ConnectorPublication,
+  runPruneDailyObservationHistoryV3RunFinalization,
   runPruneDailyObservationHistoryV3Writer,
   runSosHistoricalReplacementObservationHistoryV3Writer,
   runSupportedBackfillObservationHistoryV3Writer,
@@ -356,6 +358,77 @@ test("run-level v3 writer releases each lock phase, merges days, and publishes l
     const lastDependencyGetIndex = fixture.events.lastIndexOf(`v3:get:${key}`);
     assert.ok(lastDependencyGetIndex >= 0 && lastDependencyGetIndex < latestPutIndex);
   }
+});
+
+test("split Prune API publishes two same-day connectors then finalizes the run once", async () => {
+  const fixture = buildFixture();
+  const connectorPublications = [
+    await runPruneDailyObservationHistoryV3ConnectorPublication({
+      ...fixture.options,
+      partitions: fixture.options.partitions.slice(0, 2),
+    }),
+    await runPruneDailyObservationHistoryV3ConnectorPublication({
+      ...fixture.options,
+      partitions: fixture.options.partitions.slice(2, 3),
+    }),
+  ];
+  assert.equal(fixture.dayCalls.length, 0);
+  assert.equal(fixture.globalLockCount(), 0);
+  for (const publication of connectorPublications) {
+    const evidence = publication.run_finalization_evidence;
+    assert.equal(evidence.connector_results.length, 1);
+    assert.equal(evidence.connector_results[0].partitions[0].target_metadata, undefined);
+    assert.equal(evidence.connector_results[0].partitions[0].pollutant_manifest, undefined);
+    assert.equal(evidence.connector_results[0].partitions[0].file_evidence, undefined);
+    assert.equal(evidence.connector_results[0].canonical.pollutant_manifests, undefined);
+    assert.equal(JSON.stringify(evidence).includes('"rows"'), false);
+  }
+
+  const result = await runPruneDailyObservationHistoryV3RunFinalization({
+    ...fixture.options,
+    connectorPublications: connectorPublications.map(
+      (publication) => publication.run_finalization_evidence,
+    ),
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(fixture.connectorCalls.map((entry) => entry.connector_id), [1, 2]);
+  assert.deepEqual(fixture.dayCalls.map((entry) => entry.day_utc), ["2026-08-18"]);
+  assert.equal(fixture.globalLockCount(), 1);
+  assert.equal(
+    fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
+    1,
+  );
+});
+
+test("split Prune API finalizes two exact affected days and shared parents once", async () => {
+  const fixture = buildFixture();
+  const connectorPublications = [
+    await runPruneDailyObservationHistoryV3ConnectorPublication({
+      ...fixture.options,
+      partitions: fixture.options.partitions.slice(0, 2),
+    }),
+    await runPruneDailyObservationHistoryV3ConnectorPublication({
+      ...fixture.options,
+      partitions: fixture.options.partitions.slice(3, 4),
+    }),
+  ];
+  const result = await runPruneDailyObservationHistoryV3RunFinalization({
+    ...fixture.options,
+    connectorPublications: connectorPublications.map(
+      (publication) => publication.run_finalization_evidence,
+    ),
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.affected_days_utc, ["2026-08-18", "2026-08-20"]);
+  assert.deepEqual(
+    fixture.dayCalls.map((entry) => entry.day_utc),
+    ["2026-08-18", "2026-08-20"],
+  );
+  assert.equal(fixture.globalLockCount(), 1);
+  assert.equal(
+    fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
+    1,
+  );
 });
 
 test("connector exact-publication or day failure prevents later authority phases", async () => {

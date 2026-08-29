@@ -18,7 +18,6 @@ import {
   buildObservationMonthInventoryShard,
   buildObservationRunManifestInventoryShard,
   observationMonthInventoryShardKey,
-  resolveObservationsTimeseriesLatestPath,
   sha256Hex,
   stableJson,
   validateLatestTimeseriesInventoryUnit,
@@ -61,6 +60,9 @@ const DEFAULT_INVENTORY_ROOT_PREFIX = normalizePrefix(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
   || "history/_index_v2/backup_inventory_v2",
 );
+const DEFAULT_LATEST_TIMESERIES_KEY = normalizePrefix(
+  `${DEFAULT_INDEX_V2_PREFIX}/observations_timeseries_latest.json`,
+);
 const DEFAULT_REPORT_OUT = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_REPORT_OUT || "",
 ).trim();
@@ -80,7 +82,7 @@ function usage() {
     `  --core-prefix <p>            Default: ${DEFAULT_CORE_PREFIX}`,
     `  --timeseries-binding-prefix <p> Default: ${DEFAULT_TIMESERIES_BINDING_PREFIX}`,
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
-    "  --history-index-version <v2|v3> Required observation-history authority",
+    `  --latest-timeseries-key <p>  Default: ${DEFAULT_LATEST_TIMESERIES_KEY}`,
     `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
     "  --full-scan                  Independently hash observations, bindings and core",
     "  --dry-run                    Build and compare only; do not write inventory objects",
@@ -97,8 +99,7 @@ function parseArgs(argv) {
     core_prefix: DEFAULT_CORE_PREFIX,
     timeseries_binding_prefix: DEFAULT_TIMESERIES_BINDING_PREFIX,
     inventory_root_prefix: DEFAULT_INVENTORY_ROOT_PREFIX,
-    history_index_version: "",
-    latest_timeseries_key: "",
+    latest_timeseries_key: DEFAULT_LATEST_TIMESERIES_KEY,
     rclone_bin: DEFAULT_RCLONE_BIN,
     full_scan: false,
     dry_run: false,
@@ -107,7 +108,6 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = () => String(argv[++i] || "").trim();
-    const nextExact = () => String(argv[++i] || "");
     if (arg === "--source-root") args.source_root = next();
     else if (arg === "--observations-prefix") args.observations_prefix = normalizePrefix(next());
     else if (arg === "--runs-prefix") args.runs_prefix = normalizePrefix(next());
@@ -116,8 +116,8 @@ function parseArgs(argv) {
       args.timeseries_binding_prefix = normalizePrefix(next());
     } else if (arg === "--inventory-root-prefix") {
       args.inventory_root_prefix = normalizePrefix(next());
-    } else if (arg === "--history-index-version") {
-      args.history_index_version = nextExact();
+    } else if (arg === "--latest-timeseries-key") {
+      args.latest_timeseries_key = normalizePrefix(next());
     } else if (arg === "--rclone-bin") args.rclone_bin = next() || DEFAULT_RCLONE_BIN;
     else if (arg === "--report-out") args.report_out = next();
     else if (arg === "--full-scan") args.full_scan = true;
@@ -134,9 +134,7 @@ function parseArgs(argv) {
     throw new Error("--timeseries-binding-prefix is required");
   }
   if (!args.inventory_root_prefix) throw new Error("--inventory-root-prefix is required");
-  args.latest_timeseries_key = resolveObservationsTimeseriesLatestPath(
-    args.history_index_version,
-  );
+  if (!args.latest_timeseries_key) throw new Error("--latest-timeseries-key is required");
   return args;
 }
 
@@ -523,7 +521,6 @@ async function main() {
     started_at: startedAt,
     completed_at: new Date().toISOString(),
     inventory_mode: args.full_scan ? "full_scan" : "hierarchical",
-    observation_history_index_authority: args.history_index_version,
     source_root: args.source_root,
     observations_prefix: args.observations_prefix,
     core_prefix: args.core_prefix,

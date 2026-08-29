@@ -718,12 +718,11 @@ async function publishConnectorExactV3Scopes({
 }
 
 /**
- * Publish one bounded set of connector-scoped canonical leaves and exact v3
- * scopes. This phase deliberately does not publish day, aggregate or latest
- * authority; callers retain only its durable lightweight evidence for the
- * coordinated run finalizer.
+ * The one post-cutover run-level publication path for Prune, Integrity, SOS and
+ * supported backfills. Connector, day and global locks are acquired in three
+ * sequential, non-nested phases.
  */
-export async function runObservationHistoryV3ConnectorPublication({
+export async function runObservationHistoryV3SteadyStateWriter({
   client,
   source,
   partitions,
@@ -738,12 +737,15 @@ export async function runObservationHistoryV3ConnectorPublication({
   headObject = r2HeadObject,
   getObject,
   publishConnectorScopedCanonicalManifests,
+  finalizeCanonicalDayManifests,
+  finalizeCanonicalAggregateManifests,
   putIfChanged,
   recordDurableEvidence,
   finalizeV3Publication = finalizeObservationHistoryIndexV3Publication,
   putAndVerifyParquet = putAndVerifyR2ObjectWithSha256,
   withConnectorDayLock = withConnectorDayHistoryLock,
   runDayFinalizer = runCanonicalDayFinalizer,
+  runGlobalFinalizer = runCanonicalGlobalIndexFinalizer,
   diagnostics,
   diagnosticEnvironment,
   lockTimeoutMs,
@@ -754,12 +756,15 @@ export async function runObservationHistoryV3ConnectorPublication({
   for (const [name, adapter] of Object.entries({
     getObject,
     publishConnectorScopedCanonicalManifests,
+    finalizeCanonicalDayManifests,
+    finalizeCanonicalAggregateManifests,
     putIfChanged,
     recordDurableEvidence,
     finalizeV3Publication,
     putAndVerifyParquet,
     withConnectorDayLock,
     runDayFinalizer,
+    runGlobalFinalizer,
   })) {
     if (typeof adapter !== "function") throw new TypeError(`V3 steady-state writer adapter is missing: ${name}`);
   }
@@ -898,171 +903,6 @@ export async function runObservationHistoryV3ConnectorPublication({
     group.partitions.length = 0;
   }
 
-  const connectorPublication = {
-    ok: connectorResults.every((entry) =>
-      entry.v3_exact_publication?.ok === true
-    ),
-    status: "connector_publication_complete",
-    source: normalizedSource,
-    prune_eligibility_owner:
-      normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
-    connector_publication_complete: true,
-    connector_results: Object.freeze(connectorResults),
-    complete_day_replacement_results: Object.freeze(
-      completeDayReplacementResults,
-    ),
-  };
-  return Object.freeze({
-    ...connectorPublication,
-    run_finalization_evidence:
-      buildRunFinalizationEvidence(connectorPublication),
-  });
-}
-
-function collectVerifiedConnectorPublications({ source, connectorPublications }) {
-  const normalizedSource = normalizeSource(source);
-  if (!Array.isArray(connectorPublications) || connectorPublications.length === 0) {
-    throw new TypeError("V3 run finalization requires connector publication evidence");
-  }
-  const connectorResults = [];
-  const completeDayReplacementResults = [];
-  const seenConnectorDays = new Set();
-  for (const publication of connectorPublications) {
-    if (
-      publication?.ok !== true ||
-      publication?.connector_publication_complete !== true ||
-      publication?.source !== normalizedSource ||
-      !Array.isArray(publication.connector_results) ||
-      publication.connector_results.length === 0
-    ) {
-      throw new Error("V3 run finalization received incomplete connector publication evidence");
-    }
-    for (const result of publication.connector_results) {
-      const identity = `${result?.day_utc}\u0000${result?.connector_id}`;
-      if (
-        !/^\d{4}-\d{2}-\d{2}$/.test(String(result?.day_utc || "")) ||
-        !Number.isInteger(Number(result?.connector_id)) ||
-        Number(result.connector_id) <= 0 ||
-        result?.canonical?.connector_scope_verified !== true ||
-        result?.canonical?.parent_state_reread_under_lock !== true ||
-        result?.v3_exact_publication?.ok !== true ||
-        !Array.isArray(result?.partitions) ||
-        result.partitions.length === 0 ||
-        seenConnectorDays.has(identity)
-      ) {
-        throw new Error("V3 run finalization received contradictory connector publication evidence");
-      }
-      seenConnectorDays.add(identity);
-      connectorResults.push(result);
-    }
-    completeDayReplacementResults.push(
-      ...(publication.complete_day_replacement_results || []),
-    );
-  }
-  connectorResults.sort((left, right) =>
-    bytewiseCompare(left.day_utc, right.day_utc) ||
-    left.connector_id - right.connector_id
-  );
-  return Object.freeze({
-    source: normalizedSource,
-    connector_results: Object.freeze(connectorResults),
-    complete_day_replacement_results: Object.freeze(
-      completeDayReplacementResults,
-    ),
-  });
-}
-
-function buildRunFinalizationEvidence(connectorPublication) {
-  return Object.freeze({
-    ok: connectorPublication.ok,
-    status: connectorPublication.status,
-    source: connectorPublication.source,
-    prune_eligibility_owner: connectorPublication.prune_eligibility_owner,
-    connector_publication_complete:
-      connectorPublication.connector_publication_complete,
-    connector_results: Object.freeze(
-      connectorPublication.connector_results.map((result) => Object.freeze({
-        day_utc: result.day_utc,
-        connector_id: result.connector_id,
-        partitions: Object.freeze(result.partitions.map((partition) =>
-          Object.freeze({
-            scope: partition.scope,
-            scoped_root: partition.scoped_root,
-          })
-        )),
-        canonical: Object.freeze({
-          connector_manifest: result.canonical.connector_manifest,
-          connector_manifest_payload:
-            result.canonical.connector_manifest_payload,
-          connector_scope_verified:
-            result.canonical.connector_scope_verified,
-          parent_state_reread_under_lock:
-            result.canonical.parent_state_reread_under_lock,
-        }),
-        v3_exact_publication: Object.freeze({
-          ok: result.v3_exact_publication?.ok === true,
-          status: result.v3_exact_publication?.status ?? null,
-        }),
-      })),
-    ),
-    complete_day_replacement_results:
-      connectorPublication.complete_day_replacement_results,
-  });
-}
-
-/**
- * Finalize exact affected days once, then aggregate/root and latest/global
- * authority once, from verified connector publication evidence only.
- */
-export async function runObservationHistoryV3RunFinalization({
-  client,
-  source,
-  connectorPublications,
-  observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
-  indexRoot = OBSERVATION_HISTORY_V3_INDEX_ROOT,
-  latestKey = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_LATEST_KEY,
-  r2,
-  getObject,
-  finalizeCanonicalDayManifests,
-  finalizeCanonicalAggregateManifests,
-  putIfChanged,
-  recordDurableEvidence,
-  finalizeV3Publication = finalizeObservationHistoryIndexV3Publication,
-  runDayFinalizer = runCanonicalDayFinalizer,
-  runGlobalFinalizer = runCanonicalGlobalIndexFinalizer,
-  diagnostics,
-  diagnosticEnvironment,
-  lockTimeoutMs,
-}) {
-  if (!client?.query) throw new Error("V3 run finalization requires PostgreSQL lock client");
-  if (!r2 || typeof r2 !== "object") throw new Error("V3 run finalization requires R2 configuration");
-  for (const [name, adapter] of Object.entries({
-    getObject,
-    finalizeCanonicalDayManifests,
-    finalizeCanonicalAggregateManifests,
-    putIfChanged,
-    recordDurableEvidence,
-    finalizeV3Publication,
-    runDayFinalizer,
-    runGlobalFinalizer,
-  })) {
-    if (typeof adapter !== "function") {
-      throw new TypeError(`V3 run finalization adapter is missing: ${name}`);
-    }
-  }
-  const publicationEvidence = collectVerifiedConnectorPublications({
-    source,
-    connectorPublications,
-  });
-  const normalizedSource = publicationEvidence.source;
-  const connectorResults = publicationEvidence.connector_results;
-  const completeDayReplacementResults =
-    publicationEvidence.complete_day_replacement_results;
-  const canonicalObservationsPrefix = normalizePrefix(
-    observationsPrefix,
-    "observationsPrefix",
-  );
-
   const affectedDays = [...new Set(connectorResults.map((entry) => entry.day_utc))]
     .sort(bytewiseCompare);
   const dayResults = [];
@@ -1188,38 +1028,9 @@ export async function runObservationHistoryV3RunFinalization({
   });
 }
 
-/**
- * The one post-cutover run-level publication path for Prune, Integrity, SOS and
- * supported backfills. It composes bounded connector publication with one
- * coordinated exact-day, aggregate and latest/global finalization.
- */
-export async function runObservationHistoryV3SteadyStateWriter(options) {
-  const connectorPublication = await runObservationHistoryV3ConnectorPublication(
-    options,
-  );
-  return await runObservationHistoryV3RunFinalization({
-    ...options,
-    connectorPublications: [connectorPublication.run_finalization_evidence],
-  });
-}
-
 // Named, fixed-authority adapters are the Phase 6 import surface. They avoid a
 // runtime writer-generation selector and prevent each caller from reimplementing
 // target construction or v3 publication semantics.
-export function runPruneDailyObservationHistoryV3ConnectorPublication(options) {
-  return runObservationHistoryV3ConnectorPublication({
-    ...options,
-    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
-  });
-}
-
-export function runPruneDailyObservationHistoryV3RunFinalization(options) {
-  return runObservationHistoryV3RunFinalization({
-    ...options,
-    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
-  });
-}
-
 export function runPruneDailyObservationHistoryV3Writer(options) {
   return runObservationHistoryV3SteadyStateWriter({
     ...options,

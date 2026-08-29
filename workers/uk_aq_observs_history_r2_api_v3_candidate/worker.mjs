@@ -98,10 +98,10 @@ function authorize(request, env) {
 }
 
 function assertCandidateConfiguration(env) {
-  if (required(env.UK_AQ_R2_HISTORY_VERSION).toLowerCase() !== LOGICAL_HISTORY_VERSION) {
+  if (String(env.UK_AQ_R2_HISTORY_VERSION || "") !== LOGICAL_HISTORY_VERSION) {
     throw new Error("V3 candidate requires UK_AQ_R2_HISTORY_VERSION=v2");
   }
-  if (required(env.UK_AQ_R2_HISTORY_INDEX_VERSION).toLowerCase() !== INDEX_GENERATION) {
+  if (String(env.UK_AQ_R2_HISTORY_INDEX_VERSION || "") !== INDEX_GENERATION) {
     throw new Error("V3 candidate requires UK_AQ_R2_HISTORY_INDEX_VERSION=v3");
   }
   const indexRoot = normalizePrefix(env.UK_AQ_R2_HISTORY_V3_OBSERVATIONS_TIMESERIES_INDEX_PREFIX);

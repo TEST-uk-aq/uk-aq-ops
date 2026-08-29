@@ -6,9 +6,6 @@ import { pathToFileURL } from "node:url";
 import {
   requireObservationsGlobalOperationLockContext,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
-import {
-  resolveObservationsTimeseriesLatestPath,
-} from "./lib/hierarchical_backup_v2.mjs";
 
 function requireValue(argv, index, flag) {
   const value = argv[index + 1];
@@ -24,7 +21,7 @@ export function parseLockedHistoryBackupArgs(argv) {
     runsPrefix: null,
     corePrefix: null,
     timeseriesBindingPrefix: null,
-    historyIndexVersion: null,
+    latestTimeseriesKey: null,
     inventoryRootPrefix: null,
     stateRootPrefix: null,
     maxDaysPerRun: "0",
@@ -48,7 +45,7 @@ export function parseLockedHistoryBackupArgs(argv) {
       else if (flag === "--runs-prefix") args.runsPrefix = value;
       else if (flag === "--core-prefix") args.corePrefix = value;
       else if (flag === "--timeseries-binding-prefix") args.timeseriesBindingPrefix = value;
-      else if (flag === "--history-index-version") args.historyIndexVersion = value;
+      else if (flag === "--latest-timeseries-key") args.latestTimeseriesKey = value;
       else if (flag === "--inventory-root-prefix") args.inventoryRootPrefix = value;
       else if (flag === "--state-root-prefix") args.stateRootPrefix = value;
       else if (flag === "--max-days-per-run") args.maxDaysPerRun = value;
@@ -66,7 +63,7 @@ export function parseLockedHistoryBackupArgs(argv) {
     ["--runs-prefix", args.runsPrefix],
     ["--core-prefix", args.corePrefix],
     ["--timeseries-binding-prefix", args.timeseriesBindingPrefix],
-    ["--history-index-version", args.historyIndexVersion],
+    ["--latest-timeseries-key", args.latestTimeseriesKey],
     ["--inventory-root-prefix", args.inventoryRootPrefix],
     ["--state-root-prefix", args.stateRootPrefix],
     ["--inventory-report-out", args.inventoryReportOut],
@@ -81,7 +78,6 @@ export function parseLockedHistoryBackupArgs(argv) {
   ]) {
     if (!/^\d+$/.test(String(value))) throw new Error(`${flag} must be a non-negative integer`);
   }
-  resolveObservationsTimeseriesLatestPath(args.historyIndexVersion);
   return Object.freeze(args);
 }
 
@@ -124,7 +120,7 @@ export function runLockedHistoryBackup({
     "--runs-prefix", args.runsPrefix,
     "--core-prefix", args.corePrefix,
     "--timeseries-binding-prefix", args.timeseriesBindingPrefix,
-    "--history-index-version", args.historyIndexVersion,
+    "--latest-timeseries-key", args.latestTimeseriesKey,
     "--inventory-root-prefix", args.inventoryRootPrefix,
     "--report-out", args.inventoryReportOut,
   ], { env, run });

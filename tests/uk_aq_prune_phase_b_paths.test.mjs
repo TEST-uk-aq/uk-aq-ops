@@ -17,11 +17,9 @@ import {
   resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
   runCandidateAqilevelsStageForTest,
-  shouldResetManifestlessV2ResumeForTest,
   summarizeFrozenObservationSourceForAqi,
   updateFinalizedHistoryIndexesForTest,
   validateAqilevelDataDebugConnectorManifests,
-  writeCommittedV2PartAndCheckpointForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
   normalizeObservationPropertyCode,
@@ -31,10 +29,75 @@ import { computePruneConnectorSourceIdentity } from "../workers/shared/uk_aq_pru
 
 const DAY = "2026-06-14";
 const RUN_ID = "test-run";
+const PHASE_B_SOURCE = readFileSync(
+  "workers/uk_aq_prune_daily/phase_b_history_r2.mjs",
+  "utf8",
+);
+
+function sourceSection(startMarker, endMarker) {
+  const start = PHASE_B_SOURCE.indexOf(startMarker);
+  const end = PHASE_B_SOURCE.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
+  assert.notEqual(end, -1, `missing source marker: ${endMarker}`);
+  return PHASE_B_SOURCE.slice(start, end);
+}
 
 function runManifestKey(prefix, runId = RUN_ID) {
   return `${prefix}/run_id=${runId}/run_manifest.json`;
 }
+
+test("active v3 connector verification cannot invoke the legacy v2 observation index writer", () => {
+  const activeCandidateLoop = sourceSection(
+    "export async function runPhaseBBackup(",
+    "async function updateFinalizedHistoryIndexes(",
+  );
+  const candidateExport = sourceSection(
+    "async function exportCandidateObservationsToR2(",
+    "async function exportCandidateAqiFromFrozenSource(",
+  );
+  const frozenWriter = sourceSection(
+    "async function writeFrozenCandidateObservationsToV3(",
+    "export async function writeFrozenCandidateObservationsToV3ForTest(",
+  );
+  const connectorVerification = sourceSection(
+    "export async function verifyObservationConnectorHistory(",
+    "function createPruneComparisonManifest(",
+  );
+
+  assert.match(activeCandidateLoop, /exportCandidateToR2\(/);
+  assert.match(candidateExport, /writeFrozenCandidateObservationsToV3\(/);
+  assert.match(
+    frozenWriter,
+    /connectorPublisher\s*=\s*runOperationalPruneDailyObservationHistoryV3ConnectorPublication/,
+  );
+  assert.match(frozenWriter, /const connectorPublication = await connectorPublisher\(\{/);
+  assert.match(
+    PHASE_B_SOURCE,
+    /runFinalizer\s*=\s*runOperationalPruneDailyObservationHistoryV3RunFinalization/,
+  );
+  assert.match(activeCandidateLoop, /verifyObservationConnectorHistory\(/);
+  assert.doesNotMatch(connectorVerification, /updateR2HistoryIndexesTargeted\(/);
+  assert.doesNotMatch(connectorVerification, /domains:\s*\["observations"\]/);
+  assert.doesNotMatch(connectorVerification, /writeR2:\s*true/);
+});
+
+test("active normal Phase B has no reachable retired AQI R2 branch", () => {
+  const activeCandidateLoop = sourceSection(
+    "export async function runPhaseBBackup(",
+    "async function updateFinalizedHistoryIndexes(",
+  );
+  const runtime = resolvePhaseBRuntimeConfig({
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+    UK_AQ_R2_HISTORY_INDEX_VERSION: "v3",
+  });
+
+  assert.doesNotMatch(activeCandidateLoop, /runCandidateAqilevelsStage\(/);
+  assert.doesNotMatch(activeCandidateLoop, /updateFinalizedHistoryIndexes\(/);
+  assert.equal(
+    Object.hasOwn(runtime, "phase_b_calculate_aqi_from_observations_enabled"),
+    false,
+  );
+});
 
 test("Phase B v2 observations use canonical all-property scope", () => {
   const resolved = resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2" });
@@ -365,6 +428,15 @@ test("Phase B deploy workflow and env catalogs retire the observations history a
   assert.doesNotMatch(workflow, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.doesNotMatch(targets, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.equal(master.includes("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES"), false);
+  assert.match(
+    workflow,
+    /UK_AQ_R2_HISTORY_INDEX_VERSION: \$\{\{ vars\.UK_AQ_R2_HISTORY_INDEX_VERSION \|\| '' \}\}/,
+  );
+  assert.match(workflow, /UK_AQ_R2_HISTORY_INDEX_VERSION.*must be exactly v3/);
+  assert.doesNotMatch(
+    workflow,
+    /UK_AQ_R2_HISTORY_INDEX_VERSION[^\n]*\|\| 'v[23]'/,
+  );
 });
 
 test("Prune Daily timeout hierarchy matches the 30-minute runtime contract", () => {
@@ -385,22 +457,6 @@ test("Prune Daily timeout hierarchy matches the 30-minute runtime contract", () 
     UK_AQ_R2_HISTORY_VERSION: "v2",
     DATABASE_URL: "postgresql://retired-fallback.invalid/db",
   }).supabase_db_url, "");
-});
-
-test("Phase B resets a stale v2 checkpoint when cleanup already removed all partial objects", () => {
-  assert.equal(shouldResetManifestlessV2ResumeForTest({
-    connectorManifestExists: false,
-    existingEntryCount: 0,
-    resumePartIndex: 2,
-    resumeParts: [{ key: "missing-part.parquet" }],
-  }), true);
-
-  assert.equal(shouldResetManifestlessV2ResumeForTest({
-    connectorManifestExists: false,
-    existingEntryCount: 0,
-    resumePartIndex: 0,
-    resumeParts: [],
-  }), false);
 });
 
 test("Phase B v2 resolves AQI levels to v2 hourly data and debug prefixes", () => {
@@ -442,88 +498,6 @@ test("Phase B v2 Dropbox prune comparison covers all canonical observations", ()
   ]);
   assert.equal(query.comparison_filter_mode, "canonical_observed_properties");
   assert.equal(query.comparison_scope, "all_canonical_observations");
-});
-
-test("Phase B v2 observation checkpoints include every canonical property", async () => {
-  const committedPrefix = "history/v2/observations";
-  const written = new Map();
-  const checkpointCalls = [];
-  const logEvents = [];
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init = {}) => {
-    const key = decodeURIComponent(new URL(url).pathname.replace(/^\/bucket\//, ""));
-    if (init.method === "PUT") {
-      written.set(key, Buffer.from(await new Response(init.body).arrayBuffer()));
-      return new Response(null, { status: 200, headers: { etag: `etag-${written.size}` } });
-    }
-    if (init.method === "HEAD") {
-      return written.has(key)
-        ? new Response(null, {
-          status: 200,
-          headers: { etag: "etag-head", "content-length": String(written.get(key).byteLength) },
-        })
-        : new Response(null, { status: 404 });
-    }
-    throw new Error(`Unexpected fetch ${init.method} ${url}`);
-  };
-
-  try {
-    const result = await writeCommittedV2PartAndCheckpointForTest({
-      streamClient: {},
-      runtime: {
-        run_id: RUN_ID,
-        history_write_version: "v2",
-        committed_prefix: committedPrefix,
-        observations_pollutant_codes: ["pm10", "pm25"],
-        observations_row_group_size: 1000,
-        checkpoint_client_for_test: {
-          async query(_sql, params) {
-            checkpointCalls.push(params);
-            return { rows: [], rowCount: 1 };
-          },
-        },
-        logStructured(severity, event, fields) {
-          logEvents.push({ severity, event, fields });
-        },
-        r2: {
-          endpoint: "https://r2.example.test",
-          bucket: "bucket",
-          region: "auto",
-          access_key_id: "key",
-          secret_access_key: "secret",
-        },
-      },
-      dayUtc: DAY,
-      connectorId: 7,
-      partIndex: 0,
-      rows: [
-        { connector_id: 7, station_id: 1, timeseries_id: 101, pollutant_code: "pm10", observed_at_utc: `${DAY}T00:00:00.000Z`, value: 10 },
-        { connector_id: 7, station_id: 1, timeseries_id: 102, pollutant_code: "temperature", observed_at_utc: `${DAY}T00:00:00.000Z`, value: 18 },
-        { connector_id: 7, station_id: 1, timeseries_id: 103, pollutant_code: "pm25", observed_at_utc: `${DAY}T00:00:00.000Z`, value: 8 },
-      ],
-      committedParts: [],
-      observedRows: 0n,
-      totalBytes: 0n,
-    });
-
-    assert.equal(result.observedRows, 3n);
-    assert.equal(result.committedParts.length, 3);
-    assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "pm10", 0)), true);
-    assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "pm25", 0)), true);
-    assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "temperature", 0)), true);
-    assert.equal(checkpointCalls.length, 1);
-    assert.equal(checkpointCalls[0][6], "3");
-
-    const plan = logEvents.find((entry) => entry.event === "phase_b_history_connector_pollutant_plan");
-    assert.deepEqual(plan.fields.source_pollutant_codes, ["pm10", "pm25", "temperature"]);
-    assert.deepEqual(plan.fields.write_pollutant_codes, ["pm10", "pm25", "temperature"]);
-    assert.deepEqual(plan.fields.excluded_pollutant_codes, []);
-    assert.equal(plan.fields.row_count, 3);
-    assert.equal(plan.fields.eligible_for_history_count, 3);
-    assert.equal(plan.fields.excluded_row_count, 0);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
 });
 
 test("Phase B rejects deprecated split write version", () => {
@@ -690,11 +664,11 @@ test("Phase B v2 AQI debug manifests use debug profile and debug columns", () =>
   assert.deepEqual(pollutantManifest.columns, HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2);
 });
 
-test("Phase B resolves the internal observation-derived AQI switch to false", () => {
+test("Phase B exposes no observation-derived AQI R2 re-enable selector", () => {
   const config = resolvePhaseBRuntimeConfig({
     UK_AQ_R2_HISTORY_VERSION: "v2",
   });
-  assert.equal(config.phase_b_calculate_aqi_from_observations_enabled, false);
+  assert.equal("phase_b_calculate_aqi_from_observations_enabled" in config, false);
   assert.equal("phase_b_legacy_aqi_rpc_export_enabled" in config, false);
   assert.equal("aqilevels_source" in config, false);
 });
@@ -746,7 +720,7 @@ test("Phase B disabled candidate skips AQI context, objects and indexes without 
   assert.equal(logEvents[0].fields.reason, "aqilevels_disabled");
 });
 
-test("Phase B directly constructed enabled runtime still reaches candidate AQI work", async () => {
+test("Phase B directly constructed legacy selector cannot re-enable candidate AQI R2 work", async () => {
   const calls = {
     connectorLock: 0,
     exporter: 0,
@@ -774,18 +748,18 @@ test("Phase B directly constructed enabled runtime still reaches candidate AQI w
     },
   });
 
-  assert.deepEqual(result, { status: "complete", output_row_count: 24 });
+  assert.deepEqual(result, { status: "skipped", reason: "aqilevels_disabled" });
   assert.deepEqual(calls, {
-    connectorLock: 1,
-    exporter: 1,
-    pmContext: 1,
-    objectWrite: 1,
-    connectorIndex: 1,
+    connectorLock: 0,
+    exporter: 0,
+    pmContext: 0,
+    objectWrite: 0,
+    connectorIndex: 0,
   });
   assert.deepEqual(summary.aggregate_day_failures, []);
 });
 
-test("Phase B enabled AQI failure remains isolated from a verified observation connector gate", async () => {
+test("Phase B legacy AQI adapters are unreachable from the retired candidate stage", async () => {
   let connectorGateComplete = true;
   let connectorGateMutationCalls = 0;
   const summary = { aggregate_day_failures: [] };
@@ -807,18 +781,13 @@ test("Phase B enabled AQI failure remains isolated from a verified observation c
     },
   });
 
-  assert.deepEqual(result, { status: "failed", error: "injected AQI failure" });
+  assert.deepEqual(result, { status: "skipped", reason: "aqilevels_disabled" });
   assert.equal(connectorGateComplete, true);
   assert.equal(connectorGateMutationCalls, 0);
-  assert.deepEqual(summary.aggregate_day_failures, [{
-    day_utc: DAY,
-    connector_id: 7,
-    domain: "aqilevels",
-    error: "injected AQI failure",
-  }]);
+  assert.deepEqual(summary.aggregate_day_failures, []);
 });
 
-test("Phase B disabled day finalisation skips AQI and still completes observation day evidence", async () => {
+test("Phase B observation day finalisation has no AQI R2 completion dependency", async () => {
   let aqiFinalizerCalls = 0;
   const dayGateCalls = [];
   const result = await completeObservationDayFinalizationForTest({
@@ -850,14 +819,10 @@ test("Phase B disabled day finalisation skips AQI and still completes observatio
   assert.equal(dayGateCalls[0].fileCount, 2);
   assert.equal(dayGateCalls[0].totalBytes, 300n);
   assert.equal(result.history_done, true);
-  assert.deepEqual(result.aqi_day_manifest, {
-    required: false,
-    skipped: true,
-    reason: "aqilevels_disabled",
-  });
+  assert.equal(Object.hasOwn(result, "aqi_day_manifest"), false);
 });
 
-test("Phase B directly constructed enabled runtime still reaches AQI day finalisation", async () => {
+test("Phase B directly constructed legacy selector cannot re-enable AQI day finalisation", async () => {
   let aqiFinalizerCalls = 0;
   let dayGateCalls = 0;
   const result = await completeObservationDayFinalizationForTest({
@@ -884,16 +849,13 @@ test("Phase B directly constructed enabled runtime still reaches AQI day finalis
     },
   });
 
-  assert.equal(aqiFinalizerCalls, 1);
+  assert.equal(aqiFinalizerCalls, 0);
   assert.equal(dayGateCalls, 1);
   assert.equal(result.history_done, true);
-  assert.deepEqual(result.aqi_day_manifest, {
-    required: true,
-    data_day_manifest_key: "aqi-data-day",
-  });
+  assert.equal(Object.hasOwn(result, "aqi_day_manifest"), false);
 });
 
-test("Phase B disabled global finalisation updates only observation indexes", async () => {
+test("Phase B retired global finalisation cannot update observation or AQI indexes", async () => {
   const calls = [];
   await updateFinalizedHistoryIndexesForTest({
     runtime: {
@@ -907,10 +869,7 @@ test("Phase B disabled global finalisation updates only observation indexes", as
       return { ok: true };
     },
   });
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].domains, ["observations"]);
-  assert.equal(Object.hasOwn(calls[0].env, "UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX"), false);
-  assert.equal(Object.hasOwn(calls[0].env, "UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX"), false);
+  assert.equal(calls.length, 0);
 
   await updateFinalizedHistoryIndexesForTest({
     runtime: {
@@ -924,18 +883,16 @@ test("Phase B disabled global finalisation updates only observation indexes", as
       return { ok: true };
     },
   });
-  assert.deepEqual(calls[1].domains, ["observations", "aqilevels"]);
-  assert.equal(Object.hasOwn(calls[1].env, "UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX"), true);
-  assert.equal(Object.hasOwn(calls[1].env, "UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX"), true);
+  assert.equal(calls.length, 0);
 });
 
 test("Phase B run summaries distinguish AQI disablement from budget exhaustion", () => {
   assert.deepEqual(buildPhaseBAqilevelsSummaryForTest({
-    runtime: { phase_b_calculate_aqi_from_observations_enabled: false },
+    runtime: {},
     summary: { status: "completed" },
   }), { skipped: true, reason: "aqilevels_disabled" });
   assert.deepEqual(buildPhaseBAqilevelsSummaryForTest({
-    runtime: { phase_b_calculate_aqi_from_observations_enabled: false },
+    runtime: {},
     summary: { status: "stopped_budget" },
   }), { skipped: true, reason: "phase_b_history_budget_exhausted" });
 });
@@ -949,6 +906,23 @@ test("Phase B observation-only mode adds no environment selector or fallback AQI
     assert.doesNotMatch(content, /UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/);
     assert.doesNotMatch(content, /runAqilevelsBackup/);
   }
+  assert.match(
+    implementation,
+    /connectorPublisher\s*=\s*runOperationalPruneDailyObservationHistoryV3ConnectorPublication/,
+  );
+  assert.match(implementation, /const connectorPublication = await connectorPublisher\(\{/);
+  assert.match(
+    implementation,
+    /runFinalizer\s*=\s*runOperationalPruneDailyObservationHistoryV3RunFinalization/,
+  );
+  assert.match(
+    implementation,
+    /resolveObservationHistoryIndexV3BuildConfig\(/,
+  );
+  assert.doesNotMatch(
+    sourceSection("async function updateFinalizedHistoryIndexes(", "export async function updateFinalizedHistoryIndexesForTest("),
+    /domains:\s*\["aqilevels"\]/,
+  );
 });
 
 import {
