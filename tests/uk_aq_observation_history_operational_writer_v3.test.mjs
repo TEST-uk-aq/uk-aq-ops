@@ -7,6 +7,7 @@ import {
   createObservationHistoryV3CanonicalAggregatePublisher,
   createObservationHistoryV3CanonicalDayPublisher,
   runDisconnectedPruneDailyObservationHistoryV3Writer,
+  runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
 } from "../workers/shared/uk_aq_observation_history_operational_writer_v3.mjs";
 import {
   buildObservationHistoryV3SteadyStatePartition,
@@ -228,6 +229,64 @@ test("connector publisher rereads and preserves unchanged pollutant union", asyn
       }],
     }),
     /SOS complete-day replacement found live connector state after deletion/,
+  );
+});
+
+test("operational writer accepts an R2 404 for a brand-new connector-day manifest", async () => {
+  const connectorKey = buildHistoryV2ConnectorManifestKey(
+    "history/v2/observations",
+    DAY_UTC,
+    1,
+  );
+  const objects = new Map();
+  const events = [];
+  const result = await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
+    env: { UK_AQ_R2_HISTORY_INDEX_VERSION: "v3" },
+    client: { query: async () => ({ rows: [] }) },
+    r2: { bucket: "test" },
+    partitions: [{ rows: rows("pm25", 101) }],
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+    getObject: async ({ key }) => {
+      events.push(`get:${key}`);
+      if (key === connectorKey && !objects.has(key)) {
+        const error = new Error(
+          `R2 GET failed (404)\nkey=${key}\nCode=NoSuchKey`,
+        );
+        error.status = 404;
+        error.code = "NoSuchKey";
+        throw error;
+      }
+      return objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false };
+    },
+    putIfChanged: async ({ key, body }) => {
+      events.push(`put:${key}`);
+      objects.set(key, Buffer.from(body));
+      return { ok: true, status: "written" };
+    },
+    recordDurableEvidence: async () => ({ durable: true }),
+    putAndVerifyParquet: async ({ intent }) => ({
+      key: intent.key,
+      byte_size: intent.byte_size,
+      sha256: intent.sha256,
+    }),
+    withConnectorDayLock: async (_options, callback) => await callback(),
+  });
+
+  assert.equal(result.connector_publication_complete, true);
+  assert.deepEqual(
+    result.connector_results[0].canonical.current_pollutant_codes,
+    [],
+  );
+  assert.deepEqual(
+    result.connector_results[0].canonical.final_pollutant_codes,
+    ["pm25"],
+  );
+  assert.ok(objects.has(connectorKey));
+  assert.ok(
+    events.indexOf(`get:${connectorKey}`) < events.indexOf(`put:${connectorKey}`),
   );
 });
 

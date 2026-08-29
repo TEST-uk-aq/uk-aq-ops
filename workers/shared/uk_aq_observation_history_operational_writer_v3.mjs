@@ -168,8 +168,8 @@ async function readCurrentPollutantManifests({
     dayUtc,
     connectorId,
   );
-  const current = await getObject({ key: connectorKey });
-  if (!current || current.exists === false) {
+  const current = await getOptionalObject(getObject, connectorKey);
+  if (!current) {
     return Object.freeze({ connector_manifest: null, pollutant_manifests: [] });
   }
   const connectorManifest = parseCanonicalManifest({
