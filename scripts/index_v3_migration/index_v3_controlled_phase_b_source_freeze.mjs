@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { Client } from "pg";
@@ -31,6 +32,36 @@ export function parseControlledPhaseBSourceFreezeArgs(argv = process.argv.slice(
   });
 }
 
+function childOptionValue(commandArgs, flag) {
+  const index = commandArgs.lastIndexOf(flag);
+  if (index < 0 || index >= commandArgs.length - 1) return null;
+  const value = String(commandArgs[index + 1] || "").trim();
+  return value || null;
+}
+
+function appendSourceFreezeEvidence(reportPath, evidence, { required } = { required: false }) {
+  if (!reportPath) {
+    if (required) fail("Controlled Phase B child did not expose --report-out for source-freeze evidence");
+    return false;
+  }
+  if (!fs.existsSync(reportPath)) {
+    if (required) fail(`Controlled Phase B evidence report is missing after successful child: ${reportPath}`);
+    return false;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+  } catch (error) {
+    fail(`Controlled Phase B evidence report could not be read for source-freeze evidence: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    fail("Controlled Phase B evidence report is not a JSON object");
+  }
+  payload.source_write_freeze = evidence;
+  fs.writeFileSync(reportPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  return true;
+}
+
 async function defaultRunChild({ command, commandArgs, env }) {
   return await new Promise((resolve, reject) => {
     const child = spawn(command, commandArgs, {
@@ -58,6 +89,7 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
   lockTimeoutMs = 60_000,
   createClient = (config) => new Client(config),
   runChild = defaultRunChild,
+  appendEvidence = appendSourceFreezeEvidence,
 } = {}) {
   const connectionString = String(databaseUrl || "").trim();
   if (!connectionString) {
@@ -79,6 +111,8 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
   });
 
   let transactionOpen = false;
+  const acquiredAtUtc = new Date().toISOString();
+  let lockAcquiredAtUtc = null;
   await client.connect();
   try {
     await client.query("begin");
@@ -87,11 +121,13 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
     await client.query(
       `lock table ${CONTROLLED_PHASE_B_SOURCE_TABLES.join(", ")} in share mode`,
     );
+    lockAcquiredAtUtc = new Date().toISOString();
 
     process.stderr.write(`${JSON.stringify({
       event: "controlled_phase_b_source_write_freeze_acquired",
       lock_mode: "SHARE",
       tables: CONTROLLED_PHASE_B_SOURCE_TABLES,
+      acquired_at_utc: lockAcquiredAtUtc,
     })}\n`);
 
     const childCode = await runChild({
@@ -105,10 +141,29 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
 
     await client.query("rollback");
     transactionOpen = false;
+    const releasedAtUtc = new Date().toISOString();
+
+    const freezeEvidence = {
+      held_during_controlled_child: true,
+      lock_mode: "SHARE",
+      tables: CONTROLLED_PHASE_B_SOURCE_TABLES,
+      coordinator_started_at_utc: acquiredAtUtc,
+      acquired_at_utc: lockAcquiredAtUtc,
+      released_at_utc: releasedAtUtc,
+      child_exit_code: childCode,
+      persistent_database_mutation: false,
+    };
+
+    appendEvidence(
+      childOptionValue(commandArgs, "--report-out"),
+      freezeEvidence,
+      { required: childCode === 0 },
+    );
 
     process.stderr.write(`${JSON.stringify({
       event: "controlled_phase_b_source_write_freeze_released",
       child_exit_code: childCode,
+      released_at_utc: releasedAtUtc,
     })}\n`);
 
     return childCode;
