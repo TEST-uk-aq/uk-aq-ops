@@ -132,6 +132,24 @@ current_verify_dependencies_are_trusted() {
   git -C "$repository" diff --quiet HEAD -- "${VERIFY_CURRENT_TRUSTED_DEPENDENCIES[@]}"
 }
 
+validate_read_only_dependency_authority() {
+  local repository="$1" target_writer_git_sha="$2" drift
+  printf '%s' "$target_writer_git_sha" | grep -Eq '^[0-9a-f]{40}$' \
+    || stop "pinned target writer Git SHA is malformed"
+  git -C "$repository" cat-file -e "${target_writer_git_sha}^{commit}" 2>/dev/null \
+    || stop "pinned target writer commit is unavailable"
+  git -C "$repository" merge-base --is-ancestor \
+    "$target_writer_git_sha" "$(git -C "$repository" rev-parse HEAD)" \
+    || stop "pinned target writer commit is not an ancestor of current HEAD"
+  current_verify_dependencies_are_trusted "$repository" \
+    || stop "current read-only verification dependency set is not exact, tracked current HEAD"
+  drift="$(git -C "$repository" diff --name-only \
+    "$target_writer_git_sha" HEAD -- \
+    "${VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES[@]}")"
+  [ -z "$drift" ] \
+    || stop "migration/recovery implementation differs from the pinned target writer commit"
+}
+
 self_test() {
   local output status drift_repo base_commit unrelated_commit critical_commit critical_path mutation_mode
   set +e
@@ -190,6 +208,15 @@ case "${1:-}" in
   --self-test) self_test; exit 0 ;;
   --_self-test-auth)
     require_authorization UK_AQ_INDEX_V3_MIGRATION_AUTH SELF_TEST_AUTH
+    exit 0
+    ;;
+  --verify-dependency-authority)
+    [ "$#" -eq 2 ] || stop "--verify-dependency-authority requires one target writer Git SHA"
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)" \
+      || stop "repository root cannot be derived from Git"
+    validate_read_only_dependency_authority "$REPO_ROOT" "$2"
+    printf 'PASS: current verifier dependencies and pinned historical semantics are exact.\n'
     exit 0
     ;;
 esac
@@ -328,22 +355,20 @@ load_authority() {
     || stop "plan report does not match operator authority"
   [ "$(jq -r '.result.migration_run_id // empty' "$PLAN_REPORT")" = "$MIGRATION_RUN_ID" ] \
     || stop "plan report migration run ID does not match operator authority"
-  printf '%s' "$TARGET_WRITER_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' \
-    || stop "pinned target writer Git SHA is malformed"
   for identity in "$PLAN_SHA" "$INVENTORY_SHA" "$STATE_SHA"; do
     printf '%s' "$identity" | grep -Eq '^[0-9a-f]{64}$' \
       || stop "operator authority contains a malformed SHA-256 identity"
   done
-  git cat-file -e "${TARGET_WRITER_GIT_SHA}^{commit}" 2>/dev/null \
-    || stop "pinned target writer commit is unavailable"
-  git merge-base --is-ancestor "$TARGET_WRITER_GIT_SHA" "$(git rev-parse HEAD)" \
-    || stop "pinned target writer commit is not an ancestor of current HEAD"
   if [ "$MODE" = "verify" ]; then
-    current_verify_dependencies_are_trusted "$REPO_ROOT" \
-      || stop "current read-only verification dependency set is not exact, tracked current HEAD"
-    LOAD_AUTHORITY_DRIFT="$(git diff --name-only "$TARGET_WRITER_GIT_SHA" HEAD -- \
-      "${VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES[@]}")"
+    validate_read_only_dependency_authority "$REPO_ROOT" "$TARGET_WRITER_GIT_SHA"
+    LOAD_AUTHORITY_DRIFT=""
   else
+    printf '%s' "$TARGET_WRITER_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+      || stop "pinned target writer Git SHA is malformed"
+    git cat-file -e "${TARGET_WRITER_GIT_SHA}^{commit}" 2>/dev/null \
+      || stop "pinned target writer commit is unavailable"
+    git merge-base --is-ancestor "$TARGET_WRITER_GIT_SHA" "$(git rev-parse HEAD)" \
+      || stop "pinned target writer commit is not an ancestor of current HEAD"
     LOAD_AUTHORITY_DRIFT="$(git diff --name-only "$TARGET_WRITER_GIT_SHA" HEAD -- \
       "${MUTATION_IMPLEMENTATION_SCOPES[@]}")"
   fi

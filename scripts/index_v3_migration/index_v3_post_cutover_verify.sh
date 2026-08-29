@@ -361,6 +361,10 @@ printf '%s\n' '--- B. EXACT V3 DEPENDENCY / GENERATION VERIFICATION ---'
 DEPENDENCY_WRITER_LIMITS="$TMP_DIR/writer_limits.json"
 DEPENDENCY_VERIFY_REPORT="$TMP_DIR/current_dependency_verify.json"
 jq '.result.target.writer_limits' "$PLAN_REPORT" > "$DEPENDENCY_WRITER_LIMITS"
+MIGRATION_WRAPPER="$SCRIPT_DIR/index_v3_migration.sh"
+[ -x "$MIGRATION_WRAPPER" ] || fail "migration dependency-authority wrapper is missing or not executable"
+"$MIGRATION_WRAPPER" --verify-dependency-authority "$TARGET_WRITER_GIT_SHA" >/dev/null \
+  || fail "current verifier or pinned historical semantic dependency authority is invalid"
 if ! UK_AQ_ENV_NAME="$ENVIRONMENT" node --max-old-space-size=4096 \
   scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs \
   --mode verify \

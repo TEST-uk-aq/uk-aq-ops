@@ -40,8 +40,6 @@ import {
 } from "../shared/uk_aq_observation_history_schema.mjs";
 import {
   resolveObservationHistoryIndexV3BuildConfig,
-} from "../shared/uk_aq_observation_history_index_v3.mjs";
-import {
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
 } from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";

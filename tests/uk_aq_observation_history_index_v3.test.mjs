@@ -12,7 +12,6 @@ import {
   buildObservationHistoryIndexV3ScopedManifest,
   encodeObservationHistoryIndexV3Json,
   finalizeObservationHistoryIndexV3Publication,
-  resolveObservationHistoryIndexV3BuildConfig,
   updateObservationHistoryIndexV3Latest,
   updateObservationHistoryIndexV3ScopedManifest,
   validateObservationHistoryIndexV3ChildShardArtifact,
@@ -20,6 +19,9 @@ import {
   validateObservationHistoryIndexV3ScopedManifestArtifact,
   validateObservationHistoryTargetMetadataForV3,
 } from "../workers/shared/uk_aq_observation_history_index_v3.mjs";
+import {
+  resolveObservationHistoryIndexV3BuildConfig,
+} from "../workers/shared/uk_aq_observation_history_operational_writer_v3.mjs";
 
 const limits = Object.freeze({
   target_row_group_rows: 4,
@@ -292,6 +294,20 @@ test("v3 hierarchy is byte-stable and preserves cross-shard files and continuati
   assert.equal(latest.body, latestReordered.body);
   assert.equal(latest.payload.day_count, 2);
   assert.deepEqual(latest.payload.days, ["2026-01-02", "2026-01-03"]);
+  assert.deepEqual({
+    child_shards: first.child_shards.map((artifact) => artifact.sha256),
+    scoped_manifest: first.scoped_manifest.sha256,
+    latest_global: latest.sha256,
+  }, {
+    // Known deterministic identities from migration target
+    // b8858d95c42ff52558cb0fa59413162d6bc12afa.
+    child_shards: [
+      "b96c6742623c405b5b2c1f69268200cbfa4af913c37924c4ec40834923d8a1c7",
+      "d908a82f1a4406ea566898f5ad192fd81562cd8f274d3c0b79a98a68a1209fcd",
+    ],
+    scoped_manifest: "b787a9dda7aa8d1ce42ea2551c527a8a4c3841fd817987ccae650927b911aa40",
+    latest_global: "6dff013a057f29ad0fe3ecec1a9b99e555be860b1939ee324bbd4f6157328be6",
+  });
 });
 
 test("v3 builders fail closed on file identity, overlap, shard and coverage conflicts", () => {
@@ -854,7 +870,7 @@ test("observation-only v3 resolver rejects every unsupported generation", () => 
     }).index_generation,
     "v3",
   );
-  for (const generation of ["", "v1", "v2", "v4", "V3", " v3", "v3 "]) {
+  for (const generation of ["", "v1", "v2", "v4", "V3", " v3", "v3 ", " v3 ", "v3\n"]) {
     assert.throws(
       () => resolveObservationHistoryIndexV3BuildConfig({
         env: { UK_AQ_R2_HISTORY_INDEX_VERSION: generation },

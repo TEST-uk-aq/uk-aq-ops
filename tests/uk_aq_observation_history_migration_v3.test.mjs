@@ -724,6 +724,7 @@ function authenticatedRecoveryAuthority(checkpoint) {
     plan_sha256: checkpoint.plan_sha256,
     last_sequence: 1,
     last_entry_sha256: "d".repeat(64),
+    replayed_checkpoint_sha256: sha256Hex(stableMigrationJson(checkpoint)),
   };
 }
 
@@ -2067,9 +2068,45 @@ test("legacy recovery ordering reconciles complete dependency closure without se
   const legacyKeys = result.recovery_reconciliation.classifications
     .filter((entry) => entry.classification === "LEGACY_RECOVERY_ORDERING")
     .map((entry) => entry.key);
+  for (const key of legacyKeys) {
+    const evidence = legacy.checkpoint.completed_objects[key];
+    assert.ok(
+      legacy.verificationPlan.recovery_reconciliation
+        .legacy_allowed_identities[key]
+        .some((identity) =>
+          identity.byte_size === evidence.byte_size &&
+          identity.sha256 === evidence.sha256
+        ),
+      `journal evidence is not an exact explicitly reconstructed historical identity: ${key}`,
+    );
+  }
   assert.ok(legacyKeys.some((key) => key.includes("/connector_id=")));
   assert.ok(legacyKeys.some((key) => key.includes("/_manifests/")));
   assert.ok(legacyKeys.some((key) => key.includes("/_index_v3/")));
+});
+
+test("legacy recovery ordering rejects an arbitrary valid same-size completed JSON SHA", async () => {
+  const legacy = await buildLegacyRecoveryOrderingFixture();
+  const key = legacy.verificationPlan.canonical_publication_objects.find(
+    (entry) => entry.publication_stage === "connector_manifest",
+  ).key;
+  const arbitrarySha = "e".repeat(64);
+  assert.notEqual(
+    arbitrarySha,
+    legacy.verificationPlan.canonical_publication_objects.find(
+      (entry) => entry.key === key,
+    ).sha256,
+  );
+  legacy.checkpoint.completed_objects[key].sha256 = arbitrarySha;
+
+  assert.throws(
+    () => buildObservationHistoryV3RerunVerificationPlan({
+      checkpoint: legacy.checkpoint,
+      allowLegacyRecoveryOrdering: true,
+      recoveryAuthority: authenticatedRecoveryAuthority(legacy.checkpoint),
+    }),
+    new RegExp(`recovery_evidence_invalid:.*${key}`),
+  );
 });
 
 test("legacy recovery ordering requires authenticated recovery authority", async () => {

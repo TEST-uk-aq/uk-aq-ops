@@ -494,6 +494,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
       plan_sha256: manifest.payload.plan_sha256,
       last_sequence: replay.sequence,
       last_entry_sha256: replay.entrySha256,
+      replayed_checkpoint_sha256: sha256Hex(stableMigrationJson(recoveredCheckpoint)),
     }),
   };
   context.persistCheckpoint = async (current) => {

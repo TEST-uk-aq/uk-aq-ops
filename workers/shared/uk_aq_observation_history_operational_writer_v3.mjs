@@ -2,7 +2,10 @@
 import { Buffer } from "node:buffer";
 
 import {
-  resolveObservationHistoryIndexV3BuildConfig,
+  DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
+  DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+  OBSERVATION_HISTORY_INDEX_GENERATION_V3,
+  OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3,
 } from "./uk_aq_observation_history_index_v3.mjs";
 import {
   DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
@@ -35,6 +38,28 @@ import {
   ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
   assertAcceptedObservationHistoryWriterLimitsV3,
 } from "./uk_aq_observation_history_writer_limits_v3.mjs";
+
+export function resolveObservationHistoryIndexV3BuildConfig({
+  env = typeof process !== "undefined" ? process.env : {},
+  requestedIndexGeneration = null,
+} = {}) {
+  const generation = String(
+    requestedIndexGeneration ?? env?.UK_AQ_R2_HISTORY_INDEX_VERSION ?? "",
+  );
+  if (generation !== OBSERVATION_HISTORY_INDEX_GENERATION_V3) {
+    throw new Error(
+      `Unsupported observation-history index generation for v3 builder: ${generation || "unset"}`,
+    );
+  }
+  return Object.freeze({
+    domain: "observations",
+    history_version: "v2",
+    index_generation: OBSERVATION_HISTORY_INDEX_GENERATION_V3,
+    index_root: DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+    latest_key: DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
+    shard_width: OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3,
+  });
+}
 
 function bytewiseCompare(left, right) {
   return Buffer.compare(Buffer.from(String(left)), Buffer.from(String(right)));

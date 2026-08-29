@@ -142,12 +142,26 @@ test("operator verification authenticates exact current dependencies under v2 or
   assert.match(migrationWrapper, /VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES=\(/);
   assert.match(migrationWrapper, /workers\/shared\/uk_aq_observation_history_index_v3\.mjs/);
   assert.match(migrationWrapper, /current_verify_dependencies_are_trusted/);
+  assert.match(migrationWrapper, /validate_read_only_dependency_authority/);
   assert.match(migrationWrapper, /verify mode does not accept --apply/);
   assert.match(migrationWrapper, /MUTATION_IMPLEMENTATION_SCOPES=\([\s\S]*scripts\/backup_r2/);
-  assert.doesNotMatch(
-    migrationWrapper.match(/LOAD_AUTHORITY_DRIFT="\$\(git diff[\s\S]*?\n  else/)[0],
-    /scripts\/backup_r2 scripts\/operations/,
+  const gateCall = postCutoverVerify.indexOf(
+    '"$MIGRATION_WRAPPER" --verify-dependency-authority "$TARGET_WRITER_GIT_SHA"',
   );
+  const directVerifier = postCutoverVerify.indexOf(
+    "scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs",
+  );
+  assert.ok(gateCall >= 0, "post-cutover verifier does not invoke the shared dependency gate");
+  assert.ok(directVerifier > gateCall, "migration verifier can run before dependency authority validation");
+  assert.match(
+    migrationWrapper,
+    /if \[ "\$MODE" = "verify" \]; then\n\s+validate_read_only_dependency_authority "\$REPO_ROOT" "\$TARGET_WRITER_GIT_SHA"/,
+  );
+  const verifyAuthorityBranch = migrationWrapper.match(
+    /if \[ "\$MODE" = "verify" \]; then[\s\S]*?\n  else/,
+  );
+  assert.ok(verifyAuthorityBranch);
+  assert.doesNotMatch(verifyAuthorityBranch[0], /MUTATION_IMPLEMENTATION_SCOPES/);
 });
 
 test("read-only verify dependency classes match actual migration-to-HEAD history", () => {
@@ -173,10 +187,10 @@ test("read-only verify dependency classes match actual migration-to-HEAD history
   );
   assert.equal(
     gitStatus(repositoryRoot, [
-      "diff", "--quiet", migrationTargetGitSha, currentHead, "--", ...historicalSemantic,
+      "diff", "--quiet", migrationTargetGitSha, "--", ...historicalSemantic,
     ]).status,
     0,
-    "historically pinned semantic dependencies drifted after migration",
+    "prospective historically pinned semantic dependencies drift from the migration target",
   );
   for (const operationalDependency of [
     "workers/shared/r2_sigv4.mjs",

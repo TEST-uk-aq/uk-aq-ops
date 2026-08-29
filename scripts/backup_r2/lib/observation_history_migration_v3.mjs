@@ -2454,11 +2454,14 @@ function preparedUnitFromRecord(authorityUnit, record, {
           sha256: intent.sha256,
         })),
       });
+  const targetManifestPayload = legacyOriginalOrdering && !hasExactManifestBody
+    ? targetManifestObject.payload
+    : record.target_manifest;
   const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({
     metadata: record.target_metadata,
     canonicalManifest: canonicalManifestDescriptor(
       targetManifestObject,
-      record.target_manifest,
+      targetManifestPayload,
     ),
     indexRoot: record.v3_index_root,
   });
@@ -2468,7 +2471,7 @@ function preparedUnitFromRecord(authorityUnit, record, {
     target_file_intents: Object.freeze(
       record.target_file_intents.map((entry) => Object.freeze({ ...entry })),
     ),
-    target_manifest: record.target_manifest,
+    target_manifest: targetManifestPayload,
     target_manifest_object: targetManifestObject,
     v3_hierarchy: hierarchy,
     logical_identity_verified: true,
@@ -3142,12 +3145,25 @@ function completionEvidenceMatches(evidence, expected) {
     );
 }
 
-function legacyJsonEvidenceShapeMatches(evidence, expected) {
-  return evidence?.verified === true &&
+function historicalDependencyIdentitySets(plan) {
+  return Object.freeze(Object.fromEntries(
+    [...migrationRequiredDependencies(plan)].map(([key, entry]) => [
+      key,
+      Object.freeze([Object.freeze({
+        byte_size: entry.byte_size,
+        sha256: entry.sha256,
+      })]),
+    ]),
+  ));
+}
+
+function completedEvidenceMatchesAllowedHistoricalIdentity(evidence, allowed) {
+  return Array.isArray(allowed) && allowed.some((identity) =>
+    evidence?.verified === true &&
     evidence?.durable === true &&
-    evidence.byte_size === expected.byte_size &&
-    SHA256_PATTERN.test(String(evidence.sha256 || "")) &&
-    evidence.sha256 !== expected.sha256;
+    evidence.byte_size === identity.byte_size &&
+    evidence.sha256 === identity.sha256
+  );
 }
 
 export async function verifyObservationHistoryV3CurrentDependencies({
@@ -3166,9 +3182,7 @@ export async function verifyObservationHistoryV3CurrentDependencies({
   const recovery = plan.recovery_reconciliation || null;
   if (!checkpoint || !recovery) return base;
   const expectedByKey = migrationRequiredDependencies(plan);
-  const legacyByKey = recovery.legacy_plan
-    ? migrationRequiredDependencies(recovery.legacy_plan)
-    : new Map();
+  const legacyAllowedByKey = recovery.legacy_allowed_identities || {};
   const classifications = [];
   const blockers = [...base.blockers];
   for (const [key, expected] of expectedByKey) {
@@ -3179,13 +3193,12 @@ export async function verifyObservationHistoryV3CurrentDependencies({
       classification = "EXACT";
       reason = null;
     } else {
-      const legacyExpected = legacyByKey.get(key);
       if (
         recovery.mode === "LEGACY_RECOVERY_ORDERING" &&
         !key.endsWith(".parquet") &&
-        (
-          (legacyExpected && completionEvidenceMatches(evidence, legacyExpected)) ||
-          legacyJsonEvidenceShapeMatches(evidence, expected)
+        completedEvidenceMatchesAllowedHistoricalIdentity(
+          evidence,
+          legacyAllowedByKey[key],
         )
       ) {
         classification = "LEGACY_RECOVERY_ORDERING";
@@ -3271,6 +3284,8 @@ export function buildObservationHistoryV3RerunVerificationPlan({
     recoveryAuthority.immutable_authority_sha256 === checkpoint?.authority_sha256 &&
     recoveryAuthority.migration_run_id === checkpoint?.migration_run_id &&
     recoveryAuthority.plan_sha256 === checkpoint?.plan_sha256 &&
+    recoveryAuthority.replayed_checkpoint_sha256 ===
+      sha256Hex(stableMigrationJson(checkpoint)) &&
     Number.isSafeInteger(recoveryAuthority.last_sequence) &&
     recoveryAuthority.last_sequence > 0 &&
     SHA256_PATTERN.test(String(recoveryAuthority.original_checkpoint_sha256 || "")) &&
@@ -3317,18 +3332,17 @@ export function buildObservationHistoryV3RerunVerificationPlan({
     throw new Error("Current plan does not match the pinned migration authority");
   }
   const requiredDependencies = migrationRequiredDependencies(pinnedPlan);
-  const legacyDependencies = legacyPlan
-    ? migrationRequiredDependencies(legacyPlan)
-    : new Map();
+  const legacyAllowedIdentities = legacyPlan
+    ? historicalDependencyIdentitySets(legacyPlan)
+    : Object.freeze({});
   const legacyOrderingSeedVerified = hasLegacyPreparedRecords && pinnedPlan.units.some((unit) => {
     const key = unit.target_manifest_object.key;
     const currentEntry = requiredDependencies.get(key);
-    const legacyEntry = legacyDependencies.get(key);
+    const legacyIdentities = legacyAllowedIdentities[key];
     const completed = checkpoint.completed_objects?.[key];
     return currentEntry &&
-      legacyEntry &&
-      currentEntry.sha256 !== legacyEntry.sha256 &&
-      completionEvidenceMatches(completed, legacyEntry);
+      legacyIdentities?.some((identity) => identity.sha256 !== currentEntry.sha256) &&
+      completedEvidenceMatchesAllowedHistoricalIdentity(completed, legacyIdentities);
   });
   if (hasLegacyPreparedRecords && !legacyOrderingSeedVerified) {
     throw new Error(
@@ -3337,16 +3351,15 @@ export function buildObservationHistoryV3RerunVerificationPlan({
   }
   for (const [key, entry] of requiredDependencies) {
     const completed = checkpoint.completed_objects?.[entry.key];
-    const legacyEntry = legacyDependencies.get(key);
     const legacyMatch = legacyOrderingSeedVerified &&
       !key.endsWith(".parquet") &&
-      (
-        (legacyEntry && completionEvidenceMatches(completed, legacyEntry)) ||
-        legacyJsonEvidenceShapeMatches(completed, entry)
+      completedEvidenceMatchesAllowedHistoricalIdentity(
+        completed,
+        legacyAllowedIdentities[key],
       );
     if (!completionEvidenceMatches(completed, entry) && !legacyMatch) {
       throw new Error(
-        `recovery_evidence_invalid: checkpoint lacks exact durable completed-object evidence: ${entry.key}; evidence=${JSON.stringify(completed)} current=${entry.byte_size}/${entry.sha256} legacy=${legacyEntry ? `${legacyEntry.byte_size}/${legacyEntry.sha256}` : "missing"}`,
+        `recovery_evidence_invalid: checkpoint lacks exact durable completed-object evidence: ${entry.key}; evidence=${JSON.stringify(completed)} current=${entry.byte_size}/${entry.sha256} allowed_historical=${JSON.stringify(legacyAllowedIdentities[key] || [])}`,
       );
     }
   }
@@ -3355,7 +3368,7 @@ export function buildObservationHistoryV3RerunVerificationPlan({
     blockers: Object.freeze([]),
     recovery_reconciliation: Object.freeze({
       mode: hasLegacyPreparedRecords ? "LEGACY_RECOVERY_ORDERING" : "EXACT",
-      legacy_plan: legacyPlan,
+      legacy_allowed_identities: legacyAllowedIdentities,
     }),
   });
 }
