@@ -7,6 +7,7 @@ import { Client } from "pg";
 
 export const CONTROLLED_PHASE_B_SOURCE_FREEZE_ENV =
   "UK_AQ_CONTROLLED_PHASE_B_SOURCE_WRITE_FREEZE";
+export const CONTROLLED_PHASE_B_CHILD_TIMEZONE = "UTC";
 
 export const CONTROLLED_PHASE_B_SOURCE_TABLES = Object.freeze([
   "uk_aq_core.observations",
@@ -128,6 +129,7 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
       lock_mode: "SHARE",
       tables: CONTROLLED_PHASE_B_SOURCE_TABLES,
       acquired_at_utc: lockAcquiredAtUtc,
+      child_timezone: CONTROLLED_PHASE_B_CHILD_TIMEZONE,
     })}\n`);
 
     const childCode = await runChild({
@@ -135,6 +137,7 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
       commandArgs,
       env: {
         ...env,
+        TZ: CONTROLLED_PHASE_B_CHILD_TIMEZONE,
         [CONTROLLED_PHASE_B_SOURCE_FREEZE_ENV]: "held",
       },
     });
@@ -151,6 +154,7 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
       acquired_at_utc: lockAcquiredAtUtc,
       released_at_utc: releasedAtUtc,
       child_exit_code: childCode,
+      child_timezone: CONTROLLED_PHASE_B_CHILD_TIMEZONE,
       persistent_database_mutation: false,
     };
 
@@ -165,6 +169,7 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
       event: "controlled_phase_b_source_write_freeze_released",
       child_exit_code: childCode,
       released_at_utc: releasedAtUtc,
+      child_timezone: CONTROLLED_PHASE_B_CHILD_TIMEZONE,
     })}\n`);
 
     return childCode;
