@@ -23,6 +23,8 @@ The dry-run prints the candidate day, connector, row count, exact source-content
 
 The source-table lock is held only for the controlled apply child. It prevents source observations or their canonical metadata from changing while the acceptance runner re-derives and verifies the pinned source-content identity and while `runPhaseBBackup()` acquires its repeatable-read frozen source and publishes/finalises the selected connector-day. Normal upstream ingest may wait briefly on this lock during the acceptance operation. The lock transaction performs no persistent database mutation and is rolled back solely to release the locks when the child finishes or fails.
 
+The source-freeze coordinator starts the controlled Phase B child with `TZ=UTC`. This is a required acceptance invariant so PostgreSQL `DATE` values have the same calendar-day semantics on an operator Mac in BST as they do in the normal GitHub Actions runtime. The UTC child timezone is included in the source-freeze evidence report.
+
 The controlled runner invokes only `runPhaseBBackup()` with:
 
 - `max_candidates_per_run=1`;
