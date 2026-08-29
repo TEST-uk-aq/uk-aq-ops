@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CONTROLLED_PHASE_B_CHILD_TIMEZONE,
   CONTROLLED_PHASE_B_SOURCE_FREEZE_ENV,
   CONTROLLED_PHASE_B_SOURCE_TABLES,
   parseControlledPhaseBSourceFreezeArgs,
@@ -45,7 +46,7 @@ test("source-freeze holds all canonical source tables while child runs", async (
     databaseUrl: "postgres://example.invalid/test",
     command: "node",
     commandArgs: ["child.mjs"],
-    env: { TEST_MARKER: "yes" },
+    env: { TEST_MARKER: "yes", TZ: "Europe/London" },
     createClient: () => mockClient(log),
     runChild: async (args) => {
       childObserved = args;
@@ -58,6 +59,8 @@ test("source-freeze holds all canonical source tables while child runs", async (
   assert.equal(childObserved.command, "node");
   assert.deepEqual(childObserved.commandArgs, ["child.mjs"]);
   assert.equal(childObserved.env.TEST_MARKER, "yes");
+  assert.equal(childObserved.env.TZ, CONTROLLED_PHASE_B_CHILD_TIMEZONE);
+  assert.equal(CONTROLLED_PHASE_B_CHILD_TIMEZONE, "UTC");
   assert.equal(childObserved.env[CONTROLLED_PHASE_B_SOURCE_FREEZE_ENV], "held");
 
   const sql = log.filter(([kind]) => kind === "query").map(([, value]) => value);
