@@ -205,6 +205,8 @@ test("connector publisher rereads and preserves unchanged pollutant union", asyn
   assert.deepEqual(result.current_pollutant_codes, ["o3"]);
   assert.deepEqual(result.changed_pollutant_codes, ["pm25"]);
   assert.deepEqual(result.final_pollutant_codes, ["o3", "pm25"]);
+  assert.deepEqual(result.removed_pollutant_codes, []);
+  assert.deepEqual(result.removed_scopes, []);
   assert.deepEqual(
     result.connector_manifest_payload.pollutant_codes,
     ["o3", "pm25"],
@@ -227,6 +229,90 @@ test("connector publisher rereads and preserves unchanged pollutant union", asyn
     }),
     /SOS complete-day replacement found live connector state after deletion/,
   );
+});
+
+test("Prune connector publisher replaces the complete pollutant set and reports removed scopes", async () => {
+  const currentPm25 = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("pm25", 101),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const currentNo2 = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("no2", 102),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const changedPm25 = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("pm25", 101).map((row) => ({ ...row, value: row.value + 1 })),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const connectorKey = buildHistoryV2ConnectorManifestKey(
+    "history/v2/observations",
+    DAY_UTC,
+    1,
+  );
+  const currentConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY_UTC,
+    connectorId: 1,
+    runId: null,
+    manifestKey: connectorKey,
+    pollutantManifests: [
+      currentPm25.canonical_pollutant_manifest.payload,
+      currentNo2.canonical_pollutant_manifest.payload,
+    ],
+    writerGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const objects = new Map([
+    [currentPm25.canonical_pollutant_manifest.key, Buffer.from(currentPm25.canonical_pollutant_manifest.body)],
+    [currentNo2.canonical_pollutant_manifest.key, Buffer.from(currentNo2.canonical_pollutant_manifest.body)],
+    [connectorKey, Buffer.from(JSON.stringify(currentConnector, null, 2), "utf8")],
+  ]);
+  const publisher = createObservationHistoryV3CanonicalConnectorPublisher({
+    targetWriterGitSha: TARGET_GIT_SHA,
+    getObject: async ({ key }) => objects.has(key)
+      ? { exists: true, body: Buffer.from(objects.get(key)) }
+      : { exists: false },
+    putIfChanged: async ({ key, body }) => {
+      objects.set(key, Buffer.from(body));
+      return { ok: true, status: "written" };
+    },
+    recordDurableEvidence: async () => ({ durable: true }),
+  });
+  const result = await publisher({
+    source: "prune_daily",
+    day_utc: DAY_UTC,
+    connector_id: 1,
+    partitions: [{
+      scope: changedPm25.scope,
+      target_metadata: changedPm25.target_metadata,
+      pollutant_manifest: changedPm25.canonical_pollutant_manifest,
+      file_evidence: changedPm25.file_intents.map((intent) => ({
+        key: intent.key,
+        byte_size: intent.byte_size,
+        sha256: intent.sha256,
+        verified: true,
+        durable: true,
+      })),
+      v3_hierarchy: changedPm25.v3_hierarchy,
+    }],
+  });
+
+  assert.deepEqual(result.current_pollutant_codes, ["no2", "pm25"]);
+  assert.deepEqual(result.changed_pollutant_codes, ["pm25"]);
+  assert.deepEqual(result.final_pollutant_codes, ["pm25"]);
+  assert.deepEqual(result.removed_pollutant_codes, ["no2"]);
+  assert.deepEqual(result.removed_scopes, [{
+    day_utc: DAY_UTC,
+    connector_id: 1,
+    pollutant_code: "no2",
+  }]);
+  assert.deepEqual(result.connector_manifest_payload.pollutant_codes, ["pm25"]);
 });
 
 test("day publisher creates verified canonical parent from changed connector authority", async () => {

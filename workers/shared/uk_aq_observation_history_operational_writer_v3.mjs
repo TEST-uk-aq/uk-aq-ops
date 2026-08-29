@@ -292,8 +292,14 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
         `SOS complete-day replacement found live connector state after deletion: ${dayUtc}/${connectorId}`,
       );
     }
+    // Prune partitions come from one complete frozen connector-day snapshot.
+    // Integrity/backfill partitions remain targeted repairs that preserve peers.
+    const completeConnectorSnapshot =
+      source === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily;
     const finalByCode = new Map(
-      current.pollutant_manifests.map((manifest) => [manifest.pollutant_code, manifest]),
+      completeConnectorSnapshot
+        ? []
+        : current.pollutant_manifests.map((manifest) => [manifest.pollutant_code, manifest]),
     );
     const changedCodes = sortedPollutantCodes(
       partitions.map((partition) => partition.scope.pollutant_code),
@@ -368,6 +374,10 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
     const finalCodes = finalPollutants.map(
       (manifest) => manifest.pollutant_code,
     ).sort(bytewiseCompare);
+    const finalCodeSet = new Set(finalCodes);
+    const removedCodes = completeConnectorSnapshot
+      ? currentCodes.filter((pollutantCode) => !finalCodeSet.has(pollutantCode))
+      : [];
     return Object.freeze({
       connector_scope_verified: true,
       parent_state_reread_under_lock: true,
@@ -376,6 +386,14 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
       current_pollutant_codes: Object.freeze(currentCodes),
       changed_pollutant_codes: Object.freeze(changedCodes),
       final_pollutant_codes: Object.freeze(finalCodes),
+      removed_pollutant_codes: Object.freeze(removedCodes),
+      removed_scopes: Object.freeze(removedCodes.map((pollutantCode) =>
+        Object.freeze({
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          pollutant_code: pollutantCode,
+        })
+      )),
       pollutant_manifests: Object.freeze(changedEvidence),
       connector_manifest: connectorEvidence,
       connector_manifest_payload: connectorPayload,

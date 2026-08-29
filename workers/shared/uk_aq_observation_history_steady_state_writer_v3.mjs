@@ -457,7 +457,12 @@ function groupPreparedByConnectorDay(prepared) {
   );
 }
 
-function validateConnectorCanonicalResult(group, result, observationsPrefix) {
+function validateConnectorCanonicalResult({
+  group,
+  result,
+  observationsPrefix,
+  source,
+}) {
   if (
     result?.connector_scope_verified !== true ||
     result?.parent_state_reread_under_lock !== true ||
@@ -537,10 +542,22 @@ function validateConnectorCanonicalResult(group, result, observationsPrefix) {
     result.final_pollutant_codes,
     "final_pollutant_codes",
   );
-  const expectedFinalPollutants = [...new Set([
-    ...currentPollutants,
-    ...changedPollutants,
-  ])].sort(bytewiseCompare);
+  const removedPollutants = reportedPollutantCodes(
+    result.removed_pollutant_codes,
+    "removed_pollutant_codes",
+  );
+  const completeConnectorSnapshot =
+    source === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily;
+  const changedPollutantSet = new Set(changedPollutants);
+  const expectedFinalPollutants = completeConnectorSnapshot
+    ? [...changedPollutants]
+    : [...new Set([...currentPollutants, ...changedPollutants])]
+      .sort(bytewiseCompare);
+  const expectedRemovedPollutants = completeConnectorSnapshot
+    ? currentPollutants.filter((pollutantCode) =>
+      !changedPollutantSet.has(pollutantCode)
+    )
+    : [];
   if (!sameArray(reportedChanged, changedPollutants)) {
     throw new Error(
       `Canonical connector finalizer changed-pollutant evidence disagrees: ${group.day_utc}/${group.connector_id}`,
@@ -548,7 +565,34 @@ function validateConnectorCanonicalResult(group, result, observationsPrefix) {
   }
   if (!sameArray(finalPollutants, expectedFinalPollutants)) {
     throw new Error(
-      `Canonical connector finalizer did not preserve the current pollutant union: ${group.day_utc}/${group.connector_id}`,
+      completeConnectorSnapshot
+        ? `Canonical connector finalizer did not publish the complete Prune pollutant set: ${group.day_utc}/${group.connector_id}`
+        : `Canonical connector finalizer did not preserve the current pollutant union: ${group.day_utc}/${group.connector_id}`,
+    );
+  }
+  if (!sameArray(removedPollutants, expectedRemovedPollutants)) {
+    throw new Error(
+      `Canonical connector finalizer removed-pollutant evidence disagrees: ${group.day_utc}/${group.connector_id}`,
+    );
+  }
+  const removedScopes = Array.isArray(result.removed_scopes)
+    ? result.removed_scopes.map((scope) => ({
+      day_utc: String(scope?.day_utc || ""),
+      connector_id: Number(scope?.connector_id),
+      pollutant_code: String(scope?.pollutant_code || "").trim().toLowerCase(),
+    }))
+    : null;
+  const expectedRemovedScopes = expectedRemovedPollutants.map((pollutantCode) => ({
+    day_utc: group.day_utc,
+    connector_id: group.connector_id,
+    pollutant_code: pollutantCode,
+  }));
+  if (
+    removedScopes === null ||
+    JSON.stringify(removedScopes) !== JSON.stringify(expectedRemovedScopes)
+  ) {
+    throw new Error(
+      `Canonical connector finalizer removed-scope evidence disagrees: ${group.day_utc}/${group.connector_id}`,
     );
   }
   return Object.freeze({
@@ -559,6 +603,10 @@ function validateConnectorCanonicalResult(group, result, observationsPrefix) {
     current_pollutant_codes: Object.freeze(currentPollutants),
     changed_pollutant_codes: Object.freeze(reportedChanged),
     final_pollutant_codes: Object.freeze(finalPollutants),
+    removed_pollutant_codes: Object.freeze(removedPollutants),
+    removed_scopes: Object.freeze(removedScopes.map((scope) =>
+      Object.freeze({ ...scope })
+    )),
     pollutant_manifests: Object.freeze(pollutantManifests),
     connector_scope_verified: true,
     parent_state_reread_under_lock: true,
@@ -862,11 +910,12 @@ export async function runObservationHistoryV3ConnectorPublication({
         connector_id: group.connector_id,
         partitions: Object.freeze(partitionResults),
       });
-      const canonical = validateConnectorCanonicalResult(
+      const canonical = validateConnectorCanonicalResult({
         group,
-        canonicalResult,
-        canonicalObservationsPrefix,
-      );
+        result: canonicalResult,
+        observationsPrefix: canonicalObservationsPrefix,
+        source: normalizedSource,
+      });
       const exact = await publishConnectorExactV3Scopes({
         partitions: partitionResults,
         canonical,
@@ -994,6 +1043,9 @@ function buildRunFinalizationEvidence(connectorPublication) {
           connector_manifest: result.canonical.connector_manifest,
           connector_manifest_payload:
             result.canonical.connector_manifest_payload,
+          removed_pollutant_codes:
+            result.canonical.removed_pollutant_codes,
+          removed_scopes: result.canonical.removed_scopes,
           connector_scope_verified:
             result.canonical.connector_scope_verified,
           parent_state_reread_under_lock:
@@ -1008,6 +1060,43 @@ function buildRunFinalizationEvidence(connectorPublication) {
     complete_day_replacement_results:
       connectorPublication.complete_day_replacement_results,
   });
+}
+
+function obsoletePruneLatestScopes({ source, existingLatest, connectorResults }) {
+  if (source !== OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily) {
+    return Object.freeze([]);
+  }
+  const completeConnectorDays = new Set(
+    connectorResults.map((result) => connectorDayIdentity({
+      day_utc: result.day_utc,
+      connector_id: result.connector_id,
+    })),
+  );
+  const replacementScopes = new Set(
+    connectorResults.flatMap((result) => result.partitions)
+      .map((partition) => scopeIdentity(partition.scope)),
+  );
+  // Derive removals from latest as well as connector publication evidence so a
+  // retry still converges after canonical connector authority already advanced.
+  const removals = (Array.isArray(existingLatest?.payload?.day_summaries)
+    ? existingLatest.payload.day_summaries
+    : [])
+    .flatMap((day) => Array.isArray(day?.scoped_roots) ? day.scoped_roots : [])
+    .filter((root) =>
+      completeConnectorDays.has(connectorDayIdentity(root)) &&
+      !replacementScopes.has(scopeIdentity(root))
+    )
+    .map((root) => Object.freeze({
+      day_utc: root.day_utc,
+      connector_id: root.connector_id,
+      pollutant_code: root.pollutant_code,
+    }))
+    .sort((left, right) =>
+      bytewiseCompare(left.day_utc, right.day_utc) ||
+      left.connector_id - right.connector_id ||
+      bytewiseCompare(left.pollutant_code, right.pollutant_code)
+    );
+  return Object.freeze(removals);
 }
 
 /**
@@ -1124,9 +1213,15 @@ export async function runObservationHistoryV3RunFinalization({
       const replacementScopedManifests = partitionResults.map(
         (partition) => partition.scoped_root.artifact,
       );
+      const removedScopes = obsoletePruneLatestScopes({
+        source: normalizedSource,
+        existingLatest,
+        connectorResults,
+      });
       const updatedLatest = updateObservationHistoryIndexV3Latest({
         existingLatest,
         replacementScopedManifests,
+        removedScopes,
         indexRoot,
         latestKey,
       });
@@ -1168,6 +1263,7 @@ export async function runObservationHistoryV3RunFinalization({
         complete_day_replacement_results: Object.freeze(
           completeDayReplacementResults,
         ),
+        removed_scopes: removedScopes,
         affected_partition_count: partitionResults.length,
         affected_connector_days: Object.freeze(connectorResults.map((entry) => ({
           day_utc: entry.day_utc,

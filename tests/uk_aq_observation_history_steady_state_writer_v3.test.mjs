@@ -63,6 +63,7 @@ function buildFixture({
   failDay = false,
   reportPruneEligibility = false,
   afterConnectorRelease = null,
+  currentPollutantsFor = null,
 } = {}) {
   const events = [];
   const objects = new Map();
@@ -86,13 +87,32 @@ function buildFixture({
     targetWriterGitSha: TARGET_GIT_SHA,
     backedUpAtUtc: BACKED_UP_AT_UTC,
   });
+  const obsoletePruneScope = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows({
+      dayUtc: "2026-08-18",
+      connectorId: 1,
+      pollutantCode: "o3",
+      timeseriesId: 103,
+    }),
+    writerLimits: LIMITS,
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: BACKED_UP_AT_UTC,
+  });
   const initialLatest = buildObservationHistoryIndexV3Latest({
-    scopedHierarchies: [unrelated.v3_hierarchy],
+    scopedHierarchies: [
+      unrelated.v3_hierarchy,
+      obsoletePruneScope.v3_hierarchy,
+    ],
   });
   objects.set(initialLatest.key, Buffer.from(initialLatest.body));
   objects.set(
     unrelated.v3_hierarchy.scoped_manifest.key,
     Buffer.from(unrelated.v3_hierarchy.scoped_manifest.body),
+  );
+  objects.set(
+    obsoletePruneScope.v3_hierarchy.scoped_manifest.key,
+    Buffer.from(obsoletePruneScope.v3_hierarchy.scoped_manifest.body),
   );
 
   async function withinLock(kind, identity, callback) {
@@ -136,6 +156,7 @@ function buildFixture({
       };
     },
     publishConnectorScopedCanonicalManifests: async ({
+      source,
       day_utc: dayUtc,
       connector_id: connectorId,
       partitions: changedPartitions,
@@ -159,7 +180,24 @@ function buildFixture({
       const changedPollutants = changedPartitions
         .map((partition) => partition.scope.pollutant_code)
         .sort();
-      const currentPollutants = connectorId === 1 ? ["o3"] : [];
+      const currentPollutants = typeof currentPollutantsFor === "function"
+        ? currentPollutantsFor({ source, dayUtc, connectorId })
+        : source === "sos_historical_replacement"
+          ? []
+          : connectorId === 1 ? ["o3"] : [];
+      const completePruneSnapshot = source === "prune_daily";
+      const finalPollutants = completePruneSnapshot
+        ? changedPollutants
+        : [...new Set([
+          ...currentPollutants,
+          ...changedPollutants,
+        ])].sort();
+      const finalPollutantSet = new Set(finalPollutants);
+      const removedPollutants = completePruneSnapshot
+        ? currentPollutants.filter((pollutantCode) =>
+          !finalPollutantSet.has(pollutantCode)
+        )
+        : [];
       return {
         connector_scope_verified: true,
         parent_state_reread_under_lock: true,
@@ -167,10 +205,13 @@ function buildFixture({
         connector_id: connectorId,
         current_pollutant_codes: currentPollutants,
         changed_pollutant_codes: changedPollutants,
-        final_pollutant_codes: [...new Set([
-          ...currentPollutants,
-          ...changedPollutants,
-        ])].sort(),
+        final_pollutant_codes: finalPollutants,
+        removed_pollutant_codes: removedPollutants,
+        removed_scopes: removedPollutants.map((pollutantCode) => ({
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          pollutant_code: pollutantCode,
+        })),
         pollutant_manifests: pollutantManifests,
         connector_manifest: evidence(
           `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
@@ -236,6 +277,7 @@ function buildFixture({
     objects,
     latestKey: initialLatest.key,
     unrelatedScopedKey: unrelated.v3_hierarchy.scoped_manifest.key,
+    removedScopedKey: obsoletePruneScope.v3_hierarchy.scoped_manifest.key,
     activeLocks,
     globalLockCount: () => globalLockCount,
   };
@@ -269,6 +311,17 @@ test("run-level v3 writer releases each lock phase, merges days, and publishes l
   );
   assert.equal(latestPuts.length, 1);
   assert.equal(latestPuts[0].lock, "global");
+  assert.deepEqual(result.removed_scopes, [{
+    day_utc: "2026-08-18",
+    connector_id: 1,
+    pollutant_code: "o3",
+  }]);
+  const updatedLatest = JSON.parse(fixture.objects.get(fixture.latestKey).toString("utf8"));
+  const updatedScopedKeys = updatedLatest.day_summaries.flatMap((day) =>
+    day.scoped_roots.map((root) => root.key)
+  );
+  assert.equal(updatedScopedKeys.includes(fixture.removedScopedKey), false);
+  assert.equal(fixture.objects.has(fixture.removedScopedKey), true);
 
   const exactPuts = fixture.publicationCalls.filter((call) =>
     call.stage === "child_shard" || call.stage === "scoped_manifest"
@@ -429,6 +482,27 @@ test("split Prune API finalizes two exact affected days and shared parents once"
     fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
     1,
   );
+});
+
+test("Prune retry removes a stale latest scope after canonical connector authority is already exact", async () => {
+  const fixture = buildFixture({ currentPollutantsFor: () => [] });
+  const result = await runPruneDailyObservationHistoryV3Writer({
+    ...fixture.options,
+    partitions: fixture.options.partitions.slice(0, 1),
+  });
+
+  assert.deepEqual(result.connector_results[0].canonical.removed_scopes, []);
+  assert.deepEqual(result.removed_scopes, [{
+    day_utc: "2026-08-18",
+    connector_id: 1,
+    pollutant_code: "o3",
+  }]);
+  const updatedLatest = JSON.parse(fixture.objects.get(fixture.latestKey).toString("utf8"));
+  const updatedScopedKeys = updatedLatest.day_summaries.flatMap((day) =>
+    day.scoped_roots.map((root) => root.key)
+  );
+  assert.equal(updatedScopedKeys.includes(fixture.removedScopedKey), false);
+  assert.equal(fixture.objects.has(fixture.removedScopedKey), true);
 });
 
 test("connector exact-publication or day failure prevents later authority phases", async () => {
