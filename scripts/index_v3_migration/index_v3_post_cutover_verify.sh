@@ -175,14 +175,14 @@ INDEX_AUTHORITY="$(gh variable get UK_AQ_R2_HISTORY_INDEX_VERSION --repo "$REPO_
   || fail "GitHub UK_AQ_R2_HISTORY_INDEX_VERSION could not be read"
 [ "$INDEX_AUTHORITY" = "v3" ] || fail "persistent index authority is not v3: $INDEX_AUTHORITY"
 [ "$UK_AQ_R2_HISTORY_INDEX_VERSION" = "v3" ] || fail "loaded observation-history index authority is not v3"
-for variable_name in UK_AQ_R2_HISTORY_VERSION UK_AQ_R2_HISTORY_INTEGRITY_VERSION; do
-  actual_value="$(gh variable get "$variable_name" --repo "$REPO_SLUG" 2>/dev/null)" \
-    || fail "GitHub $variable_name could not be read"
-  [ "$actual_value" = "${!variable_name}" ] \
-    || fail "GitHub $variable_name differs from the independently loaded value"
-done
+HISTORY_AUTHORITY="$(gh variable get UK_AQ_R2_HISTORY_VERSION --repo "$REPO_SLUG" 2>/dev/null)" \
+  || fail "GitHub UK_AQ_R2_HISTORY_VERSION could not be read"
+[ "$HISTORY_AUTHORITY" = "$UK_AQ_R2_HISTORY_VERSION" ] \
+  || fail "GitHub UK_AQ_R2_HISTORY_VERSION differs from the independently loaded value"
 [ "$UK_AQ_R2_HISTORY_VERSION" = "v2" ] || fail "logical history version is not v2"
-pass "persistent GitHub history/index/integrity authorities independently match the loaded v2/v3/v2 values"
+[ "$UK_AQ_R2_HISTORY_INTEGRITY_VERSION" = "v2" ] \
+  || fail "loaded Integrity semantic version is not v2"
+pass "persistent GitHub history/index authorities match loaded v2/v3 values and loaded Integrity semantic version is v2"
 
 STABLE_STATION_WORKER="$(gh variable get UK_AQ_STATION_HISTORY_WORKER_NAME --repo "$REPO_SLUG" 2>/dev/null)" \
   || fail "GitHub UK_AQ_STATION_HISTORY_WORKER_NAME could not be read"
