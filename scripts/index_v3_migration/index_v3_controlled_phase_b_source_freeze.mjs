@@ -111,7 +111,7 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
   });
 
   let transactionOpen = false;
-  const acquiredAtUtc = new Date().toISOString();
+  const coordinatorStartedAtUtc = new Date().toISOString();
   let lockAcquiredAtUtc = null;
   await client.connect();
   try {
@@ -147,17 +147,18 @@ export async function runWithControlledPhaseBSourceWriteFreeze({
       held_during_controlled_child: true,
       lock_mode: "SHARE",
       tables: CONTROLLED_PHASE_B_SOURCE_TABLES,
-      coordinator_started_at_utc: acquiredAtUtc,
+      coordinator_started_at_utc: coordinatorStartedAtUtc,
       acquired_at_utc: lockAcquiredAtUtc,
       released_at_utc: releasedAtUtc,
       child_exit_code: childCode,
       persistent_database_mutation: false,
     };
 
+    const isApplyChild = commandArgs.includes("--apply");
     appendEvidence(
       childOptionValue(commandArgs, "--report-out"),
       freezeEvidence,
-      { required: childCode === 0 },
+      { required: childCode === 0 && isApplyChild },
     );
 
     process.stderr.write(`${JSON.stringify({
