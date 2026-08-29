@@ -14,7 +14,16 @@ The dry-run prints the candidate day, connector, row count, exact source-content
 
 ## Apply
 
-`--apply` requires `--writers-frozen`, the exact candidate identity from a reviewed dry-run and a report path. It repeats the same preflight, acquires the existing global observations-operation lock as `prune_daily`, and invokes only `runPhaseBBackup()` with:
+`--apply` requires `--writers-frozen`, the exact candidate identity from a reviewed dry-run and a report path. It repeats the same preflight, acquires the existing global observations-operation lock as `prune_daily`, then acquires a temporary PostgreSQL `SHARE` lock over the canonical Phase B source tables:
+
+- `uk_aq_core.observations`;
+- `uk_aq_core.timeseries`;
+- `uk_aq_core.phenomena`;
+- `uk_aq_core.observed_properties`.
+
+The source-table lock is held only for the controlled apply child. It prevents source observations or their canonical metadata from changing while the acceptance runner re-derives and verifies the pinned source-content identity and while `runPhaseBBackup()` acquires its repeatable-read frozen source and publishes/finalises the selected connector-day. Normal upstream ingest may wait briefly on this lock during the acceptance operation. The lock transaction performs no persistent database mutation and is rolled back solely to release the locks when the child finishes or fails.
+
+The controlled runner invokes only `runPhaseBBackup()` with:
 
 - `max_candidates_per_run=1`;
 - accepted snapshot cap 250000 rows;
@@ -31,6 +40,10 @@ The JSON evidence report contains identities and counts only. It does not contai
 
 ## Safety boundary
 
-A source change between the read-only apply preflight and Phase B's own frozen source acquisition can cause the acceptance to fail after a valid normal Phase B write has occurred. The operation still retains the IngestDB source and does not enter source deletion. Keep maintenance ON and writers frozen on any failure and inspect the resulting generation before retrying.
+The reviewed dry-run source identity is checked again after the source-table `SHARE` locks are held. Because those source tables cannot then be modified until the controlled Phase B child finishes, a source-content change cannot race between the accepted candidate/hash check and Phase B's frozen-source acquisition/publication.
+
+If the source changed before the apply lock was obtained, the apply-side candidate/hash check fails before `runPhaseBBackup()` publishes the connector-day. If the source lock cannot be obtained within its bounded timeout, the operation stops without starting the controlled Phase B child.
+
+Any apply failure still leaves maintenance ON and migration-sensitive writers frozen. The full Prune deletion path is never entered and the selected IngestDB source is deliberately retained for rollback-data preservation.
 
 Do not use the ordinary Prune Daily `dry_run` input as a substitute for this helper. Historical Prune/Phase B dry-run semantics are not the strict read-only contract implemented here.
