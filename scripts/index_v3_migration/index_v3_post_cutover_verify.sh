@@ -272,7 +272,7 @@ printf '%s' "$D1_JSON" | jq -e '
   | ($rows | length) == 3
     and all($rows[]; (.enabled | type) == "number" and .enabled == 0)
     and (["uk_aq_prune_daily","uk_aq_r2_history_dropbox_backup","uk_aq_r2_history_dropbox_backup_force_prune_recheck"] as $expected
-      | all($expected[] as $key; ([$rows[] | select(.job_key == $key)] | length) == 1))
+      | ([$rows[].job_key] | sort) == ($expected | sort))
     and all($rows[]; .job_key == "uk_aq_prune_daily"
       or .job_key == "uk_aq_r2_history_dropbox_backup"
       or .job_key == "uk_aq_r2_history_dropbox_backup_force_prune_recheck")
