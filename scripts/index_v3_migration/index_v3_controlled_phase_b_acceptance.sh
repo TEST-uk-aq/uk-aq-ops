@@ -38,8 +38,11 @@ Strict --dry-run guarantees:
 
 The wrapper performs read-only GitHub, D1 scheduler, maintenance and database checks.
 The --apply path invokes only runPhaseBBackup() under the global observation-operation
-lock. It never invokes the full Prune Daily job, so the IngestDB deletion path is not
-part of this acceptance operation. The retained source is verified after the write.
+lock and a temporary PostgreSQL SHARE lock on the canonical Phase B source tables.
+That source-table lock prevents observations or their canonical metadata from changing
+between the pinned source-identity check and the Phase B frozen snapshot/publication.
+The full Prune Daily job is never invoked, so the IngestDB deletion path is not part of
+this acceptance operation. The retained source is verified again after the write.
 EOF
 }
 
@@ -276,6 +279,8 @@ NODE_RUNNER="$SCRIPT_DIR/index_v3_controlled_phase_b_acceptance.mjs"
 [ -f "$NODE_RUNNER" ] || fail "Node acceptance runner is missing: $NODE_RUNNER"
 LOCK_RUNNER="scripts/operations/uk_aq_with_observations_global_operation_lock.mjs"
 [ -f "$LOCK_RUNNER" ] || fail "global observation-operation lock runner is missing: $LOCK_RUNNER"
+SOURCE_FREEZE_RUNNER="$SCRIPT_DIR/index_v3_controlled_phase_b_source_freeze.mjs"
+[ -f "$SOURCE_FREEZE_RUNNER" ] || fail "controlled source-freeze runner is missing: $SOURCE_FREEZE_RUNNER"
 
 if [ "$MODE" = "dry-run" ]; then
   "$NODE_BIN" "$NODE_RUNNER" --dry-run "${NODE_ARGS[@]}"
@@ -289,6 +294,7 @@ fi
 printf 'Run ID: %s\n' "$RUN_ID"
 printf 'Evidence report: %s\n' "$REPORT_OUT"
 printf '%s\n' 'APPLY SCOPE: runPhaseBBackup() ONLY; FULL PRUNE/INGESTDB DELETION PATH IS NOT INVOKED'
+printf '%s\n' 'SOURCE WRITE FREEZE: SHARE locks on observations/timeseries/phenomena/observed_properties for the apply window'
 printf '%s\n\n' 'ROLLBACK DATA PRESERVATION: RETAIN UPSTREAM SOURCE'
 
 "$NODE_BIN" "$LOCK_RUNNER" \
@@ -297,8 +303,10 @@ printf '%s\n\n' 'ROLLBACK DATA PRESERVATION: RETAIN UPSTREAM SOURCE'
   --timeout-ms 60000 \
   --heartbeat-ms 5000 \
   -- \
-  "$NODE_BIN" "$NODE_RUNNER" \
-    --apply \
-    "${NODE_ARGS[@]}" \
-    --run-id "$RUN_ID" \
-    --report-out "$REPORT_OUT"
+  "$NODE_BIN" "$SOURCE_FREEZE_RUNNER" \
+    -- \
+    "$NODE_BIN" "$NODE_RUNNER" \
+      --apply \
+      "${NODE_ARGS[@]}" \
+      --run-id "$RUN_ID" \
+      --report-out "$REPORT_OUT"
