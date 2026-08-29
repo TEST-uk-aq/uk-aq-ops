@@ -41,6 +41,7 @@ import {
   buildObservationHistoryV3MigrationAuditReport,
   buildObservationHistoryV3MigrationPlan,
   buildObservationHistoryV3MigrationPlanFromCheckpoint,
+  buildObservationHistoryV3RecoveryReplayStateSha256,
   buildObservationHistoryV3RerunVerificationPlan,
   DEFAULT_OBSERVATIONS_PREFIX,
   DEFAULT_V3_INDEX_ROOT,
@@ -494,7 +495,8 @@ export function buildObservationHistoryV3RecoveryProgressContext({
       plan_sha256: manifest.payload.plan_sha256,
       last_sequence: replay.sequence,
       last_entry_sha256: replay.entrySha256,
-      replayed_checkpoint_sha256: sha256Hex(stableMigrationJson(recoveredCheckpoint)),
+      replayed_checkpoint_sha256:
+        buildObservationHistoryV3RecoveryReplayStateSha256(recoveredCheckpoint),
     }),
   };
   context.persistCheckpoint = async (current) => {

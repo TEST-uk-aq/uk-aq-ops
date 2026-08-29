@@ -57,6 +57,7 @@ import {
   buildObservationHistoryV3MigrationAuditReport,
   buildObservationHistoryV3MigrationPlan,
   buildObservationHistoryV3MigrationPlanFromCheckpoint,
+  buildObservationHistoryV3RecoveryReplayStateSha256,
   buildObservationHistoryV3RerunVerificationPlan,
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
@@ -724,9 +725,119 @@ function authenticatedRecoveryAuthority(checkpoint) {
     plan_sha256: checkpoint.plan_sha256,
     last_sequence: 1,
     last_entry_sha256: "d".repeat(64),
-    replayed_checkpoint_sha256: sha256Hex(stableMigrationJson(checkpoint)),
+    replayed_checkpoint_sha256:
+      buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint),
   };
 }
+
+function compactReplayStateFixture() {
+  return {
+    authority_sha256: "a".repeat(64),
+    migration_run_id: "test-replay-run",
+    plan_sha256: "b".repeat(64),
+    preparation_order: ["unit-b", "unit-a"],
+    prepared_units: {
+      "unit-a": {
+        prepared_plan_sha256: "c".repeat(64),
+        files_published: true,
+        target_file_intents: [
+          { key: "history/a.parquet", staging_ref: null },
+        ],
+        target_manifest_body: "large-body-a-is-authenticated-by-prepared-plan-sha",
+      },
+      "unit-b": {
+        prepared_plan_sha256: "d".repeat(64),
+        files_published: false,
+        target_file_intents: [
+          { key: "history/b.parquet", staging_ref: "/tmp/staging/b.parquet" },
+        ],
+        target_manifest_body: "large-body-b-is-authenticated-by-prepared-plan-sha",
+      },
+    },
+    completed_objects: {
+      "history/b.parquet": {
+        byte_size: 20,
+        sha256: "e".repeat(64),
+        verified: true,
+        durable: true,
+        stored_sha256_verified: true,
+      },
+      "history/a.json": {
+        byte_size: 10,
+        sha256: "f".repeat(64),
+        verified: true,
+        durable: true,
+      },
+    },
+    full_verification_complete: true,
+    cutover_ready: true,
+  };
+}
+
+test("compact recovery replay digest is deterministic and binds every mutable progress class", async (t) => {
+  const checkpoint = compactReplayStateFixture();
+  const expected = buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint);
+  const reordered = {
+    ...structuredClone(checkpoint),
+    prepared_units: Object.fromEntries(
+      Object.entries(checkpoint.prepared_units).reverse(),
+    ),
+    completed_objects: Object.fromEntries(
+      Object.entries(checkpoint.completed_objects).reverse(),
+    ),
+  };
+  assert.equal(
+    buildObservationHistoryV3RecoveryReplayStateSha256(reordered),
+    expected,
+  );
+
+  for (const [name, mutate] of [
+    ["completed SHA", (value) => { value.completed_objects["history/a.json"].sha256 = "0".repeat(64); }],
+    ["completed byte size", (value) => { value.completed_objects["history/a.json"].byte_size += 1; }],
+    ["preparation order", (value) => { value.preparation_order.reverse(); }],
+    ["prepared plan SHA", (value) => { value.prepared_units["unit-a"].prepared_plan_sha256 = "1".repeat(64); }],
+    ["files published", (value) => { value.prepared_units["unit-b"].files_published = true; }],
+    ["staging progress", (value) => { value.prepared_units["unit-b"].target_file_intents[0].staging_ref = null; }],
+    ["full verification", (value) => { value.full_verification_complete = false; }],
+    ["cutover readiness", (value) => { value.cutover_ready = false; }],
+  ]) {
+    await t.test(name, () => {
+      const changed = structuredClone(checkpoint);
+      mutate(changed);
+      assert.notEqual(
+        buildObservationHistoryV3RecoveryReplayStateSha256(changed),
+        expected,
+      );
+    });
+  }
+});
+
+test("compact recovery replay digest omits giant prepared payload material", () => {
+  const checkpoint = compactReplayStateFixture();
+  const sharedLargeBody = "x".repeat(1024 * 1024);
+  const preparedUnits = {};
+  checkpoint.preparation_order = [];
+  for (let index = 0; index < 1024; index += 1) {
+    const unitId = `unit-${String(index).padStart(4, "0")}`;
+    checkpoint.preparation_order.push(unitId);
+    preparedUnits[unitId] = {
+      prepared_plan_sha256: sha256Hex(unitId),
+      files_published: false,
+      target_file_intents: [{
+        key: `history/${unitId}.parquet`,
+        staging_ref: `/tmp/staging/${unitId}.parquet`,
+      }],
+      target_manifest_body: sharedLargeBody,
+      target_metadata: { deliberately_large: sharedLargeBody },
+    };
+  }
+  checkpoint.prepared_units = preparedUnits;
+  assert.ok(sharedLargeBody.length * checkpoint.preparation_order.length > 1_000_000_000);
+  assert.match(
+    buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint),
+    /^[0-9a-f]{64}$/,
+  );
+});
 
 async function buildLegacyRecoveryOrderingFixture() {
   const fixture = await buildFixture();
@@ -2028,6 +2139,10 @@ test("recovery persistence rejects changed evidence for an already completed key
       repositoryRoot: REPOSITORY_ROOT,
       create: true,
     });
+    assert.equal(
+      context.authenticatedRecoveryAuthority.replayed_checkpoint_sha256,
+      buildObservationHistoryV3RecoveryReplayStateSha256(context.checkpoint),
+    );
     const changed = structuredClone(context.checkpoint);
     changed.completed_objects[completedKey] = {
       ...changed.completed_objects[completedKey],
@@ -2106,6 +2221,22 @@ test("legacy recovery ordering rejects an arbitrary valid same-size completed JS
       recoveryAuthority: authenticatedRecoveryAuthority(legacy.checkpoint),
     }),
     new RegExp(`recovery_evidence_invalid:.*${key}`),
+  );
+});
+
+test("legacy recovery authority rejects changed compact replay progress", async () => {
+  const legacy = await buildLegacyRecoveryOrderingFixture();
+  const recoveryAuthority = authenticatedRecoveryAuthority(legacy.checkpoint);
+  const unitId = legacy.checkpoint.preparation_order[0];
+  legacy.checkpoint.prepared_units[unitId].files_published =
+    legacy.checkpoint.prepared_units[unitId].files_published !== true;
+  assert.throws(
+    () => buildObservationHistoryV3RerunVerificationPlan({
+      checkpoint: legacy.checkpoint,
+      allowLegacyRecoveryOrdering: true,
+      recoveryAuthority,
+    }),
+    /recovery_evidence_invalid:authenticated recovery journal is required/,
   );
 });
 
@@ -3016,6 +3147,10 @@ test("recovery journal schema and final-state replay remain structurally compati
     assert.equal(replayed.sequence, 1);
     assert.equal(replayed.checkpoint.full_verification_complete, true);
     assert.equal(replayed.checkpoint.cutover_ready, true);
+    assert.equal(
+      replayed.authenticatedRecoveryAuthority.replayed_checkpoint_sha256,
+      buildObservationHistoryV3RecoveryReplayStateSha256(replayed.checkpoint),
+    );
     const journalEntry = JSON.parse(fs.readFileSync(
       path.join(replayed.paths.entries, "0000000001.json"),
       "utf8",

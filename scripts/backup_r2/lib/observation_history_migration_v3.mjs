@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 
 import {
   parquetMetadataAsync,
@@ -169,6 +170,152 @@ function stableObject(value) {
 
 export function stableMigrationJson(value) {
   return `${JSON.stringify(stableObject(value), null, 2)}\n`;
+}
+
+function updateRecoveryReplayDigest(hash, value) {
+  if (value === null) {
+    hash.update("null;");
+    return;
+  }
+  if (value === undefined) {
+    hash.update("undefined;");
+    return;
+  }
+  if (typeof value === "boolean") {
+    hash.update(value ? "boolean:true;" : "boolean:false;");
+    return;
+  }
+  if (typeof value === "number") {
+    hash.update(`number:${Object.is(value, -0) ? "-0" : String(value)};`);
+    return;
+  }
+  if (typeof value === "string") {
+    const bytes = Buffer.from(value, "utf8");
+    hash.update(`string:${bytes.byteLength}:`);
+    hash.update(bytes);
+    hash.update(";");
+    return;
+  }
+  if (Array.isArray(value)) {
+    hash.update(`array:${value.length}:[`);
+    for (const entry of value) updateRecoveryReplayDigest(hash, entry);
+    hash.update("];");
+    return;
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    hash.update(`object:${keys.length}:{`);
+    for (const key of keys) {
+      updateRecoveryReplayDigest(hash, key);
+      updateRecoveryReplayDigest(hash, value[key]);
+    }
+    hash.update("};");
+    return;
+  }
+  throw new TypeError(`Unsupported recovery replay digest value type: ${typeof value}`);
+}
+
+function addRecoveryReplayDigestRecord(hash, name, value) {
+  updateRecoveryReplayDigest(hash, name);
+  updateRecoveryReplayDigest(hash, value);
+}
+
+export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint) {
+  const hash = createHash("sha256");
+  hash.update("uk_aq_observation_history_v3_recovery_replay_state_v1;");
+  addRecoveryReplayDigestRecord(hash, "authority_sha256", checkpoint?.authority_sha256);
+  addRecoveryReplayDigestRecord(hash, "migration_run_id", checkpoint?.migration_run_id);
+  addRecoveryReplayDigestRecord(hash, "plan_sha256", checkpoint?.plan_sha256);
+
+  const preparationOrder = Array.isArray(checkpoint?.preparation_order)
+    ? checkpoint.preparation_order
+    : [];
+  addRecoveryReplayDigestRecord(hash, "preparation_order_valid", Array.isArray(
+    checkpoint?.preparation_order,
+  ));
+  addRecoveryReplayDigestRecord(hash, "preparation_order_count", preparationOrder.length);
+  for (const [index, unitId] of preparationOrder.entries()) {
+    addRecoveryReplayDigestRecord(hash, "preparation_order_entry", [index, unitId]);
+  }
+
+  const preparedEntries = checkpoint?.prepared_units &&
+      typeof checkpoint.prepared_units === "object" &&
+      !Array.isArray(checkpoint.prepared_units)
+    ? Object.entries(checkpoint.prepared_units).sort(([left], [right]) =>
+      Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
+    )
+    : [];
+  addRecoveryReplayDigestRecord(
+    hash,
+    "prepared_units_valid",
+    Boolean(checkpoint?.prepared_units) &&
+      typeof checkpoint.prepared_units === "object" &&
+      !Array.isArray(checkpoint.prepared_units),
+  );
+  addRecoveryReplayDigestRecord(hash, "prepared_units_count", preparedEntries.length);
+  for (const [unitId, record] of preparedEntries) {
+    addRecoveryReplayDigestRecord(hash, "prepared_unit_id", unitId);
+    addRecoveryReplayDigestRecord(
+      hash,
+      "prepared_plan_sha256",
+      record?.prepared_plan_sha256,
+    );
+    addRecoveryReplayDigestRecord(
+      hash,
+      "files_published",
+      record?.files_published === true,
+    );
+    const intents = Array.isArray(record?.target_file_intents)
+      ? record.target_file_intents
+      : [];
+    addRecoveryReplayDigestRecord(
+      hash,
+      "target_file_intents_valid",
+      Array.isArray(record?.target_file_intents),
+    );
+    addRecoveryReplayDigestRecord(hash, "target_file_intent_count", intents.length);
+    let stagingRefCount = 0;
+    for (const [index, intent] of intents.entries()) {
+      const hasStagingRef = Boolean(intent?.staging_ref);
+      if (hasStagingRef) stagingRefCount += 1;
+      addRecoveryReplayDigestRecord(hash, "staging_progress", {
+        index,
+        key: intent?.key,
+        staging_ref: hasStagingRef ? intent.staging_ref : null,
+      });
+    }
+    addRecoveryReplayDigestRecord(hash, "staging_ref_count", stagingRefCount);
+  }
+
+  const completedEntries = checkpoint?.completed_objects &&
+      typeof checkpoint.completed_objects === "object" &&
+      !Array.isArray(checkpoint.completed_objects)
+    ? Object.entries(checkpoint.completed_objects).sort(([left], [right]) =>
+      Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
+    )
+    : [];
+  addRecoveryReplayDigestRecord(
+    hash,
+    "completed_objects_valid",
+    Boolean(checkpoint?.completed_objects) &&
+      typeof checkpoint.completed_objects === "object" &&
+      !Array.isArray(checkpoint.completed_objects),
+  );
+  addRecoveryReplayDigestRecord(hash, "completed_objects_count", completedEntries.length);
+  for (const [key, evidence] of completedEntries) {
+    addRecoveryReplayDigestRecord(hash, "completed_object", { key, evidence });
+  }
+  addRecoveryReplayDigestRecord(
+    hash,
+    "full_verification_complete",
+    checkpoint?.full_verification_complete === true,
+  );
+  addRecoveryReplayDigestRecord(
+    hash,
+    "cutover_ready",
+    checkpoint?.cutover_ready === true,
+  );
+  return hash.digest("hex");
 }
 
 function sameJson(left, right) {
@@ -3285,7 +3432,7 @@ export function buildObservationHistoryV3RerunVerificationPlan({
     recoveryAuthority.migration_run_id === checkpoint?.migration_run_id &&
     recoveryAuthority.plan_sha256 === checkpoint?.plan_sha256 &&
     recoveryAuthority.replayed_checkpoint_sha256 ===
-      sha256Hex(stableMigrationJson(checkpoint)) &&
+      buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint) &&
     Number.isSafeInteger(recoveryAuthority.last_sequence) &&
     recoveryAuthority.last_sequence > 0 &&
     SHA256_PATTERN.test(String(recoveryAuthority.original_checkpoint_sha256 || "")) &&
