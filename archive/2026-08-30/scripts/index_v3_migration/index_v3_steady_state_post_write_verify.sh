@@ -52,7 +52,7 @@ EOF
 }
 
 fail() {
-  if [ "${REPORT_OUT_SAFE:-false}" = "true" ] && [ -n "${REPORT_OUT:-}" ] && command -v jq >/dev/null 2>&1; then
+  if [ -n "${REPORT_OUT:-}" ] && command -v jq >/dev/null 2>&1; then
     mkdir -p "$(dirname -- "$REPORT_OUT")" 2>/dev/null || true
     jq -n --arg error "$1" '{schema_version:1,kind:"index_v3_steady_state_post_write_verification",status:"FAIL",stage:"wrapper_preflight",mutation_performed:false,error:$error}' > "$REPORT_OUT" 2>/dev/null || true
   fi
@@ -89,7 +89,6 @@ CACHE_URL=""
 EXPECTED_STATION_HISTORY_WORKER=""
 EXPECTED_OBSERVATION_HISTORY_WORKER=""
 REPORT_OUT=""
-REPORT_OUT_SAFE="false"
 NODE_BIN=""
 
 while [ "$#" -gt 0 ]; do
@@ -158,30 +157,6 @@ done
 [ -d "$CHECKPOINT.recovery" ] || fail "authenticated recovery journal is missing: $CHECKPOINT.recovery"
 [ -d "$DROPBOX_ROOT" ] || fail "Dropbox read-only root is missing: $DROPBOX_ROOT"
 
-if [ -n "$NODE_BIN" ]; then
-  [ -x "$NODE_BIN" ] || fail "--node-bin is not executable"
-elif command -v node >/dev/null 2>&1 && node --version | grep -Eq '^v20\.'; then
-  NODE_BIN="$(command -v node)"
-else
-  NODE_BIN="$(npx --yes node@20 -p 'process.execPath')" || fail "Node 20 could not be resolved"
-fi
-"$NODE_BIN" --version | grep -Eq '^v20\.' || fail "the verifier requires Node 20"
-
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-steady-state.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
-CONTROL_EVIDENCE="$TMP_DIR/control.json"
-RUNNER="$SCRIPT_DIR/index_v3_steady_state_post_write_verify.mjs"
-REPORT_OUT="$("$NODE_BIN" "$RUNNER" --check-report-path \
-  --report-out "$REPORT_OUT" \
-  --acceptance-report "$ACCEPTANCE_REPORT" \
-  --control-evidence "$CONTROL_EVIDENCE" \
-  --plan-report "$PLAN_REPORT" \
-  --checkpoint "$CHECKPOINT" \
-  --dropbox-root "$DROPBOX_ROOT" \
-  --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE" \
-  --v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD")" || fail "report output path protection failed"
-REPORT_OUT_SAFE="true"
-
 CURRENT_SHA="$(git rev-parse HEAD)"
 [ "$CURRENT_SHA" = "$EXPECTED_REPOSITORY_GIT_SHA" ] || fail "current repository SHA differs from explicit expected SHA"
 git cat-file -e "${EXPECTED_ACCEPTANCE_GIT_SHA}^{commit}" 2>/dev/null || fail "accepted writer Git SHA is unavailable locally"
@@ -230,8 +205,15 @@ printf '%s' "$D1_JSON" | jq -e '
 ' >/dev/null || fail "scheduler jobs are not exactly the three required numeric disabled rows"
 ACTIVE_PRUNE="$(gh run list --repo "$REPO_SLUG" --workflow uk_aq_prune_daily.yml --limit 50 --json status --jq '[.[]|select(.status != "completed")]' 2>/dev/null)" || fail "Prune workflow state could not be read"
 [ "$ACTIVE_PRUNE" = "[]" ] || fail "a Prune workflow is active"
-ACTIVE_BACKUP="$(gh run list --repo "$REPO_SLUG" --workflow uk_aq_r2_history_dropbox_backup.yml --limit 50 --json status --jq '[.[]|select(.status != "completed")]' 2>/dev/null)" || fail "history backup workflow state could not be read"
-[ "$ACTIVE_BACKUP" = "[]" ] || fail "an observation-history Dropbox backup workflow is active"
+
+if [ -n "$NODE_BIN" ]; then
+  [ -x "$NODE_BIN" ] || fail "--node-bin is not executable"
+elif command -v node >/dev/null 2>&1 && node --version | grep -Eq '^v20\.'; then
+  NODE_BIN="$(command -v node)"
+else
+  NODE_BIN="$(npx --yes node@20 -p 'process.execPath')" || fail "Node 20 could not be resolved"
+fi
+"$NODE_BIN" --version | grep -Eq '^v20\.' || fail "the verifier requires Node 20"
 
 OPERATOR_HELPER="$SCRIPT_DIR/index_v3_operator_evidence.mjs"
 FREEZE_RESULT="$("$NODE_BIN" "$OPERATOR_HELPER" validate --evidence "$WRITER_FREEZE_EVIDENCE" --plan-report "$PLAN_REPORT" --repository-root "$REPO_ROOT")" || fail "writer-freeze evidence is invalid"
@@ -265,6 +247,9 @@ printf '%s\n' "$CACHE_LOG" | grep -Fq 'Persistent observation-history authority:
 # that its supplied URL is exactly the derived observation-candidate worker.
 [ -n "$STATION_RUN_ID" ] && [ -n "$OBS_RUN_ID" ] || fail "candidate deployment identities are incomplete"
 
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-steady-state.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+CONTROL_EVIDENCE="$TMP_DIR/control.json"
 jq -n \
   --arg environment "$ENVIRONMENT" --arg repository "$REPO_SLUG" \
   --arg repository_git_sha "$CURRENT_SHA" --arg bucket "$EXPECTED_BUCKET" \
@@ -278,9 +263,10 @@ jq -n \
    observation_deploy_run_id:$observation_deploy_run_id,station_deploy_run_id:$station_deploy_run_id,cache_deploy_run_id:$cache_deploy_run_id,
    repository_exact:true,working_tree_clean:true,default_branch_current:true,repository_git_sha_exact:true,
    loaded_history_v2:true,loaded_index_v3:true,persistent_history_v2:true,persistent_index_v3:true,loaded_integrity_v2:true,
-   maintenance_on:true,three_scheduler_jobs_disabled:true,no_active_prune:true,no_active_backup:true,writer_freeze_valid:true,v2_runtime_rollback_record_valid:true,
+   maintenance_on:true,three_scheduler_jobs_disabled:true,no_active_prune:true,writer_freeze_valid:true,v2_runtime_rollback_record_valid:true,
    cache_to_station_candidate_exact:true,station_to_observation_candidate_exact:true,mutation_performed:false}' > "$CONTROL_EVIDENCE"
 
+RUNNER="$SCRIPT_DIR/index_v3_steady_state_post_write_verify.mjs"
 "$NODE_BIN" "$RUNNER" \
   --environment "$ENVIRONMENT" \
   --repository "$EXPECTED_REPOSITORY" \
@@ -300,8 +286,6 @@ jq -n \
   --plan-report "$PLAN_REPORT" \
   --checkpoint "$CHECKPOINT" \
   --dropbox-root "$DROPBOX_ROOT" \
-  --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE" \
-  --v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD" \
   --required-unchanged-day "$REQUIRED_UNCHANGED_DAY" \
   --site-url "$SITE_URL" \
   --cache-url "$CACHE_URL" \

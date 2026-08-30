@@ -1,15 +1,23 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
   STEADY_STATE_BASELINE_KIND,
+  assertExactAffectedBranchDelta,
+  assertExactLatestGlobalDelta,
   assertExactPollutantSet,
   assertReadOnlyAdapters,
+  assertSafeLocalReportPath,
+  bindIndependentControlStateToCanonical,
   classifyDependencyIdentity,
   summarizeDependencyReconciliation,
   validateAcceptanceReport,
   validateIndependentControlState,
   validateSteadyStateBaselineProvenance,
+  withReadOnlyPgTransaction,
 } from "../scripts/index_v3_migration/index_v3_steady_state_post_write_verify.mjs";
 import { computePruneConnectorSourceIdentity } from "../workers/shared/uk_aq_prune_connector_source_identity.mjs";
 import { CONTROLLED_PHASE_B_SOURCE_TABLES } from "../scripts/index_v3_migration/index_v3_controlled_phase_b_source_freeze.mjs";
@@ -203,19 +211,100 @@ test("canonical dependency mismatch is classified FAIL", () => {
   );
 });
 
-test("LEGACY is visible and new LIVE steady-state acceptance rejects it", () => {
+test("new TEST and LIVE steady-state scope both reject legacy recovery ordering", () => {
   const legacy = classifyDependencyIdentity(
     { exists: true, byte_size: 10, sha256: "a".repeat(64) },
     { key: "legacy-hashless.json" },
     { allowLegacy: true },
   );
-  assert.equal(legacy.classification, "LEGACY");
-  const testSummary = summarizeDependencyReconciliation([{ key: "legacy-hashless.json", ...legacy }], "TEST");
-  assert.equal(testSummary.counts.LEGACY, 1);
+  assert.equal(legacy.classification, "LEGACY_RECOVERY_ORDERING");
+  assert.throws(
+    () => summarizeDependencyReconciliation([{ key: "legacy-hashless.json", ...legacy }], "TEST"),
+    /TEST steady-state scope rejects LEGACY_RECOVERY_ORDERING=1/,
+  );
   assert.throws(
     () => summarizeDependencyReconciliation([{ key: "legacy-hashless.json", ...legacy }], "LIVE"),
-    /LIVE steady-state acceptance rejects LEGACY=1/,
+    /LIVE steady-state scope rejects LEGACY_RECOVERY_ORDERING=1/,
   );
+});
+
+test("report output cannot overwrite input, recovery, Dropbox or operator evidence", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-steady-report-"));
+  try {
+    const checkpoint = path.join(root, "checkpoint.json");
+    const recoveryRoot = `${checkpoint}.recovery`;
+    const dropboxRoot = path.join(root, "Dropbox");
+    const acceptance = path.join(root, "acceptance.json");
+    const freeze = path.join(root, "writer-freeze.json");
+    for (const directory of [recoveryRoot, dropboxRoot]) fs.mkdirSync(directory, { recursive: true });
+    for (const file of [checkpoint, acceptance, freeze]) fs.writeFileSync(file, "{}\n");
+    const args = {
+      evidencePaths: [acceptance, freeze], checkpoint, recoveryRoot, dropboxRoot,
+    };
+    assert.throws(() => assertSafeLocalReportPath({ ...args, reportOut: acceptance }), /equals protected input/);
+    assert.throws(() => assertSafeLocalReportPath({ ...args, reportOut: path.join(recoveryRoot, "report.json") }), /protected evidence directory/);
+    assert.throws(() => assertSafeLocalReportPath({ ...args, reportOut: path.join(dropboxRoot, "report.json") }), /protected evidence directory/);
+    assert.equal(
+      assertSafeLocalReportPath({ ...args, reportOut: path.join(root, "reports", "result.json") }),
+      path.join(fs.realpathSync(root), "reports", "result.json"),
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("affected hierarchy branch rejects an omitted baseline sibling", () => {
+  const oldDay = { day_utc: "2026-08-20", manifest_key: "day-20", manifest_hash: "1".repeat(64) };
+  const newDay = { day_utc: DAY, manifest_key: "day-21", manifest_hash: "2".repeat(64) };
+  const july = { month: "07", manifest_key: "month-07", content_hash: "3".repeat(64) };
+  const august = { month: "08", manifest_key: "month-08", content_hash: "4".repeat(64) };
+  const year2025 = { year: 2025, manifest_key: "year-2025", content_hash: "5".repeat(64) };
+  const year2026 = { year: 2026, manifest_key: "year-2026", content_hash: "6".repeat(64) };
+  assert.throws(() => assertExactAffectedBranchDelta({
+    baselineMonthChildren: [oldDay],
+    baselineYearChildren: [july, { ...august, content_hash: "7".repeat(64) }],
+    baselineRootChildren: [year2025, { ...year2026, content_hash: "8".repeat(64) }],
+    currentMonth: { month: "08", manifest_key: "month-08", content_hash: august.content_hash, children: [newDay] },
+    currentYear: { year: 2026, manifest_key: "year-2026", content_hash: year2026.content_hash, children: [july, august] },
+    currentRoot: { children: [year2025, year2026] },
+    acceptedDay: newDay,
+  }), /advanced month aggregate differs/);
+});
+
+test("latest-global delta rejects removal of a baseline canonical day", () => {
+  const old = { day_utc: "2026-08-20", scoped_roots: [] };
+  const added = { day_utc: DAY, scoped_roots: [] };
+  assert.throws(() => assertExactLatestGlobalDelta({
+    baselineLatest: { days: [old.day_utc], day_summaries: [old] },
+    currentLatest: { days: [DAY], day_summaries: [added] },
+    acceptedDayUtc: DAY,
+  }), /day set differs from baseline canonical days plus accepted day/);
+});
+
+test("connector gate semantic hash and totals must bind to canonical R2", () => {
+  const independent = validateIndependentControlState(controlState(), accepted());
+  const canonical = {
+    connector: { manifest_hash: "b".repeat(64) },
+    parquet: { row_count: 1, file_count: 1, total_bytes: 100 },
+  };
+  assert.equal(bindIndependentControlStateToCanonical(independent, canonical).connector_day_gate_exact, true);
+  assert.throws(
+    () => bindIndependentControlStateToCanonical(independent, {
+      ...canonical,
+      connector: { manifest_hash: "c".repeat(64) },
+    }),
+    /semantic manifest_hash mismatch/,
+  );
+});
+
+test("PostgreSQL verifier work is enclosed in READ ONLY and always rolled back", async () => {
+  const statements = [];
+  const client = { query: async (sql) => { statements.push(sql); return { rows: [] }; } };
+  await assert.rejects(
+    withReadOnlyPgTransaction(client, async () => { throw new Error("probe failed"); }),
+    /probe failed/,
+  );
+  assert.deepEqual(statements, ["begin transaction read only", "rollback"]);
 });
 
 test("pre-migration Dropbox hierarchy cannot be a steady-state baseline", () => {

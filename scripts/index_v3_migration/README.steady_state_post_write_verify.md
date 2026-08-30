@@ -15,9 +15,10 @@ Evidence sources are:
 
 - local Git plus read-only GitHub repository, variable, workflow and deployment-log reads;
 - public maintenance-mode HTTP GET and one remote D1 scheduler `SELECT`;
+- an explicit check that neither Prune nor the observation-history Dropbox backup workflow is active;
 - the existing durable writer-freeze and immutable v2 runtime rollback validators;
 - the successful controlled Phase B report, including its source-freeze coordinator evidence;
-- independent IngestDB `SELECT`s and recomputation of source-content-hash v1;
+- independent IngestDB `SELECT`s, all enclosed in an explicit PostgreSQL `READ ONLY` transaction that is rolled back, and recomputation of source-content-hash v1;
 - canonical R2 connector, pollutant, day and aggregate manifests plus Parquet `HEAD` checksum evidence;
 - current v3 latest-global, scoped and child objects, validated by production readers;
 - the authenticated completed-migration recovery journal as the post-migration/pre-steady-state hierarchy baseline;
@@ -29,16 +30,26 @@ as a steady-state baseline. The accepted day must be absent from the completed
 migration recovery journal. All authenticated unaffected day manifests,
 including `--required-unchanged-day`, must still match exactly. Only the
 accepted month, year and root aggregate lineage may advance, and its current
-objects must remain canonical and include the accepted day.
+objects must contain exactly the authenticated sibling children with the
+accepted branch identity replaced. All unaffected completed-migration v3
+scoped/child objects remain exact, and latest-global must contain exactly the
+authenticated baseline canonical days plus the accepted day while retaining
+every older day summary exactly.
 
-Dependency outcomes are recorded as `EXACT`, `LEGACY` or `FAIL`. Any `FAIL`
-fails the verifier. A new LIVE acceptance also rejects any `LEGACY`; TEST
-records it visibly, though exact-only evidence is expected for a new scope.
+Dependency outcomes are recorded as `EXACT`, `LEGACY_RECOVERY_ORDERING` or
+`FAIL`. A newly written steady-state v3 scope is exact-only in both TEST and
+LIVE: `FAIL=0` and `LEGACY_RECOVERY_ORDERING=0` are mandatory.
 Missing/extra pollutants, source/gate/run mismatches, lost source rows,
 checksum/size mismatches, non-v3 physical schema, hard writer-limit violations,
 invalid baseline provenance, stale deployment evidence or an unsuccessful
 deployed read all fail closed. A whole-day gate blocked solely by pending peer
 connectors is valid.
+
+Before any PASS or FAIL report can be written, `--report-out` is canonicalized
+and proven distinct from every supplied input evidence file and the checkpoint,
+and outside both the checkpoint recovery directory and the supplied Dropbox
+root. This prevents the verifier report from overwriting migration or operator
+authority evidence.
 
 PASS means only:
 

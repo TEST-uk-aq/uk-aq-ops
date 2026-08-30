@@ -33,10 +33,6 @@ import {
   validateR2HistoryV2ObservationsAggregateManifest,
 } from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import { r2GetObject, r2HeadObject } from "../../workers/shared/r2_sigv4.mjs";
-import {
-  buildObservationHistoryV3RecoveryReplayStateSha256,
-  buildObservationHistoryV3RerunVerificationPlan,
-} from "../backup_r2/lib/observation_history_migration_v3.mjs";
 import { readAndValidateRecoveryJournal } from "./recovery_journal_authority.mjs";
 import { CONTROLLED_PHASE_B_SOURCE_TABLES } from "./index_v3_controlled_phase_b_source_freeze.mjs";
 
@@ -137,50 +133,6 @@ function requireEqual(actual, expected, label) {
   if (String(actual) !== String(expected)) {
     fail(`${label} mismatch: expected=${String(expected)} actual=${String(actual)}`);
   }
-}
-
-function canonicalizeLocalPath(input, label) {
-  const resolved = path.resolve(String(input || ""));
-  let existing = resolved;
-  const missing = [];
-  while (!fs.existsSync(existing)) {
-    const parent = path.dirname(existing);
-    if (parent === existing) fail(`${label} has no existing canonical ancestor`);
-    missing.unshift(path.basename(existing));
-    existing = parent;
-  }
-  let canonical;
-  try {
-    canonical = fs.realpathSync(existing);
-  } catch (error) {
-    fail(`${label} cannot be canonicalized: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  return path.join(canonical, ...missing);
-}
-
-function pathIsWithin(candidate, root) {
-  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
-}
-
-export function assertSafeLocalReportPath({
-  reportOut,
-  evidencePaths,
-  checkpoint,
-  recoveryRoot,
-  dropboxRoot,
-}) {
-  const output = canonicalizeLocalPath(reportOut, "report output path");
-  const protectedFiles = [...(evidencePaths || []), checkpoint]
-    .map((entry) => canonicalizeLocalPath(entry, "protected evidence path"));
-  if (protectedFiles.includes(output)) fail("report output path equals protected input evidence");
-  const protectedDirectories = [
-    canonicalizeLocalPath(recoveryRoot, "checkpoint recovery directory"),
-    canonicalizeLocalPath(dropboxRoot, "Dropbox root"),
-  ];
-  if (protectedDirectories.some((root) => pathIsWithin(output, root))) {
-    fail("report output path is inside a protected evidence directory");
-  }
-  return output;
 }
 
 export function validateAcceptanceReport(reportInput, expectedInput) {
@@ -433,29 +385,6 @@ export function validateIndependentControlState(stateInput, accepted) {
   });
 }
 
-export function bindIndependentControlStateToCanonical(independentInput, canonicalInput) {
-  const independent = plainObject(independentInput, "independent control state");
-  const canonical = plainObject(canonicalInput, "canonical R2 state");
-  const candidate = plainObject(independent.candidate, "independent candidate evidence");
-  const gate = plainObject(independent.connector_day_gate, "independent connector gate evidence");
-  const connector = plainObject(canonical.connector, "canonical connector manifest evidence");
-  const parquet = plainObject(canonical.parquet, "canonical Parquet totals");
-  requireEqual(gate.history_manifest_hash, connector.manifest_hash, "connector-day gate semantic manifest_hash");
-  for (const [label, record] of [["candidate", candidate], ["connector-day gate", gate]]) {
-    requireEqual(record.history_row_count, parquet.row_count, `${label} independently counted row total`);
-    requireEqual(record.history_file_count, parquet.file_count, `${label} independently counted file total`);
-    requireEqual(record.history_total_bytes, parquet.total_bytes, `${label} independently counted byte total`);
-  }
-  return Object.freeze({
-    semantic_manifest_hash: connector.manifest_hash,
-    row_count: parquet.row_count,
-    file_count: parquet.file_count,
-    total_bytes: parquet.total_bytes,
-    candidate_exact: true,
-    connector_day_gate_exact: true,
-  });
-}
-
 async function getIdentity(getObject, key) {
   const object = await getObject({ key });
   const body = exactBuffer(object?.body, key);
@@ -468,7 +397,7 @@ export function classifyDependencyIdentity(actual, expected, { allowLegacy = fal
     Number(expected.byte_size) > 0 && SHA256_PATTERN.test(String(expected?.sha256 || ""));
   if (!hasExact) {
     return allowLegacy
-      ? { classification: "LEGACY_RECOVERY_ORDERING", reason: "dependency_descriptor_lacks_exact_identity" }
+      ? { classification: "LEGACY", reason: "dependency_descriptor_lacks_exact_identity" }
       : { classification: "FAIL", reason: "dependency_descriptor_lacks_exact_identity" };
   }
   if (
@@ -485,12 +414,12 @@ export function summarizeDependencyReconciliation(entriesInput, environment) {
   const counts = {
     total: entries.length,
     EXACT: entries.filter((entry) => entry.classification === "EXACT").length,
-    LEGACY_RECOVERY_ORDERING: entries.filter((entry) => entry.classification === "LEGACY_RECOVERY_ORDERING").length,
+    LEGACY: entries.filter((entry) => entry.classification === "LEGACY").length,
     FAIL: entries.filter((entry) => entry.classification === "FAIL").length,
   };
   if (counts.FAIL !== 0) fail(`v3 dependency reconciliation has FAIL=${counts.FAIL}`);
-  if (counts.LEGACY_RECOVERY_ORDERING !== 0) {
-    fail(`new ${String(environment).toUpperCase()} steady-state scope rejects LEGACY_RECOVERY_ORDERING=${counts.LEGACY_RECOVERY_ORDERING}`);
+  if (String(environment).toUpperCase() === "LIVE" && counts.LEGACY !== 0) {
+    fail(`new LIVE steady-state acceptance rejects LEGACY=${counts.LEGACY}`);
   }
   return Object.freeze({ counts: Object.freeze(counts), entries: Object.freeze(entries.map((entry) => Object.freeze({ ...entry }))) });
 }
@@ -749,7 +678,7 @@ async function verifyV3Authority({ getObject, headObject, accepted, canonical, e
 
   let selectedProbe = null;
   for (const root of roots) {
-    const scopedObject = await reconcileJsonDependency(getObject, root, "scoped_manifest", entries);
+    const scopedObject = await reconcileJsonDependency(getObject, root, "scoped_manifest", entries, { allowLegacy: true });
     if (!scopedObject) continue;
     const scoped = validateObservationHistoryIndexV3ScopedManifestBody({ key: root.key, body: scopedObject.body });
     requireEqual(scoped.source.row_count, root.row_count, `v3 scoped canonical source rows ${root.pollutant_code}`);
@@ -761,7 +690,7 @@ async function verifyV3Authority({ getObject, headObject, accepted, canonical, e
     );
     const childFiles = new Map();
     for (const descriptor of scoped.descriptors) {
-      const childObject = await reconcileJsonDependency(getObject, descriptor, "child_shard", entries);
+      const childObject = await reconcileJsonDependency(getObject, descriptor, "child_shard", entries, { allowLegacy: true });
       if (!childObject) continue;
       const timeseriesId = descriptor.timeseries_ids[0];
       const child = validateObservationHistoryV3ChildForRead({
@@ -843,126 +772,6 @@ function completedIdentity(completed, key) {
   return { key, byte_size: Number(evidence.byte_size), sha256: evidence.sha256 };
 }
 
-function requireExactJson(actual, expected, label) {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) fail(`${label} differs from the exact expected child set`);
-}
-
-export function assertExactAffectedBranchDelta({
-  baselineMonthChildren,
-  baselineYearChildren,
-  baselineRootChildren,
-  currentMonth,
-  currentYear,
-  currentRoot,
-  acceptedDay,
-}) {
-  const accepted = plainObject(acceptedDay, "accepted day hierarchy descriptor");
-  const month = plainObject(currentMonth, "current month aggregate");
-  const year = plainObject(currentYear, "current year aggregate");
-  const root = plainObject(currentRoot, "current root aggregate");
-  const monthChildren = Array.isArray(baselineMonthChildren) ? baselineMonthChildren : [];
-  if (monthChildren.some((child) => child.day_utc === accepted.day_utc)) {
-    fail("accepted day already exists in the authenticated baseline month");
-  }
-  const expectedMonthChildren = [...monthChildren, {
-    day_utc: accepted.day_utc,
-    manifest_key: accepted.manifest_key,
-    manifest_hash: accepted.manifest_hash,
-  }].sort((left, right) => left.day_utc.localeCompare(right.day_utc));
-  requireExactJson(month.children, expectedMonthChildren, "advanced month aggregate");
-
-  const expectedYearChildren = [
-    ...(Array.isArray(baselineYearChildren) ? baselineYearChildren : [])
-      .filter((child) => child.month !== month.month),
-    { month: month.month, manifest_key: month.manifest_key, content_hash: month.content_hash },
-  ].sort((left, right) => left.month.localeCompare(right.month));
-  requireExactJson(year.children, expectedYearChildren, "advanced year aggregate");
-
-  const expectedRootChildren = [
-    ...(Array.isArray(baselineRootChildren) ? baselineRootChildren : [])
-      .filter((child) => Number(child.year) !== Number(year.year)),
-    { year: Number(year.year), manifest_key: year.manifest_key, content_hash: year.content_hash },
-  ].sort((left, right) => Number(left.year) - Number(right.year));
-  requireExactJson(root.children, expectedRootChildren, "advanced root aggregate");
-  return Object.freeze({
-    month_child_count: expectedMonthChildren.length,
-    year_child_count: expectedYearChildren.length,
-    root_child_count: expectedRootChildren.length,
-  });
-}
-
-export function assertExactLatestGlobalDelta({ baselineLatest, currentLatest, acceptedDayUtc }) {
-  const baseline = plainObject(baselineLatest, "authenticated baseline v3 latest-global");
-  const current = plainObject(currentLatest, "current v3 latest-global");
-  const acceptedDay = exactDay(acceptedDayUtc, "accepted latest-global day");
-  const baselineSummaries = Array.isArray(baseline.day_summaries) ? baseline.day_summaries : [];
-  const currentSummaries = Array.isArray(current.day_summaries) ? current.day_summaries : [];
-  if (baselineSummaries.some((summary) => summary.day_utc === acceptedDay)) {
-    fail("accepted day already exists in authenticated baseline v3 latest-global");
-  }
-  const expectedDays = [...baselineSummaries.map((summary) => summary.day_utc), acceptedDay].sort();
-  if (!sameSorted(current.days || [], expectedDays)) {
-    fail("current v3 latest-global day set differs from baseline canonical days plus accepted day");
-  }
-  const currentByDay = new Map(currentSummaries.map((summary) => [summary.day_utc, summary]));
-  for (const summary of baselineSummaries) {
-    requireExactJson(currentByDay.get(summary.day_utc), summary, `unaffected v3 latest-global day ${summary.day_utc}`);
-  }
-  if (!currentByDay.has(acceptedDay) || currentSummaries.length !== expectedDays.length) {
-    fail("current v3 latest-global has a missing or extra day summary");
-  }
-  return Object.freeze({ baseline_day_count: baselineSummaries.length, current_day_count: expectedDays.length });
-}
-
-function requireAuthenticatedCompletedPlanIdentity(completed, expected, label) {
-  const identity = completedIdentity(completed, expected.key);
-  if (!identity) fail(`${label} lacks exact authenticated completed-migration identity: ${expected.key}`);
-  return identity;
-}
-
-function replayAuthenticatedRecoveryCheckpoint(originalCheckpoint, journal) {
-  const checkpoint = structuredClone(originalCheckpoint);
-  checkpoint.prepared_units ||= {};
-  checkpoint.completed_objects ||= {};
-  checkpoint.preparation_order ||= [];
-  for (const entry of journal.entries) {
-    const updates = entry.payload.updates || {};
-    for (const prepared of updates.prepared_records || []) {
-      if (!prepared?.unit_id || prepared.record?.unit_id !== prepared.unit_id || checkpoint.prepared_units[prepared.unit_id]) {
-        fail(`authenticated recovery prepared-record update is invalid: ${String(prepared?.unit_id || "")}`);
-      }
-      checkpoint.prepared_units[prepared.unit_id] = structuredClone(prepared.record);
-    }
-    for (const state of updates.prepared_state_updates || []) {
-      const record = checkpoint.prepared_units[state?.unit_id];
-      if (!record) fail(`authenticated recovery state references unknown unit: ${String(state?.unit_id || "")}`);
-      if (state.files_published === true) record.files_published = true;
-      if (state.remove_staging_refs === true) {
-        record.target_file_intents = record.target_file_intents.map(({ staging_ref: _stagingRef, ...intent }) => intent);
-      }
-    }
-    for (const completed of updates.completed_objects || []) {
-      if (!completed?.key || !completed.evidence) fail("authenticated recovery completed-object update is invalid");
-      checkpoint.completed_objects[completed.key] ||= structuredClone(completed.evidence);
-    }
-    for (const unitId of updates.preparation_order_append || []) {
-      if (!checkpoint.prepared_units[unitId] || checkpoint.preparation_order.includes(unitId)) {
-        fail(`authenticated recovery preparation-order update is invalid: ${String(unitId)}`);
-      }
-      checkpoint.preparation_order.push(unitId);
-    }
-    if (updates.final_state) {
-      if (typeof updates.final_state.full_verification_complete === "boolean") {
-        checkpoint.full_verification_complete = updates.final_state.full_verification_complete;
-      }
-      if (typeof updates.final_state.cutover_ready === "boolean") {
-        checkpoint.cutover_ready = updates.final_state.cutover_ready;
-      }
-    }
-  }
-  return checkpoint;
-}
-
 async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, recoveryRoot, accepted, requiredUnchangedDay }) {
   const checkpointBytes = fs.readFileSync(checkpointPath);
   const checkpoint = JSON.parse(checkpointBytes.toString("utf8"));
@@ -980,21 +789,6 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
     expectedPlanSha256: planSha,
     expectedTargetWriterGitSha: targetWriterGitSha,
   });
-  const replayedCheckpoint = replayAuthenticatedRecoveryCheckpoint(checkpoint, journal);
-  const baselinePlan = buildObservationHistoryV3RerunVerificationPlan({
-    checkpoint: replayedCheckpoint,
-    allowLegacyRecoveryOrdering: true,
-    recoveryAuthority: {
-      authenticated: true,
-      original_checkpoint_sha256: sha256(checkpointBytes),
-      immutable_authority_sha256: authoritySha,
-      migration_run_id: migrationRunId,
-      plan_sha256: planSha,
-      last_sequence: journal.last_sequence,
-      last_entry_sha256: journal.last_entry_sha256,
-      replayed_checkpoint_sha256: buildObservationHistoryV3RecoveryReplayStateSha256(replayedCheckpoint),
-    },
-  });
   const headBytes = fs.readFileSync(path.join(recoveryRoot, "head.json"));
   const provenance = validateSteadyStateBaselineProvenance({
     kind: STEADY_STATE_BASELINE_KIND,
@@ -1008,7 +802,6 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
     migration_run_id: migrationRunId,
     plan_sha256: planSha,
     target_writer_git_sha: targetWriterGitSha,
-    recovery_reconciliation_mode: baselinePlan.recovery_reconciliation.mode,
   });
 
   const dayKey = buildHistoryV2DayManifestKey("history/v2/observations", accepted.day_utc);
@@ -1024,12 +817,6 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
     buildR2HistoryV2ObservationsYearManifestKey("history/v2/observations", accepted.day_utc.slice(0, 4)),
     buildR2HistoryV2ObservationsRootManifestKey("history/v2/observations"),
   ]);
-  const baselineCanonical = new Map(
-    baselinePlan.canonical_publication_objects.map((object) => [object.key, object]),
-  );
-  for (const object of baselineCanonical.values()) {
-    requireAuthenticatedCompletedPlanIdentity(journal.completed_objects, object, "canonical baseline object");
-  }
   const unaffected = [];
   const unaffectedAggregates = [];
   for (const key of journal.completed_objects.keys()) {
@@ -1060,68 +847,15 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
   const root = aggregates.find((entry) => entry.key.endsWith("/_manifests/manifest.json"));
   const dayIdentity = await getIdentity(getObject, dayKey);
   const dayPayload = JSON.parse(dayIdentity.body.toString("utf8"));
-  const acceptedYear = Number(accepted.day_utc.slice(0, 4));
-  const acceptedMonth = accepted.day_utc.slice(5, 7);
-  const baselineMonthChildren = [...baselineCanonical.values()]
-    .filter((object) => object.publication_stage === "day_manifest" && object.payload.day_utc.startsWith(`${acceptedYear}-${acceptedMonth}`))
-    .map((object) => ({
-      day_utc: object.payload.day_utc,
-      manifest_key: object.key,
-      manifest_hash: object.payload.manifest_hash,
-    }));
-  const baselineYearChildren = [...baselineCanonical.values()]
-    .filter((object) => object.publication_stage === "month_manifest" && Number(object.payload.year) === acceptedYear)
-    .map((object) => ({
-      month: object.payload.month,
-      manifest_key: object.key,
-      content_hash: object.payload.content_hash,
-    }));
-  const baselineRootChildren = [...baselineCanonical.values()]
-    .filter((object) => object.publication_stage === "year_manifest")
-    .map((object) => ({
-      year: Number(object.payload.year),
-      manifest_key: object.key,
-      content_hash: object.payload.content_hash,
-    }));
-  const branchDelta = assertExactAffectedBranchDelta({
-    baselineMonthChildren,
-    baselineYearChildren,
-    baselineRootChildren,
-    currentMonth: { ...month.payload, manifest_key: month.key },
-    currentYear: { ...year.payload, manifest_key: year.key },
-    currentRoot: root.payload,
-    acceptedDay: {
-      day_utc: accepted.day_utc,
-      manifest_key: dayKey,
-      manifest_hash: dayPayload.manifest_hash,
-    },
-  });
-
-  const baselineV3Entries = baselinePlan.v3_publication_plan.entries;
-  const unaffectedV3 = [];
-  for (const expected of baselineV3Entries) {
-    const authenticatedIdentity = requireAuthenticatedCompletedPlanIdentity(journal.completed_objects, expected, "v3 baseline object");
-    if (expected.key === DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY) continue;
-    const current = await getIdentity(getObject, expected.key);
-    if (current.byte_size !== authenticatedIdentity.byte_size || current.sha256 !== authenticatedIdentity.sha256) {
-      fail(`unaffected authenticated v3 authority changed: ${expected.key}`);
-    }
-    unaffectedV3.push({ key: expected.key, byte_size: current.byte_size, sha256: current.sha256 });
-  }
-  const currentLatestIdentity = await getIdentity(getObject, DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY);
-  const currentLatest = exactLatestPayload(currentLatestIdentity.body);
-  const baselineCanonicalDays = [...baselineCanonical.keys()]
-    .filter((key) => /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key))
-    .map((key) => key.match(/day_utc=(\d{4}-\d{2}-\d{2})/)[1])
-    .sort();
-  if (!sameSorted(baselinePlan.v3_latest.payload.days || [], baselineCanonicalDays)) {
-    fail("authenticated baseline v3 latest-global days differ from baseline canonical day authority");
-  }
-  const latestDelta = assertExactLatestGlobalDelta({
-    baselineLatest: baselinePlan.v3_latest.payload,
-    currentLatest,
-    acceptedDayUtc: accepted.day_utc,
-  });
+  const dayChild = month.payload.children.find((entry) => entry.day_utc === accepted.day_utc);
+  if (!dayChild || dayChild.manifest_key !== dayKey) fail("advanced month aggregate omits the accepted day");
+  requireEqual(dayChild.manifest_hash, dayPayload.manifest_hash, "advanced month accepted-day identity");
+  const monthChild = year.payload.children.find((entry) => entry.manifest_key === month.key);
+  if (!monthChild) fail("advanced year aggregate omits the accepted month");
+  requireEqual(monthChild.content_hash, month.content_hash, "advanced year accepted-month identity");
+  const yearChild = root.payload.children.find((entry) => entry.manifest_key === year.key);
+  if (!yearChild) fail("advanced root aggregate omits the accepted year");
+  requireEqual(yearChild.content_hash, year.content_hash, "advanced root accepted-year identity");
 
   return Object.freeze({
     baseline: provenance,
@@ -1134,9 +868,6 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
     unaffected_aggregate_identity_count: unaffectedAggregates.length,
     required_unchanged_day: unaffected.find((entry) => entry.key === requiredDayKey),
     advanced_aggregate_identities: aggregates.map(({ payload: _payload, ...identity }) => identity),
-    affected_branch_exact_delta: branchDelta,
-    unaffected_v3_identity_count: unaffectedV3.length,
-    latest_global_exact_delta: latestDelta,
   });
 }
 
@@ -1210,7 +941,6 @@ function validateControlAuthority(controlInput, expected) {
     "repository_git_sha_exact", "loaded_history_v2", "loaded_index_v3",
     "persistent_history_v2", "persistent_index_v3", "loaded_integrity_v2",
     "maintenance_on", "three_scheduler_jobs_disabled", "no_active_prune",
-    "no_active_backup",
     "writer_freeze_valid", "v2_runtime_rollback_record_valid",
     "cache_to_station_candidate_exact", "station_to_observation_candidate_exact",
   ]) {
@@ -1251,7 +981,6 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     accepted,
     candidateManifestKey: independent.candidate.manifest_key,
   });
-  const controlR2Binding = bindIndependentControlStateToCanonical(independent, canonical);
   const v3 = await verifyV3Authority({
     getObject: adapters.getObject,
     headObject: adapters.headObject,
@@ -1287,7 +1016,6 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     repository_control_authority: control,
     accepted_publication: accepted,
     independent_control_state: independent,
-    independent_control_r2_binding: controlR2Binding,
     canonical_hierarchy: canonical,
     observation_index_v3: v3,
     hierarchy_delta: hierarchyDelta,
@@ -1310,49 +1038,19 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
   });
 }
 
-function parseFlagValues(argv) {
+function parseArgs(argv) {
   const values = {};
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (!flag.startsWith("--") || index + 1 >= argv.length) fail(`invalid argument: ${flag}`);
     values[flag.slice(2).replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase())] = argv[++index];
   }
-  return values;
-}
-
-function validateReportPathValues(values) {
-  for (const name of [
-    "reportOut", "acceptanceReport", "controlEvidence", "planReport", "checkpoint",
-    "dropboxRoot", "writerFreezeEvidence", "v2RuntimeRollbackRecord",
-  ]) {
-    if (!values[name]) fail(`--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)} is required`);
-  }
-  values.reportOut = assertSafeLocalReportPath({
-    reportOut: values.reportOut,
-    evidencePaths: [
-      values.acceptanceReport,
-      values.controlEvidence,
-      values.planReport,
-      values.writerFreezeEvidence,
-      values.v2RuntimeRollbackRecord,
-    ],
-    checkpoint: values.checkpoint,
-    recoveryRoot: `${values.checkpoint}.recovery`,
-    dropboxRoot: values.dropboxRoot,
-  });
-  values.reportOutSafetyValidated = true;
-  return values;
-}
-
-function parseArgs(argv) {
-  const values = parseFlagValues(argv);
   const required = [
     "environment", "repository", "repositoryGitSha", "bucket", "expectedAcceptanceGitSha",
     "acceptanceReport", "expectedAcceptanceReportSha256", "expectedRunId", "expectedDayUtc",
     "expectedConnectorId", "expectedRowCount", "expectedSourceContentHash",
     "expectedSourceHashContractVersion", "expectedPollutantCount", "controlEvidence",
-    "planReport", "checkpoint", "dropboxRoot", "writerFreezeEvidence",
-    "v2RuntimeRollbackRecord", "requiredUnchangedDay", "siteUrl", "cacheUrl", "reportOut",
+    "planReport", "checkpoint", "dropboxRoot", "requiredUnchangedDay", "siteUrl", "cacheUrl", "reportOut",
   ];
   for (const name of required) if (!values[name]) fail(`--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)} is required`);
   values.environment = String(values.environment).toUpperCase();
@@ -1367,34 +1065,18 @@ function parseArgs(argv) {
   values.expectedSourceContentHash = exactSha256(values.expectedSourceContentHash, "expected source hash");
   values.expectedSourceHashContractVersion = exactPositiveInteger(values.expectedSourceHashContractVersion, "expected source hash contract version");
   values.expectedPollutantCount = exactPositiveInteger(values.expectedPollutantCount, "expected pollutant count");
-  validateReportPathValues(values);
   values.cacheBypassSecret = process.env.UK_AQ_CACHE_BYPASS_SECRET || "";
   if (!values.cacheBypassSecret) fail("UK_AQ_CACHE_BYPASS_SECRET is required for the deployed read probe");
   return values;
 }
 
-function writeReport(reportOut, payload, safetyValidated) {
-  if (safetyValidated !== true) fail("report output path protection has not passed");
-  const output = reportOut;
+function writeReport(reportOut, payload) {
+  const output = path.resolve(reportOut);
   fs.mkdirSync(path.dirname(output), { recursive: true });
   fs.writeFileSync(output, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
-export async function withReadOnlyPgTransaction(client, operation) {
-  await client.query("begin transaction read only");
-  try {
-    return await operation();
-  } finally {
-    await client.query("rollback");
-  }
-}
-
 async function main() {
-  if (process.argv[2] === "--check-report-path") {
-    const values = validateReportPathValues(parseFlagValues(process.argv.slice(3)));
-    process.stdout.write(`${values.reportOut}\n`);
-    return;
-  }
   const options = parseArgs(process.argv.slice(2));
   const r2 = {
     endpoint: process.env.CFLARE_R2_ENDPOINT,
@@ -1414,15 +1096,13 @@ async function main() {
   let report;
   try {
     await client.connect();
-    report = await withReadOnlyPgTransaction(client, async () =>
-      await executeSteadyStatePostWriteVerifier(options, {
-        query: async ({ sql, params }) => await client.query(assertReadOnlySql(sql), params),
-        getObject: async ({ key }) => await r2GetObject({ r2, key }),
-        headObject: async ({ key }) => await r2HeadObject({ r2, key }),
-        httpGet: async ({ url, headers }) => await fetch(url, { method: "GET", headers }),
-      })
-    );
-    writeReport(options.reportOut, report, options.reportOutSafetyValidated);
+    report = await executeSteadyStatePostWriteVerifier(options, {
+      query: async ({ sql, params }) => await client.query(assertReadOnlySql(sql), params),
+      getObject: async ({ key }) => await r2GetObject({ r2, key }),
+      headObject: async ({ key }) => await r2HeadObject({ r2, key }),
+      httpGet: async ({ url, headers }) => await fetch(url, { method: "GET", headers }),
+    });
+    writeReport(options.reportOut, report);
     process.stdout.write(`${FINAL_SUCCESS.join("\n")}\n`);
   } catch (error) {
     report = {
@@ -1434,9 +1114,7 @@ async function main() {
       mutation_performed: false,
       error: error instanceof Error ? error.message : String(error),
     };
-    if (options?.reportOutSafetyValidated === true) {
-      writeReport(options.reportOut, report, true);
-    }
+    if (options?.reportOut) writeReport(options.reportOut, report);
     throw error;
   } finally {
     await client.end().catch(() => {});
