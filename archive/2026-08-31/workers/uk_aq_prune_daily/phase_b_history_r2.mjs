@@ -1318,26 +1318,7 @@ async function revalidateCompleteCandidateSourceIdentity(client, candidate) {
   try {
     const locked = await client.query(
       `
-select
-  day_utc::text as day_utc,
-  connector_id,
-  expected_row_count,
-  min_observed_at,
-  max_observed_at,
-  status,
-  run_id,
-  manifest_key,
-  history_row_count,
-  history_file_count,
-  history_total_bytes,
-  source_content_hash,
-  source_content_hash_contract_version,
-  source_content_hash_row_count,
-  resume_last_timeseries_id,
-  resume_last_observed_at,
-  resume_part_index,
-  resume_exported_row_count,
-  resume_parts_json
+select *
 from uk_aq_ops.history_candidates
 where day_utc = $1::date
   and connector_id = $2::integer
@@ -1717,25 +1698,7 @@ invalidated_connector_gates as (
   returning day_utc, connector_id
 )
 select
-  u.day_utc::text as day_utc,
-  u.connector_id,
-  u.expected_row_count,
-  u.min_observed_at,
-  u.max_observed_at,
-  u.status,
-  u.run_id,
-  u.manifest_key,
-  u.history_row_count,
-  u.history_file_count,
-  u.history_total_bytes,
-  u.source_content_hash,
-  u.source_content_hash_contract_version,
-  u.source_content_hash_row_count,
-  u.resume_last_timeseries_id,
-  u.resume_last_observed_at,
-  u.resume_part_index,
-  u.resume_exported_row_count,
-  u.resume_parts_json,
+  u.*,
   u.expected_row_count::bigint as source_row_count,
   0::bigint as excluded_row_count,
   '{}'::jsonb as excluded_pollutant_counts,
@@ -1928,24 +1891,7 @@ upserted as (
     resume_exported_row_count,
     resume_parts_json
 )
-select
-  day_utc::text as day_utc,
-  connector_id,
-  expected_row_count,
-  min_observed_at,
-  max_observed_at,
-  status,
-  run_id,
-  manifest_key,
-  history_row_count,
-  history_file_count,
-  history_total_bytes,
-  resume_last_timeseries_id,
-  resume_last_observed_at,
-  resume_part_index,
-  resume_exported_row_count,
-  resume_parts_json
-from upserted
+select * from upserted
 order by day_utc, connector_id
 `;
 
@@ -2040,7 +1986,7 @@ with active_scope as (
   from jsonb_to_recordset($1::jsonb) as s(day_utc text, connector_id integer)
 )
 select
-  c.day_utc::text as day_utc,
+  c.day_utc,
   c.connector_id,
   c.expected_row_count,
   c.min_observed_at,
@@ -2239,7 +2185,7 @@ async function fetchDayCandidates(client, dayUtc) {
   const result = await client.query(
     `
 select
-  day_utc::text as day_utc,
+  day_utc,
   connector_id,
   expected_row_count,
   min_observed_at,

@@ -359,7 +359,8 @@ function candidatePopulationClient({ candidates, gates, sourceRows, afterPopulat
       if (/^begin isolation level repeatable read$/i.test(sql.trim()) || /^(commit|rollback)$/i.test(sql.trim())) {
         return { rows: [] };
       }
-      if (/select \*\s+from uk_aq_ops\.history_candidates/i.test(sql)) {
+      if (/from uk_aq_ops\.history_candidates[\s\S]+for update/i.test(sql)) {
+        assert.match(sql, /day_utc::text as day_utc/i);
         return { rows: [candidates.get(connectorDayGateKey(params[0], params[1]))] };
       }
       if (/uk_aq_phase_b_history_rows_v2/i.test(sql)) {

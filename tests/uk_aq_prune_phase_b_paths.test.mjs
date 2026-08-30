@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
@@ -321,6 +322,59 @@ test("Phase B v2 accepts digit-leading canonical codes in candidate SQL and R2 p
   }
 });
 
+test("Phase B keeps PostgreSQL calendar days stable during Europe/London BST", () => {
+  const script = String.raw`
+import assert from "node:assert/strict";
+import pg from "pg";
+import { populateBackupCandidatesForTest } from "./workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+
+const dayUtc = "2026-08-25";
+const pgDate = pg.types.getTypeParser(1082, "text")(dayUtc);
+assert.equal(pgDate.constructor.name, "Date");
+assert.equal(pgDate.toISOString(), "2026-08-24T23:00:00.000Z");
+
+let candidateSql = "";
+const timestamp = new Date("2026-08-25T12:34:56.000Z");
+const client = {
+  async query(sql) {
+    if (sql.includes("select distinct op.code")) return { rows: [] };
+    candidateSql = sql;
+    return {
+      rows: [{
+        day_utc: /u\.day_utc::text as day_utc/i.test(sql) ? dayUtc : pgDate,
+        connector_id: 7,
+        expected_row_count: "1",
+        source_row_count: "1",
+        excluded_row_count: "0",
+        excluded_pollutant_counts: {},
+        min_observed_at: timestamp,
+        max_observed_at: timestamp,
+        status: "pending",
+      }],
+    };
+  },
+};
+
+const [candidate] = await populateBackupCandidatesForTest({
+  client,
+  latestEligibleWindowEndIso: "2026-08-26T00:00:00.000Z",
+  runtime: { history_write_version: "v2" },
+});
+
+assert.match(candidateSql, /u\.day_utc::text as day_utc/i);
+assert.equal(candidate.day_utc, dayUtc);
+assert.equal(candidate.min_observed_at, timestamp.toISOString());
+assert.equal(candidate.max_observed_at, timestamp.toISOString());
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: { ...process.env, TZ: "Europe/London" },
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
 test("Phase B v2 still rejects blank and unsafe observation property paths", async () => {
   const unsafeCodes = ["", " ", "a/b", "a\\b", "a=b", "../a", "a.b", "a%2fb"];
   for (const code of unsafeCodes) {
@@ -402,6 +456,7 @@ test("Phase B v2 SQL uses set-based aggregation and preserves complete candidate
   assert.equal(candidateSql.includes("count(*)::bigint as expected_row_count"), true);
   assert.equal(candidateSql.includes("min(o.observed_at) as min_observed_at"), true);
   assert.equal(candidateSql.includes("max(o.observed_at) as max_observed_at"), true);
+  assert.match(candidateSql, /u\.day_utc::text as day_utc/i);
   
   // Verify no correlated subquery
   assert.equal(candidateSql.includes("select count(*)::bigint"), false);
