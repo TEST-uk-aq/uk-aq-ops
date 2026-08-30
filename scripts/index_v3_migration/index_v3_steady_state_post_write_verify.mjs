@@ -36,6 +36,7 @@ import { r2GetObject, r2HeadObject } from "../../workers/shared/r2_sigv4.mjs";
 import {
   buildObservationHistoryV3RecoveryReplayStateSha256,
   buildObservationHistoryV3RerunVerificationPlan,
+  stableMigrationJson,
 } from "../backup_r2/lib/observation_history_migration_v3.mjs";
 import { readAndValidateRecoveryJournal } from "./recovery_journal_authority.mjs";
 import { CONTROLLED_PHASE_B_SOURCE_TABLES } from "./index_v3_controlled_phase_b_source_freeze.mjs";
@@ -857,7 +858,9 @@ function completedIdentity(completed, key) {
 }
 
 function requireExactJson(actual, expected, label) {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) fail(`${label} differs from the exact expected child set`);
+  if (stableMigrationJson(actual) !== stableMigrationJson(expected)) {
+    fail(`${label} differs from the exact expected child set`);
+  }
 }
 
 export function assertExactAffectedBranchDelta({

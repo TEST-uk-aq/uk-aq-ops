@@ -440,6 +440,36 @@ test("affected hierarchy branch rejects an omitted baseline sibling", () => {
   const august = { month: "08", manifest_key: "month-08", content_hash: "4".repeat(64) };
   const year2025 = { year: 2025, manifest_key: "year-2025", content_hash: "5".repeat(64) };
   const year2026 = { year: 2026, manifest_key: "year-2026", content_hash: "6".repeat(64) };
+  assert.doesNotThrow(() => assertExactAffectedBranchDelta({
+    baselineMonthChildren: [oldDay],
+    baselineYearChildren: [july, { ...august, content_hash: "7".repeat(64) }],
+    baselineRootChildren: [year2025, { ...year2026, content_hash: "8".repeat(64) }],
+    currentMonth: {
+      month: "08",
+      manifest_key: "month-08",
+      content_hash: august.content_hash,
+      children: [
+        { manifest_hash: oldDay.manifest_hash, manifest_key: oldDay.manifest_key, day_utc: oldDay.day_utc },
+        { manifest_hash: newDay.manifest_hash, manifest_key: newDay.manifest_key, day_utc: newDay.day_utc },
+      ],
+    },
+    currentYear: {
+      year: 2026,
+      manifest_key: "year-2026",
+      content_hash: year2026.content_hash,
+      children: [
+        { content_hash: july.content_hash, manifest_key: july.manifest_key, month: july.month },
+        { content_hash: august.content_hash, manifest_key: august.manifest_key, month: august.month },
+      ],
+    },
+    currentRoot: {
+      children: [
+        { content_hash: year2025.content_hash, manifest_key: year2025.manifest_key, year: year2025.year },
+        { content_hash: year2026.content_hash, manifest_key: year2026.manifest_key, year: year2026.year },
+      ],
+    },
+    acceptedDay: newDay,
+  }));
   assert.throws(() => assertExactAffectedBranchDelta({
     baselineMonthChildren: [oldDay],
     baselineYearChildren: [july, { ...august, content_hash: "7".repeat(64) }],
@@ -449,6 +479,70 @@ test("affected hierarchy branch rejects an omitted baseline sibling", () => {
     currentRoot: { children: [year2025, year2026] },
     acceptedDay: newDay,
   }), /advanced month aggregate differs/);
+});
+
+test("latest-global semantic comparison ignores object insertion order but preserves arrays and exact fields", () => {
+  const oldDay = "2025-01-01";
+  const baselineSummary = {
+    scoped_roots: [
+      { row_count: 10, nested: { z: 2, a: 1 }, pollutant_code: "no2" },
+      { row_count: 20, nested: { z: 4, a: 3 }, pollutant_code: "pm10" },
+    ],
+    row_count: 30,
+    day_utc: oldDay,
+  };
+  const currentSummary = {
+    day_utc: oldDay,
+    row_count: 30,
+    scoped_roots: [
+      { nested: { a: 1, z: 2 }, pollutant_code: "no2", row_count: 10 },
+      { nested: { a: 3, z: 4 }, pollutant_code: "pm10", row_count: 20 },
+    ],
+  };
+  const baselineLatest = { days: [oldDay], day_summaries: [baselineSummary] };
+  const currentLatest = {
+    days: [oldDay, DAY],
+    day_summaries: [currentSummary, { day_utc: DAY }],
+  };
+  assert.doesNotThrow(() => assertExactLatestGlobalDelta({
+    baselineLatest,
+    currentLatest,
+    acceptedDayUtc: DAY,
+  }));
+
+  assert.throws(() => assertExactLatestGlobalDelta({
+    baselineLatest,
+    currentLatest: {
+      ...currentLatest,
+      day_summaries: [{ ...currentSummary, scoped_roots: [...currentSummary.scoped_roots].reverse() }, { day_utc: DAY }],
+    },
+    acceptedDayUtc: DAY,
+  }), /unaffected v3 latest-global day 2025-01-01 differs/);
+
+  const { row_count: _rowCount, ...missingFieldSummary } = currentSummary;
+  assert.throws(() => assertExactLatestGlobalDelta({
+    baselineLatest,
+    currentLatest: { ...currentLatest, day_summaries: [missingFieldSummary, { day_utc: DAY }] },
+    acceptedDayUtc: DAY,
+  }), /unaffected v3 latest-global day 2025-01-01 differs/);
+
+  assert.throws(() => assertExactLatestGlobalDelta({
+    baselineLatest,
+    currentLatest: {
+      ...currentLatest,
+      day_summaries: [{ ...currentSummary, unexpected: true }, { day_utc: DAY }],
+    },
+    acceptedDayUtc: DAY,
+  }), /unaffected v3 latest-global day 2025-01-01 differs/);
+
+  assert.throws(() => assertExactLatestGlobalDelta({
+    baselineLatest,
+    currentLatest: {
+      ...currentLatest,
+      day_summaries: [{ ...currentSummary, row_count: 31 }, { day_utc: DAY }],
+    },
+    acceptedDayUtc: DAY,
+  }), /unaffected v3 latest-global day 2025-01-01 differs/);
 });
 
 test("latest-global delta rejects removal of a baseline canonical day", () => {
