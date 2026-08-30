@@ -566,7 +566,7 @@ function assertChildWriterLimits(child, label) {
   }
 }
 
-async function verifyCanonicalHierarchy({ getObject, headObject, accepted, candidateManifestKey }) {
+export async function verifyCanonicalHierarchy({ getObject, headObject, accepted, candidateManifestKey }) {
   const connectorObject = await getIdentity(getObject, candidateManifestKey);
   const connector = JSON.parse(connectorObject.body.toString("utf8"));
   validateCanonicalHistoryV2Manifest(connector, {
@@ -657,7 +657,20 @@ async function verifyCanonicalHierarchy({ getObject, headObject, accepted, candi
   requireEqual(acceptedRef.manifest_hash, connector.manifest_hash, "day parent connector hash");
   for (const peer of day.connector_manifests || []) {
     const object = await getIdentity(getObject, peer.manifest_key);
-    requireEqual(object.sha256, peer.manifest_hash, `day parent connector child identity ${peer.connector_id}`);
+    const peerConnector = JSON.parse(object.body.toString("utf8"));
+    validateCanonicalHistoryV2Manifest(peerConnector, {
+      history_version: "v2",
+      domain: "observations",
+      manifest_kind: "connector",
+      day_utc: accepted.day_utc,
+      connector_id: peer.connector_id,
+      manifest_key: peer.manifest_key,
+    });
+    requireEqual(
+      peerConnector.manifest_hash,
+      peer.manifest_hash,
+      `day parent connector child identity ${peer.connector_id}`,
+    );
   }
   return Object.freeze({
     connector: { key: connectorObject.key, byte_size: connectorObject.byte_size, sha256: connectorObject.sha256, manifest_hash: connector.manifest_hash },

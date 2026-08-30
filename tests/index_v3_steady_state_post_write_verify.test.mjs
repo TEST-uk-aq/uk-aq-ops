@@ -19,8 +19,16 @@ import {
   validateAcceptanceReport,
   validateIndependentControlState,
   validateSteadyStateBaselineProvenance,
+  verifyCanonicalHierarchy,
   withReadOnlyPgTransaction,
 } from "../scripts/index_v3_migration/index_v3_steady_state_post_write_verify.mjs";
+import { buildObservationHistoryV3SteadyStatePartition } from "../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
+import {
+  buildHistoryV2ConnectorManifest,
+  buildHistoryV2ConnectorManifestKey,
+  buildHistoryV2DayManifest,
+  buildHistoryV2DayManifestKey,
+} from "../workers/shared/uk_aq_r2_history_canonical.mjs";
 import { computePruneConnectorSourceIdentity } from "../workers/shared/uk_aq_prune_connector_source_identity.mjs";
 import { CONTROLLED_PHASE_B_SOURCE_TABLES } from "../scripts/index_v3_migration/index_v3_controlled_phase_b_source_freeze.mjs";
 
@@ -116,6 +124,83 @@ function acceptanceReport(overrides = {}) {
 
 function accepted() {
   return validateAcceptanceReport(acceptanceReport(), expected());
+}
+
+function canonicalHierarchyFixture() {
+  const prefix = "history/v2/observations";
+  const writerGitSha = "d".repeat(40);
+  const backedUpAtUtc = "2026-08-30T00:00:00.000Z";
+  const partition = (connectorId, pollutantCode, timeseriesId) =>
+    buildObservationHistoryV3SteadyStatePartition({
+      source: "prune_daily",
+      rows: [{
+        connector_id: connectorId,
+        station_id: connectorId * 10,
+        timeseries_id: timeseriesId,
+        pollutant_code: pollutantCode,
+        observed_at_utc: `${DAY}T12:00:00.000Z`,
+        value: 12.5,
+        verification_status: null,
+      }],
+      targetWriterGitSha: writerGitSha,
+      backedUpAtUtc,
+    });
+  const acceptedPartition = partition(1, "no2", 101);
+  const peerPartition = partition(2, "pm10", 201);
+  const connector = (connectorId, prepared) => buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY,
+    connectorId,
+    runId: null,
+    manifestKey: buildHistoryV2ConnectorManifestKey(prefix, DAY, connectorId),
+    pollutantManifests: [prepared.canonical_pollutant_manifest.payload],
+    writerGitSha,
+    backedUpAtUtc,
+  });
+  const acceptedConnector = connector(1, acceptedPartition);
+  const peerConnector = connector(2, peerPartition);
+  const dayKey = buildHistoryV2DayManifestKey(prefix, DAY);
+  const objects = new Map([
+    [acceptedConnector.manifest_key, Buffer.from(JSON.stringify(acceptedConnector, null, 2))],
+    [peerConnector.manifest_key, Buffer.from(JSON.stringify(peerConnector, null, 2))],
+    [acceptedPartition.canonical_pollutant_manifest.key, Buffer.from(JSON.stringify(acceptedPartition.canonical_pollutant_manifest.payload, null, 2))],
+  ]);
+  const fileHeads = new Map(acceptedPartition.target_metadata.files.map((file) => [file.key, {
+    exists: true,
+    bytes: file.byte_size,
+    sha256: file.sha256,
+  }]));
+  const writeDay = (peerManifestHash = peerConnector.manifest_hash) => {
+    const payload = buildHistoryV2DayManifest({
+      domain: "observations",
+      dayUtc: DAY,
+      runId: null,
+      manifestKey: dayKey,
+      connectorManifests: [acceptedConnector, { ...peerConnector, manifest_hash: peerManifestHash }],
+      writerGitSha,
+      backedUpAtUtc,
+    });
+    objects.set(dayKey, Buffer.from(JSON.stringify(payload, null, 2)));
+  };
+  writeDay();
+  return {
+    accepted: {
+      day_utc: DAY,
+      connector_id: 1,
+      source_row_count: 1,
+      pollutant_codes: ["no2"],
+    },
+    candidateManifestKey: acceptedConnector.manifest_key,
+    acceptedConnector,
+    peerConnector,
+    objects,
+    writeDay,
+    getObject: async ({ key }) => {
+      if (!objects.has(key)) throw new Error(`fixture object missing: ${key}`);
+      return { body: objects.get(key) };
+    },
+    headObject: async ({ key }) => fileHeads.get(key) || { exists: false },
+  };
 }
 
 function controlState(overrides = {}) {
@@ -278,6 +363,31 @@ test("canonical dependency mismatch is classified FAIL", () => {
       { byte_size: 10, sha256: "a".repeat(64) },
     ),
     { classification: "FAIL", reason: "exact_identity_mismatch" },
+  );
+});
+
+test("day parent resolves connector children by semantic manifest_hash, not complete-object SHA", async () => {
+  const fixture = canonicalHierarchyFixture();
+  const peerBodySha = crypto.createHash("sha256")
+    .update(fixture.objects.get(fixture.peerConnector.manifest_key))
+    .digest("hex");
+  assert.notEqual(peerBodySha, fixture.peerConnector.manifest_hash);
+  const verified = await verifyCanonicalHierarchy(fixture);
+  assert.equal(verified.connector.manifest_hash, fixture.acceptedConnector.manifest_hash);
+
+  fixture.writeDay("e".repeat(64));
+  await assert.rejects(
+    verifyCanonicalHierarchy(fixture),
+    /day parent connector child identity 2 mismatch/,
+  );
+
+  fixture.writeDay();
+  fixture.objects.set(fixture.peerConnector.manifest_key, Buffer.from("{"));
+  await assert.rejects(verifyCanonicalHierarchy(fixture));
+  fixture.objects.delete(fixture.peerConnector.manifest_key);
+  await assert.rejects(
+    verifyCanonicalHierarchy(fixture),
+    /fixture object missing/,
   );
 });
 
