@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +14,7 @@ import {
   assertSafeLocalReportPath,
   bindIndependentControlStateToCanonical,
   classifyDependencyIdentity,
+  executeSteadyStatePostWriteVerifier,
   summarizeDependencyReconciliation,
   validateAcceptanceReport,
   validateIndependentControlState,
@@ -179,6 +181,74 @@ test("acceptance-report exact identity mismatch fails closed", () => {
     () => validateAcceptanceReport(acceptanceReport(), expected({ run_id: "different-run" })),
     /acceptance run_id mismatch/,
   );
+});
+
+test("parsed repositoryGitSha maps to control repository_git_sha and still fails on a real mismatch", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-steady-control-"));
+  try {
+    const acceptancePath = path.join(root, "acceptance.json");
+    const controlPath = path.join(root, "control.json");
+    const acceptanceBody = Buffer.from(JSON.stringify(acceptanceReport()), "utf8");
+    const repositoryGitSha = "b".repeat(40);
+    fs.writeFileSync(acceptancePath, acceptanceBody);
+    fs.writeFileSync(controlPath, JSON.stringify({
+      environment: "TEST",
+      repository: "TEST-uk-aq/uk-aq-ops",
+      repository_git_sha: repositoryGitSha,
+      bucket: "test-bucket",
+      repository_exact: true,
+      working_tree_clean: true,
+      default_branch_current: true,
+      repository_git_sha_exact: true,
+      loaded_history_v2: true,
+      loaded_index_v3: true,
+      persistent_history_v2: true,
+      persistent_index_v3: true,
+      loaded_integrity_v2: true,
+      maintenance_on: true,
+      three_scheduler_jobs_disabled: true,
+      no_active_prune: true,
+      no_active_backup: true,
+      writer_freeze_valid: true,
+      v2_runtime_rollback_record_valid: true,
+      cache_to_station_candidate_exact: true,
+      station_to_observation_candidate_exact: true,
+    }));
+    const options = {
+      ...expected(),
+      environment: "TEST",
+      repository: "TEST-uk-aq/uk-aq-ops",
+      repositoryGitSha,
+      bucket: "test-bucket",
+      acceptanceReport: acceptancePath,
+      expectedAcceptanceReportSha256: crypto.createHash("sha256").update(acceptanceBody).digest("hex"),
+      expectedAcceptanceGitSha: ACCEPTANCE_GIT_SHA,
+      expectedRunId: RUN_ID,
+      expectedDayUtc: DAY,
+      expectedConnectorId: 1,
+      expectedRowCount: 1,
+      expectedSourceContentHash: SOURCE_IDENTITY.source_content_hash,
+      expectedSourceHashContractVersion: 1,
+      expectedPollutantCount: 1,
+      controlEvidence: controlPath,
+    };
+    const adapters = {
+      query: async () => { throw new Error("control authority passed"); },
+      getObject: async () => { throw new Error("unexpected R2 GET"); },
+      headObject: async () => { throw new Error("unexpected R2 HEAD"); },
+      httpGet: async () => { throw new Error("unexpected HTTP GET"); },
+    };
+    await assert.rejects(
+      executeSteadyStatePostWriteVerifier(options, adapters),
+      /control authority passed/,
+    );
+    await assert.rejects(
+      executeSteadyStatePostWriteVerifier({ ...options, repositoryGitSha: "c".repeat(40) }, adapters),
+      /control repository Git SHA mismatch: expected=c{40} actual=b{40}/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("independently retained source mismatch fails closed", () => {

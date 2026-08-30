@@ -1239,7 +1239,15 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     source_content_hash_contract_version: options.expectedSourceHashContractVersion,
     pollutant_count: options.expectedPollutantCount,
   });
-  const control = validateControlAuthority(parseJsonFile(options.controlEvidence, "control evidence"), options);
+  const control = validateControlAuthority(
+    parseJsonFile(options.controlEvidence, "control evidence"),
+    {
+      environment: options.environment,
+      repository: options.repository,
+      repository_git_sha: options.repositoryGitSha,
+      bucket: options.bucket,
+    },
+  );
   const state = await readControlState(async (sql, params) => {
     assertReadOnlySql(sql);
     return await adapters.query({ sql, params });
