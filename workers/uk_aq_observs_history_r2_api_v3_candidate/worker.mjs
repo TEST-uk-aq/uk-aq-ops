@@ -20,6 +20,7 @@ const MAX_LIMIT = 20000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const DEFAULT_BINDING_PREFIX = "history/_index_v2/timeseries_binding";
 const VALID_OBSERVATION_PATHS = new Set(["/", "/v1/observations"]);
+export const OBSERVATION_HISTORY_V3_WORKLOAD_DIAGNOSTIC_MODE = "workload_v1";
 const footerCache = createObservationHistoryV3FooterCache();
 
 function required(value) {
@@ -66,7 +67,12 @@ function corsHeaders() {
   };
 }
 
-function jsonResponse(payload, { status = 200, cacheSeconds = 30, noStore = false } = {}) {
+function jsonResponse(payload, {
+  status = 200,
+  cacheSeconds = 30,
+  noStore = false,
+  extraHeaders = {},
+} = {}) {
   return new Response(JSON.stringify(payload), {
     status,
     headers: {
@@ -75,6 +81,7 @@ function jsonResponse(payload, { status = 200, cacheSeconds = 30, noStore = fals
         ? "no-store"
         : `public, max-age=${cacheSeconds}, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds * 2}`,
       ...corsHeaders(),
+      ...extraHeaders,
     },
   });
 }
@@ -112,7 +119,7 @@ function assertCandidateConfiguration(env) {
   return indexRoot;
 }
 
-function parseObservationRequest(url) {
+export function parseObservationRequest(url) {
   if (!VALID_OBSERVATION_PATHS.has(url.pathname)) return { ok: false, status: 404, error: "Not found." };
   const timeseriesId = positiveInteger(url.searchParams.get("timeseries_id"));
   if (!timeseriesId) return { ok: false, status: 400, error: "timeseries_id must be a positive integer." };
@@ -130,7 +137,72 @@ function parseObservationRequest(url) {
   const limitRequested = url.searchParams.has("limit");
   const limit = optionalLimit(url.searchParams.get("limit"));
   if (limitRequested && limit === null) return { ok: false, status: 400, error: `limit must be an integer between 1 and ${MAX_LIMIT}.` };
-  return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso, sinceIso, limit };
+  const diagnosticRequested = url.searchParams.has("diagnostics");
+  const diagnosticMode = diagnosticRequested
+    ? required(url.searchParams.get("diagnostics"))
+    : null;
+  if (
+    diagnosticRequested &&
+    diagnosticMode !== OBSERVATION_HISTORY_V3_WORKLOAD_DIAGNOSTIC_MODE
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      error: `diagnostics must be ${OBSERVATION_HISTORY_V3_WORKLOAD_DIAGNOSTIC_MODE} when provided.`,
+    };
+  }
+  return {
+    ok: true,
+    timeseriesId,
+    connectorId,
+    pollutantCode,
+    startIso,
+    endIso,
+    sinceIso,
+    limit,
+    diagnosticMode,
+  };
+}
+
+function diagnosticRequestContext(request, params) {
+  if (!params.diagnosticMode) return null;
+  return {
+    schema_version: 1,
+    mode: params.diagnosticMode,
+    request_id: globalThis.crypto.randomUUID(),
+    cloudflare_ray_id: required(request.headers.get("cf-ray")) || null,
+    started_at: globalThis.performance?.now?.() ?? Date.now(),
+  };
+}
+
+function diagnosticElapsedMs(context) {
+  if (!context) return null;
+  const now = globalThis.performance?.now?.() ?? Date.now();
+  return Number((now - context.started_at).toFixed(3));
+}
+
+function diagnosticHeaders(context) {
+  return context
+    ? { "x-ukaq-diagnostic-request-id": context.request_id }
+    : {};
+}
+
+function diagnosticRequestPayload(context, details = {}) {
+  if (!context) return null;
+  return {
+    schema_version: context.schema_version,
+    mode: context.mode,
+    request_id: context.request_id,
+    cloudflare_ray_id: context.cloudflare_ray_id,
+    cache_bypassed: true,
+    timing_basis:
+      "performance_now_deployed_workers_advances_only_after_io_not_cpu_time",
+    synchronous_phase_timings_may_be_zero_in_deployed_workers: true,
+    cpu_time_ms: null,
+    cpu_time_source: "cloudflare_invocation_logs_or_analytics",
+    worker_pre_response_elapsed_ms: diagnosticElapsedMs(context),
+    ...details,
+  };
 }
 
 function parseBindingRequest(url) {
@@ -202,7 +274,7 @@ async function handleBinding(params, env) {
   return jsonResponse({ ok: true, timeseries_id: params.timeseriesId, binding_index_prefix: prefix, binding_key: key, binding }, { cacheSeconds: DEFAULT_IMMUTABLE_CACHE_SECONDS });
 }
 
-async function handleObservations(params, env) {
+async function handleObservations(params, env, diagnosticContext = null) {
   const indexRoot = assertCandidateConfiguration(env);
   const effectiveStartMs = params.sinceIso
     ? Math.max(Date.parse(params.startIso), Date.parse(params.sinceIso) + 1)
@@ -219,6 +291,7 @@ async function handleObservations(params, env) {
     endUtc: params.endIso,
     indexRoot,
     footerCache,
+    collectWorkloadDiagnostics: Boolean(diagnosticContext),
   });
   const allRows = result.rows.map((row) => ({ observed_at: row.observed_at_utc, value: row.value }));
   const limited = params.limit !== null && allRows.length > params.limit;
@@ -226,6 +299,18 @@ async function handleObservations(params, env) {
   const partialReasons = [...new Set([...result.partial_reasons, ...(limited ? ["limited_by_limit"] : [])])];
   const complete = result.response_complete === true && !limited;
   const policy = cachePolicy(params.endIso);
+  const diagnosticRequest = diagnosticRequestPayload(diagnosticContext, {
+    outcome: complete ? "complete" : "partial",
+    rows_before_limit: allRows.length,
+    rows_returned: rows.length,
+  });
+  if (diagnosticRequest) {
+    console.info(JSON.stringify({
+      event: "observation_history_v3_workload_diagnostic_complete",
+      diagnostic_request: diagnosticRequest,
+      exact_reader_diagnostics: result.diagnostics,
+    }));
+  }
   return jsonResponse({
     ok: true,
     generated_at_utc: new Date().toISOString(),
@@ -247,6 +332,7 @@ async function handleObservations(params, env) {
     coverage_state: complete ? "complete" : "partial",
     partial_reasons: partialReasons,
     rows,
+    ...(diagnosticRequest ? { diagnostic_request: diagnosticRequest } : {}),
     coverage: {
       read_version: LOGICAL_HISTORY_VERSION,
       index_version: INDEX_GENERATION,
@@ -262,7 +348,11 @@ async function handleObservations(params, env) {
       partial_reasons: partialReasons,
       exact_reader_diagnostics: result.diagnostics,
     },
-  }, { cacheSeconds: policy.seconds, noStore: !complete });
+  }, {
+    cacheSeconds: policy.seconds,
+    noStore: !complete || Boolean(diagnosticContext),
+    extraHeaders: diagnosticHeaders(diagnosticContext),
+  });
 }
 
 export default {
@@ -272,6 +362,7 @@ export default {
     const auth = authorize(request, env);
     if (!auth.ok) return jsonResponse({ ok: false, error: auth.error }, { status: auth.status, noStore: true });
     const url = new URL(request.url);
+    let diagnosticContext = null;
     try {
       if (url.pathname === "/v1/timeseries-binding") {
         assertCandidateConfiguration(env);
@@ -286,6 +377,25 @@ export default {
       }
       const params = parseObservationRequest(url);
       if (!params.ok) return jsonResponse({ ok: false, error: params.error }, { status: params.status, noStore: true });
+      diagnosticContext = diagnosticRequestContext(request, params);
+      if (diagnosticContext) {
+        console.info(JSON.stringify({
+          event: "observation_history_v3_workload_diagnostic_start",
+          diagnostic_request_id: diagnosticContext.request_id,
+          cloudflare_ray_id: diagnosticContext.cloudflare_ray_id,
+          connector_id: params.connectorId,
+          pollutant_code: params.pollutantCode,
+          timeseries_id: params.timeseriesId,
+          start_utc: params.startIso,
+          end_utc: params.endIso,
+        }));
+        const response = await handleObservations(params, env, diagnosticContext);
+        return withCacheHeaders(
+          response,
+          "BYPASS",
+          OBSERVATION_HISTORY_V3_RESPONSE_CACHE_GENERATION,
+        );
+      }
       const key = cacheKey(request.url, params, INDEX_GENERATION);
       const cached = await caches.default.match(key);
       if (cached) return withCacheHeaders(cached, "HIT", OBSERVATION_HISTORY_V3_RESPONSE_CACHE_GENERATION);
@@ -297,8 +407,26 @@ export default {
       return withCacheHeaders(response, "MISS", OBSERVATION_HISTORY_V3_RESPONSE_CACHE_GENERATION);
     } catch (error) {
       const diagnostics = error instanceof ObservationHistoryV3ReadError ? error.diagnostics : null;
-      console.warn(JSON.stringify({ event: "observation_history_v3_candidate_error", path: url.pathname, error: error instanceof Error ? error.message : String(error), diagnostics }));
-      return jsonResponse({ ok: false, error: error instanceof Error ? error.message : String(error), ...(diagnostics ? { diagnostics } : {}) }, { status: 500, noStore: true });
+      const diagnosticRequest = diagnosticRequestPayload(diagnosticContext, {
+        outcome: "error",
+      });
+      console.warn(JSON.stringify({
+        event: "observation_history_v3_candidate_error",
+        path: url.pathname,
+        error: error instanceof Error ? error.message : String(error),
+        diagnostics,
+        ...(diagnosticRequest ? { diagnostic_request: diagnosticRequest } : {}),
+      }));
+      return jsonResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        ...(diagnostics ? { diagnostics } : {}),
+        ...(diagnosticRequest ? { diagnostic_request: diagnosticRequest } : {}),
+      }, {
+        status: 500,
+        noStore: true,
+        extraHeaders: diagnosticHeaders(diagnosticContext),
+      });
     }
   },
 };

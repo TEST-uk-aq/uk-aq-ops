@@ -555,7 +555,48 @@ function resolveLimits(raw = {}) {
   return Object.freeze(limits);
 }
 
-function createDiagnostics() {
+function elapsedNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function createWorkloadDiagnostics() {
+  return {
+    schema_version: 1,
+    timing_basis:
+      "performance_now_deployed_workers_advances_only_after_io_not_cpu_time",
+    synchronous_phase_timings_may_be_zero_in_deployed_workers: true,
+    cpu_time_ms: null,
+    cpu_time_source: "cloudflare_invocation_logs_or_analytics",
+    start_utc: null,
+    end_utc: null,
+    duration_ms: 0,
+    connector_id: null,
+    pollutant_code: null,
+    timeseries_id: null,
+    intersecting_utc_days: [],
+    scoped_manifest_fetch_elapsed_ms: 0,
+    scoped_manifest_validation_elapsed_ms: 0,
+    child_index_fetch_elapsed_ms: 0,
+    child_sha_elapsed_ms: 0,
+    child_parse_validation_elapsed_ms: 0,
+    requested_timeseries_segment_rows: 0,
+    parquet_file_identity_elapsed_ms: 0,
+    footer_elapsed_ms: 0,
+    parquet_planning_elapsed_ms: 0,
+    projected_compressed_bytes_by_column: Object.fromEntries(
+      OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS.map((column) => [column, 0]),
+    ),
+    projected_compressed_bytes_total: 0,
+    planned_ranges: 0,
+    data_read_elapsed_ms: 0,
+    parquet_decode_elapsed_ms: 0,
+    final_filter_validation_elapsed_ms: 0,
+    rows_surviving_filter: 0,
+    total_elapsed_ms: 0,
+  };
+}
+
+function createDiagnostics({ collectWorkloadDiagnostics = false } = {}) {
   return {
     index_generation: OBSERVATION_HISTORY_V3_INDEX_GENERATION,
     index_objects_read: 0,
@@ -589,7 +630,45 @@ function createDiagnostics() {
     missing_scoped_manifest_keys: [],
     missing_child_keys: [],
     partial_or_fail_closed_reason: null,
+    ...(collectWorkloadDiagnostics
+      ? { workload: createWorkloadDiagnostics() }
+      : {}),
   };
+}
+
+function addElapsed(workload, field, startedAt) {
+  if (!workload) return;
+  workload[field] += elapsedNow() - startedAt;
+}
+
+async function measureAsync(workload, field, operation) {
+  if (!workload) return operation();
+  const startedAt = elapsedNow();
+  try {
+    return await operation();
+  } finally {
+    addElapsed(workload, field, startedAt);
+  }
+}
+
+function measureSync(workload, field, operation) {
+  if (!workload) return operation();
+  const startedAt = elapsedNow();
+  try {
+    return operation();
+  } finally {
+    addElapsed(workload, field, startedAt);
+  }
+}
+
+function finalizeWorkloadDiagnostics(workload, startedAt) {
+  if (!workload) return;
+  workload.total_elapsed_ms = elapsedNow() - startedAt;
+  for (const [key, value] of Object.entries(workload)) {
+    if (key.endsWith("_elapsed_ms") && Number.isFinite(value)) {
+      workload[key] = Number(value.toFixed(3));
+    }
+  }
 }
 
 export class ObservationHistoryV3ReadError extends Error {
@@ -843,6 +922,12 @@ function selectedColumnRanges({ file, footer, rowGroupOrdinals, diagnostics }) {
         id: `${ordinal}:${columnName}`,
         ...range,
       });
+      if (diagnostics.workload) {
+        const compressedBytes = range.end - range.start;
+        diagnostics.workload.projected_compressed_bytes_by_column[columnName] +=
+          compressedBytes;
+        diagnostics.workload.projected_compressed_bytes_total += compressedBytes;
+      }
       allPageIndexesAvailable = hasValidPageIndexes(column, file) &&
         allPageIndexesAvailable;
     }
@@ -974,8 +1059,11 @@ export async function readObservationHistoryExactV3({
   indexRoot = OBSERVATION_HISTORY_V3_INDEX_ROOT,
   limits: rawLimits = {},
   footerCache = createObservationHistoryV3FooterCache(),
+  collectWorkloadDiagnostics = false,
 }) {
-  const diagnostics = createDiagnostics();
+  const totalStartedAt = collectWorkloadDiagnostics ? elapsedNow() : 0;
+  const diagnostics = createDiagnostics({ collectWorkloadDiagnostics });
+  const workload = diagnostics.workload || null;
   let budget = null;
   try {
     if (String(indexGeneration || "").trim().toLowerCase() !== "v3") {
@@ -1007,6 +1095,17 @@ export async function readObservationHistoryExactV3({
     if (endMs <= startMs) throw new TypeError("endUtc must be after startUtc");
     const limits = resolveLimits(rawLimits);
     const days = listIntersectingUtcDays(startIso, endIso);
+    if (workload) {
+      Object.assign(workload, {
+        start_utc: startIso,
+        end_utc: endIso,
+        duration_ms: endMs - startMs,
+        connector_id: scopeBase.connector_id,
+        pollutant_code: scopeBase.pollutant_code,
+        timeseries_id: normalizedTimeseriesId,
+        intersecting_utc_days: [...days],
+      });
+    }
     assertPlanLimit(
       days.length * 2,
       limits.max_index_objects,
@@ -1026,12 +1125,16 @@ export async function readObservationHistoryExactV3({
       });
       let scoped = scopedManifestCache.get(scopedKey);
       if (!scoped) {
-        const scopedObject = await fetchBoundedIndexObject({
-          source,
-          key: scopedKey,
-          limits,
-          diagnostics,
-        });
+        const scopedObject = await measureAsync(
+          workload,
+          "scoped_manifest_fetch_elapsed_ms",
+          () => fetchBoundedIndexObject({
+            source,
+            key: scopedKey,
+            limits,
+            diagnostics,
+          }),
+        );
         if (!scopedObject) {
           diagnostics.missing_index_keys.push(scopedKey);
           diagnostics.missing_scoped_manifest_keys.push(scopedKey);
@@ -1040,11 +1143,15 @@ export async function readObservationHistoryExactV3({
         }
         diagnostics.scoped_manifests_read += 1;
         diagnostics.scoped_manifest_bytes_read += scopedObject.byte_size;
-        scoped = validateObservationHistoryIndexV3ScopedManifestBody({
-          key: scopedKey,
-          body: scopedObject.body,
-          indexRoot,
-        });
+        scoped = measureSync(
+          workload,
+          "scoped_manifest_validation_elapsed_ms",
+          () => validateObservationHistoryIndexV3ScopedManifestBody({
+            key: scopedKey,
+            body: scopedObject.body,
+            indexRoot,
+          }),
+        );
         scopedManifestCache.set(scopedKey, scoped);
       }
 
@@ -1072,12 +1179,16 @@ export async function readObservationHistoryExactV3({
       if (descriptor.key !== expectedChildKey) {
         throw new Error("Scoped v3 manifest selected a non-canonical child key");
       }
-      const childObject = await fetchBoundedIndexObject({
-        source,
-        key: descriptor.key,
-        limits,
-        diagnostics,
-      });
+      const childObject = await measureAsync(
+        workload,
+        "child_index_fetch_elapsed_ms",
+        () => fetchBoundedIndexObject({
+          source,
+          key: descriptor.key,
+          limits,
+          diagnostics,
+        }),
+      );
       if (!childObject) {
         diagnostics.missing_index_keys.push(descriptor.key);
         diagnostics.missing_child_keys.push(descriptor.key);
@@ -1091,41 +1202,50 @@ export async function readObservationHistoryExactV3({
         diagnostics.child_identity_mismatch += 1;
         throw new Error(`V3 pinned child byte-size mismatch: ${descriptor.key}`);
       }
-      const childSha256 = await sha256ObservationHistoryV3Bytes(
-        childObject.body,
+      const childSha256 = await measureAsync(
+        workload,
+        "child_sha_elapsed_ms",
+        () => sha256ObservationHistoryV3Bytes(childObject.body),
       );
       if (childSha256 !== descriptor.sha256) {
         diagnostics.child_identity_mismatch += 1;
         throw new Error(`V3 pinned child SHA-256 mismatch: ${descriptor.key}`);
       }
-      const child = validateObservationHistoryV3ChildForRead({
-        key: descriptor.key,
-        body: childObject.body,
-        dayUtc,
-        connectorId: scopeBase.connector_id,
-        pollutantCode: scopeBase.pollutant_code,
-        timeseriesId: normalizedTimeseriesId,
-        indexRoot,
-      });
-      if (
-        !sameJson(
-          scopedDescriptorForValidatedChild(
-            child,
-            childObject.byte_size,
-            childSha256,
-          ),
-          descriptor,
-        )
-      ) {
-        throw new Error(
-          `V3 pinned child semantics disagree with scoped manifest: ${descriptor.key}`,
-        );
-      }
-      if (!child.requested_timeseries) {
-        throw new Error(
-          `V3 pinned child omits scoped timeseries_id=${normalizedTimeseriesId}`,
-        );
-      }
+      const child = measureSync(
+        workload,
+        "child_parse_validation_elapsed_ms",
+        () => {
+          const validated = validateObservationHistoryV3ChildForRead({
+            key: descriptor.key,
+            body: childObject.body,
+            dayUtc,
+            connectorId: scopeBase.connector_id,
+            pollutantCode: scopeBase.pollutant_code,
+            timeseriesId: normalizedTimeseriesId,
+            indexRoot,
+          });
+          if (
+            !sameJson(
+              scopedDescriptorForValidatedChild(
+                validated,
+                childObject.byte_size,
+                childSha256,
+              ),
+              descriptor,
+            )
+          ) {
+            throw new Error(
+              `V3 pinned child semantics disagree with scoped manifest: ${descriptor.key}`,
+            );
+          }
+          if (!validated.requested_timeseries) {
+            throw new Error(
+              `V3 pinned child omits scoped timeseries_id=${normalizedTimeseriesId}`,
+            );
+          }
+          return validated;
+        },
+      );
       for (const segment of child.requested_timeseries.segments) {
         if (
           Date.parse(segment.max_observed_at_utc) < startMs ||
@@ -1145,6 +1265,11 @@ export async function readObservationHistoryExactV3({
 
     diagnostics.parquet_files_selected = filesByKey.size;
     diagnostics.selected_segments = selectedSegments.length;
+    if (workload) {
+      workload.requested_timeseries_segment_rows = sum(
+        selectedSegments.map((segment) => segment.row_count),
+      );
+    }
     const selectedRowGroupKeys = new Set(selectedSegments.map((segment) =>
       `${segment.file_key}\u0000${segment.row_group_ordinal}`
     ));
@@ -1177,11 +1302,15 @@ export async function readObservationHistoryExactV3({
     const contexts = new Map();
     let plannedDecodedRows = 0;
     for (const file of filesByKey.values()) {
-      const randomAccessFile = await source.openParquetFile({
-        identity: file,
-        budget,
-        diagnostics,
-      });
+      const randomAccessFile = await measureAsync(
+        workload,
+        "parquet_file_identity_elapsed_ms",
+        () => source.openParquetFile({
+          identity: file,
+          budget,
+          diagnostics,
+        }),
+      );
       if (
         randomAccessFile?.identity_verified !== true ||
         randomAccessFile.byteLength !== file.byte_size ||
@@ -1189,41 +1318,53 @@ export async function readObservationHistoryExactV3({
       ) {
         throw new Error(`V3 source did not establish pinned file identity: ${file.key}`);
       }
-      const footer = await acquireFooter({
-        randomAccessFile,
-        file,
-        footerCache,
-        limits,
-        diagnostics,
-      });
-      const fileSegments = selectedSegments.filter((segment) =>
-        segment.file_key === file.key
+      const footer = await measureAsync(
+        workload,
+        "footer_elapsed_ms",
+        () => acquireFooter({
+          randomAccessFile,
+          file,
+          footerCache,
+          limits,
+          diagnostics,
+        }),
       );
-      validateSegmentsAgainstFooter(fileSegments, file, footer);
-      const rowGroupOrdinals = [...new Set(fileSegments.map((segment) =>
-        segment.row_group_ordinal
-      ))].sort((left, right) => left - right);
-      plannedDecodedRows += sum(rowGroupOrdinals.map((ordinal) =>
+      const plan = measureSync(
+        workload,
+        "parquet_planning_elapsed_ms",
+        () => {
+          const fileSegments = selectedSegments.filter((segment) =>
+            segment.file_key === file.key
+          );
+          validateSegmentsAgainstFooter(fileSegments, file, footer);
+          const rowGroupOrdinals = [...new Set(fileSegments.map((segment) =>
+            segment.row_group_ordinal
+          ))].sort((left, right) => left - right);
+          const ranges = selectedColumnRanges({
+            file,
+            footer,
+            rowGroupOrdinals,
+            diagnostics,
+          });
+          const coalesced = coalesceObservationHistoryV3ByteRanges(ranges, {
+            maxGapBytes: limits.coalesce_max_gap_bytes,
+            maxMergedBytes: limits.coalesce_max_merged_bytes,
+          });
+          return { fileSegments, rowGroupOrdinals, ranges, coalesced };
+        },
+      );
+      plannedDecodedRows += sum(plan.rowGroupOrdinals.map((ordinal) =>
         footer.rowGroupRows[ordinal]
       ));
-      const ranges = selectedColumnRanges({
-        file,
-        footer,
-        rowGroupOrdinals,
-        diagnostics,
-      });
-      const coalesced = coalesceObservationHistoryV3ByteRanges(ranges, {
-        maxGapBytes: limits.coalesce_max_gap_bytes,
-        maxMergedBytes: limits.coalesce_max_merged_bytes,
-      });
-      diagnostics.range_coalesces += ranges.length - coalesced.length;
+      if (workload) workload.planned_ranges += plan.coalesced.length;
+      diagnostics.range_coalesces += plan.ranges.length - plan.coalesced.length;
       contexts.set(file.key, {
         file,
         randomAccessFile,
         footer,
-        fileSegments,
-        ranges,
-        coalesced,
+        fileSegments: plan.fileSegments,
+        ranges: plan.ranges,
+        coalesced: plan.coalesced,
       });
     }
     assertPlanLimit(plannedDecodedRows, limits.max_decoded_rows, "decoded-row count");
@@ -1231,48 +1372,68 @@ export async function readObservationHistoryExactV3({
 
     const decodedRows = [];
     for (const context of contexts.values()) {
-      const blocks = await readObservationHistoryV3ByteRanges({
-        file: context.randomAccessFile,
-        ranges: context.coalesced,
-        concurrency: limits.max_concurrency,
-        budget,
-      });
+      const blocks = await measureAsync(
+        workload,
+        "data_read_elapsed_ms",
+        () => readObservationHistoryV3ByteRanges({
+          file: context.randomAccessFile,
+          ranges: context.coalesced,
+          concurrency: limits.max_concurrency,
+          budget,
+        }),
+      );
       const prefetchedFile = createPrefetchedObservationHistoryV3AsyncBuffer({
         file: context.randomAccessFile,
         blocks,
       });
       for (const segment of context.fileSegments) {
-        const rows = await parquetReadObjects({
-          file: prefetchedFile,
-          metadata: context.footer.metadata,
-          compressors,
-          columns: [...OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS],
-          rowStart: segment.row_start,
-          rowEnd: segment.row_start + segment.row_count,
-          useOffsetIndex: false,
-        });
-        decodedRows.push(...validateDecodedSegment(
-          rows,
-          segment,
-          normalizedTimeseriesId,
+        const rows = await measureAsync(
+          workload,
+          "parquet_decode_elapsed_ms",
+          () => parquetReadObjects({
+            file: prefetchedFile,
+            metadata: context.footer.metadata,
+            compressors,
+            columns: [...OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS],
+            rowStart: segment.row_start,
+            rowEnd: segment.row_start + segment.row_count,
+            useOffsetIndex: false,
+          }),
+        );
+        decodedRows.push(...measureSync(
+          workload,
+          "final_filter_validation_elapsed_ms",
+          () => validateDecodedSegment(
+            rows,
+            segment,
+            normalizedTimeseriesId,
+          ),
         ));
       }
     }
 
-    let previousTimestamp = null;
-    const rows = [];
-    for (const row of decodedRows) {
-      if (previousTimestamp !== null && row.observed_at_utc < previousTimestamp) {
-        throw new Error("V3 decoded rows regress across exact segments");
-      }
-      previousTimestamp = row.observed_at_utc;
-      const timestampMs = Date.parse(row.observed_at_utc);
-      if (timestampMs >= startMs && timestampMs < endMs) rows.push(row);
-    }
+    const rows = measureSync(
+      workload,
+      "final_filter_validation_elapsed_ms",
+      () => {
+        let previousTimestamp = null;
+        const filtered = [];
+        for (const row of decodedRows) {
+          if (previousTimestamp !== null && row.observed_at_utc < previousTimestamp) {
+            throw new Error("V3 decoded rows regress across exact segments");
+          }
+          previousTimestamp = row.observed_at_utc;
+          const timestampMs = Date.parse(row.observed_at_utc);
+          if (timestampMs >= startMs && timestampMs < endMs) filtered.push(row);
+        }
+        return filtered;
+      },
+    );
     if (rows.length > limits.max_response_rows) {
       throw new Error("V3 response-row budget exceeded after exact filtering");
     }
     diagnostics.rows_returned = rows.length;
+    if (workload) workload.rows_surviving_filter = rows.length;
     const budgetSnapshot = budget.snapshot();
     diagnostics.r2_range_reads = budgetSnapshot.range_reads;
     diagnostics.r2_bytes_requested = budgetSnapshot.bytes_requested;
@@ -1281,6 +1442,7 @@ export async function readObservationHistoryExactV3({
     diagnostics.partial_or_fail_closed_reason = complete
       ? null
       : partialReasons.join(",");
+    finalizeWorkloadDiagnostics(workload, totalStartedAt);
     return Object.freeze({
       index_generation: OBSERVATION_HISTORY_V3_INDEX_GENERATION,
       history_version: OBSERVATION_HISTORY_V3_LOGICAL_HISTORY_VERSION,
@@ -1304,6 +1466,7 @@ export async function readObservationHistoryExactV3({
     diagnostics.partial_or_fail_closed_reason = error instanceof Error
       ? error.message
       : String(error);
+    finalizeWorkloadDiagnostics(workload, totalStartedAt);
     if (error instanceof ObservationHistoryV3ReadError) throw error;
     throw new ObservationHistoryV3ReadError(
       "v3_exact_read_failed",

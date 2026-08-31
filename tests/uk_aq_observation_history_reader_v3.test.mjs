@@ -248,6 +248,7 @@ test("v3 exact reader follows Phase 1 segments across row groups, files, and day
   const result = await query(fixture.source);
 
   assert.equal(result.response_complete, true);
+  assert.equal("workload" in result.diagnostics, false);
   assert.equal(result.has_gap, false);
   assert.equal(result.rows.length, 10);
   assert.deepEqual(
@@ -313,6 +314,56 @@ test("v3 exact reader follows Phase 1 segments across row groups, files, and day
       "2026-08-19T00:02:00.000Z",
     ],
   );
+});
+
+test("v3 exact reader reports debug-gated workload shape without extra reads", async () => {
+  const baselineFixture = buildFixture();
+  const baseline = await query(baselineFixture.source);
+  const instrumentedFixture = buildFixture();
+  const instrumented = await query(instrumentedFixture.source, {
+    collectWorkloadDiagnostics: true,
+  });
+
+  assert.deepEqual(instrumented.rows, baseline.rows);
+  assert.deepEqual(
+    instrumentedFixture.observations.indexKeys,
+    baselineFixture.observations.indexKeys,
+  );
+  assert.deepEqual(
+    instrumentedFixture.observations.ranges,
+    baselineFixture.observations.ranges,
+  );
+
+  const { workload } = instrumented.diagnostics;
+  assert.equal(workload.schema_version, 1);
+  assert.equal(workload.cpu_time_ms, null);
+  assert.match(workload.timing_basis, /not_cpu_time/);
+  assert.equal(
+    workload.synchronous_phase_timings_may_be_zero_in_deployed_workers,
+    true,
+  );
+  assert.equal(workload.connector_id, 7);
+  assert.equal(workload.pollutant_code, "pm25");
+  assert.equal(workload.timeseries_id, 100);
+  assert.equal(workload.start_utc, "2026-08-18T00:00:00.000Z");
+  assert.equal(workload.end_utc, "2026-08-20T00:00:00.000Z");
+  assert.equal(workload.duration_ms, 2 * 24 * 60 * 60 * 1000);
+  assert.deepEqual(workload.intersecting_utc_days, ["2026-08-18", "2026-08-19"]);
+  assert.equal(workload.requested_timeseries_segment_rows, 10);
+  assert.equal(workload.rows_surviving_filter, 10);
+  assert.ok(workload.projected_compressed_bytes_total > 0);
+  assert.equal(
+    workload.projected_compressed_bytes_total,
+    Object.values(workload.projected_compressed_bytes_by_column)
+      .reduce((total, bytes) => total + bytes, 0),
+  );
+  assert.ok(workload.planned_ranges > 0);
+  for (const [key, value] of Object.entries(workload)) {
+    if (key.endsWith("_elapsed_ms")) {
+      assert.ok(Number.isFinite(value) && value >= 0, `${key} must be bounded elapsed timing`);
+    }
+  }
+  assert.ok(workload.total_elapsed_ms > 0);
 });
 
 test("v3 footer cache is content-identity scoped and still re-verifies file identity", async () => {
