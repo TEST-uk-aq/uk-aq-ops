@@ -124,6 +124,63 @@ test("calculated history counts high-frequency observations by hour-ending inter
     assert.equal(requestedEnds[2], "2026-08-27T00:00:00.001Z");
     assert.equal(withAqi.observations.source_segments[0].end_utc, "2026-08-27T00:00:00.001Z");
     assert.equal(withAqi.observations.source_segments[0].response_complete, false);
+
+    const exactStartMs = Date.parse("2026-06-04T00:00:00.000Z");
+    const exactEndMs = Date.parse("2026-06-11T00:00:00.000Z");
+    const exactRows = Array.from({ length: 168 }, (_, index) => ({
+      observed_at: new Date(exactStartMs + index * HOUR_MS).toISOString(),
+      value: 10 + (index % 10),
+    }));
+    r2Rows = exactRows;
+    const exactComplete = await buildCalculatedHistory({
+      request,
+      continuity,
+      env: {
+        UK_AQ_EDGE_UPSTREAM_SECRET: "secret",
+        UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations",
+      },
+      outputStartMs: exactStartMs,
+      outputEndMs: exactEndMs,
+    });
+    assert.equal(exactComplete.observations.rows.length, 168);
+    assert.equal(exactComplete.observations.source_segments[0].response_complete, true);
+    assert.equal(exactComplete.observations.response_complete, true);
+    assert.deepEqual(exactComplete.observations.gap_ranges, []);
+    assert.deepEqual(exactComplete.observations.partial_reasons, []);
+
+    const removedExactTimestamp = exactStartMs + 73 * HOUR_MS;
+    r2Rows = exactRows.filter((row) => Date.parse(row.observed_at) !== removedExactTimestamp);
+    const exactMissingHour = await buildCalculatedHistory({
+      request,
+      continuity,
+      env: {
+        UK_AQ_EDGE_UPSTREAM_SECRET: "secret",
+        UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations",
+      },
+      outputStartMs: exactStartMs,
+      outputEndMs: exactEndMs,
+    });
+    assert.equal(exactMissingHour.observations.response_complete, false);
+    assert.deepEqual(exactMissingHour.observations.gap_ranges, [{
+      start_utc: new Date(removedExactTimestamp).toISOString(),
+      end_utc: new Date(removedExactTimestamp + HOUR_MS).toISOString(),
+    }]);
+    assert.deepEqual(exactMissingHour.observations.partial_reasons, ["missing_visible_observation_hours"]);
+
+    r2Rows = exactRows;
+    const exactWithAqi = await buildCalculatedHistory({
+      request: { ...request, includeAqi: true },
+      continuity,
+      env: {
+        UK_AQ_EDGE_UPSTREAM_SECRET: "secret",
+        UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations",
+      },
+      outputStartMs: exactStartMs,
+      outputEndMs: exactEndMs,
+    });
+    const exactHourAqi = exactWithAqi.aqi.rows.find((row) => row.timestamp_hour_utc === "2026-06-04T01:00:00.000Z");
+    assert.ok(exactHourAqi);
+    assert.equal(exactHourAqi.hourly_mean_ugm3, 11);
   } finally {
     globalThis.fetch = originalFetch;
   }
