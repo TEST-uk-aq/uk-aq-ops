@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import worker from "../workers/uk_aq_station_history/src/index.mjs";
+import { buildCalculatedHistory } from "../workers/uk_aq_station_history/src/calculated_history.mjs";
 import {
   aqiResponseRows,
   buildAqiHistoryChunk,
@@ -11,9 +12,98 @@ import {
 import { resolveStationHistoryPolicy } from "../workers/uk_aq_station_history/src/policy.mjs";
 import { buildR2ObservationRequestUrl } from "../workers/uk_aq_station_history/src/r2_observations.mjs";
 
+const HOUR_MS = 60 * 60 * 1000;
+
 function chunkUrl(path, start, end, extra = "") {
   return new URL(`https://internal${path}?timeseries_id=7&connector_id=2&pollutant=pm25&start_utc=${encodeURIComponent(start)}&end_utc=${encodeURIComponent(end)}&stable_head_start_utc=${encodeURIComponent("2026-07-08T00:00:00.000Z")}&format=objects${extra}`);
 }
+
+test("calculated history counts high-frequency observations by hour-ending interval", async () => {
+  const originalFetch = globalThis.fetch;
+  const startMs = Date.parse("2026-08-25T00:00:00.000Z");
+  const endMs = Date.parse("2026-08-25T03:00:00.000Z");
+  const request = {
+    timeseriesId: 7421,
+    connectorId: 7,
+    stationId: 9,
+    pollutant: "pm25",
+    includeObservations: true,
+    includeAqi: false,
+  };
+  const continuity = {
+    enabled: false,
+    continuityKey: null,
+    siteRef: null,
+    ukAirRef: null,
+    pollutant: "pm25",
+    members: [{
+      stationId: 9,
+      stationRef: null,
+      timeseriesId: 7421,
+      timeseriesRef: null,
+      connectorId: 7,
+      pollutant: "pm25",
+      validFromDayUtc: null,
+      validToDayUtc: null,
+    }],
+  };
+  const allRows = Array.from({ length: 3 }, (_, hour) =>
+    Array.from({ length: 11 }, (_, index) => ({
+      observed_at: new Date(startMs + hour * HOUR_MS + (index + 1) * 5 * 60 * 1000).toISOString(),
+      value: 10 + hour,
+    }))).flat();
+  let r2Rows = allRows;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    timeseries_id: 7421,
+    connector_id: 7,
+    pollutant: "pm25",
+    response_complete: true,
+    coverage_state: "complete",
+    rows: r2Rows,
+  }), { status: 200 });
+
+  try {
+    const complete = await buildCalculatedHistory({
+      request,
+      continuity,
+      env: {
+        UK_AQ_EDGE_UPSTREAM_SECRET: "secret",
+        UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations",
+      },
+      outputStartMs: startMs,
+      outputEndMs: endMs,
+    });
+    assert.equal(complete.observations.rows.length, 33);
+    assert.equal(complete.observations.source_segments[0].response_complete, true);
+    assert.equal(complete.observations.response_complete, true);
+    assert.deepEqual(complete.observations.gap_ranges, []);
+    assert.deepEqual(complete.observations.partial_reasons, []);
+
+    r2Rows = allRows.filter((row) => {
+      const timestamp = Date.parse(row.observed_at);
+      return timestamp <= startMs + HOUR_MS || timestamp > startMs + 2 * HOUR_MS;
+    });
+    const missingHour = await buildCalculatedHistory({
+      request,
+      continuity,
+      env: {
+        UK_AQ_EDGE_UPSTREAM_SECRET: "secret",
+        UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations",
+      },
+      outputStartMs: startMs,
+      outputEndMs: endMs,
+    });
+    assert.equal(missingHour.observations.source_segments[0].response_complete, true);
+    assert.equal(missingHour.observations.response_complete, false);
+    assert.deepEqual(missingHour.observations.gap_ranges, [{
+      start_utc: "2026-08-25T01:00:00.000Z",
+      end_utc: "2026-08-25T02:00:00.000Z",
+    }]);
+    assert.deepEqual(missingHour.observations.partial_reasons, ["missing_visible_observation_hours"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("chunk boundaries progress newest first without gaps or overlap", () => {
   const newest = parseHistoryChunkRequest(chunkUrl("/v1/aqi-history", "2026-07-01T00:00:00.000Z", "2026-07-08T00:00:00.000Z"), "aqi");
