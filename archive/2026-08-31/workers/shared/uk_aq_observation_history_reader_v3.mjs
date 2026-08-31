@@ -68,13 +68,6 @@ const EXPECTED_CREATED_BY = [
   `history_schema_version=${OBSERVATION_HISTORY_SCHEMA_VERSION_V3}`,
   `physical_layout_version=${OBSERVATION_HISTORY_V3_PHYSICAL_LAYOUT_VERSION}`,
 ].join(";");
-const DEFAULT_PHYSICAL_IDENTITY = Object.freeze({
-  history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
-  writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
-  physical_layout_version: OBSERVATION_HISTORY_V3_PHYSICAL_LAYOUT_VERSION,
-  parquet_footer_identity: "created_by",
-  parquet_created_by: EXPECTED_CREATED_BY,
-});
 const PAGE_SELECTION_UNAVAILABLE_REASON =
   "hyparquet-1.25.1-offset-index-dictionary-decode-unsafe";
 const textEncoder = new TextEncoder();
@@ -111,35 +104,6 @@ function canonicalJson(value) {
 
 function sameJson(left, right) {
   return canonicalJson(left) === canonicalJson(right);
-}
-
-function normalizePhysicalIdentity(raw = DEFAULT_PHYSICAL_IDENTITY) {
-  const identity = {
-    history_schema_version: Number(raw?.history_schema_version),
-    writer_version: String(raw?.writer_version || ""),
-    physical_layout_version: String(raw?.physical_layout_version || ""),
-    parquet_footer_identity: String(raw?.parquet_footer_identity || ""),
-    ...(raw?.parquet_created_by === undefined
-      ? {}
-      : { parquet_created_by: String(raw.parquet_created_by) }),
-  };
-  if (
-    identity.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
-    !identity.writer_version ||
-    !identity.physical_layout_version ||
-    ![
-      "created_by",
-      "uk_aq_schema_metadata",
-      "created_by_and_uk_aq_schema_metadata",
-    ].includes(
-      identity.parquet_footer_identity,
-    ) ||
-    (identity.parquet_footer_identity.includes("created_by") &&
-      !identity.parquet_created_by)
-  ) {
-    throw new Error("V3 reader physical identity profile is invalid");
-  }
-  return Object.freeze(identity);
 }
 
 function positiveSafeInteger(value, fieldName) {
@@ -289,7 +253,7 @@ export function buildObservationHistoryV3ScopedManifestReadKey({
     `/pollutant_code=${scope.pollutant_code}/manifest.json`;
 }
 
-function normalizeChildFile(raw, physicalIdentity) {
+function normalizeChildFile(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new TypeError("V3 child file descriptor must be an object");
   }
@@ -308,10 +272,10 @@ function normalizeChildFile(raw, physicalIdentity) {
     ...(raw.etag === undefined ? {} : { etag: String(raw.etag || "").trim() }),
   };
   if (
-    file.history_schema_version !== physicalIdentity.history_schema_version ||
-    file.writer_version !== physicalIdentity.writer_version ||
+    file.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
+    file.writer_version !== OBSERVATION_HISTORY_WRITER_VERSION_V3 ||
     file.physical_layout_version !==
-      physicalIdentity.physical_layout_version ||
+      OBSERVATION_HISTORY_V3_PHYSICAL_LAYOUT_VERSION ||
     (Object.hasOwn(file, "etag") && !file.etag)
   ) {
     throw new Error("V3 child has unsupported physical file identity");
@@ -400,9 +364,7 @@ export function validateObservationHistoryV3ChildForRead({
   pollutantCode,
   timeseriesId,
   indexRoot = OBSERVATION_HISTORY_V3_INDEX_ROOT,
-  physicalIdentity = DEFAULT_PHYSICAL_IDENTITY,
 }) {
-  const identity = normalizePhysicalIdentity(physicalIdentity);
   const scope = exactScope({ dayUtc, connectorId, pollutantCode });
   const expectedKey = buildObservationHistoryV3ChildReadKey({
     dayUtc,
@@ -433,10 +395,11 @@ export function validateObservationHistoryV3ChildForRead({
     payload.index_generation !== OBSERVATION_HISTORY_V3_INDEX_GENERATION ||
     payload.history_version !== OBSERVATION_HISTORY_V3_LOGICAL_HISTORY_VERSION ||
     payload.domain !== "observations" ||
-    Number(payload.history_schema_version) !== identity.history_schema_version ||
-    payload.writer_version !== identity.writer_version ||
+    Number(payload.history_schema_version) !==
+      OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
+    payload.writer_version !== OBSERVATION_HISTORY_WRITER_VERSION_V3 ||
     payload.physical_layout_version !==
-      identity.physical_layout_version ||
+      OBSERVATION_HISTORY_V3_PHYSICAL_LAYOUT_VERSION ||
     Number(payload.shard_width) !== OBSERVATION_HISTORY_V3_SHARD_WIDTH ||
     Number(payload.range_start) !== requestedRange.range_start ||
     Number(payload.range_end) !== requestedRange.range_end ||
@@ -449,7 +412,7 @@ export function validateObservationHistoryV3ChildForRead({
   }
 
   const files = (Array.isArray(payload.files) ? payload.files : [])
-    .map((file) => normalizeChildFile(file, identity));
+    .map(normalizeChildFile);
   if (files.length === 0) throw new Error("V3 child requires physical files");
   const filesByKey = new Map();
   for (const [index, file] of files.entries()) {
@@ -531,9 +494,9 @@ export function validateObservationHistoryV3ChildForRead({
     index_generation: OBSERVATION_HISTORY_V3_INDEX_GENERATION,
     history_version: OBSERVATION_HISTORY_V3_LOGICAL_HISTORY_VERSION,
     domain: "observations",
-    history_schema_version: identity.history_schema_version,
-    writer_version: identity.writer_version,
-    physical_layout_version: identity.physical_layout_version,
+    history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+    writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
+    physical_layout_version: OBSERVATION_HISTORY_V3_PHYSICAL_LAYOUT_VERSION,
     shard_width: OBSERVATION_HISTORY_V3_SHARD_WIDTH,
     range_start: requestedRange.range_start,
     range_end: requestedRange.range_end,
@@ -760,22 +723,8 @@ function combineFooterBytes(metadataBytes, trailerBytes) {
   return combined.buffer;
 }
 
-function validateFooterMetadata(metadata, file, physicalIdentity) {
-  const footerMetadata = new Map(
-    (metadata.key_value_metadata || []).map((entry) => [entry.key, entry.value]),
-  );
-  const createdByMatches = metadata.created_by === physicalIdentity.parquet_created_by;
-  const schemaMetadataMatches = footerMetadata.get("uk_aq_history_schema_version") ===
-        String(physicalIdentity.history_schema_version) &&
-      footerMetadata.get("uk_aq_writer_version") === physicalIdentity.writer_version &&
-      footerMetadata.get("uk_aq_physical_layout_version") ===
-        physicalIdentity.physical_layout_version;
-  const footerIdentityMatches = physicalIdentity.parquet_footer_identity === "created_by"
-    ? createdByMatches
-    : physicalIdentity.parquet_footer_identity === "uk_aq_schema_metadata"
-    ? schemaMetadataMatches
-    : createdByMatches && schemaMetadataMatches;
-  if (!footerIdentityMatches) {
+function validateFooterMetadata(metadata, file) {
+  if (metadata.created_by !== EXPECTED_CREATED_BY) {
     throw new Error(`V3 Parquet footer writer identity mismatch: ${file.key}`);
   }
   const columns = parquetSchema(metadata).children.map((column) =>
@@ -816,7 +765,6 @@ async function acquireFooter({
   footerCache,
   limits,
   diagnostics,
-  physicalIdentity,
 }) {
   const cacheKey = observationHistoryV3FooterCacheKey(file);
   const cached = footerCache.get(cacheKey);
@@ -858,7 +806,7 @@ async function acquireFooter({
     combineFooterBytes(metadataBytes, trailer),
     { geoparquet: false },
   );
-  const validated = validateFooterMetadata(metadata, file, physicalIdentity);
+  const validated = validateFooterMetadata(metadata, file);
   const entry = Object.freeze({
     ...validated,
     metadata_length: metadataLength,
@@ -1112,9 +1060,7 @@ export async function readObservationHistoryExactV3({
   limits: rawLimits = {},
   footerCache = createObservationHistoryV3FooterCache(),
   collectWorkloadDiagnostics = false,
-  physicalIdentity = DEFAULT_PHYSICAL_IDENTITY,
 }) {
-  const identity = normalizePhysicalIdentity(physicalIdentity);
   const totalStartedAt = collectWorkloadDiagnostics ? elapsedNow() : 0;
   const diagnostics = createDiagnostics({ collectWorkloadDiagnostics });
   const workload = diagnostics.workload || null;
@@ -1204,7 +1150,6 @@ export async function readObservationHistoryExactV3({
             key: scopedKey,
             body: scopedObject.body,
             indexRoot,
-            physicalIdentity: identity,
           }),
         );
         scopedManifestCache.set(scopedKey, scoped);
@@ -1278,7 +1223,6 @@ export async function readObservationHistoryExactV3({
             pollutantCode: scopeBase.pollutant_code,
             timeseriesId: normalizedTimeseriesId,
             indexRoot,
-            physicalIdentity: identity,
           });
           if (
             !sameJson(
@@ -1383,7 +1327,6 @@ export async function readObservationHistoryExactV3({
           footerCache,
           limits,
           diagnostics,
-          physicalIdentity: identity,
         }),
       );
       const plan = measureSync(

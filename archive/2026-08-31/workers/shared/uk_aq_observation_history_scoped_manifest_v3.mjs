@@ -11,11 +11,6 @@ const LOGICAL_HISTORY_VERSION = "v2";
 const PHYSICAL_LAYOUT_VERSION = "timeseries-bounded-v1";
 const SHARD_WIDTH = 1000;
 const DEFAULT_INDEX_ROOT = "history/_index_v3/observations_timeseries";
-const DEFAULT_PHYSICAL_IDENTITY = Object.freeze({
-  history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
-  writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
-  physical_layout_version: PHYSICAL_LAYOUT_VERSION,
-});
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const textEncoder = new TextEncoder();
@@ -52,22 +47,6 @@ function canonicalJson(value) {
 
 function sameJson(left, right) {
   return canonicalJson(left) === canonicalJson(right);
-}
-
-function normalizePhysicalIdentity(raw = DEFAULT_PHYSICAL_IDENTITY) {
-  const identity = {
-    history_schema_version: Number(raw?.history_schema_version),
-    writer_version: String(raw?.writer_version || ""),
-    physical_layout_version: String(raw?.physical_layout_version || ""),
-  };
-  if (
-    identity.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
-    !identity.writer_version ||
-    !identity.physical_layout_version
-  ) {
-    throw new Error("Scoped v3 manifest physical identity is invalid");
-  }
-  return Object.freeze(identity);
 }
 
 function exactArrayBuffer(value) {
@@ -314,9 +293,7 @@ export function buildObservationHistoryIndexV3ScopedManifestPayload({
   scope,
   canonicalSource,
   childDescriptors,
-  physicalIdentity = DEFAULT_PHYSICAL_IDENTITY,
 }) {
-  const identity = normalizePhysicalIdentity(physicalIdentity);
   const source = canonicalSource;
   const descriptors = childDescriptors;
   const timeseriesIds = [];
@@ -370,9 +347,9 @@ export function buildObservationHistoryIndexV3ScopedManifestPayload({
     index_generation: INDEX_GENERATION,
     history_version: LOGICAL_HISTORY_VERSION,
     domain: "observations",
-    history_schema_version: identity.history_schema_version,
-    writer_version: identity.writer_version,
-    physical_layout_version: identity.physical_layout_version,
+    history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+    writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
+    physical_layout_version: PHYSICAL_LAYOUT_VERSION,
     shard_width: SHARD_WIDTH,
     day_utc: scope.day_utc,
     connector_id: scope.connector_id,
@@ -387,7 +364,6 @@ export function validateObservationHistoryIndexV3ScopedManifestBody({
   key,
   body,
   indexRoot = DEFAULT_INDEX_ROOT,
-  physicalIdentity = DEFAULT_PHYSICAL_IDENTITY,
 }) {
   const bodyBuffer = exactArrayBuffer(body);
   let bodyText;
@@ -418,7 +394,6 @@ export function validateObservationHistoryIndexV3ScopedManifestBody({
     scope,
     canonicalSource: source,
     childDescriptors: descriptors,
-    physicalIdentity,
   });
   if (!sameJson(payload, expectedPayload)) {
     throw new Error(
