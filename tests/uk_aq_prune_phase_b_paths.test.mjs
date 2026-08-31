@@ -20,6 +20,7 @@ import {
   runCandidateAqilevelsStageForTest,
   summarizeFrozenObservationSourceForAqi,
   updateFinalizedHistoryIndexesForTest,
+  validateObservationDayConnectorReferencesForTest,
   validateAqilevelDataDebugConnectorManifests,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
@@ -80,6 +81,64 @@ test("active v3 connector verification cannot invoke the legacy v2 observation i
   assert.doesNotMatch(connectorVerification, /updateR2HistoryIndexesTargeted\(/);
   assert.doesNotMatch(connectorVerification, /domains:\s*\["observations"\]/);
   assert.doesNotMatch(connectorVerification, /writeR2:\s*true/);
+});
+
+test("Phase B accepts the verified canonical v3 day authority and rejects a non-canonical connector key", () => {
+  const observationsPrefix = "history/v2/observations";
+  const connectorManifest = buildHistoryV2ConnectorManifestForTest({
+    domain: "observations",
+    dayUtc: DAY,
+    connectorId: 1,
+    runId: RUN_ID,
+    manifestKey: `${observationsPrefix}/day_utc=${DAY}/connector_id=1/manifest.json`,
+    pollutantManifests: [],
+    writerGitSha: "4".repeat(40),
+    backedUpAtUtc: "2026-06-15T00:00:00.000Z",
+  });
+  const manifestKey = `${observationsPrefix}/day_utc=${DAY}/manifest.json`;
+  const dayManifest = buildHistoryV2DayManifestForTest({
+    domain: "observations",
+    dayUtc: DAY,
+    runId: RUN_ID,
+    manifestKey,
+    connectorManifests: [connectorManifest],
+    writerGitSha: "4".repeat(40),
+    backedUpAtUtc: "2026-06-15T00:00:00.000Z",
+  });
+
+  assert.deepEqual(validateObservationDayConnectorReferencesForTest({
+    manifest: dayManifest,
+    manifestKey,
+    dayUtc: DAY,
+    observationsPrefix,
+  }), [{
+    connector_id: 1,
+    manifest_key: connectorManifest.manifest_key,
+  }]);
+
+  const invalidConnectorManifest = {
+    ...connectorManifest,
+    manifest_key:
+      `${observationsPrefix}/day_utc=${DAY}/nested/connector_id=1/manifest.json`,
+  };
+  const invalidDayManifest = buildHistoryV2DayManifestForTest({
+    domain: "observations",
+    dayUtc: DAY,
+    runId: RUN_ID,
+    manifestKey,
+    connectorManifests: [invalidConnectorManifest],
+    writerGitSha: "4".repeat(40),
+    backedUpAtUtc: "2026-06-15T00:00:00.000Z",
+  });
+  assert.throws(
+    () => validateObservationDayConnectorReferencesForTest({
+      manifest: invalidDayManifest,
+      manifestKey,
+      dayUtc: DAY,
+      observationsPrefix,
+    }),
+    /invalid connector references/,
+  );
 });
 
 test("active normal Phase B has no reachable retired AQI R2 branch", () => {

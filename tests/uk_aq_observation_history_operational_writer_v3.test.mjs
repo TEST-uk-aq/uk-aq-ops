@@ -397,16 +397,24 @@ test("day publisher creates verified canonical parent from changed connector aut
     backedUpAtUtc: "2026-08-22T00:00:00.000Z",
   });
   const objects = new Map([[connectorKey, Buffer.from(JSON.stringify(connectorPayload, null, 2))]]);
+  const events = [];
   const publisher = createObservationHistoryV3CanonicalDayPublisher({
     targetWriterGitSha: TARGET_GIT_SHA,
-    getObject: async ({ key }) => objects.has(key)
-      ? { exists: true, body: Buffer.from(objects.get(key)) }
-      : { exists: false },
+    getObject: async ({ key }) => {
+      events.push(`get:${key}`);
+      return objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false };
+    },
     putIfChanged: async ({ key, body }) => {
+      events.push(`put:${key}`);
       objects.set(key, Buffer.from(body));
       return { ok: true, status: "written" };
     },
-    recordDurableEvidence: async () => ({ durable: true }),
+    recordDurableEvidence: async ({ key }) => {
+      events.push(`durable:${key}`);
+      return { durable: true };
+    },
   });
   const result = await publisher({
     day_utc: DAY_UTC,
@@ -419,6 +427,43 @@ test("day publisher creates verified canonical parent from changed connector aut
   assert.equal(
     result.day_manifest.key,
     buildHistoryV2DayManifestKey("history/v2/observations", DAY_UTC),
+  );
+  const dayKey = result.day_manifest.key;
+  const putIndex = events.indexOf(`put:${dayKey}`);
+  const readbackIndex = events.lastIndexOf(`get:${dayKey}`);
+  const durableIndex = events.indexOf(`durable:${dayKey}`);
+  assert.ok(putIndex >= 0 && putIndex < readbackIndex);
+  assert.ok(readbackIndex < durableIndex);
+});
+
+test("day publisher fails closed when canonical day authority is missing after publication", async () => {
+  const partition = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("pm25", 102),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const connectorPayload = connectorFromPartition({
+    connectorId: 1,
+    partition,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const connectorBody = Buffer.from(JSON.stringify(connectorPayload, null, 2));
+  const publisher = createObservationHistoryV3CanonicalDayPublisher({
+    targetWriterGitSha: TARGET_GIT_SHA,
+    getObject: async ({ key }) => key === connectorPayload.manifest_key
+      ? { exists: true, body: connectorBody }
+      : { exists: false },
+    putIfChanged: async () => ({ ok: true, status: "written" }),
+    recordDurableEvidence: async () => ({ durable: true }),
+  });
+
+  await assert.rejects(
+    publisher({
+      day_utc: DAY_UTC,
+      changed_connectors: [changedConnectorEntry(connectorPayload)],
+    }),
+    /Published canonical manifest is missing/,
   );
 });
 

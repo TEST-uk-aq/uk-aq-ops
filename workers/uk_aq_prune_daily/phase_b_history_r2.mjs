@@ -4903,6 +4903,42 @@ export function summarizeVerifiedMergedDayManifestForGate({ manifest, manifestKe
   };
 }
 
+function validateObservationDayConnectorReferences({
+  manifest,
+  manifestKey,
+  dayUtc,
+  observationsPrefix,
+}) {
+  validateCanonicalHistoryV2Manifest(manifest, {
+    history_version: "v2",
+    domain: "observations",
+    manifest_kind: "day",
+    day_utc: dayUtc,
+    manifest_key: manifestKey,
+  });
+  const currentReferences = Array.isArray(manifest.connector_manifests)
+    ? manifest.connector_manifests
+    : Array.isArray(manifest.child_manifests) ? manifest.child_manifests : [];
+  const references = currentReferences.map((entry) => ({
+    connector_id: Number(entry.connector_id),
+    manifest_key: String(entry.manifest_key || ""),
+  }));
+  if (references.some((entry) =>
+    !Number.isInteger(entry.connector_id) || entry.connector_id <= 0 ||
+    entry.manifest_key !== buildCanonicalHistoryV2ConnectorManifestKey(
+      observationsPrefix,
+      dayUtc,
+      entry.connector_id,
+    )
+  )) {
+    throw new Error(`Current day manifest has invalid connector references: ${manifestKey}`);
+  }
+  return references;
+}
+
+export const validateObservationDayConnectorReferencesForTest =
+  validateObservationDayConnectorReferences;
+
 async function finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }) {
   const dayCandidates = await fetchDayCandidates(client, dayUtc);
   const dayState = computeDayGateState(dayCandidates);
@@ -4923,32 +4959,23 @@ async function finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }) {
     getObject: r2GetObject,
     r2: runtime.r2,
     key: dayManifestKey,
-    validate: (current) => {
-      validateCanonicalHistoryV2Manifest(current, {
-        history_version: "v2",
-        domain: "observations",
-        manifest_kind: "day",
-        day_utc: dayUtc,
-        manifest_key: dayManifestKey,
-      });
-      const currentReferences = Array.isArray(current.connector_manifests)
-        ? current.connector_manifests
-        : Array.isArray(current.child_manifests) ? current.child_manifests : [];
-      const references = currentReferences.map((entry) => ({
-        connector_id: Number(entry.connector_id),
-        manifest_key: String(entry.manifest_key || ""),
-      }));
-      if (references.some((entry) =>
-        !Number.isInteger(entry.connector_id) || entry.connector_id <= 0 ||
-        !entry.manifest_key.startsWith(dayPrefix) ||
-        !entry.manifest_key.endsWith(`/connector_id=${entry.connector_id}/manifest.json`)
-      )) {
-        throw new Error(`Current day manifest has invalid connector references: ${dayManifestKey}`);
-      }
-      return references;
-    },
+    validate: (current) => validateObservationDayConnectorReferences({
+      manifest: current,
+      manifestKey: dayManifestKey,
+      dayUtc,
+      observationsPrefix: runtime.committed_prefix,
+    }),
   });
   if (currentRead.state !== "valid") {
+    if (currentRead.state === "structurally_invalid") {
+      const detail = currentRead.validation_error instanceof Error
+        ? currentRead.validation_error.message
+        : String(currentRead.validation_error || "unknown validation failure");
+      throw new Error(
+        `V3 canonical day authority failed validation: ${dayManifestKey}; ${detail}`,
+        { cause: currentRead.validation_error },
+      );
+    }
     throw new Error(`V3 observation writer did not publish the canonical day authority: ${dayManifestKey}`);
   }
   const referenceByConnector = new Map(
