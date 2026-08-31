@@ -233,18 +233,18 @@ def load_partition(role: str, root: Path) -> dict[str, Any]:
         )
     }:
         raise ValueError(f"source timeseries counts disagree with manifest: {root}")
-    first = rows[0]
     scope = {
         "day_utc": manifest["day_utc"],
         "connector_id": int(manifest["connector_id"]),
         "pollutant_code": manifest["pollutant_code"],
     }
-    if (
-        first["observed_at_utc"][:10] != scope["day_utc"]
-        or first["connector_id"] != scope["connector_id"]
-        or first["pollutant_code"] != scope["pollutant_code"]
-    ):
-        raise ValueError(f"source scope mismatch: {root}")
+    for row in rows:
+        if row["connector_id"] != scope["connector_id"]:
+            raise ValueError(f"source connector_id disagrees with partition scope: {root}")
+        if row["pollutant_code"] != scope["pollutant_code"]:
+            raise ValueError(f"source pollutant_code disagrees with partition scope: {root}")
+        if row["observed_at_utc"][:10] != scope["day_utc"]:
+            raise ValueError(f"source UTC day disagrees with partition scope: {root}")
     return {
         "role": role,
         "root": str(root),
@@ -302,6 +302,68 @@ def pack_files(segments: list[dict[str, Any]], max_row_groups: int) -> list[list
     if current:
         files.append(current)
     return files
+
+
+def serialize_segments(file_segments: list[dict[str, Any]]) -> bytes:
+    sink = pa.BufferOutputStream()
+    with pq.ParquetWriter(
+        sink,
+        PARQUET_SCHEMA,
+        compression="zstd",
+        use_dictionary=True,
+        write_statistics=True,
+        write_page_index=True,
+        data_page_version="1.0",
+    ) as writer:
+        for segment in file_segments:
+            writer.write_table(
+                table_from_rows(segment["rows"]),
+                row_group_size=segment["row_count"],
+            )
+    return sink.getvalue().to_pybytes()
+
+
+def deterministic_segment_split_index(file_segments: list[dict[str, Any]]) -> int:
+    midpoint = sum(segment["row_count"] for segment in file_segments) / 2
+    candidates = []
+    row_count = 0
+    for index, segment in enumerate(file_segments[:-1], start=1):
+        row_count += segment["row_count"]
+        candidates.append(
+            (
+                abs(row_count - midpoint),
+                index,
+                segment["timeseries_id"]
+                != file_segments[index]["timeseries_id"],
+            )
+        )
+    if not candidates:
+        raise ValueError("prototype byte split requires a row-group boundary")
+    timeseries_boundaries = [candidate for candidate in candidates if candidate[2]]
+    return min(timeseries_boundaries or candidates)[1]
+
+
+def serialize_within_byte_target(
+    file_segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    body = serialize_segments(file_segments)
+    if len(body) <= TARGET_FILE_BYTES:
+        return [{"segments": file_segments, "body": body}]
+    if len(file_segments) == 1:
+        if len(body) > MAX_FILE_BYTES:
+            raise ValueError(
+                "one prototype row group exceeds max_file_bytes and requires "
+                "smaller chronological segmentation"
+            )
+        raise ValueError(
+            "one prototype row group exceeds target_file_bytes and cannot be "
+            "split without changing the configured chronological segmentation"
+        )
+    split_at = deterministic_segment_split_index(file_segments)
+    return [
+        *serialize_within_byte_target(file_segments[:split_at]),
+        *serialize_within_byte_target(file_segments[split_at:]),
+    ]
 
 
 def column_index(metadata: pq.FileMetaData, name: str) -> int:
@@ -527,31 +589,30 @@ def run_configuration(
     )
     config_root.mkdir(parents=True, exist_ok=True)
     intended_segments = build_segments(source["rows"], cap)
-    file_plans = pack_files(intended_segments, max_row_groups)
+    candidate_file_plans = pack_files(intended_segments, max_row_groups)
+    file_plans = [
+        serialized
+        for candidate in candidate_file_plans
+        for serialized in serialize_within_byte_target(candidate)
+    ]
     file_descriptors = []
     exact_segments = []
     output_rows = []
     total_footer_bytes = 0
     shared_files = 0
 
-    for file_ordinal, file_segments in enumerate(file_plans):
+    for stale_path in config_root.glob("part-*.parquet"):
+        stale_path.unlink()
+    (config_root / "index.json").unlink(missing_ok=True)
+
+    for file_ordinal, serialized in enumerate(file_plans):
+        file_segments = serialized["segments"]
         file_name = f"part-{file_ordinal:05d}.parquet"
         path = config_root / file_name
-        with pq.ParquetWriter(
-            path,
-            PARQUET_SCHEMA,
-            compression="zstd",
-            use_dictionary=True,
-            write_statistics=True,
-            write_page_index=True,
-            data_page_version="1.0",
-        ) as writer:
-            for segment in file_segments:
-                writer.write_table(
-                    table_from_rows(segment["rows"]),
-                    row_group_size=segment["row_count"],
-                )
+        path.write_bytes(serialized["body"])
         byte_size = path.stat().st_size
+        if byte_size > TARGET_FILE_BYTES:
+            raise ValueError(f"prototype Parquet exceeds target_file_bytes: {path}")
         if byte_size > MAX_FILE_BYTES:
             raise ValueError(f"prototype Parquet exceeds max_file_bytes: {path}")
         parquet_file = pq.ParquetFile(path)
@@ -658,6 +719,9 @@ def run_configuration(
     return {
         "cap_rows": cap,
         "max_row_groups_per_file": max_row_groups,
+        "row_and_group_candidate_file_count": len(candidate_file_plans),
+        "byte_aware_split_count": len(file_plans) - len(candidate_file_plans),
+        "target_file_bytes_enforced": True,
         "row_group_count": len(exact_segments),
         "file_count": len(file_descriptors),
         "shared_file_count": shared_files,
@@ -745,7 +809,12 @@ def main() -> None:
             "max_file_rows": MAX_FILE_ROWS,
             "target_file_bytes": TARGET_FILE_BYTES,
             "max_file_bytes": MAX_FILE_BYTES,
+            "target_file_bytes_enforced": True,
         },
+        "file_packing_model": (
+            "row and row-group candidate packing followed by deterministic "
+            "serialized-byte splitting at row-group boundaries"
+        ),
         "caps": args.caps,
         "row_groups_per_file_bounds": args.row_groups_per_file,
         "sources": {},
