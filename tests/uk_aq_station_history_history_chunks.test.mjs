@@ -20,8 +20,8 @@ function chunkUrl(path, start, end, extra = "") {
 
 test("calculated history counts high-frequency observations by hour-ending interval", async () => {
   const originalFetch = globalThis.fetch;
-  const startMs = Date.parse("2026-08-25T00:00:00.000Z");
-  const endMs = Date.parse("2026-08-25T03:00:00.000Z");
+  const startMs = Date.parse("2026-08-26T21:00:00.000Z");
+  const endMs = Date.parse("2026-08-27T00:00:00.000Z");
   const request = {
     timeseriesId: 7421,
     connectorId: 7,
@@ -53,14 +53,20 @@ test("calculated history counts high-frequency observations by hour-ending inter
       value: 10 + hour,
     }))).flat();
   let r2Rows = allRows;
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    timeseries_id: 7421,
-    connector_id: 7,
-    pollutant: "pm25",
-    response_complete: true,
-    coverage_state: "complete",
-    rows: r2Rows,
-  }), { status: 200 });
+  const requestedEnds = [];
+  globalThis.fetch = async (input) => {
+    const requestedEnd = new URL(String(input)).searchParams.get("end_utc");
+    requestedEnds.push(requestedEnd);
+    const responseComplete = Date.parse(requestedEnd) <= endMs;
+    return new Response(JSON.stringify({
+      timeseries_id: 7421,
+      connector_id: 7,
+      pollutant: "pm25",
+      response_complete: responseComplete,
+      coverage_state: responseComplete ? "complete" : "partial",
+      rows: r2Rows,
+    }), { status: 200 });
+  };
 
   try {
     const complete = await buildCalculatedHistory({
@@ -74,6 +80,8 @@ test("calculated history counts high-frequency observations by hour-ending inter
       outputEndMs: endMs,
     });
     assert.equal(complete.observations.rows.length, 33);
+    assert.equal(requestedEnds[0], "2026-08-27T00:00:00.000Z");
+    assert.equal(complete.observations.source_segments[0].end_utc, "2026-08-27T00:00:00.000Z");
     assert.equal(complete.observations.source_segments[0].response_complete, true);
     assert.equal(complete.observations.response_complete, true);
     assert.deepEqual(complete.observations.gap_ranges, []);
@@ -93,13 +101,29 @@ test("calculated history counts high-frequency observations by hour-ending inter
       outputStartMs: startMs,
       outputEndMs: endMs,
     });
+    assert.equal(requestedEnds[1], "2026-08-27T00:00:00.000Z");
     assert.equal(missingHour.observations.source_segments[0].response_complete, true);
     assert.equal(missingHour.observations.response_complete, false);
     assert.deepEqual(missingHour.observations.gap_ranges, [{
-      start_utc: "2026-08-25T01:00:00.000Z",
-      end_utc: "2026-08-25T02:00:00.000Z",
+      start_utc: "2026-08-26T22:00:00.000Z",
+      end_utc: "2026-08-26T23:00:00.000Z",
     }]);
     assert.deepEqual(missingHour.observations.partial_reasons, ["missing_visible_observation_hours"]);
+
+    r2Rows = allRows;
+    const withAqi = await buildCalculatedHistory({
+      request: { ...request, includeAqi: true },
+      continuity,
+      env: {
+        UK_AQ_EDGE_UPSTREAM_SECRET: "secret",
+        UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations",
+      },
+      outputStartMs: startMs,
+      outputEndMs: endMs,
+    });
+    assert.equal(requestedEnds[2], "2026-08-27T00:00:00.001Z");
+    assert.equal(withAqi.observations.source_segments[0].end_utc, "2026-08-27T00:00:00.001Z");
+    assert.equal(withAqi.observations.source_segments[0].response_complete, false);
   } finally {
     globalThis.fetch = originalFetch;
   }

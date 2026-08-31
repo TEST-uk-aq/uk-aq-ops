@@ -155,7 +155,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const includeObservations = request.includeObservations !== false;
   const contextHours = request.includeAqi && ["pm25", "pm10"].includes(request.pollutant) ? 23 : 0;
   const requiredStartMs = outputStartMs - contextHours * HOUR_MS;
-  const requiredEndExclusiveMs = outputEndMs + 1;
+  const requiredEndExclusiveMs = request.includeAqi ? outputEndMs + 1 : outputEndMs;
   const selection = selectContinuitySegments(continuity, requiredStartMs, requiredEndExclusiveMs);
   const visibleSelection = selectContinuitySegments(continuity, outputStartMs, requiredEndExclusiveMs);
   if (!selection.segments.length) throw new Error("station_history_continuity_member_missing");
