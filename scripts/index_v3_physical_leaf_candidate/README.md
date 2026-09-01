@@ -1,35 +1,66 @@
-# TEST observation-history physical-leaf candidate
+# TEST observation-history exact physical-leaf candidate
 
-This directory owns the isolated, non-authoritative TEST experiment that
-replaces the physical-index-v1 1,000-ID child read with one exact-timeseries
-leaf. It is fixed to the existing timeseries-aligned-v2 1,024-row fixture,
-creates no Parquet objects, and never writes canonical `history/v2` or
-`history/_index_v3` keys.
+This isolated TEST candidate exercises the selected index_v3 physical leaf
+mechanism without changing canonical station-history or observation-history.
+Its logical history contract remains v2. Its fixed physical design is:
 
-The fixed prototype namespace is:
+- `timeseries-aligned-v2`;
+- one timeseries per row group;
+- an aligned row cap of 1,024;
+- exact-timeseries physical leaf indexes;
+- exact `observed_at_utc` and `value` byte ranges;
+- no runtime Parquet-footer fetch or parse; and
+- no runtime `timeseries_id` decode.
+
+The prototype namespace remains:
 
 ```text
 history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-leaf-index-v1/cap_rows=1024/
 ```
 
-Each day/connector/pollutant manifest contains the common decoder profile and
-a compact `leaves_by_timeseries_id` lookup. Its tuple field order is pinned by
-`leaf_descriptor_fields: ["key", "byte_size", "sha256"]`. Exact leaf keys use:
+The production-intended shared read implementation is
+`workers/shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs`. The
+deployed `-v3-leaf-candidate` Worker is only a TEST wrapper around that shared
+implementation; it does not carry a second reader implementation.
 
-```text
-.../timeseries_id=000007421.json
+## Physical paging contract
+
+A low-level logical request must be non-empty and at most 24 hours. It may
+cross UTC midnight, so a page may validate indexes from two UTC-day
+partitions, but one Worker invocation opens and decodes at most one complete
+physical segment and at most 1,024 physical rows.
+
+When more intersecting segments remain, the response includes:
+
+```json
+{
+  "response_complete": false,
+  "has_gap": false,
+  "partial_reasons": ["physical_pagination_incomplete"],
+  "physical_page": {
+    "pagination_complete": false,
+    "next_cursor": "<opaque base64url cursor>"
+  }
+}
 ```
 
-A leaf contains exactly one timeseries, only its aligned Parquet file
-identities, and only its chronological segments and exact
-`observed_at_utc`/`value` column ranges. Runtime verifies the manifest-pinned
-leaf byte size and SHA-256. It also continues to HEAD each selected aligned
-Parquet object and require stored SHA-256, byte size, and ETag before range
-reads. Neither a Parquet footer nor `timeseries_id` is decoded at runtime.
+`has_gap` is reserved for genuine coverage loss. A final page is complete only
+when physical pagination and index coverage are both complete. The opaque
+cursor is bound to the logical request, index/layout/writer identity, and the
+next manifest/leaf/file/row-group physical coordinates. Malformed,
+cross-request, stale-index, or stale-coordinate cursors fail closed.
+
+`since_utc` and `limit` are rejected by this low-level endpoint. They do not
+compete with `physical_cursor`; higher-level range and limiting semantics must
+be applied by a later station-history page walker.
+
+The reader verifies the manifest-pinned leaf byte size and SHA-256 and the
+pinned aligned Parquet SHA-256, byte size, and ETag before range reads. It
+never reads R2 outside the wrapper-provided candidate prefixes.
 
 ## Generate and validate locally
 
-Use Node 20.20.2 with the existing aligned and physical-1024 fixtures:
+Use Node 20.20.2 with the existing aligned, physical-1024, and leaf fixtures:
 
 ```bash
 node scripts/index_v3_physical_leaf_candidate/generate.mjs \
@@ -38,68 +69,31 @@ node scripts/index_v3_physical_leaf_candidate/generate.mjs \
   --output-root tmp/index_v3_physical_leaf_candidate \
   --replace
 
-node scripts/index_v3_physical_leaf_candidate/validate_local.mjs \
+npx --yes node@20.20.2 \
+  scripts/index_v3_physical_leaf_candidate/validate_local.mjs \
   --aligned-root tmp/index_v3_aligned_candidate \
   --physical-root tmp/index_v3_physical_candidate_1024 \
   --leaf-root tmp/index_v3_physical_leaf_candidate
 
-node scripts/index_v3_physical_leaf_candidate/measure.mjs --dry-run
+npx --yes node@20.20.2 \
+  scripts/index_v3_physical_leaf_candidate/measure.mjs --dry-run
+
 git diff --check
 ```
 
-The validator proves that the plan contains JSON only, every leaf contains one
-timeseries, every segment/file is cap=1024 aligned data, every manifest tuple
-matches the exact generated leaf bytes, and both focused TS7421 cases decode to
-the same rows and hash as the current physical-index-1024 reader.
+The focused validator page-walks normal TS7421 24h, dense TS7421 1h, and
+dense TS7421 24h. It expects the existing fixture evidence of 1, 1, and 13
+pages respectively, proves no invocation decodes a second segment, and
+compares the assembled rows and SHA-256 with the existing physical-index-1024
+reader. The page counts are fixture assertions, not runtime configuration.
+It also proves cursor replay/staleness rejection, a missing required leaf as a
+genuine gap, the 24-hour boundary, and the explicit `since_utc`/`limit`
+rejections.
 
-### Consecutive normal TS7421 extension
+## Prototype publication (only after separate authorization)
 
-Canonical TEST source coverage is available for every UTC day from
-2026-08-20 through 2026-08-26. Stage only days 21-26, preserving the existing
-day-20 fixture:
-
-```bash
-node scripts/index_v3_aligned_candidate/stage_source.mjs \
-  --profile sensorcommunity-normal-multiday-extension \
-  --output-root tmp/index_v3_aligned_candidate_multiday_source \
-  --replace
-
-/tmp/uk_aq_aligned_v2_env/bin/python \
-  scripts/index_v3_aligned_candidate/generate.py \
-  --environment TEST \
-  --source-root tmp/index_v3_aligned_candidate_multiday_source \
-  --output-root tmp/index_v3_aligned_candidate_multiday_extension \
-  --caps 1024 \
-  --partition sensorcommunity_normal_2026_08_21=sensorcommunity_normal_2026-08-21_pm25 \
-  --partition sensorcommunity_normal_2026_08_22=sensorcommunity_normal_2026-08-22_pm25 \
-  --partition sensorcommunity_normal_2026_08_23=sensorcommunity_normal_2026-08-23_pm25 \
-  --partition sensorcommunity_normal_2026_08_24=sensorcommunity_normal_2026-08-24_pm25 \
-  --partition sensorcommunity_normal_2026_08_25=sensorcommunity_normal_2026-08-25_pm25 \
-  --partition sensorcommunity_normal_2026_08_26=sensorcommunity_normal_2026-08-26_pm25 \
-  --replace
-
-node scripts/index_v3_physical_leaf_candidate/generate.mjs \
-  --environment TEST \
-  --aligned-root tmp/index_v3_aligned_candidate_multiday_extension \
-  --output-root tmp/index_v3_physical_leaf_candidate_multiday_extension \
-  --replace
-
-node scripts/index_v3_physical_leaf_candidate/validate_local.mjs \
-  --aligned-root tmp/index_v3_aligned_candidate \
-  --aligned-extension-root tmp/index_v3_aligned_candidate_multiday_extension \
-  --physical-root tmp/index_v3_physical_candidate_1024 \
-  --leaf-root tmp/index_v3_physical_leaf_candidate \
-  --leaf-extension-root tmp/index_v3_physical_leaf_candidate_multiday_extension
-```
-
-The extension plans contain only days 21-26. Validation rejects any key shared
-with the existing fixture, any canonical key, and any leaf-plan Parquet object.
-
-## Publish only after explicit review
-
-The publisher is checksum-aware, accepts only JSON under the exact isolated
-leaf prefix, publishes leaves before scoped manifests, and rejects canonical or
-Parquet keys. Export the established TEST R2 configuration first.
+The existing checksum-aware publisher accepts JSON only under the exact
+isolated leaf prefix and rejects canonical and Parquet keys:
 
 ```bash
 node scripts/index_v3_physical_leaf_candidate/publish.mjs \
@@ -107,26 +101,13 @@ node scripts/index_v3_physical_leaf_candidate/publish.mjs \
   --confirm-test-prefix history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-leaf-index-v1/cap_rows=1024
 ```
 
-Do not add `--replace-existing` unless the exact differing prototype objects
-have been reviewed.
+Do not run this as part of code review. No R2 publication is required for the
+shared-reader change when the existing TEST fixture is already deployed.
 
-After reviewing the multiday extension, publish aligned dependencies first and
-leaf JSON second:
+## Deploy and tail on TEST only after explicit review
 
-```bash
-node scripts/index_v3_aligned_candidate/publish.mjs \
-  --plan tmp/index_v3_aligned_candidate_multiday_extension/publication-plan.json \
-  --confirm-test-prefix history/_prototype/observation-history/timeseries-aligned-v2
-
-node scripts/index_v3_physical_leaf_candidate/publish.mjs \
-  --plan tmp/index_v3_physical_leaf_candidate_multiday_extension/publication-plan.json \
-  --confirm-test-prefix history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-leaf-index-v1/cap_rows=1024
-```
-
-## Deploy and tail only after explicit review and push
-
-The separate Worker uses the short `-v3-leaf-candidate` suffix,
-`workers_dev=true`, and `preview_urls=false`.
+The separate Worker keeps `workers_dev=true`, `preview_urls=false`, and the
+short `-v3-leaf-candidate` suffix:
 
 ```bash
 gh workflow run uk_aq_observs_history_r2_api_v3_leaf_candidate_deploy.yml \
@@ -147,38 +128,32 @@ npx --yes wrangler@4 tail "${PHYSICAL_LEAF_WORKER_NAME}" --format json \
   | tee tmp/index_v3_physical_leaf_candidate_tail.jsonl
 ```
 
-## Run the focused A/B only after deployment
+## Focused post-deployment measurement
 
 ```bash
 export UK_AQ_V3_PHYSICAL_1024_CANDIDATE_URL="https://${PHYSICAL_1024_WORKER_NAME}.<test-account-subdomain>.workers.dev"
 export UK_AQ_V3_PHYSICAL_LEAF_CANDIDATE_URL="https://${PHYSICAL_LEAF_WORKER_NAME}.<test-account-subdomain>.workers.dev"
 
-node scripts/index_v3_physical_leaf_candidate/measure.mjs \
+npx --yes node@20.20.2 \
+  scripts/index_v3_physical_leaf_candidate/measure.mjs \
   --physical-1024-endpoint "${UK_AQ_V3_PHYSICAL_1024_CANDIDATE_URL}" \
   --physical-leaf-endpoint "${UK_AQ_V3_PHYSICAL_LEAF_CANDIDATE_URL}" \
   --repeat 1
 ```
 
-With no `--case` and no `--leaf-only`, the runner retains the original normal
-24-hour and dense one-hour physical-1024 versus leaf A/B matrix. `--case
-<name>` is repeatable. Successful A/B pairs must have the same `rows_sha256`;
-a mismatch fails the run.
+The measurement client follows `physical_page.next_cursor` to completion,
+records every page's diagnostic request ID and CF-Ray, and fails if assembled
+rows differ from the physical-1024 response. It never reports client wall time
+as Worker CPU. CPU evidence must be correlated per invocation from Cloudflare
+tail or Workers Analytics telemetry. There is no CPU-reactive adaptive limiter;
+telemetry can only support a later manual reconsideration of the fixed cap.
 
-The physical-1024 prototype was intentionally not extended beyond day 20.
-After publishing the aligned and leaf extension objects, measure consecutive
-leaf scaling without generating excluded coarse physical-index JSON:
+## Canonical integration handover
 
-```bash
-node scripts/index_v3_physical_leaf_candidate/measure.mjs \
-  --physical-leaf-endpoint "${UK_AQ_V3_PHYSICAL_LEAF_CANDIDATE_URL}" \
-  --case sensorcommunity_normal_ts7421_24h \
-  --case sensorcommunity_normal_ts7421_48h \
-  --case sensorcommunity_normal_ts7421_72h \
-  --case sensorcommunity_normal_ts7421_7d \
-  --leaf-only \
-  --repeat 1
-```
-
-CPU stays null for
-correlation by diagnostic request ID or CF-Ray with Cloudflare invocation
-telemetry. Client wall time is recorded separately and is not Worker CPU.
+The active system contract still describes the earlier
+`timeseries-bounded-v1`/footer-derived reader. Before station-history adopts
+this shared mechanism, Chat-mode documentation work must reconcile the active
+contract with `timeseries-aligned-v2`, exact stored ranges, physical paging,
+and the higher-level cursor walk. Arbitrary user date ranges will later be
+composed from these bounded reads by station-history/chart orchestration. This
+experiment does not edit that contract or switch either canonical Worker.

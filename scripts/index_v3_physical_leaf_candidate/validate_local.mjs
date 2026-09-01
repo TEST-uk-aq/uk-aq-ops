@@ -8,30 +8,24 @@ import {
   createPinnedObservationHistoryV3RandomAccessFile,
 } from "../../workers/shared/uk_aq_observation_history_random_access_v3.mjs";
 import {
-  createObservationHistoryV3FooterCache,
-  readObservationHistoryExactV3,
-} from "../../workers/shared/uk_aq_observation_history_reader_v3.mjs";
+  OBSERVATION_HISTORY_EXACT_LEAF_PAGINATION_REASON,
+  ObservationHistoryExactLeafReadError,
+  readObservationHistoryExactLeafPageV3,
+} from "../../workers/shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs";
 import {
   readObservationHistoryPhysicalCandidate,
 } from "../../workers/uk_aq_observs_history_r2_api_v3_physical_candidate/reader.mjs";
 import {
-  readObservationHistoryPhysicalLeafCandidate,
-} from "../../workers/uk_aq_observs_history_r2_api_v3_leaf_candidate/reader.mjs";
+  parseObservationRequest,
+  physicalLeafCandidateReaderIndex,
+} from "../../workers/uk_aq_observs_history_r2_api_v3_leaf_candidate/worker.mjs";
 
 const BASE_PREFIX = "history/_prototype/observation-history/timeseries-aligned-v2";
-const ALIGNED_INDEX_ROOT = `${BASE_PREFIX}/cap_rows=1024/observations_timeseries`;
 const ALIGNED_DATA_ROOT = `${BASE_PREFIX}/cap_rows=1024/observations`;
 const PHYSICAL_PREFIX = `${BASE_PREFIX}/candidate=physical-index-v1/cap_rows=1024`;
 const PHYSICAL_INDEX_ROOT = `${PHYSICAL_PREFIX}/observations_timeseries`;
 const LEAF_PREFIX = `${BASE_PREFIX}/candidate=physical-leaf-index-v1/cap_rows=1024`;
 const LEAF_INDEX_ROOT = `${LEAF_PREFIX}/observations_timeseries`;
-const ALIGNED_IDENTITY = Object.freeze({
-  history_schema_version: 3,
-  writer_version: "pyarrow-zstd-timeseries-aligned-candidate-v1",
-  physical_layout_version: "timeseries-aligned-v2",
-  parquet_footer_identity: "created_by_and_uk_aq_schema_metadata",
-  parquet_created_by: "parquet-cpp-arrow version 25.0.1",
-});
 
 function parse(argv) {
   const options = {
@@ -265,8 +259,88 @@ function comparable(rows) {
   }));
 }
 
-function requestedUtcDays(item) {
-  return (Date.parse(item.end_utc) - Date.parse(item.start_utc)) / 86_400_000;
+function rowsSha256(rows) {
+  return sha256(Buffer.from(JSON.stringify(comparable(rows))));
+}
+
+async function walkLeafPages({ source, item }) {
+  const rows = [];
+  const pages = [];
+  const cursors = new Set();
+  let physicalCursor = null;
+  for (let pageNumber = 1; pageNumber <= 256; pageNumber += 1) {
+    const page = await readObservationHistoryExactLeafPageV3({
+      source,
+      timeseriesId: item.timeseries_id,
+      connectorId: item.connector_id,
+      pollutantCode: "pm25",
+      startUtc: item.start_utc,
+      endUtc: item.end_utc,
+      physicalCursor,
+      index: physicalLeafCandidateReaderIndex(LEAF_INDEX_ROOT),
+    });
+    const physical = page.physical_page;
+    assert.equal(physical.page_number, pageNumber);
+    assert.equal(physical.continuation_cursor_supplied, pageNumber > 1);
+    assert.ok(physical.candidate_intersecting_segments >= physical.segments_decoded);
+    assert.ok(physical.segments_decoded === 0 || physical.segments_decoded === 1);
+    assert.ok(physical.physical_rows_decoded >= 0 && physical.physical_rows_decoded <= 1024);
+    assert.equal(page.diagnostics.selected_chronological_segments, physical.segments_decoded);
+    assert.equal(page.diagnostics.selected_files, physical.segments_decoded);
+    assert.equal(page.diagnostics.physical_segments_decoded, physical.segments_decoded);
+    assert.equal(page.diagnostics.physical_rows_decoded, physical.physical_rows_decoded);
+    assert.equal(page.diagnostics.identity_head_reads, physical.segments_decoded);
+    assert.ok(page.diagnostics.r2_range_reads <= 2);
+    assert.equal(page.diagnostics.selected_coordinates.length, physical.segments_decoded);
+    for (const name of ["observed_at_utc", "value"]) {
+      const ranges = page.diagnostics.requested_physical_byte_ranges_by_column[name];
+      assert.equal(ranges.length, physical.segments_decoded);
+      if (ranges.length) {
+        assert.equal(ranges[0].file_key, page.diagnostics.selected_coordinates[0].file_key);
+        assert.equal(ranges[0].row_group_ordinal, page.diagnostics.selected_coordinates[0].row_group_ordinal);
+      }
+    }
+    assert.equal(page.diagnostics.parquet_footer_fetched, false);
+    assert.equal(page.diagnostics.parquet_footer_parsed, false);
+    assert.equal(page.diagnostics.timeseries_id_decoded, false);
+    assert.equal(page.diagnostics.coarse_child_shards_read, 0);
+    rows.push(...page.rows);
+    pages.push(page);
+    if (physical.pagination_complete) {
+      assert.equal(physical.next_cursor, null);
+      assert.equal(page.response_complete, true);
+      assert.equal(page.has_gap, false);
+      break;
+    }
+    assert.equal(page.response_complete, false);
+    assert.equal(page.has_gap, false);
+    assert.deepEqual(page.coverage_partial_reasons, []);
+    assert.deepEqual(page.partial_reasons, [OBSERVATION_HISTORY_EXACT_LEAF_PAGINATION_REASON]);
+    assert.equal(typeof physical.next_cursor, "string");
+    assert.ok(physical.next_cursor.length > 0);
+    assert.equal(cursors.has(physical.next_cursor), false);
+    cursors.add(physical.next_cursor);
+    physicalCursor = physical.next_cursor;
+  }
+  assert.equal(pages.at(-1)?.physical_page.pagination_complete, true);
+  return { rows, pages, rows_sha256: rowsSha256(rows) };
+}
+
+function decodeCursor(cursor) {
+  const padded = cursor.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(cursor.length / 4) * 4, "=");
+  return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+}
+
+function encodeCursor(payload) {
+  return Buffer.from(JSON.stringify(payload)).toString("base64url");
+}
+
+async function assertCursorRejected(action) {
+  await assert.rejects(action, (error) => {
+    assert.ok(error instanceof ObservationHistoryExactLeafReadError);
+    assert.equal(error.code, "physical_cursor_invalid");
+    return true;
+  });
 }
 
 function assertExtensionDoesNotRewrite({ baseRoot, extensionRoot, prefix, kind }) {
@@ -330,7 +404,7 @@ async function main() {
       end_utc: "2026-08-21T00:00:00.000Z",
       expected_rows: 288,
       expected_physical_rows: 288,
-      expected_segments: 1,
+      expected_pages: 1,
     },
     {
       name: "sensorcommunity_dense_ts7421_1h",
@@ -340,37 +414,22 @@ async function main() {
       end_utc: "2026-04-03T01:00:00.000Z",
       expected_rows: 527,
       expected_physical_rows: 1024,
-      expected_segments: 1,
-    },
-  ];
-  const normalDurationCases = [
-    {
-      name: "sensorcommunity_normal_ts7421_24h",
-      start_utc: "2026-08-20T00:00:00.000Z",
-      end_utc: "2026-08-21T00:00:00.000Z",
-      expected_rows: 288,
+      expected_pages: 1,
     },
     {
-      name: "sensorcommunity_normal_ts7421_48h",
-      start_utc: "2026-08-20T00:00:00.000Z",
-      end_utc: "2026-08-22T00:00:00.000Z",
-      expected_rows: 576,
-    },
-    {
-      name: "sensorcommunity_normal_ts7421_72h",
-      start_utc: "2026-08-20T00:00:00.000Z",
-      end_utc: "2026-08-23T00:00:00.000Z",
-      expected_rows: 863,
-    },
-    {
-      name: "sensorcommunity_normal_ts7421_7d",
-      start_utc: "2026-08-20T00:00:00.000Z",
-      end_utc: "2026-08-27T00:00:00.000Z",
-      expected_rows: 1995,
+      name: "sensorcommunity_dense_ts7421_24h",
+      connector_id: 7,
+      timeseries_id: 7421,
+      start_utc: "2026-04-03T00:00:00.000Z",
+      end_utc: "2026-04-04T00:00:00.000Z",
+      expected_rows: 12505,
+      expected_physical_rows: 12505,
+      expected_pages: 13,
     },
   ];
 
   const results = [];
+  let denseFirstCursor = null;
   for (const item of cases) {
     const common = {
       source,
@@ -386,123 +445,118 @@ async function main() {
         indexRoot: PHYSICAL_INDEX_ROOT,
         alignedRowCap: 1024,
       }),
-      readObservationHistoryPhysicalLeafCandidate({
-        ...common,
-        indexRoot: LEAF_INDEX_ROOT,
-      }),
+      walkLeafPages({ source, item }),
     ]);
     assert.equal(physical.response_complete, true);
-    assert.equal(leaf.response_complete, true);
     assert.equal(physical.rows.length, item.expected_rows);
     assert.equal(leaf.rows.length, item.expected_rows);
-    assert.equal(leaf.diagnostics.physical_rows_decoded, item.expected_physical_rows);
-    assert.equal(leaf.diagnostics.selected_chronological_segments, item.expected_segments);
-    assert.equal(leaf.diagnostics.index_objects_read, 2);
-    assert.equal(leaf.diagnostics.timeseries_leaf_objects_read, 1);
-    assert.equal(leaf.diagnostics.coarse_child_shards_read, 0);
-    assert.equal(leaf.diagnostics.parquet_footer_fetched, false);
-    assert.equal(leaf.diagnostics.parquet_footer_parsed, false);
-    assert.equal(leaf.diagnostics.timeseries_id_decoded, false);
-    assert.equal(leaf.diagnostics.identity_head_reads, leaf.diagnostics.selected_files);
-    assert.equal(leaf.diagnostics.r2_range_reads, physical.diagnostics.r2_range_reads);
-    assert.equal(leaf.diagnostics.r2_bytes_requested, physical.diagnostics.r2_bytes_requested);
+    assert.equal(leaf.pages.length, item.expected_pages);
+    assert.equal(
+      leaf.pages.reduce((sum, page) => sum + page.physical_page.physical_rows_decoded, 0),
+      item.expected_physical_rows,
+    );
+    assert.equal(leaf.pages.every((page) => page.physical_page.segments_decoded === 1), true);
+    assert.equal(leaf.pages.every((page) => page.diagnostics.index_objects_read === 2), true);
+    assert.equal(leaf.pages.every((page) => page.diagnostics.timeseries_leaf_objects_read === 1), true);
 
     const physicalRows = comparable(physical.rows);
     const leafRows = comparable(leaf.rows);
     assert.deepEqual(leafRows, physicalRows);
     const physicalRowsSha256 = sha256(Buffer.from(JSON.stringify(physicalRows)));
-    const leafRowsSha256 = sha256(Buffer.from(JSON.stringify(leafRows)));
+    const leafRowsSha256 = leaf.rows_sha256;
     assert.equal(leafRowsSha256, physicalRowsSha256);
-    assert.equal(leaf.diagnostics.index_bytes_read < physical.diagnostics.index_bytes_read, true);
+    if (item.expected_pages === 1) {
+      assert.equal(leaf.pages[0].diagnostics.index_bytes_read < physical.diagnostics.index_bytes_read, true);
+    }
+    if (item.name === "sensorcommunity_dense_ts7421_24h") {
+      denseFirstCursor = leaf.pages[0].physical_page.next_cursor;
+    }
 
     results.push({
       case: item.name,
       returned_rows: leaf.rows.length,
-      selected_segments: leaf.diagnostics.selected_chronological_segments,
-      physical_rows_decoded: leaf.diagnostics.physical_rows_decoded,
+      page_count: leaf.pages.length,
+      rows_per_page: leaf.pages.map((page) => page.rows.length),
+      physical_segments_decoded_per_page: leaf.pages.map((page) => page.physical_page.segments_decoded),
+      physical_rows_decoded_per_page: leaf.pages.map((page) => page.physical_page.physical_rows_decoded),
+      maximum_physical_segments_in_one_invocation: Math.max(...leaf.pages.map((page) => page.physical_page.segments_decoded)),
+      maximum_physical_rows_in_one_invocation: Math.max(...leaf.pages.map((page) => page.physical_page.physical_rows_decoded)),
       physical_index_objects_read: physical.diagnostics.index_objects_read,
       physical_index_bytes_read: physical.diagnostics.index_bytes_read,
-      leaf_index_objects_read: leaf.diagnostics.index_objects_read,
-      leaf_index_bytes_read: leaf.diagnostics.index_bytes_read,
-      timeseries_leaf_objects_read: leaf.diagnostics.timeseries_leaf_objects_read,
-      timeseries_leaf_bytes_read: leaf.diagnostics.timeseries_leaf_bytes_read,
-      coarse_child_shards_read: leaf.diagnostics.coarse_child_shards_read,
-      r2_range_reads: leaf.diagnostics.r2_range_reads,
-      r2_bytes_requested: leaf.diagnostics.r2_bytes_requested,
+      leaf_index_objects_read_per_page: leaf.pages.map((page) => page.diagnostics.index_objects_read),
+      leaf_index_bytes_read_per_page: leaf.pages.map((page) => page.diagnostics.index_bytes_read),
+      r2_range_reads_per_page: leaf.pages.map((page) => page.diagnostics.r2_range_reads),
+      r2_bytes_requested_per_page: leaf.pages.map((page) => page.diagnostics.r2_bytes_requested),
       physical_rows_sha256: physicalRowsSha256,
       leaf_rows_sha256: leafRowsSha256,
       equal_to_physical_1024_reader: true,
     });
   }
 
-  const normalDurationResults = [];
-  if (roots.alignedExtensionRoot) {
-    for (const item of normalDurationCases) {
-      const common = {
-        source,
-        timeseriesId: 7421,
-        connectorId: 7,
-        pollutantCode: "pm25",
-        startUtc: item.start_utc,
-        endUtc: item.end_utc,
-      };
-      const [reference, leaf] = await Promise.all([
-        readObservationHistoryExactV3({
-          ...common,
-          indexGeneration: "v3",
-          historyVersion: "v2",
-          indexRoot: ALIGNED_INDEX_ROOT,
-          physicalIdentity: ALIGNED_IDENTITY,
-          footerCache: createObservationHistoryV3FooterCache(),
-          collectWorkloadDiagnostics: true,
-        }),
-        readObservationHistoryPhysicalLeafCandidate({
-          ...common,
-          indexRoot: LEAF_INDEX_ROOT,
-        }),
-      ]);
-      const requestedDays = requestedUtcDays(item);
-      assert.equal(Number.isSafeInteger(requestedDays), true);
-      assert.equal(reference.response_complete, true);
-      assert.equal(leaf.response_complete, true);
-      assert.equal(reference.rows.length, item.expected_rows);
-      assert.equal(leaf.rows.length, item.expected_rows);
-      assert.equal(leaf.diagnostics.index_objects_read, requestedDays * 2);
-      assert.equal(leaf.diagnostics.timeseries_leaf_objects_read, requestedDays);
-      assert.equal(leaf.diagnostics.selected_files, requestedDays);
-      assert.equal(leaf.diagnostics.selected_chronological_segments, requestedDays);
-      assert.equal(leaf.diagnostics.physical_rows_decoded, item.expected_rows);
-      assert.equal(leaf.diagnostics.identity_head_reads, requestedDays);
-      assert.equal(leaf.diagnostics.coarse_child_shards_read, 0);
-      assert.equal(leaf.diagnostics.parquet_footer_fetched, false);
-      assert.equal(leaf.diagnostics.parquet_footer_parsed, false);
-      assert.equal(leaf.diagnostics.timeseries_id_decoded, false);
-      const referenceRows = comparable(reference.rows);
-      const leafRows = comparable(leaf.rows);
-      assert.deepEqual(leafRows, referenceRows);
-      const referenceHash = sha256(Buffer.from(JSON.stringify(referenceRows)));
-      const leafHash = sha256(Buffer.from(JSON.stringify(leafRows)));
-      assert.equal(leafHash, referenceHash);
-      normalDurationResults.push({
-        case: item.name,
-        requested_utc_days: requestedDays,
-        returned_rows: leaf.rows.length,
-        response_complete: leaf.response_complete,
-        rows_sha256: leafHash,
-        reference_rows_sha256: referenceHash,
-        index_objects_read: leaf.diagnostics.index_objects_read,
-        index_bytes_read: leaf.diagnostics.index_bytes_read,
-        timeseries_leaf_objects_read: leaf.diagnostics.timeseries_leaf_objects_read,
-        timeseries_leaf_bytes_read: leaf.diagnostics.timeseries_leaf_bytes_read,
-        selected_files: leaf.diagnostics.selected_files,
-        selected_chronological_segments: leaf.diagnostics.selected_chronological_segments,
-        physical_rows_decoded: leaf.diagnostics.physical_rows_decoded,
-        identity_head_reads: leaf.diagnostics.identity_head_reads,
-        r2_range_reads: leaf.diagnostics.r2_range_reads,
-        r2_bytes_requested: leaf.diagnostics.r2_bytes_requested,
-        equal_to_aligned_1024_reference_reader: true,
-      });
-    }
+  assert.equal(typeof denseFirstCursor, "string");
+  const denseRequest = {
+    source,
+    timeseriesId: 7421,
+    connectorId: 7,
+    pollutantCode: "pm25",
+    startUtc: "2026-04-03T00:00:00.000Z",
+    endUtc: "2026-04-04T00:00:00.000Z",
+    index: physicalLeafCandidateReaderIndex(LEAF_INDEX_ROOT),
+  };
+  await assertCursorRejected(() => readObservationHistoryExactLeafPageV3({
+    ...denseRequest,
+    physicalCursor: "not-a-valid-cursor",
+  }));
+  for (const changed of [
+    { timeseriesId: 7422 },
+    { connectorId: 8 },
+    { pollutantCode: "pm10" },
+    { startUtc: "2026-04-03T00:01:00.000Z" },
+    { endUtc: "2026-04-03T23:59:00.000Z" },
+  ]) {
+    await assertCursorRejected(() => readObservationHistoryExactLeafPageV3({
+      ...denseRequest,
+      ...changed,
+      physicalCursor: denseFirstCursor,
+    }));
+  }
+  await assertCursorRejected(() => readObservationHistoryExactLeafPageV3({
+    ...denseRequest,
+    index: { ...denseRequest.index, indexGeneration: "v3-physical-leaf-candidate-stale" },
+    physicalCursor: denseFirstCursor,
+  }));
+
+  let staleCursorParquetOpens = 0;
+  const staleCursorSource = Object.freeze({
+    getIndexObject: (request) => source.getIndexObject(request),
+    openParquetFile(request) {
+      staleCursorParquetOpens += 1;
+      return source.openParquetFile(request);
+    },
+  });
+  const staleCursorPayload = decodeCursor(denseFirstCursor);
+  staleCursorPayload.next.file_sha256 = "0".repeat(64);
+  await assertCursorRejected(() => readObservationHistoryExactLeafPageV3({
+    ...denseRequest,
+    source: staleCursorSource,
+    physicalCursor: encodeCursor(staleCursorPayload),
+  }));
+  assert.equal(staleCursorParquetOpens, 0);
+
+  const exactly24hAcrossMidnight = parseObservationRequest(new URL(
+    "https://candidate.invalid/v1/observations?timeseries_id=7421&connector_id=7&pollutant=pm25&start_utc=2026-08-20T12%3A00%3A00.000Z&end_utc=2026-08-21T12%3A00%3A00.000Z",
+  ));
+  assert.equal(exactly24hAcrossMidnight.ok, true);
+  for (const [query, errorCode] of [
+    ["start_utc=2026-08-20T00%3A00%3A00.000Z&end_utc=2026-08-21T00%3A00%3A00.001Z", "logical_range_exceeds_24_hours"],
+    ["start_utc=2026-08-20T00%3A00%3A00.000Z&end_utc=2026-08-21T00%3A00%3A00.000Z&since_utc=2026-08-20T01%3A00%3A00.000Z", "since_utc_incompatible_with_physical_paging"],
+    ["start_utc=2026-08-20T00%3A00%3A00.000Z&end_utc=2026-08-21T00%3A00%3A00.000Z&limit=100", "limit_incompatible_with_physical_paging"],
+  ]) {
+    const parsed = parseObservationRequest(new URL(
+      `https://candidate.invalid/v1/observations?timeseries_id=7421&connector_id=7&pollutant=pm25&${query}`,
+    ));
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.error_code, errorCode);
   }
 
   const missingLeafKey =
@@ -513,16 +567,18 @@ async function main() {
       : source.getIndexObject(request),
     openParquetFile: (request) => source.openParquetFile(request),
   });
-  const missingLeaf = await readObservationHistoryPhysicalLeafCandidate({
+  const missingLeaf = await readObservationHistoryExactLeafPageV3({
     source: missingLeafSource,
     timeseriesId: 7421,
     connectorId: 7,
     pollutantCode: "pm25",
     startUtc: "2026-08-20T00:00:00.000Z",
     endUtc: "2026-08-21T00:00:00.000Z",
-    indexRoot: LEAF_INDEX_ROOT,
+    index: physicalLeafCandidateReaderIndex(LEAF_INDEX_ROOT),
   });
   assert.equal(missingLeaf.response_complete, false);
+  assert.equal(missingLeaf.has_gap, true);
+  assert.equal(missingLeaf.physical_page.pagination_complete, true);
   assert.deepEqual(missingLeaf.partial_reasons, ["required_physical_timeseries_leaf_missing"]);
 
   process.stdout.write(`${JSON.stringify({
@@ -539,8 +595,19 @@ async function main() {
     leaf_index_total_bytes: structural.totalIndexBytes + (extensionStructural?.totalIndexBytes || 0),
     aligned_cap_1024_parquet_reused_by_identity: true,
     missing_required_leaf_incomplete: true,
+    cursor_validation: {
+      malformed_rejected: true,
+      cross_request_replay_rejected: true,
+      stale_index_identity_rejected: true,
+      stale_physical_coordinate_rejected_before_parquet_open: true,
+    },
+    request_validation: {
+      exact_24h_cross_utc_midnight_accepted: true,
+      greater_than_24h_rejected: true,
+      since_utc_rejected: true,
+      limit_rejected: true,
+    },
     results,
-    normal_duration_results: normalDurationResults,
   }, null, 2)}\n`);
 }
 

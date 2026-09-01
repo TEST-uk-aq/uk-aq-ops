@@ -2,10 +2,9 @@ import {
   createR2ObservationHistoryV3Source,
 } from "../shared/uk_aq_observation_history_random_access_v3.mjs";
 import {
-  OBSERVATION_HISTORY_EXACT_LEAF_LIMITS,
-  ObservationHistoryExactLeafReadError,
-  readObservationHistoryExactLeafPageV3,
-} from "../shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs";
+  ObservationHistoryPhysicalLeafCandidateReadError,
+  readObservationHistoryPhysicalLeafCandidate,
+} from "../uk_aq_observs_history_r2_api_v3_leaf_candidate/reader.mjs";
 
 const LOGICAL_HISTORY_VERSION = "v2";
 const INDEX_GENERATION = "v3-physical-leaf-candidate";
@@ -15,15 +14,14 @@ const WRITER_VERSION = "pyarrow-zstd-timeseries-aligned-candidate-v1";
 const ALIGNED_ROW_CAP = 1024;
 const DEFAULT_PROTOTYPE_PREFIX =
   "history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-leaf-index-v1/cap_rows=1024";
-const ALIGNED_INDEX_PREFIX =
-  "history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=1024/observations_timeseries";
 const ALIGNED_DATA_PREFIX =
   "history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=1024/observations";
-const RESPONSE_CACHE_GENERATION = "physical-leaf-index-v1-1024-page-2";
+const RESPONSE_CACHE_GENERATION = "physical-leaf-index-v1-1024-1";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const DEFAULT_MUTABLE_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MUTABLE_WINDOW_MS = 24 * 60 * 60 * 1000;
+const MAX_LIMIT = 20000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const DEFAULT_BINDING_PREFIX = "history/_index_v2/timeseries_binding";
 const VALID_OBSERVATION_PATHS = new Set(["/", "/v1/observations"]);
@@ -40,6 +38,12 @@ function normalizePrefix(value) {
 function positiveInteger(value) {
   const number = Number(value);
   return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function optionalLimit(value) {
+  if (value === null || value === undefined || required(value) === "") return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 1 && number <= MAX_LIMIT ? number : null;
 }
 
 function isoOrNull(value) {
@@ -114,25 +118,6 @@ function assertCandidateConfiguration(env) {
   return `${prefix}/observations_timeseries`;
 }
 
-export function physicalLeafCandidateReaderIndex(indexRoot) {
-  return Object.freeze({
-    root: indexRoot,
-    alignedIndexRoot: ALIGNED_INDEX_PREFIX,
-    alignedDataRoot: ALIGNED_DATA_PREFIX,
-    indexGeneration: INDEX_GENERATION,
-    historyVersion: LOGICAL_HISTORY_VERSION,
-    historySchemaVersion: 3,
-    writerVersion: WRITER_VERSION,
-    physicalLayoutVersion: PHYSICAL_LAYOUT_VERSION,
-    alignedRowCap: ALIGNED_ROW_CAP,
-    manifestKind: "observation_timeseries_physical_leaf_scoped_manifest",
-    leafKind: "observation_timeseries_physical_leaf",
-    additionalCommonFields: Object.freeze({
-      physical_leaf_candidate_version: CANDIDATE_VERSION,
-    }),
-  });
-}
-
 export function parseObservationRequest(url) {
   if (!VALID_OBSERVATION_PATHS.has(url.pathname)) return { ok: false, status: 404, error: "Not found." };
   const timeseriesId = positiveInteger(url.searchParams.get("timeseries_id"));
@@ -144,30 +129,19 @@ export function parseObservationRequest(url) {
   if (!connectorId) return { ok: false, status: 400, error: "connector_id must be a positive integer." };
   if (!pollutantCode) return { ok: false, status: 400, error: "pollutant must be one of pm25, pm10, or no2." };
   if (!startIso || !endIso) return { ok: false, status: 400, error: "start_utc and end_utc must be valid ISO timestamps." };
-  const startMs = Date.parse(startIso);
-  const endMs = Date.parse(endIso);
-  if (endMs <= startMs) return { ok: false, status: 400, error_code: "logical_range_invalid", error: "end_utc must be greater than start_utc." };
-  if (endMs - startMs > OBSERVATION_HISTORY_EXACT_LEAF_LIMITS.max_logical_request_ms) {
-    return { ok: false, status: 400, error_code: "logical_range_exceeds_24_hours", error: "logical observation-history range must not exceed 24 hours." };
-  }
-  if (url.searchParams.has("since_utc")) {
-    return { ok: false, status: 400, error_code: "since_utc_incompatible_with_physical_paging", error: "since_utc is not supported with exact physical-segment paging; use physical_cursor." };
-  }
-  if (url.searchParams.has("limit")) {
-    return { ok: false, status: 400, error_code: "limit_incompatible_with_physical_paging", error: "limit is not supported with exact physical-segment paging." };
-  }
-  const physicalCursor = url.searchParams.has("physical_cursor")
-    ? required(url.searchParams.get("physical_cursor"))
-    : null;
-  if (url.searchParams.has("physical_cursor") && !physicalCursor) {
-    return { ok: false, status: 400, error_code: "physical_cursor_invalid", error: "physical_cursor must not be empty." };
-  }
+  if (Date.parse(endIso) <= Date.parse(startIso)) return { ok: false, status: 400, error: "end_utc must be greater than start_utc." };
+  const sinceRequested = url.searchParams.has("since_utc");
+  const sinceIso = sinceRequested ? isoOrNull(url.searchParams.get("since_utc")) : null;
+  if (sinceRequested && !sinceIso) return { ok: false, status: 400, error: "since_utc must be a valid ISO timestamp when provided." };
+  const limitRequested = url.searchParams.has("limit");
+  const limit = optionalLimit(url.searchParams.get("limit"));
+  if (limitRequested && limit === null) return { ok: false, status: 400, error: `limit must be an integer between 1 and ${MAX_LIMIT}.` };
   const diagnosticRequested = url.searchParams.has("diagnostics");
   const diagnosticMode = diagnosticRequested ? required(url.searchParams.get("diagnostics")) : null;
   if (diagnosticRequested && diagnosticMode !== PHYSICAL_CANDIDATE_DIAGNOSTIC_MODE) {
     return { ok: false, status: 400, error: `diagnostics must be ${PHYSICAL_CANDIDATE_DIAGNOSTIC_MODE} when provided.` };
   }
-  return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso, physicalCursor, diagnosticMode };
+  return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso, sinceIso, limit, diagnosticMode };
 }
 
 function diagnosticRequestContext(request, params) {
@@ -177,19 +151,23 @@ function diagnosticRequestContext(request, params) {
     mode: params.diagnosticMode,
     request_id: globalThis.crypto.randomUUID(),
     cloudflare_ray_id: required(request.headers.get("cf-ray")) || null,
+    started_at: globalThis.performance?.now?.() ?? Date.now(),
   };
 }
 
 function diagnosticPayload(context, details = {}) {
   if (!context) return null;
+  const now = globalThis.performance?.now?.() ?? Date.now();
   return {
     schema_version: 1,
     mode: context.mode,
     request_id: context.request_id,
     cloudflare_ray_id: context.cloudflare_ray_id,
     cache_bypassed: true,
+    timing_basis: "performance_now_deployed_workers_advances_only_after_io_not_cpu_time",
     cpu_time_ms: null,
     cpu_time_source: "cloudflare_invocation_logs_or_analytics",
+    worker_pre_response_elapsed_ms: Number((now - context.started_at).toFixed(3)),
     ...details,
   };
 }
@@ -251,31 +229,29 @@ async function handleBinding(params, env) {
 
 async function handleObservations(params, env, diagnosticContext) {
   const indexRoot = assertCandidateConfiguration(env);
-  const result = await readObservationHistoryExactLeafPageV3({
+  const effectiveStartMs = params.sinceIso
+    ? Math.max(Date.parse(params.startIso), Date.parse(params.sinceIso) + 1)
+    : Date.parse(params.startIso);
+  const result = await readObservationHistoryPhysicalLeafCandidate({
     source: createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET }),
     timeseriesId: params.timeseriesId,
     connectorId: params.connectorId,
     pollutantCode: params.pollutantCode,
-    startUtc: params.startIso,
+    startUtc: new Date(effectiveStartMs).toISOString(),
     endUtc: params.endIso,
-    physicalCursor: params.physicalCursor,
-    index: physicalLeafCandidateReaderIndex(indexRoot),
+    indexRoot,
   });
-  const rows = result.rows.map((row) => ({ observed_at: row.observed_at_utc, value: row.value }));
-  const partialReasons = result.partial_reasons;
-  const complete = result.response_complete === true;
-  const hasGap = result.has_gap === true;
+  const allRows = result.rows.map((row) => ({ observed_at: row.observed_at_utc, value: row.value }));
+  const limited = params.limit !== null && allRows.length > params.limit;
+  const rows = limited ? allRows.slice(0, params.limit) : allRows;
+  const partialReasons = [...new Set([...result.partial_reasons, ...(limited ? ["limited_by_limit"] : [])])];
+  const complete = result.response_complete === true && !limited;
   const policy = cachePolicy(params.endIso);
   const diagnosticRequest = diagnosticPayload(diagnosticContext, {
-    outcome: complete ? "complete" : (hasGap ? "partial_coverage" : "physical_page_more"),
-    rows_before_limit: rows.length,
+    outcome: complete ? "complete" : "partial",
+    rows_before_limit: allRows.length,
     rows_returned: rows.length,
     physical_leaf_candidate_version: CANDIDATE_VERSION,
-    physical_page_number: result.physical_page.page_number,
-    physical_segments_decoded: result.physical_page.segments_decoded,
-    physical_rows_decoded: result.physical_page.physical_rows_decoded,
-    pagination_complete: result.physical_page.pagination_complete,
-    continuation_returned: Boolean(result.physical_page.next_cursor),
   });
   if (diagnosticRequest) console.info(JSON.stringify({
     event: "observation_history_v3_physical_leaf_candidate_workload_diagnostic_complete",
@@ -299,14 +275,13 @@ async function handleObservations(params, env, diagnosticContext) {
     connector_id: params.connectorId,
     start_utc: params.startIso,
     end_utc: params.endIso,
-    since_utc: null,
+    since_utc: params.sinceIso,
     cache_scope: policy.scope,
     row_count: rows.length,
     response_complete: complete,
-    has_gap: hasGap,
-    coverage_state: result.coverage_complete ? "complete" : "partial",
+    has_gap: !complete,
+    coverage_state: complete ? "complete" : "partial",
     partial_reasons: partialReasons,
-    physical_page: result.physical_page,
     rows,
     ...(diagnosticRequest ? { diagnostic_request: diagnosticRequest } : {}),
     coverage: {
@@ -320,14 +295,12 @@ async function handleObservations(params, env, diagnosticContext) {
       history_prefix: ALIGNED_DATA_PREFIX,
       history_index_prefix: indexRoot,
       timeseries_index_prefix: indexRoot,
-      limited_by_limit: false,
-      total_rows_before_limit: rows.length,
+      limited_by_limit: limited,
+      total_rows_before_limit: allRows.length,
       response_complete: complete,
-      has_gap: hasGap,
-      coverage_state: result.coverage_complete ? "complete" : "partial",
+      has_gap: !complete,
+      coverage_state: complete ? "complete" : "partial",
       partial_reasons: partialReasons,
-      coverage_partial_reasons: result.coverage_partial_reasons,
-      physical_page: result.physical_page,
       exact_reader_diagnostics: result.diagnostics,
     },
   }, { cacheSeconds: policy.seconds, noStore: !complete || Boolean(diagnosticContext), extraHeaders: diagnosticHeaders(diagnosticContext) });
@@ -354,7 +327,7 @@ export default {
         return withCacheHeaders(response, "MISS", TIMESERIES_BINDING_CACHE_GENERATION);
       }
       const params = parseObservationRequest(url);
-      if (!params.ok) return jsonResponse({ ok: false, ...(params.error_code ? { error_code: params.error_code } : {}), error: params.error }, { status: params.status, noStore: true });
+      if (!params.ok) return jsonResponse({ ok: false, error: params.error }, { status: params.status, noStore: true });
       context = diagnosticRequestContext(request, params);
       if (context) {
         console.info(JSON.stringify({
@@ -367,7 +340,6 @@ export default {
           physical_leaf_candidate_version: CANDIDATE_VERSION,
           start_utc: params.startIso,
           end_utc: params.endIso,
-          physical_cursor_supplied: Boolean(params.physicalCursor),
         }));
         return withCacheHeaders(await handleObservations(params, env, context), "BYPASS", RESPONSE_CACHE_GENERATION);
       }
@@ -381,29 +353,21 @@ export default {
       }
       return withCacheHeaders(response, "MISS", RESPONSE_CACHE_GENERATION);
     } catch (error) {
-      const diagnostics = error instanceof ObservationHistoryExactLeafReadError ? error.diagnostics : null;
-      const errorCode = error instanceof ObservationHistoryExactLeafReadError ? error.code : null;
-      const status = errorCode === "physical_cursor_invalid" ||
-        errorCode === "logical_range_invalid" ||
-        errorCode === "logical_range_exceeds_24_hours"
-        ? 400
-        : 500;
+      const diagnostics = error instanceof ObservationHistoryPhysicalLeafCandidateReadError ? error.diagnostics : null;
       const diagnosticRequest = diagnosticPayload(context, { outcome: "error" });
       console.warn(JSON.stringify({
         event: "observation_history_v3_physical_leaf_candidate_error",
         path: url.pathname,
         error: error instanceof Error ? error.message : String(error),
-        ...(errorCode ? { error_code: errorCode } : {}),
         diagnostics,
         ...(diagnosticRequest ? { diagnostic_request: diagnosticRequest } : {}),
       }));
       return jsonResponse({
         ok: false,
-        ...(errorCode ? { error_code: errorCode } : {}),
         error: error instanceof Error ? error.message : String(error),
         ...(diagnostics ? { diagnostics } : {}),
         ...(diagnosticRequest ? { diagnostic_request: diagnosticRequest } : {}),
-      }, { status, noStore: true, extraHeaders: diagnosticHeaders(context) });
+      }, { status: 500, noStore: true, extraHeaders: diagnosticHeaders(context) });
     }
   },
 };
