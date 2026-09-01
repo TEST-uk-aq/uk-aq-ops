@@ -28,7 +28,7 @@ function parse(argv) {
   const options = {
     physical1024Endpoint: process.env.UK_AQ_V3_PHYSICAL_1024_CANDIDATE_URL || "",
     physical2048Endpoint: process.env.UK_AQ_V3_PHYSICAL_CANDIDATE_URL || "",
-    outputDir: "", repeat: 1, timeoutMs: 30000, dryRun: false,
+    outputDir: "", repeat: 1, timeoutMs: 30000, dryRun: false, caseNames: [],
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -38,6 +38,7 @@ function parse(argv) {
     else if (argument === "--output-dir") options.outputDir = next();
     else if (argument === "--repeat") options.repeat = Number(next());
     else if (argument === "--timeout-ms") options.timeoutMs = Number(next());
+    else if (argument === "--case") options.caseNames.push(next());
     else if (argument === "--dry-run") options.dryRun = true;
     else throw new Error(`Unknown argument: ${argument}`);
   }
@@ -45,6 +46,19 @@ function parse(argv) {
     throw new Error("repeat and timeout-ms must be positive integers");
   }
   return options;
+}
+
+function selectCases(matrix, caseNames) {
+  if (!caseNames.length) return matrix;
+  const accepted = new Set(matrix.map((item) => item.name));
+  const unknown = [...new Set(caseNames.filter((name) => !accepted.has(name)))];
+  if (unknown.length) {
+    throw new Error(
+      `Unknown --case name(s): ${unknown.join(", ")}. Accepted: ${[...accepted].join(", ")}`,
+    );
+  }
+  const selected = new Set(caseNames);
+  return matrix.filter((item) => selected.has(item.name));
 }
 
 function requestUrl(base, item) {
@@ -104,7 +118,7 @@ async function attempt({ base, item, variant, number, secret, timeoutMs }) {
 
 async function main() {
   const options = parse(process.argv.slice(2));
-  const matrix = buildPhysicalCapMeasurementMatrix();
+  const matrix = selectCases(buildPhysicalCapMeasurementMatrix(), options.caseNames);
   if (options.dryRun) {
     process.stdout.write(`${JSON.stringify({ repeat: options.repeat, variants: ["physical_1024", "physical_2048"], cases: matrix }, null, 2)}\n`);
     return;
