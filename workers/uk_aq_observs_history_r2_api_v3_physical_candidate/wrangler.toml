@@ -1,0 +1,17 @@
+main = "worker.mjs"
+compatibility_date = "2026-08-01"
+workers_dev = true
+
+[vars]
+UKAQ_ENV_NAME = "TEST"
+UK_AQ_R2_HISTORY_VERSION = "v2"
+UK_AQ_R2_HISTORY_INDEX_VERSION = "v3-physical-index-candidate"
+UK_AQ_PHYSICAL_INDEX_PROTOTYPE_PREFIX = "history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-index-v1"
+
+[[r2_buckets]]
+binding = "UK_AQ_HISTORY_BUCKET"
+bucket_name = "__CFLARE_R2_BUCKET__"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
