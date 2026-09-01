@@ -29,7 +29,10 @@ export class R2ObjectNotFoundError extends Error {
 }
 
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 5;
+const RETRY_BASE_DELAY_MS = 1000;
+const RETRY_MAX_DELAY_MS = 8000;
+const RETRY_JITTER_MS = 250;
 const LOGICAL_HASH_HEADER = "x-amz-meta-uk-aq-logical-sha256";
 
 function textBytes(value: string): Uint8Array {
@@ -88,6 +91,40 @@ function encodePathPart(value: string): string {
     /[!'()*]/g,
     (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
   );
+}
+
+function retryDelayMs(attempt: number): number {
+  const exponentialDelay = Math.min(
+    RETRY_BASE_DELAY_MS * 2 ** (attempt - 1),
+    RETRY_MAX_DELAY_MS,
+  );
+  return exponentialDelay + Math.floor(Math.random() * (RETRY_JITTER_MS + 1));
+}
+
+function retryErrorMessage(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 500);
+}
+
+function logR2Retry(args: {
+  method: "GET" | "HEAD" | "PUT";
+  objectKey: string;
+  attempt: number;
+  status: number | null;
+  error: string | null;
+  delayMs: number;
+}): void {
+  console.warn(JSON.stringify({
+    level: "warn",
+    event: "r2_request_retry",
+    method: args.method,
+    object_key: args.objectKey,
+    attempt: args.attempt,
+    next_attempt: args.attempt + 1,
+    max_attempts: MAX_ATTEMPTS,
+    status: args.status,
+    error: args.error,
+    delay_ms: args.delayMs,
+  }));
 }
 
 async function signedRequest(
@@ -169,6 +206,8 @@ async function fetchR2(
       body,
       headers,
     );
+    let retryStatus: number | null = null;
+    let retryError: string | null = null;
     try {
       const response = await fetch(signed.url, {
         method,
@@ -182,10 +221,24 @@ async function fetchR2(
       ) {
         return response;
       }
+      retryStatus = response.status;
+      if (response.body) {
+        await response.body.cancel().catch(() => undefined);
+      }
     } catch (error) {
       if (attempt === MAX_ATTEMPTS) throw error;
+      retryError = retryErrorMessage(error);
     }
-    await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+    const delayMs = retryDelayMs(attempt);
+    logR2Retry({
+      method,
+      objectKey,
+      attempt,
+      status: retryStatus,
+      error: retryError,
+      delayMs,
+    });
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
   throw new Error("R2 request retry loop exhausted");
 }
