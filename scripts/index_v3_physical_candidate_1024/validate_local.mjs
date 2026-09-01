@@ -16,8 +16,8 @@ import {
 } from "../../workers/uk_aq_observs_history_r2_api_v3_physical_candidate/reader.mjs";
 
 const BASE_PREFIX = "history/_prototype/observation-history/timeseries-aligned-v2";
-const CANDIDATE_PREFIX = `${BASE_PREFIX}/candidate=physical-index-v1`;
-const BASE_INDEX_ROOT = `${BASE_PREFIX}/cap_rows=2048/observations_timeseries`;
+const CANDIDATE_PREFIX = `${BASE_PREFIX}/candidate=physical-index-v1/cap_rows=1024`;
+const BASE_INDEX_ROOT = `${BASE_PREFIX}/cap_rows=1024/observations_timeseries`;
 const CANDIDATE_INDEX_ROOT = `${CANDIDATE_PREFIX}/observations_timeseries`;
 const IDENTITY = Object.freeze({
   history_schema_version: 3,
@@ -94,7 +94,7 @@ function assertPlan(candidateRoot) {
   assert.equal(plan.environment, "TEST");
   assert.equal(plan.prototype_prefix, CANDIDATE_PREFIX);
   assert.equal(plan.index_root, CANDIDATE_INDEX_ROOT);
-  assert.equal(plan.aligned_row_cap, 2048);
+  assert.equal(plan.aligned_row_cap, 1024);
   assert.equal(plan.reuses_aligned_parquet, true);
   assert.deepEqual(plan.parquet_objects, []);
   assert.ok(plan.objects.length > 0);
@@ -110,13 +110,14 @@ function assertPlan(candidateRoot) {
     if (payload.kind !== "observation_timeseries_physical_index_shard") continue;
     assert.equal(payload.source_aligned_child.key.startsWith(BASE_INDEX_ROOT), true);
     for (const file of payload.files) {
-      assert.equal(file.key.startsWith(`${BASE_PREFIX}/cap_rows=2048/observations/`), true);
+      assert.equal(file.key.startsWith(`${BASE_PREFIX}/cap_rows=1024/observations/`), true);
+      assert.equal(file.key.includes("/cap_rows=2048/"), false);
       assert.equal(file.key.startsWith(CANDIDATE_PREFIX), false);
     }
     for (const timeseries of payload.timeseries) {
       let previous = null;
       for (const segment of timeseries.segments) {
-        assert.equal(segment.row_count <= 2048, true);
+        assert.equal(segment.row_count <= 1024, true);
         assert.equal(segment.row_group_row_start, 0);
         assert.equal(previous === null || previous <= segment.min_observed_at_utc, true);
         previous = segment.max_observed_at_utc;
@@ -141,24 +142,19 @@ async function main() {
   const source = localSource(roots);
   const cases = [
     {
-      name: "aurn_ts218_24h", connector_id: 1, timeseries_id: 218,
-      start_utc: "2026-08-20T00:00:00.000Z", end_utc: "2026-08-21T00:00:00.000Z",
-      expected_rows: 24, expected_physical_rows: 24,
-    },
-    {
       name: "sensorcommunity_normal_ts7421_24h", connector_id: 7, timeseries_id: 7421,
       start_utc: "2026-08-20T00:00:00.000Z", end_utc: "2026-08-21T00:00:00.000Z",
-      expected_rows: 288, expected_physical_rows: 288,
+      expected_rows: 288, expected_physical_rows: 288, expected_segments: 1,
     },
     {
       name: "sensorcommunity_dense_ts7421_1h", connector_id: 7, timeseries_id: 7421,
       start_utc: "2026-04-03T00:00:00.000Z", end_utc: "2026-04-03T01:00:00.000Z",
-      expected_rows: 527, expected_physical_rows: 2048,
+      expected_rows: 527, expected_physical_rows: 1024, expected_segments: 1,
     },
     {
       name: "sensorcommunity_dense_ts7421_24h", connector_id: 7, timeseries_id: 7421,
       start_utc: "2026-04-03T00:00:00.000Z", end_utc: "2026-04-04T00:00:00.000Z",
-      expected_rows: 12505, expected_physical_rows: 12505,
+      expected_rows: 12505, expected_physical_rows: 12505, expected_segments: 13,
     },
   ];
   const results = [];
@@ -184,14 +180,21 @@ async function main() {
       readObservationHistoryPhysicalCandidate({
         ...common,
         indexRoot: CANDIDATE_INDEX_ROOT,
-        alignedRowCap: 2048,
+        alignedRowCap: 1024,
       }),
     ]);
     assert.equal(baseline.response_complete, true);
     assert.equal(candidate.response_complete, true);
     assert.equal(candidate.rows.length, item.expected_rows);
     assert.equal(candidate.diagnostics.physical_rows_decoded, item.expected_physical_rows);
-    assert.deepEqual(comparable(candidate.rows), comparable(baseline.rows));
+    assert.equal(candidate.diagnostics.selected_chronological_segments, item.expected_segments);
+    assert.equal(candidate.diagnostics.aligned_row_cap, 1024);
+    const baselineRows = comparable(baseline.rows);
+    const candidateRows = comparable(candidate.rows);
+    assert.deepEqual(candidateRows, baselineRows);
+    const baselineRowsSha256 = sha256(Buffer.from(JSON.stringify(baselineRows)));
+    const candidateRowsSha256 = sha256(Buffer.from(JSON.stringify(candidateRows)));
+    assert.equal(candidateRowsSha256, baselineRowsSha256);
     assert.equal(candidate.diagnostics.parquet_footer_fetched, false);
     assert.equal(candidate.diagnostics.parquet_footer_parsed, false);
     assert.equal(candidate.diagnostics.timeseries_id_decoded, false);
@@ -206,14 +209,30 @@ async function main() {
       physical_rows_decoded: candidate.diagnostics.physical_rows_decoded,
       r2_range_reads: candidate.diagnostics.r2_range_reads,
       r2_bytes_requested: candidate.diagnostics.r2_bytes_requested,
-      equal_to_aligned_2048_reader: true,
+      aligned_rows_sha256: baselineRowsSha256,
+      physical_rows_sha256: candidateRowsSha256,
+      equal_to_aligned_1024_reader: true,
     });
   }
+  await assert.rejects(
+    readObservationHistoryPhysicalCandidate({
+      source,
+      timeseriesId: 7421,
+      connectorId: 7,
+      pollutantCode: "pm25",
+      startUtc: "2026-04-03T00:00:00.000Z",
+      endUtc: "2026-04-03T01:00:00.000Z",
+      indexRoot: CANDIDATE_INDEX_ROOT,
+      alignedRowCap: 2048,
+    }),
+    /physical 2048 candidate requires its exact isolated index root/,
+  );
   process.stdout.write(`${JSON.stringify({
     ok: true,
     node: process.version,
     plan_objects: plan.objects.length,
     parquet_objects_created: plan.parquet_objects.length,
+    cross_cap_namespace_rejected: true,
     results,
   }, null, 2)}\n`);
 }

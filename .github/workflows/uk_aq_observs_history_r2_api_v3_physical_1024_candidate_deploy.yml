@@ -1,0 +1,55 @@
+name: Deploy physical-index-1024 observation-history candidate Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-physical-1024-candidate:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.20.2"
+          cache: npm
+      - run: npm ci
+      - name: Validate isolated TEST candidate configuration
+        run: |
+          set -euo pipefail
+          test -n "${CLOUDFLARE_ACCOUNT_ID}" || { echo "Missing UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID."; exit 1; }
+          test -n "${CLOUDFLARE_API_TOKEN}" || { echo "Missing UK_AQ_R2_CLOUDFLARE_API_TOKEN."; exit 1; }
+          test -n "${CFLARE_R2_BUCKET}" || { echo "Missing CFLARE_R2_BUCKET."; exit 1; }
+          test -n "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" || { echo "Missing UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME."; exit 1; }
+          case "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" in
+            *[!a-z0-9-]*|-*|*-|*-v3-physical-candidate|*-v3-physical-1024-candidate|*[Ll][Ii][Vv][Ee]*) echo "Base Worker name is invalid or not isolated from LIVE."; exit 1 ;;
+          esac
+          test "${#UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" -le 36 || { echo "Base Worker name is too long for the physical 1024 candidate suffix."; exit 1; }
+          printf 'PHYSICAL_1024_CANDIDATE_WORKER_NAME=%s-v3-physical-1024-candidate\n' "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" >> "${GITHUB_ENV}"
+          test -n "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" || { echo "Missing UK_AQ_EDGE_UPSTREAM_SECRET."; exit 1; }
+      - name: Resolve isolated R2 binding
+        working-directory: workers/uk_aq_observs_history_r2_api_v3_physical_1024_candidate
+        run: |
+          set -euo pipefail
+          sed -i "s|__CFLARE_R2_BUCKET__|${CFLARE_R2_BUCKET}|g" wrangler.toml
+          grep -F 'UKAQ_ENV_NAME = "TEST"' wrangler.toml >/dev/null
+          grep -F 'UK_AQ_R2_HISTORY_INDEX_VERSION = "v3-physical-index-candidate"' wrangler.toml >/dev/null
+          grep -F 'UK_AQ_PHYSICAL_INDEX_PROTOTYPE_PREFIX = "history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-index-v1/cap_rows=1024"' wrangler.toml >/dev/null
+          ! grep -E 'history/v2/observations|history/_index_v3/observations_timeseries' wrangler.toml >/dev/null
+      - name: Reuse existing upstream-auth secret
+        working-directory: workers/uk_aq_observs_history_r2_api_v3_physical_1024_candidate
+        run: |
+          set -euo pipefail
+          jq -n --arg UK_AQ_EDGE_UPSTREAM_SECRET "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" \
+            '{UK_AQ_EDGE_UPSTREAM_SECRET:$UK_AQ_EDGE_UPSTREAM_SECRET}' \
+            | npx --yes wrangler@4 secret bulk --name "${PHYSICAL_1024_CANDIDATE_WORKER_NAME}"
+      - name: Deploy non-authoritative physical-index-1024 candidate
+        working-directory: workers/uk_aq_observs_history_r2_api_v3_physical_1024_candidate
+        run: npx --yes wrangler@4 deploy --name "${PHYSICAL_1024_CANDIDATE_WORKER_NAME}"

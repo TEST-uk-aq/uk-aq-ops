@@ -22,7 +22,6 @@ const MAX_CONCURRENCY = 4;
 const SHA256 = /^[0-9a-f]{64}$/;
 const COLUMN_NAMES = ["observed_at_utc", "value"];
 const CANDIDATE_VERSION = "physical-index-v1";
-const ALLOWED_ALIGNED_ROW_CAPS = new Set([1024, 2048]);
 
 export class ObservationHistoryPhysicalCandidateReadError extends Error {
   constructor(message, diagnostics, options) {
@@ -104,7 +103,7 @@ function assertCommonIndex(payload, expected, kind) {
     payload?.physical_index_candidate_version !== CANDIDATE_VERSION ||
     payload?.index_generation !== "v3-physical-index-candidate" ||
     payload?.history_version !== "v2" || payload?.domain !== "observations" ||
-    payload?.history_schema_version !== 3 || payload?.aligned_row_cap !== expected.alignedRowCap ||
+    payload?.history_schema_version !== 3 || payload?.aligned_row_cap !== 2048 ||
     payload?.physical_layout_version !== "timeseries-aligned-v2" ||
     payload?.writer_version !== "pyarrow-zstd-timeseries-aligned-candidate-v1" ||
     payload?.day_utc !== expected.dayUtc || payload?.connector_id !== expected.connectorId ||
@@ -115,9 +114,9 @@ function assertCommonIndex(payload, expected, kind) {
 function validateFile(raw, expectedScope) {
   const key = required(raw?.key, "file.key");
   if (
-    !key.startsWith(`history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=${expectedScope.alignedRowCap}/observations/`) ||
+    !key.startsWith("history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=2048/observations/") ||
     !key.includes(`/${scopePath(expectedScope)}/`) || !key.endsWith(".parquet")
-  ) throw new Error(`physical index points outside the pinned aligned ${expectedScope.alignedRowCap} scope: ${key}`);
+  ) throw new Error(`physical index points outside the pinned aligned 2048 scope: ${key}`);
   const sha256 = String(raw.sha256 || "");
   if (!SHA256.test(sha256)) throw new Error(`file SHA-256 is invalid: ${key}`);
   return Object.freeze({
@@ -236,11 +235,10 @@ function decodeColumn(buffer, profile, name, rowCount) {
   return values;
 }
 
-function diagnosticsTemplate(alignedRowCap) {
+function diagnosticsTemplate() {
   return {
     schema_version: 1,
     physical_index_candidate_version: CANDIDATE_VERSION,
-    aligned_row_cap: alignedRowCap,
     selected_chronological_segments: 0,
     selected_files: 0,
     selected_row_groups: 0,
@@ -270,13 +268,8 @@ async function readIndex(source, key, diagnostics) {
 
 export async function readObservationHistoryPhysicalCandidate({
   source, timeseriesId, connectorId, pollutantCode, startUtc, endUtc, indexRoot,
-  alignedRowCap,
 }) {
-  const normalizedAlignedRowCap = positiveInteger(alignedRowCap, "alignedRowCap");
-  if (!ALLOWED_ALIGNED_ROW_CAPS.has(normalizedAlignedRowCap)) {
-    throw new TypeError("alignedRowCap must be exactly 1024 or 2048");
-  }
-  const diagnostics = diagnosticsTemplate(normalizedAlignedRowCap);
+  const diagnostics = diagnosticsTemplate();
   const budget = createObservationHistoryV3RangeBudget({
     maxRangeReads: MAX_RANGE_READS,
     maxBytesRequested: MAX_RANGE_BYTES,
@@ -293,23 +286,14 @@ export async function readObservationHistoryPhysicalCandidate({
     const endMs = Date.parse(endIso);
     if (endMs <= startMs) throw new Error("endUtc must be after startUtc");
     const root = required(indexRoot, "indexRoot").replace(/^\/+|\/+$/g, "");
-    const expectedRoot = normalizedAlignedRowCap === 2048
-      ? "history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-index-v1/observations_timeseries"
-      : "history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-index-v1/cap_rows=1024/observations_timeseries";
-    if (root !== expectedRoot) {
-      throw new Error(`physical ${normalizedAlignedRowCap} candidate requires its exact isolated index root`);
+    if (!root.endsWith("/candidate=physical-index-v1/observations_timeseries")) {
+      throw new Error("physical candidate requires its isolated index root");
     }
     const shard = shardBounds(normalized.timeseriesId);
     const selectedSegments = [];
     const partialReasons = [];
     for (const dayUtc of dayList(startMs, endMs)) {
-      const expected = {
-        ...normalized,
-        alignedRowCap: normalizedAlignedRowCap,
-        dayUtc,
-        rangeStart: shard.start,
-        rangeEnd: shard.end,
-      };
+      const expected = { ...normalized, dayUtc, rangeStart: shard.start, rangeEnd: shard.end };
       const scope = scopePath(expected);
       const manifestKey = `${root}/${scope}/manifest.json`;
       const manifestObject = await readIndex(source, manifestKey, diagnostics);

@@ -4,19 +4,19 @@ import {
 import {
   ObservationHistoryPhysicalCandidateReadError,
   readObservationHistoryPhysicalCandidate,
-} from "./reader.mjs";
+} from "../uk_aq_observs_history_r2_api_v3_physical_candidate/reader.mjs";
 
 const LOGICAL_HISTORY_VERSION = "v2";
 const INDEX_GENERATION = "v3-physical-index-candidate";
 const CANDIDATE_VERSION = "physical-index-v1";
 const PHYSICAL_LAYOUT_VERSION = "timeseries-aligned-v2";
 const WRITER_VERSION = "pyarrow-zstd-timeseries-aligned-candidate-v1";
-const ALIGNED_ROW_CAP = 2048;
+const ALIGNED_ROW_CAP = 1024;
 const DEFAULT_PROTOTYPE_PREFIX =
-  "history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-index-v1";
+  "history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-index-v1/cap_rows=1024";
 const ALIGNED_DATA_PREFIX =
-  "history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=2048/observations";
-const RESPONSE_CACHE_GENERATION = "physical-index-v1-1";
+  "history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=1024/observations";
+const RESPONSE_CACHE_GENERATION = "physical-index-v1-1024-1";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const DEFAULT_MUTABLE_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
@@ -255,7 +255,7 @@ async function handleObservations(params, env, diagnosticContext) {
     physical_index_candidate_version: CANDIDATE_VERSION,
   });
   if (diagnosticRequest) console.info(JSON.stringify({
-    event: "observation_history_v3_physical_candidate_workload_diagnostic_complete",
+    event: "observation_history_v3_physical_1024_candidate_workload_diagnostic_complete",
     diagnostic_request: diagnosticRequest,
     exact_reader_diagnostics: result.diagnostics,
   }));
@@ -332,7 +332,7 @@ export default {
       context = diagnosticRequestContext(request, params);
       if (context) {
         console.info(JSON.stringify({
-          event: "observation_history_v3_physical_candidate_workload_diagnostic_start",
+          event: "observation_history_v3_physical_1024_candidate_workload_diagnostic_start",
           diagnostic_request_id: context.request_id,
           cloudflare_ray_id: context.cloudflare_ray_id,
           connector_id: params.connectorId,
@@ -357,7 +357,7 @@ export default {
       const diagnostics = error instanceof ObservationHistoryPhysicalCandidateReadError ? error.diagnostics : null;
       const diagnosticRequest = diagnosticPayload(context, { outcome: "error" });
       console.warn(JSON.stringify({
-        event: "observation_history_v3_physical_candidate_error",
+        event: "observation_history_v3_physical_1024_candidate_error",
         path: url.pathname,
         error: error instanceof Error ? error.message : String(error),
         diagnostics,

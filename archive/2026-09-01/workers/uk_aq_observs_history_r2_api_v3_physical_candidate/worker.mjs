@@ -240,7 +240,6 @@ async function handleObservations(params, env, diagnosticContext) {
     startUtc: new Date(effectiveStartMs).toISOString(),
     endUtc: params.endIso,
     indexRoot,
-    alignedRowCap: ALIGNED_ROW_CAP,
   });
   const allRows = result.rows.map((row) => ({ observed_at: row.observed_at_utc, value: row.value }));
   const limited = params.limit !== null && allRows.length > params.limit;
