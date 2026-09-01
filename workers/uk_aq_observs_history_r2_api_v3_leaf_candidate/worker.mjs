@@ -19,7 +19,7 @@ const ALIGNED_INDEX_PREFIX =
   "history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=1024/observations_timeseries";
 const ALIGNED_DATA_PREFIX =
   "history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=1024/observations";
-const RESPONSE_CACHE_GENERATION = "physical-leaf-index-v1-1024-page-3-direct-continuation";
+const RESPONSE_CACHE_GENERATION = "physical-leaf-index-v1-1024-page-4-production-shaped";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const DEFAULT_MUTABLE_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
@@ -27,7 +27,12 @@ const MUTABLE_WINDOW_MS = 24 * 60 * 60 * 1000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const DEFAULT_BINDING_PREFIX = "history/_index_v2/timeseries_binding";
 const VALID_OBSERVATION_PATHS = new Set(["/", "/v1/observations"]);
-export const PHYSICAL_CANDIDATE_DIAGNOSTIC_MODE = "workload_v1";
+export const PHYSICAL_CANDIDATE_WORKLOAD_DIAGNOSTIC_MODE = "workload_v1";
+export const PHYSICAL_CANDIDATE_CPU_DIAGNOSTIC_MODE = "cpu_v1";
+const PHYSICAL_CANDIDATE_DIAGNOSTIC_MODES = new Set([
+  PHYSICAL_CANDIDATE_WORKLOAD_DIAGNOSTIC_MODE,
+  PHYSICAL_CANDIDATE_CPU_DIAGNOSTIC_MODE,
+]);
 
 function required(value) {
   return String(value ?? "").trim();
@@ -165,8 +170,12 @@ export function parseObservationRequest(url) {
   }
   const diagnosticRequested = url.searchParams.has("diagnostics");
   const diagnosticMode = diagnosticRequested ? required(url.searchParams.get("diagnostics")) : null;
-  if (diagnosticRequested && diagnosticMode !== PHYSICAL_CANDIDATE_DIAGNOSTIC_MODE) {
-    return { ok: false, status: 400, error: `diagnostics must be ${PHYSICAL_CANDIDATE_DIAGNOSTIC_MODE} when provided.` };
+  if (diagnosticRequested && !PHYSICAL_CANDIDATE_DIAGNOSTIC_MODES.has(diagnosticMode)) {
+    return {
+      ok: false,
+      status: 400,
+      error: `diagnostics must be ${[...PHYSICAL_CANDIDATE_DIAGNOSTIC_MODES].join(" or ")} when provided.`,
+    };
   }
   return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso, physicalCursor, diagnosticMode };
 }
@@ -250,6 +259,59 @@ async function handleBinding(params, env) {
   return jsonResponse({ ok: true, timeseries_id: params.timeseriesId, binding_index_prefix: prefix, binding_key: key, binding }, { cacheSeconds: DEFAULT_IMMUTABLE_CACHE_SECONDS });
 }
 
+function compactReaderSummary({ result, outcome, returnedRows }) {
+  const diagnostics = result.diagnostics;
+  return Object.freeze({
+    schema_version: 1,
+    outcome,
+    page_number: result.physical_page.page_number,
+    physical_page_path: result.physical_page.physical_page_path,
+    continuation_supplied: result.physical_page.continuation_cursor_supplied,
+    pagination_complete: result.physical_page.pagination_complete,
+    physical_segments_decoded: result.physical_page.segments_decoded,
+    physical_rows_decoded: result.physical_page.physical_rows_decoded,
+    returned_rows: returnedRows,
+    scoped_manifests_read: diagnostics.scoped_manifests_read,
+    leaf_objects_read: diagnostics.timeseries_leaf_objects_read,
+    index_objects_read: diagnostics.index_objects_read,
+    index_bytes_read: diagnostics.index_bytes_read,
+    whole_logical_range_discovery: diagnostics.whole_logical_range_segment_discovery,
+    global_segment_sorting: diagnostics.global_segment_sorting,
+    identity_head_reads: diagnostics.identity_head_reads,
+    r2_range_reads: diagnostics.r2_range_reads,
+    r2_bytes_requested: diagnostics.r2_bytes_requested,
+    parquet_footer_fetched: diagnostics.parquet_footer_fetched,
+    parquet_footer_parsed: diagnostics.parquet_footer_parsed,
+    timeseries_id_decoded: diagnostics.timeseries_id_decoded,
+  });
+}
+
+function compactErrorSummary(diagnostics) {
+  return Object.freeze({
+    schema_version: 1,
+    outcome: "error",
+    page_number: diagnostics?.physical_page_number ?? null,
+    physical_page_path: diagnostics?.physical_page_path ?? null,
+    continuation_supplied: diagnostics?.continuation_cursor_supplied ?? null,
+    pagination_complete: diagnostics?.pagination_complete ?? null,
+    physical_segments_decoded: diagnostics?.physical_segments_decoded ?? null,
+    physical_rows_decoded: diagnostics?.physical_rows_decoded ?? null,
+    returned_rows: diagnostics?.returned_rows ?? null,
+    scoped_manifests_read: diagnostics?.scoped_manifests_read ?? null,
+    leaf_objects_read: diagnostics?.timeseries_leaf_objects_read ?? null,
+    index_objects_read: diagnostics?.index_objects_read ?? null,
+    index_bytes_read: diagnostics?.index_bytes_read ?? null,
+    whole_logical_range_discovery: diagnostics?.whole_logical_range_segment_discovery ?? null,
+    global_segment_sorting: diagnostics?.global_segment_sorting ?? null,
+    identity_head_reads: diagnostics?.identity_head_reads ?? null,
+    r2_range_reads: diagnostics?.r2_range_reads ?? null,
+    r2_bytes_requested: diagnostics?.r2_bytes_requested ?? null,
+    parquet_footer_fetched: diagnostics?.parquet_footer_fetched ?? false,
+    parquet_footer_parsed: diagnostics?.parquet_footer_parsed ?? false,
+    timeseries_id_decoded: diagnostics?.timeseries_id_decoded ?? false,
+  });
+}
+
 async function handleObservations(params, env, diagnosticContext) {
   const indexRoot = assertCandidateConfiguration(env);
   const result = await readObservationHistoryExactLeafPageV3({
@@ -267,28 +329,29 @@ async function handleObservations(params, env, diagnosticContext) {
   const complete = result.response_complete === true;
   const hasGap = result.has_gap === true;
   const policy = cachePolicy(params.endIso);
-  const diagnosticRequest = diagnosticPayload(diagnosticContext, {
-    outcome: complete ? "complete" : (hasGap ? "partial_coverage" : "physical_page_more"),
-    rows_before_limit: rows.length,
-    rows_returned: rows.length,
-    physical_leaf_candidate_version: CANDIDATE_VERSION,
-    physical_page_number: result.physical_page.page_number,
-    physical_page_path: result.physical_page.physical_page_path,
-    physical_segments_decoded: result.physical_page.segments_decoded,
-    physical_rows_decoded: result.physical_page.physical_rows_decoded,
-    pagination_complete: result.physical_page.pagination_complete,
-    continuation_returned: Boolean(result.physical_page.next_cursor),
-    scoped_manifests_read: result.diagnostics.scoped_manifests_read,
-    timeseries_leaf_objects_read: result.diagnostics.timeseries_leaf_objects_read,
-    whole_logical_range_segment_discovery: result.diagnostics.whole_logical_range_segment_discovery,
-    global_segment_sorting: result.diagnostics.global_segment_sorting,
+  const outcome = complete ? "complete" : (hasGap ? "partial_coverage" : "physical_page_more");
+  const structuralSummary = compactReaderSummary({
+    result,
+    outcome,
+    returnedRows: rows.length,
   });
-  if (diagnosticRequest) console.info(JSON.stringify({
-    event: "observation_history_v3_physical_leaf_candidate_workload_diagnostic_complete",
-    diagnostic_request: diagnosticRequest,
-    exact_reader_diagnostics: result.diagnostics,
-  }));
-  return jsonResponse({
+  const diagnosticRequest = diagnosticPayload(diagnosticContext);
+  if (diagnosticContext?.mode === PHYSICAL_CANDIDATE_WORKLOAD_DIAGNOSTIC_MODE) {
+    console.info(JSON.stringify({
+      event: "observation_history_v3_physical_leaf_candidate_workload_diagnostic_complete",
+      diagnostic_request_id: diagnosticContext.request_id,
+      cloudflare_ray_id: diagnosticContext.cloudflare_ray_id,
+      ...structuralSummary,
+    }));
+  } else if (diagnosticContext?.mode === PHYSICAL_CANDIDATE_CPU_DIAGNOSTIC_MODE) {
+    console.info(JSON.stringify({
+      event: "observation_history_v3_physical_leaf_candidate_cpu_measurement",
+      diagnostic_request_id: diagnosticContext.request_id,
+      cloudflare_ray_id: diagnosticContext.cloudflare_ray_id,
+      ...structuralSummary,
+    }));
+  }
+  const payload = {
     ok: true,
     generated_at_utc: new Date().toISOString(),
     read_version: LOGICAL_HISTORY_VERSION,
@@ -298,9 +361,6 @@ async function handleObservations(params, env, diagnosticContext) {
     physical_layout_version: PHYSICAL_LAYOUT_VERSION,
     writer_version: WRITER_VERSION,
     aligned_row_cap: ALIGNED_ROW_CAP,
-    history_prefix: ALIGNED_DATA_PREFIX,
-    history_index_prefix: indexRoot,
-    timeseries_index_prefix: indexRoot,
     timeseries_id: params.timeseriesId,
     connector_id: params.connectorId,
     start_utc: params.startIso,
@@ -312,31 +372,22 @@ async function handleObservations(params, env, diagnosticContext) {
     has_gap: hasGap,
     coverage_state: result.coverage_complete ? "complete" : "partial",
     partial_reasons: partialReasons,
+    coverage_partial_reasons: result.coverage_partial_reasons,
     physical_page: result.physical_page,
     rows,
     ...(diagnosticRequest ? { diagnostic_request: diagnosticRequest } : {}),
-    coverage: {
-      read_version: LOGICAL_HISTORY_VERSION,
-      index_version: INDEX_GENERATION,
-      physical_leaf_candidate_version: CANDIDATE_VERSION,
-      pollutant_partition: params.pollutantCode,
-      physical_layout_version: PHYSICAL_LAYOUT_VERSION,
-      writer_version: WRITER_VERSION,
-      aligned_row_cap: ALIGNED_ROW_CAP,
-      history_prefix: ALIGNED_DATA_PREFIX,
-      history_index_prefix: indexRoot,
-      timeseries_index_prefix: indexRoot,
-      limited_by_limit: false,
-      total_rows_before_limit: rows.length,
-      response_complete: complete,
-      has_gap: hasGap,
-      coverage_state: result.coverage_complete ? "complete" : "partial",
-      partial_reasons: partialReasons,
-      coverage_partial_reasons: result.coverage_partial_reasons,
-      physical_page: result.physical_page,
-      exact_reader_diagnostics: result.diagnostics,
-    },
-  }, { cacheSeconds: policy.seconds, noStore: !complete || Boolean(diagnosticContext), extraHeaders: diagnosticHeaders(diagnosticContext) });
+    ...(diagnosticContext?.mode === PHYSICAL_CANDIDATE_WORKLOAD_DIAGNOSTIC_MODE
+      ? { coverage: { exact_reader_diagnostics: result.diagnostics } }
+      : {}),
+    ...(diagnosticContext?.mode === PHYSICAL_CANDIDATE_CPU_DIAGNOSTIC_MODE
+      ? { cpu_measurement: structuralSummary }
+      : {}),
+  };
+  return jsonResponse(payload, {
+    cacheSeconds: policy.seconds,
+    noStore: !complete || Boolean(diagnosticContext),
+    extraHeaders: diagnosticHeaders(diagnosticContext),
+  });
 }
 
 export default {
@@ -363,18 +414,20 @@ export default {
       if (!params.ok) return jsonResponse({ ok: false, ...(params.error_code ? { error_code: params.error_code } : {}), error: params.error }, { status: params.status, noStore: true });
       context = diagnosticRequestContext(request, params);
       if (context) {
-        console.info(JSON.stringify({
-          event: "observation_history_v3_physical_leaf_candidate_workload_diagnostic_start",
-          diagnostic_request_id: context.request_id,
-          cloudflare_ray_id: context.cloudflare_ray_id,
-          connector_id: params.connectorId,
-          pollutant_code: params.pollutantCode,
-          timeseries_id: params.timeseriesId,
-          physical_leaf_candidate_version: CANDIDATE_VERSION,
-          start_utc: params.startIso,
-          end_utc: params.endIso,
-          physical_cursor_supplied: Boolean(params.physicalCursor),
-        }));
+        if (context.mode === PHYSICAL_CANDIDATE_WORKLOAD_DIAGNOSTIC_MODE) {
+          console.info(JSON.stringify({
+            event: "observation_history_v3_physical_leaf_candidate_workload_diagnostic_start",
+            diagnostic_request_id: context.request_id,
+            cloudflare_ray_id: context.cloudflare_ray_id,
+            connector_id: params.connectorId,
+            pollutant_code: params.pollutantCode,
+            timeseries_id: params.timeseriesId,
+            physical_leaf_candidate_version: CANDIDATE_VERSION,
+            start_utc: params.startIso,
+            end_utc: params.endIso,
+            physical_cursor_supplied: Boolean(params.physicalCursor),
+          }));
+        }
         return withCacheHeaders(await handleObservations(params, env, context), "BYPASS", RESPONSE_CACHE_GENERATION);
       }
       const key = cacheKey(request.url, INDEX_GENERATION);
@@ -394,20 +447,47 @@ export default {
         errorCode === "logical_range_exceeds_24_hours"
         ? 400
         : 500;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const responseError = context?.mode === PHYSICAL_CANDIDATE_CPU_DIAGNOSTIC_MODE
+        ? (errorCode || "physical_leaf_cpu_measurement_failed")
+        : errorMessage;
       const diagnosticRequest = diagnosticPayload(context, { outcome: "error" });
-      console.warn(JSON.stringify({
-        event: "observation_history_v3_physical_leaf_candidate_error",
-        path: url.pathname,
-        error: error instanceof Error ? error.message : String(error),
-        ...(errorCode ? { error_code: errorCode } : {}),
-        diagnostics,
-        ...(diagnosticRequest ? { diagnostic_request: diagnosticRequest } : {}),
-      }));
+      const compactError = compactErrorSummary(diagnostics);
+      if (context?.mode === PHYSICAL_CANDIDATE_CPU_DIAGNOSTIC_MODE) {
+        console.warn(JSON.stringify({
+          event: "observation_history_v3_physical_leaf_candidate_cpu_measurement",
+          diagnostic_request_id: context.request_id,
+          cloudflare_ray_id: context.cloudflare_ray_id,
+          ...(errorCode ? { error_code: errorCode } : {}),
+          ...compactError,
+        }));
+      } else if (context?.mode === PHYSICAL_CANDIDATE_WORKLOAD_DIAGNOSTIC_MODE) {
+        console.warn(JSON.stringify({
+          event: "observation_history_v3_physical_leaf_candidate_workload_diagnostic_error",
+          diagnostic_request_id: context.request_id,
+          cloudflare_ray_id: context.cloudflare_ray_id,
+          ...(errorCode ? { error_code: errorCode } : {}),
+          ...compactError,
+        }));
+      } else {
+        console.warn(JSON.stringify({
+          event: "observation_history_v3_physical_leaf_candidate_error",
+          path: url.pathname,
+          error: errorMessage,
+          ...(errorCode ? { error_code: errorCode } : {}),
+          diagnostics,
+        }));
+      }
       return jsonResponse({
         ok: false,
         ...(errorCode ? { error_code: errorCode } : {}),
-        error: error instanceof Error ? error.message : String(error),
-        ...(diagnostics ? { diagnostics } : {}),
+        error: responseError,
+        ...(context?.mode === PHYSICAL_CANDIDATE_WORKLOAD_DIAGNOSTIC_MODE && diagnostics
+          ? { diagnostics }
+          : {}),
+        ...(context?.mode === PHYSICAL_CANDIDATE_CPU_DIAGNOSTIC_MODE
+          ? { cpu_measurement: compactError }
+          : {}),
         ...(diagnosticRequest ? { diagnostic_request: diagnosticRequest } : {}),
       }, { status, noStore: true, extraHeaders: diagnosticHeaders(context) });
     }

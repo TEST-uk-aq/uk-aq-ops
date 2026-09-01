@@ -23,6 +23,7 @@ export function buildPhysicalLeafMeasurementMatrix() {
       start_utc: "2026-08-20T00:00:00.000Z",
       end_utc: "2026-08-21T00:00:00.000Z",
       fixture_expected_leaf_pages: 1,
+      fixture_expected_response_rows_sha256: "7d1a65015c0a0b694c10297f3ec2d8f6e2823db71060eed114a055551c854743",
     },
     {
       name: "sensorcommunity_dense_ts7421_1h",
@@ -31,6 +32,7 @@ export function buildPhysicalLeafMeasurementMatrix() {
       start_utc: "2026-04-03T00:00:00.000Z",
       end_utc: "2026-04-03T01:00:00.000Z",
       fixture_expected_leaf_pages: 1,
+      fixture_expected_response_rows_sha256: "d644c2f5ffb0dd3b5ba69ea1130785d38ee253a277feace7cb0c7c2758054691",
     },
     {
       name: "sensorcommunity_dense_ts7421_24h",
@@ -39,6 +41,7 @@ export function buildPhysicalLeafMeasurementMatrix() {
       start_utc: "2026-04-03T00:00:00.000Z",
       end_utc: "2026-04-04T00:00:00.000Z",
       fixture_expected_leaf_pages: 13,
+      fixture_expected_response_rows_sha256: "d8d229992f96ed44fb6204959541732f2c126faa7d9c8132e514951b612fcabe",
     },
   ];
 }
@@ -63,6 +66,7 @@ function parse(argv) {
     timeoutMs: 30_000,
     dryRun: false,
     leafOnly: false,
+    diagnosticMode: "cpu_v1",
     caseNames: [],
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -74,6 +78,7 @@ function parse(argv) {
     else if (argument === "--repeat") options.repeat = Number(next());
     else if (argument === "--timeout-ms") options.timeoutMs = Number(next());
     else if (argument === "--case") options.caseNames.push(next());
+    else if (argument === "--diagnostic-mode") options.diagnosticMode = next();
     else if (argument === "--dry-run") options.dryRun = true;
     else if (argument === "--leaf-only") options.leafOnly = true;
     else throw new Error(`Unknown argument: ${argument}`);
@@ -84,6 +89,9 @@ function parse(argv) {
     !Number.isSafeInteger(options.timeoutMs) ||
     options.timeoutMs < 1
   ) throw new Error("repeat and timeout-ms must be positive integers");
+  if (!["cpu_v1", "workload_v1"].includes(options.diagnosticMode)) {
+    throw new Error("diagnostic-mode must be cpu_v1 or workload_v1");
+  }
   return options;
 }
 
@@ -98,7 +106,7 @@ function selectCases(matrix, caseNames) {
   return matrix.filter((item) => selected.has(item.name));
 }
 
-function requestUrl(base, item, physicalCursor = null) {
+function requestUrl(base, item, physicalCursor = null, diagnosticMode = "workload_v1") {
   const url = new URL(base);
   for (const [key, value] of Object.entries({
     connector_id: item.connector_id,
@@ -106,7 +114,7 @@ function requestUrl(base, item, physicalCursor = null) {
     timeseries_id: item.timeseries_id,
     start_utc: item.start_utc,
     end_utc: item.end_utc,
-    diagnostics: "workload_v1",
+    ...(diagnosticMode ? { diagnostics: diagnosticMode } : {}),
   })) url.searchParams.set(key, String(value));
   if (physicalCursor) url.searchParams.set("physical_cursor", physicalCursor);
   return url;
@@ -125,8 +133,9 @@ function physicalDiagnostics(diagnostics) {
     physical_page_number: diagnostics.physical_page_number ?? null,
     continuation_cursor_supplied: diagnostics.continuation_cursor_supplied ?? null,
     candidate_intersecting_segments: diagnostics.candidate_intersecting_segments ?? null,
-    selected_chronological_segments: diagnostics.selected_chronological_segments,
-    selected_files: diagnostics.selected_files,
+    selected_chronological_segments:
+      diagnostics.selected_chronological_segments ?? diagnostics.physical_segments_decoded ?? null,
+    selected_files: diagnostics.selected_files ?? null,
     selected_segment_physical_identity: diagnostics.selected_segment_physical_identity ?? null,
     selected_segment_row_count: diagnostics.selected_segment_row_count ?? null,
     physical_segments_decoded: diagnostics.physical_segments_decoded ?? null,
@@ -135,11 +144,13 @@ function physicalDiagnostics(diagnostics) {
     pagination_complete: diagnostics.pagination_complete ?? null,
     continuation_returned: diagnostics.continuation_returned ?? null,
     scoped_manifests_read: diagnostics.scoped_manifests_read ?? null,
-    whole_logical_range_segment_discovery: diagnostics.whole_logical_range_segment_discovery ?? null,
+    whole_logical_range_segment_discovery:
+      diagnostics.whole_logical_range_segment_discovery ?? diagnostics.whole_logical_range_discovery ?? null,
     global_segment_sorting: diagnostics.global_segment_sorting ?? null,
     index_objects_read: diagnostics.index_objects_read,
     index_bytes_read: diagnostics.index_bytes_read,
-    timeseries_leaf_objects_read: diagnostics.timeseries_leaf_objects_read ?? 0,
+    timeseries_leaf_objects_read:
+      diagnostics.timeseries_leaf_objects_read ?? diagnostics.leaf_objects_read ?? 0,
     timeseries_leaf_bytes_read: diagnostics.timeseries_leaf_bytes_read ?? 0,
     coarse_child_shards_read: diagnostics.coarse_child_shards_read ?? 0,
     identity_head_reads: diagnostics.identity_head_reads,
@@ -163,7 +174,8 @@ async function fetchPayload({ url, secret, timeoutMs }) {
 }
 
 function pageEvidence({ response, payload, text, pageNumber }) {
-  const diagnostics = payload?.coverage?.exact_reader_diagnostics || payload?.diagnostics || null;
+  const diagnostics = payload?.cpu_measurement || payload?.coverage?.exact_reader_diagnostics || payload?.diagnostics || null;
+  const physical = physicalDiagnostics(diagnostics);
   const rows = Array.isArray(payload?.rows) ? payload.rows : null;
   return {
     page_number: pageNumber,
@@ -173,13 +185,13 @@ function pageEvidence({ response, payload, text, pageNumber }) {
     response_complete: payload?.response_complete ?? null,
     has_gap: payload?.has_gap ?? null,
     partial_reasons: payload?.partial_reasons ?? null,
-    physical_page_path: diagnostics?.physical_page_path ?? payload?.physical_page?.physical_page_path ?? null,
-    manifest_objects_read: diagnostics?.scoped_manifests_read ?? null,
-    leaf_objects_read: diagnostics?.timeseries_leaf_objects_read ?? null,
-    index_bytes_read: diagnostics?.index_bytes_read ?? null,
-    whole_range_discovery: diagnostics?.whole_logical_range_segment_discovery ?? null,
-    global_segment_sort: diagnostics?.global_segment_sorting ?? null,
-    physical_rows: diagnostics?.physical_rows_decoded ?? null,
+    physical_page_path: physical?.physical_page_path ?? payload?.physical_page?.physical_page_path ?? null,
+    manifest_objects_read: physical?.scoped_manifests_read ?? null,
+    leaf_objects_read: physical?.timeseries_leaf_objects_read ?? null,
+    index_bytes_read: physical?.index_bytes_read ?? null,
+    whole_range_discovery: physical?.whole_logical_range_segment_discovery ?? null,
+    global_segment_sort: physical?.global_segment_sorting ?? null,
+    physical_rows: physical?.physical_rows_decoded ?? null,
     physical_page: payload?.physical_page ?? null,
     rows,
     rows_sha256: rows ? rowsSha256(rows) : null,
@@ -188,14 +200,18 @@ function pageEvidence({ response, payload, text, pageNumber }) {
       payload?.diagnostic_request?.request_id ||
       null,
     cf_ray: response.headers.get("cf-ray") || payload?.diagnostic_request?.cloudflare_ray_id || null,
-    physical: physicalDiagnostics(diagnostics),
+    cpu_measurement_present: Boolean(payload?.cpu_measurement),
+    verbose_diagnostics_present: Boolean(
+      payload?.coverage?.exact_reader_diagnostics || payload?.diagnostics,
+    ),
+    physical,
     error: payload?.error ?? (!payload ? text.slice(0, 500) : null),
     cloudflare_cpu_time_ms: null,
     cloudflare_cpu_time_source: "correlate this page request ID or CF-Ray in Cloudflare invocation telemetry",
   };
 }
 
-function assertLeafPage(page, expectedPageNumber) {
+function assertLeafPage(page, expectedPageNumber, diagnosticMode) {
   if (!page.ok || !Array.isArray(page.rows) || page.returned_rows !== page.rows.length) {
     throw new Error(`leaf page ${expectedPageNumber} failed or has contradictory rows`);
   }
@@ -220,6 +236,20 @@ function assertLeafPage(page, expectedPageNumber) {
     physical?.parquet_footer_parsed !== false ||
     physical?.timeseries_id_decoded !== false
   ) throw new Error(`leaf page ${expectedPageNumber} violates the one-segment physical contract`);
+  if (diagnosticMode === "cpu_v1") {
+    if (
+      page.cpu_measurement_present !== true ||
+      page.verbose_diagnostics_present !== false ||
+      page.physical?.schema_version !== undefined ||
+      page.physical?.selected_segment_physical_identity !== null ||
+      page.physical?.selected_files !== null
+    ) throw new Error(`leaf page ${expectedPageNumber} returned verbose diagnostics in cpu_v1 mode`);
+  } else if (
+    diagnosticMode === "workload_v1" &&
+    page.verbose_diagnostics_present !== true
+  ) {
+    throw new Error(`leaf page ${expectedPageNumber} omitted workload_v1 diagnostics`);
+  }
   if (
     expectedPageNumber === 1
       ? physical?.whole_logical_range_segment_discovery !== true ||
@@ -287,17 +317,17 @@ async function attemptPhysical1024({ base, item, number, secret, timeoutMs }) {
   }
 }
 
-async function attemptPhysicalLeaf({ base, item, number, secret, timeoutMs }) {
+async function attemptPhysicalLeaf({ base, item, number, secret, timeoutMs, diagnosticMode }) {
   const pages = [];
   const rows = [];
   const cursors = new Set();
   let cursor = null;
   try {
     for (let pageNumber = 1; pageNumber <= MAX_MEASUREMENT_PAGES; pageNumber += 1) {
-      const url = requestUrl(base, item, cursor);
+      const url = requestUrl(base, item, cursor, diagnosticMode);
       const fetched = await fetchPayload({ url, secret, timeoutMs });
       const page = pageEvidence({ ...fetched, pageNumber });
-      assertLeafPage(page, pageNumber);
+      assertLeafPage(page, pageNumber, diagnosticMode);
       pages.push(page);
       rows.push(...page.rows);
       if (page.physical_page.pagination_complete) break;
@@ -315,6 +345,7 @@ async function attemptPhysicalLeaf({ base, item, number, secret, timeoutMs }) {
       case: item.name,
       variant: "physical_leaf_1024_paged",
       attempt: number,
+      diagnostic_mode: diagnosticMode,
       request: item,
       response: {
         status: finalPage.status,
@@ -348,6 +379,7 @@ async function attemptPhysicalLeaf({ base, item, number, secret, timeoutMs }) {
       case: item.name,
       variant: "physical_leaf_1024_paged",
       attempt: number,
+      diagnostic_mode: diagnosticMode,
       request: item,
       response: {
         status: pages.at(-1)?.status ?? null,
@@ -387,6 +419,7 @@ async function main() {
     process.stdout.write(`${JSON.stringify({
       repeat: options.repeat,
       variants,
+      leaf_diagnostic_mode: options.diagnosticMode,
       cases: matrix,
       physical_contract: {
         max_logical_request_hours: 24,
@@ -435,6 +468,7 @@ async function main() {
     cases: matrix.length,
     variants,
     endpoints: Object.fromEntries(Object.entries(endpoints).map(([key, value]) => [key, value.origin])),
+    leaf_diagnostic_mode: options.diagnosticMode,
   }, null, 2)}\n`, { flag: "wx" });
 
   let sequence = 0;
@@ -445,7 +479,14 @@ async function main() {
         sequence += 1;
         const result = variant === "physical_1024"
           ? await attemptPhysical1024({ base: endpoints[variant], item, number, secret, timeoutMs: options.timeoutMs })
-          : await attemptPhysicalLeaf({ base: endpoints[variant], item, number, secret, timeoutMs: options.timeoutMs });
+          : await attemptPhysicalLeaf({
+              base: endpoints[variant],
+              item,
+              number,
+              secret,
+              timeoutMs: options.timeoutMs,
+              diagnosticMode: options.diagnosticMode,
+            });
         pair.push(result);
         const filename = `${String(sequence).padStart(3, "0")}_${item.name}_${variant}_attempt${number}.json`;
         fs.writeFileSync(path.join(directory, filename), `${JSON.stringify(result, null, 2)}\n`, { flag: "wx" });
@@ -481,6 +522,7 @@ async function main() {
         physical_leaf_assembled_rows_sha256: leaf?.response.rows_sha256 ?? null,
         physical_leaf_page_count: leaf?.response.page_count ?? null,
         fixture_expected_leaf_pages: item.fixture_expected_leaf_pages,
+        fixture_expected_response_rows_sha256: item.fixture_expected_response_rows_sha256,
       };
       fs.appendFileSync(path.join(directory, "comparisons.jsonl"), `${JSON.stringify(comparison)}\n`);
       if (leaf && (!leaf.response.ok || leaf.response.response_complete !== true)) {
@@ -488,6 +530,9 @@ async function main() {
       }
       if (leaf?.response.page_count !== item.fixture_expected_leaf_pages) {
         throw new Error(`paged leaf fixture page-count mismatch for ${item.name} attempt ${number}`);
+      }
+      if (leaf?.response.rows_sha256 !== item.fixture_expected_response_rows_sha256) {
+        throw new Error(`paged leaf fixture SHA-256 mismatch for ${item.name} attempt ${number}`);
       }
       if (physical && (!physical.response.ok || physical.response.response_complete !== true)) {
         throw new Error(`physical-1024 reference failed for ${item.name} attempt ${number}`);

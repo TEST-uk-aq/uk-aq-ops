@@ -23,6 +23,40 @@ The production-intended shared read implementation is
 deployed `-v3-leaf-candidate` Worker is only a TEST wrapper around that shared
 implementation; it does not carry a second reader implementation.
 
+## Response and diagnostics modes
+
+A request without `diagnostics` uses the production-shaped response and the
+existing candidate Cache API policy. Its observation payload contains the
+logical/index/candidate/layout/writer identities, pollutant partition,
+timeseries and connector identities, requested bounds, cache scope, row count,
+completeness/gap/partial fields, compact `physical_page` paging state, and the
+ordered `rows`. It does not contain `coverage.exact_reader_diagnostics`, R2
+keys, physical SHA-256 identities, selected-coordinate arrays, or requested
+byte-range arrays. The response-cache generation is
+`physical-leaf-index-v1-1024-page-4-production-shaped`, so an older cached
+candidate response cannot survive a later deployment of this schema.
+
+Two explicit TEST-only diagnostic modes bypass Cache API and return
+`Cache-Control: no-store`:
+
+- `diagnostics=workload_v1` is verbose structural troubleshooting. The HTTP
+  response exposes `coverage.exact_reader_diagnostics` once; its completion
+  log contains only correlation fields and a compact structural summary, not a
+  second serialized copy of the full reader diagnostics.
+- `diagnostics=cpu_v1` is the default deployed leaf measurement mode. Its HTTP
+  response and single completion log contain only the diagnostic request ID,
+  CF-Ray when available, and a bounded `cpu_measurement` summary: outcome,
+  page number/path, continuation supplied, pagination complete, physical
+  segments/rows decoded, returned rows, scoped-manifest/leaf/index reads,
+  index bytes, discovery/sort flags, identity HEADs, R2 range reads/bytes, and
+  the footer/`timeseries_id` decode flags. It does not serialize full reader
+  diagnostics, keys, SHA objects, byte-range arrays, or selected-coordinate
+  arrays.
+
+Neither mode performs in-Worker timing. Cloudflare invocation `cpuTime` from
+tail or Workers Analytics remains the authoritative CPU source; verbose
+diagnostic serialization must not be treated as production reader cost.
+
 ## Physical paging contract
 
 A low-level logical request must be non-empty and at most 24 hours. It may
@@ -111,7 +145,10 @@ The focused validator page-walks normal TS7421 24h, dense TS7421 1h, and
 dense TS7421 24h. It expects the existing fixture evidence of 1, 1, and 13
 pages respectively, proves no invocation decodes a second segment, and
 compares the assembled rows and SHA-256 with the existing physical-index-1024
-reader. The page counts are fixture assertions, not runtime configuration.
+reader. It also invokes the Worker in normal, `workload_v1`, and `cpu_v1`
+modes, proves identical ordered response rows and the fixed deployed response
+hashes, checks the diagnostic cache/no-store boundaries, and records response
+bytes per page. The page counts are fixture assertions, not runtime configuration.
 It also proves cursor replay/staleness rejection, a missing required leaf as a
 genuine gap, the 24-hour boundary, and the explicit `since_utc`/`limit`
 rejections. With the optional multiday extension fixtures it also proves a
@@ -157,6 +194,33 @@ npx --yes wrangler@4 tail "${PHYSICAL_LEAF_WORKER_NAME}" --format json \
   | tee tmp/index_v3_physical_leaf_candidate_tail.jsonl
 ```
 
+The tail output is a stream of complete JSON values (despite the `.jsonl`
+suffix). After a `cpu_v1` run, extract authoritative invocation CPU and its
+page/request correlation with:
+
+```bash
+jq -c '
+  . as $invocation
+  | [
+      .logs[]?.message[]?
+      | fromjson?
+      | select(.event == "observation_history_v3_physical_leaf_candidate_cpu_measurement")
+    ][0] as $measurement
+  | select($measurement != null)
+  | {
+      cpuTime: $invocation.cpuTime,
+      outcome: $invocation.outcome,
+      diagnostic_request_id: $measurement.diagnostic_request_id,
+      cf_ray: $measurement.cloudflare_ray_id,
+      page_number: $measurement.page_number,
+      physical_page_path: $measurement.physical_page_path,
+      continuation_supplied: $measurement.continuation_supplied,
+      physical_rows_decoded: $measurement.physical_rows_decoded,
+      returned_rows: $measurement.returned_rows
+    }
+' tmp/index_v3_physical_leaf_candidate_tail.jsonl
+```
+
 ## Focused post-deployment measurement
 
 ```bash
@@ -167,6 +231,7 @@ npx --yes node@20.20.2 \
   scripts/index_v3_physical_leaf_candidate/measure.mjs \
   --physical-1024-endpoint "${UK_AQ_V3_PHYSICAL_1024_CANDIDATE_URL}" \
   --physical-leaf-endpoint "${UK_AQ_V3_PHYSICAL_LEAF_CANDIDATE_URL}" \
+  --diagnostic-mode cpu_v1 \
   --repeat 1
 ```
 
@@ -179,6 +244,10 @@ invocation from Cloudflare tail or Workers Analytics telemetry. There is no
 CPU-reactive adaptive limiter; telemetry can only support a later manual
 reconsideration of the fixed cap. The cap remains 1,024 rows and one physical
 segment per Worker invocation.
+
+`cpu_v1` is the leaf default. Use `--diagnostic-mode workload_v1` only when a
+full structural diagnostic response is required. The physical-1024 comparison
+Worker continues to use its existing `workload_v1` mode.
 
 ## Canonical integration handover
 

@@ -16,6 +16,7 @@ import {
   readObservationHistoryPhysicalCandidate,
 } from "../../workers/uk_aq_observs_history_r2_api_v3_physical_candidate/reader.mjs";
 import {
+  default as physicalLeafCandidateWorker,
   parseObservationRequest,
   physicalLeafCandidateReaderIndex,
 } from "../../workers/uk_aq_observs_history_r2_api_v3_leaf_candidate/worker.mjs";
@@ -26,6 +27,12 @@ const PHYSICAL_PREFIX = `${BASE_PREFIX}/candidate=physical-index-v1/cap_rows=102
 const PHYSICAL_INDEX_ROOT = `${PHYSICAL_PREFIX}/observations_timeseries`;
 const LEAF_PREFIX = `${BASE_PREFIX}/candidate=physical-leaf-index-v1/cap_rows=1024`;
 const LEAF_INDEX_ROOT = `${LEAF_PREFIX}/observations_timeseries`;
+const EXPECTED_RESPONSE_ROWS_SHA256 = Object.freeze({
+  sensorcommunity_normal_ts7421_24h: "7d1a65015c0a0b694c10297f3ec2d8f6e2823db71060eed114a055551c854743",
+  sensorcommunity_dense_ts7421_1h: "d644c2f5ffb0dd3b5ba69ea1130785d38ee253a277feace7cb0c7c2758054691",
+  sensorcommunity_dense_ts7421_24h: "d8d229992f96ed44fb6204959541732f2c126faa7d9c8132e514951b612fcabe",
+});
+const DIAGNOSTIC_MODES = Object.freeze([null, "workload_v1", "cpu_v1"]);
 
 function parse(argv) {
   const options = {
@@ -219,6 +226,9 @@ function localSource({
     return readFrom([alignedRoot, alignedExtensionRoot], key);
   };
   return Object.freeze({
+    readObjectBytes(key) {
+      return read(key);
+    },
     async getIndexObject({ key, maxBytes }) {
       try {
         const bytes = read(key);
@@ -250,6 +260,218 @@ function localSource({
       });
     },
   });
+}
+
+function localR2Bucket(source) {
+  const objectMetadata = (key, bytes) => {
+    const digest = sha256(bytes);
+    return {
+      key,
+      size: bytes.byteLength,
+      etag: digest,
+      httpEtag: `"${digest}"`,
+      checksums: { sha256: Uint8Array.from(Buffer.from(digest, "hex")) },
+    };
+  };
+  return Object.freeze({
+    async head(key) {
+      try {
+        const bytes = source.readObjectBytes(key);
+        return objectMetadata(key, bytes);
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      }
+    },
+    async get(key, options = {}) {
+      try {
+        const bytes = source.readObjectBytes(key);
+        const metadata = objectMetadata(key, bytes);
+        if (
+          options.onlyIf?.etagMatches &&
+          String(options.onlyIf.etagMatches).replaceAll('"', "") !== metadata.etag
+        ) return null;
+        const offset = options.range?.offset ?? 0;
+        const length = options.range?.length ?? bytes.byteLength;
+        const selected = bytes.subarray(offset, offset + length);
+        return {
+          ...metadata,
+          body: true,
+          ...(options.range ? { range: { offset, length } } : {}),
+          async arrayBuffer() {
+            return selected.buffer.slice(selected.byteOffset, selected.byteOffset + selected.byteLength);
+          },
+          async json() {
+            return JSON.parse(selected.toString("utf8"));
+          },
+        };
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      }
+    },
+  });
+}
+
+function installLocalCache() {
+  const entries = new Map();
+  const counters = { match: 0, put: 0 };
+  const cache = Object.freeze({
+    async match(request) {
+      counters.match += 1;
+      return entries.get(request.url)?.clone() ?? null;
+    },
+    async put(request, response) {
+      counters.put += 1;
+      entries.set(request.url, response.clone());
+    },
+  });
+  Object.defineProperty(globalThis, "caches", {
+    value: Object.freeze({ default: cache }),
+    configurable: true,
+    writable: true,
+  });
+  return Object.freeze({ counters, entries });
+}
+
+function responseRowsSha256(rows) {
+  return sha256(Buffer.from(JSON.stringify(rows)));
+}
+
+function assertCompactDiagnosticObject(payload, label) {
+  const forbiddenKeys = new Set([
+    "exact_reader_diagnostics",
+    "selected_coordinates",
+    "requested_physical_byte_ranges_by_column",
+    "selected_segment_physical_identity",
+    "selected_files",
+    "selected_scopes",
+    "sha256",
+    "file_key",
+    "leaf_key",
+  ]);
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      assert.equal(forbiddenKeys.has(key), false, `${label} exposes verbose diagnostic key ${key}`);
+      visit(child);
+    }
+  };
+  visit(payload);
+}
+
+async function walkWorkerMode({ worker, env, item, mode, cacheState }) {
+  const rows = [];
+  const pages = [];
+  const cursors = new Set();
+  const logs = [];
+  let cursor = null;
+  const originalInfo = console.info;
+  const originalWarn = console.warn;
+  console.info = (...values) => logs.push(values.map(String).join(" "));
+  console.warn = (...values) => logs.push(values.map(String).join(" "));
+  try {
+    for (let pageNumber = 1; pageNumber <= 256; pageNumber += 1) {
+      const url = new URL("https://physical-leaf-candidate.test/v1/observations");
+      for (const [key, value] of Object.entries({
+        timeseries_id: item.timeseries_id,
+        connector_id: item.connector_id,
+        pollutant: "pm25",
+        start_utc: item.start_utc,
+        end_utc: item.end_utc,
+        ...(mode ? { diagnostics: mode } : {}),
+        ...(cursor ? { physical_cursor: cursor } : {}),
+      })) url.searchParams.set(key, String(value));
+      const pending = [];
+      const beforeCache = { ...cacheState.counters };
+      const response = await worker.fetch(new Request(url, {
+        headers: {
+          "x-uk-aq-upstream-auth": "local-test-secret",
+          "cf-ray": `local-${item.name}-${mode || "normal"}-${pageNumber}`,
+        },
+      }), env, { waitUntil: (promise) => pending.push(promise) });
+      const text = await response.text();
+      const payload = JSON.parse(text);
+      await Promise.all(pending);
+      assert.equal(response.ok, true);
+      assert.equal(payload.ok, true);
+      assert.equal(payload.row_count, payload.rows.length);
+      assert.equal(payload.physical_page.schema_version, 2);
+      assert.equal(payload.physical_page.page_number, pageNumber);
+      assert.ok(payload.physical_page.segments_decoded <= 1);
+      assert.ok(payload.physical_page.physical_rows_decoded <= 1024);
+      assert.equal(response.headers.get("x-ukaq-cache-generation"), "physical-leaf-index-v1-1024-page-4-production-shaped");
+      if (mode) {
+        assert.equal(response.headers.get("x-ukaq-cache"), "BYPASS");
+        assert.equal(response.headers.get("cache-control"), "no-store");
+        assert.equal(cacheState.counters.match, beforeCache.match);
+        assert.equal(cacheState.counters.put, beforeCache.put);
+        assert.equal(payload.diagnostic_request.mode, mode);
+        assert.equal(payload.diagnostic_request.cache_bypassed, true);
+        assert.equal(payload.diagnostic_request.cpu_time_ms, null);
+        assert.equal(response.headers.get("x-ukaq-diagnostic-request-id"), payload.diagnostic_request.request_id);
+      } else {
+        assert.equal(response.headers.get("x-ukaq-cache"), "MISS");
+        assert.equal(payload.diagnostic_request, undefined);
+        assert.equal(payload.coverage, undefined);
+        assert.equal(payload.cpu_measurement, undefined);
+        assert.equal(payload.diagnostics, undefined);
+        assert.equal(cacheState.counters.match, beforeCache.match + 1);
+        assert.equal(
+          cacheState.counters.put,
+          beforeCache.put + (payload.response_complete === true && payload.has_gap !== true ? 1 : 0),
+        );
+      }
+      if (mode === "workload_v1") {
+        assert.ok(payload.coverage?.exact_reader_diagnostics);
+        assert.equal(payload.cpu_measurement, undefined);
+      }
+      if (mode === "cpu_v1") {
+        assert.ok(payload.cpu_measurement);
+        assert.equal(payload.coverage, undefined);
+        assert.equal(payload.diagnostics, undefined);
+        assertCompactDiagnosticObject(payload.cpu_measurement, "cpu_v1 response");
+      }
+      rows.push(...payload.rows);
+      pages.push({
+        response_bytes: Buffer.byteLength(text),
+        physical_page: payload.physical_page,
+        compact: payload.cpu_measurement ?? null,
+        verbose: payload.coverage?.exact_reader_diagnostics ?? null,
+      });
+      if (payload.physical_page.pagination_complete) break;
+      cursor = payload.physical_page.next_cursor;
+      assert.equal(typeof cursor, "string");
+      assert.equal(cursors.has(cursor), false);
+      cursors.add(cursor);
+    }
+  } finally {
+    console.info = originalInfo;
+    console.warn = originalWarn;
+  }
+  assert.equal(pages.at(-1)?.physical_page.pagination_complete, true);
+  const parsedLogs = logs.map((entry) => JSON.parse(entry));
+  if (mode === null) assert.equal(parsedLogs.length, 0);
+  if (mode === "workload_v1") {
+    assert.equal(parsedLogs.length, pages.length * 2);
+    for (const entry of parsedLogs) assertCompactDiagnosticObject(entry, "workload_v1 log");
+  }
+  if (mode === "cpu_v1") {
+    assert.equal(parsedLogs.length, pages.length);
+    for (const entry of parsedLogs) {
+      assert.equal(entry.event, "observation_history_v3_physical_leaf_candidate_cpu_measurement");
+      assertCompactDiagnosticObject(entry, "cpu_v1 log");
+    }
+  }
+  return {
+    mode: mode || "normal",
+    rows,
+    rows_sha256: responseRowsSha256(rows),
+    pages,
+    page_count: pages.length,
+    response_bytes_per_page: pages.map((page) => page.response_bytes),
+    logs,
+  };
 }
 
 function comparable(rows) {
@@ -412,6 +634,15 @@ async function main() {
   assert.equal(physicalPlan.prototype_prefix, PHYSICAL_PREFIX);
   const physicalTotalIndexBytes = physicalPlan.objects.reduce((sum, entry) => sum + entry.byte_size, 0);
   const source = localSource(roots);
+  const cacheState = installLocalCache();
+  const workerEnvironment = Object.freeze({
+    UKAQ_ENV_NAME: "TEST",
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+    UK_AQ_R2_HISTORY_INDEX_VERSION: "v3-physical-leaf-candidate",
+    UK_AQ_PHYSICAL_INDEX_PROTOTYPE_PREFIX: LEAF_PREFIX,
+    UK_AQ_EDGE_UPSTREAM_SECRET: "local-test-secret",
+    UK_AQ_HISTORY_BUCKET: localR2Bucket(source),
+  });
   const cases = [
     {
       name: "sensorcommunity_normal_ts7421_24h",
@@ -481,6 +712,42 @@ async function main() {
     const physicalRowsSha256 = sha256(Buffer.from(JSON.stringify(physicalRows)));
     const leafRowsSha256 = leaf.rows_sha256;
     assert.equal(leafRowsSha256, physicalRowsSha256);
+    const workerModes = [];
+    for (const mode of DIAGNOSTIC_MODES) {
+      workerModes.push(await walkWorkerMode({
+        worker: physicalLeafCandidateWorker,
+        env: workerEnvironment,
+        item,
+        mode,
+        cacheState,
+      }));
+    }
+    const workerRows = workerModes.map((result) => result.rows);
+    assert.deepEqual(workerRows[1], workerRows[0]);
+    assert.deepEqual(workerRows[2], workerRows[0]);
+    for (const result of workerModes) {
+      assert.equal(result.page_count, item.expected_pages);
+      assert.equal(result.rows.length, item.expected_rows);
+      assert.equal(result.rows_sha256, EXPECTED_RESPONSE_ROWS_SHA256[item.name]);
+      assert.equal(
+        result.pages.every((page) => page.physical_page.segments_decoded <= 1),
+        true,
+      );
+      assert.equal(
+        result.pages.every((page) => page.physical_page.physical_rows_decoded <= 1024),
+        true,
+      );
+    }
+    for (const modeResult of workerModes.filter((result) => result.mode !== "normal")) {
+      for (const [index, page] of modeResult.pages.entries()) {
+        const diagnostics = page.compact ?? page.verbose;
+        assert.equal(diagnostics.parquet_footer_fetched, false);
+        assert.equal(diagnostics.parquet_footer_parsed, false);
+        assert.equal(diagnostics.timeseries_id_decoded, false);
+        assert.equal(diagnostics.physical_page_path, index === 0 ? "initial_discovery" : "direct_leaf_continuation");
+        assert.equal(diagnostics.scoped_manifests_read, index === 0 ? 1 : 0);
+      }
+    }
     if (item.expected_pages === 1) {
       assert.equal(leaf.pages[0].diagnostics.index_bytes_read < physical.diagnostics.index_bytes_read, true);
     }
@@ -509,6 +776,19 @@ async function main() {
       r2_bytes_requested_per_page: leaf.pages.map((page) => page.diagnostics.r2_bytes_requested),
       physical_rows_sha256: physicalRowsSha256,
       leaf_rows_sha256: leafRowsSha256,
+      response_rows_sha256: EXPECTED_RESPONSE_ROWS_SHA256[item.name],
+      worker_modes: workerModes.map((result) => ({
+        mode: result.mode,
+        returned_rows: result.rows.length,
+        page_count: result.page_count,
+        rows_sha256: result.rows_sha256,
+        response_bytes_per_page: result.response_bytes_per_page,
+      })),
+      representative_response_bytes: {
+        normal_production_shaped: workerModes[0].response_bytes_per_page[0],
+        workload_verbose_proxy_for_previous_diagnostics: workerModes[1].response_bytes_per_page[0],
+        cpu_compact: workerModes[2].response_bytes_per_page[0],
+      },
       equal_to_physical_1024_reader: true,
     });
   }
