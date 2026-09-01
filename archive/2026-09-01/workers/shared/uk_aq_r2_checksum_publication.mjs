@@ -33,26 +33,12 @@ export function buildR2ChecksumAwarePutIntent({
   });
 }
 
-export function verifyR2StoredSha256Head({
-  head,
-  intent,
-  requireStoredByteSize = true,
-}) {
+export function verifyR2StoredSha256Head({ head, intent }) {
   if (!head || head.exists === false) {
     throw new Error(`Checksum-aware R2 object is missing: ${intent.key}`);
   }
-  const rawStoredByteSize = head.bytes ?? head.size;
-  const storedByteSizeAvailable = (
-    rawStoredByteSize !== null &&
-    rawStoredByteSize !== undefined &&
-    rawStoredByteSize !== ""
-  );
-  const storedByteSize = storedByteSizeAvailable ? Number(rawStoredByteSize) : null;
-  if (storedByteSizeAvailable && storedByteSize !== intent.byte_size) {
+  if (Number(head.bytes ?? head.size) !== intent.byte_size) {
     throw new Error(`Checksum-aware R2 byte-size verification failed: ${intent.key}`);
-  }
-  if (!storedByteSizeAvailable && requireStoredByteSize) {
-    throw new Error(`Checksum-aware R2 byte-size verification unavailable: ${intent.key}`);
   }
   const storedSha256 = requireSha256(
     head.sha256 ?? head.checksums?.sha256,
@@ -67,7 +53,6 @@ export function verifyR2StoredSha256Head({
     sha256: intent.sha256,
     etag: String(head.etag || head.httpEtag || "").trim() || null,
     stored_sha256_verified: true,
-    ...(storedByteSizeAvailable ? {} : { stored_byte_size_verified: false }),
   });
 }
 
@@ -76,7 +61,6 @@ export async function putAndVerifyR2ObjectWithSha256({
   intent,
   putObject = r2PutObject,
   headObject = r2HeadObject,
-  requireStoredByteSize = true,
 }) {
   const normalizedIntent = buildR2ChecksumAwarePutIntent({
     key: intent?.key,
@@ -103,9 +87,5 @@ export async function putAndVerifyR2ObjectWithSha256({
     sha256: normalizedIntent.sha256,
   });
   const head = await headObject({ r2, key: normalizedIntent.key });
-  return verifyR2StoredSha256Head({
-    head,
-    intent: normalizedIntent,
-    requireStoredByteSize,
-  });
+  return verifyR2StoredSha256Head({ head, intent: normalizedIntent });
 }

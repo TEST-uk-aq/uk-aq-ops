@@ -2,15 +2,16 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   hasRequiredR2Config,
-  normalizeR2Sha256Checksum,
   r2HeadObject,
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
   buildR2ChecksumAwarePutIntent,
   putAndVerifyR2ObjectWithSha256,
+  verifyR2StoredSha256Head,
 } from "../../workers/shared/uk_aq_r2_checksum_publication.mjs";
 import { assertAlignedV2TestR2Identity } from "./test_r2_identity.mjs";
 
@@ -36,6 +37,16 @@ function r2Config(env) {
     access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || "").trim(),
     secret_access_key: String(env.CFLARE_R2_SECRET_ACCESS_KEY || "").trim(),
   };
+}
+
+export function classifyExistingAlignedV2PrototypeObject({ head, intent }) {
+  if (!head || head.exists === false) return null;
+  const verified = verifyR2StoredSha256Head({
+    head,
+    intent,
+    requireStoredByteSize: false,
+  });
+  return Object.freeze({ action: "unchanged", ...verified });
 }
 
 async function main() {
@@ -76,22 +87,37 @@ async function main() {
   for (const intent of intents) {
     const existing = await r2HeadObject({ r2, key: intent.key });
     if (existing?.exists !== false) {
-      const existingSha = normalizeR2Sha256Checksum(existing.sha256 ?? existing.checksums?.sha256);
-      if (Number(existing.bytes ?? existing.size) === intent.byte_size && existingSha === intent.sha256) {
-        results.push({ key: intent.key, action: "unchanged" });
-        continue;
-      }
-      if (!options.replaceExisting) {
-        throw new Error(`prototype object differs; review then pass --replace-existing: ${intent.key}`);
+      try {
+        const unchanged = classifyExistingAlignedV2PrototypeObject({
+          head: existing,
+          intent,
+        });
+        if (unchanged) {
+          results.push(unchanged);
+          continue;
+        }
+      } catch (error) {
+        if (!options.replaceExisting) {
+          throw new Error(
+            `prototype object differs; review then pass --replace-existing: ${intent.key}`,
+            { cause: error },
+          );
+        }
       }
     }
-    const verified = await putAndVerifyR2ObjectWithSha256({ r2, intent });
+    const verified = await putAndVerifyR2ObjectWithSha256({
+      r2,
+      intent,
+      requireStoredByteSize: false,
+    });
     results.push({ key: intent.key, action: "put", ...verified });
   }
   process.stdout.write(`${JSON.stringify({ ok: true, environment: "TEST", prototype_prefix: prefix, results }, null, 2)}\n`);
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
