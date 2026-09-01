@@ -216,7 +216,7 @@ function descriptorForCandidate(payload, body) {
   };
 }
 
-async function buildChild({ alignedRoot, alignedPlanByKey, sourceEntry }) {
+export async function buildPhysicalCandidateChild({ alignedRoot, alignedPlanByKey, sourceEntry }) {
   const sourceBytes = fs.readFileSync(path.join(alignedRoot, sourceEntry.local_path));
   if (sourceBytes.byteLength !== sourceEntry.byte_size || sha256(sourceBytes) !== sourceEntry.sha256) {
     throw new Error(`aligned child identity mismatch: ${sourceEntry.key}`);
@@ -322,7 +322,7 @@ async function main() {
   const objects = [];
   const candidateChildrenBySource = new Map();
   for (const entry of sourceChildren) {
-    const payload = await buildChild({ alignedRoot: options.alignedRoot, alignedPlanByKey, sourceEntry: entry });
+    const payload = await buildPhysicalCandidateChild({ alignedRoot: options.alignedRoot, alignedPlanByKey, sourceEntry: entry });
     const object = writeObject(options.outputRoot, payload.key, payload);
     objects.push(object);
     candidateChildrenBySource.set(entry.key, { payload, object });

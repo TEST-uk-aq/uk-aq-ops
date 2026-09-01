@@ -236,6 +236,8 @@ function decodeColumn(buffer, profile, name, rowCount) {
   return values;
 }
 
+export { decodeColumn, validateFile, validateProfile, validateRange };
+
 function diagnosticsTemplate(alignedRowCap) {
   return {
     schema_version: 1,
