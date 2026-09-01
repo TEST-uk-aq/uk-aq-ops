@@ -6,6 +6,10 @@ import { pathToFileURL } from "node:url";
 
 const PHYSICAL_1024_HOST = /-v3-physical-1024-candidate\.[a-z0-9-]*test[a-z0-9-]*\.workers\.dev$/i;
 const PHYSICAL_LEAF_HOST = /-v3-leaf-candidate\.[a-z0-9-]*test[a-z0-9-]*\.workers\.dev$/i;
+const DEFAULT_AB_CASE_NAMES = Object.freeze([
+  "sensorcommunity_normal_ts7421_24h",
+  "sensorcommunity_dense_ts7421_1h",
+]);
 
 export function buildPhysicalLeafMeasurementMatrix() {
   return [
@@ -15,6 +19,27 @@ export function buildPhysicalLeafMeasurementMatrix() {
       timeseries_id: 7421,
       start_utc: "2026-08-20T00:00:00.000Z",
       end_utc: "2026-08-21T00:00:00.000Z",
+    },
+    {
+      name: "sensorcommunity_normal_ts7421_48h",
+      connector_id: 7,
+      timeseries_id: 7421,
+      start_utc: "2026-08-20T00:00:00.000Z",
+      end_utc: "2026-08-22T00:00:00.000Z",
+    },
+    {
+      name: "sensorcommunity_normal_ts7421_72h",
+      connector_id: 7,
+      timeseries_id: 7421,
+      start_utc: "2026-08-20T00:00:00.000Z",
+      end_utc: "2026-08-23T00:00:00.000Z",
+    },
+    {
+      name: "sensorcommunity_normal_ts7421_7d",
+      connector_id: 7,
+      timeseries_id: 7421,
+      start_utc: "2026-08-20T00:00:00.000Z",
+      end_utc: "2026-08-27T00:00:00.000Z",
     },
     {
       name: "sensorcommunity_dense_ts7421_1h",
@@ -45,6 +70,7 @@ function parse(argv) {
     repeat: 1,
     timeoutMs: 30000,
     dryRun: false,
+    leafOnly: false,
     caseNames: [],
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -57,6 +83,7 @@ function parse(argv) {
     else if (argument === "--timeout-ms") options.timeoutMs = Number(next());
     else if (argument === "--case") options.caseNames.push(next());
     else if (argument === "--dry-run") options.dryRun = true;
+    else if (argument === "--leaf-only") options.leafOnly = true;
     else throw new Error(`Unknown argument: ${argument}`);
   }
   if (
@@ -142,6 +169,7 @@ async function attempt({ base, item, variant, number, secret, timeoutMs }) {
       schema_version: 1,
       measured_at_utc: new Date().toISOString(),
       case: item.name,
+      requested_utc_days: requestedUtcDays(item),
       variant,
       attempt: number,
       request: {
@@ -150,6 +178,7 @@ async function attempt({ base, item, variant, number, secret, timeoutMs }) {
         pollutant: "pm25",
         start_utc: item.start_utc,
         end_utc: item.end_utc,
+        requested_utc_days: requestedUtcDays(item),
       },
       response: {
         status: response.status,
@@ -177,6 +206,7 @@ async function attempt({ base, item, variant, number, secret, timeoutMs }) {
       schema_version: 1,
       measured_at_utc: new Date().toISOString(),
       case: item.name,
+      requested_utc_days: requestedUtcDays(item),
       variant,
       attempt: number,
       request: item,
@@ -200,28 +230,36 @@ async function attempt({ base, item, variant, number, secret, timeoutMs }) {
 
 async function main() {
   const options = parse(process.argv.slice(2));
-  const matrix = selectCases(buildPhysicalLeafMeasurementMatrix(), options.caseNames);
+  const selectedNames = options.caseNames.length || options.leafOnly
+    ? options.caseNames
+    : DEFAULT_AB_CASE_NAMES;
+  const matrix = selectCases(buildPhysicalLeafMeasurementMatrix(), selectedNames);
+  const variants = options.leafOnly
+    ? ["physical_leaf_1024"]
+    : ["physical_1024", "physical_leaf_1024"];
   if (options.dryRun) {
     process.stdout.write(`${JSON.stringify({
       repeat: options.repeat,
-      variants: ["physical_1024", "physical_leaf_1024"],
+      variants,
       cases: matrix,
     }, null, 2)}\n`);
     return;
   }
 
   const endpoints = {
-    physical_1024: endpoint(
-      options.physical1024Endpoint,
-      PHYSICAL_1024_HOST,
-      "physical 1024 endpoint",
-    ),
     physical_leaf_1024: endpoint(
       options.physicalLeafEndpoint,
       PHYSICAL_LEAF_HOST,
       "physical leaf endpoint",
     ),
   };
+  if (!options.leafOnly) {
+    endpoints.physical_1024 = endpoint(
+      options.physical1024Endpoint,
+      PHYSICAL_1024_HOST,
+      "physical 1024 endpoint",
+    );
+  }
   const secret = String(process.env.UK_AQ_EDGE_UPSTREAM_SECRET || "");
   if (!secret) throw new Error("UK_AQ_EDGE_UPSTREAM_SECRET is required");
 
@@ -238,6 +276,7 @@ async function main() {
     started_at_utc: stamp,
     repeat: options.repeat,
     cases: matrix.length,
+    variants,
     endpoints: Object.fromEntries(
       Object.entries(endpoints).map(([key, value]) => [key, value.origin]),
     ),
@@ -247,7 +286,7 @@ async function main() {
   for (const item of matrix) {
     for (let number = 1; number <= options.repeat; number += 1) {
       const pair = [];
-      for (const variant of ["physical_1024", "physical_leaf_1024"]) {
+      for (const variant of variants) {
         sequence += 1;
         const result = await attempt({
           base: endpoints[variant],
@@ -272,14 +311,16 @@ async function main() {
         })}\n`);
       }
       const hashes = pair.map((result) => result.response.rows_sha256);
+      const byVariant = Object.fromEntries(pair.map((result) => [result.variant, result]));
       const comparison = {
         schema_version: 1,
         case: item.name,
         attempt: number,
-        comparable: hashes.every(Boolean),
-        rows_sha256_equal: hashes.every(Boolean) ? hashes[0] === hashes[1] : null,
-        physical_1024_rows_sha256: hashes[0],
-        physical_leaf_1024_rows_sha256: hashes[1],
+        variants,
+        comparable: hashes.length === 2 && hashes.every(Boolean),
+        rows_sha256_equal: hashes.length === 2 && hashes.every(Boolean) ? hashes[0] === hashes[1] : null,
+        physical_1024_rows_sha256: byVariant.physical_1024?.response.rows_sha256 ?? null,
+        physical_leaf_1024_rows_sha256: byVariant.physical_leaf_1024?.response.rows_sha256 ?? null,
       };
       fs.appendFileSync(path.join(directory, "comparisons.jsonl"), `${JSON.stringify(comparison)}\n`);
       if (comparison.comparable && !comparison.rows_sha256_equal) {

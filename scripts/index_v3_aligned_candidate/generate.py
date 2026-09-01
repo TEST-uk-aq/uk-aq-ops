@@ -452,6 +452,13 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--prototype-prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--caps", nargs="+", type=int, default=list(ALLOWED_CAPS))
+    parser.add_argument(
+        "--partition",
+        action="append",
+        default=[],
+        metavar="ROLE=DIRECTORY",
+        help="generate only the named source directory; repeatable",
+    )
     parser.add_argument("--replace", action="store_true")
     args = parser.parse_args()
     if args.environment.strip().upper() != "TEST":
@@ -460,6 +467,19 @@ def main() -> None:
     caps = sorted(set(args.caps))
     if not caps or any(cap not in ALLOWED_CAPS for cap in caps):
         raise SystemExit(f"caps must be selected from {ALLOWED_CAPS}")
+    roles = dict(ROLES)
+    if args.partition:
+        roles = {}
+        for raw in args.partition:
+            role, separator, directory = raw.partition("=")
+            if (
+                not separator
+                or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", role)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", directory)
+                or role in roles
+            ):
+                raise SystemExit(f"invalid or duplicate --partition: {raw}")
+            roles[role] = directory
     output = args.output_root.resolve()
     if output.exists():
         if not args.replace:
@@ -473,7 +493,7 @@ def main() -> None:
         temp_root = Path(temp)
         for cap in caps:
             cap_root = f"{prefix}/cap_rows={cap}"
-            for role, dirname in ROLES.items():
+            for role, dirname in roles.items():
                 spool = temp_root / f"cap-{cap}-{role}"; spool.mkdir()
                 reports.append(generate_partition(args.source_root / dirname, objects_root, cap_root, cap, role, spool))
     planned = []

@@ -52,6 +52,49 @@ timeseries, every segment/file is cap=1024 aligned data, every manifest tuple
 matches the exact generated leaf bytes, and both focused TS7421 cases decode to
 the same rows and hash as the current physical-index-1024 reader.
 
+### Consecutive normal TS7421 extension
+
+Canonical TEST source coverage is available for every UTC day from
+2026-08-20 through 2026-08-26. Stage only days 21-26, preserving the existing
+day-20 fixture:
+
+```bash
+node scripts/index_v3_aligned_candidate/stage_source.mjs \
+  --profile sensorcommunity-normal-multiday-extension \
+  --output-root tmp/index_v3_aligned_candidate_multiday_source \
+  --replace
+
+/tmp/uk_aq_aligned_v2_env/bin/python \
+  scripts/index_v3_aligned_candidate/generate.py \
+  --environment TEST \
+  --source-root tmp/index_v3_aligned_candidate_multiday_source \
+  --output-root tmp/index_v3_aligned_candidate_multiday_extension \
+  --caps 1024 \
+  --partition sensorcommunity_normal_2026_08_21=sensorcommunity_normal_2026-08-21_pm25 \
+  --partition sensorcommunity_normal_2026_08_22=sensorcommunity_normal_2026-08-22_pm25 \
+  --partition sensorcommunity_normal_2026_08_23=sensorcommunity_normal_2026-08-23_pm25 \
+  --partition sensorcommunity_normal_2026_08_24=sensorcommunity_normal_2026-08-24_pm25 \
+  --partition sensorcommunity_normal_2026_08_25=sensorcommunity_normal_2026-08-25_pm25 \
+  --partition sensorcommunity_normal_2026_08_26=sensorcommunity_normal_2026-08-26_pm25 \
+  --replace
+
+node scripts/index_v3_physical_leaf_candidate/generate.mjs \
+  --environment TEST \
+  --aligned-root tmp/index_v3_aligned_candidate_multiday_extension \
+  --output-root tmp/index_v3_physical_leaf_candidate_multiday_extension \
+  --replace
+
+node scripts/index_v3_physical_leaf_candidate/validate_local.mjs \
+  --aligned-root tmp/index_v3_aligned_candidate \
+  --aligned-extension-root tmp/index_v3_aligned_candidate_multiday_extension \
+  --physical-root tmp/index_v3_physical_candidate_1024 \
+  --leaf-root tmp/index_v3_physical_leaf_candidate \
+  --leaf-extension-root tmp/index_v3_physical_leaf_candidate_multiday_extension
+```
+
+The extension plans contain only days 21-26. Validation rejects any key shared
+with the existing fixture, any canonical key, and any leaf-plan Parquet object.
+
 ## Publish only after explicit review
 
 The publisher is checksum-aware, accepts only JSON under the exact isolated
@@ -66,6 +109,19 @@ node scripts/index_v3_physical_leaf_candidate/publish.mjs \
 
 Do not add `--replace-existing` unless the exact differing prototype objects
 have been reviewed.
+
+After reviewing the multiday extension, publish aligned dependencies first and
+leaf JSON second:
+
+```bash
+node scripts/index_v3_aligned_candidate/publish.mjs \
+  --plan tmp/index_v3_aligned_candidate_multiday_extension/publication-plan.json \
+  --confirm-test-prefix history/_prototype/observation-history/timeseries-aligned-v2
+
+node scripts/index_v3_physical_leaf_candidate/publish.mjs \
+  --plan tmp/index_v3_physical_leaf_candidate_multiday_extension/publication-plan.json \
+  --confirm-test-prefix history/_prototype/observation-history/timeseries-aligned-v2/candidate=physical-leaf-index-v1/cap_rows=1024
+```
 
 ## Deploy and tail only after explicit review and push
 
@@ -103,8 +159,26 @@ node scripts/index_v3_physical_leaf_candidate/measure.mjs \
   --repeat 1
 ```
 
-The runner contains only normal TS7421 24h and dense TS7421 1h. `--case <name>`
-is repeatable and accepts only those matrix names. Successful pairs must have
-the same `rows_sha256`; a mismatch fails the run. CPU stays null for
+With no `--case` and no `--leaf-only`, the runner retains the original normal
+24-hour and dense one-hour physical-1024 versus leaf A/B matrix. `--case
+<name>` is repeatable. Successful A/B pairs must have the same `rows_sha256`;
+a mismatch fails the run.
+
+The physical-1024 prototype was intentionally not extended beyond day 20.
+After publishing the aligned and leaf extension objects, measure consecutive
+leaf scaling without generating excluded coarse physical-index JSON:
+
+```bash
+node scripts/index_v3_physical_leaf_candidate/measure.mjs \
+  --physical-leaf-endpoint "${UK_AQ_V3_PHYSICAL_LEAF_CANDIDATE_URL}" \
+  --case sensorcommunity_normal_ts7421_24h \
+  --case sensorcommunity_normal_ts7421_48h \
+  --case sensorcommunity_normal_ts7421_72h \
+  --case sensorcommunity_normal_ts7421_7d \
+  --leaf-only \
+  --repeat 1
+```
+
+CPU stays null for
 correlation by diagnostic request ID or CF-Ray with Cloudflare invocation
 telemetry. Client wall time is recorded separately and is not Worker CPU.

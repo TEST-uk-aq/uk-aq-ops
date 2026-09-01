@@ -123,6 +123,15 @@ history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=<cap>/
 Historical prototype caps remain useful for reproducing calibration evidence,
 but 1,024 is the selected design for subsequent implementation work.
 
+The default staging profile and generator inputs above remain the original
+calibration fixture. The reviewed consecutive TS7421 extension uses
+`--profile sensorcommunity-normal-multiday-extension` to stage only
+2026-08-21 through 2026-08-26. The generator's repeatable
+`--partition ROLE=DIRECTORY` option selects only those staged directories and
+`--caps 1024` prevents regeneration of rejected calibration caps. Exact
+commands and overlay validation are in
+`scripts/index_v3_physical_leaf_candidate/README.md`.
+
 ## Publish after review
 
 The first command is idempotent and skips objects whose stored SHA-256 is
