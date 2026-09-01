@@ -10,6 +10,15 @@ import {
   assertTestCandidateEndpoint,
   buildObservationHistoryV3MeasurementMatrix,
 } from "../scripts/index_v3_migration/measure_observation_history_v3_candidate.mjs";
+import {
+  assertAlignedTestEndpoint,
+  buildAlignedV2MeasurementMatrix,
+  measureAlignedV2Attempt,
+} from "../scripts/index_v3_aligned_candidate/measure.mjs";
+import {
+  alignedV2TestR2Authority,
+  assertAlignedV2TestR2Identity,
+} from "../scripts/index_v3_aligned_candidate/test_r2_identity.mjs";
 
 const candidateSource = readFileSync(
   new URL(
@@ -114,5 +123,64 @@ test("v3 workload matrix is bounded, repeatable, and TEST-host restricted", () =
       "https://uk-aq-observs-history-r2-api-live-v3-candidate.account.workers.dev",
     ),
     /Refusing non-TEST endpoint/,
+  );
+});
+
+test("aligned-v2 measurement records a thrown request without inventing diagnostics", async () => {
+  const item = buildAlignedV2MeasurementMatrix()[0];
+  const result = await measureAlignedV2Attempt({
+    endpoint: assertAlignedTestEndpoint(
+      "https://uk-aq-observs-history-r2-api-v3-aligned-candidate.cic-test.workers.dev",
+    ),
+    secret: "secret",
+    item,
+    attempt: 2,
+    timeoutMs: 100,
+    fetchImpl: async () => {
+      throw new Error("fixture connection reset");
+    },
+  });
+
+  assert.equal(result.case, item.name);
+  assert.equal(result.aligned_row_cap, item.aligned_row_cap);
+  assert.equal(result.attempt, 2);
+  assert.deepEqual(result.request, {
+    connector_id: item.connector_id,
+    timeseries_id: item.timeseries_id,
+    pollutant: "pm25",
+    start_utc: item.start_utc,
+    end_utc: item.end_utc,
+  });
+  assert.equal(result.response.status, null);
+  assert.equal(result.response.error, "fixture connection reset");
+  assert.equal(result.physical, null);
+  assert.equal(result.cloudflare_cpu_time_ms, null);
+});
+
+test("aligned-v2 local R2 guard uses exact repository TEST authority", () => {
+  const authority = alignedV2TestR2Authority();
+  assert.deepEqual(
+    assertAlignedV2TestR2Identity({
+      UKAQ_ENV_NAME: "TEST",
+      CFLARE_R2_ENDPOINT: authority.endpoint,
+      CFLARE_R2_BUCKET: authority.bucket,
+    }),
+    authority,
+  );
+  assert.throws(
+    () => assertAlignedV2TestR2Identity({
+      UKAQ_ENV_NAME: "TEST",
+      CFLARE_R2_ENDPOINT: "https://live-account.r2.cloudflarestorage.com",
+      CFLARE_R2_BUCKET: authority.bucket,
+    }),
+    /endpoint does not match.*TEST authority/,
+  );
+  assert.throws(
+    () => assertAlignedV2TestR2Identity({
+      UKAQ_ENV_NAME: "TEST",
+      CFLARE_R2_ENDPOINT: authority.endpoint,
+      CFLARE_R2_BUCKET: "different-bucket",
+    }),
+    /bucket does not match.*TEST authority/,
   );
 });

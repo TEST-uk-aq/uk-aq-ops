@@ -12,6 +12,7 @@ import {
   buildR2ChecksumAwarePutIntent,
   putAndVerifyR2ObjectWithSha256,
 } from "../../workers/shared/uk_aq_r2_checksum_publication.mjs";
+import { assertAlignedV2TestR2Identity } from "./test_r2_identity.mjs";
 
 const PREFIX_PATTERN = /^history\/_prototype\/observation-history\/timeseries-aligned-v2(?:\/candidate=[a-z0-9][a-z0-9-]{0,31})?$/;
 
@@ -39,9 +40,7 @@ function r2Config(env) {
 
 async function main() {
   const options = parse(process.argv.slice(2));
-  if (String(process.env.UKAQ_ENV_NAME || "").trim().toUpperCase() !== "TEST") {
-    throw new Error("refusing publication unless UKAQ_ENV_NAME=TEST");
-  }
+  assertAlignedV2TestR2Identity(process.env);
   if (!options.plan) throw new Error("--plan is required");
   const planPath = path.resolve(options.plan);
   const root = path.dirname(planPath);

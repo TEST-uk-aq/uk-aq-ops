@@ -31,10 +31,6 @@ jobs:
           case "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" in
             *[!a-z0-9-]*|-*|*-|*-v3-aligned-candidate|*[Ll][Ii][Vv][Ee]*) echo "Base Worker name is invalid or not isolated from LIVE."; exit 1 ;;
           esac
-          case "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" in
-            *test*) ;;
-            *) echo "Base Worker name must explicitly contain test."; exit 1 ;;
-          esac
           test "${#UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" -le 42 || { echo "Base Worker name is too long for the aligned candidate suffix."; exit 1; }
           printf 'ALIGNED_CANDIDATE_WORKER_NAME=%s-v3-aligned-candidate\n' "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" >> "${GITHUB_ENV}"
           test -n "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" || { echo "Missing UK_AQ_EDGE_UPSTREAM_SECRET."; exit 1; }

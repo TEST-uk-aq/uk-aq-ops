@@ -69,12 +69,22 @@ function requestUrl(endpoint, item) {
   return url;
 }
 
+function requestShape(item) {
+  return {
+    connector_id: item.connector_id,
+    timeseries_id: item.timeseries_id,
+    pollutant: "pm25",
+    start_utc: item.start_utc,
+    end_utc: item.end_utc,
+  };
+}
+
 function compact(item, attempt, response, payload, elapsedMs) {
   const diag = payload?.coverage?.exact_reader_diagnostics || payload?.diagnostics || null;
   return {
     schema_version: 1, measured_at_utc: new Date().toISOString(), case: item.name,
     aligned_row_cap: item.aligned_row_cap, attempt,
-    request: { connector_id: item.connector_id, timeseries_id: item.timeseries_id, pollutant: "pm25", start_utc: item.start_utc, end_utc: item.end_utc },
+    request: requestShape(item),
     response: {
       status: response.status, ok: response.ok, returned_rows: payload?.row_count ?? null,
       response_complete: payload?.response_complete ?? null, error: payload?.error ?? null,
@@ -97,6 +107,46 @@ function compact(item, attempt, response, payload, elapsedMs) {
   };
 }
 
+function compactThrownRequest(item, attempt, error, elapsedMs) {
+  return {
+    schema_version: 1, measured_at_utc: new Date().toISOString(), case: item.name,
+    aligned_row_cap: item.aligned_row_cap, attempt,
+    request: requestShape(item),
+    response: {
+      status: null, ok: false, returned_rows: null, response_complete: null,
+      error: error instanceof Error ? error.message : String(error),
+      diagnostic_request_id: null, cf_ray: null,
+      client_wall_ms: Number(elapsedMs.toFixed(3)),
+    },
+    physical: null,
+    cloudflare_cpu_time_ms: null,
+    cloudflare_cpu_time_source: null,
+  };
+}
+
+export async function measureAlignedV2Attempt({
+  endpoint,
+  secret,
+  item,
+  attempt,
+  timeoutMs,
+  fetchImpl = globalThis.fetch,
+}) {
+  const started = performance.now();
+  try {
+    const response = await fetchImpl(requestUrl(endpoint, item), {
+      headers: { "x-uk-aq-upstream-auth": secret },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await response.text();
+    let payload = null;
+    try { payload = JSON.parse(text); } catch { /* platform errors may be text */ }
+    return compact(item, attempt, response, payload, performance.now() - started);
+  } catch (error) {
+    return compactThrownRequest(item, attempt, error, performance.now() - started);
+  }
+}
+
 async function main() {
   const options = parse(process.argv.slice(2));
   const matrix = buildAlignedV2MeasurementMatrix();
@@ -115,18 +165,17 @@ async function main() {
   for (const item of matrix) {
     for (let attempt = 1; attempt <= options.repeat; attempt += 1) {
       sequence += 1;
-      const started = performance.now();
-      const response = await fetch(requestUrl(endpoint, item), {
-        headers: { "x-uk-aq-upstream-auth": secret }, signal: AbortSignal.timeout(options.timeoutMs),
+      const result = await measureAlignedV2Attempt({
+        endpoint,
+        secret,
+        item,
+        attempt,
+        timeoutMs: options.timeoutMs,
       });
-      const text = await response.text();
-      let payload = null;
-      try { payload = JSON.parse(text); } catch { /* platform errors may be text */ }
-      const result = compact(item, attempt, response, payload, performance.now() - started);
       const name = `${String(sequence).padStart(3, "0")}_${item.name}_cap${item.aligned_row_cap}_attempt${attempt}.json`;
       fs.writeFileSync(path.join(directory, name), `${JSON.stringify(result, null, 2)}\n`, { flag: "wx" });
       fs.appendFileSync(path.join(directory, "results.jsonl"), `${JSON.stringify(result)}\n`);
-      process.stdout.write(`${JSON.stringify({ case: item.name, cap: item.aligned_row_cap, attempt, status: response.status, rows: result.response.returned_rows, request_id: result.response.diagnostic_request_id })}\n`);
+      process.stdout.write(`${JSON.stringify({ case: item.name, cap: item.aligned_row_cap, attempt, status: result.response.status, rows: result.response.returned_rows, request_id: result.response.diagnostic_request_id, error: result.response.error })}\n`);
     }
   }
   process.stdout.write(`results=${directory}\n`);

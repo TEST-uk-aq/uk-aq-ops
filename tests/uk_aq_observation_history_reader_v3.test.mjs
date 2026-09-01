@@ -391,6 +391,27 @@ test("v3 footer cache is content-identity scoped and still re-verifies file iden
     observationHistoryV3FooterCacheKey(file),
     observationHistoryV3FooterCacheKey({ ...file, sha256: "a".repeat(64) }),
   );
+
+  const changedFooterProfile = {
+    history_schema_version: file.history_schema_version,
+    writer_version: file.writer_version,
+    physical_layout_version: file.physical_layout_version,
+    parquet_footer_identity: "created_by",
+    parquet_created_by: "different-created-by-policy",
+  };
+  assert.notEqual(
+    observationHistoryV3FooterCacheKey(file),
+    observationHistoryV3FooterCacheKey(file, changedFooterProfile),
+  );
+  await assert.rejects(
+    query(fixture.source, { footerCache, physicalIdentity: changedFooterProfile }),
+    (error) => {
+      assert.match(error.message, /footer writer identity mismatch/);
+      assert.equal(error.diagnostics.footer_cache_hits, 0);
+      assert.equal(error.diagnostics.footer_cache_misses, 1);
+      return true;
+    },
+  );
 });
 
 test("v3 R2 adapter pins HEAD SHA-256 and conditionally ranges the same ETag", async () => {

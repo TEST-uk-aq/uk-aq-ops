@@ -717,7 +717,11 @@ export class ObservationHistoryV3ReadError extends Error {
   }
 }
 
-export function observationHistoryV3FooterCacheKey(file) {
+export function observationHistoryV3FooterCacheKey(
+  file,
+  physicalIdentity = DEFAULT_PHYSICAL_IDENTITY,
+) {
+  const identity = normalizePhysicalIdentity(physicalIdentity);
   return [
     OBSERVATION_HISTORY_V3_FOOTER_CACHE_GENERATION,
     normalizeSha256(file?.sha256, "file.sha256"),
@@ -725,6 +729,8 @@ export function observationHistoryV3FooterCacheKey(file) {
     Number(file?.history_schema_version),
     String(file?.writer_version || ""),
     String(file?.physical_layout_version || ""),
+    identity.parquet_footer_identity,
+    identity.parquet_created_by || "",
   ].join(":");
 }
 
@@ -818,7 +824,7 @@ async function acquireFooter({
   diagnostics,
   physicalIdentity,
 }) {
-  const cacheKey = observationHistoryV3FooterCacheKey(file);
+  const cacheKey = observationHistoryV3FooterCacheKey(file, physicalIdentity);
   const cached = footerCache.get(cacheKey);
   if (cached) {
     diagnostics.footer_cache_hits += 1;

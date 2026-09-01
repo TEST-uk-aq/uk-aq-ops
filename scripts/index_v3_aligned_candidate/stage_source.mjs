@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { hasRequiredR2Config, r2GetObject } from "../../workers/shared/r2_sigv4.mjs";
+import { assertAlignedV2TestR2Identity } from "./test_r2_identity.mjs";
 
 const PARTITIONS = [
   { directory: "aurn_2026-08-20_pm25", day: "2026-08-20", connector: 1, pollutant: "pm25" },
@@ -32,9 +33,7 @@ function sha256(body) {
 }
 
 async function main() {
-  if (String(process.env.UKAQ_ENV_NAME || "").trim().toUpperCase() !== "TEST") {
-    throw new Error("refusing source staging unless UKAQ_ENV_NAME=TEST");
-  }
+  assertAlignedV2TestR2Identity(process.env);
   const options = parse(process.argv.slice(2));
   if (options.output === path.parse(options.output).root || options.output.split(path.sep).length < 4) {
     throw new Error("refusing broad local staging target");
