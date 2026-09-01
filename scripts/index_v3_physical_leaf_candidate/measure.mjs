@@ -121,6 +121,7 @@ function physicalDiagnostics(diagnostics) {
   return {
     logical_requested_start_utc: diagnostics.logical_requested_start_utc ?? null,
     logical_requested_end_utc: diagnostics.logical_requested_end_utc ?? null,
+    physical_page_path: diagnostics.physical_page_path ?? null,
     physical_page_number: diagnostics.physical_page_number ?? null,
     continuation_cursor_supplied: diagnostics.continuation_cursor_supplied ?? null,
     candidate_intersecting_segments: diagnostics.candidate_intersecting_segments ?? null,
@@ -133,6 +134,9 @@ function physicalDiagnostics(diagnostics) {
     returned_rows: diagnostics.returned_rows,
     pagination_complete: diagnostics.pagination_complete ?? null,
     continuation_returned: diagnostics.continuation_returned ?? null,
+    scoped_manifests_read: diagnostics.scoped_manifests_read ?? null,
+    whole_logical_range_segment_discovery: diagnostics.whole_logical_range_segment_discovery ?? null,
+    global_segment_sorting: diagnostics.global_segment_sorting ?? null,
     index_objects_read: diagnostics.index_objects_read,
     index_bytes_read: diagnostics.index_bytes_read,
     timeseries_leaf_objects_read: diagnostics.timeseries_leaf_objects_read ?? 0,
@@ -169,6 +173,13 @@ function pageEvidence({ response, payload, text, pageNumber }) {
     response_complete: payload?.response_complete ?? null,
     has_gap: payload?.has_gap ?? null,
     partial_reasons: payload?.partial_reasons ?? null,
+    physical_page_path: diagnostics?.physical_page_path ?? payload?.physical_page?.physical_page_path ?? null,
+    manifest_objects_read: diagnostics?.scoped_manifests_read ?? null,
+    leaf_objects_read: diagnostics?.timeseries_leaf_objects_read ?? null,
+    index_bytes_read: diagnostics?.index_bytes_read ?? null,
+    whole_range_discovery: diagnostics?.whole_logical_range_segment_discovery ?? null,
+    global_segment_sort: diagnostics?.global_segment_sorting ?? null,
+    physical_rows: diagnostics?.physical_rows_decoded ?? null,
     physical_page: payload?.physical_page ?? null,
     rows,
     rows_sha256: rows ? rowsSha256(rows) : null,
@@ -191,8 +202,12 @@ function assertLeafPage(page, expectedPageNumber) {
   const physicalPage = page.physical_page;
   const physical = page.physical;
   if (
-    physicalPage?.schema_version !== 1 ||
+    physicalPage?.schema_version !== 2 ||
     physicalPage?.page_number !== expectedPageNumber ||
+    physicalPage?.physical_page_path !== (expectedPageNumber === 1
+      ? "initial_discovery"
+      : "direct_leaf_continuation") ||
+    physical?.physical_page_path !== physicalPage.physical_page_path ||
     !Number.isSafeInteger(physicalPage?.candidate_intersecting_segments) ||
     ![0, 1].includes(physicalPage?.segments_decoded) ||
     !Number.isSafeInteger(physicalPage?.physical_rows_decoded) ||
@@ -205,6 +220,16 @@ function assertLeafPage(page, expectedPageNumber) {
     physical?.parquet_footer_parsed !== false ||
     physical?.timeseries_id_decoded !== false
   ) throw new Error(`leaf page ${expectedPageNumber} violates the one-segment physical contract`);
+  if (
+    expectedPageNumber === 1
+      ? physical?.whole_logical_range_segment_discovery !== true ||
+        physical?.global_segment_sorting !== true ||
+        physical?.scoped_manifests_read !== 1
+      : physical?.whole_logical_range_segment_discovery !== false ||
+        physical?.global_segment_sorting !== false ||
+        physical?.scoped_manifests_read !== 0 ||
+        physical?.timeseries_leaf_objects_read !== 1
+  ) throw new Error(`leaf page ${expectedPageNumber} did not use the expected discovery path`);
   if (physicalPage.pagination_complete) {
     if (physicalPage.next_cursor !== null) throw new Error(`leaf page ${expectedPageNumber} returned a terminal cursor`);
   } else if (
@@ -302,6 +327,14 @@ async function attemptPhysicalLeaf({ base, item, number, secret, timeoutMs }) {
         rows_per_page: pages.map((page) => page.returned_rows),
         physical_segments_decoded_per_page: pages.map((page) => page.physical_page.segments_decoded),
         physical_rows_decoded_per_page: pages.map((page) => page.physical_page.physical_rows_decoded),
+        physical_page_path_per_page: pages.map((page) => page.physical_page_path),
+        manifest_objects_read_per_page: pages.map((page) => page.manifest_objects_read),
+        leaf_objects_read_per_page: pages.map((page) => page.leaf_objects_read),
+        index_bytes_read_per_page: pages.map((page) => page.index_bytes_read),
+        whole_range_discovery_per_page: pages.map((page) => page.whole_range_discovery),
+        global_segment_sort_per_page: pages.map((page) => page.global_segment_sort),
+        diagnostic_request_ids_per_page: pages.map((page) => page.diagnostic_request_id),
+        cf_rays_per_page: pages.map((page) => page.cf_ray),
         pages,
         error: null,
       },
@@ -327,6 +360,14 @@ async function attemptPhysicalLeaf({ base, item, number, secret, timeoutMs }) {
         rows_per_page: pages.map((page) => page.returned_rows),
         physical_segments_decoded_per_page: pages.map((page) => page.physical_page.segments_decoded),
         physical_rows_decoded_per_page: pages.map((page) => page.physical_page.physical_rows_decoded),
+        physical_page_path_per_page: pages.map((page) => page.physical_page_path),
+        manifest_objects_read_per_page: pages.map((page) => page.manifest_objects_read),
+        leaf_objects_read_per_page: pages.map((page) => page.leaf_objects_read),
+        index_bytes_read_per_page: pages.map((page) => page.index_bytes_read),
+        whole_range_discovery_per_page: pages.map((page) => page.whole_range_discovery),
+        global_segment_sort_per_page: pages.map((page) => page.global_segment_sort),
+        diagnostic_request_ids_per_page: pages.map((page) => page.diagnostic_request_id),
+        cf_rays_per_page: pages.map((page) => page.cf_ray),
         pages,
         error: error instanceof Error ? error.message : String(error),
       },
@@ -352,6 +393,10 @@ async function main() {
         max_segments_per_leaf_invocation: 1,
         max_physical_rows_per_leaf_invocation: 1024,
         client_follows_physical_cursor: true,
+        cursor_schema_version: 2,
+        first_page_path: "initial_discovery",
+        same_leaf_continuation_path: "direct_leaf_continuation",
+        same_leaf_continuation_manifest_objects: 0,
         fixture_expected_pages_are_evidence_not_runtime_configuration: true,
       },
     }, null, 2)}\n`);

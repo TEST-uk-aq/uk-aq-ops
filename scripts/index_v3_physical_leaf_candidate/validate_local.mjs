@@ -280,7 +280,18 @@ async function walkLeafPages({ source, item }) {
       index: physicalLeafCandidateReaderIndex(LEAF_INDEX_ROOT),
     });
     const physical = page.physical_page;
+    const expectedPath = item.expected_page_paths?.[pageNumber - 1] ||
+      (pageNumber === 1 ? "initial_discovery" : "direct_leaf_continuation");
+    const expectedManifestObjects = pageNumber === 1
+      ? (item.expected_initial_manifest_objects ?? 1)
+      : 0;
+    const expectedLeafObjects = pageNumber === 1
+      ? (item.expected_initial_leaf_objects ?? 1)
+      : 1;
+    assert.equal(physical.schema_version, 2);
     assert.equal(physical.page_number, pageNumber);
+    assert.equal(physical.physical_page_path, expectedPath);
+    assert.equal(page.diagnostics.physical_page_path, expectedPath);
     assert.equal(physical.continuation_cursor_supplied, pageNumber > 1);
     assert.ok(physical.candidate_intersecting_segments >= physical.segments_decoded);
     assert.ok(physical.segments_decoded === 0 || physical.segments_decoded === 1);
@@ -304,6 +315,11 @@ async function walkLeafPages({ source, item }) {
     assert.equal(page.diagnostics.parquet_footer_parsed, false);
     assert.equal(page.diagnostics.timeseries_id_decoded, false);
     assert.equal(page.diagnostics.coarse_child_shards_read, 0);
+    assert.equal(page.diagnostics.scoped_manifests_read, expectedManifestObjects);
+    assert.equal(page.diagnostics.index_objects_read, expectedManifestObjects + expectedLeafObjects);
+    assert.equal(page.diagnostics.timeseries_leaf_objects_read, expectedLeafObjects);
+    assert.equal(page.diagnostics.whole_logical_range_segment_discovery, pageNumber === 1);
+    assert.equal(page.diagnostics.global_segment_sorting, pageNumber === 1);
     rows.push(...page.rows);
     pages.push(page);
     if (physical.pagination_complete) {
@@ -318,6 +334,7 @@ async function walkLeafPages({ source, item }) {
     assert.deepEqual(page.partial_reasons, [OBSERVATION_HISTORY_EXACT_LEAF_PAGINATION_REASON]);
     assert.equal(typeof physical.next_cursor, "string");
     assert.ok(physical.next_cursor.length > 0);
+    assert.equal(encodeCursor(decodeCursor(physical.next_cursor)), physical.next_cursor);
     assert.equal(cursors.has(physical.next_cursor), false);
     cursors.add(physical.next_cursor);
     physicalCursor = physical.next_cursor;
@@ -456,7 +473,6 @@ async function main() {
       item.expected_physical_rows,
     );
     assert.equal(leaf.pages.every((page) => page.physical_page.segments_decoded === 1), true);
-    assert.equal(leaf.pages.every((page) => page.diagnostics.index_objects_read === 2), true);
     assert.equal(leaf.pages.every((page) => page.diagnostics.timeseries_leaf_objects_read === 1), true);
 
     const physicalRows = comparable(physical.rows);
@@ -479,6 +495,10 @@ async function main() {
       rows_per_page: leaf.pages.map((page) => page.rows.length),
       physical_segments_decoded_per_page: leaf.pages.map((page) => page.physical_page.segments_decoded),
       physical_rows_decoded_per_page: leaf.pages.map((page) => page.physical_page.physical_rows_decoded),
+      physical_page_path_per_page: leaf.pages.map((page) => page.diagnostics.physical_page_path),
+      scoped_manifests_read_per_page: leaf.pages.map((page) => page.diagnostics.scoped_manifests_read),
+      whole_logical_range_segment_discovery_per_page: leaf.pages.map((page) => page.diagnostics.whole_logical_range_segment_discovery),
+      global_segment_sorting_per_page: leaf.pages.map((page) => page.diagnostics.global_segment_sorting),
       maximum_physical_segments_in_one_invocation: Math.max(...leaf.pages.map((page) => page.physical_page.segments_decoded)),
       maximum_physical_rows_in_one_invocation: Math.max(...leaf.pages.map((page) => page.physical_page.physical_rows_decoded)),
       physical_index_objects_read: physical.diagnostics.index_objects_read,
@@ -494,6 +514,12 @@ async function main() {
   }
 
   assert.equal(typeof denseFirstCursor, "string");
+  const denseCursorV2 = decodeCursor(denseFirstCursor);
+  assert.equal(denseCursorV2.schema_version, 2);
+  assert.equal(denseCursorV2.kind, "uk_aq_observation_history_exact_leaf_physical_cursor");
+  assert.equal(denseCursorV2.discovery.scopes.length, 1);
+  assert.equal(denseCursorV2.discovery.total_intersecting_segments, 13);
+  assert.equal(encodeCursor(denseCursorV2), denseFirstCursor);
   const denseRequest = {
     source,
     timeseriesId: 7421,
@@ -526,6 +552,39 @@ async function main() {
     physicalCursor: denseFirstCursor,
   }));
 
+  let outsideRootIndexReads = 0;
+  const outsideRootSource = Object.freeze({
+    getIndexObject(request) {
+      outsideRootIndexReads += 1;
+      return source.getIndexObject(request);
+    },
+    openParquetFile: (request) => source.openParquetFile(request),
+  });
+  const contradictoryCoveragePayload = decodeCursor(denseFirstCursor);
+  contradictoryCoveragePayload.discovery.coverage_complete = false;
+  await assertCursorRejected(() => readObservationHistoryExactLeafPageV3({
+    ...denseRequest,
+    source: outsideRootSource,
+    physicalCursor: encodeCursor(contradictoryCoveragePayload),
+  }));
+  const outsideLeafPayload = decodeCursor(denseFirstCursor);
+  const outsideLeafKey = "history/v2/observations/not-authoritative.json";
+  outsideLeafPayload.next.leaf_key = outsideLeafKey;
+  outsideLeafPayload.discovery.scopes[0].leaf_descriptor.key = outsideLeafKey;
+  await assertCursorRejected(() => readObservationHistoryExactLeafPageV3({
+    ...denseRequest,
+    source: outsideRootSource,
+    physicalCursor: encodeCursor(outsideLeafPayload),
+  }));
+  const outsideDataPayload = decodeCursor(denseFirstCursor);
+  outsideDataPayload.next.file_key = "history/v2/observations/not-authoritative.parquet";
+  await assertCursorRejected(() => readObservationHistoryExactLeafPageV3({
+    ...denseRequest,
+    source: outsideRootSource,
+    physicalCursor: encodeCursor(outsideDataPayload),
+  }));
+  assert.equal(outsideRootIndexReads, 0);
+
   let staleCursorParquetOpens = 0;
   const staleCursorSource = Object.freeze({
     getIndexObject: (request) => source.getIndexObject(request),
@@ -534,6 +593,14 @@ async function main() {
       return source.openParquetFile(request);
     },
   });
+  const staleLeafPayload = decodeCursor(denseFirstCursor);
+  staleLeafPayload.next.leaf_sha256 = "0".repeat(64);
+  staleLeafPayload.discovery.scopes[0].leaf_descriptor.sha256 = "0".repeat(64);
+  await assertCursorRejected(() => readObservationHistoryExactLeafPageV3({
+    ...denseRequest,
+    source: staleCursorSource,
+    physicalCursor: encodeCursor(staleLeafPayload),
+  }));
   const staleCursorPayload = decodeCursor(denseFirstCursor);
   staleCursorPayload.next.file_sha256 = "0".repeat(64);
   await assertCursorRejected(() => readObservationHistoryExactLeafPageV3({
@@ -542,6 +609,36 @@ async function main() {
     physicalCursor: encodeCursor(staleCursorPayload),
   }));
   assert.equal(staleCursorParquetOpens, 0);
+
+  let crossUtcResult = null;
+  if (roots.alignedExtensionRoot) {
+    const crossUtc = await walkLeafPages({
+      source,
+      item: {
+        connector_id: 7,
+        timeseries_id: 7421,
+        start_utc: "2026-08-20T12:00:00.000Z",
+        end_utc: "2026-08-21T12:00:00.000Z",
+        expected_page_paths: ["initial_discovery", "cross_scope_continuation"],
+        expected_initial_manifest_objects: 2,
+        expected_initial_leaf_objects: 2,
+      },
+    });
+    assert.equal(crossUtc.pages.length, 2);
+    assert.equal(crossUtc.pages[1].diagnostics.scoped_manifests_read, 0);
+    assert.equal(crossUtc.pages[1].diagnostics.timeseries_leaf_objects_read, 1);
+    assert.equal(crossUtc.rows.every(
+      (row, index) => index === 0 || row.observed_at_utc >= crossUtc.rows[index - 1].observed_at_utc,
+    ), true);
+    crossUtcResult = {
+      page_count: crossUtc.pages.length,
+      returned_rows: crossUtc.rows.length,
+      rows_sha256: crossUtc.rows_sha256,
+      cursor_v2_base64url_characters: crossUtc.pages[0].physical_page.next_cursor.length,
+      physical_page_paths: crossUtc.pages.map((page) => page.diagnostics.physical_page_path),
+      scoped_manifests_read_per_page: crossUtc.pages.map((page) => page.diagnostics.scoped_manifests_read),
+    };
+  }
 
   const exactly24hAcrossMidnight = parseObservationRequest(new URL(
     "https://candidate.invalid/v1/observations?timeseries_id=7421&connector_id=7&pollutant=pm25&start_utc=2026-08-20T12%3A00%3A00.000Z&end_utc=2026-08-21T12%3A00%3A00.000Z",
@@ -599,7 +696,12 @@ async function main() {
       malformed_rejected: true,
       cross_request_replay_rejected: true,
       stale_index_identity_rejected: true,
+      stale_leaf_identity_rejected_before_parquet_open: true,
       stale_physical_coordinate_rejected_before_parquet_open: true,
+      cursor_v2_round_trip: true,
+      dense_cursor_v2_base64url_characters: denseFirstCursor.length,
+      contradictory_carried_coverage_rejected_before_index_read: true,
+      deterministic_leaf_and_data_roots_enforced_before_index_read: true,
     },
     request_validation: {
       exact_24h_cross_utc_midnight_accepted: true,
@@ -608,6 +710,7 @@ async function main() {
       limit_rejected: true,
     },
     results,
+    cross_utc_result: crossUtcResult,
   }, null, 2)}\n`);
 }
 

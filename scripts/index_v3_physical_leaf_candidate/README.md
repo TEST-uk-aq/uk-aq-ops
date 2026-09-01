@@ -45,10 +45,36 @@ When more intersecting segments remain, the response includes:
 ```
 
 `has_gap` is reserved for genuine coverage loss. A final page is complete only
-when physical pagination and index coverage are both complete. The opaque
-cursor is bound to the logical request, index/layout/writer identity, and the
-next manifest/leaf/file/row-group physical coordinates. Malformed,
-cross-request, stale-index, or stale-coordinate cursors fail closed.
+when physical pagination and index coverage are both complete.
+
+The first page owns complete bounded discovery for the one or two UTC scopes
+touched by the request. It validates each scoped manifest and selected exact
+leaf, establishes coverage/gap state, finds the complete intersecting segment
+count, and returns cursor schema v2 when another segment remains. Cursor v2
+carries only bounded discovery state: one state/leaf descriptor/segment count
+and first relevant coordinate per UTC scope, plus the exact next segment. It
+never carries an unbounded remaining-segment list.
+
+A continuation validates the cursor request/index/layout/profile identity and
+the deterministic day/timeseries leaf key before any index read. It reads the
+pinned current leaf directly, verifies its bytes against the carried size and
+SHA-256, completely validates that leaf, and validates the selected and next
+coordinates. Ordinary same-leaf continuations read zero scoped manifests and
+do not reconstruct or globally sort the whole logical-range segment list.
+Cross-scope continuation uses the first segment pinned during initial
+discovery, then directly verifies the second scope's deterministic leaf before
+decoding. It still decodes only one segment.
+
+Malformed, cross-request, stale-index, stale-leaf, stale-coordinate, or
+out-of-root cursors fail closed. The decode profile is the exact shared
+`hyparquet-direct-column-v1` production constant selected by wrapper
+configuration; no cursor-supplied decoder metadata is trusted.
+Cursor v2 is not signed: the leaf route already requires the established
+upstream-auth secret, and signing would not remove the need to validate every
+object-routing field. The cursor is still parsed as untrusted input; its
+coverage fields must be internally derivable from its bounded scope states,
+and any leaf/file key that can direct I/O must match deterministic configured
+roots before the first read.
 
 `since_utc` and `limit` are rejected by this low-level endpoint. They do not
 compete with `physical_cursor`; higher-level range and limiting semantics must
@@ -88,7 +114,10 @@ compares the assembled rows and SHA-256 with the existing physical-index-1024
 reader. The page counts are fixture assertions, not runtime configuration.
 It also proves cursor replay/staleness rejection, a missing required leaf as a
 genuine gap, the 24-hour boundary, and the explicit `since_utc`/`limit`
-rejections.
+rejections. With the optional multiday extension fixtures it also proves a
+two-page request crossing UTC midnight follows
+`initial_discovery -> cross_scope_continuation`, with zero manifest reads on
+the second page.
 
 ## Prototype publication (only after separate authorization)
 
@@ -142,11 +171,14 @@ npx --yes node@20.20.2 \
 ```
 
 The measurement client follows `physical_page.next_cursor` to completion,
-records every page's diagnostic request ID and CF-Ray, and fails if assembled
-rows differ from the physical-1024 response. It never reports client wall time
-as Worker CPU. CPU evidence must be correlated per invocation from Cloudflare
-tail or Workers Analytics telemetry. There is no CPU-reactive adaptive limiter;
-telemetry can only support a later manual reconsideration of the fixed cap.
+records every page's path, manifest/leaf object counts, index bytes, discovery
+and sorting flags, physical/returned rows, diagnostic request ID, and CF-Ray,
+and fails if assembled rows differ from the physical-1024 response. It never
+reports client wall time as Worker CPU. CPU evidence must be correlated per
+invocation from Cloudflare tail or Workers Analytics telemetry. There is no
+CPU-reactive adaptive limiter; telemetry can only support a later manual
+reconsideration of the fixed cap. The cap remains 1,024 rows and one physical
+segment per Worker invocation.
 
 ## Canonical integration handover
 

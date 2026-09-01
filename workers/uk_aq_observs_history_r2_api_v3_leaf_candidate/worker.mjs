@@ -19,7 +19,7 @@ const ALIGNED_INDEX_PREFIX =
   "history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=1024/observations_timeseries";
 const ALIGNED_DATA_PREFIX =
   "history/_prototype/observation-history/timeseries-aligned-v2/cap_rows=1024/observations";
-const RESPONSE_CACHE_GENERATION = "physical-leaf-index-v1-1024-page-2";
+const RESPONSE_CACHE_GENERATION = "physical-leaf-index-v1-1024-page-3-direct-continuation";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const DEFAULT_MUTABLE_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
@@ -125,6 +125,7 @@ export function physicalLeafCandidateReaderIndex(indexRoot) {
     writerVersion: WRITER_VERSION,
     physicalLayoutVersion: PHYSICAL_LAYOUT_VERSION,
     alignedRowCap: ALIGNED_ROW_CAP,
+    decodeProfileId: "hyparquet-direct-column-v1",
     manifestKind: "observation_timeseries_physical_leaf_scoped_manifest",
     leafKind: "observation_timeseries_physical_leaf",
     additionalCommonFields: Object.freeze({
@@ -272,10 +273,15 @@ async function handleObservations(params, env, diagnosticContext) {
     rows_returned: rows.length,
     physical_leaf_candidate_version: CANDIDATE_VERSION,
     physical_page_number: result.physical_page.page_number,
+    physical_page_path: result.physical_page.physical_page_path,
     physical_segments_decoded: result.physical_page.segments_decoded,
     physical_rows_decoded: result.physical_page.physical_rows_decoded,
     pagination_complete: result.physical_page.pagination_complete,
     continuation_returned: Boolean(result.physical_page.next_cursor),
+    scoped_manifests_read: result.diagnostics.scoped_manifests_read,
+    timeseries_leaf_objects_read: result.diagnostics.timeseries_leaf_objects_read,
+    whole_logical_range_segment_discovery: result.diagnostics.whole_logical_range_segment_discovery,
+    global_segment_sorting: result.diagnostics.global_segment_sorting,
   });
   if (diagnosticRequest) console.info(JSON.stringify({
     event: "observation_history_v3_physical_leaf_candidate_workload_diagnostic_complete",
