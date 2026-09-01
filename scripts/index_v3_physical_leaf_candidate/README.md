@@ -249,12 +249,20 @@ segment per Worker invocation.
 full structural diagnostic response is required. The physical-1024 comparison
 Worker continues to use its existing `workload_v1` mode.
 
-## Canonical integration handover
+## Station-history integration and system-doc handover
+
+The TEST station-history implementation now composes arbitrary required R2
+ranges internally from UTC-aligned logical pieces of at most 24 hours and
+follows the private `physical_cursor` within a fixed 16-page invocation
+budget. The browser-facing station-history routes do not expose a continuation
+protocol. This repository change does not itself deploy or retarget either
+canonical Worker.
 
 The active system contract still describes the earlier
-`timeseries-bounded-v1`/footer-derived reader. Before station-history adopts
-this shared mechanism, Chat-mode documentation work must reconcile the active
-contract with `timeseries-aligned-v2`, exact stored ranges, physical paging,
-and the higher-level cursor walk. Arbitrary user date ranges will later be
-composed from these bounded reads by station-history/chart orchestration. This
-experiment does not edit that contract or switch either canonical Worker.
+`timeseries-bounded-v1`/footer-derived reader. Chat-mode documentation work
+must reconcile that contract with `timeseries-aligned-v2`, exact stored
+ranges, one-segment physical paging, the private bounded station-history walk,
+and the budget-exceeded partial reason. The shelved higher-level encrypted
+station-history continuation is retained under
+`archive/2026-09-02/index_v3_station_history_continuation/` for historical
+reference only.

@@ -3,12 +3,7 @@ import {
   helperRowsToNormalizedAqiV1Rows,
   pivotNarrowRowsToHelperRows,
 } from "../../../lib/aqi/aqi_levels.mjs";
-import {
-  createStationHistoryV3PageBudget,
-  readR2Observations,
-  STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
-  usesV3PhysicalObservationPages,
-} from "./r2_observations.mjs";
+import { readR2Observations } from "./r2_observations.mjs";
 import { publicContinuity, selectContinuitySegments } from "./continuity.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -164,32 +159,10 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const selection = selectContinuitySegments(continuity, requiredStartMs, requiredEndExclusiveMs);
   const visibleSelection = selectContinuitySegments(continuity, outputStartMs, requiredEndExclusiveMs);
   if (!selection.segments.length) throw new Error("station_history_continuity_member_missing");
-  let reads;
-  if (usesV3PhysicalObservationPages(env)) {
-    const pageBudget = createStationHistoryV3PageBudget();
-    reads = [];
-    for (const segment of selection.segments) {
-      const result = await readR2Observations({
-        env,
-        identity: identityForSegment(segment),
-        startMs: segment.startMs,
-        endMs: segment.endMs,
-        pageBudget,
-      });
-      reads.push({ segment, result });
-      if (result.partial_reasons.includes(STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON)) break;
-    }
-  } else {
-    reads = await Promise.all(selection.segments.map(async (segment) => ({
-      segment,
-      result: await readR2Observations({
-        env,
-        identity: identityForSegment(segment),
-        startMs: segment.startMs,
-        endMs: segment.endMs,
-      }),
-    })));
-  }
+  const reads = await Promise.all(selection.segments.map(async (segment) => ({
+    segment,
+    result: await readR2Observations({ env, identity: identityForSegment(segment), startMs: segment.startMs, endMs: segment.endMs }),
+  })));
   const r2Rows = reads.flatMap((entry) => entry.result.rows);
   const rows = mergePhysicalObservations(r2Rows, ingestRows, continuity);
   const visibleRows = rows.filter((row) => {
@@ -213,22 +186,17 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const aqiGaps = request.includeAqi
     ? [...visibleSelection.gaps, ...missingRanges(expected, aqiPresent)]
     : [];
-  const r2PartialReasons = [...new Set(reads.flatMap((entry) => entry.result.partial_reasons))];
-  const pageBudgetExceeded = r2PartialReasons.includes(STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON);
-  const r2Complete = reads.length === selection.segments.length
-    && reads.every((entry) => entry.result.response_complete === true);
-  const sourceComplete = !pageBudgetExceeded && (r2Complete || ingestComplete === true);
+  const r2Complete = reads.every((entry) => entry.result.response_complete === true);
+  const sourceComplete = r2Complete || ingestComplete === true;
   const observationsComplete = includeObservations && sourceComplete && observationGaps.length === 0;
   const aqiStatusesComplete = !request.includeAqi || aqiRows.every((row) => row.daqi_calculation_status === "ok" && row.eaqi_calculation_status === "ok");
   const aqiContextComplete = selection.gaps.length === 0;
   const aqiComplete = request.includeAqi && sourceComplete && aqiContextComplete && aqiGaps.length === 0 && aqiStatusesComplete;
   const observationPartialReasons = observationsComplete ? [] : Array.from(new Set([
-    ...r2PartialReasons,
     ...(sourceComplete ? [] : ["required_observation_source_incomplete"]),
     ...(observationGaps.length ? ["missing_visible_observation_hours"] : []),
   ]));
   const aqiPartialReasons = aqiComplete ? [] : Array.from(new Set([
-    ...r2PartialReasons,
     ...(sourceComplete ? [] : ["required_observation_source_incomplete"]),
     ...(aqiContextComplete ? [] : ["required_aqi_context_incomplete"]),
     ...(aqiGaps.length ? ["missing_visible_aqi_hours"] : []),
@@ -284,7 +252,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
     source: {
       mode: "continuity_calculated_observations",
       ingest_fetch_count: ingestFetchCount,
-      r2_observation_fetch_count: reads.reduce((sum, entry) => sum + entry.result.fetch_count, 0),
+      r2_observation_fetch_count: reads.length,
       required_context_start_utc: new Date(requiredStartMs).toISOString(),
       output_start_utc: new Date(outputStartMs).toISOString(),
       output_end_utc: new Date(outputEndMs).toISOString(),

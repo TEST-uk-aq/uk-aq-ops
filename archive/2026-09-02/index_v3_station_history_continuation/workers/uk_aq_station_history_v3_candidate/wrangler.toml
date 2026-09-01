@@ -1,0 +1,21 @@
+# The deployment workflow supplies --name after deriving the candidate identity
+# from UK_AQ_STATION_HISTORY_WORKER_NAME.
+main = "entry.mjs"
+compatibility_date = "2026-08-21"
+workers_dev = true
+preview_urls = false
+
+[vars]
+UKAQ_ENV_NAME = "TEST"
+UK_AQ_R2_HISTORY_INDEX_VERSION = "v3"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+
+# No routes or custom domains. Phase 6 will atomically retarget the existing
+# cache-proxy STATION_HISTORY Service Binding after migration verification.

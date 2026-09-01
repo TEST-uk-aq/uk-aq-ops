@@ -32,12 +32,7 @@ import {
   readDirectIngestObservations,
   StationHistoryIngestError,
 } from "./ingest_observations.mjs";
-import {
-  buildR2ObservationRequestUrl,
-  mergeObservationRowsPreferR2,
-  readR2Observations,
-  usesV3PhysicalObservationPages,
-} from "./r2_observations.mjs";
+import { buildR2ObservationRequestUrl, mergeObservationRowsPreferR2, readR2Observations } from "./r2_observations.mjs";
 import { resolveStationHistoryPolicy } from "./policy.mjs";
 import { buildCalculatedHistory } from "./calculated_history.mjs";
 import { publicContinuity, resolveTimeseriesBinding, selectContinuitySegments } from "./continuity.mjs";
@@ -513,7 +508,7 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
       r2_aqi_response_complete: r2Payload ? r2ResponseComplete(r2Payload) : null,
       r2_observations_response_complete: r2Observations.response_complete,
       used_recent_r2_aqi: Boolean(request.includeAqi), used_r2_observations: true,
-      r2_aqi_fetch_count: request.includeAqi ? 1 : 0, r2_observation_fetch_count: r2Observations.fetch_count,
+      r2_aqi_fetch_count: request.includeAqi ? 1 : 0, r2_observation_fetch_count: 1,
       r2_aqi_row_count: r2AqiRows.length, live_calculated_aqi_row_count: liveRows.length,
       r2_observation_row_count: outputObservations.filter((row) => row.source === "r2").length,
       ingest_observation_row_count: outputObservations.filter((row) => row.source === "ingest").length,
@@ -531,11 +526,6 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
     } : disabledAqiSection(),
     observations: {
       rows: outputObservations, guideline: direct.guideline, response_complete: observationsComplete, has_gap: !observationsComplete, gap_ranges: observationGaps,
-      partial_reasons: observationsComplete ? [] : Array.from(new Set([
-        ...r2Observations.partial_reasons,
-        ...(observationGaps.length ? ["missing_visible_observation_hours"] : []),
-        ...(directObservationTailRequired && !direct.response_complete ? ["required_observation_source_incomplete"] : []),
-      ])),
       stable_head_start_utc: observationHeadStartUtc, stable_head_end_utc: new Date(request.endMs).toISOString(),
       next_chunk_end_utc: observationBounds.headStartMs > request.startMs ? observationHeadStartUtc : null,
       next_older_observation_chunk_end_utc: observationBounds.headStartMs > request.startMs ? observationHeadStartUtc : null,
@@ -698,12 +688,10 @@ async function handleObservationHistoryChunk(request, env, ctx) {
         response_complete: complete,
         has_gap: !complete,
         coverage_state: complete ? "complete" : "partial",
-        partial_reasons: complete ? [] : Array.from(new Set([
-          ...(!chunk.includeObservations || combined.observations.response_complete ? [] : combined.observations.partial_reasons),
-          ...(!parsed.includeAqi || combined.aqi.response_complete ? [] : combined.aqi.partial_reasons),
+        partial_reasons: complete ? [] : [
           ...(!chunk.includeObservations || combined.observations.response_complete ? [] : ["observations_incomplete"]),
           ...(!parsed.includeAqi || combined.aqi.response_complete ? [] : [policy.calculatedHistoryAqiEnabled ? "calculated_aqi_incomplete" : "calculated_aqi_disabled"]),
-        ])),
+        ],
         chunk: {
           direction: "newest_first", row_order: "ascending", start_utc: chunk.startUtc, end_utc: chunk.endUtc,
           stable_head_start_utc: chunk.stableHeadStartUtc, next_older_chunk_end_utc: chunk.startUtc,
@@ -725,25 +713,6 @@ async function handleObservationHistoryChunk(request, env, ctx) {
   catch (error) { return identityErrorResponse(error, url.pathname) || errorResponse(502, "station_history_identity_lookup_failed", url.pathname); }
   const baseUrl = required(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL); const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
   if (!baseUrl || !secret) return errorResponse(500, "internal_observation_history_config_missing", url.pathname);
-  if (usesV3PhysicalObservationPages(env)) {
-    try {
-      const payload = await readR2Observations({
-        env,
-        identity: chunk,
-        startMs: chunk.startMs,
-        endMs: chunk.endMs,
-      });
-      const body = buildObservationHistoryChunk(chunk, {
-        ...payload,
-        timeseries_id: chunk.timeseriesId,
-        connector_id: chunk.connectorId,
-        pollutant: chunk.pollutant,
-      });
-      return new Response(JSON.stringify(body), { status: 200, headers: chunkHeaders(body) });
-    } catch (error) {
-      return errorResponse(502, error instanceof Error ? error.message : "observation_history_r2_failed", url.pathname);
-    }
-  }
   const target = buildR2ObservationRequestUrl({
     baseUrl,
     identity: chunk,

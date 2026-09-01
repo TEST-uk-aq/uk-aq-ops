@@ -1,6 +1,6 @@
 // The code path is the existing station-history contract implementation. This
-// separately named deployment is fixed to the selected v3 exact-leaf reader by
-// its manual deployment workflow; the active station Worker remains intact.
+// separately named deployment is fixed to the v3-only low-level candidate URL
+// by its manual deployment workflow; the active station Worker remains intact.
 import stationHistoryWorker from "../uk_aq_station_history/src/index.mjs";
 
 export function assertV3Candidate(env) {
@@ -13,7 +13,7 @@ export function assertV3Candidate(env) {
   if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(activeObservationsWorkerName)) {
     throw new Error("Station-history v3 candidate requires the active observations Worker name");
   }
-  const expectedCandidateWorkerName = `${activeObservationsWorkerName}-v3-leaf-candidate`;
+  const expectedCandidateWorkerName = `${activeObservationsWorkerName}-v3-candidate`;
   let url;
   try {
     url = new URL(String(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL || ""));
@@ -24,7 +24,10 @@ export function assertV3Candidate(env) {
     `^${expectedCandidateWorkerName}\\.[a-z0-9-]+\\.workers\\.dev$`,
     "i",
   );
-  if (url.protocol !== "https:" || !expectedHostname.test(url.hostname)) {
+  if (
+    url.protocol !== "https:"
+    || !expectedHostname.test(url.hostname)
+  ) {
     throw new Error(
       `Station-history v3 candidate requires the ${expectedCandidateWorkerName} observations URL`,
     );

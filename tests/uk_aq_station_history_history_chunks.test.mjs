@@ -10,7 +10,12 @@ import {
   parseHistoryChunkRequest,
 } from "../workers/uk_aq_station_history/src/history_chunks.mjs";
 import { resolveStationHistoryPolicy } from "../workers/uk_aq_station_history/src/policy.mjs";
-import { buildR2ObservationRequestUrl } from "../workers/uk_aq_station_history/src/r2_observations.mjs";
+import {
+  buildR2ObservationRequestUrl,
+  createStationHistoryV3PageBudget,
+  readR2Observations,
+  STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+} from "../workers/uk_aq_station_history/src/r2_observations.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -221,6 +226,82 @@ test("recent and historical R2 observation reads share the complete timeseries U
   assert.equal(target.searchParams.get("start_utc"), "2026-07-01T00:16:34.527Z");
   assert.equal(target.searchParams.get("end_utc"), "2026-07-02T00:16:34.527Z");
   assert.equal(target.searchParams.get("limit"), "1000");
+});
+
+test("v3 observation reads assemble UTC pieces in order and stop at the shared physical-page budget", async () => {
+  const identity = { timeseriesId: 7421, connectorId: 7, stationId: 9, pollutant: "pm25" };
+  const startMs = Date.parse("2026-07-01T12:00:00.000Z");
+  const endMs = Date.parse("2026-07-03T06:00:00.000Z");
+  const requested = [];
+  const fetchApi = async (input) => {
+    const url = new URL(String(input));
+    const pieceStart = Date.parse(url.searchParams.get("start_utc"));
+    const pieceEnd = Date.parse(url.searchParams.get("end_utc"));
+    const cursor = url.searchParams.get("physical_cursor");
+    const pageNumber = cursor ? 2 : 1;
+    const observedAt = pieceStart + pageNumber * HOUR_MS;
+    requested.push({ pieceStart, pieceEnd, cursor, hasLimit: url.searchParams.has("limit") });
+    return new Response(JSON.stringify({
+      ok: true,
+      timeseries_id: identity.timeseriesId,
+      connector_id: identity.connectorId,
+      pollutant: identity.pollutant,
+      start_utc: new Date(pieceStart).toISOString(),
+      end_utc: new Date(pieceEnd).toISOString(),
+      response_complete: pageNumber === 2,
+      has_gap: false,
+      coverage_partial_reasons: [],
+      physical_page: {
+        schema_version: 2,
+        page_number: pageNumber,
+        continuation_cursor_supplied: Boolean(cursor),
+        segments_decoded: 1,
+        physical_rows_decoded: 1,
+        pagination_complete: pageNumber === 2,
+        next_cursor: pageNumber === 2 ? null : `cursor-${pieceStart}`,
+      },
+      rows: [{ observed_at: new Date(observedAt).toISOString(), value: pageNumber }],
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  const env = {
+    UK_AQ_R2_HISTORY_INDEX_VERSION: "v3",
+    UK_AQ_EDGE_UPSTREAM_SECRET: "secret",
+    UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations",
+  };
+
+  const complete = await readR2Observations({ env, identity, startMs, endMs, fetchApi });
+  assert.equal(complete.response_complete, true);
+  assert.equal(complete.fetch_count, 6);
+  assert.deepEqual(complete.rows.map((row) => row.observed_at), [
+    "2026-07-01T13:00:00.000Z",
+    "2026-07-01T14:00:00.000Z",
+    "2026-07-02T01:00:00.000Z",
+    "2026-07-02T02:00:00.000Z",
+    "2026-07-03T01:00:00.000Z",
+    "2026-07-03T02:00:00.000Z",
+  ]);
+  assert.equal(requested.every((entry) => entry.pieceEnd - entry.pieceStart <= 24 * HOUR_MS), true);
+  assert.equal(requested.every((entry) => entry.hasLimit === false), true);
+
+  requested.length = 0;
+  const bounded = await readR2Observations({
+    env,
+    identity,
+    startMs,
+    endMs,
+    pageBudget: createStationHistoryV3PageBudget(3),
+    fetchApi,
+  });
+  assert.equal(bounded.response_complete, false);
+  assert.equal(bounded.has_gap, true);
+  assert.equal(bounded.fetch_count, 3);
+  assert.equal(requested.length, 3);
+  assert.equal(bounded.partial_reasons.includes(STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON), true);
+  assert.deepEqual(bounded.rows.map((row) => row.observed_at), [
+    "2026-07-01T13:00:00.000Z",
+    "2026-07-01T14:00:00.000Z",
+    "2026-07-02T01:00:00.000Z",
+  ]);
 });
 
 test("chunk immutable classification uses the existing 120 hour boundary", () => {

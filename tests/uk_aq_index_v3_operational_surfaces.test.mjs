@@ -111,7 +111,7 @@ test("candidate workflows derive TEST and LIVE identities from active Worker nam
 
   assert.match(stationWorkflow, /UK_AQ_STATION_HISTORY_WORKER_NAME: \$\{\{ vars\.UK_AQ_STATION_HISTORY_WORKER_NAME \|\| '' \}\}/);
   assert.match(stationWorkflow, /CANDIDATE_WORKER_NAME="\$\{UK_AQ_STATION_HISTORY_WORKER_NAME\}-v3-candidate"/);
-  assert.match(stationWorkflow, /CANDIDATE_OBSERVATIONS_WORKER_NAME="\$\{UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME\}-v3-candidate"/);
+  assert.match(stationWorkflow, /CANDIDATE_OBSERVATIONS_WORKER_NAME="\$\{UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME\}-v3-leaf-candidate"/);
   assert.match(stationWorkflow, /CANDIDATE_OBSERVATIONS_URL_PATTERN="\^https:\/\//);
   assert.match(observationsWorkflow, /UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME: \$\{\{ vars\.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME \|\| '' \}\}/);
   assert.match(observationsWorkflow, /CANDIDATE_WORKER_NAME=%s-v3-candidate/);
@@ -626,14 +626,14 @@ test("station candidate accepts only its environment-specific observations candi
 
   assert.doesNotThrow(() => assertV3Candidate({
     ...baseEnv,
-    UK_AQ_OBSERVS_HISTORY_R2_API_URL: `https://${testWorkerName}-v3-candidate.account.workers.dev`,
+    UK_AQ_OBSERVS_HISTORY_R2_API_URL: `https://${testWorkerName}-v3-leaf-candidate.account.workers.dev`,
   }));
   for (const authority of ["V3", " v3", "v3 "]) {
     assert.throws(
       () => assertV3Candidate({
         ...baseEnv,
         UK_AQ_R2_HISTORY_INDEX_VERSION: authority,
-        UK_AQ_OBSERVS_HISTORY_R2_API_URL: `https://${testWorkerName}-v3-candidate.account.workers.dev`,
+        UK_AQ_OBSERVS_HISTORY_R2_API_URL: `https://${testWorkerName}-v3-leaf-candidate.account.workers.dev`,
       }),
       /requires index generation v3/,
     );
@@ -641,8 +641,8 @@ test("station candidate accepts only its environment-specific observations candi
   assert.throws(
     () => assertV3Candidate({
       ...baseEnv,
-      UK_AQ_OBSERVS_HISTORY_R2_API_URL: `https://${liveWorkerName}-v3-candidate.account.workers.dev`,
+      UK_AQ_OBSERVS_HISTORY_R2_API_URL: `https://${liveWorkerName}-v3-leaf-candidate.account.workers.dev`,
     }),
-    /requires the uk-aq-observs-history-r2-api-test-v3-candidate observations URL/,
+    /requires the uk-aq-observs-history-r2-api-test-v3-leaf-candidate observations URL/,
   );
 });
