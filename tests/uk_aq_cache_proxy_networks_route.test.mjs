@@ -11,9 +11,14 @@ async function cacheProxySource() {
 test("/api/aq/networks routes to the public networks edge function with metadata caching", async () => {
   const source = await cacheProxySource();
 
+  assert.match(source, /const PUBLIC_NETWORKS_PATH = "\/api\/aq\/networks"/);
   assert.match(source, /uk_aq_public_networks:\s*"metadata"/);
   assert.match(source, /networks:\s*"uk_aq_public_networks"/);
   assert.doesNotMatch(source, /networks:\s*"uk_aq_networks"/);
+  assert.match(
+    source,
+    /const upstreamFunction = resolveUpstreamFunction\(url\.pathname\);[\s\S]*?if \(!isLocalDevRequest\) \{\s*if \(requestOrigin === null\)[\s\S]*?if \(!isOriginAllowed\(requestOrigin, allowedOrigins\)\)[\s\S]*?if \(!isPublicMetadataRoute\(url\.pathname\)\) \{\s*const sessionToken = getCookieValue/,
+  );
 });
 
 test("cache proxy keeps snapshot URLs stable and does not add routine cache busters", async () => {

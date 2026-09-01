@@ -235,7 +235,6 @@ const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> =
 };
 
 const API_PREFIX = "/api/aq/";
-const PUBLIC_NETWORKS_PATH = "/api/aq/networks";
 const SESSION_START_PATH = "/api/aq/session/start";
 const SESSION_END_PATH = "/api/aq/session/end";
 const CHART_METRICS_PATH = "/api/aq/chart-metrics";
@@ -2757,10 +2756,6 @@ function isSessionRoute(pathname: string): boolean {
   return pathname === SESSION_START_PATH || pathname === SESSION_END_PATH;
 }
 
-function isPublicMetadataRoute(pathname: string): boolean {
-  return pathname.replace(/\/+$/, "") === PUBLIC_NETWORKS_PATH;
-}
-
 function requiresApiCORS(pathname: string): boolean {
   return pathname.startsWith(API_PREFIX);
 }
@@ -2911,16 +2906,14 @@ export default {
       if (!isOriginAllowed(requestOrigin, allowedOrigins)) {
         return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
       }
-      if (!isPublicMetadataRoute(url.pathname)) {
-        const sessionToken = getCookieValue(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
-        if (!sessionToken) {
-          return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
-        }
+      const sessionToken = getCookieValue(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
+      if (!sessionToken) {
+        return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
+      }
 
-        const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
-        if (!authCheck.ok) {
-          return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
-        }
+      const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
+      if (!authCheck.ok) {
+        return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
       }
     }
 
