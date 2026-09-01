@@ -1,6 +1,7 @@
 main = "worker.mjs"
 compatibility_date = "2026-08-01"
 workers_dev = true
+preview_urls = false
 
 [vars]
 UKAQ_ENV_NAME = "TEST"
