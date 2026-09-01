@@ -1,0 +1,21 @@
+main = "worker.mjs"
+compatibility_date = "2026-08-01"
+workers_dev = true
+preview_urls = false
+
+[vars]
+UKAQ_ENV_NAME = "TEST"
+UK_AQ_R2_HISTORY_INDEX_VERSION = "v3-physical-leaf-fanout-candidate"
+
+[[services]]
+binding = "PHYSICAL_LEAF"
+service = "__UK_AQ_PHYSICAL_LEAF_CANDIDATE_WORKER_NAME__"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
