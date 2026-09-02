@@ -1007,17 +1007,16 @@ async function reverifyPinnedSourceManifestReference({
 async function reverifyPinnedCompatibleSourceUnitsBeforeMutation({
   plan,
   getR2Object,
-  onProgress = null,
 }) {
-  const compatiblePartitions = plan.inventory.partitions.filter((sourcePartition) =>
-    sourcePartition.source_manifest_reference.provenance ===
-      SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT ||
-    sourcePartition.source_manifest_self_hash.provenance ===
-      SOURCE_MANIFEST_SELF_HASH_PROVENANCE_LEGACY_SORTED_CHECKPOINT
-  );
-  onProgress?.(0, { force: true });
-  let verified = 0;
-  for (const sourcePartition of compatiblePartitions) {
+  for (const sourcePartition of plan.inventory.partitions) {
+    if (
+      sourcePartition.source_manifest_reference.provenance !==
+        SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT &&
+      sourcePartition.source_manifest_self_hash.provenance !==
+        SOURCE_MANIFEST_SELF_HASH_PROVENANCE_LEGACY_SORTED_CHECKPOINT
+    ) {
+      continue;
+    }
     const authorityUnit = plan.units.find((unit) =>
       unit.source_manifest_identity.key === sourcePartition.manifest_identity.key &&
       unit.source_manifest_identity.sha256 === sourcePartition.manifest_identity.sha256
@@ -1042,18 +1041,13 @@ async function reverifyPinnedCompatibleSourceUnitsBeforeMutation({
     if (!sameSemanticJson(rewritten.source_files, authorityUnit.source_files)) {
       throw new Error(`Pinned source file identity changed: ${authorityUnit.unit_id}`);
     }
-    verified += 1;
-    onProgress?.(verified);
   }
 }
 
 async function reverifyPinnedEmptySourceConnectorsBeforeMutation({
   plan,
   getR2Object,
-  onProgress = null,
 }) {
-  onProgress?.(0, { force: true });
-  let verified = 0;
   for (const pinned of plan.empty_source_connectors || []) {
     const connectorObject = await getRequiredObject(
       getR2Object,
@@ -1092,8 +1086,6 @@ async function reverifyPinnedEmptySourceConnectorsBeforeMutation({
         `Pinned empty source connector evidence changed: ${pinned.source_manifest_key}`,
       );
     }
-    verified += 1;
-    onProgress?.(verified);
   }
 }
 
@@ -1469,70 +1461,12 @@ export function deriveObservationHistoryV3WriterFreezePlan({ repositoryRoot }) {
   });
 }
 
-function formatMigrationProgressElapsed(elapsedMilliseconds) {
-  const elapsedSeconds = Math.max(0, Math.floor(elapsedMilliseconds / 1000));
-  const hours = Math.floor(elapsedSeconds / 3600);
-  const minutes = Math.floor((elapsedSeconds % 3600) / 60);
-  const seconds = elapsedSeconds % 60;
-  return [hours, minutes, seconds]
-    .map((value) => String(value).padStart(2, "0"))
-    .join(":");
-}
-
-function createMigrationProgressReporter({ label, total, enabled }) {
-  if (!enabled || !Number.isInteger(total) || total <= 0) {
-    return Object.freeze({ report() {} });
-  }
-  const startedAt = Date.now();
-  let lastPercentage = null;
-  let lastReportedAt = 0;
-  return Object.freeze({
-    report(completed, { force = false } = {}) {
-      const safeCompleted = Math.min(Math.max(Number(completed) || 0, 0), total);
-      const percentage = (safeCompleted / total) * 100;
-      const integerPercentage = Math.floor(percentage);
-      const now = Date.now();
-      if (
-        !force &&
-        integerPercentage === lastPercentage &&
-        now - lastReportedAt < 30_000
-      ) return;
-      process.stderr.write(
-        `${label} ${safeCompleted}/${total} (${percentage.toFixed(1)}%) elapsed=${
-          formatMigrationProgressElapsed(now - startedAt)
-        }\n`,
-      );
-      lastPercentage = integerPercentage;
-      lastReportedAt = now;
-    },
-  });
-}
-
-function createMigrationActivityReporter({ label, enabled }) {
-  if (!enabled) return Object.freeze({ report() {} });
-  const startedAt = Date.now();
-  let lastReportedAt = 0;
-  return Object.freeze({
-    report(count, { force = false } = {}) {
-      const now = Date.now();
-      if (!force && now - lastReportedAt < 30_000) return;
-      process.stderr.write(
-        `${label} discovered partitions=${count} elapsed=${
-          formatMigrationProgressElapsed(now - startedAt)
-        }\n`,
-      );
-      lastReportedAt = now;
-    },
-  });
-}
-
 export async function inventoryAuthoritativeCanonicalObservationHistory({
   getR2Object,
   observationsPrefix = DEFAULT_OBSERVATIONS_PREFIX,
   v2IndexRoot = DEFAULT_V2_INDEX_ROOT,
   v2LatestKey = DEFAULT_V2_LATEST_KEY,
   sosConnectorId = 1,
-  onProgress = null,
 }) {
   if (typeof getR2Object !== "function") {
     throw new TypeError("Canonical inventory requires getR2Object adapter");
@@ -1551,7 +1485,6 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
   const connectors = [];
   const emptyConnectors = [];
   const partitions = [];
-  onProgress?.(partitions.length, { force: true });
   for (const yearReference of rootPayload.children) {
     const yearKey = buildR2HistoryV2ObservationsYearManifestKey(
       prefix,
@@ -1768,7 +1701,6 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
                 ? bodyIdentity(v2IndexKey, v2IndexObject.body)
                 : null,
             }));
-            onProgress?.(partitions.length);
           }
         }
       }
@@ -2674,17 +2606,12 @@ export async function buildObservationHistoryV3MigrationPlan({
   const writerFreezePlan = deriveObservationHistoryV3WriterFreezePlan({
     repositoryRoot,
   });
-  const inventoryProgress = createMigrationActivityReporter({
-    label: "V3 migration plan: canonical inventory",
-    enabled: transition.kind === "v2-to-v3",
-  });
   const inventory = await inventoryAuthoritativeCanonicalObservationHistory({
     getR2Object,
     observationsPrefix,
     v2IndexRoot,
     v2LatestKey,
     sosConnectorId,
-    onProgress: inventoryProgress.report,
   });
   let backupGate = null;
   let v3RebuildSnapshot = null;
@@ -3372,51 +3299,22 @@ export async function executeObservationHistoryV3MigrationPlan({
   ) {
     throw new Error("Migration checkpoint belongs to a different deterministic plan");
   }
-  const progressEnabled = plan.transition.kind === "v2-to-v3";
   if (rawCheckpoint) {
     buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
   } else {
     await adapters.writeCheckpoint(checkpoint);
-    const emptyConnectorProgress = createMigrationProgressReporter({
-      label: "V3 migration: empty source connectors",
-      total: plan.empty_source_connectors.length,
-      enabled: progressEnabled,
-    });
     await reverifyPinnedEmptySourceConnectorsBeforeMutation({
       plan,
       getR2Object: adapters.getObject,
-      onProgress: emptyConnectorProgress.report,
-    });
-    const compatibleSourceUnitCount = plan.inventory.partitions.filter((partition) =>
-      partition.source_manifest_reference.provenance ===
-        SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT ||
-      partition.source_manifest_self_hash.provenance ===
-        SOURCE_MANIFEST_SELF_HASH_PROVENANCE_LEGACY_SORTED_CHECKPOINT
-    ).length;
-    const compatibleSourceUnitProgress = createMigrationProgressReporter({
-      label: "V3 migration: source compatibility checks",
-      total: compatibleSourceUnitCount,
-      enabled: progressEnabled,
     });
     await reverifyPinnedCompatibleSourceUnitsBeforeMutation({
       plan,
       getR2Object: adapters.getObject,
-      onProgress: compatibleSourceUnitProgress.report,
     });
   }
-  const partitionProgress = createMigrationProgressReporter({
-    label: "V3 migration: partitions",
-    total: plan.units.length,
-    enabled: progressEnabled,
-  });
-  let completedPartitions = plan.units.filter((unit) =>
-    checkpoint.prepared_units[unit.unit_id]?.files_published === true
-  ).length;
-  partitionProgress.report(completedPartitions, { force: true });
   const parquetEvidence = [];
   for (const authorityUnit of plan.units) {
     let record = checkpoint.prepared_units[authorityUnit.unit_id] || null;
-    const wasFilesPublished = record?.files_published === true;
     if (!record) {
       const sourcePartition = plan.inventory.partitions.find((partition) =>
         partition.manifest_identity.key === authorityUnit.source_manifest_identity.key &&
@@ -3540,27 +3438,11 @@ export async function executeObservationHistoryV3MigrationPlan({
       ({ staging_ref: _stagingRef, ...entry }) => entry,
     );
     await adapters.writeCheckpoint(checkpoint);
-    if (!wasFilesPublished && checkpoint.prepared_units[authorityUnit.unit_id]?.files_published === true) {
-      completedPartitions += 1;
-      partitionProgress.report(completedPartitions);
-    }
   }
   const completedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
     checkpoint,
     requirePrepared: true,
   });
-  const canonicalPublicationProgress = createMigrationProgressReporter({
-    label: "V3 migration: canonical publication objects",
-    total: completedPlan.canonical_publication_objects.length,
-    enabled: progressEnabled,
-  });
-  const previouslyCompletedCanonicalObjectKeys = new Set(
-    completedPlan.canonical_publication_objects
-      .filter((object) => checkpoint.completed_objects[object.key]?.verified === true)
-      .map((object) => object.key),
-  );
-  let completedCanonicalObjects = previouslyCompletedCanonicalObjectKeys.size;
-  canonicalPublicationProgress.report(completedCanonicalObjects, { force: true });
   for (const object of completedPlan.canonical_publication_objects) {
     const completed = checkpointObjectMap(checkpoint);
     const reuse = await verifyObservationHistoryV3CheckpointReuse({
@@ -3585,10 +3467,6 @@ export async function executeObservationHistoryV3MigrationPlan({
       evidence: object,
       writeCheckpoint: adapters.writeCheckpoint,
     });
-    if (!previouslyCompletedCanonicalObjectKeys.has(object.key)) {
-      completedCanonicalObjects += 1;
-      canonicalPublicationProgress.report(completedCanonicalObjects);
-    }
     if (object.publication_stage === "pollutant_manifest") {
       await testHooks?.afterCanonicalManifestPublication?.({
         key: object.key,
@@ -3602,23 +3480,11 @@ export async function executeObservationHistoryV3MigrationPlan({
       });
     }
   }
-  const v3PublicationProgress = createMigrationProgressReporter({
-    label: "V3 migration: v3 publication objects",
-    total: completedPlan.v3_publication_plan.entries.length,
-    enabled: progressEnabled,
-  });
-  let completedV3PublicationObjects = 0;
-  v3PublicationProgress.report(completedV3PublicationObjects, { force: true });
   const v3Publication = await adapters.finalizeV3Publication({
     plan: completedPlan.v3_publication_plan,
     putIfChanged: adapters.putIfChanged,
     getObject: adapters.getObject,
-    recordDurableEvidence: async (entry) => {
-      const result = await adapters.recordDurableEvidence(entry);
-      completedV3PublicationObjects += 1;
-      v3PublicationProgress.report(completedV3PublicationObjects);
-      return result;
-    },
+    recordDurableEvidence: adapters.recordDurableEvidence,
   });
   for (const evidence of v3Publication.objects || []) {
     await persistCompletedObject({
@@ -3636,7 +3502,6 @@ export async function executeObservationHistoryV3MigrationPlan({
     getObject: adapters.getObject,
     headObject: adapters.headObject,
     publicationResult: v3Publication,
-    progressEnabled,
   });
   checkpoint.full_verification_complete = verification.ok;
   checkpoint.cutover_ready = verification.cutover_ready;
@@ -3657,16 +3522,8 @@ export async function verifyObservationHistoryV3MigrationResult({
   getObject,
   headObject,
   publicationResult = null,
-  progressEnabled = plan.transition.kind === "v2-to-v3",
 }) {
   const blockers = [];
-  const partitionProgress = createMigrationProgressReporter({
-    label: "V3 verification: partitions",
-    total: plan.units.length,
-    enabled: progressEnabled,
-  });
-  partitionProgress.report(0, { force: true });
-  let verifiedPartitions = 0;
   for (const unit of plan.units) {
     if (
       unit.source_row_count !== unit.target_metadata.row_count ||
@@ -3689,16 +3546,7 @@ export async function verifyObservationHistoryV3MigrationResult({
         );
       }
     }
-    verifiedPartitions += 1;
-    partitionProgress.report(verifiedPartitions);
   }
-  const canonicalProgress = createMigrationProgressReporter({
-    label: "V3 verification: canonical publication objects",
-    total: plan.canonical_publication_objects.length,
-    enabled: progressEnabled,
-  });
-  canonicalProgress.report(0, { force: true });
-  let verifiedCanonicalObjects = 0;
   for (const expected of plan.canonical_publication_objects) {
     try {
       const current = await getRequiredObject(
@@ -3719,17 +3567,8 @@ export async function verifyObservationHistoryV3MigrationResult({
         }`,
       );
     }
-    verifiedCanonicalObjects += 1;
-    canonicalProgress.report(verifiedCanonicalObjects);
   }
   const actualArtifacts = new Map();
-  const v3PublicationProgress = createMigrationProgressReporter({
-    label: "V3 verification: v3 publication objects",
-    total: plan.v3_publication_plan.entries.length,
-    enabled: progressEnabled,
-  });
-  v3PublicationProgress.report(0, { force: true });
-  let verifiedV3PublicationObjects = 0;
   for (const entry of plan.v3_publication_plan.entries) {
     try {
       const current = await getRequiredObject(getObject, entry.key, "published v3");
@@ -3744,16 +3583,7 @@ export async function verifyObservationHistoryV3MigrationResult({
         }`,
       );
     }
-    verifiedV3PublicationObjects += 1;
-    v3PublicationProgress.report(verifiedV3PublicationObjects);
   }
-  const hierarchyProgress = createMigrationProgressReporter({
-    label: "V3 verification: scoped roots",
-    total: plan.units.length,
-    enabled: progressEnabled,
-  });
-  hierarchyProgress.report(0, { force: true });
-  let verifiedScopedRoots = 0;
   for (const unit of plan.units) {
     try {
       const children = unit.v3_hierarchy.child_shards.map((artifact) => {
@@ -3790,8 +3620,6 @@ export async function verifyObservationHistoryV3MigrationResult({
         }`,
       );
     }
-    verifiedScopedRoots += 1;
-    hierarchyProgress.report(verifiedScopedRoots);
   }
   try {
     const latestBody = actualArtifacts.get(plan.v3_latest.key);
@@ -3919,7 +3747,6 @@ export async function verifyObservationHistoryV3CurrentDependencies({
     getObject,
     headObject,
     publicationResult,
-    progressEnabled: plan.transition.kind === "v2-to-v3",
   });
   const recovery = plan.recovery_reconciliation || null;
   if (!checkpoint || !recovery) return base;
@@ -3927,13 +3754,6 @@ export async function verifyObservationHistoryV3CurrentDependencies({
   const legacyAllowedByKey = recovery.legacy_allowed_identities || {};
   const classifications = [];
   const blockers = [...base.blockers];
-  const dependencyProgress = createMigrationProgressReporter({
-    label: "V3 verification: checkpoint dependencies",
-    total: expectedByKey.size,
-    enabled: plan.transition.kind === "v2-to-v3",
-  });
-  dependencyProgress.report(0, { force: true });
-  let verifiedDependencies = 0;
   for (const [key, expected] of expectedByKey) {
     const evidence = checkpoint.completed_objects?.[key];
     let classification = "FAIL";
@@ -3979,8 +3799,6 @@ export async function verifyObservationHistoryV3CurrentDependencies({
       reason = category;
     }
     classifications.push(Object.freeze({ key, classification, reason }));
-    verifiedDependencies += 1;
-    dependencyProgress.report(verifiedDependencies);
   }
   const counts = Object.freeze({
     total: classifications.length,
