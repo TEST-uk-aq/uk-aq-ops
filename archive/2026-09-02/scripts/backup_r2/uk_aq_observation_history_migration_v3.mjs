@@ -1146,7 +1146,6 @@ function buildR2Adapters({
       });
       return { durable: true };
     },
-    getDurablePublicationEvidence: () => durableEvidence.map((entry) => ({ ...entry })),
     writeCheckpoint: recoveryProgress
       ? recoveryProgress.persistCheckpoint
       : async (checkpoint) => atomicWriteJson(checkpointOut, checkpoint),
