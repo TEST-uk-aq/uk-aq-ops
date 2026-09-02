@@ -1,20 +1,10 @@
 import { Buffer } from "node:buffer";
 
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
-import {
-  validateObservationHistoryIndexV3ScopedManifestBody,
-} from "../../../workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs";
-import {
-  validateObservationHistoryV3ChildForRead,
-} from "../../../workers/shared/uk_aq_observation_history_reader_v3.mjs";
 
 const DEFAULT_V3_INDEX_ROOT = "history/_index_v3/observations_timeseries";
 const DEFAULT_V3_LATEST_KEY =
   "history/_index_v3/observations_timeseries_latest.json";
-const PROVISIONAL_V3_LAYOUT = "timeseries-bounded-v1";
-const FINAL_V3_LAYOUT = "timeseries-aligned-v2";
-const FINAL_V3_EXACT_LEAF_VERSION = "exact-timeseries-leaf-v1";
-const FINAL_V3_ALIGNED_ROW_CAP = 1024;
 
 export const OBSERVATION_HISTORY_V3_REBUILD_SNAPSHOT_KIND =
   "uk_aq_observation_history_v3_rebuild_rollback_snapshot";
@@ -74,62 +64,6 @@ function parseJson(key, body) {
   }
 }
 
-function sameJson(left, right) {
-  return stableMigrationJson(left) === stableMigrationJson(right);
-}
-
-function sourceGenerationFromLatest(latest) {
-  const layout = String(latest?.physical_layout_version || "");
-  const hasExactFields =
-    latest?.exact_leaf_index_version !== undefined ||
-    latest?.aligned_row_cap !== undefined ||
-    latest?.key_layout?.exact_leaf_key_template !== undefined ||
-    latest?.key_layout?.aligned_source_index_root !== undefined;
-  const hasProvisionalFields =
-    latest?.key_layout?.child_shard_key_template !== undefined;
-  if (
-    layout === PROVISIONAL_V3_LAYOUT &&
-    !hasExactFields &&
-    hasProvisionalFields
-  ) {
-    return Object.freeze({
-      hierarchy: "provisional-range-shard-v1",
-      physical_layout_version: PROVISIONAL_V3_LAYOUT,
-    });
-  }
-  if (
-    layout === FINAL_V3_LAYOUT &&
-    latest?.exact_leaf_index_version === FINAL_V3_EXACT_LEAF_VERSION &&
-    Number(latest?.aligned_row_cap) === FINAL_V3_ALIGNED_ROW_CAP &&
-    hasExactFields &&
-    !hasProvisionalFields
-  ) {
-    return Object.freeze({
-      hierarchy: FINAL_V3_EXACT_LEAF_VERSION,
-      physical_layout_version: FINAL_V3_LAYOUT,
-      aligned_row_cap: FINAL_V3_ALIGNED_ROW_CAP,
-      exact_leaf_index_version: FINAL_V3_EXACT_LEAF_VERSION,
-    });
-  }
-  throw new Error("Authoritative v3 latest has an unsupported or contradictory generation");
-}
-
-function normalizeSourceGeneration(raw) {
-  return sourceGenerationFromLatest({
-    physical_layout_version: raw?.physical_layout_version,
-    aligned_row_cap: raw?.aligned_row_cap,
-    exact_leaf_index_version: raw?.exact_leaf_index_version,
-    key_layout: raw?.hierarchy === "provisional-range-shard-v1"
-      ? { child_shard_key_template: "pinned" }
-      : raw?.hierarchy === FINAL_V3_EXACT_LEAF_VERSION
-        ? {
-            exact_leaf_key_template: "pinned",
-            aligned_source_index_root: "pinned",
-          }
-        : {},
-  });
-}
-
 function snapshotRoot(migrationRunId) {
   const runId = requiredText(migrationRunId, "migrationRunId");
   if (!/^[A-Za-z0-9._-]+$/.test(runId)) {
@@ -178,7 +112,6 @@ async function authoritativeV3Closure({ getR2Object, latestKey, indexRoot }) {
   ) {
     throw new Error("Authoritative v3 latest object is invalid or contradictory");
   }
-  const sourceGeneration = sourceGenerationFromLatest(latest);
   const objects = new Map();
   objects.set(latestKey, Object.freeze({
     ...objectIdentity(latestKey, latestBody),
@@ -210,90 +143,8 @@ async function authoritativeV3Closure({ getR2Object, latestKey, indexRoot }) {
   for (const root of roots) {
     const scopedObject = await add(root, "scoped_root", "scoped_manifest");
     const scoped = parseJson(scopedObject.key, scopedObject.body);
-    if (sourceGeneration.hierarchy === "provisional-range-shard-v1") {
-      if (
-        scoped?.kind !== "observation_timeseries_scoped_manifest" ||
-        scoped?.physical_layout_version !== PROVISIONAL_V3_LAYOUT
-      ) {
-        throw new Error(
-          `Authoritative provisional v3 scoped manifest is invalid: ${scopedObject.key}`,
-        );
-      }
-      const validatedScoped = validateObservationHistoryIndexV3ScopedManifestBody({
-        key: scopedObject.key,
-        body: scopedObject.body,
-        indexRoot,
-      });
-      const rootSummary = {
-        row_count: root.row_count,
-        timeseries_count: root.timeseries_count,
-        child_shard_count: root.child_shard_count,
-        physical_file_count: root.physical_file_count,
-        min_observed_at_utc: root.min_observed_at_utc,
-        max_observed_at_utc: root.max_observed_at_utc,
-      };
-      const scopedSummary = Object.fromEntries(
-        Object.keys(rootSummary).map((field) => [
-          field,
-          validatedScoped.coverage[field],
-        ]),
-      );
-      if (!sameJson(rootSummary, scopedSummary)) {
-        throw new Error(
-          `Authoritative provisional v3 root summary is contradictory: ${scopedObject.key}`,
-        );
-      }
-      for (const descriptor of validatedScoped.descriptors) {
-        const childObject = await add(
-          descriptor,
-          "provisional_scoped_manifest.children",
-          "provisional_child_shard",
-        );
-        const timeseriesId = descriptor.timeseries_ids[0];
-        const child = validateObservationHistoryV3ChildForRead({
-          key: childObject.key,
-          body: childObject.body,
-          dayUtc: validatedScoped.scope.day_utc,
-          connectorId: validatedScoped.scope.connector_id,
-          pollutantCode: validatedScoped.scope.pollutant_code,
-          timeseriesId,
-          indexRoot,
-        });
-        const childSummary = {
-          range_start: child.payload.range_start,
-          range_end: child.payload.range_end,
-          timeseries_ids: child.payload.coverage.timeseries_ids,
-          row_count: child.payload.coverage.row_count,
-          min_observed_at_utc: child.payload.coverage.min_observed_at_utc,
-          max_observed_at_utc: child.payload.coverage.max_observed_at_utc,
-          files: child.payload.files.map(({ key, byte_size, sha256 }) => ({
-            key,
-            byte_size,
-            sha256,
-          })),
-        };
-        const descriptorSummary = {
-          range_start: descriptor.range_start,
-          range_end: descriptor.range_end,
-          timeseries_ids: descriptor.timeseries_ids,
-          row_count: descriptor.row_count,
-          min_observed_at_utc: descriptor.min_observed_at_utc,
-          max_observed_at_utc: descriptor.max_observed_at_utc,
-          files: descriptor.files,
-        };
-        if (!sameJson(childSummary, descriptorSummary)) {
-          throw new Error(
-            `Authoritative provisional v3 child contradicts its scoped descriptor: ${childObject.key}`,
-          );
-        }
-      }
-      continue;
-    }
     if (
       scoped?.kind !== "observation_timeseries_physical_leaf_scoped_manifest" ||
-      scoped?.physical_layout_version !== FINAL_V3_LAYOUT ||
-      scoped?.aligned_row_cap !== FINAL_V3_ALIGNED_ROW_CAP ||
-      scoped?.exact_leaf_index_version !== FINAL_V3_EXACT_LEAF_VERSION ||
       scoped?.key !== scopedObject.key ||
       !scoped?.leaves_by_timeseries_id
     ) throw new Error(`Authoritative v3 scoped manifest is invalid: ${scopedObject.key}`);
@@ -308,9 +159,6 @@ async function authoritativeV3Closure({ getR2Object, latestKey, indexRoot }) {
     );
     if (
       alignedManifest?.kind !== "observation_timeseries_aligned_source_manifest" ||
-      alignedManifest?.physical_layout_version !== FINAL_V3_LAYOUT ||
-      alignedManifest?.aligned_row_cap !== FINAL_V3_ALIGNED_ROW_CAP ||
-      alignedManifest?.exact_leaf_index_version !== FINAL_V3_EXACT_LEAF_VERSION ||
       alignedManifest?.key !== alignedManifestObject.key ||
       !Array.isArray(alignedManifest.children)
     ) throw new Error(`Authoritative aligned manifest is invalid: ${alignedManifestObject.key}`);
@@ -330,9 +178,6 @@ async function authoritativeV3Closure({ getR2Object, latestKey, indexRoot }) {
       const leaf = parseJson(leafObject.key, leafObject.body);
       if (
         leaf?.kind !== "observation_timeseries_physical_leaf" ||
-        leaf?.physical_layout_version !== FINAL_V3_LAYOUT ||
-        leaf?.aligned_row_cap !== FINAL_V3_ALIGNED_ROW_CAP ||
-        leaf?.exact_leaf_index_version !== FINAL_V3_EXACT_LEAF_VERSION ||
         leaf?.key !== leafObject.key ||
         String(leaf?.timeseries_id) !== timeseriesId
       ) throw new Error(`Authoritative exact leaf is invalid: ${leafObject.key}`);
@@ -357,38 +202,24 @@ async function authoritativeV3Closure({ getR2Object, latestKey, indexRoot }) {
       const alignedChild = parseJson(alignedChildObject.key, alignedChildObject.body);
       if (
         alignedChild?.kind !== "observation_timeseries_aligned_source_shard" ||
-        alignedChild?.physical_layout_version !== FINAL_V3_LAYOUT ||
-        alignedChild?.aligned_row_cap !== FINAL_V3_ALIGNED_ROW_CAP ||
-        alignedChild?.exact_leaf_index_version !== FINAL_V3_EXACT_LEAF_VERSION ||
         alignedChild?.key !== alignedChildObject.key
       ) throw new Error(`Authoritative aligned child is invalid: ${alignedChildObject.key}`);
     }
   }
   const stageRank = {
     aligned_child: 10,
-    provisional_child_shard: 10,
     aligned_manifest: 20,
     exact_leaf: 30,
     scoped_manifest: 40,
     latest_global: 50,
   };
-  return Object.freeze({
-    source_generation: sourceGeneration,
-    objects: Object.freeze([...objects.values()].sort((left, right) =>
-      stageRank[left.stage] - stageRank[right.stage] ||
-      Buffer.compare(Buffer.from(left.key), Buffer.from(right.key))
-    )),
-  });
+  return Object.freeze([...objects.values()].sort((left, right) =>
+    stageRank[left.stage] - stageRank[right.stage] ||
+    Buffer.compare(Buffer.from(left.key), Buffer.from(right.key))
+  ));
 }
 
-function snapshotPayload({
-  migrationRunId,
-  environment,
-  bucket,
-  canonicalRoot,
-  sourceGeneration,
-  objects,
-}) {
+function snapshotPayload({ migrationRunId, environment, bucket, canonicalRoot, objects }) {
   return {
     transition: {
       kind: "v3-rebuild",
@@ -399,7 +230,6 @@ function snapshotPayload({
     bucket: requiredText(bucket, "bucket"),
     migration_run_id: requiredText(migrationRunId, "migrationRunId"),
     canonical_pre_state: exactDescriptor(canonicalRoot, "canonicalRoot"),
-    source_v3_generation: normalizeSourceGeneration(sourceGeneration),
     latest_key: DEFAULT_V3_LATEST_KEY,
     index_root: DEFAULT_V3_INDEX_ROOT,
     object_count: objects.length,
@@ -430,12 +260,11 @@ export async function createObservationHistoryV3RebuildRollbackSnapshot({
     if (typeof adapter !== "function") throw new TypeError(`${name} adapter is required`);
   }
   const root = snapshotRoot(migrationRunId);
-  const closure = await authoritativeV3Closure({
+  const objects = await authoritativeV3Closure({
     getR2Object,
     latestKey: DEFAULT_V3_LATEST_KEY,
     indexRoot: DEFAULT_V3_INDEX_ROOT,
   });
-  const objects = closure.objects;
   for (const object of objects) {
     const key = backupObjectKey(root, object.key);
     await putBackupObject({ key, body: object.body });
@@ -452,7 +281,6 @@ export async function createObservationHistoryV3RebuildRollbackSnapshot({
     environment,
     bucket,
     canonicalRoot,
-    sourceGeneration: closure.source_generation,
     objects,
   });
   const envelope = {
@@ -502,7 +330,6 @@ export async function verifyObservationHistoryV3RebuildRollbackSnapshot({
     environment,
     bucket,
     canonicalRoot,
-    sourceGeneration: envelope.payload?.source_v3_generation,
     objects: (envelope.payload?.objects || []).map((entry) => ({ ...entry })),
   });
   if (stableMigrationJson(envelope.payload) !== stableMigrationJson(expectedPayload)) {
@@ -539,7 +366,6 @@ export async function verifyObservationHistoryV3RebuildRollbackSnapshot({
     inventory_key: inventoryKey,
     inventory_identity: objectIdentity(inventoryKey, inventory.body),
     canonical_pre_state: envelope.payload.canonical_pre_state,
-    source_v3_generation: envelope.payload.source_v3_generation,
     object_count: objects.length,
     total_bytes: envelope.payload.total_bytes,
     objects: Object.freeze(objects),

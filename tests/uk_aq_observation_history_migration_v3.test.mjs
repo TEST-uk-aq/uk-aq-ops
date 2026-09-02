@@ -6,15 +6,35 @@ import test from "node:test";
 
 import {
   buildObservationHistoryIndexV3ChildShardKey,
+  buildObservationHistoryIndexV3Latest,
   buildObservationHistoryIndexV3ScopedManifestKey,
+  buildObservationHistoryIndexV3ScopedHierarchy,
   finalizeObservationHistoryIndexV3Publication,
 } from "../workers/shared/uk_aq_observation_history_index_v3.mjs";
+import {
+  DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
+  OBSERVATION_HISTORY_EXACT_LEAF_KIND_V3,
+  OBSERVATION_HISTORY_EXACT_LEAF_MANIFEST_KIND_V3,
+} from "../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
+import {
+  readObservationHistoryExactLeafPageV3,
+} from "../workers/shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs";
+import {
+  createPinnedObservationHistoryV3RandomAccessFile,
+} from "../workers/shared/uk_aq_observation_history_random_access_v3.mjs";
 import {
   putAndVerifyR2ObjectWithSha256,
 } from "../workers/shared/uk_aq_r2_checksum_publication.mjs";
 import {
   buildCanonicalObservationTimeseriesBoundedFiles,
+  OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
+  OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
+  OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
+  OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
 } from "../workers/shared/uk_aq_observation_history_target_writer.mjs";
+import {
+  ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+} from "../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
 import {
   validateObservationContentHashMetadata,
 } from "../workers/shared/uk_aq_observation_content_hash.mjs";
@@ -197,6 +217,100 @@ function mapReader(objects) {
     : { exists: false, body: null };
 }
 
+function exactArrayBuffer(value) {
+  return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+}
+
+const EXACT_READER_INDEX = Object.freeze({
+  root: DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
+  alignedIndexRoot:
+    `${DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT}/_aligned`,
+  alignedDataRoot: PREFIX,
+  indexGeneration: "v3",
+  historyVersion: "v2",
+  historySchemaVersion: 3,
+  writerVersion: "parquet-wasm-zstd-v3",
+  physicalLayoutVersion: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
+  alignedRowCap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
+  decodeProfileId: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
+  manifestKind: OBSERVATION_HISTORY_EXACT_LEAF_MANIFEST_KIND_V3,
+  leafKind: OBSERVATION_HISTORY_EXACT_LEAF_KIND_V3,
+  additionalCommonFields: {
+    exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
+  },
+});
+
+function migrationReaderSource(r2) {
+  return {
+    async getIndexObject({ key }) {
+      const body = r2.get(key);
+      return body
+        ? { key, body: exactArrayBuffer(body), byte_size: body.byteLength }
+        : null;
+    },
+    openParquetFile({ identity, budget }) {
+      const body = r2.get(identity.key);
+      assert.ok(body, `missing migration-generated Parquet ${identity.key}`);
+      return createPinnedObservationHistoryV3RandomAccessFile({
+        identity,
+        objectMetadata: {
+          byte_size: body.byteLength,
+          sha256: identity.sha256,
+          etag: null,
+        },
+        budget,
+        readRange: async ({ offset, length }) =>
+          exactArrayBuffer(body.subarray(offset, offset + length)),
+      });
+    },
+  };
+}
+
+function provisionalV3Metadata(source) {
+  const metadata = structuredClone(source.metadata);
+  metadata.physical_layout_version = "timeseries-bounded-v1";
+  for (const file of metadata.files) {
+    file.physical_layout_version = "timeseries-bounded-v1";
+    for (const rowGroup of file.row_groups) {
+      for (const segment of rowGroup.segments) {
+        segment.physical_layout_version = "timeseries-bounded-v1";
+      }
+    }
+  }
+  for (const segment of metadata.segments) {
+    segment.physical_layout_version = "timeseries-bounded-v1";
+  }
+  return metadata;
+}
+
+function publishProvisionalV3Hierarchy(fixture, pollutantCode = "pm25") {
+  const sourceIndex = [...fixture.pollutantKeys.keys()].indexOf(pollutantCode);
+  const source = fixture.sources[sourceIndex];
+  const manifestKey = fixture.pollutantKeys.get(pollutantCode);
+  const manifestBody = fixture.r2.get(manifestKey);
+  const manifest = JSON.parse(manifestBody.toString("utf8"));
+  const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({
+    metadata: provisionalV3Metadata(source),
+    canonicalManifest: {
+      key: manifestKey,
+      byte_size: manifestBody.byteLength,
+      sha256: sha256Hex(manifestBody),
+      manifest_hash: manifest.manifest_hash,
+      row_count: manifest.row_count,
+      observation_content_hash: manifest.observation_content_hash,
+    },
+  });
+  const latest = buildObservationHistoryIndexV3Latest({
+    scopedHierarchies: [hierarchy],
+  });
+  for (const object of [
+    ...hierarchy.child_shards,
+    hierarchy.scoped_manifest,
+    latest,
+  ]) fixture.r2.set(object.key, Buffer.from(object.body, "utf8"));
+  return { hierarchy, latest };
+}
+
 function readerWithFailure(objects, shouldFail, errorForKey) {
   return async ({ key }) => {
     if (shouldFail(key)) throw errorForKey(key);
@@ -214,6 +328,8 @@ function realR2NotFoundError(key) {
 
 async function buildFixture({
   pollutantCodes = ["pm25", "pm10"],
+  inputRowsByPollutant = null,
+  sourceLimits = SOURCE_LIMITS,
   manifestModes = {},
   parentReferenceOverrides = {},
   missingParentReferenceFields = {},
@@ -228,7 +344,8 @@ async function buildFixture({
   ];
   const pollutantInputs = pollutantCodes.map((pollutantCode, index) => [
     pollutantCode,
-    baseRows.map(([timeseriesId, ...rest]) => [timeseriesId + (index * 2000), ...rest]),
+    inputRowsByPollutant?.[pollutantCode] ||
+      baseRows.map(([timeseriesId, ...rest]) => [timeseriesId + (index * 2000), ...rest]),
   ]);
   const sources = [];
   const pollutants = [];
@@ -244,7 +361,7 @@ async function buildFixture({
     verification_status: verificationStatus,
     }));
     const source = buildCanonicalObservationTimeseriesBoundedFiles(rows, {
-      limits: SOURCE_LIMITS,
+      limits: sourceLimits,
       fileKeyForOrdinal: (ordinal) =>
         `${PREFIX}/day_utc=${DAY}/connector_id=1/pollutant_code=${pollutantCode}/part-${String(ordinal).padStart(5, "0")}.parquet`,
     });
@@ -2096,6 +2213,130 @@ test("migration transition guard is explicit and enforces exact source authority
   assert.ok(wrongIntegrity.blockers.includes("loaded_integrity_version_must_be_v2"));
 });
 
+test("v2-to-v3 migration output crosses 1024 rows and is consumed by the exact reader", async () => {
+  const denseRows = Array.from({ length: 1025 }, (_, index) => [
+    100,
+    new Date(Date.UTC(2026, 0, 2) + (index * 60_000)).toISOString(),
+    10 + (index / 100),
+    ["P", "R", null][index % 3],
+  ]);
+  const sparseRows = [
+    [200, `${DAY}T20:00:00.000Z`, 30.5, "P"],
+    [200, `${DAY}T21:00:00.000Z`, 31.5, "R"],
+  ];
+  const fixture = await buildFixture({
+    pollutantCodes: ["pm25"],
+    inputRowsByPollutant: { pm25: [...denseRows, ...sparseRows] },
+    sourceLimits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+  });
+  const sourceManifestBody = fixture.r2.get(fixture.pollutantKeys.get("pm25"));
+  const sourceManifest = JSON.parse(sourceManifestBody.toString("utf8"));
+  validateCanonicalHistoryV2Manifest(sourceManifest, {
+    domain: "observations",
+    manifest_kind: "pollutant",
+    day_utc: DAY,
+    connector_id: 1,
+    pollutant_code: "pm25",
+    manifest_key: fixture.pollutantKeys.get("pm25"),
+  });
+
+  const plan = await buildPlan(fixture, {
+    writerLimits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+  });
+  assert.deepEqual(plan.blockers, []);
+  const adapters = memoryAdapters(fixture);
+  const migration = await executeObservationHistoryV3MigrationPlan({
+    plan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  });
+  assert.equal(migration.verification.cutover_ready, true);
+  const completedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: migration.checkpoint,
+    requirePrepared: true,
+  });
+  assert.equal(completedPlan.units.length, 1);
+  const unit = completedPlan.units[0];
+
+  assert.deepEqual(
+    completedPlan.target.writer_limits,
+    ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+  );
+  assert.equal(unit.source_row_count, 1027);
+  assert.equal(unit.target_metadata.row_count, unit.source_row_count);
+  assert.equal(
+    unit.target_metadata.observation_content_hash,
+    unit.source_observation_content_hash,
+  );
+  assert.deepEqual(
+    unit.target_metadata.verification_status_counts,
+    unit.source_verification_status_counts,
+  );
+  assert.equal(
+    unit.target_metadata.physical_layout_version,
+    "timeseries-aligned-v2",
+  );
+  const rowGroups = unit.target_metadata.files.flatMap((file) => file.row_groups);
+  assert.ok(rowGroups.every((group) =>
+    group.row_count <= OBSERVATION_HISTORY_ALIGNED_ROW_CAP &&
+    group.min_timeseries_id === group.max_timeseries_id
+  ));
+  assert.ok(unit.target_metadata.segments.every(
+    (segment) => segment.row_count <= OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
+  ));
+  const denseSegments = unit.target_metadata.segments.filter(
+    (segment) => segment.timeseries_id === 100,
+  );
+  assert.deepEqual(denseSegments.map((segment) => segment.row_count), [1024, 1]);
+  assert.ok(denseSegments[0].max_observed_at_utc <= denseSegments[1].min_observed_at_utc);
+  assert.equal(unit.v3_hierarchy.exact_leaves.length, 2);
+  assert.deepEqual(
+    Object.keys(unit.v3_hierarchy.scoped_manifest.payload.leaves_by_timeseries_id),
+    ["100", "200"],
+  );
+  assert.deepEqual(unit.v3_hierarchy.scoped_manifest.payload.coverage, {
+    row_count: 1027,
+    timeseries_count: 2,
+    min_observed_at_utc: denseRows[0][1],
+    max_observed_at_utc: sparseRows.at(-1)[1],
+    physical_file_count: unit.target_metadata.file_count,
+    physical_leaf_count: 2,
+  });
+
+  const request = {
+    source: migrationReaderSource(fixture.r2),
+    timeseriesId: 100,
+    connectorId: 1,
+    pollutantCode: "pm25",
+    startUtc: `${DAY}T00:00:00.000Z`,
+    endUtc: "2026-01-03T00:00:00.000Z",
+    index: EXACT_READER_INDEX,
+  };
+  const first = await readObservationHistoryExactLeafPageV3(request);
+  const second = await readObservationHistoryExactLeafPageV3({
+    ...request,
+    physicalCursor: first.physical_page.next_cursor,
+  });
+  assert.equal(first.rows.length, 1024);
+  assert.equal(second.rows.length, 1);
+  assert.equal(first.response_complete, false);
+  assert.equal(second.response_complete, true);
+  assert.deepEqual(
+    [...first.rows, ...second.rows].map(({ observed_at_utc, value }) => ({
+      observed_at_utc,
+      value,
+    })),
+    denseRows.map(([, observed_at_utc, value]) => ({ observed_at_utc, value })),
+  );
+  for (const result of [first, second]) {
+    assert.equal(result.diagnostics.parquet_footer_fetched, false);
+    assert.equal(result.diagnostics.parquet_footer_parsed, false);
+    assert.equal(result.diagnostics.timeseries_id_decoded, false);
+  }
+});
+
 test("v3-rebuild rollback snapshot pins the authoritative exact index closure to canonical pre-state", async () => {
   const fixture = await buildFixture();
   const plan = await buildPlan(fixture);
@@ -2126,6 +2367,12 @@ test("v3-rebuild rollback snapshot pins the authoritative exact index closure to
     canonicalRoot: currentInventory.root_manifest,
   });
   assert.equal(snapshot.verified, true);
+  assert.deepEqual(snapshot.source_v3_generation, {
+    hierarchy: "exact-timeseries-leaf-v1",
+    physical_layout_version: "timeseries-aligned-v2",
+    aligned_row_cap: 1024,
+    exact_leaf_index_version: "exact-timeseries-leaf-v1",
+  });
   assert.ok(snapshot.object_count > 1);
   assert.ok(snapshot.objects.some((entry) => entry.stage === "latest_global"));
   assert.ok(snapshot.objects.some((entry) => entry.stage === "scoped_manifest"));
@@ -2170,6 +2417,86 @@ test("v3-rebuild rollback snapshot pins the authoritative exact index closure to
     }),
     /does not match this migration/,
   );
+});
+
+test("v3-rebuild rollback snapshot captures the provisional range-shard authority", async () => {
+  const fixture = await buildFixture({ pollutantCodes: ["pm25"] });
+  const provisional = publishProvisionalV3Hierarchy(fixture);
+  const currentInventory = await inventoryAuthoritativeCanonicalObservationHistory({
+    getR2Object: mapReader(fixture.r2),
+  });
+  const putBackupObject = async ({ key, body }) => {
+    fixture.backup.set(key, Buffer.from(body));
+    return { ok: true };
+  };
+  const snapshot = await createObservationHistoryV3RebuildRollbackSnapshot({
+    getR2Object: mapReader(fixture.r2),
+    putBackupObject,
+    getBackupObject: mapReader(fixture.backup),
+    migrationRunId: "fixture-migration",
+    environment: "TEST",
+    bucket: ENVIRONMENT.bucket,
+    canonicalRoot: currentInventory.root_manifest,
+  });
+  assert.equal(snapshot.verified, true);
+  assert.deepEqual(snapshot.source_v3_generation, {
+    hierarchy: "provisional-range-shard-v1",
+    physical_layout_version: "timeseries-bounded-v1",
+  });
+  assert.deepEqual(
+    snapshot.objects.map((entry) => entry.key),
+    [
+      ...provisional.hierarchy.child_shards.map((entry) => entry.key),
+      provisional.hierarchy.scoped_manifest.key,
+      provisional.latest.key,
+    ],
+  );
+  const verified = await verifyObservationHistoryV3RebuildRollbackSnapshot({
+    getBackupObject: mapReader(fixture.backup),
+    getR2Object: mapReader(fixture.r2),
+    migrationRunId: "fixture-migration",
+    environment: "TEST",
+    bucket: ENVIRONMENT.bucket,
+    canonicalRoot: currentInventory.root_manifest,
+    expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
+  });
+  assert.equal(verified.snapshot_root_sha256, snapshot.snapshot_root_sha256);
+
+  const childKey = provisional.hierarchy.child_shards[0].key;
+  const driftedR2 = new Map(fixture.r2);
+  driftedR2.set(childKey, Buffer.from(`${driftedR2.get(childKey)} `));
+  await assert.rejects(
+    verifyObservationHistoryV3RebuildRollbackSnapshot({
+      getBackupObject: mapReader(fixture.backup),
+      getR2Object: mapReader(driftedR2),
+      migrationRunId: "fixture-migration",
+      environment: "TEST",
+      bucket: ENVIRONMENT.bucket,
+      canonicalRoot: currentInventory.root_manifest,
+      expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
+    }),
+    /current authoritative v3 pre-state object identity mismatch/,
+  );
+
+  const plan = await buildPlan(fixture, {
+    environmentEvidence: {
+      ...ENVIRONMENT,
+      transition: "v3-rebuild",
+      indexVersion: "v3",
+    },
+    expectedV3RollbackSnapshotRootSha256: snapshot.snapshot_root_sha256,
+  });
+  assert.deepEqual(plan.blockers, []);
+  const restorePlan = await buildObservationHistoryV2RestorePlan({
+    migrationPlan: plan,
+    getBackupObject: mapReader(fixture.backup),
+  });
+  const restoredLegacyKeys = restorePlan.objects
+    .filter((entry) => entry.key.startsWith("history/_index_v3/"))
+    .map((entry) => entry.key);
+  assert.deepEqual(restoredLegacyKeys, snapshot.objects.map((entry) => entry.key));
+  assert.equal(restorePlan.objects.at(-1).key, provisional.latest.key);
+  assert.ok(snapshot.objects.every((entry) => !entry.key.endsWith(".parquet")));
 });
 
 test("Phase 4 resumes after an early PUT failure without rereading overwritten source", async () => {
