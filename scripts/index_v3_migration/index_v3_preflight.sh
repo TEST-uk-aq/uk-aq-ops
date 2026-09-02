@@ -12,14 +12,19 @@ Usage:
   index_v3_preflight.sh --stage plan --transition v2-to-v3|v3-rebuild
   index_v3_preflight.sh --stage migration-start --transition v2-to-v3|v3-rebuild \
     --authority-file PATH --plan-report PATH --dropbox-root PATH --site-url URL \
-    --writer-freeze-evidence PATH
+    --writer-freeze-evidence PATH [--v2-runtime-rollback-record PATH]
   index_v3_preflight.sh --stage cutover --transition v2-to-v3 \
     --plan-report PATH --dropbox-root PATH --site-url URL \
     --checkpoint PATH --verify-report PATH \
     --writer-freeze-evidence PATH --v2-runtime-rollback-record PATH
   index_v3_preflight.sh --stage completion --transition v3-rebuild \
     --plan-report PATH --dropbox-root PATH --site-url URL \
-    --checkpoint PATH --verify-report PATH --writer-freeze-evidence PATH
+    --checkpoint PATH --verify-report PATH --writer-freeze-evidence PATH \
+    --v2-runtime-rollback-record PATH
+  index_v3_preflight.sh --stage rollback --transition v2-to-v3|v3-rebuild \
+    --authority-file PATH --plan-report PATH --dropbox-root PATH --site-url URL \
+    --checkpoint PATH --writer-freeze-evidence PATH \
+    --v2-runtime-rollback-record PATH
   index_v3_preflight.sh --self-test
 
 Stages:
@@ -27,6 +32,7 @@ Stages:
   migration-start  Adds frozen writers, current backup/source, and maintenance.
   cutover          Adds final v3 verification, recovery, and candidate readiness.
   completion       Same final acceptance boundary for v3-rebuild, without an authority switch.
+  rollback         Revalidates pinned backup, writer freeze, maintenance, and v2 runtime recovery authority.
 
 This script is strictly read-only. It never changes maintenance, schedulers,
 deployments, GitHub configuration, D1, R2, Dropbox, or migration state.
@@ -256,8 +262,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$STAGE" in
-  plan|migration-start|cutover|completion) ;;
-  *) usage >&2; fail "--stage must be plan, migration-start, cutover, or completion" ;;
+  plan|migration-start|cutover|completion|rollback) ;;
+  *) usage >&2; fail "--stage must be plan, migration-start, cutover, completion, or rollback" ;;
 esac
 [ -n "$TRANSITION" ] || fail "--transition is required"
 case "$TRANSITION" in v2-to-v3|v3-rebuild) ;; *) fail "--transition must be v2-to-v3 or v3-rebuild" ;; esac
@@ -275,18 +281,20 @@ if [ "$STAGE" != "plan" ]; then
   [ -n "$DROPBOX_ROOT" ] || fail "--dropbox-root is required for $STAGE"
   [ -n "$SITE_URL" ] || fail "--site-url is required for $STAGE (no established repository variable exists)"
 fi
-if [ "$STAGE" = "migration-start" ]; then
-  [ -n "$AUTHORITY_FILE" ] || fail "--authority-file is required for migration-start"
+if [ "$STAGE" = "migration-start" ] || [ "$STAGE" = "rollback" ]; then
+  [ -n "$AUTHORITY_FILE" ] || fail "--authority-file is required for $STAGE"
 fi
 if [ "$STAGE" != "plan" ]; then
   [ -n "$WRITER_FREEZE_EVIDENCE" ] || fail "--writer-freeze-evidence is required for $STAGE"
 fi
-if [ "$STAGE" = "cutover" ] || [ "$STAGE" = "completion" ]; then
+if [ "$STAGE" = "cutover" ] || [ "$STAGE" = "completion" ] || [ "$STAGE" = "rollback" ]; then
   [ -n "$CHECKPOINT" ] || fail "--checkpoint is required for $STAGE"
+fi
+if [ "$STAGE" = "cutover" ] || [ "$STAGE" = "completion" ]; then
   [ -n "$VERIFY_REPORT" ] || fail "--verify-report is required for $STAGE"
 fi
-if [ "$STAGE" = "cutover" ]; then
-  [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] || fail "--v2-runtime-rollback-record is required for cutover"
+if [ "$STAGE" = "cutover" ] || [ "$STAGE" = "completion" ] || [ "$STAGE" = "rollback" ] || { [ "$STAGE" = "migration-start" ] && [ "$TRANSITION" = "v3-rebuild" ]; }; then
+  [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] || fail "--v2-runtime-rollback-record is required for $STAGE $TRANSITION"
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -313,6 +321,10 @@ for name in \
 do
   require_env "$name"
 done
+if [ "$STAGE" = "rollback" ]; then
+  require_env UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID
+  require_env UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN
+fi
 
 ENVIRONMENT="$(printf '%s' "$UKAQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')"
 case "$ENVIRONMENT" in TEST|LIVE) ;; *) fail "UKAQ_ENV_NAME must identify TEST or LIVE" ;; esac
@@ -334,8 +346,15 @@ case "$TRANSITION" in
   v2-to-v3) EXPECTED_SOURCE_INDEX="v2" ;;
   v3-rebuild) EXPECTED_SOURCE_INDEX="v3" ;;
 esac
-[ "$UK_AQ_R2_HISTORY_INDEX_VERSION" = "$EXPECTED_SOURCE_INDEX" ] \
-  || fail "$TRANSITION requires loaded UK_AQ_R2_HISTORY_INDEX_VERSION=$EXPECTED_SOURCE_INDEX"
+if [ "$STAGE" = "rollback" ]; then
+  case "$UK_AQ_R2_HISTORY_INDEX_VERSION" in
+    v2|v3) ;;
+    *) fail "rollback requires loaded UK_AQ_R2_HISTORY_INDEX_VERSION=v2 or v3" ;;
+  esac
+else
+  [ "$UK_AQ_R2_HISTORY_INDEX_VERSION" = "$EXPECTED_SOURCE_INDEX" ] \
+    || fail "$TRANSITION requires loaded UK_AQ_R2_HISTORY_INDEX_VERSION=$EXPECTED_SOURCE_INDEX"
+fi
 [ "$UK_AQ_R2_HISTORY_INTEGRITY_VERSION" = "v2" ] \
   || fail "expected loaded UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v2"
 pass "loaded environment matches the explicit $TRANSITION source authority"
@@ -476,16 +495,16 @@ jq -e --arg transition "$TRANSITION" --arg source "$EXPECTED_SOURCE_INDEX" '
     "target_row_group_rows":1024
   }
 ' "$PLAN_REPORT" >/dev/null || fail "migration plan/rollback authority is not accepted"
-if [ "$TRANSITION" = "v3-rebuild" ]; then
-  jq -e '
-    .result.v3_rebuild_rollback_snapshot.verified == true and
-    (.result.v3_rebuild_rollback_snapshot.snapshot_root_sha256 | test("^[0-9a-f]{64}$")) and
-    .result.v3_rebuild_rollback_snapshot.object_count > 0 and
-    .result.rollback_preflight.v3_index_strategy.mode == "exact_snapshot_restore" and
-    .result.rollback_preflight.v3_index_strategy.authority_switch_required == false
-  ' "$PLAN_REPORT" >/dev/null \
-    || fail "v3-rebuild plan lacks exact migration-specific v3 rollback authority"
-fi
+jq -e '
+  .result.rollback_preflight.v2_index_strategy.mode == "rebuild" and
+  .result.rollback_preflight.v2_index_strategy.rollback_index_generation == "v2" and
+  .result.rollback_preflight.v2_index_strategy.retained_index_assumed_valid == false and
+  .result.rollback_preflight.v2_index_strategy.authority_switch_required == true and
+  .result.rollback_preflight.v2_index_strategy.runtime_restore_mode == "pinned_v2_runtime_evidence" and
+  .result.rollback_preflight.v2_index_strategy.post_restore_verification_required == true and
+  .result.rollback_preflight.v3_index_strategy == null
+' "$PLAN_REPORT" >/dev/null \
+  || fail "rollback plan does not require canonical v2 restoration, index_v2 rebuild, and verified v2 runtime authority"
 pass "migration plan, backup gate, rollback preflight, and writer limits are accepted"
 
 OPERATOR_EVIDENCE_HELPER="$SCRIPT_DIR/index_v3_operator_evidence.mjs"
@@ -504,7 +523,7 @@ FREEZE_EVIDENCE_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
   || fail "writer-freeze evidence branch does not match $CURRENT_BRANCH"
 pass "durable writer-freeze evidence covers every migration-plan mutation class"
 
-if [ "$STAGE" = "cutover" ]; then
+if [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ]; then
   [ -f "$V2_RUNTIME_ROLLBACK_RECORD" ] \
     || fail "immutable v2 runtime rollback record is missing: $V2_RUNTIME_ROLLBACK_RECORD"
   ROLLBACK_RECORD_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
@@ -517,6 +536,13 @@ if [ "$STAGE" = "cutover" ]; then
     || fail "v2 runtime rollback record repository does not match $REPO_SLUG"
   [ "$(printf '%s' "$ROLLBACK_RECORD_RESULT" | jq -r '.branch // empty')" = "$CURRENT_BRANCH" ] \
     || fail "v2 runtime rollback record branch does not match $CURRENT_BRANCH"
+  if [ "$TRANSITION" = "v3-rebuild" ] && [ -n "$AUTHORITY_FILE" ]; then
+    PINNED_V2_RUNTIME_ROLLBACK_SHA="$(jq -r '.v2_runtime_rollback_record_sha256 // empty' "$AUTHORITY_FILE")"
+    printf '%s' "$PINNED_V2_RUNTIME_ROLLBACK_SHA" | grep -Eq '^[0-9a-f]{64}$' \
+      || fail "v3-rebuild operator authority lacks a pinned v2 runtime rollback record identity"
+    [ "$(shasum -a 256 "$V2_RUNTIME_ROLLBACK_RECORD" | awk '{print $1}')" = "$PINNED_V2_RUNTIME_ROLLBACK_SHA" ] \
+      || fail "v2 runtime rollback record differs from pinned v3-rebuild operator authority"
+  fi
   pass "immutable v2 runtime rollback record has exact code, workflow, Worker, and deployment identities"
 fi
 
@@ -688,8 +714,26 @@ for path in / /hex_map/ /about/ /dev-blog/ /resources/ /sensor_map/ /sensors/; d
 done
 pass "public site-mode deployment and all maintenance routes are positively ON"
 
-if [ "$STAGE" = "migration-start" ]; then
-  printf '\nPREFLIGHT PASS: migration-start prerequisites are satisfied.\n'
+if [ "$STAGE" = "rollback" ]; then
+  [ -f "$CHECKPOINT" ] || fail "immutable checkpoint is missing: $CHECKPOINT"
+  jq -e --arg transition "$TRANSITION" --arg run_id "$AUTH_RUN_ID" --arg plan_sha "$AUTH_PLAN_SHA" '
+    .kind == "uk_aq_observation_history_v3_migration_checkpoint" and
+    .transition.kind == $transition and
+    .migration_run_id == $run_id and
+    .plan_sha256 == $plan_sha and
+    .authority.plan_sha256 == $plan_sha and
+    (.authority_sha256 | test("^[0-9a-f]{64}$")) and
+    .rollback_preflight.verified == true and
+    .rollback_preflight.v2_index_strategy.mode == "rebuild" and
+    .rollback_preflight.v2_index_strategy.authority_switch_required == true and
+    .rollback_preflight.v3_index_strategy == null
+  ' "$CHECKPOINT" >/dev/null \
+    || fail "rollback checkpoint does not match the pinned canonical-v2 recovery authority"
+  pass "rollback checkpoint matches the pinned plan and v2 recovery strategy"
+fi
+
+if [ "$STAGE" = "migration-start" ] || [ "$STAGE" = "rollback" ]; then
+  printf '\nPREFLIGHT PASS: %s prerequisites are satisfied.\n' "$STAGE"
   printf 'NO CUTOVER WAS PERFORMED.\n'
   exit 0
 fi
@@ -810,17 +854,10 @@ trap 'rm -rf "$DEPENDENCY_VERIFY_DIR"' EXIT
 DEPENDENCY_WRITER_LIMITS="$DEPENDENCY_VERIFY_DIR/writer_limits.json"
 DEPENDENCY_VERIFY_REPORT="$DEPENDENCY_VERIFY_DIR/current_dependency_verify.json"
 jq '.result.target.writer_limits' "$PLAN_REPORT" > "$DEPENDENCY_WRITER_LIMITS"
-DEPENDENCY_TRANSITION_ARGS=(--transition "$TRANSITION")
-if [ "$TRANSITION" = "v3-rebuild" ]; then
-  V3_ROLLBACK_SNAPSHOT_SHA="$(jq -r '.result.v3_rebuild_rollback_snapshot.snapshot_root_sha256 // empty' "$PLAN_REPORT")"
-  DEPENDENCY_TRANSITION_ARGS+=(
-    --expected-v3-rollback-snapshot-root-sha256 "$V3_ROLLBACK_SNAPSHOT_SHA"
-  )
-fi
 UK_AQ_ENV_NAME="$ENVIRONMENT" node --max-old-space-size=4096 \
   scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs \
   --mode verify \
-  "${DEPENDENCY_TRANSITION_ARGS[@]}" \
+  --transition "$TRANSITION" \
   --environment "$ENVIRONMENT" \
   --expected-bucket "$CFLARE_R2_BUCKET" \
   --migration-run-id "$AUTH_RUN_ID" \

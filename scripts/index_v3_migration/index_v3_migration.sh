@@ -10,23 +10,25 @@ usage() {
 Usage:
   index_v3_migration.sh plan --transition v2-to-v3|v3-rebuild \
     --work-dir PATH --migration-run-id ID --dropbox-root PATH \
-    --inventory-root-sha256 HEX --state-root-sha256 HEX
-
-  index_v3_migration.sh snapshot --transition v3-rebuild \
-    --work-dir PATH --migration-run-id ID --dropbox-root PATH \
     --inventory-root-sha256 HEX --state-root-sha256 HEX \
-    --writers-frozen --apply
+    [--v2-runtime-rollback-record PATH]
 
   index_v3_migration.sh migrate --transition v2-to-v3|v3-rebuild \
     --work-dir PATH --dropbox-root PATH --site-url URL \
-    --writer-freeze-evidence PATH --apply
+    --writer-freeze-evidence PATH [--v2-runtime-rollback-record PATH] --apply
 
   index_v3_migration.sh resume --transition v2-to-v3|v3-rebuild \
     --work-dir PATH --dropbox-root PATH --site-url URL \
-    --writer-freeze-evidence PATH --apply
+    --writer-freeze-evidence PATH [--v2-runtime-rollback-record PATH] --apply
+
+  index_v3_migration.sh rollback --transition v2-to-v3|v3-rebuild \
+    --work-dir PATH --dropbox-root PATH --site-url URL \
+    --writer-freeze-evidence PATH --v2-runtime-rollback-record PATH \
+    --writers-frozen --apply
 
   index_v3_migration.sh verify --transition v2-to-v3|v3-rebuild \
-    --work-dir PATH --dropbox-root PATH [--report-out PATH]
+    --work-dir PATH --dropbox-root PATH [--v2-runtime-rollback-record PATH] \
+    [--report-out PATH]
 
 Common work-dir files:
   operator_authority.json
@@ -38,13 +40,14 @@ Explicit path overrides:
   --authority-file PATH --plan-report PATH --checkpoint PATH --report-out PATH
 
 Mutation authorisation:
-  snapshot requires UK_AQ_INDEX_V3_SNAPSHOT_AUTH to equal the exact phrase printed.
   migrate requires UK_AQ_INDEX_V3_MIGRATION_AUTH to equal the exact phrase printed.
   resume  requires UK_AQ_INDEX_V3_RESUME_AUTH to equal the exact phrase printed.
+  rollback requires UK_AQ_INDEX_V3_ROLLBACK_AUTH to equal the exact phrase printed.
 
-The wrapper never changes scheduler, maintenance, deployment, GitHub, or reader
-configuration. It never performs cutover. The underlying CLI owns the global
-observation lock and the checkpoint/recovery journal.
+Migration and verification never change scheduler, maintenance, deployment,
+GitHub, or reader configuration. Rollback restores canonical v2 first, rebuilds
+and verifies index_v2, then restores and verifies the pinned v2 runtime authority.
+The underlying CLI owns the global observation lock and checkpoint authority.
 EOF
 }
 
@@ -72,7 +75,6 @@ VERIFY_CURRENT_TRUSTED_DEPENDENCIES=(
   scripts/index_v3_migration/recovery_journal_authority.mjs
   scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs
   scripts/backup_r2/lib/observation_history_migration_v3.mjs
-  scripts/backup_r2/lib/observation_history_v3_rebuild_rollback.mjs
   package.json
   package-lock.json
   scripts/backup_r2/lib/hierarchical_backup_v2.mjs
@@ -233,7 +235,7 @@ esac
 [ "$#" -gt 0 ] || { usage >&2; stop "an explicit mode is required"; }
 MODE="$1"
 shift
-case "$MODE" in snapshot|plan|migrate|resume|verify) ;; *) usage >&2; stop "unsupported mode: $MODE" ;; esac
+case "$MODE" in plan|migrate|resume|verify|rollback) ;; *) usage >&2; stop "unsupported mode: $MODE" ;; esac
 
 WORK_DIR=""
 TRANSITION=""
@@ -242,12 +244,12 @@ DROPBOX_ROOT=""
 SITE_URL=""
 INVENTORY_SHA=""
 STATE_SHA=""
-V3_ROLLBACK_SNAPSHOT_SHA=""
 AUTHORITY_FILE=""
 PLAN_REPORT=""
 CHECKPOINT=""
 REPORT_OUT=""
 WRITER_FREEZE_EVIDENCE=""
+V2_RUNTIME_ROLLBACK_RECORD=""
 APPLY=0
 WRITERS_FROZEN=0
 
@@ -260,12 +262,12 @@ while [ "$#" -gt 0 ]; do
     --site-url) SITE_URL="${2:-}"; shift 2 ;;
     --inventory-root-sha256) INVENTORY_SHA="${2:-}"; shift 2 ;;
     --state-root-sha256) STATE_SHA="${2:-}"; shift 2 ;;
-    --v3-rollback-snapshot-root-sha256) V3_ROLLBACK_SNAPSHOT_SHA="${2:-}"; shift 2 ;;
     --authority-file) AUTHORITY_FILE="${2:-}"; shift 2 ;;
     --plan-report) PLAN_REPORT="${2:-}"; shift 2 ;;
     --checkpoint) CHECKPOINT="${2:-}"; shift 2 ;;
     --report-out) REPORT_OUT="${2:-}"; shift 2 ;;
     --writer-freeze-evidence) WRITER_FREEZE_EVIDENCE="${2:-}"; shift 2 ;;
+    --v2-runtime-rollback-record) V2_RUNTIME_ROLLBACK_RECORD="${2:-}"; shift 2 ;;
     --writers-frozen) WRITERS_FROZEN=1; shift ;;
     --apply) APPLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -383,7 +385,7 @@ NODE
   AUTH_TRANSITION="$(jq -r '.transition // empty' "$AUTHORITY_FILE")"
   AUTH_SOURCE_INDEX="$(jq -r '.source_index_generation // empty' "$AUTHORITY_FILE")"
   AUTH_TARGET_INDEX="$(jq -r '.target_index_generation // empty' "$AUTHORITY_FILE")"
-  V3_ROLLBACK_SNAPSHOT_SHA="$(jq -r '.v3_rollback_snapshot_root_sha256 // empty' "$AUTHORITY_FILE")"
+  AUTH_V2_RUNTIME_ROLLBACK_SHA="$(jq -r '.v2_runtime_rollback_record_sha256 // empty' "$AUTHORITY_FILE")"
   [ "$AUTH_ENV" = "$ENVIRONMENT" ] || stop "authority environment does not match $ENVIRONMENT"
   [ "$AUTH_TRANSITION" = "$TRANSITION" ] || stop "authority transition does not match --transition"
   [ "$AUTH_SOURCE_INDEX" = "$SOURCE_INDEX_GENERATION" ] || stop "authority source index generation is invalid"
@@ -405,11 +407,15 @@ NODE
       || stop "operator authority contains a malformed SHA-256 identity"
   done
   if [ "$TRANSITION" = "v3-rebuild" ]; then
-    printf '%s' "$V3_ROLLBACK_SNAPSHOT_SHA" | grep -Eq '^[0-9a-f]{64}$' \
-      || stop "v3-rebuild authority lacks a valid rollback snapshot root"
+    [ -f "$V2_RUNTIME_ROLLBACK_RECORD" ] \
+      || stop "v3-rebuild authority requires --v2-runtime-rollback-record"
+    printf '%s' "$AUTH_V2_RUNTIME_ROLLBACK_SHA" | grep -Eq '^[0-9a-f]{64}$' \
+      || stop "v3-rebuild authority lacks a valid v2 runtime rollback record identity"
+    [ "$(shasum -a 256 "$V2_RUNTIME_ROLLBACK_RECORD" | awk '{print $1}')" = "$AUTH_V2_RUNTIME_ROLLBACK_SHA" ] \
+      || stop "v2 runtime rollback record differs from pinned operator authority"
   else
-    [ -z "$V3_ROLLBACK_SNAPSHOT_SHA" ] \
-      || stop "v2-to-v3 authority unexpectedly contains a v3 rebuild snapshot root"
+    [ -z "$AUTH_V2_RUNTIME_ROLLBACK_SHA" ] \
+      || stop "v2-to-v3 authority unexpectedly pins a plan-time v2 runtime rollback record"
   fi
   if [ "$MODE" = "verify" ]; then
     validate_read_only_dependency_authority "$REPO_ROOT" "$TARGET_WRITER_GIT_SHA"
@@ -433,40 +439,6 @@ run_cli() {
   node --max-old-space-size=4096 "$MIGRATION_CLI" "$@"
 }
 
-if [ "$MODE" = "snapshot" ]; then
-  [ "$TRANSITION" = "v3-rebuild" ] || stop "snapshot mode is valid only for --transition v3-rebuild"
-  [ "$APPLY" -eq 1 ] || stop "snapshot requires the explicit --apply flag"
-  [ "$WRITERS_FROZEN" -eq 1 ] \
-    || stop "snapshot requires explicit --writers-frozen confirmation"
-  [ -n "$MIGRATION_RUN_ID" ] || stop "snapshot requires --migration-run-id"
-  printf '%s' "$INVENTORY_SHA" | grep -Eq '^[0-9a-f]{64}$' \
-    || stop "snapshot requires a valid --inventory-root-sha256"
-  printf '%s' "$STATE_SHA" | grep -Eq '^[0-9a-f]{64}$' \
-    || stop "snapshot requires a valid --state-root-sha256"
-  [ ! -e "$AUTHORITY_FILE" ] || stop "operator authority already exists: $AUTHORITY_FILE"
-  "$PREFLIGHT" --stage plan --transition "$TRANSITION"
-  TARGET_WRITER_GIT_SHA="$(git rev-parse HEAD)"
-  write_writer_limits
-  REPORT_OUT="${REPORT_OUT:-$WORK_DIR/v3_rebuild_rollback_snapshot_report.json}"
-  EXPECTED_AUTH="AUTHORISE_${ENVIRONMENT}_INDEX_V3_V3_REBUILD_SNAPSHOT:${MIGRATION_RUN_ID}:${INVENTORY_SHA}:${STATE_SHA}"
-  require_authorization UK_AQ_INDEX_V3_SNAPSHOT_AUTH "$EXPECTED_AUTH"
-  run_cli \
-    --mode snapshot-v3-rollback --apply --writers-frozen \
-    --transition "$TRANSITION" \
-    --environment "$ENVIRONMENT" \
-    --expected-bucket "$CFLARE_R2_BUCKET" \
-    --migration-run-id "$MIGRATION_RUN_ID" \
-    --target-writer-git-sha "$TARGET_WRITER_GIT_SHA" \
-    --writer-limits-json "$WRITER_LIMITS" \
-    --dropbox-root "$DROPBOX_ROOT" \
-    --expected-inventory-root-sha256 "$INVENTORY_SHA" \
-    --expected-state-root-sha256 "$STATE_SHA" \
-    --report-out "$REPORT_OUT"
-  printf 'V3 REBUILD ROLLBACK SNAPSHOT COMPLETE. ROOT: %s\n' \
-    "$(jq -r '.result.snapshot_root_sha256' "$REPORT_OUT")"
-  exit 0
-fi
-
 if [ "$MODE" = "plan" ]; then
   [ "$APPLY" -eq 0 ] || stop "plan mode does not accept --apply"
   [ -n "$MIGRATION_RUN_ID" ] || stop "plan requires --migration-run-id"
@@ -477,19 +449,15 @@ if [ "$MODE" = "plan" ]; then
   [ ! -e "$AUTHORITY_FILE" ] || stop "operator authority already exists: $AUTHORITY_FILE"
   [ ! -e "$PLAN_REPORT" ] || stop "plan report already exists: $PLAN_REPORT"
   [ ! -e "$CHECKPOINT" ] || stop "checkpoint already exists: $CHECKPOINT"
-
+  V2_RUNTIME_ROLLBACK_SHA=""
   if [ "$TRANSITION" = "v3-rebuild" ]; then
-    printf '%s' "$V3_ROLLBACK_SNAPSHOT_SHA" | grep -Eq '^[0-9a-f]{64}$' \
-      || stop "v3-rebuild plan requires --v3-rollback-snapshot-root-sha256"
-  else
-    [ -z "$V3_ROLLBACK_SNAPSHOT_SHA" ] \
-      || stop "v2-to-v3 plan does not accept a v3 rebuild snapshot root"
-  fi
-  V3_SNAPSHOT_ARGS=()
-  if [ -n "$V3_ROLLBACK_SNAPSHOT_SHA" ]; then
-    V3_SNAPSHOT_ARGS=(
-      --expected-v3-rollback-snapshot-root-sha256 "$V3_ROLLBACK_SNAPSHOT_SHA"
-    )
+    [ -f "$V2_RUNTIME_ROLLBACK_RECORD" ] \
+      || stop "v3-rebuild plan requires --v2-runtime-rollback-record"
+    node scripts/index_v3_migration/index_v3_operator_evidence.mjs validate \
+      --evidence "$V2_RUNTIME_ROLLBACK_RECORD" \
+      --repository-root "$REPO_ROOT" >/dev/null \
+      || stop "v3-rebuild v2 runtime rollback record is invalid"
+    V2_RUNTIME_ROLLBACK_SHA="$(shasum -a 256 "$V2_RUNTIME_ROLLBACK_RECORD" | awk '{print $1}')"
   fi
 
   "$PREFLIGHT" --stage plan --transition "$TRANSITION"
@@ -509,13 +477,12 @@ if [ "$MODE" = "plan" ]; then
     --dropbox-root "$DROPBOX_ROOT" \
     --expected-inventory-root-sha256 "$INVENTORY_SHA" \
     --expected-state-root-sha256 "$STATE_SHA" \
-    "${V3_SNAPSHOT_ARGS[@]}" \
     --report-out "$PLAN_REPORT" > "$WORK_DIR/migration_plan_stdout.json"
 
   PLAN_SHA="$(jq -r '.result.plan_sha256 // empty' "$PLAN_REPORT")"
   [ -n "$PLAN_SHA" ] || stop "completed plan did not emit a plan SHA-256"
   AUTHORITY_TMP="$AUTHORITY_FILE.tmp-$$"
-  export AUTHORITY_TMP ENVIRONMENT REPOSITORY BRANCH TARGET_WRITER_GIT_SHA MIGRATION_RUN_ID PLAN_SHA INVENTORY_SHA STATE_SHA TRANSITION SOURCE_INDEX_GENERATION TARGET_INDEX_GENERATION V3_ROLLBACK_SNAPSHOT_SHA
+  export AUTHORITY_TMP ENVIRONMENT REPOSITORY BRANCH TARGET_WRITER_GIT_SHA MIGRATION_RUN_ID PLAN_SHA INVENTORY_SHA STATE_SHA TRANSITION SOURCE_INDEX_GENERATION TARGET_INDEX_GENERATION V2_RUNTIME_ROLLBACK_SHA
   node --input-type=module <<'NODE'
 import fs from "node:fs";
 import crypto from "node:crypto";
@@ -533,8 +500,8 @@ const authorityPayload = {
   plan_sha256: process.env.PLAN_SHA,
   inventory_root_sha256: process.env.INVENTORY_SHA,
   state_root_sha256: process.env.STATE_SHA,
-  v3_rollback_snapshot_root_sha256:
-    process.env.V3_ROLLBACK_SNAPSHOT_SHA || null,
+  v2_runtime_rollback_record_sha256:
+    process.env.V2_RUNTIME_ROLLBACK_SHA || null,
 };
 const authority = {
   ...authorityPayload,
@@ -551,17 +518,17 @@ NODE
 fi
 
 load_authority
-V3_SNAPSHOT_ARGS=()
-if [ -n "$V3_ROLLBACK_SNAPSHOT_SHA" ]; then
-  V3_SNAPSHOT_ARGS=(
-    --expected-v3-rollback-snapshot-root-sha256 "$V3_ROLLBACK_SNAPSHOT_SHA"
-  )
-fi
 
 if [ "$MODE" = "migrate" ]; then
   [ "$APPLY" -eq 1 ] || stop "migrate requires the explicit --apply flag"
   [ -n "$SITE_URL" ] || stop "migrate requires --site-url for positive maintenance verification"
   [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "migrate requires --writer-freeze-evidence"
+  V2_RUNTIME_ARGS=()
+  if [ "$TRANSITION" = "v3-rebuild" ]; then
+    [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] \
+      || stop "v3-rebuild migrate requires --v2-runtime-rollback-record"
+    V2_RUNTIME_ARGS=(--v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD")
+  fi
   [ ! -e "$CHECKPOINT" ] || stop "migrate checkpoint already exists; use explicit resume mode"
   REPORT_OUT="${REPORT_OUT:-$WORK_DIR/migration_report.json}"
   EXPECTED_AUTH="AUTHORISE_${ENVIRONMENT}_INDEX_V3_${TRANSITION}_MIGRATE:${MIGRATION_RUN_ID}:${PLAN_SHA}"
@@ -571,7 +538,8 @@ if [ "$MODE" = "migrate" ]; then
     --plan-report "$PLAN_REPORT" \
     --dropbox-root "$DROPBOX_ROOT" \
     --site-url "$SITE_URL" \
-    --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE"
+    --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE" \
+    "${V2_RUNTIME_ARGS[@]}"
   run_cli \
     --mode migrate --apply --writers-frozen \
     --transition "$TRANSITION" \
@@ -583,7 +551,6 @@ if [ "$MODE" = "migrate" ]; then
     --dropbox-root "$DROPBOX_ROOT" \
     --expected-inventory-root-sha256 "$INVENTORY_SHA" \
     --expected-state-root-sha256 "$STATE_SHA" \
-    "${V3_SNAPSHOT_ARGS[@]}" \
     --expected-plan-sha256 "$PLAN_SHA" \
     --checkpoint-out "$CHECKPOINT" \
     --report-out "$REPORT_OUT"
@@ -596,6 +563,12 @@ if [ "$MODE" = "resume" ]; then
   [ "$APPLY" -eq 1 ] || stop "resume requires the explicit --apply flag"
   [ -n "$SITE_URL" ] || stop "resume requires --site-url for positive maintenance verification"
   [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "resume requires --writer-freeze-evidence"
+  V2_RUNTIME_ARGS=()
+  if [ "$TRANSITION" = "v3-rebuild" ]; then
+    [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] \
+      || stop "v3-rebuild resume requires --v2-runtime-rollback-record"
+    V2_RUNTIME_ARGS=(--v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD")
+  fi
   [ -f "$CHECKPOINT" ] || stop "resume requires an existing checkpoint: $CHECKPOINT"
   REPORT_OUT="${REPORT_OUT:-$WORK_DIR/migration_resume_report.json}"
   EXPECTED_AUTH="AUTHORISE_${ENVIRONMENT}_INDEX_V3_${TRANSITION}_RESUME:${MIGRATION_RUN_ID}:${PLAN_SHA}"
@@ -605,7 +578,8 @@ if [ "$MODE" = "resume" ]; then
     --plan-report "$PLAN_REPORT" \
     --dropbox-root "$DROPBOX_ROOT" \
     --site-url "$SITE_URL" \
-    --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE"
+    --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE" \
+    "${V2_RUNTIME_ARGS[@]}"
   run_cli \
     --mode migrate --apply --writers-frozen \
     --transition "$TRANSITION" \
@@ -617,12 +591,84 @@ if [ "$MODE" = "resume" ]; then
     --dropbox-root "$DROPBOX_ROOT" \
     --expected-inventory-root-sha256 "$INVENTORY_SHA" \
     --expected-state-root-sha256 "$STATE_SHA" \
-    "${V3_SNAPSHOT_ARGS[@]}" \
     --expected-plan-sha256 "$PLAN_SHA" \
     --checkpoint-in "$CHECKPOINT" \
     --checkpoint-out "$CHECKPOINT" \
     --report-out "$REPORT_OUT"
   printf 'RESUME COMMAND COMPLETE. NO CUTOVER WAS PERFORMED.\n'
+  exit 0
+fi
+
+if [ "$MODE" = "rollback" ]; then
+  [ "$APPLY" -eq 1 ] || stop "rollback requires the explicit --apply flag"
+  [ "$WRITERS_FROZEN" -eq 1 ] \
+    || stop "rollback requires explicit --writers-frozen confirmation"
+  [ -n "$SITE_URL" ] || stop "rollback requires --site-url for positive maintenance verification"
+  [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "rollback requires --writer-freeze-evidence"
+  [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] || stop "rollback requires --v2-runtime-rollback-record"
+  [ -f "$CHECKPOINT" ] || stop "rollback requires an existing checkpoint: $CHECKPOINT"
+  REPORT_OUT="${REPORT_OUT:-$WORK_DIR/migration_rollback_report.json}"
+  ROLLBACK_PLAN_REPORT="$WORK_DIR/migration_rollback_plan_report.json"
+  EXPECTED_AUTH="AUTHORISE_${ENVIRONMENT}_INDEX_V3_${TRANSITION}_ROLLBACK:${MIGRATION_RUN_ID}:${PLAN_SHA}"
+  require_authorization UK_AQ_INDEX_V3_ROLLBACK_AUTH "$EXPECTED_AUTH"
+  "$PREFLIGHT" --stage rollback --transition "$TRANSITION" \
+    --authority-file "$AUTHORITY_FILE" \
+    --plan-report "$PLAN_REPORT" \
+    --dropbox-root "$DROPBOX_ROOT" \
+    --site-url "$SITE_URL" \
+    --checkpoint "$CHECKPOINT" \
+    --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE" \
+    --v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD"
+  run_cli \
+    --mode rollback-plan \
+    --transition "$TRANSITION" \
+    --environment "$ENVIRONMENT" \
+    --expected-bucket "$CFLARE_R2_BUCKET" \
+    --migration-run-id "$MIGRATION_RUN_ID" \
+    --target-writer-git-sha "$TARGET_WRITER_GIT_SHA" \
+    --writer-limits-json "$WRITER_LIMITS" \
+    --dropbox-root "$DROPBOX_ROOT" \
+    --expected-inventory-root-sha256 "$INVENTORY_SHA" \
+    --expected-state-root-sha256 "$STATE_SHA" \
+    --expected-plan-sha256 "$PLAN_SHA" \
+    --checkpoint-in "$CHECKPOINT" \
+    --report-out "$ROLLBACK_PLAN_REPORT" >/dev/null
+  jq -e '
+    .result.ready == true and
+    .result.v2_index_strategy.mode == "rebuild" and
+    .result.v2_index_strategy.rollback_index_generation == "v2" and
+    .result.v2_index_strategy.authority_switch_required == true and
+    .result.v2_index_strategy.post_restore_verification_required == true and
+    .result.v3_index_strategy == null
+  ' "$ROLLBACK_PLAN_REPORT" >/dev/null \
+    || stop "rollback plan does not require canonical-v2 restore, index_v2 rebuild, and verified v2 authority"
+  run_cli \
+    --mode rollback --apply --writers-frozen \
+    --transition "$TRANSITION" \
+    --environment "$ENVIRONMENT" \
+    --expected-bucket "$CFLARE_R2_BUCKET" \
+    --migration-run-id "$MIGRATION_RUN_ID" \
+    --target-writer-git-sha "$TARGET_WRITER_GIT_SHA" \
+    --writer-limits-json "$WRITER_LIMITS" \
+    --dropbox-root "$DROPBOX_ROOT" \
+    --expected-inventory-root-sha256 "$INVENTORY_SHA" \
+    --expected-state-root-sha256 "$STATE_SHA" \
+    --v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD" \
+    --expected-plan-sha256 "$PLAN_SHA" \
+    --checkpoint-in "$CHECKPOINT" \
+    --report-out "$REPORT_OUT"
+  jq -e '
+    .result.ok == true and
+    .result.status == "rollback_complete_v2_authority_verified" and
+    .result.v2_index_completeness.complete == true and
+    .result.v2_runtime_verification.complete == true and
+    .result.v2_runtime_verification.index_generation == "v2" and
+    .result.v2_runtime_verification.observations_reader_generation == "v2" and
+    .result.v2_runtime_verification.station_reader_generation == "v2" and
+    .result.v2_runtime_verification.cache_station_binding_generation == "v2"
+  ' "$REPORT_OUT" >/dev/null \
+    || stop "rollback report does not prove complete v2 data, index, and runtime authority"
+  printf 'ROLLBACK COMPLETE: canonical v2, index_v2, and deployed v2 reader authority are verified.\n'
   exit 0
 fi
 
@@ -661,7 +707,6 @@ run_cli \
   --dropbox-root "$DROPBOX_ROOT" \
   --expected-inventory-root-sha256 "$INVENTORY_SHA" \
   --expected-state-root-sha256 "$STATE_SHA" \
-  "${V3_SNAPSHOT_ARGS[@]}" \
   --expected-plan-sha256 "$PLAN_SHA" \
   --checkpoint-in "$CHECKPOINT" \
   --report-out "$REPORT_OUT"

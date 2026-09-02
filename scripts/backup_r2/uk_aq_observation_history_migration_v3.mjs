@@ -35,6 +35,9 @@ import {
 import {
   readAndValidateRecoveryJournal,
 } from "../index_v3_migration/recovery_journal_authority.mjs";
+import {
+  validateIndexV3OperatorEvidence,
+} from "../index_v3_migration/index_v3_operator_evidence.mjs";
 import { runHistoryIndexBuild } from "./uk_aq_build_r2_history_index.mjs";
 import {
   buildObservationHistoryV2RestorePlan,
@@ -55,17 +58,12 @@ import {
   verifyObservationHistoryV2IndexCompleteness,
   verifyObservationHistoryV3CurrentDependencies,
 } from "./lib/observation_history_migration_v3.mjs";
-import {
-  createObservationHistoryV3RebuildRollbackSnapshot,
-} from "./lib/observation_history_v3_rebuild_rollback.mjs";
-
 const MODES = new Set([
   "plan",
   "migrate",
   "verify",
   "rollback-plan",
   "rollback",
-  "snapshot-v3-rollback",
 ]);
 
 function usage() {
@@ -78,8 +76,7 @@ function usage() {
     "  --mode migrate          Execute the offline rewrite and complete v3 publication",
     "  --mode verify           Rerun complete verification without mutation",
     "  --mode rollback-plan    Build the transition-specific exact restore plan",
-    "  --mode rollback         Restore the selected transition's exact pre-state",
-    "  --mode snapshot-v3-rollback  Explicitly snapshot current v3 rollback authority to Dropbox",
+    "  --mode rollback         Restore canonical v2, rebuild/verify index_v2, then restore/verify v2 runtime authority",
     "",
     "Required for every mode:",
     "  --environment TEST|LIVE",
@@ -91,19 +88,20 @@ function usage() {
     "  --dropbox-root <local directory or rclone remote:path>",
     "  --expected-inventory-root-sha256 <hex>",
     "  --expected-state-root-sha256 <hex>",
-    "  --expected-v3-rollback-snapshot-root-sha256 <hex>  Required for v3-rebuild plan/migration",
     "  --report-out <audit JSON path>",
-    "  --expected-plan-sha256 <hex>  Required except for plan/snapshot preparation",
+    "  --expected-plan-sha256 <hex>  Required except for plan",
     "",
     "Mutation-only requirements:",
     "  --apply                  Explicitly permit the selected external mutation",
     "  --writers-frozen         Confirm every planner-listed writer is paused",
     "  --checkpoint-out <path>  Required for migrate; atomically updated after each object",
+    "  --v2-runtime-rollback-record <path>  Required for rollback authority restoration",
     "",
     "Resume/verify:",
     "  --checkpoint-in <path>   Prior checkpoint; required for verify/rollback and migrate resume",
     "",
-    "The command never changes configuration, scheduler state, deployments, or reader generation.",
+    "Migration modes never change configuration, scheduler state, deployments, or reader generation.",
+    "Rollback changes only the pinned v2 Worker deployments and persistent index authority after canonical/index verification.",
   ].join("\n");
 }
 
@@ -127,7 +125,7 @@ export function parseObservationHistoryMigrationArgs(argv) {
     dropboxRoot: null,
     expectedInventoryRootSha256: null,
     expectedStateRootSha256: null,
-    expectedV3RollbackSnapshotRootSha256: null,
+    v2RuntimeRollbackRecord: null,
     reportOut: null,
     checkpointIn: null,
     checkpointOut: null,
@@ -152,8 +150,8 @@ export function parseObservationHistoryMigrationArgs(argv) {
     } else if (flag === "--expected-state-root-sha256") {
       args.expectedStateRootSha256 = requireValue(argv, index++, flag);
     } else if (flag === "--report-out") args.reportOut = requireValue(argv, index++, flag);
-    else if (flag === "--expected-v3-rollback-snapshot-root-sha256") {
-      args.expectedV3RollbackSnapshotRootSha256 = requireValue(argv, index++, flag);
+    else if (flag === "--v2-runtime-rollback-record") {
+      args.v2RuntimeRollbackRecord = requireValue(argv, index++, flag);
     }
     else if (flag === "--checkpoint-in") args.checkpointIn = requireValue(argv, index++, flag);
     else if (flag === "--checkpoint-out") args.checkpointOut = requireValue(argv, index++, flag);
@@ -169,13 +167,10 @@ export function parseObservationHistoryMigrationArgs(argv) {
   ) {
     throw new Error("--transition must be explicitly set to v2-to-v3 or v3-rebuild");
   }
-  if (args.mode === "snapshot-v3-rollback" && args.transition !== "v3-rebuild") {
-    throw new Error("snapshot-v3-rollback requires --transition v3-rebuild");
-  }
-  if (args.apply && !new Set(["migrate", "rollback", "snapshot-v3-rollback"]).has(args.mode)) {
+  if (args.apply && !new Set(["migrate", "rollback"]).has(args.mode)) {
     throw new Error("--apply is valid only with a mutation mode");
   }
-  if (new Set(["migrate", "rollback", "snapshot-v3-rollback"]).has(args.mode) && !args.apply) {
+  if (new Set(["migrate", "rollback"]).has(args.mode) && !args.apply) {
     throw new Error(`${args.mode} mode requires --apply`);
   }
   if (args.apply && !args.writersFrozen) {
@@ -197,7 +192,10 @@ export function parseObservationHistoryMigrationArgs(argv) {
   if (new Set(["rollback-plan", "rollback"]).has(args.mode) && !args.checkpointIn) {
     throw new Error(`${args.mode} mode requires --checkpoint-in`);
   }
-  if (!new Set(["plan", "snapshot-v3-rollback"]).has(args.mode) && !String(args.expectedPlanSha256 || "").trim()) {
+  if (args.mode === "rollback" && !args.v2RuntimeRollbackRecord) {
+    throw new Error("rollback mode requires --v2-runtime-rollback-record");
+  }
+  if (args.mode !== "plan" && !String(args.expectedPlanSha256 || "").trim()) {
     throw new Error(`${args.mode} mode requires --expected-plan-sha256`);
   }
   return Object.freeze(args);
@@ -230,7 +228,6 @@ const RECOVERY_PROGRESS_SCHEMA_VERSION = 1;
 const RECOVERY_IMPLEMENTATION_PATHS = Object.freeze([
   "scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs",
   "scripts/backup_r2/lib/observation_history_migration_v3.mjs",
-  "scripts/backup_r2/lib/observation_history_v3_rebuild_rollback.mjs",
   "scripts/index_v3_migration/index_v3_migration.sh",
   "scripts/index_v3_migration/recovery_journal_authority.mjs",
 ]);
@@ -693,39 +690,6 @@ export function buildDropboxBackupReader(dropboxRoot) {
   };
 }
 
-export function buildDropboxBackupWriter(dropboxRoot) {
-  const root = String(dropboxRoot || "").trim().replace(/\/+$/, "");
-  if (!root) throw new Error("--dropbox-root is required");
-  if (isRcloneRemote(root)) {
-    return async ({ key, body }) => {
-      const target = `${root}/${String(key).replace(/^\/+/, "")}`;
-      const result = spawnSync("rclone", ["rcat", target], {
-        input: Buffer.isBuffer(body) ? body : Buffer.from(body),
-        encoding: null,
-        maxBuffer: 2_147_483_647,
-      });
-      if (result.status !== 0) {
-        throw new Error(
-          `Dropbox rclone write failed: ${key}: ${Buffer.from(result.stderr || "").toString("utf8").trim()}`,
-        );
-      }
-      return { ok: true, key };
-    };
-  }
-  const localRoot = path.resolve(root);
-  return async ({ key, body }) => {
-    const target = path.resolve(localRoot, String(key).replace(/^\/+/, ""));
-    if (target !== localRoot && !target.startsWith(`${localRoot}${path.sep}`)) {
-      throw new Error(`Dropbox backup key escapes the selected root: ${key}`);
-    }
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    const temporary = `${target}.tmp-${process.pid}`;
-    fs.writeFileSync(temporary, body, { mode: 0o600 });
-    fs.renameSync(temporary, target);
-    return { ok: true, key };
-  };
-}
-
 function requireCommonArgs(args) {
   const missing = [
     ["--transition", args.transition],
@@ -740,13 +704,6 @@ function requireCommonArgs(args) {
     ["--report-out", args.reportOut],
   ].filter(([, value]) => !String(value || "").trim());
   if (missing.length) throw new Error(`Missing required arguments: ${missing.map(([flag]) => flag).join(", ")}`);
-  if (
-    args.transition === "v3-rebuild" &&
-    args.mode !== "snapshot-v3-rollback" &&
-    !String(args.expectedV3RollbackSnapshotRootSha256 || "").trim()
-  ) {
-    throw new Error("v3-rebuild requires --expected-v3-rollback-snapshot-root-sha256");
-  }
 }
 
 function environmentEvidence(args, env, config) {
@@ -789,7 +746,6 @@ function summaryForPlan(plan) {
           state_root: identity(plan.backup_gate.state_root),
         }
       : null,
-    v3_rebuild_rollback_snapshot: plan.v3_rebuild_rollback_snapshot,
     estimated: plan.estimated,
     source_observation_content_hash_provenance_counts:
       plan.source_observation_content_hash_provenance_counts,
@@ -1089,12 +1045,233 @@ export function buildObservationHistoryV3ReportOutput({
   };
 }
 
+function runRollbackCommand(command, args, { cwd, env, label }) {
+  const result = spawnSync(command, args, {
+    cwd,
+    env,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (result.status !== 0) {
+    const detail = String(result.stderr || result.stdout || "").trim();
+    throw new Error(`${label} failed${detail ? `: ${detail}` : ""}`);
+  }
+  return Object.freeze({ ok: true, label });
+}
+
+function rollbackComponent(payload, role) {
+  const matches = (payload?.components || []).filter((entry) => entry?.role === role);
+  if (matches.length !== 1) throw new Error(`Pinned v2 runtime component is invalid: ${role}`);
+  return matches[0];
+}
+
+async function cloudflareWorkerApiGet({ accountId, apiToken, workerName, suffix }) {
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+      `/workers/scripts/${encodeURIComponent(workerName)}/${suffix}`,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${apiToken}`, Accept: "application/json" },
+    },
+  );
+  const document = await response.json().catch(() => null);
+  if (!response.ok || document?.success !== true) {
+    throw new Error(
+      `Read-only Cloudflare Worker verification failed for ${workerName} with HTTP ${response.status}`,
+    );
+  }
+  return document.result;
+}
+
+function currentFullDeploymentForVersion(result, versionId, label) {
+  const deployments = Array.isArray(result) ? result : result?.deployments;
+  if (!Array.isArray(deployments) || deployments.length === 0) {
+    throw new Error(`${label} deployment history is missing`);
+  }
+  const ordered = deployments.map((deployment) => {
+    const createdAt = Date.parse(String(deployment?.created_on || ""));
+    if (!Number.isFinite(createdAt)) {
+      throw new Error(`${label} deployment timestamp is invalid`);
+    }
+    return { deployment, createdAt };
+  }).sort((left, right) => right.createdAt - left.createdAt);
+  if (ordered.length > 1 && ordered[0].createdAt === ordered[1].createdAt) {
+    throw new Error(`${label} current deployment chronology is ambiguous`);
+  }
+  const current = ordered[0].deployment;
+  const versions = Array.isArray(current?.versions) ? current.versions : [];
+  if (
+    versions.length !== 1 ||
+    versions[0]?.version_id !== versionId ||
+    Number(versions[0]?.percentage) !== 100
+  ) {
+    throw new Error(`${label} current deployment is not the pinned v2 version at 100%`);
+  }
+  return current;
+}
+
+function serviceBindingTarget(versionDetail, bindingName, label) {
+  const bindings = (versionDetail?.resources?.bindings || []).filter((binding) =>
+    binding?.type === "service" && binding?.name === bindingName
+  );
+  if (bindings.length !== 1 || typeof bindings[0]?.service !== "string") {
+    throw new Error(`${label} does not contain one ${bindingName} Service Binding`);
+  }
+  return bindings[0].service;
+}
+
+function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, env }) {
+  const payload = rollbackEvidence.payload;
+  const observations = rollbackComponent(payload, "stable_observations_worker");
+  const station = rollbackComponent(payload, "stable_station_worker");
+  const cache = rollbackComponent(payload, "cache_worker");
+  const cacheVersionId = payload.cache_provenance.pre_cutover_v2_cache_runtime.version_id;
+  const accountId = String(env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || "").trim();
+  const apiToken = String(env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || "").trim();
+  if (!accountId || !apiToken) {
+    throw new Error(
+      "Rollback requires UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID and UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN before canonical restoration",
+    );
+  }
+  const childEnvironment = { ...process.env, ...env };
+  childEnvironment.CLOUDFLARE_ACCOUNT_ID = accountId;
+  childEnvironment.CLOUDFLARE_API_TOKEN = apiToken;
+  return Object.freeze({
+    restoreV2RuntimeAuthority: async () => {
+      const results = [];
+      results.push(runRollbackCommand("npx", [
+        "wrangler", "versions", "deploy",
+        `${observations.deployment.version_id}@100%`,
+        "--name", observations.worker_name,
+        "-y",
+      ], {
+        cwd: repositoryRoot,
+        env: childEnvironment,
+        label: "Restore pinned stable observations-history Worker",
+      }));
+      results.push(runRollbackCommand("npx", [
+        "wrangler", "versions", "deploy",
+        `${station.deployment.version_id}@100%`,
+        "--name", station.worker_name,
+        "-y",
+      ], {
+        cwd: repositoryRoot,
+        env: childEnvironment,
+        label: "Restore pinned stable station-history Worker",
+      }));
+      results.push(runRollbackCommand("gh", [
+        "variable", "set", "UK_AQ_R2_HISTORY_INDEX_VERSION",
+        "--repo", payload.repository,
+        "--body", "v2",
+      ], {
+        cwd: repositoryRoot,
+        env: childEnvironment,
+        label: "Restore persistent observation-history index authority to v2",
+      }));
+      results.push(runRollbackCommand("npx", [
+        "wrangler", "versions", "deploy",
+        `${cacheVersionId}@100%`,
+        "--name", cache.worker_name,
+        "-y",
+      ], {
+        cwd: repositoryRoot,
+        env: childEnvironment,
+        label: "Restore pinned cache Worker with stable station-history binding",
+      }));
+      return Object.freeze({
+        ok: true,
+        target_index_generation: "v2",
+        evidence_payload_sha256: rollbackEvidence.payload_sha256,
+        completed_steps: Object.freeze(results),
+      });
+    },
+    verifyV2RuntimeAuthority: async () => {
+      const repositoryResult = spawnSync("gh", [
+        "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner",
+      ], { cwd: repositoryRoot, env: childEnvironment, encoding: "utf8" });
+      if (
+        repositoryResult.status !== 0 ||
+        String(repositoryResult.stdout || "").trim() !== payload.repository
+      ) {
+        throw new Error("Post-rollback GitHub repository identity does not match v2 runtime evidence");
+      }
+      const authorityResult = spawnSync("gh", [
+        "variable", "get", "UK_AQ_R2_HISTORY_INDEX_VERSION",
+        "--repo", payload.repository,
+      ], { cwd: repositoryRoot, env: childEnvironment, encoding: "utf8" });
+      if (
+        authorityResult.status !== 0 ||
+        String(authorityResult.stdout || "").trim() !== "v2"
+      ) {
+        throw new Error("Post-rollback persistent observation-history authority is not v2");
+      }
+      const resolver = spawnSync("bash", [
+        "workers/uk_aq_cache_proxy/resolve_station_history_service.sh",
+        station.worker_name,
+        "v2",
+        "",
+      ], { cwd: repositoryRoot, env: childEnvironment, encoding: "utf8" });
+      if (
+        resolver.status !== 0 ||
+        String(resolver.stdout || "").trim() !== station.worker_name
+      ) {
+        throw new Error("Post-rollback local authority resolver does not select stable station history");
+      }
+      const deploymentChecks = await Promise.all([
+        [observations, observations.deployment.version_id, "observations-history"],
+        [station, station.deployment.version_id, "station-history"],
+        [cache, cacheVersionId, "cache"],
+      ].map(async ([component, versionId, label]) => {
+        const result = await cloudflareWorkerApiGet({
+          accountId,
+          apiToken,
+          workerName: component.worker_name,
+          suffix: "deployments",
+        });
+        const deployment = currentFullDeploymentForVersion(result, versionId, label);
+        return Object.freeze({
+          role: component.role,
+          worker_name: component.worker_name,
+          version_id: versionId,
+          deployment_id: deployment.id,
+          percentage: 100,
+        });
+      }));
+      const cacheVersion = await cloudflareWorkerApiGet({
+        accountId,
+        apiToken,
+        workerName: cache.worker_name,
+        suffix: `versions/${encodeURIComponent(cacheVersionId)}`,
+      });
+      if (cacheVersion?.id !== cacheVersionId) {
+        throw new Error("Post-rollback cache version detail does not match pinned v2 evidence");
+      }
+      if (
+        serviceBindingTarget(cacheVersion, "STATION_HISTORY", "Post-rollback cache version") !==
+          station.worker_name
+      ) {
+        throw new Error("Post-rollback cache still binds the v3 station-history candidate");
+      }
+      return Object.freeze({
+        ok: true,
+        complete: true,
+        index_generation: "v2",
+        observations_reader_generation: "v2",
+        station_reader_generation: "v2",
+        cache_station_binding_generation: "v2",
+        deployments: Object.freeze(deploymentChecks),
+      });
+    },
+  });
+}
+
 function buildR2Adapters({
   config,
   checkpointOut,
   env,
   getBackupObject,
   recoveryProgress = null,
+  runtimeAuthorityAdapters = null,
 }) {
   const r2 = config.r2;
   const durableEvidence = recoveryProgress
@@ -1230,6 +1407,7 @@ function buildR2Adapters({
         expectedCanonicalRootIdentity,
       });
     },
+    ...(runtimeAuthorityAdapters || {}),
   };
 }
 
@@ -1258,12 +1436,10 @@ export async function runObservationHistoryMigrationV3({
     readJsonFile(args.writerLimitsPath, "writer limits"),
     "migration --writer-limits-json",
   );
-  if (new Set(["migrate", "rollback", "snapshot-v3-rollback"]).has(args.mode)) {
+  if (new Set(["migrate", "rollback"]).has(args.mode)) {
     const lockOwner = args.mode === "rollback"
       ? `observation_history_rollback_${args.transition.replaceAll("-", "_")}`
-      : args.mode === "snapshot-v3-rollback"
-        ? "observation_history_v3_rebuild_snapshot"
-        : `observation_history_migration_${args.transition.replaceAll("-", "_")}`;
+      : `observation_history_migration_${args.transition.replaceAll("-", "_")}`;
     const lockContext = observationsGlobalOperationLockContext({
       env,
       expectedOwner: lockOwner,
@@ -1304,47 +1480,37 @@ export async function runObservationHistoryMigrationV3({
   const startedAt = now();
   const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
   const repositoryRoot = path.resolve(scriptDirectory, "../..");
-  if (args.mode === "snapshot-v3-rollback") {
-    const guarded = validateObservationHistoryV3MigrationEnvironment({
-      ...evidence,
-      apply: true,
+  let v2RuntimeRollbackEvidence = null;
+  if (args.mode === "rollback") {
+    v2RuntimeRollbackEvidence = readJsonFile(
+      args.v2RuntimeRollbackRecord,
+      "v2 runtime rollback record",
+    );
+    const validation = validateIndexV3OperatorEvidence({
+      evidence: v2RuntimeRollbackEvidence,
+      repositoryRoot,
     });
-    if (guarded.transition.kind !== "v3-rebuild") {
-      throw new Error("snapshot-v3-rollback is valid only for --transition v3-rebuild");
+    if (
+      validation.environment.toUpperCase() !== args.environment.toUpperCase() ||
+      validation.kind !== "uk_aq_index_v3_v2_runtime_rollback_record"
+    ) {
+      throw new Error("v2 runtime rollback record does not match the requested environment");
     }
-    const inventory = await inventoryAuthoritativeCanonicalObservationHistory({
-      getR2Object,
+    const currentBranch = spawnSync("git", ["branch", "--show-current"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
     });
-    await verifyObservationHistoryDropboxCheckpoint({
-      getR2Object,
-      getBackupObject,
-      canonicalInventory: inventory,
-      expectedInventoryRootSha256: args.expectedInventoryRootSha256,
-      expectedStateRootSha256: args.expectedStateRootSha256,
-    });
-    const snapshot = await createObservationHistoryV3RebuildRollbackSnapshot({
-      getR2Object,
-      putBackupObject: buildDropboxBackupWriter(args.dropboxRoot),
-      getBackupObject,
-      migrationRunId: args.migrationRunId,
-      environment: guarded.environment,
-      bucket: guarded.bucket,
-      canonicalRoot: inventory.root_manifest,
-    });
-    const result = {
-      kind: "uk_aq_observation_history_v3_rebuild_rollback_snapshot_result",
-      transition: guarded.transition,
-      migration_run_id: args.migrationRunId,
-      writers_frozen_confirmed: args.writersFrozen === true,
-      snapshot_root_sha256: snapshot.snapshot_root_sha256,
-      inventory_key: snapshot.inventory_key,
-      inventory_identity: snapshot.inventory_identity,
-      canonical_pre_state: snapshot.canonical_pre_state,
-      object_count: snapshot.object_count,
-      total_bytes: snapshot.total_bytes,
-    };
-    atomicWriteJson(args.reportOut, { schema_version: 1, mode: args.mode, result });
-    return result;
+    const currentRepository = spawnSync("gh", [
+      "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner",
+    ], { cwd: repositoryRoot, encoding: "utf8" });
+    if (
+      currentBranch.status !== 0 ||
+      String(currentBranch.stdout || "").trim() !== v2RuntimeRollbackEvidence.payload.branch ||
+      currentRepository.status !== 0 ||
+      String(currentRepository.stdout || "").trim() !== v2RuntimeRollbackEvidence.payload.repository
+    ) {
+      throw new Error("v2 runtime rollback record does not match the current repository/branch");
+    }
   }
   let checkpoint = args.checkpointIn
     ? readJsonFile(args.checkpointIn, "migration checkpoint")
@@ -1381,8 +1547,6 @@ export async function runObservationHistoryMigrationV3({
         targetWriterGitSha: args.targetWriterGitSha,
         expectedInventoryRootSha256: args.expectedInventoryRootSha256,
         expectedStateRootSha256: args.expectedStateRootSha256,
-        expectedV3RollbackSnapshotRootSha256:
-          args.expectedV3RollbackSnapshotRootSha256,
       });
   if (
     args.expectedPlanSha256 &&
@@ -1413,6 +1577,13 @@ export async function runObservationHistoryMigrationV3({
     env,
     getBackupObject,
     recoveryProgress,
+    runtimeAuthorityAdapters: v2RuntimeRollbackEvidence
+      ? v2RuntimeAuthorityAdapters({
+          rollbackEvidence: v2RuntimeRollbackEvidence,
+          repositoryRoot,
+          env,
+        })
+      : null,
   });
   let result;
   let rollback = null;

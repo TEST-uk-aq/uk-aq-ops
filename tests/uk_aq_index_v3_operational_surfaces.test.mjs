@@ -143,7 +143,8 @@ test("operator verification binds explicit transitions and treats Integrity v2 a
   assert.match(migrationWrapper, /source_index_generation/);
   assert.match(migrationWrapper, /target_index_generation/);
   assert.match(migrationWrapper, /authority_sha256/);
-  assert.match(migrationWrapper, /v3_rebuild_rollback_snapshot/);
+  assert.match(migrationWrapper, /rollback_complete_v2_authority_verified/);
+  assert.match(migrationWrapper, /--v2-runtime-rollback-record/);
   assert.doesNotMatch(
     migrationWrapper,
     /for variable_name in UK_AQ_R2_HISTORY_VERSION UK_AQ_R2_HISTORY_INDEX_VERSION UK_AQ_R2_HISTORY_INTEGRITY_VERSION/,

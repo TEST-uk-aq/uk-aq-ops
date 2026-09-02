@@ -9,9 +9,7 @@ import * as parquetWasm from "parquet-wasm/esm";
 
 import {
   buildObservationHistoryIndexV3ChildShardKey,
-  buildObservationHistoryIndexV3Latest,
   buildObservationHistoryIndexV3ScopedManifestKey,
-  buildObservationHistoryIndexV3ScopedHierarchy,
   finalizeObservationHistoryIndexV3Publication,
 } from "../workers/shared/uk_aq_observation_history_index_v3.mjs";
 import {
@@ -108,11 +106,6 @@ import {
   buildObservationHistoryV3ReportOutput,
   parseObservationHistoryMigrationArgs,
 } from "../scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs";
-import {
-  createObservationHistoryV3RebuildRollbackSnapshot,
-  verifyObservationHistoryV3RebuildRollbackSnapshot,
-} from "../scripts/backup_r2/lib/observation_history_v3_rebuild_rollback.mjs";
-
 const REPOSITORY_ROOT = path.resolve(import.meta.dirname, "..");
 const PREFIX = "history/v2/observations";
 const DAY = "2026-01-02";
@@ -429,51 +422,6 @@ function migrationReaderSource(r2) {
       });
     },
   };
-}
-
-function provisionalV3Metadata(source) {
-  const metadata = structuredClone(source.metadata);
-  metadata.physical_layout_version = "timeseries-bounded-v1";
-  for (const file of metadata.files) {
-    file.physical_layout_version = "timeseries-bounded-v1";
-    for (const rowGroup of file.row_groups) {
-      for (const segment of rowGroup.segments) {
-        segment.physical_layout_version = "timeseries-bounded-v1";
-      }
-    }
-  }
-  for (const segment of metadata.segments) {
-    segment.physical_layout_version = "timeseries-bounded-v1";
-  }
-  return metadata;
-}
-
-function publishProvisionalV3Hierarchy(fixture, pollutantCode = "pm25") {
-  const sourceIndex = [...fixture.pollutantKeys.keys()].indexOf(pollutantCode);
-  const source = fixture.sources[sourceIndex];
-  const manifestKey = fixture.pollutantKeys.get(pollutantCode);
-  const manifestBody = fixture.r2.get(manifestKey);
-  const manifest = JSON.parse(manifestBody.toString("utf8"));
-  const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({
-    metadata: provisionalV3Metadata(source),
-    canonicalManifest: {
-      key: manifestKey,
-      byte_size: manifestBody.byteLength,
-      sha256: sha256Hex(manifestBody),
-      manifest_hash: manifest.manifest_hash,
-      row_count: manifest.row_count,
-      observation_content_hash: manifest.observation_content_hash,
-    },
-  });
-  const latest = buildObservationHistoryIndexV3Latest({
-    scopedHierarchies: [hierarchy],
-  });
-  for (const object of [
-    ...hierarchy.child_shards,
-    hierarchy.scoped_manifest,
-    latest,
-  ]) fixture.r2.set(object.key, Buffer.from(object.body, "utf8"));
-  return { hierarchy, latest };
 }
 
 function readerWithFailure(objects, shouldFail, errorForKey) {
@@ -889,6 +837,8 @@ function memoryAdapters(fixture, options = {}) {
   const stagedBodies = new Map();
   const activeStagedUnits = new Set();
   let rebuildCalls = 0;
+  let runtimeRestoreCalls = 0;
+  let runtimeVerifyCalls = 0;
   let putCalls = 0;
   let jsonPutCalls = 0;
   let maxStagedUnits = 0;
@@ -904,6 +854,8 @@ function memoryAdapters(fixture, options = {}) {
     get maxStagedBodies() { return maxStagedBodies; },
     get stagedBodyCount() { return stagedBodies.size; },
     get rebuildCalls() { return rebuildCalls; },
+    get runtimeRestoreCalls() { return runtimeRestoreCalls; },
+    get runtimeVerifyCalls() { return runtimeVerifyCalls; },
     getObject,
     headObject: async ({ key }) => fixture.r2.has(key)
       ? {
@@ -985,6 +937,21 @@ function memoryAdapters(fixture, options = {}) {
         ok: true,
         complete: true,
         pollutant_index_count: 2,
+      };
+    },
+    restoreV2RuntimeAuthority: async () => {
+      runtimeRestoreCalls += 1;
+      return { ok: true, target_index_generation: "v2" };
+    },
+    verifyV2RuntimeAuthority: async () => {
+      runtimeVerifyCalls += 1;
+      return {
+        ok: true,
+        complete: true,
+        index_generation: "v2",
+        observations_reader_generation: "v2",
+        station_reader_generation: "v2",
+        cache_station_binding_generation: "v2",
       };
     },
   };
@@ -2661,166 +2628,42 @@ test("v2-to-v3 migration output crosses 1024 rows and is consumed by the exact r
   }
 });
 
-test("v3-rebuild rollback snapshot pins the authoritative exact index closure to canonical pre-state", async () => {
-  const fixture = await buildFixture();
-  const plan = await buildPlan(fixture);
-  const adapters = memoryAdapters(fixture);
-  const migration = await executeObservationHistoryV3MigrationPlan({
-    plan,
-    apply: true,
-    writersFrozen: true,
-    environmentEvidence: ENVIRONMENT,
-    adapters,
-  });
-  assert.equal(migration.verification.cutover_ready, true);
-  const currentInventory = await inventoryAuthoritativeCanonicalObservationHistory({
-    getR2Object: mapReader(fixture.r2),
-  });
-  const snapshotStore = new Map();
-  const putBackupObject = async ({ key, body }) => {
-    snapshotStore.set(key, Buffer.from(body));
-    return { ok: true };
-  };
-  const snapshot = await createObservationHistoryV3RebuildRollbackSnapshot({
-    getR2Object: mapReader(fixture.r2),
-    putBackupObject,
-    getBackupObject: mapReader(snapshotStore),
-    migrationRunId: "fixture-v3-rebuild",
-    environment: "TEST",
-    bucket: ENVIRONMENT.bucket,
-    canonicalRoot: currentInventory.root_manifest,
-  });
-  assert.equal(snapshot.verified, true);
-  assert.deepEqual(snapshot.source_v3_generation, {
-    hierarchy: "exact-timeseries-leaf-v1",
-    physical_layout_version: "timeseries-aligned-v2",
-    aligned_row_cap: 1024,
-    exact_leaf_index_version: "exact-timeseries-leaf-v1",
-  });
-  assert.ok(snapshot.object_count > 1);
-  assert.ok(snapshot.objects.some((entry) => entry.stage === "latest_global"));
-  assert.ok(snapshot.objects.some((entry) => entry.stage === "scoped_manifest"));
-  assert.ok(snapshot.objects.some((entry) => entry.stage === "exact_leaf"));
-  assert.ok(snapshot.objects.some((entry) => entry.stage === "aligned_manifest"));
-  assert.ok(snapshot.objects.some((entry) => entry.stage === "aligned_child"));
-  const verified = await verifyObservationHistoryV3RebuildRollbackSnapshot({
-    getBackupObject: mapReader(snapshotStore),
-    getR2Object: mapReader(fixture.r2),
-    migrationRunId: "fixture-v3-rebuild",
-    environment: "TEST",
-    bucket: ENVIRONMENT.bucket,
-    canonicalRoot: currentInventory.root_manifest,
-    expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
-  });
-  assert.equal(verified.snapshot_root_sha256, snapshot.snapshot_root_sha256);
-  const driftedR2 = new Map(fixture.r2);
-  const driftedKey = snapshot.objects.find(
-    (entry) => entry.stage === "exact_leaf",
-  ).key;
-  driftedR2.set(driftedKey, Buffer.from(`${driftedR2.get(driftedKey)} `));
-  await assert.rejects(
-    verifyObservationHistoryV3RebuildRollbackSnapshot({
-      getBackupObject: mapReader(snapshotStore),
-      getR2Object: mapReader(driftedR2),
-      migrationRunId: "fixture-v3-rebuild",
-      environment: "TEST",
-      bucket: ENVIRONMENT.bucket,
-      canonicalRoot: currentInventory.root_manifest,
-      expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
-    }),
-    /current authoritative v3 pre-state object identity mismatch/,
-  );
-  await assert.rejects(
-    verifyObservationHistoryV3RebuildRollbackSnapshot({
-      getBackupObject: mapReader(snapshotStore),
-      migrationRunId: "fixture-v3-rebuild",
-      environment: "TEST",
-      bucket: ENVIRONMENT.bucket,
-      canonicalRoot: { ...currentInventory.root_manifest, sha256: "f".repeat(64) },
-      expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
-    }),
-    /does not match this migration/,
-  );
-});
-
-test("v3-rebuild rollback snapshot captures the provisional range-shard authority", async () => {
+test("v3-rebuild rollback restores pinned canonical v2 and requires rebuilt index_v2 plus verified v2 runtime authority", async () => {
   const fixture = await buildFixture({ pollutantCodes: ["pm25"] });
-  const provisional = publishProvisionalV3Hierarchy(fixture);
-  const currentInventory = await inventoryAuthoritativeCanonicalObservationHistory({
-    getR2Object: mapReader(fixture.r2),
-  });
-  const putBackupObject = async ({ key, body }) => {
-    fixture.backup.set(key, Buffer.from(body));
-    return { ok: true };
-  };
-  const snapshot = await createObservationHistoryV3RebuildRollbackSnapshot({
-    getR2Object: mapReader(fixture.r2),
-    putBackupObject,
-    getBackupObject: mapReader(fixture.backup),
-    migrationRunId: "fixture-migration",
-    environment: "TEST",
-    bucket: ENVIRONMENT.bucket,
-    canonicalRoot: currentInventory.root_manifest,
-  });
-  assert.equal(snapshot.verified, true);
-  assert.deepEqual(snapshot.source_v3_generation, {
-    hierarchy: "provisional-range-shard-v1",
-    physical_layout_version: "timeseries-bounded-v1",
-  });
-  assert.deepEqual(
-    snapshot.objects.map((entry) => entry.key),
-    [
-      ...provisional.hierarchy.child_shards.map((entry) => entry.key),
-      provisional.hierarchy.scoped_manifest.key,
-      provisional.latest.key,
-    ],
-  );
-  const verified = await verifyObservationHistoryV3RebuildRollbackSnapshot({
-    getBackupObject: mapReader(fixture.backup),
-    getR2Object: mapReader(fixture.r2),
-    migrationRunId: "fixture-migration",
-    environment: "TEST",
-    bucket: ENVIRONMENT.bucket,
-    canonicalRoot: currentInventory.root_manifest,
-    expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
-  });
-  assert.equal(verified.snapshot_root_sha256, snapshot.snapshot_root_sha256);
-
-  const childKey = provisional.hierarchy.child_shards[0].key;
-  const driftedR2 = new Map(fixture.r2);
-  driftedR2.set(childKey, Buffer.from(`${driftedR2.get(childKey)} `));
-  await assert.rejects(
-    verifyObservationHistoryV3RebuildRollbackSnapshot({
-      getBackupObject: mapReader(fixture.backup),
-      getR2Object: mapReader(driftedR2),
-      migrationRunId: "fixture-migration",
-      environment: "TEST",
-      bucket: ENVIRONMENT.bucket,
-      canonicalRoot: currentInventory.root_manifest,
-      expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
-    }),
-    /current authoritative v3 pre-state object identity mismatch/,
-  );
-
   const plan = await buildPlan(fixture, {
     environmentEvidence: {
       ...ENVIRONMENT,
       transition: "v3-rebuild",
       indexVersion: "v3",
     },
-    expectedV3RollbackSnapshotRootSha256: snapshot.snapshot_root_sha256,
   });
   assert.deepEqual(plan.blockers, []);
+  assert.equal(plan.transition.authority_switch_required, false);
   const restorePlan = await buildObservationHistoryV2RestorePlan({
     migrationPlan: plan,
     getBackupObject: mapReader(fixture.backup),
   });
-  const restoredLegacyKeys = restorePlan.objects
-    .filter((entry) => entry.key.startsWith("history/_index_v3/"))
-    .map((entry) => entry.key);
-  assert.deepEqual(restoredLegacyKeys, snapshot.objects.map((entry) => entry.key));
-  assert.equal(restorePlan.objects.at(-1).key, provisional.latest.key);
-  assert.ok(snapshot.objects.every((entry) => !entry.key.endsWith(".parquet")));
+  assert.equal(restorePlan.v2_index_strategy.mode, "rebuild");
+  assert.equal(restorePlan.v2_index_strategy.rollback_index_generation, "v2");
+  assert.equal(restorePlan.v2_index_strategy.authority_switch_required, true);
+  assert.equal(restorePlan.v3_index_strategy, null);
+  assert.ok(restorePlan.objects.every((entry) => !entry.key.startsWith("history/_index_v3/")));
+  const adapters = memoryAdapters(fixture);
+  const rollback = await executeObservationHistoryV2Rollback({
+    restorePlan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: {
+      ...ENVIRONMENT,
+      transition: "v3-rebuild",
+      indexVersion: "v3",
+    },
+    adapters,
+  });
+  assert.equal(rollback.status, "rollback_complete_v2_authority_verified");
+  assert.equal(adapters.rebuildCalls, 1);
+  assert.equal(adapters.runtimeRestoreCalls, 1);
+  assert.equal(adapters.runtimeVerifyCalls, 1);
 });
 
 test("Phase 4 resumes after an early PUT failure without rereading overwritten source", async () => {
@@ -3544,12 +3387,14 @@ test("Phase 4 rollback restores from the checkpoint after partial migration with
   assert.equal(rollback.ok, true);
   assert.equal(rollback.observed_starting_index_version, "v3");
   assert.equal(adapters.rebuildCalls, 1);
+  assert.equal(adapters.runtimeRestoreCalls, 1);
+  assert.equal(adapters.runtimeVerifyCalls, 1);
   for (const [key, expected] of fixture.oldCanonical) {
     assert.equal(Buffer.compare(fixture.r2.get(key), expected), 0, key);
   }
-  assert.equal(rollback.configuration_changed, false);
+  assert.equal(rollback.configuration_changed, true);
   assert.equal(rollback.scheduler_changed, false);
-  assert.equal(rollback.deployment_changed, false);
+  assert.equal(rollback.deployment_changed, true);
 });
 
 test("Phase 4 rollback restores from the same checkpoint after completed migration", async () => {
