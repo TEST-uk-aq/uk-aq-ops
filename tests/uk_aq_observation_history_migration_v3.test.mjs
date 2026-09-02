@@ -230,31 +230,28 @@ function exactArrayBuffer(value) {
   return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
 }
 
-const LEGACY_PHYSICAL_LAYOUT = "timeseries-bounded-v1";
-const LEGACY_PARQUET_CREATED_BY = [
-  `writer_version=${OBSERVATION_HISTORY_WRITER_VERSION_V3}`,
-  `history_schema_version=${OBSERVATION_HISTORY_SCHEMA_VERSION_V3}`,
-  `physical_layout_version=${LEGACY_PHYSICAL_LAYOUT}`,
-].join(";");
-let legacyParquetWasmInitialized = false;
+const HISTORICAL_V2_OBSERVATION_ROW_GROUP_SIZE = 50_000;
+const HISTORICAL_V2_PARQUET_CREATED_BY =
+  OBSERVATION_HISTORY_WRITER_VERSION_V3;
+let historicalV2ParquetWasmInitialized = false;
 
-function ensureLegacyParquetWasmInitialized() {
-  if (legacyParquetWasmInitialized) return;
+function ensureHistoricalV2ParquetWasmInitialized() {
+  if (historicalV2ParquetWasmInitialized) return;
   parquetWasm.initSync({
     module: fs.readFileSync(path.join(
       REPOSITORY_ROOT,
       "node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm",
     )),
   });
-  legacyParquetWasmInitialized = true;
+  historicalV2ParquetWasmInitialized = true;
 }
 
-function buildLegacyCanonicalObservationSource(rows, { fileKeyForOrdinal }) {
+function buildHistoricalCanonicalV2ObservationSource(rows, { fileKeyForOrdinal }) {
   const hash = computeObservationContentHash(rows);
   const orderedRows = hash.canonical_rows;
   const first = orderedRows[0];
   const key = fileKeyForOrdinal(0);
-  ensureLegacyParquetWasmInitialized();
+  ensureHistoricalV2ParquetWasmInitialized();
   const table = arrow.tableFromArrays({
     connector_id: arrow.vectorFromArray(
       orderedRows.map((row) => row.connector_id),
@@ -287,8 +284,8 @@ function buildLegacyCanonicalObservationSource(rows, { fileKeyForOrdinal }) {
   });
   const properties = new parquetWasm.WriterPropertiesBuilder()
     .setCompression(parquetWasm.Compression.ZSTD)
-    .setMaxRowGroupSize(orderedRows.length)
-    .setCreatedBy(LEGACY_PARQUET_CREATED_BY)
+    .setMaxRowGroupSize(HISTORICAL_V2_OBSERVATION_ROW_GROUP_SIZE)
+    .setCreatedBy(HISTORICAL_V2_PARQUET_CREATED_BY)
     .build();
   const wasmTable = parquetWasm.Table.fromIPCStream(
     arrow.tableToIPC(table, "stream"),
@@ -319,7 +316,6 @@ function buildLegacyCanonicalObservationSource(rows, { fileKeyForOrdinal }) {
       file_etag: null,
       history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
       writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
-      physical_layout_version: LEGACY_PHYSICAL_LAYOUT,
     });
     start = end;
   }
@@ -352,7 +348,6 @@ function buildLegacyCanonicalObservationSource(rows, { fileKeyForOrdinal }) {
     etag: null,
     history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
     writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
-    physical_layout_version: LEGACY_PHYSICAL_LAYOUT,
     row_group_count: footer.row_groups.length,
     row_groups: [rowGroup],
     timeseries_row_counts: Object.fromEntries(segments.map((segment) => [
@@ -366,7 +361,6 @@ function buildLegacyCanonicalObservationSource(rows, { fileKeyForOrdinal }) {
       history_version: "v2",
       history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
       writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
-      physical_layout_version: LEGACY_PHYSICAL_LAYOUT,
       columns: [...OBSERVATION_HISTORY_COLUMNS_V3],
       physical_order: [
         "timeseries_id ASC",
@@ -378,15 +372,7 @@ function buildLegacyCanonicalObservationSource(rows, { fileKeyForOrdinal }) {
         connector_id: first.connector_id,
         pollutant_code: first.pollutant_code,
       },
-      limits: {
-        target_row_group_rows: 8192,
-        max_row_group_rows: 16384,
-        target_file_rows: 65536,
-        max_file_rows: 131072,
-        target_file_bytes: 4194304,
-        max_file_bytes: 8388608,
-        max_row_groups_per_file: 8,
-      },
+      row_group_size: HISTORICAL_V2_OBSERVATION_ROW_GROUP_SIZE,
       row_count: orderedRows.length,
       file_count: 1,
       files: [file],
@@ -394,7 +380,7 @@ function buildLegacyCanonicalObservationSource(rows, { fileKeyForOrdinal }) {
       ...contentHash,
     },
     file_bodies: [{ key, body }],
-    legacy_footer: footer,
+    historical_v2_footer: footer,
   };
 }
 
@@ -2408,25 +2394,24 @@ test("v2-to-v3 migration output crosses 1024 rows and is consumed by the exact r
   const fixture = await buildFixture({
     pollutantCodes: ["pm25"],
     inputRowsByPollutant: { pm25: [...denseRows, ...sparseRows] },
-    sourceBuilder: buildLegacyCanonicalObservationSource,
+    sourceBuilder: buildHistoricalCanonicalV2ObservationSource,
   });
   assert.equal(fixture.source.metadata.history_version, "v2");
-  assert.equal(
-    fixture.source.metadata.physical_layout_version,
-    LEGACY_PHYSICAL_LAYOUT,
-  );
   assert.deepEqual(
     fixture.source.metadata.columns,
     OBSERVATION_HISTORY_COLUMNS_V3,
   );
-  assert.equal(fixture.source.legacy_footer.created_by, LEGACY_PARQUET_CREATED_BY);
-  assert.equal(fixture.source.legacy_footer.row_groups.length, 1);
   assert.equal(
-    Number(fixture.source.legacy_footer.row_groups[0].num_rows),
+    fixture.source.historical_v2_footer.created_by,
+    HISTORICAL_V2_PARQUET_CREATED_BY,
+  );
+  assert.equal(fixture.source.historical_v2_footer.row_groups.length, 1);
+  assert.equal(
+    Number(fixture.source.historical_v2_footer.row_groups[0].num_rows),
     1027,
   );
   assert.ok(
-    Number(fixture.source.legacy_footer.row_groups[0].num_rows) >
+    Number(fixture.source.historical_v2_footer.row_groups[0].num_rows) >
       OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
   );
   assert.deepEqual(
@@ -2435,6 +2420,15 @@ test("v2-to-v3 migration output crosses 1024 rows and is consumed by the exact r
       .map((segment) => segment.row_count),
     [1025],
   );
+  for (const finalV3Field of [
+    "physical_layout_version",
+    "aligned_row_cap",
+    "exact_leaf_index_version",
+    "decode_profile",
+  ]) {
+    assert.equal(finalV3Field in fixture.source.metadata, false);
+    assert.equal(finalV3Field in fixture.source.metadata.files[0], false);
+  }
   const sourceManifestBody = fixture.r2.get(fixture.pollutantKeys.get("pm25"));
   const sourceManifest = JSON.parse(sourceManifestBody.toString("utf8"));
   validateCanonicalHistoryV2Manifest(sourceManifest, {
@@ -2445,6 +2439,16 @@ test("v2-to-v3 migration output crosses 1024 rows and is consumed by the exact r
     pollutant_code: "pm25",
     manifest_key: fixture.pollutantKeys.get("pm25"),
   });
+  assert.equal(
+    sourceManifest.history_schema_version,
+    OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+  );
+  assert.deepEqual(sourceManifest.columns, OBSERVATION_HISTORY_COLUMNS_V3);
+  assert.equal(
+    sourceManifest.writer_version,
+    OBSERVATION_HISTORY_WRITER_VERSION_V3,
+  );
+  assert.equal("physical_layout_version" in sourceManifest, false);
 
   const plan = await buildPlan(fixture, {
     writerLimits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
