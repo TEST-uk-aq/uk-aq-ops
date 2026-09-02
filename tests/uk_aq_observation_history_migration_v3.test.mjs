@@ -1058,7 +1058,12 @@ test("Phase 6 derives and pins genuine legacy hashless metadata for any canonica
     return mapReader(fixture.r2)({ key });
   };
   const first = await buildPlan(fixture, { getR2Object });
-  assert.equal(canonicalParquetReads, 1);
+  assert.equal(
+    canonicalParquetReads,
+    fixture.sources.find((source) =>
+      source.metadata.partition.pollutant_code === "h3cch2chch32"
+    ).file_bodies.length,
+  );
   const second = await buildPlan(fixture);
   assert.equal(first.plan_sha256, second.plan_sha256);
   assert.deepEqual(first.source_observation_content_hash_provenance_counts, {
@@ -1175,6 +1180,9 @@ test("Phase 6 accepts a generic legacy stale parent only when all summary identi
     target_schema: first.target.history_schema_version,
     target_writer: first.target.writer_version,
     target_layout: first.target.physical_layout_version,
+    target_aligned_row_cap: first.target.aligned_row_cap,
+    target_exact_leaf_index_version: first.target.exact_leaf_index_version,
+    target_decode_profile: first.target.decode_profile,
   }));
   assert.equal(unit.unit_id, expectedUnitId);
   const changedReference = structuredClone(unit.source_manifest_reference);
@@ -1194,6 +1202,9 @@ test("Phase 6 accepts a generic legacy stale parent only when all summary identi
       target_schema: first.target.history_schema_version,
       target_writer: first.target.writer_version,
       target_layout: first.target.physical_layout_version,
+      target_aligned_row_cap: first.target.aligned_row_cap,
+      target_exact_leaf_index_version: first.target.exact_leaf_index_version,
+      target_decode_profile: first.target.decode_profile,
     })),
   );
   const alternateFixture = await buildFixture({

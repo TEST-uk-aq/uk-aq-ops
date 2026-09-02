@@ -24,53 +24,13 @@ import {
 import { sha256Hex } from "./r2_sigv4.mjs";
 
 export const OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION =
-  "timeseries-aligned-v2";
-export const OBSERVATION_HISTORY_ALIGNED_ROW_CAP = 1024;
-export const OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID =
-  "hyparquet-direct-column-v1";
-export const OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION =
-  "exact-timeseries-leaf-v1";
+  "timeseries-bounded-v1";
 
 const REQUIRED_RANGED_READER_COLUMNS = Object.freeze([
+  "timeseries_id",
   "observed_at_utc",
   "value",
 ]);
-export const OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE = Object.freeze({
-  version: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
-  hyparquet_version: "1.25.1",
-  page_headers: "included_in_column_chunk_ranges",
-  root_schema_element: Object.freeze({
-    repetition_type: "REQUIRED",
-    name: "schema",
-    num_children: 7,
-  }),
-  columns: Object.freeze({
-    observed_at_utc: Object.freeze({
-      physical_type: "INT64",
-      codec: "ZSTD",
-      schema_element: Object.freeze({
-        type: "INT64",
-        repetition_type: "OPTIONAL",
-        name: "observed_at_utc",
-        converted_type: "TIMESTAMP_MILLIS",
-        logical_type: Object.freeze({
-          type: "TIMESTAMP",
-          isAdjustedToUTC: false,
-          unit: "MILLIS",
-        }),
-      }),
-    }),
-    value: Object.freeze({
-      physical_type: "DOUBLE",
-      codec: "ZSTD",
-      schema_element: Object.freeze({
-        type: "DOUBLE",
-        repetition_type: "OPTIONAL",
-        name: "value",
-      }),
-    }),
-  }),
-});
 const PARQUET_CREATED_BY = [
   `writer_version=${OBSERVATION_HISTORY_WRITER_VERSION_V3}`,
   `history_schema_version=${OBSERVATION_HISTORY_SCHEMA_VERSION_V3}`,
@@ -99,7 +59,7 @@ function positiveSafeInteger(value, fieldName) {
 
 function validateLimits(limits) {
   if (!limits || typeof limits !== "object" || Array.isArray(limits)) {
-    throw new TypeError("timeseries-aligned writer limits must be an object");
+    throw new TypeError("timeseries-bounded writer limits must be an object");
   }
   const normalized = {
     target_row_group_rows: positiveSafeInteger(
@@ -141,14 +101,6 @@ function validateLimits(limits) {
   }
   if (normalized.target_file_bytes > normalized.max_file_bytes) {
     throw new TypeError("target_file_bytes must not exceed max_file_bytes");
-  }
-  if (
-    normalized.target_row_group_rows > OBSERVATION_HISTORY_ALIGNED_ROW_CAP ||
-    normalized.max_row_group_rows > OBSERVATION_HISTORY_ALIGNED_ROW_CAP
-  ) {
-    throw new TypeError(
-      `timeseries-aligned-v2 row-group limits must not exceed the ${OBSERVATION_HISTORY_ALIGNED_ROW_CAP}-row segment cap`,
-    );
   }
   return Object.freeze(normalized);
 }
@@ -249,8 +201,16 @@ function canonicalPhysicalRows(rows, explicitPartition = null) {
 }
 
 function packTimeseriesAwareRowGroups(rows, limits) {
-  const hardCapacity = limits.max_row_group_rows;
+  const hardCapacity = Math.min(
+    limits.max_row_group_rows,
+    limits.max_file_rows,
+  );
   const groups = [];
+  let current = [];
+  const flush = () => {
+    if (current.length) groups.push(current);
+    current = [];
+  };
 
   for (let start = 0; start < rows.length;) {
     let end = start + 1;
@@ -260,11 +220,25 @@ function packTimeseriesAwareRowGroups(rows, limits) {
     ) {
       end += 1;
     }
-    for (let runStart = start; runStart < end; runStart += hardCapacity) {
-      groups.push(rows.slice(runStart, Math.min(end, runStart + hardCapacity)));
+    let runStart = start;
+    while (end - runStart > hardCapacity) {
+      flush();
+      groups.push(rows.slice(runStart, runStart + hardCapacity));
+      runStart += hardCapacity;
+    }
+    const remainder = rows.slice(runStart, end);
+    if (remainder.length) {
+      if (
+        current.length &&
+        current.length + remainder.length > limits.target_row_group_rows
+      ) {
+        flush();
+      }
+      current.push(...remainder);
     }
     start = end;
   }
+  flush();
   return groups;
 }
 
@@ -564,13 +538,6 @@ function validateProjectedColumnChunkRange(column, label, fileByteLength) {
   ) {
     throw new Error(`Parquet ${label} column-chunk range is invalid`);
   }
-  return Object.freeze({
-    start: chunkStart,
-    end: chunkEnd,
-    data_page_offset: dataPageOffset,
-    dictionary_page_offset: dictionaryPageOffset,
-    num_values: Number(metadata.num_values),
-  });
 }
 
 function buildIntendedSegments(rows, groupSizes) {
@@ -664,7 +631,6 @@ function validateFooter({ body, rows, limits, intended }) {
 
   const pageIndexAvailability = {};
   let validatedProjectedColumnChunks = 0;
-  const rowGroupColumnRanges = [];
   for (const [ordinal, actual] of actualGroups.entries()) {
     const expected = intended.rowGroups[ordinal];
     const actualRows = Number(actual.num_rows);
@@ -674,16 +640,12 @@ function validateFooter({ body, rows, limits, intended }) {
     ) {
       throw new Error(`Parquet row group ${ordinal} row bound mismatch`);
     }
-    if (
-      expected.segments.length !== 1 ||
-      expected.segments[0].row_count !== expected.row_count ||
-      expected.segments[0].row_group_row_start !== 0 ||
-      expected.min_timeseries_id !== expected.max_timeseries_id ||
-      expected.row_count > OBSERVATION_HISTORY_ALIGNED_ROW_CAP
-    ) {
-      throw new Error(
-        `Intended row group ${ordinal} is not one complete cap-1024 timeseries segment`,
-      );
+    const expectedSegmentRows = expected.segments.reduce(
+      (sum, segment) => sum + segment.row_count,
+      0,
+    );
+    if (expectedSegmentRows !== expected.row_count) {
+      throw new Error(`Intended row group ${ordinal} segment coverage mismatch`);
     }
 
     const timeseriesColumn = columnChunk(actual, "timeseries_id");
@@ -706,20 +668,13 @@ function validateFooter({ body, rows, limits, intended }) {
       throw new Error(`Parquet row group ${ordinal} routing statistics mismatch`);
     }
 
-    const exactRanges = {};
     for (const columnName of REQUIRED_RANGED_READER_COLUMNS) {
       const column = columnChunk(actual, columnName);
-      const range = validateProjectedColumnChunkRange(
+      validateProjectedColumnChunkRange(
         column,
         `row group ${ordinal} ${columnName}`,
         body.byteLength,
       );
-      if (range.num_values !== actualRows) {
-        throw new Error(
-          `Parquet row group ${ordinal} ${columnName} value count mismatch`,
-        );
-      }
-      exactRanges[columnName] = range;
       validatedProjectedColumnChunks += 1;
       const available = validateOptionalPageIndexes(
         column,
@@ -733,7 +688,6 @@ function validateFooter({ body, rows, limits, intended }) {
       pageIndexAvailability[columnName] =
         (pageIndexAvailability[columnName] ?? true) && available;
     }
-    rowGroupColumnRanges.push(Object.freeze(exactRanges));
   }
   if (actualGroups.length > limits.max_row_groups_per_file) {
     throw new Error("Parquet footer exceeds max_row_groups_per_file");
@@ -745,7 +699,6 @@ function validateFooter({ body, rows, limits, intended }) {
     projected_column_chunk_fallback_supported:
       validatedProjectedColumnChunks ===
         actualGroups.length * REQUIRED_RANGED_READER_COLUMNS.length,
-    row_group_column_ranges: Object.freeze(rowGroupColumnRanges),
   };
 }
 
@@ -800,7 +753,7 @@ function validateCompleteSegments(metadata, orderedRows) {
  * Build the isolated target physical layout for one canonical observation
  * day/connector/pollutant partition. This function has no R2 side effects.
  */
-export function buildCanonicalObservationTimeseriesAlignedFiles(rows, {
+export function buildCanonicalObservationTimeseriesBoundedFiles(rows, {
   limits: rawLimits,
   fileKeyForOrdinal,
   partition = null,
@@ -854,8 +807,6 @@ export function buildCanonicalObservationTimeseriesAlignedFiles(rows, {
     };
     const exactSegments = intended.segments.map((segment) => ({
       ...segment,
-      column_ranges:
-        footer.row_group_column_ranges[segment.row_group_ordinal],
       file_ordinal: fileOrdinal,
       file_key: key,
       file_row_count: identity.row_count,
@@ -898,9 +849,6 @@ export function buildCanonicalObservationTimeseriesAlignedFiles(rows, {
     history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
     writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
     physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-    aligned_row_cap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-    exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
-    decode_profile: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE,
     columns: [...OBSERVATION_HISTORY_COLUMNS_V3],
     physical_order: [
       "timeseries_id ASC",
@@ -918,8 +866,3 @@ export function buildCanonicalObservationTimeseriesAlignedFiles(rows, {
   validateCompleteSegments(metadata, orderedRows);
   return { metadata, file_bodies: fileBodies };
 }
-
-// Compatibility export for callers that have not yet adopted the selected
-// layout-specific name. It produces only timeseries-aligned-v2 output.
-export const buildCanonicalObservationTimeseriesBoundedFiles =
-  buildCanonicalObservationTimeseriesAlignedFiles;

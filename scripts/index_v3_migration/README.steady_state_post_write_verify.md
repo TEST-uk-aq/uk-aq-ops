@@ -20,7 +20,9 @@ Evidence sources are:
 - the successful controlled Phase B report, including its source-freeze coordinator evidence;
 - independent IngestDB `SELECT`s, all enclosed in an explicit PostgreSQL `READ ONLY` transaction that is rolled back, and recomputation of source-content-hash v1;
 - canonical R2 connector, pollutant, day and aggregate manifests plus Parquet `HEAD` checksum evidence;
-- current v3 latest-global, scoped and child objects, validated by production readers;
+- current v3 latest-global, exact-timeseries scoped manifests and exact leaf
+  objects, including their aligned-source evidence, validated against the
+  production exact-reader contract;
 - the authenticated completed-migration recovery journal as the post-migration/pre-steady-state hierarchy baseline;
 - the pinned local Dropbox state-root identity, read only to prove the first post-v3 backup has not been started;
 - a cache-bypassed ranged station-series HTTP GET using an accepted-scope timeseries selected from v3 authority.
@@ -32,7 +34,7 @@ including `--required-unchanged-day`, must still match exactly. Only the
 accepted month, year and root aggregate lineage may advance, and its current
 objects must contain exactly the authenticated sibling children with the
 accepted branch identity replaced. All unaffected completed-migration v3
-scoped/child objects remain exact, and latest-global must contain exactly the
+scoped/exact-leaf objects remain exact, and latest-global must contain exactly the
 authenticated baseline canonical days plus the accepted day while retaining
 every older day summary exactly.
 
@@ -40,7 +42,9 @@ Dependency outcomes are recorded as `EXACT`, `LEGACY_RECOVERY_ORDERING` or
 `FAIL`. A newly written steady-state v3 scope is exact-only in both TEST and
 LIVE: `FAIL=0` and `LEGACY_RECOVERY_ORDERING=0` are mandatory.
 Missing/extra pollutants, source/gate/run mismatches, lost source rows,
-checksum/size mismatches, non-v3 physical schema, hard writer-limit violations,
+checksum/size mismatches, non-`timeseries-aligned-v2` physical schema, a row
+group above the fixed 1,024-row cap, invalid exact column ranges, hard
+writer-limit violations,
 invalid baseline provenance, stale deployment evidence or an unsuccessful
 deployed read all fail closed. A whole-day gate blocked solely by pending peer
 connectors is valid.

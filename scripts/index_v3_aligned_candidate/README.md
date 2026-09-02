@@ -32,6 +32,12 @@ Do not reopen row-cap calibration without new evidence that the selected
 
 This prototype path never writes canonical history or index keys.
 
+The selected design is now implemented by the shared production write path in
+`workers/shared/uk_aq_observation_history_target_writer.mjs` and
+`workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs`. This
+candidate directory remains calibration evidence only; migration and
+steady-state publication must not import or execute it.
+
 ## Why aligned-v2 exists
 
 The earlier `timeseries-bounded-v1` layout allowed multiple timeseries to share

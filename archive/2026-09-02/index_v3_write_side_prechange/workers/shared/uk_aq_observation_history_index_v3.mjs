@@ -9,6 +9,9 @@ import {
   OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
 } from "./uk_aq_observation_history_schema.mjs";
+import {
+  OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
+} from "./uk_aq_observation_history_target_writer.mjs";
 import { normalizeObservationPropertyCode } from "./uk_aq_observation_property_code.mjs";
 import {
   buildObservationHistoryIndexV3ScopedManifestPayload,
@@ -19,11 +22,6 @@ import { sha256Hex } from "./r2_sigv4.mjs";
 export const OBSERVATION_HISTORY_INDEX_GENERATION_V3 = "v3";
 export const OBSERVATION_HISTORY_INDEX_SCHEMA_VERSION_V3 = 3;
 export const OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3 = 1000;
-// Retained only for the provisional 1,000-ID shard hierarchy and its
-// backward-compatible footer reader. New canonical output uses the separate
-// exact-leaf builder and timeseries-aligned-v2.
-export const OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION =
-  "timeseries-bounded-v1";
 export const DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT =
   "history/_index_v3/observations_timeseries";
 export const DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY =

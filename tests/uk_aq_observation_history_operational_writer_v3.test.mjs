@@ -82,7 +82,7 @@ function changedConnectorEntry(payload) {
   };
 }
 
-test("accepted Phase 6 writer limits are exact and reject drift", () => {
+test("selected aligned-v2 writer limits are exact and reject drift", () => {
   assert.equal(
     assertAcceptedObservationHistoryWriterLimitsV3({
       ...ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
@@ -94,14 +94,14 @@ test("accepted Phase 6 writer limits are exact and reject drift", () => {
       ...ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
       max_file_rows: 131071,
     }),
-    /max_file_rows must equal the accepted Phase 6 value 131072/,
+    /max_file_rows must equal the selected aligned-v2 value 131072/,
   );
   assert.throws(
     () => assertAcceptedObservationHistoryWriterLimitsV3({
       ...ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
       tunable_override: 1,
     }),
-    /exactly the accepted Phase 6 fields/,
+    /exactly the selected aligned-v2 fields/,
   );
 });
 

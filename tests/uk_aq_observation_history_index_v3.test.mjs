@@ -32,6 +32,27 @@ const limits = Object.freeze({
   max_file_bytes: 2_000_000,
   max_row_groups_per_file: 2,
 });
+const LEGACY_LAYOUT = "timeseries-bounded-v1";
+
+function asLegacyShardFixtureMetadata(metadata) {
+  const segment = (value) => ({
+    ...value,
+    physical_layout_version: LEGACY_LAYOUT,
+  });
+  return {
+    ...metadata,
+    physical_layout_version: LEGACY_LAYOUT,
+    files: metadata.files.map((file) => ({
+      ...file,
+      physical_layout_version: LEGACY_LAYOUT,
+      row_groups: file.row_groups.map((rowGroup) => ({
+        ...rowGroup,
+        segments: rowGroup.segments.map(segment),
+      })),
+    })),
+    segments: metadata.segments.map(segment),
+  };
+}
 
 function sha256(body) {
   return createHash("sha256").update(body).digest("hex");
@@ -75,12 +96,13 @@ function buildPhase1({
     definitions,
     valueOffsetsByTimeseries,
   });
-  return buildCanonicalObservationTimeseriesBoundedFiles(rows, {
+  const built = buildCanonicalObservationTimeseriesBoundedFiles(rows, {
     limits,
     fileKeyForOrdinal: (ordinal) =>
       `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}` +
       `/pollutant_code=pm25/part-${String(ordinal).padStart(5, "0")}.parquet`,
-  }).metadata;
+  });
+  return asLegacyShardFixtureMetadata(built.metadata);
 }
 
 function canonicalManifestFor(metadata) {
@@ -299,14 +321,14 @@ test("v3 hierarchy is byte-stable and preserves cross-shard files and continuati
     scoped_manifest: first.scoped_manifest.sha256,
     latest_global: latest.sha256,
   }, {
-    // Known deterministic identities from migration target
-    // b8858d95c42ff52558cb0fa59413162d6bc12afa.
+    // Known deterministic identities for the retained legacy-shard fixture
+    // generated over aligned production Parquet.
     child_shards: [
-      "b96c6742623c405b5b2c1f69268200cbfa4af913c37924c4ec40834923d8a1c7",
-      "d908a82f1a4406ea566898f5ad192fd81562cd8f274d3c0b79a98a68a1209fcd",
+      "fb4d2e186775d3b7c41b6d7a86830db7d98f7bf7a768e6271f23002cab9ef213",
+      "8c5fbafab0c0d7a9d996abf598f1272e6a8153bef0e3ab7bd9c1b0cfdf70d307",
     ],
-    scoped_manifest: "b787a9dda7aa8d1ce42ea2551c527a8a4c3841fd817987ccae650927b911aa40",
-    latest_global: "6dff013a057f29ad0fe3ecec1a9b99e555be860b1939ee324bbd4f6157328be6",
+    scoped_manifest: "1d36fde8207a9815789e0aebad1c45a4e892d74a468433f393f5aa6e92527cb7",
+    latest_global: "2d3ad47917244e712a7c6c8ee5c814da030174a957b409e5457026f12e56e6b6",
   });
 });
 
@@ -346,7 +368,7 @@ test("v3 builders fail closed on file identity, overlap, shard and coverage conf
   nested1000.row_group_row_start = 0;
   assert.throws(
     () => validateObservationHistoryTargetMetadataForV3(overlapping),
-    /segments overlap/,
+    /segments overlap|impossible row-group\/file coordinates/,
   );
 
   const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({

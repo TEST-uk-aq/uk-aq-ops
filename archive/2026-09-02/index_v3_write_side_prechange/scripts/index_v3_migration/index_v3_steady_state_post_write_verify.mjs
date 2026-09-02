@@ -8,19 +8,17 @@ import { pathToFileURL } from "node:url";
 import { Client } from "pg";
 
 import {
-  DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
+  DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
   encodeObservationHistoryIndexV3Json,
-} from "../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
+} from "../../workers/shared/uk_aq_observation_history_index_v3.mjs";
+import { validateObservationHistoryV3ChildForRead } from "../../workers/shared/uk_aq_observation_history_reader_v3.mjs";
+import { validateObservationHistoryIndexV3ScopedManifestBody } from "../../workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs";
 import {
   OBSERVATION_HISTORY_COLUMNS_V3,
   OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
 } from "../../workers/shared/uk_aq_observation_history_schema.mjs";
-import {
-  OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-  OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
-  OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-} from "../../workers/shared/uk_aq_observation_history_target_writer.mjs";
+import { OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION } from "../../workers/shared/uk_aq_observation_history_target_writer.mjs";
 import { ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3 } from "../../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
 import { computePruneConnectorSourceIdentity } from "../../workers/shared/uk_aq_prune_connector_source_identity.mjs";
 import {
@@ -539,10 +537,9 @@ function assertPhysicalManifest(manifest, label) {
   }
 }
 
-function assertExactLeafWriterLimits(leaf, label) {
+function assertChildWriterLimits(child, label) {
   const limits = ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3;
-  const files = new Map();
-  for (const file of leaf.files) {
+  for (const file of child.files) {
     if (
       file.row_count > limits.max_file_rows ||
       file.byte_size > limits.max_file_bytes ||
@@ -550,30 +547,24 @@ function assertExactLeafWriterLimits(leaf, label) {
     ) {
       fail(`${label} exceeds an accepted file or row-group-count limit`);
     }
-    files.set(file.key, file);
   }
-  let rows = 0;
-  for (const segment of leaf.segments) {
-    const file = files.get(segment.file_key);
-    if (
-      !file || segment.row_group_row_start !== 0 ||
-      Number(segment.row_count) > limits.max_row_group_rows ||
-      Number(segment.row_count) > OBSERVATION_HISTORY_ALIGNED_ROW_CAP ||
-      Number(segment.row_group_ordinal) >= Number(file.row_group_count)
-    ) fail(`${label} contains a non-aligned physical segment`);
-    for (const column of ["observed_at_utc", "value"]) {
-      const range = segment.column_ranges?.[column];
-      if (
-        !Number.isSafeInteger(Number(range?.start)) ||
-        !Number.isSafeInteger(Number(range?.end)) ||
-        Number(range.start) < 0 || Number(range.end) <= Number(range.start) ||
-        Number(range.end) > Number(file.byte_size) ||
-        Number(range.num_values) !== Number(segment.row_count)
-      ) fail(`${label} has an invalid exact ${column} byte range`);
+  const groups = new Map();
+  for (const timeseries of child.timeseries) {
+    for (const segment of timeseries.segments) {
+      const key = `${segment.file_key}\u0000${segment.row_group_ordinal}`;
+      const start = segment.row_start - segment.row_group_row_start;
+      const end = segment.row_start + segment.row_count;
+      const current = groups.get(key) || { start, end };
+      current.start = Math.min(current.start, start);
+      current.end = Math.max(current.end, end);
+      groups.set(key, current);
     }
-    rows += Number(segment.row_count);
   }
-  requireEqual(rows, Number(leaf.row_count), `${label} leaf row coverage`);
+  for (const group of groups.values()) {
+    if (group.end - group.start > limits.max_row_group_rows) {
+      fail(`${label} exceeds max_row_group_rows`);
+    }
+  }
 }
 
 export async function verifyCanonicalHierarchy({ getObject, headObject, accepted, candidateManifestKey }) {
@@ -707,8 +698,7 @@ function exactLatestPayload(body) {
     payload?.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
     payload?.writer_version !== OBSERVATION_HISTORY_WRITER_VERSION_V3 ||
     payload?.physical_layout_version !== OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION ||
-    payload?.aligned_row_cap !== OBSERVATION_HISTORY_ALIGNED_ROW_CAP ||
-    payload?.exact_leaf_index_version !== OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION ||
+    payload?.shard_width !== 1000 ||
     !Array.isArray(payload.day_summaries) ||
     body.toString("utf8") !== encodeObservationHistoryIndexV3Json(payload)
   ) {
@@ -753,10 +743,7 @@ function exactLatestPayload(body) {
     Number(payload.child_shard_count) !== childShardCount ||
     Number(payload.physical_file_reference_count) !== physicalFileReferenceCount ||
     Number(payload.total_rows) !== totalRows ||
-    Number(payload.physical_leaf_count) !== childShardCount ||
-    payload.key_layout?.latest_key !== DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY ||
-    payload.key_layout?.aligned_source_index_root !==
-      "history/_index_v3/observations_timeseries/_aligned"
+    payload.key_layout?.latest_key !== DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY
   ) {
     fail("v3 latest-global aggregate counters or key layout are contradictory");
   }
@@ -765,10 +752,7 @@ function exactLatestPayload(body) {
 
 async function verifyV3Authority({ getObject, headObject, accepted, canonical, environment }) {
   const entries = [];
-  const latest = await getIdentity(
-    getObject,
-    DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
-  );
+  const latest = await getIdentity(getObject, DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY);
   const latestPayload = exactLatestPayload(latest.body);
   entries.push({ kind: "latest_global", key: latest.key, classification: "EXACT", reason: null, byte_size: latest.byte_size, sha256: latest.sha256 });
   const day = latestPayload.day_summaries.find((entry) => entry.day_utc === accepted.day_utc);
@@ -781,53 +765,28 @@ async function verifyV3Authority({ getObject, headObject, accepted, canonical, e
   for (const root of roots) {
     const scopedObject = await reconcileJsonDependency(getObject, root, "scoped_manifest", entries);
     if (!scopedObject) continue;
-    const scoped = JSON.parse(scopedObject.body.toString("utf8"));
-    if (
-      scoped.kind !== "observation_timeseries_physical_leaf_scoped_manifest" ||
-      scoped.index_generation !== "v3" || scoped.history_version !== "v2" ||
-      scoped.writer_version !== OBSERVATION_HISTORY_WRITER_VERSION_V3 ||
-      scoped.physical_layout_version !== OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION ||
-      scoped.aligned_row_cap !== OBSERVATION_HISTORY_ALIGNED_ROW_CAP ||
-      scoped.exact_leaf_index_version !== OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION ||
-      scoped.key !== root.key ||
-      Number(scoped.coverage?.row_count) !== Number(root.row_count) ||
-      !scoped.leaves_by_timeseries_id ||
-      JSON.stringify(scoped.leaf_descriptor_fields) !==
-        JSON.stringify(["key", "byte_size", "sha256"])
-    ) fail(`v3 exact-leaf scoped manifest is contradictory: ${root.key}`);
-    await reconcileJsonDependency(getObject, scoped.source_aligned_scoped_manifest, "aligned_source_manifest", entries);
-    const childFiles = new Map();
-    let scopedRows = 0;
-    const leafDescriptors = Object.entries(scoped.leaves_by_timeseries_id)
-      .sort(([left], [right]) => Number(left) - Number(right));
-    requireEqual(
-      leafDescriptors.length,
-      Number(root.physical_leaf_count),
-      `v3 exact-leaf count ${root.pollutant_code}`,
+    const scoped = validateObservationHistoryIndexV3ScopedManifestBody({ key: root.key, body: scopedObject.body });
+    requireEqual(scoped.source.row_count, root.row_count, `v3 scoped canonical source rows ${root.pollutant_code}`);
+    await reconcileJsonDependency(
+      getObject,
+      scoped.source,
+      "canonical_source_manifest",
+      entries,
     );
-    for (const [timeseriesIdText, tuple] of leafDescriptors) {
-      if (!Array.isArray(tuple) || tuple.length !== 3) {
-        fail(`v3 exact-leaf descriptor is invalid: ${root.key}/${timeseriesIdText}`);
-      }
-      const descriptor = { key: tuple[0], byte_size: tuple[1], sha256: tuple[2] };
-      const childObject = await reconcileJsonDependency(getObject, descriptor, "exact_leaf", entries);
+    const childFiles = new Map();
+    for (const descriptor of scoped.descriptors) {
+      const childObject = await reconcileJsonDependency(getObject, descriptor, "child_shard", entries);
       if (!childObject) continue;
-      const timeseriesId = Number(timeseriesIdText);
-      const child = JSON.parse(childObject.body.toString("utf8"));
-      if (
-        child.kind !== "observation_timeseries_physical_leaf" ||
-        child.key !== descriptor.key || child.timeseries_id !== timeseriesId ||
-        child.day_utc !== accepted.day_utc ||
-        Number(child.connector_id) !== accepted.connector_id ||
-        child.pollutant_code !== root.pollutant_code ||
-        child.writer_version !== OBSERVATION_HISTORY_WRITER_VERSION_V3 ||
-        child.physical_layout_version !== OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION ||
-        child.aligned_row_cap !== OBSERVATION_HISTORY_ALIGNED_ROW_CAP ||
-        child.exact_leaf_index_version !== OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION
-      ) fail(`v3 exact leaf is contradictory: ${descriptor.key}`);
-      assertExactLeafWriterLimits(child, descriptor.key);
-      await reconcileJsonDependency(getObject, child.source_aligned_child, "aligned_source_shard", entries);
-      scopedRows += Number(child.row_count);
+      const timeseriesId = descriptor.timeseries_ids[0];
+      const child = validateObservationHistoryV3ChildForRead({
+        key: descriptor.key,
+        body: childObject.body,
+        dayUtc: accepted.day_utc,
+        connectorId: accepted.connector_id,
+        pollutantCode: root.pollutant_code,
+        timeseriesId,
+      });
+      assertChildWriterLimits(child, descriptor.key);
       for (const file of child.files) {
         await reconcileParquetDependency(headObject, file, "child_parquet", entries);
         const prior = childFiles.get(file.key);
@@ -851,7 +810,6 @@ async function verifyV3Authority({ getObject, headObject, accepted, canonical, e
         };
       }
     }
-    requireEqual(scopedRows, Number(root.row_count), `v3 exact-leaf scoped rows ${root.pollutant_code}`);
     const canonicalPollutant = canonical.pollutants.find((entry) => entry.pollutant_code === root.pollutant_code);
     if (!canonicalPollutant) fail(`v3 scope lacks canonical pollutant authority: ${root.pollutant_code}`);
     const canonicalFiles = new Map(canonicalPollutant.files.map((file) => [file.key, file]));

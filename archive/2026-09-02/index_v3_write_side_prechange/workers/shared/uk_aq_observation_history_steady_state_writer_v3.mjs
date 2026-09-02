@@ -3,16 +3,16 @@ import { Buffer } from "node:buffer";
 
 import {
   buildObservationHistoryIndexV3PublicationPlan,
+  buildObservationHistoryIndexV3ScopedHierarchy,
   encodeObservationHistoryIndexV3Json,
   finalizeObservationHistoryIndexV3Publication,
-  buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
-  updateObservationHistoryExactLeafIndexV3Latest,
-} from "./uk_aq_observation_history_exact_leaf_index_v3.mjs";
+  updateObservationHistoryIndexV3Latest,
+} from "./uk_aq_observation_history_index_v3.mjs";
 import {
   OBSERVATION_HISTORY_V3_INDEX_ROOT,
 } from "./uk_aq_observation_history_reader_v3.mjs";
 import {
-  buildCanonicalObservationTimeseriesAlignedFiles,
+  buildCanonicalObservationTimeseriesBoundedFiles,
 } from "./uk_aq_observation_history_target_writer.mjs";
 import {
   ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
@@ -280,8 +280,7 @@ async function verifiedExternalReference(reference, getObject) {
 
 /**
  * Pure preparation for one complete canonical day/connector/pollutant scope.
- * Migration and supported steady-state adapters share the same target writer
- * and exact-leaf hierarchy builder through this preparation boundary.
+ * No scheduled v2 writer imports this module during Phase 5.
  */
 export function buildObservationHistoryV3SteadyStatePartition({
   source,
@@ -313,7 +312,7 @@ export function buildObservationHistoryV3SteadyStatePartition({
     connector_id: firstRow.connector_id,
     pollutant_code: firstRow.pollutant_code,
   } : null);
-  const target = buildCanonicalObservationTimeseriesAlignedFiles(rows, {
+  const target = buildCanonicalObservationTimeseriesBoundedFiles(rows, {
     limits: acceptedWriterLimits,
     partition: requestedScope,
     fileKeyForOrdinal: (ordinal) => {
@@ -366,7 +365,7 @@ export function buildObservationHistoryV3SteadyStatePartition({
       sha256: intent.sha256,
     })),
   });
-  const hierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+  const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({
     metadata: target.metadata,
     canonicalManifest: canonicalManifestDescriptor(manifestArtifact),
     indexRoot: normalizedIndexRoot,
@@ -702,9 +701,10 @@ async function publishConnectorExactV3Scopes({
   recordDurableEvidence,
   finalizeV3Publication,
 }) {
-  const exactObjects = partitions.flatMap((partition) =>
-    partition.v3_hierarchy.publication_objects
-  );
+  const exactObjects = partitions.flatMap((partition) => [
+    ...partition.v3_hierarchy.child_shards,
+    partition.v3_hierarchy.scoped_manifest,
+  ]);
   const knownEvidence = new Map();
   for (const partition of partitions) {
     for (const evidence of partition.file_evidence) {
@@ -1218,7 +1218,7 @@ export async function runObservationHistoryV3RunFinalization({
         existingLatest,
         connectorResults,
       });
-      const updatedLatest = updateObservationHistoryExactLeafIndexV3Latest({
+      const updatedLatest = updateObservationHistoryIndexV3Latest({
         existingLatest,
         replacementScopedManifests,
         removedScopes,

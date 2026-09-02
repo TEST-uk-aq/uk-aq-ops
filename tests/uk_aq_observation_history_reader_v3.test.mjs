@@ -33,6 +33,29 @@ const WRITER_LIMITS = Object.freeze({
   max_file_bytes: 2_000_000,
   max_row_groups_per_file: 2,
 });
+const LEGACY_LAYOUT = "timeseries-bounded-v1";
+
+function asLegacyReaderFixtureMetadata(metadata, replacementShaByKey) {
+  const segment = (value) => ({
+    ...value,
+    file_sha256: replacementShaByKey.get(value.file_key) ?? value.file_sha256,
+    physical_layout_version: LEGACY_LAYOUT,
+  });
+  return {
+    ...metadata,
+    physical_layout_version: LEGACY_LAYOUT,
+    files: metadata.files.map((file) => ({
+      ...file,
+      sha256: replacementShaByKey.get(file.key) ?? file.sha256,
+      physical_layout_version: LEGACY_LAYOUT,
+      row_groups: file.row_groups.map((rowGroup) => ({
+        ...rowGroup,
+        segments: rowGroup.segments.map(segment),
+      })),
+    })),
+    segments: metadata.segments.map(segment),
+  };
+}
 
 function sha256(body) {
   return createHash("sha256").update(body).digest("hex");
@@ -105,13 +128,34 @@ function buildScopedDay(dayUtc, rows) {
         `pollutant_code=pm25/part-${String(ordinal).padStart(5, "0")}.parquet`,
     },
   );
+  const alignedMarker = Buffer.from(
+    "physical_layout_version=timeseries-aligned-v2",
+  );
+  const boundedMarker = Buffer.from(
+    "physical_layout_version=timeseries-bounded-v1",
+  );
+  assert.equal(alignedMarker.byteLength, boundedMarker.byteLength);
+  const replacementShaByKey = new Map();
+  phase1.file_bodies = phase1.file_bodies.map((file) => {
+    const body = Buffer.from(file.body);
+    const offset = body.indexOf(alignedMarker);
+    assert.ok(offset >= 0, `missing aligned writer marker in ${file.key}`);
+    boundedMarker.copy(body, offset);
+    replacementShaByKey.set(file.key, sha256(body));
+    return { ...file, body };
+  });
+  const legacyMetadata = asLegacyReaderFixtureMetadata(
+    phase1.metadata,
+    replacementShaByKey,
+  );
   const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({
-    metadata: phase1.metadata,
-    canonicalManifest: canonicalManifestFor(phase1.metadata),
+    metadata: legacyMetadata,
+    canonicalManifest: canonicalManifestFor(legacyMetadata),
   });
   const child = hierarchy.child_shards.find((artifact) =>
     artifact.payload.timeseries.some((entry) => entry.timeseries_id === 100)
   );
+  phase1.metadata = legacyMetadata;
   return { phase1, hierarchy, child };
 }
 

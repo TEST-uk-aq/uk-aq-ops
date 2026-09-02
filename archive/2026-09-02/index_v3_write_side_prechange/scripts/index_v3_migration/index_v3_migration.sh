@@ -76,7 +76,6 @@ VERIFY_CURRENT_TRUSTED_DEPENDENCIES=(
   workers/shared/r2_sigv4.mjs
   workers/shared/uk_aq_connector_day_gate.mjs
   workers/shared/uk_aq_observation_content_hash.mjs
-  workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs
   workers/shared/uk_aq_observation_history_index_v3.mjs
   workers/shared/uk_aq_observation_history_schema.mjs
   workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs
@@ -100,7 +99,6 @@ VERIFY_CURRENT_TRUSTED_DEPENDENCIES=(
 VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES=(
   scripts/backup_r2/uk_aq_observations_manifest_hierarchy.mjs
   workers/shared/uk_aq_observation_content_hash.mjs
-  workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs
   workers/shared/uk_aq_observation_history_index_v3.mjs
   workers/shared/uk_aq_observation_history_schema.mjs
   workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs
@@ -308,13 +306,13 @@ printf '%s\n' '============================================================'
 
 write_writer_limits() {
   printf '%s\n' '{' \
-    '  "target_row_group_rows": 1024,' \
-    '  "max_row_group_rows": 1024,' \
+    '  "target_row_group_rows": 8192,' \
+    '  "max_row_group_rows": 16384,' \
     '  "target_file_rows": 65536,' \
     '  "max_file_rows": 131072,' \
     '  "target_file_bytes": 4194304,' \
     '  "max_file_bytes": 8388608,' \
-    '  "max_row_groups_per_file": 128' \
+    '  "max_row_groups_per_file": 8' \
     '}' > "$WRITER_LIMITS"
   chmod 600 "$WRITER_LIMITS"
 }

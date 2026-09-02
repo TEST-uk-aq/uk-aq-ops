@@ -2,15 +2,11 @@
 import { Buffer } from "node:buffer";
 
 import {
-  DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
-  DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
-  OBSERVATION_HISTORY_EXACT_LEAF_INDEX_GENERATION_V3,
-} from "./uk_aq_observation_history_exact_leaf_index_v3.mjs";
-import {
-  OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-  OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
-  OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-} from "./uk_aq_observation_history_target_writer.mjs";
+  DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
+  DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+  OBSERVATION_HISTORY_INDEX_GENERATION_V3,
+  OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3,
+} from "./uk_aq_observation_history_index_v3.mjs";
 import {
   DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
@@ -50,7 +46,7 @@ export function resolveObservationHistoryIndexV3BuildConfig({
   const generation = String(
     requestedIndexGeneration ?? env?.UK_AQ_R2_HISTORY_INDEX_VERSION ?? "",
   );
-  if (generation !== OBSERVATION_HISTORY_EXACT_LEAF_INDEX_GENERATION_V3) {
+  if (generation !== OBSERVATION_HISTORY_INDEX_GENERATION_V3) {
     throw new Error(
       `Unsupported observation-history index generation for v3 builder: ${generation || "unset"}`,
     );
@@ -58,12 +54,10 @@ export function resolveObservationHistoryIndexV3BuildConfig({
   return Object.freeze({
     domain: "observations",
     history_version: "v2",
-    index_generation: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_GENERATION_V3,
-    index_root: DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
-    latest_key: DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
-    physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-    aligned_row_cap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-    exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
+    index_generation: OBSERVATION_HISTORY_INDEX_GENERATION_V3,
+    index_root: DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT,
+    latest_key: DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY,
+    shard_width: OBSERVATION_HISTORY_INDEX_SHARD_WIDTH_V3,
   });
 }
 

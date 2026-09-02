@@ -1,11 +1,11 @@
 export const ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3 = Object.freeze({
-  target_row_group_rows: 1024,
-  max_row_group_rows: 1024,
+  target_row_group_rows: 8192,
+  max_row_group_rows: 16384,
   target_file_rows: 65536,
   max_file_rows: 131072,
   target_file_bytes: 4194304,
   max_file_bytes: 8388608,
-  max_row_groups_per_file: 128,
+  max_row_groups_per_file: 8,
 });
 
 const LIMIT_KEYS = Object.freeze(
@@ -25,12 +25,12 @@ export function assertAcceptedObservationHistoryWriterLimitsV3(
     actualKeys.length !== expectedKeys.length ||
     actualKeys.some((key, index) => key !== expectedKeys[index])
   ) {
-    throw new Error(`${fieldName} must contain exactly the selected aligned-v2 fields`);
+    throw new Error(`${fieldName} must contain exactly the accepted Phase 6 fields`);
   }
   for (const key of LIMIT_KEYS) {
     if (Number(value[key]) !== ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3[key]) {
       throw new Error(
-        `${fieldName}.${key} must equal the selected aligned-v2 value ` +
+        `${fieldName}.${key} must equal the accepted Phase 6 value ` +
           `${ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3[key]}`,
       );
     }

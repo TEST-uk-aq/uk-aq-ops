@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
-  buildObservationHistoryIndexV3Latest,
-} from "../workers/shared/uk_aq_observation_history_index_v3.mjs";
+  buildObservationHistoryExactLeafIndexV3Latest as buildObservationHistoryIndexV3Latest,
+} from "../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   buildObservationHistoryV3SteadyStatePartition,
   runIntegrityObservationHistoryV3Writer,

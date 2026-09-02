@@ -16,24 +16,21 @@ import {
   validateObservationContentHashMetadata,
 } from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 import {
+  buildObservationHistoryIndexV3Latest,
   buildObservationHistoryIndexV3PublicationPlan,
-  buildObservationHistoryExactLeafIndexV3Latest,
-  buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
-  validateObservationHistoryExactLeafArtifactV3,
-  validateObservationHistoryExactLeafIndexV3LatestArtifact,
-  validateObservationHistoryExactLeafScopedManifestArtifactV3,
-} from "../../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
+  buildObservationHistoryIndexV3ScopedHierarchy,
+  validateObservationHistoryIndexV3ChildShardArtifact,
+  validateObservationHistoryIndexV3LatestArtifact,
+  validateObservationHistoryIndexV3ScopedManifestArtifact,
+} from "../../../workers/shared/uk_aq_observation_history_index_v3.mjs";
 import {
   OBSERVATION_HISTORY_COLUMNS_V3,
   OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
 } from "../../../workers/shared/uk_aq_observation_history_schema.mjs";
 import {
-  OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-  OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
-  OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
   OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-  buildCanonicalObservationTimeseriesAlignedFiles,
+  buildCanonicalObservationTimeseriesBoundedFiles,
 } from "../../../workers/shared/uk_aq_observation_history_target_writer.mjs";
 import {
   buildHistoryV2ConnectorManifest,
@@ -1899,7 +1896,7 @@ async function rewritePartition({
       `Canonical source logical identity mismatch: ${partitionIdentity(sourcePartition.scope)}`,
     );
   }
-  const target = buildCanonicalObservationTimeseriesAlignedFiles(rows, {
+  const target = buildCanonicalObservationTimeseriesBoundedFiles(rows, {
     limits: writerLimits,
     fileKeyForOrdinal: (ordinal) => buildHistoryV2PartKey(
       observationsPrefix,
@@ -1957,7 +1954,7 @@ async function rewritePartition({
       sha256: intent.sha256,
     })),
   });
-  const hierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+  const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({
     metadata: target.metadata,
     canonicalManifest: canonicalManifestDescriptor(
       manifestObject,
@@ -1983,9 +1980,6 @@ async function rewritePartition({
       target_schema: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
       target_writer: OBSERVATION_HISTORY_WRITER_VERSION_V3,
       target_layout: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-      target_aligned_row_cap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-      target_exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
-      target_decode_profile: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
     })),
     scope: sourcePartition.scope,
     source_manifest: sourcePartition.manifest,
@@ -2228,9 +2222,6 @@ function sourceUnitFromPartition({
       target_schema: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
       target_writer: OBSERVATION_HISTORY_WRITER_VERSION_V3,
       target_layout: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-      target_aligned_row_cap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-      target_exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
-      target_decode_profile: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
     })),
     scope: sourcePartition.scope,
     source_manifest: sourcePartition.manifest,
@@ -2410,10 +2401,6 @@ export async function buildObservationHistoryV3MigrationPlan({
     observations_prefix: inventory.observations_prefix,
     v3_index_root: v3IndexRoot,
     v3_latest_key: v3LatestKey,
-    target_physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-    target_aligned_row_cap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-    target_exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
-    target_decode_profile: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
     rollback_objects: rollbackPreflight?.objects || null,
   };
   const uniqueBlockers = [...new Set(blockers)].sort();
@@ -2429,9 +2416,6 @@ export async function buildObservationHistoryV3MigrationPlan({
       history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
       writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
       physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
-      aligned_row_cap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-      exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
-      decode_profile: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
       index_generation: "v3",
       writer_limits: Object.freeze({ ...writerLimits }),
     }),
@@ -2620,7 +2604,7 @@ function preparedUnitFromRecord(authorityUnit, record, {
   const targetManifestPayload = legacyOriginalOrdering && !hasExactManifestBody
     ? targetManifestObject.payload
     : record.target_manifest;
-  const hierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+  const hierarchy = buildObservationHistoryIndexV3ScopedHierarchy({
     metadata: record.target_metadata,
     canonicalManifest: canonicalManifestDescriptor(
       targetManifestObject,
@@ -2682,13 +2666,14 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
     ...parents.day_objects,
     ...parents.aggregate_objects,
   ]);
-  const latest = buildObservationHistoryExactLeafIndexV3Latest({
+  const latest = buildObservationHistoryIndexV3Latest({
     scopedHierarchies: units.map((unit) => unit.v3_hierarchy),
     indexRoot: authority.v3_index_root,
     latestKey: authority.v3_latest_key,
   });
   const v3Objects = [
-    ...units.flatMap((unit) => unit.v3_hierarchy.publication_objects),
+    ...units.flatMap((unit) => unit.v3_hierarchy.child_shards),
+    ...units.map((unit) => unit.v3_hierarchy.scoped_manifest),
     latest,
   ];
   const externalReferences = [
@@ -3189,7 +3174,7 @@ export async function verifyObservationHistoryV3MigrationResult({
           sha256: sha256Hex(body),
           payload: parseJsonBody(artifact.key, body),
         };
-        validateObservationHistoryExactLeafArtifactV3({ artifact: actual });
+        validateObservationHistoryIndexV3ChildShardArtifact({ artifact: actual });
         return actual;
       });
       const rootArtifact = unit.v3_hierarchy.scoped_manifest;
@@ -3202,9 +3187,9 @@ export async function verifyObservationHistoryV3MigrationResult({
         sha256: sha256Hex(rootBody),
         payload: parseJsonBody(rootArtifact.key, rootBody),
       };
-      validateObservationHistoryExactLeafScopedManifestArtifactV3({
+      validateObservationHistoryIndexV3ScopedManifestArtifact({
         artifact: actualRoot,
-        exactLeaves: children,
+        childShards: children,
       });
     } catch (error) {
       blockers.push(
@@ -3225,7 +3210,7 @@ export async function verifyObservationHistoryV3MigrationResult({
           ?.toString("utf8"),
       },
     }));
-    validateObservationHistoryExactLeafIndexV3LatestArtifact({
+    validateObservationHistoryIndexV3LatestArtifact({
       artifact: {
         ...plan.v3_latest,
         body: latestBody.toString("utf8"),

@@ -266,3 +266,8 @@ and the budget-exceeded partial reason. The shelved higher-level encrypted
 station-history continuation is retained under
 `archive/2026-09-02/index_v3_station_history_continuation/` for historical
 reference only.
+
+The write-side selection is now implemented in the shared production target
+writer and exact-leaf index builder. This directory remains TEST calibration
+and measurement evidence only; it is not a migration or steady-state runtime
+dependency.

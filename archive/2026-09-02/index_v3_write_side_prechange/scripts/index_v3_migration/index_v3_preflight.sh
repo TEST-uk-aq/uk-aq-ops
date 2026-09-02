@@ -424,18 +424,15 @@ jq -e '
   .result.target.history_schema_version == 3 and
   .result.target.index_generation == "v3" and
   .result.target.writer_version == "parquet-wasm-zstd-v3" and
-  .result.target.physical_layout_version == "timeseries-aligned-v2" and
-  .result.target.aligned_row_cap == 1024 and
-  .result.target.exact_leaf_index_version == "exact-timeseries-leaf-v1" and
-  .result.target.decode_profile == "hyparquet-direct-column-v1" and
+  .result.target.physical_layout_version == "timeseries-bounded-v1" and
   .result.target.writer_limits == {
     "max_file_bytes":8388608,
     "max_file_rows":131072,
-    "max_row_group_rows":1024,
-    "max_row_groups_per_file":128,
+    "max_row_group_rows":16384,
+    "max_row_groups_per_file":8,
     "target_file_bytes":4194304,
     "target_file_rows":65536,
-    "target_row_group_rows":1024
+    "target_row_group_rows":8192
   }
 ' "$PLAN_REPORT" >/dev/null || fail "migration plan/rollback authority is not accepted"
 pass "migration plan, backup gate, rollback preflight, and writer limits are accepted"
