@@ -82,6 +82,7 @@ import {
   DEFAULT_BACKUP_STATE_ROOT_KEY,
   DEFAULT_V2_LATEST_KEY,
   DEFAULT_V3_LATEST_KEY,
+  LEGACY_INDEX_V3_SORTED_CHECKPOINT_MANIFEST_CONTRACT_VERSION,
   buildObservationHistoryV2RestorePlan,
   buildObservationHistoryV3MigrationAuditReport,
   buildObservationHistoryV3MigrationPlan,
@@ -92,6 +93,7 @@ import {
   executeObservationHistoryV3MigrationPlan,
   inventoryAuthoritativeCanonicalObservationHistory,
   stableMigrationJson,
+  validateMigrationSourceObservationPollutantManifest,
   validateObservationHistoryV3MigrationEnvironment,
   verifyObservationHistoryV2IndexCompleteness,
   verifyObservationHistoryV3CheckpointReuse,
@@ -589,6 +591,8 @@ async function buildFixture({
       pollutant = structuredClone(pollutant);
       delete pollutant.observation_content_hash_algorithm;
       pollutant = rehashManifest(pollutant);
+    } else if (manifestMode === "legacy_sorted_checkpoint") {
+      pollutant = JSON.parse(stableMigrationJson(pollutant));
     }
     let parentReferenceHash = pollutant.manifest_hash;
     if (
@@ -1335,6 +1339,113 @@ test("Phase 6 migration inventory keeps complete modern hash metadata strict and
       null,
     );
   }
+});
+
+test("migration-only source compatibility proves the historical sorted-checkpoint pollutant self-hash", async () => {
+  const fixture = await buildFixture({
+    pollutantCodes: ["pm25"],
+    manifestModes: { pm25: "legacy_sorted_checkpoint" },
+  });
+  const manifestKey = fixture.pollutantKeys.get("pm25");
+  const body = fixture.r2.get(manifestKey);
+  const manifest = JSON.parse(body.toString("utf8"));
+  const expected = {
+    domain: "observations",
+    manifest_kind: "pollutant",
+    day_utc: DAY,
+    connector_id: 1,
+    pollutant_code: "pm25",
+    manifest_key: manifestKey,
+  };
+
+  assert.throws(
+    () => validateCanonicalHistoryV2Manifest(manifest, expected),
+    /Canonical history manifest hash verification failed/,
+  );
+  const compatibility =
+    validateMigrationSourceObservationPollutantManifest({
+      manifest,
+      body,
+      expected,
+    });
+  assert.deepEqual(compatibility, {
+    provenance: "legacy_index_v3_sorted_checkpoint_manifest",
+    compatibility_contract_version:
+      LEGACY_INDEX_V3_SORTED_CHECKPOINT_MANIFEST_CONTRACT_VERSION,
+    manifest_hash: manifest.manifest_hash,
+    reconstructed_manifest_hash: manifest.manifest_hash,
+    recursively_sorted_checkpoint_representation: true,
+  });
+
+  const materiallyChanged = structuredClone(manifest);
+  materiallyChanged.row_count += 1;
+  assert.throws(
+    () => validateMigrationSourceObservationPollutantManifest({
+      manifest: materiallyChanged,
+      body: jsonBody(materiallyChanged),
+      expected,
+    }),
+    /row count is invalid|differs from historical builder output/,
+  );
+  const wrongHash = structuredClone(manifest);
+  wrongHash.manifest_hash = "f".repeat(64);
+  assert.throws(
+    () => validateMigrationSourceObservationPollutantManifest({
+      manifest: wrongHash,
+      body: jsonBody(wrongHash),
+      expected,
+    }),
+    /historical builder output/,
+  );
+  const { manifest_hash: originalHash, ...sortedPayload } = manifest;
+  const unsorted = {
+    history_version: sortedPayload.history_version,
+    ...sortedPayload,
+    manifest_hash: originalHash,
+  };
+  assert.throws(
+    () => validateMigrationSourceObservationPollutantManifest({
+      manifest: unsorted,
+      body: jsonBody(unsorted),
+      expected,
+    }),
+    /not the exact recursively sorted representation/,
+  );
+
+  const plan = await buildPlan(fixture);
+  assert.deepEqual(plan.blockers, []);
+  assert.deepEqual(plan.source_manifest_self_hash_provenance_counts, {
+    exact: 0,
+    legacy_index_v3_sorted_checkpoint_manifest: 1,
+    unexplained: 0,
+  });
+  assert.equal(
+    plan.units[0].source_manifest_self_hash.provenance,
+    "legacy_index_v3_sorted_checkpoint_manifest",
+  );
+  assert.equal(plan.units[0].source_manifest_reference.provenance, "exact");
+  const audit = buildObservationHistoryV3MigrationAuditReport({
+    plan,
+    mode: "plan",
+  });
+  assert.deepEqual(
+    audit.source_manifest_self_hash_provenance_counts,
+    plan.source_manifest_self_hash_provenance_counts,
+  );
+  assert.equal(
+    audit.partition_results[0].source_manifest_self_hash_compatibility_contract_version,
+    LEGACY_INDEX_V3_SORTED_CHECKPOINT_MANIFEST_CONTRACT_VERSION,
+  );
+
+  const adapters = memoryAdapters(fixture);
+  const execution = await executeObservationHistoryV3MigrationPlan({
+    plan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  });
+  assert.equal(execution.verification.cutover_ready, true);
 });
 
 test("Phase 6 derives and pins genuine legacy hashless metadata for any canonical property code", async () => {
@@ -2788,6 +2899,33 @@ test("prepared canonical manifest exact bytes survive stable recovery serializat
     ),
     0,
   );
+  const recoveredRecord = recoveredCheckpoint.prepared_units[
+    recoveredCheckpoint.preparation_order[0]
+  ];
+  const recoveredUnit = afterRecovery.units[0];
+  assert.equal(
+    recoveredUnit.target_manifest_object.byte_size,
+    recoveredRecord.target_manifest_byte_size,
+  );
+  assert.equal(
+    recoveredUnit.target_manifest_object.sha256,
+    recoveredRecord.target_manifest_sha256,
+  );
+  assert.equal(
+    recoveredUnit.target_manifest_object.body.toString("utf8"),
+    recoveredRecord.target_manifest_body,
+  );
+  const recoveredTargetManifest = JSON.parse(
+    recoveredUnit.target_manifest_object.body.toString("utf8"),
+  );
+  validateCanonicalHistoryV2Manifest(recoveredTargetManifest, {
+    domain: "observations",
+    manifest_kind: "pollutant",
+    day_utc: recoveredUnit.scope.day_utc,
+    connector_id: recoveredUnit.scope.connector_id,
+    pollutant_code: recoveredUnit.scope.pollutant_code,
+    manifest_key: recoveredUnit.target_manifest_object.key,
+  });
 });
 
 test("recovery persistence rejects changed evidence for an already completed key", async () => {

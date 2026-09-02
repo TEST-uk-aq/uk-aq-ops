@@ -124,6 +124,26 @@ const SOURCE_HASH_PROVENANCE_LEGACY_PARQUET =
 const SOURCE_MANIFEST_REFERENCE_PROVENANCE_EXACT = "exact";
 const SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT =
   "legacy_stale_parent_manifest_hash";
+export const LEGACY_INDEX_V3_SORTED_CHECKPOINT_MANIFEST_CONTRACT_VERSION =
+  "legacy_index_v3_sorted_checkpoint_manifest_v1";
+export const SOURCE_MANIFEST_SELF_HASH_PROVENANCE_EXACT = "exact";
+export const SOURCE_MANIFEST_SELF_HASH_PROVENANCE_LEGACY_SORTED_CHECKPOINT =
+  "legacy_index_v3_sorted_checkpoint_manifest";
+const CANONICAL_MANIFEST_SELF_HASH_FAILURE =
+  "Canonical history manifest hash verification failed";
+const HISTORICAL_SORTED_CHECKPOINT_FILE_FIELDS = Object.freeze([
+  "key",
+  "row_count",
+  "bytes",
+  "etag_or_hash",
+  "pollutant_codes",
+  "min_timeseries_id",
+  "max_timeseries_id",
+  "min_observed_at_utc",
+  "max_observed_at_utc",
+  "timeseries_row_counts",
+  "pollutant_code",
+]);
 const LEGACY_STALE_PARENT_MANIFEST_HASH_CONTRACT_VERSION =
   "legacy_stale_parent_manifest_hash_v1";
 const LEGACY_STALE_PARENT_SUMMARY_IDENTITY_FIELDS = Object.freeze([
@@ -535,6 +555,199 @@ function contentHashMetadata(metadata) {
   };
 }
 
+function requireHistoricalSortedCheckpointExpectedIdentity(expected) {
+  const normalized = {
+    domain: String(expected?.domain || "").trim(),
+    manifest_kind: String(expected?.manifest_kind || "").trim(),
+    day_utc: requireIsoDay(expected?.day_utc),
+    connector_id: requirePositiveInteger(
+      expected?.connector_id,
+      "connector_id",
+    ),
+    pollutant_code: String(expected?.pollutant_code || "").trim(),
+    manifest_key: String(expected?.manifest_key || "").trim(),
+  };
+  if (
+    normalized.domain !== "observations" ||
+    normalized.manifest_kind !== "pollutant" ||
+    !normalized.pollutant_code ||
+    !normalized.manifest_key
+  ) {
+    throw new Error(
+      "Legacy sorted-checkpoint compatibility requires an exact observation pollutant scope",
+    );
+  }
+  return normalized;
+}
+
+function historicalSortedCheckpointFileEntry(file, expectedPollutantCode) {
+  if (!file || typeof file !== "object" || Array.isArray(file)) {
+    throw new Error("Legacy sorted-checkpoint manifest file entry is invalid");
+  }
+  const keys = Object.keys(file);
+  if (
+    keys.length !== HISTORICAL_SORTED_CHECKPOINT_FILE_FIELDS.length ||
+    HISTORICAL_SORTED_CHECKPOINT_FILE_FIELDS.some(
+      (field) => !Object.hasOwn(file, field),
+    )
+  ) {
+    throw new Error(
+      "Legacy sorted-checkpoint manifest file fields are not historical",
+    );
+  }
+  if (
+    file.pollutant_code !== expectedPollutantCode ||
+    !Array.isArray(file.pollutant_codes) ||
+    file.pollutant_codes.length !== 1 ||
+    file.pollutant_codes[0] !== expectedPollutantCode
+  ) {
+    throw new Error(
+      "Legacy sorted-checkpoint manifest file pollutant identity is invalid",
+    );
+  }
+  return {
+    key: file.key,
+    row_count: file.row_count,
+    bytes: file.bytes,
+    etag_or_hash: file.etag_or_hash,
+    pollutant_codes: [...file.pollutant_codes],
+    min_timeseries_id: file.min_timeseries_id,
+    max_timeseries_id: file.max_timeseries_id,
+    min_observed_at_utc: file.min_observed_at_utc,
+    max_observed_at_utc: file.max_observed_at_utc,
+    timeseries_row_counts: { ...file.timeseries_row_counts },
+  };
+}
+
+function rebuildHistoricalSortedCheckpointPollutantManifest(
+  manifest,
+  expected,
+) {
+  if (
+    manifest.history_version !== "v2" ||
+    manifest.domain !== "observations" ||
+    manifest.manifest_kind !== "pollutant" ||
+    manifest.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
+    manifest.writer_version !== OBSERVATION_HISTORY_WRITER_VERSION_V3 ||
+    !sameJson(manifest.columns, OBSERVATION_HISTORY_COLUMNS_V3) ||
+    Object.hasOwn(manifest, "physical_schemas")
+  ) {
+    throw new Error(
+      "Legacy sorted-checkpoint manifest physical identity is unsupported",
+    );
+  }
+  const files = Array.isArray(manifest.files)
+    ? manifest.files.map((file) =>
+        historicalSortedCheckpointFileEntry(file, expected.pollutant_code)
+      )
+    : [];
+  const observationContentHash = {
+    observation_content_hash: manifest.observation_content_hash,
+    observation_content_hash_algorithm:
+      manifest.observation_content_hash_algorithm,
+    observation_content_hash_contract_version:
+      manifest.observation_content_hash_contract_version,
+    observation_content_hash_row_count:
+      manifest.observation_content_hash_row_count,
+    observation_content_hash_columns: [
+      ...(manifest.observation_content_hash_columns || []),
+    ],
+    verification_status_counts: {
+      ...(manifest.verification_status_counts || {}),
+    },
+  };
+  validateObservationContentHashMetadata(observationContentHash, {
+    rowCount: manifest.row_count,
+  });
+  return buildHistoryV2PollutantManifest({
+    domain: "observations",
+    grain: manifest.grain,
+    profile: manifest.profile,
+    dayUtc: expected.day_utc,
+    connectorId: expected.connector_id,
+    pollutantCode: expected.pollutant_code,
+    runId: manifest.run_id,
+    manifestKey: expected.manifest_key,
+    sourceRowCount: manifest.source_row_count,
+    fileEntries: files,
+    writerGitSha: manifest.writer_git_sha,
+    backedUpAtUtc: manifest.backed_up_at_utc,
+    observationContentHash,
+    physicalSchema: {
+      history_schema_version: manifest.history_schema_version,
+      columns: [...manifest.columns],
+      writer_version: manifest.writer_version,
+    },
+  });
+}
+
+export function validateMigrationSourceObservationPollutantManifest({
+  manifest,
+  body = null,
+  expected,
+}) {
+  const exactExpected = requireHistoricalSortedCheckpointExpectedIdentity(expected);
+  try {
+    const validation = validateCanonicalHistoryV2Manifest(
+      manifest,
+      exactExpected,
+    );
+    return Object.freeze({
+      provenance: SOURCE_MANIFEST_SELF_HASH_PROVENANCE_EXACT,
+      compatibility_contract_version: null,
+      manifest_hash: validation.manifest_hash,
+      reconstructed_manifest_hash: null,
+      recursively_sorted_checkpoint_representation: false,
+    });
+  } catch (error) {
+    if (
+      !(error instanceof Error) ||
+      error.message !== CANONICAL_MANIFEST_SELF_HASH_FAILURE
+    ) {
+      throw error;
+    }
+  }
+
+  const exactBody = exactBuffer(body, exactExpected.manifest_key);
+  const historicalSortedBody = Buffer.from(
+    JSON.stringify(stableObject(manifest), null, 2),
+    "utf8",
+  );
+  if (!exactBody.equals(historicalSortedBody)) {
+    throw new Error(
+      "Legacy sorted-checkpoint manifest is not the exact recursively sorted representation",
+    );
+  }
+
+  const rebuilt = rebuildHistoricalSortedCheckpointPollutantManifest(
+    manifest,
+    exactExpected,
+  );
+  if (!sameSemanticJson(rebuilt, manifest)) {
+    throw new Error(
+      "Legacy sorted-checkpoint manifest differs from historical builder output",
+    );
+  }
+  if (rebuilt.manifest_hash !== manifest.manifest_hash) {
+    throw new Error(
+      "Legacy sorted-checkpoint manifest hash is not historical builder output",
+    );
+  }
+  validateCanonicalHistoryV2Manifest(rebuilt, exactExpected);
+  validateObservationContentHashMetadata(rebuilt, {
+    rowCount: rebuilt.row_count,
+  });
+  return Object.freeze({
+    provenance:
+      SOURCE_MANIFEST_SELF_HASH_PROVENANCE_LEGACY_SORTED_CHECKPOINT,
+    compatibility_contract_version:
+      LEGACY_INDEX_V3_SORTED_CHECKPOINT_MANIFEST_CONTRACT_VERSION,
+    manifest_hash: manifest.manifest_hash,
+    reconstructed_manifest_hash: rebuilt.manifest_hash,
+    recursively_sorted_checkpoint_representation: true,
+  });
+}
+
 function isGenuineLegacyHashlessObservationManifest(manifest) {
   return OBSERVATION_CONTENT_HASH_METADATA_FIELDS.every(
     (field) => !Object.hasOwn(manifest, field) || manifest[field] === null,
@@ -752,14 +965,29 @@ async function reverifyPinnedSourceManifestReference({
     pinned.referenced_child_manifest_key,
     pollutantObject.body,
   );
-  validateCanonicalHistoryV2Manifest(pollutantManifest, {
-    domain: "observations",
-    manifest_kind: "pollutant",
-    day_utc: sourcePartition.scope.day_utc,
-    connector_id: sourcePartition.scope.connector_id,
-    pollutant_code: sourcePartition.scope.pollutant_code,
-    manifest_key: pinned.referenced_child_manifest_key,
-  });
+  const sourceManifestSelfHash =
+    validateMigrationSourceObservationPollutantManifest({
+      manifest: pollutantManifest,
+      body: pollutantObject.body,
+      expected: {
+        domain: "observations",
+        manifest_kind: "pollutant",
+        day_utc: sourcePartition.scope.day_utc,
+        connector_id: sourcePartition.scope.connector_id,
+        pollutant_code: sourcePartition.scope.pollutant_code,
+        manifest_key: pinned.referenced_child_manifest_key,
+      },
+    });
+  if (
+    !sameSemanticJson(
+      sourceManifestSelfHash,
+      sourcePartition.source_manifest_self_hash,
+    )
+  ) {
+    throw new Error(
+      `Pinned source manifest self-hash provenance changed: ${partitionIdentity(sourcePartition.scope)}`,
+    );
+  }
   const currentEvidence = buildSourceManifestReferenceEvidence({
     connectorManifest,
     connectorManifestIdentity: connectorIdentity,
@@ -783,7 +1011,9 @@ async function reverifyPinnedCompatibleSourceUnitsBeforeMutation({
   for (const sourcePartition of plan.inventory.partitions) {
     if (
       sourcePartition.source_manifest_reference.provenance !==
-        SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT
+        SOURCE_MANIFEST_REFERENCE_PROVENANCE_LEGACY_STALE_PARENT &&
+      sourcePartition.source_manifest_self_hash.provenance !==
+        SOURCE_MANIFEST_SELF_HASH_PROVENANCE_LEGACY_SORTED_CHECKPOINT
     ) {
       continue;
     }
@@ -1409,14 +1639,19 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
               pollutantKey,
               pollutantObject.body,
             );
-            validateCanonicalHistoryV2Manifest(pollutantPayload, {
-              domain: "observations",
-              manifest_kind: "pollutant",
-              day_utc: dayUtc,
-              connector_id: connectorId,
-              pollutant_code: pollutantCode,
-              manifest_key: pollutantKey,
-            });
+            const sourceManifestSelfHash =
+              validateMigrationSourceObservationPollutantManifest({
+                manifest: pollutantPayload,
+                body: pollutantObject.body,
+                expected: {
+                  domain: "observations",
+                  manifest_kind: "pollutant",
+                  day_utc: dayUtc,
+                  connector_id: connectorId,
+                  pollutant_code: pollutantCode,
+                  manifest_key: pollutantKey,
+                },
+              });
             const pollutantIdentity = bodyIdentity(
               pollutantKey,
               pollutantObject.body,
@@ -1453,6 +1688,7 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
               scope: Object.freeze(scope),
               manifest: pollutantPayload,
               manifest_identity: pollutantIdentity,
+              source_manifest_self_hash: sourceManifestSelfHash,
               source_manifest_reference: sourceManifestReference,
               source_observation_content_hash_metadata:
                 effectiveSourceHash.metadata,
@@ -2016,6 +2252,8 @@ async function rewritePartition({
       source_observation_content_hash_metadata: effectiveSourceHash,
       source_observation_content_hash_provenance:
         sourcePartition.source_observation_content_hash_provenance,
+      source_manifest_self_hash:
+        sourcePartition.source_manifest_self_hash,
       source_manifest_reference:
         sourcePartition.source_manifest_reference,
       writer_limits: writerLimits,
@@ -2030,6 +2268,7 @@ async function rewritePartition({
     scope: sourcePartition.scope,
     source_manifest: sourcePartition.manifest,
     source_manifest_identity: sourcePartition.manifest_identity,
+    source_manifest_self_hash: sourcePartition.source_manifest_self_hash,
     source_manifest_reference: sourcePartition.source_manifest_reference,
     source_files: Object.freeze(sourceFiles),
     source_row_count: sourcePartition.manifest.row_count,
@@ -2261,6 +2500,8 @@ function sourceUnitFromPartition({
         sourcePartition.source_observation_content_hash_metadata,
       source_observation_content_hash_provenance:
         sourcePartition.source_observation_content_hash_provenance,
+      source_manifest_self_hash:
+        sourcePartition.source_manifest_self_hash,
       source_manifest_reference:
         sourcePartition.source_manifest_reference,
       writer_limits: writerLimits,
@@ -2275,6 +2516,7 @@ function sourceUnitFromPartition({
     scope: sourcePartition.scope,
     source_manifest: sourcePartition.manifest,
     source_manifest_identity: sourcePartition.manifest_identity,
+    source_manifest_self_hash: sourcePartition.source_manifest_self_hash,
     source_manifest_reference: sourcePartition.source_manifest_reference,
     source_files: Object.freeze(sourceFiles),
     source_row_count: sourcePartition.manifest.row_count,
@@ -2486,6 +2728,18 @@ export async function buildObservationHistoryV3MigrationPlan({
       ).length,
     unexplained: 0,
   });
+  const sourceManifestSelfHashProvenanceCounts = Object.freeze({
+    exact: inventory.partitions.filter((partition) =>
+      partition.source_manifest_self_hash.provenance ===
+        SOURCE_MANIFEST_SELF_HASH_PROVENANCE_EXACT
+    ).length,
+    legacy_index_v3_sorted_checkpoint_manifest:
+      inventory.partitions.filter((partition) =>
+        partition.source_manifest_self_hash.provenance ===
+          SOURCE_MANIFEST_SELF_HASH_PROVENANCE_LEGACY_SORTED_CHECKPOINT
+      ).length,
+    unexplained: 0,
+  });
   const emptySourceConnectors = inventory.empty_source_connectors;
   const planIdentityPayload = {
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
@@ -2505,6 +2759,8 @@ export async function buildObservationHistoryV3MigrationPlan({
       sourceObservationContentHashProvenanceCounts,
     source_manifest_reference_provenance_counts:
       sourceManifestReferenceProvenanceCounts,
+    source_manifest_self_hash_provenance_counts:
+      sourceManifestSelfHashProvenanceCounts,
     empty_source_connectors: emptySourceConnectors,
     observations_prefix: inventory.observations_prefix,
     v3_index_root: v3IndexRoot,
@@ -2561,6 +2817,8 @@ export async function buildObservationHistoryV3MigrationPlan({
       sourceObservationContentHashProvenanceCounts,
     source_manifest_reference_provenance_counts:
       sourceManifestReferenceProvenanceCounts,
+    source_manifest_self_hash_provenance_counts:
+      sourceManifestSelfHashProvenanceCounts,
     empty_source_connector_count: emptySourceConnectors.length,
     empty_source_connectors: emptySourceConnectors,
     canonical_publication_objects: Object.freeze([]),
@@ -3832,14 +4090,19 @@ export async function buildObservationHistoryV2RestorePlan({
             expected: requirePreStateIdentity(pollutantReference.manifest_key),
           });
           const pollutant = parseJsonBody(pollutantIntent.key, pollutantIntent.body);
-          validateCanonicalHistoryV2Manifest(pollutant, {
-            domain: "observations",
-            manifest_kind: "pollutant",
-            day_utc: dayEntry.day_utc,
-            connector_id: connectorReference.connector_id,
-            pollutant_code: pollutantReference.pollutant_code,
-            manifest_key: pollutantReference.manifest_key,
-          });
+          const restoredManifestSelfHash =
+            validateMigrationSourceObservationPollutantManifest({
+              manifest: pollutant,
+              body: pollutantIntent.body,
+              expected: {
+                domain: "observations",
+                manifest_kind: "pollutant",
+                day_utc: dayEntry.day_utc,
+                connector_id: connectorReference.connector_id,
+                pollutant_code: pollutantReference.pollutant_code,
+                manifest_key: pollutantReference.manifest_key,
+              },
+            });
           if (!isGenuineLegacyHashlessObservationManifest(pollutant)) {
             validateObservationContentHashMetadata(pollutant, {
               rowCount: pollutant.row_count,
@@ -3851,6 +4114,16 @@ export async function buildObservationHistoryV2RestorePlan({
           if (!sourcePartition) {
             throw new Error(
               `Rollback source partition authority is missing: ${pollutantIntent.key}`,
+            );
+          }
+          if (
+            !sameSemanticJson(
+              restoredManifestSelfHash,
+              sourcePartition.source_manifest_self_hash,
+            )
+          ) {
+            throw new Error(
+              `Dropbox source manifest self-hash provenance changed: ${pollutantIntent.key}`,
             );
           }
           const restoredReferenceEvidence =
@@ -4207,6 +4480,15 @@ export function buildObservationHistoryV3MigrationAuditReport({
         unit.target_metadata?.verification_status_counts ?? null,
       source_observation_content_hash_provenance:
         unit.source_observation_content_hash_provenance,
+      source_manifest_self_hash_provenance:
+        unit.source_manifest_self_hash.provenance,
+      source_manifest_self_hash_compatibility_contract_version:
+        unit.source_manifest_self_hash.compatibility_contract_version,
+      source_manifest_self_hash_reconstructed_manifest_hash:
+        unit.source_manifest_self_hash.reconstructed_manifest_hash,
+      source_manifest_self_hash_recursively_sorted_checkpoint_representation:
+        unit.source_manifest_self_hash
+          .recursively_sorted_checkpoint_representation,
       source_manifest_reference_provenance:
         unit.source_manifest_reference.provenance,
       source_parent_manifest_key:
@@ -4234,6 +4516,8 @@ export function buildObservationHistoryV3MigrationAuditReport({
       plan.source_observation_content_hash_provenance_counts,
     source_manifest_reference_provenance_counts:
       plan.source_manifest_reference_provenance_counts,
+    source_manifest_self_hash_provenance_counts:
+      plan.source_manifest_self_hash_provenance_counts,
     target_writer_version: plan.target.writer_version,
     target_history_schema_version: plan.target.history_schema_version,
     target_physical_layout_version: plan.target.physical_layout_version,
