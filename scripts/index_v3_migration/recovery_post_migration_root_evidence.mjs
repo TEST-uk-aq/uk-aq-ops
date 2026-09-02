@@ -146,6 +146,12 @@ function buildValidFixture(root) {
     },
     immutable_authority_sha256: identity.authoritySha,
     migration_run_id: identity.migrationRunId,
+    transition: {
+      kind: "v2-to-v3",
+      source_index_generation: "v2",
+      target_index_generation: "v3",
+      authority_switch_required: true,
+    },
     plan_sha256: identity.planSha,
     target_writer_git_sha: identity.targetWriterGitSha,
     recovery_implementation: {
@@ -160,7 +166,7 @@ function buildValidFixture(root) {
     immutable_authority_sha256: identity.authoritySha,
     updates: {
       completed_objects: [{
-        key: identity.sourceKey,
+        key: `${identity.sourceKey}.prior-fixture-object`,
         evidence: { byte_size: 100, sha256: "7".repeat(64), verified: true, durable: true },
       }],
     },

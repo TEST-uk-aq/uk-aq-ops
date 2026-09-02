@@ -77,8 +77,25 @@ import {
 } from "./hierarchical_backup_v2.mjs";
 import { compressors } from "./uk_aq_parquet_dependencies.mjs";
 import { buildObservationsManifestHierarchy } from "../uk_aq_observations_manifest_hierarchy.mjs";
+import {
+  verifyObservationHistoryV3RebuildRollbackSnapshot,
+} from "./observation_history_v3_rebuild_rollback.mjs";
 
 export const OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION = 1;
+export const OBSERVATION_HISTORY_V3_MIGRATION_TRANSITIONS = Object.freeze({
+  "v2-to-v3": Object.freeze({
+    kind: "v2-to-v3",
+    source_index_generation: "v2",
+    target_index_generation: "v3",
+    authority_switch_required: true,
+  }),
+  "v3-rebuild": Object.freeze({
+    kind: "v3-rebuild",
+    source_index_generation: "v3",
+    target_index_generation: "v3",
+    authority_switch_required: false,
+  }),
+});
 export const DEFAULT_OBSERVATIONS_PREFIX = "history/v2/observations";
 export const DEFAULT_V2_INDEX_ROOT = "history/_index_v2/observations_timeseries";
 export const DEFAULT_V2_LATEST_KEY =
@@ -173,6 +190,17 @@ function stableObject(value) {
 
 export function stableMigrationJson(value) {
   return `${JSON.stringify(stableObject(value), null, 2)}\n`;
+}
+
+export function normalizeObservationHistoryV3MigrationTransition(value) {
+  const kind = String(value || "").trim();
+  const transition = OBSERVATION_HISTORY_V3_MIGRATION_TRANSITIONS[kind];
+  if (!transition) {
+    throw new Error(
+      "Explicit migration transition must be v2-to-v3 or v3-rebuild",
+    );
+  }
+  return transition;
 }
 
 function updateRecoveryReplayDigest(hash, value) {
@@ -1024,6 +1052,7 @@ export async function readCanonicalObservationRowsFromParquetBytes({
 }
 
 export function validateObservationHistoryV3MigrationEnvironment({
+  transition,
   environment,
   configuredEnvironment,
   bucket,
@@ -1034,6 +1063,12 @@ export function validateObservationHistoryV3MigrationEnvironment({
   apply = false,
   operation = "migration",
 }) {
+  let selectedTransition = null;
+  try {
+    selectedTransition = normalizeObservationHistoryV3MigrationTransition(transition);
+  } catch {
+    // Report the missing/invalid transition with the other fail-closed blockers.
+  }
   const requested = String(environment || "").trim().toUpperCase();
   const configured = String(configuredEnvironment || "").trim().toUpperCase();
   const actualBucket = String(bucket || "").trim();
@@ -1050,23 +1085,27 @@ export function validateObservationHistoryV3MigrationEnvironment({
     blockers.push("logical_history_version_must_remain_v2");
   }
   const deployedIndexVersion = String(indexVersion || "").trim();
-  if (
-    operation === "rollback"
-      ? !new Set(["v2", "v3"]).has(deployedIndexVersion)
-      : operation === "verification"
-        ? !new Set(["v2", "v3"]).has(deployedIndexVersion)
-      : deployedIndexVersion !== "v2"
-  ) {
-    blockers.push(
-      operation === "rollback"
-        ? "rollback_observation_index_must_be_v2_or_v3"
-        : operation === "verification"
-          ? "verification_observation_index_must_be_v2_or_v3"
-        : "deployed_observation_index_must_remain_v2",
-    );
+  if (!selectedTransition) {
+    blockers.push("migration_transition_must_be_explicit");
+  } else {
+    const permittedIndexVersions = operation === "verification"
+      ? new Set([
+          selectedTransition.source_index_generation,
+          selectedTransition.target_index_generation,
+        ])
+      : operation === "rollback" && selectedTransition.kind === "v2-to-v3"
+        ? new Set(["v2", "v3"])
+        : new Set([selectedTransition.source_index_generation]);
+    if (!permittedIndexVersions.has(deployedIndexVersion)) {
+      blockers.push(
+        `current_observation_index_must_be_${[
+          ...permittedIndexVersions,
+        ].join("_or_")}_for_${selectedTransition.kind}`,
+      );
+    }
   }
-  if (!String(integrityVersion || "").trim()) {
-    blockers.push("integrity_version_identity_missing");
+  if (String(integrityVersion || "").trim() !== "v2") {
+    blockers.push("loaded_integrity_version_must_be_v2");
   }
   if (apply && blockers.length) {
     throw new Error(`Migration environment guard failed: ${blockers.join(",")}`);
@@ -1080,6 +1119,7 @@ export function validateObservationHistoryV3MigrationEnvironment({
     history_version: String(historyVersion || "").trim(),
     index_version: deployedIndexVersion,
     integrity_version: String(integrityVersion || "").trim(),
+    transition: selectedTransition,
     blockers: Object.freeze(blockers),
   });
 }
@@ -2255,14 +2295,39 @@ function sourceUnitFromPartition({
   });
 }
 
-function buildRollbackAuthority({ migrationRunId, environment, inventory, backupGate }) {
+function buildRollbackAuthority({
+  migrationRunId,
+  transition,
+  environment,
+  inventory,
+  backupGate,
+  v3RebuildSnapshot = null,
+}) {
+  const snapshotAuthority = v3RebuildSnapshot
+    ? Object.freeze({
+        verified: true,
+        snapshot_root_sha256: v3RebuildSnapshot.snapshot_root_sha256,
+        inventory_key: v3RebuildSnapshot.inventory_key,
+        inventory_identity: v3RebuildSnapshot.inventory_identity,
+        canonical_pre_state: v3RebuildSnapshot.canonical_pre_state,
+        object_count: v3RebuildSnapshot.object_count,
+        total_bytes: v3RebuildSnapshot.total_bytes,
+        objects: Object.freeze(v3RebuildSnapshot.objects.map(
+          ({ body: _body, ...entry }) => entry,
+        )),
+      })
+    : null;
   return Object.freeze({
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
-    kind: "uk_aq_observation_history_v2_rollback_authority",
+    kind: transition.kind === "v3-rebuild"
+      ? "uk_aq_observation_history_v3_rebuild_rollback_authority"
+      : "uk_aq_observation_history_v2_rollback_authority",
     migration_run_id: migrationRunId,
+    transition,
     environment,
     inventory,
     backup_gate: backupGate,
+    v3_rebuild_snapshot: snapshotAuthority,
   });
 }
 
@@ -2276,6 +2341,7 @@ export async function buildObservationHistoryV3MigrationPlan({
   targetWriterGitSha,
   expectedInventoryRootSha256,
   expectedStateRootSha256,
+  expectedV3RollbackSnapshotRootSha256 = null,
   observationsPrefix = DEFAULT_OBSERVATIONS_PREFIX,
   v2IndexRoot = DEFAULT_V2_INDEX_ROOT,
   v2LatestKey = DEFAULT_V2_LATEST_KEY,
@@ -2287,6 +2353,9 @@ export async function buildObservationHistoryV3MigrationPlan({
     ...environmentEvidence,
     apply: false,
   });
+  const transition = normalizeObservationHistoryV3MigrationTransition(
+    environmentEvidence?.transition,
+  );
   const runId = String(migrationRunId || "").trim();
   if (!runId) throw new TypeError("migrationRunId is required for audit evidence");
   if (!writerLimits || typeof writerLimits !== "object") {
@@ -2303,7 +2372,12 @@ export async function buildObservationHistoryV3MigrationPlan({
     sosConnectorId,
   });
   let backupGate = null;
+  let v3RebuildSnapshot = null;
   const blockers = [...environment.blockers];
+  if (
+    transition.kind === "v2-to-v3" &&
+    String(expectedV3RollbackSnapshotRootSha256 || "").trim()
+  ) blockers.push("v2_to_v3_must_not_use_v3_rebuild_snapshot_authority");
   try {
     backupGate = await verifyObservationHistoryDropboxCheckpoint({
       getR2Object,
@@ -2319,12 +2393,33 @@ export async function buildObservationHistoryV3MigrationPlan({
       }`,
     );
   }
+  if (transition.kind === "v3-rebuild") {
+    try {
+      v3RebuildSnapshot = await verifyObservationHistoryV3RebuildRollbackSnapshot({
+        getBackupObject,
+        getR2Object,
+        migrationRunId: runId,
+        environment: environment.environment,
+        bucket: environment.bucket,
+        canonicalRoot: inventory.root_manifest,
+        expectedSnapshotRootSha256: expectedV3RollbackSnapshotRootSha256,
+      });
+    } catch (error) {
+      blockers.push(
+        `verified_v3_rebuild_rollback_snapshot_missing:${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
   const rollbackAuthority = backupGate
     ? buildRollbackAuthority({
         migrationRunId: runId,
+        transition,
         environment,
         inventory,
         backupGate,
+        v3RebuildSnapshot,
       })
     : null;
   let rollbackPreflight = null;
@@ -2344,6 +2439,7 @@ export async function buildObservationHistoryV3MigrationPlan({
           stage: object.stage,
         }))),
         v2_index_strategy: restorePlan.v2_index_strategy,
+        v3_index_strategy: restorePlan.v3_index_strategy,
       });
       if (!rollbackPreflight.verified) {
         blockers.push("manifest_guided_rollback_preflight_incomplete");
@@ -2393,6 +2489,7 @@ export async function buildObservationHistoryV3MigrationPlan({
   const emptySourceConnectors = inventory.empty_source_connectors;
   const planIdentityPayload = {
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
+    transition,
     environment: environment.environment,
     bucket: environment.bucket,
     source_root: inventory.root_manifest.payload.content_hash,
@@ -2400,6 +2497,8 @@ export async function buildObservationHistoryV3MigrationPlan({
     backup_checkpoint: backupGate?.state_root.sha256 || null,
     writer_limits: writerLimits,
     target_writer_git_sha: targetWriterGitSha,
+    v3_rebuild_rollback_snapshot_root:
+      v3RebuildSnapshot?.snapshot_root_sha256 || null,
     unit_ids: units.map((unit) => unit.unit_id),
     source_files: units.flatMap((unit) => unit.source_files),
     source_observation_content_hash_provenance_counts:
@@ -2422,7 +2521,9 @@ export async function buildObservationHistoryV3MigrationPlan({
     kind: "uk_aq_observation_history_v3_migration_plan",
     mode: "plan",
     migration_run_id: runId,
+    transition,
     plan_sha256: sha256Hex(stableMigrationJson(planIdentityPayload)),
+    plan_identity: Object.freeze(structuredClone(planIdentityPayload)),
     environment,
     target: Object.freeze({
       history_version: "v2",
@@ -2441,6 +2542,20 @@ export async function buildObservationHistoryV3MigrationPlan({
     backup_gate: backupGate,
     rollback_authority: rollbackAuthority,
     rollback_preflight: rollbackPreflight,
+    v3_rebuild_rollback_snapshot: v3RebuildSnapshot
+      ? Object.freeze({
+          verified: true,
+          snapshot_root_sha256: v3RebuildSnapshot.snapshot_root_sha256,
+          inventory_key: v3RebuildSnapshot.inventory_key,
+          inventory_identity: v3RebuildSnapshot.inventory_identity,
+          canonical_pre_state: v3RebuildSnapshot.canonical_pre_state,
+          object_count: v3RebuildSnapshot.object_count,
+          total_bytes: v3RebuildSnapshot.total_bytes,
+          objects: Object.freeze(v3RebuildSnapshot.objects.map(
+            ({ body: _body, ...entry }) => entry,
+          )),
+        })
+      : null,
     units: Object.freeze(units),
     source_observation_content_hash_provenance_counts:
       sourceObservationContentHashProvenanceCounts,
@@ -2653,12 +2768,28 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
   legacyOriginalOrdering = false,
 }) {
   const authority = checkpoint?.authority;
+  const transition = authority?.transition
+    ? normalizeObservationHistoryV3MigrationTransition(authority.transition.kind)
+    : null;
   if (
     checkpoint?.kind !== "uk_aq_observation_history_v3_migration_checkpoint" ||
     !authority ||
     checkpoint.plan_sha256 !== authority.plan_sha256 ||
     checkpoint.migration_run_id !== authority.migration_run_id ||
-    checkpoint.authority_sha256 !== sha256Hex(stableMigrationJson(authority))
+    stableMigrationJson(checkpoint.transition) !==
+      stableMigrationJson(authority.transition) ||
+    authority.plan_sha256 !==
+      sha256Hex(stableMigrationJson(authority.plan_identity)) ||
+    stableMigrationJson(authority.plan_identity?.transition) !==
+      stableMigrationJson(authority.transition) ||
+    checkpoint.authority_sha256 !== sha256Hex(stableMigrationJson(authority)) ||
+    !transition ||
+    authority.transition.source_index_generation !==
+      transition.source_index_generation ||
+    authority.transition.target_index_generation !==
+      transition.target_index_generation ||
+    authority.transition.authority_switch_required !==
+      transition.authority_switch_required
   ) {
     throw new Error("Migration checkpoint immutable authority is missing or invalid");
   }
@@ -2784,6 +2915,7 @@ function emptyCheckpoint(plan) {
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
     kind: "uk_aq_observation_history_v3_migration_checkpoint",
     migration_run_id: plan.migration_run_id,
+    transition: plan.transition,
     plan_sha256: plan.plan_sha256,
     authority,
     authority_sha256: sha256Hex(stableMigrationJson(authority)),
@@ -2813,6 +2945,7 @@ function emptyCheckpoint(plan) {
           object_count: plan.rollback_preflight.object_count,
           objects: plan.rollback_preflight.objects,
           v2_index_strategy: plan.rollback_preflight.v2_index_strategy,
+          v3_index_strategy: plan.rollback_preflight.v3_index_strategy,
         }
       : null,
     completed_objects: {},
@@ -2854,6 +2987,7 @@ export async function executeObservationHistoryV3MigrationPlan({
   }
   const currentEnvironment = validateObservationHistoryV3MigrationEnvironment({
     ...environmentEvidence,
+    transition: plan.transition.kind,
     apply: true,
   });
   if (
@@ -2884,6 +3018,21 @@ export async function executeObservationHistoryV3MigrationPlan({
     if (typeof adapters?.[name] !== "function") {
       throw new TypeError(`Migration apply adapter is missing: ${name}`);
     }
+  }
+  if (plan.transition.kind === "v3-rebuild" && !rawCheckpoint) {
+    if (typeof adapters?.getBackupObject !== "function") {
+      throw new TypeError("Migration apply adapter is missing: getBackupObject");
+    }
+    await verifyObservationHistoryV3RebuildRollbackSnapshot({
+      getBackupObject: adapters.getBackupObject,
+      getR2Object: adapters.getObject,
+      migrationRunId: plan.migration_run_id,
+      environment: currentEnvironment.environment,
+      bucket: currentEnvironment.bucket,
+      canonicalRoot: plan.inventory.root_manifest,
+      expectedSnapshotRootSha256:
+        plan.v3_rebuild_rollback_snapshot?.snapshot_root_sha256,
+    });
   }
   const checkpoint = rawCheckpoint ? structuredClone(rawCheckpoint) : emptyCheckpoint(plan);
   if (
@@ -3586,6 +3735,7 @@ export async function buildObservationHistoryV2RestorePlan({
     (migrationPlan
       ? {
           migration_run_id: migrationPlan.migration_run_id,
+          transition: migrationPlan.transition,
           environment: migrationPlan.environment,
           inventory: migrationPlan.inventory,
           backup_gate: migrationPlan.backup_gate,
@@ -3766,10 +3916,56 @@ export async function buildObservationHistoryV2RestorePlan({
     year_manifest: 60,
     root_manifest: 70,
   };
-  const ordered = [...objects.values()].sort((left, right) =>
+  let ordered = [...objects.values()].sort((left, right) =>
     stageRank[left.stage] - stageRank[right.stage] ||
     Buffer.compare(Buffer.from(left.key), Buffer.from(right.key))
   );
+  const transition = normalizeObservationHistoryV3MigrationTransition(
+    authority.transition?.kind,
+  );
+  let v3IndexStrategy = null;
+  if (transition.kind === "v3-rebuild") {
+    const snapshot = authority.v3_rebuild_snapshot;
+    if (
+      snapshot?.verified !== true ||
+      !SHA256_PATTERN.test(String(snapshot.snapshot_root_sha256 || "")) ||
+      !Array.isArray(snapshot.objects) ||
+      snapshot.objects.length === 0
+    ) {
+      throw new Error("v3 rebuild rollback requires immutable v3 snapshot authority");
+    }
+    const snapshotObjects = [];
+    for (const raw of snapshot.objects) {
+      const backupKey = String(raw.backup_key || "");
+      if (!backupKey) throw new Error(`v3 snapshot backup key is missing: ${raw.key}`);
+      const backupObject = await getRequiredObject(
+        getBackupObject,
+        backupKey,
+        "v3 rebuild rollback snapshot",
+      );
+      if (
+        backupObject.byte_size !== raw.byte_size ||
+        backupObject.sha256 !== raw.sha256
+      ) throw new Error(`v3 snapshot object identity changed: ${raw.key}`);
+      snapshotObjects.push(Object.freeze({
+        key: raw.key,
+        backup_key: backupKey,
+        byte_size: raw.byte_size,
+        sha256: raw.sha256,
+        content_type: "application/json; charset=utf-8",
+        stage: raw.stage,
+        body: backupObject.body,
+      }));
+    }
+    ordered = [...ordered, ...snapshotObjects];
+    v3IndexStrategy = Object.freeze({
+      mode: "exact_snapshot_restore",
+      snapshot_root_sha256: snapshot.snapshot_root_sha256,
+      inventory_key: snapshot.inventory_key,
+      retained_index_assumed_valid: false,
+      authority_switch_required: false,
+    });
+  }
   if (checkpointPlan) {
     const pinnedObjects = checkpointPlan.rollback_preflight?.objects || [];
     const identities = ordered.map(({ key, byte_size, sha256, stage }) => ({
@@ -3786,21 +3982,27 @@ export async function buildObservationHistoryV2RestorePlan({
   }
   return Object.freeze({
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
-    kind: "uk_aq_observation_history_v2_restore_plan",
+    kind: transition.kind === "v3-rebuild"
+      ? "uk_aq_observation_history_v3_rebuild_restore_plan"
+      : "uk_aq_observation_history_v2_restore_plan",
     migration_run_id: authority.migration_run_id,
+    transition,
     environment: authority.environment,
     backup_checkpoint: Object.freeze({
       inventory_root: backupGate.inventory_root,
       state_root: backupGate.state_root,
     }),
     objects: Object.freeze(ordered),
-    v2_index_strategy: Object.freeze({
-      mode: "rebuild",
-      retained_index_assumed_valid: false,
-      command:
-        "node scripts/backup_r2/uk_aq_build_r2_history_index.mjs " +
-        "--history-version v2 --domain observations --write-r2",
-    }),
+    v2_index_strategy: transition.kind === "v2-to-v3"
+      ? Object.freeze({
+          mode: "rebuild",
+          retained_index_assumed_valid: false,
+          command:
+            "node scripts/backup_r2/uk_aq_build_r2_history_index.mjs " +
+            "--history-version v2 --domain observations --write-r2",
+        })
+      : null,
+    v3_index_strategy: v3IndexStrategy,
     ready: ordered.length > 0,
   });
 }
@@ -3820,10 +4022,12 @@ export async function executeObservationHistoryV2Rollback({
       mutation_calls: 0,
       object_count: restorePlan.objects.length,
       v2_index_strategy: restorePlan.v2_index_strategy,
+      v3_index_strategy: restorePlan.v3_index_strategy,
     });
   }
   const environment = validateObservationHistoryV3MigrationEnvironment({
     ...environmentEvidence,
+    transition: restorePlan.transition?.kind || environmentEvidence?.transition,
     apply: true,
     operation: "rollback",
   });
@@ -3836,15 +4040,17 @@ export async function executeObservationHistoryV2Rollback({
   if (writersFrozen !== true) {
     throw new Error("Rollback apply requires explicit confirmation that writers remain frozen");
   }
-  for (const name of [
+  const requiredAdapters = [
     "putChecksumObject",
     "putJsonObject",
     "getObject",
     "headObject",
-    "rebuildV2Indexes",
-    "verifyV2IndexCompleteness",
     "getBackupObject",
-  ]) {
+  ];
+  if (restorePlan.transition.kind === "v2-to-v3") {
+    requiredAdapters.push("rebuildV2Indexes", "verifyV2IndexCompleteness");
+  }
+  for (const name of requiredAdapters) {
     if (typeof adapters?.[name] !== "function") {
       throw new TypeError(`Rollback apply adapter is missing: ${name}`);
     }
@@ -3853,7 +4059,7 @@ export async function executeObservationHistoryV2Rollback({
   for (const descriptor of restorePlan.objects) {
     const backupObject = await getRequiredObject(
       adapters.getBackupObject,
-      descriptor.key,
+      descriptor.backup_key || descriptor.key,
       "Dropbox rollback authority",
     );
     if (
@@ -3879,6 +4085,19 @@ export async function executeObservationHistoryV2Rollback({
       }
       evidence.push(identity);
     }
+  }
+  if (restorePlan.transition.kind === "v3-rebuild") {
+    return Object.freeze({
+      ok: true,
+      status: "rollback_canonical_and_v3_snapshot_restored",
+      dry_run: false,
+      observed_starting_index_version: environment.index_version,
+      restored_objects: Object.freeze(evidence),
+      v3_index_restore: restorePlan.v3_index_strategy,
+      configuration_changed: false,
+      scheduler_changed: false,
+      deployment_changed: false,
+    });
   }
   const indexResult = await adapters.rebuildV2Indexes();
   if (
@@ -3935,15 +4154,26 @@ export function buildObservationHistoryV3MigrationAuditReport({
     kind: "uk_aq_observation_history_v3_migration_audit",
     environment: plan.environment.environment,
     migration_run_id: plan.migration_run_id,
+    transition: plan.transition,
     start_utc: startedAt || null,
     end_utc: completedAt || null,
     mode,
     pre_state_identities: {
+      source_index_generation: plan.transition.source_index_generation,
       observation_root: {
         ...identity(plan.inventory.root_manifest),
         content_hash: plan.inventory.root_manifest.payload.content_hash,
       },
       v2_latest: plan.inventory.existing_v2_latest_identity,
+      v3_rebuild_rollback_snapshot: plan.v3_rebuild_rollback_snapshot
+        ? {
+            snapshot_root_sha256:
+              plan.v3_rebuild_rollback_snapshot.snapshot_root_sha256,
+            inventory_identity:
+              plan.v3_rebuild_rollback_snapshot.inventory_identity,
+            object_count: plan.v3_rebuild_rollback_snapshot.object_count,
+          }
+        : null,
     },
     dropbox_checkpoint_identity: plan.backup_gate
       ? {
@@ -4014,6 +4244,7 @@ export function buildObservationHistoryV3MigrationAuditReport({
     v3_latest_count: plan.estimated.v3_latest_objects,
     publication_verification: execution?.v3_publication?.ok === true,
     cutover_ready: execution?.verification?.cutover_ready === true,
+    completion_ready: execution?.verification?.cutover_ready === true,
     blockers: [...failed],
     rollback_ready: Boolean(
       plan.backup_gate?.verified && plan.rollback_preflight?.verified,

@@ -18,7 +18,6 @@ usage() {
   cat <<'EOF'
 Usage:
   index_v3_post_cutover_verify.sh \
-    --transition v2-to-v3|v3-rebuild \
     --plan-report PATH \
     --checkpoint PATH \
     --dropbox-root PATH \
@@ -49,7 +48,7 @@ pass() { printf 'PASS: %s\n' "$1"; }
 warn() { printf 'WARN: %s\n' "$1"; }
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
-  printf 'DEPLOYED-PATH VERIFICATION FAILED. KEEP MAINTENANCE ON AND WRITERS FROZEN.\n' >&2
+  printf 'POST-CUTOVER VERIFICATION FAILED. KEEP MAINTENANCE ON AND WRITERS FROZEN.\n' >&2
   exit 1
 }
 
@@ -85,7 +84,6 @@ read_http_header() {
 }
 
 PLAN_REPORT=""
-TRANSITION=""
 CHECKPOINT=""
 SITE_URL=""
 CACHE_URL=""
@@ -96,7 +94,6 @@ V2_RUNTIME_ROLLBACK_RECORD=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --plan-report) PLAN_REPORT="${2:-}"; shift 2 ;;
-    --transition) TRANSITION="${2:-}"; shift 2 ;;
     --checkpoint) CHECKPOINT="${2:-}"; shift 2 ;;
     --dropbox-root) DROPBOX_ROOT="${2:-}"; shift 2 ;;
     --writer-freeze-evidence) WRITER_FREEZE_EVIDENCE="${2:-}"; shift 2 ;;
@@ -109,16 +106,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$PLAN_REPORT" ] || fail "--plan-report is required"
-[ -n "$TRANSITION" ] || fail "--transition is required"
-case "$TRANSITION" in v2-to-v3|v3-rebuild) ;; *) fail "--transition must be v2-to-v3 or v3-rebuild" ;; esac
 [ -n "$CHECKPOINT" ] || fail "--checkpoint is required"
 [ -n "$DROPBOX_ROOT" ] || fail "--dropbox-root is required"
 [ -n "$WRITER_FREEZE_EVIDENCE" ] || fail "--writer-freeze-evidence is required"
-if [ "$TRANSITION" = "v2-to-v3" ]; then
-  [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] || fail "--v2-runtime-rollback-record is required for v2-to-v3"
-else
-  [ -z "$V2_RUNTIME_ROLLBACK_RECORD" ] || fail "v3-rebuild does not accept a v2 runtime rollback record"
-fi
+[ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] || fail "--v2-runtime-rollback-record is required"
 [ -n "$SITE_URL" ] || fail "--site-url is required"
 [ -n "$CACHE_URL" ] || fail "--cache-url is required"
 
@@ -133,8 +124,6 @@ cd -- "$REPO_ROOT"
 
 [ -f "$PLAN_REPORT" ] || fail "migration plan report is missing: $PLAN_REPORT"
 jq empty "$PLAN_REPORT" >/dev/null 2>&1 || fail "migration plan report is invalid JSON"
-[ "$(jq -r '.result.transition.kind // empty' "$PLAN_REPORT")" = "$TRANSITION" ] \
-  || fail "migration plan transition does not match --transition"
 [ -f "$CHECKPOINT" ] || fail "migration checkpoint is missing: $CHECKPOINT"
 
 for name in \
@@ -169,7 +158,7 @@ if [ -n "$(git status --short)" ]; then
 fi
 
 printf '%s\n' '============================================================'
-printf 'UK AQ INDEX V3 DEPLOYED-PATH VERIFY: %s / %s\n' "$ENVIRONMENT" "$TRANSITION"
+printf 'UK AQ INDEX V3 POST-CUTOVER VERIFY: %s\n' "$ENVIRONMENT"
 printf 'Repository: %s / %s\n' "$REPO_SLUG" "$CURRENT_BRANCH"
 printf 'Site URL: %s\n' "${SITE_URL%/}"
 printf 'Cache URL: %s\n' "${CACHE_URL%/}"
@@ -304,15 +293,11 @@ FREEZE_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
   --plan-report "$PLAN_REPORT" \
   --repository-root "$REPO_ROOT")" \
   || fail "durable writer-freeze evidence is invalid"
-EVIDENCE_RESULTS=(FREEZE_RESULT)
-if [ "$TRANSITION" = "v2-to-v3" ]; then
-  ROLLBACK_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
-    --evidence "$V2_RUNTIME_ROLLBACK_RECORD" \
-    --repository-root "$REPO_ROOT")" \
-    || fail "immutable v2 runtime rollback record is invalid or lacks exact historical deployment identity"
-  EVIDENCE_RESULTS+=(ROLLBACK_RESULT)
-fi
-for result_name in "${EVIDENCE_RESULTS[@]}"; do
+ROLLBACK_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
+  --evidence "$V2_RUNTIME_ROLLBACK_RECORD" \
+  --repository-root "$REPO_ROOT")" \
+  || fail "immutable v2 runtime rollback record is invalid or lacks exact historical deployment identity"
+for result_name in FREEZE_RESULT ROLLBACK_RESULT; do
   result_value="${!result_name}"
   [ "$(printf '%s' "$result_value" | jq -r '.environment // empty' | tr '[:lower:]' '[:upper:]')" = "$ENVIRONMENT" ] \
     || fail "$result_name environment differs from $ENVIRONMENT"
@@ -321,11 +306,7 @@ for result_name in "${EVIDENCE_RESULTS[@]}"; do
   [ "$(printf '%s' "$result_value" | jq -r '.branch // empty')" = "$CURRENT_BRANCH" ] \
     || fail "$result_name branch differs from $CURRENT_BRANCH"
 done
-if [ "$TRANSITION" = "v2-to-v3" ]; then
-  pass "durable freeze evidence covers all declared mutation classes and the v2 runtime rollback record is exact"
-else
-  pass "durable freeze evidence covers all declared mutation classes; pinned v3 snapshot authority provides rebuild rollback"
-fi
+pass "durable freeze evidence covers all declared mutation classes and the v2 runtime rollback record is exact"
 
 RECOVERY_ROOT="$CHECKPOINT.recovery"
 RECOVERY_HEAD="$RECOVERY_ROOT/head.json"
@@ -334,8 +315,6 @@ RECOVERY_HELPER="$SCRIPT_DIR/recovery_post_migration_root_evidence.mjs"
 [ -f "$RECOVERY_HEAD" ] || fail "recovery journal head is missing: $RECOVERY_HEAD"
 [ -f "$RECOVERY_MANIFEST" ] || fail "recovery manifest is missing: $RECOVERY_MANIFEST"
 [ -f "$RECOVERY_HELPER" ] || fail "post-migration recovery-root helper is missing"
-[ "$(jq -r '.payload.transition.kind // empty' "$RECOVERY_MANIFEST")" = "$TRANSITION" ] \
-  || fail "recovery manifest transition does not match --transition"
 CHECKPOINT_SHA="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
 CHECKPOINT_BYTES="$(wc -c < "$CHECKPOINT" | tr -d ' ')"
 IMMUTABLE_AUTHORITY_SHA="$(jq -r '.authority_sha256 // empty' "$CHECKPOINT")"
@@ -382,13 +361,6 @@ printf '%s\n' '--- B. EXACT V3 DEPENDENCY / GENERATION VERIFICATION ---'
 DEPENDENCY_WRITER_LIMITS="$TMP_DIR/writer_limits.json"
 DEPENDENCY_VERIFY_REPORT="$TMP_DIR/current_dependency_verify.json"
 jq '.result.target.writer_limits' "$PLAN_REPORT" > "$DEPENDENCY_WRITER_LIMITS"
-DEPENDENCY_TRANSITION_ARGS=(--transition "$TRANSITION")
-if [ "$TRANSITION" = "v3-rebuild" ]; then
-  DEPENDENCY_TRANSITION_ARGS+=(
-    --expected-v3-rollback-snapshot-root-sha256
-    "$(jq -r '.result.v3_rebuild_rollback_snapshot.snapshot_root_sha256 // empty' "$PLAN_REPORT")"
-  )
-fi
 MIGRATION_WRAPPER="$SCRIPT_DIR/index_v3_migration.sh"
 [ -x "$MIGRATION_WRAPPER" ] || fail "migration dependency-authority wrapper is missing or not executable"
 "$MIGRATION_WRAPPER" --verify-dependency-authority "$TARGET_WRITER_GIT_SHA" >/dev/null \
@@ -396,7 +368,6 @@ MIGRATION_WRAPPER="$SCRIPT_DIR/index_v3_migration.sh"
 if ! UK_AQ_ENV_NAME="$ENVIRONMENT" node --max-old-space-size=4096 \
   scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs \
   --mode verify \
-  "${DEPENDENCY_TRANSITION_ARGS[@]}" \
   --environment "$ENVIRONMENT" \
   --expected-bucket "$CFLARE_R2_BUCKET" \
   --migration-run-id "$MIGRATION_RUN_ID" \
@@ -583,5 +554,5 @@ fi
 pass "routing/data smoke: cache BYPASS traversed /v1/station-series and returned historical R2 rows (r2_rows=$R2_ROW_COUNT)"
 warn "cache BYPASS does not prove that the inner observations candidate performed a fresh cache MISS or fresh ranged R2 read"
 
-printf '\nDEPLOYED-PATH VERIFY PASS: exact v3 dependency generation and deployed routing/data smoke both passed.\n'
+printf '\nPOST-CUTOVER VERIFY PASS: exact v3 dependency generation and deployed routing/data smoke both passed.\n'
 printf 'KEEP MAINTENANCE ON AND WRITERS FROZEN UNTIL THE OPERATOR EXPLICITLY RESUMES THEM.\n'

@@ -48,16 +48,11 @@ import {
   DEFAULT_V3_LATEST_KEY,
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
-  inventoryAuthoritativeCanonicalObservationHistory,
   stableMigrationJson,
   validateObservationHistoryV3MigrationEnvironment,
-  verifyObservationHistoryDropboxCheckpoint,
   verifyObservationHistoryV2IndexCompleteness,
   verifyObservationHistoryV3CurrentDependencies,
 } from "./lib/observation_history_migration_v3.mjs";
-import {
-  createObservationHistoryV3RebuildRollbackSnapshot,
-} from "./lib/observation_history_v3_rebuild_rollback.mjs";
 
 const MODES = new Set([
   "plan",
@@ -65,7 +60,6 @@ const MODES = new Set([
   "verify",
   "rollback-plan",
   "rollback",
-  "snapshot-v3-rollback",
 ]);
 
 function usage() {
@@ -77,13 +71,11 @@ function usage() {
     "  --mode plan             Build non-mutating pinned inventory/rollback authority (default)",
     "  --mode migrate          Execute the offline rewrite and complete v3 publication",
     "  --mode verify           Rerun complete verification without mutation",
-    "  --mode rollback-plan    Build the transition-specific exact restore plan",
-    "  --mode rollback         Restore the selected transition's exact pre-state",
-    "  --mode snapshot-v3-rollback  Explicitly snapshot current v3 rollback authority to Dropbox",
+    "  --mode rollback-plan    Build the manifest-guided v2 restore plan",
+    "  --mode rollback         Restore canonical v2 bytes and rebuild observation _index_v2",
     "",
     "Required for every mode:",
     "  --environment TEST|LIVE",
-    "  --transition v2-to-v3|v3-rebuild",
     "  --expected-bucket <exact environment bucket>",
     "  --migration-run-id <stable operator identity>",
     "  --target-writer-git-sha <exact deployed migration code identity>",
@@ -91,12 +83,11 @@ function usage() {
     "  --dropbox-root <local directory or rclone remote:path>",
     "  --expected-inventory-root-sha256 <hex>",
     "  --expected-state-root-sha256 <hex>",
-    "  --expected-v3-rollback-snapshot-root-sha256 <hex>  Required for v3-rebuild plan/migration",
     "  --report-out <audit JSON path>",
-    "  --expected-plan-sha256 <hex>  Required except for plan/snapshot preparation",
+    "  --expected-plan-sha256 <hex>  Required for every non-plan mode",
     "",
     "Mutation-only requirements:",
-    "  --apply                  Explicitly permit the selected external mutation",
+    "  --apply                  Explicitly permit R2 mutation",
     "  --writers-frozen         Confirm every planner-listed writer is paused",
     "  --checkpoint-out <path>  Required for migrate; atomically updated after each object",
     "",
@@ -116,7 +107,6 @@ function requireValue(argv, index, flag) {
 export function parseObservationHistoryMigrationArgs(argv) {
   const args = {
     mode: "plan",
-    transition: null,
     apply: false,
     writersFrozen: false,
     environment: null,
@@ -127,7 +117,6 @@ export function parseObservationHistoryMigrationArgs(argv) {
     dropboxRoot: null,
     expectedInventoryRootSha256: null,
     expectedStateRootSha256: null,
-    expectedV3RollbackSnapshotRootSha256: null,
     reportOut: null,
     checkpointIn: null,
     checkpointOut: null,
@@ -140,7 +129,6 @@ export function parseObservationHistoryMigrationArgs(argv) {
     else if (flag === "--apply") args.apply = true;
     else if (flag === "--writers-frozen") args.writersFrozen = true;
     else if (flag === "--mode") args.mode = requireValue(argv, index++, flag);
-    else if (flag === "--transition") args.transition = requireValue(argv, index++, flag);
     else if (flag === "--environment") args.environment = requireValue(argv, index++, flag);
     else if (flag === "--expected-bucket") args.expectedBucket = requireValue(argv, index++, flag);
     else if (flag === "--migration-run-id") args.migrationRunId = requireValue(argv, index++, flag);
@@ -152,9 +140,6 @@ export function parseObservationHistoryMigrationArgs(argv) {
     } else if (flag === "--expected-state-root-sha256") {
       args.expectedStateRootSha256 = requireValue(argv, index++, flag);
     } else if (flag === "--report-out") args.reportOut = requireValue(argv, index++, flag);
-    else if (flag === "--expected-v3-rollback-snapshot-root-sha256") {
-      args.expectedV3RollbackSnapshotRootSha256 = requireValue(argv, index++, flag);
-    }
     else if (flag === "--checkpoint-in") args.checkpointIn = requireValue(argv, index++, flag);
     else if (flag === "--checkpoint-out") args.checkpointOut = requireValue(argv, index++, flag);
     else if (flag === "--expected-plan-sha256") {
@@ -163,19 +148,10 @@ export function parseObservationHistoryMigrationArgs(argv) {
     else throw new Error(`Unknown argument: ${flag}`);
   }
   if (!MODES.has(args.mode)) throw new Error(`Unsupported --mode: ${args.mode}`);
-  if (
-    !args.help &&
-    !new Set(["v2-to-v3", "v3-rebuild"]).has(String(args.transition || ""))
-  ) {
-    throw new Error("--transition must be explicitly set to v2-to-v3 or v3-rebuild");
+  if (args.apply && !new Set(["migrate", "rollback"]).has(args.mode)) {
+    throw new Error("--apply is valid only with --mode migrate or --mode rollback");
   }
-  if (args.mode === "snapshot-v3-rollback" && args.transition !== "v3-rebuild") {
-    throw new Error("snapshot-v3-rollback requires --transition v3-rebuild");
-  }
-  if (args.apply && !new Set(["migrate", "rollback", "snapshot-v3-rollback"]).has(args.mode)) {
-    throw new Error("--apply is valid only with a mutation mode");
-  }
-  if (new Set(["migrate", "rollback", "snapshot-v3-rollback"]).has(args.mode) && !args.apply) {
+  if (new Set(["migrate", "rollback"]).has(args.mode) && !args.apply) {
     throw new Error(`${args.mode} mode requires --apply`);
   }
   if (args.apply && !args.writersFrozen) {
@@ -197,7 +173,7 @@ export function parseObservationHistoryMigrationArgs(argv) {
   if (new Set(["rollback-plan", "rollback"]).has(args.mode) && !args.checkpointIn) {
     throw new Error(`${args.mode} mode requires --checkpoint-in`);
   }
-  if (!new Set(["plan", "snapshot-v3-rollback"]).has(args.mode) && !String(args.expectedPlanSha256 || "").trim()) {
+  if (args.mode !== "plan" && !String(args.expectedPlanSha256 || "").trim()) {
     throw new Error(`${args.mode} mode requires --expected-plan-sha256`);
   }
   return Object.freeze(args);
@@ -230,7 +206,6 @@ const RECOVERY_PROGRESS_SCHEMA_VERSION = 1;
 const RECOVERY_IMPLEMENTATION_PATHS = Object.freeze([
   "scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs",
   "scripts/backup_r2/lib/observation_history_migration_v3.mjs",
-  "scripts/backup_r2/lib/observation_history_v3_rebuild_rollback.mjs",
   "scripts/index_v3_migration/index_v3_migration.sh",
   "scripts/index_v3_migration/recovery_journal_authority.mjs",
 ]);
@@ -315,7 +290,6 @@ function recoveryManifestPayload({
     original_checkpoint: checkpointFileIdentity(checkpointPath),
     immutable_authority_sha256: checkpoint.authority_sha256,
     migration_run_id: plan.migration_run_id,
-    transition: plan.transition,
     plan_sha256: plan.plan_sha256,
     target_writer_git_sha: plan.target_writer_git_sha,
     recovery_implementation:
@@ -693,42 +667,8 @@ export function buildDropboxBackupReader(dropboxRoot) {
   };
 }
 
-export function buildDropboxBackupWriter(dropboxRoot) {
-  const root = String(dropboxRoot || "").trim().replace(/\/+$/, "");
-  if (!root) throw new Error("--dropbox-root is required");
-  if (isRcloneRemote(root)) {
-    return async ({ key, body }) => {
-      const target = `${root}/${String(key).replace(/^\/+/, "")}`;
-      const result = spawnSync("rclone", ["rcat", target], {
-        input: Buffer.isBuffer(body) ? body : Buffer.from(body),
-        encoding: null,
-        maxBuffer: 2_147_483_647,
-      });
-      if (result.status !== 0) {
-        throw new Error(
-          `Dropbox rclone write failed: ${key}: ${Buffer.from(result.stderr || "").toString("utf8").trim()}`,
-        );
-      }
-      return { ok: true, key };
-    };
-  }
-  const localRoot = path.resolve(root);
-  return async ({ key, body }) => {
-    const target = path.resolve(localRoot, String(key).replace(/^\/+/, ""));
-    if (target !== localRoot && !target.startsWith(`${localRoot}${path.sep}`)) {
-      throw new Error(`Dropbox backup key escapes the selected root: ${key}`);
-    }
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    const temporary = `${target}.tmp-${process.pid}`;
-    fs.writeFileSync(temporary, body, { mode: 0o600 });
-    fs.renameSync(temporary, target);
-    return { ok: true, key };
-  };
-}
-
 function requireCommonArgs(args) {
   const missing = [
-    ["--transition", args.transition],
     ["--environment", args.environment],
     ["--expected-bucket", args.expectedBucket],
     ["--migration-run-id", args.migrationRunId],
@@ -740,18 +680,10 @@ function requireCommonArgs(args) {
     ["--report-out", args.reportOut],
   ].filter(([, value]) => !String(value || "").trim());
   if (missing.length) throw new Error(`Missing required arguments: ${missing.map(([flag]) => flag).join(", ")}`);
-  if (
-    args.transition === "v3-rebuild" &&
-    args.mode !== "snapshot-v3-rollback" &&
-    !String(args.expectedV3RollbackSnapshotRootSha256 || "").trim()
-  ) {
-    throw new Error("v3-rebuild requires --expected-v3-rollback-snapshot-root-sha256");
-  }
 }
 
 function environmentEvidence(args, env, config) {
   return {
-    transition: args.transition,
     environment: args.environment,
     configuredEnvironment: env.UK_AQ_ENV_NAME || env.ENVIRONMENT || "",
     bucket: config.r2.bucket,
@@ -774,7 +706,6 @@ function summaryForPlan(plan) {
     schema_version: plan.schema_version,
     kind: "uk_aq_observation_history_v3_migration_plan_summary",
     migration_run_id: plan.migration_run_id,
-    transition: plan.transition,
     plan_sha256: plan.plan_sha256,
     environment: plan.environment,
     target: plan.target,
@@ -789,7 +720,6 @@ function summaryForPlan(plan) {
           state_root: identity(plan.backup_gate.state_root),
         }
       : null,
-    v3_rebuild_rollback_snapshot: plan.v3_rebuild_rollback_snapshot,
     estimated: plan.estimated,
     source_observation_content_hash_provenance_counts:
       plan.source_observation_content_hash_provenance_counts,
@@ -1257,12 +1187,10 @@ export async function runObservationHistoryMigrationV3({
     readJsonFile(args.writerLimitsPath, "writer limits"),
     "migration --writer-limits-json",
   );
-  if (new Set(["migrate", "rollback", "snapshot-v3-rollback"]).has(args.mode)) {
+  if (new Set(["migrate", "rollback"]).has(args.mode)) {
     const lockOwner = args.mode === "rollback"
-      ? `observation_history_rollback_${args.transition.replaceAll("-", "_")}`
-      : args.mode === "snapshot-v3-rollback"
-        ? "observation_history_v3_rebuild_snapshot"
-        : `observation_history_migration_${args.transition.replaceAll("-", "_")}`;
+      ? "observation_history_rollback_v2"
+      : "observation_history_migration_v3";
     const lockContext = observationsGlobalOperationLockContext({
       env,
       expectedOwner: lockOwner,
@@ -1303,48 +1231,6 @@ export async function runObservationHistoryMigrationV3({
   const startedAt = now();
   const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
   const repositoryRoot = path.resolve(scriptDirectory, "../..");
-  if (args.mode === "snapshot-v3-rollback") {
-    const guarded = validateObservationHistoryV3MigrationEnvironment({
-      ...evidence,
-      apply: true,
-    });
-    if (guarded.transition.kind !== "v3-rebuild") {
-      throw new Error("snapshot-v3-rollback is valid only for --transition v3-rebuild");
-    }
-    const inventory = await inventoryAuthoritativeCanonicalObservationHistory({
-      getR2Object,
-    });
-    await verifyObservationHistoryDropboxCheckpoint({
-      getR2Object,
-      getBackupObject,
-      canonicalInventory: inventory,
-      expectedInventoryRootSha256: args.expectedInventoryRootSha256,
-      expectedStateRootSha256: args.expectedStateRootSha256,
-    });
-    const snapshot = await createObservationHistoryV3RebuildRollbackSnapshot({
-      getR2Object,
-      putBackupObject: buildDropboxBackupWriter(args.dropboxRoot),
-      getBackupObject,
-      migrationRunId: args.migrationRunId,
-      environment: guarded.environment,
-      bucket: guarded.bucket,
-      canonicalRoot: inventory.root_manifest,
-    });
-    const result = {
-      kind: "uk_aq_observation_history_v3_rebuild_rollback_snapshot_result",
-      transition: guarded.transition,
-      migration_run_id: args.migrationRunId,
-      writers_frozen_confirmed: args.writersFrozen === true,
-      snapshot_root_sha256: snapshot.snapshot_root_sha256,
-      inventory_key: snapshot.inventory_key,
-      inventory_identity: snapshot.inventory_identity,
-      canonical_pre_state: snapshot.canonical_pre_state,
-      object_count: snapshot.object_count,
-      total_bytes: snapshot.total_bytes,
-    };
-    atomicWriteJson(args.reportOut, { schema_version: 1, mode: args.mode, result });
-    return result;
-  }
   let checkpoint = args.checkpointIn
     ? readJsonFile(args.checkpointIn, "migration checkpoint")
     : null;
@@ -1380,8 +1266,6 @@ export async function runObservationHistoryMigrationV3({
         targetWriterGitSha: args.targetWriterGitSha,
         expectedInventoryRootSha256: args.expectedInventoryRootSha256,
         expectedStateRootSha256: args.expectedStateRootSha256,
-        expectedV3RollbackSnapshotRootSha256:
-          args.expectedV3RollbackSnapshotRootSha256,
       });
   if (
     args.expectedPlanSha256 &&
@@ -1393,7 +1277,6 @@ export async function runObservationHistoryMigrationV3({
     checkpoint &&
     (
       plan.migration_run_id !== args.migrationRunId ||
-      plan.transition.kind !== args.transition ||
       plan.target_writer_git_sha !== args.targetWriterGitSha ||
       stableMigrationJson(plan.target.writer_limits) !== stableMigrationJson(writerLimits) ||
       plan.backup_gate?.inventory_root?.sha256 !==
@@ -1484,7 +1367,6 @@ export async function runObservationHistoryMigrationV3({
             },
           },
           v2_index_strategy: restorePlan.v2_index_strategy,
-          v3_index_strategy: restorePlan.v3_index_strategy,
           ready: restorePlan.ready,
           dry_run: true,
           mutation_calls: 0,

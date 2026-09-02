@@ -9,20 +9,24 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  index_v3_preflight.sh --stage plan
-  index_v3_preflight.sh --stage migration-start \
+  index_v3_preflight.sh --stage plan --transition v2-to-v3|v3-rebuild
+  index_v3_preflight.sh --stage migration-start --transition v2-to-v3|v3-rebuild \
     --authority-file PATH --plan-report PATH --dropbox-root PATH --site-url URL \
     --writer-freeze-evidence PATH
-  index_v3_preflight.sh --stage cutover \
+  index_v3_preflight.sh --stage cutover --transition v2-to-v3 \
     --plan-report PATH --dropbox-root PATH --site-url URL \
     --checkpoint PATH --verify-report PATH \
     --writer-freeze-evidence PATH --v2-runtime-rollback-record PATH
+  index_v3_preflight.sh --stage completion --transition v3-rebuild \
+    --plan-report PATH --dropbox-root PATH --site-url URL \
+    --checkpoint PATH --verify-report PATH --writer-freeze-evidence PATH
   index_v3_preflight.sh --self-test
 
 Stages:
   plan             Local/repository/environment configuration only.
   migration-start  Adds frozen writers, current backup/source, and maintenance.
   cutover          Adds final v3 verification, recovery, and candidate readiness.
+  completion       Same final acceptance boundary for v3-rebuild, without an authority switch.
 
 This script is strictly read-only. It never changes maintenance, schedulers,
 deployments, GitHub configuration, D1, R2, Dropbox, or migration state.
@@ -83,6 +87,20 @@ recovery_manifest_implementation_is_valid() {
   jq -e '
     .schema_version == 1 and
     .kind == "uk_aq_observation_history_v3_recovery_manifest" and
+    (
+      .payload.transition == {
+        "authority_switch_required": true,
+        "kind": "v2-to-v3",
+        "source_index_generation": "v2",
+        "target_index_generation": "v3"
+      } or
+      .payload.transition == {
+        "authority_switch_required": false,
+        "kind": "v3-rebuild",
+        "source_index_generation": "v3",
+        "target_index_generation": "v3"
+      }
+    ) and
     ((.payload.recovery_implementation.repository_head | type) == "string") and
     (.payload.recovery_implementation.repository_head | test("^[0-9a-f]{40}$")) and
     ((.payload.recovery_implementation.files | type) == "array") and
@@ -148,10 +166,10 @@ self_test() {
     fi
   done
 
-  recovery_fixture='{"schema_version":1,"kind":"uk_aq_observation_history_v3_recovery_manifest","payload":{"recovery_implementation":{"repository_head":"0123456789abcdef0123456789abcdef01234567","files":[{"path":"scripts/example.sh","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}}}'
+  recovery_fixture='{"schema_version":1,"kind":"uk_aq_observation_history_v3_recovery_manifest","payload":{"transition":{"kind":"v2-to-v3","source_index_generation":"v2","target_index_generation":"v3","authority_switch_required":true},"recovery_implementation":{"repository_head":"0123456789abcdef0123456789abcdef01234567","files":[{"path":"scripts/example.sh","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}}}'
   printf '%s\n' "$recovery_fixture" | recovery_manifest_implementation_is_valid \
     || fail "self-test: valid recovery_implementation manifest shape was rejected"
-  recovery_fixture='{"schema_version":1,"kind":"uk_aq_observation_history_v3_recovery_manifest","payload":{"implementation":{"repository_head":"0123456789abcdef0123456789abcdef01234567","files":[{"path":"scripts/example.sh","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}}}'
+  recovery_fixture='{"schema_version":1,"kind":"uk_aq_observation_history_v3_recovery_manifest","payload":{"transition":{"kind":"v2-to-v3","source_index_generation":"v2","target_index_generation":"v3","authority_switch_required":true},"implementation":{"repository_head":"0123456789abcdef0123456789abcdef01234567","files":[{"path":"scripts/example.sh","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}}}'
   if printf '%s\n' "$recovery_fixture" | recovery_manifest_implementation_is_valid 2>/dev/null; then
     fail "self-test: obsolete payload.implementation manifest shape was accepted"
   fi
@@ -210,6 +228,7 @@ case "${1:-}" in
 esac
 
 STAGE=""
+TRANSITION=""
 AUTHORITY_FILE=""
 PLAN_REPORT=""
 DROPBOX_ROOT=""
@@ -222,6 +241,7 @@ V2_RUNTIME_ROLLBACK_RECORD=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --stage) STAGE="${2:-}"; shift 2 ;;
+    --transition) TRANSITION="${2:-}"; shift 2 ;;
     --authority-file) AUTHORITY_FILE="${2:-}"; shift 2 ;;
     --plan-report) PLAN_REPORT="${2:-}"; shift 2 ;;
     --dropbox-root) DROPBOX_ROOT="${2:-}"; shift 2 ;;
@@ -236,9 +256,15 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$STAGE" in
-  plan|migration-start|cutover) ;;
-  *) usage >&2; fail "--stage must be plan, migration-start, or cutover" ;;
+  plan|migration-start|cutover|completion) ;;
+  *) usage >&2; fail "--stage must be plan, migration-start, cutover, or completion" ;;
 esac
+[ -n "$TRANSITION" ] || fail "--transition is required"
+case "$TRANSITION" in v2-to-v3|v3-rebuild) ;; *) fail "--transition must be v2-to-v3 or v3-rebuild" ;; esac
+[ "$STAGE" != "cutover" ] || [ "$TRANSITION" = "v2-to-v3" ] \
+  || fail "cutover stage is valid only for v2-to-v3"
+[ "$STAGE" != "completion" ] || [ "$TRANSITION" = "v3-rebuild" ] \
+  || fail "completion stage is valid only for v3-rebuild"
 
 for command in git gh jq node curl shasum; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable: $command"
@@ -255,9 +281,11 @@ fi
 if [ "$STAGE" != "plan" ]; then
   [ -n "$WRITER_FREEZE_EVIDENCE" ] || fail "--writer-freeze-evidence is required for $STAGE"
 fi
+if [ "$STAGE" = "cutover" ] || [ "$STAGE" = "completion" ]; then
+  [ -n "$CHECKPOINT" ] || fail "--checkpoint is required for $STAGE"
+  [ -n "$VERIFY_REPORT" ] || fail "--verify-report is required for $STAGE"
+fi
 if [ "$STAGE" = "cutover" ]; then
-  [ -n "$CHECKPOINT" ] || fail "--checkpoint is required for cutover"
-  [ -n "$VERIFY_REPORT" ] || fail "--verify-report is required for cutover"
   [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] || fail "--v2-runtime-rollback-record is required for cutover"
 fi
 
@@ -296,16 +324,21 @@ OBSERVATIONS_CANDIDATE_WORKER_NAME="$(candidate_worker_name "$UK_AQ_OBSERVS_HIST
 
 printf '%s\n' '============================================================'
 printf 'UK AQ INDEX V3 PREFLIGHT: %s / %s\n' "$ENVIRONMENT" "$STAGE"
+printf 'Transition: %s\n' "$TRANSITION"
 printf 'Repository root: %s\n' "$REPO_ROOT"
 printf '%s\n\n' 'READ-ONLY: NO CUTOVER OR MUTATION IS PERFORMED'
 
 [ "$UK_AQ_R2_HISTORY_VERSION" = "v2" ] \
   || fail "expected loaded UK_AQ_R2_HISTORY_VERSION=v2"
-[ "$UK_AQ_R2_HISTORY_INDEX_VERSION" = "v2" ] \
-  || fail "pre-cutover UK_AQ_R2_HISTORY_INDEX_VERSION must be v2"
+case "$TRANSITION" in
+  v2-to-v3) EXPECTED_SOURCE_INDEX="v2" ;;
+  v3-rebuild) EXPECTED_SOURCE_INDEX="v3" ;;
+esac
+[ "$UK_AQ_R2_HISTORY_INDEX_VERSION" = "$EXPECTED_SOURCE_INDEX" ] \
+  || fail "$TRANSITION requires loaded UK_AQ_R2_HISTORY_INDEX_VERSION=$EXPECTED_SOURCE_INDEX"
 [ "$UK_AQ_R2_HISTORY_INTEGRITY_VERSION" = "v2" ] \
   || fail "expected loaded UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v2"
-pass "loaded environment is recognised and retains the v2 pre-cutover authority"
+pass "loaded environment matches the explicit $TRANSITION source authority"
 
 CURRENT_BRANCH="$(git branch --show-current)"
 [ -n "$CURRENT_BRANCH" ] || fail "detached HEAD is not permitted"
@@ -347,7 +380,6 @@ compare_repo_var() {
 
 compare_repo_var UK_AQ_R2_HISTORY_VERSION "$UK_AQ_R2_HISTORY_VERSION"
 compare_repo_var UK_AQ_R2_HISTORY_INDEX_VERSION "$UK_AQ_R2_HISTORY_INDEX_VERSION"
-compare_repo_var UK_AQ_R2_HISTORY_INTEGRITY_VERSION "$UK_AQ_R2_HISTORY_INTEGRITY_VERSION"
 compare_repo_var UK_AQ_STATION_HISTORY_WORKER_NAME "$UK_AQ_STATION_HISTORY_WORKER_NAME"
 compare_repo_var UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME "$UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME"
 compare_repo_var UK_AQ_DROPBOX_ROOT "$UK_AQ_DROPBOX_ROOT"
@@ -378,6 +410,7 @@ if [ -n "$AUTHORITY_FILE" ]; then
   AUTH_HEAD_LABEL="target writer"
   AUTH_PLAN_SHA="$(jq -r '.plan_sha256 // empty' "$AUTHORITY_FILE")"
   AUTH_RUN_ID="$(jq -r '.migration_run_id // empty' "$AUTHORITY_FILE")"
+  AUTH_TRANSITION="$(jq -r '.transition // empty' "$AUTHORITY_FILE")"
 else
   RECOVERY_MANIFEST="$CHECKPOINT.recovery/manifest.json"
   [ -f "$RECOVERY_MANIFEST" ] || fail "recovery manifest is required when --authority-file is omitted"
@@ -391,11 +424,13 @@ else
   AUTH_HEAD_LABEL="recovery implementation"
   AUTH_PLAN_SHA="$(jq -r '.payload.plan_sha256 // empty' "$RECOVERY_MANIFEST")"
   AUTH_RUN_ID="$(jq -r '.payload.migration_run_id // empty' "$RECOVERY_MANIFEST")"
+  AUTH_TRANSITION="$(jq -r '.payload.transition.kind // empty' "$RECOVERY_MANIFEST")"
   RECOVERY_AUTHORITY=1
   pass "operator authority was derived from the immutable recovery manifest"
 fi
 
 [ "$AUTH_ENV" = "$ENVIRONMENT" ] || fail "authority environment does not match $ENVIRONMENT"
+[ "$AUTH_TRANSITION" = "$TRANSITION" ] || fail "authority transition does not match --transition"
 [ "$AUTH_REPO" = "$REPO_SLUG" ] || fail "authority repository does not match $REPO_SLUG"
 [ "$AUTH_BRANCH" = "$CURRENT_BRANCH" ] || fail "authority branch does not match $CURRENT_BRANCH"
 printf '%s' "$AUTH_HEAD" | grep -Eq '^[0-9a-f]{40}$' || fail "$AUTH_HEAD_LABEL Git SHA is invalid"
@@ -409,11 +444,14 @@ PLAN_SHA="$(jq -r '.result.plan_sha256 // empty' "$PLAN_REPORT")"
 [ "$PLAN_ENV" = "$ENVIRONMENT" ] || fail "plan environment does not match $ENVIRONMENT"
 [ "$PLAN_RUN_ID" = "$AUTH_RUN_ID" ] || fail "plan migration run ID does not match authority"
 [ "$PLAN_SHA" = "$AUTH_PLAN_SHA" ] || fail "plan SHA-256 does not match authority"
-jq -e '
+jq -e --arg transition "$TRANSITION" --arg source "$EXPECTED_SOURCE_INDEX" '
   .result.kind == "uk_aq_observation_history_v3_migration_plan_summary" and
+  .result.transition.kind == $transition and
+  .result.transition.source_index_generation == $source and
+  .result.transition.target_index_generation == "v3" and
   .result.environment.ok == true and
   .result.environment.history_version == "v2" and
-  .result.environment.index_version == "v2" and
+  .result.environment.index_version == $source and
   .result.environment.integrity_version == "v2" and
   .result.backup_gate.verified == true and
   .result.rollback_preflight.verified == true and
@@ -438,6 +476,16 @@ jq -e '
     "target_row_group_rows":1024
   }
 ' "$PLAN_REPORT" >/dev/null || fail "migration plan/rollback authority is not accepted"
+if [ "$TRANSITION" = "v3-rebuild" ]; then
+  jq -e '
+    .result.v3_rebuild_rollback_snapshot.verified == true and
+    (.result.v3_rebuild_rollback_snapshot.snapshot_root_sha256 | test("^[0-9a-f]{64}$")) and
+    .result.v3_rebuild_rollback_snapshot.object_count > 0 and
+    .result.rollback_preflight.v3_index_strategy.mode == "exact_snapshot_restore" and
+    .result.rollback_preflight.v3_index_strategy.authority_switch_required == false
+  ' "$PLAN_REPORT" >/dev/null \
+    || fail "v3-rebuild plan lacks exact migration-specific v3 rollback authority"
+fi
 pass "migration plan, backup gate, rollback preflight, and writer limits are accepted"
 
 OPERATOR_EVIDENCE_HELPER="$SCRIPT_DIR/index_v3_operator_evidence.mjs"
@@ -762,9 +810,17 @@ trap 'rm -rf "$DEPENDENCY_VERIFY_DIR"' EXIT
 DEPENDENCY_WRITER_LIMITS="$DEPENDENCY_VERIFY_DIR/writer_limits.json"
 DEPENDENCY_VERIFY_REPORT="$DEPENDENCY_VERIFY_DIR/current_dependency_verify.json"
 jq '.result.target.writer_limits' "$PLAN_REPORT" > "$DEPENDENCY_WRITER_LIMITS"
+DEPENDENCY_TRANSITION_ARGS=(--transition "$TRANSITION")
+if [ "$TRANSITION" = "v3-rebuild" ]; then
+  V3_ROLLBACK_SNAPSHOT_SHA="$(jq -r '.result.v3_rebuild_rollback_snapshot.snapshot_root_sha256 // empty' "$PLAN_REPORT")"
+  DEPENDENCY_TRANSITION_ARGS+=(
+    --expected-v3-rollback-snapshot-root-sha256 "$V3_ROLLBACK_SNAPSHOT_SHA"
+  )
+fi
 UK_AQ_ENV_NAME="$ENVIRONMENT" node --max-old-space-size=4096 \
   scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs \
   --mode verify \
+  "${DEPENDENCY_TRANSITION_ARGS[@]}" \
   --environment "$ENVIRONMENT" \
   --expected-bucket "$CFLARE_R2_BUCKET" \
   --migration-run-id "$AUTH_RUN_ID" \
@@ -925,6 +981,11 @@ grep -Fq '__UK_AQ_STATION_HISTORY_WORKER_NAME__' workers/uk_aq_cache_proxy/wrang
   || fail "cache-proxy station service-binding placeholder is missing"
 pass "persistent generation authority and fail-closed single cache deployment remain intact"
 
-warn "cutover remains an explicit operator action outside this read-only script"
-printf '\nPREFLIGHT PASS: all cutover-readiness prerequisites are satisfied.\n'
+if [ "$TRANSITION" = "v2-to-v3" ]; then
+  warn "cutover remains an explicit operator action outside this read-only script"
+  printf '\nPREFLIGHT PASS: all cutover-readiness prerequisites are satisfied.\n'
+else
+  pass "v3-rebuild retains persistent index authority v3; no authority switch is required"
+  printf '\nPREFLIGHT PASS: all v3-rebuild completion prerequisites are satisfied.\n'
+fi
 printf 'NO CUTOVER WAS PERFORMED.\n'

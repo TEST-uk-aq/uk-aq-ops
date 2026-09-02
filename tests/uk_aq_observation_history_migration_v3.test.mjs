@@ -75,7 +75,12 @@ import {
 import {
   buildObservationHistoryV3RecoveryProgressContext,
   buildObservationHistoryV3ReportOutput,
+  parseObservationHistoryMigrationArgs,
 } from "../scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs";
+import {
+  createObservationHistoryV3RebuildRollbackSnapshot,
+  verifyObservationHistoryV3RebuildRollbackSnapshot,
+} from "../scripts/backup_r2/lib/observation_history_v3_rebuild_rollback.mjs";
 
 const REPOSITORY_ROOT = path.resolve(import.meta.dirname, "..");
 const PREFIX = "history/v2/observations";
@@ -96,6 +101,7 @@ const SOURCE_LIMITS = Object.freeze({
   max_row_groups_per_file: 1,
 });
 const ENVIRONMENT = Object.freeze({
+  transition: "v2-to-v3",
   environment: "TEST",
   configuredEnvironment: "TEST",
   bucket: "fixture-test-bucket",
@@ -1893,7 +1899,7 @@ test("Phase 4 persists immutable authority before the first PUT and preserves ap
       environmentEvidence: { ...ENVIRONMENT, indexVersion: "v3" },
       adapters: {},
     }),
-    /deployed_observation_index_must_remain_v2/,
+    /current_observation_index_must_be_v2_for_v2-to-v3/,
   );
   const checkpointFailure = memoryAdapters(fixture, { failCheckpointCall: 1 });
   await assert.rejects(
@@ -2026,7 +2032,17 @@ test("Phase 4 multi-partition apply is bounded, exact and byte-identical on reru
   ));
 });
 
-test("current dependency verification admits only explicit v2 or v3 observation authority", () => {
+test("migration transition guard is explicit and enforces exact source authority plus local Integrity v2", () => {
+  assert.throws(
+    () => parseObservationHistoryMigrationArgs(["--mode", "plan"]),
+    /--transition must be explicitly set/,
+  );
+  assert.equal(
+    parseObservationHistoryMigrationArgs([
+      "--mode", "plan", "--transition", "v2-to-v3",
+    ]).transition,
+    "v2-to-v3",
+  );
   for (const indexVersion of ["v2", "v3"]) {
     const result = validateObservationHistoryV3MigrationEnvironment({
       ...ENVIRONMENT,
@@ -2041,7 +2057,119 @@ test("current dependency verification admits only explicit v2 or v3 observation 
     operation: "verification",
   });
   assert.equal(invalid.ok, false);
-  assert.deepEqual(invalid.blockers, ["verification_observation_index_must_be_v2_or_v3"]);
+  assert.deepEqual(invalid.blockers, ["current_observation_index_must_be_v2_or_v3_for_v2-to-v3"]);
+  const missingTransition = validateObservationHistoryV3MigrationEnvironment({
+    ...ENVIRONMENT,
+    transition: "",
+  });
+  assert.equal(missingTransition.ok, false);
+  assert.ok(missingTransition.blockers.includes("migration_transition_must_be_explicit"));
+  const v2ToV3AtV3 = validateObservationHistoryV3MigrationEnvironment({
+    ...ENVIRONMENT,
+    indexVersion: "v3",
+  });
+  assert.equal(v2ToV3AtV3.ok, false);
+  assert.ok(v2ToV3AtV3.blockers.includes(
+    "current_observation_index_must_be_v2_for_v2-to-v3",
+  ));
+  const v3RebuildAtV2 = validateObservationHistoryV3MigrationEnvironment({
+    ...ENVIRONMENT,
+    transition: "v3-rebuild",
+    indexVersion: "v2",
+  });
+  assert.equal(v3RebuildAtV2.ok, false);
+  assert.ok(v3RebuildAtV2.blockers.includes(
+    "current_observation_index_must_be_v3_for_v3-rebuild",
+  ));
+  const v3Rebuild = validateObservationHistoryV3MigrationEnvironment({
+    ...ENVIRONMENT,
+    transition: "v3-rebuild",
+    indexVersion: "v3",
+  });
+  assert.equal(v3Rebuild.ok, true);
+  assert.equal(v3Rebuild.transition.authority_switch_required, false);
+  const wrongIntegrity = validateObservationHistoryV3MigrationEnvironment({
+    ...ENVIRONMENT,
+    integrityVersion: "v3",
+  });
+  assert.equal(wrongIntegrity.ok, false);
+  assert.ok(wrongIntegrity.blockers.includes("loaded_integrity_version_must_be_v2"));
+});
+
+test("v3-rebuild rollback snapshot pins the authoritative exact index closure to canonical pre-state", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture);
+  const adapters = memoryAdapters(fixture);
+  const migration = await executeObservationHistoryV3MigrationPlan({
+    plan,
+    apply: true,
+    writersFrozen: true,
+    environmentEvidence: ENVIRONMENT,
+    adapters,
+  });
+  assert.equal(migration.verification.cutover_ready, true);
+  const currentInventory = await inventoryAuthoritativeCanonicalObservationHistory({
+    getR2Object: mapReader(fixture.r2),
+  });
+  const snapshotStore = new Map();
+  const putBackupObject = async ({ key, body }) => {
+    snapshotStore.set(key, Buffer.from(body));
+    return { ok: true };
+  };
+  const snapshot = await createObservationHistoryV3RebuildRollbackSnapshot({
+    getR2Object: mapReader(fixture.r2),
+    putBackupObject,
+    getBackupObject: mapReader(snapshotStore),
+    migrationRunId: "fixture-v3-rebuild",
+    environment: "TEST",
+    bucket: ENVIRONMENT.bucket,
+    canonicalRoot: currentInventory.root_manifest,
+  });
+  assert.equal(snapshot.verified, true);
+  assert.ok(snapshot.object_count > 1);
+  assert.ok(snapshot.objects.some((entry) => entry.stage === "latest_global"));
+  assert.ok(snapshot.objects.some((entry) => entry.stage === "scoped_manifest"));
+  assert.ok(snapshot.objects.some((entry) => entry.stage === "exact_leaf"));
+  assert.ok(snapshot.objects.some((entry) => entry.stage === "aligned_manifest"));
+  assert.ok(snapshot.objects.some((entry) => entry.stage === "aligned_child"));
+  const verified = await verifyObservationHistoryV3RebuildRollbackSnapshot({
+    getBackupObject: mapReader(snapshotStore),
+    getR2Object: mapReader(fixture.r2),
+    migrationRunId: "fixture-v3-rebuild",
+    environment: "TEST",
+    bucket: ENVIRONMENT.bucket,
+    canonicalRoot: currentInventory.root_manifest,
+    expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
+  });
+  assert.equal(verified.snapshot_root_sha256, snapshot.snapshot_root_sha256);
+  const driftedR2 = new Map(fixture.r2);
+  const driftedKey = snapshot.objects.find(
+    (entry) => entry.stage === "exact_leaf",
+  ).key;
+  driftedR2.set(driftedKey, Buffer.from(`${driftedR2.get(driftedKey)} `));
+  await assert.rejects(
+    verifyObservationHistoryV3RebuildRollbackSnapshot({
+      getBackupObject: mapReader(snapshotStore),
+      getR2Object: mapReader(driftedR2),
+      migrationRunId: "fixture-v3-rebuild",
+      environment: "TEST",
+      bucket: ENVIRONMENT.bucket,
+      canonicalRoot: currentInventory.root_manifest,
+      expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
+    }),
+    /current authoritative v3 pre-state object identity mismatch/,
+  );
+  await assert.rejects(
+    verifyObservationHistoryV3RebuildRollbackSnapshot({
+      getBackupObject: mapReader(snapshotStore),
+      migrationRunId: "fixture-v3-rebuild",
+      environment: "TEST",
+      bucket: ENVIRONMENT.bucket,
+      canonicalRoot: { ...currentInventory.root_manifest, sha256: "f".repeat(64) },
+      expectedSnapshotRootSha256: snapshot.snapshot_root_sha256,
+    }),
+    /does not match this migration/,
+  );
 });
 
 test("Phase 4 resumes after an early PUT failure without rereading overwritten source", async () => {
@@ -2855,6 +2983,23 @@ test("Phase 4 rejects a checkpoint whose immutable authority was tampered", asyn
   tampered.authority.inventory.root_manifest.sha256 = "0".repeat(64);
   assert.throws(
     () => buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: tampered }),
+    /immutable authority is missing or invalid/,
+  );
+  const crossTransition = structuredClone(validCheckpoint);
+  crossTransition.transition = {
+    kind: "v3-rebuild",
+    source_index_generation: "v3",
+    target_index_generation: "v3",
+    authority_switch_required: false,
+  };
+  crossTransition.authority.transition = crossTransition.transition;
+  crossTransition.authority_sha256 = sha256Hex(
+    stableMigrationJson(crossTransition.authority),
+  );
+  assert.throws(
+    () => buildObservationHistoryV3MigrationPlanFromCheckpoint({
+      checkpoint: crossTransition,
+    }),
     /immutable authority is missing or invalid/,
   );
   await assert.rejects(

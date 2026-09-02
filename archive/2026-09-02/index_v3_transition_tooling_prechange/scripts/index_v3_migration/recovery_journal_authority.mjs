@@ -93,7 +93,6 @@ function validateManifestPayload(payload) {
     "original_checkpoint",
     "immutable_authority_sha256",
     "migration_run_id",
-    "transition",
     "plan_sha256",
     "target_writer_git_sha",
     "recovery_implementation",
@@ -104,31 +103,6 @@ function validateManifestPayload(payload) {
   requireRecoverySha(payload.original_checkpoint.sha256, "recovery manifest checkpoint SHA-256");
   requireRecoverySha(payload.immutable_authority_sha256, "recovery manifest authority SHA-256");
   requireNonEmptyString(payload.migration_run_id, "recovery manifest migration_run_id");
-  requireExactKeys(payload.transition, [
-    "kind",
-    "source_index_generation",
-    "target_index_generation",
-    "authority_switch_required",
-  ], "recovery manifest transition");
-  const expectedTransition = payload.transition.kind === "v2-to-v3"
-    ? {
-        kind: "v2-to-v3",
-        source_index_generation: "v2",
-        target_index_generation: "v3",
-        authority_switch_required: true,
-      }
-    : payload.transition.kind === "v3-rebuild"
-      ? {
-          kind: "v3-rebuild",
-          source_index_generation: "v3",
-          target_index_generation: "v3",
-          authority_switch_required: false,
-        }
-      : null;
-  if (
-    !expectedTransition ||
-    stableRecoveryJson(payload.transition) !== stableRecoveryJson(expectedTransition)
-  ) throw new Error("recovery manifest transition is invalid");
   requireRecoverySha(payload.plan_sha256, "recovery manifest plan SHA-256");
   if (!GIT_SHA1_PATTERN.test(String(payload.target_writer_git_sha || ""))) {
     throw new Error("recovery manifest target_writer_git_sha is invalid");
