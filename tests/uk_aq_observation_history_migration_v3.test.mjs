@@ -1575,6 +1575,7 @@ test("Phase 6 accepts a generic legacy stale parent only when all summary identi
       unit.source_observation_content_hash_metadata,
     source_observation_content_hash_provenance:
       unit.source_observation_content_hash_provenance,
+    source_manifest_self_hash: unit.source_manifest_self_hash,
     source_manifest_reference: unit.source_manifest_reference,
     writer_limits: first.target.writer_limits,
     target_writer_git_sha: first.target_writer_git_sha,
@@ -1597,6 +1598,7 @@ test("Phase 6 accepts a generic legacy stale parent only when all summary identi
         unit.source_observation_content_hash_metadata,
       source_observation_content_hash_provenance:
         unit.source_observation_content_hash_provenance,
+      source_manifest_self_hash: unit.source_manifest_self_hash,
       source_manifest_reference: changedReference,
       writer_limits: first.target.writer_limits,
       target_writer_git_sha: first.target_writer_git_sha,
@@ -1710,7 +1712,7 @@ test("Phase 6 rejects wrong scope, invalid child integrity and modern stale refe
   invalidChild.r2.set(invalidChildKey, jsonBody(invalidChildPayload));
   await assert.rejects(
     buildPlan(invalidChild),
-    /Canonical history manifest hash verification failed/,
+    /Legacy sorted-checkpoint manifest is not the exact recursively sorted representation/,
   );
 
   const modern = await buildFixture({
