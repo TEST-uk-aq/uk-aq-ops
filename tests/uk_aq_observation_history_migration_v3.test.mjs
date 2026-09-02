@@ -3,6 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import * as arrow from "apache-arrow";
+import { parquetMetadata } from "hyparquet";
+import * as parquetWasm from "parquet-wasm/esm";
 
 import {
   buildObservationHistoryIndexV3ChildShardKey,
@@ -36,8 +39,14 @@ import {
   ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
 } from "../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
 import {
+  computeObservationContentHash,
   validateObservationContentHashMetadata,
 } from "../workers/shared/uk_aq_observation_content_hash.mjs";
+import {
+  OBSERVATION_HISTORY_COLUMNS_V3,
+  OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+  OBSERVATION_HISTORY_WRITER_VERSION_V3,
+} from "../workers/shared/uk_aq_observation_history_schema.mjs";
 import {
   buildHistoryV2TimeseriesLatestPayload,
   buildHistoryV2TimeseriesPollutantIndexPayload,
@@ -221,6 +230,174 @@ function exactArrayBuffer(value) {
   return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
 }
 
+const LEGACY_PHYSICAL_LAYOUT = "timeseries-bounded-v1";
+const LEGACY_PARQUET_CREATED_BY = [
+  `writer_version=${OBSERVATION_HISTORY_WRITER_VERSION_V3}`,
+  `history_schema_version=${OBSERVATION_HISTORY_SCHEMA_VERSION_V3}`,
+  `physical_layout_version=${LEGACY_PHYSICAL_LAYOUT}`,
+].join(";");
+let legacyParquetWasmInitialized = false;
+
+function ensureLegacyParquetWasmInitialized() {
+  if (legacyParquetWasmInitialized) return;
+  parquetWasm.initSync({
+    module: fs.readFileSync(path.join(
+      REPOSITORY_ROOT,
+      "node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm",
+    )),
+  });
+  legacyParquetWasmInitialized = true;
+}
+
+function buildLegacyCanonicalObservationSource(rows, { fileKeyForOrdinal }) {
+  const hash = computeObservationContentHash(rows);
+  const orderedRows = hash.canonical_rows;
+  const first = orderedRows[0];
+  const key = fileKeyForOrdinal(0);
+  ensureLegacyParquetWasmInitialized();
+  const table = arrow.tableFromArrays({
+    connector_id: arrow.vectorFromArray(
+      orderedRows.map((row) => row.connector_id),
+      new arrow.Int32(),
+    ),
+    station_id: arrow.vectorFromArray(
+      orderedRows.map((row) => row.station_id),
+      new arrow.Int32(),
+    ),
+    timeseries_id: arrow.vectorFromArray(
+      orderedRows.map((row) => row.timeseries_id),
+      new arrow.Int32(),
+    ),
+    pollutant_code: arrow.vectorFromArray(
+      orderedRows.map((row) => row.pollutant_code),
+      new arrow.Utf8(),
+    ),
+    observed_at_utc: arrow.vectorFromArray(
+      orderedRows.map((row) => new Date(row.observed_at_utc)),
+      new arrow.TimestampMillisecond(),
+    ),
+    value: arrow.vectorFromArray(
+      orderedRows.map((row) => row.value),
+      new arrow.Float64(),
+    ),
+    verification_status: arrow.vectorFromArray(
+      orderedRows.map((row) => row.verification_status),
+      new arrow.Utf8(),
+    ),
+  });
+  const properties = new parquetWasm.WriterPropertiesBuilder()
+    .setCompression(parquetWasm.Compression.ZSTD)
+    .setMaxRowGroupSize(orderedRows.length)
+    .setCreatedBy(LEGACY_PARQUET_CREATED_BY)
+    .build();
+  const wasmTable = parquetWasm.Table.fromIPCStream(
+    arrow.tableToIPC(table, "stream"),
+  );
+  const body = Buffer.from(parquetWasm.writeParquet(wasmTable, properties));
+  const footer = parquetMetadata(exactArrayBuffer(body), { geoparquet: false });
+  const sha256 = sha256Hex(body);
+  const segments = [];
+  for (let start = 0; start < orderedRows.length;) {
+    let end = start + 1;
+    while (
+      end < orderedRows.length &&
+      orderedRows[end].timeseries_id === orderedRows[start].timeseries_id
+    ) end += 1;
+    segments.push({
+      timeseries_id: orderedRows[start].timeseries_id,
+      file_ordinal: 0,
+      file_key: key,
+      row_group_ordinal: 0,
+      row_start: start,
+      row_group_row_start: start,
+      row_count: end - start,
+      min_observed_at_utc: orderedRows[start].observed_at_utc,
+      max_observed_at_utc: orderedRows[end - 1].observed_at_utc,
+      file_row_count: orderedRows.length,
+      file_byte_size: body.byteLength,
+      file_sha256: sha256,
+      file_etag: null,
+      history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+      writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
+      physical_layout_version: LEGACY_PHYSICAL_LAYOUT,
+    });
+    start = end;
+  }
+  const rowGroup = {
+    row_group_ordinal: 0,
+    row_start: 0,
+    row_count: orderedRows.length,
+    min_timeseries_id: orderedRows[0].timeseries_id,
+    max_timeseries_id: orderedRows.at(-1).timeseries_id,
+    min_observed_at_utc: orderedRows.reduce(
+      (minimum, row) => row.observed_at_utc < minimum
+        ? row.observed_at_utc
+        : minimum,
+      orderedRows[0].observed_at_utc,
+    ),
+    max_observed_at_utc: orderedRows.reduce(
+      (maximum, row) => row.observed_at_utc > maximum
+        ? row.observed_at_utc
+        : maximum,
+      orderedRows[0].observed_at_utc,
+    ),
+    segments,
+  };
+  const file = {
+    file_ordinal: 0,
+    key,
+    row_count: orderedRows.length,
+    byte_size: body.byteLength,
+    sha256,
+    etag: null,
+    history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+    writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
+    physical_layout_version: LEGACY_PHYSICAL_LAYOUT,
+    row_group_count: footer.row_groups.length,
+    row_groups: [rowGroup],
+    timeseries_row_counts: Object.fromEntries(segments.map((segment) => [
+      String(segment.timeseries_id),
+      segment.row_count,
+    ])),
+  };
+  const { canonical_rows: _canonicalRows, ...contentHash } = hash;
+  return {
+    metadata: {
+      history_version: "v2",
+      history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+      writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
+      physical_layout_version: LEGACY_PHYSICAL_LAYOUT,
+      columns: [...OBSERVATION_HISTORY_COLUMNS_V3],
+      physical_order: [
+        "timeseries_id ASC",
+        "observed_at_utc ASC",
+        "canonical_observation_row_v1 ASC",
+      ],
+      partition: {
+        day_utc: first.observed_at_utc.slice(0, 10),
+        connector_id: first.connector_id,
+        pollutant_code: first.pollutant_code,
+      },
+      limits: {
+        target_row_group_rows: 8192,
+        max_row_group_rows: 16384,
+        target_file_rows: 65536,
+        max_file_rows: 131072,
+        target_file_bytes: 4194304,
+        max_file_bytes: 8388608,
+        max_row_groups_per_file: 8,
+      },
+      row_count: orderedRows.length,
+      file_count: 1,
+      files: [file],
+      segments,
+      ...contentHash,
+    },
+    file_bodies: [{ key, body }],
+    legacy_footer: footer,
+  };
+}
+
 const EXACT_READER_INDEX = Object.freeze({
   root: DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
   alignedIndexRoot:
@@ -329,6 +506,7 @@ function realR2NotFoundError(key) {
 async function buildFixture({
   pollutantCodes = ["pm25", "pm10"],
   inputRowsByPollutant = null,
+  sourceBuilder = null,
   sourceLimits = SOURCE_LIMITS,
   manifestModes = {},
   parentReferenceOverrides = {},
@@ -360,11 +538,14 @@ async function buildFixture({
     value,
     verification_status: verificationStatus,
     }));
-    const source = buildCanonicalObservationTimeseriesBoundedFiles(rows, {
-      limits: sourceLimits,
-      fileKeyForOrdinal: (ordinal) =>
-        `${PREFIX}/day_utc=${DAY}/connector_id=1/pollutant_code=${pollutantCode}/part-${String(ordinal).padStart(5, "0")}.parquet`,
-    });
+    const fileKeyForOrdinal = (ordinal) =>
+      `${PREFIX}/day_utc=${DAY}/connector_id=1/pollutant_code=${pollutantCode}/part-${String(ordinal).padStart(5, "0")}.parquet`;
+    const source = sourceBuilder
+      ? sourceBuilder(rows, { fileKeyForOrdinal })
+      : buildCanonicalObservationTimeseriesBoundedFiles(rows, {
+          limits: sourceLimits,
+          fileKeyForOrdinal,
+        });
     const pollutantKey = buildHistoryV2PollutantManifestKey(
       PREFIX,
       DAY,
@@ -2227,8 +2408,33 @@ test("v2-to-v3 migration output crosses 1024 rows and is consumed by the exact r
   const fixture = await buildFixture({
     pollutantCodes: ["pm25"],
     inputRowsByPollutant: { pm25: [...denseRows, ...sparseRows] },
-    sourceLimits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+    sourceBuilder: buildLegacyCanonicalObservationSource,
   });
+  assert.equal(fixture.source.metadata.history_version, "v2");
+  assert.equal(
+    fixture.source.metadata.physical_layout_version,
+    LEGACY_PHYSICAL_LAYOUT,
+  );
+  assert.deepEqual(
+    fixture.source.metadata.columns,
+    OBSERVATION_HISTORY_COLUMNS_V3,
+  );
+  assert.equal(fixture.source.legacy_footer.created_by, LEGACY_PARQUET_CREATED_BY);
+  assert.equal(fixture.source.legacy_footer.row_groups.length, 1);
+  assert.equal(
+    Number(fixture.source.legacy_footer.row_groups[0].num_rows),
+    1027,
+  );
+  assert.ok(
+    Number(fixture.source.legacy_footer.row_groups[0].num_rows) >
+      OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
+  );
+  assert.deepEqual(
+    fixture.source.metadata.segments
+      .filter((segment) => segment.timeseries_id === 100)
+      .map((segment) => segment.row_count),
+    [1025],
+  );
   const sourceManifestBody = fixture.r2.get(fixture.pollutantKeys.get("pm25"));
   const sourceManifest = JSON.parse(sourceManifestBody.toString("utf8"));
   validateCanonicalHistoryV2Manifest(sourceManifest, {
@@ -2244,6 +2450,7 @@ test("v2-to-v3 migration output crosses 1024 rows and is consumed by the exact r
     writerLimits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
   });
   assert.deepEqual(plan.blockers, []);
+  assert.equal(plan.transition.source_index_generation, "v2");
   const adapters = memoryAdapters(fixture);
   const migration = await executeObservationHistoryV3MigrationPlan({
     plan,
