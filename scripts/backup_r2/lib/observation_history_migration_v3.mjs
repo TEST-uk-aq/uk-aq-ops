@@ -3607,7 +3607,24 @@ export async function executeObservationHistoryV3MigrationPlan({
     total: completedPlan.v3_publication_plan.entries.length,
     enabled: progressEnabled,
   });
-  let completedV3PublicationObjects = 0;
+  const v3PublicationEntriesByKey = new Map(
+    completedPlan.v3_publication_plan.entries.map((entry) => [entry.key, entry]),
+  );
+  const durableV3PublicationKeys = new Set();
+  for (const evidence of progressEnabled
+    ? adapters.getDurablePublicationEvidence?.() || []
+    : []) {
+    const expected = v3PublicationEntriesByKey.get(evidence?.key);
+    if (
+      expected &&
+      evidence.byte_size === expected.byte_size &&
+      evidence.sha256 === expected.sha256 &&
+      evidence.post_put_get_verified === true
+    ) {
+      durableV3PublicationKeys.add(evidence.key);
+    }
+  }
+  let completedV3PublicationObjects = durableV3PublicationKeys.size;
   v3PublicationProgress.report(completedV3PublicationObjects, { force: true });
   const v3Publication = await adapters.finalizeV3Publication({
     plan: completedPlan.v3_publication_plan,
@@ -3615,8 +3632,20 @@ export async function executeObservationHistoryV3MigrationPlan({
     getObject: adapters.getObject,
     recordDurableEvidence: async (entry) => {
       const result = await adapters.recordDurableEvidence(entry);
-      completedV3PublicationObjects += 1;
-      v3PublicationProgress.report(completedV3PublicationObjects);
+      const expected = v3PublicationEntriesByKey.get(entry.key);
+      if (
+        progressEnabled &&
+        result?.durable === true &&
+        expected &&
+        entry.byte_size === expected.byte_size &&
+        entry.sha256 === expected.sha256 &&
+        entry.post_put_get_verified === true &&
+        !durableV3PublicationKeys.has(entry.key)
+      ) {
+        durableV3PublicationKeys.add(entry.key);
+        completedV3PublicationObjects = durableV3PublicationKeys.size;
+        v3PublicationProgress.report(completedV3PublicationObjects);
+      }
       return result;
     },
   });
