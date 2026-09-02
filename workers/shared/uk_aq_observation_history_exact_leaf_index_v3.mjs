@@ -283,6 +283,15 @@ function normalizedTarget(metadata) {
       }
     }
   }
+  if (
+    validated.row_count <= 0 ||
+    segments.length === 0 ||
+    segmentsByTimeseries.size === 0
+  ) {
+    throw new Error(
+      "exact-v3 publication requires a non-empty canonical scope",
+    );
+  }
   return Object.freeze({
     scope: normalizeScope(validated.scope),
     row_count: validated.row_count,
@@ -437,6 +446,16 @@ function buildExactScopedManifest({ normalized, indexRoot, alignedManifest, leav
   const orderedLeaves = [...leaves].sort((left, right) =>
     left.payload.timeseries_id - right.payload.timeseries_id
   );
+  const coverageMin = orderedLeaves.reduce((minimum, leaf) => {
+    const candidate = leaf.payload.min_observed_at_utc;
+    if (candidate === null || candidate === undefined) return minimum;
+    return minimum === null || candidate < minimum ? candidate : minimum;
+  }, null);
+  const coverageMax = orderedLeaves.reduce((maximum, leaf) => {
+    const candidate = leaf.payload.max_observed_at_utc;
+    if (candidate === null || candidate === undefined) return maximum;
+    return maximum === null || candidate > maximum ? candidate : maximum;
+  }, null);
   const payload = {
     ...commonPayload(OBSERVATION_HISTORY_EXACT_LEAF_MANIFEST_KIND_V3, normalized.scope),
     key,
@@ -445,8 +464,8 @@ function buildExactScopedManifest({ normalized, indexRoot, alignedManifest, leav
     coverage: {
       row_count: normalized.row_count,
       timeseries_count: orderedLeaves.length,
-      min_observed_at_utc: orderedLeaves[0]?.payload.min_observed_at_utc ?? null,
-      max_observed_at_utc: orderedLeaves.at(-1)?.payload.max_observed_at_utc ?? null,
+      min_observed_at_utc: coverageMin,
+      max_observed_at_utc: coverageMax,
       physical_file_count: normalized.files.size,
       physical_leaf_count: orderedLeaves.length,
     },

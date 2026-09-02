@@ -105,27 +105,21 @@ test("selected aligned-v2 writer limits are exact and reject drift", () => {
   );
 });
 
-test("steady-state preparation represents authoritative empty pollutant scope", () => {
-  const prepared = buildObservationHistoryV3SteadyStatePartition({
-    source: "integrity",
-    scope: {
-      day_utc: DAY_UTC,
-      connector_id: 1,
-      pollutant_code: "o3",
-    },
-    rows: [],
-    targetWriterGitSha: TARGET_GIT_SHA,
-    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
-  });
-  assert.deepEqual(prepared.scope, {
-    day_utc: DAY_UTC,
-    connector_id: 1,
-    pollutant_code: "o3",
-  });
-  assert.equal(prepared.target_metadata.row_count, 0);
-  assert.equal(prepared.file_intents.length, 0);
-  assert.equal(prepared.canonical_pollutant_manifest.payload.row_count, 0);
-  assert.equal(prepared.v3_hierarchy.child_shards.length, 0);
+test("steady-state preparation rejects an empty exact-v3 pollutant scope", () => {
+  assert.throws(
+    () => buildObservationHistoryV3SteadyStatePartition({
+      source: "integrity",
+      scope: {
+        day_utc: DAY_UTC,
+        connector_id: 1,
+        pollutant_code: "o3",
+      },
+      rows: [],
+      targetWriterGitSha: TARGET_GIT_SHA,
+      backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+    }),
+    /exact-v3 publication requires a non-empty canonical scope/,
+  );
 });
 
 test("connector publisher rereads and preserves unchanged pollutant union", async () => {
