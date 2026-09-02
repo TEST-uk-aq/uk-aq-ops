@@ -137,3 +137,88 @@ test("PM observations-only requests do not request AQI context", () => {
   const parsed = resolveStationSeriesRequest(new URL("https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=pm25&start_utc=2026-07-13T00%3A00%3A00.000Z&end_utc=2026-07-14T00%3A00%3A00.000Z&window=24h&format=objects&include_aqi=false"));
   assert.equal(parsed.contextHours, 0);
 });
+
+test("continuity with calculated-history AQI disabled shares one v3 physical-page budget", async () => {
+  const originalFetch = globalThis.fetch;
+  let leafCalls = 0;
+  let directCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v1/timeseries-binding") {
+      return new Response(JSON.stringify({
+        binding: {
+          schema_version: 2,
+          history_version: "v2",
+          index_kind: "timeseries_binding",
+          timeseries_id: 7,
+          station_id: 9,
+          connector_id: 2,
+          pollutant_code: "no2",
+          continuity: {
+            schema_version: 1,
+            source: "sos_station_timeseries_site_refs",
+            continuity_key: "2:UKA00001:no2",
+            site_ref: "TEST",
+            uk_air_ref: "UKA00001",
+            pollutant_code: "no2",
+            members: [
+              { station_id: 8, timeseries_id: 6, valid_from_day_utc: "2026-01-01", valid_to_day_utc: "2026-05-31" },
+              { station_id: 9, timeseries_id: 7, valid_from_day_utc: "2026-06-01", valid_to_day_utc: null },
+            ],
+          },
+        },
+      }), { status: 200 });
+    }
+    if (url.pathname.endsWith("/rpc/uk_aq_timeseries_rpc")) {
+      directCalls += 1;
+      return new Response(JSON.stringify(rpcPayload([])), { status: 200 });
+    }
+    if (url.pathname === "/v1/observations") {
+      const cursor = url.searchParams.get("physical_cursor");
+      const pageNumber = cursor ? Number(cursor) : 1;
+      const startMs = Date.parse(url.searchParams.get("start_utc"));
+      const endMs = Date.parse(url.searchParams.get("end_utc"));
+      leafCalls += 1;
+      return new Response(JSON.stringify({
+        ok: true,
+        timeseries_id: 7,
+        connector_id: 2,
+        pollutant: "no2",
+        start_utc: new Date(startMs).toISOString(),
+        end_utc: new Date(endMs).toISOString(),
+        response_complete: false,
+        has_gap: false,
+        coverage_partial_reasons: [],
+        physical_page: {
+          schema_version: 2,
+          page_number: pageNumber,
+          continuation_cursor_supplied: Boolean(cursor),
+          segments_decoded: 1,
+          physical_rows_decoded: 1,
+          pagination_complete: false,
+          next_cursor: String(pageNumber + 1),
+        },
+        rows: [{ observed_at: new Date(startMs + pageNumber * 60_000).toISOString(), value: 20 }],
+      }), { status: 200 });
+    }
+    throw new Error(`unexpected call: ${url}`);
+  };
+  const featureEnv = {
+    ...env,
+    UK_AQ_R2_HISTORY_INDEX_VERSION: "v3",
+    UK_AQ_STATION_HISTORY_CONTINUITY_ENABLED: "true",
+    UK_AQ_STATION_HISTORY_CALCULATED_HISTORY_AQI_ENABLED: "false",
+  };
+  try {
+    const response = await worker.fetch(new Request("https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=no2&start_utc=2026-07-01T00%3A00%3A00.000Z&end_utc=2026-07-02T00%3A00%3A00.000Z&window=24h&format=objects&include_aqi=false"), featureEnv);
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+    assert.equal(directCalls, 2, "the existing calculated and legacy phases both execute");
+    assert.equal(leafCalls, 16, "both phases share one hard physical-page budget for the request");
+    assert.equal(body.observations.response_complete, false);
+    assert.equal(body.observations.partial_reasons.includes("observation_history_physical_page_budget_exceeded"), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

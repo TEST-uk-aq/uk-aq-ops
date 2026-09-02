@@ -29,8 +29,9 @@ The R2 observation adapter:
 - issues the first exact-leaf request, then follows
   `physical_page.next_cursor` until that logical piece is complete;
 - appends pages and UTC pieces in strict chronological order;
-- shares one fixed budget of 16 physical pages across all continuity members
-  in a station-history invocation; and
+- shares one invocation-scoped read budget across all continuity members and
+  compatibility phases, capped at 16 physical pages and the existing 5,000
+  station-history observation rows; and
 - preserves the exact-leaf reader's one-segment/1,024-row invocation bound,
   pinned object identities, exact stored byte ranges, and fail-closed cursor
   validation.
@@ -42,11 +43,16 @@ below the current external-subrequest limit and would produce at most 19
 Worker invocations in the full cache-proxy -> station-history ->
 observation-history chain if the leaf client later moves to a Service Binding.
 
-If page 16 still has work remaining, station-history stops. It does not expose
-a browser continuation and does not claim completeness. The observation and
-AQI sections retain any assembled rows, include the machine-readable partial
-reason `observation_history_physical_page_budget_exceeded`, and flow through
-the existing incomplete-response `Cache-Control: no-store` policy.
+If page 16 still has work remaining, station-history stops with
+`observation_history_physical_page_budget_exceeded`. If appending a physical
+page would take the invocation above its row budget, that page is not appended
+and station-history stops with `observation_history_row_budget_exceeded`.
+Neither case exposes a browser continuation or claims completeness. Both flow
+through the existing incomplete-response `Cache-Control: no-store` policy.
+
+The historical response `limits.max_pages` field retains its established v2
+meaning. A v3 physical-page response instead reports
+`limits.max_physical_pages: 16`.
 
 The shelved encrypted, browser-visible station-history continuation candidate
 and its cap experiments are retained under

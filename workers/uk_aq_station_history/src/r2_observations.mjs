@@ -1,4 +1,5 @@
 import { mergeObservationRowsPreferR2, normalizePollutantCode } from "../../../lib/aqi/aqi_levels.mjs";
+import { STATION_HISTORY_OBSERVATION_ROW_LIMIT } from "./limits.mjs";
 
 const UPSTREAM_AUTH_HEADER = "X-UK-AQ-Upstream-Auth";
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -8,6 +9,8 @@ const V3_MAX_PHYSICAL_ROWS_PER_PAGE = 1024;
 export const STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET = 16;
 export const STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON =
   "observation_history_physical_page_budget_exceeded";
+export const STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON =
+  "observation_history_row_budget_exceeded";
 
 function required(value) { return String(value ?? "").trim(); }
 function uniqueStrings(values) {
@@ -29,9 +32,46 @@ export function usesV3PhysicalObservationPages(env = {}) {
   return required(env.UK_AQ_R2_HISTORY_INDEX_VERSION) === "v3";
 }
 
-export function createStationHistoryV3PageBudget(limit = STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET) {
-  if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("station_history_v3_page_budget_invalid");
-  return { limit, used: 0 };
+export function createStationHistoryV3ReadBudget({
+  pageLimit = STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET,
+  rowLimit = STATION_HISTORY_OBSERVATION_ROW_LIMIT,
+} = {}) {
+  if (
+    !Number.isSafeInteger(pageLimit)
+    || pageLimit <= 0
+    || pageLimit > STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET
+  ) {
+    throw new Error("station_history_v3_page_budget_invalid");
+  }
+  if (!Number.isSafeInteger(rowLimit) || rowLimit <= 0 || rowLimit > STATION_HISTORY_OBSERVATION_ROW_LIMIT) {
+    throw new Error("station_history_v3_row_budget_invalid");
+  }
+  return {
+    pageLimit,
+    pagesUsed: 0,
+    rowLimit,
+    rowsUsed: 0,
+    rowExhausted: false,
+  };
+}
+
+function assertStationHistoryV3ReadBudget(budget) {
+  if (
+    !budget
+    || !Number.isSafeInteger(budget.pageLimit)
+    || budget.pageLimit <= 0
+    || budget.pageLimit > STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET
+    || !Number.isSafeInteger(budget.pagesUsed)
+    || budget.pagesUsed < 0
+    || budget.pagesUsed > budget.pageLimit
+    || !Number.isSafeInteger(budget.rowLimit)
+    || budget.rowLimit <= 0
+    || budget.rowLimit > STATION_HISTORY_OBSERVATION_ROW_LIMIT
+    || !Number.isSafeInteger(budget.rowsUsed)
+    || budget.rowsUsed < 0
+    || budget.rowsUsed > budget.rowLimit
+    || typeof budget.rowExhausted !== "boolean"
+  ) throw new Error("station_history_v3_read_budget_invalid");
 }
 
 export function splitR2ObservationRangeByUtcDay(startMs, endMs) {
@@ -226,26 +266,34 @@ async function readV2R2Observations({ env, identity, startMs, endMs, limit, fetc
   };
 }
 
-async function readV3R2Observations({ env, identity, startMs, endMs, pageBudget, fetchApi }) {
+async function readV3R2Observations({ env, identity, startMs, endMs, readBudget, fetchApi }) {
   const baseUrl = required(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL);
   const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
   if (!baseUrl || !secret) throw new Error("station_series_r2_observations_config_missing");
-  const budget = pageBudget || createStationHistoryV3PageBudget();
-  const fetchCountAtStart = budget.used;
+  const budget = readBudget || createStationHistoryV3ReadBudget();
+  assertStationHistoryV3ReadBudget(budget);
+  const fetchCountAtStart = budget.pagesUsed;
   const rows = [];
   const partialReasons = [];
   let hasGap = false;
   let allPiecesComplete = true;
   let previousMs = null;
-  let budgetExceeded = false;
+  let pageBudgetExceeded = false;
+  let rowBudgetExceeded = false;
 
   outer: for (const piece of splitR2ObservationRangeByUtcDay(startMs, endMs)) {
     let cursor = null;
     let expectedPage = 1;
     const seenCursors = new Set();
     while (true) {
-      if (budget.used >= budget.limit) {
-        budgetExceeded = true;
+      if (budget.rowExhausted || budget.rowsUsed >= budget.rowLimit) {
+        budget.rowExhausted = true;
+        rowBudgetExceeded = true;
+        allPiecesComplete = false;
+        break outer;
+      }
+      if (budget.pagesUsed >= budget.pageLimit) {
+        pageBudgetExceeded = true;
         allPiecesComplete = false;
         break outer;
       }
@@ -257,9 +305,21 @@ async function readV3R2Observations({ env, identity, startMs, endMs, pageBudget,
         physicalCursor: cursor,
         physicalPaging: true,
       });
-      budget.used += 1;
+      budget.pagesUsed += 1;
       const payload = await fetchObservationJson(target, secret, fetchApi);
       const normalized = normalizeV3PhysicalPage(payload, identity, piece, expectedPage, cursor);
+      hasGap ||= payload.has_gap === true;
+      partialReasons.push(...(
+        Array.isArray(payload.coverage_partial_reasons)
+          ? payload.coverage_partial_reasons.map(String)
+          : []
+      ));
+      if (budget.rowsUsed + normalized.rows.length > budget.rowLimit) {
+        budget.rowExhausted = true;
+        rowBudgetExceeded = true;
+        allPiecesComplete = false;
+        break outer;
+      }
       for (const row of normalized.rows) {
         const observedAtMs = Date.parse(row.observed_at);
         if (previousMs !== null && observedAtMs < previousMs) {
@@ -268,15 +328,16 @@ async function readV3R2Observations({ env, identity, startMs, endMs, pageBudget,
         previousMs = observedAtMs;
         rows.push(row);
       }
-      hasGap ||= payload.has_gap === true;
-      partialReasons.push(...(
-        Array.isArray(payload.coverage_partial_reasons)
-          ? payload.coverage_partial_reasons.map(String)
-          : []
-      ));
+      budget.rowsUsed += normalized.rows.length;
       if (normalized.paginationComplete) {
         if (payload.response_complete !== true) allPiecesComplete = false;
         break;
+      }
+      if (budget.rowsUsed >= budget.rowLimit) {
+        budget.rowExhausted = true;
+        rowBudgetExceeded = true;
+        allPiecesComplete = false;
+        break outer;
       }
       if (seenCursors.has(normalized.page.next_cursor)) {
         throw new Error("station_history_v3_leaf_cursor_loop");
@@ -287,8 +348,9 @@ async function readV3R2Observations({ env, identity, startMs, endMs, pageBudget,
     }
   }
 
-  if (budgetExceeded) partialReasons.push(STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON);
-  const responseComplete = allPiecesComplete && !hasGap && !budgetExceeded;
+  if (pageBudgetExceeded) partialReasons.push(STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON);
+  if (rowBudgetExceeded) partialReasons.push(STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON);
+  const responseComplete = allPiecesComplete && !hasGap && !pageBudgetExceeded && !rowBudgetExceeded;
   return {
     rows,
     response_complete: responseComplete,
@@ -298,7 +360,7 @@ async function readV3R2Observations({ env, identity, startMs, endMs, pageBudget,
     coverage: null,
     start_utc: new Date(startMs).toISOString(),
     end_utc: new Date(endMs).toISOString(),
-    fetch_count: budget.used - fetchCountAtStart,
+    fetch_count: budget.pagesUsed - fetchCountAtStart,
   };
 }
 
@@ -308,11 +370,11 @@ export async function readR2Observations({
   startMs,
   endMs,
   limit = 5000,
-  pageBudget = null,
+  readBudget = null,
   fetchApi = fetch,
 }) {
   if (usesV3PhysicalObservationPages(env)) {
-    return readV3R2Observations({ env, identity, startMs, endMs, pageBudget, fetchApi });
+    return readV3R2Observations({ env, identity, startMs, endMs, readBudget, fetchApi });
   }
   return readV2R2Observations({ env, identity, startMs, endMs, limit, fetchApi });
 }

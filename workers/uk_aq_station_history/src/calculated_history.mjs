@@ -4,8 +4,9 @@ import {
   pivotNarrowRowsToHelperRows,
 } from "../../../lib/aqi/aqi_levels.mjs";
 import {
-  createStationHistoryV3PageBudget,
+  createStationHistoryV3ReadBudget,
   readR2Observations,
+  STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
   STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
   usesV3PhysicalObservationPages,
 } from "./r2_observations.mjs";
@@ -156,7 +157,7 @@ function missingRanges(expected, present) {
   }));
 }
 
-export async function buildCalculatedHistory({ request, continuity, env, outputStartMs, outputEndMs, ingestRows = [], ingestComplete = false, ingestFetchCount = 0, guideline = null } = {}) {
+export async function buildCalculatedHistory({ request, continuity, env, outputStartMs, outputEndMs, ingestRows = [], ingestComplete = false, ingestFetchCount = 0, guideline = null, observationReadBudget = null } = {}) {
   const includeObservations = request.includeObservations !== false;
   const contextHours = request.includeAqi && ["pm25", "pm10"].includes(request.pollutant) ? 23 : 0;
   const requiredStartMs = outputStartMs - contextHours * HOUR_MS;
@@ -166,7 +167,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   if (!selection.segments.length) throw new Error("station_history_continuity_member_missing");
   let reads;
   if (usesV3PhysicalObservationPages(env)) {
-    const pageBudget = createStationHistoryV3PageBudget();
+    const readBudget = observationReadBudget || createStationHistoryV3ReadBudget();
     reads = [];
     for (const segment of selection.segments) {
       const result = await readR2Observations({
@@ -174,10 +175,13 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
         identity: identityForSegment(segment),
         startMs: segment.startMs,
         endMs: segment.endMs,
-        pageBudget,
+        readBudget,
       });
       reads.push({ segment, result });
-      if (result.partial_reasons.includes(STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON)) break;
+      if (result.partial_reasons.some((reason) => [
+        STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+        STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+      ].includes(reason))) break;
     }
   } else {
     reads = await Promise.all(selection.segments.map(async (segment) => ({
@@ -214,10 +218,13 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
     ? [...visibleSelection.gaps, ...missingRanges(expected, aqiPresent)]
     : [];
   const r2PartialReasons = [...new Set(reads.flatMap((entry) => entry.result.partial_reasons))];
-  const pageBudgetExceeded = r2PartialReasons.includes(STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON);
+  const readBudgetExceeded = r2PartialReasons.some((reason) => [
+    STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+    STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+  ].includes(reason));
   const r2Complete = reads.length === selection.segments.length
     && reads.every((entry) => entry.result.response_complete === true);
-  const sourceComplete = !pageBudgetExceeded && (r2Complete || ingestComplete === true);
+  const sourceComplete = !readBudgetExceeded && (r2Complete || ingestComplete === true);
   const observationsComplete = includeObservations && sourceComplete && observationGaps.length === 0;
   const aqiStatusesComplete = !request.includeAqi || aqiRows.every((row) => row.daqi_calculation_status === "ok" && row.eaqi_calculation_status === "ok");
   const aqiContextComplete = selection.gaps.length === 0;

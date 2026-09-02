@@ -20,6 +20,7 @@ import {
   buildAqiHistoryChunk,
   buildObservationHistoryChunk,
   buildTsv,
+  OBSERVATION_CHUNK_MAX_ROWS,
   parseHistoryChunkRequest,
 } from "./history_chunks.mjs";
 import {
@@ -34,8 +35,12 @@ import {
 } from "./ingest_observations.mjs";
 import {
   buildR2ObservationRequestUrl,
+  createStationHistoryV3ReadBudget,
   mergeObservationRowsPreferR2,
   readR2Observations,
+  STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+  STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET,
+  STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
   usesV3PhysicalObservationPages,
 } from "./r2_observations.mjs";
 import { resolveStationHistoryPolicy } from "./policy.mjs";
@@ -404,7 +409,7 @@ function seamGapHourCount({ aqiGaps, observationGaps }) {
   return hours.size;
 }
 
-async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds, nowMs) {
+async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds, nowMs, observationReadBudget = null) {
   let r2Payload = null;
   let r2AqiRows = [];
   let missing = [];
@@ -420,7 +425,13 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
   const r2ObservationEndMs = Number.isFinite(actualDirectStartMs)
     ? Math.min(request.endMs, Math.max(observationContextStartMs + HOUR_MS, actualDirectStartMs + policy.observationOverlapHours * HOUR_MS))
     : request.endMs;
-  const r2Observations = await readR2Observations({ env, identity: request, startMs: observationContextStartMs, endMs: r2ObservationEndMs });
+  const r2Observations = await readR2Observations({
+    env,
+    identity: request,
+    startMs: observationContextStartMs,
+    endMs: r2ObservationEndMs,
+    readBudget: observationReadBudget,
+  });
   const mergedObservations = mergeObservationRowsPreferR2({ r2Rows: r2Observations.rows, ingestRows: direct.rows });
   const calculationRows = dedupeSourceObservationRows(mergedObservations.rows);
   const outputObservations = mergedObservations.rows.filter((row) => {
@@ -435,7 +446,12 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
     observationR2AssignedEndMs,
     "observed_at",
   );
-  const observationR2AssignedComplete = observationR2AssignedRowsComplete
+  const observationReadBudgetExceeded = r2Observations.partial_reasons.some((reason) => [
+    STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+    STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+  ].includes(reason));
+  const observationR2AssignedComplete = !observationReadBudgetExceeded
+    && observationR2AssignedRowsComplete
     && (observationR2AssignedEndMs < request.endMs || r2Observations.response_complete);
   const directObservationTailRequired = outputObservations.some((row) => row.source === "ingest");
   const observationsComplete = observationR2AssignedComplete
@@ -545,7 +561,7 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
   };
 }
 
-export async function buildStationSeries(request, env, nowMs = Date.now()) {
+export async function buildStationSeries(request, env, nowMs = Date.now(), observationReadBudget = null) {
   const policy = resolveStationHistoryPolicy(env);
   const aqiBounds = resolveStableHeadBounds(request, policy.stableAqiHeadMaxHours);
   const observationBounds = resolveStableHeadBounds(request, policy.observationChunkMaxHours);
@@ -559,7 +575,7 @@ export async function buildStationSeries(request, env, nowMs = Date.now()) {
   const direct = await readDirectIngestObservations({ env, identity: request, startMs: directStartMs, rpcWindowStartMs, endMs: request.endMs, nowMs, timeoutMs: policy.obsAqiDbTimeoutMs });
   const capability = ingestCapability({ request, direct, aqiBounds, observationBounds });
   if (capability.qualifies) return buildIngestOnlyResponse(request, direct, capability, policy, nowMs);
-  return buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds, nowMs);
+  return buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds, nowMs, observationReadBudget);
 }
 
 function exactContinuity(identity) {
@@ -573,7 +589,7 @@ function exactContinuity(identity) {
   };
 }
 
-async function buildFeatureStationSeries(request, bindingContext, env, policy, nowMs) {
+async function buildFeatureStationSeries(request, bindingContext, env, policy, nowMs, observationReadBudget = null) {
   const aqiBounds = resolveStableHeadBounds(request, policy.stableAqiHeadMaxHours);
   const observationBounds = resolveStableHeadBounds(request, policy.observationChunkMaxHours);
   const requestedStarts = [
@@ -609,6 +625,7 @@ async function buildFeatureStationSeries(request, bindingContext, env, policy, n
     ingestComplete: directReads.every((entry) => entry.response_complete === true),
     ingestFetchCount: directReads.length,
     guideline: directReads.find((entry) => entry.guideline)?.guideline ?? null,
+    observationReadBudget,
   });
   if (request.includeObservations) {
     combined.observations.stable_head_start_utc = new Date(outputStartMs).toISOString();
@@ -625,7 +642,7 @@ async function buildFeatureStationSeries(request, bindingContext, env, policy, n
     }
     return { body: combined, continuity };
   }
-  const legacy = await buildStationSeries(request, env, nowMs);
+  const legacy = await buildStationSeries(request, env, nowMs, observationReadBudget);
   return {
     body: {
       ...legacy,
@@ -679,6 +696,9 @@ async function handleObservationHistoryChunk(request, env, ctx) {
   const policy = resolveStationHistoryPolicy(env);
   const parsed = parseHistoryChunkRequest(url, "observations", policy);
   if (!parsed.ok) return errorResponse(parsed.code === "history_chunk_overlaps_stable_head" ? 409 : 400, parsed.code, url.pathname);
+  const observationReadBudget = usesV3PhysicalObservationPages(env)
+    ? createStationHistoryV3ReadBudget({ rowLimit: parsed.limit })
+    : null;
   if (policy.continuityEnabled || policy.calculatedHistoryAqiEnabled) {
     try {
       const bindingContext = await resolveTimeseriesBinding(parsed, env);
@@ -687,7 +707,14 @@ async function handleObservationHistoryChunk(request, env, ctx) {
       chunk.includeAqi = parsed.includeAqi && policy.calculatedHistoryAqiEnabled;
       chunk.contextHours = chunk.includeAqi && ["pm25", "pm10"].includes(chunk.pollutant) ? 23 : 0;
       const continuity = policy.continuityEnabled ? bindingContext.continuity : exactContinuity(bindingContext.identity);
-      const combined = await buildCalculatedHistory({ request: chunk, continuity, env, outputStartMs: chunk.startMs, outputEndMs: chunk.endMs });
+      const combined = await buildCalculatedHistory({
+        request: chunk,
+        continuity,
+        env,
+        outputStartMs: chunk.startMs,
+        outputEndMs: chunk.endMs,
+        observationReadBudget,
+      });
       const complete = (!chunk.includeObservations || combined.observations.response_complete === true)
         && (!parsed.includeAqi || combined.aqi.response_complete === true);
       const immutable = chunk.endMs <= Date.now() - 120 * HOUR_MS;
@@ -732,13 +759,14 @@ async function handleObservationHistoryChunk(request, env, ctx) {
         identity: chunk,
         startMs: chunk.startMs,
         endMs: chunk.endMs,
+        readBudget: observationReadBudget,
       });
       const body = buildObservationHistoryChunk(chunk, {
         ...payload,
         timeseries_id: chunk.timeseriesId,
         connector_id: chunk.connectorId,
         pollutant: chunk.pollutant,
-      });
+      }, Date.now(), { physicalPageLimit: STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET });
       return new Response(JSON.stringify(body), { status: 200, headers: chunkHeaders(body) });
     } catch (error) {
       return errorResponse(502, error instanceof Error ? error.message : "observation_history_r2_failed", url.pathname);
@@ -771,9 +799,12 @@ export default {
       const bindingContext = featurePath ? await resolveTimeseriesBinding(parsed, env) : null;
       const identity = bindingContext?.identity || await resolveAuthoritativeTimeseriesIdentity(parsed, env);
       const authoritative = applyAuthoritativeTimeseriesIdentity(parsed, identity);
+      const observationReadBudget = usesV3PhysicalObservationPages(env)
+        ? createStationHistoryV3ReadBudget({ rowLimit: OBSERVATION_CHUNK_MAX_ROWS })
+        : null;
       const built = featurePath
-        ? await buildFeatureStationSeries(authoritative, bindingContext, env, policy, Date.now())
-        : { body: await buildStationSeries(authoritative, env), continuity: exactContinuity(identity) };
+        ? await buildFeatureStationSeries(authoritative, bindingContext, env, policy, Date.now(), observationReadBudget)
+        : { body: await buildStationSeries(authoritative, env, Date.now(), observationReadBudget), continuity: exactContinuity(identity) };
       const body = applyRequestedPartContract(attachAuthoritativeIdentity(built.body, identity), authoritative);
       const complete = (!authoritative.includeAqi || body.aqi.response_complete === true)
         && (!authoritative.includeObservations || body.observations.response_complete === true);

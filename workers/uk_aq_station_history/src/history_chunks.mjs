@@ -1,10 +1,11 @@
 import { normalizePollutantCode } from "../../../lib/aqi/aqi_levels.mjs";
 import { AQI_HOUR_INTERVAL_RESPONSE_CONTRACT, canonicalAqiHourStarts } from "./stable_head.mjs";
+import { STATION_HISTORY_OBSERVATION_ROW_LIMIT } from "./limits.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 export const AQI_CHUNK_MAX_HOURS = 31 * 24;
 export const OBSERVATION_CHUNK_MAX_HOURS = 7 * 24;
-export const OBSERVATION_CHUNK_MAX_ROWS = 5000;
+export const OBSERVATION_CHUNK_MAX_ROWS = STATION_HISTORY_OBSERVATION_ROW_LIMIT;
 export const OBSERVATION_CHUNK_MAX_R2_OBJECT_READS = 80;
 export const AQI_MUTABLE_HOURS = 120;
 
@@ -130,7 +131,7 @@ function observedAt(row) {
   return parsed === null ? null : new Date(parsed).toISOString();
 }
 
-export function buildObservationHistoryChunk(chunk, payload, nowMs = Date.now()) {
+export function buildObservationHistoryChunk(chunk, payload, nowMs = Date.now(), { physicalPageLimit = null } = {}) {
   const rowsByObservedAt = new Map();
   const sourceRows = Array.isArray(payload?.rows) ? [...payload.rows] : [];
   sourceRows.sort((left, right) => String(observedAt(left) || "").localeCompare(String(observedAt(right) || "")) || JSON.stringify(left).localeCompare(JSON.stringify(right)));
@@ -147,6 +148,7 @@ export function buildObservationHistoryChunk(chunk, payload, nowMs = Date.now())
   const upstreamComplete = payload?.response_complete !== false && payload?.coverage?.response_complete !== false;
   const complete = upstreamComplete && withinObjectLimit && rows.length <= chunk.limit;
   const cacheClass = classifyChunk(chunk.endMs, nowMs);
+  const v3PhysicalPageLimit = positiveInt(physicalPageLimit);
   return {
     ...payload,
     rows,
@@ -156,7 +158,12 @@ export function buildObservationHistoryChunk(chunk, payload, nowMs = Date.now())
     coverage_state: complete ? "complete" : "partial",
     source: "r2_only",
     chunk: chunkFields(chunk, cacheClass),
-    limits: { max_chunk_hours: chunk.maxHours, max_rows: OBSERVATION_CHUNK_MAX_ROWS, max_pages: 1, max_r2_object_reads: OBSERVATION_CHUNK_MAX_R2_OBJECT_READS },
+    limits: {
+      max_chunk_hours: chunk.maxHours,
+      max_rows: OBSERVATION_CHUNK_MAX_ROWS,
+      ...(v3PhysicalPageLimit ? { max_physical_pages: v3PhysicalPageLimit } : { max_pages: 1 }),
+      max_r2_object_reads: OBSERVATION_CHUNK_MAX_R2_OBJECT_READS,
+    },
     partial_reasons: complete ? (Array.isArray(payload?.partial_reasons) ? payload.partial_reasons : []) : Array.from(new Set([...(Array.isArray(payload?.partial_reasons) ? payload.partial_reasons : []), ...(upstreamComplete ? [] : ["upstream_incomplete"]), ...(withinObjectLimit ? [] : ["r2_object_read_limit_exceeded"]), ...(rows.length <= chunk.limit ? [] : ["row_limit_exceeded"])])),
   };
 }

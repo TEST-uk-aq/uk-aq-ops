@@ -12,8 +12,9 @@ import {
 import { resolveStationHistoryPolicy } from "../workers/uk_aq_station_history/src/policy.mjs";
 import {
   buildR2ObservationRequestUrl,
-  createStationHistoryV3PageBudget,
+  createStationHistoryV3ReadBudget,
   readR2Observations,
+  STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
   STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
 } from "../workers/uk_aq_station_history/src/r2_observations.mjs";
 
@@ -284,12 +285,13 @@ test("v3 observation reads assemble UTC pieces in order and stop at the shared p
   assert.equal(requested.every((entry) => entry.hasLimit === false), true);
 
   requested.length = 0;
+  const readBudget = createStationHistoryV3ReadBudget({ pageLimit: 3 });
   const bounded = await readR2Observations({
     env,
     identity,
     startMs,
     endMs,
-    pageBudget: createStationHistoryV3PageBudget(3),
+    readBudget,
     fetchApi,
   });
   assert.equal(bounded.response_complete, false);
@@ -302,6 +304,90 @@ test("v3 observation reads assemble UTC pieces in order and stop at the shared p
     "2026-07-01T14:00:00.000Z",
     "2026-07-02T01:00:00.000Z",
   ]);
+
+  const secondPhase = await readR2Observations({
+    env,
+    identity,
+    startMs,
+    endMs,
+    readBudget,
+    fetchApi,
+  });
+  assert.equal(secondPhase.fetch_count, 0);
+  assert.equal(secondPhase.response_complete, false);
+  assert.deepEqual(secondPhase.rows, []);
+  assert.equal(secondPhase.partial_reasons.includes(STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON), true);
+  assert.equal(requested.length, 3, "a second phase cannot acquire an independent physical-page budget");
+});
+
+test("v3 observation reads stop before an overflowing page breaches the station-history row budget", async () => {
+  const identity = { timeseriesId: 7421, connectorId: 7, stationId: 9, pollutant: "pm25" };
+  const startMs = Date.parse("2026-07-01T00:00:00.000Z");
+  const endMs = Date.parse("2026-07-02T00:00:00.000Z");
+  let fetchCount = 0;
+  const fetchApi = async (input) => {
+    const url = new URL(String(input));
+    const cursor = url.searchParams.get("physical_cursor");
+    const pageNumber = cursor ? Number(cursor) : 1;
+    const rowCount = pageNumber <= 12 ? 1024 : 217;
+    const rows = Array.from({ length: rowCount }, (_, index) => ({
+      observed_at: new Date(startMs + ((pageNumber - 1) * 1024 + index) * 1000).toISOString(),
+      value: pageNumber,
+    }));
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      ok: true,
+      timeseries_id: identity.timeseriesId,
+      connector_id: identity.connectorId,
+      pollutant: identity.pollutant,
+      start_utc: new Date(startMs).toISOString(),
+      end_utc: new Date(endMs).toISOString(),
+      response_complete: pageNumber === 13,
+      has_gap: false,
+      coverage_partial_reasons: [],
+      physical_page: {
+        schema_version: 2,
+        page_number: pageNumber,
+        continuation_cursor_supplied: Boolean(cursor),
+        segments_decoded: 1,
+        physical_rows_decoded: rowCount,
+        pagination_complete: pageNumber === 13,
+        next_cursor: pageNumber === 13 ? null : String(pageNumber + 1),
+      },
+      rows,
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  const env = {
+    UK_AQ_R2_HISTORY_INDEX_VERSION: "v3",
+    UK_AQ_EDGE_UPSTREAM_SECRET: "secret",
+    UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations",
+  };
+  const readBudget = createStationHistoryV3ReadBudget();
+
+  const result = await readR2Observations({ env, identity, startMs, endMs, readBudget, fetchApi });
+
+  assert.equal(fetchCount, 5, "the fifth page is inspected but not assembled because it would breach 5,000 rows");
+  assert.equal(result.fetch_count, 5);
+  assert.equal(result.rows.length, 4096);
+  assert.equal(result.rows.length <= 5000, true);
+  assert.equal(result.response_complete, false);
+  assert.equal(result.has_gap, true);
+  assert.deepEqual(result.partial_reasons, [STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON]);
+  assert.equal(readBudget.rowsUsed, 4096);
+  assert.equal(readBudget.rowExhausted, true);
+  assert.equal(JSON.stringify(result).includes("physical_cursor"), false);
+  assert.equal(JSON.stringify(result).includes("next_cursor"), false);
+});
+
+test("v3 station-history read budgets reject limits above the fixed page and row maxima", () => {
+  assert.throws(
+    () => createStationHistoryV3ReadBudget({ pageLimit: 17 }),
+    /station_history_v3_page_budget_invalid/,
+  );
+  assert.throws(
+    () => createStationHistoryV3ReadBudget({ rowLimit: 5001 }),
+    /station_history_v3_row_budget_invalid/,
+  );
 });
 
 test("chunk immutable classification uses the existing 120 hour boundary", () => {
@@ -342,6 +428,17 @@ test("incomplete AQI and observation R2 responses remain independently incomplet
   assert.equal(observations.response_complete, false);
   assert.equal(observations.rows.length, 1);
   assert.deepEqual(observations.rows.map((row) => row.observed_at), ["2026-07-07T01:00:00.000Z"]);
+  assert.equal(observations.limits.max_pages, 1, "v2 retains its established single response-page metadata");
+  assert.equal("max_physical_pages" in observations.limits, false);
+
+  const v3Observations = buildObservationHistoryChunk(
+    obsChunk,
+    { rows: [], response_complete: false },
+    Date.now(),
+    { physicalPageLimit: 16 },
+  );
+  assert.equal(v3Observations.limits.max_physical_pages, 16);
+  assert.equal("max_pages" in v3Observations.limits, false);
 });
 
 test("AQI object and compact formats retain the existing columns", () => {
