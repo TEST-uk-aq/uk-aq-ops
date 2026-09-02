@@ -3639,11 +3639,12 @@ export async function executeObservationHistoryV3MigrationPlan({
         expected &&
         entry.byte_size === expected.byte_size &&
         entry.sha256 === expected.sha256 &&
-        entry.post_put_get_verified === true &&
-        !durableV3PublicationKeys.has(entry.key)
+        entry.post_put_get_verified === true
       ) {
-        durableV3PublicationKeys.add(entry.key);
-        completedV3PublicationObjects = durableV3PublicationKeys.size;
+        if (!durableV3PublicationKeys.has(entry.key)) {
+          durableV3PublicationKeys.add(entry.key);
+          completedV3PublicationObjects = durableV3PublicationKeys.size;
+        }
         v3PublicationProgress.report(completedV3PublicationObjects);
       }
       return result;
