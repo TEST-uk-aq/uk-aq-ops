@@ -14,9 +14,6 @@ import {
   validateCanonicalHistoryV2Manifest,
 } from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
-  buildR2HistoryV2ObservationsMonthManifestKey,
-  buildR2HistoryV2ObservationsRootManifestKey,
-  buildR2HistoryV2ObservationsYearManifestKey,
   validateR2HistoryV2ObservationsAggregateManifest,
 } from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import {
@@ -242,112 +239,6 @@ function parseJson(bytes, key) {
   }
 }
 
-function sameJson(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function readCanonicalAggregateManifest(sourceRoot, key) {
-  const body = readRequiredFile(sourceRoot, key);
-  const payload = parseJson(body, key);
-  const canonical = validateR2HistoryV2ObservationsAggregateManifest(payload, {
-    basePrefix: OBSERVATIONS_PREFIX,
-  });
-  if (!sameJson(payload, canonical)) {
-    throw new Error(`Source aggregate manifest has unsupported fields or ordering: ${key}`);
-  }
-  return { key, body, payload: canonical };
-}
-
-function requireManifestReference(reference, {
-  expectedKey,
-  label,
-}) {
-  if (!reference || typeof reference !== "object" || Array.isArray(reference)) {
-    throw new Error(`${label} reference is invalid`);
-  }
-  if (reference.manifest_key !== expectedKey) {
-    throw new Error(`${label} reference key mismatch: ${expectedKey}`);
-  }
-  const manifestHash = String(reference.manifest_hash || "").trim();
-  if (!/^[0-9a-f]{64}$/.test(manifestHash)) {
-    throw new Error(`${label} reference manifest_hash is invalid: ${expectedKey}`);
-  }
-  return { ...reference, manifest_key: expectedKey, manifest_hash: manifestHash };
-}
-
-function loadSourceAuthority(sourceRoot, requestedDays) {
-  const rootKey = buildR2HistoryV2ObservationsRootManifestKey(OBSERVATIONS_PREFIX);
-  const root = readCanonicalAggregateManifest(sourceRoot, rootKey);
-  const dayReferences = new Map();
-  let yearCount = 0;
-  let monthCount = 0;
-
-  for (const yearReference of root.payload.children) {
-    const yearKey = buildR2HistoryV2ObservationsYearManifestKey(
-      OBSERVATIONS_PREFIX,
-      yearReference.year,
-    );
-    if (yearReference.manifest_key !== yearKey) {
-      throw new Error(`Source root/year reference key mismatch: ${yearKey}`);
-    }
-    const year = readCanonicalAggregateManifest(sourceRoot, yearKey);
-    if (
-      year.payload.year !== Number(yearReference.year) ||
-      year.payload.content_hash !== yearReference.content_hash
-    ) {
-      throw new Error(`Source root/year identity mismatch: ${yearKey}`);
-    }
-    yearCount += 1;
-
-    for (const monthReference of year.payload.children) {
-      const monthKey = buildR2HistoryV2ObservationsMonthManifestKey(
-        OBSERVATIONS_PREFIX,
-        year.payload.year,
-        monthReference.month,
-      );
-      if (monthReference.manifest_key !== monthKey) {
-        throw new Error(`Source year/month reference key mismatch: ${monthKey}`);
-      }
-      const month = readCanonicalAggregateManifest(sourceRoot, monthKey);
-      if (
-        month.payload.year !== year.payload.year ||
-        month.payload.month !== monthReference.month ||
-        month.payload.content_hash !== monthReference.content_hash
-      ) {
-        throw new Error(`Source year/month identity mismatch: ${monthKey}`);
-      }
-      monthCount += 1;
-
-      for (const dayReference of month.payload.children) {
-        if (dayReferences.has(dayReference.day_utc)) {
-          throw new Error(`Source aggregate hierarchy references a day more than once: ${dayReference.day_utc}`);
-        }
-        dayReferences.set(dayReference.day_utc, Object.freeze({ ...dayReference }));
-      }
-    }
-  }
-
-  const absentDays = requestedDays.filter((dayUtc) => !dayReferences.has(dayUtc));
-  if (absentDays.length) {
-    throw new Error(
-      `Requested days are absent from the authoritative source hierarchy: ${absentDays.join(",")}`,
-    );
-  }
-  return {
-    root: {
-      key: root.key,
-      content_hash: root.payload.content_hash,
-      sha256: sha256Hex(root.body),
-      byte_size: root.body.byteLength,
-    },
-    dayReferences,
-    yearCount,
-    monthCount,
-    authoritativeDayCount: dayReferences.size,
-    authoritativeRequestedDayCount: requestedDays.length,
-  };
-}
-
 function verifyLocalFileIdentity({ bytes, entry }) {
   const key = String(entry?.key || "");
   const expectedBytes = Number(entry?.bytes);
@@ -388,8 +279,6 @@ function addCopiedObject(objects, key, sourcePath, byteSize, sha256, kind) {
 }
 
 function buildPlan(args, roots) {
-  const requestedDays = daysInclusive(args.fromDay, args.toDay);
-  const sourceAuthority = loadSourceAuthority(roots.sourceRoot, requestedDays);
   const objects = new Map();
   const dayManifests = [];
   const scopes = [];
@@ -400,134 +289,23 @@ function buildPlan(args, roots) {
   const outputPollutants = new Set();
   let rows = 0;
   let parquetBytes = 0;
-  let ignoredConnectorReferenceCount = 0;
-  let ignoredPollutantReferenceCount = 0;
 
-  for (const dayUtc of requestedDays) {
-    const sourceDayReference = sourceAuthority.dayReferences.get(dayUtc);
-    const sourceDayKey = buildHistoryV2DayManifestKey(OBSERVATIONS_PREFIX, dayUtc);
-    const exactDayReference = requireManifestReference(sourceDayReference, {
-      expectedKey: sourceDayKey,
-      label: `Source month/day ${dayUtc}`,
-    });
-    const sourceDayBody = readRequiredFile(roots.sourceRoot, exactDayReference.manifest_key);
-    const sourceDayManifest = parseJson(sourceDayBody, exactDayReference.manifest_key);
-    validateCanonicalHistoryV2Manifest(sourceDayManifest, {
-      history_version: "v2",
-      domain: "observations",
-      manifest_kind: "day",
-      day_utc: dayUtc,
-      manifest_key: exactDayReference.manifest_key,
-    });
-    if (sourceDayManifest.manifest_hash !== exactDayReference.manifest_hash) {
-      throw new Error(`Source month/day manifest identity mismatch: ${exactDayReference.manifest_key}`);
-    }
-    if (!Array.isArray(sourceDayManifest.connector_manifests)) {
-      throw new Error(`Source day has no canonical connector references: ${exactDayReference.manifest_key}`);
-    }
-    const sourceConnectorReferences = new Map();
-    for (const reference of sourceDayManifest.connector_manifests) {
-      const connectorId = Number(reference?.connector_id);
-      if (!Number.isSafeInteger(connectorId) || connectorId <= 0) {
-        throw new Error(`Source day connector reference is invalid: ${exactDayReference.manifest_key}`);
-      }
-      if (sourceConnectorReferences.has(connectorId)) {
-        throw new Error(`Source day references connector ${connectorId} more than once: ${exactDayReference.manifest_key}`);
-      }
-      const connectorKey = buildHistoryV2ConnectorManifestKey(
-        OBSERVATIONS_PREFIX,
-        dayUtc,
-        connectorId,
-      );
-      sourceConnectorReferences.set(connectorId, requireManifestReference(reference, {
-        expectedKey: connectorKey,
-        label: `Source day/connector ${dayUtc}/${connectorId}`,
-      }));
-    }
-    ignoredConnectorReferenceCount += [...sourceConnectorReferences.keys()]
-      .filter((connectorId) => !args.connectorIds.includes(connectorId)).length;
-
+  for (const dayUtc of daysInclusive(args.fromDay, args.toDay)) {
     const connectorManifests = [];
     for (const connectorId of args.connectorIds) {
-      const sourceConnectorReference = sourceConnectorReferences.get(connectorId);
-      if (!sourceConnectorReference) {
-        for (const pollutantCode of args.pollutants) {
-          missingScopes.push({
-            day_utc: dayUtc,
-            connector_id: connectorId,
-            pollutant_code: pollutantCode,
-            reason: "connector_not_referenced_by_authoritative_day",
-          });
-        }
-        continue;
-      }
-      const sourceConnectorBody = readRequiredFile(
-        roots.sourceRoot,
-        sourceConnectorReference.manifest_key,
-      );
-      const sourceConnectorManifest = parseJson(
-        sourceConnectorBody,
-        sourceConnectorReference.manifest_key,
-      );
-      validateCanonicalHistoryV2Manifest(sourceConnectorManifest, {
-        history_version: "v2",
-        domain: "observations",
-        manifest_kind: "connector",
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        manifest_key: sourceConnectorReference.manifest_key,
-      });
-      if (sourceConnectorManifest.manifest_hash !== sourceConnectorReference.manifest_hash) {
-        throw new Error(
-          `Source day/connector manifest identity mismatch: ${sourceConnectorReference.manifest_key}`,
-        );
-      }
-      if (!Array.isArray(sourceConnectorManifest.pollutant_manifests)) {
-        throw new Error(
-          `Source connector has no canonical pollutant references: ${sourceConnectorReference.manifest_key}`,
-        );
-      }
-      const sourcePollutantReferences = new Map();
-      for (const reference of sourceConnectorManifest.pollutant_manifests) {
-        const pollutantCode = String(reference?.pollutant_code || "").trim();
-        if (!/^[a-z0-9_]+$/.test(pollutantCode)) {
-          throw new Error(
-            `Source connector pollutant reference is invalid: ${sourceConnectorReference.manifest_key}`,
-          );
-        }
-        if (sourcePollutantReferences.has(pollutantCode)) {
-          throw new Error(
-            `Source connector references pollutant ${pollutantCode} more than once: ${sourceConnectorReference.manifest_key}`,
-          );
-        }
-        const pollutantKey = buildHistoryV2PollutantManifestKey(
+      const pollutantManifests = [];
+      for (const pollutantCode of args.pollutants) {
+        const manifestKey = buildHistoryV2PollutantManifestKey(
           OBSERVATIONS_PREFIX,
           dayUtc,
           connectorId,
           pollutantCode,
         );
-        sourcePollutantReferences.set(pollutantCode, requireManifestReference(reference, {
-          expectedKey: pollutantKey,
-          label: `Source connector/pollutant ${dayUtc}/${connectorId}/${pollutantCode}`,
-        }));
-      }
-      ignoredPollutantReferenceCount += [...sourcePollutantReferences.keys()]
-        .filter((pollutantCode) => !args.pollutants.includes(pollutantCode)).length;
-
-      const pollutantManifests = [];
-      for (const pollutantCode of args.pollutants) {
-        const sourcePollutantReference = sourcePollutantReferences.get(pollutantCode);
-        if (!sourcePollutantReference) {
-          missingScopes.push({
-            day_utc: dayUtc,
-            connector_id: connectorId,
-            pollutant_code: pollutantCode,
-            reason: "pollutant_not_referenced_by_authoritative_connector",
-          });
+        const manifestPath = sourceFilePath(roots.sourceRoot, manifestKey, { required: false });
+        if (!manifestPath) {
+          missingScopes.push({ day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode });
           continue;
         }
-        const manifestKey = sourcePollutantReference.manifest_key;
-        const manifestPath = sourceFilePath(roots.sourceRoot, manifestKey);
         const manifestBody = fs.readFileSync(manifestPath);
         const manifest = parseJson(manifestBody, manifestKey);
         validateMigrationSourceObservationPollutantManifest({
@@ -542,9 +320,6 @@ function buildPlan(args, roots) {
             manifest_key: manifestKey,
           },
         });
-        if (manifest.manifest_hash !== sourcePollutantReference.manifest_hash) {
-          throw new Error(`Source connector/pollutant manifest identity mismatch: ${manifestKey}`);
-        }
         if (Number(manifest.row_count) === 0 && Number(manifest.file_count) === 0) {
           missingScopes.push({
             day_utc: dayUtc,
@@ -638,11 +413,7 @@ function buildPlan(args, roots) {
       addPlannedObject(objects, connectorKey, parentBody(connectorManifest), "connector_manifest");
       connectorManifests.push(connectorManifest);
     }
-    if (!connectorManifests.length) {
-      throw new Error(
-        `Requested day has no surviving selected connector/pollutant scope: ${dayUtc}`,
-      );
-    }
+    if (!connectorManifests.length) continue;
     const dayKey = buildHistoryV2DayManifestKey(OBSERVATIONS_PREFIX, dayUtc);
     const dayManifest = buildHistoryV2DayManifest({
       domain: "observations",
@@ -696,18 +467,6 @@ function buildPlan(args, roots) {
       source_root: roots.sourceRoot,
       destination_root: roots.destinationRoot,
       observations_prefix: OBSERVATIONS_PREFIX,
-      source_authority: {
-        root: sourceAuthority.root,
-        authoritative_year_count: sourceAuthority.yearCount,
-        authoritative_month_count: sourceAuthority.monthCount,
-        authoritative_day_count: sourceAuthority.authoritativeDayCount,
-        authoritative_requested_day_count:
-          sourceAuthority.authoritativeRequestedDayCount,
-        ignored_unselected_connector_reference_count:
-          ignoredConnectorReferenceCount,
-        ignored_unselected_pollutant_reference_count:
-          ignoredPollutantReferenceCount,
-      },
       requested: {
         from_day: args.fromDay,
         to_day: args.toDay,
