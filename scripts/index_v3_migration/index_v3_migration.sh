@@ -648,10 +648,10 @@ if [ "$MODE" = "resume" ]; then
   EXPECTED_AUTH="AUTHORISE_${ENVIRONMENT}_INDEX_V3_${TRANSITION}_RESUME:${MIGRATION_RUN_ID}:${PLAN_SHA}"
   require_authorization UK_AQ_INDEX_V3_RESUME_AUTH "$EXPECTED_AUTH"
   "$PREFLIGHT" --stage migration-start --transition "$TRANSITION" \
-    --authority-file "$AUTHORITY_FILE" \
     --plan-report "$PLAN_REPORT" \
     --dropbox-root "$DROPBOX_ROOT" \
     --site-url "$SITE_URL" \
+    --checkpoint "$CHECKPOINT" \
     --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE" \
     "${V2_RUNTIME_ARGS[@]}"
   run_cli \

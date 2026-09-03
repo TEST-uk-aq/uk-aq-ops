@@ -11,8 +11,7 @@ usage() {
 Usage:
   index_v3_preflight.sh --stage plan --transition v2-to-v3|v3-rebuild
   index_v3_preflight.sh --stage migration-start --transition v2-to-v3|v3-rebuild \
-    {--authority-file PATH | --checkpoint PATH} \
-    --plan-report PATH --dropbox-root PATH --site-url URL \
+    --authority-file PATH --plan-report PATH --dropbox-root PATH --site-url URL \
     --writer-freeze-evidence PATH [--v2-runtime-rollback-record PATH]
   index_v3_preflight.sh --stage cutover --transition v2-to-v3 \
     --plan-report PATH --dropbox-root PATH --site-url URL \
@@ -282,10 +281,7 @@ if [ "$STAGE" != "plan" ]; then
   [ -n "$DROPBOX_ROOT" ] || fail "--dropbox-root is required for $STAGE"
   [ -n "$SITE_URL" ] || fail "--site-url is required for $STAGE (no established repository variable exists)"
 fi
-if [ "$STAGE" = "migration-start" ]; then
-  [ -n "$AUTHORITY_FILE" ] || [ -n "$CHECKPOINT" ] \
-    || fail "--authority-file or --checkpoint is required for $STAGE"
-elif [ "$STAGE" = "rollback" ]; then
+if [ "$STAGE" = "migration-start" ] || [ "$STAGE" = "rollback" ]; then
   [ -n "$AUTHORITY_FILE" ] || fail "--authority-file is required for $STAGE"
 fi
 if [ "$STAGE" != "plan" ]; then
