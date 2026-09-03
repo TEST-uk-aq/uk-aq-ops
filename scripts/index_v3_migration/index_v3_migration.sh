@@ -161,6 +161,64 @@ validate_read_only_dependency_authority() {
     || stop "migration/recovery implementation differs from the pinned target writer commit"
 }
 
+validate_resume_recovery_authority() {
+  node --max-old-space-size=4096 --input-type=module - \
+    "$CHECKPOINT" "$REPO_ROOT" "$MIGRATION_RUN_ID" "$PLAN_SHA" \
+    "$TARGET_WRITER_GIT_SHA" "$TRANSITION" <<'NODE'
+import fs from "node:fs";
+import {
+  buildObservationHistoryV3RecoveryProgressContext,
+} from "./scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs";
+
+const [
+  checkpointPath,
+  repositoryRoot,
+  expectedMigrationRunId,
+  expectedPlanSha256,
+  expectedTargetWriterGitSha,
+  expectedTransition,
+] = process.argv.slice(2);
+const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, "utf8"));
+const recovery = buildObservationHistoryV3RecoveryProgressContext({
+  checkpointPath,
+  checkpoint,
+  repositoryRoot,
+});
+const manifest = recovery.manifest.payload;
+if (
+  manifest.migration_run_id !== expectedMigrationRunId ||
+  manifest.plan_sha256 !== expectedPlanSha256 ||
+  manifest.target_writer_git_sha !== expectedTargetWriterGitSha ||
+  manifest.transition.kind !== expectedTransition
+) {
+  throw new Error("Recovery manifest differs from the accepted operator authority");
+}
+NODE
+}
+
+resume_recovery_implementation_drift_is_authorized() {
+  local recovery_manifest="$CHECKPOINT.recovery/manifest.json" recovery_path changed_path
+  git_paths_are_unchanged \
+    "$REPO_ROOT" "$TARGET_WRITER_GIT_SHA" HEAD \
+    "${VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES[@]}" \
+    || return 1
+  git diff --quiet HEAD -- "${VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES[@]}" \
+    || return 1
+  while IFS= read -r recovery_path; do
+    git ls-files --error-unmatch -- "$recovery_path" >/dev/null 2>&1 \
+      || return 1
+    git diff --quiet HEAD -- "$recovery_path" || return 1
+  done < <(jq -r '.payload.recovery_implementation.files[].path' "$recovery_manifest")
+  while IFS= read -r changed_path; do
+    [ -z "$changed_path" ] && continue
+    jq -e --arg changed_path "$changed_path" '
+      .payload.recovery_implementation.files |
+      any(.path == $changed_path)
+    ' "$recovery_manifest" >/dev/null || return 1
+  done < <(git diff --name-only \
+    "$TARGET_WRITER_GIT_SHA" HEAD -- "${MUTATION_IMPLEMENTATION_SCOPES[@]}")
+}
+
 self_test() {
   local output status drift_repo base_commit unrelated_commit critical_commit critical_path mutation_mode
   set +e
@@ -419,6 +477,21 @@ NODE
   fi
   if [ "$MODE" = "verify" ]; then
     validate_read_only_dependency_authority "$REPO_ROOT" "$TARGET_WRITER_GIT_SHA"
+    LOAD_AUTHORITY_DRIFT=""
+  elif [ "$MODE" = "resume" ]; then
+    printf '%s' "$TARGET_WRITER_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+      || stop "pinned target writer Git SHA is malformed"
+    git cat-file -e "${TARGET_WRITER_GIT_SHA}^{commit}" 2>/dev/null \
+      || stop "pinned target writer commit is unavailable"
+    git merge-base --is-ancestor "$TARGET_WRITER_GIT_SHA" "$(git rev-parse HEAD)" \
+      || stop "pinned target writer commit is not an ancestor of current HEAD"
+    [ -f "$CHECKPOINT" ] || stop "resume requires an existing checkpoint: $CHECKPOINT"
+    [ -f "$CHECKPOINT.recovery/manifest.json" ] \
+      || stop "resume requires an existing recovery manifest: $CHECKPOINT.recovery/manifest.json"
+    validate_resume_recovery_authority \
+      || stop "resume recovery manifest does not authenticate the checkpoint, authority, and current recovery implementation"
+    resume_recovery_implementation_drift_is_authorized \
+      || stop "resume implementation drift is not limited to the authenticated recovery implementation"
     LOAD_AUTHORITY_DRIFT=""
   else
     printf '%s' "$TARGET_WRITER_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' \
