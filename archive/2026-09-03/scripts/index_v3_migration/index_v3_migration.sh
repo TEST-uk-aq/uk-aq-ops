@@ -520,7 +520,6 @@ fi
 load_authority
 
 if [ "$MODE" = "migrate" ]; then
-  trap '' HUP
   [ "$APPLY" -eq 1 ] || stop "migrate requires the explicit --apply flag"
   [ -n "$SITE_URL" ] || stop "migrate requires --site-url for positive maintenance verification"
   [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "migrate requires --writer-freeze-evidence"
