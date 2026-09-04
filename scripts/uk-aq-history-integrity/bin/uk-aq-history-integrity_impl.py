@@ -22682,6 +22682,30 @@ def run_sos_timeseries_binding_verification(
     return result
 
 
+def run_pack_mode_sos_timeseries_binding_verification(
+    *,
+    conn: sqlite3.Connection,
+    config: HistoryPathConfig,
+    individual_root: Path,
+    backup_mode: str,
+    pack_root: Path | None,
+    stage: str,
+    log: logging.Logger | None = None,
+) -> dict[str, Any] | None:
+    """Route Phase 3 SOS binding verification only for explicit pack mode."""
+    if backup_mode != "pack":
+        return None
+    return run_sos_timeseries_binding_verification(
+        conn=conn,
+        config=config,
+        individual_root=individual_root,
+        backup_mode=backup_mode,
+        pack_root=pack_root,
+        stage=stage,
+        log=log,
+    )
+
+
 def _resolve_run_scoped_apply_artifact(
     run_state: Mapping[str, Any], raw_path: Any,
 ) -> Path:
@@ -26592,7 +26616,7 @@ def run_v2_integrity_repair_flow(
             run_state=run_state,
             apply_result=apply_result,
         )
-        binding_final = run_sos_timeseries_binding_verification(
+        binding_final = run_pack_mode_sos_timeseries_binding_verification(
             conn=conn,
             config=final_verification_config,
             individual_root=Path(str(run_state["base_dropbox_root"])),
@@ -26601,19 +26625,20 @@ def run_v2_integrity_repair_flow(
             stage="repair_final",
             log=log,
         )
-        run_state["timeseries_binding_final_verification"] = binding_final
-        write_run_state(run_state)
-        final_verification["timeseries_binding"] = binding_final
-        binding_gaps = list(binding_final.get("gaps") or [])
-        if binding_gaps:
-            final_verification["remaining_scopes"].extend(binding_gaps)
-            final_verification["remaining_gap_count"] = len(
-                final_verification["remaining_scopes"]
-            )
-            final_verification["status"] = "failed"
-            final_verification[
-                "final_sos_light_r2_verification_status"
-            ] = "failed"
+        if binding_final is not None:
+            run_state["timeseries_binding_final_verification"] = binding_final
+            write_run_state(run_state)
+            final_verification["timeseries_binding"] = binding_final
+            binding_gaps = list(binding_final.get("gaps") or [])
+            if binding_gaps:
+                final_verification["remaining_scopes"].extend(binding_gaps)
+                final_verification["remaining_gap_count"] = len(
+                    final_verification["remaining_scopes"]
+                )
+                final_verification["status"] = "failed"
+                final_verification[
+                    "final_sos_light_r2_verification_status"
+                ] = "failed"
     else:
         final_verification = run_v2_final_verification(
             run_state=run_state,
@@ -30704,13 +30729,7 @@ def main(argv: list[str]) -> int:
         sc_metrics: dict[str, Any] = dict(empty_metrics)
         sos_metrics: dict[str, Any] = dict(empty_metrics)
         cross_check_metrics: dict[str, Any] = dict(empty_metrics)
-        sos_binding_verification: dict[str, Any] = {
-            "stage": "check_only_or_pre_repair",
-            "status": "not_run",
-            "reason": "source_not_sos_or_core_snapshot_not_ready",
-            "gap_count": 0,
-            "gaps": [],
-        }
+        sos_binding_verification: dict[str, Any] | None = None
         verified_first_value_at_connector_days: list[dict[str, Any]] = []
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
@@ -30966,7 +30985,7 @@ def main(argv: list[str]) -> int:
                 args.timeseries_binding_pack_root
                 or str(individual_binding_root)
             )
-            sos_binding_verification = run_sos_timeseries_binding_verification(
+            sos_binding_verification = run_pack_mode_sos_timeseries_binding_verification(
                 conn=conn,
                 config=history_path_configs["v2"],
                 individual_root=individual_binding_root,
@@ -30975,27 +30994,33 @@ def main(argv: list[str]) -> int:
                 stage="check_only" if effective_mode == "check_only" else "pre_repair",
                 log=log,
             )
-            binding_gap_count = int(
-                sos_binding_verification.get("gap_count") or 0
-            )
-            cross_check_metrics["v2_timeseries_bindings"] = (
-                sos_binding_verification
-            )
-            cross_check_metrics["cross_checks_total"] = int(
-                cross_check_metrics.get("cross_checks_total") or 0
-            ) + int(sos_binding_verification.get("required_binding_count") or 0)
-            cross_check_metrics["cross_checks_ok"] = int(
-                cross_check_metrics.get("cross_checks_ok") or 0
-            ) + (
-                int(sos_binding_verification.get("required_binding_count") or 0)
-                if binding_gap_count == 0 else 0
-            )
-            cross_check_metrics["cross_checks_mismatch"] = int(
-                cross_check_metrics.get("cross_checks_mismatch") or 0
-            ) + binding_gap_count
-            cross_check_metrics["discrepancy_total"] = int(
-                cross_check_metrics.get("discrepancy_total") or 0
-            ) + binding_gap_count
+            if sos_binding_verification is not None:
+                binding_gap_count = int(
+                    sos_binding_verification.get("gap_count") or 0
+                )
+                cross_check_metrics["v2_timeseries_bindings"] = (
+                    sos_binding_verification
+                )
+                cross_check_metrics["cross_checks_total"] = int(
+                    cross_check_metrics.get("cross_checks_total") or 0
+                ) + int(
+                    sos_binding_verification.get("required_binding_count") or 0
+                )
+                cross_check_metrics["cross_checks_ok"] = int(
+                    cross_check_metrics.get("cross_checks_ok") or 0
+                ) + (
+                    int(
+                        sos_binding_verification.get("required_binding_count")
+                        or 0
+                    )
+                    if binding_gap_count == 0 else 0
+                )
+                cross_check_metrics["cross_checks_mismatch"] = int(
+                    cross_check_metrics.get("cross_checks_mismatch") or 0
+                ) + binding_gap_count
+                cross_check_metrics["discrepancy_total"] = int(
+                    cross_check_metrics.get("discrepancy_total") or 0
+                ) + binding_gap_count
         if cross_check_metrics.get("ran"):
             v2_backfill_metrics = run_v2_gap_backfills(
                 conn=conn,
@@ -31066,6 +31091,7 @@ def main(argv: list[str]) -> int:
 
         if (
             mode_creates_repair_overlay(effective_mode)
+            and sos_binding_verification is not None
             and sos_binding_verification.get("status") == "fail"
         ):
             repair_flow = {
@@ -31088,18 +31114,16 @@ def main(argv: list[str]) -> int:
             repair_overlay["effective_mode"] = effective_mode
             repair_overlay["dropbox_baseline"] = str(dropbox_root)
             repair_overlay["allow_stale_dropbox"] = bool(args.allow_stale_dropbox)
-            repair_overlay["timeseries_binding_backup_mode"] = (
-                args.timeseries_binding_backup_mode
-            )
-            repair_overlay["timeseries_binding_pack_root"] = (
-                args.timeseries_binding_pack_root
-                or str(dropbox_root)
-                if args.timeseries_binding_backup_mode == "pack"
-                else None
-            )
-            repair_overlay["timeseries_binding_pre_repair_verification"] = (
-                sos_binding_verification
-            )
+            if sos_binding_verification is not None:
+                repair_overlay["timeseries_binding_backup_mode"] = (
+                    args.timeseries_binding_backup_mode
+                )
+                repair_overlay["timeseries_binding_pack_root"] = (
+                    args.timeseries_binding_pack_root or str(dropbox_root)
+                )
+                repair_overlay[
+                    "timeseries_binding_pre_repair_verification"
+                ] = sos_binding_verification
             repair_overlay["observations_global_operation_lock"] = dict(
                 global_operation_lock
             )
@@ -31254,7 +31278,7 @@ def main(argv: list[str]) -> int:
             int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
             + int((cross_check_metrics.get("v2_aqilevels") or {}).get("gap_count", 0) or 0)
             + int(((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0 if ((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("required") else 0)
-            + int(sos_binding_verification.get("gap_count") or 0)
+            + int((sos_binding_verification or {}).get("gap_count") or 0)
         )
         coordinator_failed = repair_flow.get("status") in {"failed", "blocked_dependency"}
         final_verification = repair_flow.get("final_verification") or {}
@@ -31747,12 +31771,16 @@ def main(argv: list[str]) -> int:
             "status": "fail" if (
                 v2_obs.get("status") == "fail"
                 or v2_aqi.get("status") == "fail"
-                or sos_binding_verification.get("status") == "fail"
+                or (
+                    sos_binding_verification is not None
+                    and sos_binding_verification.get("status") == "fail"
+                )
             ) else "ok",
             "observations": v2_obs,
             "aqilevels": v2_aqi,
-            "timeseries_bindings": sos_binding_verification,
         }
+        if sos_binding_verification is not None:
+            v2_result["timeseries_bindings"] = sos_binding_verification
         final_result = repair_flow.get("final_verification") or {}
         if args.run_backfill and not args.dry_run and final_result.get("ran"):
             recheck = final_result.get("recheck") or {}
@@ -31763,11 +31791,13 @@ def main(argv: list[str]) -> int:
                 "final_verification": final_result,
                 "observations": recheck.get("observations") or v2_obs,
                 "aqilevels": recheck.get("aqilevels") or v2_aqi,
-                "timeseries_bindings": (
-                    final_result.get("timeseries_binding")
-                    or sos_binding_verification
-                ),
             })
+            final_binding_result = (
+                final_result.get("timeseries_binding")
+                or sos_binding_verification
+            )
+            if final_binding_result is not None:
+                v2_result["timeseries_bindings"] = final_binding_result
         elif args.run_backfill and args.dry_run:
             v2_result["final_verified"] = False
             v2_result["final_verification"] = {"status": "planned", "reason": "dry_run"}

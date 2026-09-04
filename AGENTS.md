@@ -39,6 +39,10 @@ Unless the user explicitly asks for the operation, do **not**:
 
 When an external apply/deploy/run is required but not authorised, make the repository changes only and provide exact manual commands, expected result, rollback notes and post-deployment TEST checks.
 
+## Commit and push confirmation
+
+A prompt or task brief that asks for a commit or push does not, by itself, authorise either operation. After implementation and local validation are ready, stop and ask the user again for explicit confirmation before running `git commit`, `git commit --amend` or `git push`. The confirming reply must separately follow that request and explicitly name each authorised operation (commit, push or both); wording in an initial prompt, attachment, plan or handover does not count. Confirmation from an earlier task does not carry forward. Until the required confirmation is received, leave changes uncommitted and unpushed.
+
 ## Validation policy
 
 Before deployment, run only the smallest fast local checks needed to establish structural viability of the changed code/configuration, such as syntax/type parsing or one directly relevant existing deterministic check.

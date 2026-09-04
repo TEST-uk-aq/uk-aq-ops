@@ -399,6 +399,58 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
         self.assertEqual(result["provider"]["non_sos_bindings_materialised"], 0)
         self.assertEqual(result["provider"]["cleanup_outcome"], "removed")
 
+    def test_individual_mode_skips_operational_verifier(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            for stage in ("check_only", "pre_repair", "repair_final"):
+                with self.subTest(stage=stage), mock.patch.object(
+                    MODULE,
+                    "run_sos_timeseries_binding_verification",
+                ) as verifier:
+                    result = (
+                        MODULE.run_pack_mode_sos_timeseries_binding_verification(
+                            conn=conn,
+                            config=MODULE.resolve_history_path_config("v2", {}),
+                            individual_root=self.root / "individual",
+                            backup_mode="individual",
+                            pack_root=self.root,
+                            stage=stage,
+                        )
+                    )
+                    self.assertIsNone(result)
+                    verifier.assert_not_called()
+        finally:
+            conn.close()
+
+    def test_pack_check_only_invokes_operational_verifier(self) -> None:
+        expected = {
+            "stage": "check_only",
+            "status": "ok",
+            "gap_count": 0,
+            "gaps": [],
+        }
+        conn = sqlite3.connect(":memory:")
+        try:
+            with mock.patch.object(
+                MODULE,
+                "run_sos_timeseries_binding_verification",
+                return_value=expected,
+            ) as verifier:
+                result = MODULE.run_pack_mode_sos_timeseries_binding_verification(
+                    conn=conn,
+                    config=MODULE.resolve_history_path_config("v2", {}),
+                    individual_root=self.root / "unused",
+                    backup_mode="pack",
+                    pack_root=self.root,
+                    stage="check_only",
+                )
+        finally:
+            conn.close()
+        self.assertIs(result, expected)
+        verifier.assert_called_once()
+        self.assertEqual(verifier.call_args.kwargs["stage"], "check_only")
+        self.assertEqual(verifier.call_args.kwargs["backup_mode"], "pack")
+
 
 if __name__ == "__main__":
     unittest.main()
