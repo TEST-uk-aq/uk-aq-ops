@@ -12,6 +12,7 @@ import {
 import {
   buildTimeseriesBindingPackInventoryReference,
   ISOLATED_TEST_PACK_BACKUP_DESTINATION,
+  NORMAL_TEST_DROPBOX_BACKUP_DESTINATION,
   normalizeTimeseriesBindingBackupMode,
 } from "../scripts/backup_r2/lib/timeseries_binding_pack_inventory_v1.mjs";
 import {
@@ -250,10 +251,14 @@ function lockEnv() {
   };
 }
 
-function lockedArgs(extra = [], historyIndexVersion = "v2") {
+function lockedArgs(
+  extra = [],
+  historyIndexVersion = "v2",
+  destRoot = NORMAL_TEST_DROPBOX_BACKUP_DESTINATION,
+) {
   return parseLockedHistoryBackupArgs([
     "--source-root", "uk_aq_r2:uk-aq-history-cic-test",
-    "--dest-root", "uk_aq_dropbox:TEST/R2_history_backup",
+    "--dest-root", destRoot,
     "--observations-prefix", "history/v2/observations",
     "--runs-prefix", "history/v2/_ops/observations/runs",
     "--core-prefix", "history/v2/core",
@@ -667,38 +672,51 @@ test("pack state validator rejects the individual checkpoint kind", () => {
   );
 });
 
-test("mode validation is exact and pack-only destination guard is fail-closed", () => {
+test("mode validation is exact and pack-only destination allow-list is fail-closed", () => {
   assert.equal(normalizeTimeseriesBindingBackupMode("individual"), "individual");
   assert.equal(normalizeTimeseriesBindingBackupMode("dual"), "dual");
   assert.equal(normalizeTimeseriesBindingBackupMode("pack"), "pack");
   assert.throws(() => normalizeTimeseriesBindingBackupMode("DUAL"), /exactly/);
+  const defaults = lockedArgs();
+  assert.equal(defaults.timeseriesBindingBackupMode, "individual");
+  assert.equal(defaults.allowExperimentalPackOnly, false);
   assert.throws(
     () => lockedArgs(["--timeseries-binding-backup-mode", "pack"]),
     /requires --allow-experimental-pack-only/,
   );
   assert.throws(
+    () => lockedArgs(["--timeseries-binding-packs-only"]),
+    /--timeseries-binding-packs-only requires pack backup mode/,
+  );
+  const normal = lockedArgs([
+    "--timeseries-binding-backup-mode", "pack",
+    "--allow-experimental-pack-only",
+  ]);
+  assert.equal(normal.timeseriesBindingBackupMode, "pack");
+  assert.equal(normal.destRoot, NORMAL_TEST_DROPBOX_BACKUP_DESTINATION);
+  assert.equal(normal.allowExperimentalPackOnly, true);
+  assert.throws(
     () => lockedArgs([
       "--timeseries-binding-backup-mode", "pack",
       "--allow-experimental-pack-only",
-    ]),
-    /forbidden against the normal TEST backup destination/,
+    ], "v2", "uk_aq_dropbox:LIVE/R2_history_backup"),
+    /requires an exact allowed TEST destination/,
   );
-  const isolated = parseLockedHistoryBackupArgs([
-    "--source-root", "uk_aq_r2:uk-aq-history-cic-test",
-    "--dest-root", ISOLATED_TEST_PACK_BACKUP_DESTINATION,
-    "--observations-prefix", "history/v2/observations",
-    "--runs-prefix", "history/v2/_ops/observations/runs",
-    "--core-prefix", "history/v2/core",
-    "--timeseries-binding-prefix", BINDING_PREFIX,
-    "--history-index-version", "v2",
-    "--inventory-root-prefix", "history/_index_v2/backup_inventory_v2",
-    "--state-root-prefix", STATE_PREFIX,
-    "--inventory-report-out", "tmp/inventory.json",
-    "--backup-report-out", "tmp/backup.json",
+  assert.throws(
+    () => lockedArgs([
+      "--timeseries-binding-backup-mode", "pack",
+      "--allow-experimental-pack-only",
+    ], "v2", "uk_aq_dropbox:TEST/arbitrary"),
+    /requires an exact allowed TEST destination/,
+  );
+  const isolated = lockedArgs([
     "--timeseries-binding-backup-mode", "pack",
     "--allow-experimental-pack-only",
     "--timeseries-binding-packs-only",
-  ]);
+  ], "v2", ISOLATED_TEST_PACK_BACKUP_DESTINATION);
+  assert.equal(isolated.timeseriesBindingBackupMode, "pack");
+  assert.equal(isolated.destRoot, ISOLATED_TEST_PACK_BACKUP_DESTINATION);
+  assert.equal(isolated.allowExperimentalPackOnly, true);
   assert.equal(isolated.timeseriesBindingPacksOnly, true);
 });
 
