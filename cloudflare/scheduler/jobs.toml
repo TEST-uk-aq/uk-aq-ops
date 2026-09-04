@@ -75,7 +75,7 @@ write_parquet = "configured"
 
 [jobs.uk_aq_r2_history_dropbox_backup]
 enabled = true
-cron_expr = "53 21 * * *"
+cron_expr = "35 4 * * *"
 target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-ops"
 github_workflow_file = "uk_aq_r2_history_dropbox_backup.yml"
