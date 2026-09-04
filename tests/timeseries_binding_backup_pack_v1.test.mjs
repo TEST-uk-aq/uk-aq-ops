@@ -379,3 +379,117 @@ test("publisher dry-run is read-only and write mode publishes verified root last
     false,
   );
 });
+
+test("publisher rebuilds and writes only the changed authoritative source range", async () => {
+  const store = memoryR2(hierarchyFixture());
+  const first = await publishTimeseriesBindingBackupPacksV1({
+    r2: store.r2,
+    bindingPrefix: BINDING_PREFIX,
+    packPrefix: PACK_PREFIX,
+    writeR2: true,
+  });
+  assert.equal(first.ranges_written, 2);
+  assert.equal(first.pack_root_written, true);
+
+  const changedBody = Buffer.from('{"timeseries_id":31,"station_id":99}\n');
+  const changedRange = sourceRange(0, [{ timeseriesId: 31, body: changedBody }]);
+  const unchangedRangeKey = timeseriesBindingSourceRangeManifestKey(
+    BINDING_PREFIX,
+    1000,
+    1999,
+  );
+  const unchangedRange = JSON.parse(store.objects.get(unchangedRangeKey).toString("utf8"));
+  const changedRangeKey = timeseriesBindingSourceRangeManifestKey(BINDING_PREFIX, 0, 999);
+  const changedRoot = buildTimeseriesBindingSourceRootManifest({
+    bindingPrefix: BINDING_PREFIX,
+    ranges: [changedRange, unchangedRange].map((range) => ({
+      range_start: range.range_start,
+      range_end: range.range_end,
+      source_range_hash: range.source_range_hash,
+      manifest_key: timeseriesBindingSourceRangeManifestKey(
+        BINDING_PREFIX,
+        range.range_start,
+        range.range_end,
+      ),
+      unit_count: range.units.length,
+    })),
+  });
+  store.objects.set(`${BINDING_PREFIX}/timeseries_id=31.json`, changedBody);
+  store.objects.set(changedRangeKey, Buffer.from(stableJson(changedRange)));
+  store.objects.set(
+    timeseriesBindingSourceRootKey(BINDING_PREFIX),
+    Buffer.from(stableJson(changedRoot)),
+  );
+
+  store.puts.length = 0;
+  store.gets.length = 0;
+  const second = await publishTimeseriesBindingBackupPacksV1({
+    r2: store.r2,
+    bindingPrefix: BINDING_PREFIX,
+    packPrefix: PACK_PREFIX,
+    writeR2: true,
+  });
+  const firstChangedRange = first.ranges.find((range) => range.range_start === 0);
+  const firstUnchangedRange = first.ranges.find((range) => range.range_start === 1000);
+  const secondChangedRange = second.ranges.find((range) => range.range_start === 0);
+  const secondUnchangedRange = second.ranges.find((range) => range.range_start === 1000);
+
+  assert.equal(second.ranges_rebuilt, 1);
+  assert.equal(second.ranges_reused, 1);
+  assert.equal(second.ranges_written, 1);
+  assert.equal(secondChangedRange.action, "rebuilt");
+  assert.equal(secondChangedRange.written, true);
+  assert.notEqual(secondChangedRange.pack_relative_path, firstChangedRange.pack_relative_path);
+  assert.notEqual(secondChangedRange.pack_sha256, firstChangedRange.pack_sha256);
+  assert.equal(secondUnchangedRange.action, "reused");
+  assert.equal(secondUnchangedRange.written, false);
+  assert.equal(secondUnchangedRange.pack_relative_path, firstUnchangedRange.pack_relative_path);
+  assert.equal(secondUnchangedRange.pack_sha256, firstUnchangedRange.pack_sha256);
+  assert.equal(second.pack_root_changed, true);
+  assert.equal(second.pack_root_written, true);
+  assert.deepEqual(store.puts, [
+    secondChangedRange.pack_relative_path,
+    timeseriesBindingBackupPackRootKey(PACK_PREFIX),
+  ]);
+  assert.equal(
+    store.gets.includes(`${BINDING_PREFIX}/timeseries_id=31.json`),
+    true,
+  );
+  assert.equal(
+    store.gets.includes(`${BINDING_PREFIX}/timeseries_id=1031.json`),
+    false,
+  );
+});
+
+test("publisher never publishes the pack root when child verification fails", async () => {
+  const store = memoryR2(hierarchyFixture());
+  const sourceRangeKey = timeseriesBindingSourceRangeManifestKey(BINDING_PREFIX, 0, 999);
+  const range = JSON.parse(store.objects.get(sourceRangeKey).toString("utf8"));
+  const failedPackKey = timeseriesBindingBackupPackKey({
+    packPrefix: PACK_PREFIX,
+    rangeStart: range.range_start,
+    rangeEnd: range.range_end,
+    sourceRangeHash: range.source_range_hash,
+  });
+  const originalGetObject = store.r2.adapter.getObject;
+  store.r2.adapter.getObject = async ({ key }) => {
+    if (key === failedPackKey && store.puts.includes(failedPackKey)) {
+      throw new Error("injected child post-PUT verification failure");
+    }
+    return originalGetObject({ key });
+  };
+
+  await assert.rejects(
+    publishTimeseriesBindingBackupPacksV1({
+      r2: store.r2,
+      bindingPrefix: BINDING_PREFIX,
+      packPrefix: PACK_PREFIX,
+      writeR2: true,
+    }),
+    /injected child post-PUT verification failure/,
+  );
+  assert.equal(store.puts.includes(failedPackKey), true);
+  assert.equal(store.objects.has(failedPackKey), true);
+  assert.equal(store.puts.includes(timeseriesBindingBackupPackRootKey(PACK_PREFIX)), false);
+  assert.equal(store.objects.has(timeseriesBindingBackupPackRootKey(PACK_PREFIX)), false);
+});
