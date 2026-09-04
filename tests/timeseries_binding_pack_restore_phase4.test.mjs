@@ -529,6 +529,14 @@ test("destination member readback failure prevents all manifest and root publica
 });
 
 test("write CLI is dry-run by default and exactly guards the isolated TEST target", () => {
+  assert.equal(
+    NORMAL_TEST_R2_HISTORY_DESTINATION,
+    "uk_aq_r2_test:uk-aq-history-cic-test",
+  );
+  assert.equal(
+    PHASE4_ISOLATED_TEST_R2_DESTINATION,
+    "uk_aq_r2_test:uk-aq-history-cic-test-timeseries-binding-restore-phase4",
+  );
   const base = [
     "--source-root", NORMAL_TEST_DROPBOX_PACK_SOURCE,
     "--dest-root", NORMAL_TEST_R2_HISTORY_DESTINATION,
@@ -543,7 +551,7 @@ test("write CLI is dry-run by default and exactly guards the isolated TEST targe
   assert.throws(
     () => parseTimeseriesBindingPackRestoreArgs([
       "--source-root", NORMAL_TEST_DROPBOX_PACK_SOURCE,
-      "--dest-root", "uk_aq_r2:uk-aq-history-live",
+      "--dest-root", "uk_aq_r2_live:uk-aq-history-live",
       "--write-r2",
     ]),
     /exact isolated TEST destination/,

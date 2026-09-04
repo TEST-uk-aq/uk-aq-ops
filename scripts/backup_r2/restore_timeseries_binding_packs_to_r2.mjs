@@ -16,9 +16,9 @@ import {
 } from "./lib/timeseries_binding_pack_restore_v1.mjs";
 
 export const NORMAL_TEST_R2_HISTORY_DESTINATION =
-  "uk_aq_r2:uk-aq-history-cic-test";
+  "uk_aq_r2_test:uk-aq-history-cic-test";
 export const PHASE4_ISOLATED_TEST_R2_DESTINATION =
-  "uk_aq_r2:uk-aq-history-cic-test-timeseries-binding-restore-phase4";
+  "uk_aq_r2_test:uk-aq-history-cic-test-timeseries-binding-restore-phase4";
 export const NORMAL_TEST_DROPBOX_PACK_SOURCE =
   "uk_aq_dropbox:TEST/R2_history_backup";
 
