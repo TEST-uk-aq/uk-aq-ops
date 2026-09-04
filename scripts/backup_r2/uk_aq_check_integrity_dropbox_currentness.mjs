@@ -8,6 +8,12 @@ import {
   validateHierarchicalStateRoot,
 } from "./lib/hierarchical_backup_v2.mjs";
 import {
+  normalizeTimeseriesBindingPackRootState,
+} from "./lib/hierarchical_timeseries_binding_pack_sync_v1.mjs";
+import {
+  normalizeTimeseriesBindingBackupMode,
+} from "./lib/timeseries_binding_pack_inventory_v1.mjs";
+import {
   OBSERVATIONS_AGGREGATE_MANIFEST_KINDS,
   validateR2HistoryV2ObservationsAggregateManifest,
 } from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
@@ -50,6 +56,7 @@ function parseArgs(argv) {
     dropboxRoot: null,
     statePrefix: DEFAULT_STATE_PREFIX,
     observationsPrefix: DEFAULT_OBSERVATIONS_PREFIX,
+    timeseriesBindingBackupMode: "individual",
   };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -61,15 +68,26 @@ function parseArgs(argv) {
     if (flag === "--dropbox-root") args.dropboxRoot = value();
     else if (flag === "--state-prefix") args.statePrefix = value();
     else if (flag === "--observations-prefix") args.observationsPrefix = value();
+    else if (flag === "--timeseries-binding-backup-mode") {
+      args.timeseriesBindingBackupMode = value();
+    }
     else throw new Error(`Unknown argument: ${flag}`);
   }
   if (!args.dropboxRoot) throw new Error("--dropbox-root is required");
   args.statePrefix = normalizeRelativePath(args.statePrefix, "state prefix");
   args.observationsPrefix = normalizeRelativePath(args.observationsPrefix, "observations prefix");
+  args.timeseriesBindingBackupMode = normalizeTimeseriesBindingBackupMode(
+    args.timeseriesBindingBackupMode,
+  );
+  if (!["individual", "pack"].includes(args.timeseriesBindingBackupMode)) {
+    throw new Error(
+      "Integrity timeseries binding backup mode must be individual or pack",
+    );
+  }
   return Object.freeze(args);
 }
 
-function requireCompleteCheckpoint(state) {
+function requireCompleteCheckpoint(state, timeseriesBindingBackupMode) {
   const blockers = [];
   if (!state.observations.processed_source_root_hash) blockers.push("observations_root_not_processed");
   if (!state.observations.years.length) blockers.push("observations_years_missing");
@@ -97,28 +115,38 @@ function requireCompleteCheckpoint(state) {
     !SHA256_PATTERN.test(String(core.processed_source_hash || "")) ||
     !SHA256_PATTERN.test(String(core.state_shard_hash || ""))
   ) blockers.push("core_incomplete");
-  const binding = state.timeseries_binding;
-  if (!binding || !SHA256_PATTERN.test(String(binding.processed_source_root_hash || ""))) {
-    blockers.push("timeseries_binding_incomplete");
-  }
-  for (const range of Array.isArray(binding?.ranges) ? binding.ranges : []) {
-    if (
-      !SHA256_PATTERN.test(String(range.processed_source_range_hash || "")) ||
-      !SHA256_PATTERN.test(String(range.state_shard_hash || ""))
-    ) blockers.push(`timeseries_binding_range_incomplete:${String(range.range_start)}`);
+  let binding = null;
+  let bindingPacks = null;
+  if (timeseriesBindingBackupMode === "individual") {
+    binding = state.timeseries_binding;
+    if (!binding || !SHA256_PATTERN.test(String(binding.processed_source_root_hash || ""))) {
+      blockers.push("timeseries_binding_incomplete");
+    }
+    for (const range of Array.isArray(binding?.ranges) ? binding.ranges : []) {
+      if (
+        !SHA256_PATTERN.test(String(range.processed_source_range_hash || "")) ||
+        !SHA256_PATTERN.test(String(range.state_shard_hash || ""))
+      ) blockers.push(`timeseries_binding_range_incomplete:${String(range.range_start)}`);
+    }
+  } else {
+    bindingPacks = normalizeTimeseriesBindingPackRootState(state);
+    if (!bindingPacks.verified || bindingPacks.ranges.length === 0) {
+      blockers.push("timeseries_binding_packs_incomplete");
+    }
   }
   if (blockers.length) {
     const error = new Error(`Dropbox hierarchical checkpoint is incomplete: ${blockers.join(",")}`);
     error.blockers = blockers;
     throw error;
   }
-  return { core, binding };
+  return { core, binding, bindingPacks };
 }
 
 export async function checkIntegrityDropboxCurrentness({
   dropboxRoot,
   statePrefix = DEFAULT_STATE_PREFIX,
   observationsPrefix = DEFAULT_OBSERVATIONS_PREFIX,
+  timeseriesBindingBackupMode = "individual",
   env = process.env,
   getLiveRoot,
   lockContext,
@@ -130,6 +158,14 @@ export async function checkIntegrityDropboxCurrentness({
   if (!lock.valid) throw new Error("Integrity Dropbox currentness gate requires the held global lock");
   const normalizedStatePrefix = normalizeRelativePath(statePrefix, "state prefix");
   const normalizedObservationsPrefix = normalizeRelativePath(observationsPrefix, "observations prefix");
+  const normalizedBindingBackupMode = normalizeTimeseriesBindingBackupMode(
+    timeseriesBindingBackupMode,
+  );
+  if (!["individual", "pack"].includes(normalizedBindingBackupMode)) {
+    throw new Error(
+      "Integrity timeseries binding backup mode must be individual or pack",
+    );
+  }
   const checkpointPath = resolveBelow(dropboxRoot, `${normalizedStatePrefix}/root.json`);
   const checkpointBody = fs.readFileSync(checkpointPath);
   let checkpointRaw;
@@ -139,7 +175,7 @@ export async function checkIntegrityDropboxCurrentness({
     throw new Error(`Dropbox checkpoint root is invalid JSON: ${checkpointPath}`, { cause: error });
   }
   const checkpoint = validateHierarchicalStateRoot(checkpointRaw, normalizedStatePrefix);
-  requireCompleteCheckpoint(checkpoint);
+  requireCompleteCheckpoint(checkpoint, normalizedBindingBackupMode);
 
   const liveRootKey = `${normalizedObservationsPrefix}/_manifests/manifest.json`;
   let liveObject;

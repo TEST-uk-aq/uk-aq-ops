@@ -451,6 +451,32 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
         self.assertEqual(verifier.call_args.kwargs["stage"], "check_only")
         self.assertEqual(verifier.call_args.kwargs["backup_mode"], "pack")
 
+    def test_currentness_gate_wrapper_propagates_pack_mode(self) -> None:
+        completed = mock.Mock(
+            returncode=0,
+            stdout='{"allowed": true}\n',
+            stderr="",
+        )
+        with mock.patch.object(
+            MODULE,
+            "_repo_root_for_integrity_script",
+            return_value=self.root,
+        ), mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            return_value=completed,
+        ) as runner:
+            result = MODULE.run_integrity_dropbox_currentness_gate(
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                dropbox_root=self.root,
+                observations_prefix="history/v2/observations",
+                timeseries_binding_backup_mode="pack",
+            )
+        command = runner.call_args.args[0]
+        mode_index = command.index("--timeseries-binding-backup-mode")
+        self.assertEqual(command[mode_index + 1], "pack")
+        self.assertTrue(result["allowed"])
+
     def _format_binding_summary(
         self,
         binding_result: dict[str, object] | None,

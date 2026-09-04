@@ -24215,6 +24215,7 @@ def run_integrity_dropbox_currentness_gate(
     env: Mapping[str, str],
     dropbox_root: str | Path,
     observations_prefix: str,
+    timeseries_binding_backup_mode: str,
 ) -> dict[str, Any]:
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -24230,6 +24231,7 @@ def run_integrity_dropbox_currentness_gate(
             or "_ops/checkpoints/r2_history_backup_state_v2"
         ),
         "--observations-prefix", observations_prefix,
+        "--timeseries-binding-backup-mode", timeseries_binding_backup_mode,
     ]
     completed = subprocess.run(
         command,
@@ -30434,6 +30436,9 @@ def main(argv: list[str]) -> int:
             env={**env, **os.environ},
             dropbox_root=dropbox_root,
             observations_prefix=history_path_configs["v2"].observations_data_prefix,
+            timeseries_binding_backup_mode=(
+                args.timeseries_binding_backup_mode
+            ),
         )
     log.info(
         "observations global operation lock: %s",

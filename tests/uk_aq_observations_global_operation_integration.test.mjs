@@ -32,6 +32,9 @@ import {
   emptyHierarchicalStateRoot,
 } from "../scripts/backup_r2/lib/hierarchical_backup_v2.mjs";
 import {
+  TIMESERIES_BINDING_PACK_ROOT_STATE_KIND,
+} from "../scripts/backup_r2/lib/hierarchical_timeseries_binding_pack_sync_v1.mjs";
+import {
   buildR2HistoryV2ObservationsRootManifest,
 } from "../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import {
@@ -143,6 +146,42 @@ function completeCheckpoint(rootHash) {
   return state;
 }
 
+function completePackCheckpoint(rootHash) {
+  const state = completeCheckpoint(rootHash);
+  state.timeseries_binding = {
+    processed_source_root_hash: null,
+    ranges: [],
+  };
+  state.timeseries_binding_packs = {
+    schema_version: 1,
+    kind: TIMESERIES_BINDING_PACK_ROOT_STATE_KIND,
+    backup_pack_version: "v1",
+    processed_source_root_hash: h("4"),
+    processed_pack_root_sha256: h("5"),
+    pack_root_relative_path:
+      "history/_backup_packs_v1/timeseries_binding/root.json",
+    pack_root_size: 1234,
+    copied_at: "2026-09-04T12:00:00.000Z",
+    verified: true,
+    ranges: [{
+      range_start: 0,
+      range_end: 999,
+      state_shard_key:
+        "_ops/checkpoints/r2_history_backup_state_v2/"
+        + "timeseries_binding_packs/range=000000-000999.json",
+      processed_source_range_hash: h("6"),
+      pack_relative_path:
+        "history/_backup_packs_v1/timeseries_binding/"
+        + `range=000000-000999/${h("6")}.pack.json`,
+      pack_sha256: h("7"),
+      pack_size: 5678,
+      member_count: 10,
+      state_shard_hash: h("8"),
+    }],
+  };
+  return state;
+}
+
 test("Integrity currentness gate runs under the global lock and blocks a stale checkpoint", async (t) => {
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-currentness-"));
   t.after(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }));
@@ -183,6 +222,67 @@ test("Integrity currentness gate runs under the global lock and blocks a stale c
     }),
     (error) => error.code === "UK_AQ_INTEGRITY_DROPBOX_CHECKPOINT_STALE"
       && error.result.checkpoint_live_root_match === false,
+  );
+});
+
+test("Integrity currentness gate requires the explicitly selected binding representation", async (t) => {
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-currentness-binding-"));
+  t.after(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }));
+  const stateDirectory = path.join(
+    temporaryRoot,
+    "_ops/checkpoints/r2_history_backup_state_v2",
+  );
+  fs.mkdirSync(stateDirectory, { recursive: true });
+  const checkpointPath = path.join(stateDirectory, "root.json");
+  const liveRoot = buildR2HistoryV2ObservationsRootManifest({
+    basePrefix: "history/v2/observations",
+    yearManifests: [{
+      year: "2026",
+      manifest_key: "history/v2/observations/_manifests/year=2026/manifest.json",
+      content_hash: h("b"),
+    }],
+  });
+  const getLiveRoot = async () => ({
+    body: Buffer.from(JSON.stringify(liveRoot)),
+    bytes: 456,
+  });
+  const check = (timeseriesBindingBackupMode) =>
+    checkIntegrityDropboxCurrentness({
+      dropboxRoot: temporaryRoot,
+      timeseriesBindingBackupMode,
+      getLiveRoot,
+      lockContext: { valid: true, owner: "integrity", run_id: "integrity:test" },
+    });
+
+  const packCheckpoint = completePackCheckpoint(liveRoot.content_hash);
+  fs.writeFileSync(checkpointPath, JSON.stringify(packCheckpoint));
+  await assert.rejects(
+    check("individual"),
+    (error) => error.blockers.includes("timeseries_binding_incomplete"),
+  );
+  const current = await check("pack");
+  assert.equal(current.allowed, true);
+  assert.equal(current.checkpoint_live_root_match, true);
+
+  const missingPackCheckpoint = completePackCheckpoint(liveRoot.content_hash);
+  delete missingPackCheckpoint.timeseries_binding_packs;
+  fs.writeFileSync(checkpointPath, JSON.stringify(missingPackCheckpoint));
+  await assert.rejects(
+    check("pack"),
+    (error) => error.blockers.includes("timeseries_binding_packs_incomplete"),
+  );
+
+  const malformedPackCheckpoint = completePackCheckpoint(liveRoot.content_hash);
+  malformedPackCheckpoint.timeseries_binding_packs.kind = "wrong_kind";
+  fs.writeFileSync(checkpointPath, JSON.stringify(malformedPackCheckpoint));
+  await assert.rejects(check("pack"), /root state identity mismatch/);
+
+  const incompleteObservations = completePackCheckpoint(liveRoot.content_hash);
+  incompleteObservations.observations.processed_source_root_hash = null;
+  fs.writeFileSync(checkpointPath, JSON.stringify(incompleteObservations));
+  await assert.rejects(
+    check("pack"),
+    (error) => error.blockers.includes("observations_root_not_processed"),
   );
 });
 
