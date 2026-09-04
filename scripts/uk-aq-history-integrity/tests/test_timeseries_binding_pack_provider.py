@@ -451,6 +451,48 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
         self.assertEqual(verifier.call_args.kwargs["stage"], "check_only")
         self.assertEqual(verifier.call_args.kwargs["backup_mode"], "pack")
 
+    def _format_binding_summary(
+        self,
+        binding_result: dict[str, object] | None,
+    ) -> str:
+        history_result: dict[str, object] = {}
+        if binding_result is not None:
+            history_result["timeseries_bindings"] = binding_result
+        return MODULE.format_summary_md({
+            "env": "TEST",
+            "profile": "manual",
+            "started_at_utc": "2026-09-04T12:00:00Z",
+            "status": "ok",
+            "source": "sos",
+            "dry_run": False,
+            "check_only": True,
+            "run_backfill": False,
+            "db_path": ":memory:",
+            "log_path": "tmp/test.log",
+            "checked_versions": ["v2"],
+            "history_version_results": {"v2": history_result},
+            "cross_check": {"ran": True},
+        })
+
+    def test_individual_summary_omits_binding_input_section(self) -> None:
+        markdown = self._format_binding_summary(None)
+        self.assertNotIn("### SOS timeseries binding input", markdown)
+
+    def test_pack_summary_renders_binding_input_section(self) -> None:
+        markdown = self._format_binding_summary({
+            "stage": "check_only",
+            "status": "ok",
+            "gap_count": 0,
+            "gaps": [],
+            "provider": {
+                "mode": "pack",
+                "ranges_verified": 143,
+            },
+        })
+        self.assertIn("### SOS timeseries binding input", markdown)
+        self.assertIn("- Mode: pack", markdown)
+        self.assertIn("- Ranges verified: 143", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

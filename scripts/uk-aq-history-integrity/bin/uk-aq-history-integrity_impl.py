@@ -29860,7 +29860,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         f"- Checked AQI hourly data partitions: {aqi.get('checked_partitions', 0)}",
                         f"- AQI hourly data gaps: {aqi.get('gap_count', len(aqi.get('gaps') or []))}",
                     ])
-                    if binding_check.get("status") != "not_run":
+                    if binding_check:
                         lines.extend([
                             "",
                             "### SOS timeseries binding input",
