@@ -20,6 +20,14 @@ on:
         required: false
         default: false
         type: boolean
+      timeseries_binding_backup_mode:
+        description: "Timeseries binding Dropbox backup representation"
+        required: false
+        default: "individual"
+        type: choice
+        options:
+          - individual
+          - pack
 
 permissions:
   contents: read
@@ -62,6 +70,7 @@ jobs:
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
       INPUT_FORCE_PRUNE_RECHECK: ${{ github.event.inputs.force_prune_recheck || 'false' }}
+      INPUT_TIMESERIES_BINDING_BACKUP_MODE: ${{ github.event.inputs.timeseries_binding_backup_mode || 'individual' }}
 
     steps:
       - name: Checkout
@@ -199,6 +208,15 @@ jobs:
               ;;
           esac
 
+          selected_mode="${INPUT_TIMESERIES_BINDING_BACKUP_MODE:-individual}"
+          case "${selected_mode}" in
+            individual|pack) ;;
+            *)
+              echo "timeseries_binding_backup_mode must be exactly individual or pack" >&2
+              exit 1
+              ;;
+          esac
+
           dropbox_root="${UK_AQ_DROPBOX_ROOT%/}"
           dropbox_root="${dropbox_root#/}"
           dropbox_dir="${UK_AQ_R2_HISTORY_DROPBOX_DIR#/}"
@@ -226,6 +244,7 @@ jobs:
             --runs-prefix "${UK_AQ_R2_HISTORY_V2_RUNS_PREFIX}"
             --core-prefix "${UK_AQ_R2_HISTORY_V2_CORE_PREFIX}"
             --timeseries-binding-prefix "${UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX}"
+            --timeseries-binding-backup-mode "${selected_mode}"
             --history-index-version "${UK_AQ_R2_HISTORY_INDEX_VERSION}"
             --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
             --state-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX}"
@@ -235,6 +254,10 @@ jobs:
             --inventory-report-out "tmp/r2_backup_inventory_report.json"
             --backup-report-out "tmp/r2_history_dropbox_backup_report.json"
           )
+
+          if [ "${selected_mode}" = "pack" ]; then
+            cmd+=(--allow-experimental-pack-only)
+          fi
 
           if [ "${INPUT_DRY_RUN}" = "true" ]; then
             cmd+=(--dry-run)
