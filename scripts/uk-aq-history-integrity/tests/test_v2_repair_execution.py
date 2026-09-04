@@ -4399,8 +4399,30 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                     MODULE, "run_aqi_rebuild_queue_execution", side_effect=forbidden,
                 ), mock.patch.object(
                     MODULE, "run_v2_final_verification", side_effect=forbidden,
-                ):
-                    result = MODULE.run_v2_integrity_repair_flow(
+                ), mock.patch.object(
+                    MODULE, "assemble_sos_light_complete_days", return_value={
+                        "status": "ok",
+                    },
+                ), mock.patch.object(
+                    MODULE,
+                    "run_sos_timeseries_binding_verification",
+                    return_value={
+                        "stage": "repair_final",
+                        "status": "ok",
+                        "gap_count": 0,
+                        "gaps": [],
+                        "provider": {
+                            "mode": "pack",
+                            "cleanup_outcome": "removed",
+                        },
+                    },
+                ) as binding_verifier:
+                    with mock.patch.object(
+                        MODULE,
+                        "validate_run_state_core_snapshot_identity",
+                        return_value={"coordinator_identity_match": True},
+                    ):
+                        result = MODULE.run_v2_integrity_repair_flow(
                         run_state=run_state,
                         conn=conn,
                         run_id=1,
@@ -4425,6 +4447,9 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                         log=logging.getLogger("dedicated-sos-test"),
                         repair_pollutants=["no2"],
                         dedicated_sos_historical_replacement=True,
+                        protected_connector_ids=[1],
+                        timeseries_binding_backup_mode="pack",
+                        timeseries_binding_pack_root=root / "pack",
                     )
             finally:
                 conn.close()
@@ -4434,6 +4459,17 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
             self.assertEqual(result["final_verification"]["status"], "ok")
             self.assertFalse(
                 result["final_verification"]["second_broad_r2_scan_invoked"]
+            )
+            self.assertEqual(
+                result["final_verification"]["timeseries_binding"]["status"],
+                "ok",
+            )
+            binding_verifier.assert_called_once()
+            self.assertEqual(
+                binding_verifier.call_args.kwargs["stage"], "repair_final"
+            )
+            self.assertEqual(
+                binding_verifier.call_args.kwargs["backup_mode"], "pack"
             )
             self.assertEqual(
                 current_state_runner.call_args.kwargs[

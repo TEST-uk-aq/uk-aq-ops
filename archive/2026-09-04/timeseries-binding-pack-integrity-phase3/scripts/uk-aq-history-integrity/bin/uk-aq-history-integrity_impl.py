@@ -79,7 +79,6 @@ from integrity.current_state.audit import (
     start_target_attempt,
 )
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
-from integrity.timeseries_binding_provider import binding_backup_view
 
 
 REQUIRED_ENV_VARS = (
@@ -22480,14 +22479,19 @@ def _validate_changed_timeseries_metadata(
     return gaps
 
 
-def _expected_v2_core_timeseries_bindings(
-    conn: sqlite3.Connection | None,
-    *,
-    allowed_connector_ids: set[int] | None = None,
-) -> dict[int, dict[str, Any]]:
+def _validate_v2_timeseries_bindings(
+    *, conn: sqlite3.Connection | None, view_root: Path, config: HistoryPathConfig,
+) -> list[dict[str, Any]]:
+    """Validate stable bindings against the imported v2 core snapshot.
+
+    Bindings are deliberately independent of daily observation/AQI coverage.
+    Missing or stale objects are reported only; this integrity path never
+    deletes R2 objects.  The dedicated core-snapshot reconciliation command
+    is the repair mechanism.
+    """
     authoritative = _authoritative_v2_core_timeseries_bindings(conn)
     if not authoritative:
-        return {}
+        return []
     expected_by_id: dict[int, dict[str, Any]] = {}
     for raw in authoritative:
         try:
@@ -22496,11 +22500,6 @@ def _expected_v2_core_timeseries_bindings(
         except (KeyError, TypeError, ValueError):
             continue
         if timeseries_id <= 0 or connector_id <= 0:
-            continue
-        if (
-            allowed_connector_ids is not None
-            and connector_id not in allowed_connector_ids
-        ):
             continue
         expected = {
             "timeseries_id": timeseries_id,
@@ -22516,28 +22515,6 @@ def _expected_v2_core_timeseries_bindings(
                 expected[field] = value
         if expected["pollutant_code"]:
             expected_by_id[timeseries_id] = expected
-    return expected_by_id
-
-
-def _validate_v2_timeseries_bindings(
-    *,
-    conn: sqlite3.Connection | None,
-    view_root: Path,
-    config: HistoryPathConfig,
-    allowed_connector_ids: set[int] | None = None,
-) -> list[dict[str, Any]]:
-    """Validate stable bindings against the imported v2 core snapshot.
-
-    Bindings are deliberately independent of daily observation/AQI coverage.
-    Missing or stale objects are reported only; this integrity path never
-    deletes R2 objects.  The dedicated core-snapshot reconciliation command
-    is the repair mechanism.  The optional connector scope lets SOS-light use
-    the same semantics without assuming unrelated physical bindings exist.
-    """
-    expected_by_id = _expected_v2_core_timeseries_bindings(
-        conn,
-        allowed_connector_ids=allowed_connector_ids,
-    )
     if not expected_by_id:
         return []
 
@@ -22550,19 +22527,7 @@ def _validate_v2_timeseries_bindings(
         "connector_id", "pollutant_code", "station_id", "phenomenon_id",
         "observed_property_id", "continuity",
     }
-    binding_paths = (
-        [
-            binding_root / f"timeseries_id={timeseries_id}.json"
-            for timeseries_id in sorted(expected_by_id)
-            if (binding_root / f"timeseries_id={timeseries_id}.json").is_file()
-        ]
-        if allowed_connector_ids is not None
-        else (
-            sorted(binding_root.glob("timeseries_id=*.json"))
-            if binding_root.is_dir() else []
-        )
-    )
-    for path in binding_paths:
+    for path in sorted(binding_root.glob("timeseries_id=*.json")) if binding_root.is_dir() else []:
         relative_key = path.relative_to(view_root).as_posix()
         match = re.fullmatch(r"timeseries_id=([1-9]\d*)\.json", path.name)
         if not match:
@@ -22620,66 +22585,6 @@ def _validate_v2_timeseries_bindings(
             "gap_type": "timeseries_binding_missing_reconcile_from_core",
         })
     return gaps
-
-
-def run_sos_timeseries_binding_verification(
-    *,
-    conn: sqlite3.Connection,
-    config: HistoryPathConfig,
-    individual_root: Path,
-    backup_mode: str,
-    pack_root: Path | None,
-    stage: str,
-    log: logging.Logger | None = None,
-) -> dict[str, Any]:
-    """Run established connector-1 semantics through one physical provider."""
-    connector_ids = {1}
-    expected = _expected_v2_core_timeseries_bindings(
-        conn,
-        allowed_connector_ids=connector_ids,
-    )
-    required_ids = set(expected)
-    provider_audit: dict[str, Any]
-    with binding_backup_view(
-        mode=backup_mode,
-        individual_root=individual_root,
-        pack_root=pack_root,
-        required_timeseries_ids=required_ids,
-    ) as (view_root, mutable_audit):
-        provider_audit = mutable_audit
-        gaps = _validate_v2_timeseries_bindings(
-            conn=conn,
-            view_root=view_root,
-            config=config,
-            allowed_connector_ids=connector_ids,
-        )
-    result = {
-        "stage": stage,
-        "status": "ok" if not gaps else "fail",
-        "connector_ids": [1],
-        "required_binding_count": len(required_ids),
-        "semantic_binding_count_checked": len(required_ids),
-        "gap_count": len(gaps),
-        "gaps": gaps,
-        "provider": dict(provider_audit),
-    }
-    if log is not None:
-        log.info(
-            "SOS timeseries binding verification stage=%s mode=%s status=%s "
-            "required=%s gaps=%s ranges_verified=%s members_verified=%s "
-            "materialised=%s non_sos_materialised=%s cleanup=%s",
-            stage,
-            backup_mode,
-            result["status"],
-            result["required_binding_count"],
-            result["gap_count"],
-            provider_audit.get("ranges_verified"),
-            provider_audit.get("total_pack_members_verified"),
-            provider_audit.get("sos_bindings_materialised"),
-            provider_audit.get("non_sos_bindings_materialised"),
-            provider_audit.get("cleanup_outcome"),
-        )
-    return result
 
 
 def _resolve_run_scoped_apply_artifact(
@@ -25942,8 +25847,6 @@ def run_v2_integrity_repair_flow(
     repair_pollutants: Iterable[str] | None = None,
     dedicated_sos_historical_replacement: bool = False,
     protected_connector_ids: Iterable[int] | None = None,
-    timeseries_binding_backup_mode: str = "individual",
-    timeseries_binding_pack_root: Path | None = None,
 ) -> dict[str, Any]:
     """Build one canonical local proposal, then optionally apply and verify it."""
     validate_run_state_core_snapshot_identity(
@@ -26592,28 +26495,6 @@ def run_v2_integrity_repair_flow(
             run_state=run_state,
             apply_result=apply_result,
         )
-        binding_final = run_sos_timeseries_binding_verification(
-            conn=conn,
-            config=final_verification_config,
-            individual_root=Path(str(run_state["base_dropbox_root"])),
-            backup_mode=timeseries_binding_backup_mode,
-            pack_root=timeseries_binding_pack_root,
-            stage="repair_final",
-            log=log,
-        )
-        run_state["timeseries_binding_final_verification"] = binding_final
-        write_run_state(run_state)
-        final_verification["timeseries_binding"] = binding_final
-        binding_gaps = list(binding_final.get("gaps") or [])
-        if binding_gaps:
-            final_verification["remaining_scopes"].extend(binding_gaps)
-            final_verification["remaining_gap_count"] = len(
-                final_verification["remaining_scopes"]
-            )
-            final_verification["status"] = "failed"
-            final_verification[
-                "final_sos_light_r2_verification_status"
-            ] = "failed"
     else:
         final_verification = run_v2_final_verification(
             run_state=run_state,
@@ -27076,23 +26957,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--timeseries-binding-backup-mode",
-        choices=["individual", "pack"],
-        default="individual",
-        help=(
-            "Physical Dropbox binding representation for source=sos "
-            "(default: individual)."
-        ),
-    )
-    p.add_argument(
-        "--timeseries-binding-pack-root",
-        default=None,
-        help=(
-            "Absolute local Dropbox root containing packed bindings; defaults "
-            "to the normal R2 history Dropbox root in pack mode."
-        ),
-    )
-    p.add_argument(
         "--check-aqi-debug",
         action="store_true",
         default=_parse_bool(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_CHECK_AQI_DEBUG"), False),
@@ -27129,24 +26993,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         )
     if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
         p.error("historical identity repair must remain disabled in LIVE")
-    if parsed.timeseries_binding_pack_root:
-        pack_root = Path(parsed.timeseries_binding_pack_root)
-        if parsed.timeseries_binding_backup_mode != "pack":
-            p.error("--timeseries-binding-pack-root requires pack mode")
-        if not pack_root.is_absolute():
-            p.error("--timeseries-binding-pack-root must be absolute")
-        if "archive" in pack_root.parts:
-            p.error("--timeseries-binding-pack-root must not point into archive")
-        other_environment = "LIVE" if parsed.env == "TEST" else "TEST"
-        if f"/{other_environment}/" in pack_root.as_posix():
-            p.error(
-                "--timeseries-binding-pack-root points at the other environment"
-            )
-    if parsed.timeseries_binding_backup_mode == "pack":
-        if parsed.source != "sos":
-            p.error("pack binding mode is currently supported only with --source sos")
-        if parsed.env != "TEST":
-            p.error("pack binding mode is currently TEST-only")
     return parsed
 
 
@@ -29800,8 +29646,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     first_value_evidence = (
                         obs.get("first_value_at_evidence") or {}
                     )
-                    binding_check = hvr.get("timeseries_bindings") or {}
-                    binding_provider = binding_check.get("provider") or {}
                     source_scope_line = "all connectors"
                     if source_scope.get("scope") == "source":
                         connector_ids = source_scope.get("connector_ids") or []
@@ -29835,26 +29679,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         f"- Checked AQI hourly data partitions: {aqi.get('checked_partitions', 0)}",
                         f"- AQI hourly data gaps: {aqi.get('gap_count', len(aqi.get('gaps') or []))}",
                     ])
-                    if binding_check.get("status") != "not_run":
-                        lines.extend([
-                            "",
-                            "### SOS timeseries binding input",
-                            "",
-                            f"- Stage: {binding_check.get('stage') or '(none)'}",
-                            f"- Status: {binding_check.get('status') or '(none)'}",
-                            f"- Mode: {binding_provider.get('mode') or '(none)'}",
-                            f"- Pack root SHA-256: {binding_provider.get('pack_root_sha256') or '(not applicable)'}",
-                            f"- Source root hash: {binding_provider.get('source_root_hash') or '(not applicable)'}",
-                            f"- Ranges verified: {binding_provider.get('ranges_verified', 0)}",
-                            f"- Pack bytes verified: {binding_provider.get('total_pack_bytes_verified', 0)}",
-                            f"- Pack members verified: {binding_provider.get('total_pack_members_verified', 0)}",
-                            f"- SOS bindings selected: {binding_provider.get('sos_bindings_selected', 0)}",
-                            f"- SOS bindings materialised: {binding_provider.get('sos_bindings_materialised', 0)}",
-                            f"- Non-SOS bindings materialised: {binding_provider.get('non_sos_bindings_materialised', 0)}",
-                            f"- Temporary path: {binding_provider.get('temporary_path') or '(none)'}",
-                            f"- Cleanup: {binding_provider.get('cleanup_outcome') or '(none)'}",
-                            f"- Semantic binding gaps: {binding_check.get('gap_count', 0)}",
-                        ])
                     if source_resolution:
                         source_resolution_sample = next(
                             iter(source_resolution.values())
@@ -30165,11 +29989,9 @@ def main(argv: list[str]) -> int:
     log = logging.getLogger("uk-aq-history-integrity")
 
     log.info(
-        "start env=%s profile=%s source=%s dry_run=%s check_only=%s "
-        "run_backfill=%s timeseries_binding_backup_mode=%s",
+        "start env=%s profile=%s source=%s dry_run=%s check_only=%s run_backfill=%s",
         args.env, args.profile, args.source,
         args.dry_run, args.check_only, args.run_backfill,
-        args.timeseries_binding_backup_mode,
     )
     log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
     log.info("log_file=%s", log_path)
@@ -30247,15 +30069,6 @@ def main(argv: list[str]) -> int:
                 dedicated_sos_historical_replacement
             ),
             "dropbox_baseline": resolve_r2_history_root(os.environ),
-            "timeseries_binding_backup_mode": (
-                args.timeseries_binding_backup_mode
-            ),
-            "timeseries_binding_pack_root": (
-                args.timeseries_binding_pack_root
-                or resolve_r2_history_root(os.environ)
-                if args.timeseries_binding_backup_mode == "pack"
-                else None
-            ),
             "repair_mode": bool(args.run_backfill),
             "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
             "log_path": str(log_path),
@@ -30704,13 +30517,6 @@ def main(argv: list[str]) -> int:
         sc_metrics: dict[str, Any] = dict(empty_metrics)
         sos_metrics: dict[str, Any] = dict(empty_metrics)
         cross_check_metrics: dict[str, Any] = dict(empty_metrics)
-        sos_binding_verification: dict[str, Any] = {
-            "stage": "check_only_or_pre_repair",
-            "status": "not_run",
-            "reason": "source_not_sos_or_core_snapshot_not_ready",
-            "gap_count": 0,
-            "gaps": [],
-        }
         verified_first_value_at_connector_days: list[dict[str, Any]] = []
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
@@ -30958,44 +30764,6 @@ def main(argv: list[str]) -> int:
                 "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
                 "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
             }
-        if args.source == "sos" and snapshot_ok:
-            individual_binding_root = Path(
-                str(resolve_r2_history_root(os.environ) or "")
-            )
-            packed_binding_root = Path(
-                args.timeseries_binding_pack_root
-                or str(individual_binding_root)
-            )
-            sos_binding_verification = run_sos_timeseries_binding_verification(
-                conn=conn,
-                config=history_path_configs["v2"],
-                individual_root=individual_binding_root,
-                backup_mode=args.timeseries_binding_backup_mode,
-                pack_root=packed_binding_root,
-                stage="check_only" if effective_mode == "check_only" else "pre_repair",
-                log=log,
-            )
-            binding_gap_count = int(
-                sos_binding_verification.get("gap_count") or 0
-            )
-            cross_check_metrics["v2_timeseries_bindings"] = (
-                sos_binding_verification
-            )
-            cross_check_metrics["cross_checks_total"] = int(
-                cross_check_metrics.get("cross_checks_total") or 0
-            ) + int(sos_binding_verification.get("required_binding_count") or 0)
-            cross_check_metrics["cross_checks_ok"] = int(
-                cross_check_metrics.get("cross_checks_ok") or 0
-            ) + (
-                int(sos_binding_verification.get("required_binding_count") or 0)
-                if binding_gap_count == 0 else 0
-            )
-            cross_check_metrics["cross_checks_mismatch"] = int(
-                cross_check_metrics.get("cross_checks_mismatch") or 0
-            ) + binding_gap_count
-            cross_check_metrics["discrepancy_total"] = int(
-                cross_check_metrics.get("discrepancy_total") or 0
-            ) + binding_gap_count
         if cross_check_metrics.get("ran"):
             v2_backfill_metrics = run_v2_gap_backfills(
                 conn=conn,
@@ -31064,18 +30832,7 @@ def main(argv: list[str]) -> int:
                 result=current_state_plan,
             )
 
-        if (
-            mode_creates_repair_overlay(effective_mode)
-            and sos_binding_verification.get("status") == "fail"
-        ):
-            repair_flow = {
-                "status": "blocked_dependency",
-                "reason": "sos_timeseries_binding_semantic_verification_failed",
-                "r2_write_attempted": False,
-                "stage_order": list(CANONICAL_REPAIR_STAGE_ORDER),
-                "timeseries_binding": sos_binding_verification,
-            }
-        elif mode_creates_repair_overlay(effective_mode):
+        if mode_creates_repair_overlay(effective_mode):
             dropbox_root = resolve_r2_history_root({**os.environ, **env})
             if not dropbox_root:
                 raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is required for the v2 repair overlay")
@@ -31088,18 +30845,6 @@ def main(argv: list[str]) -> int:
             repair_overlay["effective_mode"] = effective_mode
             repair_overlay["dropbox_baseline"] = str(dropbox_root)
             repair_overlay["allow_stale_dropbox"] = bool(args.allow_stale_dropbox)
-            repair_overlay["timeseries_binding_backup_mode"] = (
-                args.timeseries_binding_backup_mode
-            )
-            repair_overlay["timeseries_binding_pack_root"] = (
-                args.timeseries_binding_pack_root
-                or str(dropbox_root)
-                if args.timeseries_binding_backup_mode == "pack"
-                else None
-            )
-            repair_overlay["timeseries_binding_pre_repair_verification"] = (
-                sos_binding_verification
-            )
             repair_overlay["observations_global_operation_lock"] = dict(
                 global_operation_lock
             )
@@ -31188,14 +30933,6 @@ def main(argv: list[str]) -> int:
                         dedicated_sos_historical_replacement
                     ),
                     protected_connector_ids=protected_connector_ids,
-                    timeseries_binding_backup_mode=(
-                        args.timeseries_binding_backup_mode
-                    ),
-                    timeseries_binding_pack_root=(
-                        Path(args.timeseries_binding_pack_root)
-                        if args.timeseries_binding_pack_root
-                        else Path(str(dropbox_root))
-                    ),
                 )
             aqi_stage = next(
                 (
@@ -31254,7 +30991,6 @@ def main(argv: list[str]) -> int:
             int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
             + int((cross_check_metrics.get("v2_aqilevels") or {}).get("gap_count", 0) or 0)
             + int(((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0 if ((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("required") else 0)
-            + int(sos_binding_verification.get("gap_count") or 0)
         )
         coordinator_failed = repair_flow.get("status") in {"failed", "blocked_dependency"}
         final_verification = repair_flow.get("final_verification") or {}
@@ -31744,14 +31480,9 @@ def main(argv: list[str]) -> int:
         v2_result: dict[str, Any] = {
             "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
             "checks_implemented": True,
-            "status": "fail" if (
-                v2_obs.get("status") == "fail"
-                or v2_aqi.get("status") == "fail"
-                or sos_binding_verification.get("status") == "fail"
-            ) else "ok",
+            "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
             "observations": v2_obs,
             "aqilevels": v2_aqi,
-            "timeseries_bindings": sos_binding_verification,
         }
         final_result = repair_flow.get("final_verification") or {}
         if args.run_backfill and not args.dry_run and final_result.get("ran"):
@@ -31763,10 +31494,6 @@ def main(argv: list[str]) -> int:
                 "final_verification": final_result,
                 "observations": recheck.get("observations") or v2_obs,
                 "aqilevels": recheck.get("aqilevels") or v2_aqi,
-                "timeseries_bindings": (
-                    final_result.get("timeseries_binding")
-                    or sos_binding_verification
-                ),
             })
         elif args.run_backfill and args.dry_run:
             v2_result["final_verified"] = False
@@ -31861,15 +31588,6 @@ def main(argv: list[str]) -> int:
                 dedicated_sos_historical_replacement
             ),
             "dropbox_baseline": resolve_r2_history_root(os.environ),
-            "timeseries_binding_backup_mode": (
-                args.timeseries_binding_backup_mode
-            ),
-            "timeseries_binding_pack_root": (
-                args.timeseries_binding_pack_root
-                or resolve_r2_history_root(os.environ)
-                if args.timeseries_binding_backup_mode == "pack"
-                else None
-            ),
             "repair_mode": args.run_backfill,
             "force_snapshot_import": args.force_snapshot_import,
             "skip_snapshot_import": args.skip_snapshot_import,
