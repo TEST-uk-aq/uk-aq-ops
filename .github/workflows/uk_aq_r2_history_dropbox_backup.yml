@@ -23,7 +23,7 @@ on:
       timeseries_binding_backup_mode:
         description: "Timeseries binding Dropbox backup representation"
         required: false
-        default: "individual"
+        default: "pack"
         type: choice
         options:
           - individual
@@ -70,7 +70,7 @@ jobs:
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
       INPUT_FORCE_PRUNE_RECHECK: ${{ github.event.inputs.force_prune_recheck || 'false' }}
-      INPUT_TIMESERIES_BINDING_BACKUP_MODE: ${{ github.event.inputs.timeseries_binding_backup_mode || 'individual' }}
+      INPUT_TIMESERIES_BINDING_BACKUP_MODE: ${{ github.event.inputs.timeseries_binding_backup_mode || 'pack' }}
 
     steps:
       - name: Checkout
@@ -208,7 +208,7 @@ jobs:
               ;;
           esac
 
-          selected_mode="${INPUT_TIMESERIES_BINDING_BACKUP_MODE:-individual}"
+          selected_mode="${INPUT_TIMESERIES_BINDING_BACKUP_MODE:-pack}"
           case "${selected_mode}" in
             individual|pack) ;;
             *)

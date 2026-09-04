@@ -66,6 +66,33 @@ test("backup workflow passes explicit observation index authority without fallba
   assert.doesNotMatch(workflow, /--latest-timeseries-key/);
 });
 
+test("backup workflow defaults timeseries binding transport to pack with rollback choice", () => {
+  const workflow = readFileSync(
+    path.join(REPO_ROOT, ".github/workflows/uk_aq_r2_history_dropbox_backup.yml"),
+    "utf8",
+  );
+  const inputStart = workflow.indexOf("      timeseries_binding_backup_mode:");
+  const inputEnd = workflow.indexOf("\n\npermissions:", inputStart);
+  assert.ok(inputStart >= 0 && inputEnd > inputStart, "binding mode input block must exist");
+  const inputBlock = workflow.slice(inputStart, inputEnd);
+
+  assert.match(inputBlock, /default: "pack"/);
+  assert.match(inputBlock, /options:\n\s+- individual\n\s+- pack/);
+  assert.match(
+    workflow,
+    /INPUT_TIMESERIES_BINDING_BACKUP_MODE: \$\{\{ github\.event\.inputs\.timeseries_binding_backup_mode \|\| 'pack' \}\}/,
+  );
+  assert.match(
+    workflow,
+    /selected_mode="\$\{INPUT_TIMESERIES_BINDING_BACKUP_MODE:-pack\}"/,
+  );
+  assert.match(
+    workflow,
+    /if \[ "\$\{selected_mode\}" = "pack" \]; then\s+cmd\+=\(--allow-experimental-pack-only\)/,
+  );
+  assert.doesNotMatch(workflow, /--timeseries-binding-packs-only/);
+});
+
 test("core inventory identity is deterministic and non-range based", () => {
   const shardA = buildCoreInventoryShard("history/v2/core", [
     {
