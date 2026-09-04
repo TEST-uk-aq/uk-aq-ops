@@ -9,13 +9,6 @@ import {
 import {
   resolveObservationsTimeseriesLatestPath,
 } from "./lib/hierarchical_backup_v2.mjs";
-import {
-  assertExperimentalPackOnlyDestination,
-  normalizeTimeseriesBindingBackupMode,
-} from "./lib/timeseries_binding_pack_inventory_v1.mjs";
-import {
-  DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
-} from "./lib/timeseries_binding_backup_pack_v1.mjs";
 
 function requireValue(argv, index, flag) {
   const value = argv[index + 1];
@@ -31,8 +24,6 @@ export function parseLockedHistoryBackupArgs(argv) {
     runsPrefix: null,
     corePrefix: null,
     timeseriesBindingPrefix: null,
-    timeseriesBindingBackupMode: "individual",
-    timeseriesBindingPackPrefix: DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
     historyIndexVersion: null,
     inventoryRootPrefix: null,
     stateRootPrefix: null,
@@ -43,19 +34,11 @@ export function parseLockedHistoryBackupArgs(argv) {
     backupReportOut: null,
     dryRun: false,
     forcePruneRecheck: false,
-    allowExperimentalPackOnly: false,
-    timeseriesBindingPacksOnly: false,
-    packPublisherReportOut: null,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--dry-run") args.dryRun = true;
     else if (flag === "--force-prune-recheck") args.forcePruneRecheck = true;
-    else if (flag === "--allow-experimental-pack-only") {
-      args.allowExperimentalPackOnly = true;
-    } else if (flag === "--timeseries-binding-packs-only") {
-      args.timeseriesBindingPacksOnly = true;
-    }
     else {
       const value = requireValue(argv, index, flag);
       index += 1;
@@ -65,11 +48,6 @@ export function parseLockedHistoryBackupArgs(argv) {
       else if (flag === "--runs-prefix") args.runsPrefix = value;
       else if (flag === "--core-prefix") args.corePrefix = value;
       else if (flag === "--timeseries-binding-prefix") args.timeseriesBindingPrefix = value;
-      else if (flag === "--timeseries-binding-backup-mode") {
-        args.timeseriesBindingBackupMode = normalizeTimeseriesBindingBackupMode(value);
-      } else if (flag === "--timeseries-binding-pack-prefix") {
-        args.timeseriesBindingPackPrefix = value;
-      }
       else if (flag === "--history-index-version") args.historyIndexVersion = value;
       else if (flag === "--inventory-root-prefix") args.inventoryRootPrefix = value;
       else if (flag === "--state-root-prefix") args.stateRootPrefix = value;
@@ -78,9 +56,6 @@ export function parseLockedHistoryBackupArgs(argv) {
       else if (flag === "--checkpoint-flush-seconds") args.checkpointFlushSeconds = value;
       else if (flag === "--inventory-report-out") args.inventoryReportOut = value;
       else if (flag === "--backup-report-out") args.backupReportOut = value;
-      else if (flag === "--pack-publisher-report-out") {
-        args.packPublisherReportOut = value;
-      }
       else throw new Error(`Unknown argument: ${flag}`);
     }
   }
@@ -107,17 +82,6 @@ export function parseLockedHistoryBackupArgs(argv) {
     if (!/^\d+$/.test(String(value))) throw new Error(`${flag} must be a non-negative integer`);
   }
   resolveObservationsTimeseriesLatestPath(args.historyIndexVersion);
-  assertExperimentalPackOnlyDestination({
-    mode: args.timeseriesBindingBackupMode,
-    destRoot: args.destRoot,
-    allowExperimentalPackOnly: args.allowExperimentalPackOnly,
-  });
-  if (
-    args.timeseriesBindingPacksOnly
-    && args.timeseriesBindingBackupMode !== "pack"
-  ) {
-    throw new Error("--timeseries-binding-packs-only requires pack backup mode");
-  }
   return Object.freeze(args);
 }
 
@@ -153,17 +117,6 @@ export function runLockedHistoryBackup({
     expectedOwner: "r2_history_dropbox_backup",
   });
   const node = process.execPath;
-  if (args.timeseriesBindingBackupMode !== "individual") {
-    runRequired(node, [
-      "scripts/backup_r2/publish_timeseries_binding_backup_packs.mjs",
-      "--binding-prefix", args.timeseriesBindingPrefix,
-      "--pack-prefix", args.timeseriesBindingPackPrefix,
-      ...(args.packPublisherReportOut
-        ? ["--report-out", args.packPublisherReportOut]
-        : []),
-      args.dryRun ? "--dry-run" : "--write-r2",
-    ], { env, run });
-  }
   runRequired(node, [
     "scripts/backup_r2/build_backup_inventory.mjs",
     "--source-root", args.sourceRoot,
@@ -171,8 +124,6 @@ export function runLockedHistoryBackup({
     "--runs-prefix", args.runsPrefix,
     "--core-prefix", args.corePrefix,
     "--timeseries-binding-prefix", args.timeseriesBindingPrefix,
-    "--timeseries-binding-backup-mode", args.timeseriesBindingBackupMode,
-    "--timeseries-binding-pack-prefix", args.timeseriesBindingPackPrefix,
     "--history-index-version", args.historyIndexVersion,
     "--inventory-root-prefix", args.inventoryRootPrefix,
     "--report-out", args.inventoryReportOut,
@@ -183,15 +134,12 @@ export function runLockedHistoryBackup({
     "--dest-root", args.destRoot,
     "--inventory-root-prefix", args.inventoryRootPrefix,
     "--state-root-prefix", args.stateRootPrefix,
-    "--timeseries-binding-backup-mode", args.timeseriesBindingBackupMode,
     "--max-days-per-run", args.maxDaysPerRun,
     "--checkpoint-batch-units", args.checkpointBatchUnits,
     "--checkpoint-flush-seconds", args.checkpointFlushSeconds,
     "--report-out", args.backupReportOut,
     ...(args.dryRun ? ["--dry-run"] : []),
     ...(args.forcePruneRecheck ? ["--force-prune-recheck"] : []),
-    ...(args.allowExperimentalPackOnly ? ["--allow-experimental-pack-only"] : []),
-    ...(args.timeseriesBindingPacksOnly ? ["--timeseries-binding-packs-only"] : []),
   ], { env, run });
   return {
     ok: true,

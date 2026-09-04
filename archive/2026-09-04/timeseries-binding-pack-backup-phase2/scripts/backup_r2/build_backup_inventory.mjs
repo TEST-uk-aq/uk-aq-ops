@@ -24,7 +24,6 @@ import {
   validateLatestTimeseriesInventoryUnit,
   validateHierarchicalInventoryRoot,
   validateObservationRunManifestInventoryShard,
-  validateTimeseriesBindingPackInventoryReference,
 } from "./lib/hierarchical_backup_v2.mjs";
 import {
   buildTimeseriesBindingInventory,
@@ -32,13 +31,6 @@ import {
 import {
   buildCoreInventory,
 } from "./lib/hierarchical_core_backup_v2.mjs";
-import {
-  buildTimeseriesBindingPackInventory,
-  normalizeTimeseriesBindingBackupMode,
-} from "./lib/timeseries_binding_pack_inventory_v1.mjs";
-import {
-  DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX as BUILTIN_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
-} from "./lib/timeseries_binding_backup_pack_v1.mjs";
 import {
   OBSERVATIONS_AGGREGATE_MANIFEST_KINDS,
   validateR2HistoryV2ObservationsAggregateManifest,
@@ -72,10 +64,6 @@ const DEFAULT_INVENTORY_ROOT_PREFIX = normalizePrefix(
 const DEFAULT_REPORT_OUT = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_REPORT_OUT || "",
 ).trim();
-const DEFAULT_TIMESERIES_BINDING_BACKUP_MODE = "individual";
-const DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX = normalizePrefix(
-  BUILTIN_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
-);
 
 function usage() {
   console.log([
@@ -91,8 +79,6 @@ function usage() {
     `  --runs-prefix <p>            Default: ${DEFAULT_RUNS_PREFIX}`,
     `  --core-prefix <p>            Default: ${DEFAULT_CORE_PREFIX}`,
     `  --timeseries-binding-prefix <p> Default: ${DEFAULT_TIMESERIES_BINDING_PREFIX}`,
-    `  --timeseries-binding-backup-mode <individual|dual|pack> Default: ${DEFAULT_TIMESERIES_BINDING_BACKUP_MODE}`,
-    `  --timeseries-binding-pack-prefix <p> Default: ${DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX}`,
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
     "  --history-index-version <v2|v3> Required observation-history authority",
     `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
@@ -110,8 +96,6 @@ function parseArgs(argv) {
     runs_prefix: DEFAULT_RUNS_PREFIX,
     core_prefix: DEFAULT_CORE_PREFIX,
     timeseries_binding_prefix: DEFAULT_TIMESERIES_BINDING_PREFIX,
-    timeseries_binding_backup_mode: DEFAULT_TIMESERIES_BINDING_BACKUP_MODE,
-    timeseries_binding_pack_prefix: DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
     inventory_root_prefix: DEFAULT_INVENTORY_ROOT_PREFIX,
     history_index_version: "",
     latest_timeseries_key: "",
@@ -130,10 +114,6 @@ function parseArgs(argv) {
     else if (arg === "--core-prefix") args.core_prefix = normalizePrefix(next());
     else if (arg === "--timeseries-binding-prefix") {
       args.timeseries_binding_prefix = normalizePrefix(next());
-    } else if (arg === "--timeseries-binding-backup-mode") {
-      args.timeseries_binding_backup_mode = normalizeTimeseriesBindingBackupMode(nextExact());
-    } else if (arg === "--timeseries-binding-pack-prefix") {
-      args.timeseries_binding_pack_prefix = normalizePrefix(next());
     } else if (arg === "--inventory-root-prefix") {
       args.inventory_root_prefix = normalizePrefix(next());
     } else if (arg === "--history-index-version") {
@@ -152,9 +132,6 @@ function parseArgs(argv) {
   if (!args.core_prefix) throw new Error("--core-prefix is required");
   if (!args.timeseries_binding_prefix) {
     throw new Error("--timeseries-binding-prefix is required");
-  }
-  if (!args.timeseries_binding_pack_prefix) {
-    throw new Error("--timeseries-binding-pack-prefix is required");
   }
   if (!args.inventory_root_prefix) throw new Error("--inventory-root-prefix is required");
   args.latest_timeseries_key = resolveObservationsTimeseriesLatestPath(
@@ -326,11 +303,7 @@ async function main() {
   const previousRoot = previousRaw
     ? validateHierarchicalInventoryRoot(
       previousRaw.parsed,
-      {
-        requireLatestTimeseries: false,
-        validateTimeseriesBindingPacks:
-          args.timeseries_binding_backup_mode !== "individual",
-      },
+      { requireLatestTimeseries: false },
     )
     : null;
 
@@ -526,34 +499,6 @@ async function main() {
     dryRun: args.dry_run,
   });
 
-  let bindingPackInventory = null;
-  let bindingPackInventoryError = null;
-  try {
-    let previousBindingPackReference = previousRoot?.timeseries_binding_packs || null;
-    if (
-      previousBindingPackReference
-      && args.timeseries_binding_backup_mode === "individual"
-    ) {
-      try {
-        validateTimeseriesBindingPackInventoryReference(
-          previousBindingPackReference,
-        );
-      } catch {
-        previousBindingPackReference = null;
-      }
-    }
-    bindingPackInventory = buildTimeseriesBindingPackInventory({
-      rcloneBin: args.rclone_bin,
-      sourceRoot: args.source_root,
-      sourcePrefix: args.timeseries_binding_prefix,
-      packPrefix: args.timeseries_binding_pack_prefix,
-      previousRootReference: previousBindingPackReference,
-    });
-  } catch (error) {
-    bindingPackInventoryError = error instanceof Error ? error.message : String(error);
-    if (args.timeseries_binding_backup_mode !== "individual") throw error;
-  }
-
   const root = buildHierarchicalInventoryRoot({
     observationsRootManifestKey: observationsRootKey,
     observationsRootHash: sourceRoot.content_hash,
@@ -564,9 +509,6 @@ async function main() {
     latestTimeseries,
   });
   root.timeseries_binding = bindingInventory.root_reference;
-  if (bindingPackInventory) {
-    root.timeseries_binding_packs = bindingPackInventory.root_reference;
-  }
   root.core = coreInventory.root_reference;
   const rootWrite = writeRemoteJson(
     args.rclone_bin,
@@ -593,7 +535,6 @@ async function main() {
     inventory_root_changed: rootWrite.changed,
     inventory_root_written: rootWrite.written,
     dry_run: args.dry_run,
-    timeseries_binding_backup_mode: args.timeseries_binding_backup_mode,
     first_build: previousRoot === null,
     years_total: years.length,
     years_inspected: yearsInspected,
@@ -607,11 +548,6 @@ async function main() {
     full_scan_day_count: fullScanDays?.size ?? null,
     full_scan_hierarchy_agreed: args.full_scan ? true : null,
     timeseries_binding: bindingInventory.report,
-    timeseries_binding_packs: bindingPackInventory?.report || {
-      available: false,
-      required: args.timeseries_binding_backup_mode !== "individual",
-      error: bindingPackInventoryError,
-    },
     core: coreInventory.report,
     run_manifests: {
       listed: runScan.listed,

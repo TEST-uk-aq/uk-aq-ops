@@ -14,8 +14,6 @@ export const OBSERVATION_RUN_MANIFEST_INVENTORY_KIND =
   "uk_aq_r2_history_backup_inventory_observation_run_manifests";
 export const OBSERVATION_RUN_MANIFEST_STATE_KIND =
   "uk_aq_r2_history_backup_state_observation_run_manifests";
-export const TIMESERIES_BINDING_PACK_INVENTORY_KIND =
-  "uk_aq_r2_history_backup_inventory_timeseries_binding_packs";
 export const OBSERVATIONS_TIMESERIES_LATEST_PATHS = Object.freeze({
   v2: "history/_index_v2/observations_timeseries_latest.json",
   v3: "history/_index_v3/observations_timeseries_latest.json",
@@ -38,7 +36,6 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const ISO_DAY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 const YEAR_PATTERN = /^\d{4}$/;
 const MONTH_PATTERN = /^(0[1-9]|1[0-2])$/;
-const TIMESERIES_BINDING_PACK_RANGE_SIZE = 1_000;
 
 export function sha256Hex(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -323,142 +320,9 @@ export function validateLatestTimeseriesInventoryUnit(raw) {
   };
 }
 
-export function validateTimeseriesBindingPackInventoryReference(raw) {
-  if (raw === undefined || raw === null) return null;
-  const value = assertObject(raw, "timeseries binding pack inventory reference");
-  if (
-    Number(value.schema_version) !== HIERARCHICAL_INVENTORY_SCHEMA_VERSION
-    || value.kind !== TIMESERIES_BINDING_PACK_INVENTORY_KIND
-    || value.backup_pack_version !== "v1"
-    || Number(value.range_size) !== TIMESERIES_BINDING_PACK_RANGE_SIZE
-  ) {
-    throw new Error("Timeseries binding pack inventory reference identity mismatch");
-  }
-  const sourcePrefix = normalizeRelativePath(
-    value.source_prefix,
-    "timeseries binding pack inventory source prefix",
-  );
-  const sourceRootKey = normalizeRelativePath(
-    value.source_root_key,
-    "timeseries binding pack inventory source root key",
-  );
-  if (sourceRootKey !== `${sourcePrefix}/_manifests/root.json`) {
-    throw new Error("Timeseries binding pack inventory source root key mismatch");
-  }
-  const ranges = Array.isArray(value.ranges)
-    ? value.ranges.map((entry) => {
-      const rangeStart = Number(entry?.range_start);
-      const rangeEnd = Number(entry?.range_end);
-      if (
-        !Number.isSafeInteger(rangeStart)
-        || rangeStart < 0
-        || rangeStart % TIMESERIES_BINDING_PACK_RANGE_SIZE !== 0
-        || rangeEnd !== rangeStart + TIMESERIES_BINDING_PACK_RANGE_SIZE - 1
-      ) {
-        throw new Error(
-          `Invalid timeseries binding pack inventory range ${rangeStart}-${rangeEnd}`,
-        );
-      }
-      const packSize = Number(entry?.pack_size);
-      const memberCount = Number(entry?.member_count);
-      if (!Number.isSafeInteger(packSize) || packSize <= 0) {
-        throw new Error("Timeseries binding pack inventory pack_size is invalid");
-      }
-      if (!Number.isSafeInteger(memberCount) || memberCount <= 0) {
-        throw new Error("Timeseries binding pack inventory member_count is invalid");
-      }
-      return {
-        range_start: rangeStart,
-        range_end: rangeEnd,
-        source_range_hash: assertSha256(
-          entry.source_range_hash,
-          "timeseries binding pack inventory source_range_hash",
-        ),
-        pack_relative_path: normalizeRelativePath(entry.pack_relative_path),
-        pack_sha256: assertSha256(
-          entry.pack_sha256,
-          "timeseries binding pack inventory pack_sha256",
-        ),
-        pack_size: packSize,
-        member_count: memberCount,
-      };
-    }).sort((left, right) => left.range_start - right.range_start)
-    : null;
-  if (!ranges) {
-    throw new Error("Timeseries binding pack inventory ranges must be an array");
-  }
-  const seen = new Set();
-  for (const range of ranges) {
-    if (seen.has(range.range_start)) {
-      throw new Error(
-        `Duplicate timeseries binding pack inventory range ${range.range_start}`,
-      );
-    }
-    seen.add(range.range_start);
-  }
-  const rangeCount = Number(value.range_count);
-  const memberCount = Number(value.member_count);
-  const packRootSize = Number(value.pack_root_size);
-  if (!Number.isSafeInteger(rangeCount) || rangeCount !== ranges.length) {
-    throw new Error("Timeseries binding pack inventory range_count mismatch");
-  }
-  if (
-    !Number.isSafeInteger(memberCount)
-    || memberCount !== ranges.reduce((sum, range) => sum + range.member_count, 0)
-  ) {
-    throw new Error("Timeseries binding pack inventory member_count mismatch");
-  }
-  if (!Number.isSafeInteger(packRootSize) || packRootSize <= 0) {
-    throw new Error("Timeseries binding pack inventory pack_root_size is invalid");
-  }
-  const packRootRelativePath = normalizeRelativePath(
-    value.pack_root_relative_path,
-    "timeseries binding pack inventory root path",
-  );
-  if (!packRootRelativePath.endsWith("/root.json")) {
-    throw new Error("Timeseries binding pack inventory root path mismatch");
-  }
-  const packPrefix = packRootRelativePath.slice(0, -"/root.json".length);
-  for (const range of ranges) {
-    const expectedPackPath = `${packPrefix}/range=`
-      + `${String(range.range_start).padStart(6, "0")}-`
-      + `${String(range.range_end).padStart(6, "0")}/`
-      + `${range.source_range_hash}.pack.json`;
-    if (range.pack_relative_path !== expectedPackPath) {
-      throw new Error(
-        `Timeseries binding pack inventory path mismatch: ${range.pack_relative_path}`,
-      );
-    }
-  }
-  return {
-    schema_version: HIERARCHICAL_INVENTORY_SCHEMA_VERSION,
-    kind: TIMESERIES_BINDING_PACK_INVENTORY_KIND,
-    backup_pack_version: "v1",
-    range_size: TIMESERIES_BINDING_PACK_RANGE_SIZE,
-    source_prefix: sourcePrefix,
-    source_root_key: sourceRootKey,
-    source_root_hash: assertSha256(
-      value.source_root_hash,
-      "timeseries binding pack inventory source_root_hash",
-    ),
-    pack_root_relative_path: packRootRelativePath,
-    pack_root_sha256: assertSha256(
-      value.pack_root_sha256,
-      "timeseries binding pack inventory root SHA-256",
-    ),
-    pack_root_size: packRootSize,
-    range_count: rangeCount,
-    member_count: memberCount,
-    ranges,
-  };
-}
-
 export function validateHierarchicalInventoryRoot(
   root,
-  {
-    requireLatestTimeseries = true,
-    validateTimeseriesBindingPacks = true,
-  } = {},
+  { requireLatestTimeseries = true } = {},
 ) {
   const value = assertObject(root, "hierarchical inventory root");
   if (Number(value.schema_version) !== HIERARCHICAL_INVENTORY_SCHEMA_VERSION) {
@@ -531,15 +395,6 @@ export function validateHierarchicalInventoryRoot(
       years,
     },
     global_units: globalUnits,
-    ...(value.timeseries_binding_packs === undefined
-      || !validateTimeseriesBindingPacks
-      ? {}
-      : {
-        timeseries_binding_packs:
-          validateTimeseriesBindingPackInventoryReference(
-            value.timeseries_binding_packs,
-          ),
-      }),
   };
 }
 
