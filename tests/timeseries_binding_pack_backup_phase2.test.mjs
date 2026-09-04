@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildHierarchicalInventoryRoot,
   emptyHierarchicalStateRoot,
+  resolveObservationsTimeseriesLatestPath,
   sha256Hex,
   stableJson,
   validateHierarchicalInventoryRoot,
@@ -118,8 +119,9 @@ function makeHarness({ inventoryRoot, stateRoot = emptyHierarchicalStateRoot() }
   const inventory = inventoryRoot.timeseries_binding_packs;
   const stateFiles = new Map();
   const copies = [];
+  const identityReads = [];
   const writes = [];
-  let destinationRoot = { exists: false, sha256: null, size: null, verified: false };
+  const destinationIdentities = new Map();
   const identityForPath = (relativePath) => {
     if (relativePath === inventory.pack_root_relative_path) {
       return {
@@ -137,9 +139,17 @@ function makeHarness({ inventoryRoot, stateRoot = emptyHierarchicalStateRoot() }
     stateRoot,
     stateFiles,
     copies,
+    destinationIdentities,
+    identityReads,
     writes,
     setDestinationRoot(value) {
-      destinationRoot = value;
+      destinationIdentities.set(inventory.pack_root_relative_path, value);
+    },
+    setDestinationIdentity(relativePath, value) {
+      destinationIdentities.set(relativePath, value);
+    },
+    deleteDestinationIdentity(relativePath) {
+      destinationIdentities.delete(relativePath);
     },
     run({ dryRun = false, copyOverride = null } = {}) {
       return syncTimeseriesBindingPacksToDropbox({
@@ -157,10 +167,25 @@ function makeHarness({ inventoryRoot, stateRoot = emptyHierarchicalStateRoot() }
         },
         copyAndVerifyFile: (relativePath) => {
           copies.push(relativePath);
-          if (copyOverride) return copyOverride(relativePath, identityForPath(relativePath));
-          return { ...identityForPath(relativePath), verified: !dryRun, dry_run: dryRun };
+          const sourceIdentity = identityForPath(relativePath);
+          const result = copyOverride
+            ? copyOverride(relativePath, sourceIdentity)
+            : { ...sourceIdentity, verified: !dryRun, dry_run: dryRun };
+          if (!dryRun && result.verified) {
+            destinationIdentities.set(relativePath, {
+              exists: true,
+              sha256: sourceIdentity.source_hash,
+              size: sourceIdentity.source_size,
+              verified: true,
+            });
+          }
+          return result;
         },
-        readDestinationFileIdentity: () => destinationRoot,
+        readDestinationFileIdentity: (relativePath) => {
+          identityReads.push(relativePath);
+          return destinationIdentities.get(relativePath)
+            || { exists: false, sha256: null, size: null, verified: false };
+        },
       });
     },
   };
@@ -225,7 +250,7 @@ function lockEnv() {
   };
 }
 
-function lockedArgs(extra = []) {
+function lockedArgs(extra = [], historyIndexVersion = "v2") {
   return parseLockedHistoryBackupArgs([
     "--source-root", "uk_aq_r2:uk-aq-history-cic-test",
     "--dest-root", "uk_aq_dropbox:TEST/R2_history_backup",
@@ -233,7 +258,7 @@ function lockedArgs(extra = []) {
     "--runs-prefix", "history/v2/_ops/observations/runs",
     "--core-prefix", "history/v2/core",
     "--timeseries-binding-prefix", BINDING_PREFIX,
-    "--history-index-version", "v2",
+    "--history-index-version", historyIndexVersion,
     "--inventory-root-prefix", "history/_index_v2/backup_inventory_v2",
     "--state-root-prefix", STATE_PREFIX,
     "--inventory-report-out", "tmp/inventory.json",
@@ -365,32 +390,168 @@ test("unchanged pack sync checks destination root identity and performs zero chi
   const harness = makeHarness(fixture);
   harness.run();
   harness.copies.length = 0;
+  harness.identityReads.length = 0;
   harness.writes.length = 0;
-  harness.setDestinationRoot({
-    exists: true,
-    sha256: fixture.reference.pack_root_sha256,
-    size: fixture.reference.pack_root_size,
-    verified: true,
-  });
   const result = harness.run();
   assert.equal(result.report.packs_skipped, 2);
   assert.equal(result.report.pack_root.skipped, true);
   assert.equal(result.report.complete, true);
   assert.deepEqual(harness.copies, []);
+  assert.deepEqual(harness.identityReads, [fixture.reference.pack_root_relative_path]);
+  assert.equal(result.report.packs_destination_identity_checks, 0);
   assert.deepEqual(harness.writes, []);
 });
 
-test("a missing destination root is repaired root-only from complete pack checkpoints", () => {
+test("a missing destination root checks every healthy child before repairing root last", () => {
   const fixture = makePackInventory();
   const harness = makeHarness(fixture);
   harness.run();
   harness.copies.length = 0;
+  harness.identityReads.length = 0;
+  harness.deleteDestinationIdentity(fixture.reference.pack_root_relative_path);
   const result = harness.run();
   assert.deepEqual(harness.copies, [fixture.reference.pack_root_relative_path]);
+  assert.deepEqual(harness.identityReads, [
+    fixture.reference.pack_root_relative_path,
+    ...fixture.reference.ranges.map((range) => range.pack_relative_path),
+  ]);
   assert.equal(result.report.packs_candidates, 0);
+  assert.equal(result.report.packs_destination_identity_checks, 2);
+  assert.equal(result.report.packs_destination_identity_matches, 2);
   assert.equal(result.report.pack_root.destination_missing_before_copy, true);
   assert.equal(result.report.pack_root.destination_missing, false);
   assert.equal(result.report.pack_root.copied, true);
+});
+
+test("a missing root and child checks every child, repairs only that child, then root", () => {
+  const fixture = makePackInventory();
+  const harness = makeHarness(fixture);
+  harness.run();
+  harness.copies.length = 0;
+  harness.identityReads.length = 0;
+  const missingChild = fixture.reference.ranges[0];
+  harness.deleteDestinationIdentity(fixture.reference.pack_root_relative_path);
+  harness.deleteDestinationIdentity(missingChild.pack_relative_path);
+  const result = harness.run();
+  assert.deepEqual(harness.identityReads, [
+    fixture.reference.pack_root_relative_path,
+    ...fixture.reference.ranges.map((range) => range.pack_relative_path),
+  ]);
+  assert.deepEqual(harness.copies, [
+    missingChild.pack_relative_path,
+    fixture.reference.pack_root_relative_path,
+  ]);
+  assert.deepEqual(harness.destinationIdentities.get(missingChild.pack_relative_path), {
+    exists: true,
+    sha256: missingChild.pack_sha256,
+    size: missingChild.pack_size,
+    verified: true,
+  });
+  assert.equal(result.report.packs_destination_identity_checks, 2);
+  assert.equal(result.report.packs_destination_identity_mismatches, 1);
+  assert.equal(result.report.packs_copied, 1);
+  assert.equal(result.report.complete, true);
+});
+
+test("a wrong root and corrupt child repairs only that child before root", () => {
+  const fixture = makePackInventory();
+  const harness = makeHarness(fixture);
+  harness.run();
+  harness.copies.length = 0;
+  harness.identityReads.length = 0;
+  const corruptChild = fixture.reference.ranges[1];
+  harness.setDestinationRoot({ exists: true, sha256: h("e"), size: 7, verified: true });
+  harness.setDestinationIdentity(corruptChild.pack_relative_path, {
+    exists: true,
+    sha256: h("f"),
+    size: corruptChild.pack_size,
+    verified: true,
+  });
+  const result = harness.run();
+  assert.deepEqual(harness.identityReads, [
+    fixture.reference.pack_root_relative_path,
+    ...fixture.reference.ranges.map((range) => range.pack_relative_path),
+  ]);
+  assert.deepEqual(harness.copies, [
+    corruptChild.pack_relative_path,
+    fixture.reference.pack_root_relative_path,
+  ]);
+  assert.deepEqual(harness.destinationIdentities.get(corruptChild.pack_relative_path), {
+    exists: true,
+    sha256: corruptChild.pack_sha256,
+    size: corruptChild.pack_size,
+    verified: true,
+  });
+  assert.equal(result.report.packs_destination_identity_matches, 1);
+  assert.equal(result.report.packs_destination_identity_mismatches, 1);
+  assert.equal(result.report.complete, true);
+});
+
+test("a failed child repair prevents root copy and completion", () => {
+  const fixture = makePackInventory();
+  const harness = makeHarness(fixture);
+  harness.run();
+  harness.copies.length = 0;
+  harness.identityReads.length = 0;
+  const missingChild = fixture.reference.ranges[0];
+  harness.deleteDestinationIdentity(fixture.reference.pack_root_relative_path);
+  harness.deleteDestinationIdentity(missingChild.pack_relative_path);
+  assert.throws(
+    () => harness.run({ copyOverride: (relativePath, identity) => {
+      if (relativePath === missingChild.pack_relative_path) {
+        throw new Error("injected repair failure");
+      }
+      return { ...identity, verified: true };
+    } }),
+    /injected repair failure/,
+  );
+  assert.deepEqual(harness.copies, [missingChild.pack_relative_path]);
+  assert.equal(harness.copies.includes(fixture.reference.pack_root_relative_path), false);
+  assert.equal(harness.stateRoot.timeseries_binding_packs.verified, false);
+  assert.equal(harness.stateRoot.timeseries_binding_packs.processed_source_root_hash, null);
+});
+
+test("repair trusts destination evidence rather than a complete child checkpoint", () => {
+  const fixture = makePackInventory();
+  const harness = makeHarness(fixture);
+  harness.run();
+  harness.copies.length = 0;
+  const missingChild = fixture.reference.ranges[1];
+  harness.deleteDestinationIdentity(fixture.reference.pack_root_relative_path);
+  harness.deleteDestinationIdentity(missingChild.pack_relative_path);
+  assert.ok(harness.stateRoot.timeseries_binding_packs.ranges.some(
+    (range) => range.pack_relative_path === missingChild.pack_relative_path,
+  ));
+  const result = harness.run();
+  assert.deepEqual(harness.copies, [
+    missingChild.pack_relative_path,
+    fixture.reference.pack_root_relative_path,
+  ]);
+  assert.equal(result.report.packs_copied, 1);
+  assert.equal(result.report.complete, true);
+});
+
+test("a wrong root with all healthy children checks all children and recopies only root", () => {
+  const fixture = makePackInventory();
+  const harness = makeHarness(fixture);
+  harness.run();
+  harness.copies.length = 0;
+  harness.identityReads.length = 0;
+  harness.setDestinationRoot({
+    exists: true,
+    sha256: h("d"),
+    size: fixture.reference.pack_root_size,
+    verified: true,
+  });
+  const result = harness.run();
+  assert.deepEqual(harness.identityReads, [
+    fixture.reference.pack_root_relative_path,
+    ...fixture.reference.ranges.map((range) => range.pack_relative_path),
+  ]);
+  assert.deepEqual(harness.copies, [fixture.reference.pack_root_relative_path]);
+  assert.equal(result.report.packs_destination_identity_checks, 2);
+  assert.equal(result.report.packs_destination_identity_matches, 2);
+  assert.equal(result.report.complete, true);
 });
 
 test("one changed range transfers one immutable pack plus root and retains unchanged pack state", () => {
@@ -414,6 +575,9 @@ test("one changed range transfers one immutable pack plus root and retains uncha
   changed.timeseries_binding_packs.pack_root_size += 1;
   const second = makeHarness({ inventoryRoot: changed, stateRoot });
   for (const [key, value] of first.stateFiles) second.stateFiles.set(key, value);
+  for (const [key, value] of first.destinationIdentities) {
+    second.destinationIdentities.set(key, value);
+  }
   const result = second.run();
   assert.deepEqual(second.copies, [
     range.pack_relative_path,
@@ -568,4 +732,31 @@ test("locked wrapper keeps individual at two children and orders dual publisher 
   assert.equal(dualCalls[0].includes("--dry-run"), true);
   assert.equal(dualCalls[1].includes("--dry-run"), false);
   assert.equal(dualCalls[2].includes("--dry-run"), true);
+});
+
+test("locked wrapper forwards v2 and v3 unchanged and the resolver returns exact paths", () => {
+  for (const [historyIndexVersion, expectedPath] of [
+    ["v2", "history/_index_v2/observations_timeseries_latest.json"],
+    ["v3", "history/_index_v3/observations_timeseries_latest.json"],
+  ]) {
+    const calls = [];
+    runLockedHistoryBackup({
+      args: lockedArgs([], historyIndexVersion),
+      env: lockEnv(),
+      run: (_command, commandArgs) => {
+        calls.push(commandArgs);
+        return { status: 0, signal: null, error: null };
+      },
+    });
+    const inventoryArgs = calls.find(
+      (commandArgs) => /build_backup_inventory\.mjs$/.test(commandArgs[0]),
+    );
+    assert.ok(inventoryArgs);
+    const versionFlagIndex = inventoryArgs.indexOf("--history-index-version");
+    assert.equal(inventoryArgs[versionFlagIndex + 1], historyIndexVersion);
+    assert.equal(
+      resolveObservationsTimeseriesLatestPath(historyIndexVersion),
+      expectedPath,
+    );
+  }
 });

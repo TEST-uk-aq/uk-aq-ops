@@ -280,11 +280,11 @@ function rootCompletionMatches(rootState, inventory) {
     && rootState.pack_root_size === inventory.pack_root_size;
 }
 
-function destinationIdentityMatches(identity, expectedSha256, expectedSize) {
+function destinationIdentityMatches(identity, inventory) {
   return identity?.exists === true
     && identity.verified === true
-    && identity.sha256 === expectedSha256
-    && identity.size === expectedSize;
+    && identity.sha256 === inventory.pack_root_sha256
+    && identity.size === inventory.pack_root_size;
 }
 
 export function syncTimeseriesBindingPacksToDropbox({
@@ -317,8 +317,7 @@ export function syncTimeseriesBindingPacksToDropbox({
   );
   const destinationRootMatches = destinationIdentityMatches(
     destinationRootIdentity,
-    inventory.pack_root_sha256,
-    inventory.pack_root_size,
+    inventory,
   );
   const report = {
     mode: "pack",
@@ -332,9 +331,6 @@ export function syncTimeseriesBindingPacksToDropbox({
     packs_candidates: 0,
     packs_copied: 0,
     packs_dry_run: 0,
-    packs_destination_identity_checks: 0,
-    packs_destination_identity_matches: 0,
-    packs_destination_identity_mismatches: 0,
     bytes_candidates: 0,
     bytes_copied: 0,
     state_shards_written: 0,
@@ -371,49 +367,26 @@ export function syncTimeseriesBindingPacksToDropbox({
       reference.range_start,
       reference.range_end,
     );
-    let checkpointComplete = rootRangeComplete(
-      rootState,
-      reference,
-      stateRootPrefix,
-    );
-    if (!checkpointComplete) {
-      const existing = readStateJsonMaybe(stateShardKey);
-      const rangeState = validateTimeseriesBindingPackRangeState(
-        existing?.parsed || null,
-        reference.range_start,
-        reference.range_end,
-      );
-      if (rangeStateComplete(rangeState, reference)) {
-        upsertRootRange(
-          rootState,
-          reference,
-          stateShardKey,
-          sha256Hex(existing.text),
-        );
-        stateRootDirty = true;
-        checkpointComplete = true;
-      }
+    if (rootRangeComplete(rootState, reference, stateRootPrefix)) {
+      report.packs_skipped += 1;
+      continue;
     }
-    if (checkpointComplete) {
-      if (!destinationRootMatches) {
-        report.packs_destination_identity_checks += 1;
-        const destinationPackIdentity = readDestinationFileIdentity(
-          reference.pack_relative_path,
-        );
-        if (destinationIdentityMatches(
-          destinationPackIdentity,
-          reference.pack_sha256,
-          reference.pack_size,
-        )) {
-          report.packs_destination_identity_matches += 1;
-          report.packs_skipped += 1;
-          continue;
-        }
-        report.packs_destination_identity_mismatches += 1;
-      } else {
-        report.packs_skipped += 1;
-        continue;
-      }
+    const existing = readStateJsonMaybe(stateShardKey);
+    const rangeState = validateTimeseriesBindingPackRangeState(
+      existing?.parsed || null,
+      reference.range_start,
+      reference.range_end,
+    );
+    if (rangeStateComplete(rangeState, reference)) {
+      upsertRootRange(
+        rootState,
+        reference,
+        stateShardKey,
+        sha256Hex(existing.text),
+      );
+      report.packs_skipped += 1;
+      stateRootDirty = true;
+      continue;
     }
 
     report.packs_candidates += 1;
