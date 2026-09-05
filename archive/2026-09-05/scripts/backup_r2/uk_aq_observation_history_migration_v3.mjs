@@ -97,8 +97,6 @@ function usage() {
     "  --checkpoint-out <path>  Required for migrate; atomically updated after each object",
     "  --v2-runtime-rollback-record <path>  Required for rollback authority restoration",
     "",
-    "  --publication-concurrency <1..16>  Concurrent v3 publications (default: 1)",
-    "",
     "Resume/verify:",
     "  --checkpoint-in <path>   Prior checkpoint; required for verify/rollback and migrate resume",
     "",
@@ -111,13 +109,6 @@ function requireValue(argv, index, flag) {
   const value = argv[index + 1];
   if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
   return value;
-}
-
-export function parsePublicationConcurrency(value) {
-  if (!/^(?:[1-9]|1[0-6])$/.test(String(value))) {
-    throw new Error("--publication-concurrency must be an integer from 1 to 16");
-  }
-  return Number(value);
 }
 
 export function parseObservationHistoryMigrationArgs(argv) {
@@ -139,7 +130,6 @@ export function parseObservationHistoryMigrationArgs(argv) {
     checkpointIn: null,
     checkpointOut: null,
     expectedPlanSha256: null,
-    publicationConcurrency: 1,
     help: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -162,9 +152,6 @@ export function parseObservationHistoryMigrationArgs(argv) {
     } else if (flag === "--report-out") args.reportOut = requireValue(argv, index++, flag);
     else if (flag === "--v2-runtime-rollback-record") {
       args.v2RuntimeRollbackRecord = requireValue(argv, index++, flag);
-    }
-    else if (flag === "--publication-concurrency") {
-      args.publicationConcurrency = parsePublicationConcurrency(requireValue(argv, index++, flag));
     }
     else if (flag === "--checkpoint-in") args.checkpointIn = requireValue(argv, index++, flag);
     else if (flag === "--checkpoint-out") args.checkpointOut = requireValue(argv, index++, flag);
@@ -1278,138 +1265,6 @@ function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, env }) {
   });
 }
 
-// Keep the pinned finaliser's private schedule validator as the authority. Its
-// first adapter call is after validation; stop there without performing any I/O.
-// This avoids duplicating its hash encoding or rebuilding/replacing the plan.
-async function validateMigrationPublicationSchedule(plan) {
-  const validated = new Error("V3 publication schedule validated");
-  try {
-    await finalizeObservationHistoryIndexV3Publication({
-      plan,
-      putIfChanged: async () => { throw validated; },
-      getObject: async () => { throw new Error("Unexpected validation GET"); },
-      recordDurableEvidence: async () => { throw new Error("Unexpected validation evidence"); },
-    });
-  } catch (error) {
-    if (error === validated) return;
-    throw error;
-  }
-  throw new Error("V3 publication validation did not reach the publication boundary");
-}
-
-async function finalizeMigrationV3Publication({
-  plan,
-  putIfChanged,
-  getObject,
-  recordDurableEvidence,
-  publicationConcurrency,
-}) {
-  const concurrency = parsePublicationConcurrency(publicationConcurrency);
-  if (concurrency === 1) {
-    return finalizeObservationHistoryIndexV3Publication({
-      plan, putIfChanged, getObject, recordDurableEvidence,
-    });
-  }
-  await validateMigrationPublicationSchedule(plan);
-  const changedKeys = new Set(plan.entries.map((entry) => entry.key));
-  const externalByKey = new Map(plan.external_references.map((entry) => [entry.key, entry]));
-  const completed = new Set();
-  const evidence = [];
-  let next = 0;
-  while (next < plan.entries.length) {
-    const batch = [];
-    // Take only an eligible prefix of the immutable topological order. Stopping
-    // at a barrier preserves global journal position order, even across batches.
-    while (next < plan.entries.length && batch.length < concurrency) {
-      const entry = plan.entries[next];
-      const blocked = [...entry.dependencies, ...entry.publication_prerequisites].find(
-        (reference) => changedKeys.has(reference.key)
-          ? !completed.has(reference.key)
-          : externalByKey.get(reference.key)?.verified !== true ||
-            externalByKey.get(reference.key)?.durable !== true,
-      );
-      if (blocked) {
-        if (batch.length) break;
-        throw new Error(`V3 dependent publication blocked: ${blocked.key} -> ${entry.key}`);
-      }
-      batch.push(entry);
-      next += 1;
-    }
-    // No new batch starts until every started sibling settles and all successful
-    // results have passed the single serial durability path below.
-    const results = await Promise.allSettled(batch.map(async (entry) => {
-      const putResult = await putIfChanged({
-        key: entry.key,
-        body: Buffer.from(entry.body),
-        byte_size: entry.byte_size,
-        sha256: entry.sha256,
-        content_type: entry.content_type,
-        publication_stage: entry.publication_stage,
-      });
-      if (!putResult || putResult.ok === false) {
-        throw new Error(`V3 publication PUT failed: ${entry.key}`);
-      }
-      const fetched = await getObject({ key: entry.key });
-      const fetchedBody = Buffer.isBuffer(fetched?.body)
-        ? Buffer.from(fetched.body)
-        : Buffer.from(fetched?.body ?? "");
-      if (fetchedBody.byteLength !== entry.byte_size || sha256Hex(fetchedBody) !== entry.sha256) {
-        throw new Error(`V3 post-PUT GET verification failed: ${entry.key}`);
-      }
-      return {
-        key: entry.key,
-        byte_size: entry.byte_size,
-        sha256: entry.sha256,
-        publication_stage: entry.publication_stage,
-        put_status: String(putResult.status || "succeeded"),
-        post_put_get_verified: true,
-        schedule_sha256: plan.schedule_sha256,
-        position: entry.position,
-      };
-    }));
-    const failures = results.flatMap((result, index) => result.status === "rejected"
-      ? [new Error(`V3 publication failed: ${batch[index].key}: ${
-          result.reason instanceof Error ? result.reason.message : String(result.reason)
-        }`, { cause: result.reason })]
-      : []);
-    for (const [index, result] of results.entries()) {
-      if (result.status !== "fulfilled") continue;
-      const entry = batch[index];
-      try {
-        const durableResult = await recordDurableEvidence(result.value);
-        if (durableResult?.durable !== true) {
-          throw new Error("Durability adapter did not confirm persistence");
-        }
-      } catch (error) {
-        failures.push(new Error(`V3 durable publication evidence failed: ${entry.key}`, { cause: error }));
-        // A journal failure can leave an entry beyond its head. Never append
-        // again through an uncertain sequence/head; remaining objects are retried.
-        break;
-      }
-      completed.add(entry.key);
-      evidence.push(Object.freeze({
-        key: entry.key,
-        byte_size: entry.byte_size,
-        sha256: entry.sha256,
-        publication_stage: entry.publication_stage,
-        put_status: result.value.put_status,
-        verified: true,
-        durable: true,
-      }));
-    }
-    if (failures.length) {
-      throw new AggregateError(failures, failures.map((error) => error.message).join("; "));
-    }
-  }
-  return Object.freeze({
-    ok: true,
-    status: "succeeded",
-    schedule_sha256: plan.schedule_sha256,
-    published_object_count: evidence.length,
-    objects: Object.freeze(evidence),
-  });
-}
-
 function buildR2Adapters({
   config,
   checkpointOut,
@@ -1417,7 +1272,6 @@ function buildR2Adapters({
   getBackupObject,
   recoveryProgress = null,
   runtimeAuthorityAdapters = null,
-  publicationConcurrency = 1,
 }) {
   const r2 = config.r2;
   const durableEvidence = recoveryProgress
@@ -1530,7 +1384,7 @@ function buildR2Adapters({
     },
     getBackupObject,
     finalizeV3Publication: (options) =>
-      finalizeMigrationV3Publication({ ...options, publicationConcurrency }),
+      finalizeObservationHistoryIndexV3Publication(options),
     rebuildV2Indexes: () => runHistoryIndexBuild({
       argv: ["--history-version", "v2", "--domain", "observations", "--write-r2"],
       env,
@@ -1667,21 +1521,7 @@ export async function runObservationHistoryMigrationV3({
       checkpointPath: args.checkpointIn,
       checkpoint,
       repositoryRoot,
-      // The original manifest remains historical authority. Enforce the narrow
-      // committed-executor drift gate separately, before any migration R2 work.
-      requireCurrentImplementation: false,
     });
-    const recoveryExecutorCheck = spawnSync("bash", [
-      "scripts/index_v3_migration/index_v3_migration.sh",
-      "--resume-implementation-authority",
-      path.resolve(args.checkpointIn),
-      args.targetWriterGitSha,
-    ], { cwd: repositoryRoot, encoding: "utf8" });
-    if (recoveryExecutorCheck.status !== 0) {
-      throw new Error(`Resume recovery executor is not authorized: ${
-        recoveryExecutorCheck.stderr || recoveryExecutorCheck.error?.message || "local authority check failed"
-      }`);
-    }
     checkpoint = recoveryProgress.checkpoint;
   } else if (
     checkpoint &&
@@ -1737,7 +1577,6 @@ export async function runObservationHistoryMigrationV3({
     env,
     getBackupObject,
     recoveryProgress,
-    publicationConcurrency: args.publicationConcurrency,
     runtimeAuthorityAdapters: v2RuntimeRollbackEvidence
       ? v2RuntimeAuthorityAdapters({
           rollbackEvidence: v2RuntimeRollbackEvidence,

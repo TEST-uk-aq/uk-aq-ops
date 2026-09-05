@@ -36,9 +36,6 @@ Common work-dir files:
   migration_checkpoint.json
   writer_limits.json
 
-Publication execution (migrate/resume):
-  --publication-concurrency N  Integer 1..16 (default 1; use 8 explicitly)
-
 Explicit path overrides:
   --authority-file PATH --plan-report PATH --checkpoint PATH --report-out PATH
 
@@ -186,9 +183,6 @@ const recovery = buildObservationHistoryV3RecoveryProgressContext({
   checkpointPath,
   checkpoint,
   repositoryRoot,
-  // Authenticate historical authority first; the subsequent committed-drift
-  // gate owns whether the current recovery executor is permitted to differ.
-  requireCurrentImplementation: false,
 });
 const manifest = recovery.manifest.payload;
 if (
@@ -204,21 +198,6 @@ NODE
 
 resume_recovery_implementation_drift_is_authorized() {
   local recovery_manifest="$CHECKPOINT.recovery/manifest.json" recovery_path changed_path
-  local recovery_head expected_sha actual_sha
-  # Match the real resume preflight's clean-tree requirement, including staged
-  # and untracked changes, and the complete current dependency trust boundary.
-  [ -z "$(git status --porcelain)" ] || return 1
-  current_verify_dependencies_are_trusted "$REPO_ROOT" || return 1
-  recovery_head="$(jq -er '.payload.recovery_implementation.repository_head' "$recovery_manifest")" || return 1
-  printf '%s' "$recovery_head" | grep -Eq '^[0-9a-f]{40}$' || return 1
-  git cat-file -e "${recovery_head}^{commit}" 2>/dev/null || return 1
-  git merge-base --is-ancestor "$recovery_head" HEAD || return 1
-  # Manifest-pinned implementation bytes must still exist in Git history. Only
-  # current committed executor bytes may evolve; never repin the manifest.
-  while IFS=$'\t' read -r recovery_path expected_sha; do
-    actual_sha="$(git show "$recovery_head:$recovery_path" | shasum -a 256 | awk '{print $1}')" || return 1
-    [ "$actual_sha" = "$expected_sha" ] || return 1
-  done < <(jq -r '.payload.recovery_implementation.files[] | [.path,.sha256] | @tsv' "$recovery_manifest")
   git_paths_are_unchanged \
     "$REPO_ROOT" "$TARGET_WRITER_GIT_SHA" HEAD \
     "${VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES[@]}" \
@@ -300,21 +279,6 @@ case "${1:-}" in
     require_authorization UK_AQ_INDEX_V3_MIGRATION_AUTH SELF_TEST_AUTH
     exit 0
     ;;
-  --resume-implementation-authority)
-    # Local/read-only subcommand used by the CLI after authenticating/replaying
-    # the original manifest. It grants no mutation or historical-authority bypass.
-    [ "$#" -eq 3 ] || stop "--resume-implementation-authority requires checkpoint and target writer Git SHA"
-    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-    REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)" \
-      || stop "repository root cannot be derived from Git"
-    CHECKPOINT="$2"
-    TARGET_WRITER_GIT_SHA="$3"
-    cd -- "$REPO_ROOT"
-    validate_read_only_dependency_authority "$REPO_ROOT" "$TARGET_WRITER_GIT_SHA"
-    resume_recovery_implementation_drift_is_authorized \
-      || stop "resume implementation drift is not limited to clean authenticated recovery files"
-    exit 0
-    ;;
   --verify-dependency-authority)
     [ "$#" -eq 2 ] || stop "--verify-dependency-authority requires one target writer Git SHA"
     SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -346,7 +310,6 @@ WRITER_FREEZE_EVIDENCE=""
 V2_RUNTIME_ROLLBACK_RECORD=""
 APPLY=0
 WRITERS_FROZEN=0
-PUBLICATION_CONCURRENCY=1
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -363,10 +326,6 @@ while [ "$#" -gt 0 ]; do
     --report-out) REPORT_OUT="${2:-}"; shift 2 ;;
     --writer-freeze-evidence) WRITER_FREEZE_EVIDENCE="${2:-}"; shift 2 ;;
     --v2-runtime-rollback-record) V2_RUNTIME_ROLLBACK_RECORD="${2:-}"; shift 2 ;;
-    --publication-concurrency)
-      [ "$#" -ge 2 ] || stop "--publication-concurrency requires a value"
-      case "$2" in [1-9]|1[0-6]) ;; *) stop "--publication-concurrency must be an integer from 1 to 16" ;; esac
-      PUBLICATION_CONCURRENCY="$2"; shift 2 ;;
     --writers-frozen) WRITERS_FROZEN=1; shift ;;
     --apply) APPLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -530,7 +489,7 @@ NODE
     [ -f "$CHECKPOINT.recovery/manifest.json" ] \
       || stop "resume requires an existing recovery manifest: $CHECKPOINT.recovery/manifest.json"
     validate_resume_recovery_authority \
-      || stop "resume recovery manifest does not authenticate the original checkpoint and historical authority"
+      || stop "resume recovery manifest does not authenticate the checkpoint, authority, and current recovery implementation"
     resume_recovery_implementation_drift_is_authorized \
       || stop "resume implementation drift is not limited to the authenticated recovery implementation"
     LOAD_AUTHORITY_DRIFT=""
@@ -635,7 +594,6 @@ load_authority
 
 if [ "$MODE" = "migrate" ]; then
   trap '' HUP
-  printf 'V3 publication concurrency: %s (maximum 16)\n' "$PUBLICATION_CONCURRENCY"
   [ "$APPLY" -eq 1 ] || stop "migrate requires the explicit --apply flag"
   [ -n "$SITE_URL" ] || stop "migrate requires --site-url for positive maintenance verification"
   [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "migrate requires --writer-freeze-evidence"
@@ -658,7 +616,6 @@ if [ "$MODE" = "migrate" ]; then
     "${V2_RUNTIME_ARGS[@]}"
   run_cli \
     --mode migrate --apply --writers-frozen \
-    --publication-concurrency "$PUBLICATION_CONCURRENCY" \
     --transition "$TRANSITION" \
     --environment "$ENVIRONMENT" \
     --expected-bucket "$CFLARE_R2_BUCKET" \
@@ -677,7 +634,6 @@ fi
 
 if [ "$MODE" = "resume" ]; then
   trap '' HUP
-  printf 'V3 publication concurrency: %s (maximum 16)\n' "$PUBLICATION_CONCURRENCY"
   [ "$APPLY" -eq 1 ] || stop "resume requires the explicit --apply flag"
   [ -n "$SITE_URL" ] || stop "resume requires --site-url for positive maintenance verification"
   [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "resume requires --writer-freeze-evidence"
@@ -700,7 +656,6 @@ if [ "$MODE" = "resume" ]; then
     "${V2_RUNTIME_ARGS[@]}"
   run_cli \
     --mode migrate --apply --writers-frozen \
-    --publication-concurrency "$PUBLICATION_CONCURRENCY" \
     --transition "$TRANSITION" \
     --environment "$ENVIRONMENT" \
     --expected-bucket "$CFLARE_R2_BUCKET" \

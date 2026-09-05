@@ -1485,7 +1485,6 @@ function createMigrationProgressReporter({ label, total, enabled }) {
   const startedAt = Date.now();
   let lastPercentage = null;
   let lastReportedAt = 0;
-  const samples = [];
   return Object.freeze({
     report(completed, { force = false } = {}) {
       const safeCompleted = Math.min(Math.max(Number(completed) || 0, 0), total);
@@ -1497,22 +1496,10 @@ function createMigrationProgressReporter({ label, total, enabled }) {
         integerPercentage === lastPercentage &&
         now - lastReportedAt < 30_000
       ) return;
-      let eta = "";
-      if (samples.length >= 5) {
-        const oldest = samples[0];
-        const elapsed = now - oldest.at;
-        const advanced = safeCompleted - oldest.completed;
-        const remainingMilliseconds = (total - safeCompleted) * elapsed / advanced;
-        if (elapsed > 0 && advanced > 0 && Number.isFinite(remainingMilliseconds) && remainingMilliseconds >= 0) {
-          eta = ` eta=${formatMigrationProgressElapsed(remainingMilliseconds)}`;
-        }
-      }
-      samples.push({ at: now, completed: safeCompleted });
-      if (samples.length > 10) samples.shift();
       process.stderr.write(
         `${label} ${safeCompleted}/${total} (${percentage.toFixed(1)}%) elapsed=${
           formatMigrationProgressElapsed(now - startedAt)
-        }${eta}\n`,
+        }\n`,
       );
       lastPercentage = integerPercentage;
       lastReportedAt = now;
