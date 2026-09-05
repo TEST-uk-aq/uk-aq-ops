@@ -1330,7 +1330,7 @@ export function validateObservationHistoryV3MigrationEnvironment({
       : operation === "rollback"
         ? new Set([
             selectedTransition.source_index_generation,
-            "v2",
+            selectedTransition.target_index_generation,
           ])
         : new Set([selectedTransition.source_index_generation]);
     if (!permittedIndexVersions.has(deployedIndexVersion)) {
