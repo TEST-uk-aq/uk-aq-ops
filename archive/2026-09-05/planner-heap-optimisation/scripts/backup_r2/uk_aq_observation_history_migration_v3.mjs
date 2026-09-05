@@ -1821,7 +1821,6 @@ export async function runObservationHistoryMigrationV3({
         checkpoint,
         allowLegacyRecoveryOrdering: args.environment === "TEST",
         recoveryAuthority: recoveryProgress?.authenticatedRecoveryAuthority || null,
-        progressEnabled: true,
       });
       result = await verifyObservationHistoryV3CurrentDependencies({
         plan: reportPlan,

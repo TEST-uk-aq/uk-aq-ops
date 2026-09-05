@@ -87,6 +87,7 @@ import {
   buildObservationHistoryV3MigrationPlanFromCheckpoint,
   buildObservationHistoryV3RecoveryReplayStateSha256,
   buildObservationHistoryV3RerunVerificationPlan,
+  createMigrationProgressReporter,
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
   inventoryAuthoritativeCanonicalObservationHistory,
@@ -107,6 +108,7 @@ import {
   buildObservationHistoryV3ReportOutput,
   parseObservationHistoryMigrationArgs,
 } from "../scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs";
+import { buildObservationHistoryIndexV3PublicationPlan as sortedArrayPublicationPlan } from "./fixtures/uk_aq_index_v3_sorted_array_reference.mjs";
 const REPOSITORY_ROOT = path.resolve(import.meta.dirname, "..");
 const PREFIX = "history/v2/observations";
 const DAY = "2026-01-02";
@@ -4232,7 +4234,8 @@ test("legacy canonical resume preserves historical evidence and requires exact a
         const expectedLegacy = legacy.recoveredPlan.canonical_publication_objects.filter((entry) =>
           before.completed_objects[entry.key].sha256 !== entry.sha256).length;
         assert.match(text, new RegExp(`legacy_recovery_ordering=${expectedLegacy} failed=0`));
-        assert.equal(diagnostics.filter((line) => line.includes(": v3_publication_plan ")).length, 1);
+        assert.equal(diagnostics.filter((line) => /: v3 publication plan 0\//.test(line)).length, 1);
+        assert.equal(diagnostics.filter((line) => /: v3 publication plan .*\(100\.0%\)/.test(line)).length, 1);
         assert.doesNotMatch(text, /historical canonical identities: v3_/);
         assert.equal(adapters.jsonPutCalls, 0);
       } else {
@@ -4266,7 +4269,16 @@ test("recovered plan progress is optional and preserves every reconstructed byte
     assert.deepEqual(observed, quiet);
     assert.deepEqual(args.checkpoint, checkpointBefore);
     assert.deepEqual(events.filter((event) => event.phase === "prepared_units").map((event) => event.completed), [0, 1, 2]);
-    assert.deepEqual(events.slice(-6).map((event) => event.phase), ["canonical_schedule", "v3_hierarchies", "v3_latest", "v3_objects", "v3_publication_plan", "complete"]);
+    assert.deepEqual(events.filter((event, index) => index === 0 || event.phase !== events[index - 1].phase).slice(-6).map((event) => event.phase), ["canonical_schedule", "v3_hierarchies", "v3_latest", "v3_objects", "v3_publication_plan", "complete"]);
+    const total = quiet.v3_publication_plan.entries.length;
+    assert.deepEqual(events.filter((event) => event.phase === "v3_publication_plan"),
+      Array.from({ length: total + 1 }, (_, completed) => ({ phase: "v3_publication_plan", completed, total })));
+    const oldPlan = sortedArrayPublicationPlan({
+      objects: [...quiet.units.flatMap((unit) => unit.v3_hierarchy.publication_objects), quiet.v3_latest],
+      externalReferences: quiet.v3_publication_plan.external_references,
+    });
+    assert.deepEqual(quiet.v3_publication_plan, oldPlan);
+    assert.equal(JSON.stringify(quiet.v3_publication_plan), JSON.stringify(oldPlan));
     assert.deepEqual(events.at(-1), { phase: "complete", canonical: quiet.canonical_publication_objects.length, v3: quiet.v3_publication_plan.entries.length });
   }
 });
@@ -4309,7 +4321,8 @@ test("canonical evidence gate skips historical reconstruction for all-current ev
         assert.deepEqual(report.recovery_reconciliation.legacy_allowed_identities, {});
         assert.doesNotMatch(diagnostics.join(""), /reconstructing historical/);
         assert.match(diagnostics.join(""), /resumed canonical verification: exact=7 legacy_recovery_ordering=0 failed=0/);
-        assert.equal(diagnostics.filter((line) => line.includes(": v3_publication_plan ")).length, 1);
+        assert.equal(diagnostics.filter((line) => /: v3 publication plan 0\//.test(line)).length, 1);
+        assert.equal(diagnostics.filter((line) => /: v3 publication plan .*\(100\.0%\)/.test(line)).length, 1);
         assert.deepEqual(stdout, []);
       } finally { process.stderr.write = stderrWrite; process.stdout.write = stdoutWrite; }
       assert.deepEqual(checkpoint, before);
@@ -4373,4 +4386,62 @@ test("canonical evidence gate reports all 14 settled failures and starts no late
     assert.equal(legacy.adapters.checkpoints.length, 0);
   } finally { process.stderr.write = stderrWrite; process.stdout.write = stdoutWrite; }
   assert.deepEqual(checkpoint, before);
+});
+
+
+test("planner operator reporter throttles real counts and retains existing ETA sampling rules", (t) => {
+  let now = 100000;
+  t.mock.method(Date, "now", () => now);
+  const lines = [];
+  t.mock.method(process.stderr, "write", (message) => { lines.push(String(message)); return true; });
+  const reporter = createMigrationProgressReporter({ label: "V3 migration: v3 publication plan", total: 1000, enabled: true });
+  for (let completed = 0; completed <= 1000; completed += 1) {
+    now += 100;
+    reporter.report(completed);
+  }
+  assert.equal(lines.length, 101);
+  assert.match(lines[0], /0\/1000 \(0.0%\) elapsed=00:00:00\n$/);
+  assert.ok(lines.slice(0, 5).every((line) => !line.includes("eta=")));
+  assert.match(lines[5], /50\/1000 .*eta=00:01:35/);
+  assert.match(lines.at(-1), /1000\/1000 \(100.0%\).*eta=00:00:00/);
+  const stalled = createMigrationProgressReporter({ label: "stalled", total: 1000, enabled: true });
+  stalled.report(0);
+  now += 29999;
+  stalled.report(0);
+  assert.equal(lines.length, 102);
+  now += 1;
+  stalled.report(0);
+  assert.equal(lines.length, 103);
+  assert.doesNotMatch(lines.at(-1), /eta=/);
+});
+
+test("fresh migration and archive verification expose genuine planner progress on stderr", async () => {
+  const fixture = await buildFixture();
+  const adapters = memoryAdapters(fixture);
+  const diagnostics = [];
+  const stderrWrite = process.stderr.write;
+  try {
+    process.stderr.write = (message) => { diagnostics.push(String(message)); return true; };
+    const execution = await executeObservationHistoryV3MigrationPlan({
+      plan: await buildPlan(fixture), apply: true, writersFrozen: true,
+      environmentEvidence: ENVIRONMENT, adapters,
+    });
+    for (const verify of [false, true]) {
+      if (verify) {
+        diagnostics.length = 0;
+        const quiet = buildObservationHistoryV3RerunVerificationPlan({ checkpoint: execution.checkpoint });
+        assert.deepEqual(diagnostics, []);
+        const observed = buildObservationHistoryV3RerunVerificationPlan({ checkpoint: execution.checkpoint, progressEnabled: true });
+        assert.deepEqual(observed, quiet);
+      }
+      const plannerLines = diagnostics.filter((line) => line.includes(": v3 publication plan "));
+      assert.ok(plannerLines.length > 2);
+      const counts = plannerLines.map((line) => Number(line.match(/plan (\d+)\//)[1]));
+      assert.equal(counts[0], 0);
+      assert.equal(counts.at(-1), 13);
+      assert.ok(counts.every((count, index) => index === 0 || count > counts[index - 1]));
+      assert.doesNotMatch(diagnostics.join(""), /: v3_publication_plan /);
+      if (!verify) assert.ok(diagnostics.findIndex((line) => line.includes("resumed canonical verification:")) < diagnostics.indexOf(plannerLines[0]));
+    }
+  } finally { process.stderr.write = stderrWrite; }
 });

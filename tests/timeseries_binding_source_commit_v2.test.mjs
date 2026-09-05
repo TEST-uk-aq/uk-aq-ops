@@ -151,6 +151,39 @@ test("unchanged fingerprint preserves reconciliation/hierarchy skips without rew
   assert.equal(f.events.some(([op]) => op === "PUT" || op === "LIST"), false);
 });
 
+test("changed fingerprint with identical hierarchy writes only refresh and final source state", async () => {
+  const f = fixture();
+  await f.run();
+  f.events.length = 0;
+  const nextFingerprint = "e".repeat(64);
+  const nextProposal = {
+    ...f.proposal,
+    source_fingerprint: nextFingerprint,
+  };
+  f.coreSnapshotReport.timeseries_binding_reconciliation = {
+    status: "succeeded",
+    invalid_binding_count: 0,
+    authoritative_timeseries_count: 1,
+    current_source_fingerprint: nextFingerprint,
+    source_state_key: sourceKey,
+    source_state_status: "awaiting_hierarchy_commit",
+    proposed_source_state: nextProposal,
+  };
+  const report = await f.run({ sourceFingerprint: nextFingerprint });
+  assert.equal(report.hierarchy.range_manifests_changed, 0);
+  assert.equal(report.hierarchy.range_manifests_written, 0);
+  assert.equal(report.hierarchy.source_root_changed, false);
+  assert.equal(report.hierarchy.source_root_written, false);
+  assert.equal(report.hierarchy.refresh_state_changed, true);
+  assert.equal(report.hierarchy.refresh_state_written, true);
+  assert.equal(report.hierarchy.change_detection_get_count, 0);
+  assert.equal(report.source_state_status, "written_and_verified");
+  assert.deepEqual(
+    f.events.filter(([operation]) => operation === "PUT").map(([, key]) => key),
+    [refreshKey, sourceKey],
+  );
+});
+
 test("final PUT and read-back retry transient failures independently", async () => {
   const f = fixture();
   const put = f.adapter.putObject;

@@ -48,58 +48,6 @@ function bytewiseCompare(left, right) {
   );
 }
 
-function compareEligiblePublicationObjects(left, right) {
-  return PUBLICATION_STAGE_RANK[left.publication_stage] -
-    PUBLICATION_STAGE_RANK[right.publication_stage] ||
-    bytewiseCompare(left.key, right.key);
-}
-
-// Match the old stable sorted array, including FIFO selection if distinct JS
-// keys encode to equal UTF-8 bytes. Queue metadata never enters the plan.
-class EligiblePublicationMinHeap {
-  entries = [];
-  nextOrdinal = 0;
-
-  get size() { return this.entries.length; }
-
-  compare(left, right) {
-    return compareEligiblePublicationObjects(left.object, right.object) ||
-      left.ordinal - right.ordinal;
-  }
-
-  push(object) {
-    const entry = { object, ordinal: this.nextOrdinal++ };
-    const entries = this.entries;
-    let index = entries.length;
-    entries.push(entry);
-    while (index > 0) {
-      const parent = Math.floor((index - 1) / 2);
-      if (this.compare(entries[parent], entry) <= 0) break;
-      entries[index] = entries[parent];
-      index = parent;
-    }
-    entries[index] = entry;
-  }
-
-  pop() {
-    const entries = this.entries;
-    const minimum = entries[0];
-    const last = entries.pop();
-    if (entries.length) {
-      let index = 0;
-      while (index * 2 + 1 < entries.length) {
-        let child = index * 2 + 1;
-        if (child + 1 < entries.length && this.compare(entries[child + 1], entries[child]) < 0) child += 1;
-        if (this.compare(last, entries[child]) <= 0) break;
-        entries[index] = entries[child];
-        index = child;
-      }
-      entries[index] = last;
-    }
-    return minimum.object;
-  }
-}
-
 function canonicalizeJsonValue(value) {
   if (Array.isArray(value)) {
     return value.map(canonicalizeJsonValue);
@@ -2321,21 +2269,12 @@ function scheduleHashInput(plan) {
 export function buildObservationHistoryIndexV3PublicationPlan({
   objects,
   externalReferences = [],
-  onProgress = null,
 }) {
   const normalizedObjects = (Array.isArray(objects) ? objects : [])
     .map(normalizePublicationObject);
   if (normalizedObjects.length === 0) {
     throw new Error("V3 publication plan requires changed objects");
   }
-  const reportProgress = typeof onProgress === "function" ? (completed) => {
-    try {
-      onProgress({ completed, total: normalizedObjects.length });
-    } catch {
-      // Optional diagnostics cannot change planner output or blocker semantics.
-    }
-  } : null;
-  reportProgress?.(0);
   const byKey = new Map();
   for (const object of normalizedObjects) {
     if (byKey.has(object.key)) {
@@ -2397,26 +2336,32 @@ export function buildObservationHistoryIndexV3PublicationPlan({
       }
     }
   }
-  const eligible = new EligiblePublicationMinHeap();
-  for (const object of normalizedObjects) {
-    if (indegree.get(object.key) === 0) eligible.push(object);
-  }
+  const eligible = normalizedObjects
+    .filter((object) => indegree.get(object.key) === 0)
+    .sort((left, right) =>
+      PUBLICATION_STAGE_RANK[left.publication_stage] -
+        PUBLICATION_STAGE_RANK[right.publication_stage] ||
+      bytewiseCompare(left.key, right.key)
+    );
   const ordered = [];
-  while (eligible.size) {
-    const next = eligible.pop();
+  while (eligible.length) {
+    const next = eligible.shift();
     ordered.push(next);
-    reportProgress?.(ordered.length);
     for (const parentKey of outgoing.get(next.key).sort(bytewiseCompare)) {
       indegree.set(parentKey, indegree.get(parentKey) - 1);
       if (indegree.get(parentKey) === 0) {
         eligible.push(byKey.get(parentKey));
+        eligible.sort((left, right) =>
+          PUBLICATION_STAGE_RANK[left.publication_stage] -
+            PUBLICATION_STAGE_RANK[right.publication_stage] ||
+          bytewiseCompare(left.key, right.key)
+        );
       }
     }
   }
   if (ordered.length !== normalizedObjects.length) {
-    const orderedKeys = new Set(ordered.map((object) => object.key));
     const cycleKeys = normalizedObjects
-      .filter((object) => !orderedKeys.has(object.key))
+      .filter((object) => !ordered.includes(object))
       .map((object) => object.key)
       .sort(bytewiseCompare);
     throw new Error(`V3 publication dependency cycle: ${cycleKeys.join(" -> ")}`);

@@ -1042,7 +1042,6 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
   const baselinePlan = buildObservationHistoryV3RerunVerificationPlan({
     checkpoint: replayedCheckpoint,
     allowLegacyRecoveryOrdering: true,
-    progressEnabled: true,
     recoveryAuthority: {
       authenticated: true,
       original_checkpoint_sha256: sha256(checkpointBytes),

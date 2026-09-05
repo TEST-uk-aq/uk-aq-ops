@@ -3159,12 +3159,10 @@ function completePreparedV3Plan({ checkpoint, authority, units: canonicalUnits, 
       durable: true,
     })),
   ];
+  onProgress?.({ phase: "v3_publication_plan", completed: 0, total: v3Objects.length });
   const v3PublicationPlan = buildObservationHistoryIndexV3PublicationPlan({
     objects: v3Objects,
     externalReferences,
-    onProgress: onProgress
-      ? ({ completed, total }) => onProgress({ phase: "v3_publication_plan", completed, total })
-      : null,
   });
   onProgress?.({ phase: "complete", canonical: canonicalObjects.length, v3: v3Objects.length });
   return Object.freeze({
@@ -3398,7 +3396,6 @@ function recoveredPlanProgress(enabled, label = "V3 migration: reconstructing re
   if (!enabled) return null;
   const startedAt = Date.now();
   let unitsProgress;
-  let plannerProgress;
   process.stderr.write(`${label}: start=${new Date(startedAt).toISOString()}\n`);
   return (event) => {
     if (event.phase === "prepared_units") {
@@ -3406,13 +3403,6 @@ function recoveredPlanProgress(enabled, label = "V3 migration: reconstructing re
         label: `${label}: prepared units`, total: event.total, enabled,
       });
       unitsProgress.report(event.completed);
-      return;
-    }
-    if (event.phase === "v3_publication_plan") {
-      plannerProgress ||= createMigrationProgressReporter({
-        label: `${label}: v3 publication plan`, total: event.total, enabled,
-      });
-      plannerProgress.report(event.completed);
       return;
     }
     const counts = event.phase === "complete"
@@ -3547,7 +3537,7 @@ export async function executeObservationHistoryV3MigrationPlan({
   });
   let onCurrentProgress;
   const verifyCanonicalGate = async () => {
-    onCurrentProgress = recoveredPlanProgress(true);
+    onCurrentProgress = recoveredPlanProgress(progressEnabled);
     const currentCanonical = reconstructPreparedCanonicalPlan({
       checkpoint, authority: checkpoint.authority, allowLegacyRecoveryOrdering,
       includeV3Hierarchy: false, onProgress: onCurrentProgress,
@@ -4421,18 +4411,16 @@ export function buildObservationHistoryV3RerunVerificationPlan({
   checkpoint,
   allowLegacyRecoveryOrdering = false,
   recoveryAuthority = null,
-  progressEnabled = false,
 }) {
   const authority = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
   const legacyAuthority = validateLegacyRecoveryOrderingAuthority({
     checkpoint, allowLegacyRecoveryOrdering, recoveryAuthority,
   });
-  const onProgress = recoveredPlanProgress(progressEnabled);
   let currentCanonical;
   try {
     currentCanonical = reconstructPreparedCanonicalPlan({
       checkpoint, authority, allowLegacyRecoveryOrdering: legacyAuthority.eligible,
-      includeV3Hierarchy: false, onProgress,
+      includeV3Hierarchy: false,
     });
   } catch (error) {
     throw new Error(
@@ -4441,12 +4429,7 @@ export function buildObservationHistoryV3RerunVerificationPlan({
     );
   }
   const { historicalCanonicalReconciliationRequired, legacyCanonicalIdentities } =
-    reconcileCompletedCanonicalHistory({
-      checkpoint, currentCanonical, legacyAuthority,
-      onHistoricalProgress: () => recoveredPlanProgress(
-        progressEnabled, "V3 migration: reconstructing historical canonical identities",
-      ),
-    });
+    reconcileCompletedCanonicalHistory({ checkpoint, currentCanonical, legacyAuthority });
   const legacyAllowedIdentities = legacyCanonicalIdentities || Object.freeze({});
   // Reject unexplained canonical evidence before constructing any v3 hierarchy.
   for (const entry of currentCanonical.canonicalObjects) {
@@ -4457,7 +4440,7 @@ export function buildObservationHistoryV3RerunVerificationPlan({
       throw new Error(`recovery_evidence_invalid: checkpoint lacks exact durable completed-object evidence: ${entry.key}; ${result.reason}`);
     }
   }
-  const pinnedPlan = completePreparedV3Plan({ checkpoint, authority, ...currentCanonical, onProgress });
+  const pinnedPlan = completePreparedV3Plan({ checkpoint, authority, ...currentCanonical });
   if (
     checkpoint?.migration_run_id !== pinnedPlan.migration_run_id ||
     checkpoint?.backup_gate?.verified !== true ||
