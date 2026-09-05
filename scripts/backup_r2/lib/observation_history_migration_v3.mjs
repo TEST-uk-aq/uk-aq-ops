@@ -3547,7 +3547,9 @@ export async function executeObservationHistoryV3MigrationPlan({
   });
   let onCurrentProgress;
   const verifyCanonicalGate = async () => {
-    onCurrentProgress = recoveredPlanProgress(true);
+    onCurrentProgress = recoveredPlanProgress(true, authenticatedResume
+      ? "V3 migration: reconstructing recovered plan"
+      : "V3 migration: constructing prepared publication plan");
     const currentCanonical = reconstructPreparedCanonicalPlan({
       checkpoint, authority: checkpoint.authority, allowLegacyRecoveryOrdering,
       includeV3Hierarchy: false, onProgress: onCurrentProgress,

@@ -4230,6 +4230,10 @@ test("legacy canonical resume preserves historical evidence and requires exact a
           for (const saved of adapters.checkpoints) assert.deepEqual(saved.completed_objects[key], evidence, key);
         }
         const text = diagnostics.join("");
+        for (const phase of ["start=", "prepared units ", "v3 publication plan "]) {
+          assert.ok(diagnostics.some((line) => line.startsWith(`V3 migration: reconstructing recovered plan: ${phase}`)));
+        }
+        assert.doesNotMatch(text, /constructing prepared publication plan/);
         assert.match(text, /resumed canonical legacy recovery identity accepted: .*connector_id=1\/manifest.json/);
         const expectedLegacy = legacy.recoveredPlan.canonical_publication_objects.filter((entry) =>
           before.completed_objects[entry.key].sha256 !== entry.sha256).length;
@@ -4435,6 +4439,14 @@ test("fresh migration and archive verification expose genuine planner progress o
         assert.deepEqual(observed, quiet);
       }
       const plannerLines = diagnostics.filter((line) => line.includes(": v3 publication plan "));
+      const expectedLabel = verify
+        ? "V3 migration: reconstructing recovered plan"
+        : "V3 migration: constructing prepared publication plan";
+      for (const phase of ["start=", "prepared units ", "v3 publication plan "]) {
+        assert.ok(diagnostics.some((line) => line.startsWith(`${expectedLabel}: ${phase}`)));
+      }
+      assert.ok(plannerLines.every((line) => line.startsWith(`${expectedLabel}: `)));
+      if (!verify) assert.doesNotMatch(diagnostics.join(""), /reconstructing recovered plan/);
       assert.ok(plannerLines.length > 2);
       const counts = plannerLines.map((line) => Number(line.match(/plan (\d+)\//)[1]));
       assert.equal(counts[0], 0);
