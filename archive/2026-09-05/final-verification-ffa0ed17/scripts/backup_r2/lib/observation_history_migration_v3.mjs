@@ -3734,7 +3734,6 @@ export async function executeObservationHistoryV3MigrationPlan({
     headObject: adapters.headObject,
     publicationResult: v3Publication,
     progressEnabled,
-    publicationConcurrency,
   });
   checkpoint.full_verification_complete = verification.ok;
   checkpoint.cutover_ready = verification.cutover_ready;
@@ -3750,33 +3749,13 @@ export async function executeObservationHistoryV3MigrationPlan({
   });
 }
 
-// Read-only settlement: bounded network work, completion-time diagnostics, and
-// deterministic input-order results for caller-owned blocker/artifact handling.
-async function* settleFinalVerificationBatches(items, concurrency, verify, onSettled) {
-  for (let offset = 0; offset < items.length; offset += concurrency) {
-    const batch = items.slice(offset, offset + concurrency);
-    const results = await Promise.allSettled(batch.map(async (item) => {
-      try {
-        return await verify(item);
-      } finally {
-        onSettled(item);
-      }
-    }));
-    yield batch.map((item, index) => ({ item, result: results[index] }));
-  }
-}
-
 export async function verifyObservationHistoryV3MigrationResult({
   plan,
   getObject,
   headObject,
   publicationResult = null,
   progressEnabled = plan.transition.kind === "v2-to-v3",
-  publicationConcurrency = 1,
 }) {
-  if (!Number.isInteger(publicationConcurrency) || publicationConcurrency < 1 || publicationConcurrency > 16) {
-    throw new Error("--publication-concurrency must be an integer from 1 to 16");
-  }
   const blockers = [];
   const partitionProgress = createMigrationProgressReporter({
     label: "V3 verification: partitions",
@@ -3784,10 +3763,8 @@ export async function verifyObservationHistoryV3MigrationResult({
     enabled: progressEnabled,
   });
   partitionProgress.report(0, { force: true });
-  const remainingParquet = plan.units.map((unit) => unit.target_file_intents.length);
-  let verifiedPartitions = remainingParquet.filter((count) => count === 0).length;
-  const parquetChecks = [];
-  for (const [unitIndex, unit] of plan.units.entries()) {
+  let verifiedPartitions = 0;
+  for (const unit of plan.units) {
     if (
       unit.source_row_count !== unit.target_metadata.row_count ||
       !sameSemanticJson(
@@ -3797,37 +3774,21 @@ export async function verifyObservationHistoryV3MigrationResult({
     ) {
       blockers.push(`logical_identity_mismatch:${partitionIdentity(unit.scope)}`);
     }
-    for (const intent of unit.target_file_intents) parquetChecks.push({ unitIndex, intent });
-  }
-  const parquetProgress = createMigrationProgressReporter({
-    label: "V3 verification: Parquet objects", total: parquetChecks.length, enabled: progressEnabled,
-  });
-  parquetProgress.report(0, { force: true });
-  let verifiedParquet = 0;
-  for await (const settled of settleFinalVerificationBatches(
-    parquetChecks, publicationConcurrency,
-    async ({ intent }) => {
-      const head = await headObject({ key: intent.key });
-      verifyR2StoredSha256Head({ head, intent });
-    },
-    ({ unitIndex }) => {
-      verifiedParquet += 1;
-      parquetProgress.report(verifiedParquet);
-      remainingParquet[unitIndex] -= 1;
-      if (remainingParquet[unitIndex] === 0) verifiedPartitions += 1;
-      partitionProgress.report(verifiedPartitions);
-    },
-  )) {
-    for (const { item: { intent }, result } of settled) {
-      if (result.status === "rejected") {
-        const error = result.reason;
-        blockers.push(`parquet_stored_sha_mismatch:${intent.key}:${
-          error instanceof Error ? error.message : String(error)
-        }`);
+    for (const intent of unit.target_file_intents) {
+      try {
+        const head = await headObject({ key: intent.key });
+        verifyR2StoredSha256Head({ head, intent });
+      } catch (error) {
+        blockers.push(
+          `parquet_stored_sha_mismatch:${intent.key}:${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       }
     }
+    verifiedPartitions += 1;
+    partitionProgress.report(verifiedPartitions);
   }
-  partitionProgress.report(verifiedPartitions);
   const canonicalProgress = createMigrationProgressReporter({
     label: "V3 verification: canonical publication objects",
     total: plan.canonical_publication_objects.length,
@@ -3835,29 +3796,28 @@ export async function verifyObservationHistoryV3MigrationResult({
   });
   canonicalProgress.report(0, { force: true });
   let verifiedCanonicalObjects = 0;
-  for await (const settled of settleFinalVerificationBatches(
-    plan.canonical_publication_objects, publicationConcurrency,
-    async (expected) => {
+  for (const expected of plan.canonical_publication_objects) {
+    try {
       const current = await getRequiredObject(
-        getObject, expected.key, "published canonical manifest",
+        getObject,
+        expected.key,
+        "published canonical manifest",
       );
-      if (current.byte_size !== expected.byte_size || current.sha256 !== expected.sha256) {
+      if (
+        current.byte_size !== expected.byte_size ||
+        current.sha256 !== expected.sha256
+      ) {
         throw new Error("published canonical manifest identity differs from plan");
       }
-    },
-    () => {
-      verifiedCanonicalObjects += 1;
-      canonicalProgress.report(verifiedCanonicalObjects);
-    },
-  )) {
-    for (const { item: expected, result } of settled) {
-      if (result.status === "rejected") {
-        const error = result.reason;
-        blockers.push(`canonical_manifest_identity_mismatch:${expected.key}:${
+    } catch (error) {
+      blockers.push(
+        `canonical_manifest_identity_mismatch:${expected.key}:${
           error instanceof Error ? error.message : String(error)
-        }`);
-      }
+        }`,
+      );
     }
+    verifiedCanonicalObjects += 1;
+    canonicalProgress.report(verifiedCanonicalObjects);
   }
   const actualArtifacts = new Map();
   const v3PublicationProgress = createMigrationProgressReporter({
@@ -3867,33 +3827,23 @@ export async function verifyObservationHistoryV3MigrationResult({
   });
   v3PublicationProgress.report(0, { force: true });
   let verifiedV3PublicationObjects = 0;
-  for await (const settled of settleFinalVerificationBatches(
-    plan.v3_publication_plan.entries, publicationConcurrency,
-    async (entry) => {
+  for (const entry of plan.v3_publication_plan.entries) {
+    try {
       const current = await getRequiredObject(getObject, entry.key, "published v3");
       if (current.byte_size !== entry.byte_size || current.sha256 !== entry.sha256) {
         throw new Error("published identity differs from plan");
       }
-      return current.body;
-    },
-    () => {
-      verifiedV3PublicationObjects += 1;
-      v3PublicationProgress.report(verifiedV3PublicationObjects);
-    },
-  )) {
-    for (const { item: entry, result } of settled) {
-      if (result.status === "fulfilled") {
-        actualArtifacts.set(entry.key, result.value);
-      } else {
-        const error = result.reason;
-        blockers.push(`v3_publication_identity_mismatch:${entry.key}:${
+      actualArtifacts.set(entry.key, current.body);
+    } catch (error) {
+      blockers.push(
+        `v3_publication_identity_mismatch:${entry.key}:${
           error instanceof Error ? error.message : String(error)
-        }`);
-      }
+        }`,
+      );
     }
+    verifiedV3PublicationObjects += 1;
+    v3PublicationProgress.report(verifiedV3PublicationObjects);
   }
-  // Every independent v3 GET has settled before hierarchy validation can use
-  // these exact fetched bodies. Failed identities never enter actualArtifacts.
   const hierarchyProgress = createMigrationProgressReporter({
     label: "V3 verification: scoped roots",
     total: plan.units.length,

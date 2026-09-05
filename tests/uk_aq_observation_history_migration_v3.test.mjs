@@ -3447,6 +3447,93 @@ test("failed unit completion batch retains staging and resumes without invented 
   assert.equal(resumed.verification.cutover_ready, true);
 });
 
+test("independent final verification bounds all reads and preserves exact blockers and hierarchy", async () => {
+  const fixture = await buildFixture();
+  const adapters = memoryAdapters(fixture);
+  const execution = await executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(fixture), apply: true, writersFrozen: true,
+    environmentEvidence: ENVIRONMENT, adapters,
+  });
+  const plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: execution.checkpoint, requirePrepared: true,
+  });
+  const parquet = plan.units.flatMap((unit) => unit.target_file_intents);
+  const canonicalKeys = new Set(plan.canonical_publication_objects.map((entry) => entry.key));
+  const v3Keys = new Set(plan.v3_publication_plan.entries.map((entry) => entry.key));
+  const expectedReads = [
+    ...parquet.map((entry) => entry.key), ...canonicalKeys, ...v3Keys,
+  ].sort();
+  const verify = async (concurrency) => {
+    let active = 0;
+    let settledV3 = 0;
+    let liveProgress = false;
+    const maximum = { parquet: 0, canonical: 0, v3: 0 };
+    const reads = new Map();
+    const observe = (reader, head = false) => async (request) => {
+      const phase = head ? "parquet" : canonicalKeys.has(request.key) ? "canonical" : "v3";
+      reads.set(request.key, (reads.get(request.key) || 0) + 1);
+      maximum[phase] = Math.max(maximum[phase], ++active);
+      try {
+        await new Promise((resolve) => setImmediate(resolve));
+        return await reader(request);
+      } finally {
+        active -= 1;
+        if (phase === "v3") settledV3 += 1;
+      }
+    };
+    const hierarchy = plan.units[0].v3_hierarchy;
+    const checkedPlan = { ...plan, units: [
+      { ...plan.units[0], v3_hierarchy: { ...hierarchy, get child_shards() {
+        assert.equal(active, 0);
+        assert.equal(settledV3, v3Keys.size);
+        return hierarchy.child_shards;
+      } } }, ...plan.units.slice(1),
+    ] };
+    const stderrWrite = process.stderr.write;
+    let result;
+    try {
+      process.stderr.write = (message) => {
+        if (String(message).startsWith("V3 verification: v3 publication objects 1/") && active > 0) {
+          liveProgress = true;
+        }
+        return true;
+      };
+      result = await verifyObservationHistoryV3MigrationResult({
+        plan: checkedPlan, getObject: observe(adapters.getObject),
+        headObject: observe(adapters.headObject, true),
+        publicationResult: execution.v3_publication, publicationConcurrency: concurrency,
+      });
+    } finally { process.stderr.write = stderrWrite; }
+    assert.deepEqual([...reads.keys()].sort(), expectedReads);
+    assert.ok([...reads.values()].every((count) => count === 1));
+    assert.equal(active, 0);
+    for (const count of Object.values(maximum)) {
+      assert.ok(count <= concurrency);
+      assert.ok(concurrency === 1 ? count === 1 : count > 1);
+    }
+    if (concurrency > 1) assert.equal(liveProgress, true);
+    return result;
+  };
+  const serial = await verify(1);
+  assert.equal(serial.cutover_ready, true);
+  assert.deepEqual(await verify(8), serial);
+  const leaves = plan.units.flatMap((unit) => unit.v3_hierarchy.child_shards);
+  adapters.storedSha.set(parquet[0].key, "f".repeat(64));
+  fixture.r2.set(plan.canonical_publication_objects[0].key, Buffer.from("corrupt canonical"));
+  fixture.r2.set(leaves[0].key, Buffer.from("corrupt v3"));
+  fixture.r2.delete(leaves[1].key);
+  const failedSerial = await verify(1);
+  assert.deepEqual(await verify(8), failedSerial);
+  assert.equal(failedSerial.cutover_ready, false);
+  for (const prefix of [
+    `parquet_stored_sha_mismatch:${parquet[0].key}:`,
+    `canonical_manifest_identity_mismatch:${plan.canonical_publication_objects[0].key}:`,
+    `v3_publication_identity_mismatch:${leaves[0].key}:`,
+    `v3_publication_identity_mismatch:${leaves[1].key}:`,
+    "scoped_root_child_authority_mismatch:",
+  ]) assert.ok(failedSerial.blockers.some((blocker) => blocker.startsWith(prefix)), prefix);
+});
+
 test("Phase 4 checkpoint reuse requires exact current stored identity", async () => {
   const expected = {
     key: "history/v2/observations/fixture.parquet",
