@@ -610,14 +610,10 @@ require_env CFLARE_R2_ACCESS_KEY_ID
 require_env CFLARE_R2_SECRET_ACCESS_KEY
 export SOURCE_KEY SOURCE_SHA SOURCE_CONTENT_HASH INVENTORY_KEY INVENTORY_SHA
 if [ "$STAGE" = "migration-start" ]; then
-  node --max-old-space-size=4096 --input-type=module - \
-    "$RECOVERY_AUTHORITY" "$CHECKPOINT" "$AUTH_RUN_ID" "$AUTH_PLAN_SHA" <<'NODE' || fail "current R2 source/inventory identity differs from the pinned plan or authenticated recovery evidence"
+  node --input-type=module <<'NODE' || fail "current R2 source/inventory identity differs from the pinned pre-migration plan"
 import crypto from "node:crypto";
-import fs from "node:fs";
 import { r2GetObject } from "./workers/shared/r2_sigv4.mjs";
-import { findPostMigrationCompletedObjectEvidence } from "./scripts/index_v3_migration/recovery_post_migration_root_evidence.mjs";
 
-const [recoveryAuthority, checkpointPath, migrationRunId, planSha] = process.argv.slice(2);
 const r2 = {
   endpoint: process.env.CFLARE_R2_ENDPOINT,
   bucket: process.env.CFLARE_R2_BUCKET,
@@ -629,47 +625,13 @@ const body = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value);
 const sha = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const source = body((await r2GetObject({ r2, key: process.env.SOURCE_KEY })).body);
 const inventory = body((await r2GetObject({ r2, key: process.env.INVENTORY_KEY })).body);
-if (sha(inventory) !== process.env.INVENTORY_SHA) throw new Error("inventory root SHA mismatch");
-const sourceSha = sha(source);
-if (sourceSha === process.env.SOURCE_SHA) {
-  // Initial migrate and an early resume must retain the original exact check.
-  // No completed root entry is required while the original root is still current.
-  if (JSON.parse(source).content_hash !== process.env.SOURCE_CONTENT_HASH) {
-    throw new Error("source root content hash mismatch");
-  }
-  console.log("PASS: current R2 canonical source matches the pinned pre-migration plan");
-} else {
-  if (recoveryAuthority !== "1") throw new Error("source root SHA mismatch");
-  const checkpointBody = fs.readFileSync(checkpointPath);
-  const checkpoint = JSON.parse(checkpointBody);
-  const targetWriterGitSha = checkpoint.authority?.target_writer_git_sha;
-  if (!/^[0-9a-f]{40}$/.test(String(targetWriterGitSha || ""))) {
-    throw new Error("checkpoint target writer Git SHA is malformed");
-  }
-  // Despite its historical name, this helper requires durable completed-object
-  // evidence, not final migration completion. It authenticates the entire journal.
-  const completed = findPostMigrationCompletedObjectEvidence({
-    recoveryRoot: `${checkpointPath}.recovery`,
-    sourceKey: process.env.SOURCE_KEY,
-    expectedCheckpointSha256: sha(checkpointBody),
-    expectedCheckpointByteSize: checkpointBody.byteLength,
-    expectedAuthoritySha256: checkpoint.authority_sha256,
-    expectedMigrationRunId: migrationRunId,
-    expectedPlanSha256: planSha,
-    expectedTargetWriterGitSha: targetWriterGitSha,
-  });
-  if (
-    completed.key !== process.env.SOURCE_KEY ||
-    completed.sha256 !== sourceSha ||
-    completed.byte_size !== source.byteLength ||
-    completed.verified !== true || completed.durable !== true
-  ) {
-    throw new Error("source root differs from authenticated durable recovery evidence");
-  }
-  console.log("PASS: current R2 canonical source matches authenticated durable recovery evidence");
+if (sha(source) !== process.env.SOURCE_SHA) throw new Error("source root SHA mismatch");
+if (JSON.parse(source).content_hash !== process.env.SOURCE_CONTENT_HASH) {
+  throw new Error("source root content hash mismatch");
 }
+if (sha(inventory) !== process.env.INVENTORY_SHA) throw new Error("inventory root SHA mismatch");
 NODE
-  pass "current R2 backup inventory matches the pinned rollback plan"
+  pass "current R2 canonical source and backup inventory match the pinned pre-migration plan"
 else
   node --input-type=module <<'NODE' || fail "current R2 backup inventory differs from the pinned rollback plan"
 import crypto from "node:crypto";
