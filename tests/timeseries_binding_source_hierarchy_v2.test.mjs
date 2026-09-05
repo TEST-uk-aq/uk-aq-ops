@@ -114,7 +114,7 @@ test("backup root reference retains authoritative source root identity", () => {
   assert.equal(reference.source_manifest_root_hash, h("c"));
 });
 
-test("refresh bootstraps once then skips the complete physical listing", async () => {
+test("refresh skips byte-identical hierarchy objects despite opaque real-R2-style ETags", async () => {
   const bindingPrefix = "history/_index_v2/timeseries_binding";
   const inventoryPrefix = "history/_index_v2/backup_inventory_v2";
   const physical = [
@@ -175,6 +175,9 @@ test("refresh bootstraps once then skips the complete physical listing", async (
   );
 
   let listCalls = 0;
+  const putKeys = [];
+  const getKeys = [];
+  const storedSha256 = new Map();
   const adapter = {
     async headObject({ key }) {
       if (!objects.has(key)) return { exists: false, key };
@@ -182,18 +185,27 @@ test("refresh bootstraps once then skips the complete physical listing", async (
       return {
         exists: true,
         key,
-        etag: md5(body),
+        // R2 ETags are opaque validators. Multipart or migrated-object ETags
+        // are not body MD5s and may include validator syntax or a part suffix.
+        etag: key.includes("/_manifests/")
+          ? `W/\"${md5(body).toUpperCase()}-1\"`
+          : md5(body),
         bytes: Buffer.byteLength(body),
+        sha256: storedSha256.get(key) || null,
       };
     },
     async getObject({ key }) {
+      getKeys.push(key);
       if (!objects.has(key)) throw new Error(`missing ${key}`);
       const body = Buffer.from(objects.get(key));
       return { key, bytes: body.byteLength, body, etag: md5(body) };
     },
-    async putObject({ key, body }) {
+    async putObject({ key, body, sha256: expectedSha256 }) {
       const text = Buffer.from(body).toString("utf8");
+      putKeys.push(key);
       objects.set(key, text);
+      assert.equal(expectedSha256, sha256(text));
+      storedSha256.set(key, expectedSha256);
       return { key, bytes: Buffer.byteLength(text), etag: md5(text) };
     },
     async listAllObjects({ prefix }) {
@@ -222,6 +234,32 @@ test("refresh bootstraps once then skips the complete physical listing", async (
   assert.equal(first.reused_from_backup_inventory, 2);
   assert.equal(first.read_and_hashed, 0);
   assert.equal(listCalls, 1);
+  assert.equal(first.range_manifests_written, 2);
+  assert.equal(first.source_root_written, true);
+
+  // Simulate legacy hierarchy range objects that predate stored SHA-256 and
+  // expose an opaque multipart/weak-validator-shaped ETag. With no root cache,
+  // exact GET comparison must still skip their PUTs.
+  objects.delete(`${bindingPrefix}/_manifests/root.json`);
+  objects.delete(`${bindingPrefix}/_manifests/_refresh_state.json`);
+  storedSha256.delete(`${bindingPrefix}/_manifests/range=000000-000999.json`);
+  storedSha256.delete(`${bindingPrefix}/_manifests/range=001000-001999.json`);
+  putKeys.length = 0;
+  getKeys.length = 0;
+  const legacyComparison = await refreshTimeseriesBindingSourceHierarchy({
+    r2,
+    bindingPrefix,
+    backupInventoryRootPrefix: inventoryPrefix,
+    sourceFingerprint: fingerprint,
+    writeR2: true,
+  });
+  assert.equal(legacyComparison.range_manifests_changed, 0);
+  assert.equal(legacyComparison.range_manifests_written, 0);
+  assert.equal(legacyComparison.change_detection_get_count, 2);
+  assert.deepEqual(legacyComparison.unchanged_equality_methods, {
+    exact_body_get: 2,
+  });
+  assert.equal(putKeys.some((key) => key.includes("/range=")), false);
 
   const second = await refreshTimeseriesBindingSourceHierarchy({
     r2,
@@ -233,5 +271,59 @@ test("refresh bootstraps once then skips the complete physical listing", async (
   assert.equal(second.status, "skipped");
   assert.equal(second.physical_listing_performed, false);
   assert.equal(second.physical_bindings_listed, 0);
-  assert.equal(listCalls, 1);
+  assert.equal(listCalls, 2);
+
+  putKeys.length = 0;
+  getKeys.length = 0;
+  const changedFingerprint = await refreshTimeseriesBindingSourceHierarchy({
+    r2,
+    bindingPrefix,
+    backupInventoryRootPrefix: inventoryPrefix,
+    sourceFingerprint: h("e"),
+    writeR2: true,
+  });
+  assert.equal(changedFingerprint.status, "succeeded");
+  assert.equal(changedFingerprint.physical_bindings_listed, 2);
+  assert.equal(changedFingerprint.reused_from_source_hierarchy, 2);
+  assert.equal(changedFingerprint.range_manifests_changed, 0);
+  assert.equal(changedFingerprint.range_manifests_written, 0);
+  assert.equal(changedFingerprint.source_root_changed, false);
+  assert.equal(changedFingerprint.source_root_written, false);
+  assert.equal(changedFingerprint.refresh_state_changed, true);
+  assert.equal(changedFingerprint.refresh_state_written, true);
+  assert.equal(changedFingerprint.change_detection_get_count, 0);
+  assert.deepEqual(changedFingerprint.unchanged_equality_methods, {
+    cached_exact_body: 3,
+  });
+  assert.deepEqual(putKeys, [
+    `${bindingPrefix}/_manifests/_refresh_state.json`,
+  ]);
+
+  putKeys.length = 0;
+  getKeys.length = 0;
+  objects.set(
+    `${bindingPrefix}/timeseries_id=434.json`,
+    '{"timeseries_id":434,"connector_id":1,"station_id":9}\n',
+  );
+  const changedRange = await refreshTimeseriesBindingSourceHierarchy({
+    r2,
+    bindingPrefix,
+    backupInventoryRootPrefix: inventoryPrefix,
+    sourceFingerprint: h("d"),
+    writeR2: true,
+  });
+  assert.equal(changedRange.range_manifests_changed, 1);
+  assert.equal(changedRange.range_manifests_written, 1);
+  assert.equal(changedRange.source_root_changed, true);
+  assert.equal(changedRange.source_root_written, true);
+  assert.equal(changedRange.refresh_state_changed, true);
+  assert.equal(changedRange.refresh_state_written, true);
+  assert.deepEqual(putKeys, [
+    `${bindingPrefix}/_manifests/range=000000-000999.json`,
+    `${bindingPrefix}/_manifests/root.json`,
+    `${bindingPrefix}/_manifests/_refresh_state.json`,
+  ]);
+  for (const key of putKeys) {
+    assert.ok(getKeys.includes(key), `expected exact read-back verification for ${key}`);
+  }
 });

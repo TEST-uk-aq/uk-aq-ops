@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
+
 import {
-  normalizeR2Sha256Checksum,
   normalizePrefix,
   r2GetObject,
   r2HeadObject,
@@ -69,6 +70,10 @@ function stableJson(value) {
 function stripEtagQuotes(value) {
   const normalized = String(value || "").trim().replace(/^"|"$/g, "").toLowerCase();
   return normalized || null;
+}
+
+function md5Hex(body) {
+  return createHash("md5").update(body).digest("hex");
 }
 
 function normalizeRangeBounds(rangeStart, rangeEnd = null) {
@@ -315,94 +320,39 @@ export function validateTimeseriesBindingSourceRootManifest(raw) {
   return canonical;
 }
 
-async function readJsonMaybe(r2, key, exactBodyByKey = null) {
+async function readJsonMaybe(r2, key) {
   const head = await r2HeadObject({ r2, key });
   if (!head?.exists) return null;
   const object = await r2GetObject({ r2, key });
-  const text = object.body.toString("utf8");
-  exactBodyByKey?.set(key, text);
   try {
-    return JSON.parse(text);
+    return JSON.parse(object.body.toString("utf8"));
   } catch (error) {
     throw new Error(`Invalid JSON at ${key}: ${error?.message || error}`);
   }
 }
 
-async function writeJsonIfChanged({
-  r2,
-  key,
-  payload,
-  writeR2,
-  existingExactBody = null,
-}) {
+async function writeJsonIfChanged({ r2, key, payload, writeR2 }) {
   const text = stableJson(payload);
-  const hash = sha256Hex(text);
-  const size = Buffer.byteLength(text);
-  let equalityMethod = null;
-  let comparisonGetPerformed = false;
-
-  if (existingExactBody !== null) {
-    if (existingExactBody === text) equalityMethod = "cached_exact_body";
-  } else {
-    const head = await r2HeadObject({ r2, key });
-    if (head?.exists) {
-      const storedSha256 = normalizeR2Sha256Checksum(
-        head.sha256 ?? head.checksums?.sha256,
-      );
-      if (storedSha256) {
-        const storedSize = head.bytes ?? head.size;
-        const sizeMatches = storedSize === null
-          || storedSize === undefined
-          || storedSize === ""
-          || Number(storedSize) === size;
-        if (storedSha256 === hash && sizeMatches) equalityMethod = "stored_sha256";
-      } else {
-        const existing = await r2GetObject({ r2, key });
-        comparisonGetPerformed = true;
-        if (existing.body.toString("utf8") === text) equalityMethod = "exact_body_get";
-      }
-    }
-  }
-
-  if (equalityMethod) {
-    return {
-      changed: false,
-      written: false,
-      hash,
-      size,
-      equality_method: equalityMethod,
-      comparison_get_performed: comparisonGetPerformed,
-    };
+  const nextMd5 = md5Hex(text);
+  const head = await r2HeadObject({ r2, key });
+  const existingMd5 = head?.exists ? stripEtagQuotes(head.etag) : null;
+  if (existingMd5 && existingMd5 === nextMd5) {
+    return { changed: false, written: false, hash: sha256Hex(text), size: Buffer.byteLength(text) };
   }
   if (!writeR2) {
-    return {
-      changed: true,
-      written: false,
-      hash,
-      size,
-      equality_method: null,
-      comparison_get_performed: comparisonGetPerformed,
-    };
+    return { changed: true, written: false, hash: sha256Hex(text), size: Buffer.byteLength(text) };
   }
   await r2PutObject({
     r2,
     key,
     body: text,
     content_type: "application/json; charset=utf-8",
-    sha256: hash,
   });
   const verified = await r2GetObject({ r2, key });
   if (verified.body.toString("utf8") !== text) {
     throw new Error(`Timeseries binding source hierarchy verification failed: ${key}`);
   }
-  return {
-    changed: true,
-    written: true,
-    hash,
-    size,
-    equality_method: null,
-    comparison_get_performed: comparisonGetPerformed,
-  };
+  return { changed: true, written: true, hash: sha256Hex(text), size: Buffer.byteLength(text) };
 }
 
 function normalizeListedPhysicalBinding(entry, bindingPrefix) {
@@ -440,11 +390,11 @@ function sourceUnitMap(rangeManifests) {
   return out;
 }
 
-async function loadExistingSourceUnits(r2, root, exactBodyByKey = null) {
+async function loadExistingSourceUnits(r2, root) {
   if (!root) return new Map();
   const ranges = [];
   for (const rangeRef of root.ranges) {
-    const raw = await readJsonMaybe(r2, rangeRef.manifest_key, exactBodyByKey);
+    const raw = await readJsonMaybe(r2, rangeRef.manifest_key);
     if (!raw) {
       throw new Error(`Timeseries binding source range missing: ${rangeRef.manifest_key}`);
     }
@@ -544,16 +494,11 @@ export async function refreshTimeseriesBindingSourceHierarchy({
   const prefix = normalizePrefix(bindingPrefix);
   const rootKey = timeseriesBindingSourceRootKey(prefix);
   const refreshStateKey = timeseriesBindingSourceRefreshStateKey(prefix);
-  const existingExactBodyByKey = new Map();
-  const existingRootRaw = await readJsonMaybe(r2, rootKey, existingExactBodyByKey);
+  const existingRootRaw = await readJsonMaybe(r2, rootKey);
   const existingRoot = existingRootRaw
     ? validateTimeseriesBindingSourceRootManifest(existingRootRaw)
     : null;
-  const existingRefreshState = await readJsonMaybe(
-    r2,
-    refreshStateKey,
-    existingExactBodyByKey,
-  );
+  const existingRefreshState = await readJsonMaybe(r2, refreshStateKey);
   const fingerprint = normalizeSourceFingerprint(sourceFingerprint);
 
   if (
@@ -580,18 +525,10 @@ export async function refreshTimeseriesBindingSourceHierarchy({
       range_manifests_written: 0,
       source_root_changed: false,
       source_root_written: false,
-      refresh_state_changed: false,
-      refresh_state_written: false,
-      change_detection_get_count: 0,
-      unchanged_equality_methods: {},
     };
   }
 
-  const priorSourceUnits = await loadExistingSourceUnits(
-    r2,
-    existingRoot,
-    existingExactBodyByKey,
-  );
+  const priorSourceUnits = await loadExistingSourceUnits(r2, existingRoot);
   const backupUnits = priorSourceUnits.size === 0
     ? await loadBackupInventoryUnits(r2, backupInventoryRootPrefix)
     : new Map();
@@ -640,8 +577,6 @@ export async function refreshTimeseriesBindingSourceHierarchy({
   const rangeRefs = [];
   let rangeManifestsChanged = 0;
   let rangeManifestsWritten = 0;
-  let changeDetectionGetCount = 0;
-  const unchangedEqualityMethods = {};
   for (const rangeStart of [...groups.keys()].sort((a, b) => a - b)) {
     const rangeEnd = rangeStart + TIMESERIES_BINDING_SOURCE_RANGE_SIZE - 1;
     const manifest = buildTimeseriesBindingSourceRangeManifest({
@@ -660,13 +595,7 @@ export async function refreshTimeseriesBindingSourceHierarchy({
       key: manifestKey,
       payload: manifest,
       writeR2,
-      existingExactBody: existingExactBodyByKey.get(manifestKey) ?? null,
     });
-    if (write.comparison_get_performed) changeDetectionGetCount += 1;
-    if (!write.changed && write.equality_method) {
-      unchangedEqualityMethods[write.equality_method] =
-        (unchangedEqualityMethods[write.equality_method] || 0) + 1;
-    }
     if (write.changed) rangeManifestsChanged += 1;
     if (write.written) rangeManifestsWritten += 1;
     rangeRefs.push({
@@ -687,13 +616,7 @@ export async function refreshTimeseriesBindingSourceHierarchy({
     key: rootKey,
     payload: root,
     writeR2,
-    existingExactBody: existingExactBodyByKey.get(rootKey) ?? null,
   });
-  if (rootWrite.comparison_get_performed) changeDetectionGetCount += 1;
-  if (!rootWrite.changed && rootWrite.equality_method) {
-    unchangedEqualityMethods[rootWrite.equality_method] =
-      (unchangedEqualityMethods[rootWrite.equality_method] || 0) + 1;
-  }
 
   let refreshStateWrite = { changed: false, written: false };
   if (fingerprint) {
@@ -706,13 +629,7 @@ export async function refreshTimeseriesBindingSourceHierarchy({
         sourceRoot: root,
       }),
       writeR2,
-      existingExactBody: existingExactBodyByKey.get(refreshStateKey) ?? null,
     });
-    if (refreshStateWrite.comparison_get_performed) changeDetectionGetCount += 1;
-    if (!refreshStateWrite.changed && refreshStateWrite.equality_method) {
-      unchangedEqualityMethods[refreshStateWrite.equality_method] =
-        (unchangedEqualityMethods[refreshStateWrite.equality_method] || 0) + 1;
-    }
   }
 
   return {
@@ -732,7 +649,5 @@ export async function refreshTimeseriesBindingSourceHierarchy({
     source_root_written: rootWrite.written,
     refresh_state_changed: refreshStateWrite.changed,
     refresh_state_written: refreshStateWrite.written,
-    change_detection_get_count: changeDetectionGetCount,
-    unchanged_equality_methods: unchangedEqualityMethods,
   };
 }
