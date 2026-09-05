@@ -22,12 +22,6 @@ import {
   DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import { normalizeObservationPropertyCode } from "../../workers/shared/uk_aq_observation_property_code.mjs";
-import {
-  TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION,
-  buildTimeseriesBindingSourceState,
-  validTimeseriesBindingSourceState,
-} from "./lib/timeseries_binding_source_state_v2.mjs";
-export { TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION, buildTimeseriesBindingSourceState };
 
 export function resolveCoreSnapshotPrefix(env = process.env) {
   const version = resolveR2HistoryVersion(env, { context: "R2 core snapshot" });
@@ -106,6 +100,8 @@ export const DEFAULT_TABLES = Object.freeze([
   "sos_station_timeseries_site_refs",
 ]);
 const V2_ONLY_DEFAULT_TABLES = Object.freeze(["station_initial_metadata"]);
+export const TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION = 2;
+const TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION = 1;
 const TIMESERIES_BINDING_SOURCE_TABLES = Object.freeze(["timeseries", "phenomena", "observed_properties"]);
 
 export function buildTimeseriesBindingSourceFingerprint(tableArtifacts, continuityRows = []) {
@@ -142,6 +138,21 @@ export function buildTimeseriesBindingSourceFingerprint(tableArtifacts, continui
   return { fingerprint: createHash("sha256").update(canonical).digest("hex"), tables, continuity };
 }
 
+export function buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema, sourceFingerprint, sourceTables, authoritativeTimeseriesCount }) {
+  return {
+    schema_version: TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION,
+    history_version: "v2",
+    state_kind: "timeseries_binding_source_state",
+    timeseries_binding_index_prefix: normalizePrefix(bindingPrefix),
+    fingerprint_algorithm: "sha256",
+    fingerprint_version: TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION,
+    source_schema: String(sourceSchema || "").trim(),
+    source_fingerprint: sourceFingerprint,
+    source_tables: sourceTables,
+    authoritative_timeseries_count: authoritativeTimeseriesCount,
+  };
+}
+
 async function readTimeseriesContinuityRows(connectionString) {
   return withPgClient(connectionString, async (client) => {
     const result = await client.query(`
@@ -151,6 +162,19 @@ async function readTimeseriesContinuityRows(connectionString) {
     `);
     return result.rows || [];
   });
+}
+
+function validTimeseriesBindingSourceState(state, { bindingPrefix, sourceSchema }) {
+  return Boolean(state && typeof state === "object" && !Array.isArray(state)
+    && state.schema_version === TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION
+    && state.history_version === "v2"
+    && state.state_kind === "timeseries_binding_source_state"
+    && state.fingerprint_algorithm === "sha256"
+    && state.fingerprint_version === TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION
+    && state.timeseries_binding_index_prefix === normalizePrefix(bindingPrefix)
+    && state.source_schema === String(sourceSchema || "").trim()
+    && /^[a-f0-9]{64}$/.test(String(state.source_fingerprint || ""))
+    && Array.isArray(state.source_tables));
 }
 
 function usage() {
@@ -867,10 +891,11 @@ async function main(args) {
           };
           if (!args.dry_run && reconciliation.status === "succeeded" && reconciliation.invalid_binding_count === 0) {
             const state = buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema, sourceFingerprint: source.fingerprint, sourceTables: source.tables, authoritativeTimeseriesCount: reconciliation.authoritative_timeseries_count });
-            // The hierarchy command commits this proposal only after range, root
-            // and refresh-state publication has completed successfully.
-            report.timeseries_binding_reconciliation.proposed_source_state = state;
-            report.timeseries_binding_reconciliation.source_state_status = "awaiting_hierarchy_commit";
+            const body = `${JSON.stringify(state, null, 2)}\n`;
+            await r2PutObject({ r2, key: sourceStateKey, body, content_type: "application/json; charset=utf-8" });
+            const verified = await r2GetObject({ r2, key: sourceStateKey });
+            if (verified.body.toString("utf8") !== body) throw new Error("timeseries_binding_source_state_verification_failed");
+            report.timeseries_binding_reconciliation.source_state_status = "written";
           }
           }
         }

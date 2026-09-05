@@ -3000,10 +3000,7 @@ function preparedUnitFromRecord(authorityUnit, record, {
   ) {
     throw new Error(`Prepared unit logical identity changed: ${authorityUnit.unit_id}`);
   }
-  // Historical ordering is reconstructed from authenticated metadata using the
-  // original builder, even when the effective record now pins an exact body.
-  // Only the separate completed-evidence/seed gate can authorise its reuse.
-  const targetManifestObject = legacyOriginalOrdering
+  const targetManifestObject = legacyOriginalOrdering && !hasExactManifestBody
     ? rebuildLegacyPreparedManifestObject(authorityUnit, record)
     : canonicalJsonObjectFromBody({
         key: authorityUnit.source_manifest_identity.key,
@@ -3017,7 +3014,7 @@ function preparedUnitFromRecord(authorityUnit, record, {
           sha256: intent.sha256,
         })),
       });
-  const targetManifestPayload = legacyOriginalOrdering
+  const targetManifestPayload = legacyOriginalOrdering && !hasExactManifestBody
     ? targetManifestObject.payload
     : record.target_manifest;
   const hierarchy = includeV3Hierarchy ? buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
@@ -3115,21 +3112,6 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
   const { units, canonicalObjects } = reconstructPreparedCanonicalPlan({
     checkpoint, authority, allowLegacyRecoveryOrdering, legacyOriginalOrdering, onProgress,
   });
-  return completePreparedV3Plan({ checkpoint, authority, units, canonicalObjects, onProgress });
-}
-
-function completePreparedV3Plan({ checkpoint, authority, units: canonicalUnits, canonicalObjects, onProgress = null }) {
-  // Reuse canonical bytes/schedule already checked by the recovery gate. Only
-  // the current exact-leaf hierarchy is materialised, once the gate succeeds.
-  onProgress?.({ phase: "v3_hierarchies" });
-  const units = canonicalUnits.map((unit) => unit.v3_hierarchy ? unit : Object.freeze({
-    ...unit,
-    v3_hierarchy: buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
-      metadata: unit.target_metadata,
-      canonicalManifest: canonicalManifestDescriptor(unit.target_manifest_object, unit.target_manifest),
-      indexRoot: checkpoint.prepared_units[unit.unit_id].v3_index_root,
-    }),
-  }));
   onProgress?.({ phase: "v3_latest" });
   const latest = buildObservationHistoryExactLeafIndexV3Latest({
     scopedHierarchies: units.map((unit) => unit.v3_hierarchy),
@@ -3330,12 +3312,9 @@ async function reverifyCompletedMigrationObjects({
     const batch = objects.slice(offset, offset + concurrency);
     const results = await Promise.allSettled(batch.map(async (expected) => {
       const evidence = checkpoint.completed_objects[expected.key];
-      const evidenceResult = classifyCompletedCanonicalEvidence(
-        evidence, { ...expected, require_stored_sha256: requireStoredSha256 },
-        legacyCanonicalIdentities?.[expected.key],
-      );
-      if (evidenceResult.classification === "FAIL") throw new Error(evidenceResult.reason);
-      const legacyMatch = evidenceResult.classification === "LEGACY_RECOVERY_ORDERING";
+      const legacyMatch = !requireStoredSha256 && !expected.key.endsWith(".parquet") &&
+        !completionEvidenceMatches(evidence, expected) &&
+        completedEvidenceMatchesAllowedHistoricalIdentity(evidence, legacyCanonicalIdentities?.[expected.key]);
       const verificationArgs = {
         checkpointEntry: evidence,
         expected,
@@ -3346,12 +3325,11 @@ async function reverifyCompletedMigrationObjects({
       const current = legacyMatch
         ? await verifyCurrentMigrationObjectIdentity(verificationArgs)
         : await verifyObservationHistoryV3CheckpointReuse(verificationArgs);
-      if (!current.reusable) throw new Error(`${current.reason}; completed_evidence=${evidenceResult.classification}`);
+      if (!current.reusable) throw new Error(current.reason);
       const result = { ...current, classification: legacyMatch ? "LEGACY_RECOVERY_ORDERING" : "EXACT" };
       return { byte_size: expected.byte_size, sha256: expected.sha256, result };
     }));
     let failure = null;
-    const failedIdentities = [];
     for (const [index, result] of results.entries()) {
       const key = batch[index].key;
       if (result.status === "fulfilled") {
@@ -3364,18 +3342,14 @@ async function reverifyCompletedMigrationObjects({
         progress.report(completed);
       } else {
         counts.failed += 1;
-        const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
-        failedIdentities.push(Object.freeze({ key, reason }));
-        failure ||= new Error(`${label} failed: ${key}: ${reason}`, { cause: result.reason });
+        failure ||= new Error(`${label} failed: ${key}: ${
+          result.reason instanceof Error ? result.reason.message : String(result.reason)
+        }`, { cause: result.reason });
       }
     }
     // Already-started checks settled; no further reads or publication follow a failure.
     if (failure) {
       reportCounts();
-      if (enabled && reportClassifications) for (const { key, reason } of failedIdentities) {
-        process.stderr.write(`V3 migration: failed canonical recovery identity: ${key}: ${reason}\n`);
-      }
-      failure.failed_identities = Object.freeze(failedIdentities);
       throw failure;
     }
   }
@@ -3520,10 +3494,9 @@ export async function executeObservationHistoryV3MigrationPlan({
   )) {
     throw new Error("Resume verification requires matching authenticated replay state");
   }
-  const legacyAuthority = validateLegacyRecoveryOrderingAuthority({
+  const allowLegacyRecoveryOrdering = validateLegacyRecoveryOrderingAuthority({
     checkpoint, recoveryAuthority, allowLegacyRecoveryOrdering: Boolean(authenticatedResume),
   });
-  const allowLegacyRecoveryOrdering = legacyAuthority.eligible;
   const publishedParquet = authenticatedResume ? plan.units.flatMap((unit) => {
     const record = checkpoint.prepared_units[unit.unit_id];
     return record?.files_published === true
@@ -3687,19 +3660,32 @@ export async function executeObservationHistoryV3MigrationPlan({
       partitionProgress.report(completedPartitions);
     }
   }
-  const onCurrentProgress = recoveredPlanProgress(progressEnabled);
-  const currentCanonical = reconstructPreparedCanonicalPlan({
-    checkpoint, authority: checkpoint.authority, allowLegacyRecoveryOrdering,
-    includeV3Hierarchy: false, onProgress: onCurrentProgress,
+  const completedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint,
+    requirePrepared: true,
+    allowLegacyRecoveryOrdering,
+    onProgress: recoveredPlanProgress(progressEnabled),
   });
-  const { legacyCanonicalIdentities } = reconcileCompletedCanonicalHistory({
-    checkpoint, currentCanonical, legacyAuthority,
-    onHistoricalProgress: () => recoveredPlanProgress(
+  onReconstructedPlan?.(completedPlan);
+  let legacyCanonicalIdentities = null;
+  if (allowLegacyRecoveryOrdering) {
+    const onHistoricalProgress = recoveredPlanProgress(
       progressEnabled, "V3 migration: reconstructing historical canonical identities",
-    ),
-  });
+    );
+    const historical = reconstructPreparedCanonicalPlan({
+      checkpoint, authority: checkpoint.authority,
+      allowLegacyRecoveryOrdering: true, legacyOriginalOrdering: true,
+      includeV3Hierarchy: false,
+      onProgress: onHistoricalProgress,
+    });
+    onHistoricalProgress?.({ phase: "complete", canonical: historical.canonicalObjects.length, v3: 0 });
+    legacyCanonicalIdentities = historicalObjectIdentitySets(historical.canonicalObjects);
+    requireLegacyRecoveryOrderingSeed({
+      units: completedPlan.units, checkpoint, legacyAllowedIdentities: legacyCanonicalIdentities,
+    });
+  }
   const reverifiedCanonical = await reverifyCompletedMigrationObjects({
-    objects: authenticatedResume ? currentCanonical.canonicalObjects.filter(
+    objects: authenticatedResume ? completedPlan.canonical_publication_objects.filter(
       (object) => Object.hasOwn(checkpoint.completed_objects, object.key),
     ) : [],
     checkpoint, adapters, concurrency: publicationConcurrency, requireStoredSha256: false,
@@ -3707,11 +3693,6 @@ export async function executeObservationHistoryV3MigrationPlan({
     legacyCanonicalIdentities,
     reportClassifications: true,
   });
-  const completedPlan = completePreparedV3Plan({
-    checkpoint, authority: checkpoint.authority, ...currentCanonical,
-    onProgress: onCurrentProgress,
-  });
-  onReconstructedPlan?.(completedPlan);
   const canonicalPublicationProgress = createMigrationProgressReporter({
     label: "V3 migration: canonical publication objects",
     total: completedPlan.canonical_publication_objects.length,
@@ -4165,6 +4146,10 @@ function completionEvidenceMatches(evidence, expected) {
     );
 }
 
+function historicalDependencyIdentitySets(plan) {
+  return historicalObjectIdentitySets([...migrationRequiredDependencies(plan).values()]);
+}
+
 function historicalObjectIdentitySets(objects) {
   return Object.freeze(Object.fromEntries(
     objects.map((entry) => [
@@ -4184,20 +4169,6 @@ function completedEvidenceMatchesAllowedHistoricalIdentity(evidence, allowed) {
     evidence.byte_size === identity.byte_size &&
     evidence.sha256 === identity.sha256
   );
-}
-
-function classifyCompletedCanonicalEvidence(evidence, expected, historicalIdentities) {
-  if (completionEvidenceMatches(evidence, expected)) return { classification: "EXACT", reason: null };
-  if (!expected.key.endsWith(".parquet") && expected.require_stored_sha256 !== true &&
-    completedEvidenceMatchesAllowedHistoricalIdentity(evidence, historicalIdentities)) {
-    return { classification: "LEGACY_RECOVERY_ORDERING", reason: null };
-  }
-  return {
-    classification: "FAIL",
-    reason: `checkpoint_identity_mismatch:${historicalIdentities?.length
-      ? "completed_evidence_matches_neither_current_nor_historical"
-      : "historical_identity_not_generated"}`,
-  };
 }
 
 export async function verifyObservationHistoryV3CurrentDependencies({
@@ -4312,6 +4283,15 @@ function validateLegacyRecoveryOrderingAuthority({
   const hasLegacyPreparedRecords = Object.values(checkpoint?.prepared_units || {}).some(
     (record) => typeof record?.target_manifest_body !== "string",
   );
+  if (hasLegacyPreparedRecords && !allowLegacyRecoveryOrdering) {
+    throw new Error("reconstructed_target_mismatch:legacy prepared canonical body is absent");
+  }
+  if (
+    hasLegacyPreparedRecords &&
+    checkpoint?.authority?.environment?.environment !== "TEST"
+  ) {
+    throw new Error("recovery_evidence_invalid:legacy recovery ordering is TEST-only");
+  }
   const recoveryAuthorityValid = recoveryAuthority?.authenticated === true &&
     recoveryAuthority.immutable_authority_sha256 === checkpoint?.authority_sha256 &&
     recoveryAuthority.migration_run_id === checkpoint?.migration_run_id &&
@@ -4322,44 +4302,10 @@ function validateLegacyRecoveryOrderingAuthority({
     recoveryAuthority.last_sequence > 0 &&
     SHA256_PATTERN.test(String(recoveryAuthority.original_checkpoint_sha256 || "")) &&
     SHA256_PATTERN.test(String(recoveryAuthority.last_entry_sha256 || ""));
-  const reason = !allowLegacyRecoveryOrdering
-    ? "reconstructed_target_mismatch:legacy prepared canonical body is absent or historical recovery is not enabled"
-    : checkpoint?.authority?.environment?.environment !== "TEST"
-      ? "recovery_evidence_invalid:legacy recovery ordering is TEST-only"
-      : !recoveryAuthorityValid
-        ? "recovery_evidence_invalid:authenticated recovery journal is required"
-        : null;
-  if (hasLegacyPreparedRecords && reason) throw new Error(reason);
-  return Object.freeze({ eligible: reason === null, reason });
-}
-
-// Prepared-record format controls how a record is validated, never whether
-// authenticated completed canonical evidence needs historical reconciliation.
-function reconcileCompletedCanonicalHistory({
-  checkpoint, currentCanonical, legacyAuthority, onHistoricalProgress = null,
-}) {
-  const historicalCanonicalReconciliationRequired = currentCanonical.canonicalObjects.some((entry) =>
-    Object.hasOwn(checkpoint.completed_objects || {}, entry.key) &&
-    !completionEvidenceMatches(checkpoint.completed_objects[entry.key], entry)
-  );
-  if (!historicalCanonicalReconciliationRequired) {
-    return { historicalCanonicalReconciliationRequired, legacyCanonicalIdentities: null };
+  if (hasLegacyPreparedRecords && !recoveryAuthorityValid) {
+    throw new Error("recovery_evidence_invalid:authenticated recovery journal is required");
   }
-  if (!legacyAuthority.eligible) {
-    throw new Error(`historical_authority_invalid:${legacyAuthority.reason}`);
-  }
-  const progress = onHistoricalProgress?.();
-  const historical = reconstructPreparedCanonicalPlan({
-    checkpoint, authority: checkpoint.authority,
-    allowLegacyRecoveryOrdering: true, legacyOriginalOrdering: true,
-    includeV3Hierarchy: false, onProgress: progress,
-  });
-  progress?.({ phase: "complete", canonical: historical.canonicalObjects.length, v3: 0 });
-  const legacyCanonicalIdentities = historicalObjectIdentitySets(historical.canonicalObjects);
-  requireLegacyRecoveryOrderingSeed({
-    units: currentCanonical.units, checkpoint, legacyAllowedIdentities: legacyCanonicalIdentities,
-  });
-  return { historicalCanonicalReconciliationRequired, legacyCanonicalIdentities };
+  return hasLegacyPreparedRecords;
 }
 
 function requireLegacyRecoveryOrderingSeed({ units, checkpoint, legacyAllowedIdentities }) {
@@ -4385,35 +4331,31 @@ export function buildObservationHistoryV3RerunVerificationPlan({
   allowLegacyRecoveryOrdering = false,
   recoveryAuthority = null,
 }) {
-  const authority = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
-  const legacyAuthority = validateLegacyRecoveryOrderingAuthority({
+  const hasLegacyPreparedRecords = validateLegacyRecoveryOrderingAuthority({
     checkpoint, allowLegacyRecoveryOrdering, recoveryAuthority,
   });
-  let currentCanonical;
+  let pinnedPlan;
+  let legacyPlan = null;
   try {
-    currentCanonical = reconstructPreparedCanonicalPlan({
-      checkpoint, authority, allowLegacyRecoveryOrdering: legacyAuthority.eligible,
-      includeV3Hierarchy: false,
+    pinnedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+      checkpoint,
+      requirePrepared: true,
+      allowLegacyRecoveryOrdering: hasLegacyPreparedRecords,
     });
+    if (hasLegacyPreparedRecords) {
+      legacyPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+        checkpoint,
+        requirePrepared: true,
+        allowLegacyRecoveryOrdering: true,
+        legacyOriginalOrdering: true,
+      });
+    }
   } catch (error) {
     throw new Error(
       `reconstructed_target_mismatch:${error instanceof Error ? error.message : String(error)}`,
       { cause: error },
     );
   }
-  const { historicalCanonicalReconciliationRequired, legacyCanonicalIdentities } =
-    reconcileCompletedCanonicalHistory({ checkpoint, currentCanonical, legacyAuthority });
-  const legacyAllowedIdentities = legacyCanonicalIdentities || Object.freeze({});
-  // Reject unexplained canonical evidence before constructing any v3 hierarchy.
-  for (const entry of currentCanonical.canonicalObjects) {
-    const result = classifyCompletedCanonicalEvidence(
-      checkpoint.completed_objects?.[entry.key], entry, legacyAllowedIdentities[entry.key],
-    );
-    if (result.classification === "FAIL") {
-      throw new Error(`recovery_evidence_invalid:${entry.key}:${result.reason}`);
-    }
-  }
-  const pinnedPlan = completePreparedV3Plan({ checkpoint, authority, ...currentCanonical });
   if (
     checkpoint?.migration_run_id !== pinnedPlan.migration_run_id ||
     checkpoint?.backup_gate?.verified !== true ||
@@ -4431,9 +4373,15 @@ export function buildObservationHistoryV3RerunVerificationPlan({
     throw new Error("Current plan does not match the pinned migration authority");
   }
   const requiredDependencies = migrationRequiredDependencies(pinnedPlan);
+  const legacyAllowedIdentities = legacyPlan
+    ? historicalDependencyIdentitySets(legacyPlan)
+    : Object.freeze({});
+  const legacyOrderingSeedVerified = hasLegacyPreparedRecords && requireLegacyRecoveryOrderingSeed({
+    units: pinnedPlan.units, checkpoint, legacyAllowedIdentities,
+  });
   for (const [key, entry] of requiredDependencies) {
     const completed = checkpoint.completed_objects?.[entry.key];
-    const legacyMatch = historicalCanonicalReconciliationRequired &&
+    const legacyMatch = legacyOrderingSeedVerified &&
       !key.endsWith(".parquet") &&
       completedEvidenceMatchesAllowedHistoricalIdentity(
         completed,
@@ -4449,7 +4397,7 @@ export function buildObservationHistoryV3RerunVerificationPlan({
     ...pinnedPlan,
     blockers: Object.freeze([]),
     recovery_reconciliation: Object.freeze({
-      mode: historicalCanonicalReconciliationRequired ? "LEGACY_RECOVERY_ORDERING" : "EXACT",
+      mode: hasLegacyPreparedRecords ? "LEGACY_RECOVERY_ORDERING" : "EXACT",
       legacy_allowed_identities: legacyAllowedIdentities,
     }),
   });

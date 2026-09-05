@@ -153,7 +153,7 @@ jobs:
           echo "Running: ${cmd[*]}"
           "${cmd[@]}"
 
-      - name: Refresh timeseries binding source hierarchy and commit source state
+      - name: Refresh timeseries binding source hierarchy
         run: |
           set -euo pipefail
           mkdir -p tmp
@@ -178,7 +178,6 @@ jobs:
 
           cmd=(
             node scripts/backup_r2/uk_aq_refresh_timeseries_binding_source_hierarchy.mjs
-            --core-snapshot-report "tmp/uk_aq_core_snapshot_to_r2_report.json"
             --binding-prefix "${UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX}"
             --backup-inventory-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
             --report-out "tmp/uk_aq_timeseries_binding_source_hierarchy_report.json"
