@@ -519,6 +519,12 @@ NODE
   if [ "$MODE" = "verify" ]; then
     validate_read_only_dependency_authority "$REPO_ROOT" "$TARGET_WRITER_GIT_SHA"
     LOAD_AUTHORITY_DRIFT=""
+  elif [ "$MODE" = "rollback" ]; then
+    node --max-old-space-size=4096 "$SCRIPT_DIR/rollback_executor_authority.mjs" \
+      "$CHECKPOINT" "$MIGRATION_RUN_ID" "$PLAN_SHA" "$TARGET_WRITER_GIT_SHA" \
+      "$TRANSITION" "$INVENTORY_SHA" "$STATE_SHA" \
+      || stop "rollback executor does not authenticate the immutable historical authority"
+    LOAD_AUTHORITY_DRIFT=""
   elif [ "$MODE" = "resume" ]; then
     printf '%s' "$TARGET_WRITER_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' \
       || stop "pinned target writer Git SHA is malformed"

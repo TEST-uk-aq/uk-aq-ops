@@ -565,7 +565,21 @@ CRITICAL_PATHS=(
   scripts/uk_aq_backfill_local.sh
   workers/uk_aq_backfill_local
 )
-if [ "$RECOVERY_AUTHORITY" -eq 1 ]; then
+if [ "$STAGE" = "rollback" ]; then
+  # Rollback interprets the original restore authority with reviewed current
+  # machinery; it does not use the migration's broad historical writer scope.
+  ROLLBACK_TARGET_WRITER="$AUTH_HEAD"
+  if [ "$RECOVERY_AUTHORITY" -eq 1 ]; then
+    ROLLBACK_TARGET_WRITER="$(jq -r '.payload.target_writer_git_sha' "$RECOVERY_MANIFEST")"
+  fi
+  node --max-old-space-size=4096 "$SCRIPT_DIR/rollback_executor_authority.mjs" \
+    "$CHECKPOINT" "$AUTH_RUN_ID" "$AUTH_PLAN_SHA" \
+    "$ROLLBACK_TARGET_WRITER" "$TRANSITION" \
+    "$(jq -r '.result.backup_gate.inventory_root.sha256' "$PLAN_REPORT")" \
+    "$(jq -r '.result.backup_gate.state_root.sha256' "$PLAN_REPORT")" \
+    || fail "rollback executor does not authenticate the immutable historical authority"
+  CRITICAL_DRIFT=""
+elif [ "$RECOVERY_AUTHORITY" -eq 1 ]; then
   CRITICAL_DRIFT="$(git diff --name-only "$AUTH_HEAD" "$CURRENT_HEAD" -- \
     "${CRITICAL_PATHS[@]}" \
     ':(exclude)scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs' \
@@ -578,7 +592,9 @@ fi
   printf '%s\n' "$CRITICAL_DRIFT" >&2
   fail "migration-critical code changed after the pinned authority"
 }
-if [ "$RECOVERY_AUTHORITY" -eq 1 ]; then
+if [ "$STAGE" = "rollback" ]; then
+  pass "current rollback executor and pinned historical restore semantics are authenticated"
+elif [ "$RECOVERY_AUTHORITY" -eq 1 ]; then
   pass "runtime/writer-critical code matches the pinned recovery authority; superseded recovery operator tooling is excluded"
 else
   pass "migration-critical code matches the pinned writer authority"

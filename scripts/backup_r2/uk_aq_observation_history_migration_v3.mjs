@@ -1719,6 +1719,25 @@ export async function runObservationHistoryMigrationV3({
       }`);
     }
     checkpoint = recoveryProgress.checkpoint;
+  } else if (checkpoint && new Set(["rollback-plan", "rollback"]).has(args.mode)) {
+    // Rollback never falls back to an unauthenticated checkpoint or requires
+    // the current recovery executor to impersonate the historical writer.
+    // Load this rollback-only helper lazily so resume/verify retain their
+    // existing dependency trust models.
+    const { authenticateRollbackExecutor } = await import(
+      "../index_v3_migration/rollback_executor_authority.mjs"
+    );
+    recoveryProgress = await authenticateRollbackExecutor({
+      repositoryRoot,
+      checkpointPath: args.checkpointIn,
+      migrationRunId: args.migrationRunId,
+      planSha256: args.expectedPlanSha256,
+      targetWriterGitSha: args.targetWriterGitSha,
+      transition: args.transition,
+      inventoryRootSha256: args.expectedInventoryRootSha256,
+      stateRootSha256: args.expectedStateRootSha256,
+    });
+    checkpoint = recoveryProgress.checkpoint;
   } else if (
     checkpoint &&
     fs.existsSync(recoveryProgressPaths(args.checkpointIn).manifest)
