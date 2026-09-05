@@ -94,47 +94,6 @@ function git(repositoryRoot, args) {
   return result.stdout;
 }
 
-function readGithubRepository(repositoryRoot) {
-  // gh resolves owner/repo from the same authenticated repository context used
-  // by the operator tooling. One uncached query obtains branch name and commit
-  // together; no local remote-tracking ref or hard-coded branch is authority.
-  const result = spawnSync("gh", [
-    "api", "graphql",
-    "-F", "owner={owner}", "-F", "name={repo}",
-    "-f", "query=query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { nameWithOwner defaultBranchRef { name target { ... on Commit { oid } } } } }",
-  ], { cwd: repositoryRoot, encoding: "utf8", timeout: 30_000, maxBuffer: 1024 * 1024 });
-  if (result.status !== 0) throw new Error("Rollback GitHub repository/default-branch identity could not be established by gh");
-  let response;
-  try { response = JSON.parse(result.stdout); } catch {
-    throw new Error("Rollback GitHub repository/default-branch response is invalid JSON");
-  }
-  if (response?.errors?.length) throw new Error("Rollback GitHub repository/default-branch query failed");
-  return response?.data?.repository;
-}
-
-export function validateRollbackReviewedHead({ repositoryRoot, resolveGithubRepository = readGithubRepository }) {
-  let remote;
-  try { remote = resolveGithubRepository(repositoryRoot); } catch (error) {
-    throw new Error("Rollback GitHub repository/default-branch identity is unavailable", { cause: error });
-  }
-  if (typeof remote?.nameWithOwner !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(remote.nameWithOwner)) {
-    throw new Error("Rollback GitHub repository identity is missing or invalid");
-  }
-  const branch = remote.defaultBranchRef?.name;
-  if (typeof branch !== "string" || !branch.trim()) throw new Error("Rollback GitHub default branch could not be established");
-  const githubHead = remote.defaultBranchRef?.target?.oid;
-  if (!/^[0-9a-f]{40}$/.test(String(githubHead || ""))) throw new Error("Rollback GitHub default-branch HEAD could not be established");
-  const localBranch = git(repositoryRoot, ["branch", "--show-current"]).toString().trim();
-  if (localBranch !== branch) {
-    throw new Error(`Rollback local branch ${localBranch || "(detached HEAD)"} differs from GitHub default branch ${branch}`);
-  }
-  const localHead = git(repositoryRoot, ["rev-parse", "HEAD"]).toString().trim();
-  if (localHead !== githubHead) {
-    throw new Error(`Rollback local HEAD ${localHead} differs from GitHub default-branch HEAD ${githubHead}`);
-  }
-  return Object.freeze({ repository: remote.nameWithOwner, branch, local_head: localHead, github_default_branch_head: githubHead });
-}
-
 function requireAncestor(repositoryRoot, commit) {
   if (!/^[0-9a-f]{40}$/.test(String(commit || ""))) throw new Error("Rollback historical Git SHA is malformed");
   git(repositoryRoot, ["cat-file", "-e", `${commit}^{commit}`]);
@@ -182,15 +141,11 @@ export function validateRollbackDependencies({ repositoryRoot, targetWriterGitSh
 export async function authenticateRollbackExecutor({
   repositoryRoot, checkpointPath, migrationRunId, planSha256,
   targetWriterGitSha, transition, inventoryRootSha256, stateRootSha256,
-  resolveGithubRepository = readGithubRepository,
 }) {
   if (!String(migrationRunId || "").trim() || !["v2-to-v3", "v3-rebuild"].includes(transition) ||
       [planSha256, inventoryRootSha256, stateRootSha256].some((value) => !/^[0-9a-f]{64}$/.test(String(value || "")))) {
     throw new Error("Rollback requires explicit original run, transition, plan and backup identities");
   }
-  // Executor trust only: never use the current GitHub HEAD as migration or
-  // recovery authority. The resolver seam is for local tests, not a CLI bypass.
-  const executorIdentity = validateRollbackReviewedHead({ repositoryRoot, resolveGithubRepository });
   validateRollbackDependencies({ repositoryRoot, targetWriterGitSha });
   const body = fs.readFileSync(checkpointPath);
   const checkpoint = JSON.parse(body);
@@ -230,12 +185,6 @@ export async function authenticateRollbackExecutor({
       authority.backup_gate?.state_root?.sha256 !== stateRootSha256) {
     throw new Error("Rollback checkpoint differs from the original run, plan, writer, transition or backup authority");
   }
-  if (git(repositoryRoot, ["rev-parse", "HEAD"]).toString().trim() !== executorIdentity.local_head ||
-      git(repositoryRoot, ["branch", "--show-current"]).toString().trim() !== executorIdentity.branch) {
-    throw new Error("Rollback local executor changed during authority authentication");
-  }
-  // Returned diagnostic metadata only; not part of checkpoint/manifest hashes.
-  recovery.executor_identity = executorIdentity;
   return recovery;
 }
 

@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
-  authenticateRollbackExecutor, validateRollbackDependencies,
+  authenticateRollbackExecutor, validateRollbackDependencies, validateRollbackReviewedHead,
   ROLLBACK_CURRENT_TRUSTED_DEPENDENCIES, ROLLBACK_PINNED_HISTORICAL_DEPENDENCIES,
 } from "../scripts/index_v3_migration/rollback_executor_authority.mjs";
 import { buildObservationHistoryV3RecoveryProgressContext } from "../scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs";
@@ -36,11 +36,13 @@ const commit = (repo) => {
 };
 
 async function fixture(t) {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-rollback-compatibility-"));
+  // Node resolves import.meta.url through macOS /var symlinks; use the same
+  // canonical path for argv so the executable helper's main guard is exercised.
+  const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-rollback-compatibility-")));
   t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
   const repo = path.join(temp, "repo");
   fs.mkdirSync(repo);
-  git(repo, "init", "-q");
+  git(repo, "init", "-q", "--initial-branch=reviewed-default");
   // Small temporary Git history only. Real repository and real authority are
   // read-only. Pin real historical semantic/recovery bytes at the fixture base.
   for (const file of ROLLBACK_CURRENT_TRUSTED_DEPENDENCIES) {
@@ -71,17 +73,22 @@ async function fixture(t) {
   for (const file of ROLLBACK_CURRENT_TRUSTED_DEPENDENCIES) write(repo, file, read(file));
   write(repo, "scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs", "// unrelated reviewed change\n");
   write(repo, "scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs", "// unrelated reviewed change\n");
-  commit(repo);
+  const reviewedHead = commit(repo);
+  const githubRepository = {
+    nameWithOwner: "TEST-uk-aq/uk-aq-ops",
+    defaultBranchRef: { name: "reviewed-default", target: { oid: reviewedHead } },
+  };
   const options = {
     repositoryRoot: repo, checkpointPath, migrationRunId: authority.migration_run_id,
     planSha256, targetWriterGitSha, transition: transition.kind,
     inventoryRootSha256: "a".repeat(64), stateRootSha256: "b".repeat(64),
+    resolveGithubRepository: () => structuredClone(githubRepository),
   };
-  return { repo, options, context };
+  return { repo, options, context, githubRepository };
 }
 
 test("rollback accepts historical authority with clean current descendant, without repinning or evidence writes", async (t) => {
-  const { repo, options, context } = await fixture(t);
+  const { repo, options, context, githubRepository } = await fixture(t);
   const evidence = [options.checkpointPath, context.paths.manifest, context.paths.head,
     path.join(context.paths.entries, "0000000001.json")];
   const before = evidence.map((file) => fs.readFileSync(file));
@@ -89,6 +96,11 @@ test("rollback accepts historical authority with clean current descendant, witho
   assert.notEqual(git(repo, "rev-parse", "HEAD").toString().trim(), options.targetWriterGitSha);
   assert.equal(recovery.checkpoint.authority.target_writer_git_sha, options.targetWriterGitSha);
   assert.equal(recovery.manifest.payload.recovery_implementation.repository_head, options.targetWriterGitSha);
+  assert.deepEqual(recovery.executor_identity, {
+    repository: githubRepository.nameWithOwner, branch: "reviewed-default",
+    local_head: githubRepository.defaultBranchRef.target.oid,
+    github_default_branch_head: githubRepository.defaultBranchRef.target.oid,
+  });
   assert.equal(recovery.sequence, 1);
   assert.equal(recovery.checkpoint.full_verification_complete, true);
   assert.deepEqual(evidence.map((file) => fs.readFileSync(file)), before);
@@ -97,14 +109,68 @@ test("rollback accepts historical authority with clean current descendant, witho
   // its positional identities and fixture-local import resolution.
   fs.symlinkSync(path.join(root, "node_modules"), path.join(repo, "node_modules"), "dir");
   fs.appendFileSync(path.join(repo, ".git/info/exclude"), "\n/node_modules\n");
-  const result = spawnSync(process.execPath, [
+  // Fake only the read-only gh process; exercise the production resolver and
+  // helper entrypoint without network access or an authority-bypass flag.
+  const bin = path.join(path.dirname(repo), "bin");
+  const responsePath = path.join(bin, "github.json");
+  fs.mkdirSync(bin);
+  const ghResponse = (status, response) => fs.writeFileSync(responsePath, JSON.stringify({ status, response }));
+  ghResponse(0, JSON.stringify({ data: { repository: githubRepository } }));
+  fs.writeFileSync(path.join(bin, "gh"), `#!/usr/bin/env node
+const fs = require('node:fs');
+const assert = require('node:assert/strict');
+assert.deepEqual(process.argv.slice(2, 4), ['api', 'graphql']);
+assert.ok(process.argv.includes('owner={owner}') && process.argv.includes('name={repo}'));
+assert.ok(process.argv.some(arg => arg.includes('defaultBranchRef') && arg.includes('oid')));
+assert.ok(!process.argv.includes('--cache'));
+const state = JSON.parse(fs.readFileSync(${JSON.stringify(responsePath)}, 'utf8'));
+process.stdout.write(state.response);
+process.exit(state.status);
+`, { mode: 0o755 });
+  const runHelper = () => spawnSync(process.execPath, [
     path.join(repo, "scripts/index_v3_migration/rollback_executor_authority.mjs"),
     options.checkpointPath, options.migrationRunId, options.planSha256,
     options.targetWriterGitSha, options.transition, options.inventoryRootSha256, options.stateRootSha256,
-  ], { cwd: repo, encoding: "utf8" });
+  ], { cwd: repo, encoding: "utf8", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` } });
+  const result = runHelper();
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "");
   assert.deepEqual(evidence.map((file) => fs.readFileSync(file)), before);
+  for (const [status, response] of [[1, ""], [0, "not JSON"], [0, JSON.stringify({ errors: [{ message: "denied" }], data: { repository: githubRepository } })]]) {
+    ghResponse(status, response);
+    const failed = runHelper();
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /GitHub repository\/default-branch identity is unavailable/);
+  }
+});
+
+test("rollback requires the exact current GitHub default-branch HEAD, not merely a clean descendant", async (t) => {
+  const { repo, options, githubRepository } = await fixture(t);
+  const publishedHead = githubRepository.defaultBranchRef.target.oid;
+  assert.equal(validateRollbackReviewedHead(options).local_head, publishedHead);
+  // Main regression: a clean committed change to current-trusted machinery
+  // passes local dependency compatibility but is not on GitHub.
+  write(repo, "workers/shared/r2_sigv4.mjs", read("workers/shared/r2_sigv4.mjs") + "\n// locally committed executor change\n");
+  const unpushedHead = commit(repo);
+  assert.equal(git(repo, "status", "--short").toString(), "");
+  assert.doesNotThrow(() => validateRollbackDependencies(options));
+  await assert.rejects(authenticateRollbackExecutor(options), /local HEAD .* differs from GitHub default-branch HEAD/);
+  // Model GitHub advancing while the local default branch is behind.
+  git(repo, "reset", "--hard", publishedHead);
+  const advanced = structuredClone(githubRepository);
+  advanced.defaultBranchRef.target.oid = unpushedHead;
+  await assert.rejects(authenticateRollbackExecutor({ ...options, resolveGithubRepository: () => advanced }), /local HEAD .* differs from GitHub default-branch HEAD/);
+  const wrongBranch = structuredClone(githubRepository);
+  wrongBranch.defaultBranchRef.name = "different-default";
+  await assert.rejects(authenticateRollbackExecutor({ ...options, resolveGithubRepository: () => wrongBranch }), /local branch .* differs from GitHub default branch/);
+  for (const [remote, expected] of [
+    [null, /repository identity is missing/],
+    [{ ...githubRepository, nameWithOwner: "" }, /repository identity is missing/],
+    [{ ...githubRepository, defaultBranchRef: null }, /default branch could not be established/],
+    [{ ...githubRepository, defaultBranchRef: { name: "reviewed-default" } }, /default-branch HEAD could not be established/],
+    [{ ...githubRepository, defaultBranchRef: { name: "reviewed-default", target: { oid: "invalid" } } }, /default-branch HEAD could not be established/],
+  ]) await assert.rejects(authenticateRollbackExecutor({ ...options, resolveGithubRepository: () => remote }), expected);
+  await assert.rejects(authenticateRollbackExecutor({ ...options, resolveGithubRepository: () => { throw new Error("offline"); } }), /GitHub repository\/default-branch identity is unavailable/);
 });
 
 test("rollback critical dependencies reject dirty, staged and missing/untracked replacements", async (t) => {
