@@ -400,8 +400,10 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
       },
     ));
   }
-  const authenticationStartedAt = Date.now();
-  if (diagnostics) process.stderr.write(`V3 recovery: authenticating ${names.length} journal entries start=${new Date(authenticationStartedAt).toISOString()}\n`);
+  const replayProgress = createMigrationProgressReporter({
+    label: "V3 recovery: journal entries", total: names.length, enabled: diagnostics,
+  });
+  replayProgress.report(0, { force: true });
   const replay = readAndValidateRecoveryJournal({
     recoveryRoot: paths.root,
     expectedCheckpointSha256: manifest.payload.original_checkpoint.sha256,
@@ -412,11 +414,6 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     expectedTargetWriterGitSha: manifest.payload.target_writer_git_sha,
     allowEmpty: true,
   });
-  if (diagnostics) process.stderr.write(`V3 recovery: authentication complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
-  const replayProgress = createMigrationProgressReporter({
-    label: "V3 recovery: applying authenticated journal", total: replay.entries.length, enabled: diagnostics,
-  });
-  replayProgress.report(0, { force: true });
   const publicationEvidence = [];
   for (const [index, entry] of replay.entries.entries()) {
     const payload = entry.payload;
@@ -424,7 +421,6 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     publicationEvidence.push(...(payload.updates?.publication_evidence || []));
     replayProgress.report(index + 1);
   }
-  if (diagnostics) process.stderr.write(`V3 recovery: replay complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   return {
     sequence: replay.last_sequence,
     entrySha256: replay.last_entry_sha256,
@@ -1798,8 +1794,11 @@ export async function runObservationHistoryMigrationV3({
         checkpoint,
         recoveryAuthority: recoveryProgress?.authenticatedRecoveryAuthority || null,
         publicationConcurrency: args.publicationConcurrency,
-        onReconstructedPlan: (completedPlan) => { reportPlan = completedPlan; },
         adapters,
+      });
+      reportPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+        checkpoint: result.checkpoint,
+        requirePrepared: true,
       });
     } else if (args.mode === "verify") {
       const currentEnvironment = validateObservationHistoryV3MigrationEnvironment({

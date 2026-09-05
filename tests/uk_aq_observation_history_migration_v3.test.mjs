@@ -4058,12 +4058,36 @@ test("recovery journal schema and final-state replay remain structurally compati
       }),
       /Recovery manifest does not match/,
     );
-    const replayed = buildObservationHistoryV3RecoveryProgressContext({
-      checkpointPath,
-      checkpoint: originalCheckpoint,
-      repositoryRoot: REPOSITORY_ROOT,
-      requireCurrentImplementation: false,
-    });
+    const evidencePaths = [checkpointPath, context.paths.manifest, context.paths.head,
+      ...fs.readdirSync(context.paths.entries).map((name) => path.join(context.paths.entries, name))];
+    const evidenceBefore = evidencePaths.map((name) => fs.readFileSync(name));
+    const stderrWrite = process.stderr.write;
+    const stdoutWrite = process.stdout.write;
+    const diagnostics = [];
+    const stdout = [];
+    let replayed;
+    try {
+      process.stderr.write = (message) => { diagnostics.push(String(message)); return true; };
+      process.stdout.write = (message) => { stdout.push(String(message)); return true; };
+      replayed = buildObservationHistoryV3RecoveryProgressContext({
+        checkpointPath,
+        checkpoint: originalCheckpoint,
+        repositoryRoot: REPOSITORY_ROOT,
+        requireCurrentImplementation: false,
+        diagnostics: true,
+      });
+    } finally {
+      process.stderr.write = stderrWrite;
+      process.stdout.write = stdoutWrite;
+    }
+    const authenticationStart = diagnostics.findIndex((line) => line.includes("authenticating 1 journal entries"));
+    const authenticationEnd = diagnostics.findIndex((line) => line.includes("authentication complete entries=1"));
+    const applicationStart = diagnostics.findIndex((line) => line.includes("applying authenticated journal 0/1"));
+    const replayEnd = diagnostics.findIndex((line) => line.includes("replay complete entries=1"));
+    assert.ok(authenticationStart >= 0 && authenticationStart < authenticationEnd);
+    assert.ok(authenticationEnd < applicationStart && applicationStart < replayEnd);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(evidencePaths.map((name) => fs.readFileSync(name)), evidenceBefore);
     assert.equal(replayed.sequence, 1);
     assert.equal(replayed.checkpoint.full_verification_complete, true);
     assert.equal(replayed.checkpoint.cutover_ready, true);
@@ -4086,5 +4110,122 @@ test("recovery journal schema and final-state replay remain structurally compati
     });
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy canonical resume preserves historical evidence and requires exact authenticated TEST recovery", async (t) => {
+  const legacy = await buildLegacyRecoveryOrderingFixture();
+  const connector = legacy.recoveredPlan.canonical_publication_objects.find(
+    (entry) => entry.publication_stage === "connector_manifest",
+  );
+  const parquet = legacy.recoveredPlan.units[0].target_file_intents[0];
+  for (const scenario of [
+    "accepted concurrency 1", "accepted concurrency 16", "semantic-only current JSON",
+    "unrelated SHA", "Parquet mismatch", "not durable", "missing seed", "LIVE",
+    "unauthenticated", "authority SHA", "run ID", "plan SHA", "replay SHA",
+    "journal sequence", "journal head", "original checkpoint SHA",
+  ]) await t.test(scenario, async () => {
+    const checkpoint = structuredClone(legacy.checkpoint);
+    checkpoint.full_verification_complete = false;
+    checkpoint.cutover_ready = false;
+    // This interrupted migration has completed canonical objects; v3 completion
+    // evidence is not yet present. Keep every historical canonical identity.
+    for (const entry of legacy.recoveredPlan.v3_publication_plan.entries) {
+      delete checkpoint.completed_objects[entry.key];
+    }
+    const fixture = { ...legacy.fixture, r2: new Map(legacy.fixture.r2) };
+    const adapters = memoryAdapters(fixture);
+    for (const unit of legacy.recoveredPlan.units) for (const entry of unit.target_file_intents) {
+      adapters.storedSha.set(entry.key, entry.sha256);
+    }
+    let environmentEvidence = ENVIRONMENT;
+    if (scenario === "semantic-only current JSON") {
+      fixture.r2.set(connector.key, Buffer.from(JSON.stringify(JSON.parse(connector.body))));
+    }
+    if (scenario === "unrelated SHA") checkpoint.completed_objects[connector.key].sha256 = "e".repeat(64);
+    if (scenario === "Parquet mismatch") checkpoint.completed_objects[parquet.key].sha256 = "e".repeat(64);
+    if (scenario === "not durable") checkpoint.completed_objects[connector.key].durable = false;
+    if (scenario === "missing seed") for (const unit of legacy.recoveredPlan.units) {
+      const entry = unit.target_manifest_object;
+      Object.assign(checkpoint.completed_objects[entry.key], { byte_size: entry.byte_size, sha256: entry.sha256 });
+    }
+    if (scenario === "LIVE") {
+      checkpoint.authority.environment.environment = "LIVE";
+      checkpoint.authority_sha256 = sha256Hex(stableMigrationJson(checkpoint.authority));
+      environmentEvidence = { ...ENVIRONMENT, environment: "LIVE", configuredEnvironment: "LIVE" };
+    }
+    const recoveryAuthority = authenticatedRecoveryAuthority(checkpoint);
+    const authorityMutations = {
+      unauthenticated: ["authenticated", false],
+      "authority SHA": ["immutable_authority_sha256", "e".repeat(64)],
+      "run ID": ["migration_run_id", "other-run"],
+      "plan SHA": ["plan_sha256", "e".repeat(64)],
+      "replay SHA": ["replayed_checkpoint_sha256", "e".repeat(64)],
+      "journal sequence": ["last_sequence", 0],
+      "journal head": ["last_entry_sha256", null],
+      "original checkpoint SHA": ["original_checkpoint_sha256", null],
+    };
+    if (authorityMutations[scenario]) {
+      const [key, value] = authorityMutations[scenario];
+      recoveryAuthority[key] = value;
+    }
+    const before = structuredClone(checkpoint);
+    const stderrWrite = process.stderr.write;
+    const diagnostics = [];
+    let reconstructed;
+    try {
+      process.stderr.write = (message) => { diagnostics.push(String(message)); return true; };
+      const execute = () => executeObservationHistoryV3MigrationPlan({
+        plan: buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint }), checkpoint,
+        apply: true, writersFrozen: true, environmentEvidence, recoveryAuthority, adapters,
+        publicationConcurrency: scenario.endsWith("16") ? 16 : 1,
+        onReconstructedPlan: (plan) => { reconstructed = plan; },
+      });
+      if (scenario.startsWith("accepted")) {
+        const result = await execute();
+        assert.equal(result.ok, true);
+        assert.deepEqual(reconstructed, legacy.recoveredPlan);
+        for (const [key, evidence] of Object.entries(before.completed_objects)) {
+          assert.deepEqual(result.checkpoint.completed_objects[key], evidence, key);
+          for (const saved of adapters.checkpoints) assert.deepEqual(saved.completed_objects[key], evidence, key);
+        }
+        const text = diagnostics.join("");
+        assert.match(text, /resumed canonical legacy recovery identity accepted: .*connector_id=1\/manifest.json/);
+        const expectedLegacy = legacy.recoveredPlan.canonical_publication_objects.filter((entry) =>
+          before.completed_objects[entry.key].sha256 !== entry.sha256).length;
+        assert.match(text, new RegExp(`legacy_recovery_ordering=${expectedLegacy} failed=0`));
+        assert.equal(diagnostics.filter((line) => line.includes(": v3_publication_plan ")).length, 1);
+        assert.doesNotMatch(text, /historical canonical identities: v3_/);
+        assert.equal(adapters.jsonPutCalls, 0);
+      } else {
+        const expected = scenario === "missing seed" ? /no exact pollutant-manifest seed/
+          : scenario === "LIVE" ? /TEST-only/
+          : scenario === "Parquet mismatch" ? /resumed Parquet verification failed:.*checkpoint_identity_mismatch/
+          : scenario === "semantic-only current JSON" ? /resumed canonical verification failed:.*current_object_identity_mismatch/
+          : scenario === "unrelated SHA" || scenario === "not durable" ? /resumed canonical verification failed:.*checkpoint_identity_mismatch/
+          : /authenticated replay state|authenticated recovery journal is required/;
+        await assert.rejects(execute, expected);
+        assert.equal(adapters.jsonPutCalls, 0);
+        assert.equal(adapters.putCalls, 0);
+        assert.equal(adapters.checkpoints.length, 0);
+      }
+    } finally { process.stderr.write = stderrWrite; }
+    assert.deepEqual(checkpoint, before);
+  });
+});
+
+test("recovered plan progress is optional and preserves every reconstructed byte and schedule", async () => {
+  const legacy = await buildLegacyRecoveryOrderingFixture();
+  for (const legacyOriginalOrdering of [false, true]) {
+    const args = { checkpoint: legacy.checkpoint, requirePrepared: true, allowLegacyRecoveryOrdering: true, legacyOriginalOrdering };
+    const checkpointBefore = structuredClone(args.checkpoint);
+    const quiet = buildObservationHistoryV3MigrationPlanFromCheckpoint(args);
+    const events = [];
+    const observed = buildObservationHistoryV3MigrationPlanFromCheckpoint({ ...args, onProgress: (event) => events.push(event) });
+    assert.deepEqual(observed, quiet);
+    assert.deepEqual(args.checkpoint, checkpointBefore);
+    assert.deepEqual(events.filter((event) => event.phase === "prepared_units").map((event) => event.completed), [0, 1, 2]);
+    assert.deepEqual(events.slice(-5).map((event) => event.phase), ["canonical_schedule", "v3_latest", "v3_objects", "v3_publication_plan", "complete"]);
+    assert.deepEqual(events.at(-1), { phase: "complete", canonical: quiet.canonical_publication_objects.length, v3: quiet.v3_publication_plan.entries.length });
   }
 });
