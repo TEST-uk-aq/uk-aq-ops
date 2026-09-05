@@ -1478,7 +1478,7 @@ function formatMigrationProgressElapsed(elapsedMilliseconds) {
     .join(":");
 }
 
-export function createMigrationProgressReporter({ label, total, enabled }) {
+function createMigrationProgressReporter({ label, total, enabled }) {
   if (!enabled || !Number.isInteger(total) || total <= 0) {
     return Object.freeze({ report() {} });
   }
@@ -2872,6 +2872,12 @@ export async function buildObservationHistoryV3MigrationPlan({
   });
 }
 
+function checkpointObjectMap(checkpoint) {
+  return new Map(
+    Object.entries(checkpoint?.completed_objects || {}).map(([key, value]) => [key, value]),
+  );
+}
+
 function preparedUnitPlanIdentity(record) {
   return sha256Hex(stableMigrationJson({
     unit_id: record.unit_id,
@@ -3233,81 +3239,15 @@ function emptyCheckpoint(plan) {
   };
 }
 
-const COMPLETED_OBJECT_BATCH_SIZE = 256;
-
-async function persistCompletedObjectBatch({ checkpoint, evidence, writeCheckpoint, forceWrite = false }) {
-  const additions = new Map();
-  for (const entry of evidence) {
-    const next = {
-      byte_size: entry.byte_size,
-      sha256: entry.sha256,
-      verified: true,
-      durable: true,
-      stored_sha256_verified: entry.stored_sha256_verified === true,
-    };
-    const previous = additions.get(entry.key) || checkpoint.completed_objects[entry.key];
-    if (previous && stableMigrationJson(previous) !== stableMigrationJson(next)) {
-      throw new Error(`Completed-object evidence changed for ${entry.key}`);
-    }
-    if (!previous) additions.set(entry.key, next);
-  }
-  if (!additions.size && !forceWrite) return;
-  for (const [key, value] of additions) checkpoint.completed_objects[key] = value;
-  try {
-    await writeCheckpoint(checkpoint);
-  } catch (error) {
-    // Do not expose an unpersisted chunk as durable in the caller's memory.
-    for (const key of additions.keys()) delete checkpoint.completed_objects[key];
-    throw error;
-  }
-}
-
-async function reverifyCompletedMigrationObjects({
-  objects, checkpoint, adapters, concurrency, requireStoredSha256, label, enabled,
-}) {
-  const progress = createMigrationProgressReporter({ label, total: objects.length, enabled });
-  const verified = new Map();
-  let completed = 0;
-  progress.report(0, { force: true });
-  for (let offset = 0; offset < objects.length; offset += concurrency) {
-    const batch = objects.slice(offset, offset + concurrency);
-    const results = await Promise.allSettled(batch.map(async (expected) => {
-      const result = await verifyObservationHistoryV3CheckpointReuse({
-        checkpointEntry: checkpoint.completed_objects[expected.key],
-        expected,
-        headObject: adapters.headObject,
-        getObject: adapters.getObject,
-        requireStoredSha256,
-      });
-      if (!result.reusable) throw new Error(result.reason);
-      return { byte_size: expected.byte_size, sha256: expected.sha256, result };
-    }));
-    let failure = null;
-    for (const [index, result] of results.entries()) {
-      const key = batch[index].key;
-      if (result.status === "fulfilled") {
-        verified.set(key, result.value);
-        completed += 1;
-        progress.report(completed);
-      } else if (!failure) {
-        failure = new Error(`${label} failed: ${key}: ${
-          result.reason instanceof Error ? result.reason.message : String(result.reason)
-        }`, { cause: result.reason });
-      }
-    }
-    // Already-started checks settled; no further reads or publication follow a failure.
-    if (failure) throw failure;
-  }
-  return verified;
-}
-
-function establishedReuse(verified, expected) {
-  const established = verified.get(expected.key);
-  if (!established) return null;
-  if (established.byte_size !== expected.byte_size || established.sha256 !== expected.sha256) {
-    throw new Error(`Reverified object intent changed: ${expected.key}`);
-  }
-  return established.result;
+async function persistCompletedObject({ checkpoint, evidence, writeCheckpoint }) {
+  checkpoint.completed_objects[evidence.key] = {
+    byte_size: evidence.byte_size,
+    sha256: evidence.sha256,
+    verified: true,
+    durable: true,
+    stored_sha256_verified: evidence.stored_sha256_verified === true,
+  };
+  await writeCheckpoint(checkpoint);
 }
 
 export async function executeObservationHistoryV3MigrationPlan({
@@ -3316,8 +3256,6 @@ export async function executeObservationHistoryV3MigrationPlan({
   writersFrozen = false,
   environmentEvidence,
   checkpoint: rawCheckpoint = null,
-  recoveryAuthority = null,
-  publicationConcurrency = 1,
   adapters,
   testHooks = null,
 }) {
@@ -3364,9 +3302,6 @@ export async function executeObservationHistoryV3MigrationPlan({
       throw new TypeError(`Migration apply adapter is missing: ${name}`);
     }
   }
-  if (!Number.isInteger(publicationConcurrency) || publicationConcurrency < 1 || publicationConcurrency > 16) {
-    throw new Error("--publication-concurrency must be an integer from 1 to 16");
-  }
   const checkpoint = rawCheckpoint ? structuredClone(rawCheckpoint) : emptyCheckpoint(plan);
   if (
     checkpoint.plan_sha256 !== plan.plan_sha256 ||
@@ -3406,26 +3341,6 @@ export async function executeObservationHistoryV3MigrationPlan({
       onProgress: compatibleSourceUnitProgress.report,
     });
   }
-  const authenticatedResume = rawCheckpoint && recoveryAuthority?.authenticated === true;
-  if (recoveryAuthority && (!authenticatedResume ||
-    recoveryAuthority.immutable_authority_sha256 !== checkpoint.authority_sha256 ||
-    recoveryAuthority.migration_run_id !== checkpoint.migration_run_id ||
-    recoveryAuthority.plan_sha256 !== checkpoint.plan_sha256 ||
-    recoveryAuthority.replayed_checkpoint_sha256 !== buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint)
-  )) {
-    throw new Error("Resume verification requires matching authenticated replay state");
-  }
-  const publishedParquet = authenticatedResume ? plan.units.flatMap((unit) => {
-    const record = checkpoint.prepared_units[unit.unit_id];
-    return record?.files_published === true
-      ? preparedUnitFromRecord(unit, record).target_file_intents
-      : [];
-  }) : [];
-  const reverifiedParquet = await reverifyCompletedMigrationObjects({
-    objects: publishedParquet, checkpoint, adapters, concurrency: publicationConcurrency,
-    requireStoredSha256: true,
-    label: "V3 migration: resumed Parquet verification", enabled: progressEnabled,
-  });
   const partitionProgress = createMigrationProgressReporter({
     label: "V3 migration: partitions",
     total: plan.units.length,
@@ -3503,10 +3418,10 @@ export async function executeObservationHistoryV3MigrationPlan({
       });
     }
     const preparedUnit = preparedUnitFromRecord(authorityUnit, record);
-    const unitEvidence = [];
     for (const intent of preparedUnit.target_file_intents) {
-      const reuse = establishedReuse(reverifiedParquet, intent) || await verifyObservationHistoryV3CheckpointReuse({
-        checkpointEntry: checkpoint.completed_objects[intent.key],
+      const completed = checkpointObjectMap(checkpoint);
+      const reuse = await verifyObservationHistoryV3CheckpointReuse({
+        checkpointEntry: completed.get(intent.key),
         expected: intent,
         headObject: adapters.headObject,
         getObject: adapters.getObject,
@@ -3542,32 +3457,26 @@ export async function executeObservationHistoryV3MigrationPlan({
         };
       }
       parquetEvidence.push(evidence);
-      unitEvidence.push({ ...evidence, stored_sha256_verified: true });
+      await persistCompletedObject({
+        checkpoint,
+        evidence: { ...evidence, stored_sha256_verified: true },
+        writeCheckpoint: adapters.writeCheckpoint,
+      });
     }
     record.files_published = true;
-    try {
-      await persistCompletedObjectBatch({
-        checkpoint, evidence: unitEvidence, writeCheckpoint: adapters.writeCheckpoint,
-        forceWrite: !wasFilesPublished,
-      });
-    } catch (error) {
-      record.files_published = wasFilesPublished;
-      throw error;
-    }
+    await adapters.writeCheckpoint(checkpoint);
     await testHooks?.afterParquetPublication?.({
       unit_id: authorityUnit.unit_id,
       checkpoint: structuredClone(checkpoint),
     });
-    if (record.target_file_intents.some((intent) => intent.staging_ref)) {
-      await adapters.releaseStagedUnit({
-        unitId: authorityUnit.unit_id,
-        intents: record.target_file_intents,
-      });
-      record.target_file_intents = record.target_file_intents.map(
-        ({ staging_ref: _stagingRef, ...entry }) => entry,
-      );
-      await adapters.writeCheckpoint(checkpoint);
-    }
+    await adapters.releaseStagedUnit({
+      unitId: authorityUnit.unit_id,
+      intents: record.target_file_intents,
+    });
+    record.target_file_intents = record.target_file_intents.map(
+      ({ staging_ref: _stagingRef, ...entry }) => entry,
+    );
+    await adapters.writeCheckpoint(checkpoint);
     if (!wasFilesPublished && checkpoint.prepared_units[authorityUnit.unit_id]?.files_published === true) {
       completedPartitions += 1;
       partitionProgress.report(completedPartitions);
@@ -3576,13 +3485,6 @@ export async function executeObservationHistoryV3MigrationPlan({
   const completedPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
     checkpoint,
     requirePrepared: true,
-  });
-  const reverifiedCanonical = await reverifyCompletedMigrationObjects({
-    objects: authenticatedResume ? completedPlan.canonical_publication_objects.filter(
-      (object) => Object.hasOwn(checkpoint.completed_objects, object.key),
-    ) : [],
-    checkpoint, adapters, concurrency: publicationConcurrency, requireStoredSha256: false,
-    label: "V3 migration: resumed canonical verification", enabled: progressEnabled,
   });
   const canonicalPublicationProgress = createMigrationProgressReporter({
     label: "V3 migration: canonical publication objects",
@@ -3596,31 +3498,10 @@ export async function executeObservationHistoryV3MigrationPlan({
   );
   let completedCanonicalObjects = previouslyCompletedCanonicalObjectKeys.size;
   canonicalPublicationProgress.report(completedCanonicalObjects, { force: true });
-  let pendingCanonical = [];
-  const pendingCanonicalKeys = new Set();
-  const flushCanonical = async () => {
-    await persistCompletedObjectBatch({
-      checkpoint, evidence: pendingCanonical, writeCheckpoint: adapters.writeCheckpoint,
-    });
-    for (const object of pendingCanonical) {
-      if (!previouslyCompletedCanonicalObjectKeys.has(object.key)) {
-        previouslyCompletedCanonicalObjectKeys.add(object.key);
-        completedCanonicalObjects += 1;
-        canonicalPublicationProgress.report(completedCanonicalObjects);
-      }
-    }
-    pendingCanonical = [];
-    pendingCanonicalKeys.clear();
-  };
   for (const object of completedPlan.canonical_publication_objects) {
-    if (pendingCanonical.length && (
-      pendingCanonical[0].publication_stage !== object.publication_stage ||
-      [...object.dependencies, ...object.publication_prerequisites].some(
-        (reference) => pendingCanonicalKeys.has(reference.key),
-      )
-    )) await flushCanonical();
-    const reuse = establishedReuse(reverifiedCanonical, object) || await verifyObservationHistoryV3CheckpointReuse({
-      checkpointEntry: checkpoint.completed_objects[object.key],
+    const completed = checkpointObjectMap(checkpoint);
+    const reuse = await verifyObservationHistoryV3CheckpointReuse({
+      checkpointEntry: completed.get(object.key),
       expected: object,
       headObject: adapters.headObject,
       getObject: adapters.getObject,
@@ -3636,11 +3517,15 @@ export async function executeObservationHistoryV3MigrationPlan({
         throw new Error(`Canonical manifest post-PUT verification failed: ${object.key}`);
       }
     }
-    pendingCanonical.push(object);
-    pendingCanonicalKeys.add(object.key);
-    if (pendingCanonical.length >= COMPLETED_OBJECT_BATCH_SIZE ||
-      testHooks?.afterCanonicalManifestPublication || testHooks?.afterParentPublication
-    ) await flushCanonical();
+    await persistCompletedObject({
+      checkpoint,
+      evidence: object,
+      writeCheckpoint: adapters.writeCheckpoint,
+    });
+    if (!previouslyCompletedCanonicalObjectKeys.has(object.key)) {
+      completedCanonicalObjects += 1;
+      canonicalPublicationProgress.report(completedCanonicalObjects);
+    }
     if (object.publication_stage === "pollutant_manifest") {
       await testHooks?.afterCanonicalManifestPublication?.({
         key: object.key,
@@ -3654,7 +3539,6 @@ export async function executeObservationHistoryV3MigrationPlan({
       });
     }
   }
-  await flushCanonical();
   const v3PublicationProgress = createMigrationProgressReporter({
     label: "V3 migration: v3 publication objects",
     total: completedPlan.v3_publication_plan.entries.length,
@@ -3679,50 +3563,36 @@ export async function executeObservationHistoryV3MigrationPlan({
   }
   let completedV3PublicationObjects = durableV3PublicationKeys.size;
   v3PublicationProgress.report(completedV3PublicationObjects, { force: true });
-  const reportDurableV3Entry = (entry) => {
-    const expected = v3PublicationEntriesByKey.get(entry.key);
-    if (
-      progressEnabled &&
-      expected &&
-      entry.byte_size === expected.byte_size &&
-      entry.sha256 === expected.sha256 &&
-      entry.post_put_get_verified === true
-    ) {
-      if (!durableV3PublicationKeys.has(entry.key)) {
-        durableV3PublicationKeys.add(entry.key);
-        completedV3PublicationObjects = durableV3PublicationKeys.size;
-      }
-      v3PublicationProgress.report(completedV3PublicationObjects);
-    }
-  };
   const v3Publication = await adapters.finalizeV3Publication({
     plan: completedPlan.v3_publication_plan,
     putIfChanged: adapters.putIfChanged,
     getObject: adapters.getObject,
     recordDurableEvidence: async (entry) => {
       const result = await adapters.recordDurableEvidence(entry);
-      if (result?.durable === true) reportDurableV3Entry(entry);
+      const expected = v3PublicationEntriesByKey.get(entry.key);
+      if (
+        progressEnabled &&
+        result?.durable === true &&
+        expected &&
+        entry.byte_size === expected.byte_size &&
+        entry.sha256 === expected.sha256 &&
+        entry.post_put_get_verified === true
+      ) {
+        if (!durableV3PublicationKeys.has(entry.key)) {
+          durableV3PublicationKeys.add(entry.key);
+          completedV3PublicationObjects = durableV3PublicationKeys.size;
+        }
+        v3PublicationProgress.report(completedV3PublicationObjects);
+      }
       return result;
     },
-    recordDurableEvidenceBatch: adapters.recordDurableEvidenceBatch
-      ? async (entries) => {
-          const result = await adapters.recordDurableEvidenceBatch(entries);
-          if (result?.durable === true) entries.forEach(reportDurableV3Entry);
-          return result;
-        }
-      : undefined,
   });
-  const v3Objects = v3Publication.objects || [];
-  const completionProgress = createMigrationProgressReporter({
-    label: "V3 migration: v3 completed-object persistence", total: v3Objects.length, enabled: progressEnabled,
-  });
-  completionProgress.report(0, { force: true });
-  for (let offset = 0; offset < v3Objects.length; offset += COMPLETED_OBJECT_BATCH_SIZE) {
-    const chunk = v3Objects.slice(offset, offset + COMPLETED_OBJECT_BATCH_SIZE);
-    await persistCompletedObjectBatch({
-      checkpoint, evidence: chunk, writeCheckpoint: adapters.writeCheckpoint,
+  for (const evidence of v3Publication.objects || []) {
+    await persistCompletedObject({
+      checkpoint,
+      evidence,
+      writeCheckpoint: adapters.writeCheckpoint,
     });
-    completionProgress.report(offset + chunk.length);
   }
   await testHooks?.afterV3Finalization?.({
     checkpoint: structuredClone(checkpoint),

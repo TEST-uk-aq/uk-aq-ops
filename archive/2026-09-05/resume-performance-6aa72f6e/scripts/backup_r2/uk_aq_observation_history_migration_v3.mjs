@@ -45,7 +45,6 @@ import {
   buildObservationHistoryV3MigrationPlan,
   buildObservationHistoryV3MigrationPlanFromCheckpoint,
   buildObservationHistoryV3RecoveryReplayStateSha256,
-  createMigrationProgressReporter,
   buildObservationHistoryV3RerunVerificationPlan,
   DEFAULT_OBSERVATIONS_PREFIX,
   DEFAULT_V3_INDEX_ROOT,
@@ -385,7 +384,7 @@ function applyRecoveryUpdates(checkpoint, updates) {
   }
 }
 
-function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false, diagnostics = false }) {
+function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false }) {
   fs.mkdirSync(paths.entries, { recursive: true, mode: 0o700 });
   const names = fs.readdirSync(paths.entries)
     .sort();
@@ -400,10 +399,6 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
       },
     ));
   }
-  const replayProgress = createMigrationProgressReporter({
-    label: "V3 recovery: journal entries", total: names.length, enabled: diagnostics,
-  });
-  replayProgress.report(0, { force: true });
   const replay = readAndValidateRecoveryJournal({
     recoveryRoot: paths.root,
     expectedCheckpointSha256: manifest.payload.original_checkpoint.sha256,
@@ -415,11 +410,10 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     allowEmpty: true,
   });
   const publicationEvidence = [];
-  for (const [index, entry] of replay.entries.entries()) {
+  for (const entry of replay.entries) {
     const payload = entry.payload;
     applyRecoveryUpdates(checkpoint, payload.updates || {});
     publicationEvidence.push(...(payload.updates?.publication_evidence || []));
-    replayProgress.report(index + 1);
   }
   return {
     sequence: replay.last_sequence,
@@ -478,9 +472,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   create = false,
   repairHead = false,
   requireCurrentImplementation = true,
-  diagnostics = false,
 }) {
-  if (diagnostics) process.stderr.write("V3 recovery: authenticating original checkpoint and recovery manifest\n");
   const paths = recoveryProgressPaths(checkpointPath);
   let createdManifest = false;
   if (!fs.existsSync(paths.manifest)) {
@@ -513,15 +505,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     checkpoint: recoveredCheckpoint,
     manifest,
     repairHead: repairHead || createdManifest,
-    diagnostics,
   });
-  if (diagnostics) {
-    process.stderr.write(`V3 recovery: authenticated entries=${replay.sequence} prepared_units=${
-      Object.keys(recoveredCheckpoint.prepared_units || {}).length
-    } completed_objects=${Object.keys(recoveredCheckpoint.completed_objects || {}).length} v3_publication_evidence=${
-      replay.publicationEvidence.length
-    }\n`);
-  }
   buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: recoveredCheckpoint });
   const context = {
     paths,
@@ -630,19 +614,11 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     context.fullVerificationComplete = current.full_verification_complete === true;
     context.cutoverReady = current.cutover_ready === true;
   };
-  context.recordPublicationEvidenceBatch = async (entries) => {
-    if (!Array.isArray(entries) || entries.length === 0 || entries.length > 16) {
-      throw new Error("Recovery publication evidence batch must contain 1..16 entries");
-    }
-    const ordered = entries.map((entry) => ({ ...entry }));
-    if (ordered.some((entry, index) => index > 0 && entry.position <= ordered[index - 1].position)) {
-      throw new Error("Recovery publication evidence batch is not in publication-plan order");
-    }
-    appendRecoveryJournalEntry(context, { publication_evidence: ordered });
-    context.publicationEvidence.push(...ordered);
+  context.recordPublicationEvidence = async (entry) => {
+    appendRecoveryJournalEntry(context, { publication_evidence: [{ ...entry }] });
+    context.publicationEvidence.push({ ...entry });
     return { durable: true };
   };
-  context.recordPublicationEvidence = (entry) => context.recordPublicationEvidenceBatch([entry]);
   return context;
 }
 
@@ -1321,22 +1297,18 @@ async function validateMigrationPublicationSchedule(plan) {
   throw new Error("V3 publication validation did not reach the publication boundary");
 }
 
-export async function finalizeMigrationV3Publication({
+async function finalizeMigrationV3Publication({
   plan,
   putIfChanged,
   getObject,
   recordDurableEvidence,
-  recordDurableEvidenceBatch,
-  publicationConcurrency = 1,
+  publicationConcurrency,
 }) {
   const concurrency = parsePublicationConcurrency(publicationConcurrency);
   if (concurrency === 1) {
     return finalizeObservationHistoryIndexV3Publication({
       plan, putIfChanged, getObject, recordDurableEvidence,
     });
-  }
-  if (typeof recordDurableEvidenceBatch !== "function") {
-    throw new Error("Concurrent publication requires a durable batch adapter");
   }
   await validateMigrationPublicationSchedule(plan);
   const changedKeys = new Set(plan.entries.map((entry) => entry.key));
@@ -1400,35 +1372,33 @@ export async function finalizeMigrationV3Publication({
           result.reason instanceof Error ? result.reason.message : String(result.reason)
         }`, { cause: result.reason })]
       : []);
-    const successes = results.filter((result) => result.status === "fulfilled").map((result) => result.value);
-    if (successes.length) {
+    for (const [index, result] of results.entries()) {
+      if (result.status !== "fulfilled") continue;
+      const entry = batch[index];
       try {
-        // Promise.allSettled preserves input order, hence immutable plan position.
-        const durableResult = await recordDurableEvidenceBatch(successes);
+        const durableResult = await recordDurableEvidence(result.value);
         if (durableResult?.durable !== true) {
-          throw new Error("Durability adapter did not confirm batch persistence");
+          throw new Error("Durability adapter did not confirm persistence");
         }
       } catch (error) {
-        // A failed append may leave an entry beyond its head. No further append
-        // or parent publication may use that uncertain sequence/head state.
-        throw new AggregateError([...failures, error],
-          `V3 durable publication batch failed: ${successes.map((entry) => entry.key).join(", ")}: ${error.message}`);
+        failures.push(new Error(`V3 durable publication evidence failed: ${entry.key}`, { cause: error }));
+        // A journal failure can leave an entry beyond its head. Never append
+        // again through an uncertain sequence/head; remaining objects are retried.
+        break;
       }
-      for (const entry of successes) {
-        completed.add(entry.key);
-        evidence.push(Object.freeze({
-          key: entry.key,
-          byte_size: entry.byte_size,
-          sha256: entry.sha256,
-          publication_stage: entry.publication_stage,
-          put_status: entry.put_status,
-          verified: true,
-          durable: true,
-        }));
-      }
+      completed.add(entry.key);
+      evidence.push(Object.freeze({
+        key: entry.key,
+        byte_size: entry.byte_size,
+        sha256: entry.sha256,
+        publication_stage: entry.publication_stage,
+        put_status: result.value.put_status,
+        verified: true,
+        durable: true,
+      }));
     }
     if (failures.length) {
-      throw failures[0];
+      throw new AggregateError(failures, failures.map((error) => error.message).join("; "));
     }
   }
   return Object.freeze({
@@ -1467,20 +1437,6 @@ function buildR2Adapters({
     }
     return resolved;
   };
-  const recordDurableEvidenceBatch = async (entries) => {
-    if (recoveryProgress) {
-      const result = await recoveryProgress.recordPublicationEvidenceBatch(entries);
-      if (result?.durable === true) durableEvidence.push(...entries.map((entry) => ({ ...entry })));
-      return result;
-    }
-    if (!evidencePath) throw new Error("Durable v3 publication evidence requires --checkpoint-out");
-    const nextEvidence = [...durableEvidence, ...entries.map((entry) => ({ ...entry }))];
-    atomicWriteJson(evidencePath, {
-      kind: "uk_aq_observation_history_v3_publication_evidence", objects: nextEvidence,
-    });
-    durableEvidence.push(...entries.map((entry) => ({ ...entry })));
-    return { durable: true };
-  };
   return {
     getObject: ({ key }) => r2GetObject({ r2, key }),
     headObject: ({ key }) => r2HeadObject({ r2, key }),
@@ -1498,8 +1454,21 @@ function buildR2Adapters({
       content_type: object.content_type,
       writeR2: true,
     }),
-    recordDurableEvidence: (entry) => recordDurableEvidenceBatch([entry]),
-    recordDurableEvidenceBatch,
+    recordDurableEvidence: async (entry) => {
+      if (recoveryProgress) {
+        durableEvidence.push({ ...entry });
+        return recoveryProgress.recordPublicationEvidence(entry);
+      }
+      if (!evidencePath) {
+        throw new Error("Durable v3 publication evidence requires --checkpoint-out");
+      }
+      durableEvidence.push({ ...entry });
+      atomicWriteJson(evidencePath, {
+        kind: "uk_aq_observation_history_v3_publication_evidence",
+        objects: durableEvidence,
+      });
+      return { durable: true };
+    },
     getDurablePublicationEvidence: () => durableEvidence.map((entry) => ({ ...entry })),
     writeCheckpoint: recoveryProgress
       ? recoveryProgress.persistCheckpoint
@@ -1701,7 +1670,6 @@ export async function runObservationHistoryMigrationV3({
       // The original manifest remains historical authority. Enforce the narrow
       // committed-executor drift gate separately, before any migration R2 work.
       requireCurrentImplementation: false,
-      diagnostics: true,
     });
     const recoveryExecutorCheck = spawnSync("bash", [
       "scripts/index_v3_migration/index_v3_migration.sh",
@@ -1785,15 +1753,12 @@ export async function runObservationHistoryMigrationV3({
     if (args.mode === "plan") {
       result = summaryForPlan(plan);
     } else if (args.mode === "migrate") {
-      process.stderr.write(`V3 migration: concurrency=${args.publicationConcurrency} for resumed Parquet/canonical verification and v3 publication\n`);
       result = await executeObservationHistoryV3MigrationPlan({
         plan,
         apply: true,
         writersFrozen: args.writersFrozen,
         environmentEvidence: evidence,
         checkpoint,
-        recoveryAuthority: recoveryProgress?.authenticatedRecoveryAuthority || null,
-        publicationConcurrency: args.publicationConcurrency,
         adapters,
       });
       reportPlan = buildObservationHistoryV3MigrationPlanFromCheckpoint({

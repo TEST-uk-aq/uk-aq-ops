@@ -103,6 +103,7 @@ import {
 } from "../scripts/backup_r2/uk_aq_observations_manifest_hierarchy.mjs";
 import {
   buildObservationHistoryV3RecoveryProgressContext,
+  finalizeMigrationV3Publication,
   buildObservationHistoryV3ReportOutput,
   parseObservationHistoryMigrationArgs,
 } from "../scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs";
@@ -3290,6 +3291,159 @@ test("interrupted resume is byte-identical to uninterrupted and reuses published
     planJsonObjects(uninterruptedPlan).map(({ key, byte_size, sha256 }) => ({ key, byte_size, sha256 })),
   );
   assert.equal(resumedAdapters.jsonPutCalls, resumedPlan.canonical_publication_objects.length);
+  assert.equal(resumed.verification.cutover_ready, true);
+});
+
+test("authenticated resume bounds reads, reuses them once, and replays batched evidence", async (t) => {
+  for (const concurrency of [1, 8]) await t.test(`concurrency ${concurrency}`, async () => {
+    const fixture = await buildFixture();
+    const adapters = memoryAdapters(fixture);
+    await assert.rejects(executeObservationHistoryV3MigrationPlan({
+      plan: await buildPlan(fixture), apply: true, writersFrozen: true,
+      environmentEvidence: ENVIRONMENT, adapters,
+      testHooks: { afterParentPublication: () => { throw new Error("fixture parent stop"); } },
+    }), /fixture parent stop/);
+    const checkpoint = adapters.checkpoints.at(-1);
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-resume-batch-"));
+    try {
+      const checkpointPath = path.join(temporary, "checkpoint.json");
+      fs.writeFileSync(checkpointPath, stableMigrationJson(checkpoint));
+      const context = buildObservationHistoryV3RecoveryProgressContext({
+        checkpointPath, checkpoint, repositoryRoot: REPOSITORY_ROOT, create: true,
+      });
+      const head = adapters.headObject;
+      const get = adapters.getObject;
+      const counts = new Map();
+      let active = 0;
+      let maximum = 0;
+      let corrupt = true;
+      let corruptCanonical = false;
+      const completedCanonicalKey = Object.keys(checkpoint.completed_objects).find((key) => !key.endsWith(".parquet"));
+      const observe = (reader) => async (request) => {
+        counts.set(request.key, (counts.get(request.key) || 0) + 1);
+        maximum = Math.max(maximum, ++active);
+        try {
+          await new Promise((resolve) => setImmediate(resolve));
+          const result = await reader(request);
+          if (corruptCanonical && request.key === completedCanonicalKey) return { ...result, body: Buffer.from("corrupt") };
+          return corrupt && request.key.endsWith(".parquet") ? { ...result, sha256: "f".repeat(64) } : result;
+        } finally { active -= 1; }
+      };
+      adapters.headObject = observe(head);
+      adapters.getObject = observe(get);
+      adapters.writeCheckpoint = context.persistCheckpoint;
+      adapters.recordDurableEvidence = context.recordPublicationEvidence;
+      adapters.recordDurableEvidenceBatch = context.recordPublicationEvidenceBatch;
+      adapters.finalizeV3Publication = (options) => finalizeMigrationV3Publication({
+        ...options, publicationConcurrency: concurrency,
+      });
+      const args = {
+        plan: buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint }),
+        checkpoint, recoveryAuthority: context.authenticatedRecoveryAuthority,
+        publicationConcurrency: concurrency, apply: true, writersFrozen: true,
+        environmentEvidence: ENVIRONMENT, adapters,
+      };
+      const puts = adapters.putCalls + adapters.jsonPutCalls;
+      await assert.rejects(executeObservationHistoryV3MigrationPlan(args), /resumed Parquet verification failed:.*parquet/);
+      assert.equal(adapters.putCalls + adapters.jsonPutCalls, puts);
+      assert.equal(context.sequence, 0);
+      assert.equal(active, 0);
+      assert.ok(maximum <= concurrency);
+      corrupt = false;
+      corruptCanonical = true;
+      await assert.rejects(executeObservationHistoryV3MigrationPlan(args), /resumed canonical verification failed/);
+      assert.equal(adapters.putCalls + adapters.jsonPutCalls, puts);
+      assert.equal(context.sequence, 0);
+      assert.equal(active, 0);
+      corruptCanonical = false;
+      counts.clear();
+      maximum = 0;
+      const result = await executeObservationHistoryV3MigrationPlan({
+        ...args,
+        testHooks: { afterV3Finalization: () => {
+          // Full final verification intentionally performs further independent reads.
+          for (const key of Object.keys(checkpoint.completed_objects)) assert.equal(counts.get(key), 1, key);
+          assert.ok(maximum <= concurrency);
+          if (concurrency > 1) assert.ok(maximum > 1);
+        } },
+      });
+      assert.equal(result.verification.cutover_ready, true);
+      const recovered = buildObservationHistoryV3RecoveryProgressContext({
+        checkpointPath, checkpoint, repositoryRoot: REPOSITORY_ROOT,
+      });
+      assert.deepEqual(recovered.checkpoint.completed_objects, result.checkpoint.completed_objects);
+      assert.equal(recovered.publicationEvidence.length, result.v3_publication.objects.length);
+      const entries = fs.readdirSync(context.paths.entries).map((name) =>
+        JSON.parse(fs.readFileSync(path.join(context.paths.entries, name))).payload.updates);
+      assert.ok(entries.some((updates) => updates.completed_objects?.length > 1));
+      if (concurrency > 1) assert.ok(entries.some((updates) => updates.publication_evidence?.length > 1));
+      assert.ok(entries.every((updates) => (updates.publication_evidence?.length || 0) <= concurrency));
+    } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+});
+
+test("concurrent v3 siblings flush once before failure and stop after append failure", async () => {
+  const fixture = await buildFixture();
+  const adapters = memoryAdapters(fixture);
+  const execution = await executeObservationHistoryV3MigrationPlan({
+    plan: await buildPlan(fixture), apply: true, writersFrozen: true,
+    environmentEvidence: ENVIRONMENT, adapters,
+  });
+  const plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({
+    checkpoint: execution.checkpoint, requirePrepared: true,
+  }).v3_publication_plan;
+  for (const failure of ["publication", "journal"]) {
+    const started = [];
+    const batches = [];
+    const durable = new Set();
+    const changed = new Set(plan.entries.map((entry) => entry.key));
+    await assert.rejects(finalizeMigrationV3Publication({
+      plan, publicationConcurrency: 8,
+      putIfChanged: async (entry) => {
+        const planned = plan.entries.find((object) => object.key === entry.key);
+        for (const ref of [...planned.dependencies, ...planned.publication_prerequisites]) {
+          if (changed.has(ref.key)) assert.ok(durable.has(ref.key));
+        }
+        started.push(entry.key);
+        if (failure === "publication" && entry.key === plan.entries[0].key) throw new Error("fixture sibling failure");
+        return { ok: true };
+      },
+      getObject: adapters.getObject,
+      recordDurableEvidence: () => { throw new Error("single append must not run"); },
+      recordDurableEvidenceBatch: async (entries) => {
+        batches.push(entries);
+        if (failure === "journal") throw new Error("fixture journal failure");
+        entries.forEach((entry) => durable.add(entry.key));
+        return { durable: true };
+      },
+    }), failure === "publication" ? /fixture sibling failure/ : /fixture journal failure/);
+    assert.ok(started.length > 1 && started.length <= 8);
+    assert.equal(batches.length, 1);
+    assert.deepEqual(batches[0].map((entry) => entry.key),
+      failure === "publication" ? started.slice(1) : started);
+    assert.equal(durable.size, failure === "publication" ? started.length - 1 : 0);
+  }
+});
+
+test("failed unit completion batch retains staging and resumes without invented completion", async () => {
+  const fixture = await buildFixture();
+  // Initial checkpoint, prepared unit, then combined completion/files-published write.
+  const options = { failCheckpointCall: 3 };
+  const adapters = memoryAdapters(fixture, options);
+  const plan = await buildPlan(fixture);
+  await assert.rejects(executeObservationHistoryV3MigrationPlan({
+    plan, apply: true, writersFrozen: true, environmentEvidence: ENVIRONMENT, adapters,
+  }), /deliberate checkpoint failure 3/);
+  assert.ok(adapters.stagedBodyCount > 0);
+  assert.equal(adapters.jsonPutCalls, 0);
+  const checkpoint = adapters.checkpoints.at(-1);
+  assert.equal(Object.keys(checkpoint.completed_objects).length, 0);
+  assert.equal(Object.values(checkpoint.prepared_units)[0].files_published, false);
+  options.failCheckpointCall = null;
+  const resumed = await executeObservationHistoryV3MigrationPlan({
+    plan: buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint }), checkpoint,
+    apply: true, writersFrozen: true, environmentEvidence: ENVIRONMENT, adapters,
+  });
   assert.equal(resumed.verification.cutover_ready, true);
 });
 
