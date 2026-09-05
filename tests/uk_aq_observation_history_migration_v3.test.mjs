@@ -1101,8 +1101,8 @@ test("compact recovery replay digest omits giant prepared payload material", () 
   );
 });
 
-async function buildLegacyRecoveryOrderingFixture() {
-  const fixture = await buildFixture();
+async function buildLegacyRecoveryOrderingFixture({ exactPreparedBodies = false, fixtureOptions = {} } = {}) {
+  const fixture = await buildFixture(fixtureOptions);
   const adapters = memoryAdapters(fixture);
   const execution = await executeObservationHistoryV3MigrationPlan({
     plan: await buildPlan(fixture),
@@ -1126,6 +1126,28 @@ async function buildLegacyRecoveryOrderingFixture() {
   });
   for (const object of planJsonObjects(recoveredPlan)) {
     fixture.r2.set(object.key, Buffer.from(object.body));
+  }
+  // Historical reconciliation is canonical-only. Model current exact v3
+  // completion, retaining the historical canonical completions independently.
+  for (const entry of recoveredPlan.v3_publication_plan.entries) {
+    Object.assign(recoveredCheckpoint.completed_objects[entry.key], {
+      byte_size: entry.byte_size, sha256: entry.sha256,
+    });
+  }
+  if (exactPreparedBodies) for (const unit of recoveredPlan.units) {
+    const record = recoveredCheckpoint.prepared_units[unit.unit_id];
+    record.target_manifest_body = unit.target_manifest_object.body.toString("utf8");
+    record.target_manifest_byte_size = unit.target_manifest_object.byte_size;
+    record.target_manifest_sha256 = unit.target_manifest_object.sha256;
+    record.prepared_plan_sha256 = sha256Hex(stableMigrationJson({
+      unit_id: record.unit_id, scope: record.scope,
+      target_metadata: record.target_metadata, target_manifest: record.target_manifest,
+      target_manifest_body: record.target_manifest_body,
+      target_manifest_byte_size: record.target_manifest_byte_size,
+      target_manifest_sha256: record.target_manifest_sha256,
+      target_file_intents: record.target_file_intents.map(({ key, byte_size, sha256 }) => ({ key, byte_size, sha256 })),
+      v3_index_root: record.v3_index_root,
+    }));
   }
   const verificationPlan = buildObservationHistoryV3RerunVerificationPlan({
     checkpoint: recoveredCheckpoint,
@@ -2858,7 +2880,7 @@ test("legacy recovery ordering reconciles complete dependency closure without se
   }
   assert.ok(legacyKeys.some((key) => key.includes("/connector_id=")));
   assert.ok(legacyKeys.some((key) => key.includes("/_manifests/")));
-  assert.ok(legacyKeys.some((key) => key.includes("/_index_v3/")));
+  assert.ok(legacyKeys.every((key) => !key.includes("/_index_v3/")));
 });
 
 test("legacy recovery ordering rejects an arbitrary valid same-size completed JSON SHA", async () => {
@@ -2913,6 +2935,7 @@ test("legacy recovery ordering requires authenticated recovery authority", async
   );
   const live = structuredClone(legacy.checkpoint);
   live.authority.environment.environment = "LIVE";
+  live.authority_sha256 = sha256Hex(stableMigrationJson(live.authority));
   assert.throws(
     () => buildObservationHistoryV3RerunVerificationPlan({
       checkpoint: live,
@@ -4068,7 +4091,11 @@ test("recovery journal schema and final-state replay remain structurally compati
     let replayed;
     try {
       process.stderr.write = (message) => { diagnostics.push(String(message)); return true; };
-      process.stdout.write = (message) => { stdout.push(String(message)); return true; };
+      process.stdout.write = (message, ...args) => {
+          // node:test transports its own binary events over stdout.
+          if (Buffer.isBuffer(message)) return stdoutWrite.call(process.stdout, message, ...args);
+          stdout.push(String(message)); return true;
+        };
       replayed = buildObservationHistoryV3RecoveryProgressContext({
         checkpointPath,
         checkpoint: originalCheckpoint,
@@ -4114,14 +4141,15 @@ test("recovery journal schema and final-state replay remain structurally compati
 });
 
 test("legacy canonical resume preserves historical evidence and requires exact authenticated TEST recovery", async (t) => {
-  const legacy = await buildLegacyRecoveryOrderingFixture();
+  const legacy = await buildLegacyRecoveryOrderingFixture({ exactPreparedBodies: true });
+  assert.ok(Object.values(legacy.checkpoint.prepared_units).every((record) => typeof record.target_manifest_body === "string"));
   const connector = legacy.recoveredPlan.canonical_publication_objects.find(
     (entry) => entry.publication_stage === "connector_manifest",
   );
   const parquet = legacy.recoveredPlan.units[0].target_file_intents[0];
   for (const scenario of [
-    "accepted concurrency 1", "accepted concurrency 16", "semantic-only current JSON",
-    "unrelated SHA", "Parquet mismatch", "not durable", "missing seed", "LIVE",
+    "accepted concurrency 1", "accepted concurrency 16", "accepted after staging cleanup 16", "semantic-only current JSON",
+    "unrelated SHA", "unrelated SHA before staging cleanup", "unknown canonical key", "semantic-only completed JSON", "Parquet mismatch", "not durable", "missing seed", "LIVE",
     "unauthenticated", "authority SHA", "run ID", "plan SHA", "replay SHA",
     "journal sequence", "journal head", "original checkpoint SHA",
   ]) await t.test(scenario, async () => {
@@ -4142,7 +4170,17 @@ test("legacy canonical resume preserves historical evidence and requires exact a
     if (scenario === "semantic-only current JSON") {
       fixture.r2.set(connector.key, Buffer.from(JSON.stringify(JSON.parse(connector.body))));
     }
-    if (scenario === "unrelated SHA") checkpoint.completed_objects[connector.key].sha256 = "e".repeat(64);
+    if (scenario.startsWith("unrelated SHA")) checkpoint.completed_objects[connector.key].sha256 = "e".repeat(64);
+    if (scenario.includes("staging cleanup")) for (const record of Object.values(checkpoint.prepared_units)) {
+      for (const intent of record.target_file_intents) intent.staging_ref = `fixture-staging/${intent.key}`;
+    }
+    if (scenario === "unknown canonical key") {
+      checkpoint.completed_objects[`${PREFIX}/unknown/manifest.json`] = { ...checkpoint.completed_objects[connector.key] };
+    }
+    if (scenario === "semantic-only completed JSON") {
+      const unrelated = Buffer.from(`${JSON.stringify(JSON.parse(connector.body))}\n`);
+      Object.assign(checkpoint.completed_objects[connector.key], { byte_size: unrelated.byteLength, sha256: sha256Hex(unrelated) });
+    }
     if (scenario === "Parquet mismatch") checkpoint.completed_objects[parquet.key].sha256 = "e".repeat(64);
     if (scenario === "not durable") checkpoint.completed_objects[connector.key].durable = false;
     if (scenario === "missing seed") for (const unit of legacy.recoveredPlan.units) {
@@ -4202,12 +4240,15 @@ test("legacy canonical resume preserves historical evidence and requires exact a
           : scenario === "LIVE" ? /TEST-only/
           : scenario === "Parquet mismatch" ? /resumed Parquet verification failed:.*checkpoint_identity_mismatch/
           : scenario === "semantic-only current JSON" ? /resumed canonical verification failed:.*current_object_identity_mismatch/
-          : scenario === "unrelated SHA" || scenario === "not durable" ? /resumed canonical verification failed:.*checkpoint_identity_mismatch/
+          : scenario === "unknown canonical key" ? /current_canonical_identity_not_generated/
+          : scenario.startsWith("unrelated SHA") || scenario === "semantic-only completed JSON" || scenario === "not durable" ? /resumed canonical verification failed:.*checkpoint_identity_mismatch/
           : /authenticated replay state|authenticated recovery journal is required/;
         await assert.rejects(execute, expected);
         assert.equal(adapters.jsonPutCalls, 0);
         assert.equal(adapters.putCalls, 0);
         assert.equal(adapters.checkpoints.length, 0);
+        assert.doesNotMatch(diagnostics.join(""), /: v3_(hierarchies|latest|objects|publication_plan)/);
+        assert.equal(reconstructed, undefined);
       }
     } finally { process.stderr.write = stderrWrite; }
     assert.deepEqual(checkpoint, before);
@@ -4225,7 +4266,111 @@ test("recovered plan progress is optional and preserves every reconstructed byte
     assert.deepEqual(observed, quiet);
     assert.deepEqual(args.checkpoint, checkpointBefore);
     assert.deepEqual(events.filter((event) => event.phase === "prepared_units").map((event) => event.completed), [0, 1, 2]);
-    assert.deepEqual(events.slice(-5).map((event) => event.phase), ["canonical_schedule", "v3_latest", "v3_objects", "v3_publication_plan", "complete"]);
+    assert.deepEqual(events.slice(-6).map((event) => event.phase), ["canonical_schedule", "v3_hierarchies", "v3_latest", "v3_objects", "v3_publication_plan", "complete"]);
     assert.deepEqual(events.at(-1), { phase: "complete", canonical: quiet.canonical_publication_objects.length, v3: quiet.v3_publication_plan.entries.length });
   }
+});
+
+
+test("canonical evidence gate skips historical reconstruction for all-current evidence in TEST and LIVE", async (t) => {
+  for (const exactPreparedBodies of [false, true]) for (const environment of ["TEST", "LIVE"]) {
+    if (!exactPreparedBodies && environment === "LIVE") continue;
+    await t.test(`${environment} exact bodies=${exactPreparedBodies}`, async () => {
+      const fixture = await buildLegacyRecoveryOrderingFixture({ exactPreparedBodies });
+      const checkpoint = structuredClone(fixture.checkpoint);
+      for (const entry of fixture.recoveredPlan.canonical_publication_objects) {
+        Object.assign(checkpoint.completed_objects[entry.key], { byte_size: entry.byte_size, sha256: entry.sha256 });
+      }
+      checkpoint.authority.environment.environment = environment;
+      checkpoint.authority_sha256 = sha256Hex(stableMigrationJson(checkpoint.authority));
+      const before = structuredClone(checkpoint);
+      const stderrWrite = process.stderr.write;
+      const stdoutWrite = process.stdout.write;
+      const diagnostics = [], stdout = [];
+      try {
+        process.stderr.write = (message) => { diagnostics.push(String(message)); return true; };
+        process.stdout.write = (message, ...args) => {
+          // node:test transports its own binary events over stdout.
+          if (Buffer.isBuffer(message)) return stdoutWrite.call(process.stdout, message, ...args);
+          stdout.push(String(message)); return true;
+        };
+        const result = await executeObservationHistoryV3MigrationPlan({
+          plan: checkpoint.authority, checkpoint, apply: true, writersFrozen: true,
+          environmentEvidence: { ...ENVIRONMENT, environment, configuredEnvironment: environment },
+          recoveryAuthority: authenticatedRecoveryAuthority(checkpoint), adapters: fixture.adapters,
+          publicationConcurrency: 16,
+        });
+        assert.equal(result.ok, true);
+        assert.deepEqual(result.checkpoint.completed_objects, before.completed_objects);
+        const report = buildObservationHistoryV3RerunVerificationPlan({
+          checkpoint, allowLegacyRecoveryOrdering: true, recoveryAuthority: authenticatedRecoveryAuthority(checkpoint),
+        });
+        assert.equal(report.recovery_reconciliation.mode, "EXACT");
+        assert.deepEqual(report.recovery_reconciliation.legacy_allowed_identities, {});
+        assert.doesNotMatch(diagnostics.join(""), /reconstructing historical/);
+        assert.match(diagnostics.join(""), /resumed canonical verification: exact=7 legacy_recovery_ordering=0 failed=0/);
+        assert.equal(diagnostics.filter((line) => line.includes(": v3_publication_plan ")).length, 1);
+        assert.deepEqual(stdout, []);
+      } finally { process.stderr.write = stderrWrite; process.stdout.write = stdoutWrite; }
+      assert.deepEqual(checkpoint, before);
+    });
+  }
+});
+
+test("canonical evidence gate reports all 14 settled failures and starts no later batch", async () => {
+  const legacy = await buildLegacyRecoveryOrderingFixture({
+    exactPreparedBodies: true,
+    fixtureOptions: { pollutantCodes: ["pm25", "pm10", "no2", "no", "nox", "o3", "so2", "co", "nh3", "c6h6", "c7h8", "c8h10", "h2s", "ch4", "co2", "bc", "ec", "oc"] },
+  });
+  legacy.adapters = memoryAdapters(legacy.fixture);
+  for (const unit of legacy.recoveredPlan.units) for (const entry of unit.target_file_intents) {
+    legacy.adapters.storedSha.set(entry.key, entry.sha256);
+  }
+  const checkpoint = structuredClone(legacy.checkpoint);
+  const firstBatch = legacy.recoveredPlan.canonical_publication_objects.slice(0, 16);
+  const failed = firstBatch.slice(2);
+  assert.equal(failed.length, 14);
+  // Keep the first two exact historical pollutant seeds. Seven failures are
+  // unexplained completion SHAs; seven match history but fail current R2 bytes.
+  for (const entry of failed.slice(0, 7)) checkpoint.completed_objects[entry.key].sha256 = "e".repeat(64);
+  for (const entry of failed.slice(7)) legacy.fixture.r2.set(entry.key, Buffer.from("wrong current R2 body"));
+  const reads = [], settled = [];
+  const getObject = legacy.adapters.getObject;
+  legacy.adapters.getObject = async (args) => {
+    reads.push(args.key);
+    await new Promise((resolve) => setTimeout(resolve, args.key === firstBatch[0].key ? 10 : 1));
+    const result = await getObject(args);
+    settled.push(args.key);
+    return result;
+  };
+  const before = structuredClone(checkpoint);
+  const stderrWrite = process.stderr.write, stdoutWrite = process.stdout.write;
+  const diagnostics = [], stdout = [];
+  try {
+    process.stderr.write = (message) => { diagnostics.push(String(message)); return true; };
+    process.stdout.write = (message, ...args) => {
+          // node:test transports its own binary events over stdout.
+          if (Buffer.isBuffer(message)) return stdoutWrite.call(process.stdout, message, ...args);
+          stdout.push(String(message)); return true;
+        };
+    await assert.rejects(() => executeObservationHistoryV3MigrationPlan({
+      plan: checkpoint.authority, checkpoint, apply: true, writersFrozen: true,
+      environmentEvidence: ENVIRONMENT, recoveryAuthority: authenticatedRecoveryAuthority(checkpoint),
+      adapters: legacy.adapters, publicationConcurrency: 16,
+    }), (error) => {
+      assert.deepEqual(error.failed_identities.map((entry) => entry.key), failed.map((entry) => entry.key));
+      return true;
+    });
+    const text = diagnostics.join("");
+    assert.match(text, /resumed canonical verification: exact=0 legacy_recovery_ordering=2 failed=14/);
+    assert.match(text, /completed_evidence_matches_neither_current_nor_historical/);
+    assert.match(text, /current_object_identity_mismatch; completed_evidence=LEGACY_RECOVERY_ORDERING/);
+    assert.equal(diagnostics.filter((line) => line.startsWith("V3 migration: failed canonical recovery identity:")).length, 14);
+    assert.doesNotMatch(text, /: v3_(hierarchies|latest|objects|publication_plan)/);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(new Set(reads), new Set([firstBatch[0].key, firstBatch[1].key, ...failed.slice(7).map((entry) => entry.key)]));
+    assert.deepEqual(new Set(settled), new Set(reads));
+    assert.equal(legacy.adapters.checkpoints.length, 0);
+  } finally { process.stderr.write = stderrWrite; process.stdout.write = stdoutWrite; }
+  assert.deepEqual(checkpoint, before);
 });

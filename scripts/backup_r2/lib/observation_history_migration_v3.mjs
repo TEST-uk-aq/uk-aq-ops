@@ -3535,6 +3535,37 @@ export async function executeObservationHistoryV3MigrationPlan({
     requireStoredSha256: true,
     label: "V3 migration: resumed Parquet verification", enabled: progressEnabled,
   });
+  let onCurrentProgress;
+  const verifyCanonicalGate = async () => {
+    onCurrentProgress = recoveredPlanProgress(progressEnabled);
+    const currentCanonical = reconstructPreparedCanonicalPlan({
+      checkpoint, authority: checkpoint.authority, allowLegacyRecoveryOrdering,
+      includeV3Hierarchy: false, onProgress: onCurrentProgress,
+    });
+    const { legacyCanonicalIdentities } = reconcileCompletedCanonicalHistory({
+      checkpoint, currentCanonical, legacyAuthority,
+      onHistoricalProgress: () => recoveredPlanProgress(
+        progressEnabled, "V3 migration: reconstructing historical canonical identities",
+      ),
+    });
+    const reverifiedCanonical = await reverifyCompletedMigrationObjects({
+      objects: authenticatedResume ? currentCanonical.canonicalObjects.filter(
+        (object) => Object.hasOwn(checkpoint.completed_objects, object.key),
+      ) : [],
+      checkpoint, adapters, concurrency: publicationConcurrency, requireStoredSha256: false,
+      label: "V3 migration: resumed canonical verification", enabled: progressEnabled,
+      legacyCanonicalIdentities,
+      reportClassifications: true,
+    });
+    return { currentCanonical, reverifiedCanonical };
+  };
+  // Canonical publication begins only after every unit was prepared. Any
+  // recovered canonical completion therefore requires the complete cheap gate
+  // before new preparation, staging cleanup, or checkpoint writes can occur.
+  const hasCompletedCanonical = authenticatedResume && Object.keys(checkpoint.completed_objects).some(
+    (key) => key.startsWith(`${plan.inventory.observations_prefix}/`) && key.endsWith(".json"),
+  );
+  const earlyCanonicalGate = hasCompletedCanonical ? await verifyCanonicalGate() : null;
   const partitionProgress = createMigrationProgressReporter({
     label: "V3 migration: partitions",
     total: plan.units.length,
@@ -3687,26 +3718,15 @@ export async function executeObservationHistoryV3MigrationPlan({
       partitionProgress.report(completedPartitions);
     }
   }
-  const onCurrentProgress = recoveredPlanProgress(progressEnabled);
-  const currentCanonical = reconstructPreparedCanonicalPlan({
-    checkpoint, authority: checkpoint.authority, allowLegacyRecoveryOrdering,
-    includeV3Hierarchy: false, onProgress: onCurrentProgress,
-  });
-  const { legacyCanonicalIdentities } = reconcileCompletedCanonicalHistory({
-    checkpoint, currentCanonical, legacyAuthority,
-    onHistoricalProgress: () => recoveredPlanProgress(
-      progressEnabled, "V3 migration: reconstructing historical canonical identities",
-    ),
-  });
-  const reverifiedCanonical = await reverifyCompletedMigrationObjects({
-    objects: authenticatedResume ? currentCanonical.canonicalObjects.filter(
-      (object) => Object.hasOwn(checkpoint.completed_objects, object.key),
-    ) : [],
-    checkpoint, adapters, concurrency: publicationConcurrency, requireStoredSha256: false,
-    label: "V3 migration: resumed canonical verification", enabled: progressEnabled,
-    legacyCanonicalIdentities,
-    reportClassifications: true,
-  });
+  const { currentCanonical, reverifiedCanonical } = earlyCanonicalGate || await verifyCanonicalGate();
+  // Early verification may precede staging-reference cleanup. Refresh only this
+  // invocation's staging progress; canonical bytes/dependencies remain checked.
+  currentCanonical.units = currentCanonical.units.map((unit) => Object.freeze({
+    ...unit,
+    target_file_intents: Object.freeze(checkpoint.prepared_units[unit.unit_id].target_file_intents.map(
+      (entry) => Object.freeze({ ...entry }),
+    )),
+  }));
   const completedPlan = completePreparedV3Plan({
     checkpoint, authority: checkpoint.authority, ...currentCanonical,
     onProgress: onCurrentProgress,
@@ -4338,6 +4358,13 @@ function validateLegacyRecoveryOrderingAuthority({
 function reconcileCompletedCanonicalHistory({
   checkpoint, currentCanonical, legacyAuthority, onHistoricalProgress = null,
 }) {
+  const currentKeys = new Set(currentCanonical.canonicalObjects.map((entry) => entry.key));
+  const canonicalPrefix = `${checkpoint.authority.inventory.observations_prefix}/`;
+  for (const key of Object.keys(checkpoint.completed_objects || {})) {
+    if (key.startsWith(canonicalPrefix) && key.endsWith(".json") && !currentKeys.has(key)) {
+      throw new Error(`checkpoint_identity_mismatch:current_canonical_identity_not_generated:${key}`);
+    }
+  }
   const historicalCanonicalReconciliationRequired = currentCanonical.canonicalObjects.some((entry) =>
     Object.hasOwn(checkpoint.completed_objects || {}, entry.key) &&
     !completionEvidenceMatches(checkpoint.completed_objects[entry.key], entry)
@@ -4373,7 +4400,7 @@ function requireLegacyRecoveryOrderingSeed({ units, checkpoint, legacyAllowedIde
   });
   if (!verified) {
     throw new Error(
-      "recovery_evidence_invalid: legacy recovery ordering has no exact pollutant-manifest seed",
+      "recovery_evidence_invalid:historical_seed_invalid: legacy recovery ordering has no exact pollutant-manifest seed",
     );
   }
   return true;
@@ -4410,7 +4437,7 @@ export function buildObservationHistoryV3RerunVerificationPlan({
       checkpoint.completed_objects?.[entry.key], entry, legacyAllowedIdentities[entry.key],
     );
     if (result.classification === "FAIL") {
-      throw new Error(`recovery_evidence_invalid:${entry.key}:${result.reason}`);
+      throw new Error(`recovery_evidence_invalid: checkpoint lacks exact durable completed-object evidence: ${entry.key}; ${result.reason}`);
     }
   }
   const pinnedPlan = completePreparedV3Plan({ checkpoint, authority, ...currentCanonical });
