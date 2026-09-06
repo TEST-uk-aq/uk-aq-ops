@@ -1,3 +1,8 @@
+import {
+  runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
+  runOperationalPruneDailyObservationHistoryV3RunFinalization,
+} from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";
+import { getObservationHistoryGeneration, resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -201,7 +206,7 @@ const HISTORY_R2_V2_SCHEMA_VERSION = 2;
 const HISTORY_R2_V2_OBSERVATIONS_MANIFEST_SCHEMA_VERSION = 3;
 const HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION = OBSERVATION_HISTORY_WRITER_VERSION_V3;
 const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
-export const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE = "^history/(v1/(observations|aqilevels/hourly)|v2/observations)/day_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}/manifest\\.json$";
+export const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE = "^history/(v1/(observations|aqilevels/hourly)|(v2|v3)/observations)/day_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}/manifest\\.json$";
 const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX = new RegExp(PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE);
 
 let parquetWasmInitialized = false;
@@ -403,7 +408,7 @@ export function isAcceptedPruneHistoryDayManifestKey(value) {
 
 export function resolvePruneHistoryGeneration(env = process.env) {
   assertNoDeprecatedR2HistoryVersionVars(env, { context: "Prune Daily history" });
-  const generation = String(env.UK_AQ_R2_HISTORY_VERSION ?? "");
+  const { version: generation } = resolveObservationHistoryGeneration(env);
   if (generation === "v3") {
     throw new Error("v3 side-by-side Prune history writer is not yet implemented");
   }
@@ -415,6 +420,7 @@ export function resolvePruneHistoryGeneration(env = process.env) {
 
 export function resolvePhaseBHistoryWritePrefixes(env = process.env) {
   const historyWriteVersion = resolvePruneHistoryGeneration(env);
+  const generation = getObservationHistoryGeneration(historyWriteVersion);
   const observationsPrefixV2 = normalizePrefix(
     env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || HISTORY_R2_V2_OBSERVATIONS_PREFIX,
   );
@@ -433,12 +439,12 @@ export function resolvePhaseBHistoryWritePrefixes(env = process.env) {
 
   return Object.freeze({
     history_write_version: historyWriteVersion,
-    observations_prefix: observationsPrefixV2,
+    observations_prefix: generation.observations_prefix,
     observations_prefix_v2: observationsPrefixV2,
     aqilevels_prefix: aqilevelsDataPrefixV2,
     aqilevels_hourly_data_prefix_v2: aqilevelsDataPrefixV2,
     aqilevels_hourly_debug_prefix_v2: aqilevelsDebugPrefixV2,
-    runs_prefix: runsPrefixV2,
+    runs_prefix: historyWriteVersion === "v3" ? generation.observations_runs_prefix : runsPrefixV2,
     runs_prefix_v2: runsPrefixV2,
   });
 }
@@ -1343,7 +1349,7 @@ where day_utc = $1::date
   });
 }
 
-async function revalidateCompleteCandidateSourceIdentity(client, candidate) {
+async function revalidateCompleteCandidateSourceIdentity(client, candidate, generation = "v2") {
   if (candidate.status !== "complete") return candidate;
   await client.query("begin isolation level repeatable read");
   try {
@@ -1382,7 +1388,9 @@ for update
       return currentCandidate;
     }
     let currentIdentity;
-    let failureReason = null;
+    let failureReason = currentCandidate.manifest_key === canonicalObservationConnectorManifestKey(
+      currentCandidate.day_utc, currentCandidate.connector_id, generation,
+    ) ? null : "history_generation_changed";
     try {
       currentIdentity = computePruneConnectorSourceIdentity(
         await readCanonicalConnectorDaySourceRows(
@@ -1464,7 +1472,7 @@ export async function revalidateCompleteCandidateSourceIdentityForTest(client, c
 
 
 async function populateBackupCandidates(client, latestEligibleWindowEndIso, runtime = {}) {
-  if (runtime.history_write_version === "v2") {
+  if (["v2", "v3"].includes(runtime.history_write_version)) {
     const invalidCodes = await client.query(`
 select distinct op.code
 from uk_aq_core.observations o
@@ -1818,7 +1826,7 @@ order by u.day_utc, u.connector_id
     });
     const revalidated = [];
     for (const candidate of candidates) {
-      const checked = await revalidateCompleteCandidateSourceIdentity(client, candidate);
+      const checked = await revalidateCompleteCandidateSourceIdentity(client, candidate, runtime.history_write_version);
       revalidated.push({
         ...candidate,
         ...checked,
@@ -3490,10 +3498,70 @@ async function publishFrozenV2Observations({ candidate, runtime, streamClient, r
   };
 }
 
+async function publishFrozenV3Observations({ candidate, runtime, streamClient, rows, backedUpAtUtc }) {
+  const byPollutant = new Map();
+  for (const row of rows) {
+    const code = normalizePollutantCodeForPath(row.pollutant_code);
+    if (!byPollutant.has(code)) byPollutant.set(code, []);
+    byPollutant.get(code).push(row);
+  }
+  const publication = await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
+    env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+    client: streamClient, r2: runtime.r2,
+    observationsPrefix: runtime.committed_prefix,
+    targetWriterGitSha: runtime.writer_git_sha, backedUpAtUtc,
+    partitions: [...byPollutant.entries()].map(([code, partitionRows]) => ({
+      scope: { day_utc: candidate.day_utc, connector_id: candidate.connector_id, pollutant_code: code },
+      rows: partitionRows,
+    })),
+    lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+    diagnosticEnvironment: runtime.environment,
+  });
+  if (publication.ok !== true || publication.connector_results.length !== 1) {
+    throw new Error("Side-by-side v3 connector publication is incomplete");
+  }
+  const result = publication.connector_results[0];
+  const manifest = result.canonical.connector_manifest_payload;
+  const files = result.partitions.flatMap((partition) => partition.pollutant_manifest.payload.files);
+  return {
+    manifest_key: manifest.manifest_key, connector_manifest: manifest,
+    written_row_count: BigInt(manifest.source_row_count),
+    total_bytes: BigInt(manifest.total_bytes), file_count: files.length,
+    files, parquet_object_keys: files.map((file) => file.key),
+    v3_connector_publication: publication.run_finalization_evidence,
+  };
+}
+
+async function finalizeSelectedObservationRun({ client, runtime, publishedCandidates, diagnostics }) {
+  if (runtime.history_write_version === "v2") {
+    return finalizeObservationV2Run({ client, runtime, publishedCandidates, diagnostics });
+  }
+  resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
+  const result = await runOperationalPruneDailyObservationHistoryV3RunFinalization({
+    env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+    client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
+    targetWriterGitSha: runtime.writer_git_sha,
+    connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
+    diagnostics, diagnosticEnvironment: runtime.environment,
+    lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+  });
+  if (result.ok !== true || result.canonical_aggregate_result?.canonical_aggregate_authority_verified !== true ||
+      result.v3_publication?.latest_global?.ok !== true) {
+    throw new Error("Side-by-side v3 finalisation lacks verified canonical and exact-index authority");
+  }
+  return {
+    ...result,
+    observations_manifest_hierarchy: result.canonical_aggregate_result.hierarchy,
+    index_finalization: { observations_timeseries: {
+      updated_latest_index: true, warning_count: 0, index_generation: "v3",
+    } },
+  };
+}
+
 async function writeFrozenCandidateObservationsToV2({
   candidate, runtime, streamClient, frozen, backedUpAtUtc = nowIso(),
   readFrozenRows = readFrozenSourceRows,
-  connectorPublisher = publishFrozenV2Observations,
+  connectorPublisher = runtime.history_write_version === "v3" ? publishFrozenV3Observations : publishFrozenV2Observations,
   cleanupFrozenSource = cleanupPhaseBTargetDaySourceTemp,
 }) {
   try {
@@ -3524,8 +3592,8 @@ async function writeFrozenCandidateObservationsToV2({
       source_row_count: candidate.expected_row_count,
       frozen_source_temp: frozen.temp, frozen_source_counts: frozen.counts,
       source_identity: frozen.sourceIdentity,
-      observation_history_writer_generation: "v2",
-      observation_history_index_generation: "v2",
+      observation_history_writer_generation: runtime.history_write_version,
+      observation_history_index_generation: runtime.history_write_version,
     };
   } catch (error) {
     cleanupFrozenSource(frozen.temp);
@@ -3682,7 +3750,7 @@ async function finalizePublishedPhaseBConnectors({
   runtime,
   runId,
   publishedCandidates,
-  runFinalizer = finalizeObservationV2Run,
+  runFinalizer = finalizeSelectedObservationRun,
   completeCandidateAndGate = markCandidateAndConnectorGateComplete,
 }) {
   if (!Array.isArray(publishedCandidates) || publishedCandidates.length === 0) {
@@ -3822,9 +3890,7 @@ export async function runCandidateAqilevelsStageForTest(args) {
 }
 
 async function exportCandidateToR2({ candidate, runtime }) {
-  if (runtime.history_write_version !== "v2") {
-    throw new Error("Phase B connector-day export requires canonical R2 history version v2");
-  }
+  resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
   return await exportCandidateObservationsToR2({ candidate, runtime });
 }
 async function dropboxRefreshAccessToken(dropboxConfig, { signal = undefined } = {}) {
@@ -4073,8 +4139,8 @@ export async function verifyObservationConnectorHistory({
     day_utc: dayUtc,
     connector_id: connectorId,
   }, PHASE_B_STAGE_MIN_MS.observation_index);
-  const expectedConnectorKey = canonicalObservationConnectorManifestKey(dayUtc, connectorId);
-  if (manifestKey !== expectedConnectorKey || runtime.committed_prefix !== HISTORY_R2_V2_OBSERVATIONS_PREFIX) {
+  const expectedConnectorKey = canonicalObservationConnectorManifestKey(dayUtc, connectorId, runtime.history_write_version);
+  if (manifestKey !== expectedConnectorKey || runtime.committed_prefix !== getObservationHistoryGeneration(runtime.history_write_version).observations_prefix) {
     throw new Error(`Observation connector manifest is not the canonical v2 key: ${manifestKey}`);
   }
 
@@ -4098,7 +4164,7 @@ export async function verifyObservationConnectorHistory({
     throw new Error(`Observation connector manifest has no pollutant children: ${manifestKey}`);
   }
 
-  if (writerResult?.observation_history_writer_generation !== "v2" ||
+  if (writerResult?.observation_history_writer_generation !== runtime.history_write_version ||
       JSON.stringify(connectorManifest) !== JSON.stringify(writerResult.connector_manifest)) {
     throw new Error(`Observation connector manifest disagrees with v2 writer evidence: ${manifestKey}`);
   }
@@ -4118,7 +4184,7 @@ export async function verifyObservationConnectorHistory({
     }
     seenPollutants.add(pollutantCode);
     const childKey = buildHistoryV2PollutantManifestKey(
-      HISTORY_R2_V2_OBSERVATIONS_PREFIX,
+      runtime.committed_prefix,
       dayUtc,
       connectorId,
       pollutantCode,
@@ -4323,7 +4389,7 @@ function buildPruneComparisonBasePath({ runtime, dayUtc, connectorId }) {
 }
 
 function buildPruneComparisonRowsQuery({ runtime, connectorId, dayStart, dayEnd }) {
-  if (runtime.history_write_version === "v2") {
+  if (["v2", "v3"].includes(runtime.history_write_version)) {
     return {
       sql: `
 select

@@ -1,4 +1,3 @@
-import { getObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "./uk_aq_observation_history_generation.mjs";
 // @ts-nocheck -- post-cutover-only Node writer shared by every canonical source.
 import { Buffer } from "node:buffer";
 
@@ -44,7 +43,7 @@ import {
 export const OBSERVATION_HISTORY_V3_STEADY_STATE_WRITER_GENERATION = "v3";
 export const OBSERVATION_HISTORY_V3_STEADY_STATE_HISTORY_VERSION = "v2";
 export const DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX =
-  "history/v3/observations";
+  "history/v2/observations";
 export const DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_LATEST_KEY =
   "history/_index_v3/observations_timeseries_latest.json";
 
@@ -294,7 +293,6 @@ export function buildObservationHistoryV3SteadyStatePartition({
   observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
   indexRoot = OBSERVATION_HISTORY_V3_INDEX_ROOT,
 }) {
-  assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot });
   const normalizedSource = normalizeSource(source);
   const writerGitSha = String(targetWriterGitSha || "").trim().toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(writerGitSha)) {
@@ -799,7 +797,6 @@ export async function runObservationHistoryV3ConnectorPublication({
   lockTimeoutMs,
   prepareCompleteDayReplacement = null,
 }) {
-  assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot, latestKey });
   if (!client?.query) throw new Error("V3 steady-state writer requires PostgreSQL lock client");
   if (!r2 || typeof r2 !== "object") throw new Error("V3 steady-state writer requires R2 configuration");
   for (const [name, adapter] of Object.entries({
@@ -814,7 +811,6 @@ export async function runObservationHistoryV3ConnectorPublication({
   })) {
     if (typeof adapter !== "function") throw new TypeError(`V3 steady-state writer adapter is missing: ${name}`);
   }
-  assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot });
   const normalizedSource = normalizeSource(source);
   const sosReplacement =
     normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement;
@@ -1127,7 +1123,6 @@ export async function runObservationHistoryV3RunFinalization({
   diagnosticEnvironment,
   lockTimeoutMs,
 }) {
-  assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot, latestKey });
   if (!client?.query) throw new Error("V3 run finalization requires PostgreSQL lock client");
   if (!r2 || typeof r2 !== "object") throw new Error("V3 run finalization requires R2 configuration");
   for (const [name, adapter] of Object.entries({

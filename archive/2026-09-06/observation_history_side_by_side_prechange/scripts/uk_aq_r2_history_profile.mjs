@@ -27,7 +27,7 @@ try {
     format = "show";
   }
 
-  const version = values.version === "v3" ? "v3" : parseR2HistoryVersion(values.version, { varName: "--version", required: true });
+  const version = parseR2HistoryVersion(values.version, { varName: "--version", required: true });
   const profile = getR2HistoryProfile(version);
 
   if (format === "json") {

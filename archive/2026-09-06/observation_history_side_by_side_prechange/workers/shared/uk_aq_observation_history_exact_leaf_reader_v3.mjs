@@ -1,4 +1,3 @@
-import { getObservationHistoryGeneration, assertObservationHistoryGenerationKey } from "./uk_aq_observation_history_generation.mjs";
 // @ts-nocheck -- shared exact-timeseries physical-leaf reader for index_v3.
 import { readColumn } from "hyparquet/src/column.js";
 import { DEFAULT_PARSERS } from "hyparquet/src/convert.js";
@@ -168,10 +167,6 @@ function normalizeIndex(index) {
     normalized.alignedRowCap !== MAX_PHYSICAL_SEGMENT_ROWS ||
     normalized.decodeProfileId !== SUPPORTED_DECODE_PROFILE_ID
   ) throw new Error("unsupported exact-leaf logical/layout identity");
-  if (normalized.root === getObservationHistoryGeneration("v3").observations_timeseries_index_prefix &&
-      (normalized.alignedDataRoot !== getObservationHistoryGeneration("v3").observations_prefix || normalized.indexGeneration !== "v3")) {
-    throw new Error("Canonical exact v3 index must reference history/v3 observations");
-  }
   return normalized;
 }
 
@@ -252,9 +247,6 @@ function validateProfile(profile) {
 
 function validateFile(raw, expectedScope, index) {
   const key = required(raw?.key, "file.key");
-  if (index.root === getObservationHistoryGeneration("v3").observations_timeseries_index_prefix) {
-    assertObservationHistoryGenerationKey(getObservationHistoryGeneration("v3"), key);
-  }
   if (
     !key.startsWith(`${index.alignedDataRoot}/`) ||
     !key.includes(`/${scopePath(expectedScope)}/`) ||
@@ -559,9 +551,6 @@ function validateCursorCoordinate(raw, request, index, dayUtc, label) {
     "max_observed_at_utc",
   ], label);
   const fileKey = required(raw.file_key, `${label}.file_key`);
-  if (index.root === getObservationHistoryGeneration("v3").observations_timeseries_index_prefix) {
-    assertObservationHistoryGenerationKey(getObservationHistoryGeneration("v3"), fileKey);
-  }
   const expectedScope = scopePath({
     dayUtc,
     connectorId: request.connectorId,

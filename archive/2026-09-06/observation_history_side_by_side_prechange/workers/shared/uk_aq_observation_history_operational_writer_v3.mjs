@@ -1,4 +1,3 @@
-import { getObservationHistoryGeneration, resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "./uk_aq_observation_history_generation.mjs";
 // @ts-nocheck -- disconnected post-cutover-only orchestration for Node writers.
 import { Buffer } from "node:buffer";
 
@@ -48,10 +47,9 @@ export function resolveObservationHistoryIndexV3BuildConfig({
   env = typeof process !== "undefined" ? process.env : {},
   requestedIndexGeneration = null,
 } = {}) {
-  const generation = resolveObservationHistoryGeneration(env).version;
-  if (requestedIndexGeneration !== null && requestedIndexGeneration !== generation) {
-    throw new Error("Requested index generation contradicts complete observation generation");
-  }
+  const generation = String(
+    requestedIndexGeneration ?? env?.UK_AQ_R2_HISTORY_INDEX_VERSION ?? "",
+  );
   if (generation !== OBSERVATION_HISTORY_EXACT_LEAF_INDEX_GENERATION_V3) {
     throw new Error(
       `Unsupported observation-history index generation for v3 builder: ${generation || "unset"}`,
@@ -664,7 +662,6 @@ function v3OnlyOptions({
   ...options
 }) {
   resolveObservationHistoryIndexV3BuildConfig({ env });
-  assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), options);
   const acceptedLimits = assertAcceptedObservationHistoryWriterLimitsV3(
     writerLimits,
     "disconnected operational observation-history v3 writer limits",

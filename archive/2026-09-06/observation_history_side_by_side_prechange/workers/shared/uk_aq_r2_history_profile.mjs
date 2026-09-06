@@ -1,4 +1,4 @@
-import { getObservationHistoryGeneration, resolveObservationHistoryGeneration } from "./uk_aq_observation_history_generation.mjs";
+import { resolveR2HistoryVersion, UK_AQ_R2_HISTORY_VERSION_ENV } from "./uk_aq_r2_history_version.mjs";
 
 const PROFILES = Object.freeze({
   v1: Object.freeze({
@@ -15,7 +15,7 @@ const PROFILES = Object.freeze({
   }),
   v2: Object.freeze({
     version: "v2",
-    ...getObservationHistoryGeneration("v2"),
+    observations_prefix: "history/v2/observations",
     aqilevels_hourly_data_prefix: "history/v2/aqilevels/hourly/data",
     aqilevels_hourly_debug_prefix: "history/v2/aqilevels/hourly/debug",
     core_prefix: "history/v2/core",
@@ -24,25 +24,18 @@ const PROFILES = Object.freeze({
     observations_timeseries_index_prefix: "history/_index_v2/observations_timeseries",
     aqilevels_timeseries_index_prefix: "history/_index_v2/aqilevels_hourly_data_timeseries",
     timeseries_binding_index_prefix: "history/_index_v2/timeseries_binding"
-  }),
-  v3: Object.freeze({
-    ...getObservationHistoryGeneration("v3"),
-    core_prefix: "history/v2/core",
-    aqilevels_hourly_data_prefix: "history/v2/aqilevels/hourly/data",
-    aqilevels_hourly_debug_prefix: "history/v2/aqilevels/hourly/debug",
-    aqilevels_timeseries_index_prefix: "history/_index_v2/aqilevels_hourly_data_timeseries",
   })
 });
 
 export function getR2HistoryProfile(version) {
-  if (version !== "v1" && version !== "v2" && version !== "v3") {
+  if (version !== "v1" && version !== "v2") {
     throw new Error(`Invalid R2 history version: ${version}`);
   }
   return PROFILES[version];
 }
 
 export function resolveR2HistoryProfile(env, options = {}) {
-  const { version } = resolveObservationHistoryGeneration(env);
+  const version = resolveR2HistoryVersion(env, options);
   return getR2HistoryProfile(version);
 }
 
@@ -50,7 +43,7 @@ export function assertR2HistoryProfile(profile) {
   if (!profile || typeof profile !== "object") {
     throw new Error("Missing or invalid profile object");
   }
-  if (!profile.version || (profile.version !== "v1" && profile.version !== "v2" && profile.version !== "v3")) {
+  if (!profile.version || (profile.version !== "v1" && profile.version !== "v2")) {
     throw new Error("Profile is missing a valid version field");
   }
   if (profile !== PROFILES[profile.version]) {

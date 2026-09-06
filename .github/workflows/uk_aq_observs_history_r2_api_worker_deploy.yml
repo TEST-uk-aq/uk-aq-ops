@@ -56,13 +56,13 @@ jobs:
             exit 1
           fi
           case "${UK_AQ_R2_HISTORY_VERSION}" in
-            v1|v2) ;;
+            v2|v3) ;;
             "")
               echo "Missing GitHub variable UK_AQ_R2_HISTORY_VERSION."
               exit 1
               ;;
             *)
-              echo "Invalid UK_AQ_R2_HISTORY_VERSION=${UK_AQ_R2_HISTORY_VERSION}; expected v1 or v2."
+              echo "Invalid UK_AQ_R2_HISTORY_VERSION=${UK_AQ_R2_HISTORY_VERSION}; expected v2 or v3."
               exit 1
               ;;
           esac

@@ -1,5 +1,3 @@
-import observationHistoryV3 from "./worker_v3.mjs";
-import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import {
@@ -1444,21 +1442,6 @@ async function handleTimeseriesBindingRequest(requestParams, env) {
 
 export default {
   async fetch(request, env, ctx) {
-    try {
-      const generation = resolveObservationHistoryGeneration(env);
-      if (generation.version === "v3") return await observationHistoryV3.fetch(request, env, ctx);
-      for (const [name, expected] of Object.entries({
-        UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: generation.observations_prefix,
-        UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: generation.index_root_prefix,
-        UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX: generation.observations_timeseries_index_prefix,
-        UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX: generation.timeseries_binding_index_prefix,
-      })) {
-        if (env[name] && normalizePrefix(env[name]) !== expected) throw new Error(`${name} conflicts with selected generation`);
-      }
-    } catch (error) {
-      return jsonResponse({ ok: false, error: error.message }, { status: 500, noStore: true });
-    }
-
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,

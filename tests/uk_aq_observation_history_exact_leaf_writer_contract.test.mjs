@@ -80,7 +80,7 @@ const EXACT_READER_INDEX = Object.freeze({
   root: DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
   alignedIndexRoot:
     `${DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT}/_aligned`,
-  alignedDataRoot: "history/v2/observations",
+  alignedDataRoot: "history/v3/observations",
   indexGeneration: "v3",
   historyVersion: "v2",
   historySchemaVersion: 3,

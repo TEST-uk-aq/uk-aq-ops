@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -721,11 +720,6 @@ async function main() {
     },
   );
 
-  const generation = resolveObservationHistoryGeneration(process.env);
-  if (inventoryRoot.observations.source_root_manifest_key !== generation.observations_root_key ||
-      inventoryRoot.global_units.observations_timeseries_latest.relative_path !== generation.observations_timeseries_latest_key) {
-    throw new Error("Backup inventory does not describe the selected observation generation");
-  }
   const runManifestInventoryPointer =
     inventoryRoot.global_units.observation_run_manifests;
   const runManifestInventoryResult = readJsonRequired(

@@ -24,7 +24,7 @@ on:
         default: ""
         type: string
       history_version:
-        description: "Core snapshot history version (v1 or v2). Blank = repo variable UK_AQ_R2_HISTORY_VERSION."
+        description: "Observation binding generation (v2 or v3); must match the repository selector. Core remains v2."
         required: false
         default: ""
         type: string
@@ -108,9 +108,9 @@ jobs:
           fi
 
           case "${UK_AQ_R2_HISTORY_VERSION}" in
-            v1|v2) ;;
+            v2|v3) ;;
             *)
-              echo "UK_AQ_R2_HISTORY_VERSION must be v1 or v2." >&2
+              echo "UK_AQ_R2_HISTORY_VERSION must be v2 or v3." >&2
               exit 1
               ;;
           esac
@@ -153,46 +153,18 @@ jobs:
           echo "Running: ${cmd[*]}"
           "${cmd[@]}"
 
-      - name: Refresh timeseries binding source hierarchy and commit source state
+      - name: Save binding hierarchy result from protected publication
         run: |
-          set -euo pipefail
-          mkdir -p tmp
-
-          if [ "${UK_AQ_R2_HISTORY_VERSION}" != "v2" ]; then
-            echo "Skipping binding source hierarchy refresh for ${UK_AQ_R2_HISTORY_VERSION}."
-            exit 0
-          fi
-          if [ "${INPUT_DRY_RUN}" = "true" ]; then
-            echo "Skipping binding source hierarchy refresh during core snapshot dry run."
-            exit 0
-          fi
-
-          source_fingerprint="$(python3 - <<'PY'
+          python3 - <<'PYCODE'
           import json
-          with open('tmp/uk_aq_core_snapshot_to_r2_report.json', 'r', encoding='utf-8') as handle:
-              report = json.load(handle)
-          reconciliation = report.get('timeseries_binding_reconciliation') or {}
-          print(str(reconciliation.get('current_source_fingerprint') or '').strip())
-          PY
-          )"
-
-          cmd=(
-            node scripts/backup_r2/uk_aq_refresh_timeseries_binding_source_hierarchy.mjs
-            --core-snapshot-report "tmp/uk_aq_core_snapshot_to_r2_report.json"
-            --binding-prefix "${UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX}"
-            --backup-inventory-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
-            --report-out "tmp/uk_aq_timeseries_binding_source_hierarchy_report.json"
-          )
-          if [ -n "${source_fingerprint}" ]; then
-            if ! printf "%s" "${source_fingerprint}" | grep -Eq '^[a-f0-9]{64}$'; then
-              echo "Invalid binding reconciliation source fingerprint in core snapshot report." >&2
-              exit 1
-            fi
-            cmd+=(--source-fingerprint "${source_fingerprint}")
-          fi
-
-          echo "Running: ${cmd[*]}"
-          "${cmd[@]}"
+          from pathlib import Path
+          report = json.loads(Path("tmp/uk_aq_core_snapshot_to_r2_report.json").read_text())
+          result = report.get("timeseries_binding_source_hierarchy")
+          if not report.get("dry_run") and report.get("timeseries_binding_reconciliation", {}).get("status") in ("succeeded", "skipped"):
+              if not result or result.get("ok") is not True:
+                  raise SystemExit("Protected binding hierarchy publication is incomplete")
+          Path("tmp/uk_aq_timeseries_binding_source_hierarchy_report.json").write_text(json.dumps(result, indent=2))
+          PYCODE
 
       - name: Upload snapshot report artifact
         if: always()

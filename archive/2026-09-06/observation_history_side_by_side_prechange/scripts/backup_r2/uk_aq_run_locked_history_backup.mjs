@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
@@ -88,7 +87,11 @@ export function parseLockedHistoryBackupArgs(argv) {
   for (const [flag, value] of [
     ["--source-root", args.sourceRoot],
     ["--dest-root", args.destRoot],
+    ["--observations-prefix", args.observationsPrefix],
+    ["--runs-prefix", args.runsPrefix],
     ["--core-prefix", args.corePrefix],
+    ["--timeseries-binding-prefix", args.timeseriesBindingPrefix],
+    ["--history-index-version", args.historyIndexVersion],
     ["--inventory-root-prefix", args.inventoryRootPrefix],
     ["--state-root-prefix", args.stateRootPrefix],
     ["--inventory-report-out", args.inventoryReportOut],
@@ -103,7 +106,7 @@ export function parseLockedHistoryBackupArgs(argv) {
   ]) {
     if (!/^\d+$/.test(String(value))) throw new Error(`${flag} must be a non-negative integer`);
   }
-  if (args.historyIndexVersion !== null) resolveObservationsTimeseriesLatestPath(args.historyIndexVersion);
+  resolveObservationsTimeseriesLatestPath(args.historyIndexVersion);
   assertExperimentalPackOnlyDestination({
     mode: args.timeseriesBindingBackupMode,
     destRoot: args.destRoot,
@@ -149,19 +152,6 @@ export function runLockedHistoryBackup({
     env,
     expectedOwner: "r2_history_dropbox_backup",
   });
-  const generation = resolveObservationHistoryGeneration(env);
-  args = {
-    ...args,
-    observationsPrefix: args.observationsPrefix ?? generation.observations_prefix,
-    runsPrefix: args.runsPrefix ?? generation.observations_runs_prefix,
-    timeseriesBindingPrefix: args.timeseriesBindingPrefix ?? generation.timeseries_binding_index_prefix,
-    historyIndexVersion: args.historyIndexVersion ?? generation.version,
-  };
-  assertObservationHistoryGenerationPrefixes(generation, {
-    observationsPrefix: args.observationsPrefix, bindingPrefix: args.timeseriesBindingPrefix,
-  });
-  if (args.runsPrefix !== generation.observations_runs_prefix || args.historyIndexVersion !== generation.version ||
-      args.corePrefix !== "history/v2/core") throw new Error("Backup arguments contradict selected complete generation");
   const node = process.execPath;
   if (args.timeseriesBindingBackupMode !== "individual") {
     runRequired(node, [

@@ -1,4 +1,3 @@
-import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 import { createHash } from "node:crypto";
 import {
   parquetMetadataAsync,
@@ -15,11 +14,7 @@ import {
   sha256Hex,
 } from "./r2_objects.ts";
 
-export function observationHistoryPrefix(): string {
-  return resolveObservationHistoryGeneration({
-    UK_AQ_R2_HISTORY_VERSION: Deno.env.get("UK_AQ_R2_HISTORY_VERSION"),
-  }).observations_prefix;
-}
+export const R2_OBSERVATION_PREFIX = "history/v2/observations";
 export const R2_OBSERVATION_COLUMNS = [
   "connector_id",
   "station_id",
@@ -123,7 +118,7 @@ export function createR2ManifestCache(): R2ManifestCache {
 
 export function r2ObservationDayManifestKey(dayUtc: string): string {
   assertIsoDay(dayUtc, "dayUtc");
-  return `${observationHistoryPrefix()}/day_utc=${dayUtc}/manifest.json`;
+  return `${R2_OBSERVATION_PREFIX}/day_utc=${dayUtc}/manifest.json`;
 }
 
 export function isAbsentR2ObservationDayManifest(
@@ -559,7 +554,7 @@ function parseManifestFiles(
   pollutantCode: string,
 ): ManifestFile[] {
   const expectedPrefix =
-    `${observationHistoryPrefix()}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/`;
+    `${R2_OBSERVATION_PREFIX}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/`;
   const files = asArray(manifest.files, `${manifestKey}.files`).map(
     (value, index) => {
       const label = `${manifestKey}.files[${index}]`;
@@ -763,7 +758,7 @@ export async function readValidatedObservationPollutantPartition(args: {
     `${dayKey}.connector_manifests`,
   );
   const connectorKey =
-    `${observationHistoryPrefix()}/day_utc=${args.dayUtc}/connector_id=${args.connectorId}/manifest.json`;
+    `${R2_OBSERVATION_PREFIX}/day_utc=${args.dayUtc}/connector_id=${args.connectorId}/manifest.json`;
   const connectorManifest = await readJsonManifest(
     args.readObject,
     connectorKey,
@@ -792,7 +787,7 @@ export async function readValidatedObservationPollutantPartition(args: {
     `${connectorKey}.child_manifests`,
   );
   const pollutantKey =
-    `${observationHistoryPrefix()}/day_utc=${args.dayUtc}/connector_id=${args.connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
+    `${R2_OBSERVATION_PREFIX}/day_utc=${args.dayUtc}/connector_id=${args.connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
   const pollutantManifest = await readJsonManifest(
     args.readObject,
     pollutantKey,

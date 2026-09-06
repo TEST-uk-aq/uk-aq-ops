@@ -16,9 +16,7 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
-import { resolveObservationHistoryGeneration } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
-import { delegateBindingPublicationIfNeeded } from "./lib/observation_binding_publication_lock.mjs";
-import { refreshAndCommitTimeseriesBindingSource } from "./uk_aq_refresh_timeseries_binding_source_hierarchy.mjs";
+import { resolveR2HistoryVersion } from "../../workers/shared/uk_aq_r2_history_version.mjs";
 import {
   reconcileR2HistoryV2TimeseriesBindings,
   DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
@@ -32,10 +30,11 @@ import {
 export { TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION, buildTimeseriesBindingSourceState };
 
 export function resolveCoreSnapshotPrefix(env = process.env) {
-  resolveObservationHistoryGeneration(env);
-  const prefix = normalizePrefix(env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || "history/v2/core");
-  if (prefix !== "history/v2/core") throw new Error("Observation generation does not relocate canonical core authority");
-  return prefix;
+  const version = resolveR2HistoryVersion(env, { context: "R2 core snapshot" });
+  if (version === "v2") {
+    return normalizePrefix(env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || "history/v2/core");
+  }
+  return normalizePrefix(env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core");
 }
 
 const DEFAULT_SOURCE_SCHEMA = (process.env.UK_AQ_CORE_SNAPSHOT_SCHEMA || "uk_aq_core").trim();
@@ -393,7 +392,7 @@ function parseArgs(argv) {
     throw new Error("--prefix resolved to an empty value");
   }
 
-  const defaultTables = ["v2", "v3"].includes(resolveObservationHistoryGeneration(process.env).version)
+  const defaultTables = resolveR2HistoryVersion(process.env, { context: "R2 core snapshot" }) === "v2"
     ? [...DEFAULT_TABLES, ...V2_ONLY_DEFAULT_TABLES]
     : [...DEFAULT_TABLES];
   const requestedTables = args.tables.length ? Array.from(new Set(args.tables)) : defaultTables;
@@ -804,7 +803,7 @@ async function main(args) {
     }
 
     try {
-      if (["v2", "v3"].includes(resolveObservationHistoryGeneration(process.env).version)) {
+      if (resolveR2HistoryVersion(process.env, { context: "R2 core snapshot" }) === "v2") {
         const artifactByTable = new Map(tableArtifacts.map((entry) => [entry.table, entry]));
         const timeseriesFile = artifactByTable.get("timeseries")?.temp_file;
         const phenomenaFile = artifactByTable.get("phenomena")?.temp_file;
@@ -815,7 +814,8 @@ async function main(args) {
             reason: "required_core_binding_tables_not_exported",
           };
         } else {
-          const bindingPrefix = resolveObservationHistoryGeneration(process.env).timeseries_binding_index_prefix;
+          const bindingPrefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
+            || DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX);
           const sourceStateKey = `${bindingPrefix}/_source_state.json`;
           const continuityRows = await retryTransient(
             () => readTimeseriesContinuityRows(ingestDbUrl),
@@ -873,15 +873,6 @@ async function main(args) {
             report.timeseries_binding_reconciliation.source_state_status = "awaiting_hierarchy_commit";
           }
           }
-          if (!args.dry_run && report.timeseries_binding_reconciliation?.status !== "failed") {
-            report.timeseries_binding_source_hierarchy = await refreshAndCommitTimeseriesBindingSource({
-              r2, bindingPrefix,
-              backupInventoryRootPrefix: process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || "history/_index_v2/backup_inventory_v2",
-              sourceFingerprint: source.fingerprint, coreSnapshotReport: report,
-              forceRebuild: false, dryRun: false,
-            });
-            if (report.timeseries_binding_source_hierarchy.ok !== true) throw new Error("Binding source hierarchy publication failed");
-          }
         }
       }
     } catch (error) {
@@ -907,10 +898,6 @@ function isMainModule(moduleUrl) {
 
 if (isMainModule(import.meta.url)) {
 try {
-  if (!process.argv.includes("--help") && !process.argv.includes("-h")) {
-    const delegated = await delegateBindingPublicationIfNeeded(import.meta.url);
-    if (delegated !== null) process.exit(delegated);
-  }
   const args = parseArgs(process.argv.slice(2));
   reportOutPath = args.report_out || reportOutPath;
   const report = await main(args);

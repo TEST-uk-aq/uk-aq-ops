@@ -1,4 +1,3 @@
-import { resolveObservationHistoryGeneration } from "../../shared/uk_aq_observation_history_generation.mjs";
 import { mergeObservationRowsPreferR2, normalizePollutantCode } from "../../../lib/aqi/aqi_levels.mjs";
 import { STATION_HISTORY_OBSERVATION_ROW_LIMIT } from "./limits.mjs";
 
@@ -30,7 +29,7 @@ function resolveApiUrl(value) {
 }
 
 export function usesV3PhysicalObservationPages(env = {}) {
-  return resolveObservationHistoryGeneration(env).version === "v3";
+  return required(env.UK_AQ_R2_HISTORY_INDEX_VERSION) === "v3";
 }
 
 export function createStationHistoryV3ReadBudget({

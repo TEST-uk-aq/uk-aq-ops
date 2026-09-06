@@ -56,7 +56,7 @@ jobs:
       UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || 'history/v2/_ops/observations/runs' }}
       UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
       UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
-      UK_AQ_R2_HISTORY_INDEX_VERSION: ${{ vars.UK_AQ_R2_HISTORY_INDEX_VERSION || '' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || 'history/_index_v2/timeseries_binding' }}
       UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || 'history/_index_v2/backup_inventory_v2' }}
       UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || '_ops/checkpoints/r2_history_backup_state_v2' }}
@@ -189,10 +189,10 @@ jobs:
           set -euo pipefail
           mkdir -p tmp
 
-          case "${UK_AQ_R2_HISTORY_INDEX_VERSION}" in
+          case "${UK_AQ_R2_HISTORY_VERSION}" in
             v2|v3) ;;
             *)
-              echo "UK_AQ_R2_HISTORY_INDEX_VERSION must be exactly v2 or v3" >&2
+              echo "UK_AQ_R2_HISTORY_VERSION must be exactly v2 or v3" >&2
               exit 1
               ;;
           esac
@@ -240,12 +240,8 @@ jobs:
             node scripts/backup_r2/uk_aq_run_locked_history_backup.mjs
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
             --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
-            --observations-prefix "${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX}"
-            --runs-prefix "${UK_AQ_R2_HISTORY_V2_RUNS_PREFIX}"
             --core-prefix "${UK_AQ_R2_HISTORY_V2_CORE_PREFIX}"
-            --timeseries-binding-prefix "${UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX}"
             --timeseries-binding-backup-mode "${selected_mode}"
-            --history-index-version "${UK_AQ_R2_HISTORY_INDEX_VERSION}"
             --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
             --state-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX}"
             --max-days-per-run "${max_days}"

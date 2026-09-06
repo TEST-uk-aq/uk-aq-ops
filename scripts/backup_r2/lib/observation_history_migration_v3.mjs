@@ -1,3 +1,10 @@
+import { inventorySideBySideBindings } from "./observation_history_generation_bindings.mjs";
+import {
+  getObservationHistoryGeneration,
+  assertObservationHistoryGenerationKey,
+  assertObservationHistoryGenerationPrefixes,
+} from "../../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3 } from "../../../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
 import { createOperatorProgress, withOperatorPhase, formatElapsed as formatMigrationProgressElapsed } from "../../index_v3_migration/operator_execution.mjs";
 import fs from "node:fs";
 import path from "node:path";
@@ -1028,7 +1035,7 @@ async function reverifyPinnedCompatibleSourceUnitsBeforeMutation({
       sourcePartition,
       getR2Object,
       writerLimits: plan.target.writer_limits,
-      observationsPrefix: plan.inventory.observations_prefix,
+      observationsPrefix: plan.target_observations_prefix || plan.inventory.observations_prefix,
       targetWriterGitSha: plan.target_writer_git_sha,
       sosConnectorId: plan.sos_connector_id,
       v3IndexRoot: plan.v3_index_root,
@@ -2946,7 +2953,7 @@ function preparedUnitFromRecord(authorityUnit, record, {
   const targetManifestObject = legacyOriginalOrdering
     ? rebuildLegacyPreparedManifestObject(authorityUnit, record)
     : canonicalJsonObjectFromBody({
-        key: authorityUnit.source_manifest_identity.key,
+        key: record.target_manifest.manifest_key,
         payload: record.target_manifest,
         body: manifestBody,
         stage: "pollutant_manifest",
@@ -3005,7 +3012,7 @@ function reconstructPreparedCanonicalPlan({
   const parents = buildCanonicalParents({
     inventory: authority.inventory,
     units,
-    observationsPrefix: authority.inventory.observations_prefix,
+    observationsPrefix: authority.target_observations_prefix || authority.inventory.observations_prefix,
     targetWriterGitSha: authority.target_writer_git_sha,
   });
   onProgress?.({ phase: "canonical_schedule" });
@@ -3389,8 +3396,12 @@ export async function executeObservationHistoryV3MigrationPlan({
       blockers: plan.blockers,
     });
   }
+  assertSideBySideMigrationPlan(plan);
+  adapters = guardSideBySideMigrationAdapters(plan, adapters);
+  await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
   const currentEnvironment = validateObservationHistoryV3MigrationEnvironment({
     ...environmentEvidence,
+    indexVersion: environmentEvidence.historyVersion,
     transition: plan.transition.kind,
     apply: true,
   });
@@ -3403,7 +3414,7 @@ export async function executeObservationHistoryV3MigrationPlan({
   if (writersFrozen !== true) {
     throw new Error("Migration apply requires explicit confirmation that all planned writers are frozen");
   }
-  if (!plan.backup_gate?.verified || plan.blockers.length || plan.mutation_allowed !== true) {
+  if (plan.blockers.length || plan.mutation_allowed !== true) {
     throw new Error("Migration apply is blocked by incomplete plan or backup evidence");
   }
   for (const name of [
@@ -3477,7 +3488,9 @@ export async function executeObservationHistoryV3MigrationPlan({
   const legacyAuthority = validateLegacyRecoveryOrderingAuthority({
     checkpoint, recoveryAuthority, allowLegacyRecoveryOrdering: Boolean(authenticatedResume),
   });
-  const allowLegacyRecoveryOrdering = legacyAuthority.eligible;
+  if (legacyAuthority.eligible) throw new Error("Historical in-place recovery ordering cannot authorize side-by-side migration");
+  await publishSideBySideBindings({ plan, checkpoint, adapters });
+  const allowLegacyRecoveryOrdering = false;
   const publishedParquet = authenticatedResume ? plan.units.flatMap((unit) => {
     const record = checkpoint.prepared_units[unit.unit_id];
     return record?.files_published === true
@@ -3519,7 +3532,7 @@ export async function executeObservationHistoryV3MigrationPlan({
   // recovered canonical completion therefore requires the complete cheap gate
   // before new preparation, staging cleanup, or checkpoint writes can occur.
   const hasCompletedCanonical = authenticatedResume && Object.keys(checkpoint.completed_objects).some(
-    (key) => key.startsWith(`${plan.inventory.observations_prefix}/`) && key.endsWith(".json"),
+    (key) => key.startsWith(`${plan.target_observations_prefix || plan.inventory.observations_prefix}/`) && key.endsWith(".json"),
   );
   const earlyCanonicalGate = hasCompletedCanonical ? await verifyCanonicalGate() : null;
   const partitionProgress = createMigrationProgressReporter({
@@ -3547,7 +3560,7 @@ export async function executeObservationHistoryV3MigrationPlan({
         sourcePartition,
         getR2Object: adapters.getObject,
         writerLimits: plan.target.writer_limits,
-        observationsPrefix: plan.inventory.observations_prefix,
+        observationsPrefix: plan.target_observations_prefix || plan.inventory.observations_prefix,
         targetWriterGitSha: plan.target_writer_git_sha,
         sosConnectorId: plan.sos_connector_id,
         v3IndexRoot: plan.v3_index_root,
@@ -4079,9 +4092,17 @@ export async function verifyObservationHistoryV3MigrationResult({
   if (!publicationResult || publicationResult.ok !== true) {
     blockers.push("v3_durable_publication_evidence_incomplete");
   }
-  if (!plan.backup_gate?.verified) blockers.push("verified_dropbox_checkpoint_missing");
-  if (!plan.rollback_preflight?.verified) {
-    blockers.push("manifest_guided_rollback_preflight_incomplete");
+  if (plan.generation_topology === SIDE_BY_SIDE_TOPOLOGY) {
+    try {
+      assertSideBySideMigrationPlan(plan);
+      await verifySideBySideLogicalOutput({ plan, getObject });
+      await verifySideBySideSourceRoot({ plan, getObject });
+    } catch (error) {
+      blockers.push(`side_by_side_source_or_target_invalid:${error.message}`);
+    }
+  } else {
+    if (!plan.backup_gate?.verified) blockers.push("verified_dropbox_checkpoint_missing");
+    if (!plan.rollback_preflight?.verified) blockers.push("manifest_guided_rollback_preflight_incomplete");
   }
   if (!plan.writer_freeze_plan?.entries?.length) blockers.push("writer_freeze_plan_missing");
   const uniqueBlockers = [...new Set(blockers)].sort();
@@ -5029,4 +5050,240 @@ export function buildObservationHistoryV3MigrationAuditReport({
     rollback_observed_starting_index_version:
       rollback?.observed_starting_index_version || null,
   };
+}
+
+export const SIDE_BY_SIDE_TOPOLOGY = "observation-history-side-by-side-v1";
+
+export function assertSideBySideMigrationPlan(plan) {
+  const target = getObservationHistoryGeneration("v3");
+  if (plan?.generation_topology !== SIDE_BY_SIDE_TOPOLOGY ||
+      plan.plan_identity?.generation_topology !== SIDE_BY_SIDE_TOPOLOGY ||
+      plan.transition?.kind !== "v2-to-v3" ||
+      plan.inventory?.observations_prefix !== getObservationHistoryGeneration("v2").observations_prefix ||
+      plan.plan_identity?.target_observations_prefix !== plan.target_observations_prefix ||
+      plan.plan_sha256 !== sha256Hex(stableMigrationJson(plan.plan_identity))) {
+    throw new Error("Migration requires fresh authenticated side-by-side authority; in-place v3 authority is retired");
+  }
+  const identity = plan.plan_identity;
+  const pinnedRoot = identity.source_root;
+  const root = plan.inventory.root_manifest;
+  if (identity.v3_index_root !== plan.v3_index_root ||
+      identity.v3_latest_key !== plan.v3_latest_key ||
+      identity.migration_run_id !== plan.migration_run_id ||
+      identity.target_writer_git_sha !== plan.target_writer_git_sha ||
+      identity.environment !== plan.environment.environment ||
+      identity.bucket !== plan.environment.bucket ||
+      pinnedRoot?.key !== root.key || pinnedRoot?.byte_size !== root.byte_size ||
+      pinnedRoot?.sha256 !== root.sha256 ||
+      !sameSemanticJson(identity.transition, plan.transition) ||
+      !sameSemanticJson(identity.writer_limits, plan.target.writer_limits) ||
+      !sameSemanticJson(identity.unit_ids, plan.units.map((unit) => unit.unit_id)) ||
+      !sameSemanticJson(identity.bindings, plan.bindings) ||
+      !sameSemanticJson(identity.empty_source_connectors, plan.empty_source_connectors)) {
+    throw new Error("Side-by-side plan contradicts its pinned generation authority");
+  }
+  assertObservationHistoryGenerationPrefixes(target, {
+    observationsPrefix: plan.target_observations_prefix,
+    indexRoot: plan.v3_index_root,
+    latestKey: plan.v3_latest_key,
+  });
+  for (const unit of plan.units) {
+    if (unit.target_manifest_object) assertObservationHistoryGenerationKey(target, unit.target_manifest_object.key);
+    for (const file of unit.target_file_intents || []) assertObservationHistoryGenerationKey(target, file.key);
+    for (const file of unit.target_metadata?.files || []) assertObservationHistoryGenerationKey(target, file.key);
+  }
+  for (const object of plan.canonical_publication_objects || []) assertObservationHistoryGenerationKey(target, object.key);
+  return target;
+}
+
+export async function verifySideBySideSourceRoot({ plan, getObject }) {
+  const source = getObservationHistoryGeneration("v2");
+  const expected = plan.inventory.root_manifest;
+  if (expected.key !== source.observations_root_key) throw new Error("Side-by-side source root key is invalid");
+  const current = await getRequiredObject(getObject, source.observations_root_key, "locked v2 source");
+  if (current.byte_size !== expected.byte_size || current.sha256 !== expected.sha256) {
+    throw new Error("Locked v2 source-root identity changed; migration must stop without catch-up");
+  }
+  return Object.freeze({ key: expected.key, byte_size: expected.byte_size, sha256: expected.sha256, unchanged: true });
+}
+
+function guardSideBySideMigrationAdapters(plan, adapters) {
+  const target = assertSideBySideMigrationPlan(plan);
+  if (typeof adapters?.assertLockHeld !== "function") throw new Error("Side-by-side migration requires supervised global lock ownership");
+  const guarded = { ...adapters };
+  const assertTarget = (key) => {
+    if (key === target.observations_timeseries_latest_key) return assertObservationHistoryGenerationKey(target, key, "latest");
+    const domain = key?.startsWith(`${target.timeseries_binding_index_prefix}/`) ? "bindings"
+      : key?.startsWith(`${target.observations_timeseries_index_prefix}/`) ? "observation_index" : "observations";
+    return assertObservationHistoryGenerationKey(target, key, domain);
+  };
+  for (const name of ["putChecksumObject", "putJsonObject", "putIfChanged"]) {
+    if (typeof adapters[name] !== "function") continue;
+    guarded[name] = async (object) => {
+      adapters.assertLockHeld();
+      assertTarget(object.key);
+      const result = await adapters[name](object);
+      adapters.assertLockHeld();
+      return result;
+    };
+  }
+  for (const name of ["getObject", "headObject", "writeCheckpoint", "recordDurableEvidence", "recordDurableEvidenceBatch", "stageUnit", "readStagedBody", "releaseStagedUnit"]) {
+    if (typeof adapters[name] !== "function") continue;
+    guarded[name] = async (...args) => {
+      adapters.assertLockHeld();
+      const result = await adapters[name](...args);
+      adapters.assertLockHeld();
+      return result;
+    };
+  }
+  return guarded;
+}
+
+// This inventory stores identities only. All source bodies are read directly
+// from locked canonical R2; no frozen source copy or delta mechanism exists.
+export async function buildObservationHistorySideBySideMigrationPlan({
+  getR2Object, assertLockHeld, repositoryRoot, environmentEvidence,
+  migrationRunId, targetWriterGitSha, sosConnectorId = 1,
+}) {
+  if (typeof assertLockHeld !== "function") throw new Error("Side-by-side planning requires the global observations lock");
+  assertLockHeld();
+  const environment = validateObservationHistoryV3MigrationEnvironment({
+    ...environmentEvidence, transition: "v2-to-v3",
+    indexVersion: environmentEvidence.historyVersion, apply: true,
+  });
+  const source = getObservationHistoryGeneration("v2");
+  const target = getObservationHistoryGeneration("v3");
+  const writerLimits = ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3;
+  const runId = String(migrationRunId || "").trim();
+  if (!runId || !/^[0-9a-f]{40}$/.test(String(targetWriterGitSha || ""))) throw new Error("Migration run ID and exact writer Git SHA are required");
+  const read = async ({ key }) => {
+    assertLockHeld();
+    const result = await getR2Object({ key });
+    assertLockHeld();
+    return result;
+  };
+  const progress = createMigrationActivityReporter({ label: "Side-by-side: locked v2 inventory", enabled: true });
+  const inventory = await inventoryAuthoritativeCanonicalObservationHistory({
+    getR2Object: read, observationsPrefix: source.observations_prefix,
+    v2IndexRoot: source.observations_timeseries_index_prefix,
+    v2LatestKey: source.observations_timeseries_latest_key,
+    sosConnectorId, onProgress: progress.report,
+  });
+  progress.finish();
+  const sourceIdentities = new Map();
+  const units = [];
+  const filesProgress = createMigrationProgressReporter({ label: "Side-by-side: source file identities", total: inventory.partitions.length, enabled: true });
+  for (const partition of inventory.partitions) {
+    for (const file of partition.canonical_files) {
+      assertObservationHistoryGenerationKey(source, file.key);
+      const object = await getRequiredObject(read, file.key, "locked v2 Parquet");
+      verifyManifestFileIdentity({ manifestIdentity: file.etag_or_hash, expectedBytes: file.bytes, liveObject: object, objectKey: file.key });
+      sourceIdentities.set(file.key, { ...bodyIdentity(file.key, object.body), stage: "canonical_parquet" });
+    }
+    units.push(sourceUnitFromPartition({ sourcePartition: partition, rollbackObjectsByKey: sourceIdentities, writerLimits, targetWriterGitSha }));
+    filesProgress.report(units.length);
+  }
+  const bindings = await inventorySideBySideBindings(read);
+  const transition = normalizeObservationHistoryV3MigrationTransition("v2-to-v3");
+  const planIdentity = {
+    generation_topology: SIDE_BY_SIDE_TOPOLOGY,
+    bindings,
+    transition, environment: environment.environment, bucket: environment.bucket,
+    migration_run_id: runId,
+    source_root: { key: inventory.root_manifest.key, byte_size: inventory.root_manifest.byte_size, sha256: inventory.root_manifest.sha256 },
+    target_observations_prefix: target.observations_prefix,
+    v3_index_root: target.observations_timeseries_index_prefix,
+    v3_latest_key: target.observations_timeseries_latest_key,
+    writer_limits: writerLimits, target_writer_git_sha: targetWriterGitSha,
+    unit_ids: units.map((unit) => unit.unit_id),
+    empty_source_connectors: inventory.empty_source_connectors,
+  };
+  const plan = {
+    schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
+    kind: "uk_aq_observation_history_v3_migration_plan", mode: "plan",
+    generation_topology: SIDE_BY_SIDE_TOPOLOGY,
+    migration_run_id: runId, transition, environment,
+    plan_identity: planIdentity, plan_sha256: sha256Hex(stableMigrationJson(planIdentity)),
+    target_observations_prefix: target.observations_prefix,
+    target_writer_git_sha: targetWriterGitSha,
+    target: { history_version: "v2", storage_generation: "v3", index_generation: "v3",
+      history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+      writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
+      physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
+      aligned_row_cap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
+      exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
+      decode_profile: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID, writer_limits: writerLimits },
+    inventory, units, bindings, empty_source_connectors: inventory.empty_source_connectors,
+    empty_source_connector_count: inventory.empty_source_connectors.length,
+    writer_freeze_plan: deriveObservationHistoryV3WriterFreezePlan({ repositoryRoot }),
+    canonical_publication_objects: [], v3_latest: null, v3_publication_plan: null,
+    v3_index_root: target.observations_timeseries_index_prefix,
+    v3_latest_key: target.observations_timeseries_latest_key,
+    sos_connector_id: sosConnectorId,
+    blockers: [], mutation_allowed: true,
+    estimated: { partitions: units.length, source_rows: units.reduce((sum, unit) => sum + unit.source_row_count, 0) },
+  };
+  assertSideBySideMigrationPlan(plan);
+  await verifySideBySideSourceRoot({ plan, getObject: read });
+  return Object.freeze(plan);
+}
+
+async function publishSideBySideBindings({ plan, checkpoint, adapters }) {
+  const generation = getObservationHistoryGeneration("v3");
+  if (!plan.bindings || stableMigrationJson(plan.bindings) !== stableMigrationJson(plan.plan_identity.bindings)) throw new Error("Binding migration authority is absent or changed");
+  for (const entry of [...plan.bindings.bindings, ...plan.bindings.manifests]) {
+    assertObservationHistoryGenerationKey(generation, entry.key, "bindings");
+    const body = entry.source_key
+      ? Buffer.from((await adapters.getObject({ key: entry.source_key })).body)
+      : Buffer.from(entry.body, "utf8");
+    if (body.byteLength !== entry.byte_size || sha256Hex(body) !== entry.sha256) throw new Error(`Binding prepared identity changed: ${entry.key}`);
+    const reuse = await verifyObservationHistoryV3CheckpointReuse({
+      checkpointEntry: checkpoint.completed_objects[entry.key], expected: entry,
+      getObject: adapters.getObject, headObject: adapters.headObject,
+    });
+    if (!reuse.reusable) {
+      await adapters.putJsonObject({ ...entry, body });
+      const actual = Buffer.from((await adapters.getObject({ key: entry.key })).body);
+      if (actual.byteLength !== entry.byte_size || sha256Hex(actual) !== entry.sha256) throw new Error(`Binding post-write identity mismatch: ${entry.key}`);
+    }
+    await persistCompletedObjectBatch({ checkpoint, evidence: [entry], writeCheckpoint: adapters.writeCheckpoint });
+  }
+}
+
+async function verifySideBySideLogicalOutput({ plan, getObject }) {
+  const bindings = new Map(plan.bindings.bindings.map((binding) => [binding.timeseries_id, binding]));
+  for (const expected of [...plan.bindings.source_objects,
+    ...plan.bindings.bindings.map((entry) => ({ ...entry, key: entry.source_key })),
+    ...plan.bindings.bindings, ...plan.bindings.manifests]) {
+    const bytes = Buffer.from((await getObject({ key: expected.key })).body);
+    if (bytes.byteLength !== expected.byte_size || sha256Hex(bytes) !== expected.sha256) throw new Error(`Binding verification identity mismatch: ${expected.key}`);
+  }
+  const progress = createMigrationProgressReporter({ label: "Side-by-side: independent logical/source verification", total: plan.units.length, enabled: true });
+  for (const [index, unit] of plan.units.entries()) {
+    const sourceManifest = await getRequiredObject(getObject, unit.source_manifest_identity.key, "locked source manifest");
+    if (sourceManifest.byte_size !== unit.source_manifest_identity.byte_size ||
+        sourceManifest.sha256 !== unit.source_manifest_identity.sha256) throw new Error("Locked v2 source manifest changed");
+    const sourceRows = [];
+    for (const expected of unit.source_files) {
+      const bytes = Buffer.from((await getObject({ key: expected.key })).body);
+      if (bytes.byteLength !== expected.byte_size || sha256Hex(bytes) !== expected.sha256) throw new Error(`Locked v2 file changed: ${expected.key}`);
+      sourceRows.push(...await readCanonicalObservationRowsFromParquetBytes({ body: bytes, connectorId: unit.scope.connector_id, sosConnectorId: plan.sos_connector_id }));
+    }
+    const sourceContent = contentHashMetadata(computeObservationContentHash(sourceRows));
+    sourceRows.length = 0;
+    const rows = [];
+    for (const expected of unit.target_file_intents) {
+      assertObservationHistoryGenerationKey(getObservationHistoryGeneration("v3"), expected.key);
+      const bytes = Buffer.from((await getObject({ key: expected.key })).body);
+      if (bytes.byteLength !== expected.byte_size || sha256Hex(bytes) !== expected.sha256) throw new Error(`V3 target bytes changed: ${expected.key}`);
+      rows.push(...await readCanonicalObservationRowsFromParquetBytes({ body: bytes, connectorId: unit.scope.connector_id, sosConnectorId: plan.sos_connector_id }));
+    }
+    const actual = contentHashMetadata(computeObservationContentHash(rows));
+    if (rows.length !== unit.source_row_count || !sameSemanticJson(actual, sourceContent) || !sameSemanticJson(actual, unit.source_observation_content_hash_metadata)) throw new Error(`Independent v3 logical identity mismatch: ${unit.unit_id}`);
+    for (const row of rows) {
+      const binding = bindings.get(row.timeseries_id);
+      if (!binding || binding.connector_id !== unit.scope.connector_id || binding.pollutant_code !== unit.scope.pollutant_code) throw new Error(`V3 binding disagrees with canonical observation: ${row.timeseries_id}`);
+    }
+    progress.report(index + 1);
+  }
 }

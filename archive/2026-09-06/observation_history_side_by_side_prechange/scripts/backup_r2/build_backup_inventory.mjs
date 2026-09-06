@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -148,16 +147,6 @@ function parseArgs(argv) {
       process.exit(0);
     } else throw new Error(`Unknown argument: ${arg}`);
   }
-  const generation = resolveObservationHistoryGeneration(process.env);
-  if (!argv.includes("--observations-prefix")) args.observations_prefix = generation.observations_prefix;
-  if (!argv.includes("--runs-prefix")) args.runs_prefix = generation.observations_runs_prefix;
-  if (!argv.includes("--timeseries-binding-prefix")) args.timeseries_binding_prefix = generation.timeseries_binding_index_prefix;
-  if (!argv.includes("--history-index-version")) args.history_index_version = generation.version;
-  assertObservationHistoryGenerationPrefixes(generation, {
-    observationsPrefix: args.observations_prefix, bindingPrefix: args.timeseries_binding_prefix,
-  });
-  if (args.runs_prefix !== generation.observations_runs_prefix || args.history_index_version !== generation.version ||
-      args.core_prefix !== "history/v2/core") throw new Error("Backup inventory arguments contradict selected complete generation");
   if (!args.source_root) throw new Error("--source-root is required");
   if (!args.observations_prefix) throw new Error("--observations-prefix is required");
   if (!args.core_prefix) throw new Error("--core-prefix is required");
@@ -334,7 +323,7 @@ async function main() {
   const observationsRootKey = `${args.observations_prefix}/_manifests/manifest.json`;
 
   const previousRaw = readJsonMaybe(args.rclone_bin, args.source_root, inventoryRootKey);
-  let previousRoot = previousRaw
+  const previousRoot = previousRaw
     ? validateHierarchicalInventoryRoot(
       previousRaw.parsed,
       {
@@ -344,8 +333,6 @@ async function main() {
       },
     )
     : null;
-
-  if (previousRoot?.observations?.source_root_manifest_key !== observationsRootKey) previousRoot = null;
 
   const latestTimeseriesSource = readJson(
     args.rclone_bin,

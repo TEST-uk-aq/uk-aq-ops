@@ -1,4 +1,3 @@
-import { resolveObservationHistoryGeneration } from "../../shared/uk_aq_observation_history_generation.mjs";
 import {
   buildTimeseriesV2SupabaseFillPlan,
   classifyTimeseriesV2SourceRoute,
@@ -15,7 +14,6 @@ import * as stationHistoryObservations from "./station_history/observations.mjs"
 import * as stationHistoryStaleCache from "./station_history/stale_cache.mjs";
 
 export interface Env {
-  UK_AQ_R2_HISTORY_VERSION: unknown;
   STATION_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
   SUPABASE_URL: unknown;
   SB_PUBLISHABLE_DEFAULT_KEY: unknown;
@@ -3077,22 +3075,11 @@ export default {
 
     const shouldUseCache = shouldCacheRequest(request, bypassRequested);
     const cache = (caches as unknown as { default: Cache }).default;
-    const historyCacheUrl = new URL(normalizedRequestUrl.toString());
-    if (stationHistoryInternalRoute || usingStationSeriesUpstream || useTimeseriesV2Skeleton || usingExternalAqiHistoryUpstream) {
-      try {
-        const generation = resolveObservationHistoryGeneration({
-          UK_AQ_R2_HISTORY_VERSION: await readSecret(env.UK_AQ_R2_HISTORY_VERSION),
-        });
-        historyCacheUrl.searchParams.set("__uk_aq_observation_generation", generation.version);
-      } catch (_error) {
-        return makeErrorResponse(500, "invalid_observation_history_generation", requestOrigin, allowedOrigins);
-      }
-    }
     const stationHistoryVersionedKeys = stationHistoryStaleRequestSupported
-      ? stationHistoryStaleCache.buildFreshAndStaleCacheKeys(historyCacheUrl)
+      ? stationHistoryStaleCache.buildFreshAndStaleCacheKeys(normalizedRequestUrl)
       : null;
     const cacheKey = stationHistoryVersionedKeys?.fresh
-      ?? new Request(historyCacheUrl.toString(), { method: "GET" });
+      ?? new Request(normalizedRequestUrl.toString(), { method: "GET" });
 
     if (shouldUseCache && request.method === "GET") {
       let cachedResponse = await cache.match(cacheKey);

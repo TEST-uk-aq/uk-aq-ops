@@ -1,4 +1,3 @@
-import { getObservationHistoryGeneration } from "./uk_aq_observation_history_generation.mjs";
 import { Client } from "pg";
 import { normalizePruneConnectorSourceIdentity } from "./uk_aq_prune_connector_source_identity.mjs";
 
@@ -44,9 +43,9 @@ export function connectorDayGateKey(dayUtc, connectorId) {
   return `${pair.day_utc}|${pair.connector_id}`;
 }
 
-export function canonicalObservationConnectorManifestKey(dayUtc, connectorId, generation = process.env.UK_AQ_R2_HISTORY_VERSION || "v2") {
+export function canonicalObservationConnectorManifestKey(dayUtc, connectorId) {
   const pair = normalizeConnectorDayPair(dayUtc, connectorId);
-  return `${getObservationHistoryGeneration(generation).observations_prefix}/day_utc=${pair.day_utc}/connector_id=${pair.connector_id}/manifest.json`;
+  return `history/v2/observations/day_utc=${pair.day_utc}/connector_id=${pair.connector_id}/manifest.json`;
 }
 
 export function isValidConnectorHistoryGateEvidence(row) {
