@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import { withOperatorPhase } from "./operator_execution.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
@@ -10,7 +9,6 @@ import { recoverySha256 } from "./recovery_journal_authority.mjs";
 // Explicit local load/command closure, not the migration mutation directory
 // scopes. Current reviewed machinery may evolve; every entry must match HEAD.
 export const ROLLBACK_CURRENT_TRUSTED_DEPENDENCIES = Object.freeze([
-  "scripts/index_v3_migration/operator_execution.mjs",
   // Operator controls, evidence authentication, replay, restore orchestration.
   "scripts/index_v3_migration/rollback_executor_authority.mjs",
   "scripts/index_v3_migration/index_v3_migration.sh",
@@ -192,11 +190,8 @@ export async function authenticateRollbackExecutor({
   }
   // Executor trust only: never use the current GitHub HEAD as migration or
   // recovery authority. The resolver seam is for local tests, not a CLI bypass.
-  const executorIdentity = await withOperatorPhase("Rollback: authenticating current executor", () => {
-    const identity = validateRollbackReviewedHead({ repositoryRoot, resolveGithubRepository });
-    validateRollbackDependencies({ repositoryRoot, targetWriterGitSha });
-    return identity;
-  });
+  const executorIdentity = validateRollbackReviewedHead({ repositoryRoot, resolveGithubRepository });
+  validateRollbackDependencies({ repositoryRoot, targetWriterGitSha });
   const body = fs.readFileSync(checkpointPath);
   const checkpoint = JSON.parse(body);
   const recoveryRoot = `${path.resolve(checkpointPath)}.recovery`;
@@ -213,9 +208,9 @@ export async function authenticateRollbackExecutor({
   // Existing readAndValidateRecoveryJournal authenticates ALL entries before
   // applying updates. Replay once in memory, with create/repair disabled; no
   // completed-object evidence reaches rollback until every gate below passes.
-  const recovery = await withOperatorPhase("Rollback: authenticating historical recovery journal", () => buildObservationHistoryV3RecoveryProgressContext({
+  const recovery = buildObservationHistoryV3RecoveryProgressContext({
     checkpointPath, checkpoint, repositoryRoot, requireCurrentImplementation: false,
-  }));
+  });
   const implementation = recovery.manifest.payload.recovery_implementation;
   requireAncestor(repositoryRoot, implementation.repository_head);
   if (JSON.stringify(implementation.files.map((file) => file.path).sort()) !==

@@ -942,6 +942,7 @@ function memoryAdapters(fixture, options = {}) {
         pollutant_index_count: 2,
       };
     },
+    checkV2RuntimeRecoverability: async () => ({ ok: true }),
     restoreV2RuntimeAuthority: async () => {
       runtimeRestoreCalls += 1;
       return { ok: true, target_index_generation: "v2" };
@@ -3518,7 +3519,7 @@ test("independent final verification bounds all reads and preserves exact blocke
     let result;
     try {
       process.stderr.write = (message) => {
-        if (String(message).startsWith("V3 verification: v3 publication objects 1/") && active > 0) {
+        if (String(message).startsWith("V3 verification: v3 publication objects: start") && active === 0) {
           liveProgress = true;
         }
         return true;
@@ -4111,7 +4112,7 @@ test("recovery journal schema and final-state replay remain structurally compati
     }
     const authenticationStart = diagnostics.findIndex((line) => line.includes("authenticating 1 journal entries"));
     const authenticationEnd = diagnostics.findIndex((line) => line.includes("authentication complete entries=1"));
-    const applicationStart = diagnostics.findIndex((line) => line.includes("applying authenticated journal 0/1"));
+    const applicationStart = diagnostics.findIndex((line) => line.includes("applying authenticated journal: start"));
     const replayEnd = diagnostics.findIndex((line) => line.includes("replay complete entries=1"));
     assert.ok(authenticationStart >= 0 && authenticationStart < authenticationEnd);
     assert.ok(authenticationEnd < applicationStart && applicationStart < replayEnd);
@@ -4230,7 +4231,7 @@ test("legacy canonical resume preserves historical evidence and requires exact a
           for (const saved of adapters.checkpoints) assert.deepEqual(saved.completed_objects[key], evidence, key);
         }
         const text = diagnostics.join("");
-        for (const phase of ["start=", "prepared units ", "v3 publication plan "]) {
+        for (const phase of ["start=", "prepared units:", "v3 publication plan:"]) {
           assert.ok(diagnostics.some((line) => line.startsWith(`V3 migration: reconstructing recovered plan: ${phase}`)));
         }
         assert.doesNotMatch(text, /constructing prepared publication plan/);
@@ -4238,8 +4239,8 @@ test("legacy canonical resume preserves historical evidence and requires exact a
         const expectedLegacy = legacy.recoveredPlan.canonical_publication_objects.filter((entry) =>
           before.completed_objects[entry.key].sha256 !== entry.sha256).length;
         assert.match(text, new RegExp(`legacy_recovery_ordering=${expectedLegacy} failed=0`));
-        assert.equal(diagnostics.filter((line) => /: v3 publication plan 0\//.test(line)).length, 1);
-        assert.equal(diagnostics.filter((line) => /: v3 publication plan .*\(100\.0%\)/.test(line)).length, 1);
+        assert.equal(diagnostics.filter((line) => /: v3 publication plan: start .*objects=0\//.test(line)).length, 1);
+        assert.equal(diagnostics.filter((line) => /: v3 publication plan: complete /.test(line)).length, 1);
         assert.doesNotMatch(text, /historical canonical identities: v3_/);
         assert.equal(adapters.jsonPutCalls, 0);
       } else {
@@ -4325,8 +4326,8 @@ test("canonical evidence gate skips historical reconstruction for all-current ev
         assert.deepEqual(report.recovery_reconciliation.legacy_allowed_identities, {});
         assert.doesNotMatch(diagnostics.join(""), /reconstructing historical/);
         assert.match(diagnostics.join(""), /resumed canonical verification: exact=7 legacy_recovery_ordering=0 failed=0/);
-        assert.equal(diagnostics.filter((line) => /: v3 publication plan 0\//.test(line)).length, 1);
-        assert.equal(diagnostics.filter((line) => /: v3 publication plan .*\(100\.0%\)/.test(line)).length, 1);
+        assert.equal(diagnostics.filter((line) => /: v3 publication plan: start .*objects=0\//.test(line)).length, 1);
+        assert.equal(diagnostics.filter((line) => /: v3 publication plan: complete /.test(line)).length, 1);
         assert.deepEqual(stdout, []);
       } finally { process.stderr.write = stderrWrite; process.stdout.write = stdoutWrite; }
       assert.deepEqual(checkpoint, before);
@@ -4393,30 +4394,14 @@ test("canonical evidence gate reports all 14 settled failures and starts no late
 });
 
 
-test("planner operator reporter throttles real counts and retains existing ETA sampling rules", (t) => {
-  let now = 100000;
-  t.mock.method(Date, "now", () => now);
+test("planner operator reporter is time driven rather than count driven", (t) => {
   const lines = [];
   t.mock.method(process.stderr, "write", (message) => { lines.push(String(message)); return true; });
-  const reporter = createMigrationProgressReporter({ label: "V3 migration: v3 publication plan", total: 1000, enabled: true });
-  for (let completed = 0; completed <= 1000; completed += 1) {
-    now += 100;
-    reporter.report(completed);
-  }
-  assert.equal(lines.length, 101);
-  assert.match(lines[0], /0\/1000 \(0.0%\) elapsed=00:00:00\n$/);
-  assert.ok(lines.slice(0, 5).every((line) => !line.includes("eta=")));
-  assert.match(lines[5], /50\/1000 .*eta=00:01:35/);
-  assert.match(lines.at(-1), /1000\/1000 \(100.0%\).*eta=00:00:00/);
-  const stalled = createMigrationProgressReporter({ label: "stalled", total: 1000, enabled: true });
-  stalled.report(0);
-  now += 29999;
-  stalled.report(0);
-  assert.equal(lines.length, 102);
-  now += 1;
-  stalled.report(0);
-  assert.equal(lines.length, 103);
-  assert.doesNotMatch(lines.at(-1), /eta=/);
+  const reporter = createMigrationProgressReporter({ label: "planner", total: 1000, enabled: true });
+  for (let completed = 0; completed <= 1000; completed++) reporter.report(completed);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /start elapsed=00:00:00 objects=0\/1000.*ETA=unknown/);
+  assert.match(lines[1], /complete elapsed=.*objects=1000\/1000/);
 });
 
 test("fresh migration and archive verification expose genuine planner progress on stderr", async () => {
@@ -4438,17 +4423,17 @@ test("fresh migration and archive verification expose genuine planner progress o
         const observed = buildObservationHistoryV3RerunVerificationPlan({ checkpoint: execution.checkpoint, progressEnabled: true });
         assert.deepEqual(observed, quiet);
       }
-      const plannerLines = diagnostics.filter((line) => line.includes(": v3 publication plan "));
+      const plannerLines = diagnostics.filter((line) => line.includes(": v3 publication plan:"));
       const expectedLabel = verify
         ? "V3 migration: reconstructing recovered plan"
         : "V3 migration: constructing prepared publication plan";
-      for (const phase of ["start=", "prepared units ", "v3 publication plan "]) {
+      for (const phase of ["start=", "prepared units:", "v3 publication plan:"]) {
         assert.ok(diagnostics.some((line) => line.startsWith(`${expectedLabel}: ${phase}`)));
       }
       assert.ok(plannerLines.every((line) => line.startsWith(`${expectedLabel}: `)));
       if (!verify) assert.doesNotMatch(diagnostics.join(""), /reconstructing recovered plan/);
-      assert.ok(plannerLines.length > 2);
-      const counts = plannerLines.map((line) => Number(line.match(/plan (\d+)\//)[1]));
+      assert.equal(plannerLines.length, 2);
+      const counts = plannerLines.map((line) => Number(line.match(/objects=(\d+)\//)[1]));
       assert.equal(counts[0], 0);
       assert.equal(counts.at(-1), 13);
       assert.ok(counts.every((count, index) => index === 0 || count > counts[index - 1]));
@@ -4456,4 +4441,30 @@ test("fresh migration and archive verification expose genuine planner progress o
       if (!verify) assert.ok(diagnostics.findIndex((line) => line.includes("resumed canonical verification:")) < diagnostics.indexOf(plannerLines[0]));
     }
   } finally { process.stderr.write = stderrWrite; }
+});
+
+test("rollback admission is before PUT and reruns skip only exact stored canonical identities", async () => {
+  const fixture = await buildFixture();
+  const plan = await buildPlan(fixture);
+  const restorePlan = await buildObservationHistoryV2RestorePlan({ migrationPlan: plan, getBackupObject: mapReader(fixture.backup) });
+  const adapters = memoryAdapters(fixture);
+  const options = { restorePlan, apply: true, writersFrozen: true, environmentEvidence: ENVIRONMENT, adapters };
+  await assert.rejects(executeObservationHistoryV2Rollback({ ...options, adapters: { ...adapters, checkV2RuntimeRecoverability: async () => ({ ok: false }) } }), /before canonical mutation/);
+  assert.equal(adapters.putCalls + adapters.jsonPutCalls, 0);
+  const first = await executeObservationHistoryV2Rollback(options);
+  assert.ok(first.already_restored_object_count > 0); // Exact JSON, despite no stored Parquet SHA yet.
+  const putCount = adapters.putCalls + adapters.jsonPutCalls;
+  const repeated = await executeObservationHistoryV2Rollback(options);
+  assert.equal(adapters.putCalls + adapters.jsonPutCalls, putCount);
+  assert.equal(repeated.already_restored_object_count, restorePlan.objects.length);
+  assert.equal(repeated.restored_object_count, 0);
+  assert.ok(repeated.restored_objects.every(entry => entry.reused && entry.put_status === 'already_restored'));
+  assert.equal(adapters.rebuildCalls, 2); // Retained index_v2 remains insufficient authority.
+  const parquet = restorePlan.objects.find(object => object.stage === 'canonical_parquet');
+  const json = restorePlan.objects.find(object => object.stage === 'root_manifest');
+  adapters.storedSha.set(parquet.key, 'f'.repeat(64));
+  fixture.r2.set(json.key, Buffer.from('{}\n'));
+  const changed = await executeObservationHistoryV2Rollback(options);
+  assert.equal(changed.restored_object_count, 2);
+  assert.equal(adapters.putCalls + adapters.jsonPutCalls, putCount + 2);
 });

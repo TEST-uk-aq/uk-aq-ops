@@ -1,14 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# One diagnostic run per top-level invocation; nested commands share its log.
-case "${1:-}" in --help|-h|--self-test|--resume-implementation-authority) ;; *)
-  if [ "${UK_AQ_OPERATOR_SUPERVISED:-}" != "1" ]; then
-    exec node "$(dirname -- "${BASH_SOURCE[0]}")/operator_execution.mjs" run "${BASH_SOURCE[0]}" "$@"
-  fi
-  ;;
-esac
-
 # Environment-neutral operator wrapper for the observation-history v3 migration.
 # No mode is implicit. Mutation requires an explicit mode, --apply, a matching
 # run-bound authorisation phrase, and the complete read-only migration-start gate.
@@ -81,7 +73,6 @@ require_authorization() {
 # trusted as current reviewed verifier machinery: it must be tracked and match
 # clean current HEAD, but it may legitimately evolve after the migration.
 VERIFY_CURRENT_TRUSTED_DEPENDENCIES=(
-  scripts/index_v3_migration/operator_execution.mjs
   scripts/index_v3_migration/index_v3_migration.sh
   scripts/index_v3_migration/index_v3_preflight.sh
   scripts/index_v3_migration/recovery_journal_authority.mjs

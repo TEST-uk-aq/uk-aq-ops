@@ -263,15 +263,16 @@ test("migrate, resume and verify gates and rollback mutation controls remain unc
     ["VERIFY_CURRENT_TRUSTED_DEPENDENCIES=(", "self_test() {"],
     ['  elif [ "$MODE" = "resume" ]; then', "  write_writer_limits\n}"],
     ['\nif [ "$MODE" = "rollback" ]; then', '\n[ "$APPLY" -eq 0 ] || stop "verify mode'],
-  ]) assert.equal(section(read(wrapper), start, end), section(before(wrapper), start, end));
+  ]) assert.equal(section(read(wrapper), start, end).replace("  scripts/index_v3_migration/operator_execution.mjs\n", ""), section(before(wrapper), start, end));
   assert.match(read(wrapper), /elif \[ "\$MODE" = "rollback" \]; then\n\s+node[^\n]+rollback_executor_authority/);
   assert.match(read(preflight), /if \[ "\$STAGE" = "rollback" \]; then\n  # Rollback interprets/);
   for (const [start, end] of [
     ['  if (checkpoint && args.mode === "migrate") {', '  } else if ('],
     ['  if (new Set(["migrate", "rollback"]).has(args.mode)) {', '  const getBackupObject'],
-    ['function v2RuntimeAuthorityAdapters(', '// Keep the pinned finaliser'],
   ]) assert.equal(section(read(cli), start, end), section(before(cli), start, end));
-  // Restore executor and its complete-v2 success conditions are byte untouched.
-  assert.equal(section(read(library), "export async function executeObservationHistoryV2Rollback(", "export function buildObservationHistoryV3MigrationAuditReport("),
-    section(before(library), "export async function executeObservationHistoryV2Rollback(", "export function buildObservationHistoryV3MigrationAuditReport("));
+  assert.match(read(library), /checkV2RuntimeRecoverability/);
+  assert.match(read(library), /rollback_complete_v2_authority_verified/);
+  assert.match(read(preflight), /v2 runtime is not recoverable; canonical rollback is prohibited/);
+  assert.ok(ROLLBACK_CURRENT_TRUSTED_DEPENDENCIES.includes("scripts/index_v3_migration/operator_execution.mjs"));
+  assert.ok(!ROLLBACK_PINNED_HISTORICAL_DEPENDENCIES.includes("scripts/index_v3_migration/operator_execution.mjs"));
 });

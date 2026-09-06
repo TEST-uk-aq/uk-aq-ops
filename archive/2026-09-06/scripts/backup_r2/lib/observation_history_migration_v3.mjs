@@ -1,4 +1,3 @@
-import { createOperatorProgress, withOperatorPhase, formatElapsed as formatMigrationProgressElapsed } from "../../index_v3_migration/operator_execution.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { Buffer } from "node:buffer";
@@ -1469,12 +1468,74 @@ export function deriveObservationHistoryV3WriterFreezePlan({ repositoryRoot }) {
   });
 }
 
-export function createMigrationProgressReporter(options) {
-  return createOperatorProgress(options);
+function formatMigrationProgressElapsed(elapsedMilliseconds) {
+  const elapsedSeconds = Math.max(0, Math.floor(elapsedMilliseconds / 1000));
+  const hours = Math.floor(elapsedSeconds / 3600);
+  const minutes = Math.floor((elapsedSeconds % 3600) / 60);
+  const seconds = elapsedSeconds % 60;
+  return [hours, minutes, seconds]
+    .map((value) => String(value).padStart(2, "0"))
+    .join(":");
 }
 
-function createMigrationActivityReporter(options) {
-  return createOperatorProgress(options);
+export function createMigrationProgressReporter({ label, total, enabled }) {
+  if (!enabled || !Number.isInteger(total) || total <= 0) {
+    return Object.freeze({ report() {} });
+  }
+  const startedAt = Date.now();
+  let lastPercentage = null;
+  let lastReportedAt = 0;
+  const samples = [];
+  return Object.freeze({
+    report(completed, { force = false } = {}) {
+      const safeCompleted = Math.min(Math.max(Number(completed) || 0, 0), total);
+      const percentage = (safeCompleted / total) * 100;
+      const integerPercentage = Math.floor(percentage);
+      const now = Date.now();
+      if (
+        !force &&
+        integerPercentage === lastPercentage &&
+        now - lastReportedAt < 30_000
+      ) return;
+      let eta = "";
+      if (samples.length >= 5) {
+        const oldest = samples[0];
+        const elapsed = now - oldest.at;
+        const advanced = safeCompleted - oldest.completed;
+        const remainingMilliseconds = (total - safeCompleted) * elapsed / advanced;
+        if (elapsed > 0 && advanced > 0 && Number.isFinite(remainingMilliseconds) && remainingMilliseconds >= 0) {
+          eta = ` eta=${formatMigrationProgressElapsed(remainingMilliseconds)}`;
+        }
+      }
+      samples.push({ at: now, completed: safeCompleted });
+      if (samples.length > 10) samples.shift();
+      process.stderr.write(
+        `${label} ${safeCompleted}/${total} (${percentage.toFixed(1)}%) elapsed=${
+          formatMigrationProgressElapsed(now - startedAt)
+        }${eta}\n`,
+      );
+      lastPercentage = integerPercentage;
+      lastReportedAt = now;
+    },
+  });
+}
+
+function createMigrationActivityReporter({ label, enabled }) {
+  if (!enabled) return Object.freeze({ report() {} });
+  const startedAt = Date.now();
+  let lastReportedAt = 0;
+  return Object.freeze({
+    report(count, { force = false } = {}) {
+      const now = Date.now();
+      if (!force && now - lastReportedAt < 30_000) return;
+      process.stderr.write(
+        `${label} discovered partitions=${count} elapsed=${
+          formatMigrationProgressElapsed(now - startedAt)
+        }\n`,
+      );
+      lastReportedAt = now;
+    },
+  });
 }
 
 export async function inventoryAuthoritativeCanonicalObservationHistory({
@@ -2612,7 +2673,7 @@ export async function buildObservationHistoryV3MigrationPlan({
   });
   const inventoryProgress = createMigrationActivityReporter({
     label: "V3 migration plan: canonical inventory",
-    enabled: true,
+    enabled: transition.kind === "v2-to-v3",
   });
   const inventory = await inventoryAuthoritativeCanonicalObservationHistory({
     getR2Object,
@@ -2622,7 +2683,6 @@ export async function buildObservationHistoryV3MigrationPlan({
     sosConnectorId,
     onProgress: inventoryProgress.report,
   });
-  inventoryProgress.finish();
   let backupGate = null;
   const blockers = [...environment.blockers];
   try {
@@ -3339,10 +3399,8 @@ function recoveredPlanProgress(enabled, label = "V3 migration: reconstructing re
   const startedAt = Date.now();
   let unitsProgress;
   let plannerProgress;
-  const phaseProgress = createOperatorProgress({ label });
-  try { process.stderr.write(`${label}: start=${new Date(startedAt).toISOString()}\n`); } catch { /* diagnostic only */ }
+  process.stderr.write(`${label}: start=${new Date(startedAt).toISOString()}\n`);
   return (event) => {
-    try {
     if (event.phase === "prepared_units") {
       unitsProgress ||= createMigrationProgressReporter({
         label: `${label}: prepared units`, total: event.total, enabled,
@@ -3363,8 +3421,6 @@ function recoveredPlanProgress(enabled, label = "V3 migration: reconstructing re
     process.stderr.write(`${label}: ${event.phase}${counts} elapsed=${
       formatMigrationProgressElapsed(Date.now() - startedAt)
     }\n`);
-    if (event.phase === "complete") phaseProgress.finish();
-    } catch { /* diagnostic only */ }
   };
 }
 
@@ -3433,7 +3489,7 @@ export async function executeObservationHistoryV3MigrationPlan({
   ) {
     throw new Error("Migration checkpoint belongs to a different deterministic plan");
   }
-  const progressEnabled = true;
+  const progressEnabled = plan.transition.kind === "v2-to-v3";
   if (rawCheckpoint) {
     buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
   } else {
@@ -3879,7 +3935,7 @@ export async function verifyObservationHistoryV3MigrationResult({
   getObject,
   headObject,
   publicationResult = null,
-  progressEnabled = true,
+  progressEnabled = plan.transition.kind === "v2-to-v3",
   publicationConcurrency = 1,
 }) {
   if (!Number.isInteger(publicationConcurrency) || publicationConcurrency < 1 || publicationConcurrency > 16) {
@@ -4188,7 +4244,7 @@ export async function verifyObservationHistoryV3CurrentDependencies({
     getObject,
     headObject,
     publicationResult,
-    progressEnabled: true,
+    progressEnabled: plan.transition.kind === "v2-to-v3",
   });
   const recovery = plan.recovery_reconciliation || null;
   if (!checkpoint || !recovery) return base;
@@ -4199,7 +4255,7 @@ export async function verifyObservationHistoryV3CurrentDependencies({
   const dependencyProgress = createMigrationProgressReporter({
     label: "V3 verification: checkpoint dependencies",
     total: expectedByKey.size,
-    enabled: true,
+    enabled: plan.transition.kind === "v2-to-v3",
   });
   dependencyProgress.report(0, { force: true });
   let verifiedDependencies = 0;
@@ -4787,60 +4843,48 @@ export async function executeObservationHistoryV2Rollback({
     requiredAdapters.push("rebuildV2Indexes", "verifyV2IndexCompleteness");
   }
   if (rollbackIndexStrategy?.authority_switch_required === true) {
-    requiredAdapters.push("checkV2RuntimeRecoverability", "restoreV2RuntimeAuthority", "verifyV2RuntimeAuthority");
+    requiredAdapters.push("restoreV2RuntimeAuthority", "verifyV2RuntimeAuthority");
   }
   for (const name of requiredAdapters) {
     if (typeof adapters?.[name] !== "function") {
       throw new TypeError(`Rollback apply adapter is missing: ${name}`);
     }
   }
-  // Mandatory and read-only, even for direct callers, before any canonical PUT.
-  const runtimeRecoverability = await adapters.checkV2RuntimeRecoverability();
-  if (runtimeRecoverability?.ok !== true) throw new Error("Rollback runtime recoverability admission failed before canonical mutation");
   const evidence = [];
-  await withOperatorPhase("Rollback: restoring canonical v2", async progress => {
-    let completedBytes = 0;
-    for (const descriptor of restorePlan.objects) {
-      // Keep the pinned backup verification mandatory even when current R2 is exact.
-      const backupObject = await getRequiredObject(
-        adapters.getBackupObject, descriptor.backup_key || descriptor.key, "Dropbox rollback authority",
-      );
-      if (backupObject.byte_size !== descriptor.byte_size || backupObject.sha256 !== descriptor.sha256) {
-        throw new Error(`Dropbox rollback object identity changed: ${descriptor.key}`);
-      }
-      const object = { ...descriptor, body: backupObject.body };
-      if (object.stage === "canonical_parquet") {
-        const currentHead = await adapters.headObject({ key: object.key });
-        let exact = null;
-        try { exact = verifyR2StoredSha256Head({ head: currentHead, intent: object }); }
-        catch { /* A missing/mismatched stored identity requires normal checksum publication. */ }
-        if (exact) evidence.push({ ...exact, put_status: "already_restored", reused: true });
-        else {
-          const putEvidence = await adapters.putChecksumObject(object);
-          const head = await adapters.headObject({ key: object.key });
-          evidence.push({ ...verifyR2StoredSha256Head({ head, intent: object }), put_status: String(putEvidence?.status || "succeeded"), reused: false });
-        }
-      } else {
-        const current = await adapters.getObject({ key: object.key });
-        const existing = current?.body != null ? bodyIdentity(object.key, current.body) : null;
-        if (existing?.byte_size === object.byte_size && existing?.sha256 === object.sha256) {
-          evidence.push({ ...existing, put_status: "already_restored", reused: true });
-        } else {
-          await adapters.putJsonObject(object);
-          const restored = await adapters.getObject({ key: object.key });
-          const identity = bodyIdentity(object.key, restored.body);
-          if (identity.byte_size !== object.byte_size || identity.sha256 !== object.sha256) throw new Error(`Restored canonical object verification failed: ${object.key}`);
-          evidence.push({ ...identity, put_status: "succeeded", reused: false });
-        }
-      }
-      completedBytes += descriptor.byte_size;
-      progress.report(evidence.length, { bytes: completedBytes });
+  for (const descriptor of restorePlan.objects) {
+    const backupObject = await getRequiredObject(
+      adapters.getBackupObject,
+      descriptor.backup_key || descriptor.key,
+      "Dropbox rollback authority",
+    );
+    if (
+      backupObject.byte_size !== descriptor.byte_size ||
+      backupObject.sha256 !== descriptor.sha256
+    ) {
+      throw new Error(`Dropbox rollback object identity changed: ${descriptor.key}`);
     }
-  }, { total: restorePlan.objects.length, totalBytes: restorePlan.objects.reduce((sum, object) => sum + object.byte_size, 0) });
+    const object = { ...descriptor, body: backupObject.body };
+    if (object.stage === "canonical_parquet") {
+      const putEvidence = await adapters.putChecksumObject(object);
+      const head = await adapters.headObject({ key: object.key });
+      evidence.push({
+        ...verifyR2StoredSha256Head({ head, intent: object }),
+        put_status: String(putEvidence?.status || "succeeded"),
+      });
+    } else {
+      await adapters.putJsonObject(object);
+      const current = await adapters.getObject({ key: object.key });
+      const identity = bodyIdentity(object.key, current.body);
+      if (identity.byte_size !== object.byte_size || identity.sha256 !== object.sha256) {
+        throw new Error(`Restored canonical object verification failed: ${object.key}`);
+      }
+      evidence.push(identity);
+    }
+  }
   if (rollbackIndexStrategy?.mode !== "rebuild") {
     throw new Error("Rollback index strategy is missing or unsupported");
   }
-  const indexResult = await withOperatorPhase("Rollback: rebuilding index_v2", () => adapters.rebuildV2Indexes());
+  const indexResult = await adapters.rebuildV2Indexes();
   if (
     !indexResult ||
     indexResult.ok === false ||
@@ -4849,10 +4893,10 @@ export async function executeObservationHistoryV2Rollback({
   ) {
     throw new Error("Rollback v2 observation-timeseries index rebuild failed");
   }
-  const v2IndexCompleteness = await withOperatorPhase("Rollback: verifying index_v2 completeness", () => adapters.verifyV2IndexCompleteness({
+  const v2IndexCompleteness = await adapters.verifyV2IndexCompleteness({
     restorePlan,
     indexResult,
-  }));
+  });
   if (
     !v2IndexCompleteness ||
     v2IndexCompleteness.ok === false ||
@@ -4863,18 +4907,18 @@ export async function executeObservationHistoryV2Rollback({
   if (rollbackIndexStrategy.authority_switch_required !== true) {
     throw new Error("Rollback v2 strategy must require an explicit runtime authority switch");
   }
-  const runtimeRestore = await withOperatorPhase("Rollback: restoring v2 runtime", () => adapters.restoreV2RuntimeAuthority({
+  const runtimeRestore = await adapters.restoreV2RuntimeAuthority({
     restorePlan,
     indexResult,
     v2IndexCompleteness,
-  }));
+  });
   if (!runtimeRestore || runtimeRestore.ok === false) {
     throw new Error("Rollback v2 runtime authority restoration failed");
   }
-  const runtimeVerification = await withOperatorPhase("Rollback: verifying selected v2 runtime", () => adapters.verifyV2RuntimeAuthority({
+  const runtimeVerification = await adapters.verifyV2RuntimeAuthority({
     restorePlan,
     runtimeRestore,
-  }));
+  });
   if (
     !runtimeVerification ||
     runtimeVerification.ok === false ||
@@ -4893,16 +4937,13 @@ export async function executeObservationHistoryV2Rollback({
     dry_run: false,
     observed_starting_index_version: environment.index_version,
     restored_objects: Object.freeze(evidence),
-    restored_object_count: evidence.filter(entry => !entry.reused).length,
-    already_restored_object_count: evidence.filter(entry => entry.reused).length,
-    runtime_recoverability: runtimeRecoverability,
     v2_index_rebuild: indexResult,
     v2_index_completeness: v2IndexCompleteness,
     v2_runtime_restore: runtimeRestore,
     v2_runtime_verification: runtimeVerification,
     configuration_changed: true,
     scheduler_changed: false,
-    deployment_changed: runtimeRestore.components ? runtimeRestore.components.some(entry => entry.deployed) : true,
+    deployment_changed: true,
   });
 }
 

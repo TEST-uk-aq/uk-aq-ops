@@ -1,22 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# One diagnostic run per top-level invocation; nested commands share its log.
-case "${1:-}" in --help|-h|--self-test|--resume-implementation-authority) ;; *)
-  if [ "${UK_AQ_OPERATOR_SUPERVISED:-}" != "1" ]; then
-    exec node "$(dirname -- "${BASH_SOURCE[0]}")/operator_execution.mjs" run "${BASH_SOURCE[0]}" "$@"
-  fi
-  ;;
-esac
-
-case "${1:-}" in --help|-h|--self-test) ;; *)
-  if [ "${UK_AQ_OPERATOR_PREFLIGHT_PHASE:-}" != "1" ]; then
-    export UK_AQ_OPERATOR_PREFLIGHT_PHASE=1
-    exec node "$(dirname -- "${BASH_SOURCE[0]}")/operator_execution.mjs" phase "Full preflight" bash "${BASH_SOURCE[0]}" "$@"
-  fi
-  ;;
-esac
-
 # Read-only Phase 6 observation-history index-v3 readiness gate.
 # Expected environment identity comes from the loaded terminal profile.
 # Actual repository/configuration state is read independently from GitHub,
@@ -564,14 +548,6 @@ if [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ]; then
       || fail "v2 runtime rollback record differs from pinned v3-rebuild operator authority"
   fi
   pass "immutable v2 runtime rollback record has exact code, workflow, Worker, and deployment identities"
-  if [ "$STAGE" = "rollback" ]; then
-    node scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs \
-      --mode runtime-recoverability --transition "$TRANSITION" --environment "$ENVIRONMENT" \
-      --v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD" \
-      --report-out "$UK_AQ_OPERATOR_RUN_DIR/runtime_recoverability.json" \
-      || fail "v2 runtime is not recoverable; canonical rollback is prohibited"
-    pass "all required pinned v2 runtimes have a viable recovery route before canonical mutation"
-  fi
 fi
 
 CRITICAL_PATHS=(
