@@ -16,6 +16,8 @@ import {
   expandPhaseBCompactSourceRowsForTest,
   populateBackupCandidatesForTest,
   resolvePhaseBRuntimeConfig,
+  resolvePruneHistoryGeneration,
+  runPhaseBBackup,
   resolvePhaseBHistoryWritePrefixes,
   runCandidateAqilevelsStageForTest,
   summarizeFrozenObservationSourceForAqi,
@@ -48,42 +50,30 @@ function runManifestKey(prefix, runId = RUN_ID) {
   return `${prefix}/run_id=${runId}/run_manifest.json`;
 }
 
-test("active v3 connector verification cannot invoke the legacy v2 observation index writer", () => {
-  const activeCandidateLoop = sourceSection(
-    "export async function runPhaseBBackup(",
-    "async function updateFinalizedHistoryIndexes(",
-  );
-  const candidateExport = sourceSection(
-    "async function exportCandidateObservationsToR2(",
-    "async function exportCandidateAqiFromFrozenSource(",
-  );
-  const frozenWriter = sourceSection(
-    "async function writeFrozenCandidateObservationsToV3(",
-    "export async function writeFrozenCandidateObservationsToV3ForTest(",
-  );
-  const connectorVerification = sourceSection(
-    "export async function verifyObservationConnectorHistory(",
-    "function createPruneComparisonManifest(",
-  );
-
-  assert.match(activeCandidateLoop, /exportCandidateToR2\(/);
-  assert.match(candidateExport, /writeFrozenCandidateObservationsToV3\(/);
-  assert.match(
-    frozenWriter,
-    /connectorPublisher\s*=\s*runOperationalPruneDailyObservationHistoryV3ConnectorPublication/,
-  );
-  assert.match(frozenWriter, /const connectorPublication = await connectorPublisher\(\{/);
-  assert.match(
-    PHASE_B_SOURCE,
-    /runFinalizer\s*=\s*runOperationalPruneDailyObservationHistoryV3RunFinalization/,
-  );
-  assert.match(activeCandidateLoop, /verifyObservationConnectorHistory\(/);
-  assert.doesNotMatch(connectorVerification, /updateR2HistoryIndexesTargeted\(/);
-  assert.doesNotMatch(connectorVerification, /domains:\s*\["observations"\]/);
-  assert.doesNotMatch(connectorVerification, /writeR2:\s*true/);
+test("Prune generation dispatch admits only v2 and rejects v3 before any database or history work", async () => {
+  for (const index of [undefined, "v2", "v3", "invalid"]) {
+    const env = { UK_AQ_R2_HISTORY_VERSION: "v2", UK_AQ_R2_HISTORY_INDEX_VERSION: index };
+    const config = resolvePhaseBRuntimeConfig(env);
+    assert.equal(config.history_write_version, "v2");
+    assert.equal(config.committed_prefix, "history/v2/observations");
+    assert.equal(Object.hasOwn(config, "observation_history_index_version"), false);
+  }
+  for (const version of [undefined, "", "v1", "V2", " v2", "v4", "v3"]) {
+    const pattern = version === "v3" ? /v3 side-by-side Prune history writer is not yet implemented/ : /missing or unsupported history generation/;
+    assert.throws(() => resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: version }), pattern);
+    assert.throws(() => resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: version }), pattern);
+    let connections = 0;
+    await assert.rejects(runPhaseBBackup({
+      dryRun: false, phaseB: { enabled: true, history_write_version: version }, logStructured: () => {},
+      createPgClient: () => { connections++; throw new Error("unexpected database work"); },
+    }), pattern);
+    assert.equal(connections, 0);
+  }
+  assert.doesNotMatch(PHASE_B_SOURCE, /UK_AQ_R2_HISTORY_INDEX_VERSION|runOperationalPruneDailyObservationHistoryV3|resolveObservationHistoryIndexV3BuildConfig/);
+  assert.throws(() => resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2", UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: "history/_index_v3" }), /Prune v2 requires/);
 });
 
-test("Phase B accepts the verified canonical v3 day authority and rejects a non-canonical connector key", () => {
+test("Phase B accepts the verified canonical v2 day authority and rejects a non-canonical connector key", () => {
   const observationsPrefix = "history/v2/observations";
   const connectorManifest = buildHistoryV2ConnectorManifestForTest({
     domain: "observations",
@@ -542,11 +532,8 @@ test("Phase B deploy workflow and env catalogs retire the observations history a
   assert.doesNotMatch(workflow, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.doesNotMatch(targets, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.equal(master.includes("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES"), false);
-  assert.match(
-    workflow,
-    /UK_AQ_R2_HISTORY_INDEX_VERSION: \$\{\{ vars\.UK_AQ_R2_HISTORY_INDEX_VERSION \|\| '' \}\}/,
-  );
-  assert.match(workflow, /UK_AQ_R2_HISTORY_INDEX_VERSION.*must be exactly v3/);
+  assert.doesNotMatch(workflow, /UK_AQ_R2_HISTORY_INDEX_VERSION/);
+  assert.match(workflow, /resolvePruneHistoryGeneration\(process.env\)/);
   assert.doesNotMatch(
     workflow,
     /UK_AQ_R2_HISTORY_INDEX_VERSION[^\n]*\|\| 'v[23]'/,
@@ -640,7 +627,7 @@ test("Phase B v2 resolves run manifests to the v2 ops prefix even when legacy ru
 test("Phase B fails closed instead of resolving a v1 AQI writer", () => {
   assert.throws(
     () => resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v1" }),
-    /require canonical history version v2/,
+    /missing or unsupported history generation/,
   );
 });
 
@@ -969,35 +956,29 @@ test("Phase B directly constructed legacy selector cannot re-enable AQI day fina
   assert.equal(Object.hasOwn(result, "aqi_day_manifest"), false);
 });
 
-test("Phase B retired global finalisation cannot update observation or AQI indexes", async () => {
+test("Phase B global finalisation updates only the coupled v2 observation indexes even with a legacy AQI flag", async () => {
   const calls = [];
-  await updateFinalizedHistoryIndexesForTest({
-    runtime: {
-      phase_b_calculate_aqi_from_observations_enabled: false,
-      committed_prefix: "history/v2/observations",
-      r2: {},
-    },
-    finalizedDays: [DAY],
-    updateIndexesAdapter: async (options) => {
-      calls.push(options);
-      return { ok: true };
-    },
-  });
-  assert.equal(calls.length, 0);
-
-  await updateFinalizedHistoryIndexesForTest({
-    runtime: {
-      phase_b_calculate_aqi_from_observations_enabled: true,
-      committed_prefix: "history/v2/observations",
-      r2: {},
-    },
-    finalizedDays: [DAY],
-    updateIndexesAdapter: async (options) => {
-      calls.push(options);
-      return { ok: true };
-    },
-  });
-  assert.equal(calls.length, 0);
+  for (const flag of [false, true]) {
+    await updateFinalizedHistoryIndexesForTest({
+      runtime: { history_write_version: "v2", phase_b_calculate_aqi_from_observations_enabled: flag, committed_prefix: "history/v2/observations", r2: {} },
+      finalizedDays: [DAY, "2026-01-01"],
+      updateIndexesAdapter: async options => {
+        calls.push(options);
+        return { observations_timeseries: { warning_count: 0, updated_latest_index: true } };
+      },
+    });
+  }
+  assert.equal(calls.length, 2);
+  for (const options of calls) {
+    assert.equal(options.historyVersion, "v2");
+    assert.deepEqual(options.domains, ["observations"]);
+    assert.deepEqual(options.affectedDaysUtc, [DAY, "2026-01-01"]);
+    assert.equal(options.writePollutantIndexes, false);
+    assert.equal(options.updateLatestIndex, true);
+    assert.equal(options.env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX, "history/_index_v2");
+    assert.equal(options.env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX, "history/_index_v2/observations_timeseries");
+    assert.equal(Object.hasOwn(options.env, "UK_AQ_R2_HISTORY_INDEX_VERSION"), false);
+  }
 });
 
 test("Phase B run summaries distinguish AQI disablement from budget exhaustion", () => {
@@ -1020,19 +1001,9 @@ test("Phase B observation-only mode adds no environment selector or fallback AQI
     assert.doesNotMatch(content, /UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/);
     assert.doesNotMatch(content, /runAqilevelsBackup/);
   }
-  assert.match(
-    implementation,
-    /connectorPublisher\s*=\s*runOperationalPruneDailyObservationHistoryV3ConnectorPublication/,
-  );
-  assert.match(implementation, /const connectorPublication = await connectorPublisher\(\{/);
-  assert.match(
-    implementation,
-    /runFinalizer\s*=\s*runOperationalPruneDailyObservationHistoryV3RunFinalization/,
-  );
-  assert.match(
-    implementation,
-    /resolveObservationHistoryIndexV3BuildConfig\(/,
-  );
+  assert.match(implementation, /connectorPublisher\s*=\s*publishFrozenV2Observations/);
+  assert.match(implementation, /runFinalizer\s*=\s*finalizeObservationV2Run/);
+  assert.doesNotMatch(implementation, /resolveObservationHistoryIndexV3BuildConfig/);
   assert.doesNotMatch(
     sourceSection("async function updateFinalizedHistoryIndexes(", "export async function updateFinalizedHistoryIndexesForTest("),
     /domains:\s*\["aqilevels"\]/,

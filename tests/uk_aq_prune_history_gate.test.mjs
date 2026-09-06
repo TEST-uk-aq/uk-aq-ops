@@ -515,9 +515,9 @@ function frozenObservationRow(overrides = {}) {
   };
 }
 
-test("v3 frozen-source replay stops on the controlled Phase B budget before starting the writer", async () => {
+test("v2 frozen-source replay stops on the controlled Phase B budget before starting the writer", async () => {
   assert.equal(
-    typeof phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest,
+    typeof phaseBHistoryModule.writeFrozenCandidateObservationsToV2ForTest,
     "function",
     "the production replay/write boundary must expose its deterministic test seam",
   );
@@ -530,7 +530,7 @@ test("v3 frozen-source replay stops on the controlled Phase B budget before star
       stopBeforeTimeoutSeconds: 60,
     }),
     sos_connector_id: 1,
-    observation_history_index_version: "v3",
+    history_write_version: "v2",
     writer_git_sha: "4".repeat(40),
     committed_prefix: "history/v2/observations",
     r2: {},
@@ -553,7 +553,7 @@ test("v3 frozen-source replay stops on the controlled Phase B budget before star
   }
 
   await assert.rejects(
-    phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest({
+    phaseBHistoryModule.writeFrozenCandidateObservationsToV2ForTest({
       candidate: { day_utc: "2026-07-21", connector_id: 7, expected_row_count: 2n },
       runtime,
       streamClient: {},
@@ -576,9 +576,9 @@ test("v3 frozen-source replay stops on the controlled Phase B budget before star
   assert.equal(cleanupCalls, 1);
 });
 
-test("v3 writer is not invoked when its completion allowance no longer fits the Phase B budget", async () => {
+test("v2 writer is not invoked when its completion allowance no longer fits the Phase B budget", async () => {
   assert.equal(
-    typeof phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest,
+    typeof phaseBHistoryModule.writeFrozenCandidateObservationsToV2ForTest,
     "function",
     "the production replay/write boundary must expose its deterministic test seam",
   );
@@ -591,7 +591,7 @@ test("v3 writer is not invoked when its completion allowance no longer fits the 
       stopBeforeTimeoutSeconds: 60,
     }),
     sos_connector_id: 1,
-    observation_history_index_version: "v3",
+    history_write_version: "v2",
     writer_git_sha: "4".repeat(40),
     committed_prefix: "history/v2/observations",
     r2: {},
@@ -613,7 +613,7 @@ test("v3 writer is not invoked when its completion allowance no longer fits the 
 
   let budgetError;
   try {
-    await phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest({
+    await phaseBHistoryModule.writeFrozenCandidateObservationsToV2ForTest({
       candidate,
       runtime,
       streamClient: {},
@@ -631,7 +631,7 @@ test("v3 writer is not invoked when its completion allowance no longer fits the 
     budgetError = error;
   }
   assert.equal(budgetError?.code, "PHASE_B_HISTORY_BUDGET_EXHAUSTED");
-  assert.equal(budgetError?.operation, "observation_v3_connector_publication");
+  assert.equal(budgetError?.operation, "observation_connector_publication");
   const summary = stopPhaseBForBudgetForTest({
     summary: { enabled: true },
     runtime,
@@ -643,10 +643,18 @@ test("v3 writer is not invoked when its completion allowance no longer fits the 
   assert.equal(cleanupCalls, 1);
   assert.equal(summary.status, "stopped_budget");
   assert.equal(summary.stopped_for_budget, true);
-  assert.equal(summary.budget_stop.operation, "observation_v3_connector_publication");
+  assert.equal(summary.budget_stop.operation, "observation_connector_publication");
 });
 
-async function reproduceCandidateSizedV3RunFinalization({ candidates, counts }) {
+function v2FinalizationResult(days) {
+  return {
+    ok: true, affected_days_utc: days,
+    observations_manifest_hierarchy: { ok: true },
+    index_finalization: { observations_timeseries: { warning_count: 0, updated_latest_index: true } },
+  };
+}
+
+async function reproduceCandidateSizedV2RunFinalization({ candidates, counts }) {
   const runtime = {
     run_budget: createPhaseBRunBudgetForTest({
       nowMs: () => 0,
@@ -655,56 +663,19 @@ async function reproduceCandidateSizedV3RunFinalization({ candidates, counts }) 
       stopBeforeTimeoutSeconds: 60,
     }),
     sos_connector_id: 1,
-    observation_history_index_version: "v3",
+    history_write_version: "v2",
     writer_git_sha: "4".repeat(40),
     committed_prefix: "history/v2/observations",
     r2: {},
     environment: "TEST",
   };
-  const connectorPublisher = async ({ partitions }) => {
-    const { day_utc: dayUtc, connector_id: connectorId } = partitions[0].scope;
-    counts.connector_publication += 1;
-    const partitionResults = partitions.map((partition, index) => {
-      const key = `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${partition.scope.pollutant_code}/part-${index}.parquet`;
-      return {
-        scope: partition.scope,
-        target_metadata: {
-          files: [{
-            key,
-            row_count: partition.rows.length,
-            byte_size: 1,
-            sha256: "a".repeat(64),
-          }],
-        },
-      };
-    });
-    const publication = {
-      ok: true,
-      source: "prune_daily",
-      prune_eligibility_owner: true,
-      connector_publication_complete: true,
-      connector_results: [{
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        canonical: {
-          connector_manifest_payload: {
-            manifest_key: `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
-            parquet_object_keys: partitionResults.flatMap((partition) =>
-              partition.target_metadata.files.map((file) => file.key)
-            ),
-          },
-        },
-        partitions: partitionResults,
-      }],
+  const connectorPublisher = async ({ candidate, rows }) => {
+    counts.connector_publication++;
+    return {
+      manifest_key: `history/v2/observations/day_utc=${candidate.day_utc}/connector_id=${candidate.connector_id}/manifest.json`,
+      connector_manifest: {}, files: [], parquet_object_keys: [],
+      written_row_count: BigInt(rows.length), total_bytes: 1n, file_count: 1,
     };
-    publication.run_finalization_evidence = {
-      ...publication,
-      connector_results: publication.connector_results.map((result) => ({
-        day_utc: result.day_utc,
-        connector_id: result.connector_id,
-      })),
-    };
-    return publication;
   };
 
   const publishedCandidates = [];
@@ -715,7 +686,7 @@ async function reproduceCandidateSizedV3RunFinalization({ candidates, counts }) 
       timeseries_id: candidate.connector_id * 100 + 1,
       observed_at_utc: `${candidate.day_utc}T00:00:00.000Z`,
     });
-    const exportResult = await phaseBHistoryModule.writeFrozenCandidateObservationsToV3ForTest({
+    const exportResult = await phaseBHistoryModule.writeFrozenCandidateObservationsToV2ForTest({
       candidate: { ...candidate, expected_row_count: 1n },
       runtime,
       streamClient: {},
@@ -729,8 +700,6 @@ async function reproduceCandidateSizedV3RunFinalization({ candidates, counts }) 
       connectorPublisher,
       cleanupFrozenSource: () => {},
     });
-    exportResult.v3_run_finalization_evidence =
-      exportResult.v3_connector_publication.run_finalization_evidence;
     publishedCandidates.push({
       candidate: { ...candidate, expected_row_count: 1n },
       exportResult,
@@ -744,43 +713,31 @@ async function reproduceCandidateSizedV3RunFinalization({ candidates, counts }) 
     });
   }
   const affectedDays = [...new Set(candidates.map((candidate) => candidate.day_utc))].sort();
-  await phaseBHistoryModule.finalizePublishedPhaseBV3ConnectorsForTest({
+  await phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
     client: {},
     runtime,
     runId: "run-finalization-regression",
     publishedCandidates,
-    runFinalizer: async () => {
-      counts.day_finalization.push(...affectedDays);
-      counts.aggregate_global_finalization += 1;
-      counts.latest_publication += 1;
-      return {
-        ok: true,
-        prune_eligibility_owner: true,
-        affected_connector_days: candidates,
-        affected_days_utc: affectedDays,
-        day_results: affectedDays.map((day_utc) => ({
-          day_utc,
-          canonical_day_authority_verified: true,
-          parent_state_reread_under_lock: true,
-        })),
-        canonical_aggregate_result: {
-          canonical_aggregate_authority_verified: true,
-        },
-        v3_publication: { latest_global: { ok: true } },
-      };
-    },
+    runFinalizer: async (args) => await phaseBHistoryModule.finalizeObservationV2RunForTest({
+      ...args,
+      dayFinalizer: async ({ dayUtc }) => { counts.day_finalization.push(dayUtc); },
+      globalFinalizer: async ({ affectedDaysUtc }) => {
+        counts.aggregate_global_finalization++; counts.latest_publication++;
+        return v2FinalizationResult(affectedDaysUtc);
+      },
+    }),
     completeCandidateAndGate: async () => {},
   });
 }
 
-test("one Prune v3 run finalizes two same-day connector publications only once", async () => {
+test("one Prune v2 run finalizes two same-day connector publications only once", async () => {
   const counts = {
     connector_publication: 0,
     day_finalization: [],
     aggregate_global_finalization: 0,
     latest_publication: 0,
   };
-  await reproduceCandidateSizedV3RunFinalization({
+  await reproduceCandidateSizedV2RunFinalization({
     candidates: [
       { day_utc: "2026-08-28", connector_id: 1 },
       { day_utc: "2026-08-28", connector_id: 2 },
@@ -795,14 +752,14 @@ test("one Prune v3 run finalizes two same-day connector publications only once",
   });
 });
 
-test("one Prune v3 run finalizes two affected days and shared parents once", async () => {
+test("one Prune v2 run finalizes two affected days and shared parents once", async () => {
   const counts = {
     connector_publication: 0,
     day_finalization: [],
     aggregate_global_finalization: 0,
     latest_publication: 0,
   };
-  await reproduceCandidateSizedV3RunFinalization({
+  await reproduceCandidateSizedV2RunFinalization({
     candidates: [
       { day_utc: "2026-08-27", connector_id: 1 },
       { day_utc: "2026-08-28", connector_id: 2 },
@@ -821,7 +778,6 @@ function publishedCandidateForFinalizationTest(dayUtc = "2026-08-28", connectorI
   return {
     candidate: { day_utc: dayUtc, connector_id: connectorId, expected_row_count: 1n },
     exportResult: {
-      v3_run_finalization_evidence: { ok: true },
       source_identity: {
         source_content_hash: "c".repeat(64),
         source_content_hash_contract_version: 1,
@@ -838,7 +794,7 @@ function publishedCandidateForFinalizationTest(dayUtc = "2026-08-28", connectorI
   };
 }
 
-test("v3 run-finalization failure cannot create connector deletion authority", async () => {
+test("v2 run-finalization failure cannot create connector deletion authority", async () => {
   const runtime = {
     run_budget: createPhaseBRunBudgetForTest({
       nowMs: () => 0,
@@ -846,7 +802,7 @@ test("v3 run-finalization failure cannot create connector deletion authority", a
       maxSecondsPerRun: 1_740,
       stopBeforeTimeoutSeconds: 60,
     }),
-    observation_history_index_version: "v3",
+    history_write_version: "v2",
     writer_git_sha: "4".repeat(40),
     committed_prefix: "history/v2/observations",
     r2: {},
@@ -854,7 +810,7 @@ test("v3 run-finalization failure cannot create connector deletion authority", a
   };
   let gateCalls = 0;
   await assert.rejects(
-    phaseBHistoryModule.finalizePublishedPhaseBV3ConnectorsForTest({
+    phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
       client: {},
       runtime,
       runId: "failed-finalization",
@@ -867,7 +823,7 @@ test("v3 run-finalization failure cannot create connector deletion authority", a
   assert.equal(gateCalls, 0);
 });
 
-test("v3 run finalization is not invoked when its conservative allowance no longer fits", async () => {
+test("v2 run finalization is not invoked when its conservative allowance no longer fits", async () => {
   let nowMs = 0;
   const runtime = {
     run_budget: createPhaseBRunBudgetForTest({
@@ -876,7 +832,7 @@ test("v3 run finalization is not invoked when its conservative allowance no long
       maxSecondsPerRun: 1_740,
       stopBeforeTimeoutSeconds: 60,
     }),
-    observation_history_index_version: "v3",
+    history_write_version: "v2",
     writer_git_sha: "4".repeat(40),
     committed_prefix: "history/v2/observations",
     r2: {},
@@ -886,7 +842,7 @@ test("v3 run finalization is not invoked when its conservative allowance no long
   let finalizerCalls = 0;
   let gateCalls = 0;
   await assert.rejects(
-    phaseBHistoryModule.finalizePublishedPhaseBV3ConnectorsForTest({
+    phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
       client: {},
       runtime,
       runId: "budget-finalization",
@@ -896,7 +852,7 @@ test("v3 run finalization is not invoked when its conservative allowance no long
     }),
     (error) => {
       assert.equal(error.code, "PHASE_B_HISTORY_BUDGET_EXHAUSTED");
-      assert.equal(error.operation, "observation_v3_run_finalization");
+      assert.equal(error.operation, "observation_run_finalization");
       return true;
     },
   );
@@ -912,7 +868,7 @@ test("a later connector failure does not prevent a verified earlier connector fr
       maxSecondsPerRun: 1_740,
       stopBeforeTimeoutSeconds: 60,
     }),
-    observation_history_index_version: "v3",
+    history_write_version: "v2",
     writer_git_sha: "4".repeat(40),
     committed_prefix: "history/v2/observations",
     r2: {},
@@ -920,28 +876,14 @@ test("a later connector failure does not prevent a verified earlier connector fr
   };
   const successful = publishedCandidateForFinalizationTest("2026-08-28", 1);
   const gated = [];
-  const finalized = await phaseBHistoryModule.finalizePublishedPhaseBV3ConnectorsForTest({
+  const finalized = await phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
     client: {},
     runtime,
     runId: "partial-connector-failure",
     publishedCandidates: [successful],
-    runFinalizer: async ({ connectorPublications }) => {
-      assert.deepEqual(connectorPublications, [successful.exportResult.v3_run_finalization_evidence]);
-      return {
-        ok: true,
-        prune_eligibility_owner: true,
-        affected_connector_days: [{ day_utc: "2026-08-28", connector_id: 1 }],
-        affected_days_utc: ["2026-08-28"],
-        day_results: [{
-          day_utc: "2026-08-28",
-          canonical_day_authority_verified: true,
-          parent_state_reread_under_lock: true,
-        }],
-        canonical_aggregate_result: {
-          canonical_aggregate_authority_verified: true,
-        },
-        v3_publication: { latest_global: { ok: true } },
-      };
+    runFinalizer: async ({ publishedCandidates }) => {
+      assert.deepEqual(publishedCandidates, [successful]);
+      return v2FinalizationResult(["2026-08-28"]);
     },
     completeCandidateAndGate: async (_client, evidence) => {
       gated.push(evidence.connectorId);
@@ -963,7 +905,6 @@ function phaseBConfig() {
       secret_access_key: "test-secret-key",
     },
     history_write_version: "v2",
-    observation_history_index_version: "v3",
     writer_git_sha: "4".repeat(40),
     staging_prefix_base: "history/v2/_ops/observations/staging",
     committed_prefix: "history/v2/observations",

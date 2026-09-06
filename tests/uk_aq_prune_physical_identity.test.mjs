@@ -8,23 +8,13 @@ import {
   buildHistoryV2ConnectorManifestKey,
 } from "../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
-  buildObservationHistoryV3SteadyStatePartition,
-} from "../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
-import {
   validateObservationPollutantManifestForGate,
+  resolvePhaseBRuntimeConfig,
+  writeFrozenCandidateObservationsToV2ForTest,
+  publishObservationV2DayForTest,
   verifyObservationConnectorHistory,
   verifyOpaqueObservationFileForGate,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
-
-function durableEvidence(artifact) {
-  return {
-    key: artifact.key,
-    byte_size: artifact.byte_size,
-    sha256: artifact.sha256,
-    verified: true,
-    durable: true,
-  };
-}
 
 test("Prune verifies manifest SHA-256 identity from downloaded bytes rather than R2 ETag", () => {
   const body = Buffer.from("identity-pinned parquet bytes");
@@ -83,114 +73,67 @@ test("Prune preserves parent-linked opaque children but keeps active hash metada
   }), /observation_content_hash must be lower-case SHA-256/);
 });
 
-test("Prune v3 connector gate verifies exact writer evidence with stored SHA HEADs only", async () => {
-  const dayUtc = "2026-08-18";
-  const connectorId = 7;
-  const writerGitSha = "3".repeat(40);
-  const partition = buildObservationHistoryV3SteadyStatePartition({
-    source: "prune_daily",
-    rows: [{
-      connector_id: connectorId,
-      station_id: 70,
-      timeseries_id: 701,
-      pollutant_code: "pm25",
-      observed_at_utc: `${dayUtc}T00:00:00.000Z`,
-      value: 9.5,
-      verification_status: null,
-    }],
-    targetWriterGitSha: writerGitSha,
-    backedUpAtUtc: "2026-08-19T00:00:00.000Z",
-  });
-  const connectorKey = buildHistoryV2ConnectorManifestKey(
-    "history/v2/observations",
-    dayUtc,
-    connectorId,
-  );
-  const connectorPayload = buildHistoryV2ConnectorManifest({
-    domain: "observations",
-    dayUtc,
-    connectorId,
-    runId: null,
-    manifestKey: connectorKey,
-    pollutantManifests: [partition.canonical_pollutant_manifest.payload],
-    writerGitSha,
-    backedUpAtUtc: "2026-08-19T00:00:00.000Z",
-  });
-  const connectorBody = Buffer.from(JSON.stringify(connectorPayload, null, 2));
-  const connectorArtifact = {
-    key: connectorKey,
-    body: connectorBody,
-    byte_size: connectorBody.byteLength,
-    sha256: sha256Hex(connectorBody),
-  };
-  const fileEvidence = partition.target_metadata.files.map((file) => ({
-    key: file.key,
-    byte_size: file.byte_size,
-    sha256: file.sha256,
-    verified: true,
-    durable: true,
-  }));
-  const scopedArtifact = partition.v3_hierarchy.scoped_manifest;
-  const writerResult = {
-    ok: true,
-    prune_eligibility_owner: true,
-    connector_publication_complete: true,
-    connector_results: [{
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      partitions: [{
-        scope: partition.scope,
-        target_metadata: partition.target_metadata,
-        pollutant_manifest: partition.canonical_pollutant_manifest,
-        file_evidence: fileEvidence,
-        scoped_root: {
-          artifact: scopedArtifact,
-          evidence: durableEvidence(scopedArtifact),
-        },
-      }],
-      canonical: {
-        connector_scope_verified: true,
-        parent_state_reread_under_lock: true,
-        connector_manifest_payload: connectorPayload,
-        connector_manifest: durableEvidence(connectorArtifact),
-        pollutant_manifests: [durableEvidence(partition.canonical_pollutant_manifest)],
-      },
-      v3_exact_publication: { ok: true },
-    }],
-  };
-  const manifestBodies = new Map([
-    [connectorKey, connectorBody],
-    [partition.canonical_pollutant_manifest.key, partition.canonical_pollutant_manifest.body],
-  ]);
-  let parquetGetCount = 0;
-  let parquetHeadCount = 0;
-  const result = await verifyObservationConnectorHistory({
-    runtime: { committed_prefix: "history/v2/observations", r2: {} },
-    dayUtc,
-    connectorId,
-    manifestKey: connectorKey,
-    expectedRowCount: 1n,
-    writerResult,
-    getObject: async ({ key }) => {
-      if (key.endsWith(".parquet")) parquetGetCount += 1;
-      const body = manifestBodies.get(key);
-      if (!body) throw new Error(`unexpected object GET: ${key}`);
-      return { exists: true, body: Buffer.from(body) };
+test("Prune publishes canonical v2 bytes and complete pollutant children then verifies targeted v2 index evidence", async () => {
+  const dayUtc = "2026-08-18", connectorId = 7;
+  const objects = new Map();
+  let parquetGets = 0, checkpoints = 0;
+  const r2 = { adapter: {
+    putObject: async ({key, body}) => { objects.set(key, Buffer.from(body)); return {bytes: body.length}; },
+    headObject: async ({key}) => ({exists: objects.has(key), bytes: objects.get(key)?.length, sha256: objects.has(key) ? sha256Hex(objects.get(key)) : null}),
+    getObject: async ({key}) => {
+      if (key.endsWith('.parquet')) parquetGets++;
+      if (!objects.has(key)) throw Object.assign(new Error("missing"), {status:404});
+      return {body: objects.get(key)};
     },
-    headObject: async ({ key }) => {
-      parquetHeadCount += 1;
-      const evidence = fileEvidence.find((entry) => entry.key === key);
-      return {
-        exists: true,
-        bytes: evidence.byte_size,
-        sha256: evidence.sha256,
-      };
-    },
+  }};
+  const runtime = {...resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2", GITHUB_SHA: "3".repeat(40), UK_AQ_R2_HISTORY_OBSERVATIONS_PART_MAX_ROWS: "1" }), r2, run_id:"fixture"};
+  const rows = [0,1].map(i => ({connector_id:connectorId, station_id:70, timeseries_id:701, pollutant_code:"pm25", observed_at_utc:`${dayUtc}T0${i}:00:00.000Z`, value:9.5+i}));
+  const connectorKey=buildHistoryV2ConnectorManifestKey(runtime.committed_prefix,dayUtc,connectorId);
+  // A disappeared pollutant must not survive the complete source snapshot.
+  objects.set(connectorKey,Buffer.from(JSON.stringify({pollutant_codes:["pm25","no2"]})));
+  const writerResult=await writeFrozenCandidateObservationsToV2ForTest({
+    candidate:{day_utc:dayUtc,connector_id:connectorId,expected_row_count:2n}, runtime,
+    streamClient:{query:async()=>{checkpoints++;return {rows:[]};}},
+    frozen:{temp:{ndjsonPath:"unused"},counts:{},sourceIdentity:{}},
+    readFrozenRows:async function*(){yield* rows;},cleanupFrozenSource:()=>{},
+    backedUpAtUtc:"2026-08-19T00:00:00.000Z",
   });
-
-  assert.equal(result.v3_scoped_index_authority_verified, true);
-  assert.equal(result.observation_index_generation, "v3");
-  assert.equal(result.history_row_count, 1);
-  assert.equal(parquetGetCount, 0);
-  assert.equal(parquetHeadCount, fileEvidence.length);
+  assert.equal(checkpoints,2);
+  assert.equal(writerResult.written_row_count,2n);
+  assert.equal(writerResult.file_count,2);
+  assert.deepEqual(writerResult.connector_manifest.pollutant_codes,["pm25"]);
+  assert.ok([...objects.keys()].every(key=>key.startsWith('history/v2/observations/')));
+  const child=JSON.parse(objects.get(writerResult.connector_manifest.pollutant_manifests[0].manifest_key));
+  assert.equal(child.observation_content_hash_row_count,2);
+  assert.ok(writerResult.files.every(file=>file.etag_or_hash===sha256Hex(objects.get(file.key))));
+  let indexCalls=0;
+  const options={runtime, dayUtc, connectorId, manifestKey:connectorKey, expectedRowCount:2n, writerResult,
+    updateIndexes:async args=>{
+      indexCalls++;
+      assert.equal(args.historyVersion,'v2');assert.deepEqual(args.domains,['observations']);
+      assert.equal(args.updateLatestIndex,false);
+      assert.equal(args.env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX,'history/_index_v2');
+      // Use the actual canonical index-key builder through the verifier below.
+      const {buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey:buildKey}=await import('../workers/shared/uk_aq_r2_history_index.mjs');
+      const indexKey=buildKey('history/_index_v2/observations_timeseries',dayUtc,connectorId,'pm25');
+      objects.set(indexKey,Buffer.from(JSON.stringify({history_version:'v2',domain:'observations',day_utc:dayUtc,connector_id:connectorId,pollutant_code:'pm25',pollutant_manifest_key:child.manifest_key,pollutant_manifest_hash:child.manifest_hash,source_row_count:2,file_count:2,indexed_file_count:2,index_coverage:'complete',timeseries_row_counts:{701:2}})));
+      return {observations_timeseries:{warning_count:0,rewritten_connector_index_count:1,timeseries_index_prefix:'history/_index_v2/observations_timeseries',affected_pollutant_indexes:[{key:indexKey}]}};
+    },
+  };
+  const evidence=await verifyObservationConnectorHistory(options);
+  assert.equal(evidence.observation_index_generation,'v2');assert.equal(evidence.history_row_count,2);
+  assert.equal(indexCalls,1);assert.equal(parquetGets,0);
+  const file=writerResult.files[0], saved=objects.get(file.key);objects.set(file.key,Buffer.alloc(saved.length));
+  await assert.rejects(verifyObservationConnectorHistory(options),/SHA-256 verification failed/);
+  assert.equal(indexCalls,1);
+  objects.set(file.key,saved);
+  const retained=buildHistoryV2ConnectorManifest({domain:'observations',dayUtc,connectorId:8,runId:'fixture',manifestKey:buildHistoryV2ConnectorManifestKey(runtime.committed_prefix,dayUtc,8),pollutantManifests:[],writerGitSha:'3'.repeat(40),backedUpAtUtc:'2026-08-19T00:00:00.000Z'});
+  const {buildHistoryV2DayManifest}=await import('../workers/shared/uk_aq_r2_history_canonical.mjs');
+  const dayKey=`${runtime.committed_prefix}/day_utc=${dayUtc}/manifest.json`;
+  const previousDay=buildHistoryV2DayManifest({domain:'observations',dayUtc,runId:'fixture',manifestKey:dayKey,connectorManifests:[retained],writerGitSha:'3'.repeat(40),backedUpAtUtc:'2026-08-19T00:00:00.000Z'});
+  objects.set(retained.manifest_key,Buffer.from(JSON.stringify(retained)));
+  objects.set(dayKey,Buffer.from(JSON.stringify(previousDay)));
+  const client={query:async(sql)=>({rows:[{acquired:true,released:true}]})};
+  await publishObservationV2DayForTest({client,runtime,dayUtc,publishedCandidates:[{candidate:{day_utc:dayUtc,connector_id:connectorId},connectorGateEvidence:evidence}]});
+  assert.deepEqual(JSON.parse(objects.get(dayKey)).connector_manifests.map(c=>c.connector_id),[7,8]);
 });

@@ -15,24 +15,15 @@ const pruneJob = fs.readFileSync(
   "utf8",
 );
 
-test("Prune Daily delegates observation hierarchy and v3 indexes to the shared v3 writer", () => {
+test("Prune Daily delegates v2 hierarchy to the existing shared global finalizer", () => {
   const sharedImport = "uk_aq_r2_observations_global_finalizer.mjs";
-  assert.match(integrityApply, new RegExp(sharedImport.replaceAll(".", "\\.")));
-  assert.match(
-    phaseB,
-    /connectorPublisher\s*=\s*runOperationalPruneDailyObservationHistoryV3ConnectorPublication/,
-  );
-  assert.match(phaseB, /const connectorPublication = await connectorPublisher\(\{/);
-  assert.match(
-    phaseB,
-    /runFinalizer\s*=\s*runOperationalPruneDailyObservationHistoryV3RunFinalization/,
-  );
-  assert.match(phaseB, /await runFinalizer\(\{/);
-  assert.doesNotMatch(phaseB, new RegExp(sharedImport.replaceAll(".", "\\.")));
-  assert.doesNotMatch(phaseB, /summary\.global_index_finalization/);
-  assert.match(integrityApply, /runState\.global_index_finalization = await runCanonicalObservationsGlobalFinalizer\(/);
+  assert.ok(phaseB.includes(sharedImport));
+  assert.ok(integrityApply.includes(sharedImport));
+  assert.match(phaseB, /globalFinalizer = runCanonicalObservationsGlobalFinalizer/);
+  assert.match(phaseB, /runCanonicalConnectorDayWriter\(/);
+  assert.match(phaseB, /runCanonicalDayFinalizer\(/);
+  assert.doesNotMatch(phaseB, /runOperationalPruneDailyObservationHistoryV3/);
   assert.doesNotMatch(phaseB, /runCanonicalGlobalIndexFinalizer\(/);
-  assert.doesNotMatch(integrityApply, /runCanonicalGlobalIndexFinalizer\(/);
 });
 
 test("Prune Daily no longer runs a second hierarchy finaliser from job.mjs", () => {
