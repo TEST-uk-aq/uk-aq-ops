@@ -287,36 +287,20 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
     const match = String(raw || "").match(new RegExp(`^${escapeRegex(prefix)}/day_utc=(\\d{4}-\\d{2}-\\d{2})/$`));
     return match ? [`${prefix}/day_utc=${match[1]}/manifest.json`] : [];
   }).sort();
+  const discovered = new Set(dayKeys.map((key) => key.match(/day_utc=(\d{4}-\d{2}-\d{2})/)?.[1]));
+  for (const day of days) {
+    if (!discovered.has(day)) throw new Error(`Affected observation day prefix is missing: ${day}`);
+  }
+
   const objects = [];
   const writes = [];
   const monthOverlays = new Map();
   for (const yearMonth of affectedMonths) {
     const [year, month] = yearMonth.split("-");
-    const key = buildR2HistoryV2ObservationsMonthManifestKey(prefix, year, month);
-    const existingMonth = await readAggregate({
-      io, r2, key, prefix, level: "month", year, month, allowMissing: true,
-    });
-    // Required children come from authority, independently of LIST completeness.
-    const requiredDayKeys = new Set([
-      ...(existingMonth?.canonical.children || []).map((child) => child.manifest_key),
-      ...days.filter((day) => day.startsWith(`${yearMonth}-`))
-        .map((day) => `${prefix}/day_utc=${day}/manifest.json`),
-    ]);
-    const candidateDayKeys = [...new Set([
-      ...requiredDayKeys,
-      ...dayKeys.filter((value) => value.includes(`/day_utc=${yearMonth}-`)),
-    ])].sort();
     const references = [];
-    for (const dayKey of candidateDayKeys) {
-      let object;
-      try {
-        object = await io.getObject({ r2, key: dayKey });
-      } catch (error) {
-        // Interrupted publication can leave an uncommitted, discovery-only prefix.
-        if (!requiredDayKeys.has(dayKey) && isMissing(error)) continue;
-        throw error;
-      }
-      references.push(dayReference(parseJson(object, dayKey), dayKey, prefix));
+    for (const key of dayKeys.filter((value) => value.includes(`/day_utc=${yearMonth}-`))) {
+      const object = await io.getObject({ r2, key });
+      references.push(dayReference(parseJson(object, key), key, prefix));
     }
     if (references.length === 0) throw new Error(`No committed observation day manifests found for ${yearMonth}`);
     const manifest = buildR2HistoryV2ObservationsMonthManifest({
@@ -325,6 +309,7 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
       month,
       dayManifests: references,
     });
+    const key = buildR2HistoryV2ObservationsMonthManifestKey(prefix, year, month);
     const result = await planAndWrite({
       io,
       r2,

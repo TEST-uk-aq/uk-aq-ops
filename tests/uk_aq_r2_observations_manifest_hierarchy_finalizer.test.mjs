@@ -190,3 +190,104 @@ test("targeted finaliser fails closed when an affected day prefix has no day man
     /R2 GET failed \(404\).*day_utc=2026-01-15\/manifest\.json/,
   );
 });
+
+function createAugustRetryFixture() {
+  const fixture = createFixture();
+  seedCompleteHierarchy(fixture);
+  const days = ["2026-08-27", "2026-08-28", "2026-08-29"];
+  for (const day of days) {
+    const reference = dayReference(day, "e");
+    storeJson(fixture.objects, reference.manifest_key, {
+      domain: "observations", manifest_kind: "day", ...reference,
+    });
+  }
+  const partialKey = `${PREFIX}/day_utc=2026-08-30/connector_id=1/part-00000.parquet`;
+  fixture.objects.set(partialKey, Buffer.from("partial publication"));
+  const finalize = (affectedDaysUtc = days) => finalizeR2HistoryV2ObservationsManifestHierarchy({
+    r2: fixture.r2,
+    observationsPrefix: PREFIX,
+    affectedDaysUtc,
+    adapters: fixture.adapter,
+  });
+  return { ...fixture, days, partialKey, finalize };
+}
+
+test("August retry ignores an unreferenced partial day prefix and finalises month/year/root", async () => {
+  const fixture = createAugustRetryFixture();
+  const result = await fixture.finalize();
+  const monthKey = buildR2HistoryV2ObservationsMonthManifestKey(PREFIX, "2026", "08");
+  const yearKey = buildR2HistoryV2ObservationsYearManifestKey(PREFIX, "2026");
+  const rootKey = buildR2HistoryV2ObservationsRootManifestKey(PREFIX);
+  const month = JSON.parse(fixture.objects.get(monthKey));
+  const year = JSON.parse(fixture.objects.get(yearKey));
+  const root = JSON.parse(fixture.objects.get(rootKey));
+  assert.equal(result.status, "written");
+  assert.deepEqual(month.children.map((child) => child.day_utc), fixture.days);
+  assert.equal(year.children.find((child) => child.month === "08").content_hash, month.content_hash);
+  assert.equal(root.children.find((child) => child.year === 2026).content_hash, year.content_hash);
+  assert.deepEqual(fixture.writes, [monthKey, yearKey, rootKey]);
+  assert.equal(fixture.objects.has(fixture.partialKey), true);
+  assert.equal(fixture.objects.has(`${PREFIX}/day_utc=2026-08-30/manifest.json`), false);
+});
+
+test("August retry fails if the missing day is affected even when LIST omits it", async () => {
+  const fixture = createAugustRetryFixture();
+  fixture.adapter.listAllCommonPrefixes = async () => [];
+  await assert.rejects(fixture.finalize([...fixture.days, "2026-08-30"]),
+    /R2 GET failed \(404\).*day_utc=2026-08-30\/manifest\.json/);
+  assert.deepEqual(fixture.writes, []);
+});
+
+test("August retry fails if the existing month references a missing day omitted by LIST", async () => {
+  const fixture = createAugustRetryFixture();
+  const month = buildR2HistoryV2ObservationsMonthManifest({
+    basePrefix: PREFIX,
+    year: "2026",
+    month: "08",
+    dayManifests: [...fixture.days, "2026-08-30"].map((day) => dayReference(day, "e")),
+  });
+  fixture.objects.set(buildR2HistoryV2ObservationsMonthManifestKey(PREFIX, "2026", "08"),
+    serializeR2HistoryV2ObservationsAggregateManifest(month, { basePrefix: PREFIX }));
+  fixture.adapter.listAllCommonPrefixes = async () => [];
+  await assert.rejects(fixture.finalize(), /R2 GET failed \(404\).*day_utc=2026-08-30\/manifest\.json/);
+  assert.deepEqual(fixture.writes, []);
+});
+
+test("LIST omissions cannot remove existing authoritative or affected days", async () => {
+  const fixture = createFixture();
+  seedCompleteHierarchy(fixture);
+  fixture.adapter.listAllCommonPrefixes = async () => [];
+  const result = await finalizeR2HistoryV2ObservationsManifestHierarchy({
+    r2: fixture.r2,
+    observationsPrefix: PREFIX,
+    affectedDaysUtc: ["2026-01-15"],
+    adapters: fixture.adapter,
+  });
+  assert.equal(result.status, "up_to_date");
+  assert.deepEqual(fixture.writes, []);
+});
+
+for (const [label, body, expected] of [
+  ["invalid JSON", "{", /Invalid JSON/],
+  ["invalid identity", JSON.stringify(dayReference("2026-08-31", "e")), /Day manifest identity mismatch/],
+  ["invalid hash", JSON.stringify({ ...dayReference("2026-08-30", "e"), manifest_hash: "bad" }), /Invalid day manifest_hash/],
+]) {
+  test(`August retry fails for an unrelated discovered day with ${label}`, async () => {
+    const fixture = createAugustRetryFixture();
+    fixture.objects.set(`${PREFIX}/day_utc=2026-08-30/manifest.json`, Buffer.from(body));
+    await assert.rejects(fixture.finalize(), expected);
+    assert.deepEqual(fixture.writes, []);
+  });
+}
+
+test("August retry propagates non-missing GET failures for unrelated discovered days", async () => {
+  const fixture = createAugustRetryFixture();
+  const getObject = fixture.adapter.getObject;
+  const failure = Object.assign(new Error("R2 unavailable"), { status: 503 });
+  fixture.adapter.getObject = async (args) => {
+    if (args.key === `${PREFIX}/day_utc=2026-08-30/manifest.json`) throw failure;
+    return getObject(args);
+  };
+  await assert.rejects(fixture.finalize(), (error) => error === failure);
+  assert.deepEqual(fixture.writes, []);
+});
