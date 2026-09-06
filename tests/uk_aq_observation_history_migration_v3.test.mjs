@@ -81,6 +81,7 @@ import {
   DEFAULT_V2_LATEST_KEY,
   DEFAULT_V3_LATEST_KEY,
   LEGACY_INDEX_V3_SORTED_CHECKPOINT_MANIFEST_CONTRACT_VERSION,
+  guardSideBySideMigrationAdapters,
   buildObservationHistoryV2RestorePlan,
   buildObservationHistoryV3MigrationAuditReport,
   buildObservationHistoryV3MigrationPlan,
@@ -107,8 +108,21 @@ import {
   finalizeMigrationV3Publication,
   buildObservationHistoryV3ReportOutput,
   parseObservationHistoryMigrationArgs,
+  runObservationHistoryMigrationV3,
+  createSideBySideLockAssertion,
+  SIDE_BY_SIDE_LOCK_OWNER,
 } from "../scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs";
 import { buildObservationHistoryIndexV3PublicationPlan as sortedArrayPublicationPlan } from "./fixtures/uk_aq_index_v3_sorted_array_reference.mjs";
+import {
+  OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV as LOCK_ENV,
+  observationsGlobalOperationLockIdentity,
+} from "../workers/shared/uk_aq_r2_history_writer.mjs";
+import {
+  buildTimeseriesBindingSourceRangeManifest,
+  buildTimeseriesBindingSourceRootManifest,
+  timeseriesBindingSourceRangeManifestKey,
+  timeseriesBindingSourceRootKey,
+} from "../scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs";
 const REPOSITORY_ROOT = path.resolve(import.meta.dirname, "..");
 const PREFIX = "history/v2/observations";
 const DAY = "2026-01-02";
@@ -4467,4 +4481,138 @@ test("rollback admission is before PUT and reruns skip only exact stored canonic
   const changed = await executeObservationHistoryV2Rollback(options);
   assert.equal(changed.restored_object_count, 2);
   assert.equal(adapters.putCalls + adapters.jsonPutCalls, putCount + 2);
+});
+
+
+test("side-by-side operator locks direct v2 selection, guards v3 writes and refuses changed-source resume", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-side-by-side-operator-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const fixture = await buildFixture({ pollutantCodes: ["pm25"] });
+  const bindingPrefix = "history/_index_v2/timeseries_binding";
+  const ranges = [100, 1000].map((id) => {
+    const key = `${bindingPrefix}/timeseries_id=${id}.json`;
+    const body = jsonBody({ schema_version: 1, history_version: "v2", index_kind: "timeseries_binding",
+      timeseries_id: id, connector_id: 1, pollutant_code: "pm25" });
+    fixture.r2.set(key, body);
+    const rangeStart = Math.floor(id / 1000) * 1000;
+    const manifest = buildTimeseriesBindingSourceRangeManifest({ bindingPrefix, rangeStart,
+      units: [{ timeseries_id: id, relative_path: key, size: body.byteLength, sha256: sha256Hex(body) }] });
+    const manifestKey = timeseriesBindingSourceRangeManifestKey(bindingPrefix, rangeStart);
+    fixture.r2.set(manifestKey, jsonBody(manifest));
+    return { range_start: rangeStart, range_end: rangeStart + 999,
+      manifest_key: manifestKey, source_range_hash: manifest.source_range_hash, unit_count: 1 };
+  });
+  fixture.r2.set(timeseriesBindingSourceRootKey(bindingPrefix),
+    jsonBody(buildTimeseriesBindingSourceRootManifest({ bindingPrefix, ranges })));
+  const originalV2 = new Map(fixture.r2);
+  const memory = memoryAdapters(fixture);
+  const checkpointPath = path.join(directory, "checkpoint.json");
+  const limitsPath = path.join(directory, "limits.json");
+  const reportPath = path.join(directory, "report.json");
+  fs.writeFileSync(limitsPath, JSON.stringify(ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3));
+  const env = { UK_AQ_ENV_NAME: "TEST", UK_AQ_R2_HISTORY_VERSION: "v2",
+    UK_AQ_R2_HISTORY_INDEX_VERSION: "v3", UK_AQ_R2_HISTORY_INTEGRITY_VERSION: "v2",
+    CFLARE_R2_ENDPOINT: "https://example.invalid", CFLARE_R2_BUCKET: ENVIRONMENT.bucket,
+    CFLARE_R2_ACCESS_KEY_ID: "fixture", CFLARE_R2_SECRET_ACCESS_KEY: "fixture" };
+  const common = ["--transition", "v2-to-v3", "--environment", "TEST", "--expected-bucket", ENVIRONMENT.bucket,
+    "--migration-run-id", "operator-safety", "--target-writer-git-sha", "a".repeat(40),
+    "--writer-limits-json", limitsPath, "--report-out", reportPath];
+  let supervised = false;
+  let lockCount = 0;
+  let heldEnv;
+  let failFirstMutation = true;
+  const writes = [];
+  const reads = [];
+  const factory = ({ assertLockHeld, recoveryProgress }) => {
+    assert.equal(supervised, true, "adapter construction must follow lock acquisition");
+    const adapters = { ...memory,
+      getObject: async (request) => {
+        assert.equal(supervised, true);
+        assertLockHeld();
+        reads.push(request.key);
+        return memory.getObject(request);
+      },
+      finalizeV3Publication: finalizeMigrationV3Publication,
+      writeCheckpoint: recoveryProgress ? recoveryProgress.persistCheckpoint : async (checkpoint) => {
+        fs.writeFileSync(checkpointPath, stableMigrationJson(checkpoint));
+      },
+      ...(recoveryProgress ? {
+        recordDurableEvidence: (entry) => recoveryProgress.recordPublicationEvidenceBatch([entry]),
+        recordDurableEvidenceBatch: recoveryProgress.recordPublicationEvidenceBatch,
+      } : {}),
+    };
+    for (const name of ["putChecksumObject", "putJsonObject", "putIfChanged"]) {
+      adapters[name] = async (object) => {
+        assert.equal(supervised, true);
+        assertLockHeld();
+        assert.match(object.key, /^history\/(?:v3\/observations\/|_index_v3\/(?:observations_timeseries(?:\/|_latest\.json$)|timeseries_binding\/))/);
+        if (failFirstMutation) { failFirstMutation = false; throw new Error("operator fixture interruption before PUT"); }
+        writes.push(object.key);
+        return memory[name](object);
+      };
+    }
+    return adapters;
+  };
+  const invoke = async (extra) => {
+    const argv = [...common, ...extra];
+    let output;
+    await runObservationHistoryMigrationV3({ argv, env, sideBySideAdapterFactory: factory,
+      runLockedCommand: async (options) => {
+        assert.equal(options.owner, SIDE_BY_SIDE_LOCK_OWNER);
+        assert.equal(supervised, false);
+        const identity = observationsGlobalOperationLockIdentity();
+        heldEnv = { ...env, [LOCK_ENV.held]: "true", [LOCK_ENV.acquired]: "true",
+          [LOCK_ENV.owner]: options.owner, [LOCK_ENV.runId]: options.runId,
+          [LOCK_ENV.logicalIdentity]: identity.logical_identity, [LOCK_ENV.classId]: String(identity.class_id),
+          [LOCK_ENV.objectId]: String(identity.object_id), [LOCK_ENV.nonce]: `session-${++lockCount}`,
+          [LOCK_ENV.waitMs]: "0", [LOCK_ENV.outcome]: "held" };
+        supervised = true;
+        try { output = await runObservationHistoryMigrationV3({ argv, env: heldEnv,
+          sideBySideAdapterFactory: factory, runLockedCommand: () => assert.fail("nested acquisition") }); }
+        finally { supervised = false; }
+        return 0;
+      } });
+    return output;
+  };
+  assert.throws(() => createSideBySideLockAssertion({ env, migrationRunId: "operator-safety" }), /coordinator-owned/);
+  const preview = await invoke(["--mode", "plan"]);
+  assert.equal(writes.length, 0);
+  assert.ok(reads.includes(preview.result.source_root.key));
+  assert.ok(reads.every((key) => key.startsWith(`${PREFIX}/`) || key.startsWith("history/_index_v2/")));
+  const migrate = ["--mode", "migrate", "--apply", "--writers-frozen", "--checkpoint-out", checkpointPath,
+    "--expected-plan-sha256", preview.result.plan_sha256];
+  await assert.rejects(invoke(migrate), /operator fixture interruption before PUT/);
+  const checkpoint = JSON.parse(fs.readFileSync(checkpointPath));
+  assert.equal(checkpoint.authority.generation_topology, "observation-history-side-by-side-v1");
+  assert.equal(checkpoint.authority.inventory.observations_prefix, PREFIX);
+  assert.equal(checkpoint.authority.target_observations_prefix, "history/v3/observations");
+  assert.throws(() => guardSideBySideMigrationAdapters(checkpoint.authority, {}), /supervised global lock/);
+  const locked = createSideBySideLockAssertion({ env: heldEnv, migrationRunId: "operator-safety" });
+  const guard = guardSideBySideMigrationAdapters(checkpoint.authority, { assertLockHeld: locked,
+    putJsonObject: () => assert.fail("forbidden mutation reached transport") });
+  await assert.rejects(guard.putJsonObject({ key: `${PREFIX}/forbidden.json` }), /outside v3 observations/);
+  heldEnv[LOCK_ENV.nonce] = "different-session";
+  await assert.rejects(guard.putJsonObject({ key: "history/v3/observations/forbidden.json" }), /lock session changed/);
+  const rootKey = checkpoint.authority.inventory.root_manifest.key;
+  fixture.r2.set(rootKey, Buffer.concat([originalV2.get(rootKey), Buffer.from("\n")]));
+  const resume = [...migrate, "--checkpoint-in", checkpointPath];
+  await assert.rejects(invoke(resume), /source-root identity changed/);
+  assert.equal(writes.length, 0);
+  assert.equal(fs.existsSync(`${checkpointPath}.recovery`), false, "changed source must fail before recovery initialization");
+  fixture.r2.set(rootKey, originalV2.get(rootKey));
+  const complete = await invoke(resume);
+  assert.equal(complete.result.ok, true);
+  assert.equal(complete.result.status, "side_by_side_build_verified");
+  assert.equal(complete.result.source_root.unchanged, true);
+  assert.equal(complete.result.runtime_switch_performed, false);
+  assert.ok(writes.some((key) => key.startsWith("history/v3/observations/")));
+  assert.ok(writes.some((key) => key.startsWith("history/_index_v3/observations_timeseries/")));
+  assert.ok(writes.some((key) => key.startsWith("history/_index_v3/timeseries_binding/")));
+  assert.equal((await invoke(resume)).result.ok, true, "non-empty recovery journal resumes with exact evidence");
+  const verified = await invoke(["--mode", "verify", "--checkpoint-in", checkpointPath,
+    "--expected-plan-sha256", preview.result.plan_sha256]);
+  assert.equal(verified.result.ok, true);
+  assert.equal(lockCount, 6, "every plan, migrate/resume and verify invocation reacquires");
+  for (const [key, body] of originalV2) assert.deepEqual(fixture.r2.get(key), body, `v2 changed: ${key}`);
+  await assert.rejects(invoke(["--mode", "plan", "--dropbox-root", "/unused"]), /historical Dropbox/);
 });

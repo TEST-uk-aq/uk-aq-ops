@@ -33,6 +33,7 @@ import {
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import {
   observationsGlobalOperationLockContext,
+  requireObservationsGlobalOperationLockContext,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
   runCommandWithObservationsGlobalOperationLock,
@@ -45,6 +46,11 @@ import {
 } from "../index_v3_migration/index_v3_operator_evidence.mjs";
 import { runHistoryIndexBuild } from "./uk_aq_build_r2_history_index.mjs";
 import {
+  SIDE_BY_SIDE_TOPOLOGY,
+  assertSideBySideMigrationPlan,
+  buildObservationHistorySideBySideMigrationPlan,
+  guardSideBySideMigrationAdapters,
+  verifySideBySideSourceRoot,
   buildObservationHistoryV2RestorePlan,
   buildObservationHistoryV3MigrationAuditReport,
   buildObservationHistoryV3MigrationPlan,
@@ -78,7 +84,16 @@ function usage() {
     "Usage:",
     "  node scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs [options]",
     "",
-    "Modes:",
+    "Active side-by-side v2-to-v3 (plan, migrate, verify):",
+    "  Acquires the existing global observations lock before reading canonical v2.",
+    "  Uses direct R2 v2 source and independent v3 targets; no Dropbox/runtime rollback record.",
+    "  Required: environment, expected-bucket, migration-run-id, target-writer-git-sha,",
+    "            writer-limits-json, report-out; migrate/verify also require expected-plan-sha256.",
+    "  migrate requires apply, writers-frozen and checkpoint-out; resume also checkpoint-in.",
+    "  plan is a separately locked preview. migrate reacquires, rebuilds and checks its exact plan hash.",
+    "  This command builds/verifies only; it never switches readers or releases writers onto v3.",
+    "",
+    "Historical recovery / v3-rebuild interfaces (not the active side-by-side build):",
     "  --mode plan             Build non-mutating pinned inventory/rollback authority (default)",
     "  --mode migrate          Execute the offline rewrite and complete v3 publication",
     "  --mode verify           Rerun complete verification without mutation",
@@ -86,12 +101,12 @@ function usage() {
     "  --mode runtime-recoverability  Read-only pinned runtime route check; requires environment, transition, runtime record and report-out only",
     "  --mode rollback         Restore canonical v2, rebuild/verify index_v2, then restore/verify v2 runtime authority",
     "",
-    "Required for every mode:",
+    "Historical interface arguments (Dropbox arguments are rejected by active side-by-side modes):",
     "  --environment TEST|LIVE",
     "  --transition v2-to-v3|v3-rebuild",
     "  --expected-bucket <exact environment bucket>",
     "  --migration-run-id <stable operator identity>",
-    "  --target-writer-git-sha <exact deployed migration code identity>",
+    "  --target-writer-git-sha <exact reviewed migration writer code identity>",
     "  --writer-limits-json <Phase 1 writer limits JSON>",
     "  --dropbox-root <local directory or rclone remote:path>",
     "  --expected-inventory-root-sha256 <hex>",
@@ -99,7 +114,7 @@ function usage() {
     "  --report-out <audit JSON path>",
     "  --expected-plan-sha256 <hex>  Required except for plan",
     "",
-    "Mutation-only requirements:",
+    "Mutation requirements (runtime rollback/operator authority files are historical-only):",
     "  --apply                  Explicitly permit the selected external mutation",
     "  --writers-frozen         Confirm every planner-listed writer is paused",
     "  --checkpoint-out <path>  Required for migrate; atomically updated after each object",
@@ -1610,14 +1625,210 @@ function buildR2Adapters({
   };
 }
 
+function buildSideBySideR2Adapters(options) {
+  const {
+    getBackupObject, rebuildV2Indexes, verifyV2IndexCompleteness,
+    ...adapters
+  } = buildR2Adapters(options);
+  return adapters;
+}
+
+export const SIDE_BY_SIDE_LOCK_OWNER = "observation_history_migration_v2_to_v3";
+
+export function createSideBySideLockAssertion({ env, migrationRunId }) {
+  const options = { env, expectedOwner: SIDE_BY_SIDE_LOCK_OWNER, expectedRunId: migrationRunId };
+  const pinned = requireObservationsGlobalOperationLockContext(options);
+  // Session health and process-group termination belong to the existing parent
+  // coordinator/child supervisor. Never reinterpret an env flag as a new lock.
+  return () => {
+    const current = requireObservationsGlobalOperationLockContext(options);
+    if (current.nonce !== pinned.nonce) throw new Error("Supervised migration lock session changed");
+    return current;
+  };
+}
+
+async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory }) {
+  const missing = [
+    ["--environment", args.environment], ["--expected-bucket", args.expectedBucket],
+    ["--migration-run-id", args.migrationRunId], ["--target-writer-git-sha", args.targetWriterGitSha],
+    ["--writer-limits-json", args.writerLimitsPath], ["--report-out", args.reportOut],
+  ].filter(([, value]) => !String(value || "").trim());
+  if (missing.length) throw new Error(`Missing side-by-side arguments: ${missing.map(([flag]) => flag).join(", ")}`);
+  if (args.environment !== "TEST") throw new Error("The active side-by-side operator path is TEST-only");
+  if ([args.dropboxRoot, args.expectedInventoryRootSha256, args.expectedStateRootSha256,
+    args.v2RuntimeRollbackRecord, args.operatorAuthorityFile].some(Boolean)) {
+    throw new Error("Side-by-side migration does not accept historical Dropbox/runtime rollback authority arguments");
+  }
+  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const config = resolveR2HistoryIndexConfig(env);
+  if (!hasRequiredR2Config(config.r2)) throw new Error("Complete configured R2 credentials and bucket are required");
+  const evidence = {
+    ...environmentEvidence(args, env, config),
+    configuredEnvironment: env.UKAQ_ENV_NAME || env.UK_AQ_ENV_NAME || env.ENVIRONMENT || "",
+    indexVersion: env.UK_AQ_R2_HISTORY_VERSION,
+  };
+  validateObservationHistoryV3MigrationEnvironment({ ...evidence, apply: true });
+  const writerLimits = assertAcceptedObservationHistoryWriterLimitsV3(
+    readJsonFile(args.writerLimitsPath, "writer limits"), "side-by-side writer limits",
+  );
+  const checkpointPath = args.checkpointOut || args.checkpointIn;
+  const checkpointArtifacts = checkpointPath ? ["", ".staging", ".recovery", ".publication.json"]
+    .map((suffix) => `${path.resolve(checkpointPath)}${suffix}`) : [];
+  const reportPath = path.resolve(args.reportOut);
+  if (reportPath === path.resolve(args.writerLimitsPath) || checkpointArtifacts.some((entry) =>
+    reportPath === entry || reportPath.startsWith(`${entry}${path.sep}`))) {
+    throw new Error("Report path must be separate from writer limits and checkpoint/recovery artifacts");
+  }
+  if (args.mode === "migrate" && !args.checkpointIn && checkpointArtifacts.some((entry) => fs.existsSync(entry))) {
+    throw new Error("Fresh migration cannot overwrite checkpoint artifacts; use --checkpoint-in to resume");
+  }
+  const lockOptions = { env, expectedOwner: SIDE_BY_SIDE_LOCK_OWNER, expectedRunId: args.migrationRunId };
+  const context = observationsGlobalOperationLockContext(lockOptions);
+  if (context.held && !context.valid) throw new Error("Invalid side-by-side supervised global lock context");
+  if (!context.valid) {
+    const diagnostics = [];
+    try {
+      const exitCode = await runLockedCommand({
+        databaseUrl: env.SUPABASE_DB_URL || env.DATABASE_URL,
+        owner: SIDE_BY_SIDE_LOCK_OWNER, runId: args.migrationRunId,
+        command: process.execPath,
+        commandArgs: [...process.execArgv, fileURLToPath(import.meta.url), ...argv],
+        env, diagnostics,
+      });
+      return { delegated: true, exitCode };
+    } finally {
+      for (const entry of diagnostics) process.stderr.write(`${JSON.stringify(entry)}\n`);
+    }
+  }
+  const assertLockHeld = createSideBySideLockAssertion({ env, migrationRunId: args.migrationRunId });
+  const startedAt = now();
+  let plan = null;
+  let checkpoint = null;
+  let recoveryProgress = null;
+  // Construct only R2/local adapters. No Dropbox reader or deployment adapter.
+  const baseAdapters = adapterFactory({
+    config, checkpointOut: args.checkpointOut || args.checkpointIn, env,
+    publicationConcurrency: args.publicationConcurrency, assertLockHeld,
+  });
+  const getObject = async (request) => {
+    assertLockHeld();
+    const result = await baseAdapters.getObject(request);
+    assertLockHeld();
+    return result;
+  };
+  try {
+    if (args.checkpointIn) {
+      assertLockHeld();
+      checkpoint = readJsonFile(args.checkpointIn, "side-by-side checkpoint");
+      plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+      assertSideBySideMigrationPlan(plan);
+      // Check pinned source BEFORE recovery journal initialization or target work.
+      await verifySideBySideSourceRoot({ plan, getObject });
+    } else {
+      plan = await buildObservationHistorySideBySideMigrationPlan({
+        getR2Object: getObject, assertLockHeld, repositoryRoot,
+        environmentEvidence: evidence, migrationRunId: args.migrationRunId,
+        targetWriterGitSha: args.targetWriterGitSha,
+      });
+    }
+    if (plan.migration_run_id !== args.migrationRunId ||
+        plan.target_writer_git_sha !== args.targetWriterGitSha ||
+        plan.environment.environment !== evidence.environment || plan.environment.bucket !== evidence.bucket ||
+        stableMigrationJson(plan.target.writer_limits) !== stableMigrationJson(writerLimits) ||
+        (args.expectedPlanSha256 && args.expectedPlanSha256 !== plan.plan_sha256)) {
+      throw new Error("Side-by-side pinned run, writer, limits, environment or plan hash differs");
+    }
+    if (checkpoint) {
+      const hasJournal = fs.existsSync(recoveryProgressPaths(args.checkpointIn).manifest);
+      if (hasJournal || args.mode === "migrate") {
+        recoveryProgress = buildObservationHistoryV3RecoveryProgressContext({
+          checkpointPath: args.checkpointIn, checkpoint, repositoryRoot,
+          create: args.mode === "migrate", requireCurrentImplementation: true,
+        });
+        checkpoint = recoveryProgress.checkpoint;
+        plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+        assertSideBySideMigrationPlan(plan);
+      }
+    }
+    const adapters = guardSideBySideMigrationAdapters(plan, {
+      ...(recoveryProgress ? adapterFactory({
+        config, checkpointOut: args.checkpointOut || args.checkpointIn, env,
+        recoveryProgress, publicationConcurrency: args.publicationConcurrency, assertLockHeld,
+      }) : baseAdapters),
+      assertLockHeld,
+    });
+    await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
+    let result;
+    let reportPlan = plan;
+    if (args.mode === "plan") {
+      result = { ...summaryForPlan(plan), ok: true, status: "planned", dry_run: true, mutation_calls: 0 };
+    } else if (args.mode === "migrate") {
+      result = await executeObservationHistoryV3MigrationPlan({
+        plan, apply: true, writersFrozen: args.writersFrozen,
+        environmentEvidence: evidence, checkpoint,
+        recoveryAuthority: recoveryProgress?.authenticatedRecoveryAuthority || null,
+        publicationConcurrency: args.publicationConcurrency,
+        onReconstructedPlan: (value) => { reportPlan = value; }, adapters,
+      });
+      checkpoint = result.checkpoint;
+    } else {
+      reportPlan = buildObservationHistoryV3RerunVerificationPlan({
+        checkpoint, allowLegacyRecoveryOrdering: false,
+        recoveryAuthority: recoveryProgress?.authenticatedRecoveryAuthority || null,
+      });
+      assertSideBySideMigrationPlan(reportPlan);
+      result = await verifyObservationHistoryV3CurrentDependencies({
+        plan: reportPlan, checkpoint, getObject: adapters.getObject, headObject: adapters.headObject,
+        publicationResult: { ok: true, checkpoint_evidence: true },
+      });
+    }
+    const sourceRoot = await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
+    assertLockHeld();
+    const output = buildObservationHistoryV3ReportOutput({
+      result, mode: args.mode, checkpoint,
+      audit: buildObservationHistoryV3MigrationAuditReport({
+        plan: reportPlan, mode: args.mode, startedAt, completedAt: now(),
+        execution: args.mode === "migrate" ? result : args.mode === "verify"
+          ? { verification: result, v3_publication: { ok: true } } : null,
+      }),
+    });
+    output.result.plan_sha256 = plan.plan_sha256;
+    output.result.generation_topology = SIDE_BY_SIDE_TOPOLOGY;
+    output.result.source_root = sourceRoot;
+    output.result.runtime_switch_performed = false;
+    if (result.ok && args.mode !== "plan") output.result.status = "side_by_side_build_verified";
+    output.audit.generation_topology = SIDE_BY_SIDE_TOPOLOGY;
+    output.audit.source_root_unchanged = sourceRoot;
+    output.audit.rollback_ready = false;
+    output.audit.rollback_model = "intact_v2_selection_requires_separate_controlled_acceptance";
+    atomicWriteJson(args.reportOut, output);
+    assertLockHeld();
+    return output;
+  } catch (error) {
+    atomicWriteJson(args.reportOut, {
+      result: { ok: false, status: "failed", generation_topology: SIDE_BY_SIDE_TOPOLOGY,
+        plan_sha256: plan?.plan_sha256 || null, error: error.message, runtime_switch_performed: false },
+    });
+    throw error;
+  }
+}
+
 export async function runObservationHistoryMigrationV3({
   argv = process.argv.slice(2),
   env = process.env,
   now = () => new Date().toISOString(),
   runLockedCommand = runCommandWithObservationsGlobalOperationLock,
+  sideBySideAdapterFactory = buildSideBySideR2Adapters,
 } = {}) {
   const args = parseObservationHistoryMigrationArgs(argv);
   if (args.help) return { help: true, text: usage() };
+  if (args.transition === "v2-to-v3" && ["plan", "migrate", "verify"].includes(args.mode)) {
+    return runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory: sideBySideAdapterFactory });
+  }
+  if (args.checkpointIn && ["rollback", "rollback-plan"].includes(args.mode) &&
+      readJsonFile(args.checkpointIn, "migration checkpoint")?.authority?.generation_topology === SIDE_BY_SIDE_TOPOLOGY) {
+    throw new Error("Side-by-side rollback selects intact v2; Dropbox restore and historical runtime deployment are not permitted for this checkpoint");
+  }
   if (args.mode === "migrate" && !args.checkpointIn && (!args.operatorAuthorityFile || !args.v2RuntimeRollbackRecord)) throw new Error("Fresh migration requires --operator-authority-file and --v2-runtime-rollback-record");
   if (args.mode === "migrate" && args.checkpointIn && !args.operatorAuthorityFile) throw new Error("Resume requires --operator-authority-file to distinguish immutable runtime pin from historical compatibility");
   if (args.mode !== "runtime-recoverability" && args.v2RuntimeRollbackRecord && !args.operatorAuthorityFile && readJsonFile(args.v2RuntimeRollbackRecord, "runtime evidence").schema_version === 2) throw new Error("Durable runtime evidence requires --operator-authority-file");

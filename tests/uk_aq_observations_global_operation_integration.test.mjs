@@ -461,16 +461,14 @@ test("v3 migrate --apply acquires the global lock before reading migration autho
   fs.writeFileSync(limitsPath, JSON.stringify(ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3));
   const argv = [
     "--mode", "migrate",
+    "--transition", "v2-to-v3",
     "--apply",
     "--writers-frozen",
     "--environment", "TEST",
     "--expected-bucket", "test-bucket",
     "--migration-run-id", "migration:test",
-    "--target-writer-git-sha", "0123456789abcdef",
+    "--target-writer-git-sha", "a".repeat(40),
     "--writer-limits-json", limitsPath,
-    "--dropbox-root", path.join(temporaryRoot, "missing-dropbox-authority"),
-    "--expected-inventory-root-sha256", h("a"),
-    "--expected-state-root-sha256", h("b"),
     "--expected-plan-sha256", h("c"),
     "--report-out", path.join(temporaryRoot, "report.json"),
     "--checkpoint-out", path.join(temporaryRoot, "checkpoint.json"),
@@ -496,10 +494,11 @@ test("v3 migrate --apply acquires the global lock before reading migration autho
     },
   });
   assert.deepEqual(result, { delegated: true, exitCode: 0 });
-  assert.equal(lockedOptions.owner, "observation_history_migration_v3");
+  assert.equal(lockedOptions.owner, "observation_history_migration_v2_to_v3");
   assert.equal(lockedOptions.runId, "migration:test");
   assert.equal(lockedOptions.databaseUrl, "postgresql://direct-session");
-  assert.deepEqual(lockedOptions.commandArgs.slice(1), argv);
+  assert.deepEqual(lockedOptions.commandArgs, [...process.execArgv,
+    fileURLToPath(new URL("../scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs", import.meta.url)), ...argv]);
 });
 
 test("v2 rollback --apply delegates the complete command to the same global lock", async (t) => {

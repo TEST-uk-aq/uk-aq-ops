@@ -2890,6 +2890,7 @@ function rebuildLegacyPreparedManifestObject(authorityUnit, record) {
 }
 
 function preparedUnitFromRecord(authorityUnit, record, {
+  sideBySide = false,
   allowLegacyRecoveryOrdering = false,
   legacyOriginalOrdering = false,
   includeV3Hierarchy = true,
@@ -2964,9 +2965,11 @@ function preparedUnitFromRecord(authorityUnit, record, {
           sha256: intent.sha256,
         })),
       });
+  // Side-by-side parent identities must survive sorted checkpoint/journal JSON.
+  // Reuse property order from the authenticated physical child body.
   const targetManifestPayload = legacyOriginalOrdering
     ? targetManifestObject.payload
-    : record.target_manifest;
+    : sideBySide ? parsedManifest : record.target_manifest;
   const hierarchy = includeV3Hierarchy ? buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
     metadata: record.target_metadata,
     canonicalManifest: canonicalManifestDescriptor(
@@ -3004,6 +3007,7 @@ function reconstructPreparedCanonicalPlan({
   const units = authority.units.map((unit, index) => {
     const preparedUnit = preparedUnitFromRecord(unit, prepared[unit.unit_id], {
       allowLegacyRecoveryOrdering, legacyOriginalOrdering, includeV3Hierarchy,
+      sideBySide: authority.generation_topology === SIDE_BY_SIDE_TOPOLOGY,
     });
     onProgress?.({ phase: "prepared_units", completed: index + 1, total: authority.units.length });
     return preparedUnit;
@@ -3486,7 +3490,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     throw new Error("Resume verification requires matching authenticated replay state");
   }
   const legacyAuthority = validateLegacyRecoveryOrderingAuthority({
-    checkpoint, recoveryAuthority, allowLegacyRecoveryOrdering: Boolean(authenticatedResume),
+    checkpoint, recoveryAuthority, allowLegacyRecoveryOrdering: false,
   });
   if (legacyAuthority.eligible) throw new Error("Historical in-place recovery ordering cannot authorize side-by-side migration");
   await publishSideBySideBindings({ plan, checkpoint, adapters });
@@ -3494,7 +3498,7 @@ export async function executeObservationHistoryV3MigrationPlan({
   const publishedParquet = authenticatedResume ? plan.units.flatMap((unit) => {
     const record = checkpoint.prepared_units[unit.unit_id];
     return record?.files_published === true
-      ? preparedUnitFromRecord(unit, record, { allowLegacyRecoveryOrdering, includeV3Hierarchy: false }).target_file_intents
+      ? preparedUnitFromRecord(unit, record, { sideBySide: true, allowLegacyRecoveryOrdering, includeV3Hierarchy: false }).target_file_intents
       : [];
   }) : [];
   const reverifiedParquet = await reverifyCompletedMigrationObjects({
@@ -3612,6 +3616,7 @@ export async function executeObservationHistoryV3MigrationPlan({
       });
     }
     const preparedUnit = preparedUnitFromRecord(authorityUnit, record, {
+      sideBySide: true,
       allowLegacyRecoveryOrdering,
       // Published authenticated units have already passed exact Parquet reuse.
       // Retain full metadata/hierarchy validation before any new file publication.
@@ -4336,7 +4341,7 @@ function reconcileCompletedCanonicalHistory({
   checkpoint, currentCanonical, legacyAuthority, onHistoricalProgress = null,
 }) {
   const currentKeys = new Set(currentCanonical.canonicalObjects.map((entry) => entry.key));
-  const canonicalPrefix = `${checkpoint.authority.inventory.observations_prefix}/`;
+  const canonicalPrefix = `${checkpoint.authority.target_observations_prefix || checkpoint.authority.inventory.observations_prefix}/`;
   for (const key of Object.keys(checkpoint.completed_objects || {})) {
     if (key.startsWith(canonicalPrefix) && key.endsWith(".json") && !currentKeys.has(key)) {
       throw new Error(`checkpoint_identity_mismatch:current_canonical_identity_not_generated:${key}`);
@@ -4391,8 +4396,10 @@ export function buildObservationHistoryV3RerunVerificationPlan({
   progressEnabled = false,
 }) {
   const authority = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+  const sideBySide = authority.generation_topology === SIDE_BY_SIDE_TOPOLOGY;
+  if (sideBySide) assertSideBySideMigrationPlan(authority);
   const legacyAuthority = validateLegacyRecoveryOrderingAuthority({
-    checkpoint, allowLegacyRecoveryOrdering, recoveryAuthority,
+    checkpoint, allowLegacyRecoveryOrdering: sideBySide ? false : allowLegacyRecoveryOrdering, recoveryAuthority,
   });
   const onProgress = recoveredPlanProgress(progressEnabled);
   let currentCanonical;
@@ -4427,12 +4434,13 @@ export function buildObservationHistoryV3RerunVerificationPlan({
   const pinnedPlan = completePreparedV3Plan({ checkpoint, authority, ...currentCanonical, onProgress });
   if (
     checkpoint?.migration_run_id !== pinnedPlan.migration_run_id ||
-    checkpoint?.backup_gate?.verified !== true ||
-    checkpoint?.rollback_preflight?.verified !== true ||
+    (!sideBySide && (checkpoint?.backup_gate?.verified !== true ||
+      checkpoint?.rollback_preflight?.verified !== true)) ||
     checkpoint?.full_verification_complete !== true
   ) {
     throw new Error(
-      "Rerun verification requires a matching completed checkpoint with verified pre-state backup evidence",
+      sideBySide ? "Rerun verification requires a matching completed side-by-side checkpoint"
+        : "Rerun verification requires a matching completed checkpoint with verified pre-state backup evidence",
     );
   }
   if (
@@ -5107,7 +5115,7 @@ export async function verifySideBySideSourceRoot({ plan, getObject }) {
   return Object.freeze({ key: expected.key, byte_size: expected.byte_size, sha256: expected.sha256, unchanged: true });
 }
 
-function guardSideBySideMigrationAdapters(plan, adapters) {
+export function guardSideBySideMigrationAdapters(plan, adapters) {
   const target = assertSideBySideMigrationPlan(plan);
   if (typeof adapters?.assertLockHeld !== "function") throw new Error("Side-by-side migration requires supervised global lock ownership");
   const guarded = { ...adapters };
@@ -5215,7 +5223,12 @@ export async function buildObservationHistorySideBySideMigrationPlan({
       decode_profile: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID, writer_limits: writerLimits },
     inventory, units, bindings, empty_source_connectors: inventory.empty_source_connectors,
     empty_source_connector_count: inventory.empty_source_connectors.length,
-    writer_freeze_plan: deriveObservationHistoryV3WriterFreezePlan({ repositoryRoot }),
+    writer_freeze_plan: (() => {
+      const freeze = deriveObservationHistoryV3WriterFreezePlan({ repositoryRoot });
+      return { ...freeze, entries: freeze.entries.map((entry) => ({
+        ...entry, resume_only_after: "separately_authorized_intact_v2_resume_or_generation_switch",
+      })) };
+    })(),
     canonical_publication_objects: [], v3_latest: null, v3_publication_plan: null,
     v3_index_root: target.observations_timeseries_index_prefix,
     v3_latest_key: target.observations_timeseries_latest_key,
