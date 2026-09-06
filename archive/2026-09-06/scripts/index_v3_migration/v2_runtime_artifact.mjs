@@ -139,34 +139,19 @@ export async function downloadRuntimeModules(response) {
   return {main_module, modules:modules.sort((a,b)=>a.name.localeCompare(b.name))};
 }
 
-export function readRuntimePackage(component, repositoryRoot, runtimeEvidencePath) {
+export function readRuntimePackage(component, repositoryRoot) {
   const location = component.recovery_package.path;
-  requireThat(typeof location === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(location) && !location.includes('..'), 'Runtime package path must be a safe relative basename');
-  requireThat(typeof runtimeEvidencePath === 'string' && path.isAbsolute(runtimeEvidencePath), 'An explicit absolute runtime evidence path is required to resolve packages');
-  // During capture the record has not been published yet. Every existing record
-  // resolves through its real file location, including an evidence-file symlink.
-  const directory = fs.existsSync(runtimeEvidencePath)
-    ? path.dirname(fs.realpathSync(runtimeEvidencePath))
-    : fs.realpathSync(path.dirname(runtimeEvidencePath));
-  const real = fs.realpathSync(path.join(directory, location));
-  const root = fs.realpathSync(repositoryRoot);
-  requireThat(path.dirname(real) === directory, 'Runtime package escapes its evidence directory');
-  requireThat(real !== root && !real.startsWith(root + path.sep), 'Recovery package must be outside the Git working tree');
-  const fd = fs.openSync(real, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-  let bytes;
-  try {
-    const stat = fs.fstatSync(fd);
-    requireThat(stat.isFile() && stat.size <= 48 * 1024 * 1024, 'Recovery package must be a bounded regular file');
-    bytes = fs.readFileSync(fd);
-    requireThat(bytes.length <= 48 * 1024 * 1024, 'Recovery package exceeds size limit');
-  } finally { fs.closeSync(fd); }
+  requireThat(path.isAbsolute(location), 'Runtime package path must be absolute');
+  const real = fs.realpathSync(location), root = fs.realpathSync(repositoryRoot);
+  requireThat(real !== root && !real.startsWith(root + path.sep) && fs.statSync(real).size <= 48 * 1024 * 1024, 'Recovery package must be bounded and outside the Git working tree');
+  const bytes = fs.readFileSync(real);
   requireThat(runtimeSha(bytes) === component.recovery_package.sha256, 'Recovery package SHA-256 mismatch');
   const pkg = validateRuntimePackage(JSON.parse(bytes));
   requireThat(runtimeSha(runtimeJson(pkg.descriptor)) === component.runtime_descriptor_sha256, 'Runtime descriptor identity mismatch');
   return pkg;
 }
 
-export function validateDurableRuntimeEvidence(evidence, repositoryRoot, runtimeEvidencePath) {
+export function validateDurableRuntimeEvidence(evidence, repositoryRoot) {
   keys(evidence, ['schema_version','kind','payload','payload_sha256'], 'Runtime evidence');
   requireThat(evidence.schema_version === 2 && evidence.kind === RUNTIME_KIND && runtimeSha(runtimeJson(evidence.payload)) === evidence.payload_sha256, 'Invalid durable runtime evidence envelope');
   const p = evidence.payload;
@@ -192,18 +177,18 @@ export function validateDurableRuntimeEvidence(evidence, repositoryRoot, runtime
     requireThat(git(['rev-parse',`${c.git_commit_sha}^{tree}`]).toString().trim() === c.provenance.git_tree_sha, 'Pinned source tree mismatch');
     requireThat(runtimeSha(git(['cat-file','blob',`${c.git_commit_sha}:${expectedWorkflow}`])) === c.provenance.workflow_sha256, 'Pinned workflow blob mismatch');
     requireThat(runtimeSha(git(['cat-file','blob',`${c.git_commit_sha}:package-lock.json`])) === c.provenance.package_lock_sha256, 'Pinned package lock mismatch');
-    const pkg = readRuntimePackage(c, repositoryRoot, runtimeEvidencePath);
+    const pkg = readRuntimePackage(c, repositoryRoot);
     const classification = workflowBindingSources(git(['cat-file','blob',`${c.git_commit_sha}:${expectedWorkflow}`]).toString());
     const publicOpaque = pkg.descriptor.bindings.filter(b=>b.type === 'secret_text' && !classification.privateNames.has(b.name));
     requireThat(publicOpaque.every(b=>classification.publicNames.has(b.name)) && runtimeJson(publicOpaque.map(b=>b.name).sort()) === runtimeJson(pkg.resolved_nonsecret_bindings.map(b=>b.name).sort()), 'Public opaque bindings lack exact pinned configuration or contain private values');
   }
   const observations = p.components.find(c=>c.role === 'stable_observations_worker');
-  const observationsBindings = readRuntimePackage(observations, repositoryRoot, runtimeEvidencePath).descriptor.bindings;
+  const observationsBindings = readRuntimePackage(observations, repositoryRoot).descriptor.bindings;
   const historyBinding = observationsBindings.find(b=>b.name === 'UK_AQ_R2_HISTORY_VERSION');
   requireThat(historyBinding?.type === 'plain_text' && historyBinding.text === 'v2', 'Captured observations runtime does not explicitly select v2');
   const cache = p.components.find(c=>c.role === 'cache_worker');
   const station = p.components.find(c=>c.role === 'stable_station_worker');
-  const bindings = readRuntimePackage(cache, repositoryRoot, runtimeEvidencePath).descriptor.bindings.filter(b=>b.name === 'STATION_HISTORY');
+  const bindings = readRuntimePackage(cache, repositoryRoot).descriptor.bindings.filter(b=>b.name === 'STATION_HISTORY');
   requireThat(bindings.length === 1 && bindings[0].type === 'service' && bindings[0].service === station.worker_name, 'Captured cache does not bind stable station history');
   return {ok:true, kind:evidence.kind, payload_sha256:evidence.payload_sha256, environment:p.environment, repository:p.repository, branch:p.branch};
 }

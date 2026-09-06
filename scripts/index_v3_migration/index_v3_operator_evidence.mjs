@@ -442,8 +442,8 @@ function validateRollbackPayload(payload, { repositoryRoot }) {
   });
 }
 
-export function validateIndexV3OperatorEvidence({ evidence, repositoryRoot, planReport = null }) {
-  if (evidence?.schema_version === 2) return validateDurableRuntimeEvidence(evidence, path.resolve(repositoryRoot));
+export function validateIndexV3OperatorEvidence({ evidence, repositoryRoot, planReport = null, runtimeEvidencePath }) {
+  if (evidence?.schema_version === 2) return validateDurableRuntimeEvidence(evidence, path.resolve(repositoryRoot), runtimeEvidencePath);
   exactKeys(evidence, ["schema_version", "kind", "payload", "payload_sha256"], "operator evidence envelope");
   if (evidence.schema_version !== 1 || !KINDS.has(evidence.kind)) throw new Error("operator evidence schema/kind is invalid");
   plain(evidence.payload, "operator evidence payload");
@@ -508,7 +508,7 @@ export function main(argv = process.argv.slice(2)) {
   }
   if (!args.evidence) throw new Error("validate requires --evidence");
   const evidence = readJson(args.evidence, "operator evidence");
-  process.stdout.write(`${JSON.stringify(validateIndexV3OperatorEvidence({ evidence, repositoryRoot: args.repositoryRoot, planReport }))}\n`);
+  process.stdout.write(`${JSON.stringify(validateIndexV3OperatorEvidence({ evidence, repositoryRoot: args.repositoryRoot, planReport, runtimeEvidencePath: path.resolve(args.evidence) }))}\n`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) main();

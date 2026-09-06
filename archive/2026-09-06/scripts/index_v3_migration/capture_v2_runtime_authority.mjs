@@ -54,8 +54,8 @@ async function context(environment,env) {
   for(const name of ['UK_AQ_R2_HISTORY_VERSION','UK_AQ_R2_HISTORY_INDEX_VERSION']) if(variable(name)!=='v2') throw new Error(`GitHub ${name} must be v2`);
   return {identity,variable,credentials:cloudflareCaptureCredentials(env)};
 }
-export async function verifyCurrentRuntimeEvidence(evidence, environment, env=process.env, pinnedAuthority=null, runtimeEvidencePath) {
-  validateDurableRuntimeEvidence(evidence,root,runtimeEvidencePath);
+export async function verifyCurrentRuntimeEvidence(evidence, environment, env=process.env, pinnedAuthority=null) {
+  validateDurableRuntimeEvidence(evidence,root);
   const {identity,variable,credentials}=await context(environment,env), p=evidence.payload;
   if(p.environment!==environment || p.repository!==identity.repository || p.branch!==identity.branch) throw new Error('Fresh runtime evidence repository/default HEAD mismatch');
   if(pinnedAuthority) {
@@ -67,8 +67,8 @@ export async function verifyCurrentRuntimeEvidence(evidence, environment, env=pr
     const current=latestFullDeployment(await runtimeGet(auth,c.worker_name,'deployments'));
     if(current.id!==c.deployment.deployment_id || current.versions[0].version_id!==c.deployment.version_id) throw new Error('Stable runtime changed since capture; do not repin a started migration');
     const detail=await runtimeGet(auth,c.worker_name,`versions/${c.deployment.version_id}`);
-    if(detail.id!==c.deployment.version_id || runtimeJson(runtimeDescriptor(detail))!==runtimeJson(readRuntimePackage(c,root,runtimeEvidencePath).descriptor)) throw new Error('Current runtime descriptor differs from captured authority');
-    const pkg=readRuntimePackage(c,root,runtimeEvidencePath);
+    if(detail.id!==c.deployment.version_id || runtimeJson(runtimeDescriptor(detail))!==runtimeJson(readRuntimePackage(c,root).descriptor)) throw new Error('Current runtime descriptor differs from captured authority');
+    const pkg=readRuntimePackage(c,root);
     const content=await downloadRuntimeModules(await runtimeGet(auth,c.worker_name,`content/v2?version=${c.deployment.version_id}`,{raw:true}));
     if(runtimeJson(content)!==runtimeJson({main_module:pkg.main_module,modules:pkg.modules})) throw new Error('Captured module bytes differ from the exact current version');
     const runId=c.provenance.workflow_run_id;
@@ -84,14 +84,14 @@ export async function verifyCurrentRuntimeEvidence(evidence, environment, env=pr
 }
 export async function main(argv=process.argv.slice(2),env=process.env) {
   const [mode,...rest]=argv;
-  if(mode==='--help') {process.stdout.write('capture-v2-runtime-rollback-authority --environment TEST|LIVE --work-dir DIR --out FILE --operator NAME --confirm-frozen --secret-binding-policy preserve_current_required_bindings --observations-run-id ID --station-run-id ID --cache-run-id ID\nverify-current --environment TEST|LIVE --evidence FILE\nPackages are safe basenames resolved beside the runtime evidence file; retain the entire directory.\n');return;}
+  if(mode==='--help') {process.stdout.write('capture-v2-runtime-rollback-authority --environment TEST|LIVE --work-dir DIR --out FILE --operator NAME --confirm-frozen --secret-binding-policy preserve_current_required_bindings --observations-run-id ID --station-run-id ID --cache-run-id ID\nverify-current --environment TEST|LIVE --evidence FILE\n');return;}
   if(!['capture-v2-runtime-rollback-authority','verify-current'].includes(mode)) throw new Error('Unknown runtime authority operation');
   const args=options(rest);
   if(mode==='verify-current') {
     const bytes=fs.readFileSync(args.evidence);
     const authority=args['operator-authority-file']?JSON.parse(fs.readFileSync(args['operator-authority-file'])):null;
     if(authority) assertRuntimeRecordPin(authority,bytes);
-    const result=await verifyCurrentRuntimeEvidence(JSON.parse(bytes),args.environment,env,authority,path.resolve(args.evidence));
+    const result=await verifyCurrentRuntimeEvidence(JSON.parse(bytes),args.environment,env,authority);
     process.stdout.write(JSON.stringify(result)+'\n');return;
   }
   if(!args.confirmFrozen || !args.operator?.trim()) throw new Error('Capture requires --operator and --confirm-frozen covering every manual and scheduled mutation class until cutover or completed rollback');
@@ -123,11 +123,11 @@ export async function main(argv=process.argv.slice(2),env=process.env) {
     if(fs.existsSync(packagePath)) {if(runtimeSha(fs.readFileSync(packagePath))!==digest) throw new Error('Existing package identity mismatch');}
     else publishRuntimeFile(packagePath,bytes);
     const commit=workflowRun.head_sha;
-    p.components.push({role,worker_name:worker,account_id:auth.accountId,git_commit_sha:commit,deployment:{version_id:version,deployment_id:deployment.id,captured_by:'version_specific_cloudflare_get'},provenance:{workflow_run_id:runId,workflow_path:workflow,workflow_sha256:runtimeSha(gitBytes(commit,workflow)),git_tree_sha:run('git',['rev-parse',`${commit}^{tree}`]),package_lock_sha256:runtimeSha(gitBytes(commit,'package-lock.json'))},runtime_descriptor_sha256:runtimeSha(runtimeJson(pkg.descriptor)),recovery_package:{path:path.basename(packagePath),sha256:digest}});
+    p.components.push({role,worker_name:worker,account_id:auth.accountId,git_commit_sha:commit,deployment:{version_id:version,deployment_id:deployment.id,captured_by:'version_specific_cloudflare_get'},provenance:{workflow_run_id:runId,workflow_path:workflow,workflow_sha256:runtimeSha(gitBytes(commit,workflow)),git_tree_sha:run('git',['rev-parse',`${commit}^{tree}`]),package_lock_sha256:runtimeSha(gitBytes(commit,'package-lock.json'))},runtime_descriptor_sha256:runtimeSha(runtimeJson(pkg.descriptor)),recovery_package:{path:packagePath,sha256:digest}});
   });
   p.recorded_at_utc=new Date().toISOString();
   const evidence={schema_version:2,kind:RUNTIME_KIND,payload:p,payload_sha256:runtimeSha(runtimeJson(p))};
-  await verifyCurrentRuntimeEvidence(evidence,args.environment,env,null,destination);
+  await verifyCurrentRuntimeEvidence(evidence,args.environment,env);
   publishRuntimeFile(destination,runtimeJson(evidence));
   process.stdout.write(JSON.stringify({ok:true,out:destination,payload_sha256:evidence.payload_sha256,mutation_calls:0,scheduler_state_proved:false})+'\n');
 }

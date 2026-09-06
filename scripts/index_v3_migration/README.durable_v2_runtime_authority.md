@@ -55,7 +55,20 @@ Runtime record schema 2 contains:
 - Git commit/tree, workflow blob and package-lock hashes. The Git tree identifies
   all source/config files; recovery uploads the captured deployed bytes without
   executing a build, resolving dependencies or using today's workflow variables.
-- Per-component absolute package path, package SHA-256, and descriptor SHA-256.
+- Per-component relative package basename, package SHA-256, and descriptor SHA-256.
+
+The evidence file and its three package files form one portable recovery bundle.
+Retain/back up the complete evidence directory together with its operator
+authority. Package references are basenames resolved only beside the real runtime
+evidence file, using explicit `runtimeEvidencePath` context throughout validation,
+current-runtime verification, admission and restoration. Absolute machine paths
+are not authority, and no directory search or missing-file fallback is allowed.
+Empty names, absolute paths, separators/traversal, symlink escapes, non-regular
+or oversized files, locations inside the Git working tree and SHA mismatches all
+fail closed. Moving/copying the complete directory requires no evidence edits;
+the physical runtime-record SHA pinned by operator authority remains identical.
+Schema 2 is retained because no accepted schema-2 capture predates this fix;
+absolute-path schema-2 records are rejected. Schema-1 records are unaffected.
 
 Each secret-free package contains every version-specific downloaded module with
 its MIME type, byte SHA-256 and base64 bytes, the exact main entrypoint,
@@ -72,8 +85,10 @@ them as `plain_text` bindings. Masked, missing, conflicting or shell-interpreted
 values stop capture. Actual secrets are identified by the pinned workflow's
 `secrets.NAME` references; their values are never requested or recorded.
 
-The explicit artifact secret policy preserves the then-current required actual
-secret bindings. It does **not** prove historical secret-value equality. Operators
+The explicit artifact secret policy preserves the required actual secret
+bindings from the exact current stable version deployed at 100% when rollback
+admission runs. A newer uploaded but undeployed version is not the secret source.
+It does **not** prove historical secret-value equality. Operators
 who require historical secret values must not select this policy; immutable
 external secret-version authority would be needed for that different policy.
 There is no silent default. This policy never applies to schema-1 old evidence.
@@ -116,14 +131,43 @@ schema-2 evidence only, an unavailable UUID can report
 `deterministic_pinned_runtime_redeploy_available` when the complete pinned package
 and required current secret inventory validate.
 
-In a separately authorized real rollback, the executor uploads those module
-bytes and resolved settings directly through the version API. Only true secret
-bindings use explicit `inherit` entries with `bindings_inherit=strict`. It checks
-that no intervening upload changed inheritance provenance, verifies the new
-version's module bytes and descriptor, then deploys that new UUID to 100%.
+Admission reads deployment history, requires unambiguous latest chronology and
+one valid version at exactly 100%, and checks the true secret-name inventory on
+that deployed version. The result records
+`secret_inheritance_source_version_id` and
+`secret_inheritance_source_deployment_id`. These are recovery-attempt state;
+neither the immutable package nor the historical runtime evidence is rewritten.
+
+In a separately authorized real rollback, the executor revalidates the admitted
+deployment/version and required secret names before uploading anything. A changed
+deployment, including redeployment of the same version under a new deployment ID,
+fails before upload. Each true secret explicitly uses:
+
+```json
+{"name":"BINDING_NAME","type":"inherit","version_id":"ADMITTED_DEPLOYED_VERSION_ID"}
+```
+
+The version upload retains `bindings_inherit=strict`; resolved public literals
+are still sent as `plain_text`. No actual secret values are read or recorded,
+and historical secret-value equality is not claimed. The latest uploaded version
+is consulted only for creation chronology: the returned new version must be the
+next numbered version, match the returned UUID, and remain latest after upload.
+Physical module bytes, runtime configuration and resulting binding descriptors
+must match the pinned package before deployment. The executor checks both the
+admitted current deployment and latest uploaded UUID again immediately before
+deploying to 100%. Intervening uploads or deployment changes fail closed.
+
+Cloudflare's version/deployment APIs do not make these separate reads and the
+final deployment request one atomic operation. A change after the last read can
+only be exposed by later verification; explicit source `version_id` still prevents
+secret inheritance from silently switching to a newer upload. Real TEST acceptance
+must verify this API behavior and descriptor round-trip; local tests do not inspect
+secret values or prove their equality.
+
 `deployed_pinned_runtime_artifact` records the new UUID alongside the immutable
-historical UUID and pinned package identity. This needs no worktree switch,
-checkout, package installation, rebuild or Cloudflare dry-run assumption.
+historical UUID, pinned package identity and admitted secret-source identities.
+This needs no worktree switch, checkout, package installation, rebuild or
+Cloudflare dry-run assumption.
 
 Observations -> station -> GitHub v2 authority -> cache order is retained, as are
 canonical-v2 restoration, required index_v2 rebuild/completeness verification,
@@ -153,8 +197,10 @@ new artifact route cannot authorize it from Git/timestamp proximity.
 
 Local focused tests exercise immutable pins, legacy distinction, successful
 read-only capture with mocked GitHub/Cloudflare, no-overwrite publication,
-package tampering, public-versus-private bindings, expiry admission, strict
-artifact upload without deployment, inheritance races, logging, and the existing
+portable directory copy/move with unchanged evidence bytes, traversal/symlink
+rejection, package tampering, public-versus-private bindings, expiry admission,
+explicit deployed-version inheritance despite newer undeployed versions, upload
+and deployment races, read-only diagnostics, logging, and the existing
 rollback pre-mutation/index verification boundaries. These are structural/local
 checks, not a real Cloudflare package capture or redeployment.
 

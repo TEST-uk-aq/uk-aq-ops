@@ -5,7 +5,7 @@ import fs from "node:fs";
 import { validateDurableRuntimeEvidence, readRuntimePackage, runtimeDescriptor, runtimeJson, assertRuntimeRecordPin } from "../index_v3_migration/v2_runtime_artifact.mjs";
 import { cloudflareCaptureCredentials } from "../index_v3_migration/index_v3_capture_operator_evidence.mjs";
 import { verifyCurrentRuntimeEvidence } from "../index_v3_migration/capture_v2_runtime_authority.mjs";
-import { inspectArtifactRecovery, uploadPinnedRuntime, verifyArtifactRuntime, workerRuntimeRequest } from "../index_v3_migration/v2_runtime_recovery.mjs";
+import { inspectArtifactRecovery, uploadPinnedRuntime, verifyArtifactRuntime, workerRuntimeRequest, assertArtifactDeploymentReady } from "../index_v3_migration/v2_runtime_recovery.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1168,9 +1168,9 @@ function serviceBindingTarget(versionDetail, bindingName, label) {
   return bindings[0].service;
 }
 
-export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, env, apiGet = cloudflareWorkerApiGet, command = runRollbackCommand, apiRequest = workerRuntimeRequest }) {
+export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, runtimeEvidencePath, env, apiGet = cloudflareWorkerApiGet, command = runRollbackCommand, apiRequest = workerRuntimeRequest }) {
   const durable = rollbackEvidence.schema_version === 2;
-  if (durable) validateDurableRuntimeEvidence(rollbackEvidence, repositoryRoot);
+  if (durable) validateDurableRuntimeEvidence(rollbackEvidence, repositoryRoot, runtimeEvidencePath);
   const payload = rollbackEvidence.payload;
   const observations = rollbackComponent(payload, "stable_observations_worker");
   const station = rollbackComponent(payload, "stable_station_worker");
@@ -1217,11 +1217,12 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, e
       // descriptor. Git templates + dates cannot authorize another UUID or a
       // rebuild using today's substitutions/secrets/toolchain. Cache descriptor
       // equality also cannot prove opaque secret-value identity across versions.
-      if (durable && detail && runtimeJson(runtimeDescriptor(detail)) !== runtimeJson(readRuntimePackage(component, repositoryRoot).descriptor)) throw new Error("Pinned runtime descriptor differs from durable authority");
+      if (durable && detail && runtimeJson(runtimeDescriptor(detail)) !== runtimeJson(readRuntimePackage(component, repositoryRoot, runtimeEvidencePath).descriptor)) throw new Error("Pinned runtime descriptor differs from durable authority");
       let artifactAvailable = false;
+      let artifactRecovery = null;
       let artifactFailure = null;
       if (durable && !detail) {
-        try { await inspectArtifactRecovery({component, repositoryRoot, get}); artifactAvailable = true; }
+        try { artifactRecovery = await inspectArtifactRecovery({component, repositoryRoot, runtimeEvidencePath, get}); artifactAvailable = true; }
         catch (error) { artifactFailure = error.message; }
       }
       const viable = !durable && (component.role !== "cache_worker" || detail !== null) || detail !== null;
@@ -1233,6 +1234,10 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, e
         historical_version_id: versionId,
         selected_version_id: state === "unrecoverable" || artifactAvailable ? null : versionId,
         state,
+        ...(artifactRecovery ? {
+          secret_inheritance_source_version_id: artifactRecovery.secret_inheritance_source_version_id,
+          secret_inheritance_source_deployment_id: artifactRecovery.secret_inheritance_source_deployment_id,
+        } : {}),
         reason: state === "unrecoverable"
           ? artifactFailure || "Pinned Cloudflare version unavailable; no durable exact deployed bundle, resolved configuration/binding/secret identity and reproducible build provenance authorizes a replacement runtime. Stable name, timestamps and nearby workflow runs are insufficient."
           : artifactAvailable ? "Pinned physical module bytes and resolved configuration; explicit current-required-secret-binding policy" : "Exact immutable Cloudflare version identity",
@@ -1268,13 +1273,14 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, e
         let selected = admission.components.find(entry => entry.role === component.role);
         const artifactRoute = selected.state === "deterministic_pinned_runtime_redeploy_available";
         if (artifactRoute) {
-          const version = await uploadPinnedRuntime({component, repositoryRoot, get, request});
+          const version = await uploadPinnedRuntime({component, repositoryRoot, runtimeEvidencePath, source:selected, get, request});
           selected = {...selected, selected_version_id:version};
         }
         // Re-check before retaining a version; admission is not a stale-state shortcut.
         const current = await get(component, "deployments");
         let exact = false;
         try { currentFullDeploymentForVersion(current, selected.selected_version_id, component.role); exact = true; } catch { /* deploy only selected authority */ }
+        if (artifactRoute) await assertArtifactDeploymentReady({component,versionId:selected.selected_version_id,source:selected,get});
         if (!exact && durable) await request(component, "deployments", {method:"POST",body:JSON.stringify({strategy:"percentage",versions:[{version_id:selected.selected_version_id,percentage:100}]})});
         if (!exact && !durable) await command("npx", ["wrangler", "versions", "deploy", `${selected.selected_version_id}@100%`, "--name", component.worker_name, "-y"], {
           cwd: repositoryRoot, env: childEnvironment, label: `Restore pinned ${component.role}`,
@@ -1309,7 +1315,7 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, e
         const deployment = currentFullDeploymentForVersion(await get(component, "deployments"), selected.selected_version_id, selected.role);
         deploymentChecks.push(Object.freeze({ ...selected, version_id: selected.selected_version_id, deployment_id: deployment.id, percentage: 100 }));
       }
-      if (durable) for (const selected of dispositions) await verifyArtifactRuntime({component:components.find(c=>c.role===selected.role),versionId:selected.selected_version_id,repositoryRoot,get,request});
+      if (durable) for (const selected of dispositions) await verifyArtifactRuntime({component:components.find(c=>c.role===selected.role),versionId:selected.selected_version_id,repositoryRoot,runtimeEvidencePath,get,request});
       const selectedCacheVersionId = durable ? dispositions.find(c=>c.role === "cache_worker").selected_version_id : cacheVersionId;
       const cacheVersion = await get(cache, `versions/${encodeURIComponent(selectedCacheVersionId)}`);
       if (cacheVersion?.id !== selectedCacheVersionId || serviceBindingTarget(cacheVersion, "STATION_HISTORY", "Post-rollback cache version") !== station.worker_name) throw new Error("Post-rollback cache binding/version does not match selected pinned v2 authority");
@@ -1621,7 +1627,7 @@ export async function runObservationHistoryMigrationV3({
     const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
     if (!args.reportOut) throw new Error("runtime-recoverability requires --report-out");
     const rollbackEvidence = readJsonFile(args.v2RuntimeRollbackRecord, "v2 runtime rollback record");
-    const validated = validateIndexV3OperatorEvidence({ evidence: rollbackEvidence, repositoryRoot });
+    const validated = validateIndexV3OperatorEvidence({ evidence: rollbackEvidence, repositoryRoot, runtimeEvidencePath: path.resolve(args.v2RuntimeRollbackRecord) });
     if (validated.kind !== "uk_aq_index_v3_v2_runtime_rollback_record" ||
         validated.environment.toUpperCase() !== String(args.environment || "").toUpperCase() ||
         validated.environment.toUpperCase() !== String(env.UKAQ_ENV_NAME || "").toUpperCase()) {
@@ -1633,7 +1639,7 @@ export async function runObservationHistoryMigrationV3({
     if (identity.stdout.trim() !== validated.repository) throw new Error("Runtime recovery diagnostic repository mismatch");
     let result;
     try {
-      result = await v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, env }).checkV2RuntimeRecoverability();
+      result = await v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, runtimeEvidencePath: path.resolve(args.v2RuntimeRollbackRecord), env }).checkV2RuntimeRecoverability();
     } catch (error) {
       if (!error.runtimeRecoverability) throw error;
       result = { ...error.runtimeRecoverability, status: "unrecoverable", error: error.message };
@@ -1650,8 +1656,8 @@ export async function runObservationHistoryMigrationV3({
     for (const [key,value] of Object.entries(identities)) if (authority[key] !== value) throw new Error(`Runtime operator authority ${key} differs from historical migration identity`);
     if (!compatibility.legacy) {
       const record = JSON.parse(bytes);
-      validateIndexV3OperatorEvidence({evidence:record,repositoryRoot:path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")});
-      if (args.mode === "migrate" && args.transition === "v2-to-v3") await verifyCurrentRuntimeEvidence(record, args.environment, env, authority);
+      validateIndexV3OperatorEvidence({evidence:record,runtimeEvidencePath:path.resolve(args.v2RuntimeRollbackRecord),repositoryRoot:path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")});
+      if (args.mode === "migrate" && args.transition === "v2-to-v3") await verifyCurrentRuntimeEvidence(record, args.environment, env, authority, path.resolve(args.v2RuntimeRollbackRecord));
     }
   }
   if (args.mode === "migrate" && args.checkpointIn) {
@@ -1724,6 +1730,7 @@ export async function runObservationHistoryMigrationV3({
     const validation = validateIndexV3OperatorEvidence({
       evidence: v2RuntimeRollbackEvidence,
       repositoryRoot,
+      runtimeEvidencePath: path.resolve(args.v2RuntimeRollbackRecord),
     });
     if (
       validation.environment.toUpperCase() !== args.environment.toUpperCase() ||
@@ -1851,6 +1858,7 @@ export async function runObservationHistoryMigrationV3({
       ? v2RuntimeAuthorityAdapters({
           rollbackEvidence: v2RuntimeRollbackEvidence,
           repositoryRoot,
+          runtimeEvidencePath: path.resolve(args.v2RuntimeRollbackRecord),
           env,
         })
       : null,
