@@ -3410,6 +3410,7 @@ async function writeObservationV2ConnectorManifest({
     const manifestStartedAtMs = Date.now();
     await putAndVerifyR2ObjectWithSha256({
       r2: runtime.r2,
+      requireStoredByteSize: false,
       intent: {
         key: pollutantManifestKey,
         body: Buffer.from(JSON.stringify(pollutantManifest, null, 2), "utf8"),
@@ -3447,6 +3448,7 @@ async function writeObservationV2ConnectorManifest({
   const connectorManifestStartedAtMs = Date.now();
   await putAndVerifyR2ObjectWithSha256({
     r2: runtime.r2,
+    requireStoredByteSize: false,
     intent: {
       key: connectorManifestKey,
       body: Buffer.from(JSON.stringify(connectorManifest, null, 2), "utf8"),
@@ -3612,6 +3614,7 @@ async function publishObservationV2Day({ client, runtime, dayUtc, publishedCandi
 
       await putAndVerifyR2ObjectWithSha256({
         r2: runtime.r2,
+        requireStoredByteSize: false,
         intent: {
           key: dayManifestKey,
           body: Buffer.from(JSON.stringify(dayManifest, null, 2), "utf8"),
@@ -6238,13 +6241,13 @@ export async function runPhaseBBackup({
               history_done: false,
               reason: "aggregate_day_finalization_failed",
             });
-            summary.aggregate_day_failures.push({ day_utc: dayUtc, error: message });
             if (error instanceof PhaseBHistoryBudgetExhaustedError) {
               stopPhaseBForBudget(summary, runtime, {
                 operation: error.operation || "day_finalization",
               });
               break;
             }
+            summary.aggregate_day_failures.push({ day_utc: dayUtc, error: message });
           }
         }
       } catch (error) {

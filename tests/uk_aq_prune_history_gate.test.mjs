@@ -18,6 +18,7 @@ import {
 import * as phaseBHistoryModule from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
   executePruneDaily,
+  reportPruneDailyError,
   filterBucketsByConnectorHistoryGate,
   runPruneForTest,
 } from "../workers/uk_aq_prune_daily/server.mjs";
@@ -988,6 +989,9 @@ test("top-level stopped-budget path skips every downstream adapter, finishes tas
   const stoppedPhaseB = {
     enabled: true,
     run_id: "stopped-run",
+    failed_candidates: 0,
+    failures: [],
+    aggregate_day_failures: [],
     status: "stopped_budget",
     stopped_for_budget: true,
   };
@@ -1030,6 +1034,47 @@ test("top-level stopped-budget path skips every downstream adapter, finishes tas
   assert.equal(jobResult.ok, true);
   assert.equal(reportPayload.ok, true);
   assert.equal(reportPayload.summary.phase_b_history.status, "stopped_budget");
+});
+
+test("real Phase B failures override budget stops and reach the job error report before downstream deletion", async (t) => {
+  // Exercise the real error-report formatter without contacting an external service.
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("external access disabled in local test"); });
+  const config = { dryRun: false, maxHoursPerRun: 24, ingestDbRetentionDays: 5, phaseB: { enabled: true } };
+  for (const evidence of [
+    { failed_candidates: 20, failures: [{ day_utc: "2026-08-27", connector_id: 1, error: "Checksum-aware R2 byte-size verification unavailable: manifest.json" }] },
+    { failures: [{ error: "connector publication failed" }] },
+    { aggregate_day_failures: [{ day_utc: "2026-08-27", error: "global finalization failed" }] },
+    { error_count: 1 },
+  ]) {
+    for (const status of ["stopped_budget", "completed"]) {
+      const phaseB = { enabled: true, run_id: "failed-phase-b", status, failed_candidates: 0, failures: [], aggregate_day_failures: [], ...evidence };
+      let pruneCalls = 0, lateCalls = 0, exitCode = null, report = null, healthFailure = null;
+      const result = await runPruneDailyJob({
+        env: {}, buildRunConfigAdapter: () => config,
+        executePruneDailyAdapter: () => executePruneDaily(config, {
+          runPhaseARecent: async () => ({ enabled: true }),
+          runPhaseBBackup: async () => phaseB,
+          runPruneSingleWindow: async () => { pruneCalls++; },
+          runLateArrivalCleanup: async () => { lateCalls++; },
+          withDailyTaskRun: async (input, fn) => {
+            try { return await fn(); }
+            catch (error) { healthFailure = input.buildFailedSummary(error); throw error; }
+          },
+        }),
+        reportPruneDailyErrorAdapter: reportPruneDailyError,
+        writeReportAdapter: async payload => { report = payload; },
+        setExitCode: code => { exitCode = code; },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(exitCode, 1);
+      assert.equal(pruneCalls, 0); assert.equal(lateCalls, 0);
+      assert.equal(report.summary.deletion_attempted, false);
+      assert.deepEqual(report.summary.phase_b_history, phaseB);
+      assert.deepEqual(healthFailure.phase_b_history, phaseB);
+      assert.equal(report.summary.normal_prune.reason, "phase_b_failed");
+      assert.equal(report.summary.late_arrival.reason, "phase_b_failed");
+    }
+  }
 });
 
 test("completed Phase B proceeds directly to normal prune and late-arrival stages", async () => {

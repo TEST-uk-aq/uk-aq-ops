@@ -73,13 +73,13 @@ test("Prune preserves parent-linked opaque children but keeps active hash metada
   }), /observation_content_hash must be lower-case SHA-256/);
 });
 
-test("Prune publishes canonical v2 bytes and complete pollutant children then verifies targeted v2 index evidence", async () => {
+test("Prune publishes canonical v2 bytes and complete pollutant children with absent JSON HEAD sizes then verifies targeted v2 index evidence", async () => {
   const dayUtc = "2026-08-18", connectorId = 7;
   const objects = new Map();
   let parquetGets = 0, checkpoints = 0;
   const r2 = { adapter: {
     putObject: async ({key, body}) => { objects.set(key, Buffer.from(body)); return {bytes: body.length}; },
-    headObject: async ({key}) => ({exists: objects.has(key), bytes: objects.get(key)?.length, sha256: objects.has(key) ? sha256Hex(objects.get(key)) : null}),
+    headObject: async ({key}) => ({exists: objects.has(key), bytes: key.endsWith(".json") ? null : objects.get(key)?.length, sha256: objects.has(key) ? sha256Hex(objects.get(key)) : null}),
     getObject: async ({key}) => {
       if (key.endsWith('.parquet')) parquetGets++;
       if (!objects.has(key)) throw Object.assign(new Error("missing"), {status:404});

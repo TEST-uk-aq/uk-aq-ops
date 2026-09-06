@@ -2716,32 +2716,6 @@ async function runPrune(config, adapters = {}) {
     logStructured,
     runId: phaseBRunId,
   });
-  // Budget exhaustion never erases failures recorded earlier in Phase B.
-  const phaseBFailed = Number(phaseBHistorySummary?.failed_candidates || 0) > 0
-    || (phaseBHistorySummary?.failures?.length || 0) > 0
-    || (phaseBHistorySummary?.aggregate_day_failures?.length || 0) > 0
-    || Number(phaseBHistorySummary?.error_count || 0) > 0
-    || phaseBHistorySummary?.ok === false
-    || phaseBHistorySummary?.status === "failed";
-  if (phaseBFailed) {
-    const error = new Error(
-      `Prune Daily Phase B failed: ${Number(phaseBHistorySummary.failed_candidates || 0)} failed candidates; `
-      + `${phaseBHistorySummary.aggregate_day_failures?.length || 0} aggregate day failures; `
-      + `status=${phaseBHistorySummary.status || "unknown"}. Downstream deletion skipped.`,
-    );
-    error.code = "UK_AQ_PRUNE_PHASE_B_FAILED";
-    error.prune_summary = {
-      mode: config.dryRun ? "dry-run" : "delete",
-      reason: "phase_b_failed",
-      deletion_attempted: false,
-      normal_prune: { skipped: true, reason: "phase_b_failed", deletion_attempted: false },
-      late_arrival: { skipped: true, reason: "phase_b_failed", deletion_attempted: false },
-      phase_a_recent: phaseARecentSummary,
-      phase_b_history: phaseBHistorySummary,
-    };
-    logStructured("ERROR", "ingestdb_prune_stopped_after_phase_b_failure", error.prune_summary);
-    throw error;
-  }
   if (phaseBHistorySummary?.enabled === true && phaseBHistorySummary?.status === "stopped_budget") {
     const overallWindow = buildWindow(
       config.maxHoursPerRun,
@@ -2897,7 +2871,6 @@ export async function executePruneDaily(config, adapters = {}) {
         phase_b_enabled: Boolean(config.phaseB?.enabled),
       },
       buildFinishedSummary: compactPruneHealthSummary,
-      buildFailedSummary: (error) => error?.prune_summary || {},
     },
     () => runPrune(config, adapters),
   );
@@ -2918,7 +2891,6 @@ export async function reportPruneDailyError(error, context = {}) {
     message,
     stack,
     context,
-    ...(error?.prune_summary ? { summary: error.prune_summary } : {}),
   };
 
   const dropboxResult = await (async () => {
@@ -2947,7 +2919,6 @@ export async function reportPruneDailyError(error, context = {}) {
   });
 
   return {
-    ...(error?.prune_summary ? { summary: error.prune_summary } : {}),
     error_id: errorId,
     dropbox_uploaded: Boolean(dropboxResult.uploaded),
     dropbox_path: dropboxResult.dropbox_path || null,
