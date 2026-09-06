@@ -2,6 +2,10 @@
 import { runOperatorCommand, createOperatorProgress, withOperatorPhase, superviseOperatorInvocation, finishOperatorProgress } from "../index_v3_migration/operator_execution.mjs";
 
 import fs from "node:fs";
+import { validateDurableRuntimeEvidence, readRuntimePackage, runtimeDescriptor, runtimeJson, assertRuntimeRecordPin } from "../index_v3_migration/v2_runtime_artifact.mjs";
+import { cloudflareCaptureCredentials } from "../index_v3_migration/index_v3_capture_operator_evidence.mjs";
+import { verifyCurrentRuntimeEvidence } from "../index_v3_migration/capture_v2_runtime_authority.mjs";
+import { inspectArtifactRecovery, uploadPinnedRuntime, verifyArtifactRuntime, workerRuntimeRequest } from "../index_v3_migration/v2_runtime_recovery.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -99,7 +103,8 @@ function usage() {
     "  --apply                  Explicitly permit the selected external mutation",
     "  --writers-frozen         Confirm every planner-listed writer is paused",
     "  --checkpoint-out <path>  Required for migrate; atomically updated after each object",
-    "  --v2-runtime-rollback-record <path>  Required for rollback authority restoration",
+    "  --v2-runtime-rollback-record <path>  Required for fresh migration and rollback; pinned by new authority",
+    "  --operator-authority-file <path>    Required for migrate/resume and all schema-2 runtime evidence use",
     "",
     "  --publication-concurrency <1..16>  Concurrent v3 publications (default: 1)",
     "",
@@ -139,6 +144,7 @@ export function parseObservationHistoryMigrationArgs(argv) {
     expectedInventoryRootSha256: null,
     expectedStateRootSha256: null,
     v2RuntimeRollbackRecord: null,
+    operatorAuthorityFile: null,
     reportOut: null,
     checkpointIn: null,
     checkpointOut: null,
@@ -164,6 +170,7 @@ export function parseObservationHistoryMigrationArgs(argv) {
     } else if (flag === "--expected-state-root-sha256") {
       args.expectedStateRootSha256 = requireValue(argv, index++, flag);
     } else if (flag === "--report-out") args.reportOut = requireValue(argv, index++, flag);
+    else if (flag === "--operator-authority-file") args.operatorAuthorityFile = requireValue(argv, index++, flag);
     else if (flag === "--v2-runtime-rollback-record") {
       args.v2RuntimeRollbackRecord = requireValue(argv, index++, flag);
     }
@@ -1161,14 +1168,17 @@ function serviceBindingTarget(versionDetail, bindingName, label) {
   return bindings[0].service;
 }
 
-export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, env, apiGet = cloudflareWorkerApiGet, command = runRollbackCommand }) {
+export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, env, apiGet = cloudflareWorkerApiGet, command = runRollbackCommand, apiRequest = workerRuntimeRequest }) {
+  const durable = rollbackEvidence.schema_version === 2;
+  if (durable) validateDurableRuntimeEvidence(rollbackEvidence, repositoryRoot);
   const payload = rollbackEvidence.payload;
   const observations = rollbackComponent(payload, "stable_observations_worker");
   const station = rollbackComponent(payload, "stable_station_worker");
   const cache = rollbackComponent(payload, "cache_worker");
-  const cacheVersionId = payload.cache_provenance.pre_cutover_v2_cache_runtime.version_id;
-  const accountId = String(env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || "").trim();
-  const apiToken = String(env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || "").trim();
+  const cacheVersionId = durable ? cache.deployment.version_id : payload.cache_provenance.pre_cutover_v2_cache_runtime.version_id;
+  const durableCredentials = durable ? cloudflareCaptureCredentials(env) : null;
+  const accountId = durable ? durableCredentials.domain.accountId : String(env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || "").trim();
+  const apiToken = durable ? durableCredentials.domain.apiToken : String(env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || "").trim();
   if (!accountId || !apiToken) {
     throw new Error(
       "Rollback requires UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID and UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN before canonical restoration",
@@ -1180,7 +1190,14 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, e
   const components = [observations, station, cache];
   let admission = null;
   let dispositions = null;
-  const get = (component, suffix, options = {}) => apiGet({ accountId, apiToken, workerName: component.worker_name, suffix, ...options });
+  const auth = component => {
+    const selectedAccount = durable && component.role === "stable_observations_worker" ? durableCredentials.observations.accountId : accountId;
+    const selectedToken = durable && component.role === "stable_observations_worker" ? durableCredentials.observations.apiToken : apiToken;
+    if (!selectedAccount || !selectedToken || (durable && selectedAccount !== component.account_id)) throw new Error("Pinned runtime Cloudflare account/credentials mismatch");
+    return {accountId:selectedAccount, apiToken:selectedToken, workerName:component.worker_name};
+  };
+  const get = (component, suffix, options = {}) => apiGet({ ...auth(component), suffix, ...options });
+  const request = (component, suffix, options) => apiRequest({...auth(component),suffix,...options});
   const inspect = async () => {
     const recoverability = [];
     for (const component of components) {
@@ -1200,18 +1217,25 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, e
       // descriptor. Git templates + dates cannot authorize another UUID or a
       // rebuild using today's substitutions/secrets/toolchain. Cache descriptor
       // equality also cannot prove opaque secret-value identity across versions.
-      const viable = component.role !== "cache_worker" || detail !== null;
+      if (durable && detail && runtimeJson(runtimeDescriptor(detail)) !== runtimeJson(readRuntimePackage(component, repositoryRoot).descriptor)) throw new Error("Pinned runtime descriptor differs from durable authority");
+      let artifactAvailable = false;
+      let artifactFailure = null;
+      if (durable && !detail) {
+        try { await inspectArtifactRecovery({component, repositoryRoot, get}); artifactAvailable = true; }
+        catch (error) { artifactFailure = error.message; }
+      }
+      const viable = !durable && (component.role !== "cache_worker" || detail !== null) || detail !== null;
       const state = currentExact && viable ? "already_exact_pinned_version"
-        : detail ? "pinned_version_available_for_deploy" : "unrecoverable";
+        : detail ? "pinned_version_available_for_deploy" : artifactAvailable ? "deterministic_pinned_runtime_redeploy_available" : "unrecoverable";
       recoverability.push(Object.freeze({
         role: component.role, worker_name: component.worker_name,
         pinned_git_commit_sha: component.git_commit_sha,
         historical_version_id: versionId,
-        selected_version_id: state === "unrecoverable" ? null : versionId,
+        selected_version_id: state === "unrecoverable" || artifactAvailable ? null : versionId,
         state,
         reason: state === "unrecoverable"
-          ? "Pinned Cloudflare version unavailable; no durable exact deployed bundle, resolved configuration/binding/secret identity and reproducible build provenance authorizes a replacement runtime. Stable name, timestamps and nearby workflow runs are insufficient."
-          : "Exact immutable Cloudflare version identity",
+          ? artifactFailure || "Pinned Cloudflare version unavailable; no durable exact deployed bundle, resolved configuration/binding/secret identity and reproducible build provenance authorizes a replacement runtime. Stable name, timestamps and nearby workflow runs are insufficient."
+          : artifactAvailable ? "Pinned physical module bytes and resolved configuration; explicit current-required-secret-binding policy" : "Exact immutable Cloudflare version identity",
       }));
     }
     return Object.freeze({ ok: recoverability.every(entry => entry.state !== "unrecoverable"), components: Object.freeze(recoverability), evidence_payload_sha256: rollbackEvidence.payload_sha256 });
@@ -1241,15 +1265,21 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, e
       if (!admission?.ok) throw new Error("Runtime restoration requires successful pre-mutation recoverability admission");
       dispositions = [];
       const restore = async component => {
-        const selected = admission.components.find(entry => entry.role === component.role);
+        let selected = admission.components.find(entry => entry.role === component.role);
+        const artifactRoute = selected.state === "deterministic_pinned_runtime_redeploy_available";
+        if (artifactRoute) {
+          const version = await uploadPinnedRuntime({component, repositoryRoot, get, request});
+          selected = {...selected, selected_version_id:version};
+        }
         // Re-check before retaining a version; admission is not a stale-state shortcut.
         const current = await get(component, "deployments");
         let exact = false;
         try { currentFullDeploymentForVersion(current, selected.selected_version_id, component.role); exact = true; } catch { /* deploy only selected authority */ }
-        if (!exact) await command("npx", ["wrangler", "versions", "deploy", `${selected.selected_version_id}@100%`, "--name", component.worker_name, "-y"], {
+        if (!exact && durable) await request(component, "deployments", {method:"POST",body:JSON.stringify({strategy:"percentage",versions:[{version_id:selected.selected_version_id,percentage:100}]})});
+        if (!exact && !durable) await command("npx", ["wrangler", "versions", "deploy", `${selected.selected_version_id}@100%`, "--name", component.worker_name, "-y"], {
           cwd: repositoryRoot, env: childEnvironment, label: `Restore pinned ${component.role}`,
         });
-        dispositions.push(Object.freeze({ ...selected, disposition: exact ? "confirmed_existing_pinned_runtime" : "deployed_pinned_historical_version", deployed: !exact }));
+        dispositions.push(Object.freeze({ ...selected, disposition: exact ? "confirmed_existing_pinned_runtime" : artifactRoute ? "deployed_pinned_runtime_artifact" : "deployed_pinned_historical_version", deployed: !exact }));
       };
       await restore(observations);
       await restore(station);
@@ -1279,8 +1309,10 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, e
         const deployment = currentFullDeploymentForVersion(await get(component, "deployments"), selected.selected_version_id, selected.role);
         deploymentChecks.push(Object.freeze({ ...selected, version_id: selected.selected_version_id, deployment_id: deployment.id, percentage: 100 }));
       }
-      const cacheVersion = await get(cache, `versions/${encodeURIComponent(cacheVersionId)}`);
-      if (cacheVersion?.id !== cacheVersionId || serviceBindingTarget(cacheVersion, "STATION_HISTORY", "Post-rollback cache version") !== station.worker_name) throw new Error("Post-rollback cache binding/version does not match selected pinned v2 authority");
+      if (durable) for (const selected of dispositions) await verifyArtifactRuntime({component:components.find(c=>c.role===selected.role),versionId:selected.selected_version_id,repositoryRoot,get,request});
+      const selectedCacheVersionId = durable ? dispositions.find(c=>c.role === "cache_worker").selected_version_id : cacheVersionId;
+      const cacheVersion = await get(cache, `versions/${encodeURIComponent(selectedCacheVersionId)}`);
+      if (cacheVersion?.id !== selectedCacheVersionId || serviceBindingTarget(cacheVersion, "STATION_HISTORY", "Post-rollback cache version") !== station.worker_name) throw new Error("Post-rollback cache binding/version does not match selected pinned v2 authority");
       return Object.freeze({ ok: true, complete: true, index_generation: "v2", observations_reader_generation: "v2", station_reader_generation: "v2", cache_station_binding_generation: "v2", deployments: Object.freeze(deploymentChecks) });
     },
   });
@@ -1580,6 +1612,9 @@ export async function runObservationHistoryMigrationV3({
 } = {}) {
   const args = parseObservationHistoryMigrationArgs(argv);
   if (args.help) return { help: true, text: usage() };
+  if (args.mode === "migrate" && !args.checkpointIn && (!args.operatorAuthorityFile || !args.v2RuntimeRollbackRecord)) throw new Error("Fresh migration requires --operator-authority-file and --v2-runtime-rollback-record");
+  if (args.mode === "migrate" && args.checkpointIn && !args.operatorAuthorityFile) throw new Error("Resume requires --operator-authority-file to distinguish immutable runtime pin from historical compatibility");
+  if (args.mode !== "runtime-recoverability" && args.v2RuntimeRollbackRecord && !args.operatorAuthorityFile && readJsonFile(args.v2RuntimeRollbackRecord, "runtime evidence").schema_version === 2) throw new Error("Durable runtime evidence requires --operator-authority-file");
   if (args.mode === "runtime-recoverability") {
     // Diagnostic only. This does not replace formal rollback preflight or grant
     // mutation authority; no lock, R2/Dropbox transport or deployment is entered.
@@ -1606,6 +1641,18 @@ export async function runObservationHistoryMigrationV3({
     const output = { result: { ...result, status: result.ok ? "runtime_recoverable" : "unrecoverable", diagnostic_only: true, mutation_calls: 0 } };
     atomicWriteJson(args.reportOut, output);
     return output;
+  }
+  if (args.operatorAuthorityFile) {
+    const authority = readJsonFile(args.operatorAuthorityFile, "operator authority");
+    const bytes = args.v2RuntimeRollbackRecord ? fs.readFileSync(args.v2RuntimeRollbackRecord) : null;
+    const compatibility = assertRuntimeRecordPin(authority, bytes, {allowLegacy: args.mode !== "migrate" || Boolean(args.checkpointIn)});
+    const identities = {environment:args.environment, transition:args.transition, migration_run_id:args.migrationRunId, target_writer_git_sha:args.targetWriterGitSha, plan_sha256:args.expectedPlanSha256, inventory_root_sha256:args.expectedInventoryRootSha256, state_root_sha256:args.expectedStateRootSha256};
+    for (const [key,value] of Object.entries(identities)) if (authority[key] !== value) throw new Error(`Runtime operator authority ${key} differs from historical migration identity`);
+    if (!compatibility.legacy) {
+      const record = JSON.parse(bytes);
+      validateIndexV3OperatorEvidence({evidence:record,repositoryRoot:path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")});
+      if (args.mode === "migrate" && args.transition === "v2-to-v3") await verifyCurrentRuntimeEvidence(record, args.environment, env, authority);
+    }
   }
   if (args.mode === "migrate" && args.checkpointIn) {
     process.on("SIGHUP", () => {

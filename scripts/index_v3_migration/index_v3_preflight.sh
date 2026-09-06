@@ -27,7 +27,7 @@ usage() {
 Usage:
   index_v3_preflight.sh --stage plan --transition v2-to-v3|v3-rebuild
   index_v3_preflight.sh --stage migration-start --transition v2-to-v3|v3-rebuild \
-    {--authority-file PATH | --checkpoint PATH} \
+    {--authority-file PATH | --checkpoint PATH --runtime-operator-authority PATH} \
     --plan-report PATH --dropbox-root PATH --site-url URL \
     --writer-freeze-evidence PATH [--v2-runtime-rollback-record PATH]
   index_v3_preflight.sh --stage cutover --transition v2-to-v3 \
@@ -253,6 +253,7 @@ esac
 STAGE=""
 TRANSITION=""
 AUTHORITY_FILE=""
+RUNTIME_OPERATOR_AUTHORITY=""
 PLAN_REPORT=""
 DROPBOX_ROOT=""
 SITE_URL=""
@@ -266,6 +267,7 @@ while [ "$#" -gt 0 ]; do
     --stage) STAGE="${2:-}"; shift 2 ;;
     --transition) TRANSITION="${2:-}"; shift 2 ;;
     --authority-file) AUTHORITY_FILE="${2:-}"; shift 2 ;;
+    --runtime-operator-authority) RUNTIME_OPERATOR_AUTHORITY="${2:-}"; shift 2 ;;
     --plan-report) PLAN_REPORT="${2:-}"; shift 2 ;;
     --dropbox-root) DROPBOX_ROOT="${2:-}"; shift 2 ;;
     --site-url) SITE_URL="${2:-}"; shift 2 ;;
@@ -313,7 +315,7 @@ fi
 if [ "$STAGE" = "cutover" ] || [ "$STAGE" = "completion" ]; then
   [ -n "$VERIFY_REPORT" ] || fail "--verify-report is required for $STAGE"
 fi
-if [ "$STAGE" = "cutover" ] || [ "$STAGE" = "completion" ] || [ "$STAGE" = "rollback" ] || { [ "$STAGE" = "migration-start" ] && [ "$TRANSITION" = "v3-rebuild" ]; }; then
+if [ "$STAGE" = "cutover" ] || [ "$STAGE" = "completion" ] || [ "$STAGE" = "rollback" ] || { [ "$STAGE" = "migration-start" ] && { [ "$TRANSITION" = "v3-rebuild" ] || [ -z "$CHECKPOINT" ] || { [ -n "$RUNTIME_OPERATOR_AUTHORITY" ] && [ "$(jq -r '.schema_version' "$RUNTIME_OPERATOR_AUTHORITY")" = "2" ]; }; }; }; then
   [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] || fail "--v2-runtime-rollback-record is required for $STAGE $TRANSITION"
 fi
 
@@ -438,6 +440,9 @@ for file in "$PLAN_REPORT"; do
   jq empty "$file" >/dev/null 2>&1 || fail "migration evidence is not valid JSON: $file"
 done
 
+if [ "$STAGE" = "migration-start" ] && [ -z "$AUTHORITY_FILE" ]; then
+  [ -n "$RUNTIME_OPERATOR_AUTHORITY" ] || fail "checkpoint preflight requires --runtime-operator-authority to distinguish new authority from legacy"
+fi
 RECOVERY_AUTHORITY=0
 if [ -n "$AUTHORITY_FILE" ]; then
   [ -f "$AUTHORITY_FILE" ] || fail "required migration evidence is missing: $AUTHORITY_FILE"
@@ -543,7 +548,24 @@ FREEZE_EVIDENCE_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
   || fail "writer-freeze evidence branch does not match $CURRENT_BRANCH"
 pass "durable writer-freeze evidence covers every migration-plan mutation class"
 
+RUNTIME_PIN_AUTHORITY="${RUNTIME_OPERATOR_AUTHORITY:-$AUTHORITY_FILE}"
+if [ -n "$RUNTIME_PIN_AUTHORITY" ]; then
+  LEGACY_RUNTIME_ARGS=()
+  if [ "$(jq -r '.schema_version' "$RUNTIME_PIN_AUTHORITY")" = "1" ] && [ "$TRANSITION" = "v2-to-v3" ]; then
+    [ "$STAGE" != "migration-start" ] || [ -n "$CHECKPOINT" ] \
+      || fail "legacy unpinned authority cannot start a new migration"
+    LEGACY_RUNTIME_ARGS=(--allow-legacy)
+  fi
+  node "$SCRIPT_DIR/v2_runtime_artifact.mjs" validate-pin "$RUNTIME_PIN_AUTHORITY" "$V2_RUNTIME_ROLLBACK_RECORD" "${LEGACY_RUNTIME_ARGS[@]}" \
+    || fail "v2 runtime rollback record differs from pinned operator authority"
+  jq -e --arg plan "$PLAN_SHA" --arg run "$PLAN_RUN_ID" --arg repo "$REPO_SLUG" --arg env "$ENVIRONMENT" --arg transition "$TRANSITION" \
+    '.plan_sha256 == $plan and .migration_run_id == $run and .repository == $repo and .environment == $env and .transition == $transition' \
+    "$RUNTIME_PIN_AUTHORITY" >/dev/null || fail "runtime operator authority differs from historical migration identity"
+fi
 if [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ]; then
+  if [ "$(jq -r '.schema_version' "$V2_RUNTIME_ROLLBACK_RECORD")" = "2" ]; then
+    [ -n "$RUNTIME_PIN_AUTHORITY" ] || fail "durable runtime record requires its operator authority pin for this stage"
+  fi
   [ -f "$V2_RUNTIME_ROLLBACK_RECORD" ] \
     || fail "immutable v2 runtime rollback record is missing: $V2_RUNTIME_ROLLBACK_RECORD"
   ROLLBACK_RECORD_RESULT="$(node "$OPERATOR_EVIDENCE_HELPER" validate \
@@ -556,12 +578,12 @@ if [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ]; then
     || fail "v2 runtime rollback record repository does not match $REPO_SLUG"
   [ "$(printf '%s' "$ROLLBACK_RECORD_RESULT" | jq -r '.branch // empty')" = "$CURRENT_BRANCH" ] \
     || fail "v2 runtime rollback record branch does not match $CURRENT_BRANCH"
-  if [ "$TRANSITION" = "v3-rebuild" ] && [ -n "$AUTHORITY_FILE" ]; then
-    PINNED_V2_RUNTIME_ROLLBACK_SHA="$(jq -r '.v2_runtime_rollback_record_sha256 // empty' "$AUTHORITY_FILE")"
-    printf '%s' "$PINNED_V2_RUNTIME_ROLLBACK_SHA" | grep -Eq '^[0-9a-f]{64}$' \
-      || fail "v3-rebuild operator authority lacks a pinned v2 runtime rollback record identity"
-    [ "$(shasum -a 256 "$V2_RUNTIME_ROLLBACK_RECORD" | awk '{print $1}')" = "$PINNED_V2_RUNTIME_ROLLBACK_SHA" ] \
-      || fail "v2 runtime rollback record differs from pinned v3-rebuild operator authority"
+  if [ "$STAGE" = "migration-start" ] && [ "$TRANSITION" = "v2-to-v3" ] && [ "$(jq -r '.schema_version' "$V2_RUNTIME_ROLLBACK_RECORD")" = "2" ]; then
+    [ -n "$RUNTIME_PIN_AUTHORITY" ] || fail "durable runtime authority requires its pinned operator authority"
+    node "$SCRIPT_DIR/capture_v2_runtime_authority.mjs" verify-current \
+      --environment "$ENVIRONMENT" --evidence "$V2_RUNTIME_ROLLBACK_RECORD" \
+      --operator-authority-file "$RUNTIME_PIN_AUTHORITY" \
+      || fail "current v2 runtime differs from the immutable pre-migration capture"
   fi
   pass "immutable v2 runtime rollback record has exact code, workflow, Worker, and deployment identities"
   if [ "$STAGE" = "rollback" ]; then

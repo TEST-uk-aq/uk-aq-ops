@@ -239,7 +239,7 @@ export async function superviseOperatorInvocation(entry, args, env = process.env
   const signals = new Map();
   try {
     result = await runOperatorCommand(process.execPath, [fileURLToPath(import.meta.url), 'phase', operation.startsWith('preflight-') ? 'Full preflight' : `Operator ${operation}`, entry.endsWith('.sh') ? 'bash' : process.execPath, entry, ...args], {
-      cwd: process.cwd(), env: { ...env, UK_AQ_OPERATOR_SUPERVISED: '1', ...(operation.startsWith('preflight-') ? { UK_AQ_OPERATOR_PREFLIGHT_PHASE: '1' } : {}), UK_AQ_OPERATOR_RUN_DIR: directory, UK_AQ_OPERATOR_AUTHORITY_ROOT: path.resolve(root) },
+      cwd: process.cwd(), env: { ...env, UK_AQ_OPERATOR_SUPERVISED: '1', UK_AQ_OPERATOR_RUN_DIR: directory, UK_AQ_OPERATOR_AUTHORITY_ROOT: path.resolve(root) },
       phase: false, sink: log,
       onSpawn(child) {
         metadata.child_pid = child.pid;
@@ -273,7 +273,7 @@ export async function superviseOperatorInvocation(entry, args, env = process.env
     exit_code: result.status, signal: result.signal || null, success: result.status === 0,
     final_status: result.status === 0 ? domainStatus || 'succeeded' : 'failed',
     domain_status: domainStatus, domain_report_path: domainPath, domain_report_written_this_invocation: domainReportWritten,
-    evidence_paths: [...new Set([inferredAuthority, authorityPath, path.resolve(root, 'migration_checkpoint.json'), path.resolve(root, 'writer_limits.json'), path.join(directory, 'runtime_recoverability.json'), argValue(args, '--plan-report'), argValue(args, '--out'), argValue(args, '--evidence'), argValue(args, '--runtime-operator-authority'), argValue(args, '--v2-runtime-rollback-record'), argValue(args, '--writer-freeze-evidence')].filter(Boolean).map(p => path.resolve(p)).filter(p => fs.existsSync(p)))],
+    evidence_paths: [...new Set([inferredAuthority, authorityPath, path.resolve(root, 'migration_checkpoint.json'), path.resolve(root, 'writer_limits.json'), path.join(directory, 'runtime_recoverability.json'), argValue(args, '--plan-report'), argValue(args, '--v2-runtime-rollback-record'), argValue(args, '--writer-freeze-evidence')].filter(Boolean).map(p => path.resolve(p)))],
     log_write_failed: logFailed,
   };
   announce(`Operator completion: UTC=${summary.completed_at_utc} elapsed=${formatElapsed(summary.elapsed_ms)} exit=${result.status} status=${summary.final_status} domain_report=${domainPath || 'none'} run_report=${path.join(directory, 'run_report.json')}\n`);

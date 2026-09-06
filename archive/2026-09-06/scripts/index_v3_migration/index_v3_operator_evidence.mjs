@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
-import { validateDurableRuntimeEvidence } from "./v2_runtime_artifact.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -443,7 +442,6 @@ function validateRollbackPayload(payload, { repositoryRoot }) {
 }
 
 export function validateIndexV3OperatorEvidence({ evidence, repositoryRoot, planReport = null }) {
-  if (evidence?.schema_version === 2) return validateDurableRuntimeEvidence(evidence, path.resolve(repositoryRoot));
   exactKeys(evidence, ["schema_version", "kind", "payload", "payload_sha256"], "operator evidence envelope");
   if (evidence.schema_version !== 1 || !KINDS.has(evidence.kind)) throw new Error("operator evidence schema/kind is invalid");
   plain(evidence.payload, "operator evidence payload");

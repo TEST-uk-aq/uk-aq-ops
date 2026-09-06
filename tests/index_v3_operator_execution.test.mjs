@@ -28,6 +28,7 @@ test('persistent run log tees both streams, redacts split secrets and preserves 
   assert.match(result.stdout, /ordinary output/); assert.match(result.stderr, /ordinary error/);
   assert.match(log, /ordinary output/); assert.match(log, /ordinary error/); assert.match(log, /exit=7 status=failed/);
   assert.doesNotMatch(log + result.stdout + result.stderr, /fake-credential/);
+  assert.deepEqual(report.evidence_paths, []);
   assert.equal(report.exit_code, 7); assert.equal(report.success, false); assert.equal(report.diagnostic_only, true);
 });
 test('run directory failure prevents starting the child', t => {
@@ -76,4 +77,15 @@ test('termination reaches a shell child and preserves cancellation status', asyn
   });
   assert.equal(code, 143);
   assert.equal(fs.readFileSync(stopped, 'utf8'), 'stopped');
+});
+
+test('standalone preflight supervision installs only one Full preflight phase', t => {
+  const root=temp(t), entry=path.join(root,'index_v3_preflight.sh');
+  const preflight=fileURLToPath(new URL('../scripts/index_v3_migration/index_v3_preflight.sh', import.meta.url));
+  const source=fs.readFileSync(preflight,'utf8').split('# Read-only Phase 6')[0];
+  fs.writeFileSync(entry, source.replaceAll('$(dirname -- "${BASH_SOURCE[0]}")/operator_execution.mjs', helper)+'\nexit 0\n');
+  const result=spawnSync('bash',[entry,'--stage','plan','--work-dir',root],{encoding:'utf8'});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal((result.stderr.match(/Full preflight: start/g)||[]).length,1,result.stderr);
+  assert.equal((result.stderr.match(/Full preflight: complete/g)||[]).length,1,result.stderr);
 });

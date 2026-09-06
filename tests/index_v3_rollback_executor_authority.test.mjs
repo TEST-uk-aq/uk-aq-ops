@@ -263,7 +263,7 @@ test("migrate, resume and verify gates and rollback mutation controls remain unc
     ["VERIFY_CURRENT_TRUSTED_DEPENDENCIES=(", "self_test() {"],
     ['  elif [ "$MODE" = "resume" ]; then', "  write_writer_limits\n}"],
     ['\nif [ "$MODE" = "rollback" ]; then', '\n[ "$APPLY" -eq 0 ] || stop "verify mode'],
-  ]) assert.equal(section(read(wrapper), start, end).replace("  scripts/index_v3_migration/operator_execution.mjs\n", ""), section(before(wrapper), start, end));
+  ]) assert.equal(section(read(wrapper), start, end).replace(/^  scripts\/index_v3_migration\/(?:operator_execution|v2_runtime_artifact|v2_runtime_recovery|capture_v2_runtime_authority|index_v3_capture_operator_evidence|rollback_executor_authority|index_v3_operator_evidence)\.mjs\n/gm, ""), section(before(wrapper), start, end));
   assert.match(read(wrapper), /elif \[ "\$MODE" = "rollback" \]; then\n\s+node[^\n]+rollback_executor_authority/);
   assert.match(read(preflight), /if \[ "\$STAGE" = "rollback" \]; then\n  # Rollback interprets/);
   for (const [start, end] of [

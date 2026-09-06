@@ -11,6 +11,10 @@ import { recoverySha256 } from "./recovery_journal_authority.mjs";
 // scopes. Current reviewed machinery may evolve; every entry must match HEAD.
 export const ROLLBACK_CURRENT_TRUSTED_DEPENDENCIES = Object.freeze([
   "scripts/index_v3_migration/operator_execution.mjs",
+  "scripts/index_v3_migration/v2_runtime_artifact.mjs",
+  "scripts/index_v3_migration/v2_runtime_recovery.mjs",
+  "scripts/index_v3_migration/capture_v2_runtime_authority.mjs",
+  "scripts/index_v3_migration/index_v3_capture_operator_evidence.mjs",
   // Operator controls, evidence authentication, replay, restore orchestration.
   "scripts/index_v3_migration/rollback_executor_authority.mjs",
   "scripts/index_v3_migration/index_v3_migration.sh",

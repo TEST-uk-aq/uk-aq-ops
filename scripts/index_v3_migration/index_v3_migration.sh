@@ -19,11 +19,11 @@ Usage:
   index_v3_migration.sh plan --transition v2-to-v3|v3-rebuild \
     --work-dir PATH --migration-run-id ID --dropbox-root PATH \
     --inventory-root-sha256 HEX --state-root-sha256 HEX \
-    [--v2-runtime-rollback-record PATH]
+    --v2-runtime-rollback-record PATH
 
   index_v3_migration.sh migrate --transition v2-to-v3|v3-rebuild \
     --work-dir PATH --dropbox-root PATH --site-url URL \
-    --writer-freeze-evidence PATH [--v2-runtime-rollback-record PATH] --apply
+    --writer-freeze-evidence PATH --v2-runtime-rollback-record PATH --apply
 
   index_v3_migration.sh resume --transition v2-to-v3|v3-rebuild \
     --work-dir PATH --dropbox-root PATH --site-url URL \
@@ -37,6 +37,9 @@ Usage:
   index_v3_migration.sh verify --transition v2-to-v3|v3-rebuild \
     --work-dir PATH --dropbox-root PATH [--v2-runtime-rollback-record PATH] \
     [--report-out PATH]
+
+Runtime records are required for every schema-2 authority use; only historical
+schema-1 v2-to-v3 resume/verify may omit the separately supplied legacy record.
 
 Common work-dir files:
   operator_authority.json
@@ -82,6 +85,12 @@ require_authorization() {
 # clean current HEAD, but it may legitimately evolve after the migration.
 VERIFY_CURRENT_TRUSTED_DEPENDENCIES=(
   scripts/index_v3_migration/operator_execution.mjs
+  scripts/index_v3_migration/v2_runtime_artifact.mjs
+  scripts/index_v3_migration/v2_runtime_recovery.mjs
+  scripts/index_v3_migration/capture_v2_runtime_authority.mjs
+  scripts/index_v3_migration/rollback_executor_authority.mjs
+  scripts/index_v3_migration/index_v3_operator_evidence.mjs
+  scripts/index_v3_migration/index_v3_capture_operator_evidence.mjs
   scripts/index_v3_migration/index_v3_migration.sh
   scripts/index_v3_migration/index_v3_preflight.sh
   scripts/index_v3_migration/recovery_journal_authority.mjs
@@ -453,7 +462,7 @@ esac
 load_authority() {
   [ -f "$AUTHORITY_FILE" ] || stop "operator authority is missing: $AUTHORITY_FILE"
   [ -f "$PLAN_REPORT" ] || stop "migration plan report is missing: $PLAN_REPORT"
-  jq -e '.schema_version == 1 and .kind == "uk_aq_index_v3_operator_authority"' \
+  jq -e '(.schema_version == 1 or .schema_version == 2) and .kind == "uk_aq_index_v3_operator_authority"' \
     "$AUTHORITY_FILE" >/dev/null 2>&1 || stop "operator authority is malformed"
   node --input-type=module - "$AUTHORITY_FILE" <<'NODE' \
     || stop "operator authority cryptographic identity is invalid"
@@ -514,17 +523,17 @@ NODE
     printf '%s' "$identity" | grep -Eq '^[0-9a-f]{64}$' \
       || stop "operator authority contains a malformed SHA-256 identity"
   done
-  if [ "$TRANSITION" = "v3-rebuild" ]; then
-    [ -f "$V2_RUNTIME_ROLLBACK_RECORD" ] \
-      || stop "v3-rebuild authority requires --v2-runtime-rollback-record"
-    printf '%s' "$AUTH_V2_RUNTIME_ROLLBACK_SHA" | grep -Eq '^[0-9a-f]{64}$' \
-      || stop "v3-rebuild authority lacks a valid v2 runtime rollback record identity"
-    [ "$(shasum -a 256 "$V2_RUNTIME_ROLLBACK_RECORD" | awk '{print $1}')" = "$AUTH_V2_RUNTIME_ROLLBACK_SHA" ] \
-      || stop "v2 runtime rollback record differs from pinned operator authority"
-  else
-    [ -z "$AUTH_V2_RUNTIME_ROLLBACK_SHA" ] \
-      || stop "v2-to-v3 authority unexpectedly pins a plan-time v2 runtime rollback record"
+  AUTHORITY_SCHEMA="$(jq -r '.schema_version' "$AUTHORITY_FILE")"
+  LEGACY_RUNTIME_ARGS=()
+  if [ "$AUTHORITY_SCHEMA" = "1" ] && [ "$TRANSITION" = "v2-to-v3" ]; then
+    case "$MODE" in
+      resume|rollback|verify) LEGACY_RUNTIME_ARGS=(--allow-legacy) ;;
+      *) stop "legacy unpinned authority cannot start a new migration; create a new plan" ;;
+    esac
+    printf 'Explicit historical compatibility: schema-1 v2-to-v3 runtime record remains separately supplied.\n'
   fi
+  node "$SCRIPT_DIR/v2_runtime_artifact.mjs" validate-pin "$AUTHORITY_FILE" "$V2_RUNTIME_ROLLBACK_RECORD" "${LEGACY_RUNTIME_ARGS[@]}" \
+    || stop "runtime rollback record does not match operator authority"
   if [ "$MODE" = "verify" ]; then
     validate_read_only_dependency_authority "$REPO_ROOT" "$TARGET_WRITER_GIT_SHA"
     LOAD_AUTHORITY_DRIFT=""
@@ -565,7 +574,16 @@ NODE
 }
 
 run_cli() {
-  node --max-old-space-size=4096 "$MIGRATION_CLI" "$@"
+  local argument has_runtime=0
+  local extra=()
+  if [ "$MODE" != "plan" ]; then
+    extra=(--operator-authority-file "$AUTHORITY_FILE")
+    for argument in "$@"; do [ "$argument" != "--v2-runtime-rollback-record" ] || has_runtime=1; done
+    if [ "$has_runtime" -eq 0 ] && [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ]; then
+      extra+=(--v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD")
+    fi
+  fi
+  node --max-old-space-size=4096 "$MIGRATION_CLI" "$@" "${extra[@]}"
 }
 
 if [ "$MODE" = "plan" ]; then
@@ -578,16 +596,17 @@ if [ "$MODE" = "plan" ]; then
   [ ! -e "$AUTHORITY_FILE" ] || stop "operator authority already exists: $AUTHORITY_FILE"
   [ ! -e "$PLAN_REPORT" ] || stop "plan report already exists: $PLAN_REPORT"
   [ ! -e "$CHECKPOINT" ] || stop "checkpoint already exists: $CHECKPOINT"
-  V2_RUNTIME_ROLLBACK_SHA=""
-  if [ "$TRANSITION" = "v3-rebuild" ]; then
-    [ -f "$V2_RUNTIME_ROLLBACK_RECORD" ] \
-      || stop "v3-rebuild plan requires --v2-runtime-rollback-record"
-    node scripts/index_v3_migration/index_v3_operator_evidence.mjs validate \
-      --evidence "$V2_RUNTIME_ROLLBACK_RECORD" \
-      --repository-root "$REPO_ROOT" >/dev/null \
-      || stop "v3-rebuild v2 runtime rollback record is invalid"
-    V2_RUNTIME_ROLLBACK_SHA="$(shasum -a 256 "$V2_RUNTIME_ROLLBACK_RECORD" | awk '{print $1}')"
+  [ -f "$V2_RUNTIME_ROLLBACK_RECORD" ] \
+    || stop "new plan requires --v2-runtime-rollback-record"
+  node "$SCRIPT_DIR/index_v3_operator_evidence.mjs" validate \
+    --evidence "$V2_RUNTIME_ROLLBACK_RECORD" --repository-root "$REPO_ROOT" >/dev/null \
+    || stop "v2 runtime rollback record is invalid"
+  if [ "$TRANSITION" = "v2-to-v3" ]; then
+    node "$SCRIPT_DIR/capture_v2_runtime_authority.mjs" verify-current \
+      --environment "$ENVIRONMENT" --evidence "$V2_RUNTIME_ROLLBACK_RECORD" \
+      || stop "fresh v2-to-v3 plan requires exact current durable v2 runtime authority"
   fi
+  V2_RUNTIME_ROLLBACK_SHA="$(shasum -a 256 "$V2_RUNTIME_ROLLBACK_RECORD" | awk '{print $1}')"
 
   "$PREFLIGHT" --stage plan --transition "$TRANSITION"
   TARGET_WRITER_GIT_SHA="$(git rev-parse HEAD)"
@@ -610,13 +629,15 @@ if [ "$MODE" = "plan" ]; then
 
   PLAN_SHA="$(jq -r '.result.plan_sha256 // empty' "$PLAN_REPORT")"
   [ -n "$PLAN_SHA" ] || stop "completed plan did not emit a plan SHA-256"
+  [ "$(shasum -a 256 "$V2_RUNTIME_ROLLBACK_RECORD" | awk '{print $1}')" = "$V2_RUNTIME_ROLLBACK_SHA" ] \
+    || stop "runtime record changed during planning"
   AUTHORITY_TMP="$AUTHORITY_FILE.tmp-$$"
   export AUTHORITY_TMP ENVIRONMENT REPOSITORY BRANCH TARGET_WRITER_GIT_SHA MIGRATION_RUN_ID PLAN_SHA INVENTORY_SHA STATE_SHA TRANSITION SOURCE_INDEX_GENERATION TARGET_INDEX_GENERATION V2_RUNTIME_ROLLBACK_SHA
   node --input-type=module <<'NODE'
 import fs from "node:fs";
 import crypto from "node:crypto";
 const authorityPayload = {
-  schema_version: 1,
+  schema_version: 2,
   kind: "uk_aq_index_v3_operator_authority",
   environment: process.env.ENVIRONMENT,
   repository: process.env.REPOSITORY,
@@ -638,9 +659,10 @@ const authority = {
     .update(`${JSON.stringify(authorityPayload, null, 2)}\n`)
     .digest("hex"),
 };
-fs.writeFileSync(process.env.AUTHORITY_TMP, `${JSON.stringify(authority, null, 2)}\n`, { mode: 0o600 });
+fs.writeFileSync(process.env.AUTHORITY_TMP, `${JSON.stringify(authority, null, 2)}\n`, { flag: "wx", mode: 0o600 });
 NODE
-  mv -- "$AUTHORITY_TMP" "$AUTHORITY_FILE"
+  ln -- "$AUTHORITY_TMP" "$AUTHORITY_FILE" || stop "operator authority already exists"
+  rm -- "$AUTHORITY_TMP"
   printf 'PLAN COMPLETE (READ-ONLY)\nAuthority: %s\nReport: %s\nNO CUTOVER WAS PERFORMED.\n' \
     "$AUTHORITY_FILE" "$PLAN_REPORT"
   exit 0
@@ -655,9 +677,9 @@ if [ "$MODE" = "migrate" ]; then
   [ -n "$SITE_URL" ] || stop "migrate requires --site-url for positive maintenance verification"
   [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "migrate requires --writer-freeze-evidence"
   V2_RUNTIME_ARGS=()
-  if [ "$TRANSITION" = "v3-rebuild" ]; then
+  if [ "$TRANSITION" = "v3-rebuild" ] || [ "$AUTHORITY_SCHEMA" = "2" ]; then
     [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] \
-      || stop "v3-rebuild migrate requires --v2-runtime-rollback-record"
+      || stop "migrate authority requires --v2-runtime-rollback-record"
     V2_RUNTIME_ARGS=(--v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD")
   fi
   [ ! -e "$CHECKPOINT" ] || stop "migrate checkpoint already exists; use explicit resume mode"
@@ -697,9 +719,9 @@ if [ "$MODE" = "resume" ]; then
   [ -n "$SITE_URL" ] || stop "resume requires --site-url for positive maintenance verification"
   [ -n "$WRITER_FREEZE_EVIDENCE" ] || stop "resume requires --writer-freeze-evidence"
   V2_RUNTIME_ARGS=()
-  if [ "$TRANSITION" = "v3-rebuild" ]; then
+  if [ "$TRANSITION" = "v3-rebuild" ] || [ "$AUTHORITY_SCHEMA" = "2" ]; then
     [ -n "$V2_RUNTIME_ROLLBACK_RECORD" ] \
-      || stop "v3-rebuild resume requires --v2-runtime-rollback-record"
+      || stop "resume authority requires --v2-runtime-rollback-record"
     V2_RUNTIME_ARGS=(--v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD")
   fi
   [ -f "$CHECKPOINT" ] || stop "resume requires an existing checkpoint: $CHECKPOINT"
@@ -711,6 +733,7 @@ if [ "$MODE" = "resume" ]; then
     --dropbox-root "$DROPBOX_ROOT" \
     --site-url "$SITE_URL" \
     --checkpoint "$CHECKPOINT" \
+    --runtime-operator-authority "$AUTHORITY_FILE" \
     --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE" \
     "${V2_RUNTIME_ARGS[@]}"
   run_cli \
