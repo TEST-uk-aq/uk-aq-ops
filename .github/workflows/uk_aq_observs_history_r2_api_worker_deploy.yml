@@ -23,10 +23,6 @@ jobs:
       UK_AQ_R2_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || '' }}
-      UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || '' }}
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX || '' }}
-      UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,10 +69,6 @@ jobs:
           set -euo pipefail
           sed -i "s|__CFLARE_R2_BUCKET__|${CFLARE_R2_BUCKET}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_VERSION__|${UK_AQ_R2_HISTORY_VERSION}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
-          sed -i "s|__UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX__|${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
-          sed -i "s|__UK_AQ_R2_HISTORY_INDEX_V2_PREFIX__|${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
-          sed -i "s|__UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX__|${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
-          sed -i "s|__UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX__|${UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
 
       - name: Set Worker secrets
         working-directory: workers/uk_aq_observs_history_r2_api_worker
