@@ -1,7 +1,10 @@
 #!/usr/bin/env node
+import { migrationConcurrencyLimits, validateMigrationConcurrency, inspectEmptyV3Target, validateCleanStartEvidence, GCP_CLEAN_POLICY } from './lib/observation_history_migration_gcp.mjs';
+import { exactPublicationEvidence, settledMigrationBatches, migrationFailure, migrationFailureEvidence } from './lib/observation_history_migration_concurrency.mjs';
 import { runOperatorCommand, createOperatorProgress, withOperatorPhase, superviseOperatorInvocation, finishOperatorProgress } from "../index_v3_migration/operator_execution.mjs";
 
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { validateDurableRuntimeEvidence, readRuntimePackage, runtimeDescriptor, runtimeJson, assertRuntimeRecordPin } from "../index_v3_migration/v2_runtime_artifact.mjs";
 import { cloudflareCaptureCredentials } from "../index_v3_migration/index_v3_capture_operator_evidence.mjs";
 import { verifyCurrentRuntimeEvidence } from "../index_v3_migration/capture_v2_runtime_authority.mjs";
@@ -23,6 +26,7 @@ import {
   hasRequiredR2Config,
   r2GetObject,
   r2HeadObject,
+  r2ListObjectsV2,
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
@@ -40,6 +44,7 @@ import {
 } from "../operations/uk_aq_with_observations_global_operation_lock.mjs";
 import {
   readAndValidateRecoveryJournal,
+  inspectRecoveryJournalForInterruptedAppend,
 } from "../index_v3_migration/recovery_journal_authority.mjs";
 import {
   validateIndexV3OperatorEvidence,
@@ -56,6 +61,7 @@ import {
   buildObservationHistoryV3MigrationPlan,
   buildObservationHistoryV3MigrationPlanFromCheckpoint,
   buildObservationHistoryV3RecoveryReplayStateSha256,
+  validateObservationHistoryV3RecoveryAppend,
   createMigrationProgressReporter,
   buildObservationHistoryV3RerunVerificationPlan,
   DEFAULT_OBSERVATIONS_PREFIX,
@@ -117,11 +123,12 @@ function usage() {
     "Mutation requirements (runtime rollback/operator authority files are historical-only):",
     "  --apply                  Explicitly permit the selected external mutation",
     "  --writers-frozen         Confirm every planner-listed writer is paused",
-    "  --checkpoint-out <path>  Required for migrate; atomically updated after each object",
+    "  --checkpoint-out <path>  Required for migrate; immutable base plus authenticated append-only journal",
     "  --v2-runtime-rollback-record <path>  Required for fresh migration and rollback; pinned by new authority",
     "  --operator-authority-file <path>    Required for migrate/resume and all schema-2 runtime evidence use",
     "",
-    "  --publication-concurrency <1..16>  Concurrent v3 publications (default: 1)",
+    "  --partition-concurrency <1..4>  Persistent CPU workers (local default: 1)",
+    "  --publication-concurrency <1..16>  Concurrent independent publications/reads (local default: 1)",
     "",
     "Resume/verify:",
     "  --checkpoint-in <path>   Prior checkpoint; required for verify/rollback and migrate resume",
@@ -137,14 +144,14 @@ function requireValue(argv, index, flag) {
   return value;
 }
 
-export function parsePublicationConcurrency(value) {
-  if (!/^(?:[1-9]|1[0-6])$/.test(String(value))) {
-    throw new Error("--publication-concurrency must be an integer from 1 to 16");
-  }
+export function parsePublicationConcurrency(value, runnerPermit = null) {
+  if (!/^[1-9][0-9]*$/.test(String(value))) throw new Error('--publication-concurrency requires a positive integer');
+  validateMigrationConcurrency({ publicationConcurrency: Number(value), runnerPermit });
   return Number(value);
 }
 
-export function parseObservationHistoryMigrationArgs(argv) {
+export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null) {
+  const limits = migrationConcurrencyLimits(runnerPermit);
   const args = {
     mode: "plan",
     transition: null,
@@ -164,7 +171,8 @@ export function parseObservationHistoryMigrationArgs(argv) {
     checkpointIn: null,
     checkpointOut: null,
     expectedPlanSha256: null,
-    publicationConcurrency: 1,
+    publicationConcurrency: limits.publicationDefault,
+    partitionConcurrency: limits.partitionDefault,
     help: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -190,7 +198,12 @@ export function parseObservationHistoryMigrationArgs(argv) {
       args.v2RuntimeRollbackRecord = requireValue(argv, index++, flag);
     }
     else if (flag === "--publication-concurrency") {
-      args.publicationConcurrency = parsePublicationConcurrency(requireValue(argv, index++, flag));
+      args.publicationConcurrency = parsePublicationConcurrency(requireValue(argv, index++, flag), runnerPermit);
+    }
+    else if (flag === "--partition-concurrency") {
+      const value = requireValue(argv, index++, flag);
+      if (!/^[1-9][0-9]*$/.test(value)) throw new Error("--partition-concurrency requires a positive integer");
+      args.partitionConcurrency = Number(value);
     }
     else if (flag === "--checkpoint-in") args.checkpointIn = requireValue(argv, index++, flag);
     else if (flag === "--checkpoint-out") args.checkpointOut = requireValue(argv, index++, flag);
@@ -199,6 +212,7 @@ export function parseObservationHistoryMigrationArgs(argv) {
     }
     else throw new Error(`Unknown argument: ${flag}`);
   }
+  validateMigrationConcurrency({ ...args, runnerPermit });
   if (!MODES.has(args.mode)) throw new Error(`Unsupported --mode: ${args.mode}`);
   if (
     !args.help &&
@@ -251,13 +265,36 @@ function readJsonFile(filePath, label) {
   }
 }
 
-function atomicWriteJson(filePath, value) {
+function ensureDurableDirectory(directory, mode = 0o700) {
+  const missing = [];
+  let current = path.resolve(directory);
+  while (!fs.existsSync(current)) { missing.push(current); current = path.dirname(current); }
+  for (const target of missing.reverse()) {
+    fs.mkdirSync(target, { mode });
+    const parent = fs.openSync(path.dirname(target), 'r');
+    try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+  }
+}
+
+function atomicWriteJson(filePath, value, temporaryRoot = null) {
   const target = path.resolve(filePath);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  const temporary = `${target}.tmp-${process.pid}`;
+  ensureDurableDirectory(path.dirname(target));
+  // Journal scratch bytes never enter the exact numbered-entry namespace.
+  // Unique files also tolerate PID reuse after a VM restart. Interrupted scratch
+  // files are retained; only renamed numbered entries can acquire authority.
+  const scratch = temporaryRoot || path.dirname(target);
+  ensureDurableDirectory(scratch);
+  const temporary = path.join(scratch, `${path.basename(target)}.tmp-${process.pid}-${crypto.randomUUID()}`);
   try {
-    fs.writeFileSync(temporary, stableMigrationJson(value), { mode: 0o600 });
+    const fd = fs.openSync(temporary, 'wx', 0o600);
+    try { fs.writeFileSync(fd, stableMigrationJson(value)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.renameSync(temporary, target);
+    const directory = fs.openSync(path.dirname(target), 'r');
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    if (scratch !== path.dirname(target)) {
+      const scratchDirectory = fs.openSync(scratch, 'r');
+      try { fs.fsyncSync(scratchDirectory); } finally { fs.closeSync(scratchDirectory); }
+    }
   } finally {
     if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
   }
@@ -269,6 +306,11 @@ const RECOVERY_IMPLEMENTATION_PATHS = Object.freeze([
   "scripts/backup_r2/lib/observation_history_migration_v3.mjs",
   "scripts/index_v3_migration/index_v3_migration.sh",
   "scripts/index_v3_migration/recovery_journal_authority.mjs",
+  "scripts/backup_r2/lib/observation_history_migration_worker_pool.mjs",
+  "scripts/backup_r2/lib/observation_history_migration_worker.mjs",
+  "scripts/backup_r2/lib/observation_history_migration_concurrency.mjs",
+  "scripts/backup_r2/lib/observation_history_migration_gcp.mjs",
+  "scripts/backup_r2/lib/observation_history_generation_bindings.mjs",
 ]);
 
 function recoveryProgressPaths(checkpointPath) {
@@ -278,6 +320,7 @@ function recoveryProgressPaths(checkpointPath) {
     manifest: path.join(root, "manifest.json"),
     head: path.join(root, "head.json"),
     entries: path.join(root, "entries"),
+    pending: path.join(root, "pending"),
   });
 }
 
@@ -303,7 +346,7 @@ function readRecoveryEnvelope(filePath, expectedKind) {
   return envelope;
 }
 
-function recoveryImplementationIdentity(repositoryRoot) {
+function recoveryImplementationIdentity(repositoryRoot, runner = null) {
   const root = path.resolve(repositoryRoot);
   const repositoryHead = spawnSync("git", ["rev-parse", "HEAD"], {
     cwd: root,
@@ -312,7 +355,9 @@ function recoveryImplementationIdentity(repositoryRoot) {
   if (repositoryHead.status !== 0 || !String(repositoryHead.stdout || "").trim()) {
     throw new Error("Current recovery repository HEAD is unavailable");
   }
-  const files = RECOVERY_IMPLEMENTATION_PATHS.map((relativePath) => {
+  const paths = [...RECOVERY_IMPLEMENTATION_PATHS];
+  if (!runner || runner.runner_kind === 'gcp') paths.push('scripts/backup_r2/uk_aq_observation_history_migration_v3_gcp.mjs');
+  const files = paths.map((relativePath) => {
     const absolutePath = path.join(root, relativePath);
     if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
       throw new Error(`Recovery implementation file is missing: ${relativePath}`);
@@ -325,6 +370,7 @@ function recoveryImplementationIdentity(repositoryRoot) {
     };
   });
   return Object.freeze({
+    ...(runner ? { runner } : {}),
     repository_head: String(repositoryHead.stdout).trim(),
     files: Object.freeze(files),
   });
@@ -338,6 +384,21 @@ function checkpointFileIdentity(checkpointPath) {
     byte_size: body.byteLength,
     sha256: sha256Hex(body),
   });
+}
+
+function recoveryRunnerIdentity(plan) {
+  const policy = plan.plan_identity?.runner_policy;
+  if (policy?.runner_kind === 'gcp') {
+    if (stableMigrationJson(policy) !== stableMigrationJson(GCP_CLEAN_POLICY) ||
+        plan.runner?.runner_kind !== 'gcp' || plan.runner?.runner_profile !== GCP_CLEAN_POLICY.runner_profile) {
+      throw new Error('Recovery runner contradicts pinned GCP policy');
+    }
+    return { runner_kind: 'gcp', runner_profile: GCP_CLEAN_POLICY.runner_profile };
+  }
+  if (policy || (plan.runner && (plan.runner.runner_kind !== 'local' || plan.runner.runner_profile !== 'local-conservative'))) {
+    throw new Error('Recovery runner contradicts local policy');
+  }
+  return { runner_kind: 'local', runner_profile: 'local-conservative' };
 }
 
 function recoveryManifestPayload({
@@ -355,11 +416,51 @@ function recoveryManifestPayload({
     plan_sha256: plan.plan_sha256,
     target_writer_git_sha: plan.target_writer_git_sha,
     recovery_implementation:
-      recoveryImplementation || recoveryImplementationIdentity(repositoryRoot),
+      recoveryImplementation || recoveryImplementationIdentity(repositoryRoot,
+        checkpoint.progress_format === 'authenticated-journal-v1'
+          ? recoveryRunnerIdentity(plan) : null),
   });
 }
 
+function validateRecoveryUpdateStructure(updates) {
+  const object = (value) => value && typeof value === 'object' && !Array.isArray(value);
+  const fields = (value, allowed, required = allowed) => {
+    if (!object(value) || Object.keys(value).some((key) => !allowed.includes(key)) ||
+        required.some((key) => !Object.hasOwn(value, key))) throw new Error('Recovery update fields are invalid');
+  };
+  fields(updates, ['clean_target_admission', 'prepared_records', 'prepared_state_updates',
+    'completed_objects', 'preparation_order_append', 'final_state', 'publication_evidence'], []);
+  if (!Object.keys(updates).length) throw new Error('Recovery append has no updates');
+  for (const key of ['prepared_records', 'prepared_state_updates', 'completed_objects', 'preparation_order_append', 'publication_evidence']) {
+    if (Object.hasOwn(updates, key) && (!Array.isArray(updates[key]) || !updates[key].length)) throw new Error(`Invalid recovery update array: ${key}`);
+  }
+  for (const entry of updates.prepared_records || []) fields(entry, ['unit_id', 'record']);
+  for (const entry of updates.completed_objects || []) fields(entry, ['key', 'evidence']);
+  const publications = updates.publication_evidence || [];
+  if (publications.length > 16 || publications.some((entry, index) =>
+    !object(entry) || !Number.isSafeInteger(entry.position) || entry.position < 0 ||
+    (index > 0 && entry.position <= publications[index - 1].position))) throw new Error('Recovery publication batch order is invalid');
+  const stateUnits = new Set();
+  for (const entry of updates.prepared_state_updates || []) {
+    fields(entry, ['unit_id', 'files_published', 'remove_staging_refs'], ['unit_id']);
+    if (stateUnits.has(entry.unit_id) || Object.keys(entry).length === 1 ||
+        ['files_published', 'remove_staging_refs'].some((key) => Object.hasOwn(entry, key) && entry[key] !== true)) throw new Error('Recovery state transition is invalid');
+    stateUnits.add(entry.unit_id);
+  }
+  if (Object.hasOwn(updates, 'clean_target_admission') && !object(updates.clean_target_admission)) throw new Error('Invalid clean-start update');
+  if (Object.hasOwn(updates, 'final_state')) {
+    fields(updates.final_state, ['full_verification_complete', 'cutover_ready']);
+    if (Object.values(updates.final_state).some((value) => typeof value !== 'boolean') ||
+        (updates.final_state.cutover_ready && !updates.final_state.full_verification_complete)) throw new Error('Recovery final state is invalid');
+  }
+}
+
 function applyRecoveryUpdates(checkpoint, updates) {
+  if (updates.clean_target_admission) {
+    if (checkpoint.progress_format !== 'authenticated-journal-v1' || checkpoint.clean_target_admission) throw new Error('Clean-start journal evidence redefined or incompatible');
+    validateCleanStartEvidence(updates.clean_target_admission, checkpoint.authority);
+    checkpoint.clean_target_admission = updates.clean_target_admission;
+  }
   for (const entry of updates.prepared_records || []) {
     if (!entry?.unit_id || !entry.record || entry.record.unit_id !== entry.unit_id) {
       throw new Error("Recovery prepared-record update is invalid");
@@ -411,7 +512,7 @@ function applyRecoveryUpdates(checkpoint, updates) {
 }
 
 function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false, diagnostics = false }) {
-  fs.mkdirSync(paths.entries, { recursive: true, mode: 0o700 });
+  ensureDurableDirectory(paths.entries);
   const names = fs.readdirSync(paths.entries)
     .sort();
   if (!fs.existsSync(paths.head) && repairHead && names.length === 0) {
@@ -428,7 +529,7 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
   const authenticationStartedAt = Date.now();
   const authenticationProgress = createOperatorProgress({ label: "V3 recovery: authenticating historical journal", enabled: diagnostics || Boolean(process.env.UK_AQ_OPERATOR_RUN_DIR) });
   if (diagnostics) process.stderr.write(`V3 recovery: authenticating ${names.length} journal entries start=${new Date(authenticationStartedAt).toISOString()}\n`);
-  const replay = readAndValidateRecoveryJournal({
+  const journalOptions = {
     recoveryRoot: paths.root,
     expectedCheckpointSha256: manifest.payload.original_checkpoint.sha256,
     expectedCheckpointByteSize: manifest.payload.original_checkpoint.byte_size,
@@ -437,7 +538,10 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     expectedPlanSha256: manifest.payload.plan_sha256,
     expectedTargetWriterGitSha: manifest.payload.target_writer_git_sha,
     allowEmpty: true,
-  });
+  };
+  const replay = repairHead
+    ? inspectRecoveryJournalForInterruptedAppend(journalOptions)
+    : readAndValidateRecoveryJournal(journalOptions);
   authenticationProgress.finish();
   if (diagnostics) process.stderr.write(`V3 recovery: authentication complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   const replayProgress = createMigrationProgressReporter({
@@ -445,16 +549,45 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
   });
   replayProgress.report(0, { force: true });
   const publicationEvidence = [];
+  let interruptedPreparedPlan = null;
   for (const [index, entry] of replay.entries.entries()) {
     const payload = entry.payload;
+    if (entry === replay.interrupted_append) {
+      // Validate against the committed replay before any head mutation. This
+      // includes exact target identities and immutable schedule/DAG evidence.
+      validateRecoveryUpdateStructure(payload.updates);
+      interruptedPreparedPlan = validateObservationHistoryV3RecoveryAppend({ checkpoint, updates: payload.updates });
+    }
     applyRecoveryUpdates(checkpoint, payload.updates || {});
     publicationEvidence.push(...(payload.updates?.publication_evidence || []));
     replayProgress.report(index + 1);
   }
+  if (replay.interrupted_append) {
+    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+    if (publicationEvidence.length || interruptedPreparedPlan?.v3_publication_plan) {
+      const prepared = interruptedPreparedPlan || buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, requirePrepared: true });
+      const recovered = new Set(validateRecoveredPublicationEvidence(prepared.v3_publication_plan, publicationEvidence).map((entry) => entry.key));
+      for (const entry of prepared.v3_publication_plan.entries) {
+        if (checkpoint.completed_objects[entry.key] && !recovered.has(entry.key)) throw new Error(`Recovery v3 completion lacks publication journal authority: ${entry.key}`);
+      }
+    }
+    const tail = replay.interrupted_append;
+    // The entry may have been renamed immediately before interruption: flush
+    // it and the entries directory again before committing its head.
+    const entryFd = fs.openSync(path.join(paths.entries, `${String(tail.sequence).padStart(10, '0')}.json`), 'r');
+    try { fs.fsyncSync(entryFd); } finally { fs.closeSync(entryFd); }
+    const entriesFd = fs.openSync(paths.entries, 'r');
+    try { fs.fsyncSync(entriesFd); } finally { fs.closeSync(entriesFd); }
+    atomicWriteJson(paths.head, recoveryEnvelope('uk_aq_observation_history_v3_recovery_head', {
+      ...replay.head.payload, last_sequence: tail.sequence, last_entry_sha256: tail.payload_sha256,
+    }), paths.pending);
+    // Re-enter the unchanged exact reader after durable promotion.
+    readAndValidateRecoveryJournal(journalOptions);
+  }
   if (diagnostics) process.stderr.write(`V3 recovery: replay complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   return {
-    sequence: replay.last_sequence,
-    entrySha256: replay.last_entry_sha256,
+    sequence: replay.interrupted_append?.sequence ?? replay.last_sequence,
+    entrySha256: replay.interrupted_append?.payload_sha256 ?? replay.last_entry_sha256,
     publicationEvidence,
   };
 }
@@ -473,7 +606,10 @@ function preparedProgressState(checkpoint) {
 }
 
 function appendRecoveryJournalEntry(context, updates) {
+  if (context.poisoned) throw new Error("Recovery journal persistence previously failed; no further appends allowed");
+  context.poisoned = true;
   const sequence = context.sequence + 1;
+  if (!Number.isSafeInteger(sequence) || sequence > 9999999999) throw new Error("Recovery sequence exceeds numbered journal format");
   const payload = {
     sequence,
     previous_entry_sha256: context.entrySha256,
@@ -487,7 +623,7 @@ function appendRecoveryJournalEntry(context, updates) {
   );
   const target = path.join(context.paths.entries, `${String(sequence).padStart(10, "0")}.json`);
   if (fs.existsSync(target)) throw new Error(`Recovery journal entry already exists: ${target}`);
-  atomicWriteJson(target, envelope);
+  atomicWriteJson(target, envelope, context.paths.pending);
   const headPayload = {
     original_checkpoint_sha256: context.manifest.payload.original_checkpoint.sha256,
     immutable_authority_sha256: context.manifest.payload.immutable_authority_sha256,
@@ -497,9 +633,10 @@ function appendRecoveryJournalEntry(context, updates) {
   atomicWriteJson(context.paths.head, recoveryEnvelope(
     "uk_aq_observation_history_v3_recovery_head",
     headPayload,
-  ));
+  ), context.paths.pending);
   context.sequence = sequence;
   context.entrySha256 = envelope.payload_sha256;
+  context.poisoned = false;
 }
 
 export function buildObservationHistoryV3RecoveryProgressContext({
@@ -516,7 +653,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   let createdManifest = false;
   if (!fs.existsSync(paths.manifest)) {
     if (!create) throw new Error("Recovery progress manifest is missing; run resume preflight first");
-    fs.mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+    ensureDurableDirectory(paths.root);
     atomicWriteJson(paths.manifest, recoveryEnvelope(
       "uk_aq_observation_history_v3_recovery_manifest",
       recoveryManifestPayload({ checkpointPath, checkpoint, repositoryRoot }),
@@ -527,12 +664,17 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     paths.manifest,
     "uk_aq_observation_history_v3_recovery_manifest",
   );
+  if (manifest.payload.recovery_implementation.runner !== undefined &&
+      stableMigrationJson(manifest.payload.recovery_implementation.runner) !== stableMigrationJson(recoveryRunnerIdentity(checkpoint.authority))) {
+    throw new Error('Recovery implementation profile differs from immutable checkpoint runner');
+  }
   const expectedManifestPayload = recoveryManifestPayload({
     checkpointPath,
     checkpoint,
     repositoryRoot,
     recoveryImplementation: requireCurrentImplementation
-      ? null
+      ? (manifest.payload.recovery_implementation.runner === undefined
+        ? recoveryImplementationIdentity(repositoryRoot) : null)
       : manifest.payload.recovery_implementation,
   });
   if (stableMigrationJson(manifest.payload) !== stableMigrationJson(expectedManifestPayload)) {
@@ -582,7 +724,69 @@ export function buildObservationHistoryV3RecoveryProgressContext({
         buildObservationHistoryV3RecoveryReplayStateSha256(recoveredCheckpoint),
     }),
   };
-  context.persistCheckpoint = async (current) => {
+  context.cleanStart = recoveredCheckpoint.clean_target_admission || null;
+  // Active side-by-side writers name only the changed records. This path never
+  // scans/serializes/clones all previous completions on each progress update.
+  context.persistCheckpointDelta = async (current, { preparedUnitIds = [], completedKeys = [], finalState = false, cleanStart = false }) => {
+    if (current.authority_sha256 !== context.manifest.payload.immutable_authority_sha256 ||
+        current.plan_sha256 !== context.manifest.payload.plan_sha256 || current.migration_run_id !== context.manifest.payload.migration_run_id) throw new Error('Checkpoint delta contradicts immutable journal authority');
+    const updates = {};
+    const preparedNext = new Map();
+    const newOrder = [];
+    for (const unitId of preparedUnitIds) {
+      const record = current.prepared_units[unitId];
+      if (!record) throw new Error(`Missing prepared delta: ${unitId}`);
+      const previous = context.preparedState.get(unitId);
+      const next = preparedProgressState({ prepared_units: { [unitId]: record } }).get(unitId);
+      if (!previous) {
+        const position = context.preparationOrder.length + newOrder.length;
+        if (current.authority.units[position]?.unit_id !== unitId || current.preparation_order[position] !== unitId) throw new Error('Preparation delta is not in immutable plan order');
+        (updates.prepared_records ||= []).push({ unit_id: unitId, record });
+        newOrder.push(unitId);
+      } else {
+        if (previous.prepared_plan_sha256 !== next.prepared_plan_sha256 || (previous.files_published && !next.files_published)) throw new Error(`Prepared delta identity changed: ${unitId}`);
+        const change = { unit_id: unitId };
+        if (!previous.files_published && next.files_published) change.files_published = true;
+        if (previous.staging_ref_count > 0 && next.staging_ref_count === 0) change.remove_staging_refs = true;
+        else if (previous.staging_ref_count !== next.staging_ref_count) throw new Error(`Prepared staging delta changed: ${unitId}`);
+        if (Object.keys(change).length > 1) (updates.prepared_state_updates ||= []).push(change);
+      }
+      preparedNext.set(unitId, next);
+    }
+    if (newOrder.length) updates.preparation_order_append = newOrder;
+    const completedNext = new Map();
+    for (const key of completedKeys) {
+      const evidence = current.completed_objects[key];
+      const previous = context.completedEvidence.get(key);
+      if (!evidence || evidence.verified !== true || evidence.durable !== true) throw new Error(`Invalid completed delta: ${key}`);
+      if (previous && stableMigrationJson(previous) !== stableMigrationJson(evidence)) throw new Error(`Completed-object evidence changed for ${key}`);
+      if (!previous) { (updates.completed_objects ||= []).push({ key, evidence }); completedNext.set(key, structuredClone(evidence)); }
+    }
+    for (const unitId of preparedUnitIds) {
+      const record = current.prepared_units[unitId];
+      if (!record.files_published) continue;
+      for (const intent of record.target_file_intents) {
+        const evidence = completedNext.get(intent.key) || context.completedEvidence.get(intent.key);
+        if (evidence?.verified !== true || evidence?.durable !== true || evidence?.stored_sha256_verified !== true ||
+            evidence.byte_size !== intent.byte_size || evidence.sha256 !== intent.sha256) throw new Error(`Prepared publication lacks exact durable file: ${intent.key}`);
+      }
+    }
+    if (cleanStart) {
+      validateCleanStartEvidence(current.clean_target_admission, current.authority);
+      if (context.cleanStart) throw new Error('Clean-start evidence is immutable');
+      updates.clean_target_admission = current.clean_target_admission;
+    }
+    if (finalState) updates.final_state = { full_verification_complete: current.full_verification_complete === true, cutover_ready: current.cutover_ready === true };
+    if (!Object.keys(updates).length) return;
+    appendRecoveryJournalEntry(context, updates);
+    for (const [id, next] of preparedNext) context.preparedState.set(id, next);
+    for (const [key, next] of completedNext) context.completedEvidence.set(key, next);
+    context.preparationOrder.push(...newOrder);
+    if (cleanStart) context.cleanStart = structuredClone(current.clean_target_admission);
+    if (finalState) { context.fullVerificationComplete = current.full_verification_complete === true; context.cutoverReady = current.cutover_ready === true; }
+  };
+  context.persistCheckpoint = async (current, delta = null) => {
+    if (delta) return context.persistCheckpointDelta(current, delta);
     const updates = {};
     const preparedRecords = [];
     const preparedStateUpdates = [];
@@ -907,6 +1111,7 @@ function compactVerificationReport(verification) {
     scoped_root_child_verification:
       verification.scoped_root_child_verification,
     failure_category: verification.failure_category || null,
+    failure_evidence: verification.failure_evidence || null,
     recovery_reconciliation: verification.recovery_reconciliation
       ? {
           mode: verification.recovery_reconciliation.mode,
@@ -1063,6 +1268,7 @@ function compactMigrationResult(result, mode, checkpoint) {
       ok: false,
       status: result.status,
       error: compactReportString(result.error || "operation failed"),
+      failure_evidence: result.failure_evidence || null,
       runtime_recoverability: result.runtime_recoverability || null,
       runtime_recovery: result.runtime_recovery || null,
       verification: compactVerificationReport(result.verification),
@@ -1358,6 +1564,33 @@ async function validateMigrationPublicationSchedule(plan) {
   throw new Error("V3 publication validation did not reach the publication boundary");
 }
 
+function validateRecoveredPublicationEvidence(plan, entries) {
+  if (!Array.isArray(entries)) throw new Error('Recovered publication evidence must be an array');
+  const byKey = new Map(plan.entries.map((entry) => [entry.key, entry]));
+  const recovered = new Map();
+  for (const entry of entries) {
+    const expected = byKey.get(entry?.key);
+    if (!expected || entry.byte_size !== expected.byte_size || entry.sha256 !== expected.sha256 ||
+        entry.position !== expected.position || entry.schedule_sha256 !== plan.schedule_sha256 ||
+        entry.post_put_get_verified !== true ||
+        (entry.publication_stage !== undefined && entry.publication_stage !== expected.publication_stage) ||
+        (entry.verified !== undefined && entry.verified !== true) || (entry.durable !== undefined && entry.durable !== true)) {
+      throw new Error(`Recovered publication contradicts immutable schedule: ${entry?.key}`);
+    }
+    // Historical equivalent duplicate records are redundant, never replacement
+    // authority. Every occurrence independently passes the full identity gate.
+    recovered.set(entry.key, expected);
+  }
+  for (const entry of recovered.values()) {
+    for (const reference of [...entry.dependencies, ...entry.publication_prerequisites]) {
+      if (byKey.has(reference.key) && !recovered.has(reference.key)) {
+        throw new Error(`Recovered parent lacks durable changed child: ${reference.key} -> ${entry.key}`);
+      }
+    }
+  }
+  return plan.entries.filter((entry) => recovered.has(entry.key));
+}
+
 export async function finalizeMigrationV3Publication({
   plan,
   putIfChanged,
@@ -1365,21 +1598,54 @@ export async function finalizeMigrationV3Publication({
   recordDurableEvidence,
   recordDurableEvidenceBatch,
   publicationConcurrency = 1,
+  runnerPermit = null,
+  recoveredPublicationEvidence = [],
+  onRecoveredPublication = null,
 }) {
-  const concurrency = parsePublicationConcurrency(publicationConcurrency);
+  const concurrency = parsePublicationConcurrency(publicationConcurrency, runnerPermit);
+  await validateMigrationPublicationSchedule(plan);
+  const recovered = validateRecoveredPublicationEvidence(plan, recoveredPublicationEvidence);
+  const completed = new Set();
+  const evidence = [];
+  // Historical completion alone cannot satisfy a dependency. Strong current
+  // GET identity is established for all recovered entries before any new PUT.
+  for await (const batch of settledMigrationBatches(recovered, concurrency, async (entry) => {
+    const current = await getObject({ key: entry.key });
+    if (!current || current.exists === false || current.ok === false || current.body == null) throw new Error(`Recovered v3 object is missing: ${entry.key}`);
+    const body = Buffer.from(current.body);
+    if (body.byteLength !== entry.byte_size || sha256Hex(body) !== entry.sha256 || !body.equals(Buffer.from(entry.body))) {
+      throw new Error(`Recovered v3 current exact identity changed: ${entry.key}`);
+    }
+    return entry;
+  })) {
+    const currentlyVerified = [];
+    for (const { result } of batch) if (result.status === 'fulfilled') {
+      const entry = result.value;
+      completed.add(entry.key);
+      currentlyVerified.push(entry);
+      evidence.push(Object.freeze({ key: entry.key, byte_size: entry.byte_size, sha256: entry.sha256,
+        publication_stage: entry.publication_stage, verified: true, durable: true, put_status: 'recovered' }));
+    }
+    onRecoveredPublication?.(currentlyVerified);
+  }
   if (concurrency === 1) {
+    // Retain the contracted original serial finaliser and its dependency gates.
+    // Already reverified objects use exact lower-adapter evidence and no append.
     return finalizeObservationHistoryIndexV3Publication({
-      plan, putIfChanged, getObject, recordDurableEvidence,
+      plan,
+      putIfChanged: (entry) => completed.has(entry.key)
+        ? { ...entry, ok: true, verified: true, post_put_get_verified: true, status: 'recovered' }
+        : putIfChanged(entry),
+      getObject,
+      recordDurableEvidence: (entry) => completed.has(entry.key) ? { durable: true } : recordDurableEvidence(entry),
     });
   }
   if (typeof recordDurableEvidenceBatch !== "function") {
     throw new Error("Concurrent publication requires a durable batch adapter");
   }
-  await validateMigrationPublicationSchedule(plan);
+  const positions = new Map(plan.entries.map((entry) => [entry.key, entry.position]));
   const changedKeys = new Set(plan.entries.map((entry) => entry.key));
   const externalByKey = new Map(plan.external_references.map((entry) => [entry.key, entry]));
-  const completed = new Set();
-  const evidence = [];
   let next = 0;
   while (next < plan.entries.length) {
     const batch = [];
@@ -1387,6 +1653,7 @@ export async function finalizeMigrationV3Publication({
     // at a barrier preserves global journal position order, even across batches.
     while (next < plan.entries.length && batch.length < concurrency) {
       const entry = plan.entries[next];
+      if (completed.has(entry.key)) { next += 1; continue; }
       const blocked = [...entry.dependencies, ...entry.publication_prerequisites].find(
         (reference) => changedKeys.has(reference.key)
           ? !completed.has(reference.key)
@@ -1414,12 +1681,10 @@ export async function finalizeMigrationV3Publication({
       if (!putResult || putResult.ok === false) {
         throw new Error(`V3 publication PUT failed: ${entry.key}`);
       }
-      const fetched = await getObject({ key: entry.key });
-      const fetchedBody = Buffer.isBuffer(fetched?.body)
-        ? Buffer.from(fetched.body)
-        : Buffer.from(fetched?.body ?? "");
-      if (fetchedBody.byteLength !== entry.byte_size || sha256Hex(fetchedBody) !== entry.sha256) {
-        throw new Error(`V3 post-PUT GET verification failed: ${entry.key}`);
+      if (!exactPublicationEvidence(putResult, entry, 'post_put_get_verified')) {
+        const fetched = await getObject({ key: entry.key });
+        const fetchedBody = Buffer.from(fetched?.body ?? '');
+        if (fetchedBody.byteLength !== entry.byte_size || sha256Hex(fetchedBody) !== entry.sha256) throw new Error(`V3 post-PUT GET verification failed: ${entry.key}`);
       }
       return {
         key: entry.key,
@@ -1448,8 +1713,7 @@ export async function finalizeMigrationV3Publication({
       } catch (error) {
         // A failed append may leave an entry beyond its head. No further append
         // or parent publication may use that uncertain sequence/head state.
-        throw new AggregateError([...failures, error],
-          `V3 durable publication batch failed: ${successes.map((entry) => entry.key).join(", ")}: ${error.message}`);
+        throw migrationFailure([...failures, new Error(`V3 durable publication batch failed: ${error.message}`, { cause: error })]);
       }
       for (const entry of successes) {
         completed.add(entry.key);
@@ -1465,7 +1729,7 @@ export async function finalizeMigrationV3Publication({
       }
     }
     if (failures.length) {
-      throw failures[0];
+      throw migrationFailure(failures);
     }
   }
   return Object.freeze({
@@ -1473,7 +1737,7 @@ export async function finalizeMigrationV3Publication({
     status: "succeeded",
     schedule_sha256: plan.schedule_sha256,
     published_object_count: evidence.length,
-    objects: Object.freeze(evidence),
+    objects: Object.freeze(evidence.sort((a, b) => positions.get(a.key) - positions.get(b.key))),
   });
 }
 
@@ -1485,8 +1749,12 @@ function buildR2Adapters({
   recoveryProgress = null,
   runtimeAuthorityAdapters = null,
   publicationConcurrency = 1,
+  runnerPermit = null, freshJournal = false, repositoryRoot = null,
 }) {
   const r2 = config.r2;
+  const requireHealthyJournal = () => {
+    if (recoveryProgress?.poisoned) throw new Error('Recovery journal persistence failed; publication is forbidden until authenticated restart');
+  };
   const durableEvidence = recoveryProgress
     ? [...recoveryProgress.publicationEvidence]
     : [];
@@ -1506,10 +1774,15 @@ function buildR2Adapters({
   };
   const recordDurableEvidenceBatch = async (entries) => {
     if (recoveryProgress) {
-      const result = await recoveryProgress.recordPublicationEvidenceBatch(entries);
-      if (result?.durable === true) durableEvidence.push(...entries.map((entry) => ({ ...entry })));
-      return result;
+      for (let offset = 0; offset < entries.length; offset += 16) {
+        const chunk = entries.slice(offset, offset + 16);
+        const result = await recoveryProgress.recordPublicationEvidenceBatch(chunk);
+        if (result?.durable !== true) throw new Error('Journal did not prove publication durability');
+        durableEvidence.push(...chunk.map((entry) => ({ ...entry })));
+      }
+      return { durable: true };
     }
+    if (freshJournal) throw new Error("Fresh journal authority must exist before publication");
     if (!evidencePath) throw new Error("Durable v3 publication evidence requires --checkpoint-out");
     const nextEvidence = [...durableEvidence, ...entries.map((entry) => ({ ...entry }))];
     atomicWriteJson(evidencePath, {
@@ -1521,30 +1794,35 @@ function buildR2Adapters({
   return {
     getObject: ({ key }) => r2GetObject({ r2, key }),
     headObject: ({ key }) => r2HeadObject({ r2, key }),
-    putChecksumObject: (intent) => putAndVerifyR2ObjectWithSha256({ r2, intent }),
-    putJsonObject: (object) => r2PutObject({
+    listObjects: (request) => r2ListObjectsV2({ r2, ...request, require_valid_listing: true }),
+    putChecksumObject: (intent) => { requireHealthyJournal(); return putAndVerifyR2ObjectWithSha256({ r2, intent }); },
+    putJsonObject: (object) => { requireHealthyJournal(); return r2PutObject({
       r2,
       key: object.key,
       body: object.body,
       content_type: object.content_type,
-    }),
-    putIfChanged: (object) => r2PutObjectIfChanged({
+    }); },
+    putIfChanged: (object) => { requireHealthyJournal(); return r2PutObjectIfChanged({
       r2,
       key: object.key,
       body: object.body,
       content_type: object.content_type,
       writeR2: true,
-    }),
+    }); },
     recordDurableEvidence: (entry) => recordDurableEvidenceBatch([entry]),
     recordDurableEvidenceBatch,
     getDurablePublicationEvidence: () => durableEvidence.map((entry) => ({ ...entry })),
-    writeCheckpoint: recoveryProgress
-      ? recoveryProgress.persistCheckpoint
-      : async (checkpoint) => atomicWriteJson(checkpointOut, checkpoint),
+    writeCheckpoint: async (checkpoint, delta) => {
+      if (recoveryProgress) return recoveryProgress.persistCheckpoint(checkpoint, delta);
+      if (!freshJournal) return atomicWriteJson(checkpointOut, checkpoint);
+      if (fs.existsSync(checkpointOut)) throw new Error('Fresh immutable checkpoint already exists');
+      atomicWriteJson(checkpointOut, checkpoint);
+      recoveryProgress = buildObservationHistoryV3RecoveryProgressContext({ checkpointPath: checkpointOut, checkpoint, repositoryRoot, create: true });
+    },
     stageUnit: async ({ unitId, intents }) => {
       if (!stagingRoot) throw new Error("Migration staging requires --checkpoint-out");
       const unitDirectory = requireStagingPath(path.join(stagingRoot, unitId));
-      fs.mkdirSync(unitDirectory, { recursive: true, mode: 0o700 });
+      ensureDurableDirectory(unitDirectory);
       return intents.map((intent, index) => {
         const target = requireStagingPath(
           path.join(unitDirectory, `${String(index).padStart(5, "0")}.parquet`),
@@ -1558,8 +1836,11 @@ function buildR2Adapters({
         }
         const temporary = `${target}.tmp-${process.pid}`;
         try {
-          fs.writeFileSync(temporary, body, { mode: 0o600 });
+          const fd = fs.openSync(temporary, 'wx', 0o600);
+          try { fs.writeFileSync(fd, body); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
           fs.renameSync(temporary, target);
+          const directory = fs.openSync(unitDirectory, 'r');
+          try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
         } finally {
           if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
         }
@@ -1598,7 +1879,8 @@ function buildR2Adapters({
     },
     getBackupObject,
     finalizeV3Publication: (options) =>
-      finalizeMigrationV3Publication({ ...options, publicationConcurrency }),
+      finalizeMigrationV3Publication({ ...options, publicationConcurrency, runnerPermit,
+        recoveredPublicationEvidence: recoveryProgress ? [...recoveryProgress.publicationEvidence] : [] }),
     rebuildV2Indexes: () => runHistoryIndexBuild({
       argv: ["--history-version", "v2", "--domain", "observations", "--write-r2"],
       env,
@@ -1629,7 +1911,7 @@ function buildSideBySideR2Adapters(options) {
   const {
     getBackupObject, rebuildV2Indexes, verifyV2IndexCompleteness,
     ...adapters
-  } = buildR2Adapters(options);
+  } = buildR2Adapters({ ...options, freshJournal: true });
   return adapters;
 }
 
@@ -1647,7 +1929,7 @@ export function createSideBySideLockAssertion({ env, migrationRunId }) {
   };
 }
 
-async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory }) {
+async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory, runnerPermit = null, entrypoint = fileURLToPath(import.meta.url) }) {
   const missing = [
     ["--environment", args.environment], ["--expected-bucket", args.expectedBucket],
     ["--migration-run-id", args.migrationRunId], ["--target-writer-git-sha", args.targetWriterGitSha],
@@ -1660,6 +1942,11 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
     throw new Error("Side-by-side migration does not accept historical Dropbox/runtime rollback authority arguments");
   }
   const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repositoryRoot, encoding: 'utf8' });
+  const dirty = spawnSync('git', ['status', '--porcelain=v1', '--untracked-files=normal'], { cwd: repositoryRoot, encoding: 'utf8' });
+  if (head.status !== 0 || dirty.status !== 0 || head.stdout.trim() !== args.targetWriterGitSha || dirty.stdout.trim()) {
+    throw new Error('Side-by-side execution requires clean reviewed code at the exact target writer Git SHA');
+  }
   const config = resolveR2HistoryIndexConfig(env);
   if (!hasRequiredR2Config(config.r2)) throw new Error("Complete configured R2 credentials and bucket are required");
   const evidence = {
@@ -1692,7 +1979,7 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
         databaseUrl: env.SUPABASE_DB_URL || env.DATABASE_URL,
         owner: SIDE_BY_SIDE_LOCK_OWNER, runId: args.migrationRunId,
         command: process.execPath,
-        commandArgs: [...process.execArgv, fileURLToPath(import.meta.url), ...argv],
+        commandArgs: [...process.execArgv, entrypoint, ...argv],
         env, diagnostics,
       });
       return { delegated: true, exitCode };
@@ -1705,10 +1992,11 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
   let plan = null;
   let checkpoint = null;
   let recoveryProgress = null;
+  let planningAdmission = null;
   // Construct only R2/local adapters. No Dropbox reader or deployment adapter.
   const baseAdapters = adapterFactory({
     config, checkpointOut: args.checkpointOut || args.checkpointIn, env,
-    publicationConcurrency: args.publicationConcurrency, assertLockHeld,
+    publicationConcurrency: args.publicationConcurrency, runnerPermit, repositoryRoot, assertLockHeld,
   });
   const getObject = async (request) => {
     assertLockHeld();
@@ -1717,11 +2005,13 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
     return result;
   };
   try {
+    if (runnerPermit && !args.checkpointIn) planningAdmission = await inspectEmptyV3Target({ listObjects: baseAdapters.listObjects, assertLockHeld, phase: 'plan' });
     if (args.checkpointIn) {
       assertLockHeld();
       checkpoint = readJsonFile(args.checkpointIn, "side-by-side checkpoint");
       plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
       assertSideBySideMigrationPlan(plan);
+      if (!runnerPermit && plan.plan_identity.runner_policy?.runner_kind === 'gcp') throw new Error('GCP checkpoint recovery requires the metadata-admitted GCP entrypoint');
       // Check pinned source BEFORE recovery journal initialization or target work.
       await verifySideBySideSourceRoot({ plan, getObject });
     } else {
@@ -1729,6 +2019,7 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
         getR2Object: getObject, assertLockHeld, repositoryRoot,
         environmentEvidence: evidence, migrationRunId: args.migrationRunId,
         targetWriterGitSha: args.targetWriterGitSha,
+        publicationConcurrency: args.publicationConcurrency, runnerPermit, runnerPolicy: runnerPermit ? GCP_CLEAN_POLICY : null,
       });
     }
     if (plan.migration_run_id !== args.migrationRunId ||
@@ -1738,12 +2029,19 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
         (args.expectedPlanSha256 && args.expectedPlanSha256 !== plan.plan_sha256)) {
       throw new Error("Side-by-side pinned run, writer, limits, environment or plan hash differs");
     }
+    if (runnerPermit && stableMigrationJson(plan.plan_identity.runner_policy) !== stableMigrationJson(GCP_CLEAN_POLICY)) throw new Error('GCP runner requires its own complete clean-build plan; local/historical checkpoint is incompatible');
+    if (!checkpoint) plan = Object.freeze({ ...plan,
+      runner: { ...(runnerPermit || { runner_kind: 'local', runner_profile: 'local-conservative' }),
+        partition_concurrency: args.partitionConcurrency, publication_concurrency: args.publicationConcurrency },
+      planning_clean_target_admission: planningAdmission });
+    process.stderr.write(`V3 migration: runner=${runnerPermit?.runner_profile || 'local-conservative'} partition_concurrency=${args.partitionConcurrency} publication_concurrency=${args.publicationConcurrency}\n`);
     if (checkpoint) {
       const hasJournal = fs.existsSync(recoveryProgressPaths(args.checkpointIn).manifest);
+      if (!hasJournal && checkpoint.progress_format === "authenticated-journal-v1") throw new Error("Authenticated fresh-run journal is missing");
       if (hasJournal || args.mode === "migrate") {
         recoveryProgress = buildObservationHistoryV3RecoveryProgressContext({
           checkpointPath: args.checkpointIn, checkpoint, repositoryRoot,
-          create: args.mode === "migrate", requireCurrentImplementation: true,
+          create: args.mode === "migrate", repairHead: args.mode === "migrate", requireCurrentImplementation: true,
         });
         checkpoint = recoveryProgress.checkpoint;
         plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
@@ -1753,7 +2051,7 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
     const adapters = guardSideBySideMigrationAdapters(plan, {
       ...(recoveryProgress ? adapterFactory({
         config, checkpointOut: args.checkpointOut || args.checkpointIn, env,
-        recoveryProgress, publicationConcurrency: args.publicationConcurrency, assertLockHeld,
+        recoveryProgress, publicationConcurrency: args.publicationConcurrency, runnerPermit, repositoryRoot, assertLockHeld,
       }) : baseAdapters),
       assertLockHeld,
     });
@@ -1767,7 +2065,7 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
         plan, apply: true, writersFrozen: args.writersFrozen,
         environmentEvidence: evidence, checkpoint,
         recoveryAuthority: recoveryProgress?.authenticatedRecoveryAuthority || null,
-        publicationConcurrency: args.publicationConcurrency,
+        publicationConcurrency: args.publicationConcurrency, partitionConcurrency: args.partitionConcurrency, runnerPermit,
         onReconstructedPlan: (value) => { reportPlan = value; }, adapters,
       });
       checkpoint = result.checkpoint;
@@ -1780,6 +2078,7 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
       result = await verifyObservationHistoryV3CurrentDependencies({
         plan: reportPlan, checkpoint, getObject: adapters.getObject, headObject: adapters.headObject,
         publicationResult: { ok: true, checkpoint_evidence: true },
+        publicationConcurrency: args.publicationConcurrency, partitionConcurrency: args.partitionConcurrency, runnerPermit,
       });
     }
     const sourceRoot = await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
@@ -1792,6 +2091,11 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
           ? { verification: result, v3_publication: { ok: true } } : null,
       }),
     });
+    output.audit.runner = { ...(runnerPermit || { runner_kind: 'local', runner_profile: 'local-conservative' }),
+      partition_concurrency: args.partitionConcurrency, publication_concurrency: args.publicationConcurrency };
+    output.audit.clean_target_admission = checkpoint?.clean_target_admission || planningAdmission;
+    output.audit.initial_runner = plan.runner;
+    output.audit.planning_clean_target_admission = plan.planning_clean_target_admission;
     output.result.plan_sha256 = plan.plan_sha256;
     output.result.generation_topology = SIDE_BY_SIDE_TOPOLOGY;
     output.result.source_root = sourceRoot;
@@ -1807,7 +2111,8 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
   } catch (error) {
     atomicWriteJson(args.reportOut, {
       result: { ok: false, status: "failed", generation_topology: SIDE_BY_SIDE_TOPOLOGY,
-        plan_sha256: plan?.plan_sha256 || null, error: error.message, runtime_switch_performed: false },
+        plan_sha256: plan?.plan_sha256 || null, error: error.message, failure_evidence: migrationFailureEvidence(error), runtime_switch_performed: false },
+      audit: { runner: runnerPermit, clean_target_admission: error.clean_target_admission || checkpoint?.clean_target_admission || null },
     });
     throw error;
   }
@@ -1819,11 +2124,13 @@ export async function runObservationHistoryMigrationV3({
   now = () => new Date().toISOString(),
   runLockedCommand = runCommandWithObservationsGlobalOperationLock,
   sideBySideAdapterFactory = buildSideBySideR2Adapters,
+  runnerPermit = null, entrypoint = fileURLToPath(import.meta.url),
 } = {}) {
-  const args = parseObservationHistoryMigrationArgs(argv);
+  const args = parseObservationHistoryMigrationArgs(argv, runnerPermit);
   if (args.help) return { help: true, text: usage() };
+  if (runnerPermit && (args.environment !== "TEST" || args.transition !== "v2-to-v3" || !["plan", "migrate", "verify"].includes(args.mode))) throw new Error("GCP clean-build runner supports only TEST v2-to-v3 plan/migrate/verify");
   if (args.transition === "v2-to-v3" && ["plan", "migrate", "verify"].includes(args.mode)) {
-    return runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory: sideBySideAdapterFactory });
+    return runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory: sideBySideAdapterFactory, runnerPermit, entrypoint });
   }
   if (args.checkpointIn && ["rollback", "rollback-plan"].includes(args.mode) &&
       readJsonFile(args.checkpointIn, "migration checkpoint")?.authority?.generation_topology === SIDE_BY_SIDE_TOPOLOGY) {
@@ -2171,11 +2478,13 @@ export async function runObservationHistoryMigrationV3({
       ok: false,
       status: "failed",
       error: message,
+      failure_evidence: migrationFailureEvidence(error),
       runtime_recoverability: error.runtimeRecoverability || null,
       runtime_recovery: adapters.getV2RuntimeRecoveryEvidence?.() || null,
       failure_category: failureCategory,
       verification: {
-        blockers: [`operation_failed:${message}`],
+        blockers: error.blockers || (error.errors || [error]).map((failure) => `operation_failed:${failure.message}`),
+        failure_evidence: migrationFailureEvidence(error),
         failure_category: failureCategory,
       },
     };

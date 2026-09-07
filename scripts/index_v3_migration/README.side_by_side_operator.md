@@ -5,6 +5,10 @@ active Node CLI directly. `index_v3_migration.sh` is a historical in-place/Dropb
 recovery wrapper and is not the side-by-side entry point. Its historical authority
 arguments are rejected by active `--transition v2-to-v3` plan/migrate/verify modes.
 
+The local runner uses partition concurrency 1 (maximum 4) and publication
+concurrency 1 (maximum 16). Both are explicit bounded CLI options. For the separately
+GCE-attested complete clean TEST build, see [the GCP runner guide](README.gcp_clean_build.md).
+
 The operator builds from `history/v2/observations` and its authoritative v2 binding
 hierarchy. Writes are restricted to `history/v3/observations`,
 `history/_index_v3/observations_timeseries`,
@@ -87,8 +91,10 @@ checkpoint or its historical `cutover_ready` field is not authorization to switc
 readers or resume writers onto v3. Real TEST output is still required acceptance
 evidence; local deterministic checks are structural proof only.
 
-For interruption, retain `checkpoint.json` and all its `.staging`, `.publication.json`
-and `.recovery` siblings that exist. Do not edit, relocate, delete or substitute
+Fresh runs retain an immutable `checkpoint.json` plus an authenticated append-only
+`.recovery` journal from the start; they no longer rewrite a growing checkpoint or
+`.publication.json` per object. For interruption, retain the checkpoint and all its
+`.staging`, `.publication.json` (older runs) and `.recovery` siblings that exist. Do not edit, relocate, delete or substitute
 them. Use the same run, writer, limits, plan hash and checkpoint path:
 
 ```bash

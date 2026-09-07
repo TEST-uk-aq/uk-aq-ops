@@ -1,3 +1,6 @@
+import { MigrationWorkerPool } from './observation_history_migration_worker_pool.mjs';
+import { settledMigrationBatches, exactPublicationEvidence, migrationFailure, migrationBatchFailures, throwMigrationBatchFailures, withMigrationBatchEvidence, migrationFailureEvidence } from './observation_history_migration_concurrency.mjs';
+import { validateMigrationConcurrency, inspectEmptyV3Target, validateCleanStartEvidence } from './observation_history_migration_gcp.mjs';
 import { inventorySideBySideBindings } from "./observation_history_generation_bindings.mjs";
 import {
   getObservationHistoryGeneration,
@@ -278,6 +281,10 @@ function addRecoveryReplayDigestRecord(hash, name, value) {
 export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint) {
   const hash = createHash("sha256");
   hash.update("uk_aq_observation_history_v3_recovery_replay_state_v1;");
+  if (checkpoint?.progress_format === "authenticated-journal-v1") {
+    addRecoveryReplayDigestRecord(hash, "progress_format", checkpoint.progress_format);
+    addRecoveryReplayDigestRecord(hash, "clean_target_admission", checkpoint.clean_target_admission);
+  }
   addRecoveryReplayDigestRecord(hash, "authority_sha256", checkpoint?.authority_sha256);
   addRecoveryReplayDigestRecord(hash, "migration_run_id", checkpoint?.migration_run_id);
   addRecoveryReplayDigestRecord(hash, "plan_sha256", checkpoint?.plan_sha256);
@@ -2121,46 +2128,35 @@ function partitionIdentity(scope) {
   return `${scope.day_utc}|${scope.connector_id}|${scope.pollutant_code}`;
 }
 
-async function rewritePartition({
-  sourcePartition,
-  getR2Object,
-  writerLimits,
-  observationsPrefix,
-  targetWriterGitSha,
-  sosConnectorId,
-  v3IndexRoot,
+async function acquirePinnedPartitionMaterial({ sourcePartition, authorityUnit, getR2Object }) {
+  await reverifyPinnedSourceManifestReference({ sourcePartition, getR2Object });
+  const material = [];
+  for (const file of [...sourcePartition.canonical_files].sort((a, b) => String(a.key).localeCompare(String(b.key)))) {
+    const object = await getRequiredObject(getR2Object, file.key, "canonical R2");
+    verifyManifestFileIdentity({ manifestIdentity: file.etag_or_hash, expectedBytes: file.bytes, liveObject: object, objectKey: file.key });
+    const identity = { key: file.key, byte_size: object.body.byteLength, sha256: sha256Hex(object.body),
+      manifest_identity_type: classifyManifestFileIdentity(file.etag_or_hash, { objectKey: file.key }).type };
+    const expected = authorityUnit.source_files[material.length];
+    if (!sameSemanticJson(identity, expected)) throw new Error(`Pinned source file changed before CPU dispatch: ${file.key}`);
+    material.push({ identity, body: Uint8Array.from(object.body) });
+  }
+  if (material.length !== authorityUnit.source_files.length) throw new Error('Pinned source file count changed');
+  return material;
+}
+
+// Pure CPU entry point. The main process alone acquires/authenticates material.
+export async function transformPinnedObservationPartition({
+  sourcePartition, material, writerLimits, observationsPrefix, targetWriterGitSha, sosConnectorId, v3IndexRoot, position,
 }) {
-  await reverifyPinnedSourceManifestReference({
-    sourcePartition,
-    getR2Object,
-  });
   const rows = [];
   const sourceFiles = [];
-  for (const file of [...sourcePartition.canonical_files].sort((a, b) =>
-    String(a.key).localeCompare(String(b.key))
-  )) {
-    const object = await getRequiredObject(getR2Object, file.key, "canonical R2");
-    verifyManifestFileIdentity({
-      manifestIdentity: file.etag_or_hash,
-      expectedBytes: file.bytes,
-      liveObject: object,
-      objectKey: file.key,
-    });
-    const decoded = await readCanonicalObservationRowsFromParquetBytes({
-      body: object.body,
-      connectorId: sourcePartition.scope.connector_id,
-      sosConnectorId,
-    });
-    rows.push(...decoded);
-    sourceFiles.push(Object.freeze({
-      key: file.key,
-      byte_size: object.body.byteLength,
-      sha256: sha256Hex(object.body),
-      manifest_identity_type: classifyManifestFileIdentity(
-        file.etag_or_hash,
-        { objectKey: file.key },
-      ).type,
-    }));
+  for (const entry of material) {
+    const body = Buffer.from(entry.body);
+    if (body.byteLength !== entry.identity.byte_size || sha256Hex(body) !== entry.identity.sha256) throw new Error('CPU source transfer identity mismatch');
+    const decoded = await readCanonicalObservationRowsFromParquetBytes({ body, connectorId: sourcePartition.scope.connector_id, sosConnectorId });
+    for (const row of decoded) rows.push(row);
+    sourceFiles.push(entry.identity);
+    entry.body = null;
   }
   const sourceLogical = computeObservationContentHash(rows);
   assertRowsMatchSourcePartition(rows, {
@@ -2211,6 +2207,7 @@ async function rewritePartition({
       ordinal,
     ),
   });
+  rows.length = 0;
   if (
     !sameSemanticJson(contentHashMetadata(target.metadata), effectiveSourceHash)
   ) {
@@ -2272,6 +2269,7 @@ async function rewritePartition({
     0,
   );
   return Object.freeze({
+    plan_position: position,
     unit_id: sha256Hex(stableMigrationJson({
       source_manifest: sourcePartition.manifest_identity,
       source_files: sourceFiles,
@@ -3037,6 +3035,12 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
   onProgress = null,
 }) {
   const authority = checkpoint?.authority;
+  if (checkpoint?.progress_format !== undefined && checkpoint.progress_format !== 'authenticated-journal-v1') throw new Error('Unsupported migration progress format');
+  if (checkpoint?.progress_format === 'authenticated-journal-v1') {
+    for (const [index, unitId] of (checkpoint.preparation_order || []).entries()) {
+      if (authority?.units?.[index]?.unit_id !== unitId || !checkpoint.prepared_units?.[unitId]) throw new Error('Journal preparation order contradicts immutable plan');
+    }
+  }
   const transition = authority?.transition
     ? normalizeObservationHistoryV3MigrationTransition(authority.transition.kind)
     : null;
@@ -3067,6 +3071,102 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
     checkpoint, authority, allowLegacyRecoveryOrdering, legacyOriginalOrdering, onProgress,
   });
   return completePreparedV3Plan({ checkpoint, authority, units, canonicalObjects, onProgress });
+}
+
+// Validate a possible interrupted append against committed state. This is a
+// local authentication gate, never an R2 verifier or a completion inference.
+export function validateObservationHistoryV3RecoveryAppend({ checkpoint, updates }) {
+  const authority = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+  const units = new Map(authority.units.map((unit) => [unit.unit_id, unit]));
+  const records = new Map(Object.entries(checkpoint.prepared_units));
+  const added = [];
+  for (const { unit_id: unitId, record } of updates.prepared_records || []) {
+    if (records.has(unitId) || !units.has(unitId)) throw new Error(`Recovery prepared unit redefined or unknown: ${unitId}`);
+    const unit = units.get(unitId);
+    preparedUnitFromRecord(unit, record, { sideBySide: authority.generation_topology === SIDE_BY_SIDE_TOPOLOGY });
+    const prefix = authority.target_observations_prefix || authority.inventory.observations_prefix;
+    if (!sameSemanticJson(record.scope, unit.scope) || record.v3_index_root !== authority.v3_index_root ||
+        record.target_manifest.writer_git_sha !== authority.target_writer_git_sha ||
+        record.target_manifest.manifest_key !== buildHistoryV2PollutantManifestKey(prefix, unit.scope.day_utc, unit.scope.connector_id, unit.scope.pollutant_code) ||
+        record.target_file_intents.length !== record.target_metadata.files.length ||
+        record.target_file_intents.some((intent, ordinal) => intent.key !== buildHistoryV2PartKey(prefix, unit.scope.day_utc, unit.scope.connector_id, unit.scope.pollutant_code, ordinal) ||
+          intent.key !== record.target_metadata.files[ordinal].key || intent.sha256 !== record.target_metadata.files[ordinal].sha256 ||
+          intent.byte_size !== record.target_metadata.files[ordinal].byte_size)) {
+      throw new Error(`Recovery prepared target contradicts immutable writer/scope: ${unitId}`);
+    }
+    if (record.files_published !== false) throw new Error('New prepared unit already claims publication');
+    records.set(unitId, record);
+    added.push(unitId);
+  }
+  const append = updates.preparation_order_append || [];
+  if (!sameSemanticJson(added, append) || append.some((unitId, index) =>
+    authority.units[checkpoint.preparation_order.length + index]?.unit_id !== unitId)) {
+    throw new Error('Recovery append is not the next immutable preparation prefix');
+  }
+  const expected = new Map();
+  for (const record of records.values()) for (const intent of record.target_file_intents) {
+    expected.set(intent.key, { ...intent, require_stored_sha256: true });
+  }
+  for (const entry of [...(authority.bindings?.bindings || []), ...(authority.bindings?.manifests || [])]) expected.set(entry.key, entry);
+  const additions = updates.completed_objects || [];
+  let complete = null;
+  if (additions.some((entry) => !expected.has(entry.key)) || (updates.publication_evidence || []).length || updates.final_state?.full_verification_complete) {
+    const candidate = { ...checkpoint, prepared_units: Object.fromEntries(records), preparation_order: [...checkpoint.preparation_order, ...append] };
+    complete = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: candidate, requirePrepared: true });
+    for (const entry of [...complete.canonical_publication_objects, ...complete.v3_publication_plan.entries]) expected.set(entry.key, entry);
+  }
+  const v3Keys = new Set(complete?.v3_publication_plan.entries.map((entry) => entry.key) || []);
+  const completions = new Map(Object.entries(checkpoint.completed_objects));
+  const bindingLeaves = authority.bindings?.bindings || [];
+  const bindingManifests = authority.bindings?.manifests || [];
+  const bindingManifestKeys = new Set(bindingManifests.map((entry) => entry.key));
+  if (added.length && [...bindingLeaves, ...bindingManifests].some((entry) =>
+    !completionEvidenceMatches(completions.get(entry.key), entry))) throw new Error('Recovery preparation precedes durable binding hierarchy');
+  for (const { key, evidence } of additions) {
+    if (completions.has(key) || !expected.has(key) || !completionEvidenceMatches(evidence, expected.get(key)) ||
+        (evidence.key !== undefined && evidence.key !== key)) {
+      throw new Error(`Recovery completion is duplicated or contradicts its immutable target: ${key}`);
+    }
+    completions.set(key, evidence);
+    if (bindingManifestKeys.has(key)) {
+      const required = key === bindingManifests.at(-1)?.key
+        ? [...bindingLeaves, ...bindingManifests.slice(0, -1)] : bindingLeaves;
+      if (required.some((entry) => !completionEvidenceMatches(completions.get(entry.key), entry))) throw new Error('Recovery binding parent precedes durable children');
+    }
+    for (const reference of [...(expected.get(key).dependencies || []), ...(expected.get(key).publication_prerequisites || [])]) {
+      // V3 completion copies follow a separately authenticated full publication
+      // journal, possibly in chunks; canonical dependencies must be completed.
+      if (v3Keys.has(key)) continue;
+      if (!completionEvidenceMatches(completions.get(reference.key), {
+        ...reference, require_stored_sha256: reference.kind === 'canonical_parquet',
+      })) throw new Error(`Recovery completed parent lacks durable child: ${reference.key} -> ${key}`);
+    }
+  }
+  for (const entry of updates.prepared_state_updates || []) {
+    const record = records.get(entry.unit_id);
+    if (!record || (entry.files_published && record.files_published) ||
+        (entry.remove_staging_refs && !record.files_published && !entry.files_published)) throw new Error('Recovery prepared-state transition contradicts committed state');
+    if ((entry.files_published || entry.remove_staging_refs) && record.target_file_intents.some((intent) =>
+      !completionEvidenceMatches(completions.get(intent.key), { ...intent, require_stored_sha256: true }))) {
+      throw new Error('Recovery prepared publication lacks exact durable Parquet evidence');
+    }
+  }
+  if (updates.final_state && ((checkpoint.full_verification_complete && !updates.final_state.full_verification_complete) ||
+      (checkpoint.cutover_ready && !updates.final_state.cutover_ready))) throw new Error('Recovery final state regresses');
+  if ((updates.publication_evidence || []).length) {
+    for (const reference of complete.v3_publication_plan.external_references) {
+      if (!completionEvidenceMatches(completions.get(reference.key), {
+        ...reference, require_stored_sha256: reference.kind === 'canonical_parquet',
+      })) throw new Error(`Recovery publication lacks durable canonical prerequisite: ${reference.key}`);
+    }
+  }
+  if (updates.final_state?.full_verification_complete && [...expected].some(([key, entry]) =>
+    !completionEvidenceMatches(completions.get(key), entry))) throw new Error('Recovery final verification lacks complete durable target evidence');
+  if (authority.plan_identity.runner_policy?.clean_target_required && !checkpoint.clean_target_admission &&
+      ((updates.prepared_records || []).length || additions.length || (updates.publication_evidence || []).length)) {
+    throw new Error('Recovery target progress precedes durable clean-start admission');
+  }
+  return complete;
 }
 
 function completePreparedV3Plan({ checkpoint, authority, units: canonicalUnits, canonicalObjects, onProgress = null }) {
@@ -3228,6 +3328,8 @@ function emptyCheckpoint(plan) {
           v3_index_strategy: plan.rollback_preflight.v3_index_strategy,
         }
       : null,
+    progress_format: "authenticated-journal-v1",
+    clean_target_admission: null,
     completed_objects: {},
     prepared_units: {},
     preparation_order: [],
@@ -3238,7 +3340,7 @@ function emptyCheckpoint(plan) {
 
 const COMPLETED_OBJECT_BATCH_SIZE = 256;
 
-async function persistCompletedObjectBatch({ checkpoint, evidence, writeCheckpoint, forceWrite = false }) {
+async function persistCompletedObjectBatch({ checkpoint, evidence, writeCheckpoint, forceWrite = false, preparedUnitIds = [] }) {
   const additions = new Map();
   for (const entry of evidence) {
     const next = {
@@ -3257,7 +3359,7 @@ async function persistCompletedObjectBatch({ checkpoint, evidence, writeCheckpoi
   if (!additions.size && !forceWrite) return;
   for (const [key, value] of additions) checkpoint.completed_objects[key] = value;
   try {
-    await writeCheckpoint(checkpoint);
+    await writeCheckpoint(checkpoint, { completedKeys: [...additions.keys()], preparedUnitIds });
   } catch (error) {
     // Do not expose an unpersisted chunk as durable in the caller's memory.
     for (const key of additions.keys()) delete checkpoint.completed_objects[key];
@@ -3303,7 +3405,7 @@ async function reverifyCompletedMigrationObjects({
       const result = { ...current, classification: legacyMatch ? "LEGACY_RECOVERY_ORDERING" : "EXACT" };
       return { byte_size: expected.byte_size, sha256: expected.sha256, result };
     }));
-    let failure = null;
+    const failures = [];
     const failedIdentities = [];
     for (const [index, result] of results.entries()) {
       const key = batch[index].key;
@@ -3319,11 +3421,12 @@ async function reverifyCompletedMigrationObjects({
         counts.failed += 1;
         const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
         failedIdentities.push(Object.freeze({ key, reason }));
-        failure ||= new Error(`${label} failed: ${key}: ${reason}`, { cause: result.reason });
+        failures.push(new Error(`${label} failed: ${key}: ${reason}`, { cause: result.reason }));
       }
     }
     // Already-started checks settled; no further reads or publication follow a failure.
-    if (failure) {
+    if (failures.length) {
+      const failure = migrationFailure(failures);
       reportCounts();
       if (enabled && reportClassifications) for (const { key, reason } of failedIdentities) {
         process.stderr.write(`V3 migration: failed canonical recovery identity: ${key}: ${reason}\n`);
@@ -3387,6 +3490,8 @@ export async function executeObservationHistoryV3MigrationPlan({
   checkpoint: rawCheckpoint = null,
   recoveryAuthority = null,
   publicationConcurrency = 1,
+  partitionConcurrency = 1,
+  runnerPermit = null,
   onReconstructedPlan = null,
   adapters,
   testHooks = null,
@@ -3438,9 +3543,7 @@ export async function executeObservationHistoryV3MigrationPlan({
       throw new TypeError(`Migration apply adapter is missing: ${name}`);
     }
   }
-  if (!Number.isInteger(publicationConcurrency) || publicationConcurrency < 1 || publicationConcurrency > 16) {
-    throw new Error("--publication-concurrency must be an integer from 1 to 16");
-  }
+  validateMigrationConcurrency({ partitionConcurrency, publicationConcurrency, runnerPermit });
   const checkpoint = rawCheckpoint ? structuredClone(rawCheckpoint) : emptyCheckpoint(plan);
   if (
     checkpoint.plan_sha256 !== plan.plan_sha256 ||
@@ -3481,6 +3584,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     });
   }
   const authenticatedResume = rawCheckpoint && recoveryAuthority?.authenticated === true;
+  if (rawCheckpoint?.progress_format === "authenticated-journal-v1" && !authenticatedResume) throw new Error("Fresh-run checkpoint reuse requires authenticated journal replay");
   if (recoveryAuthority && (!authenticatedResume ||
     recoveryAuthority.immutable_authority_sha256 !== checkpoint.authority_sha256 ||
     recoveryAuthority.migration_run_id !== checkpoint.migration_run_id ||
@@ -3493,7 +3597,18 @@ export async function executeObservationHistoryV3MigrationPlan({
     checkpoint, recoveryAuthority, allowLegacyRecoveryOrdering: false,
   });
   if (legacyAuthority.eligible) throw new Error("Historical in-place recovery ordering cannot authorize side-by-side migration");
-  await publishSideBySideBindings({ plan, checkpoint, adapters });
+  if (plan.plan_identity.runner_policy) {
+    if (!checkpoint.clean_target_admission) {
+      if (Object.keys(checkpoint.completed_objects).length || checkpoint.preparation_order.length) throw new Error('Clean-start evidence missing after target work');
+      await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
+      const admission = await inspectEmptyV3Target({ listObjects: adapters.listObjects, assertLockHeld: adapters.assertLockHeld, phase: 'migrate-before-first-write' });
+      checkpoint.clean_target_admission = { ...admission, plan_sha256: plan.plan_sha256,
+        migration_run_id: plan.migration_run_id, source_root_sha256: plan.plan_identity.source_root.sha256 };
+      await adapters.writeCheckpoint(checkpoint, { cleanStart: true });
+    }
+    validateCleanStartEvidence(checkpoint.clean_target_admission, plan);
+  }
+  await publishSideBySideBindings({ plan, checkpoint, adapters, publicationConcurrency });
   const allowLegacyRecoveryOrdering = false;
   const publishedParquet = authenticatedResume ? plan.units.flatMap((unit) => {
     const record = checkpoint.prepared_units[unit.unit_id];
@@ -3542,156 +3657,207 @@ export async function executeObservationHistoryV3MigrationPlan({
   const partitionProgress = createMigrationProgressReporter({
     label: "V3 migration: partitions",
     total: plan.units.length,
+    totalRows: plan.estimated.source_rows,
     enabled: progressEnabled,
   });
   let completedPartitions = plan.units.filter((unit) =>
     checkpoint.prepared_units[unit.unit_id]?.files_published === true
   ).length;
-  partitionProgress.report(completedPartitions, { force: true });
+  let completedSourceRows = plan.units.filter((unit) => checkpoint.prepared_units[unit.unit_id]?.files_published === true).reduce((sum, unit) => sum + unit.source_row_count, 0);
+  partitionProgress.report(completedPartitions, { rows: completedSourceRows });
   const parquetEvidence = [];
-  for (const authorityUnit of plan.units) {
-    let record = checkpoint.prepared_units[authorityUnit.unit_id] || null;
-    const wasFilesPublished = record?.files_published === true;
-    if (!record) {
-      const sourcePartition = plan.inventory.partitions.find((partition) =>
-        partition.manifest_identity.key === authorityUnit.source_manifest_identity.key &&
-        partition.manifest_identity.sha256 === authorityUnit.source_manifest_identity.sha256
-      );
-      if (!sourcePartition) {
-        throw new Error(`Pinned source partition is unavailable: ${authorityUnit.unit_id}`);
+  const pool = new MigrationWorkerPool(partitionConcurrency);
+  const sourceByKey = new Map(plan.inventory.partitions.map((partition) => [partition.manifest_identity.key, partition]));
+  try {
+    for await (const batch of settledMigrationBatches(plan.units, partitionConcurrency, async (authorityUnit, position) => {
+      if (checkpoint.prepared_units[authorityUnit.unit_id]) return { authorityUnit, position, rewritten: null };
+      const sourcePartition = sourceByKey.get(authorityUnit.source_manifest_identity.key);
+      if (!sourcePartition || sourcePartition.manifest_identity.sha256 !== authorityUnit.source_manifest_identity.sha256) throw new Error(`Pinned source partition is unavailable: ${authorityUnit.unit_id}`);
+      const material = await acquirePinnedPartitionMaterial({ sourcePartition, authorityUnit, getR2Object: adapters.getObject });
+      const rewritten = await pool.run('transform', { sourcePartition, material, position, writerLimits: plan.target.writer_limits,
+        observationsPrefix: plan.target_observations_prefix, targetWriterGitSha: plan.target_writer_git_sha,
+        sosConnectorId: plan.sos_connector_id, v3IndexRoot: plan.v3_index_root });
+      // Never trust a worker's claimed task identity, scope, logical summary, file
+      // identity or target namespace without checking it in the supervisor.
+      if (rewritten.plan_position !== position || rewritten.unit_id !== authorityUnit.unit_id || !sameSemanticJson(rewritten.source_files, authorityUnit.source_files) ||
+          !sameSemanticJson(rewritten.scope, authorityUnit.scope) || rewritten.target_metadata.row_count !== authorityUnit.source_row_count ||
+          !sameSemanticJson(contentHashMetadata(rewritten.target_metadata), authorityUnit.source_observation_content_hash_metadata)) {
+        throw new Error(`Worker result contradicts immutable plan position ${position}: ${authorityUnit.unit_id}`);
       }
-      const rewritten = await rewritePartition({
-        sourcePartition,
-        getR2Object: adapters.getObject,
-        writerLimits: plan.target.writer_limits,
-        observationsPrefix: plan.target_observations_prefix || plan.inventory.observations_prefix,
-        targetWriterGitSha: plan.target_writer_git_sha,
-        sosConnectorId: plan.sos_connector_id,
-        v3IndexRoot: plan.v3_index_root,
-      });
-      if (rewritten.unit_id !== authorityUnit.unit_id) {
-        throw new Error(`Pinned source unit identity changed: ${authorityUnit.unit_id}`);
+      rewritten.target_manifest_object.body = Buffer.from(rewritten.target_manifest_object.body);
+      for (const [ordinal, intent] of rewritten.target_file_intents.entries()) {
+        const expectedKey = buildHistoryV2PartKey(plan.target_observations_prefix, authorityUnit.scope.day_utc,
+          authorityUnit.scope.connector_id, authorityUnit.scope.pollutant_code, ordinal);
+        assertObservationHistoryGenerationKey(getObservationHistoryGeneration('v3'), intent.key);
+        intent.body = Buffer.from(intent.body);
+        if (intent.key !== expectedKey || intent.body.byteLength !== intent.byte_size || sha256Hex(intent.body) !== intent.sha256 ||
+            rewritten.target_metadata.files[ordinal]?.key !== intent.key ||
+            rewritten.target_metadata.files[ordinal]?.sha256 !== intent.sha256) throw new Error(`Worker Parquet identity mismatch: ${intent.key}`);
       }
-      if (!sameSemanticJson(rewritten.source_files, authorityUnit.source_files)) {
-        throw new Error(`Pinned source file identity changed: ${authorityUnit.unit_id}`);
-      }
-      const staged = await adapters.stageUnit({
-        unitId: authorityUnit.unit_id,
-        intents: rewritten.target_file_intents,
-      });
-      if (!Array.isArray(staged) || staged.length !== rewritten.target_file_intents.length) {
-        throw new Error(`Prepared unit staging is incomplete: ${authorityUnit.unit_id}`);
-      }
-      for (let index = 0; index < staged.length; index += 1) {
-        const expected = rewritten.target_file_intents[index];
-        const actual = staged[index];
-        if (
-          actual.key !== expected.key ||
-          actual.byte_size !== expected.byte_size ||
-          actual.sha256 !== expected.sha256 ||
-          !actual.staging_ref
-        ) {
-          throw new Error(`Prepared unit staging identity mismatch: ${expected.key}`);
-        }
-      }
-      record = {
-        unit_id: authorityUnit.unit_id,
-        scope: authorityUnit.scope,
-        target_metadata: rewritten.target_metadata,
-        target_manifest: rewritten.target_manifest,
-        target_manifest_body: rewritten.target_manifest_object.body.toString("utf8"),
-        target_manifest_byte_size: rewritten.target_manifest_object.byte_size,
-        target_manifest_sha256: rewritten.target_manifest_object.sha256,
-        target_file_intents: staged.map((entry) => ({ ...entry })),
-        v3_index_root: plan.v3_index_root,
-        files_published: false,
+      const expectedManifestKey = buildHistoryV2PollutantManifestKey(plan.target_observations_prefix, authorityUnit.scope.day_utc, authorityUnit.scope.connector_id, authorityUnit.scope.pollutant_code);
+      if (rewritten.target_file_intents.length !== rewritten.target_metadata.files.length || rewritten.target_file_intents.length !== rewritten.target_metadata.file_count ||
+          rewritten.target_manifest_object.key !== expectedManifestKey || rewritten.target_manifest.manifest_key !== expectedManifestKey ||
+          rewritten.target_manifest.writer_git_sha !== plan.target_writer_git_sha) throw new Error(`Worker target structure mismatch at position ${position}`);
+      const validationRecord = {
+        unit_id: authorityUnit.unit_id, scope: authorityUnit.scope,
+        target_metadata: rewritten.target_metadata, target_manifest: rewritten.target_manifest,
+        target_manifest_body: rewritten.target_manifest_object.body.toString('utf8'),
+        target_manifest_byte_size: rewritten.target_manifest_object.byte_size, target_manifest_sha256: rewritten.target_manifest_object.sha256,
+        target_file_intents: rewritten.target_file_intents.map(({ body: _body, ...intent }) => intent),
+        v3_index_root: plan.v3_index_root, files_published: false,
       };
-      record.prepared_plan_sha256 = preparedUnitPlanIdentity(record);
-      checkpoint.prepared_units[authorityUnit.unit_id] = record;
-      checkpoint.preparation_order.push(authorityUnit.unit_id);
-      await adapters.writeCheckpoint(checkpoint);
-      await testHooks?.afterPreparation?.({
-        unit_id: authorityUnit.unit_id,
-        checkpoint: structuredClone(checkpoint),
-      });
-    }
-    const preparedUnit = preparedUnitFromRecord(authorityUnit, record, {
-      sideBySide: true,
-      allowLegacyRecoveryOrdering,
-      // Published authenticated units have already passed exact Parquet reuse.
-      // Retain full metadata/hierarchy validation before any new file publication.
-      includeV3Hierarchy: !(authenticatedResume && wasFilesPublished),
-    });
-    const unitEvidence = [];
-    for (const intent of preparedUnit.target_file_intents) {
-      const reuse = establishedReuse(reverifiedParquet, intent) || await verifyObservationHistoryV3CheckpointReuse({
-        checkpointEntry: checkpoint.completed_objects[intent.key],
-        expected: intent,
-        headObject: adapters.headObject,
-        getObject: adapters.getObject,
-        requireStoredSha256: true,
-      });
-      let evidence;
-      if (reuse.reusable) {
-        evidence = {
-          key: intent.key,
-          byte_size: intent.byte_size,
-          sha256: intent.sha256,
-          stored_sha256_verified: true,
-          reused: true,
-        };
-      } else {
-        const body = await adapters.readStagedBody(intent);
-        const publicationIntent = buildR2ChecksumAwarePutIntent({
-          key: intent.key,
-          body,
-        });
-        if (
-          publicationIntent.byte_size !== intent.byte_size ||
-          publicationIntent.sha256 !== intent.sha256
-        ) {
-          throw new Error(`Prepared Parquet staging identity changed: ${intent.key}`);
+      validationRecord.prepared_plan_sha256 = preparedUnitPlanIdentity(validationRecord);
+      preparedUnitFromRecord(authorityUnit, validationRecord, { sideBySide: true });
+      rewritten.prepared_plan_sha256 = validationRecord.prepared_plan_sha256;
+      // The supervisor has reconstructed/validated the hierarchy; retain only
+      // metadata needed for the durable record, not another copy of leaf bodies.
+      rewritten.v3_hierarchy = null;
+      adapters.assertLockHeld();
+      return { authorityUnit, position, rewritten };
+    })) {
+      // On CPU failure retain only a contiguous safe preparation prefix. Later
+      // CPU-only siblings have no R2 side effects and are deliberately discarded.
+      let preparationPosition = batch[0].position;
+      await withMigrationBatchEvidence(batch, async () => {
+        for (const entry of batch) {
+          if (entry.result.status === 'rejected') break;
+          preparationPosition = entry.position;
+          const { authorityUnit, rewritten } = entry.result.value;
+          if (!rewritten) continue;
+          let record;
+          const staged = await adapters.stageUnit({
+            unitId: authorityUnit.unit_id,
+            intents: rewritten.target_file_intents,
+          });
+          if (!Array.isArray(staged) || staged.length !== rewritten.target_file_intents.length) {
+            throw new Error(`Prepared unit staging is incomplete: ${authorityUnit.unit_id}`);
+          }
+          for (let index = 0; index < staged.length; index += 1) {
+            const expected = rewritten.target_file_intents[index];
+            const actual = staged[index];
+            if (
+              actual.key !== expected.key ||
+              actual.byte_size !== expected.byte_size ||
+              actual.sha256 !== expected.sha256 ||
+              !actual.staging_ref
+            ) {
+              throw new Error(`Prepared unit staging identity mismatch: ${expected.key}`);
+            }
+          }
+          record = {
+            unit_id: authorityUnit.unit_id,
+            scope: authorityUnit.scope,
+            target_metadata: rewritten.target_metadata,
+            target_manifest: rewritten.target_manifest,
+            target_manifest_body: rewritten.target_manifest_object.body.toString("utf8"),
+            target_manifest_byte_size: rewritten.target_manifest_object.byte_size,
+            target_manifest_sha256: rewritten.target_manifest_object.sha256,
+            target_file_intents: staged.map((entry) => ({ ...entry })),
+            v3_index_root: plan.v3_index_root,
+            files_published: false,
+          };
+          record.prepared_plan_sha256 = preparedUnitPlanIdentity(record);
+          // Staging references do not change prepared semantic/physical authority.
+          if (record.prepared_plan_sha256 !== rewritten.prepared_plan_sha256) throw new Error(`Staging changed prepared authority: ${authorityUnit.unit_id}`);
+          checkpoint.prepared_units[authorityUnit.unit_id] = record;
+          checkpoint.preparation_order.push(authorityUnit.unit_id);
+          await adapters.writeCheckpoint(checkpoint, { preparedUnitIds: [authorityUnit.unit_id] });
+          entry.result.value.rewritten = null;
+          await testHooks?.afterPreparation?.({
+            unit_id: authorityUnit.unit_id,
+            checkpoint: structuredClone(checkpoint),
+          });
         }
-        const putEvidence = await adapters.putChecksumObject(publicationIntent);
-        const head = await adapters.headObject({ key: intent.key });
-        evidence = {
-          ...verifyR2StoredSha256Head({ head, intent: publicationIntent }),
-          put_status: String(putEvidence?.status || "succeeded"),
-          reused: false,
-        };
+      }, () => preparationPosition);
+      throwMigrationBatchFailures(batch);
+      for (const { item: authorityUnit } of batch) {
+        const record = checkpoint.prepared_units[authorityUnit.unit_id];
+        const wasFilesPublished = record.files_published === true;
+        const preparedUnit = preparedUnitFromRecord(authorityUnit, record, {
+          sideBySide: true,
+          allowLegacyRecoveryOrdering,
+          // New worker results passed full supervisor validation before staging;
+          // recovered unpublished records must still pass that full gate here.
+          includeV3Hierarchy: Boolean(rawCheckpoint) && !(authenticatedResume && wasFilesPublished),
+        });
+        const unitEvidence = [];
+        for await (const settled of settledMigrationBatches(preparedUnit.target_file_intents, publicationConcurrency, async (intent) => {
+          const reuse = establishedReuse(reverifiedParquet, intent) || await verifyObservationHistoryV3CheckpointReuse({
+            checkpointEntry: checkpoint.completed_objects[intent.key],
+            expected: intent,
+            headObject: adapters.headObject,
+            getObject: adapters.getObject,
+            requireStoredSha256: true,
+          });
+          let evidence;
+          if (reuse.reusable) {
+            evidence = {
+              key: intent.key,
+              byte_size: intent.byte_size,
+              sha256: intent.sha256,
+              stored_sha256_verified: true,
+              reused: true,
+            };
+          } else {
+            const body = await adapters.readStagedBody(intent);
+            const publicationIntent = buildR2ChecksumAwarePutIntent({
+              key: intent.key,
+              body,
+            });
+            if (
+              publicationIntent.byte_size !== intent.byte_size ||
+              publicationIntent.sha256 !== intent.sha256
+            ) {
+              throw new Error(`Prepared Parquet staging identity changed: ${intent.key}`);
+            }
+            const putEvidence = await adapters.putChecksumObject(publicationIntent);
+            const verified = exactPublicationEvidence(putEvidence, intent, 'stored_sha256_verified') && putEvidence.stored_byte_size_verified === true
+              ? putEvidence : verifyR2StoredSha256Head({ head: await adapters.headObject({ key: intent.key }), intent: publicationIntent });
+            evidence = {
+              ...verified,
+              put_status: String(putEvidence?.status || "succeeded"),
+              reused: false,
+            };
+          }
+          return { ...evidence, stored_sha256_verified: true };
+        })) {
+          const safe = settled.filter((entry) => entry.result.status === 'fulfilled').map((entry) => entry.result.value);
+          await withMigrationBatchEvidence(settled, () => persistCompletedObjectBatch({ checkpoint, evidence: safe, writeCheckpoint: adapters.writeCheckpoint }));
+          parquetEvidence.push(...safe);
+          unitEvidence.push(...safe);
+        }
+        record.files_published = true;
+        try {
+          await persistCompletedObjectBatch({
+            checkpoint, evidence: unitEvidence, writeCheckpoint: adapters.writeCheckpoint,
+            forceWrite: !wasFilesPublished, preparedUnitIds: [authorityUnit.unit_id],
+          });
+        } catch (error) {
+          record.files_published = wasFilesPublished;
+          throw error;
+        }
+        await testHooks?.afterParquetPublication?.({
+          unit_id: authorityUnit.unit_id,
+          checkpoint: structuredClone(checkpoint),
+        });
+        if (record.target_file_intents.some((intent) => intent.staging_ref)) {
+          await adapters.releaseStagedUnit({
+            unitId: authorityUnit.unit_id,
+            intents: record.target_file_intents,
+          });
+          record.target_file_intents = record.target_file_intents.map(
+            ({ staging_ref: _stagingRef, ...entry }) => entry,
+          );
+          await adapters.writeCheckpoint(checkpoint, { preparedUnitIds: [authorityUnit.unit_id] });
+        }
+        if (!wasFilesPublished && checkpoint.prepared_units[authorityUnit.unit_id]?.files_published === true) {
+          completedPartitions += 1;
+          completedSourceRows += authorityUnit.source_row_count;
+          partitionProgress.report(completedPartitions, { rows: completedSourceRows });
+        }
       }
-      parquetEvidence.push(evidence);
-      unitEvidence.push({ ...evidence, stored_sha256_verified: true });
     }
-    record.files_published = true;
-    try {
-      await persistCompletedObjectBatch({
-        checkpoint, evidence: unitEvidence, writeCheckpoint: adapters.writeCheckpoint,
-        forceWrite: !wasFilesPublished,
-      });
-    } catch (error) {
-      record.files_published = wasFilesPublished;
-      throw error;
-    }
-    await testHooks?.afterParquetPublication?.({
-      unit_id: authorityUnit.unit_id,
-      checkpoint: structuredClone(checkpoint),
-    });
-    if (record.target_file_intents.some((intent) => intent.staging_ref)) {
-      await adapters.releaseStagedUnit({
-        unitId: authorityUnit.unit_id,
-        intents: record.target_file_intents,
-      });
-      record.target_file_intents = record.target_file_intents.map(
-        ({ staging_ref: _stagingRef, ...entry }) => entry,
-      );
-      await adapters.writeCheckpoint(checkpoint);
-    }
-    if (!wasFilesPublished && checkpoint.prepared_units[authorityUnit.unit_id]?.files_published === true) {
-      completedPartitions += 1;
-      partitionProgress.report(completedPartitions);
-    }
-  }
+  } finally { await pool.close(); }
   const { currentCanonical, reverifiedCanonical } = earlyCanonicalGate || await verifyCanonicalGate();
   // Early verification may precede staging-reference cleanup. Refresh only this
   // invocation's staging progress; canonical bytes/dependencies remain checked.
@@ -3718,69 +3884,52 @@ export async function executeObservationHistoryV3MigrationPlan({
   );
   let completedCanonicalObjects = previouslyCompletedCanonicalObjectKeys.size;
   canonicalPublicationProgress.report(completedCanonicalObjects, { force: true });
-  let pendingCanonical = [];
-  const pendingCanonicalKeys = new Set();
-  const flushCanonical = async () => {
-    await persistCompletedObjectBatch({
-      checkpoint, evidence: pendingCanonical, writeCheckpoint: adapters.writeCheckpoint,
-    });
-    for (const object of pendingCanonical) {
+  let canonicalPosition = 0;
+  const canonicalObjects = completedPlan.canonical_publication_objects;
+  while (canonicalPosition < canonicalObjects.length) {
+    const batch = [];
+    while (canonicalPosition < canonicalObjects.length && batch.length < publicationConcurrency) {
+      const object = canonicalObjects[canonicalPosition];
+      const blocked = [...object.dependencies, ...object.publication_prerequisites].find((reference) =>
+        !completionEvidenceMatches(checkpoint.completed_objects[reference.key], {
+          ...reference, require_stored_sha256: reference.kind === 'canonical_parquet',
+        }));
+      if (blocked) {
+        if (batch.length) break;
+        throw new Error(`Canonical parent lacks durable child: ${blocked.key} -> ${object.key}`);
+      }
+      // Keep barriers in immutable stage order even for unrelated parents.
+      if (batch.length && batch[0].publication_stage !== object.publication_stage) break;
+      batch.push(object);
+      canonicalPosition += 1;
+    }
+    const settled = await Promise.allSettled(batch.map(async (object) => {
+      const reuse = establishedReuse(reverifiedCanonical, object) || await verifyObservationHistoryV3CheckpointReuse({
+        checkpointEntry: checkpoint.completed_objects[object.key], expected: object,
+        headObject: adapters.headObject, getObject: adapters.getObject,
+      });
+      if (!reuse.reusable) {
+        await adapters.putJsonObject(object);
+        const current = await adapters.getObject({ key: object.key });
+        const identity = bodyIdentity(object.key, current.body);
+        if (identity.byte_size !== object.byte_size || identity.sha256 !== object.sha256) throw new Error(`Canonical manifest post-PUT verification failed: ${object.key}`);
+      }
+      return object;
+    }));
+    const outcome = batch.map((item, index) => ({ item, position: canonicalPosition - batch.length + index, result: settled[index] }));
+    const safe = settled.filter((entry) => entry.status === 'fulfilled').map((entry) => entry.value);
+    await withMigrationBatchEvidence(outcome, () => persistCompletedObjectBatch({ checkpoint, evidence: safe, writeCheckpoint: adapters.writeCheckpoint }));
+    for (const object of safe) {
       if (!previouslyCompletedCanonicalObjectKeys.has(object.key)) {
         previouslyCompletedCanonicalObjectKeys.add(object.key);
         completedCanonicalObjects += 1;
-        canonicalPublicationProgress.report(completedCanonicalObjects);
       }
+      canonicalPublicationProgress.report(completedCanonicalObjects);
+      if (object.publication_stage === 'pollutant_manifest') await testHooks?.afterCanonicalManifestPublication?.({ key: object.key, checkpoint: structuredClone(checkpoint) });
+      else await testHooks?.afterParentPublication?.({ key: object.key, stage: object.publication_stage, checkpoint: structuredClone(checkpoint) });
     }
-    pendingCanonical = [];
-    pendingCanonicalKeys.clear();
-  };
-  for (const object of completedPlan.canonical_publication_objects) {
-    if (pendingCanonical.length && (
-      pendingCanonical[0].publication_stage !== object.publication_stage ||
-      [...object.dependencies, ...object.publication_prerequisites].some(
-        (reference) => pendingCanonicalKeys.has(reference.key),
-      )
-    )) await flushCanonical();
-    const reuse = establishedReuse(reverifiedCanonical, object) || await verifyObservationHistoryV3CheckpointReuse({
-      checkpointEntry: checkpoint.completed_objects[object.key],
-      expected: object,
-      headObject: adapters.headObject,
-      getObject: adapters.getObject,
-    });
-    if (!reuse.reusable) {
-      await adapters.putJsonObject(object);
-      const current = await adapters.getObject({ key: object.key });
-      const currentIdentity = bodyIdentity(object.key, current.body);
-      if (
-        currentIdentity.byte_size !== object.byte_size ||
-        currentIdentity.sha256 !== object.sha256
-      ) {
-        throw new Error(`Canonical manifest post-PUT verification failed: ${object.key}`);
-      }
-    }
-    // Legacy evidence remains historical: a successful current GET is not
-    // permission to replace its recorded identity in the checkpoint/journal.
-    if (reuse.classification !== "LEGACY_RECOVERY_ORDERING") {
-      pendingCanonical.push(object);
-      pendingCanonicalKeys.add(object.key);
-    }
-    if (pendingCanonical.length >= COMPLETED_OBJECT_BATCH_SIZE ||
-      testHooks?.afterCanonicalManifestPublication || testHooks?.afterParentPublication
-    ) await flushCanonical();
-    if (object.publication_stage === "pollutant_manifest") {
-      await testHooks?.afterCanonicalManifestPublication?.({
-        key: object.key,
-        checkpoint: structuredClone(checkpoint),
-      });
-    } else {
-      await testHooks?.afterParentPublication?.({
-        key: object.key,
-        stage: object.publication_stage,
-        checkpoint: structuredClone(checkpoint),
-      });
-    }
+    throwMigrationBatchFailures(outcome);
   }
-  await flushCanonical();
   const v3PublicationProgress = createMigrationProgressReporter({
     label: "V3 migration: v3 publication objects",
     total: completedPlan.v3_publication_plan.entries.length,
@@ -3790,19 +3939,6 @@ export async function executeObservationHistoryV3MigrationPlan({
     completedPlan.v3_publication_plan.entries.map((entry) => [entry.key, entry]),
   );
   const durableV3PublicationKeys = new Set();
-  for (const evidence of progressEnabled
-    ? adapters.getDurablePublicationEvidence?.() || []
-    : []) {
-    const expected = v3PublicationEntriesByKey.get(evidence?.key);
-    if (
-      expected &&
-      evidence.byte_size === expected.byte_size &&
-      evidence.sha256 === expected.sha256 &&
-      evidence.post_put_get_verified === true
-    ) {
-      durableV3PublicationKeys.add(evidence.key);
-    }
-  }
   let completedV3PublicationObjects = durableV3PublicationKeys.size;
   v3PublicationProgress.report(completedV3PublicationObjects, { force: true });
   const reportDurableV3Entry = (entry) => {
@@ -3823,6 +3959,11 @@ export async function executeObservationHistoryV3MigrationPlan({
   };
   const v3Publication = await adapters.finalizeV3Publication({
     plan: completedPlan.v3_publication_plan,
+    onRecoveredPublication: (entries) => {
+      for (const entry of entries) durableV3PublicationKeys.add(entry.key);
+      completedV3PublicationObjects = durableV3PublicationKeys.size;
+      v3PublicationProgress.report(completedV3PublicationObjects);
+    },
     putIfChanged: adapters.putIfChanged,
     getObject: adapters.getObject,
     recordDurableEvidence: async (entry) => {
@@ -3860,11 +4001,12 @@ export async function executeObservationHistoryV3MigrationPlan({
     headObject: adapters.headObject,
     publicationResult: v3Publication,
     progressEnabled,
-    publicationConcurrency,
+    publicationConcurrency, partitionConcurrency, runnerPermit,
+    cleanStartEvidence: checkpoint.clean_target_admission,
   });
   checkpoint.full_verification_complete = verification.ok;
   checkpoint.cutover_ready = verification.cutover_ready;
-  await adapters.writeCheckpoint(checkpoint);
+  await adapters.writeCheckpoint(checkpoint, { finalState: true });
   return Object.freeze({
     ok: verification.ok,
     status: verification.cutover_ready ? "cutover_ready" : "blocked",
@@ -3888,7 +4030,9 @@ async function* settleFinalVerificationBatches(items, concurrency, verify, onSet
         onSettled(item);
       }
     }));
-    yield batch.map((item, index) => ({ item, result: results[index] }));
+    const settled = batch.map((item, index) => ({ item, position: offset + index, result: results[index] }));
+    yield settled;
+    throwMigrationBatchFailures(settled);
   }
 }
 
@@ -3899,11 +4043,13 @@ export async function verifyObservationHistoryV3MigrationResult({
   publicationResult = null,
   progressEnabled = true,
   publicationConcurrency = 1,
+  partitionConcurrency = 1,
+  runnerPermit = null,
+  cleanStartEvidence = null,
 }) {
-  if (!Number.isInteger(publicationConcurrency) || publicationConcurrency < 1 || publicationConcurrency > 16) {
-    throw new Error("--publication-concurrency must be an integer from 1 to 16");
-  }
+  validateMigrationConcurrency({ partitionConcurrency, publicationConcurrency, runnerPermit });
   const blockers = [];
+  const failureEvidence = [];
   const partitionProgress = createMigrationProgressReporter({
     label: "V3 verification: partitions",
     total: plan.units.length,
@@ -3925,6 +4071,7 @@ export async function verifyObservationHistoryV3MigrationResult({
     }
     for (const intent of unit.target_file_intents) parquetChecks.push({ unitIndex, intent });
   }
+  if (blockers.length) throw migrationFailure(blockers.map((message) => new Error(message)));
   const parquetProgress = createMigrationProgressReporter({
     label: "V3 verification: Parquet objects", total: parquetChecks.length, enabled: progressEnabled,
   });
@@ -3951,6 +4098,11 @@ export async function verifyObservationHistoryV3MigrationResult({
           error instanceof Error ? error.message : String(error)
         }`);
       }
+    }
+    if (settled.some((entry) => entry.result.status === 'rejected')) {
+      const failure = migrationFailure(migrationBatchFailures(settled));
+      failure.blockers = [...blockers];
+      throw failure;
     }
   }
   partitionProgress.report(verifiedPartitions);
@@ -3984,8 +4136,15 @@ export async function verifyObservationHistoryV3MigrationResult({
         }`);
       }
     }
+    if (settled.some((entry) => entry.result.status === 'rejected')) {
+      const failure = migrationFailure(migrationBatchFailures(settled));
+      failure.blockers = [...blockers];
+      throw failure;
+    }
   }
-  const actualArtifacts = new Map();
+  const verifiedArtifactKeys = new Set();
+  const expectedArtifacts = new Map(plan.v3_publication_plan.entries.map((entry) => [entry.key, entry]));
+  const actualArtifacts = { get: (key) => verifiedArtifactKeys.has(key) ? Buffer.from(expectedArtifacts.get(key).body) : null };
   const v3PublicationProgress = createMigrationProgressReporter({
     label: "V3 verification: v3 publication objects",
     total: plan.v3_publication_plan.entries.length,
@@ -4000,7 +4159,7 @@ export async function verifyObservationHistoryV3MigrationResult({
       if (current.byte_size !== entry.byte_size || current.sha256 !== entry.sha256) {
         throw new Error("published identity differs from plan");
       }
-      return current.body;
+      return true;
     },
     () => {
       verifiedV3PublicationObjects += 1;
@@ -4009,13 +4168,18 @@ export async function verifyObservationHistoryV3MigrationResult({
   )) {
     for (const { item: entry, result } of settled) {
       if (result.status === "fulfilled") {
-        actualArtifacts.set(entry.key, result.value);
+        verifiedArtifactKeys.add(entry.key);
       } else {
         const error = result.reason;
         blockers.push(`v3_publication_identity_mismatch:${entry.key}:${
           error instanceof Error ? error.message : String(error)
         }`);
       }
+    }
+    if (settled.some((entry) => entry.result.status === 'rejected')) {
+      const failure = migrationFailure(migrationBatchFailures(settled));
+      failure.blockers = [...blockers];
+      throw failure;
     }
   }
   // Every independent v3 GET has settled before hierarchy validation can use
@@ -4057,11 +4221,7 @@ export async function verifyObservationHistoryV3MigrationResult({
         exactLeaves: children,
       });
     } catch (error) {
-      blockers.push(
-        `scoped_root_child_authority_mismatch:${partitionIdentity(unit.scope)}:${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      throw new Error(`scoped_root_child_authority_mismatch:${partitionIdentity(unit.scope)}:${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
     verifiedScopedRoots += 1;
     hierarchyProgress.report(verifiedScopedRoots);
@@ -4088,33 +4248,32 @@ export async function verifyObservationHistoryV3MigrationResult({
       scopedHierarchies: actualHierarchies,
     });
   } catch (error) {
-    blockers.push(
-      `v3_latest_verification_failed:${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
+    throw new Error(`v3_latest_verification_failed:${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
   if (!publicationResult || publicationResult.ok !== true) {
-    blockers.push("v3_durable_publication_evidence_incomplete");
+    throw new Error("v3_durable_publication_evidence_incomplete");
   }
   if (plan.generation_topology === SIDE_BY_SIDE_TOPOLOGY) {
     try {
       assertSideBySideMigrationPlan(plan);
-      await verifySideBySideLogicalOutput({ plan, getObject });
+      validateCleanStartEvidence(cleanStartEvidence, plan);
+      await verifySideBySideLogicalOutput({ plan, getObject, partitionConcurrency, publicationConcurrency });
       await verifySideBySideSourceRoot({ plan, getObject });
     } catch (error) {
-      blockers.push(`side_by_side_source_or_target_invalid:${error.message}`);
+      failureEvidence.push(migrationFailureEvidence(error));
+      for (const failure of error.errors || [error]) blockers.push(`side_by_side_source_or_target_invalid:${failure.message}`);
     }
   } else {
     if (!plan.backup_gate?.verified) blockers.push("verified_dropbox_checkpoint_missing");
     if (!plan.rollback_preflight?.verified) blockers.push("manifest_guided_rollback_preflight_incomplete");
   }
   if (!plan.writer_freeze_plan?.entries?.length) blockers.push("writer_freeze_plan_missing");
-  const uniqueBlockers = [...new Set(blockers)].sort();
+  const uniqueBlockers = [...new Set(blockers)];
   return Object.freeze({
     ok: uniqueBlockers.length === 0,
     cutover_ready: uniqueBlockers.length === 0,
     blockers: Object.freeze(uniqueBlockers),
+    failure_evidence: Object.freeze(failureEvidence),
     partition_count: plan.units.length,
     v3_child_count: plan.units.reduce(
       (sum, unit) => sum + unit.v3_hierarchy.child_shards.length,
@@ -4208,6 +4367,7 @@ export async function verifyObservationHistoryV3CurrentDependencies({
   getObject,
   headObject,
   publicationResult = null,
+  publicationConcurrency = 1, partitionConcurrency = 1, runnerPermit = null,
 }) {
   const base = await verifyObservationHistoryV3MigrationResult({
     plan,
@@ -4215,13 +4375,16 @@ export async function verifyObservationHistoryV3CurrentDependencies({
     headObject,
     publicationResult,
     progressEnabled: true,
+    publicationConcurrency, partitionConcurrency, runnerPermit,
+    cleanStartEvidence: checkpoint?.clean_target_admission,
   });
   const recovery = plan.recovery_reconciliation || null;
-  if (!checkpoint || !recovery) return base;
+  if (!base.ok || !checkpoint || !recovery) return base;
   const expectedByKey = migrationRequiredDependencies(plan);
   const legacyAllowedByKey = recovery.legacy_allowed_identities || {};
   const classifications = [];
   const blockers = [...base.blockers];
+  const failureEvidence = [...(base.failure_evidence || [])];
   const dependencyProgress = createMigrationProgressReporter({
     label: "V3 verification: checkpoint dependencies",
     total: expectedByKey.size,
@@ -4229,53 +4392,54 @@ export async function verifyObservationHistoryV3CurrentDependencies({
   });
   dependencyProgress.report(0, { force: true });
   let verifiedDependencies = 0;
-  for (const [key, expected] of expectedByKey) {
+  for await (const batch of settledMigrationBatches([...expectedByKey], publicationConcurrency, async ([key, expected]) => {
     const evidence = checkpoint.completed_objects?.[key];
-    let classification = "FAIL";
-    let reason = "recovery_evidence_invalid";
+    const localBlockers = [];
+    let classification = 'FAIL';
+    let reason = 'recovery_evidence_invalid';
     if (completionEvidenceMatches(evidence, expected)) {
-      classification = "EXACT";
+      classification = 'EXACT';
+      reason = null;
+    } else if (recovery.mode === 'LEGACY_RECOVERY_ORDERING' && !key.endsWith('.parquet') &&
+        completedEvidenceMatchesAllowedHistoricalIdentity(evidence, legacyAllowedByKey[key])) {
+      classification = 'LEGACY_RECOVERY_ORDERING';
       reason = null;
     } else {
-      if (
-        recovery.mode === "LEGACY_RECOVERY_ORDERING" &&
-        !key.endsWith(".parquet") &&
-        completedEvidenceMatchesAllowedHistoricalIdentity(
-          evidence,
-          legacyAllowedByKey[key],
-        )
-      ) {
-        classification = "LEGACY_RECOVERY_ORDERING";
-        reason = null;
-      } else {
-        blockers.push(`recovery_evidence_invalid:${key}`);
-      }
+      localBlockers.push(`recovery_evidence_invalid:${key}`);
     }
     let currentExact = false;
+    let currentFailure = null;
     try {
-      if (key.endsWith(".parquet")) {
-        const head = await headObject({ key });
-        verifyR2StoredSha256Head({ head, intent: expected });
+      if (key.endsWith('.parquet')) {
+        verifyR2StoredSha256Head({ head: await headObject({ key }), intent: expected });
         currentExact = true;
       } else {
-        const current = await getRequiredObject(getObject, key, "current dependency");
-        currentExact = current.byte_size === expected.byte_size &&
-          current.sha256 === expected.sha256;
+        const current = await getRequiredObject(getObject, key, 'current dependency');
+        currentExact = current.byte_size === expected.byte_size && current.sha256 === expected.sha256;
       }
-    } catch {
-      currentExact = false;
-    }
+    } catch (error) { currentExact = false; currentFailure = migrationFailureEvidence(error); }
     if (!currentExact) {
-      const category = classification === "LEGACY_RECOVERY_ORDERING"
-        ? "legacy_reconciliation_failed"
-        : "r2_exact_mismatch";
-      blockers.push(`${category}:${key}`);
-      classification = "FAIL";
+      const category = classification === 'LEGACY_RECOVERY_ORDERING' ? 'legacy_reconciliation_failed' : 'r2_exact_mismatch';
+      localBlockers.push(`${category}:${key}`);
+      classification = 'FAIL';
       reason = category;
     }
-    classifications.push(Object.freeze({ key, classification, reason }));
-    verifiedDependencies += 1;
-    dependencyProgress.report(verifiedDependencies);
+    return { classification: Object.freeze({ key, classification, reason }), blockers: localBlockers, failure: currentFailure };
+  })) {
+    for (const { result, item: [key] } of batch) {
+      if (result.status === 'fulfilled') {
+        classifications.push(result.value.classification);
+        blockers.push(...result.value.blockers);
+        if (result.value.failure) failureEvidence.push({ key, ...result.value.failure });
+      } else {
+        classifications.push(Object.freeze({ key, classification: 'FAIL', reason: 'r2_exact_mismatch' }));
+        blockers.push(`r2_exact_mismatch:${key}`);
+        failureEvidence.push({ key, ...migrationFailureEvidence(result.reason) });
+      }
+      verifiedDependencies += 1;
+      dependencyProgress.report(verifiedDependencies);
+    }
+    if (blockers.length) { dependencyProgress.finish('failed'); break; }
   }
   const counts = Object.freeze({
     total: classifications.length,
@@ -4285,7 +4449,7 @@ export async function verifyObservationHistoryV3CurrentDependencies({
     ).length,
     fail: classifications.filter((entry) => entry.classification === "FAIL").length,
   });
-  const uniqueBlockers = [...new Set(blockers)].sort();
+  const uniqueBlockers = [...new Set(blockers)];
   const failureCategory = uniqueBlockers.some((entry) =>
     entry.startsWith("recovery_evidence_invalid:"))
     ? "recovery_evidence_invalid"
@@ -4299,6 +4463,7 @@ export async function verifyObservationHistoryV3CurrentDependencies({
     ok: uniqueBlockers.length === 0,
     cutover_ready: uniqueBlockers.length === 0,
     blockers: Object.freeze(uniqueBlockers),
+    failure_evidence: Object.freeze(failureEvidence),
     failure_category: failureCategory,
     recovery_reconciliation: Object.freeze({
       mode: recovery.mode,
@@ -4396,6 +4561,12 @@ export function buildObservationHistoryV3RerunVerificationPlan({
   progressEnabled = false,
 }) {
   const authority = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+  if (checkpoint.progress_format === 'authenticated-journal-v1' && (
+      recoveryAuthority?.authenticated !== true || recoveryAuthority.immutable_authority_sha256 !== checkpoint.authority_sha256 ||
+      recoveryAuthority.migration_run_id !== checkpoint.migration_run_id || recoveryAuthority.plan_sha256 !== checkpoint.plan_sha256 ||
+      recoveryAuthority.replayed_checkpoint_sha256 !== buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint))) {
+    throw new Error('Fresh-run verification requires authenticated journal replay');
+  }
   const sideBySide = authority.generation_topology === SIDE_BY_SIDE_TOPOLOGY;
   if (sideBySide) assertSideBySideMigrationPlan(authority);
   const legacyAuthority = validateLegacyRecoveryOrderingAuthority({
@@ -5135,7 +5306,7 @@ export function guardSideBySideMigrationAdapters(plan, adapters) {
       return result;
     };
   }
-  for (const name of ["getObject", "headObject", "writeCheckpoint", "recordDurableEvidence", "recordDurableEvidenceBatch", "stageUnit", "readStagedBody", "releaseStagedUnit"]) {
+  for (const name of ["getObject", "headObject", "writeCheckpoint", "recordDurableEvidence", "recordDurableEvidenceBatch", "stageUnit", "readStagedBody", "releaseStagedUnit", "listObjects"]) {
     if (typeof adapters[name] !== "function") continue;
     guarded[name] = async (...args) => {
       adapters.assertLockHeld();
@@ -5152,6 +5323,7 @@ export function guardSideBySideMigrationAdapters(plan, adapters) {
 export async function buildObservationHistorySideBySideMigrationPlan({
   getR2Object, assertLockHeld, repositoryRoot, environmentEvidence,
   migrationRunId, targetWriterGitSha, sosConnectorId = 1,
+  publicationConcurrency = 1, runnerPermit = null, runnerPolicy = null,
 }) {
   if (typeof assertLockHeld !== "function") throw new Error("Side-by-side planning requires the global observations lock");
   assertLockHeld();
@@ -5191,9 +5363,11 @@ export async function buildObservationHistorySideBySideMigrationPlan({
     units.push(sourceUnitFromPartition({ sourcePartition: partition, rollbackObjectsByKey: sourceIdentities, writerLimits, targetWriterGitSha }));
     filesProgress.report(units.length);
   }
-  const bindings = await inventorySideBySideBindings(read);
+  validateMigrationConcurrency({ publicationConcurrency, runnerPermit });
+  const bindings = await inventorySideBySideBindings(read, { concurrency: publicationConcurrency });
   const transition = normalizeObservationHistoryV3MigrationTransition("v2-to-v3");
   const planIdentity = {
+    ...(runnerPolicy ? { runner_policy: runnerPolicy } : {}),
     generation_topology: SIDE_BY_SIDE_TOPOLOGY,
     bindings,
     transition, environment: environment.environment, bucket: environment.bucket,
@@ -5241,62 +5415,106 @@ export async function buildObservationHistorySideBySideMigrationPlan({
   return Object.freeze(plan);
 }
 
-async function publishSideBySideBindings({ plan, checkpoint, adapters }) {
-  const generation = getObservationHistoryGeneration("v3");
-  if (!plan.bindings || stableMigrationJson(plan.bindings) !== stableMigrationJson(plan.plan_identity.bindings)) throw new Error("Binding migration authority is absent or changed");
-  for (const entry of [...plan.bindings.bindings, ...plan.bindings.manifests]) {
-    assertObservationHistoryGenerationKey(generation, entry.key, "bindings");
-    const body = entry.source_key
-      ? Buffer.from((await adapters.getObject({ key: entry.source_key })).body)
-      : Buffer.from(entry.body, "utf8");
-    if (body.byteLength !== entry.byte_size || sha256Hex(body) !== entry.sha256) throw new Error(`Binding prepared identity changed: ${entry.key}`);
-    const reuse = await verifyObservationHistoryV3CheckpointReuse({
-      checkpointEntry: checkpoint.completed_objects[entry.key], expected: entry,
-      getObject: adapters.getObject, headObject: adapters.headObject,
-    });
-    if (!reuse.reusable) {
-      await adapters.putJsonObject({ ...entry, body });
-      const actual = Buffer.from((await adapters.getObject({ key: entry.key })).body);
-      if (actual.byteLength !== entry.byte_size || sha256Hex(actual) !== entry.sha256) throw new Error(`Binding post-write identity mismatch: ${entry.key}`);
+async function publishSideBySideBindings({ plan, checkpoint, adapters, publicationConcurrency }) {
+  const generation = getObservationHistoryGeneration('v3');
+  if (!plan.bindings || !sameSemanticJson(plan.bindings, plan.plan_identity.bindings)) throw new Error('Binding migration authority is absent or changed');
+  const progress = createMigrationProgressReporter({ label: 'V3 migration: binding publication objects', total: plan.bindings.bindings.length + plan.bindings.manifests.length });
+  let completed = 0;
+  // Stronger barrier than per-range dependencies: all leaves durable, then all
+  // independent ranges durable, then root. Arrays retain immutable plan order.
+  const levels = [plan.bindings.bindings, plan.bindings.manifests.slice(0, -1), plan.bindings.manifests.slice(-1)];
+  for (const entries of levels) {
+    for await (const batch of settledMigrationBatches(entries, publicationConcurrency, async (entry) => {
+      assertObservationHistoryGenerationKey(generation, entry.key, 'bindings');
+      const body = entry.source_key ? Buffer.from((await adapters.getObject({ key: entry.source_key })).body) : Buffer.from(entry.body, 'utf8');
+      if (body.byteLength !== entry.byte_size || sha256Hex(body) !== entry.sha256) throw new Error(`Binding prepared identity changed: ${entry.key}`);
+      const reuse = await verifyObservationHistoryV3CheckpointReuse({ checkpointEntry: checkpoint.completed_objects[entry.key], expected: entry, getObject: adapters.getObject, headObject: adapters.headObject });
+      if (!reuse.reusable) {
+        await adapters.putJsonObject({ ...entry, body });
+        const actual = Buffer.from((await adapters.getObject({ key: entry.key })).body);
+        if (actual.byteLength !== entry.byte_size || sha256Hex(actual) !== entry.sha256) throw new Error(`Binding post-write identity mismatch: ${entry.key}`);
+      }
+      return entry;
+    })) {
+      const safe = batch.filter((entry) => entry.result.status === 'fulfilled').map((entry) => entry.result.value);
+      await withMigrationBatchEvidence(batch, () => persistCompletedObjectBatch({ checkpoint, evidence: safe, writeCheckpoint: adapters.writeCheckpoint }));
+      completed += safe.length;
+      progress.report(completed);
     }
-    await persistCompletedObjectBatch({ checkpoint, evidence: [entry], writeCheckpoint: adapters.writeCheckpoint });
   }
 }
 
-async function verifySideBySideLogicalOutput({ plan, getObject }) {
+// A fresh complete read of both generations. Checkpoint summaries never stand
+// in for this comparison. Each worker returns compact logical/binding evidence.
+async function verifySideBySideLogicalOutput({ plan, getObject, partitionConcurrency, publicationConcurrency }) {
   const bindings = new Map(plan.bindings.bindings.map((binding) => [binding.timeseries_id, binding]));
-  for (const expected of [...plan.bindings.source_objects,
+  const bindingObjects = [...plan.bindings.source_objects,
     ...plan.bindings.bindings.map((entry) => ({ ...entry, key: entry.source_key })),
-    ...plan.bindings.bindings, ...plan.bindings.manifests]) {
+    ...plan.bindings.bindings, ...plan.bindings.manifests];
+  const bindingProgress = createMigrationProgressReporter({ label: 'Side-by-side: independent binding verification', total: bindingObjects.length });
+  let completedBindings = 0;
+  for await (const batch of settledMigrationBatches(bindingObjects, publicationConcurrency, async (expected) => {
     const bytes = Buffer.from((await getObject({ key: expected.key })).body);
     if (bytes.byteLength !== expected.byte_size || sha256Hex(bytes) !== expected.sha256) throw new Error(`Binding verification identity mismatch: ${expected.key}`);
+  })) {
+    completedBindings += batch.filter((entry) => entry.result.status === 'fulfilled').length;
+    bindingProgress.report(completedBindings);
   }
-  const progress = createMigrationProgressReporter({ label: "Side-by-side: independent logical/source verification", total: plan.units.length, enabled: true });
-  for (const [index, unit] of plan.units.entries()) {
-    const sourceManifest = await getRequiredObject(getObject, unit.source_manifest_identity.key, "locked source manifest");
-    if (sourceManifest.byte_size !== unit.source_manifest_identity.byte_size ||
-        sourceManifest.sha256 !== unit.source_manifest_identity.sha256) throw new Error("Locked v2 source manifest changed");
-    const sourceRows = [];
-    for (const expected of unit.source_files) {
-      const bytes = Buffer.from((await getObject({ key: expected.key })).body);
-      if (bytes.byteLength !== expected.byte_size || sha256Hex(bytes) !== expected.sha256) throw new Error(`Locked v2 file changed: ${expected.key}`);
-      sourceRows.push(...await readCanonicalObservationRowsFromParquetBytes({ body: bytes, connectorId: unit.scope.connector_id, sosConnectorId: plan.sos_connector_id }));
+  const progress = createMigrationProgressReporter({ label: 'Side-by-side: independent logical/source verification', total: plan.units.length,
+    totalRows: plan.units.reduce((sum, unit) => sum + unit.source_row_count, 0) });
+  let completed = 0;
+  let rows = 0;
+  const pool = new MigrationWorkerPool(partitionConcurrency);
+  try {
+    for await (const batch of settledMigrationBatches(plan.units, partitionConcurrency, async (unit, position) => {
+      const manifest = await getRequiredObject(getObject, unit.source_manifest_identity.key, 'locked source manifest');
+      if (manifest.byte_size !== unit.source_manifest_identity.byte_size || manifest.sha256 !== unit.source_manifest_identity.sha256) throw new Error('Locked v2 source manifest changed');
+      const readMaterial = async (expectedFiles, target) => {
+        const material = [];
+        for (const expected of expectedFiles) {
+          if (target) assertObservationHistoryGenerationKey(getObservationHistoryGeneration('v3'), expected.key);
+          const bytes = Buffer.from((await getObject({ key: expected.key })).body);
+          if (bytes.byteLength !== expected.byte_size || sha256Hex(bytes) !== expected.sha256) throw new Error(`Independent file identity changed: ${expected.key}`);
+          material.push({ identity: { key: expected.key, byte_size: expected.byte_size, sha256: expected.sha256 }, body: Uint8Array.from(bytes) });
+        }
+        return material;
+      };
+      const source = await readMaterial(unit.source_files, false);
+      const target = await readMaterial(unit.target_file_intents, true);
+      const result = await pool.run('verify', { unitId: unit.unit_id, position, scope: unit.scope, source, target, sosConnectorId: plan.sos_connector_id });
+      if (result.unit_id !== unit.unit_id || result.position !== position || result.row_count !== unit.source_row_count ||
+          !sameSemanticJson(result.source_content, result.target_content) || !sameSemanticJson(result.target_content, unit.source_observation_content_hash_metadata)) throw new Error(`Independent v3 logical identity mismatch: ${unit.unit_id}`);
+      for (const timeseriesId of result.timeseries_ids) {
+        const binding = bindings.get(timeseriesId);
+        if (!binding || binding.connector_id !== unit.scope.connector_id || binding.pollutant_code !== unit.scope.pollutant_code) throw new Error(`V3 binding disagrees with canonical observation: ${timeseriesId}`);
+      }
+    })) {
+      for (const entry of batch) if (entry.result.status === 'fulfilled') { completed += 1; rows += entry.item.source_row_count; }
+      progress.report(completed, { rows });
     }
-    const sourceContent = contentHashMetadata(computeObservationContentHash(sourceRows));
-    sourceRows.length = 0;
+  } finally { await pool.close(); }
+}
+
+export async function verifyPinnedObservationLogicalMaterial({ unitId, position, scope, source, target, sosConnectorId }) {
+  const decode = async (material) => {
     const rows = [];
-    for (const expected of unit.target_file_intents) {
-      assertObservationHistoryGenerationKey(getObservationHistoryGeneration("v3"), expected.key);
-      const bytes = Buffer.from((await getObject({ key: expected.key })).body);
-      if (bytes.byteLength !== expected.byte_size || sha256Hex(bytes) !== expected.sha256) throw new Error(`V3 target bytes changed: ${expected.key}`);
-      rows.push(...await readCanonicalObservationRowsFromParquetBytes({ body: bytes, connectorId: unit.scope.connector_id, sosConnectorId: plan.sos_connector_id }));
+    for (const entry of material) {
+      const body = Buffer.from(entry.body);
+      if (body.byteLength !== entry.identity.byte_size || sha256Hex(body) !== entry.identity.sha256) throw new Error('Verification CPU transfer identity mismatch');
+      const decoded = await readCanonicalObservationRowsFromParquetBytes({ body, connectorId: scope.connector_id, sosConnectorId });
+      for (const row of decoded) {
+        if (row.connector_id !== scope.connector_id || row.pollutant_code !== scope.pollutant_code || row.observed_at_utc.slice(0, 10) !== scope.day_utc) throw new Error('Independent row contradicts planned partition');
+        rows.push(row);
+      }
+      entry.body = null;
     }
-    const actual = contentHashMetadata(computeObservationContentHash(rows));
-    if (rows.length !== unit.source_row_count || !sameSemanticJson(actual, sourceContent) || !sameSemanticJson(actual, unit.source_observation_content_hash_metadata)) throw new Error(`Independent v3 logical identity mismatch: ${unit.unit_id}`);
-    for (const row of rows) {
-      const binding = bindings.get(row.timeseries_id);
-      if (!binding || binding.connector_id !== unit.scope.connector_id || binding.pollutant_code !== unit.scope.pollutant_code) throw new Error(`V3 binding disagrees with canonical observation: ${row.timeseries_id}`);
-    }
-    progress.report(index + 1);
-  }
+    return rows;
+  };
+  const sourceRows = await decode(source);
+  const sourceContent = contentHashMetadata(computeObservationContentHash(sourceRows));
+  sourceRows.length = 0;
+  const targetRows = await decode(target);
+  return { unit_id: unitId, position, row_count: targetRows.length, source_content: sourceContent,
+    target_content: contentHashMetadata(computeObservationContentHash(targetRows)),
+    timeseries_ids: [...new Set(targetRows.map((row) => row.timeseries_id))].sort((a, b) => a - b) };
 }

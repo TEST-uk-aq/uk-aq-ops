@@ -66,8 +66,9 @@ export function verifyR2StoredSha256Head({
     byte_size: intent.byte_size,
     sha256: intent.sha256,
     etag: String(head.etag || head.httpEtag || "").trim() || null,
+    verified: true,
     stored_sha256_verified: true,
-    ...(storedByteSizeAvailable ? {} : { stored_byte_size_verified: false }),
+    stored_byte_size_verified: storedByteSizeAvailable,
   });
 }
 

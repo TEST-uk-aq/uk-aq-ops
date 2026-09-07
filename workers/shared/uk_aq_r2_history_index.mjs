@@ -134,7 +134,8 @@ export async function r2PutObjectIfChanged({
   const result = await r2PutObject({ r2, key, body, content_type });
   const liveObject = await r2GetObject({ r2, key });
   const liveBodyText = liveObject.body.toString("utf8");
-  if (liveBodyText !== bodyText || liveObject.bytes !== bodyBytes) {
+  const expectedSha256 = sha256Hex(Buffer.from(body));
+  if (liveBodyText !== bodyText || liveObject.bytes !== bodyBytes || sha256Hex(liveObject.body) !== expectedSha256) {
     throw new Error(
       `R2 verification failed for key=${key}: wrote bytes=${bodyBytes} but live read returned bytes=${liveObject.bytes}`,
     );
@@ -142,6 +143,10 @@ export async function r2PutObjectIfChanged({
 
   return {
     ...result,
+    key,
+    byte_size: bodyBytes,
+    sha256: expectedSha256,
+    post_put_get_verified: true,
     skipped: false,
     status: "succeeded",
     write_r2: true,

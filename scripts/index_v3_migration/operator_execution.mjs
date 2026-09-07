@@ -37,26 +37,38 @@ function worker() {
   }
   return heartbeatWorker;
 }
-function progressLine(label, state, started, status) {
-  const elapsed = Date.now() - started;
-  const [completed, total, bytes, totalBytes] = state;
+function progressLine(label, state, started, status, samples = []) {
+  const now = Date.now();
+  const elapsed = now - started;
+  const [completed, total, bytes, totalBytes, , rows, totalRows] = state;
   const counter = total >= 0 ? ` objects=${completed}/${total}` : '';
   const byteCounter = totalBytes > 0 ? ` bytes=${bytes}/${totalBytes}` : '';
-  // Object counts alone are not a defensible cost model for heterogeneous files.
-  const eta = totalBytes > 0
-    ? bytes > 0 && elapsed >= 15000
-      ? `ETA~${formatElapsed((totalBytes - bytes) * elapsed / bytes)}` : 'ETA=calculating'
-    : 'ETA=unknown';
-  return `${label}: ${status} elapsed=${formatElapsed(elapsed)}${counter}${byteCounter} ${eta}\n`;
+  const rowCounter = totalRows >= 0 ? ` rows=${rows}/${totalRows}` : '';
+  const work = totalRows >= 0 ? rows : totalBytes > 0 ? bytes : completed;
+  const planned = totalRows >= 0 ? totalRows : totalBytes > 0 ? totalBytes : total;
+  let eta = '';
+  // Five previous emitted observations, at most ten. Window throughput smooths
+  // batches without inventing a partition cost: partitions use planned rows.
+  if (samples.length >= 5 && planned > work && work > 0) {
+    const oldest = samples[0];
+    const delta = work - oldest.work;
+    const duration = now - oldest.at;
+    const remaining = delta > 0 && duration > 0 ? (planned - work) * duration / delta : NaN;
+    if (Number.isFinite(remaining) && remaining >= 0) eta = ` ETA=${formatElapsed(remaining)}`;
+  }
+  samples.push({ at: now, work });
+  if (samples.length > 10) samples.shift();
+  return `${label}: ${status} elapsed=${formatElapsed(elapsed)}${counter}${byteCounter}${rowCounter}${eta}\n`;
 }
-export function createOperatorProgress({ label, total, totalBytes = 0, enabled = true } = {}) {
+export function createOperatorProgress({ label, total, totalBytes = 0, totalRows = null, enabled = true } = {}) {
   const noop = Object.freeze({ report() {}, finish() {} });
   if (!enabled) return noop;
   try {
     const id = ++nextId;
-    const state = new Float64Array(new SharedArrayBuffer(5 * 8));
+    const state = new Float64Array(new SharedArrayBuffer(7 * 8));
     state[1] = Number.isInteger(total) && total >= 0 ? total : -1;
     state[3] = totalBytes;
+    state[6] = Number.isFinite(totalRows) && totalRows >= 0 ? totalRows : -1;
     const started = Date.now();
     const finish = (status = 'complete') => {
       if (state[4]) return;
@@ -70,10 +82,11 @@ export function createOperatorProgress({ label, total, totalBytes = 0, enabled =
     safeWrite(progressLine(label, state, started, 'start'));
     worker().postMessage({ id, label, state: state.buffer, started });
     return Object.freeze({
-      report(completed, { bytes } = {}) {
+      report(completed, { bytes, rows } = {}) {
         try {
           state[0] = Number(completed) || 0;
           if (Number.isFinite(bytes)) state[2] = bytes;
+          if (Number.isFinite(rows)) state[5] = rows;
           if (state[1] >= 0 && state[0] >= state[1]) finish();
         } catch { /* counters never affect execution */ }
       },
@@ -101,7 +114,7 @@ export async function withOperatorPhase(label, action, options = {}) {
 // replay/hashing and CPU-bound planning. Only the innermost active phase reports.
 if (!isMainThread && workerData?.heartbeat) {
   const phases = new Map();
-  parentPort.on('message', entry => phases.set(entry.id, { ...entry, state: new Float64Array(entry.state), last: entry.started }));
+  parentPort.on('message', entry => phases.set(entry.id, { ...entry, state: new Float64Array(entry.state), last: entry.started, samples: [] }));
   setInterval(() => {
     for (const [id, phase] of phases) if (phase.state[4]) phases.delete(id);
     const phase = [...phases.values()].at(-1);
@@ -117,7 +130,7 @@ if (!isMainThread && workerData?.heartbeat) {
         }
       } catch { /* keep local heartbeat if diagnostics are unavailable */ }
       if (newer) return;
-      try { fs.writeSync(2, progressLine(phase.label, phase.state, phase.started, 'active')); } catch { /* diagnostic only */ }
+      try { fs.writeSync(2, progressLine(phase.label, phase.state, phase.started, 'active', phase.samples)); } catch { /* diagnostic only */ }
       phase.last = Date.now();
     }
   }, 250);

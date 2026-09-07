@@ -2552,15 +2552,13 @@ export async function finalizeObservationHistoryIndexV3Publication({
     if (!putResult || putResult.ok === false) {
       throw new Error(`V3 publication PUT failed: ${entry.key}`);
     }
-    const fetched = await getObject({ key: entry.key });
-    const fetchedBody = Buffer.isBuffer(fetched?.body)
-      ? Buffer.from(fetched.body)
-      : Buffer.from(fetched?.body ?? "");
-    if (
-      fetchedBody.byteLength !== entry.byte_size ||
-      sha256Hex(fetchedBody) !== entry.sha256
-    ) {
-      throw new Error(`V3 post-PUT GET verification failed: ${entry.key}`);
+    // A lower post-PUT GET may supply this exact proof. ETag-only unchanged
+    // evidence has no post_put_get_verified flag and still requires a GET here.
+    if (!(putResult.verified === true && putResult.post_put_get_verified === true &&
+        putResult.key === entry.key && putResult.byte_size === entry.byte_size && putResult.sha256 === entry.sha256)) {
+      const fetched = await getObject({ key: entry.key });
+      const fetchedBody = Buffer.from(fetched?.body ?? '');
+      if (fetchedBody.byteLength !== entry.byte_size || sha256Hex(fetchedBody) !== entry.sha256) throw new Error(`V3 post-PUT GET verification failed: ${entry.key}`);
     }
     const durableResult = await recordDurableEvidence({
       key: entry.key,

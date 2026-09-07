@@ -589,6 +589,7 @@ export async function r2ListObjectsV2({
   continuation_token = null,
   max_keys = 1000,
   delimiter = null,
+  require_valid_listing = false,
 }) {
   const query = {
     "list-type": 2,
@@ -622,7 +623,22 @@ export async function r2ListObjectsV2({
   }
 
   const xml = await response.text();
-  return parseListObjectsXml(xml);
+  const parsed = parseListObjectsXml(xml);
+  if (require_valid_listing) {
+    const truncated = xml.match(/<IsTruncated>(true|false)<\/IsTruncated>/);
+    const returnedPrefix = xml.match(/<Prefix>([^<]*)<\/Prefix>/);
+    const returnedBucket = xml.match(/<Name>([^<]+)<\/Name>/);
+    const keyCount = xml.match(/<KeyCount>([0-9]+)<\/KeyCount>/);
+    if (!/<ListBucketResult(?:\s[^>]*)?>/.test(xml) || !/<\/ListBucketResult>/.test(xml) || !truncated ||
+        !returnedPrefix || decodeXmlEntities(returnedPrefix[1]) !== prefix ||
+        !returnedBucket || decodeXmlEntities(returnedBucket[1]) !== r2.bucket ||
+        !keyCount || Number(keyCount[1]) !== parsed.entries.length || parsed.common_prefixes.length ||
+        (xml.match(/<IsTruncated>/g) || []).length !== 1 ||
+        (xml.match(/<Contents>/g) || []).length !== parsed.entries.length ||
+        (truncated[1] === 'true' && !parsed.next_token)) throw new Error(`Invalid R2 admission listing: ${prefix}`);
+    return { ...parsed, is_truncated: truncated[1] === 'true' };
+  }
+  return parsed;
 }
 
 export async function r2ListAllObjects({ r2, prefix, max_keys = 1000 }) {
