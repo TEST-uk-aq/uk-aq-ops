@@ -24,3 +24,4 @@ sync_to_live.sh
 .venv*
 venv/
 ./venv
+.env.gcp
