@@ -22,10 +22,6 @@ import {
   observationsGlobalOperationLockContext,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
-  assertObservationHistoryGenerationPrefixes,
-  resolveObservationHistoryGeneration,
-} from "../../workers/shared/uk_aq_observation_history_generation.mjs";
-import {
   r2GetObject,
 } from "../../workers/shared/r2_sigv4.mjs";
 
@@ -466,22 +462,12 @@ function validateRuntimeAuthority({ options, phaseB, env }) {
   if (String(env.UK_AQ_R2_HISTORY_INTEGRITY_VERSION || "").trim() !== "v2") {
     fail("Loaded UK_AQ_R2_HISTORY_INTEGRITY_VERSION must be exactly v2");
   }
-  const generation = resolveObservationHistoryGeneration(env);
-  if (generation.version !== "v3") {
-    fail(`Selected observation generation must be v3; loaded ${generation.version}`);
+  if (phaseB.history_write_version !== "v3") {
+    fail(`Selected observation generation must be v3; loaded ${phaseB.history_write_version}`);
   }
-  if (phaseB.history_write_version !== generation.version) {
-    fail(
-      `Phase B observation generation differs from selected generation: selected=${generation.version} phase_b=${phaseB.history_write_version}`,
-    );
+  if (phaseB.observation_history_index_version !== "v3") {
+    fail(`Observation index authority must be v3; loaded ${phaseB.observation_history_index_version}`);
   }
-  assertObservationHistoryGenerationPrefixes(generation, {
-    observationsPrefix: phaseB.committed_prefix,
-    indexRoot: generation.observations_timeseries_index_prefix,
-    indexPrefix: generation.index_root_prefix,
-    bindingPrefix: generation.timeseries_binding_index_prefix,
-    runsPrefix: phaseB.runs_prefix,
-  });
   if (phaseB.r2?.bucket !== options.expectedBucket) {
     fail(`R2 bucket differs from expected: expected=${options.expectedBucket} actual=${phaseB.r2?.bucket || "<empty>"}`);
   }
@@ -494,7 +480,6 @@ function validateRuntimeAuthority({ options, phaseB, env }) {
   if (!(phaseB.r2?.endpoint && phaseB.r2?.access_key_id && phaseB.r2?.secret_access_key)) {
     fail("Complete R2 endpoint/access credentials are required");
   }
-  return generation;
 }
 
 function assertApplySummary({ summary, expected, events }) {
@@ -714,7 +699,7 @@ export async function executeControlledPhaseBAcceptance(options, {
   nowUtc = () => new Date().toISOString(),
 } = {}) {
   const phaseBBase = resolveConfig(env);
-  const generation = validateRuntimeAuthority({ options, phaseB: phaseBBase, env });
+  validateRuntimeAuthority({ options, phaseB: phaseBBase, env });
   const phaseB = buildControlledPhaseBConfig(phaseBBase);
   const ingestRetentionDays = Number(env.INGESTDB_RETENTION_DAYS || "5");
   if (!Number.isSafeInteger(ingestRetentionDays) || ingestRetentionDays <= 0) {
@@ -745,8 +730,8 @@ export async function executeControlledPhaseBAcceptance(options, {
       repository_git_sha: options.expectedGitSha,
       r2_bucket: phaseB.r2.bucket,
       logical_history_version: "v2",
-      observation_generation: generation.version,
-      observation_history_index_version: generation.version,
+      observation_generation: phaseB.history_write_version,
+      observation_history_index_version: phaseB.observation_history_index_version,
       controlled_limits: {
         max_candidates_per_run: phaseB.max_candidates_per_run,
         snapshot_max_rows: phaseB.phase_b_observation_snapshot_max_rows,
@@ -799,8 +784,8 @@ export async function executeControlledPhaseBAcceptance(options, {
     node_version: process.version,
     r2_bucket: phaseB.r2.bucket,
     logical_history_version: "v2",
-    observation_generation: generation.version,
-    observation_history_index_version: generation.version,
+    observation_generation: phaseB.history_write_version,
+    observation_history_index_version: phaseB.observation_history_index_version,
     rollback_data_preservation_mode: "retain_upstream_source",
     execution_scope: "runPhaseBBackup_only_no_full_prune_job",
     controlled_limits: {
