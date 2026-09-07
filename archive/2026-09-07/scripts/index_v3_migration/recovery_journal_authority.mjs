@@ -133,17 +133,7 @@ function validateManifestPayload(payload) {
   if (!GIT_SHA1_PATTERN.test(String(payload.target_writer_git_sha || ""))) {
     throw new Error("recovery manifest target_writer_git_sha is invalid");
   }
-  const implementation = payload.recovery_implementation;
-  requireExactKeys(implementation, implementation?.runner === undefined
-    ? ["repository_head", "files"] : ["repository_head", "files", "runner"], "recovery implementation");
-  if (implementation.runner !== undefined) {
-    requireExactKeys(implementation.runner, ["runner_kind", "runner_profile"], "recovery runner");
-    const runner = implementation.runner;
-    if (!((runner.runner_kind === "local" && runner.runner_profile === "local-conservative") ||
-        (runner.runner_kind === "gcp" && runner.runner_profile === "gcp-c4a-32"))) {
-      throw new Error("Recovery implementation runner is invalid");
-    }
-  }
+  requireExactKeys(payload.recovery_implementation, ["repository_head", "files"], "recovery implementation");
   if (!GIT_SHA1_PATTERN.test(String(payload.recovery_implementation.repository_head || ""))) {
     throw new Error("recovery implementation repository_head is invalid");
   }
@@ -169,17 +159,7 @@ function validateExpectedIdentity(actual, expected, label) {
   if (actual !== expected) throw new Error(`${label} differs from independently expected identity`);
 }
 
-// The exact reader remains the default for all existing consumers. Inspection
-// authenticates a candidate append; it grants no committed/replay authority.
-export function readAndValidateRecoveryJournal(options) {
-  return inspectJournal(options, false);
-}
-
-export function inspectRecoveryJournalForInterruptedAppend(options) {
-  return inspectJournal(options, true);
-}
-
-function inspectJournal({
+export function readAndValidateRecoveryJournal({
   recoveryRoot,
   expectedCheckpointSha256,
   expectedCheckpointByteSize,
@@ -188,7 +168,7 @@ function inspectJournal({
   expectedPlanSha256,
   expectedTargetWriterGitSha,
   allowEmpty = false,
-}, permitSingleTail) {
+}) {
   const root = path.resolve(recoveryRoot);
   const manifestPath = path.join(root, "manifest.json");
   const headPath = path.join(root, "head.json");
@@ -250,14 +230,14 @@ function inspectJournal({
   for (const name of names) {
     if (!/^\d{10}\.json$/.test(name)) throw new Error(`Unexpected recovery entry filename: ${name}`);
   }
-  if (names.length !== lastSequence && !(permitSingleTail && names.length === lastSequence + 1)) {
+  if (names.length !== lastSequence) {
     throw new Error("Recovery entry count does not exactly match the claimed head sequence");
   }
 
   const entries = [];
   const completedObjects = new Map();
   let previousEntrySha = null;
-  for (let sequence = 1; sequence <= names.length; sequence += 1) {
+  for (let sequence = 1; sequence <= lastSequence; sequence += 1) {
     const expectedName = `${String(sequence).padStart(10, "0")}.json`;
     if (names[sequence - 1] !== expectedName) {
       throw new Error(`Recovery journal sequence is missing before ${expectedName}`);
@@ -326,11 +306,8 @@ function inspectJournal({
       payload: envelope.payload,
     }));
     previousEntrySha = envelope.payload_sha256;
-    if (sequence === lastSequence && previousEntrySha !== lastEntrySha) {
-      throw new Error("Recovery head terminal entry SHA does not equal its committed entry");
-    }
   }
-  if (names.length === lastSequence && previousEntrySha !== lastEntrySha) {
+  if (previousEntrySha !== lastEntrySha) {
     throw new Error("Recovery head terminal entry SHA does not equal the final enumerated entry");
   }
 
@@ -342,6 +319,5 @@ function inspectJournal({
     completed_objects: completedObjects,
     last_sequence: lastSequence,
     last_entry_sha256: lastEntrySha,
-    interrupted_append: names.length === lastSequence + 1 ? entries.at(-1) : null,
   });
 }
