@@ -878,6 +878,8 @@ async function main(args) {
               r2, bindingPrefix,
               backupInventoryRootPrefix: process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || "history/_index_v2/backup_inventory_v2",
               sourceFingerprint: source.fingerprint, coreSnapshotReport: report,
+              // Completion is recorded only after this in-process finalisation.
+              inProcessCoreSnapshotReport: true,
               forceRebuild: false, dryRun: false,
             });
             if (report.timeseries_binding_source_hierarchy.ok !== true) throw new Error("Binding source hierarchy publication failed");

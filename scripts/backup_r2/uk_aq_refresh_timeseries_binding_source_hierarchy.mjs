@@ -227,12 +227,16 @@ function writeReport(filename, payload) {
   fs.writeFileSync(output, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
-// A proposal is accepted only from a completed, successful reconciliation report.
+// External reports must be completed; the core snapshot's explicit in-process
+// caller is still finalising its report. All reconciliation checks apply to both.
 // An explicit fingerprint alone remains a hierarchy-only operation.
-function proposalFromCoreSnapshotReport(report, bindingPrefix, sourceFingerprint) {
+function proposalFromCoreSnapshotReport(report, bindingPrefix, sourceFingerprint, inProcessCoreSnapshotReport = false) {
   if (!report) return null;
   const reconciliation = report.timeseries_binding_reconciliation;
-  if (report.ok !== true || report.dry_run !== false || !report.completed_at || !reconciliation) {
+  if (
+    report.ok !== true || report.dry_run !== false || !reconciliation
+    || (inProcessCoreSnapshotReport !== true && !report.completed_at)
+  ) {
     throw new Error("Invalid or incomplete core snapshot report for source-state finalisation");
   }
   const state = reconciliation.proposed_source_state;
@@ -272,6 +276,7 @@ export async function refreshAndCommitTimeseriesBindingSource({
   backupInventoryRootPrefix = DEFAULT_BACKUP_INVENTORY_PREFIX,
   sourceFingerprint = null,
   coreSnapshotReport = null,
+  inProcessCoreSnapshotReport = false,
   forceRebuild = false,
   dryRun = false,
   sleepFn = sleep,
@@ -286,7 +291,9 @@ export async function refreshAndCommitTimeseriesBindingSource({
   if (reportFingerprint && reportFingerprint !== sourceFingerprint) {
     throw new Error("Core snapshot report and --source-fingerprint disagree");
   }
-  const proposal = proposalFromCoreSnapshotReport(coreSnapshotReport, bindingPrefix, sourceFingerprint);
+  const proposal = proposalFromCoreSnapshotReport(
+    coreSnapshotReport, bindingPrefix, sourceFingerprint, inProcessCoreSnapshotReport,
+  );
   const sourceStateKey = `${bindingPrefix}/_source_state.json`;
   const retry = (operation, label) => withTransientR2Retry(operation, label, sleepFn);
   const report = {
