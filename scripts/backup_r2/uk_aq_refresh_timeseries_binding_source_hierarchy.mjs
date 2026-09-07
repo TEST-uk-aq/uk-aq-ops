@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import { resolveObservationHistoryGeneration } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { delegateBindingPublicationIfNeeded } from "./lib/observation_binding_publication_lock.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -378,8 +378,11 @@ export async function refreshAndCommitTimeseriesBindingSource({
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   const generation = resolveObservationHistoryGeneration(process.env);
-  if (!argv.includes("--binding-prefix")) args.binding_prefix = generation.timeseries_binding_index_prefix;
-  if (args.binding_prefix !== generation.timeseries_binding_index_prefix) throw new Error("Binding prefix contradicts selected generation");
+  if (!argv.includes("--binding-prefix")) args.binding_prefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || generation.timeseries_binding_index_prefix);
+  if (!argv.includes("--backup-inventory-prefix")) args.backup_inventory_prefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix);
+  assertObservationHistoryGenerationPrefixes(generation, {
+    bindingPrefix: args.binding_prefix, inventoryPrefix: args.backup_inventory_prefix,
+  });
   const r2 = r2FromEnv();
   if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing required R2 configuration (CFLARE_R2_* / R2_*)");

@@ -1,3 +1,4 @@
+import { getObservationHistoryGeneration, assertObservationHistoryGeneration } from "../../../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
   assertSha256,
   sha256Hex,
@@ -85,8 +86,8 @@ function requireStrictRelativePath(value, label) {
   return value;
 }
 
-function exactBindingPath(timeseriesId) {
-  return `${TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX}/timeseries_id=${timeseriesId}.json`;
+function exactBindingPath(timeseriesId, generation) {
+  return `${generation.timeseries_binding_index_prefix}/timeseries_id=${timeseriesId}.json`;
 }
 
 function requireCanonicalJsonBytes(actual, canonical, label) {
@@ -126,6 +127,7 @@ function shardIdentityMatches(shard, reference) {
 }
 
 function createReport({
+  generation,
   sourceRoot,
   destRoot,
   dryRun,
@@ -138,9 +140,9 @@ function createReport({
     dry_run: dryRun,
     source_root: sourceRoot,
     dest_root: destRoot,
-    checkpoint_root_path: TIMESERIES_BINDING_RESTORE_STATE_ROOT_KEY,
+    checkpoint_root_path: `${generation.backup_state_prefix}/root.json`,
     checkpoint_root_sha256: null,
-    pack_root_path: TIMESERIES_BINDING_RESTORE_PACK_ROOT_KEY,
+    pack_root_path: `${generation.timeseries_binding_pack_prefix}/root.json`,
     pack_root_sha256: null,
     pack_root_size: null,
     pack_source_root_hash: null,
@@ -160,16 +162,16 @@ function createReport({
     reconstructed_source_root_hash: null,
     source_root_hash_match: false,
     source_root_path: timeseriesBindingSourceRootKey(
-      TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX,
+      generation.timeseries_binding_index_prefix,
     ),
     source_root_written: false,
     source_root_readback_verified: false,
     control_products_restored: false,
     control_products_intentionally_not_restored: [
-      `${TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX}/_source_state.json`,
-      `${TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX}/_manifests/_refresh_state.json`,
-      "history/_index_v2/backup_inventory_v2/",
-      `${TIMESERIES_BINDING_RESTORE_STATE_PREFIX}/`,
+      `${generation.timeseries_binding_index_prefix}/_source_state.json`,
+      `${generation.timeseries_binding_index_prefix}/_manifests/_refresh_state.json`,
+      `${generation.backup_inventory_prefix}/`,
+      `${generation.backup_state_prefix}/`,
     ],
     root_publication_planned_last: true,
     root_published_last: false,
@@ -222,6 +224,7 @@ function verifyReadback(actual, expected, label) {
 }
 
 export async function restoreTimeseriesBindingPacksToR2({
+  generation = getObservationHistoryGeneration("v2"),
   sourceRoot,
   destRoot,
   readSourceObject,
@@ -232,6 +235,7 @@ export async function restoreTimeseriesBindingPacksToR2({
   expectedSourceRootHash = null,
   expectedPackRootSha256 = null,
 } = {}) {
+  assertObservationHistoryGeneration(generation);
   if (typeof readSourceObject !== "function") {
     throw new Error("readSourceObject is required");
   }
@@ -252,6 +256,7 @@ export async function restoreTimeseriesBindingPacksToR2({
     ? assertSha256(expectedPackRootSha256, "expected pack root SHA-256")
     : null;
   const report = createReport({
+    generation,
     sourceRoot,
     destRoot,
     dryRun,
@@ -262,7 +267,7 @@ export async function restoreTimeseriesBindingPacksToR2({
   try {
     const checkpointBody = await readRequired(
       readSourceObject,
-      TIMESERIES_BINDING_RESTORE_STATE_ROOT_KEY,
+      `${generation.backup_state_prefix}/root.json`,
       "Dropbox hierarchical checkpoint root",
     );
     report.checkpoint_root_sha256 = sha256Hex(checkpointBody);
@@ -270,6 +275,8 @@ export async function restoreTimeseriesBindingPacksToR2({
       parseJsonBytes(checkpointBody, "Dropbox hierarchical checkpoint root"),
       "Dropbox hierarchical checkpoint root",
     );
+    if ((checkpointRaw.observation_generation !== undefined && checkpointRaw.observation_generation !== generation.version) ||
+        (generation.version === "v3" && checkpointRaw.observation_generation !== "v3")) throw new Error("Pack checkpoint contradicts selected generation");
     const rawPackState = requireObject(
       checkpointRaw.timeseries_binding_packs,
       "Dropbox timeseries binding pack checkpoint root",
@@ -294,7 +301,7 @@ export async function restoreTimeseriesBindingPacksToR2({
     }
     const checkpoint = validateHierarchicalStateRoot(
       checkpointRaw,
-      TIMESERIES_BINDING_RESTORE_STATE_PREFIX,
+      generation.backup_state_prefix,
     );
     const packState = normalizeTimeseriesBindingPackRootState(checkpoint);
     requireCanonicalJsonBytes(
@@ -305,7 +312,7 @@ export async function restoreTimeseriesBindingPacksToR2({
     if (!packState.verified || packState.ranges.length === 0) {
       throw new Error("Dropbox timeseries binding pack checkpoint root is incomplete");
     }
-    if (packState.pack_root_relative_path !== TIMESERIES_BINDING_RESTORE_PACK_ROOT_KEY) {
+    if (packState.pack_root_relative_path !== `${generation.timeseries_binding_pack_prefix}/root.json`) {
       throw new Error("Dropbox checkpoint does not identify the required pack root");
     }
 
@@ -330,7 +337,7 @@ export async function restoreTimeseriesBindingPacksToR2({
       parseJsonBytes(packRootBody, "Dropbox timeseries binding pack root"),
       "Dropbox timeseries binding pack root",
     );
-    if (packRootRaw.source_prefix !== TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX) {
+    if (packRootRaw.source_prefix !== generation.timeseries_binding_index_prefix) {
       throw new Error("Dropbox pack root source prefix is not the runtime binding namespace");
     }
     requireStrictRelativePath(packRootRaw.source_root_key, "pack source root key");
@@ -342,7 +349,7 @@ export async function restoreTimeseriesBindingPacksToR2({
       requireStrictRelativePath(range.pack_relative_path, "Dropbox child pack path");
     }
     const packRoot = validateTimeseriesBindingBackupPackRootV1(packRootRaw, {
-      packPrefix: DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
+      packPrefix: generation.timeseries_binding_pack_prefix,
     });
     const canonicalPackRoot = serializeTimeseriesBindingBackupPackRootV1(packRoot);
     if (!packRootBody.equals(canonicalPackRoot.bytes)) {
@@ -373,7 +380,7 @@ export async function restoreTimeseriesBindingPacksToR2({
         );
       }
       const expectedShardKey = timeseriesBindingPackRangeStateShardKey(
-        TIMESERIES_BINDING_RESTORE_STATE_PREFIX,
+        generation.backup_state_prefix,
         reference.range_start,
         reference.range_end,
       );
@@ -467,7 +474,7 @@ export async function restoreTimeseriesBindingPacksToR2({
           member.relative_path,
           `packed timeseries ${timeseriesId} path`,
         );
-        if (relativePath !== exactBindingPath(timeseriesId)) {
+        if (relativePath !== exactBindingPath(timeseriesId, generation)) {
           throw new Error(
             `Packed timeseries ${timeseriesId} is outside the exact binding namespace`,
           );
@@ -486,7 +493,7 @@ export async function restoreTimeseriesBindingPacksToR2({
         });
       }
       const sourceRange = buildTimeseriesBindingSourceRangeManifest({
-        bindingPrefix: TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX,
+        bindingPrefix: generation.timeseries_binding_index_prefix,
         rangeStart: reference.range_start,
         rangeEnd: reference.range_end,
         units: sourceUnits,
@@ -513,7 +520,7 @@ export async function restoreTimeseriesBindingPacksToR2({
         });
       }
       const manifestKey = timeseriesBindingSourceRangeManifestKey(
-        TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX,
+        generation.timeseries_binding_index_prefix,
         reference.range_start,
         reference.range_end,
       );
@@ -534,7 +541,7 @@ export async function restoreTimeseriesBindingPacksToR2({
     }
 
     const reconstructedRoot = buildTimeseriesBindingSourceRootManifest({
-      bindingPrefix: TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX,
+      bindingPrefix: generation.timeseries_binding_index_prefix,
       ranges: reconstructedRanges.map(({ manifest, manifest_key: manifestKey }) => ({
         range_start: manifest.range_start,
         range_end: manifest.range_end,
@@ -553,7 +560,7 @@ export async function restoreTimeseriesBindingPacksToR2({
       throw new Error("Reconstructed source root member count does not match pack authority");
     }
     validateTimeseriesBindingBackupPackRootV1(packRootRaw, {
-      packPrefix: DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
+      packPrefix: generation.timeseries_binding_pack_prefix,
       sourceRootManifest: reconstructedRoot,
     });
 

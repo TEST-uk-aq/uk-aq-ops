@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -120,6 +121,17 @@ function parseArgs(argv) {
     throw new Error("--day-utc must be in YYYY-MM-DD format");
   }
 
+  if (args.domains.some((domain) => domain === "observations" || domain === "core")) {
+    const generation = resolveObservationHistoryGeneration(process.env);
+    args.domain_prefixes = {
+      ...DEFAULT_DOMAIN_PREFIXES,
+      observations: normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || generation.observations_prefix),
+      core: normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || generation.core_prefix),
+    };
+    assertObservationHistoryGenerationPrefixes(generation, {
+      observationsPrefix: args.domain_prefixes.observations, corePrefix: args.domain_prefixes.core,
+    });
+  } else args.domain_prefixes = DEFAULT_DOMAIN_PREFIXES;
   return args;
 }
 
@@ -294,7 +306,7 @@ async function main(args) {
   };
 
   for (const domain of args.domains) {
-    const domainPrefix = DEFAULT_DOMAIN_PREFIXES[domain];
+    const domainPrefix = args.domain_prefixes[domain];
     if (!domainPrefix) {
       throw new Error(`No configured prefix for domain: ${domain}`);
     }

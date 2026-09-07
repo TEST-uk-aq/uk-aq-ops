@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,7 +48,7 @@ function normalizePositiveInteger(raw, flag) {
   return value;
 }
 
-function parseArgs(argv) {
+function parseArgs(argv, env) {
   const args = {
     bindingPrefix: DEFAULT_BINDING_PREFIX,
     packPrefix: DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
@@ -80,6 +81,10 @@ function parseArgs(argv) {
       throw new Error(`Unknown argument: ${flag}`);
     }
   }
+  const generation = resolveObservationHistoryGeneration(env);
+  if (!argv.includes("--binding-prefix")) args.bindingPrefix = generation.timeseries_binding_index_prefix;
+  if (!argv.includes("--pack-prefix")) args.packPrefix = generation.timeseries_binding_pack_prefix;
+  assertObservationHistoryGenerationPrefixes(generation, { bindingPrefix: args.bindingPrefix, packPrefix: args.packPrefix });
   if (!args.bindingPrefix) throw new Error("--binding-prefix must not be empty");
   if (!args.packPrefix) throw new Error("--pack-prefix must not be empty");
   if (args.sawDryRun && args.sawWriteR2) {
@@ -118,7 +123,7 @@ function writeReport(filename, report) {
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
-  const args = parseArgs(argv);
+  const args = parseArgs(argv, env);
   const r2 = r2FromEnv(env);
   if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing required R2 configuration (CFLARE_R2_* / R2_*)");

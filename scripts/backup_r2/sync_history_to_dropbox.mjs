@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +31,9 @@ import {
   stateYearEntry,
   upsertStateMonthSummary,
   validateHierarchicalInventoryRoot,
+  assertSelectedBackupInventory,
+  assertSelectedBackupState,
+  assertSelectedObservationInventoryShard,
   validateHierarchicalStateRoot,
   validateLatestTimeseriesState,
   validateObservationMonthInventoryShard,
@@ -260,6 +263,10 @@ function parseArgs(argv) {
     }
     throw new Error(`Unknown argument: ${arg}`);
   }
+  const generation = resolveObservationHistoryGeneration(process.env);
+  if (!argv.includes("--inventory-root-prefix")) args.inventory_root_prefix = process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix;
+  if (!argv.includes("--state-root-prefix")) args.state_root_prefix = process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || generation.backup_state_prefix;
+  assertObservationHistoryGenerationPrefixes(generation, { inventoryPrefix: args.inventory_root_prefix, statePrefix: args.state_root_prefix });
   if (!args.source_root) throw new Error("--source-root is required");
   if (!args.dest_root) throw new Error("--dest-root is required");
   if (!args.inventory_root_prefix) {
@@ -524,6 +531,15 @@ function parseDayManifestHash(text, relativePath) {
   return hash;
 }
 
+function readSelectedInventoryJson(args, relativePath, domain) {
+  const generation = resolveObservationHistoryGeneration(process.env);
+  assertObservationHistoryGenerationKey(generation, relativePath, "backup_inventory");
+  const value = readJsonRequired(args.rclone_bin, args.source_root, relativePath).parsed;
+  const prefix = domain === "core" ? generation.core_prefix : generation.timeseries_binding_index_prefix;
+  if (value.source_prefix !== prefix) throw new Error("Inventory shard source prefix contradicts selected generation");
+  return value;
+}
+
 function copyAndVerifyObservationDay({ args, day }) {
   const sourceDayPath = joinTargetPath(args.source_root, day.relative_path);
   const destDayPath = joinTargetPath(args.dest_root, day.relative_path);
@@ -666,6 +682,7 @@ function runForcedObservationPruneRecheck(args, inventoryRoot, report) {
           inventoryMonth.inventory_shard_key,
         ).parsed,
       );
+      assertSelectedObservationInventoryShard(resolveObservationHistoryGeneration(process.env), inventoryShard);
       if (inventoryShard.source_month_hash !== inventoryMonth.content_hash) {
         failures.push({
           day_utc: `${inventoryYear.year}-${inventoryMonth.month}`,
@@ -722,10 +739,7 @@ async function main() {
   );
 
   const generation = resolveObservationHistoryGeneration(process.env);
-  if (inventoryRoot.observations.source_root_manifest_key !== generation.observations_root_key ||
-      inventoryRoot.global_units.observations_timeseries_latest.relative_path !== generation.observations_timeseries_latest_key) {
-    throw new Error("Backup inventory does not describe the selected observation generation");
-  }
+  assertSelectedBackupInventory(generation, inventoryRoot);
   const runManifestInventoryPointer =
     inventoryRoot.global_units.observation_run_manifests;
   const runManifestInventoryResult = readJsonRequired(
@@ -737,6 +751,7 @@ async function main() {
     validateObservationRunManifestInventoryShard(
       runManifestInventoryResult.parsed,
     );
+  for (const unit of runManifestInventoryShard.units) assertObservationHistoryGenerationKey(generation, unit.relative_path, "runs");
   const actualRunManifestShardHash = sha256Hex(
     stableJson(runManifestInventoryShard),
   );
@@ -755,9 +770,12 @@ async function main() {
     DROPBOX_READ_RETRY,
   );
   let stateRoot = validateHierarchicalStateRoot(
-    existingStateResult?.parsed || emptyHierarchicalStateRoot(args.state_root_prefix),
+    existingStateResult?.parsed || emptyHierarchicalStateRoot(args.state_root_prefix, generation),
     args.state_root_prefix,
   );
+
+  assertSelectedBackupState(generation, stateRoot);
+  if (generation.version === "v3") stateRoot.observation_generation = "v3";
 
   const report = {
     ok: true,
@@ -907,6 +925,7 @@ async function main() {
       const inventoryShard = validateObservationMonthInventoryShard(
         inventoryShardResult.parsed,
       );
+      assertSelectedObservationInventoryShard(resolveObservationHistoryGeneration(process.env), inventoryShard);
       if (inventoryShard.source_month_hash !== inventoryMonth.content_hash) {
         throw new Error(
           `Inventory month shard hash mismatch for `
@@ -1098,11 +1117,7 @@ async function main() {
         dryRun: args.dry_run,
         checkpointBatchUnits: args.checkpoint_batch_units,
         checkpointFlushSeconds: args.checkpoint_flush_seconds,
-        readInventoryJson: (relativePath) => readJsonRequired(
-          args.rclone_bin,
-          args.source_root,
-          relativePath,
-        ).parsed,
+        readInventoryJson: (relativePath) => readSelectedInventoryJson(args, relativePath, "bindings"),
         readStateJsonMaybe: (relativePath) => readJsonMaybe(
           args.rclone_bin,
           args.dest_root,
@@ -1185,11 +1200,7 @@ async function main() {
       dryRun: args.dry_run,
       checkpointBatchUnits: args.checkpoint_batch_units,
       checkpointFlushSeconds: args.checkpoint_flush_seconds,
-      readInventoryJson: (relativePath) => readJsonRequired(
-        args.rclone_bin,
-        args.source_root,
-        relativePath,
-      ).parsed,
+      readInventoryJson: (relativePath) => readSelectedInventoryJson(args, relativePath, "core"),
       readStateJsonMaybe: (relativePath) => readJsonMaybe(
         args.rclone_bin,
         args.dest_root,

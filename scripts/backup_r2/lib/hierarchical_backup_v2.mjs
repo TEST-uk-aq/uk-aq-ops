@@ -1,3 +1,4 @@
+import { assertObservationHistoryGeneration, assertObservationHistoryGenerationKey } from "../../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { createHash } from "node:crypto";
 
 export const HIERARCHICAL_INVENTORY_SCHEMA_VERSION = 1;
@@ -809,12 +810,18 @@ export function markLatestTimeseriesProcessed(stateRoot, inventoryUnit, copiedAt
 
 export function emptyHierarchicalStateRoot(
   stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2",
+  generation = null,
 ) {
   const prefix = normalizeRelativePath(stateRootPrefix, "state root prefix");
+  if (generation) {
+    assertObservationHistoryGeneration(generation);
+    if (prefix !== generation.backup_state_prefix) throw new Error("Empty checkpoint prefix contradicts selected generation");
+  }
   return {
     schema_version: HIERARCHICAL_STATE_SCHEMA_VERSION,
     kind: HIERARCHICAL_STATE_KIND,
     backup_version: "v2",
+    ...(generation?.version === "v3" ? { observation_generation: "v3" } : {}),
     observations: {
       processed_source_root_hash: null,
       years: [],
@@ -826,7 +833,10 @@ export function emptyHierarchicalStateRoot(
         processed_source_hash: null,
         state_shard_hash: null,
       },
-      observations_timeseries_latest: emptyLatestTimeseriesState(),
+      observations_timeseries_latest: {
+        ...emptyLatestTimeseriesState(),
+        ...(generation ? { source_relative_path: generation.observations_timeseries_latest_key } : {}),
+      },
     },
   };
 }
@@ -1000,4 +1010,74 @@ export function stateMonthEntry(stateRoot, year, month) {
   const yearEntry = stateYearEntry(stateRoot, year);
   const normalizedMonth = normalizeMonth(month);
   return yearEntry?.months?.find((entry) => entry.month === normalizedMonth) || null;
+}
+
+// Runtime backup admission only; historical migration evidence keeps its own verifier.
+export function assertSelectedBackupInventory(generation, root) {
+  assertObservationHistoryGeneration(generation);
+  if ((root.observation_generation !== undefined && root.observation_generation !== generation.version) ||
+      (generation.version === "v3" && root.observation_generation !== "v3") ||
+      root.observations.source_root_manifest_key !== generation.observations_root_key ||
+      root.global_units.observations_timeseries_latest?.relative_path !== generation.observations_timeseries_latest_key ||
+      root.core?.source_prefix !== generation.core_prefix ||
+      root.timeseries_binding?.source_manifest_root_key !== `${generation.timeseries_binding_index_prefix}/_manifests/root.json`) {
+    throw new Error("Backup inventory does not describe the selected complete generation");
+  }
+  const inventoryKey = (key) => assertObservationHistoryGenerationKey(generation, key, "backup_inventory");
+  inventoryKey(root.core.inventory_shard_key);
+  inventoryKey(root.timeseries_binding.inventory_root_key);
+  for (const range of root.timeseries_binding.ranges) inventoryKey(range.inventory_shard_key);
+  inventoryKey(root.global_units.observation_run_manifests.inventory_shard_key);
+  for (const year of root.observations.years) {
+    assertObservationHistoryGenerationKey(generation, year.manifest_key);
+    for (const month of year.months) {
+      assertObservationHistoryGenerationKey(generation, month.manifest_key);
+      inventoryKey(month.inventory_shard_key);
+    }
+  }
+  if (root.timeseries_binding_packs) {
+    const pack = validateTimeseriesBindingPackInventoryReference(root.timeseries_binding_packs);
+    if (pack.source_prefix !== generation.timeseries_binding_index_prefix ||
+        pack.pack_root_relative_path !== `${generation.timeseries_binding_pack_prefix}/root.json`) {
+      throw new Error("Binding pack inventory contradicts selected generation");
+    }
+    for (const range of pack.ranges) assertObservationHistoryGenerationKey(generation, range.pack_relative_path, "packs");
+  }
+  return root;
+}
+
+export function assertSelectedBackupState(generation, root) {
+  assertObservationHistoryGeneration(generation);
+  if ((root.observation_generation !== undefined && root.observation_generation !== generation.version) ||
+      (generation.version === "v3" && root.observation_generation !== "v3")) {
+    throw new Error("Dropbox checkpoint contradicts selected generation");
+  }
+  const stateKey = (key) => assertObservationHistoryGenerationKey(generation, key, "backup_state");
+  for (const year of root.observations.years) {
+    for (const month of year.months) stateKey(month.state_shard_key);
+  }
+  stateKey(root.global_units.observation_run_manifests.state_shard_key);
+  if (root.core?.state_shard_key) stateKey(root.core.state_shard_key);
+  const latest = root.global_units.observations_timeseries_latest?.source_relative_path;
+  if (latest) assertObservationHistoryGenerationKey(generation, latest, "latest");
+  for (const range of root.timeseries_binding?.ranges || []) stateKey(range.state_shard_key);
+  for (const range of root.timeseries_binding_packs?.ranges || []) {
+    stateKey(range.state_shard_key);
+    assertObservationHistoryGenerationKey(generation, range.pack_relative_path, "packs");
+  }
+  if (root.timeseries_binding_packs?.pack_root_relative_path) {
+    assertObservationHistoryGenerationKey(generation, root.timeseries_binding_packs.pack_root_relative_path, "packs");
+  }
+  return root;
+}
+
+export function assertSelectedObservationInventoryShard(generation, shard) {
+  assertObservationHistoryGenerationKey(generation, shard.source_month_manifest_key);
+  for (const day of shard.days) {
+    const expected = `${generation.observations_prefix}/day_utc=${day.day_utc}`;
+    if (day.relative_path !== expected || day.manifest_key !== `${expected}/manifest.json`) {
+      throw new Error("Observation inventory day contradicts selected generation");
+    }
+  }
+  return shard;
 }

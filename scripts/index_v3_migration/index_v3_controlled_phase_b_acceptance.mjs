@@ -462,8 +462,8 @@ function validateRuntimeAuthority({ options, phaseB, env }) {
   if (String(env.UK_AQ_R2_HISTORY_INTEGRITY_VERSION || "").trim() !== "v2") {
     fail("Loaded UK_AQ_R2_HISTORY_INTEGRITY_VERSION must be exactly v2");
   }
-  if (phaseB.history_write_version !== "v2") {
-    fail(`Logical history authority must be v2; loaded ${phaseB.history_write_version}`);
+  if (phaseB.history_write_version !== "v3") {
+    fail(`Selected observation generation must be v3; loaded ${phaseB.history_write_version}`);
   }
   if (phaseB.observation_history_index_version !== "v3") {
     fail(`Observation index authority must be v3; loaded ${phaseB.observation_history_index_version}`);
@@ -729,7 +729,8 @@ export async function executeControlledPhaseBAcceptance(options, {
       environment: options.environment,
       repository_git_sha: options.expectedGitSha,
       r2_bucket: phaseB.r2.bucket,
-      logical_history_version: phaseB.history_write_version,
+      logical_history_version: "v2",
+      observation_generation: phaseB.history_write_version,
       observation_history_index_version: phaseB.observation_history_index_version,
       controlled_limits: {
         max_candidates_per_run: phaseB.max_candidates_per_run,
@@ -782,7 +783,8 @@ export async function executeControlledPhaseBAcceptance(options, {
     repository_git_sha: options.expectedGitSha,
     node_version: process.version,
     r2_bucket: phaseB.r2.bucket,
-    logical_history_version: phaseB.history_write_version,
+    logical_history_version: "v2",
+    observation_generation: phaseB.history_write_version,
     observation_history_index_version: phaseB.observation_history_index_version,
     rollback_data_preservation_mode: "retain_upstream_source",
     execution_scope: "runPhaseBBackup_only_no_full_prune_job",
@@ -808,7 +810,7 @@ function printDryRun(result) {
   process.stdout.write("STRICT READ-ONLY PLANNER: runPhaseBBackup() WAS NOT CALLED\n\n");
   process.stdout.write(`Git SHA: ${result.repository_git_sha}\n`);
   process.stdout.write(`R2 bucket: ${result.r2_bucket}\n`);
-  process.stdout.write(`History/index: ${result.logical_history_version}/${result.observation_history_index_version}\n`);
+  process.stdout.write(`Observation generation/index: ${result.observation_generation}/${result.observation_history_index_version}\n`);
   process.stdout.write(`Latest eligible day: ${result.plan.window.latest_eligible_day_utc}\n`);
   process.stdout.write(`Selection reason: ${result.plan.selection_reason}\n\n`);
   process.stdout.write("Selected candidate:\n");

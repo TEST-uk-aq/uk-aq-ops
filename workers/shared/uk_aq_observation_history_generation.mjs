@@ -13,6 +13,10 @@ const GENERATIONS = Object.freeze(Object.fromEntries(["v2", "v3"].map((version) 
     observations_timeseries_index_prefix: `${indexes}/observations_timeseries`,
     observations_timeseries_latest_key: `${indexes}/observations_timeseries_latest.json`,
     timeseries_binding_index_prefix: `${indexes}/timeseries_binding`,
+    core_prefix: `history/${version}/core`,
+    backup_inventory_prefix: `${indexes}/backup_inventory_v2`,
+    backup_state_prefix: `_ops/checkpoints/r2_history_backup_state_v2${version === "v3" ? "/generation=v3" : ""}`,
+    timeseries_binding_pack_prefix: `history/_backup_packs_v1/timeseries_binding${version === "v3" ? "/generation=v3" : ""}`,
   })];
 })));
 
@@ -44,9 +48,14 @@ export function assertObservationHistoryGenerationKey(generation, key, domain = 
     observation_index: generation.observations_timeseries_index_prefix,
     bindings: generation.timeseries_binding_index_prefix,
     runs: generation.observations_runs_prefix,
+    core: generation.core_prefix,
+    backup_inventory: generation.backup_inventory_prefix,
+    backup_state: generation.backup_state_prefix,
+    packs: generation.timeseries_binding_pack_prefix,
   };
   const prefix = prefixes[domain];
-  if (typeof key !== "string" || key.split("/").some((part) =>
+  if ((["packs", "backup_state"].includes(domain) && generation.version === "v2" &&
+      typeof key === "string" && key.startsWith(`${prefix}/generation=`)) || typeof key !== "string" || key.split("/").some((part) =>
     !part || part === "." || part === ".." || /[\\\x00-\x1f\x7f]/.test(part)
   ) || (domain === "latest"
     ? key !== generation.observations_timeseries_latest_key
@@ -59,14 +68,26 @@ export function assertObservationHistoryGenerationKey(generation, key, domain = 
 export function assertObservationHistoryGenerationPrefixes(generation, {
   observationsPrefix = generation.observations_prefix,
   indexRoot = generation.observations_timeseries_index_prefix,
+  indexPrefix = generation.index_root_prefix,
   latestKey = generation.observations_timeseries_latest_key,
   bindingPrefix = generation.timeseries_binding_index_prefix,
+  runsPrefix = generation.observations_runs_prefix,
+  corePrefix = generation.core_prefix,
+  inventoryPrefix = generation.backup_inventory_prefix,
+  statePrefix = generation.backup_state_prefix,
+  packPrefix = generation.timeseries_binding_pack_prefix,
 } = {}) {
   assertObservationHistoryGeneration(generation);
   if (observationsPrefix !== generation.observations_prefix ||
       indexRoot !== generation.observations_timeseries_index_prefix ||
+      indexPrefix !== generation.index_root_prefix ||
       latestKey !== generation.observations_timeseries_latest_key ||
-      bindingPrefix !== generation.timeseries_binding_index_prefix) {
+      bindingPrefix !== generation.timeseries_binding_index_prefix ||
+      runsPrefix !== generation.observations_runs_prefix ||
+      corePrefix !== generation.core_prefix ||
+      inventoryPrefix !== generation.backup_inventory_prefix ||
+      statePrefix !== generation.backup_state_prefix ||
+      packPrefix !== generation.timeseries_binding_pack_prefix) {
     throw new Error(`Observation history prefixes must describe complete ${generation.version}`);
   }
   return generation;

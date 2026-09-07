@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { resolveObservationHistoryGeneration } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -223,6 +224,7 @@ export async function main({ argv = process.argv.slice(2) } = {}) {
     args = parseTimeseriesBindingPackRestoreArgs(argv);
     if (!args) return 0;
     const report = await restoreTimeseriesBindingPacksToR2({
+      generation: resolveObservationHistoryGeneration(process.env),
       sourceRoot: args.sourceRoot,
       destRoot: args.destRoot,
       dryRun: !args.writeR2,

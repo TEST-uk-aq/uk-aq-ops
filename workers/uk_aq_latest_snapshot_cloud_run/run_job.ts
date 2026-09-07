@@ -1,3 +1,4 @@
+import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../shared/uk_aq_observation_history_generation.mjs";
 import zlib from "node:zlib";
 import {
   fetchWithTimeout,
@@ -275,6 +276,7 @@ type MetadataObservedProperty = {
 };
 
 type CoreMetadataCacheFile = {
+  source_core_prefix?: string;
   schema_version: 2;
   generated_at: string;
   source_day_utc: string | null;
@@ -361,9 +363,11 @@ const UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX") || "latest_snapshots_state/v1",
 );
 const UK_AQ_LATEST_SNAPSHOT_STATE_KEY = `${UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX}/latest_state.json`;
+const OBSERVATION_HISTORY_GENERATION = resolveObservationHistoryGeneration(Deno.env.toObject());
 const UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX = normalizePrefix(
-  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX") || "history/v2/core",
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX") || OBSERVATION_HISTORY_GENERATION.core_prefix,
 );
+assertObservationHistoryGenerationPrefixes(OBSERVATION_HISTORY_GENERATION, { corePrefix: UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX });
 const UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY =
   `${UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX}/core_metadata_cache_v2.json`;
 const UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS = parsePositiveInt(
@@ -1104,6 +1108,7 @@ function metadataCacheRepresentsLatestCoreManifest(
   cache: CoreMetadataCacheFile,
   latestManifestInfo: LatestCoreManifestInfo,
 ): boolean {
+  if ((cache.source_core_prefix || "history/v2/core") !== UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX) return false;
   if (cache.source_day_utc !== latestManifestInfo.day_utc) return false;
   const generatedAt = normalizeTimestamp(cache.generated_at);
   const manifestLastModified = normalizeTimestamp(latestManifestInfo.last_modified);
@@ -1303,6 +1308,7 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
   }
 
   const cachePayload: CoreMetadataCacheFile = {
+    source_core_prefix: UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX,
     schema_version: 2,
     generated_at: utcNowIso(),
     source_day_utc: manifest.day_utc || latestManifestInfo.day_utc,

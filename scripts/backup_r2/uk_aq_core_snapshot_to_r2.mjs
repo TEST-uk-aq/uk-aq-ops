@@ -16,7 +16,7 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
-import { resolveObservationHistoryGeneration } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { delegateBindingPublicationIfNeeded } from "./lib/observation_binding_publication_lock.mjs";
 import { refreshAndCommitTimeseriesBindingSource } from "./uk_aq_refresh_timeseries_binding_source_hierarchy.mjs";
 import {
@@ -32,9 +32,9 @@ import {
 export { TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION, buildTimeseriesBindingSourceState };
 
 export function resolveCoreSnapshotPrefix(env = process.env) {
-  resolveObservationHistoryGeneration(env);
-  const prefix = normalizePrefix(env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || "history/v2/core");
-  if (prefix !== "history/v2/core") throw new Error("Observation generation does not relocate canonical core authority");
+  const generation = resolveObservationHistoryGeneration(env);
+  const prefix = normalizePrefix(env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || generation.core_prefix);
+  assertObservationHistoryGenerationPrefixes(generation, { corePrefix: prefix });
   return prefix;
 }
 
@@ -170,7 +170,7 @@ function usage() {
       "",
       "Optional:",
       "  --day-utc <YYYY-MM-DD>       Default: today UTC",
-      "  --prefix <r2-prefix>         Default: selected by UK_AQ_R2_HISTORY_VERSION (v1 history/v1/core; v2 history/v2/core)",
+      "  --prefix <r2-prefix>         Default: selected by UK_AQ_R2_HISTORY_VERSION (v2 history/v2/core; v3 history/v3/core)",
       "  --table <name>               Repeatable table filter",
       "  --tables <a,b,c>             Comma-separated table filter",
       "  --cursor-batch-rows <N>      Default: 5000",
@@ -385,9 +385,14 @@ function parseArgs(argv) {
     throw new Error(`Unknown arg: ${arg}`);
   }
 
-  if (!args.prefix) {
-    args.prefix = resolveCoreSnapshotPrefix(process.env);
-  }
+  const generation = resolveObservationHistoryGeneration(process.env);
+  const corePrefix = resolveCoreSnapshotPrefix(process.env);
+  if (!args.prefix) args.prefix = corePrefix;
+  assertObservationHistoryGenerationPrefixes(generation, {
+    corePrefix: args.prefix,
+    bindingPrefix: normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || generation.timeseries_binding_index_prefix),
+    inventoryPrefix: normalizePrefix(process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix),
+  });
 
   if (!args.prefix) {
     throw new Error("--prefix resolved to an empty value");
@@ -876,7 +881,7 @@ async function main(args) {
           if (!args.dry_run && report.timeseries_binding_reconciliation?.status !== "failed") {
             report.timeseries_binding_source_hierarchy = await refreshAndCommitTimeseriesBindingSource({
               r2, bindingPrefix,
-              backupInventoryRootPrefix: process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || "history/_index_v2/backup_inventory_v2",
+              backupInventoryRootPrefix: resolveObservationHistoryGeneration(process.env).backup_inventory_prefix,
               sourceFingerprint: source.fingerprint, coreSnapshotReport: report,
               // Completion is recorded only after this in-process finalisation.
               inProcessCoreSnapshotReport: true,

@@ -36,20 +36,23 @@ import {
 } from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import { r2GetObject, r2HeadObject } from "../../workers/shared/r2_sigv4.mjs";
 import {
-  buildObservationHistoryV3RecoveryReplayStateSha256,
-  buildObservationHistoryV3RerunVerificationPlan,
   stableMigrationJson,
 } from "../backup_r2/lib/observation_history_migration_v3.mjs";
-import { readAndValidateRecoveryJournal } from "./recovery_journal_authority.mjs";
+import {
+  selectedCutoverGeneration, readAuthenticatedCutoverBaseline, verifySelectedCutoverMetadata,
+} from "./index_v3_cutover_generation_evidence.mjs";
+import { getObservationHistoryGeneration, assertObservationHistoryGenerationKey } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { CONTROLLED_PHASE_B_SOURCE_TABLES } from "./index_v3_controlled_phase_b_source_freeze.mjs";
 
-export const STEADY_STATE_POST_WRITE_VERIFIER_VERSION = 1;
+const GENERATION = getObservationHistoryGeneration("v3");
+
+export const STEADY_STATE_POST_WRITE_VERIFIER_VERSION = 2;
 export const STEADY_STATE_BASELINE_KIND =
   "authenticated_completed_migration_recovery_journal";
 export const FINAL_SUCCESS = Object.freeze([
   "STEADY-STATE POST-WRITE VERIFY PASS",
   "ELIGIBLE FOR FIRST LOCKED POST-v3 DROPBOX BACKUP.",
-  "MAINTENANCE AND WRITER FREEZE REMAIN REQUIRED.",
+  "READ-ONLY EVIDENCE: NO SCHEDULE OR WRITER RELEASE IS PERFORMED.",
 ]);
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -178,7 +181,7 @@ export function assertSafeLocalReportPath({
   if (protectedFiles.includes(output)) fail("report output path equals protected input evidence");
   const protectedDirectories = [
     canonicalizeLocalPath(recoveryRoot, "checkpoint recovery directory"),
-    canonicalizeLocalPath(dropboxRoot, "Dropbox root"),
+    ...(dropboxRoot ? [canonicalizeLocalPath(dropboxRoot, "Dropbox root")] : []),
   ];
   if (protectedDirectories.some((root) => pathIsWithin(output, root))) {
     fail("report output path is inside a protected evidence directory");
@@ -203,7 +206,8 @@ export function validateAcceptanceReport(reportInput, expectedInput) {
   requireEqual(String(report.environment || "").toUpperCase(), expected.environment, "acceptance environment");
   requireEqual(report.repository_git_sha, expectedGitSha, "acceptance Git SHA");
   requireEqual(report.run_id, expected.run_id, "acceptance run_id");
-  requireEqual(report.logical_history_version, "v2", "acceptance logical history version");
+  requireEqual(report.observation_generation, "v3", "acceptance observation generation");
+  requireEqual(report.logical_history_version, "v2", "acceptance logical schema version");
   requireEqual(report.observation_history_index_version, "v3", "acceptance index authority");
   requireEqual(report.rollback_data_preservation_mode, "retain_upstream_source", "acceptance rollback preservation mode");
   requireEqual(report.execution_scope, "runPhaseBBackup_only_no_full_prune_job", "acceptance execution scope");
@@ -379,7 +383,7 @@ export function validateIndependentControlState(stateInput, accepted) {
     fail("candidate history manifest/file evidence is incomplete");
   }
   const expectedManifestKey = buildHistoryV2ConnectorManifestKey(
-    "history/v2/observations",
+    GENERATION.observations_prefix,
     accepted.day_utc,
     accepted.connector_id,
   );
@@ -460,6 +464,9 @@ export function bindIndependentControlStateToCanonical(independentInput, canonic
 }
 
 async function getIdentity(getObject, key) {
+  const domain = key === GENERATION.observations_timeseries_latest_key ? "latest"
+    : key?.startsWith(`${GENERATION.observations_timeseries_index_prefix}/`) ? "observation_index" : "observations";
+  assertObservationHistoryGenerationKey(GENERATION, key, domain);
   const object = await getObject({ key });
   const body = exactBuffer(object?.body, key);
   return Object.freeze({ key, body, byte_size: body.byteLength, sha256: sha256(body) });
@@ -514,6 +521,7 @@ async function reconcileJsonDependency(getObject, descriptor, kind, entries, { a
 async function reconcileParquetDependency(headObject, descriptor, kind, entries) {
   let head;
   try {
+    assertObservationHistoryGenerationKey(GENERATION, descriptor.key);
     head = await headObject({ key: descriptor.key });
   } catch (error) {
     entries.push({ kind, key: descriptor.key, classification: "FAIL", reason: error instanceof Error ? error.message : String(error) });
@@ -622,6 +630,7 @@ export async function verifyCanonicalHierarchy({ getObject, headObject, accepted
         byte_size: Number(file.bytes),
         sha256: String(file.etag_or_hash || ""),
       };
+      assertObservationHistoryGenerationKey(GENERATION, file.key);
       const head = await headObject({ key: file.key });
       const classification = classifyDependencyIdentity({
         exists: head?.exists !== false,
@@ -651,7 +660,7 @@ export async function verifyCanonicalHierarchy({ getObject, headObject, accepted
   }
   requireEqual(parquetRows, accepted.source_row_count, "canonical child Parquet row total");
 
-  const dayKey = buildHistoryV2DayManifestKey("history/v2/observations", accepted.day_utc);
+  const dayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, accepted.day_utc);
   const dayObject = await getIdentity(getObject, dayKey);
   const day = JSON.parse(dayObject.body.toString("utf8"));
   validateCanonicalHistoryV2Manifest(day, {
@@ -978,110 +987,24 @@ function requireAuthenticatedCompletedPlanIdentity(completed, expected, label) {
   return identity;
 }
 
-function replayAuthenticatedRecoveryCheckpoint(originalCheckpoint, journal) {
-  const checkpoint = structuredClone(originalCheckpoint);
-  checkpoint.prepared_units ||= {};
-  checkpoint.completed_objects ||= {};
-  checkpoint.preparation_order ||= [];
-  for (const entry of journal.entries) {
-    const updates = entry.payload.updates || {};
-    for (const prepared of updates.prepared_records || []) {
-      if (!prepared?.unit_id || prepared.record?.unit_id !== prepared.unit_id || checkpoint.prepared_units[prepared.unit_id]) {
-        fail(`authenticated recovery prepared-record update is invalid: ${String(prepared?.unit_id || "")}`);
-      }
-      checkpoint.prepared_units[prepared.unit_id] = structuredClone(prepared.record);
-    }
-    for (const state of updates.prepared_state_updates || []) {
-      const record = checkpoint.prepared_units[state?.unit_id];
-      if (!record) fail(`authenticated recovery state references unknown unit: ${String(state?.unit_id || "")}`);
-      if (state.files_published === true) record.files_published = true;
-      if (state.remove_staging_refs === true) {
-        record.target_file_intents = record.target_file_intents.map(({ staging_ref: _stagingRef, ...intent }) => intent);
-      }
-    }
-    for (const completed of updates.completed_objects || []) {
-      if (!completed?.key || !completed.evidence) fail("authenticated recovery completed-object update is invalid");
-      checkpoint.completed_objects[completed.key] ||= structuredClone(completed.evidence);
-    }
-    for (const unitId of updates.preparation_order_append || []) {
-      if (!checkpoint.prepared_units[unitId] || checkpoint.preparation_order.includes(unitId)) {
-        fail(`authenticated recovery preparation-order update is invalid: ${String(unitId)}`);
-      }
-      checkpoint.preparation_order.push(unitId);
-    }
-    if (updates.final_state) {
-      if (typeof updates.final_state.full_verification_complete === "boolean") {
-        checkpoint.full_verification_complete = updates.final_state.full_verification_complete;
-      }
-      if (typeof updates.final_state.cutover_ready === "boolean") {
-        checkpoint.cutover_ready = updates.final_state.cutover_ready;
-      }
-    }
-  }
-  return checkpoint;
-}
+async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, accepted, requiredUnchangedDay, environment, bucket }) {
+  const baseline = readAuthenticatedCutoverBaseline({ checkpointPath, planReport, environment, bucket });
+  const baselinePlan = baseline.plan;
+  const journal = { completed_objects: baseline.completedObjects };
+  const provenance = validateSteadyStateBaselineProvenance(baseline.provenance);
 
-async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, recoveryRoot, accepted, requiredUnchangedDay }) {
-  const checkpointBytes = fs.readFileSync(checkpointPath);
-  const checkpoint = JSON.parse(checkpointBytes.toString("utf8"));
-  const recoveryManifest = parseJsonFile(path.join(recoveryRoot, "manifest.json"), "recovery manifest");
-  const migrationRunId = String(planReport?.result?.migration_run_id || "");
-  const planSha = exactSha256(planReport?.result?.plan_sha256, "migration plan SHA-256");
-  const authoritySha = exactSha256(checkpoint.authority_sha256, "checkpoint immutable authority SHA-256");
-  const targetWriterGitSha = exactGitSha(recoveryManifest?.payload?.target_writer_git_sha, "migration target writer Git SHA");
-  const journal = readAndValidateRecoveryJournal({
-    recoveryRoot,
-    expectedCheckpointSha256: sha256(checkpointBytes),
-    expectedCheckpointByteSize: checkpointBytes.byteLength,
-    expectedAuthoritySha256: authoritySha,
-    expectedMigrationRunId: migrationRunId,
-    expectedPlanSha256: planSha,
-    expectedTargetWriterGitSha: targetWriterGitSha,
-  });
-  const replayedCheckpoint = replayAuthenticatedRecoveryCheckpoint(checkpoint, journal);
-  const baselinePlan = buildObservationHistoryV3RerunVerificationPlan({
-    checkpoint: replayedCheckpoint,
-    allowLegacyRecoveryOrdering: true,
-    progressEnabled: true,
-    recoveryAuthority: {
-      authenticated: true,
-      original_checkpoint_sha256: sha256(checkpointBytes),
-      immutable_authority_sha256: authoritySha,
-      migration_run_id: migrationRunId,
-      plan_sha256: planSha,
-      last_sequence: journal.last_sequence,
-      last_entry_sha256: journal.last_entry_sha256,
-      replayed_checkpoint_sha256: buildObservationHistoryV3RecoveryReplayStateSha256(replayedCheckpoint),
-    },
-  });
-  const headBytes = fs.readFileSync(path.join(recoveryRoot, "head.json"));
-  const provenance = validateSteadyStateBaselineProvenance({
-    kind: STEADY_STATE_BASELINE_KIND,
-    pre_migration_dropbox_source: false,
-    checkpoint_sha256: sha256(checkpointBytes),
-    checkpoint_byte_size: checkpointBytes.byteLength,
-    immutable_authority_sha256: authoritySha,
-    recovery_head_sha256: sha256(headBytes),
-    recovery_last_sequence: journal.last_sequence,
-    recovery_last_entry_sha256: journal.last_entry_sha256,
-    migration_run_id: migrationRunId,
-    plan_sha256: planSha,
-    target_writer_git_sha: targetWriterGitSha,
-    recovery_reconciliation_mode: baselinePlan.recovery_reconciliation.mode,
-  });
-
-  const dayKey = buildHistoryV2DayManifestKey("history/v2/observations", accepted.day_utc);
+  const dayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, accepted.day_utc);
   if (journal.completed_objects.has(dayKey)) fail("accepted day already exists in the authenticated pre-steady-state baseline");
   const requiredDay = exactDay(requiredUnchangedDay, "required unchanged day");
-  const requiredDayKey = buildHistoryV2DayManifestKey("history/v2/observations", requiredDay);
+  const requiredDayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, requiredDay);
   if (!completedIdentity(journal.completed_objects, requiredDayKey)) {
     fail(`required unchanged day lacks authenticated post-migration evidence: ${requiredDay}`);
   }
 
   const branchKeys = new Set([
-    buildR2HistoryV2ObservationsMonthManifestKey("history/v2/observations", accepted.day_utc.slice(0, 4), accepted.day_utc.slice(5, 7)),
-    buildR2HistoryV2ObservationsYearManifestKey("history/v2/observations", accepted.day_utc.slice(0, 4)),
-    buildR2HistoryV2ObservationsRootManifestKey("history/v2/observations"),
+    buildR2HistoryV2ObservationsMonthManifestKey(GENERATION.observations_prefix, accepted.day_utc.slice(0, 4), accepted.day_utc.slice(5, 7)),
+    buildR2HistoryV2ObservationsYearManifestKey(GENERATION.observations_prefix, accepted.day_utc.slice(0, 4)),
+    buildR2HistoryV2ObservationsRootManifestKey(GENERATION.observations_prefix),
   ]);
   const baselineCanonical = new Map(
     baselinePlan.canonical_publication_objects.map((object) => [object.key, object]),
@@ -1092,7 +1015,7 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
   const unaffected = [];
   const unaffectedAggregates = [];
   for (const key of journal.completed_objects.keys()) {
-    if (!key.startsWith("history/v2/observations/") || !key.endsWith("/manifest.json") || branchKeys.has(key)) continue;
+    if (!key.startsWith(`${GENERATION.observations_prefix}/`) || !key.endsWith("/manifest.json") || branchKeys.has(key)) continue;
     const identity = completedIdentity(journal.completed_objects, key);
     if (!identity) continue;
     const isDay = /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key);
@@ -1111,7 +1034,7 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
   for (const key of branchKeys) {
     const current = await getIdentity(getObject, key);
     const payload = JSON.parse(current.body.toString("utf8"));
-    const canonical = validateR2HistoryV2ObservationsAggregateManifest(payload, { basePrefix: "history/v2/observations" });
+    const canonical = validateR2HistoryV2ObservationsAggregateManifest(payload, { basePrefix: GENERATION.observations_prefix });
     aggregates.push({ key, byte_size: current.byte_size, sha256: current.sha256, content_hash: canonical.content_hash, payload });
   }
   const month = aggregates.find((entry) => entry.key.includes("month="));
@@ -1160,14 +1083,14 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
   const unaffectedV3 = [];
   for (const expected of baselineV3Entries) {
     const authenticatedIdentity = requireAuthenticatedCompletedPlanIdentity(journal.completed_objects, expected, "v3 baseline object");
-    if (expected.key === DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY) continue;
+    if (expected.key === DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY) continue;
     const current = await getIdentity(getObject, expected.key);
     if (current.byte_size !== authenticatedIdentity.byte_size || current.sha256 !== authenticatedIdentity.sha256) {
       fail(`unaffected authenticated v3 authority changed: ${expected.key}`);
     }
     unaffectedV3.push({ key: expected.key, byte_size: current.byte_size, sha256: current.sha256 });
   }
-  const currentLatestIdentity = await getIdentity(getObject, DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY);
+  const currentLatestIdentity = await getIdentity(getObject, DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY);
   const currentLatest = exactLatestPayload(currentLatestIdentity.body);
   const baselineCanonicalDays = [...baselineCanonical.keys()]
     .filter((key) => /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key))
@@ -1196,21 +1119,6 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, rec
     affected_branch_exact_delta: branchDelta,
     unaffected_v3_identity_count: unaffectedV3.length,
     latest_global_exact_delta: latestDelta,
-  });
-}
-
-function verifyDropboxPrestate({ planReport, dropboxRoot }) {
-  const state = plainObject(planReport?.result?.backup_gate?.state_root, "migration backup state root");
-  const key = String(state.key || "");
-  if (!key || path.isAbsolute(key) || key.split("/").includes("..")) fail("backup state-root key is unsafe");
-  const filePath = path.join(path.resolve(dropboxRoot), ...key.split("/"));
-  const body = fs.readFileSync(filePath);
-  requireEqual(body.byteLength, state.byte_size, "pinned Dropbox state-root byte size");
-  requireEqual(sha256(body), state.sha256, "pinned Dropbox state-root SHA-256");
-  return Object.freeze({
-    first_post_v3_backup_started_by_verifier: false,
-    pinned_prestate_unchanged: true,
-    state_root: { key, byte_size: body.byteLength, sha256: sha256(body) },
   });
 }
 
@@ -1266,12 +1174,9 @@ function validateControlAuthority(controlInput, expected) {
   const control = plainObject(controlInput, "repository/control authority evidence");
   for (const field of [
     "repository_exact", "working_tree_clean", "default_branch_current",
-    "repository_git_sha_exact", "loaded_history_v2", "loaded_index_v3",
-    "persistent_history_v2", "persistent_index_v3", "loaded_integrity_v2",
-    "maintenance_on", "three_scheduler_jobs_disabled", "no_active_prune",
+    "repository_git_sha_exact", "loaded_history_v3", "persistent_history_v3", "loaded_integrity_v2", "three_scheduler_jobs_disabled", "no_active_prune",
     "no_active_backup",
-    "writer_freeze_valid", "v2_runtime_rollback_record_valid",
-    "cache_to_station_candidate_exact", "station_to_observation_candidate_exact",
+    "cache_to_station_exact", "station_to_observation_exact",
   ]) {
     if (control[field] !== true) fail(`repository/control authority proof failed: ${field}`);
   }
@@ -1334,8 +1239,12 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     recoveryRoot: `${options.checkpoint}.recovery`,
     accepted,
     requiredUnchangedDay: options.requiredUnchangedDay,
+    environment: options.environment, bucket: options.bucket,
   });
-  const backupGate = verifyDropboxPrestate({ planReport, dropboxRoot: options.dropboxRoot });
+  const backupGate = await verifySelectedCutoverMetadata({
+    generation: selectedCutoverGeneration(process.env),
+    getObject: adapters.getObject, headObject: adapters.headObject,
+  });
   const deployedReadProbe = await verifyReadProbe({
     httpGet: adapters.httpGet,
     siteUrl: options.siteUrl,
@@ -1358,10 +1267,10 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     canonical_hierarchy: canonical,
     observation_index_v3: v3,
     hierarchy_delta: hierarchyDelta,
-    rollback_source_preservation: {
+    controlled_source_retention: {
       source_deletion_committed: false,
       independently_recoverable: true,
-      complete_prestate_v2_rollback_guarantee_closed: false,
+      v2_current_rollback_generation_claimed: false,
       normal_prune_deletion_safe: false,
     },
     backup_gate: {
@@ -1390,7 +1299,6 @@ function parseFlagValues(argv) {
 function validateReportPathValues(values) {
   for (const name of [
     "reportOut", "acceptanceReport", "controlEvidence", "planReport", "checkpoint",
-    "dropboxRoot", "writerFreezeEvidence", "v2RuntimeRollbackRecord",
   ]) {
     if (!values[name]) fail(`--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)} is required`);
   }
@@ -1400,8 +1308,6 @@ function validateReportPathValues(values) {
       values.acceptanceReport,
       values.controlEvidence,
       values.planReport,
-      values.writerFreezeEvidence,
-      values.v2RuntimeRollbackRecord,
     ],
     checkpoint: values.checkpoint,
     recoveryRoot: `${values.checkpoint}.recovery`,
@@ -1418,8 +1324,7 @@ function parseArgs(argv) {
     "acceptanceReport", "expectedAcceptanceReportSha256", "expectedRunId", "expectedDayUtc",
     "expectedConnectorId", "expectedRowCount", "expectedSourceContentHash",
     "expectedSourceHashContractVersion", "expectedPollutantCount", "controlEvidence",
-    "planReport", "checkpoint", "dropboxRoot", "writerFreezeEvidence",
-    "v2RuntimeRollbackRecord", "requiredUnchangedDay", "siteUrl", "cacheUrl", "reportOut",
+    "planReport", "checkpoint", "requiredUnchangedDay", "siteUrl", "cacheUrl", "reportOut",
   ];
   for (const name of required) if (!values[name]) fail(`--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)} is required`);
   values.environment = String(values.environment).toUpperCase();
@@ -1463,6 +1368,7 @@ async function main() {
     return;
   }
   const options = parseArgs(process.argv.slice(2));
+  selectedCutoverGeneration(process.env);
   const r2 = {
     endpoint: process.env.CFLARE_R2_ENDPOINT,
     bucket: process.env.CFLARE_R2_BUCKET,
@@ -1514,7 +1420,7 @@ const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv
 if (isMain) {
   main().catch((error) => {
     process.stderr.write(`STEADY-STATE POST-WRITE VERIFY FAIL: ${error instanceof Error ? error.message : String(error)}\n`);
-    process.stderr.write("MAINTENANCE AND WRITER FREEZE REMAIN REQUIRED.\n");
+    process.stderr.write("READ-ONLY EVIDENCE: NO SCHEDULE OR WRITER RELEASE IS PERFORMED.\n");
     process.exitCode = 1;
   });
 }

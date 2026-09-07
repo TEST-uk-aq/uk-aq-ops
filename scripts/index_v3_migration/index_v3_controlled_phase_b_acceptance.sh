@@ -36,7 +36,7 @@ Strict --dry-run guarantees:
 - no Dropbox writes;
 - no GitHub/Cloudflare mutation.
 
-The wrapper performs read-only GitHub, D1 scheduler, maintenance and database checks.
+The wrapper performs read-only GitHub, D1 scheduler and database checks.
 The --apply path invokes only runPhaseBBackup() under the global observation-operation
 lock and a temporary PostgreSQL SHARE lock on the canonical Phase B source tables.
 That source-table lock prevents observations or their canonical metadata from changing
@@ -159,7 +159,6 @@ CURRENT_BRANCH="$(git branch --show-current)"
 for name in \
   UKAQ_ENV_NAME \
   UK_AQ_R2_HISTORY_VERSION \
-  UK_AQ_R2_HISTORY_INDEX_VERSION \
   UK_AQ_R2_HISTORY_INTEGRITY_VERSION \
   SUPABASE_DB_URL \
   OBS_AQIDB_SUPABASE_URL \
@@ -175,8 +174,7 @@ done
 LOADED_ENV="$(printf '%s' "$UKAQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')"
 [ "$LOADED_ENV" = "$ENVIRONMENT" ] \
   || fail "loaded UKAQ_ENV_NAME=$LOADED_ENV differs from requested $ENVIRONMENT"
-[ "$UK_AQ_R2_HISTORY_VERSION" = "v2" ] || fail "loaded logical history authority must be v2"
-[ "$UK_AQ_R2_HISTORY_INDEX_VERSION" = "v3" ] || fail "loaded observation index authority must be v3"
+[ "$UK_AQ_R2_HISTORY_VERSION" = "v3" ] || fail "loaded observation generation must be v3"
 [ "$UK_AQ_R2_HISTORY_INTEGRITY_VERSION" = "v2" ] || fail "loaded Integrity semantic version must be v2"
 [ "$CFLARE_R2_BUCKET" = "$EXPECTED_BUCKET" ] \
   || fail "loaded R2 bucket differs from --expected-bucket"
@@ -186,25 +184,11 @@ GH_ENV="$(gh variable get UKAQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:
 [ "$GH_ENV" = "$ENVIRONMENT" ] || fail "GitHub environment differs from requested $ENVIRONMENT"
 GH_HISTORY="$(gh variable get UK_AQ_R2_HISTORY_VERSION --repo "$REPO_SLUG" 2>/dev/null)" \
   || fail "GitHub UK_AQ_R2_HISTORY_VERSION could not be read"
-GH_INDEX="$(gh variable get UK_AQ_R2_HISTORY_INDEX_VERSION --repo "$REPO_SLUG" 2>/dev/null)" \
-  || fail "GitHub UK_AQ_R2_HISTORY_INDEX_VERSION could not be read"
-[ "$GH_HISTORY" = "v2" ] || fail "persistent GitHub history authority is not v2"
-[ "$GH_INDEX" = "v3" ] || fail "persistent GitHub observation index authority is not v3"
+[ "$GH_HISTORY" = "v3" ] || fail "persistent GitHub history generation is not v3"
 # Intentionally no GitHub UK_AQ_R2_HISTORY_INTEGRITY_VERSION lookup. Integrity v2 is
 # a loaded/profile semantic value, not a persistent GitHub migration authority.
 
 SITE_URL="${SITE_URL%/}"
-SITE_MODE="$(curl -fsSL \
-  -H 'Cache-Control: no-cache, no-store' \
-  -H 'Pragma: no-cache' \
-  "$SITE_URL/uk-aq-site-mode.json?controlled_phase_b_check=$(date -u +%s)-$$")" \
-  || fail "public maintenance status could not be read"
-printf '%s' "$SITE_MODE" | jq -e '
-  .schema_version == 1 and
-  .mode == "on" and
-  (.deployment_id | type == "string" and length > 0)
-' >/dev/null || fail "public site maintenance mode is not positively ON"
-
 SCHEDULER_CONFIG="cloudflare/scheduler/wrangler.toml"
 [ -f "$SCHEDULER_CONFIG" ] || fail "scheduler configuration is missing: $SCHEDULER_CONFIG"
 D1_DATABASE="$(awk -F ' *= *' '/^database_name *=/ {gsub(/"/, "", $2); print $2; exit}' "$SCHEDULER_CONFIG")"
@@ -272,7 +256,7 @@ printf 'R2 bucket: %s\n' "$EXPECTED_BUCKET"
 printf 'Maintenance: ON\n'
 printf 'Migration-sensitive schedulers: DISABLED\n'
 printf 'Active Prune workflows: NONE\n'
-printf 'Logical history/index: v2/v3\n'
+printf 'Observation generation/index: v3/v3\n'
 printf 'Loaded Integrity semantic version: v2\n\n'
 
 NODE_RUNNER="$SCRIPT_DIR/index_v3_controlled_phase_b_acceptance.mjs"

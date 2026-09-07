@@ -24,6 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate station-history deployment configuration
         env:
+          UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || '' }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
           SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY || '' }}
           UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
@@ -40,6 +41,17 @@ jobs:
           test -n "${UK_AQ_EDGE_UPSTREAM_SECRET}" || { echo "Missing required GitHub repository secret UK_AQ_EDGE_UPSTREAM_SECRET."; exit 1; }
           test -n "${UK_AQ_AQI_HISTORY_R2_API_URL}" || { echo "Missing required GitHub repository variable UK_AQ_AQI_HISTORY_R2_API_URL."; exit 1; }
           test -n "${UK_AQ_OBSERVS_HISTORY_R2_API_URL}" || { echo "Missing required GitHub repository variable UK_AQ_OBSERVS_HISTORY_R2_API_URL."; exit 1; }
+          node --input-type=module <<'NODE'
+          const name = process.env.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || '';
+          const target = new URL(process.env.UK_AQ_OBSERVS_HISTORY_R2_API_URL);
+          if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || name.endsWith('-v3-candidate') ||
+              target.protocol !== 'https:' || target.username || target.password ||
+              target.hostname.split('.')[0] !== name || !target.hostname.endsWith('.workers.dev')) {
+            throw new Error('Station history requires the configured stable observation-history Worker URL');
+          }
+          console.log(`Resolved observation-history Worker target: ${name}`);
+          console.log(`Persistent observation-history authority: ${process.env.UK_AQ_R2_HISTORY_VERSION}`);
+          NODE
       - name: Set data-path Worker secrets
         working-directory: workers/uk_aq_station_history
         env:

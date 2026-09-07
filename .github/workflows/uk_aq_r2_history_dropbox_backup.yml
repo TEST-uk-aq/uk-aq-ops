@@ -52,14 +52,14 @@ jobs:
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
 
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
-      UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || 'history/v2/_ops/observations/runs' }}
-      UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
-      UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
+      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || '' }}
+      UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || '' }}
+      UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || '' }}
+      UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || '' }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
-      UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || 'history/_index_v2/timeseries_binding' }}
-      UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || 'history/_index_v2/backup_inventory_v2' }}
-      UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || '_ops/checkpoints/r2_history_backup_state_v2' }}
+      UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || '' }}
+      UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || '' }}
+      UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || '' }}
 
       UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS || '10' }}
@@ -112,12 +112,6 @@ jobs:
             DROPBOX_REFRESH_TOKEN
             UK_AQ_DROPBOX_ROOT
             UK_AQ_R2_HISTORY_DROPBOX_DIR
-            UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX
-            UK_AQ_R2_HISTORY_V2_RUNS_PREFIX
-            UK_AQ_R2_HISTORY_V2_CORE_PREFIX
-            UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX
-            UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
-            UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
           )
 
           missing=0
@@ -240,10 +234,7 @@ jobs:
             node scripts/backup_r2/uk_aq_run_locked_history_backup.mjs
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
             --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
-            --core-prefix "${UK_AQ_R2_HISTORY_V2_CORE_PREFIX}"
             --timeseries-binding-backup-mode "${selected_mode}"
-            --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
-            --state-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX}"
             --max-days-per-run "${max_days}"
             --checkpoint-batch-units "${UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS}"
             --checkpoint-flush-seconds "${UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS}"

@@ -25,9 +25,6 @@ Usage:
     --expected-pollutant-count N \
     --plan-report PATH \
     --checkpoint PATH \
-    --dropbox-root PATH \
-    --writer-freeze-evidence PATH \
-    --v2-runtime-rollback-record PATH \
     --required-unchanged-day YYYY-MM-DD \
     --site-url URL \
     --cache-url URL \
@@ -37,9 +34,8 @@ Usage:
     [--node-bin PATH]
 
 Required loaded environment:
-  UKAQ_ENV_NAME=v2 authority profile environment
-  UK_AQ_R2_HISTORY_VERSION=v2
-  UK_AQ_R2_HISTORY_INDEX_VERSION=v3
+  UKAQ_ENV_NAME=TEST
+  UK_AQ_R2_HISTORY_VERSION=v3
   UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v2
   SUPABASE_DB_URL
   CFLARE_R2_ENDPOINT/CFLARE_R2_BUCKET/R2 credentials
@@ -57,7 +53,7 @@ fail() {
     jq -n --arg error "$1" '{schema_version:1,kind:"index_v3_steady_state_post_write_verification",status:"FAIL",stage:"wrapper_preflight",mutation_performed:false,error:$error}' > "$REPORT_OUT" 2>/dev/null || true
   fi
   printf 'FAIL: %s\n' "$1" >&2
-  printf 'STEADY-STATE POST-WRITE VERIFY FAILED. MAINTENANCE AND WRITER FREEZE REMAIN REQUIRED.\n' >&2
+  printf 'STEADY-STATE POST-WRITE VERIFY FAILED. NO SCHEDULE OR WRITER RELEASE IS PERFORMED.\n' >&2
   exit 1
 }
 
@@ -80,9 +76,6 @@ EXPECTED_SOURCE_HASH_CONTRACT_VERSION=""
 EXPECTED_POLLUTANT_COUNT=""
 PLAN_REPORT=""
 CHECKPOINT=""
-DROPBOX_ROOT=""
-WRITER_FREEZE_EVIDENCE=""
-V2_RUNTIME_ROLLBACK_RECORD=""
 REQUIRED_UNCHANGED_DAY=""
 SITE_URL=""
 CACHE_URL=""
@@ -110,9 +103,6 @@ while [ "$#" -gt 0 ]; do
     --expected-pollutant-count) EXPECTED_POLLUTANT_COUNT="${2:-}"; shift 2 ;;
     --plan-report) PLAN_REPORT="${2:-}"; shift 2 ;;
     --checkpoint) CHECKPOINT="${2:-}"; shift 2 ;;
-    --dropbox-root) DROPBOX_ROOT="${2:-}"; shift 2 ;;
-    --writer-freeze-evidence) WRITER_FREEZE_EVIDENCE="${2:-}"; shift 2 ;;
-    --v2-runtime-rollback-record) V2_RUNTIME_ROLLBACK_RECORD="${2:-}"; shift 2 ;;
     --required-unchanged-day) REQUIRED_UNCHANGED_DAY="${2:-}"; shift 2 ;;
     --site-url) SITE_URL="${2:-}"; shift 2 ;;
     --cache-url) CACHE_URL="${2:-}"; shift 2 ;;
@@ -127,7 +117,7 @@ done
 
 ENVIRONMENT="$(printf '%s' "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')"
 case "$ENVIRONMENT" in TEST|LIVE) ;; *) fail "--environment must be TEST or LIVE" ;; esac
-for value_name in EXPECTED_REPOSITORY EXPECTED_BUCKET ACCEPTANCE_REPORT EXPECTED_RUN_ID PLAN_REPORT CHECKPOINT DROPBOX_ROOT WRITER_FREEZE_EVIDENCE V2_RUNTIME_ROLLBACK_RECORD SITE_URL CACHE_URL EXPECTED_STATION_HISTORY_WORKER EXPECTED_OBSERVATION_HISTORY_WORKER REPORT_OUT; do
+for value_name in EXPECTED_REPOSITORY EXPECTED_BUCKET ACCEPTANCE_REPORT EXPECTED_RUN_ID PLAN_REPORT CHECKPOINT SITE_URL CACHE_URL EXPECTED_STATION_HISTORY_WORKER EXPECTED_OBSERVATION_HISTORY_WORKER REPORT_OUT; do
   [ -n "${!value_name}" ] || fail "required argument is empty: $value_name"
 done
 for sha_value in "$EXPECTED_REPOSITORY_GIT_SHA" "$EXPECTED_ACCEPTANCE_GIT_SHA"; do
@@ -152,11 +142,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)" || fail "repository root cannot be derived from Git"
 cd -- "$REPO_ROOT"
 
-for file in "$ACCEPTANCE_REPORT" "$PLAN_REPORT" "$CHECKPOINT" "$WRITER_FREEZE_EVIDENCE" "$V2_RUNTIME_ROLLBACK_RECORD"; do
+for file in "$ACCEPTANCE_REPORT" "$PLAN_REPORT" "$CHECKPOINT"; do
   [ -f "$file" ] || fail "required evidence file is missing: $file"
 done
 [ -d "$CHECKPOINT.recovery" ] || fail "authenticated recovery journal is missing: $CHECKPOINT.recovery"
-[ -d "$DROPBOX_ROOT" ] || fail "Dropbox read-only root is missing: $DROPBOX_ROOT"
 
 if [ -n "$NODE_BIN" ]; then
   [ -x "$NODE_BIN" ] || fail "--node-bin is not executable"
@@ -176,10 +165,7 @@ REPORT_OUT="$("$NODE_BIN" "$RUNNER" --check-report-path \
   --acceptance-report "$ACCEPTANCE_REPORT" \
   --control-evidence "$CONTROL_EVIDENCE" \
   --plan-report "$PLAN_REPORT" \
-  --checkpoint "$CHECKPOINT" \
-  --dropbox-root "$DROPBOX_ROOT" \
-  --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE" \
-  --v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD")" || fail "report output path protection failed"
+  --checkpoint "$CHECKPOINT")" || fail "report output path protection failed"
 REPORT_OUT_SAFE="true"
 
 CURRENT_SHA="$(git rev-parse HEAD)"
@@ -193,32 +179,29 @@ DEFAULT_BRANCH="$(printf '%s' "$REPO_JSON" | jq -r '.defaultBranchRef.name // em
 CURRENT_BRANCH="$(git branch --show-current)"
 [ "$REPO_SLUG" = "$EXPECTED_REPOSITORY" ] || fail "repository differs from explicit expected repository"
 [ -n "$DEFAULT_BRANCH" ] && [ "$CURRENT_BRANCH" = "$DEFAULT_BRANCH" ] || fail "current branch is not the GitHub default branch"
+REMOTE_SHA="$(gh api "repos/$REPO_SLUG/commits/$DEFAULT_BRANCH" --jq .sha)" || fail "current default-branch SHA could not be read"
+[ "$CURRENT_SHA" = "$REMOTE_SHA" ] || fail "local HEAD differs from current GitHub default-branch HEAD"
 
-for name in UKAQ_ENV_NAME UK_AQ_R2_HISTORY_VERSION UK_AQ_R2_HISTORY_INDEX_VERSION UK_AQ_R2_HISTORY_INTEGRITY_VERSION SUPABASE_DB_URL CFLARE_R2_ENDPOINT CFLARE_R2_BUCKET CFLARE_R2_ACCESS_KEY_ID CFLARE_R2_SECRET_ACCESS_KEY UK_AQ_CACHE_BYPASS_SECRET; do require_env "$name"; done
+for name in UKAQ_ENV_NAME UK_AQ_R2_HISTORY_VERSION UK_AQ_R2_HISTORY_INTEGRITY_VERSION SUPABASE_DB_URL CFLARE_R2_ENDPOINT CFLARE_R2_BUCKET CFLARE_R2_ACCESS_KEY_ID CFLARE_R2_SECRET_ACCESS_KEY UK_AQ_CACHE_BYPASS_SECRET; do require_env "$name"; done
 [ "$(printf '%s' "$UKAQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')" = "$ENVIRONMENT" ] || fail "loaded environment differs from explicit environment"
-[ "$UK_AQ_R2_HISTORY_VERSION" = "v2" ] || fail "loaded logical history authority is not v2"
-[ "$UK_AQ_R2_HISTORY_INDEX_VERSION" = "v3" ] || fail "loaded index authority is not v3"
+[ "$UK_AQ_R2_HISTORY_VERSION" = "v3" ] || fail "loaded observation generation is not v3"
 [ "$UK_AQ_R2_HISTORY_INTEGRITY_VERSION" = "v2" ] || fail "loaded Integrity semantic version is not v2"
 [ "$CFLARE_R2_BUCKET" = "$EXPECTED_BUCKET" ] || fail "loaded R2 bucket differs from explicit expected bucket"
 
 GH_ENV="$(gh variable get UKAQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:lower:]' '[:upper:]')" || fail "GitHub environment could not be read"
 GH_HISTORY="$(gh variable get UK_AQ_R2_HISTORY_VERSION --repo "$REPO_SLUG" 2>/dev/null)" || fail "GitHub history authority could not be read"
-GH_INDEX="$(gh variable get UK_AQ_R2_HISTORY_INDEX_VERSION --repo "$REPO_SLUG" 2>/dev/null)" || fail "GitHub index authority could not be read"
-[ "$GH_ENV" = "$ENVIRONMENT" ] && [ "$GH_HISTORY" = "v2" ] && [ "$GH_INDEX" = "v3" ] || fail "persistent GitHub environment/history/index authority is contradictory"
+[ "$GH_ENV" = "$ENVIRONMENT" ] && [ "$GH_HISTORY" = "v3" ] || fail "persistent GitHub environment/history authority is contradictory"
 # Deliberately do not read or create UK_AQ_R2_HISTORY_INTEGRITY_VERSION in GitHub.
 
 GH_STATION="$(gh variable get UK_AQ_STATION_HISTORY_WORKER_NAME --repo "$REPO_SLUG" 2>/dev/null)" || fail "stable station-history worker identity could not be read"
 GH_OBSERVATION="$(gh variable get UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME --repo "$REPO_SLUG" 2>/dev/null)" || fail "stable observation-history worker identity could not be read"
 [ "$GH_STATION" = "$EXPECTED_STATION_HISTORY_WORKER" ] || fail "station-history worker differs from explicit expected identity"
 [ "$GH_OBSERVATION" = "$EXPECTED_OBSERVATION_HISTORY_WORKER" ] || fail "observation-history worker differs from explicit expected identity"
-STATION_CANDIDATE="${EXPECTED_STATION_HISTORY_WORKER}-v3-candidate"
-OBSERVATION_CANDIDATE="${EXPECTED_OBSERVATION_HISTORY_WORKER}-v3-candidate"
+STATION_WORKER="$EXPECTED_STATION_HISTORY_WORKER"
+OBSERVATION_WORKER="$EXPECTED_OBSERVATION_HISTORY_WORKER"
 
 SITE_URL="${SITE_URL%/}"
 CACHE_URL="${CACHE_URL%/}"
-SITE_MODE="$(curl -fsSL -H 'Cache-Control: no-cache, no-store' -H 'Pragma: no-cache' "$SITE_URL/uk-aq-site-mode.json?steady_state_verify=$(date -u +%s)-$$")" || fail "maintenance status could not be read"
-printf '%s' "$SITE_MODE" | jq -e '.schema_version == 1 and .mode == "on" and (.deployment_id | type == "string" and length > 0)' >/dev/null || fail "maintenance is not positively ON"
-
 SCHEDULER_CONFIG="cloudflare/scheduler/wrangler.toml"
 D1_DATABASE="$(awk -F ' *= *' '/^database_name *=/ {gsub(/"/, "", $2); print $2; exit}' "$SCHEDULER_CONFIG")"
 [ -n "$D1_DATABASE" ] || fail "scheduler D1 identity is unavailable"
@@ -232,14 +215,6 @@ ACTIVE_PRUNE="$(gh run list --repo "$REPO_SLUG" --workflow uk_aq_prune_daily.yml
 [ "$ACTIVE_PRUNE" = "[]" ] || fail "a Prune workflow is active"
 ACTIVE_BACKUP="$(gh run list --repo "$REPO_SLUG" --workflow uk_aq_r2_history_dropbox_backup.yml --limit 50 --json status --jq '[.[]|select(.status != "completed")]' 2>/dev/null)" || fail "history backup workflow state could not be read"
 [ "$ACTIVE_BACKUP" = "[]" ] || fail "an observation-history Dropbox backup workflow is active"
-
-OPERATOR_HELPER="$SCRIPT_DIR/index_v3_operator_evidence.mjs"
-FREEZE_RESULT="$("$NODE_BIN" "$OPERATOR_HELPER" validate --evidence "$WRITER_FREEZE_EVIDENCE" --plan-report "$PLAN_REPORT" --repository-root "$REPO_ROOT")" || fail "writer-freeze evidence is invalid"
-ROLLBACK_RESULT="$("$NODE_BIN" "$OPERATOR_HELPER" validate --evidence "$V2_RUNTIME_ROLLBACK_RECORD" --repository-root "$REPO_ROOT")" || fail "v2 runtime rollback record is invalid"
-for result in "$FREEZE_RESULT" "$ROLLBACK_RESULT"; do
-  [ "$(printf '%s' "$result" | jq -r '.environment // empty' | tr '[:lower:]' '[:upper:]')" = "$ENVIRONMENT" ] || fail "operator evidence environment mismatch"
-  [ "$(printf '%s' "$result" | jq -r '.repository // empty')" = "$REPO_SLUG" ] || fail "operator evidence repository mismatch"
-done
 
 verify_current_successful_deploy() {
   local workflow="$1" paths="$2" label="$3"
@@ -255,31 +230,34 @@ verify_current_successful_deploy() {
   printf '%s' "$run" | jq -r '.databaseId'
 }
 
-OBS_RUN_ID="$(verify_current_successful_deploy uk_aq_observs_history_r2_api_v3_candidate_deploy.yml '.github/workflows/uk_aq_observs_history_r2_api_v3_candidate_deploy.yml workers/uk_aq_observs_history_r2_api_v3_candidate workers/shared/uk_aq_observation_history_reader_v3.mjs workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs' 'observation candidate')"
-STATION_RUN_ID="$(verify_current_successful_deploy uk_aq_station_history_v3_candidate_deploy.yml '.github/workflows/uk_aq_station_history_v3_candidate_deploy.yml workers/uk_aq_station_history_v3_candidate workers/uk_aq_station_history/src' 'station candidate')"
-CACHE_RUN_ID="$(verify_current_successful_deploy uk_aq_cache_proxy_deploy.yml '.github/workflows/uk_aq_cache_proxy_deploy.yml workers/uk_aq_cache_proxy workers/uk_aq_station_history_v3_candidate workers/uk_aq_station_history/src' 'cache')"
+OBS_RUN_ID="$(verify_current_successful_deploy uk_aq_observs_history_r2_api_worker_deploy.yml '.github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml workers/uk_aq_observs_history_r2_api_worker workers/shared' 'observation history')"
+STATION_RUN_ID="$(verify_current_successful_deploy uk_aq_station_history_deploy.yml '.github/workflows/uk_aq_station_history_deploy.yml workers/uk_aq_station_history workers/shared' 'station history')"
+CACHE_RUN_ID="$(verify_current_successful_deploy uk_aq_cache_proxy_deploy.yml '.github/workflows/uk_aq_cache_proxy_deploy.yml workers/uk_aq_cache_proxy workers/uk_aq_station_history workers/shared' 'cache')"
 CACHE_LOG="$(gh run view "$CACHE_RUN_ID" --repo "$REPO_SLUG" --log 2>/dev/null)" || fail "cache deployment log could not be read"
-printf '%s\n' "$CACHE_LOG" | grep -Fq "Resolved STATION_HISTORY Service Binding target: $STATION_CANDIDATE" || fail "cache deployment did not bind the explicit station v3 candidate"
+printf '%s\n' "$CACHE_LOG" | grep -Fq "Resolved STATION_HISTORY Service Binding target: $STATION_WORKER" || fail "cache deployment did not bind the expected stable station Worker"
 printf '%s\n' "$CACHE_LOG" | grep -Fq 'Persistent observation-history authority: v3' || fail "cache deployment did not record v3 authority"
-# Successful, current station-candidate deployment executes repository validation
-# that its supplied URL is exactly the derived observation-candidate worker.
-[ -n "$STATION_RUN_ID" ] && [ -n "$OBS_RUN_ID" ] || fail "candidate deployment identities are incomplete"
+STATION_LOG="$(gh run view "$STATION_RUN_ID" --repo "$REPO_SLUG" --log 2>/dev/null)" || fail "station deployment log could not be read"
+printf '%s\n' "$STATION_LOG" | grep -Fq "Resolved observation-history Worker target: $OBSERVATION_WORKER" || fail "station deployment target differs from the expected stable observation Worker"
+for deploy_id in "$STATION_RUN_ID" "$OBS_RUN_ID"; do
+  DEPLOY_LOG="$(gh run view "$deploy_id" --repo "$REPO_SLUG" --log 2>/dev/null)" || fail "history deployment log could not be read"
+  printf '%s\n' "$DEPLOY_LOG" | grep -Fq 'Persistent observation-history authority: v3' || fail "history deployment did not record v3 authority"
+done
 
 jq -n \
   --arg environment "$ENVIRONMENT" --arg repository "$REPO_SLUG" \
   --arg repository_git_sha "$CURRENT_SHA" --arg bucket "$EXPECTED_BUCKET" \
-  --arg branch "$CURRENT_BRANCH" --arg station_candidate "$STATION_CANDIDATE" \
-  --arg observation_candidate "$OBSERVATION_CANDIDATE" \
+  --arg branch "$CURRENT_BRANCH" --arg station_worker "$STATION_WORKER" \
+  --arg observation_worker "$OBSERVATION_WORKER" \
   --argjson observation_deploy_run_id "$OBS_RUN_ID" \
   --argjson station_deploy_run_id "$STATION_RUN_ID" \
   --argjson cache_deploy_run_id "$CACHE_RUN_ID" '
   {environment:$environment,repository:$repository,repository_git_sha:$repository_git_sha,bucket:$bucket,branch:$branch,
-   station_candidate:$station_candidate,observation_candidate:$observation_candidate,
+   station_worker:$station_worker,observation_worker:$observation_worker,
    observation_deploy_run_id:$observation_deploy_run_id,station_deploy_run_id:$station_deploy_run_id,cache_deploy_run_id:$cache_deploy_run_id,
    repository_exact:true,working_tree_clean:true,default_branch_current:true,repository_git_sha_exact:true,
-   loaded_history_v2:true,loaded_index_v3:true,persistent_history_v2:true,persistent_index_v3:true,loaded_integrity_v2:true,
-   maintenance_on:true,three_scheduler_jobs_disabled:true,no_active_prune:true,no_active_backup:true,writer_freeze_valid:true,v2_runtime_rollback_record_valid:true,
-   cache_to_station_candidate_exact:true,station_to_observation_candidate_exact:true,mutation_performed:false}' > "$CONTROL_EVIDENCE"
+   loaded_history_v3:true,persistent_history_v3:true,loaded_integrity_v2:true,
+   three_scheduler_jobs_disabled:true,no_active_prune:true,no_active_backup:true,
+   cache_to_station_exact:true,station_to_observation_exact:true,mutation_performed:false}' > "$CONTROL_EVIDENCE"
 
 "$NODE_BIN" "$RUNNER" \
   --environment "$ENVIRONMENT" \
@@ -299,9 +277,6 @@ jq -n \
   --control-evidence "$CONTROL_EVIDENCE" \
   --plan-report "$PLAN_REPORT" \
   --checkpoint "$CHECKPOINT" \
-  --dropbox-root "$DROPBOX_ROOT" \
-  --writer-freeze-evidence "$WRITER_FREEZE_EVIDENCE" \
-  --v2-runtime-rollback-record "$V2_RUNTIME_ROLLBACK_RECORD" \
   --required-unchanged-day "$REQUIRED_UNCHANGED_DAY" \
   --site-url "$SITE_URL" \
   --cache-url "$CACHE_URL" \

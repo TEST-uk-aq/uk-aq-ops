@@ -24,7 +24,7 @@ on:
         default: ""
         type: string
       history_version:
-        description: "Observation binding generation (v2 or v3); must match the repository selector. Core remains v2."
+        description: "Optional confirmation of the repository history generation (v2 or v3); applies to Core and bindings together."
         required: false
         default: ""
         type: string
@@ -47,13 +47,13 @@ jobs:
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
-      UK_AQ_R2_HISTORY_VERSION: ${{ github.event.inputs.history_version || vars.UK_AQ_R2_HISTORY_VERSION || '' }}
-      UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
-      UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
-      UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || 'history/_index_v2/timeseries_binding' }}
-      UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || 'history/_index_v2/backup_inventory_v2' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || '' }}
+      UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || '' }}
+      UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || '' }}
       UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS: ${{ vars.UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS || '5000' }}
 
+      INPUT_HISTORY_VERSION: ${{ github.event.inputs.history_version || '' }}
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_DAY_UTC: ${{ github.event.inputs.day_utc || '' }}
       INPUT_TABLES: ${{ github.event.inputs.tables || '' }}
@@ -89,10 +89,6 @@ jobs:
             CFLARE_R2_ACCESS_KEY_ID
             CFLARE_R2_SECRET_ACCESS_KEY
             UK_AQ_R2_HISTORY_VERSION
-            UK_AQ_R2_HISTORY_CORE_PREFIX
-            UK_AQ_R2_HISTORY_V2_CORE_PREFIX
-            UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
-            UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
           )
 
           missing=0
@@ -114,6 +110,11 @@ jobs:
               exit 1
               ;;
           esac
+
+          if [ -n "${INPUT_HISTORY_VERSION}" ] && [ "${INPUT_HISTORY_VERSION}" != "${UK_AQ_R2_HISTORY_VERSION}" ]; then
+            echo "history_version must match the persistent repository selector." >&2
+            exit 1
+          fi
 
           day_utc="$(printf "%s" "${INPUT_DAY_UTC}" | tr -d '\r\n' | xargs)"
           case "${day_utc}" in

@@ -1,0 +1,936 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import zlib from "node:zlib";
+import { Client } from "pg";
+import Cursor from "pg-cursor";
+import {
+  hasRequiredR2Config,
+  normalizePrefix,
+  r2GetObject,
+  r2HeadObject,
+  r2PutObject,
+  sha256Hex,
+} from "../../workers/shared/r2_sigv4.mjs";
+import { resolveObservationHistoryGeneration } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { delegateBindingPublicationIfNeeded } from "./lib/observation_binding_publication_lock.mjs";
+import { refreshAndCommitTimeseriesBindingSource } from "./uk_aq_refresh_timeseries_binding_source_hierarchy.mjs";
+import {
+  reconcileR2HistoryV2TimeseriesBindings,
+  DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
+} from "../../workers/shared/uk_aq_r2_history_index.mjs";
+import { normalizeObservationPropertyCode } from "../../workers/shared/uk_aq_observation_property_code.mjs";
+import {
+  TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION,
+  buildTimeseriesBindingSourceState,
+  validTimeseriesBindingSourceState,
+} from "./lib/timeseries_binding_source_state_v2.mjs";
+export { TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION, buildTimeseriesBindingSourceState };
+
+export function resolveCoreSnapshotPrefix(env = process.env) {
+  resolveObservationHistoryGeneration(env);
+  const prefix = normalizePrefix(env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || "history/v2/core");
+  if (prefix !== "history/v2/core") throw new Error("Observation generation does not relocate canonical core authority");
+  return prefix;
+}
+
+const DEFAULT_SOURCE_SCHEMA = (process.env.UK_AQ_CORE_SNAPSHOT_SCHEMA || "uk_aq_core").trim();
+const SOS_SITE_REF_SOURCE_SCHEMA = "uk_aq_raw";
+const DEFAULT_CURSOR_BATCH_ROWS = parsePositiveInt(process.env.UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS, 5000);
+const DEFAULT_REPORT_OUT = String(process.env.UK_AQ_R2_CORE_SNAPSHOT_REPORT_OUT || "").trim();
+const CORE_SNAPSHOT_DB_RETRY_MAX_ATTEMPTS = 4;
+const CORE_SNAPSHOT_DB_RETRY_INITIAL_DELAY_MS = 1_000;
+const CORE_SNAPSHOT_DB_RETRY_MAX_DELAY_MS = 10_000;
+const CORE_SNAPSHOT_DB_RETRY_BACKOFF_MULTIPLIER = 2;
+const CORE_SNAPSHOT_DB_RETRYABLE_ERROR_CODES = new Set([
+  "08001",
+  "08003",
+  "08004",
+  "08006",
+  "08007",
+  "53300",
+  "57P01",
+  "57P02",
+  "57P03",
+  "EAI_AGAIN",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EPIPE",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+  "ETIMEDOUT",
+]);
+
+const TABLE_EXPORT_CONFIG = Object.freeze({
+  connectors: Object.freeze({ order_by: "id" }),
+  categories: Object.freeze({ order_by: "id" }),
+  observed_properties: Object.freeze({ order_by: "id" }),
+  observed_property_mappings: Object.freeze({ order_by: "connector_id, source_label, id" }),
+  phenomena: Object.freeze({ order_by: "id" }),
+  offerings: Object.freeze({ order_by: "id" }),
+  features: Object.freeze({ order_by: "id" }),
+  procedures: Object.freeze({ order_by: "id" }),
+  networks: Object.freeze({ order_by: "id" }),
+  sos_networks: Object.freeze({ order_by: "network_ref" }),
+  sos_network_pollutants: Object.freeze({ order_by: "network_ref, match_type, match_value" }),
+  stations: Object.freeze({ order_by: "id" }),
+  station_metadata: Object.freeze({ order_by: "station_id" }),
+  station_initial_metadata: Object.freeze({ order_by: "station_id" }),
+  timeseries: Object.freeze({ order_by: "id" }),
+  sos_station_timeseries_site_refs: Object.freeze({
+    source_schema: SOS_SITE_REF_SOURCE_SCHEMA,
+    order_by: "site_ref, pollutant_code, timeseries_id",
+  }),
+});
+
+export const DEFAULT_TABLES = Object.freeze([
+  "connectors",
+  "categories",
+  "observed_properties",
+  "observed_property_mappings",
+  "phenomena",
+  "offerings",
+  "features",
+  "procedures",
+  "networks",
+  "sos_networks",
+  "sos_network_pollutants",
+  "stations",
+  "station_metadata",
+  "timeseries",
+  "sos_station_timeseries_site_refs",
+]);
+const V2_ONLY_DEFAULT_TABLES = Object.freeze(["station_initial_metadata"]);
+const TIMESERIES_BINDING_SOURCE_TABLES = Object.freeze(["timeseries", "phenomena", "observed_properties"]);
+
+export function buildTimeseriesBindingSourceFingerprint(tableArtifacts, continuityRows = []) {
+  const artifacts = tableArtifacts instanceof Map
+    ? tableArtifacts
+    : new Map((Array.isArray(tableArtifacts) ? tableArtifacts : []).map((entry) => [entry.table, entry]));
+  const tables = TIMESERIES_BINDING_SOURCE_TABLES.map((table) => {
+    const artifact = artifacts.get(table);
+    const rowCount = Number(artifact?.row_count);
+    const sha256 = String(artifact?.sha256_uncompressed || "").trim().toLowerCase();
+    if (!Number.isInteger(rowCount) || rowCount < 0 || !/^[a-f0-9]{64}$/.test(sha256)) return null;
+    return { table, row_count: rowCount, sha256_uncompressed: sha256 };
+  });
+  if (tables.some((entry) => !entry)) return null;
+  const stableContinuityRows = (Array.isArray(continuityRows) ? continuityRows : []).map((row) => ({
+    connector_id: row.connector_id,
+    continuity_key: row.continuity_key,
+    site_ref: row.site_ref,
+    uk_air_ref: row.uk_air_ref,
+    pollutant_code: row.pollutant_code,
+    station_id: row.station_id,
+    station_ref: row.station_ref,
+    timeseries_id: row.timeseries_id,
+    timeseries_ref: row.timeseries_ref,
+    valid_from_day_utc: row.valid_from_day_utc,
+    valid_to_day_utc: row.valid_to_day_utc,
+  })).sort((left, right) => String(left.continuity_key).localeCompare(String(right.continuity_key)) || Number(left.timeseries_id) - Number(right.timeseries_id));
+  const continuity = {
+    view: "uk_aq_public.uk_aq_timeseries_continuity",
+    row_count: stableContinuityRows.length,
+    sha256: createHash("sha256").update(JSON.stringify(stableContinuityRows)).digest("hex"),
+  };
+  const canonical = JSON.stringify({ version: TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION, tables, continuity });
+  return { fingerprint: createHash("sha256").update(canonical).digest("hex"), tables, continuity };
+}
+
+async function readTimeseriesContinuityRows(connectionString) {
+  return withPgClient(connectionString, async (client) => {
+    const result = await client.query(`
+      select *
+      from uk_aq_public.uk_aq_timeseries_continuity
+      order by continuity_key, valid_from_day_utc, timeseries_id
+    `);
+    return result.rows || [];
+  });
+}
+
+function usage() {
+  console.log(
+    [
+      "Usage:",
+      "  node scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs [options]",
+      "",
+      "Required env:",
+      "  UK_AQ_INGEST_DATABASE_URL or SUPABASE_DB_URL",
+      "  CFLARE_R2_ENDPOINT",
+      "  CFLARE_R2_BUCKET",
+      "  CFLARE_R2_REGION (optional, default auto)",
+      "  CFLARE_R2_ACCESS_KEY_ID",
+      "  CFLARE_R2_SECRET_ACCESS_KEY",
+      "",
+      "Optional:",
+      "  --day-utc <YYYY-MM-DD>       Default: today UTC",
+      "  --prefix <r2-prefix>         Default: selected by UK_AQ_R2_HISTORY_VERSION (v1 history/v1/core; v2 history/v2/core)",
+      "  --table <name>               Repeatable table filter",
+      "  --tables <a,b,c>             Comma-separated table filter",
+      "  --cursor-batch-rows <N>      Default: 5000",
+      "  --report-out <file>          Write JSON report to file",
+      "  --dry-run                    Build snapshot + manifest only, no R2 writes",
+      "  -h, --help",
+    ].join("\n"),
+  );
+}
+
+function parsePositiveInt(raw, fallback, min = 1, max = 1_000_000) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+  const intValue = Math.trunc(value);
+  if (intValue < min) return min;
+  if (intValue > max) return max;
+  return intValue;
+}
+
+function parseIsoDayOrThrow(raw) {
+  const value = String(raw || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new Error(`Invalid day_utc (expected YYYY-MM-DD): ${value}`);
+  }
+  return value;
+}
+
+function todayUtcDay() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function assertSimpleSqlIdent(value, label) {
+  const ident = String(value || "").trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ident)) {
+    throw new Error(`Invalid ${label}: ${ident}`);
+  }
+  return ident;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function describeError(error) {
+  if (error && typeof error === "object") {
+    const parts = [];
+    if ("code" in error && error.code) {
+      parts.push(`code=${String(error.code)}`);
+    }
+    if ("errno" in error && error.errno && error.errno !== error.code) {
+      parts.push(`errno=${String(error.errno)}`);
+    }
+    if ("message" in error && error.message) {
+      parts.push(String(error.message));
+    }
+    if ("detail" in error && error.detail && error.detail !== error.message) {
+      parts.push(String(error.detail));
+    }
+    if (parts.length) {
+      return parts.join(" | ");
+    }
+  }
+  return String(error || "");
+}
+
+function isRetryableCoreSnapshotDbError(error) {
+  const code = String(error?.code || error?.errno || "").trim().toUpperCase();
+  if (CORE_SNAPSHOT_DB_RETRYABLE_ERROR_CODES.has(code)) {
+    return true;
+  }
+
+  const message = describeError(error).toLowerCase();
+  if (!message) {
+    return false;
+  }
+
+  return [
+    "broken pipe",
+    "connection reset",
+    "connection reset by peer",
+    "connection terminated",
+    "could not connect to server",
+    "econnrefused",
+    "econnreset",
+    "ehostunreach",
+    "enetunreach",
+    "eof",
+    "network error",
+    "networkerror",
+    "remaining connection slots are reserved",
+    "server closed the connection unexpectedly",
+    "socket hang up",
+    "temporarily unavailable",
+    "terminating connection",
+    "timed out",
+    "timeout",
+    "too many clients",
+  ].some((token) => message.includes(token));
+}
+
+async function retryTransient(operation, options = {}) {
+  const label = String(options.label || "operation").trim() || "operation";
+  const maxAttempts = Number.isFinite(Number(options.maxAttempts))
+    ? Math.max(1, Math.trunc(Number(options.maxAttempts)))
+    : 1;
+  const initialDelayMs = Number.isFinite(Number(options.initialDelayMs))
+    ? Math.max(0, Math.trunc(Number(options.initialDelayMs)))
+    : 0;
+  const maxDelayMs = Number.isFinite(Number(options.maxDelayMs))
+    ? Math.max(0, Math.trunc(Number(options.maxDelayMs)))
+    : initialDelayMs;
+  const backoffMultiplier = Number.isFinite(Number(options.backoffMultiplier))
+    ? Math.max(1, Number(options.backoffMultiplier))
+    : 2;
+  const shouldRetry = typeof options.shouldRetry === "function"
+    ? options.shouldRetry
+    : () => false;
+
+  let attempt = 1;
+  let delayMs = initialDelayMs;
+  for (;;) {
+    try {
+      return await operation();
+    } catch (error) {
+      const retryable = attempt < maxAttempts && shouldRetry(error);
+      if (!retryable) {
+        throw error;
+      }
+
+      console.warn(
+        `${label} attempt ${attempt}/${maxAttempts} failed: ${describeError(error) || "<no error message>"}; retrying in ${delayMs}ms`,
+      );
+      await sleep(delayMs);
+      delayMs = Math.min(
+        maxDelayMs,
+        Math.max(delayMs + 1, Math.trunc(delayMs * backoffMultiplier)),
+      );
+      attempt += 1;
+    }
+  }
+}
+
+function writeReport(reportOutPath, payload) {
+  if (!reportOutPath) {
+    return;
+  }
+  const outputPath = path.resolve(reportOutPath);
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+function parseArgs(argv) {
+  const args = {
+    day_utc: todayUtcDay(),
+    prefix: "",
+    tables: [],
+    cursor_batch_rows: DEFAULT_CURSOR_BATCH_ROWS,
+    dry_run: false,
+    report_out: DEFAULT_REPORT_OUT,
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--day-utc") {
+      args.day_utc = parseIsoDayOrThrow(argv[i + 1]);
+      i += 1;
+      continue;
+    }
+    if (arg === "--prefix") {
+      args.prefix = normalizePrefix(argv[i + 1]);
+      i += 1;
+      continue;
+    }
+    if (arg === "--table") {
+      const table = String(argv[i + 1] || "").trim();
+      if (!table) {
+        throw new Error("--table requires a value");
+      }
+      args.tables.push(table);
+      i += 1;
+      continue;
+    }
+    if (arg === "--tables") {
+      const values = String(argv[i + 1] || "").split(",").map((v) => v.trim()).filter(Boolean);
+      args.tables.push(...values);
+      i += 1;
+      continue;
+    }
+    if (arg === "--cursor-batch-rows") {
+      args.cursor_batch_rows = parsePositiveInt(argv[i + 1], Number.NaN);
+      if (!Number.isFinite(args.cursor_batch_rows)) {
+        throw new Error("--cursor-batch-rows must be a positive integer");
+      }
+      i += 1;
+      continue;
+    }
+    if (arg === "--report-out") {
+      args.report_out = String(argv[i + 1] || "").trim();
+      i += 1;
+      continue;
+    }
+    if (arg === "--dry-run") {
+      args.dry_run = true;
+      continue;
+    }
+    if (arg === "-h" || arg === "--help") {
+      usage();
+      process.exit(0);
+    }
+    throw new Error(`Unknown arg: ${arg}`);
+  }
+
+  if (!args.prefix) {
+    args.prefix = resolveCoreSnapshotPrefix(process.env);
+  }
+
+  if (!args.prefix) {
+    throw new Error("--prefix resolved to an empty value");
+  }
+
+  const defaultTables = ["v2", "v3"].includes(resolveObservationHistoryGeneration(process.env).version)
+    ? [...DEFAULT_TABLES, ...V2_ONLY_DEFAULT_TABLES]
+    : [...DEFAULT_TABLES];
+  const requestedTables = args.tables.length ? Array.from(new Set(args.tables)) : defaultTables;
+  const unknown = requestedTables.filter((name) => !TABLE_EXPORT_CONFIG[name]);
+  if (unknown.length) {
+    throw new Error(`Unknown table(s): ${unknown.join(", ")}`);
+  }
+  args.tables = requestedTables;
+
+  return args;
+}
+
+function buildR2Config() {
+  return {
+    endpoint: String(process.env.CFLARE_R2_ENDPOINT || process.env.R2_ENDPOINT || "").trim(),
+    bucket: String(process.env.CFLARE_R2_BUCKET || process.env.R2_BUCKET || "").trim(),
+    region: String(process.env.CFLARE_R2_REGION || process.env.R2_REGION || "auto").trim() || "auto",
+    access_key_id: String(process.env.CFLARE_R2_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || "").trim(),
+    secret_access_key: String(
+      process.env.CFLARE_R2_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || "",
+    ).trim(),
+  };
+}
+
+function getIngestDbUrl() {
+  return String(process.env.UK_AQ_INGEST_DATABASE_URL || process.env.SUPABASE_DB_URL || "").trim();
+}
+
+async function withPgClient(connectionString, fn) {
+  const client = new Client({
+    connectionString,
+    statement_timeout: 0,
+    query_timeout: 0,
+    application_name: "uk_aq_core_snapshot_to_r2",
+  });
+  try {
+    await client.connect();
+    await client.query("set timezone = 'UTC'");
+    return await fn(client);
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+function readCursor(cursor, rowCount) {
+  return new Promise((resolve, reject) => {
+    cursor.read(rowCount, (error, rows) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(rows || []);
+    });
+  });
+}
+
+function closeCursor(cursor) {
+  return new Promise((resolve, reject) => {
+    cursor.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function writeLine(stream, text) {
+  if (stream.write(text, "utf8")) {
+    return;
+  }
+  await once(stream, "drain");
+}
+
+function waitForStreamFinish(stream) {
+  return new Promise((resolve, reject) => {
+    stream.on("finish", resolve);
+    stream.on("error", reject);
+  });
+}
+
+async function exportTableToGzip({
+  client,
+  schema,
+  table,
+  orderBy,
+  outputFile,
+  cursorBatchRows,
+}) {
+  const sql = `
+select row_to_json(source_row)::text as row_json
+from (
+  select *
+  from ${schema}.${table}
+  order by ${orderBy}
+) as source_row
+`;
+
+  const cursor = client.query(new Cursor(sql));
+  const gzip = zlib.createGzip({ level: zlib.constants.Z_BEST_COMPRESSION });
+  const outStream = fs.createWriteStream(outputFile);
+  gzip.pipe(outStream);
+
+  const uncompressedHash = createHash("sha256");
+  let rowCount = 0;
+  let uncompressedBytes = 0;
+
+  try {
+    for (;;) {
+      const rows = await readCursor(cursor, cursorBatchRows);
+      if (!rows.length) {
+        break;
+      }
+
+      for (const row of rows) {
+        const rowJson = typeof row.row_json === "string" ? row.row_json : JSON.stringify(row.row_json || {});
+        const line = `${rowJson}\n`;
+        rowCount += 1;
+        uncompressedBytes += Buffer.byteLength(line);
+        uncompressedHash.update(line);
+        await writeLine(gzip, line);
+      }
+    }
+
+    gzip.end();
+    await waitForStreamFinish(outStream);
+  } finally {
+    await closeCursor(cursor).catch(() => {});
+  }
+
+  const compressedBytes = fs.statSync(outputFile).size;
+  const compressedBuffer = fs.readFileSync(outputFile);
+
+  return {
+    row_count: rowCount,
+    uncompressed_bytes: uncompressedBytes,
+    compressed_bytes: compressedBytes,
+    sha256_uncompressed: uncompressedHash.digest("hex"),
+    sha256: sha256Hex(compressedBuffer),
+  };
+}
+
+function readNdjsonGz(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return [];
+  return zlib.gunzipSync(fs.readFileSync(filePath)).toString("utf8")
+    .split(/\r?\n/)
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
+}
+
+function positiveIntegerOrNull(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+export function buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows({
+  timeseriesRows = [],
+  phenomenaRows = [],
+  observedPropertiesRows = [],
+} = {}) {
+  const phenomenaById = new Map();
+  for (const row of phenomenaRows) {
+    const id = positiveIntegerOrNull(row?.id);
+    if (id) phenomenaById.set(id, row);
+  }
+  const observedPropertiesById = new Map();
+  for (const row of observedPropertiesRows) {
+    const id = positiveIntegerOrNull(row?.id);
+    if (id) observedPropertiesById.set(id, row);
+  }
+  const bindings = [];
+  for (const row of timeseriesRows) {
+    const phenomenonId = positiveIntegerOrNull(row?.phenomenon_id);
+    const observedPropertyId = positiveIntegerOrNull(row?.observed_property_id)
+      || positiveIntegerOrNull(phenomenaById.get(phenomenonId)?.observed_property_id);
+    const phenomenon = phenomenonId ? phenomenaById.get(phenomenonId) : null;
+    const observedProperty = observedPropertyId
+      ? observedPropertiesById.get(observedPropertyId)
+      : null;
+    bindings.push({
+      timeseries_id: row?.id,
+      connector_id: row?.connector_id,
+      station_id: row?.station_id,
+      phenomenon_id: phenomenonId,
+      observed_property_id: observedPropertyId,
+      // `uk_aq_core.observed_properties.code` is the sole authoritative
+      // pollutant identity. Missing or unsafe values intentionally remain
+      // null so reconciliation reports an invalid binding rather than guessing.
+      pollutant_code: normalizeObservationPropertyCode(observedProperty?.code),
+    });
+  }
+  return bindings;
+}
+
+export function buildAuthoritativeTimeseriesBindingsFromCoreSnapshotFiles({
+  timeseriesFile,
+  phenomenaFile,
+  observedPropertiesFile,
+} = {}) {
+  return buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows({
+    timeseriesRows: readNdjsonGz(timeseriesFile),
+    phenomenaRows: readNdjsonGz(phenomenaFile),
+    observedPropertiesRows: readNdjsonGz(observedPropertiesFile),
+  });
+}
+
+async function fetchExistingManifestHash(r2, manifestKey) {
+  const head = await r2HeadObject({ r2, key: manifestKey });
+  if (!head.exists) {
+    return null;
+  }
+
+  const object = await r2GetObject({ r2, key: manifestKey });
+  const manifestText = object.body.toString("utf8");
+
+  try {
+    const parsed = JSON.parse(manifestText);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && typeof parsed.manifest_hash === "string") {
+      return parsed.manifest_hash.trim() || null;
+    }
+  } catch {
+    // Ignore parse failure and treat as changed.
+  }
+
+  return null;
+}
+
+async function main(args) {
+  const startedAt = new Date().toISOString();
+  const report = {
+    ok: true,
+    started_at: startedAt,
+    completed_at: null,
+    dry_run: args.dry_run,
+    day_utc: args.day_utc,
+    prefix: args.prefix,
+    source_schema: DEFAULT_SOURCE_SCHEMA,
+    source_tables: args.tables,
+    existing_manifest_hash: null,
+    new_manifest_hash: null,
+    manifest_changed: null,
+    uploaded_objects: 0,
+    uploaded_bytes: 0,
+    skipped_write_reason: null,
+    timeseries_binding_reconciliation: null,
+    manifest_key: `${args.prefix}/day_utc=${args.day_utc}/manifest.json`,
+    checksums_key: `${args.prefix}/day_utc=${args.day_utc}/checksums.sha256`,
+    table_exports: [],
+  };
+
+  const ingestDbUrl = getIngestDbUrl();
+  if (!ingestDbUrl) {
+    throw new Error("Missing UK_AQ_INGEST_DATABASE_URL (or SUPABASE_DB_URL)");
+  }
+  const sourceSchema = assertSimpleSqlIdent(DEFAULT_SOURCE_SCHEMA, "UK_AQ_CORE_SNAPSHOT_SCHEMA");
+  report.source_schema = sourceSchema;
+
+  const r2 = buildR2Config();
+  if (!hasRequiredR2Config(r2)) {
+    throw new Error("Missing required R2 configuration (CFLARE_R2_* / R2_*)");
+  }
+
+  const dayPrefix = `${args.prefix}/day_utc=${args.day_utc}`;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "uk_aq_core_snapshot_"));
+
+  try {
+    const tableArtifacts = await retryTransient(
+      () => withPgClient(ingestDbUrl, async (client) => {
+        const artifacts = [];
+        for (const table of args.tables) {
+          const config = TABLE_EXPORT_CONFIG[table];
+          const tableSourceSchema = assertSimpleSqlIdent(
+            config.source_schema || sourceSchema,
+            `source schema for ${table}`,
+          );
+          const relativePath = `table=${table}/rows.ndjson.gz`;
+          const tempFile = path.join(tmpDir, `${table}.rows.ndjson.gz`);
+          const result = await exportTableToGzip({
+            client,
+            schema: tableSourceSchema,
+            table,
+            orderBy: config.order_by,
+            outputFile: tempFile,
+            cursorBatchRows: args.cursor_batch_rows,
+          });
+
+          artifacts.push({
+            table,
+            source_schema: tableSourceSchema,
+            order_by: config.order_by,
+            relative_path: relativePath,
+            key: `${dayPrefix}/${relativePath}`,
+            temp_file: tempFile,
+            ...result,
+          });
+        }
+        return artifacts;
+      }),
+      {
+        label: "core snapshot DB export",
+        maxAttempts: CORE_SNAPSHOT_DB_RETRY_MAX_ATTEMPTS,
+        initialDelayMs: CORE_SNAPSHOT_DB_RETRY_INITIAL_DELAY_MS,
+        maxDelayMs: CORE_SNAPSHOT_DB_RETRY_MAX_DELAY_MS,
+        backoffMultiplier: CORE_SNAPSHOT_DB_RETRY_BACKOFF_MULTIPLIER,
+        shouldRetry: isRetryableCoreSnapshotDbError,
+      },
+    );
+
+    const checksumsLines = tableArtifacts
+      .map((entry) => `${entry.sha256}  ${entry.relative_path}`)
+      .join("\n");
+    const checksumsPayload = checksumsLines ? `${checksumsLines}\n` : "";
+    const checksumsSha = sha256Hex(checksumsPayload);
+
+    const manifestWithoutHash = {
+      schema_name: "uk_aq_core_snapshot",
+      schema_version: 1,
+      generated_at_utc: new Date().toISOString(),
+      day_utc: args.day_utc,
+      source_schema: sourceSchema,
+      prefix: args.prefix,
+      file_format: "ndjson.gz",
+      tables: tableArtifacts.map((entry) => ({
+        table: entry.table,
+        ...(entry.source_schema !== sourceSchema
+          ? { source_schema: entry.source_schema }
+          : {}),
+        order_by: entry.order_by,
+        key: entry.key,
+        relative_path: entry.relative_path,
+        row_count: entry.row_count,
+        uncompressed_bytes: entry.uncompressed_bytes,
+        compressed_bytes: entry.compressed_bytes,
+        sha256: entry.sha256,
+        sha256_uncompressed: entry.sha256_uncompressed,
+      })),
+      totals: {
+        table_count: tableArtifacts.length,
+        total_rows: tableArtifacts.reduce((sum, entry) => sum + entry.row_count, 0),
+        total_uncompressed_bytes: tableArtifacts.reduce((sum, entry) => sum + entry.uncompressed_bytes, 0),
+        total_compressed_bytes: tableArtifacts.reduce((sum, entry) => sum + entry.compressed_bytes, 0),
+      },
+      checksums: {
+        key: report.checksums_key,
+        algorithm: "sha256",
+        sha256: checksumsSha,
+      },
+    };
+
+    const manifestHash = sha256Hex(JSON.stringify(manifestWithoutHash));
+    const manifest = {
+      ...manifestWithoutHash,
+      manifest_hash: manifestHash,
+    };
+    const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+
+    report.existing_manifest_hash = await fetchExistingManifestHash(r2, report.manifest_key);
+    report.new_manifest_hash = manifestHash;
+    report.manifest_changed = report.existing_manifest_hash !== manifestHash;
+
+    report.table_exports = tableArtifacts.map((entry) => ({
+      table: entry.table,
+      source_schema: entry.source_schema,
+      key: entry.key,
+      relative_path: entry.relative_path,
+      row_count: entry.row_count,
+      uncompressed_bytes: entry.uncompressed_bytes,
+      compressed_bytes: entry.compressed_bytes,
+      sha256: entry.sha256,
+      sha256_uncompressed: entry.sha256_uncompressed,
+    }));
+
+    if (!args.dry_run && report.manifest_changed) {
+      for (const entry of tableArtifacts) {
+        const body = fs.readFileSync(entry.temp_file);
+        await r2PutObject({
+          r2,
+          key: entry.key,
+          body,
+          content_type: "application/gzip",
+        });
+        report.uploaded_objects += 1;
+        report.uploaded_bytes += body.byteLength;
+      }
+
+      await r2PutObject({
+        r2,
+        key: report.checksums_key,
+        body: checksumsPayload,
+        content_type: "text/plain; charset=utf-8",
+      });
+      report.uploaded_objects += 1;
+      report.uploaded_bytes += Buffer.byteLength(checksumsPayload);
+
+      await r2PutObject({
+        r2,
+        key: report.manifest_key,
+        body: manifestText,
+        content_type: "application/json",
+      });
+      report.uploaded_objects += 1;
+      report.uploaded_bytes += Buffer.byteLength(manifestText);
+    } else if (!args.dry_run && !report.manifest_changed) {
+      report.skipped_write_reason = "manifest_unchanged";
+    } else if (args.dry_run) {
+      report.skipped_write_reason = "dry_run";
+    }
+
+    try {
+      if (["v2", "v3"].includes(resolveObservationHistoryGeneration(process.env).version)) {
+        const artifactByTable = new Map(tableArtifacts.map((entry) => [entry.table, entry]));
+        const timeseriesFile = artifactByTable.get("timeseries")?.temp_file;
+        const phenomenaFile = artifactByTable.get("phenomena")?.temp_file;
+        const observedPropertiesFile = artifactByTable.get("observed_properties")?.temp_file;
+        if (!timeseriesFile || !phenomenaFile || !observedPropertiesFile) {
+          report.timeseries_binding_reconciliation = {
+            status: "skipped",
+            reason: "required_core_binding_tables_not_exported",
+          };
+        } else {
+          const bindingPrefix = resolveObservationHistoryGeneration(process.env).timeseries_binding_index_prefix;
+          const sourceStateKey = `${bindingPrefix}/_source_state.json`;
+          const continuityRows = await retryTransient(
+            () => readTimeseriesContinuityRows(ingestDbUrl),
+            {
+              label: "timeseries continuity view read",
+              maxAttempts: CORE_SNAPSHOT_DB_RETRY_MAX_ATTEMPTS,
+              initialDelayMs: CORE_SNAPSHOT_DB_RETRY_INITIAL_DELAY_MS,
+              maxDelayMs: CORE_SNAPSHOT_DB_RETRY_MAX_DELAY_MS,
+              backoffMultiplier: CORE_SNAPSHOT_DB_RETRY_BACKOFF_MULTIPLIER,
+              shouldRetry: isRetryableCoreSnapshotDbError,
+            },
+          );
+          const source = buildTimeseriesBindingSourceFingerprint(tableArtifacts, continuityRows);
+          if (!source) throw new Error("timeseries_binding_source_fingerprint_invalid");
+          let storedState = null;
+          let sourceStateStatus = "missing";
+          try {
+            const object = await r2GetObject({ r2, key: sourceStateKey });
+            storedState = JSON.parse(object.body.toString("utf8"));
+            sourceStateStatus = validTimeseriesBindingSourceState(storedState, { bindingPrefix, sourceSchema }) ? "valid" : "invalid";
+          } catch (error) {
+            if (!String(error instanceof Error ? error.message : error).includes("(404)")) sourceStateStatus = "invalid";
+          }
+          const fingerprintMatch = sourceStateStatus === "valid" && storedState.source_fingerprint === source.fingerprint;
+          if (fingerprintMatch) {
+            report.timeseries_binding_reconciliation = {
+              status: "skipped", reason: "source_fingerprint_unchanged", source_state_key: sourceStateKey,
+              current_source_fingerprint: source.fingerprint, stored_source_fingerprint: storedState.source_fingerprint,
+              source_fingerprint_match: true, source_state_status: "valid",
+              authoritative_timeseries_count: storedState.authoritative_timeseries_count,
+            };
+          } else {
+          const reconciliation = await reconcileR2HistoryV2TimeseriesBindings({
+            r2,
+            bucketName: r2.bucket,
+            timeseriesBindingIndexPrefix: bindingPrefix,
+            authoritativeTimeseries: buildAuthoritativeTimeseriesBindingsFromCoreSnapshotFiles({
+              timeseriesFile,
+              phenomenaFile,
+              observedPropertiesFile,
+            }),
+            continuityRows,
+            writeR2: !args.dry_run,
+          });
+          report.timeseries_binding_reconciliation = {
+            ...reconciliation, source_state_key: sourceStateKey, current_source_fingerprint: source.fingerprint,
+            stored_source_fingerprint: sourceStateStatus === "valid" ? storedState.source_fingerprint : null,
+            source_fingerprint_match: false, source_state_status: sourceStateStatus,
+          };
+          if (!args.dry_run && reconciliation.status === "succeeded" && reconciliation.invalid_binding_count === 0) {
+            const state = buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema, sourceFingerprint: source.fingerprint, sourceTables: source.tables, authoritativeTimeseriesCount: reconciliation.authoritative_timeseries_count });
+            // The hierarchy command commits this proposal only after range, root
+            // and refresh-state publication has completed successfully.
+            report.timeseries_binding_reconciliation.proposed_source_state = state;
+            report.timeseries_binding_reconciliation.source_state_status = "awaiting_hierarchy_commit";
+          }
+          }
+          if (!args.dry_run && report.timeseries_binding_reconciliation?.status !== "failed") {
+            report.timeseries_binding_source_hierarchy = await refreshAndCommitTimeseriesBindingSource({
+              r2, bindingPrefix,
+              backupInventoryRootPrefix: process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || "history/_index_v2/backup_inventory_v2",
+              sourceFingerprint: source.fingerprint, coreSnapshotReport: report,
+              // Completion is recorded only after this in-process finalisation.
+              inProcessCoreSnapshotReport: true,
+              forceRebuild: false, dryRun: false,
+            });
+            if (report.timeseries_binding_source_hierarchy.ok !== true) throw new Error("Binding source hierarchy publication failed");
+          }
+        }
+      }
+    } catch (error) {
+      report.timeseries_binding_reconciliation = {
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  report.completed_at = new Date().toISOString();
+  return report;
+}
+
+let reportOutPath = DEFAULT_REPORT_OUT;
+
+function isMainModule(moduleUrl) {
+  if (!process.argv[1]) return false;
+  return path.resolve(process.argv[1]) === fileURLToPath(moduleUrl);
+}
+
+if (isMainModule(import.meta.url)) {
+try {
+  if (!process.argv.includes("--help") && !process.argv.includes("-h")) {
+    const delegated = await delegateBindingPublicationIfNeeded(import.meta.url);
+    if (delegated !== null) process.exit(delegated);
+  }
+  const args = parseArgs(process.argv.slice(2));
+  reportOutPath = args.report_out || reportOutPath;
+  const report = await main(args);
+  writeReport(reportOutPath, report);
+  console.log(JSON.stringify(report, null, 2));
+  if (report.timeseries_binding_reconciliation?.status === "failed") {
+    process.exitCode = 1;
+  }
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const payload = {
+    ok: false,
+    error: message,
+  };
+  if (reportOutPath) {
+    writeReport(reportOutPath, payload);
+  }
+  console.error(JSON.stringify(payload));
+  process.exit(1);
+}
+}

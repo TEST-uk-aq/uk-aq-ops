@@ -2,7 +2,7 @@ import {
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
 } from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";
-import { getObservationHistoryGeneration, resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
+import { getObservationHistoryGeneration, resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -409,12 +409,6 @@ export function isAcceptedPruneHistoryDayManifestKey(value) {
 export function resolvePruneHistoryGeneration(env = process.env) {
   assertNoDeprecatedR2HistoryVersionVars(env, { context: "Prune Daily history" });
   const { version: generation } = resolveObservationHistoryGeneration(env);
-  if (generation === "v3") {
-    throw new Error("v3 side-by-side Prune history writer is not yet implemented");
-  }
-  if (generation !== "v2") {
-    throw new Error("Prune Daily requires UK_AQ_R2_HISTORY_VERSION=v2; missing or unsupported history generation");
-  }
   return generation;
 }
 
@@ -422,11 +416,9 @@ export function resolvePhaseBHistoryWritePrefixes(env = process.env) {
   const historyWriteVersion = resolvePruneHistoryGeneration(env);
   const generation = getObservationHistoryGeneration(historyWriteVersion);
   const observationsPrefixV2 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || HISTORY_R2_V2_OBSERVATIONS_PREFIX,
+    env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || generation.observations_prefix,
   );
-  if (observationsPrefixV2 !== HISTORY_R2_V2_OBSERVATIONS_PREFIX) {
-    throw new Error("Prune v2 observations must use history/v2/observations");
-  }
+  assertObservationHistoryGenerationPrefixes(generation, { observationsPrefix: observationsPrefixV2 });
   const aqilevelsDataPrefixV2 = normalizePrefix(
     env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX,
   );
@@ -434,9 +426,10 @@ export function resolvePhaseBHistoryWritePrefixes(env = process.env) {
     env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
   );
   const runsPrefixV2 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || DEFAULT_RUNS_PREFIX_V2,
+    env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || generation.observations_runs_prefix,
   );
 
+  assertObservationHistoryGenerationPrefixes(generation, { runsPrefix: runsPrefixV2 });
   return Object.freeze({
     history_write_version: historyWriteVersion,
     observations_prefix: generation.observations_prefix,
@@ -444,7 +437,7 @@ export function resolvePhaseBHistoryWritePrefixes(env = process.env) {
     aqilevels_prefix: aqilevelsDataPrefixV2,
     aqilevels_hourly_data_prefix_v2: aqilevelsDataPrefixV2,
     aqilevels_hourly_debug_prefix_v2: aqilevelsDebugPrefixV2,
-    runs_prefix: historyWriteVersion === "v3" ? generation.observations_runs_prefix : runsPrefixV2,
+    runs_prefix: runsPrefixV2,
     runs_prefix_v2: runsPrefixV2,
   });
 }
@@ -4278,6 +4271,41 @@ export async function verifyObservationConnectorHistory({
     );
   }
 
+  if (runtime.history_write_version === "v3") {
+    const generation = getObservationHistoryGeneration("v3");
+    const publication = writerResult.v3_connector_publication;
+    const result = publication?.connector_results?.[0];
+    if (publication?.ok !== true || publication.connector_publication_complete !== true ||
+        publication.connector_results.length !== 1 || result?.day_utc !== dayUtc ||
+        result.connector_id !== connectorId || result.v3_exact_publication?.ok !== true ||
+        result.canonical?.connector_scope_verified !== true ||
+        result.canonical.connector_manifest?.key !== manifestKey ||
+        result.canonical.connector_manifest.sha256 !== sha256Hex(connectorObject.body) ||
+        result.partitions?.length !== verifiedChildren.length) {
+      throw new Error(`V3 connector publication evidence disagrees: ${manifestKey}`);
+    }
+    for (const child of verifiedChildren) {
+      const partition = result.partitions.find((entry) => entry.scope.pollutant_code === child.pollutant_code);
+      const root = partition?.scoped_root;
+      const evidence = root?.evidence;
+      if (partition?.scope.day_utc !== dayUtc || partition?.scope.connector_id !== connectorId ||
+          evidence?.verified !== true || evidence?.durable !== true ||
+          evidence.key !== root?.artifact?.key) throw new Error("V3 scoped publication evidence is incomplete");
+      assertObservationHistoryGenerationKey(generation, evidence.key, "observation_index");
+      const object = await getObject({ r2: runtime.r2, key: evidence.key });
+      if (object.body.byteLength !== evidence.byte_size || sha256Hex(object.body) !== evidence.sha256) {
+        throw new Error(`V3 scoped publication identity changed: ${evidence.key}`);
+      }
+    }
+    return {
+      observation_index_generation: "v3", connector_manifest: connectorManifest,
+      history_manifest_key: manifestKey, history_manifest_hash: connectorManifestHash,
+      history_row_count: rowCount, history_file_count: fileCount, history_total_bytes: totalBytes,
+      connector_index_count: verifiedChildren.length, active_pollutant_count: verifiedChildren.length,
+      opaque_preserved_pollutant_count: 0,
+    };
+  }
+
   const indexSummary = await runBudgetedPhaseBStage({
     runtime,
     operation: "observation_index",
@@ -5654,12 +5682,13 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   const aqilevelsDebugPrefixV2 = writePrefixes.aqilevels_hourly_debug_prefix_v2;
   const runsPrefix = writePrefixes.runs_prefix;
   const historyWriteVersion = writePrefixes.history_write_version;
+  const generation = getObservationHistoryGeneration(historyWriteVersion);
   for (const [name, expected] of [
-    ["UK_AQ_R2_HISTORY_INDEX_V2_PREFIX", "history/_index_v2"],
-    ["UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX", "history/_index_v2/observations_timeseries"],
+    ["UK_AQ_R2_HISTORY_INDEX_V2_PREFIX", generation.index_root_prefix],
+    ["UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX", generation.observations_timeseries_index_prefix],
   ]) {
     if (normalizePrefix(env[name] || expected) !== expected) {
-      throw new Error(`Prune v2 requires ${name}=${expected}`);
+      throw new Error(`Prune ${historyWriteVersion} requires ${name}=${expected}`);
     }
   }
   const sharedPartMaxRows = parsePositiveInt(

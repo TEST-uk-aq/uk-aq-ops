@@ -1446,7 +1446,6 @@ export default {
   async fetch(request, env, ctx) {
     try {
       const generation = resolveObservationHistoryGeneration(env);
-      if (generation.version === "v3") return await observationHistoryV3.fetch(request, env, ctx);
       for (const [name, expected] of Object.entries({
         UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: generation.observations_prefix,
         UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: generation.index_root_prefix,
@@ -1455,6 +1454,7 @@ export default {
       })) {
         if (env[name] && normalizePrefix(env[name]) !== expected) throw new Error(`${name} conflicts with selected generation`);
       }
+      if (generation.version === "v3") return await observationHistoryV3.fetch(request, env, ctx);
     } catch (error) {
       return jsonResponse({ ok: false, error: error.message }, { status: 500, noStore: true });
     }

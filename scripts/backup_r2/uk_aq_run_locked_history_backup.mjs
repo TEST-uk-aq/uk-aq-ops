@@ -33,7 +33,7 @@ export function parseLockedHistoryBackupArgs(argv) {
     corePrefix: null,
     timeseriesBindingPrefix: null,
     timeseriesBindingBackupMode: "individual",
-    timeseriesBindingPackPrefix: DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
+    timeseriesBindingPackPrefix: null,
     historyIndexVersion: null,
     inventoryRootPrefix: null,
     stateRootPrefix: null,
@@ -88,9 +88,6 @@ export function parseLockedHistoryBackupArgs(argv) {
   for (const [flag, value] of [
     ["--source-root", args.sourceRoot],
     ["--dest-root", args.destRoot],
-    ["--core-prefix", args.corePrefix],
-    ["--inventory-root-prefix", args.inventoryRootPrefix],
-    ["--state-root-prefix", args.stateRootPrefix],
     ["--inventory-report-out", args.inventoryReportOut],
     ["--backup-report-out", args.backupReportOut],
   ]) {
@@ -152,16 +149,24 @@ export function runLockedHistoryBackup({
   const generation = resolveObservationHistoryGeneration(env);
   args = {
     ...args,
-    observationsPrefix: args.observationsPrefix ?? generation.observations_prefix,
-    runsPrefix: args.runsPrefix ?? generation.observations_runs_prefix,
-    timeseriesBindingPrefix: args.timeseriesBindingPrefix ?? generation.timeseries_binding_index_prefix,
+    observationsPrefix: args.observationsPrefix ?? (env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || generation.observations_prefix),
+    runsPrefix: args.runsPrefix ?? (env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || generation.observations_runs_prefix),
+    timeseriesBindingPrefix: args.timeseriesBindingPrefix ?? (env.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || generation.timeseries_binding_index_prefix),
     historyIndexVersion: args.historyIndexVersion ?? generation.version,
+    corePrefix: args.corePrefix ?? (env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || generation.core_prefix),
+    inventoryRootPrefix: args.inventoryRootPrefix ?? (env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix),
+    stateRootPrefix: args.stateRootPrefix ?? (env.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || generation.backup_state_prefix),
+    timeseriesBindingPackPrefix: args.timeseriesBindingPackPrefix ?? generation.timeseries_binding_pack_prefix,
   };
   assertObservationHistoryGenerationPrefixes(generation, {
+    indexPrefix: env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || generation.index_root_prefix,
     observationsPrefix: args.observationsPrefix, bindingPrefix: args.timeseriesBindingPrefix,
+    corePrefix: args.corePrefix, inventoryPrefix: args.inventoryRootPrefix,
+    statePrefix: args.stateRootPrefix, packPrefix: args.timeseriesBindingPackPrefix,
+    runsPrefix: args.runsPrefix,
   });
   if (args.runsPrefix !== generation.observations_runs_prefix || args.historyIndexVersion !== generation.version ||
-      args.corePrefix !== "history/v2/core") throw new Error("Backup arguments contradict selected complete generation");
+      args.corePrefix !== generation.core_prefix) throw new Error("Backup arguments contradict selected complete generation");
   const node = process.execPath;
   if (args.timeseriesBindingBackupMode !== "individual") {
     runRequired(node, [

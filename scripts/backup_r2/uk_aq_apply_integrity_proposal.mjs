@@ -2653,12 +2653,19 @@ export async function applySosLightPerDayUnits({
   await publishAffectedIndexes();
 }
 
+export function assertIntegrityApplyGenerationEligible(env = process.env) {
+  if (String(env.UK_AQ_R2_HISTORY_VERSION || "").trim().toLowerCase() === "v3") {
+    throw new Error("Integrity/SOS historical canonical apply is deferred and ineligible while v3 is selected");
+  }
+}
+
 export async function applyValidatedProposal({
   runStatePath,
   r2,
   adapters = {},
   env = process.env,
 }) {
+  assertIntegrityApplyGenerationEligible(env);
   const resolvedAdapters = {
     deleteObjects: adapters.deleteObjects || r2DeleteObjects,
     getObject: adapters.getObject || r2GetObject,
@@ -3335,6 +3342,7 @@ export function requireIntegrityApplyGlobalLock({ runStatePath, env = process.en
 }
 
 async function main() {
+  assertIntegrityApplyGenerationEligible(process.env);
   const args = parseArgs(process.argv.slice(2));
   const runStatePath = path.resolve(args.runStateJson);
   requireIntegrityApplyGlobalLock({ runStatePath, env: process.env });

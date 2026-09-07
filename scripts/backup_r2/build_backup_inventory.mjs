@@ -16,6 +16,7 @@ import {
 } from "./lib/rclone.mjs";
 import {
   buildHierarchicalInventoryRoot,
+  assertSelectedBackupInventory,
   buildObservationMonthInventoryShard,
   buildObservationRunManifestInventoryShard,
   observationMonthInventoryShardKey,
@@ -149,15 +150,21 @@ function parseArgs(argv) {
     } else throw new Error(`Unknown argument: ${arg}`);
   }
   const generation = resolveObservationHistoryGeneration(process.env);
-  if (!argv.includes("--observations-prefix")) args.observations_prefix = generation.observations_prefix;
-  if (!argv.includes("--runs-prefix")) args.runs_prefix = generation.observations_runs_prefix;
-  if (!argv.includes("--timeseries-binding-prefix")) args.timeseries_binding_prefix = generation.timeseries_binding_index_prefix;
+  if (!argv.includes("--observations-prefix")) args.observations_prefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || generation.observations_prefix);
+  if (!argv.includes("--runs-prefix")) args.runs_prefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || generation.observations_runs_prefix);
+  if (!argv.includes("--timeseries-binding-prefix")) args.timeseries_binding_prefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || generation.timeseries_binding_index_prefix);
   if (!argv.includes("--history-index-version")) args.history_index_version = generation.version;
+  if (!argv.includes("--core-prefix")) args.core_prefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || generation.core_prefix);
+  if (!argv.includes("--inventory-root-prefix")) args.inventory_root_prefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix);
+  if (!argv.includes("--timeseries-binding-pack-prefix")) args.timeseries_binding_pack_prefix = generation.timeseries_binding_pack_prefix;
   assertObservationHistoryGenerationPrefixes(generation, {
+    indexPrefix: process.env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || generation.index_root_prefix,
     observationsPrefix: args.observations_prefix, bindingPrefix: args.timeseries_binding_prefix,
+    corePrefix: args.core_prefix, inventoryPrefix: args.inventory_root_prefix,
+    packPrefix: args.timeseries_binding_pack_prefix, runsPrefix: args.runs_prefix,
   });
   if (args.runs_prefix !== generation.observations_runs_prefix || args.history_index_version !== generation.version ||
-      args.core_prefix !== "history/v2/core") throw new Error("Backup inventory arguments contradict selected complete generation");
+      args.core_prefix !== generation.core_prefix) throw new Error("Backup inventory arguments contradict selected complete generation");
   if (!args.source_root) throw new Error("--source-root is required");
   if (!args.observations_prefix) throw new Error("--observations-prefix is required");
   if (!args.core_prefix) throw new Error("--core-prefix is required");
@@ -345,7 +352,7 @@ async function main() {
     )
     : null;
 
-  if (previousRoot?.observations?.source_root_manifest_key !== observationsRootKey) previousRoot = null;
+  if (previousRoot) assertSelectedBackupInventory(resolveObservationHistoryGeneration(process.env), previousRoot);
 
   const latestTimeseriesSource = readJson(
     args.rclone_bin,
@@ -581,6 +588,8 @@ async function main() {
     root.timeseries_binding_packs = bindingPackInventory.root_reference;
   }
   root.core = coreInventory.root_reference;
+  if (args.history_index_version === "v3") root.observation_generation = "v3";
+  assertSelectedBackupInventory(resolveObservationHistoryGeneration(process.env), root);
   const rootWrite = writeRemoteJson(
     args.rclone_bin,
     args.source_root,
