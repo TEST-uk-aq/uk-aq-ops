@@ -50,6 +50,24 @@ function rowsFor(connectorId, pollutantCode, timeseriesId, value = 12.5) {
   }));
 }
 
+function recoveryRows(count, valueOffset = 0) {
+  return Array.from({ length: count }, (_, index) => ({
+    connector_id: 1,
+    station_id: 1000 + index,
+    timeseries_id: 1000 + index,
+    pollutant_code: "no2",
+    observed_at_utc: `${DAY_UTC}T00:00:00.000Z`,
+    value: 10 + index + valueOffset,
+    verification_status: null,
+  }));
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((accept) => { resolve = accept; });
+  return { promise, resolve };
+}
+
 function connectorFromPartition({ connectorId, partition, backedUpAtUtc }) {
   const key = buildHistoryV2ConnectorManifestKey(
     "history/v2/observations",
@@ -204,12 +222,187 @@ test("Prune latest recovery independently rebuilds and verifies the current exac
   assert.equal(result.artifact.sha256, current.v3_hierarchy.scoped_manifest.sha256);
   assert.equal(result.evidence.sha256, current.v3_hierarchy.scoped_manifest.sha256);
   assert.notEqual(result.artifact.sha256, stale.v3_hierarchy.scoped_manifest.sha256);
+  assert.equal(
+    result.verification_object_count,
+    current.v3_hierarchy.publication_objects.length,
+  );
+  assert.equal(result.verification_concurrency, 8);
+  assert.ok(Number.isSafeInteger(result.verification_duration_ms));
   assert.ok(reads.includes(current.canonical_pollutant_manifest.key));
   assert.ok(current.file_intents.every((intent) => reads.includes(intent.key)));
   assert.ok(current.v3_hierarchy.publication_objects.every((artifact) =>
     artifact.key === current.v3_hierarchy.scoped_manifest.key ||
     reads.includes(artifact.key)
   ));
+});
+
+test("Prune latest recovery verifies rebuilt exact-v3 artifacts with bounded concurrency", async () => {
+  const stale = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: recoveryRows(20),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const current = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: recoveryRows(20, 1),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const objects = recoveryObjects(current);
+  const verificationKeys = new Set(
+    current.v3_hierarchy.publication_objects
+      .filter((artifact) => artifact.key !== current.v3_hierarchy.scoped_manifest.key)
+      .map((artifact) => artifact.key),
+  );
+  assert.ok(verificationKeys.size >= 8);
+  const eightStarted = deferred();
+  const releaseReads = deferred();
+  let active = 0;
+  let maximumActive = 0;
+  let started = 0;
+  const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+    observationsPrefix: OBSERVATIONS_PREFIX,
+    indexRoot: EXACT_INDEX_ROOT,
+    getObject: async ({ key }) => {
+      if (verificationKeys.has(key)) {
+        started += 1;
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        if (started === 8) eightStarted.resolve();
+        await releaseReads.promise;
+        active -= 1;
+      }
+      return objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false };
+    },
+  });
+  const recovery = recover(latestRecoveryRequest({
+    stale: stale.v3_hierarchy.scoped_manifest,
+    current: current.v3_hierarchy.scoped_manifest,
+  }));
+
+  await eightStarted.promise;
+  assert.equal(active, 8);
+  assert.equal(maximumActive, 8);
+  releaseReads.resolve();
+  const result = await recovery;
+
+  assert.equal(result.verification_concurrency, 8);
+  assert.equal(
+    result.verification_object_count,
+    current.v3_hierarchy.publication_objects.length,
+  );
+  assert.equal(started, verificationKeys.size);
+  assert.throws(
+    () => createObservationHistoryV3LatestScopedReferenceRecovery({
+      observationsPrefix: OBSERVATIONS_PREFIX,
+      indexRoot: EXACT_INDEX_ROOT,
+      exactV3PublicationConcurrency: 17,
+      getObject: async () => ({ exists: false }),
+    }),
+    /verification concurrency must be an integer from 1 to 16/,
+  );
+});
+
+test("Prune latest recovery stops new verification launches and preserves failures", async (t) => {
+  const stale = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: recoveryRows(6),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const current = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: recoveryRows(6, 1),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const request = latestRecoveryRequest({
+    stale: stale.v3_hierarchy.scoped_manifest,
+    current: current.v3_hierarchy.scoped_manifest,
+  });
+  const verificationKeys = current.v3_hierarchy.publication_objects
+    .filter((artifact) => artifact.key !== current.v3_hierarchy.scoped_manifest.key)
+    .map((artifact) => artifact.key);
+
+  await t.test("exact identity failure", async () => {
+    const objects = recoveryObjects(current);
+    const bothStarted = deferred();
+    const releaseFailure = deferred();
+    const releaseSibling = deferred();
+    const started = [];
+    const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+      observationsPrefix: OBSERVATIONS_PREFIX,
+      indexRoot: EXACT_INDEX_ROOT,
+      exactV3PublicationConcurrency: 2,
+      getObject: async ({ key }) => {
+        if (verificationKeys.includes(key)) {
+          started.push(key);
+          if (started.length === 2) bothStarted.resolve();
+          if (key === verificationKeys[0]) {
+            await releaseFailure.promise;
+            return { exists: true, body: Buffer.from("wrong identity") };
+          }
+          await releaseSibling.promise;
+        }
+        return objects.has(key)
+          ? { exists: true, body: Buffer.from(objects.get(key)) }
+          : { exists: false };
+      },
+    });
+    const recovery = recover(request);
+    await bothStarted.promise;
+    releaseFailure.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(started.length, 2);
+    releaseSibling.resolve();
+    await assert.rejects(
+      recovery,
+      /Canonically rebuilt exact-v3 dependency identity disagrees/,
+    );
+    assert.equal(started.length, 2);
+  });
+
+  await t.test("Phase B budget error", async () => {
+    const objects = recoveryObjects(current);
+    const bothStarted = deferred();
+    const releaseFailure = deferred();
+    const releaseSibling = deferred();
+    const started = [];
+    const budgetError = Object.assign(new Error("controlled Phase B budget"), {
+      name: "PhaseBHistoryBudgetExhaustedError",
+      code: "PHASE_B_HISTORY_BUDGET_EXHAUSTED",
+    });
+    const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+      observationsPrefix: OBSERVATIONS_PREFIX,
+      indexRoot: EXACT_INDEX_ROOT,
+      exactV3PublicationConcurrency: 2,
+      getObject: async ({ key }) => {
+        if (verificationKeys.includes(key)) {
+          started.push(key);
+          if (started.length === 2) bothStarted.resolve();
+          if (key === verificationKeys[0]) {
+            await releaseFailure.promise;
+            throw budgetError;
+          }
+          await releaseSibling.promise;
+        }
+        return objects.has(key)
+          ? { exists: true, body: Buffer.from(objects.get(key)) }
+          : { exists: false };
+      },
+    });
+    const recovery = recover(request);
+    await bothStarted.promise;
+    releaseFailure.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(started.length, 2);
+    releaseSibling.resolve();
+    await assert.rejects(recovery, (error) => error === budgetError);
+    assert.equal(started.length, 2);
+  });
 });
 
 test("Prune latest recovery rejects a live scoped object outside current canonical authority", async () => {

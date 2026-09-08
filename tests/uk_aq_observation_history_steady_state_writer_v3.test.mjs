@@ -875,6 +875,9 @@ test("Prune rebuilds latest with a canonically recovered same-key scoped identit
           verified: true,
           durable: true,
         },
+        verification_object_count: 3,
+        verification_concurrency: 8,
+        verification_duration_ms: 25,
       };
     },
   });
@@ -901,7 +904,79 @@ test("Prune rebuilds latest with a canonically recovered same-key scoped identit
     stale_latest_global_sha256: recoveryCalls[0].reference.sha256,
     canonically_proven_current_sha256: replacementRoot.sha256,
     recovery_mode: "canonical_authority_same_key_recovery",
+    verification_object_count: 3,
+    verification_concurrency: 8,
+    verification_duration_ms: 25,
   });
+});
+
+test("Prune emits recovered-scope evidence before the strict final dependency reread", async () => {
+  const replacement = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows({
+      dayUtc: "2026-08-01",
+      connectorId: 99,
+      pollutantCode: "o3",
+      timeseriesId: 9901,
+    }).map((row) => ({ ...row, value: row.value + 1 })),
+    writerLimits: LIMITS,
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: BACKED_UP_AT_UTC,
+  });
+  const replacementRoot = replacement.v3_hierarchy.scoped_manifest;
+  const diagnosticEvents = [];
+  const fixture = buildFixture();
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+  fixture.objects.set(replacementRoot.key, Buffer.from(replacementRoot.body));
+  const baseGetObject = fixture.options.getObject;
+  let recoveryCompleted = false;
+  const finalRereadError = new Error("controlled strict final dependency reread failure");
+
+  await assert.rejects(
+    runPruneDailyObservationHistoryV3RunFinalization({
+      ...fixture.options,
+      connectorPublications: [connectorPublication],
+      finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+      diagnosticLog: (event, fields) => diagnosticEvents.push({ event, fields }),
+      getObject: async ({ key }) => {
+        if (recoveryCompleted && key === replacementRoot.key) {
+          throw finalRereadError;
+        }
+        return await baseGetObject({ key });
+      },
+      recoverLatestScopedReference: async () => {
+        recoveryCompleted = true;
+        return {
+          artifact: replacementRoot,
+          evidence: {
+            key: replacementRoot.key,
+            byte_size: replacementRoot.byte_size,
+            sha256: replacementRoot.sha256,
+            verified: true,
+            durable: true,
+          },
+          verification_object_count: 3,
+          verification_concurrency: 8,
+          verification_duration_ms: 25,
+        };
+      },
+    }),
+    (error) => error === finalRereadError,
+  );
+
+  assert.ok(diagnosticEvents.some(({ event }) =>
+    event === "latest_global_exact_v3_scoped_reference_recovered"
+  ));
+  assert.equal(
+    fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
+    0,
+  );
 });
 
 test("unchanged strict latest references do not invoke Prune recovery", async () => {

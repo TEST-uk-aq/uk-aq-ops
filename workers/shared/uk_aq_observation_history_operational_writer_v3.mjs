@@ -22,6 +22,8 @@ import {
   OBSERVATION_HISTORY_COLUMNS_V3,
 } from "./uk_aq_observation_history_schema.mjs";
 import {
+  DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
+  MAX_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
   DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
   buildObservationHistoryV3SteadyStatePartition,
@@ -296,11 +298,91 @@ async function exactLiveEvidence(getObject, expected, suppliedBody = null) {
   });
 }
 
+function normalizeLatestRecoveryVerificationConcurrency(raw) {
+  if (
+    typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 1 ||
+    raw > MAX_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY
+  ) {
+    throw new TypeError(
+      "Prune latest-global recovery verification concurrency must be an integer from 1 to " +
+        MAX_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
+    );
+  }
+  return raw;
+}
+
+function isPhaseBHistoryBudgetError(error) {
+  return error?.name === "PhaseBHistoryBudgetExhaustedError" ||
+    error?.code === "PHASE_B_HISTORY_BUDGET_EXHAUSTED";
+}
+
+async function verifyRebuiltExactV3PublicationObjects({
+  getObject,
+  artifacts,
+  suppliedKey,
+  suppliedBody,
+  concurrency,
+}) {
+  const startedAtMs = Date.now();
+  const evidenceByPosition = new Array(artifacts.length);
+  const failures = [];
+  let nextPosition = 0;
+  let stopLaunching = false;
+
+  const verifyWorker = async () => {
+    while (!stopLaunching) {
+      const position = nextPosition;
+      if (position >= artifacts.length) return;
+      nextPosition += 1;
+      const artifact = artifacts[position];
+      try {
+        evidenceByPosition[position] = await exactLiveEvidence(
+          getObject,
+          artifact,
+          artifact.key === suppliedKey ? suppliedBody : null,
+        );
+      } catch (error) {
+        failures.push({ position, error });
+        stopLaunching = true;
+      }
+    }
+  };
+
+  // The Promise set is bounded by the accepted exact-v3 publication maximum;
+  // artifacts themselves are never expanded into an unbounded Promise.all().
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, artifacts.length) },
+      () => verifyWorker(),
+    ),
+  );
+  if (failures.length > 0) {
+    failures.sort((left, right) => left.position - right.position);
+    const budgetFailure = failures.find(({ error }) =>
+      isPhaseBHistoryBudgetError(error)
+    );
+    throw (budgetFailure || failures[0]).error;
+  }
+  if (
+    evidenceByPosition.filter((entry) => entry?.verified === true).length !==
+      artifacts.length
+  ) {
+    throw new Error("Canonically rebuilt exact-v3 verification is incomplete");
+  }
+  return Object.freeze({
+    verification_object_count: evidenceByPosition.length,
+    verification_concurrency: concurrency,
+    verification_duration_ms: Math.max(0, Date.now() - startedAtMs),
+  });
+}
+
 export function createObservationHistoryV3LatestScopedReferenceRecovery({
   getObject,
   observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
   indexRoot = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
   writerLimits = ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+  exactV3PublicationConcurrency =
+    DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
 }) {
   if (typeof getObject !== "function") {
     throw new TypeError("Prune latest-global recovery requires getObject");
@@ -308,6 +390,9 @@ export function createObservationHistoryV3LatestScopedReferenceRecovery({
   const acceptedLimits = assertAcceptedObservationHistoryWriterLimitsV3(
     writerLimits,
     "Prune latest-global recovery writer limits",
+  );
+  const verificationConcurrency = normalizeLatestRecoveryVerificationConcurrency(
+    exactV3PublicationConcurrency,
   );
   return async function recoverLatestScopedReference({
     source,
@@ -484,13 +569,13 @@ export function createObservationHistoryV3LatestScopedReferenceRecovery({
         `Live exact-v3 scoped identity does not match current canonical authority: ${reference.key}`,
       );
     }
-    for (const artifact of hierarchy.publication_objects) {
-      await exactLiveEvidence(
-        getObject,
-        artifact,
-        artifact.key === reference.key ? liveBytes : null,
-      );
-    }
+    const verification = await verifyRebuiltExactV3PublicationObjects({
+      getObject,
+      artifacts: hierarchy.publication_objects,
+      suppliedKey: reference.key,
+      suppliedBody: liveBytes,
+      concurrency: verificationConcurrency,
+    });
     return Object.freeze({
       artifact: hierarchy.scoped_manifest,
       evidence: Object.freeze({
@@ -500,6 +585,7 @@ export function createObservationHistoryV3LatestScopedReferenceRecovery({
         verified: true,
         durable: true,
       }),
+      ...verification,
     });
   };
 }
@@ -1085,6 +1171,7 @@ function v3OnlyOptions({
       observationsPrefix: options.observationsPrefix,
       indexRoot: options.indexRoot,
       writerLimits: acceptedLimits,
+      exactV3PublicationConcurrency: options.exactV3PublicationConcurrency,
     });
   return {
     ...options,

@@ -1535,7 +1535,6 @@ export async function runObservationHistoryV3RunFinalization({
           );
           const latestExternalByKey = new Map();
           const recoveredScopedManifests = [];
-          const recoveredDiagnostics = [];
           for (const reference of updatedLatest.dependencies) {
             const exact = changedScopedEvidenceByKey.get(reference.key);
             if (exact) {
@@ -1591,15 +1590,37 @@ export async function runObservationHistoryV3RunFinalization({
               );
               recoveredScopedManifests.push(artifact);
               latestExternalByKey.set(reference.key, evidence);
-              recoveredDiagnostics.push({
-                day_utc: artifact.payload.day_utc,
-                connector_id: artifact.payload.connector_id,
-                pollutant_code: artifact.payload.pollutant_code,
-                key: artifact.key,
-                stale_latest_global_sha256: reference.sha256,
-                canonically_proven_current_sha256: artifact.sha256,
-                recovery_mode: "canonical_authority_same_key_recovery",
-              });
+              emitV3PublicationDiagnostic(
+                diagnosticLog,
+                "latest_global_exact_v3_scoped_reference_recovered",
+                {
+                  day_utc: artifact.payload.day_utc,
+                  connector_id: artifact.payload.connector_id,
+                  pollutant_code: artifact.payload.pollutant_code,
+                  key: artifact.key,
+                  stale_latest_global_sha256: reference.sha256,
+                  canonically_proven_current_sha256: artifact.sha256,
+                  recovery_mode: "canonical_authority_same_key_recovery",
+                  ...(Number.isSafeInteger(recovered.verification_object_count)
+                    ? {
+                        verification_object_count:
+                          recovered.verification_object_count,
+                      }
+                    : {}),
+                  ...(Number.isSafeInteger(recovered.verification_concurrency)
+                    ? {
+                        verification_concurrency:
+                          recovered.verification_concurrency,
+                      }
+                    : {}),
+                  ...(Number.isSafeInteger(recovered.verification_duration_ms)
+                    ? {
+                        verification_duration_ms:
+                          recovered.verification_duration_ms,
+                      }
+                    : {}),
+                },
+              );
             }
           }
           if (recoveredScopedManifests.length > 0) {
@@ -1623,13 +1644,6 @@ export async function runObservationHistoryV3RunFinalization({
                 await verifiedExternalReference(reference, getObject),
               );
             }
-          }
-          for (const fields of recoveredDiagnostics) {
-            emitV3PublicationDiagnostic(
-              diagnosticLog,
-              "latest_global_exact_v3_scoped_reference_recovered",
-              fields,
-            );
           }
           const latestPlan = buildObservationHistoryIndexV3PublicationPlan({
             objects: [updatedLatest],
