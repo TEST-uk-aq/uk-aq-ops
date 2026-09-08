@@ -53,6 +53,9 @@ R2 history-days response shape:
 - `domains.<domain>.max_day_utc`
 - `domains.<domain>.day_count`
 - `sources.<domain>` (`cloudflare_r2_history_index` or `cloudflare_r2_manifest_scan`)
+- `domain_versions` / `domain_version_labels` (the independently resolved observation and legacy AQI layouts)
+- `domain_status` (`canonical`, `legacy_manual`, or `retired_legacy_optional`)
+- `index_prefixes` / `index_keys` (per-domain index authority)
 
 R2 history-counts query params:
 
@@ -73,6 +76,9 @@ R2 history-counts response shape:
 - `bucket_count`
 - `range_day_count`
 - `index_prefix`
+- `domain_versions` / `domain_version_labels`
+- `domain_status` (`canonical`, `legacy_manual`, or `retired_legacy_optional`)
+- `index_prefixes.observations` / `index_prefixes.aqilevels`
 - `index_keys.observations`
 - `index_keys.aqilevels`
 - `domains.observations` / `domains.aqilevels`
@@ -127,6 +133,11 @@ Behavior:
   - `history/v2/observations/day_utc=YYYY-MM-DD/`
   - `history/v2/aqilevels/hourly/data/day_utc=YYYY-MM-DD/`
   - v2 paths are configurable via `UK_AQ_R2_HISTORY_INDEX_V2_PREFIX`, `UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX`, and `UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX`.
+- For `v3`, observation calendar and count reads use the immutable shared observation-generation layout:
+  - `history/_index_v3/observations_timeseries_latest.json`
+  - `history/v3/observations/day_utc=YYYY-MM-DD/`
+  - the Worker does not accept a separate v3 observation-prefix override and does not fall back to v2 or v1 observations.
+  - calculated AQI/aqilevel R2 is not a v3 product. For dashboard compatibility it remains an optional retired v2 diagnostic at `history/_index_v2/aqilevels_hourly_data_timeseries_latest.json` and `history/v2/aqilevels/hourly/data/`.
 - For `/v1/r2-history-counts`, reads the same version-selected derived R2 history index files and aggregates
   connector row counts by day or month entirely in-memory.
 - In `read_version=v2`, connector counts come from
@@ -134,7 +145,10 @@ Behavior:
   If a v2 latest index is still on the old shape without `connectors`, the
   response includes a warning that the v2 latest index must be rebuilt instead
   of silently treating missing connector summaries as genuine zero rows.
-- If an index file is missing or invalid for a domain, falls back to low-subrequest domain day-prefix scan for that same active-version domain only (no v1 fallback when v2 is selected):
+- In `read_version=v3`, an API-boundary adapter sums canonical
+  `day_summaries[].scoped_roots[].row_count` entries by connector into the
+  existing dashboard connector-count response shape. It does not alter the v3 index format.
+- If an index file is missing or invalid for a domain, falls back to low-subrequest domain day-prefix scan for that same resolved domain only (no cross-generation observation fallback):
   - lists `day_utc=YYYY-MM-DD/` common prefixes under the domain;
   - filters by `max_days` and excludes future dates.
 - Optional strict mode (`strict_manifests=true`):
@@ -157,7 +171,7 @@ Optional:
 - `CFLARE_R2_REGION` (default `auto`)
 - `CFLARE_R2_ACCESS_KEY_ID` (required for `/v1/r2-history-days`)
 - `CFLARE_R2_SECRET_ACCESS_KEY` (required for `/v1/r2-history-days`)
-- `UK_AQ_R2_HISTORY_VERSION` (required `v1` or `v2`, canonical active selector. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
+- `UK_AQ_R2_HISTORY_VERSION` (required `v1`, `v2`, or `v3`, canonical observation-history selector. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (v1 default `history/v1/observations`)
 - `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (v1 default `history/v1/aqilevels/hourly`)
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX` (v1 default `history/_index`)
@@ -185,6 +199,10 @@ wrangler secret put CFLARE_R2_BUCKET
 wrangler secret put CFLARE_R2_REGION
 wrangler secret put CFLARE_R2_ACCESS_KEY_ID
 wrangler secret put CFLARE_R2_SECRET_ACCESS_KEY
-wrangler secret put UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX
-wrangler secret put UK_AQ_R2_HISTORY_AQILEVELS_PREFIX
+wrangler secret put UK_AQ_R2_HISTORY_VERSION
 ```
+
+The deployment workflow supplies only `UK_AQ_R2_HISTORY_VERSION` for history
+routing. Canonical v3 observation paths are derived in code from the shared
+generation contract; generic v1 prefix variables are not injected into a v3
+deployment.

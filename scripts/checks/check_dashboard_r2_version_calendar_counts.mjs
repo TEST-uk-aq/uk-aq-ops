@@ -32,10 +32,12 @@ assert.equal(v2.readVersion.label, 'R2_v2');
 assert.equal(buildR2HistoryReadIndexKey(v2, 'observations'), 'history/_index_v2/observations_timeseries_latest.json');
 assert.equal(buildR2HistoryReadIndexKey(v2, 'aqilevels'), 'history/_index_v2/aqilevels_hourly_data_timeseries_latest.json');
 
-assert.throws(
-  () => resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: 'v3' }, fakeUrl()),
-  /Invalid UK_AQ_R2_HISTORY_VERSION.*expected v1 or v2/,
-);
+const v3 = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: 'v3' }, fakeUrl());
+assert.equal(v3.readVersion.label, 'R2_v3');
+assert.equal(v3.observationsPrefix, 'history/v3/observations');
+assert.equal(v3.aqilevelsPrefix, 'history/v2/aqilevels/hourly/data');
+assert.equal(buildR2HistoryReadIndexKey(v3, 'observations'), 'history/_index_v3/observations_timeseries_latest.json');
+assert.equal(buildR2HistoryReadIndexKey(v3, 'aqilevels'), 'history/_index_v2/aqilevels_hourly_data_timeseries_latest.json');
 
 assert.throws(
   () => resolveR2HistoryLayoutConfig({}, fakeUrl()),

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import worker from "../workers/uk_aq_db_size_metrics_api_worker/worker.mjs";
 import {
@@ -145,6 +146,7 @@ test("aggregateR2HistoryConnectorCounts preserves per-connector daily rows and m
 import {
   buildR2HistoryReadIndexKey,
   compactHistoryIndexDomain,
+  normalizeObservationHistoryV3MetricsDomain,
   resolveR2HistoryLayoutConfig,
 } from "../workers/uk_aq_db_size_metrics_api_worker/worker.mjs";
 
@@ -187,10 +189,36 @@ test("R2 history calendar resolver honours explicit v2 env defaults and query la
   assert.equal(buildR2HistoryReadIndexKey(layout, "aqilevels"), "custom/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
 });
 
+test("R2 history calendar resolver maps v3 observations and retained v2 AQI separately", () => {
+  const layout = resolveR2HistoryLayoutConfig({
+    UK_AQ_R2_HISTORY_VERSION: "v3",
+    UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: "wrong/v1/observations",
+  }, testUrl());
+  assert.equal(layout.readVersion.label, "R2_v3");
+  assert.equal(layout.observations.version, "v3");
+  assert.equal(layout.observationsPrefix, "history/v3/observations");
+  assert.equal(layout.observations.indexPrefix, "history/_index_v3");
+  assert.equal(layout.aqilevels.version, "v2");
+  assert.equal(layout.aqilevels.status, "retired_legacy_optional");
+  assert.equal(layout.aqilevelsPrefix, "history/v2/aqilevels/hourly/data");
+  assert.equal(buildR2HistoryReadIndexKey(layout, "observations"), "history/_index_v3/observations_timeseries_latest.json");
+  assert.equal(buildR2HistoryReadIndexKey(layout, "aqilevels"), "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
+});
+
+test("read_version=v3 uses the same canonical observation generation as runtime v3", () => {
+  const layout = resolveR2HistoryLayoutConfig(
+    { UK_AQ_R2_HISTORY_VERSION: "v1" },
+    testUrl("?read_version=v3"),
+  );
+  assert.equal(layout.readVersion.source, "query");
+  assert.equal(layout.observationsPrefix, "history/v3/observations");
+  assert.equal(buildR2HistoryReadIndexKey(layout, "observations"), "history/_index_v3/observations_timeseries_latest.json");
+});
+
 test("invalid R2 history read version gives a clear warning/error", () => {
   assert.throws(
-    () => resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: "v3" }, testUrl()),
-    /Invalid UK_AQ_R2_HISTORY_VERSION="v3"; expected v1 or v2/,
+    () => resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: "v4" }, testUrl()),
+    /Invalid UK_AQ_R2_HISTORY_VERSION="v4"; expected v1, v2, or v3/,
   );
 });
 
@@ -220,6 +248,40 @@ test("calendar day compaction detects v2-only days from day_summaries even witho
     ],
   });
   assert.deepEqual(compacted.days, ["2026-06-12", "2026-06-13", "2026-06-14"]);
+});
+
+test("v3 metrics adapter sums pollutant-scoped roots into connector summaries", () => {
+  const normalized = normalizeObservationHistoryV3MetricsDomain({
+    domain: "observations",
+    day_summaries: [
+      {
+        day_utc: "2026-06-12",
+        row_count: 25,
+        scoped_roots: [
+          { connector_id: 1, pollutant_code: "no2", row_count: 10 },
+          { connector_id: 1, pollutant_code: "pm10", row_count: 12 },
+          { connector_id: 6, pollutant_code: "no2", row_count: 3 },
+        ],
+      },
+    ],
+  });
+  assert.equal(normalized.total_rows, 25);
+  assert.equal(normalized.day_summaries[0].total_rows, 25);
+  assert.deepEqual(normalized.day_summaries[0].connectors, [
+    { connector_id: 1, row_count: 22 },
+    { connector_id: 6, row_count: 3 },
+  ]);
+});
+
+test("deployment validation accepts v3 without injecting generic v1 prefixes", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/uk_aq_db_r2_metrics_api_worker_deploy.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(workflow, /v1\|v2\|v3\) ;;/);
+  assert.match(workflow, /expected v1, v2, or v3/);
+  assert.doesNotMatch(workflow, /--arg UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX/);
+  assert.doesNotMatch(workflow, /--arg UK_AQ_R2_HISTORY_AQILEVELS_PREFIX/);
 });
 
 function installFakeR2GetObjects(objectsByKey) {
@@ -264,6 +326,20 @@ async function fetchCountsJson(search, objectsByKey, env = {}) {
   try {
     const response = await worker.fetch(
       new Request(`https://metrics.example.test/v1/r2-history-counts${search}`),
+      { ...r2Env, ...env },
+    );
+    const payload = await response.json();
+    return { status: response.status, payload };
+  } finally {
+    fakeFetch.restore();
+  }
+}
+
+async function fetchHistoryDaysJson(search, objectsByKey, env = {}) {
+  const fakeFetch = installFakeR2GetObjects(objectsByKey);
+  try {
+    const response = await worker.fetch(
+      new Request(`https://metrics.example.test/v1/r2-history-days${search}`),
       { ...r2Env, ...env },
     );
     const payload = await response.json();
@@ -405,6 +481,102 @@ test("v2 counts API aggregates connector rows from v2 latest index connector sum
   assert.equal(payload.connectors[1].aqilevels_total_rows, 6);
   assert.equal(payload.connectors[2].observations_total_rows, 147);
   assert.equal(payload.connectors[2].aqilevels_total_rows, 29);
+});
+
+test("v3 counts API adapts observation scoped roots and reads optional AQI from v2", async () => {
+  const objects = {
+    "history/_index_v3/observations_timeseries_latest.json": {
+      schema_version: 3,
+      kind: "observation_history_index_v3_latest_global",
+      index_generation: "v3",
+      history_version: "v2",
+      domain: "observations",
+      min_day_utc: "2026-06-12",
+      max_day_utc: "2026-06-12",
+      day_count: 1,
+      total_rows: 25,
+      days: ["2026-06-12"],
+      day_summaries: [
+        {
+          day_utc: "2026-06-12",
+          row_count: 25,
+          scoped_roots: [
+            { connector_id: 1, pollutant_code: "no2", row_count: 10 },
+            { connector_id: 1, pollutant_code: "pm10", row_count: 12 },
+            { connector_id: 6, pollutant_code: "no2", row_count: 3 },
+          ],
+        },
+      ],
+    },
+    "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": latestIndexPayload("aqilevels", [
+      {
+        day_utc: "2026-06-12",
+        connectors: [{ connector_id: 1, row_count: 4 }],
+        total_rows: 4,
+      },
+    ]),
+  };
+
+  const { status, payload } = await fetchCountsJson(
+    "?from_day=2026-06-12&to_day=2026-06-12&grain=day",
+    objects,
+    { UK_AQ_R2_HISTORY_VERSION: "v3" },
+  );
+
+  assert.equal(status, 200);
+  assert.equal(payload.read_version, "v3");
+  assert.deepEqual(payload.domain_versions, { observations: "v3", aqilevels: "v2" });
+  assert.equal(payload.index_prefix, "history/_index_v3");
+  assert.deepEqual(payload.index_prefixes, {
+    observations: "history/_index_v3",
+    aqilevels: "history/_index_v2",
+  });
+  assert.equal(payload.index_keys.observations, "history/_index_v3/observations_timeseries_latest.json");
+  assert.equal(payload.index_keys.aqilevels, "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
+  assert.equal(payload.domains.observations.total_rows, 25);
+  assert.equal(payload.domains.observations.connector_row_counts_found, true);
+  assert.equal(payload.connectors[0].observations_total_rows, 22);
+  assert.equal(payload.connectors[0].aqilevels_total_rows, 4);
+  assert.equal(payload.connectors[1].observations_total_rows, 3);
+  assert.equal(payload.connectors[1].aqilevels_total_rows, 0);
+});
+
+test("v3 history-days API reads the v3 observation index without cross-generation fallback", async () => {
+  const objects = {
+    "history/_index_v3/observations_timeseries_latest.json": {
+      schema_version: 3,
+      kind: "observation_history_index_v3_latest_global",
+      index_generation: "v3",
+      history_version: "v2",
+      domain: "observations",
+      min_day_utc: "2026-06-12",
+      max_day_utc: "2026-06-12",
+      day_count: 1,
+      total_rows: 10,
+      days: ["2026-06-12"],
+      day_summaries: [{
+        day_utc: "2026-06-12",
+        row_count: 10,
+        scoped_roots: [{ connector_id: 1, pollutant_code: "no2", row_count: 10 }],
+      }],
+    },
+    "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": latestIndexPayload("aqilevels", [
+      { day_utc: "2026-06-12", connectors: [], total_rows: 0 },
+    ]),
+  };
+
+  const { status, payload } = await fetchHistoryDaysJson(
+    "?max_days=0",
+    objects,
+    { UK_AQ_R2_HISTORY_VERSION: "v3" },
+  );
+
+  assert.equal(status, 200);
+  assert.equal(payload.read_version, "v3");
+  assert.equal(payload.prefixes.observations, "history/v3/observations");
+  assert.equal(payload.index_keys.observations, "history/_index_v3/observations_timeseries_latest.json");
+  assert.deepEqual(payload.domains.observations.days, ["2026-06-12"]);
+  assert.deepEqual(payload.warnings, []);
 });
 
 test("v2 counts API supports month grain and connector_ids filtering", async () => {
