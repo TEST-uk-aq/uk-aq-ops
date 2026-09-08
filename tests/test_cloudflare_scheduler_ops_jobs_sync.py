@@ -315,16 +315,25 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
         self.assertIn("refusing to apply canonical jobs", workflow)
         self.assertNotIn("d1 migrations apply", workflow)
 
-    def test_scheduler_workflows_pin_wrangler_v4_consistently(self) -> None:
+    def test_scheduler_workflows_pin_node24_actions_and_wrangler_v4_consistently(self) -> None:
         config_sync = CONFIG_SYNC_WORKFLOW.read_text(encoding="utf-8")
         deploy = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+        checkout_sha = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+        setup_python_sha = "5fda3b95a4ea91299a34e894583c3862153e4b97"
         action_sha = "ebbaa1584979971c8614a24965b4405ff95890e0"
         retired_action_sha = "da0e0dfe58b7a431659754fdf3f186c529afbe65"
 
         for workflow in [config_sync, deploy]:
+            self.assertEqual(workflow.count(f"actions/checkout@{checkout_sha}"), 1)
+            self.assertNotIn("actions/checkout@v4", workflow)
             self.assertIn('WRANGLER_VERSION: "4.130.0"', workflow)
             self.assertNotIn("wrangler@4 ", workflow)
 
+        self.assertEqual(config_sync.count(f"actions/setup-python@{setup_python_sha}"), 1)
+        self.assertNotIn("actions/setup-python@v5", config_sync)
+        self.assertNotIn("actions/setup-python@", deploy)
+        self.assertIn("fetch-depth: 0", config_sync)
+        self.assertIn('python-version: "3.12"', config_sync)
         self.assertEqual(
             config_sync.count('npx --yes "wrangler@${WRANGLER_VERSION}"'),
             3,
