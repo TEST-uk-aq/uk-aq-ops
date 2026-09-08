@@ -951,6 +951,126 @@ test("a later connector failure does not prevent a verified earlier connector fr
   assert.deepEqual(gated, [1]);
 });
 
+test("v3 day boundary finalizes and clears the completed day before the next day starts", async () => {
+  const publishedCandidates = [
+    publishedCandidateForFinalizationTest("2026-08-28", 1),
+    publishedCandidateForFinalizationTest("2026-08-28", 2),
+  ];
+  const events = [];
+  const boundary = await phaseBHistoryModule.finalizeV3DayBoundaryIfNeededForTest({
+    historyWriteVersion: "v3",
+    publishedCandidates,
+    nextCandidate: { day_utc: "2026-08-29", connector_id: 1 },
+    finalizeBatch: async ({ trigger, finalized_day_utc, next_day_utc }) => {
+      events.push(`finalize:${finalized_day_utc}:${trigger}`);
+      assert.equal(next_day_utc, "2026-08-29");
+      publishedCandidates.splice(0);
+      return { can_continue: true };
+    },
+  });
+  events.push("publish:2026-08-29");
+
+  assert.equal(boundary.finalized, true);
+  assert.equal(boundary.can_continue, true);
+  assert.deepEqual(publishedCandidates, []);
+  assert.deepEqual(events, [
+    "finalize:2026-08-28:utc_day_boundary",
+    "publish:2026-08-29",
+  ]);
+});
+
+test("v2 does not use the v3 UTC-day boundary finalization path", async () => {
+  let finalizerCalls = 0;
+  const result = await phaseBHistoryModule.finalizeV3DayBoundaryIfNeededForTest({
+    historyWriteVersion: "v2",
+    publishedCandidates: [publishedCandidateForFinalizationTest("2026-08-28", 1)],
+    nextCandidate: { day_utc: "2026-08-29", connector_id: 1 },
+    finalizeBatch: async () => {
+      finalizerCalls += 1;
+      return { can_continue: true };
+    },
+  });
+
+  assert.deepEqual(result, { finalized: false, can_continue: true });
+  assert.equal(finalizerCalls, 0);
+});
+
+test("a stopped candidate loop still finalizes published v3 work and establishes gates once", async () => {
+  const runtime = {
+    run_budget: createPhaseBRunBudgetForTest({
+      nowMs: () => 0,
+      startedAtMs: 0,
+      maxSecondsPerRun: 3_540,
+      stopBeforeTimeoutSeconds: 60,
+    }),
+    history_write_version: "v3",
+    writer_git_sha: "4".repeat(40),
+    committed_prefix: "history/v3/observations",
+    r2: {},
+    environment: "TEST",
+  };
+  const published = publishedCandidateForFinalizationTest("2026-08-28", 1);
+  published.startedAtMs = 0;
+  published.exportResult = {
+    ...published.exportResult,
+    written_row_count: 1n,
+    total_bytes: 7n,
+    file_count: 1,
+    manifest_key: published.connectorGateEvidence.history_manifest_key,
+  };
+  const summary = {
+    status: "stopped_budget",
+    stopped_for_budget: true,
+    completed_candidates: 0,
+    failed_candidates: 0,
+    failures: [],
+    aggregate_day_failures: [],
+  };
+  const dayResults = new Map();
+  const events = [];
+  const outcome = await phaseBHistoryModule.finalizeAndRecordPublishedPhaseBBatchForTest({
+    client: {},
+    runtime,
+    runId: "budget-stop-finalization",
+    publishedCandidates: [published],
+    summary,
+    dayResults,
+    logStructured: (_severity, event) => events.push(event),
+    batchTrigger: "candidate_loop_budget_stop",
+    finalizePublished: async (args) =>
+      await phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
+        ...args,
+        runFinalizer: async () => {
+          events.push("run_finalizer");
+          return v2FinalizationResult(["2026-08-28"]);
+        },
+        completeCandidateAndGate: async () => {
+          events.push("connector_gate");
+        },
+      }),
+    finalizeDayGate: async () => {
+      events.push("aggregate_day_gate");
+      return { day_utc: "2026-08-28", history_done: true };
+    },
+  });
+
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.can_continue, false);
+  assert.equal(outcome.completed_written_rows, 1n);
+  assert.equal(outcome.completed_written_bytes, 7n);
+  assert.equal(summary.completed_candidates, 1);
+  assert.equal(summary.failed_candidates, 0);
+  assert.deepEqual(dayResults.get("2026-08-28"), {
+    day_utc: "2026-08-28",
+    history_done: true,
+  });
+  assert.equal(events.filter((event) => event === "run_finalizer").length, 1);
+  assert.equal(events.filter((event) => event === "connector_gate").length, 1);
+  assert.equal(events.filter((event) => event === "aggregate_day_gate").length, 1);
+  assert.ok(events.indexOf("run_finalizer") < events.indexOf("connector_gate"));
+  assert.ok(events.indexOf("connector_gate") < events.indexOf("aggregate_day_gate"));
+});
+
 function phaseBConfig() {
   return {
     enabled: true,

@@ -659,6 +659,8 @@ function validateConnectorCanonicalResult({
   return Object.freeze({
     day_utc: group.day_utc,
     connector_id: group.connector_id,
+    current_child_validation_mode:
+      result.current_child_validation_mode ?? null,
     connector_manifest: connectorManifest,
     connector_manifest_payload: result.connector_manifest_payload ?? null,
     current_pollutant_codes: Object.freeze(currentPollutants),
@@ -1006,6 +1008,8 @@ export async function runObservationHistoryV3ConnectorPublication({
         });
         emitV3PublicationDiagnostic(diagnosticLog, "canonical_connector_publication_complete", {
           ...canonicalFields,
+          current_child_validation_mode:
+            canonical.current_child_validation_mode,
           duration_ms: Math.max(0, Date.now() - canonicalStartedAtMs),
         });
       } catch (error) {

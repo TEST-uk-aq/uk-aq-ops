@@ -170,6 +170,7 @@ async function readCurrentPollutantManifests({
   observationsPrefix,
   dayUtc,
   connectorId,
+  completeConnectorSnapshot,
 }) {
   const connectorKey = buildHistoryV2ConnectorManifestKey(
     observationsPrefix,
@@ -178,7 +179,14 @@ async function readCurrentPollutantManifests({
   );
   const current = await getOptionalObject(getObject, connectorKey);
   if (!current) {
-    return Object.freeze({ connector_manifest: null, pollutant_manifests: [] });
+    return Object.freeze({
+      connector_manifest: null,
+      current_pollutant_codes: Object.freeze([]),
+      pollutant_manifests: Object.freeze([]),
+      child_validation_mode: completeConnectorSnapshot
+        ? "parent_descriptors_only_complete_snapshot"
+        : "strict_live_child_identity",
+    });
   }
   const connectorManifest = parseCanonicalManifest({
     body: current.body,
@@ -195,6 +203,14 @@ async function readCurrentPollutantManifests({
   const codes = sortedPollutantCodes(
     descriptors.map((entry) => entry?.pollutant_code),
   );
+  if (completeConnectorSnapshot) {
+    return Object.freeze({
+      connector_manifest: connectorManifest,
+      current_pollutant_codes: Object.freeze(codes),
+      pollutant_manifests: Object.freeze([]),
+      child_validation_mode: "parent_descriptors_only_complete_snapshot",
+    });
+  }
   const manifests = [];
   for (const code of codes) {
     const descriptor = descriptors.find((entry) => entry.pollutant_code === code);
@@ -220,7 +236,9 @@ async function readCurrentPollutantManifests({
   }
   return Object.freeze({
     connector_manifest: connectorManifest,
+    current_pollutant_codes: Object.freeze(codes),
     pollutant_manifests: Object.freeze(manifests),
+    child_validation_mode: "strict_live_child_identity",
   });
 }
 
@@ -311,11 +329,18 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
     connector_id: connectorId,
     partitions,
   }) {
+    // Prune owns a complete frozen connector-day snapshot. Its current parent
+    // descriptors identify the previously authoritative pollutant set, but a
+    // retry may find newer orphan child bodies left below that old parent.
+    // Targeted repair modes still need the live child bodies to preserve peers.
+    const completeConnectorSnapshot =
+      source === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily;
     const current = await readCurrentPollutantManifests({
       getObject,
       observationsPrefix,
       dayUtc,
       connectorId,
+      completeConnectorSnapshot,
     });
     if (
       source === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement &&
@@ -325,10 +350,6 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
         `SOS complete-day replacement found live connector state after deletion: ${dayUtc}/${connectorId}`,
       );
     }
-    // Prune partitions come from one complete frozen connector-day snapshot.
-    // Integrity/backfill partitions remain targeted repairs that preserve peers.
-    const completeConnectorSnapshot =
-      source === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily;
     const finalByCode = new Map(
       completeConnectorSnapshot
         ? []
@@ -401,9 +422,7 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
       getObject,
       recordDurableEvidence,
     });
-    const currentCodes = current.pollutant_manifests.map(
-      (manifest) => manifest.pollutant_code,
-    ).sort(bytewiseCompare);
+    const currentCodes = [...current.current_pollutant_codes];
     const finalCodes = finalPollutants.map(
       (manifest) => manifest.pollutant_code,
     ).sort(bytewiseCompare);
@@ -416,6 +435,7 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
       parent_state_reread_under_lock: true,
       day_utc: dayUtc,
       connector_id: connectorId,
+      current_child_validation_mode: current.child_validation_mode,
       current_pollutant_codes: Object.freeze(currentCodes),
       changed_pollutant_codes: Object.freeze(changedCodes),
       final_pollutant_codes: Object.freeze(finalCodes),

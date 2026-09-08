@@ -4084,6 +4084,225 @@ export async function finalizePublishedPhaseBConnectorsForTest(args) {
   return await finalizePublishedPhaseBConnectors(args);
 }
 
+async function finalizeAndRecordPublishedPhaseBBatch({
+  client,
+  runtime,
+  runId,
+  publishedCandidates,
+  summary,
+  dayResults,
+  logStructured,
+  batchTrigger,
+  finalizePublished = finalizePublishedPhaseBConnectors,
+  finalizeDayGate = finalizeDayGateIfReady,
+  markFailed = markCandidateFailed,
+  markStoppedForBudget = markCandidateStoppedForBudget,
+  blockDayGate = updateDayGateBlocked,
+}) {
+  if (!Array.isArray(publishedCandidates) || publishedCandidates.length === 0) {
+    return {
+      attempted: false,
+      can_continue: true,
+      completed_written_rows: 0n,
+      completed_written_bytes: 0n,
+    };
+  }
+  const batch = [...publishedCandidates];
+  try {
+    const finalized = await finalizePublished({
+      client,
+      runtime,
+      runId,
+      publishedCandidates: batch,
+    });
+    let completedWrittenRows = 0n;
+    let completedWrittenBytes = 0n;
+    for (const completed of finalized.completed) {
+      const { candidate, exportResult, connectorComparison, startedAtMs } = completed;
+      summary.completed_candidates += 1;
+      completedWrittenRows += exportResult.written_row_count;
+      completedWrittenBytes += exportResult.total_bytes;
+      logStructured("INFO", "phase_b_history_candidate_complete", {
+        run_id: runId,
+        day_utc: candidate.day_utc,
+        connector_id: candidate.connector_id,
+        expected_row_count: candidate.expected_row_count.toString(),
+        written_row_count: exportResult.written_row_count.toString(),
+        file_count: exportResult.file_count,
+        total_bytes: exportResult.total_bytes.toString(),
+        manifest_key: exportResult.manifest_key,
+        source_content_hash: exportResult.source_identity.source_content_hash,
+        comparison_output_root: connectorComparison?.comparison_output_root || null,
+        connector_gate_complete: true,
+        run_finalization_complete: true,
+        finalization_batch_trigger: batchTrigger,
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+      });
+    }
+    for (const { published, error } of finalized.gate_failures) {
+      const { candidate } = published;
+      const message = error instanceof Error ? error.message : String(error);
+      await markFailed(client, {
+        dayUtc: candidate.day_utc,
+        connectorId: candidate.connector_id,
+        runId,
+        errorText: message,
+      });
+      summary.failed_candidates += 1;
+      summary.failures.push({
+        day_utc: candidate.day_utc,
+        connector_id: candidate.connector_id,
+        run_id: runId,
+        error: message,
+        next_action: "retry_gate_completion",
+      });
+    }
+    logStructured("INFO", `phase_b_history_${runtime.history_write_version}_run_finalization_complete`, {
+      run_id: runId,
+      affected_days_utc: finalized.result.affected_days_utc,
+      connector_publication_count: batch.length,
+      connector_gate_completed_count: finalized.completed.length,
+      connector_gate_failure_count: finalized.gate_failures.length,
+      finalization_batch_trigger: batchTrigger,
+      lock_diagnostics: finalized.lock_diagnostics,
+    });
+    for (const dayUtc of finalized.result.affected_days_utc) {
+      try {
+        const dayState = await finalizeDayGate({
+          client,
+          runtime,
+          dayUtc,
+        });
+        dayResults.set(dayUtc, dayState);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await blockDayGate(client, dayUtc);
+        dayResults.set(dayUtc, {
+          day_utc: dayUtc,
+          history_done: false,
+          reason: "aggregate_day_finalization_failed",
+        });
+        if (error instanceof PhaseBHistoryBudgetExhaustedError) {
+          stopPhaseBForBudget(summary, runtime, {
+            operation: error.operation || "day_finalization",
+          });
+          break;
+        }
+        summary.aggregate_day_failures.push({ day_utc: dayUtc, error: message });
+      }
+    }
+    return {
+      attempted: true,
+      can_continue: summary.stopped_for_budget !== true,
+      completed_written_rows: completedWrittenRows,
+      completed_written_bytes: completedWrittenBytes,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const stoppedForBudget = error instanceof PhaseBHistoryBudgetExhaustedError;
+    for (const { candidate } of batch) {
+      if (stoppedForBudget) {
+        await markStoppedForBudget(client, {
+          dayUtc: candidate.day_utc,
+          connectorId: candidate.connector_id,
+          runId,
+          errorText: message,
+          clearCheckpoint: true,
+        });
+      } else {
+        await markFailed(client, {
+          dayUtc: candidate.day_utc,
+          connectorId: candidate.connector_id,
+          runId,
+          errorText: message,
+        });
+        summary.failed_candidates += 1;
+        summary.failures.push({
+          day_utc: candidate.day_utc,
+          connector_id: candidate.connector_id,
+          run_id: runId,
+          error: message,
+          next_action: "retry_run_finalization",
+        });
+      }
+      await blockDayGate(client, candidate.day_utc);
+      dayResults.set(candidate.day_utc, {
+        day_utc: candidate.day_utc,
+        history_done: false,
+        pending_connectors: 1,
+        reason: stoppedForBudget
+          ? "phase_b_history_budget_exhausted"
+          : "observation_run_finalization_failed",
+      });
+    }
+    if (stoppedForBudget) {
+      stopPhaseBForBudget(summary, runtime, {
+        operation: error.operation || "observation_run_finalization",
+      });
+    } else {
+      summary.aggregate_day_failures.push({
+        affected_days_utc: uniqueSorted(
+          batch.map(({ candidate }) => candidate.day_utc),
+        ),
+        error: message,
+      });
+    }
+    logStructured(
+      stoppedForBudget ? "WARNING" : "ERROR",
+      `phase_b_history_${runtime.history_write_version}_run_finalization_failed`,
+      {
+        run_id: runId,
+        connector_publication_count: batch.length,
+        connector_gate_completed_count: 0,
+        finalization_batch_trigger: batchTrigger,
+        stopped_for_budget: stoppedForBudget,
+        error: message,
+      },
+    );
+    return {
+      attempted: true,
+      can_continue: false,
+      completed_written_rows: 0n,
+      completed_written_bytes: 0n,
+    };
+  }
+}
+
+export async function finalizeAndRecordPublishedPhaseBBatchForTest(args) {
+  return await finalizeAndRecordPublishedPhaseBBatch(args);
+}
+
+async function finalizeV3DayBoundaryIfNeeded({
+  historyWriteVersion,
+  publishedCandidates,
+  nextCandidate,
+  finalizeBatch,
+}) {
+  if (
+    historyWriteVersion !== "v3" ||
+    publishedCandidates.length === 0 ||
+    publishedCandidates[0].candidate.day_utc === nextCandidate.day_utc
+  ) {
+    return { finalized: false, can_continue: true };
+  }
+  const finalizedDayUtc = publishedCandidates[0].candidate.day_utc;
+  const result = await finalizeBatch({
+    trigger: "utc_day_boundary",
+    finalized_day_utc: finalizedDayUtc,
+    next_day_utc: nextCandidate.day_utc,
+  });
+  return {
+    finalized: true,
+    finalized_day_utc: finalizedDayUtc,
+    next_day_utc: nextCandidate.day_utc,
+    ...result,
+  };
+}
+
+export async function finalizeV3DayBoundaryIfNeededForTest(args) {
+  return await finalizeV3DayBoundaryIfNeeded(args);
+}
+
 async function exportCandidateObservationsToR2({ candidate, runtime }) {
   resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
   return await withPgClient(runtime.supabase_db_url, async (streamClient) => {
@@ -6371,8 +6590,46 @@ export async function runPhaseBBackup({
       return;
     }
 
+    const finalizeAccumulatedBatch = async ({ trigger }) => {
+      const batch = [...publishedCandidates];
+      if (batch.length === 0) {
+        return { attempted: false, can_continue: true };
+      }
+      logStructured("INFO", `phase_b_history_${runtime.history_write_version}_run_finalization_batch_start`, {
+        run_id: runId,
+        finalization_batch_trigger: trigger,
+        affected_days_utc: uniqueSorted(
+          batch.map(({ candidate }) => candidate.day_utc),
+        ),
+        connector_publication_count: batch.length,
+      });
+      const outcome = await finalizeAndRecordPublishedPhaseBBatch({
+        client: controlClient,
+        runtime,
+        runId,
+        publishedCandidates: batch,
+        summary,
+        dayResults,
+        logStructured,
+        batchTrigger: trigger,
+      });
+      publishedCandidates.splice(0, batch.length);
+      totalWrittenRows += outcome.completed_written_rows;
+      totalWrittenBytes += outcome.completed_written_bytes;
+      return outcome;
+    };
+
     for (let candidateIndex = 0; candidateIndex < pendingCandidates.length; candidateIndex += 1) {
       const candidate = pendingCandidates[candidateIndex];
+      const boundaryFinalization = await finalizeV3DayBoundaryIfNeeded({
+        historyWriteVersion: runtime.history_write_version,
+        publishedCandidates,
+        nextCandidate: candidate,
+        finalizeBatch: finalizeAccumulatedBatch,
+      });
+      if (boundaryFinalization.finalized && boundaryFinalization.can_continue !== true) {
+        break;
+      }
       if (!hasBudgetFor(runtime, phaseBCandidateStartMinimumMs(runtime.history_write_version))) {
         logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
           operation: "candidate_start",
@@ -6593,149 +6850,11 @@ export async function runPhaseBBackup({
       }
     }
 
-    if (publishedCandidates.length > 0) {
-      try {
-        const finalized = await finalizePublishedPhaseBConnectors({
-          client: controlClient,
-          runtime,
-          runId,
-          publishedCandidates,
-        });
-        for (const completed of finalized.completed) {
-          const { candidate, exportResult, connectorComparison, startedAtMs } = completed;
-          summary.completed_candidates += 1;
-          totalWrittenRows += exportResult.written_row_count;
-          totalWrittenBytes += exportResult.total_bytes;
-          logStructured("INFO", "phase_b_history_candidate_complete", {
-            run_id: runId,
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            expected_row_count: candidate.expected_row_count.toString(),
-            written_row_count: exportResult.written_row_count.toString(),
-            file_count: exportResult.file_count,
-            total_bytes: exportResult.total_bytes.toString(),
-            manifest_key: exportResult.manifest_key,
-            source_content_hash: exportResult.source_identity.source_content_hash,
-            comparison_output_root: connectorComparison?.comparison_output_root || null,
-            connector_gate_complete: true,
-            run_finalization_complete: true,
-            duration_ms: Math.max(0, Date.now() - startedAtMs),
-          });
-        }
-        for (const { published, error } of finalized.gate_failures) {
-          const { candidate } = published;
-          const message = error instanceof Error ? error.message : String(error);
-          await markCandidateFailed(controlClient, {
-            dayUtc: candidate.day_utc,
-            connectorId: candidate.connector_id,
-            runId,
-            errorText: message,
-          });
-          summary.failed_candidates += 1;
-          summary.failures.push({
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            run_id: runId,
-            error: message,
-            next_action: "retry_gate_completion",
-          });
-        }
-        logStructured("INFO", `phase_b_history_${runtime.history_write_version}_run_finalization_complete`, {
-          run_id: runId,
-          affected_days_utc: finalized.result.affected_days_utc,
-          connector_publication_count: publishedCandidates.length,
-          connector_gate_completed_count: finalized.completed.length,
-          connector_gate_failure_count: finalized.gate_failures.length,
-          lock_diagnostics: finalized.lock_diagnostics,
-        });
-        for (const dayUtc of finalized.result.affected_days_utc) {
-          try {
-            const dayState = await finalizeDayGateIfReady({
-              client: controlClient,
-              runtime,
-              dayUtc,
-            });
-            dayResults.set(dayUtc, dayState);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            await updateDayGateBlocked(controlClient, dayUtc);
-            dayResults.set(dayUtc, {
-              day_utc: dayUtc,
-              history_done: false,
-              reason: "aggregate_day_finalization_failed",
-            });
-            if (error instanceof PhaseBHistoryBudgetExhaustedError) {
-              stopPhaseBForBudget(summary, runtime, {
-                operation: error.operation || "day_finalization",
-              });
-              break;
-            }
-            summary.aggregate_day_failures.push({ day_utc: dayUtc, error: message });
-          }
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const stoppedForBudget = error instanceof PhaseBHistoryBudgetExhaustedError;
-        for (const { candidate } of publishedCandidates) {
-          if (stoppedForBudget) {
-            await markCandidateStoppedForBudget(controlClient, {
-              dayUtc: candidate.day_utc,
-              connectorId: candidate.connector_id,
-              runId,
-              errorText: message,
-              clearCheckpoint: true,
-            });
-          } else {
-            await markCandidateFailed(controlClient, {
-              dayUtc: candidate.day_utc,
-              connectorId: candidate.connector_id,
-              runId,
-              errorText: message,
-            });
-            summary.failed_candidates += 1;
-            summary.failures.push({
-              day_utc: candidate.day_utc,
-              connector_id: candidate.connector_id,
-              run_id: runId,
-              error: message,
-              next_action: "retry_run_finalization",
-            });
-          }
-          await updateDayGateBlocked(controlClient, candidate.day_utc);
-          dayResults.set(candidate.day_utc, {
-            day_utc: candidate.day_utc,
-            history_done: false,
-            pending_connectors: 1,
-            reason: stoppedForBudget
-              ? "phase_b_history_budget_exhausted"
-              : "observation_run_finalization_failed",
-          });
-        }
-        if (stoppedForBudget) {
-          stopPhaseBForBudget(summary, runtime, {
-            operation: error.operation || "observation_run_finalization",
-          });
-        } else {
-          summary.aggregate_day_failures.push({
-            affected_days_utc: uniqueSorted(
-              publishedCandidates.map(({ candidate }) => candidate.day_utc),
-            ),
-            error: message,
-          });
-        }
-        logStructured(
-          stoppedForBudget ? "WARNING" : "ERROR",
-          `phase_b_history_${runtime.history_write_version}_run_finalization_failed`,
-          {
-            run_id: runId,
-            connector_publication_count: publishedCandidates.length,
-            connector_gate_completed_count: 0,
-            stopped_for_budget: stoppedForBudget,
-            error: message,
-          },
-        );
-      }
-    }
+    await finalizeAccumulatedBatch({
+      trigger: summary.stopped_for_budget
+        ? "candidate_loop_budget_stop"
+        : "candidate_loop_complete",
+    });
 
     }, {
       statementTimeoutMs: controlPgTimeouts.statement_timeout_ms,

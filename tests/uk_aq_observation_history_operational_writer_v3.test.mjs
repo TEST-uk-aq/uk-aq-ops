@@ -136,7 +136,7 @@ test("connector publisher rereads and preserves unchanged pollutant union", asyn
     backedUpAtUtc: "2026-08-22T00:00:00.000Z",
   });
   const connectorKey = buildHistoryV2ConnectorManifestKey(
-    "history/v2/observations",
+    "history/v3/observations",
     DAY_UTC,
     1,
   );
@@ -304,7 +304,7 @@ test("Prune connector publisher replaces the complete pollutant set and reports 
     backedUpAtUtc: "2026-08-22T00:00:00.000Z",
   });
   const connectorKey = buildHistoryV2ConnectorManifestKey(
-    "history/v2/observations",
+    "history/v3/observations",
     DAY_UTC,
     1,
   );
@@ -366,6 +366,172 @@ test("Prune connector publisher replaces the complete pollutant set and reports 
     pollutant_code: "no2",
   }]);
   assert.deepEqual(result.connector_manifest_payload.pollutant_codes, ["pm25"]);
+});
+
+test("Prune complete snapshot recovers from a parent-pinned older child beneath a newer orphan body", async () => {
+  const previousPm25 = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("pm25", 101),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const previousNo2 = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("no2", 102),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const selectedPm25 = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("pm25", 101).map((row) => ({ ...row, value: 99 })),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const connectorKey = buildHistoryV2ConnectorManifestKey(
+    "history/v3/observations",
+    DAY_UTC,
+    1,
+  );
+  const previousConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY_UTC,
+    connectorId: 1,
+    runId: null,
+    manifestKey: connectorKey,
+    pollutantManifests: [
+      previousPm25.canonical_pollutant_manifest.payload,
+      previousNo2.canonical_pollutant_manifest.payload,
+    ],
+    writerGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const objects = new Map([
+    [connectorKey, Buffer.from(JSON.stringify(previousConnector, null, 2), "utf8")],
+    // This newer body is durable but is not selected by previousConnector.
+    [selectedPm25.canonical_pollutant_manifest.key, Buffer.from(selectedPm25.canonical_pollutant_manifest.body)],
+  ]);
+  const reads = [];
+  const publisher = createObservationHistoryV3CanonicalConnectorPublisher({
+    targetWriterGitSha: TARGET_GIT_SHA,
+    getObject: async ({ key }) => {
+      reads.push(key);
+      return objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false };
+    },
+    putIfChanged: async ({ key, body }) => {
+      objects.set(key, Buffer.from(body));
+      return { ok: true, status: "written" };
+    },
+    recordDurableEvidence: async () => ({ durable: true }),
+  });
+  const result = await publisher({
+    source: "prune_daily",
+    day_utc: DAY_UTC,
+    connector_id: 1,
+    partitions: [{
+      scope: selectedPm25.scope,
+      target_metadata: selectedPm25.target_metadata,
+      pollutant_manifest: selectedPm25.canonical_pollutant_manifest,
+      file_evidence: selectedPm25.file_intents.map((intent) => ({
+        key: intent.key,
+        byte_size: intent.byte_size,
+        sha256: intent.sha256,
+        verified: true,
+        durable: true,
+      })),
+      v3_hierarchy: selectedPm25.v3_hierarchy,
+    }],
+  });
+
+  assert.equal(
+    result.current_child_validation_mode,
+    "parent_descriptors_only_complete_snapshot",
+  );
+  assert.deepEqual(result.current_pollutant_codes, ["no2", "pm25"]);
+  assert.deepEqual(result.final_pollutant_codes, ["pm25"]);
+  assert.deepEqual(result.removed_pollutant_codes, ["no2"]);
+  assert.deepEqual(result.connector_manifest_payload.pollutant_codes, ["pm25"]);
+  assert.equal(
+    result.connector_manifest_payload.pollutant_manifests[0].manifest_hash,
+    selectedPm25.canonical_pollutant_manifest.payload.manifest_hash,
+  );
+  assert.ok(!reads.includes(previousNo2.canonical_pollutant_manifest.key));
+});
+
+test("targeted connector publication still rejects a live child that contradicts its current parent", async () => {
+  const previousO3 = buildObservationHistoryV3SteadyStatePartition({
+    source: "integrity",
+    rows: rows("o3", 101),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const orphanO3 = buildObservationHistoryV3SteadyStatePartition({
+    source: "integrity",
+    rows: rows("o3", 101).map((row) => ({ ...row, value: 88 })),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-21T00:00:00.000Z",
+  });
+  const selectedPm25 = buildObservationHistoryV3SteadyStatePartition({
+    source: "integrity",
+    rows: rows("pm25", 102),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const connectorKey = buildHistoryV2ConnectorManifestKey(
+    "history/v3/observations",
+    DAY_UTC,
+    1,
+  );
+  const previousConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY_UTC,
+    connectorId: 1,
+    runId: null,
+    manifestKey: connectorKey,
+    pollutantManifests: [previousO3.canonical_pollutant_manifest.payload],
+    writerGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const objects = new Map([
+    [connectorKey, Buffer.from(JSON.stringify(previousConnector, null, 2), "utf8")],
+    [orphanO3.canonical_pollutant_manifest.key, Buffer.from(orphanO3.canonical_pollutant_manifest.body)],
+  ]);
+  let putCount = 0;
+  const publisher = createObservationHistoryV3CanonicalConnectorPublisher({
+    targetWriterGitSha: TARGET_GIT_SHA,
+    getObject: async ({ key }) => objects.has(key)
+      ? { exists: true, body: Buffer.from(objects.get(key)) }
+      : { exists: false },
+    putIfChanged: async () => {
+      putCount += 1;
+      return { ok: true, status: "written" };
+    },
+    recordDurableEvidence: async () => ({ durable: true }),
+  });
+
+  await assert.rejects(
+    publisher({
+      source: "integrity",
+      day_utc: DAY_UTC,
+      connector_id: 1,
+      partitions: [{
+        scope: selectedPm25.scope,
+        target_metadata: selectedPm25.target_metadata,
+        pollutant_manifest: selectedPm25.canonical_pollutant_manifest,
+        file_evidence: selectedPm25.file_intents.map((intent) => ({
+          key: intent.key,
+          byte_size: intent.byte_size,
+          sha256: intent.sha256,
+          verified: true,
+          durable: true,
+        })),
+        v3_hierarchy: selectedPm25.v3_hierarchy,
+      }],
+    }),
+    /Current pollutant child identity disagrees/,
+  );
+  assert.equal(putCount, 0);
 });
 
 test("day publisher creates verified canonical parent from changed connector authority", async () => {
