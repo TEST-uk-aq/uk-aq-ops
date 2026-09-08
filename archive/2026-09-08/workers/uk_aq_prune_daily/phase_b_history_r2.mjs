@@ -5880,19 +5880,7 @@ export async function runPhaseBBackup({
     };
   }
 
-  if (runtime.history_write_version === "v2") {
-    buildObservationV2IndexEnv(runtime);
-  } else {
-    const generation = getObservationHistoryGeneration(
-      resolvePruneHistoryGeneration({
-        UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version,
-      }),
-    );
-    assertObservationHistoryGenerationPrefixes(generation, {
-      observationsPrefix: runtime.committed_prefix,
-      runsPrefix: runtime.runs_prefix,
-    });
-  }
+  buildObservationV2IndexEnv(runtime);
   if (!runtime.supabase_db_url) {
     throw new Error("Phase B history export requires SUPABASE_DB_URL for streaming Postgres extraction and deletion safety.");
   }
