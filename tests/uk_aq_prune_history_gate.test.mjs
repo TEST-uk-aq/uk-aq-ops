@@ -38,6 +38,10 @@ import {
   setConnectorDayGateIncomplete,
 } from "../workers/shared/uk_aq_connector_day_gate.mjs";
 import { computePruneConnectorSourceIdentity } from "../workers/shared/uk_aq_prune_connector_source_identity.mjs";
+import {
+  R2_PUBLICATION_SAFETY_MARGIN_MS,
+  R2_REQUEST_WORST_CASE_DURATION_MS,
+} from "../workers/shared/r2_sigv4.mjs";
 
 test("connector-day pairs accept canonical text and UTC-midnight Date values only", () => {
   assert.deepEqual(
@@ -1032,6 +1036,77 @@ test("source-change invalidation survives a real Phase B candidate-start budget 
   assert.deepEqual(summary.run_manifest, { skipped: true, reason: "reserved_for_final_reporting" });
   assert.equal(summary.total_written_rows, "0");
   assert.equal(summary.total_written_bytes, "0");
+});
+
+test("v3 candidate admission preserves the real run-finalization reserve without changing v2", async () => {
+  const v3RunFinalizationReserveMs =
+    (3 * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS;
+  const v3CandidateStartMinimumMs = 180_000 + v3RunFinalizationReserveMs;
+
+  assert.equal(v3RunFinalizationReserveMs, 375_500);
+  assert.equal(
+    phaseBHistoryModule.phaseBCandidateStartMinimumMsForTest("v2"),
+    300_000,
+  );
+  assert.equal(
+    phaseBHistoryModule.phaseBCandidateStartMinimumMsForTest("v3"),
+    v3CandidateStartMinimumMs,
+  );
+
+  const dayUtc = "2026-07-21";
+  const key = connectorDayGateKey(dayUtc, 1);
+  const candidates = new Map([
+    [key, completeCandidate(dayUtc, 1, 10, `${dayUtc}T00:00:00.000Z`, `${dayUtc}T23:00:00.000Z`)],
+  ]);
+  const gates = new Map([[key, true]]);
+  const populationClient = candidatePopulationClient({
+    candidates,
+    gates,
+    sourceRows: [
+      { day_utc: dayUtc, connector_id: 1, expected_row_count: "11", min_observed_at: `${dayUtc}T00:00:00.000Z`, max_observed_at: `${dayUtc}T23:30:00.000Z` },
+    ],
+  });
+  const phaseB = {
+    ...phaseBConfig(),
+    history_write_version: "v3",
+    committed_prefix: "history/v3/observations",
+    runs_prefix: "history/v3/_ops/observations/runs",
+  };
+  const deadlineMs = (phaseB.max_seconds_per_run - phaseB.stop_before_timeout_seconds) * 1000;
+  let nowMs = 0;
+  let candidateClaimed = false;
+  const fakeClient = {
+    async connect() {},
+    async end() {},
+    async query(sql, params) {
+      if (/^set (timezone|statement_timeout)/i.test(sql.trim())) return { rows: [] };
+      if (/select distinct op\.code|source_changes as materialized/i.test(sql)) {
+        return populationClient.query(sql, params);
+      }
+      if (/insert into uk_aq_ops\.prune_day_gates/i.test(sql)) return { rows: [] };
+      if (/where c\.status = 'pending'/i.test(sql)) {
+        nowMs = deadlineMs - v3CandidateStartMinimumMs;
+        return { rows: [candidates.get(key)] };
+      }
+      if (/set status = 'in_progress'/i.test(sql)) candidateClaimed = true;
+      throw new Error(`Unexpected fake PostgreSQL query: ${sql.slice(0, 80)}`);
+    },
+  };
+
+  const summary = await runPhaseBBackup({
+    dryRun: false,
+    phaseB,
+    ingestRetentionDays: 5,
+    logStructured: () => {},
+    runId: "v3-finalization-reserve-run",
+    nowUtc: "2026-07-27T12:00:00.000Z",
+    nowMs: () => nowMs,
+    createPgClient: () => fakeClient,
+  });
+
+  assert.equal(candidateClaimed, false);
+  assert.equal(summary.status, "stopped_budget");
+  assert.equal(summary.budget_stop.operation, "candidate_start");
 });
 
 test("top-level stopped-budget path skips every downstream adapter, finishes task health, and writes the normal report", async () => {

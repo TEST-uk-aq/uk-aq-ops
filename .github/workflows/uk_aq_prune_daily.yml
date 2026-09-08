@@ -19,7 +19,7 @@ concurrency:
 jobs:
   prune-daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 70
     env:
       UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'TEST' }}
       UK_AQ_SERVICE_EGRESS_METRICS_ENABLED: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_ENABLED || 'false' }}
@@ -50,7 +50,7 @@ jobs:
       UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS: ${{ vars.UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS || '20000' }}
       UK_AQ_R2_HISTORY_ROW_GROUP_SIZE: ${{ vars.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE || '100000' }}
       UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN || '500' }}
-      UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN: ${{ vars.UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN || '1740' }}
+      UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN: ${{ vars.UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN || '3540' }}
       UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS: ${{ vars.UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS || '60' }}
       UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS: ${{ vars.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS || '7' }}
       UK_AQ_R2_HISTORY_STAGING_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_STAGING_PREFIX || 'history/v1/_ops/observations/staging' }}
@@ -118,7 +118,7 @@ jobs:
           exit "${missing}"
 
       - name: Run Prune Daily
-        run: timeout --kill-after=30s 30m node workers/uk_aq_prune_daily/job.mjs
+        run: timeout --kill-after=30s 60m node workers/uk_aq_prune_daily/job.mjs
 
       - name: Upload Prune Daily report
         if: always()

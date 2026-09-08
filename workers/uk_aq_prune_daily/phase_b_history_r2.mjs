@@ -110,7 +110,7 @@ const DEFAULT_ROW_GROUP_SIZE = 100_000;
 const DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE = 50_000;
 const DEFAULT_AQILEVELS_ROW_GROUP_SIZE = DEFAULT_ROW_GROUP_SIZE;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
-const DEFAULT_MAX_SECONDS_PER_RUN = 1_740;
+const DEFAULT_MAX_SECONDS_PER_RUN = 3_540;
 const DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS = 60;
 const PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS = 600_000;
 const PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS = 15_000;
@@ -127,6 +127,12 @@ const PHASE_B_STAGE_MIN_MS = Object.freeze({
   day_finalization: 120_000,
   dropbox_comparison: 180_000,
 });
+const PHASE_B_V3_RUN_FINALIZATION_RESERVE_MS =
+  (3 * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS;
+const PHASE_B_V3_CANDIDATE_START_MIN_MS =
+  PHASE_B_STAGE_MIN_MS.candidate_start
+  - PHASE_B_STAGE_MIN_MS.observation_run_finalization
+  + PHASE_B_V3_RUN_FINALIZATION_RESERVE_MS;
 const DEFAULT_STAGING_RETENTION_DAYS = 7;
 const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
 const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
@@ -287,6 +293,16 @@ export function createPhaseBRunBudgetForTest({
     deadline_ms: startedAtMs + usableMs,
     now_ms: nowMs,
   };
+}
+
+function phaseBCandidateStartMinimumMs(historyWriteVersion) {
+  return historyWriteVersion === "v3"
+    ? PHASE_B_V3_CANDIDATE_START_MIN_MS
+    : PHASE_B_STAGE_MIN_MS.candidate_start;
+}
+
+export function phaseBCandidateStartMinimumMsForTest(historyWriteVersion) {
+  return phaseBCandidateStartMinimumMs(historyWriteVersion);
 }
 
 function budgetNowMs(runtime) {
@@ -6357,7 +6373,7 @@ export async function runPhaseBBackup({
 
     for (let candidateIndex = 0; candidateIndex < pendingCandidates.length; candidateIndex += 1) {
       const candidate = pendingCandidates[candidateIndex];
-      if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
+      if (!hasBudgetFor(runtime, phaseBCandidateStartMinimumMs(runtime.history_write_version))) {
         logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
           operation: "candidate_start",
           day_utc: candidate.day_utc,
