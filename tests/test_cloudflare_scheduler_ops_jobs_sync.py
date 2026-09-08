@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,6 +17,79 @@ assert SPEC is not None and SPEC.loader is not None
 sync_jobs = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = sync_jobs
 SPEC.loader.exec_module(sync_jobs)
+
+CONFIG_SYNC_WORKFLOW = ROOT / ".github/workflows/uk_aq_cloudflare_scheduler_ops_config_sync.yml"
+DEPLOY_WORKFLOW = ROOT / ".github/workflows/uk_aq_cloudflare_scheduler_ops_deploy.yml"
+
+
+def extract_workflow_run_step(workflow_text: str, step_name: str) -> str:
+    lines = workflow_text.splitlines()
+    step_marker = f"      - name: {step_name}"
+    try:
+        step_start = lines.index(step_marker)
+    except ValueError as exc:
+        raise AssertionError(f"Missing workflow step {step_name!r}") from exc
+
+    run_start = next(
+        index for index in range(step_start + 1, len(lines)) if lines[index] == "        run: |"
+    )
+    script_lines: list[str] = []
+    for line in lines[run_start + 1 :]:
+        if line.startswith("      - name: "):
+            break
+        script_lines.append(line[10:] if line.startswith("          ") else "")
+    return "\n".join(script_lines) + "\n"
+
+
+def commit_all(repo: Path, message: str) -> str:
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", message],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def run_sync_scope_step(
+    script: str,
+    repo: Path,
+    *,
+    event_name: str,
+    before_sha: str,
+    after_sha: str,
+) -> dict[str, str]:
+    output_path = repo / ".git/github-output.txt"
+    output_path.write_text("", encoding="utf-8")
+    env = {
+        **os.environ,
+        "EVENT_NAME": event_name,
+        "BEFORE_SHA": before_sha,
+        "AFTER_SHA": after_sha,
+        "JOBS_FILE": "cloudflare/scheduler/jobs.toml",
+        "GITHUB_OUTPUT": str(output_path),
+    }
+    subprocess.run(
+        ["bash", "-c", script],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return dict(
+        line.split("=", 1)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
 
 
 class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
@@ -115,6 +190,10 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             self.assertEqual(manifest["job_count"], 9)
             self.assertEqual(len(manifest["jobs"]), 9)
             self.assertEqual(
+                set(manifest["scheduler_jobs_required_columns"]),
+                set(sync_jobs.SQL_COLUMNS + ["updated_at"]),
+            )
+            self.assertEqual(
                 manifest["deployment_managed_cloud_run_url_job_keys"],
                 [],
             )
@@ -122,6 +201,144 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
                 job for job in manifest["jobs"] if job["job_key"] == "uk_aq_r2_core_snapshot"
             )
             self.assertEqual(core_snapshot["cloud_run_method"], "POST")
+
+    def test_schema_compatibility_uses_manifest_shape_and_detects_missing_columns(self) -> None:
+        manifest = sync_jobs.validate_jobs_config(sync_jobs.load_jobs_config(self.jobs_file))
+        expected = sync_jobs.build_expected_manifest(manifest)
+        required_columns = sync_jobs.required_scheduler_jobs_columns(expected)
+        compatible_schema = [{"results": [{"name": name} for name in sorted(required_columns)]}]
+
+        self.assertEqual(sync_jobs.missing_scheduler_jobs_columns(expected, compatible_schema), [])
+
+        missing_worker_columns = {
+            "worker_http_url",
+            "worker_http_secret_binding",
+            "worker_http_body_json",
+        }
+        old_schema = [
+            {
+                "results": [
+                    {"name": name}
+                    for name in sorted(required_columns - missing_worker_columns)
+                ]
+            }
+        ]
+        self.assertEqual(
+            sync_jobs.missing_scheduler_jobs_columns(expected, old_schema),
+            sorted(missing_worker_columns),
+        )
+
+        expected["jobs"][0]["cloud_run_url"] = "https://runtime-owned.example.test/run"
+        self.assertEqual(sync_jobs.missing_scheduler_jobs_columns(expected, compatible_schema), [])
+
+    def test_push_scope_detects_script_only_and_multi_commit_jobs_changes(self) -> None:
+        workflow_text = CONFIG_SYNC_WORKFLOW.read_text(encoding="utf-8")
+        script = extract_workflow_run_step(
+            workflow_text,
+            "Determine whether remote job sync is required",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+            jobs_path = repo / "cloudflare/scheduler/jobs.toml"
+            script_path = repo / "cloudflare/scheduler/scripts/sync_jobs.py"
+            workflow_path = repo / ".github/workflows/config-sync.yml"
+            jobs_path.parent.mkdir(parents=True)
+            script_path.parent.mkdir(parents=True)
+            workflow_path.parent.mkdir(parents=True)
+            jobs_path.write_text("config_version = 1\n", encoding="utf-8")
+            script_path.write_text("# initial\n", encoding="utf-8")
+            workflow_path.write_text("# initial\n", encoding="utf-8")
+            base_sha = commit_all(repo, "base")
+
+            script_path.write_text("# implementation only\n", encoding="utf-8")
+            script_only_sha = commit_all(repo, "script only")
+            outputs = run_sync_scope_step(
+                script,
+                repo,
+                event_name="push",
+                before_sha=base_sha,
+                after_sha=script_only_sha,
+            )
+            self.assertEqual(outputs["remote_sync"], "false")
+            self.assertIn("jobs.toml did not change", outputs["reason"])
+
+            jobs_path.write_text("config_version = 1\n# changed\n", encoding="utf-8")
+            commit_all(repo, "jobs change")
+            workflow_path.write_text("# later implementation commit\n", encoding="utf-8")
+            multi_commit_after_sha = commit_all(repo, "later workflow change")
+            outputs = run_sync_scope_step(
+                script,
+                repo,
+                event_name="push",
+                before_sha=script_only_sha,
+                after_sha=multi_commit_after_sha,
+            )
+            self.assertEqual(outputs["remote_sync"], "true")
+            self.assertIn("jobs.toml changed", outputs["reason"])
+
+            outputs = run_sync_scope_step(
+                script,
+                repo,
+                event_name="push",
+                before_sha="0" * 40,
+                after_sha=multi_commit_after_sha,
+            )
+            self.assertEqual(outputs["remote_sync"], "true")
+
+            outputs = run_sync_scope_step(
+                script,
+                repo,
+                event_name="workflow_dispatch",
+                before_sha="",
+                after_sha=multi_commit_after_sha,
+            )
+            self.assertEqual(outputs["remote_sync"], "true")
+            self.assertEqual(outputs["reason"], "explicit workflow_dispatch")
+
+    def test_workflow_remote_steps_are_gated_and_schema_guard_is_read_only(self) -> None:
+        workflow = CONFIG_SYNC_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("fetch-depth: 0", workflow)
+        self.assertGreaterEqual(
+            workflow.count("if: steps.sync-scope.outputs.remote_sync == 'true'"),
+            4,
+        )
+        self.assertIn("No remote D1 mutation or verification is required.", workflow)
+        self.assertIn('command "pragma table_info(scheduler_jobs)"', workflow)
+        self.assertIn("max_attempts=8", workflow)
+        self.assertIn("retry_seconds=10", workflow)
+        self.assertIn("missing_scheduler_jobs_columns", workflow)
+        self.assertIn("refusing to apply canonical jobs", workflow)
+        self.assertNotIn("d1 migrations apply", workflow)
+
+    def test_scheduler_workflows_pin_wrangler_v4_consistently(self) -> None:
+        config_sync = CONFIG_SYNC_WORKFLOW.read_text(encoding="utf-8")
+        deploy = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+        action_sha = "ebbaa1584979971c8614a24965b4405ff95890e0"
+        retired_action_sha = "da0e0dfe58b7a431659754fdf3f186c529afbe65"
+
+        for workflow in [config_sync, deploy]:
+            self.assertIn('WRANGLER_VERSION: "4.130.0"', workflow)
+            self.assertNotIn("wrangler@4 ", workflow)
+
+        self.assertEqual(
+            config_sync.count('npx --yes "wrangler@${WRANGLER_VERSION}"'),
+            3,
+        )
+        self.assertEqual(
+            deploy.count('npx --yes "wrangler@${WRANGLER_VERSION}"'),
+            2,
+        )
+        self.assertEqual(
+            deploy.count(f"cloudflare/wrangler-action@{action_sha}"),
+            2,
+        )
+        self.assertEqual(deploy.count("wranglerVersion: ${{ env.WRANGLER_VERSION }}"), 2)
+        self.assertNotIn(retired_action_sha, deploy)
 
     def test_invalid_cron_expression_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

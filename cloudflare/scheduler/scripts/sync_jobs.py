@@ -503,6 +503,7 @@ def build_expected_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "config_version": manifest["config_version"],
         "scheduler_name": manifest["scheduler_name"],
         "job_count": manifest["job_count"],
+        "scheduler_jobs_required_columns": SQL_COLUMNS + ["updated_at"],
         "jobs": [
             {column: job[column] for column in SQL_COLUMNS}
             for job in manifest["jobs"]
@@ -513,6 +514,38 @@ def build_expected_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             if job.get("cloud_run_url_managed_by_deploy")
         ],
     }
+
+
+def required_scheduler_jobs_columns(expected_manifest: dict[str, Any]) -> set[str]:
+    required_columns = expected_manifest.get("scheduler_jobs_required_columns")
+    if (
+        not isinstance(required_columns, list)
+        or not required_columns
+        or any(not isinstance(column, str) or not column for column in required_columns)
+        or len(set(required_columns)) != len(required_columns)
+    ):
+        raise JobsConfigError("Expected jobs manifest has invalid required scheduler_jobs columns")
+    return set(required_columns)
+
+
+def missing_scheduler_jobs_columns(
+    expected_manifest: dict[str, Any],
+    d1_schema_response: Any,
+) -> list[str]:
+    required_columns = required_scheduler_jobs_columns(expected_manifest)
+    try:
+        schema_rows = d1_schema_response[0]["results"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise JobsConfigError("Invalid D1 scheduler_jobs schema response") from exc
+    if not isinstance(schema_rows, list):
+        raise JobsConfigError("Invalid D1 scheduler_jobs schema response")
+
+    actual_columns = {
+        row["name"]
+        for row in schema_rows
+        if isinstance(row, dict) and isinstance(row.get("name"), str) and row["name"]
+    }
+    return sorted(required_columns - actual_columns)
 
 
 def write_text_file(path: Path, text: str) -> None:

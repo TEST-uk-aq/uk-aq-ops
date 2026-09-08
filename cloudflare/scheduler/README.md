@@ -16,6 +16,16 @@ This Worker runs once per minute and reads its schedule entirely from D1.
 - Config sync workflow: `.github/workflows/uk_aq_cloudflare_scheduler_ops_config_sync.yml`
 - Deploy workflow: `.github/workflows/uk_aq_cloudflare_scheduler_ops_deploy.yml`
 
+## CI sync and Wrangler version
+
+Scheduler workflows pin Wrangler v4 at `4.130.0`. Pull requests and relevant
+pushes validate the canonical scheduler configuration, but a push rewrites
+remote `scheduler_jobs` only when `jobs.toml` changed; `workflow_dispatch`
+remains an explicit manual sync. Script- or workflow-only pushes validate
+without mutating D1. Before a remote sync, the config workflow waits briefly
+for the remote table to contain every column required by the generated job
+manifest. Scheduler migrations remain owned by the deployment workflow.
+
 ## Worker name
 
 - `uk-aq-cron-scheduler-ops`
@@ -127,7 +137,7 @@ For each configured `worker_http` job, install the binding named in
 ```bash
 cd cloudflare/scheduler
 printf '%s' "${UK_AQ_EXAMPLE_WORKER_HTTP_SECRET}" | \
-  npx --yes wrangler@4 secret put UK_AQ_EXAMPLE_WORKER_HTTP_SECRET \
+  npx --yes wrangler@4.130.0 secret put UK_AQ_EXAMPLE_WORKER_HTTP_SECRET \
     --name uk-aq-cron-scheduler-ops
 ```
 
@@ -136,7 +146,7 @@ Install the existing shared edge secret on the Worker:
 ```bash
 cd cloudflare/scheduler
 printf '%s' "${UK_AQ_EDGE_UPSTREAM_SECRET}" | \
-  npx --yes wrangler@4 secret put UK_AQ_EDGE_UPSTREAM_SECRET \
+  npx --yes wrangler@4.130.0 secret put UK_AQ_EDGE_UPSTREAM_SECRET \
     --name uk-aq-cron-scheduler-ops
 ```
 

@@ -28,6 +28,7 @@ jobs:
   sync-jobs:
     runs-on: ubuntu-latest
     env:
+      WRANGLER_VERSION: "4.130.0"
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
       SCHEDULER_D1_DATABASE: uk_aq_cron_scheduler_ops_db
@@ -37,6 +38,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -51,8 +54,64 @@ jobs:
             --sql-file /tmp/scheduler_jobs_sync.sql \
             --json-file /tmp/scheduler_jobs_expected.json
 
+      - name: Determine whether remote job sync is required
+        id: sync-scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          remote_sync=false
+          reason="validation-only event"
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            remote_sync=true
+            reason="explicit workflow_dispatch"
+          elif [ "${EVENT_NAME}" = "push" ]; then
+            if [ -z "${BEFORE_SHA}" ] || [[ "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              compare_from="$(git hash-object -t tree /dev/null)"
+              echo "github.event.before is all zeroes; comparing the pushed tree with the empty tree."
+            else
+              compare_from="${BEFORE_SHA}"
+              if ! git cat-file -e "${compare_from}^{commit}" 2>/dev/null; then
+                echo "Fetching the push before commit ${compare_from}."
+                git fetch --no-tags --depth=1 origin "${compare_from}"
+              fi
+              if ! git cat-file -e "${compare_from}^{commit}" 2>/dev/null; then
+                echo "Unable to resolve push before commit ${compare_from}; refusing remote sync."
+                exit 1
+              fi
+            fi
+
+            diff_status=0
+            git diff --quiet "${compare_from}" "${AFTER_SHA}" -- "${JOBS_FILE}" || diff_status=$?
+            if [ "${diff_status}" -eq 0 ]; then
+              reason="canonical jobs.toml did not change in the pushed range"
+            elif [ "${diff_status}" -eq 1 ]; then
+              remote_sync=true
+              reason="canonical jobs.toml changed in the pushed range"
+            else
+              echo "Unable to compare ${JOBS_FILE} across the pushed range; refusing remote sync."
+              exit "${diff_status}"
+            fi
+          fi
+
+          echo "remote_sync=${remote_sync}" >> "${GITHUB_OUTPUT}"
+          echo "reason=${reason}" >> "${GITHUB_OUTPUT}"
+          echo "Remote scheduler job sync: ${remote_sync} (${reason})."
+
+      - name: Report validation-only result
+        if: steps.sync-scope.outputs.remote_sync != 'true'
+        env:
+          SYNC_REASON: ${{ steps.sync-scope.outputs.reason }}
+        run: |
+          echo "Scheduler config validation passed: ${SYNC_REASON}."
+          echo "No remote D1 mutation or verification is required."
+
       - name: Validate Cloudflare credentials for remote sync
-        if: github.event_name != 'pull_request'
+        if: steps.sync-scope.outputs.remote_sync == 'true'
         run: |
           set -euo pipefail
           if [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
@@ -64,20 +123,85 @@ jobs:
             exit 1
           fi
 
-      - name: Apply scheduler jobs to remote D1
-        if: github.event_name != 'pull_request'
+      - name: Wait for remote scheduler schema compatibility
+        if: steps.sync-scope.outputs.remote_sync == 'true'
         run: |
           set -euo pipefail
-          npx --yes wrangler@4 d1 execute "${SCHEDULER_D1_DATABASE}" \
+          max_attempts=8
+          retry_seconds=10
+
+          for attempt in $(seq 1 "${max_attempts}"); do
+            echo "Checking remote scheduler_jobs schema (attempt ${attempt}/${max_attempts})."
+            npx --yes "wrangler@${WRANGLER_VERSION}" d1 execute "${SCHEDULER_D1_DATABASE}" \
+              --remote \
+              --config "${WRANGLER_CONFIG}" \
+              --json \
+              --command "pragma table_info(scheduler_jobs)" \
+              > /tmp/scheduler_jobs_schema.json
+
+            schema_status=0
+            python3 - <<'PY' || schema_status=$?
+          import json
+          from pathlib import Path
+
+          from cloudflare.scheduler.scripts.sync_jobs import (
+              JobsConfigError,
+              missing_scheduler_jobs_columns,
+          )
+
+          try:
+              expected = json.loads(
+                  Path("/tmp/scheduler_jobs_expected.json").read_text(encoding="utf-8")
+              )
+              remote = json.loads(
+                  Path("/tmp/scheduler_jobs_schema.json").read_text(encoding="utf-8")
+              )
+              missing_columns = missing_scheduler_jobs_columns(expected, remote)
+          except (JobsConfigError, json.JSONDecodeError) as exc:
+              print(f"Invalid scheduler schema compatibility input: {exc}")
+              raise SystemExit(2)
+
+          if missing_columns:
+              print(
+                  "Remote scheduler_jobs is missing required columns: "
+                  + ", ".join(missing_columns)
+              )
+              raise SystemExit(1)
+
+          print(
+              "Remote scheduler_jobs schema is compatible with the generated canonical jobs manifest."
+          )
+          PY
+
+            if [ "${schema_status}" -eq 0 ]; then
+              break
+            fi
+            if [ "${schema_status}" -ne 1 ]; then
+              echo "Schema compatibility check failed before comparison; refusing remote sync."
+              exit "${schema_status}"
+            fi
+            if [ "${attempt}" -eq "${max_attempts}" ]; then
+              echo "Remote scheduler_jobs schema did not become compatible after ${max_attempts} attempts; refusing to apply canonical jobs."
+              exit 1
+            fi
+            echo "Schema is not ready; retrying in ${retry_seconds} seconds."
+            sleep "${retry_seconds}"
+          done
+
+      - name: Apply scheduler jobs to remote D1
+        if: steps.sync-scope.outputs.remote_sync == 'true'
+        run: |
+          set -euo pipefail
+          npx --yes "wrangler@${WRANGLER_VERSION}" d1 execute "${SCHEDULER_D1_DATABASE}" \
             --remote \
             --config "${WRANGLER_CONFIG}" \
             --file /tmp/scheduler_jobs_sync.sql
 
       - name: Verify remote D1 matches jobs.toml
-        if: github.event_name != 'pull_request'
+        if: steps.sync-scope.outputs.remote_sync == 'true'
         run: |
           set -euo pipefail
-          npx --yes wrangler@4 d1 execute "${SCHEDULER_D1_DATABASE}" \
+          npx --yes "wrangler@${WRANGLER_VERSION}" d1 execute "${SCHEDULER_D1_DATABASE}" \
             --remote \
             --config "${WRANGLER_CONFIG}" \
             --json \
