@@ -3886,6 +3886,33 @@ async function exportCandidateToR2({ candidate, runtime }) {
   resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
   return await exportCandidateObservationsToR2({ candidate, runtime });
 }
+
+async function runPhaseBCandidateObservationWrite({
+  historyWriteVersion,
+  connectorDayWriterOptions,
+  write,
+  verify,
+  connectorDayWriter = runCanonicalConnectorDayWriter,
+}) {
+  if (historyWriteVersion === "v2") {
+    return await connectorDayWriter({
+      ...connectorDayWriterOptions,
+      write,
+      verify,
+    });
+  }
+  // The v3 steady-state publisher owns this connector/day lock on its stream
+  // session. Wait for that publication to return before caller verification.
+  resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: historyWriteVersion });
+  const written = await write();
+  const verified = await verify(written);
+  return { written, verified };
+}
+
+export async function runPhaseBCandidateObservationWriteForTest(args) {
+  return await runPhaseBCandidateObservationWrite(args);
+}
+
 async function dropboxRefreshAccessToken(dropboxConfig, { signal = undefined } = {}) {
   const appKey = String(dropboxConfig?.app_key || "").trim();
   const appSecret = String(dropboxConfig?.app_secret || "").trim();
@@ -6100,10 +6127,13 @@ export async function runPhaseBBackup({
         let connectorGateEvidence = null;
         let connectorComparison = null;
         const lockDiagnostics = [];
-        const connectorWrite = await runCanonicalConnectorDayWriter({
-          client: controlClient, dayUtc: candidate.day_utc, connectorId: candidate.connector_id,
-          diagnosticEnvironment: runtime.environment, diagnostics: lockDiagnostics,
-          timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+        const connectorWrite = await runPhaseBCandidateObservationWrite({
+          historyWriteVersion: runtime.history_write_version,
+          connectorDayWriterOptions: {
+            client: controlClient, dayUtc: candidate.day_utc, connectorId: candidate.connector_id,
+            diagnosticEnvironment: runtime.environment, diagnostics: lockDiagnostics,
+            timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+          },
           write: async () => {
             await setConnectorDayGateIncomplete(controlClient, {
               day_utc: candidate.day_utc, connector_id: candidate.connector_id,
