@@ -3498,17 +3498,121 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     if (!byPollutant.has(code)) byPollutant.set(code, []);
     byPollutant.get(code).push(row);
   }
-  const publication = await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
-    env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
-    client: streamClient, r2: runtime.r2,
-    observationsPrefix: runtime.committed_prefix,
-    targetWriterGitSha: runtime.writer_git_sha, backedUpAtUtc,
-    partitions: [...byPollutant.entries()].map(([code, partitionRows]) => ({
-      scope: { day_utc: candidate.day_utc, connector_id: candidate.connector_id, pollutant_code: code },
-      rows: partitionRows,
-    })),
-    lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-    diagnosticEnvironment: runtime.environment,
+  const publicationStartedAtMs = Date.now();
+  const publicationFields = {
+    day_utc: candidate.day_utc,
+    connector_id: candidate.connector_id,
+    source_row_count: rows.length,
+    pollutant_count: byPollutant.size,
+    pollutant_codes: [...byPollutant.keys()].sort(),
+  };
+  logPhaseB(runtime, "INFO", "phase_b_history_v3_connector_publication_start", publicationFields);
+
+  // These adapters preserve the established v3 writer and connector/day lock,
+  // while making the first non-PG awaited boundary observable.  In particular,
+  // a missing lock-wait event means the synchronous target/index preparation is
+  // still running; a lock-acquired event followed by an incomplete file event
+  // points to a durable R2 PUT/readback instead.
+  const putAndVerifyParquet = async ({ r2, intent, putObject, headObject }) => {
+    assertBudget(runtime, "v3_parquet_object_write", {
+      ...publicationFields,
+      key: intent?.key || null,
+      byte_size: Number(intent?.byte_size || intent?.body?.byteLength || 0),
+    }, PHASE_B_STAGE_MIN_MS.observation_segment);
+    const startedAtMs = Date.now();
+    logPhaseB(runtime, "INFO", "phase_b_history_v3_parquet_object_start", {
+      ...publicationFields,
+      key: intent?.key || null,
+      byte_size: Number(intent?.byte_size || intent?.body?.byteLength || 0),
+    });
+    try {
+      const verified = await putAndVerifyR2ObjectWithSha256({
+        r2,
+        intent,
+        putObject,
+        headObject,
+      });
+      logPhaseB(runtime, "INFO", "phase_b_history_v3_parquet_object_complete", {
+        ...publicationFields,
+        key: verified.key,
+        byte_size: verified.byte_size,
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+      });
+      return verified;
+    } catch (error) {
+      logPhaseB(runtime, "ERROR", "phase_b_history_v3_parquet_object_failed", {
+        ...publicationFields,
+        key: intent?.key || null,
+        byte_size: Number(intent?.byte_size || intent?.body?.byteLength || 0),
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  };
+
+  const withConnectorDayLock = async (lockOptions, callback) => {
+    assertBudget(runtime, "v3_connector_day_lock", {
+      ...publicationFields,
+      lock_day_utc: lockOptions?.dayUtc || null,
+      lock_connector_id: lockOptions?.connectorId ?? null,
+    }, PHASE_B_STAGE_MIN_MS.observation_connector_publication);
+    const lockStartedAtMs = Date.now();
+    logPhaseB(runtime, "INFO", "phase_b_history_v3_connector_day_lock_wait_start", {
+      ...publicationFields,
+      lock_day_utc: lockOptions?.dayUtc || null,
+      lock_connector_id: lockOptions?.connectorId ?? null,
+    });
+    return await withConnectorDayHistoryLock(lockOptions, async (...args) => {
+      logPhaseB(runtime, "INFO", "phase_b_history_v3_connector_day_lock_acquired", {
+        ...publicationFields,
+        lock_day_utc: lockOptions?.dayUtc || null,
+        lock_connector_id: lockOptions?.connectorId ?? null,
+        wait_duration_ms: Math.max(0, Date.now() - lockStartedAtMs),
+      });
+      try {
+        return await callback(...args);
+      } finally {
+        logPhaseB(runtime, "INFO", "phase_b_history_v3_connector_day_lock_released", {
+          ...publicationFields,
+          lock_day_utc: lockOptions?.dayUtc || null,
+          lock_connector_id: lockOptions?.connectorId ?? null,
+          held_duration_ms: Math.max(0, Date.now() - lockStartedAtMs),
+        });
+      }
+    });
+  };
+
+  let publication;
+  try {
+    publication = await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
+      env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+      client: streamClient, r2: runtime.r2,
+      observationsPrefix: runtime.committed_prefix,
+      targetWriterGitSha: runtime.writer_git_sha, backedUpAtUtc,
+      partitions: [...byPollutant.entries()].map(([code, partitionRows]) => ({
+        scope: { day_utc: candidate.day_utc, connector_id: candidate.connector_id, pollutant_code: code },
+        rows: partitionRows,
+      })),
+      lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+      putAndVerifyParquet,
+      withConnectorDayLock,
+      diagnosticEnvironment: runtime.environment,
+    });
+  } catch (error) {
+    logPhaseB(runtime, "ERROR", "phase_b_history_v3_connector_publication_failed", {
+      ...publicationFields,
+      duration_ms: Math.max(0, Date.now() - publicationStartedAtMs),
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+  logPhaseB(runtime, "INFO", "phase_b_history_v3_connector_publication_complete", {
+    ...publicationFields,
+    connector_result_count: Array.isArray(publication?.connector_results)
+      ? publication.connector_results.length
+      : 0,
+    duration_ms: Math.max(0, Date.now() - publicationStartedAtMs),
   });
   if (publication.ok !== true || publication.connector_results.length !== 1) {
     throw new Error("Side-by-side v3 connector publication is incomplete");
@@ -3559,6 +3663,15 @@ async function writeFrozenCandidateObservationsToV2({
 }) {
   try {
     resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
+    const replayStartedAtMs = Date.now();
+    const emitV3Diagnostics = runtime.history_write_version === "v3";
+    if (emitV3Diagnostics) {
+      logPhaseB(runtime, "INFO", "phase_b_history_v3_frozen_source_replay_start", {
+        day_utc: candidate.day_utc,
+        connector_id: candidate.connector_id,
+        expected_row_count: candidate.expected_row_count.toString(),
+      });
+    }
     const rows = [];
     for await (const raw of readFrozenRows(frozen.temp.ndjsonPath)) {
       assertBudget(runtime, "frozen_source_replay", {
@@ -3574,11 +3687,29 @@ async function writeFrozenCandidateObservationsToV2({
     if (BigInt(rows.length) !== candidate.expected_row_count || rows.length === 0) {
       throw new Error(`Frozen source replay row count mismatch for day=${candidate.day_utc} connector=${candidate.connector_id}`);
     }
+    if (emitV3Diagnostics) {
+      logPhaseB(runtime, "INFO", "phase_b_history_v3_frozen_source_replay_complete", {
+        day_utc: candidate.day_utc,
+        connector_id: candidate.connector_id,
+        replayed_row_count: rows.length,
+        duration_ms: Math.max(0, Date.now() - replayStartedAtMs),
+      });
+    }
     assertBudget(runtime, "observation_connector_publication", {
       day_utc: candidate.day_utc, connector_id: candidate.connector_id,
       replayed_row_count: rows.length,
     }, PHASE_B_STAGE_MIN_MS.observation_connector_publication);
     const result = await connectorPublisher({ candidate, runtime, streamClient, rows, backedUpAtUtc });
+    if (emitV3Diagnostics) {
+      logPhaseB(runtime, "INFO", "phase_b_history_v3_candidate_write_complete", {
+        day_utc: candidate.day_utc,
+        connector_id: candidate.connector_id,
+        source_row_count: rows.length,
+        file_count: Number(result?.file_count || 0),
+        total_bytes: String(result?.total_bytes ?? 0n),
+        duration_ms: Math.max(0, Date.now() - replayStartedAtMs),
+      });
+    }
     return {
       ...result,
       day_utc: candidate.day_utc, connector_id: candidate.connector_id,
