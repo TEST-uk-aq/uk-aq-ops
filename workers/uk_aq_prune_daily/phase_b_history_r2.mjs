@@ -23,6 +23,9 @@ import {
   r2HeadObject,
   r2ListAllObjects,
   r2PutObject,
+  R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS,
+  R2_PUBLICATION_SAFETY_MARGIN_MS,
+  R2_REQUEST_WORST_CASE_DURATION_MS,
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
 import {
@@ -51,6 +54,7 @@ import {
 import {
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey,
   buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey,
+  r2PutObjectIfChanged,
   updateR2HistoryIndexesTargeted,
 } from "../shared/uk_aq_r2_history_index.mjs";
 import {
@@ -3499,6 +3503,7 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     byPollutant.get(code).push(row);
   }
   const publicationStartedAtMs = Date.now();
+  let publicationStage = "preparation";
   const publicationFields = {
     day_utc: candidate.day_utc,
     connector_id: candidate.connector_id,
@@ -3507,6 +3512,42 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     pollutant_codes: [...byPollutant.keys()].sort(),
   };
   logPhaseB(runtime, "INFO", "phase_b_history_v3_connector_publication_start", publicationFields);
+
+  const assertPublicationRequestBudget = (operation, requestCount, fields = {}) => {
+    assertBudget(runtime, operation, {
+      ...publicationFields,
+      publication_stage: publicationStage,
+      ...fields,
+    }, (requestCount * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS);
+  };
+
+  const publicationGetObject = async ({ r2, key }) => {
+    assertPublicationRequestBudget("v3_publication_r2_read", 1, { key });
+    return await r2GetObject({ r2: r2 || runtime.r2, key });
+  };
+
+  const publicationPutIfChanged = async (object) => {
+    // A changed idempotent JSON artifact can perform HEAD + PUT + GET before
+    // the caller's durability readback, so reserve all three bounded requests.
+    assertPublicationRequestBudget("v3_publication_json_artifact", 3, {
+      key: object?.key || null,
+    });
+    return await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
+  };
+
+  const diagnosticLog = (event, fields = {}) => {
+    const severity = event.endsWith("_failed") ? "ERROR" : "INFO";
+    logPhaseB(runtime, severity, `phase_b_history_v3_${event}`, fields);
+  };
+
+  const beforePublicationStage = ({ stage, ...fields }) => {
+    publicationStage = stage;
+    // Stage work is admitted at a safe boundary, then every individual R2
+    // operation performs its own bounded admission as dynamic references are
+    // discovered. This avoids pretending that current canonical child counts
+    // are known before their parent is read.
+    assertPublicationRequestBudget(`v3_${stage}_start`, 1, fields);
+  };
 
   // These adapters preserve the established v3 writer and connector/day lock,
   // while making the first non-PG awaited boundary observable.  In particular,
@@ -3518,7 +3559,7 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
       ...publicationFields,
       key: intent?.key || null,
       byte_size: Number(intent?.byte_size || intent?.body?.byteLength || 0),
-    }, PHASE_B_STAGE_MIN_MS.observation_segment);
+    }, R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS);
     const startedAtMs = Date.now();
     logPhaseB(runtime, "INFO", "phase_b_history_v3_parquet_object_start", {
       ...publicationFields,
@@ -3558,31 +3599,45 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
       lock_connector_id: lockOptions?.connectorId ?? null,
     }, PHASE_B_STAGE_MIN_MS.observation_connector_publication);
     const lockStartedAtMs = Date.now();
+    const lockDiagnostics = Array.isArray(lockOptions?.diagnostics)
+      ? lockOptions.diagnostics
+      : [];
+    const lockDiagnosticsStart = lockDiagnostics.length;
+    let acquiredAtMs = null;
     logPhaseB(runtime, "INFO", "phase_b_history_v3_connector_day_lock_wait_start", {
       ...publicationFields,
       lock_day_utc: lockOptions?.dayUtc || null,
       lock_connector_id: lockOptions?.connectorId ?? null,
     });
-    return await withConnectorDayHistoryLock(lockOptions, async (...args) => {
+    let result;
+    try {
+      result = await withConnectorDayHistoryLock(lockOptions, async (...args) => {
+        acquiredAtMs = Date.now();
       logPhaseB(runtime, "INFO", "phase_b_history_v3_connector_day_lock_acquired", {
         ...publicationFields,
         lock_day_utc: lockOptions?.dayUtc || null,
         lock_connector_id: lockOptions?.connectorId ?? null,
         wait_duration_ms: Math.max(0, Date.now() - lockStartedAtMs),
       });
-      try {
         return await callback(...args);
-      } finally {
+      });
+    } finally {
+      const helperReleased = lockDiagnostics
+        .slice(lockDiagnosticsStart)
+        .some((entry) => entry?.event === "lock_released");
+      if (helperReleased && acquiredAtMs !== null) {
         logPhaseB(runtime, "INFO", "phase_b_history_v3_connector_day_lock_released", {
           ...publicationFields,
           lock_day_utc: lockOptions?.dayUtc || null,
           lock_connector_id: lockOptions?.connectorId ?? null,
-          held_duration_ms: Math.max(0, Date.now() - lockStartedAtMs),
+          held_duration_ms: Math.max(0, Date.now() - acquiredAtMs),
         });
       }
-    });
+    }
+    return result;
   };
 
+  const publicationDiagnostics = [];
   let publication;
   try {
     publication = await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
@@ -3597,6 +3652,11 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
       lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
       putAndVerifyParquet,
       withConnectorDayLock,
+      diagnostics: publicationDiagnostics,
+      getObject: publicationGetObject,
+      putIfChanged: publicationPutIfChanged,
+      diagnosticLog,
+      beforePublicationStage,
       diagnosticEnvironment: runtime.environment,
     });
   } catch (error) {

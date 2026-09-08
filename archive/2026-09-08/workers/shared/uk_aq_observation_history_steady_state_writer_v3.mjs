@@ -412,73 +412,23 @@ function prepareRunPartitions({
   backedUpAtUtc,
   observationsPrefix,
   indexRoot,
-  diagnosticLog,
 }) {
-  const prepared = [];
-  for (const partition of normalizePartitionInputs(partitions)) {
-    const firstRow = partition.rows?.[0] || null;
-    const scope = partition.scope || (firstRow ? {
-      day_utc: firstRow.day_utc || String(firstRow.observed_at_utc || "").slice(0, 10),
-      connector_id: firstRow.connector_id,
-      pollutant_code: firstRow.pollutant_code,
-    } : null);
-    emitV3PublicationDiagnostic(diagnosticLog, "partition_prepare_start", {
-      scope,
-      row_count: partition.rows.length,
-    });
-    const startedAtMs = Date.now();
-    let built;
-    try {
-      built = buildObservationHistoryV3SteadyStatePartition({
-        source,
-        rows: partition.rows,
-        scope: partition.scope,
-        writerLimits,
-        targetWriterGitSha,
-        backedUpAtUtc: partition.backed_up_at_utc ?? backedUpAtUtc,
-        observationsPrefix,
-        indexRoot,
-      });
-    } catch (error) {
-      emitV3PublicationDiagnostic(diagnosticLog, "partition_prepare_failed", {
-        scope,
-        row_count: partition.rows.length,
-        duration_ms: Math.max(0, Date.now() - startedAtMs),
-        error: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
-    emitV3PublicationDiagnostic(diagnosticLog, "partition_prepare_complete", {
-      scope: built.scope,
-      row_count: built.target_metadata.row_count,
-      file_count: built.file_intents.length,
-      total_bytes: built.file_intents.reduce((sum, intent) => sum + intent.byte_size, 0),
-      duration_ms: Math.max(0, Date.now() - startedAtMs),
-    });
-    prepared.push(built);
-  }
-  return validatePreparedPartitions(prepared.sort((left, right) =>
+  const prepared = normalizePartitionInputs(partitions).map((partition) =>
+    buildObservationHistoryV3SteadyStatePartition({
+      source,
+      rows: partition.rows,
+      scope: partition.scope,
+      writerLimits,
+      targetWriterGitSha,
+      backedUpAtUtc: partition.backed_up_at_utc ?? backedUpAtUtc,
+      observationsPrefix,
+      indexRoot,
+    })
+  ).sort((left, right) =>
     bytewiseCompare(left.scope.day_utc, right.scope.day_utc) ||
     left.scope.connector_id - right.scope.connector_id ||
     bytewiseCompare(left.scope.pollutant_code, right.scope.pollutant_code)
-  ));
-}
-
-function emitV3PublicationDiagnostic(diagnosticLog, event, fields = {}) {
-  if (typeof diagnosticLog !== "function") return;
-  try {
-    diagnosticLog(event, fields);
-  } catch {
-    // Diagnostics must never change publication semantics.
-  }
-}
-
-function assertV3PublicationStageBudget(beforePublicationStage, stage, fields) {
-  if (typeof beforePublicationStage !== "function") return;
-  beforePublicationStage({ stage, ...fields });
-}
-
-function validatePreparedPartitions(prepared) {
+  );
   const seen = new Set();
   for (const partition of prepared) {
     const identity = scopeIdentity(partition.scope);
@@ -846,8 +796,6 @@ export async function runObservationHistoryV3ConnectorPublication({
   runDayFinalizer = runCanonicalDayFinalizer,
   diagnostics,
   diagnosticEnvironment,
-  diagnosticLog,
-  beforePublicationStage,
   lockTimeoutMs,
   prepareCompleteDayReplacement = null,
 }) {
@@ -888,7 +836,6 @@ export async function runObservationHistoryV3ConnectorPublication({
     backedUpAtUtc,
     observationsPrefix,
     indexRoot,
-    diagnosticLog,
   });
   const canonicalObservationsPrefix = normalizePrefix(
     observationsPrefix,
@@ -961,85 +908,25 @@ export async function runObservationHistoryV3ConnectorPublication({
           v3_hierarchy: partition.v3_hierarchy,
         }));
       }
-      const canonicalFields = {
-        publication_stage: "canonical_connector_publication",
+      const canonicalResult = await publishConnectorScopedCanonicalManifests({
+        source: normalizedSource,
         day_utc: group.day_utc,
         connector_id: group.connector_id,
-        pollutant_count: partitionResults.length,
-        affected_object_count: partitionResults.length + 1,
-      };
-      assertV3PublicationStageBudget(
-        beforePublicationStage,
-        "canonical_connector_publication",
-        canonicalFields,
-      );
-      emitV3PublicationDiagnostic(diagnosticLog, "canonical_connector_publication_start", canonicalFields);
-      const canonicalStartedAtMs = Date.now();
-      let canonicalResult;
-      let canonical;
-      try {
-        canonicalResult = await publishConnectorScopedCanonicalManifests({
-          source: normalizedSource,
-          day_utc: group.day_utc,
-          connector_id: group.connector_id,
-          partitions: Object.freeze(partitionResults),
-        });
-        canonical = validateConnectorCanonicalResult({
-          group,
-          result: canonicalResult,
-          observationsPrefix: canonicalObservationsPrefix,
-          source: normalizedSource,
-        });
-        emitV3PublicationDiagnostic(diagnosticLog, "canonical_connector_publication_complete", {
-          ...canonicalFields,
-          duration_ms: Math.max(0, Date.now() - canonicalStartedAtMs),
-        });
-      } catch (error) {
-        emitV3PublicationDiagnostic(diagnosticLog, "canonical_connector_publication_failed", {
-          ...canonicalFields,
-          duration_ms: Math.max(0, Date.now() - canonicalStartedAtMs),
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throw error;
-      }
-      const exactFields = {
-        publication_stage: "exact_v3_connector_publication",
-        day_utc: group.day_utc,
-        connector_id: group.connector_id,
-        pollutant_count: partitionResults.length,
-        affected_object_count: partitionResults.reduce(
-          (sum, partition) => sum + partition.v3_hierarchy.publication_objects.length,
-          0,
-        ),
-      };
-      assertV3PublicationStageBudget(
-        beforePublicationStage,
-        "exact_v3_connector_publication",
-        exactFields,
-      );
-      emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_start", exactFields);
-      const exactStartedAtMs = Date.now();
-      let exact;
-      try {
-        exact = await publishConnectorExactV3Scopes({
-          partitions: partitionResults,
-          canonical,
-          getObject,
-          putIfChanged,
-          recordDurableEvidence,
-          finalizeV3Publication,
-        });
-      } catch (error) {
-        emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_failed", {
-          ...exactFields,
-          duration_ms: Math.max(0, Date.now() - exactStartedAtMs),
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throw error;
-      }
-      emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_complete", {
-        ...exactFields,
-        duration_ms: Math.max(0, Date.now() - exactStartedAtMs),
+        partitions: Object.freeze(partitionResults),
+      });
+      const canonical = validateConnectorCanonicalResult({
+        group,
+        result: canonicalResult,
+        observationsPrefix: canonicalObservationsPrefix,
+        source: normalizedSource,
+      });
+      const exact = await publishConnectorExactV3Scopes({
+        partitions: partitionResults,
+        canonical,
+        getObject,
+        putIfChanged,
+        recordDurableEvidence,
+        finalizeV3Publication,
       });
       const scopedRootByIdentity = new Map(
         exact.scoped_roots.map((root) => [scopeIdentity(root.scope), root]),

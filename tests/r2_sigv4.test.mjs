@@ -2,6 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   fetchWithTimeout,
+  R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS,
+  R2_PUBLICATION_SAFETY_MARGIN_MS,
+  R2_REQUEST_RETRY_DELAYS_MS,
+  R2_REQUEST_TIMEOUT_MS,
+  R2_REQUEST_WORST_CASE_DURATION_MS,
   r2PutObject,
 } from "../workers/shared/r2_sigv4.mjs";
 
@@ -26,6 +31,16 @@ function installImmediateSleep() {
     globalThis.setTimeout = originalSetTimeout;
   };
 }
+
+test("R2 checksum publication bound includes both requests, retries and safety margin", () => {
+  const oneRequest = (4 * R2_REQUEST_TIMEOUT_MS) +
+    R2_REQUEST_RETRY_DELAYS_MS.reduce((sum, delayMs) => sum + delayMs, 0);
+  assert.equal(R2_REQUEST_WORST_CASE_DURATION_MS, oneRequest);
+  assert.equal(
+    R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS,
+    (2 * oneRequest) + R2_PUBLICATION_SAFETY_MARGIN_MS,
+  );
+});
 
 test("fetchWithTimeout aborts a hung request with an actionable error", async () => {
   let observedAbort = false;

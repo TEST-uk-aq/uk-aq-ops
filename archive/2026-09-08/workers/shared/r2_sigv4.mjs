@@ -2,28 +2,10 @@ import { createHash, createHmac } from "node:crypto";
 import { Buffer } from "node:buffer";
 
 const R2_RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
-export const R2_REQUEST_MAX_ATTEMPTS = 4;
-export const R2_REQUEST_RETRY_BASE_MS = 500;
-export const R2_REQUEST_RETRY_MAX_MS = 5000;
-export const R2_REQUEST_TIMEOUT_MS = 30_000;
-export const R2_PUBLICATION_SAFETY_MARGIN_MS = 5_000;
-const DEFAULT_FETCH_TIMEOUT_MS = R2_REQUEST_TIMEOUT_MS;
-
-export const R2_REQUEST_RETRY_DELAYS_MS = Object.freeze(
-  Array.from({ length: Math.max(0, R2_REQUEST_MAX_ATTEMPTS - 1) }, (_, index) =>
-    Math.min(
-      R2_REQUEST_RETRY_MAX_MS,
-      R2_REQUEST_RETRY_BASE_MS * (2 ** index),
-    )
-  ),
-);
-export const R2_REQUEST_WORST_CASE_DURATION_MS =
-  // Four 30-second attempts plus 500+1000+2000ms backoff.
-  (R2_REQUEST_MAX_ATTEMPTS * R2_REQUEST_TIMEOUT_MS) +
-  R2_REQUEST_RETRY_DELAYS_MS.reduce((sum, delayMs) => sum + delayMs, 0);
-export const R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS =
-  // One complete checksum-aware object is PUT followed by HEAD verification.
-  (2 * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS;
+const R2_REQUEST_MAX_ATTEMPTS = 4;
+const R2_REQUEST_RETRY_BASE_MS = 500;
+const R2_REQUEST_RETRY_MAX_MS = 5000;
+const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
 const R2_REQUEST_ERROR_CAUSE_MAX_DEPTH = 8;
 const R2_RETRYABLE_ERROR_CODES = new Set([
   "ECONNABORTED",
