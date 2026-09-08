@@ -34,10 +34,32 @@ manifest. Scheduler migrations remain owned by the deployment workflow.
 
 - `SCHEDULER_DB`
 
-## Required secret
+## Required scheduler secrets
 
 - `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
 - `UK_AQ_SCHEDULER_TRIGGER_SECRET` for authenticated `POST /run-if-due`
+- `UK_AQ_MEDIA_WORKER_HTTP_SECRET` for scheduler authentication to the UK AQ
+  Media discovery Worker
+
+## Deployment-managed Worker secrets
+
+The normal scheduler deployment manages these four Worker secrets:
+
+- `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
+- `UK_AQ_EDGE_UPSTREAM_SECRET`
+- `UK_AQ_SCHEDULER_TRIGGER_SECRET`
+- `UK_AQ_MEDIA_WORKER_HTTP_SECRET`
+
+Their values are stored as encrypted GitHub Actions repository secrets. The
+scheduler deployment workflow passes them through its in-memory `jq` payload to
+`wrangler secret bulk`, which installs them on `uk-aq-cron-scheduler-ops` before
+the workflow redeploys the Worker.
+
+`UK_AQ_MEDIA_WORKER_HTTP_SECRET` authenticates scheduler requests to the UK AQ
+Media discovery Worker. Its value must never be stored in `jobs.toml`, D1,
+request bodies, repository source, or logs. The future Media `worker_http` job
+will refer only to the binding name `UK_AQ_MEDIA_WORKER_HTTP_SECRET`; that job is
+not active yet.
 
 ## Cloud Run authentication secret
 
@@ -126,12 +148,15 @@ python3 -m unittest discover -s tests -p 'test*.py'
    `0003_worker_http_target.sql`.
 4. Sync `cloudflare/scheduler/jobs.toml` into D1 with the config sync workflow or the local sync script.
 5. Seed `cloudflare/scheduler/seeds/0001_github_jobs.sql` only if you need a bootstrap snapshot for a brand-new D1 database.
-6. Install `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT` and
-   `UK_AQ_SCHEDULER_TRIGGER_SECRET` on the Worker.
+6. Install `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`,
+   `UK_AQ_EDGE_UPSTREAM_SECRET`, `UK_AQ_SCHEDULER_TRIGGER_SECRET`, and
+   `UK_AQ_MEDIA_WORKER_HTTP_SECRET` on the Worker.
 7. Deploy the Worker.
 8. Verify one-minute `scheduler_runs` rows and dry-run dispatch records.
 
-For each configured `worker_http` job, install the binding named in
+Normal GitHub-managed deployment installs the four secrets above automatically.
+For manual bootstrap or recovery, an operator may still install a binding with
+Wrangler. For each configured `worker_http` job, install the binding named in
 `worker_http_secret_binding` before enabling live dispatch. For example:
 
 ```bash

@@ -27,6 +27,7 @@ jobs:
       UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: ${{ secrets.UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT || '' }}
       UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
       UK_AQ_SCHEDULER_TRIGGER_SECRET: ${{ secrets.UK_AQ_SCHEDULER_TRIGGER_SECRET || '' }}
+      UK_AQ_MEDIA_WORKER_HTTP_SECRET: ${{ secrets.UK_AQ_MEDIA_WORKER_HTTP_SECRET || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,6 +53,10 @@ jobs:
           fi
           if [ -z "${UK_AQ_SCHEDULER_TRIGGER_SECRET}" ]; then
             echo "Missing secret UK_AQ_SCHEDULER_TRIGGER_SECRET."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_MEDIA_WORKER_HTTP_SECRET}" ]; then
+            echo "Missing secret UK_AQ_MEDIA_WORKER_HTTP_SECRET."
             exit 1
           fi
 
@@ -120,7 +125,8 @@ jobs:
             --arg UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT "${UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT}" \
             --arg UK_AQ_EDGE_UPSTREAM_SECRET "${UK_AQ_EDGE_UPSTREAM_SECRET}" \
             --arg UK_AQ_SCHEDULER_TRIGGER_SECRET "${UK_AQ_SCHEDULER_TRIGGER_SECRET}" \
-            '{UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: $UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT, UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET, UK_AQ_SCHEDULER_TRIGGER_SECRET: $UK_AQ_SCHEDULER_TRIGGER_SECRET} | with_entries(select(.value != ""))')"
+            --arg UK_AQ_MEDIA_WORKER_HTTP_SECRET "${UK_AQ_MEDIA_WORKER_HTTP_SECRET}" \
+            '{UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: $UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT, UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET, UK_AQ_SCHEDULER_TRIGGER_SECRET: $UK_AQ_SCHEDULER_TRIGGER_SECRET, UK_AQ_MEDIA_WORKER_HTTP_SECRET: $UK_AQ_MEDIA_WORKER_HTTP_SECRET} | with_entries(select(.value != ""))')"
           printf '%s' "$secrets_json" | npx --yes "wrangler@${WRANGLER_VERSION}" secret bulk --name uk-aq-cron-scheduler-ops
 
       - name: Redeploy worker
