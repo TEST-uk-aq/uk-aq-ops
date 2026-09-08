@@ -6,6 +6,7 @@ import {
   createObservationHistoryV3CanonicalConnectorPublisher,
   createObservationHistoryV3CanonicalAggregatePublisher,
   createObservationHistoryV3CanonicalDayPublisher,
+  createObservationHistoryV3LatestScopedReferenceRecovery,
   runDisconnectedPruneDailyObservationHistoryV3Writer,
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
 } from "../workers/shared/uk_aq_observation_history_operational_writer_v3.mjs";
@@ -25,6 +26,8 @@ import {
 
 const TARGET_GIT_SHA = "2".repeat(40);
 const DAY_UTC = "2026-08-18";
+const OBSERVATIONS_PREFIX = "history/v3/observations";
+const EXACT_INDEX_ROOT = "history/_index_v3/observations_timeseries";
 
 function rows(pollutantCode, timeseriesId) {
   return [{
@@ -82,6 +85,69 @@ function changedConnectorEntry(payload) {
   };
 }
 
+function currentConnectorFromPartitions(partitions) {
+  const connectorId = partitions[0].scope.connector_id;
+  const key = buildHistoryV2ConnectorManifestKey(
+    OBSERVATIONS_PREFIX,
+    DAY_UTC,
+    connectorId,
+  );
+  return buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: DAY_UTC,
+    connectorId,
+    runId: null,
+    manifestKey: key,
+    pollutantManifests: partitions.map(
+      (partition) => partition.canonical_pollutant_manifest.payload,
+    ),
+    writerGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+}
+
+function recoveryObjects(partition, connector = currentConnectorFromPartitions([partition])) {
+  return new Map([
+    [connector.manifest_key, Buffer.from(JSON.stringify(connector, null, 2))],
+    [
+      partition.canonical_pollutant_manifest.key,
+      Buffer.from(partition.canonical_pollutant_manifest.body),
+    ],
+    ...partition.file_intents.map((intent) => [intent.key, Buffer.from(intent.body)]),
+    ...partition.v3_hierarchy.publication_objects.map((artifact) => [
+      artifact.key,
+      Buffer.from(artifact.body),
+    ]),
+  ]);
+}
+
+function latestRecoveryRequest({ stale, current }) {
+  return {
+    source: "prune_daily",
+    reference: {
+      key: stale.key,
+      byte_size: stale.byte_size,
+      sha256: stale.sha256,
+    },
+    latest_scope: {
+      day_utc: stale.payload.day_utc,
+      connector_id: stale.payload.connector_id,
+      pollutant_code: stale.payload.pollutant_code,
+      key: stale.key,
+      byte_size: stale.byte_size,
+      sha256: stale.sha256,
+    },
+    live_reference: {
+      key: current.key,
+      byte_size: current.byte_size,
+      sha256: current.sha256,
+    },
+    live_body: Buffer.from(current.body),
+    observations_prefix: OBSERVATIONS_PREFIX,
+    index_root: EXACT_INDEX_ROOT,
+  };
+}
+
 test("selected aligned-v2 writer limits are exact and reject drift", () => {
   assert.equal(
     assertAcceptedObservationHistoryWriterLimitsV3({
@@ -103,6 +169,191 @@ test("selected aligned-v2 writer limits are exact and reject drift", () => {
     }),
     /exactly the selected aligned-v2 fields/,
   );
+});
+
+test("Prune latest recovery independently rebuilds and verifies the current exact scope", async () => {
+  const stale = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("no2", 101),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const current = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("no2", 101).map((row) => ({ ...row, value: 14.5 })),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const objects = recoveryObjects(current);
+  const reads = [];
+  const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+    observationsPrefix: OBSERVATIONS_PREFIX,
+    indexRoot: EXACT_INDEX_ROOT,
+    getObject: async ({ key }) => {
+      reads.push(key);
+      return objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false };
+    },
+  });
+  const result = await recover(latestRecoveryRequest({
+    stale: stale.v3_hierarchy.scoped_manifest,
+    current: current.v3_hierarchy.scoped_manifest,
+  }));
+
+  assert.equal(result.artifact.sha256, current.v3_hierarchy.scoped_manifest.sha256);
+  assert.equal(result.evidence.sha256, current.v3_hierarchy.scoped_manifest.sha256);
+  assert.notEqual(result.artifact.sha256, stale.v3_hierarchy.scoped_manifest.sha256);
+  assert.ok(reads.includes(current.canonical_pollutant_manifest.key));
+  assert.ok(current.file_intents.every((intent) => reads.includes(intent.key)));
+  assert.ok(current.v3_hierarchy.publication_objects.every((artifact) =>
+    artifact.key === current.v3_hierarchy.scoped_manifest.key ||
+    reads.includes(artifact.key)
+  ));
+});
+
+test("Prune latest recovery rejects a live scoped object outside current canonical authority", async () => {
+  const stale = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("no2", 101),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const canonical = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("no2", 101).map((row) => ({ ...row, value: 14.5 })),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const wrongLive = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("no2", 101).map((row) => ({ ...row, value: 99 })),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-23T00:00:00.000Z",
+  });
+  const objects = recoveryObjects(canonical);
+  const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+    observationsPrefix: OBSERVATIONS_PREFIX,
+    indexRoot: EXACT_INDEX_ROOT,
+    getObject: async ({ key }) => objects.has(key)
+      ? { exists: true, body: Buffer.from(objects.get(key)) }
+      : { exists: false },
+  });
+
+  await assert.rejects(
+    recover(latestRecoveryRequest({
+      stale: stale.v3_hierarchy.scoped_manifest,
+      current: wrongLive.v3_hierarchy.scoped_manifest,
+    })),
+    /Live exact-v3 scoped identity does not match current canonical authority/,
+  );
+});
+
+test("Prune latest recovery rejects malformed or contradictory canonical authority", async (t) => {
+  const stale = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("no2", 101),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-20T00:00:00.000Z",
+  });
+  const current = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows("no2", 101).map((row) => ({ ...row, value: 14.5 })),
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const request = latestRecoveryRequest({
+    stale: stale.v3_hierarchy.scoped_manifest,
+    current: current.v3_hierarchy.scoped_manifest,
+  });
+
+  await t.test("malformed connector parent", async () => {
+    const objects = recoveryObjects(current);
+    const connector = currentConnectorFromPartitions([current]);
+    objects.set(connector.manifest_key, Buffer.from("{bad json", "utf8"));
+    const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+      observationsPrefix: OBSERVATIONS_PREFIX,
+      indexRoot: EXACT_INDEX_ROOT,
+      getObject: async ({ key }) => objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false },
+    });
+    await assert.rejects(recover(request), /manifest is invalid JSON/);
+  });
+
+  await t.test("missing connector parent", async () => {
+    const objects = recoveryObjects(current);
+    const connector = currentConnectorFromPartitions([current]);
+    objects.delete(connector.manifest_key);
+    const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+      observationsPrefix: OBSERVATIONS_PREFIX,
+      indexRoot: EXACT_INDEX_ROOT,
+      getObject: async ({ key }) => objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false },
+    });
+    await assert.rejects(recover(request), /connector manifest is missing/);
+  });
+
+  await t.test("pollutant child contradicts parent descriptor", async () => {
+    const objects = recoveryObjects(current);
+    objects.set(
+      current.canonical_pollutant_manifest.key,
+      Buffer.from(stale.canonical_pollutant_manifest.body),
+    );
+    const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+      observationsPrefix: OBSERVATIONS_PREFIX,
+      indexRoot: EXACT_INDEX_ROOT,
+      getObject: async ({ key }) => objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false },
+    });
+    await assert.rejects(
+      recover(request),
+      /pollutant child contradicts its connector descriptor/,
+    );
+  });
+
+  await t.test("canonical Parquet identity contradicts pollutant authority", async () => {
+    const objects = recoveryObjects(current);
+    const parquetKey = current.file_intents[0].key;
+    const body = Buffer.from(objects.get(parquetKey));
+    body[0] ^= 0xff;
+    objects.set(parquetKey, body);
+    const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+      observationsPrefix: OBSERVATIONS_PREFIX,
+      indexRoot: EXACT_INDEX_ROOT,
+      getObject: async ({ key }) => objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false },
+    });
+    await assert.rejects(
+      recover(request),
+      /canonical Parquet identity disagrees/,
+    );
+  });
+
+  await t.test("pollutant absent from current connector", async () => {
+    const pm25 = buildObservationHistoryV3SteadyStatePartition({
+      source: "prune_daily",
+      rows: rows("pm25", 102),
+      targetWriterGitSha: TARGET_GIT_SHA,
+      backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+    });
+    const connector = currentConnectorFromPartitions([pm25]);
+    const objects = recoveryObjects(current, connector);
+    const recover = createObservationHistoryV3LatestScopedReferenceRecovery({
+      observationsPrefix: OBSERVATIONS_PREFIX,
+      indexRoot: EXACT_INDEX_ROOT,
+      getObject: async ({ key }) => objects.has(key)
+        ? { exists: true, body: Buffer.from(objects.get(key)) }
+        : { exists: false },
+    });
+    await assert.rejects(
+      recover(request),
+      /does not authorise pollutant no2/,
+    );
+  });
 });
 
 test("steady-state preparation rejects an empty exact-v3 pollutant scope", () => {

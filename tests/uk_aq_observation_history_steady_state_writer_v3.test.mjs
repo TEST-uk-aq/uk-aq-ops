@@ -7,6 +7,7 @@ import {
 } from "../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   buildObservationHistoryV3SteadyStatePartition,
+  runObservationHistoryV3RunFinalization,
   runIntegrityObservationHistoryV3Writer,
   runPruneDailyObservationHistoryV3ConnectorPublication,
   runPruneDailyObservationHistoryV3RunFinalization,
@@ -333,6 +334,25 @@ function finalizationEvidence({
       v3_exact_publication: { ok: true, status: "written" },
     }],
     complete_day_replacement_results: [],
+  };
+}
+
+async function finalizeCanonicalDayV3({
+  day_utc: dayUtc,
+  changed_connectors: changed,
+}) {
+  const changedIds = changed.map((entry) => entry.connector_id)
+    .sort((left, right) => left - right);
+  return {
+    canonical_day_authority_verified: true,
+    parent_state_reread_under_lock: true,
+    day_utc: dayUtc,
+    current_connector_ids: [],
+    changed_connector_ids: changedIds,
+    final_connector_ids: changedIds,
+    day_manifest: evidence(
+      `history/v3/observations/day_utc=${dayUtc}/manifest.json`,
+    ),
   };
 }
 
@@ -805,6 +825,212 @@ test("a stale unchanged latest dependency fails closed before latest publication
     Buffer.from(replacementRoot.body),
   );
   assert.equal(fixture.activeLocks.size, 0);
+});
+
+test("Prune rebuilds latest with a canonically recovered same-key scoped identity", async () => {
+  const replacement = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows({
+      dayUtc: "2026-08-01",
+      connectorId: 99,
+      pollutantCode: "o3",
+      timeseriesId: 9901,
+    }).map((row) => ({ ...row, value: row.value + 1 })),
+    writerLimits: LIMITS,
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: BACKED_UP_AT_UTC,
+  });
+  const replacementRoot = replacement.v3_hierarchy.scoped_manifest;
+  const diagnosticEvents = [];
+  const recoveryCalls = [];
+  const fixture = buildFixture();
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+  fixture.objects.set(replacementRoot.key, Buffer.from(replacementRoot.body));
+
+  const result = await runPruneDailyObservationHistoryV3RunFinalization({
+    ...fixture.options,
+    connectorPublications: [connectorPublication],
+    finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+    diagnosticLog: (event, fields) => diagnosticEvents.push({ event, fields }),
+    recoverLatestScopedReference: async (request) => {
+      recoveryCalls.push(request);
+      assert.equal(request.source, "prune_daily");
+      assert.equal(request.reference.key, replacementRoot.key);
+      assert.equal(request.latest_scope.key, replacementRoot.key);
+      assert.equal(request.latest_scope.pollutant_code, "o3");
+      assert.equal(request.live_reference.sha256, replacementRoot.sha256);
+      assert.deepEqual(request.live_body, Buffer.from(replacementRoot.body));
+      return {
+        artifact: replacementRoot,
+        evidence: {
+          key: replacementRoot.key,
+          byte_size: replacementRoot.byte_size,
+          sha256: replacementRoot.sha256,
+          verified: true,
+          durable: true,
+        },
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(recoveryCalls.length, 1);
+  const latest = JSON.parse(fixture.objects.get(fixture.latestKey).toString("utf8"));
+  const recovered = latest.day_summaries
+    .flatMap((day) => day.scoped_roots)
+    .find((root) => root.key === replacementRoot.key);
+  assert.equal(recovered.sha256, replacementRoot.sha256);
+  assert.notEqual(
+    recovered.sha256,
+    recoveryCalls[0].reference.sha256,
+  );
+  const diagnostic = diagnosticEvents.find(({ event }) =>
+    event === "latest_global_exact_v3_scoped_reference_recovered"
+  );
+  assert.deepEqual(diagnostic.fields, {
+    day_utc: "2026-08-01",
+    connector_id: 99,
+    pollutant_code: "o3",
+    key: replacementRoot.key,
+    stale_latest_global_sha256: recoveryCalls[0].reference.sha256,
+    canonically_proven_current_sha256: replacementRoot.sha256,
+    recovery_mode: "canonical_authority_same_key_recovery",
+  });
+});
+
+test("unchanged strict latest references do not invoke Prune recovery", async () => {
+  const fixture = buildFixture();
+  let recoveryCalls = 0;
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+  const result = await runPruneDailyObservationHistoryV3RunFinalization({
+    ...fixture.options,
+    connectorPublications: [connectorPublication],
+    finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+    recoverLatestScopedReference: async () => {
+      recoveryCalls += 1;
+      throw new Error("unexpected recovery");
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(recoveryCalls, 0);
+});
+
+test("a missing Prune latest dependency is not treated as recoverable", async () => {
+  const fixture = buildFixture();
+  let recoveryCalls = 0;
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+  fixture.objects.delete(fixture.unrelatedScopedKey);
+  await assert.rejects(
+    runPruneDailyObservationHistoryV3RunFinalization({
+      ...fixture.options,
+      connectorPublications: [connectorPublication],
+      finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+      recoverLatestScopedReference: async () => {
+        recoveryCalls += 1;
+      },
+    }),
+    /V3 external publication reference is missing/,
+  );
+  assert.equal(recoveryCalls, 0);
+});
+
+test("a changed current-run Prune scope retains the strict race failure", async () => {
+  const fixture = buildFixture();
+  let recoveryCalls = 0;
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+  const replacement = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows({
+      dayUtc: "2026-08-18",
+      connectorId: 1,
+      pollutantCode: "pm25",
+      timeseriesId: 101,
+    }).map((row) => ({ ...row, value: row.value + 1 })),
+    writerLimits: LIMITS,
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: BACKED_UP_AT_UTC,
+  });
+  fixture.objects.set(
+    replacement.v3_hierarchy.scoped_manifest.key,
+    Buffer.from(replacement.v3_hierarchy.scoped_manifest.body),
+  );
+  await assert.rejects(
+    runPruneDailyObservationHistoryV3RunFinalization({
+      ...fixture.options,
+      connectorPublications: [connectorPublication],
+      finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+      recoverLatestScopedReference: async () => {
+        recoveryCalls += 1;
+      },
+    }),
+    /V3 external publication reference identity changed/,
+  );
+  assert.equal(recoveryCalls, 0);
+});
+
+test("non-Prune latest identity mismatch remains strict even with a recovery adapter", async () => {
+  const replacement = buildObservationHistoryV3SteadyStatePartition({
+    source: "integrity",
+    rows: rows({
+      dayUtc: "2026-08-01",
+      connectorId: 99,
+      pollutantCode: "o3",
+      timeseriesId: 9901,
+    }).map((row) => ({ ...row, value: row.value + 1 })),
+    writerLimits: LIMITS,
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: BACKED_UP_AT_UTC,
+  });
+  const replacementRoot = replacement.v3_hierarchy.scoped_manifest;
+  let recoveryCalls = 0;
+  const fixture = buildFixture();
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+  connectorPublication.source = "integrity";
+  fixture.objects.set(replacementRoot.key, Buffer.from(replacementRoot.body));
+
+  await assert.rejects(
+    runObservationHistoryV3RunFinalization({
+      ...fixture.options,
+      source: "integrity",
+      connectorPublications: [connectorPublication],
+      finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+      recoverLatestScopedReference: async () => {
+        recoveryCalls += 1;
+      },
+    }),
+    /V3 external publication reference identity changed/,
+  );
+  assert.equal(recoveryCalls, 0);
 });
 
 test("non-Prune fixed-source adapters reject prune-eligibility reporting", async () => {

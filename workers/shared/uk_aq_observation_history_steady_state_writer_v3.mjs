@@ -276,7 +276,17 @@ async function verifiedExternalReference(reference, getObject) {
   }
   const body = exactBuffer(object.body, reference.key);
   if (body.byteLength !== reference.byte_size || sha256Hex(body) !== reference.sha256) {
-    throw new Error(`V3 external publication reference identity changed: ${reference.key}`);
+    const error = new Error(
+      `V3 external publication reference identity changed: ${reference.key}`,
+    );
+    error.code = "V3_EXTERNAL_REFERENCE_IDENTITY_CHANGED";
+    error.actual_reference = Object.freeze({
+      key: reference.key,
+      byte_size: body.byteLength,
+      sha256: sha256Hex(body),
+    });
+    error.actual_body = body;
+    throw error;
   }
   return Object.freeze({
     key: reference.key,
@@ -1294,6 +1304,7 @@ export async function runObservationHistoryV3RunFinalization({
   diagnosticLog,
   beforePublicationStage,
   lockTimeoutMs,
+  recoverLatestScopedReference = null,
 }) {
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot, latestKey });
   if (!client?.query) throw new Error("V3 run finalization requires PostgreSQL lock client");
@@ -1494,6 +1505,13 @@ export async function runObservationHistoryV3RunFinalization({
             body: latestObject.body,
             latestKey,
           });
+          const existingLatestRoots = (
+            Array.isArray(existingLatest.payload.day_summaries)
+              ? existingLatest.payload.day_summaries
+              : []
+          ).flatMap((day) =>
+            Array.isArray(day?.scoped_roots) ? day.scoped_roots : []
+          );
           const replacementScopedManifests = partitionResults.map(
             (partition) => partition.scoped_root.artifact,
           );
@@ -1502,7 +1520,7 @@ export async function runObservationHistoryV3RunFinalization({
             existingLatest,
             connectorResults,
           });
-          const updatedLatest = updateObservationHistoryExactLeafIndexV3Latest({
+          let updatedLatest = updateObservationHistoryExactLeafIndexV3Latest({
             existingLatest,
             replacementScopedManifests,
             removedScopes,
@@ -1516,14 +1534,101 @@ export async function runObservationHistoryV3RunFinalization({
             ]),
           );
           const latestExternalByKey = new Map();
+          const recoveredScopedManifests = [];
+          const recoveredDiagnostics = [];
           for (const reference of updatedLatest.dependencies) {
             const exact = changedScopedEvidenceByKey.get(reference.key);
             if (exact) {
               assertEvidence(exact, reference, "V3 latest scoped prerequisite");
             }
-            latestExternalByKey.set(
-              reference.key,
-              await verifiedExternalReference(reference, getObject),
+            try {
+              latestExternalByKey.set(
+                reference.key,
+                await verifiedExternalReference(reference, getObject),
+              );
+            } catch (error) {
+              if (
+                exact ||
+                normalizedSource !==
+                  OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily ||
+                error?.code !== "V3_EXTERNAL_REFERENCE_IDENTITY_CHANGED" ||
+                typeof recoverLatestScopedReference !== "function"
+              ) {
+                throw error;
+              }
+              const recovered = await recoverLatestScopedReference({
+                source: normalizedSource,
+                reference,
+                latest_scope: (() => {
+                  const matches = existingLatestRoots.filter((root) =>
+                    root.key === reference.key
+                  );
+                  if (matches.length !== 1) {
+                    throw new Error(
+                      `Prune latest-global recovery scope evidence is ambiguous: ${reference.key}`,
+                    );
+                  }
+                  return matches[0];
+                })(),
+                live_reference: error.actual_reference,
+                live_body: error.actual_body,
+                observations_prefix: canonicalObservationsPrefix,
+                index_root: indexRoot,
+              });
+              const artifact = recovered?.artifact;
+              if (
+                !artifact || artifact.key !== reference.key ||
+                artifact.sha256 === reference.sha256
+              ) {
+                throw new Error(
+                  `Prune latest-global recovery returned invalid replacement: ${reference.key}`,
+                );
+              }
+              const evidence = assertEvidence(
+                recovered?.evidence,
+                artifact,
+                "Prune latest-global recovered scoped prerequisite",
+              );
+              recoveredScopedManifests.push(artifact);
+              latestExternalByKey.set(reference.key, evidence);
+              recoveredDiagnostics.push({
+                day_utc: artifact.payload.day_utc,
+                connector_id: artifact.payload.connector_id,
+                pollutant_code: artifact.payload.pollutant_code,
+                key: artifact.key,
+                stale_latest_global_sha256: reference.sha256,
+                canonically_proven_current_sha256: artifact.sha256,
+                recovery_mode: "canonical_authority_same_key_recovery",
+              });
+            }
+          }
+          if (recoveredScopedManifests.length > 0) {
+            const replacementsByKey = new Map(
+              replacementScopedManifests.map((artifact) => [artifact.key, artifact]),
+            );
+            for (const artifact of recoveredScopedManifests) {
+              replacementsByKey.set(artifact.key, artifact);
+            }
+            updatedLatest = updateObservationHistoryExactLeafIndexV3Latest({
+              existingLatest,
+              replacementScopedManifests: [...replacementsByKey.values()],
+              removedScopes,
+              indexRoot,
+              latestKey,
+            });
+            latestExternalByKey.clear();
+            for (const reference of updatedLatest.dependencies) {
+              latestExternalByKey.set(
+                reference.key,
+                await verifiedExternalReference(reference, getObject),
+              );
+            }
+          }
+          for (const fields of recoveredDiagnostics) {
+            emitV3PublicationDiagnostic(
+              diagnosticLog,
+              "latest_global_exact_v3_scoped_reference_recovered",
+              fields,
             );
           }
           const latestPlan = buildObservationHistoryIndexV3PublicationPlan({
