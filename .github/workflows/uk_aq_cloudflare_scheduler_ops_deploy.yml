@@ -64,6 +64,7 @@ jobs:
             cloudflare/scheduler/README.md \
             cloudflare/scheduler/migrations/0001_scheduler_schema.sql \
             cloudflare/scheduler/migrations/0002_scheduler_minute_slot_claim.sql \
+            cloudflare/scheduler/migrations/0003_worker_http_target.sql \
             cloudflare/scheduler/seeds/0001_github_jobs.sql
           do
             if [ ! -f "${path}" ]; then

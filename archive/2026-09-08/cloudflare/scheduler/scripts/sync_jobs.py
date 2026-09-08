@@ -5,11 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import tomllib
 
@@ -20,7 +18,6 @@ DEFAULT_TIMEZONE = "UTC"
 DEFAULT_GITHUB_REF = "main"
 DEFAULT_CLOUD_RUN_METHOD = "POST"
 DEPLOYMENT_PENDING_CLOUD_RUN_URL = "https://deployment-pending.invalid/run"
-WORKER_HTTP_SECRET_BINDING_PATTERN = re.compile(r"^UK_AQ_[A-Z0-9_]*WORKER_HTTP_SECRET$")
 
 MONTH_NAME_TO_NUMBER = {
     "JAN": 1,
@@ -61,9 +58,6 @@ SQL_COLUMNS = [
     "cloud_run_method",
     "cloud_run_headers_json",
     "cloud_run_body_json",
-    "worker_http_url",
-    "worker_http_secret_binding",
-    "worker_http_body_json",
     "dry_run",
     "notes",
 ]
@@ -116,34 +110,6 @@ def normalize_json_table(value: Any, field_name: str) -> str:
     if not isinstance(value, dict):
         raise JobsConfigError(f"Invalid {field_name}: expected a TOML table")
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-
-def require_absolute_https_url(value: Any, field_name: str) -> str:
-    url = require_string(value, field_name)
-    try:
-        parsed = urlsplit(url)
-        hostname = parsed.hostname
-        _ = parsed.port
-    except ValueError as exc:
-        raise JobsConfigError(f"Invalid {field_name}: expected an absolute HTTPS URL") from exc
-    if (
-        parsed.scheme.lower() != "https"
-        or not parsed.netloc
-        or not hostname
-        or any(character.isspace() for character in url)
-    ):
-        raise JobsConfigError(f"Invalid {field_name}: expected an absolute HTTPS URL")
-    return url
-
-
-def require_worker_http_secret_binding(value: Any, field_name: str) -> str:
-    binding = require_string(value, field_name)
-    if WORKER_HTTP_SECRET_BINDING_PATTERN.fullmatch(binding) is None:
-        raise JobsConfigError(
-            f"Invalid {field_name}: expected a name matching "
-            "^UK_AQ_[A-Z0-9_]*WORKER_HTTP_SECRET$"
-        )
-    return binding
 
 
 def normalize_cron_atom(
@@ -270,9 +236,6 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "cloud_run_method",
         "cloud_run_headers",
         "cloud_run_body",
-        "worker_http_url",
-        "worker_http_secret_binding",
-        "worker_http_body",
         "dry_run",
         "notes",
     }
@@ -283,7 +246,7 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
 
     enabled = require_bool(raw_job.get("enabled"), f"scheduler_jobs.enabled for {job_key}")
     target_type = require_string(raw_job.get("target_type"), f"scheduler_jobs.target_type for {job_key}")
-    if target_type not in {"github_workflow", "cloud_run", "worker_http"}:
+    if target_type not in {"github_workflow", "cloud_run"}:
         raise JobsConfigError(f"Invalid scheduler job {job_key}: unsupported target_type {target_type!r}")
 
     cron_expr = validate_cron_expression(raw_job.get("cron_expr"), job_key)
@@ -306,9 +269,6 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "cloud_run_method": DEFAULT_CLOUD_RUN_METHOD,
         "cloud_run_headers_json": None,
         "cloud_run_body_json": None,
-        "worker_http_url": None,
-        "worker_http_secret_binding": None,
-        "worker_http_body_json": None,
         "dry_run": dry_run,
         "notes": notes,
         "cloud_run_url_managed_by_deploy": False,
@@ -317,18 +277,14 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
     if not job["job_key"]:
         raise JobsConfigError("Invalid scheduler job: job_key must not be empty")
 
-    github_fields = {"github_repo", "github_workflow_file", "github_ref", "github_inputs"}
-    cloud_run_fields = {
-        "cloud_run_url",
-        "cloud_run_url_managed_by_deploy",
-        "cloud_run_method",
-        "cloud_run_headers",
-        "cloud_run_body",
-    }
-    worker_http_fields = {"worker_http_url", "worker_http_secret_binding", "worker_http_body"}
-
     if target_type == "github_workflow":
-        forbidden = (cloud_run_fields | worker_http_fields) & set(raw_job)
+        forbidden = {
+            "cloud_run_url",
+            "cloud_run_url_managed_by_deploy",
+            "cloud_run_method",
+            "cloud_run_headers",
+            "cloud_run_body",
+        } & set(raw_job)
         if forbidden:
             joined = ", ".join(sorted(forbidden))
             raise JobsConfigError(f"Invalid scheduler job {job_key}: github_workflow does not use {joined}")
@@ -343,8 +299,8 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
             raw_job.get("github_inputs"),
             f"scheduler_jobs.github_inputs for {job_key}",
         )
-    elif target_type == "cloud_run":
-        forbidden = (github_fields | worker_http_fields) & set(raw_job)
+    else:
+        forbidden = {"github_repo", "github_workflow_file", "github_ref", "github_inputs"} & set(raw_job)
         if forbidden:
             joined = ", ".join(sorted(forbidden))
             raise JobsConfigError(f"Invalid scheduler job {job_key}: cloud_run does not use {joined}")
@@ -374,24 +330,6 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         job["cloud_run_body_json"] = normalize_json_table(
             raw_job.get("cloud_run_body"),
             f"scheduler_jobs.cloud_run_body for {job_key}",
-        )
-    else:
-        forbidden = (github_fields | cloud_run_fields) & set(raw_job)
-        if forbidden:
-            joined = ", ".join(sorted(forbidden))
-            raise JobsConfigError(f"Invalid scheduler job {job_key}: worker_http does not use {joined}")
-
-        job["worker_http_url"] = require_absolute_https_url(
-            raw_job.get("worker_http_url"),
-            f"scheduler_jobs.worker_http_url for {job_key}",
-        )
-        job["worker_http_secret_binding"] = require_worker_http_secret_binding(
-            raw_job.get("worker_http_secret_binding"),
-            f"scheduler_jobs.worker_http_secret_binding for {job_key}",
-        )
-        job["worker_http_body_json"] = normalize_json_table(
-            raw_job.get("worker_http_body"),
-            f"scheduler_jobs.worker_http_body for {job_key}",
         )
 
     return job
@@ -446,8 +384,7 @@ def render_upsert_statement(job: dict[str, Any]) -> str:
     insert_values = ",\n  ".join(sql_literal(value) for value in values)
 
     cloud_run_url_update = (
-        "  cloud_run_url = case when scheduler_jobs.target_type = 'cloud_run' "
-        "then scheduler_jobs.cloud_run_url else excluded.cloud_run_url end"
+        "  cloud_run_url = scheduler_jobs.cloud_run_url"
         if job.get("cloud_run_url_managed_by_deploy")
         else "  cloud_run_url = excluded.cloud_run_url"
     )
@@ -464,9 +401,6 @@ def render_upsert_statement(job: dict[str, Any]) -> str:
         "  cloud_run_method = excluded.cloud_run_method",
         "  cloud_run_headers_json = excluded.cloud_run_headers_json",
         "  cloud_run_body_json = excluded.cloud_run_body_json",
-        "  worker_http_url = excluded.worker_http_url",
-        "  worker_http_secret_binding = excluded.worker_http_secret_binding",
-        "  worker_http_body_json = excluded.worker_http_body_json",
         "  dry_run = excluded.dry_run",
         "  notes = excluded.notes",
         "  updated_at = current_timestamp",

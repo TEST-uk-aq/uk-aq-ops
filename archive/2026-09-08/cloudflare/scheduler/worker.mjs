@@ -10,7 +10,6 @@ export const RESPONSE_PREVIEW_LIMIT = 1_000;
 export const GITHUB_USER_AGENT = "uk-aq-cloudflare-cron-scheduler";
 export const TRIGGER_SOURCE_CLOUDFLARE_CRON = "cloudflare_cron";
 export const TRIGGER_SOURCE_EXTERNAL_WATCHDOG = "external_watchdog";
-export const WORKER_HTTP_SECRET_BINDING_PATTERN = /^UK_AQ_[A-Z0-9_]*WORKER_HTTP_SECRET$/;
 
 const SCHEDULER_TRIGGER_HEADER = "x-uk-aq-scheduler-trigger";
 const SCHEDULER_TRIGGER_SECRET_MAX_LENGTH = 512;
@@ -150,30 +149,6 @@ function normalizeTimezone(value) {
     return normalized;
   }
   throw new Error(`Unsupported timezone ${JSON.stringify(normalized)}; expected UTC`);
-}
-
-function normalizeWorkerHttpUrl(value, jobKey) {
-  const normalized = trimText(value);
-  let parsed;
-  try {
-    parsed = new URL(normalized);
-  } catch {
-    throw new Error(`Invalid scheduler job ${jobKey}: worker_http_url must be an absolute HTTPS URL`);
-  }
-  if (parsed.protocol !== "https:" || !parsed.hostname) {
-    throw new Error(`Invalid scheduler job ${jobKey}: worker_http_url must be an absolute HTTPS URL`);
-  }
-  return normalized;
-}
-
-function normalizeWorkerHttpSecretBinding(value, jobKey) {
-  const binding = trimText(value);
-  if (!WORKER_HTTP_SECRET_BINDING_PATTERN.test(binding)) {
-    throw new Error(
-      `Invalid scheduler job ${jobKey}: worker_http_secret_binding must match ${WORKER_HTTP_SECRET_BINDING_PATTERN}`,
-    );
-  }
-  return binding;
 }
 
 function normalizeCronAtom(token, fieldName, min, max, names = {}) {
@@ -345,7 +320,7 @@ function parseSchedulerJobRow(row) {
 
   const enabled = parseBinaryFlag(row.enabled, `scheduler_jobs.enabled for ${jobKey}`);
   const targetType = trimText(row.target_type);
-  if (targetType !== "github_workflow" && targetType !== "cloud_run" && targetType !== "worker_http") {
+  if (targetType !== "github_workflow" && targetType !== "cloud_run") {
     throw new Error(`Invalid scheduler job ${jobKey}: unsupported target_type ${JSON.stringify(targetType)}`);
   }
 
@@ -379,7 +354,7 @@ function parseSchedulerJobRow(row) {
     normalized.github_workflow_file = githubWorkflowFile;
     normalized.github_ref = githubRef;
     normalized.github_inputs = parseJsonObject(row.github_inputs_json, `scheduler_jobs.github_inputs_json for ${jobKey}`);
-  } else if (targetType === "cloud_run") {
+  } else {
     const cloudRunUrl = trimText(row.cloud_run_url);
     if (!cloudRunUrl) {
       throw new Error(`Invalid scheduler job ${jobKey}: cloud_run requires cloud_run_url`);
@@ -389,16 +364,6 @@ function parseSchedulerJobRow(row) {
     normalized.cloud_run_method = trimText(row.cloud_run_method) || "POST";
     normalized.cloud_run_headers = parseJsonObject(row.cloud_run_headers_json, `scheduler_jobs.cloud_run_headers_json for ${jobKey}`);
     normalized.cloud_run_body = parseJsonBody(row.cloud_run_body_json, `scheduler_jobs.cloud_run_body_json for ${jobKey}`);
-  } else {
-    normalized.worker_http_url = normalizeWorkerHttpUrl(row.worker_http_url, jobKey);
-    normalized.worker_http_secret_binding = normalizeWorkerHttpSecretBinding(
-      row.worker_http_secret_binding,
-      jobKey,
-    );
-    normalized.worker_http_body = parseJsonObject(
-      row.worker_http_body_json,
-      `scheduler_jobs.worker_http_body_json for ${jobKey}`,
-    );
   }
 
   return normalized;
@@ -519,9 +484,6 @@ export function createSchedulerStore(db) {
             cloud_run_method,
             cloud_run_headers_json,
             cloud_run_body_json,
-            worker_http_url,
-            worker_http_secret_binding,
-            worker_http_body_json,
             dry_run,
             notes,
             created_at,
@@ -719,47 +681,12 @@ async function dispatchCloudRun(job, env) {
       };
 }
 
-async function dispatchWorkerHttp(job, env) {
-  const binding = job.worker_http_secret_binding;
-  const secret = trimText(await readSecret(env?.[binding]));
-  if (!secret) {
-    throw new Error(`Missing required Worker secret: ${binding}`);
-  }
-
-  const response = await fetch(job.worker_http_url, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json; charset=utf-8",
-      "x-uk-aq-worker-http-secret": secret,
-    },
-    body: JSON.stringify(job.worker_http_body ?? {}),
-  });
-  const responseText = await response.text();
-  const responsePreview = truncatePreview(responseText.split(secret).join("[REDACTED]"));
-  return response.ok
-    ? {
-        ok: true,
-        response_status: response.status,
-        response_preview: responsePreview,
-      }
-    : {
-        ok: false,
-        response_status: response.status,
-        response_preview: responsePreview,
-        reason: `Worker HTTP dispatch failed with HTTP ${response.status}`,
-      };
-}
-
 async function dispatchTarget(job, env) {
   if (job.target_type === "github_workflow") {
     return dispatchGitHubWorkflow(job, env);
   }
   if (job.target_type === "cloud_run") {
     return dispatchCloudRun(job, env);
-  }
-  if (job.target_type === "worker_http") {
-    return dispatchWorkerHttp(job, env);
   }
   throw new Error(`Unsupported target_type ${JSON.stringify(job.target_type)}`);
 }

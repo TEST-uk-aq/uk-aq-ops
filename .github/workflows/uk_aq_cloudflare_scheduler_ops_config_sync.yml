@@ -81,7 +81,7 @@ jobs:
             --remote \
             --config "${WRANGLER_CONFIG}" \
             --json \
-            --command "select job_key, enabled, target_type, cron_expr, timezone, github_repo, github_workflow_file, github_ref, github_inputs_json, cloud_run_url, cloud_run_method, cloud_run_headers_json, cloud_run_body_json, dry_run, notes from scheduler_jobs order by job_key" \
+            --command "select job_key, enabled, target_type, cron_expr, timezone, github_repo, github_workflow_file, github_ref, github_inputs_json, cloud_run_url, cloud_run_method, cloud_run_headers_json, cloud_run_body_json, worker_http_url, worker_http_secret_binding, worker_http_body_json, dry_run, notes from scheduler_jobs order by job_key" \
             > /tmp/scheduler_jobs_remote.json
 
           python3 - <<'PY'
