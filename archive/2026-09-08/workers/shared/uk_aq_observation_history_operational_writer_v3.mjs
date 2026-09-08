@@ -612,8 +612,6 @@ export function createObservationHistoryV3CanonicalDayPublisher({
 export function createObservationHistoryV3CanonicalAggregatePublisher({
   r2,
   getObject,
-  putObject,
-  listAllCommonPrefixes,
   recordDurableEvidence,
   observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
   hierarchyFinalizer = finalizeR2HistoryV2ObservationsManifestHierarchy,
@@ -626,11 +624,6 @@ export function createObservationHistoryV3CanonicalAggregatePublisher({
       observationsPrefix,
       affectedDaysUtc,
       writeR2: true,
-      adapters: {
-        getObject,
-        putObject,
-        listAllCommonPrefixes,
-      },
     });
     if (result?.ok !== true) {
       throw new Error("Canonical observation aggregate finalisation failed");
@@ -706,8 +699,6 @@ function v3OnlyOptions({
     createObservationHistoryV3CanonicalAggregatePublisher({
       r2: options.r2,
       getObject,
-      putObject: options.putObject,
-      listAllCommonPrefixes: options.listAllCommonPrefixes,
       recordDurableEvidence,
       observationsPrefix: options.observationsPrefix,
     });

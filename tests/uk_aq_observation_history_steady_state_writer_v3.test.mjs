@@ -283,6 +283,59 @@ function buildFixture({
   };
 }
 
+function finalizationEvidence({
+  dayUtc,
+  connectorId,
+  pollutantCode,
+  timeseriesId,
+  objects,
+}) {
+  const partition = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily",
+    rows: rows({ dayUtc, connectorId, pollutantCode, timeseriesId }),
+    writerLimits: LIMITS,
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: BACKED_UP_AT_UTC,
+  });
+  const artifact = partition.v3_hierarchy.scoped_manifest;
+  objects.set(artifact.key, Buffer.from(artifact.body));
+  return {
+    ok: true,
+    status: "connector_publication_complete",
+    source: "prune_daily",
+    connector_publication_complete: true,
+    connector_results: [{
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      partitions: [{
+        scope: partition.scope,
+        scoped_root: {
+          artifact,
+          evidence: {
+            key: artifact.key,
+            byte_size: artifact.byte_size,
+            sha256: artifact.sha256,
+            verified: true,
+            durable: true,
+          },
+        },
+      }],
+      canonical: {
+        connector_scope_verified: true,
+        parent_state_reread_under_lock: true,
+        connector_manifest: evidence(
+          `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
+        ),
+        connector_manifest_payload: {},
+        removed_pollutant_codes: [],
+        removed_scopes: [],
+      },
+      v3_exact_publication: { ok: true, status: "written" },
+    }],
+    complete_day_replacement_results: [],
+  };
+}
+
 test("run-level v3 writer releases each lock phase, merges days, and publishes latest once", async () => {
   const fixture = buildFixture();
   const result = await runPruneDailyObservationHistoryV3Writer(fixture.options);
@@ -482,6 +535,119 @@ test("split Prune API finalizes two exact affected days and shared parents once"
     fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
     1,
   );
+});
+
+test("run finalization admits and diagnoses day, aggregate and latest stages", async () => {
+  const fixture = buildFixture();
+  const admittedStages = [];
+  const diagnosticEvents = [];
+  const connectorPublications = [
+    finalizationEvidence({
+      dayUtc: "2026-08-18",
+      connectorId: 1,
+      pollutantCode: "pm25",
+      timeseriesId: 101,
+      objects: fixture.objects,
+    }),
+    finalizationEvidence({
+      dayUtc: "2026-08-20",
+      connectorId: 2,
+      pollutantCode: "no2",
+      timeseriesId: 202,
+      objects: fixture.objects,
+    }),
+  ];
+
+  const result = await runPruneDailyObservationHistoryV3RunFinalization({
+    ...fixture.options,
+    connectorPublications,
+    finalizeCanonicalDayManifests: async ({
+      day_utc: dayUtc,
+      changed_connectors: changed,
+    }) => {
+      const changedIds = changed.map((entry) => entry.connector_id);
+      return {
+        canonical_day_authority_verified: true,
+        parent_state_reread_under_lock: true,
+        day_utc: dayUtc,
+        current_connector_ids: [],
+        changed_connector_ids: changedIds,
+        final_connector_ids: changedIds,
+        day_manifest: evidence(
+          `history/v3/observations/day_utc=${dayUtc}/manifest.json`,
+        ),
+      };
+    },
+    beforePublicationStage: ({ stage, ...fields }) => {
+      admittedStages.push({ stage, fields });
+    },
+    diagnosticLog: (event, fields) => {
+      diagnosticEvents.push({ event, fields });
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(admittedStages.map(({ stage }) => stage), [
+    "run_finalization",
+    "canonical_day_finalization",
+    "canonical_day_finalization",
+    "canonical_aggregate_finalization",
+    "latest_global_exact_v3_finalization",
+  ]);
+  assert.deepEqual(diagnosticEvents.map(({ event }) => event), [
+    "run_finalization_start",
+    "canonical_day_finalization_start",
+    "canonical_day_finalization_complete",
+    "canonical_day_finalization_start",
+    "canonical_day_finalization_complete",
+    "canonical_aggregate_finalization_start",
+    "canonical_aggregate_finalization_complete",
+    "latest_global_exact_v3_finalization_start",
+    "latest_global_exact_v3_finalization_complete",
+    "run_finalization_complete",
+  ]);
+  assert.deepEqual(
+    diagnosticEvents
+      .filter(({ event }) => event === "canonical_day_finalization_start")
+      .map(({ fields }) => fields.day_utc),
+    ["2026-08-18", "2026-08-20"],
+  );
+});
+
+test("run finalization preserves a budget-admission error at a safe stage boundary", async () => {
+  const fixture = buildFixture();
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+  const budgetError = Object.assign(new Error("fixture budget exhausted"), {
+    name: "PhaseBHistoryBudgetExhaustedError",
+    code: "PHASE_B_HISTORY_BUDGET_EXHAUSTED",
+    operation: "v3_canonical_day_finalization_start",
+  });
+  const diagnosticEvents = [];
+
+  await assert.rejects(
+    runPruneDailyObservationHistoryV3RunFinalization({
+      ...fixture.options,
+      connectorPublications: [connectorPublication],
+      beforePublicationStage: ({ stage }) => {
+        if (stage === "canonical_day_finalization") throw budgetError;
+      },
+      diagnosticLog: (event) => diagnosticEvents.push(event),
+    }),
+    (error) => error === budgetError,
+  );
+  assert.deepEqual(diagnosticEvents, [
+    "run_finalization_start",
+    "canonical_day_finalization_failed",
+    "run_finalization_failed",
+  ]);
+  assert.equal(fixture.dayCalls.length, 0);
+  assert.equal(fixture.globalLockCount(), 0);
 });
 
 test("Prune retry removes a stale latest scope after canonical connector authority is already exact", async () => {

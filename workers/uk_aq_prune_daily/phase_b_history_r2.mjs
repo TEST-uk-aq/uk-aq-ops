@@ -22,6 +22,7 @@ import {
   r2GetObject,
   r2HeadObject,
   r2ListAllObjects,
+  r2ListObjectsV2,
   r2PutObject,
   R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS,
   R2_PUBLICATION_SAFETY_MARGIN_MS,
@@ -3694,6 +3695,78 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     return finalizeObservationV2Run({ client, runtime, publishedCandidates, diagnostics });
   }
   resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
+  const affectedDays = uniqueSorted(
+    publishedCandidates.map(({ candidate }) => candidate.day_utc),
+  );
+  const finalizationFields = {
+    connector_count: publishedCandidates.length,
+    affected_days_utc: affectedDays,
+  };
+  let finalizationStage = "run_finalization";
+  const assertFinalizationRequestBudget = (operation, requestCount, fields = {}) => {
+    assertBudget(runtime, operation, {
+      ...finalizationFields,
+      publication_stage: finalizationStage,
+      ...fields,
+    }, (requestCount * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS);
+  };
+  const finalizationGetObject = async ({ r2, key }) => {
+    assertFinalizationRequestBudget("v3_run_finalization_r2_read", 1, { key });
+    return await r2GetObject({ r2: r2 || runtime.r2, key });
+  };
+  const finalizationPutIfChanged = async (object) => {
+    // HEAD + PUT + GET is one retry-safe idempotent publication operation.
+    assertFinalizationRequestBudget("v3_run_finalization_json_artifact", 3, {
+      key: object?.key || null,
+    });
+    return await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
+  };
+  const finalizationPutObject = async (object) => {
+    // The hierarchy finalizer reads the changed object back immediately. Admit
+    // the complete PUT + verification pair before creating new authority.
+    assertFinalizationRequestBudget("v3_run_finalization_hierarchy_artifact", 2, {
+      key: object?.key || null,
+    });
+    return await r2PutObject({ ...object, r2: object?.r2 || runtime.r2 });
+  };
+  const finalizationListAllCommonPrefixes = async ({
+    r2,
+    prefix,
+    delimiter = "/",
+    max_keys = 1000,
+  }) => {
+    const prefixes = [];
+    let continuationToken = null;
+    for (;;) {
+      assertFinalizationRequestBudget("v3_run_finalization_r2_list", 1, {
+        prefix,
+        continuation_token_present: continuationToken !== null,
+      });
+      const page = await r2ListObjectsV2({
+        r2: r2 || runtime.r2,
+        prefix,
+        continuation_token: continuationToken,
+        max_keys,
+        delimiter,
+      });
+      prefixes.push(...(
+        Array.isArray(page.common_prefixes) ? page.common_prefixes : []
+      ));
+      if (!page.next_token) break;
+      continuationToken = page.next_token;
+    }
+    return Array.from(new Set(prefixes)).sort((left, right) =>
+      left.localeCompare(right)
+    );
+  };
+  const diagnosticLog = (event, fields = {}) => {
+    const severity = event.endsWith("_failed") ? "ERROR" : "INFO";
+    logPhaseB(runtime, severity, `phase_b_history_v3_${event}`, fields);
+  };
+  const beforePublicationStage = ({ stage, ...fields }) => {
+    finalizationStage = stage;
+    assertFinalizationRequestBudget(`v3_${stage}_start`, 1, fields);
+  };
   const result = await runOperationalPruneDailyObservationHistoryV3RunFinalization({
     env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
     client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
@@ -3701,6 +3774,12 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
     diagnostics, diagnosticEnvironment: runtime.environment,
     lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+    getObject: finalizationGetObject,
+    putIfChanged: finalizationPutIfChanged,
+    putObject: finalizationPutObject,
+    listAllCommonPrefixes: finalizationListAllCommonPrefixes,
+    diagnosticLog,
+    beforePublicationStage,
   });
   if (result.ok !== true || result.canonical_aggregate_result?.canonical_aggregate_authority_verified !== true ||
       result.v3_publication?.latest_global?.ok !== true) {
@@ -6545,7 +6624,7 @@ export async function runPhaseBBackup({
             next_action: "retry_gate_completion",
           });
         }
-        logStructured("INFO", "phase_b_history_v2_run_finalization_complete", {
+        logStructured("INFO", `phase_b_history_${runtime.history_write_version}_run_finalization_complete`, {
           run_id: runId,
           affected_days_utc: finalized.result.affected_days_utc,
           connector_publication_count: publishedCandidates.length,
@@ -6628,13 +6707,17 @@ export async function runPhaseBBackup({
             error: message,
           });
         }
-        logStructured(stoppedForBudget ? "WARNING" : "ERROR", "phase_b_history_v2_run_finalization_failed", {
-          run_id: runId,
-          connector_publication_count: publishedCandidates.length,
-          connector_gate_completed_count: 0,
-          stopped_for_budget: stoppedForBudget,
-          error: message,
-        });
+        logStructured(
+          stoppedForBudget ? "WARNING" : "ERROR",
+          `phase_b_history_${runtime.history_write_version}_run_finalization_failed`,
+          {
+            run_id: runId,
+            connector_publication_count: publishedCandidates.length,
+            connector_gate_completed_count: 0,
+            stopped_for_budget: stoppedForBudget,
+            error: message,
+          },
+        );
       }
     }
 

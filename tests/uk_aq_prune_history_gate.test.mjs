@@ -861,6 +861,59 @@ test("v2 run finalization is not invoked when its conservative allowance no long
   assert.equal(gateCalls, 0);
 });
 
+test("v3 run-finalization admission exhaustion propagates before connector gating", async () => {
+  let nowMs = 0;
+  const runtime = {
+    run_budget: createPhaseBRunBudgetForTest({
+      nowMs: () => nowMs,
+      startedAtMs: 0,
+      maxSecondsPerRun: 1_740,
+      stopBeforeTimeoutSeconds: 60,
+    }),
+    history_write_version: "v3",
+    writer_git_sha: "4".repeat(40),
+    committed_prefix: "history/v3/observations",
+    r2: {},
+    environment: "TEST",
+  };
+  nowMs = runtime.run_budget.deadline_ms - 125_000;
+  const published = publishedCandidateForFinalizationTest();
+  published.exportResult.v3_connector_publication = {
+    ok: true,
+    status: "connector_publication_complete",
+    source: "prune_daily",
+    connector_publication_complete: true,
+    connector_results: [{
+      day_utc: published.candidate.day_utc,
+      connector_id: published.candidate.connector_id,
+      partitions: [{ scope: {}, scoped_root: {} }],
+      canonical: {
+        connector_scope_verified: true,
+        parent_state_reread_under_lock: true,
+      },
+      v3_exact_publication: { ok: true, status: "written" },
+    }],
+    complete_day_replacement_results: [],
+  };
+  let gateCalls = 0;
+
+  await assert.rejects(
+    phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
+      client: { query: async () => ({ rows: [] }) },
+      runtime,
+      runId: "v3-budget-finalization",
+      publishedCandidates: [published],
+      completeCandidateAndGate: async () => { gateCalls += 1; },
+    }),
+    (error) => {
+      assert.equal(error.code, "PHASE_B_HISTORY_BUDGET_EXHAUSTED");
+      assert.equal(error.operation, "v3_run_finalization_start");
+      return true;
+    },
+  );
+  assert.equal(gateCalls, 0);
+});
+
 test("a later connector failure does not prevent a verified earlier connector from finalizing and gating", async () => {
   const runtime = {
     run_budget: createPhaseBRunBudgetForTest({

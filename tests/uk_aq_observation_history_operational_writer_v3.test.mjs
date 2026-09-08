@@ -595,16 +595,27 @@ test("day publisher fails closed on changed and unchanged connector drift", asyn
 test("aggregate publisher returns durable identities for hierarchy objects", async () => {
   const key = "history/v2/observations/_manifests/manifest.json";
   const body = Buffer.from('{"kind":"test"}', "utf8");
+  const getObject = async ({ key: requested }) => {
+    assert.equal(requested, key);
+    return { body };
+  };
+  const putObject = async () => ({ ok: true });
+  const listAllCommonPrefixes = async () => [];
   const publisher = createObservationHistoryV3CanonicalAggregatePublisher({
     r2: { bucket: "test" },
-    getObject: async ({ key: requested }) => {
-      assert.equal(requested, key);
-      return { body };
-    },
+    getObject,
+    putObject,
+    listAllCommonPrefixes,
     recordDurableEvidence: async () => ({ durable: true }),
     hierarchyFinalizer: async (options) => {
       assert.deepEqual(options.affectedDaysUtc, [DAY_UTC]);
       assert.equal(options.writeR2, true);
+      assert.equal(options.adapters.getObject, getObject);
+      assert.equal(options.adapters.putObject, putObject);
+      assert.equal(
+        options.adapters.listAllCommonPrefixes,
+        listAllCommonPrefixes,
+      );
       return { ok: true, objects: [{ key }] };
     },
   });

@@ -18,7 +18,7 @@ export const R2_REQUEST_RETRY_DELAYS_MS = Object.freeze(
   ),
 );
 export const R2_REQUEST_WORST_CASE_DURATION_MS =
-  // Four 30-second attempts plus 500+1000+2000ms backoff.
+  // Four complete request-and-response-body attempts plus 500+1000+2000ms backoff.
   (R2_REQUEST_MAX_ATTEMPTS * R2_REQUEST_TIMEOUT_MS) +
   R2_REQUEST_RETRY_DELAYS_MS.reduce((sum, delayMs) => sum + delayMs, 0);
 export const R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS =
@@ -255,6 +255,7 @@ export async function fetchWithTimeout(
   init = {},
   timeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
   fetchImpl = globalThis.fetch,
+  consumeResponse = null,
 ) {
   const boundedTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
     ? Math.trunc(Number(timeoutMs))
@@ -268,10 +269,13 @@ export async function fetchWithTimeout(
   }, boundedTimeoutMs);
 
   try {
-    return await fetchImpl(url, {
+    const response = await fetchImpl(url, {
       ...init,
       signal: controller.signal,
     });
+    return typeof consumeResponse === "function"
+      ? await consumeResponse(response)
+      : response;
   } catch (error) {
     if (timedOut) {
       let target = "external service";
@@ -354,21 +358,53 @@ function computeR2RetryDelayMs(attempt) {
   );
 }
 
-async function fetchR2WithRetry({ method, buildRequest, body = undefined }) {
+function cancelResponseBody(response) {
+  try {
+    const cancelled = response?.body?.cancel?.();
+    if (cancelled && typeof cancelled.catch === "function") {
+      void cancelled.catch(() => {});
+    }
+  } catch {
+    // A retry does not depend on best-effort disposal of the failed response.
+  }
+}
+
+async function fetchR2WithRetry({
+  method,
+  buildRequest,
+  body = undefined,
+  consumeResponse = null,
+}) {
   for (let attempt = 1; attempt <= R2_REQUEST_MAX_ATTEMPTS; attempt += 1) {
     const request = buildRequest();
     try {
-      const response = await fetchWithTimeout(request.url, {
-        method,
-        headers: request.headers,
-        body,
-      });
-      if (
-        response.ok ||
-        !isRetryableR2Status(response.status) ||
-        attempt === R2_REQUEST_MAX_ATTEMPTS
-      ) {
-        return response;
+      const attemptResult = await fetchWithTimeout(
+        request.url,
+        {
+          method,
+          headers: request.headers,
+          body,
+        },
+        R2_REQUEST_TIMEOUT_MS,
+        globalThis.fetch,
+        async (response) => {
+          if (
+            isRetryableR2Status(response.status) &&
+            attempt < R2_REQUEST_MAX_ATTEMPTS
+          ) {
+            cancelResponseBody(response);
+            return { retry: true, value: null };
+          }
+          return {
+            retry: false,
+            value: typeof consumeResponse === "function"
+              ? await consumeResponse(response)
+              : response,
+          };
+        },
+      );
+      if (!attemptResult.retry) {
+        return attemptResult.value;
       }
     } catch (error) {
       if (
@@ -408,7 +444,7 @@ export async function r2PutObject({
   }
   const bufferBody = body instanceof Uint8Array ? body : Buffer.from(body);
   const payloadHash = createHash("sha256").update(bufferBody).digest("hex");
-  const response = await fetchR2WithRetry({
+  const { response, errorText } = await fetchR2WithRetry({
     method: "PUT",
     body: bufferBody,
     buildRequest: () => buildAwsSignedRequest({
@@ -428,10 +464,13 @@ export async function r2PutObject({
           : {}),
       },
     }),
+    consumeResponse: async (response) => ({
+      response,
+      errorText: response.ok ? "" : await readResponseText(response, 4000),
+    }),
   });
   if (!response.ok) {
-    const text = await readResponseText(response, 4000);
-    throw new Error(`R2 PUT failed (${response.status}) key=${key}: ${text}`);
+    throw new Error(`R2 PUT failed (${response.status}) key=${key}: ${errorText}`);
   }
 
   return {
@@ -446,7 +485,7 @@ export async function r2PutObject({
 
 export async function r2CopyObject({ r2, source_key, dest_key }) {
   const copySource = `/${r2.bucket}/${source_key.split("/").map((part) => encodeRfc3986(part)).join("/")}`;
-  const response = await fetchR2WithRetry({
+  const { response, errorText } = await fetchR2WithRetry({
     method: "PUT",
     buildRequest: () => buildAwsSignedRequest({
       method: "PUT",
@@ -460,10 +499,13 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
         "x-amz-copy-source": copySource,
       },
     }),
+    consumeResponse: async (response) => ({
+      response,
+      errorText: response.ok ? "" : await readResponseText(response, 4000),
+    }),
   });
   if (!response.ok) {
-    const text = await readResponseText(response, 4000);
-    throw new Error(`R2 COPY failed (${response.status}) ${source_key} -> ${dest_key}: ${text}`);
+    throw new Error(`R2 COPY failed (${response.status}) ${source_key} -> ${dest_key}: ${errorText}`);
   }
 
   return {
@@ -481,7 +523,7 @@ export async function r2HeadObject({ r2, key }) {
     );
     return sha256 ? { ...result, sha256 } : result;
   }
-  const response = await fetchR2WithRetry({
+  const { response, errorText } = await fetchR2WithRetry({
     method: "HEAD",
     buildRequest: () => buildAwsSignedRequest({
       method: "HEAD",
@@ -495,6 +537,12 @@ export async function r2HeadObject({ r2, key }) {
         "x-amz-checksum-mode": "ENABLED",
       },
     }),
+    consumeResponse: async (response) => ({
+      response,
+      errorText: response.ok || response.status === 404
+        ? ""
+        : await readResponseText(response, 2000),
+    }),
   });
 
   if (response.status === 404) {
@@ -505,8 +553,7 @@ export async function r2HeadObject({ r2, key }) {
   }
 
   if (!response.ok) {
-    const text = await readResponseText(response, 2000);
-    throw new Error(`R2 HEAD failed (${response.status}) key=${key}: ${text}`);
+    throw new Error(`R2 HEAD failed (${response.status}) key=${key}: ${errorText}`);
   }
 
   const bytesHeader = response.headers.get("content-length");
@@ -526,7 +573,7 @@ export async function r2GetObject({ r2, key }) {
   if (r2?.adapter?.getObject) {
     return r2.adapter.getObject({ key });
   }
-  const response = await fetchR2WithRetry({
+  const { response, arrayBuffer, errorText } = await fetchR2WithRetry({
     method: "GET",
     buildRequest: () => buildAwsSignedRequest({
       method: "GET",
@@ -537,14 +584,17 @@ export async function r2GetObject({ r2, key }) {
       bucket: r2.bucket,
       objectKey: key,
     }),
+    consumeResponse: async (response) => ({
+      response,
+      arrayBuffer: response.ok ? await response.arrayBuffer() : null,
+      errorText: response.ok ? "" : await readResponseText(response, 3000),
+    }),
   });
 
   if (!response.ok) {
-    const text = await readResponseText(response, 3000);
-    throw new Error(`R2 GET failed (${response.status}) key=${key}: ${text}`);
+    throw new Error(`R2 GET failed (${response.status}) key=${key}: ${errorText}`);
   }
 
-  const arrayBuffer = await response.arrayBuffer();
   return {
     key,
     bytes: arrayBuffer.byteLength,
@@ -621,7 +671,7 @@ export async function r2ListObjectsV2({
     query.delimiter = delimiter;
   }
 
-  const response = await fetchR2WithRetry({
+  const { response, text: xml } = await fetchR2WithRetry({
     method: "GET",
     buildRequest: () => buildAwsSignedRequest({
       method: "GET",
@@ -633,14 +683,17 @@ export async function r2ListObjectsV2({
       objectKey: "",
       query,
     }),
+    consumeResponse: async (response) => ({
+      response,
+      text: await response.text(),
+    }),
   });
 
   if (!response.ok) {
-    const text = await readResponseText(response, 4000);
+    const text = xml.length <= 4000 ? xml : xml.slice(0, 4000);
     throw new Error(`R2 LIST failed (${response.status}) prefix=${prefix}: ${text}`);
   }
 
-  const xml = await response.text();
   const parsed = parseListObjectsXml(xml);
   if (require_valid_listing) {
     const truncated = xml.match(/<IsTruncated>(true|false)<\/IsTruncated>/);
@@ -733,7 +786,7 @@ export async function r2DeleteObjects({ r2, keys }) {
   const payloadHash = createHash("sha256").update(bodyBuffer).digest("hex");
   const contentMd5 = createHash("md5").update(bodyBuffer).digest("base64");
 
-  const response = await fetchR2WithRetry({
+  const { response, text: xml } = await fetchR2WithRetry({
     method: "POST",
     body: bodyBuffer,
     buildRequest: () => buildAwsSignedRequest({
@@ -752,14 +805,17 @@ export async function r2DeleteObjects({ r2, keys }) {
         "content-md5": contentMd5,
       },
     }),
+    consumeResponse: async (response) => ({
+      response,
+      text: await response.text(),
+    }),
   });
 
   if (!response.ok) {
-    const text = await readResponseText(response, 4000);
+    const text = xml.length <= 4000 ? xml : xml.slice(0, 4000);
     throw new Error(`R2 delete objects failed (${response.status}): ${text}`);
   }
 
-  const xml = await response.text();
   const deleted = [...xml.matchAll(/<Deleted>[\s\S]*?<Key>([^<]+)<\/Key>[\s\S]*?<\/Deleted>/g)]
     .map((match) => decodeXmlEntities(match[1]));
   const errors = [...xml.matchAll(/<Error>[\s\S]*?<Key>([^<]+)<\/Key>[\s\S]*?<Code>([^<]+)<\/Code>[\s\S]*?<Message>([^<]+)<\/Message>[\s\S]*?<\/Error>/g)]

@@ -7,6 +7,7 @@ import {
   R2_REQUEST_RETRY_DELAYS_MS,
   R2_REQUEST_TIMEOUT_MS,
   R2_REQUEST_WORST_CASE_DURATION_MS,
+  r2GetObject,
   r2PutObject,
 } from "../workers/shared/r2_sigv4.mjs";
 
@@ -63,6 +64,68 @@ test("fetchWithTimeout aborts a hung request with an actionable error", async ()
     /POST request to https:\/\/example\.invalid\/hung timed out after 5ms/,
   );
   assert.equal(observedAbort, true);
+});
+
+test("fetchWithTimeout keeps the timeout active while consuming a response body", async () => {
+  let observedBodyAbort = false;
+  const headersOnlyFetch = async (_url, init) => ({
+    ok: true,
+    status: 200,
+    arrayBuffer: async () => await new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => {
+        observedBodyAbort = true;
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+    }),
+  });
+
+  await assert.rejects(
+    () => fetchWithTimeout(
+      "https://example.invalid/slow-body",
+      { method: "GET" },
+      5,
+      headersOnlyFetch,
+      async (response) => await response.arrayBuffer(),
+    ),
+    /GET request to https:\/\/example\.invalid\/slow-body timed out after 5ms/,
+  );
+  assert.equal(observedBodyAbort, true);
+});
+
+test("r2GetObject retries a retryable response-body transport failure", async () => {
+  const restoreSleep = installImmediateSleep();
+  const originalFetch = globalThis.fetch;
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        arrayBuffer: async () => {
+          throw new TypeError("fetch failed", {
+            cause: Object.assign(new Error("body socket reset"), {
+              code: "ECONNRESET",
+            }),
+          });
+        },
+      };
+    }
+    return new Response("complete-body", { status: 200 });
+  };
+
+  try {
+    const result = await r2GetObject({
+      r2: TEST_R2_CONFIG,
+      key: "history/v2/test/retry-body.json",
+    });
+    assert.equal(attempts, 2);
+    assert.equal(result.body.toString("utf8"), "complete-body");
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreSleep();
+  }
 });
 
 test("r2PutObject retries a transient connection reset and succeeds", async () => {

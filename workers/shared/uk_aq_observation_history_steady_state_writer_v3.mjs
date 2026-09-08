@@ -1238,6 +1238,8 @@ export async function runObservationHistoryV3RunFinalization({
   runGlobalFinalizer = runCanonicalGlobalIndexFinalizer,
   diagnostics,
   diagnosticEnvironment,
+  diagnosticLog,
+  beforePublicationStage,
   lockTimeoutMs,
 }) {
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot, latestKey });
@@ -1272,134 +1274,280 @@ export async function runObservationHistoryV3RunFinalization({
 
   const affectedDays = [...new Set(connectorResults.map((entry) => entry.day_utc))]
     .sort(bytewiseCompare);
+  const partitionResults = connectorResults.flatMap(
+    (connectorResult) => connectorResult.partitions,
+  );
+  const runFields = {
+    affected_days_utc: Object.freeze([...affectedDays]),
+    connector_count: connectorResults.length,
+    affected_reference_count: partitionResults.length,
+  };
+  const runStartedAtMs = Date.now();
   const dayResults = [];
-  for (const dayUtc of affectedDays) {
-    const changedConnectors = connectorResults
-      .filter((entry) => entry.day_utc === dayUtc)
-      .sort((left, right) => left.connector_id - right.connector_id);
-    const changedConnectorIds = changedConnectors.map((entry) => entry.connector_id);
-    const result = await runDayFinalizer({
+  try {
+    assertV3PublicationStageBudget(
+      beforePublicationStage,
+      "run_finalization",
+      runFields,
+    );
+    emitV3PublicationDiagnostic(diagnosticLog, "run_finalization_start", runFields);
+    for (const dayUtc of affectedDays) {
+      const changedConnectors = connectorResults
+        .filter((entry) => entry.day_utc === dayUtc)
+        .sort((left, right) => left.connector_id - right.connector_id);
+      const changedConnectorIds = changedConnectors.map((entry) => entry.connector_id);
+      const dayFields = {
+        day_utc: dayUtc,
+        connector_count: changedConnectors.length,
+        affected_reference_count: changedConnectors.reduce(
+          (sum, entry) => sum + entry.partitions.length,
+          0,
+        ),
+      };
+      const dayStartedAtMs = Date.now();
+      let result;
+      try {
+        assertV3PublicationStageBudget(
+          beforePublicationStage,
+          "canonical_day_finalization",
+          dayFields,
+        );
+        emitV3PublicationDiagnostic(
+          diagnosticLog,
+          "canonical_day_finalization_start",
+          dayFields,
+        );
+        result = await runDayFinalizer({
+          client,
+          dayUtc,
+          diagnostics,
+          diagnosticEnvironment,
+          timeoutMs: lockTimeoutMs,
+          finalize: async () => {
+            const finalized = await finalizeCanonicalDayManifests({
+              source: normalizedSource,
+              day_utc: dayUtc,
+              changed_connectors: Object.freeze(changedConnectors),
+            });
+            return validateDayCanonicalResult({
+              dayUtc,
+              changedConnectorIds,
+              result: finalized,
+              observationsPrefix: canonicalObservationsPrefix,
+            });
+          },
+        });
+        emitV3PublicationDiagnostic(
+          diagnosticLog,
+          "canonical_day_finalization_complete",
+          {
+            ...dayFields,
+            duration_ms: Math.max(0, Date.now() - dayStartedAtMs),
+          },
+        );
+      } catch (error) {
+        emitV3PublicationDiagnostic(
+          diagnosticLog,
+          "canonical_day_finalization_failed",
+          {
+            ...dayFields,
+            duration_ms: Math.max(0, Date.now() - dayStartedAtMs),
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        throw error;
+      }
+      dayResults.push(result);
+    }
+
+    const finalResult = await runGlobalFinalizer({
       client,
-      dayUtc,
       diagnostics,
       diagnosticEnvironment,
       timeoutMs: lockTimeoutMs,
       finalize: async () => {
-        const finalized = await finalizeCanonicalDayManifests({
-          source: normalizedSource,
-          day_utc: dayUtc,
-          changed_connectors: Object.freeze(changedConnectors),
-        });
-        return validateDayCanonicalResult({
-          dayUtc,
-          changedConnectorIds,
-          result: finalized,
-          observationsPrefix: canonicalObservationsPrefix,
-        });
+        const aggregateFields = {
+          affected_days_utc: Object.freeze([...affectedDays]),
+          connector_count: connectorResults.length,
+          affected_reference_count: dayResults.length,
+        };
+        const aggregateStartedAtMs = Date.now();
+        let aggregateResult;
+        try {
+          assertV3PublicationStageBudget(
+            beforePublicationStage,
+            "canonical_aggregate_finalization",
+            aggregateFields,
+          );
+          emitV3PublicationDiagnostic(
+            diagnosticLog,
+            "canonical_aggregate_finalization_start",
+            aggregateFields,
+          );
+          aggregateResult = validateAggregateCanonicalResult({
+            affectedDays,
+            result: await finalizeCanonicalAggregateManifests({
+              source: normalizedSource,
+              affected_days_utc: Object.freeze([...affectedDays]),
+              day_results: Object.freeze(dayResults),
+            }),
+          });
+          emitV3PublicationDiagnostic(
+            diagnosticLog,
+            "canonical_aggregate_finalization_complete",
+            {
+              ...aggregateFields,
+              affected_object_count:
+                aggregateResult.aggregate_manifests.length,
+              duration_ms: Math.max(0, Date.now() - aggregateStartedAtMs),
+            },
+          );
+        } catch (error) {
+          emitV3PublicationDiagnostic(
+            diagnosticLog,
+            "canonical_aggregate_finalization_failed",
+            {
+              ...aggregateFields,
+              duration_ms: Math.max(0, Date.now() - aggregateStartedAtMs),
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+          throw error;
+        }
+
+        const latestFields = {
+          affected_days_utc: Object.freeze([...affectedDays]),
+          connector_count: connectorResults.length,
+          changed_scoped_reference_count: partitionResults.length,
+        };
+        const latestStartedAtMs = Date.now();
+        try {
+          assertV3PublicationStageBudget(
+            beforePublicationStage,
+            "latest_global_exact_v3_finalization",
+            latestFields,
+          );
+          emitV3PublicationDiagnostic(
+            diagnosticLog,
+            "latest_global_exact_v3_finalization_start",
+            latestFields,
+          );
+          const latestObject = await getObject({ key: latestKey });
+          if (!latestObject || latestObject.exists === false) {
+            throw new Error(`Post-cutover v3 latest object is missing: ${latestKey}`);
+          }
+          const existingLatest = latestArtifactFromStoredObject({
+            key: latestKey,
+            body: latestObject.body,
+            latestKey,
+          });
+          const replacementScopedManifests = partitionResults.map(
+            (partition) => partition.scoped_root.artifact,
+          );
+          const removedScopes = obsoletePruneLatestScopes({
+            source: normalizedSource,
+            existingLatest,
+            connectorResults,
+          });
+          const updatedLatest = updateObservationHistoryExactLeafIndexV3Latest({
+            existingLatest,
+            replacementScopedManifests,
+            removedScopes,
+            indexRoot,
+            latestKey,
+          });
+          const changedScopedEvidenceByKey = new Map(
+            partitionResults.map((partition) => [
+              partition.scoped_root.evidence.key,
+              partition.scoped_root.evidence,
+            ]),
+          );
+          const latestExternalByKey = new Map();
+          for (const reference of updatedLatest.dependencies) {
+            const exact = changedScopedEvidenceByKey.get(reference.key);
+            if (exact) {
+              assertEvidence(exact, reference, "V3 latest scoped prerequisite");
+            }
+            latestExternalByKey.set(
+              reference.key,
+              await verifiedExternalReference(reference, getObject),
+            );
+          }
+          const latestPlan = buildObservationHistoryIndexV3PublicationPlan({
+            objects: [updatedLatest],
+            externalReferences: [...latestExternalByKey.values()],
+          });
+          const latestPublication = await finalizeV3Publication({
+            plan: latestPlan,
+            putIfChanged,
+            getObject,
+            recordDurableEvidence,
+          });
+          emitV3PublicationDiagnostic(
+            diagnosticLog,
+            "latest_global_exact_v3_finalization_complete",
+            {
+              ...latestFields,
+              prerequisite_reference_count: updatedLatest.dependencies.length,
+              removed_scope_count: removedScopes.length,
+              duration_ms: Math.max(0, Date.now() - latestStartedAtMs),
+            },
+          );
+          return Object.freeze({
+            ok: connectorResults.every((entry) =>
+              entry.v3_exact_publication?.ok === true
+            ) && latestPublication.ok === true,
+            status: latestPublication.status,
+            source: normalizedSource,
+            prune_eligibility_owner:
+              normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
+            complete_day_replacement_results: Object.freeze(
+              completeDayReplacementResults,
+            ),
+            removed_scopes: removedScopes,
+            affected_partition_count: partitionResults.length,
+            affected_connector_days: Object.freeze(connectorResults.map((entry) => ({
+              day_utc: entry.day_utc,
+              connector_id: entry.connector_id,
+            }))),
+            affected_days_utc: Object.freeze([...affectedDays]),
+            connector_results: Object.freeze(connectorResults),
+            day_results: Object.freeze(dayResults),
+            canonical_aggregate_result: aggregateResult,
+            v3_publication: Object.freeze({
+              exact_scopes: Object.freeze(connectorResults.map((entry) =>
+                entry.v3_exact_publication
+              )),
+              latest_global: latestPublication,
+            }),
+          });
+        } catch (error) {
+          emitV3PublicationDiagnostic(
+            diagnosticLog,
+            "latest_global_exact_v3_finalization_failed",
+            {
+              ...latestFields,
+              duration_ms: Math.max(0, Date.now() - latestStartedAtMs),
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+          throw error;
+        }
       },
     });
-    dayResults.push(result);
+    emitV3PublicationDiagnostic(diagnosticLog, "run_finalization_complete", {
+      ...runFields,
+      duration_ms: Math.max(0, Date.now() - runStartedAtMs),
+    });
+    return finalResult;
+  } catch (error) {
+    emitV3PublicationDiagnostic(diagnosticLog, "run_finalization_failed", {
+      ...runFields,
+      duration_ms: Math.max(0, Date.now() - runStartedAtMs),
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
   }
-
-  return await runGlobalFinalizer({
-    client,
-    diagnostics,
-    diagnosticEnvironment,
-    timeoutMs: lockTimeoutMs,
-    finalize: async () => {
-      const partitionResults = connectorResults.flatMap(
-        (connectorResult) => connectorResult.partitions,
-      );
-      const aggregateResult = validateAggregateCanonicalResult({
-        affectedDays,
-        result: await finalizeCanonicalAggregateManifests({
-          source: normalizedSource,
-          affected_days_utc: Object.freeze([...affectedDays]),
-          day_results: Object.freeze(dayResults),
-        }),
-      });
-
-      const latestObject = await getObject({ key: latestKey });
-      if (!latestObject || latestObject.exists === false) {
-        throw new Error(`Post-cutover v3 latest object is missing: ${latestKey}`);
-      }
-      const existingLatest = latestArtifactFromStoredObject({
-        key: latestKey,
-        body: latestObject.body,
-        latestKey,
-      });
-      const replacementScopedManifests = partitionResults.map(
-        (partition) => partition.scoped_root.artifact,
-      );
-      const removedScopes = obsoletePruneLatestScopes({
-        source: normalizedSource,
-        existingLatest,
-        connectorResults,
-      });
-      const updatedLatest = updateObservationHistoryExactLeafIndexV3Latest({
-        existingLatest,
-        replacementScopedManifests,
-        removedScopes,
-        indexRoot,
-        latestKey,
-      });
-      const changedScopedEvidenceByKey = new Map(
-        partitionResults.map((partition) => [
-          partition.scoped_root.evidence.key,
-          partition.scoped_root.evidence,
-        ]),
-      );
-      const latestExternalByKey = new Map();
-      for (const reference of updatedLatest.dependencies) {
-        const exact = changedScopedEvidenceByKey.get(reference.key);
-        if (exact) {
-          assertEvidence(exact, reference, "V3 latest scoped prerequisite");
-        }
-        latestExternalByKey.set(
-          reference.key,
-          await verifiedExternalReference(reference, getObject),
-        );
-      }
-      const latestPlan = buildObservationHistoryIndexV3PublicationPlan({
-        objects: [updatedLatest],
-        externalReferences: [...latestExternalByKey.values()],
-      });
-      const latestPublication = await finalizeV3Publication({
-        plan: latestPlan,
-        putIfChanged,
-        getObject,
-        recordDurableEvidence,
-      });
-      return Object.freeze({
-        ok: connectorResults.every((entry) =>
-          entry.v3_exact_publication?.ok === true
-        ) && latestPublication.ok === true,
-        status: latestPublication.status,
-        source: normalizedSource,
-        prune_eligibility_owner:
-          normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
-        complete_day_replacement_results: Object.freeze(
-          completeDayReplacementResults,
-        ),
-        removed_scopes: removedScopes,
-        affected_partition_count: partitionResults.length,
-        affected_connector_days: Object.freeze(connectorResults.map((entry) => ({
-          day_utc: entry.day_utc,
-          connector_id: entry.connector_id,
-        }))),
-        affected_days_utc: Object.freeze([...affectedDays]),
-        connector_results: Object.freeze(connectorResults),
-        day_results: Object.freeze(dayResults),
-        canonical_aggregate_result: aggregateResult,
-        v3_publication: Object.freeze({
-          exact_scopes: Object.freeze(connectorResults.map((entry) =>
-            entry.v3_exact_publication
-          )),
-          latest_global: latestPublication,
-        }),
-      });
-    },
-  });
 }
 
 /**
