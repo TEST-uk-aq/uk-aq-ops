@@ -30,11 +30,6 @@ export const DEFAULT_OBSERVATION_HISTORY_INDEX_V3_LATEST_KEY =
   "history/_index_v3/observations_timeseries_latest.json";
 export const OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONTRACT =
   "observation-history-index-v3-publication-v2";
-// Direct callers retain the historical serial default. Steady-state writers
-// opt into their own bounded default, while migration keeps journal batching
-// and its separate publication-concurrency authority outside this finaliser.
-export const DEFAULT_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY = 1;
-export const MAX_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY = 16;
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -102,48 +97,6 @@ class EligiblePublicationMinHeap {
       entries[index] = last;
     }
     return minimum.object;
-  }
-}
-
-class PublicationPositionMinHeap {
-  entries = [];
-
-  get size() { return this.entries.length; }
-
-  push(entry) {
-    const entries = this.entries;
-    let index = entries.length;
-    entries.push(entry);
-    while (index > 0) {
-      const parent = Math.floor((index - 1) / 2);
-      if (entries[parent].position <= entry.position) break;
-      entries[index] = entries[parent];
-      index = parent;
-    }
-    entries[index] = entry;
-  }
-
-  pop() {
-    const entries = this.entries;
-    const minimum = entries[0];
-    const last = entries.pop();
-    if (entries.length) {
-      let index = 0;
-      while (index * 2 + 1 < entries.length) {
-        let child = index * 2 + 1;
-        if (
-          child + 1 < entries.length &&
-          entries[child + 1].position < entries[child].position
-        ) {
-          child += 1;
-        }
-        if (last.position <= entries[child].position) break;
-        entries[index] = entries[child];
-        index = child;
-      }
-      entries[index] = last;
-    }
-    return minimum;
   }
 }
 
@@ -2542,50 +2495,11 @@ function validatePublicationPlan(plan) {
   return plan;
 }
 
-function normalizePublicationConcurrency(raw) {
-  const value = raw;
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < 1 ||
-    value > MAX_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY
-  ) {
-    throw new TypeError(
-      "V3 publication concurrency must be an integer from 1 to " +
-        MAX_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY,
-    );
-  }
-  return value;
-}
-
-function isBudgetExhaustion(error) {
-  return error?.name === "PhaseBHistoryBudgetExhaustedError" ||
-    error?.code === "PHASE_B_HISTORY_BUDGET_EXHAUSTED";
-}
-
-function publicationPutDisposition(putResult) {
-  const status = String(putResult?.status || "succeeded");
-  if (
-    putResult?.skipped === true ||
-    status === "skipped_unchanged" ||
-    status === "recovered"
-  ) {
-    return "reused";
-  }
-  if (putResult?.write_r2 === true || status === "succeeded") {
-    return "newly_written";
-  }
-  return "unknown";
-}
-
 export async function finalizeObservationHistoryIndexV3Publication({
   plan,
   putIfChanged,
   getObject,
   recordDurableEvidence,
-  publicationConcurrency =
-    DEFAULT_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY,
-  onProgress = null,
 }) {
   validatePublicationPlan(plan);
   if (
@@ -2597,20 +2511,12 @@ export async function finalizeObservationHistoryIndexV3Publication({
       "V3 publication finaliser requires putIfChanged, getObject and recordDurableEvidence adapters",
     );
   }
-  if (onProgress !== null && typeof onProgress !== "function") {
-    throw new TypeError("V3 publication onProgress must be a function");
-  }
-  const concurrency = normalizePublicationConcurrency(publicationConcurrency);
-  const startedAtMs = Date.now();
-  const entriesByKey = new Map(plan.entries.map((entry) => [entry.key, entry]));
+  const completed = new Map();
   const externalByKey = new Map(
     plan.external_references.map((entry) => [entry.key, entry]),
   );
-  const unresolved = new Map();
-  const dependants = new Map(plan.entries.map((entry) => [entry.key, []]));
-  const ready = new PublicationPositionMinHeap();
+  const evidence = [];
   for (const entry of plan.entries) {
-    let count = 0;
     for (const [relationship, reference] of [
       ...entry.dependencies.map((dependency) =>
         ["content dependency", dependency]
@@ -2619,68 +2525,22 @@ export async function finalizeObservationHistoryIndexV3Publication({
         ["order prerequisite", prerequisite]
       ),
     ]) {
-      const changedDependency = entriesByKey.get(reference.key);
-      if (changedDependency) {
-        count += 1;
-        dependants.get(reference.key).push(entry);
-        continue;
-      }
+      const completedDependency = completed.get(reference.key);
       const externalDependency = externalByKey.get(reference.key);
       if (
-        externalDependency?.verified !== true ||
-        externalDependency?.durable !== true ||
-        externalDependency.byte_size !== reference.byte_size ||
-        externalDependency.sha256 !== reference.sha256
+        completedDependency?.verified !== true ||
+        completedDependency?.durable !== true
       ) {
-        throw new Error(
-          `V3 dependent publication blocked by incomplete ${relationship}: ${reference.key} -> ${entry.key}`,
-        );
+        if (
+          externalDependency?.verified !== true ||
+          externalDependency?.durable !== true
+        ) {
+          throw new Error(
+            `V3 dependent publication blocked by incomplete ${relationship}: ${reference.key} -> ${entry.key}`,
+          );
+        }
       }
     }
-    unresolved.set(entry.key, count);
-    if (count === 0) ready.push(entry);
-  }
-  for (const children of dependants.values()) {
-    children.sort((left, right) => left.position - right.position);
-  }
-
-  const evidenceByPosition = new Array(plan.entries.length);
-  const active = new Map();
-  const failures = [];
-  let completedCount = 0;
-  let maximumActivePublications = 0;
-  let reusedObjectCount = 0;
-  let newlyWrittenObjectCount = 0;
-  let unknownPutStatusObjectCount = 0;
-  let stopLaunching = false;
-
-  const diagnostics = (status) => Object.freeze({
-    status,
-    configured_concurrency: concurrency,
-    total_object_count: plan.entries.length,
-    reused_object_count: reusedObjectCount,
-    newly_written_object_count: newlyWrittenObjectCount,
-    unknown_put_status_object_count: unknownPutStatusObjectCount,
-    completed_object_count: completedCount,
-    active_publication_count: active.size,
-    ready_object_count: ready.size,
-    blocked_object_count: Math.max(
-      0,
-      plan.entries.length - completedCount - active.size - ready.size,
-    ),
-    maximum_active_publications: maximumActivePublications,
-    elapsed_ms: Math.max(0, Date.now() - startedAtMs),
-  });
-  const reportProgress = (status) => {
-    if (typeof onProgress !== "function") return;
-    try {
-      onProgress(diagnostics(status));
-    } catch {
-      // Optional diagnostics cannot change publication or failure semantics.
-    }
-  };
-
-  const publishEntry = async (entry) => {
     const putResult = await putIfChanged({
       key: entry.key,
       body: Buffer.from(entry.body),
@@ -2697,10 +2557,8 @@ export async function finalizeObservationHistoryIndexV3Publication({
     if (!(putResult.verified === true && putResult.post_put_get_verified === true &&
         putResult.key === entry.key && putResult.byte_size === entry.byte_size && putResult.sha256 === entry.sha256)) {
       const fetched = await getObject({ key: entry.key });
-      const fetchedBody = Buffer.from(fetched?.body ?? "");
-      if (fetchedBody.byteLength !== entry.byte_size || sha256Hex(fetchedBody) !== entry.sha256) {
-        throw new Error(`V3 post-PUT GET verification failed: ${entry.key}`);
-      }
+      const fetchedBody = Buffer.from(fetched?.body ?? '');
+      if (fetchedBody.byteLength !== entry.byte_size || sha256Hex(fetchedBody) !== entry.sha256) throw new Error(`V3 post-PUT GET verification failed: ${entry.key}`);
     }
     const durableResult = await recordDurableEvidence({
       key: entry.key,
@@ -2715,88 +2573,23 @@ export async function finalizeObservationHistoryIndexV3Publication({
     if (!durableResult || durableResult.durable !== true) {
       throw new Error(`V3 durable publication evidence failed: ${entry.key}`);
     }
-    return Object.freeze({
-      evidence: Object.freeze({
-        key: entry.key,
-        byte_size: entry.byte_size,
-        sha256: entry.sha256,
-        publication_stage: entry.publication_stage,
-        put_status: String(putResult.status || "succeeded"),
-        verified: true,
-        durable: true,
-      }),
-      disposition: publicationPutDisposition(putResult),
+    const entryEvidence = Object.freeze({
+      key: entry.key,
+      byte_size: entry.byte_size,
+      sha256: entry.sha256,
+      publication_stage: entry.publication_stage,
+      put_status: String(putResult.status || "succeeded"),
+      verified: true,
+      durable: true,
     });
-  };
-
-  const launch = (entry) => {
-    const settled = publishEntry(entry).then(
-      (value) => ({ status: "fulfilled", entry, value }),
-      (reason) => ({ status: "rejected", entry, reason }),
-    );
-    active.set(entry.key, settled);
-    maximumActivePublications = Math.max(
-      maximumActivePublications,
-      active.size,
-    );
-  };
-
-  const acceptOutcome = (outcome) => {
-    active.delete(outcome.entry.key);
-    if (outcome.status === "rejected") {
-      failures.push(outcome);
-      stopLaunching = true;
-      return;
-    }
-    completedCount += 1;
-    evidenceByPosition[outcome.entry.position - 1] = outcome.value.evidence;
-    if (outcome.value.disposition === "reused") reusedObjectCount += 1;
-    else if (outcome.value.disposition === "newly_written") {
-      newlyWrittenObjectCount += 1;
-    } else {
-      unknownPutStatusObjectCount += 1;
-    }
-    for (const dependant of dependants.get(outcome.entry.key)) {
-      const remaining = unresolved.get(dependant.key) - 1;
-      unresolved.set(dependant.key, remaining);
-      if (remaining === 0) ready.push(dependant);
-    }
-  };
-
-  reportProgress("running");
-  while (completedCount < plan.entries.length && !stopLaunching) {
-    while (active.size < concurrency && ready.size > 0) {
-      launch(ready.pop());
-    }
-    if (active.size === 0) {
-      throw new Error("V3 publication scheduler has no eligible entry");
-    }
-    acceptOutcome(await Promise.race(active.values()));
-    reportProgress(stopLaunching ? "settling_after_failure" : "running");
+    completed.set(entry.key, entryEvidence);
+    evidence.push(entryEvidence);
   }
-
-  if (stopLaunching && active.size > 0) {
-    const inFlight = await Promise.all(active.values());
-    for (const outcome of inFlight) acceptOutcome(outcome);
-  }
-  if (failures.length > 0) {
-    reportProgress("failed");
-    failures.sort((left, right) => left.entry.position - right.entry.position);
-    const budgetFailure = failures.find((outcome) =>
-      isBudgetExhaustion(outcome.reason)
-    );
-    throw (budgetFailure || failures[0]).reason;
-  }
-
-  const finalDiagnostics = diagnostics("succeeded");
-  reportProgress("succeeded");
-  const evidence = evidenceByPosition.filter(Boolean);
   return Object.freeze({
     ok: true,
     status: "succeeded",
     schedule_sha256: plan.schedule_sha256,
     published_object_count: evidence.length,
     objects: Object.freeze(evidence),
-    publication_diagnostics: finalDiagnostics,
   });
 }

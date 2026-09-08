@@ -10,6 +10,9 @@ import {
   updateObservationHistoryExactLeafIndexV3Latest,
 } from "./uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
+  MAX_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY,
+} from "./uk_aq_observation_history_index_v3.mjs";
+import {
   OBSERVATION_HISTORY_V3_INDEX_ROOT,
 } from "./uk_aq_observation_history_reader_v3.mjs";
 import {
@@ -47,6 +50,11 @@ export const DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX =
   "history/v3/observations";
 export const DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_LATEST_KEY =
   "history/_index_v3/observations_timeseries_latest.json";
+// Eight overlaps the small exact-v3 JSON request pipelines without coupling
+// steady-state fan-out to the migration runner's separately bounded scheduler.
+export const DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY = 8;
+export const MAX_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY =
+  MAX_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY;
 
 export const OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES = Object.freeze({
   pruneDaily: "prune_daily",
@@ -753,6 +761,8 @@ async function publishConnectorExactV3Scopes({
   putIfChanged,
   recordDurableEvidence,
   finalizeV3Publication,
+  publicationConcurrency,
+  onProgress,
 }) {
   const exactObjects = partitions.flatMap((partition) =>
     partition.v3_hierarchy.publication_objects
@@ -792,6 +802,8 @@ async function publishConnectorExactV3Scopes({
     putIfChanged,
     getObject,
     recordDurableEvidence,
+    publicationConcurrency,
+    onProgress,
   });
   if (publication?.ok !== true || !Array.isArray(publication.objects)) {
     throw new Error("Connector-scoped v3 publication did not return verified object evidence");
@@ -850,6 +862,8 @@ export async function runObservationHistoryV3ConnectorPublication({
   beforePublicationStage,
   lockTimeoutMs,
   prepareCompleteDayReplacement = null,
+  exactV3PublicationConcurrency =
+    DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
 }) {
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot, latestKey });
   if (!client?.query) throw new Error("V3 steady-state writer requires PostgreSQL lock client");
@@ -1011,6 +1025,7 @@ export async function runObservationHistoryV3ConnectorPublication({
           (sum, partition) => sum + partition.v3_hierarchy.publication_objects.length,
           0,
         ),
+        configured_concurrency: exactV3PublicationConcurrency,
       };
       assertV3PublicationStageBudget(
         beforePublicationStage,
@@ -1020,6 +1035,8 @@ export async function runObservationHistoryV3ConnectorPublication({
       emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_start", exactFields);
       const exactStartedAtMs = Date.now();
       let exact;
+      let exactProgress = null;
+      let lastLoggedProgress = 0;
       try {
         exact = await publishConnectorExactV3Scopes({
           partitions: partitionResults,
@@ -1028,10 +1045,41 @@ export async function runObservationHistoryV3ConnectorPublication({
           putIfChanged,
           recordDurableEvidence,
           finalizeV3Publication,
+          publicationConcurrency: exactV3PublicationConcurrency,
+          onProgress: (progress) => {
+            exactProgress = progress;
+            if (
+              progress?.status === "running" &&
+              progress.completed_object_count > 0 &&
+              progress.completed_object_count % 100 === 0 &&
+              progress.completed_object_count !== lastLoggedProgress
+            ) {
+              lastLoggedProgress = progress.completed_object_count;
+              emitV3PublicationDiagnostic(
+                diagnosticLog,
+                "exact_v3_connector_publication_progress",
+                {
+                  ...exactFields,
+                  completed: progress.completed_object_count,
+                  total: progress.total_object_count,
+                  active: progress.active_publication_count,
+                  ready: progress.ready_object_count,
+                  blocked: progress.blocked_object_count,
+                  maximum_active_publications:
+                    progress.maximum_active_publications,
+                  reused_object_count: progress.reused_object_count,
+                  newly_written_object_count:
+                    progress.newly_written_object_count,
+                  elapsed_ms: progress.elapsed_ms,
+                },
+              );
+            }
+          },
         });
       } catch (error) {
         emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_failed", {
           ...exactFields,
+          ...(exactProgress || {}),
           duration_ms: Math.max(0, Date.now() - exactStartedAtMs),
           error: error instanceof Error ? error.message : String(error),
         });
@@ -1039,6 +1087,7 @@ export async function runObservationHistoryV3ConnectorPublication({
       }
       emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_complete", {
         ...exactFields,
+        ...(exact.publication.publication_diagnostics || {}),
         duration_ms: Math.max(0, Date.now() - exactStartedAtMs),
       });
       const scopedRootByIdentity = new Map(
