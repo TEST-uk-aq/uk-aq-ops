@@ -57,9 +57,8 @@ the workflow redeploys the Worker.
 
 `UK_AQ_MEDIA_WORKER_HTTP_SECRET` authenticates scheduler requests to the UK AQ
 Media discovery Worker. Its value must never be stored in `jobs.toml`, D1,
-request bodies, repository source, or logs. The future Media `worker_http` job
-will refer only to the binding name `UK_AQ_MEDIA_WORKER_HTTP_SECRET`; that job is
-not active yet.
+request bodies, repository source, or logs. The Media `worker_http` job refers
+only to the binding name `UK_AQ_MEDIA_WORKER_HTTP_SECRET`.
 
 ## Cloud Run authentication secret
 
@@ -117,6 +116,23 @@ methods and arbitrary request headers are not supported for this target.
 The actual secret value must be installed as a secret on the scheduler Worker.
 Never store it in `jobs.toml`, D1, a configured request body, or logs. Different
 `worker_http` jobs may name and use dedicated Worker secrets.
+
+### Media discovery validation job
+
+`uk_aq_media_discovery` is configured as a live `worker_http` job calling the UK
+AQ Media discovery receiver at
+`https://uk-aq-media-discovery.uk-aq-media.workers.dev/scheduler/run`. It uses
+the dedicated `UK_AQ_MEDIA_WORKER_HTTP_SECRET` binding.
+
+Its current cadence is temporarily `*/5 * * * *` for operational validation.
+The intended steady-state cadence is `0 */2 * * *`; change the job to that
+two-hour cadence only after the central scheduler path has been operationally
+proven through successful real dispatches.
+
+The Media account's existing native `*/30 * * * *` Cron remains in place during
+this proof phase. Remove it only after the central scheduler -> Media Queue ->
+AQN -> D1 path has been demonstrated to work. The central path is not yet
+considered proven merely because this job is configured.
 
 ## Deployment-managed Cloud Run URLs
 
