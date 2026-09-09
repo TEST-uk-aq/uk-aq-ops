@@ -799,6 +799,182 @@ function publishedCandidateForFinalizationTest(dayUtc = "2026-08-28", connectorI
   };
 }
 
+function finalizationValidationRuntime(historyWriteVersion) {
+  return {
+    run_budget: createPhaseBRunBudgetForTest({
+      nowMs: () => 0,
+      startedAtMs: 0,
+      maxSecondsPerRun: 3_540,
+      stopBeforeTimeoutSeconds: 60,
+    }),
+    history_write_version: historyWriteVersion,
+    writer_git_sha: "4".repeat(40),
+    committed_prefix: "history/v2/observations",
+    r2: {},
+    environment: "TEST",
+  };
+}
+
+function v3FinalizationResult(days, exactScopeCount = 1) {
+  return {
+    ok: true,
+    affected_days_utc: days,
+    canonical_aggregate_result: {
+      affected_days_utc: days,
+      aggregate_manifests: [],
+      canonical_aggregate_authority_verified: true,
+      parent_state_reread_under_lock: true,
+    },
+    v3_publication: {
+      exact_scopes: Array.from(
+        { length: exactScopeCount },
+        () => ({ ok: true, status: "succeeded" }),
+      ),
+      latest_global: { ok: true, status: "succeeded" },
+    },
+  };
+}
+
+test("Phase B preserves the successful v2 finalization result contract", async () => {
+  const gated = [];
+  const published = publishedCandidateForFinalizationTest();
+  const finalized = await phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
+    client: {},
+    runtime: finalizationValidationRuntime("v2"),
+    runId: "v2-finalization-contract",
+    publishedCandidates: [published],
+    runFinalizer: async () => v2FinalizationResult([published.candidate.day_utc]),
+    completeCandidateAndGate: async (_client, evidence) => gated.push(evidence.connectorId),
+  });
+
+  assert.equal(finalized.finalized, true);
+  assert.deepEqual(gated, [published.candidate.connector_id]);
+});
+
+test("Phase B rejects an incomplete v2 finalization result before connector gating", async () => {
+  let gateCalls = 0;
+  const incomplete = v2FinalizationResult(["2026-08-28"]);
+  incomplete.index_finalization.observations_timeseries.updated_latest_index = false;
+
+  await assert.rejects(
+    phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
+      client: {},
+      runtime: finalizationValidationRuntime("v2"),
+      runId: "v2-incomplete-finalization",
+      publishedCandidates: [publishedCandidateForFinalizationTest()],
+      runFinalizer: async () => incomplete,
+      completeCandidateAndGate: async () => { gateCalls += 1; },
+    }),
+    /Phase B v2 run finalization did not establish complete parent\/latest authority/,
+  );
+  assert.equal(gateCalls, 0);
+});
+
+test("Phase B accepts the real v3 finalization shape before connector gating", async () => {
+  const publishedCandidates = [
+    publishedCandidateForFinalizationTest("2026-08-28", 1),
+    publishedCandidateForFinalizationTest("2026-08-28", 2),
+  ];
+  const events = [];
+  const result = v3FinalizationResult(["2026-08-28"], 2);
+  assert.equal(Object.hasOwn(result, "observations_manifest_hierarchy"), false);
+  assert.equal(Object.hasOwn(result, "index_finalization"), false);
+
+  const finalized = await phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
+    client: {},
+    runtime: finalizationValidationRuntime("v3"),
+    runId: "v3-finalization-contract",
+    publishedCandidates,
+    runFinalizer: async () => {
+      events.push("run_finalization");
+      return result;
+    },
+    completeCandidateAndGate: async (_client, evidence) => {
+      events.push(`connector_gate:${evidence.connectorId}`);
+    },
+  });
+
+  assert.equal(finalized.finalized, true);
+  assert.deepEqual(events, [
+    "run_finalization",
+    "connector_gate:1",
+    "connector_gate:2",
+  ]);
+});
+
+test("Phase B v3 finalization validation fails closed before connector gating", async (t) => {
+  const expectedMessage = /Phase B v3 run finalization did not establish complete canonical\/latest authority/;
+  const cases = [
+    ["top-level success is absent", (result) => { result.ok = false; }],
+    ["affected days disagree", (result) => { result.affected_days_utc = ["2026-08-27"]; }],
+    ["canonical aggregate authority is missing", (result) => {
+      delete result.canonical_aggregate_result;
+    }],
+    ["canonical aggregate verification is unsuccessful", (result) => {
+      result.canonical_aggregate_result.canonical_aggregate_authority_verified = false;
+    }],
+    ["canonical aggregate authority is incomplete", (result) => {
+      result.canonical_aggregate_result.parent_state_reread_under_lock = false;
+    }],
+    ["canonical aggregate affected days disagree", (result) => {
+      result.canonical_aggregate_result.affected_days_utc = ["2026-08-27"];
+    }],
+    ["latest-global publication is unsuccessful", (result) => {
+      result.v3_publication.latest_global.ok = false;
+    }],
+    ["latest-global publication is missing", (result) => {
+      delete result.v3_publication.latest_global;
+    }],
+    ["a required exact-scope publication is unsuccessful", (result) => {
+      result.v3_publication.exact_scopes[0].ok = false;
+    }],
+    ["a required exact-scope publication result is missing", (result) => {
+      result.v3_publication.exact_scopes = [];
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      let gateCalls = 0;
+      const result = v3FinalizationResult(["2026-08-28"]);
+      mutate(result);
+      await assert.rejects(
+        phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
+          client: {},
+          runtime: finalizationValidationRuntime("v3"),
+          runId: "v3-incomplete-finalization",
+          publishedCandidates: [publishedCandidateForFinalizationTest()],
+          runFinalizer: async () => result,
+          completeCandidateAndGate: async () => { gateCalls += 1; },
+        }),
+        (error) => {
+          assert.match(error.message, expectedMessage);
+          assert.doesNotMatch(error.message, /Phase B v2 run finalization/);
+          return true;
+        },
+      );
+      assert.equal(gateCalls, 0);
+    });
+  }
+});
+
+test("Phase B preserves an underlying v3 finalizer error", async () => {
+  let gateCalls = 0;
+  const finalizerError = new Error("fixture latest-global publication failed");
+  await assert.rejects(
+    phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
+      client: {},
+      runtime: finalizationValidationRuntime("v3"),
+      runId: "v3-finalizer-error",
+      publishedCandidates: [publishedCandidateForFinalizationTest()],
+      runFinalizer: async () => { throw finalizerError; },
+      completeCandidateAndGate: async () => { gateCalls += 1; },
+    }),
+    (error) => error === finalizerError,
+  );
+  assert.equal(gateCalls, 0);
+});
+
 test("v2 run-finalization failure cannot create connector deletion authority", async () => {
   const runtime = {
     run_budget: createPhaseBRunBudgetForTest({
@@ -1042,7 +1218,7 @@ test("a stopped candidate loop still finalizes published v3 work and establishes
         ...args,
         runFinalizer: async () => {
           events.push("run_finalizer");
-          return v2FinalizationResult(["2026-08-28"]);
+          return v3FinalizationResult(["2026-08-28"]);
         },
         completeCandidateAndGate: async () => {
           events.push("connector_gate");

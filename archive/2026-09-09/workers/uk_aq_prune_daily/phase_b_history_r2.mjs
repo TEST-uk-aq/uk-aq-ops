@@ -3706,42 +3706,6 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
   };
 }
 
-function phaseBAffectedDaysMatch(actual, expected) {
-  return Array.isArray(actual) &&
-    JSON.stringify(actual) === JSON.stringify(expected);
-}
-
-function validatePhaseBV2RunFinalizationResult({ result, expectedDays }) {
-  if (result?.ok !== true || result?.observations_manifest_hierarchy?.ok !== true ||
-      result?.index_finalization?.observations_timeseries?.updated_latest_index !== true ||
-      result?.index_finalization?.observations_timeseries?.warning_count !== 0 ||
-      !phaseBAffectedDaysMatch(result?.affected_days_utc, expectedDays)) {
-    throw new Error("Phase B v2 run finalization did not establish complete parent/latest authority");
-  }
-  return result;
-}
-
-function validatePhaseBV3RunFinalizationResult({
-  result,
-  expectedDays,
-  expectedConnectorPublicationCount,
-}) {
-  const aggregate = result?.canonical_aggregate_result;
-  const exactScopes = result?.v3_publication?.exact_scopes;
-  if (result?.ok !== true ||
-      !phaseBAffectedDaysMatch(result?.affected_days_utc, expectedDays) ||
-      aggregate?.canonical_aggregate_authority_verified !== true ||
-      aggregate?.parent_state_reread_under_lock !== true ||
-      !phaseBAffectedDaysMatch(aggregate?.affected_days_utc, expectedDays) ||
-      !Array.isArray(exactScopes) ||
-      exactScopes.length !== expectedConnectorPublicationCount ||
-      exactScopes.some((publication) => publication?.ok !== true) ||
-      result?.v3_publication?.latest_global?.ok !== true) {
-    throw new Error("Phase B v3 run finalization did not establish complete canonical/latest authority");
-  }
-  return result;
-}
-
 async function finalizeSelectedObservationRun({ client, runtime, publishedCandidates, diagnostics }) {
   if (runtime.history_write_version === "v2") {
     return finalizeObservationV2Run({ client, runtime, publishedCandidates, diagnostics });
@@ -3833,11 +3797,17 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     diagnosticLog,
     beforePublicationStage,
   });
-  return validatePhaseBV3RunFinalizationResult({
-    result,
-    expectedDays: affectedDays,
-    expectedConnectorPublicationCount: publishedCandidates.length,
-  });
+  if (result.ok !== true || result.canonical_aggregate_result?.canonical_aggregate_authority_verified !== true ||
+      result.v3_publication?.latest_global?.ok !== true) {
+    throw new Error("Side-by-side v3 finalisation lacks verified canonical and exact-index authority");
+  }
+  return {
+    ...result,
+    observations_manifest_hierarchy: result.canonical_aggregate_result.hierarchy,
+    index_finalization: { observations_timeseries: {
+      updated_latest_index: true, warning_count: 0, index_generation: "v3",
+    } },
+  };
 }
 
 async function writeFrozenCandidateObservationsToV2({
@@ -4037,7 +4007,13 @@ async function finalizeObservationV2Run({
     r2: runtime.r2, observationsPrefix: runtime.committed_prefix, affectedDaysUtc: days,
     finalizeExistingIndexes: async () => await updateFinalizedHistoryIndexes({ runtime, finalizedDays: days }),
   });
-  return validatePhaseBV2RunFinalizationResult({ result, expectedDays: days });
+  if (result?.ok !== true || result?.observations_manifest_hierarchy?.ok !== true ||
+      result?.index_finalization?.observations_timeseries?.updated_latest_index !== true ||
+      result?.index_finalization?.observations_timeseries?.warning_count !== 0 ||
+      JSON.stringify(result?.affected_days_utc) !== JSON.stringify(days)) {
+    throw new Error("Phase B v2 run finalization did not establish complete parent/latest authority");
+  }
+  return result;
 }
 
 export async function finalizeObservationV2RunForTest(args) {
@@ -4068,16 +4044,11 @@ async function finalizePublishedPhaseBConnectors({
   const lockDiagnostics = [];
   const result = await runFinalizer({ client, runtime, publishedCandidates, diagnostics: lockDiagnostics });
   const expectedDays = uniqueSorted(publishedCandidates.map(({ candidate }) => candidate.day_utc));
-  if (runtime.history_write_version === "v2") {
-    validatePhaseBV2RunFinalizationResult({ result, expectedDays });
-  } else if (runtime.history_write_version === "v3") {
-    validatePhaseBV3RunFinalizationResult({
-      result,
-      expectedDays,
-      expectedConnectorPublicationCount: publishedCandidates.length,
-    });
-  } else {
-    throw new Error(`Unsupported Phase B history write version: ${String(runtime.history_write_version || "")}`);
+  if (result?.ok !== true || result?.observations_manifest_hierarchy?.ok !== true ||
+      result?.index_finalization?.observations_timeseries?.updated_latest_index !== true ||
+      result?.index_finalization?.observations_timeseries?.warning_count !== 0 ||
+      JSON.stringify(result?.affected_days_utc) !== JSON.stringify(expectedDays)) {
+    throw new Error("Phase B v2 run finalization did not establish complete parent/latest authority");
   }
   const completed = [];
   const gateFailures = [];
