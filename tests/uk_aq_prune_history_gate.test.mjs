@@ -5,7 +5,9 @@ import {
   buildHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest,
   buildHistoryV2PollutantManifest,
+  computeDayGateState,
   derivePhaseBPgTimeoutsForTest,
+  filterDayCandidatesForSelectedGeneration,
   isAcceptedPruneHistoryDayManifestKey,
   markCandidateAndConnectorGateCompleteForTest,
   populateBackupCandidatesForTest,
@@ -449,6 +451,153 @@ test("real candidate population invalidates only the connector gate whose comple
   assert.equal(populated[1].source_changed_connector_gate_invalidated, false);
   assert.equal(new Map([[dayUtc, true]]).get(dayUtc), true, "aggregate truth exists but cannot restore the exact connector gate");
   assert.equal(gates.get(connectorDayGateKey(dayUtc, 1)), false);
+});
+
+test("v3 candidate population reopens an old complete v2 row only when current source exists", async () => {
+  const dayUtc = "2026-08-31";
+  const connectorId = 2;
+  const canonicalRows = canonicalCandidateRows(dayUtc, connectorId, 2);
+  const oldCandidate = {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    expected_row_count: "2",
+    min_observed_at: `${dayUtc}T00:00:00.000Z`,
+    max_observed_at: `${dayUtc}T01:00:00.000Z`,
+    status: "complete",
+    run_id: "historical-v2-run",
+    manifest_key: canonicalObservationConnectorManifestKey(dayUtc, connectorId, "v2"),
+    history_row_count: "2",
+    history_file_count: 1,
+    history_total_bytes: "100",
+    ...computePruneConnectorSourceIdentity(canonicalRows),
+    resume_part_index: 0,
+    resume_exported_row_count: "0",
+    resume_parts_json: [],
+    source_row_count: "2",
+    excluded_row_count: "0",
+    excluded_pollutant_counts: {},
+  };
+  const queries = [];
+  const client = {
+    async query(sql, params = []) {
+      queries.push({ sql, params });
+      const normalized = sql.trim();
+      if (/select distinct op\.code/i.test(sql)) return { rows: [] };
+      if (/^begin isolation level repeatable read$|^commit$|^rollback$/i.test(normalized)) {
+        return { rows: [] };
+      }
+      if (/from uk_aq_ops\.history_candidates[\s\S]+for update/i.test(sql)) {
+        return { rows: [oldCandidate] };
+      }
+      if (/uk_aq_phase_b_history_rows_v2/i.test(sql)) return { rows: canonicalRows };
+      if (/source_aggregates as/i.test(sql)) return { rows: [oldCandidate] };
+      return { rows: [], rowCount: 1 };
+    },
+  };
+
+  const [candidate] = await populateBackupCandidatesForTest({
+    client,
+    latestEligibleWindowEndIso: "2026-09-02T00:00:00.000Z",
+    runtime: { history_write_version: "v3" },
+  });
+
+  const populationSql = queries.find(({ sql }) => /source_aggregates as/i.test(sql))?.sql || "";
+  assert.match(populationSql, /from source_aggregates sa/i);
+  assert.doesNotMatch(populationSql, /existing_complete\.day_utc is null/i);
+  assert.equal(candidate.status, "pending");
+  assert.equal(candidate.source_identity_failure_reason, "history_generation_changed");
+  assert.equal(candidate.source_changed_connector_gate_invalidated, true);
+  assert.equal(
+    queries.some(({ sql, params }) =>
+      /^update uk_aq_ops\.history_candidates/im.test(sql)
+      && params[2] === "history_generation_changed"
+    ),
+    true,
+  );
+  assert.equal(
+    queries.some(({ sql }) => /insert into uk_aq_ops\.prune_connector_day_gates/i.test(sql)),
+    true,
+  );
+
+  const historicalOnlyQueries = [];
+  const historicalOnly = await populateBackupCandidatesForTest({
+    client: {
+      async query(sql) {
+        historicalOnlyQueries.push(sql);
+        return { rows: [] };
+      },
+    },
+    latestEligibleWindowEndIso: "2026-09-02T00:00:00.000Z",
+    runtime: { history_write_version: "v3" },
+  });
+  assert.deepEqual(historicalOnly, []);
+  assert.equal(historicalOnlyQueries.length, 2);
+  assert.match(historicalOnlyQueries[1], /from source_aggregates sa/i);
+  assert.doesNotMatch(historicalOnlyQueries[1], /existing_complete\.day_utc is null/i);
+});
+
+test("v3 day finalization excludes only exact historical v2 completions", () => {
+  const dayUtc = "2026-08-31";
+  const currentComplete = {
+    day_utc: dayUtc,
+    connector_id: 8,
+    status: "complete",
+    manifest_key: canonicalObservationConnectorManifestKey(dayUtc, 8, "v3"),
+  };
+  const historicalComplete = {
+    day_utc: dayUtc,
+    connector_id: 2,
+    status: "complete",
+    manifest_key: canonicalObservationConnectorManifestKey(dayUtc, 2, "v2"),
+  };
+  const currentOnly = filterDayCandidatesForSelectedGeneration(
+    [historicalComplete, currentComplete],
+    "v3",
+  );
+  assert.deepEqual(currentOnly.map(({ connector_id }) => connector_id), [8]);
+  assert.equal(computeDayGateState(currentOnly).all_complete, true);
+  assert.deepEqual(
+    filterDayCandidatesForSelectedGeneration([historicalComplete, currentComplete], "v2")
+      .map(({ connector_id }) => connector_id),
+    [2],
+    "the rule is symmetric and selected-generation based",
+  );
+
+  const incomplete = [
+    { day_utc: dayUtc, connector_id: 3, status: "pending", manifest_key: null },
+    {
+      day_utc: dayUtc,
+      connector_id: 4,
+      status: "failed",
+      manifest_key: canonicalObservationConnectorManifestKey(dayUtc, 4, "v2"),
+    },
+    { day_utc: dayUtc, connector_id: 5, status: "in_progress", manifest_key: null },
+  ];
+  const withIncomplete = filterDayCandidatesForSelectedGeneration(
+    [historicalComplete, currentComplete, ...incomplete],
+    "v3",
+  );
+  assert.deepEqual(withIncomplete.map(({ connector_id }) => connector_id), [8, 3, 4, 5]);
+  assert.deepEqual(computeDayGateState(withIncomplete), {
+    total: 4,
+    complete: 1,
+    failed: 1,
+    pending: 1,
+    in_progress: 1,
+    all_complete: false,
+  });
+
+  const malformedComplete = {
+    day_utc: dayUtc,
+    connector_id: 6,
+    status: "complete",
+    manifest_key: "history/v2/observations/not-canonical/manifest.json",
+  };
+  assert.deepEqual(
+    filterDayCandidatesForSelectedGeneration([malformedComplete], "v3"),
+    [malformedComplete],
+    "unrecognised completion evidence must remain visible and fail closed later",
+  );
 });
 
 test("insufficient Phase B budget prevents AQI and Dropbox adapters and reports a controlled stop", async () => {

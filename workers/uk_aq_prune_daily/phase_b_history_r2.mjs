@@ -2325,7 +2325,38 @@ where day_utc = $1::date
   );
 }
 
-async function fetchDayCandidates(client, dayUtc) {
+function completedCandidateHistoryGeneration(candidate) {
+  if (candidate?.status !== "complete") return null;
+  for (const generation of ["v2", "v3"]) {
+    try {
+      if (candidate.manifest_key === canonicalObservationConnectorManifestKey(
+        candidate.day_utc,
+        candidate.connector_id,
+        generation,
+      )) {
+        return generation;
+      }
+    } catch (_error) {
+      return null;
+    }
+  }
+  return null;
+}
+
+export function filterDayCandidatesForSelectedGeneration(
+  dayCandidates,
+  selectedGeneration,
+) {
+  getObservationHistoryGeneration(selectedGeneration);
+  return (Array.isArray(dayCandidates) ? dayCandidates : []).filter((candidate) => {
+    const completedGeneration = completedCandidateHistoryGeneration(candidate);
+    // Exclude only exact canonical historical completion. Incomplete or malformed
+    // evidence remains visible so current work and unsafe state still block.
+    return completedGeneration === null || completedGeneration === selectedGeneration;
+  });
+}
+
+async function fetchDayCandidates(client, dayUtc, selectedGeneration) {
   const result = await client.query(
     `
 select
@@ -2351,7 +2382,10 @@ order by connector_id
 `,
     [dayUtc],
   );
-  return result.rows.map(toConnectorDayRow);
+  return filterDayCandidatesForSelectedGeneration(
+    result.rows.map(toConnectorDayRow),
+    selectedGeneration,
+  );
 }
 
 export function computeDayGateState(dayCandidates) {
@@ -6031,7 +6065,11 @@ export const validateObservationDayConnectorReferencesForTest =
   validateObservationDayConnectorReferences;
 
 async function finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }) {
-  const dayCandidates = await fetchDayCandidates(client, dayUtc);
+  const dayCandidates = await fetchDayCandidates(
+    client,
+    dayUtc,
+    runtime.history_write_version,
+  );
   const dayState = computeDayGateState(dayCandidates);
 
   if (!dayState.all_complete) {
