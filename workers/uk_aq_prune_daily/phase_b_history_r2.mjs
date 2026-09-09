@@ -6101,11 +6101,11 @@ async function finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }) {
         ? currentRead.validation_error.message
         : String(currentRead.validation_error || "unknown validation failure");
       throw new Error(
-        `V2 canonical day authority failed validation: ${dayManifestKey}; ${detail}`,
+        `Canonical day authority failed validation: ${dayManifestKey}; ${detail}`,
         { cause: currentRead.validation_error },
       );
     }
-    throw new Error(`V2 observation writer did not publish the canonical day authority: ${dayManifestKey}`);
+    throw new Error(`Observation writer did not publish the canonical day authority: ${dayManifestKey}`);
   }
   const referenceByConnector = new Map(
     currentRead.value.map((reference) => [reference.connector_id, reference]),
@@ -6117,7 +6117,7 @@ async function finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }) {
       reference.manifest_key !== candidate.manifest_key
     ) {
       throw new Error(
-        `V2 canonical day authority does not contain completed connector ${dayUtc}/${candidate.connector_id}`,
+        `Canonical day authority does not contain completed connector ${dayUtc}/${candidate.connector_id}`,
       );
     }
   }
