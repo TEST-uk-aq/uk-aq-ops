@@ -108,7 +108,7 @@ notes = "Dropbox raw-data pruning"
 
 [jobs.uk_aq_media_discovery]
 enabled = true
-cron_expr = "0 */1 * * *"
+cron_expr = "0 */2 * * *"
 target_type = "worker_http"
 worker_http_url = "https://uk-aq-media-discovery.uk-aq-media.workers.dev/scheduler/run"
 worker_http_secret_binding = "UK_AQ_MEDIA_WORKER_HTTP_SECRET"
