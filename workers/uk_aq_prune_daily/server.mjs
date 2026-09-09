@@ -153,7 +153,7 @@ function compactPruneHealthSummary(summary = {}) {
       + Number(summary.connector_history_gate_blocked_after_repair_bucket_count || 0),
     delete_error_count: pickCount(summary, ["delete_error_count", "delete_after_repair_error_count"]),
     repair_replay_attempt_count: summary.repair_replay_attempt_count,
-    repair_replay_count: summary.repair_replay_attempt_count,
+    repair_replay_count: summary.repair_replay_success_count,
     repair_replay_applied_count: summary.repair_replay_applied_count,
     repair_replay_not_applied_count: summary.repair_replay_not_applied_count,
     repair_replay_error_count: summary.repair_replay_error_count,
