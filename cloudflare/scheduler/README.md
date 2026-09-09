@@ -117,22 +117,22 @@ The actual secret value must be installed as a secret on the scheduler Worker.
 Never store it in `jobs.toml`, D1, a configured request body, or logs. Different
 `worker_http` jobs may name and use dedicated Worker secrets.
 
-### Media discovery validation job
+### Media discovery job
 
 `uk_aq_media_discovery` is configured as a live `worker_http` job calling the UK
 AQ Media discovery receiver at
 `https://uk-aq-media-discovery.uk-aq-media.workers.dev/scheduler/run`. It uses
 the dedicated `UK_AQ_MEDIA_WORKER_HTTP_SECRET` binding.
 
-Its current cadence is temporarily `*/5 * * * *` for operational validation.
-The intended steady-state cadence is `0 */2 * * *`; change the job to that
-two-hour cadence only after the central scheduler path has been operationally
-proven through successful real dispatches.
+The current steady-state cadence is `0 */2 * * *`. Before switching to that
+cadence, repeated real dispatches were proven at a temporary `*/5 * * * *`
+validation cadence. Those runs successfully reached the Media receiver, received
+HTTP 202 responses, enqueued Media Queue work and completed the Queue consumer.
 
-The Media account's existing native `*/30 * * * *` Cron remains in place during
-this proof phase. Remove it only after the central scheduler -> Media Queue ->
-AQN -> D1 path has been demonstrated to work. The central path is not yet
-considered proven merely because this job is configured.
+The Media account's native Cron trigger has been removed from Cloudflare and from
+the Media Wrangler configuration, so the TEST central scheduler is the active
+scheduling authority during standalone operation. When Media moves to public/LIVE
+operation, this job moves to the LIVE central scheduler.
 
 ## Deployment-managed Cloud Run URLs
 
