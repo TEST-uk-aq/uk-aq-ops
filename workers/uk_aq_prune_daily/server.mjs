@@ -38,6 +38,9 @@ const LATE_ARRIVAL_DISCOVERY_PAGE_SIZE = 1000;
 const MAX_LATE_ARRIVAL_DISCOVERY_PAGES = 100;
 const MAX_LATE_ARRIVAL_WINDOWS_PER_RUN = 14;
 const RPC_SCHEMA = "uk_aq_public";
+const REPAIR_RECEIPT_SEMANTICS = "sync_attempt_audit_not_applied_row_evidence";
+const REPAIR_OPERATOR_RECOVERY_MESSAGE =
+  "Fingerprint mismatch remains after the allowed ObsAQIDB repair attempt; use the connector's authoritative recovery path if correction is required.";
 
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
 const RPC_REPAIR_FETCH_HOUR_BUCKET = "uk_aq_rpc_observations_select_hour_bucket";
@@ -149,8 +152,14 @@ function compactPruneHealthSummary(summary = {}) {
       Number(summary.connector_history_gate_blocked_bucket_count || 0)
       + Number(summary.connector_history_gate_blocked_after_repair_bucket_count || 0),
     delete_error_count: pickCount(summary, ["delete_error_count", "delete_after_repair_error_count"]),
-    repair_replay_count: summary.repair_replay_success_count,
+    repair_replay_attempt_count: summary.repair_replay_attempt_count,
+    repair_replay_count: summary.repair_replay_attempt_count,
+    repair_replay_applied_count: summary.repair_replay_applied_count,
+    repair_replay_not_applied_count: summary.repair_replay_not_applied_count,
     repair_replay_error_count: summary.repair_replay_error_count,
+    repair_mismatch_remaining_after_attempt_count:
+      summary.repair_mismatch_remaining_after_attempt_count,
+    repair_receipt_semantics: summary.repair_receipt_semantics,
     alert_condition_count: summary.alert_condition_count,
     connector_day_atomic_delete_planned_count:
       summary.connector_day_atomic_delete_planned_count,
@@ -170,7 +179,13 @@ function compactPruneHealthSummary(summary = {}) {
         enabled: summary.phase_a_recent.enabled,
         mismatch_count: summary.phase_a_recent.mismatch_count,
         mismatch_after_repair_count: summary.phase_a_recent.mismatch_after_repair_count,
+        repair_replay_attempt_count: summary.phase_a_recent.repair_replay_attempt_count,
+        repair_replay_applied_count: summary.phase_a_recent.repair_replay_applied_count,
         repair_replay_success_count: summary.phase_a_recent.repair_replay_success_count,
+        repair_replay_not_applied_count:
+          summary.phase_a_recent.repair_replay_not_applied_count,
+        repair_mismatch_remaining_after_attempt_count:
+          summary.phase_a_recent.repair_mismatch_remaining_after_attempt_count,
       }
       : undefined,
     phase_b_history: summary.phase_b_history
@@ -694,12 +709,23 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     ...summaryBase,
     ...aggregateAtomicDeletionSummaryForTest(batchSummaries),
     repairable_mismatch_bucket_count: sumIntField(batchSummaries, "repairable_mismatch_bucket_count"),
+    repair_replay_attempt_count: sumIntField(batchSummaries, "repair_replay_attempt_count"),
+    repair_replay_applied_count: sumIntField(batchSummaries, "repair_replay_applied_count"),
     repair_replay_success_count: sumIntField(batchSummaries, "repair_replay_success_count"),
+    repair_replay_not_applied_count: sumIntField(
+      batchSummaries,
+      "repair_replay_not_applied_count",
+    ),
     repair_replay_error_count: sumIntField(batchSummaries, "repair_replay_error_count"),
     repair_rows_selected_total: sumBigIntField(batchSummaries, "repair_rows_selected_total").toString(),
     repair_rows_replayed_total: sumBigIntField(batchSummaries, "repair_rows_replayed_total").toString(),
     repair_receipts_upserted_total: sumBigIntField(batchSummaries, "repair_receipts_upserted_total").toString(),
+    repair_receipt_semantics: REPAIR_RECEIPT_SEMANTICS,
     mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
+    repair_mismatch_remaining_after_attempt_count: sumIntField(
+      batchSummaries,
+      "repair_mismatch_remaining_after_attempt_count",
+    ),
     repaired_now_deletable_bucket_count: sumIntField(
       batchSummaries,
       "repaired_now_deletable_bucket_count",
@@ -792,12 +818,23 @@ function aggregatePhaseARecentSummary(overallWindow, batches, batchSummaries, pa
     observs_count_exceeds_ingest_count: sumIntField(batchSummaries, "observs_count_exceeds_ingest_count"),
     observs_extra_bucket_count: sumIntField(batchSummaries, "observs_extra_bucket_count"),
     repairable_mismatch_bucket_count: sumIntField(batchSummaries, "repairable_mismatch_bucket_count"),
+    repair_replay_attempt_count: sumIntField(batchSummaries, "repair_replay_attempt_count"),
+    repair_replay_applied_count: sumIntField(batchSummaries, "repair_replay_applied_count"),
     repair_replay_success_count: sumIntField(batchSummaries, "repair_replay_success_count"),
+    repair_replay_not_applied_count: sumIntField(
+      batchSummaries,
+      "repair_replay_not_applied_count",
+    ),
     repair_replay_error_count: sumIntField(batchSummaries, "repair_replay_error_count"),
     repair_rows_selected_total: sumBigIntField(batchSummaries, "repair_rows_selected_total").toString(),
     repair_rows_replayed_total: sumBigIntField(batchSummaries, "repair_rows_replayed_total").toString(),
     repair_receipts_upserted_total: sumBigIntField(batchSummaries, "repair_receipts_upserted_total").toString(),
+    repair_receipt_semantics: REPAIR_RECEIPT_SEMANTICS,
     mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
+    repair_mismatch_remaining_after_attempt_count: sumIntField(
+      batchSummaries,
+      "repair_mismatch_remaining_after_attempt_count",
+    ),
     repaired_now_deletable_bucket_count: sumIntField(batchSummaries, "repaired_now_deletable_bucket_count"),
     deleted_bucket_count: sumIntField(batchSummaries, "deleted_bucket_count"),
     total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
@@ -1052,6 +1089,69 @@ function toIntField(value, fieldName) {
   return Math.trunc(number);
 }
 
+export function classifyRepairReplayOutcome({
+  rowsSelected,
+  rowsSubmitted,
+  rowsReplayed,
+}) {
+  const selected = toIntField(rowsSelected, "rows_selected");
+  const submitted = toIntField(rowsSubmitted, "rows_submitted");
+  const replayed = toIntField(rowsReplayed, "rows_replayed");
+  if (submitted > selected) {
+    throw new Error("Repair rows_submitted cannot exceed rows_selected");
+  }
+  if (replayed > submitted) {
+    throw new Error("Repair rows_replayed cannot exceed rows_submitted");
+  }
+  const repairAttempted = submitted > 0;
+  const replayOutcome = !repairAttempted
+    ? "not_attempted_no_rows_selected"
+    : replayed > 0 ? "applied" : "not_applied";
+  return {
+    repair_attempted: repairAttempted,
+    replay_outcome: replayOutcome,
+    replay_not_applied_reason:
+      replayOutcome === "not_applied" ? "obs_aqidb_upsert_applied_zero_rows" : null,
+    receipt_semantics: REPAIR_RECEIPT_SEMANTICS,
+  };
+}
+
+export function attachRepairPostRecheckOutcomes(repairReplayResults, mismatchesAfterRepair) {
+  const remainingMismatchKeys = new Set(
+    (Array.isArray(mismatchesAfterRepair) ? mismatchesAfterRepair : []).map((mismatch) => (
+      buildBucketKey(mismatch.connector_id, mismatch.hour_start)
+    )),
+  );
+  return (Array.isArray(repairReplayResults) ? repairReplayResults : []).map((result) => {
+    const postRepairMismatchRemaining = remainingMismatchKeys.has(
+      buildBucketKey(result.connector_id, result.hour_start),
+    );
+    return {
+      ...result,
+      post_repair_mismatch_remaining: postRepairMismatchRemaining,
+      operator_recovery_required: postRepairMismatchRemaining,
+      operator_recovery_message: postRepairMismatchRemaining
+        ? REPAIR_OPERATOR_RECOVERY_MESSAGE
+        : null,
+    };
+  });
+}
+
+export function summarizeRepairReplayOutcomes(repairOutcomeResults) {
+  const results = Array.isArray(repairOutcomeResults) ? repairOutcomeResults : [];
+  return {
+    attempt_count: results.filter((row) => row.repair_attempted).length,
+    applied_count: results.filter((row) => row.replay_outcome === "applied").length,
+    success_count: results.filter((row) => (
+      row.replay_outcome === "applied" && !row.post_repair_mismatch_remaining
+    )).length,
+    not_applied_count: results.filter((row) => row.replay_outcome === "not_applied").length,
+    mismatch_remaining_after_attempt_count: results.filter((row) => (
+      row.repair_attempted && row.post_repair_mismatch_remaining
+    )).length,
+  };
+}
+
 function parseFloat8Hex(value) {
   if (value === null || value === undefined) {
     return null;
@@ -1233,8 +1333,14 @@ async function replayObservationsForRepairBucket(mainClient, observsClient, mism
     hour_start: mismatch.hour_start,
     fetch_pages: pagesFetched,
     rows_selected: rawRows.length,
+    rows_submitted: observsRows.length,
     rows_replayed: rowsReplayed,
     receipts_upserted: receiptsUpserted,
+    ...classifyRepairReplayOutcome({
+      rowsSelected: rawRows.length,
+      rowsSubmitted: observsRows.length,
+      rowsReplayed,
+    }),
   };
 }
 
@@ -1954,12 +2060,16 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
             repairCandidate,
             deleteEligiblePollutantCodes,
           );
+          const [repairOutcome] = attachRepairPostRecheckOutcomes(
+            [replayResult],
+            recheck.mismatch ? [recheck.mismatch] : [],
+          );
           repairPilot = {
             attempted: true,
             connector_id: repairCandidate.connector_id,
             hour_start: repairCandidate.hour_start,
             initial_reason: repairCandidate.reason,
-            replay: replayResult,
+            replay: repairOutcome,
             recheck,
           };
           logStructured("INFO", "repair_one_mismatch_bucket_result", {
@@ -2019,14 +2129,24 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
           mismatch,
         );
         repairReplayResults.push(replayResult);
-        logStructured("INFO", "hour_bucket_repair_replay_result", {
-          run_id: runId,
-          connector_id: replayResult.connector_id,
-          hour_start: replayResult.hour_start,
-          rows_selected: replayResult.rows_selected,
-          rows_replayed: replayResult.rows_replayed,
-          receipts_upserted: replayResult.receipts_upserted,
-        });
+        logStructured(
+          replayResult.replay_outcome === "applied" ? "INFO" : "WARNING",
+          "hour_bucket_repair_replay_result",
+          {
+            run_id: runId,
+            connector_id: replayResult.connector_id,
+            hour_start: replayResult.hour_start,
+            repair_attempted: replayResult.repair_attempted,
+            replay_outcome: replayResult.replay_outcome,
+            replay_not_applied_reason: replayResult.replay_not_applied_reason,
+            rows_selected: replayResult.rows_selected,
+            rows_submitted: replayResult.rows_submitted,
+            rows_replayed: replayResult.rows_replayed,
+            receipts_upserted: replayResult.receipts_upserted,
+            receipt_semantics: replayResult.receipt_semantics,
+            operator_recovery_required_if_mismatch_persists: true,
+          },
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const errorPayload = {
@@ -2101,10 +2221,32 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
       pollutantCodes: deleteEligiblePollutantCodes,
     });
 
+  const repairOutcomeResults = attachRepairPostRecheckOutcomes(
+    repairReplayResults,
+    mismatchesAfterRepair,
+  );
+  const repairOutcomeByBucket = new Map(repairOutcomeResults.map((result) => [
+    buildBucketKey(result.connector_id, result.hour_start),
+    result,
+  ]));
+
   for (const mismatch of mismatchesAfterRepair) {
+    const repairOutcome = repairOutcomeByBucket.get(
+      buildBucketKey(mismatch.connector_id, mismatch.hour_start),
+    ) ?? null;
     logStructured("ERROR", "hour_bucket_mismatch_after_repair", {
       run_id: runId,
       ...mismatch,
+      repair_attempted: repairOutcome?.repair_attempted ?? false,
+      repair_replay_outcome: repairOutcome?.replay_outcome ?? null,
+      repair_replay_not_applied_reason: repairOutcome?.replay_not_applied_reason ?? null,
+      repair_rows_selected: repairOutcome?.rows_selected ?? 0,
+      repair_rows_submitted: repairOutcome?.rows_submitted ?? 0,
+      repair_rows_replayed: repairOutcome?.rows_replayed ?? 0,
+      repair_receipts_upserted: repairOutcome?.receipts_upserted ?? 0,
+      repair_receipt_semantics: repairOutcome?.receipt_semantics ?? null,
+      operator_recovery_required: repairOutcome?.operator_recovery_required ?? false,
+      operator_recovery_message: repairOutcome?.operator_recovery_message ?? null,
     });
   }
   for (const bucket of repairedNowDeletableBuckets) {
@@ -2156,28 +2298,35 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   const capAfterRepairWarnings = [];
 
   const finalMismatchCount = mismatchesAfterRepair.length;
-  const totalRowsSelectedForRepair = repairReplayResults.reduce(
+  const totalRowsSelectedForRepair = repairOutcomeResults.reduce(
     (total, row) => total + BigInt(row.rows_selected),
     0n,
   );
-  const totalRowsReplayedForRepair = repairReplayResults.reduce(
+  const totalRowsReplayedForRepair = repairOutcomeResults.reduce(
     (total, row) => total + BigInt(row.rows_replayed),
     0n,
   );
-  const totalReceiptsUpsertedForRepair = repairReplayResults.reduce(
+  const totalReceiptsUpsertedForRepair = repairOutcomeResults.reduce(
     (total, row) => total + BigInt(row.receipts_upserted),
     0n,
   );
+  const repairOutcomeCounts = summarizeRepairReplayOutcomes(repairOutcomeResults);
 
   const runSummary = {
     ...summaryBase,
     repairable_mismatch_bucket_count: repairableMismatches.length,
-    repair_replay_success_count: repairReplayResults.length,
+    repair_replay_attempt_count: repairOutcomeCounts.attempt_count,
+    repair_replay_applied_count: repairOutcomeCounts.applied_count,
+    repair_replay_success_count: repairOutcomeCounts.success_count,
+    repair_replay_not_applied_count: repairOutcomeCounts.not_applied_count,
     repair_replay_error_count: repairReplayErrors.length,
     repair_rows_selected_total: totalRowsSelectedForRepair.toString(),
     repair_rows_replayed_total: totalRowsReplayedForRepair.toString(),
     repair_receipts_upserted_total: totalReceiptsUpsertedForRepair.toString(),
+    repair_receipt_semantics: REPAIR_RECEIPT_SEMANTICS,
     mismatch_after_repair_count: finalMismatchCount,
+    repair_mismatch_remaining_after_attempt_count:
+      repairOutcomeCounts.mismatch_remaining_after_attempt_count,
     repaired_now_deletable_bucket_count: repairedNowDeletableBuckets.length,
     repaired_now_deletable_bucket_count_before_history_gate: repairedNowDeletableBuckets.length,
     connector_history_gate_allowed_after_repair_bucket_count: repairedNowDeletableBuckets.filter((bucket) => (
@@ -2222,7 +2371,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     mismatches_before_repair_preview: sampleRows(mismatches),
     mismatches_after_repair_preview: sampleRows(mismatchesAfterRepair),
     connector_history_gate_blocked_after_repair_buckets_preview: sampleRows(historyGateBlockedAfterRepairBuckets),
-    repair_replay_results_preview: sampleRows(repairReplayResults),
+    repair_replay_results_preview: sampleRows(repairOutcomeResults),
     repair_replay_errors_preview: sampleRows(repairReplayErrors),
     delete_errors_preview: sampleRows(deleteErrors),
     cap_warnings_preview: sampleRows(capWarnings),
