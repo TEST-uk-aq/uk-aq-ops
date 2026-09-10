@@ -38,6 +38,9 @@ import {
   OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
   observationsGlobalOperationLockIdentity,
 } from "../workers/shared/uk_aq_r2_history_writer.mjs";
+import {
+  getObservationHistoryGeneration,
+} from "../workers/shared/uk_aq_observation_history_generation.mjs";
 
 const BINDING_PREFIX = "history/_index_v2/timeseries_binding";
 const PACK_PREFIX = "history/_backup_packs_v1/timeseries_binding";
@@ -235,9 +238,10 @@ function makeSyntheticInventory(rangeCount, memberCount) {
   };
 }
 
-function lockEnv() {
+function lockEnv(historyVersion = "v2") {
   const identity = observationsGlobalOperationLockIdentity();
   return {
+    UK_AQ_R2_HISTORY_VERSION: historyVersion,
     [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: "true",
     [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: "r2_history_dropbox_backup",
     [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: "backup:phase2-test",
@@ -256,16 +260,17 @@ function lockedArgs(
   historyIndexVersion = "v2",
   destRoot = NORMAL_TEST_DROPBOX_BACKUP_DESTINATION,
 ) {
+  const generation = getObservationHistoryGeneration(historyIndexVersion);
   return parseLockedHistoryBackupArgs([
     "--source-root", "uk_aq_r2:uk-aq-history-cic-test",
     "--dest-root", destRoot,
-    "--observations-prefix", "history/v2/observations",
-    "--runs-prefix", "history/v2/_ops/observations/runs",
-    "--core-prefix", "history/v2/core",
-    "--timeseries-binding-prefix", BINDING_PREFIX,
+    "--observations-prefix", generation.observations_prefix,
+    "--runs-prefix", generation.observations_runs_prefix,
+    "--core-prefix", generation.core_prefix,
+    "--timeseries-binding-prefix", generation.timeseries_binding_index_prefix,
     "--history-index-version", historyIndexVersion,
-    "--inventory-root-prefix", "history/_index_v2/backup_inventory_v2",
-    "--state-root-prefix", STATE_PREFIX,
+    "--inventory-root-prefix", generation.backup_inventory_prefix,
+    "--state-root-prefix", generation.backup_state_prefix,
     "--inventory-report-out", "tmp/inventory.json",
     "--backup-report-out", "tmp/backup.json",
     ...extra,
@@ -720,8 +725,10 @@ test("mode validation is exact and pack-only destination allow-list is fail-clos
   assert.equal(isolated.timeseriesBindingPacksOnly, true);
 });
 
-test("locked wrapper keeps individual at two children and orders dual publisher before inventory and sync", () => {
+test("locked wrapper logs coarse stages and orders dual publisher before inventory and sync", () => {
   const individualCalls = [];
+  const individualLogs = [];
+  let individualNowMs = 0;
   runLockedHistoryBackup({
     args: lockedArgs(),
     env: lockEnv(),
@@ -729,18 +736,38 @@ test("locked wrapper keeps individual at two children and orders dual publisher 
       individualCalls.push(commandArgs);
       return { status: 0, signal: null, error: null };
     },
+    log: (message) => individualLogs.push(message),
+    now: () => {
+      const value = individualNowMs;
+      individualNowMs += 1000;
+      return value;
+    },
   });
   assert.equal(individualCalls.length, 2);
   assert.match(individualCalls[0][0], /build_backup_inventory\.mjs$/);
   assert.match(individualCalls[1][0], /sync_history_to_dropbox\.mjs$/);
+  assert.deepEqual(individualLogs, [
+    "[1970-01-01T00:00:00.000Z] R2 history backup stage: building backup inventory",
+    "[1970-01-01T00:00:01.000Z] R2 history backup stage complete: backup inventory (elapsed 1.0s)",
+    "[1970-01-01T00:00:02.000Z] R2 history backup stage: syncing history to Dropbox",
+    "[1970-01-01T00:00:03.000Z] R2 history backup stage complete: Dropbox sync (elapsed 1.0s)",
+  ]);
 
   const dualCalls = [];
+  const dualLogs = [];
+  let dualNowMs = 0;
   runLockedHistoryBackup({
     args: lockedArgs(["--timeseries-binding-backup-mode", "dual", "--dry-run"]),
     env: lockEnv(),
     run: (_command, commandArgs) => {
       dualCalls.push(commandArgs);
       return { status: 0, signal: null, error: null };
+    },
+    log: (message) => dualLogs.push(message),
+    now: () => {
+      const value = dualNowMs;
+      dualNowMs += 1000;
+      return value;
     },
   });
   assert.equal(dualCalls.length, 3);
@@ -750,6 +777,14 @@ test("locked wrapper keeps individual at two children and orders dual publisher 
   assert.equal(dualCalls[0].includes("--dry-run"), true);
   assert.equal(dualCalls[1].includes("--dry-run"), false);
   assert.equal(dualCalls[2].includes("--dry-run"), true);
+  assert.deepEqual(dualLogs, [
+    "[1970-01-01T00:00:00.000Z] R2 history backup stage: building timeseries-binding packs",
+    "[1970-01-01T00:00:01.000Z] R2 history backup stage complete: timeseries-binding packs (elapsed 1.0s)",
+    "[1970-01-01T00:00:02.000Z] R2 history backup stage: building backup inventory",
+    "[1970-01-01T00:00:03.000Z] R2 history backup stage complete: backup inventory (elapsed 1.0s)",
+    "[1970-01-01T00:00:04.000Z] R2 history backup stage: syncing history to Dropbox",
+    "[1970-01-01T00:00:05.000Z] R2 history backup stage complete: Dropbox sync (elapsed 1.0s)",
+  ]);
 });
 
 test("locked wrapper forwards v2 and v3 unchanged and the resolver returns exact paths", () => {
@@ -760,7 +795,7 @@ test("locked wrapper forwards v2 and v3 unchanged and the resolver returns exact
     const calls = [];
     runLockedHistoryBackup({
       args: lockedArgs([], historyIndexVersion),
-      env: lockEnv(),
+      env: lockEnv(historyIndexVersion),
       run: (_command, commandArgs) => {
         calls.push(commandArgs);
         return { status: 0, signal: null, error: null };

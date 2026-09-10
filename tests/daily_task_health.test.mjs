@@ -6,6 +6,38 @@ import {
   formatDailyTaskError,
   summarizeForDailyTaskHealth,
 } from "../workers/shared/daily_task_health.mjs";
+import {
+  buildBackupVersionDetails,
+} from "../scripts/report_daily_task_health.mjs";
+
+test("backup health details use complete v2/v3 generation inventory roots and retain v1", () => {
+  assert.deepEqual(buildBackupVersionDetails({ UK_AQ_R2_HISTORY_VERSION: "v1" }), {
+    history_version: "v1",
+    backup_version: "v1",
+    inventory_rel_path: "history/_index/backup_inventory_v1.json",
+  });
+  assert.deepEqual(buildBackupVersionDetails({ UK_AQ_R2_HISTORY_VERSION: "v2" }), {
+    history_version: "v2",
+    backup_version: "v2",
+    inventory_rel_path: "history/_index_v2/backup_inventory_v2/root.json",
+  });
+  assert.deepEqual(buildBackupVersionDetails({ UK_AQ_R2_HISTORY_VERSION: "v3" }), {
+    history_version: "v3",
+    backup_version: "v3",
+    inventory_rel_path: "history/_index_v3/backup_inventory_v2/root.json",
+  });
+  assert.throws(
+    () => buildBackupVersionDetails({ UK_AQ_R2_HISTORY_VERSION: "v4" }),
+    /expected v1, v2, or v3/,
+  );
+  assert.throws(
+    () => buildBackupVersionDetails({
+      UK_AQ_R2_HISTORY_VERSION: "v3",
+      UK_AQ_R2_HISTORY_BACKUP_VERSION: "v2",
+    }),
+    /no longer supports UK_AQ_R2_HISTORY_BACKUP_VERSION/,
+  );
+});
 
 test("summarizeForDailyTaskHealth converts BigInt values and circular references", () => {
   const input = {

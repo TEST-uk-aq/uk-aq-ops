@@ -126,6 +126,21 @@ function runRequired(command, commandArgs, { env, run = spawnSync }) {
   }
 }
 
+function reportStageStarted(label, { log, now }) {
+  const startedAtMs = now();
+  log(`[${new Date(startedAtMs).toISOString()}] R2 history backup stage: ${label}`);
+  return startedAtMs;
+}
+
+function reportStageComplete(label, startedAtMs, { log, now }) {
+  const completedAtMs = now();
+  const elapsedSeconds = Math.max(0, completedAtMs - startedAtMs) / 1000;
+  log(
+    `[${new Date(completedAtMs).toISOString()}] R2 history backup stage complete: ${label} `
+    + `(elapsed ${elapsedSeconds.toFixed(1)}s)`,
+  );
+}
+
 export function requireLockedHistoryBackupMutation({
   dryRun = false,
   env = process.env,
@@ -141,6 +156,8 @@ export function runLockedHistoryBackup({
   args,
   env = process.env,
   run = spawnSync,
+  log = (message) => console.log(message),
+  now = Date.now,
 } = {}) {
   const lock = requireObservationsGlobalOperationLockContext({
     env,
@@ -169,6 +186,10 @@ export function runLockedHistoryBackup({
       args.corePrefix !== generation.core_prefix) throw new Error("Backup arguments contradict selected complete generation");
   const node = process.execPath;
   if (args.timeseriesBindingBackupMode !== "individual") {
+    const packStartedAtMs = reportStageStarted("building timeseries-binding packs", {
+      log,
+      now,
+    });
     runRequired(node, [
       "scripts/backup_r2/publish_timeseries_binding_backup_packs.mjs",
       "--binding-prefix", args.timeseriesBindingPrefix,
@@ -178,7 +199,12 @@ export function runLockedHistoryBackup({
         : []),
       args.dryRun ? "--dry-run" : "--write-r2",
     ], { env, run });
+    reportStageComplete("timeseries-binding packs", packStartedAtMs, { log, now });
   }
+  const inventoryStartedAtMs = reportStageStarted("building backup inventory", {
+    log,
+    now,
+  });
   runRequired(node, [
     "scripts/backup_r2/build_backup_inventory.mjs",
     "--source-root", args.sourceRoot,
@@ -192,6 +218,11 @@ export function runLockedHistoryBackup({
     "--inventory-root-prefix", args.inventoryRootPrefix,
     "--report-out", args.inventoryReportOut,
   ], { env, run });
+  reportStageComplete("backup inventory", inventoryStartedAtMs, { log, now });
+  const syncStartedAtMs = reportStageStarted("syncing history to Dropbox", {
+    log,
+    now,
+  });
   runRequired(node, [
     "scripts/backup_r2/sync_history_to_dropbox.mjs",
     "--source-root", args.sourceRoot,
@@ -208,6 +239,7 @@ export function runLockedHistoryBackup({
     ...(args.allowExperimentalPackOnly ? ["--allow-experimental-pack-only"] : []),
     ...(args.timeseriesBindingPacksOnly ? ["--timeseries-binding-packs-only"] : []),
   ], { env, run });
+  reportStageComplete("Dropbox sync", syncStartedAtMs, { log, now });
   return {
     ok: true,
     observations_global_operation_lock: {

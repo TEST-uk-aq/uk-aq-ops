@@ -1,9 +1,13 @@
 import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 
 import {
   deprecatedR2HistoryVersionVarsPresent,
   parseR2HistoryVersion,
 } from "../workers/shared/uk_aq_r2_history_version.mjs";
+import {
+  getObservationHistoryGeneration,
+} from "../workers/shared/uk_aq_observation_history_generation.mjs";
 
 const RPC_SCHEMA = "uk_aq_public";
 const RESERVED_SUMMARY_FIELDS = new Set([
@@ -124,31 +128,43 @@ function mapReportStage(rawStage) {
   throw new Error(`Invalid DAILY_TASK_HEALTH_REPORT_STAGE: ${rawStage}`);
 }
 
-function buildBackupVersionDetails() {
-  const deprecated = deprecatedR2HistoryVersionVarsPresent(process.env);
+export function buildBackupVersionDetails(env = process.env) {
+  const deprecated = deprecatedR2HistoryVersionVarsPresent(env);
   if (deprecated.length > 0) {
     throw new Error(
       `Daily task health no longer supports ${deprecated.join(", ")}. `
-      + "Use UK_AQ_R2_HISTORY_VERSION=v1|v2 and delete the old split read/write/backup vars.",
+      + "Use UK_AQ_R2_HISTORY_VERSION=v1|v2|v3 and delete the old split read/write/backup vars.",
     );
   }
 
-  const rawHistoryVersion = optionalEnv("UK_AQ_R2_HISTORY_VERSION");
+  const rawHistoryVersion = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
   if (!rawHistoryVersion) {
     return null;
   }
 
-  const historyVersion = parseR2HistoryVersion(rawHistoryVersion);
-
-  const inventoryRelPaths = {
-    v1: "history/_index/backup_inventory_v1.json",
-    v2: "history/_index_v2/backup_inventory_v2/root.json",
-  };
+  const normalizedHistoryVersion = rawHistoryVersion.toLowerCase();
+  let historyVersion;
+  let inventoryRelPath;
+  if (normalizedHistoryVersion === "v1") {
+    historyVersion = parseR2HistoryVersion(rawHistoryVersion);
+    inventoryRelPath = "history/_index/backup_inventory_v1.json";
+  } else if (
+    normalizedHistoryVersion === "v2"
+    || normalizedHistoryVersion === "v3"
+  ) {
+    const generation = getObservationHistoryGeneration(normalizedHistoryVersion);
+    historyVersion = generation.version;
+    inventoryRelPath = `${generation.backup_inventory_prefix}/root.json`;
+  } else {
+    throw new Error(
+      `Invalid UK_AQ_R2_HISTORY_VERSION=${JSON.stringify(rawHistoryVersion)}; expected v1, v2, or v3.`,
+    );
+  }
 
   const details = {
     history_version: historyVersion,
     backup_version: historyVersion,
-    inventory_rel_path: inventoryRelPaths[historyVersion] || null,
+    inventory_rel_path: inventoryRelPath,
   };
 
   return details;
@@ -229,7 +245,7 @@ function stripUndefined(input) {
   return input;
 }
 
-async function main() {
+export async function main() {
   const disabled = parseBoolean(process.env.DAILY_TASK_HEALTH_DISABLED, false);
   const strict = parseBoolean(process.env.DAILY_TASK_HEALTH_STRICT, false);
   if (disabled) {
@@ -372,4 +388,7 @@ async function main() {
   }
 }
 
-await main();
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  await main();
+}
