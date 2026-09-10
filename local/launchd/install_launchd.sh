@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Installs (or reloads) the test dashboard and cloudflared launchd services.
-# Run once after setting up .env and ~/.cloudflared/config.yml.
+# Installs (or reloads) the test dashboard, dashboard cache refresher, and cloudflared launchd services.
+# Run once after setting up .env, dashboard cache env files, and ~/.cloudflared/config.yml.
 # The live dashboard is installed separately from the LIVE-uk-aq-ops repo.
 set -euo pipefail
 
@@ -12,6 +12,7 @@ mkdir -p "$AGENTS_DIR" "$LOGS_DIR"
 
 PLISTS=(
   co.uk.chronicillnesschannel.aq.dashboard.test.plist
+  co.uk.chronicillnesschannel.aq.dashboard-cache.test.plist
   co.uk.chronicillnesschannel.aq.cloudflared.plist
 )
 
@@ -34,4 +35,5 @@ echo "  launchctl list | grep chronicillnesschannel"
 echo ""
 echo "View logs:"
 echo "  tail -f $LOGS_DIR/dashboard_test.log"
+echo "  tail -f $LOGS_DIR/dashboard_cache_test.log"
 echo "  tail -f $LOGS_DIR/cloudflared.log"
