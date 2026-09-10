@@ -1532,7 +1532,7 @@ function filterDropboxBackupDaysForReadVersion(
   if (!r2Days) {
     return {
       days: { observations: new Set<string>(), aqilevels: new Set<string>() },
-      warning: "Active R2 history version is v2 but explicit v2 history-days data is unavailable; ignoring Dropbox checkpoint day coverage because it is not verified.",
+      warning: `Active R2 history version is ${readVersion.version} but explicit ${readVersion.version} history-days data is unavailable; ignoring Dropbox checkpoint day coverage because it is not verified.`,
     };
   }
 
@@ -1550,12 +1550,12 @@ function filterDropboxBackupDaysForReadVersion(
     }
     if (r2Bounds.earliest && dropboxBounds.earliest && dropboxBounds.earliest < r2Bounds.earliest) {
       warnings.push(
-        `Dropbox v2 ${domainName} checkpoint claims ${dropboxBounds.earliest} before explicit v2 R2 history starts at ${r2Bounds.earliest}; earlier Dropbox days ignored.`,
+        `Dropbox ${domainName} checkpoint claims ${dropboxBounds.earliest} before explicit ${readVersion.version} R2 history starts at ${r2Bounds.earliest}; earlier Dropbox days ignored.`,
       );
     }
     const ignoredCount = dropboxSet.size - filtered[domainName].size;
     if (ignoredCount > 0) {
-      warnings.push(`Ignored ${ignoredCount} unverified Dropbox v2 ${domainName} day(s).`);
+      warnings.push(`Ignored ${ignoredCount} unverified Dropbox ${domainName} day(s) for the ${readVersion.version} serving generation.`);
     }
   }
   return { days: filtered, warning: warnings.length ? warnings.join(" ") : null };
@@ -1979,7 +1979,7 @@ async function fetchDashboardBaseData(
       }
     } else if (!r2_backup_window && ["v2", "v3"].includes(r2_history_read_version.version)) {
       r2_backup_window_error = r2_history_days_error ||
-        "R2 history-days API did not return a v2 window; version-blind Supabase window fallback disabled for v2.";
+        `R2 history-days API did not return a ${r2_history_read_version.version} window; version-blind Supabase window fallback disabled for the selected serving generation.`;
     }
     if (options.includeStorageCoverage) {
       storage_coverage_days = buildStorageCoverageRows(
@@ -2166,7 +2166,7 @@ export async function getDirectR2MetricsPayload(
   const fallbackWindow = ["v2", "v3"].includes(r2History.readVersion.version)
     ? {
       window: null,
-      error: "Version-blind Supabase window fallback disabled for v2.",
+      error: `Version-blind Supabase window fallback disabled for the ${r2History.readVersion.version} serving generation.`,
     }
     : await fetchR2BackupWindowFromSupabase(env);
   const window = r2History.window || fallbackWindow.window;

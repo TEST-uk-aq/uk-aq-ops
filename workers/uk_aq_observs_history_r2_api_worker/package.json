@@ -1,14 +1,13 @@
 {
-  "name": "uk-aq-ops-dashboard-api-worker",
+  "name": "uk-aq-observs-history-r2-api-worker",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "scripts": {
-    "check": "tsc --noEmit",
-    "deploy": "wrangler deploy"
+  "dependencies": {
+    "hyparquet": "1.25.1",
+    "hyparquet-compressors": "1.1.1"
   },
   "devDependencies": {
-    "typescript": "^5.9.2",
     "wrangler": "4.130.0"
   },
   "overrides": {

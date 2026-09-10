@@ -1936,9 +1936,11 @@ def _filter_dropbox_backup_days_for_read_version(
 ) -> Tuple[Dict[str, Set[date]], Optional[str]]:
     if read_version_info.get("version") not in {"v2", "v3"}:
         return dropbox_days, None
+    selected_version = str(read_version_info["version"])
     if not isinstance(r2_history_days, dict):
         return _empty_dropbox_backup_days(), (
-            "Active R2 history version is v2 but explicit v2 history-days data is unavailable; "
+            f"Active R2 history version is {selected_version} but explicit "
+            f"{selected_version} history-days data is unavailable; "
             "ignoring Dropbox checkpoint day coverage because it is not verified."
         )
 
@@ -1950,12 +1952,16 @@ def _filter_dropbox_backup_days_for_read_version(
         filtered[domain_name] = raw_days & r2_days
         if r2_days and raw_days and min(raw_days) < min(r2_days):
             warnings.append(
-                f"Dropbox v2 {domain_name} checkpoint claims {min(raw_days).isoformat()} "
-                f"before explicit v2 R2 history starts at {min(r2_days).isoformat()}; earlier Dropbox days ignored."
+                f"Dropbox {domain_name} checkpoint claims {min(raw_days).isoformat()} "
+                f"before explicit {selected_version} R2 history starts at {min(r2_days).isoformat()}; "
+                "earlier Dropbox days ignored."
             )
         ignored_count = len(raw_days) - len(filtered[domain_name])
         if ignored_count > 0:
-            warnings.append(f"Ignored {ignored_count} unverified Dropbox v2 {domain_name} day(s).")
+            warnings.append(
+                f"Ignored {ignored_count} unverified Dropbox {domain_name} day(s) "
+                f"for the {selected_version} serving generation."
+            )
     return filtered, " ".join(warnings) if warnings else None
 
 

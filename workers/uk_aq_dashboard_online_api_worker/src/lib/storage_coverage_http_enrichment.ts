@@ -414,7 +414,9 @@ async function loadSources(request: Request, env: WorkerEnv): Promise<SourceSnap
     const url = new URL(historyUrl);
     url.searchParams.set("read_version", version);
     url.searchParams.set("max_days", "3660");
-    return fetchJsonObject(url.toString(), resolveHistoryToken(env));
+    const payload = await fetchJsonObject(url.toString(), resolveHistoryToken(env));
+    assertHistoryPayload(payload, env);
+    return payload;
   })();
 
   const dbPromise = (async () => {

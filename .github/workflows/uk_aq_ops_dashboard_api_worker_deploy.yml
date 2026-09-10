@@ -1,12 +1,7 @@
 name: Deploy UK AQ Ops Dashboard API Worker
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "workers/uk_aq_dashboard_online_api_worker/**"
-      - ".github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml"
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -42,6 +37,8 @@ jobs:
       UK_AQ_R2_HISTORY_COUNTS_API_TOKEN: ${{ secrets.UK_AQ_R2_HISTORY_COUNTS_API_TOKEN || '' }}
       UK_AQ_OBSERVS_HISTORY_R2_API_URL: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_URL || '' }}
       UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
+      UK_AQ_AQI_HISTORY_R2_API_URL: ${{ vars.UK_AQ_AQI_HISTORY_R2_API_URL || '' }}
+      UK_AQ_AQI_HISTORY_R2_API_TOKEN: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
       UK_AQ_R2_METRICS_SERVICE_BINDING_ENABLED: ${{ vars.UK_AQ_R2_METRICS_SERVICE_BINDING_ENABLED || 'false' }}
       UK_AQ_R2_HISTORY_WINDOW_RPC: ${{ vars.UK_AQ_R2_HISTORY_WINDOW_RPC || 'uk_aq_rpc_r2_history_window' }}
       UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
@@ -58,10 +55,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -168,7 +165,7 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
-        run: npx wrangler deploy --config wrangler.deploy.toml --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"
+        run: ./node_modules/.bin/wrangler deploy --config wrangler.deploy.toml --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"
 
       - name: Set Worker secrets
         working-directory: workers/uk_aq_dashboard_online_api_worker
@@ -200,6 +197,8 @@ jobs:
             --arg UK_AQ_R2_HISTORY_COUNTS_API_TOKEN "${UK_AQ_R2_HISTORY_COUNTS_API_TOKEN}" \
             --arg UK_AQ_OBSERVS_HISTORY_R2_API_URL "${UK_AQ_OBSERVS_HISTORY_R2_API_URL}" \
             --arg UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN "${UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN}" \
+            --arg UK_AQ_AQI_HISTORY_R2_API_URL "${UK_AQ_AQI_HISTORY_R2_API_URL}" \
+            --arg UK_AQ_AQI_HISTORY_R2_API_TOKEN "${UK_AQ_AQI_HISTORY_R2_API_TOKEN}" \
             --arg UK_AQ_R2_HISTORY_WINDOW_RPC "${UK_AQ_R2_HISTORY_WINDOW_RPC}" \
             --arg UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID "${UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID}" \
             --arg UK_AQ_R2_CLOUDFLARE_API_TOKEN "${UK_AQ_R2_CLOUDFLARE_API_TOKEN}" \
@@ -234,6 +233,8 @@ jobs:
               UK_AQ_R2_HISTORY_COUNTS_API_TOKEN: $UK_AQ_R2_HISTORY_COUNTS_API_TOKEN,
               UK_AQ_OBSERVS_HISTORY_R2_API_URL: $UK_AQ_OBSERVS_HISTORY_R2_API_URL,
               UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN: $UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN,
+              UK_AQ_AQI_HISTORY_R2_API_URL: $UK_AQ_AQI_HISTORY_R2_API_URL,
+              UK_AQ_AQI_HISTORY_R2_API_TOKEN: $UK_AQ_AQI_HISTORY_R2_API_TOKEN,
               UK_AQ_R2_HISTORY_WINDOW_RPC: $UK_AQ_R2_HISTORY_WINDOW_RPC,
               UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: $UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID,
               UK_AQ_R2_CLOUDFLARE_API_TOKEN: $UK_AQ_R2_CLOUDFLARE_API_TOKEN,
@@ -249,7 +250,7 @@ jobs:
             } | with_entries(select(.value != ""))')"
 
           for attempt in 1 2 3; do
-            if printf '%s' "${secrets_json}" | npx wrangler secret bulk --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"; then
+            if printf '%s' "${secrets_json}" | ./node_modules/.bin/wrangler secret bulk --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"; then
               exit 0
             fi
             if [ "${attempt}" -eq 3 ]; then
@@ -264,4 +265,4 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
-        run: npx wrangler deploy --config wrangler.deploy.toml --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"
+        run: ./node_modules/.bin/wrangler deploy --config wrangler.deploy.toml --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"

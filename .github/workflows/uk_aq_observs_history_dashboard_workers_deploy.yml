@@ -1,0 +1,110 @@
+name: Deploy observations-history and dashboard API Workers
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "workers/uk_aq_observs_history_r2_api_worker/**"
+      - "workers/shared/uk_aq_observation_history_generation.mjs"
+      - "workers/shared/uk_aq_r2_history_version.mjs"
+      - "workers/uk_aq_dashboard_online_api_worker/**"
+      - ".github/workflows/uk_aq_observs_history_dashboard_workers_deploy.yml"
+      - ".github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml"
+      - ".github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml"
+  workflow_dispatch:
+    inputs:
+      deploy_observations_history:
+        description: Deploy the stable observations-history Worker
+        required: true
+        default: true
+        type: boolean
+      deploy_dashboard_api:
+        description: Deploy the dashboard API Worker
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-observs-history-dashboard-workers-${{ github.ref }}
+  queue: max
+
+jobs:
+  select_deployments:
+    runs-on: ubuntu-latest
+    outputs:
+      observations_history: ${{ steps.scope.outputs.observations_history }}
+      dashboard_api: ${{ steps.scope.outputs.dashboard_api }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Select required deployments
+        id: scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DEPLOY_OBSERVATIONS_HISTORY: ${{ inputs.deploy_observations_history }}
+          DEPLOY_DASHBOARD_API: ${{ inputs.deploy_dashboard_api }}
+        run: |
+          set -euo pipefail
+
+          observations_history=false
+          dashboard_api=false
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            observations_history="${DEPLOY_OBSERVATIONS_HISTORY}"
+            dashboard_api="${DEPLOY_DASHBOARD_API}"
+          else
+            changed_paths="${RUNNER_TEMP}/uk_aq_worker_deploy_changed_paths.txt"
+            if [[ "${PUSH_BEFORE}" =~ ^0+$ ]]; then
+              git ls-files > "${changed_paths}"
+            else
+              git diff --name-only "${PUSH_BEFORE}" "${GITHUB_SHA}" > "${changed_paths}"
+            fi
+
+            while IFS= read -r changed_path; do
+              case "${changed_path}" in
+                workers/uk_aq_observs_history_r2_api_worker/*|workers/shared/uk_aq_observation_history_generation.mjs|workers/shared/uk_aq_r2_history_version.mjs|.github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml)
+                  observations_history=true
+                  ;;
+                workers/uk_aq_dashboard_online_api_worker/*|.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml)
+                  dashboard_api=true
+                  ;;
+                .github/workflows/uk_aq_observs_history_dashboard_workers_deploy.yml)
+                  observations_history=true
+                  dashboard_api=true
+                  ;;
+              esac
+            done < "${changed_paths}"
+          fi
+
+          printf 'observations_history=%s\n' "${observations_history}" >> "${GITHUB_OUTPUT}"
+          printf 'dashboard_api=%s\n' "${dashboard_api}" >> "${GITHUB_OUTPUT}"
+
+  deploy_observations_history:
+    needs: select_deployments
+    if: needs.select_deployments.outputs.observations_history == 'true'
+    uses: ./.github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml
+    secrets: inherit
+
+  deploy_dashboard_api:
+    needs:
+      - select_deployments
+      - deploy_observations_history
+    if: >-
+      ${{
+        always() &&
+        needs.select_deployments.result == 'success' &&
+        needs.select_deployments.outputs.dashboard_api == 'true' &&
+        (needs.deploy_observations_history.result == 'success' ||
+         needs.deploy_observations_history.result == 'skipped')
+      }}
+    uses: ./.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml
+    secrets: inherit

@@ -1,7 +1,8 @@
 # Local dashboard cache and shared history authority
 
-Implementation is uncommitted and requires real TEST acceptance. No database,
-Worker deployment or launchd registration is performed by these files.
+The implementation has been committed and deployed, but still requires real TEST
+acceptance. No database, Worker deployment or launchd registration is performed
+by this README.
 
 ## Separation
 

@@ -104,7 +104,7 @@ Cache behavior:
 
 Optional env:
 
-- `UK_AQ_R2_HISTORY_VERSION` (required `v1|v2`, canonical active selector. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
+- `UK_AQ_R2_HISTORY_VERSION` (required `v2|v3`, canonical active selector. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
 - `UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS` (default `300`, clamp `30..604800`)
 - `UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS` (default `86400`, clamp `30..604800`)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
