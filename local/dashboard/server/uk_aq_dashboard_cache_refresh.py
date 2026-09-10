@@ -50,6 +50,8 @@ def main():
                 except Exception:
                     rolling.record_sync_failure("daily_task_runs")
                     raise
+                print("dashboard_cache_refresh product=daily_task_runs generation=none status=success", flush=True)
+                return cache.PRODUCT_SECONDS[product], True
             elif product == "dashboard":
                 try:
                     rolling.sync_ingest_runs(core, base_url=base, service_role_key=key)
@@ -70,15 +72,12 @@ def main():
                     raise
 
             payload = cache.build_product(core, product, base, key)
-            resolution = None
-            if product != "daily_task_runs":
-                resolution = resolve_history_generation(force=True)
-                if resolution["version"] != expected: raise RuntimeError("generation_changed")
+            resolution = resolve_history_generation(force=True)
+            if resolution["version"] != expected: raise RuntimeError("generation_changed")
             expires = cache.utcnow() + timedelta(seconds=cache.PRODUCT_SECONDS[product])
             if product == "storage_coverage":
                 expires = core._next_storage_coverage_refresh(datetime.now(timezone.utc)).replace(tzinfo=None)
-            if product != "daily_task_runs":
-                payload["r2_history_read_version"] = resolution
+            payload["r2_history_read_version"] = resolution
             if product == "r2_metrics":
                 try:
                     rolling.store_r2_usage(payload.get("r2_usage"))
@@ -89,8 +88,9 @@ def main():
             print(f"dashboard_cache_refresh product={product} generation={expected} status=success", flush=True)
             return max(1, (expires - cache.utcnow()).total_seconds()), True
         except Exception:
-            try: cache.record_failure(product, expected)
-            except Exception: pass
+            if product != "daily_task_runs":
+                try: cache.record_failure(product, expected)
+                except Exception: pass
             print(f"dashboard_cache_refresh product={product} generation={expected} status=failed", flush=True)
             return max(60, min(300, cache.PRODUCT_SECONDS[product])), False
         finally:
