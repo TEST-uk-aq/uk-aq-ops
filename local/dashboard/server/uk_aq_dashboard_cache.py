@@ -3,12 +3,13 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs
 
 PRODUCT_SECONDS = {"dashboard": 300, "metric_context": 300, "storage_coverage": 21600,
-                   "r2_metrics": 3600, "daily_task_runs": 60}
+                   "r2_metrics": 3600, "daily_task_runs": 300}
 METRIC_KEYS = ("db_size_metrics", "schema_size_metrics", "r2_domain_size_metrics",
                "db_size_metrics_error", "schema_size_metrics_error", "r2_domain_size_metrics_error",
                "r2_usage", "r2_usage_error", "service_egress_metrics", "service_egress_metrics_error",
@@ -104,6 +105,20 @@ def read_product(product, version):
             "source_generated_at": iso(row["source_generated_at"]), "refreshed_at": iso(row["refreshed_at"]),
             "expires_at": iso(row["expires_at"]), "last_error_code": row["last_error_code"]}
     return payload, meta
+
+
+def wait_for_newer_product(product, version, previous_refreshed_at, timeout_seconds=8.0):
+    """Wait briefly for the independent writer to publish a requested refresh."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            row = read_product(product, version)
+        except Exception:
+            row = None
+        if row and row[1].get("refreshed_at") != previous_refreshed_at:
+            return row
+        time.sleep(0.1)
+    return None
 
 
 def provenance(product):
@@ -216,8 +231,23 @@ def serve_cached_request(handler, parsed):
     if parsed.path == "/api/dashboard":
         if flag("include_metric_context") or flag("include_storage_coverage"): products.append("metric_context")
         if flag("include_storage_coverage"): products.append("storage_coverage")
-    if flag("force", "0"):
+
+    # The Daily Task Runs Refresh button currently sends t=<timestamp> as its
+    # explicit cache-busting signal. Treat that as an on-demand refresh locally,
+    # while also supporting the canonical force=1 form used by other routes.
+    force_requested = flag("force", "0") or (parsed.path == "/api/daily_task_runs" and "t" in query)
+    forced_daily_row = None
+    if force_requested and parsed.path == "/api/daily_task_runs":
+        try:
+            before = read_product("daily_task_runs", "none")
+        except Exception:
+            before = None
+        previous_refreshed_at = before[1].get("refreshed_at") if before else None
+        request_refresh("daily_task_runs")
+        forced_daily_row = wait_for_newer_product("daily_task_runs", "none", previous_refreshed_at)
+    elif force_requested:
         for product in products: request_refresh(product)
+
     sensitive = products != ["daily_task_runs"]
     try:
         resolution = core._ensure_history_generation() if sensitive else None
@@ -226,7 +256,7 @@ def serve_cached_request(handler, parsed):
         for product in products:
             identity = "none" if product == "daily_task_runs" else version
             try:
-                row = read_product(product, identity)
+                row = forced_daily_row if product == "daily_task_runs" and forced_daily_row else read_product(product, identity)
             except CacheConfigurationError:
                 raise
             except Exception:
