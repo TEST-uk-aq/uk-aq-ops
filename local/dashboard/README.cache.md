@@ -111,7 +111,7 @@ The background refresher runs independently of the browser.
 - Service egress: every 5 minutes. Recent mutable minute buckets are re-read with overlap and upserted rather than repeatedly downloading the dashboard's whole graph window.
 - DB-size and schema-size metrics: hourly, with at least two recent hours re-read and upserted. Normal chart rendering reads MySQL.
 - R2 account usage: hourly. The Cloudflare fetch remains asynchronous to the browser and each successful result is persisted as an hourly local point.
-- Storage coverage/calendar: retains its existing six-hour materialised cadence and serving-generation rules.
+- Storage coverage/calendar: retains its existing six-hour materialised cadence and serving-generation rules. Its **Refresh** button creates an environment-local request identity and returns promptly; the browser uses short status polls while the writer associates a post-acceptance rebuild with that identity. On success the browser reads the newly published MySQL product. The existing calendar and last successful snapshot remain visible/in place if that update fails or times out.
 
 Retention pruning happens only inside a successful sync transaction. A failed upstream read must not erase the previously successful local history.
 
@@ -125,7 +125,7 @@ Latest and All runs are therefore display modes over the same local rows. Latest
 
 Normal local R2 account-usage rendering is served from MySQL after a successful hourly background fetch, so a slow Cloudflare response no longer needs to delay the browser. `r2_usage_hourly` also preserves a recent local trend across dashboard/refresher restarts.
 
-Persisting R2 usage does not make the actual Cloudflare API request faster. It moves that latency out of normal page rendering. The storage calendar and its explicit Force Refresh have separate generation-selected history/Dropbox/coverage behaviour and are not changed by this rolling-history rollout.
+Persisting R2 usage does not make the actual Cloudflare API request faster. It moves that latency out of normal page rendering. The storage calendar's explicit Refresh has separate generation-selected history/Dropbox/coverage behaviour and does not refresh R2 account usage or other dashboard products.
 
 ## First real TEST operation after schema apply
 

@@ -38,18 +38,7 @@ def main():
     active = {}; seen_markers = {}; generation = None; completed = set(); failed = set(); pending_refresh = set()
     pending_daily_day = None
 
-    def resolve_storage_requests(requests, status, error=None):
-        completed_at = cache.iso(cache.utcnow())
-        for request in requests:
-            state = dict(request)
-            state["status"] = status
-            state["completed_at"] = completed_at
-            if error:
-                state["error"] = error
-            cache.write_storage_coverage_request(state)
-
-    def refresh(product, expected, requested_daily_day=None, storage_requests=None):
-        storage_requests = storage_requests or []
+    def refresh(product, expected, requested_daily_day=None):
         try:
             if product != "daily_task_runs":
                 actual = core._ensure_history_generation()["version"]
@@ -96,13 +85,9 @@ def main():
                     rolling.record_sync_failure("r2_usage_hourly")
                     raise
             cache.publish(product, expected, payload, expires)
-            if product == "storage_coverage":
-                resolve_storage_requests(storage_requests, "success")
             print(f"dashboard_cache_refresh product={product} generation={expected} status=success", flush=True)
             return max(1, (expires - cache.utcnow()).total_seconds()), True
         except Exception:
-            if product == "storage_coverage":
-                resolve_storage_requests(storage_requests, "failed", "storage_coverage_refresh_failed")
             if product != "daily_task_runs":
                 try: cache.record_failure(product, expected)
                 except Exception: pass
@@ -149,19 +134,9 @@ def main():
                 if name != "daily_task_runs" and not selected: continue
                 target = "none" if name == "daily_task_runs" else selected
                 requested_day = pending_daily_day if name == "daily_task_runs" else None
-                storage_requests = []
-                if name == "storage_coverage":
-                    for request in cache.pending_storage_coverage_requests():
-                        if request.get("generation") != target:
-                            resolve_storage_requests([request], "failed", "history_generation_changed")
-                            continue
-                        request["status"] = "running"
-                        request["rebuild_started_at"] = cache.iso(cache.utcnow())
-                        cache.write_storage_coverage_request(request)
-                        storage_requests.append(request)
                 if name == "daily_task_runs":
                     pending_daily_day = None
-                active[name] = (executor.submit(refresh, name, target, requested_day, storage_requests), target)
+                active[name] = (executor.submit(refresh, name, target, requested_day), target)
             if args.once and len(completed) == len(next_due): break
             if args.once and not selected and not active: raise SystemExit("History authority unavailable")
             _STOP.wait(2)

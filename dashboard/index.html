@@ -1970,6 +1970,8 @@
       const R2_CONNECTOR_COUNTS_MODE_STORAGE_KEY = "uk_aq_r2_connector_counts_mode";
       const R2_CONNECTOR_COUNTS_MODE_VALUES = new Set(["stacked", "observs", "aqi"]);
       const R2_CONNECTOR_COUNTS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+      const STORAGE_COVERAGE_MANUAL_TIMEOUT_MS = 3 * 60 * 1000;
+      const STORAGE_COVERAGE_STATUS_POLL_MS = 1000;
       const STORAGE_COVERAGE_ERROR_PREFIX = "Storage coverage calendar failed to load:";
       const R2_CONNECTOR_COUNTS_ERROR_PREFIX = "R2 connector counts failed to load:";
       const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1995,6 +1997,7 @@
       let latestR2HistoryReadVersion = { label: "R2_?", warning: "R2 history read version has not been reported by the dashboard API yet.", valid: false };
       let dashboardLoadSequence = 0;
       let storageCoverageLoadSequence = 0;
+      let manualStorageCoverageRefresh = null;
       let r2ConnectorCountsLoadSequence = 0;
       let operationsLoadSequence = 0;
       const R2_CONNECTOR_CHARTS = [
@@ -5238,7 +5241,7 @@
                 </span>
               </span>
               <button type="button" class="coverage-calendar-nav-btn" data-action="today-period">Today</button>
-              <button type="button" class="settings-button r2-refresh-button" data-action="force-refresh">Force Refresh</button>
+              <button type="button" class="settings-button r2-refresh-button" data-action="force-refresh"${manualStorageCoverageRefresh ? " disabled" : ""}>${manualStorageCoverageRefresh ? "Updating" : "Refresh"}</button>
               <button type="button" class="coverage-calendar-nav-btn" data-action="prev-period">${previousLabel}</button>
               <button type="button" class="coverage-calendar-nav-btn" data-action="next-period">${nextLabel}</button>
             </div>
@@ -5269,21 +5272,8 @@
         const nextButton = panel.querySelector('[data-action="next-period"]');
         const modeButtons = Array.from(panel.querySelectorAll('[data-action="coverage-mode"]'));
         if (forceRefreshButton) {
-          forceRefreshButton.addEventListener("click", async () => {
-            forceRefreshButton.disabled = true;
-            forceRefreshButton.textContent = "Force Refreshing...";
-            try {
-              if (activeMode === "operations") {
-                await loadOperationsDashboard({ forceRefresh: true });
-              } else {
-                await loadDashboard({ forceRefresh: true });
-              }
-            } finally {
-              if (document.body.contains(forceRefreshButton)) {
-                forceRefreshButton.disabled = false;
-                forceRefreshButton.textContent = "Force Refresh";
-              }
-            }
+          forceRefreshButton.addEventListener("click", () => {
+            void startManualStorageCoverageRefresh();
           });
         }
         if (todayButton) {
@@ -5559,7 +5549,6 @@
       }
 
       function renderStorageCoverageErrorPanel(message, options = {}) {
-        const forceRefresh = Boolean(options.forceRefresh);
         const parentLoadId = Number(options.parentLoadId) || operationsLoadSequence;
         const panel = document.createElement("section");
         panel.className = "panel coverage-calendar-panel";
@@ -5574,7 +5563,7 @@
         const retryButton = panel.querySelector('[data-action="retry-storage-coverage"]');
         if (retryButton) {
           retryButton.addEventListener("click", () => {
-            loadStorageCoverage({ forceRefresh, parentLoadId });
+            loadStorageCoverage({ parentLoadId });
           });
         }
         return panel;
@@ -5584,17 +5573,18 @@
         if (activeMode !== "operations") {
           return;
         }
-        const forceRefresh = Boolean(options.forceRefresh);
+        if (manualStorageCoverageRefresh) {
+          return;
+        }
+        const preservePanel = Boolean(options.preservePanel);
         const parentLoadId = Number(options.parentLoadId) || 0;
         const requestId = ++storageCoverageLoadSequence;
-        const loadingLabel = forceRefresh ? "Force refreshing calendar..." : "Refreshing calendar...";
-        upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel(loadingLabel));
+        if (!preservePanel) {
+          upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel("Refreshing calendar..."));
+        }
         try {
           const params = new URLSearchParams();
           params.set("t", String(Date.now()));
-          if (forceRefresh) {
-            params.set("force", "1");
-          }
           const storageCoverageUrl = buildApiUrl("storage_coverage", params);
           const resp = await fetch(storageCoverageUrl);
           const text = await resp.text();
@@ -5604,9 +5594,16 @@
           } catch (_err) {
             payload = null;
           }
+          if (resp.status === 202
+              || (payload && (payload.refresh_request_id || payload.status === "pending" || payload.status === "running"))) {
+            throw new Error("Unexpected storage coverage refresh acknowledgement");
+          }
           if (!resp.ok) {
             const message = buildResponseErrorMessage(resp, payload, text);
             throw new Error(message);
+          }
+          if (!payload || !Array.isArray(payload.storage_coverage_days)) {
+            throw new Error("Unexpected storage coverage response");
           }
           if (requestId !== storageCoverageLoadSequence) {
             return;
@@ -5615,23 +5612,7 @@
             return;
           }
           const data = payload || {};
-          const coverageRows = Array.isArray(data.storage_coverage_days)
-            ? data.storage_coverage_days
-            : [];
-          if (latestDashboardData && typeof latestDashboardData === "object") {
-            latestDashboardData.storage_coverage_days = coverageRows;
-            latestDashboardData.storage_coverage_source =
-              data.storage_coverage_source || "live_per_day_presence";
-            latestDashboardData.r2_history_read_version =
-              data.r2_history_read_version || latestDashboardData.r2_history_read_version;
-          }
-          latestR2HistoryReadVersion = data.r2_history_read_version || latestR2HistoryReadVersion;
-          upsertStorageCoveragePanel(
-            renderStorageCoverageCalendarPanel(coverageRows, {
-              forceConnectorCountsRefresh: forceRefresh,
-              r2HistoryReadVersion: latestR2HistoryReadVersion,
-            }),
-          );
+          applyStorageCoveragePayload(data);
           if (String(errorEl.textContent || "").startsWith(STORAGE_COVERAGE_ERROR_PREFIX)) {
             setError("");
           }
@@ -5648,9 +5629,125 @@
             return;
           }
           const message = err.message || String(err);
-          upsertStorageCoveragePanel(
-            renderStorageCoverageErrorPanel(message, { forceRefresh, parentLoadId }),
-          );
+          if (!preservePanel) {
+            upsertStorageCoveragePanel(
+              renderStorageCoverageErrorPanel(message, { parentLoadId }),
+            );
+          }
+          setError(`${STORAGE_COVERAGE_ERROR_PREFIX} ${message}`);
+        }
+      }
+
+      function syncManualStorageCoverageRefreshControls() {
+        document.querySelectorAll('[data-panel="storage-coverage"] [data-action="force-refresh"]')
+          .forEach((button) => {
+            button.disabled = Boolean(manualStorageCoverageRefresh);
+            button.textContent = manualStorageCoverageRefresh ? "Updating" : "Refresh";
+          });
+      }
+
+      function waitForStorageCoveragePoll() {
+        return new Promise((resolve) => window.setTimeout(resolve, STORAGE_COVERAGE_STATUS_POLL_MS));
+      }
+
+      async function fetchStorageCoverageJson(params) {
+        const url = buildApiUrl("storage_coverage", params);
+        const resp = await fetch(url);
+        const text = await resp.text();
+        let payload = null;
+        try {
+          payload = JSON.parse(text);
+        } catch (_err) {
+          payload = null;
+        }
+        if (!resp.ok) {
+          throw new Error(buildResponseErrorMessage(resp, payload, text));
+        }
+        return payload || {};
+      }
+
+      function applyStorageCoveragePayload(data) {
+        const coverageRows = Array.isArray(data.storage_coverage_days)
+          ? data.storage_coverage_days
+          : [];
+        if (latestDashboardData && typeof latestDashboardData === "object") {
+          latestDashboardData.storage_coverage_days = coverageRows;
+          latestDashboardData.storage_coverage_source =
+            data.storage_coverage_source || "live_per_day_presence";
+          latestDashboardData.r2_history_read_version =
+            data.r2_history_read_version || latestDashboardData.r2_history_read_version;
+        }
+        latestR2HistoryReadVersion = data.r2_history_read_version || latestR2HistoryReadVersion;
+        upsertStorageCoveragePanel(
+          renderStorageCoverageCalendarPanel(coverageRows, {
+            forceConnectorCountsRefresh: false,
+            r2HistoryReadVersion: latestR2HistoryReadVersion,
+          }),
+        );
+      }
+
+      async function startManualStorageCoverageRefresh() {
+        if (manualStorageCoverageRefresh) {
+          return;
+        }
+        storageCoverageLoadSequence += 1;
+        manualStorageCoverageRefresh = { requestId: null, startedAtMs: Date.now() };
+        syncManualStorageCoverageRefreshControls();
+        setError("");
+        try {
+          const initiation = await fetchStorageCoverageJson(new URLSearchParams({
+            force: "1",
+            t: String(Date.now()),
+          }));
+          const requestId = String(initiation.refresh_request_id || "");
+          if (!requestId) {
+            if (Array.isArray(initiation.storage_coverage_days)) {
+              manualStorageCoverageRefresh = null;
+              applyStorageCoveragePayload(initiation);
+              return;
+            }
+            throw new Error("Storage coverage refresh was not acknowledged");
+          }
+          manualStorageCoverageRefresh.requestId = requestId;
+
+          while (manualStorageCoverageRefresh
+              && manualStorageCoverageRefresh.requestId === requestId) {
+            if (Date.now() - manualStorageCoverageRefresh.startedAtMs >= STORAGE_COVERAGE_MANUAL_TIMEOUT_MS) {
+              throw new Error("Storage coverage refresh timed out");
+            }
+            await waitForStorageCoveragePoll();
+            const status = await fetchStorageCoverageJson(new URLSearchParams({
+              refresh_request_id: requestId,
+              t: String(Date.now()),
+            }));
+            if (status.status === "failed") {
+              throw new Error(status.error || "Storage coverage refresh failed");
+            }
+            if (status.status !== "success") {
+              continue;
+            }
+            const data = await fetchStorageCoverageJson(new URLSearchParams({ t: String(Date.now()) }));
+            const publishedGeneration = String(
+              (data.r2_history_read_version && data.r2_history_read_version.version) || "",
+            );
+            if (publishedGeneration !== String(status.generation || "")) {
+              throw new Error("Storage coverage history generation changed; retry Refresh");
+            }
+            if (!manualStorageCoverageRefresh
+                || manualStorageCoverageRefresh.requestId !== requestId) {
+              return;
+            }
+            manualStorageCoverageRefresh = null;
+            applyStorageCoveragePayload(data);
+            if (String(errorEl.textContent || "").startsWith(STORAGE_COVERAGE_ERROR_PREFIX)) {
+              setError("");
+            }
+            return;
+          }
+        } catch (err) {
+          const message = err.message || String(err);
+          manualStorageCoverageRefresh = null;
+          syncManualStorageCoverageRefreshControls();
           setError(`${STORAGE_COVERAGE_ERROR_PREFIX} ${message}`);
         }
       }
@@ -5684,7 +5781,8 @@
         if (!operationsContainer) {
           return;
         }
-        if (operationsContainer.children.length > 0 && !forceRefresh) {
+        if (operationsContainer.children.length > 0
+            && (!forceRefresh || manualStorageCoverageRefresh)) {
           syncModeControlRefsFromVisibleContainer();
           return;
         }
@@ -6353,6 +6451,7 @@
           latestDashboardData = data;
           latestR2HistoryReadVersion = data.r2_history_read_version || latestR2HistoryReadVersion;
           const existingDailyTaskPanel = operationsContainer.querySelector('[data-panel="operations-daily-task"]');
+          const existingStorageCoveragePanel = operationsContainer.querySelector('[data-panel="storage-coverage"]');
           const nextPanels = [
             renderModeControlPanel("operations"),
             renderOperationsDropboxPanel(),
@@ -6369,7 +6468,9 @@
               data.r2_backup_window,
               data.r2_backup_window_error,
             ),
-            renderStorageCoverageLoadingPanel("Refreshing calendar..."),
+            existingStorageCoveragePanel
+              ? existingStorageCoveragePanel
+              : renderStorageCoverageLoadingPanel("Refreshing calendar..."),
             renderServiceEgressPanel(
               data.service_egress_metrics,
               data.service_egress_metrics_error,
@@ -6387,7 +6488,12 @@
           setStatus(`Updated ${formatDateTimeLocalWithTimezone(data.generated_at)}${Object.values(data.local_cache || {}).some(entry => entry && entry.state === "stale") ? " · cached data stale; refresh pending" : ""}`);
           setDataMeta(data);
           startOperationsDropboxPolling();
-          void loadStorageCoverage({ forceRefresh, parentLoadId: loadId });
+          if (!manualStorageCoverageRefresh) {
+            void loadStorageCoverage({
+              preservePanel: Boolean(existingStorageCoveragePanel),
+              parentLoadId: loadId,
+            });
+          }
         } catch (err) {
           if (loadId !== operationsLoadSequence || activeMode !== "operations") {
             modeIsLoading.operations = false;
