@@ -5781,7 +5781,8 @@
         if (!operationsContainer) {
           return;
         }
-        if (operationsContainer.children.length > 0 && !forceRefresh) {
+        if (operationsContainer.children.length > 0
+            && (!forceRefresh || manualStorageCoverageRefresh)) {
           syncModeControlRefsFromVisibleContainer();
           return;
         }
