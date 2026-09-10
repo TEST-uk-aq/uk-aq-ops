@@ -25,6 +25,7 @@ jobs:
       UK_AQ_CACHE_WORKER_NAME: ${{ vars.UK_AQ_CACHE_WORKER_NAME || 'uk-aq-cache-proxy' }}
       UK_AQ_STATION_HISTORY_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UK_AQ_MEDIA_PUBLIC_URL: ${{ vars.UK_AQ_MEDIA_PUBLIC_URL || '' }}
       STATION_HISTORY_SERVICE_OVERRIDE: ${{ inputs.station_history_service_override || '' }}
       UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN || '' }}
@@ -65,15 +66,49 @@ jobs:
               "${UK_AQ_R2_HISTORY_VERSION}" \
               "${STATION_HISTORY_SERVICE_OVERRIDE}"
           )"
+          RESOLVED_MEDIA_PUBLIC_URL="$(node <<'NODE'
+          const value = String(process.env.UK_AQ_MEDIA_PUBLIC_URL || "").trim();
+          let url;
+          try {
+            url = new URL(value);
+          } catch (_error) {
+            console.error("UK_AQ_MEDIA_PUBLIC_URL must be a non-empty HTTPS base URL.");
+            process.exit(1);
+          }
+          if (
+            url.protocol !== "https:"
+            || !url.hostname
+            || url.username
+            || url.password
+            || url.pathname !== "/"
+            || url.search
+            || url.hash
+          ) {
+            console.error("UK_AQ_MEDIA_PUBLIC_URL must be an HTTPS origin without credentials, path, query, or fragment.");
+            process.exit(1);
+          }
+          process.stdout.write(url.origin);
+          NODE
+          )"
           echo "Resolved STATION_HISTORY Service Binding target: ${STATION_HISTORY_SERVICE}"
           printf 'STATION_HISTORY_SERVICE=%s\n' "${STATION_HISTORY_SERVICE}" >> "${GITHUB_ENV}"
-          sed "s|__UK_AQ_STATION_HISTORY_WORKER_NAME__|${STATION_HISTORY_SERVICE}|g" wrangler.toml > wrangler.deploy.toml
+          media_url_escaped="${RESOLVED_MEDIA_PUBLIC_URL//\\/\\\\}"
+          media_url_escaped="${media_url_escaped//|/\\|}"
+          media_url_escaped="${media_url_escaped//&/\\&}"
+          sed \
+            -e "s|__UK_AQ_STATION_HISTORY_WORKER_NAME__|${STATION_HISTORY_SERVICE}|g" \
+            -e "s|__UK_AQ_MEDIA_PUBLIC_URL__|${media_url_escaped}|g" \
+            wrangler.toml > wrangler.deploy.toml
           grep -F "service = \"${STATION_HISTORY_SERVICE}\"" wrangler.deploy.toml >/dev/null || {
             echo "Failed to resolve STATION_HISTORY Service Binding target."
             exit 1
           }
           if grep -q '__UK_AQ_STATION_HISTORY_WORKER_NAME__' wrangler.deploy.toml; then
             echo "Unresolved STATION_HISTORY Service Binding placeholder."
+            exit 1
+          fi
+          if grep -q '__UK_AQ_MEDIA_PUBLIC_URL__' wrangler.deploy.toml; then
+            echo "Unresolved UK_AQ_MEDIA_PUBLIC_URL placeholder."
             exit 1
           fi
 
@@ -91,6 +126,7 @@ jobs:
           [ -z "${{ vars.UK_AQ_POSTCODE_LOOKUP_R2_API_URL }}" ]  && missing_vars+=("UK_AQ_POSTCODE_LOOKUP_R2_API_URL")
           [ -z "${{ vars.UK_AQ_POSTCODE_SUGGEST_R2_API_URL }}" ] && missing_vars+=("UK_AQ_POSTCODE_SUGGEST_R2_API_URL")
           [ -z "${{ vars.UK_AQ_LATEST_SNAPSHOT_R2_API_URL }}" ]  && missing_vars+=("UK_AQ_LATEST_SNAPSHOT_R2_API_URL")
+          [ -z "${UK_AQ_MEDIA_PUBLIC_URL}" ]                    && missing_vars+=("UK_AQ_MEDIA_PUBLIC_URL")
           if [ ${#missing_secrets[@]} -gt 0 ]; then
             echo "Missing required GitHub secrets:"
             printf '  - %s\n' "${missing_secrets[@]}"

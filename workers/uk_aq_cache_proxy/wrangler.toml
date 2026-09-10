@@ -10,6 +10,9 @@ enabled = true
 binding = "STATION_HISTORY"
 service = "__UK_AQ_STATION_HISTORY_WORKER_NAME__"
 
+[vars]
+UK_AQ_MEDIA_PUBLIC_URL = "__UK_AQ_MEDIA_PUBLIC_URL__"
+
 # Current-reading route policy:
 # - /api/aq/latest is retired.
 # - /api/aq/latest-snapshot is the sole current-reading route.
@@ -27,6 +30,7 @@ service = "__UK_AQ_STATION_HISTORY_WORKER_NAME__"
 # - UK_AQ_TURNSTILE_SECRET_KEY
 # - UK_AQ_OBSERVS_HISTORY_R2_API_URL
 # Runtime variables:
+# - UK_AQ_MEDIA_PUBLIC_URL (required public HTTPS base URL for /api/media/articles)
 # - UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS (optional)
 # - UK_AQ_LOCAL_DEV_BYPASS_ENABLED (optional; set true/1 in test only)
 # - UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED (optional; default false)

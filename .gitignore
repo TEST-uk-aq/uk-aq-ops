@@ -1,10 +1,7 @@
 node_modules/
 .DS_Store
 logs/
-.env.supabase
-.env
-.env.test
-.env.live
+.env*
 *.numbers
 env-vars-master.csv
 /tmp
@@ -24,7 +21,3 @@ sync_to_live.sh
 .venv*
 venv/
 ./venv
-.env.gcp
-
-# Local dashboard cache credentials (separate least-privilege processes).
-.env.dashboard-cache.*
