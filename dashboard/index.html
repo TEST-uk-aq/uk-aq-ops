@@ -5549,7 +5549,6 @@
       }
 
       function renderStorageCoverageErrorPanel(message, options = {}) {
-        const forceRefresh = Boolean(options.forceRefresh);
         const parentLoadId = Number(options.parentLoadId) || operationsLoadSequence;
         const panel = document.createElement("section");
         panel.className = "panel coverage-calendar-panel";
@@ -5564,7 +5563,7 @@
         const retryButton = panel.querySelector('[data-action="retry-storage-coverage"]');
         if (retryButton) {
           retryButton.addEventListener("click", () => {
-            loadStorageCoverage({ forceRefresh, parentLoadId });
+            loadStorageCoverage({ parentLoadId });
           });
         }
         return panel;
@@ -5577,20 +5576,15 @@
         if (manualStorageCoverageRefresh) {
           return;
         }
-        const forceRefresh = Boolean(options.forceRefresh);
         const preservePanel = Boolean(options.preservePanel);
         const parentLoadId = Number(options.parentLoadId) || 0;
         const requestId = ++storageCoverageLoadSequence;
-        const loadingLabel = forceRefresh ? "Force refreshing calendar..." : "Refreshing calendar...";
         if (!preservePanel) {
-          upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel(loadingLabel));
+          upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel("Refreshing calendar..."));
         }
         try {
           const params = new URLSearchParams();
           params.set("t", String(Date.now()));
-          if (forceRefresh) {
-            params.set("force", "1");
-          }
           const storageCoverageUrl = buildApiUrl("storage_coverage", params);
           const resp = await fetch(storageCoverageUrl);
           const text = await resp.text();
@@ -5600,9 +5594,16 @@
           } catch (_err) {
             payload = null;
           }
+          if (resp.status === 202
+              || (payload && (payload.refresh_request_id || payload.status === "pending" || payload.status === "running"))) {
+            throw new Error("Unexpected storage coverage refresh acknowledgement");
+          }
           if (!resp.ok) {
             const message = buildResponseErrorMessage(resp, payload, text);
             throw new Error(message);
+          }
+          if (!payload || !Array.isArray(payload.storage_coverage_days)) {
+            throw new Error("Unexpected storage coverage response");
           }
           if (requestId !== storageCoverageLoadSequence) {
             return;
@@ -5630,7 +5631,7 @@
           const message = err.message || String(err);
           if (!preservePanel) {
             upsertStorageCoveragePanel(
-              renderStorageCoverageErrorPanel(message, { forceRefresh, parentLoadId }),
+              renderStorageCoverageErrorPanel(message, { parentLoadId }),
             );
           }
           setError(`${STORAGE_COVERAGE_ERROR_PREFIX} ${message}`);
@@ -6466,7 +6467,7 @@
               data.r2_backup_window,
               data.r2_backup_window_error,
             ),
-            manualStorageCoverageRefresh && existingStorageCoveragePanel
+            existingStorageCoveragePanel
               ? existingStorageCoveragePanel
               : renderStorageCoverageLoadingPanel("Refreshing calendar..."),
             renderServiceEgressPanel(
@@ -6487,7 +6488,10 @@
           setDataMeta(data);
           startOperationsDropboxPolling();
           if (!manualStorageCoverageRefresh) {
-            void loadStorageCoverage({ forceRefresh, parentLoadId: loadId });
+            void loadStorageCoverage({
+              preservePanel: Boolean(existingStorageCoveragePanel),
+              parentLoadId: loadId,
+            });
           }
         } catch (err) {
           if (loadId !== operationsLoadSequence || activeMode !== "operations") {
