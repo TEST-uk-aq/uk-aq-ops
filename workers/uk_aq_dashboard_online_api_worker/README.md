@@ -97,7 +97,7 @@ Optional direct-mode data sources:
 - `UK_AQ_R2_HISTORY_DAYS_API_TOKEN`
 - `UK_AQ_R2_HISTORY_COUNTS_API_URL`
 - `UK_AQ_R2_HISTORY_COUNTS_API_TOKEN`
-- `UK_AQ_R2_HISTORY_VERSION` (required `v1` or `v2`; canonical active selector deployed as a Worker secret by `.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml`; TEST uses `v2`. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
+- `UK_AQ_OBSERVS_HISTORY_R2_API_URL` and `UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN`: stable service authority; the workflow maps the existing upstream secret. History selection uses `/v1/history-generation`, accepts v2/v3, and ignores the dashboard history-version environment snapshot.
 - `UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX` (optional; defaults to `_ops/checkpoints/r2_history_backup_state_v2`; coverage reads `root.json` and its observation month shards)
 - `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` or `CLOUDFLARE_ACCOUNT_ID`
 - `UK_AQ_R2_CLOUDFLARE_API_TOKEN` or `CFLARE_API_READ_TOKEN`
@@ -121,12 +121,12 @@ R2 history API fallback behavior:
   hosted dashboard can show the active R2 history source and the current
   hierarchical v2 Dropbox checkpoint source. AQI Dropbox bounds remain empty
   because AQI history is outside the current backup scope.
-- In `UK_AQ_R2_HISTORY_VERSION=v2`, the storage coverage calendar does not use
-  version-blind Supabase R2 day/window fallbacks. If the v2 history-days API is
+- With a v2/v3 serving descriptor, the storage coverage calendar does not use
+  version-blind Supabase R2 day/window fallbacks. If the selected history-days API is
   unavailable, R2 presence remains false/unknown instead of being filled from
   v1-derived RPC data.
-- In `UK_AQ_R2_HISTORY_VERSION=v2`, Dropbox checkpoint day coverage is only
-  counted for days also returned by the explicit v2 R2 history-days API. A
+- With a v2/v3 serving descriptor, Dropbox checkpoint day coverage is only
+  counted for days also returned by the explicit selected-generation R2 history-days API. A
   stale checkpoint that claims 2025 v2 days is warned about and ignored for the
   coverage calendar.
 - `/api/r2_connector_counts` forwards the active read version to the R2 metrics API as `read_version`.
@@ -150,3 +150,7 @@ npm run check
 cd workers/uk_aq_dashboard_online_api_worker
 npx wrangler deploy
 ```
+
+## Local cache separation
+
+This Cloudflare Worker has no MySQL dependency. It retains existing cloud/API adapters and optional upstream mode; this change does not enable a proxy through the Mac. The local Python dashboard alone may use the persistent MySQL cache/refresher. Both resolve the stable observations-history generation descriptor. Existing cache keys include that generation so a cutover cannot reuse the previous generation's payload.

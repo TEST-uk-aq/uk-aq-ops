@@ -25,3 +25,6 @@ sync_to_live.sh
 venv/
 ./venv
 .env.gcp
+
+# Local dashboard cache credentials (separate least-privilege processes).
+.env.dashboard-cache.*

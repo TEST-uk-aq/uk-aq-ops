@@ -1,4 +1,3 @@
-import { assertHistoryPayload, historyResolution } from "./history_generation";
 import type { WorkerEnv } from "./upstream";
 
 type JsonObject = Record<string, unknown>;
@@ -162,7 +161,11 @@ function normaliseRelativeKey(value: unknown): string {
 }
 
 function hierarchicalStateRootRelativePath(env: WorkerEnv): string {
-  const prefix = historyResolution(env).generation.backup_state_prefix;
+  const extendedEnv = env as ExtendedWorkerEnv;
+  const prefix = String(
+    extendedEnv.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
+      || DEFAULT_HIERARCHICAL_STATE_PREFIX,
+  ).trim().replace(/^\/+|\/+$/g, "");
   if (!prefix) throw new Error("Hierarchical Dropbox state prefix is empty");
   return `${prefix}/root.json`;
 }
@@ -333,23 +336,21 @@ async function loadHierarchicalBackupDays(env: WorkerEnv): Promise<{
   key: string | null;
   error: string | null;
 }> {
-  const version = historyResolution(env).version;
+  const version = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim().toLowerCase();
   const rootRelativePath = hierarchicalStateRootRelativePath(env);
   const rootRemotePath = joinDropboxPath(env, rootRelativePath);
-  if (!["v2", "v3"].includes(version)) {
+  if (version !== "v2") {
     return {
       days: null,
       key: rootRemotePath,
-      error: `Hierarchical Dropbox backup coverage requires a v2/v3 serving descriptor; got ${version || "missing"}`,
+      error: `Hierarchical Dropbox backup coverage requires UK_AQ_R2_HISTORY_VERSION=v2; got ${version || "missing"}`,
     };
   }
 
   try {
     const token = await fetchDropboxAccessToken(env);
     const rootPayload = await fetchDropboxJson(token, rootRemotePath);
-    if ((rootPayload.observation_generation || "v2") !== version) throw new Error("Dropbox checkpoint generation mismatch");
     const refs = parseHierarchicalStateRoot(rootPayload);
-    if (refs.some(ref => !ref.stateKey.startsWith(historyResolution(env).generation.backup_state_prefix + "/"))) throw new Error("Dropbox shard outside selected generation");
     const observations = new Set<string>();
     const errors: string[] = [];
 
@@ -381,7 +382,7 @@ async function loadHierarchicalBackupDays(env: WorkerEnv): Promise<{
 async function loadSources(request: Request, env: WorkerEnv): Promise<SourceSnapshot> {
   const historyUrl = resolveHistoryDaysUrl(env);
   const dbSizeUrl = String(env.UK_AQ_DB_SIZE_API_URL || "").trim();
-  const version = historyResolution(env).version;
+  const version = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim().toLowerCase();
   const rootPath = (() => {
     try {
       return joinDropboxPath(env, hierarchicalStateRootRelativePath(env));
@@ -408,8 +409,8 @@ async function loadSources(request: Request, env: WorkerEnv): Promise<SourceSnap
 
   const historyPromise = (async () => {
     if (!historyUrl) throw new Error("R2 history-days API is not configured");
-    if (!["v2", "v3"].includes(version)) {
-      throw new Error("Serving history descriptor must select v2 or v3");
+    if (version !== "v1" && version !== "v2") {
+      throw new Error("UK_AQ_R2_HISTORY_VERSION must be v1 or v2");
     }
     const url = new URL(historyUrl);
     url.searchParams.set("read_version", version);

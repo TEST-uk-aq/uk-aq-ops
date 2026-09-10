@@ -27,6 +27,10 @@ import uk_aq_dashboard_api_patch as coverage_patch
 
 DIRECT_R2_ROOT_ENV = "UK_AQ_R2_HISTORY_DIRECT_RCLONE_ROOT"
 DIRECT_R2_CACHE_TTL_ENV = "UK_AQ_R2_HISTORY_DIRECT_DAY_CACHE_TTL_SECONDS"
+DIRECT_R2_ROOT_DEFAULTS = {
+    "v1": "uk_aq_r2_test:uk-aq-history-cic-test/history/v1",
+    "v2": "uk_aq_r2_test:uk-aq-history-cic-test/history/v2",
+}
 DAY_DIR_RE = re.compile(r"^day_utc=(\d{4}-\d{2}-\d{2})/?$")
 
 _DIRECT_CACHE_LOCK = threading.Lock()
@@ -70,16 +74,16 @@ def _cache_ttl_seconds() -> int:
 
 def _resolve_direct_root() -> Tuple[Optional[str], Optional[str], Optional[str]]:
     version_info = dashboard._resolve_r2_history_read_version()
-    version = version_info["version"]
-    configured = str(os.getenv(DIRECT_R2_ROOT_ENV) or "").strip().rstrip("/")
-    if not configured:
-        return None, version, None
-    # Existing roots end in history/vN; only their explicit remote/bucket identity
-    # is configuration. The authoritative descriptor supplies the storage path.
-    match = re.fullmatch(r"(.+)/history/v[123]", configured)
-    if not match:
-        return None, version, "Direct R2 root must name an explicit remote/bucket/history/vN"
-    root = match.group(1) + "/" + version_info["generation"]["observations_prefix"].rsplit("/", 1)[0]
+    version = str(version_info.get("version") or "").strip().lower()
+    if not version_info.get("valid") or version not in DIRECT_R2_ROOT_DEFAULTS:
+        warning = str(
+            version_info.get("warning")
+            or "Invalid R2 history version; direct R2 day discovery disabled."
+        )
+        return None, None, warning
+
+    override = str(os.getenv(DIRECT_R2_ROOT_ENV) or "").strip().rstrip("/")
+    root = override or DIRECT_R2_ROOT_DEFAULTS[version]
     return root, version, None
 
 
@@ -168,8 +172,11 @@ def _get_direct_r2_days(
         root,
         "observations",
     )
-    # Calculated AQI is retired; optional legacy diagnostic days come from metrics.
-    aqilevels, aqilevels_error = set(), None
+    aqilevels, aqilevels_error = _list_domain_days(
+        rclone_bin,
+        root,
+        "aqilevels",
+    )
 
     errors = [
         value
@@ -192,7 +199,7 @@ def _get_direct_r2_days(
             }
         )
 
-    return (None if error else day_sets), error, root
+    return day_sets, error, root
 
 
 def _merge_errors(*parts: Optional[str]) -> Optional[str]:
@@ -218,25 +225,31 @@ def _get_r2_history_days_cached(
         force_refresh=force_refresh,
     )
 
-    if not isinstance(normal_days, dict):
-        return None, r2_window, bucket, _merge_errors(normal_error, direct_error)
-    committed = {name: set(normal_days.get(name) or set()) for name in ("observations", "aqilevels")}
-    if isinstance(direct_days, dict) and not direct_error:
-        committed["observations"].intersection_update(direct_days.get("observations") or set())
-    return committed, r2_window, bucket, _merge_errors(normal_error, direct_error)
+    if not isinstance(normal_days, dict) and not isinstance(direct_days, dict):
+        return normal_days, r2_window, bucket, _merge_errors(normal_error, direct_error)
 
+    merged = {
+        "observations": set(
+            (normal_days or {}).get("observations") or set()
+        ),
+        "aqilevels": set(
+            (normal_days or {}).get("aqilevels") or set()
+        ),
+    }
+    if isinstance(direct_days, dict):
+        merged["observations"].update(direct_days.get("observations") or set())
+        merged["aqilevels"].update(direct_days.get("aqilevels") or set())
 
-def install():
-    dashboard._get_r2_history_days_cached = _get_r2_history_days_cached
-    coverage_patch._configure_cache_ttl()
-    dashboard._fetch_ingest_observation_days = coverage_patch._fetch_ingest_observation_days
-    dashboard._build_live_storage_coverage_days = coverage_patch._build_live_storage_coverage_days
-    dashboard._build_storage_coverage_payload = coverage_patch._build_storage_coverage_payload
-    return dashboard
+    source = str(bucket or "").strip()
+    direct_label = f"rclone-direct:{direct_root}" if direct_root else "rclone-direct"
+    merged_source = f"{source}+{direct_label}" if source else direct_label
+
+    return merged, r2_window, merged_source, _merge_errors(normal_error, direct_error)
 
 
 def main() -> None:
-    install().main()
+    dashboard._get_r2_history_days_cached = _get_r2_history_days_cached
+    coverage_patch.main()
 
 
 if __name__ == "__main__":

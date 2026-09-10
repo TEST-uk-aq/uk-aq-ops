@@ -1,4 +1,3 @@
-import { resolveHistoryEnvironment, historyResolution } from "../lib/history_generation";
 import { errorEnvelope } from "../lib/http";
 import { handleDirectCompatRoute } from "../lib/direct";
 import {
@@ -69,21 +68,12 @@ export async function handleCompatRoute(
       return errorEnvelope("METHOD_NOT_ALLOWED", "Only GET is supported for this route", 405);
     }
 
-    const historyRoute = ["/api/dashboard", "/api/storage_coverage", "/api/r2_metrics", "/api/r2_connector_counts"].includes(pathname);
-    if (historyRoute) {
-      try { env = await resolveHistoryEnvironment(env); }
-      catch { return errorEnvelope("HISTORY_AUTHORITY_UNAVAILABLE", "Stable history generation could not be resolved", 503); }
-      // An upstream payload must not survive an authority switch in the proxy cache.
-      const url = new URL(request.url);
-      url.searchParams.set("__history_generation", historyResolution(env).version);
-      request = new Request(url, request);
-    }
     if (!useUpstream && pathname === "/api/r2_connector_counts") {
       const serviceResponse = await proxyR2ConnectorCounts(request, env);
-      if (serviceResponse) return withHistoryDiagnostics(serviceResponse, env);
+      if (serviceResponse) return serviceResponse;
     }
 
-    let response = !useUpstream
+    const response = !useUpstream
       ? await handleDirectCompatRoute(request, env, pathname)
       : await proxyToUpstream(request, env, pathname, {
           cacheTtlSeconds: GET_ROUTE_CACHE_SECONDS[pathname] ?? 0,
@@ -94,20 +84,11 @@ export async function handleCompatRoute(
             : undefined,
         });
 
-    if (historyRoute && useUpstream && response.ok) {
-      const body = await response.clone().json() as Record<string, unknown>;
-      const reportedDescriptor = body.r2_history_read_version;
-      const reported = (reportedDescriptor && typeof reportedDescriptor === "object"
-        ? (reportedDescriptor as Record<string, unknown>).version : null) || body.read_version;
-      if (reported !== historyResolution(env).version) {
-        return errorEnvelope("HISTORY_GENERATION_MISMATCH", "Upstream payload does not match serving history generation", 503);
-      }
-    }
     if (pathname === "/api/storage_coverage" || pathname === "/api/dashboard") {
-      response = await enrichStorageCoverageResponse(response, request, env);
-      response = await enrichStorageCoverageFromMetrics(response, request, env);
+      const httpEnriched = await enrichStorageCoverageResponse(response, request, env);
+      return enrichStorageCoverageFromMetrics(httpEnriched, request, env);
     }
-    return historyRoute ? withHistoryDiagnostics(response, env) : response;
+    return response;
   }
 
   if (POST_ROUTES.has(pathname)) {
@@ -121,25 +102,4 @@ export async function handleCompatRoute(
   }
 
   return errorEnvelope("NOT_FOUND", "Route not found", 404);
-}
-
-async function withHistoryDiagnostics(response: Response, env: WorkerEnv): Promise<Response> {
-  if (!response.ok) return response;
-  const body = await response.clone().json() as Record<string, unknown>;
-  const resolution = historyResolution(env);
-  body.r2_history_read_version = resolution;
-  body.r2_history_read_version_effective = resolution;
-  if (body.read_version) {
-    if (body.read_version !== resolution.version) return errorEnvelope("HISTORY_GENERATION_MISMATCH", "History response generation mismatch", 503);
-    body.metrics_read_version_source = body.read_version_source;
-    body.read_version_source = resolution.source;
-  }
-  if (resolution.version === "v3" && "r2_domain_size_metrics" in body) {
-    body.r2_domain_size_metrics = [];
-    body.r2_domain_size_metrics_error = null;
-    body.r2_domain_size_metrics_warning = "Historical domain byte metrics have no generation identity; unavailable for v3. Account usage remains account-wide.";
-  }
-  const headers = new Headers(response.headers);
-  headers.delete("content-length"); headers.set("Cache-Control", "no-store");
-  return new Response(JSON.stringify(body), { status: response.status, headers });
 }

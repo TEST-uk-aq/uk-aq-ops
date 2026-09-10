@@ -6384,7 +6384,7 @@
           }
           modeLastLoadedAtMs.operations = Date.now();
           modeIsLoading.operations = false;
-          setStatus(`Updated ${formatDateTimeLocalWithTimezone(data.generated_at)}${Object.values(data.local_cache || {}).some(entry => entry && entry.state === "stale") ? " · cached data stale; refresh pending" : ""}`);
+          setStatus(`Updated ${formatDateTimeLocalWithTimezone(data.generated_at)}`);
           setDataMeta(data);
           startOperationsDropboxPolling();
           void loadStorageCoverage({ forceRefresh, parentLoadId: loadId });
@@ -6501,7 +6501,7 @@
           ingestContainer.replaceChildren(...nextPanels);
           modeLastLoadedAtMs.ingest = Date.now();
           modeIsLoading.ingest = false;
-          setStatus(`Updated ${formatDateTimeLocalWithTimezone(data.generated_at)}${Object.values(data.local_cache || {}).some(entry => entry && entry.state === "stale") ? " · cached data stale; refresh pending" : ""}`);
+          setStatus(`Updated ${formatDateTimeLocalWithTimezone(data.generated_at)}`);
           setDataMeta(data);
         } catch (err) {
           if (loadId !== dashboardLoadSequence) {

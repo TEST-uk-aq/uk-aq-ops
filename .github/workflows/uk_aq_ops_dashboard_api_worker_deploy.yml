@@ -40,7 +40,8 @@ jobs:
       UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS: ${{ vars.UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS || '3660' }}
       UK_AQ_R2_HISTORY_COUNTS_API_URL: ${{ vars.UK_AQ_R2_HISTORY_COUNTS_API_URL || '' }}
       UK_AQ_R2_HISTORY_COUNTS_API_TOKEN: ${{ secrets.UK_AQ_R2_HISTORY_COUNTS_API_TOKEN || '' }}
-      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UK_AQ_OBSERVS_HISTORY_R2_API_URL: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_URL || '' }}
+      UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
       UK_AQ_R2_METRICS_SERVICE_BINDING_ENABLED: ${{ vars.UK_AQ_R2_METRICS_SERVICE_BINDING_ENABLED || 'false' }}
       UK_AQ_R2_HISTORY_WINDOW_RPC: ${{ vars.UK_AQ_R2_HISTORY_WINDOW_RPC || 'uk_aq_rpc_r2_history_window' }}
       UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
@@ -116,17 +117,10 @@ jobs:
             exit 1
           fi
 
-          case "${UK_AQ_R2_HISTORY_VERSION}" in
-            v1|v2) ;;
-            "")
-              echo "Missing GitHub variable UK_AQ_R2_HISTORY_VERSION."
-              exit 1
-              ;;
-            *)
-              echo "Invalid UK_AQ_R2_HISTORY_VERSION=${UK_AQ_R2_HISTORY_VERSION}; expected v1 or v2."
-              exit 1
-              ;;
-          esac
+          if [ -z "${UK_AQ_OBSERVS_HISTORY_R2_API_URL}" ] || [ -z "${UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN}" ]; then
+            echo "Stable observations-history URL and upstream authentication secret are required."
+            exit 1
+          fi
 
           binding_enabled="$(printf '%s' "${UK_AQ_R2_METRICS_SERVICE_BINDING_ENABLED}" | tr '[:upper:]' '[:lower:]')"
           case "${binding_enabled}" in
@@ -143,7 +137,7 @@ jobs:
           echo "  hostname=${UK_AQ_OPS_ADMIN_HOSTNAME}"
           echo "  zone=${UK_AQ_OPS_ADMIN_ZONE_NAME}"
           echo "  account=${masked_account_id}"
-          echo "  r2_history_version=${UK_AQ_R2_HISTORY_VERSION}"
+          echo "  r2_history_authority=stable_observations_history_service"
           echo "  r2_metrics_service_binding=${binding_enabled}"
 
       - name: Prepare wrangler config
@@ -204,7 +198,8 @@ jobs:
             --arg UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS "${UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS}" \
             --arg UK_AQ_R2_HISTORY_COUNTS_API_URL "${UK_AQ_R2_HISTORY_COUNTS_API_URL}" \
             --arg UK_AQ_R2_HISTORY_COUNTS_API_TOKEN "${UK_AQ_R2_HISTORY_COUNTS_API_TOKEN}" \
-            --arg UK_AQ_R2_HISTORY_VERSION "${UK_AQ_R2_HISTORY_VERSION}" \
+            --arg UK_AQ_OBSERVS_HISTORY_R2_API_URL "${UK_AQ_OBSERVS_HISTORY_R2_API_URL}" \
+            --arg UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN "${UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN}" \
             --arg UK_AQ_R2_HISTORY_WINDOW_RPC "${UK_AQ_R2_HISTORY_WINDOW_RPC}" \
             --arg UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID "${UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID}" \
             --arg UK_AQ_R2_CLOUDFLARE_API_TOKEN "${UK_AQ_R2_CLOUDFLARE_API_TOKEN}" \
@@ -237,7 +232,8 @@ jobs:
               UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS: $UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS,
               UK_AQ_R2_HISTORY_COUNTS_API_URL: $UK_AQ_R2_HISTORY_COUNTS_API_URL,
               UK_AQ_R2_HISTORY_COUNTS_API_TOKEN: $UK_AQ_R2_HISTORY_COUNTS_API_TOKEN,
-              UK_AQ_R2_HISTORY_VERSION: $UK_AQ_R2_HISTORY_VERSION,
+              UK_AQ_OBSERVS_HISTORY_R2_API_URL: $UK_AQ_OBSERVS_HISTORY_R2_API_URL,
+              UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN: $UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN,
               UK_AQ_R2_HISTORY_WINDOW_RPC: $UK_AQ_R2_HISTORY_WINDOW_RPC,
               UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: $UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID,
               UK_AQ_R2_CLOUDFLARE_API_TOKEN: $UK_AQ_R2_CLOUDFLARE_API_TOKEN,

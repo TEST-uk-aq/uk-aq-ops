@@ -1,8 +1,6 @@
-import type { HistoryResolution } from "./history_generation";
 import { errorEnvelope, withCorsAndCacheControl, withCorsAndNoStore } from "./http";
 
 export type WorkerEnv = {
-  historyResolution?: HistoryResolution;
   DASHBOARD_UPSTREAM_BASE_URL?: string;
   DASHBOARD_UPSTREAM_BEARER_TOKEN?: string;
   UKAQ_PROXY_ROUTE_PREFIX?: string;
@@ -23,6 +21,7 @@ export type WorkerEnv = {
   UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS?: string;
   UK_AQ_R2_HISTORY_COUNTS_API_URL?: string;
   UK_AQ_R2_HISTORY_COUNTS_API_TOKEN?: string;
+  UK_AQ_R2_HISTORY_VERSION?: string;
   UK_AQ_OBSERVS_HISTORY_R2_API_URL?: string;
   UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN?: string;
   UK_AQ_AQI_HISTORY_R2_API_URL?: string;

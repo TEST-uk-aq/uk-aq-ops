@@ -76,6 +76,7 @@ R2_HISTORY_COUNTS_API_TOKEN = str(
     os.getenv("UK_AQ_R2_HISTORY_COUNTS_API_TOKEN") or R2_HISTORY_DAYS_API_TOKEN
 ).strip()
 R2_HISTORY_VERSION_ENV = "UK_AQ_R2_HISTORY_VERSION"
+R2_HISTORY_READ_VERSION_ACCEPTED = {"v1", "v2"}
 DEPRECATED_R2_HISTORY_VERSION_ENVS = (
     "UK_AQ_R2_HISTORY_READ_VERSION",
     "UK_AQ_R2_HISTORY_WRITE_VERSION",
@@ -278,8 +279,6 @@ def _dashboard_cache_bucket(
 
 
 def _invalidate_dashboard_cache(clear_storage_coverage: bool = False) -> None:
-    from uk_aq_dashboard_cache import request_refresh
-    request_refresh("dashboard")
     with CACHE_LOCK:
         for cache_bucket in ("with_coverage", "without_coverage"):
             bucket_state = CACHE_STATE.get(cache_bucket)
@@ -545,24 +544,48 @@ def _flush_dashboard_service_egress_metrics() -> None:
 
 
 def _resolve_r2_history_read_version() -> Dict[str, Any]:
-    from uk_aq_dashboard_history_generation import resolve_history_generation
-    return resolve_history_generation()
-
-
-_HISTORY_CACHE_VERSION = None
-_HISTORY_CACHE_VERSION_LOCK = threading.Lock()
-
-
-def _ensure_history_generation():
-    global _HISTORY_CACHE_VERSION
-    resolved = _resolve_r2_history_read_version()
-    with _HISTORY_CACHE_VERSION_LOCK:
-        if _HISTORY_CACHE_VERSION != resolved["version"]:
-            _invalidate_dashboard_cache(clear_storage_coverage=True)
-            with CACHE_LOCK:
-                R2_HISTORY_DAYS_CACHE_STATE.clear()
-            _HISTORY_CACHE_VERSION = resolved["version"]
-    return resolved
+    present_deprecated = [name for name in DEPRECATED_R2_HISTORY_VERSION_ENVS if name in os.environ]
+    if present_deprecated:
+        return {
+            "version": None,
+            "label": "R2 invalid",
+            "source": "invalid_env",
+            "warning": (
+                "Deprecated R2 history version env var(s) "
+                f"{', '.join(present_deprecated)} are no longer supported. "
+                f"Use {R2_HISTORY_VERSION_ENV}=v1|v2 and delete the old split vars."
+            ),
+            "valid": False,
+            "raw": "",
+        }
+    raw = str(os.getenv(R2_HISTORY_VERSION_ENV) or "").strip()
+    normalized = raw.lower()
+    if not normalized:
+        return {
+            "version": None,
+            "label": "R2 invalid",
+            "source": "missing_env",
+            "warning": f"Missing {R2_HISTORY_VERSION_ENV}; set {R2_HISTORY_VERSION_ENV}=v1 or {R2_HISTORY_VERSION_ENV}=v2.",
+            "valid": False,
+            "raw": raw,
+        }
+    if normalized in R2_HISTORY_READ_VERSION_ACCEPTED:
+        return {
+            "version": normalized,
+            "label": f"R2_{normalized}",
+            "source": "env",
+            "warning": None,
+            "valid": True,
+            "raw": raw,
+        }
+    return {
+        "version": None,
+        "label": "R2 invalid",
+        "source": "invalid_env",
+        "warning": f"Invalid {R2_HISTORY_VERSION_ENV}={raw!r}; expected v1 or v2. R2 history checks are disabled until this is fixed.",
+        "valid": False,
+        "raw": raw,
+    }
 
 
 def _append_r2_history_read_version(params: Dict[str, str]) -> Dict[str, str]:
@@ -1372,9 +1395,9 @@ def _fetch_size_metrics_from_external_api(
     if not DB_SIZE_API_URL:
         return None, None, None, None, None, None, None
 
-    params = _append_r2_history_read_version({
+    params = {
         "lookback_days": str(DB_SIZE_LOOKBACK_DAYS),
-    })
+    }
     headers = {
         "Accept": "application/json",
     }
@@ -1934,7 +1957,7 @@ def _filter_dropbox_backup_days_for_read_version(
     r2_history_days: Optional[Dict[str, Set[date]]],
     read_version_info: Dict[str, Any],
 ) -> Tuple[Dict[str, Set[date]], Optional[str]]:
-    if read_version_info.get("version") not in {"v2", "v3"}:
+    if read_version_info.get("version") != "v2":
         return dropbox_days, None
     if not isinstance(r2_history_days, dict):
         return _empty_dropbox_backup_days(), (
@@ -2883,8 +2906,6 @@ def _fetch_r2_history_days_from_external_api(
 
     if not isinstance(payload, dict):
         return None, None, None, "R2 history-days API payload is not an object"
-    if payload.get("read_version") != params["read_version"] or payload.get("ok") is False:
-        return None, None, None, "R2 history-days generation mismatch or failed response"
 
     raw_error = payload.get("error")
     if isinstance(raw_error, str) and raw_error.strip():
@@ -2912,7 +2933,7 @@ def _fetch_r2_history_days_from_external_api(
 
     observations_days = day_sets["observations"]
     aqilevels_days = day_sets["aqilevels"]
-    overlap_days = observations_days if params["read_version"] == "v3" else observations_days & aqilevels_days
+    overlap_days = observations_days & aqilevels_days
 
     if overlap_days:
         r2_window: Dict[str, Any] = {
@@ -2932,7 +2953,7 @@ def _fetch_r2_history_days_from_external_api(
     # Include domain counts for debugging/inspection in dashboard payloads.
     r2_window["observations_day_count"] = len(observations_days)
     r2_window["aqilevels_day_count"] = len(aqilevels_days)
-    r2_window["count_basis"] = "explicit_observation_days" if params["read_version"] == "v3" else "explicit_overlap_both_domains"
+    r2_window["count_basis"] = "explicit_overlap_both_domains"
 
     resolved_version = _resolve_r2_history_read_version()
     r2_window["read_version"] = resolved_version["version"]
@@ -3032,13 +3053,11 @@ def _get_r2_history_days_cached(
     Optional[str],
     Optional[str],
 ]:
-    selected_version = _resolve_r2_history_read_version()["version"]
     now = datetime.now(timezone.utc)
     with CACHE_LOCK:
         cached_generated_at = R2_HISTORY_DAYS_CACHE_STATE.get("generated_at")
         if (
             not force_refresh
-            and R2_HISTORY_DAYS_CACHE_STATE.get("history_version") == selected_version
             and isinstance(cached_generated_at, datetime)
             and (now - cached_generated_at).total_seconds() < R2_HISTORY_DAYS_CACHE_TTL_SECONDS
         ):
@@ -3051,16 +3070,13 @@ def _get_r2_history_days_cached(
 
     day_sets, r2_window, bucket_value, error = _fetch_r2_history_days_from_external_api()
     read_version = _resolve_r2_history_read_version()
-    if error is not None and base_url and service_role_key and read_version.get("version") not in {"v2", "v3"}:
+    if error is not None and base_url and service_role_key and read_version.get("version") != "v2":
         sb_day_sets, sb_window, sb_bucket, sb_error = _fetch_r2_history_days_from_supabase(
             base_url, service_role_key
         )
         if sb_error is None and sb_day_sets is not None:
             day_sets, r2_window, bucket_value, error = sb_day_sets, sb_window, sb_bucket, None
-    if _resolve_r2_history_read_version()["version"] != selected_version:
-        raise RuntimeError("History generation changed during day collection")
     with CACHE_LOCK:
-        R2_HISTORY_DAYS_CACHE_STATE["history_version"] = selected_version
         R2_HISTORY_DAYS_CACHE_STATE["day_sets"] = day_sets
         R2_HISTORY_DAYS_CACHE_STATE["window"] = r2_window
         R2_HISTORY_DAYS_CACHE_STATE["bucket"] = bucket_value
@@ -3114,8 +3130,6 @@ def _fetch_r2_history_counts_from_external_api(
 
     if not isinstance(payload, dict):
         return None, "R2 history-counts API payload is not an object"
-    if payload.get("read_version") != params["read_version"] or payload.get("ok") is False:
-        return None, "R2 history-counts generation mismatch or failed response"
 
     raw_error = payload.get("error")
     if isinstance(raw_error, str) and raw_error.strip():
@@ -4022,10 +4036,10 @@ def _fetch_storage_coverage_context(
         service_role_key=str(headers.get("apikey") or ""),
     )
     read_version_info = _resolve_r2_history_read_version()
-    if read_version_info.get("version") in {"v2", "v3"}:
+    if read_version_info.get("version") == "v2":
         r2_backup_window_rpc = None
         r2_backup_window_rpc_error = (
-            "Version-blind Supabase window fallback disabled for selected history generation."
+            "Version-blind Supabase window fallback disabled for v2."
             if r2_backup_window_from_history_days is None
             else None
         )
@@ -4388,8 +4402,7 @@ def _get_dashboard(
     include_metric_context: bool = True,
     include_ingest_context: bool = True,
 ) -> Dict[str, Any]:
-    selected_version = _resolve_r2_history_read_version()["version"]
-    cache_bucket = selected_version + ":" + _dashboard_cache_bucket(
+    cache_bucket = _dashboard_cache_bucket(
         include_storage_coverage,
         include_metric_context,
         include_ingest_context,
@@ -4410,8 +4423,6 @@ def _get_dashboard(
         include_metric_context=include_metric_context,
         include_ingest_context=include_ingest_context,
     )
-    if _resolve_r2_history_read_version()["version"] != selected_version:
-        raise RuntimeError("History generation changed during dashboard collection")
     with CACHE_LOCK:
         bucket_state = CACHE_STATE.setdefault(cache_bucket, {})
         bucket_state["data"] = data
@@ -4424,10 +4435,6 @@ def _build_storage_coverage_payload(
     service_role_key: str,
     force_refresh: bool = False,
 ) -> Dict[str, Any]:
-    if force_refresh:
-        with CACHE_LOCK:
-            STORAGE_COVERAGE_CACHE_STATE["rows"] = None
-            STORAGE_COVERAGE_CACHE_STATE["next_refresh_at"] = None
     now = datetime.now(timezone.utc)
     storage_coverage_days = None if force_refresh else _get_cached_storage_coverage_days(now)
     if storage_coverage_days is None:
@@ -4438,10 +4445,6 @@ def _build_storage_coverage_payload(
             now,
             force_refresh=force_refresh,
         )
-        with CACHE_LOCK:
-            STORAGE_COVERAGE_CACHE_STATE["source_errors"] = {
-                key: value for key, value in coverage_context.items() if key.endswith("_error") and value
-            }
         storage_coverage_days = _get_storage_coverage_days_cached(
             now=now,
             base_url=base_url,
@@ -4468,7 +4471,6 @@ def _build_storage_coverage_payload(
 
     return {
         "generated_at": now.isoformat().replace("+00:00", "Z"),
-        "upstream_refresh_errors": STORAGE_COVERAGE_CACHE_STATE.get("source_errors", {}),
         "storage_coverage_source": "live_per_day_presence",
         "storage_coverage_days": storage_coverage_days,
         "r2_history_read_version": dropbox_state_info.get("read_version"),
@@ -4503,15 +4505,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(self.path)
             if parsed.path.startswith("/api/") and not self._authorize_api_request():
-                return
-            from uk_aq_dashboard_cache import serve_cached_request
-            if parsed.path in {"/api/dashboard", "/api/storage_coverage", "/api/r2_metrics", "/api/r2_connector_counts"}:
-                try:
-                    _ensure_history_generation()
-                except RuntimeError:
-                    self._send_cache_json({"error": "History generation authority unavailable"}, 503)
-                    return
-            if serve_cached_request(self, parsed):
                 return
             if parsed.path in ("/", "/index.html"):
                 self._serve_html()
@@ -4602,13 +4595,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload.encode("utf-8"))
         return False
 
-    def _send_cache_json(self, data, status=200):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
-
     def _serve_html(self) -> None:
         html_path: Path = self.server.html_path
         try:
@@ -4698,12 +4684,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload.encode("utf-8"))
             return
 
-        resolution = _resolve_r2_history_read_version()
-        data = dict(data, r2_history_read_version=resolution, r2_history_read_version_effective=resolution)
-        if resolution["version"] == "v3":
-            data["r2_domain_size_metrics"] = []
-            data["r2_domain_size_metrics_error"] = None
-            data["r2_domain_size_metrics_warning"] = "Historical domain byte metrics have no generation identity; unavailable for v3."
         payload = json.dumps(data, indent=2)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
@@ -4837,14 +4817,65 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload.encode("utf-8"))
 
     def _serve_r2_metrics(self, parsed) -> None:
-        from uk_aq_dashboard_cache import build_product
-        query = parse_qs(parsed.query)
-        if (query.get("force") or [""])[0].lower() in {"1", "true", "yes"}:
-            _get_r2_usage_cached(force_refresh=True)
+        query = parse_qs(parsed.query, keep_blank_values=False)
+        force_refresh_raw = ((query.get("force") or [""])[0] or "").strip().lower()
+        force_refresh = force_refresh_raw in {"1", "true", "yes", "y", "on"}
         try:
-            self._send_cache_json(build_product(__import__(__name__), "r2_metrics", self.server.base_url, self.server.service_role_key))
-        except Exception:
-            self._send_cache_json({"error": "Authoritative R2 metrics unavailable"}, 503)
+            r2_usage, r2_usage_error = _get_r2_usage_cached(force_refresh=force_refresh)
+            headers = _postgrest_headers(self.server.service_role_key)
+            (
+                _r2_history_days,
+                r2_backup_window_from_history_days,
+                r2_history_days_bucket,
+                r2_history_days_error,
+            ) = _get_r2_history_days_cached(
+                force_refresh=False,
+                base_url=self.server.base_url,
+                service_role_key=self.server.service_role_key,
+            )
+            r2_backup_window_rpc, r2_backup_window_rpc_error = _fetch_r2_backup_window(
+                self.server.base_url,
+                headers,
+            )
+            r2_backup_window = (
+                r2_backup_window_from_history_days
+                if r2_backup_window_from_history_days is not None
+                else r2_backup_window_rpc
+            )
+            r2_backup_window_error = _join_error_messages(
+                r2_history_days_error,
+                r2_backup_window_rpc_error if r2_backup_window_from_history_days is None else None,
+            )
+        except Exception as exc:
+            payload = json.dumps({"error": str(exc)}, indent=2)
+            self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        if force_refresh:
+            _invalidate_dashboard_cache(clear_storage_coverage=False)
+
+        payload = json.dumps(
+            {
+                "r2_usage": r2_usage,
+                "r2_usage_error": r2_usage_error,
+                "r2_backup_window": r2_backup_window,
+                "r2_backup_window_error": r2_backup_window_error,
+                "r2_history_days_bucket": r2_history_days_bucket,
+                "r2_history_days_error": r2_history_days_error,
+                "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            },
+            indent=2,
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload.encode("utf-8"))
 
     def _serve_r2_connector_counts(self, parsed) -> None:
         query = parse_qs(parsed.query, keep_blank_values=False)
@@ -5141,7 +5172,7 @@ def main() -> None:
     server.html_path = html_path
     server.upstream_bearer_token = str(os.getenv("DASHBOARD_UPSTREAM_BEARER_TOKEN") or "").strip()
 
-    r2_version = _ensure_history_generation()
+    r2_version = _resolve_r2_history_read_version()
     print(f"UK AQ dashboard R2 history read version: {r2_version['label']} ({r2_version['source']})")
     if r2_version.get("warning"):
         print(f"UK AQ dashboard R2 history read version warning: {r2_version['warning']}")

@@ -66,7 +66,28 @@ def _resolve_dropbox_state_path_info() -> Dict[str, Any]:
         }
 
     version = str(read_version_info.get("version") or "")
-    state_prefix = read_version_info["generation"]["backup_state_prefix"]
+    if version != "v2":
+        warning = (
+            "Dropbox storage coverage is sourced only from the hierarchical v2 backup state; "
+            f"active R2 history version is {version or 'unknown'}."
+        )
+        return {
+            "path": None,
+            "source": "disabled_non_v2",
+            "cache_key": f"{version or 'unknown'}:dropbox_hierarchical_disabled",
+            "warning": warning,
+            "error": warning,
+            "fallback_attempted": False,
+            "read_version": read_version_info,
+            "attempted_paths": [],
+            "state_file_override": None,
+            "ignored_state_file_override": None,
+        }
+
+    state_prefix = str(
+        os.getenv("UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX")
+        or HIERARCHICAL_STATE_PREFIX_DEFAULT
+    ).strip().strip("/")
     if not state_prefix:
         warning = "UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX resolved to an empty path."
         return {
@@ -86,7 +107,7 @@ def _resolve_dropbox_state_path_info() -> Dict[str, Any]:
     return {
         "path": root_path,
         "source": "hierarchical_v2",
-        "cache_key": f"{version}:hierarchical:{root_path}",
+        "cache_key": f"v2:hierarchical:{root_path}",
         "warning": None,
         "error": None,
         "fallback_attempted": False,
@@ -108,9 +129,6 @@ def _hierarchical_state_month_refs(
     ):
         return [], "Hierarchical Dropbox state root identity mismatch"
 
-    version = core._resolve_r2_history_read_version()["version"]
-    if raw_root.get("observation_generation", "v2") != version:
-        return [], "Hierarchical Dropbox state generation mismatch"
     observations = raw_root.get("observations")
     if not isinstance(observations, dict):
         return [], "Hierarchical Dropbox state root has no observations object"
@@ -143,9 +161,6 @@ def _hierarchical_state_month_refs(
                 or "\\" in state_key
             ):
                 return [], f"Invalid hierarchical Dropbox state shard key: {state_key!r}"
-            prefix = core._resolve_r2_history_read_version()["generation"]["backup_state_prefix"]
-            if not state_key.startswith(prefix + "/"):
-                return [], "Hierarchical checkpoint shard outside selected generation"
             refs.append((year, month, state_key))
 
     refs.sort(key=lambda item: (item[0], item[1], item[2]))

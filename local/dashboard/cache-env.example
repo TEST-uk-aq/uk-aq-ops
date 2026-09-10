@@ -1,0 +1,9 @@
+# Copy to separate .env.dashboard-cache.reader / .writer files, chmod 600.
+# Never sync these settings to Cloudflare, Supabase or GCP.
+UKAQ_ENV_NAME=test
+UK_AQ_DASHBOARD_MYSQL_ENABLED=true
+UK_AQ_DASHBOARD_MYSQL_DATABASE=uk_aq_dashboard_test
+UK_AQ_DASHBOARD_MYSQL_SOCKET=/absolute/path/to/actual/mysql.sock
+UK_AQ_DASHBOARD_MYSQL_USER=uk_aq_dashboard_test_reader
+UK_AQ_DASHBOARD_MYSQL_PASSWORD=REPLACE_LOCALLY
+# Writer file uses uk_aq_dashboard_test_writer and its distinct password.

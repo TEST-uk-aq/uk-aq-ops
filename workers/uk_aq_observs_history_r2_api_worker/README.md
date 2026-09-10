@@ -127,3 +127,7 @@ Optional env:
 cd workers/uk_aq_observs_history_r2_api_worker
 wrangler deploy
 ```
+
+## Serving generation descriptor
+
+`GET /v1/history-generation` uses the existing `x-uk-aq-upstream-auth` authentication and returns the immutable shared generation selected by the stable service, with `Cache-Control: no-store`. It does not read or list R2. Dashboard clients use this endpoint rather than their own deployment-time history selector. See the active `system_docs/r2_history/generation_descriptor_contract.md` in the system-docs repository for the wire contract and failure semantics.

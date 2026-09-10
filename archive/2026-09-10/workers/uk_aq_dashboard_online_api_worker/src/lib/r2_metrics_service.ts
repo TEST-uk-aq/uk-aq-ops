@@ -1,4 +1,3 @@
-import { assertHistoryPayload, historyResolution } from "./history_generation";
 import { errorEnvelope } from "./http";
 import type { WorkerEnv } from "./upstream";
 
@@ -85,7 +84,6 @@ async function fetchMetricsBindingJson(
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("R2 metrics service response is not a JSON object");
   }
-  if (pathname === "/v1/r2-history-days" || pathname === "/v1/r2-history-counts") assertHistoryPayload(payload as JsonObject, env);
   return payload as JsonObject;
 }
 
@@ -150,10 +148,12 @@ export async function proxyR2ConnectorCounts(
   try {
     const incoming = new URL(request.url);
     const params = new URLSearchParams(incoming.search);
-    params.set("read_version", historyResolution(env).version);
+    if (!params.get("read_version")) {
+      const version = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim().toLowerCase();
+      if (version === "v1" || version === "v2") params.set("read_version", version);
+    }
 
     const response = await fetchMetricsBinding(env, "/v1/r2-history-counts", params);
-    if (response.ok) assertHistoryPayload(await response.clone().json() as JsonObject, env);
     const headers = new Headers(response.headers);
     headers.delete("content-length");
     headers.set("x-ukaq-r2-metrics-transport", "service-binding");
@@ -186,7 +186,7 @@ export async function enrichStorageCoverageFromMetrics(
   const object = payload as JsonObject;
   if (!Array.isArray(object.storage_coverage_days)) return response;
 
-  const version = historyResolution(env).version;
+  const version = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim().toLowerCase();
   const historyParams = new URLSearchParams();
   historyParams.set("read_version", version);
   historyParams.set("max_days", "3660");
@@ -196,9 +196,9 @@ export async function enrichStorageCoverageFromMetrics(
   dbParams.set("lookback_days", String(lookback));
 
   const [historyResult, dbResult] = await Promise.allSettled([
-    version === "v2" || version === "v3"
+    version === "v1" || version === "v2"
       ? fetchMetricsBindingJson(env, "/v1/r2-history-days", historyParams)
-      : Promise.reject(new Error("Serving history descriptor must select v2 or v3")),
+      : Promise.reject(new Error("UK_AQ_R2_HISTORY_VERSION must be v1 or v2")),
     fetchMetricsBindingJson(env, "/v1/db-size-metrics", dbParams),
   ]);
 

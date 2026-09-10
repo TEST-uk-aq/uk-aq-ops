@@ -1454,17 +1454,6 @@ export default {
       })) {
         if (env[name] && normalizePrefix(env[name]) !== expected) throw new Error(`${name} conflicts with selected generation`);
       }
-      if (new URL(request.url).pathname === "/v1/history-generation") {
-        const auth = authorized(request, env);
-        if (!auth.ok) return jsonResponse({ ok: false, error: auth.error }, { status: auth.status, noStore: true });
-        if (request.method !== "GET") return jsonResponse({ ok: false, error: "Only GET is supported" }, { status: 405, noStore: true });
-        if (!env.UK_AQ_HISTORY_BUCKET) throw new Error("Missing UK_AQ_HISTORY_BUCKET");
-        return jsonResponse({
-          ok: true, kind: "uk_aq_observation_history_generation", schema_version: 1,
-          read_version: generation.version, source: "stable_observations_history_service",
-          selector: "UK_AQ_R2_HISTORY_VERSION", resolved_at: new Date().toISOString(), generation,
-        }, { noStore: true });
-      }
       if (generation.version === "v3") return await observationHistoryV3.fetch(request, env, ctx);
     } catch (error) {
       return jsonResponse({ ok: false, error: error.message }, { status: 500, noStore: true });
