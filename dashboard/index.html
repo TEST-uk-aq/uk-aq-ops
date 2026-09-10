@@ -5238,7 +5238,7 @@
                 </span>
               </span>
               <button type="button" class="coverage-calendar-nav-btn" data-action="today-period">Today</button>
-              <button type="button" class="settings-button r2-refresh-button" data-action="force-refresh">Force Refresh</button>
+              <button type="button" class="settings-button r2-refresh-button" data-action="force-refresh">Refresh</button>
               <button type="button" class="coverage-calendar-nav-btn" data-action="prev-period">${previousLabel}</button>
               <button type="button" class="coverage-calendar-nav-btn" data-action="next-period">${nextLabel}</button>
             </div>
@@ -5271,17 +5271,13 @@
         if (forceRefreshButton) {
           forceRefreshButton.addEventListener("click", async () => {
             forceRefreshButton.disabled = true;
-            forceRefreshButton.textContent = "Force Refreshing...";
+            forceRefreshButton.textContent = "Updating";
             try {
-              if (activeMode === "operations") {
-                await loadOperationsDashboard({ forceRefresh: true });
-              } else {
-                await loadDashboard({ forceRefresh: true });
-              }
+              await loadStorageCoverage({ forceRefresh: true, preservePanel: true });
             } finally {
               if (document.body.contains(forceRefreshButton)) {
                 forceRefreshButton.disabled = false;
-                forceRefreshButton.textContent = "Force Refresh";
+                forceRefreshButton.textContent = "Refresh";
               }
             }
           });
@@ -5585,10 +5581,13 @@
           return;
         }
         const forceRefresh = Boolean(options.forceRefresh);
+        const preservePanel = Boolean(options.preservePanel);
         const parentLoadId = Number(options.parentLoadId) || 0;
         const requestId = ++storageCoverageLoadSequence;
         const loadingLabel = forceRefresh ? "Force refreshing calendar..." : "Refreshing calendar...";
-        upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel(loadingLabel));
+        if (!preservePanel) {
+          upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel(loadingLabel));
+        }
         try {
           const params = new URLSearchParams();
           params.set("t", String(Date.now()));
@@ -5628,7 +5627,7 @@
           latestR2HistoryReadVersion = data.r2_history_read_version || latestR2HistoryReadVersion;
           upsertStorageCoveragePanel(
             renderStorageCoverageCalendarPanel(coverageRows, {
-              forceConnectorCountsRefresh: forceRefresh,
+              forceConnectorCountsRefresh: false,
               r2HistoryReadVersion: latestR2HistoryReadVersion,
             }),
           );
@@ -5648,9 +5647,11 @@
             return;
           }
           const message = err.message || String(err);
-          upsertStorageCoveragePanel(
-            renderStorageCoverageErrorPanel(message, { forceRefresh, parentLoadId }),
-          );
+          if (!preservePanel) {
+            upsertStorageCoveragePanel(
+              renderStorageCoverageErrorPanel(message, { forceRefresh, parentLoadId }),
+            );
+          }
           setError(`${STORAGE_COVERAGE_ERROR_PREFIX} ${message}`);
         }
       }

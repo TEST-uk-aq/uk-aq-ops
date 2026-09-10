@@ -11,7 +11,6 @@ from urllib.parse import parse_qs
 
 PRODUCT_SECONDS = {"dashboard": 300, "metric_context": 300, "storage_coverage": 21600,
                    "r2_metrics": 3600, "daily_task_runs": 300}
-STORAGE_COVERAGE_FORCE_TIMEOUT_SECONDS = 180.0
 METRIC_KEYS = ("db_size_metrics", "schema_size_metrics", "r2_domain_size_metrics",
                "db_size_metrics_error", "schema_size_metrics_error", "r2_domain_size_metrics_error",
                "r2_usage", "r2_usage_error", "service_egress_metrics", "service_egress_metrics_error",
@@ -128,54 +127,6 @@ def read_product(product, version, role="reader"):
             "source_generated_at": iso(row["source_generated_at"]), "refreshed_at": iso(row["refreshed_at"]),
             "expires_at": iso(row["expires_at"]), "last_error_code": row["last_error_code"]}
     return payload, meta
-
-
-def read_product_publication(product, version, role="reader"):
-    """Return the publication/failure identity without reading or changing payload data."""
-    with connect(role) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT refreshed_at, last_attempt_at, last_error_code "
-                "FROM dashboard_cache WHERE product=%s AND history_version=%s",
-                (product, version),
-            )
-            return cursor.fetchone()
-
-
-def _serve_forced_storage_coverage(handler, core, version, resolution):
-    """Signal the writer and synchronously return only its next successful publication."""
-    previous = read_product_publication("storage_coverage", version)
-    previous_refreshed_at = previous.get("refreshed_at") if previous else None
-    previous_attempt_at = previous.get("last_attempt_at") if previous else None
-    request_refresh("storage_coverage")
-    deadline = time.monotonic() + STORAGE_COVERAGE_FORCE_TIMEOUT_SECONDS
-
-    while time.monotonic() < deadline:
-        if core._ensure_history_generation()["version"] != version:
-            handler._send_cache_json({"error": "Storage coverage refresh generation changed"}, 503)
-            return
-        publication = read_product_publication("storage_coverage", version)
-        if publication:
-            refreshed_at = publication.get("refreshed_at")
-            if refreshed_at is not None and refreshed_at != previous_refreshed_at:
-                row = read_product("storage_coverage", version)
-                if row is None:
-                    break
-                payload, meta = row
-                payload = copy.deepcopy(payload)
-                payload["r2_history_read_version"] = resolution
-                payload["r2_history_read_version_effective"] = resolution
-                payload["local_cache"] = {"storage_coverage": meta}
-                handler._send_cache_json(payload)
-                return
-            attempt_at = publication.get("last_attempt_at")
-            if (publication.get("last_error_code") and attempt_at is not None
-                    and attempt_at != previous_attempt_at):
-                handler._send_cache_json({"error": "Storage coverage refresh failed"}, 503)
-                return
-        time.sleep(0.25)
-
-    handler._send_cache_json({"error": "Storage coverage refresh timed out"}, 504)
 
 
 def provenance(product):
@@ -390,16 +341,12 @@ def serve_cached_request(handler, parsed):
     if parsed.path == "/api/dashboard":
         if flag("include_metric_context") or flag("include_storage_coverage"): products.append("metric_context")
         if flag("include_storage_coverage"): products.append("storage_coverage")
-    force_requested = flag("force", "0")
-    if force_requested and parsed.path != "/api/storage_coverage":
+    if flag("force", "0"):
         for product in products: request_refresh(product)
 
     try:
         resolution = core._ensure_history_generation()
         version = resolution["version"]
-        if force_requested and parsed.path == "/api/storage_coverage":
-            _serve_forced_storage_coverage(handler, core, version, resolution)
-            return True
         payload = {}; metadata = {}
         for product in products:
             try:
