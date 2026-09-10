@@ -3,15 +3,18 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qs
 
 PRODUCT_SECONDS = {"dashboard": 300, "metric_context": 300, "storage_coverage": 21600,
                    "r2_metrics": 3600, "daily_task_runs": 300}
-STORAGE_COVERAGE_FORCE_TIMEOUT_SECONDS = 180.0
+STORAGE_COVERAGE_REQUEST_RETENTION_SECONDS = 86400
+_STORAGE_COVERAGE_REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
 METRIC_KEYS = ("db_size_metrics", "schema_size_metrics", "r2_domain_size_metrics",
                "db_size_metrics_error", "schema_size_metrics_error", "r2_domain_size_metrics_error",
                "r2_usage", "r2_usage_error", "service_egress_metrics", "service_egress_metrics_error",
@@ -130,52 +133,66 @@ def read_product(product, version, role="reader"):
     return payload, meta
 
 
-def read_product_publication(product, version, role="reader"):
-    """Return the publication/failure identity without reading or changing payload data."""
-    with connect(role) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT refreshed_at, last_attempt_at, last_error_code "
-                "FROM dashboard_cache WHERE product=%s AND history_version=%s",
-                (product, version),
-            )
-            return cursor.fetchone()
+def storage_coverage_request_dir():
+    return request_dir() / "storage-coverage-requests"
 
 
-def _serve_forced_storage_coverage(handler, core, version, resolution):
-    """Signal the writer and synchronously return only its next successful publication."""
-    previous = read_product_publication("storage_coverage", version)
-    previous_refreshed_at = previous.get("refreshed_at") if previous else None
-    previous_attempt_at = previous.get("last_attempt_at") if previous else None
+def _storage_coverage_request_path(request_id):
+    if not _STORAGE_COVERAGE_REQUEST_ID.fullmatch(str(request_id or "")):
+        raise ValueError("Invalid storage coverage refresh request identity")
+    return storage_coverage_request_dir() / f"{request_id}.json"
+
+
+def write_storage_coverage_request(state):
+    """Atomically persist bounded coordination state; never include product payloads."""
+    directory = storage_coverage_request_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    path = _storage_coverage_request_path(state["request_id"])
+    temporary = directory / f".{state['request_id']}-{os.getpid()}-{time.time_ns()}"
+    temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def create_storage_coverage_request(version):
+    request_id = uuid.uuid4().hex
+    state = {"request_id": request_id, "status": "pending", "generation": version,
+             "accepted_at": iso(utcnow())}
+    write_storage_coverage_request(state)
     request_refresh("storage_coverage")
-    deadline = time.monotonic() + STORAGE_COVERAGE_FORCE_TIMEOUT_SECONDS
+    return state
 
-    while time.monotonic() < deadline:
-        if core._ensure_history_generation()["version"] != version:
-            handler._send_cache_json({"error": "Storage coverage refresh generation changed"}, 503)
-            return
-        publication = read_product_publication("storage_coverage", version)
-        if publication:
-            refreshed_at = publication.get("refreshed_at")
-            if refreshed_at is not None and refreshed_at != previous_refreshed_at:
-                row = read_product("storage_coverage", version)
-                if row is None:
-                    break
-                payload, meta = row
-                payload = copy.deepcopy(payload)
-                payload["r2_history_read_version"] = resolution
-                payload["r2_history_read_version_effective"] = resolution
-                payload["local_cache"] = {"storage_coverage": meta}
-                handler._send_cache_json(payload)
-                return
-            attempt_at = publication.get("last_attempt_at")
-            if (publication.get("last_error_code") and attempt_at is not None
-                    and attempt_at != previous_attempt_at):
-                handler._send_cache_json({"error": "Storage coverage refresh failed"}, 503)
-                return
-        time.sleep(0.25)
 
-    handler._send_cache_json({"error": "Storage coverage refresh timed out"}, 504)
+def read_storage_coverage_request(request_id):
+    path = _storage_coverage_request_path(request_id)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return state if isinstance(state, dict) and state.get("request_id") == request_id else None
+
+
+def pending_storage_coverage_requests():
+    directory = storage_coverage_request_dir()
+    now = time.time()
+    pending = []
+    try:
+        paths = list(directory.glob("*.json"))
+    except OSError:
+        return pending
+    for path in paths:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            age = now - path.stat().st_mtime
+            if age > STORAGE_COVERAGE_REQUEST_RETENTION_SECONDS:
+                path.unlink(missing_ok=True)
+            elif isinstance(state, dict) and state.get("status") == "pending":
+                _storage_coverage_request_path(state.get("request_id"))
+                pending.append(state)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return pending
 
 
 def provenance(product):
@@ -393,12 +410,24 @@ def serve_cached_request(handler, parsed):
     force_requested = flag("force", "0")
     if force_requested and parsed.path != "/api/storage_coverage":
         for product in products: request_refresh(product)
+    refresh_request_id = (query.get("refresh_request_id") or [None])[0]
+    if parsed.path == "/api/storage_coverage" and refresh_request_id:
+        try:
+            state = read_storage_coverage_request(refresh_request_id)
+        except ValueError:
+            state = None
+        if state is None:
+            handler._send_cache_json({"error": "Storage coverage refresh request not found"}, 404)
+        else:
+            handler._send_cache_json(state)
+        return True
 
     try:
         resolution = core._ensure_history_generation()
         version = resolution["version"]
         if force_requested and parsed.path == "/api/storage_coverage":
-            _serve_forced_storage_coverage(handler, core, version, resolution)
+            state = create_storage_coverage_request(version)
+            handler._send_cache_json({"refresh_request_id": state["request_id"], "status": "pending"}, 202)
             return True
         payload = {}; metadata = {}
         for product in products:

@@ -111,7 +111,7 @@ The background refresher runs independently of the browser.
 - Service egress: every 5 minutes. Recent mutable minute buckets are re-read with overlap and upserted rather than repeatedly downloading the dashboard's whole graph window.
 - DB-size and schema-size metrics: hourly, with at least two recent hours re-read and upserted. Normal chart rendering reads MySQL.
 - R2 account usage: hourly. The Cloudflare fetch remains asynchronous to the browser and each successful result is persisted as an hourly local point.
-- Storage coverage/calendar: retains its existing six-hour materialised cadence and serving-generation rules. Its **Refresh** button signals only the storage-coverage writer job and waits for a new successful MySQL publication; the existing calendar and last successful snapshot remain visible/in place if that update fails or times out.
+- Storage coverage/calendar: retains its existing six-hour materialised cadence and serving-generation rules. Its **Refresh** button creates an environment-local request identity and returns promptly; the browser uses short status polls while the writer associates a post-acceptance rebuild with that identity. On success the browser reads the newly published MySQL product. The existing calendar and last successful snapshot remain visible/in place if that update fails or times out.
 
 Retention pruning happens only inside a successful sync transaction. A failed upstream read must not erase the previously successful local history.
 
