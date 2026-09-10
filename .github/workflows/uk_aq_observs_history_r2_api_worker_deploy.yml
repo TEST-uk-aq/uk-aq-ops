@@ -25,9 +25,14 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: workers/uk_aq_observs_history_r2_api_worker/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            workers/uk_aq_observs_history_r2_api_worker/package-lock.json
 
-      - name: Install Dependencies
+      - name: Install repository runtime dependencies
+        run: npm ci
+
+      - name: Install Worker toolchain
         working-directory: workers/uk_aq_observs_history_r2_api_worker
         run: npm ci
 

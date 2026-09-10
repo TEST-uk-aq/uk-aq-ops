@@ -123,9 +123,14 @@ Optional env:
 
 ## Deploy (manual)
 
+From the repository root, install shared runtime dependencies and the pinned
+Worker-local deployment toolchain before invoking Wrangler:
+
 ```bash
+npm ci
+npm --prefix workers/uk_aq_observs_history_r2_api_worker ci
 cd workers/uk_aq_observs_history_r2_api_worker
-wrangler deploy
+./node_modules/.bin/wrangler deploy
 ```
 
 ## Serving generation descriptor
