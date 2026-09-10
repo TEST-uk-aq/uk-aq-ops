@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import json
 import os
+import threading
 import time
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qs
 
 PRODUCT_SECONDS = {"dashboard": 300, "metric_context": 300, "storage_coverage": 21600,
@@ -16,6 +17,7 @@ METRIC_KEYS = ("db_size_metrics", "schema_size_metrics", "r2_domain_size_metrics
                "r2_backup_window", "r2_backup_window_error", "r2_history_days_bucket", "r2_history_days_error",
                "r2_history_read_version", "r2_history_read_version_effective")
 _WRITER = False
+_INGEST_OVERRIDE_LOCK = threading.Lock()
 
 
 class CacheConfigurationError(RuntimeError):
@@ -54,7 +56,6 @@ def configuration(role):
     password = os.getenv("UK_AQ_DASHBOARD_MYSQL_PASSWORD", "")
     if not password:
         raise CacheConfigurationError("Missing dashboard MySQL password")
-    # Local socket only: no accidental remote database target or unencrypted TCP.
     socket = os.getenv("UK_AQ_DASHBOARD_MYSQL_SOCKET", "")
     if not socket or not Path(socket).is_absolute():
         raise CacheConfigurationError("An explicit absolute local MySQL socket path is required")
@@ -77,8 +78,6 @@ def request_dir():
 
 
 def request_refresh(product="dashboard"):
-    # This signal is best-effort and must never change the outcome of an
-    # already applied authoritative connector/dispatcher mutation.
     try:
         if _WRITER or not enabled(): return
         if product not in PRODUCT_SECONDS: return
@@ -89,8 +88,31 @@ def request_refresh(product="dashboard"):
         pass
 
 
-def read_product(product, version):
-    with connect("reader") as connection:
+def request_daily_task_refresh(day_value: date):
+    """Request a complete authoritative reconciliation for one retained task day."""
+    try:
+        if _WRITER or not enabled(): return
+        directory = request_dir()
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = directory / "refresh-daily_task_runs"
+        temporary = directory / f".refresh-daily_task_runs-{os.getpid()}-{time.time_ns()}"
+        temporary.write_text(day_value.isoformat(), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, marker)
+    except (OSError, CacheConfigurationError):
+        pass
+
+
+def requested_daily_task_refresh_day():
+    try:
+        text = (request_dir() / "refresh-daily_task_runs").read_text(encoding="utf-8").strip()
+        return date.fromisoformat(text)
+    except (OSError, ValueError):
+        return None
+
+
+def read_product(product, version, role="reader"):
+    with connect(role) as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT * FROM dashboard_cache WHERE product=%s AND history_version=%s", (product, version))
             row = cursor.fetchone()
@@ -107,31 +129,17 @@ def read_product(product, version):
     return payload, meta
 
 
-def wait_for_newer_product(product, version, previous_refreshed_at, timeout_seconds=8.0):
-    """Wait briefly for the independent writer to publish a requested refresh."""
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        try:
-            row = read_product(product, version)
-        except Exception:
-            row = None
-        if row and row[1].get("refreshed_at") != previous_refreshed_at:
-            return row
-        time.sleep(0.1)
-    return None
-
-
 def provenance(product):
     return {"builder": product, "authority": {
-        "dashboard": "ingestdb_dashboard_adapters", "metric_context": "db_r2_metrics_and_cloudflare_and_egress_adapters",
+        "dashboard": "ingestdb_dashboard_adapters_plus_local_rolling_ingest_runs",
+        "metric_context": "local_rolling_db_schema_egress_plus_cloudflare_history_metadata",
         "storage_coverage": "ingestdb_obsaqidb_selected_history_dropbox_adapters",
-        "r2_metrics": "cloudflare_account_and_selected_history_days", "daily_task_runs": "operational_postgresql",
+        "r2_metrics": "cloudflare_account_and_selected_history_days",
+        "daily_task_runs": "local_rolling_copy_of_operational_postgresql",
     }[product]}
 
 
 def assert_complete(product, payload):
-    # Optional diagnostic warnings are preserved. Explicit adapter failures or
-    # partial required products must not replace an earlier complete result.
     for key, value in payload.items():
         if value and (key == "error" or key.endswith("_error") or key in {"ingest_coverage_failed_days", "upstream_refresh_errors"}):
             raise RuntimeError("upstream_product_incomplete")
@@ -146,7 +154,6 @@ def publish(product, version, payload, expires):
     encoded = json.dumps(payload, allow_nan=False, separators=(",", ":"))
     if len(encoded.encode()) > 8 * 1024 * 1024:
         raise RuntimeError("dashboard_product_too_large")
-    # Never persist credentials even if a future adapter accidentally includes them.
     def check(value):
         if isinstance(value, dict):
             for key, child in value.items():
@@ -180,17 +187,60 @@ def record_failure(product, version):
         connection.commit()
 
 
+def _build_dashboard_with_local_ingest(core, base_url, service_role_key):
+    import uk_aq_dashboard_rolling_cache as rolling
+    rows = rolling.read_ingest_runs(role="writer", lookback_minutes=core.DISPATCH_OBSERVS_WINDOW_MINUTES)
+    original = core._get_ingest_runs_cached
+
+    def local_runs(*_args, **_kwargs):
+        return copy.deepcopy(rows)
+
+    with _INGEST_OVERRIDE_LOCK:
+        core._get_ingest_runs_cached = local_runs
+        try:
+            return core._build_dashboard(base_url, service_role_key, include_storage_coverage=False, include_metric_context=False)
+        finally:
+            core._get_ingest_runs_cached = original
+
+
+def _build_local_metric_context(core):
+    import uk_aq_dashboard_rolling_cache as rolling
+    version = core._resolve_r2_history_read_version()["version"]
+    r2_row = read_product("r2_metrics", version, role="writer")
+    r2_payload = r2_row[0] if r2_row else {}
+    r2_usage = rolling.read_latest_r2_usage(role="writer") or r2_payload.get("r2_usage")
+    payload = {
+        "db_size_metrics": rolling.read_db_size_metrics(role="writer", lookback_days=30),
+        "schema_size_metrics": rolling.read_schema_size_metrics(role="writer", lookback_days=30),
+        "r2_domain_size_metrics": [],
+        "db_size_metrics_error": None,
+        "schema_size_metrics_error": None,
+        "r2_domain_size_metrics_error": None,
+        "r2_usage": r2_usage,
+        "r2_usage_error": r2_payload.get("r2_usage_error"),
+        "service_egress_metrics": rolling.read_service_egress(role="writer", lookback_hours=24),
+        "service_egress_metrics_error": None,
+        "r2_backup_window": r2_payload.get("r2_backup_window"),
+        "r2_backup_window_error": r2_payload.get("r2_backup_window_error"),
+        "r2_history_days_bucket": r2_payload.get("r2_history_days_bucket"),
+        "r2_history_days_error": r2_payload.get("r2_history_days_error"),
+        "r2_history_read_version": core._resolve_r2_history_read_version(),
+        "r2_usage_history": rolling.read_r2_usage_history(role="writer", lookback_days=30),
+        "generated_at": iso(utcnow()),
+    }
+    if version == "v3":
+        payload["r2_domain_size_metrics_warning"] = "Historical domain byte metrics have no generation identity; unavailable for v3."
+    return payload
+
+
 def build_product(core, product, base_url, service_role_key):
     if product == "dashboard":
-        return core._build_dashboard(base_url, service_role_key, include_storage_coverage=False, include_metric_context=False)
+        return _build_dashboard_with_local_ingest(core, base_url, service_role_key) if _WRITER else core._build_dashboard(base_url, service_role_key, include_storage_coverage=False, include_metric_context=False)
     if product == "metric_context":
-        result = core._build_dashboard(base_url, service_role_key, include_storage_coverage=False, include_metric_context=True, include_ingest_context=False)
-        payload = {key: result.get(key) for key in (*METRIC_KEYS, "generated_at")}
-        if core._resolve_r2_history_read_version()["version"] == "v3":
-            payload["r2_domain_size_metrics"] = []
-            payload["r2_domain_size_metrics_error"] = None
-            payload["r2_domain_size_metrics_warning"] = "Historical domain byte metrics have no generation identity; unavailable for v3."
-        return payload
+        return _build_local_metric_context(core) if _WRITER else {
+            key: core._build_dashboard(base_url, service_role_key, include_storage_coverage=False, include_metric_context=True, include_ingest_context=False).get(key)
+            for key in (*METRIC_KEYS, "generated_at")
+        }
     if product == "storage_coverage":
         result = core._build_storage_coverage_payload(base_url, service_role_key, force_refresh=True)
         if core._resolve_r2_history_read_version()["version"] == "v3":
@@ -203,9 +253,68 @@ def build_product(core, product, base_url, service_role_key):
                 "r2_backup_window_error": error, "r2_history_days_bucket": bucket, "r2_history_days_error": error,
                 "r2_history_read_version": core._resolve_r2_history_read_version(), "generated_at": iso(utcnow())}
     if product == "daily_task_runs":
+        import uk_aq_dashboard_rolling_cache as rolling
         today = datetime.now(timezone.utc).date()
-        return {"day": today.isoformat(), "mode": "latest", "rows": core._fetch_daily_task_runs_dashboard_rows(scheduled_day=today, mode="latest"), "generated_at": iso(utcnow())}
+        rows = rolling.read_daily_task_runs(today, "latest", role="writer" if _WRITER else "reader")
+        return {"day": today.isoformat(), "mode": "latest", "rows": rows or [], "generated_at": iso(utcnow())}
     raise ValueError("Unknown cache product")
+
+
+def _serve_rolling_daily_tasks(handler, query):
+    import uk_aq_dashboard_rolling_cache as rolling
+    today = datetime.now(timezone.utc).date()
+    day_text = (query.get("day") or [today.isoformat()])[0]
+    mode = (query.get("mode") or ["latest"])[0]
+    try:
+        selected_day = date.fromisoformat(day_text)
+    except ValueError:
+        return False
+    if mode not in {"latest", "all"}:
+        return False
+    try:
+        rows = rolling.read_daily_task_runs(selected_day, mode, role="reader")
+        state = rolling._state("daily_task_runs", role="reader")
+    except Exception:
+        return False
+    if rows is None or not state or not state.get("last_success_at"):
+        request_refresh("daily_task_runs")
+        return False
+
+    force_requested = ((query.get("force") or ["0"])[0].lower() not in {"0", "false", "no", "off"}) or "t" in query
+    refresh_state = "cached"
+    if force_requested:
+        previous = rolling.daily_task_full_refresh_token(selected_day, role="reader")
+        request_daily_task_refresh(selected_day)
+        deadline = time.monotonic() + 12.0
+        changed = False
+        while time.monotonic() < deadline:
+            current = rolling.daily_task_full_refresh_token(selected_day, role="reader")
+            if current and current != previous:
+                changed = True
+                break
+            time.sleep(0.1)
+        rows = rolling.read_daily_task_runs(selected_day, mode, role="reader") or []
+        state = rolling._state("daily_task_runs", role="reader") or state
+        refresh_state = "refreshed" if changed else "refresh_timeout"
+
+    generated = state.get("last_full_reconcile_at") if force_requested and state.get("last_full_reconcile_day") == selected_day else state.get("last_success_at")
+    payload = {
+        "day": selected_day.isoformat(),
+        "mode": mode,
+        "rows": rows,
+        "generated_at": iso(generated) if isinstance(generated, datetime) else iso(utcnow()),
+        "local_cache": {
+            "daily_task_runs": {
+                "source": "local_mysql",
+                "state": refresh_state,
+                "history_version": "none",
+                "refreshed_at": iso(state.get("last_success_at")) if isinstance(state.get("last_success_at"), datetime) else None,
+                "last_error_code": state.get("last_error_code"),
+            }
+        },
+    }
+    handler._send_cache_json(payload)
+    return True
 
 
 def serve_cached_request(handler, parsed):
@@ -214,74 +323,55 @@ def serve_cached_request(handler, parsed):
         return False
     query = parse_qs(parsed.query)
     flag = lambda name, default="1": (query.get(name) or [default])[0].lower() not in {"0", "false", "no", "off"}
-    products = {
-        "/api/dashboard": ["dashboard"], "/api/storage_coverage": ["storage_coverage"],
-        "/api/r2_metrics": ["r2_metrics"], "/api/daily_task_runs": ["daily_task_runs"],
-    }.get(parsed.path)
-    if products is None: return False
-    today = datetime.now(timezone.utc).date().isoformat()
-    if parsed.path == "/api/daily_task_runs" and ((query.get("mode") or ["latest"])[0] != "latest" or (query.get("day") or [today])[0] != today):
-        return False
     try:
         if not enabled(): return False
-        configuration("reader")  # Misconfiguration never becomes a silent direct fallback.
+        configuration("reader")
     except CacheConfigurationError:
         handler._send_cache_json({"error": "Invalid local dashboard cache configuration"}, 503)
         return True
+
+    if parsed.path == "/api/daily_task_runs":
+        return _serve_rolling_daily_tasks(handler, query)
+
+    products = {
+        "/api/dashboard": ["dashboard"], "/api/storage_coverage": ["storage_coverage"],
+        "/api/r2_metrics": ["r2_metrics"],
+    }.get(parsed.path)
+    if products is None: return False
     if parsed.path == "/api/dashboard":
         if flag("include_metric_context") or flag("include_storage_coverage"): products.append("metric_context")
         if flag("include_storage_coverage"): products.append("storage_coverage")
-
-    # The Daily Task Runs Refresh button currently sends t=<timestamp> as its
-    # explicit cache-busting signal. Treat that as an on-demand refresh locally,
-    # while also supporting the canonical force=1 form used by other routes.
-    force_requested = flag("force", "0") or (parsed.path == "/api/daily_task_runs" and "t" in query)
-    forced_daily_row = None
-    if force_requested and parsed.path == "/api/daily_task_runs":
-        try:
-            before = read_product("daily_task_runs", "none")
-        except Exception:
-            before = None
-        previous_refreshed_at = before[1].get("refreshed_at") if before else None
-        request_refresh("daily_task_runs")
-        forced_daily_row = wait_for_newer_product("daily_task_runs", "none", previous_refreshed_at)
-    elif force_requested:
+    if flag("force", "0"):
         for product in products: request_refresh(product)
 
-    sensitive = products != ["daily_task_runs"]
     try:
-        resolution = core._ensure_history_generation() if sensitive else None
-        version = resolution["version"] if resolution else "none"
+        resolution = core._ensure_history_generation()
+        version = resolution["version"]
         payload = {}; metadata = {}
         for product in products:
-            identity = "none" if product == "daily_task_runs" else version
             try:
-                row = forced_daily_row if product == "daily_task_runs" and forced_daily_row else read_product(product, identity)
+                row = read_product(product, version)
             except CacheConfigurationError:
                 raise
             except Exception:
                 row = None
-            if row and product == "daily_task_runs" and row[0].get("day") != today:
-                row = None
             if row is None:
                 result = build_product(core, product, handler.server.base_url, handler.server.service_role_key)
-                meta = {"source": "direct_upstream", "state": "cache_unavailable_or_missing", "history_version": identity}
+                meta = {"source": "direct_upstream", "state": "cache_unavailable_or_missing", "history_version": version}
                 request_refresh(product)
             else:
                 result, meta = row
             result = copy.deepcopy(result)
-            # Keep main operational timestamp; each materialized product has its own timestamp in metadata.
             if payload: result.pop("generated_at", None)
             payload.update(result); metadata[product] = meta
-        if resolution:
-            if core._ensure_history_generation()["version"] != version:
-                raise RuntimeError("generation_changed_during_read")
-            payload["r2_history_read_version"] = resolution
-            payload["r2_history_read_version_effective"] = resolution
-            if resolution["version"] == "v3" and "r2_domain_size_metrics" in payload:
-                payload["r2_domain_size_metrics"] = []
-                payload["r2_domain_size_metrics_error"] = None
-                payload["r2_domain_size_metrics_warning"] = "Historical domain byte metrics have no generation identity; unavailable for v3. Account usage remains account-wide."
+        if core._ensure_history_generation()["version"] != version:
+            raise RuntimeError("generation_changed_during_read")
+        payload["r2_history_read_version"] = resolution
+        payload["r2_history_read_version_effective"] = resolution
+        if resolution["version"] == "v3" and "r2_domain_size_metrics" in payload:
+            payload["r2_domain_size_metrics"] = []
+            payload["r2_domain_size_metrics_error"] = None
+            payload["r2_domain_size_metrics_warning"] = "Historical domain byte metrics have no generation identity; unavailable for v3. Account usage remains account-wide."
         if parsed.path == "/api/dashboard" and not flag("include_ingest_context"):
             payload["pollutants"] = []; payload["connectors_settings"] = []
         payload["local_cache"] = metadata
