@@ -7,7 +7,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs
 
-PRODUCT_SECONDS = {"dashboard": 20, "metric_context": 300, "storage_coverage": 21600,
+PRODUCT_SECONDS = {"dashboard": 300, "metric_context": 300, "storage_coverage": 21600,
                    "r2_metrics": 3600, "daily_task_runs": 60}
 METRIC_KEYS = ("db_size_metrics", "schema_size_metrics", "r2_domain_size_metrics",
                "db_size_metrics_error", "schema_size_metrics_error", "r2_domain_size_metrics_error",
