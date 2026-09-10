@@ -10,6 +10,8 @@ on:
       - "workers/shared/uk_aq_observation_history_random_access_v3.mjs"
       - "workers/shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs"
       - "workers/shared/uk_aq_r2_history_version.mjs"
+      - "package.json"
+      - "package-lock.json"
       - "workers/uk_aq_dashboard_online_api_worker/**"
       - ".github/workflows/uk_aq_observs_history_dashboard_workers_deploy.yml"
       - ".github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml"
@@ -73,7 +75,7 @@ jobs:
 
             while IFS= read -r changed_path; do
               case "${changed_path}" in
-                workers/uk_aq_observs_history_r2_api_worker/*|workers/shared/uk_aq_observation_history_generation.mjs|workers/shared/uk_aq_observation_history_random_access_v3.mjs|workers/shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs|workers/shared/uk_aq_r2_history_version.mjs|.github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml)
+                workers/uk_aq_observs_history_r2_api_worker/*|workers/shared/uk_aq_observation_history_generation.mjs|workers/shared/uk_aq_observation_history_random_access_v3.mjs|workers/shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs|workers/shared/uk_aq_r2_history_version.mjs|package.json|package-lock.json|.github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml)
                   observations_history=true
                   ;;
                 workers/uk_aq_dashboard_online_api_worker/*|.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml)
