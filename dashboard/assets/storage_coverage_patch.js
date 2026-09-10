@@ -36,6 +36,10 @@
     return Boolean(url && url.pathname.includes("/r2_connector_counts"));
   }
 
+  function isStorageCalendarPayload(payload) {
+    return Boolean(payload && Array.isArray(payload.storage_coverage_days));
+  }
+
   function scheduleEnhancement() {
     if (state.scheduled) return;
     state.scheduled = true;
@@ -546,7 +550,7 @@
     if (ttlHours !== null) {
       details.push(`cache ${Number.isInteger(ttlHours) ? ttlHours : ttlHours.toFixed(1)} hours`);
     }
-    details.push("Force Refresh checks current storage now");
+    details.push("Refresh checks current storage now");
     meta.textContent = details.join(" · ");
     panel.appendChild(meta);
 
@@ -575,7 +579,7 @@
 
   function enhanceCoveragePanel() {
     const payload = state.coveragePayload;
-    if (!payload) return;
+    if (!isStorageCalendarPayload(payload)) return;
 
     injectStyles();
     const rowsByDate = rowMap(payload);
@@ -611,7 +615,7 @@
 
     if (isStorageCoverageRequest(url)) {
       response.clone().json().then((payload) => {
-        if (!payload || typeof payload !== "object") return;
+        if (!isStorageCalendarPayload(payload)) return;
         state.coveragePayload = payload;
         state.revision += 1;
         scheduleEnhancement();
