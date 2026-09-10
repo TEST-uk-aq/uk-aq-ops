@@ -122,7 +122,7 @@ The local client accepts `UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN`, or the same exist
 - Metric context and DB trends: 5 minutes, using existing metrics/egress adapters.
 - Storage coverage: existing six-hour cadence and 06:00 UTC checkpoint boundary.
 - R2 account usage/history window: 1 hour, retaining internal source caches.
-- Today's latest task summary: 60 seconds.
+- Today's latest task summary: 5 minutes.
 
 Each product runs independently; a slow coverage call does not block the summary
 thread. Publication is transactional, bounded to 8 MiB and a fixed product set.
@@ -142,8 +142,11 @@ existing authoritative builders directly, labels the fallback, and requests a
 background refresh. Invalid environment/database/user configuration fails closed.
 The reader never persists the fallback. Force Refresh coalesces per-product
 refresh markers; the existing result may be shown while the background job runs.
-Successful connector/dispatcher mutations expedite the summary without redirecting
-those mutations into MySQL.
+For today's latest Daily Task Runs, the card's Refresh action signals the writer,
+waits briefly for a newer Supabase-derived MySQL publication, then returns that
+new row to the dashboard. This keeps the HTTP process SELECT-only while making the
+manual refresh visibly current. Successful connector/dispatcher mutations expedite
+the summary without redirecting those mutations into MySQL.
 
 On a newly resolved v3 descriptor, v2 cache rows cannot satisfy a read. Refresher
 products are keyed by generation and revalidate authority before publication.
