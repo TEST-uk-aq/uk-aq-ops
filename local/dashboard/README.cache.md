@@ -118,7 +118,7 @@ The local client accepts `UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN`, or the same exist
 
 ## Products and behaviour
 
-- Dashboard operational summary: 20 seconds, using the existing IngestDB builder.
+- Dashboard operational summary: 5 minutes, using the existing IngestDB builder.
 - Metric context and DB trends: 5 minutes, using existing metrics/egress adapters.
 - Storage coverage: existing six-hour cadence and 06:00 UTC checkpoint boundary.
 - R2 account usage/history window: 1 hour, retaining internal source caches.
