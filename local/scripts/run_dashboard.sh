@@ -87,6 +87,10 @@ load_dotenv_file() {
 
 load_dotenv_file "$ENV_FILE"
 
+# Never pass interactive/local MySQL administration helper secrets into either
+# dashboard process, even when this script is started from an operator shell.
+unset PRO_MYSQL_PSWD DASHBOARD_TEST_READER_MYSQLPSWD DASHBOARD_TEST_WRITER_MYSQLPSWD
+
 # Separate process credentials: the HTTP server never loads the writer file.
 if [[ "${1:-}" == "--cache-refresh" ]]; then
   shift
