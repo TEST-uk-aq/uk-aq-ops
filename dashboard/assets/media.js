@@ -173,8 +173,10 @@
   function filterScroll(name, options) {
     const label = name === "publications" ? "publications" : "authors";
     return `<div class="media-filter-scroll" data-filter-scroll>
+      <div class="media-filter-scroll__fade media-filter-scroll__fade--top" data-scroll-fade="up" aria-hidden="true" hidden></div>
       <button type="button" class="media-filter-scroll__indicator media-filter-scroll__indicator--top" data-scroll-direction="up" aria-label="Scroll ${label} up" hidden><span aria-hidden="true">▲</span></button>
       <div class="media-filter-options media-filter-scroll__viewport" data-filter-scroll-viewport tabindex="0">${options}</div>
+      <div class="media-filter-scroll__fade media-filter-scroll__fade--bottom" data-scroll-fade="down" aria-hidden="true" hidden></div>
       <button type="button" class="media-filter-scroll__indicator media-filter-scroll__indicator--bottom" data-scroll-direction="down" aria-label="Scroll ${label} down" hidden><span aria-hidden="true">▼</span></button>
     </div>`;
   }
@@ -186,8 +188,14 @@
     const canScroll = viewport.scrollHeight > viewport.clientHeight + tolerance;
     const top = scroll.querySelector('[data-scroll-direction="up"]');
     const bottom = scroll.querySelector('[data-scroll-direction="down"]');
-    if (top) top.hidden = !canScroll || viewport.scrollTop <= tolerance;
-    if (bottom) bottom.hidden = !canScroll || viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - tolerance;
+    const topHidden = !canScroll || viewport.scrollTop <= tolerance;
+    const bottomHidden = !canScroll || viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - tolerance;
+    if (top) top.hidden = topHidden;
+    if (bottom) bottom.hidden = bottomHidden;
+    const topFade = scroll.querySelector('[data-scroll-fade="up"]');
+    const bottomFade = scroll.querySelector('[data-scroll-fade="down"]');
+    if (topFade) topFade.hidden = topHidden;
+    if (bottomFade) bottomFade.hidden = bottomHidden;
   }
 
   function updateFilterScrolls() {
