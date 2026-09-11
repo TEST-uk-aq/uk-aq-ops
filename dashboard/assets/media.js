@@ -139,15 +139,15 @@
     const titleStates = [["original", "Original only"], ["human", "Human title"], ["ai", "AI-approved title"], ["pending_ai", "Pending AI suggestion"]]
       .map(([value, label]) => `<label><input type="checkbox" data-filter="titleState" value="${value}"${checkedFilter("titleState", value)}> ${label}</label>`).join("");
     return `<div class="media-filter-panel" aria-label="Article filters">
-      <fieldset class="media-filter-group"><legend>Status</legend><div class="media-filter-options">${status}</div></fieldset>
-      <fieldset class="media-filter-group"><legend>Publication</legend><div class="media-filter-options">${publications || "No publications"}</div></fieldset>
-      <fieldset class="media-filter-group"><legend>Author</legend><label class="media-field"><input data-author-search type="search" placeholder="Find author"></label><div class="media-filter-options">${authors || "No authors"}</div></fieldset>
       <fieldset class="media-filter-group"><legend>Has image</legend><div class="media-filter-options">
         <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value=""${!state.filters.hasImage ? " checked" : ""}> Any</label>
         <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="yes"${state.filters.hasImage === "yes" ? " checked" : ""}> Yes</label>
         <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="no"${state.filters.hasImage === "no" ? " checked" : ""}> No</label>
       </div></fieldset>
       <fieldset class="media-filter-group"><legend>Display title state</legend><div class="media-filter-options">${titleStates}</div></fieldset>
+      <fieldset class="media-filter-group"><legend>Publication</legend><div class="media-filter-options">${publications || "No publications"}</div></fieldset>
+      <fieldset class="media-filter-group"><legend>Author</legend><label class="media-field"><input data-author-search type="search" placeholder="Find author"></label><div class="media-filter-options">${authors || "No authors"}</div></fieldset>
+      <fieldset class="media-filter-group"><legend>Status</legend><div class="media-filter-options">${status}</div></fieldset>
     </div><div class="media-active-filters">${esc(activeFilterSummary())}</div>`;
   }
 
