@@ -20,6 +20,7 @@
   };
   const AI_PREVIEW_MODES = ["desktop", "carousel", "mobile"];
   const articleDetailCache = new Map();
+  let articleRefreshSequence = 0;
 
   function storedAiPreviewMode() {
     try {
@@ -163,10 +164,10 @@
         <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="no"${state.filters.hasImage === "no" ? " checked" : ""}> No</label>
       </div></fieldset>
       <fieldset class="media-filter-group"><legend>Display title state</legend><div class="media-filter-options">${titleStates}</div></fieldset>
-      <fieldset class="media-filter-group"><legend>Publication</legend><div class="media-filter-options">${publications || "No publications"}</div></fieldset>
+      <fieldset class="media-filter-group"><legend>Publication</legend><div class="media-filter-options media-filter-options--publications">${publications || "No publications"}</div></fieldset>
       <fieldset class="media-filter-group"><legend>Author</legend><label class="media-field"><input data-author-search type="search" placeholder="Find author"></label><div class="media-filter-options">${authors || "No authors"}</div></fieldset>
       <fieldset class="media-filter-group"><legend>Status</legend><div class="media-filter-options">${status}</div></fieldset>
-    </div><div class="media-active-filters">${esc(activeFilterSummary())}</div>`;
+    </div><div class="media-active-filters" data-active-filters>${esc(activeFilterSummary())}</div>`;
   }
 
   function activeFilterSummary() {
@@ -211,6 +212,7 @@
   }
 
   async function renderArticles(append) {
+    articleRefreshSequence += 1;
     if (!append) {
       setView(`<section class="media-card"><div class="media-loading">Loading Articles…</div></section>`);
     }
@@ -234,29 +236,73 @@
     }
   }
 
+  async function refreshArticleTable(append = false) {
+    const table = state.root.querySelector("[data-article-table]");
+    if (!table) return;
+    const refreshSequence = ++articleRefreshSequence;
+    const summary = state.root.querySelector("[data-active-filters]");
+    if (summary) summary.textContent = activeFilterSummary();
+    table.setAttribute("aria-busy", "true");
+    const loadMore = table.querySelector("[data-load-more-articles]");
+    if (loadMore) loadMore.disabled = true;
+    try {
+      const cursor = append ? state.articleCursor : null;
+      const data = await request("articles", { params: articleParams(cursor) });
+      if (refreshSequence !== articleRefreshSequence) return;
+      state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
+      state.articleCursor = data.page?.next_cursor || null;
+      state.articleHasMore = Boolean(data.page?.has_more);
+      table.innerHTML = articleTableHtml();
+      bindArticleTableEvents();
+    } catch (error) {
+      if (refreshSequence !== articleRefreshSequence) return;
+      table.innerHTML = articleTableHtml(error.message || "Media admin unavailable.");
+      bindArticleTableEvents();
+    } finally {
+      if (refreshSequence === articleRefreshSequence) table.removeAttribute("aria-busy");
+    }
+  }
+
+  function syncArticleFilterControls() {
+    const search = state.root.querySelector("[data-table-search] input[name='q']");
+    if (search) search.value = state.filters.q;
+    const sort = state.root.querySelector("[data-article-sort]");
+    if (sort) sort.value = state.filters.sort;
+    state.root.querySelectorAll("[data-filter]").forEach(input => {
+      input.checked = state.filters[input.dataset.filter].has(input.value);
+    });
+    state.root.querySelectorAll("[data-filter-radio]").forEach(input => {
+      input.checked = state.filters[input.dataset.filterRadio] === input.value;
+    });
+  }
+
   function bindArticleEvents() {
     state.root.querySelector("[data-focus-add]")?.addEventListener("click", () => {
       const input = state.root.querySelector("[data-url-lookup] input"); input?.focus(); input?.scrollIntoView({ behavior: "smooth", block: "center" });
     });
     state.root.querySelector("[data-url-lookup]")?.addEventListener("submit", event => { event.preventDefault(); void lookupUrl(new FormData(event.currentTarget).get("url")); });
-    state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); void renderArticles(false); });
+    state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); void refreshArticleTable(); });
     state.root.querySelector("[data-clear-filters]")?.addEventListener("click", () => {
       state.filters = { status: new Set(["approved"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" };
-      void renderArticles(false);
+      syncArticleFilterControls();
+      const authorSearch = state.root.querySelector("[data-author-search]");
+      if (authorSearch) authorSearch.value = "";
+      state.root.querySelectorAll("[data-author-option]").forEach(option => { option.hidden = false; });
+      void refreshArticleTable();
     });
-    state.root.querySelector("[data-article-sort]")?.addEventListener("change", event => { state.filters.sort = event.target.value; void renderArticles(false); });
+    state.root.querySelector("[data-article-sort]")?.addEventListener("change", event => { state.filters.sort = event.target.value; void refreshArticleTable(); });
     state.root.querySelectorAll("[data-filter]").forEach(input => input.addEventListener("change", event => {
-      const set = state.filters[event.target.dataset.filter]; event.target.checked ? set.add(event.target.value) : set.delete(event.target.value); void renderArticles(false);
+      const set = state.filters[event.target.dataset.filter]; event.target.checked ? set.add(event.target.value) : set.delete(event.target.value); void refreshArticleTable();
     }));
-    state.root.querySelectorAll("[data-filter-radio]").forEach(input => input.addEventListener("change", event => { state.filters[event.target.dataset.filterRadio] = event.target.value; void renderArticles(false); }));
+    state.root.querySelectorAll("[data-filter-radio]").forEach(input => input.addEventListener("change", event => { state.filters[event.target.dataset.filterRadio] = event.target.value; void refreshArticleTable(); }));
     state.root.querySelector("[data-author-search]")?.addEventListener("input", event => {
       const query = event.target.value.toLowerCase(); state.root.querySelectorAll("[data-author-option]").forEach(option => { option.hidden = !option.dataset.authorOption.includes(query); });
     });
-    state.root.querySelector("[data-load-more-articles]")?.addEventListener("click", () => void renderArticles(true));
     bindArticleTableEvents();
   }
 
   function bindArticleTableEvents() {
+    state.root.querySelector("[data-load-more-articles]")?.addEventListener("click", () => void refreshArticleTable(true));
     state.root.querySelectorAll("[data-status-control] select").forEach(select => select.addEventListener("change", event => {
       const control = event.target.closest("[data-status-control]");
       const current = control.dataset.current;

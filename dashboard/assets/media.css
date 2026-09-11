@@ -96,6 +96,7 @@
 }
 .media-filter-group { min-width: 0; border: 0; padding: 0; margin: 0; }
 .media-filter-options { display: grid; gap: 5px; max-height: 145px; overflow: auto; }
+.media-filter-options--publications { max-height: none; overflow: visible; }
 .media-filter-options label { display: flex; align-items: center; gap: 6px; font-size: 15px; }
 .media-active-filters { min-height: 20px; margin: 8px 0 0; color: var(--accent-2); font-size: 14px; font-weight: 700; }
 
@@ -145,6 +146,7 @@ button.media-save-state { cursor: pointer; }
 .media-message--success { background: #e2f4e6; color: #175b2b; }
 .media-empty { padding: 28px 12px; text-align: center; color: var(--muted); }
 .media-loading { padding: 22px; color: var(--muted); }
+[data-article-table][aria-busy="true"] { opacity: 0.65; }
 
 .media-detail {
   width: min(840px, calc(100vw - 28px));
