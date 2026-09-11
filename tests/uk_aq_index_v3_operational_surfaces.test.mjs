@@ -122,19 +122,19 @@ test("candidate workflows derive TEST and LIVE identities from active Worker nam
 
 test("operator verification binds explicit transitions and treats Integrity v2 as loaded-only", () => {
   for (const surface of [preflight, postCutoverVerify]) {
-    assert.match(surface, /--mode verify/);
-    assert.match(surface, /current_dependency_verify\.json/);
-    assert.match(surface, /canonical Parquet/);
     assert.doesNotMatch(surface, /unique_by\(\.job_key\)/);
     assert.match(surface, /\(\.enabled \| type\) == "number"/);
   }
+  assert.match(preflight, /--mode verify/);
+  assert.match(preflight, /current_dependency_verify\.json/);
+  assert.match(preflight, /canonical Parquet/);
+  assert.match(postCutoverVerify, /verifyObservationHistoryV3CurrentDependencies/);
+  assert.match(postCutoverVerify, /verifySideBySideSourceRoot/);
+  assert.match(postCutoverVerify, /readAuthenticatedCutoverBaseline/);
+  assert.match(postCutoverVerify, /createSideBySideLockAssertion/);
   assert.doesNotMatch(preflight, /compare_repo_var UK_AQ_R2_HISTORY_INTEGRITY_VERSION/);
   assert.match(preflight, /loaded UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v2/);
-  assert.match(postCutoverVerify, /UK_AQ_R2_HISTORY_INTEGRITY_VERSION/);
-  assert.match(postCutoverVerify, /verification_failed_before_r2_comparison/);
-  assert.match(postCutoverVerify, /VERIFY_FAILURE_CATEGORY/);
-  assert.match(postCutoverVerify, /\.result\.failure_category/);
-  assert.match(postCutoverVerify, /recovery_reconciliation\.counts\.fail == 0/);
+  assert.doesNotMatch(postCutoverVerify, /UK_AQ_R2_HISTORY_INTEGRITY_VERSION/);
   assert.match(migrationWrapper, /case "\$UK_AQ_R2_HISTORY_INDEX_VERSION" in/);
   assert.match(migrationWrapper, /\n  v2\)/);
   assert.match(migrationWrapper, /\n  v3\)/);
@@ -156,14 +156,17 @@ test("operator verification binds explicit transitions and treats Integrity v2 a
   assert.match(migrationWrapper, /validate_read_only_dependency_authority/);
   assert.match(migrationWrapper, /verify mode does not accept --apply/);
   assert.match(migrationWrapper, /MUTATION_IMPLEMENTATION_SCOPES=\([\s\S]*scripts\/backup_r2/);
-  const gateCall = postCutoverVerify.indexOf(
-    '"$MIGRATION_WRAPPER" --verify-dependency-authority "$TARGET_WRITER_GIT_SHA"',
+  const sourceRootVerification = postCutoverVerify.indexOf(
+    "await verifySideBySideSourceRoot({ plan, getObject });",
   );
-  const directVerifier = postCutoverVerify.indexOf(
-    "scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs",
+  const currentDependencyVerification = postCutoverVerify.indexOf(
+    "const result = await verifyObservationHistoryV3CurrentDependencies",
   );
-  assert.ok(gateCall >= 0, "post-cutover verifier does not invoke the shared dependency gate");
-  assert.ok(directVerifier > gateCall, "migration verifier can run before dependency authority validation");
+  assert.ok(sourceRootVerification >= 0, "post-cutover verifier does not validate the locked source root");
+  assert.ok(
+    currentDependencyVerification > sourceRootVerification,
+    "current dependency closure can run before locked source-root validation",
+  );
   assert.match(
     migrationWrapper,
     /if \[ "\$MODE" = "verify" \]; then\n\s+validate_read_only_dependency_authority "\$REPO_ROOT" "\$TARGET_WRITER_GIT_SHA"/,
@@ -199,6 +202,7 @@ test("read-only verify dependency classes match actual migration-to-HEAD history
   for (const operationalDependency of [
     "workers/shared/r2_sigv4.mjs",
     "workers/shared/uk_aq_r2_history_writer.mjs",
+    "workers/shared/uk_aq_observation_history_index_v3.mjs",
     "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs",
     "scripts/backup_r2/uk_aq_build_r2_history_index.mjs",
   ]) {
@@ -273,9 +277,13 @@ test("post-cutover verifier requires only credentials it consumes", () => {
 
 test("post-cutover smoke does not claim cache bypass proves a fresh inner MISS", () => {
   assert.match(postCutoverVerify, /routing\/data smoke/);
-  assert.match(postCutoverVerify, /does not prove that the inner observations candidate performed a fresh cache MISS/);
-  assert.match(postCutoverVerify, /EXACT V3 DEPENDENCY \/ GENERATION VERIFICATION/);
+  assert.match(postCutoverVerify, /does not prove that the inner observations Worker performed a fresh cache MISS or fresh ranged R2 read/);
   assert.match(postCutoverVerify, /DEPLOYMENT \/ ROUTING SMOKE TEST/);
+  assert.ok(
+    postCutoverVerify.indexOf("verifyObservationHistoryV3CurrentDependencies")
+      < postCutoverVerify.indexOf("DEPLOYMENT / ROUTING SMOKE TEST"),
+    "exact v3 dependency verification must precede routing/data smoke checks",
+  );
 });
 
 test("v2 runtime rollback evidence requires exact non-secret deployment and Git identities", () => {
@@ -416,9 +424,14 @@ test("writer-freeze evidence exactly covers scheduled and manually started mutat
       id: "write_enabled_integrity",
       kind: "coordinated_external_runner",
       evidence_files: [
-        "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py",
-        "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh",
+        "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3_impl.py",
+        "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh",
+        "scripts/backup_r2/uk_aq_apply_sos_light_v3_proposal.mjs",
+        "scripts/backup_r2/lib/sos_light_v3_proposal_validation.mjs",
+        "scripts/backup_r2/lib/sos_light_v3_apply_persistence.mjs",
         "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/backup_r2/lib/observation_history_integrity_writer_v3.mjs",
+        "workers/shared/uk_aq_observation_history_operational_writer_v3.mjs",
       ],
     },
   ];
@@ -465,10 +478,10 @@ test("persistent v2 authority with no override selects the normal Worker", () =>
   assert.equal(result.stdout.trim(), "uk-aq-station-history-test");
 });
 
-test("persistent v3 authority with no override selects the derived candidate", () => {
+test("persistent v3 authority with no override selects the stable Worker", () => {
   const result = resolveStationHistoryService("uk-aq-station-history-test", "v3");
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), "uk-aq-station-history-test-v3-candidate");
+  assert.equal(result.stdout.trim(), "uk-aq-station-history-test");
 });
 
 test("TEST and LIVE station-history targets derive independently", () => {
@@ -481,7 +494,15 @@ test("TEST and LIVE station-history targets derive independently", () => {
     assert.equal(v2.status, 0, v2.stderr);
     assert.equal(v3.status, 0, v3.stderr);
     assert.equal(v2.stdout.trim(), normalService);
-    assert.equal(v3.stdout.trim(), `${normalService}-v3-candidate`);
+    assert.equal(v3.stdout.trim(), normalService);
+    assert.notEqual(
+      resolveStationHistoryService(
+        normalService,
+        "v3",
+        `${normalService}-v3-candidate`,
+      ).status,
+      0,
+    );
   }
 });
 
@@ -508,7 +529,7 @@ test("double-suffixed station-history candidates remain rejected", () => {
 test("manual station-history overrides cannot contradict persistent authority", () => {
   const matchingSelections = [
     ["v2", "uk-aq-station-history-test"],
-    ["v3", "uk-aq-station-history-test-v3-candidate"],
+    ["v3", "uk-aq-station-history-test"],
   ];
   for (const [authorityGeneration, override] of matchingSelections) {
     const result = resolveStationHistoryService(
@@ -522,7 +543,7 @@ test("manual station-history overrides cannot contradict persistent authority", 
 
   const oppositeSelections = [
     ["v2", "uk-aq-station-history-test-v3-candidate"],
-    ["v3", "uk-aq-station-history-test"],
+    ["v3", "uk-aq-station-history-test-v3-candidate"],
   ];
   for (const [authorityGeneration, override] of oppositeSelections) {
     const result = resolveStationHistoryService(
@@ -546,12 +567,12 @@ test("manual station-history overrides cannot contradict persistent authority", 
 test("an ordinary cache-proxy push preserves persistent v3 reader authority", () => {
   const result = resolveStationHistoryService("uk-aq-station-history-test", "v3");
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), "uk-aq-station-history-test-v3-candidate");
+  assert.equal(result.stdout.trim(), "uk-aq-station-history-test");
 
   assert.match(cacheWorkflow, /push:/);
-  assert.match(cacheWorkflow, /UK_AQ_R2_HISTORY_INDEX_VERSION: \$\{\{ vars\.UK_AQ_R2_HISTORY_INDEX_VERSION \|\| '' \}\}/);
-  assert.match(cacheWorkflow, /"\$\{UK_AQ_R2_HISTORY_INDEX_VERSION\}"/);
-  assert.doesNotMatch(cacheWorkflow, /UK_AQ_R2_HISTORY_INDEX_VERSION[^\n]*\|\| 'v2'/);
+  assert.match(cacheWorkflow, /UK_AQ_R2_HISTORY_VERSION: \$\{\{ vars\.UK_AQ_R2_HISTORY_VERSION \|\| '' \}\}/);
+  assert.match(cacheWorkflow, /"\$\{UK_AQ_R2_HISTORY_VERSION\}"/);
+  assert.doesNotMatch(cacheWorkflow, /UK_AQ_R2_HISTORY_VERSION[^\n]*\|\| 'v2'/);
 });
 
 test("all cache deployment prerequisites precede the authority-changing deploy", () => {
@@ -605,12 +626,12 @@ test("no prerequisite failure gate remains after the authority-changing deploy",
   assert.match(afterDeploy, /Report deployed STATION_HISTORY target/);
 });
 
-test("rollback to persistent v2 authority restores the normal default", () => {
+test("rollback to persistent v2 authority preserves the stable default", () => {
   const cutover = resolveStationHistoryService("uk-aq-station-history-test", "v3");
   const rollback = resolveStationHistoryService("uk-aq-station-history-test", "v2");
   assert.equal(cutover.status, 0, cutover.stderr);
   assert.equal(rollback.status, 0, rollback.stderr);
-  assert.equal(cutover.stdout.trim(), "uk-aq-station-history-test-v3-candidate");
+  assert.equal(cutover.stdout.trim(), "uk-aq-station-history-test");
   assert.equal(rollback.stdout.trim(), "uk-aq-station-history-test");
 });
 

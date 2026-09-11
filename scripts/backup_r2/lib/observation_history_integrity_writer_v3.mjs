@@ -2,8 +2,10 @@
 import {
   loadImmutableSourcePartition,
   readCanonicalObservationRows,
-  validateDedicatedSosHistoricalProposal,
 } from "../uk_aq_apply_integrity_proposal.mjs";
+import {
+  validateDedicatedSosHistoricalProposalV3,
+} from "./sos_light_v3_proposal_validation.mjs";
 import {
   runDisconnectedIntegrityObservationHistoryV3Writer,
   runDisconnectedSosHistoricalReplacementObservationHistoryV3Writer,
@@ -14,7 +16,7 @@ import {
 } from "../../../workers/shared/uk_aq_r2_history_canonical.mjs";
 
 const POLLUTANT_MANIFEST_PATTERN =
-  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
+  /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
 
 function assertValidatedApplyRepresentation({ runState, validatedProposal }) {
   if (!runState || typeof runState !== "object") {
@@ -139,7 +141,7 @@ function buildSelectedIntegrityPartitions({ runState, validatedProposal, audit }
 }
 
 async function buildCompleteSosPartitions({ runState, validatedProposal }) {
-  const dedicated = validateDedicatedSosHistoricalProposal({
+  const dedicated = validateDedicatedSosHistoricalProposalV3({
     runState,
     proposal: validatedProposal,
   });

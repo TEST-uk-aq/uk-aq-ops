@@ -9,12 +9,12 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  uk-aq-history-integrity-runner.sh --env TEST|LIVE [options]
+  uk-aq-history-integrity-sos-light-v2.sh --env TEST|LIVE [options]
 
 This repository runner loads the selected repository root .env and derives
 non-Dropbox state under /Users/mikehinford/uk-aq-history-integrity/state/<ENV>.
 The local dispatcher is a separate deployed file at:
-  /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh
+  /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v2.sh
 
 All options after --env are forwarded unchanged to the Python coordinator.
 USAGE
@@ -310,6 +310,8 @@ for ((i = 0; i < ${#REMAINING_ARGS[@]}; i++)); do
 done
 [[ "${HAS_CHECK_ONLY}" == true && "${HAS_RUN_BACKFILL}" == true ]] && error "--check-only and --run-backfill cannot be used together"
 
+echo "mode=sos-light"
+echo "history_generation=v2"
 set +e
 "${UK_AQ_HISTORY_INTEGRITY_PYTHON}" "${PY_ENTRY}" --env "${ENV_NAME}" "${REMAINING_ARGS[@]}"
 PY_STATUS=$?
