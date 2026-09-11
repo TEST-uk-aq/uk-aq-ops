@@ -428,6 +428,8 @@ test("writer-freeze evidence exactly covers scheduled and manually started mutat
         "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh",
         "scripts/backup_r2/uk_aq_apply_sos_light_v3_proposal.mjs",
         "scripts/backup_r2/lib/sos_light_v3_proposal_validation.mjs",
+        "scripts/backup_r2/lib/sos_light_v3_apply_persistence.mjs",
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
         "scripts/backup_r2/lib/observation_history_integrity_writer_v3.mjs",
         "workers/shared/uk_aq_observation_history_operational_writer_v3.mjs",
       ],
