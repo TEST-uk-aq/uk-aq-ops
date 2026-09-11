@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   buildValidatedIntegrityObservationHistoryV3Partitions,
@@ -14,6 +16,9 @@ import {
 import {
   computeObservationContentHash,
 } from "../workers/shared/uk_aq_observation_content_hash.mjs";
+import {
+  runPersistedSosLightV3Apply,
+} from "../scripts/backup_r2/lib/sos_light_v3_apply_persistence.mjs";
 
 const DAY_UTC = "2026-08-18";
 const CONNECTOR_ID = 1;
@@ -113,6 +118,176 @@ test("validated Integrity adapter loads immutable stored rows without a second p
       partitions[0].backed_up_at_utc,
       prepared.canonical_pollutant_manifest.payload.backed_up_at_utc,
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity verifier", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-sos-light-v3-apply-"));
+  const runStatePath = path.join(root, "run-state.json");
+  const dayPrefix = `history/v3/observations/day_utc=${DAY_UTC}`;
+  const oldKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/obsolete.json`;
+  const publishedKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/manifest.json`;
+  const publishedBody = Buffer.from('{"schema_version":3}\n', "utf8");
+  const store = new Map([[oldKey, Buffer.from("obsolete", "utf8")]]);
+  const tombstone = { proposed: true, prefix: dayPrefix };
+  const runState = {
+    run_id: "sos-light-v3-persistence-test",
+    run_root: root,
+    execution_path: "sos_light",
+    sos_light: { days: [{ day_utc: DAY_UTC }] },
+    tombstone_prefixes: [tombstone],
+  };
+  const proposal = {
+    objects: [{ key: publishedKey }],
+    prefixes: [{ prefix: dayPrefix, entry: tombstone }],
+  };
+  const adapters = {
+    getObject: async ({ key }) => store.has(key)
+      ? { exists: true, body: Buffer.from(store.get(key)) }
+      : { exists: false, body: Buffer.alloc(0) },
+    putObject: async ({ key, body }) => {
+      store.set(key, Buffer.from(body));
+      return { status: "succeeded" };
+    },
+    putIfChanged: async ({ key, body }) => {
+      store.set(key, Buffer.from(body));
+      return { status: "succeeded", skipped: false };
+    },
+    listAllObjects: async ({ prefix }) => [...store.keys()]
+      .filter((key) => key.startsWith(prefix))
+      .map((key) => ({ key })),
+    deleteObjects: async ({ keys }) => {
+      for (const key of keys) store.delete(key);
+      return { deleted: keys.length };
+    },
+  };
+
+  try {
+    const result = await runPersistedSosLightV3Apply({
+      runStatePath,
+      runState,
+      proposal,
+      r2: {},
+      adapters,
+      executeWriter: async ({
+        getObject,
+        putIfChanged,
+        recordDurableEvidence,
+        prepareCompleteDayReplacement,
+      }) => {
+        const replacement = await prepareCompleteDayReplacement({ day_utc: DAY_UTC });
+        const publication = await putIfChanged({
+          key: publishedKey,
+          body: publishedBody,
+          content_type: "application/json",
+          publication_stage: "observation_connector_manifest",
+        });
+        await getObject({ key: publishedKey });
+        await recordDurableEvidence({
+          key: publishedKey,
+          byte_size: publishedBody.byteLength,
+          sha256: sha256(publishedBody),
+        });
+        return {
+          ok: true,
+          status: "succeeded",
+          complete_day_replacement_results: [replacement],
+          publication,
+        };
+      },
+    });
+    assert.equal(result.status, "succeeded");
+    assert.equal(store.has(oldKey), false);
+    assert.deepEqual(store.get(publishedKey), publishedBody);
+
+    const persisted = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+    assert.equal(persisted.apply.status, "succeeded");
+    assert.equal(persisted.apply.v3_publication_evidence.length, 1);
+    assert.equal(persisted.apply.v3_publication_evidence[0].sha256, sha256(publishedBody));
+    assert.equal(persisted.tombstone_prefixes[0].deletion_verified, true);
+
+    const verifierPath = fileURLToPath(new URL(
+      "../scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3_impl.py",
+      import.meta.url,
+    ));
+    const verification = spawnSync("python3", [
+      "-c",
+      [
+        "import importlib.util,json,sys",
+        "spec=importlib.util.spec_from_file_location('sos_light_v3',sys.argv[1])",
+        "module=importlib.util.module_from_spec(spec)",
+        "spec.loader.exec_module(module)",
+        "state=json.load(open(sys.argv[2],encoding='utf-8'))",
+        "persistence=module.verify_apply_persistence_artifacts(state)",
+        "summary=module.summarize_ordered_apply_verification(run_state=state,apply_result={'status':'succeeded'})",
+        "print(json.dumps({'persistence':persistence,'summary':summary}))",
+      ].join(";"),
+      verifierPath,
+      runStatePath,
+    ], { encoding: "utf8" });
+    assert.equal(verification.status, 0, verification.stderr);
+    const verified = JSON.parse(verification.stdout);
+    assert.equal(verified.persistence.status, "verified");
+    assert.equal(verified.persistence.verified_publication_object_count, 1);
+    assert.equal(verified.summary.status, "ok");
+    assert.equal(verified.summary.r2_objects_written, 1);
+    assert.equal(verified.summary.r2_objects_deleted, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fixed-v3 apply records failure after deletion instead of false success", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-sos-light-v3-failure-"));
+  const runStatePath = path.join(root, "run-state.json");
+  const dayPrefix = `history/v3/observations/day_utc=${DAY_UTC}`;
+  const oldKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/obsolete.json`;
+  const store = new Map([[oldKey, Buffer.from("obsolete", "utf8")]]);
+  const tombstone = { proposed: true, prefix: dayPrefix };
+  const runState = {
+    run_id: "sos-light-v3-failure-test",
+    run_root: root,
+    execution_path: "sos_light",
+    sos_light: { days: [{ day_utc: DAY_UTC }] },
+    tombstone_prefixes: [tombstone],
+  };
+
+  try {
+    await assert.rejects(
+      runPersistedSosLightV3Apply({
+        runStatePath,
+        runState,
+        proposal: {
+          objects: [],
+          prefixes: [{ prefix: dayPrefix, entry: tombstone }],
+        },
+        r2: {},
+        adapters: {
+          getObject: async () => ({ exists: false, body: Buffer.alloc(0) }),
+          putObject: async () => ({ status: "succeeded" }),
+          putIfChanged: async () => ({ status: "succeeded" }),
+          listAllObjects: async ({ prefix }) => [...store.keys()]
+            .filter((key) => key.startsWith(prefix))
+            .map((key) => ({ key })),
+          deleteObjects: async ({ keys }) => {
+            for (const key of keys) store.delete(key);
+          },
+        },
+        executeWriter: async ({ prepareCompleteDayReplacement }) => {
+          await prepareCompleteDayReplacement({ day_utc: DAY_UTC });
+          throw new Error("simulated publication failure");
+        },
+      }),
+      /simulated publication failure/,
+    );
+    const persisted = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+    assert.equal(persisted.apply.status, "failed");
+    assert.equal(persisted.apply.canonical_v3_writer_result, null);
+    assert.equal(persisted.apply.failure_checkpoint.succeeded, true);
+    assert.equal(persisted.tombstone_prefixes[0].deletion_verified, true);
+    assert.equal(store.has(oldKey), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

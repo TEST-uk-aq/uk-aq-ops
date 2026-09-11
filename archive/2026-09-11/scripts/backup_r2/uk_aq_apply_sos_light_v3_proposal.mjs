@@ -6,15 +6,10 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   hasRequiredR2Config,
-  r2GetObject,
   r2DeleteObjects,
   r2ListAllObjects,
-  r2PutObject,
 } from "../../workers/shared/r2_sigv4.mjs";
-import {
-  r2PutObjectIfChanged,
-  resolveR2HistoryIndexConfig,
-} from "../../workers/shared/uk_aq_r2_history_index.mjs";
+import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import {
   requireObservationsGlobalOperationLockContext,
   withHistoryWriterClient,
@@ -26,9 +21,6 @@ import {
 import {
   runValidatedSosHistoricalReplacementObservationHistoryV3Writer,
 } from "./lib/observation_history_integrity_writer_v3.mjs";
-import {
-  runPersistedSosLightV3Apply,
-} from "./lib/sos_light_v3_apply_persistence.mjs";
 
 function parseArgs(argv) {
   if (argv.length !== 3 || argv[0] !== "--run-state-json" || argv[2] !== "--write-r2") {
@@ -56,33 +48,28 @@ async function main() {
   await validateFinalSosLightV3ProposalGraph({ runState, proposal });
   const targetWriterGitSha = String(runState.writer_git_sha || runState.git_sha || process.env.GITHUB_SHA || execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" })).trim();
   if (!/^[0-9a-f]{40}$/.test(targetWriterGitSha)) throw new Error("SOS-light-v3 requires a pinned 40-hex writer git SHA");
-  return await runPersistedSosLightV3Apply({
-    runStatePath,
-    runState,
-    proposal,
-    r2: config.r2,
-    adapters: {
-      getObject: r2GetObject,
-      putObject: r2PutObject,
-      putIfChanged: r2PutObjectIfChanged,
-      listAllObjects: r2ListAllObjects,
-      deleteObjects: r2DeleteObjects,
-    },
-    executeWriter: async (mutationAdapters) => await withHistoryWriterClient(
-      process.env.SUPABASE_DB_URL || process.env.DATABASE_URL,
-      async (client) => await runValidatedSosHistoricalReplacementObservationHistoryV3Writer({
-        env: process.env,
-        client,
-        r2: config.r2,
-        runState,
-        validatedProposal: proposal,
-        targetWriterGitSha,
-        observationsPrefix: "history/v3/observations",
-        ...mutationAdapters,
-      }),
-      { applicationName: "uk-aq-sos-light-v3-history-writer" },
-    ),
-  });
+  return await withHistoryWriterClient(
+    process.env.SUPABASE_DB_URL || process.env.DATABASE_URL,
+    async (client) => await runValidatedSosHistoricalReplacementObservationHistoryV3Writer({
+      env: process.env,
+      client,
+      r2: config.r2,
+      runState,
+      validatedProposal: proposal,
+      targetWriterGitSha,
+      observationsPrefix: "history/v3/observations",
+      prepareCompleteDayReplacement: async ({ day_utc }) => {
+        const prefix = `history/v3/observations/day_utc=${day_utc}/`;
+        const existing = await r2ListAllObjects({ r2: config.r2, prefix, max_keys: 10_000 });
+        const keys = existing.map((entry) => entry.key);
+        if (keys.length) await r2DeleteObjects({ r2: config.r2, keys });
+        const remaining = await r2ListAllObjects({ r2: config.r2, prefix, max_keys: 10_000 });
+        if (remaining.length) throw new Error(`SOS-light-v3 complete-day deletion verification failed: ${day_utc}`);
+        return { complete_day_replacement_verified: true, complete_partition_set: true, day_utc, deleted_object_count: keys.length };
+      },
+    }),
+    { applicationName: "uk-aq-sos-light-v3-history-writer" },
+  );
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

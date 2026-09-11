@@ -9493,13 +9493,13 @@ R2_HISTORY_INDEX_PREFIX = "history/_index"
 R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations"
 R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v3"
 R2_HISTORY_V2_OBSERVATIONS_PREFIX = "history/v3/observations"
-R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data"
-R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug"
+R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v3/aqilevels/hourly/data"
+R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v3/aqilevels/hourly/debug"
 R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = (
     "history/_index_v3/observations_timeseries"
 )
 R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX = (
-    "history/_index_v2/aqilevels_hourly_data_timeseries"
+    "history/_index_v3/aqilevels_hourly_data_timeseries"
 )
 AQILEVELS_EXPECTED_HISTORY_SCHEMA_NAME = "aqilevels"
 AQILEVELS_EXPECTED_HISTORY_SCHEMA_VERSION = 2
@@ -9611,7 +9611,7 @@ def resolve_history_path_config(
         )
         aqilevels_index_prefix = _normalize_history_prefix(
             values.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX"),
-            R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX,
+            f"{index_prefix}/aqilevels_hourly_data_timeseries",
         )
         timeseries_binding_index_prefix = _normalize_history_prefix(
             values.get("UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX"),
@@ -9639,7 +9639,7 @@ def resolve_history_path_config(
                 "observations_timeseries_latest.json",
             ),
             aqilevels_latest_index_key=_append_json_name(
-                aqilevels_index_prefix.rsplit("/", 1)[0],
+                index_prefix,
                 "aqilevels_hourly_data_timeseries_latest.json",
             ),
             observations_partition_levels=("day_utc", "connector_id", "pollutant_code"),
@@ -22757,9 +22757,6 @@ def _verified_deleted_object_keys(
 
 MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1"
 PUBLICATION_SCHEDULE_CONTRACT_VERSION = "integrity-apply-publication-schedule-v1"
-SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT = (
-    "sos-light-v3-apply-persistence-v1"
-)
 
 
 def canonical_mutation_event_hash_input(event: Mapping[str, Any]) -> bytes:
@@ -22859,241 +22856,10 @@ def verify_publication_schedule(
     }
 
 
-def _verify_sos_light_v3_apply_persistence(
-    run_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    apply_summary = run_state.get("apply") or {}
-    persistence = apply_summary.get("persistence") or {}
-    journal_path = _resolve_run_scoped_apply_artifact(
-        run_state, persistence.get("mutation_journal_path")
-    )
-    body = journal_path.read_bytes()
-    expected_bytes = int(persistence.get("mutation_journal_bytes") or -1)
-    expected_sha256 = str(
-        persistence.get("mutation_journal_sha256") or ""
-    ).strip().lower()
-    if (
-        len(body) != expected_bytes
-        or hashlib.sha256(body).hexdigest() != expected_sha256
-    ):
-        raise ValueError(f"mutation journal identity mismatch: {journal_path}")
-    lines = [line for line in body.splitlines() if line]
-    if len(lines) != int(persistence.get("mutation_journal_event_count") or 0):
-        raise ValueError(
-            f"mutation journal event-count mismatch: {journal_path}"
-        )
-    run_id = str(run_state.get("run_id") or "")
-    previous_sha256: str | None = None
-    parsed_events: list[Mapping[str, Any]] = []
-    event_types: dict[str, int] = {}
-    publication_events: dict[int, list[Mapping[str, Any]]] = {}
-    publication_event_types = {
-        "put_started",
-        "put_completed",
-        "post_put_get_started",
-        "post_put_get_verified",
-        "put_or_verification_failed",
-    }
-    for line in lines:
-        event = json.loads(line.decode("utf-8"))
-        if not isinstance(event, Mapping):
-            raise ValueError("mutation journal event is not an object")
-        if str(event.get("run_id") or "") != run_id:
-            raise ValueError("mutation journal run identity mismatch")
-        if (
-            event.get("event_hash_contract_version")
-            != MUTATION_EVENT_HASH_CONTRACT_VERSION
-        ):
-            raise ValueError("unsupported legacy mutation journal contract")
-        if event.get("previous_event_sha256") != previous_sha256:
-            raise ValueError("mutation journal event-chain linkage mismatch")
-        event_sha256 = str(event.get("event_sha256") or "").strip().lower()
-        recomputed_sha256 = hashlib.sha256(
-            canonical_mutation_event_hash_input(event)
-        ).hexdigest()
-        if event_sha256 != recomputed_sha256:
-            raise ValueError("mutation journal event-hash mismatch")
-        previous_sha256 = recomputed_sha256
-        event_type = str(event.get("event_type") or "")
-        event_types[event_type] = event_types.get(event_type, 0) + 1
-        parsed_events.append(event)
-        if event_type in publication_event_types:
-            operation_id = int(event.get("operation_id") or 0)
-            if operation_id <= 0:
-                raise ValueError(
-                    "v3 publication event operation identity is invalid"
-                )
-            publication_events.setdefault(operation_id, []).append(event)
-    if (
-        previous_sha256
-        != persistence.get("mutation_journal_tail_event_sha256")
-    ):
-        raise ValueError("mutation journal event-chain tail mismatch")
-
-    evidence_entries = list(
-        apply_summary.get("v3_publication_evidence") or []
-    )
-    if apply_summary.get("status") == "succeeded":
-        if (
-            not parsed_events
-            or parsed_events[-1].get("event_type")
-            != "canonical_apply_completed"
-        ):
-            raise ValueError("v3 mutation journal completion is absent")
-        expected_event_sequence = [
-            "put_started",
-            "put_completed",
-            "post_put_get_started",
-            "post_put_get_verified",
-        ]
-        evidence_operation_ids: set[int] = set()
-        uploaded_count = 0
-        skipped_count = 0
-        for raw_evidence in evidence_entries:
-            if not isinstance(raw_evidence, Mapping):
-                raise ValueError("v3 publication evidence is invalid")
-            operation_id = int(raw_evidence.get("operation_id") or 0)
-            key = str(raw_evidence.get("object_key") or "")
-            sha256 = str(raw_evidence.get("sha256") or "").strip().lower()
-            byte_size = int(raw_evidence.get("bytes") or -1)
-            events = publication_events.get(operation_id) or []
-            if (
-                operation_id <= 0
-                or operation_id in evidence_operation_ids
-                or not key
-                or not re.fullmatch(r"[a-f0-9]{64}", sha256)
-                or byte_size < 0
-                or raw_evidence.get("r2_verified") is not True
-                or raw_evidence.get("durable") is not True
-                or int(
-                    raw_evidence.get("post_put_verification_get_count") or 0
-                )
-                != 1
-                or [str(event.get("event_type") or "") for event in events]
-                != expected_event_sequence
-                or any(
-                    str(event.get("canonical_key") or "") != key
-                    or str(event.get("sha256") or "") != sha256
-                    or int(event.get("byte_size") or -1) != byte_size
-                    for event in events
-                )
-            ):
-                raise ValueError(
-                    f"v3 publication evidence is incomplete: {key}"
-                )
-            uploaded = raw_evidence.get("uploaded") is True
-            skipped = raw_evidence.get("skipped_unchanged") is True
-            if uploaded == skipped:
-                raise ValueError(
-                    f"v3 publication disposition is contradictory: {key}"
-                )
-            uploaded_count += int(uploaded)
-            skipped_count += int(skipped)
-            evidence_operation_ids.add(operation_id)
-        if evidence_operation_ids != set(publication_events):
-            raise ValueError("v3 publication journal/evidence operations differ")
-        completed = len(evidence_entries)
-        if not (
-            completed
-            == int(apply_summary.get("completed_writes") or 0)
-            == int(
-                apply_summary.get("completed_post_put_verifications") or 0
-            )
-            == int(apply_summary.get("get_verified_writes") or 0)
-            and uploaded_count
-            == int(apply_summary.get("uploaded_writes") or 0)
-            and skipped_count
-            == int(apply_summary.get("skipped_unchanged_writes") or 0)
-        ):
-            raise ValueError("v3 publication evidence counts differ")
-        writer_result = apply_summary.get("canonical_v3_writer_result")
-        if (
-            not isinstance(writer_result, Mapping)
-            or writer_result.get("ok") is not True
-        ):
-            raise ValueError("canonical v3 writer result is absent")
-
-    sidecars: list[dict[str, Any]] = []
-    verified_deletions = 0
-    for raw_prefix in list(run_state.get("tombstone_prefixes") or []):
-        if not isinstance(raw_prefix, Mapping) or not raw_prefix.get("proposed"):
-            continue
-        if raw_prefix.get("deletion_verified") is not True:
-            if apply_summary.get("status") == "succeeded":
-                raise ValueError("successful v3 apply has unverified deletion")
-            continue
-        keys = _verified_deleted_object_keys(run_state, raw_prefix)
-        verified_deletions += 1
-        sidecars.append({
-            "prefix": str(raw_prefix.get("prefix") or ""),
-            "path": str(raw_prefix.get("deleted_keys_sidecar_path") or ""),
-            "bytes": int(raw_prefix.get("deleted_keys_sidecar_bytes") or 0),
-            "sha256": str(raw_prefix.get("deleted_keys_sha256") or ""),
-            "deleted_object_count": len(keys),
-        })
-    if (
-        len(sidecars)
-        != int(persistence.get("deleted_key_sidecar_count") or 0)
-    ):
-        raise ValueError("deleted-key sidecar-count mismatch")
-    if apply_summary.get("status") == "succeeded" and not (
-        verified_deletions
-        == int(apply_summary.get("completed_deletions") or 0)
-        == int(event_types.get("deletion_verified") or 0)
-    ):
-        raise ValueError("v3 deletion verification counts differ")
-
-    node_writes = int(
-        persistence.get("node_complete_run_state_write_count") or 0
-    )
-    coordinator_writes = int(
-        persistence.get("coordinator_complete_run_state_write_count") or 0
-    )
-    total_writes = int(
-        persistence.get("total_complete_run_state_write_count") or 0
-    )
-    if total_writes != node_writes + coordinator_writes:
-        raise ValueError("complete run-state write count mismatch")
-    if (
-        "complete_run_state_write_count" in persistence
-        and int(persistence.get("complete_run_state_write_count") or 0)
-        != total_writes
-    ):
-        raise ValueError(
-            "legacy complete run-state write count is not an exact total alias"
-        )
-    return {
-        "status": "verified",
-        "contract_version": SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT,
-        "mutation_journal_path": str(journal_path),
-        "mutation_journal_bytes": len(body),
-        "mutation_journal_sha256": expected_sha256,
-        "mutation_journal_event_count": len(lines),
-        "mutation_journal_tail_event_sha256": previous_sha256,
-        "event_type_counts": event_types,
-        "verified_publication_object_count": len(evidence_entries),
-        "deleted_key_sidecars": sidecars,
-        "compact_checkpoint_count": int(
-            persistence.get("compact_checkpoint_count") or 0
-        ),
-        "node_complete_run_state_write_count": node_writes,
-        "coordinator_complete_run_state_write_count": coordinator_writes,
-        "total_complete_run_state_write_count": total_writes,
-        "mutation_journal_flush_count": int(
-            persistence.get("mutation_journal_flush_count") or 0
-        ),
-    }
-
-
 def verify_apply_persistence_artifacts(
     run_state: Mapping[str, Any],
 ) -> dict[str, Any]:
     persistence = ((run_state.get("apply") or {}).get("persistence") or {})
-    if (
-        persistence.get("contract_version")
-        == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT
-    ):
-        return _verify_sos_light_v3_apply_persistence(run_state)
     journal_path_raw = persistence.get("mutation_journal_path")
     if not journal_path_raw:
         return {"status": "not_available", "reason": "mutation_journal_not_recorded"}
@@ -26080,41 +25846,14 @@ def summarize_ordered_apply_verification(
         })
     written_keys: list[str] = []
     verification_evidence: list[dict[str, Any]] = []
-    persistence_contract = str(
-        ((run_state.get("apply") or {}).get("persistence") or {}).get(
-            "contract_version"
-        )
-        or ""
-    )
-    if persistence_contract == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT:
-        ordered_entries = [
-            (
-                str(entry.get("object_key") or ""),
-                {
-                    **dict(entry),
-                    "proposed": True,
-                },
-            )
-            for entry in list(
-                (run_state.get("apply") or {}).get(
-                    "v3_publication_evidence"
-                )
-                or []
-            )
-            if isinstance(entry, Mapping)
-        ]
-    else:
-        ordered_entries = sorted(
-            dict(run_state.get("objects") or {}).items()
-        )
-    for object_key, raw_entry in ordered_entries:
+    for object_key, raw_entry in sorted(dict(run_state.get("objects") or {}).items()):
         if not isinstance(raw_entry, Mapping) or not raw_entry.get("proposed"):
             continue
         entry = dict(raw_entry)
         get_count = int(entry.get("post_put_verification_get_count") or 0)
         evidence = {
             "object_key": object_key,
-            "bytes": entry.get("bytes", entry.get("byte_size")),
+            "bytes": entry.get("bytes"),
             "sha256": entry.get("sha256"),
             "uploaded": bool(entry.get("uploaded")),
             "r2_verified": bool(entry.get("r2_verified")),
@@ -26126,17 +25865,6 @@ def summarize_ordered_apply_verification(
             "final_live_sha256": entry.get("final_live_sha256"),
         }
         verification_evidence.append(evidence)
-        if persistence_contract == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT and (
-            evidence["r2_verified"]
-            and get_count == 1
-            and (
-                evidence["uploaded"]
-                or evidence["skipped_unchanged"]
-            )
-        ):
-            if evidence["uploaded"]:
-                written_keys.append(str(object_key))
-            continue
         if (
             evidence["delegated_global_latest_finalization"]
             and evidence["skipped_unchanged"]
@@ -30450,9 +30178,6 @@ def main(argv: list[str]) -> int:
     history_version_mode = resolve_history_version_mode(args)
     checked_history_versions = expand_history_versions(history_version_mode)
     history_path_configs = resolve_history_path_configs(history_version_mode)
-    observation_history_config = history_path_configs[
-        CURRENT_INTEGRITY_HISTORY_VERSION
-    ]
     serialized_history_path_configs = serialize_history_path_configs(history_path_configs)
     site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_VERSION", "")).strip() or None
 
@@ -30578,7 +30303,7 @@ def main(argv: list[str]) -> int:
                 "daily profile cannot discover the latest R2 observations day: "
                 "UK_AQ_R2_HISTORY_DROPBOX_ROOT is unavailable"
             )
-        observations_prefix = observation_history_config.observations_data_prefix
+        observations_prefix = history_path_configs["v2"].observations_data_prefix
         try:
             observations_days = discover_observations_days(r2_history_root, observations_prefix)
         except Exception as exc:
@@ -30710,7 +30435,7 @@ def main(argv: list[str]) -> int:
         dropbox_currentness = run_integrity_dropbox_currentness_gate(
             env={**env, **os.environ},
             dropbox_root=dropbox_root,
-            observations_prefix=observation_history_config.observations_data_prefix,
+            observations_prefix=history_path_configs["v2"].observations_data_prefix,
             timeseries_binding_backup_mode=(
                 args.timeseries_binding_backup_mode
             ),
@@ -31190,7 +30915,7 @@ def main(argv: list[str]) -> int:
                 r2_history_root = resolve_r2_history_root(os.environ)
                 v2_obs = run_v2_observations_integrity_checks(
                     r2_history_root=r2_history_root,
-                    config=observation_history_config,
+                    config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
                     selected_days=selected_day_values,
@@ -31237,7 +30962,7 @@ def main(argv: list[str]) -> int:
             else:
                 v2_aqi = run_v2_aqilevels_integrity_checks(
                     r2_history_root=r2_history_root,
-                    config=observation_history_config,
+                    config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
                     selected_days=selected_day_values,
@@ -31271,7 +30996,7 @@ def main(argv: list[str]) -> int:
             )
             sos_binding_verification = run_pack_mode_sos_timeseries_binding_verification(
                 conn=conn,
-                config=observation_history_config,
+                config=history_path_configs["v2"],
                 individual_root=individual_binding_root,
                 backup_mode=args.timeseries_binding_backup_mode,
                 pack_root=packed_binding_root,
@@ -31480,7 +31205,7 @@ def main(argv: list[str]) -> int:
                     verified_first_value_at_connector_days
                 ),
                 v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
-                final_verification_config=observation_history_config,
+                final_verification_config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
                 selected_days=selected_day_values,

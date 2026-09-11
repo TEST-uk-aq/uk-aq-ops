@@ -131,7 +131,6 @@ VERIFY_PINNED_HISTORICAL_SEMANTIC_DEPENDENCIES=(
   scripts/backup_r2/uk_aq_observations_manifest_hierarchy.mjs
   workers/shared/uk_aq_observation_content_hash.mjs
   workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs
-  workers/shared/uk_aq_observation_history_index_v3.mjs
   workers/shared/uk_aq_observation_history_schema.mjs
   workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs
   workers/shared/uk_aq_observation_history_target_writer.mjs
