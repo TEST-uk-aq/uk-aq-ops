@@ -51,7 +51,7 @@ export async function resolveHistoryEnvironment(env: WorkerEnv): Promise<WorkerE
   if (url.protocol !== "https:" || url.username || url.password) throw new Error("Invalid stable history URL");
   const response = await fetch(url, {
     headers: { "x-uk-aq-upstream-auth": token, Accept: "application/json" },
-    redirect: "error", signal: AbortSignal.timeout(10000), cache: "no-store",
+    redirect: "manual", signal: AbortSignal.timeout(10000), cache: "no-store",
   });
   if (!response.ok) throw new Error(`History generation authority HTTP ${response.status}`);
   const p = await readDescriptor(response);
