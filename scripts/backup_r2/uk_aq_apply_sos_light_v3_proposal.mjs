@@ -15,9 +15,9 @@ import {
   withHistoryWriterClient,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
-  validateFinalProposalGraph,
-  validateLocalProposal,
-} from "./uk_aq_apply_integrity_proposal.mjs";
+  validateFinalSosLightV3ProposalGraph,
+  validateLocalSosLightV3Proposal,
+} from "./lib/sos_light_v3_proposal_validation.mjs";
 import {
   runValidatedSosHistoricalReplacementObservationHistoryV3Writer,
 } from "./lib/observation_history_integrity_writer_v3.mjs";
@@ -44,8 +44,8 @@ async function main() {
   requireObservationsGlobalOperationLockContext({ env: process.env, expectedOwner: "integrity", expectedRunId: lockRunId });
   const config = resolveR2HistoryIndexConfig(process.env);
   if (!hasRequiredR2Config(config.r2)) throw new Error("SOS-light-v3 requires complete R2 configuration");
-  const proposal = validateLocalProposal(runState);
-  await validateFinalProposalGraph({ runState, proposal, runStatePath });
+  const proposal = validateLocalSosLightV3Proposal(runState);
+  await validateFinalSosLightV3ProposalGraph({ runState, proposal });
   const targetWriterGitSha = String(runState.writer_git_sha || runState.git_sha || process.env.GITHUB_SHA || execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" })).trim();
   if (!/^[0-9a-f]{40}$/.test(targetWriterGitSha)) throw new Error("SOS-light-v3 requires a pinned 40-hex writer git SHA");
   return await withHistoryWriterClient(

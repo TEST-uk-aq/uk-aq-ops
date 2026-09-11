@@ -1394,25 +1394,35 @@ const WRITER_FREEZE_EVIDENCE = Object.freeze([
   {
     id: "write_enabled_integrity",
     kind: "coordinated_external_runner",
-    schedule_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py",
+    schedule_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3_impl.py",
     workflow_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh",
-    implementation_file: "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+    implementation_file: "scripts/backup_r2/uk_aq_apply_sos_light_v3_proposal.mjs",
+    dependency_files: [
+      "scripts/backup_r2/lib/sos_light_v3_proposal_validation.mjs",
+      "scripts/backup_r2/lib/observation_history_integrity_writer_v3.mjs",
+      "workers/shared/uk_aq_observation_history_operational_writer_v3.mjs",
+    ],
     markers: [
       "DAILY_TASK_HEALTH_TASK_KEY = \"ops.history_integrity\"",
       "--run-backfill",
-      "uk_aq_apply_integrity_proposal.mjs",
+      "uk_aq_apply_sos_light_v3_proposal.mjs",
     ],
   },
   {
     id: "sos_historical_replacement",
     kind: "coordinated_external_runner",
-    schedule_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py",
+    schedule_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3_impl.py",
     workflow_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh",
-    implementation_file: "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+    implementation_file: "scripts/backup_r2/uk_aq_apply_sos_light_v3_proposal.mjs",
+    dependency_files: [
+      "scripts/backup_r2/lib/sos_light_v3_proposal_validation.mjs",
+      "scripts/backup_r2/lib/observation_history_integrity_writer_v3.mjs",
+      "workers/shared/uk_aq_observation_history_operational_writer_v3.mjs",
+    ],
     markers: [
       "SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH",
       "sos_light",
-      "dedicated_sos_historical_proposal",
+      "runValidatedSosHistoricalReplacementObservationHistoryV3Writer",
     ],
   },
   {
@@ -1449,6 +1459,7 @@ export function deriveObservationHistoryV3WriterFreezePlan({ repositoryRoot }) {
       definition.schedule_file,
       definition.workflow_file,
       definition.implementation_file,
+      ...(definition.dependency_files || []),
     ];
     const contents = files.map((relative) => {
       const absolute = path.resolve(root, relative);

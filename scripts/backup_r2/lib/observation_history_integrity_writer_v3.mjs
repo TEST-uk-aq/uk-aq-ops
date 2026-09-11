@@ -2,8 +2,10 @@
 import {
   loadImmutableSourcePartition,
   readCanonicalObservationRows,
-  validateDedicatedSosHistoricalProposal,
 } from "../uk_aq_apply_integrity_proposal.mjs";
+import {
+  validateDedicatedSosHistoricalProposalV3,
+} from "./sos_light_v3_proposal_validation.mjs";
 import {
   runDisconnectedIntegrityObservationHistoryV3Writer,
   runDisconnectedSosHistoricalReplacementObservationHistoryV3Writer,
@@ -139,7 +141,7 @@ function buildSelectedIntegrityPartitions({ runState, validatedProposal, audit }
 }
 
 async function buildCompleteSosPartitions({ runState, validatedProposal }) {
-  const dedicated = validateDedicatedSosHistoricalProposal({
+  const dedicated = validateDedicatedSosHistoricalProposalV3({
     runState,
     proposal: validatedProposal,
   });

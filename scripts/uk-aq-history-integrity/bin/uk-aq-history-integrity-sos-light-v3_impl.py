@@ -6239,7 +6239,7 @@ def check_openaq(
                     _check_one_openaq_file_threadsafe,
                     db_path, env_name, base_url, loc, day,
                     tmp_dir, cache_root, log, limits,
-                    force_download_when_cache_missing=(history_version == "v2"),
+                    force_download_when_cache_missing=(history_version == CURRENT_INTEGRITY_HISTORY_VERSION),
                 ))
         total_tasks = len(futures)
         progress.update(
@@ -6314,7 +6314,7 @@ def check_openaq(
                     day_obj = dt.date.fromisoformat(result["day"])
                     connector_ids = (
                         _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == "v2"
+                        if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
                         else None
                     )
                     cmd = _planned_backfill_command(
@@ -6388,7 +6388,7 @@ def check_openaq(
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
             connector_ids = (
                 _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == "v2"
+                if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
                 else None
             )
             chunks = _chunk_timeseries_ids(union_ids)
@@ -7033,7 +7033,7 @@ def check_sensor_community(
                 _check_one_sc_file_threadsafe,
                 db_path, env_name, base_url, sensor_id, day, filename,
                 tmp_dir, cache_root, log, limits,
-                force_download_when_cache_missing=(history_version == "v2"),
+                force_download_when_cache_missing=(history_version == CURRENT_INTEGRITY_HISTORY_VERSION),
             ))
         total_tasks = len(futures)
         completed_tasks = 0
@@ -7108,7 +7108,7 @@ def check_sensor_community(
                     day_obj = dt.date.fromisoformat(result["day"])
                     connector_ids = (
                         _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == "v2"
+                        if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
                         else None
                     )
                     cmd = _planned_backfill_command(
@@ -7182,7 +7182,7 @@ def check_sensor_community(
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
             connector_ids = (
                 _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == "v2"
+                if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
                 else None
             )
             chunks = _chunk_timeseries_ids(union_ids)
@@ -8646,7 +8646,7 @@ def check_sos_flat_files(
 
     source_count_mapping_identity: str | None = None
     source_count_mapping_hash: str | None = None
-    if history_version == "v2":
+    if history_version == CURRENT_INTEGRITY_HISTORY_VERSION:
         connector_rows = conn.execute(
             """
             SELECT id FROM core_connectors_snapshot
@@ -8656,7 +8656,7 @@ def check_sos_flat_files(
         ).fetchall()
         if len(connector_rows) != 1:
             raise RuntimeError(
-                "v2 SOS annual-file processing requires exactly one imported "
+                "fixed-v3 SOS annual-file processing requires exactly one imported "
                 f"SOS connector; found={len(connector_rows)}"
             )
         bridge = _load_authoritative_sos_bridge_mapping(
@@ -8689,7 +8689,7 @@ def check_sos_flat_files(
     if not grouped_mappings:
         metrics["skipped_reason"] = (
             "no UK-AIR site_ref mappings in imported SOS bridge"
-            if history_version == "v2"
+            if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
             else "no UK-AIR site_ref mappings returned from Supabase"
         )
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
@@ -19994,7 +19994,7 @@ def run_aqi_rebuild_queue_execution(
         if parsed_connector_id <= 0:
             metrics["aqi_rebuilds_skipped"] += 1
             continue
-        connector_scope = parsed_connector_id if history_version == "v2" else None
+        connector_scope = parsed_connector_id if history_version == CURRENT_INTEGRITY_HISTORY_VERSION else None
         by_key.setdefault((day_iso, connector_scope), []).append(row)
 
     metrics["aqi_rebuilds_queued_total"] = len(by_key)
@@ -20011,7 +20011,7 @@ def run_aqi_rebuild_queue_execution(
                 continue
             if connector_id <= 0:
                 continue
-            connector_scope = connector_id if history_version == "v2" else None
+            connector_scope = connector_id if history_version == CURRENT_INTEGRITY_HISTORY_VERSION else None
             seed_key = (day_iso, connector_scope)
             current = seed_by_key.get(seed_key)
             row_reasons = _parse_reason_tokens(",".join(str(v) for v in (row.get("reasons") or [])))
@@ -20183,7 +20183,7 @@ def run_aqi_rebuild_queue_execution(
         post_validation_gaps: list[dict[str, Any]] = []
         if (
             bf.get("status") == "ok"
-            and history_version == "v2"
+            and history_version == CURRENT_INTEGRITY_HISTORY_VERSION
             and connector_scope is not None
             and not skip_stale_local_post_validation
             and (
@@ -20210,7 +20210,7 @@ def run_aqi_rebuild_queue_execution(
                 )]
         elif (
             bf.get("status") == "ok"
-            and history_version == "v2"
+            and history_version == CURRENT_INTEGRITY_HISTORY_VERSION
             and connector_scope is not None
             and skip_stale_local_post_validation
         ):
@@ -27221,7 +27221,11 @@ def select_sos_historical_replacement_route(
     requirements = {
         "source_sos": str(getattr(args, "source", "")) == "sos",
         "real_run_backfill": resolve_effective_mode(args) == "repair_apply",
-        "history_version_v2": str(getattr(args, "history_version", "")) == "v2",
+        "fixed_history_generation_v3": (
+            str(getattr(args, "history_version", ""))
+            == CURRENT_INTEGRITY_HISTORY_VERSION
+            == "v3"
+        ),
         "explicit_from_day": bool(str(getattr(args, "from_day", "") or "").strip()),
         "explicit_to_day": bool(str(getattr(args, "to_day", "") or "").strip()),
         "explicit_repair_pollutants": bool(
@@ -30735,14 +30739,18 @@ def main(argv: list[str]) -> int:
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
         )
-        v2_allowed_connector_ids: set[int] | None = None
-        v2_source_scope = {"source": args.source, "connector_ids": None, "scope": "all"}
-        if "v2" in checked_history_versions and snapshot_ok:
-            v2_allowed_connector_ids, v2_source_scope = resolve_v2_source_scope(conn, args.source)
-            log.info("v2 source scope: %s", v2_source_scope)
+        # ``resolve_v2_source_scope`` is a legacy-named canonical core-snapshot
+        # helper, not a physical-v2 router.  Fixed-v3 SOS-light must preserve
+        # that authoritative connector/source mapping instead of falling back
+        # to a different lookup merely because its R2 generation is v3.
+        v3_allowed_connector_ids: set[int] | None = None
+        v3_source_scope = {"source": args.source, "connector_ids": None, "scope": "all"}
+        if snapshot_ok:
+            v3_allowed_connector_ids, v3_source_scope = resolve_v2_source_scope(conn, args.source)
+            log.info("fixed-v3 canonical source scope: %s", v3_source_scope)
             sos_historical_route = select_sos_historical_replacement_route(
                 args,
-                mutation_connector_ids=v2_allowed_connector_ids,
+                mutation_connector_ids=v3_allowed_connector_ids,
                 protected_connector_ids=protected_connector_ids,
             )
             dedicated_sos_historical_replacement = bool(
@@ -30913,11 +30921,11 @@ def main(argv: list[str]) -> int:
                     selected_days=selected_day_values,
                     conn=conn,
                     env_name=args.env,
-                    allowed_connector_ids=v2_allowed_connector_ids,
-                    source_scope=v2_source_scope,
+                    allowed_connector_ids=v3_allowed_connector_ids,
+                    source_scope=v3_source_scope,
                     log=log,
                     observation_total_connector_ids=(
-                        v2_source_scope.get("connector_ids") or []
+                        v3_source_scope.get("connector_ids") or []
                     ),
                     observation_total_pollutants=args.repair_pollutants,
                 )
@@ -30928,7 +30936,7 @@ def main(argv: list[str]) -> int:
                         run_compact=run_compact,
                         env=env,
                         v2_observations=v2_obs,
-                        source_scope=v2_source_scope,
+                        source_scope=v3_source_scope,
                         log=log,
                         repair_pollutants=args.repair_pollutants,
                         verified_first_value_at_scope_sink=(
@@ -30958,8 +30966,8 @@ def main(argv: list[str]) -> int:
                     from_day=from_day,
                     to_day=to_day,
                     selected_days=selected_day_values,
-                    allowed_connector_ids=v2_allowed_connector_ids,
-                    source_scope=v2_source_scope,
+                    allowed_connector_ids=v3_allowed_connector_ids,
+                    source_scope=v3_source_scope,
                     conn=conn,
                     check_aqi_debug=bool(args.check_aqi_debug),
                     require_aqi_debug=bool(args.require_aqi_debug),
@@ -30969,7 +30977,7 @@ def main(argv: list[str]) -> int:
                 "ran": True,
                 "history_version": "v2",
                 "skipped_reason": None,
-                "source_scope": v2_source_scope,
+                "source_scope": v3_source_scope,
                 "v2_observations": v2_obs,
                 "observation_content_hash_checks": observation_hash_metrics,
                 "v2_aqilevels": v2_aqi,
@@ -31066,7 +31074,7 @@ def main(argv: list[str]) -> int:
                     dry_run=args.dry_run,
                     run_backfill=False,
                     log=log,
-                    allowed_connector_ids=v2_allowed_connector_ids,
+                    allowed_connector_ids=v3_allowed_connector_ids,
                     blocked_connector_days=observation_gap_keys,
                 )
             )
@@ -31201,8 +31209,8 @@ def main(argv: list[str]) -> int:
                 from_day=from_day,
                 to_day=to_day,
                 selected_days=selected_day_values,
-                allowed_connector_ids=v2_allowed_connector_ids,
-                source_scope=v2_source_scope,
+                allowed_connector_ids=v3_allowed_connector_ids,
+                source_scope=v3_source_scope,
                 check_aqi_debug=bool(args.check_aqi_debug),
                 require_aqi_debug=bool(args.require_aqi_debug),
                 limits=limits,
@@ -31825,7 +31833,7 @@ def main(argv: list[str]) -> int:
         selected_total_connector_ids = (
             [1]
             if dedicated_sos_historical_replacement
-            else list(v2_source_scope.get("connector_ids") or [])
+            else list(v3_source_scope.get("connector_ids") or [])
         )
         connector_observation_totals = build_connector_observation_totals(
             successful_real_repair=bool(
@@ -31875,7 +31883,7 @@ def main(argv: list[str]) -> int:
             "checked_versions": checked_history_versions,
             "history_path_configs": serialized_history_path_configs,
             "history_version_results": history_version_results,
-            "source_scope": v2_source_scope if "v2" in checked_history_versions else None,
+            "source_scope": v3_source_scope,
             "requested_repair_pollutants": list(args.repair_pollutants),
             "site_read_version": site_read_version,
             "backfill_env_file": LAST_BACKFILL_ENV_LOAD_RESULT,
