@@ -226,12 +226,15 @@
     return parts.length ? `Active filters · ${parts.join(" · ")}` : "No active filters";
   }
 
-  function statusControl(article) {
-    const options = [`<option value="${article.status}">${STATUS_LABELS[article.status]}</option>`]
-      .concat((STATUS_ACTIONS[article.status] || []).map(([target, label, action]) =>
+  function statusOptions(status) {
+    return [`<option value="${status}">${STATUS_LABELS[status]}</option>`]
+      .concat((STATUS_ACTIONS[status] || []).map(([target, label, action]) =>
         `<option value="${target}" data-action="${action}">${label}</option>`)).join("");
+  }
+
+  function statusControl(article) {
     return `<div class="media-status-control" data-status-control data-id="${article.id}" data-current="${article.status}">
-      <select aria-label="Status for ${esc(article.title)}">${options}</select>
+      <select aria-label="Status for ${esc(article.title)}">${statusOptions(article.status)}</select>
       <span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>
     </div>`;
   }
@@ -379,10 +382,22 @@
     const option = select.selectedOptions[0];
     const action = option.dataset.action;
     if (!action) return;
+    const nextStatus = option.value;
     const button = control.querySelector("button"); button.disabled = true;
     try {
       await request(`articles/${control.dataset.id}/${action}`, { method: "POST", idempotent: "status" });
-      await renderArticles(false);
+      const row = control.closest("[data-article-id]");
+      const article = state.articles.find(item => String(item.id) === control.dataset.id);
+      if (article) article.status = nextStatus;
+      control.parentElement.querySelector(".media-message")?.remove();
+      if (state.filters.status.size && !state.filters.status.has(nextStatus)) {
+        state.articles = state.articles.filter(item => String(item.id) !== control.dataset.id);
+        row?.remove();
+        return;
+      }
+      control.dataset.current = nextStatus;
+      select.innerHTML = statusOptions(nextStatus);
+      button.outerHTML = `<span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>`;
     } catch (error) {
       button.disabled = false;
       const prior = control.parentElement.querySelector(".media-message"); prior?.remove();
