@@ -164,7 +164,7 @@
         <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="no"${state.filters.hasImage === "no" ? " checked" : ""}> No</label>
       </div></fieldset>
       <fieldset class="media-filter-group"><legend>Display title state</legend><div class="media-filter-options">${titleStates}</div></fieldset>
-      <fieldset class="media-filter-group"><legend>Publication</legend>${filterScroll("publications", publications || "No publications")}</fieldset>
+      <fieldset class="media-filter-group media-filter-group--publication"><legend>Publication</legend>${filterScroll("publications", publications || "No publications")}</fieldset>
       <fieldset class="media-filter-group"><legend>Author</legend><label class="media-field"><input data-author-search type="search" placeholder="Find author"></label>${filterScroll("authors", authors || "No authors")}</fieldset>
       <fieldset class="media-filter-group"><legend>Status</legend><div class="media-filter-options">${status}</div></fieldset>
     </div><div class="media-active-filters" data-active-filters>${esc(activeFilterSummary())}</div>`;

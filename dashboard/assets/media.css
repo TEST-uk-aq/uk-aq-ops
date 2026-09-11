@@ -105,6 +105,7 @@
   padding-block: 18px;
   scrollbar-gutter: stable;
 }
+.media-filter-group--publication .media-filter-scroll__viewport { height: 190px; }
 .media-filter-scroll__fade {
   position: absolute;
   z-index: 1;
