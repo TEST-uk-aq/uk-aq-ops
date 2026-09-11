@@ -1399,6 +1399,8 @@ const WRITER_FREEZE_EVIDENCE = Object.freeze([
     implementation_file: "scripts/backup_r2/uk_aq_apply_sos_light_v3_proposal.mjs",
     dependency_files: [
       "scripts/backup_r2/lib/sos_light_v3_proposal_validation.mjs",
+      "scripts/backup_r2/lib/sos_light_v3_apply_persistence.mjs",
+      "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
       "scripts/backup_r2/lib/observation_history_integrity_writer_v3.mjs",
       "workers/shared/uk_aq_observation_history_operational_writer_v3.mjs",
     ],
@@ -1406,6 +1408,7 @@ const WRITER_FREEZE_EVIDENCE = Object.freeze([
       "DAILY_TASK_HEALTH_TASK_KEY = \"ops.history_integrity\"",
       "--run-backfill",
       "uk_aq_apply_sos_light_v3_proposal.mjs",
+      "runPersistedSosLightV3Apply",
     ],
   },
   {
@@ -1416,6 +1419,8 @@ const WRITER_FREEZE_EVIDENCE = Object.freeze([
     implementation_file: "scripts/backup_r2/uk_aq_apply_sos_light_v3_proposal.mjs",
     dependency_files: [
       "scripts/backup_r2/lib/sos_light_v3_proposal_validation.mjs",
+      "scripts/backup_r2/lib/sos_light_v3_apply_persistence.mjs",
+      "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
       "scripts/backup_r2/lib/observation_history_integrity_writer_v3.mjs",
       "workers/shared/uk_aq_observation_history_operational_writer_v3.mjs",
     ],
@@ -1423,6 +1428,7 @@ const WRITER_FREEZE_EVIDENCE = Object.freeze([
       "SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH",
       "sos_light",
       "runValidatedSosHistoricalReplacementObservationHistoryV3Writer",
+      "runPersistedSosLightV3Apply",
     ],
   },
   {
