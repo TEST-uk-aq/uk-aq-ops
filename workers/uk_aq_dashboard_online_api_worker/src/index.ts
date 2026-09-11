@@ -12,6 +12,7 @@ import {
 import type { WorkerEnv } from "./lib/upstream";
 import { handleStationSnapshotV2Rows, handleStationSnapshotV2Search } from "./lib/station_snapshot_v2";
 import { flushDashboardServiceEgressMetrics } from "./lib/service_egress_metrics";
+import { handleMediaRoute, isMediaRoute } from "./routes/media";
 
 type WorkerExecutionContext = {
   waitUntil(promise: Promise<unknown>): void;
@@ -32,6 +33,10 @@ export default {
 
       if (request.method === "OPTIONS" && isApiRoute(pathname)) {
         return optionsResponse();
+      }
+
+      if (isMediaRoute(pathname)) {
+        return handleMediaRoute(request, env);
       }
 
       if (pathname === "/api/health") {

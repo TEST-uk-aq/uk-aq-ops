@@ -39,6 +39,8 @@ export type WorkerEnv = {
   UK_AQ_R2_HISTORY_DROPBOX_DIR?: string;
   UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX?: string;
   CLEANAIRSURB_ST_ID?: string;
+  UK_AQ_MEDIA_ADMIN_URL?: string;
+  UK_AQ_MEDIA_ADMIN_TOKEN?: string;
 };
 
 export type ProxyCacheOptions = {

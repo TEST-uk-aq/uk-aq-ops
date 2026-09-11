@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>UK AQ Dashboard</title>
     <link rel="icon" type="image/png" href="assets/favicon.png" />
+    <link rel="stylesheet" href="assets/media.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -1774,6 +1775,16 @@
           >
             Operations
           </button>
+          <button
+            id="mode-media"
+            class="mode-switch-btn"
+            type="button"
+            data-mode="media"
+            role="tab"
+            aria-selected="false"
+          >
+            Media
+          </button>
         </div>
       </header>
 
@@ -1798,9 +1809,19 @@
       >
         Operations
       </button>
+      <button
+        id="mode-media-bottom"
+        type="button"
+        class="dashboard-page-switcher__button"
+        data-mode="media"
+        aria-selected="false"
+      >
+        Media
+      </button>
     </nav>
 
     <script src="assets/config.js"></script>
+    <script src="assets/media.js"></script>
     <script>
       const DEFAULT_CONFIG = {
         envName: "local",
@@ -1868,8 +1889,10 @@
       const dashboardTitleEl = document.getElementById("dashboard-title");
       const modeIngestBtn = document.getElementById("mode-ingest");
       const modeOperationsBtn = document.getElementById("mode-operations");
+      const modeMediaBtn = document.getElementById("mode-media");
       const modeIngestBottomBtn = document.getElementById("mode-ingest-bottom");
       const modeOperationsBottomBtn = document.getElementById("mode-operations-bottom");
+      const modeMediaBottomBtn = document.getElementById("mode-media-bottom");
       const DASHBOARD_MODE_STORAGE_KEY = "uk_aq_dashboard_mode";
       const DASHBOARD_REFRESH_INGEST_STORAGE_KEY = "uk_aq_dashboard_refresh_ingest_seconds";
       const DASHBOARD_REFRESH_OPERATIONS_STORAGE_KEY = "uk_aq_dashboard_refresh_operations_seconds";
@@ -1883,7 +1906,7 @@
         "finished_failed",
         "duration",
       ]);
-      const DASHBOARD_MODES = new Set(["ingest", "operations"]);
+      const DASHBOARD_MODES = new Set(["ingest", "operations", "media"]);
       let activeMode = "ingest";
       let statusEl = null;
       let dataMetaEl = null;
@@ -1905,19 +1928,23 @@
       const modeContainers = {
         ingest: null,
         operations: null,
+        media: null,
       };
       const modeIsLoading = {
         ingest: false,
         operations: false,
+        media: false,
       };
       const modeLastLoadedAtMs = {
         ingest: 0,
         operations: 0,
+        media: 0,
       };
       const MIN_OPERATIONS_AUTO_REFRESH_SECONDS = 3600;
       const refreshSecondsByMode = {
         ingest: Number(runtimeConfig.defaultRefreshSeconds) || 300,
         operations: MIN_OPERATIONS_AUTO_REFRESH_SECONDS,
+        media: 300,
       };
       let modeStatusText = "Waiting for data...";
       let modeDataMetaText = "Project n/a";
@@ -6398,6 +6425,11 @@
           modeOperationsBtn.classList.toggle("is-active", isActive);
           modeOperationsBtn.setAttribute("aria-selected", isActive ? "true" : "false");
         }
+        if (modeMediaBtn) {
+          const isActive = activeMode === "media";
+          modeMediaBtn.classList.toggle("is-active", isActive);
+          modeMediaBtn.setAttribute("aria-selected", isActive ? "true" : "false");
+        }
         if (modeIngestBottomBtn) {
           const isActive = activeMode === "ingest";
           modeIngestBottomBtn.classList.toggle("is-active", isActive);
@@ -6407,6 +6439,11 @@
           const isActive = activeMode === "operations";
           modeOperationsBottomBtn.classList.toggle("is-active", isActive);
           modeOperationsBottomBtn.setAttribute("aria-selected", isActive ? "true" : "false");
+        }
+        if (modeMediaBottomBtn) {
+          const isActive = activeMode === "media";
+          modeMediaBottomBtn.classList.toggle("is-active", isActive);
+          modeMediaBottomBtn.setAttribute("aria-selected", isActive ? "true" : "false");
         }
       }
 
@@ -6517,6 +6554,14 @@
         applyModeSwitchUi();
         showModeContainer(activeMode);
         clearOperationsDropboxPollTimer();
+        if (activeMode === "media") {
+          const mediaContainer = getModeContainer("media");
+          if (mediaContainer && window.UKAQMediaDashboard) {
+            window.UKAQMediaDashboard.mount(mediaContainer, { apiBaseUrl: API_BASE_URL });
+            modeLastLoadedAtMs.media = Date.now();
+          }
+          return;
+        }
         if (activeMode === "operations") {
           const hasLoaded = Number(modeLastLoadedAtMs.operations || 0) > 0;
           const shouldLoad = modeSwitch
@@ -6652,11 +6697,17 @@
       if (modeOperationsBtn) {
         modeOperationsBtn.addEventListener("click", () => activateMode("operations"));
       }
+      if (modeMediaBtn) {
+        modeMediaBtn.addEventListener("click", () => activateMode("media"));
+      }
       if (modeIngestBottomBtn) {
         modeIngestBottomBtn.addEventListener("click", () => activateMode("ingest"));
       }
       if (modeOperationsBottomBtn) {
         modeOperationsBottomBtn.addEventListener("click", () => activateMode("operations"));
+      }
+      if (modeMediaBottomBtn) {
+        modeMediaBottomBtn.addEventListener("click", () => activateMode("media"));
       }
 
       applyModeSwitchUi();

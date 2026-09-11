@@ -1,0 +1,554 @@
+(() => {
+  "use strict";
+
+  const TABS = ["articles", "ai-titles", "runs", "sources"];
+  const TAB_LABELS = { articles: "Articles", "ai-titles": "AI Titles", runs: "Runs", sources: "Sources" };
+  const SORTS = [
+    ["published_desc", "Published Date: Newest to Oldest"],
+    ["published_asc", "Published Date: Oldest to Newest"],
+    ["approved_desc", "Approved Date: Newest to Oldest"],
+    ["approved_asc", "Approved Date: Oldest to Newest"],
+    ["discovered_desc", "Discovered Date: Newest to Oldest"],
+    ["updated_desc", "Recently Updated"],
+  ];
+  const STATUS_LABELS = { approved: "Approved", pending: "Pending", rejected: "Rejected", hidden: "Hidden" };
+  const STATUS_ACTIONS = {
+    pending: [["approved", "Approve", "approve"], ["rejected", "Reject", "reject"]],
+    approved: [["hidden", "Hide", "hide"], ["rejected", "Reject", "reject"]],
+    rejected: [["approved", "Approve", "approve"]],
+    hidden: [["approved", "Restore / Unhide", "unhide"]],
+  };
+
+  const state = {
+    root: null,
+    apiBase: "/api",
+    tab: "articles",
+    loaded: new Set(),
+    selectors: { publications: [], authors: [] },
+    articles: [],
+    articleCursor: null,
+    articleHasMore: false,
+    filters: { status: new Set(["approved"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" },
+    aiState: "pending",
+    aiCursor: null,
+    runsCursor: null,
+  };
+
+  function esc(value) {
+    return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function formatDate(value) {
+    if (!value) return "—";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "—";
+    return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Europe/London" }).format(date).replace(",", "");
+  }
+
+  function duration(start, finish) {
+    const startMs = Date.parse(start || "");
+    const finishMs = Date.parse(finish || "");
+    if (!Number.isFinite(startMs) || !Number.isFinite(finishMs) || finishMs < startMs) return "—";
+    const seconds = Math.round((finishMs - startMs) / 1000);
+    return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  }
+
+  function idempotencyKey(prefix = "media") {
+    return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`;
+  }
+
+  function apiUrl(path, params) {
+    const url = `${state.apiBase}/media/${String(path).replace(/^\/+/, "")}`;
+    const query = params instanceof URLSearchParams ? params.toString() : "";
+    return query ? `${url}?${query}` : url;
+  }
+
+  async function request(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    if (options.body !== undefined) headers.set("Content-Type", "application/json");
+    if (options.idempotent) headers.set("Idempotency-Key", idempotencyKey(options.idempotent));
+    let response;
+    try {
+      response = await fetch(apiUrl(path, options.params), { method: options.method || "GET", headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body) });
+    } catch (_error) {
+      throw new Error("Media admin unavailable.");
+    }
+    const contentType = String(response.headers.get("Content-Type") || "");
+    const payload = contentType.includes("json") ? await response.json().catch(() => null) : null;
+    if (!response.ok) {
+      throw new Error(String(payload?.error?.message || payload?.error || payload?.message || `Media request failed (${response.status})`));
+    }
+    return payload;
+  }
+
+  function message(text, kind = "") {
+    return `<div class="media-message${kind ? ` media-message--${kind}` : ""}" role="status">${esc(text)}</div>`;
+  }
+
+  function setView(html) {
+    const view = state.root?.querySelector("[data-media-view]");
+    if (view) view.innerHTML = html;
+  }
+
+  function setTab(tab) {
+    if (!TABS.includes(tab)) return;
+    state.tab = tab;
+    state.root.querySelectorAll("[data-media-tab]").forEach(button => {
+      const active = button.dataset.mediaTab === tab;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    if (tab === "articles") void renderArticles(false);
+    if (tab === "ai-titles") void renderAiTitles(false);
+    if (tab === "runs") void renderRuns(false);
+    if (tab === "sources") void renderSources(false);
+  }
+
+  function checkedFilter(group, value) {
+    return state.filters[group].has(value) ? " checked" : "";
+  }
+
+  function articleParams(cursor = null) {
+    const params = new URLSearchParams({ limit: "20", sort: state.filters.sort });
+    state.filters.status.forEach(value => params.append("status", value));
+    state.filters.source.forEach(value => params.append("source", value));
+    state.filters.author.forEach(value => params.append("author", value));
+    state.filters.titleState.forEach(value => params.append("title_state", value));
+    if (state.filters.hasImage) params.set("has_image", state.filters.hasImage);
+    if (state.filters.q) params.set("q", state.filters.q);
+    if (cursor) params.set("cursor", cursor);
+    return params;
+  }
+
+  async function ensureSelectors() {
+    if (state.selectors.publications.length || state.selectors.authors.length) return;
+    const data = await request("articles/selectors");
+    state.selectors = { publications: data.publications || [], authors: data.authors || [] };
+  }
+
+  function filterPanel() {
+    const status = ["approved", "pending", "rejected", "hidden"].map(value =>
+      `<label><input type="checkbox" data-filter="status" value="${value}"${checkedFilter("status", value)}> ${STATUS_LABELS[value]}</label>`).join("");
+    const publications = state.selectors.publications.map(source =>
+      `<label><input type="checkbox" data-filter="source" value="${esc(source.source_key)}"${checkedFilter("source", source.source_key)}> ${esc(source.name)}</label>`).join("");
+    const authors = state.selectors.authors.map(author =>
+      `<label data-author-option="${esc(String(author).toLowerCase())}"><input type="checkbox" data-filter="author" value="${esc(author)}"${checkedFilter("author", author)}> ${esc(author)}</label>`).join("");
+    const titleStates = [["original", "Original only"], ["human", "Human title"], ["ai", "AI-approved title"], ["pending_ai", "Pending AI suggestion"]]
+      .map(([value, label]) => `<label><input type="checkbox" data-filter="titleState" value="${value}"${checkedFilter("titleState", value)}> ${label}</label>`).join("");
+    return `<div class="media-filter-panel" aria-label="Article filters">
+      <fieldset class="media-filter-group"><legend>Status</legend><div class="media-filter-options">${status}</div></fieldset>
+      <fieldset class="media-filter-group"><legend>Publication</legend><div class="media-filter-options">${publications || "No publications"}</div></fieldset>
+      <fieldset class="media-filter-group"><legend>Author</legend><label class="media-field"><input data-author-search type="search" placeholder="Find author"></label><div class="media-filter-options">${authors || "No authors"}</div></fieldset>
+      <fieldset class="media-filter-group"><legend>Has image</legend><div class="media-filter-options">
+        <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value=""${!state.filters.hasImage ? " checked" : ""}> Any</label>
+        <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="yes"${state.filters.hasImage === "yes" ? " checked" : ""}> Yes</label>
+        <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="no"${state.filters.hasImage === "no" ? " checked" : ""}> No</label>
+      </div></fieldset>
+      <fieldset class="media-filter-group"><legend>Display title state</legend><div class="media-filter-options">${titleStates}</div></fieldset>
+    </div><div class="media-active-filters">${esc(activeFilterSummary())}</div>`;
+  }
+
+  function activeFilterSummary() {
+    const parts = [];
+    if (state.filters.status.size) parts.push(`Status: ${[...state.filters.status].map(v => STATUS_LABELS[v]).join(", ")}`);
+    if (state.filters.source.size) parts.push(`${state.filters.source.size} publication filter${state.filters.source.size === 1 ? "" : "s"}`);
+    if (state.filters.author.size) parts.push(`${state.filters.author.size} author filter${state.filters.author.size === 1 ? "" : "s"}`);
+    if (state.filters.hasImage) parts.push(`Image: ${state.filters.hasImage}`);
+    if (state.filters.titleState.size) parts.push(`${state.filters.titleState.size} title-state filter${state.filters.titleState.size === 1 ? "" : "s"}`);
+    if (state.filters.q) parts.push(`Search: “${state.filters.q}”`);
+    return parts.length ? `Active filters · ${parts.join(" · ")}` : "No active filters";
+  }
+
+  function statusControl(article) {
+    const options = [`<option value="${article.status}">${STATUS_LABELS[article.status]}</option>`]
+      .concat((STATUS_ACTIONS[article.status] || []).map(([target, label, action]) =>
+        `<option value="${target}" data-action="${action}">${label}</option>`)).join("");
+    return `<div class="media-status-control" data-status-control data-id="${article.id}" data-current="${article.status}">
+      <select aria-label="Status for ${esc(article.title)}">${options}</select>
+      <span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>
+    </div>`;
+  }
+
+  function articleRow(article) {
+    const title = article.display_title || article.title;
+    const thumb = article.admin_preview_image_path
+      ? `<img class="media-thumb" loading="lazy" src="${esc(apiUrl(`articles/${article.id}/image`))}" alt="" data-media-thumb>`
+      : `<span class="media-thumb-fallback">No image</span>`;
+    return `<tr data-article-id="${article.id}"><td>${thumb}</td>
+      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}</td>
+      <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
+      <td>${esc(formatDate(article.published_at))}</td><td>${esc(formatDate(article.approved_at))}</td>
+      <td>${statusControl(article)}</td></tr>`;
+  }
+
+  function articleTableHtml(error = "") {
+    const rows = state.articles.map(articleRow).join("");
+    return `${error ? message(error, "error") : ""}<div class="media-table-wrap"><table class="media-table">
+      <thead><tr><th>Image</th><th>Title</th><th>Publication</th><th>Author</th><th>Published</th><th>Approved</th><th>Status</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7" class="media-empty">No approved articles match these filters.</td></tr>`}</tbody>
+    </table></div>${state.articleHasMore ? `<div class="media-actions"><button class="media-button" data-load-more-articles>Load more</button></div>` : ""}`;
+  }
+
+  async function renderArticles(append) {
+    if (!append) {
+      setView(`<section class="media-card"><div class="media-loading">Loading Articles…</div></section>`);
+    }
+    try {
+      await ensureSelectors();
+      const cursor = append ? state.articleCursor : null;
+      const data = await request("articles", { params: articleParams(cursor) });
+      state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
+      state.articleCursor = data.page?.next_cursor || null;
+      state.articleHasMore = Boolean(data.page?.has_more);
+      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>
+        <button class="media-button media-button--primary" data-focus-add>+ Add Article</button></div>
+        <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
+        <div data-url-result></div></section>
+        <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form>
+          <label class="media-field"><span>Sort</span><select data-article-sort>${SORTS.map(([value, label]) => `<option value="${value}"${state.filters.sort === value ? " selected" : ""}>${label}</option>`).join("")}</select></label></div>
+          ${filterPanel()}<div data-article-table>${articleTableHtml()}</div></section>`);
+      bindArticleEvents();
+    } catch (error) {
+      setView(`<section class="media-card"><h3>Articles</h3>${message(error.message || "Media admin unavailable.", "error")}</section>`);
+    }
+  }
+
+  function bindArticleEvents() {
+    state.root.querySelector("[data-focus-add]")?.addEventListener("click", () => {
+      const input = state.root.querySelector("[data-url-lookup] input"); input?.focus(); input?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    state.root.querySelector("[data-url-lookup]")?.addEventListener("submit", event => { event.preventDefault(); void lookupUrl(new FormData(event.currentTarget).get("url")); });
+    state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); void renderArticles(false); });
+    state.root.querySelector("[data-clear-filters]")?.addEventListener("click", () => {
+      state.filters = { status: new Set(["approved"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" };
+      void renderArticles(false);
+    });
+    state.root.querySelector("[data-article-sort]")?.addEventListener("change", event => { state.filters.sort = event.target.value; void renderArticles(false); });
+    state.root.querySelectorAll("[data-filter]").forEach(input => input.addEventListener("change", event => {
+      const set = state.filters[event.target.dataset.filter]; event.target.checked ? set.add(event.target.value) : set.delete(event.target.value); void renderArticles(false);
+    }));
+    state.root.querySelectorAll("[data-filter-radio]").forEach(input => input.addEventListener("change", event => { state.filters[event.target.dataset.filterRadio] = event.target.value; void renderArticles(false); }));
+    state.root.querySelector("[data-author-search]")?.addEventListener("input", event => {
+      const query = event.target.value.toLowerCase(); state.root.querySelectorAll("[data-author-option]").forEach(option => { option.hidden = !option.dataset.authorOption.includes(query); });
+    });
+    state.root.querySelector("[data-load-more-articles]")?.addEventListener("click", () => void renderArticles(true));
+    bindArticleTableEvents();
+  }
+
+  function bindArticleTableEvents() {
+    state.root.querySelectorAll("[data-status-control] select").forEach(select => select.addEventListener("change", event => {
+      const control = event.target.closest("[data-status-control]");
+      const current = control.dataset.current;
+      const saved = control.querySelector(".media-save-state");
+      if (event.target.value === current) {
+        saved.outerHTML = `<span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>`;
+      } else {
+        saved.outerHTML = `<button type="button" class="media-save-state is-unsaved" title="Save status change" aria-label="Save status change">💾</button>`;
+        control.querySelector("button")?.addEventListener("click", () => void saveStatus(control));
+      }
+    }));
+    state.root.querySelectorAll("[data-article-id]").forEach(row => row.addEventListener("click", event => {
+      if (event.target.closest("button,select,input,a")) return;
+      void openArticle(Number(row.dataset.articleId));
+    }));
+    state.root.querySelectorAll("[data-open-article]").forEach(button => button.addEventListener("click", () => {
+      void openArticle(Number(button.closest("[data-article-id]").dataset.articleId));
+    }));
+    state.root.querySelectorAll("[data-media-thumb]").forEach(image => image.addEventListener("error", () => { image.outerHTML = `<span class="media-thumb-fallback">Image unavailable</span>`; }, { once: true }));
+  }
+
+  async function saveStatus(control) {
+    const select = control.querySelector("select");
+    const option = select.selectedOptions[0];
+    const action = option.dataset.action;
+    if (!action) return;
+    const button = control.querySelector("button"); button.disabled = true;
+    try {
+      await request(`articles/${control.dataset.id}/${action}`, { method: "POST", idempotent: "status" });
+      await renderArticles(false);
+    } catch (error) {
+      button.disabled = false;
+      const prior = control.parentElement.querySelector(".media-message"); prior?.remove();
+      control.parentElement.insertAdjacentHTML("beforeend", message(error.message, "error"));
+    }
+  }
+
+  async function lookupUrl(value) {
+    const result = state.root.querySelector("[data-url-result]");
+    result.innerHTML = message("Checking canonical Media identity…");
+    try {
+      const data = await request("articles/lookup", { method: "POST", body: { url: String(value) } });
+      if (data.article) {
+        result.innerHTML = `${message(`Existing ${STATUS_LABELS[data.article.status] || data.article.status} article found.`, "success")}<button class="media-button" data-open-found>Open article</button>`;
+        result.querySelector("[data-open-found]")?.addEventListener("click", () => void openArticle(data.article.id));
+        return;
+      }
+      const metadata = data.metadata || {};
+      result.innerHTML = `${data.metadata_error ? message(`Automatic metadata unavailable: ${data.metadata_error}. Supply the missing public fields manually.`) : message("New canonical article. Review metadata before adding.", "success")}
+        <form class="media-inline-form" data-add-manual>
+          <input type="hidden" name="url" value="${esc(data.canonical_url)}">
+          <label class="media-field media-field--grow"><span>Publisher title</span><input name="title" required maxlength="1000" value="${esc(metadata.title || "")}"></label>
+          <label class="media-field"><span>Publication</span><input name="publisher" required maxlength="200" value="${esc(metadata.publisher || data.source?.name || "")}"></label>
+          <label class="media-field"><span>Author</span><input name="author" maxlength="500" value="${esc(metadata.author || "")}"></label>
+          <label class="media-field"><span>Published</span><input name="published_at" type="datetime-local" value="${metadata.published_at ? esc(metadata.published_at.slice(0, 16)) : ""}"></label>
+          <input type="hidden" name="preview_image_url" value="${esc(metadata.image_url || "")}">
+          <button class="media-button media-button--primary">Add approved</button>
+        </form><p class="media-subtext">Creation records status Approved and approval method Manual. ${data.source?.will_create_disabled_definition ? "A conservative disabled publisher definition will also be created." : ""}</p>`;
+      result.querySelector("[data-add-manual]")?.addEventListener("submit", event => { event.preventDefault(); void addManualArticle(event.currentTarget, result); });
+    } catch (error) { result.innerHTML = message(error.message, "error"); }
+  }
+
+  async function addManualArticle(form, result) {
+    const values = new FormData(form);
+    const published = String(values.get("published_at") || "");
+    try {
+      const data = await request("articles", { method: "POST", idempotent: "add", body: {
+        url: values.get("url"), title: values.get("title"), publisher: values.get("publisher"),
+        author: String(values.get("author") || "").trim() || null,
+        published_at: published ? new Date(published).toISOString() : null,
+        preview_image_url: String(values.get("preview_image_url") || "").trim() || null,
+      } });
+      result.innerHTML = message("Article added and approved with manual provenance.", "success");
+      await renderArticles(false); await openArticle(data.article.id);
+    } catch (error) { result.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
+  }
+
+  function detailDialog() {
+    let dialog = document.getElementById("media-article-detail");
+    if (!dialog) { dialog = document.createElement("dialog"); dialog.id = "media-article-detail"; dialog.className = "media-detail"; document.body.appendChild(dialog); }
+    return dialog;
+  }
+
+  async function openArticle(id) {
+    const dialog = detailDialog();
+    dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading article…</div></div>`;
+    if (!dialog.open) dialog.showModal();
+    try {
+      const data = await request(`articles/${id}`); const article = data.article;
+      const guardianRouteKeys = article.source_key === "the-guardian"
+        ? [...new Set((data.discovery_evidence || []).map(item => item.route_key).filter(Boolean))]
+        : [];
+      dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>
+        <div class="media-detail__grid"><div>${article.admin_preview_image_path ? `<img class="media-detail__preview" src="${esc(apiUrl(`articles/${id}/image`))}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
+        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>AI suggestion</dt><dd>${esc(article.ai_title_suggestion || "—")} (${esc(article.ai_title_suggestion_state || "none")})</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatDate(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatDate(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatDate(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatDate(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
+        <section><h4>Editorial status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Action</span><select><option value="">Choose action…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div data-detail-status-message></div></section>
+        <section><h4>Display title</h4><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
+        <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
+        <section><details><summary>Discovery evidence and recent events</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
+      dialog.querySelector("[data-close-detail]")?.addEventListener("click", () => dialog.close());
+      const detailStatus = dialog.querySelector("[data-detail-status]");
+      detailStatus?.querySelector("select")?.addEventListener("change", event => {
+        const button = detailStatus.querySelector("button");
+        button.disabled = !event.currentTarget.value;
+        button.classList.toggle("is-unsaved", Boolean(event.currentTarget.value));
+        button.setAttribute("aria-label", event.currentTarget.value ? "Save status change" : "Saved/current");
+        button.title = event.currentTarget.value ? "Save status change" : "Saved/current";
+      });
+      detailStatus?.querySelector("button")?.addEventListener("click", () => void saveDetailStatus(id, detailStatus, dialog));
+      dialog.querySelector("[data-detail-title]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailTitle(id, new FormData(event.currentTarget).get("display_title"), dialog); });
+      dialog.querySelector("[data-clear-title]")?.addEventListener("click", () => void saveDetailTitle(id, null, dialog));
+      dialog.querySelector("[data-reload-metadata]")?.addEventListener("click", () => void reloadMetadata(id, article, dialog));
+    } catch (error) { dialog.innerHTML = `<div class="media-detail__inner">${message(error.message, "error")}<button class="media-button" onclick="this.closest('dialog').close()">Close</button></div>`; }
+  }
+
+  async function saveDetailStatus(id, control, dialog) {
+    const select = control.querySelector("select");
+    const action = select.selectedOptions[0]?.dataset.action;
+    const output = dialog.querySelector("[data-detail-status-message]");
+    if (!action) return;
+    control.querySelector("button").disabled = true;
+    try {
+      await request(`articles/${id}/${action}`, { method: "POST", idempotent: "status" });
+      await renderArticles(false);
+      await openArticle(id);
+    } catch (error) {
+      control.querySelector("button").disabled = false;
+      output.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function saveDetailTitle(id, value, dialog) {
+    const output = dialog.querySelector("[data-detail-title-message]");
+    try { await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: value === null ? null : String(value) } }); output.innerHTML = message(value === null ? "Publisher original restored." : "Human display title saved.", "success"); void renderArticles(false); }
+    catch (error) { output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function reloadMetadata(id, article, dialog) {
+    const output = dialog.querySelector("[data-metadata-result]"); output.innerHTML = message("Reloading bounded publisher metadata…");
+    try {
+      if (article.source_key === "the-guardian") {
+        const routeKey = dialog.querySelector("[data-guardian-route]")?.value;
+        if (!routeKey) { output.innerHTML = message("No stored Guardian RSS route evidence is available for this article.", "error"); return; }
+        const data = await request(`articles/${id}/guardian-image-refresh/preview`, { method: "POST", body: { route_key: routeKey } });
+        const refresh = data.refresh;
+        if (!refresh?.proposed_image || refresh.current_image?.url === refresh.proposed_image.url) {
+          output.innerHTML = message("No useful metadata change found."); return;
+        }
+        output.innerHTML = `<div class="media-message"><strong>Proposed Guardian RSS image</strong><pre>${esc(JSON.stringify({ current: refresh.current_image, proposed: refresh.proposed_image }, null, 2))}</pre><button class="media-button media-button--primary" data-apply-guardian-image>${refresh.replacement_required ? "Replace image" : "Apply metadata"}</button></div>`;
+        output.querySelector("[data-apply-guardian-image]")?.addEventListener("click", async () => {
+          try {
+            await request(`articles/${id}/guardian-image-refresh/apply`, { method: "POST", body: {
+              route_key: routeKey,
+              expected_current_image_url: refresh.current_image?.url ?? null,
+              proposed_image_url: refresh.proposed_image.url,
+              confirm_replace_existing: true,
+            } });
+            output.innerHTML = message("Guardian RSS preview image applied without changing editorial state.", "success");
+            void renderArticles(false);
+          } catch (error) { output.innerHTML = message(error.message, "error"); }
+        });
+        return;
+      }
+      const data = await request(`articles/${id}/metadata/preview`, { method: "POST" });
+      if (!data.has_useful_change) { output.innerHTML = message("No useful metadata change found."); return; }
+      output.innerHTML = `<div class="media-message"><strong>Proposed changes</strong><pre>${esc(JSON.stringify(data.changes, null, 2))}</pre><button class="media-button media-button--primary" data-apply-metadata>Apply metadata${data.changes.image?.replacement_required ? " / replace image" : ""}</button></div>`;
+      output.querySelector("[data-apply-metadata]")?.addEventListener("click", async () => {
+        try { await request(`articles/${id}/metadata/apply`, { method: "PUT", idempotent: "metadata", body: {
+          expected_current_image_url: data.changes.image?.current ?? article.og_image_url ?? null,
+          replace_existing_image: Boolean(data.changes.image?.replacement_required), apply_publisher_display_title: true,
+        } }); output.innerHTML = message("Metadata applied without changing editorial state.", "success"); void renderArticles(false); }
+        catch (error) { output.innerHTML = message(error.message, "error"); }
+      });
+    } catch (error) { output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function renderAiTitles(append) {
+    if (!append) setView(`<section class="media-card"><div class="media-loading">Loading AI Titles…</div></section>`);
+    try {
+      const [usage, titles] = await Promise.all([
+        request("ai-usage", { params: new URLSearchParams({ limit: "1" }) }),
+        request("ai-titles", { params: new URLSearchParams({ state: state.aiState, limit: "20", ...(append && state.aiCursor ? { cursor: state.aiCursor } : {}) }) }),
+      ]);
+      const day = usage.usage_days?.[0] || {};
+      const rows = append ? (state.aiRows || []).concat(titles.suggestions || []) : (titles.suggestions || []);
+      state.aiRows = rows; state.aiCursor = titles.page?.next_cursor || null;
+      setView(`<section class="media-card"><h3>AI Titles</h3><p>Media’s local budget is enforced here; Cloudflare allowance values are estimates, not billing authority.</p><div class="media-stats">
+        ${[[day.calculated_neurons_used, "Calculated neurons used today"], [day.media_daily_neuron_budget, "Media daily neuron budget"], [day.media_budget_remaining, "Media budget remaining"], [day.configured_cloudflare_free_allocation_neurons, "Configured Cloudflare free allowance"], [day.estimated_cloudflare_free_neurons_remaining, "Estimated Cloudflare allowance remaining"], [day.ai_requests, "Request count"], [day.ai_titles_attempted, "Titles attempted"], [day.titles_generated_successfully, "Titles generated"], [day.prompt_tokens, "Input tokens"], [day.completion_tokens, "Output tokens"], [day.outstanding_reserved_neurons, "Outstanding reserved neurons"]].map(([value, label]) => `<div class="media-stat"><strong>${esc(value ?? 0)}</strong><span>${esc(label)}</span></div>`).join("")}</div></section>
+        <section class="media-card"><div class="media-toolbar"><div class="media-mini-nav" role="tablist" aria-label="AI title state">${["pending", "accepted", "rejected"].map(value => `<button data-ai-state="${value}" class="${state.aiState === value ? "is-active" : ""}" aria-selected="${state.aiState === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div></div>
+        <div class="media-review-list">${rows.length ? rows.map(aiReviewRow).join("") : `<div class="media-empty">No ${esc(state.aiState)} AI titles.</div>`}</div>${titles.page?.has_more ? `<button class="media-button" data-load-more-ai>Load more</button>` : ""}</section>`);
+      state.root.querySelectorAll("[data-ai-state]").forEach(button => button.addEventListener("click", () => { state.aiState = button.dataset.aiState; state.aiCursor = null; void renderAiTitles(false); }));
+      state.root.querySelector("[data-load-more-ai]")?.addEventListener("click", () => void renderAiTitles(true));
+      bindAiActions();
+    } catch (error) { setView(`<section class="media-card"><h3>AI Titles</h3>${message(error.message, "error")}</section>`); }
+  }
+
+  function aiReviewRow(row) {
+    const pendingActions = row.ai_title_suggestion_state === "pending"
+      ? `<button class="media-button media-button--primary" data-ai-action="accept-ai">Approve title</button><button class="media-button" data-ai-action="reject-ai">Use original / Reject</button>`
+      : "";
+    return `<article class="media-review" data-ai-id="${row.id}"><strong>${esc(row.publisher)}</strong><span class="media-subtext">Generated ${esc(formatDate(row.ai_title_generated_at))} · Article ${esc(STATUS_LABELS[row.status] || row.status)}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(row.title)}</div><div class="media-review__title"><span>AI suggestion</span>${esc(row.ai_title_suggestion)}</div></div>
+      <div class="media-actions">${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(row.display_title || row.ai_title_suggestion || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save edit</button>${row.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message></div></article>`;
+  }
+
+  function bindAiActions() {
+    state.root.querySelectorAll("[data-ai-action]").forEach(button => button.addEventListener("click", async () => {
+      const row = button.closest("[data-ai-id]"); const id = row.dataset.aiId; const action = button.dataset.aiAction; const output = row.querySelector("[data-ai-message]");
+      try {
+        if (action === "accept-ai" || action === "reject-ai") await request(`articles/${id}/display-title/${action}`, { method: "POST" });
+        if (action === "edit") await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: row.querySelector("[data-ai-edit]").value } });
+        if (action === "clear") await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: null } });
+        output.innerHTML = message("Title decision saved.", "success"); setTimeout(() => void renderAiTitles(false), 350);
+      } catch (error) { output.innerHTML = message(error.message, "error"); }
+    }));
+  }
+
+  async function renderRuns(append) {
+    if (!append) setView(`<section class="media-card"><div class="media-loading">Loading Runs…</div></section>`);
+    try {
+      const params = new URLSearchParams({ limit: "20" }); if (append && state.runsCursor) params.set("cursor", state.runsCursor);
+      const data = await request("runs", { params });
+      const rows = append ? (state.runRows || []).concat(data.runs || []) : (data.runs || []);
+      state.runRows = rows; state.runsCursor = data.page?.next_cursor || null;
+      setView(`<section class="media-card"><h3>Recent discovery runs</h3><p>Newest first; diagnostics are bounded to stored run evidence.</p><div class="media-table-wrap"><table class="media-table"><thead><tr><th>Publication</th><th>Route</th><th>Started</th><th>Duration</th><th>Status</th><th>Seen</th><th>Inserted</th><th>Updated</th><th>Filtered</th><th>Invalid</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(run.source_name || run.source_key || "System")}</td><td>${esc(run.discovery_route_key || "—")}</td><td>${esc(formatDate(run.started_at))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td>${esc(run.items_seen)}</td><td>${esc(run.items_inserted)}</td><td>${esc(run.items_updated)}</td><td>${esc(run.items_filtered ?? 0)}</td><td>${esc(run.items_invalid)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)}</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="11" class="media-empty">No discovery runs found.</td></tr>`}</tbody></table></div>${data.page?.has_more ? `<button class="media-button" data-load-more-runs>Load more</button>` : ""}</section>`);
+      state.root.querySelector("[data-load-more-runs]")?.addEventListener("click", () => void renderRuns(true));
+    } catch (error) { setView(`<section class="media-card"><h3>Runs</h3>${message(error.message, "error")}</section>`); }
+  }
+
+  async function renderSources() {
+    setView(`<section class="media-card"><div class="media-loading">Loading Sources…</div></section>`);
+    try {
+      const data = await request("sources");
+      const rulesBySource = new Map(); (data.author_rules || []).forEach(rule => { const group = rulesBySource.get(rule.source_key) || []; group.push(rule); rulesBySource.set(rule.source_key, group); });
+      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Sources</h3><p>Policy changes apply to future discovery only.</p></div><button class="media-button media-button--primary" data-toggle-add-source>+ Add Source</button></div><div data-add-source></div><div class="media-source-list">${(data.sources || []).map(source => sourceCard(source, rulesBySource.get(source.source_key) || [])).join("") || `<div class="media-empty">No Media sources found.</div>`}</div></section>`);
+      bindSourceActions();
+    } catch (error) { setView(`<section class="media-card"><h3>Sources</h3>${message(error.message, "error")}</section>`); }
+  }
+
+  function sourceCard(source, rules) {
+    let config = source.discovery_config_json; try { config = JSON.stringify(JSON.parse(config), null, 2); } catch (_error) {}
+    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
+      ${[["Canonical domain", source.canonical_domain], ["Source type", source.source_type], ["Discovery adapter", source.discovery_method], ["Review level", source.review_level], ["Content fetch", source.content_fetch_policy], ["AI content", source.ai_content_policy], ["Image policy", source.image_policy], ["Recent run", source.recent_run_status ? `${source.recent_run_status} · ${formatDate(source.recent_run_started_at)}` : "No run"]].map(([label, value]) => `<div><span class="media-subtext">${label}</span>${esc(value)}</div>`).join("")}
+      <label class="media-field"><span>Publication policy</span><select data-source-policy><option value="manual"${source.publication_policy === "manual" ? " selected" : ""}>manual</option><option value="auto_approve"${source.publication_policy === "auto_approve" ? " selected" : ""}>auto_approve</option></select></label>
+      <label class="media-field"><span>Enabled</span><select data-source-enabled><option value="false"${!source.enabled ? " selected" : ""}>No</option><option value="true"${source.enabled ? " selected" : ""}>Yes</option></select></label>
+      <button class="media-button media-button--primary" data-save-source>Save source policy</button></div>
+      <details><summary>Bounded route/configuration</summary><pre>${esc(config)}</pre></details><div data-source-message></div>
+      <div class="media-author-rules"><div class="media-toolbar"><h4>Author rules</h4>${source.source_key === "the-guardian" ? `<button class="media-button" data-add-author>+ Add author rule</button>` : ""}</div><div data-add-author-form></div>
+      ${rules.length ? rules.map(authorRuleRow).join("") : `<p>No author rules.</p>`}</div></details>`;
+  }
+
+  function authorRuleRow(rule) {
+    let aliases = rule.byline_aliases;
+    if (typeof aliases === "string") { try { aliases = JSON.parse(aliases); } catch (_error) { aliases = [aliases]; } }
+    const identity = [rule.author_key, rule.profile_url, rule.profile_rss_url, ...(Array.isArray(aliases) ? aliases : [])].filter(Boolean).join(" · ");
+    return `<div class="media-author-rule" data-author-key="${esc(rule.author_key)}"><div><strong>${esc(rule.display_name)}</strong><span class="media-subtext">${esc(identity)}</span></div><label class="media-field"><span>Inclusion</span><select data-author-inclusion><option value="normal"${rule.inclusion_policy === "normal" ? " selected" : ""}>normal</option><option value="always_include"${rule.inclusion_policy === "always_include" ? " selected" : ""}>always_include</option></select></label><label class="media-field"><span>Publication</span><select data-author-publication><option value="inherit_source"${rule.publication_policy === "inherit_source" ? " selected" : ""}>inherit_source</option><option value="pending"${rule.publication_policy === "pending" ? " selected" : ""}>pending</option><option value="auto_approve"${rule.publication_policy === "auto_approve" ? " selected" : ""}>auto_approve</option></select></label><label class="media-field"><span>Enabled</span><select data-author-enabled><option value="true"${rule.enabled ? " selected" : ""}>Yes</option><option value="false"${!rule.enabled ? " selected" : ""}>No</option></select></label><button class="media-button" data-save-author>Save rule</button></div>`;
+  }
+
+  function bindSourceActions() {
+    state.root.querySelector("[data-toggle-add-source]")?.addEventListener("click", () => {
+      const target = state.root.querySelector("[data-add-source]"); target.innerHTML = `<form class="media-inline-form media-message" data-add-source-form><label class="media-field"><span>Stable source key</span><input name="source_key" required pattern="[a-z0-9]+(?:-[a-z0-9]+)*"></label><label class="media-field"><span>Display name</span><input name="name" required></label><label class="media-field"><span>Canonical domain</span><input name="canonical_domain" required placeholder="example.org"></label><label class="media-field"><span>Source type</span><select name="source_type"><option value="publisher">publisher</option><option value="government">government</option></select></label><button class="media-button media-button--primary">Create disabled definition</button></form><p class="media-subtext">Defaults: disabled, manual, standard, discovery metadata only, AI disabled, image blocked. No adapter or schedule is created.</p>`;
+      target.querySelector("form")?.addEventListener("submit", event => { event.preventDefault(); void submitAddSource(event.currentTarget, target); });
+    });
+    state.root.querySelectorAll("[data-save-source]").forEach(button => button.addEventListener("click", () => void saveSource(button.closest("[data-source-key]"))));
+    state.root.querySelectorAll("[data-save-author]").forEach(button => button.addEventListener("click", () => void saveAuthor(button.closest("[data-author-key]"))));
+    state.root.querySelectorAll("[data-add-author]").forEach(button => button.addEventListener("click", () => showAddAuthor(button.closest("[data-source-key]"))));
+  }
+
+  async function saveSource(container) {
+    const policy = container.querySelector("[data-source-policy]").value;
+    const enabled = container.querySelector("[data-source-enabled]").value === "true";
+    if (policy === "auto_approve" && !confirm("Auto-approve is a broad editorial decision for FUTURE discoveries. Existing rows will not change. Continue?")) return;
+    const output = container.querySelector("[data-source-message]");
+    try { await request(`sources/${container.dataset.sourceKey}`, { method: "PUT", idempotent: "source", body: { publication_policy: policy, enabled } }); output.innerHTML = message("Source policy saved for future discovery.", "success"); }
+    catch (error) { output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function saveAuthor(container) {
+    const output = container.closest(".media-author-rules").querySelector("[data-source-message]") || container.closest(".media-source").querySelector("[data-source-message]");
+    try { await request(`author-rules/${container.dataset.authorKey}`, { method: "PUT", idempotent: "author", body: { inclusion_policy: container.querySelector("[data-author-inclusion]").value, publication_policy: container.querySelector("[data-author-publication]").value, enabled: container.querySelector("[data-author-enabled]").value === "true" } }); if (output) output.innerHTML = message("Author rule saved for future discovery.", "success"); }
+    catch (error) { if (output) output.innerHTML = message(error.message, "error"); else alert(error.message); }
+  }
+
+  function showAddAuthor(sourceContainer) {
+    const target = sourceContainer.querySelector("[data-add-author-form]");
+    target.innerHTML = `<form class="media-inline-form media-message" data-add-author-rule><label class="media-field"><span>Stable author key</span><input name="author_key" required placeholder="guardian:name-slug"></label><label class="media-field"><span>Display name</span><input name="display_name" required></label><label class="media-field media-field--grow"><span>Profile URL</span><input name="profile_url" type="url" required></label><label class="media-field"><span>Byline aliases (comma separated)</span><input name="aliases" required></label><button class="media-button media-button--primary">Add rule</button></form><p class="media-subtext">Guardian byline rules are supported. Adding a rule does not change source-wide policy.</p>`;
+    target.querySelector("form")?.addEventListener("submit", event => { event.preventDefault(); void submitAddAuthor(event.currentTarget, sourceContainer.dataset.sourceKey, target); });
+  }
+
+  async function submitAddAuthor(form, sourceKey, target) {
+    const values = new FormData(form);
+    try { await request("author-rules", { method: "POST", idempotent: "author", body: { author_key: values.get("author_key"), source_key: sourceKey, display_name: values.get("display_name"), profile_url: values.get("profile_url"), profile_rss_url: null, profile_rss_route_key: null, inclusion_policy: "normal", publication_policy: "inherit_source", enabled: true, byline_aliases: String(values.get("aliases") || "").split(",").map(value => value.trim()).filter(Boolean) } }); target.innerHTML = message("Author rule added. It affects future discovery only.", "success"); setTimeout(() => void renderSources(), 350); }
+    catch (error) { target.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
+  }
+
+  async function submitAddSource(form, target) {
+    const values = Object.fromEntries(new FormData(form));
+    try { await request("sources", { method: "POST", idempotent: "source", body: values }); target.innerHTML = message("Disabled source definition created. It is not scheduled or trusted.", "success"); setTimeout(() => void renderSources(), 350); }
+    catch (error) { target.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
+  }
+
+  function mount(container, options = {}) {
+    if (!container) return;
+    state.root = container;
+    state.apiBase = String(options.apiBaseUrl || "/api").replace(/\/+$/, "");
+    if (!container.querySelector(".media-dashboard")) {
+      container.innerHTML = `<div class="media-dashboard"><section class="media-header"><h2>Media</h2><p>Editorial administration for authoritative UK AQ Media D1.</p><nav class="media-mini-nav" role="tablist" aria-label="Media sections">${TABS.map(tab => `<button type="button" data-media-tab="${tab}" role="tab" aria-selected="${tab === state.tab}" class="${tab === state.tab ? "is-active" : ""}">${TAB_LABELS[tab]}</button>`).join("")}</nav></section><div data-media-view></div></div>`;
+      container.querySelectorAll("[data-media-tab]").forEach(button => button.addEventListener("click", () => setTab(button.dataset.mediaTab)));
+    }
+    setTab(state.tab);
+  }
+
+  window.UKAQMediaDashboard = { mount, refresh: () => setTab(state.tab) };
+})();

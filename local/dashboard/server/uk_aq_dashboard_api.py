@@ -8,10 +8,12 @@ import os
 import re
 import sys
 from datetime import date, datetime, timedelta, timezone
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import uk_aq_dashboard_api_core as core
+from uk_aq_dashboard_media_proxy import is_media_path, proxy_media_request
 
 
 HIERARCHICAL_STATE_PREFIX_DEFAULT = "_ops/checkpoints/r2_history_backup_state_v2"
@@ -532,6 +534,34 @@ def _next_storage_coverage_refresh(now_utc: datetime) -> datetime:
 core._resolve_dropbox_state_path_info = _resolve_dropbox_state_path_info
 core._load_dropbox_backup_days = _load_dropbox_backup_days
 core._next_storage_coverage_refresh = _next_storage_coverage_refresh
+
+
+class MediaDashboardHandler(core.DashboardHandler):
+    """Adds the shared Media route family without changing existing dashboard handlers."""
+
+    def _serve_media(self, method: str) -> bool:
+        parsed = urlparse(self.path)
+        if not is_media_path(parsed.path):
+            return False
+        if not self._authorize_api_request():
+            return True
+        proxy_media_request(self, method)
+        return True
+
+    def do_GET(self) -> None:
+        if not self._serve_media("GET"):
+            super().do_GET()
+
+    def do_POST(self) -> None:
+        if not self._serve_media("POST"):
+            super().do_POST()
+
+    def do_PUT(self) -> None:
+        if not self._serve_media("PUT"):
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+
+core.DashboardHandler = MediaDashboardHandler
 
 if __name__ == "__main__":
     core.main()
