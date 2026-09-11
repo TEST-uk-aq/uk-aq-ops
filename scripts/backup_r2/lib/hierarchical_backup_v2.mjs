@@ -808,20 +808,17 @@ export function markLatestTimeseriesProcessed(stateRoot, inventoryUnit, copiedAt
   return stateRoot;
 }
 
-export function emptyHierarchicalStateRoot(
-  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
-  generation = null,
-) {
+export function emptyHierarchicalStateRoot(stateRootPrefix, generation) {
+  assertObservationHistoryGeneration(generation);
   const prefix = normalizeRelativePath(stateRootPrefix, "state root prefix");
-  if (generation) {
-    assertObservationHistoryGeneration(generation);
-    if (prefix !== generation.backup_state_prefix) throw new Error("Empty checkpoint prefix contradicts selected generation");
+  if (prefix !== generation.backup_state_prefix) {
+    throw new Error("Empty checkpoint prefix contradicts selected generation");
   }
   return {
     schema_version: HIERARCHICAL_STATE_SCHEMA_VERSION,
     kind: HIERARCHICAL_STATE_KIND,
     backup_version: "v2",
-    ...(generation ? { observation_generation: generation.version } : {}),
+    observation_generation: generation.version,
     observations: {
       processed_source_root_hash: null,
       years: [],
@@ -835,7 +832,7 @@ export function emptyHierarchicalStateRoot(
       },
       observations_timeseries_latest: {
         ...emptyLatestTimeseriesState(),
-        ...(generation ? { source_relative_path: generation.observations_timeseries_latest_key } : {}),
+        source_relative_path: generation.observations_timeseries_latest_key,
       },
     },
   };

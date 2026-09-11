@@ -15,6 +15,9 @@ import {
   rcloneLsjsonRecursive,
   runRclone,
 } from "./lib/rclone.mjs";
+import {
+  requireObservationsGlobalOperationLockContext,
+} from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 
 const LEGACY_CHECKPOINT_BASE = "_ops/checkpoints/r2_history_backup_state_v2";
 
@@ -24,6 +27,9 @@ export function legacyCheckpointPrefix(version) {
 }
 
 export function rewriteCheckpointRoot(root, generation, sourcePrefix) {
+  if (generation !== getObservationHistoryGeneration(generation?.version)) {
+    throw new Error("Migration requires an immutable shared observation generation");
+  }
   if (!root || typeof root !== "object" || Array.isArray(root) ||
       root.kind !== "uk_aq_r2_history_backup_state_v2_root" || root.backup_version !== "v2") {
     throw new Error("Legacy checkpoint root identity is invalid");
@@ -34,11 +40,25 @@ export function rewriteCheckpointRoot(root, generation, sourcePrefix) {
   if (generation.version === "v2" && root.observation_generation !== undefined && root.observation_generation !== "v2") {
     throw new Error("Legacy v2 checkpoint contradicts observation_generation v2");
   }
+  if (sourcePrefix !== legacyCheckpointPrefix(generation.version)) {
+    throw new Error("Legacy checkpoint source prefix contradicts selected generation");
+  }
   const sourceStart = `${sourcePrefix}/`;
   const destinationStart = `${generation.backup_state_prefix}/`;
-  const rewriteKey = (value, label) => {
-    if (typeof value !== "string" || !value.startsWith(sourceStart)) {
-      throw new Error(`${label} is outside the selected legacy checkpoint tree`);
+  const forbiddenPrefixes = [
+    `${LEGACY_CHECKPOINT_BASE}/observation_generation=v2/`,
+    `${LEGACY_CHECKPOINT_BASE}/observation_generation=v3/`,
+    ...(generation.version === "v2"
+      ? [`${LEGACY_CHECKPOINT_BASE}/generation=v3/`]
+      : []),
+  ];
+  const rewriteKey = (value, label, expectedRelativePrefix) => {
+    const segments = typeof value === "string" ? value.split("/") : [];
+    if (typeof value !== "string" || value !== value.trim() || value.startsWith("/") ||
+        value.endsWith("/") || value.includes("\\") || segments.some((part) => !part || part === "." || part === "..") ||
+        forbiddenPrefixes.some((prefix) => value.startsWith(prefix)) ||
+        !value.startsWith(`${sourceStart}${expectedRelativePrefix}`)) {
+      throw new Error(`${label} is outside the exact selected legacy namespace`);
     }
     return `${destinationStart}${value.slice(sourceStart.length)}`;
   };
@@ -46,19 +66,19 @@ export function rewriteCheckpointRoot(root, generation, sourcePrefix) {
   migrated.observation_generation = generation.version;
   for (const year of migrated.observations?.years || []) {
     for (const month of year.months || []) {
-      month.state_shard_key = rewriteKey(month.state_shard_key, "Observation month state shard");
+      month.state_shard_key = rewriteKey(month.state_shard_key, "Observation month state shard", "observations/");
     }
   }
   const globalKey = migrated.global_units?.observation_run_manifests?.state_shard_key;
-  migrated.global_units.observation_run_manifests.state_shard_key = rewriteKey(globalKey, "Run-manifest state shard");
+  migrated.global_units.observation_run_manifests.state_shard_key = rewriteKey(globalKey, "Run-manifest state shard", "global/");
   if (migrated.core?.state_shard_key) {
-    migrated.core.state_shard_key = rewriteKey(migrated.core.state_shard_key, "Core state shard");
+    migrated.core.state_shard_key = rewriteKey(migrated.core.state_shard_key, "Core state shard", "global/");
   }
   for (const range of migrated.timeseries_binding?.ranges || []) {
-    range.state_shard_key = rewriteKey(range.state_shard_key, "Binding state shard");
+    range.state_shard_key = rewriteKey(range.state_shard_key, "Binding state shard", "timeseries_binding/");
   }
   for (const range of migrated.timeseries_binding_packs?.ranges || []) {
-    range.state_shard_key = rewriteKey(range.state_shard_key, "Binding-pack state shard");
+    range.state_shard_key = rewriteKey(range.state_shard_key, "Binding-pack state shard", "timeseries_binding_packs/");
   }
   return migrated;
 }
@@ -89,8 +109,13 @@ function filters(version) {
     : ["--exclude", "/root.json"];
 }
 
-export function migrateHierarchicalCheckpoint({ dropboxRoot, version, rcloneBin = "rclone", apply = false }) {
+export function migrateHierarchicalCheckpoint({
+  dropboxRoot, version, rcloneBin = "rclone", apply = false, env = process.env,
+}) {
   const generation = getObservationHistoryGeneration(version);
+  if (apply) requireObservationsGlobalOperationLockContext({
+    env, expectedOwner: "r2_history_checkpoint_migration",
+  });
   const sourcePrefix = legacyCheckpointPrefix(version);
   const destinationPrefix = generation.backup_state_prefix;
   const source = joinTargetPath(dropboxRoot, sourcePrefix);

@@ -7,6 +7,7 @@ import * as arrow from "apache-arrow";
 import { parquetMetadata } from "hyparquet";
 import * as parquetWasm from "parquet-wasm/esm";
 
+import { getObservationHistoryGeneration } from "../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
   buildObservationHistoryIndexV3ChildShardKey,
   buildObservationHistoryIndexV3ScopedManifestKey,
@@ -745,7 +746,11 @@ async function buildFixture({
   monthState = completeObservationMonthState(monthState, monthInventory);
   const monthStateBody = Buffer.from(stableJson(monthState));
   backup.set(monthStateKey, monthStateBody);
-  const stateRoot = emptyHierarchicalStateRoot(statePrefix);
+  const v2Generation = getObservationHistoryGeneration("v2");
+  const stateRoot = emptyHierarchicalStateRoot(v2Generation.backup_state_prefix, v2Generation);
+  delete stateRoot.observation_generation;
+  stateRoot.global_units.observation_run_manifests.state_shard_key =
+    `${statePrefix}/global/observation_run_manifests.json`;
   upsertStateMonthSummary(stateRoot, {
     year: "2026",
     month: "01",

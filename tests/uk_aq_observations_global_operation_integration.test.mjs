@@ -308,7 +308,10 @@ test("backup child holds the coordinator context across inventory then sync", ()
     "--backup-report-out", "tmp/backup.json",
   ]);
   const calls = [];
-  const env = lockEnv("r2_history_dropbox_backup", "backup:test");
+  const env = {
+    ...lockEnv("r2_history_dropbox_backup", "backup:test"),
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+  };
   const result = runLockedHistoryBackup({
     args,
     env,
