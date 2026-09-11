@@ -18,6 +18,15 @@
     rejected: [["approved", "Approve", "approve"]],
     hidden: [["approved", "Restore / Unhide", "unhide"]],
   };
+  const AI_PREVIEW_MODES = ["desktop", "carousel", "mobile"];
+  const articleDetailCache = new Map();
+
+  function storedAiPreviewMode() {
+    try {
+      const mode = sessionStorage.getItem("media-ai-preview-mode");
+      return AI_PREVIEW_MODES.includes(mode) ? mode : "desktop";
+    } catch (_error) { return "desktop"; }
+  }
 
   const state = {
     root: null,
@@ -30,6 +39,7 @@
     articleHasMore: false,
     filters: { status: new Set(["approved"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" },
     aiState: "pending",
+    aiPreviewMode: storedAiPreviewMode(),
     aiCursor: null,
     runsCursor: null,
   };
@@ -45,6 +55,14 @@
     if (Number.isNaN(date.getTime())) return "—";
     return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric",
       hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Europe/London" }).format(date).replace(",", "");
+  }
+
+  function formatPublishedDate(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "long", year: "numeric",
+      timeZone: "Europe/London" }).format(date);
   }
 
   function duration(start, finish) {
@@ -427,11 +445,13 @@
       state.aiRows = rows; state.aiCursor = titles.page?.next_cursor || null;
       setView(`<section class="media-card"><h3>AI Titles</h3><p>Media’s local budget is enforced here; Cloudflare allowance values are estimates, not billing authority.</p><div class="media-stats">
         ${[[day.calculated_neurons_used, "Calculated neurons used today"], [day.media_daily_neuron_budget, "Media daily neuron budget"], [day.media_budget_remaining, "Media budget remaining"], [day.configured_cloudflare_free_allocation_neurons, "Configured Cloudflare free allowance"], [day.estimated_cloudflare_free_neurons_remaining, "Estimated Cloudflare allowance remaining"], [day.ai_requests, "Request count"], [day.ai_titles_attempted, "Titles attempted"], [day.titles_generated_successfully, "Titles generated"], [day.prompt_tokens, "Input tokens"], [day.completion_tokens, "Output tokens"], [day.outstanding_reserved_neurons, "Outstanding reserved neurons"]].map(([value, label]) => `<div class="media-stat"><strong>${esc(value ?? 0)}</strong><span>${esc(label)}</span></div>`).join("")}</div></section>
-        <section class="media-card"><div class="media-toolbar"><div class="media-mini-nav" role="tablist" aria-label="AI title state">${["pending", "accepted", "rejected"].map(value => `<button data-ai-state="${value}" class="${state.aiState === value ? "is-active" : ""}" aria-selected="${state.aiState === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div></div>
+        <section class="media-card media-ai-preview-mode--${state.aiPreviewMode}" data-ai-review-section><div class="media-toolbar media-ai-toolbar"><div class="media-mini-nav" role="tablist" aria-label="AI title state">${["pending", "accepted", "rejected"].map(value => `<button data-ai-state="${value}" class="${state.aiState === value ? "is-active" : ""}" aria-selected="${state.aiState === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div><div class="media-ai-preview-controls"><span class="media-ai-preview-controls__label" id="media-ai-preview-label">Preview</span><div class="media-mini-nav" role="group" aria-labelledby="media-ai-preview-label">${AI_PREVIEW_MODES.map(value => `<button type="button" data-ai-preview-mode="${value}" class="${state.aiPreviewMode === value ? "is-active" : ""}" aria-pressed="${state.aiPreviewMode === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div><span class="media-ai-carousel-note" title="Compact preview based on the current website card style; the public site does not yet have a separate carousel layout.">Carousel is a provisional compact card.</span></div></div>
         <div class="media-review-list">${rows.length ? rows.map(aiReviewRow).join("") : `<div class="media-empty">No ${esc(state.aiState)} AI titles.</div>`}</div>${titles.page?.has_more ? `<button class="media-button" data-load-more-ai>Load more</button>` : ""}</section>`);
       state.root.querySelectorAll("[data-ai-state]").forEach(button => button.addEventListener("click", () => { state.aiState = button.dataset.aiState; state.aiCursor = null; void renderAiTitles(false); }));
+      state.root.querySelectorAll("[data-ai-preview-mode]").forEach(button => button.addEventListener("click", () => setAiPreviewMode(button.dataset.aiPreviewMode)));
       state.root.querySelector("[data-load-more-ai]")?.addEventListener("click", () => void renderAiTitles(true));
       bindAiActions();
+      hydrateAiPreviewDetails();
     } catch (error) { setView(`<section class="media-card"><h3>AI Titles</h3>${message(error.message, "error")}</section>`); }
   }
 
@@ -439,11 +459,64 @@
     const pendingActions = row.ai_title_suggestion_state === "pending"
       ? `<button class="media-button media-button--primary" data-ai-action="accept-ai">Approve title</button><button class="media-button" data-ai-action="reject-ai">Use original / Reject</button>`
       : "";
-    return `<article class="media-review" data-ai-id="${row.id}"><strong>${esc(row.publisher)}</strong><span class="media-subtext">Generated ${esc(formatDate(row.ai_title_generated_at))} · Article ${esc(STATUS_LABELS[row.status] || row.status)}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(row.title)}</div><div class="media-review__title"><span>AI suggestion</span>${esc(row.ai_title_suggestion)}</div></div>
-      <div class="media-actions">${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(row.display_title || row.ai_title_suggestion || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save edit</button>${row.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message></div></article>`;
+    const published = formatPublishedDate(row.published_at);
+    const sourceRow = `${esc(row.publisher)}<span data-ai-preview-date>${published ? ` · ${esc(published)}` : ""}</span>`;
+    return `<article class="media-review" data-ai-id="${row.id}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website article card preview"><img class="media-site-preview__image" loading="lazy" src="${esc(apiUrl(`articles/${row.id}/image`))}" alt="" data-ai-preview-image><div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(row.ai_title_suggestion || row.title)}</div></div></div></div><div class="media-review__controls"><strong>${esc(row.publisher)}</strong><span class="media-subtext">Generated ${esc(formatDate(row.ai_title_generated_at))} · Article ${esc(STATUS_LABELS[row.status] || row.status)}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(row.title)}</div><div class="media-review__title"><span>AI suggestion</span>${esc(row.ai_title_suggestion)}</div></div>
+      <div class="media-actions">${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(row.display_title || row.ai_title_suggestion || "")}" data-ai-suggestion="${esc(row.ai_title_suggestion || row.title)}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save edit</button>${row.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message></div></div></div></article>`;
+  }
+
+  function setAiPreviewMode(mode) {
+    if (!AI_PREVIEW_MODES.includes(mode)) return;
+    state.aiPreviewMode = mode;
+    try { sessionStorage.setItem("media-ai-preview-mode", mode); } catch (_error) { /* Session persistence is optional. */ }
+    const section = state.root.querySelector("[data-ai-review-section]");
+    if (!section) return;
+    AI_PREVIEW_MODES.forEach(value => section.classList.toggle(`media-ai-preview-mode--${value}`, value === mode));
+    section.querySelectorAll("[data-ai-preview-mode]").forEach(button => {
+      const selected = button.dataset.aiPreviewMode === mode;
+      button.classList.toggle("is-active", selected);
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
+    });
+  }
+
+  async function hydrateAiPreviewDetail(row) {
+    const id = row.dataset.aiId;
+    if (!id || row.dataset.aiPublished === "true") return;
+    let detail = articleDetailCache.get(id);
+    if (!detail) {
+      detail = request(`articles/${id}`).then(data => data?.article || null).catch(() => null);
+      articleDetailCache.set(id, detail);
+    }
+    const article = await detail;
+    const published = formatPublishedDate(article?.published_at);
+    if (!published || !row.isConnected) return;
+    const date = row.querySelector("[data-ai-preview-date]");
+    if (date) date.textContent = ` · ${published}`;
+    row.dataset.aiPublished = "true";
+  }
+
+  function hydrateAiPreviewDetails() {
+    const rows = [...state.root.querySelectorAll("[data-ai-id]")];
+    const pending = rows.filter(row => row.dataset.aiPublished !== "true");
+    if (!("IntersectionObserver" in window)) {
+      pending.forEach(row => void hydrateAiPreviewDetail(row));
+      return;
+    }
+    const observer = new IntersectionObserver(entries => entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      observer.unobserve(entry.target);
+      void hydrateAiPreviewDetail(entry.target);
+    }), { rootMargin: "160px" });
+    pending.forEach(row => observer.observe(row));
   }
 
   function bindAiActions() {
+    state.root.querySelectorAll("[data-ai-edit]").forEach(input => input.addEventListener("input", () => {
+      const row = input.closest("[data-ai-id]");
+      const title = row?.querySelector("[data-ai-preview-title]");
+      if (title) title.textContent = input.value.trim() || input.dataset.aiSuggestion || "";
+    }));
+    state.root.querySelectorAll("[data-ai-preview-image]").forEach(image => image.addEventListener("error", () => image.remove(), { once: true }));
     state.root.querySelectorAll("[data-ai-action]").forEach(button => button.addEventListener("click", async () => {
       const row = button.closest("[data-ai-id]"); const id = row.dataset.aiId; const action = button.dataset.aiAction; const output = row.querySelector("[data-ai-message]");
       try {
