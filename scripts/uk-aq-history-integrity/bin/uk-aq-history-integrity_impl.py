@@ -24226,10 +24226,7 @@ def run_integrity_dropbox_currentness_gate(
             / "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
         ),
         "--dropbox-root", str(dropbox_root),
-        "--state-prefix", str(
-            env.get("UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX")
-            or "_ops/checkpoints/r2_history_backup_state_v2"
-        ),
+        "--observation-generation", "v2",
         "--observations-prefix", observations_prefix,
         "--timeseries-binding-backup-mode", timeseries_binding_backup_mode,
     ]

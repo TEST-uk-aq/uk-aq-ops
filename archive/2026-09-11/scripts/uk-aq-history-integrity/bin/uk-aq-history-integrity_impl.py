@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UK-AQ SOS-light v3 History Integrity — entrypoint.
+"""UK-AQ History Integrity — entrypoint.
 
 Phase 1: env loading, guardrails, schema, run row + report.
 Phase 2: core snapshot import from the local Dropbox R2 history backup.
@@ -127,8 +127,8 @@ DROPBOX_APP_ROOT = Path(
     "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks",
 )
 DEFAULT_R2_HISTORY_DROPBOX_DIR = "R2_history_backup"
-CURRENT_INTEGRITY_HISTORY_VERSION = "v3"
-CURRENT_INTEGRITY_CORE_PREFIX = "history/v3/core"
+CURRENT_INTEGRITY_HISTORY_VERSION = "v2"
+CURRENT_INTEGRITY_CORE_PREFIX = "history/v2/core"
 SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH = (
     "sos_light"
 )
@@ -1823,20 +1823,20 @@ def _build_lookup(conn: sqlite3.Connection, log: logging.Logger) -> int:
 
 def resolve_core_history_version_for_mode(history_version_mode: str) -> str:
     if str(history_version_mode or "").strip().lower() != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     return CURRENT_INTEGRITY_HISTORY_VERSION
 
 def resolve_core_snapshot_prefix(history_version: str, env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     if str(history_version or "").strip().lower() != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     prefix = _normalize_history_prefix(
         values.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX"),
         CURRENT_INTEGRITY_CORE_PREFIX,
     )
     if prefix != CURRENT_INTEGRITY_CORE_PREFIX:
         raise ValueError(
-            "UK_AQ_R2_HISTORY_V2_CORE_PREFIX must be history/v3/core for current history integrity",
+            "UK_AQ_R2_HISTORY_V2_CORE_PREFIX must be history/v2/core for current history integrity",
         )
     return prefix
 
@@ -1888,14 +1888,14 @@ def resolve_core_snapshot_root(
     values = os.environ if env is None else env
     version = str(history_version or "").strip().lower()
     if version != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     core_prefix = resolve_core_snapshot_prefix(version, values)
     explicit_root = str(values.get("UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT", "") or "").strip()
     if explicit_root:
         normalized = explicit_root.replace("\\", "/").rstrip("/")
         if not normalized.endswith(f"/{core_prefix}") and normalized != core_prefix:
             raise ValueError(
-                "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT must target history/v3/core; "
+                "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT must target history/v2/core; "
                 f"got {explicit_root}",
             )
         return explicit_root
@@ -5273,13 +5273,15 @@ def _planned_backfill_command(
     pollutants_csv = ",".join(selected_pollutants)
     iso = day.isoformat()
     wrapper_command = wrapper
-    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill_v3.sh":
+    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh":
         mode_arg = "--aqi-only" if output_scope == "aqilevels_only" else "--observs-only"
         cli_parts = [
             shlex.quote(wrapper),
             "--env",
             shlex.quote(str(env_name or env.get("UK_AQ_ENV_NAME") or os.environ.get("UK_AQ_ENV_NAME") or "<env unset>")),
             mode_arg,
+            "--history-version",
+            shlex.quote(str(history_version)),
             "--from-day",
             iso,
             "--to-day",
@@ -5311,7 +5313,7 @@ def _planned_backfill_command(
 
 def adapter_backfill_history_version(history_version_mode: str) -> str:
     if history_version_mode != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     return CURRENT_INTEGRITY_HISTORY_VERSION
 
 
@@ -5962,7 +5964,7 @@ def run_narrow_backfill(
 
     wrapper_name = Path(wrapper_path).name
     cmd = ["bash", wrapper_path]
-    if wrapper_name == "uk_aq_integrity_backfill_v3.sh":
+    if wrapper_name == "uk_aq_integrity_backfill.sh":
         for required_identity_key in (
             "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON",
             "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE",
@@ -6239,7 +6241,7 @@ def check_openaq(
                     _check_one_openaq_file_threadsafe,
                     db_path, env_name, base_url, loc, day,
                     tmp_dir, cache_root, log, limits,
-                    force_download_when_cache_missing=(history_version == CURRENT_INTEGRITY_HISTORY_VERSION),
+                    force_download_when_cache_missing=(history_version == "v2"),
                 ))
         total_tasks = len(futures)
         progress.update(
@@ -6314,7 +6316,7 @@ def check_openaq(
                     day_obj = dt.date.fromisoformat(result["day"])
                     connector_ids = (
                         _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                        if history_version == "v2"
                         else None
                     )
                     cmd = _planned_backfill_command(
@@ -6388,7 +6390,7 @@ def check_openaq(
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
             connector_ids = (
                 _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                if history_version == "v2"
                 else None
             )
             chunks = _chunk_timeseries_ids(union_ids)
@@ -7033,7 +7035,7 @@ def check_sensor_community(
                 _check_one_sc_file_threadsafe,
                 db_path, env_name, base_url, sensor_id, day, filename,
                 tmp_dir, cache_root, log, limits,
-                force_download_when_cache_missing=(history_version == CURRENT_INTEGRITY_HISTORY_VERSION),
+                force_download_when_cache_missing=(history_version == "v2"),
             ))
         total_tasks = len(futures)
         completed_tasks = 0
@@ -7108,7 +7110,7 @@ def check_sensor_community(
                     day_obj = dt.date.fromisoformat(result["day"])
                     connector_ids = (
                         _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                        if history_version == "v2"
                         else None
                     )
                     cmd = _planned_backfill_command(
@@ -7182,7 +7184,7 @@ def check_sensor_community(
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
             connector_ids = (
                 _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                if history_version == "v2"
                 else None
             )
             chunks = _chunk_timeseries_ids(union_ids)
@@ -8646,7 +8648,7 @@ def check_sos_flat_files(
 
     source_count_mapping_identity: str | None = None
     source_count_mapping_hash: str | None = None
-    if history_version == CURRENT_INTEGRITY_HISTORY_VERSION:
+    if history_version == "v2":
         connector_rows = conn.execute(
             """
             SELECT id FROM core_connectors_snapshot
@@ -8656,7 +8658,7 @@ def check_sos_flat_files(
         ).fetchall()
         if len(connector_rows) != 1:
             raise RuntimeError(
-                "fixed-v3 SOS annual-file processing requires exactly one imported "
+                "v2 SOS annual-file processing requires exactly one imported "
                 f"SOS connector; found={len(connector_rows)}"
             )
         bridge = _load_authoritative_sos_bridge_mapping(
@@ -8689,7 +8691,7 @@ def check_sos_flat_files(
     if not grouped_mappings:
         metrics["skipped_reason"] = (
             "no UK-AIR site_ref mappings in imported SOS bridge"
-            if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+            if history_version == "v2"
             else "no UK-AIR site_ref mappings returned from Supabase"
         )
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
@@ -9491,12 +9493,12 @@ R2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeserie
 R2_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly"
 R2_HISTORY_INDEX_PREFIX = "history/_index"
 R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations"
-R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v3"
-R2_HISTORY_V2_OBSERVATIONS_PREFIX = "history/v3/observations"
+R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v2"
+R2_HISTORY_V2_OBSERVATIONS_PREFIX = "history/v2/observations"
 R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data"
 R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug"
 R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = (
-    "history/_index_v3/observations_timeseries"
+    "history/_index_v2/observations_timeseries"
 )
 R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX = (
     "history/_index_v2/aqilevels_hourly_data_timeseries"
@@ -9580,7 +9582,7 @@ def resolve_history_version_mode(args: argparse.Namespace | None = None) -> str:
         ).strip().lower()
     if raw not in HISTORY_VERSION_CHOICES:
         raise ValueError(
-            "fixed SOS-light-v3 supports v3 only "
+            "current history integrity supports --history-version v2 only "
             f"(got {raw!r})",
         )
     return CURRENT_INTEGRITY_HISTORY_VERSION
@@ -9590,7 +9592,7 @@ def expand_history_versions(history_version_mode: str) -> list[str]:
     if history_version_mode == CURRENT_INTEGRITY_HISTORY_VERSION:
         return [CURRENT_INTEGRITY_HISTORY_VERSION]
     raise ValueError(
-        "fixed SOS-light-v3 supports history version v3 only "
+        "current history integrity supports history version v2 only "
         f"(got {history_version_mode!r})",
     )
 
@@ -9611,7 +9613,7 @@ def resolve_history_path_config(
         )
         aqilevels_index_prefix = _normalize_history_prefix(
             values.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX"),
-            R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX,
+            f"{index_prefix}/aqilevels_hourly_data_timeseries",
         )
         timeseries_binding_index_prefix = _normalize_history_prefix(
             values.get("UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX"),
@@ -9639,7 +9641,7 @@ def resolve_history_path_config(
                 "observations_timeseries_latest.json",
             ),
             aqilevels_latest_index_key=_append_json_name(
-                aqilevels_index_prefix.rsplit("/", 1)[0],
+                index_prefix,
                 "aqilevels_hourly_data_timeseries_latest.json",
             ),
             observations_partition_levels=("day_utc", "connector_id", "pollutant_code"),
@@ -9647,7 +9649,7 @@ def resolve_history_path_config(
             checks_implemented=True,
         )
     raise ValueError(
-        "fixed SOS-light-v3 supports history version v3 only "
+        "current history integrity supports history version v2 only "
         f"(got {history_version!r})",
     )
 
@@ -16476,12 +16478,14 @@ def _planned_aqi_rebuild_command(
     if connector_id is not None and int(connector_id) > 0:
         connector_scope = f"UK_AQ_BACKFILL_CONNECTOR_IDS={int(connector_id)} "
     wrapper_command = wrapper
-    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill_v3.sh":
+    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh":
         cli_parts = [
             shlex.quote(wrapper),
             "--env",
             shlex.quote(str(env_name or env.get("UK_AQ_ENV_NAME") or os.environ.get("UK_AQ_ENV_NAME") or "<env unset>")),
             "--aqi-only",
+            "--history-version",
+            shlex.quote(str(history_version)),
             "--from-day",
             iso,
             "--to-day",
@@ -16599,7 +16603,7 @@ def run_aqi_rebuild_backfill(
 
     wrapper_name = Path(wrapper_path).name
     cmd = ["bash", wrapper_path]
-    if wrapper_name == "uk_aq_integrity_backfill_v3.sh":
+    if wrapper_name == "uk_aq_integrity_backfill.sh":
         cmd = [
             "bash",
             wrapper_path,
@@ -19994,7 +19998,7 @@ def run_aqi_rebuild_queue_execution(
         if parsed_connector_id <= 0:
             metrics["aqi_rebuilds_skipped"] += 1
             continue
-        connector_scope = parsed_connector_id if history_version == CURRENT_INTEGRITY_HISTORY_VERSION else None
+        connector_scope = parsed_connector_id if history_version == "v2" else None
         by_key.setdefault((day_iso, connector_scope), []).append(row)
 
     metrics["aqi_rebuilds_queued_total"] = len(by_key)
@@ -20011,7 +20015,7 @@ def run_aqi_rebuild_queue_execution(
                 continue
             if connector_id <= 0:
                 continue
-            connector_scope = connector_id if history_version == CURRENT_INTEGRITY_HISTORY_VERSION else None
+            connector_scope = connector_id if history_version == "v2" else None
             seed_key = (day_iso, connector_scope)
             current = seed_by_key.get(seed_key)
             row_reasons = _parse_reason_tokens(",".join(str(v) for v in (row.get("reasons") or [])))
@@ -20183,7 +20187,7 @@ def run_aqi_rebuild_queue_execution(
         post_validation_gaps: list[dict[str, Any]] = []
         if (
             bf.get("status") == "ok"
-            and history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+            and history_version == "v2"
             and connector_scope is not None
             and not skip_stale_local_post_validation
             and (
@@ -20210,7 +20214,7 @@ def run_aqi_rebuild_queue_execution(
                 )]
         elif (
             bf.get("status") == "ok"
-            and history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+            and history_version == "v2"
             and connector_scope is not None
             and skip_stale_local_post_validation
         ):
@@ -22641,7 +22645,6 @@ def run_sos_timeseries_binding_verification(
         individual_root=individual_root,
         pack_root=pack_root,
         required_timeseries_ids=required_ids,
-        observation_generation="v3",
     ) as (view_root, mutable_audit):
         provider_audit = mutable_audit
         gaps = _validate_v2_timeseries_bindings(
@@ -22758,9 +22761,6 @@ def _verified_deleted_object_keys(
 
 MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1"
 PUBLICATION_SCHEDULE_CONTRACT_VERSION = "integrity-apply-publication-schedule-v1"
-SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT = (
-    "sos-light-v3-apply-persistence-v1"
-)
 
 
 def canonical_mutation_event_hash_input(event: Mapping[str, Any]) -> bytes:
@@ -22860,241 +22860,10 @@ def verify_publication_schedule(
     }
 
 
-def _verify_sos_light_v3_apply_persistence(
-    run_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    apply_summary = run_state.get("apply") or {}
-    persistence = apply_summary.get("persistence") or {}
-    journal_path = _resolve_run_scoped_apply_artifact(
-        run_state, persistence.get("mutation_journal_path")
-    )
-    body = journal_path.read_bytes()
-    expected_bytes = int(persistence.get("mutation_journal_bytes") or -1)
-    expected_sha256 = str(
-        persistence.get("mutation_journal_sha256") or ""
-    ).strip().lower()
-    if (
-        len(body) != expected_bytes
-        or hashlib.sha256(body).hexdigest() != expected_sha256
-    ):
-        raise ValueError(f"mutation journal identity mismatch: {journal_path}")
-    lines = [line for line in body.splitlines() if line]
-    if len(lines) != int(persistence.get("mutation_journal_event_count") or 0):
-        raise ValueError(
-            f"mutation journal event-count mismatch: {journal_path}"
-        )
-    run_id = str(run_state.get("run_id") or "")
-    previous_sha256: str | None = None
-    parsed_events: list[Mapping[str, Any]] = []
-    event_types: dict[str, int] = {}
-    publication_events: dict[int, list[Mapping[str, Any]]] = {}
-    publication_event_types = {
-        "put_started",
-        "put_completed",
-        "post_put_get_started",
-        "post_put_get_verified",
-        "put_or_verification_failed",
-    }
-    for line in lines:
-        event = json.loads(line.decode("utf-8"))
-        if not isinstance(event, Mapping):
-            raise ValueError("mutation journal event is not an object")
-        if str(event.get("run_id") or "") != run_id:
-            raise ValueError("mutation journal run identity mismatch")
-        if (
-            event.get("event_hash_contract_version")
-            != MUTATION_EVENT_HASH_CONTRACT_VERSION
-        ):
-            raise ValueError("unsupported legacy mutation journal contract")
-        if event.get("previous_event_sha256") != previous_sha256:
-            raise ValueError("mutation journal event-chain linkage mismatch")
-        event_sha256 = str(event.get("event_sha256") or "").strip().lower()
-        recomputed_sha256 = hashlib.sha256(
-            canonical_mutation_event_hash_input(event)
-        ).hexdigest()
-        if event_sha256 != recomputed_sha256:
-            raise ValueError("mutation journal event-hash mismatch")
-        previous_sha256 = recomputed_sha256
-        event_type = str(event.get("event_type") or "")
-        event_types[event_type] = event_types.get(event_type, 0) + 1
-        parsed_events.append(event)
-        if event_type in publication_event_types:
-            operation_id = int(event.get("operation_id") or 0)
-            if operation_id <= 0:
-                raise ValueError(
-                    "v3 publication event operation identity is invalid"
-                )
-            publication_events.setdefault(operation_id, []).append(event)
-    if (
-        previous_sha256
-        != persistence.get("mutation_journal_tail_event_sha256")
-    ):
-        raise ValueError("mutation journal event-chain tail mismatch")
-
-    evidence_entries = list(
-        apply_summary.get("v3_publication_evidence") or []
-    )
-    if apply_summary.get("status") == "succeeded":
-        if (
-            not parsed_events
-            or parsed_events[-1].get("event_type")
-            != "canonical_apply_completed"
-        ):
-            raise ValueError("v3 mutation journal completion is absent")
-        expected_event_sequence = [
-            "put_started",
-            "put_completed",
-            "post_put_get_started",
-            "post_put_get_verified",
-        ]
-        evidence_operation_ids: set[int] = set()
-        uploaded_count = 0
-        skipped_count = 0
-        for raw_evidence in evidence_entries:
-            if not isinstance(raw_evidence, Mapping):
-                raise ValueError("v3 publication evidence is invalid")
-            operation_id = int(raw_evidence.get("operation_id") or 0)
-            key = str(raw_evidence.get("object_key") or "")
-            sha256 = str(raw_evidence.get("sha256") or "").strip().lower()
-            byte_size = int(raw_evidence.get("bytes") or -1)
-            events = publication_events.get(operation_id) or []
-            if (
-                operation_id <= 0
-                or operation_id in evidence_operation_ids
-                or not key
-                or not re.fullmatch(r"[a-f0-9]{64}", sha256)
-                or byte_size < 0
-                or raw_evidence.get("r2_verified") is not True
-                or raw_evidence.get("durable") is not True
-                or int(
-                    raw_evidence.get("post_put_verification_get_count") or 0
-                )
-                != 1
-                or [str(event.get("event_type") or "") for event in events]
-                != expected_event_sequence
-                or any(
-                    str(event.get("canonical_key") or "") != key
-                    or str(event.get("sha256") or "") != sha256
-                    or int(event.get("byte_size") or -1) != byte_size
-                    for event in events
-                )
-            ):
-                raise ValueError(
-                    f"v3 publication evidence is incomplete: {key}"
-                )
-            uploaded = raw_evidence.get("uploaded") is True
-            skipped = raw_evidence.get("skipped_unchanged") is True
-            if uploaded == skipped:
-                raise ValueError(
-                    f"v3 publication disposition is contradictory: {key}"
-                )
-            uploaded_count += int(uploaded)
-            skipped_count += int(skipped)
-            evidence_operation_ids.add(operation_id)
-        if evidence_operation_ids != set(publication_events):
-            raise ValueError("v3 publication journal/evidence operations differ")
-        completed = len(evidence_entries)
-        if not (
-            completed
-            == int(apply_summary.get("completed_writes") or 0)
-            == int(
-                apply_summary.get("completed_post_put_verifications") or 0
-            )
-            == int(apply_summary.get("get_verified_writes") or 0)
-            and uploaded_count
-            == int(apply_summary.get("uploaded_writes") or 0)
-            and skipped_count
-            == int(apply_summary.get("skipped_unchanged_writes") or 0)
-        ):
-            raise ValueError("v3 publication evidence counts differ")
-        writer_result = apply_summary.get("canonical_v3_writer_result")
-        if (
-            not isinstance(writer_result, Mapping)
-            or writer_result.get("ok") is not True
-        ):
-            raise ValueError("canonical v3 writer result is absent")
-
-    sidecars: list[dict[str, Any]] = []
-    verified_deletions = 0
-    for raw_prefix in list(run_state.get("tombstone_prefixes") or []):
-        if not isinstance(raw_prefix, Mapping) or not raw_prefix.get("proposed"):
-            continue
-        if raw_prefix.get("deletion_verified") is not True:
-            if apply_summary.get("status") == "succeeded":
-                raise ValueError("successful v3 apply has unverified deletion")
-            continue
-        keys = _verified_deleted_object_keys(run_state, raw_prefix)
-        verified_deletions += 1
-        sidecars.append({
-            "prefix": str(raw_prefix.get("prefix") or ""),
-            "path": str(raw_prefix.get("deleted_keys_sidecar_path") or ""),
-            "bytes": int(raw_prefix.get("deleted_keys_sidecar_bytes") or 0),
-            "sha256": str(raw_prefix.get("deleted_keys_sha256") or ""),
-            "deleted_object_count": len(keys),
-        })
-    if (
-        len(sidecars)
-        != int(persistence.get("deleted_key_sidecar_count") or 0)
-    ):
-        raise ValueError("deleted-key sidecar-count mismatch")
-    if apply_summary.get("status") == "succeeded" and not (
-        verified_deletions
-        == int(apply_summary.get("completed_deletions") or 0)
-        == int(event_types.get("deletion_verified") or 0)
-    ):
-        raise ValueError("v3 deletion verification counts differ")
-
-    node_writes = int(
-        persistence.get("node_complete_run_state_write_count") or 0
-    )
-    coordinator_writes = int(
-        persistence.get("coordinator_complete_run_state_write_count") or 0
-    )
-    total_writes = int(
-        persistence.get("total_complete_run_state_write_count") or 0
-    )
-    if total_writes != node_writes + coordinator_writes:
-        raise ValueError("complete run-state write count mismatch")
-    if (
-        "complete_run_state_write_count" in persistence
-        and int(persistence.get("complete_run_state_write_count") or 0)
-        != total_writes
-    ):
-        raise ValueError(
-            "legacy complete run-state write count is not an exact total alias"
-        )
-    return {
-        "status": "verified",
-        "contract_version": SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT,
-        "mutation_journal_path": str(journal_path),
-        "mutation_journal_bytes": len(body),
-        "mutation_journal_sha256": expected_sha256,
-        "mutation_journal_event_count": len(lines),
-        "mutation_journal_tail_event_sha256": previous_sha256,
-        "event_type_counts": event_types,
-        "verified_publication_object_count": len(evidence_entries),
-        "deleted_key_sidecars": sidecars,
-        "compact_checkpoint_count": int(
-            persistence.get("compact_checkpoint_count") or 0
-        ),
-        "node_complete_run_state_write_count": node_writes,
-        "coordinator_complete_run_state_write_count": coordinator_writes,
-        "total_complete_run_state_write_count": total_writes,
-        "mutation_journal_flush_count": int(
-            persistence.get("mutation_journal_flush_count") or 0
-        ),
-    }
-
-
 def verify_apply_persistence_artifacts(
     run_state: Mapping[str, Any],
 ) -> dict[str, Any]:
     persistence = ((run_state.get("apply") or {}).get("persistence") or {})
-    if (
-        persistence.get("contract_version")
-        == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT
-    ):
-        return _verify_sos_light_v3_apply_persistence(run_state)
     journal_path_raw = persistence.get("mutation_journal_path")
     if not journal_path_raw:
         return {"status": "not_available", "reason": "mutation_journal_not_recorded"}
@@ -24210,7 +23979,7 @@ def run_canonical_apply_executor(
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
     command = [
         node_bin,
-        str(repo_root / "scripts/backup_r2/uk_aq_apply_sos_light_v3_proposal.mjs"),
+        str(repo_root / "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"),
         "--run-state-json", str(run_state["run_state_path"]),
         "--write-r2",
     ]
@@ -24457,7 +24226,10 @@ def run_integrity_dropbox_currentness_gate(
             / "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
         ),
         "--dropbox-root", str(dropbox_root),
-        "--observation-generation", "v3",
+        "--state-prefix", str(
+            env.get("UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX")
+            or "_ops/checkpoints/r2_history_backup_state_v2"
+        ),
         "--observations-prefix", observations_prefix,
         "--timeseries-binding-backup-mode", timeseries_binding_backup_mode,
     ]
@@ -26078,41 +25850,14 @@ def summarize_ordered_apply_verification(
         })
     written_keys: list[str] = []
     verification_evidence: list[dict[str, Any]] = []
-    persistence_contract = str(
-        ((run_state.get("apply") or {}).get("persistence") or {}).get(
-            "contract_version"
-        )
-        or ""
-    )
-    if persistence_contract == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT:
-        ordered_entries = [
-            (
-                str(entry.get("object_key") or ""),
-                {
-                    **dict(entry),
-                    "proposed": True,
-                },
-            )
-            for entry in list(
-                (run_state.get("apply") or {}).get(
-                    "v3_publication_evidence"
-                )
-                or []
-            )
-            if isinstance(entry, Mapping)
-        ]
-    else:
-        ordered_entries = sorted(
-            dict(run_state.get("objects") or {}).items()
-        )
-    for object_key, raw_entry in ordered_entries:
+    for object_key, raw_entry in sorted(dict(run_state.get("objects") or {}).items()):
         if not isinstance(raw_entry, Mapping) or not raw_entry.get("proposed"):
             continue
         entry = dict(raw_entry)
         get_count = int(entry.get("post_put_verification_get_count") or 0)
         evidence = {
             "object_key": object_key,
-            "bytes": entry.get("bytes", entry.get("byte_size")),
+            "bytes": entry.get("bytes"),
             "sha256": entry.get("sha256"),
             "uploaded": bool(entry.get("uploaded")),
             "r2_verified": bool(entry.get("r2_verified")),
@@ -26124,17 +25869,6 @@ def summarize_ordered_apply_verification(
             "final_live_sha256": entry.get("final_live_sha256"),
         }
         verification_evidence.append(evidence)
-        if persistence_contract == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT and (
-            evidence["r2_verified"]
-            and get_count == 1
-            and (
-                evidence["uploaded"]
-                or evidence["skipped_unchanged"]
-            )
-        ):
-            if evidence["uploaded"]:
-                written_keys.append(str(object_key))
-            continue
         if (
             evidence["delegated_global_latest_finalization"]
             and evidence["skipped_unchanged"]
@@ -27281,7 +27015,7 @@ def run_v2_integrity_repair_flow(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="uk-aq-history-integrity",
-        description="UK-AQ SOS-light v3 History Integrity entrypoint (Phase 1).",
+        description="UK-AQ History Integrity entrypoint (Phase 1).",
     )
     p.add_argument("--env", required=True, choices=["TEST", "LIVE"])
     p.add_argument(
@@ -27364,17 +27098,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=default_history_version,
         choices=list(HISTORY_VERSION_CHOICES),
         help=(
-            "Fixed SOS-light v3 history layout "
+            "R2 history layout version to check (v2 only) "
             f"(default {default_history_version!r}; env UK_AQ_R2_HISTORY_INTEGRITY_VERSION)."
         ),
     )
     p.add_argument(
         "--timeseries-binding-backup-mode",
         choices=["individual", "pack"],
-        default=None,
+        default="individual",
         help=(
-            "Physical Dropbox binding representation; fixed-v3 source=sos "
-            "owns pack mode and rejects individual mode."
+            "Physical Dropbox binding representation for source=sos "
+            "(default: individual)."
         ),
     )
     p.add_argument(
@@ -27422,12 +27156,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         )
     if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
         p.error("historical identity repair must remain disabled in LIVE")
-    if parsed.timeseries_binding_backup_mode is None:
-        parsed.timeseries_binding_backup_mode = (
-            "pack" if parsed.source == "sos" else "individual"
-        )
-    if parsed.source == "sos" and parsed.timeseries_binding_backup_mode != "pack":
-        p.error("fixed-v3 SOS-light source=sos requires packed Timeseries Binding backup state")
     if parsed.timeseries_binding_pack_root:
         pack_root = Path(parsed.timeseries_binding_pack_root)
         if parsed.timeseries_binding_backup_mode != "pack":
@@ -27497,11 +27225,7 @@ def select_sos_historical_replacement_route(
     requirements = {
         "source_sos": str(getattr(args, "source", "")) == "sos",
         "real_run_backfill": resolve_effective_mode(args) == "repair_apply",
-        "fixed_history_generation_v3": (
-            str(getattr(args, "history_version", ""))
-            == CURRENT_INTEGRITY_HISTORY_VERSION
-            == "v3"
-        ),
+        "history_version_v2": str(getattr(args, "history_version", "")) == "v2",
         "explicit_from_day": bool(str(getattr(args, "from_day", "") or "").strip()),
         "explicit_to_day": bool(str(getattr(args, "to_day", "") or "").strip()),
         "explicit_repair_pollutants": bool(
@@ -28586,7 +28310,7 @@ def collect_preflight_errors(
             )
 
         nested_wrapper = loaded_backfill_env.get("UK_AQ_BACKFILL_WRAPPER", "").strip()
-        wrapper_is_integrity = Path(wrapper_raw).name == "uk_aq_integrity_backfill_v3.sh" if wrapper_raw else False
+        wrapper_is_integrity = Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh" if wrapper_raw else False
         if wrapper_is_integrity and not nested_wrapper:
             errors.append(
                 "UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE is required when the integrity wrapper is used, but it is not set.",
@@ -29358,7 +29082,7 @@ def setup_logging(log_dir: str, run_compact: str, verbose: bool) -> Path:
 
 def format_summary_md(s: dict[str, Any]) -> str:
     lines = [
-        f"# UK-AQ SOS-light v3 History Integrity run — {s['env']} / {s['profile']}",
+        f"# UK-AQ History Integrity run — {s['env']} / {s['profile']}",
         "",
         f"- Started:   {s['started_at_utc']}",
         f"- Finished:  {s.get('finished_at_utc', '')}",
@@ -30454,9 +30178,6 @@ def main(argv: list[str]) -> int:
     history_version_mode = resolve_history_version_mode(args)
     checked_history_versions = expand_history_versions(history_version_mode)
     history_path_configs = resolve_history_path_configs(history_version_mode)
-    observation_history_config = history_path_configs[
-        CURRENT_INTEGRITY_HISTORY_VERSION
-    ]
     serialized_history_path_configs = serialize_history_path_configs(history_path_configs)
     site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_VERSION", "")).strip() or None
 
@@ -30582,7 +30303,7 @@ def main(argv: list[str]) -> int:
                 "daily profile cannot discover the latest R2 observations day: "
                 "UK_AQ_R2_HISTORY_DROPBOX_ROOT is unavailable"
             )
-        observations_prefix = observation_history_config.observations_data_prefix
+        observations_prefix = history_path_configs["v2"].observations_data_prefix
         try:
             observations_days = discover_observations_days(r2_history_root, observations_prefix)
         except Exception as exc:
@@ -30714,7 +30435,7 @@ def main(argv: list[str]) -> int:
         dropbox_currentness = run_integrity_dropbox_currentness_gate(
             env={**env, **os.environ},
             dropbox_root=dropbox_root,
-            observations_prefix=observation_history_config.observations_data_prefix,
+            observations_prefix=history_path_configs["v2"].observations_data_prefix,
             timeseries_binding_backup_mode=(
                 args.timeseries_binding_backup_mode
             ),
@@ -31018,18 +30739,14 @@ def main(argv: list[str]) -> int:
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
         )
-        # ``resolve_v2_source_scope`` is a legacy-named canonical core-snapshot
-        # helper, not a physical-v2 router.  Fixed-v3 SOS-light must preserve
-        # that authoritative connector/source mapping instead of falling back
-        # to a different lookup merely because its R2 generation is v3.
-        v3_allowed_connector_ids: set[int] | None = None
-        v3_source_scope = {"source": args.source, "connector_ids": None, "scope": "all"}
-        if snapshot_ok:
-            v3_allowed_connector_ids, v3_source_scope = resolve_v2_source_scope(conn, args.source)
-            log.info("fixed-v3 canonical source scope: %s", v3_source_scope)
+        v2_allowed_connector_ids: set[int] | None = None
+        v2_source_scope = {"source": args.source, "connector_ids": None, "scope": "all"}
+        if "v2" in checked_history_versions and snapshot_ok:
+            v2_allowed_connector_ids, v2_source_scope = resolve_v2_source_scope(conn, args.source)
+            log.info("v2 source scope: %s", v2_source_scope)
             sos_historical_route = select_sos_historical_replacement_route(
                 args,
-                mutation_connector_ids=v3_allowed_connector_ids,
+                mutation_connector_ids=v2_allowed_connector_ids,
                 protected_connector_ids=protected_connector_ids,
             )
             dedicated_sos_historical_replacement = bool(
@@ -31194,17 +30911,17 @@ def main(argv: list[str]) -> int:
                 r2_history_root = resolve_r2_history_root(os.environ)
                 v2_obs = run_v2_observations_integrity_checks(
                     r2_history_root=r2_history_root,
-                    config=observation_history_config,
+                    config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
                     selected_days=selected_day_values,
                     conn=conn,
                     env_name=args.env,
-                    allowed_connector_ids=v3_allowed_connector_ids,
-                    source_scope=v3_source_scope,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    source_scope=v2_source_scope,
                     log=log,
                     observation_total_connector_ids=(
-                        v3_source_scope.get("connector_ids") or []
+                        v2_source_scope.get("connector_ids") or []
                     ),
                     observation_total_pollutants=args.repair_pollutants,
                 )
@@ -31215,7 +30932,7 @@ def main(argv: list[str]) -> int:
                         run_compact=run_compact,
                         env=env,
                         v2_observations=v2_obs,
-                        source_scope=v3_source_scope,
+                        source_scope=v2_source_scope,
                         log=log,
                         repair_pollutants=args.repair_pollutants,
                         verified_first_value_at_scope_sink=(
@@ -31241,12 +30958,12 @@ def main(argv: list[str]) -> int:
             else:
                 v2_aqi = run_v2_aqilevels_integrity_checks(
                     r2_history_root=r2_history_root,
-                    config=observation_history_config,
+                    config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
                     selected_days=selected_day_values,
-                    allowed_connector_ids=v3_allowed_connector_ids,
-                    source_scope=v3_source_scope,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    source_scope=v2_source_scope,
                     conn=conn,
                     check_aqi_debug=bool(args.check_aqi_debug),
                     require_aqi_debug=bool(args.require_aqi_debug),
@@ -31256,7 +30973,7 @@ def main(argv: list[str]) -> int:
                 "ran": True,
                 "history_version": "v2",
                 "skipped_reason": None,
-                "source_scope": v3_source_scope,
+                "source_scope": v2_source_scope,
                 "v2_observations": v2_obs,
                 "observation_content_hash_checks": observation_hash_metrics,
                 "v2_aqilevels": v2_aqi,
@@ -31275,7 +30992,7 @@ def main(argv: list[str]) -> int:
             )
             sos_binding_verification = run_pack_mode_sos_timeseries_binding_verification(
                 conn=conn,
-                config=observation_history_config,
+                config=history_path_configs["v2"],
                 individual_root=individual_binding_root,
                 backup_mode=args.timeseries_binding_backup_mode,
                 pack_root=packed_binding_root,
@@ -31353,7 +31070,7 @@ def main(argv: list[str]) -> int:
                     dry_run=args.dry_run,
                     run_backfill=False,
                     log=log,
-                    allowed_connector_ids=v3_allowed_connector_ids,
+                    allowed_connector_ids=v2_allowed_connector_ids,
                     blocked_connector_days=observation_gap_keys,
                 )
             )
@@ -31484,12 +31201,12 @@ def main(argv: list[str]) -> int:
                     verified_first_value_at_connector_days
                 ),
                 v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
-                final_verification_config=observation_history_config,
+                final_verification_config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
                 selected_days=selected_day_values,
-                allowed_connector_ids=v3_allowed_connector_ids,
-                source_scope=v3_source_scope,
+                allowed_connector_ids=v2_allowed_connector_ids,
+                source_scope=v2_source_scope,
                 check_aqi_debug=bool(args.check_aqi_debug),
                 require_aqi_debug=bool(args.require_aqi_debug),
                 limits=limits,
@@ -32112,7 +31829,7 @@ def main(argv: list[str]) -> int:
         selected_total_connector_ids = (
             [1]
             if dedicated_sos_historical_replacement
-            else list(v3_source_scope.get("connector_ids") or [])
+            else list(v2_source_scope.get("connector_ids") or [])
         )
         connector_observation_totals = build_connector_observation_totals(
             successful_real_repair=bool(
@@ -32162,7 +31879,7 @@ def main(argv: list[str]) -> int:
             "checked_versions": checked_history_versions,
             "history_path_configs": serialized_history_path_configs,
             "history_version_results": history_version_results,
-            "source_scope": v3_source_scope,
+            "source_scope": v2_source_scope if "v2" in checked_history_versions else None,
             "requested_repair_pollutants": list(args.repair_pollutants),
             "site_read_version": site_read_version,
             "backfill_env_file": LAST_BACKFILL_ENV_LOAD_RESULT,

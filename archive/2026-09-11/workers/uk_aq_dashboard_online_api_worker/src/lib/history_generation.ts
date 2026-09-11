@@ -70,7 +70,7 @@ export async function resolveHistoryEnvironment(env: WorkerEnv): Promise<WorkerE
     observations_timeseries_latest_key: `history/_index_${version}/observations_timeseries_latest.json`,
     timeseries_binding_index_prefix: `history/_index_${version}/timeseries_binding`,
     core_prefix: `history/${version}/core`,
-    backup_state_prefix: `_ops/checkpoints/r2_history_backup_state_v2/observation_generation=${version}`,
+    backup_state_prefix: `_ops/checkpoints/r2_history_backup_state_v2${version === "v3" ? "/generation=v3" : ""}`,
     backup_inventory_prefix: `history/_index_${version}/backup_inventory_v2`,
     timeseries_binding_pack_prefix: `history/_backup_packs_v1/timeseries_binding${version === "v3" ? "/generation=v3" : ""}`,
   };

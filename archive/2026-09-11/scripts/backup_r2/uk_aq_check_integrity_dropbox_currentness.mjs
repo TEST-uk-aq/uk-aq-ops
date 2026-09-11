@@ -28,10 +28,9 @@ import {
 import {
   requireObservationsGlobalOperationLockContext,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
-import {
-  getObservationHistoryGeneration,
-} from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 
+const DEFAULT_STATE_PREFIX = "_ops/checkpoints/r2_history_backup_state_v2";
+const DEFAULT_OBSERVATIONS_PREFIX = "history/v2/observations";
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
 function normalizeRelativePath(value, label) {
@@ -55,9 +54,8 @@ function resolveBelow(root, relativePath) {
 function parseArgs(argv) {
   const args = {
     dropboxRoot: null,
-    observationGeneration: null,
-    statePrefix: null,
-    observationsPrefix: null,
+    statePrefix: DEFAULT_STATE_PREFIX,
+    observationsPrefix: DEFAULT_OBSERVATIONS_PREFIX,
     timeseriesBindingBackupMode: "individual",
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -68,7 +66,6 @@ function parseArgs(argv) {
       return next;
     };
     if (flag === "--dropbox-root") args.dropboxRoot = value();
-    else if (flag === "--observation-generation") args.observationGeneration = value();
     else if (flag === "--state-prefix") args.statePrefix = value();
     else if (flag === "--observations-prefix") args.observationsPrefix = value();
     else if (flag === "--timeseries-binding-backup-mode") {
@@ -77,10 +74,6 @@ function parseArgs(argv) {
     else throw new Error(`Unknown argument: ${flag}`);
   }
   if (!args.dropboxRoot) throw new Error("--dropbox-root is required");
-  const generation = getObservationHistoryGeneration(args.observationGeneration);
-  args.generation = generation;
-  args.statePrefix = args.statePrefix || generation.backup_state_prefix;
-  args.observationsPrefix = args.observationsPrefix || generation.observations_prefix;
   args.statePrefix = normalizeRelativePath(args.statePrefix, "state prefix");
   args.observationsPrefix = normalizeRelativePath(args.observationsPrefix, "observations prefix");
   args.timeseriesBindingBackupMode = normalizeTimeseriesBindingBackupMode(
@@ -90,9 +83,6 @@ function parseArgs(argv) {
     throw new Error(
       "Integrity timeseries binding backup mode must be individual or pack",
     );
-  }
-  if (args.statePrefix !== generation.backup_state_prefix || args.observationsPrefix !== generation.observations_prefix) {
-    throw new Error("Currentness paths contradict selected observation generation");
   }
   return Object.freeze(args);
 }
@@ -154,10 +144,8 @@ function requireCompleteCheckpoint(state, timeseriesBindingBackupMode) {
 
 export async function checkIntegrityDropboxCurrentness({
   dropboxRoot,
-  observationGeneration,
-  generation = getObservationHistoryGeneration(observationGeneration),
-  statePrefix = generation.backup_state_prefix,
-  observationsPrefix = generation.observations_prefix,
+  statePrefix = DEFAULT_STATE_PREFIX,
+  observationsPrefix = DEFAULT_OBSERVATIONS_PREFIX,
   timeseriesBindingBackupMode = "individual",
   env = process.env,
   getLiveRoot,
@@ -168,9 +156,6 @@ export async function checkIntegrityDropboxCurrentness({
     expectedOwner: "integrity",
   });
   if (!lock.valid) throw new Error("Integrity Dropbox currentness gate requires the held global lock");
-  if (statePrefix !== generation.backup_state_prefix || observationsPrefix !== generation.observations_prefix) {
-    throw new Error("Currentness paths contradict selected observation generation");
-  }
   const normalizedStatePrefix = normalizeRelativePath(statePrefix, "state prefix");
   const normalizedObservationsPrefix = normalizeRelativePath(observationsPrefix, "observations prefix");
   const normalizedBindingBackupMode = normalizeTimeseriesBindingBackupMode(
@@ -189,7 +174,7 @@ export async function checkIntegrityDropboxCurrentness({
   } catch (error) {
     throw new Error(`Dropbox checkpoint root is invalid JSON: ${checkpointPath}`, { cause: error });
   }
-  const checkpoint = validateHierarchicalStateRoot(checkpointRaw, normalizedStatePrefix, generation);
+  const checkpoint = validateHierarchicalStateRoot(checkpointRaw, normalizedStatePrefix);
   requireCompleteCheckpoint(checkpoint, normalizedBindingBackupMode);
 
   const liveRootKey = `${normalizedObservationsPrefix}/_manifests/manifest.json`;

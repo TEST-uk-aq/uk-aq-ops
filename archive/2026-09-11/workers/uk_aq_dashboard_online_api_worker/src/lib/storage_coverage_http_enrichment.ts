@@ -347,7 +347,7 @@ async function loadHierarchicalBackupDays(env: WorkerEnv): Promise<{
   try {
     const token = await fetchDropboxAccessToken(env);
     const rootPayload = await fetchDropboxJson(token, rootRemotePath);
-    if (rootPayload.observation_generation !== version) throw new Error("Dropbox checkpoint generation mismatch");
+    if ((rootPayload.observation_generation || "v2") !== version) throw new Error("Dropbox checkpoint generation mismatch");
     const refs = parseHierarchicalStateRoot(rootPayload);
     if (refs.some(ref => !ref.stateKey.startsWith(historyResolution(env).generation.backup_state_prefix + "/"))) throw new Error("Dropbox shard outside selected generation");
     const observations = new Set<string>();

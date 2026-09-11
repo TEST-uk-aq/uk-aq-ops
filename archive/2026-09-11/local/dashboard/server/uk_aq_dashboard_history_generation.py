@@ -58,7 +58,7 @@ def resolve_history_generation(*, force=False):
                 "observations_timeseries_index_prefix": f"history/_index_{version}/observations_timeseries",
                 "observations_timeseries_latest_key": f"history/_index_{version}/observations_timeseries_latest.json",
                 "backup_inventory_prefix": f"history/_index_{version}/backup_inventory_v2",
-                "backup_state_prefix": f"_ops/checkpoints/r2_history_backup_state_v2/observation_generation={version}",
+                "backup_state_prefix": "_ops/checkpoints/r2_history_backup_state_v2" + ("/generation=v3" if version == "v3" else ""),
             }
             if any(g.get(k) != value for k, value in expected.items()):
                 raise ValueError("descriptor paths")

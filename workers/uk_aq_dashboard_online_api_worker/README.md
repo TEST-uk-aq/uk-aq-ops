@@ -100,7 +100,7 @@ Optional direct-mode data sources:
 - `UK_AQ_R2_HISTORY_COUNTS_API_TOKEN`
 - `UK_AQ_OBSERVS_HISTORY_R2_API_URL` and `UK_AQ_OBSERVS_HISTORY_R2_API_TOKEN`: stable service authority; the workflow maps the existing upstream secret. History selection uses `/v1/history-generation`, accepts v2/v3, and ignores the dashboard history-version environment snapshot.
 - `UK_AQ_AQI_HISTORY_R2_API_URL` and `UK_AQ_AQI_HISTORY_R2_API_TOKEN`: optional legacy-v2 calculated AQI history source; the workflow maps the existing upstream secret.
-- `UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX` (optional; defaults to `_ops/checkpoints/r2_history_backup_state_v2`; coverage reads `root.json` and its observation month shards)
+- `UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX` (optional; routing comes from the selected generation descriptor under `_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2|v3`; coverage reads `root.json` and its observation month shards)
 - `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` or `CLOUDFLARE_ACCOUNT_ID`
 - `UK_AQ_R2_CLOUDFLARE_API_TOKEN` or `CFLARE_API_READ_TOKEN`
 - Dropbox optional fields (`DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN`) for `/api/operations_dropbox_mtime`

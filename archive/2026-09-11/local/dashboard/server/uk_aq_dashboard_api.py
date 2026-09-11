@@ -112,7 +112,7 @@ def _hierarchical_state_month_refs(
         return [], "Hierarchical Dropbox state root identity mismatch"
 
     version = core._resolve_r2_history_read_version()["version"]
-    if raw_root.get("observation_generation") != version:
+    if raw_root.get("observation_generation", "v2") != version:
         return [], "Hierarchical Dropbox state generation mismatch"
     observations = raw_root.get("observations")
     if not isinstance(observations, dict):

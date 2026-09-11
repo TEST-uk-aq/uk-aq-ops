@@ -809,7 +809,7 @@ export function markLatestTimeseriesProcessed(stateRoot, inventoryUnit, copiedAt
 }
 
 export function emptyHierarchicalStateRoot(
-  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
+  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2",
   generation = null,
 ) {
   const prefix = normalizeRelativePath(stateRootPrefix, "state root prefix");
@@ -821,7 +821,7 @@ export function emptyHierarchicalStateRoot(
     schema_version: HIERARCHICAL_STATE_SCHEMA_VERSION,
     kind: HIERARCHICAL_STATE_KIND,
     backup_version: "v2",
-    ...(generation ? { observation_generation: generation.version } : {}),
+    ...(generation?.version === "v3" ? { observation_generation: "v3" } : {}),
     observations: {
       processed_source_root_hash: null,
       years: [],
@@ -843,17 +843,14 @@ export function emptyHierarchicalStateRoot(
 
 export function validateHierarchicalStateRoot(
   root,
-  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
-  generation = null,
+  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2",
 ) {
-  if (generation) assertObservationHistoryGeneration(generation);
-  if (!root) return emptyHierarchicalStateRoot(stateRootPrefix, generation);
+  if (!root) return emptyHierarchicalStateRoot(stateRootPrefix);
   const value = assertObject(root, "hierarchical state root");
   if (Number(value.schema_version) !== HIERARCHICAL_STATE_SCHEMA_VERSION) {
     throw new Error("Hierarchical state root schema_version mismatch");
   }
-  if (value.kind !== HIERARCHICAL_STATE_KIND || value.backup_version !== "v2" ||
-      (generation && value.observation_generation !== generation.version)) {
+  if (value.kind !== HIERARCHICAL_STATE_KIND || value.backup_version !== "v2") {
     throw new Error("Hierarchical state root identity mismatch");
   }
   const observations = assertObject(value.observations, "state observations");
@@ -1018,7 +1015,8 @@ export function stateMonthEntry(stateRoot, year, month) {
 // Runtime backup admission only; historical migration evidence keeps its own verifier.
 export function assertSelectedBackupInventory(generation, root) {
   assertObservationHistoryGeneration(generation);
-  if (root.observation_generation !== generation.version ||
+  if ((root.observation_generation !== undefined && root.observation_generation !== generation.version) ||
+      (generation.version === "v3" && root.observation_generation !== "v3") ||
       root.observations.source_root_manifest_key !== generation.observations_root_key ||
       root.global_units.observations_timeseries_latest?.relative_path !== generation.observations_timeseries_latest_key ||
       root.core?.source_prefix !== generation.core_prefix ||
@@ -1050,7 +1048,8 @@ export function assertSelectedBackupInventory(generation, root) {
 
 export function assertSelectedBackupState(generation, root) {
   assertObservationHistoryGeneration(generation);
-  if (root.observation_generation !== generation.version) {
+  if ((root.observation_generation !== undefined && root.observation_generation !== generation.version) ||
+      (generation.version === "v3" && root.observation_generation !== "v3")) {
     throw new Error("Dropbox checkpoint contradicts selected generation");
   }
   const stateKey = (key) => assertObservationHistoryGenerationKey(generation, key, "backup_state");

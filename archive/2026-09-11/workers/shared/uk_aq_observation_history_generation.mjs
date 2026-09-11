@@ -15,7 +15,7 @@ const GENERATIONS = Object.freeze(Object.fromEntries(["v2", "v3"].map((version) 
     timeseries_binding_index_prefix: `${indexes}/timeseries_binding`,
     core_prefix: `history/${version}/core`,
     backup_inventory_prefix: `${indexes}/backup_inventory_v2`,
-    backup_state_prefix: `_ops/checkpoints/r2_history_backup_state_v2/observation_generation=${version}`,
+    backup_state_prefix: `_ops/checkpoints/r2_history_backup_state_v2${version === "v3" ? "/generation=v3" : ""}`,
     timeseries_binding_pack_prefix: `history/_backup_packs_v1/timeseries_binding${version === "v3" ? "/generation=v3" : ""}`,
   })];
 })));
