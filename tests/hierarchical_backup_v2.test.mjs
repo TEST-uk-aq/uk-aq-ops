@@ -20,7 +20,9 @@ import {
   validateLatestTimeseriesState,
   validateObservationMonthState,
 } from "../scripts/backup_r2/lib/hierarchical_backup_v2.mjs";
+import { getObservationHistoryGeneration } from "../workers/shared/uk_aq_observation_history_generation.mjs";
 
+const V2_GENERATION = getObservationHistoryGeneration("v2");
 const h = (char) => char.repeat(64);
 
 test("latest-timeseries backup path follows explicit v2/v3 authority", () => {
@@ -138,7 +140,7 @@ test("inventory and state shard paths are stable", () => {
 });
 
 test("root state is updated only after the month shard identity exists", () => {
-  const root = emptyHierarchicalStateRoot();
+  const root = emptyHierarchicalStateRoot(V2_GENERATION.backup_state_prefix, V2_GENERATION);
   upsertStateMonthSummary(root, {
     year: "2026",
     month: "08",
@@ -156,7 +158,7 @@ test("root state is updated only after the month shard identity exists", () => {
 });
 
 test("latest-timeseries state advances only through verified completion", () => {
-  const root = emptyHierarchicalStateRoot();
+  const root = emptyHierarchicalStateRoot(V2_GENERATION.backup_state_prefix, V2_GENERATION);
   assert.equal(
     validateLatestTimeseriesState(
       root.global_units.observations_timeseries_latest,
@@ -178,7 +180,7 @@ test("latest-timeseries state advances only through verified completion", () => 
 });
 
 test("v2 and v3 latest state identities cannot satisfy each other", () => {
-  const root = emptyHierarchicalStateRoot();
+  const root = emptyHierarchicalStateRoot(V2_GENERATION.backup_state_prefix, V2_GENERATION);
   markLatestTimeseriesProcessed(root, {
     relative_path: resolveObservationsTimeseriesLatestPath("v2"),
     sha256: h("e"),

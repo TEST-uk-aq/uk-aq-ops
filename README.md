@@ -296,7 +296,8 @@ node scripts/backup_r2/sync_history_to_dropbox.mjs \
 Notes:
 - The current inventory root is `history/_index_v2/backup_inventory_v2/root.json`.
 - The current Dropbox checkpoint root is
-  `_ops/checkpoints/r2_history_backup_state_v2/root.json`.
+  `_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2/root.json`
+  or `.../observation_generation=v3/root.json`, selected by the observation generation.
 - In-scope data includes v2 observations, observation run manifests,
   timeseries bindings, `observations_timeseries_latest.json`, and core.
 - AQI history and the derived `history/_index_v2/observations_timeseries/`

@@ -1318,7 +1318,7 @@ async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
   }
   try {
     const root = await fetchDropboxJson(token, remotePath);
-    if (root.observation_generation !== historyResolution(env).version) throw new Error("Dropbox checkpoint generation mismatch");
+    if ((root.observation_generation || "v2") !== historyResolution(env).version) throw new Error("Dropbox checkpoint generation mismatch");
     const references = parseHierarchicalStateMonthReferences(root);
     if (references.some(ref => !ref.stateKey.startsWith(historyResolution(env).generation.backup_state_prefix + "/"))) throw new Error("Dropbox shard outside selected generation");
     const days = emptyDays();

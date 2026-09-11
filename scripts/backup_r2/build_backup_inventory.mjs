@@ -588,7 +588,7 @@ async function main() {
     root.timeseries_binding_packs = bindingPackInventory.root_reference;
   }
   root.core = coreInventory.root_reference;
-  if (args.history_index_version === "v3") root.observation_generation = "v3";
+  root.observation_generation = generation.version;
   assertSelectedBackupInventory(resolveObservationHistoryGeneration(process.env), root);
   const rootWrite = writeRemoteJson(
     args.rclone_bin,

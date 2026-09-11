@@ -69,7 +69,7 @@ const DEFAULT_INVENTORY_ROOT_PREFIX = String(
 ).trim().replace(/^\/+|\/+$/g, "");
 const DEFAULT_STATE_ROOT_PREFIX = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
-  || "_ops/checkpoints/r2_history_backup_state_v2",
+  || "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
 ).trim().replace(/^\/+|\/+$/g, "");
 const DEFAULT_REPORT_OUT = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_SYNC_REPORT_OUT || "",
@@ -772,10 +772,11 @@ async function main() {
   let stateRoot = validateHierarchicalStateRoot(
     existingStateResult?.parsed || emptyHierarchicalStateRoot(args.state_root_prefix, generation),
     args.state_root_prefix,
+    generation,
   );
 
   assertSelectedBackupState(generation, stateRoot);
-  if (generation.version === "v3") stateRoot.observation_generation = "v3";
+  stateRoot.observation_generation = generation.version;
 
   const report = {
     ok: true,

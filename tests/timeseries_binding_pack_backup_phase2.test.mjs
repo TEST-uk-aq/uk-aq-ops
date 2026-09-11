@@ -44,7 +44,8 @@ import {
 
 const BINDING_PREFIX = "history/_index_v2/timeseries_binding";
 const PACK_PREFIX = "history/_backup_packs_v1/timeseries_binding";
-const STATE_PREFIX = "_ops/checkpoints/r2_history_backup_state_v2";
+const V2_GENERATION = getObservationHistoryGeneration("v2");
+const STATE_PREFIX = V2_GENERATION.backup_state_prefix;
 const h = (character) => character.repeat(64);
 
 function makePackInventory() {
@@ -119,7 +120,7 @@ function makePackInventory() {
   };
 }
 
-function makeHarness({ inventoryRoot, stateRoot = emptyHierarchicalStateRoot() } = {}) {
+function makeHarness({ inventoryRoot, stateRoot = emptyHierarchicalStateRoot(V2_GENERATION.backup_state_prefix, V2_GENERATION) } = {}) {
   const inventory = inventoryRoot.timeseries_binding_packs;
   const stateFiles = new Map();
   const copies = [];
@@ -566,7 +567,7 @@ test("a wrong root with all healthy children checks all children and recopies on
 
 test("one changed range transfers one immutable pack plus root and retains unchanged pack state", () => {
   const fixture = makePackInventory();
-  const stateRoot = emptyHierarchicalStateRoot();
+  const stateRoot = emptyHierarchicalStateRoot(V2_GENERATION.backup_state_prefix, V2_GENERATION);
   const first = makeHarness({ inventoryRoot: fixture.inventoryRoot, stateRoot });
   first.run();
   const changed = structuredClone(fixture.inventoryRoot);

@@ -158,7 +158,8 @@ async function readBackupInventory(r2, version) {
       payload.kind !== "uk_aq_r2_history_backup_inventory_v2_root"
       || payload.backup_version !== "v2"
       || !Array.isArray(payload.observations?.years)
-      || payload.observation_generation !== version
+      || (version === "v3" && payload.observation_generation !== "v3")
+      || (version === "v2" && payload.observation_generation === "v3")
     ) {
       throw new Error(`Hierarchical ${version} observation backup inventory root identity is invalid`);
     }

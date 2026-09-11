@@ -31,6 +31,7 @@ import {
 import {
   emptyHierarchicalStateRoot,
 } from "../scripts/backup_r2/lib/hierarchical_backup_v2.mjs";
+import { getObservationHistoryGeneration } from "../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
   TIMESERIES_BINDING_PACK_ROOT_STATE_KIND,
 } from "../scripts/backup_r2/lib/hierarchical_timeseries_binding_pack_sync_v1.mjs";
@@ -108,7 +109,10 @@ async function startLifecycleFixture(t) {
 }
 
 function completeCheckpoint(rootHash) {
-  const state = emptyHierarchicalStateRoot();
+  const state = emptyHierarchicalStateRoot(
+    "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
+    getObservationHistoryGeneration("v2"),
+  );
   state.observations = {
     processed_source_root_hash: rootHash,
     years: [{
@@ -116,14 +120,14 @@ function completeCheckpoint(rootHash) {
       processed_source_year_hash: h("b"),
       months: [{
         month: "08",
-        state_shard_key: "_ops/checkpoints/r2_history_backup_state_v2/observations/year=2026/month=08.json",
+        state_shard_key: "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2/observations/year=2026/month=08.json",
         processed_source_month_hash: h("c"),
         state_shard_hash: h("d"),
       }],
     }],
   };
   state.global_units.observation_run_manifests = {
-    state_shard_key: "_ops/checkpoints/r2_history_backup_state_v2/global/observation_run_manifests.json",
+    state_shard_key: "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2/global/observation_run_manifests.json",
     processed_source_hash: h("e"),
     state_shard_hash: h("f"),
   };
@@ -135,7 +139,7 @@ function completeCheckpoint(rootHash) {
     verified: true,
   };
   state.core = {
-    state_shard_key: "_ops/checkpoints/r2_history_backup_state_v2/global/core.json",
+    state_shard_key: "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2/global/core.json",
     processed_source_hash: h("1"),
     state_shard_hash: h("3"),
   };
@@ -167,7 +171,7 @@ function completePackCheckpoint(rootHash) {
       range_start: 0,
       range_end: 999,
       state_shard_key:
-        "_ops/checkpoints/r2_history_backup_state_v2/"
+        "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2/"
         + "timeseries_binding_packs/range=000000-000999.json",
       processed_source_range_hash: h("6"),
       pack_relative_path:
@@ -187,7 +191,7 @@ test("Integrity currentness gate runs under the global lock and blocks a stale c
   t.after(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }));
   const stateDirectory = path.join(
     temporaryRoot,
-    "_ops/checkpoints/r2_history_backup_state_v2",
+    "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
   );
   fs.mkdirSync(stateDirectory, { recursive: true });
   const liveRoot = buildR2HistoryV2ObservationsRootManifest({
@@ -203,6 +207,7 @@ test("Integrity currentness gate runs under the global lock and blocks a stale c
   const getLiveRoot = async () => ({ body: Buffer.from(JSON.stringify(liveRoot)), bytes: 456 });
   const current = await checkIntegrityDropboxCurrentness({
     dropboxRoot: temporaryRoot,
+    observationGeneration: "v2",
     getLiveRoot,
     lockContext: { valid: true, owner: "integrity", run_id: "integrity:test" },
   });
@@ -217,6 +222,7 @@ test("Integrity currentness gate runs under the global lock and blocks a stale c
   await assert.rejects(
     checkIntegrityDropboxCurrentness({
       dropboxRoot: temporaryRoot,
+      observationGeneration: "v2",
       getLiveRoot,
       lockContext: { valid: true, owner: "integrity", run_id: "integrity:test" },
     }),
@@ -230,7 +236,7 @@ test("Integrity currentness gate requires the explicitly selected binding repres
   t.after(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }));
   const stateDirectory = path.join(
     temporaryRoot,
-    "_ops/checkpoints/r2_history_backup_state_v2",
+    "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
   );
   fs.mkdirSync(stateDirectory, { recursive: true });
   const checkpointPath = path.join(stateDirectory, "root.json");
@@ -249,6 +255,7 @@ test("Integrity currentness gate requires the explicitly selected binding repres
   const check = (timeseriesBindingBackupMode) =>
     checkIntegrityDropboxCurrentness({
       dropboxRoot: temporaryRoot,
+      observationGeneration: "v2",
       timeseriesBindingBackupMode,
       getLiveRoot,
       lockContext: { valid: true, owner: "integrity", run_id: "integrity:test" },
@@ -296,12 +303,15 @@ test("backup child holds the coordinator context across inventory then sync", ()
     "--timeseries-binding-prefix", "history/_index_v2/timeseries_binding",
     "--history-index-version", "v2",
     "--inventory-root-prefix", "history/_index_v2/backup_inventory_v2",
-    "--state-root-prefix", "_ops/checkpoints/r2_history_backup_state_v2",
+    "--state-root-prefix", "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
     "--inventory-report-out", "tmp/inventory.json",
     "--backup-report-out", "tmp/backup.json",
   ]);
   const calls = [];
-  const env = lockEnv("r2_history_dropbox_backup", "backup:test");
+  const env = {
+    ...lockEnv("r2_history_dropbox_backup", "backup:test"),
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+  };
   const result = runLockedHistoryBackup({
     args,
     env,

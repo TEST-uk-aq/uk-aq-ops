@@ -28,7 +28,7 @@ import {
 export const TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX =
   "history/_index_v2/timeseries_binding";
 export const TIMESERIES_BINDING_RESTORE_STATE_PREFIX =
-  "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2";
+  "_ops/checkpoints/r2_history_backup_state_v2";
 export const TIMESERIES_BINDING_RESTORE_STATE_ROOT_KEY =
   `${TIMESERIES_BINDING_RESTORE_STATE_PREFIX}/root.json`;
 export const TIMESERIES_BINDING_RESTORE_PACK_ROOT_KEY =
@@ -275,7 +275,8 @@ export async function restoreTimeseriesBindingPacksToR2({
       parseJsonBytes(checkpointBody, "Dropbox hierarchical checkpoint root"),
       "Dropbox hierarchical checkpoint root",
     );
-    if (checkpointRaw.observation_generation !== generation.version) throw new Error("Pack checkpoint contradicts selected generation");
+    if ((checkpointRaw.observation_generation !== undefined && checkpointRaw.observation_generation !== generation.version) ||
+        (generation.version === "v3" && checkpointRaw.observation_generation !== "v3")) throw new Error("Pack checkpoint contradicts selected generation");
     const rawPackState = requireObject(
       checkpointRaw.timeseries_binding_packs,
       "Dropbox timeseries binding pack checkpoint root",
@@ -301,7 +302,6 @@ export async function restoreTimeseriesBindingPacksToR2({
     const checkpoint = validateHierarchicalStateRoot(
       checkpointRaw,
       generation.backup_state_prefix,
-      generation,
     );
     const packState = normalizeTimeseriesBindingPackRootState(checkpoint);
     requireCanonicalJsonBytes(

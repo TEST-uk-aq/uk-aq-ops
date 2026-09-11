@@ -21,7 +21,7 @@ from typing import Any, Iterator, Mapping
 BINDING_PREFIX = "history/_index_v2/timeseries_binding"
 PACK_PREFIX = "history/_backup_packs_v1/timeseries_binding"
 PACK_ROOT_PATH = f"{PACK_PREFIX}/root.json"
-STATE_ROOT_PREFIX = "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2"
+STATE_ROOT_PREFIX = "_ops/checkpoints/r2_history_backup_state_v2"
 STATE_ROOT_PATH = f"{STATE_ROOT_PREFIX}/root.json"
 RANGE_SIZE = 1_000
 
@@ -136,9 +136,7 @@ def _safe_local_file(root: Path, relative_path: str, label: str) -> Path:
     return resolved
 
 
-def _validate_root(
-    root: Mapping[str, Any], binding_prefix: str, pack_prefix: str
-) -> dict[str, Any]:
+def _validate_root(root: Mapping[str, Any]) -> dict[str, Any]:
     if (
         root.get("schema_version") != 1
         or root.get("kind") != PACK_ROOT_KIND
@@ -147,7 +145,7 @@ def _validate_root(
     ):
         raise PackedBindingError("packed binding root identity mismatch")
     source_prefix = _relative_path(root.get("source_prefix"), "source_prefix")
-    if source_prefix != binding_prefix:
+    if source_prefix != BINDING_PREFIX:
         raise PackedBindingError("packed binding root source_prefix mismatch")
     source_root_key = _relative_path(root.get("source_root_key"), "source_root_key")
     if source_root_key != f"{source_prefix}/_manifests/root.json":
@@ -172,7 +170,7 @@ def _validate_root(
             raw_range.get("pack_relative_path"), f"range {start} pack_relative_path"
         )
         expected_path = (
-            f"{pack_prefix}/{_range_key(start, end)}/{source_range_hash}.pack.json"
+            f"{PACK_PREFIX}/{_range_key(start, end)}/{source_range_hash}.pack.json"
         )
         if pack_path != expected_path:
             raise PackedBindingError(f"range {start} pack_relative_path mismatch")
@@ -215,15 +213,11 @@ def _validate_checkpoint_state(
     state_root: Mapping[str, Any],
     root_info: Mapping[str, Any],
     root_body: bytes,
-    observation_generation: str,
-    pack_root_path: str,
-    state_root_prefix: str,
 ) -> None:
     if (
         state_root.get("schema_version") != 1
         or state_root.get("kind") != STATE_ROOT_KIND
         or state_root.get("backup_version") != "v2"
-        or state_root.get("observation_generation") != observation_generation
     ):
         raise PackedBindingError("hierarchical checkpoint state root identity mismatch")
     pack_state = state_root.get("timeseries_binding_packs")
@@ -255,7 +249,7 @@ def _validate_checkpoint_state(
     if _relative_path(
         pack_state.get("pack_root_relative_path"),
         "checkpoint pack_root_relative_path",
-    ) != pack_root_path:
+    ) != PACK_ROOT_PATH:
         raise PackedBindingError("checkpoint pack root path mismatch")
     if _require_int(
         pack_state.get("pack_root_size"), "checkpoint pack_root_size", positive=True
@@ -275,7 +269,7 @@ def _validate_checkpoint_state(
             raise PackedBindingError(f"duplicate checkpoint range {start}")
         by_start[start] = raw
         expected_shard = (
-            f"{state_root_prefix}/timeseries_binding_packs/{_range_key(start, end)}.json"
+            f"{STATE_ROOT_PREFIX}/timeseries_binding_packs/{_range_key(start, end)}.json"
         )
         if _relative_path(raw.get("state_shard_key"), "state_shard_key") != expected_shard:
             raise PackedBindingError(f"checkpoint range {start} state shard path mismatch")
@@ -337,23 +331,8 @@ def _validate_checkpoint_state(
 def verify_packed_binding_generation(
     pack_root: Path,
     required_timeseries_ids: set[int],
-    observation_generation: str = "v2",
 ) -> tuple[dict[int, bytes], dict[str, Any]]:
     """Verify every packed range and retain only required member bytes."""
-    if observation_generation not in {"v2", "v3"}:
-        raise PackedBindingError("observation generation must be v2 or v3")
-    binding_prefix = f"history/_index_{observation_generation}/timeseries_binding"
-    binding_path_re = re.compile(
-        rf"{re.escape(binding_prefix)}/timeseries_id=([1-9]\d*)\.json"
-    )
-    suffix = "/generation=v3" if observation_generation == "v3" else ""
-    pack_prefix = f"history/_backup_packs_v1/timeseries_binding{suffix}"
-    pack_root_path = f"{pack_prefix}/root.json"
-    state_root_prefix = (
-        "_ops/checkpoints/r2_history_backup_state_v2/"
-        f"observation_generation={observation_generation}"
-    )
-    state_root_path = f"{state_root_prefix}/root.json"
     try:
         resolved_root = Path(pack_root).resolve(strict=True)
     except (FileNotFoundError, OSError, RuntimeError) as exc:
@@ -364,19 +343,16 @@ def verify_packed_binding_generation(
     if any(value <= 0 for value in required):
         raise PackedBindingError("required timeseries IDs must be positive integers")
 
-    root_path = _safe_local_file(resolved_root, pack_root_path, "packed binding root")
+    root_path = _safe_local_file(resolved_root, PACK_ROOT_PATH, "packed binding root")
     root_body, root = _read_json_bytes(root_path, "packed binding root")
-    root_info = _validate_root(root, binding_prefix, pack_prefix)
-    state_path = _safe_local_file(resolved_root, state_root_path, "checkpoint state root")
+    root_info = _validate_root(root)
+    state_path = _safe_local_file(resolved_root, STATE_ROOT_PATH, "checkpoint state root")
     _, state_root = _read_json_bytes(state_path, "checkpoint state root")
     _validate_checkpoint_state(
         pack_root=resolved_root,
         state_root=state_root,
         root_info=root_info,
         root_body=root_body,
-        observation_generation=observation_generation,
-        pack_root_path=pack_root_path,
-        state_root_prefix=state_root_prefix,
     )
 
     selected: dict[int, bytes] = {}
@@ -404,7 +380,7 @@ def verify_packed_binding_generation(
             or pack.get("range_size") != RANGE_SIZE
             or pack.get("range_start") != start
             or pack.get("range_end") != end
-            or pack.get("source_prefix") != binding_prefix
+            or pack.get("source_prefix") != BINDING_PREFIX
             or pack.get("source_range_hash") != reference["source_range_hash"]
         ):
             raise PackedBindingError(f"binding pack {start}-{end} identity mismatch")
@@ -441,7 +417,7 @@ def verify_packed_binding_generation(
             relative_path = _relative_path(
                 member.get("relative_path"), f"member {timeseries_id} path"
             )
-            match = binding_path_re.fullmatch(relative_path)
+            match = _BINDING_PATH_RE.fullmatch(relative_path)
             if match is None or int(match.group(1)) != timeseries_id:
                 raise PackedBindingError(
                     f"member {timeseries_id} path is outside the exact binding namespace"
@@ -482,7 +458,7 @@ def verify_packed_binding_generation(
     audit = {
         "mode": "pack",
         "pack_root": str(resolved_root),
-        "pack_root_relative_path": pack_root_path,
+        "pack_root_relative_path": PACK_ROOT_PATH,
         "pack_root_sha256": _sha256(root_body),
         "pack_root_size": len(root_body),
         "source_root_hash": root_info["source_root_hash"],
@@ -506,7 +482,6 @@ def binding_backup_view(
     individual_root: Path,
     pack_root: Path | None,
     required_timeseries_ids: set[int],
-    observation_generation: str = "v2",
 ) -> Iterator[tuple[Path, dict[str, Any]]]:
     """Yield an individual-file-shaped binding view and mutable audit data."""
     if mode == "individual":
@@ -524,7 +499,7 @@ def binding_backup_view(
         raise PackedBindingError("pack mode requires a packed binding root")
 
     selected, audit = verify_packed_binding_generation(
-        Path(pack_root), required_timeseries_ids, observation_generation
+        Path(pack_root), required_timeseries_ids
     )
     temporary = tempfile.TemporaryDirectory(prefix="uk-aq-sos-binding-view-")
     view_root = Path(temporary.name)
@@ -541,8 +516,7 @@ def binding_backup_view(
     try:
         for timeseries_id, body in sorted(selected.items()):
             relative_path = (
-                f"history/_index_{observation_generation}/timeseries_binding/"
-                f"timeseries_id={timeseries_id}.json"
+                f"{BINDING_PREFIX}/timeseries_id={timeseries_id}.json"
             )
             target = view_root / relative_path
             target.parent.mkdir(parents=True, exist_ok=True)

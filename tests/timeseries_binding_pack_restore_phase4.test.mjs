@@ -34,6 +34,7 @@ import {
   timeseriesBindingSourceRangeManifestKey,
   timeseriesBindingSourceRootKey,
 } from "../scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs";
+import { getObservationHistoryGeneration } from "../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
   NORMAL_TEST_DROPBOX_PACK_SOURCE,
   NORMAL_TEST_R2_HISTORY_DESTINATION,
@@ -41,6 +42,7 @@ import {
   parseTimeseriesBindingPackRestoreArgs,
 } from "../scripts/backup_r2/restore_timeseries_binding_packs_to_r2.mjs";
 
+const V2_GENERATION = getObservationHistoryGeneration("v2");
 const PACK_PREFIX = "history/_backup_packs_v1/timeseries_binding";
 const NOW = "2026-09-04T12:00:00.000Z";
 const h = (value) => createHash("sha256").update(value).digest("hex");
@@ -172,7 +174,7 @@ function buildFixture() {
       state_shard_hash: sha256Hex(shardBody),
     });
   }
-  const stateRoot = emptyHierarchicalStateRoot(TIMESERIES_BINDING_RESTORE_STATE_PREFIX);
+  const stateRoot = emptyHierarchicalStateRoot(TIMESERIES_BINDING_RESTORE_STATE_PREFIX, V2_GENERATION);
   stateRoot.timeseries_binding_packs = {
     schema_version: 1,
     kind: TIMESERIES_BINDING_PACK_ROOT_STATE_KIND,
