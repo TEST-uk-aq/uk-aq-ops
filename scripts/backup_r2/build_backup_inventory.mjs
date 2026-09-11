@@ -332,6 +332,7 @@ function scanRunManifests(args, previousShard) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const generation = resolveObservationHistoryGeneration(process.env);
   requireLockedHistoryBackupMutation({
     dryRun: args.dry_run,
     env: process.env,
@@ -352,7 +353,7 @@ async function main() {
     )
     : null;
 
-  if (previousRoot) assertSelectedBackupInventory(resolveObservationHistoryGeneration(process.env), previousRoot);
+  if (previousRoot) assertSelectedBackupInventory(generation, previousRoot);
 
   const latestTimeseriesSource = readJson(
     args.rclone_bin,
@@ -589,7 +590,7 @@ async function main() {
   }
   root.core = coreInventory.root_reference;
   root.observation_generation = generation.version;
-  assertSelectedBackupInventory(resolveObservationHistoryGeneration(process.env), root);
+  assertSelectedBackupInventory(generation, root);
   const rootWrite = writeRemoteJson(
     args.rclone_bin,
     args.source_root,

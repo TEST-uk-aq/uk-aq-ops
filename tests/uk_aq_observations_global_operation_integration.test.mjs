@@ -343,6 +343,12 @@ test("backup mutation CLIs fail closed without the coordinator while dry-run rem
   );
 
   const env = { ...process.env };
+  env.UK_AQ_R2_HISTORY_VERSION = "v2";
+  for (const key of [
+    "UK_AQ_R2_HISTORY_READ_VERSION",
+    "UK_AQ_R2_HISTORY_WRITE_VERSION",
+    "UK_AQ_R2_HISTORY_BACKUP_VERSION",
+  ]) delete env[key];
   for (const key of Object.values(OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV)) delete env[key];
   for (const [script, args] of [
     [
