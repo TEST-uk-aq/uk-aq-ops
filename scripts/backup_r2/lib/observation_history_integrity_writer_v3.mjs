@@ -14,7 +14,7 @@ import {
 } from "../../../workers/shared/uk_aq_r2_history_canonical.mjs";
 
 const POLLUTANT_MANIFEST_PATTERN =
-  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
+  /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
 
 function assertValidatedApplyRepresentation({ runState, validatedProposal }) {
   if (!runState || typeof runState !== "object") {

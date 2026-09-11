@@ -269,7 +269,8 @@ def main() -> int:
 
         # Include launch scripts that help explain which flags/environment ran.
         launcher_candidates = [
-            PROJECT_ROOT / "bin" / "uk-aq-history-integrity.sh",
+            PROJECT_ROOT / "bin" / "uk-aq-history-integrity-sos-light-v2.sh",
+            PROJECT_ROOT / "bin" / "uk-aq-history-integrity-sos-light-v3.sh",
             *sorted((PROJECT_ROOT / "bin").glob("*monthly*.sh")),
         ]
         for candidate in launcher_candidates:

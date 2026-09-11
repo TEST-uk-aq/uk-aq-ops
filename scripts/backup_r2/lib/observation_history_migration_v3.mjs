@@ -1395,7 +1395,7 @@ const WRITER_FREEZE_EVIDENCE = Object.freeze([
     id: "write_enabled_integrity",
     kind: "coordinated_external_runner",
     schedule_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py",
-    workflow_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh",
+    workflow_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh",
     implementation_file: "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
     markers: [
       "DAILY_TASK_HEALTH_TASK_KEY = \"ops.history_integrity\"",
@@ -1407,7 +1407,7 @@ const WRITER_FREEZE_EVIDENCE = Object.freeze([
     id: "sos_historical_replacement",
     kind: "coordinated_external_runner",
     schedule_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py",
-    workflow_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh",
+    workflow_file: "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh",
     implementation_file: "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
     markers: [
       "SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH",

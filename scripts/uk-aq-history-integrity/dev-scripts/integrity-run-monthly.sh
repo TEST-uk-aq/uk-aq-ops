@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh"
+INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v2.sh"
 LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/integrity-run-monthly"
 COOL_DOWN_SECONDS=300
 PYTHON_BIN="${PYTHON_BIN:-python3}"

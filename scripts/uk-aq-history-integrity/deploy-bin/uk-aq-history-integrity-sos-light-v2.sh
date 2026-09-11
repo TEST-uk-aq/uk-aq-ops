@@ -7,7 +7,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  uk-aq-history-integrity.sh --env TEST|LIVE [options]
+  uk-aq-history-integrity-sos-light-v2.sh --env TEST|LIVE [options]
 
 This deployed dispatcher reads only:
   /Users/mikehinford/uk-aq-history-integrity/env/TEST.env
@@ -107,7 +107,7 @@ reject_archive_path "UK_AQ_OPS_REPO_ROOT" "${OPS_REPO_ROOT}"
 [[ -d "${OPS_REPO_ROOT}" ]] || error "selected repository does not exist: ${OPS_REPO_ROOT}"
 OPS_REPO_ROOT="$(cd -P -- "${OPS_REPO_ROOT}" && pwd -P)"
 reject_archive_path "resolved UK_AQ_OPS_REPO_ROOT" "${OPS_REPO_ROOT}"
-RUNNER="${OPS_REPO_ROOT}/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh"
+RUNNER="${OPS_REPO_ROOT}/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v2.sh"
 [[ -f "${RUNNER}" && -x "${RUNNER}" ]] || error "selected repository runner is unavailable or not executable: ${RUNNER}"
 
 export UK_AQ_ENV_NAME="${ENV_NAME}"

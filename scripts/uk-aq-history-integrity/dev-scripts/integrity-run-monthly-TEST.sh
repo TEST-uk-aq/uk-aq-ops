@@ -5,7 +5,7 @@ set -euo pipefail
 # Always provide a valid detached stdin to Python and child processes.
 exec </dev/null
 
-INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh"
+INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh"
 LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/TEST/logs/integrity-run-monthly"
 COOL_DOWN_SECONDS=300
 PYTHON_BIN="${PYTHON_BIN:-python3}"

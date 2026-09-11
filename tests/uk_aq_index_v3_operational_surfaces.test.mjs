@@ -417,7 +417,7 @@ test("writer-freeze evidence exactly covers scheduled and manually started mutat
       kind: "coordinated_external_runner",
       evidence_files: [
         "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py",
-        "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh",
+        "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh",
         "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
       ],
     },
