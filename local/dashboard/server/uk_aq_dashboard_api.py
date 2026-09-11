@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import uk_aq_dashboard_api_core as core
 from uk_aq_dashboard_media_proxy import is_media_path, proxy_media_request
