@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  const TABS = ["articles", "runs", "sources"];
-  const TAB_LABELS = { articles: "Articles", runs: "Runs", sources: "Sources" };
+  const TABS = ["articles", "ai-titles", "runs", "sources"];
+  const TAB_LABELS = { articles: "Articles", "ai-titles": "AI Titles", runs: "Runs", sources: "Sources" };
   const SORTS = [
     ["published_desc", "Published Date: Newest to Oldest"],
     ["published_asc", "Published Date: Oldest to Newest"],
@@ -13,13 +13,12 @@
   ];
   const STATUS_LABELS = { approved: "Approved", pending: "Pending", rejected: "Rejected", hidden: "Hidden" };
   const STATUS_ACTIONS = {
-    pending: [["approved", "Approve", "approve"], ["rejected", "Reject", "reject"], ["hidden", "Hide", "hide"]],
+    pending: [["approved", "Approve", "approve"], ["rejected", "Reject", "reject"]],
     approved: [["hidden", "Hide", "hide"], ["rejected", "Reject", "reject"]],
-    rejected: [["approved", "Approve", "approve"], ["hidden", "Hide", "hide"]],
-    hidden: [["approved", "Approve", "unhide"], ["rejected", "Reject", "reject"]],
+    rejected: [["approved", "Approve", "approve"]],
+    hidden: [["approved", "Restore / Unhide", "unhide"]],
   };
   const AI_PREVIEW_MODES = ["desktop", "carousel", "mobile"];
-  const MAX_BATCH_SELECTION = 50;
   const articleDetailCache = new Map();
   let articleRefreshSequence = 0;
 
@@ -40,11 +39,9 @@
     articleCursor: null,
     articleHasMore: false,
     filters: { status: new Set(["approved"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" },
+    aiState: "pending",
     aiPreviewMode: storedAiPreviewMode(),
-    selectedArticleIds: new Set(),
-    expandedArticleIds: new Set(),
-    aiUsage: null,
-    batchMessage: "",
+    aiCursor: null,
     runsCursor: null,
   };
 
@@ -124,6 +121,7 @@
       button.setAttribute("aria-selected", active ? "true" : "false");
     });
     if (tab === "articles") void renderArticles(false);
+    if (tab === "ai-titles") void renderAiTitles(false);
     if (tab === "runs") void renderRuns(false);
     if (tab === "sources") void renderSources(false);
   }
@@ -157,7 +155,7 @@
       `<label><input type="checkbox" data-filter="source" value="${esc(source.source_key)}"${checkedFilter("source", source.source_key)}> ${esc(source.name)}</label>`).join("");
     const authors = state.selectors.authors.map(author =>
       `<label data-author-option="${esc(String(author).toLowerCase())}"><input type="checkbox" data-filter="author" value="${esc(author)}"${checkedFilter("author", author)}> ${esc(author)}</label>`).join("");
-    const titleStates = [["original", "Original"], ["publisher", "Publisher"], ["human", "Human"], ["ai", "AI Accepted"], ["pending_ai", "AI Pending"], ["rejected_ai", "AI Rejected"]]
+    const titleStates = [["original", "Original only"], ["human", "Human title"], ["ai", "AI-approved title"], ["pending_ai", "Pending AI suggestion"]]
       .map(([value, label]) => `<label><input type="checkbox" data-filter="titleState" value="${value}"${checkedFilter("titleState", value)}> ${label}</label>`).join("");
     return `<div class="media-filter-panel" aria-label="Article filters">
       <fieldset class="media-filter-group"><legend>Has image</legend><div class="media-filter-options">
@@ -165,10 +163,10 @@
         <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="yes"${state.filters.hasImage === "yes" ? " checked" : ""}> Yes</label>
         <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="no"${state.filters.hasImage === "no" ? " checked" : ""}> No</label>
       </div></fieldset>
-      <fieldset class="media-filter-group"><legend>Title Status</legend><div class="media-filter-options">${titleStates}</div></fieldset>
+      <fieldset class="media-filter-group"><legend>Display title state</legend><div class="media-filter-options">${titleStates}</div></fieldset>
       <fieldset class="media-filter-group media-filter-group--publication"><legend>Publication</legend>${filterScroll("publications", publications || "No publications")}</fieldset>
       <fieldset class="media-filter-group"><legend>Author</legend><label class="media-field"><input data-author-search type="search" placeholder="Find author"></label>${filterScroll("authors", authors || "No authors")}</fieldset>
-      <fieldset class="media-filter-group"><legend>Article Status</legend><div class="media-filter-options">${status}</div></fieldset>
+      <fieldset class="media-filter-group"><legend>Status</legend><div class="media-filter-options">${status}</div></fieldset>
     </div><div class="media-active-filters" data-active-filters>${esc(activeFilterSummary())}</div>`;
   }
 
@@ -219,11 +217,11 @@
 
   function activeFilterSummary() {
     const parts = [];
-    if (state.filters.status.size) parts.push(`Article Status: ${[...state.filters.status].map(v => STATUS_LABELS[v]).join(", ")}`);
+    if (state.filters.status.size) parts.push(`Status: ${[...state.filters.status].map(v => STATUS_LABELS[v]).join(", ")}`);
     if (state.filters.source.size) parts.push(`${state.filters.source.size} publication filter${state.filters.source.size === 1 ? "" : "s"}`);
     if (state.filters.author.size) parts.push(`${state.filters.author.size} author filter${state.filters.author.size === 1 ? "" : "s"}`);
     if (state.filters.hasImage) parts.push(`Image: ${state.filters.hasImage}`);
-    if (state.filters.titleState.size) parts.push(`${state.filters.titleState.size} Title Status filter${state.filters.titleState.size === 1 ? "" : "s"}`);
+    if (state.filters.titleState.size) parts.push(`${state.filters.titleState.size} title-state filter${state.filters.titleState.size === 1 ? "" : "s"}`);
     if (state.filters.q) parts.push(`Search: “${state.filters.q}”`);
     return parts.length ? `Active filters · ${parts.join(" · ")}` : "No active filters";
   }
@@ -236,68 +234,28 @@
 
   function statusControl(article) {
     return `<div class="media-status-control" data-status-control data-id="${article.id}" data-current="${article.status}">
-      <select aria-label="Article Status for ${esc(article.title)}">${statusOptions(article.status)}</select>
+      <select aria-label="Status for ${esc(article.title)}">${statusOptions(article.status)}</select>
       <span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>
     </div>`;
   }
 
-  function titleStatus(article) {
-    if (article.display_title_origin === "human" && article.display_title) return ["human", "Human"];
-    if (article.display_title_origin === "ai" && article.display_title) return ["ai", "AI Accepted"];
-    if (article.ai_title_suggestion_state === "pending") return ["pending_ai", "AI Pending"];
-    if (article.ai_title_suggestion_state === "rejected") return ["rejected_ai", "AI Rejected"];
-    if (article.display_title_origin === "publisher" && article.display_title) return ["publisher", "Publisher"];
-    return ["original", "Original"];
-  }
-
-  function hasAiTitleInformation(article) {
-    return Boolean(article.ai_title_suggestion || article.ai_title_suggestion_state || article.ai_title_generated_at);
-  }
-
-  function aiPreviewControls() {
-    return `<div class="media-ai-preview-controls"><span class="media-ai-preview-controls__label" id="media-ai-preview-label">Preview</span><div class="media-mini-nav" role="group" aria-labelledby="media-ai-preview-label">${AI_PREVIEW_MODES.map(value => `<button type="button" data-ai-preview-mode="${value}" class="${state.aiPreviewMode === value ? "is-active" : ""}" aria-pressed="${state.aiPreviewMode === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div><span class="media-ai-carousel-note" title="Compact preview based on the current website card style; the public site does not yet have a separate carousel layout.">Carousel is a provisional compact card.</span></div>`;
-  }
-
-  function aiUsageHtml() {
-    const day = state.aiUsage?.usage_days?.[0] || {};
-    const entries = [[day.calculated_neurons_used, "Calculated neurons used today"], [day.media_daily_neuron_budget, "Media daily neuron budget"], [day.media_budget_remaining, "Media budget remaining"], [day.configured_cloudflare_free_allocation_neurons, "Configured Cloudflare free allowance"], [day.estimated_cloudflare_free_neurons_remaining, "Estimated Cloudflare allowance remaining"], [day.ai_requests, "Request count"], [day.ai_titles_attempted, "Titles attempted"], [day.titles_generated_successfully, "Titles generated"], [day.prompt_tokens, "Input tokens"], [day.completion_tokens, "Output tokens"], [day.outstanding_reserved_neurons, "Outstanding reserved neurons"]];
-    return `<details class="media-ai-usage"><summary>AI Usage</summary><p>Media’s local budget is enforced here; Cloudflare allowance values are estimates, not billing authority.</p><div class="media-stats">${entries.map(([value, label]) => `<div class="media-stat"><strong>${esc(value ?? 0)}</strong><span>${esc(label)}</span></div>`).join("")}</div></details>`;
-  }
-
-  function inlineAiReview(article) {
-    const pendingActions = article.ai_title_suggestion_state === "pending"
-      ? `<button class="media-button media-button--primary" data-ai-action="accept-ai">Accept AI title</button><button class="media-button" data-ai-action="reject-ai">Reject AI / use original</button>` : "";
-    const published = formatPublishedDate(article.published_at);
-    const sourceRow = `${esc(article.publisher)}<span data-ai-preview-date>${published ? ` · ${esc(published)}` : ""}</span>`;
-    return `<section class="media-review media-ai-preview-mode--${state.aiPreviewMode}" data-ai-id="${article.id}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website article card preview"><img class="media-site-preview__image" loading="lazy" src="${esc(apiUrl(`articles/${article.id}/image`))}" alt="" data-ai-preview-image><div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(article.display_title || article.ai_title_suggestion || article.title)}</div></div></div></div><div class="media-review__controls"><span class="media-subtext">Generated ${esc(formatDate(article.ai_title_generated_at))} · AI suggestion ${esc(article.ai_title_suggestion_state || "none")}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>AI suggestion</span>${esc(article.ai_title_suggestion || "—")}</div><div class="media-review__title"><span>Current display title</span>${esc(article.display_title || "Publisher original")} · ${esc(titleStatus(article)[1])}</div></div><div class="media-actions">${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || article.ai_title_suggestion || "")}" data-ai-suggestion="${esc(article.ai_title_suggestion || article.title)}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message></div></div></div></section>`;
-  }
-
   function articleRow(article) {
     const title = article.display_title || article.title;
-    const [titleState, titleLabel] = titleStatus(article);
-    const isExpanded = state.expandedArticleIds.has(String(article.id));
     const thumb = article.admin_preview_image_path
       ? `<img class="media-thumb" loading="lazy" src="${esc(apiUrl(`articles/${article.id}/image`))}" alt="" data-media-thumb>`
       : `<span class="media-thumb-fallback">No image</span>`;
-    return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}</td>
+    return `<tr data-article-id="${article.id}"><td>${thumb}</td>
       <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
       <td>${esc(formatDate(article.published_at))}</td><td>${esc(formatDate(article.approved_at))}</td>
-      <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span>${hasAiTitleInformation(article) ? `<button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Hide" : "▾ Review AI"}</button>` : ""}</td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
-  }
-
-  function bulkToolbarHtml() {
-    const count = state.selectedArticleIds.size;
-    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}><option value="">Choose status…</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="hidden">Hidden</option></select></label><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
+      <td>${statusControl(article)}</td></tr>`;
   }
 
   function articleTableHtml(error = "") {
     const rows = state.articles.map(articleRow).join("");
-    const selectedLoaded = state.articles.filter(article => state.selectedArticleIds.has(String(article.id))).length;
-    const allSelected = state.articles.length > 0 && selectedLoaded === state.articles.length;
-    return `${error ? message(error, "error") : ""}${bulkToolbarHtml()}<div class="media-table-wrap"><table class="media-table">
-      <thead><tr><th class="media-select-cell"><input type="checkbox" data-select-all aria-label="Select all currently loaded articles"${allSelected ? " checked" : ""}></th><th>Image</th><th>Title</th><th>Publication</th><th>Author</th><th>Published</th><th>Approved</th><th>Title Status</th><th>Article Status</th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="9" class="media-empty">No articles match these filters.</td></tr>`}</tbody>
+    return `${error ? message(error, "error") : ""}<div class="media-table-wrap"><table class="media-table">
+      <thead><tr><th>Image</th><th>Title</th><th>Publication</th><th>Author</th><th>Published</th><th>Approved</th><th>Status</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7" class="media-empty">No approved articles match these filters.</td></tr>`}</tbody>
     </table></div>${state.articleHasMore ? `<div class="media-actions"><button class="media-button" data-load-more-articles>Load more</button></div>` : ""}`;
   }
 
@@ -309,15 +267,14 @@
     try {
       await ensureSelectors();
       const cursor = append ? state.articleCursor : null;
-      const [data, usage] = await Promise.all([request("articles", { params: articleParams(cursor) }), request("ai-usage", { params: new URLSearchParams({ limit: "1" }) }).catch(() => null)]);
-      state.aiUsage = usage;
+      const data = await request("articles", { params: articleParams(cursor) });
       state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
       state.articleCursor = data.page?.next_cursor || null;
       state.articleHasMore = Boolean(data.page?.has_more);
-      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>${aiPreviewControls()}
+      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>
         <button class="media-button media-button--primary" data-focus-add>+ Add Article</button></div>
         <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
-        <div data-url-result></div>${aiUsageHtml()}</section>
+        <div data-url-result></div></section>
         <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form>
           <label class="media-field"><span>Sort</span><select data-article-sort>${SORTS.map(([value, label]) => `<option value="${value}"${state.filters.sort === value ? " selected" : ""}>${label}</option>`).join("")}</select></label></div>
           ${filterPanel()}<div data-article-table>${articleTableHtml()}</div></section>`);
@@ -341,8 +298,6 @@
       const data = await request("articles", { params: articleParams(cursor) });
       if (refreshSequence !== articleRefreshSequence) return;
       state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
-      const loadedIds = new Set(state.articles.map(article => String(article.id)));
-      state.selectedArticleIds = new Set([...state.selectedArticleIds].filter(id => loadedIds.has(id)));
       state.articleCursor = data.page?.next_cursor || null;
       state.articleHasMore = Boolean(data.page?.has_more);
       table.innerHTML = articleTableHtml();
@@ -375,10 +330,9 @@
       const input = state.root.querySelector("[data-url-lookup] input"); input?.focus(); input?.scrollIntoView({ behavior: "smooth", block: "center" });
     });
     state.root.querySelector("[data-url-lookup]")?.addEventListener("submit", event => { event.preventDefault(); void lookupUrl(new FormData(event.currentTarget).get("url")); });
-    state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); clearArticleSelection(); void refreshArticleTable(); });
+    state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); void refreshArticleTable(); });
     state.root.querySelector("[data-clear-filters]")?.addEventListener("click", () => {
       state.filters = { status: new Set(["approved"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" };
-      clearArticleSelection();
       syncArticleFilterControls();
       const authorSearch = state.root.querySelector("[data-author-search]");
       if (authorSearch) authorSearch.value = "";
@@ -387,11 +341,11 @@
       updateFilterScrolls();
       void refreshArticleTable();
     });
-    state.root.querySelector("[data-article-sort]")?.addEventListener("change", event => { state.filters.sort = event.target.value; clearArticleSelection(); void refreshArticleTable(); });
+    state.root.querySelector("[data-article-sort]")?.addEventListener("change", event => { state.filters.sort = event.target.value; void refreshArticleTable(); });
     state.root.querySelectorAll("[data-filter]").forEach(input => input.addEventListener("change", event => {
-      const set = state.filters[event.target.dataset.filter]; event.target.checked ? set.add(event.target.value) : set.delete(event.target.value); clearArticleSelection(); void refreshArticleTable();
+      const set = state.filters[event.target.dataset.filter]; event.target.checked ? set.add(event.target.value) : set.delete(event.target.value); void refreshArticleTable();
     }));
-    state.root.querySelectorAll("[data-filter-radio]").forEach(input => input.addEventListener("change", event => { state.filters[event.target.dataset.filterRadio] = event.target.value; clearArticleSelection(); void refreshArticleTable(); }));
+    state.root.querySelectorAll("[data-filter-radio]").forEach(input => input.addEventListener("change", event => { state.filters[event.target.dataset.filterRadio] = event.target.value; void refreshArticleTable(); }));
     state.root.querySelector("[data-author-search]")?.addEventListener("input", event => {
       const query = event.target.value.toLowerCase(); state.root.querySelectorAll("[data-author-option]").forEach(option => { option.hidden = !option.dataset.authorOption.includes(query); });
       updateFilterScrolls();
@@ -402,19 +356,6 @@
 
   function bindArticleTableEvents() {
     state.root.querySelector("[data-load-more-articles]")?.addEventListener("click", () => void refreshArticleTable(true));
-    state.root.querySelectorAll("[data-ai-preview-mode]").forEach(button => button.addEventListener("click", () => setAiPreviewMode(button.dataset.aiPreviewMode)));
-    state.root.querySelector("[data-select-all]")?.addEventListener("change", event => {
-      const ids = state.articles.map(article => String(article.id));
-      if (event.target.checked) ids.forEach(id => state.selectedArticleIds.add(id));
-      else ids.forEach(id => state.selectedArticleIds.delete(id));
-      refreshSelectionControls();
-    });
-    state.root.querySelectorAll("[data-select-article]").forEach(input => input.addEventListener("change", event => {
-      const id = String(event.target.closest("[data-article-id]").dataset.articleId);
-      if (event.target.checked) state.selectedArticleIds.add(id); else state.selectedArticleIds.delete(id);
-      refreshSelectionControls();
-    }));
-    state.root.querySelector("[data-save-bulk]")?.addEventListener("click", () => void saveBulkStatus());
     state.root.querySelectorAll("[data-status-control] select").forEach(select => select.addEventListener("change", event => {
       const control = event.target.closest("[data-status-control]");
       const current = control.dataset.current;
@@ -433,46 +374,7 @@
     state.root.querySelectorAll("[data-open-article]").forEach(button => button.addEventListener("click", () => {
       void openArticle(Number(button.closest("[data-article-id]").dataset.articleId));
     }));
-    state.root.querySelectorAll("[data-toggle-ai]").forEach(button => button.addEventListener("click", () => {
-      const id = String(button.closest("[data-article-id]").dataset.articleId);
-      state.expandedArticleIds.has(id) ? state.expandedArticleIds.delete(id) : state.expandedArticleIds.add(id);
-      const table = state.root.querySelector("[data-article-table]"); table.innerHTML = articleTableHtml(); bindArticleTableEvents(); hydrateAiPreviewDetails();
-    }));
     state.root.querySelectorAll("[data-media-thumb]").forEach(image => image.addEventListener("error", () => { image.outerHTML = `<span class="media-thumb-fallback">Image unavailable</span>`; }, { once: true }));
-    bindAiActions();
-    hydrateAiPreviewDetails();
-  }
-
-  function clearArticleSelection() { state.selectedArticleIds.clear(); state.batchMessage = ""; }
-
-  function refreshSelectionControls() {
-    const table = state.root.querySelector("[data-article-table]");
-    if (!table) return;
-    const count = state.selectedArticleIds.size;
-    const selectedLoaded = state.articles.filter(article => state.selectedArticleIds.has(String(article.id))).length;
-    const all = table.querySelector("[data-select-all]");
-    if (all) { all.checked = state.articles.length > 0 && selectedLoaded === state.articles.length; all.indeterminate = selectedLoaded > 0 && selectedLoaded < state.articles.length; }
-    table.querySelectorAll("[data-select-article]").forEach(input => { input.checked = state.selectedArticleIds.has(String(input.closest("[data-article-id]").dataset.articleId)); });
-    const label = table.querySelector(".media-bulk-toolbar strong"); if (label) label.textContent = `${count} selected`;
-    const target = table.querySelector("[data-bulk-status]"); const save = table.querySelector("[data-save-bulk]");
-    if (target) target.disabled = count === 0; if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value;
-    const output = table.querySelector("[data-bulk-message]"); if (output) output.innerHTML = state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : "";
-    target?.addEventListener("change", () => { if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target.value; });
-  }
-
-  async function saveBulkStatus() {
-    const table = state.root.querySelector("[data-article-table]"); const target = table?.querySelector("[data-bulk-status]")?.value;
-    if (!target || !["approved", "rejected", "hidden"].includes(target)) return;
-    const selected = state.articles.filter(article => state.selectedArticleIds.has(String(article.id)));
-    if (selected.length > MAX_BATCH_SELECTION) { state.batchMessage = { text: `Apply Article Status to at most ${MAX_BATCH_SELECTION} selected rows at a time.`, kind: "error" }; refreshSelectionControls(); return; }
-    const changes = selected.map(article => ({ article, action: (STATUS_ACTIONS[article.status] || []).find(([next]) => next === target)?.[2] })).filter(item => item.action);
-    const save = table.querySelector("[data-save-bulk]"); save.disabled = true;
-    const results = await Promise.allSettled(changes.map(({ article, action }) => request(`articles/${article.id}/${action}`, { method: "POST", idempotent: "status" })));
-    const succeeded = results.filter(result => result.status === "fulfilled").length;
-    const failed = results.length - succeeded;
-    state.batchMessage = { text: `${succeeded} changed${selected.length - changes.length ? `; ${selected.length - changes.length} already ${STATUS_LABELS[target]}` : ""}${failed ? `; ${failed} failed` : ""}.`, kind: failed ? "error" : "success" };
-    if (succeeded || selected.length !== changes.length) await refreshArticleTable(false);
-    else refreshSelectionControls();
   }
 
   async function saveStatus(control) {
@@ -484,7 +386,18 @@
     const button = control.querySelector("button"); button.disabled = true;
     try {
       await request(`articles/${control.dataset.id}/${action}`, { method: "POST", idempotent: "status" });
-      await refreshArticleTable(false);
+      const row = control.closest("[data-article-id]");
+      const article = state.articles.find(item => String(item.id) === control.dataset.id);
+      if (article) article.status = nextStatus;
+      control.parentElement.querySelector(".media-message")?.remove();
+      if (state.filters.status.size && !state.filters.status.has(nextStatus)) {
+        state.articles = state.articles.filter(item => String(item.id) !== control.dataset.id);
+        row?.remove();
+        return;
+      }
+      control.dataset.current = nextStatus;
+      select.innerHTML = statusOptions(nextStatus);
+      button.outerHTML = `<span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>`;
     } catch (error) {
       button.disabled = false;
       const prior = control.parentElement.querySelector(".media-message"); prior?.remove();
@@ -549,8 +462,8 @@
         : [];
       dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>
         <div class="media-detail__grid"><div>${article.admin_preview_image_path ? `<img class="media-detail__preview" src="${esc(apiUrl(`articles/${id}/image`))}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
-        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>AI suggestion</dt><dd>${esc(article.ai_title_suggestion || "—")} (${esc(article.ai_title_suggestion_state || "none")})</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatDate(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatDate(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatDate(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatDate(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
-        <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div data-detail-status-message></div></section>
+        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>AI suggestion</dt><dd>${esc(article.ai_title_suggestion || "—")} (${esc(article.ai_title_suggestion_state || "none")})</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatDate(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatDate(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatDate(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatDate(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
+        <section><h4>Editorial status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Action</span><select><option value="">Choose action…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div data-detail-status-message></div></section>
         <section><h4>Display title</h4><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
         <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
         <section><details><summary>Discovery evidence and recent events</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
@@ -631,14 +544,46 @@
     } catch (error) { output.innerHTML = message(error.message, "error"); }
   }
 
+  async function renderAiTitles(append) {
+    if (!append) setView(`<section class="media-card"><div class="media-loading">Loading AI Titles…</div></section>`);
+    try {
+      const [usage, titles] = await Promise.all([
+        request("ai-usage", { params: new URLSearchParams({ limit: "1" }) }),
+        request("ai-titles", { params: new URLSearchParams({ state: state.aiState, limit: "20", ...(append && state.aiCursor ? { cursor: state.aiCursor } : {}) }) }),
+      ]);
+      const day = usage.usage_days?.[0] || {};
+      const rows = append ? (state.aiRows || []).concat(titles.suggestions || []) : (titles.suggestions || []);
+      state.aiRows = rows; state.aiCursor = titles.page?.next_cursor || null;
+      setView(`<section class="media-card"><h3>AI Titles</h3><p>Media’s local budget is enforced here; Cloudflare allowance values are estimates, not billing authority.</p><div class="media-stats">
+        ${[[day.calculated_neurons_used, "Calculated neurons used today"], [day.media_daily_neuron_budget, "Media daily neuron budget"], [day.media_budget_remaining, "Media budget remaining"], [day.configured_cloudflare_free_allocation_neurons, "Configured Cloudflare free allowance"], [day.estimated_cloudflare_free_neurons_remaining, "Estimated Cloudflare allowance remaining"], [day.ai_requests, "Request count"], [day.ai_titles_attempted, "Titles attempted"], [day.titles_generated_successfully, "Titles generated"], [day.prompt_tokens, "Input tokens"], [day.completion_tokens, "Output tokens"], [day.outstanding_reserved_neurons, "Outstanding reserved neurons"]].map(([value, label]) => `<div class="media-stat"><strong>${esc(value ?? 0)}</strong><span>${esc(label)}</span></div>`).join("")}</div></section>
+        <section class="media-card media-ai-preview-mode--${state.aiPreviewMode}" data-ai-review-section><div class="media-toolbar media-ai-toolbar"><div class="media-mini-nav" role="tablist" aria-label="AI title state">${["pending", "accepted", "rejected"].map(value => `<button data-ai-state="${value}" class="${state.aiState === value ? "is-active" : ""}" aria-selected="${state.aiState === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div><div class="media-ai-preview-controls"><span class="media-ai-preview-controls__label" id="media-ai-preview-label">Preview</span><div class="media-mini-nav" role="group" aria-labelledby="media-ai-preview-label">${AI_PREVIEW_MODES.map(value => `<button type="button" data-ai-preview-mode="${value}" class="${state.aiPreviewMode === value ? "is-active" : ""}" aria-pressed="${state.aiPreviewMode === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div><span class="media-ai-carousel-note" title="Compact preview based on the current website card style; the public site does not yet have a separate carousel layout.">Carousel is a provisional compact card.</span></div></div>
+        <div class="media-review-list">${rows.length ? rows.map(aiReviewRow).join("") : `<div class="media-empty">No ${esc(state.aiState)} AI titles.</div>`}</div>${titles.page?.has_more ? `<button class="media-button" data-load-more-ai>Load more</button>` : ""}</section>`);
+      state.root.querySelectorAll("[data-ai-state]").forEach(button => button.addEventListener("click", () => { state.aiState = button.dataset.aiState; state.aiCursor = null; void renderAiTitles(false); }));
+      state.root.querySelectorAll("[data-ai-preview-mode]").forEach(button => button.addEventListener("click", () => setAiPreviewMode(button.dataset.aiPreviewMode)));
+      state.root.querySelector("[data-load-more-ai]")?.addEventListener("click", () => void renderAiTitles(true));
+      bindAiActions();
+      hydrateAiPreviewDetails();
+    } catch (error) { setView(`<section class="media-card"><h3>AI Titles</h3>${message(error.message, "error")}</section>`); }
+  }
+
+  function aiReviewRow(row) {
+    const pendingActions = row.ai_title_suggestion_state === "pending"
+      ? `<button class="media-button media-button--primary" data-ai-action="accept-ai">Approve title</button><button class="media-button" data-ai-action="reject-ai">Use original / Reject</button>`
+      : "";
+    const published = formatPublishedDate(row.published_at);
+    const sourceRow = `${esc(row.publisher)}<span data-ai-preview-date>${published ? ` · ${esc(published)}` : ""}</span>`;
+    return `<article class="media-review" data-ai-id="${row.id}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website article card preview"><img class="media-site-preview__image" loading="lazy" src="${esc(apiUrl(`articles/${row.id}/image`))}" alt="" data-ai-preview-image><div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(row.ai_title_suggestion || row.title)}</div></div></div></div><div class="media-review__controls"><strong>${esc(row.publisher)}</strong><span class="media-subtext">Generated ${esc(formatDate(row.ai_title_generated_at))} · Article ${esc(STATUS_LABELS[row.status] || row.status)}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(row.title)}</div><div class="media-review__title"><span>AI suggestion</span>${esc(row.ai_title_suggestion)}</div></div>
+      <div class="media-actions">${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(row.display_title || row.ai_title_suggestion || "")}" data-ai-suggestion="${esc(row.ai_title_suggestion || row.title)}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save edit</button>${row.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message></div></div></div></article>`;
+  }
+
   function setAiPreviewMode(mode) {
     if (!AI_PREVIEW_MODES.includes(mode)) return;
     state.aiPreviewMode = mode;
     try { sessionStorage.setItem("media-ai-preview-mode", mode); } catch (_error) { /* Session persistence is optional. */ }
-    const workspace = state.root.querySelector("[data-article-table]");
-    if (!workspace) return;
-    workspace.querySelectorAll("[data-ai-id]").forEach(row => AI_PREVIEW_MODES.forEach(value => row.classList.toggle(`media-ai-preview-mode--${value}`, value === mode)));
-    state.root.querySelectorAll("[data-ai-preview-mode]").forEach(button => {
+    const section = state.root.querySelector("[data-ai-review-section]");
+    if (!section) return;
+    AI_PREVIEW_MODES.forEach(value => section.classList.toggle(`media-ai-preview-mode--${value}`, value === mode));
+    section.querySelectorAll("[data-ai-preview-mode]").forEach(button => {
       const selected = button.dataset.aiPreviewMode === mode;
       button.classList.toggle("is-active", selected);
       button.setAttribute("aria-pressed", selected ? "true" : "false");
@@ -689,7 +634,7 @@
         if (action === "accept-ai" || action === "reject-ai") await request(`articles/${id}/display-title/${action}`, { method: "POST" });
         if (action === "edit") await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: row.querySelector("[data-ai-edit]").value } });
         if (action === "clear") await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: null } });
-        output.innerHTML = message("Title decision saved.", "success"); setTimeout(() => void refreshArticleTable(false), 350);
+        output.innerHTML = message("Title decision saved.", "success"); setTimeout(() => void renderAiTitles(false), 350);
       } catch (error) { output.innerHTML = message(error.message, "error"); }
     }));
   }
