@@ -282,7 +282,7 @@ button.media-save-state { cursor: pointer; }
 .media-site-preview__source-row {
   margin-bottom: 6px;
   color: rgba(255, 255, 255, 0.88);
-  font-size: clamp(0.7rem, 1vw, 0.8rem);
+  font-size: 0.7rem;
   font-weight: 750;
   line-height: 1.25;
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
@@ -291,7 +291,7 @@ button.media-save-state { cursor: pointer; }
   display: -webkit-box;
   overflow: hidden;
   color: #fff;
-  font-size: clamp(1rem, 1.55vw, 1.28rem);
+  font-size: 16.91px;
   font-weight: 700;
   line-height: 1.18;
   letter-spacing: -0.02em;
