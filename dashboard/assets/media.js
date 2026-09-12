@@ -624,6 +624,7 @@
       output.querySelector("[data-apply-metadata]")?.addEventListener("click", async () => {
         try { await request(`articles/${id}/metadata/apply`, { method: "PUT", idempotent: "metadata", body: {
           expected_current_image_url: data.changes.image?.current ?? article.og_image_url ?? null,
+          expected_proposed_image_url: data.changes.image?.expected_proposed_image_url ?? null,
           replace_existing_image: Boolean(data.changes.image?.replacement_required), apply_publisher_display_title: true,
         } }); output.innerHTML = message("Metadata applied without changing editorial state.", "success"); void renderArticles(false); }
         catch (error) { output.innerHTML = message(error.message, "error"); }
