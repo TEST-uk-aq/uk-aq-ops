@@ -258,7 +258,7 @@
   }
 
   function aiPreviewControls() {
-    return `<div class="media-ai-preview-controls media-ai-preview-mode--${state.aiPreviewMode}" data-ai-preview-controls><span class="media-ai-preview-controls__label" id="media-ai-preview-label">Preview</span><div class="media-mini-nav" role="group" aria-labelledby="media-ai-preview-label">${AI_PREVIEW_MODES.map(value => `<button type="button" data-ai-preview-mode="${value}" class="${state.aiPreviewMode === value ? "is-active" : ""}" aria-pressed="${state.aiPreviewMode === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div><span class="media-ai-carousel-note" title="Compact preview based on the current website card style; the public site does not yet have a separate carousel layout.">Carousel is a provisional compact card.</span></div>`;
+    return `<div class="media-ai-preview-controls media-ai-preview-mode--${state.aiPreviewMode}" data-ai-preview-controls><span class="media-ai-preview-controls__label" id="media-ai-preview-label">Preview</span><div class="media-mini-nav" role="group" aria-labelledby="media-ai-preview-label">${AI_PREVIEW_MODES.map(value => `<button type="button" data-ai-preview-mode="${value}" class="${state.aiPreviewMode === value ? "is-active" : ""}" aria-pressed="${state.aiPreviewMode === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div></div>`;
   }
 
   function aiUsageHtml() {
