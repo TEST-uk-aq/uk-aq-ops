@@ -39,10 +39,11 @@
     articles: [],
     articleCursor: null,
     articleHasMore: false,
-    filters: { status: new Set(["approved"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" },
+    filters: { status: new Set(["pending"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" },
     aiPreviewMode: storedAiPreviewMode(),
     selectedArticleIds: new Set(),
     expandedArticleIds: new Set(),
+    titleMessages: new Map(),
     aiUsage: null,
     batchMessage: "",
     runsCursor: null,
@@ -151,7 +152,7 @@
   }
 
   function filterPanel() {
-    const status = ["approved", "pending", "rejected", "hidden"].map(value =>
+    const status = ["pending", "approved", "rejected", "hidden"].map(value =>
       `<label><input type="checkbox" data-filter="status" value="${value}"${checkedFilter("status", value)}> ${STATUS_LABELS[value]}</label>`).join("");
     const publications = state.selectors.publications.map(source =>
       `<label><input type="checkbox" data-filter="source" value="${esc(source.source_key)}"${checkedFilter("source", source.source_key)}> ${esc(source.name)}</label>`).join("");
@@ -250,18 +251,14 @@
     return ["original", "Original"];
   }
 
-  function hasAiTitleInformation(article) {
-    return Boolean(article.ai_title_suggestion || article.ai_title_suggestion_state || article.ai_title_generated_at);
-  }
-
   function aiPreviewControls() {
-    return `<div class="media-ai-preview-controls"><span class="media-ai-preview-controls__label" id="media-ai-preview-label">Preview</span><div class="media-mini-nav" role="group" aria-labelledby="media-ai-preview-label">${AI_PREVIEW_MODES.map(value => `<button type="button" data-ai-preview-mode="${value}" class="${state.aiPreviewMode === value ? "is-active" : ""}" aria-pressed="${state.aiPreviewMode === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div><span class="media-ai-carousel-note" title="Compact preview based on the current website card style; the public site does not yet have a separate carousel layout.">Carousel is a provisional compact card.</span></div>`;
+    return `<div class="media-ai-preview-controls media-ai-preview-mode--${state.aiPreviewMode}" data-ai-preview-controls><span class="media-ai-preview-controls__label" id="media-ai-preview-label">Preview</span><div class="media-mini-nav" role="group" aria-labelledby="media-ai-preview-label">${AI_PREVIEW_MODES.map(value => `<button type="button" data-ai-preview-mode="${value}" class="${state.aiPreviewMode === value ? "is-active" : ""}" aria-pressed="${state.aiPreviewMode === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div><span class="media-ai-carousel-note" title="Compact preview based on the current website card style; the public site does not yet have a separate carousel layout.">Carousel is a provisional compact card.</span></div>`;
   }
 
   function aiUsageHtml() {
     const day = state.aiUsage?.usage_days?.[0] || {};
     const entries = [[day.calculated_neurons_used, "Calculated neurons used today"], [day.media_daily_neuron_budget, "Media daily neuron budget"], [day.media_budget_remaining, "Media budget remaining"], [day.configured_cloudflare_free_allocation_neurons, "Configured Cloudflare free allowance"], [day.estimated_cloudflare_free_neurons_remaining, "Estimated Cloudflare allowance remaining"], [day.ai_requests, "Request count"], [day.ai_titles_attempted, "Titles attempted"], [day.titles_generated_successfully, "Titles generated"], [day.prompt_tokens, "Input tokens"], [day.completion_tokens, "Output tokens"], [day.outstanding_reserved_neurons, "Outstanding reserved neurons"]];
-    return `<details class="media-ai-usage"><summary>AI Usage</summary><p>Media’s local budget is enforced here; Cloudflare allowance values are estimates, not billing authority.</p><div class="media-stats">${entries.map(([value, label]) => `<div class="media-stat"><strong>${esc(value ?? 0)}</strong><span>${esc(label)}</span></div>`).join("")}</div></details>`;
+    return `<details class="media-ai-usage" data-ai-usage><summary>AI Usage</summary><p>Media’s local budget is enforced here; Cloudflare allowance values are estimates, not billing authority.</p><div class="media-stats">${entries.map(([value, label]) => `<div class="media-stat"><strong>${esc(value ?? 0)}</strong><span>${esc(label)}</span></div>`).join("")}</div></details>`;
   }
 
   function inlineAiReview(article) {
@@ -269,7 +266,15 @@
       ? `<button class="media-button media-button--primary" data-ai-action="accept-ai">Accept AI title</button><button class="media-button" data-ai-action="reject-ai">Reject AI / use original</button>` : "";
     const published = formatPublishedDate(article.published_at);
     const sourceRow = `${esc(article.publisher)}<span data-ai-preview-date>${published ? ` · ${esc(published)}` : ""}</span>`;
-    return `<section class="media-review media-ai-preview-mode--${state.aiPreviewMode}" data-ai-id="${article.id}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website article card preview"><img class="media-site-preview__image" loading="lazy" src="${esc(apiUrl(`articles/${article.id}/image`))}" alt="" data-ai-preview-image><div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(article.display_title || article.ai_title_suggestion || article.title)}</div></div></div></div><div class="media-review__controls"><span class="media-subtext">Generated ${esc(formatDate(article.ai_title_generated_at))} · AI suggestion ${esc(article.ai_title_suggestion_state || "none")}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>AI suggestion</span>${esc(article.ai_title_suggestion || "—")}</div><div class="media-review__title"><span>Current display title</span>${esc(article.display_title || "Publisher original")} · ${esc(titleStatus(article)[1])}</div></div><div class="media-actions">${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || article.ai_title_suggestion || "")}" data-ai-suggestion="${esc(article.ai_title_suggestion || article.title)}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message></div></div></div></section>`;
+    const currentTitle = article.display_title || article.title;
+    const provenance = article.ai_title_generated_at
+      ? `Generated ${esc(formatDate(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}${article.ai_title_prompt_version ? ` · ${esc(article.ai_title_prompt_version)}` : ""}`
+      : "No AI title has been generated.";
+    const generateLabel = article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title";
+    const image = article.admin_preview_image_path
+      ? `<img class="media-site-preview__image" loading="lazy" src="${esc(apiUrl(`articles/${article.id}/image`))}" alt="" data-ai-preview-image>` : "";
+    const savedMessage = state.titleMessages.get(String(article.id));
+    return `<section class="media-review media-ai-preview-mode--${state.aiPreviewMode}" data-ai-id="${article.id}" data-current-title="${esc(currentTitle)}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website article card preview"><span class="media-site-preview__fallback">No permitted preview</span>${image}<div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(currentTitle)}</div></div></div></div><div class="media-review__controls"><span class="media-subtext">${provenance}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div><div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div><div class="media-review__title"><span>AI suggestion</span>${esc(article.ai_title_suggestion || "—")} · ${esc(article.ai_title_suggestion_state || "none")}</div></div><div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message>${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div></div></div></section>`;
   }
 
   function articleRow(article) {
@@ -283,7 +288,7 @@
       <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
       <td>${esc(formatDate(article.published_at))}</td><td>${esc(formatDate(article.approved_at))}</td>
-      <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span>${hasAiTitleInformation(article) ? `<button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Hide" : "▾ Review AI"}</button>` : ""}</td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
+      <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
   }
 
   function bulkToolbarHtml() {
@@ -314,13 +319,13 @@
       state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
       state.articleCursor = data.page?.next_cursor || null;
       state.articleHasMore = Boolean(data.page?.has_more);
-      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>${aiPreviewControls()}
+      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>
         <button class="media-button media-button--primary" data-focus-add>+ Add Article</button></div>
         <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
         <div data-url-result></div>${aiUsageHtml()}</section>
         <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form>
           <label class="media-field"><span>Sort</span><select data-article-sort>${SORTS.map(([value, label]) => `<option value="${value}"${state.filters.sort === value ? " selected" : ""}>${label}</option>`).join("")}</select></label></div>
-          ${filterPanel()}<div data-article-table>${articleTableHtml()}</div></section>`);
+          ${filterPanel()}${aiPreviewControls()}<div data-article-table>${articleTableHtml()}</div></section>`);
       bindArticleEvents();
     } catch (error) {
       setView(`<section class="media-card"><h3>Articles</h3>${message(error.message || "Media admin unavailable.", "error")}</section>`);
@@ -377,7 +382,7 @@
     state.root.querySelector("[data-url-lookup]")?.addEventListener("submit", event => { event.preventDefault(); void lookupUrl(new FormData(event.currentTarget).get("url")); });
     state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); clearArticleSelection(); void refreshArticleTable(); });
     state.root.querySelector("[data-clear-filters]")?.addEventListener("click", () => {
-      state.filters = { status: new Set(["approved"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" };
+      state.filters = { status: new Set(["pending"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" };
       clearArticleSelection();
       syncArticleFilterControls();
       const authorSearch = state.root.querySelector("[data-author-search]");
@@ -538,7 +543,7 @@
     return dialog;
   }
 
-  async function openArticle(id) {
+  async function openArticle(id, notice = "") {
     const dialog = detailDialog();
     dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading article…</div></div>`;
     if (!dialog.open) dialog.showModal();
@@ -547,11 +552,13 @@
       const guardianRouteKeys = article.source_key === "the-guardian"
         ? [...new Set((data.discovery_evidence || []).map(item => item.route_key).filter(Boolean))]
         : [];
-      dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>
+      const detailAiActions = article.ai_title_suggestion_state === "pending"
+        ? `<button type="button" class="media-button media-button--primary" data-detail-ai-decision="accept-ai">Accept AI title</button><button type="button" class="media-button" data-detail-ai-decision="reject-ai">Reject AI / use original</button>` : "";
+      dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
         <div class="media-detail__grid"><div>${article.admin_preview_image_path ? `<img class="media-detail__preview" src="${esc(apiUrl(`articles/${id}/image`))}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
         <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>AI suggestion</dt><dd>${esc(article.ai_title_suggestion || "—")} (${esc(article.ai_title_suggestion_state || "none")})</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatDate(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatDate(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatDate(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatDate(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div data-detail-status-message></div></section>
-        <section><h4>Display title</h4><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
+        <section><h4>Display title</h4><p>AI suggestion: ${esc(article.ai_title_suggestion || "—")} · ${esc(article.ai_title_suggestion_state || "none")}${article.ai_title_generated_at ? ` · ${esc(formatDate(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}` : ""}</p><div class="media-actions"><button type="button" class="media-button" data-detail-generate-ai>${article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title"}</button>${detailAiActions}</div><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
         <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
         <section><details><summary>Discovery evidence and recent events</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
       dialog.querySelector("[data-close-detail]")?.addEventListener("click", () => dialog.close());
@@ -566,7 +573,10 @@
       detailStatus?.querySelector("button")?.addEventListener("click", () => void saveDetailStatus(id, detailStatus, dialog));
       dialog.querySelector("[data-detail-title]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailTitle(id, new FormData(event.currentTarget).get("display_title"), dialog); });
       dialog.querySelector("[data-clear-title]")?.addEventListener("click", () => void saveDetailTitle(id, null, dialog));
+      dialog.querySelector("[data-detail-generate-ai]")?.addEventListener("click", event => void generateDetailAiTitle(id, event.currentTarget, dialog));
+      dialog.querySelectorAll("[data-detail-ai-decision]").forEach(button => button.addEventListener("click", () => void decideDetailAiTitle(id, button.dataset.detailAiDecision, dialog)));
       dialog.querySelector("[data-reload-metadata]")?.addEventListener("click", () => void reloadMetadata(id, article, dialog));
+      dialog.querySelector(".media-detail__preview[src]")?.addEventListener("error", event => { event.currentTarget.outerHTML = `<div class="media-thumb-fallback media-detail__preview">Image unavailable</div>`; }, { once: true });
     } catch (error) { dialog.innerHTML = `<div class="media-detail__inner">${message(error.message, "error")}<button class="media-button" onclick="this.closest('dialog').close()">Close</button></div>`; }
   }
 
@@ -590,6 +600,35 @@
     const output = dialog.querySelector("[data-detail-title-message]");
     try { await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: value === null ? null : String(value) } }); output.innerHTML = message(value === null ? "Publisher original restored." : "Human display title saved.", "success"); void renderArticles(false); }
     catch (error) { output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function generateDetailAiTitle(id, button, dialog) {
+    const output = dialog.querySelector("[data-detail-title-message]");
+    button.disabled = true; button.textContent = "Generating AI title…";
+    output.innerHTML = message("Generating one accounted AI title suggestion…");
+    try {
+      const data = await request(`articles/${id}/display-title/generate-ai`, { method: "POST", idempotent: "ai-title" });
+      updateArticleFromMutation(id, data.article);
+      rerenderArticleTable();
+      void refreshAiUsage();
+      await openArticle(id, data.generation?.outcome === "no_change"
+        ? "AI found no useful title change; the matching suggestion is pending for review."
+        : "AI title suggestion generated and left pending for review.");
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Generate / refresh AI title";
+      output.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function decideDetailAiTitle(id, action, dialog) {
+    const output = dialog.querySelector("[data-detail-title-message]");
+    try {
+      const data = await request(`articles/${id}/display-title/${action}`, { method: "POST" });
+      updateArticleFromMutation(id, data.article);
+      rerenderArticleTable();
+      await openArticle(id, "Title decision saved.");
+    } catch (error) { output.innerHTML = message(error.message, "error"); }
   }
 
   async function reloadMetadata(id, article, dialog) {
@@ -639,6 +678,7 @@
     const workspace = state.root.querySelector("[data-article-table]");
     if (!workspace) return;
     workspace.querySelectorAll("[data-ai-id]").forEach(row => AI_PREVIEW_MODES.forEach(value => row.classList.toggle(`media-ai-preview-mode--${value}`, value === mode)));
+    state.root.querySelectorAll("[data-ai-preview-controls]").forEach(control => AI_PREVIEW_MODES.forEach(value => control.classList.toggle(`media-ai-preview-mode--${value}`, value === mode)));
     state.root.querySelectorAll("[data-ai-preview-mode]").forEach(button => {
       const selected = button.dataset.aiPreviewMode === mode;
       button.classList.toggle("is-active", selected);
@@ -677,21 +717,67 @@
     pending.forEach(row => observer.observe(row));
   }
 
+  function updateArticleFromMutation(id, changed) {
+    const index = state.articles.findIndex(article => String(article.id) === String(id));
+    if (index >= 0 && changed) state.articles[index] = { ...state.articles[index], ...changed };
+    articleDetailCache.delete(String(id));
+  }
+
+  function rerenderArticleTable() {
+    const table = state.root.querySelector("[data-article-table]");
+    if (!table) return;
+    table.innerHTML = articleTableHtml();
+    bindArticleTableEvents();
+  }
+
+  async function refreshAiUsage() {
+    const current = state.root.querySelector("[data-ai-usage]");
+    if (!current) return;
+    const usage = await request("ai-usage", { params: new URLSearchParams({ limit: "1" }) }).catch(() => null);
+    if (!usage) return;
+    state.aiUsage = usage;
+    current.outerHTML = aiUsageHtml();
+  }
+
   function bindAiActions() {
     state.root.querySelectorAll("[data-ai-edit]").forEach(input => input.addEventListener("input", () => {
       const row = input.closest("[data-ai-id]");
       const title = row?.querySelector("[data-ai-preview-title]");
-      if (title) title.textContent = input.value.trim() || input.dataset.aiSuggestion || "";
+      if (title) title.textContent = input.value.trim() || row.dataset.currentTitle || "";
     }));
     state.root.querySelectorAll("[data-ai-preview-image]").forEach(image => image.addEventListener("error", () => image.remove(), { once: true }));
     state.root.querySelectorAll("[data-ai-action]").forEach(button => button.addEventListener("click", async () => {
       const row = button.closest("[data-ai-id]"); const id = row.dataset.aiId; const action = button.dataset.aiAction; const output = row.querySelector("[data-ai-message]");
+      const originalButtonText = button.textContent;
       try {
-        if (action === "accept-ai" || action === "reject-ai") await request(`articles/${id}/display-title/${action}`, { method: "POST" });
-        if (action === "edit") await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: row.querySelector("[data-ai-edit]").value } });
-        if (action === "clear") await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: null } });
-        output.innerHTML = message("Title decision saved.", "success"); setTimeout(() => void refreshArticleTable(false), 350);
-      } catch (error) { output.innerHTML = message(error.message, "error"); }
+        let data;
+        if (action === "generate") {
+          button.disabled = true; button.textContent = "Generating AI title…";
+          output.innerHTML = message("Generating one accounted AI title suggestion…");
+          data = await request(`articles/${id}/display-title/generate-ai`, { method: "POST", idempotent: "ai-title" });
+          state.titleMessages.set(String(id), { text: data.generation?.outcome === "no_change"
+            ? "AI found no useful title change; the matching suggestion is pending for review."
+            : "AI title suggestion generated and left pending for review.", kind: "success" });
+          void refreshAiUsage();
+        }
+        if (action === "accept-ai" || action === "reject-ai") {
+          data = await request(`articles/${id}/display-title/${action}`, { method: "POST" });
+          state.titleMessages.set(String(id), { text: "Title decision saved.", kind: "success" });
+        }
+        if (action === "edit") {
+          data = await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: row.querySelector("[data-ai-edit]").value } });
+          state.titleMessages.set(String(id), { text: "Human display title saved.", kind: "success" });
+        }
+        if (action === "clear") {
+          data = await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: null } });
+          state.titleMessages.set(String(id), { text: "Publisher original restored.", kind: "success" });
+        }
+        updateArticleFromMutation(id, data?.article);
+        rerenderArticleTable();
+      } catch (error) {
+        button.disabled = false; button.textContent = originalButtonText;
+        output.innerHTML = message(error.message, "error");
+      }
     }));
   }
 
