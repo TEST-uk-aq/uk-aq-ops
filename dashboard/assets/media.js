@@ -44,6 +44,7 @@
     selectedArticleIds: new Set(),
     expandedArticleIds: new Set(),
     aiUsage: null,
+    aiUsageUnavailable: false,
     batchMessage: "",
     runsCursor: null,
   };
@@ -259,6 +260,9 @@
   }
 
   function aiUsageHtml() {
+    if (state.aiUsageUnavailable) {
+      return `<details class="media-ai-usage"><summary>AI Usage</summary>${message("AI Usage unavailable", "error")}</details>`;
+    }
     const day = state.aiUsage?.usage_days?.[0] || {};
     const entries = [[day.calculated_neurons_used, "Calculated neurons used today"], [day.media_daily_neuron_budget, "Media daily neuron budget"], [day.media_budget_remaining, "Media budget remaining"], [day.configured_cloudflare_free_allocation_neurons, "Configured Cloudflare free allowance"], [day.estimated_cloudflare_free_neurons_remaining, "Estimated Cloudflare allowance remaining"], [day.ai_requests, "Request count"], [day.ai_titles_attempted, "Titles attempted"], [day.titles_generated_successfully, "Titles generated"], [day.prompt_tokens, "Input tokens"], [day.completion_tokens, "Output tokens"], [day.outstanding_reserved_neurons, "Outstanding reserved neurons"]];
     return `<details class="media-ai-usage"><summary>AI Usage</summary><p>Media’s local budget is enforced here; Cloudflare allowance values are estimates, not billing authority.</p><div class="media-stats">${entries.map(([value, label]) => `<div class="media-stat"><strong>${esc(value ?? 0)}</strong><span>${esc(label)}</span></div>`).join("")}</div></details>`;
@@ -309,8 +313,13 @@
     try {
       await ensureSelectors();
       const cursor = append ? state.articleCursor : null;
-      const [data, usage] = await Promise.all([request("articles", { params: articleParams(cursor) }), request("ai-usage", { params: new URLSearchParams({ limit: "1" }) }).catch(() => null)]);
+      let aiUsageUnavailable = false;
+      const [data, usage] = await Promise.all([request("articles", { params: articleParams(cursor) }), request("ai-usage", { params: new URLSearchParams({ limit: "1" }) }).catch(() => {
+        aiUsageUnavailable = true;
+        return null;
+      })]);
       state.aiUsage = usage;
+      state.aiUsageUnavailable = aiUsageUnavailable;
       state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
       state.articleCursor = data.page?.next_cursor || null;
       state.articleHasMore = Boolean(data.page?.has_more);
@@ -414,6 +423,11 @@
       if (event.target.checked) state.selectedArticleIds.add(id); else state.selectedArticleIds.delete(id);
       refreshSelectionControls();
     }));
+    state.root.querySelector("[data-bulk-status]")?.addEventListener("change", event => {
+      const count = state.selectedArticleIds.size;
+      const save = state.root.querySelector("[data-article-table] [data-save-bulk]");
+      if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !event.target.value;
+    });
     state.root.querySelector("[data-save-bulk]")?.addEventListener("click", () => void saveBulkStatus());
     state.root.querySelectorAll("[data-status-control] select").forEach(select => select.addEventListener("change", event => {
       const control = event.target.closest("[data-status-control]");
@@ -457,7 +471,6 @@
     const target = table.querySelector("[data-bulk-status]"); const save = table.querySelector("[data-save-bulk]");
     if (target) target.disabled = count === 0; if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value;
     const output = table.querySelector("[data-bulk-message]"); if (output) output.innerHTML = state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : "";
-    target?.addEventListener("change", () => { if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target.value; });
   }
 
   async function saveBulkStatus() {
