@@ -1,31 +1,9 @@
 export const MEDIA_PUBLIC_API_PATH = "/api/media/articles";
-export const MEDIA_PUBLIC_HOMEPAGE_VERSION_API_PATH = "/api/media/articles/homepage/version";
-export const MEDIA_PUBLIC_HOMEPAGE_API_PATH = "/api/media/articles/homepage";
 
+const MEDIA_PUBLIC_UPSTREAM_PATH = "/articles";
 const MEDIA_PUBLIC_TIMEOUT_MS = 10_000;
+const ALLOWED_QUERY_PARAMETERS = new Set(["limit", "before"]);
 const RELAYED_RESPONSE_HEADERS = ["Content-Type", "Cache-Control", "ETag", "Last-Modified"];
-
-type MediaPublicRoute = {
-  upstreamPath: string;
-  allowedQueryParameters: ReadonlySet<string>;
-  requiresGeneration?: boolean;
-};
-
-const MEDIA_PUBLIC_ROUTES: Readonly<Record<string, MediaPublicRoute>> = {
-  [MEDIA_PUBLIC_API_PATH]: {
-    upstreamPath: "/articles",
-    allowedQueryParameters: new Set(["limit", "before"]),
-  },
-  [MEDIA_PUBLIC_HOMEPAGE_VERSION_API_PATH]: {
-    upstreamPath: "/articles/homepage/version",
-    allowedQueryParameters: new Set(),
-  },
-  [MEDIA_PUBLIC_HOMEPAGE_API_PATH]: {
-    upstreamPath: "/articles/homepage",
-    allowedQueryParameters: new Set(["generation"]),
-    requiresGeneration: true,
-  },
-};
 
 export type MediaPublicRouteEnv = {
   UK_AQ_MEDIA_PUBLIC_URL?: unknown;
@@ -127,7 +105,7 @@ function resolveAllowedOrigin(request: Request, env: MediaPublicRouteEnv):
   };
 }
 
-function resolveUpstream(env: MediaPublicRouteEnv, path: string): UpstreamResolution {
+function resolveUpstream(env: MediaPublicRouteEnv): UpstreamResolution {
   const configured = stringValue(env.UK_AQ_MEDIA_PUBLIC_URL);
   if (!configured) return { ok: false, error: "media_upstream_not_configured" };
 
@@ -149,7 +127,7 @@ function resolveUpstream(env: MediaPublicRouteEnv, path: string): UpstreamResolu
     return { ok: false, error: "media_upstream_invalid" };
   }
 
-  return { ok: true, url: new URL(path, baseUrl) };
+  return { ok: true, url: new URL(MEDIA_PUBLIC_UPSTREAM_PATH, baseUrl) };
 }
 
 function relayResponse(upstreamResponse: Response, allowedOrigin: string | null): Response {
@@ -181,26 +159,18 @@ export async function handleMediaPublicRequest(
   }
 
   const requestUrl = new URL(request.url);
-  const route = MEDIA_PUBLIC_ROUTES[requestUrl.pathname];
-  if (!route) return jsonError(404, "media_route_not_found", "Media route was not found", allowedOrigin);
   for (const name of requestUrl.searchParams.keys()) {
-    if (!route.allowedQueryParameters.has(name)) {
+    if (!ALLOWED_QUERY_PARAMETERS.has(name)) {
       return jsonError(
         400,
         "unsupported_query_parameter",
-        "Query parameter is not supported for this Media route",
+        "Only limit and before query parameters are supported",
         allowedOrigin,
       );
     }
   }
-  const generation = requestUrl.searchParams.get("generation");
-  if (route.requiresGeneration && (requestUrl.searchParams.getAll("generation").length !== 1
-    || !generation || !/^\d{1,15}$/.test(generation)
-    || !Number.isSafeInteger(Number(generation)) || Number(generation) < 1)) {
-    return jsonError(400, "invalid_homepage_generation", "Homepage generation is invalid", allowedOrigin);
-  }
 
-  const upstream = resolveUpstream(env, route.upstreamPath);
+  const upstream = resolveUpstream(env);
   if (!upstream.ok) {
     const message = upstream.error === "media_upstream_not_configured"
       ? "Media public upstream is not configured"

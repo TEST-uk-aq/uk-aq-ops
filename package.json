@@ -39,7 +39,8 @@
     "geo:upload-shards": "node scripts/geography/upload_pcon_la_lookup_shards_to_r2.mjs",
     "geo:validate-stations": "python3 scripts/geography/validate_r2_geo_lookup_against_stations.py",
     "check:timeseries-v2-skeleton": "node scripts/uk_aq_cache_proxy/check_timeseries_v2_skeleton.mjs",
-    "test:timeseries-v2-stitch": "node --test tests/uk_aq_cache_proxy.timeseries_v2_stitch.test.mjs"
+    "test:timeseries-v2-stitch": "node --test tests/uk_aq_cache_proxy.timeseries_v2_stitch.test.mjs",
+    "check:media-public-proxy": "deno run workers/uk_aq_cache_proxy/src/media_public_route_check.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",
