@@ -18,17 +18,9 @@
     rejected: [["approved", "Approve", "approve"], ["hidden", "Hide", "hide"]],
     hidden: [["approved", "Approve", "unhide"], ["rejected", "Reject", "reject"]],
   };
-  const AI_PREVIEW_MODES = ["desktop", "carousel", "mobile"];
   const MAX_BATCH_SELECTION = 50;
   const articleDetailCache = new Map();
   let articleRefreshSequence = 0;
-
-  function storedAiPreviewMode() {
-    try {
-      const mode = sessionStorage.getItem("media-ai-preview-mode");
-      return AI_PREVIEW_MODES.includes(mode) ? mode : "desktop";
-    } catch (_error) { return "desktop"; }
-  }
 
   const state = {
     root: null,
@@ -40,7 +32,6 @@
     articleCursor: null,
     articleHasMore: false,
     filters: { status: new Set(["pending"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" },
-    aiPreviewMode: storedAiPreviewMode(),
     selectedArticleIds: new Set(),
     expandedArticleIds: new Set(),
     titleMessages: new Map(),
@@ -69,6 +60,14 @@
     if (Number.isNaN(date.getTime())) return "";
     return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "long", year: "numeric",
       timeZone: "UTC" }).format(date);
+  }
+
+  function formatHomepageDate(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "long", year: "numeric",
+      timeZone: "Europe/London" }).format(date);
   }
 
   function formatUtcDateTimeInput(value) {
@@ -264,10 +263,6 @@
     return article.ai_title_suggestion && state ? `AI suggestion · ${state}` : "AI suggestion";
   }
 
-  function aiPreviewControls() {
-    return `<div class="media-ai-preview-controls media-ai-preview-mode--${state.aiPreviewMode}" data-ai-preview-controls><span class="media-ai-preview-controls__label" id="media-ai-preview-label">Preview</span><div class="media-mini-nav" role="group" aria-labelledby="media-ai-preview-label">${AI_PREVIEW_MODES.map(value => `<button type="button" data-ai-preview-mode="${value}" class="${state.aiPreviewMode === value ? "is-active" : ""}" aria-pressed="${state.aiPreviewMode === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div></div>`;
-  }
-
   function articleSortControl() {
     return `<label class="media-field media-article-sort"><span>Sort</span><select data-article-sort>${SORTS.map(([value, label]) => `<option value="${value}"${state.filters.sort === value ? " selected" : ""}>${label}</option>`).join("")}</select></label>`;
   }
@@ -291,7 +286,10 @@
     const image = article.admin_preview_image_path
       ? `<img class="media-site-preview__image" loading="lazy" src="${esc(apiUrl(`articles/${article.id}/image`))}" alt="" data-ai-preview-image>` : "";
     const savedMessage = state.titleMessages.get(String(article.id));
-    return `<section class="media-review media-ai-preview-mode--${state.aiPreviewMode}" data-ai-id="${article.id}" data-current-title="${esc(currentTitle)}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website article card preview"><span class="media-site-preview__fallback">No permitted preview</span>${image}<div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(currentTitle)}</div></div></div></div><div class="media-review__controls"><span class="media-subtext">${provenance}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div><div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div><div class="media-review__title"><span>${esc(aiSuggestionLabel(article))}</span>${esc(article.ai_title_suggestion || "—")}</div></div><div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message>${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div></div></div></section>`;
+    const homepagePublished = formatHomepageDate(article.published_at);
+    const homepageSourceRow = `${esc(article.publisher)}<span data-homepage-preview-date>${homepagePublished ? ` · ${esc(homepagePublished)}` : ""}</span>`;
+    const externalLinkIcon = `<svg class="media-homepage-mobile-preview__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5M19 5l-9 9M18 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    return `<section class="media-review" data-ai-id="${article.id}" data-publisher-title="${esc(article.title)}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-preview-stack"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website image article card preview"><span class="media-site-preview__fallback">No permitted preview</span>${image}<div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(currentTitle)}</div></div></div></div><div class="media-homepage-mobile-preview-wrap"><div class="media-homepage-mobile-preview__label">Homepage mobile · 360px</div><div class="media-homepage-mobile-preview" aria-label="Homepage non-image article card at a 360 pixel viewport"><div class="media-homepage-mobile-preview__container"><div class="media-homepage-mobile-preview__card">${externalLinkIcon}<p class="media-homepage-mobile-preview__source">${homepageSourceRow}</p><h5 class="media-homepage-mobile-preview__headline"><span data-ai-preview-title>${esc(currentTitle)}</span></h5></div></div></div></div></div><div class="media-review__controls"><span class="media-subtext">${provenance}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div><div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div><div class="media-review__title"><span>${esc(aiSuggestionLabel(article))}</span>${esc(article.ai_title_suggestion || "—")}</div></div><div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message>${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div></div></div></section>`;
   }
 
   function articleRow(article) {
@@ -341,7 +339,7 @@
         <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
         <div data-url-result></div>${aiUsageHtml()}</section>
         <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form></div>
-          ${filterPanel()}<div class="media-article-controls">${aiPreviewControls()}${articleSortControl()}</div><div data-article-table>${articleTableHtml()}</div></section>`);
+          ${filterPanel()}<div class="media-article-controls">${articleSortControl()}</div><div data-article-table>${articleTableHtml()}</div></section>`);
       bindArticleEvents();
     } catch (error) {
       setView(`<section class="media-card"><h3>Articles</h3>${message(error.message || "Media admin unavailable.", "error")}</section>`);
@@ -423,7 +421,6 @@
 
   function bindArticleTableEvents() {
     state.root.querySelector("[data-load-more-articles]")?.addEventListener("click", () => void refreshArticleTable(true));
-    state.root.querySelectorAll("[data-ai-preview-mode]").forEach(button => button.addEventListener("click", () => setAiPreviewMode(button.dataset.aiPreviewMode)));
     state.root.querySelector("[data-select-all]")?.addEventListener("change", event => {
       const ids = state.articles.map(article => String(article.id));
       if (event.target.checked) ids.forEach(id => state.selectedArticleIds.add(id));
@@ -687,21 +684,6 @@
     } catch (error) { output.innerHTML = message(error.message, "error"); }
   }
 
-  function setAiPreviewMode(mode) {
-    if (!AI_PREVIEW_MODES.includes(mode)) return;
-    state.aiPreviewMode = mode;
-    try { sessionStorage.setItem("media-ai-preview-mode", mode); } catch (_error) { /* Session persistence is optional. */ }
-    const workspace = state.root.querySelector("[data-article-table]");
-    if (!workspace) return;
-    workspace.querySelectorAll("[data-ai-id]").forEach(row => AI_PREVIEW_MODES.forEach(value => row.classList.toggle(`media-ai-preview-mode--${value}`, value === mode)));
-    state.root.querySelectorAll("[data-ai-preview-controls]").forEach(control => AI_PREVIEW_MODES.forEach(value => control.classList.toggle(`media-ai-preview-mode--${value}`, value === mode)));
-    state.root.querySelectorAll("[data-ai-preview-mode]").forEach(button => {
-      const selected = button.dataset.aiPreviewMode === mode;
-      button.classList.toggle("is-active", selected);
-      button.setAttribute("aria-pressed", selected ? "true" : "false");
-    });
-  }
-
   async function hydrateAiPreviewDetail(row) {
     const id = row.dataset.aiId;
     if (!id || row.dataset.aiPublished === "true") return;
@@ -715,6 +697,9 @@
     if (!published || !row.isConnected) return;
     const date = row.querySelector("[data-ai-preview-date]");
     if (date) date.textContent = ` · ${published}`;
+    const homepageDate = formatHomepageDate(article?.published_at);
+    const homepageDateNode = row.querySelector("[data-homepage-preview-date]");
+    if (homepageDateNode && homepageDate) homepageDateNode.textContent = ` · ${homepageDate}`;
     row.dataset.aiPublished = "true";
   }
 
@@ -758,8 +743,8 @@
   function bindAiActions() {
     state.root.querySelectorAll("[data-ai-edit]").forEach(input => input.addEventListener("input", () => {
       const row = input.closest("[data-ai-id]");
-      const title = row?.querySelector("[data-ai-preview-title]");
-      if (title) title.textContent = input.value.trim() || row.dataset.currentTitle || "";
+      const title = input.value.trim() || row?.dataset.publisherTitle || "";
+      row?.querySelectorAll("[data-ai-preview-title]").forEach(preview => { preview.textContent = title; });
     }));
     state.root.querySelectorAll("[data-ai-preview-image]").forEach(image => image.addEventListener("error", () => image.remove(), { once: true }));
     state.root.querySelectorAll("[data-ai-action]").forEach(button => button.addEventListener("click", async () => {
