@@ -54,27 +54,20 @@
       .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
-  function formatUtcDateTime(value, includeUtcSuffix = true) {
+  function formatDate(value) {
     if (!value) return "—";
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return "—";
-    const formatted = new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric",
-      hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(date).replace(",", "");
-    return includeUtcSuffix ? `${formatted} UTC` : formatted;
+    return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Europe/London" }).format(date).replace(",", "");
   }
 
-  function formatUtcDate(value) {
+  function formatPublishedDate(value) {
     if (!value) return "";
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return "";
     return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "long", year: "numeric",
-      timeZone: "UTC" }).format(date);
-  }
-
-  function formatUtcDateTimeInput(value) {
-    if (!value) return "";
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 16);
+      timeZone: "Europe/London" }).format(date);
   }
 
   function duration(start, finish) {
@@ -277,11 +270,11 @@
   function inlineAiReview(article) {
     const pendingActions = article.ai_title_suggestion_state === "pending"
       ? `<button class="media-button media-button--primary" data-ai-action="accept-ai">Accept AI title</button><button class="media-button" data-ai-action="reject-ai">Reject AI / use original</button>` : "";
-    const published = formatUtcDate(article.published_at);
+    const published = formatPublishedDate(article.published_at);
     const sourceRow = `${esc(article.publisher)}<span data-ai-preview-date>${published ? ` · ${esc(published)}` : ""}</span>`;
     const currentTitle = article.display_title || article.title;
     const provenance = article.ai_title_generated_at
-      ? `Generated ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}${article.ai_title_prompt_version ? ` · ${esc(article.ai_title_prompt_version)}` : ""}`
+      ? `Generated ${esc(formatDate(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}${article.ai_title_prompt_version ? ` · ${esc(article.ai_title_prompt_version)}` : ""}`
       : "No AI title has been generated.";
     const generateLabel = article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title";
     const image = article.admin_preview_image_path
@@ -300,7 +293,7 @@
     return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}</td>
       <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
-      <td>${esc(formatUtcDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
+      <td>${esc(formatDate(article.published_at))}</td><td>${esc(formatDate(article.approved_at))}</td>
       <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
   }
 
@@ -314,7 +307,7 @@
     const selectedLoaded = state.articles.filter(article => state.selectedArticleIds.has(String(article.id))).length;
     const allSelected = state.articles.length > 0 && selectedLoaded === state.articles.length;
     return `${error ? message(error, "error") : ""}${bulkToolbarHtml()}<div class="media-table-wrap"><table class="media-table">
-      <thead><tr><th class="media-select-cell"><input type="checkbox" data-select-all aria-label="Select all currently loaded articles"${allSelected ? " checked" : ""}></th><th>Image</th><th>Title</th><th>Publication</th><th>Author</th><th>Published UTC</th><th>Approved UTC</th><th>Title Status</th><th>Article Status</th></tr></thead>
+      <thead><tr><th class="media-select-cell"><input type="checkbox" data-select-all aria-label="Select all currently loaded articles"${allSelected ? " checked" : ""}></th><th>Image</th><th>Title</th><th>Publication</th><th>Author</th><th>Published</th><th>Approved</th><th>Title Status</th><th>Article Status</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="9" class="media-empty">No articles match these filters.</td></tr>`}</tbody>
     </table></div>${state.articleHasMore ? `<div class="media-actions"><button class="media-button" data-load-more-articles>Load more</button></div>` : ""}`;
   }
@@ -527,7 +520,7 @@
           <label class="media-field media-field--grow"><span>Publisher title</span><input name="title" required maxlength="1000" value="${esc(metadata.title || "")}"></label>
           <label class="media-field"><span>Publication</span><input name="publisher" required maxlength="200" value="${esc(metadata.publisher || data.source?.name || "")}"></label>
           <label class="media-field"><span>Author</span><input name="author" maxlength="500" value="${esc(metadata.author || "")}"></label>
-          <label class="media-field"><span>Published UTC</span><input name="published_at" type="datetime-local" value="${esc(formatUtcDateTimeInput(metadata.published_at))}"></label>
+          <label class="media-field"><span>Published</span><input name="published_at" type="datetime-local" value="${metadata.published_at ? esc(metadata.published_at.slice(0, 16)) : ""}"></label>
           <input type="hidden" name="preview_image_url" value="${esc(metadata.image_url || "")}">
           <button class="media-button media-button--primary">Add approved</button>
         </form><p class="media-subtext">Creation records status Approved and approval method Manual. ${data.source?.will_create_disabled_definition ? "A conservative disabled publisher definition will also be created." : ""}</p>`;
@@ -542,7 +535,7 @@
       const data = await request("articles", { method: "POST", idempotent: "add", body: {
         url: values.get("url"), title: values.get("title"), publisher: values.get("publisher"),
         author: String(values.get("author") || "").trim() || null,
-        published_at: published ? new Date(`${published}Z`).toISOString() : null,
+        published_at: published ? new Date(published).toISOString() : null,
         preview_image_url: String(values.get("preview_image_url") || "").trim() || null,
       } });
       result.innerHTML = message("Article added and approved with manual provenance.", "success");
@@ -569,11 +562,11 @@
         ? `<button type="button" class="media-button media-button--primary" data-detail-ai-decision="accept-ai">Accept AI title</button><button type="button" class="media-button" data-detail-ai-decision="reject-ai">Reject AI / use original</button>` : "";
       dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
         <div class="media-detail__grid"><div>${article.admin_preview_image_path ? `<img class="media-detail__preview" src="${esc(apiUrl(`articles/${id}/image`))}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
-        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatUtcDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
+        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatDate(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatDate(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatDate(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatDate(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div data-detail-status-message></div></section>
-        <section><h4>Display title</h4><p>${esc(aiSuggestionLabel(article))}${article.ai_title_generated_at ? ` · ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}` : ""}</p><p>${esc(article.ai_title_suggestion || "—")}</p><div class="media-actions"><button type="button" class="media-button" data-detail-generate-ai>${article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title"}</button>${detailAiActions}</div><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
+        <section><h4>Display title</h4><p>${esc(aiSuggestionLabel(article))}${article.ai_title_generated_at ? ` · ${esc(formatDate(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}` : ""}</p><p>${esc(article.ai_title_suggestion || "—")}</p><div class="media-actions"><button type="button" class="media-button" data-detail-generate-ai>${article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title"}</button>${detailAiActions}</div><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
         <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
-        <section><details><summary>Discovery evidence and recent events (raw ISO UTC)</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
+        <section><details><summary>Discovery evidence and recent events</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
       dialog.querySelector("[data-close-detail]")?.addEventListener("click", () => dialog.close());
       const detailStatus = dialog.querySelector("[data-detail-status]");
       detailStatus?.querySelector("select")?.addEventListener("change", event => {
@@ -655,7 +648,7 @@
         if (!refresh?.proposed_image || refresh.current_image?.url === refresh.proposed_image.url) {
           output.innerHTML = message("No useful metadata change found."); return;
         }
-        output.innerHTML = `<div class="media-message"><strong>Proposed Guardian RSS image (raw ISO UTC timestamps)</strong><pre>${esc(JSON.stringify({ current: refresh.current_image, proposed: refresh.proposed_image }, null, 2))}</pre><button class="media-button media-button--primary" data-apply-guardian-image>${refresh.replacement_required ? "Replace image" : "Apply metadata"}</button></div>`;
+        output.innerHTML = `<div class="media-message"><strong>Proposed Guardian RSS image</strong><pre>${esc(JSON.stringify({ current: refresh.current_image, proposed: refresh.proposed_image }, null, 2))}</pre><button class="media-button media-button--primary" data-apply-guardian-image>${refresh.replacement_required ? "Replace image" : "Apply metadata"}</button></div>`;
         output.querySelector("[data-apply-guardian-image]")?.addEventListener("click", async () => {
           try {
             await request(`articles/${id}/guardian-image-refresh/apply`, { method: "POST", body: {
@@ -672,7 +665,7 @@
       }
       const data = await request(`articles/${id}/metadata/preview`, { method: "POST" });
       if (!data.has_useful_change) { output.innerHTML = message("No useful metadata change found."); return; }
-      output.innerHTML = `<div class="media-message"><strong>Proposed changes (raw ISO UTC timestamps)</strong><pre>${esc(JSON.stringify(data.changes, null, 2))}</pre><button class="media-button media-button--primary" data-apply-metadata>Apply metadata${data.changes.image?.replacement_required ? " / replace image" : ""}</button></div>`;
+      output.innerHTML = `<div class="media-message"><strong>Proposed changes</strong><pre>${esc(JSON.stringify(data.changes, null, 2))}</pre><button class="media-button media-button--primary" data-apply-metadata>Apply metadata${data.changes.image?.replacement_required ? " / replace image" : ""}</button></div>`;
       output.querySelector("[data-apply-metadata]")?.addEventListener("click", async () => {
         try { await request(`articles/${id}/metadata/apply`, { method: "PUT", idempotent: "metadata", body: {
           expected_current_image_url: data.changes.image?.current ?? article.og_image_url ?? null,
@@ -708,7 +701,7 @@
       articleDetailCache.set(id, detail);
     }
     const article = await detail;
-    const published = formatUtcDate(article?.published_at);
+    const published = formatPublishedDate(article?.published_at);
     if (!published || !row.isConnected) return;
     const date = row.querySelector("[data-ai-preview-date]");
     if (date) date.textContent = ` · ${published}`;
@@ -801,7 +794,7 @@
       const data = await request("runs", { params });
       const rows = append ? (state.runRows || []).concat(data.runs || []) : (data.runs || []);
       state.runRows = rows; state.runsCursor = data.page?.next_cursor || null;
-      setView(`<section class="media-card"><h3>Recent discovery runs</h3><p>Newest first; diagnostics are bounded to stored run evidence.</p><div class="media-table-wrap"><table class="media-table"><thead><tr><th>Publication</th><th>Route</th><th>Started UTC</th><th>Duration</th><th>Status</th><th>Seen</th><th>Inserted</th><th>Updated</th><th>Filtered</th><th>Invalid</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(run.source_name || run.source_key || "System")}</td><td>${esc(run.discovery_route_key || "—")}</td><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td>${esc(run.items_seen)}</td><td>${esc(run.items_inserted)}</td><td>${esc(run.items_updated)}</td><td>${esc(run.items_filtered ?? 0)}</td><td>${esc(run.items_invalid)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · raw ISO UTC evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="11" class="media-empty">No discovery runs found.</td></tr>`}</tbody></table></div>${data.page?.has_more ? `<button class="media-button" data-load-more-runs>Load more</button>` : ""}</section>`);
+      setView(`<section class="media-card"><h3>Recent discovery runs</h3><p>Newest first; diagnostics are bounded to stored run evidence.</p><div class="media-table-wrap"><table class="media-table"><thead><tr><th>Publication</th><th>Route</th><th>Started</th><th>Duration</th><th>Status</th><th>Seen</th><th>Inserted</th><th>Updated</th><th>Filtered</th><th>Invalid</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(run.source_name || run.source_key || "System")}</td><td>${esc(run.discovery_route_key || "—")}</td><td>${esc(formatDate(run.started_at))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td>${esc(run.items_seen)}</td><td>${esc(run.items_inserted)}</td><td>${esc(run.items_updated)}</td><td>${esc(run.items_filtered ?? 0)}</td><td>${esc(run.items_invalid)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)}</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="11" class="media-empty">No discovery runs found.</td></tr>`}</tbody></table></div>${data.page?.has_more ? `<button class="media-button" data-load-more-runs>Load more</button>` : ""}</section>`);
       state.root.querySelector("[data-load-more-runs]")?.addEventListener("click", () => void renderRuns(true));
     } catch (error) { setView(`<section class="media-card"><h3>Runs</h3>${message(error.message, "error")}</section>`); }
   }
@@ -819,7 +812,7 @@
   function sourceCard(source, rules) {
     let config = source.discovery_config_json; try { config = JSON.stringify(JSON.parse(config), null, 2); } catch (_error) {}
     return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
-      ${[["Canonical domain", source.canonical_domain], ["Source type", source.source_type], ["Discovery adapter", source.discovery_method], ["Review level", source.review_level], ["Content fetch", source.content_fetch_policy], ["AI content", source.ai_content_policy], ["Image policy", source.image_policy], ["Recent run", source.recent_run_status ? `${source.recent_run_status} · ${formatUtcDateTime(source.recent_run_started_at)}` : "No run"]].map(([label, value]) => `<div><span class="media-subtext">${label}</span>${esc(value)}</div>`).join("")}
+      ${[["Canonical domain", source.canonical_domain], ["Source type", source.source_type], ["Discovery adapter", source.discovery_method], ["Review level", source.review_level], ["Content fetch", source.content_fetch_policy], ["AI content", source.ai_content_policy], ["Image policy", source.image_policy], ["Recent run", source.recent_run_status ? `${source.recent_run_status} · ${formatDate(source.recent_run_started_at)}` : "No run"]].map(([label, value]) => `<div><span class="media-subtext">${label}</span>${esc(value)}</div>`).join("")}
       <label class="media-field"><span>Publication policy</span><select data-source-policy><option value="manual"${source.publication_policy === "manual" ? " selected" : ""}>manual</option><option value="auto_approve"${source.publication_policy === "auto_approve" ? " selected" : ""}>auto_approve</option></select></label>
       <label class="media-field"><span>Enabled</span><select data-source-enabled><option value="false"${!source.enabled ? " selected" : ""}>No</option><option value="true"${source.enabled ? " selected" : ""}>Yes</option></select></label>
       <button class="media-button media-button--primary" data-save-source>Save source policy</button></div>
