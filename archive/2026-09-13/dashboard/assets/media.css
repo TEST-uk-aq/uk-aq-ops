@@ -240,9 +240,8 @@ button.media-save-state { cursor: pointer; }
 .media-review__title { padding: 10px; border-radius: 9px; background: var(--card); }
 .media-review__title span { display: block; color: var(--muted); font-size: 13px; }
 .media-ai-toolbar { align-items: start; }
-.media-article-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0 2px; }
-.media-ai-preview-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-start; gap: 8px; }
-.media-article-sort { flex: 0 1 330px; max-width: 100%; margin-left: auto; }
+.media-ai-preview-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.media-active-filters + .media-ai-preview-controls { margin: 10px 0 2px; }
 .media-ai-preview-controls .media-mini-nav { margin-top: 0; }
 .media-ai-preview-controls__label { color: var(--muted); font-size: 14px; font-weight: 700; }
 .media-ai-carousel-note { display: none; max-width: 250px; color: var(--muted); font-size: 12px; line-height: 1.3; }

@@ -268,6 +268,10 @@
     return `<div class="media-ai-preview-controls media-ai-preview-mode--${state.aiPreviewMode}" data-ai-preview-controls><span class="media-ai-preview-controls__label" id="media-ai-preview-label">Preview</span><div class="media-mini-nav" role="group" aria-labelledby="media-ai-preview-label">${AI_PREVIEW_MODES.map(value => `<button type="button" data-ai-preview-mode="${value}" class="${state.aiPreviewMode === value ? "is-active" : ""}" aria-pressed="${state.aiPreviewMode === value}">${value[0].toUpperCase() + value.slice(1)}</button>`).join("")}</div></div>`;
   }
 
+  function articleSortControl() {
+    return `<label class="media-field media-article-sort"><span>Sort</span><select data-article-sort>${SORTS.map(([value, label]) => `<option value="${value}"${state.filters.sort === value ? " selected" : ""}>${label}</option>`).join("")}</select></label>`;
+  }
+
   function aiUsageHtml() {
     const day = state.aiUsage?.usage_days?.[0] || {};
     const entries = [[day.calculated_neurons_used, "Calculated neurons used today"], [day.media_daily_neuron_budget, "Media daily neuron budget"], [day.media_budget_remaining, "Media budget remaining"], [day.configured_cloudflare_free_allocation_neurons, "Configured Cloudflare free allowance"], [day.estimated_cloudflare_free_neurons_remaining, "Estimated Cloudflare allowance remaining"], [day.ai_requests, "Request count"], [day.ai_titles_attempted, "Titles attempted"], [day.titles_generated_successfully, "Titles generated"], [day.prompt_tokens, "Input tokens"], [day.completion_tokens, "Output tokens"], [day.outstanding_reserved_neurons, "Outstanding reserved neurons"]];
@@ -336,9 +340,8 @@
         <button class="media-button media-button--primary" data-focus-add>+ Add Article</button></div>
         <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
         <div data-url-result></div>${aiUsageHtml()}</section>
-        <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form>
-          <label class="media-field"><span>Sort</span><select data-article-sort>${SORTS.map(([value, label]) => `<option value="${value}"${state.filters.sort === value ? " selected" : ""}>${label}</option>`).join("")}</select></label></div>
-          ${filterPanel()}${aiPreviewControls()}<div data-article-table>${articleTableHtml()}</div></section>`);
+        <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form></div>
+          ${filterPanel()}<div class="media-article-controls">${aiPreviewControls()}${articleSortControl()}</div><div data-article-table>${articleTableHtml()}</div></section>`);
       bindArticleEvents();
     } catch (error) {
       setView(`<section class="media-card"><h3>Articles</h3>${message(error.message || "Media admin unavailable.", "error")}</section>`);
