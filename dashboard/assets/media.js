@@ -3,6 +3,7 @@
 
   const TABS = ["articles", "runs", "sources"];
   const TAB_LABELS = { articles: "Articles", runs: "Runs", sources: "Sources" };
+  const RUN_KINDS = ["publisher", "gdelt"];
   const SORTS = [
     ["published_desc", "Published Date: Newest to Oldest"],
     ["published_asc", "Published Date: Oldest to Newest"],
@@ -37,7 +38,9 @@
     titleMessages: new Map(),
     aiUsage: null,
     batchMessage: "",
-    runsCursor: null,
+    runsKind: "publisher",
+    publisherRuns: { rows: null, error: "", loading: false },
+    gdeltRuns: { rows: null, error: "", loading: false },
   };
 
   function esc(value) {
@@ -131,7 +134,7 @@
       button.setAttribute("aria-selected", active ? "true" : "false");
     });
     if (tab === "articles") void renderArticles(false);
-    if (tab === "runs") void renderRuns(false);
+    if (tab === "runs") void renderRuns(true);
     if (tab === "sources") void renderSources(false);
   }
 
@@ -782,16 +785,57 @@
     }));
   }
 
-  async function renderRuns(append) {
-    if (!append) setView(`<section class="media-card"><div class="media-loading">Loading Runs…</div></section>`);
+  function runsState(kind) {
+    return kind === "gdelt" ? state.gdeltRuns : state.publisherRuns;
+  }
+
+  function formatGdeltMinute(value) {
+    const match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})00$/.exec(String(value || ""));
+    return match ? `${match[3]}/${match[2]}/${match[1]} ${match[4]}:${match[5]} UTC` : formatUtcDateTime(value, false);
+  }
+
+  function publisherRunsTable(rows) {
+    return `<div class="media-table-wrap"><table class="media-table"><thead><tr><th>Publication</th><th>Route</th><th>Started UTC</th><th>Duration</th><th>Status</th><th>Seen</th><th>Inserted</th><th>Updated</th><th>Filtered</th><th>Invalid</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(run.source_name || run.source_key || "System")}</td><td>${esc(run.discovery_route_key || "—")}</td><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td>${esc(run.items_seen)}</td><td>${esc(run.items_inserted)}</td><td>${esc(run.items_updated)}</td><td>${esc(run.items_filtered ?? 0)}</td><td>${esc(run.items_invalid)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · raw ISO UTC evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="11" class="media-empty">No discovery runs found.</td></tr>`}</tbody></table></div>`;
+  }
+
+  function gdeltRunsTable(rows) {
+    return `<div class="media-table-wrap"><table class="media-table"><thead><tr><th>Started UTC</th><th>Duration</th><th>Status</th><th>Window</th><th>Completed through</th><th>Pairs processed</th><th>Pairs replayed</th><th>Missing minutes</th><th>Matches</th><th>Candidates inserted</th><th>Candidates updated</th><th>UK candidates</th><th>UK promoted</th><th>Malformed</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td>${esc(`${formatGdeltMinute(run.window_start)} → ${formatGdeltMinute(run.window_end)}`)}</td><td>${esc(formatGdeltMinute(run.completed_through))}</td><td>${esc(run.complete_pairs_processed)}</td><td>${esc(run.complete_pairs_replayed)}</td><td>${esc(run.missing_minutes)}</td><td>${esc(run.matches_seen)}</td><td>${esc(run.candidates_inserted)}</td><td>${esc(run.candidates_updated)}</td><td>${esc(run.candidates_uk)}</td><td>${esc(run.uk_promoted)}</td><td>${esc(run.malformed_rows)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · stored run evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="15" class="media-empty">No GDELT runs found.</td></tr>`}</tbody></table></div>`;
+  }
+
+  function renderRunsView() {
+    const kind = state.runsKind;
+    const current = runsState(kind);
+    const table = current.loading ? `<div class="media-loading">Loading ${kind === "gdelt" ? "GDELT" : "Publisher"} Runs…</div>`
+      : current.error ? message(current.error, "error")
+        : kind === "gdelt" ? gdeltRunsTable(current.rows || []) : publisherRunsTable(current.rows || []);
+    setView(`<section class="media-card"><h3>Recent discovery runs</h3><p>Newest first; diagnostics are bounded to stored run evidence.</p><nav class="media-mini-nav" role="tablist" aria-label="Run type">${RUN_KINDS.map(runKind => `<button type="button" data-run-kind="${runKind}" role="tab" aria-selected="${runKind === kind}" class="${runKind === kind ? "is-active" : ""}">${runKind === "gdelt" ? "GDELT" : "Publisher"}</button>`).join("")}</nav>${table}</section>`);
+    state.root.querySelectorAll("[data-run-kind]").forEach(button => button.addEventListener("click", () => {
+      const nextKind = button.dataset.runKind;
+      if (!RUN_KINDS.includes(nextKind) || nextKind === state.runsKind) return;
+      state.runsKind = nextKind;
+      void renderRuns(false);
+    }));
+  }
+
+  async function renderRuns(refresh) {
+    const kind = state.runsKind;
+    const current = runsState(kind);
+    if (!refresh && (current.rows !== null || current.loading)) {
+      renderRunsView();
+      return;
+    }
+    current.loading = true;
+    current.error = "";
+    renderRunsView();
     try {
-      const params = new URLSearchParams({ limit: "20" }); if (append && state.runsCursor) params.set("cursor", state.runsCursor);
-      const data = await request("runs", { params });
-      const rows = append ? (state.runRows || []).concat(data.runs || []) : (data.runs || []);
-      state.runRows = rows; state.runsCursor = data.page?.next_cursor || null;
-      setView(`<section class="media-card"><h3>Recent discovery runs</h3><p>Newest first; diagnostics are bounded to stored run evidence.</p><div class="media-table-wrap"><table class="media-table"><thead><tr><th>Publication</th><th>Route</th><th>Started UTC</th><th>Duration</th><th>Status</th><th>Seen</th><th>Inserted</th><th>Updated</th><th>Filtered</th><th>Invalid</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(run.source_name || run.source_key || "System")}</td><td>${esc(run.discovery_route_key || "—")}</td><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td>${esc(run.items_seen)}</td><td>${esc(run.items_inserted)}</td><td>${esc(run.items_updated)}</td><td>${esc(run.items_filtered ?? 0)}</td><td>${esc(run.items_invalid)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · raw ISO UTC evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="11" class="media-empty">No discovery runs found.</td></tr>`}</tbody></table></div>${data.page?.has_more ? `<button class="media-button" data-load-more-runs>Load more</button>` : ""}</section>`);
-      state.root.querySelector("[data-load-more-runs]")?.addEventListener("click", () => void renderRuns(true));
-    } catch (error) { setView(`<section class="media-card"><h3>Runs</h3>${message(error.message, "error")}</section>`); }
+      const data = await request(kind === "gdelt" ? "runs/gdelt" : "runs", { params: new URLSearchParams({ limit: "20" }) });
+      current.rows = data.runs || [];
+    } catch (error) {
+      current.error = error.message;
+    } finally {
+      current.loading = false;
+      if (state.tab === "runs" && state.runsKind === kind) renderRunsView();
+    }
   }
 
   async function renderSources() {

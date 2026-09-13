@@ -29,7 +29,6 @@ _ROUTES = (
     (re.compile(r"^/api/media/articles/[1-9]\d*/metadata/preview$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/metadata/apply$"), {"PUT"}),
     (re.compile(r"^/api/media/(?:ai-titles|ai-usage|runs)$"), {"GET"}),
-    (re.compile(r"^/api/media/runs/gdelt$"), {"GET"}),
     (re.compile(r"^/api/media/sources$"), {"GET", "POST"}),
     (re.compile(r"^/api/media/sources/[a-z0-9]+(?:-[a-z0-9]+)*$"), {"PUT"}),
     (re.compile(r"^/api/media/author-rules$"), {"POST"}),

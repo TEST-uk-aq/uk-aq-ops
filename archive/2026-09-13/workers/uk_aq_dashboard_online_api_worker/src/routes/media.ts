@@ -18,7 +18,6 @@ const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/metadata\/apply$/, methods: new Set(['PUT']) },
   { pattern: /^\/api\/media\/ai-usage$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/runs$/, methods: new Set(['GET']) },
-  { pattern: /^\/api\/media\/runs\/gdelt$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/sources$/, methods: new Set(['GET', 'POST']) },
   { pattern: /^\/api\/media\/sources\/[a-z0-9]+(?:-[a-z0-9]+)*$/, methods: new Set(['PUT']) },
   { pattern: /^\/api\/media\/author-rules$/, methods: new Set(['POST']) },
