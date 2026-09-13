@@ -146,6 +146,8 @@
 .media-table td { padding: 9px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
 .media-table td { font-size: 15px; }
 .media-table th { background: var(--card); color: var(--muted); font-size: 14px; white-space: nowrap; }
+.media-table--gdelt { min-width: 950px; }
+.media-table--gdelt th { white-space: normal; line-height: 1.15; }
 .media-table tbody tr { cursor: pointer; }
 .media-table tbody tr:hover { background: rgba(31, 122, 122, 0.045); }
 .media-table tbody tr:last-child td { border-bottom: 0; }
