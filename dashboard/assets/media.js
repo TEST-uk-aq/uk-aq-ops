@@ -680,7 +680,12 @@
         try { await request(`articles/${id}/metadata/apply`, { method: "PUT", idempotent: "metadata", body: {
           expected_current_image_url: data.changes.image?.current ?? article.og_image_url ?? null,
           expected_proposed_image_url: data.changes.image?.expected_proposed_image_url ?? null,
-          replace_existing_image: Boolean(data.changes.image?.replacement_required), apply_publisher_display_title: true,
+          replace_existing_image: Boolean(data.changes.image?.replacement_required),
+          apply_publisher_display_title: true,
+          expected_current_published_at:
+            data.changes.published_at?.current ?? article.published_at ?? null,
+          expected_proposed_published_at: data.changes.published_at?.proposed ?? null,
+          apply_publisher_published_at: Boolean(data.changes.published_at),
         } }); output.innerHTML = message("Metadata applied without changing editorial state.", "success"); void renderArticles(false); }
         catch (error) { output.innerHTML = message(error.message, "error"); }
       });
