@@ -306,11 +306,7 @@ async function handleObservations(params, env, diagnosticContext) {
     physicalCursor: params.physicalCursor,
     index: observationHistoryV3ReaderIndex(indexRoot),
   });
-  const rows = result.rows.map((row) => ({
-    observed_at: row.observed_at_utc,
-    value: row.value,
-    vstatus: row.vstatus ?? row.verification_status ?? null,
-  }));
+  const rows = result.rows.map((row) => ({ observed_at: row.observed_at_utc, value: row.value }));
   const partialReasons = result.partial_reasons;
   const complete = result.response_complete === true;
   const hasGap = result.has_gap === true;

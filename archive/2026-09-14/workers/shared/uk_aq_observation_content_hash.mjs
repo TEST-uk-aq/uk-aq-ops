@@ -37,11 +37,14 @@ function canonicalStationId(value) {
 }
 
 export function normalizeUkAirVerificationStatus(value) {
-  const normalized = String(value ?? "").trim().toLowerCase();
-  // The UK-AIR annual CSV status cell is authoritative only when it says the
-  // observation is ratified. Every other valid, non-null AURN observation is
-  // provisional; absence of an explicit provisional marker is not a third state.
-  return normalized === "r" || normalized === "ratified" ? "R" : "P";
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "p" || normalized === "provisional") return "P";
+  if (normalized === "r" || normalized === "ratified") return "R";
+  throw new TypeError(
+    `Unsupported UK-AIR verification status: ${JSON.stringify(String(value))}`,
+  );
 }
 
 export function requireCanonicalVerificationStatus(value) {

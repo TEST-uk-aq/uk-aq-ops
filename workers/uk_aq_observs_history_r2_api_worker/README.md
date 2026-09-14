@@ -75,7 +75,7 @@ V2 serving rule:
 
 Response:
 
-- returns `{ observed_at, value }` rows sorted by `observed_at` ascending.
+- returns `{ observed_at, value, vstatus }` rows sorted by `observed_at` ascending; legacy rows without a status return `vstatus: null`.
 - includes `cache_scope` (`recent` or `immutable`) for cache policy visibility.
 - includes `read_version`, `index_version`, `pollutant`, `history_index_prefix`,
   and `timeseries_index_prefix` for read-path visibility.
