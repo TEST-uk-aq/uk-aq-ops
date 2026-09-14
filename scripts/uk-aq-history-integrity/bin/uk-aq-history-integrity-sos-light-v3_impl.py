@@ -5979,8 +5979,6 @@ def run_narrow_backfill(
             "--env",
             env_name,
             "--observs-only",
-            "--history-version",
-            history_version,
             "--from-day",
             iso,
             "--to-day",
@@ -18510,7 +18508,7 @@ def run_v2_observation_content_hash_checks(
                     f"v2_obs_hash_day_{day_utc}_connector_{connector_id}"
                 ),
                 output_scope="observations_only",
-                history_version="v2",
+                history_version=CURRENT_INTEGRITY_HISTORY_VERSION,
                 extra_env={
                     "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
                     "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
@@ -28898,8 +28896,9 @@ def _v2_top_level_status_after_repair_planning(
         if any_stopped:
             return "stopped_limit"
         return current_status
-    if v2_gap_count > 0:
-        return "fail"
+    # Check-only has no repair phase.  Report observed differences in full,
+    # but do not turn a successfully completed diagnostic into a failed run
+    # merely because repairable differences remain.
     return current_status
 
 
@@ -29493,12 +29492,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 "",
                 f"- Checks implemented: {bool(config.get('checks_implemented'))}",
                 f"- Observations data prefix: {config.get('observations_data_prefix')}",
-                f"- AQI hourly data prefix: {config.get('aqilevels_hourly_data_prefix')}",
-                f"- AQI hourly debug prefix: {config.get('aqilevels_hourly_debug_prefix') or '(none)'}",
                 f"- Observations index prefix: {config.get('observations_timeseries_index_prefix')}",
-                f"- AQI index prefix: {config.get('aqilevels_timeseries_index_prefix')}",
                 f"- Observations latest index: {config.get('observations_latest_index_key')}",
-                f"- AQI latest index: {config.get('aqilevels_latest_index_key')}",
             ])
         lines.append("")
 
@@ -29613,7 +29608,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
     repair_flow = s.get("repair_flow") or {}
     if repair_flow:
         lines.extend([
-            "## V2 repair coordinator",
+            "## Observation repair coordinator",
             "",
             f"- Status: {repair_flow.get('status') or '(none)'}",
             f"- Execution path: {repair_flow.get('execution_path') or 'generic_integrity'}",
@@ -29936,7 +29931,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Not-found cooldown secs: {sos.get('not_found_cooldown_seconds', 0)}",
             f"- Cross-check discrepancies: {cc_for_sos.get('discrepancy_total', 0)}",
             f"- Observation repairs: attempted={cc_for_sos.get('observation_backfills_attempted', cc_for_sos.get('backfills_attempted', 0))} ok={cc_for_sos.get('observation_backfills_ok', cc_for_sos.get('backfills_ok', 0))} failed={cc_for_sos.get('observation_backfills_failed', cc_for_sos.get('backfills_failed', 0))}",
-            f"- AQI rebuilds: queued={cc_for_sos.get('aqi_rebuilds_queued_total', 0)} proposal_validated={cc_for_sos.get('aqi_rebuilds_proposal_validated', 0)} complete={cc_for_sos.get('aqi_rebuilds_complete', 0)} failed={cc_for_sos.get('aqi_rebuilds_failed', 0)}",
             f"- Stopped for:    {sos.get('stopped_for') or '(none)'}",
             f"- Backfills:      attempted={sos.get('backfills_attempted', 0)} ok={sos.get('backfills_ok', 0)} failed={sos.get('backfills_failed', 0)}",
         ])
@@ -30086,14 +30080,10 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     f"- Observations index prefix: {config.get('observations_timeseries_index_prefix')}",
                 ])
                 hvr = (s.get("history_version_results") or {}).get(version) or {}
-                if version == "v2":
+                if version == CURRENT_INTEGRITY_HISTORY_VERSION:
                     obs = hvr.get("observations") or (cc.get("v2_observations") or {})
-                    aqi = hvr.get("aqilevels") or (cc.get("v2_aqilevels") or {})
                     gaps = list(obs.get("gaps") or [])
-                    aqi_gaps = list(aqi.get("gaps") or []) + list((aqi.get("debug") or {}).get("gaps") or [])
-                    debug = aqi.get("debug") or {}
-                    debug_mode = "skipped" if not debug.get("checked") else ("required" if debug.get("required") else "warning-only")
-                    source_scope = obs.get("source_scope") or aqi.get("source_scope") or {}
+                    source_scope = obs.get("source_scope") or {}
                     hash_checks = (
                         obs.get("observation_content_hash_checks")
                         or cc.get("observation_content_hash_checks")
@@ -30113,11 +30103,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         source_scope_line = f"{source_scope.get('source')} connector_id={','.join(str(c) for c in connector_ids)}"
                     lines.extend([
                         f"- Source scope: {source_scope_line}",
-                        f"- AQI hourly data prefix: {config.get('aqilevels_hourly_data_prefix')}",
-                        f"- AQI hourly data index prefix: {config.get('aqilevels_timeseries_index_prefix')}",
-                        "- V2 observations checks: implemented",
-                        "- V2 AQI hourly data checks: implemented",
-                        f"- AQI debug checks: {debug_mode}",
+                        "- Observation checks: implemented",
                         f"- Checked observation partitions: {obs.get('checked_partitions', 0)}",
                         f"- Observation gaps: {obs.get('gap_count', len(gaps))}",
                         "- Observation hash checks: "
@@ -30137,8 +30123,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         f"status={first_value_evidence.get('status') or '(none)'} "
                         f"eligible={first_value_evidence.get('eligible_scope_count', 0)} "
                         f"blocked={first_value_evidence.get('blocked_scope_count', 0)}",
-                        f"- Checked AQI hourly data partitions: {aqi.get('checked_partitions', 0)}",
-                        f"- AQI hourly data gaps: {aqi.get('gap_count', len(aqi.get('gaps') or []))}",
                     ])
                     if binding_check:
                         lines.extend([
@@ -30197,7 +30181,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     if gaps:
                         lines.extend([
                             "",
-                            "### V2 observation gaps",
+                            "### Observation gaps",
                             "",
                             "| Severity | Gap type | Day | Connector | Pollutant | Expected path | Repair plan | Index rebuild |",
                             "| --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -30217,27 +30201,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                             )
                         if len(gaps) > 25:
                             lines.append(f"| info | truncated |  |  |  | {len(gaps) - 25} more gaps |  |  |")
-                    if aqi_gaps:
-                        lines.extend([
-                            "",
-                            "### V2 AQI gaps",
-                            "",
-                            "| Severity | Profile | Gap type | Day | Connector | Pollutant | Expected path |",
-                            "| --- | --- | --- | --- | --- | --- | --- |",
-                        ])
-                        for gap in aqi_gaps[:25]:
-                            lines.append(
-                                "| "
-                                f"{gap.get('severity') or ''} | "
-                                f"{gap.get('profile') or ''} | "
-                                f"{gap.get('gap_type') or ''} | "
-                                f"{gap.get('day_utc') or ''} | "
-                                f"{gap.get('connector_id') or ''} | "
-                                f"{gap.get('pollutant_code') or ''} | "
-                                f"{gap.get('expected_path') or ''} |"
-                            )
-                        if len(aqi_gaps) > 25:
-                            lines.append(f"| info |  | truncated |  |  |  | {len(aqi_gaps) - 25} more gaps |")
                 lines.append("")
         lines.extend([
             "## R2 Cross-check metrics",
@@ -30257,29 +30220,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Observation repair candidates: days={cc.get('observation_backfill_candidate_days', cc.get('backfill_candidate_days', 0))} timeseries_ids={cc.get('observation_backfill_candidate_timeseries_ids', cc.get('backfill_candidate_timeseries_ids', 0))}",
             f"- Source-change candidates:     days={cc.get('source_change_candidate_days', 0)} timeseries_ids={cc.get('source_change_candidate_timeseries_ids', 0)}",
             f"- Observation repairs:       attempted={cc.get('observation_backfills_attempted', cc.get('backfills_attempted', 0))} ok={cc.get('observation_backfills_ok', cc.get('backfills_ok', 0))} failed={cc.get('observation_backfills_failed', cc.get('backfills_failed', 0))}",
-            f"- AQI rebuilds queued:       {cc.get('aqi_rebuilds_queued_from_obs_repair', 0)}",
-            f"- V2 AQI integrity rebuilds queued: {cc.get('v2_aqi_rebuilds_queued_from_integrity', 0)}",
-            f"- V2 AQI integrity bridge ran:      {bool(cc.get('v2_aqi_integrity_rebuild_bridge_ran'))}",
-            f"- AQI health checked connector-days: {cc.get('aqi_health_connector_days_checked', 0)}",
-            f"- AQI health rebuilds queued:        {cc.get('aqi_health_rebuilds_queued', 0)}",
-            f"- AQI health skipped obs-repaired:   {cc.get('aqi_health_skipped_already_obs_repaired', 0)}",
-            f"- AQI health manifest missing:       {cc.get('aqi_health_manifest_missing', 0)}",
-            f"- AQI health manifest stale:         {cc.get('aqi_health_manifest_stale', 0)}",
-            f"- AQI health manifest empty:         {cc.get('aqi_health_manifest_empty', 0)}",
-            f"- AQI health previous rebuild failed:{cc.get('aqi_health_previous_rebuild_failed', 0)}",
-            f"- AQI health ran:                    {bool(cc.get('aqi_health_ran'))}",
-            f"- AQI rebuild queued total:          {cc.get('aqi_rebuilds_queued_total', 0)}",
-            f"- AQI rebuild attempted:             {cc.get('aqi_rebuilds_attempted', 0)}",
-            f"- AQI rebuild complete:              {cc.get('aqi_rebuilds_complete', 0)}",
-            f"- AQI proposals validated locally:  {cc.get('aqi_rebuilds_proposal_validated', 0)}",
-            f"- AQI rebuild failed:                {cc.get('aqi_rebuilds_failed', 0)}",
-            f"- AQI rebuild skipped:               {cc.get('aqi_rebuilds_skipped', 0)}",
-            f"- AQI rebuild ran:                   {bool(cc.get('aqi_rebuild_ran'))}",
+            f"- Retired AQI Integrity excluded: {bool(cc.get('aqi_integrity_retired'))}",
         ])
-        if cc.get("aqi_health_skipped_reason"):
-            lines.append(f"- AQI health skipped reason:        {cc.get('aqi_health_skipped_reason')}")
-        if cc.get("aqi_rebuild_skipped_reason"):
-            lines.append(f"- AQI rebuild skipped reason:       {cc.get('aqi_rebuild_skipped_reason')}")
         if cc.get("skipped_reason"):
             lines.append(f"- Skipped reason:           {cc['skipped_reason']}")
         cc_planned = cc.get("planned_observation_backfills") or cc.get("planned_backfills") or []
@@ -30291,7 +30233,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 lines.append(f"... {len(cc_planned) - 20} more")
         skipped_v2_repairs = cc.get("skipped_v2_observation_repairs") or []
         if skipped_v2_repairs:
-            lines.extend(["", "### Skipped v2 observation repairs", ""])
+            lines.extend(["", "### Skipped observation repairs", ""])
             for entry in skipped_v2_repairs[:50]:
                 lines.append(
                     f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
@@ -30301,7 +30243,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 lines.append(f"- ... {len(skipped_v2_repairs) - 50} more")
         v2_repair_results = cc.get("v2_observation_repair_results") or []
         if v2_repair_results:
-            lines.extend(["", "### V2 observation repair results", ""])
+            lines.extend(["", "### Observation repair results", ""])
             for entry in v2_repair_results[:25]:
                 source_cache = entry.get("source_cache") or {}
                 lines.append(
@@ -30314,8 +30256,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 )
                 if entry.get("error"):
                     lines.append(f"  - error: {entry.get('error')}")
-                if entry.get("status") != "ok":
-                    lines.append("  - AQI rebuild was not queued because the observation repair did not complete successfully.")
                 stdout_tail = _tail_lines(str(entry.get("stdout_tail") or ""), 80)
                 if stdout_tail:
                     lines.extend(["", "  stdout tail:", "  ```text"])
@@ -30328,37 +30268,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     lines.append("  ```")
             if len(v2_repair_results) > 25:
                 lines.append(f"- ... {len(v2_repair_results) - 25} more")
-        planned_aqi = cc.get("planned_aqi_rebuilds") or []
-        if planned_aqi:
-            lines.extend(["", "### Planned AQI rebuild queue entries from cross-check", ""])
-            for entry in planned_aqi[:50]:
-                lines.append(f"- {entry}")
-            if len(planned_aqi) > 50:
-                lines.append(f"- ... {len(planned_aqi) - 50} more")
-        aqi_only_queued = cc.get("queued_aqi_only_connector_days") or []
-        if aqi_only_queued:
-            lines.extend(["", "### AQI-only queued connector-days (Phase 6.7)", ""])
-            for entry in aqi_only_queued:
-                lines.append(
-                    f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
-                    f"reasons={entry.get('reasons')} notes={entry.get('notes')}"
-                )
-        planned_aqi_rebuilds = cc.get("planned_aqi_rebuild_commands") or []
-        if planned_aqi_rebuilds:
-            lines.extend(["", "### Planned AQI rebuild commands (Phase 6.8)", ""])
-            for cmd in planned_aqi_rebuilds[:50]:
-                lines.extend(["```bash", cmd, "```"])
-            if len(planned_aqi_rebuilds) > 50:
-                lines.append(f"... {len(planned_aqi_rebuilds) - 50} more")
-        aqi_rebuild_results = cc.get("aqi_rebuild_results") or []
-        if aqi_rebuild_results:
-            lines.extend(["", "### AQI rebuild results (Phase 6.8)", ""])
-            for entry in aqi_rebuild_results:
-                lines.append(
-                    f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
-                    f"status={entry.get('status')} reasons={entry.get('reasons')} "
-                    f"error={entry.get('error')} log_path={entry.get('log_path')}"
-                )
         discrepancies = cc.get("discrepancies") or []
         if discrepancies:
             lines.extend(["", "### Discrepancies", ""])
@@ -30399,21 +30308,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "observation_backfills_attempted",
         "observation_backfills_ok",
         "observation_backfills_failed",
-        "aqi_rebuilds_queued_from_obs_repair",
         "source_change_candidate_days",
         "source_change_candidate_timeseries_ids",
-        "aqi_health_connector_days_checked",
-        "aqi_health_rebuilds_queued",
-        "aqi_health_skipped_already_obs_repaired",
-        "aqi_health_manifest_missing",
-        "aqi_health_manifest_stale",
-        "aqi_health_manifest_empty",
-        "aqi_health_previous_rebuild_failed",
-        "aqi_rebuilds_queued_total",
-        "aqi_rebuilds_attempted",
-        "aqi_rebuilds_complete",
-        "aqi_rebuilds_failed",
-        "aqi_rebuilds_skipped",
         "sos_snapshots_successful",
         "sos_snapshots_no_data",
         "sos_not_found",
@@ -31225,47 +31121,17 @@ def main(argv: list[str]) -> int:
                         ),
                     )
                 )
-            if dedicated_sos_historical_replacement:
-                v2_aqi = {
-                    "status": "bypassed",
-                    "reason": "dedicated_sos_observation_history_only",
-                    "checked_partitions": 0,
-                    "gap_count": 0,
-                    "gaps": [],
-                    "debug": {
-                        "checked": False,
-                        "required": False,
-                        "status": "bypassed",
-                        "gap_count": 0,
-                        "gaps": [],
-                    },
-                }
-            else:
-                v2_aqi = run_v2_aqilevels_integrity_checks(
-                    r2_history_root=r2_history_root,
-                    config=observation_history_config,
-                    from_day=from_day,
-                    to_day=to_day,
-                    selected_days=selected_day_values,
-                    allowed_connector_ids=v3_allowed_connector_ids,
-                    source_scope=v3_source_scope,
-                    conn=conn,
-                    check_aqi_debug=bool(args.check_aqi_debug),
-                    require_aqi_debug=bool(args.require_aqi_debug),
-                    log=log,
-                )
             cross_check_metrics = {
                 "ran": True,
-                "history_version": "v2",
+                "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
                 "skipped_reason": None,
                 "source_scope": v3_source_scope,
                 "v2_observations": v2_obs,
                 "observation_content_hash_checks": observation_hash_metrics,
-                "v2_aqilevels": v2_aqi,
-                "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0) + int(v2_aqi.get("checked_partitions", 0) or 0),
-                "cross_checks_ok": (int(v2_obs.get("checked_partitions", 0) or 0) + int(v2_aqi.get("checked_partitions", 0) or 0)) if v2_obs.get("status") == "ok" and v2_aqi.get("status") == "ok" else 0,
-                "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
-                "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
+                "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0),
+                "cross_checks_ok": int(v2_obs.get("checked_partitions", 0) or 0) if v2_obs.get("status") == "ok" else 0,
+                "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0),
+                "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0),
             }
         if args.source == "sos" and snapshot_ok:
             individual_binding_root = Path(
@@ -31325,41 +31191,12 @@ def main(argv: list[str]) -> int:
                 log=log,
             )
             cross_check_metrics.update(v2_backfill_metrics)
-            observation_gap_keys = {
-                (str(gap.get("day_utc") or ""), int(gap.get("connector_id") or 0))
-                for gap in list((cross_check_metrics.get("v2_observations") or {}).get("gaps") or [])
-                if str(gap.get("day_utc") or "") and int(gap.get("connector_id") or 0) > 0
-            }
-            v2_aqi_integrity_queue_metrics = (
-                {
-                    "v2_aqi_integrity_rebuild_bridge_ran": False,
-                    "v2_aqi_rebuilds_queued_from_integrity": 0,
-                    "planned_v2_aqi_rebuilds_from_integrity": [],
-                    "planned_aqi_rebuild_connector_days": [],
-                    "queued_aqi_only_connector_days": [],
-                    "aqi_rebuilds_queued": 0,
-                    "aqi_rebuilds_queued_total": 0,
-                    "aqi_rebuilds_attempted": 0,
-                    "aqi_rebuilds_complete": 0,
-                    "aqi_rebuilds_failed": 0,
-                    "aqi_rebuild_skipped_reason":
-                        "dedicated_sos_observation_history_only",
-                }
-                if dedicated_sos_historical_replacement else
-                queue_v2_aqi_rebuilds_from_integrity_gaps(
-                    conn=conn,
-                    run_id=int(run_id),
-                    env_name=args.env,
-                    env=env,
-                    v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
-                    dry_run=args.dry_run,
-                    run_backfill=False,
-                    log=log,
-                    allowed_connector_ids=v3_allowed_connector_ids,
-                    blocked_connector_days=observation_gap_keys,
-                )
-            )
-            cross_check_metrics.update(v2_aqi_integrity_queue_metrics)
+            cross_check_metrics.update({
+                "aqi_integrity_retired": True,
+                "aqi_integrity_repair_skipped_reason": (
+                    "retired_aqi_r2_history_product"
+                ),
+            })
 
         if effective_mode == "check_only" and cross_check_metrics.get("ran"):
             current_state_plan = run_current_state_reconciliation(
@@ -31485,15 +31322,17 @@ def main(argv: list[str]) -> int:
                 verified_first_value_at_connector_days=(
                     verified_first_value_at_connector_days
                 ),
-                v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
+                # AQI is calculated by the Worker API from observation history;
+                # SOS-light has no local/R2 AQI Integrity or repair stage.
+                v2_aqilevels={},
                 final_verification_config=observation_history_config,
                 from_day=from_day,
                 to_day=to_day,
                 selected_days=selected_day_values,
                 allowed_connector_ids=v3_allowed_connector_ids,
                 source_scope=v3_source_scope,
-                check_aqi_debug=bool(args.check_aqi_debug),
-                require_aqi_debug=bool(args.require_aqi_debug),
+                check_aqi_debug=False,
+                require_aqi_debug=False,
                 limits=limits,
                 dry_run=not mode_allows_remote_apply(effective_mode),
                     log=log,
@@ -31511,33 +31350,6 @@ def main(argv: list[str]) -> int:
                         else Path(str(dropbox_root))
                     ),
                 )
-            aqi_stage = next(
-                (
-                    stage.get("result")
-                    for stage in list(repair_flow.get("stage_results") or [])
-                    if isinstance(stage, Mapping) and stage.get("stage") == "aqi_proposal"
-                    and isinstance(stage.get("result"), Mapping)
-                ),
-                {},
-            )
-            if isinstance(aqi_stage, Mapping):
-                cross_check_metrics.update({
-                    key: aqi_stage[key]
-                    for key in (
-                        "v2_aqi_integrity_rebuild_bridge_ran",
-                        "v2_aqi_rebuilds_queued_from_integrity",
-                        "planned_v2_aqi_rebuilds_from_integrity",
-                        "planned_aqi_rebuild_connector_days",
-                        "queued_aqi_only_connector_days",
-                        "aqi_rebuilds_queued",
-                        "aqi_rebuilds_queued_total",
-                        "aqi_rebuilds_attempted",
-                        "aqi_rebuilds_complete",
-                        "aqi_rebuilds_failed",
-                    )
-                    if key in aqi_stage
-                })
-
         any_adapter_ran = (
             openaq_metrics.get("ran")
             or sc_metrics.get("ran")
@@ -31550,7 +31362,33 @@ def main(argv: list[str]) -> int:
         )
 
         # Decide top-level run status.
-        if any_stopped:
+        source_execution_failed = (
+            not snapshot_ok
+            and snapshot_result.get("status") not in {"skipped", "dry_run"}
+        ) or any(
+            int(metrics.get(key) or 0) > 0
+            for metrics in (openaq_metrics, sc_metrics, sos_metrics)
+            for key in (
+                "errors",
+                "temporary_errors",
+                "permanent_errors",
+                "persistence_failed_count",
+                "worker_database_retry_exhausted_count",
+            )
+        )
+        diagnostic_check_failed = (
+            source_execution_failed
+            or int((cross_check_metrics.get(
+                "observation_content_hash_checks"
+            ) or {}).get("invalid_contract") or 0) > 0
+            or (
+                sos_binding_verification is not None
+                and sos_binding_verification.get("status") == "fail"
+            )
+        )
+        if source_execution_failed:
+            status = "fail"
+        elif any_stopped:
             status = "stopped_limit"
         elif any_adapter_ran:
             status = "ok"
@@ -31566,8 +31404,6 @@ def main(argv: list[str]) -> int:
             status = "noop"
         v2_gap_count_for_status = (
             int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
-            + int((cross_check_metrics.get("v2_aqilevels") or {}).get("gap_count", 0) or 0)
-            + int(((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0 if ((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("required") else 0)
             + int((sos_binding_verification or {}).get("gap_count") or 0)
         )
         coordinator_failed = repair_flow.get("status") in {"failed", "blocked_dependency"}
@@ -31589,6 +31425,8 @@ def main(argv: list[str]) -> int:
                 "remaining_gap_count"
             ),
         )
+        if effective_mode == "check_only" and diagnostic_check_failed:
+            status = "fail"
 
         if daily_selection is not None:
             daily_state_status = (
@@ -31684,7 +31522,7 @@ def main(argv: list[str]) -> int:
             if args.run_backfill:
                 if cross_check_metrics.get("v2_repair_status_message"):
                     notes_parts.append(
-                        "v2-post-repair-check "
+                        "post-repair-check "
                         f"status={(cross_check_metrics.get('v2_post_repair') or {}).get('status')} "
                         f"message={cross_check_metrics.get('v2_repair_status_message')}"
                     )
@@ -31696,37 +31534,8 @@ def main(argv: list[str]) -> int:
                     f"source_change_timeseries_ids={cross_check_metrics.get('source_change_candidate_timeseries_ids', 0)} "
                     f"attempted={cross_check_metrics.get('observation_backfills_attempted', cross_check_metrics.get('backfills_attempted', 0))} "
                     f"ok={cross_check_metrics.get('observation_backfills_ok', cross_check_metrics.get('backfills_ok', 0))} "
-                    f"failed={cross_check_metrics.get('observation_backfills_failed', cross_check_metrics.get('backfills_failed', 0))} "
-                    f"aqi_rebuilds_queued={cross_check_metrics.get('aqi_rebuilds_queued_from_obs_repair', 0)}"
+                    f"failed={cross_check_metrics.get('observation_backfills_failed', cross_check_metrics.get('backfills_failed', 0))}"
                 )
-                notes_parts.append(
-                    "aqi-health-check "
-                    f"checked={cross_check_metrics.get('aqi_health_connector_days_checked', 0)} "
-                    f"queued={cross_check_metrics.get('aqi_health_rebuilds_queued', 0)} "
-                    f"skipped_obs_repaired={cross_check_metrics.get('aqi_health_skipped_already_obs_repaired', 0)} "
-                    f"manifest_missing={cross_check_metrics.get('aqi_health_manifest_missing', 0)} "
-                    f"manifest_stale={cross_check_metrics.get('aqi_health_manifest_stale', 0)} "
-                    f"manifest_empty={cross_check_metrics.get('aqi_health_manifest_empty', 0)} "
-                    f"previous_rebuild_failed={cross_check_metrics.get('aqi_health_previous_rebuild_failed', 0)}"
-                )
-                if cross_check_metrics.get("aqi_health_skipped_reason"):
-                    notes_parts.append(
-                        "aqi-health-check-skipped "
-                        f"reason={cross_check_metrics.get('aqi_health_skipped_reason')}"
-                    )
-                notes_parts.append(
-                    "aqi-rebuild-execution "
-                    f"queued_total={cross_check_metrics.get('aqi_rebuilds_queued_total', 0)} "
-                    f"attempted={cross_check_metrics.get('aqi_rebuilds_attempted', 0)} "
-                    f"complete={cross_check_metrics.get('aqi_rebuilds_complete', 0)} "
-                    f"failed={cross_check_metrics.get('aqi_rebuilds_failed', 0)} "
-                    f"skipped={cross_check_metrics.get('aqi_rebuilds_skipped', 0)}"
-                )
-                if cross_check_metrics.get("aqi_rebuild_skipped_reason"):
-                    notes_parts.append(
-                        "aqi-rebuild-execution-skipped "
-                        f"reason={cross_check_metrics.get('aqi_rebuild_skipped_reason')}"
-                    )
         elif cross_check_metrics.get("skipped_reason"):
             notes_parts.append(f"cross-check skipped: {cross_check_metrics['skipped_reason']}")
 
@@ -31757,52 +31566,11 @@ def main(argv: list[str]) -> int:
                 cross_check_metrics.get("backfills_failed", 0),
             ) or 0
         )
-        aqi_rebuilds_queued_from_obs_repair = int(
-            cross_check_metrics.get("aqi_rebuilds_queued_from_obs_repair", 0) or 0
-        )
-        aqi_health_connector_days_checked = int(
-            cross_check_metrics.get("aqi_health_connector_days_checked", 0) or 0
-        )
-        aqi_health_rebuilds_queued = int(
-            cross_check_metrics.get("aqi_health_rebuilds_queued", 0) or 0
-        )
-        aqi_health_skipped_already_obs_repaired = int(
-            cross_check_metrics.get("aqi_health_skipped_already_obs_repaired", 0) or 0
-        )
-        aqi_health_manifest_missing = int(
-            cross_check_metrics.get("aqi_health_manifest_missing", 0) or 0
-        )
-        aqi_health_manifest_stale = int(
-            cross_check_metrics.get("aqi_health_manifest_stale", 0) or 0
-        )
-        aqi_health_manifest_empty = int(
-            cross_check_metrics.get("aqi_health_manifest_empty", 0) or 0
-        )
-        aqi_health_previous_rebuild_failed = int(
-            cross_check_metrics.get("aqi_health_previous_rebuild_failed", 0) or 0
-        )
-        aqi_rebuilds_queued_total = int(
-            cross_check_metrics.get("aqi_rebuilds_queued_total", 0) or 0
-        )
-        aqi_rebuilds_attempted = int(
-            cross_check_metrics.get("aqi_rebuilds_attempted", 0) or 0
-        )
-        aqi_rebuilds_complete = int(
-            cross_check_metrics.get("aqi_rebuilds_complete", 0) or 0
-        )
-        aqi_rebuilds_failed = int(
-            cross_check_metrics.get("aqi_rebuilds_failed", 0) or 0
-        )
-        aqi_rebuilds_skipped = int(
-            cross_check_metrics.get("aqi_rebuilds_skipped", 0) or 0
-        )
-
         downloaded_bytes_total = _sum("downloaded_bytes")
         errors_count = (
             _sum("errors")
             + _sum("backfills_failed")
             + cross_check_backfills_failed
-            + aqi_rebuilds_failed
             + (v2_gap_count_for_status if not args.run_backfill else 0)
         )
         warnings_count_total = warnings_delta
@@ -31855,35 +31623,6 @@ def main(argv: list[str]) -> int:
             "observation_backfills_attempted": cross_check_backfills_attempted,
             "observation_backfills_ok": cross_check_backfills_ok,
             "observation_backfills_failed": cross_check_backfills_failed,
-            "aqi_rebuilds_queued_from_obs_repair": aqi_rebuilds_queued_from_obs_repair,
-            "aqi_health_connector_days_checked": aqi_health_connector_days_checked,
-            "aqi_health_rebuilds_queued": aqi_health_rebuilds_queued,
-            "aqi_health_skipped_already_obs_repaired": aqi_health_skipped_already_obs_repaired,
-            "aqi_health_manifest_missing": aqi_health_manifest_missing,
-            "aqi_health_manifest_stale": aqi_health_manifest_stale,
-            "aqi_health_manifest_empty": aqi_health_manifest_empty,
-            "aqi_health_previous_rebuild_failed": aqi_health_previous_rebuild_failed,
-            "v2_aqi_integrity_rebuild_bridge_ran": bool(
-                cross_check_metrics.get("v2_aqi_integrity_rebuild_bridge_ran")
-            ),
-            "v2_aqi_rebuilds_queued_from_integrity": int(
-                cross_check_metrics.get("v2_aqi_rebuilds_queued_from_integrity", 0) or 0
-            ),
-            "planned_v2_aqi_rebuilds_from_integrity": list(
-                cross_check_metrics.get("planned_v2_aqi_rebuilds_from_integrity") or []
-            ),
-            "planned_aqi_rebuild_connector_days": list(
-                cross_check_metrics.get("planned_aqi_rebuild_connector_days") or []
-            ),
-            "queued_aqi_only_connector_days": list(
-                cross_check_metrics.get("queued_aqi_only_connector_days") or []
-            ),
-            "aqi_rebuilds_queued": aqi_rebuilds_queued_total,
-            "aqi_rebuilds_queued_total": aqi_rebuilds_queued_total,
-            "aqi_rebuilds_attempted": aqi_rebuilds_attempted,
-            "aqi_rebuilds_complete": aqi_rebuilds_complete,
-            "aqi_rebuilds_failed": aqi_rebuilds_failed,
-            "aqi_rebuilds_skipped": aqi_rebuilds_skipped,
             "warnings_count": warnings_count_total,
             "errors_count": errors_count,
             "snapshot_status": snapshot_result["status"],
@@ -32026,19 +31765,7 @@ def main(argv: list[str]) -> int:
                 metrics["observation_backfills_attempted"],
                 metrics["observation_backfills_ok"],
                 metrics["observation_backfills_failed"],
-                metrics["aqi_rebuilds_queued_from_obs_repair"],
-                metrics["aqi_health_connector_days_checked"],
-                metrics["aqi_health_rebuilds_queued"],
-                metrics["aqi_health_skipped_already_obs_repaired"],
-                metrics["aqi_health_manifest_missing"],
-                metrics["aqi_health_manifest_stale"],
-                metrics["aqi_health_manifest_empty"],
-                metrics["aqi_health_previous_rebuild_failed"],
-                metrics["aqi_rebuilds_queued_total"],
-                metrics["aqi_rebuilds_attempted"],
-                metrics["aqi_rebuilds_complete"],
-                metrics["aqi_rebuilds_failed"],
-                metrics["aqi_rebuilds_skipped"],
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 warnings_count_total,
                 errors_count,
                 notes,
@@ -32050,24 +31777,17 @@ def main(argv: list[str]) -> int:
         v2_obs = cross_check_metrics.get("v2_observations") or {
             "status": "not_implemented", "checked_partitions": 0, "gap_count": 0, "gaps": [],
         }
-        v2_aqi = cross_check_metrics.get("v2_aqilevels") or {
-            "status": "not_implemented", "checked_partitions": 0, "gap_count": 0,
-            "gaps": [],
-            "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []},
-        }
         v2_result: dict[str, Any] = {
             "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
             "checks_implemented": True,
             "status": "fail" if (
                 v2_obs.get("status") == "fail"
-                or v2_aqi.get("status") == "fail"
                 or (
                     sos_binding_verification is not None
                     and sos_binding_verification.get("status") == "fail"
                 )
             ) else "ok",
             "observations": v2_obs,
-            "aqilevels": v2_aqi,
         }
         if sos_binding_verification is not None:
             v2_result["timeseries_bindings"] = sos_binding_verification
@@ -32077,10 +31797,9 @@ def main(argv: list[str]) -> int:
             v2_result.update({
                 "status": "ok" if final_result.get("status") == "ok" else "fail",
                 "final_verified": final_result.get("status") == "ok",
-                "pre_repair": {"observations": v2_obs, "aqilevels": v2_aqi},
+                "pre_repair": {"observations": v2_obs},
                 "final_verification": final_result,
                 "observations": recheck.get("observations") or v2_obs,
-                "aqilevels": recheck.get("aqilevels") or v2_aqi,
             })
             final_binding_result = (
                 final_result.get("timeseries_binding")
@@ -32304,9 +32023,6 @@ def main(argv: list[str]) -> int:
                 "backfills_triggered": metrics.get("backfills_triggered", 0),
                 "backfills_ok": metrics.get("backfills_ok", 0),
                 "backfills_failed": metrics.get("backfills_failed", 0),
-                "aqi_rebuilds_queued": metrics.get("aqi_rebuilds_queued_total", 0),
-                "aqi_rebuilds_ok": metrics.get("aqi_rebuilds_complete", 0),
-                "aqi_rebuilds_failed": metrics.get("aqi_rebuilds_failed", 0),
                 "r2_write_attempted": bool(repair_flow.get("r2_write_attempted")),
                 "r2_objects_written": int(repair_flow.get("r2_objects_written") or 0),
                 "r2_objects_deleted": int(repair_flow.get("r2_objects_deleted") or 0),
