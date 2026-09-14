@@ -253,6 +253,11 @@
     return state.articles.filter(article => state.selectedArticleIds.has(String(article.id)));
   }
 
+  function pruneArticleSelectionToLoadedRows() {
+    const loadedIds = new Set(state.articles.map(article => String(article.id)));
+    state.selectedArticleIds = new Set([...state.selectedArticleIds].filter(id => loadedIds.has(id)));
+  }
+
   function bulkStatusOptions(selected = selectedArticles()) {
     const targets = ["approved", "rejected", "hidden"].filter(target => selected.every(article =>
       article.status === target || statusActionForTarget(article.status, target)));
@@ -359,6 +364,7 @@
       state.aiUsage = usage;
       state.aiUsageUnavailable = aiUsageUnavailable;
       state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
+      pruneArticleSelectionToLoadedRows();
       state.articleCursor = data.page?.next_cursor || null;
       state.articleHasMore = Boolean(data.page?.has_more);
       setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>
@@ -387,8 +393,7 @@
       const data = await request("articles", { params: articleParams(cursor) });
       if (refreshSequence !== articleRefreshSequence) return;
       state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
-      const loadedIds = new Set(state.articles.map(article => String(article.id)));
-      state.selectedArticleIds = new Set([...state.selectedArticleIds].filter(id => loadedIds.has(id)));
+      pruneArticleSelectionToLoadedRows();
       state.articleCursor = data.page?.next_cursor || null;
       state.articleHasMore = Boolean(data.page?.has_more);
       table.innerHTML = articleTableHtml();
