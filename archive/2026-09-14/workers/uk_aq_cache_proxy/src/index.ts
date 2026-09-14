@@ -399,7 +399,7 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-export async function readSecret(value: unknown): Promise<string> {
+async function readSecret(value: unknown): Promise<string> {
   if (typeof value === "string") {
     return value;
   }
@@ -447,7 +447,7 @@ function normalizeOrigin(value: string | null): string | null {
   }
 }
 
-export function resolveRequestOrigin(request: Request, url: URL): string | null {
+function resolveRequestOrigin(request: Request, url: URL): string | null {
   const originHeader = normalizeOrigin(request.headers.get("Origin"));
   if (originHeader) {
     return originHeader;
@@ -467,7 +467,7 @@ export function resolveRequestOrigin(request: Request, url: URL): string | null 
   return null;
 }
 
-export function parseAllowedOrigins(value: string): Set<string> {
+function parseAllowedOrigins(value: string): Set<string> {
   const origins = new Set<string>();
   value
     .split(",")
@@ -486,7 +486,7 @@ export function parseAllowedOrigins(value: string): Set<string> {
   return origins;
 }
 
-export function isOriginAllowed(origin: string | null, allowedOrigins: Set<string>): boolean {
+function isOriginAllowed(origin: string | null, allowedOrigins: Set<string>): boolean {
   if (!origin) {
     return false;
   }
@@ -522,7 +522,7 @@ function appendVary(headers: Headers, value: string): void {
   }
 }
 
-export function addCorsHeaders(headers: Headers, requestOrigin: string | null, allowedOrigins: Set<string>): void {
+function addCorsHeaders(headers: Headers, requestOrigin: string | null, allowedOrigins: Set<string>): void {
   const allowedOrigin = resolveAllowOrigin(requestOrigin, allowedOrigins);
   if (allowedOrigin) {
     headers.set("Access-Control-Allow-Origin", allowedOrigin);

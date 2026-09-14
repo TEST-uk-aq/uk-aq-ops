@@ -11,13 +11,8 @@ import {
   WHO_SUMMARY_API_PATH,
   type WhoSummaryProxyEnv,
 } from "./who_summary_route.ts";
-import {
-  handleWhoDailySeriesProxyRequest,
-  WHO_DAILY_SERIES_API_PATH,
-  type WhoDailySeriesProxyEnv,
-} from "./who_daily_series_route.ts";
 
-type Env = CacheProxyEnv & MediaPublicRouteEnv & WhoSummaryProxyEnv & WhoDailySeriesProxyEnv;
+type Env = CacheProxyEnv & MediaPublicRouteEnv & WhoSummaryProxyEnv;
 
 type ExecutionContext = {
   waitUntil(promise: Promise<unknown>): void;
@@ -33,9 +28,6 @@ export default {
     }
     if (url.pathname === WHO_SUMMARY_API_PATH) {
       return handleWhoSummaryProxyRequest(request, env, ctx);
-    }
-    if (url.pathname === WHO_DAILY_SERIES_API_PATH) {
-      return handleWhoDailySeriesProxyRequest(request, env, ctx);
     }
     return cacheProxy.fetch(request, env, ctx);
   },
