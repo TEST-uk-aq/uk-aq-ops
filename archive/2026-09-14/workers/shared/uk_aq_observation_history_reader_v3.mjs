@@ -8,7 +8,6 @@ import { compressors } from "hyparquet-compressors";
 
 import {
   OBSERVATION_HISTORY_COLUMNS_V3,
-  OBSERVATION_HISTORY_COLUMNS_V3_LEGACY,
   OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
 } from "./uk_aq_observation_history_schema.mjs";
@@ -788,9 +787,10 @@ function validateFooterMetadata(metadata, file, physicalIdentity) {
   const columns = parquetSchema(metadata).children.map((column) =>
     String(column.element.name)
   );
-  if (![OBSERVATION_HISTORY_COLUMNS_V3, OBSERVATION_HISTORY_COLUMNS_V3_LEGACY]
-    .some((expected) => columns.length === expected.length &&
-      columns.every((column, index) => column === expected[index]))) {
+  if (
+    columns.length !== OBSERVATION_HISTORY_COLUMNS_V3.length ||
+    columns.some((column, index) => column !== OBSERVATION_HISTORY_COLUMNS_V3[index])
+  ) {
     throw new Error(`V3 Parquet footer schema mismatch: ${file.key}`);
   }
   const rowCount = safeMetadataInteger(metadata.num_rows, "footer.num_rows");
@@ -1026,11 +1026,6 @@ function validateDecodedSegment(rows, segment, timeseriesId) {
       timeseries_id: timeseriesId,
       observed_at_utc: observedAtUtc,
       value: Object.is(value, -0) ? 0 : value,
-      vstatus: row?.vstatus === "R" || row?.verification_status === "R"
-        ? "R"
-        : row?.vstatus === "P" || row?.verification_status === "P"
-        ? "P"
-        : null,
     });
   });
   if (
@@ -1462,12 +1457,7 @@ export async function readObservationHistoryExactV3({
             file: prefetchedFile,
             metadata: context.footer.metadata,
             compressors,
-            columns: [
-              ...OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS,
-              context.footer.columns.includes("vstatus")
-                ? "vstatus"
-                : "verification_status",
-            ],
+            columns: [...OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS],
             rowStart: segment.row_start,
             rowEnd: segment.row_start + segment.row_count,
             useOffsetIndex: false,

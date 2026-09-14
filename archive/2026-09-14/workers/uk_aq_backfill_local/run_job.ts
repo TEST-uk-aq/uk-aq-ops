@@ -71,7 +71,6 @@ import {
   computeObservationContentHash,
   normalizeCanonicalObservationRow,
   normalizeUkAirVerificationStatus,
-  preservePersistedRatifiedStatus,
   resolveLegacyVerificationStatus,
 } from "../shared/uk_aq_observation_content_hash.mjs";
 import {
@@ -4034,18 +4033,7 @@ async function loadVerifiedR2ObservationRowsForConnectorDay(
         `unchanged observation parquet failed byte verification: ${file.key}`,
       );
     }
-    const canonicalPartRows = await readCanonicalObservationRowsFromParquet(
-      livePart.body,
-      { isSos: connectorId === SOS_CONNECTOR_ID_FALLBACK },
-    );
-    const partRows: ObsHistoryRow[] = canonicalPartRows.map((row) => ({
-      station_id: row.station_id,
-      timeseries_id: row.timeseries_id,
-      pollutant_code: row.pollutant_code as SourcePollutantCode,
-      observed_at: row.observed_at_utc,
-      value: row.value,
-      verification_status: row.verification_status,
-    }));
+    const partRows = await readObsHistoryRowsFromParquetBytes(livePart.body);
     if (partRows.length !== file.row_count) {
       throw new Error(
         `verified observation parquet row count mismatch: ${file.key}`,
@@ -4797,28 +4785,6 @@ async function exportObsConnectorRowsToR2V2(args: {
   example_missing_pollutant_rows: MissingPollutantExampleRow[];
   pollutant_codes_written: string[];
 }> {
-  let rowsForWrite = args.rows;
-  if (args.connector_id === SOS_CONNECTOR_ID_FALLBACK &&
-    hasRequiredR2Config(OBS_R2_CONFIG)) {
-    const manifestKey = buildObsConnectorManifestKey(
-      args.day_utc,
-      args.connector_id,
-    );
-    const existing = await r2HeadObject({ r2: OBS_R2_CONFIG, key: manifestKey });
-    if (existing.exists) {
-      // Existing R2 contributes only an R-over-P decision for an equivalent
-      // replacement row. Replacement membership and values remain authoritative.
-      rowsForWrite = preservePersistedRatifiedStatus(
-        rowsForWrite,
-        await loadVerifiedR2ObservationRowsForConnectorDay(
-          args.day_utc,
-          args.connector_id,
-          false,
-        ),
-        { connectorId: args.connector_id },
-      );
-    }
-  }
   // Integrity prepares the complete canonical connector-day locally. Remote
   // deletion and publication are owned by the coordinator only after every
   // local object has passed structural validation.
@@ -4832,6 +4798,7 @@ async function exportObsConnectorRowsToR2V2(args: {
     );
   }
 
+  const rowsForWrite = args.rows;
   const classification = classifyObservationRowsForV2PollutantPartitions(rowsForWrite);
   if (INTEGRITY_PROPOSAL_MODE) {
     assertIntegrityProposalPollutantCompleteness(classification, args);
@@ -9945,12 +9912,7 @@ export function parseUkAirFlatFileObservationsFromStructure(args: {
       binding.targetDayNonNullRowCount += 1;
       if (!unit) binding.targetDayBlankUnitRowCount += 1;
       if (unit) units.add(unit);
-      binding.pendingRows.push({
-        observedAt,
-        value,
-        unit,
-        status: normalizeUkAirVerificationStatus(cells[binding.statusIndex] ?? null),
-      });
+      binding.pendingRows.push({ observedAt, value, unit, status: String(cells[binding.statusIndex] || "").trim() || null });
     }
   }
   for (const binding of mappedSelectedSourceLabelColumns) {
@@ -10711,30 +10673,7 @@ export function inspectIntegritySourceRowsForBlockingEvidence(
   const canonicalObservationRows: SourceObservationRow[] = [];
   let uncanonicalisableSourceRowCount = 0;
 
-  // UK-AIR can contain otherwise identical provisional and ratified evidence
-  // for the same observation. Ratified evidence is authoritative in that case.
-  const ratifiedValueIdentities = new Set((connectorId === 1 ? rows : []).filter((row) =>
-    normalizeUkAirVerificationStatus(row.status ?? null) === "R"
-  ).map((row) => JSON.stringify({
-    station_id: row.station_id,
-    timeseries_id: row.timeseries_id,
-    pollutant_code: row.pollutant_code,
-    observed_at: row.observed_at,
-    value: Number(row.value),
-  })));
-  const rowsToInspect = connectorId !== 1 ? rows : rows.filter((row) => {
-    const status = normalizeUkAirVerificationStatus(row.status ?? null);
-    const valueIdentity = JSON.stringify({
-      station_id: row.station_id,
-      timeseries_id: row.timeseries_id,
-      pollutant_code: row.pollutant_code,
-      observed_at: row.observed_at,
-      value: Number(row.value),
-    });
-    return status === "R" || !ratifiedValueIdentities.has(valueIdentity);
-  });
-
-  for (const row of rowsToInspect) {
+  for (const row of rows) {
     const canonical = normalizeSourceObservationForV2(row);
     if (!canonical) {
       uncanonicalisableSourceRowCount += 1;
@@ -11247,9 +11186,7 @@ async function readCanonicalObservationRowsFromParquet(
   const rowCount = Number(metadata.num_rows || 0);
   const columnNames = [
     ...required,
-    ...(schemaColumns.includes("vstatus")
-      ? ["vstatus"]
-      : schemaColumns.includes("verification_status")
+    ...(schemaColumns.includes("verification_status")
       ? ["verification_status"]
       : schemaColumns.includes("status")
       ? ["status"]
@@ -11268,9 +11205,7 @@ async function readCanonicalObservationRowsFromParquet(
     const observedAtUtc = parseHistoryIsoTimestamp(
       byName.get("observed_at_utc")?.[index],
     );
-    const statusRow = schemaColumns.includes("vstatus")
-      ? { verification_status: byName.get("vstatus")?.[index] ?? null }
-      : schemaColumns.includes("verification_status")
+    const statusRow = schemaColumns.includes("verification_status")
       ? {
         verification_status:
           byName.get("verification_status")?.[index] ?? null,

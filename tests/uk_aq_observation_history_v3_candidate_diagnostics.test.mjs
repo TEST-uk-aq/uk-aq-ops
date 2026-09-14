@@ -7,6 +7,10 @@ import candidateWorker, {
   parseObservationRequest,
 } from "../workers/uk_aq_observs_history_r2_api_v3_candidate/worker.mjs";
 import {
+  parseDailyProvenanceRequest,
+  parseObservationRequest as parseFixedV3ObservationRequest,
+} from "../workers/uk_aq_observs_history_r2_api_worker/worker_v3.mjs";
+import {
   assertTestCandidateEndpoint,
   buildObservationHistoryV3MeasurementMatrix,
 } from "../scripts/index_v3_migration/measure_observation_history_v3_candidate.mjs";
@@ -183,4 +187,28 @@ test("aligned-v2 local R2 guard uses exact repository TEST authority", () => {
     }),
     /bucket does not match.*TEST authority/,
   );
+});
+
+
+test("fixed-v3 keeps 24-hour observations while allowing bounded daily provenance", () => {
+  const range =
+    "timeseries_id=123&connector_id=1&pollutant=pm25" +
+    "&start_utc=2025-01-01T00:00:00.000Z" +
+    "&end_utc=2026-01-01T00:00:00.000Z";
+  const observations = parseFixedV3ObservationRequest(
+    new URL(`https://example.test/v1/observations?${range}`),
+  );
+  assert.equal(observations.ok, false);
+  assert.equal(observations.error_code, "logical_range_exceeds_24_hours");
+
+  const provenance = parseDailyProvenanceRequest(
+    new URL(`https://example.test/v1/daily-validation-provenance?${range}`),
+  );
+  assert.equal(provenance.ok, true);
+  const tooWide = parseDailyProvenanceRequest(new URL(
+    `https://example.test/v1/daily-validation-provenance?${range.replace(
+      "2025-01-01", "2024-12-30",
+    )}`,
+  ));
+  assert.equal(tooWide.ok, false);
 });

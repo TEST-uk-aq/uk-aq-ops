@@ -4,6 +4,7 @@ import {
   computeObservationContentHash,
   float64BigEndianHex,
   normalizeUkAirVerificationStatus,
+  preservePersistedRatifiedStatus,
   resolveLegacyVerificationStatus,
 } from "../workers/shared/uk_aq_observation_content_hash.mjs";
 
@@ -81,8 +82,8 @@ test("observation content hash v1 is deterministic and status-aware", () => {
   assert.equal(normalizeUkAirVerificationStatus("provisional"), "P");
   assert.equal(normalizeUkAirVerificationStatus("R"), "R");
   assert.equal(normalizeUkAirVerificationStatus(" ratified "), "R");
-  assert.equal(normalizeUkAirVerificationStatus(" "), null);
-  assert.equal(normalizeUkAirVerificationStatus(null), null);
+  assert.equal(normalizeUkAirVerificationStatus(" "), "P");
+  assert.equal(normalizeUkAirVerificationStatus(null), "P");
   assert.equal(
     resolveLegacyVerificationStatus(
       { verification_status: "R", status: "Provisional" },
@@ -104,8 +105,37 @@ test("observation content hash v1 is deterministic and status-aware", () => {
     ),
     null,
   );
-  assert.throws(
-    () => normalizeUkAirVerificationStatus("verified"),
-    /Unsupported UK-AIR verification status/,
+  assert.equal(
+    normalizeUkAirVerificationStatus("verified"),
+    "P",
+    "only explicit ratified evidence may establish R",
+  );
+});
+
+
+test("persisted ratified precedence changes status only for equivalent replacements", () => {
+  const existing = {
+    connector_id: 1, station_id: 10, timeseries_id: 101, pollutant_code: "no2",
+    observed_at_utc: "2026-07-24T01:00:00.000Z", value: 12.5, vstatus: "R",
+  };
+  const replacement = {
+    connector_id: 1, station_id: 10, timeseries_id: 101, pollutant_code: "no2",
+    observed_at_utc: "2026-07-24T01:00:00.000Z", value: 12.5, verification_status: "P",
+  };
+  assert.equal(
+    preservePersistedRatifiedStatus([replacement], [existing])[0].verification_status,
+    "R",
+  );
+
+  const corrected = { ...replacement, value: 13.5 };
+  assert.deepEqual(
+    preservePersistedRatifiedStatus([corrected], [existing]),
+    [corrected],
+    "a changed source value remains authoritative",
+  );
+  assert.deepEqual(
+    preservePersistedRatifiedStatus([], [existing]),
+    [],
+    "an omitted source observation is not restored",
   );
 });

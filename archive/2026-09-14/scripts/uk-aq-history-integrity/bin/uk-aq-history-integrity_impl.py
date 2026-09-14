@@ -18263,9 +18263,7 @@ def _observation_rows_from_local_parquet_for_shared_hash(
                 + ",".join(missing)
             )
         status_column = (
-            "vstatus"
-            if "vstatus" in columns
-            else "verification_status"
+            "verification_status"
             if "verification_status" in columns
             else "status"
             if "status" in columns

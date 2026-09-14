@@ -347,7 +347,7 @@ function serializeRows(rows, rowGroupRows) {
       rows.map((row) => row.value),
       new arrow.Float64(),
     ),
-    vstatus: arrow.vectorFromArray(
+    verification_status: arrow.vectorFromArray(
       rows.map((row) => row.verification_status),
       new arrow.Utf8(),
     ),

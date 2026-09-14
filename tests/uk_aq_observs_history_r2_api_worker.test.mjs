@@ -47,7 +47,7 @@ function installHarness(objectsByKey = {}) {
     cachePutCalls,
     env: {
       UK_AQ_EDGE_UPSTREAM_SECRET: "test-upstream-secret",
-      UK_AQ_R2_HISTORY_VERSION: "v1",
+      UK_AQ_R2_HISTORY_VERSION: "v2",
       UK_AQ_HISTORY_BUCKET: {
         async get(key) {
           getKeys.push(key);
@@ -71,11 +71,11 @@ function installHarness(objectsByKey = {}) {
   };
 }
 
-function observationRequest(extraParams = "") {
+function observationRequest(extraParams = "", includePollutant = true) {
   const suffix = extraParams ? `&${extraParams}` : "";
   return new Request(
     "https://example.test/v1/observations?"
-      + "timeseries_id=1001&connector_id=396"
+      + `timeseries_id=1001&connector_id=396${includePollutant ? "&pollutant=pm25" : ""}`
       + "&start_utc=2026-04-03T00:00:00.000Z"
       + "&end_utc=2026-04-04T00:00:00.000Z"
       + suffix,
@@ -98,10 +98,11 @@ function bindingRequest(timeseriesId = 3742) {
   );
 }
 
-test("observations Worker prefers verification_status and falls back to legacy status", () => {
-  assert.match(workerSource, /schemaColumns\.includes\(\s*"verification_status"/);
-  assert.match(workerSource, /: schemaColumns\.includes\("status"\)/);
-  assert.match(workerSource, /verification_status:/);
+test("observations Worker prefers vstatus and reads legacy status columns", () => {
+  assert.match(workerSource, /schemaColumns\.includes\("vstatus"\)/);
+  assert.match(workerSource, /schemaColumns\.includes\("verification_status"\)/);
+  assert.match(workerSource, /schemaColumns\.includes\("status"\)/);
+  assert.match(workerSource, /vstatus:/);
 });
 
 test("observations Cache API eligibility requires complete, gap-free coverage", () => {
@@ -194,39 +195,27 @@ test("partial and invalid observation responses are no-store and never seed Cach
   assert.equal(harness.cachePutCalls.length, 0);
 });
 
-test("observations Worker v1 default uses configured v1 prefix and v1 index", async () => {
+test("observations Worker v2 uses the fixed generation prefixes", async () => {
   const harness = installHarness({});
   try {
     const response = await observsHistoryWorker.fetch(
       observationRequest(),
-      {
-        ...harness.env,
-        UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: "history/v1/observations-custom",
-        UK_AQ_R2_HISTORY_INDEX_PREFIX: "history/_index_custom",
-        UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_PREFIX:
-          "history/_index_custom/observations_timeseries",
-      },
+      harness.env,
       harness.ctx,
     );
 
     assert.equal(response.status, 200);
     const payload = await response.json();
-    assert.equal(payload.read_version, "v1");
-    assert.equal(payload.history_prefix, "history/v1/observations-custom");
-    assert.equal(payload.coverage.index_version, "v1");
-    assert.equal(payload.coverage.timeseries_index.prefix, "history/_index_custom/observations_timeseries");
-    assert.ok(
-      harness.getKeys.includes(
-        "history/_index_custom/observations_timeseries/day_utc=2026-04-03/connector_id=396/manifest.json",
-      ),
+    assert.equal(payload.read_version, "v2");
+    assert.equal(payload.history_prefix, "history/v2/observations");
+    assert.equal(payload.coverage.index_version, "v2");
+    assert.equal(
+      payload.coverage.timeseries_index.prefix,
+      "history/_index_v2/observations_timeseries",
     );
-    assert.ok(
-      harness.getKeys.includes(
-        "history/v1/observations-custom/day_utc=2026-04-03/manifest.json",
-      ),
-    );
-    assert.equal(harness.getKeys.some((key) => key.includes("history/_index_v2")), false);
-    assert.equal(harness.getKeys.some((key) => key.includes("pollutant_code=")), false);
+    assert.deepEqual(harness.getKeys, [
+      "history/_index_v2/observations_timeseries/day_utc=2026-04-03/connector_id=396/pollutant_code=pm25/manifest.json",
+    ]);
   } finally {
     await harness.restore();
   }
@@ -236,7 +225,7 @@ test("observations Worker v2 requires pollutant partition and does not broad sca
   const harness = installHarness({});
   try {
     const response = await observsHistoryWorker.fetch(
-      observationRequest(),
+      observationRequest("", false),
       {
         ...harness.env,
         UK_AQ_R2_HISTORY_VERSION: "v2",

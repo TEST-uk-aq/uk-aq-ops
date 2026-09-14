@@ -37,11 +37,14 @@ function canonicalStationId(value) {
 }
 
 export function normalizeUkAirVerificationStatus(value) {
-  const normalized = String(value ?? "").trim().toLowerCase();
-  // The UK-AIR annual CSV status cell is authoritative only when it says the
-  // observation is ratified. Every other valid, non-null AURN observation is
-  // provisional; absence of an explicit provisional marker is not a third state.
-  return normalized === "r" || normalized === "ratified" ? "R" : "P";
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "p" || normalized === "provisional") return "P";
+  if (normalized === "r" || normalized === "ratified") return "R";
+  throw new TypeError(
+    `Unsupported UK-AIR verification status: ${JSON.stringify(String(value))}`,
+  );
 }
 
 export function requireCanonicalVerificationStatus(value) {
@@ -131,35 +134,6 @@ export function encodeCanonicalObservationRow(row) {
     float64BigEndianHex(canonical.value),
     canonical.verification_status,
   ]);
-}
-
-
-export function preservePersistedRatifiedStatus(
-  replacementRows,
-  existingRows,
-  { connectorId = 1 } = {},
-) {
-  if (connectorId !== 1) return replacementRows;
-  const identity = (row) => JSON.stringify([
-    connectorId,
-    row.station_id ?? null,
-    row.timeseries_id,
-    String(row.pollutant_code || "").toLowerCase(),
-    new Date(row.observed_at_utc || row.observed_at).toISOString(),
-    float64BigEndianHex(Number(row.value)),
-  ]);
-  const persistedRatified = new Set(existingRows
-    .filter((row) => normalizeUkAirVerificationStatus(
-      row.vstatus ?? row.verification_status ?? row.status ?? null,
-    ) === "R")
-    .map(identity));
-  return replacementRows.map((row) => {
-    if (!persistedRatified.has(identity(row)) ||
-      normalizeUkAirVerificationStatus(
-        row.vstatus ?? row.verification_status ?? row.status ?? null,
-      ) === "R") return row;
-    return { ...row, verification_status: "R" };
-  });
 }
 
 export function computeObservationContentHash(rows) {

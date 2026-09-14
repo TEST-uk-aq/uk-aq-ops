@@ -120,7 +120,7 @@ export function serializeCanonicalObservationV2Parquet(rows, {
     pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
     observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at_utc || row.observed_at))),
     value: rows.map((row) => nullableNumber(row.value)),
-    ...(includeVerificationStatus ? { vstatus: textVector(rows.map((row) => row.vstatus ?? row.verification_status ?? null)) } : {}),
+    ...(includeVerificationStatus ? { verification_status: textVector(rows.map((row) => row.verification_status ?? null)) } : {}),
   };
   return writeParquet(
     arrow.tableFromArrays(columns),

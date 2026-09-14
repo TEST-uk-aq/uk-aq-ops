@@ -5,6 +5,7 @@ Cloudflare Worker for historical observations reads from R2 History.
 Routes:
 
 - `GET /v1/observations`
+- `GET /v1/daily-validation-provenance` (one connector-1 timeseries, bounded to 366 UTC days)
 - `GET /v1/timeseries-binding?timeseries_id=<id>` (stable v2 identity/routing)
 - `GET /v1/who-summary?as_of=YYYY-MM-DD` (WHO homepage summary)
 - alias: `GET /`
@@ -75,7 +76,7 @@ V2 serving rule:
 
 Response:
 
-- returns `{ observed_at, value }` rows sorted by `observed_at` ascending.
+- returns `{ observed_at, value, vstatus }` rows sorted by `observed_at` ascending; legacy rows without a status return `vstatus: null`.
 - includes `cache_scope` (`recent` or `immutable`) for cache policy visibility.
 - includes `read_version`, `index_version`, `pollutant`, `history_index_prefix`,
   and `timeseries_index_prefix` for read-path visibility.

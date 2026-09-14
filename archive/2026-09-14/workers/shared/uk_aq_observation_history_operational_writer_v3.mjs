@@ -20,7 +20,6 @@ import {
 } from "./uk_aq_observation_history_target_writer.mjs";
 import {
   OBSERVATION_HISTORY_COLUMNS_V3,
-  OBSERVATION_HISTORY_COLUMNS_V3_LEGACY,
 } from "./uk_aq_observation_history_schema.mjs";
 import {
   DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
@@ -247,14 +246,10 @@ function decodeAcceptedCanonicalObservationRows(body, key) {
     );
   }
   const columns = table.schema.fields.map((field) => field.name);
-  const supportedColumns = [
-    OBSERVATION_HISTORY_COLUMNS_V3,
-    OBSERVATION_HISTORY_COLUMNS_V3_LEGACY,
-  ];
-  if (!supportedColumns.some((expected) =>
-    columns.length === expected.length &&
-    columns.every((column, index) => column === expected[index])
-  )) {
+  if (
+    columns.length !== OBSERVATION_HISTORY_COLUMNS_V3.length ||
+    columns.some((column, index) => column !== OBSERVATION_HISTORY_COLUMNS_V3[index])
+  ) {
     throw new Error(`Current canonical Parquet schema is unsupported: ${key}`);
   }
   const vectors = Object.fromEntries(columns.map((column) => [
@@ -274,9 +269,9 @@ function decodeAcceptedCanonicalObservationRows(body, key) {
       pollutant_code: String(vectors.pollutant_code.get(index)),
       observed_at_utc: observedAtUtc.toISOString(),
       value: Number(vectors.value.get(index)),
-      verification_status: (vectors.vstatus || vectors.verification_status).get(index) === null
+      verification_status: vectors.verification_status.get(index) === null
         ? null
-        : String((vectors.vstatus || vectors.verification_status).get(index)),
+        : String(vectors.verification_status.get(index)),
     };
   });
 }

@@ -11,8 +11,6 @@ export const WHO_DAILY_SERIES_API_PATH = "/api/aq/who-daily-series";
 const RPC_NAME = "uk_aq_rpc_who_2021_daily_series";
 const RPC_SCHEMA = "uk_aq_public";
 const BROWSER_CACHE_CONTROL = "no-store";
-const OBSERVATION_PROVENANCE_PATH = "/v1/daily-validation-provenance";
-const UPSTREAM_AUTH_HEADER = "X-UK-AQ-Upstream-Auth";
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const ALLOWED_QUERY_KEYS = new Set([
   "pollutant",
@@ -30,8 +28,6 @@ export type WhoDailySeriesProxyEnv = {
   OBS_AQIDB_SUPABASE_URL?: unknown;
   OBS_AQIDB_SECRET_KEY?: unknown;
   UK_AQ_CACHE_ALLOWED_ORIGINS?: unknown;
-  UK_AQ_OBSERVS_HISTORY_R2_API_URL?: unknown;
-  UK_AQ_EDGE_UPSTREAM_SECRET?: unknown;
 };
 
 type ValidatedQuery = {
@@ -258,54 +254,6 @@ function validatePayload(
   return null;
 }
 
-
-async function readDailyAurnProvenance(
-  env: WhoDailySeriesProxyEnv,
-  timeseriesId: number,
-  startDayUtc: string,
-  endDayUtc: string,
-): Promise<Map<string, "P" | "R">> {
-  const configuredUrl = (await readSecret(
-    env.UK_AQ_OBSERVS_HISTORY_R2_API_URL,
-  )).trim();
-  const upstreamSecret = (await readSecret(
-    env.UK_AQ_EDGE_UPSTREAM_SECRET,
-  )).trim();
-  if (!configuredUrl || !upstreamSecret) {
-    throw new Error("observation history provenance upstream is not configured");
-  }
-  const url = new URL(configuredUrl);
-  url.pathname = OBSERVATION_PROVENANCE_PATH;
-  url.search = "";
-  url.searchParams.set("timeseries_id", String(timeseriesId));
-  url.searchParams.set("connector_id", "1");
-  url.searchParams.set("pollutant", "pm25");
-  url.searchParams.set("start_utc", `${startDayUtc}T00:00:00.000Z`);
-  url.searchParams.set("end_utc", `${addUtcDays(endDayUtc, 1)}T00:00:00.000Z`);
-
-  const response = await fetch(url.toString(), {
-    headers: { Accept: "application/json", [UPSTREAM_AUTH_HEADER]: upstreamSecret },
-  });
-  if (!response.ok) {
-    throw new Error(`observation history provenance returned ${response.status}`);
-  }
-  const payload: unknown = await response.json();
-  if (!isObject(payload) || payload.response_complete !== true ||
-    payload.has_gap === true || !Array.isArray(payload.rows)) {
-    throw new Error("observation history provenance response is incomplete");
-  }
-
-  const daily = new Map<string, "P" | "R">();
-  for (const raw of payload.rows) {
-    if (!isObject(raw) || !isValidUtcDay(raw.day_utc) ||
-      (raw.vstatus !== "P" && raw.vstatus !== "R")) {
-      throw new Error("observation history provenance row is invalid");
-    }
-    daily.set(raw.day_utc, raw.vstatus);
-  }
-  return daily;
-}
-
 export async function handleWhoDailySeriesProxyRequest(
   request: Request,
   env: WhoDailySeriesProxyEnv,
@@ -483,33 +431,9 @@ export async function handleWhoDailySeriesProxyRequest(
     );
   }
 
-  let dailyProvenance: Map<string, "P" | "R">;
-  try {
-    dailyProvenance = await readDailyAurnProvenance(
-      env,
-      Number((payload.timeseries as Record<string, unknown>).timeseries_id),
-      String((payload.meta as Record<string, unknown>).window_start_day_utc),
-      String((payload.meta as Record<string, unknown>).window_end_day_utc),
-    );
-  } catch (error) {
-    console.error("WHO daily-series provenance request failed", error);
-    return errorResponse(
-      502,
-      "who_daily_series_provenance_failed",
-      "WHO daily series validation provenance could not be read",
-    );
-  }
-
-  const enrichedPayload = {
-    ...payload,
-    data: (payload.data as Array<Record<string, unknown>>).map((item) => ({
-      ...item,
-      source_validation_status: dailyProvenance.get(String(item.day_utc)) ?? null,
-    })),
-  };
   return jsonResponse(
     200,
-    enrichedPayload,
+    payload,
     request.method,
     requestOrigin,
     allowedOrigins,

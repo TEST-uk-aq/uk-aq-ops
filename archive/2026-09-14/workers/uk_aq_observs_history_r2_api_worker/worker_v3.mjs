@@ -7,9 +7,6 @@ import {
   ObservationHistoryExactLeafReadError,
   readObservationHistoryExactLeafPageV3,
 } from "../shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs";
-import {
-  readObservationHistoryExactV3,
-} from "../shared/uk_aq_observation_history_reader_v3.mjs";
 
 const LOGICAL_HISTORY_VERSION = "v2";
 const INDEX_GENERATION = "v3";
@@ -26,9 +23,7 @@ const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MUTABLE_WINDOW_MS = 24 * 60 * 60 * 1000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const DEFAULT_BINDING_PREFIX = V3.timeseries_binding_index_prefix;
-const DAILY_PROVENANCE_PATH = "/v1/daily-validation-provenance";
 const VALID_OBSERVATION_PATHS = new Set(["/", "/v1/observations"]);
-const MAX_PROVENANCE_RANGE_MS = 366 * 24 * 60 * 60 * 1000;
 export const EXACT_HISTORY_WORKLOAD_DIAGNOSTIC_MODE = "workload_v1";
 export const EXACT_HISTORY_CPU_DIAGNOSTIC_MODE = "cpu_v1";
 const EXACT_HISTORY_DIAGNOSTIC_MODES = new Set([
@@ -165,74 +160,6 @@ export function parseObservationRequest(url) {
     };
   }
   return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso, physicalCursor, diagnosticMode };
-}
-
-
-export function parseDailyProvenanceRequest(url) {
-  if (url.pathname !== DAILY_PROVENANCE_PATH) {
-    return { ok: false, status: 404, error: "Not found." };
-  }
-  const timeseriesId = positiveInteger(url.searchParams.get("timeseries_id"));
-  const connectorId = positiveInteger(url.searchParams.get("connector_id"));
-  const pollutantCode = normalizePollutant(url.searchParams.get("pollutant"));
-  const startIso = isoOrNull(url.searchParams.get("start_utc"));
-  const endIso = isoOrNull(url.searchParams.get("end_utc"));
-  if (!timeseriesId || connectorId !== 1 || !pollutantCode || !startIso || !endIso) {
-    return { ok: false, status: 400, error: "daily provenance requires one timeseries, connector_id=1, pollutant and UTC range." };
-  }
-  const duration = Date.parse(endIso) - Date.parse(startIso);
-  if (duration <= 0 || duration > MAX_PROVENANCE_RANGE_MS) {
-    return { ok: false, status: 400, error: "daily provenance range must be greater than zero and no more than 366 days." };
-  }
-  for (const key of url.searchParams.keys()) {
-    if (!["timeseries_id", "connector_id", "pollutant", "start_utc", "end_utc"].includes(key)) {
-      return { ok: false, status: 400, error: `unsupported daily provenance parameter: ${key}.` };
-    }
-  }
-  return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso };
-}
-
-async function handleDailyProvenance(params, env) {
-  const result = await readObservationHistoryExactV3({
-    source: createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET }),
-    indexGeneration: "v3",
-    historyVersion: "v2",
-    timeseriesId: params.timeseriesId,
-    connectorId: params.connectorId,
-    pollutantCode: params.pollutantCode,
-    startUtc: params.startIso,
-    endUtc: params.endIso,
-    indexRoot: V3.observations_timeseries_index_prefix,
-    limits: {
-      max_index_objects: 800,
-      max_total_index_bytes: 64 * 1024 * 1024,
-      max_distinct_files: 400,
-      max_selected_segments: 800,
-      max_selected_row_groups: 800,
-      max_footer_reads: 400,
-      max_footer_bytes: 32 * 1024 * 1024,
-      max_total_range_reads: 1600,
-      max_total_bytes_requested: 64 * 1024 * 1024,
-      max_decoded_rows: 20000,
-      max_response_rows: 20000,
-    },
-  });
-  if (result.response_complete !== true || result.has_gap === true) {
-    return jsonResponse({ ok: false, error: "observation provenance is incomplete" }, { status: 502, noStore: true });
-  }
-  const daily = new Map();
-  for (const row of result.rows) {
-    const dayUtc = row.observed_at_utc.slice(0, 10);
-    const status = row.vstatus === "R" ? "R" : "P";
-    if (status === "P" || !daily.has(dayUtc)) daily.set(dayUtc, status);
-  }
-  return jsonResponse({
-    ok: true, timeseries_id: params.timeseriesId, connector_id: 1,
-    pollutant: params.pollutantCode, start_utc: params.startIso, end_utc: params.endIso,
-    response_complete: true, has_gap: false,
-    rows: [...daily].sort(([left], [right]) => left.localeCompare(right))
-      .map(([day_utc, vstatus]) => ({ day_utc, vstatus })),
-  }, { noStore: true });
 }
 
 function diagnosticRequestContext(request, params) {
@@ -379,11 +306,7 @@ async function handleObservations(params, env, diagnosticContext) {
     physicalCursor: params.physicalCursor,
     index: observationHistoryV3ReaderIndex(indexRoot),
   });
-  const rows = result.rows.map((row) => ({
-    observed_at: row.observed_at_utc,
-    value: row.value,
-    vstatus: row.vstatus ?? row.verification_status ?? null,
-  }));
+  const rows = result.rows.map((row) => ({ observed_at: row.observed_at_utc, value: row.value }));
   const partialReasons = result.partial_reasons;
   const complete = result.response_complete === true;
   const hasGap = result.has_gap === true;
@@ -458,11 +381,6 @@ export default {
     let context = null;
     try {
       assertGenerationConfiguration(env);
-      if (url.pathname === DAILY_PROVENANCE_PATH) {
-        const params = parseDailyProvenanceRequest(url);
-        if (!params.ok) return jsonResponse({ ok: false, error: params.error }, { status: params.status, noStore: true });
-        return handleDailyProvenance(params, env);
-      }
       if (url.pathname === "/v1/timeseries-binding") {
         assertGenerationConfiguration(env);
         const params = parseBindingRequest(url);
