@@ -11,7 +11,7 @@ export const WHO_DAILY_SERIES_API_PATH = "/api/aq/who-daily-series";
 const RPC_NAME = "uk_aq_rpc_who_2021_daily_series";
 const RPC_SCHEMA = "uk_aq_public";
 const BROWSER_CACHE_CONTROL = "no-store";
-const OBSERVATION_PROVENANCE_PATH = "/v1/observations";
+const OBSERVATION_PROVENANCE_PATH = "/v1/daily-validation-provenance";
 const UPSTREAM_AUTH_HEADER = "X-UK-AQ-Upstream-Auth";
 const ISO_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const ALLOWED_QUERY_KEYS = new Set([
@@ -282,7 +282,6 @@ async function readDailyAurnProvenance(
   url.searchParams.set("pollutant", "pm25");
   url.searchParams.set("start_utc", `${startDayUtc}T00:00:00.000Z`);
   url.searchParams.set("end_utc", `${addUtcDays(endDayUtc, 1)}T00:00:00.000Z`);
-  url.searchParams.set("limit", "20000");
 
   const response = await fetch(url.toString(), {
     headers: { Accept: "application/json", [UPSTREAM_AUTH_HEADER]: upstreamSecret },
@@ -298,13 +297,11 @@ async function readDailyAurnProvenance(
 
   const daily = new Map<string, "P" | "R">();
   for (const raw of payload.rows) {
-    if (!isObject(raw) || raw.value === null || raw.value === undefined ||
-      !Number.isFinite(Number(raw.value))) continue;
-    const observedAt = new Date(String(raw.observed_at || ""));
-    if (Number.isNaN(observedAt.getTime())) continue;
-    const dayUtc = observedAt.toISOString().slice(0, 10);
-    const status = raw.vstatus === "R" ? "R" : "P";
-    if (status === "P" || !daily.has(dayUtc)) daily.set(dayUtc, status);
+    if (!isObject(raw) || !isValidUtcDay(raw.day_utc) ||
+      (raw.vstatus !== "P" && raw.vstatus !== "R")) {
+      throw new Error("observation history provenance row is invalid");
+    }
+    daily.set(raw.day_utc, raw.vstatus);
   }
   return daily;
 }

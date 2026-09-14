@@ -81,8 +81,8 @@ test("observation content hash v1 is deterministic and status-aware", () => {
   assert.equal(normalizeUkAirVerificationStatus("provisional"), "P");
   assert.equal(normalizeUkAirVerificationStatus("R"), "R");
   assert.equal(normalizeUkAirVerificationStatus(" ratified "), "R");
-  assert.equal(normalizeUkAirVerificationStatus(" "), null);
-  assert.equal(normalizeUkAirVerificationStatus(null), null);
+  assert.equal(normalizeUkAirVerificationStatus(" "), "P");
+  assert.equal(normalizeUkAirVerificationStatus(null), "P");
   assert.equal(
     resolveLegacyVerificationStatus(
       { verification_status: "R", status: "Provisional" },
@@ -104,8 +104,9 @@ test("observation content hash v1 is deterministic and status-aware", () => {
     ),
     null,
   );
-  assert.throws(
-    () => normalizeUkAirVerificationStatus("verified"),
-    /Unsupported UK-AIR verification status/,
+  assert.equal(
+    normalizeUkAirVerificationStatus("verified"),
+    "P",
+    "only explicit ratified evidence may establish R",
   );
 });

@@ -5,6 +5,7 @@ Cloudflare Worker for historical observations reads from R2 History.
 Routes:
 
 - `GET /v1/observations`
+- `GET /v1/daily-validation-provenance` (one connector-1 timeseries, bounded to 366 UTC days)
 - `GET /v1/timeseries-binding?timeseries_id=<id>` (stable v2 identity/routing)
 - `GET /v1/who-summary?as_of=YYYY-MM-DD` (WHO homepage summary)
 - alias: `GET /`
