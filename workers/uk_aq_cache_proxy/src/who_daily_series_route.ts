@@ -483,7 +483,7 @@ export async function handleWhoDailySeriesProxyRequest(
     );
   }
 
-  let dailyProvenance: Map<string, "P" | "R">;
+  let dailyProvenance: Map<string, "P" | "R"> | null = null;
   try {
     dailyProvenance = await readDailyAurnProvenance(
       env,
@@ -492,19 +492,27 @@ export async function handleWhoDailySeriesProxyRequest(
       String((payload.meta as Record<string, unknown>).window_end_day_utc),
     );
   } catch (error) {
-    console.error("WHO daily-series provenance request failed", error);
-    return errorResponse(
-      502,
-      "who_daily_series_provenance_failed",
-      "WHO daily series validation provenance could not be read",
-    );
+    console.error("WHO daily-series provenance enrichment degraded", {
+      timeseriesId: Number(
+        (payload.timeseries as Record<string, unknown>).timeseries_id,
+      ),
+      windowStartDayUtc: String(
+        (payload.meta as Record<string, unknown>).window_start_day_utc,
+      ),
+      windowEndDayUtc: String(
+        (payload.meta as Record<string, unknown>).window_end_day_utc,
+      ),
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 
   const enrichedPayload = {
     ...payload,
     data: (payload.data as Array<Record<string, unknown>>).map((item) => ({
       ...item,
-      source_validation_status: dailyProvenance.get(String(item.day_utc)) ?? null,
+      source_validation_status:
+        dailyProvenance?.get(String(item.day_utc)) ??
+          (item.daily_mean_ugm3 !== null ? "P" : null),
     })),
   };
   return jsonResponse(
