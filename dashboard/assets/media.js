@@ -14,9 +14,9 @@
   ];
   const STATUS_LABELS = { approved: "Approved", pending: "Pending", rejected: "Rejected", hidden: "Hidden" };
   const STATUS_ACTIONS = {
-    pending: [["approved", "Approve", "approve"], ["rejected", "Reject", "reject"], ["hidden", "Hide", "hide"]],
+    pending: [["approved", "Approve", "approve"], ["rejected", "Reject", "reject"]],
     approved: [["hidden", "Hide", "hide"], ["rejected", "Reject", "reject"]],
-    rejected: [["approved", "Approve", "approve"], ["hidden", "Hide", "hide"]],
+    rejected: [["approved", "Approve", "approve"]],
     hidden: [["approved", "Approve", "unhide"], ["rejected", "Reject", "reject"]],
   };
   const MAX_BATCH_SELECTION = 50;
@@ -245,6 +245,21 @@
         `<option value="${target}" data-action="${action}">${label}</option>`)).join("");
   }
 
+  function statusActionForTarget(status, target) {
+    return (STATUS_ACTIONS[status] || []).find(([next]) => next === target)?.[2] || null;
+  }
+
+  function selectedArticles() {
+    return state.articles.filter(article => state.selectedArticleIds.has(String(article.id)));
+  }
+
+  function bulkStatusOptions(selected = selectedArticles()) {
+    const targets = ["approved", "rejected", "hidden"].filter(target => selected.every(article =>
+      article.status === target || statusActionForTarget(article.status, target)));
+    return `<option value="">Choose status…</option>${targets.map(target =>
+      `<option value="${target}">${STATUS_LABELS[target]}</option>`).join("")}`;
+  }
+
   function statusControl(article) {
     return `<div class="media-status-control" data-status-control data-id="${article.id}" data-current="${article.status}">
       <select aria-label="Article Status for ${esc(article.title)}">${statusOptions(article.status)}</select>
@@ -315,7 +330,7 @@
 
   function bulkToolbarHtml() {
     const count = state.selectedArticleIds.size;
-    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}><option value="">Choose status…</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="hidden">Hidden</option></select></label><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
+    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
   }
 
   function articleTableHtml(error = "") {
@@ -445,9 +460,7 @@
       refreshSelectionControls();
     }));
     state.root.querySelector("[data-bulk-status]")?.addEventListener("change", event => {
-      const count = state.selectedArticleIds.size;
-      const save = state.root.querySelector("[data-article-table] [data-save-bulk]");
-      if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !event.target.value;
+      refreshSelectionControls();
     });
     state.root.querySelector("[data-save-bulk]")?.addEventListener("click", () => void saveBulkStatus());
     state.root.querySelectorAll("[data-status-control] select").forEach(select => select.addEventListener("change", event => {
@@ -490,16 +503,27 @@
     table.querySelectorAll("[data-select-article]").forEach(input => { input.checked = state.selectedArticleIds.has(String(input.closest("[data-article-id]").dataset.articleId)); });
     const label = table.querySelector(".media-bulk-toolbar strong"); if (label) label.textContent = `${count} selected`;
     const target = table.querySelector("[data-bulk-status]"); const save = table.querySelector("[data-save-bulk]");
-    if (target) target.disabled = count === 0; if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value;
+    if (target) {
+      const previous = target.value;
+      target.innerHTML = bulkStatusOptions(selectedArticles());
+      if ([...target.options].some(option => option.value === previous)) target.value = previous;
+      target.disabled = count === 0;
+    }
+    if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value;
     const output = table.querySelector("[data-bulk-message]"); if (output) output.innerHTML = state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : "";
   }
 
   async function saveBulkStatus() {
     const table = state.root.querySelector("[data-article-table]"); const target = table?.querySelector("[data-bulk-status]")?.value;
     if (!target || !["approved", "rejected", "hidden"].includes(target)) return;
-    const selected = state.articles.filter(article => state.selectedArticleIds.has(String(article.id)));
+    const selected = selectedArticles();
     if (selected.length > MAX_BATCH_SELECTION) { state.batchMessage = { text: `Apply Article Status to at most ${MAX_BATCH_SELECTION} selected rows at a time.`, kind: "error" }; refreshSelectionControls(); return; }
-    const changes = selected.map(article => ({ article, action: (STATUS_ACTIONS[article.status] || []).find(([next]) => next === target)?.[2] })).filter(item => item.action);
+    if (!selected.every(article => article.status === target || statusActionForTarget(article.status, target))) {
+      state.batchMessage = { text: `Selected rows cannot all move to ${STATUS_LABELS[target]}.`, kind: "error" };
+      refreshSelectionControls();
+      return;
+    }
+    const changes = selected.map(article => ({ article, action: statusActionForTarget(article.status, target) })).filter(item => item.action);
     const save = table.querySelector("[data-save-bulk]"); save.disabled = true;
     const results = await Promise.allSettled(changes.map(({ article, action }) => request(`articles/${article.id}/${action}`, { method: "POST", idempotent: "status" })));
     const succeeded = results.filter(result => result.status === "fulfilled").length;
