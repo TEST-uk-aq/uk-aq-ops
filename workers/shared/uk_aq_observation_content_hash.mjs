@@ -133,6 +133,35 @@ export function encodeCanonicalObservationRow(row) {
   ]);
 }
 
+
+export function preservePersistedRatifiedStatus(
+  replacementRows,
+  existingRows,
+  { connectorId = 1 } = {},
+) {
+  if (connectorId !== 1) return replacementRows;
+  const identity = (row) => JSON.stringify([
+    connectorId,
+    row.station_id ?? null,
+    row.timeseries_id,
+    String(row.pollutant_code || "").toLowerCase(),
+    new Date(row.observed_at_utc || row.observed_at).toISOString(),
+    float64BigEndianHex(Number(row.value)),
+  ]);
+  const persistedRatified = new Set(existingRows
+    .filter((row) => normalizeUkAirVerificationStatus(
+      row.vstatus ?? row.verification_status ?? row.status ?? null,
+    ) === "R")
+    .map(identity));
+  return replacementRows.map((row) => {
+    if (!persistedRatified.has(identity(row)) ||
+      normalizeUkAirVerificationStatus(
+        row.vstatus ?? row.verification_status ?? row.status ?? null,
+      ) === "R") return row;
+    return { ...row, verification_status: "R" };
+  });
+}
+
 export function computeObservationContentHash(rows) {
   if (!Array.isArray(rows) || rows.length === 0) {
     throw new TypeError(

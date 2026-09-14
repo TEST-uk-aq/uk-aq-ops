@@ -139,3 +139,18 @@ test("v2 AQI rebuild allows connector-scoped refresh without full-day non-target
   assert.match(body, /r2_history_obs_to_aqilevels_day_skipped_connector_filter_incomplete/);
   assert.match(body, /connector_scoped_v2_aqi_refresh: allowConnectorScopedV2AqiRefresh/);
 });
+
+test("SOS replacement applies persisted R precedence before any replacement deletion", () => {
+  const body = bodyOf("exportObsConnectorRowsToR2V2");
+  assert.match(body, /preservePersistedRatifiedStatus/);
+  assert.ok(
+    body.indexOf("loadVerifiedR2ObservationRowsForConnectorDay") <
+      body.indexOf("deleteR2Prefix"),
+    "persisted status evidence is read before replacement deletion",
+  );
+  assert.ok(
+    body.indexOf("preservePersistedRatifiedStatus") <
+      body.indexOf("classifyObservationRowsForV2PollutantPartitions"),
+    "R precedence is resolved before canonical partition writing",
+  );
+});
