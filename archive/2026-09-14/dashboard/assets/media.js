@@ -574,7 +574,6 @@
         <div class="media-detail__grid"><div>${article.admin_preview_image_path ? `<img class="media-detail__preview" src="${esc(apiUrl(`articles/${id}/image`))}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
         <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatUtcDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div data-detail-status-message></div></section>
-        <section><h4>Author</h4><form class="media-inline-form" data-detail-author><label class="media-field media-field--grow"><span>Author</span><input name="author" maxlength="500" value="${esc(article.author || "")}" autocomplete="off"></label><button class="media-button media-button--primary">Save Author</button></form><p class="media-subtext">Single line, maximum 500 characters. Saving a blank value clears the authoritative Author.</p><div data-detail-author-message></div></section>
         <section><h4>Display title</h4><p>${esc(aiSuggestionLabel(article))}${article.ai_title_generated_at ? ` · ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}` : ""}</p><p>${esc(article.ai_title_suggestion || "—")}</p><div class="media-actions"><button type="button" class="media-button" data-detail-generate-ai>${article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title"}</button>${detailAiActions}</div><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
         <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
         <section><details><summary>Discovery evidence and recent events (raw ISO UTC)</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
@@ -588,7 +587,6 @@
         button.title = event.currentTarget.value ? "Save status change" : "Saved/current";
       });
       detailStatus?.querySelector("button")?.addEventListener("click", () => void saveDetailStatus(id, detailStatus, dialog));
-      dialog.querySelector("[data-detail-author]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailAuthor(id, new FormData(event.currentTarget).get("author"), dialog); });
       dialog.querySelector("[data-detail-title]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailTitle(id, new FormData(event.currentTarget).get("display_title"), dialog); });
       dialog.querySelector("[data-clear-title]")?.addEventListener("click", () => void saveDetailTitle(id, null, dialog));
       dialog.querySelector("[data-detail-generate-ai]")?.addEventListener("click", event => void generateDetailAiTitle(id, event.currentTarget, dialog));
@@ -618,31 +616,6 @@
     const output = dialog.querySelector("[data-detail-title-message]");
     try { await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: value === null ? null : String(value) } }); output.innerHTML = message(value === null ? "Publisher original restored." : "Human display title saved.", "success"); void renderArticles(false); }
     catch (error) { output.innerHTML = message(error.message, "error"); }
-  }
-
-  async function saveDetailAuthor(id, value, dialog) {
-    const output = dialog.querySelector("[data-detail-author-message]");
-    const saveButton = dialog.querySelector("[data-detail-author] button");
-    const rawAuthor = String(value ?? "");
-    if (/[\r\n\u2028\u2029]/u.test(rawAuthor)) {
-      output.innerHTML = message("Author must be a single line.", "error");
-      return;
-    }
-    const author = rawAuthor.trim() || null;
-    saveButton.disabled = true;
-    try {
-      await request(`articles/${id}/author`, {
-        method: "PUT",
-        idempotent: "author",
-        body: { author },
-      });
-      state.selectors = { publications: [], authors: [] };
-      await renderArticles(false);
-      await openArticle(id, author === null ? "Author cleared." : "Author saved.");
-    } catch (error) {
-      saveButton.disabled = false;
-      output.innerHTML = message(error.message, "error");
-    }
   }
 
   async function generateDetailAiTitle(id, button, dialog) {

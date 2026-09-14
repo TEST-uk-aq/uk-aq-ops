@@ -10,7 +10,6 @@ const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/articles\/[1-9]\d*$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/image$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/(approve|reject|hide|unhide)$/, methods: new Set(['POST']) },
-  { pattern: /^\/api\/media\/articles\/[1-9]\d*\/author$/, methods: new Set(['PUT']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/display-title$/, methods: new Set(['PUT']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/display-title\/generate-ai$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/display-title\/(accept-ai|reject-ai)$/, methods: new Set(['POST']) },
