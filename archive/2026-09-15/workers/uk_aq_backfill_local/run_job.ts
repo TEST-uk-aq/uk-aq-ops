@@ -875,9 +875,7 @@ const DEPRECATED_R2_HISTORY_VERSION_ENVS = [
   "UK_AQ_R2_HISTORY_BACKUP_VERSION",
 ];
 
-type HistoryWriteVersion = "v1" | "v2" | "v3";
-
-function resolveHistoryWriteVersionFromEnv(): HistoryWriteVersion {
+function resolveHistoryWriteVersionFromEnv(): "v1" | "v2" {
   const presentDeprecated = DEPRECATED_R2_HISTORY_VERSION_ENVS.filter((name) => Deno.env.get(name) !== undefined);
   if (presentDeprecated.length > 0) {
     throw new Error(
@@ -889,53 +887,6 @@ function resolveHistoryWriteVersionFromEnv(): HistoryWriteVersion {
   const value = String(raw || "").trim().toLowerCase();
   if (value === "v1" || value === "v2") {
     return value;
-  }
-  if (value === "v3") {
-    const integrityInvocation = parseBooleanish(
-      Deno.env.get("UK_AQ_INTEGRITY_INVOCATION"),
-      false,
-    );
-    const outputScope = String(
-      Deno.env.get("UK_AQ_BACKFILL_OUTPUT_SCOPE") || "",
-    ).trim().toLowerCase();
-    const proposalMode = String(
-      Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE") || "",
-    ).trim().toLowerCase();
-    const sourceEvidenceOnly = parseBooleanish(
-      Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
-      false,
-    );
-    const workerPurpose = String(
-      Deno.env.get("UK_AQ_INTEGRITY_WORKER_PURPOSE") || "",
-    ).trim().toLowerCase();
-    const canonicalWritesAllowed = String(
-      Deno.env.get("UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED") || "",
-    ).trim().toLowerCase();
-    const finalIndexRebuild = String(
-      Deno.env.get("UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX") || "",
-    ).trim().toLowerCase();
-    const effectiveMode = String(
-      Deno.env.get("UK_AQ_INTEGRITY_EFFECTIVE_MODE") || "",
-    ).trim().toLowerCase();
-    const evidencePurposeValid = workerPurpose === "source_evidence_only" &&
-      sourceEvidenceOnly && effectiveMode === "check_only";
-    const proposalPurposeValid = workerPurpose === "repair_proposal" &&
-      !sourceEvidenceOnly &&
-      (effectiveMode === "repair_dry_run" || effectiveMode === "repair_apply");
-    if (
-      integrityInvocation && outputScope === "observations_only" &&
-      proposalMode === "prepare" &&
-      (evidencePurposeValid || proposalPurposeValid) &&
-      canonicalWritesAllowed === "false" && finalIndexRebuild === "false"
-    ) {
-      return value;
-    }
-    throw new Error(
-      `Unsupported ${CANONICAL_R2_HISTORY_VERSION_ENV}=v3 invocation; ` +
-        "v3 is restricted to fixed-v3 Integrity observations-only source " +
-        "evidence or repair proposals with canonical writes and the generic " +
-        "full-index rebuild disabled",
-    );
   }
   if (!value) {
     throw new Error(`Missing ${CANONICAL_R2_HISTORY_VERSION_ENV}; set ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1 or ${CANONICAL_R2_HISTORY_VERSION_ENV}=v2.`);
@@ -951,8 +902,6 @@ const AQI_R2_HISTORY_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX") || "history/v1/aqilevels/hourly",
 ) || "history/v1/aqilevels/hourly";
 const HISTORY_R2_WRITE_VERSION = resolveHistoryWriteVersionFromEnv();
-const USES_STRUCTURED_HISTORY_LAYOUT =
-  HISTORY_R2_WRITE_VERSION === "v2" || HISTORY_R2_WRITE_VERSION === "v3";
 const OBS_R2_HISTORY_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX") ||
     HISTORY_R2_V2_OBSERVATIONS_PREFIX,
@@ -965,7 +914,7 @@ const AQI_R2_HISTORY_DEBUG_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX") ||
     HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
 ) || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX;
-const CORE_R2_HISTORY_PREFIX = USES_STRUCTURED_HISTORY_LAYOUT
+const CORE_R2_HISTORY_PREFIX = HISTORY_R2_WRITE_VERSION === "v2"
   ? (normalizePrefix(
     Deno.env.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX") || "history/v2/core",
   ) || "history/v2/core")
@@ -1356,25 +1305,6 @@ const INTEGRITY_SOURCE_EVIDENCE_ONLY = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
   false,
 );
-if (HISTORY_R2_WRITE_VERSION === "v3") {
-  const workerPurpose = optionalEnv("UK_AQ_INTEGRITY_WORKER_PURPOSE");
-  const canonicalWritesAllowed = optionalEnv(
-    "UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED",
-  );
-  if (
-    !INTEGRITY_PROPOSAL_MODE ||
-    (workerPurpose !== "source_evidence_only" &&
-      workerPurpose !== "repair_proposal") ||
-    canonicalWritesAllowed !== "false" ||
-    (workerPurpose === "source_evidence_only" &&
-      !INTEGRITY_SOURCE_EVIDENCE_ONLY) ||
-    (workerPurpose === "repair_proposal" && INTEGRITY_SOURCE_EVIDENCE_ONLY)
-  ) {
-    throw new Error(
-      "v3 Integrity worker safety contract became inconsistent before execution",
-    );
-  }
-}
 const SOS_SOURCE_ACQUISITION_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT",
 );
@@ -2267,19 +2197,19 @@ function buildAqiPartKey(
 }
 
 function activeObsHistoryPrefix(): string {
-  return USES_STRUCTURED_HISTORY_LAYOUT
+  return HISTORY_R2_WRITE_VERSION === "v2"
     ? OBS_R2_HISTORY_PREFIX_V2
     : OBS_R2_HISTORY_PREFIX;
 }
 
 function activeAqiHistoryDataPrefix(): string {
-  return USES_STRUCTURED_HISTORY_LAYOUT
+  return HISTORY_R2_WRITE_VERSION === "v2"
     ? AQI_R2_HISTORY_DATA_PREFIX_V2
     : AQI_R2_HISTORY_PREFIX;
 }
 
 function activeAqiHistoryDebugPrefix(): string {
-  return USES_STRUCTURED_HISTORY_LAYOUT
+  return HISTORY_R2_WRITE_VERSION === "v2"
     ? AQI_R2_HISTORY_DEBUG_PREFIX_V2
     : AQI_R2_HISTORY_PREFIX;
 }
@@ -4658,7 +4588,7 @@ async function exportObsConnectorRowsToR2(args: {
   example_missing_pollutant_rows?: MissingPollutantExampleRow[];
   pollutant_codes_written?: string[];
 }> {
-  if (USES_STRUCTURED_HISTORY_LAYOUT) {
+  if (HISTORY_R2_WRITE_VERSION === "v2") {
     return await exportObsConnectorRowsToR2V2(args);
   }
 
@@ -7467,7 +7397,7 @@ async function fetchSosSiteTimeseriesRefsForConnector(
       candidateIdSet.has(row.timeseries_id)
     );
   }
-  if (INTEGRITY_COMPLETE_CONNECTOR_DAY && USES_STRUCTURED_HISTORY_LAYOUT) {
+  if (INTEGRITY_COMPLETE_CONNECTOR_DAY && HISTORY_R2_WRITE_VERSION === "v2") {
     throw new Error(
       "v2_integrity_sos_site_ref_bridge_snapshot_required; " +
         "live Supabase mapping lookup is not an authoritative fallback",
@@ -14482,7 +14412,7 @@ async function runSourceToAll(
           connectorId,
         );
         if (!FORCE_REPLACE && existingObsManifest && existingAqiManifest) {
-          if (!INTEGRITY_PROPOSAL_MODE && USES_STRUCTURED_HISTORY_LAYOUT) {
+          if (!INTEGRITY_PROPOSAL_MODE && HISTORY_R2_WRITE_VERSION === "v2") {
             const verifiedRows =
               await loadVerifiedR2ObservationRowsForConnectorDay(
                 dayUtc,
@@ -16550,7 +16480,7 @@ async function runSourceToAll(
         }
 
         if (DRY_RUN) {
-          if (!INTEGRITY_PROPOSAL_MODE && USES_STRUCTURED_HISTORY_LAYOUT) {
+          if (!INTEGRITY_PROPOSAL_MODE && HISTORY_R2_WRITE_VERSION === "v2") {
             const reconciliation = await reconcileTimeseriesFirstValueAt({
               connector_id: connectorId,
               rows: obsHistoryRows,
@@ -16666,7 +16596,7 @@ async function runSourceToAll(
         if (
           !integrityObservationProposalFinalisation &&
           !INTEGRITY_PROPOSAL_MODE &&
-          USES_STRUCTURED_HISTORY_LAYOUT
+          HISTORY_R2_WRITE_VERSION === "v2"
         ) {
           const verifiedRows =
             await loadVerifiedR2ObservationRowsForConnectorDay(

@@ -454,8 +454,6 @@ INCOMING_CORE_SNAPSHOT_DROPBOX_ROOT="$(trim "${UK_AQ_INTEGRITY_CORE_SNAPSHOT_DRO
 INCOMING_CORE_SNAPSHOT_STAGE="$(trim "${UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE:-}")"
 INCOMING_INTEGRITY_EFFECTIVE_MODE="$(trim "${UK_AQ_INTEGRITY_EFFECTIVE_MODE:-}")"
 INCOMING_INTEGRITY_INVOCATION="$(trim "${UK_AQ_INTEGRITY_INVOCATION:-}")"
-INCOMING_INTEGRITY_WORKER_PURPOSE="$(trim "${UK_AQ_INTEGRITY_WORKER_PURPOSE:-}")"
-INCOMING_CANONICAL_WRITES_ALLOWED="$(trim "${UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED:-}")"
 if [[ -z "${INCOMING_CORE_SNAPSHOT_IDENTITY_JSON}" || -z "${INCOMING_CORE_SNAPSHOT_IDENTITY_FILE}" || -z "${INCOMING_CORE_SNAPSHOT_DROPBOX_ROOT}" ]]; then
   echo "ERROR: Integrity child requires the coordinator core snapshot identity, identity file, and Dropbox root." >&2
   exit 4
@@ -483,8 +481,6 @@ export UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT="${INCOMING_CORE_SNAPSHOT_DROP
 export UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE="${INCOMING_CORE_SNAPSHOT_STAGE:-integrity_backfill_wrapper}"
 export UK_AQ_INTEGRITY_EFFECTIVE_MODE="${INCOMING_INTEGRITY_EFFECTIVE_MODE}"
 export UK_AQ_INTEGRITY_INVOCATION="${INCOMING_INTEGRITY_INVOCATION:-true}"
-export UK_AQ_INTEGRITY_WORKER_PURPOSE="${INCOMING_INTEGRITY_WORKER_PURPOSE}"
-export UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED="${INCOMING_CANONICAL_WRITES_ALLOWED}"
 
 if [[ "$(trim "${UKAQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
   echo "ERROR: UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
@@ -575,33 +571,6 @@ export UK_AQ_BACKFILL_FORCE_REPLACE="true"
 export UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX="false"
 export UK_AQ_BACKFILL_FROM_DAY_UTC="${FROM_DAY_UTC}"
 export UK_AQ_BACKFILL_TO_DAY_UTC="${TO_DAY_UTC}"
-
-case "${UK_AQ_INTEGRITY_WORKER_PURPOSE}" in
-  source_evidence_only)
-    [[ "$(trim "${UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY:-}")" == "true" ]] || {
-      echo "ERROR: source_evidence_only requires UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY=true." >&2
-      exit 4
-    }
-    ;;
-  repair_proposal)
-    [[ "$(trim "${UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE:-}")" == "prepare" ]] || {
-      echo "ERROR: repair_proposal requires UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE=prepare." >&2
-      exit 4
-    }
-    ;;
-  *)
-    echo "ERROR: fixed-v3 bridge requires an explicit source_evidence_only or repair_proposal worker purpose." >&2
-    exit 4
-    ;;
-esac
-if [[ "$(trim "${UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED}")" != "false" ]]; then
-  echo "ERROR: fixed-v3 evidence/proposal workers require canonical writes to be explicitly disabled." >&2
-  exit 4
-fi
-if [[ "$(trim "${UK_AQ_INTEGRITY_INVOCATION}")" != "true" ]]; then
-  echo "ERROR: fixed-v3 evidence/proposal workers require an Integrity invocation." >&2
-  exit 4
-fi
 
 if [[ -n "${CONNECTOR_ID}" ]]; then
   export UK_AQ_BACKFILL_CONNECTOR_IDS="${CONNECTOR_ID}"

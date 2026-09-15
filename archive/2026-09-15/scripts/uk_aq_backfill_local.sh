@@ -459,14 +459,8 @@ fi
 INDEX_HISTORY_VERSION=""
 if [[ -n "${INDEX_HISTORY_VERSION_RAW}" ]]; then
   INDEX_HISTORY_VERSION="$(printf '%s' "${INDEX_HISTORY_VERSION_RAW}" | tr '[:upper:]' '[:lower:]')"
-fi
-if [[
-  "${DRY_RUN}" == "false" &&
-  "${REBUILD_R2_HISTORY_INDEX}" == "true" &&
-  ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MODE}" == "obs_aqi_to_r2" || "${RUN_MODE}" == "r2_history_obs_to_aqilevels" )
-]]; then
   case "${INDEX_HISTORY_VERSION}" in
-    ""|v1|v2) ;;
+    v1|v2) ;;
     *)
       echo "Invalid UK_AQ_R2_HISTORY_VERSION for final index rebuild: ${INDEX_HISTORY_VERSION_RAW}" >&2
       exit 2
