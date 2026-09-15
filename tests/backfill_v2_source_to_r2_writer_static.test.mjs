@@ -18,7 +18,7 @@ function bodyOf(functionName) {
 }
 
 test("v2 observations writer classifies pollutant codes before grouping", () => {
-  const body = bodyOf("exportObsConnectorRowsToR2V2");
+  const body = bodyOf("exportStructuredObsConnectorRows");
   assert.match(body, /classifyObservationRowsForV2PollutantPartitions\(rowsForWrite\)/);
   assert.ok(
     body.indexOf("classifyObservationRowsForV2PollutantPartitions(rowsForWrite)") <
@@ -32,13 +32,13 @@ test("v2 observations writer classifies pollutant codes before grouping", () => 
 });
 
 test("v2 observations writer fails clearly when every row lacks a valid pollutant code", () => {
-  const body = bodyOf("exportObsConnectorRowsToR2V2");
+  const body = bodyOf("exportStructuredObsConnectorRows");
   assert.match(body, /rowsForWrite\.length > 0 && classification\.valid_rows\.length === 0/);
   assert.match(body, /No valid pollutant_code rows for v2 observation R2 write/);
 });
 
 test("v2 observations writer writes pollutant partitions and not connector-level parquet parts", () => {
-  const body = bodyOf("exportObsConnectorRowsToR2V2");
+  const body = bodyOf("exportStructuredObsConnectorRows");
   assert.match(body, /buildHistoryV2PartKey\([\s\S]*pollutantCode,[\s\S]*partIndex/);
   assert.doesNotMatch(body, /buildObsPartKey\(/);
   assert.doesNotMatch(body, /part-\$\{String\(partIndex\)/);
@@ -141,7 +141,7 @@ test("v2 AQI rebuild allows connector-scoped refresh without full-day non-target
 });
 
 test("SOS replacement applies persisted R precedence before any replacement deletion", () => {
-  const body = bodyOf("exportObsConnectorRowsToR2V2");
+  const body = bodyOf("exportStructuredObsConnectorRows");
   assert.match(body, /preservePersistedRatifiedStatus/);
   assert.ok(
     body.indexOf("loadVerifiedR2ObservationRowsForConnectorDay") <

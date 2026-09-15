@@ -5777,8 +5777,6 @@ def run_narrow_backfill(
     history_version: str = "v1",
     complete_connector_day: bool = False,
     repair_pollutants: Iterable[str] | None = None,
-    worker_purpose: Literal["source_evidence_only", "repair_proposal", "source_repair"],
-    canonical_writes_allowed: bool,
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local.sh` for one scope (single day by default).
 
@@ -5789,48 +5787,6 @@ def run_narrow_backfill(
     When log_dir is set, full stdout+stderr is also written to a file under
     that directory and the path is returned in `log_path`.
     """
-    if worker_purpose == "source_evidence_only":
-        if canonical_writes_allowed:
-            raise ValueError(
-                "source_evidence_only cannot allow canonical writes"
-            )
-        if not complete_connector_day or not _is_truthy(
-            (extra_env or {}).get(
-                "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"
-            )
-        ):
-            raise ValueError(
-                "source_evidence_only requires complete connector-day evidence mode"
-            )
-    elif worker_purpose == "repair_proposal":
-        if canonical_writes_allowed:
-            raise ValueError("repair_proposal cannot allow canonical writes")
-        if str((extra_env or {}).get(
-            "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE"
-        ) or "") != "prepare":
-            raise ValueError("repair_proposal requires proposal mode=prepare")
-    elif worker_purpose == "source_repair":
-        if not canonical_writes_allowed:
-            raise ValueError("source_repair requires canonical write permission")
-        if str(history_version).strip().lower() == "v3":
-            raise ValueError(
-                "fixed-v3 source repair must use a local repair_proposal; "
-                "canonical publication is coordinator-owned"
-            )
-    else:  # pragma: no cover - protected by the Literal contract
-        raise ValueError(f"unsupported Integrity worker purpose: {worker_purpose}")
-
-    effective_mode = str(
-        os.environ.get("UK_AQ_INTEGRITY_EFFECTIVE_MODE") or ""
-    ).strip()
-    if effective_mode == "check_only" and (
-        worker_purpose != "source_evidence_only" or canonical_writes_allowed
-    ):
-        raise ValueError(
-            "check_only may launch only source_evidence_only workers with "
-            "canonical writes disabled"
-        )
-
     result: dict[str, Any] = {
         "status": None,
         "exit_code": None,
@@ -5914,10 +5870,6 @@ def run_narrow_backfill(
         "UK_AQ_BACKFILL_TO_DAY_UTC": to_iso,
         # Always force trigger_mode=manual (wrapper enforces this anyway).
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
-        "UK_AQ_INTEGRITY_WORKER_PURPOSE": worker_purpose,
-        "UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED": (
-            "true" if canonical_writes_allowed else "false"
-        ),
     })
     if complete_connector_day:
         sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_IDS", None)
@@ -6427,8 +6379,6 @@ def check_openaq(
                     log_dir=backfill_log_dir,
                     log_label=chunk_label,
                     history_version=history_version,
-                    worker_purpose="source_repair",
-                    canonical_writes_allowed=True,
                 )
                 metrics["backfills_attempted"] += 1
                 if bf["status"] == "ok":
@@ -7223,8 +7173,6 @@ def check_sensor_community(
                     log_dir=backfill_log_dir,
                     log_label=chunk_label,
                     history_version=history_version,
-                    worker_purpose="source_repair",
-                    canonical_writes_allowed=True,
                 )
                 metrics["backfills_attempted"] += 1
                 if bf["status"] == "ok":
@@ -16310,8 +16258,6 @@ def run_v2_observation_content_hash_checks(
                 },
                 complete_connector_day=True,
                 repair_pollutants=selected_pollutants,
-                worker_purpose="source_evidence_only",
-                canonical_writes_allowed=False,
             )
             if result.get("status") != "ok":
                 raise RuntimeError(
@@ -16869,8 +16815,6 @@ def run_v2_gap_backfills(
             },
             complete_connector_day=True,
             repair_pollutants=selected_pollutants,
-            worker_purpose="source_evidence_only",
-            canonical_writes_allowed=False,
         )
         _record_backfill_core_snapshot_identity_audits(
             run_state,
@@ -17120,8 +17064,6 @@ def run_v2_gap_backfills(
                 },
                 complete_connector_day=True,
                 repair_pollutants=selected_repair_pollutants,
-                worker_purpose="source_evidence_only",
-                canonical_writes_allowed=False,
             )
             if run_state is not None:
                 _record_backfill_core_snapshot_identity_audits(
@@ -17279,8 +17221,6 @@ def run_v2_gap_backfills(
                 extra_env=extra_env,
                 complete_connector_day=True,
                 repair_pollutants=selected_repair_pollutants,
-                worker_purpose="repair_proposal",
-                canonical_writes_allowed=False,
             )
             if run_state is not None:
                 _record_backfill_core_snapshot_identity_audits(
@@ -23771,14 +23711,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="UTC scheduled logical date (YYYY-MM-DD); daily profile retries reuse this identity.",
     )
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument(
-        "--check-only",
-        action="store_true",
-        help=(
-            "Detect changes and acquire diagnostic source evidence; do not "
-            "execute repairs or canonical writes."
-        ),
-    )
+    p.add_argument("--check-only", action="store_true",
+                   help="Detect changes; do not trigger backfill.")
     p.add_argument("--run-backfill", action="store_true",
                    help="Enable the ordered v2 repair flow after read-only detection.")
     p.add_argument(
