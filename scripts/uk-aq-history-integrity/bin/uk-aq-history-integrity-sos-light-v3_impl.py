@@ -9724,6 +9724,134 @@ def _local_v2_observations_evidence(
     return True, [str(base.relative_to(root))]
 
 
+_SOURCE_PARTITION_UNAVAILABLE_STATES = {
+    "connection_unavailable",
+    "scope_unavailable",
+    "metadata_unavailable",
+    "pollutant_absent",
+    "counts_unavailable",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES = {
+    "data_manifest_empty_timeseries_counts",
+    "data_manifest_file_count_mismatch",
+    "data_manifest_row_count_mismatch",
+    "data_manifest_timeseries_row_count_mismatch",
+    "data_manifest_total_bytes_mismatch",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS = {"grain", "profile"}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS = {
+    "file_count",
+    "max_observed_at_utc",
+    "max_timeseries_id",
+    "min_observed_at_utc",
+    "min_timeseries_id",
+    "row_count",
+    "source_row_count",
+    "timeseries_row_counts",
+    "total_bytes",
+}
+
+
+def _observation_partition_key(gap: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(gap.get("day_utc") or ""),
+        str(gap.get("connector_id") or ""),
+        str(gap.get("pollutant_code") or ""),
+    )
+
+
+def _reconstructible_observation_manifest_gap(
+    gap: Mapping[str, Any],
+    all_gaps: Iterable[Mapping[str, Any]],
+) -> bool:
+    """Allow metadata-only planning only when live Parquet proves the data state."""
+    if gap.get("parquet_readable") is not True:
+        return False
+    gap_type = str(gap.get("gap_type") or "")
+    if gap_type == "data_manifest_schema_mismatch":
+        related = gap.get("related_paths")
+        if not isinstance(related, list) or not related:
+            return False
+        normalized_fields = []
+        for field in related:
+            text = str(field)
+            if text.startswith("field="):
+                text = text[6:].split(" ", 1)[0]
+            normalized_fields.append(text)
+        if not all(
+            field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
+            or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
+            for field in normalized_fields
+        ):
+            return False
+    elif gap_type.startswith("data_manifest_") and gap_type.endswith("_schema_mismatch"):
+        field = gap_type[len("data_manifest_"):-len("_schema_mismatch")]
+        if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
+            return False
+    elif gap_type not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
+        return False
+
+    partition_key = _observation_partition_key(gap)
+    uncertain_gap_types = {
+        "data_manifest_duplicate_file_key",
+        "data_manifest_listed_parquet_missing",
+        "data_manifest_unlisted_parquet",
+        "orphan_parquet_without_manifest",
+        "parquet_empty_or_placeholder",
+        "parquet_missing",
+        "parquet_null_timeseries_id_rows",
+        "parquet_reader_unavailable",
+        "parquet_unreadable",
+        "source_r2_timeseries_row_mismatch",
+    }
+    for sibling in all_gaps:
+        if _observation_partition_key(sibling) != partition_key:
+            continue
+        sibling_type = str(sibling.get("gap_type") or "")
+        if sibling_type in uncertain_gap_types:
+            return False
+        if sibling_type == "data_manifest_schema_mismatch":
+            related = sibling.get("related_paths")
+            if not isinstance(related, list) or not related:
+                return False
+            normalized_fields = []
+            for field in related:
+                text = str(field)
+                if text.startswith("field="):
+                    text = text[6:].split(" ", 1)[0]
+                normalized_fields.append(text)
+            if not all(
+                field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
+                or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
+                for field in normalized_fields
+            ):
+                return False
+        elif sibling_type.startswith("data_manifest_") and sibling_type.endswith("_schema_mismatch"):
+            field = sibling_type[len("data_manifest_"):-len("_schema_mismatch")]
+            if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
+                return False
+        elif sibling_type not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
+            if sibling_type.startswith("data_manifest_"):
+                return False
+    return True
+
+
+def _source_partition_state_from_gap(gap: Mapping[str, Any]) -> str | None:
+    evidence = gap.get("source_evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+    partition = evidence.get("partition")
+    if isinstance(partition, Mapping):
+        state = partition.get("state")
+        if state:
+            return str(state)
+    state = evidence.get("source_partition_state")
+    return str(state) if state else None
+
+
 def _enrich_v2_observations_repair_plans(
     *,
     root: Path,
@@ -9747,6 +9875,179 @@ def _enrich_v2_observations_repair_plans(
         gap["suggested_repair"] = suggested_repair_from_decision(
             decision, sos_scope=sos_scope
         )
+
+
+def build_v2_repair_plan(
+    *,
+    observation_gaps: Iterable[Mapping[str, Any]] = (),
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Summarize retained v2 observation repairs in operator order."""
+    del conn  # Kept for compatibility with the shared observation call sites.
+    observation_gaps = list(observation_gaps)
+    partition_priority = {
+        "observation_data_repair": 3,
+        "source_mapping_issue": 2,
+        "observation_pollutant_manifest_repair": 1,
+        "observation_index_repair": 0,
+    }
+    actions: dict[tuple[str, str, int | str | None, str | None], dict[str, Any]] = {}
+
+    for gap in observation_gaps:
+        pollutant_code = gap.get("pollutant_code")
+        if (
+            pollutant_code
+            and str(pollutant_code).strip().lower()
+            not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+        ):
+            continue
+        decision = decide_observation_repair(
+            gap,
+            source_partition_unavailable=(
+                _source_partition_state_from_gap(gap)
+                in _SOURCE_PARTITION_UNAVAILABLE_STATES
+            ),
+            reconstructible_manifest=_reconstructible_observation_manifest_gap(
+                gap, observation_gaps
+            ),
+        )
+        if decision.repair_kind == "unclassified":
+            continue
+        kind = decision.repair_kind
+        day_utc = gap.get("day_utc")
+        connector_id = gap.get("connector_id")
+        pollutant_code = decision.pollutant_code
+        if kind == "observation_day_manifest_repair":
+            connector_id = None
+            pollutant_code = None
+        key = (
+            kind,
+            str(day_utc or ""),
+            connector_id,
+            str(pollutant_code or "") or None,
+        )
+        entry = actions.get(key)
+        gap_type = str(gap.get("gap_type") or "")
+        if entry is None:
+            entry = {
+                "kind": kind,
+                "status": "planned",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": pollutant_code,
+                "requires_index_rebuild": bool(decision.requires_index_rebuild),
+                "data_changes_required": bool(decision.data_changes_required),
+                "executes": False,
+                "operator_action_required": (
+                    decision.executability_policy == "operator_action_required"
+                ),
+                "gap_types": [gap_type] if gap_type else [],
+                "commands": [],
+                "notes": decision.reason,
+                "repair_decision": decision.as_dict(),
+            }
+            actions[key] = entry
+        else:
+            if gap_type and gap_type not in entry["gap_types"]:
+                entry["gap_types"].append(gap_type)
+            entry["requires_index_rebuild"] = bool(
+                entry["requires_index_rebuild"] or decision.requires_index_rebuild
+            )
+            entry["operator_action_required"] = bool(
+                entry["operator_action_required"]
+                or decision.executability_policy == "operator_action_required"
+            )
+            entry["data_changes_required"] = bool(
+                entry["data_changes_required"] or decision.data_changes_required
+            )
+            if decision.reason and decision.reason not in str(entry.get("notes") or ""):
+                entry["notes"] = f"{entry['notes']}; {decision.reason}"
+
+        source_evidence = gap.get("source_evidence")
+        rollover_evidence = (
+            list(source_evidence.get("historical_identity_rollovers") or [])
+            if isinstance(source_evidence, Mapping)
+            else []
+        )
+        if rollover_evidence and kind == "observation_data_repair":
+            entry["identity_classification"] = (
+                "bridge_known_historical_identity_rollover"
+            )
+            entry["historical_identity_repair_gate_required"] = True
+            merged_rollovers = {
+                (
+                    int(item.get("existing_r2_timeseries_id") or 0),
+                    int(item.get("date_valid_timeseries_id") or 0),
+                ): dict(item)
+                for item in list(entry.get("historical_identity_rollovers") or [])
+                if isinstance(item, Mapping)
+            }
+            for item in rollover_evidence:
+                if isinstance(item, Mapping):
+                    merged_rollovers[(
+                        int(item.get("existing_r2_timeseries_id") or 0),
+                        int(item.get("date_valid_timeseries_id") or 0),
+                    )] = dict(item)
+            entry["historical_identity_rollovers"] = [
+                merged_rollovers[item_key] for item_key in sorted(merged_rollovers)
+            ]
+
+    selected_actions: dict[tuple[str, str, str], str] = {}
+    for entry in actions.values():
+        kind = str(entry.get("kind") or "")
+        if kind not in partition_priority:
+            continue
+        pollutant_code = entry.get("pollutant_code")
+        day_utc = entry.get("day_utc")
+        connector_id = entry.get("connector_id")
+        if pollutant_code is None or day_utc is None or connector_id is None:
+            continue
+        key = (str(day_utc), str(connector_id), str(pollutant_code))
+        current_kind = selected_actions.get(key)
+        if (
+            current_kind is None
+            or partition_priority[kind] > partition_priority[current_kind]
+        ):
+            selected_actions[key] = kind
+
+    filtered_actions = []
+    for entry in actions.values():
+        kind = str(entry.get("kind") or "")
+        pollutant_code = entry.get("pollutant_code")
+        day_utc = entry.get("day_utc")
+        connector_id = entry.get("connector_id")
+        if (
+            kind in partition_priority
+            and pollutant_code is not None
+            and day_utc is not None
+            and connector_id is not None
+            and selected_actions[(str(day_utc), str(connector_id), str(pollutant_code))]
+            != kind
+        ):
+            continue
+        entry["gap_types"] = sorted(set(entry.get("gap_types") or []))
+        filtered_actions.append(entry)
+
+    order = [
+        "observation_data_repair",
+        "source_mapping_issue",
+        "observation_pollutant_manifest_repair",
+        "observation_index_repair",
+        "observation_connector_manifest_repair",
+        "observation_day_manifest_repair",
+    ]
+    position = {kind: index for index, kind in enumerate(order)}
+    return sorted(
+        filtered_actions,
+        key=lambda entry: (
+            position.get(str(entry.get("kind") or ""), 999),
+            str(entry.get("day_utc") or ""),
+            int(entry["connector_id"])
+            if str(entry.get("connector_id") or "").isdigit()
+            else -1,
+            str(entry.get("pollutant_code") or ""),
+        ),
+    )
 
 
 def _manifest_codes_from_child_list(payload: Mapping[str, Any], field: str, id_key: str) -> set[str]:
@@ -10432,6 +10733,10 @@ def _manifest_file_keys_from_entries(entries: Iterable[Any]) -> set[str]:
 
 def _manifest_file_keys(payload: Mapping[str, Any]) -> set[str]:
     return _manifest_file_keys_from_entries(_manifest_files(payload))
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _child_manifest_aggregate(payloads: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
