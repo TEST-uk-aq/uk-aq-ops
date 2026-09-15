@@ -13639,6 +13639,15 @@ def _v2_observation_connector_manifest_key(
     )
 
 
+def _load_json_file(path: Path) -> tuple[Any | None, str | None]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except json.JSONDecodeError:
+        return None, "invalid_json"
+    except OSError:
+        return None, "unreadable"
+
+
 def _read_json_manifest_for_guard(
     *,
     manifest_key: str,
