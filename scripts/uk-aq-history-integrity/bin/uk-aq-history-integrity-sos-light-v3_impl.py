@@ -5812,6 +5812,11 @@ def run_narrow_backfill(
     elif worker_purpose == "source_repair":
         if not canonical_writes_allowed:
             raise ValueError("source_repair requires canonical write permission")
+        if str(history_version).strip().lower() == "v3":
+            raise ValueError(
+                "fixed-v3 source repair must use a local repair_proposal; "
+                "canonical publication is coordinator-owned"
+            )
     else:  # pragma: no cover - protected by the Literal contract
         raise ValueError(f"unsupported Integrity worker purpose: {worker_purpose}")
 

@@ -5,6 +5,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import {
+  buildObservationHistoryV3SteadyStatePartition,
+} from "../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const wrapper = join(repoRoot, "scripts", "uk_aq_backfill_local.sh");
@@ -79,11 +82,66 @@ test("worker source keeps generic v3 unsupported and requires the narrow Integri
   assert.match(source, /outputScope === "observations_only"/);
   assert.match(source, /integrityInvocation/);
 
+  const structuredExporter = source.slice(
+    source.indexOf("async function exportStructuredObsConnectorRows"),
+    source.indexOf("async function exportAqiConnectorRowsToR2", source.indexOf("async function exportStructuredObsConnectorRows")),
+  );
+  assert.match(
+    source,
+    /if \(HISTORY_R2_WRITE_VERSION === "v3"\) return OBS_R2_HISTORY_PREFIX_V3/,
+  );
+  assert.match(
+    source,
+    /DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX/,
+  );
+  assert.match(
+    structuredExporter,
+    /const observationsPrefix = activeStructuredObsHistoryPrefix\(\)/,
+  );
+  assert.match(structuredExporter, /buildHistoryV2PartKey\(\s*observationsPrefix,/);
+  assert.match(
+    structuredExporter,
+    /buildHistoryV2PollutantManifestKey\(\s*observationsPrefix,/,
+  );
+  assert.match(
+    structuredExporter,
+    /buildHistoryV2ConnectorManifestKey\(\s*observationsPrefix,/,
+  );
+  assert.doesNotMatch(structuredExporter, /OBS_R2_HISTORY_PREFIX_V2/);
+
   const bridgeSource = readFileSync(integrityWrapper, "utf8");
   assert.match(bridgeSource, /source_evidence_only\)/);
   assert.match(bridgeSource, /repair_proposal\)/);
   assert.match(
     bridgeSource,
     /UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED.*!= "false"/s,
+  );
+  assert.doesNotMatch(bridgeSource, /source_repair\)/);
+});
+
+test("the v3 proposal writer contract produces no v2 canonical target keys", () => {
+  const prepared = buildObservationHistoryV3SteadyStatePartition({
+    source: "integrity",
+    rows: [{
+      connector_id: 1,
+      station_id: 10,
+      timeseries_id: 101,
+      pollutant_code: "no2",
+      observed_at_utc: "2026-06-01T00:00:00.000Z",
+      value: 12.5,
+      verification_status: "P",
+    }],
+    targetWriterGitSha: "3".repeat(40),
+    backedUpAtUtc: "2026-09-15T00:00:00.000Z",
+  });
+  const keys = [
+    ...prepared.file_intents.map((intent) => intent.key),
+    prepared.canonical_pollutant_manifest.key,
+  ];
+  assert.ok(keys.length > 0);
+  assert.ok(keys.every((key) => key.startsWith("history/v3/")), keys.join("\n"));
+  assert.equal(keys.filter((key) => key.startsWith("history/v2/")).length, 0);
+  assert.ok(
+    prepared.v3_hierarchy.scoped_manifest.key.startsWith("history/_index_v3/"),
   );
 });

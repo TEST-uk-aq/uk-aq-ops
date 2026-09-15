@@ -75,6 +75,9 @@ import {
   resolveLegacyVerificationStatus,
 } from "../shared/uk_aq_observation_content_hash.mjs";
 import {
+  DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
+} from "../shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
+import {
   reconcileIntegritySourceAdapterBlockedRows,
 } from "./source_integrity/blocked_rows.ts";
 import {
@@ -957,6 +960,9 @@ const OBS_R2_HISTORY_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX") ||
     HISTORY_R2_V2_OBSERVATIONS_PREFIX,
 ) || HISTORY_R2_V2_OBSERVATIONS_PREFIX;
+const OBS_R2_HISTORY_PREFIX_V3 = normalizePrefix(
+  DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
+) || DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX;
 const AQI_R2_HISTORY_DATA_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX") ||
     HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX,
@@ -2267,9 +2273,15 @@ function buildAqiPartKey(
 }
 
 function activeObsHistoryPrefix(): string {
-  return USES_STRUCTURED_HISTORY_LAYOUT
-    ? OBS_R2_HISTORY_PREFIX_V2
-    : OBS_R2_HISTORY_PREFIX;
+  if (HISTORY_R2_WRITE_VERSION === "v3") return OBS_R2_HISTORY_PREFIX_V3;
+  if (HISTORY_R2_WRITE_VERSION === "v2") return OBS_R2_HISTORY_PREFIX_V2;
+  return OBS_R2_HISTORY_PREFIX;
+}
+
+function activeStructuredObsHistoryPrefix(): string {
+  if (HISTORY_R2_WRITE_VERSION === "v3") return OBS_R2_HISTORY_PREFIX_V3;
+  if (HISTORY_R2_WRITE_VERSION === "v2") return OBS_R2_HISTORY_PREFIX_V2;
+  throw new Error("structured observation history requires generation v2 or v3");
 }
 
 function activeAqiHistoryDataPrefix(): string {
@@ -4659,7 +4671,7 @@ async function exportObsConnectorRowsToR2(args: {
   pollutant_codes_written?: string[];
 }> {
   if (USES_STRUCTURED_HISTORY_LAYOUT) {
-    return await exportObsConnectorRowsToR2V2(args);
+    return await exportStructuredObsConnectorRows(args);
   }
 
   if (FORCE_REPLACE) {
@@ -4851,7 +4863,7 @@ type ObsV2ExportResult = {
   pollutant_codes_written: string[];
 };
 
-async function exportObsConnectorRowsToR2V2(args: {
+async function exportStructuredObsConnectorRows(args: {
   run_id: string;
   day_utc: string;
   connector_id: number;
@@ -4867,6 +4879,7 @@ async function exportObsConnectorRowsToR2V2(args: {
   example_missing_pollutant_rows: MissingPollutantExampleRow[];
   pollutant_codes_written: string[];
 }> {
+  const observationsPrefix = activeStructuredObsHistoryPrefix();
   let rowsForWrite = args.rows;
   if (args.connector_id === SOS_CONNECTOR_ID_FALLBACK &&
     hasRequiredR2Config(OBS_R2_CONFIG)) {
@@ -4895,7 +4908,7 @@ async function exportObsConnectorRowsToR2V2(args: {
   if (FORCE_REPLACE && !INTEGRITY_PROPOSAL_MODE) {
     await deleteR2Prefix(
       buildHistoryV2ConnectorPrefix(
-        OBS_R2_HISTORY_PREFIX_V2,
+        observationsPrefix,
         args.day_utc,
         args.connector_id,
       ),
@@ -4973,7 +4986,7 @@ async function exportObsConnectorRowsToR2V2(args: {
       }));
       const partSummary = summarizeObservationPartRows(parquetRows);
       const partKey = buildHistoryV2PartKey(
-        OBS_R2_HISTORY_PREFIX_V2,
+        observationsPrefix,
         args.day_utc,
         args.connector_id,
         pollutantCode,
@@ -5034,7 +5047,7 @@ async function exportObsConnectorRowsToR2V2(args: {
       }
     }
     const manifestKey = buildHistoryV2PollutantManifestKey(
-      OBS_R2_HISTORY_PREFIX_V2,
+      observationsPrefix,
       args.day_utc,
       args.connector_id,
       pollutantCode,
@@ -5061,7 +5074,7 @@ async function exportObsConnectorRowsToR2V2(args: {
   }
 
   const manifestKey = buildHistoryV2ConnectorManifestKey(
-    OBS_R2_HISTORY_PREFIX_V2,
+    observationsPrefix,
     args.day_utc,
     args.connector_id,
   );

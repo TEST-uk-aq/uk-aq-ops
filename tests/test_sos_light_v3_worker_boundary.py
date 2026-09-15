@@ -118,6 +118,30 @@ class SosLightV3WorkerBoundaryTests(unittest.TestCase):
         worker.assert_not_called()
         self.assertEqual(metrics["observation_backfills_attempted"], 0)
 
+    def test_fixed_v3_source_repair_is_coordinator_owned(self) -> None:
+        with tempfile.NamedTemporaryFile() as wrapper:
+            with (
+                mock.patch.object(MODULE.subprocess, "run") as run,
+                self.assertRaisesRegex(
+                    ValueError,
+                    "fixed-v3 source repair must use a local repair_proposal",
+                ),
+            ):
+                MODULE.run_narrow_backfill(
+                    wrapper_path=wrapper.name,
+                    env_file_path=None,
+                    env_name="TEST",
+                    timeseries_ids=[101],
+                    connector_ids=[1],
+                    day=dt.date(2026, 6, 1),
+                    log=logging.getLogger("worker-boundary-test"),
+                    output_scope="observations_only",
+                    history_version="v3",
+                    worker_purpose="source_repair",
+                    canonical_writes_allowed=True,
+                )
+        run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
