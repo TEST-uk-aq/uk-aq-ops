@@ -455,6 +455,7 @@ function installCoreSnapshotIdentity(runState, root) {
   runState.core_snapshot_identity = identity;
   runState.core_snapshot_consumer_audit = [];
   return {
+    UK_AQ_R2_HISTORY_VERSION: "v2",
     UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON: JSON.stringify(identity),
     UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE: identityFile,
     UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT: runState.base_dropbox_root,

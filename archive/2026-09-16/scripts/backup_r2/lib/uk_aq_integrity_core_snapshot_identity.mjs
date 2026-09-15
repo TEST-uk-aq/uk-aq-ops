@@ -1,9 +1,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import {
-  resolveObservationHistoryGeneration,
-} from "../../../workers/shared/uk_aq_observation_history_generation.mjs";
+
+const CORE_PREFIX = "history/v2/core";
 
 function fail({ stage, reason, coordinatorIdentity, requestedIdentity, detail = null }) {
   throw new Error(`Integrity core snapshot identity validation failed: ${JSON.stringify({
@@ -15,11 +14,7 @@ function fail({ stage, reason, coordinatorIdentity, requestedIdentity, detail = 
   })}`);
 }
 
-export function parseIntegrityCoreSnapshotIdentity(value, {
-  stage,
-  label,
-  env = process.env,
-}) {
+export function parseIntegrityCoreSnapshotIdentity(value, { stage, label }) {
   let parsed = value;
   if (typeof value === "string") {
     if (!value.trim()) fail({ stage, reason: `${label}_identity_missing` });
@@ -47,8 +42,7 @@ export function parseIntegrityCoreSnapshotIdentity(value, {
     core_snapshot_manifest_hash: String(parsed.core_snapshot_manifest_hash || "").trim().toLowerCase(),
     core_snapshot_manifest_sha256: String(parsed.core_snapshot_manifest_sha256 || "").trim().toLowerCase(),
   };
-  const generation = resolveObservationHistoryGeneration(env);
-  const expectedKey = `${generation.core_prefix}/day_utc=${day}/manifest.json`;
+  const expectedKey = `${CORE_PREFIX}/day_utc=${day}/manifest.json`;
   if (identity.core_snapshot_manifest_key !== expectedKey) {
     fail({
       stage,
@@ -77,7 +71,7 @@ export function validateIntegrityCoreSnapshotIdentity({
 }) {
   const coordinator = parseIntegrityCoreSnapshotIdentity(
     String(env?.UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON || ""),
-    { stage, label: "coordinator", env },
+    { stage, label: "coordinator" },
   );
   const identityFile = String(
     env?.UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE || "",
@@ -94,7 +88,7 @@ export function validateIntegrityCoreSnapshotIdentity({
   try {
     recorded = parseIntegrityCoreSnapshotIdentity(
       fs.readFileSync(identityFile, "utf8"),
-      { stage, label: "recorded", env },
+      { stage, label: "recorded" },
     );
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("Integrity core snapshot")) throw error;
@@ -107,7 +101,7 @@ export function validateIntegrityCoreSnapshotIdentity({
   }
   const requested = parseIntegrityCoreSnapshotIdentity(
     runState?.core_snapshot_identity,
-    { stage, label: "child_requested", env },
+    { stage, label: "child_requested" },
   );
   if (JSON.stringify(coordinator) !== JSON.stringify(recorded)
     || JSON.stringify(coordinator) !== JSON.stringify(requested)) {

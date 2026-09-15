@@ -78,9 +78,6 @@ import {
   DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
 } from "../shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import {
-  getObservationHistoryGeneration,
-} from "../shared/uk_aq_observation_history_generation.mjs";
-import {
   reconcileIntegritySourceAdapterBlockedRows,
 } from "./source_integrity/blocked_rows.ts";
 import {
@@ -974,33 +971,13 @@ const AQI_R2_HISTORY_DEBUG_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX") ||
     HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
 ) || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX;
-const CORE_R2_HISTORY_PREFIX = (() => {
-  if (!USES_STRUCTURED_HISTORY_LAYOUT) {
-    return normalizePrefix(
-      Deno.env.get("UK_AQ_R2_HISTORY_CORE_PREFIX") || "history/v1/core",
-    ) || "history/v1/core";
-  }
-  const generation = getObservationHistoryGeneration(
-    HISTORY_R2_WRITE_VERSION,
-  );
-  if (HISTORY_R2_WRITE_VERSION === "v2") {
-    return normalizePrefix(
-      Deno.env.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX") ||
-        generation.core_prefix,
-    ) || generation.core_prefix;
-  }
-  const configured = normalizePrefix(
-    Deno.env.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX") ||
-      generation.core_prefix,
-  ) || generation.core_prefix;
-  if (configured !== generation.core_prefix) {
-    throw new Error(
-      `UK_AQ_R2_HISTORY_V2_CORE_PREFIX contradicts selected ${HISTORY_R2_WRITE_VERSION} generation: ` +
-        `expected ${generation.core_prefix}, got ${configured}`,
-    );
-  }
-  return generation.core_prefix;
-})();
+const CORE_R2_HISTORY_PREFIX = USES_STRUCTURED_HISTORY_LAYOUT
+  ? (normalizePrefix(
+    Deno.env.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX") || "history/v2/core",
+  ) || "history/v2/core")
+  : (normalizePrefix(
+    Deno.env.get("UK_AQ_R2_HISTORY_CORE_PREFIX") || "history/v1/core",
+  ) || "history/v1/core");
 const R2_HISTORY_DROPBOX_ROOT = optionalEnvAny([
   "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
   "UK_AQ_BACKFILL_R2_HISTORY_DROPBOX_ROOT",

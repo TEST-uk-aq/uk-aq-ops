@@ -27,6 +27,7 @@ const PROFILES = Object.freeze({
   }),
   v3: Object.freeze({
     ...getObservationHistoryGeneration("v3"),
+    core_prefix: "history/v2/core",
     aqilevels_hourly_data_prefix: "history/v2/aqilevels/hourly/data",
     aqilevels_hourly_debug_prefix: "history/v2/aqilevels/hourly/debug",
     aqilevels_timeseries_index_prefix: "history/_index_v2/aqilevels_hourly_data_timeseries",
