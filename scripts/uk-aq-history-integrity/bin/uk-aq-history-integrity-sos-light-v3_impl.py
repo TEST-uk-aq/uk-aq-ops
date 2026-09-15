@@ -168,9 +168,6 @@ OVERLAY_CHANGED_SCOPE_SETS = (
     "OBSERVS_CHANGED",
     "OBS_MANIFESTS_CHANGED",
     "OBS_INDEXES_CHANGED",
-    "AQILEVELS_CHANGED",
-    "AQI_MANIFESTS_CHANGED",
-    "AQI_INDEXES_CHANGED",
 )
 BACKUP_GATE_URL_ENV_NAMES = (
     "DAILY_TASK_HEALTH_SUPABASE_URL",
@@ -5245,12 +5242,11 @@ def _planned_backfill_command(
     iso = day.isoformat()
     wrapper_command = wrapper
     if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill_v3.sh":
-        mode_arg = "--aqi-only" if output_scope == "aqilevels_only" else "--observs-only"
         cli_parts = [
             shlex.quote(wrapper),
             "--env",
             shlex.quote(str(env_name or env.get("UK_AQ_ENV_NAME") or os.environ.get("UK_AQ_ENV_NAME") or "<env unset>")),
-            mode_arg,
+            "--observs-only",
             "--from-day",
             iso,
             "--to-day",
@@ -10502,18 +10498,10 @@ def _append_parent_aggregate_gaps(
             expected_value=expected_value,
         )
 
-    if domain == "observations":
-        timestamp_fields = (
-            ("min_observed_at_utc", "min_timestamp_utc"),
-            ("max_observed_at_utc", "max_timestamp_utc"),
-        )
-    elif domain == "aqilevels":
-        timestamp_fields = (
-            ("min_timestamp_hour_utc", "min_timestamp_utc"),
-            ("max_timestamp_hour_utc", "max_timestamp_utc"),
-        )
-    else:
-        timestamp_fields = ()
+    timestamp_fields = (
+        ("min_observed_at_utc", "min_timestamp_utc"),
+        ("max_observed_at_utc", "max_timestamp_utc"),
+    )
 
     for field, aggregate_field in timestamp_fields:
         _append_required_timestamp_field_gap(
@@ -10946,7 +10934,6 @@ def _classify_sos_r2_historical_identity_rollovers(
             "replace_existing_r2_pollutant_partition": True,
             "requires_observation_manifest_rebuild": True,
             "requires_observation_index_rebuild": True,
-            "requires_aqi_rebuild": wanted_pollutant in {"pm25", "pm10", "no2"},
             "historical_identity_repair_gate_required": True,
         })
 
@@ -12021,18 +12008,10 @@ def _append_actual_parquet_gaps(
         expected_value=stats["max_timeseries_id"],
     )
 
-    if domain == "observations":
-        timestamp_fields = (
-            ("min_observed_at_utc", "min_timestamp_utc"),
-            ("max_observed_at_utc", "max_timestamp_utc"),
-        )
-    elif domain == "aqilevels":
-        timestamp_fields = (
-            ("min_timestamp_hour_utc", "min_timestamp_utc"),
-            ("max_timestamp_hour_utc", "max_timestamp_utc"),
-        )
-    else:
-        timestamp_fields = ()
+    timestamp_fields = (
+        ("min_observed_at_utc", "min_timestamp_utc"),
+        ("max_observed_at_utc", "max_timestamp_utc"),
+    )
 
     for field, actual_field in timestamp_fields:
         _append_required_timestamp_field_gap(
@@ -14021,84 +14000,6 @@ def _v2_partition_manifest_rel(
         f"{prefix.strip('/')}/day_utc={day_utc}/connector_id={int(connector_id)}"
         f"/pollutant_code={pollutant_code}/manifest.json"
     )
-
-
-def _v2_observation_pollutant_dirs_for_aqi_validation(
-    *,
-    root: Path,
-    config: HistoryPathConfig,
-    day_utc: str,
-    connector_id: int,
-) -> list[Path]:
-    obs_connector_dir = (
-        root
-        / config.observations_data_prefix.strip("/")
-        / f"day_utc={day_utc}"
-        / f"connector_id={int(connector_id)}"
-    )
-    if not obs_connector_dir.is_dir():
-        return []
-    return sorted(p for p in obs_connector_dir.glob("pollutant_code=*") if p.is_dir())
-
-
-def _v2_observation_connector_ids_for_aqi_validation(
-    *,
-    root: Path,
-    config: HistoryPathConfig,
-    day_utc: str,
-    allowed_connector_ids: set[int] | None,
-) -> list[int]:
-    obs_day_dir = root / config.observations_data_prefix.strip("/") / f"day_utc={day_utc}"
-    if not obs_day_dir.is_dir():
-        return []
-    connector_ids: set[int] = set()
-    for connector_dir in sorted(p for p in obs_day_dir.glob("connector_id=*") if p.is_dir()):
-        parsed = _connector_id_from_dirname(connector_dir.name)
-        if parsed is None:
-            continue
-        if allowed_connector_ids is not None and parsed not in allowed_connector_ids:
-            continue
-        connector_ids.add(parsed)
-    return sorted(connector_ids)
-
-
-def _active_aqi_eligible_pollutants_for_connector(
-    conn: sqlite3.Connection | None,
-    *,
-    connector_id: int,
-) -> set[str] | None:
-    """Return authoritative AQI-eligible codes, or None to fail closed."""
-    if conn is None or not _table_exists(conn, "core_observed_property_mappings_snapshot"):
-        return None
-    active_count = conn.execute(
-        "SELECT COUNT(*) FROM core_observed_property_mappings_snapshot "
-        "WHERE connector_id = ? AND is_active = 1",
-        (int(connector_id),),
-    ).fetchone()
-    if not active_count or int(active_count[0] or 0) <= 0:
-        return None
-    rows = conn.execute(
-        """
-        SELECT DISTINCT observed_property_code
-        FROM core_observed_property_mappings_snapshot
-        WHERE connector_id = ?
-          AND is_active = 1
-          AND is_aqi_eligible = 1
-          AND observed_property_code IS NOT NULL
-          AND observed_property_code != ''
-        """,
-        (int(connector_id),),
-    ).fetchall()
-    normalized: set[str] = set()
-    for row in rows:
-        compact = re.sub(r"[^a-z0-9]+", "", str(row[0] or "").strip().lower())
-        if compact in {"ino2", "no2"}:
-            normalized.add("no2")
-        elif compact in {"ipm25", "pm25", "pm2"}:
-            normalized.add("pm25")
-        elif compact in {"ipm10", "pm10"}:
-            normalized.add("pm10")
-    return normalized
 
 
 def _timeseries_ids_for_v2_observation_gap(
@@ -17903,7 +17804,6 @@ def _run_v2_observation_metadata_executor(
     *,
     env: Mapping[str, str],
     actions: list[dict[str, Any]],
-    domain: Literal["observations", "aqilevels"] = "observations",
     dry_run: bool,
     log: logging.Logger,
     run_state: Mapping[str, Any] | None = None,
@@ -17932,7 +17832,7 @@ def _run_v2_observation_metadata_executor(
         ])
     plan = {
         "history_version": "v2",
-        "domain": domain,
+        "domain": "observations",
         "repair_plan": actions,
         "authoritative_core_timeseries": _authoritative_v2_core_timeseries_bindings(conn),
     }
@@ -18996,273 +18896,6 @@ def _final_verification_stage_for_gap(domain: str, gap: Mapping[str, Any]) -> st
     if "manifest" in gap_type or gap_type.startswith("day_") or gap_type.startswith("connector_"):
         return "observations_metadata_proposal"
     return "observations_proposal"
-
-
-def _metadata_iso_value(value: Any, *, field: str) -> tuple[dt.datetime | None, str | None]:
-    if value is None:
-        return None, None
-    parsed = _parse_required_timestamp_value(value)
-    if parsed is None:
-        raise ValueError(f"invalid_{field}")
-    return parsed, fmt_iso(parsed)
-
-
-def _metadata_positive_int(value: Any, *, field: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"invalid_{field}")
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid_{field}") from exc
-    if parsed <= 0 or str(parsed) != str(value).strip():
-        raise ValueError(f"invalid_{field}")
-    return parsed
-
-
-def _metadata_identity(item: Mapping[str, Any]) -> str:
-    return (
-        f"{item['domain']}|{item['day_utc']}|{item['connector_id']}|"
-        f"{item['pollutant_code']}"
-    )
-
-
-def _metadata_index_identity_from_key(key: str, config: HistoryPathConfig) -> tuple[str, str, int, str]:
-    normalized = _normalise_overlay_object_key(key)
-    for domain, prefix in (
-        ("observations", config.observations_timeseries_index_prefix),
-        ("aqilevels", config.aqilevels_timeseries_index_prefix),
-    ):
-        escaped = re.escape(prefix.strip("/"))
-        match = re.fullmatch(
-            rf"{escaped}/day_utc=(\d{{4}}-\d{{2}}-\d{{2}})/connector_id=(\d+)/"
-            rf"pollutant_code=([^/]+)/manifest\.json",
-            normalized,
-        )
-        if match:
-            day_utc, connector_id, pollutant_code = match.groups()
-            dt.date.fromisoformat(day_utc)
-            connector = _metadata_positive_int(connector_id, field="affected_index_connector_id")
-            if not re.fullmatch(r"[a-z0-9_]+", pollutant_code):
-                raise ValueError("affected_index_pollutant_code_invalid")
-            return domain, day_utc, connector, pollutant_code
-    raise ValueError("affected_pollutant_index_key_invalid")
-
-
-def _validate_timeseries_metadata_coverage(
-    *, payload: Mapping[str, Any], domain: Literal["observations", "aqilevels"],
-) -> list[dict[str, Any]]:
-    coverage_name = "observations_coverage" if domain == "observations" else "aqi_coverage"
-    label = "observations" if domain == "observations" else "aqi"
-    coverage = payload.get(coverage_name)
-    if not isinstance(coverage, Mapping) or not isinstance(coverage.get("entries"), list):
-        raise ValueError(f"{label}_coverage_invalid")
-    entries: list[dict[str, Any]] = []
-    for raw in coverage["entries"]:
-        if not isinstance(raw, Mapping):
-            raise ValueError(f"{label}_coverage_entry_invalid")
-        if str(raw.get("domain") or "") != domain:
-            raise ValueError(f"{label}_coverage_entry_domain_mismatch")
-        day_utc = str(raw.get("day_utc") or "")
-        try:
-            dt.date.fromisoformat(day_utc)
-        except ValueError as exc:
-            raise ValueError(f"{label}_coverage_entry_day_utc_invalid") from exc
-        connector_id = _metadata_positive_int(raw.get("connector_id"), field=f"{label}_coverage_entry_connector_id")
-        pollutant_code = str(raw.get("pollutant_code") or "").strip().lower()
-        if not re.fullmatch(r"[a-z0-9_]+", pollutant_code):
-            raise ValueError(f"{label}_coverage_entry_pollutant_code_invalid")
-        if domain == "aqilevels" and pollutant_code not in V2_AQI_SUPPORTED_POLLUTANTS:
-            raise ValueError("aqi_coverage_entry_unsupported_pollutant")
-        row_count = _metadata_positive_int(raw.get("row_count"), field=f"{label}_coverage_entry_row_count")
-        min_name = "min_observed_at_utc" if domain == "observations" else "min_timestamp_hour_utc"
-        max_name = "max_observed_at_utc" if domain == "observations" else "max_timestamp_hour_utc"
-        minimum, minimum_text = _metadata_iso_value(raw.get(min_name), field=min_name)
-        maximum, maximum_text = _metadata_iso_value(raw.get(max_name), field=max_name)
-        if minimum is not None and maximum is not None and minimum > maximum:
-            raise ValueError(f"{label}_coverage_timestamp_range_invalid")
-        backed, backed_text = _metadata_iso_value(raw.get("backed_up_at_utc"), field="backed_up_at_utc")
-        entries.append({
-            "domain": domain, "day_utc": day_utc, "connector_id": connector_id,
-            "pollutant_code": pollutant_code, "row_count": row_count,
-            min_name: minimum_text, max_name: maximum_text, "backed_up_at_utc": backed_text,
-            "_minimum": minimum, "_maximum": maximum, "_backed": backed,
-        })
-    identities = {_metadata_identity(item) for item in entries}
-    if len(identities) != len(entries):
-        raise ValueError(f"{label}_coverage_entry_identity_duplicate")
-    ordered = sorted(entries, key=lambda item: (item["day_utc"], item["connector_id"], item["pollutant_code"]))
-    timestamp_min = min((item["_minimum"] for item in ordered if item["_minimum"] is not None), default=None)
-    timestamp_max = max((item["_maximum"] for item in ordered if item["_maximum"] is not None), default=None)
-    backed_max = max((item["_backed"] for item in ordered if item["_backed"] is not None), default=None)
-    expected = {
-        "row_count": sum(item["row_count"] for item in ordered),
-        "day_count": len({item["day_utc"] for item in ordered}),
-        "first_day_utc": ordered[0]["day_utc"] if ordered else None,
-        "last_day_utc": ordered[-1]["day_utc"] if ordered else None,
-        "connector_ids": sorted({item["connector_id"] for item in ordered}),
-        "pollutant_codes": sorted({item["pollutant_code"] for item in ordered}),
-        "first_observed_at_utc": fmt_iso(timestamp_min) if domain == "observations" and timestamp_min else None,
-        "last_observed_at_utc": fmt_iso(timestamp_max) if domain == "observations" and timestamp_max else None,
-        "first_timestamp_hour_utc": fmt_iso(timestamp_min) if domain == "aqilevels" and timestamp_min else None,
-        "last_timestamp_hour_utc": fmt_iso(timestamp_max) if domain == "aqilevels" and timestamp_max else None,
-        "backed_up_at_utc": fmt_iso(backed_max) if backed_max else None,
-    }
-    for field, expected_value in expected.items():
-        if coverage.get(field) != expected_value:
-            raise ValueError(f"{label}_coverage_{field}_mismatch")
-    return entries
-
-
-def _validate_timeseries_metadata_payload(
-    *, payload: Mapping[str, Any], key: str, config: HistoryPathConfig,
-) -> tuple[int, list[dict[str, Any]]]:
-    match = re.search(r"/timeseries_id=(\d+)\.json$", key)
-    if not match:
-        raise ValueError("metadata_object_key_invalid")
-    timeseries_id = _metadata_positive_int(match.group(1), field="timeseries_id")
-    if payload.get("schema_version") != 1:
-        raise ValueError("schema_version_mismatch")
-    if payload.get("source") != "r2_history_v2_timeseries_indexes":
-        raise ValueError("source_mismatch")
-    if payload.get("history_version") != "v2" or payload.get("index_kind") != "timeseries_metadata":
-        raise ValueError("history_version_or_index_kind_mismatch")
-    if _metadata_positive_int(payload.get("timeseries_id"), field="timeseries_id") != timeseries_id:
-        raise ValueError("timeseries_id_mismatch")
-    index_prefix = config.observations_latest_index_key.rsplit("/", 1)[0]
-    metadata_prefix = key.rsplit("/", 1)[0]
-    if payload.get("index_prefix") != index_prefix:
-        raise ValueError("index_prefix_mismatch")
-    if payload.get("timeseries_metadata_index_prefix") != metadata_prefix:
-        raise ValueError("timeseries_metadata_index_prefix_mismatch")
-    observations = _validate_timeseries_metadata_coverage(payload=payload, domain="observations")
-    aqilevels = _validate_timeseries_metadata_coverage(payload=payload, domain="aqilevels")
-    entries = observations + aqilevels
-    connector_ids = sorted({item["connector_id"] for item in entries})
-    pollutant_codes = sorted({item["pollutant_code"] for item in entries})
-    backed_values = [item["_backed"] for item in entries if item["_backed"] is not None]
-    backed = max(backed_values) if backed_values else None
-    if payload.get("connector_ids") != connector_ids:
-        raise ValueError("top_level_connector_ids_mismatch")
-    if payload.get("connector_id") != (connector_ids[0] if len(connector_ids) == 1 else None):
-        raise ValueError("top_level_connector_id_mismatch")
-    if payload.get("pollutant_codes") != pollutant_codes:
-        raise ValueError("top_level_pollutant_codes_mismatch")
-    expected_backed = fmt_iso(backed) if backed else None
-    if payload.get("backed_up_at_utc") != expected_backed:
-        raise ValueError("top_level_backed_up_at_utc_mismatch")
-    generated, generated_text = _metadata_iso_value(payload.get("generated_at"), field="generated_at")
-    if backed is not None and generated_text != expected_backed:
-        raise ValueError("top_level_generated_at_mismatch")
-    if backed is None and payload.get("generated_at") is not None and generated is None:
-        raise ValueError("top_level_generated_at_invalid")
-    return timeseries_id, entries
-
-
-def _validate_affected_timeseries_index(
-    *, index_payload: Mapping[str, Any], index_key: str, identity: tuple[str, str, int, str],
-    config: HistoryPathConfig,
-) -> None:
-    domain, day_utc, connector_id, pollutant_code = identity
-    if index_payload.get("history_version") != "v2":
-        raise ValueError("affected_pollutant_index_history_version_mismatch")
-    if index_payload.get("index_kind") != "timeseries_file_ranges":
-        raise ValueError("affected_pollutant_index_kind_mismatch")
-    if index_payload.get("domain") != domain:
-        raise ValueError("affected_pollutant_index_domain_mismatch")
-    if index_payload.get("day_utc") != day_utc:
-        raise ValueError("affected_pollutant_index_day_utc_mismatch")
-    if index_payload.get("connector_id") != connector_id:
-        raise ValueError("affected_pollutant_index_connector_id_mismatch")
-    if index_payload.get("pollutant_code") != pollutant_code:
-        raise ValueError("affected_pollutant_index_pollutant_code_mismatch")
-    expected_grain = None if domain == "observations" else "hourly"
-    expected_profile = None if domain == "observations" else "data"
-    if index_payload.get("grain") != expected_grain:
-        raise ValueError("affected_pollutant_index_grain_mismatch")
-    if index_payload.get("profile") != expected_profile:
-        raise ValueError("affected_pollutant_index_profile_mismatch")
-    data_prefix = config.observations_data_prefix if domain == "observations" else config.aqilevels_hourly_data_prefix
-    if index_payload.get("data_prefix") != data_prefix:
-        raise ValueError("affected_pollutant_index_data_prefix_mismatch")
-    expected_manifest_key = (
-        f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
-        f"pollutant_code={pollutant_code}/manifest.json"
-    )
-    if index_payload.get("pollutant_manifest_key") != expected_manifest_key:
-        raise ValueError("affected_pollutant_index_manifest_key_mismatch")
-    if not isinstance(index_payload.get("timeseries_row_counts"), Mapping):
-        raise ValueError("affected_pollutant_index_timeseries_row_counts_invalid")
-
-
-def _validate_changed_timeseries_metadata(
-    *, run_state: Mapping[str, Any], view_root: Path, config: HistoryPathConfig,
-) -> list[dict[str, Any]]:
-    """Validate canonical metadata bodies and their exact affected indexes."""
-    gaps: list[dict[str, Any]] = []
-    operations_by_key: dict[str, dict[str, Any]] = {}
-    for raw in list(run_state.get("timeseries_metadata_operations") or []):
-        if not isinstance(raw, Mapping):
-            continue
-        key = _normalise_overlay_object_key(str(raw.get("metadata_object_key") or ""))
-        if not key or key in operations_by_key:
-            gaps.append({"stage": "timeseries_metadata", "object_key": key or None, "gap_type": "metadata_operation_key_invalid_or_duplicate"})
-            continue
-        operations_by_key[key] = dict(raw)
-    for key, operation in sorted(operations_by_key.items()):
-        try:
-            outcome = str(operation.get("outcome") or "")
-            if outcome not in {"succeeded", "skipped_unchanged"}:
-                raise ValueError("metadata_operation_missing_canonical_outcome")
-            overlay_entry = dict(run_state.get("objects") or {}).get(key)
-            if outcome == "succeeded" and (
-                not isinstance(overlay_entry, Mapping)
-                or not overlay_entry.get("uploaded") or not overlay_entry.get("r2_verified")
-            ):
-                raise ValueError("metadata_operation_verified_success_missing_overlay_evidence")
-            path = view_root / key
-            if not path.is_file():
-                raise ValueError("metadata_operation_final_object_missing")
-            raw_bytes = path.read_bytes()
-            if operation.get("expected_final_sha256") and hashlib.sha256(raw_bytes).hexdigest() != str(operation["expected_final_sha256"]):
-                raise ValueError("expected_final_metadata_hash_mismatch")
-            payload = json.loads(raw_bytes.decode("utf-8"))
-            if not isinstance(payload, Mapping):
-                raise ValueError("metadata_payload_not_object")
-            timeseries_id, entries = _validate_timeseries_metadata_payload(
-                payload=payload, key=key, config=config,
-            )
-            entries_by_identity = {_metadata_identity(item): item for item in entries}
-            replacements = {str(value) for value in list(operation.get("replacement_identities") or [])}
-            removals = {str(value) for value in list(operation.get("removal_identities") or [])}
-            if replacements & removals:
-                raise ValueError("metadata_operation_identity_conflict")
-            if not replacements.issubset(entries_by_identity):
-                raise ValueError("requested_metadata_replacement_missing")
-            if removals & set(entries_by_identity):
-                raise ValueError("requested_metadata_removal_present")
-            affected_keys = sorted({_normalise_overlay_object_key(str(value)) for value in list(operation.get("affected_pollutant_index_keys") or [])})
-            for index_key in affected_keys:
-                identity = _metadata_index_identity_from_key(index_key, config)
-                identity_key = "|".join((identity[0], identity[1], str(identity[2]), identity[3]))
-                if identity_key not in replacements and identity_key not in removals:
-                    raise ValueError("affected_metadata_index_without_authoritative_identity")
-                index_path = view_root / index_key
-                if not index_path.is_file():
-                    raise ValueError("affected_pollutant_index_missing")
-                index_payload = json.loads(index_path.read_text(encoding="utf-8"))
-                if not isinstance(index_payload, Mapping):
-                    raise ValueError("affected_pollutant_index_not_object")
-                _validate_affected_timeseries_index(
-                    index_payload=index_payload, index_key=index_key, identity=identity, config=config,
-                )
-                actual = int((index_payload.get("timeseries_row_counts") or {}).get(str(timeseries_id)) or 0)
-                if identity_key in replacements and actual != int(entries_by_identity[identity_key]["row_count"]):
-                    raise ValueError("affected_pollutant_index_entry_mismatch")
-                if identity_key in removals and actual != 0:
-                    raise ValueError("requested_metadata_removal_still_indexed")
-        except Exception as exc:
-            gaps.append({"stage": "timeseries_metadata", "object_key": key, "gap_type": f"timeseries_metadata_invalid:{exc}"})
-    return gaps
 
 
 def _expected_v2_core_timeseries_bindings(
@@ -20373,7 +20006,7 @@ def cleanup_successful_repair_overlay(run_state: dict[str, Any]) -> dict[str, An
 
 
 def _object_operation_domain(object_key: str) -> str:
-    return "aqilevels" if "/aqilevels_" in object_key or "/aqilevels/" in object_key else "observations"
+    return "observations"
 
 
 def record_integrity_object_operations(
@@ -24770,8 +24403,7 @@ def _collect_guardrail_errors(cli_env: str, env: dict[str, str]) -> list[str]:
 def _detect_integrity_wrapper_capabilities(
     wrapper_path: Path,
     env_name: str,
-) -> tuple[bool, bool]:
-    # Returns (supports_observs_only, supports_aqi_only)
+) -> bool:
     try:
         proc = subprocess.run(
             [str(wrapper_path), "--help"],
@@ -24783,9 +24415,9 @@ def _detect_integrity_wrapper_capabilities(
             env={**os.environ, "UK_AQ_ENV_NAME": env_name},
         )
     except (OSError, subprocess.SubprocessError):
-        return (False, False)
+        return False
     text = proc.stdout or ""
-    return ("--observs-only" in text, "--aqi-only" in text)
+    return "--observs-only" in text
 
 
 def collect_preflight_errors(
@@ -25089,18 +24721,18 @@ def collect_preflight_errors(
 
         if wrapper_raw:
             wrapper_path = Path(wrapper_raw)
-            supports_obs, supports_aqi = _detect_integrity_wrapper_capabilities(
+            supports_obs = _detect_integrity_wrapper_capabilities(
                 wrapper_path=wrapper_path,
                 env_name=args.env,
             )
-            if not supports_obs or not supports_aqi:
+            if not supports_obs:
                 supports_output_scope = _is_truthy(
                     os.environ.get("UK_AQ_BACKFILL_SUPPORTS_OUTPUT_SCOPE"),
                 )
                 if not supports_output_scope:
                     errors.append(
                         "Backfill capability check failed: output-scope support not detected. "
-                        "Set UK_AQ_BACKFILL_SUPPORTS_OUTPUT_SCOPE=true or use a wrapper exposing --observs-only/--aqi-only.",
+                        "Set UK_AQ_BACKFILL_SUPPORTS_OUTPUT_SCOPE=true or use a wrapper exposing --observs-only.",
                     )
 
     current_state_reconciliation_enabled = _is_truthy(
