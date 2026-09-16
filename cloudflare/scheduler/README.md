@@ -138,7 +138,7 @@ operation, this job moves to the LIVE central scheduler.
 
 `uk_aq_media_gdelt` is a live `github_workflow` job that dispatches
 `TEST-uk-aq/uk-aq-media`'s `uk_aq_media_gdelt.yml` workflow on `main` at minutes
-10, 25, 40 and 55 each hour. The GDELT acquisition runs on the GitHub Actions
+10, and 40  each hour. The GDELT acquisition runs on the GitHub Actions
 runner; the scheduler only makes the workflow dispatch. The workflow has no native
 GitHub Actions Cron, so this Ops job is its sole scheduling authority. This is
 separate from `uk_aq_media_discovery`, which remains the two-hour `worker_http`

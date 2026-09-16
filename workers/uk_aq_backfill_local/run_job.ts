@@ -881,50 +881,56 @@ const DEPRECATED_R2_HISTORY_VERSION_ENVS = [
   "UK_AQ_R2_HISTORY_BACKUP_VERSION",
 ];
 
-type HistoryWriteVersion = "v1" | "v2" | "v3";
+export type HistoryWriteVersion = "v1" | "v2" | "v3";
 
-function resolveHistoryWriteVersionFromEnv(): HistoryWriteVersion {
-  const presentDeprecated = DEPRECATED_R2_HISTORY_VERSION_ENVS.filter((name) => Deno.env.get(name) !== undefined);
+export function resolveHistoryWriteVersionFromEnv(
+  getEnv: (name: string) => string | undefined = (name) => Deno.env.get(name),
+): HistoryWriteVersion {
+  const presentDeprecated = DEPRECATED_R2_HISTORY_VERSION_ENVS.filter((name) =>
+    getEnv(name) !== undefined
+  );
   if (presentDeprecated.length > 0) {
     throw new Error(
-      `R2 local backfill no longer supports ${presentDeprecated.join(", ")}. `
-        + `Use ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1|v2 and delete the old split read/write/backup vars.`,
+      `R2 local backfill no longer supports ${presentDeprecated.join(", ")}. ` +
+        `Use ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1|v2 and delete the old split read/write/backup vars.`,
     );
   }
-  const raw = Deno.env.get(CANONICAL_R2_HISTORY_VERSION_ENV);
+  const raw = getEnv(CANONICAL_R2_HISTORY_VERSION_ENV);
   const value = String(raw || "").trim().toLowerCase();
   if (value === "v1" || value === "v2") {
     return value;
   }
   if (value === "v3") {
     const integrityInvocation = parseBooleanish(
-      Deno.env.get("UK_AQ_INTEGRITY_INVOCATION"),
+      getEnv("UK_AQ_INTEGRITY_INVOCATION"),
       false,
     );
     const outputScope = String(
-      Deno.env.get("UK_AQ_BACKFILL_OUTPUT_SCOPE") || "",
+      getEnv("UK_AQ_BACKFILL_OUTPUT_SCOPE") || "",
     ).trim().toLowerCase();
     const proposalMode = String(
-      Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE") || "",
+      getEnv("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE") || "",
     ).trim().toLowerCase();
     const sourceEvidenceOnly = parseBooleanish(
-      Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
+      getEnv("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
       false,
     );
     const workerPurpose = String(
-      Deno.env.get("UK_AQ_INTEGRITY_WORKER_PURPOSE") || "",
+      getEnv("UK_AQ_INTEGRITY_WORKER_PURPOSE") || "",
     ).trim().toLowerCase();
     const canonicalWritesAllowed = String(
-      Deno.env.get("UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED") || "",
+      getEnv("UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED") || "",
     ).trim().toLowerCase();
     const finalIndexRebuild = String(
-      Deno.env.get("UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX") || "",
+      getEnv("UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX") || "",
     ).trim().toLowerCase();
     const effectiveMode = String(
-      Deno.env.get("UK_AQ_INTEGRITY_EFFECTIVE_MODE") || "",
+      getEnv("UK_AQ_INTEGRITY_EFFECTIVE_MODE") || "",
     ).trim().toLowerCase();
+    const integrityModeValid = effectiveMode === "check_only" ||
+      effectiveMode === "repair_dry_run" || effectiveMode === "repair_apply";
     const evidencePurposeValid = workerPurpose === "source_evidence_only" &&
-      sourceEvidenceOnly && effectiveMode === "check_only";
+      sourceEvidenceOnly && integrityModeValid;
     const proposalPurposeValid = workerPurpose === "repair_proposal" &&
       !sourceEvidenceOnly &&
       (effectiveMode === "repair_dry_run" || effectiveMode === "repair_apply");
@@ -944,9 +950,15 @@ function resolveHistoryWriteVersionFromEnv(): HistoryWriteVersion {
     );
   }
   if (!value) {
-    throw new Error(`Missing ${CANONICAL_R2_HISTORY_VERSION_ENV}; set ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1 or ${CANONICAL_R2_HISTORY_VERSION_ENV}=v2.`);
+    throw new Error(
+      `Missing ${CANONICAL_R2_HISTORY_VERSION_ENV}; set ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1 or ${CANONICAL_R2_HISTORY_VERSION_ENV}=v2.`,
+    );
   }
-  throw new Error(`Invalid ${CANONICAL_R2_HISTORY_VERSION_ENV}=${JSON.stringify(String(raw))}; expected v1 or v2`);
+  throw new Error(
+    `Invalid ${CANONICAL_R2_HISTORY_VERSION_ENV}=${
+      JSON.stringify(String(raw))
+    }; expected v1 or v2`,
+  );
 }
 
 const OBS_R2_HISTORY_PREFIX = normalizePrefix(

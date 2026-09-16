@@ -25,50 +25,131 @@ SPEC.loader.exec_module(MODULE)
 
 
 class SosLightV3WorkerBoundaryTests(unittest.TestCase):
-    def test_check_only_evidence_worker_is_explicitly_noncanonical(self) -> None:
-        with tempfile.NamedTemporaryFile() as wrapper:
-            completed = subprocess.CompletedProcess(["wrapper"], 0, "", "")
-            with (
-                mock.patch.dict(
-                    os.environ,
-                    {"UK_AQ_INTEGRITY_EFFECTIVE_MODE": "check_only"},
-                    clear=False,
-                ),
-                mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run,
-            ):
-                result = MODULE.run_narrow_backfill(
-                    wrapper_path=wrapper.name,
-                    env_file_path=None,
-                    env_name="TEST",
-                    timeseries_ids=[],
-                    connector_ids=[1],
-                    day=dt.date(2026, 6, 1),
-                    log=logging.getLogger("worker-boundary-test"),
-                    output_scope="observations_only",
-                    extra_env={
-                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                        "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
-                    },
-                    history_version="v3",
-                    complete_connector_day=True,
-                    repair_pollutants=["no2"],
-                    worker_purpose="source_evidence_only",
-                    canonical_writes_allowed=False,
+    def test_evidence_worker_is_explicitly_noncanonical_in_every_mode(self) -> None:
+        for effective_mode in ("check_only", "repair_dry_run", "repair_apply"):
+            with self.subTest(effective_mode=effective_mode):
+                with tempfile.NamedTemporaryFile() as wrapper:
+                    completed = subprocess.CompletedProcess(["wrapper"], 0, "", "")
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {"UK_AQ_INTEGRITY_EFFECTIVE_MODE": effective_mode},
+                            clear=False,
+                        ),
+                        mock.patch.object(
+                            MODULE.subprocess, "run", return_value=completed
+                        ) as run,
+                    ):
+                        result = MODULE.run_narrow_backfill(
+                            wrapper_path=wrapper.name,
+                            env_file_path=None,
+                            env_name="TEST",
+                            timeseries_ids=[],
+                            connector_ids=[1],
+                            day=dt.date(2026, 6, 1),
+                            log=logging.getLogger("worker-boundary-test"),
+                            output_scope="observations_only",
+                            extra_env={
+                                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                                "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                            },
+                            history_version="v3",
+                            complete_connector_day=True,
+                            repair_pollutants=["no2"],
+                            worker_purpose="source_evidence_only",
+                            canonical_writes_allowed=False,
+                        )
+
+                self.assertEqual(result["status"], "ok")
+                child_env = run.call_args.kwargs["env"]
+                self.assertEqual(
+                    child_env["UK_AQ_INTEGRITY_EFFECTIVE_MODE"],
+                    effective_mode,
+                )
+                self.assertEqual(
+                    child_env["UK_AQ_INTEGRITY_WORKER_PURPOSE"],
+                    "source_evidence_only",
+                )
+                self.assertEqual(
+                    child_env["UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED"],
+                    "false",
+                )
+                self.assertEqual(child_env["UK_AQ_BACKFILL_DRY_RUN"], "false")
+
+    def test_evidence_worker_rejects_write_permission_in_every_mode(self) -> None:
+        for effective_mode in ("check_only", "repair_dry_run", "repair_apply"):
+            with self.subTest(effective_mode=effective_mode):
+                with tempfile.NamedTemporaryFile() as wrapper:
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {"UK_AQ_INTEGRITY_EFFECTIVE_MODE": effective_mode},
+                            clear=False,
+                        ),
+                        mock.patch.object(MODULE.subprocess, "run") as run,
+                        self.assertRaisesRegex(
+                            ValueError, "cannot allow canonical writes"
+                        ),
+                    ):
+                        MODULE.run_narrow_backfill(
+                            wrapper_path=wrapper.name,
+                            env_file_path=None,
+                            env_name="TEST",
+                            timeseries_ids=[],
+                            connector_ids=[1],
+                            day=dt.date(2026, 6, 1),
+                            log=logging.getLogger("worker-boundary-test"),
+                            output_scope="observations_only",
+                            extra_env={
+                                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                                "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                            },
+                            history_version="v3",
+                            complete_connector_day=True,
+                            repair_pollutants=["no2"],
+                            worker_purpose="source_evidence_only",
+                            canonical_writes_allowed=True,
+                        )
+                run.assert_not_called()
+
+    def test_repair_proposal_worker_mode_matrix(self) -> None:
+        for effective_mode in ("repair_dry_run", "repair_apply"):
+            with self.subTest(effective_mode=effective_mode):
+                with tempfile.NamedTemporaryFile() as wrapper:
+                    completed = subprocess.CompletedProcess(["wrapper"], 0, "", "")
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {"UK_AQ_INTEGRITY_EFFECTIVE_MODE": effective_mode},
+                            clear=False,
+                        ),
+                        mock.patch.object(
+                            MODULE.subprocess, "run", return_value=completed
+                        ) as run,
+                    ):
+                        result = MODULE.run_narrow_backfill(
+                            wrapper_path=wrapper.name,
+                            env_file_path=None,
+                            env_name="TEST",
+                            timeseries_ids=[101],
+                            connector_ids=[1],
+                            day=dt.date(2026, 6, 1),
+                            log=logging.getLogger("worker-boundary-test"),
+                            output_scope="observations_only",
+                            extra_env={
+                                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                            },
+                            history_version="v3",
+                            worker_purpose="repair_proposal",
+                            canonical_writes_allowed=False,
+                        )
+                self.assertEqual(result["status"], "ok")
+                child_env = run.call_args.kwargs["env"]
+                self.assertEqual(
+                    child_env["UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED"],
+                    "false",
                 )
 
-        self.assertEqual(result["status"], "ok")
-        child_env = run.call_args.kwargs["env"]
-        self.assertEqual(
-            child_env["UK_AQ_INTEGRITY_WORKER_PURPOSE"],
-            "source_evidence_only",
-        )
-        self.assertEqual(
-            child_env["UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED"],
-            "false",
-        )
-        self.assertEqual(child_env["UK_AQ_BACKFILL_DRY_RUN"], "false")
-
-    def test_check_only_rejects_write_permission_before_launch(self) -> None:
         with tempfile.NamedTemporaryFile() as wrapper:
             with (
                 mock.patch.dict(
@@ -77,26 +158,25 @@ class SosLightV3WorkerBoundaryTests(unittest.TestCase):
                     clear=False,
                 ),
                 mock.patch.object(MODULE.subprocess, "run") as run,
-                self.assertRaisesRegex(ValueError, "cannot allow canonical writes"),
+                self.assertRaisesRegex(
+                    ValueError, "check_only may launch only source_evidence_only"
+                ),
             ):
                 MODULE.run_narrow_backfill(
                     wrapper_path=wrapper.name,
                     env_file_path=None,
                     env_name="TEST",
-                    timeseries_ids=[],
+                    timeseries_ids=[101],
                     connector_ids=[1],
                     day=dt.date(2026, 6, 1),
                     log=logging.getLogger("worker-boundary-test"),
                     output_scope="observations_only",
                     extra_env={
                         "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                        "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
                     },
                     history_version="v3",
-                    complete_connector_day=True,
-                    repair_pollutants=["no2"],
-                    worker_purpose="source_evidence_only",
-                    canonical_writes_allowed=True,
+                    worker_purpose="repair_proposal",
+                    canonical_writes_allowed=False,
                 )
         run.assert_not_called()
 
