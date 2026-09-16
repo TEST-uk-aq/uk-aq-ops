@@ -116,7 +116,7 @@ dry_run = false
 notes = "UK AQ Media discovery"
 
 [jobs.uk_aq_media_gdelt]
-enabled = true
+enabled = false
 cron_expr = "10,40 * * * *"
 target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-media"
