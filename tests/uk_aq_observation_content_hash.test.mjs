@@ -86,10 +86,28 @@ test("observation content hash v1 is deterministic and status-aware", () => {
   assert.equal(normalizeUkAirVerificationStatus(null), "P");
   assert.equal(
     resolveLegacyVerificationStatus(
-      { verification_status: "R", status: "Provisional" },
+      {
+        verification_status: "R",
+        vstatus: "P",
+        status: "Provisional",
+      },
       { isSos: true },
     ),
     "R",
+  );
+  assert.equal(resolveLegacyVerificationStatus({ vstatus: "P" }), "P");
+  assert.equal(resolveLegacyVerificationStatus({ vstatus: "R" }), "R");
+  assert.equal(
+    resolveLegacyVerificationStatus({ vstatus: "R", status: "Provisional" }),
+    "R",
+  );
+  assert.equal(
+    resolveLegacyVerificationStatus({ verification_status: "P", vstatus: "R" }),
+    "P",
+  );
+  assert.equal(
+    resolveLegacyVerificationStatus({ verification_status: null, vstatus: "R" }),
+    null,
   );
   assert.equal(
     resolveLegacyVerificationStatus(
@@ -105,6 +123,8 @@ test("observation content hash v1 is deterministic and status-aware", () => {
     ),
     null,
   );
+  assert.equal(resolveLegacyVerificationStatus({}), null);
+  assert.equal(resolveLegacyVerificationStatus(null), null);
   assert.equal(
     normalizeUkAirVerificationStatus("verified"),
     "P",
