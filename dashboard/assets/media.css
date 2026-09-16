@@ -422,7 +422,15 @@ button.media-save-state { cursor: pointer; }
   .media-source__grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
   .media-author-rule { grid-template-columns: 1fr 1fr; }
   .media-review__layout { grid-template-columns: 1fr; }
-  .media-site-preview-wrap { justify-content: center; }
+  .media-ai-expanded .media-review {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    box-sizing: border-box;
+    width: min(760px, calc(90vw - 28px));
+    max-width: calc(90vw - 28px);
+  }
+  .media-site-preview-wrap { justify-content: flex-start; }
 }
 
 @media (max-width: 640px) {
