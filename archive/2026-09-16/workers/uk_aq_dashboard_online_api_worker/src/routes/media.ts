@@ -17,7 +17,6 @@ const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/guardian-image-refresh\/(preview|apply)$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/metadata\/preview$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/metadata\/apply$/, methods: new Set(['PUT']) },
-  { pattern: /^\/api\/media\/bluesky\/settings$/, methods: new Set(['GET', 'PUT']) },
   { pattern: /^\/api\/media\/ai-usage$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/runs$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/runs\/gdelt$/, methods: new Set(['GET']) },
