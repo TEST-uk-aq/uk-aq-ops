@@ -281,9 +281,14 @@
     state.selectedArticleIds = new Set([...state.selectedArticleIds].filter(id => loadedIds.has(id)));
   }
 
+  function bulkStatusTargetEligible(article, target) {
+    if (target === "approved" && ["rejected", "hidden"].includes(article.status)) return false;
+    return article.status === target || Boolean(statusActionForTarget(article.status, target));
+  }
+
   function bulkStatusOptions(selected = selectedArticles()) {
     const targets = ["approved", "rejected", "hidden"].filter(target => selected.every(article =>
-      article.status === target || statusActionForTarget(article.status, target)));
+      bulkStatusTargetEligible(article, target)));
     return `<option value="">Choose status…</option>${targets.map(target =>
       `<option value="${target}">${STATUS_LABELS[target]}</option>`).join("")}`;
   }
@@ -547,7 +552,7 @@
     if (!target || !["approved", "rejected", "hidden"].includes(target)) return;
     const selected = selectedArticles();
     if (selected.length > MAX_BATCH_SELECTION) { state.batchMessage = { text: `Apply Article Status to at most ${MAX_BATCH_SELECTION} selected rows at a time.`, kind: "error" }; refreshSelectionControls(); return; }
-    if (!selected.every(article => article.status === target || statusActionForTarget(article.status, target))) {
+    if (!selected.every(article => bulkStatusTargetEligible(article, target))) {
       state.batchMessage = { text: `Selected rows cannot all move to ${STATUS_LABELS[target]}.`, kind: "error" };
       refreshSelectionControls();
       return;
@@ -569,6 +574,8 @@
     if (!action) return;
     const nextStatus = option.value;
     if (nextStatus === "approved" && ["rejected", "hidden"].includes(control.dataset.current)) {
+      select.value = control.dataset.current;
+      control.querySelector(".media-save-state").outerHTML = `<span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>`;
       await openArticle(Number(control.dataset.id), "", "approved");
       return;
     }
@@ -642,14 +649,15 @@
     dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading Bluesky settings…</div></div>`;
     if (!dialog.open) dialog.showModal();
     try {
-      const settings = blueskySettingsFrom(await request("bluesky/settings"));
+      const data = await request("bluesky/settings");
+      const settings = blueskySettingsFrom(data);
       const template = settings.default_message_template ?? settings.default_message ?? "";
       const cooldownSeconds = Number(settings.cooldown_seconds);
       const cooldownMinutes = Number.isFinite(cooldownSeconds) ? cooldownSeconds / 60 : "";
-      const minSeconds = Number(settings.cooldown_min_seconds ?? settings.limits?.cooldown_min_seconds);
-      const maxSeconds = Number(settings.cooldown_max_seconds ?? settings.limits?.cooldown_max_seconds);
-      const min = Number.isFinite(minSeconds) ? ` min="${minSeconds / 60}"` : "";
-      const max = Number.isFinite(maxSeconds) ? ` max="${maxSeconds / 60}"` : "";
+      const minMinutes = Number(data?.constraints?.cooldown_minutes_min);
+      const maxMinutes = Number(data?.constraints?.cooldown_minutes_max);
+      const min = Number.isFinite(minMinutes) ? ` min="${minMinutes}"` : "";
+      const max = Number.isFinite(maxMinutes) ? ` max="${maxMinutes}"` : "";
       dialog.innerHTML = `<form class="media-detail__inner" data-bluesky-form><div class="media-detail__header"><div><h3>Bluesky</h3><p>Account: <strong>@ukaq.co.uk</strong></p></div></div>${notice ? message(notice, "success") : ""}
         <label class="media-toggle"><input name="publishing_enabled" type="checkbox"${settings.publishing_enabled ? " checked" : ""}> <span>Publishing enabled</span></label>
         <label class="media-field"><span>Default message</span><textarea name="default_message_template" required>${esc(template)}</textarea></label>
@@ -681,7 +689,7 @@
           await request("bluesky/settings", { method: "PUT", idempotent: "bluesky-settings", body: {
             publishing_enabled: form.elements.publishing_enabled.checked,
             default_message_template: textarea.value,
-            cooldown_seconds: minutes * 60,
+            cooldown_minutes: minutes,
           } });
           await openBlueskySettings("Bluesky settings saved.");
         } catch (error) { save.disabled = false; save.textContent = "Save"; output.innerHTML = message(error.message, "error"); }
