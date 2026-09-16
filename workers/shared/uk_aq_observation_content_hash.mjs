@@ -58,6 +58,12 @@ export function resolveLegacyVerificationStatus(row, { isSos = false } = {}) {
       ? normalizeUkAirVerificationStatus(value)
       : requireCanonicalVerificationStatus(value);
   }
+  if (Object.hasOwn(source, "vstatus")) {
+    const value = source.vstatus;
+    return isSos
+      ? normalizeUkAirVerificationStatus(value)
+      : requireCanonicalVerificationStatus(value);
+  }
   if (Object.hasOwn(source, "status")) {
     return isSos ? normalizeUkAirVerificationStatus(source.status) : null;
   }
