@@ -460,6 +460,7 @@ button.media-save-state { cursor: pointer; }
   .media-detail__header .media-button { margin-left: auto; }
   .media-detail dl { grid-template-columns: 1fr; gap: 2px; }
   .media-detail dd { margin-bottom: 7px; }
+  .media-source pre,
   .media-detail pre,
   .media-message pre { max-width: 100%; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 }
