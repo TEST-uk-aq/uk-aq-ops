@@ -39,6 +39,12 @@ const selectedGeneration = String(
 if (selectedGeneration !== "v2" && selectedGeneration !== "v3") {
   throw new Error("Focused core identity test requires v2 or v3");
 }
+const configuredV2CorePrefix = String(
+  Deno.env.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX") || "",
+).trim().replace(/^\/+|\/+$/g, "");
+const expectedCorePrefix = selectedGeneration === "v2"
+  ? configuredV2CorePrefix || "history/v2/core"
+  : "history/v3/core";
 const otherGeneration = selectedGeneration === "v2" ? "v3" : "v2";
 const dayUtc = "2026-09-15";
 const manifestHash = "a".repeat(64);
@@ -52,12 +58,12 @@ const manifestSha256 = await sha256(manifestText);
 const identity = {
   core_snapshot_day_utc: dayUtc,
   core_snapshot_manifest_key:
-    `history/${selectedGeneration}/core/day_utc=${dayUtc}/manifest.json`,
+    `${expectedCorePrefix}/day_utc=${dayUtc}/manifest.json`,
   core_snapshot_manifest_hash: manifestHash,
   core_snapshot_manifest_sha256: manifestSha256,
 };
 
-Deno.test(`${selectedGeneration} accepts its canonical pinned core identity`, () => {
+Deno.test(`${selectedGeneration} resolves its expected core prefix`, () => {
   const validated = validateIntegrityCoreSnapshotIdentityPayload({
     coordinatorIdentity: identity,
     recordedIdentity: identity,
@@ -65,6 +71,10 @@ Deno.test(`${selectedGeneration} accepts its canonical pinned core identity`, ()
     stage: "focused_generation_acceptance",
   });
   assertEquals(validated, identity);
+  assertEquals(
+    validated.core_snapshot_manifest_key,
+    `${expectedCorePrefix}/day_utc=${dayUtc}/manifest.json`,
+  );
 });
 
 Deno.test(`${selectedGeneration} rejects ${otherGeneration} core identity`, () => {

@@ -989,16 +989,6 @@ const CORE_R2_HISTORY_PREFIX = (() => {
         generation.core_prefix,
     ) || generation.core_prefix;
   }
-  const configured = normalizePrefix(
-    Deno.env.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX") ||
-      generation.core_prefix,
-  ) || generation.core_prefix;
-  if (configured !== generation.core_prefix) {
-    throw new Error(
-      `UK_AQ_R2_HISTORY_V2_CORE_PREFIX contradicts selected ${HISTORY_R2_WRITE_VERSION} generation: ` +
-        `expected ${generation.core_prefix}, got ${configured}`,
-    );
-  }
   return generation.core_prefix;
 })();
 const R2_HISTORY_DROPBOX_ROOT = optionalEnvAny([
