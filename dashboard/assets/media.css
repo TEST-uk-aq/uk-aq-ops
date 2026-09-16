@@ -1,6 +1,7 @@
 .media-dashboard {
   grid-column: 1 / -1;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   min-width: 0;
   font-size: 16px;
@@ -11,6 +12,13 @@
  * intrinsic width to the dashboard's outer grid. Wide content gets its own
  * local scroller below instead of widening the document.
  */
+#dashboard,
+.mode-view[data-mode="media"],
+.media-dashboard,
+.media-dashboard [data-media-view] {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .mode-view[data-mode="media"],
 .media-dashboard,
 .media-dashboard > *,
@@ -111,6 +119,8 @@
 .media-bluesky__actions { justify-content: flex-end; margin-top: 18px; }
 .media-table--bluesky { min-width: 680px; }
 
+.media-filter-disclosure { min-width: 0; }
+.media-filter-disclosure__summary { display: none; }
 .media-filter-panel {
   display: grid;
   grid-template-columns: repeat(5, minmax(140px, 1fr));
@@ -173,6 +183,7 @@
   max-width: 100%;
   margin-top: 12px;
   overflow-x: auto;
+  contain: inline-size;
   border: 1px solid var(--border);
   border-radius: 12px;
   overscroll-behavior-inline: contain;
@@ -417,6 +428,24 @@ button.media-save-state { cursor: pointer; }
 @media (max-width: 640px) {
   .media-header,
   .media-card { padding: 13px; border-radius: 14px; }
+  .media-filter-disclosure__summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 10px;
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #fff;
+    color: var(--ink);
+    font-weight: 700;
+    cursor: pointer;
+    list-style: none;
+  }
+  .media-filter-disclosure__summary::-webkit-details-marker { display: none; }
+  .media-filter-disclosure__summary::after { content: "▾"; color: var(--accent-2); }
+  .media-filter-disclosure[open] > .media-filter-disclosure__summary::after { content: "▴"; }
   .media-filter-panel,
   .media-source__grid,
   .media-review__titles,

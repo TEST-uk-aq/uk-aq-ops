@@ -193,7 +193,8 @@
       `<label data-author-option="${esc(String(author).toLowerCase())}"><input type="checkbox" data-filter="author" value="${esc(author)}"${checkedFilter("author", author)}> ${esc(author)}</label>`).join("");
     const titleStates = [["original", "Original"], ["publisher", "Publisher"], ["human", "Human"], ["ai", "AI Accepted"], ["pending_ai", "AI Pending"], ["rejected_ai", "AI Rejected"]]
       .map(([value, label]) => `<label><input type="checkbox" data-filter="titleState" value="${value}"${checkedFilter("titleState", value)}> ${label}</label>`).join("");
-    return `<div class="media-filter-panel" aria-label="Article filters">
+    const open = window.matchMedia("(min-width: 641px)").matches ? " open" : "";
+    return `<details class="media-filter-disclosure" data-filter-disclosure${open}><summary class="media-filter-disclosure__summary">Filters</summary><div class="media-filter-panel" aria-label="Article filters">
       <fieldset class="media-filter-group"><legend>Has image</legend><div class="media-filter-options">
         <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value=""${!state.filters.hasImage ? " checked" : ""}> Any</label>
         <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="yes"${state.filters.hasImage === "yes" ? " checked" : ""}> Yes</label>
@@ -203,7 +204,7 @@
       <fieldset class="media-filter-group media-filter-group--publication"><legend>Publication</legend>${filterScroll("publications", publications || "No publications")}</fieldset>
       <fieldset class="media-filter-group"><legend>Author</legend><label class="media-field"><input data-author-search type="search" placeholder="Find author"></label>${filterScroll("authors", authors || "No authors")}</fieldset>
       <fieldset class="media-filter-group"><legend>Article Status</legend><div class="media-filter-options">${status}</div></fieldset>
-    </div><div class="media-active-filters" data-active-filters>${esc(activeFilterSummary())}</div>`;
+    </div></details><div class="media-active-filters" data-active-filters>${esc(activeFilterSummary())}</div>`;
   }
 
   function filterScroll(name, options) {
@@ -247,6 +248,9 @@
         viewport.scrollBy({ top: (button.dataset.scrollDirection === "up" ? -1 : 1) * viewport.clientHeight, behavior: "smooth" });
       }));
       updateFilterScroll(scroll);
+    });
+    state.root.querySelector("[data-filter-disclosure]")?.addEventListener("toggle", event => {
+      if (event.currentTarget.open) requestAnimationFrame(updateFilterScrolls);
     });
     requestAnimationFrame(updateFilterScrolls);
   }
