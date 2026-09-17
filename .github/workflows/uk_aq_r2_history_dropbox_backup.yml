@@ -133,18 +133,32 @@ jobs:
           set -euo pipefail
 
           endpoint="${CFLARE_R2_ENDPOINT%/}"
-          dropbox_access_token="$(curl -fsS https://api.dropbox.com/oauth2/token \
+          dropbox_token_response="$(curl -fsS https://api.dropbox.com/oauth2/token \
             -u "${DROPBOX_APP_KEY}:${DROPBOX_APP_SECRET}" \
             -d grant_type=refresh_token \
-            --data-urlencode "refresh_token=${DROPBOX_REFRESH_TOKEN}" \
-            | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("access_token",""))')"
+            --data-urlencode "refresh_token=${DROPBOX_REFRESH_TOKEN}")"
+
+          dropbox_access_token="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("access_token",""))' <<< "${dropbox_token_response}")"
+          dropbox_expires_in="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("expires_in",""))' <<< "${dropbox_token_response}")"
 
           if [ -z "${dropbox_access_token}" ]; then
             echo "Failed to fetch Dropbox access token from refresh token" >&2
             exit 1
           fi
 
-          dropbox_token="$(DROPBOX_ACCESS_TOKEN="${dropbox_access_token}" DROPBOX_REFRESH_TOKEN="${DROPBOX_REFRESH_TOKEN}" python3 -c 'import json, os; print(json.dumps({"access_token": os.environ["DROPBOX_ACCESS_TOKEN"], "token_type": "bearer", "refresh_token": os.environ["DROPBOX_REFRESH_TOKEN"], "expiry": "0001-01-01T00:00:00Z"}, separators=(",", ":")))')"
+          case "${dropbox_expires_in}" in
+            ''|*[!0-9]*)
+              echo "Dropbox token response did not include a valid expires_in value" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${dropbox_expires_in}" -le 0 ]; then
+            echo "Dropbox token response expires_in must be greater than zero" >&2
+            exit 1
+          fi
+
+          dropbox_expiry="$(DROPBOX_EXPIRES_IN="${dropbox_expires_in}" python3 -c 'from datetime import datetime, timedelta, timezone; import os; print((datetime.now(timezone.utc) + timedelta(seconds=int(os.environ["DROPBOX_EXPIRES_IN"]))).isoformat().replace("+00:00", "Z"))')"
+          dropbox_token="$(DROPBOX_ACCESS_TOKEN="${dropbox_access_token}" DROPBOX_REFRESH_TOKEN="${DROPBOX_REFRESH_TOKEN}" DROPBOX_EXPIRY="${dropbox_expiry}" python3 -c 'import json, os; print(json.dumps({"access_token": os.environ["DROPBOX_ACCESS_TOKEN"], "token_type": "bearer", "refresh_token": os.environ["DROPBOX_REFRESH_TOKEN"], "expiry": os.environ["DROPBOX_EXPIRY"]}, separators=(",", ":")))')"
 
           mkdir -p "$(dirname "${RCLONE_CONFIG}")"
           {
