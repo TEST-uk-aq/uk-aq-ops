@@ -13,7 +13,6 @@
     ["updated_desc", "Recently Updated"],
   ];
   const STATUS_LABELS = { approved: "Approved", pending: "Pending", rejected: "Rejected", hidden: "Hidden" };
-  const BLUESKY_REASON_LABELS = { pending_approved: "Approved from Pending" };
   const STATUS_ACTIONS = {
     pending: [["approved", "Approve", "approve"], ["rejected", "Reject", "reject"]],
     approved: [["hidden", "Hide", "hide"], ["rejected", "Reject", "reject"]],
@@ -368,7 +367,7 @@
 
   function bulkToolbarHtml() {
     const count = state.selectedArticleIds.size;
-    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><label class="media-toggle" data-bulk-bluesky hidden><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
+    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
   }
 
   function articleTableHtml(error = "") {
@@ -499,12 +498,6 @@
       refreshSelectionControls();
     }));
     state.root.querySelector("[data-bulk-status]")?.addEventListener("change", event => {
-      const bluesky = state.root.querySelector("[data-bulk-bluesky]");
-      if (bluesky) {
-        bluesky.hidden = event.currentTarget.value !== "approved";
-        const input = bluesky.querySelector("input");
-        if (input) input.checked = false;
-      }
       refreshSelectionControls();
     });
     state.root.querySelector("[data-save-bulk]")?.addEventListener("click", () => void saveBulkStatus());
@@ -554,15 +547,6 @@
       if ([...target.options].some(option => option.value === previous)) target.value = previous;
       target.disabled = count === 0;
     }
-    const bluesky = table.querySelector("[data-bulk-bluesky]");
-    if (bluesky) {
-      const visible = count > 0 && target?.value === "approved";
-      bluesky.hidden = !visible;
-      if (!visible) {
-        const input = bluesky.querySelector("input");
-        if (input) input.checked = false;
-      }
-    }
     if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value;
     const output = table.querySelector("[data-bulk-message]"); if (output) output.innerHTML = state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : "";
   }
@@ -579,21 +563,6 @@
     }
     const changes = selected.map(article => ({ article, action: statusActionForTarget(article.status, target) })).filter(item => item.action);
     const save = table.querySelector("[data-save-bulk]"); save.disabled = true;
-    const postToBluesky = target === "approved" && table.querySelector("[data-bulk-bluesky] input")?.checked === true;
-    if (postToBluesky) {
-      try {
-        await request("articles/bulk-approve", { method: "POST", idempotent: "bulk-approve", body: {
-          article_ids: changes.map(({ article }) => article.id),
-          post_to_bluesky: true,
-        } });
-        state.batchMessage = { text: `${changes.length} changed${selected.length - changes.length ? `; ${selected.length - changes.length} already ${STATUS_LABELS[target]}` : ""}.`, kind: "success" };
-        await refreshArticleTable(false);
-      } catch (error) {
-        state.batchMessage = { text: error.message, kind: "error" };
-        refreshSelectionControls();
-      }
-      return;
-    }
     const results = await Promise.allSettled(changes.map(({ article, action }) => request(`articles/${article.id}/${action}`, { method: "POST", idempotent: "status" })));
     const succeeded = results.filter(result => result.status === "fulfilled").length;
     const failed = results.length - succeeded;
@@ -608,7 +577,7 @@
     const action = option.dataset.action;
     if (!action) return;
     const nextStatus = option.value;
-    if (nextStatus === "approved" && control.dataset.current !== "approved") {
+    if (nextStatus === "approved" && ["rejected", "hidden"].includes(control.dataset.current)) {
       select.value = control.dataset.current;
       control.querySelector(".media-save-state").outerHTML = `<span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>`;
       await openArticle(Number(control.dataset.id), "", "approved");
@@ -753,15 +722,14 @@
     const rows = publications.map(item => {
       const href = item.post_url || (String(item.post_uri || "").startsWith("https://") ? item.post_uri : "");
       const post = href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">Open post ↗</a>` : esc(item.post_uri || "—");
-      const reason = BLUESKY_REASON_LABELS[item.publication_reason] || item.publication_reason || "—";
-      return `<tr><td>${esc(item.status || "—")}</td><td>${esc(reason)}</td><td>${esc(formatUtcDateTime(item.posted_at || item.updated_at || item.created_at))}</td><td>${esc(item.last_error_code || item.error_code || "—")}</td><td>${post}</td></tr>`;
+      return `<tr><td>${esc(item.status || "—")}</td><td>${esc(item.publication_reason || "—")}</td><td>${esc(formatUtcDateTime(item.posted_at || item.updated_at || item.created_at))}</td><td>${esc(item.last_error_code || item.error_code || "—")}</td><td>${post}</td></tr>`;
     }).join("");
     return `<section><h4>Bluesky publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(bluesky.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(bluesky.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(bluesky.latest_status || "—")}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--bluesky"><thead><tr><th>Status</th><th>Reason</th><th>Relevant time</th><th>Error code</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Bluesky publication history.</p>`}</section>`;
   }
 
   function manualBlueskyHtml(article, data) {
     const bluesky = blueskyState(data, article);
-    if (article.status === "approved") return "";
+    if (!["rejected", "hidden"].includes(article.status)) return "";
     if (bluesky.manual_post_available === true) return `<label class="media-toggle" data-manual-bluesky><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label>${bluesky.manual_post_reason ? `<p class="media-subtext">${esc(bluesky.manual_post_reason)}</p>` : ""}`;
     const reason = bluesky.manual_post_unavailable_reason || bluesky.manual_post_reason;
     return reason ? `<p class="media-message">Bluesky posting unavailable: ${esc(reason)}</p>` : "";
@@ -824,7 +792,7 @@
     control.querySelector("button").disabled = true;
     try {
       const manual = dialog.querySelector("[data-manual-bluesky] input");
-      const body = { post_to_bluesky: manual?.checked === true };
+      const body = manual?.checked ? { post_to_bluesky: true } : undefined;
       await request(`articles/${id}/${action}`, { method: "POST", idempotent: "status", body });
       await renderArticles(false);
       await openArticle(id);

@@ -7,7 +7,6 @@ const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/articles$/, methods: new Set(['GET', 'POST']) },
   { pattern: /^\/api\/media\/articles\/selectors$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/lookup$/, methods: new Set(['POST']) },
-  { pattern: /^\/api\/media\/articles\/bulk-approve$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/image$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/(approve|reject|hide|unhide)$/, methods: new Set(['POST']) },
