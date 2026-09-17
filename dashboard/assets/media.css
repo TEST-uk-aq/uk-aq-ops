@@ -132,6 +132,7 @@
   background: rgba(255, 250, 241, 0.62);
 }
 .media-filter-group { min-width: 0; border: 0; padding: 0; margin: 0; }
+.media-filter-group:has([data-author-search]) > .media-field { display: none; }
 .media-filter-options { display: grid; gap: 5px; }
 .media-filter-options label { display: flex; align-items: center; gap: 6px; font-size: 15px; }
 .media-filter-scroll { position: relative; }
@@ -142,7 +143,8 @@
   padding-block: 18px;
   scrollbar-gutter: stable;
 }
-.media-filter-group--publication .media-filter-scroll__viewport { height: 190px; }
+.media-filter-group--publication .media-filter-scroll__viewport,
+.media-filter-group:has([data-author-search]) .media-filter-scroll__viewport { height: 190px; }
 .media-filter-scroll__fade {
   position: absolute;
   z-index: 1;
