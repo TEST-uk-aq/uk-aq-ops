@@ -67,9 +67,16 @@ function sleepMs(delayMs) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, duration);
 }
 
-function defaultRetryMatcher(error) {
+export function isRetryableRcloneError(error) {
   const message = error instanceof Error ? error.message : String(error);
-  return /invalid character ['"]<['"] looking for beginning of value/i.test(message);
+  return (
+    /invalid character ['"]<['"] looking for beginning of value/i.test(message)
+    || /path\/(?:not_folder|not_found)(?:\/|\b)/i.test(message)
+  );
+}
+
+function defaultRetryMatcher(error) {
+  return isRetryableRcloneError(error);
 }
 
 export function runRcloneWithRetry(rcloneBin, rcloneArgs, options = {}) {
@@ -130,6 +137,15 @@ export function runRcloneWithRetry(rcloneBin, rcloneArgs, options = {}) {
         } catch {
           // Never fail the retry path because a logger callback throws.
         }
+      } else {
+        const retryMessage = (error instanceof Error ? error.message : String(error))
+          .split(/\r?\n/, 1)[0]
+          .trim();
+        process.stderr.write(
+          `[rclone retry] attempt ${attempt}/${maxAttempts} failed; `
+          + `retrying in ${delayMs}ms: ${rcloneArgs.join(" ")}`
+          + `${retryMessage ? ` (${retryMessage})` : ""}\n`,
+        );
       }
 
       sleepMs(delayMs);
