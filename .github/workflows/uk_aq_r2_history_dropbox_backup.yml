@@ -39,7 +39,7 @@ concurrency:
 jobs:
   backup-r2-history-to-dropbox:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
     env:
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
