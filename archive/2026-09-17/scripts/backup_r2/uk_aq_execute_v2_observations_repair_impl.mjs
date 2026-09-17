@@ -33,9 +33,6 @@ import {
   assertV2ObservationsChildManifest,
   classifyRepairableV2ObservationsConnectorManifest,
 } from "./lib/uk_aq_v2_observations_manifest_validation.mjs";
-import {
-  getObservationHistoryGeneration,
-} from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 
 const SUPPORTED_ACTIONS = new Set([
   "observation_pollutant_manifest_repair",
@@ -645,12 +642,7 @@ export function localDependencySnapshot({ child, proposals, prefix, dayUtc, conn
   };
 }
 
-export function createStagedObjectMap({
-  r2,
-  store,
-  dropboxSourceKeys = [],
-  observationGeneration = getObservationHistoryGeneration("v2"),
-}) {
+export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
   const proposals = new Map();
   // `dropboxSourceKeys` identifies exact source leaves for targeted index
   // repairs. It must not make a valid combined-local leaf invisible to
@@ -661,13 +653,11 @@ export function createStagedObjectMap({
       ? "latest_timeseries_index"
       : "pollutant_timeseries_index";
   const indexDependencies = (key) => {
-    const escapedIndexPrefix = observationGeneration.observations_timeseries_index_prefix
-      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const observation = String(key).match(new RegExp(
-      `^${escapedIndexPrefix}/day_utc=(\\d{4}-\\d{2}-\\d{2})/connector_id=([1-9]\\d*)/pollutant_code=([a-z0-9_]+)/manifest\\.json$`,
-    ));
+    const observation = String(key).match(
+      /^history\/_index_v2\/observations_timeseries\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/,
+    );
     if (observation) {
-      return [`${observationGeneration.observations_prefix}/day_utc=${observation[1]}/connector_id=${observation[2]}/pollutant_code=${observation[3]}/manifest.json`];
+      return [`history/v2/observations/day_utc=${observation[1]}/connector_id=${observation[2]}/pollutant_code=${observation[3]}/manifest.json`];
     }
     const aqi = String(key).match(
       /^history\/_index_v2\/aqilevels_hourly_data_timeseries\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/,
@@ -814,7 +804,7 @@ function stableGeneratedAt({ dayUtc, dayManifest }) {
   return /^\d{4}-\d{2}-\d{2}T/.test(backedUpAt) ? backedUpAt : `${dayUtc}T00:00:00.000Z`;
 }
 
-async function stageSosLightLatestIndex({ staged, config, generation, latestIndexKey, audit }) {
+async function stageSosLightLatestIndex({ staged, config, latestIndexKey, audit }) {
   const existingObject = await staged.stagedR2.adapter.getObject({ key: latestIndexKey });
   const existing = jsonObject(existingObject, latestIndexKey);
   const summaries = new Map((existing.day_summaries || [])
@@ -825,7 +815,7 @@ async function stageSosLightLatestIndex({ staged, config, generation, latestInde
     const dayUtc = String(dayAudit.day_utc);
     const included = new Set(dayAudit.final_assembled_connector_ids || []);
     const entries = await staged.stagedR2.adapter.listAllObjects({
-      prefix: `${generation.observations_timeseries_index_prefix}/day_utc=${dayUtc}/connector_id=`,
+      prefix: `${config.observations_timeseries_index_prefix_v2}/day_utc=${dayUtc}/connector_id=`,
     });
     const connectorMap = new Map([...included].map((connectorId) => [connectorId, {
       connector_id: connectorId,
@@ -893,9 +883,9 @@ async function stageSosLightLatestIndex({ staged, config, generation, latestInde
     bucket: config.r2.bucket,
     generatedAt: existing.generated_at,
     existingGeneratedAt: existing.generated_at,
-    indexPrefix: generation.index_root_prefix,
-    dataPrefix: generation.observations_prefix,
-    timeseriesIndexPrefix: generation.observations_timeseries_index_prefix,
+    indexPrefix: config.index_prefix_v2,
+    dataPrefix: config.observations_prefix_v2,
+    timeseriesIndexPrefix: config.observations_timeseries_index_prefix_v2,
     daySummaries: [...summaries.values()],
   });
   await staged.stage({
@@ -1557,7 +1547,6 @@ export async function runV2ObservationsRepair({
   env = process.env,
   repairPlan = null,
   updateIndexes = updateR2HistoryIndexesTargeted,
-  storageGeneration = "v2",
 } = {}) {
   const startedAtMs = Date.now();
   const reportProgress = ({ phase, completed_objects = 0, total_objects = 0, successful_put_count = 0, successful_readback_verification_count = 0, failures = 0, blocked_count = 0 }) => {
@@ -1615,7 +1604,6 @@ export async function runV2ObservationsRepair({
   }
   reportProgress({ phase: "metadata_planning_start", total_objects: scopes.length });
   const config = resolveR2HistoryIndexConfig(env);
-  const observationGeneration = getObservationHistoryGeneration(storageGeneration);
   if (args.writeR2) {
     throw new Error("metadata executor is proposal-only; use the validated canonical apply executor");
   }
@@ -1629,16 +1617,16 @@ export async function runV2ObservationsRepair({
     throw new Error("Combined local resolver paths are required for metadata repair");
   }
   const dataPrefix = domain === "observations"
-    ? observationGeneration.observations_prefix
+    ? config.observations_prefix_v2
     : config.aqilevels_hourly_data_prefix_v2;
   const indexPrefix = domain === "observations"
-    ? observationGeneration.observations_timeseries_index_prefix
+    ? config.observations_timeseries_index_prefix_v2
     : config.aqilevels_hourly_data_timeseries_index_prefix_v2;
   // Targeted index rebuilds merge the changed days into this global latest
   // summary.  Read exactly that key from the Dropbox baseline; scanning the
   // whole index tree would make the sparse overlay resolver non-deterministic.
   const latestIndexKey = domain === "observations"
-    ? observationGeneration.observations_timeseries_latest_key
+    ? `${config.index_prefix_v2}/observations_timeseries_latest.json`
     : `${config.index_prefix_v2}/aqilevels_hourly_data_timeseries_latest.json`;
   // An explicit index-only action can legitimately target a historical leaf
   // which is absent from the live connector/day hierarchy. Keep that leaf
@@ -1667,7 +1655,6 @@ export async function runV2ObservationsRepair({
     r2: config.r2,
     store: localStore,
     dropboxSourceKeys: additionalIndexPollutantTargets.map((target) => target.manifest_key),
-    observationGeneration,
   });
   const dayPlans = [];
   const blockedScopes = [];
@@ -1906,7 +1893,7 @@ export async function runV2ObservationsRepair({
           results.push(await updateIndexes({
             env,
             r2: staged.stagedR2,
-            historyVersion: storageGeneration,
+            historyVersion: "v2",
             domains: [domain],
             fromDayUtc: dayUtc,
             toDayUtc: dayUtc,
@@ -1921,9 +1908,6 @@ export async function runV2ObservationsRepair({
             additionalPollutantManifestTargets: additionalIndexPollutantTargets.filter((target) =>
               target.day_utc === dayUtc && target.connector_id === connectorId
             ),
-            observationGeneration: domain === "observations"
-              ? observationGeneration
-              : null,
           }));
         }
         index = {
@@ -1966,7 +1950,6 @@ export async function runV2ObservationsRepair({
     await stageSosLightLatestIndex({
       staged,
       config,
-      generation: observationGeneration,
       latestIndexKey,
       audit: sosLightAudit,
     });
