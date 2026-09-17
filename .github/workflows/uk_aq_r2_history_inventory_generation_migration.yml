@@ -1,0 +1,148 @@
+name: UK AQ R2 History Inventory Generation Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Apply the one-off LIVE v2 inventory metadata migration"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Deliberately shares the Dropbox backup concurrency group so the migration
+# cannot overlap the normal history backup.
+concurrency:
+  group: uk-aq-r2-history-dropbox-backup
+  cancel-in-progress: false
+
+jobs:
+  migrate-r2-history-inventory-generation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || '' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      INPUT_APPLY: ${{ inputs.apply }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Validate LIVE v2 configuration
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            CFLARE_R2_ENDPOINT
+            CFLARE_R2_BUCKET
+            CFLARE_R2_ACCESS_KEY_ID
+            CFLARE_R2_SECRET_ACCESS_KEY
+            UKAQ_ENV_NAME
+            UK_AQ_R2_HISTORY_VERSION
+          )
+
+          missing=0
+          for key in "${required_vars[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required value: ${key}" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          if [ "${UKAQ_ENV_NAME}" != "live" ]; then
+            echo "Refusing migration because UKAQ_ENV_NAME is not live: ${UKAQ_ENV_NAME}" >&2
+            exit 1
+          fi
+
+          if [ "${CFLARE_R2_BUCKET}" != "uk-aq-history-live" ]; then
+            echo "Refusing migration because CFLARE_R2_BUCKET is not uk-aq-history-live: ${CFLARE_R2_BUCKET}" >&2
+            exit 1
+          fi
+
+          if [ "${UK_AQ_R2_HISTORY_VERSION}" != "v2" ]; then
+            echo "Refusing migration because UK_AQ_R2_HISTORY_VERSION is not v2: ${UK_AQ_R2_HISTORY_VERSION}" >&2
+            exit 1
+          fi
+
+          if [ "${INPUT_APPLY}" = "true" ] && [ -z "${SUPABASE_DB_URL:-}" ]; then
+            echo "SUPABASE_DB_URL is required when apply=true so the global observations lock can be held" >&2
+            exit 1
+          fi
+
+      - name: Configure LIVE R2 rclone remote
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
+        run: |
+          set -euo pipefail
+          endpoint="${CFLARE_R2_ENDPOINT%/}"
+
+          mkdir -p "$(dirname "${RCLONE_CONFIG}")"
+          {
+            echo "[uk_aq_r2_live]"
+            echo "type = s3"
+            echo "provider = Cloudflare"
+            echo "env_auth = false"
+            echo "access_key_id = ${CFLARE_R2_ACCESS_KEY_ID}"
+            echo "secret_access_key = ${CFLARE_R2_SECRET_ACCESS_KEY}"
+            echo "endpoint = ${endpoint}"
+            echo "region = ${CFLARE_R2_REGION}"
+            echo "acl = private"
+            echo "no_check_bucket = true"
+          } > "${RCLONE_CONFIG}"
+
+          chmod 600 "${RCLONE_CONFIG}"
+          echo "RCLONE_CONFIG=${RCLONE_CONFIG}" >> "$GITHUB_ENV"
+          rclone listremotes
+
+      - name: Plan inventory generation migration
+        run: |
+          set -euo pipefail
+          node scripts/backup_r2/migrate_backup_inventory_generation.mjs \
+            --source-root "uk_aq_r2_live:${CFLARE_R2_BUCKET}" \
+            --observation-generation v2
+
+      - name: Apply inventory generation migration
+        if: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          node scripts/operations/uk_aq_with_observations_global_operation_lock.mjs \
+            --owner r2_history_inventory_generation_migration \
+            --run-id "r2-history-inventory-generation-migration:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}" \
+            -- \
+            node scripts/backup_r2/migrate_backup_inventory_generation.mjs \
+              --source-root "uk_aq_r2_live:${CFLARE_R2_BUCKET}" \
+              --observation-generation v2 \
+              --apply
+
+      - name: Verify inventory generation marker after apply
+        if: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          node scripts/backup_r2/migrate_backup_inventory_generation.mjs \
+            --source-root "uk_aq_r2_live:${CFLARE_R2_BUCKET}" \
+            --observation-generation v2
