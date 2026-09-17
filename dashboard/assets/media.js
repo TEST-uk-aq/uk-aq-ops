@@ -608,28 +608,40 @@
       result.innerHTML = `${data.metadata_error ? message(`Automatic metadata unavailable: ${data.metadata_error}. Supply the missing public fields manually.`) : message("New canonical article. Review metadata before adding.", "success")}
         <form class="media-inline-form" data-add-manual>
           <input type="hidden" name="url" value="${esc(data.canonical_url)}">
-          <label class="media-field media-field--grow"><span>Publisher title</span><input name="title" required maxlength="1000" value="${esc(metadata.title || "")}"></label>
-          <label class="media-field"><span>Publication</span><input name="publisher" required maxlength="200" value="${esc(metadata.publisher || data.source?.name || "")}"></label>
-          <label class="media-field"><span>Author</span><input name="author" maxlength="500" value="${esc(metadata.author || "")}"></label>
-          <label class="media-field"><span>Published UTC</span><input name="published_at" type="datetime-local" value="${esc(formatUtcDateTimeInput(metadata.published_at))}"></label>
+          <div class="media-manual-fields">
+            <label class="media-field media-field--grow"><span>Publisher title</span><input name="title" required maxlength="1000" value="${esc(metadata.title || "")}"></label>
+            <label class="media-field"><span>Publication</span><input name="publisher" required maxlength="200" value="${esc(metadata.publisher || data.source?.name || "")}"></label>
+            <label class="media-field"><span>Author</span><input name="author" maxlength="500" value="${esc(metadata.author || "")}"></label>
+            <label class="media-field"><span>Published UTC</span><input name="published_at" type="datetime-local" value="${esc(formatUtcDateTimeInput(metadata.published_at))}"></label>
+          </div>
           <input type="hidden" name="preview_image_url" value="${esc(metadata.image_url || "")}">
-          <button class="media-button media-button--primary">Add approved</button>
-        </form><p class="media-subtext">Creation records status Approved and approval method Manual. ${data.source?.will_create_disabled_definition ? "A conservative disabled publisher definition will also be created." : ""}</p>`;
-      result.querySelector("[data-add-manual]")?.addEventListener("submit", event => { event.preventDefault(); void addManualArticle(event.currentTarget, result); });
+          <div class="media-actions media-manual-actions">
+            <button class="media-button" data-initial-status="pending">Add Pending</button>
+            <button class="media-button media-button--primary" data-initial-status="approved">Add Approved</button>
+          </div>
+        </form><p class="media-subtext">Pending creates the article without approval; Approved creates it with Manual approval provenance. ${data.source?.will_create_disabled_definition ? "A conservative disabled publisher definition will also be created." : ""}</p>`;
+      result.querySelector("[data-add-manual]")?.addEventListener("submit", event => {
+        event.preventDefault();
+        void addManualArticle(event.currentTarget, result, event.submitter?.dataset.initialStatus);
+      });
     } catch (error) { result.innerHTML = message(error.message, "error"); }
   }
 
-  async function addManualArticle(form, result) {
+  async function addManualArticle(form, result, initialStatus) {
     const values = new FormData(form);
     const published = String(values.get("published_at") || "");
+    const status = initialStatus === "approved" ? "approved" : "pending";
     try {
       const data = await request("articles", { method: "POST", idempotent: "add", body: {
         url: values.get("url"), title: values.get("title"), publisher: values.get("publisher"),
         author: String(values.get("author") || "").trim() || null,
         published_at: published ? new Date(`${published}Z`).toISOString() : null,
         preview_image_url: String(values.get("preview_image_url") || "").trim() || null,
+        initial_status: status,
       } });
-      result.innerHTML = message("Article added and approved with manual provenance.", "success");
+      result.innerHTML = message(status === "approved"
+        ? "Article added and approved with manual provenance."
+        : "Article added as Pending.", "success");
       await renderArticles(false); await openArticle(data.article.id);
     } catch (error) { result.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
   }
