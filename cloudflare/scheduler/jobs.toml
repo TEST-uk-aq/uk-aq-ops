@@ -74,7 +74,7 @@ publish_json = "configured"
 write_parquet = "configured"
 
 [jobs.uk_aq_r2_history_dropbox_backup]
-enabled = true
+enabled = false
 cron_expr = "35 4 * * *"
 target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-ops"
