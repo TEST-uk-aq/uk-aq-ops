@@ -19,7 +19,6 @@ import {
   assertSelectedBackupInventory,
   buildObservationMonthInventoryShard,
   buildObservationRunManifestInventoryShard,
-  buildScopedRootsInventoryShard,
   observationMonthInventoryShardKey,
   resolveObservationsTimeseriesLatestPath,
   sha256Hex,
@@ -374,21 +373,6 @@ async function main() {
     && previousLatestTimeseries.byte_size === latestTimeseriesIdentity.byte_size
     ? previousLatestTimeseries
     : latestTimeseriesIdentity;
-  let scopedRootsInventory = null;
-  let scopedRootsWrite = null;
-  if (args.history_index_version === "v3") {
-    scopedRootsInventory = buildScopedRootsInventoryShard({ latestKey: args.latest_timeseries_key, latestSha256: latestTimeseriesIdentity.sha256, latest: latestTimeseriesSource.parsed });
-    for (const root of scopedRootsInventory.roots) {
-      const source = rcloneCat(args.rclone_bin, joinTargetPath(args.source_root, root.key));
-      const size = Buffer.byteLength(source, "utf8");
-      const hash = sha256Hex(source);
-      if (size !== root.byte_size) throw new Error(`V3 scoped root byte-size mismatch: ${root.key}`);
-      if (hash !== root.sha256) throw new Error(`V3 scoped root SHA-256 mismatch: ${root.key}`);
-    }
-    const shardKey = `${args.inventory_root_prefix}/global/observations_timeseries_scoped_roots.json`;
-    scopedRootsWrite = writeRemoteJson(args.rclone_bin, args.source_root, shardKey, scopedRootsInventory, args.dry_run);
-    scopedRootsInventory = { inventory_shard_key: shardKey, content_hash: scopedRootsWrite.hash, global_latest_sha256: scopedRootsInventory.global_latest_sha256, root_count: scopedRootsInventory.root_count };
-  }
 
   const sourceRoot = validateAggregate(
     readJson(args.rclone_bin, args.source_root, observationsRootKey).parsed,
@@ -599,7 +583,6 @@ async function main() {
     runManifestInventoryShardHash: runWrite.hash,
     runManifestUnitCount: runScan.units.length,
     latestTimeseries,
-    scopedRootsInventory,
   });
   root.timeseries_binding = bindingInventory.root_reference;
   if (bindingPackInventory) {
@@ -667,7 +650,6 @@ async function main() {
       byte_size: latestTimeseries.byte_size,
       inventory_identity_reused: latestTimeseries === previousLatestTimeseries,
     },
-    scoped_roots: scopedRootsInventory ? { ...scopedRootsInventory, changed: scopedRootsWrite.changed, written: scopedRootsWrite.written } : null,
   };
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));

@@ -16,7 +16,6 @@ import {
 } from "./lib/rclone.mjs";
 import {
   buildObservationRunManifestStateShard,
-  processScopedRootsCheckpoint,
   completeObservationMonthState,
   emptyHierarchicalStateRoot,
   markLatestTimeseriesProcessed,
@@ -41,8 +40,6 @@ import {
   validateObservationMonthState,
   validateObservationRunManifestInventoryShard,
   validateObservationRunManifestStateShard,
-  validateScopedRootsInventoryShard,
-  validateScopedRootsStateShard,
 } from "./lib/hierarchical_backup_v2.mjs";
 import {
   syncTimeseriesBindingsToDropbox,
@@ -765,14 +762,6 @@ async function main() {
       + `actual=${actualRunManifestShardHash}`,
     );
   }
-  let scopedRootsInventoryShard = null;
-  const scopedPointer = inventoryRoot.global_units.observations_timeseries_scoped_roots;
-  if (generation.version === "v3") {
-    if (!scopedPointer) throw new Error("V3 inventory is missing scoped-root dependency evidence");
-    const scopedRaw = readJsonRequired(args.rclone_bin, args.source_root, scopedPointer.inventory_shard_key);
-    scopedRootsInventoryShard = validateScopedRootsInventoryShard(scopedRaw.parsed);
-    if (sha256Hex(stableJson(scopedRootsInventoryShard)) !== scopedPointer.content_hash || scopedRootsInventoryShard.global_latest_sha256 !== inventoryRoot.global_units.observations_timeseries_latest.sha256) throw new Error("V3 scoped-root inventory pointer mismatch");
-  }
 
   const existingStateResult = readJsonMaybe(
     args.rclone_bin,
@@ -847,7 +836,6 @@ async function main() {
       incomplete: true,
       error: null,
     },
-    scoped_roots: scopedRootsInventoryShard ? { required: scopedRootsInventoryShard.root_count, verified: 0, copied: 0, reused: 0, complete: false } : null,
     prune: {
       enabled: args.prune_stale_parquet,
       force_recheck: args.force_prune_recheck,
@@ -1388,38 +1376,6 @@ async function main() {
     verified: processedLatestState.verified,
   };
 
-  if (scopedRootsInventoryShard && !args.dry_run) {
-    const statePointer = stateRoot.global_units.observations_timeseries_scoped_roots;
-    const previousRaw = readJsonMaybe(args.rclone_bin, args.dest_root, statePointer.state_shard_key, DROPBOX_READ_RETRY);
-    let previous = null;
-    if (previousRaw) {
-      try { previous = validateScopedRootsStateShard(previousRaw.parsed); } catch { previous = null; }
-    }
-    let lastWrite = null;
-    const processed = await processScopedRootsCheckpoint({
-      inventory: scopedRootsInventoryShard,
-      priorState: previous,
-      checkpointBatchUnits: args.checkpoint_batch_units,
-      checkpointFlushSeconds: args.checkpoint_flush_seconds,
-      inspectDestination: async (root) => readRemoteFileIdentity(args.rclone_bin, args.dest_root, root.key),
-      copyAndVerify: async (root) => {
-        const copied = copyAndVerifyJsonFile({ rcloneBin: args.rclone_bin, sourceRoot: args.source_root, destRoot: args.dest_root, relativePath: root.key, dryRun: false });
-        if (!copied.verified || copied.source_hash !== root.sha256 || copied.source_size !== root.byte_size) throw new Error(`V3 scoped-root source/copy identity mismatch: ${root.key}`);
-        report.scoped_roots.copied += 1;
-      },
-      flushState: async (state) => { lastWrite = uploadJson({ rcloneBin: args.rclone_bin, root: args.dest_root, relativePath: statePointer.state_shard_key, payload: state, dryRun: false }); },
-    });
-    const complete = processed.state;
-    const write = lastWrite;
-    stateRoot.global_units.observations_timeseries_scoped_roots = { state_shard_key: statePointer.state_shard_key, processed_global_latest_sha256: complete.global_latest_sha256, state_shard_hash: write.hash, complete: complete.complete };
-    report.scoped_roots.verified = complete.roots.filter((root) => root.destination_verified).length;
-    report.scoped_roots.reused = report.scoped_roots.verified - report.scoped_roots.copied;
-    report.scoped_roots.checkpoint_flush_count = processed.flush_count;
-    report.scoped_roots.prior_state_compatible = processed.prior_compatible;
-    report.scoped_roots.complete = complete.complete;
-    stateRootDirty = true;
-  }
-
   if (!args.dry_run && allYearsComplete(stateRoot, inventoryRoot)) {
     copyAndVerifyJsonFile({
       rcloneBin: args.rclone_bin,
@@ -1453,36 +1409,22 @@ async function main() {
   report.observations.processed_source_root_hash =
     stateRoot.observations.processed_source_root_hash;
   report.completed_at = new Date().toISOString();
-  report.complete = backupReportIsComplete(report, generation.version);
-  report.ok = backupReportIsOk(report);
-  writeReport(args.report_out, report);
-  console.log(JSON.stringify(report, null, 2));
-  process.exitCode = backupReportExitCode(report, {
-    dryRun: args.dry_run,
-    maxDaysPerRun: args.max_days_per_run,
-  });
-}
-
-export function backupReportIsComplete(report, generationVersion) {
-  return report.observations.incomplete_months.length === 0
+  report.complete = report.observations.incomplete_months.length === 0
     && report.observations.incomplete_years.length === 0
     && report.timeseries_binding.incomplete_ranges.length === 0
     && report.timeseries_binding_packs.complete
     && report.core.complete
     && report.run_manifests.complete
-    && !report.latest_timeseries.incomplete
-    && (generationVersion !== "v3" || report.scoped_roots?.complete === true);
-}
-
-export function backupReportIsOk(report) {
-  return report.prune.forced_failed_days === 0
+    && !report.latest_timeseries.incomplete;
+  report.ok = report.prune.forced_failed_days === 0
     && report.latest_timeseries.error === null;
-}
-
-export function backupReportExitCode(report, { dryRun, maxDaysPerRun }) {
-  if (!report.ok) return 1;
-  if (!report.complete && !dryRun && maxDaysPerRun === 0) return 1;
-  return 0;
+  writeReport(args.report_out, report);
+  console.log(JSON.stringify(report, null, 2));
+  if (!report.ok) {
+    process.exitCode = 1;
+  } else if (!report.complete && !args.dry_run && args.max_days_per_run === 0) {
+    process.exitCode = 1;
+  }
 }
 
 function isMainModule(moduleUrl) {
