@@ -31,6 +31,16 @@ import {
 import {
   validateIntegrityCoreSnapshotIdentity,
 } from "./lib/uk_aq_integrity_core_snapshot_identity.mjs";
+import {
+  buildR2HistoryV2ObservationsMonthManifest,
+  buildR2HistoryV2ObservationsMonthManifestKey,
+  buildR2HistoryV2ObservationsRootManifest,
+  buildR2HistoryV2ObservationsRootManifestKey,
+  buildR2HistoryV2ObservationsYearManifest,
+  buildR2HistoryV2ObservationsYearManifestKey,
+  serializeR2HistoryV2ObservationsAggregateManifest,
+  validateR2HistoryV2ObservationsAggregateManifest,
+} from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 
 const GENERATION = getObservationHistoryGeneration("v3");
 const FULL_LOWER_GIT_SHA = /^[0-9a-f]{40}$/;
@@ -114,6 +124,149 @@ function artifactFromStoredObject(object, kind, stage) {
   };
 }
 
+function parsePinnedJson(object, key) {
+  try {
+    return JSON.parse(Buffer.from(object.body).toString("utf8"));
+  } catch (error) {
+    throw new Error(`Pinned Dropbox JSON is invalid: ${key} (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
+function pinnedAggregate(store, key, level, identity = {}) {
+  const object = store.getObjectFromSourceIfExists(key, "dropbox");
+  if (!object) throw new Error(`Pinned Dropbox aggregate baseline is unavailable: ${key}`);
+  const canonical = validateR2HistoryV2ObservationsAggregateManifest(
+    parsePinnedJson(object, key), { basePrefix: GENERATION.observations_prefix },
+  );
+  const canonicalBody = serializeR2HistoryV2ObservationsAggregateManifest(canonical, {
+    basePrefix: GENERATION.observations_prefix,
+  });
+  if (Buffer.compare(Buffer.from(object.body), canonicalBody) !== 0) {
+    throw new Error(`Pinned Dropbox aggregate baseline is not canonical: ${key}`);
+  }
+  if (level === "month" && (canonical.year !== Number(identity.year) || canonical.month !== identity.month)) {
+    throw new Error(`Pinned Dropbox month aggregate identity contradicts key: ${key}`);
+  }
+  if (level === "year" && canonical.year !== Number(identity.year)) {
+    throw new Error(`Pinned Dropbox year aggregate identity contradicts key: ${key}`);
+  }
+  return { object, canonical };
+}
+
+function dayReferenceFromObject(object, key) {
+  const payload = parsePinnedJson(object, key);
+  const dayUtc = key.match(/\/day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/)?.[1];
+  const manifestHash = String(payload?.manifest_hash || "").toLowerCase();
+  if (!dayUtc || payload?.day_utc !== dayUtc || payload?.manifest_key !== key
+    || !/^[a-f0-9]{64}$/.test(manifestHash)) {
+    throw new Error(`Pinned Dropbox day manifest is incomplete or contradictory: ${key}`);
+  }
+  return { day_utc: dayUtc, manifest_key: key, manifest_hash: manifestHash };
+}
+
+// This deliberately uses only explicit Dropbox aggregate references.  The
+// live-R2 finaliser lists targets, whereas this local planner must fail closed
+// rather than discover membership from R2 at apply time.
+function addObservationsAggregateHierarchy({ output, env, repairPlan }) {
+  const proposals = output.planning.proposals || [];
+  const proposalsByKey = new Map(proposals.map((proposal) => [proposal.key, proposal]));
+  const days = [...new Set((repairPlan.repair_plan || []).map((entry) => String(entry?.day_utc || ""))
+    .filter((day) => /^\d{4}-\d{2}-\d{2}$/.test(day)))].sort();
+  if (!days.length) throw new Error("Fixed-v3 aggregate proposal has no affected days");
+  const store = createCombinedLocalStore({
+    overlayRoot: env.UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT,
+    dropboxRoot: env.UK_AQ_R2_HISTORY_DROPBOX_ROOT,
+    runStateJson: env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON,
+    prefixes: [`${GENERATION.observations_prefix}/_manifests`],
+    exactKeys: [buildR2HistoryV2ObservationsRootManifestKey(GENERATION.observations_prefix)],
+    dynamicExactKeyPrefixes: [`${GENERATION.observations_prefix}/day_utc=`],
+  });
+  const rootKey = buildR2HistoryV2ObservationsRootManifestKey(GENERATION.observations_prefix);
+  const root = pinnedAggregate(store, rootKey, "root");
+  const stage = ({ key, kind, body, dependencies, dayUtc = null }) => {
+    const baseline = store.getObjectFromSourceIfExists(key, "dropbox");
+    const bytes = body.byteLength;
+    const newSha256 = sha256Hex(body);
+    if (baseline && sha256Hex(baseline.body) === newSha256) return null;
+    const identities = Object.fromEntries(dependencies.map((dependencyKey) => {
+      const proposed = proposalsByKey.get(dependencyKey);
+      if (proposed?.changed === true) return [dependencyKey, {
+        sha256: proposed.new_sha256, bytes: proposed.bytes, source: "planned_overlay",
+      }];
+      const baselineDependency = store.getObjectFromSourceIfExists(dependencyKey, "dropbox");
+      if (!baselineDependency) throw new Error(`Pinned Dropbox aggregate child is unavailable: ${dependencyKey}`);
+      return [dependencyKey, { sha256: sha256Hex(baselineDependency.body), bytes: baselineDependency.bytes, source: "dropbox" }];
+    }));
+    const proposal = {
+      key, kind, publication_stage: kind, day_utc: dayUtc,
+      proposed_body: body.toString("utf8"), bytes, old_sha256: baseline ? sha256Hex(baseline.body) : null,
+      new_sha256: newSha256, changed: true, included_in_write_set: true, status: "planned",
+      dependencies: [...dependencies].sort(), dependency_identities: identities,
+      provenance: "pinned_dropbox_observations_aggregate_overlay",
+    };
+    proposalsByKey.set(key, proposal);
+    proposals.push(proposal);
+    return proposal;
+  };
+  const affectedMonths = new Map();
+  for (const day of days) {
+    const year = Number(day.slice(0, 4)); const month = day.slice(5, 7);
+    const monthKey = buildR2HistoryV2ObservationsMonthManifestKey(GENERATION.observations_prefix, year, month);
+    if (!affectedMonths.has(monthKey)) affectedMonths.set(monthKey, { year, month, days: new Set() });
+    affectedMonths.get(monthKey).days.add(day);
+  }
+  const changedMonths = new Map();
+  for (const [monthKey, scope] of affectedMonths) {
+    const baseline = pinnedAggregate(store, monthKey, "month", scope).canonical;
+    const references = new Map(baseline.children.map((entry) => [entry.day_utc, entry]));
+    for (const day of scope.days) {
+      const key = `${GENERATION.observations_prefix}/day_utc=${day}/manifest.json`;
+      const proposal = proposalsByKey.get(key);
+      const object = proposal?.changed === true
+        ? { body: Buffer.from(proposal.proposed_body, "utf8") }
+        : store.getObjectFromSourceIfExists(key, "dropbox");
+      if (!object) throw new Error(`Final day manifest is unavailable for aggregate rebuild: ${key}`);
+      references.set(day, dayReferenceFromObject(object, key));
+    }
+    // Authenticate every preserved sibling day reference from its pinned body.
+    for (const reference of references.values()) {
+      if (scope.days.has(reference.day_utc)) continue;
+      const object = store.getObjectFromSourceIfExists(reference.manifest_key, "dropbox");
+      const actual = object && dayReferenceFromObject(object, reference.manifest_key);
+      if (!actual || actual.manifest_hash !== reference.manifest_hash) throw new Error(`Pinned Dropbox month child contradicts aggregate: ${reference.manifest_key}`);
+    }
+    const manifest = buildR2HistoryV2ObservationsMonthManifest({ basePrefix: GENERATION.observations_prefix, year: scope.year, month: scope.month, dayManifests: [...references.values()] });
+    const body = serializeR2HistoryV2ObservationsAggregateManifest(manifest, { basePrefix: GENERATION.observations_prefix });
+    stage({ key: monthKey, kind: "observation_month_manifest", body, dependencies: [...references.values()].map((entry) => entry.manifest_key), dayUtc: null });
+    changedMonths.set(monthKey, { ...scope, key: monthKey, manifest });
+  }
+  const changedYears = new Map();
+  for (const year of [...new Set([...changedMonths.values()].map((entry) => entry.year))]) {
+    const yearKey = buildR2HistoryV2ObservationsYearManifestKey(GENERATION.observations_prefix, year);
+    const baseline = pinnedAggregate(store, yearKey, "year", { year }).canonical;
+    const months = new Map(baseline.children.map((entry) => [entry.month, entry]));
+    for (const changed of changedMonths.values()) if (changed.year === year) months.set(changed.month, {
+      year, month: changed.month, manifest_key: changed.key, content_hash: changed.manifest.content_hash,
+    });
+    const manifest = buildR2HistoryV2ObservationsYearManifest({ basePrefix: GENERATION.observations_prefix, year, monthManifests: [...months.values()] });
+    const body = serializeR2HistoryV2ObservationsAggregateManifest(manifest, { basePrefix: GENERATION.observations_prefix });
+    stage({ key: yearKey, kind: "observation_year_manifest", body, dependencies: [...months.values()].map((entry) => entry.manifest_key) });
+    changedYears.set(yearKey, { year, key: yearKey, manifest });
+  }
+  const years = new Map(root.canonical.children.map((entry) => [entry.year, entry]));
+  for (const changed of changedYears.values()) years.set(changed.year, {
+    year: changed.year, manifest_key: changed.key, content_hash: changed.manifest.content_hash,
+  });
+  const rootManifest = buildR2HistoryV2ObservationsRootManifest({ basePrefix: GENERATION.observations_prefix, yearManifests: [...years.values()] });
+  const rootBody = serializeR2HistoryV2ObservationsAggregateManifest(rootManifest, { basePrefix: GENERATION.observations_prefix });
+  stage({ key: rootKey, kind: "observation_root_manifest", body: rootBody, dependencies: [...years.values()].map((entry) => entry.manifest_key) });
+  output.planning.observations_aggregate_hierarchy = {
+    authority: "pinned_dropbox_baseline_plus_current_run_overlay", affected_month_count: affectedMonths.size,
+    affected_year_count: changedYears.size, root_key: rootKey, root_content_hash: rootManifest.content_hash,
+  };
+  return rootKey;
+}
+
 function scopedRootIdentity(value) {
   return `${value?.day_utc}\u0000${value?.connector_id}\u0000${value?.pollutant_code}`;
 }
@@ -193,7 +346,7 @@ export function assertFixedV3Proposal(output) {
   return output;
 }
 
-async function addExactV3Indexes({ output, runState, env, repairPlan, targetWriterGitSha }) {
+async function addExactV3Indexes({ output, runState, env, repairPlan, targetWriterGitSha, observationsRootKey }) {
   const proposals = (output.planning.proposals || [])
     .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`));
   const proposalsByKey = new Map(proposals.map((proposal) => [String(proposal.key), proposal]));
@@ -208,7 +361,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     dropboxRoot: env.UK_AQ_R2_HISTORY_DROPBOX_ROOT,
     runStateJson: env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON,
     prefixes,
-    exactKeys: [GENERATION.observations_timeseries_latest_key],
+    exactKeys: [GENERATION.observations_timeseries_latest_key, observationsRootKey].filter(Boolean),
   });
   const combinedObject = (key) => proposalsByKey.has(key)
     ? proposalObject(proposalsByKey.get(key))
@@ -283,6 +436,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     prefixes,
     exactKeys: [
       GENERATION.observations_timeseries_latest_key,
+      observationsRootKey,
       ...retainedRoots.map(({ key }) => key),
     ],
   });
@@ -349,6 +503,8 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     const dependencies = [...new Set([
       ...entry.dependencies.map(({ key }) => key),
       ...entry.publication_prerequisites.map(({ key }) => key),
+      ...(entry.key === GENERATION.observations_timeseries_latest_key && observationsRootKey
+        ? [observationsRootKey] : []),
     ])].sort();
     const existing = store.getObjectIfExists(entry.key);
     proposals.push({
@@ -394,8 +550,9 @@ export async function planSosLightV3ObservationMetadata(options = {}) {
   });
   output.planning.core_snapshot_identity_validation = coreAudit;
   if (output.ok === true) {
+    const observationsRootKey = addObservationsAggregateHierarchy({ output, env, repairPlan });
     await addExactV3Indexes({
-      output, runState, env, repairPlan, targetWriterGitSha,
+      output, runState, env, repairPlan, targetWriterGitSha, observationsRootKey,
     });
     assertFixedV3Proposal(output);
     validateFinalPlannerProposalGraph(output, { runState });

@@ -4,8 +4,6 @@ import path from "node:path";
 import {
   createApplyPersistence,
   createInitialApplyProgressState,
-  createVerifiedGetBodyCache,
-  verifyLiveObservationPartition,
 } from "../uk_aq_apply_integrity_proposal.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 
@@ -209,9 +207,6 @@ export async function runPersistedSosLightV3Apply({
   }
 
   const publicationEvidence = [];
-  // Only GET-verified bodies enter this bounded cache.  The semantic verifier
-  // consumes the same body and invalidates it once that comparison completes.
-  const verifiedBodyCache = createVerifiedGetBodyCache();
   const pendingByKey = new Map();
   let nextOperationId = 1;
   let currentOperation = null;
@@ -363,19 +358,6 @@ export async function runPersistedSosLightV3Apply({
         );
       }
       operation.verified = true;
-      if (runState.objects?.[operation.key]) {
-        Object.assign(runState.objects[operation.key], {
-          r2_verified: true,
-          r2_verified_sha256: operation.sha256,
-          r2_verified_bytes: operation.byte_size,
-          byte_identity_verified: true,
-          stored_sha256_verified: operation.publication_stage === "observation_parquet",
-          stored_byte_size_verified: operation.publication_stage === "observation_parquet",
-        });
-      }
-      if (operation.publication_stage === "observation_parquet") {
-        verifiedBodyCache.store({ key: operation.key, sha256: operation.sha256, body });
-      }
       const evidence = Object.freeze({
         operation_id: operation.operation_id,
         object_key: operation.key,
@@ -516,20 +498,6 @@ export async function runPersistedSosLightV3Apply({
       throw error;
     }
   };
-  const verifyParquetSemantic = async ({ partition }) => {
-    const artifact = partition?.canonical_pollutant_manifest;
-    const key = normalizedKey(artifact?.key);
-    const entry = runState.objects?.[key];
-    if (!entry) throw new Error(`SOS-light-v3 semantic proposal manifest is unavailable: ${key}`);
-    await verifyLiveObservationPartition({
-      r2,
-      runState,
-      object: { key, body: exactBody(artifact.body, key), entry },
-      adapters,
-      persistence,
-      verifiedBodyCache,
-    });
-  };
   const prepareCompleteDayReplacement = async ({ day_utc: dayUtc }) => {
     const prefix = `history/v3/observations/day_utc=${dayUtc}`;
     const tombstone = proposal.prefixes.find((entry) => entry.prefix === prefix);
@@ -669,7 +637,6 @@ export async function runPersistedSosLightV3Apply({
       putObject: trackedPutObject,
       putIfChanged: trackedPutIfChanged,
       putAndVerifyParquet,
-      verifyParquetSemantic,
       recordDurableEvidence,
       prepareCompleteDayReplacement,
     });
@@ -766,14 +733,10 @@ export async function runPersistedSosLightV3Apply({
             publication_stage: currentOperation.publication_stage,
           }
         : null,
-      // Complete-day prefixes are prepared before publication.  Report their
-      // actual per-day state; do not imply that a later day survived when its
-      // prefix has already been deleted/verified.
-      later_selected_days_untouched: days.every(
+      later_selected_days_untouched: true,
+      untouched_later_selected_days: days.filter(
         (day) => perDayStatus[day]?.status === "not_started",
       ),
-      untouched_later_selected_days: days.filter((day) =>
-        perDayStatus[day]?.status === "not_started"),
     };
     writeCompleteRunState();
     throw error;

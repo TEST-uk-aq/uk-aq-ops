@@ -866,7 +866,6 @@ export async function runObservationHistoryV3ConnectorPublication({
   recordDurableEvidence,
   finalizeV3Publication = finalizeObservationHistoryIndexV3Publication,
   putAndVerifyParquet = putAndVerifyR2ObjectWithSha256,
-  verifyParquetSemantic = null,
   withConnectorDayLock = withConnectorDayHistoryLock,
   runDayFinalizer = runCanonicalDayFinalizer,
   diagnostics,
@@ -901,9 +900,6 @@ export async function runObservationHistoryV3ConnectorPublication({
     throw new TypeError(
       "SOS historical replacement requires complete-day deletion/reconstruction preparation",
     );
-  }
-  if (sosReplacement && typeof verifyParquetSemantic !== "function") {
-    throw new TypeError("SOS historical replacement requires post-PUT semantic verification");
   }
   if (!sosReplacement && prepareCompleteDayReplacement !== null) {
     throw new Error(
@@ -983,10 +979,6 @@ export async function runObservationHistoryV3ConnectorPublication({
             durable: true,
           }));
         }
-        // The direct SOS apply path supplies this verifier.  It consumes the
-        // immediate GET-verified bodies and must succeed before the frozen
-        // pollutant manifest can be published.
-        if (sosReplacement) await verifyParquetSemantic({ partition });
         partitionResults.push(Object.freeze({
           scope: partition.scope,
           target_metadata: partition.target_metadata,

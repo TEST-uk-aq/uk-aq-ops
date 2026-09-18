@@ -33,6 +33,29 @@ import {
 } from "./lib/uk_aq_integrity_core_snapshot_identity.mjs";
 
 const GENERATION = getObservationHistoryGeneration("v3");
+const FULL_LOWER_GIT_SHA = /^[0-9a-f]{40}$/;
+
+export function resolveIntegrityTargetWriterGitSha(env) {
+  const value = String(env?.UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA || "").trim();
+  if (!FULL_LOWER_GIT_SHA.test(value)) {
+    throw new Error(
+      "UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA must be a full lower-case Git SHA",
+    );
+  }
+  return value;
+}
+
+export function assertCurrentRunManifestWriterGitSha(manifest, targetWriterGitSha, key) {
+  const staged = manifest?.writer_git_sha;
+  if (!FULL_LOWER_GIT_SHA.test(String(staged ?? ""))) {
+    throw new Error(`Fixed-v3 staged manifest writer_git_sha is invalid: ${key}`);
+  }
+  if (staged !== targetWriterGitSha) {
+    throw new Error(`Fixed-v3 staged manifest writer_git_sha contradicts pinned run: ${key}`);
+  }
+  return targetWriterGitSha;
+}
+
 const POLLUTANT_MANIFEST = new RegExp(
   `^${GENERATION.observations_prefix}/day_utc=(\\d{4}-\\d{2}-\\d{2})/` +
   "connector_id=([1-9]\\d*)/pollutant_code=([a-z0-9_]+)/manifest\\.json$",
@@ -91,6 +114,62 @@ function artifactFromStoredObject(object, kind, stage) {
   };
 }
 
+function scopedRootIdentity(value) {
+  return `${value?.day_utc}\u0000${value?.connector_id}\u0000${value?.pollutant_code}`;
+}
+
+function expectedScopedRootKey(root) {
+  return `${GENERATION.observations_timeseries_index_prefix}/day_utc=${root.day_utc}` +
+    `/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}/manifest.json`;
+}
+
+export function retainedExactV3ScopedRoots(existingLatest, replacementScopedManifests) {
+  const roots = (Array.isArray(existingLatest?.payload?.day_summaries)
+    ? existingLatest.payload.day_summaries : []).flatMap((summary) =>
+    Array.isArray(summary?.scoped_roots) ? summary.scoped_roots : []);
+  const byScope = new Map();
+  for (const root of roots) {
+    const identity = scopedRootIdentity(root);
+    if (byScope.has(identity)) {
+      throw new Error(`Pinned v3 latest has duplicate scoped root: ${root?.key || identity}`);
+    }
+    if (root?.key !== expectedScopedRootKey(root)) {
+      throw new Error(`Pinned v3 latest scoped root key contradicts scope: ${root?.key || identity}`);
+    }
+    byScope.set(identity, root);
+  }
+  const replaced = new Set(replacementScopedManifests.map(({ payload }) =>
+    scopedRootIdentity(payload)));
+  return [...byScope.entries()]
+    .filter(([identity]) => !replaced.has(identity))
+    .map(([, root]) => root);
+}
+
+export function verifyRetainedExactV3ScopedRoots(roots, store) {
+  for (const root of roots) {
+    const object = store.getObjectFromSourceIfExists(root.key, "dropbox");
+    if (!object) throw new Error(`Fixed-v3 external dependency is unavailable: ${root.key}`);
+    const identity = exactIdentity(object, object.source);
+    if (identity.bytes !== Number(root.byte_size)) {
+      throw new Error(`Fixed-v3 external dependency byte size disagrees: ${root.key}`);
+    }
+    if (identity.sha256 !== String(root.sha256)) {
+      throw new Error(`Fixed-v3 external dependency SHA-256 disagrees: ${root.key}`);
+    }
+    let payload;
+    try {
+      payload = JSON.parse(Buffer.from(object.body).toString("utf8"));
+    } catch {
+      throw new Error(`Fixed-v3 external dependency payload is invalid: ${root.key}`);
+    }
+    if (scopedRootIdentity(payload) !== scopedRootIdentity(root)
+      || expectedScopedRootKey(payload) !== root.key) {
+      throw new Error(`Fixed-v3 external dependency scope disagrees: ${root.key}`);
+    }
+  }
+  return roots;
+}
+
 function assertAllowedKey(key) {
   if (key.startsWith(`${GENERATION.observations_prefix}/`)) {
     return assertObservationHistoryGenerationKey(GENERATION, key, "observations");
@@ -114,7 +193,7 @@ export function assertFixedV3Proposal(output) {
   return output;
 }
 
-async function addExactV3Indexes({ output, runState, env, repairPlan }) {
+async function addExactV3Indexes({ output, runState, env, repairPlan, targetWriterGitSha }) {
   const proposals = (output.planning.proposals || [])
     .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`));
   const proposalsByKey = new Map(proposals.map((proposal) => [String(proposal.key), proposal]));
@@ -124,7 +203,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan }) {
     `${GENERATION.observations_prefix}/day_utc=${day}`,
     `${GENERATION.observations_timeseries_index_prefix}/day_utc=${day}`,
   ]);
-  const store = createCombinedLocalStore({
+  let store = createCombinedLocalStore({
     overlayRoot: env.UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT,
     dropboxRoot: env.UK_AQ_R2_HISTORY_DROPBOX_ROOT,
     runStateJson: env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON,
@@ -147,6 +226,11 @@ async function addExactV3Indexes({ output, runState, env, repairPlan }) {
     const manifestObject = combinedObject(manifestKey);
     if (!manifestObject) throw new Error(`Fixed-v3 pollutant manifest is unavailable: ${manifestKey}`);
     const manifest = JSON.parse(Buffer.from(manifestObject.body).toString("utf8"));
+    const currentRunManifest = proposalsByKey.has(manifestKey) ||
+      (runState.objects?.[manifestKey]?.proposed === true && manifestObject.source === "overlay");
+    const writerGitSha = currentRunManifest
+      ? assertCurrentRunManifestWriterGitSha(manifest, targetWriterGitSha, manifestKey)
+      : manifest.writer_git_sha;
     const rows = [];
     for (const parquetKey of (manifest.parquet_object_keys || []).map(String)) {
       assertObservationHistoryGenerationKey(GENERATION, parquetKey, "observations");
@@ -158,7 +242,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan }) {
       source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
       rows,
       scope: { day_utc: match[1], connector_id: Number(match[2]), pollutant_code: match[3] },
-      targetWriterGitSha: manifest.writer_git_sha,
+      targetWriterGitSha: writerGitSha,
       backedUpAtUtc: manifest.backed_up_at_utc ?? null,
       observationsPrefix: GENERATION.observations_prefix,
       indexRoot: GENERATION.observations_timeseries_index_prefix,
@@ -189,6 +273,21 @@ async function addExactV3Indexes({ output, runState, env, repairPlan }) {
   const existingLatest = artifactFromStoredObject(
     existingLatestObject, "observation_history_index_v3_latest_global", "latest_global",
   );
+  const retainedRoots = retainedExactV3ScopedRoots(
+    existingLatest, hierarchies.map((hierarchy) => hierarchy.scoped_manifest),
+  );
+  store = createCombinedLocalStore({
+    overlayRoot: env.UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT,
+    dropboxRoot: env.UK_AQ_R2_HISTORY_DROPBOX_ROOT,
+    runStateJson: env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON,
+    prefixes,
+    exactKeys: [
+      GENERATION.observations_timeseries_latest_key,
+      ...retainedRoots.map(({ key }) => key),
+    ],
+  });
+  verifyRetainedExactV3ScopedRoots(retainedRoots, store);
+  const retainedRootsByKey = new Map(retainedRoots.map((root) => [root.key, root]));
   const exactObjects = hierarchies.flatMap((hierarchy) => hierarchy.publication_objects);
   const latest = updateObservationHistoryExactLeafIndexV3Latest({
     existingLatest,
@@ -236,6 +335,10 @@ async function addExactV3Indexes({ output, runState, env, repairPlan }) {
       && staged?.changed !== false && staged?.included_in_write_set !== false) {
       return { sha256: staged.sha256, bytes: staged.bytes, source: "planned_overlay" };
     }
+    const retainedRoot = retainedRootsByKey.get(key);
+    if (retainedRoot) return {
+      sha256: retainedRoot.sha256, bytes: retainedRoot.byte_size, source: "dropbox",
+    };
     const object = store.getObjectIfExists(key);
     if (!object || !["dropbox", "overlay"].includes(object.source)) {
       throw new Error(`Fixed-v3 external dependency is unavailable: ${key}`);
@@ -278,6 +381,7 @@ export async function planSosLightV3ObservationMetadata(options = {}) {
   const argv = options.argv || process.argv.slice(2);
   const env = resolvedEnvironment(options.env || process.env, argv);
   const repairPlan = resolveRepairPlan({ argv, repairPlan: options.repairPlan });
+  const targetWriterGitSha = resolveIntegrityTargetWriterGitSha(env);
   if (repairPlan?.domain !== "observations") throw new Error("Fixed-v3 planner is observation-only");
   const runStatePath = String(env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON || "");
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
@@ -290,7 +394,9 @@ export async function planSosLightV3ObservationMetadata(options = {}) {
   });
   output.planning.core_snapshot_identity_validation = coreAudit;
   if (output.ok === true) {
-    await addExactV3Indexes({ output, runState, env, repairPlan });
+    await addExactV3Indexes({
+      output, runState, env, repairPlan, targetWriterGitSha,
+    });
     assertFixedV3Proposal(output);
     validateFinalPlannerProposalGraph(output, { runState });
   }
