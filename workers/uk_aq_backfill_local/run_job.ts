@@ -78,6 +78,9 @@ import {
   DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
 } from "../shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import {
+  buildFixedV3IntegrityObservationProposal,
+} from "./fixed_v3_integrity_observation_proposal.mjs";
+import {
   getObservationHistoryGeneration,
 } from "../shared/uk_aq_observation_history_generation.mjs";
 import {
@@ -1409,6 +1412,11 @@ const INTEGRITY_SOURCE_EVIDENCE_ONLY = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
   false,
 );
+const USE_FIXED_V3_INTEGRITY_PROPOSAL_WRITER =
+  HISTORY_R2_WRITE_VERSION === "v3" &&
+  INTEGRITY_PROPOSAL_MODE &&
+  optionalEnv("UK_AQ_INTEGRITY_WORKER_PURPOSE") === "repair_proposal" &&
+  !INTEGRITY_SOURCE_EVIDENCE_ONLY;
 if (HISTORY_R2_WRITE_VERSION === "v3") {
   const workerPurpose = optionalEnv("UK_AQ_INTEGRITY_WORKER_PURPOSE");
   const canonicalWritesAllowed = optionalEnv(
@@ -5018,58 +5026,81 @@ async function exportStructuredObsConnectorRows(args: {
     } = canonicalHashResult;
     const fileEntries: ObsHistoryFileEntry[] = [];
     const liveParquetBodies: Uint8Array[] = [];
-    const rowChunks = chunkRows(canonicalPollutantRows, OBS_R2_PART_MAX_ROWS);
-    for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
-      const chunk = rowChunks[partIndex];
-      if (!chunk.length) continue;
-      const parquetRows: ObsHistoryV2ParquetRow[] = chunk.map((row) => ({
-        connector_id: args.connector_id,
-        station_id: row.station_id ?? null,
-        timeseries_id: row.timeseries_id,
-        pollutant_code: pollutantCode,
-        observed_at: row.observed_at_utc,
-        value: row.value,
-        verification_status: row.verification_status,
-      }));
-      const partSummary = summarizeObservationPartRows(parquetRows);
-      const partKey = buildHistoryV2PartKey(
-        observationsPrefix,
-        args.day_utc,
-        args.connector_id,
+    let exactV3Proposal: ReturnType<typeof buildFixedV3IntegrityObservationProposal> | null = null;
+    const backedUpAtUtc = nowIso();
+    if (USE_FIXED_V3_INTEGRITY_PROPOSAL_WRITER) {
+      exactV3Proposal = buildFixedV3IntegrityObservationProposal({
+        rows: canonicalPollutantRows,
+        dayUtc: args.day_utc,
+        connectorId: args.connector_id,
         pollutantCode,
-        partIndex,
-      );
-      const parquetBuffer = rowsToObservationV2ParquetBuffer(parquetRows);
-      const putResult = await publishOrStageHistoryObject({
-        key: partKey,
-        body: parquetBuffer,
-        content_type: "application/octet-stream",
+        targetWriterGitSha: OBS_R2_WRITER_GIT_SHA,
+        backedUpAtUtc,
+        observationsPrefix,
+        indexRoot: getObservationHistoryGeneration("v3").observations_timeseries_index_prefix,
       });
-      const contentSha256 = sha256Hex(parquetBuffer);
-      let verifiedBytes = parquetBuffer.byteLength;
-      let verifiedEtag = putResult.etag;
-      if (!INTEGRITY_PROPOSAL_MODE) {
-        const actual = await r2GetObject({ r2: OBS_R2_CONFIG, key: partKey });
-        if (actual.bytes !== parquetBuffer.byteLength || sha256Hex(actual.body) !== contentSha256) {
-          throw new Error(`v2 observation parquet GET verification failed: ${partKey}`);
-        }
-        verifiedBytes = actual.bytes;
-        verifiedEtag = actual.etag || putResult.etag;
-        liveParquetBodies.push(actual.body);
+      for (const intent of exactV3Proposal.file_intents) {
+        await publishOrStageHistoryObject({
+          key: intent.key,
+          body: intent.body,
+          content_type: "application/octet-stream",
+        });
+        objectsWritten += 1;
       }
-      fileEntries.push({
-        key: partKey,
-        row_count: chunk.length,
-        bytes: Math.trunc(verifiedBytes),
-        etag_or_hash: verifiedEtag || contentSha256,
-        pollutant_codes: [pollutantCode],
-        min_timeseries_id: partSummary.min_timeseries_id,
-        max_timeseries_id: partSummary.max_timeseries_id,
-        min_observed_at: partSummary.min_observed_at,
-        max_observed_at: partSummary.max_observed_at,
-        timeseries_row_counts: partSummary.timeseries_row_counts,
-      });
-      objectsWritten += 1;
+    } else {
+      const rowChunks = chunkRows(canonicalPollutantRows, OBS_R2_PART_MAX_ROWS);
+      for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
+        const chunk = rowChunks[partIndex];
+        if (!chunk.length) continue;
+        const parquetRows: ObsHistoryV2ParquetRow[] = chunk.map((row) => ({
+          connector_id: args.connector_id,
+          station_id: row.station_id ?? null,
+          timeseries_id: row.timeseries_id,
+          pollutant_code: pollutantCode,
+          observed_at: row.observed_at_utc,
+          value: row.value,
+          verification_status: row.verification_status,
+        }));
+        const partSummary = summarizeObservationPartRows(parquetRows);
+        const partKey = buildHistoryV2PartKey(
+          observationsPrefix,
+          args.day_utc,
+          args.connector_id,
+          pollutantCode,
+          partIndex,
+        );
+        const parquetBuffer = rowsToObservationV2ParquetBuffer(parquetRows);
+        const putResult = await publishOrStageHistoryObject({
+          key: partKey,
+          body: parquetBuffer,
+          content_type: "application/octet-stream",
+        });
+        const contentSha256 = sha256Hex(parquetBuffer);
+        let verifiedBytes = parquetBuffer.byteLength;
+        let verifiedEtag = putResult.etag;
+        if (!INTEGRITY_PROPOSAL_MODE) {
+          const actual = await r2GetObject({ r2: OBS_R2_CONFIG, key: partKey });
+          if (actual.bytes !== parquetBuffer.byteLength || sha256Hex(actual.body) !== contentSha256) {
+            throw new Error(`v2 observation parquet GET verification failed: ${partKey}`);
+          }
+          verifiedBytes = actual.bytes;
+          verifiedEtag = actual.etag || putResult.etag;
+          liveParquetBodies.push(actual.body);
+        }
+        fileEntries.push({
+          key: partKey,
+          row_count: chunk.length,
+          bytes: Math.trunc(verifiedBytes),
+          etag_or_hash: verifiedEtag || contentSha256,
+          pollutant_codes: [pollutantCode],
+          min_timeseries_id: partSummary.min_timeseries_id,
+          max_timeseries_id: partSummary.max_timeseries_id,
+          min_observed_at: partSummary.min_observed_at,
+          max_observed_at: partSummary.max_observed_at,
+          timeseries_row_counts: partSummary.timeseries_row_counts,
+        });
+        objectsWritten += 1;
+      }
     }
     if (!INTEGRITY_PROPOSAL_MODE) {
       const liveCanonicalRows = (
@@ -5099,7 +5130,7 @@ async function exportStructuredObsConnectorRows(args: {
       args.connector_id,
       pollutantCode,
     );
-    const pollutantManifest = createObservationV2PollutantManifest({
+    const pollutantManifest = exactV3Proposal?.canonical_pollutant_manifest.payload ?? createObservationV2PollutantManifest({
       dayUtc: args.day_utc,
       connectorId: args.connector_id,
       pollutantCode,
@@ -5108,12 +5139,12 @@ async function exportStructuredObsConnectorRows(args: {
       sourceRowCount: pollutantRows.length,
       fileEntries,
       writerGitSha: OBS_R2_WRITER_GIT_SHA,
-      backedUpAtUtc: nowIso(),
+      backedUpAtUtc,
       observationContentHash,
     });
     await publishOrStageHistoryObject({
       key: manifestKey,
-      body: encodeJsonBody(pollutantManifest),
+      body: exactV3Proposal?.canonical_pollutant_manifest.body ?? encodeJsonBody(pollutantManifest),
       content_type: "application/json",
     });
     objectsWritten += 1;
