@@ -209,6 +209,25 @@ mark_failure() {
   FAILED_REPOS+=("${label}")
 }
 
+clean_live_docs() {
+  local label="$1"
+  local dst="$2"
+  local path
+
+  for path in "${dst}/docs" "${dst}/ref_docs"; do
+    if [[ ! -e "${path}" ]]; then
+      continue
+    fi
+
+    if [[ "${APPLY}" -eq 0 ]]; then
+      echo "   DRY RUN [${label}]: would remove TEST-only documentation from LIVE: ${path}"
+    else
+      rm -rf "${path}"
+      echo "   LIVE cleanup [${label}]: removed TEST-only documentation: ${path}"
+    fi
+  done
+}
+
 apply_live_website_overrides() {
   local src="$1"
   local dst="$2"
@@ -361,6 +380,12 @@ sync_repo() {
   fi
 
   if rsync "${rsync_args[@]}" "${src}/" "${dst}/"; then
+    if ! clean_live_docs "${label}" "${dst}"; then
+      echo "   ERROR [${label}]: LIVE documentation cleanup failed" >&2
+      mark_failure "${label}"
+      return
+    fi
+
     if [[ "${label}" == "website" ]]; then
       if ! apply_live_website_overrides "${src}" "${dst}"; then
         echo "   ERROR [website]: LIVE website override failed" >&2
