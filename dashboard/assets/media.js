@@ -397,7 +397,7 @@
       state.articleCursor = data.page?.next_cursor || null;
       state.articleHasMore = Boolean(data.page?.has_more);
       setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>
-        <div class="media-actions"><button class="media-button" data-open-bluesky>Bluesky</button><button class="media-button media-button--primary" data-focus-add>+ Add Article</button></div></div>
+        <div class="media-actions"><button class="media-button" data-open-bluesky>Bluesky</button></div></div>
         <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
         <div data-url-result></div>${aiUsageHtml()}</section>
         <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form></div>
@@ -452,9 +452,6 @@
 
   function bindArticleEvents() {
     state.root.querySelector("[data-open-bluesky]")?.addEventListener("click", () => void openBlueskySettings());
-    state.root.querySelector("[data-focus-add]")?.addEventListener("click", () => {
-      const input = state.root.querySelector("[data-url-lookup] input"); input?.focus(); input?.scrollIntoView({ behavior: "smooth", block: "center" });
-    });
     state.root.querySelector("[data-url-lookup]")?.addEventListener("submit", event => { event.preventDefault(); void lookupUrl(new FormData(event.currentTarget).get("url")); });
     state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); clearArticleSelection(); void refreshArticleTable(); });
     state.root.querySelector("[data-clear-filters]")?.addEventListener("click", () => {
