@@ -84,7 +84,7 @@ The exact-leaf amendment remains authoritative for `timeseries-aligned-v2`, 1,02
 
 | File | Scope |
 |---|---|
-| [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md) | **Load-bearing SOS-light authority:** Step 0 writer-order + observations-root hash gate, then DETECT / PROPOSE / APPLY+VERIFY from Dropbox baseline and repair overlay |
+| [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md) | **Load-bearing SOS-light authority:** Step 0 IngestDB boundary + global observations lock + Dropbox checkpoint/writer-order + observations-root hash gate, then DETECT / PROPOSE / APPLY+VERIFY from the pinned Dropbox baseline and repair overlay |
 | [`sos_light_model.md`](sos_light_model.md) | Broad SOS-light complete-day replacement model, subject to the three-phase authority contract |
 | [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md) | Additional SOS historical repair behaviour not superseded by SOS-light |
 | [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md) | Run-scoped SOS source acquisition |
@@ -127,7 +127,8 @@ Do not infer authority from file age or filename alone.
 
 Current explicit precedence includes:
 
-- `sos_light_three_phase_authority_contract.md` over conflicting SOS-light currentness, planning, provenance, derived-index dependency and backup-expansion wording;\n- `integrity_generation_aware_core_snapshot_amendment.md` over conflicting v2-only generation/core-namespace wording in `integrity.md`, `integrity_core_snapshot_identity.md`, `sos_light_model.md` and older Integrity implementation notes; the base contracts remain authoritative for non-conflicting source authority, latest-complete selection, pinning, proposal/apply, verification and audit semantics;
+- `sos_light_three_phase_authority_contract.md` over conflicting SOS-light currentness, planning, provenance, derived-index dependency and backup-expansion wording;
+- `integrity_generation_aware_core_snapshot_amendment.md` over conflicting v2-only generation/core-namespace wording in `integrity.md`, `integrity_core_snapshot_identity.md`, `sos_light_model.md` and older Integrity implementation notes; the base contracts remain authoritative for non-conflicting source authority, latest-complete selection, pinning, proposal/apply, verification and audit semantics;
 - `observation_history_v3_side_by_side_generation_contract.md` over conflicting observation-history v3 base/migration/transition/operator/maintenance/rollback/backup wording for migration topology, independent v2/v3 namespaces, the single normal `UK_AQ_R2_HISTORY_VERSION` generation selector, final frozen-source catch-up/cut-over, no v2 shadow publication after accepted cut-over, and intact-v2 same-window rollback;
 - `aqi_r2_retirement_contract.md` over older active-AQI-in-R2 wording;
 - `prune_daily_observation_only_phase_b_contract.md` over reversible/optional Phase B observation-only wording;
