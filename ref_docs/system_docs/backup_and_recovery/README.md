@@ -84,17 +84,15 @@ When persistent observation-history index authority, v3 cut-over or the compact 
 
 - [`r2_history_index_v3_backup_amendment.md`](r2_history_index_v3_backup_amendment.md)
 
-It is the narrower authority for the observation-timeseries backup evidence selected by inventory and sync:
+It is the narrower authority for the one compact observation-timeseries summary selected by inventory and sync:
 
 ```text
 v2 -> history/_index_v2/observations_timeseries_latest.json
 
 v3 -> history/_index_v3/observations_timeseries_latest.json
-      + the exact scoped root manifest objects declared by
-        day_summaries[].scoped_roots[]
 ```
 
-For v3, those scoped root manifests are a small dependency-evidence set used by partial fixed-v3 Integrity. The bulk `history/_index_v3/observations_timeseries/` tree remains excluded from normal Dropbox backup; descendant exact-leaf/page objects are not copied merely because their root manifest is retained.
+The normal v3 backup does **not** additionally copy or revalidate the complete scoped/exact observation-timeseries index tree merely to support SOS-light. Derived indexes are rebuildable from the canonical Dropbox baseline plus a repair overlay under the SOS-light three-phase contract.
 
 It does **not** migrate these unrelated backup domains to v3:
 
@@ -109,16 +107,11 @@ _ops/checkpoints/r2_history_backup_state_v2/
 
 The binding-pack namespace is likewise generation-neutral and is governed separately by the packed-binding contract rather than observation-history index generation.
 
-As of 18/09/2026, the contract requires the v3 scoped-root dependency-evidence set but the TEST backup implementation still copies only the v3 global latest object. That implementation gap must be closed and accepted by a real locked TEST backup before fixed-v3 Integrity may rely on the checkpoint for unchanged scoped-root dependencies.
+For SOS-light fixed-v2/fixed-v3 repair, route back to [`../r2_history/sos_light_three_phase_authority_contract.md`](../r2_history/sos_light_three_phase_authority_contract.md). The normal Dropbox backup remains the simple canonical baseline; it is not expanded with derived v3 dependency evidence.
 
-For the **first locked post-v3 backup after a controlled steady-state write**, also read [`../r2_history/observation_history_index_v3_steady_state_acceptance_amendment.md`](../r2_history/observation_history_index_v3_steady_state_acceptance_amendment.md). That contract requires a separate strictly read-only post-write verifier to authenticate the advanced steady-state generation before the backup is eligible to start. The migration-era post-cutover verifier is not repinned or weakened for this purpose.
+For the **first locked post-v3 backup after a controlled steady-state write**, also read [`../r2_history/observation_history_index_v3_steady_state_acceptance_amendment.md`](../r2_history/observation_history_index_v3_steady_state_acceptance_amendment.md). That contract owns any separate post-write acceptance gate.
 
-For an observation-history **`v3-rebuild`**, also read [`../r2_history/observation_history_index_v3_transition_modes_amendment.md`](../r2_history/observation_history_index_v3_transition_modes_amendment.md). The complete verified pre-migration canonical v2 Dropbox generation is the rollback data authority. The superseded old v3 index generation is derived data and is not a recovery target, so an exact old-v3 snapshot or deterministic old-v3 reproduction is not required. Before incompatible mutation, the rebuild must instead pin the required v2 runtime rollback evidence. Formal rollback restores and verifies canonical v2, rebuilds and verifies index_v2, then restores and independently verifies v2 deployed authority.
-
-For a LIVE **`v2-to-v3`** migration, the same transition amendment defines the same canonical-v2 rollback basis: the complete frozen pre-migration canonical v2 backup generation, including canonical Parquet and manifests, together with its pinned identities and v2 runtime recovery evidence. Retained `_index_v2` objects are derived evidence only; the supported formal rollback rebuilds and verifies index_v2 from the restored canonical v2 generation.
-
-Load other R2-history migration/operator contracts only when their migration gates or evidence are actually in scope.
-
+For an observation-history **`v3-rebuild`** or LIVE **`v2-to-v3`** migration, use the dedicated transition/migration contracts. Those migration/rollback rules are distinct from normal SOS-light repair and normal Dropbox backup scope.
 ### Restore or recovery
 
 Do not infer complete system-wide restore capability from the backup contracts. The generic R2 restore workflow predates the complete hierarchical design.
