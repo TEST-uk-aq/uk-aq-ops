@@ -1007,29 +1007,7 @@ const R2_HISTORY_DROPBOX_ROOT = optionalEnvAny([
   "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
   "UK_AQ_BACKFILL_R2_HISTORY_DROPBOX_ROOT",
 ]);
-export function resolveObservationWriterGitSha(
-  getEnv: (name: string) => string | undefined = (name) => Deno.env.get(name),
-): string | null {
-  const integrityInvocation = parseBooleanish(
-    getEnv("UK_AQ_INTEGRITY_INVOCATION"),
-    false,
-  );
-  if (integrityInvocation) {
-    const pinned = String(
-      getEnv("UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA") || "",
-    ).trim();
-    if (!/^[0-9a-f]{40}$/.test(pinned)) {
-      throw new Error(
-        "Integrity observation writer requires " +
-          "UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA as a full lower-case Git SHA",
-      );
-    }
-    return pinned;
-  }
-  return String(getEnv("GITHUB_SHA") || "").trim() || null;
-}
-
-const OBS_R2_WRITER_GIT_SHA = resolveObservationWriterGitSha();
+const OBS_R2_WRITER_GIT_SHA = (Deno.env.get("GITHUB_SHA") || "").trim() || null;
 const OBS_R2_CONFIG = {
   endpoint:
     (Deno.env.get("CFLARE_R2_ENDPOINT") || Deno.env.get("R2_ENDPOINT") || "")

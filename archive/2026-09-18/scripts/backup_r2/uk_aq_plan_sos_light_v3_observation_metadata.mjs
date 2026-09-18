@@ -33,29 +33,6 @@ import {
 } from "./lib/uk_aq_integrity_core_snapshot_identity.mjs";
 
 const GENERATION = getObservationHistoryGeneration("v3");
-const FULL_LOWER_GIT_SHA = /^[0-9a-f]{40}$/;
-
-export function resolveIntegrityTargetWriterGitSha(env) {
-  const value = String(env?.UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA || "").trim();
-  if (!FULL_LOWER_GIT_SHA.test(value)) {
-    throw new Error(
-      "UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA must be a full lower-case Git SHA",
-    );
-  }
-  return value;
-}
-
-export function assertCurrentRunManifestWriterGitSha(manifest, targetWriterGitSha, key) {
-  const staged = manifest?.writer_git_sha;
-  if (!FULL_LOWER_GIT_SHA.test(String(staged ?? ""))) {
-    throw new Error(`Fixed-v3 staged manifest writer_git_sha is invalid: ${key}`);
-  }
-  if (staged !== targetWriterGitSha) {
-    throw new Error(`Fixed-v3 staged manifest writer_git_sha contradicts pinned run: ${key}`);
-  }
-  return targetWriterGitSha;
-}
-
 const POLLUTANT_MANIFEST = new RegExp(
   `^${GENERATION.observations_prefix}/day_utc=(\\d{4}-\\d{2}-\\d{2})/` +
   "connector_id=([1-9]\\d*)/pollutant_code=([a-z0-9_]+)/manifest\\.json$",
@@ -137,7 +114,7 @@ export function assertFixedV3Proposal(output) {
   return output;
 }
 
-async function addExactV3Indexes({ output, runState, env, repairPlan, targetWriterGitSha }) {
+async function addExactV3Indexes({ output, runState, env, repairPlan }) {
   const proposals = (output.planning.proposals || [])
     .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`));
   const proposalsByKey = new Map(proposals.map((proposal) => [String(proposal.key), proposal]));
@@ -170,11 +147,6 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     const manifestObject = combinedObject(manifestKey);
     if (!manifestObject) throw new Error(`Fixed-v3 pollutant manifest is unavailable: ${manifestKey}`);
     const manifest = JSON.parse(Buffer.from(manifestObject.body).toString("utf8"));
-    const currentRunManifest = proposalsByKey.has(manifestKey) ||
-      (runState.objects?.[manifestKey]?.proposed === true && manifestObject.source === "overlay");
-    const writerGitSha = currentRunManifest
-      ? assertCurrentRunManifestWriterGitSha(manifest, targetWriterGitSha, manifestKey)
-      : manifest.writer_git_sha;
     const rows = [];
     for (const parquetKey of (manifest.parquet_object_keys || []).map(String)) {
       assertObservationHistoryGenerationKey(GENERATION, parquetKey, "observations");
@@ -186,7 +158,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
       source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
       rows,
       scope: { day_utc: match[1], connector_id: Number(match[2]), pollutant_code: match[3] },
-      targetWriterGitSha: writerGitSha,
+      targetWriterGitSha: manifest.writer_git_sha,
       backedUpAtUtc: manifest.backed_up_at_utc ?? null,
       observationsPrefix: GENERATION.observations_prefix,
       indexRoot: GENERATION.observations_timeseries_index_prefix,
@@ -306,7 +278,6 @@ export async function planSosLightV3ObservationMetadata(options = {}) {
   const argv = options.argv || process.argv.slice(2);
   const env = resolvedEnvironment(options.env || process.env, argv);
   const repairPlan = resolveRepairPlan({ argv, repairPlan: options.repairPlan });
-  const targetWriterGitSha = resolveIntegrityTargetWriterGitSha(env);
   if (repairPlan?.domain !== "observations") throw new Error("Fixed-v3 planner is observation-only");
   const runStatePath = String(env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON || "");
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
@@ -319,9 +290,7 @@ export async function planSosLightV3ObservationMetadata(options = {}) {
   });
   output.planning.core_snapshot_identity_validation = coreAudit;
   if (output.ok === true) {
-    await addExactV3Indexes({
-      output, runState, env, repairPlan, targetWriterGitSha,
-    });
+    await addExactV3Indexes({ output, runState, env, repairPlan });
     assertFixedV3Proposal(output);
     validateFinalPlannerProposalGraph(output, { runState });
   }

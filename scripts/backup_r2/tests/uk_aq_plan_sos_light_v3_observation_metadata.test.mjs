@@ -5,7 +5,9 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  assertCurrentRunManifestWriterGitSha,
   assertFixedV3Proposal,
+  resolveIntegrityTargetWriterGitSha,
 } from "../uk_aq_plan_sos_light_v3_observation_metadata.mjs";
 import {
   readCanonicalObservationRows,
@@ -120,4 +122,33 @@ test("status-column selection prefers vstatus and retains legacy names", () => {
   ), "verification_status");
   assert.equal(selectObservationVerificationStatusColumn(new Set(["status"])), "status");
   assert.equal(selectObservationVerificationStatusColumn(new Set()), null);
+});
+
+
+test("fixed-v3 staged manifests must match pinned writer provenance", () => {
+  const pinned = "c".repeat(40);
+  assert.equal(
+    resolveIntegrityTargetWriterGitSha({
+      UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA: pinned,
+    }),
+    pinned,
+  );
+  assert.equal(
+    assertCurrentRunManifestWriterGitSha({ writer_git_sha: pinned }, pinned, "manifest.json"),
+    pinned,
+  );
+  for (const writer_git_sha of [null, "C".repeat(40), "c".repeat(39)]) {
+    assert.throws(
+      () => assertCurrentRunManifestWriterGitSha(
+        { writer_git_sha }, pinned, "manifest.json",
+      ),
+      /writer_git_sha is invalid/,
+    );
+  }
+  assert.throws(
+    () => assertCurrentRunManifestWriterGitSha(
+      { writer_git_sha: "d".repeat(40) }, pinned, "manifest.json",
+    ),
+    /contradicts pinned run/,
+  );
 });
