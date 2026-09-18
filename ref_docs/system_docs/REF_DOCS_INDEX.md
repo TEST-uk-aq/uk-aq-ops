@@ -18,7 +18,7 @@ Source repository:
 
 Source commit:
 
-`550fc53d2c7bdb84dabecc6fe32984349994c026`
+`e30fce81f0cb2e0c6f551d30a31e8ce43336ef17`
 
 Snapshot date:
 
@@ -41,7 +41,7 @@ If a routed contract is not present in this mirror, do not infer its contents. R
 This snapshot intentionally contains the contracts needed for current TEST ops work around:
 
 - History Integrity;
-- SOS-light and SOS historical repair;
+- SOS-light and SOS historical repair, including the load-bearing three-phase authority contract;
 - observation-history index v3 and exact-leaf behaviour;
 - Integrity writer/core/proposal/apply safety;
 - direct selected-partition replacement and run exclusion;
@@ -55,15 +55,19 @@ Coding agents must not edit files under this mirror as a substitute for changing
 
 ChatGPT in Chat mode owns authoritative system-doc changes. When one of the mirrored source contracts changes, refresh the corresponding mirror file and update the source commit above in the same documentation task.
 
-## Current v3 backup implementation gap
+## Current SOS-light / v3 authority
 
-The authoritative contracts now require, under v3 observation-timeseries authority:
+The authoritative SOS-light contract now requires:
 
-- the global `history/_index_v3/observations_timeseries_latest.json`;
-- the exact scoped root `manifest.json` objects referenced by its `day_summaries[].scoped_roots[]`;
+- Step 0 hard currentness precheck:
+  - complete Dropbox checkpoint;
+  - successful Dropbox backup completed after the latest relevant completed R2 writer, including Prune Daily and Integrity/SOS-light;
+  - exact equality between the Dropbox fully processed observations-root `content_hash` and the current live R2 observations-root `content_hash`;
+  - any mismatch stops immediately before DETECT;
+- DETECT from the pinned Dropbox baseline plus authoritative current-run repair source;
+- PROPOSE from a local Dropbox+repair overlay, rebuilding every affected derived v2/v3 index deterministically;
+- APPLY only the frozen changed/removed set, then verify those R2 results;
+- no pre-apply live-R2 observation/index dependency discovery beyond the single Step 0 observations-root hash comparison;
+- no normal Dropbox backup expansion for v3 scoped-root dependency evidence.
 
-to be copied and byte/SHA verified in the pinned Dropbox backup generation.
-
-The bulk scoped exact-index tree remains excluded.
-
-As of this snapshot, the TEST backup implementation still copies the v3 global latest object but does not yet inventory/copy the referenced scoped-root manifests or record their checkpoint completeness. Treat this as an implementation gap, not as permission to weaken fixed-v3 Integrity dependency verification.
+PR #69's scoped-root backup expansion was reverted. The normal v3 backup continues to carry the generation-selected compact `observations_timeseries_latest.json` but not the full derived scoped/exact index tree.
