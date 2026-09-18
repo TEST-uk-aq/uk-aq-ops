@@ -345,7 +345,7 @@ sync_repo() {
       rsync_args+=(
         # Stage 1: keep the dedicated WHO guidelines page in TEST until it is
         # ready for LIVE. Remove this exclusion when the page is promoted.
-        --exclude='who-guidelines/'
+        --exclude='/who-guidelines/'
       )
       ;;
     pop-ingest|integrity-factory)
