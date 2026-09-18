@@ -4086,7 +4086,6 @@ export async function updateR2HistoryIndexesTargeted({
   writeR2 = true,
   r2: r2Override = null,
   additionalPollutantManifestTargets = [],
-  observationGeneration = null,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   const r2 = r2Override || config.r2;
@@ -4108,12 +4107,12 @@ export async function updateR2HistoryIndexesTargeted({
   let observationsTimeseries = null;
   let aqilevelsTimeseries = null;
   for (const domain of normalizedDomains) {
-    if (normalizedHistoryVersion === "v2" || (domain === "observations" && observationGeneration)) {
+    if (normalizedHistoryVersion === "v2") {
       const dataPrefix = domain === "observations"
-        ? observationGeneration?.observations_prefix || config.observations_prefix_v2
+        ? config.observations_prefix_v2
         : config.aqilevels_hourly_data_prefix_v2;
       const timeseriesIndexPrefix = domain === "observations"
-        ? observationGeneration?.observations_timeseries_index_prefix || config.observations_timeseries_index_prefix_v2
+        ? config.observations_timeseries_index_prefix_v2
         : config.aqilevels_hourly_data_timeseries_index_prefix_v2;
         
       const result = await updateR2HistoryV2TimeseriesIndexesTargeted({
@@ -4121,7 +4120,7 @@ export async function updateR2HistoryIndexesTargeted({
         bucketName: r2.bucket,
         domain,
         dataPrefix,
-        indexPrefix: observationGeneration?.index_root_prefix || config.index_prefix_v2,
+        indexPrefix: config.index_prefix_v2,
         timeseriesIndexPrefix,
         generatedAt,
         fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
@@ -4196,17 +4195,17 @@ export async function updateR2HistoryIndexesTargeted({
     }
   }
 
-  const responseIndexPrefix = normalizedHistoryVersion === "v2" || observationGeneration
-    ? observationGeneration?.index_root_prefix || config.index_prefix_v2
+  const responseIndexPrefix = normalizedHistoryVersion === "v2"
+    ? config.index_prefix_v2
     : config.index_prefix;
-  const responseObservationsTimeseriesIndexPrefix = normalizedHistoryVersion === "v2" || observationGeneration
-    ? observationGeneration?.observations_timeseries_index_prefix || config.observations_timeseries_index_prefix_v2
+  const responseObservationsTimeseriesIndexPrefix = normalizedHistoryVersion === "v2"
+    ? config.observations_timeseries_index_prefix_v2
     : config.observations_timeseries_index_prefix;
   const responseAqilevelsTimeseriesIndexPrefix = normalizedHistoryVersion === "v2"
     ? config.aqilevels_hourly_data_timeseries_index_prefix_v2
     : config.aqilevels_timeseries_index_prefix;
-  const responseObservationsPrefix = normalizedHistoryVersion === "v2" || observationGeneration
-    ? observationGeneration?.observations_prefix || config.observations_prefix_v2
+  const responseObservationsPrefix = normalizedHistoryVersion === "v2"
+    ? config.observations_prefix_v2
     : config.observations_prefix;
   const responseAqilevelsPrefix = normalizedHistoryVersion === "v2"
     ? config.aqilevels_hourly_data_prefix_v2

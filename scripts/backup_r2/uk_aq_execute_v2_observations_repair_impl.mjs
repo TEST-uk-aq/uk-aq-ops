@@ -1558,6 +1558,7 @@ export async function runV2ObservationsRepair({
   repairPlan = null,
   updateIndexes = updateR2HistoryIndexesTargeted,
   storageGeneration = "v2",
+  planIndexes = true,
 } = {}) {
   const startedAtMs = Date.now();
   const reportProgress = ({ phase, completed_objects = 0, total_objects = 0, successful_put_count = 0, successful_readback_verification_count = 0, failures = 0, blocked_count = 0 }) => {
@@ -1880,7 +1881,7 @@ export async function runV2ObservationsRepair({
       .map((scope) => Number(scope.connectorId))
       .filter((connectorId) => Number.isInteger(connectorId) && connectorId > 0))]
       .sort((left, right) => left - right);
-    if (indexRequested && !indexConnectorIds.length) {
+    if (planIndexes && indexRequested && !indexConnectorIds.length) {
       blockedScopes.push({
         status: "blocked_dependency",
         day_utc: dayUtc,
@@ -1898,7 +1899,7 @@ export async function runV2ObservationsRepair({
       });
       continue;
     }
-    if (indexRequested) {
+    if (planIndexes && indexRequested) {
       const proposalSnapshot = new Map(staged.proposals);
       try {
         const results = [];
@@ -1954,7 +1955,7 @@ export async function runV2ObservationsRepair({
       day_utc: dayUtc,
       status: "planned",
       manifest_status: manifestStageStatus(proposalKeys),
-      index_status: indexRequested ? plannedStageStatus : "not_run",
+      index_status: planIndexes && indexRequested ? plannedStageStatus : "not_run",
       scopes: dayScopes,
       blocked_scopes: [],
       proposal_keys: [...new Set(proposalKeys)].sort(),
@@ -1962,7 +1963,7 @@ export async function runV2ObservationsRepair({
     });
   }
 
-  if (sosLightAudit && !blockedScopes.length) {
+  if (planIndexes && sosLightAudit && !blockedScopes.length) {
     await stageSosLightLatestIndex({
       staged,
       config,
