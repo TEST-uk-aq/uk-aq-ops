@@ -152,8 +152,10 @@ export function reconcileReconstructedExactV3Hierarchies({
   }
   const changedHierarchies = [];
   const unchangedRoots = [];
+  const reconstructedScopes = new Set();
   for (const hierarchy of hierarchies) {
     const reconstructed = rootDescriptor(hierarchy.scoped_manifest);
+    reconstructedScopes.add(scopeIdentity(reconstructed));
     const previous = oldByScope.get(scopeIdentity(reconstructed));
     if (sameRootIdentity(previous, reconstructed)) unchangedRoots.push(reconstructed);
     else changedHierarchies.push(hierarchy);
@@ -163,7 +165,71 @@ export function reconcileReconstructedExactV3Hierarchies({
     indexRoot: GENERATION.observations_timeseries_index_prefix,
     latestKey: GENERATION.observations_timeseries_latest_key,
   });
-  return { latest, changedHierarchies, unchangedRoots };
+  const removedScopes = oldRoots
+    .filter((root) => !reconstructedScopes.has(scopeIdentity(root)))
+    .map((root) => ({
+      day_utc: root.day_utc,
+      connector_id: root.connector_id,
+      pollutant_code: root.pollutant_code,
+      exact_prefix: `${GENERATION.observations_timeseries_index_prefix}/day_utc=${root.day_utc}` +
+        `/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}`,
+      aligned_prefix: `${GENERATION.observations_timeseries_index_prefix}/_aligned/day_utc=${root.day_utc}` +
+        `/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}`,
+    }));
+  return { latest, changedHierarchies, unchangedRoots, removedScopes };
+}
+
+export function resolveExactV3LocalReferences({
+  artifacts,
+  changedKeys,
+  proposalsByKey,
+  plannedCanonicalKeys = new Set(),
+  store,
+  unchangedRoots,
+}) {
+  const resolved = new Map(unchangedRoots.map((root) => [root.key, {
+    key: root.key,
+    byte_size: root.byte_size,
+    sha256: root.sha256,
+    verified: true,
+    durable: true,
+  }]));
+  for (const artifact of artifacts) {
+    for (const reference of [
+      ...(artifact.dependencies || []),
+      ...(artifact.publication_prerequisites || []),
+    ]) {
+      if (changedKeys.has(reference.key)) continue;
+      const plannedCanonical = proposalsByKey.get(reference.key);
+      if (plannedCanonical?.changed === true || plannedCanonicalKeys.has(reference.key)) {
+        resolved.set(reference.key, {
+          key: reference.key,
+          byte_size: Number(plannedCanonical.bytes),
+          sha256: String(plannedCanonical.new_sha256),
+          verified: true,
+          durable: true,
+        });
+        continue;
+      }
+      const local = store.getObjectFromSourceIfExists(reference.key, "dropbox");
+      if (!local) {
+        if (resolved.has(reference.key)) continue;
+        throw new Error(`Fixed-v3 pinned canonical baseline dependency is unavailable: ${reference.key}`);
+      }
+      const identity = exactIdentity(local, "dropbox");
+      if (identity.bytes !== Number(reference.byte_size) || identity.sha256 !== reference.sha256) {
+        throw new Error(`Fixed-v3 pinned canonical baseline dependency identity disagrees: ${reference.key}`);
+      }
+      resolved.set(reference.key, {
+        key: reference.key,
+        byte_size: identity.bytes,
+        sha256: identity.sha256,
+        verified: true,
+        durable: true,
+      });
+    }
+  }
+  return resolved;
 }
 
 function assertAllowedKey(key) {
@@ -190,8 +256,14 @@ export function assertFixedV3Proposal(output) {
 }
 
 async function addExactV3Indexes({ output, runState, env, repairPlan, targetWriterGitSha }) {
+  const selectedDayPrefixes = [...new Set((repairPlan.repair_plan || [])
+    .map((action) => String(action?.day_utc || "")).filter(Boolean))]
+    .map((day) => `${GENERATION.observations_prefix}/day_utc=${day}/`);
   const proposals = (output.planning.proposals || [])
-    .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`));
+    .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`))
+    .map((proposal) => selectedDayPrefixes.some((prefix) => String(proposal.key).startsWith(prefix))
+      ? { ...proposal, changed: true, included_in_write_set: true, status: "planned" }
+      : proposal);
   const proposalsByKey = new Map(proposals.map((proposal) => [String(proposal.key), proposal]));
   const prefixes = [GENERATION.observations_prefix];
   const store = createCombinedLocalStore({
@@ -268,7 +340,23 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
   });
   const exactObjects = rebuilt.changedHierarchies
     .flatMap((hierarchy) => hierarchy.publication_objects);
-  const latest = rebuilt.latest;
+  const canonicalFinalizationPrerequisites = proposals
+    .filter((proposal) => (proposal.changed === true
+        || selectedDayPrefixes.some((prefix) => String(proposal.key).startsWith(prefix)))
+      && String(proposal.key).startsWith(`${GENERATION.observations_prefix}/`)
+      && String(proposal.key).endsWith("/manifest.json"))
+    .map((proposal) => ({
+      key: String(proposal.key),
+      byte_size: Number(proposal.bytes),
+      sha256: String(proposal.new_sha256),
+    }));
+  const canonicalFinalizationPrerequisiteKeys = new Set(
+    canonicalFinalizationPrerequisites.map(({ key }) => key),
+  );
+  const latest = {
+    ...rebuilt.latest,
+    publication_prerequisites: canonicalFinalizationPrerequisites,
+  };
   exactObjects.push(latest);
   const exactByKey = new Map(exactObjects.map((artifact) => [artifact.key, artifact]));
   const changedExactObjects = exactObjects.filter((artifact) => {
@@ -279,18 +367,19 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
   if (!changedExactObjects.length) {
     throw new Error("Fixed-v3 metadata proposal unexpectedly produced no changed exact-v3 indexes");
   }
+  const resolvedLocalReferences = resolveExactV3LocalReferences({
+    artifacts: changedExactObjects,
+    changedKeys: changedExactKeys,
+    proposalsByKey,
+    plannedCanonicalKeys: canonicalFinalizationPrerequisiteKeys,
+    store,
+    unchangedRoots: rebuilt.unchangedRoots,
+  });
   const publicationPlan = buildObservationHistoryIndexV3PublicationPlan({
     objects: changedExactObjects,
-    // Unchanged roots in the rebuilt latest are canonical reconstruction
-    // results, not live/external proposal dependencies.
-    externalReferences: rebuilt.unchangedRoots
-      .map((root) => ({
-        key: root.key,
-        byte_size: root.byte_size,
-        sha256: root.sha256,
-        verified: true,
-        durable: true,
-      })),
+    // These resolve either to frozen canonical writes or exact identities read
+    // from the pinned local Dropbox baseline, never retained live-R2 objects.
+    externalReferences: [...resolvedLocalReferences.values()],
   });
   const identityFor = (key) => {
     const artifact = exactByKey.get(key);
@@ -298,7 +387,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
       return { sha256: artifact.sha256, bytes: artifact.byte_size, source: "planned_overlay" };
     }
     const proposed = proposalsByKey.get(key);
-    if (proposed?.changed === true) return {
+    if (proposed?.changed === true || canonicalFinalizationPrerequisiteKeys.has(key)) return {
       sha256: proposed.new_sha256, bytes: proposed.bytes, source: "planned_overlay",
     };
     const staged = runState.objects?.[key];
@@ -317,6 +406,10 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
       ...entry.dependencies.map(({ key }) => key),
       ...entry.publication_prerequisites.map(({ key }) => key),
     ])].filter((key) => changedExactKeys.has(key) || proposalsByKey.has(key)).sort();
+    const pinnedBaselineReferences = [...new Set([
+      ...entry.external_dependencies,
+      ...entry.external_publication_prerequisites,
+    ])].filter((key) => !proposalsByKey.has(key)).sort();
     const existing = store.getObjectIfExists(entry.key);
     proposals.push({
       key: entry.key,
@@ -331,6 +424,14 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
       status: "planned",
       dependencies,
       dependency_identities: Object.fromEntries(dependencies.map((key) => [key, identityFor(key)])),
+      pinned_baseline_references: Object.fromEntries(pinnedBaselineReferences.map((key) => {
+        const reference = resolvedLocalReferences.get(key);
+        return [key, {
+          source: "pinned_dropbox_canonical_baseline",
+          sha256: reference.sha256,
+          bytes: reference.byte_size,
+        }];
+      })),
       provenance: "fixed_v3_exact_leaf_operational_primitives",
     });
   }
@@ -341,6 +442,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     schedule_sha256: publicationPlan.schedule_sha256,
     object_count: publicationPlan.entries.length,
   };
+  output.planning.removed_exact_v3_scopes = rebuilt.removedScopes;
   return output;
 }
 

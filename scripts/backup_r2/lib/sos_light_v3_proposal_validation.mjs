@@ -10,6 +10,7 @@ const INDEX_PREFIX = "history/_index_v3";
 const V2_OBSERVATIONS_PREFIX = "history/v2/observations";
 const V2_INDEX_PREFIX = "history/_index_v2";
 const DAY_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
+const EXACT_SCOPE_PREFIX = /^history\/_index_v3\/observations_timeseries\/(?:_aligned\/)?day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const POLLUTANT_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const POLLUTANT_MANIFEST = new RegExp(`${POLLUTANT_PREFIX.source.slice(1, -1)}\\/manifest\\.json$`);
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -88,7 +89,9 @@ export function validateDedicatedSosHistoricalProposalV3({ runState, proposal })
   }
   const selectedDays = [...new Set((audit.days || []).map((entry) => String(entry?.day_utc || "")))].sort();
   if (!selectedDays.length || selectedDays.some((day) => !validDay(day))) throw new Error("SOS-light-v3 selected days are invalid");
-  const deletionDays = proposal.prefixes.map(({ prefix, entry }) => {
+  const deletionDays = proposal.prefixes
+    .filter(({ entry }) => entry?.stage === "sos_light_complete_day")
+    .map(({ prefix, entry }) => {
     const match = prefix.match(DAY_PREFIX);
     if (!match || entry?.stage !== "sos_light_complete_day") throw new Error(`SOS-light-v3 deletion is not a complete observation day: ${prefix}`);
     return match[1];
@@ -117,7 +120,12 @@ export function validateLocalSosLightV3Proposal(runState) {
   }).sort((a, b) => a.key.localeCompare(b.key));
   const prefixes = (runState.tombstone_prefixes || []).map((entry) => {
     const prefix = safeKey(entry?.prefix).replace(/\/+$/, "");
-    if (!entry?.proposed || !DAY_PREFIX.test(prefix)) throw new Error(`Non-v3 SOS-light deletion prefix: ${prefix}`);
+    const validDay = entry?.stage === "sos_light_complete_day" && DAY_PREFIX.test(prefix);
+    const validExactScope = entry?.stage === "sos_light_exact_v3_scope_removal"
+      && EXACT_SCOPE_PREFIX.test(prefix);
+    if (!entry?.proposed || (!validDay && !validExactScope)) {
+      throw new Error(`Non-v3 SOS-light deletion prefix: ${prefix}`);
+    }
     return { entry, prefix, domain: "observations" };
   }).sort((a, b) => a.prefix.localeCompare(b.prefix));
   if (!objects.length || !prefixes.length) throw new Error("SOS-light-v3 proposal has no complete-day operations");

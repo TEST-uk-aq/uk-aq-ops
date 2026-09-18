@@ -8,8 +8,10 @@ import {
   assertCurrentRunManifestWriterGitSha,
   assertFixedV3Proposal,
   reconcileReconstructedExactV3Hierarchies,
+  resolveExactV3LocalReferences,
   resolveIntegrityTargetWriterGitSha,
 } from "../uk_aq_plan_sos_light_v3_observation_metadata.mjs";
+import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import {
   buildObservationHistoryExactLeafIndexV3Latest,
   buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
@@ -158,6 +160,35 @@ test("fixed-v3 staged manifests must match pinned writer provenance", () => {
   );
 });
 
+test("changed exact hierarchy resolves unchanged canonical inputs only from pinned Dropbox", () => {
+  const parquetKey = "history/v3/observations/day_utc=2026-06-04/connector_id=1/pollutant_code=no2/part-00000.parquet";
+  const manifestKey = "history/v3/observations/day_utc=2026-06-04/connector_id=1/pollutant_code=no2/manifest.json";
+  const parquet = Buffer.from("canonical-parquet");
+  const manifest = Buffer.from("canonical-manifest");
+  const reference = (key, body) => ({
+    key, byte_size: body.byteLength, sha256: sha256Hex(body),
+  });
+  const requested = [];
+  const resolved = resolveExactV3LocalReferences({
+    artifacts: [{
+      dependencies: [reference(parquetKey, parquet)],
+      publication_prerequisites: [reference(manifestKey, manifest)],
+    }],
+    changedKeys: new Set(),
+    proposalsByKey: new Map(),
+    unchangedRoots: [],
+    store: {
+      getObjectFromSourceIfExists(key, source) {
+        requested.push([key, source]);
+        const body = key === parquetKey ? parquet : key === manifestKey ? manifest : null;
+        return body ? { key, body, bytes: body.byteLength, content_sha256: sha256Hex(body), source } : null;
+      },
+    },
+  });
+  assert.deepEqual(requested, [[parquetKey, "dropbox"], [manifestKey, "dropbox"]]);
+  assert.deepEqual([...resolved.keys()], [parquetKey, manifestKey]);
+});
+
 function exactHierarchy(dayUtc, timeseriesId) {
   const built = buildObservationHistoryV3SteadyStatePartition({
     source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
@@ -229,4 +260,11 @@ test("reconstructed exact-v3 state republishes changed roots and drops absent ol
     desiredRoots.find(({ key }) => key === changedUnselected.scoped_manifest.key).sha256,
     changedUnselected.scoped_manifest.sha256,
   );
+  assert.deepEqual(reconciled.removedScopes, [{
+    day_utc: "2026-06-03",
+    connector_id: 1,
+    pollutant_code: "no2",
+    exact_prefix: "history/_index_v3/observations_timeseries/day_utc=2026-06-03/connector_id=1/pollutant_code=no2",
+    aligned_prefix: "history/_index_v3/observations_timeseries/_aligned/day_utc=2026-06-03/connector_id=1/pollutant_code=no2",
+  }]);
 });

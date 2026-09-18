@@ -135,7 +135,11 @@ export async function runPersistedSosLightV3Apply({
     }
   }
   const days = selectedDays(runState);
-  if (!days.length || proposal?.prefixes?.length !== days.length) {
+  const dayDeletionPrefixes = (proposal?.prefixes || [])
+    .filter(({ entry }) => entry?.stage === "sos_light_complete_day");
+  const exactScopeRemovalPrefixes = (proposal?.prefixes || [])
+    .filter(({ entry }) => entry?.stage === "sos_light_exact_v3_scope_removal");
+  if (!days.length || dayDeletionPrefixes.length !== days.length) {
     throw new Error("SOS-light-v3 persisted apply requires validated selected days");
   }
   const counts = {
@@ -566,6 +570,60 @@ export async function runPersistedSosLightV3Apply({
     }
   };
 
+  const executePlannedExactScopeRemoval = async ({ prefix, entry }) => {
+    currentOperation = {
+      key: prefix,
+      publication_stage: "sos_light_exact_v3_scope_removal",
+    };
+    const existing = await adapters.listAllObjects({
+      r2,
+      prefix: `${prefix}/`,
+      max_keys: 10_000,
+    });
+    const keys = existing.map((object) => normalizedKey(object.key)).sort();
+    const sidecar = persistence.writeDeletedKeysSidecar({ prefix, keys });
+    Object.assign(entry, {
+      status: "deleting",
+      deletion_started_at_utc: new Date().toISOString(),
+      ...sidecar,
+    });
+    persistence.appendEvent({
+      event_type: "exact_v3_scope_deletion_started",
+      prefix,
+      ...mutationContext(prefix, "sos_light_exact_v3_scope_removal"),
+      status: "started",
+      deleted_object_count: keys.length,
+      deleted_keys_sha256: sidecar.deleted_keys_sha256,
+    });
+    persistence.flush();
+    if (keys.length) await adapters.deleteObjects({ r2, keys });
+    const remaining = await adapters.listAllObjects({
+      r2,
+      prefix: `${prefix}/`,
+      max_keys: 10_000,
+    });
+    if (remaining.length) {
+      throw new Error(`SOS-light-v3 exact scope deletion verification failed: ${prefix}`);
+    }
+    Object.assign(entry, {
+      status: "verified",
+      deletion_verified: true,
+      deleted_object_count: keys.length,
+      deletion_completed_at_utc: new Date().toISOString(),
+    });
+    counts.completed_deletions += 1;
+    counts.deleted_objects += keys.length;
+    persistence.appendEvent({
+      event_type: "exact_v3_scope_deletion_verified",
+      prefix,
+      ...mutationContext(prefix, "sos_light_exact_v3_scope_removal"),
+      status: "verified",
+      deleted_object_count: keys.length,
+      deleted_keys_sha256: sidecar.deleted_keys_sha256,
+    });
+    persistence.flush();
+  };
+
   const frozenPublicationOrder = () => {
     const byKey = new Map(proposal.objects.map((object) => [object.key, object]));
     const remaining = new Map(byKey);
@@ -600,6 +658,9 @@ export async function runPersistedSosLightV3Apply({
     persistence.flush();
     checkpoint("fixed_v3_apply_intent_before_first_mutation");
     for (const day of days) await prepareCompleteDayReplacement({ day_utc: day });
+    for (const removal of exactScopeRemovalPrefixes) {
+      await executePlannedExactScopeRemoval(removal);
+    }
     for (const object of orderedObjects) {
       if (object.key.endsWith(".parquet")) {
         await trackedPutAndVerifyParquet(object);

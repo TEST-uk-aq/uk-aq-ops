@@ -130,17 +130,33 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
   const oldKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/obsolete.json`;
   const publishedKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/manifest.json`;
   const publishedBody = Buffer.from('{"schema_version":3}\n', "utf8");
+  const latestKey = "history/_index_v3/observations_timeseries_latest.json";
+  const latestBody = Buffer.from('{"kind":"observation_timeseries_latest_global"}\n');
   const parquetKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/pollutant_code=no2/part-00000.parquet`;
   const parquetBody = Buffer.from("planned-parquet", "utf8");
-  const store = new Map([[oldKey, Buffer.from("obsolete", "utf8")]]);
+  const removedExactPrefix = "history/_index_v3/observations_timeseries/day_utc=2026-05-31/connector_id=1/pollutant_code=no2";
+  const removedAlignedPrefix = "history/_index_v3/observations_timeseries/_aligned/day_utc=2026-05-31/connector_id=1/pollutant_code=no2";
+  const store = new Map([
+    [oldKey, Buffer.from("obsolete", "utf8")],
+    [`${removedExactPrefix}/manifest.json`, Buffer.from("old-exact")],
+    [`${removedAlignedPrefix}/manifest.json`, Buffer.from("old-aligned")],
+  ]);
   const publicationOrder = [];
-  const tombstone = { proposed: true, prefix: dayPrefix };
+  const tombstone = { proposed: true, prefix: dayPrefix, stage: "sos_light_complete_day" };
+  const exactTombstone = {
+    proposed: true, prefix: removedExactPrefix,
+    stage: "sos_light_exact_v3_scope_removal",
+  };
+  const alignedTombstone = {
+    proposed: true, prefix: removedAlignedPrefix,
+    stage: "sos_light_exact_v3_scope_removal",
+  };
   const runState = {
     run_id: "sos-light-v3-persistence-test",
     run_root: root,
     execution_path: "sos_light",
     sos_light: { days: [{ day_utc: DAY_UTC }] },
-    tombstone_prefixes: [tombstone],
+    tombstone_prefixes: [tombstone, exactTombstone, alignedTombstone],
   };
   const proposal = {
     objects: [{
@@ -161,8 +177,20 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
         content_type: "application/json",
         publication_stage: "observation_connector_manifest",
       },
+    }, {
+      key: latestKey,
+      body: latestBody,
+      entry: {
+        dependencies: [publishedKey],
+        content_type: "application/json",
+        publication_stage: "latest_global",
+      },
     }],
-    prefixes: [{ prefix: dayPrefix, entry: tombstone }],
+    prefixes: [
+      { prefix: dayPrefix, entry: tombstone },
+      { prefix: removedExactPrefix, entry: exactTombstone },
+      { prefix: removedAlignedPrefix, entry: alignedTombstone },
+    ],
   };
   const adapters = {
     getObject: async ({ key }) => store.has(key)
@@ -210,17 +238,21 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
     });
     assert.equal(result.status, "succeeded");
     assert.equal(store.has(oldKey), false);
-    assert.deepEqual(publicationOrder, [parquetKey, publishedKey]);
+    assert.equal(store.has(`${removedExactPrefix}/manifest.json`), false);
+    assert.equal(store.has(`${removedAlignedPrefix}/manifest.json`), false);
+    assert.deepEqual(publicationOrder, [parquetKey, publishedKey, latestKey]);
     assert.deepEqual(store.get(parquetKey), parquetBody);
     assert.deepEqual(store.get(publishedKey), publishedBody);
 
     const persisted = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
     assert.equal(persisted.apply.status, "succeeded");
-    assert.equal(persisted.apply.v3_publication_evidence.length, 2);
+    assert.equal(persisted.apply.v3_publication_evidence.length, 3);
     assert.equal(persisted.apply.v3_publication_evidence[0].sha256, sha256(parquetBody));
     assert.equal(persisted.apply.v3_publication_evidence[0].stored_sha256_verified, true);
     assert.equal(persisted.apply.v3_publication_evidence[0].stored_byte_size_verified, true);
     assert.equal(persisted.tombstone_prefixes[0].deletion_verified, true);
+    assert.equal(persisted.tombstone_prefixes[1].deletion_verified, true);
+    assert.equal(persisted.tombstone_prefixes[2].deletion_verified, true);
 
     const verifierPath = fileURLToPath(new URL(
       "../scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3_impl.py",
@@ -244,10 +276,10 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
     assert.equal(verification.status, 0, verification.stderr);
     const verified = JSON.parse(verification.stdout);
     assert.equal(verified.persistence.status, "verified");
-    assert.equal(verified.persistence.verified_publication_object_count, 2);
+    assert.equal(verified.persistence.verified_publication_object_count, 3);
     assert.equal(verified.summary.status, "ok");
-    assert.equal(verified.summary.r2_objects_written, 2);
-    assert.equal(verified.summary.r2_objects_deleted, 1);
+    assert.equal(verified.summary.r2_objects_written, 3);
+    assert.equal(verified.summary.r2_objects_deleted, 3);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -261,7 +293,7 @@ test("fixed-v3 apply records failure after deletion instead of false success", a
   const store = new Map([[oldKey, Buffer.from("obsolete", "utf8")]]);
   const failedParquetKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/pollutant_code=no2/part-00000.parquet`;
   let dependentPutAttempted = false;
-  const tombstone = { proposed: true, prefix: dayPrefix };
+  const tombstone = { proposed: true, prefix: dayPrefix, stage: "sos_light_complete_day" };
   const runState = {
     run_id: "sos-light-v3-failure-test",
     run_root: root,
@@ -323,6 +355,67 @@ test("fixed-v3 apply records failure after deletion instead of false success", a
     assert.equal(persisted.tombstone_prefixes[0].deletion_verified, true);
     assert.equal(store.has(oldKey), false);
     assert.equal(dependentPutAttempted, false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("canonical finalisation failure blocks global latest publication", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-sos-light-v3-finalisation-"));
+  const runStatePath = path.join(root, "run-state.json");
+  const dayPrefix = `history/v3/observations/day_utc=${DAY_UTC}`;
+  const canonicalKey = `${dayPrefix}/manifest.json`;
+  const latestKey = "history/_index_v3/observations_timeseries_latest.json";
+  const tombstone = {
+    proposed: true,
+    prefix: dayPrefix,
+    stage: "sos_light_complete_day",
+  };
+  const attempted = [];
+  try {
+    await assert.rejects(runPersistedSosLightV3Apply({
+      runStatePath,
+      runState: {
+        run_id: "sos-light-v3-finalisation-test",
+        run_root: root,
+        execution_path: "sos_light",
+        sos_light: { days: [{ day_utc: DAY_UTC }] },
+        tombstone_prefixes: [tombstone],
+      },
+      proposal: {
+        objects: [{
+          key: canonicalKey,
+          body: Buffer.from("{}\n"),
+          entry: {
+            dependencies: [],
+            content_type: "application/json",
+            publication_stage: "observation_day_manifest",
+          },
+        }, {
+          key: latestKey,
+          body: Buffer.from("{}\n"),
+          entry: {
+            dependencies: [canonicalKey],
+            content_type: "application/json",
+            publication_stage: "latest_global",
+          },
+        }],
+        prefixes: [{ prefix: dayPrefix, entry: tombstone }],
+      },
+      r2: {},
+      adapters: {
+        getObject: async () => ({ exists: false, body: Buffer.alloc(0) }),
+        putObject: async ({ key }) => {
+          attempted.push(key);
+          if (key === canonicalKey) throw new Error("simulated canonical finalisation failure");
+          return { status: "succeeded" };
+        },
+        putAndVerifyParquet: async () => { throw new Error("unexpected Parquet"); },
+        listAllObjects: async () => [],
+        deleteObjects: async () => ({ deleted: 0 }),
+      },
+    }), /simulated canonical finalisation failure/);
+    assert.deepEqual(attempted, [canonicalKey]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

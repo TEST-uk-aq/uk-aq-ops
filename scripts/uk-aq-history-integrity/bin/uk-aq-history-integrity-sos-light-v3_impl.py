@@ -18616,6 +18616,35 @@ def _record_metadata_executor_overlay(
     run_state["proposal_transition_planner_unchanged_keys"] = sorted(
         planner_unchanged_keys
     )
+    prefix_tombstones = list(run_state.get("tombstone_prefixes") or [])
+    for removed_scope in list(planning.get("removed_exact_v3_scopes") or []):
+        if not isinstance(removed_scope, Mapping):
+            raise ValueError("fixed-v3 removed scope evidence is invalid")
+        for hierarchy, field in (
+            ("exact", "exact_prefix"),
+            ("aligned", "aligned_prefix"),
+        ):
+            prefix = _normalise_overlay_object_key(
+                str(removed_scope.get(field) or "")
+            ).rstrip("/")
+            prefix_tombstones.append({
+                "prefix": prefix,
+                "proposed": True,
+                "deleted": False,
+                "deletion_verified": False,
+                "stage": "sos_light_exact_v3_scope_removal",
+                "hierarchy": hierarchy,
+                "day_utc": str(removed_scope.get("day_utc") or ""),
+                "connector_id": int(removed_scope.get("connector_id") or 0),
+                "pollutant_code": str(
+                    removed_scope.get("pollutant_code") or ""
+                ),
+                "authority": "pinned_dropbox_latest_minus_canonical_reconstruction",
+            })
+    run_state["tombstone_prefixes"] = sorted(
+        {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
+        key=lambda entry: str(entry["prefix"]),
+    )
     write_run_state(run_state)
 
 
@@ -19050,7 +19079,13 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         total_day_uploads += len(day_keys)
         raw_day.update(day)
 
-    run_state["tombstone_prefixes"] = [
+    existing_index_scope_removals = [
+        dict(entry)
+        for entry in list(run_state.get("tombstone_prefixes") or [])
+        if isinstance(entry, Mapping)
+        and entry.get("stage") == "sos_light_exact_v3_scope_removal"
+    ]
+    run_state["tombstone_prefixes"] = existing_index_scope_removals + [
         {
             "prefix": (
                 f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
@@ -20021,7 +20056,10 @@ def _verify_sos_light_v3_apply_persistence(
     if apply_summary.get("status") == "succeeded" and not (
         verified_deletions
         == int(apply_summary.get("completed_deletions") or 0)
-        == int(event_types.get("deletion_verified") or 0)
+        == (
+            int(event_types.get("deletion_verified") or 0)
+            + int(event_types.get("exact_v3_scope_deletion_verified") or 0)
+        )
     ):
         raise ValueError("v3 deletion verification counts differ")
 
