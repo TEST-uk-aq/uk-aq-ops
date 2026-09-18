@@ -50,6 +50,16 @@ export function requireCanonicalVerificationStatus(value) {
   throw new TypeError("verification_status must be P, R or null");
 }
 
+export function selectObservationVerificationStatusColumn(schemaColumns) {
+  return schemaColumns.has("vstatus")
+    ? "vstatus"
+    : schemaColumns.has("verification_status")
+    ? "verification_status"
+    : schemaColumns.has("status")
+    ? "status"
+    : null;
+}
+
 export function resolveLegacyVerificationStatus(row, { isSos = false } = {}) {
   const source = row && typeof row === "object" ? row : {};
   if (Object.hasOwn(source, "verification_status")) {

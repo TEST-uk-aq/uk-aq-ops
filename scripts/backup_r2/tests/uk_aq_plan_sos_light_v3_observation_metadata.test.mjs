@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -6,8 +9,14 @@ import {
 } from "../uk_aq_plan_sos_light_v3_observation_metadata.mjs";
 import {
   readCanonicalObservationRows,
-  selectObservationVerificationStatusColumn,
 } from "../uk_aq_apply_integrity_proposal.mjs";
+import {
+  inspectObservationParquetFile,
+} from "../lib/uk_aq_observation_parquet_content_hash.mjs";
+import {
+  computeObservationContentHash,
+  selectObservationVerificationStatusColumn,
+} from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 import {
   buildObservationHistoryV3SteadyStatePartition,
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
@@ -75,6 +84,31 @@ test("canonical v3 vstatus survives Parquet decoding", async () => {
     readCanonicalObservationRows({ body, connectorId: 1 })
   ))).flat();
   assert.deepEqual(decodedV3.map(({ verification_status }) => verification_status), ["P", "R"]);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-vstatus-decoders-"));
+  try {
+    const inspectedRows = [];
+    for (const [index, intent] of v3.file_intents.entries()) {
+      const filePath = path.join(root, `part-${index}.parquet`);
+      fs.writeFileSync(filePath, intent.body);
+      const inspected = await inspectObservationParquetFile({ filePath, connectorId: 1 });
+      inspectedRows.push(...inspected.canonicalRows);
+    }
+    assert.deepEqual(
+      inspectedRows.map(({ verification_status }) => verification_status),
+      ["P", "R"],
+    );
+    assert.equal(
+      computeObservationContentHash(inspectedRows).observation_content_hash,
+      computeObservationContentHash(decodedV3).observation_content_hash,
+    );
+    assert.deepEqual(
+      computeObservationContentHash(inspectedRows).verification_status_counts,
+      computeObservationContentHash(decodedV3).verification_status_counts,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("status-column selection prefers vstatus and retains legacy names", () => {

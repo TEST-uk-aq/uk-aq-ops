@@ -16,6 +16,7 @@ import {
   encodeCanonicalObservationRow,
   normalizeCanonicalObservationRow,
   resolveLegacyVerificationStatus,
+  selectObservationVerificationStatusColumn,
   validateObservationContentHashMetadata,
 } from "../../workers/shared/uk_aq_observation_content_hash.mjs";
 import {
@@ -1638,16 +1639,6 @@ export async function readCanonicalObservationRows({ body, connectorId }) {
       }),
     });
   });
-}
-
-export function selectObservationVerificationStatusColumn(schemaColumns) {
-  return schemaColumns.has("vstatus")
-    ? "vstatus"
-    : schemaColumns.has("verification_status")
-    ? "verification_status"
-    : schemaColumns.has("status")
-    ? "status"
-    : null;
 }
 
 function timeseriesRowCounts(rows) {

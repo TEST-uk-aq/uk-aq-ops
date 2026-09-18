@@ -4,6 +4,7 @@ import {
   computeObservationContentHash,
   normalizeCanonicalObservationRow,
   resolveLegacyVerificationStatus,
+  selectObservationVerificationStatusColumn,
 } from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 import {
   compressors,
@@ -51,11 +52,7 @@ export async function inspectObservationParquetFile({ filePath, connectorId }) {
       `Observation Parquet is missing canonical columns: ${missing.join(",")}`,
     );
   }
-  const statusColumn = schemaColumns.has("verification_status")
-    ? "verification_status"
-    : schemaColumns.has("status")
-    ? "status"
-    : null;
+  const statusColumn = selectObservationVerificationStatusColumn(schemaColumns);
   const columns = [...required, ...(statusColumn ? [statusColumn] : [])];
   let rows = [];
   await parquetRead({
