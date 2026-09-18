@@ -153,29 +153,32 @@ Common additions are:
 - [`current_state_reconciliation.md`](current_state_reconciliation.md) when verified repair can affect timeseries freshness or Latest Snapshot;
 - [`daily_profile_selection.md`](daily_profile_selection.md) for scheduled selection;
 - [`observation_history_index_v3_contract.md`](observation_history_index_v3_contract.md) plus [`observation_history_index_v3_exact_leaf_amendment.md`](observation_history_index_v3_exact_leaf_amendment.md) for post-cut-over physical writing/index/read behaviour;
-- [`../backup_and_recovery/r2_history_index_v3_backup_amendment.md`](../backup_and_recovery/r2_history_index_v3_backup_amendment.md) and [`../backup_and_recovery/r2_history_dropbox_sync_contract.md`](../backup_and_recovery/r2_history_dropbox_sync_contract.md) when a partial fixed-v3 repair must retain unchanged scoped roots in the global latest index and prove them from the pinned Dropbox generation.
+- [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md) for SOS-light fixed-v2/fixed-v3 repair authority, overlay planning and the rule that pre-apply live R2 is not a planning or dependency source.
 
 For Latest Snapshot reconciliation also read [`../latest_snapshot/integrity_reconciliation.md`](../latest_snapshot/integrity_reconciliation.md).
 
 ### SOS historical repair and SOS-light
 
-Start with the generic Integrity route, then add:
+For SOS-light, start with the load-bearing authority contract:
 
-1. [`sos_light_model.md`](sos_light_model.md)
-2. [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md)
-3. [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md)
+1. [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md)
+2. [`sos_light_model.md`](sos_light_model.md)
+3. [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md)
+4. [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md)
 
-Use [`CONTRACT_INDEX.md`](CONTRACT_INDEX.md) only if the SOS task also enters direct selected-partition replacement, staged-write provenance, protected-connector preservation or another narrow Integrity boundary.
+The three-phase contract owns the simple fixed-v2/fixed-v3 authority model:
+
+```text
+DETECT  = Dropbox baseline + authoritative repair source
+PROPOSE = Dropbox baseline + repair overlay + deterministic derived rebuilds
+APPLY   = mutate the frozen changed/removed set, then verify those R2 results
+```
+
+It explicitly forbids pre-apply live-R2 data comparison/dependency discovery and forbids expanding normal Dropbox backup merely to preserve derived v3 index dependencies.
+
+Use [`CONTRACT_INDEX.md`](CONTRACT_INDEX.md) only if the SOS task also enters direct selected-partition replacement, staged-write provenance, protected-connector preservation or another narrow Integrity boundary. Where one of those generic contracts conflicts with the three-phase SOS-light authority model, the three-phase contract wins for SOS-light.
 
 Add [`current_state_reconciliation.md`](current_state_reconciliation.md) and [`../latest_snapshot/integrity_reconciliation.md`](../latest_snapshot/integrity_reconciliation.md) only when the repaired history can affect current state.
-
-For fixed-v3 SOS-light repair that updates the global exact-v3 latest index while preserving unchanged scopes outside the selected repair range, also read:
-
-1. [`../backup_and_recovery/r2_history_index_v3_backup_amendment.md`](../backup_and_recovery/r2_history_index_v3_backup_amendment.md);
-2. [`../backup_and_recovery/r2_history_dropbox_sync_contract.md`](../backup_and_recovery/r2_history_dropbox_sync_contract.md);
-3. [`observation_history_index_v3_backup_evidence_location_amendment.md`](observation_history_index_v3_backup_evidence_location_amendment.md).
-
-Those contracts require retained unchanged scoped-root dependencies to be proven from the same pinned Dropbox generation. The global latest descriptor alone is not durable-object proof, and live R2 is not a substitute planning authority.
 
 Do not load Prune Daily deletion-gate contracts for an SOS-only task unless the task actually crosses that ownership boundary.
 
@@ -207,6 +210,7 @@ Some established filenames remain because older active or historical documents l
 
 Current explicit precedence includes:
 
+- [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md) over conflicting SOS-light planning/currentness/provenance/backup wording, including any requirement to use live R2 before apply or retain/copy derived v3 scoped-root dependencies merely for SOS-light;
 - [`aqi_r2_retirement_contract.md`](aqi_r2_retirement_contract.md) over older active-AQI-in-R2 wording;
 - [`prune_daily_observation_only_phase_b_contract.md`](prune_daily_observation_only_phase_b_contract.md) for the permanent observation-only Phase B model;
 - [`prune_daily_complete_snapshot_child_set_contract.md`](prune_daily_complete_snapshot_child_set_contract.md) over generic child-preservation wording when Prune Daily owns a complete connector-day source snapshot;
