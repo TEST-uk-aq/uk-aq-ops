@@ -16,6 +16,7 @@ import {
   encodeCanonicalObservationRow,
   normalizeCanonicalObservationRow,
   resolveLegacyVerificationStatus,
+  selectObservationVerificationStatusColumn,
   validateObservationContentHashMetadata,
 } from "../../workers/shared/uk_aq_observation_content_hash.mjs";
 import {
@@ -1598,11 +1599,7 @@ export async function readCanonicalObservationRows({ body, connectorId }) {
   if (missing.length) {
     throw new Error(`Repaired observation Parquet is missing canonical columns: ${missing.join(",")}`);
   }
-  const statusColumn = schemaColumns.has("verification_status")
-    ? "verification_status"
-    : schemaColumns.has("status")
-    ? "status"
-    : null;
+  const statusColumn = selectObservationVerificationStatusColumn(schemaColumns);
   const columns = [...required, ...(statusColumn ? [statusColumn] : [])];
   let decodedRows = [];
   await parquetRead({

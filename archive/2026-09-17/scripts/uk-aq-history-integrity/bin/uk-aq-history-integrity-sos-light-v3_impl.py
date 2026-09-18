@@ -18270,73 +18270,6 @@ def _run_v2_observation_metadata_executor(
     }
 
 
-def _run_v3_observation_metadata_proposal(
-    *,
-    env: Mapping[str, str],
-    actions: list[dict[str, Any]],
-    dry_run: bool,
-    log: logging.Logger,
-    run_state: Mapping[str, Any],
-    conn: sqlite3.Connection | None = None,
-) -> dict[str, Any]:
-    """Run the proposal-only fixed-v3 observation metadata planner."""
-    if not actions:
-        return {"status": "not_run", "reason": "no_observation_metadata_actions", "results": []}
-    repo_root = _repo_root_for_integrity_script(env)
-    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
-    command = [
-        node_bin,
-        str(repo_root / "scripts/backup_r2/uk_aq_plan_sos_light_v3_observation_metadata.mjs"),
-        "--repair-plan-stdin",
-        "--overlay-root", str(run_state["overlay_root"]),
-        "--dropbox-root", str(run_state["base_dropbox_root"]),
-        "--run-state-json", str(run_state["run_state_path"]),
-    ]
-    plan = {
-        # Canonical manifest semantics deliberately remain v2; storage routing
-        # is selected independently by the dedicated fixed-v3 entry point.
-        "history_version": "v2",
-        "domain": "observations",
-        "repair_plan": actions,
-        "authoritative_core_timeseries": _authoritative_v2_core_timeseries_bindings(conn),
-    }
-    proc = subprocess.run(
-        command,
-        cwd=repo_root,
-        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        input=json.dumps(plan),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    for line in proc.stderr.splitlines():
-        log.info("v3 metadata proposal planner %s", line)
-    try:
-        output = json.loads(proc.stdout) if proc.stdout.strip() else {}
-    except json.JSONDecodeError:
-        output = {}
-    if proc.returncode != 0:
-        log.warning(
-            "v3 observation metadata proposal failed exit_code=%s stderr=%s",
-            proc.returncode,
-            _truncate_text(proc.stderr or proc.stdout or "", 2000),
-        )
-        return {
-            "status": str(output.get("status") or "failed") if isinstance(output, Mapping) else "failed",
-            "exit_code": proc.returncode,
-            "error": _truncate_text(proc.stderr or proc.stdout or "", 4000),
-            "output": output if isinstance(output, Mapping) else {},
-            "results": output.get("results") if isinstance(output, Mapping) else [],
-        }
-    return {
-        "status": str(output.get("status") or "planned"),
-        "exit_code": proc.returncode,
-        "output": output,
-        "results": output.get("results") if isinstance(output, Mapping) else [],
-    }
-
-
 def _record_metadata_executor_overlay(
     *,
     run_state: dict[str, Any],
@@ -23252,7 +23185,7 @@ def run_v2_integrity_repair_flow(
     metadata = (
         {"status": "blocked_dependency", "reason": "observation_repair_failed", "results": []}
         if observation_failed else
-        _run_v3_observation_metadata_proposal(
+        _run_v2_observation_metadata_executor(
             env=env, actions=metadata_actions, dry_run=dry_run, log=log,
             run_state=run_state, conn=conn,
         )
