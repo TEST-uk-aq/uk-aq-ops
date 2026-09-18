@@ -16,7 +16,7 @@ import {
 } from "./lib/rclone.mjs";
 import {
   buildObservationRunManifestStateShard,
-  buildScopedRootsStateShard,
+  processScopedRootsCheckpoint,
   completeObservationMonthState,
   emptyHierarchicalStateRoot,
   markLatestTimeseriesProcessed,
@@ -1395,26 +1395,27 @@ async function main() {
     if (previousRaw) {
       try { previous = validateScopedRootsStateShard(previousRaw.parsed); } catch { previous = null; }
     }
-    const verified = [];
-    for (const root of scopedRootsInventoryShard.roots) {
-      const existing = readRemoteFileIdentity(args.rclone_bin, args.dest_root, root.key);
-      if (existing.exists && existing.sha256 === root.sha256 && existing.size === root.byte_size) {
-        report.scoped_roots.reused += 1;
-      } else {
+    let lastWrite = null;
+    const processed = await processScopedRootsCheckpoint({
+      inventory: scopedRootsInventoryShard,
+      priorState: previous,
+      checkpointBatchUnits: args.checkpoint_batch_units,
+      checkpointFlushSeconds: args.checkpoint_flush_seconds,
+      inspectDestination: async (root) => readRemoteFileIdentity(args.rclone_bin, args.dest_root, root.key),
+      copyAndVerify: async (root) => {
         const copied = copyAndVerifyJsonFile({ rcloneBin: args.rclone_bin, sourceRoot: args.source_root, destRoot: args.dest_root, relativePath: root.key, dryRun: false });
         if (!copied.verified || copied.source_hash !== root.sha256 || copied.source_size !== root.byte_size) throw new Error(`V3 scoped-root source/copy identity mismatch: ${root.key}`);
-        const destination = readRemoteFileIdentity(args.rclone_bin, args.dest_root, root.key);
-        if (!destination.exists || destination.sha256 !== root.sha256 || destination.size !== root.byte_size) throw new Error(`V3 scoped-root Dropbox verification failed: ${root.key}`);
         report.scoped_roots.copied += 1;
-      }
-      verified.push({ ...root, destination_verified: true });
-      const partial = buildScopedRootsStateShard(scopedRootsInventoryShard, verified);
-      uploadJson({ rcloneBin: args.rclone_bin, root: args.dest_root, relativePath: statePointer.state_shard_key, payload: partial, dryRun: false });
-    }
-    const complete = buildScopedRootsStateShard(scopedRootsInventoryShard, verified);
-    const write = uploadJson({ rcloneBin: args.rclone_bin, root: args.dest_root, relativePath: statePointer.state_shard_key, payload: complete, dryRun: false });
+      },
+      flushState: async (state) => { lastWrite = uploadJson({ rcloneBin: args.rclone_bin, root: args.dest_root, relativePath: statePointer.state_shard_key, payload: state, dryRun: false }); },
+    });
+    const complete = processed.state;
+    const write = lastWrite;
     stateRoot.global_units.observations_timeseries_scoped_roots = { state_shard_key: statePointer.state_shard_key, processed_global_latest_sha256: complete.global_latest_sha256, state_shard_hash: write.hash, complete: complete.complete };
-    report.scoped_roots.verified = verified.length;
+    report.scoped_roots.verified = complete.roots.filter((root) => root.destination_verified).length;
+    report.scoped_roots.reused = report.scoped_roots.verified - report.scoped_roots.copied;
+    report.scoped_roots.checkpoint_flush_count = processed.flush_count;
+    report.scoped_roots.prior_state_compatible = processed.prior_compatible;
     report.scoped_roots.complete = complete.complete;
     stateRootDirty = true;
   }
@@ -1452,15 +1453,10 @@ async function main() {
   report.observations.processed_source_root_hash =
     stateRoot.observations.processed_source_root_hash;
   report.completed_at = new Date().toISOString();
-  report.complete = report.observations.incomplete_months.length === 0
-    && report.observations.incomplete_years.length === 0
-    && report.timeseries_binding.incomplete_ranges.length === 0
-    && report.timeseries_binding_packs.complete
-    && report.core.complete
-    && report.run_manifests.complete
-    && !report.latest_timeseries.incomplete;
+  report.complete = backupReportIsComplete(report, generation.version);
   report.ok = report.prune.forced_failed_days === 0
-    && report.latest_timeseries.error === null;
+    && report.latest_timeseries.error === null
+    && (generation.version !== "v3" || report.scoped_roots?.complete === true);
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));
   if (!report.ok) {
@@ -1468,6 +1464,17 @@ async function main() {
   } else if (!report.complete && !args.dry_run && args.max_days_per_run === 0) {
     process.exitCode = 1;
   }
+}
+
+export function backupReportIsComplete(report, generationVersion) {
+  return report.observations.incomplete_months.length === 0
+    && report.observations.incomplete_years.length === 0
+    && report.timeseries_binding.incomplete_ranges.length === 0
+    && report.timeseries_binding_packs.complete
+    && report.core.complete
+    && report.run_manifests.complete
+    && !report.latest_timeseries.incomplete
+    && (generationVersion !== "v3" || report.scoped_roots?.complete === true);
 }
 
 function isMainModule(moduleUrl) {
