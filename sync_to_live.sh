@@ -155,6 +155,10 @@ COMMON_EXCLUDES=(
   --exclude='*.numbers'
   --exclude='*.zip'
   --exclude='*.xlsx'
+
+  # Documentation is TEST-only and is never promoted to LIVE.
+  --exclude='/docs/'
+  --exclude='/ref_docs/'
   
   # Runtime, investigation and local output
   --exclude='logs/'
@@ -316,7 +320,6 @@ sync_repo() {
         --exclude='workers/shared/postcode_lookup.mjs'
         --exclude='scripts/postcodes/'
         --exclude='scripts/geography/*postcode*'
-        --exclude='docs/*postcode*'
         --exclude='system_docs/geography/postcode_lookup.md'
       )
       ;;

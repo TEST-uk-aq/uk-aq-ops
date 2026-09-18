@@ -45,7 +45,10 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 - observation-history index v3 and exact-leaf behaviour;
 - Integrity writer/core/proposal/apply safety;
 - direct selected-partition replacement and run exclusion;
-- R2 history Dropbox backup, inventory, sync and v3 backup evidence.
+- R2 history Dropbox backup, inventory, sync and v3 backup evidence;
+- AURN validation-status behaviour;
+- Media Bluesky publication behaviour;
+- Media dashboard behaviour and article/Bluesky preview contracts.
 
 It is intentionally not a complete copy of all UK AQ system documentation.
 
