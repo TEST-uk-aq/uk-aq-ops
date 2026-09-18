@@ -205,6 +205,57 @@ mark_failure() {
   FAILED_REPOS+=("${label}")
 }
 
+apply_live_website_overrides() {
+  local src="$1"
+  local dst="$2"
+  local sidebar
+
+  # TEST keeps the WHO navigation item. For Stage 1 LIVE, remove that complete
+  # nav-config line after rsync so every other sidebar.js change still promotes.
+  # Remove this override when the WHO guidelines page is ready for LIVE.
+  if [[ "${APPLY}" -eq 0 ]]; then
+    sidebar="${src}/sidebar.js"
+  else
+    sidebar="${dst}/sidebar.js"
+  fi
+
+  if [[ ! -f "${sidebar}" ]]; then
+    echo "   ERROR [website]: sidebar.js not found: ${sidebar}" >&2
+    return 1
+  fi
+
+  python3 - "${sidebar}" "${APPLY}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+apply = sys.argv[2] == "1"
+text = path.read_text(encoding="utf-8")
+lines = text.splitlines(keepends=True)
+
+matches = [
+    index
+    for index, line in enumerate(lines)
+    if "WHO guidelines" in line and "href: '/who-guidelines/'" in line
+]
+
+if len(matches) != 1:
+    raise SystemExit(
+        f"Expected exactly one WHO guidelines nav line in {path}; found {len(matches)}"
+    )
+
+if apply:
+    del lines[matches[0]]
+    path.write_text("".join(lines), encoding="utf-8")
+    print(f"   LIVE override: removed WHO guidelines nav line from {path}")
+else:
+    print(
+        "   DRY RUN [website]: would remove the WHO guidelines nav line "
+        f"from LIVE sidebar.js (validated source: {path})"
+    )
+PY
+}
+
 sync_repo() {
   local label="$1"
   local src dst
@@ -290,7 +341,14 @@ sync_repo() {
         --exclude='supabase/'
       )
       ;;
-    website|pop-ingest|integrity-factory)
+    website)
+      rsync_args+=(
+        # Stage 1: keep the dedicated WHO guidelines page in TEST until it is
+        # ready for LIVE. Remove this exclusion when the page is promoted.
+        --exclude='who-guidelines/'
+      )
+      ;;
+    pop-ingest|integrity-factory)
       # No extra repo-specific exclusions at present.
       ;;
   esac
@@ -300,6 +358,13 @@ sync_repo() {
   fi
 
   if rsync "${rsync_args[@]}" "${src}/" "${dst}/"; then
+    if [[ "${label}" == "website" ]]; then
+      if ! apply_live_website_overrides "${src}" "${dst}"; then
+        echo "   ERROR [website]: LIVE website override failed" >&2
+        mark_failure "${label}"
+        return
+      fi
+    fi
     SUCCESS_REPOS+=("${label}")
   else
     echo "   ERROR [${label}]: rsync failed" >&2
