@@ -1454,16 +1454,13 @@ async function main() {
     stateRoot.observations.processed_source_root_hash;
   report.completed_at = new Date().toISOString();
   report.complete = backupReportIsComplete(report, generation.version);
-  report.ok = report.prune.forced_failed_days === 0
-    && report.latest_timeseries.error === null
-    && (generation.version !== "v3" || report.scoped_roots?.complete === true);
+  report.ok = backupReportIsOk(report);
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));
-  if (!report.ok) {
-    process.exitCode = 1;
-  } else if (!report.complete && !args.dry_run && args.max_days_per_run === 0) {
-    process.exitCode = 1;
-  }
+  process.exitCode = backupReportExitCode(report, {
+    dryRun: args.dry_run,
+    maxDaysPerRun: args.max_days_per_run,
+  });
 }
 
 export function backupReportIsComplete(report, generationVersion) {
@@ -1475,6 +1472,17 @@ export function backupReportIsComplete(report, generationVersion) {
     && report.run_manifests.complete
     && !report.latest_timeseries.incomplete
     && (generationVersion !== "v3" || report.scoped_roots?.complete === true);
+}
+
+export function backupReportIsOk(report) {
+  return report.prune.forced_failed_days === 0
+    && report.latest_timeseries.error === null;
+}
+
+export function backupReportExitCode(report, { dryRun, maxDaysPerRun }) {
+  if (!report.ok) return 1;
+  if (!report.complete && !dryRun && maxDaysPerRun === 0) return 1;
+  return 0;
 }
 
 function isMainModule(moduleUrl) {

@@ -10,7 +10,11 @@ import {
 } from "../lib/hierarchical_backup_v2.mjs";
 import { getObservationHistoryGeneration } from "../../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { requireCompleteCheckpoint } from "../uk_aq_check_integrity_dropbox_currentness.mjs";
-import { backupReportIsComplete } from "../sync_history_to_dropbox.mjs";
+import {
+  backupReportExitCode,
+  backupReportIsComplete,
+  backupReportIsOk,
+} from "../sync_history_to_dropbox.mjs";
 
 const sha = (character) => character.repeat(64);
 const latestKey = "history/_index_v3/observations_timeseries_latest.json";
@@ -87,7 +91,16 @@ test("old v3 is readable but incomplete, while v2 and report semantics remain co
   assert.throws(() => requireCompleteCheckpoint(upgraded, "individual", v3), /scoped_roots_incomplete/);
   const v2 = getObservationHistoryGeneration("v2");
   assert.equal(emptyHierarchicalStateRoot(v2.backup_state_prefix, v2).global_units.observations_timeseries_scoped_roots, undefined);
-  const report = { observations: { incomplete_months: [], incomplete_years: [] }, timeseries_binding: { incomplete_ranges: [] }, timeseries_binding_packs: { complete: true }, core: { complete: true }, run_manifests: { complete: true }, latest_timeseries: { incomplete: false }, scoped_roots: { complete: false } };
+  const report = { observations: { incomplete_months: [], incomplete_years: [] }, timeseries_binding: { incomplete_ranges: [] }, timeseries_binding_packs: { complete: true }, core: { complete: true }, run_manifests: { complete: true }, latest_timeseries: { incomplete: false, error: null }, scoped_roots: { complete: false } };
   assert.equal(backupReportIsComplete(report, "v2"), true);
   assert.equal(backupReportIsComplete(report, "v3"), false);
+  report.ok = backupReportIsOk({ ...report, prune: { forced_failed_days: 0 } });
+  report.complete = backupReportIsComplete(report, "v3");
+  assert.equal(report.ok, true);
+  assert.equal(backupReportExitCode(report, { dryRun: true, maxDaysPerRun: 0 }), 0);
+  assert.equal(backupReportExitCode(report, { dryRun: false, maxDaysPerRun: 0 }), 1);
+  report.scoped_roots.complete = true;
+  report.complete = backupReportIsComplete(report, "v3");
+  assert.equal(report.complete, true);
+  assert.equal(backupReportExitCode(report, { dryRun: false, maxDaysPerRun: 0 }), 0);
 });
