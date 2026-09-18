@@ -2,7 +2,7 @@
 
 ## Authority and scope
 
-This document is the authoritative contract for the dedicated write-enabled UK-AIR SOS historical replacement path, referred to as **SOS-light**.
+This document is the broad authoritative contract for the dedicated write-enabled UK-AIR SOS historical replacement path, referred to as **SOS-light**.\n\nFor the load-bearing planning, authority and R2-access model used by both fixed-generation entry points, [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md) is the narrower authority. Where older wording here conflicts with that three-phase contract, the three-phase contract wins.
 
 It overrides conflicting dedicated-SOS requirements in:
 
@@ -87,26 +87,36 @@ Before normal SOS comparison/assembly work proceeds, the run order is:
 request-level IngestDB boundary passes
 -> acquire global observations operation lock
 -> verify selected Dropbox backup/checkpoint is complete and valid
--> read current live R2 observations-root content_hash
--> require Dropbox checkpoint fully processed observations-root hash
-   == live R2 observations-root content_hash
--> pin backup/checkpoint/root identities
+-> require the successful backup to have completed after
+   the latest relevant completed R2 writer, including
+   Prune Daily and Integrity/SOS-light repair
+-> read the Dropbox fully processed observations-root content_hash
+-> read the current live R2 observations-root content_hash
+-> require exact equality
+-> pin the Dropbox baseline
 -> acquire/pin SOS source evidence
--> assemble/validate replacement day(s)
--> mutate/verify R2
+-> DETECT
+-> PROPOSE the complete local overlay and all affected derived objects
+-> APPLY the frozen mutation set
+-> verify only the changed/removed R2 result
 -> final verification/audit
 -> release global observations operation lock
 ```
 
-If the global lock cannot be acquired, or if the currentness equality cannot be established, SOS-light MUST stop before normal replacement work.
+The backup/writer ordering check and observations-root hash equality are the hard Step 0 gate.
 
-This prevents all three relevant hazards:
+If either fails, SOS-light MUST stop immediately before DETECT. It MUST NOT continue into year/month/day hash comparison, child inspection, repair planning or reconciliation.
+
+The observations-root hash is the primary and sufficient normal content comparison. A root mismatch means the selected Dropbox baseline is not accepted for repair. It is not permission to decide which side is correct or to merge live R2 into the proposal.
+
+This prevents the relevant hazards:
 
 - Prune Daily cannot interleave a newer observation write while SOS-light is running;
 - the normal Dropbox backup cannot change the pinned Dropbox observation baseline while SOS-light is running;
-- SOS-light cannot deliberately rebuild a day from a Dropbox committed observation generation known to be older than the live committed observations root at run start.
+- SOS-light cannot deliberately use a Dropbox generation that predates the latest relevant completed writer;
+- SOS-light cannot start from a Dropbox canonical observation generation whose root identity differs from live R2.
 
-An immediate Dropbox backup after SOS-light completes is not required. A later Integrity/SOS run remains blocked until a subsequent complete backup acquires the same global lock, processes the stable current observation generation and again matches the current live observations root.
+An immediate Dropbox backup after SOS-light completes is not required. A later write-enabled Integrity/SOS run remains blocked until a subsequent complete backup has completed after that repair and passes both the writer-ordering and root-hash gates.
 
 ## Authorities
 
@@ -262,22 +272,18 @@ Adding another protected connector requires a separate source-authority and asse
 
 ## R2 access boundary
 
-Before destructive replacement, SOS-light may read only the live R2 metadata required by the global starting-state/currentness contract, including the current observations-root identity and lock/coordination evidence.
+Before destructive replacement, SOS-light may read only the live R2 observations-root metadata required for the Step 0 `content_hash` equality gate. It MUST NOT read live R2 observation/index bodies or lower-level hierarchy content for planning, comparison, preservation or dependency discovery. Non-content coordination such as the shared global operation lock remains permitted.
 
-It MUST NOT GET existing live R2 observation bodies for planning, comparison or preservation.
+After the proposal is complete and frozen, permitted live R2 activity is limited to execution and post-apply verification:
 
-After the baseline is accepted, permitted live R2 activity is limited to:
-
-- required global writer coordination and metadata checks;
-- listing keys only as needed to delete the complete selected day prefix;
-- deleting the selected day prefix;
-- PUTting the complete assembled replacement;
+- listing keys only as needed to execute the already-planned deletion of the complete selected day prefix;
+- deleting the selected day prefix or other already-planned replaced/removed objects;
+- PUTting the complete proposed replacement bytes;
 - required post-PUT verification for objects written by the run;
 - bounded verification of required deletion absence;
-- publishing and verifying rebuilt observation manifests/indexes.
+- publishing and verifying rebuilt observation manifests/indexes already present in the frozen proposal.
 
-A pre-existing live child `404`, dangling reference or unexpected live connector body MUST NOT influence local day assembly because the accepted Dropbox generation, not arbitrary live bodies, is the preservation baseline.
-
+A pre-existing live child `404`, dangling reference, unexpected live connector body or missing/changed live index MUST NOT influence local assembly or proposal generation because the accepted Dropbox generation, not live R2, is the pre-apply authority.
 ## Failure policy
 
 ### Blocking
@@ -305,22 +311,24 @@ A merely stale or incomplete Dropbox baseline is NOT warning-only. It blocks bef
 
 ## Index construction
 
-Affected observation indexes MUST be rebuilt from:
+Affected observation indexes MUST be rebuilt from the final local overlay:
 
 ```text
-accepted current Dropbox index/baseline evidence
+accepted current Dropbox canonical baseline
 + complete assembled selected-day result
-- old selected-day contributions
+= final local canonical state
+-> deterministically rebuild every affected derived index
 ```
 
-They MUST NOT be rebuilt by merging against arbitrary existing live R2 day bodies.
+Existing live R2 index objects are not reconstruction dependencies. Existing Dropbox index objects are not required preservation dependencies when the index can be regenerated from canonical backed-up inputs.
+
+For SOS-light, inability to rebuild a required v2 or v3 derived index from the pinned Dropbox canonical baseline plus the repair overlay is an implementation defect. It is not permission to consult live R2 or expand normal Dropbox backup scope.
 
 All changed indexes remain subject to deterministic byte-stability and required publication verification.
 
 AQI data and AQI indexes remain outside SOS-light.
 
 `sos-light-v2` continues to use the existing v2 observation writer/index path. `sos-light-v3` uses the canonical v3 physical observation writer and v3 exact/scoped index builders. Neither entry point may publish observation history or observation indexes into the other generation.
-
 ## Current-state reconciliation
 
 After the complete assembled R2 day and affected observation indexes are successfully written and verified:
