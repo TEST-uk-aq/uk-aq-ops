@@ -4,6 +4,14 @@ import test from "node:test";
 import {
   assertFixedV3Proposal,
 } from "../uk_aq_plan_sos_light_v3_observation_metadata.mjs";
+import {
+  readCanonicalObservationRows,
+  selectObservationVerificationStatusColumn,
+} from "../uk_aq_apply_integrity_proposal.mjs";
+import {
+  buildObservationHistoryV3SteadyStatePartition,
+  OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
+} from "../../../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 
 function proposalWithDependency(dependency) {
   return {
@@ -44,4 +52,38 @@ test("fixed-v3 namespace guard requires an exact dependency identity map", () =>
   );
   output.planning.proposals[0].dependency_identities = {};
   assert.throws(() => assertFixedV3Proposal(output), /identities are not exact/);
+});
+
+test("canonical v3 vstatus survives Parquet decoding", async () => {
+  const rows = ["P", "R"].map((verificationStatus, index) => ({
+    connector_id: 1,
+    station_id: 10,
+    timeseries_id: 100,
+    pollutant_code: "pm25",
+    observed_at_utc: `2026-06-01T0${index}:00:00.000Z`,
+    value: 12.5 + index,
+    verification_status: verificationStatus,
+  }));
+  const v3 = buildObservationHistoryV3SteadyStatePartition({
+    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
+    rows,
+    scope: { day_utc: "2026-06-01", connector_id: 1, pollutant_code: "pm25" },
+    targetWriterGitSha: "a".repeat(40),
+    backedUpAtUtc: "2026-06-02T00:00:00.000Z",
+  });
+  const decodedV3 = (await Promise.all(v3.file_intents.map(({ body }) =>
+    readCanonicalObservationRows({ body, connectorId: 1 })
+  ))).flat();
+  assert.deepEqual(decodedV3.map(({ verification_status }) => verification_status), ["P", "R"]);
+});
+
+test("status-column selection prefers vstatus and retains legacy names", () => {
+  assert.equal(selectObservationVerificationStatusColumn(
+    new Set(["status", "verification_status", "vstatus"]),
+  ), "vstatus");
+  assert.equal(selectObservationVerificationStatusColumn(
+    new Set(["status", "verification_status"]),
+  ), "verification_status");
+  assert.equal(selectObservationVerificationStatusColumn(new Set(["status"])), "status");
+  assert.equal(selectObservationVerificationStatusColumn(new Set()), null);
 });
