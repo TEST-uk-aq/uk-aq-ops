@@ -1,0 +1,400 @@
+# R2 history Dropbox sync and checkpoint contract
+
+## Authority and relationship
+
+This contract owns the **Dropbox-side hierarchical checkpoint, copy, prune and completion behaviour** for the R2 history backup.
+
+Read [`r2_history_dropbox_backup_contract.md`](r2_history_dropbox_backup_contract.md) first for shared scope, source/destination authority, direct-replacement rules and restore boundaries. Read [`r2_history_backup_inventory_contract.md`](r2_history_backup_inventory_contract.md) when changing the R2 inventory produced for this sync.
+
+The observation-history index-v3 amendment in [`r2_history_index_v3_backup_amendment.md`](r2_history_index_v3_backup_amendment.md) is the narrower authority for the compact latest-timeseries unit across v2/v3 index cut-over.
+
+The packed `timeseries_binding` representation in [`r2_history_timeseries_binding_pack_backup_contract.md`](r2_history_timeseries_binding_pack_backup_contract.md) is the narrower authority for current TEST binding backup. Phase 1 through Phase 5 are accepted on TEST, and scheduled/default TEST binding authority is now `pack`. Manual `individual` remains a bounded rollback option; LIVE adoption is separate.
+
+Implementation owner:
+
+```text
+scripts/backup_r2/sync_history_to_dropbox.mjs
+```
+
+## Dropbox state layout
+
+The active checkpoint root is:
+
+```text
+_ops/checkpoints/r2_history_backup_state_v2/root.json
+```
+
+Observation state shards are monthly:
+
+```text
+_ops/checkpoints/r2_history_backup_state_v2/observations/year=YYYY/month=MM.json
+```
+
+In `individual` binding mode, timeseries-binding state shards mirror the fixed 1,000-ID inventory ranges:
+
+```text
+_ops/checkpoints/r2_history_backup_state_v2/timeseries_binding/range=000000-000999.json
+_ops/checkpoints/r2_history_backup_state_v2/timeseries_binding/range=001000-001999.json
+...
+```
+
+In `pack` binding mode, which is now the scheduled/default TEST mode, completion evidence is separate and uses:
+
+```text
+_ops/checkpoints/r2_history_backup_state_v2/timeseries_binding_packs/range=000000-000999.json
+_ops/checkpoints/r2_history_backup_state_v2/timeseries_binding_packs/range=001000-001999.json
+...
+```
+
+The top-level root records the selected binding representation using distinct `timeseries_binding` and `timeseries_binding_packs` identities. Completion evidence for one representation MUST NOT be reinterpreted as completion evidence for the other.
+
+Observation run manifests use one small stable global state shard, for example:
+
+```text
+_ops/checkpoints/r2_history_backup_state_v2/global/observation_run_manifests.json
+```
+
+The authority-selected compact latest-timeseries unit MAY be represented directly in the small state root or in one stable global state shard. Its state MUST record at least exact source path, SHA-256, byte size and successful completion evidence.
+
+When observation-history index authority is v3, the checkpoint MUST also carry completion evidence for the exact scoped-root dependency-evidence set declared by that same latest object. The representation MAY be a stable global state shard or compact root section. It MUST bind the verified set to the exact latest-object SHA-256 and prove complete per-key identity coverage, either directly or through a deterministic set digest.
+
+Core MAY use a compact root section or one stable dedicated state shard. Core MUST NOT be split into timeseries-ID ranges and a core change MUST NOT rewrite observation-month or binding-range state shards.
+
+No AQI-level or AQI-debug state shard belongs in the active checkpoint tree.
+
+## Source and processed identities
+
+For observations, Dropbox records the source month identity it has completely processed as `processed_source_month_hash`.
+
+For each individual binding range, Dropbox records `processed_source_range_hash` under the legacy `timeseries_binding` state.
+
+For packed bindings, Dropbox records the authoritative source-range identity plus exact pack identity, including pack SHA-256, size and member count, under the distinct `timeseries_binding_packs` state defined by the pack contract.
+
+The compact latest-timeseries processed identity MUST advance only after copy and source/destination SHA-256 verification have succeeded.
+
+For v3 authority, the scoped-root dependency-evidence processed identity MUST advance only after every root descriptor in the selected latest object has been resolved by exact key, copied to Dropbox when required, read back, and verified for exact byte size and SHA-256. Its processed identity MUST be anchored to the same latest-object identity; evidence from an older or different latest object cannot satisfy current completeness.
+
+Core state MUST retain enough stable source identity to distinguish complete current processing from partial or older processing.
+
+The root records fully processed parent identities for observations, the selected binding representation, the compact latest-timeseries unit, the v3 scoped-root dependency-evidence set when applicable, and core as appropriate.
+
+A hash of a Dropbox state shard MAY be stored in the Dropbox root for checkpoint integrity. That state-shard hash is Dropbox state and need not be written back to R2.
+
+## Observation monthly state
+
+Each observation month shard MUST record at least:
+
+- year and month;
+- day manifest identities successfully processed;
+- copy-completion evidence per day;
+- the fully processed R2 source month hash;
+- checkpoint schema version.
+
+The state MUST permit restart of a partial month without recopying days whose current source identities already match successfully completed state.
+
+## Individual timeseries-binding range state
+
+In `individual` mode, each range shard MUST record at least:
+
+- range start/end and fixed range size;
+- successfully copied `timeseries_id` values and source file hashes;
+- copy-completion evidence;
+- `processed_source_range_hash`;
+- checkpoint schema version.
+
+The state MUST permit restart of a partial range without recopying bindings whose current source hashes already match successfully completed state.
+
+## Packed timeseries-binding range state
+
+In `pack` mode, the separate `timeseries_binding_packs` state MUST follow the packed-binding contract. Each occupied range records the authoritative source-range hash and exact current pack identity, and the top-level pack state records the current binding source-root and pack-root identities.
+
+A verified individual range MUST NOT satisfy a packed range, and a verified packed range MUST NOT satisfy an individual range.
+
+Pack state is complete only when the current pack generation has been physically verified at the Dropbox destination according to the pack contract. If the destination pack root is missing or mismatched, prior checkpoint evidence alone is insufficient and the current child pack identities MUST be re-established before the pack root is published.
+
+## Compact latest-timeseries copy
+
+The source path is selected by persistent observation-history index authority under the v3 backup amendment.
+
+Copy planning is:
+
+```text
+selected source path + SHA-256 already processed successfully
+    -> skip copy
+
+selected source differs or destination is missing
+    -> copy JSON
+    -> verify source and destination SHA-256
+    -> record successful exact source identity
+```
+
+The existing verified JSON-copy mechanism or an equivalent copy-and-verify path MUST be used.
+
+If copy or verification fails:
+
+- previous successful processed identity remains intact;
+- the run is incomplete;
+- current-complete parent state MUST NOT advance.
+
+A backup cannot be complete for the current inventory until the authority-selected compact unit has been copied and verified and, under v3 authority, its complete scoped-root dependency-evidence set has also been copied/read-back verified.
+
+### V3 scoped-root dependency-evidence copy
+
+For v3 authority, the sync MUST derive the required root set from the exact already-inventoried global latest object. For each descriptor in `day_summaries[].scoped_roots[]`, the sync MUST:
+
+1. require the expected scope-derived key;
+2. require the source R2 object to exist at that exact key;
+3. verify source byte size and SHA-256 against the latest descriptor;
+4. copy that one root manifest to the same relative path in Dropbox when the destination is missing or mismatched;
+5. read back the Dropbox object and verify exact byte size and SHA-256;
+6. record completion evidence bound to the same latest-object identity.
+
+Duplicate scope descriptors, contradictory scope/key identities, missing source roots, or source/destination identity mismatches MUST fail closed.
+
+The sync MUST NOT recursively enumerate or bulk-copy either derived tree:
+
+```text
+history/_index_v2/observations_timeseries/
+history/_index_v3/observations_timeseries/
+```
+
+For v3, only the exact scoped `manifest.json` roots referenced by the selected global latest are the narrow exception. Descendant exact-leaf/page objects remain excluded.
+
+## Observation copy planning
+
+The sync compares inventory identities with processed Dropbox state:
+
+```text
+year hash matches
+    -> skip year
+
+year differs, month hash matches
+    -> skip month
+
+month differs, day hash matches
+    -> skip day
+
+day differs
+    -> rclone complete day prefix
+```
+
+A changed day is copied from:
+
+```text
+history/v2/observations/day_utc=YYYY-MM-DD/
+```
+
+Rclone compares individual files so unchanged connector/pollutant/manifest/Parquet files are skipped and only changed or missing files transfer.
+
+After a changed-day copy, manifest-guided stale Parquet pruning remains required so Dropbox removes superseded Parquet files no longer referenced by current copied manifests.
+
+## Forced observation prune recheck
+
+The active sync MUST retain the operator input `force_prune_recheck` for an explicit observation-only destination-integrity sweep.
+
+When true, the sync audits current observation days represented by the authoritative hierarchical inventory even when source and processed year/month/day hashes match.
+
+For each audited day it compares current observation manifests with actual Dropbox Parquet files and removes stale destination Parquet objects not referenced by those manifests.
+
+A forced prune recheck:
+
+- MUST NOT recopy an otherwise unchanged day merely to audit it;
+- MUST NOT advance or invalidate processed source hashes solely because the audit ran;
+- applies to observations only;
+- MUST NOT prune/reinterpret bindings, run manifests, compact latest-timeseries or core;
+- MUST make the workflow/report unsuccessful if an audited day fails, identifying that day;
+- MAY retain previously completed valid copy state from earlier phases.
+
+## Timeseries-binding copy planning
+
+In `individual` mode, retained for bounded rollback/manual use, binding copy planning remains:
+
+```text
+binding root hash matches
+    -> skip all ranges
+
+root differs, range hash matches
+    -> skip range
+
+range differs, binding hash matches
+    -> skip binding
+
+binding differs or destination is missing
+    -> copy that binding JSON
+```
+
+A changed range MUST NOT cause unchanged ranges or unchanged bindings within the changed range to be recopied.
+
+In `pack` mode, now the normal scheduled/default TEST binding payload planner, the individual planner above is not active. The pack contract owns range/pack planning:
+
+```text
+current pack source root and verified destination pack root match
+    -> skip pack transfer work
+
+root differs but a range's source and pack identities match current verified state
+    -> skip that range
+
+range differs or current destination pack is absent/mismatched
+    -> copy and verify only that current pack
+```
+
+Pack mode MUST NOT silently fall back to individual binding copying. `--timeseries-binding-packs-only` remains a bounded proving option and is not part of the normal full scheduled backup.
+
+## Core copy planning
+
+Core remains incremental and inventory-driven:
+
+```text
+current core identity matches processed state
+    -> skip core copy work
+
+core identity differs
+    -> compare individual current core units with state
+
+unit matches
+    -> skip unit
+
+unit differs or destination is missing
+    -> copy unit
+```
+
+A core change MUST NOT cause observation days, observation run manifests, compact latest-timeseries or binding files to be recopied.
+
+## Core pruning is deferred
+
+Until a later active contract defines safe core retention/deletion:
+
+- existing core Dropbox backup coverage MUST be preserved;
+- changed or missing core units MAY be copied;
+- destination core objects MUST NOT be deleted merely because they are absent from the latest inventory;
+- generic stale-file pruning MUST NOT be applied to core by analogy with observation Parquet pruning.
+
+## Observation run manifests
+
+Observation run manifests remain mandatory backup evidence.
+
+The sync compares the stable run-manifest inventory unit with Dropbox state and copies only changed or missing run-manifest JSON files.
+
+A run-manifest state change MUST NOT force observation-month, binding-range, compact latest-timeseries or core state rewrites.
+
+## Failure and completion ordering
+
+A monthly observation shard MAY record individual day successes as they occur, but MUST NOT advance `processed_source_month_hash` until all required current day work succeeds.
+
+An individual binding range shard MAY record individual binding successes, but MUST NOT advance `processed_source_range_hash` until every current required binding succeeds.
+
+A packed binding range/root MUST advance only under the child-before-root verification and completion rules in the packed-binding contract. Incomplete packed child work MUST NOT publish a current pack parent/root identity.
+
+The compact latest-timeseries processed identity MUST NOT advance until copy and SHA-256 verification succeed.
+
+Core MAY record unit successes incrementally, but any aggregate processed core identity MUST NOT advance until all required changed/missing core work succeeds.
+
+Parent identities advance only after their required child work is complete.
+
+State shards MUST be written before their parent root. The small Dropbox root is written last.
+
+On failure, already flushed successful unit identities MAY be retained, but incomplete parent processed identities MUST NOT advance.
+
+## Batched checkpoint writes
+
+The sync MUST NOT upload a complete checkpoint after every copied unit.
+
+Dirty state is accumulated and flushed at bounded points such as:
+
+- after a bounded batch of successful units;
+- after a bounded elapsed interval;
+- at phase boundaries;
+- before controlled failure exit when dirty state can be saved safely;
+- at successful completion.
+
+Only dirty shards and the small parent root are written. Unchanged historical shards remain untouched.
+
+## Fresh start
+
+There is no flat-state adoption phase.
+
+If current hierarchical Dropbox state does not exist, the sync starts from the current hierarchical R2 inventory and empty current hierarchical state.
+
+Existing matching Dropbox data MAY be skipped only when the normal destination/hash verification mechanism proves the current source identity. Obsolete flat inventory/checkpoint files are not authority.
+
+For pack mode, prior pack checkpoint evidence is previous evidence only when the current destination root cannot authenticate the same generation. The pack contract's destination re-verification rule applies before current root completion.
+
+## Interaction with R2 writers
+
+The backup sync is a read-only R2 consumer.
+
+Prune Daily and Integrity own observation/source-manifest mutation; timeseries-binding reconciliation owns binding objects/source manifests; observation index finalisation owns the compact latest-timeseries object.
+
+The backup MUST NOT author or repair those R2 products as part of copy processing and does not require the observation mutation lease merely to copy already committed objects.
+
+The pack publisher is a backup derivative publisher and may write only its own pack namespace before inventory/sync consumes the resulting verified pack generation. It does not alter binding source authority.
+
+## Sync audit evidence
+
+Each backup report MUST expose enough evidence to explain copy/prune/checkpoint behaviour, including as applicable:
+
+- changed observation days sent to rclone;
+- stale observation Parquet files removed;
+- whether forced prune recheck was requested;
+- days audited by forced prune recheck, removals and failures;
+- selected binding backup mode;
+- individual binding files copied when `individual` is selected;
+- pack ranges total/skipped/copied and pack bytes copied when `pack` is selected;
+- whether individual binding payload copying was skipped in `pack` mode;
+- observation run manifests copied;
+- compact latest-timeseries source path, SHA-256, byte size and skipped/copied/verified status;
+- compact latest-timeseries processed identity;
+- core units skipped/copied and processed identity where used;
+- dirty state shards written;
+- checkpoint flush count;
+- incomplete observation/binding/compact/core parent identities.
+
+Legacy-adoption reporting MUST NOT be reintroduced.
+
+## TEST pack-mode evidence
+
+On 04/09/2026 the normal TEST Dropbox destination was completed in full `pack` mode and published a valid top-level hierarchical state root containing `timeseries_binding_packs` plus the normal non-binding backup domains.
+
+A manually dispatched GitHub-hosted normal backup then selected `pack` against the normal TEST destination and completed successfully through the ordinary workflow/task-health path. The unchanged binding generation reused all 143 packs, rebuilt 0, copied 0 packs and 0 pack bytes, while observations/core/run manifests/latest-timeseries were also already current or skipped as appropriate.
+
+That successful GitHub-hosted run recorded a fresh normal `ops.r2_history_dropbox_backup` task-health result, which then allowed the ordinary Integrity Dropbox freshness gate to pass without `--allow-stale-dropbox`.
+
+Phase 4 then proved that this exact normal TEST packed generation is recoverable. A dry-run authenticated all 143 ranges and 6,265 members and reconstructed the authoritative source-root hash with no destination writes. The real isolated TEST restore wrote and readback-verified all 6,265 individual binding objects, rebuilt and readback-verified all 143 source range manifests, reproduced the authoritative source-root hash and published/readback-verified the source root last. During the real operation the source root remained absent after all 6,265 member objects were present while only 64/143 range manifests had been published.
+
+The runtime-consumer audit confirmed that request-time consumers continue to use individual R2 binding paths and do not consume the pack namespace.
+
+Phase 5 was then operationally accepted through GitHub Actions run `33923153503`. The normal scheduler/external dispatch supplied no binding-mode override, so the workflow resolved its default to `pack`. The run used the full backup path (`timeseries_binding_packs_only = false`), reused all 143 current packs, rebuilt and copied 0 unchanged packs, kept observations/core/run manifests/latest-timeseries complete and successfully completed the normal task-health lifecycle. This establishes `pack` as the scheduled/default TEST binding transport authority.
+
+Manual `individual` remains available for bounded rollback during the observation period. Its checkpoint evidence remains distinct and MUST NOT be substituted for current packed completion evidence.
+
+## Structural validation
+
+Before deployment, use only the smallest checks needed to establish structural viability of sync changes.
+
+The implementation MUST preserve the relevant properties below:
+
+- unchanged compact latest-timeseries content is not recopied;
+- compact processed state advances only after source/destination SHA-256 verification;
+- previous state for one compact-summary generation cannot satisfy another generation under the v3 amendment;
+- under v3 authority, retained scoped-root manifests are resolved only from latest-declared exact keys and are byte/SHA verified at source and Dropbox destination;
+- v3 scoped-root checkpoint completion is bound to the exact latest-object identity and cannot be reused for a different latest generation;
+- missing, duplicate, scope/key-contradictory or identity-mismatched v3 retained roots fail closed;
+- bulk derived observation-timeseries trees are never copied; only v3 latest-declared scoped root manifests are the narrow exception;
+- a core change does not trigger observation/binding copies;
+- partial observation months do not advance processed month hash;
+- partial individual binding ranges do not advance processed range hash;
+- pack mode uses separate pack completion evidence and does not require/reinterpret individual binding completion;
+- individual mode remains fail-closed on incomplete individual binding evidence even when packs are present;
+- pack mode fails closed when required pack evidence is absent or malformed;
+- incomplete core work does not advance aggregate processed core identity;
+- successfully flushed unit progress survives restart;
+- batching prevents per-unit whole-checkpoint uploads;
+- no flat state adoption/compatibility/fallback path is active;
+- `force_prune_recheck` audits matching observation days without recopying them or changing processed hashes solely because of the audit;
+- forced prune does not affect bindings, run manifests, compact latest-timeseries or core;
+- no AQI-level/AQI-debug backup path is active;
+- core coverage remains active without core pruning.
+
+As of 18/09/2026, the TEST sync implementation does not yet satisfy the v3 scoped-root dependency-evidence requirements above. The current implementation copies the v3 global latest object but not its referenced scoped-root manifests. This is a known implementation gap and the next real TEST backup must not be treated as accepted for fixed-v3 Integrity retained-dependency authority until the gap is implemented and verified.
+
+Functional acceptance occurs through real TEST Dropbox backup operation after deployment. Broad speculative pre-deployment test suites are not required.
