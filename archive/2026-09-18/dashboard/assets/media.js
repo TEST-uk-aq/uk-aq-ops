@@ -139,7 +139,7 @@
     const messageText = String(template ?? "")
       .split("{publisher}").join("Example Publisher")
       .split("{publisher_mention}").join("@example.bsky.social");
-    return `Example original publisher headline for an air-quality article\n${messageText}`;
+    return `Example display title for an air-quality article\n\n${messageText}`;
   }
 
   function setView(html) {
