@@ -1,5 +1,6 @@
 /** Fixed-v3, SOS-light-only proposal validation boundary. */
 import fs from "node:fs";
+import path from "node:path";
 import { createHash } from "node:crypto";
 import {
   loadImmutableSourcePartition,
@@ -10,7 +11,6 @@ const INDEX_PREFIX = "history/_index_v3";
 const V2_OBSERVATIONS_PREFIX = "history/v2/observations";
 const V2_INDEX_PREFIX = "history/_index_v2";
 const DAY_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
-const EXACT_SCOPE_PREFIX = /^history\/_index_v3\/observations_timeseries\/(?:_aligned\/)?day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const POLLUTANT_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const POLLUTANT_MANIFEST = new RegExp(`${POLLUTANT_PREFIX.source.slice(1, -1)}\\/manifest\\.json$`);
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -42,6 +42,20 @@ function localBody(entry, key) {
   }
   return { localPath, body };
 }
+function externalDependency(runState, objectKey, dependencyKey, identity) {
+  if (!identity || !["dropbox", "overlay"].includes(identity.source)) {
+    throw new Error(`Fixed-v3 dependency is neither current-run nor pinned baseline: ${objectKey} -> ${dependencyKey}`);
+  }
+  const root = path.resolve(String(identity.source === "dropbox" ? runState.base_dropbox_root : runState.overlay_root));
+  const localPath = path.resolve(root, ...dependencyKey.split("/"));
+  if (!localPath.startsWith(`${root}${path.sep}`) || !fs.statSync(localPath, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error(`Fixed-v3 external dependency is unavailable: ${objectKey} -> ${dependencyKey}`);
+  }
+  const body = fs.readFileSync(localPath);
+  if (body.byteLength !== Number(identity.bytes) || sha256(body) !== identity.sha256) {
+    throw new Error(`Fixed-v3 external dependency identity changed: ${objectKey} -> ${dependencyKey}`);
+  }
+}
 function validateDependencies(runState, key, entry) {
   if (!Array.isArray(entry.dependencies)) throw new Error(`Fixed-v3 dependencies are not an array: ${key}`);
   const dependencies = entry.dependencies.map(safeKey);
@@ -58,14 +72,13 @@ function validateDependencies(runState, key, entry) {
       throw new Error(`Fixed-v3 dependency identity is invalid: ${key} -> ${dependencyKey}`);
     }
     const staged = runState.objects?.[dependencyKey];
-    if (!staged) {
-      throw new Error(`Fixed-v3 dependency is outside the frozen proposal: ${key} -> ${dependencyKey}`);
-    }
-    const { body } = localBody(staged, dependencyKey);
-    if (identity.source !== "planned_overlay" || body.byteLength !== Number(identity.bytes)
-        || sha256(body) !== identity.sha256) {
-      throw new Error(`Fixed-v3 current-run dependency identity is invalid: ${key} -> ${dependencyKey}`);
-    }
+    if (staged) {
+      const { body } = localBody(staged, dependencyKey);
+      if (identity.source !== "planned_overlay" || body.byteLength !== Number(identity.bytes)
+          || sha256(body) !== identity.sha256) {
+        throw new Error(`Fixed-v3 current-run dependency identity is invalid: ${key} -> ${dependencyKey}`);
+      }
+    } else externalDependency(runState, key, dependencyKey, identity);
   }
 }
 
@@ -89,9 +102,7 @@ export function validateDedicatedSosHistoricalProposalV3({ runState, proposal })
   }
   const selectedDays = [...new Set((audit.days || []).map((entry) => String(entry?.day_utc || "")))].sort();
   if (!selectedDays.length || selectedDays.some((day) => !validDay(day))) throw new Error("SOS-light-v3 selected days are invalid");
-  const deletionDays = proposal.prefixes
-    .filter(({ entry }) => entry?.stage === "sos_light_complete_day")
-    .map(({ prefix, entry }) => {
+  const deletionDays = proposal.prefixes.map(({ prefix, entry }) => {
     const match = prefix.match(DAY_PREFIX);
     if (!match || entry?.stage !== "sos_light_complete_day") throw new Error(`SOS-light-v3 deletion is not a complete observation day: ${prefix}`);
     return match[1];
@@ -120,12 +131,7 @@ export function validateLocalSosLightV3Proposal(runState) {
   }).sort((a, b) => a.key.localeCompare(b.key));
   const prefixes = (runState.tombstone_prefixes || []).map((entry) => {
     const prefix = safeKey(entry?.prefix).replace(/\/+$/, "");
-    const validDay = entry?.stage === "sos_light_complete_day" && DAY_PREFIX.test(prefix);
-    const validExactScope = entry?.stage === "sos_light_exact_v3_scope_removal"
-      && EXACT_SCOPE_PREFIX.test(prefix);
-    if (!entry?.proposed || (!validDay && !validExactScope)) {
-      throw new Error(`Non-v3 SOS-light deletion prefix: ${prefix}`);
-    }
+    if (!entry?.proposed || !DAY_PREFIX.test(prefix)) throw new Error(`Non-v3 SOS-light deletion prefix: ${prefix}`);
     return { entry, prefix, domain: "observations" };
   }).sort((a, b) => a.prefix.localeCompare(b.prefix));
   if (!objects.length || !prefixes.length) throw new Error("SOS-light-v3 proposal has no complete-day operations");

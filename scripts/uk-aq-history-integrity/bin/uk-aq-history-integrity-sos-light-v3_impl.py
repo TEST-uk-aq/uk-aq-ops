@@ -18616,6 +18616,35 @@ def _record_metadata_executor_overlay(
     run_state["proposal_transition_planner_unchanged_keys"] = sorted(
         planner_unchanged_keys
     )
+    prefix_tombstones = list(run_state.get("tombstone_prefixes") or [])
+    for removed_scope in list(planning.get("removed_exact_v3_scopes") or []):
+        if not isinstance(removed_scope, Mapping):
+            raise ValueError("fixed-v3 removed scope evidence is invalid")
+        for hierarchy, field in (
+            ("exact", "exact_prefix"),
+            ("aligned", "aligned_prefix"),
+        ):
+            prefix = _normalise_overlay_object_key(
+                str(removed_scope.get(field) or "")
+            ).rstrip("/")
+            prefix_tombstones.append({
+                "prefix": prefix,
+                "proposed": True,
+                "deleted": False,
+                "deletion_verified": False,
+                "stage": "sos_light_exact_v3_scope_removal",
+                "hierarchy": hierarchy,
+                "day_utc": str(removed_scope.get("day_utc") or ""),
+                "connector_id": int(removed_scope.get("connector_id") or 0),
+                "pollutant_code": str(
+                    removed_scope.get("pollutant_code") or ""
+                ),
+                "authority": "pinned_dropbox_latest_minus_canonical_reconstruction",
+            })
+    run_state["tombstone_prefixes"] = sorted(
+        {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
+        key=lambda entry: str(entry["prefix"]),
+    )
     write_run_state(run_state)
 
 
@@ -19050,7 +19079,13 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         total_day_uploads += len(day_keys)
         raw_day.update(day)
 
-    run_state["tombstone_prefixes"] = [
+    existing_index_scope_removals = [
+        dict(entry)
+        for entry in list(run_state.get("tombstone_prefixes") or [])
+        if isinstance(entry, Mapping)
+        and entry.get("stage") == "sos_light_exact_v3_scope_removal"
+    ]
+    run_state["tombstone_prefixes"] = existing_index_scope_removals + [
         {
             "prefix": (
                 f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
@@ -20021,7 +20056,10 @@ def _verify_sos_light_v3_apply_persistence(
     if apply_summary.get("status") == "succeeded" and not (
         verified_deletions
         == int(apply_summary.get("completed_deletions") or 0)
-        == int(event_types.get("deletion_verified") or 0)
+        == (
+            int(event_types.get("deletion_verified") or 0)
+            + int(event_types.get("exact_v3_scope_deletion_verified") or 0)
+        )
     ):
         raise ValueError("v3 deletion verification counts differ")
 
@@ -21422,6 +21460,7 @@ def run_integrity_dropbox_currentness_gate(
     dropbox_root: str | Path,
     observations_prefix: str,
     timeseries_binding_backup_mode: str,
+    checkpoint_only: bool = False,
 ) -> dict[str, Any]:
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -21436,6 +21475,8 @@ def run_integrity_dropbox_currentness_gate(
         "--observations-prefix", observations_prefix,
         "--timeseries-binding-backup-mode", timeseries_binding_backup_mode,
     ]
+    if checkpoint_only:
+        command.append("--checkpoint-only")
     completed = subprocess.run(
         command,
         cwd=repo_root,
@@ -24420,7 +24461,7 @@ def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dic
         supabase_url=supabase_url,
         service_role_key=service_role_key,
         integrity_started_at_utc=started_iso,
-        allow_stale_dropbox=bool(args.allow_stale_dropbox),
+        allow_stale_dropbox=bool(args.allow_stale_dropbox and not args.run_backfill),
         rpc_name=str(
             os.environ.get(
                 "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
@@ -27246,13 +27287,14 @@ def main(argv: list[str]) -> int:
             timeseries_binding_backup_mode=(
                 args.timeseries_binding_backup_mode
             ),
+            checkpoint_only=True,
         )
     log.info(
         "observations global operation lock: %s",
         json.dumps(global_operation_lock, sort_keys=True, default=str),
     )
     log.info(
-        "Dropbox checkpoint/live observations root gate: %s",
+        "Dropbox checkpoint completeness gate: %s",
         json.dumps(dropbox_currentness, sort_keys=True, default=str),
     )
     if not dropbox_currentness.get("allowed"):
@@ -27265,7 +27307,7 @@ def main(argv: list[str]) -> int:
             "date_selection": selection_summary,
             "started_at_utc": started_iso,
             "finished_at_utc": fmt_iso(utc_now()),
-            "status": "blocked_dropbox_checkpoint_not_current",
+            "status": "blocked_dropbox_checkpoint_incomplete",
             "dry_run": bool(args.dry_run),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
@@ -27313,6 +27355,40 @@ def main(argv: list[str]) -> int:
             "history_version_mode": history_version_mode,
             "checked_versions": checked_history_versions,
             "history_path_configs": serialized_history_path_configs,
+            "backup_readiness": backup_gate_summary,
+            "ingestdb_boundary": ingest_boundary,
+            "observations_global_operation_lock": global_operation_lock,
+            "dropbox_currentness": dropbox_currentness,
+            "metrics": {},
+        }
+        write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
+        return 2
+
+    # The complete checkpoint is now proven newer than every relevant writer.
+    # Only now compare its observations-root hash with the locked live R2 root;
+    # successful equality pins this Dropbox generation for DETECT/PROPOSE.
+    dropbox_currentness = run_integrity_dropbox_currentness_gate(
+        env={**env, **os.environ},
+        dropbox_root=dropbox_root,
+        observations_prefix=observation_history_config.observations_data_prefix,
+        timeseries_binding_backup_mode=args.timeseries_binding_backup_mode,
+    )
+    log.info(
+        "Dropbox checkpoint/live observations root gate: %s",
+        json.dumps(dropbox_currentness, sort_keys=True, default=str),
+    )
+    if not dropbox_currentness.get("allowed"):
+        summary = {
+            "env": args.env,
+            "profile": args.profile,
+            "source": args.source,
+            "from_day": from_day,
+            "to_day": to_day,
+            "started_at_utc": started_iso,
+            "finished_at_utc": fmt_iso(utc_now()),
+            "status": "blocked_dropbox_checkpoint_not_current",
+            "effective_mode": effective_mode,
+            "dropbox_baseline": str(dropbox_root),
             "backup_readiness": backup_gate_summary,
             "ingestdb_boundary": ingest_boundary,
             "observations_global_operation_lock": global_operation_lock,

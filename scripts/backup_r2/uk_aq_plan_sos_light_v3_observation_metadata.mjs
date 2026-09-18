@@ -8,8 +8,8 @@ import {
   getObservationHistoryGeneration,
 } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
+  buildObservationHistoryExactLeafIndexV3Latest,
   buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
-  updateObservationHistoryExactLeafIndexV3Latest,
 } from "../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   buildObservationHistoryIndexV3PublicationPlan,
@@ -114,60 +114,122 @@ function artifactFromStoredObject(object, kind, stage) {
   };
 }
 
-function scopedRootIdentity(value) {
+function scopeIdentity(value) {
   return `${value?.day_utc}\u0000${value?.connector_id}\u0000${value?.pollutant_code}`;
 }
 
-function expectedScopedRootKey(root) {
-  return `${GENERATION.observations_timeseries_index_prefix}/day_utc=${root.day_utc}` +
-    `/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}/manifest.json`;
+function rootDescriptor(artifact) {
+  return {
+    day_utc: artifact.payload.day_utc,
+    connector_id: artifact.payload.connector_id,
+    pollutant_code: artifact.payload.pollutant_code,
+    key: artifact.key,
+    byte_size: artifact.byte_size,
+    sha256: artifact.sha256,
+  };
 }
 
-export function retainedExactV3ScopedRoots(existingLatest, replacementScopedManifests) {
-  const roots = (Array.isArray(existingLatest?.payload?.day_summaries)
+function sameRootIdentity(left, right) {
+  return left?.key === right?.key
+    && Number(left?.byte_size) === Number(right?.byte_size)
+    && String(left?.sha256 || "") === String(right?.sha256 || "");
+}
+
+export function reconcileReconstructedExactV3Hierarchies({
+  existingLatest,
+  hierarchies,
+}) {
+  const oldRoots = (Array.isArray(existingLatest?.payload?.day_summaries)
     ? existingLatest.payload.day_summaries : []).flatMap((summary) =>
     Array.isArray(summary?.scoped_roots) ? summary.scoped_roots : []);
-  const byScope = new Map();
-  for (const root of roots) {
-    const identity = scopedRootIdentity(root);
-    if (byScope.has(identity)) {
+  const oldByScope = new Map();
+  for (const root of oldRoots) {
+    const identity = scopeIdentity(root);
+    if (oldByScope.has(identity)) {
       throw new Error(`Pinned v3 latest has duplicate scoped root: ${root?.key || identity}`);
     }
-    if (root?.key !== expectedScopedRootKey(root)) {
-      throw new Error(`Pinned v3 latest scoped root key contradicts scope: ${root?.key || identity}`);
-    }
-    byScope.set(identity, root);
+    oldByScope.set(identity, root);
   }
-  const replaced = new Set(replacementScopedManifests.map(({ payload }) =>
-    scopedRootIdentity(payload)));
-  return [...byScope.entries()]
-    .filter(([identity]) => !replaced.has(identity))
-    .map(([, root]) => root);
+  const changedHierarchies = [];
+  const unchangedRoots = [];
+  const reconstructedScopes = new Set();
+  for (const hierarchy of hierarchies) {
+    const reconstructed = rootDescriptor(hierarchy.scoped_manifest);
+    reconstructedScopes.add(scopeIdentity(reconstructed));
+    const previous = oldByScope.get(scopeIdentity(reconstructed));
+    if (sameRootIdentity(previous, reconstructed)) unchangedRoots.push(reconstructed);
+    else changedHierarchies.push(hierarchy);
+  }
+  const latest = buildObservationHistoryExactLeafIndexV3Latest({
+    scopedHierarchies: hierarchies,
+    indexRoot: GENERATION.observations_timeseries_index_prefix,
+    latestKey: GENERATION.observations_timeseries_latest_key,
+  });
+  const removedScopes = oldRoots
+    .filter((root) => !reconstructedScopes.has(scopeIdentity(root)))
+    .map((root) => ({
+      day_utc: root.day_utc,
+      connector_id: root.connector_id,
+      pollutant_code: root.pollutant_code,
+      exact_prefix: `${GENERATION.observations_timeseries_index_prefix}/day_utc=${root.day_utc}` +
+        `/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}`,
+      aligned_prefix: `${GENERATION.observations_timeseries_index_prefix}/_aligned/day_utc=${root.day_utc}` +
+        `/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}`,
+    }));
+  return { latest, changedHierarchies, unchangedRoots, removedScopes };
 }
 
-export function verifyRetainedExactV3ScopedRoots(roots, store) {
-  for (const root of roots) {
-    const object = store.getObjectFromSourceIfExists(root.key, "dropbox");
-    if (!object) throw new Error(`Fixed-v3 external dependency is unavailable: ${root.key}`);
-    const identity = exactIdentity(object, object.source);
-    if (identity.bytes !== Number(root.byte_size)) {
-      throw new Error(`Fixed-v3 external dependency byte size disagrees: ${root.key}`);
-    }
-    if (identity.sha256 !== String(root.sha256)) {
-      throw new Error(`Fixed-v3 external dependency SHA-256 disagrees: ${root.key}`);
-    }
-    let payload;
-    try {
-      payload = JSON.parse(Buffer.from(object.body).toString("utf8"));
-    } catch {
-      throw new Error(`Fixed-v3 external dependency payload is invalid: ${root.key}`);
-    }
-    if (scopedRootIdentity(payload) !== scopedRootIdentity(root)
-      || expectedScopedRootKey(payload) !== root.key) {
-      throw new Error(`Fixed-v3 external dependency scope disagrees: ${root.key}`);
+export function resolveExactV3LocalReferences({
+  artifacts,
+  changedKeys,
+  proposalsByKey,
+  plannedCanonicalKeys = new Set(),
+  store,
+  unchangedRoots,
+}) {
+  const resolved = new Map(unchangedRoots.map((root) => [root.key, {
+    key: root.key,
+    byte_size: root.byte_size,
+    sha256: root.sha256,
+    verified: true,
+    durable: true,
+  }]));
+  for (const artifact of artifacts) {
+    for (const reference of [
+      ...(artifact.dependencies || []),
+      ...(artifact.publication_prerequisites || []),
+    ]) {
+      if (changedKeys.has(reference.key)) continue;
+      const plannedCanonical = proposalsByKey.get(reference.key);
+      if (plannedCanonical?.changed === true || plannedCanonicalKeys.has(reference.key)) {
+        resolved.set(reference.key, {
+          key: reference.key,
+          byte_size: Number(plannedCanonical.bytes),
+          sha256: String(plannedCanonical.new_sha256),
+          verified: true,
+          durable: true,
+        });
+        continue;
+      }
+      const local = store.getObjectFromSourceIfExists(reference.key, "dropbox");
+      if (!local) {
+        if (resolved.has(reference.key)) continue;
+        throw new Error(`Fixed-v3 pinned canonical baseline dependency is unavailable: ${reference.key}`);
+      }
+      const identity = exactIdentity(local, "dropbox");
+      if (identity.bytes !== Number(reference.byte_size) || identity.sha256 !== reference.sha256) {
+        throw new Error(`Fixed-v3 pinned canonical baseline dependency identity disagrees: ${reference.key}`);
+      }
+      resolved.set(reference.key, {
+        key: reference.key,
+        byte_size: identity.bytes,
+        sha256: identity.sha256,
+        verified: true,
+        durable: true,
+      });
     }
   }
-  return roots;
+  return resolved;
 }
 
 function assertAllowedKey(key) {
@@ -194,16 +256,17 @@ export function assertFixedV3Proposal(output) {
 }
 
 async function addExactV3Indexes({ output, runState, env, repairPlan, targetWriterGitSha }) {
+  const selectedDayPrefixes = [...new Set((repairPlan.repair_plan || [])
+    .map((action) => String(action?.day_utc || "")).filter(Boolean))]
+    .map((day) => `${GENERATION.observations_prefix}/day_utc=${day}/`);
   const proposals = (output.planning.proposals || [])
-    .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`));
+    .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`))
+    .map((proposal) => selectedDayPrefixes.some((prefix) => String(proposal.key).startsWith(prefix))
+      ? { ...proposal, changed: true, included_in_write_set: true, status: "planned" }
+      : proposal);
   const proposalsByKey = new Map(proposals.map((proposal) => [String(proposal.key), proposal]));
-  const days = [...new Set((repairPlan.repair_plan || [])
-    .map((action) => String(action?.day_utc || "")).filter(Boolean))].sort();
-  const prefixes = days.flatMap((day) => [
-    `${GENERATION.observations_prefix}/day_utc=${day}`,
-    `${GENERATION.observations_timeseries_index_prefix}/day_utc=${day}`,
-  ]);
-  let store = createCombinedLocalStore({
+  const prefixes = [GENERATION.observations_prefix];
+  const store = createCombinedLocalStore({
     overlayRoot: env.UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT,
     dropboxRoot: env.UK_AQ_R2_HISTORY_DROPBOX_ROOT,
     runStateJson: env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON,
@@ -215,9 +278,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     : store.getObjectIfExists(key);
   const manifestKeys = new Set(store.listAllObjects({
     prefix: `${GENERATION.observations_prefix}/day_utc=`,
-  }).map(({ key }) => key).filter((key) => days.some((day) =>
-    key.startsWith(`${GENERATION.observations_prefix}/day_utc=${day}/`)
-  ) && POLLUTANT_MANIFEST.test(key)));
+  }).map(({ key }) => key).filter((key) => POLLUTANT_MANIFEST.test(key)));
   for (const key of proposalsByKey.keys()) if (POLLUTANT_MANIFEST.test(key)) manifestKeys.add(key);
 
   const hierarchies = [];
@@ -273,28 +334,29 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
   const existingLatest = artifactFromStoredObject(
     existingLatestObject, "observation_history_index_v3_latest_global", "latest_global",
   );
-  const retainedRoots = retainedExactV3ScopedRoots(
-    existingLatest, hierarchies.map((hierarchy) => hierarchy.scoped_manifest),
-  );
-  store = createCombinedLocalStore({
-    overlayRoot: env.UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT,
-    dropboxRoot: env.UK_AQ_R2_HISTORY_DROPBOX_ROOT,
-    runStateJson: env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON,
-    prefixes,
-    exactKeys: [
-      GENERATION.observations_timeseries_latest_key,
-      ...retainedRoots.map(({ key }) => key),
-    ],
-  });
-  verifyRetainedExactV3ScopedRoots(retainedRoots, store);
-  const retainedRootsByKey = new Map(retainedRoots.map((root) => [root.key, root]));
-  const exactObjects = hierarchies.flatMap((hierarchy) => hierarchy.publication_objects);
-  const latest = updateObservationHistoryExactLeafIndexV3Latest({
+  const rebuilt = reconcileReconstructedExactV3Hierarchies({
     existingLatest,
-    replacementScopedManifests: hierarchies.map((hierarchy) => hierarchy.scoped_manifest),
-    indexRoot: GENERATION.observations_timeseries_index_prefix,
-    latestKey: GENERATION.observations_timeseries_latest_key,
+    hierarchies,
   });
+  const exactObjects = rebuilt.changedHierarchies
+    .flatMap((hierarchy) => hierarchy.publication_objects);
+  const canonicalFinalizationPrerequisites = proposals
+    .filter((proposal) => (proposal.changed === true
+        || selectedDayPrefixes.some((prefix) => String(proposal.key).startsWith(prefix)))
+      && String(proposal.key).startsWith(`${GENERATION.observations_prefix}/`)
+      && String(proposal.key).endsWith("/manifest.json"))
+    .map((proposal) => ({
+      key: String(proposal.key),
+      byte_size: Number(proposal.bytes),
+      sha256: String(proposal.new_sha256),
+    }));
+  const canonicalFinalizationPrerequisiteKeys = new Set(
+    canonicalFinalizationPrerequisites.map(({ key }) => key),
+  );
+  const latest = {
+    ...rebuilt.latest,
+    publication_prerequisites: canonicalFinalizationPrerequisites,
+  };
   exactObjects.push(latest);
   const exactByKey = new Map(exactObjects.map((artifact) => [artifact.key, artifact]));
   const changedExactObjects = exactObjects.filter((artifact) => {
@@ -302,24 +364,22 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     return !existing || exactIdentity(existing, existing.source).sha256 !== artifact.sha256;
   });
   const changedExactKeys = new Set(changedExactObjects.map(({ key }) => key));
-  const externalReferences = new Map();
-  for (const artifact of changedExactObjects) for (const reference of [
-    ...(artifact.dependencies || []), ...(artifact.publication_prerequisites || []),
-  ]) if (!changedExactKeys.has(reference.key)) {
-    const resolved = exactByKey.get(reference.key);
-    const existing = store.getObjectIfExists(reference.key);
-    if (resolved && (!existing
-      || exactIdentity(existing, existing.source).sha256 !== resolved.sha256)) {
-      throw new Error(`Fixed-v3 unchanged exact dependency is unavailable: ${reference.key}`);
-    }
-    externalReferences.set(reference.key, { ...reference, verified: true, durable: true });
-  }
   if (!changedExactObjects.length) {
     throw new Error("Fixed-v3 metadata proposal unexpectedly produced no changed exact-v3 indexes");
   }
+  const resolvedLocalReferences = resolveExactV3LocalReferences({
+    artifacts: changedExactObjects,
+    changedKeys: changedExactKeys,
+    proposalsByKey,
+    plannedCanonicalKeys: canonicalFinalizationPrerequisiteKeys,
+    store,
+    unchangedRoots: rebuilt.unchangedRoots,
+  });
   const publicationPlan = buildObservationHistoryIndexV3PublicationPlan({
     objects: changedExactObjects,
-    externalReferences: [...externalReferences.values()],
+    // These resolve either to frozen canonical writes or exact identities read
+    // from the pinned local Dropbox baseline, never retained live-R2 objects.
+    externalReferences: [...resolvedLocalReferences.values()],
   });
   const identityFor = (key) => {
     const artifact = exactByKey.get(key);
@@ -327,7 +387,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
       return { sha256: artifact.sha256, bytes: artifact.byte_size, source: "planned_overlay" };
     }
     const proposed = proposalsByKey.get(key);
-    if (proposed?.changed === true) return {
+    if (proposed?.changed === true || canonicalFinalizationPrerequisiteKeys.has(key)) return {
       sha256: proposed.new_sha256, bytes: proposed.bytes, source: "planned_overlay",
     };
     const staged = runState.objects?.[key];
@@ -335,13 +395,9 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
       && staged?.changed !== false && staged?.included_in_write_set !== false) {
       return { sha256: staged.sha256, bytes: staged.bytes, source: "planned_overlay" };
     }
-    const retainedRoot = retainedRootsByKey.get(key);
-    if (retainedRoot) return {
-      sha256: retainedRoot.sha256, bytes: retainedRoot.byte_size, source: "dropbox",
-    };
     const object = store.getObjectIfExists(key);
     if (!object || !["dropbox", "overlay"].includes(object.source)) {
-      throw new Error(`Fixed-v3 external dependency is unavailable: ${key}`);
+      throw new Error(`Fixed-v3 local proposal input is unavailable: ${key}`);
     }
     return exactIdentity(object, object.source);
   };
@@ -349,7 +405,11 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     const dependencies = [...new Set([
       ...entry.dependencies.map(({ key }) => key),
       ...entry.publication_prerequisites.map(({ key }) => key),
-    ])].sort();
+    ])].filter((key) => changedExactKeys.has(key) || proposalsByKey.has(key)).sort();
+    const pinnedBaselineReferences = [...new Set([
+      ...entry.external_dependencies,
+      ...entry.external_publication_prerequisites,
+    ])].filter((key) => !proposalsByKey.has(key)).sort();
     const existing = store.getObjectIfExists(entry.key);
     proposals.push({
       key: entry.key,
@@ -364,6 +424,14 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
       status: "planned",
       dependencies,
       dependency_identities: Object.fromEntries(dependencies.map((key) => [key, identityFor(key)])),
+      pinned_baseline_references: Object.fromEntries(pinnedBaselineReferences.map((key) => {
+        const reference = resolvedLocalReferences.get(key);
+        return [key, {
+          source: "pinned_dropbox_canonical_baseline",
+          sha256: reference.sha256,
+          bytes: reference.byte_size,
+        }];
+      })),
       provenance: "fixed_v3_exact_leaf_operational_primitives",
     });
   }
@@ -374,6 +442,7 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     schedule_sha256: publicationPlan.schedule_sha256,
     object_count: publicationPlan.entries.length,
   };
+  output.planning.removed_exact_v3_scopes = rebuilt.removedScopes;
   return output;
 }
 

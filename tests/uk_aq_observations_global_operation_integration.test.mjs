@@ -204,7 +204,20 @@ test("Integrity currentness gate runs under the global lock and blocks a stale c
   });
   const checkpointPath = path.join(stateDirectory, "root.json");
   fs.writeFileSync(checkpointPath, JSON.stringify(completeCheckpoint(liveRoot.content_hash)));
-  const getLiveRoot = async () => ({ body: Buffer.from(JSON.stringify(liveRoot)), bytes: 456 });
+  let liveRootReadCount = 0;
+  const getLiveRoot = async () => {
+    liveRootReadCount += 1;
+    return { body: Buffer.from(JSON.stringify(liveRoot)), bytes: 456 };
+  };
+  const checkpointOnly = await checkIntegrityDropboxCurrentness({
+    dropboxRoot: temporaryRoot,
+    observationGeneration: "v2",
+    checkpointOnly: true,
+    getLiveRoot,
+    lockContext: { valid: true, owner: "integrity", run_id: "integrity:test" },
+  });
+  assert.equal(checkpointOnly.status, "checkpoint_complete");
+  assert.equal(liveRootReadCount, 0);
   const current = await checkIntegrityDropboxCurrentness({
     dropboxRoot: temporaryRoot,
     observationGeneration: "v2",
@@ -212,6 +225,7 @@ test("Integrity currentness gate runs under the global lock and blocks a stale c
     lockContext: { valid: true, owner: "integrity", run_id: "integrity:test" },
   });
   assert.equal(current.allowed, true);
+  assert.equal(liveRootReadCount, 1);
   assert.equal(current.checkpoint_live_root_match, true);
   assert.equal(
     current.checkpoint.observations_processed_source_root_hash,

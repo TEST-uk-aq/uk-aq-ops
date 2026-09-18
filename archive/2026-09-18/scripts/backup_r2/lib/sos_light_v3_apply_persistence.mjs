@@ -120,13 +120,17 @@ export async function runPersistedSosLightV3Apply({
   runState,
   proposal,
   r2,
+  executeWriter,
   adapters,
   persistenceIo = {},
 }) {
+  if (typeof executeWriter !== "function") {
+    throw new TypeError("SOS-light-v3 persisted apply requires executeWriter");
+  }
   for (const name of [
     "getObject",
     "putObject",
-    "putAndVerifyParquet",
+    "putIfChanged",
     "listAllObjects",
     "deleteObjects",
   ]) {
@@ -135,17 +139,13 @@ export async function runPersistedSosLightV3Apply({
     }
   }
   const days = selectedDays(runState);
-  const dayDeletionPrefixes = (proposal?.prefixes || [])
-    .filter(({ entry }) => entry?.stage === "sos_light_complete_day");
-  const exactScopeRemovalPrefixes = (proposal?.prefixes || [])
-    .filter(({ entry }) => entry?.stage === "sos_light_exact_v3_scope_removal");
-  if (!days.length || dayDeletionPrefixes.length !== days.length) {
+  if (!days.length || proposal?.prefixes?.length !== days.length) {
     throw new Error("SOS-light-v3 persisted apply requires validated selected days");
   }
   const counts = {
     planned_deletions: proposal.prefixes.length,
-    planned_writes: proposal.objects.length,
-    planned_post_put_verifications: proposal.objects.length,
+    planned_writes: null,
+    planned_post_put_verifications: null,
     completed_deletions: 0,
     deleted_objects: 0,
     completed_writes: 0,
@@ -171,7 +171,6 @@ export async function runPersistedSosLightV3Apply({
     started_at_utc: startedAtUtc,
     final_proposal_graph_validation: "succeeded",
     canonical_v3_writer_invoked: false,
-    frozen_proposal_apply: true,
     v3_publication_evidence: [],
     ...counts,
   };
@@ -373,8 +372,6 @@ export async function runPersistedSosLightV3Apply({
         r2_verified: true,
         post_put_verification_get_count: 1,
         final_live_sha256: operation.sha256,
-        stored_sha256_verified: operation.stored_sha256_verified === true,
-        stored_byte_size_verified: operation.stored_byte_size_verified === true,
         durable: true,
       });
       persistence.appendEvent({
@@ -411,38 +408,91 @@ export async function runPersistedSosLightV3Apply({
       throw error;
     }
   };
-  const trackedPutAndVerifyParquet = async (object) => {
-    const operation = beginPut({
-      key: object.key,
-      body: object.body,
-      content_type: object.entry.content_type,
-      sha256: object.entry.sha256,
-      byte_size: object.entry.bytes,
-    }, "observation_parquet");
+  const trackedPutIfChanged = async (artifact) => {
+    const operation = beginPut(artifact);
     try {
-      const result = await adapters.putAndVerifyParquet({
-        r2,
-        intent: {
-          key: operation.key,
-          body: operation.body,
-          content_type: operation.content_type,
-          sha256: operation.sha256,
-          byte_size: operation.byte_size,
+      const instrumentedR2 = {
+        ...r2,
+        canonical_mutation_sink: async (generated) => {
+          const result = await adapters.putObject({
+            r2,
+            key: generated.key,
+            body: generated.body,
+            content_type: generated.content_type,
+            sha256: generated.sha256,
+          });
+          return {
+            ...result,
+            key: generated.key,
+            byte_size: generated.bytes,
+            sha256: generated.sha256,
+            skipped: false,
+            status: "succeeded",
+            write_r2: true,
+            verified: false,
+          };
         },
+      };
+      const result = await adapters.putIfChanged({
+        r2: instrumentedR2,
+        key: operation.key,
+        body: operation.body,
+        content_type: operation.content_type,
+        writeR2: true,
       });
       completePut(operation, result);
-      if (result?.stored_sha256_verified !== true
-          || result?.stored_byte_size_verified !== true
-          || result?.sha256 !== operation.sha256
-          || Number(result?.byte_size) !== operation.byte_size) {
-        throw new Error(
-          `SOS-light-v3 checksum-aware Parquet verification failed: ${operation.key}`,
-        );
-      }
-      operation.stored_sha256_verified = true;
-      operation.stored_byte_size_verified = true;
+      return {
+        ...result,
+        verified: false,
+        post_put_get_verified: false,
+      };
+    } catch (error) {
+      appendFailure(operation, error);
+      throw error;
+    }
+  };
+  const recordDurableEvidence = async (artifact) => {
+    const key = normalizedKey(artifact?.key);
+    const evidence = [...publicationEvidence].reverse().find(
+      (entry) => entry.key === key,
+    );
+    if (
+      !evidence ||
+      evidence.byte_size !== Number(artifact?.byte_size) ||
+      evidence.sha256 !== String(artifact?.sha256 || "")
+    ) {
+      throw new Error(
+        `SOS-light-v3 durable publication evidence is incomplete: ${key}`,
+      );
+    }
+    return {
+      durable: true,
+      key,
+      byte_size: evidence.byte_size,
+      sha256: evidence.sha256,
+      evidence_kind: "r2_complete_body_readback",
+    };
+  };
+  const putAndVerifyParquet = async ({ intent }) => {
+    const operation = beginPut(intent, "observation_parquet");
+    try {
+      const result = await adapters.putObject({
+        r2,
+        key: operation.key,
+        body: operation.body,
+        content_type: operation.content_type,
+        sha256: operation.sha256,
+      });
+      completePut(operation, result);
       await trackedGetObject({ key: operation.key });
-      return result;
+      return {
+        key: operation.key,
+        byte_size: operation.byte_size,
+        sha256: operation.sha256,
+        verified: true,
+        stored_sha256_verified: true,
+        stored_byte_size_verified: true,
+      };
     } catch (error) {
       if (!operation.verified) appendFailure(operation, error);
       throw error;
@@ -570,83 +620,7 @@ export async function runPersistedSosLightV3Apply({
     }
   };
 
-  const executePlannedExactScopeRemoval = async ({ prefix, entry }) => {
-    currentOperation = {
-      key: prefix,
-      publication_stage: "sos_light_exact_v3_scope_removal",
-    };
-    const existing = await adapters.listAllObjects({
-      r2,
-      prefix: `${prefix}/`,
-      max_keys: 10_000,
-    });
-    const keys = existing.map((object) => normalizedKey(object.key)).sort();
-    const sidecar = persistence.writeDeletedKeysSidecar({ prefix, keys });
-    Object.assign(entry, {
-      status: "deleting",
-      deletion_started_at_utc: new Date().toISOString(),
-      ...sidecar,
-    });
-    persistence.appendEvent({
-      event_type: "exact_v3_scope_deletion_started",
-      prefix,
-      ...mutationContext(prefix, "sos_light_exact_v3_scope_removal"),
-      status: "started",
-      deleted_object_count: keys.length,
-      deleted_keys_sha256: sidecar.deleted_keys_sha256,
-    });
-    persistence.flush();
-    if (keys.length) await adapters.deleteObjects({ r2, keys });
-    const remaining = await adapters.listAllObjects({
-      r2,
-      prefix: `${prefix}/`,
-      max_keys: 10_000,
-    });
-    if (remaining.length) {
-      throw new Error(`SOS-light-v3 exact scope deletion verification failed: ${prefix}`);
-    }
-    Object.assign(entry, {
-      status: "verified",
-      deletion_verified: true,
-      deleted_object_count: keys.length,
-      deletion_completed_at_utc: new Date().toISOString(),
-    });
-    counts.completed_deletions += 1;
-    counts.deleted_objects += keys.length;
-    persistence.appendEvent({
-      event_type: "exact_v3_scope_deletion_verified",
-      prefix,
-      ...mutationContext(prefix, "sos_light_exact_v3_scope_removal"),
-      status: "verified",
-      deleted_object_count: keys.length,
-      deleted_keys_sha256: sidecar.deleted_keys_sha256,
-    });
-    persistence.flush();
-  };
-
-  const frozenPublicationOrder = () => {
-    const byKey = new Map(proposal.objects.map((object) => [object.key, object]));
-    const remaining = new Map(byKey);
-    const ordered = [];
-    while (remaining.size) {
-      const ready = [...remaining.values()].filter((object) =>
-        (object.entry.dependencies || []).every((key) => !remaining.has(key))
-      ).sort((left, right) => left.key.localeCompare(right.key));
-      if (!ready.length) {
-        throw new Error("SOS-light-v3 frozen proposal has a publication dependency cycle");
-      }
-      for (const object of ready) {
-        ordered.push(object);
-        remaining.delete(object.key);
-      }
-    }
-    return ordered;
-  };
-
   try {
-    // Freeze and validate the complete publication schedule before the first
-    // R2 DELETE/PUT. Apply never discovers or adds objects from live R2.
-    const orderedObjects = frozenPublicationOrder();
     writeCompleteRunState();
     persistence.appendEvent({
       event_type: "canonical_apply_started",
@@ -657,31 +631,24 @@ export async function runPersistedSosLightV3Apply({
     });
     persistence.flush();
     checkpoint("fixed_v3_apply_intent_before_first_mutation");
-    for (const day of days) await prepareCompleteDayReplacement({ day_utc: day });
-    for (const removal of exactScopeRemovalPrefixes) {
-      await executePlannedExactScopeRemoval(removal);
+    runState.apply.canonical_v3_writer_invoked = true;
+    const writerResult = await executeWriter({
+      getObject: trackedGetObject,
+      putObject: trackedPutObject,
+      putIfChanged: trackedPutIfChanged,
+      putAndVerifyParquet,
+      recordDurableEvidence,
+      prepareCompleteDayReplacement,
+    });
+    if (writerResult?.ok !== true || pendingByKey.size !== 0) {
+      throw new Error(
+        pendingByKey.size
+          ? "SOS-light-v3 writer returned with unverified publications"
+          : "SOS-light-v3 canonical writer did not report success",
+      );
     }
-    for (const object of orderedObjects) {
-      if (object.key.endsWith(".parquet")) {
-        await trackedPutAndVerifyParquet(object);
-      } else {
-        await trackedPutObject({
-          key: object.key,
-          body: object.body,
-          content_type: object.entry.content_type,
-        }, object.entry.publication_stage);
-        await trackedGetObject({ key: object.key });
-      }
-    }
-    if (pendingByKey.size !== 0) {
-      throw new Error("SOS-light-v3 frozen proposal returned with unverified publications");
-    }
-    const writerResult = {
-      ok: true,
-      status: "frozen_proposal_applied",
-      object_count: orderedObjects.length,
-      authority: "dropbox_baseline_plus_repair_overlay",
-    };
+    counts.planned_writes = publicationEvidence.length;
+    counts.planned_post_put_verifications = publicationEvidence.length;
     runState.apply.current_phase = "canonical_v3_apply_completed";
     progressState.status = "succeeded";
     progressState.current_phase = runState.apply.current_phase;
