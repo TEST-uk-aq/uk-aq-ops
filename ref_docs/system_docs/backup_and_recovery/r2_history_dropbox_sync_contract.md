@@ -56,8 +56,6 @@ _ops/checkpoints/r2_history_backup_state_v2/global/observation_run_manifests.jso
 
 The authority-selected compact latest-timeseries unit MAY be represented directly in the small state root or in one stable global state shard. Its state MUST record at least exact source path, SHA-256, byte size and successful completion evidence.
 
-When observation-history index authority is v3, the checkpoint MUST also carry completion evidence for the exact scoped-root dependency-evidence set declared by that same latest object. The representation MAY be a stable global state shard or compact root section. It MUST bind the verified set to the exact latest-object SHA-256 and prove complete per-key identity coverage, either directly or through a deterministic set digest.
-
 Core MAY use a compact root section or one stable dedicated state shard. Core MUST NOT be split into timeseries-ID ranges and a core change MUST NOT rewrite observation-month or binding-range state shards.
 
 No AQI-level or AQI-debug state shard belongs in the active checkpoint tree.
@@ -72,11 +70,9 @@ For packed bindings, Dropbox records the authoritative source-range identity plu
 
 The compact latest-timeseries processed identity MUST advance only after copy and source/destination SHA-256 verification have succeeded.
 
-For v3 authority, the scoped-root dependency-evidence processed identity MUST advance only after every root descriptor in the selected latest object has been resolved by exact key, copied to Dropbox when required, read back, and verified for exact byte size and SHA-256. Its processed identity MUST be anchored to the same latest-object identity; evidence from an older or different latest object cannot satisfy current completeness.
-
 Core state MUST retain enough stable source identity to distinguish complete current processing from partial or older processing.
 
-The root records fully processed parent identities for observations, the selected binding representation, the compact latest-timeseries unit, the v3 scoped-root dependency-evidence set when applicable, and core as appropriate.
+The root records fully processed parent identities for observations, the selected binding representation, the compact latest-timeseries unit, and core as appropriate.
 
 A hash of a Dropbox state shard MAY be stored in the Dropbox root for checkpoint integrity. That state-shard hash is Dropbox state and need not be written back to R2.
 
@@ -136,29 +132,18 @@ If copy or verification fails:
 - the run is incomplete;
 - current-complete parent state MUST NOT advance.
 
-A backup cannot be complete for the current inventory until the authority-selected compact unit has been copied and verified and, under v3 authority, its complete scoped-root dependency-evidence set has also been copied/read-back verified.
+A backup cannot be complete for the current inventory until the authority-selected compact unit has been copied and verified.
 
-### V3 scoped-root dependency-evidence copy
+### Derived observation-timeseries trees remain excluded
 
-For v3 authority, the sync MUST derive the required root set from the exact already-inventoried global latest object. For each descriptor in `day_summaries[].scoped_roots[]`, the sync MUST:
-
-1. require the expected scope-derived key;
-2. require the source R2 object to exist at that exact key;
-3. verify source byte size and SHA-256 against the latest descriptor;
-4. copy that one root manifest to the same relative path in Dropbox when the destination is missing or mismatched;
-5. read back the Dropbox object and verify exact byte size and SHA-256;
-6. record completion evidence bound to the same latest-object identity.
-
-Duplicate scope descriptors, contradictory scope/key identities, missing source roots, or source/destination identity mismatches MUST fail closed.
-
-The sync MUST NOT recursively enumerate or bulk-copy either derived tree:
+The normal Dropbox sync MUST NOT recursively enumerate or bulk-copy either derived tree:
 
 ```text
 history/_index_v2/observations_timeseries/
 history/_index_v3/observations_timeseries/
 ```
 
-For v3, only the exact scoped `manifest.json` roots referenced by the selected global latest are the narrow exception. Descendant exact-leaf/page objects remain excluded.
+The authority-selected compact latest-timeseries object is the only observation-timeseries index object required by this sync contract. Derived v3 scoped/exact index objects remain rebuildable data and are not copied merely to support SOS-light.
 
 ## Observation copy planning
 
@@ -376,10 +361,7 @@ The implementation MUST preserve the relevant properties below:
 - unchanged compact latest-timeseries content is not recopied;
 - compact processed state advances only after source/destination SHA-256 verification;
 - previous state for one compact-summary generation cannot satisfy another generation under the v3 amendment;
-- under v3 authority, retained scoped-root manifests are resolved only from latest-declared exact keys and are byte/SHA verified at source and Dropbox destination;
-- v3 scoped-root checkpoint completion is bound to the exact latest-object identity and cannot be reused for a different latest generation;
-- missing, duplicate, scope/key-contradictory or identity-mismatched v3 retained roots fail closed;
-- bulk derived observation-timeseries trees are never copied; only v3 latest-declared scoped root manifests are the narrow exception;
+- the normal backup does not recursively inventory or copy derived observation-timeseries trees;
 - a core change does not trigger observation/binding copies;
 - partial observation months do not advance processed month hash;
 - partial individual binding ranges do not advance processed range hash;
@@ -395,6 +377,6 @@ The implementation MUST preserve the relevant properties below:
 - no AQI-level/AQI-debug backup path is active;
 - core coverage remains active without core pruning.
 
-As of 18/09/2026, the TEST sync implementation does not yet satisfy the v3 scoped-root dependency-evidence requirements above. The current implementation copies the v3 global latest object but not its referenced scoped-root manifests. This is a known implementation gap and the next real TEST backup must not be treated as accepted for fixed-v3 Integrity retained-dependency authority until the gap is implemented and verified.
+The PR #69 scoped-root backup expansion was reverted on 18/09/2026. The resulting normal backup scope is the intended active design.
 
 Functional acceptance occurs through real TEST Dropbox backup operation after deployment. Broad speculative pre-deployment test suites are not required.
