@@ -71,31 +71,39 @@ Likewise, the Dropbox checkpoint/state root MUST NOT be treated as though it wer
 
 The two authorities are complementary and non-interchangeable.
 
-## V3 scoped-root dependency-evidence payload
+## V3 derived-index payload boundary
 
-The R2 inventory authority remains R2-only, but this location rule does not prohibit normal Dropbox payload from including source objects that the backup contract explicitly selects.
+The R2 inventory authority remains R2-only.
 
-Under v3 observation-timeseries authority, the normal backup now includes the exact scoped root manifests referenced by the selected global latest object as a narrow dependency-evidence set. Those files live in Dropbox at their normal source-relative keys, for example:
+Under v3 observation-timeseries authority, the normal Dropbox backup does **not** mirror the complete derived scoped/exact observation-timeseries tree merely to support SOS-light.
+
+The normal backup may carry the authority-selected compact latest object:
+
+```text
+history/_index_v3/observations_timeseries_latest.json
+```
+
+but scoped root manifests and exact-leaf/page objects beneath:
 
 ```text
 history/_index_v3/observations_timeseries/
-  day_utc=YYYY-MM-DD/
-    connector_id=N/
-      pollutant_code=CODE/
-        manifest.json
 ```
 
-This does **not** mean the R2 hierarchical inventory root has moved to Dropbox and does not authorise mirroring the complete derived v3 index tree. The distinction is:
+are derived data and are not a required Dropbox dependency-evidence set.
+
+For SOS-light, the canonical Dropbox baseline plus the repair overlay must be sufficient to rebuild required v3 derived indexes under [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md).
+
+This does **not** change the core location distinction:
 
 ```text
 R2 backup inventory/control authority
     -> remains R2-only
 
-selected source payload and dependency evidence
-    -> may be copied to Dropbox when the active backup contract requires it
+Dropbox backup state/checkpoint authority
+    -> remains Dropbox-only
 ```
 
-The exact v3 scoped-root payload and checkpoint-completeness rules are owned by [`../backup_and_recovery/r2_history_index_v3_backup_amendment.md`](../backup_and_recovery/r2_history_index_v3_backup_amendment.md) and [`../backup_and_recovery/r2_history_dropbox_sync_contract.md`](../backup_and_recovery/r2_history_dropbox_sync_contract.md).
+The compact-summary selection and normal backup scope are owned by [`../backup_and_recovery/r2_history_index_v3_backup_amendment.md`](../backup_and_recovery/r2_history_index_v3_backup_amendment.md) and [`../backup_and_recovery/r2_history_dropbox_sync_contract.md`](../backup_and_recovery/r2_history_dropbox_sync_contract.md).
 
 ## Required migration evidence terminology
 
