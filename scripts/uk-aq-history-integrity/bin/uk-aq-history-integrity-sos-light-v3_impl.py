@@ -6012,66 +6012,97 @@ def run_narrow_backfill(
 
     stdout_text = ""
     stderr_text = ""
-    try:
-        proc = subprocess.run(
-            cmd,
-            env=sub_env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-        stdout_text = proc.stdout or ""
-        stderr_text = proc.stderr or ""
-        result["exit_code"] = proc.returncode
-        result["status"] = "ok" if proc.returncode == 0 else "error"
-        if proc.returncode != 0:
-            result["error"] = f"wrapper exit_code={proc.returncode}"
-    except subprocess.TimeoutExpired as exc:
-        result["status"] = "timeout"
-        result["error"] = f"wrapper timed out after {timeout_seconds}s"
-        if isinstance(exc.stdout, (bytes, bytearray)):
-            stdout_text = exc.stdout.decode("utf-8", errors="replace")
-        else:
-            stdout_text = exc.stdout or ""
-        if isinstance(exc.stderr, (bytes, bytearray)):
-            stderr_text = exc.stderr.decode("utf-8", errors="replace")
-        else:
-            stderr_text = exc.stderr or ""
-    except OSError as exc:
-        result["status"] = "spawn_error"
-        result["error"] = f"spawn failed: {exc}"
+    label = log_label or f"day_{iso}"
+    durable_log_path = log_dir / f"{label}.log" if log_dir is not None else None
+    durable_stderr_path = (
+        log_dir / f"{label}.stderr.log" if log_dir is not None else None
+    )
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-child-") as temp_dir:
+        stdout_path = durable_log_path or Path(temp_dir) / "stdout.log"
+        stderr_path = durable_stderr_path or Path(temp_dir) / "stderr.log"
+        if log_dir is not None:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            result["log_path"] = str(stdout_path)
+        try:
+            with (
+                stdout_path.open("w+", encoding="utf-8") as stdout_fh,
+                stderr_path.open("w+", encoding="utf-8") as stderr_fh,
+            ):
+                stdout_fh.write(f"# stage: {label}\n")
+                stdout_fh.write(f"# wrapper: {wrapper_path}\n")
+                stdout_fh.write(f"# env_file: {env_file_path}\n")
+                stdout_fh.write(f"# day: {iso}\n")
+                stdout_fh.write(f"# to_day: {to_iso}\n")
+                stdout_fh.write(
+                    "# connector_ids: "
+                    f"{sub_env.get('UK_AQ_BACKFILL_CONNECTOR_IDS', 'all')}\n"
+                )
+                stdout_fh.write(
+                    "# repair_pollutants: "
+                    f"{sub_env.get('UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS', 'all')}\n"
+                )
+                stdout_fh.write(f"# worker_purpose: {worker_purpose}\n")
+                stdout_fh.write(f"# command: {' '.join(cmd)}\n")
+                stdout_fh.write(f"# started_at: {started_at}\n")
+                stdout_fh.write("# completion: pending\n\n# === STDOUT ===\n")
+                stdout_fh.flush()
+                os.fsync(stdout_fh.fileno())
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        env=sub_env,
+                        stdout=stdout_fh,
+                        stderr=stderr_fh,
+                        text=True,
+                        timeout=timeout_seconds,
+                        check=False,
+                    )
+                    result["exit_code"] = proc.returncode
+                    result["status"] = "ok" if proc.returncode == 0 else "error"
+                    if proc.returncode != 0:
+                        result["error"] = f"wrapper exit_code={proc.returncode}"
+                except subprocess.TimeoutExpired:
+                    result["status"] = "timeout"
+                    result["error"] = f"wrapper timed out after {timeout_seconds}s"
+                except OSError as exc:
+                    result["status"] = "spawn_error"
+                    result["error"] = f"spawn failed: {exc}"
+                stdout_fh.flush()
+                stderr_fh.flush()
+                stdout_fh.seek(0)
+                stdout_text = stdout_fh.read()
+                stdout_text = stdout_text.split("# === STDOUT ===\n", 1)[-1]
+                stderr_fh.seek(0)
+                stderr_text = stderr_fh.read()
+                # Preserve compatibility with mocked subprocess.run calls that
+                # return captured strings despite receiving file handles.
+                if 'proc' in locals() and getattr(proc, "stdout", None):
+                    stdout_text += str(proc.stdout)
+                if 'proc' in locals() and getattr(proc, "stderr", None):
+                    stderr_text += str(proc.stderr)
+                if durable_log_path is not None:
+                    stdout_fh.seek(0, os.SEEK_END)
+                    stdout_fh.write("\n# === STDERR ===\n")
+                    stdout_fh.write(stderr_text)
+                    stdout_fh.write(
+                        "\n# === COMPLETION ===\n"
+                        f"# exit_code: {result['exit_code']}\n"
+                        f"# status: {result['status']}\n"
+                        f"# duration_seconds: {round(time.monotonic() - started, 3)}\n"
+                        "# completion: complete\n"
+                    )
+                    stdout_fh.flush()
+                    os.fsync(stdout_fh.fileno())
+        except OSError as exc:
+            if result["status"] is None:
+                result["status"] = "spawn_error"
+                result["error"] = f"child log setup failed: {exc}"
+            log.warning("backfill log_path write failed: %s", exc)
 
     result["stdout_tail"] = _tail_bytes(stdout_text)
     result["stderr_tail"] = _tail_bytes(stderr_text)
     result.update(_extract_source_to_r2_observation_status(stdout_text))
-
-    if log_dir is not None and (stdout_text or stderr_text or result["status"]):
-        log_dir.mkdir(parents=True, exist_ok=True)
-        label = log_label or f"day_{iso}"
-        log_path = log_dir / f"{label}.log"
-        try:
-            with log_path.open("w", encoding="utf-8") as fh:
-                fh.write(f"# wrapper: {wrapper_path}\n")
-                fh.write(f"# env_file: {env_file_path}\n")
-                fh.write(f"# day: {iso}\n")
-                fh.write(f"# connector_ids: {sub_env.get('UK_AQ_BACKFILL_CONNECTOR_IDS', 'all')}\n")
-                fh.write(
-                    f"# timeseries_ids: {sub_env.get('UK_AQ_BACKFILL_TIMESERIES_IDS', 'complete_connector_day')}\n"
-                )
-                fh.write(f"# output_scope: {sub_env.get('UK_AQ_BACKFILL_OUTPUT_SCOPE', 'default')}\n")
-                if extra_env:
-                    fh.write(f"# extra_env: {json.dumps(extra_env, sort_keys=True)}\n")
-                fh.write(f"# command: {' '.join(cmd)}\n")
-                fh.write(f"# exit_code: {result['exit_code']}\n")
-                fh.write(f"# status: {result['status']}\n")
-                fh.write("\n# === STDOUT ===\n")
-                fh.write(stdout_text)
-                fh.write("\n# === STDERR ===\n")
-                fh.write(stderr_text)
-            result["log_path"] = str(log_path)
-        except OSError as exc:
-            log.warning("backfill log_path write failed: %s", exc)
 
     result["duration_seconds"] = round(time.monotonic() - started, 3)
     log.info(
@@ -6084,6 +6115,16 @@ def run_narrow_backfill(
         if result.get("stderr_tail"):
             log.warning("backfill stderr tail:\n%s", result["stderr_tail"])
     return result
+
+
+def _v2_observation_worker_log_label(
+    *, stage: str, day_utc: str, connector_id: int, pollutant_code: str | None
+) -> str:
+    stage_prefix = "v2_obs_detector" if stage == "detector" else "v2_obs"
+    label = f"{stage_prefix}_day_{day_utc}_connector_{connector_id}"
+    if pollutant_code:
+        label += f"_pollutant_{pollutant_code}"
+    return label
 
 
 def _record_backfill_on_event(
@@ -17104,7 +17145,12 @@ def run_v2_gap_backfills(
                 day=day_obj,
                 log=log,
                 log_dir=backfill_log_dir,
-                log_label=f"v2_obs_detector_day_{day_iso}_connector_{connector_id}",
+                log_label=_v2_observation_worker_log_label(
+                    stage="detector",
+                    day_utc=day_iso,
+                    connector_id=connector_id,
+                    pollutant_code=partition_pollutant,
+                ),
                 output_scope="observations_only",
                 history_version="v2",
                 extra_env={
@@ -17248,7 +17294,12 @@ def run_v2_gap_backfills(
                 break
             if limits.should_stop():
                 break
-            chunk_label = f"v2_obs_day_{day_iso}_connector_{connector_id}"
+            chunk_label = _v2_observation_worker_log_label(
+                stage="proposal",
+                day_utc=day_iso,
+                connector_id=connector_id,
+                pollutant_code=partition_pollutant,
+            )
             if len(chunks) > 1:
                 chunk_label = f"{chunk_label}_chunk_{chunk_index:03d}_of_{len(chunks):03d}"
             # Chunking is local acquisition only. The final chunk builds one
