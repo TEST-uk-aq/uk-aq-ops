@@ -210,10 +210,13 @@ function normalizeV3PhysicalPage(payload, identity, piece, expectedPage, supplie
       || observedAtMs < piece.startMs
       || observedAtMs >= piece.endMs
       || !Number.isFinite(value)
-      || value < 0
       || (previousMs !== null && observedAtMs < previousMs)
     ) throw new Error("station_history_v3_leaf_row_invalid");
     previousMs = observedAtMs;
+    // Canonical history may contain finite negative source readings. Match the
+    // v2 and direct-ingest paths by omitting them rather than treating the v3
+    // leaf as structurally invalid.
+    if (value < 0) continue;
     rows.push({
       connector_id: identity.connectorId,
       station_id: identity.stationId,
