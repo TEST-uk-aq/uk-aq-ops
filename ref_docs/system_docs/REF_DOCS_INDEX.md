@@ -18,7 +18,7 @@ Source repository:
 
 Source commit:
 
-`e30fce81f0cb2e0c6f551d30a31e8ce43336ef17`
+`beaac2eda12265a1ed3ec9b832be7752f5836d4b`
 
 Snapshot date:
 
@@ -60,10 +60,15 @@ ChatGPT in Chat mode owns authoritative system-doc changes. When one of the mirr
 The authoritative SOS-light contract now requires:
 
 - Step 0 hard currentness precheck:
-  - complete Dropbox checkpoint;
-  - successful Dropbox backup completed after the latest relevant completed R2 writer, including Prune Daily and Integrity/SOS-light;
-  - exact equality between the Dropbox fully processed observations-root `content_hash` and the current live R2 observations-root `content_hash`;
-  - any mismatch stops immediately before DETECT;
+  - request-level IngestDB boundary passes;
+  - acquire the global observations operation lock;
+  - while that lock is held, verify the Dropbox checkpoint is complete and valid;
+  - require the successful Dropbox backup to have completed after the latest relevant completed R2 writer, including Prune Daily and Integrity/SOS-light;
+  - read the Dropbox fully processed observations-root `content_hash`;
+  - read the current live R2 observations-root `content_hash`;
+  - require exact equality between those root hashes;
+  - pin the Dropbox baseline only after all preceding checks succeed;
+  - any failure before pinning stops immediately before DETECT;
 - DETECT from the pinned Dropbox baseline plus authoritative current-run repair source;
 - PROPOSE from a local Dropbox+repair overlay, rebuilding every affected derived v2/v3 index deterministically;
 - APPLY only the frozen changed/removed set, then verify those R2 results;
