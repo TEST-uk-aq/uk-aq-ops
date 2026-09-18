@@ -16,7 +16,6 @@ import {
 } from "./lib/rclone.mjs";
 import {
   buildObservationRunManifestStateShard,
-  buildScopedRootsStateShard,
   completeObservationMonthState,
   emptyHierarchicalStateRoot,
   markLatestTimeseriesProcessed,
@@ -41,8 +40,6 @@ import {
   validateObservationMonthState,
   validateObservationRunManifestInventoryShard,
   validateObservationRunManifestStateShard,
-  validateScopedRootsInventoryShard,
-  validateScopedRootsStateShard,
 } from "./lib/hierarchical_backup_v2.mjs";
 import {
   syncTimeseriesBindingsToDropbox,
@@ -765,14 +762,6 @@ async function main() {
       + `actual=${actualRunManifestShardHash}`,
     );
   }
-  let scopedRootsInventoryShard = null;
-  const scopedPointer = inventoryRoot.global_units.observations_timeseries_scoped_roots;
-  if (generation.version === "v3") {
-    if (!scopedPointer) throw new Error("V3 inventory is missing scoped-root dependency evidence");
-    const scopedRaw = readJsonRequired(args.rclone_bin, args.source_root, scopedPointer.inventory_shard_key);
-    scopedRootsInventoryShard = validateScopedRootsInventoryShard(scopedRaw.parsed);
-    if (sha256Hex(stableJson(scopedRootsInventoryShard)) !== scopedPointer.content_hash || scopedRootsInventoryShard.global_latest_sha256 !== inventoryRoot.global_units.observations_timeseries_latest.sha256) throw new Error("V3 scoped-root inventory pointer mismatch");
-  }
 
   const existingStateResult = readJsonMaybe(
     args.rclone_bin,
@@ -847,7 +836,6 @@ async function main() {
       incomplete: true,
       error: null,
     },
-    scoped_roots: scopedRootsInventoryShard ? { required: scopedRootsInventoryShard.root_count, verified: 0, copied: 0, reused: 0, complete: false } : null,
     prune: {
       enabled: args.prune_stale_parquet,
       force_recheck: args.force_prune_recheck,
@@ -1387,37 +1375,6 @@ async function main() {
     copied_at: processedLatestState.copied_at,
     verified: processedLatestState.verified,
   };
-
-  if (scopedRootsInventoryShard && !args.dry_run) {
-    const statePointer = stateRoot.global_units.observations_timeseries_scoped_roots;
-    const previousRaw = readJsonMaybe(args.rclone_bin, args.dest_root, statePointer.state_shard_key, DROPBOX_READ_RETRY);
-    let previous = null;
-    if (previousRaw) {
-      try { previous = validateScopedRootsStateShard(previousRaw.parsed); } catch { previous = null; }
-    }
-    const verified = [];
-    for (const root of scopedRootsInventoryShard.roots) {
-      const existing = readRemoteFileIdentity(args.rclone_bin, args.dest_root, root.key);
-      if (existing.exists && existing.sha256 === root.sha256 && existing.size === root.byte_size) {
-        report.scoped_roots.reused += 1;
-      } else {
-        const copied = copyAndVerifyJsonFile({ rcloneBin: args.rclone_bin, sourceRoot: args.source_root, destRoot: args.dest_root, relativePath: root.key, dryRun: false });
-        if (!copied.verified || copied.source_hash !== root.sha256 || copied.source_size !== root.byte_size) throw new Error(`V3 scoped-root source/copy identity mismatch: ${root.key}`);
-        const destination = readRemoteFileIdentity(args.rclone_bin, args.dest_root, root.key);
-        if (!destination.exists || destination.sha256 !== root.sha256 || destination.size !== root.byte_size) throw new Error(`V3 scoped-root Dropbox verification failed: ${root.key}`);
-        report.scoped_roots.copied += 1;
-      }
-      verified.push({ ...root, destination_verified: true });
-      const partial = buildScopedRootsStateShard(scopedRootsInventoryShard, verified);
-      uploadJson({ rcloneBin: args.rclone_bin, root: args.dest_root, relativePath: statePointer.state_shard_key, payload: partial, dryRun: false });
-    }
-    const complete = buildScopedRootsStateShard(scopedRootsInventoryShard, verified);
-    const write = uploadJson({ rcloneBin: args.rclone_bin, root: args.dest_root, relativePath: statePointer.state_shard_key, payload: complete, dryRun: false });
-    stateRoot.global_units.observations_timeseries_scoped_roots = { state_shard_key: statePointer.state_shard_key, processed_global_latest_sha256: complete.global_latest_sha256, state_shard_hash: write.hash, complete: complete.complete };
-    report.scoped_roots.verified = verified.length;
-    report.scoped_roots.complete = complete.complete;
-    stateRootDirty = true;
-  }
 
   if (!args.dry_run && allYearsComplete(stateRoot, inventoryRoot)) {
     copyAndVerifyJsonFile({
