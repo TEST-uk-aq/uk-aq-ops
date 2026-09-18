@@ -28,45 +28,91 @@ def load_integrity_module():
     return module
 
 
+def create_ops_git_repository(root: Path) -> str:
+    marker = root / "workers/shared/r2_sigv4.mjs"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("export const marker = true;\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "init", "--quiet"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "config", "user.name", "Integrity Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "--quiet", "-m", "fixture"],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip().lower()
+
+
 class FixedV3WriterProvenanceTest(unittest.TestCase):
     def test_repo_head_is_resolved_with_explicit_repository_and_pinned(self) -> None:
         integrity = load_integrity_module()
-        expected = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip().lower()
         old = os.environ.pop(integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV, None)
-        env = {"UK_AQ_OPS_REPO_ROOT": str(REPO_ROOT)}
         try:
-            self.assertEqual(
-                integrity.resolve_and_pin_integrity_target_writer_git_sha(env),
-                expected,
-            )
-            self.assertEqual(env[integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV], expected)
-            self.assertEqual(os.environ[integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV], expected)
+            with tempfile.TemporaryDirectory() as temp_raw:
+                repo = Path(temp_raw)
+                expected = create_ops_git_repository(repo)
+                env = {"UK_AQ_OPS_REPO_ROOT": str(repo)}
+                self.assertEqual(
+                    integrity.resolve_and_pin_integrity_target_writer_git_sha(env),
+                    expected,
+                )
+                self.assertEqual(env[integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV], expected)
+                self.assertEqual(os.environ[integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV], expected)
         finally:
             if old is None:
                 os.environ.pop(integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV, None)
             else:
                 os.environ[integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV] = old
 
+    def test_dirty_explicit_repository_is_rejected_before_sha_is_pinned(self) -> None:
+        integrity = load_integrity_module()
+        name = integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV
+        old = os.environ.pop(name, None)
+        try:
+            with tempfile.TemporaryDirectory() as temp_raw:
+                repo = Path(temp_raw)
+                create_ops_git_repository(repo)
+                (repo / "workers/shared/r2_sigv4.mjs").write_text(
+                    "export const marker = false;\n", encoding="utf-8",
+                )
+                env = {"UK_AQ_OPS_REPO_ROOT": str(repo)}
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "requires a clean ops repository worktree",
+                ):
+                    integrity.resolve_and_pin_integrity_target_writer_git_sha(env)
+                self.assertNotIn(name, env)
+                self.assertNotIn(name, os.environ)
+        finally:
+            if old is not None:
+                os.environ[name] = old
+
     def test_valid_inherited_pin_is_reused_and_invalid_pin_fails_closed(self) -> None:
         integrity = load_integrity_module()
         name = integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV
         old = os.environ.get(name)
         try:
-            expected = subprocess.run(
-                ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
-                check=True, capture_output=True, text=True,
-            ).stdout.strip().lower()
-            os.environ[name] = expected
-            self.assertEqual(
-                integrity.resolve_and_pin_integrity_target_writer_git_sha({}),
-                expected,
-            )
-            os.environ[name] = "A" * 40
-            with self.assertRaisesRegex(RuntimeError, "must exactly match"):
-                integrity.resolve_and_pin_integrity_target_writer_git_sha({})
+            with tempfile.TemporaryDirectory() as temp_raw:
+                repo = Path(temp_raw)
+                expected = create_ops_git_repository(repo)
+                env = {"UK_AQ_OPS_REPO_ROOT": str(repo)}
+                os.environ[name] = expected
+                self.assertEqual(
+                    integrity.resolve_and_pin_integrity_target_writer_git_sha(env),
+                    expected,
+                )
+                os.environ[name] = "A" * 40
+                with self.assertRaisesRegex(RuntimeError, "must exactly match"):
+                    integrity.resolve_and_pin_integrity_target_writer_git_sha(env)
         finally:
             if old is None:
                 os.environ.pop(name, None)

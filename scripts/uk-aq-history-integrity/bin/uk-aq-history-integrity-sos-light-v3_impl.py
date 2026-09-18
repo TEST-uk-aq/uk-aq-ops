@@ -14055,6 +14055,28 @@ def resolve_and_pin_integrity_target_writer_git_sha(
             "cannot establish Integrity target writer Git SHA from the ops "
             f"repository {repo_root}: {detail or 'invalid git rev-parse output'}"
         )
+    try:
+        worktree = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "status", "--porcelain",
+                "--untracked-files=normal",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            "fixed-v3 Integrity writer provenance requires a clean ops "
+            f"repository worktree: cannot inspect {repo_root}: {exc}"
+        ) from exc
+    if worktree.returncode != 0 or worktree.stdout:
+        detail = (worktree.stderr or worktree.stdout).strip()
+        raise RuntimeError(
+            "fixed-v3 Integrity writer provenance requires a clean ops "
+            f"repository worktree: {repo_root}: {detail or 'git status failed'}"
+        )
     inherited = str(os.environ.get(INTEGRITY_TARGET_WRITER_GIT_SHA_ENV, "")).strip()
     if inherited and (
         not _FULL_LOWER_GIT_SHA_RE.fullmatch(inherited) or inherited != resolved
