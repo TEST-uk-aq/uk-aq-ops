@@ -11,18 +11,21 @@
 Before implementation:
 
 1. read this file;
-2. read the active system map at `../TEST-uk-aq-system-docs/system_docs/SYSTEM_OVERVIEW.md`;
-3. follow the relevant area `README.md`;
-4. read only the broad/narrow contracts that router selects for the task;
-5. inspect only the implementation files needed by that bounded route.
+2. if the sibling system-doc repository is available, read the authoritative system map at `../TEST-uk-aq-system-docs/system_docs/SYSTEM_OVERVIEW.md`;
+3. if that sibling path is unavailable in a single-repository workspace such as Codex Cloud, read `ref_docs/system_docs/REF_DOCS_INDEX.md` and then `ref_docs/system_docs/SYSTEM_OVERVIEW.md`;
+4. follow the relevant area `README.md` from the same documentation source selected in step 2 or 3;
+5. read only the broad/narrow contracts that router selects for the task;
+6. inspect only the implementation files needed by that bounded route.
 
 Do not recursively read all of `system_docs/`, `system_docs_legacy/`, plans, drafts or archive material.
 
-Active `system_docs/` contracts are authoritative. If the user request, code or another document conflicts with an active contract, report the conflict rather than silently overriding or weakening it.
+Active `system_docs/` contracts in `TEST-uk-aq-system-docs` are authoritative. If the user request, code or another document conflicts with an active contract, report the conflict rather than silently overriding or weakening it.
+
+`ref_docs/system_docs/` in this repository is a read-only convenience mirror for single-repository workspaces. Its `REF_DOCS_INDEX.md` records the upstream source commit and mirrored scope. The mirror MUST NOT be treated as a second editable authority. If the sibling authoritative file is available and differs from the mirror, use the sibling file and report that the mirror needs refresh.
 
 `system_docs_legacy/`, plans, drafts and archived documentation are not current authority unless an active contract explicitly incorporates a decision from them.
 
-Coding agents may read `system_docs/` but MUST NOT create, edit, move, rename or delete files there. When implementation requires a system-doc change, provide a concise handover for ChatGPT in Chat mode covering behaviour, files changed, schema/configuration/deployment implications and validation evidence.
+Coding agents may read authoritative `system_docs/` and the ops reference mirror but MUST NOT create, edit, move, rename or delete either as part of ordinary implementation work. When implementation requires a system-doc change, provide a concise handover for ChatGPT in Chat mode covering behaviour, files changed, schema/configuration/deployment implications and validation evidence. ChatGPT refreshes the ops mirror after authoritative contract changes.
 
 ## Default operating mode
 
