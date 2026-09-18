@@ -56,7 +56,9 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv): Promis
   if (!base || !token) {
     return errorEnvelope('MEDIA_ADMIN_NOT_CONFIGURED', 'Media admin is unavailable', 503);
   }
-  const upstreamPath = incoming.pathname.replace(/^\/api\/media/, '/admin');
+  const upstreamPath = incoming.pathname === '/api/media/articles/bulk-approve'
+    ? '/admin/articles/bulk/approve'
+    : incoming.pathname.replace(/^\/api\/media/, '/admin');
   const target = `${base}${upstreamPath}${incoming.search}`;
   const headers = new Headers({ Authorization: `Bearer ${token}`, Accept: request.headers.get('Accept') || '*/*' });
   const contentType = request.headers.get('Content-Type');
