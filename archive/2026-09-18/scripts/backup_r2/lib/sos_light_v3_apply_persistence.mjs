@@ -120,12 +120,17 @@ export async function runPersistedSosLightV3Apply({
   runState,
   proposal,
   r2,
+  executeWriter,
   adapters,
   persistenceIo = {},
 }) {
+  if (typeof executeWriter !== "function") {
+    throw new TypeError("SOS-light-v3 persisted apply requires executeWriter");
+  }
   for (const name of [
     "getObject",
     "putObject",
+    "putIfChanged",
     "listAllObjects",
     "deleteObjects",
   ]) {
@@ -139,8 +144,8 @@ export async function runPersistedSosLightV3Apply({
   }
   const counts = {
     planned_deletions: proposal.prefixes.length,
-    planned_writes: proposal.objects.length,
-    planned_post_put_verifications: proposal.objects.length,
+    planned_writes: null,
+    planned_post_put_verifications: null,
     completed_deletions: 0,
     deleted_objects: 0,
     completed_writes: 0,
@@ -166,7 +171,6 @@ export async function runPersistedSosLightV3Apply({
     started_at_utc: startedAtUtc,
     final_proposal_graph_validation: "succeeded",
     canonical_v3_writer_invoked: false,
-    frozen_proposal_apply: true,
     v3_publication_evidence: [],
     ...counts,
   };
@@ -616,29 +620,7 @@ export async function runPersistedSosLightV3Apply({
     }
   };
 
-  const frozenPublicationOrder = () => {
-    const byKey = new Map(proposal.objects.map((object) => [object.key, object]));
-    const remaining = new Map(byKey);
-    const ordered = [];
-    while (remaining.size) {
-      const ready = [...remaining.values()].filter((object) =>
-        (object.entry.dependencies || []).every((key) => !remaining.has(key))
-      ).sort((left, right) => left.key.localeCompare(right.key));
-      if (!ready.length) {
-        throw new Error("SOS-light-v3 frozen proposal has a publication dependency cycle");
-      }
-      for (const object of ready) {
-        ordered.push(object);
-        remaining.delete(object.key);
-      }
-    }
-    return ordered;
-  };
-
   try {
-    // Freeze and validate the complete publication schedule before the first
-    // R2 DELETE/PUT. Apply never discovers or adds objects from live R2.
-    const orderedObjects = frozenPublicationOrder();
     writeCompleteRunState();
     persistence.appendEvent({
       event_type: "canonical_apply_started",
@@ -649,24 +631,24 @@ export async function runPersistedSosLightV3Apply({
     });
     persistence.flush();
     checkpoint("fixed_v3_apply_intent_before_first_mutation");
-    for (const day of days) await prepareCompleteDayReplacement({ day_utc: day });
-    for (const object of orderedObjects) {
-      await trackedPutObject({
-        key: object.key,
-        body: object.body,
-        content_type: object.entry.content_type,
-      }, object.entry.publication_stage);
-      await trackedGetObject({ key: object.key });
+    runState.apply.canonical_v3_writer_invoked = true;
+    const writerResult = await executeWriter({
+      getObject: trackedGetObject,
+      putObject: trackedPutObject,
+      putIfChanged: trackedPutIfChanged,
+      putAndVerifyParquet,
+      recordDurableEvidence,
+      prepareCompleteDayReplacement,
+    });
+    if (writerResult?.ok !== true || pendingByKey.size !== 0) {
+      throw new Error(
+        pendingByKey.size
+          ? "SOS-light-v3 writer returned with unverified publications"
+          : "SOS-light-v3 canonical writer did not report success",
+      );
     }
-    if (pendingByKey.size !== 0) {
-      throw new Error("SOS-light-v3 frozen proposal returned with unverified publications");
-    }
-    const writerResult = {
-      ok: true,
-      status: "frozen_proposal_applied",
-      object_count: orderedObjects.length,
-      authority: "dropbox_baseline_plus_repair_overlay",
-    };
+    counts.planned_writes = publicationEvidence.length;
+    counts.planned_post_put_verifications = publicationEvidence.length;
     runState.apply.current_phase = "canonical_v3_apply_completed";
     progressState.status = "succeeded";
     progressState.current_phase = runState.apply.current_phase;

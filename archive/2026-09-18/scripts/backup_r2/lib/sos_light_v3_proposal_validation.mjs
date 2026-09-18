@@ -1,5 +1,6 @@
 /** Fixed-v3, SOS-light-only proposal validation boundary. */
 import fs from "node:fs";
+import path from "node:path";
 import { createHash } from "node:crypto";
 import {
   loadImmutableSourcePartition,
@@ -41,6 +42,20 @@ function localBody(entry, key) {
   }
   return { localPath, body };
 }
+function externalDependency(runState, objectKey, dependencyKey, identity) {
+  if (!identity || !["dropbox", "overlay"].includes(identity.source)) {
+    throw new Error(`Fixed-v3 dependency is neither current-run nor pinned baseline: ${objectKey} -> ${dependencyKey}`);
+  }
+  const root = path.resolve(String(identity.source === "dropbox" ? runState.base_dropbox_root : runState.overlay_root));
+  const localPath = path.resolve(root, ...dependencyKey.split("/"));
+  if (!localPath.startsWith(`${root}${path.sep}`) || !fs.statSync(localPath, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error(`Fixed-v3 external dependency is unavailable: ${objectKey} -> ${dependencyKey}`);
+  }
+  const body = fs.readFileSync(localPath);
+  if (body.byteLength !== Number(identity.bytes) || sha256(body) !== identity.sha256) {
+    throw new Error(`Fixed-v3 external dependency identity changed: ${objectKey} -> ${dependencyKey}`);
+  }
+}
 function validateDependencies(runState, key, entry) {
   if (!Array.isArray(entry.dependencies)) throw new Error(`Fixed-v3 dependencies are not an array: ${key}`);
   const dependencies = entry.dependencies.map(safeKey);
@@ -57,14 +72,13 @@ function validateDependencies(runState, key, entry) {
       throw new Error(`Fixed-v3 dependency identity is invalid: ${key} -> ${dependencyKey}`);
     }
     const staged = runState.objects?.[dependencyKey];
-    if (!staged) {
-      throw new Error(`Fixed-v3 dependency is outside the frozen proposal: ${key} -> ${dependencyKey}`);
-    }
-    const { body } = localBody(staged, dependencyKey);
-    if (identity.source !== "planned_overlay" || body.byteLength !== Number(identity.bytes)
-        || sha256(body) !== identity.sha256) {
-      throw new Error(`Fixed-v3 current-run dependency identity is invalid: ${key} -> ${dependencyKey}`);
-    }
+    if (staged) {
+      const { body } = localBody(staged, dependencyKey);
+      if (identity.source !== "planned_overlay" || body.byteLength !== Number(identity.bytes)
+          || sha256(body) !== identity.sha256) {
+        throw new Error(`Fixed-v3 current-run dependency identity is invalid: ${key} -> ${dependencyKey}`);
+      }
+    } else externalDependency(runState, key, dependencyKey, identity);
   }
 }
 

@@ -7,11 +7,8 @@ import test from "node:test";
 import {
   assertCurrentRunManifestWriterGitSha,
   assertFixedV3Proposal,
-  retainedExactV3ScopedRoots,
   resolveIntegrityTargetWriterGitSha,
-  verifyRetainedExactV3ScopedRoots,
 } from "../uk_aq_plan_sos_light_v3_observation_metadata.mjs";
-import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import {
   readCanonicalObservationRows,
 } from "../uk_aq_apply_integrity_proposal.mjs";
@@ -154,61 +151,4 @@ test("fixed-v3 staged manifests must match pinned writer provenance", () => {
     ),
     /contradicts pinned run/,
   );
-});
-
-function scopedManifest(dayUtc) {
-  const key = `history/_index_v3/observations_timeseries/day_utc=${dayUtc}` +
-    "/connector_id=1/pollutant_code=no2/manifest.json";
-  const body = Buffer.from(JSON.stringify({
-    day_utc: dayUtc, connector_id: 1, pollutant_code: "no2",
-  }));
-  return {
-    root: {
-      day_utc: dayUtc, connector_id: 1, pollutant_code: "no2", key,
-      byte_size: body.byteLength, sha256: sha256Hex(body),
-    },
-    object: { key, body, bytes: body.byteLength, content_sha256: sha256Hex(body), source: "dropbox" },
-  };
-}
-
-test("partial fixed-v3 repair verifies only retained roots from pinned Dropbox", () => {
-  const repaired = scopedManifest("2026-06-01");
-  const unchanged = scopedManifest("2026-06-04");
-  const existingLatest = { payload: { day_summaries: [
-    { scoped_roots: [repaired.root] }, { scoped_roots: [unchanged.root] },
-  ] } };
-  const retained = retainedExactV3ScopedRoots(existingLatest, [{ payload: repaired.root }]);
-  assert.deepEqual(retained, [unchanged.root]);
-  const requested = [];
-  const store = { getObjectFromSourceIfExists(key, source) {
-    requested.push([key, source]);
-    return key === unchanged.root.key ? unchanged.object : null;
-  } };
-  assert.deepEqual(verifyRetainedExactV3ScopedRoots(retained, store), retained);
-  assert.deepEqual(requested, [[unchanged.root.key, "dropbox"]]);
-  assert.ok(!retained.some(({ key }) => key === repaired.root.key),
-    "the repaired scope cannot be satisfied by its old baseline object");
-});
-
-test("partial fixed-v3 repair fails closed for missing or mismatched retained roots", () => {
-  const unchanged = scopedManifest("2026-06-04");
-  assert.throws(() => verifyRetainedExactV3ScopedRoots([unchanged.root], {
-    getObjectFromSourceIfExists: () => null,
-  }), /external dependency is unavailable/);
-  assert.throws(() => verifyRetainedExactV3ScopedRoots([
-    { ...unchanged.root, sha256: "f".repeat(64) },
-  ], { getObjectFromSourceIfExists: () => unchanged.object }), /SHA-256 disagrees/);
-  assert.throws(() => verifyRetainedExactV3ScopedRoots([
-    { ...unchanged.root, byte_size: unchanged.root.byte_size + 1 },
-  ], { getObjectFromSourceIfExists: () => unchanged.object }), /byte size disagrees/);
-});
-
-test("pinned latest rejects duplicate and scope-contradictory roots", () => {
-  const unchanged = scopedManifest("2026-06-04");
-  assert.throws(() => retainedExactV3ScopedRoots({ payload: { day_summaries: [{
-    scoped_roots: [unchanged.root, unchanged.root],
-  }] } }, []), /duplicate scoped root/);
-  assert.throws(() => retainedExactV3ScopedRoots({ payload: { day_summaries: [{
-    scoped_roots: [{ ...unchanged.root, day_utc: "2026-06-05" }],
-  }] } }, []), /key contradicts scope/);
 });

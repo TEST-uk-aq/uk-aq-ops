@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /** Fixed-v3 SOS-light canonical apply bridge. */
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -10,14 +11,21 @@ import {
   r2ListAllObjects,
   r2PutObject,
 } from "../../workers/shared/r2_sigv4.mjs";
-import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_history_index.mjs";
+import {
+  r2PutObjectIfChanged,
+  resolveR2HistoryIndexConfig,
+} from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import {
   requireObservationsGlobalOperationLockContext,
+  withHistoryWriterClient,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
   validateFinalSosLightV3ProposalGraph,
   validateLocalSosLightV3Proposal,
 } from "./lib/sos_light_v3_proposal_validation.mjs";
+import {
+  runValidatedSosHistoricalReplacementObservationHistoryV3Writer,
+} from "./lib/observation_history_integrity_writer_v3.mjs";
 import {
   runPersistedSosLightV3Apply,
 } from "./lib/sos_light_v3_apply_persistence.mjs";
@@ -46,6 +54,8 @@ async function main() {
   if (!hasRequiredR2Config(config.r2)) throw new Error("SOS-light-v3 requires complete R2 configuration");
   const proposal = validateLocalSosLightV3Proposal(runState);
   await validateFinalSosLightV3ProposalGraph({ runState, proposal });
+  const targetWriterGitSha = String(runState.writer_git_sha || runState.git_sha || process.env.GITHUB_SHA || execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" })).trim();
+  if (!/^[0-9a-f]{40}$/.test(targetWriterGitSha)) throw new Error("SOS-light-v3 requires a pinned 40-hex writer git SHA");
   return await runPersistedSosLightV3Apply({
     runStatePath,
     runState,
@@ -54,9 +64,24 @@ async function main() {
     adapters: {
       getObject: r2GetObject,
       putObject: r2PutObject,
+      putIfChanged: r2PutObjectIfChanged,
       listAllObjects: r2ListAllObjects,
       deleteObjects: r2DeleteObjects,
     },
+    executeWriter: async (mutationAdapters) => await withHistoryWriterClient(
+      process.env.SUPABASE_DB_URL || process.env.DATABASE_URL,
+      async (client) => await runValidatedSosHistoricalReplacementObservationHistoryV3Writer({
+        env: process.env,
+        client,
+        r2: config.r2,
+        runState,
+        validatedProposal: proposal,
+        targetWriterGitSha,
+        observationsPrefix: "history/v3/observations",
+        ...mutationAdapters,
+      }),
+      { applicationName: "uk-aq-sos-light-v3-history-writer" },
+    ),
   });
 }
 

@@ -140,7 +140,15 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
     tombstone_prefixes: [tombstone],
   };
   const proposal = {
-    objects: [{ key: publishedKey }],
+    objects: [{
+      key: publishedKey,
+      body: publishedBody,
+      entry: {
+        dependencies: [],
+        content_type: "application/json",
+        publication_stage: "observation_connector_manifest",
+      },
+    }],
     prefixes: [{ prefix: dayPrefix, entry: tombstone }],
   };
   const adapters = {
@@ -171,32 +179,6 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
       proposal,
       r2: {},
       adapters,
-      executeWriter: async ({
-        getObject,
-        putIfChanged,
-        recordDurableEvidence,
-        prepareCompleteDayReplacement,
-      }) => {
-        const replacement = await prepareCompleteDayReplacement({ day_utc: DAY_UTC });
-        const publication = await putIfChanged({
-          key: publishedKey,
-          body: publishedBody,
-          content_type: "application/json",
-          publication_stage: "observation_connector_manifest",
-        });
-        await getObject({ key: publishedKey });
-        await recordDurableEvidence({
-          key: publishedKey,
-          byte_size: publishedBody.byteLength,
-          sha256: sha256(publishedBody),
-        });
-        return {
-          ok: true,
-          status: "succeeded",
-          complete_day_replacement_results: [replacement],
-          publication,
-        };
-      },
     });
     assert.equal(result.status, "succeeded");
     assert.equal(store.has(oldKey), false);
@@ -260,13 +242,21 @@ test("fixed-v3 apply records failure after deletion instead of false success", a
         runStatePath,
         runState,
         proposal: {
-          objects: [],
+          objects: [{
+            key: `${dayPrefix}/manifest.json`,
+            body: Buffer.from("{}\n"),
+            entry: {
+              dependencies: [],
+              content_type: "application/json",
+              publication_stage: "observation_day_manifest",
+            },
+          }],
           prefixes: [{ prefix: dayPrefix, entry: tombstone }],
         },
         r2: {},
         adapters: {
           getObject: async () => ({ exists: false, body: Buffer.alloc(0) }),
-          putObject: async () => ({ status: "succeeded" }),
+          putObject: async () => { throw new Error("simulated publication failure"); },
           putIfChanged: async () => ({ status: "succeeded" }),
           listAllObjects: async ({ prefix }) => [...store.keys()]
             .filter((key) => key.startsWith(prefix))
@@ -274,10 +264,6 @@ test("fixed-v3 apply records failure after deletion instead of false success", a
           deleteObjects: async ({ keys }) => {
             for (const key of keys) store.delete(key);
           },
-        },
-        executeWriter: async ({ prepareCompleteDayReplacement }) => {
-          await prepareCompleteDayReplacement({ day_utc: DAY_UTC });
-          throw new Error("simulated publication failure");
         },
       }),
       /simulated publication failure/,
