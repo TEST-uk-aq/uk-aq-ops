@@ -30,9 +30,13 @@ SOS-light has one small hard currentness gate followed by exactly three conceptu
 
 ```text
 0. CURRENTNESS PRECHECK
-   complete Dropbox backup must be newer than the latest relevant R2 writer
-   AND Dropbox observations-root content_hash == live R2 observations-root content_hash
-   -> any failure: stop immediately
+   request-level IngestDB boundary passes
+   -> acquire global observations operation lock
+   -> selected Dropbox backup/checkpoint is complete and valid
+   -> backup completed after the latest relevant R2 writer
+   -> Dropbox observations-root content_hash == live R2 observations-root content_hash
+   -> pin Dropbox baseline
+   -> any failure before pinning: stop immediately
 
 1. DETECT
    Dropbox baseline + authoritative repair source
@@ -94,13 +98,14 @@ Step 0 is intentionally small and binary. It MUST complete before DETECT.
 
 The write-enabled gate MUST establish, in this order:
 
-1. the selected Dropbox checkpoint is complete and internally valid for the fixed generation;
-2. the latest successful relevant Dropbox backup completed after the latest relevant completed R2 writer operation that could have changed canonical observation history, including at least Prune Daily and Integrity/SOS-light repair;
-3. the shared global observations operation lock is held before the baseline is pinned for normal SOS-light work;
-4. while that lock is held, read only the canonical observations-root metadata needed for the currentness check;
-5. require exact equality between:
-   - the fully processed Dropbox observations-root `content_hash`; and
-   - the current live R2 observations-root `content_hash`.
+1. the request-level IngestDB boundary passes;
+2. acquire the shared global observations operation lock;
+3. while that lock is held, verify the selected Dropbox checkpoint is complete and internally valid for the fixed generation;
+4. require the latest successful relevant Dropbox backup to have completed after the latest relevant completed R2 writer operation that could have changed canonical observation history, including at least Prune Daily and Integrity/SOS-light repair;
+5. read the fully processed Dropbox observations-root `content_hash`;
+6. read the current live R2 observations-root `content_hash`;
+7. require exact equality between those two root hashes;
+8. only after all preceding checks succeed, pin the Dropbox baseline for DETECT and PROPOSE.
 
 The observations-root hash is the primary and sufficient normal content comparison.
 
@@ -271,7 +276,8 @@ Before APPLY, SOS-light fails closed when:
 
 - the fixed generation is inconsistent with the selected baseline or target paths;
 - the Dropbox backup/checkpoint is incomplete or invalid;
-- operational ordering cannot prove the Dropbox backup completed after the latest relevant writer;\n- the Dropbox processed observations-root `content_hash` does not exactly equal the live R2 observations-root `content_hash`;
+- operational ordering cannot prove the Dropbox backup completed after the latest relevant writer;
+- the Dropbox processed observations-root `content_hash` does not exactly equal the live R2 observations-root `content_hash`;
 - required source evidence cannot be acquired or reproduced;
 - selected replacement observations cannot be built;
 - the complete local overlay cannot be assembled;
@@ -290,7 +296,10 @@ It must record at least:
 
 - fixed history generation;
 - accepted Dropbox backup/checkpoint identity;
-- evidence that the accepted backup completed after the latest relevant writer;\n- Dropbox processed observations-root `content_hash`;\n- live R2 observations-root `content_hash`;\n- exact root-hash match result;
+- evidence that the accepted backup completed after the latest relevant writer;
+- Dropbox processed observations-root `content_hash`;
+- live R2 observations-root `content_hash`;
+- exact root-hash match result;
 - selected source evidence;
 - selected repair days/pollutants;
 - confirmation that DETECT and PROPOSE used Dropbox plus current-run repair source only;
