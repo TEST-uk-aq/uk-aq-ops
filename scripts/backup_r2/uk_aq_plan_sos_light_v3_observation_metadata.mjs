@@ -8,8 +8,8 @@ import {
   getObservationHistoryGeneration,
 } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
+  buildObservationHistoryExactLeafIndexV3Latest,
   buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
-  updateObservationHistoryExactLeafIndexV3Latest,
 } from "../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   buildObservationHistoryIndexV3PublicationPlan,
@@ -114,6 +114,58 @@ function artifactFromStoredObject(object, kind, stage) {
   };
 }
 
+function scopeIdentity(value) {
+  return `${value?.day_utc}\u0000${value?.connector_id}\u0000${value?.pollutant_code}`;
+}
+
+function rootDescriptor(artifact) {
+  return {
+    day_utc: artifact.payload.day_utc,
+    connector_id: artifact.payload.connector_id,
+    pollutant_code: artifact.payload.pollutant_code,
+    key: artifact.key,
+    byte_size: artifact.byte_size,
+    sha256: artifact.sha256,
+  };
+}
+
+function sameRootIdentity(left, right) {
+  return left?.key === right?.key
+    && Number(left?.byte_size) === Number(right?.byte_size)
+    && String(left?.sha256 || "") === String(right?.sha256 || "");
+}
+
+export function reconcileReconstructedExactV3Hierarchies({
+  existingLatest,
+  hierarchies,
+}) {
+  const oldRoots = (Array.isArray(existingLatest?.payload?.day_summaries)
+    ? existingLatest.payload.day_summaries : []).flatMap((summary) =>
+    Array.isArray(summary?.scoped_roots) ? summary.scoped_roots : []);
+  const oldByScope = new Map();
+  for (const root of oldRoots) {
+    const identity = scopeIdentity(root);
+    if (oldByScope.has(identity)) {
+      throw new Error(`Pinned v3 latest has duplicate scoped root: ${root?.key || identity}`);
+    }
+    oldByScope.set(identity, root);
+  }
+  const changedHierarchies = [];
+  const unchangedRoots = [];
+  for (const hierarchy of hierarchies) {
+    const reconstructed = rootDescriptor(hierarchy.scoped_manifest);
+    const previous = oldByScope.get(scopeIdentity(reconstructed));
+    if (sameRootIdentity(previous, reconstructed)) unchangedRoots.push(reconstructed);
+    else changedHierarchies.push(hierarchy);
+  }
+  const latest = buildObservationHistoryExactLeafIndexV3Latest({
+    scopedHierarchies: hierarchies,
+    indexRoot: GENERATION.observations_timeseries_index_prefix,
+    latestKey: GENERATION.observations_timeseries_latest_key,
+  });
+  return { latest, changedHierarchies, unchangedRoots };
+}
+
 function assertAllowedKey(key) {
   if (key.startsWith(`${GENERATION.observations_prefix}/`)) {
     return assertObservationHistoryGenerationKey(GENERATION, key, "observations");
@@ -141,8 +193,6 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
   const proposals = (output.planning.proposals || [])
     .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`));
   const proposalsByKey = new Map(proposals.map((proposal) => [String(proposal.key), proposal]));
-  const days = [...new Set((repairPlan.repair_plan || [])
-    .map((action) => String(action?.day_utc || "")).filter(Boolean))].sort();
   const prefixes = [GENERATION.observations_prefix];
   const store = createCombinedLocalStore({
     overlayRoot: env.UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT,
@@ -212,18 +262,13 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
   const existingLatest = artifactFromStoredObject(
     existingLatestObject, "observation_history_index_v3_latest_global", "latest_global",
   );
-  const affectedHierarchies = hierarchies.filter((hierarchy) =>
-    days.includes(String(hierarchy.scoped_manifest.payload.day_utc)));
-  const exactObjects = affectedHierarchies.flatMap((hierarchy) => hierarchy.publication_objects);
-  const latest = updateObservationHistoryExactLeafIndexV3Latest({
+  const rebuilt = reconcileReconstructedExactV3Hierarchies({
     existingLatest,
-    // Replacing every scope is deliberate: the compact global object is rebuilt
-    // from canonical Dropbox data plus the current repair overlay, never from
-    // retained live/scoped index objects.
-    replacementScopedManifests: hierarchies.map((hierarchy) => hierarchy.scoped_manifest),
-    indexRoot: GENERATION.observations_timeseries_index_prefix,
-    latestKey: GENERATION.observations_timeseries_latest_key,
+    hierarchies,
   });
+  const exactObjects = rebuilt.changedHierarchies
+    .flatMap((hierarchy) => hierarchy.publication_objects);
+  const latest = rebuilt.latest;
   exactObjects.push(latest);
   const exactByKey = new Map(exactObjects.map((artifact) => [artifact.key, artifact]));
   const changedExactObjects = exactObjects.filter((artifact) => {
@@ -238,13 +283,11 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     objects: changedExactObjects,
     // Unchanged roots in the rebuilt latest are canonical reconstruction
     // results, not live/external proposal dependencies.
-    externalReferences: hierarchies
-      .map((hierarchy) => hierarchy.scoped_manifest)
-      .filter((artifact) => !changedExactKeys.has(artifact.key))
-      .map((artifact) => ({
-        key: artifact.key,
-        byte_size: artifact.byte_size,
-        sha256: artifact.sha256,
+    externalReferences: rebuilt.unchangedRoots
+      .map((root) => ({
+        key: root.key,
+        byte_size: root.byte_size,
+        sha256: root.sha256,
         verified: true,
         durable: true,
       })),

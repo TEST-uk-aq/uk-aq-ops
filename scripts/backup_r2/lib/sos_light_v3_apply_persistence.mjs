@@ -126,6 +126,7 @@ export async function runPersistedSosLightV3Apply({
   for (const name of [
     "getObject",
     "putObject",
+    "putAndVerifyParquet",
     "listAllObjects",
     "deleteObjects",
   ]) {
@@ -368,6 +369,8 @@ export async function runPersistedSosLightV3Apply({
         r2_verified: true,
         post_put_verification_get_count: 1,
         final_live_sha256: operation.sha256,
+        stored_sha256_verified: operation.stored_sha256_verified === true,
+        stored_byte_size_verified: operation.stored_byte_size_verified === true,
         durable: true,
       });
       persistence.appendEvent({
@@ -404,91 +407,38 @@ export async function runPersistedSosLightV3Apply({
       throw error;
     }
   };
-  const trackedPutIfChanged = async (artifact) => {
-    const operation = beginPut(artifact);
+  const trackedPutAndVerifyParquet = async (object) => {
+    const operation = beginPut({
+      key: object.key,
+      body: object.body,
+      content_type: object.entry.content_type,
+      sha256: object.entry.sha256,
+      byte_size: object.entry.bytes,
+    }, "observation_parquet");
     try {
-      const instrumentedR2 = {
-        ...r2,
-        canonical_mutation_sink: async (generated) => {
-          const result = await adapters.putObject({
-            r2,
-            key: generated.key,
-            body: generated.body,
-            content_type: generated.content_type,
-            sha256: generated.sha256,
-          });
-          return {
-            ...result,
-            key: generated.key,
-            byte_size: generated.bytes,
-            sha256: generated.sha256,
-            skipped: false,
-            status: "succeeded",
-            write_r2: true,
-            verified: false,
-          };
-        },
-      };
-      const result = await adapters.putIfChanged({
-        r2: instrumentedR2,
-        key: operation.key,
-        body: operation.body,
-        content_type: operation.content_type,
-        writeR2: true,
-      });
-      completePut(operation, result);
-      return {
-        ...result,
-        verified: false,
-        post_put_get_verified: false,
-      };
-    } catch (error) {
-      appendFailure(operation, error);
-      throw error;
-    }
-  };
-  const recordDurableEvidence = async (artifact) => {
-    const key = normalizedKey(artifact?.key);
-    const evidence = [...publicationEvidence].reverse().find(
-      (entry) => entry.key === key,
-    );
-    if (
-      !evidence ||
-      evidence.byte_size !== Number(artifact?.byte_size) ||
-      evidence.sha256 !== String(artifact?.sha256 || "")
-    ) {
-      throw new Error(
-        `SOS-light-v3 durable publication evidence is incomplete: ${key}`,
-      );
-    }
-    return {
-      durable: true,
-      key,
-      byte_size: evidence.byte_size,
-      sha256: evidence.sha256,
-      evidence_kind: "r2_complete_body_readback",
-    };
-  };
-  const putAndVerifyParquet = async ({ intent }) => {
-    const operation = beginPut(intent, "observation_parquet");
-    try {
-      const result = await adapters.putObject({
+      const result = await adapters.putAndVerifyParquet({
         r2,
-        key: operation.key,
-        body: operation.body,
-        content_type: operation.content_type,
-        sha256: operation.sha256,
+        intent: {
+          key: operation.key,
+          body: operation.body,
+          content_type: operation.content_type,
+          sha256: operation.sha256,
+          byte_size: operation.byte_size,
+        },
       });
       completePut(operation, result);
+      if (result?.stored_sha256_verified !== true
+          || result?.stored_byte_size_verified !== true
+          || result?.sha256 !== operation.sha256
+          || Number(result?.byte_size) !== operation.byte_size) {
+        throw new Error(
+          `SOS-light-v3 checksum-aware Parquet verification failed: ${operation.key}`,
+        );
+      }
+      operation.stored_sha256_verified = true;
+      operation.stored_byte_size_verified = true;
       await trackedGetObject({ key: operation.key });
-      return {
-        key: operation.key,
-        byte_size: operation.byte_size,
-        sha256: operation.sha256,
-        verified: true,
-        stored_sha256_verified: true,
-        stored_byte_size_verified: true,
-      };
+      return result;
     } catch (error) {
       if (!operation.verified) appendFailure(operation, error);
       throw error;
@@ -651,12 +601,16 @@ export async function runPersistedSosLightV3Apply({
     checkpoint("fixed_v3_apply_intent_before_first_mutation");
     for (const day of days) await prepareCompleteDayReplacement({ day_utc: day });
     for (const object of orderedObjects) {
-      await trackedPutObject({
-        key: object.key,
-        body: object.body,
-        content_type: object.entry.content_type,
-      }, object.entry.publication_stage);
-      await trackedGetObject({ key: object.key });
+      if (object.key.endsWith(".parquet")) {
+        await trackedPutAndVerifyParquet(object);
+      } else {
+        await trackedPutObject({
+          key: object.key,
+          body: object.body,
+          content_type: object.entry.content_type,
+        }, object.entry.publication_stage);
+        await trackedGetObject({ key: object.key });
+      }
     }
     if (pendingByKey.size !== 0) {
       throw new Error("SOS-light-v3 frozen proposal returned with unverified publications");

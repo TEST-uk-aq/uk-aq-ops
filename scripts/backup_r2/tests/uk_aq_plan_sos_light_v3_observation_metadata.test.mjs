@@ -7,8 +7,13 @@ import test from "node:test";
 import {
   assertCurrentRunManifestWriterGitSha,
   assertFixedV3Proposal,
+  reconcileReconstructedExactV3Hierarchies,
   resolveIntegrityTargetWriterGitSha,
 } from "../uk_aq_plan_sos_light_v3_observation_metadata.mjs";
+import {
+  buildObservationHistoryExactLeafIndexV3Latest,
+  buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
+} from "../../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   readCanonicalObservationRows,
 } from "../uk_aq_apply_integrity_proposal.mjs";
@@ -150,5 +155,78 @@ test("fixed-v3 staged manifests must match pinned writer provenance", () => {
       { writer_git_sha: "d".repeat(40) }, pinned, "manifest.json",
     ),
     /contradicts pinned run/,
+  );
+});
+
+function exactHierarchy(dayUtc, timeseriesId) {
+  const built = buildObservationHistoryV3SteadyStatePartition({
+    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
+    rows: [{
+      connector_id: 1,
+      station_id: 10,
+      timeseries_id: timeseriesId,
+      pollutant_code: "no2",
+      observed_at_utc: `${dayUtc}T00:00:00.000Z`,
+      value: 12.5,
+      verification_status: "P",
+    }],
+    scope: { day_utc: dayUtc, connector_id: 1, pollutant_code: "no2" },
+    targetWriterGitSha: "a".repeat(40),
+    backedUpAtUtc: "2026-06-10T00:00:00.000Z",
+  });
+  const manifest = built.canonical_pollutant_manifest;
+  return buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+    metadata: built.target_metadata,
+    canonicalManifest: {
+      key: manifest.key,
+      byte_size: manifest.byte_size,
+      sha256: manifest.sha256,
+      manifest_hash: manifest.payload.manifest_hash,
+      row_count: manifest.payload.row_count,
+      observation_content_hash: manifest.payload.observation_content_hash,
+    },
+  });
+}
+
+test("reconstructed exact-v3 state republishes changed roots and drops absent old scopes", () => {
+  const unchanged = exactHierarchy("2026-06-01", 101);
+  const changedUnselected = exactHierarchy("2026-06-02", 102);
+  const absent = exactHierarchy("2026-06-03", 103);
+  const builtOldLatest = buildObservationHistoryExactLeafIndexV3Latest({
+    scopedHierarchies: [unchanged, changedUnselected, absent],
+  });
+  const oldLatest = {
+    ...builtOldLatest,
+    payload: structuredClone(builtOldLatest.payload),
+  };
+  const changedRoot = oldLatest.payload.day_summaries
+    .flatMap(({ scoped_roots }) => scoped_roots)
+    .find(({ day_utc }) => day_utc === "2026-06-02");
+  changedRoot.sha256 = "f".repeat(64);
+
+  const reconciled = reconcileReconstructedExactV3Hierarchies({
+    existingLatest: oldLatest,
+    hierarchies: [unchanged, changedUnselected],
+  });
+  assert.deepEqual(
+    reconciled.changedHierarchies.map(({ scoped_manifest }) => scoped_manifest.key),
+    [changedUnselected.scoped_manifest.key],
+    "an unselected reconstructed mismatch must publish its complete hierarchy",
+  );
+  assert.deepEqual(
+    reconciled.unchangedRoots.map(({ key }) => key),
+    [unchanged.scoped_manifest.key],
+    "a genuinely unchanged reconstructed root need not be republished",
+  );
+  const desiredRoots = reconciled.latest.payload.day_summaries
+    .flatMap(({ scoped_roots }) => scoped_roots);
+  assert.deepEqual(
+    desiredRoots.map(({ key }) => key),
+    [unchanged.scoped_manifest.key, changedUnselected.scoped_manifest.key],
+    "from-scratch latest must not retain a scope absent from canonical reconstruction",
+  );
+  assert.equal(
+    desiredRoots.find(({ key }) => key === changedUnselected.scoped_manifest.key).sha256,
+    changedUnselected.scoped_manifest.sha256,
   );
 });

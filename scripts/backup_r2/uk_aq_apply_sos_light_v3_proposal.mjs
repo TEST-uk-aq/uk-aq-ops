@@ -6,10 +6,14 @@ import { pathToFileURL } from "node:url";
 import {
   hasRequiredR2Config,
   r2GetObject,
+  r2HeadObject,
   r2DeleteObjects,
   r2ListAllObjects,
   r2PutObject,
 } from "../../workers/shared/r2_sigv4.mjs";
+import {
+  putAndVerifyR2ObjectWithSha256,
+} from "../../workers/shared/uk_aq_r2_checksum_publication.mjs";
 import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import {
   requireObservationsGlobalOperationLockContext,
@@ -54,6 +58,13 @@ async function main() {
     adapters: {
       getObject: r2GetObject,
       putObject: r2PutObject,
+      putAndVerifyParquet: async ({ r2, intent }) =>
+        await putAndVerifyR2ObjectWithSha256({
+          r2,
+          intent,
+          putObject: r2PutObject,
+          headObject: r2HeadObject,
+        }),
       listAllObjects: r2ListAllObjects,
       deleteObjects: r2DeleteObjects,
     },

@@ -130,7 +130,10 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
   const oldKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/obsolete.json`;
   const publishedKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/manifest.json`;
   const publishedBody = Buffer.from('{"schema_version":3}\n', "utf8");
+  const parquetKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/pollutant_code=no2/part-00000.parquet`;
+  const parquetBody = Buffer.from("planned-parquet", "utf8");
   const store = new Map([[oldKey, Buffer.from("obsolete", "utf8")]]);
+  const publicationOrder = [];
   const tombstone = { proposed: true, prefix: dayPrefix };
   const runState = {
     run_id: "sos-light-v3-persistence-test",
@@ -141,10 +144,20 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
   };
   const proposal = {
     objects: [{
+      key: parquetKey,
+      body: parquetBody,
+      entry: {
+        dependencies: [],
+        bytes: parquetBody.byteLength,
+        sha256: sha256(parquetBody),
+        content_type: "application/vnd.apache.parquet",
+        publication_stage: "observation_parquet",
+      },
+    }, {
       key: publishedKey,
       body: publishedBody,
       entry: {
-        dependencies: [],
+        dependencies: [parquetKey],
         content_type: "application/json",
         publication_stage: "observation_connector_manifest",
       },
@@ -156,8 +169,23 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
       ? { exists: true, body: Buffer.from(store.get(key)) }
       : { exists: false, body: Buffer.alloc(0) },
     putObject: async ({ key, body }) => {
+      publicationOrder.push(key);
       store.set(key, Buffer.from(body));
       return { status: "succeeded" };
+    },
+    putAndVerifyParquet: async ({ intent }) => {
+      assert.equal(intent.sha256, sha256(parquetBody));
+      assert.equal(intent.byte_size, parquetBody.byteLength);
+      publicationOrder.push(intent.key);
+      store.set(intent.key, Buffer.from(intent.body));
+      return {
+        key: intent.key,
+        sha256: intent.sha256,
+        byte_size: intent.byte_size,
+        stored_sha256_verified: true,
+        stored_byte_size_verified: true,
+        status: "succeeded",
+      };
     },
     putIfChanged: async ({ key, body }) => {
       store.set(key, Buffer.from(body));
@@ -182,12 +210,16 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
     });
     assert.equal(result.status, "succeeded");
     assert.equal(store.has(oldKey), false);
+    assert.deepEqual(publicationOrder, [parquetKey, publishedKey]);
+    assert.deepEqual(store.get(parquetKey), parquetBody);
     assert.deepEqual(store.get(publishedKey), publishedBody);
 
     const persisted = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
     assert.equal(persisted.apply.status, "succeeded");
-    assert.equal(persisted.apply.v3_publication_evidence.length, 1);
-    assert.equal(persisted.apply.v3_publication_evidence[0].sha256, sha256(publishedBody));
+    assert.equal(persisted.apply.v3_publication_evidence.length, 2);
+    assert.equal(persisted.apply.v3_publication_evidence[0].sha256, sha256(parquetBody));
+    assert.equal(persisted.apply.v3_publication_evidence[0].stored_sha256_verified, true);
+    assert.equal(persisted.apply.v3_publication_evidence[0].stored_byte_size_verified, true);
     assert.equal(persisted.tombstone_prefixes[0].deletion_verified, true);
 
     const verifierPath = fileURLToPath(new URL(
@@ -212,9 +244,9 @@ test("fixed-v3 apply persists exact mutation evidence accepted by the Integrity 
     assert.equal(verification.status, 0, verification.stderr);
     const verified = JSON.parse(verification.stdout);
     assert.equal(verified.persistence.status, "verified");
-    assert.equal(verified.persistence.verified_publication_object_count, 1);
+    assert.equal(verified.persistence.verified_publication_object_count, 2);
     assert.equal(verified.summary.status, "ok");
-    assert.equal(verified.summary.r2_objects_written, 1);
+    assert.equal(verified.summary.r2_objects_written, 2);
     assert.equal(verified.summary.r2_objects_deleted, 1);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -227,6 +259,8 @@ test("fixed-v3 apply records failure after deletion instead of false success", a
   const dayPrefix = `history/v3/observations/day_utc=${DAY_UTC}`;
   const oldKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/obsolete.json`;
   const store = new Map([[oldKey, Buffer.from("obsolete", "utf8")]]);
+  const failedParquetKey = `${dayPrefix}/connector_id=${CONNECTOR_ID}/pollutant_code=no2/part-00000.parquet`;
+  let dependentPutAttempted = false;
   const tombstone = { proposed: true, prefix: dayPrefix };
   const runState = {
     run_id: "sos-light-v3-failure-test",
@@ -243,10 +277,18 @@ test("fixed-v3 apply records failure after deletion instead of false success", a
         runState,
         proposal: {
           objects: [{
+            key: failedParquetKey,
+            body: Buffer.from("failed-parquet"),
+            entry: {
+              dependencies: [],
+              content_type: "application/vnd.apache.parquet",
+              publication_stage: "observation_parquet",
+            },
+          }, {
             key: `${dayPrefix}/manifest.json`,
             body: Buffer.from("{}\n"),
             entry: {
-              dependencies: [],
+              dependencies: [failedParquetKey],
               content_type: "application/json",
               publication_stage: "observation_day_manifest",
             },
@@ -256,7 +298,13 @@ test("fixed-v3 apply records failure after deletion instead of false success", a
         r2: {},
         adapters: {
           getObject: async () => ({ exists: false, body: Buffer.alloc(0) }),
-          putObject: async () => { throw new Error("simulated publication failure"); },
+          putObject: async () => {
+            dependentPutAttempted = true;
+            return { status: "succeeded" };
+          },
+          putAndVerifyParquet: async () => {
+            throw new Error("simulated checksum storage verification failure");
+          },
           putIfChanged: async () => ({ status: "succeeded" }),
           listAllObjects: async ({ prefix }) => [...store.keys()]
             .filter((key) => key.startsWith(prefix))
@@ -266,7 +314,7 @@ test("fixed-v3 apply records failure after deletion instead of false success", a
           },
         },
       }),
-      /simulated publication failure/,
+      /simulated checksum storage verification failure/,
     );
     const persisted = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
     assert.equal(persisted.apply.status, "failed");
@@ -274,6 +322,7 @@ test("fixed-v3 apply records failure after deletion instead of false success", a
     assert.equal(persisted.apply.failure_checkpoint.succeeded, true);
     assert.equal(persisted.tombstone_prefixes[0].deletion_verified, true);
     assert.equal(store.has(oldKey), false);
+    assert.equal(dependentPutAttempted, false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

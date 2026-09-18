@@ -21422,6 +21422,7 @@ def run_integrity_dropbox_currentness_gate(
     dropbox_root: str | Path,
     observations_prefix: str,
     timeseries_binding_backup_mode: str,
+    checkpoint_only: bool = False,
 ) -> dict[str, Any]:
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -21436,6 +21437,8 @@ def run_integrity_dropbox_currentness_gate(
         "--observations-prefix", observations_prefix,
         "--timeseries-binding-backup-mode", timeseries_binding_backup_mode,
     ]
+    if checkpoint_only:
+        command.append("--checkpoint-only")
     completed = subprocess.run(
         command,
         cwd=repo_root,
@@ -24420,7 +24423,7 @@ def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dic
         supabase_url=supabase_url,
         service_role_key=service_role_key,
         integrity_started_at_utc=started_iso,
-        allow_stale_dropbox=bool(args.allow_stale_dropbox),
+        allow_stale_dropbox=bool(args.allow_stale_dropbox and not args.run_backfill),
         rpc_name=str(
             os.environ.get(
                 "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
@@ -27246,13 +27249,14 @@ def main(argv: list[str]) -> int:
             timeseries_binding_backup_mode=(
                 args.timeseries_binding_backup_mode
             ),
+            checkpoint_only=True,
         )
     log.info(
         "observations global operation lock: %s",
         json.dumps(global_operation_lock, sort_keys=True, default=str),
     )
     log.info(
-        "Dropbox checkpoint/live observations root gate: %s",
+        "Dropbox checkpoint completeness gate: %s",
         json.dumps(dropbox_currentness, sort_keys=True, default=str),
     )
     if not dropbox_currentness.get("allowed"):
@@ -27265,7 +27269,7 @@ def main(argv: list[str]) -> int:
             "date_selection": selection_summary,
             "started_at_utc": started_iso,
             "finished_at_utc": fmt_iso(utc_now()),
-            "status": "blocked_dropbox_checkpoint_not_current",
+            "status": "blocked_dropbox_checkpoint_incomplete",
             "dry_run": bool(args.dry_run),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
@@ -27313,6 +27317,40 @@ def main(argv: list[str]) -> int:
             "history_version_mode": history_version_mode,
             "checked_versions": checked_history_versions,
             "history_path_configs": serialized_history_path_configs,
+            "backup_readiness": backup_gate_summary,
+            "ingestdb_boundary": ingest_boundary,
+            "observations_global_operation_lock": global_operation_lock,
+            "dropbox_currentness": dropbox_currentness,
+            "metrics": {},
+        }
+        write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
+        return 2
+
+    # The complete checkpoint is now proven newer than every relevant writer.
+    # Only now compare its observations-root hash with the locked live R2 root;
+    # successful equality pins this Dropbox generation for DETECT/PROPOSE.
+    dropbox_currentness = run_integrity_dropbox_currentness_gate(
+        env={**env, **os.environ},
+        dropbox_root=dropbox_root,
+        observations_prefix=observation_history_config.observations_data_prefix,
+        timeseries_binding_backup_mode=args.timeseries_binding_backup_mode,
+    )
+    log.info(
+        "Dropbox checkpoint/live observations root gate: %s",
+        json.dumps(dropbox_currentness, sort_keys=True, default=str),
+    )
+    if not dropbox_currentness.get("allowed"):
+        summary = {
+            "env": args.env,
+            "profile": args.profile,
+            "source": args.source,
+            "from_day": from_day,
+            "to_day": to_day,
+            "started_at_utc": started_iso,
+            "finished_at_utc": fmt_iso(utc_now()),
+            "status": "blocked_dropbox_checkpoint_not_current",
+            "effective_mode": effective_mode,
+            "dropbox_baseline": str(dropbox_root),
             "backup_readiness": backup_gate_summary,
             "ingestdb_boundary": ingest_boundary,
             "observations_global_operation_lock": global_operation_lock,
