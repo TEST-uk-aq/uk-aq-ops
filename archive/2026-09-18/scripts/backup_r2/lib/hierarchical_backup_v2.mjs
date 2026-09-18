@@ -1,6 +1,5 @@
 import { assertObservationHistoryGeneration, assertObservationHistoryGenerationKey } from "../../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { createHash } from "node:crypto";
-import { validateObservationHistoryExactLeafIndexV3LatestSnapshot } from "../../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 
 export const HIERARCHICAL_INVENTORY_SCHEMA_VERSION = 1;
 export const HIERARCHICAL_STATE_SCHEMA_VERSION = 1;
@@ -16,10 +15,6 @@ export const OBSERVATION_RUN_MANIFEST_INVENTORY_KIND =
   "uk_aq_r2_history_backup_inventory_observation_run_manifests";
 export const OBSERVATION_RUN_MANIFEST_STATE_KIND =
   "uk_aq_r2_history_backup_state_observation_run_manifests";
-export const SCOPED_ROOTS_INVENTORY_KIND =
-  "uk_aq_r2_history_backup_inventory_observations_timeseries_scoped_roots";
-export const SCOPED_ROOTS_STATE_KIND =
-  "uk_aq_r2_history_backup_state_observations_timeseries_scoped_roots";
 export const TIMESERIES_BINDING_PACK_INVENTORY_KIND =
   "uk_aq_r2_history_backup_inventory_timeseries_binding_packs";
 export const OBSERVATIONS_TIMESERIES_LATEST_PATHS = Object.freeze({
@@ -74,115 +69,6 @@ export function assertSha256(value, label) {
     throw new Error(`${label} must be a lowercase SHA-256 hex string`);
   }
   return normalized;
-}
-
-export function buildScopedRootsInventoryShard({ latestKey, latestSha256, latest }) {
-  const snapshot = validateObservationHistoryExactLeafIndexV3LatestSnapshot({ payload: latest, latestKey });
-  const roots = snapshot.roots.map((root) => ({ day_utc: root.day_utc, connector_id: root.connector_id, pollutant_code: root.pollutant_code, key: root.key, sha256: root.sha256, byte_size: root.byte_size })).sort((a, b) => a.key.localeCompare(b.key));
-  const latestIdentity = assertSha256(latestSha256, "V3 global latest SHA-256");
-  return { schema_version: 1, kind: SCOPED_ROOTS_INVENTORY_KIND, backup_version: "v2", observation_generation: "v3", global_latest_key: normalizeRelativePath(latestKey), global_latest_sha256: latestIdentity, root_count: roots.length, root_set_sha256: sha256Hex(stableJson(roots)), roots };
-}
-
-export function validateScopedRootsInventoryShard(raw) {
-  const value = assertObject(raw, "scoped-root inventory shard");
-  if (value.schema_version !== 1 || value.kind !== SCOPED_ROOTS_INVENTORY_KIND || value.backup_version !== "v2" || value.observation_generation !== "v3") throw new Error("Scoped-root inventory shard identity mismatch");
-  if (!Array.isArray(value.roots) || value.roots.length === 0) throw new Error("Scoped-root inventory requires roots");
-  const roots = value.roots.map((root) => ({
-    day_utc: normalizeDay(root.day_utc),
-    connector_id: Number(root.connector_id),
-    pollutant_code: String(root.pollutant_code || ""),
-    key: normalizeRelativePath(root.key),
-    sha256: assertSha256(root.sha256, "scoped-root SHA-256"),
-    byte_size: Number(root.byte_size),
-  })).sort((left, right) => left.key.localeCompare(right.key));
-  const seen = new Set();
-  for (const root of roots) {
-    const identity = `${root.day_utc}\u0000${root.connector_id}\u0000${root.pollutant_code}`;
-    const expectedKey = `history/_index_v3/observations_timeseries/day_utc=${root.day_utc}/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}/manifest.json`;
-    if (!Number.isSafeInteger(root.connector_id) || root.connector_id <= 0 || !Number.isSafeInteger(root.byte_size) || root.byte_size <= 0 || !/^[a-z0-9_]+$/.test(root.pollutant_code) || root.key !== expectedKey || seen.has(identity)) throw new Error("Scoped-root inventory identity is invalid or contradictory");
-    seen.add(identity);
-  }
-  const rebuilt = { schema_version: 1, kind: SCOPED_ROOTS_INVENTORY_KIND, backup_version: "v2", observation_generation: "v3", global_latest_key: normalizeRelativePath(value.global_latest_key), global_latest_sha256: assertSha256(value.global_latest_sha256, "V3 global latest SHA-256"), root_count: roots.length, root_set_sha256: sha256Hex(stableJson(roots)), roots };
-  if (Number(value.root_count) !== roots.length || assertSha256(value.root_set_sha256, "scoped-root set SHA-256") !== rebuilt.root_set_sha256) throw new Error("Scoped-root inventory set identity mismatch");
-  return rebuilt;
-}
-
-export function buildScopedRootsStateShard(inventory, verifiedRoots = []) {
-  const source = validateScopedRootsInventoryShard(inventory);
-  const byKey = new Map(verifiedRoots.map((root) => [root.key, root]));
-  const roots = source.roots.map((root) => ({ ...root, destination_verified: byKey.get(root.key)?.destination_verified === true }));
-  const complete = roots.every((root) => root.destination_verified);
-  return { schema_version: 1, kind: SCOPED_ROOTS_STATE_KIND, backup_version: "v2", observation_generation: "v3", global_latest_key: source.global_latest_key, global_latest_sha256: source.global_latest_sha256, root_set_sha256: source.root_set_sha256, root_count: roots.length, roots, complete };
-}
-
-export function validateScopedRootsStateShard(raw) {
-  const value = assertObject(raw, "scoped-root state shard");
-  if (value.schema_version !== 1 || value.kind !== SCOPED_ROOTS_STATE_KIND || value.backup_version !== "v2" || value.observation_generation !== "v3") throw new Error("Scoped-root state shard identity mismatch");
-  const inventory = { ...value, kind: SCOPED_ROOTS_INVENTORY_KIND, roots: value.roots };
-  const state = buildScopedRootsStateShard(inventory, value.roots);
-  if (value.complete !== state.complete) throw new Error("Scoped-root state completeness mismatch");
-  return state;
-}
-
-export function scopedRootsStateMatchesInventory(state, inventory) {
-  if (!state) return false;
-  const source = validateScopedRootsInventoryShard(inventory);
-  try {
-    const candidate = validateScopedRootsStateShard(state);
-    return candidate.global_latest_sha256 === source.global_latest_sha256 &&
-      candidate.root_set_sha256 === source.root_set_sha256 &&
-      candidate.root_count === source.root_count;
-  } catch {
-    return false;
-  }
-}
-
-export async function processScopedRootsCheckpoint({
-  inventory,
-  priorState = null,
-  checkpointBatchUnits,
-  checkpointFlushSeconds,
-  inspectDestination,
-  copyAndVerify,
-  flushState,
-  now = Date.now,
-}) {
-  const source = validateScopedRootsInventoryShard(inventory);
-  const priorCompatible = scopedRootsStateMatchesInventory(priorState, source);
-  const verified = [];
-  let dirtyUnits = 0;
-  let lastFlushAt = now();
-  let flushCount = 0;
-  let lastState = null;
-  const flush = async ({ force = false } = {}) => {
-    if (dirtyUnits === 0) return null;
-    if (!force && dirtyUnits < checkpointBatchUnits && now() - lastFlushAt < checkpointFlushSeconds * 1_000) return null;
-    const state = buildScopedRootsStateShard(source, verified);
-    await flushState(state);
-    lastState = state;
-    dirtyUnits = 0;
-    lastFlushAt = now();
-    flushCount += 1;
-    return state;
-  };
-  try {
-    for (const root of source.roots) {
-      const destination = await inspectDestination(root);
-      if (!(destination?.exists && destination.sha256 === root.sha256 && destination.size === root.byte_size)) {
-        await copyAndVerify(root);
-        const readBack = await inspectDestination(root);
-        if (!(readBack?.exists && readBack.sha256 === root.sha256 && readBack.size === root.byte_size)) throw new Error(`V3 scoped-root Dropbox verification failed: ${root.key}`);
-      }
-      verified.push({ ...root, destination_verified: true });
-      dirtyUnits += 1;
-      await flush();
-    }
-    await flush({ force: true });
-    return { state: lastState, prior_compatible: priorCompatible, flush_count: flushCount };
-  } catch (error) {
-    if (dirtyUnits > 0) await flush({ force: true });
-    throw error;
-  }
 }
 
 export function normalizeRelativePath(value, label = "relative path") {
@@ -361,7 +247,6 @@ export function buildHierarchicalInventoryRoot({
   runManifestInventoryShardHash,
   runManifestUnitCount,
   latestTimeseries,
-  scopedRootsInventory = null,
 }) {
   const normalizedYears = [...years]
     .map((yearEntry) => ({
@@ -413,7 +298,6 @@ export function buildHierarchicalInventoryRoot({
       observations_timeseries_latest: validateLatestTimeseriesInventoryUnit(
         latestTimeseries,
       ),
-      ...(scopedRootsInventory ? { observations_timeseries_scoped_roots: scopedRootsInventory } : {}),
     },
   };
 }
@@ -638,15 +522,6 @@ export function validateHierarchicalInventoryRoot(
     throw new Error(
       "Hierarchical inventory root is missing observations_timeseries_latest",
     );
-  }
-  if (value.global_units?.observations_timeseries_scoped_roots) {
-    const pointer = assertObject(value.global_units.observations_timeseries_scoped_roots, "scoped-root inventory pointer");
-    globalUnits.observations_timeseries_scoped_roots = {
-      inventory_shard_key: normalizeRelativePath(pointer.inventory_shard_key),
-      content_hash: assertSha256(pointer.content_hash, "scoped-root inventory shard hash"),
-      global_latest_sha256: assertSha256(pointer.global_latest_sha256, "scoped-root inventory latest SHA-256"),
-      root_count: Number(pointer.root_count),
-    };
   }
   return {
     ...value,
@@ -959,7 +834,6 @@ export function emptyHierarchicalStateRoot(stateRootPrefix, generation) {
         ...emptyLatestTimeseriesState(),
         source_relative_path: generation.observations_timeseries_latest_key,
       },
-      ...(generation.version === "v3" ? { observations_timeseries_scoped_roots: { state_shard_key: `${prefix}/global/observations_timeseries_scoped_roots.json`, processed_global_latest_sha256: null, state_shard_hash: null, complete: false } } : {}),
     },
   };
 }
@@ -1042,12 +916,6 @@ export function validateHierarchicalStateRoot(
       observations_timeseries_latest: validateLatestTimeseriesState(
         value.global_units?.observations_timeseries_latest,
       ),
-      ...(generation?.version === "v3" ? { observations_timeseries_scoped_roots: {
-        state_shard_key: normalizeRelativePath(value.global_units?.observations_timeseries_scoped_roots?.state_shard_key || `${normalizeRelativePath(stateRootPrefix)}/global/observations_timeseries_scoped_roots.json`),
-        processed_global_latest_sha256: value.global_units?.observations_timeseries_scoped_roots?.processed_global_latest_sha256 ? assertSha256(value.global_units.observations_timeseries_scoped_roots.processed_global_latest_sha256, "state scoped-root latest SHA-256") : null,
-        state_shard_hash: value.global_units?.observations_timeseries_scoped_roots?.state_shard_hash ? assertSha256(value.global_units.observations_timeseries_scoped_roots.state_shard_hash, "state scoped-root shard hash") : null,
-        complete: value.global_units?.observations_timeseries_scoped_roots?.complete === true,
-      } } : {}),
     },
   };
 }

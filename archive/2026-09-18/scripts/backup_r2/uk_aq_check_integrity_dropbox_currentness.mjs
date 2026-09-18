@@ -5,9 +5,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
-  buildScopedRootsInventoryShard,
   validateHierarchicalStateRoot,
-  validateScopedRootsStateShard,
 } from "./lib/hierarchical_backup_v2.mjs";
 import {
   normalizeTimeseriesBindingPackRootState,
@@ -99,7 +97,7 @@ function parseArgs(argv) {
   return Object.freeze(args);
 }
 
-export function requireCompleteCheckpoint(state, timeseriesBindingBackupMode, generation) {
+function requireCompleteCheckpoint(state, timeseriesBindingBackupMode) {
   const blockers = [];
   if (!state.observations.processed_source_root_hash) blockers.push("observations_root_not_processed");
   if (!state.observations.years.length) blockers.push("observations_years_missing");
@@ -119,11 +117,6 @@ export function requireCompleteCheckpoint(state, timeseriesBindingBackupMode, ge
   const latest = state.global_units.observations_timeseries_latest;
   if (!latest.verified || !latest.processed_source_sha256 || latest.byte_size === null || !latest.copied_at) {
     blockers.push("observations_timeseries_latest_incomplete");
-  }
-  if (generation.version === "v3") {
-    const scoped = state.global_units.observations_timeseries_scoped_roots;
-    if (!scoped?.complete || !scoped.processed_global_latest_sha256 || !scoped.state_shard_hash) blockers.push("observations_timeseries_scoped_roots_incomplete");
-    else if (scoped.processed_global_latest_sha256 !== latest.processed_source_sha256) blockers.push("observations_timeseries_scoped_roots_latest_mismatch");
   }
   const core = state.core;
   if (
@@ -197,28 +190,7 @@ export async function checkIntegrityDropboxCurrentness({
     throw new Error(`Dropbox checkpoint root is invalid JSON: ${checkpointPath}`, { cause: error });
   }
   const checkpoint = validateHierarchicalStateRoot(checkpointRaw, normalizedStatePrefix, generation);
-  requireCompleteCheckpoint(checkpoint, normalizedBindingBackupMode, generation);
-
-  let scopedEvidence = null;
-  if (generation.version === "v3") {
-    const pointer = checkpoint.global_units.observations_timeseries_scoped_roots;
-    const statePath = resolveBelow(dropboxRoot, pointer.state_shard_key);
-    const stateBody = fs.readFileSync(statePath);
-    scopedEvidence = validateScopedRootsStateShard(JSON.parse(stateBody.toString("utf8")));
-    if (!scopedEvidence.complete || scopedEvidence.global_latest_sha256 !== checkpoint.global_units.observations_timeseries_latest.processed_source_sha256 || sha256Hex(stateBody) !== pointer.state_shard_hash) throw new Error("Dropbox v3 scoped-root checkpoint evidence is incomplete or contradictory");
-    for (const root of scopedEvidence.roots) {
-      if (!root.destination_verified) throw new Error(`Dropbox v3 scoped root is not verified: ${root.key}`);
-      const body = fs.readFileSync(resolveBelow(dropboxRoot, root.key));
-      if (body.length !== root.byte_size || sha256Hex(body) !== root.sha256) throw new Error(`Dropbox v3 scoped root identity mismatch: ${root.key}`);
-    }
-    const latest = checkpoint.global_units.observations_timeseries_latest;
-    const latestBody = fs.readFileSync(resolveBelow(dropboxRoot, latest.source_relative_path));
-    if (latestBody.length !== latest.byte_size || sha256Hex(latestBody) !== latest.processed_source_sha256) throw new Error("Dropbox v3 global latest identity mismatch");
-    let latestJson;
-    try { latestJson = JSON.parse(latestBody.toString("utf8")); } catch (error) { throw new Error("Dropbox v3 global latest is invalid JSON", { cause: error }); }
-    const declared = buildScopedRootsInventoryShard({ latestKey: latest.source_relative_path, latestSha256: latest.processed_source_sha256, latest: latestJson });
-    if (declared.root_set_sha256 !== scopedEvidence.root_set_sha256 || declared.root_count !== scopedEvidence.root_count) throw new Error("Dropbox v3 scoped-root evidence does not cover the complete backed-up latest");
-  }
+  requireCompleteCheckpoint(checkpoint, normalizedBindingBackupMode);
 
   const liveRootKey = `${normalizedObservationsPrefix}/_manifests/manifest.json`;
   let liveObject;
@@ -244,17 +216,7 @@ export async function checkIntegrityDropboxCurrentness({
     throw new Error(`Live R2 observations manifest is not the root: ${liveRootKey}`);
   }
   const checkpointHash = checkpoint.observations.processed_source_root_hash;
-  let liveLatestMatch = true;
-  let liveLatestIdentity = null;
-  if (generation.version === "v3") {
-    const latestKey = generation.observations_timeseries_latest_key;
-    const object = getLiveRoot ? await getLiveRoot({ key: latestKey }) : await r2GetObject({ r2: resolveR2HistoryIndexConfig(env).r2, key: latestKey });
-    const body = Buffer.from(object.body);
-    liveLatestIdentity = { key: latestKey, sha256: sha256Hex(body), byte_size: body.length };
-    const checkpointLatest = checkpoint.global_units.observations_timeseries_latest;
-    liveLatestMatch = liveLatestIdentity.sha256 === checkpointLatest.processed_source_sha256 && liveLatestIdentity.byte_size === checkpointLatest.byte_size;
-  }
-  const match = checkpointHash === liveRoot.content_hash && liveLatestMatch;
+  const match = checkpointHash === liveRoot.content_hash;
   const result = {
     allowed: match,
     status: match ? "current" : "blocked_stale_dropbox_checkpoint",
@@ -273,12 +235,9 @@ export async function checkIntegrityDropboxCurrentness({
       byte_size: Number(liveObject.bytes ?? Buffer.from(liveObject.body).length),
     },
     checkpoint_live_root_match: match,
-    live_observations_timeseries_latest: liveLatestIdentity,
-    checkpoint_live_latest_match: liveLatestMatch,
-    scoped_root_evidence: scopedEvidence ? { global_latest_sha256: scopedEvidence.global_latest_sha256, root_count: scopedEvidence.root_count, complete: scopedEvidence.complete } : null,
   };
   if (!match) {
-    const error = new Error("Dropbox checkpoint does not match the locked live R2 observations/latest identities");
+    const error = new Error("Dropbox checkpoint observations root does not match the locked live R2 root");
     error.code = "UK_AQ_INTEGRITY_DROPBOX_CHECKPOINT_STALE";
     error.result = result;
     throw error;
