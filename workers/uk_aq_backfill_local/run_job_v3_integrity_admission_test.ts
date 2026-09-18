@@ -131,3 +131,32 @@ Deno.test("fixed-v3 generic full-index rebuild remains rejected", () => {
       UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX: "true",
     }), unsupportedV3);
 });
+
+import { resolveObservationWriterGitSha } from "./run_job.ts";
+
+Deno.test("Integrity writer uses pinned SHA without GITHUB_SHA", () => {
+  const values: Record<string, string> = {
+    UK_AQ_INTEGRITY_INVOCATION: "true",
+    UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA: "a".repeat(40),
+  };
+  assertEquals(resolveObservationWriterGitSha((name) => values[name]), "a".repeat(40));
+});
+
+for (const invalid of [undefined, "", "A".repeat(40), "a".repeat(39), "z".repeat(40)]) {
+  Deno.test(`Integrity writer rejects invalid pinned SHA ${JSON.stringify(invalid)}`, () => {
+    const values: Record<string, string | undefined> = {
+      UK_AQ_INTEGRITY_INVOCATION: "true",
+      UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA: invalid,
+      GITHUB_SHA: "b".repeat(40),
+    };
+    assertThrows(() => resolveObservationWriterGitSha((name) => values[name]), /full lower-case Git SHA/);
+  });
+}
+
+Deno.test("non-Integrity writer preserves GITHUB_SHA compatibility", () => {
+  const values: Record<string, string> = {
+    UK_AQ_INTEGRITY_INVOCATION: "false",
+    GITHUB_SHA: "EXISTING-GITHUB-VALUE",
+  };
+  assertEquals(resolveObservationWriterGitSha((name) => values[name]), "EXISTING-GITHUB-VALUE");
+});

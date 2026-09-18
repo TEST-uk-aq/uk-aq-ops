@@ -5864,7 +5864,6 @@ def run_narrow_backfill(
             "UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT",
             "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
             "UK_AQ_INTEGRITY_INVOCATION",
-            INTEGRITY_TARGET_WRITER_GIT_SHA_ENV,
         )
         if (value := os.environ.get(key)) is not None
     }
@@ -5879,7 +5878,6 @@ def run_narrow_backfill(
         "UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE",
         "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
         "UK_AQ_INTEGRITY_INVOCATION",
-        INTEGRITY_TARGET_WRITER_GIT_SHA_ENV,
     )
     for key in internal_scope_keys:
         sub_env.pop(key, None)
@@ -14023,71 +14021,6 @@ def _resolve_repo_root_with_diagnostics(env: Mapping[str, str] | None = None) ->
 def _repo_root_for_integrity_script(env: Mapping[str, str] | None = None) -> Path:
     path, _ = _resolve_repo_root_with_diagnostics(env)
     return path
-
-
-INTEGRITY_TARGET_WRITER_GIT_SHA_ENV = (
-    "UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA"
-)
-_FULL_LOWER_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-
-
-def resolve_and_pin_integrity_target_writer_git_sha(
-    env: dict[str, str],
-) -> str:
-    """Resolve the executing ops checkout once and pin it for every child."""
-    repo_root = _repo_root_for_integrity_script(env)
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(
-            f"cannot resolve Integrity target writer Git SHA from {repo_root}: {exc}"
-        ) from exc
-    resolved = completed.stdout.strip().lower()
-    if completed.returncode != 0 or not _FULL_LOWER_GIT_SHA_RE.fullmatch(resolved):
-        detail = (completed.stderr or completed.stdout).strip()
-        raise RuntimeError(
-            "cannot establish Integrity target writer Git SHA from the ops "
-            f"repository {repo_root}: {detail or 'invalid git rev-parse output'}"
-        )
-    try:
-        worktree = subprocess.run(
-            [
-                "git", "-C", str(repo_root), "status", "--porcelain",
-                "--untracked-files=normal",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(
-            "fixed-v3 Integrity writer provenance requires a clean ops "
-            f"repository worktree: cannot inspect {repo_root}: {exc}"
-        ) from exc
-    if worktree.returncode != 0 or worktree.stdout:
-        detail = (worktree.stderr or worktree.stdout).strip()
-        raise RuntimeError(
-            "fixed-v3 Integrity writer provenance requires a clean ops "
-            f"repository worktree: {repo_root}: {detail or 'git status failed'}"
-        )
-    inherited = str(os.environ.get(INTEGRITY_TARGET_WRITER_GIT_SHA_ENV, "")).strip()
-    if inherited and (
-        not _FULL_LOWER_GIT_SHA_RE.fullmatch(inherited) or inherited != resolved
-    ):
-        raise RuntimeError(
-            f"{INTEGRITY_TARGET_WRITER_GIT_SHA_ENV} must exactly match the "
-            "full lower-case Git SHA of the executing ops repository"
-        )
-    os.environ[INTEGRITY_TARGET_WRITER_GIT_SHA_ENV] = resolved
-    env[INTEGRITY_TARGET_WRITER_GIT_SHA_ENV] = resolved
-    return resolved
 
 
 def _v2_observation_connector_manifest_key(
@@ -26973,7 +26906,6 @@ def main(argv: list[str]) -> int:
     sos_historical_route = select_sos_historical_replacement_route(args)
     dedicated_sos_historical_replacement = False
     env = load_env_or_die()
-    resolve_and_pin_integrity_target_writer_git_sha(env)
     protected_connector_ids = (
         resolve_protected_connector_ids(os.environ)
         if sos_historical_route.get("arguments_qualify") else None
