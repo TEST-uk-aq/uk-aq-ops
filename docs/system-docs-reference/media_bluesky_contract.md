@@ -1,6 +1,6 @@
 # UK AQ Media Bluesky publication contract
 
-**Status:** Current TEST implementation authority, agreed 15 September 2026 and amended 17 September 2026  
+**Status:** Current TEST implementation authority, agreed 15 September 2026 and amended 18 September 2026  
 **Implementation repository:** private `TEST-uk-aq/uk-aq-media`  
 **Runtime owner:** UK AQ Media Cloudflare account  
 **Bluesky account:** `@ukaq.co.uk`
@@ -152,24 +152,26 @@ Failure to obtain optional current card text metadata MUST NOT turn an otherwise
 
 The post MUST reuse already-publishable Media metadata. It MUST NOT invoke AI to create a separate social summary.
 
-Title priority is:
+The UK AQ-generated Bluesky post text MUST use the stored original publisher headline:
 
 ```text
-published/accepted display_title
-    -> original publisher title
+media_articles.title
 ```
 
-This title priority applies to the UK AQ-generated post text only. It does not control `app.bsky.embed.external.external.title`, which follows the publisher-metadata priority in section 5.1.
+`display_title` MUST NOT be used for the Bluesky post body, even when a human or accepted AI display title is currently public on UK AQ. A Pending AI title suggestion MUST likewise never be used for the Bluesky post body.
 
-A Pending internal AI title suggestion MUST NOT be used simply because it exists.
+This deliberate separation lets UK AQ continue editing a compact website display title without changing or creating ambiguity around an already-published automated social post. The external-card title remains governed separately by the publisher-metadata priority in section 5.1.
 
-Every normal post text MUST start with the chosen title. The title is followed by exactly one blank line and then the configured global default-message template:
+Every normal post text MUST start with the original publisher headline. The configured global default-message template follows on the **very next line**, with exactly one newline character between the rendered headline and the first line of the default message. There MUST NOT be an empty line between them:
 
 ```text
-{display title, otherwise original title}
-
+{original publisher title}
 {default_message}
 ```
+
+Therefore, when the default message starts with `From {publisher} {publisher_mention}`, that `From` line is always line 2 of the post.
+
+Existing Bluesky posts MUST NOT be edited, deleted or reposted solely to adopt the original-headline or single-newline layout rule. The change applies to posts created after the updated publisher code is deployed.
 
 The title block is fixed by the publisher and cannot be moved into, omitted from or reordered by the configurable default message.
 
@@ -227,9 +229,9 @@ The authenticated settings API MUST enforce this limit using Unicode grapheme se
 
 The complete expanded post MUST also satisfy the current Bluesky/AT Protocol post-text limits at publication time. At the time this contract was agreed, `app.bsky.feed.post` permits 300 graphemes and 3,000 bytes. Provider limits MUST be re-verified during implementation and deployment.
 
-The publisher MUST calculate the real expanded message for the actual article, including publisher and optional mention, then reserve the remaining grapheme budget for the title plus the required blank-line separator.
+The publisher MUST calculate the real expanded message for the actual article, including publisher and optional mention, then reserve the remaining grapheme budget for the original publisher headline plus the required single-newline separator.
 
-If the chosen display title or original-title fallback is too long to fit, shorten only the rendered title presentation deterministically, with an ellipsis or equivalent fixed truncation marker. Do not alter the title stored in Media and do not silently truncate the operator's configured default message.
+If the stored original publisher headline is too long to fit, shorten only the rendered social-post headline deterministically, with an ellipsis or equivalent fixed truncation marker. Do not alter the title stored in Media and do not silently truncate the operator's configured default message.
 
 If the expanded default message itself leaves no valid room for a title under the current provider limit, the publication MUST fail safely with a bounded text-length error rather than sending malformed or unexpectedly rewritten copy.
 
@@ -430,16 +432,17 @@ The default-message editor MUST show a live dynamic counter using grapheme seman
 <fixed graphemes> / 120
 ```
 
-The modal MUST also show a clearly labelled **Example preview** built from fixed dummy/example values rather than live article data. The example should demonstrate the complete structure:
+The modal MUST also show a clearly labelled **Example preview** built from fixed dummy/example article values rather than live article data, while rendering the currently edited default-message template. The dummy headline MUST represent an original publisher headline, not a UK AQ display title. The example must mirror the real post layout, including the single newline between headline and default message:
 
 ```text
-Example display title for an air-quality article
-
+Example original publisher headline for an air-quality article
 From Example Publisher @example.bsky.social
 
 Live and historical UK air quality data:
 https://ukaq.co.uk/
 ```
+
+If the currently edited default-message template differs from the initial example above, the preview MUST show that current template with the fixed dummy publisher values. It MUST NOT insert an extra blank line between the example headline and the first rendered default-message line.
 
 The example preview MUST show a second dynamic full-post count against the current Bluesky grapheme limit, currently:
 
