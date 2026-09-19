@@ -195,6 +195,9 @@ COMMON_EXCLUDES=(
   --exclude='README_CROSS_REPO.md'
   --exclude='requirements-dev.txt'
   --exclude='uk_aq_copy_core_to_live*'
+  
+  # Local web serber
+  --exclude='/serve.py'
 )
 
 # ── Sync ─────────────────────────────────────────────────────────────────────
