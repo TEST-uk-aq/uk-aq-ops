@@ -22,20 +22,6 @@ import {
   readCanonicalObservationRows,
 } from "./uk_aq_apply_integrity_proposal.mjs";
 import {
-  buildHistoryV2DayManifestKey,
-  validateCanonicalHistoryV2Manifest,
-} from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
-import {
-  buildR2HistoryV2ObservationsMonthManifest,
-  buildR2HistoryV2ObservationsMonthManifestKey,
-  buildR2HistoryV2ObservationsRootManifest,
-  buildR2HistoryV2ObservationsRootManifestKey,
-  buildR2HistoryV2ObservationsYearManifest,
-  buildR2HistoryV2ObservationsYearManifestKey,
-  serializeR2HistoryV2ObservationsAggregateManifest,
-  validateR2HistoryV2ObservationsAggregateManifest,
-} from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
-import {
   createCombinedLocalStore,
   runV2ObservationsRepair as runGenerationNeutralObservationMetadataRepair,
 } from "./uk_aq_execute_v2_observations_repair_impl.mjs";
@@ -149,287 +135,6 @@ function sameRootIdentity(left, right) {
     && String(left?.sha256 || "") === String(right?.sha256 || "");
 }
 
-function proposalBody(proposal, key) {
-  const value = proposal?.proposed_body ?? proposal?.body;
-  if (typeof value !== "string" && !Buffer.isBuffer(value)) {
-    throw new Error(`Fixed-v3 proposed canonical body is unavailable: ${key}`);
-  }
-  return Buffer.isBuffer(value) ? Buffer.from(value) : Buffer.from(value, "utf8");
-}
-
-function parseJsonBody(body, key) {
-  try {
-    return JSON.parse(Buffer.from(body).toString("utf8"));
-  } catch {
-    throw new Error(`Fixed-v3 pinned canonical JSON is invalid: ${key}`);
-  }
-}
-
-function readPinnedAggregate({ store, key, level }) {
-  const object = store.getObjectFromSourceIfExists(key, "dropbox");
-  if (!object) {
-    throw new Error(`Fixed-v3 pinned observation ${level} aggregate is unavailable: ${key}`);
-  }
-  const parsed = parseJsonBody(object.body, key);
-  const canonical = validateR2HistoryV2ObservationsAggregateManifest(parsed, {
-    basePrefix: GENERATION.observations_prefix,
-  });
-  const canonicalBody = serializeR2HistoryV2ObservationsAggregateManifest(canonical, {
-    basePrefix: GENERATION.observations_prefix,
-  });
-  if (!Buffer.from(object.body).equals(canonicalBody)) {
-    throw new Error(`Fixed-v3 pinned observation ${level} aggregate bytes are noncanonical: ${key}`);
-  }
-  return { object, payload: canonical, body: canonicalBody };
-}
-
-function validatePinnedDayManifest({ store, reference }) {
-  const key = String(reference?.manifest_key || "");
-  const object = store.getObjectFromSourceIfExists(key, "dropbox");
-  if (!object) {
-    throw new Error(`Fixed-v3 pinned observation day manifest is unavailable: ${key}`);
-  }
-  const payload = parseJsonBody(object.body, key);
-  validateCanonicalHistoryV2Manifest(payload, {
-    manifest_kind: "day",
-    domain: "observations",
-    day_utc: reference.day_utc,
-    manifest_key: key,
-  });
-  if (payload.manifest_hash !== reference.manifest_hash) {
-    throw new Error(`Fixed-v3 pinned observation day identity disagrees: ${key}`);
-  }
-  return payload;
-}
-
-function validateProposedDayManifest({ proposal, dayUtc }) {
-  const key = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, dayUtc);
-  if (!proposal || String(proposal.key) !== key) {
-    throw new Error(`Fixed-v3 selected day proposal is unavailable: ${key}`);
-  }
-  const body = proposalBody(proposal, key);
-  const payload = parseJsonBody(body, key);
-  validateCanonicalHistoryV2Manifest(payload, {
-    manifest_kind: "day",
-    domain: "observations",
-    day_utc: dayUtc,
-    manifest_key: key,
-  });
-  if (sha256Hex(body) !== String(proposal.new_sha256)
-      || body.byteLength !== Number(proposal.bytes)) {
-    throw new Error(`Fixed-v3 selected day proposal identity disagrees: ${key}`);
-  }
-  return payload;
-}
-
-function aggregateProposal({ key, kind, stage, body, existing, dependencies, proposalsByKey }) {
-  const dependencyIdentities = Object.fromEntries(dependencies.map((dependencyKey) => {
-    const dependency = proposalsByKey.get(dependencyKey);
-    if (!dependency?.changed) {
-      throw new Error(`Fixed-v3 aggregate dependency is not staged: ${dependencyKey}`);
-    }
-    return [dependencyKey, {
-      sha256: String(dependency.new_sha256),
-      bytes: Number(dependency.bytes),
-      source: "planned_overlay",
-    }];
-  }));
-  return {
-    key,
-    kind,
-    publication_stage: stage,
-    day_utc: null,
-    bytes: body.byteLength,
-    old_sha256: sha256Hex(existing.body),
-    new_sha256: sha256Hex(body),
-    changed: true,
-    included_in_write_set: true,
-    status: "planned",
-    dependencies,
-    dependency_identities: dependencyIdentities,
-    baseline_source: "dropbox",
-    provenance: "pinned_dropbox_aggregate_hierarchy_plus_selected_day_overlay",
-    proposed_body: body.toString("utf8"),
-  };
-}
-
-export function reconstructCanonicalObservationAggregateHierarchy({
-  proposals,
-  proposalsByKey,
-  selectedDays,
-  store,
-}) {
-  const basePrefix = GENERATION.observations_prefix;
-  const rootKey = buildR2HistoryV2ObservationsRootManifestKey(basePrefix);
-  const pinnedRoot = readPinnedAggregate({ store, key: rootKey, level: "root" });
-  const selectedByMonth = new Map();
-  for (const dayUtc of [...new Set(selectedDays)].sort()) {
-    const monthIdentity = dayUtc.slice(0, 7);
-    if (!selectedByMonth.has(monthIdentity)) selectedByMonth.set(monthIdentity, []);
-    selectedByMonth.get(monthIdentity).push(dayUtc);
-  }
-  const selectedYears = new Set([...selectedByMonth.keys()].map((value) => value.slice(0, 4)));
-  const rebuiltMonths = new Map();
-  const pinnedYears = new Map();
-  const stagedAggregateKeys = new Set();
-
-  for (const rootChild of pinnedRoot.payload.children) {
-    const year = String(rootChild.year);
-    const yearKey = buildR2HistoryV2ObservationsYearManifestKey(basePrefix, year);
-    if (rootChild.manifest_key !== yearKey) {
-      throw new Error(`Fixed-v3 pinned observation root child identity disagrees: ${yearKey}`);
-    }
-    const pinnedYear = readPinnedAggregate({ store, key: yearKey, level: "year" });
-    if (String(pinnedYear.payload.year) !== year
-        || pinnedYear.payload.content_hash !== rootChild.content_hash) {
-      throw new Error(`Fixed-v3 pinned observation year identity disagrees: ${yearKey}`);
-    }
-    if (!selectedYears.has(year)) continue;
-    pinnedYears.set(yearKey, pinnedYear);
-    for (const monthChild of pinnedYear.payload.children) {
-      const month = String(monthChild.month);
-      const monthKey = buildR2HistoryV2ObservationsMonthManifestKey(basePrefix, year, month);
-      if (monthChild.manifest_key !== monthKey) {
-        throw new Error(`Fixed-v3 pinned observation year child identity disagrees: ${monthKey}`);
-      }
-      const pinnedMonth = readPinnedAggregate({ store, key: monthKey, level: "month" });
-      if (String(pinnedMonth.payload.year) !== year || pinnedMonth.payload.month !== month
-          || pinnedMonth.payload.content_hash !== monthChild.content_hash) {
-        throw new Error(`Fixed-v3 pinned observation month identity disagrees: ${monthKey}`);
-      }
-      const monthIdentity = `${year}-${month}`;
-      const selectedMonthDays = selectedByMonth.get(monthIdentity) || [];
-      if (!selectedMonthDays.length) continue;
-      for (const dayChild of pinnedMonth.payload.children) {
-        validatePinnedDayManifest({ store, reference: dayChild });
-      }
-      const existingDays = new Map(
-        pinnedMonth.payload.children.map((child) => [child.day_utc, child]),
-      );
-      for (const dayUtc of selectedMonthDays) {
-        if (!existingDays.has(dayUtc)) {
-          throw new Error(`Fixed-v3 pinned observation month omits selected day: ${dayUtc}`);
-        }
-        const dayKey = buildHistoryV2DayManifestKey(basePrefix, dayUtc);
-        const payload = validateProposedDayManifest({
-          proposal: proposalsByKey.get(dayKey),
-          dayUtc,
-        });
-        existingDays.set(dayUtc, {
-          day_utc: dayUtc,
-          manifest_key: dayKey,
-          manifest_hash: payload.manifest_hash,
-        });
-      }
-      const payload = buildR2HistoryV2ObservationsMonthManifest({
-        basePrefix,
-        year,
-        month,
-        dayManifests: [...existingDays.values()],
-      });
-      const body = serializeR2HistoryV2ObservationsAggregateManifest(payload, { basePrefix });
-      rebuiltMonths.set(monthKey, payload);
-      if (!body.equals(pinnedMonth.body)) {
-        const dependencies = selectedMonthDays
-          .map((dayUtc) => buildHistoryV2DayManifestKey(basePrefix, dayUtc))
-          .filter((key) => proposalsByKey.get(key)?.changed === true)
-          .sort();
-        const proposal = aggregateProposal({
-          key: monthKey,
-          kind: "observation_month_manifest",
-          stage: "observation_month_manifest",
-          body,
-          existing: pinnedMonth.object,
-          dependencies,
-          proposalsByKey,
-        });
-        proposals.push(proposal);
-        proposalsByKey.set(monthKey, proposal);
-        stagedAggregateKeys.add(monthKey);
-      }
-    }
-  }
-
-  for (const monthIdentity of selectedByMonth.keys()) {
-    const [year, month] = monthIdentity.split("-");
-    const key = buildR2HistoryV2ObservationsMonthManifestKey(basePrefix, year, month);
-    if (!rebuiltMonths.has(key)) {
-      throw new Error(`Fixed-v3 pinned observation hierarchy omits selected month: ${monthIdentity}`);
-    }
-  }
-
-  const rebuiltYears = new Map();
-  for (const [yearKey, pinnedYear] of pinnedYears) {
-    const year = String(pinnedYear.payload.year);
-    const monthManifests = pinnedYear.payload.children.map((child) => {
-      const rebuilt = rebuiltMonths.get(child.manifest_key);
-      return rebuilt || {
-        year,
-        month: child.month,
-        manifest_key: child.manifest_key,
-        content_hash: child.content_hash,
-      };
-    });
-    const payload = buildR2HistoryV2ObservationsYearManifest({
-      basePrefix,
-      year,
-      monthManifests,
-    });
-    const body = serializeR2HistoryV2ObservationsAggregateManifest(payload, { basePrefix });
-    rebuiltYears.set(yearKey, payload);
-    if (!body.equals(pinnedYear.body)) {
-      const dependencies = pinnedYear.payload.children
-        .map((child) => child.manifest_key)
-        .filter((key) => stagedAggregateKeys.has(key))
-        .sort();
-      const proposal = aggregateProposal({
-        key: yearKey,
-        kind: "observation_year_manifest",
-        stage: "observation_year_manifest",
-        body,
-        existing: pinnedYear.object,
-        dependencies,
-        proposalsByKey,
-      });
-      proposals.push(proposal);
-      proposalsByKey.set(yearKey, proposal);
-      stagedAggregateKeys.add(yearKey);
-    }
-  }
-  const rootPayload = buildR2HistoryV2ObservationsRootManifest({
-    basePrefix,
-    yearManifests: pinnedRoot.payload.children.map((child) =>
-      rebuiltYears.get(child.manifest_key) || child),
-  });
-  const rootBody = serializeR2HistoryV2ObservationsAggregateManifest(rootPayload, { basePrefix });
-  if (!rootBody.equals(pinnedRoot.body)) {
-    const dependencies = pinnedRoot.payload.children
-      .map((child) => child.manifest_key)
-      .filter((key) => stagedAggregateKeys.has(key))
-      .sort();
-    const proposal = aggregateProposal({
-      key: rootKey,
-      kind: "observation_root_manifest",
-      stage: "observation_root_manifest",
-      body: rootBody,
-      existing: pinnedRoot.object,
-      dependencies,
-      proposalsByKey,
-    });
-    proposals.push(proposal);
-    proposalsByKey.set(rootKey, proposal);
-    stagedAggregateKeys.add(rootKey);
-  }
-  return {
-    root: {
-      key: rootKey,
-      byte_size: rootBody.byteLength,
-      sha256: sha256Hex(rootBody),
-    },
-    staged_keys: [...stagedAggregateKeys].sort(),
-  };
-}
-
 export function reconcileReconstructedExactV3Hierarchies({
   existingLatest,
   hierarchies,
@@ -496,8 +201,7 @@ export function resolveExactV3LocalReferences({
     ]) {
       if (changedKeys.has(reference.key)) continue;
       const plannedCanonical = proposalsByKey.get(reference.key);
-      if (plannedCanonical?.changed === true
-          || (plannedCanonical && plannedCanonicalKeys.has(reference.key))) {
+      if (plannedCanonical?.changed === true || plannedCanonicalKeys.has(reference.key)) {
         resolved.set(reference.key, {
           key: reference.key,
           byte_size: Number(plannedCanonical.bytes),
@@ -552,9 +256,8 @@ export function assertFixedV3Proposal(output) {
 }
 
 async function addExactV3Indexes({ output, runState, env, repairPlan, targetWriterGitSha }) {
-  const selectedDays = [...new Set((repairPlan.repair_plan || [])
-    .map((action) => String(action?.day_utc || "")).filter(Boolean))].sort();
-  const selectedDayPrefixes = selectedDays
+  const selectedDayPrefixes = [...new Set((repairPlan.repair_plan || [])
+    .map((action) => String(action?.day_utc || "")).filter(Boolean))]
     .map((day) => `${GENERATION.observations_prefix}/day_utc=${day}/`);
   const proposals = (output.planning.proposals || [])
     .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`))
@@ -569,12 +272,6 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
     runStateJson: env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON,
     prefixes,
     exactKeys: [GENERATION.observations_timeseries_latest_key],
-  });
-  const canonicalAggregateHierarchy = reconstructCanonicalObservationAggregateHierarchy({
-    proposals,
-    proposalsByKey,
-    selectedDays,
-    store,
   });
   const combinedObject = (key) => proposalsByKey.has(key)
     ? proposalObject(proposalsByKey.get(key))
@@ -653,12 +350,6 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
       byte_size: Number(proposal.bytes),
       sha256: String(proposal.new_sha256),
     }));
-  if (!canonicalFinalizationPrerequisites.some(
-    ({ key }) => key === canonicalAggregateHierarchy.root.key,
-  )) {
-    canonicalFinalizationPrerequisites.push(canonicalAggregateHierarchy.root);
-  }
-  canonicalFinalizationPrerequisites.sort((left, right) => left.key.localeCompare(right.key));
   const canonicalFinalizationPrerequisiteKeys = new Set(
     canonicalFinalizationPrerequisites.map(({ key }) => key),
   );

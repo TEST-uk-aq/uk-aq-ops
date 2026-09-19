@@ -8,6 +8,7 @@ import {
   assertCurrentRunManifestWriterGitSha,
   assertFixedV3Proposal,
   reconcileReconstructedExactV3Hierarchies,
+  reconstructCanonicalObservationAggregateHierarchy,
   resolveExactV3LocalReferences,
   resolveIntegrityTargetWriterGitSha,
 } from "../uk_aq_plan_sos_light_v3_observation_metadata.mjs";
@@ -30,6 +31,15 @@ import {
   buildObservationHistoryV3SteadyStatePartition,
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
 } from "../../../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
+import {
+  buildR2HistoryV2ObservationsMonthManifest,
+  buildR2HistoryV2ObservationsMonthManifestKey,
+  buildR2HistoryV2ObservationsRootManifest,
+  buildR2HistoryV2ObservationsRootManifestKey,
+  buildR2HistoryV2ObservationsYearManifest,
+  buildR2HistoryV2ObservationsYearManifestKey,
+  serializeR2HistoryV2ObservationsAggregateManifest,
+} from "../../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 
 function proposalWithDependency(dependency) {
   return {
@@ -187,6 +197,154 @@ test("changed exact hierarchy resolves unchanged canonical inputs only from pinn
   });
   assert.deepEqual(requested, [[parquetKey, "dropbox"], [manifestKey, "dropbox"]]);
   assert.deepEqual([...resolved.keys()], [parquetKey, manifestKey]);
+});
+
+function dayManifest(dayUtc, marker) {
+  const manifestKey = `history/v3/observations/day_utc=${dayUtc}/manifest.json`;
+  const payload = {
+    history_version: "v2",
+    manifest_kind: "day",
+    domain: "observations",
+    day_utc: dayUtc,
+    manifest_key: manifestKey,
+    source_row_count: 0,
+    row_count: 0,
+    file_count: 0,
+    total_bytes: 0,
+    files: [],
+    marker,
+  };
+  return { ...payload, manifest_hash: sha256Hex(JSON.stringify(payload)) };
+}
+
+function pinnedHierarchyFixture() {
+  const prefix = "history/v3/observations";
+  const bodies = new Map();
+  const put = (key, body) => bodies.set(key, Buffer.from(body));
+  const days = [
+    dayManifest("2026-06-01", "old-selected"),
+    dayManifest("2026-06-02", "preserved-sibling"),
+    dayManifest("2026-07-01", "unaffected-month"),
+    dayManifest("2025-12-31", "unaffected-year"),
+  ];
+  for (const day of days) put(day.manifest_key, JSON.stringify(day));
+  const months = [
+    buildR2HistoryV2ObservationsMonthManifest({
+      basePrefix: prefix, year: "2026", month: "06", dayManifests: days.slice(0, 2),
+    }),
+    buildR2HistoryV2ObservationsMonthManifest({
+      basePrefix: prefix, year: "2026", month: "07", dayManifests: [days[2]],
+    }),
+    buildR2HistoryV2ObservationsMonthManifest({
+      basePrefix: prefix, year: "2025", month: "12", dayManifests: [days[3]],
+    }),
+  ];
+  for (const month of months) {
+    const key = buildR2HistoryV2ObservationsMonthManifestKey(
+      prefix, month.year, month.month,
+    );
+    put(key, serializeR2HistoryV2ObservationsAggregateManifest(month, { basePrefix: prefix }));
+  }
+  const years = [
+    buildR2HistoryV2ObservationsYearManifest({
+      basePrefix: prefix, year: "2025", monthManifests: [months[2]],
+    }),
+    buildR2HistoryV2ObservationsYearManifest({
+      basePrefix: prefix, year: "2026", monthManifests: months.slice(0, 2),
+    }),
+  ];
+  for (const year of years) {
+    const key = buildR2HistoryV2ObservationsYearManifestKey(prefix, year.year);
+    put(key, serializeR2HistoryV2ObservationsAggregateManifest(year, { basePrefix: prefix }));
+  }
+  const root = buildR2HistoryV2ObservationsRootManifest({
+    basePrefix: prefix, yearManifests: years,
+  });
+  put(
+    buildR2HistoryV2ObservationsRootManifestKey(prefix),
+    serializeR2HistoryV2ObservationsAggregateManifest(root, { basePrefix: prefix }),
+  );
+  return { bodies, days };
+}
+
+test("fixed-v3 aggregate reconstruction follows pinned memberships and overlays selected days", () => {
+  const { bodies } = pinnedHierarchyFixture();
+  const selectedDay = dayManifest("2026-06-01", "repaired-selected");
+  const selectedBody = JSON.stringify(selectedDay);
+  const selectedKey = selectedDay.manifest_key;
+  const selectedProposal = {
+    key: selectedKey,
+    proposed_body: selectedBody,
+    bytes: Buffer.byteLength(selectedBody),
+    new_sha256: sha256Hex(selectedBody),
+    changed: true,
+  };
+  const proposals = [selectedProposal];
+  const proposalsByKey = new Map([[selectedKey, selectedProposal]]);
+  const reads = [];
+  const store = {
+    getObjectFromSourceIfExists(key, source) {
+      reads.push([key, source]);
+      const body = bodies.get(key);
+      return body ? {
+        key, body, bytes: body.byteLength, content_sha256: sha256Hex(body), source,
+      } : null;
+    },
+  };
+  const rebuilt = reconstructCanonicalObservationAggregateHierarchy({
+    proposals,
+    proposalsByKey,
+    selectedDays: ["2026-06-01"],
+    store,
+  });
+  assert.deepEqual(rebuilt.staged_keys, [
+    "history/v3/observations/_manifests/manifest.json",
+    "history/v3/observations/_manifests/year=2026/manifest.json",
+    "history/v3/observations/_manifests/year=2026/month=06/manifest.json",
+  ]);
+  assert.deepEqual(
+    proposalsByKey.get("history/v3/observations/_manifests/year=2026/month=06/manifest.json")
+      .dependencies,
+    [selectedKey],
+  );
+  assert.deepEqual(
+    proposalsByKey.get("history/v3/observations/_manifests/year=2026/manifest.json")
+      .dependencies,
+    ["history/v3/observations/_manifests/year=2026/month=06/manifest.json"],
+  );
+  assert.deepEqual(
+    proposalsByKey.get("history/v3/observations/_manifests/manifest.json").dependencies,
+    ["history/v3/observations/_manifests/year=2026/manifest.json"],
+  );
+  assert(reads.some(([key]) => key.endsWith("year=2025/manifest.json")));
+  assert(reads.some(([key]) => key.endsWith("year=2026/month=07/manifest.json")));
+  assert(!reads.some(([key]) => key.includes("day_utc=2026-07-01")));
+  assert(!reads.some(([key]) => key.includes("day_utc=2025-12-31")));
+});
+
+test("fixed-v3 aggregate reconstruction fails when a pinned sibling body is missing", () => {
+  const { bodies } = pinnedHierarchyFixture();
+  bodies.delete("history/v3/observations/day_utc=2026-06-02/manifest.json");
+  const selectedDay = dayManifest("2026-06-01", "repaired-selected");
+  const selectedBody = JSON.stringify(selectedDay);
+  const selectedProposal = {
+    key: selectedDay.manifest_key,
+    proposed_body: selectedBody,
+    bytes: Buffer.byteLength(selectedBody),
+    new_sha256: sha256Hex(selectedBody),
+    changed: true,
+  };
+  assert.throws(() => reconstructCanonicalObservationAggregateHierarchy({
+    proposals: [selectedProposal],
+    proposalsByKey: new Map([[selectedDay.manifest_key, selectedProposal]]),
+    selectedDays: ["2026-06-01"],
+    store: {
+      getObjectFromSourceIfExists(key, source) {
+        const body = bodies.get(key);
+        return body ? { key, body, source } : null;
+      },
+    },
+  }), /pinned observation day manifest is unavailable/);
 });
 
 function exactHierarchy(dayUtc, timeseriesId) {

@@ -1009,7 +1009,7 @@ const CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN =
 const CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN =
   /^history\/v2\/aqilevels\/hourly\/(data|debug)\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN =
-  /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
+  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
 
 function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
   const parsedDay = new Date(`${dayUtc}T00:00:00.000Z`);
