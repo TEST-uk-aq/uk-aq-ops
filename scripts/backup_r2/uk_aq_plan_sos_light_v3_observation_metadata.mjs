@@ -240,14 +240,14 @@ function aggregateProposal({ key, kind, stage, body, existing, dependencies, pro
     publication_stage: stage,
     day_utc: null,
     bytes: body.byteLength,
-    old_sha256: sha256Hex(existing.body),
+    old_sha256: existing ? sha256Hex(existing.body) : null,
     new_sha256: sha256Hex(body),
     changed: true,
     included_in_write_set: true,
     status: "planned",
     dependencies,
     dependency_identities: dependencyIdentities,
-    baseline_source: "dropbox",
+    baseline_source: existing ? "dropbox" : null,
     provenance: "pinned_dropbox_aggregate_hierarchy_plus_selected_day_overlay",
     proposed_body: body.toString("utf8"),
   };
@@ -271,6 +271,7 @@ export function reconstructCanonicalObservationAggregateHierarchy({
   const selectedYears = new Set([...selectedByMonth.keys()].map((value) => value.slice(0, 4)));
   const rebuiltMonths = new Map();
   const pinnedYears = new Map();
+  const pinnedMonths = new Map();
   const stagedAggregateKeys = new Set();
 
   for (const rootChild of pinnedRoot.payload.children) {
@@ -284,8 +285,8 @@ export function reconstructCanonicalObservationAggregateHierarchy({
         || pinnedYear.payload.content_hash !== rootChild.content_hash) {
       throw new Error(`Fixed-v3 pinned observation year identity disagrees: ${yearKey}`);
     }
+    pinnedYears.set(year, pinnedYear);
     if (!selectedYears.has(year)) continue;
-    pinnedYears.set(yearKey, pinnedYear);
     for (const monthChild of pinnedYear.payload.children) {
       const month = String(monthChild.month);
       const monthKey = buildR2HistoryV2ObservationsMonthManifestKey(basePrefix, year, month);
@@ -297,89 +298,92 @@ export function reconstructCanonicalObservationAggregateHierarchy({
           || pinnedMonth.payload.content_hash !== monthChild.content_hash) {
         throw new Error(`Fixed-v3 pinned observation month identity disagrees: ${monthKey}`);
       }
-      const monthIdentity = `${year}-${month}`;
-      const selectedMonthDays = selectedByMonth.get(monthIdentity) || [];
-      if (!selectedMonthDays.length) continue;
-      for (const dayChild of pinnedMonth.payload.children) {
-        validatePinnedDayManifest({ store, reference: dayChild });
-      }
-      const existingDays = new Map(
-        pinnedMonth.payload.children.map((child) => [child.day_utc, child]),
-      );
-      for (const dayUtc of selectedMonthDays) {
-        if (!existingDays.has(dayUtc)) {
-          throw new Error(`Fixed-v3 pinned observation month omits selected day: ${dayUtc}`);
-        }
-        const dayKey = buildHistoryV2DayManifestKey(basePrefix, dayUtc);
-        const payload = validateProposedDayManifest({
-          proposal: proposalsByKey.get(dayKey),
-          dayUtc,
-        });
-        existingDays.set(dayUtc, {
-          day_utc: dayUtc,
-          manifest_key: dayKey,
-          manifest_hash: payload.manifest_hash,
-        });
-      }
-      const payload = buildR2HistoryV2ObservationsMonthManifest({
-        basePrefix,
-        year,
-        month,
-        dayManifests: [...existingDays.values()],
-      });
-      const body = serializeR2HistoryV2ObservationsAggregateManifest(payload, { basePrefix });
-      rebuiltMonths.set(monthKey, payload);
-      if (!body.equals(pinnedMonth.body)) {
-        const dependencies = selectedMonthDays
-          .map((dayUtc) => buildHistoryV2DayManifestKey(basePrefix, dayUtc))
-          .filter((key) => proposalsByKey.get(key)?.changed === true)
-          .sort();
-        const proposal = aggregateProposal({
-          key: monthKey,
-          kind: "observation_month_manifest",
-          stage: "observation_month_manifest",
-          body,
-          existing: pinnedMonth.object,
-          dependencies,
-          proposalsByKey,
-        });
-        proposals.push(proposal);
-        proposalsByKey.set(monthKey, proposal);
-        stagedAggregateKeys.add(monthKey);
-      }
+      pinnedMonths.set(`${year}-${month}`, pinnedMonth);
     }
   }
 
-  for (const monthIdentity of selectedByMonth.keys()) {
+  for (const [monthIdentity, selectedMonthDays] of selectedByMonth) {
     const [year, month] = monthIdentity.split("-");
-    const key = buildR2HistoryV2ObservationsMonthManifestKey(basePrefix, year, month);
-    if (!rebuiltMonths.has(key)) {
-      throw new Error(`Fixed-v3 pinned observation hierarchy omits selected month: ${monthIdentity}`);
+    const monthKey = buildR2HistoryV2ObservationsMonthManifestKey(basePrefix, year, month);
+    const pinnedMonth = pinnedMonths.get(monthIdentity) || null;
+    const existingDays = new Map();
+    if (pinnedMonth) {
+      for (const dayChild of pinnedMonth.payload.children) {
+        validatePinnedDayManifest({ store, reference: dayChild });
+        existingDays.set(dayChild.day_utc, dayChild);
+      }
+    }
+    for (const dayUtc of selectedMonthDays) {
+      const dayKey = buildHistoryV2DayManifestKey(basePrefix, dayUtc);
+      const payload = validateProposedDayManifest({
+        proposal: proposalsByKey.get(dayKey),
+        dayUtc,
+      });
+      existingDays.set(dayUtc, {
+        day_utc: dayUtc,
+        manifest_key: dayKey,
+        manifest_hash: payload.manifest_hash,
+      });
+    }
+    const payload = buildR2HistoryV2ObservationsMonthManifest({
+      basePrefix,
+      year,
+      month,
+      dayManifests: [...existingDays.values()],
+    });
+    const body = serializeR2HistoryV2ObservationsAggregateManifest(payload, { basePrefix });
+    rebuiltMonths.set(monthIdentity, payload);
+    if (!pinnedMonth || !body.equals(pinnedMonth.body)) {
+      const dependencies = selectedMonthDays
+        .map((dayUtc) => buildHistoryV2DayManifestKey(basePrefix, dayUtc))
+        .filter((key) => proposalsByKey.get(key)?.changed === true)
+        .sort();
+      const proposal = aggregateProposal({
+        key: monthKey,
+        kind: "observation_month_manifest",
+        stage: "observation_month_manifest",
+        body,
+        existing: pinnedMonth?.object || null,
+        dependencies,
+        proposalsByKey,
+      });
+      proposals.push(proposal);
+      proposalsByKey.set(monthKey, proposal);
+      stagedAggregateKeys.add(monthKey);
     }
   }
 
   const rebuiltYears = new Map();
-  for (const [yearKey, pinnedYear] of pinnedYears) {
-    const year = String(pinnedYear.payload.year);
-    const monthManifests = pinnedYear.payload.children.map((child) => {
-      const rebuilt = rebuiltMonths.get(child.manifest_key);
-      return rebuilt || {
+  for (const year of [...selectedYears].sort()) {
+    const yearKey = buildR2HistoryV2ObservationsYearManifestKey(basePrefix, year);
+    const pinnedYear = pinnedYears.get(year) || null;
+    const monthManifests = new Map();
+    for (const child of pinnedYear?.payload.children || []) {
+      monthManifests.set(String(child.month), {
         year,
         month: child.month,
         manifest_key: child.manifest_key,
         content_hash: child.content_hash,
-      };
-    });
+      });
+    }
+    for (const [monthIdentity, payload] of rebuiltMonths) {
+      if (monthIdentity.slice(0, 4) === year) {
+        monthManifests.set(payload.month, payload);
+      }
+    }
     const payload = buildR2HistoryV2ObservationsYearManifest({
       basePrefix,
       year,
-      monthManifests,
+      monthManifests: [...monthManifests.values()],
     });
     const body = serializeR2HistoryV2ObservationsAggregateManifest(payload, { basePrefix });
-    rebuiltYears.set(yearKey, payload);
-    if (!body.equals(pinnedYear.body)) {
-      const dependencies = pinnedYear.payload.children
-        .map((child) => child.manifest_key)
+    rebuiltYears.set(year, payload);
+    if (!pinnedYear || !body.equals(pinnedYear.body)) {
+      const dependencies = [...monthManifests.values()]
+        .map((child) => child.manifest_key
+          || buildR2HistoryV2ObservationsMonthManifestKey(
+            basePrefix, year, child.month,
+          ))
         .filter((key) => stagedAggregateKeys.has(key))
         .sort();
       const proposal = aggregateProposal({
@@ -387,7 +391,7 @@ export function reconstructCanonicalObservationAggregateHierarchy({
         kind: "observation_year_manifest",
         stage: "observation_year_manifest",
         body,
-        existing: pinnedYear.object,
+        existing: pinnedYear?.object || null,
         dependencies,
         proposalsByKey,
       });
@@ -396,15 +400,19 @@ export function reconstructCanonicalObservationAggregateHierarchy({
       stagedAggregateKeys.add(yearKey);
     }
   }
+  const rootYears = new Map(pinnedRoot.payload.children.map((child) => [
+    String(child.year), child,
+  ]));
+  for (const [year, payload] of rebuiltYears) rootYears.set(year, payload);
   const rootPayload = buildR2HistoryV2ObservationsRootManifest({
     basePrefix,
-    yearManifests: pinnedRoot.payload.children.map((child) =>
-      rebuiltYears.get(child.manifest_key) || child),
+    yearManifests: [...rootYears.values()],
   });
   const rootBody = serializeR2HistoryV2ObservationsAggregateManifest(rootPayload, { basePrefix });
   if (!rootBody.equals(pinnedRoot.body)) {
-    const dependencies = pinnedRoot.payload.children
-      .map((child) => child.manifest_key)
+    const dependencies = [...rootYears.values()]
+      .map((child) => child.manifest_key
+        || buildR2HistoryV2ObservationsYearManifestKey(basePrefix, child.year))
       .filter((key) => stagedAggregateKeys.has(key))
       .sort();
     const proposal = aggregateProposal({

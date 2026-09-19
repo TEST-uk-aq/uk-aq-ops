@@ -5,6 +5,8 @@ import {
   createVerifiedGetBodyCache,
   createApplyPersistence,
   createInitialApplyProgressState,
+  VERIFIED_GET_CACHE_MAX_BYTES,
+  VERIFIED_GET_CACHE_MAX_ENTRIES,
   verifyLiveObservationPartition,
 } from "../uk_aq_apply_integrity_proposal.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
@@ -229,6 +231,98 @@ export function partitionFrozenSosLightV3PublicationGraph({ proposal, days }) {
   };
 }
 
+function semanticPartitionIdentity(dayUtc, connectorId, pollutantCode) {
+  return `day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
+}
+
+export function validateSosLightV3SemanticCacheCapacity({
+  publicationPartitions,
+  proposal,
+  runState,
+  days,
+}) {
+  const byKey = new Map(proposal.objects.map((object) => [object.key, object]));
+  const selectedDays = new Set(days);
+  const manifestParts = new Map();
+  const selectedParquetKeys = new Set();
+  for (const identity of Object.keys(runState.source_evidence_partitions || {}).sort()) {
+    const match = identity.match(
+      /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/,
+    );
+    if (!match) {
+      throw new Error(`SOS-light-v3 source-evidence partition identity is invalid: ${identity}`);
+    }
+    const expectedIdentity = semanticPartitionIdentity(match[1], Number(match[2]), match[3]);
+    if (identity !== expectedIdentity) {
+      throw new Error(`SOS-light-v3 source-evidence partition identity is noncanonical: ${identity}`);
+    }
+    if (!selectedDays.has(match[1])) {
+      throw new Error(`SOS-light-v3 source-evidence partition is outside selected days: ${identity}`);
+    }
+    const manifestKey = `history/v3/observations/day_utc=${match[1]}`
+      + `/connector_id=${match[2]}/pollutant_code=${match[3]}/manifest.json`;
+    const manifestObject = byKey.get(manifestKey);
+    if (!manifestObject) {
+      throw new Error(`SOS-light-v3 selected semantic manifest is unavailable: ${manifestKey}`);
+    }
+    let manifest;
+    try {
+      manifest = JSON.parse(exactBody(manifestObject.body, manifestKey).toString("utf8"));
+    } catch {
+      throw new Error(`SOS-light-v3 selected semantic manifest is invalid JSON: ${manifestKey}`);
+    }
+    const partKeys = Array.isArray(manifest?.parquet_object_keys)
+      ? manifest.parquet_object_keys.map(normalizedKey)
+      : [];
+    for (const key of partKeys) {
+      const part = byKey.get(key);
+      if (!part || !key.endsWith(".parquet")) {
+        throw new Error(`SOS-light-v3 selected semantic Parquet is unavailable: ${key}`);
+      }
+      selectedParquetKeys.add(key);
+    }
+    manifestParts.set(manifestKey, partKeys);
+  }
+
+  for (const day of days) {
+    const retained = new Map();
+    let retainedBytes = 0;
+    for (const object of publicationPartitions.ordered_by_day.get(day)) {
+      if (selectedParquetKeys.has(object.key)) {
+        const bytes = exactBody(object.body, object.key).byteLength;
+        retained.set(object.key, bytes);
+        retainedBytes += bytes;
+        if (retained.size > VERIFIED_GET_CACHE_MAX_ENTRIES
+            || retainedBytes > VERIFIED_GET_CACHE_MAX_BYTES) {
+          throw new Error(
+            `SOS-light-v3 selected semantic GET bodies exceed bounded cache before verification: `
+            + `day=${day} entries=${retained.size}/${VERIFIED_GET_CACHE_MAX_ENTRIES} `
+            + `bytes=${retainedBytes}/${VERIFIED_GET_CACHE_MAX_BYTES}`,
+          );
+        }
+      }
+      const partKeys = manifestParts.get(object.key);
+      if (!partKeys) continue;
+      for (const key of partKeys) {
+        if (!retained.has(key)) {
+          throw new Error(
+            `SOS-light-v3 selected semantic GET body is unavailable before manifest: ${key}`,
+          );
+        }
+        retainedBytes -= retained.get(key);
+        retained.delete(key);
+      }
+    }
+    if (retained.size) {
+      throw new Error(
+        `SOS-light-v3 selected semantic GET bodies have no consuming manifest: `
+        + [...retained.keys()].sort().join(","),
+      );
+    }
+  }
+  return Object.freeze({ selected_parquet_keys: selectedParquetKeys });
+}
+
 export async function runPersistedSosLightV3Apply({
   runStatePath,
   runState,
@@ -258,6 +352,12 @@ export async function runPersistedSosLightV3Apply({
   }
   const publicationPartitions = partitionFrozenSosLightV3PublicationGraph({
     proposal,
+    days,
+  });
+  const semanticCachePlan = validateSosLightV3SemanticCacheCapacity({
+    publicationPartitions,
+    proposal,
+    runState,
     days,
   });
   const counts = {
@@ -480,11 +580,15 @@ export async function runPersistedSosLightV3Apply({
         );
       }
       operation.verified = true;
-      const cached = verifiedBodyCache.store({
-        key: operation.key,
-        sha256: operation.sha256,
-        body,
-      });
+      const semanticBodyRequired =
+        semanticCachePlan.selected_parquet_keys.has(operation.key);
+      const cached = semanticBodyRequired
+        ? verifiedBodyCache.store({
+            key: operation.key,
+            sha256: operation.sha256,
+            body,
+          })
+        : false;
       if (operation.entry) {
         Object.assign(operation.entry, {
           r2_verified: true,
@@ -835,6 +939,7 @@ export async function runPersistedSosLightV3Apply({
         completed_publication_level: "day_parent_verified",
       });
       progressState.last_completed_day_utc = day;
+      verifiedBodyCache.clear("selected_day_complete");
       checkpoint("after_complete_day_publication_verification");
       activeDayUtc = null;
     }
@@ -888,6 +993,7 @@ export async function runPersistedSosLightV3Apply({
     };
   } catch (error) {
     counts.failed_operations += 1;
+    verifiedBodyCache.clear("apply_failure");
     if (activeDayUtc && perDayStatus[activeDayUtc]) {
       perDayStatus[activeDayUtc].status = "failed";
       perDayStatus[activeDayUtc].error =

@@ -217,6 +217,18 @@ function dayManifest(dayUtc, marker) {
   return { ...payload, manifest_hash: sha256Hex(JSON.stringify(payload)) };
 }
 
+function selectedDayProposal(dayUtc, marker) {
+  const day = dayManifest(dayUtc, marker);
+  const body = JSON.stringify(day);
+  return {
+    key: day.manifest_key,
+    proposed_body: body,
+    bytes: Buffer.byteLength(body),
+    new_sha256: sha256Hex(body),
+    changed: true,
+  };
+}
+
 function pinnedHierarchyFixture() {
   const prefix = "history/v3/observations";
   const bodies = new Map();
@@ -345,6 +357,89 @@ test("fixed-v3 aggregate reconstruction fails when a pinned sibling body is miss
       },
     },
   }), /pinned observation day manifest is unavailable/);
+});
+
+test("fixed-v3 aggregate reconstruction inserts selected new day, month, and year membership", () => {
+  const { bodies } = pinnedHierarchyFixture();
+  const selected = [
+    selectedDayProposal("2026-06-03", "new-day"),
+    selectedDayProposal("2026-08-01", "new-month"),
+    selectedDayProposal("2027-01-01", "new-year"),
+  ];
+  const requested = [];
+  const proposalsByKey = new Map(selected.map((proposal) => [proposal.key, proposal]));
+  const rebuilt = reconstructCanonicalObservationAggregateHierarchy({
+    proposals: selected,
+    proposalsByKey,
+    selectedDays: ["2026-06-03", "2026-08-01", "2027-01-01"],
+    store: {
+      getObjectFromSourceIfExists(key, source) {
+        requested.push([key, source]);
+        const body = bodies.get(key);
+        return body ? { key, body, source } : null;
+      },
+    },
+  });
+  assert.deepEqual(rebuilt.staged_keys, [
+    "history/v3/observations/_manifests/manifest.json",
+    "history/v3/observations/_manifests/year=2026/manifest.json",
+    "history/v3/observations/_manifests/year=2026/month=06/manifest.json",
+    "history/v3/observations/_manifests/year=2026/month=08/manifest.json",
+    "history/v3/observations/_manifests/year=2027/manifest.json",
+    "history/v3/observations/_manifests/year=2027/month=01/manifest.json",
+  ]);
+  const june = JSON.parse(proposalsByKey.get(
+    "history/v3/observations/_manifests/year=2026/month=06/manifest.json",
+  ).proposed_body);
+  assert.deepEqual(june.children.map(({ day_utc }) => day_utc), [
+    "2026-06-01", "2026-06-02", "2026-06-03",
+  ]);
+  const year2026 = JSON.parse(proposalsByKey.get(
+    "history/v3/observations/_manifests/year=2026/manifest.json",
+  ).proposed_body);
+  assert.deepEqual(year2026.children.map(({ month }) => month), ["06", "07", "08"]);
+  const root = JSON.parse(proposalsByKey.get(
+    "history/v3/observations/_manifests/manifest.json",
+  ).proposed_body);
+  assert.deepEqual(root.children.map(({ year }) => year), [2025, 2026, 2027]);
+  assert.deepEqual(proposalsByKey.get(
+    "history/v3/observations/_manifests/year=2027/month=01/manifest.json",
+  ).dependencies, [selected[2].key]);
+  assert.deepEqual(proposalsByKey.get(
+    "history/v3/observations/_manifests/year=2027/manifest.json",
+  ).dependencies, [
+    "history/v3/observations/_manifests/year=2027/month=01/manifest.json",
+  ]);
+  assert.deepEqual(proposalsByKey.get(
+    "history/v3/observations/_manifests/manifest.json",
+  ).dependencies, [
+    "history/v3/observations/_manifests/year=2026/manifest.json",
+    "history/v3/observations/_manifests/year=2027/manifest.json",
+  ]);
+  assert(requested.some(([key, source]) =>
+    key.endsWith("day_utc=2026-06-02/manifest.json") && source === "dropbox"
+  ));
+  assert(!requested.some(([key]) => key.includes("month=08")));
+  assert(!requested.some(([key]) => key.includes("year=2027")));
+});
+
+test("fixed-v3 aggregate reconstruction rejects a referenced month with no pinned body", () => {
+  const { bodies } = pinnedHierarchyFixture();
+  const missingKey =
+    "history/v3/observations/_manifests/year=2026/month=06/manifest.json";
+  bodies.delete(missingKey);
+  const selected = selectedDayProposal("2026-06-03", "new-day");
+  assert.throws(() => reconstructCanonicalObservationAggregateHierarchy({
+    proposals: [selected],
+    proposalsByKey: new Map([[selected.key, selected]]),
+    selectedDays: ["2026-06-03"],
+    store: {
+      getObjectFromSourceIfExists(key, source) {
+        const body = bodies.get(key);
+        return body ? { key, body, source } : null;
+      },
+    },
+  }), /pinned observation month aggregate is unavailable/);
 });
 
 function exactHierarchy(dayUtc, timeseriesId) {

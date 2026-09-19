@@ -643,6 +643,275 @@ test("fixed-v3 semantic mismatch uses the exact GET body and blocks all parent p
   }
 });
 
+test("unrelated complete-day Parquet cannot evict the selected semantic GET body", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-sos-light-v3-cache-scope-"));
+  const runStatePath = path.join(root, "run-state.json");
+  const canonicalRow = {
+    connector_id: CONNECTOR_ID,
+    station_id: 10,
+    timeseries_id: 101,
+    pollutant_code: POLLUTANT_CODE,
+    observed_at_utc: `${DAY_UTC}T00:00:00.000Z`,
+    value: 12.5,
+    verification_status: "P",
+  };
+  const sourceHashResult = computeObservationContentHash([canonicalRow]);
+  const { canonical_rows: _canonicalRows, ...sourceHash } = sourceHashResult;
+  const sourceRows = [{
+    station_id: canonicalRow.station_id,
+    timeseries_id: canonicalRow.timeseries_id,
+    pollutant_code: canonicalRow.pollutant_code,
+    observed_at: canonicalRow.observed_at_utc,
+    value: canonicalRow.value,
+    verification_status: canonicalRow.verification_status,
+  }];
+  const rowsBody = Buffer.from(JSON.stringify(sourceRows));
+  const evidence = {
+    schema_version: 1,
+    enumeration_complete: true,
+    day_utc: DAY_UTC,
+    connector_id: CONNECTOR_ID,
+    requested_pollutant_set: [POLLUTANT_CODE],
+    canonical_rows_bytes: rowsBody.byteLength,
+    canonical_rows_sha256: sha256(rowsBody),
+    total_rows: 1,
+    per_pollutant_counts: { [POLLUTANT_CODE]: 1 },
+    observation_content_hashes: { [POLLUTANT_CODE]: sourceHash },
+    missing_binding_rows: 0,
+  };
+  const evidenceDirectory = path.join(
+    root, "source-evidence", `day_utc=${DAY_UTC}`,
+    `connector_id=${CONNECTOR_ID}`, `pollutant_code=${POLLUTANT_CODE}`,
+  );
+  fs.mkdirSync(evidenceDirectory, { recursive: true });
+  const rowsPath = path.join(evidenceDirectory, "obs_history_rows.json");
+  const evidencePath = path.join(evidenceDirectory, "source-evidence.json");
+  const evidenceBody = Buffer.from(JSON.stringify(evidence));
+  fs.writeFileSync(rowsPath, rowsBody);
+  fs.writeFileSync(evidencePath, evidenceBody);
+
+  const built = buildObservationHistoryV3SteadyStatePartition({
+    source: "sos_historical_replacement",
+    rows: [canonicalRow],
+    scope: { day_utc: DAY_UTC, connector_id: CONNECTOR_ID, pollutant_code: POLLUTANT_CODE },
+    targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const selectedPart = built.file_intents[0];
+  const selectedManifest = built.canonical_pollutant_manifest;
+  const dayPrefix = `history/v3/observations/day_utc=${DAY_UTC}`;
+  const unrelatedPartKeys = Array.from({ length: 33 }, (_, index) =>
+    `${dayPrefix}/connector_id=2/pollutant_code=no2/part-${String(index).padStart(5, "0")}.parquet`
+  );
+  const unrelatedManifestKey =
+    `${dayPrefix}/connector_id=2/pollutant_code=no2/manifest.json`;
+  const connector1Key = `${dayPrefix}/connector_id=1/manifest.json`;
+  const connector2Key = `${dayPrefix}/connector_id=2/manifest.json`;
+  const dayKey = `${dayPrefix}/manifest.json`;
+  const entries = {};
+  const objects = [];
+  const addObject = (key, body, dependencies, publicationStage, contentType = "application/json") => {
+    entries[key] = {
+      dependencies,
+      bytes: body.byteLength,
+      sha256: sha256(body),
+      content_type: contentType,
+      publication_stage: publicationStage,
+    };
+    objects.push({ key, body, entry: entries[key] });
+  };
+  addObject(
+    selectedPart.key,
+    selectedPart.body,
+    [],
+    "observation_parquet",
+    selectedPart.content_type,
+  );
+  for (const [index, key] of unrelatedPartKeys.entries()) {
+    addObject(
+      key,
+      Buffer.from(`preserved-${index}`),
+      [],
+      "observation_parquet",
+      "application/vnd.apache.parquet",
+    );
+  }
+  addObject(
+    selectedManifest.key,
+    Buffer.from(selectedManifest.body),
+    [selectedPart.key],
+    "observation_pollutant_manifest",
+  );
+  addObject(
+    unrelatedManifestKey,
+    Buffer.from("{}"),
+    unrelatedPartKeys,
+    "observation_pollutant_manifest",
+  );
+  addObject(connector1Key, Buffer.from("{}"), [selectedManifest.key], "observation_connector_manifest");
+  addObject(connector2Key, Buffer.from("{}"), [unrelatedManifestKey], "observation_connector_manifest");
+  addObject(dayKey, Buffer.from("{}"), [connector1Key, connector2Key], "observation_day_manifest");
+
+  const store = new Map();
+  const getCounts = new Map();
+  let parquetPutCount = 0;
+  const tombstone = { proposed: true, prefix: dayPrefix, stage: "sos_light_complete_day" };
+  const identity = `day_utc=${DAY_UTC}/connector_id=1/pollutant_code=${POLLUTANT_CODE}`;
+  try {
+    const result = await runPersistedSosLightV3Apply({
+      runStatePath,
+      runState: {
+        run_id: "sos-light-v3-cache-scope",
+        run_root: root,
+        overlay_root: root,
+        execution_path: "sos_light",
+        sos_light: { days: [{ day_utc: DAY_UTC }] },
+        tombstone_prefixes: [tombstone],
+        objects: entries,
+        source_evidence_partitions: {
+          [identity]: {
+            identity,
+            day_utc: DAY_UTC,
+            connector_id: CONNECTOR_ID,
+            pollutant_code: POLLUTANT_CODE,
+            evidence_path: evidencePath,
+            evidence_sha256: sha256(evidenceBody),
+            rows_path: rowsPath,
+            rows_sha256: sha256(rowsBody),
+          },
+        },
+      },
+      proposal: { objects, prefixes: [{ prefix: dayPrefix, entry: tombstone }] },
+      r2: {},
+      adapters: {
+        getObject: async ({ key }) => {
+          getCounts.set(key, (getCounts.get(key) || 0) + 1);
+          return { exists: store.has(key), body: Buffer.from(store.get(key) || "") };
+        },
+        putObject: async ({ key, body }) => {
+          store.set(key, Buffer.from(body));
+          return { status: "succeeded" };
+        },
+        putAndVerifyParquet: async ({ intent }) => {
+          parquetPutCount += 1;
+          store.set(intent.key, Buffer.from(intent.body));
+          return {
+            sha256: intent.sha256,
+            byte_size: intent.byte_size,
+            stored_sha256_verified: true,
+            stored_byte_size_verified: true,
+            status: "succeeded",
+          };
+        },
+        listAllObjects: async () => [],
+        deleteObjects: async () => ({ deleted: 0 }),
+      },
+    });
+    assert.equal(result.status, "succeeded");
+    assert.equal(parquetPutCount, 34);
+    for (const key of [selectedPart.key, ...unrelatedPartKeys]) {
+      assert.equal(getCounts.get(key), 1, `expected exactly one verification GET for ${key}`);
+    }
+    assert.deepEqual(entries[selectedManifest.key].live_observation_body_sources, [{
+      key: selectedPart.key,
+      verified_sha256: selectedPart.sha256,
+      source: "verified_get_cache",
+    }]);
+    assert.equal(entries[selectedPart.key].verified_get_body_cached, true);
+    assert(unrelatedPartKeys.every((key) => entries[key].verified_get_body_cached === false));
+    const persisted = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+    const parquetEvidence = persisted.apply.v3_publication_evidence.filter(
+      ({ key }) => key.endsWith(".parquet"),
+    );
+    assert.equal(parquetEvidence.length, 34);
+    assert(parquetEvidence.every((entry) => entry.r2_verified === true
+      && entry.stored_sha256_verified === true
+      && entry.stored_byte_size_verified === true));
+    assert.equal(persisted.apply.verified_get_body_cache.peak_entries, 1);
+    assert.equal(persisted.apply.verified_get_body_cache.current_entries, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("selected semantic cache overflow fails before the first mutation", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-sos-light-v3-cache-capacity-"));
+  const dayPrefix = `history/v3/observations/day_utc=${DAY_UTC}`;
+  const partKeys = Array.from({ length: 33 }, (_, index) =>
+    `${dayPrefix}/connector_id=1/pollutant_code=${POLLUTANT_CODE}`
+      + `/part-${String(index).padStart(5, "0")}.parquet`
+  );
+  const manifestKey =
+    `${dayPrefix}/connector_id=1/pollutant_code=${POLLUTANT_CODE}/manifest.json`;
+  const connectorKey = `${dayPrefix}/connector_id=1/manifest.json`;
+  const dayKey = `${dayPrefix}/manifest.json`;
+  const partObjects = partKeys.map((key, index) => ({
+    key,
+    body: Buffer.from(`selected-${index}`),
+    entry: {
+      dependencies: [],
+      content_type: "application/vnd.apache.parquet",
+      publication_stage: "observation_parquet",
+    },
+  }));
+  const objects = [...partObjects, {
+    key: manifestKey,
+    body: Buffer.from(JSON.stringify({ parquet_object_keys: partKeys })),
+    entry: {
+      dependencies: partKeys,
+      content_type: "application/json",
+      publication_stage: "observation_pollutant_manifest",
+    },
+  }, {
+    key: connectorKey,
+    body: Buffer.from("{}"),
+    entry: {
+      dependencies: [manifestKey],
+      content_type: "application/json",
+      publication_stage: "observation_connector_manifest",
+    },
+  }, {
+    key: dayKey,
+    body: Buffer.from("{}"),
+    entry: {
+      dependencies: [connectorKey],
+      content_type: "application/json",
+      publication_stage: "observation_day_manifest",
+    },
+  }];
+  let remoteCallCount = 0;
+  const identity = `day_utc=${DAY_UTC}/connector_id=1/pollutant_code=${POLLUTANT_CODE}`;
+  try {
+    await assert.rejects(runPersistedSosLightV3Apply({
+      runStatePath: path.join(root, "run-state.json"),
+      runState: {
+        run_id: "sos-light-v3-cache-capacity",
+        execution_path: "sos_light",
+        sos_light: { days: [{ day_utc: DAY_UTC }] },
+        source_evidence_partitions: { [identity]: {} },
+      },
+      proposal: {
+        objects,
+        prefixes: [{
+          prefix: dayPrefix,
+          entry: { stage: "sos_light_complete_day" },
+        }],
+      },
+      r2: {},
+      adapters: Object.fromEntries([
+        "getObject", "putObject", "putAndVerifyParquet", "listAllObjects", "deleteObjects",
+      ].map((name) => [name, async () => {
+        remoteCallCount += 1;
+        throw new Error(`unexpected ${name}`);
+      }])),
+    }), /selected semantic GET bodies exceed bounded cache.*entries=33\/32/);
+    assert.equal(remoteCallCount, 0);
+    assert.equal(fs.existsSync(path.join(root, "run-state.json")), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("canonical root failure blocks global latest publication", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-sos-light-v3-finalisation-"));
   const runStatePath = path.join(root, "run-state.json");
