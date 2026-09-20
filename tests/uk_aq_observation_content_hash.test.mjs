@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  OBSERVATION_CONTENT_HASH_COLUMNS,
   computeObservationContentHash,
   float64BigEndianHex,
   normalizeUkAirVerificationStatus,
+  normalizeCanonicalObservationRow,
   preservePersistedRatifiedStatus,
   resolveLegacyVerificationStatus,
+  selectObservationVerificationStatusColumn,
 } from "../workers/shared/uk_aq_observation_content_hash.mjs";
+import {
+  OBSERVATION_HISTORY_COLUMNS_V3,
+} from "../workers/shared/uk_aq_observation_history_schema.mjs";
+import { serializeCanonicalObservationV2Parquet } from "../workers/shared/uk_aq_r2_history_canonical.mjs";
+import { parquetMetadataAsync, parquetSchema } from "../scripts/backup_r2/lib/uk_aq_parquet_dependencies.mjs";
 
 const baseRows = [
   {
@@ -30,6 +38,11 @@ const baseRows = [
 ];
 
 test("observation content hash v1 is deterministic and status-aware", () => {
+  assert.deepEqual(OBSERVATION_HISTORY_COLUMNS_V3, [
+    "connector_id", "station_id", "timeseries_id", "pollutant_code",
+    "observed_at_utc", "value", "verification_status",
+  ]);
+  assert.deepEqual(OBSERVATION_CONTENT_HASH_COLUMNS, OBSERVATION_HISTORY_COLUMNS_V3);
   const expected = computeObservationContentHash(baseRows);
   assert.equal(
     computeObservationContentHash([...baseRows].reverse())
@@ -84,31 +97,20 @@ test("observation content hash v1 is deterministic and status-aware", () => {
   assert.equal(normalizeUkAirVerificationStatus(" ratified "), "R");
   assert.equal(normalizeUkAirVerificationStatus(" "), "P");
   assert.equal(normalizeUkAirVerificationStatus(null), "P");
-  assert.equal(
-    resolveLegacyVerificationStatus(
-      {
-        verification_status: "R",
-        vstatus: "P",
-        status: "Provisional",
-      },
-      { isSos: true },
-    ),
-    "R",
-  );
+  assert.throws(() => resolveLegacyVerificationStatus(
+    { verification_status: "R", vstatus: "P" }, { isSos: true },
+  ), /competing.*status/i);
   assert.equal(resolveLegacyVerificationStatus({ vstatus: "P" }), "P");
   assert.equal(resolveLegacyVerificationStatus({ vstatus: "R" }), "R");
-  assert.equal(
-    resolveLegacyVerificationStatus({ vstatus: "R", status: "Provisional" }),
-    "R",
-  );
-  assert.equal(
-    resolveLegacyVerificationStatus({ verification_status: "P", vstatus: "R" }),
-    "P",
-  );
-  assert.equal(
-    resolveLegacyVerificationStatus({ verification_status: null, vstatus: "R" }),
-    null,
-  );
+  assert.throws(() => resolveLegacyVerificationStatus(
+    { vstatus: "R", status: "Provisional" },
+  ), /competing.*status/i);
+  assert.throws(() => resolveLegacyVerificationStatus(
+    { verification_status: null, vstatus: "R" },
+  ), /competing.*status/i);
+  assert.throws(() => selectObservationVerificationStatusColumn(
+    new Set(["verification_status", "vstatus"]),
+  ), /competing.*status/i);
   assert.equal(
     resolveLegacyVerificationStatus(
       { status: "Provisional" },
@@ -158,4 +160,29 @@ test("persisted ratified precedence changes status only for equivalent replaceme
     [],
     "an omitted source observation is not restored",
   );
+});
+
+test("canonical logical rows reject physical compatibility fields", () => {
+  assert.throws(() => normalizeCanonicalObservationRow({
+    ...baseRows[0], vstatus: "R",
+  }), /competing.*status/i);
+  assert.throws(() => normalizeCanonicalObservationRow({
+    ...baseRows[0], status: "R",
+  }), /competing.*status/i);
+  assert.throws(() => normalizeCanonicalObservationRow({
+    ...baseRows[0], verification_status: undefined, vstatus: "R",
+  }), /competing.*status/i);
+});
+
+test("shared observation serializer emits the canonical physical schema", async () => {
+  const body = serializeCanonicalObservationV2Parquet([baseRows[0]]);
+  const metadata = await parquetMetadataAsync(body.buffer.slice(
+    body.byteOffset, body.byteOffset + body.byteLength,
+  ));
+  assert.deepEqual(parquetSchema(metadata).children.map((column) =>
+    String(column.element.name)
+  ), OBSERVATION_HISTORY_COLUMNS_V3);
+  assert.throws(() => serializeCanonicalObservationV2Parquet([{
+    ...baseRows[0], vstatus: "R",
+  }]), /competing.*status/i);
 });

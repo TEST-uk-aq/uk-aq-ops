@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UK-AQ SOS-light v3 History Integrity — entrypoint.
+"""UK-AQ History Integrity — entrypoint.
 
 Phase 1: env loading, guardrails, schema, run row + report.
 Phase 2: core snapshot import from the local Dropbox R2 history backup.
@@ -127,8 +127,8 @@ DROPBOX_APP_ROOT = Path(
     "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks",
 )
 DEFAULT_R2_HISTORY_DROPBOX_DIR = "R2_history_backup"
-CURRENT_INTEGRITY_HISTORY_VERSION = "v3"
-CURRENT_INTEGRITY_CORE_PREFIX = "history/v3/core"
+CURRENT_INTEGRITY_HISTORY_VERSION = "v2"
+CURRENT_INTEGRITY_CORE_PREFIX = "history/v2/core"
 SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH = (
     "sos_light"
 )
@@ -168,6 +168,9 @@ OVERLAY_CHANGED_SCOPE_SETS = (
     "OBSERVS_CHANGED",
     "OBS_MANIFESTS_CHANGED",
     "OBS_INDEXES_CHANGED",
+    "AQILEVELS_CHANGED",
+    "AQI_MANIFESTS_CHANGED",
+    "AQI_INDEXES_CHANGED",
 )
 BACKUP_GATE_URL_ENV_NAMES = (
     "DAILY_TASK_HEALTH_SUPABASE_URL",
@@ -464,6 +467,35 @@ CREATE INDEX IF NOT EXISTS idx_cross_checks_run
   ON cross_checks(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_cross_checks_day_connector
   ON cross_checks(day_utc, connector_id, timeseries_id);
+
+CREATE TABLE IF NOT EXISTS aqi_rebuild_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  env_name TEXT NOT NULL,
+  history_version TEXT,
+  domain TEXT,
+  profile TEXT,
+  pollutant_code TEXT,
+  source_observations_version TEXT,
+  connector_id INTEGER NOT NULL,
+  day_utc TEXT NOT NULL,
+
+  reason TEXT NOT NULL,
+  source_mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+
+  requested_timeseries_ids TEXT,
+  notes TEXT,
+
+  created_at_utc TEXT NOT NULL,
+  started_at_utc TEXT,
+  finished_at_utc TEXT,
+
+  UNIQUE(run_id, connector_id, day_utc)
+);
+
+CREATE INDEX IF NOT EXISTS idx_aqi_rebuild_queue_run_status
+  ON aqi_rebuild_queue(run_id, status, connector_id, day_utc);
 
 CREATE TABLE IF NOT EXISTS source_file_state (
   source_file_key TEXT PRIMARY KEY,
@@ -1791,20 +1823,20 @@ def _build_lookup(conn: sqlite3.Connection, log: logging.Logger) -> int:
 
 def resolve_core_history_version_for_mode(history_version_mode: str) -> str:
     if str(history_version_mode or "").strip().lower() != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     return CURRENT_INTEGRITY_HISTORY_VERSION
 
 def resolve_core_snapshot_prefix(history_version: str, env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     if str(history_version or "").strip().lower() != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     prefix = _normalize_history_prefix(
         values.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX"),
         CURRENT_INTEGRITY_CORE_PREFIX,
     )
     if prefix != CURRENT_INTEGRITY_CORE_PREFIX:
         raise ValueError(
-            "UK_AQ_R2_HISTORY_V2_CORE_PREFIX must be history/v3/core for current history integrity",
+            "UK_AQ_R2_HISTORY_V2_CORE_PREFIX must be history/v2/core for current history integrity",
         )
     return prefix
 
@@ -1856,14 +1888,14 @@ def resolve_core_snapshot_root(
     values = os.environ if env is None else env
     version = str(history_version or "").strip().lower()
     if version != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     core_prefix = resolve_core_snapshot_prefix(version, values)
     explicit_root = str(values.get("UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT", "") or "").strip()
     if explicit_root:
         normalized = explicit_root.replace("\\", "/").rstrip("/")
         if not normalized.endswith(f"/{core_prefix}") and normalized != core_prefix:
             raise ValueError(
-                "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT must target history/v3/core; "
+                "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT must target history/v2/core; "
                 f"got {explicit_root}",
             )
         return explicit_root
@@ -5241,12 +5273,15 @@ def _planned_backfill_command(
     pollutants_csv = ",".join(selected_pollutants)
     iso = day.isoformat()
     wrapper_command = wrapper
-    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill_v3.sh":
+    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh":
+        mode_arg = "--aqi-only" if output_scope == "aqilevels_only" else "--observs-only"
         cli_parts = [
             shlex.quote(wrapper),
             "--env",
             shlex.quote(str(env_name or env.get("UK_AQ_ENV_NAME") or os.environ.get("UK_AQ_ENV_NAME") or "<env unset>")),
-            "--observs-only",
+            mode_arg,
+            "--history-version",
+            shlex.quote(str(history_version)),
             "--from-day",
             iso,
             "--to-day",
@@ -5278,7 +5313,7 @@ def _planned_backfill_command(
 
 def adapter_backfill_history_version(history_version_mode: str) -> str:
     if history_version_mode != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     return CURRENT_INTEGRITY_HISTORY_VERSION
 
 
@@ -5777,8 +5812,6 @@ def run_narrow_backfill(
     history_version: str = "v1",
     complete_connector_day: bool = False,
     repair_pollutants: Iterable[str] | None = None,
-    worker_purpose: Literal["source_evidence_only", "repair_proposal", "source_repair"],
-    canonical_writes_allowed: bool,
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local.sh` for one scope (single day by default).
 
@@ -5789,48 +5822,6 @@ def run_narrow_backfill(
     When log_dir is set, full stdout+stderr is also written to a file under
     that directory and the path is returned in `log_path`.
     """
-    if worker_purpose == "source_evidence_only":
-        if canonical_writes_allowed:
-            raise ValueError(
-                "source_evidence_only cannot allow canonical writes"
-            )
-        if not complete_connector_day or not _is_truthy(
-            (extra_env or {}).get(
-                "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"
-            )
-        ):
-            raise ValueError(
-                "source_evidence_only requires complete connector-day evidence mode"
-            )
-    elif worker_purpose == "repair_proposal":
-        if canonical_writes_allowed:
-            raise ValueError("repair_proposal cannot allow canonical writes")
-        if str((extra_env or {}).get(
-            "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE"
-        ) or "") != "prepare":
-            raise ValueError("repair_proposal requires proposal mode=prepare")
-    elif worker_purpose == "source_repair":
-        if not canonical_writes_allowed:
-            raise ValueError("source_repair requires canonical write permission")
-        if str(history_version).strip().lower() == "v3":
-            raise ValueError(
-                "fixed-v3 source repair must use a local repair_proposal; "
-                "canonical publication is coordinator-owned"
-            )
-    else:  # pragma: no cover - protected by the Literal contract
-        raise ValueError(f"unsupported Integrity worker purpose: {worker_purpose}")
-
-    effective_mode = str(
-        os.environ.get("UK_AQ_INTEGRITY_EFFECTIVE_MODE") or ""
-    ).strip()
-    if effective_mode == "check_only" and (
-        worker_purpose != "source_evidence_only" or canonical_writes_allowed
-    ):
-        raise ValueError(
-            "check_only may launch only source_evidence_only workers with "
-            "canonical writes disabled"
-        )
-
     result: dict[str, Any] = {
         "status": None,
         "exit_code": None,
@@ -5864,7 +5855,6 @@ def run_narrow_backfill(
             "UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT",
             "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
             "UK_AQ_INTEGRITY_INVOCATION",
-            INTEGRITY_TARGET_WRITER_GIT_SHA_ENV,
         )
         if (value := os.environ.get(key)) is not None
     }
@@ -5879,7 +5869,6 @@ def run_narrow_backfill(
         "UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE",
         "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
         "UK_AQ_INTEGRITY_INVOCATION",
-        INTEGRITY_TARGET_WRITER_GIT_SHA_ENV,
     )
     for key in internal_scope_keys:
         sub_env.pop(key, None)
@@ -5916,10 +5905,6 @@ def run_narrow_backfill(
         "UK_AQ_BACKFILL_TO_DAY_UTC": to_iso,
         # Always force trigger_mode=manual (wrapper enforces this anyway).
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
-        "UK_AQ_INTEGRITY_WORKER_PURPOSE": worker_purpose,
-        "UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED": (
-            "true" if canonical_writes_allowed else "false"
-        ),
     })
     if complete_connector_day:
         sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_IDS", None)
@@ -5979,7 +5964,7 @@ def run_narrow_backfill(
 
     wrapper_name = Path(wrapper_path).name
     cmd = ["bash", wrapper_path]
-    if wrapper_name == "uk_aq_integrity_backfill_v3.sh":
+    if wrapper_name == "uk_aq_integrity_backfill.sh":
         for required_identity_key in (
             "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON",
             "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE",
@@ -5996,6 +5981,8 @@ def run_narrow_backfill(
             "--env",
             env_name,
             "--observs-only",
+            "--history-version",
+            history_version,
             "--from-day",
             iso,
             "--to-day",
@@ -6014,97 +6001,66 @@ def run_narrow_backfill(
 
     stdout_text = ""
     stderr_text = ""
-    label = log_label or f"day_{iso}"
-    durable_log_path = log_dir / f"{label}.log" if log_dir is not None else None
-    durable_stderr_path = (
-        log_dir / f"{label}.stderr.log" if log_dir is not None else None
-    )
-    started_at = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-    with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-child-") as temp_dir:
-        stdout_path = durable_log_path or Path(temp_dir) / "stdout.log"
-        stderr_path = durable_stderr_path or Path(temp_dir) / "stderr.log"
-        if log_dir is not None:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            result["log_path"] = str(stdout_path)
-        try:
-            with (
-                stdout_path.open("w+", encoding="utf-8") as stdout_fh,
-                stderr_path.open("w+", encoding="utf-8") as stderr_fh,
-            ):
-                stdout_fh.write(f"# stage: {label}\n")
-                stdout_fh.write(f"# wrapper: {wrapper_path}\n")
-                stdout_fh.write(f"# env_file: {env_file_path}\n")
-                stdout_fh.write(f"# day: {iso}\n")
-                stdout_fh.write(f"# to_day: {to_iso}\n")
-                stdout_fh.write(
-                    "# connector_ids: "
-                    f"{sub_env.get('UK_AQ_BACKFILL_CONNECTOR_IDS', 'all')}\n"
-                )
-                stdout_fh.write(
-                    "# repair_pollutants: "
-                    f"{sub_env.get('UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS', 'all')}\n"
-                )
-                stdout_fh.write(f"# worker_purpose: {worker_purpose}\n")
-                stdout_fh.write(f"# command: {' '.join(cmd)}\n")
-                stdout_fh.write(f"# started_at: {started_at}\n")
-                stdout_fh.write("# completion: pending\n\n# === STDOUT ===\n")
-                stdout_fh.flush()
-                os.fsync(stdout_fh.fileno())
-                try:
-                    proc = subprocess.run(
-                        cmd,
-                        env=sub_env,
-                        stdout=stdout_fh,
-                        stderr=stderr_fh,
-                        text=True,
-                        timeout=timeout_seconds,
-                        check=False,
-                    )
-                    result["exit_code"] = proc.returncode
-                    result["status"] = "ok" if proc.returncode == 0 else "error"
-                    if proc.returncode != 0:
-                        result["error"] = f"wrapper exit_code={proc.returncode}"
-                except subprocess.TimeoutExpired:
-                    result["status"] = "timeout"
-                    result["error"] = f"wrapper timed out after {timeout_seconds}s"
-                except OSError as exc:
-                    result["status"] = "spawn_error"
-                    result["error"] = f"spawn failed: {exc}"
-                stdout_fh.flush()
-                stderr_fh.flush()
-                stdout_fh.seek(0)
-                stdout_text = stdout_fh.read()
-                stdout_text = stdout_text.split("# === STDOUT ===\n", 1)[-1]
-                stderr_fh.seek(0)
-                stderr_text = stderr_fh.read()
-                # Preserve compatibility with mocked subprocess.run calls that
-                # return captured strings despite receiving file handles.
-                if 'proc' in locals() and getattr(proc, "stdout", None):
-                    stdout_text += str(proc.stdout)
-                if 'proc' in locals() and getattr(proc, "stderr", None):
-                    stderr_text += str(proc.stderr)
-                if durable_log_path is not None:
-                    stdout_fh.seek(0, os.SEEK_END)
-                    stdout_fh.write("\n# === STDERR ===\n")
-                    stdout_fh.write(stderr_text)
-                    stdout_fh.write(
-                        "\n# === COMPLETION ===\n"
-                        f"# exit_code: {result['exit_code']}\n"
-                        f"# status: {result['status']}\n"
-                        f"# duration_seconds: {round(time.monotonic() - started, 3)}\n"
-                        "# completion: complete\n"
-                    )
-                    stdout_fh.flush()
-                    os.fsync(stdout_fh.fileno())
-        except OSError as exc:
-            if result["status"] is None:
-                result["status"] = "spawn_error"
-                result["error"] = f"child log setup failed: {exc}"
-            log.warning("backfill log_path write failed: %s", exc)
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=sub_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        stdout_text = proc.stdout or ""
+        stderr_text = proc.stderr or ""
+        result["exit_code"] = proc.returncode
+        result["status"] = "ok" if proc.returncode == 0 else "error"
+        if proc.returncode != 0:
+            result["error"] = f"wrapper exit_code={proc.returncode}"
+    except subprocess.TimeoutExpired as exc:
+        result["status"] = "timeout"
+        result["error"] = f"wrapper timed out after {timeout_seconds}s"
+        if isinstance(exc.stdout, (bytes, bytearray)):
+            stdout_text = exc.stdout.decode("utf-8", errors="replace")
+        else:
+            stdout_text = exc.stdout or ""
+        if isinstance(exc.stderr, (bytes, bytearray)):
+            stderr_text = exc.stderr.decode("utf-8", errors="replace")
+        else:
+            stderr_text = exc.stderr or ""
+    except OSError as exc:
+        result["status"] = "spawn_error"
+        result["error"] = f"spawn failed: {exc}"
 
     result["stdout_tail"] = _tail_bytes(stdout_text)
     result["stderr_tail"] = _tail_bytes(stderr_text)
     result.update(_extract_source_to_r2_observation_status(stdout_text))
+
+    if log_dir is not None and (stdout_text or stderr_text or result["status"]):
+        log_dir.mkdir(parents=True, exist_ok=True)
+        label = log_label or f"day_{iso}"
+        log_path = log_dir / f"{label}.log"
+        try:
+            with log_path.open("w", encoding="utf-8") as fh:
+                fh.write(f"# wrapper: {wrapper_path}\n")
+                fh.write(f"# env_file: {env_file_path}\n")
+                fh.write(f"# day: {iso}\n")
+                fh.write(f"# connector_ids: {sub_env.get('UK_AQ_BACKFILL_CONNECTOR_IDS', 'all')}\n")
+                fh.write(
+                    f"# timeseries_ids: {sub_env.get('UK_AQ_BACKFILL_TIMESERIES_IDS', 'complete_connector_day')}\n"
+                )
+                fh.write(f"# output_scope: {sub_env.get('UK_AQ_BACKFILL_OUTPUT_SCOPE', 'default')}\n")
+                if extra_env:
+                    fh.write(f"# extra_env: {json.dumps(extra_env, sort_keys=True)}\n")
+                fh.write(f"# command: {' '.join(cmd)}\n")
+                fh.write(f"# exit_code: {result['exit_code']}\n")
+                fh.write(f"# status: {result['status']}\n")
+                fh.write("\n# === STDOUT ===\n")
+                fh.write(stdout_text)
+                fh.write("\n# === STDERR ===\n")
+                fh.write(stderr_text)
+            result["log_path"] = str(log_path)
+        except OSError as exc:
+            log.warning("backfill log_path write failed: %s", exc)
 
     result["duration_seconds"] = round(time.monotonic() - started, 3)
     log.info(
@@ -6117,16 +6073,6 @@ def run_narrow_backfill(
         if result.get("stderr_tail"):
             log.warning("backfill stderr tail:\n%s", result["stderr_tail"])
     return result
-
-
-def _v2_observation_worker_log_label(
-    *, stage: str, day_utc: str, connector_id: int, pollutant_code: str | None
-) -> str:
-    stage_prefix = "v2_obs_detector" if stage == "detector" else "v2_obs"
-    label = f"{stage_prefix}_day_{day_utc}_connector_{connector_id}"
-    if pollutant_code:
-        label += f"_pollutant_{pollutant_code}"
-    return label
 
 
 def _record_backfill_on_event(
@@ -6295,7 +6241,7 @@ def check_openaq(
                     _check_one_openaq_file_threadsafe,
                     db_path, env_name, base_url, loc, day,
                     tmp_dir, cache_root, log, limits,
-                    force_download_when_cache_missing=(history_version == CURRENT_INTEGRITY_HISTORY_VERSION),
+                    force_download_when_cache_missing=(history_version == "v2"),
                 ))
         total_tasks = len(futures)
         progress.update(
@@ -6370,7 +6316,7 @@ def check_openaq(
                     day_obj = dt.date.fromisoformat(result["day"])
                     connector_ids = (
                         _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                        if history_version == "v2"
                         else None
                     )
                     cmd = _planned_backfill_command(
@@ -6444,7 +6390,7 @@ def check_openaq(
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
             connector_ids = (
                 _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                if history_version == "v2"
                 else None
             )
             chunks = _chunk_timeseries_ids(union_ids)
@@ -6470,8 +6416,6 @@ def check_openaq(
                     log_dir=backfill_log_dir,
                     log_label=chunk_label,
                     history_version=history_version,
-                    worker_purpose="source_repair",
-                    canonical_writes_allowed=True,
                 )
                 metrics["backfills_attempted"] += 1
                 if bf["status"] == "ok":
@@ -7091,7 +7035,7 @@ def check_sensor_community(
                 _check_one_sc_file_threadsafe,
                 db_path, env_name, base_url, sensor_id, day, filename,
                 tmp_dir, cache_root, log, limits,
-                force_download_when_cache_missing=(history_version == CURRENT_INTEGRITY_HISTORY_VERSION),
+                force_download_when_cache_missing=(history_version == "v2"),
             ))
         total_tasks = len(futures)
         completed_tasks = 0
@@ -7166,7 +7110,7 @@ def check_sensor_community(
                     day_obj = dt.date.fromisoformat(result["day"])
                     connector_ids = (
                         _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                        if history_version == "v2"
                         else None
                     )
                     cmd = _planned_backfill_command(
@@ -7240,7 +7184,7 @@ def check_sensor_community(
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
             connector_ids = (
                 _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                if history_version == "v2"
                 else None
             )
             chunks = _chunk_timeseries_ids(union_ids)
@@ -7266,8 +7210,6 @@ def check_sensor_community(
                     log_dir=backfill_log_dir,
                     log_label=chunk_label,
                     history_version=history_version,
-                    worker_purpose="source_repair",
-                    canonical_writes_allowed=True,
                 )
                 metrics["backfills_attempted"] += 1
                 if bf["status"] == "ok":
@@ -8706,7 +8648,7 @@ def check_sos_flat_files(
 
     source_count_mapping_identity: str | None = None
     source_count_mapping_hash: str | None = None
-    if history_version == CURRENT_INTEGRITY_HISTORY_VERSION:
+    if history_version == "v2":
         connector_rows = conn.execute(
             """
             SELECT id FROM core_connectors_snapshot
@@ -8716,7 +8658,7 @@ def check_sos_flat_files(
         ).fetchall()
         if len(connector_rows) != 1:
             raise RuntimeError(
-                "fixed-v3 SOS annual-file processing requires exactly one imported "
+                "v2 SOS annual-file processing requires exactly one imported "
                 f"SOS connector; found={len(connector_rows)}"
             )
         bridge = _load_authoritative_sos_bridge_mapping(
@@ -8749,7 +8691,7 @@ def check_sos_flat_files(
     if not grouped_mappings:
         metrics["skipped_reason"] = (
             "no UK-AIR site_ref mappings in imported SOS bridge"
-            if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+            if history_version == "v2"
             else "no UK-AIR site_ref mappings returned from Supabase"
         )
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
@@ -9548,18 +9490,42 @@ def check_sos(
 
 
 R2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeseries"
+R2_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly"
 R2_HISTORY_INDEX_PREFIX = "history/_index"
 R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations"
-R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v3"
-R2_HISTORY_V2_OBSERVATIONS_PREFIX = "history/v3/observations"
+R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v2"
+R2_HISTORY_V2_OBSERVATIONS_PREFIX = "history/v2/observations"
+R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data"
+R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug"
 R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = (
-    "history/_index_v3/observations_timeseries"
+    "history/_index_v2/observations_timeseries"
 )
+R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX = (
+    "history/_index_v2/aqilevels_hourly_data_timeseries"
+)
+AQILEVELS_EXPECTED_HISTORY_SCHEMA_NAME = "aqilevels"
+AQILEVELS_EXPECTED_HISTORY_SCHEMA_VERSION = 2
+AQILEVELS_EXPECTED_WRITER_VERSION = "parquet-wasm-zstd-v2"
 CROSS_CHECK_MAX_REPORT_DISCREPANCIES = 250
 
 HISTORY_INTEGRITY_SCHEMA_VERSION = 3
 HISTORY_VERSION_CHOICES = (CURRENT_INTEGRITY_HISTORY_VERSION,)
 LAST_BACKFILL_ENV_LOAD_RESULT: dict[str, Any] = {}
+AQI_INTEGRITY_OBS_COVERAGE_REASON = "aqi_integrity_obs_coverage_gap"
+V2_AQI_OBS_REBUILD_KIND = "v2_aqi_hourly_rebuild_from_v2_observations"
+V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES = {
+    "day_dir_missing",
+    "aqi_manifest_missing_after_obs_repair",
+    "aqi_manifest_missing_for_observations",
+    "aqi_expected_hours_missing",
+    "data_manifest_missing",
+    "data_manifest_empty",
+    "parquet_missing",
+    "parquet_empty_or_placeholder",
+    "row_count_mismatch",
+    "pollutant_dir_missing",
+}
+V2_AQI_SUPPORTED_POLLUTANTS = frozenset({"no2", "pm25", "pm10"})
 V2_OBSERVATION_INTEGRITY_POLLUTANTS = frozenset({"no2", "o3", "pm25", "pm10"})
 
 
@@ -9567,20 +9533,30 @@ V2_OBSERVATION_INTEGRITY_POLLUTANTS = frozenset({"no2", "o3", "pm25", "pm10"})
 class HistoryPathConfig:
     history_version: Literal["v1", "v2"]
     observations_data_prefix: str
+    aqilevels_hourly_data_prefix: str
+    aqilevels_hourly_debug_prefix: str | None
     observations_timeseries_index_prefix: str
+    aqilevels_timeseries_index_prefix: str
     timeseries_binding_index_prefix: str
     observations_latest_index_key: str
+    aqilevels_latest_index_key: str
     observations_partition_levels: tuple[str, ...]
+    aqilevels_partition_levels: tuple[str, ...]
     checks_implemented: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "history_version": self.history_version,
             "observations_data_prefix": self.observations_data_prefix,
+            "aqilevels_hourly_data_prefix": self.aqilevels_hourly_data_prefix,
+            "aqilevels_hourly_debug_prefix": self.aqilevels_hourly_debug_prefix,
             "observations_timeseries_index_prefix": self.observations_timeseries_index_prefix,
+            "aqilevels_timeseries_index_prefix": self.aqilevels_timeseries_index_prefix,
             "timeseries_binding_index_prefix": self.timeseries_binding_index_prefix,
             "observations_latest_index_key": self.observations_latest_index_key,
+            "aqilevels_latest_index_key": self.aqilevels_latest_index_key,
             "observations_partition_levels": list(self.observations_partition_levels),
+            "aqilevels_partition_levels": list(self.aqilevels_partition_levels),
             "checks_implemented": self.checks_implemented,
         }
 
@@ -9606,7 +9582,7 @@ def resolve_history_version_mode(args: argparse.Namespace | None = None) -> str:
         ).strip().lower()
     if raw not in HISTORY_VERSION_CHOICES:
         raise ValueError(
-            "fixed SOS-light-v3 supports v3 only "
+            "current history integrity supports --history-version v2 only "
             f"(got {raw!r})",
         )
     return CURRENT_INTEGRITY_HISTORY_VERSION
@@ -9616,7 +9592,7 @@ def expand_history_versions(history_version_mode: str) -> list[str]:
     if history_version_mode == CURRENT_INTEGRITY_HISTORY_VERSION:
         return [CURRENT_INTEGRITY_HISTORY_VERSION]
     raise ValueError(
-        "fixed SOS-light-v3 supports history version v3 only "
+        "current history integrity supports history version v2 only "
         f"(got {history_version_mode!r})",
     )
 
@@ -9635,6 +9611,10 @@ def resolve_history_path_config(
             values.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX"),
             f"{index_prefix}/observations_timeseries",
         )
+        aqilevels_index_prefix = _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX"),
+            f"{index_prefix}/aqilevels_hourly_data_timeseries",
+        )
         timeseries_binding_index_prefix = _normalize_history_prefix(
             values.get("UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX"),
             f"{index_prefix}/timeseries_binding",
@@ -9645,17 +9625,31 @@ def resolve_history_path_config(
                 values.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX"),
                 R2_HISTORY_V2_OBSERVATIONS_PREFIX,
             ),
+            aqilevels_hourly_data_prefix=_normalize_history_prefix(
+                values.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX"),
+                R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX,
+            ),
+            aqilevels_hourly_debug_prefix=_normalize_history_prefix(
+                values.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX"),
+                R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
+            ),
             observations_timeseries_index_prefix=observations_index_prefix,
+            aqilevels_timeseries_index_prefix=aqilevels_index_prefix,
             timeseries_binding_index_prefix=timeseries_binding_index_prefix,
             observations_latest_index_key=_append_json_name(
                 index_prefix,
                 "observations_timeseries_latest.json",
             ),
+            aqilevels_latest_index_key=_append_json_name(
+                index_prefix,
+                "aqilevels_hourly_data_timeseries_latest.json",
+            ),
             observations_partition_levels=("day_utc", "connector_id", "pollutant_code"),
+            aqilevels_partition_levels=("day_utc", "connector_id", "pollutant_code"),
             checks_implemented=True,
         )
     raise ValueError(
-        "fixed SOS-light-v3 supports history version v3 only "
+        "current history integrity supports history version v2 only "
         f"(got {history_version!r})",
     )
 
@@ -9819,134 +9813,6 @@ def _local_v2_observations_evidence(
     return True, [str(base.relative_to(root))]
 
 
-_SOURCE_PARTITION_UNAVAILABLE_STATES = {
-    "connection_unavailable",
-    "scope_unavailable",
-    "metadata_unavailable",
-    "pollutant_absent",
-    "counts_unavailable",
-}
-
-_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES = {
-    "data_manifest_empty_timeseries_counts",
-    "data_manifest_file_count_mismatch",
-    "data_manifest_row_count_mismatch",
-    "data_manifest_timeseries_row_count_mismatch",
-    "data_manifest_total_bytes_mismatch",
-}
-
-_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS = {"grain", "profile"}
-
-_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS = {
-    "file_count",
-    "max_observed_at_utc",
-    "max_timeseries_id",
-    "min_observed_at_utc",
-    "min_timeseries_id",
-    "row_count",
-    "source_row_count",
-    "timeseries_row_counts",
-    "total_bytes",
-}
-
-
-def _observation_partition_key(gap: Mapping[str, Any]) -> tuple[str, str, str]:
-    return (
-        str(gap.get("day_utc") or ""),
-        str(gap.get("connector_id") or ""),
-        str(gap.get("pollutant_code") or ""),
-    )
-
-
-def _reconstructible_observation_manifest_gap(
-    gap: Mapping[str, Any],
-    all_gaps: Iterable[Mapping[str, Any]],
-) -> bool:
-    """Allow metadata-only planning only when live Parquet proves the data state."""
-    if gap.get("parquet_readable") is not True:
-        return False
-    gap_type = str(gap.get("gap_type") or "")
-    if gap_type == "data_manifest_schema_mismatch":
-        related = gap.get("related_paths")
-        if not isinstance(related, list) or not related:
-            return False
-        normalized_fields = []
-        for field in related:
-            text = str(field)
-            if text.startswith("field="):
-                text = text[6:].split(" ", 1)[0]
-            normalized_fields.append(text)
-        if not all(
-            field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
-            or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
-            for field in normalized_fields
-        ):
-            return False
-    elif gap_type.startswith("data_manifest_") and gap_type.endswith("_schema_mismatch"):
-        field = gap_type[len("data_manifest_"):-len("_schema_mismatch")]
-        if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
-            return False
-    elif gap_type not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
-        return False
-
-    partition_key = _observation_partition_key(gap)
-    uncertain_gap_types = {
-        "data_manifest_duplicate_file_key",
-        "data_manifest_listed_parquet_missing",
-        "data_manifest_unlisted_parquet",
-        "orphan_parquet_without_manifest",
-        "parquet_empty_or_placeholder",
-        "parquet_missing",
-        "parquet_null_timeseries_id_rows",
-        "parquet_reader_unavailable",
-        "parquet_unreadable",
-        "source_r2_timeseries_row_mismatch",
-    }
-    for sibling in all_gaps:
-        if _observation_partition_key(sibling) != partition_key:
-            continue
-        sibling_type = str(sibling.get("gap_type") or "")
-        if sibling_type in uncertain_gap_types:
-            return False
-        if sibling_type == "data_manifest_schema_mismatch":
-            related = sibling.get("related_paths")
-            if not isinstance(related, list) or not related:
-                return False
-            normalized_fields = []
-            for field in related:
-                text = str(field)
-                if text.startswith("field="):
-                    text = text[6:].split(" ", 1)[0]
-                normalized_fields.append(text)
-            if not all(
-                field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
-                or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
-                for field in normalized_fields
-            ):
-                return False
-        elif sibling_type.startswith("data_manifest_") and sibling_type.endswith("_schema_mismatch"):
-            field = sibling_type[len("data_manifest_"):-len("_schema_mismatch")]
-            if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
-                return False
-        elif sibling_type not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
-            if sibling_type.startswith("data_manifest_"):
-                return False
-    return True
-
-
-def _source_partition_state_from_gap(gap: Mapping[str, Any]) -> str | None:
-    evidence = gap.get("source_evidence")
-    if not isinstance(evidence, Mapping):
-        return None
-    partition = evidence.get("partition")
-    if isinstance(partition, Mapping):
-        state = partition.get("state")
-        if state:
-            return str(state)
-    state = evidence.get("source_partition_state")
-    return str(state) if state else None
-
-
 def _enrich_v2_observations_repair_plans(
     *,
     root: Path,
@@ -9970,179 +9836,6 @@ def _enrich_v2_observations_repair_plans(
         gap["suggested_repair"] = suggested_repair_from_decision(
             decision, sos_scope=sos_scope
         )
-
-
-def build_v2_repair_plan(
-    *,
-    observation_gaps: Iterable[Mapping[str, Any]] = (),
-    conn: sqlite3.Connection | None = None,
-) -> list[dict[str, Any]]:
-    """Summarize retained v2 observation repairs in operator order."""
-    del conn  # Kept for compatibility with the shared observation call sites.
-    observation_gaps = list(observation_gaps)
-    partition_priority = {
-        "observation_data_repair": 3,
-        "source_mapping_issue": 2,
-        "observation_pollutant_manifest_repair": 1,
-        "observation_index_repair": 0,
-    }
-    actions: dict[tuple[str, str, int | str | None, str | None], dict[str, Any]] = {}
-
-    for gap in observation_gaps:
-        pollutant_code = gap.get("pollutant_code")
-        if (
-            pollutant_code
-            and str(pollutant_code).strip().lower()
-            not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
-        ):
-            continue
-        decision = decide_observation_repair(
-            gap,
-            source_partition_unavailable=(
-                _source_partition_state_from_gap(gap)
-                in _SOURCE_PARTITION_UNAVAILABLE_STATES
-            ),
-            reconstructible_manifest=_reconstructible_observation_manifest_gap(
-                gap, observation_gaps
-            ),
-        )
-        if decision.repair_kind == "unclassified":
-            continue
-        kind = decision.repair_kind
-        day_utc = gap.get("day_utc")
-        connector_id = gap.get("connector_id")
-        pollutant_code = decision.pollutant_code
-        if kind == "observation_day_manifest_repair":
-            connector_id = None
-            pollutant_code = None
-        key = (
-            kind,
-            str(day_utc or ""),
-            connector_id,
-            str(pollutant_code or "") or None,
-        )
-        entry = actions.get(key)
-        gap_type = str(gap.get("gap_type") or "")
-        if entry is None:
-            entry = {
-                "kind": kind,
-                "status": "planned",
-                "day_utc": day_utc,
-                "connector_id": connector_id,
-                "pollutant_code": pollutant_code,
-                "requires_index_rebuild": bool(decision.requires_index_rebuild),
-                "data_changes_required": bool(decision.data_changes_required),
-                "executes": False,
-                "operator_action_required": (
-                    decision.executability_policy == "operator_action_required"
-                ),
-                "gap_types": [gap_type] if gap_type else [],
-                "commands": [],
-                "notes": decision.reason,
-                "repair_decision": decision.as_dict(),
-            }
-            actions[key] = entry
-        else:
-            if gap_type and gap_type not in entry["gap_types"]:
-                entry["gap_types"].append(gap_type)
-            entry["requires_index_rebuild"] = bool(
-                entry["requires_index_rebuild"] or decision.requires_index_rebuild
-            )
-            entry["operator_action_required"] = bool(
-                entry["operator_action_required"]
-                or decision.executability_policy == "operator_action_required"
-            )
-            entry["data_changes_required"] = bool(
-                entry["data_changes_required"] or decision.data_changes_required
-            )
-            if decision.reason and decision.reason not in str(entry.get("notes") or ""):
-                entry["notes"] = f"{entry['notes']}; {decision.reason}"
-
-        source_evidence = gap.get("source_evidence")
-        rollover_evidence = (
-            list(source_evidence.get("historical_identity_rollovers") or [])
-            if isinstance(source_evidence, Mapping)
-            else []
-        )
-        if rollover_evidence and kind == "observation_data_repair":
-            entry["identity_classification"] = (
-                "bridge_known_historical_identity_rollover"
-            )
-            entry["historical_identity_repair_gate_required"] = True
-            merged_rollovers = {
-                (
-                    int(item.get("existing_r2_timeseries_id") or 0),
-                    int(item.get("date_valid_timeseries_id") or 0),
-                ): dict(item)
-                for item in list(entry.get("historical_identity_rollovers") or [])
-                if isinstance(item, Mapping)
-            }
-            for item in rollover_evidence:
-                if isinstance(item, Mapping):
-                    merged_rollovers[(
-                        int(item.get("existing_r2_timeseries_id") or 0),
-                        int(item.get("date_valid_timeseries_id") or 0),
-                    )] = dict(item)
-            entry["historical_identity_rollovers"] = [
-                merged_rollovers[item_key] for item_key in sorted(merged_rollovers)
-            ]
-
-    selected_actions: dict[tuple[str, str, str], str] = {}
-    for entry in actions.values():
-        kind = str(entry.get("kind") or "")
-        if kind not in partition_priority:
-            continue
-        pollutant_code = entry.get("pollutant_code")
-        day_utc = entry.get("day_utc")
-        connector_id = entry.get("connector_id")
-        if pollutant_code is None or day_utc is None or connector_id is None:
-            continue
-        key = (str(day_utc), str(connector_id), str(pollutant_code))
-        current_kind = selected_actions.get(key)
-        if (
-            current_kind is None
-            or partition_priority[kind] > partition_priority[current_kind]
-        ):
-            selected_actions[key] = kind
-
-    filtered_actions = []
-    for entry in actions.values():
-        kind = str(entry.get("kind") or "")
-        pollutant_code = entry.get("pollutant_code")
-        day_utc = entry.get("day_utc")
-        connector_id = entry.get("connector_id")
-        if (
-            kind in partition_priority
-            and pollutant_code is not None
-            and day_utc is not None
-            and connector_id is not None
-            and selected_actions[(str(day_utc), str(connector_id), str(pollutant_code))]
-            != kind
-        ):
-            continue
-        entry["gap_types"] = sorted(set(entry.get("gap_types") or []))
-        filtered_actions.append(entry)
-
-    order = [
-        "observation_data_repair",
-        "source_mapping_issue",
-        "observation_pollutant_manifest_repair",
-        "observation_index_repair",
-        "observation_connector_manifest_repair",
-        "observation_day_manifest_repair",
-    ]
-    position = {kind: index for index, kind in enumerate(order)}
-    return sorted(
-        filtered_actions,
-        key=lambda entry: (
-            position.get(str(entry.get("kind") or ""), 999),
-            str(entry.get("day_utc") or ""),
-            int(entry["connector_id"])
-            if str(entry.get("connector_id") or "").isdigit()
-            else -1,
-            str(entry.get("pollutant_code") or ""),
-        ),
-    )
 
 
 def _manifest_codes_from_child_list(payload: Mapping[str, Any], field: str, id_key: str) -> set[str]:
@@ -10216,7 +9909,7 @@ def _append_field_set_gaps(
     expected_path: str,
     child_key: str,
 ) -> None:
-    gap_fn = _v2_obs_gap
+    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
     missing = sorted(actual - represented)
     stale = sorted(represented - actual)
     if missing:
@@ -10248,7 +9941,7 @@ def _validate_v2_parent_hierarchy(
     domain: str,
 ) -> None:
     """Validate connector/day parent representations against live child manifests."""
-    gap_fn = _v2_obs_gap
+    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
     if connector_dir is not None:
         connector_raw = connector_dir.name.split("=", 1)[1]
         connector_rel = f"{data_prefix}/day_utc={day_utc}/{connector_dir.name}/manifest.json"
@@ -10279,8 +9972,8 @@ def _validate_v2_parent_hierarchy(
                 expected_path=connector_rel,
             ))
             return
-        expected_profile = None
-        expected_grain = None
+        expected_profile = "data" if domain == "aqilevels" else None
+        expected_grain = "hourly" if domain == "aqilevels" else None
         schema_mismatches = [
             field for field, expected in (
                 ("manifest_kind", "connector"),
@@ -10373,8 +10066,8 @@ def _validate_v2_parent_hierarchy(
     if err or not isinstance(payload, dict):
         gaps.append(gap_fn("day_manifest_invalid_json", day_utc=day_utc, expected_path=day_rel))
         return
-    expected_profile = None
-    expected_grain = None
+    expected_profile = "data" if domain == "aqilevels" else None
+    expected_grain = "hourly" if domain == "aqilevels" else None
     schema_mismatches = [
         field for field, expected in (
             ("manifest_kind", "day"),
@@ -10830,10 +10523,6 @@ def _manifest_file_keys(payload: Mapping[str, Any]) -> set[str]:
     return _manifest_file_keys_from_entries(_manifest_files(payload))
 
 
-def _is_positive_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-
 def _child_manifest_aggregate(payloads: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     children = list(payloads)
     numeric_sums = {
@@ -10873,7 +10562,7 @@ def _append_parent_aggregate_gaps(
     manifest_files: list[Any] | None = None,
     files_valid: bool = True,
 ) -> None:
-    gap_fn = _v2_obs_gap
+    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
     aggregate = _child_manifest_aggregate(child_payloads)
 
     gap_prefix = f"{level}_manifest"
@@ -10898,10 +10587,18 @@ def _append_parent_aggregate_gaps(
             expected_value=expected_value,
         )
 
-    timestamp_fields = (
-        ("min_observed_at_utc", "min_timestamp_utc"),
-        ("max_observed_at_utc", "max_timestamp_utc"),
-    )
+    if domain == "observations":
+        timestamp_fields = (
+            ("min_observed_at_utc", "min_timestamp_utc"),
+            ("max_observed_at_utc", "max_timestamp_utc"),
+        )
+    elif domain == "aqilevels":
+        timestamp_fields = (
+            ("min_timestamp_hour_utc", "min_timestamp_utc"),
+            ("max_timestamp_hour_utc", "max_timestamp_utc"),
+        )
+    else:
+        timestamp_fields = ()
 
     for field, aggregate_field in timestamp_fields:
         _append_required_timestamp_field_gap(
@@ -10943,7 +10640,7 @@ def _append_child_hash_gaps(
     connector_id: int | str | None,
     expected_path: str,
 ) -> None:
-    gap_fn = _v2_obs_gap
+    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
     child_hash_gap_type = f"{child_manifest_level}_manifest_manifest_hash_schema_mismatch"
     for field, raw_entries, id_key in representations:
         if not isinstance(raw_entries, list):
@@ -11334,6 +11031,7 @@ def _classify_sos_r2_historical_identity_rollovers(
             "replace_existing_r2_pollutant_partition": True,
             "requires_observation_manifest_rebuild": True,
             "requires_observation_index_rebuild": True,
+            "requires_aqi_rebuild": wanted_pollutant in {"pm25", "pm10", "no2"},
             "historical_identity_repair_gate_required": True,
         })
 
@@ -12290,7 +11988,7 @@ def _append_actual_parquet_gaps(
     payload: Mapping[str, Any] | None,
     parquet_files: Iterable[Path],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    gap_fn = _v2_obs_gap
+    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
     stats, error = _read_parquet_partition_stats(
         parquet_files,
         include_timeseries_min_timestamps=domain == "observations",
@@ -12408,10 +12106,18 @@ def _append_actual_parquet_gaps(
         expected_value=stats["max_timeseries_id"],
     )
 
-    timestamp_fields = (
-        ("min_observed_at_utc", "min_timestamp_utc"),
-        ("max_observed_at_utc", "max_timestamp_utc"),
-    )
+    if domain == "observations":
+        timestamp_fields = (
+            ("min_observed_at_utc", "min_timestamp_utc"),
+            ("max_observed_at_utc", "max_timestamp_utc"),
+        )
+    elif domain == "aqilevels":
+        timestamp_fields = (
+            ("min_timestamp_hour_utc", "min_timestamp_utc"),
+            ("max_timestamp_hour_utc", "max_timestamp_utc"),
+        )
+    else:
+        timestamp_fields = ()
 
     for field, actual_field in timestamp_fields:
         _append_required_timestamp_field_gap(
@@ -13341,6 +13047,1067 @@ def _log_v2_integrity_gaps(
 
 
 
+def _v2_aqi_gap(
+    gap_type: str,
+    *,
+    profile: str = "data",
+    day_utc: str | None = None,
+    connector_id: int | str | None = None,
+    pollutant_code: str | None = None,
+    expected_path: str | None = None,
+    related_paths: list[str] | None = None,
+    severity: str = "error",
+) -> dict[str, Any]:
+    cid: int | str | None = connector_id
+    if cid is not None:
+        try:
+            cid = int(str(cid))
+        except (TypeError, ValueError):
+            cid = connector_id
+    return {
+        "history_version": "v2",
+        "domain": "aqilevels",
+        "grain": "hourly",
+        "profile": profile,
+        "severity": severity,
+        "gap_type": gap_type,
+        "day_utc": day_utc,
+        "connector_id": cid,
+        "pollutant_code": pollutant_code,
+        "expected_path": expected_path,
+        "related_paths": list(related_paths or []),
+        "source_evidence": {
+            "v2_observations_present": None,
+            "v1_aqi_present": None,
+            "source_counts_present": None,
+            "source_counts_available": None,
+            "db_dump_present": None,
+        },
+        "suggested_repair": {
+            "kind": "repair_plan_unclassified",
+            "requires_index_rebuild": True,
+            "commands": [],
+            "notes": "Repair planning did not classify this v2 AQI finding.",
+        },
+    }
+
+
+def _enrich_v2_aqi_repair_plans(
+    *,
+    root: Path,
+    config: HistoryPathConfig,
+    gaps: list[dict[str, Any]],
+) -> None:
+    index_gap_types = {
+        "index_day_dir_missing",
+        "index_connector_dir_missing",
+        "index_pollutant_dir_missing",
+        "index_manifest_missing",
+        "index_manifest_invalid_json",
+        "index_manifest_missing_timeseries_counts",
+        "index_manifest_empty_timeseries_counts",
+        "latest_index_missing",
+        "latest_index_invalid_json",
+        "latest_index_stale_or_incomplete",
+    }
+    data_gap_types = {
+        "day_dir_missing",
+        "connector_dir_missing",
+        "pollutant_dir_missing",
+        "data_manifest_missing",
+        "data_manifest_invalid_json",
+        "data_manifest_schema_mismatch",
+        "data_manifest_empty",
+        "data_manifest_file_count_mismatch",
+        "data_manifest_listed_parquet_missing",
+        "data_manifest_unlisted_parquet",
+        "data_manifest_duplicate_file_key",
+        "data_manifest_timeseries_row_count_mismatch",
+        "data_manifest_total_bytes_mismatch",
+        "parquet_missing",
+        "parquet_empty_or_placeholder",
+        "parquet_unreadable",
+        "row_count_mismatch",
+        "data_manifest_row_count_mismatch",
+        "pollutant_missing",
+        "orphan_parquet_without_manifest",
+        "missing_pollutant_partitions",
+        "unexpected_connector_level_part_file",
+    }
+    debug_gap_prefixes = ("debug_",)
+    for gap in gaps:
+        gap_type = str(gap.get("gap_type") or "")
+        day_utc = gap.get("day_utc")
+        connector_id = gap.get("connector_id")
+        pollutant_code = gap.get("pollutant_code")
+        if gap.get("fault_class") == "pollutant manifest-only fault":
+            gap["suggested_repair"] = {
+                "kind": "aqi_pollutant_manifest_repair",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "executes": False,
+                "steps": ["Rebuild the AQI pollutant manifest from the readable parquet files."],
+                "notes": "The parquet content is readable; do not rebuild AQI data.",
+            }
+            continue
+        v2_obs_present, v2_obs_paths = _local_v2_observations_evidence(
+            root,
+            config,
+            day_utc=str(day_utc) if day_utc else None,
+            connector_id=connector_id,
+            pollutant_code=str(pollutant_code) if pollutant_code else None,
+        )
+        evidence = gap.setdefault("source_evidence", {})
+        evidence["v2_observations_present"] = v2_obs_present
+        if v2_obs_paths:
+            evidence["v2_observations_paths"] = v2_obs_paths
+
+        if gap_type in index_gap_types:
+            gap["suggested_repair"] = {
+                "kind": "rebuild_v2_aqi_index_only",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "steps": [
+                    "Confirm the v2 AQI hourly data partition exists for the finding.",
+                    "Rebuild only the v2 AQI hourly data _index_v2 timeseries manifest for the affected day/connector/pollutant.",
+                ],
+                "notes": "No exact _index_v2 rebuild command is emitted because the command contract remains unresolved.",
+            }
+        elif gap_type.startswith("connector_manifest_"):
+            gap["suggested_repair"] = {
+                "kind": "aqi_connector_manifest_repair",
+                "requires_index_rebuild": False,
+                "commands": [],
+                "steps": [
+                    "Rebuild the AQI connector manifest from the live pollutant child manifests.",
+                    "Keep any sibling pollutant partitions that are already present.",
+                ],
+                "notes": "Connector-level AQI hierarchy gaps are repairable by rebuilding the parent manifest only.",
+            }
+        elif gap_type.startswith("day_manifest_"):
+            gap["suggested_repair"] = {
+                "kind": "aqi_day_manifest_repair",
+                "requires_index_rebuild": False,
+                "commands": [],
+                "steps": [
+                    "Rebuild the AQI day manifest from the live connector child manifests.",
+                    "Keep any sibling connector partitions that are already present.",
+                ],
+                "notes": "Day-level AQI hierarchy gaps are repairable by rebuilding the parent manifest only.",
+            }
+        elif gap_type.startswith(debug_gap_prefixes):
+            gap["suggested_repair"] = {
+                "kind": "v2_aqi_debug_optional_rebuild_plan",
+                "requires_index_rebuild": False,
+                "commands": [],
+                "steps": [
+                    "Decide whether debug AQI coverage is required for this run.",
+                    "If required, rebuild v2 AQI debug outputs from v2 observations using the confirmed operational rebuild path.",
+                ],
+                "notes": "Debug coverage is optional unless the checker was run with debug required; no exact rebuild command is confirmed here.",
+            }
+        elif (
+            (gap_type in data_gap_types or gap_type in V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES)
+            and v2_obs_present is True
+        ):
+            if day_utc and connector_id:
+                try:
+                    command = _planned_aqi_rebuild_command(
+                        {},
+                        int(connector_id),
+                        dt.date.fromisoformat(str(day_utc)),
+                        history_version="v2",
+                    )
+                except (TypeError, ValueError):
+                    command = None
+            else:
+                command = None
+            gap["suggested_repair"] = {
+                "kind": "v2_aqi_hourly_rebuild_from_v2_observations",
+                "requires_index_rebuild": True,
+                "commands": [command] if command else [],
+                "steps": [
+                    "Queue the existing AQI-only v2 rebuild from v2 observations for the affected connector/day.",
+                    "Run the queued AQI-only rebuild through the integrity backfill wrapper.",
+                    "Post-validate v2 AQI hourly data manifests against v2 observation manifests.",
+                ],
+                "notes": "Observation-backed v2 AQI data coverage gaps are executable by the integrity runner.",
+            }
+        elif gap_type in data_gap_types:
+            gap["suggested_repair"] = {
+                "kind": (
+                    "aqi_pollutant_manifest_repair"
+                    if gap_type in {
+                        "data_manifest_file_count_mismatch",
+                        "data_manifest_listed_parquet_missing",
+                        "data_manifest_unlisted_parquet",
+                        "data_manifest_duplicate_file_key",
+                        "data_manifest_timeseries_row_count_mismatch",
+                        "data_manifest_total_bytes_mismatch",
+                    }
+                    else "repair_v2_observations_before_v2_aqi"
+                ),
+                "requires_index_rebuild": True,
+                "commands": [],
+                "steps": [
+                    (
+                        "Repair the AQI pollutant manifest so it matches the live parquet set and row counts."
+                        if gap_type in {
+                            "data_manifest_file_count_mismatch",
+                            "data_manifest_listed_parquet_missing",
+                            "data_manifest_unlisted_parquet",
+                            "data_manifest_duplicate_file_key",
+                            "data_manifest_timeseries_row_count_mismatch",
+                            "data_manifest_total_bytes_mismatch",
+                        }
+                        else "Repair or generate the missing v2 observations partition first."
+                    ),
+                    "Then rebuild v2 AQI hourly data from v2 observations.",
+                    "Finally rebuild the affected v2 AQI hourly data _index_v2 manifests.",
+                ],
+                "notes": (
+                    "Manifest-only AQI gaps are repairable by rebuilding the pollutant manifest."
+                    if gap_type in {
+                        "data_manifest_file_count_mismatch",
+                        "data_manifest_listed_parquet_missing",
+                        "data_manifest_unlisted_parquet",
+                        "data_manifest_duplicate_file_key",
+                        "data_manifest_timeseries_row_count_mismatch",
+                        "data_manifest_total_bytes_mismatch",
+                    }
+                    else "No Supabase/prune/backfill command is emitted because the exact v2 write contract has not been confirmed."
+                ),
+            }
+
+
+_SOURCE_PARTITION_UNAVAILABLE_STATES = {
+    "connection_unavailable",
+    "scope_unavailable",
+    "metadata_unavailable",
+    "pollutant_absent",
+    "counts_unavailable",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES = {
+    "data_manifest_empty_timeseries_counts",
+    "data_manifest_file_count_mismatch",
+    "data_manifest_row_count_mismatch",
+    "data_manifest_timeseries_row_count_mismatch",
+    "data_manifest_total_bytes_mismatch",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS = {
+    "grain",
+    "profile",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS = {
+    "file_count",
+    "max_observed_at_utc",
+    "max_timeseries_id",
+    "min_observed_at_utc",
+    "min_timeseries_id",
+    "row_count",
+    "source_row_count",
+    "timeseries_row_counts",
+    "total_bytes",
+}
+
+
+def _observation_partition_key(gap: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(gap.get("day_utc") or ""),
+        str(gap.get("connector_id") or ""),
+        str(gap.get("pollutant_code") or ""),
+    )
+
+
+def _reconstructible_observation_manifest_gap(
+    gap: Mapping[str, Any],
+    all_gaps: Iterable[Mapping[str, Any]],
+) -> bool:
+    """Allow metadata-only planning only when live Parquet proves the data state."""
+    if gap.get("parquet_readable") is not True:
+        return False
+    gap_type = str(gap.get("gap_type") or "")
+    if gap_type == "data_manifest_schema_mismatch":
+        related = gap.get("related_paths")
+        if not isinstance(related, list) or not related:
+            return False
+        normalized_fields = []
+        for field in related:
+            text = str(field)
+            if text.startswith("field="):
+                text = text[6:].split(" ", 1)[0]
+            normalized_fields.append(text)
+        if not all(
+            field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
+            or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
+            for field in normalized_fields
+        ):
+            return False
+    elif gap_type.startswith("data_manifest_") and gap_type.endswith("_schema_mismatch"):
+        field = gap_type[len("data_manifest_"):-len("_schema_mismatch")]
+        if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
+            return False
+    elif gap_type in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
+        pass
+    else:
+        return False
+
+    partition_key = _observation_partition_key(gap)
+    uncertain_gap_types = {
+        "data_manifest_duplicate_file_key",
+        "data_manifest_listed_parquet_missing",
+        "data_manifest_unlisted_parquet",
+        "orphan_parquet_without_manifest",
+        "parquet_empty_or_placeholder",
+        "parquet_missing",
+        "parquet_null_timeseries_id_rows",
+        "parquet_reader_unavailable",
+        "parquet_unreadable",
+        "source_r2_timeseries_row_mismatch",
+    }
+    for sibling in all_gaps:
+        if _observation_partition_key(sibling) != partition_key:
+            continue
+        sibling_type = str(sibling.get("gap_type") or "")
+        if sibling_type in uncertain_gap_types:
+            return False
+        if sibling_type == "data_manifest_schema_mismatch":
+            related = sibling.get("related_paths")
+            if not isinstance(related, list) or not related:
+                return False
+            normalized_fields = []
+            for field in related:
+                text = str(field)
+                if text.startswith("field="):
+                    text = text[6:].split(" ", 1)[0]
+                normalized_fields.append(text)
+            if not all(
+                field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
+                or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
+                for field in normalized_fields
+            ):
+                return False
+        elif sibling_type.startswith("data_manifest_") and sibling_type.endswith("_schema_mismatch"):
+            field = sibling_type[len("data_manifest_"):-len("_schema_mismatch")]
+            if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
+                return False
+        elif sibling_type not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
+            if sibling_type.startswith("data_manifest_"):
+                return False
+    return True
+
+_AQI_REBUILD_ORIGIN_ORDER = {
+    "aqi_data_fault": 0,
+    "observation_dependency": 1,
+    "unspecified": 2,
+}
+
+
+def _normalize_aqi_rebuild_origins(origins: Iterable[str] | None) -> list[str]:
+    normalized: list[str] = []
+    for origin in origins or ():
+        origin_text = str(origin).strip()
+        if not origin_text or origin_text in normalized:
+            continue
+        normalized.append(origin_text)
+    if not normalized:
+        normalized = ["unspecified"]
+    return sorted(normalized, key=lambda origin: (_AQI_REBUILD_ORIGIN_ORDER.get(origin, 99), origin))
+
+
+def _should_keep_aqi_rebuild(
+    *,
+    selected_observation_kind: str | None,
+    origins: Iterable[str] | None,
+) -> bool:
+    normalized_origins = _normalize_aqi_rebuild_origins(origins)
+    if any(origin != "observation_dependency" for origin in normalized_origins):
+        return True
+    return selected_observation_kind == "observation_data_repair"
+
+
+def _source_partition_state_from_gap(gap: Mapping[str, Any]) -> str | None:
+    evidence = gap.get("source_evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+    partition = evidence.get("partition")
+    if isinstance(partition, Mapping):
+        state = partition.get("state")
+        if state:
+            return str(state)
+    state = evidence.get("source_partition_state")
+    if state:
+        return str(state)
+    return None
+
+
+def build_v2_repair_plan(
+    *,
+    observation_gaps: Iterable[Mapping[str, Any]] = (),
+    aqi_gaps: Iterable[Mapping[str, Any]] = (),
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Summarize v2 repairs in operator order without executing writes."""
+    observation_gaps = list(observation_gaps)
+    eligible_pollutants_by_connector: dict[int, set[str] | None] = {}
+    observation_partition_priority = {
+        "observation_data_repair": 3,
+        "source_mapping_issue": 2,
+        "observation_pollutant_manifest_repair": 1,
+        "observation_index_repair": 0,
+    }
+
+    def active_observation_pollutant(pollutant_code: str | None) -> bool:
+        if not pollutant_code:
+            return True
+        return str(pollutant_code).strip().lower() in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+
+    def eligible_for(connector_id: int | str | None, pollutant_code: str | None) -> bool:
+        if not pollutant_code:
+            return False
+        code = str(pollutant_code).strip().lower()
+        if code not in {"pm25", "pm10", "no2"}:
+            return False
+        if connector_id is None:
+            return True
+        try:
+            cid = int(str(connector_id))
+        except (TypeError, ValueError):
+            return False
+        if cid not in eligible_pollutants_by_connector:
+            if conn is None:
+                eligible_pollutants_by_connector[cid] = {"pm25", "pm10", "no2"}
+            else:
+                eligible_pollutants_by_connector[cid] = _active_aqi_eligible_pollutants_for_connector(conn, connector_id=cid)
+        eligible = eligible_pollutants_by_connector[cid]
+        return eligible is None or code in eligible
+
+    actions: dict[tuple[str, str, int | str | None, str | None], dict[str, Any]] = {}
+
+    def add_action(
+        kind: str,
+        *,
+        gap: Mapping[str, Any],
+        requires_index_rebuild: bool = False,
+        executes: bool = False,
+        operator_action_required: bool = False,
+        data_changes_required: bool = False,
+        aqi_rebuild_origin: str | None = None,
+        notes: str | None = None,
+    ) -> None:
+        day_utc = gap.get("day_utc")
+        connector_id = gap.get("connector_id")
+        pollutant_code = gap.get("pollutant_code")
+        # Day manifests aggregate every connector beneath the day.  Their
+        # repair action must never inherit an incidental connector/pollutant
+        # from an individual integrity finding.
+        if kind in {"observation_day_manifest_repair", "aqi_day_manifest_repair"}:
+            connector_id = None
+            pollutant_code = None
+        key = (kind, str(day_utc or ""), connector_id, str(pollutant_code or "") or None)
+        entry = actions.get(key)
+        gap_type = str(gap.get("gap_type") or "")
+        if kind == "aqi_rebuild":
+            requires_index_rebuild = True
+            executes = False
+            data_changes_required = True
+        if entry is None:
+            entry = {
+                "kind": kind,
+                "status": "planned",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": pollutant_code,
+                "requires_index_rebuild": bool(requires_index_rebuild),
+                "data_changes_required": bool(data_changes_required),
+                "executes": False,
+                "operator_action_required": bool(operator_action_required),
+                "gap_types": [gap_type] if gap_type else [],
+                "commands": [],
+                "notes": notes or "",
+            }
+            repair_decision = gap.get("repair_decision")
+            if isinstance(repair_decision, Mapping):
+                entry["repair_decision"] = dict(repair_decision)
+            if kind == "aqi_rebuild":
+                entry["aqi_rebuild_origins"] = _normalize_aqi_rebuild_origins([aqi_rebuild_origin or "unspecified"])
+            actions[key] = entry
+        else:
+            if gap_type and gap_type not in entry["gap_types"]:
+                entry["gap_types"].append(gap_type)
+            entry["requires_index_rebuild"] = bool(entry["requires_index_rebuild"] or requires_index_rebuild)
+            entry["executes"] = bool(entry["executes"] or executes)
+            entry["operator_action_required"] = bool(entry["operator_action_required"] or operator_action_required)
+            entry["data_changes_required"] = bool(entry["data_changes_required"] or data_changes_required)
+            if notes and notes not in str(entry.get("notes") or ""):
+                entry["notes"] = f"{entry['notes']}; {notes}" if entry.get("notes") else notes
+            if kind == "aqi_rebuild":
+                entry["aqi_rebuild_origins"] = _normalize_aqi_rebuild_origins(
+                    [*(entry.get("aqi_rebuild_origins") or []), aqi_rebuild_origin or "unspecified"]
+                )
+        source_evidence = gap.get("source_evidence")
+        rollover_evidence = (
+            list(source_evidence.get("historical_identity_rollovers") or [])
+            if isinstance(source_evidence, Mapping)
+            else []
+        )
+        if rollover_evidence and kind == "observation_data_repair":
+            entry["identity_classification"] = (
+                "bridge_known_historical_identity_rollover"
+            )
+            entry["historical_identity_repair_gate_required"] = True
+            merged_rollovers = {
+                (
+                    int(item.get("existing_r2_timeseries_id") or 0),
+                    int(item.get("date_valid_timeseries_id") or 0),
+                ): dict(item)
+                for item in list(entry.get("historical_identity_rollovers") or [])
+                if isinstance(item, Mapping)
+            }
+            for item in rollover_evidence:
+                if not isinstance(item, Mapping):
+                    continue
+                merged_rollovers[(
+                    int(item.get("existing_r2_timeseries_id") or 0),
+                    int(item.get("date_valid_timeseries_id") or 0),
+                )] = dict(item)
+            entry["historical_identity_rollovers"] = [
+                merged_rollovers[key] for key in sorted(merged_rollovers)
+            ]
+
+    for gap in observation_gaps:
+        source_partition_state = _source_partition_state_from_gap(gap)
+        if not active_observation_pollutant(gap.get("pollutant_code")):
+            continue
+        decision = decide_observation_repair(
+            gap,
+            source_partition_unavailable=(
+                source_partition_state in _SOURCE_PARTITION_UNAVAILABLE_STATES
+            ),
+            reconstructible_manifest=_reconstructible_observation_manifest_gap(
+                gap, observation_gaps
+            ),
+        )
+        if decision.repair_kind == "unclassified":
+            continue
+        repair_gap = dict(gap)
+        repair_gap["pollutant_code"] = decision.pollutant_code
+        repair_gap["repair_decision"] = decision.as_dict()
+        add_action(
+            decision.repair_kind,
+            gap=repair_gap,
+            requires_index_rebuild=decision.requires_index_rebuild,
+            operator_action_required=(
+                decision.executability_policy == "operator_action_required"
+            ),
+            data_changes_required=decision.data_changes_required,
+            notes=decision.reason,
+        )
+        if (
+            decision.aqi_policy == "observation_dependency"
+            and eligible_for(decision.connector_id, decision.pollutant_code)
+        ):
+            add_action(
+                "aqi_rebuild",
+                gap=repair_gap,
+                requires_index_rebuild=True,
+                data_changes_required=True,
+                aqi_rebuild_origin="observation_dependency",
+                notes="Queue AQI rebuilding only because the observation data changed for an AQI-enabled pollutant.",
+            )
+
+    for gap in aqi_gaps:
+        gap_type = str(gap.get("gap_type") or "")
+        fault_class = str(gap.get("fault_class") or "")
+        if gap_type.startswith("connector_manifest_"):
+            add_action(
+                "aqi_connector_manifest_repair",
+                gap=gap,
+                requires_index_rebuild=False,
+                notes="Rebuild the AQI connector manifest from all valid live-R2 pollutant children without dropping siblings.",
+            )
+        elif gap_type.startswith("day_manifest_"):
+            add_action(
+                "aqi_day_manifest_repair",
+                gap=gap,
+                requires_index_rebuild=False,
+                notes="Rebuild the AQI day manifest from all valid live-R2 connector children without dropping siblings.",
+            )
+        elif gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
+            add_action(
+                "aqi_index_repair",
+                gap=gap,
+                requires_index_rebuild=True,
+                notes="Rebuild AQI index metadata for the affected day/connector/pollutant.",
+            )
+        elif gap_type in {
+            "data_manifest_file_count_mismatch",
+            "data_manifest_unlisted_parquet",
+            "data_manifest_listed_parquet_missing",
+            "data_manifest_duplicate_file_key",
+            "data_manifest_timeseries_row_count_mismatch",
+            "data_manifest_total_bytes_mismatch",
+            "data_manifest_row_count_mismatch",
+        }:
+            add_action(
+                "aqi_pollutant_manifest_repair",
+                gap=gap,
+                requires_index_rebuild=True,
+                notes="Repair the AQI pollutant manifest so it matches the actual live-R2 parquet set and row counts.",
+            )
+        elif fault_class == "pollutant manifest-only fault" and (
+            gap_type.startswith("data_manifest_") or gap_type == "orphan_parquet_without_manifest"
+        ):
+            add_action(
+                "aqi_pollutant_manifest_repair",
+                gap=gap,
+                requires_index_rebuild=True,
+                data_changes_required=False,
+                notes="Rebuild the AQI pollutant manifest from readable parquet without rewriting AQI data.",
+            )
+        elif gap_type in {
+            "data_manifest_missing",
+            "data_manifest_invalid_json",
+            "data_manifest_schema_mismatch",
+            "data_manifest_empty",
+            "data_partition_zero_rows",
+            "parquet_missing",
+            "parquet_empty_or_placeholder",
+            "parquet_unreadable",
+            "row_count_mismatch",
+            "pollutant_missing",
+            "orphan_parquet_without_manifest",
+        }:
+            add_action(
+                "aqi_rebuild",
+                gap=gap,
+                requires_index_rebuild=True,
+                data_changes_required=True,
+                aqi_rebuild_origin="aqi_data_fault",
+                notes="Rebuild AQI data only where the AQI partition itself is stale or incomplete.",
+            )
+
+    selected_observation_actions: dict[tuple[str, str, str], str] = {}
+    for entry in actions.values():
+        kind = str(entry.get("kind") or "")
+        if kind not in observation_partition_priority:
+            continue
+        pollutant_code = entry.get("pollutant_code")
+        day_utc = entry.get("day_utc")
+        connector_id = entry.get("connector_id")
+        if pollutant_code is None or day_utc is None or connector_id is None:
+            continue
+        key = (str(day_utc), str(connector_id), str(pollutant_code))
+        current_kind = selected_observation_actions.get(key)
+        if current_kind is None or observation_partition_priority[kind] > observation_partition_priority[current_kind]:
+            selected_observation_actions[key] = kind
+
+    filtered_actions: dict[tuple[str, str, int | str | None, str | None], dict[str, Any]] = {}
+    for action_key, entry in actions.items():
+        kind = str(entry.get("kind") or "")
+        pollutant_code = entry.get("pollutant_code")
+        day_utc = entry.get("day_utc")
+        connector_id = entry.get("connector_id")
+        if pollutant_code is None or day_utc is None or connector_id is None:
+            filtered_actions[action_key] = entry
+            continue
+        partition_key = (str(day_utc), str(connector_id), str(pollutant_code))
+        selected_kind = selected_observation_actions.get(partition_key)
+        if kind == "aqi_rebuild":
+            if not _should_keep_aqi_rebuild(
+                selected_observation_kind=selected_kind,
+                origins=entry.get("aqi_rebuild_origins"),
+            ):
+                continue
+            entry["aqi_rebuild_origins"] = _normalize_aqi_rebuild_origins(entry.get("aqi_rebuild_origins"))
+            entry["data_changes_required"] = True
+            entry["requires_index_rebuild"] = True
+            entry["executes"] = False
+            entry["status"] = "planned"
+            entry["commands"] = []
+            filtered_actions[action_key] = entry
+            continue
+        if kind in observation_partition_priority and selected_kind != kind:
+            continue
+        filtered_actions[action_key] = entry
+
+    order = [
+        "observation_data_repair",
+        "source_mapping_issue",
+        "observation_pollutant_manifest_repair",
+        "observation_index_repair",
+        "observation_connector_manifest_repair",
+        "observation_day_manifest_repair",
+        "aqi_rebuild",
+        "aqi_pollutant_manifest_repair",
+        "aqi_connector_manifest_repair",
+        "aqi_day_manifest_repair",
+        "aqi_index_repair",
+    ]
+    position = {kind: idx for idx, kind in enumerate(order)}
+    for entry in filtered_actions.values():
+        entry["gap_types"] = sorted(set(entry.get("gap_types") or []))
+    return sorted(
+        filtered_actions.values(),
+        key=lambda entry: (
+            position.get(str(entry.get("kind") or ""), 999),
+            str(entry.get("day_utc") or ""),
+            int(entry["connector_id"]) if str(entry.get("connector_id") or "").isdigit() else -1,
+            str(entry.get("pollutant_code") or ""),
+        ),
+    )
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _load_json_file(path: Path) -> tuple[Any | None, str | None]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except json.JSONDecodeError:
+        return None, "invalid_json"
+    except OSError:
+        return None, "unreadable"
+
+
+def _validate_v2_aqi_manifest(
+    *,
+    payload: Any,
+    profile: str,
+    day_utc: str,
+    connector_id: str,
+    pollutant_code: str,
+) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["manifest_not_object"]
+    bad: list[str] = []
+    expected = {
+        "manifest_kind": "pollutant",
+        "history_version": "v2",
+        "domain": "aqilevels",
+        "grain": "hourly",
+        "profile": profile,
+    }
+    for key, want in expected.items():
+        if key not in payload or str(payload.get(key)) != str(want):
+            bad.append(key)
+    return bad
+
+
+def run_v2_aqilevels_integrity_checks(
+    *,
+    r2_history_root: str | Path | None,
+    config: HistoryPathConfig,
+    from_day: str | None,
+    to_day: str | None,
+    selected_days: Iterable[str] | None = None,
+    allowed_connector_ids: set[int] | None = None,
+    source_scope: dict[str, Any] | None = None,
+    conn: sqlite3.Connection | None = None,
+    check_aqi_debug: bool = False,
+    require_aqi_debug: bool = False,
+    log: logging.Logger | None = None,
+    allowed_real_roots: Iterable[Path] = (),
+) -> dict[str, Any]:
+    if not r2_history_root:
+        raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
+    root = Path(r2_history_root)
+    if not root.is_dir():
+        raise RuntimeError(f"UK_AQ_R2_HISTORY_DROPBOX_ROOT is not a directory: {root}")
+    if selected_days is None and (not from_day or not to_day):
+        raise RuntimeError("v2 AQI integrity requires a selected from/to day range")
+
+    data_gaps: list[dict[str, Any]] = []
+    debug_gaps: list[dict[str, Any]] = []
+    checked = 0
+    debug_checked = 0
+    data_prefix = config.aqilevels_hourly_data_prefix.strip("/")
+    debug_prefix = (config.aqilevels_hourly_debug_prefix or "").strip("/")
+    index_prefix = config.aqilevels_timeseries_index_prefix.strip("/")
+    latest_key = config.aqilevels_latest_index_key.strip("/")
+
+    latest_path = root / latest_key
+    if not latest_path.is_file():
+        data_gaps.append(_v2_aqi_gap("latest_index_missing", expected_path=latest_key))
+    else:
+        payload, err = _load_json_file(latest_path)
+        if err:
+            data_gaps.append(_v2_aqi_gap("latest_index_invalid_json", expected_path=latest_key))
+        elif not isinstance(payload, dict):
+            data_gaps.append(_v2_aqi_gap("latest_index_stale_or_incomplete", expected_path=latest_key, related_paths=["latest index is not an object"]))
+
+    expected_parts: list[tuple[str, str, str]] = []
+    for day in _selected_dates_or_range(from_day, to_day, selected_days):
+        day_utc = day.isoformat()
+        day_rel = f"{data_prefix}/day_utc={day_utc}"
+        day_dir = root / day_rel
+        if not day_dir.is_dir():
+            if allowed_connector_ids is None:
+                data_gaps.append(_v2_aqi_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
+            else:
+                for connector_id in _expected_connector_ids(allowed_connector_ids):
+                    data_gaps.append(_v2_aqi_gap(
+                        "day_dir_missing",
+                        day_utc=day_utc,
+                        connector_id=connector_id,
+                        expected_path=f"{day_rel}/connector_id={connector_id}",
+                    ))
+            continue
+        connector_dirs = sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir())
+        if allowed_connector_ids is not None:
+            existing_allowed_ids = {
+                cid
+                for p in connector_dirs
+                for cid in [_connector_id_from_dirname(p.name)]
+                if cid is not None and cid in allowed_connector_ids
+            }
+            for connector_id in _expected_connector_ids(allowed_connector_ids):
+                if connector_id not in existing_allowed_ids:
+                    data_gaps.append(_v2_aqi_gap(
+                        "connector_dir_missing",
+                        day_utc=day_utc,
+                        connector_id=connector_id,
+                        expected_path=f"{day_rel}/connector_id={connector_id}",
+                    ))
+            connector_dirs = [
+                p for p in connector_dirs
+                if _connector_dir_allowed(p.name, allowed_connector_ids)
+            ]
+        if not connector_dirs:
+            if allowed_connector_ids is not None:
+                continue
+            data_gaps.append(_v2_aqi_gap("connector_dir_missing", day_utc=day_utc, expected_path=f"{day_rel}/connector_id=*"))
+            continue
+        for connector_dir in connector_dirs:
+            connector_raw = connector_dir.name.split("=", 1)[1]
+            pollutant_dirs = sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir())
+            if not pollutant_dirs:
+                data_gaps.append(_v2_aqi_gap("pollutant_dir_missing", day_utc=day_utc, connector_id=connector_raw, expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*"))
+                continue
+            for pollutant_dir in pollutant_dirs:
+                pollutant = pollutant_dir.name.split("=", 1)[1]
+                expected_parts.append((day_utc, connector_raw, pollutant))
+                checked += 1
+                partition_gap_start = len(data_gaps)
+                part_rel = f"{day_rel}/{connector_dir.name}/{pollutant_dir.name}"
+                manifest_rel = f"{part_rel}/manifest.json"
+                manifest_path = root / manifest_rel
+                local_parquets = list(pollutant_dir.glob("*.parquet"))
+                payload: Any = None
+                if not manifest_path.is_file():
+                    data_gaps.append(_v2_aqi_gap("data_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[str(p.relative_to(root)) for p in local_parquets]))
+                    if local_parquets:
+                        data_gaps.append(_v2_aqi_gap("orphan_parquet_without_manifest", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[str(p.relative_to(root)) for p in local_parquets]))
+                else:
+                    payload, err = _load_json_file(manifest_path)
+                    if err:
+                        data_gaps.append(_v2_aqi_gap("data_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                    elif isinstance(payload, dict):
+                        bad = _validate_v2_aqi_manifest(payload=payload, profile="data", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant)
+                        if bad:
+                            data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=bad))
+                        path_bad = [
+                            field for field, expected in {
+                                "day_utc": day_utc,
+                                "connector_id": str(connector_raw),
+                                "pollutant_code": pollutant,
+                            }.items()
+                            if field not in payload or str(payload.get(field)) != str(expected)
+                        ]
+                        if path_bad:
+                            data_gaps.append(_v2_aqi_gap("data_manifest_path_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=path_bad))
+                        files = _manifest_files_list(payload)
+                        files_valid = files is not None
+                        if not files_valid:
+                            files = []
+                        local_parquet_keys = {
+                            str(p.relative_to(root))
+                            for p in sorted(local_parquets)
+                        }
+                        if files_valid:
+                            listed_keys: list[str] = []
+                            duplicate_keys: set[str] = set()
+                            for entry in files:
+                                if isinstance(entry, dict) and str(entry.get("key") or "").strip():
+                                    key_str = str(entry.get("key")).strip().lstrip("/")
+                                    if key_str in listed_keys:
+                                        duplicate_keys.add(key_str)
+                                    listed_keys.append(key_str)
+                            listed_key_set = set(listed_keys)
+                            if duplicate_keys:
+                                data_gaps.append(_v2_aqi_gap("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=sorted(duplicate_keys)))
+                            for missing_key in sorted(listed_key_set - local_parquet_keys):
+                                data_gaps.append(_v2_aqi_gap("data_manifest_listed_parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=missing_key))
+                            for unlisted_key in sorted(local_parquet_keys - listed_key_set):
+                                data_gaps.append(_v2_aqi_gap("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=unlisted_key))
+                            for entry in files:
+                                key = entry.get("key") if isinstance(entry, dict) else None
+                                if not key:
+                                    data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
+                                    continue
+                                file_path = _resolve_canonical_history_object_key(
+                                    root, str(key), allowed_real_roots=allowed_real_roots,
+                                )
+                                if file_path is None:
+                                    data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
+                                elif not file_path.is_file():
+                                    data_gaps.append(_v2_aqi_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                                elif file_path.stat().st_size <= 0:
+                                    data_gaps.append(_v2_aqi_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                    else:
+                        data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                parquet_stats, parquet_error = _append_actual_parquet_gaps(
+                    data_gaps,
+                    domain="aqilevels",
+                    day_utc=day_utc,
+                    connector_id=connector_raw,
+                    pollutant_code=pollutant,
+                    manifest_rel=manifest_rel,
+                    payload=payload if isinstance(payload, Mapping) else None,
+                    parquet_files=local_parquets,
+                )
+                parquet_readable = parquet_stats is not None and parquet_error is None and bool(local_parquets)
+
+                # Check for null timeseries_id rows in AQI parquet files
+                if parquet_stats and parquet_stats.get("parquet_null_timeseries_id_rows"):
+                    data_gaps.append(_v2_aqi_gap("parquet_null_timeseries_id_rows", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"null_timeseries_count={parquet_stats.get('null_timeseries_count', 0)}"]))
+                for partition_gap in data_gaps[partition_gap_start:]:
+                    if str(partition_gap.get("gap_type") or "").startswith("data_manifest_") or partition_gap.get("gap_type") == "orphan_parquet_without_manifest":
+                        partition_gap["parquet_readable"] = parquet_readable
+                idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
+                idx_path = root / idx_rel
+                if not (root / f"{index_prefix}/day_utc={day_utc}").is_dir():
+                    data_gaps.append(_v2_aqi_gap("index_day_dir_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=f"{index_prefix}/day_utc={day_utc}"))
+                elif not (root / f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}").is_dir():
+                    data_gaps.append(_v2_aqi_gap("index_connector_dir_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}"))
+                elif not (root / f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}").is_dir():
+                    data_gaps.append(_v2_aqi_gap("index_pollutant_dir_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}"))
+                elif not idx_path.is_file():
+                    data_gaps.append(_v2_aqi_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                else:
+                    idx_payload, idx_err = _load_json_file(idx_path)
+                    if idx_err:
+                        data_gaps.append(_v2_aqi_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                    elif not isinstance(idx_payload, dict) or "timeseries_row_counts" not in idx_payload:
+                        data_gaps.append(_v2_aqi_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                    elif not idx_payload.get("timeseries_row_counts"):
+                        data_gaps.append(_v2_aqi_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+            _validate_v2_parent_hierarchy(
+                root=root,
+                data_prefix=data_prefix,
+                day_utc=day_utc,
+                connector_dir=connector_dir,
+                day_dir=day_dir,
+                gaps=data_gaps,
+                domain="aqilevels",
+            )
+        _validate_v2_parent_hierarchy(
+            root=root,
+            data_prefix=data_prefix,
+            day_utc=day_utc,
+            connector_dir=None,
+            day_dir=day_dir,
+            gaps=data_gaps,
+            domain="aqilevels",
+        )
+
+    debug_status = "skipped"
+    if check_aqi_debug:
+        severity = "error" if require_aqi_debug else "warning"
+        for day_utc, connector_raw, pollutant in expected_parts:
+            debug_checked += 1
+            debug_rel = f"{debug_prefix}/day_utc={day_utc}/connector_id={connector_raw}/pollutant_code={pollutant}"
+            manifest_rel = f"{debug_rel}/manifest.json"
+            manifest_path = root / manifest_rel
+            if not manifest_path.is_file():
+                debug_gaps.append(_v2_aqi_gap("debug_manifest_missing", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                continue
+            payload, err = _load_json_file(manifest_path)
+            if err:
+                debug_gaps.append(_v2_aqi_gap("debug_manifest_invalid_json", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                continue
+            bad = _validate_v2_aqi_manifest(payload=payload, profile="debug", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant)
+            bad.extend(
+                field for field, expected in {
+                    "day_utc": day_utc,
+                    "connector_id": str(connector_raw),
+                    "pollutant_code": pollutant,
+                }.items()
+                if field not in payload or str(payload.get(field)) != str(expected)
+            )
+            if bad:
+                debug_gaps.append(_v2_aqi_gap("debug_manifest_schema_mismatch", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=bad))
+            for entry in _manifest_files(payload):
+                key = entry.get("key") if isinstance(entry, dict) else None
+                if key:
+                    file_path = _resolve_canonical_history_object_key(
+                        root, str(key), allowed_real_roots=allowed_real_roots,
+                    )
+                    if file_path is None:
+                        debug_gaps.append(_v2_aqi_gap("debug_manifest_schema_mismatch", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
+                    elif not file_path.is_file():
+                        debug_gaps.append(_v2_aqi_gap("debug_parquet_missing", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+        if any(g.get("severity") == "error" for g in debug_gaps):
+            debug_status = "fail"
+        elif debug_gaps:
+            debug_status = "warning"
+        else:
+            debug_status = "ok"
+
+    observation_coverage_checked = 0
+    for day in _selected_dates_or_range(from_day, to_day, selected_days):
+        day_utc = day.isoformat()
+        for connector_id in _v2_observation_connector_ids_for_aqi_validation(
+            root=root,
+            config=config,
+            day_utc=day_utc,
+            allowed_connector_ids=allowed_connector_ids,
+        ):
+            observation_coverage_checked += 1
+            data_gaps.extend(_v2_aqi_observation_coverage_gaps(
+                root=root,
+                config=config,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                conn=conn,
+            ))
+
+    all_gaps = data_gaps + debug_gaps
+    _classify_v2_gaps(all_gaps)
+    _enrich_v2_aqi_repair_plans(root=root, config=config, gaps=all_gaps)
+    status = "fail" if any(g.get("severity") == "error" for g in all_gaps) else "ok"
+    result = {
+        "status": status,
+        # Integrity detection scans the Dropbox R2-history mirror. The repair
+        # executor separately hydrates live R2 before deciding target state.
+        "storage_source": "dropbox_r2_history_mirror",
+        "checked_partitions": checked,
+        "observation_coverage_checked": observation_coverage_checked,
+        "gap_count": len(data_gaps),
+        "gaps": data_gaps,
+        "repair_plan": build_v2_repair_plan(aqi_gaps=data_gaps, conn=conn),
+        "debug": {
+            "checked": bool(check_aqi_debug),
+            "required": bool(require_aqi_debug),
+            "status": debug_status,
+            "checked_partitions": debug_checked,
+            "gap_count": len(debug_gaps),
+            "gaps": debug_gaps,
+        },
+    }
+    if source_scope is not None:
+        result["source_scope"] = source_scope
+    if log:
+        log.info("v2 AQI integrity done status=%s checked_partitions=%s gaps=%s debug_gaps=%s", status, checked, len(data_gaps), len(debug_gaps))
+        _log_v2_integrity_gaps(log, "aqilevels", data_gaps)
+        _log_v2_integrity_gaps(log, "aqilevels_debug", debug_gaps)
+    return result
+
+
 def run_v2_post_repair_integrity_rechecks(
     *,
     conn: sqlite3.Connection | None = None,
@@ -13351,13 +14118,15 @@ def run_v2_post_repair_integrity_rechecks(
     to_day: str | None,
     allowed_connector_ids: set[int] | None,
     source_scope: dict[str, Any] | None,
+    check_aqi_debug: bool,
+    require_aqi_debug: bool,
     log: logging.Logger,
     selected_days: Iterable[str] | None = None,
     allowed_real_roots: Iterable[Path] = (),
     observation_total_connector_ids: Iterable[int] | None = None,
     observation_total_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Re-run observation Integrity after repair without inspecting AQI R2."""
+    """Re-run v2 integrity checks after repairs so final status reflects reality."""
     post_obs = run_v2_observations_integrity_checks(
         r2_history_root=r2_history_root,
         config=config,
@@ -13373,18 +14142,54 @@ def run_v2_post_repair_integrity_rechecks(
         observation_total_connector_ids=observation_total_connector_ids,
         observation_total_pollutants=observation_total_pollutants,
     )
+    post_aqi = run_v2_aqilevels_integrity_checks(
+        r2_history_root=r2_history_root,
+        config=config,
+        from_day=from_day,
+        to_day=to_day,
+        selected_days=selected_days,
+        allowed_connector_ids=allowed_connector_ids,
+        source_scope=source_scope,
+        conn=conn,
+        check_aqi_debug=check_aqi_debug,
+        require_aqi_debug=require_aqi_debug,
+        log=log,
+        allowed_real_roots=allowed_real_roots,
+    )
+    obs_status = str(post_obs.get("status") or "fail")
+    aqi_status = str(post_aqi.get("status") or "fail")
+    if obs_status == "ok" and aqi_status == "ok":
+        message = "v2 observations fixed and AQI fixed"
+    elif obs_status == "ok":
+        message = "v2 observations fixed; v2 AQI still failing"
+    elif aqi_status == "ok":
+        message = "v2 AQI fixed; v2 observations still failing"
+    else:
+        message = "v2 observations and v2 AQI still failing"
+    status = "ok" if obs_status == "ok" and aqi_status == "ok" else "fail"
     remaining_observation_gaps = list(post_obs.get("gaps") or [])
-    for gap in remaining_observation_gaps:
-        log.warning(
-            "observation post-repair remaining gap details=%s",
-            json.dumps(gap, sort_keys=True, default=str),
-        )
+    remaining_aqi_gaps = list(post_aqi.get("gaps") or [])
+    remaining_aqi_debug_gaps = list((post_aqi.get("debug") or {}).get("gaps") or [])
+    for domain, gaps in (
+        ("observations", remaining_observation_gaps),
+        ("aqilevels", remaining_aqi_gaps),
+        ("aqilevels_debug", remaining_aqi_debug_gaps),
+    ):
+        for gap in gaps:
+            log.warning(
+                "v2 post-repair remaining gap domain=%s details=%s",
+                domain,
+                json.dumps(gap, sort_keys=True, default=str),
+            )
     return {
         "ran": True,
-        "status": str(post_obs.get("status") or "fail"),
-        "message": "observations verified" if not remaining_observation_gaps else "observations still failing",
+        "status": status,
+        "message": message,
         "observations": post_obs,
+        "aqilevels": post_aqi,
         "remaining_observation_gap_count": len(remaining_observation_gaps),
+        "remaining_aqi_gap_count": len(remaining_aqi_gaps),
+        "remaining_aqi_debug_gap_count": len(remaining_aqi_debug_gaps),
     }
 
 
@@ -13950,7 +14755,288 @@ def _merge_notes(existing: str | None, extra: str | None) -> str | None:
     return f"{base} | {add}"
 
 
-def _validate_chunked_v2_observation_repair(
+def _queue_aqi_rebuild(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    connector_id: int,
+    day_utc: str,
+    reason: str,
+    source_mode: str,
+    requested_timeseries_ids: list[int],
+    queue_note: str | None,
+    log: logging.Logger,
+    history_version: str = "v1",
+) -> str:
+    now_iso = fmt_iso(utc_now())
+    merged_ids_csv = _merge_csv_ids(None, requested_timeseries_ids)
+
+    existing = conn.execute(
+        """
+        SELECT id, reason, source_mode, requested_timeseries_ids, notes
+        FROM aqi_rebuild_queue
+        WHERE run_id = ? AND connector_id = ? AND day_utc = ?
+        """,
+        (run_id, connector_id, day_utc),
+    ).fetchone()
+
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO aqi_rebuild_queue (
+              run_id, env_name, history_version, domain, profile,
+              pollutant_code, source_observations_version,
+              connector_id, day_utc,
+              reason, source_mode, status,
+              requested_timeseries_ids, notes,
+              created_at_utc, started_at_utc, finished_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            (
+                run_id,
+                env_name,
+                history_version,
+                "aqilevels",
+                "hourly",
+                None,
+                history_version,
+                connector_id,
+                day_utc,
+                reason,
+                source_mode,
+                "queued",
+                merged_ids_csv,
+                queue_note,
+                now_iso,
+            ),
+        )
+        conn.commit()
+        log.info(
+            "queued AQI rebuild run_id=%s connector_id=%s day=%s reason=%s source_mode=%s",
+            run_id,
+            connector_id,
+            day_utc,
+            reason,
+            source_mode,
+        )
+        return "inserted"
+
+    queue_id, existing_reason, existing_source_mode, existing_ids_csv, existing_notes = existing
+    updated_ids_csv = _merge_csv_ids(existing_ids_csv, requested_timeseries_ids)
+    updated_notes = _merge_notes(existing_notes, queue_note)
+    merged_reason = _merge_reason_tokens(existing_reason, reason)
+    merged_source_mode = existing_source_mode or source_mode
+    conn.execute(
+        """
+        UPDATE aqi_rebuild_queue
+        SET reason = ?,
+            source_mode = ?,
+            requested_timeseries_ids = ?,
+            notes = ?
+        WHERE id = ?
+        """,
+        (merged_reason, merged_source_mode, updated_ids_csv, updated_notes, int(queue_id)),
+    )
+    conn.commit()
+    log.info(
+        "merged AQI rebuild queue row id=%s connector_id=%s day=%s reason=%s",
+        queue_id,
+        connector_id,
+        day_utc,
+        merged_reason,
+    )
+    return "merged"
+
+
+def queue_v2_aqi_rebuilds_from_integrity_gaps(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    env: dict[str, str],
+    v2_aqilevels: Mapping[str, Any],
+    dry_run: bool,
+    run_backfill: bool,
+    log: logging.Logger,
+    allowed_connector_ids: set[int] | None = None,
+    blocked_connector_days: set[tuple[str, int]] | None = None,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "v2_aqi_integrity_rebuild_bridge_ran": False,
+        "v2_aqi_rebuilds_queued_from_integrity": 0,
+        "v2_aqi_rebuilds_skipped_missing_observation_evidence": 0,
+        "v2_aqi_rebuilds_skipped_non_executable_gap": 0,
+        "v2_aqi_rebuilds_skipped_observation_repair_unverified": 0,
+        "planned_v2_aqi_rebuilds_from_integrity": [],
+        "planned_aqi_rebuild_connector_days": [],
+        "queued_aqi_only_connector_days": [],
+        "skipped_v2_aqi_rebuilds_from_integrity": [],
+    }
+    if not run_backfill:
+        return metrics
+
+    grouped: dict[tuple[str, int], dict[str, Any]] = {}
+    for gap in list(v2_aqilevels.get("gaps") or []):
+        gap_type = str(gap.get("gap_type") or "").strip()
+        suggested_repair = gap.get("suggested_repair")
+        suggested_kind = (
+            str(suggested_repair.get("kind") or "").strip()
+            if isinstance(suggested_repair, Mapping) else ""
+        )
+        day_utc = str(gap.get("day_utc") or "").strip()
+        try:
+            connector_id = int(gap.get("connector_id"))
+        except (TypeError, ValueError):
+            connector_id = 0
+        pollutant_code = str(gap.get("pollutant_code") or "").strip()
+        evidence = gap.get("source_evidence") if isinstance(gap.get("source_evidence"), dict) else {}
+        observations_present = evidence.get("v2_observations_present") is True
+
+        skip_reason: str | None = None
+        if (
+            gap_type not in V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES
+            and suggested_kind != V2_AQI_OBS_REBUILD_KIND
+        ):
+            skip_reason = "non_executable_gap_type"
+            metrics["v2_aqi_rebuilds_skipped_non_executable_gap"] += 1
+        elif not day_utc or connector_id <= 0:
+            skip_reason = "missing_connector_day"
+            metrics["v2_aqi_rebuilds_skipped_non_executable_gap"] += 1
+        elif allowed_connector_ids is not None and connector_id not in allowed_connector_ids:
+            skip_reason = "outside_source_scope"
+            metrics["v2_aqi_rebuilds_skipped_non_executable_gap"] += 1
+        elif (day_utc, connector_id) in (blocked_connector_days or set()):
+            skip_reason = "observation_repair_not_verified"
+            metrics["v2_aqi_rebuilds_skipped_observation_repair_unverified"] += 1
+        elif not observations_present:
+            skip_reason = "missing_v2_observation_evidence"
+            metrics["v2_aqi_rebuilds_skipped_missing_observation_evidence"] += 1
+
+        if skip_reason is not None:
+            metrics["skipped_v2_aqi_rebuilds_from_integrity"].append({
+                "day_utc": day_utc or None,
+                "connector_id": connector_id if connector_id > 0 else None,
+                "pollutant_code": pollutant_code or None,
+                "gap_type": gap_type or None,
+                "reason": skip_reason,
+            })
+            continue
+
+        key = (day_utc, connector_id)
+        entry = grouped.setdefault(key, {
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "gap_types": set(),
+            "pollutants": set(),
+        })
+        entry["gap_types"].add(gap_type)
+        if pollutant_code:
+            entry["pollutants"].add(pollutant_code)
+
+    queued_keys: set[tuple[str, int]] = set()
+    planned_rows: list[dict[str, Any]] = []
+    for (day_utc, connector_id), entry in sorted(grouped.items()):
+        gap_types = sorted(entry["gap_types"])
+        pollutants = sorted(entry["pollutants"])
+        try:
+            day_obj = dt.date.fromisoformat(day_utc)
+        except ValueError:
+            metrics["skipped_v2_aqi_rebuilds_from_integrity"].append({
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "gap_types": gap_types,
+                "reason": "invalid_day",
+            })
+            continue
+        command = _planned_aqi_rebuild_command(
+            env,
+            connector_id,
+            day_obj,
+            history_version="v2",
+            env_name=env_name,
+        )
+        queue_note = (
+            "source=v2_aqi_integrity "
+            f"gap_types={','.join(gap_types)} "
+            f"pollutants={','.join(pollutants) if pollutants else '<unknown>'} "
+            "history_version=v2"
+        )
+        row = {
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "reasons": [AQI_INTEGRITY_OBS_COVERAGE_REASON],
+            "gap_types": gap_types,
+            "pollutants": pollutants,
+            "notes": queue_note,
+            "history_version": "v2",
+            "source_mode": "live_r2",
+            "planned_command": command,
+        }
+        planned_rows.append(row)
+        metrics["planned_v2_aqi_rebuilds_from_integrity"].append(command)
+        if dry_run:
+            queued_keys.add((day_utc, connector_id))
+            continue
+
+        action = _queue_aqi_rebuild(
+            conn=conn,
+            run_id=run_id,
+            env_name=env_name,
+            connector_id=connector_id,
+            day_utc=day_utc,
+            reason=AQI_INTEGRITY_OBS_COVERAGE_REASON,
+            source_mode="live_r2",
+            requested_timeseries_ids=[],
+            queue_note=queue_note,
+            log=log,
+            history_version="v2",
+        )
+        if action in {"inserted", "merged"}:
+            queued_keys.add((day_utc, connector_id))
+
+    metrics["v2_aqi_integrity_rebuild_bridge_ran"] = True
+    metrics["v2_aqi_rebuilds_queued_from_integrity"] = len(queued_keys)
+    metrics["planned_aqi_rebuild_connector_days"] = planned_rows
+    metrics["queued_aqi_only_connector_days"] = planned_rows
+    log.info(
+        "v2 AQI integrity rebuild bridge done planned=%s queued=%s skipped_missing_obs=%s skipped_non_executable=%s",
+        len(planned_rows),
+        metrics["v2_aqi_rebuilds_queued_from_integrity"],
+        metrics["v2_aqi_rebuilds_skipped_missing_observation_evidence"],
+        metrics["v2_aqi_rebuilds_skipped_non_executable_gap"],
+    )
+    return metrics
+
+
+def _queue_aqi_rebuild_from_obs_repair(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    connector_id: int,
+    day_utc: str,
+    requested_timeseries_ids: list[int],
+    queue_note: str | None,
+    log: logging.Logger,
+    history_version: str = "v1",
+) -> str:
+    return _queue_aqi_rebuild(
+        conn=conn,
+        run_id=run_id,
+        env_name=env_name,
+        connector_id=connector_id,
+        day_utc=day_utc,
+        reason="obs_repaired",
+        source_mode="combined_local",
+        requested_timeseries_ids=requested_timeseries_ids,
+        queue_note=queue_note,
+        log=log,
+        history_version=history_version,
+    )
+
+
+def _validate_chunked_v2_observation_repair_for_aqi(
     *,
     chunk_count: int,
     chunk_results: list[dict[str, Any]],
@@ -14025,71 +15111,6 @@ def _repo_root_for_integrity_script(env: Mapping[str, str] | None = None) -> Pat
     return path
 
 
-INTEGRITY_TARGET_WRITER_GIT_SHA_ENV = (
-    "UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA"
-)
-_FULL_LOWER_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-
-
-def resolve_and_pin_integrity_target_writer_git_sha(
-    env: dict[str, str],
-) -> str:
-    """Resolve the executing ops checkout once and pin it for every child."""
-    repo_root = _repo_root_for_integrity_script(env)
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(
-            f"cannot resolve Integrity target writer Git SHA from {repo_root}: {exc}"
-        ) from exc
-    resolved = completed.stdout.strip().lower()
-    if completed.returncode != 0 or not _FULL_LOWER_GIT_SHA_RE.fullmatch(resolved):
-        detail = (completed.stderr or completed.stdout).strip()
-        raise RuntimeError(
-            "cannot establish Integrity target writer Git SHA from the ops "
-            f"repository {repo_root}: {detail or 'invalid git rev-parse output'}"
-        )
-    try:
-        worktree = subprocess.run(
-            [
-                "git", "-C", str(repo_root), "status", "--porcelain",
-                "--untracked-files=normal",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(
-            "fixed-v3 Integrity writer provenance requires a clean ops "
-            f"repository worktree: cannot inspect {repo_root}: {exc}"
-        ) from exc
-    if worktree.returncode != 0 or worktree.stdout:
-        detail = (worktree.stderr or worktree.stdout).strip()
-        raise RuntimeError(
-            "fixed-v3 Integrity writer provenance requires a clean ops "
-            f"repository worktree: {repo_root}: {detail or 'git status failed'}"
-        )
-    inherited = str(os.environ.get(INTEGRITY_TARGET_WRITER_GIT_SHA_ENV, "")).strip()
-    if inherited and (
-        not _FULL_LOWER_GIT_SHA_RE.fullmatch(inherited) or inherited != resolved
-    ):
-        raise RuntimeError(
-            f"{INTEGRITY_TARGET_WRITER_GIT_SHA_ENV} must exactly match the "
-            "full lower-case Git SHA of the executing ops repository"
-        )
-    os.environ[INTEGRITY_TARGET_WRITER_GIT_SHA_ENV] = resolved
-    env[INTEGRITY_TARGET_WRITER_GIT_SHA_ENV] = resolved
-    return resolved
-
-
 def _v2_observation_connector_manifest_key(
     *,
     day_utc: str,
@@ -14102,15 +15123,6 @@ def _v2_observation_connector_manifest_key(
         f"{config.observations_data_prefix.strip('/')}"
         f"/day_utc={day_utc}/connector_id={int(connector_id)}/manifest.json"
     )
-
-
-def _load_json_file(path: Path) -> tuple[Any | None, str | None]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8")), None
-    except json.JSONDecodeError:
-        return None, "invalid_json"
-    except OSError:
-        return None, "unreadable"
 
 
 def _read_json_manifest_for_guard(
@@ -14476,6 +15488,341 @@ def _v2_partition_manifest_rel(
     )
 
 
+def _v2_observation_pollutant_dirs_for_aqi_validation(
+    *,
+    root: Path,
+    config: HistoryPathConfig,
+    day_utc: str,
+    connector_id: int,
+) -> list[Path]:
+    obs_connector_dir = (
+        root
+        / config.observations_data_prefix.strip("/")
+        / f"day_utc={day_utc}"
+        / f"connector_id={int(connector_id)}"
+    )
+    if not obs_connector_dir.is_dir():
+        return []
+    return sorted(p for p in obs_connector_dir.glob("pollutant_code=*") if p.is_dir())
+
+
+def _v2_observation_connector_ids_for_aqi_validation(
+    *,
+    root: Path,
+    config: HistoryPathConfig,
+    day_utc: str,
+    allowed_connector_ids: set[int] | None,
+) -> list[int]:
+    obs_day_dir = root / config.observations_data_prefix.strip("/") / f"day_utc={day_utc}"
+    if not obs_day_dir.is_dir():
+        return []
+    connector_ids: set[int] = set()
+    for connector_dir in sorted(p for p in obs_day_dir.glob("connector_id=*") if p.is_dir()):
+        parsed = _connector_id_from_dirname(connector_dir.name)
+        if parsed is None:
+            continue
+        if allowed_connector_ids is not None and parsed not in allowed_connector_ids:
+            continue
+        connector_ids.add(parsed)
+    return sorted(connector_ids)
+
+
+def _active_aqi_eligible_pollutants_for_connector(
+    conn: sqlite3.Connection | None,
+    *,
+    connector_id: int,
+) -> set[str] | None:
+    """Return authoritative AQI-eligible codes, or None to fail closed."""
+    if conn is None or not _table_exists(conn, "core_observed_property_mappings_snapshot"):
+        return None
+    active_count = conn.execute(
+        "SELECT COUNT(*) FROM core_observed_property_mappings_snapshot "
+        "WHERE connector_id = ? AND is_active = 1",
+        (int(connector_id),),
+    ).fetchone()
+    if not active_count or int(active_count[0] or 0) <= 0:
+        return None
+    rows = conn.execute(
+        """
+        SELECT DISTINCT observed_property_code
+        FROM core_observed_property_mappings_snapshot
+        WHERE connector_id = ?
+          AND is_active = 1
+          AND is_aqi_eligible = 1
+          AND observed_property_code IS NOT NULL
+          AND observed_property_code != ''
+        """,
+        (int(connector_id),),
+    ).fetchall()
+    normalized: set[str] = set()
+    for row in rows:
+        compact = re.sub(r"[^a-z0-9]+", "", str(row[0] or "").strip().lower())
+        if compact in {"ino2", "no2"}:
+            normalized.add("no2")
+        elif compact in {"ipm25", "pm25", "pm2"}:
+            normalized.add("pm25")
+        elif compact in {"ipm10", "pm10"}:
+            normalized.add("pm10")
+    return normalized
+
+
+def _v2_aqi_expected_hour_keys(
+    stats: Mapping[str, Any] | None,
+    *,
+    pollutant_code: str,
+) -> dict[int, set[int]]:
+    """Return the UTC hour identities the v2 AQI writer must emit.
+
+    The writer accepts only NO2, PM2.5 and PM10 source rows with a finite,
+    non-negative value, then emits one record per timeseries/UTC-hour.  PM
+    DAQI may be insufficient before a 24-hour window is available, but the
+    hourly row is still emitted for its EAQI result and diagnostics.
+    """
+    if pollutant_code not in V2_AQI_SUPPORTED_POLLUTANTS or not stats:
+        return {}
+    raw = stats.get("timeseries_hour_keys")
+    if not isinstance(raw, Mapping):
+        return {}
+    output: dict[int, set[int]] = {}
+    for raw_timeseries_id, raw_hour_keys in raw.items():
+        try:
+            timeseries_id = int(raw_timeseries_id)
+        except (TypeError, ValueError):
+            continue
+        if timeseries_id <= 0 or not isinstance(raw_hour_keys, (list, tuple, set)):
+            continue
+        hour_keys: set[int] = set()
+        for raw_hour_key in raw_hour_keys:
+            try:
+                hour_keys.add(int(raw_hour_key))
+            except (TypeError, ValueError):
+                continue
+        if hour_keys:
+            output[timeseries_id] = hour_keys
+    return output
+
+
+def _v2_aqi_missing_hour_keys(
+    expected_hours: Mapping[int, set[int]],
+    actual_hours: Mapping[int, set[int]],
+) -> dict[int, list[int]]:
+    """Return missing v2 AQI UTC-hour identities by timeseries."""
+    return {
+        timeseries_id: sorted(expected_hour_keys - actual_hours.get(timeseries_id, set()))
+        for timeseries_id, expected_hour_keys in expected_hours.items()
+        if expected_hour_keys - actual_hours.get(timeseries_id, set())
+    }
+
+
+def _v2_aqi_observation_coverage_gaps(
+    *,
+    root: Path,
+    config: HistoryPathConfig,
+    day_utc: str,
+    connector_id: int,
+    conn: sqlite3.Connection | None = None,
+    missing_manifest_gap_type: str = "aqi_manifest_missing_after_obs_repair",
+    missing_hours_gap_type: str = "aqi_expected_hours_missing",
+    missing_observations_gap_type: str | None = None,
+    invalid_gap_type: str = "aqi_post_rebuild_validation_failed",
+) -> list[dict[str, Any]]:
+    gaps: list[dict[str, Any]] = []
+    obs_prefix = config.observations_data_prefix.strip("/")
+    aqi_prefix = config.aqilevels_hourly_data_prefix.strip("/")
+    obs_pollutant_dirs = _v2_observation_pollutant_dirs_for_aqi_validation(
+        root=root,
+        config=config,
+        day_utc=day_utc,
+        connector_id=connector_id,
+    )
+    if not obs_pollutant_dirs:
+        if missing_observations_gap_type:
+            expected = f"{obs_prefix}/day_utc={day_utc}/connector_id={int(connector_id)}/pollutant_code=*"
+            gaps.append(_v2_aqi_gap(
+                missing_observations_gap_type,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                expected_path=expected,
+                related_paths=["no v2 observation pollutant manifests found"],
+            ))
+        return gaps
+
+    eligible_pollutants = _active_aqi_eligible_pollutants_for_connector(
+        conn,
+        connector_id=connector_id,
+    )
+
+    for obs_dir in obs_pollutant_dirs:
+        pollutant = obs_dir.name.split("=", 1)[1]
+        if pollutant not in V2_AQI_SUPPORTED_POLLUTANTS:
+            continue
+        if eligible_pollutants is not None and pollutant not in eligible_pollutants:
+            continue
+        obs_manifest_rel = _v2_partition_manifest_rel(
+            prefix=obs_prefix,
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant,
+        )
+        obs_payload, obs_err = _load_json_file(root / obs_manifest_rel)
+        if obs_err or not isinstance(obs_payload, dict):
+            gaps.append(_v2_aqi_gap(
+                invalid_gap_type,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant,
+                expected_path=obs_manifest_rel,
+                related_paths=[f"observation_manifest_{obs_err or 'not_object'}"],
+            ))
+            continue
+        obs_files = sorted(p for p in obs_dir.glob("*.parquet") if p.is_file())
+        obs_stats, obs_error = _read_parquet_partition_stats(
+            obs_files,
+            day_utc=day_utc,
+        )
+        if obs_error:
+            gaps.append(_v2_aqi_gap(
+                invalid_gap_type,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant,
+                expected_path=obs_manifest_rel,
+                related_paths=[f"observation_hour_read_{obs_error}"],
+            ))
+            continue
+        expected_hours = _v2_aqi_expected_hour_keys(obs_stats, pollutant_code=pollutant)
+        if not expected_hours:
+            continue
+
+        aqi_manifest_rel = _v2_partition_manifest_rel(
+            prefix=aqi_prefix,
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant,
+        )
+        aqi_manifest_path = root / aqi_manifest_rel
+        if not aqi_manifest_path.is_file():
+            gaps.append(_v2_aqi_gap(
+                missing_manifest_gap_type,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant,
+                expected_path=aqi_manifest_rel,
+                related_paths=[obs_manifest_rel, f"expected_aqi_hours={sum(map(len, expected_hours.values()))}"],
+            ))
+            continue
+        aqi_payload, aqi_err = _load_json_file(aqi_manifest_path)
+        if aqi_err or not isinstance(aqi_payload, dict):
+            gaps.append(_v2_aqi_gap(
+                invalid_gap_type,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant,
+                expected_path=aqi_manifest_rel,
+                related_paths=[obs_manifest_rel, f"aqi_manifest_{aqi_err or 'not_object'}"],
+            ))
+            continue
+
+        aqi_files = sorted(p for p in aqi_manifest_path.parent.glob("*.parquet") if p.is_file())
+        aqi_stats, aqi_error = _read_parquet_partition_stats(
+            aqi_files,
+            day_utc=day_utc,
+        )
+        if aqi_error:
+            gaps.append(_v2_aqi_gap(
+                invalid_gap_type,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant,
+                expected_path=aqi_manifest_rel,
+                related_paths=[f"aqi_hour_read_{aqi_error}"],
+            ))
+            continue
+        actual_hours = _v2_aqi_expected_hour_keys(aqi_stats, pollutant_code=pollutant)
+        missing_reasons: list[str] = []
+        for timeseries_id, missing_hour_keys in sorted(
+            _v2_aqi_missing_hour_keys(expected_hours, actual_hours).items()
+        ):
+            missing_reasons.extend(
+                f"timeseries_id={timeseries_id}:utc_hour_epoch={hour_key}"
+                for hour_key in missing_hour_keys[:25 - len(missing_reasons)]
+            )
+            if len(missing_reasons) >= 25:
+                break
+        if missing_reasons:
+            gaps.append(_v2_aqi_gap(
+                missing_hours_gap_type,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant,
+                expected_path=aqi_manifest_rel,
+                related_paths=[obs_manifest_rel, *missing_reasons],
+            ))
+    return gaps
+
+
+def _verify_v2_observation_manifest_content_for_aqi(
+    *,
+    day_utc: str,
+    connector_id: int,
+    env: Mapping[str, str],
+    run_state: Mapping[str, Any] | None,
+    expected_timeseries_row_counts: Mapping[int, int],
+    expected_pollutant_codes: Iterable[str],
+    expected_min_rows: int,
+) -> tuple[bool, str | None, dict[str, Any]]:
+    manifest_key = _v2_observation_connector_manifest_key(
+        day_utc=day_utc,
+        connector_id=connector_id,
+        env=env,
+    )
+    payload, source, err = _read_json_manifest_for_guard(
+        manifest_key=manifest_key,
+        run_state=run_state,
+    )
+    details: dict[str, Any] = {
+        "manifest_key": manifest_key,
+        "manifest_source": source,
+        "expected_min_rows": int(expected_min_rows or 0),
+        "expected_timeseries_count": len(expected_timeseries_row_counts),
+        "expected_pollutant_codes": sorted({
+            str(code).strip()
+            for code in expected_pollutant_codes
+            if str(code or "").strip()
+        }),
+    }
+    if err is not None:
+        details["error"] = err
+        return False, f"manifest_read_failed:{err}", details
+    if not isinstance(payload, dict):
+        return False, "manifest_not_object", details
+    if str(payload.get("history_version") or "v2") != "v2":
+        return False, "manifest_history_version_mismatch", details
+    if str(payload.get("domain") or "observations") != "observations":
+        return False, "manifest_domain_mismatch", details
+    if "day_utc" in payload and str(payload.get("day_utc")) != day_utc:
+        return False, "manifest_day_mismatch", details
+    if "connector_id" in payload:
+        try:
+            manifest_connector_id = int(payload.get("connector_id") or 0)
+        except (TypeError, ValueError):
+            manifest_connector_id = 0
+        if manifest_connector_id != int(connector_id):
+            return False, "manifest_connector_mismatch", details
+
+    manifest_summary, mismatches = _v2_observation_manifest_evidence_mismatches(
+        payload,
+        expected_source_row_count=int(expected_min_rows or 0),
+        expected_timeseries_row_counts=expected_timeseries_row_counts,
+        expected_pollutant_codes=details["expected_pollutant_codes"],
+    )
+    details["manifest"] = manifest_summary
+    if mismatches:
+        details["mismatches"] = mismatches[:25]
+        return False, f"manifest_{mismatches[0]['field']}_mismatch", details
+    return True, None, details
+
+
 def _timeseries_ids_for_v2_observation_gap(
     conn: sqlite3.Connection,
     *,
@@ -14581,6 +15928,774 @@ def _sos_day_scoped_expected_counts(
                 pollutants.add(pollutant)
                 break
     return counts, sorted(pollutants)
+
+
+def run_cross_check_backfills(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    run_compact: str,
+    env: dict[str, str],
+    source_filter: str,
+    sos_metrics: Mapping[str, Any] | None,
+    dry_run: bool,
+    run_backfill: bool,
+    limits: LimitTracker,
+    log: logging.Logger,
+    history_version: str = "v1",
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "observation_backfill_candidate_days": 0,
+        "observation_backfill_candidate_timeseries_ids": 0,
+        "observation_backfills_attempted": 0,
+        "observation_backfills_ok": 0,
+        "observation_backfills_failed": 0,
+        "aqi_rebuilds_queued_from_obs_repair": 0,
+        "source_change_candidate_days": 0,
+        "source_change_candidate_timeseries_ids": 0,
+        "planned_observation_backfills": [],
+        "planned_aqi_rebuilds": [],
+        "planned_aqi_rebuild_connector_days": [],
+        # Backward-compatible aliases used by existing reports/notes.
+        "backfill_candidate_days": 0,
+        "backfill_candidate_timeseries_ids": 0,
+        "backfills_attempted": 0,
+        "backfills_ok": 0,
+        "backfills_failed": 0,
+        "planned_backfills": [],
+        "cross_check_observation_repair_skipped_reason": None,
+    }
+    if not run_backfill:
+        return metrics
+    if str(history_version).strip().lower() == "v2":
+        metrics["cross_check_observation_repair_skipped_reason"] = (
+            "legacy cross_checks repair is not used in v2-only mode; "
+            "v2 observation gaps are handled by run_v2_gap_backfills"
+        )
+        log.info(
+            "cross-check observation repair: skipped legacy planner in v2-only mode; "
+            "v2 gap repair planner will handle observation gaps"
+        )
+        return metrics
+
+    cross_check_targets = _collect_cross_check_backfill_targets(
+        conn,
+        run_id=run_id,
+        source_filter=source_filter,
+    )
+    source_change_targets: dict[tuple[str, int], list[int]] = {}
+    metrics["source_change_candidate_days"] = len(
+        {day_iso for day_iso, _ in source_change_targets.keys()}
+    )
+    metrics["source_change_candidate_timeseries_ids"] = sum(
+        len(ids) for ids in source_change_targets.values()
+    )
+    targets_by_day_connector, origins_by_day_connector = _merge_observation_repair_targets(
+        cross_check_targets,
+        source_change_targets,
+    )
+    metrics["observation_backfill_candidate_days"] = len(
+        {day_iso for day_iso, _ in targets_by_day_connector.keys()}
+    )
+    metrics["observation_backfill_candidate_timeseries_ids"] = sum(
+        len(ids) for ids in targets_by_day_connector.values()
+    )
+    metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
+    metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
+    if not targets_by_day_connector:
+        log.info(
+            "cross-check observation repair: no candidates (cross-check or source-change) for run_id=%s source=%s",
+            run_id,
+            source_filter,
+        )
+        return metrics
+
+    backfill_log_dir = (
+        Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
+    )
+    queued_aqi_rebuild_keys: set[tuple[str, int]] = set()
+    for (day_iso, connector_id), ts_ids in sorted(targets_by_day_connector.items()):
+        origins = origins_by_day_connector.get((day_iso, connector_id), ["cross_check"])
+        day_obj = dt.date.fromisoformat(day_iso)
+        cmd = _planned_backfill_command(
+            env,
+            ts_ids,
+            day_obj,
+            connector_ids=[connector_id],
+            output_scope="observations_only",
+            env_name=env_name,
+        )
+        metrics["planned_observation_backfills"].append(cmd)
+        metrics["planned_backfills"].append(cmd)
+        log.info("cross-check planned observation repair: %s", cmd)
+        queue_entry = (
+            f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired "
+            f"source_mode=live_r2 origins={','.join(origins)} "
+            f"timeseries_ids={','.join(str(ts_id) for ts_id in ts_ids)}"
+        )
+        metrics["planned_aqi_rebuilds"].append(queue_entry)
+        metrics["planned_aqi_rebuild_connector_days"].append({
+            "day_utc": day_iso,
+            "connector_id": connector_id,
+            "reasons": ["obs_repaired"],
+            "notes": queue_entry,
+        })
+        if dry_run:
+            queued_aqi_rebuild_keys.add((day_iso, connector_id))
+            continue
+        if limits.should_stop():
+            log.warning(
+                "cross-check observation repair: stopping early due to limit=%s",
+                limits.stopped_for,
+            )
+            break
+        chunks = _chunk_timeseries_ids(ts_ids)
+        try_unchunked_first = _is_truthy(
+            os.environ.get(_TRY_UNCHUNKED_FIRST_ENV_VAR, "1"),
+        )
+        if len(chunks) > 1 and try_unchunked_first:
+            log.info(
+                "cross-check observation repair: trying unchunked first day=%s connector=%s total_timeseries_ids=%s",
+                day_iso,
+                connector_id,
+                len(ts_ids),
+            )
+            unchunked_label = f"cc_day_{day_iso}_connector_{connector_id}_unchunked_first"
+            bf = run_narrow_backfill(
+                wrapper_path=resolve_integrity_backfill_wrapper(),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
+                timeseries_ids=ts_ids,
+                connector_ids=[connector_id],
+                day=day_obj,
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=unchunked_label,
+                output_scope="observations_only",
+            )
+            metrics["observation_backfills_attempted"] += 1
+            metrics["backfills_attempted"] += 1
+            if bf["status"] == "ok":
+                metrics["observation_backfills_ok"] += 1
+                metrics["backfills_ok"] += 1
+                queued = _queue_aqi_rebuild_from_obs_repair(
+                    conn=conn,
+                    run_id=run_id,
+                    env_name=env_name,
+                    connector_id=connector_id,
+                    day_utc=day_iso,
+                    requested_timeseries_ids=ts_ids,
+                    queue_note=(
+                        f"queued_from_cross_check day={day_iso} connector_id={connector_id} origins={','.join(origins)}"
+                    ),
+                    log=log,
+                )
+                if queued in {"inserted", "merged"}:
+                    if queued == "inserted":
+                        queued_aqi_rebuild_keys.add((day_iso, connector_id))
+                continue
+            metrics["observation_backfills_failed"] += 1
+            metrics["backfills_failed"] += 1
+            log.warning(
+                "cross-check observation repair: unchunked attempt failed; falling back to chunked mode day=%s connector=%s status=%s",
+                day_iso,
+                connector_id,
+                bf.get("status"),
+            )
+        if len(chunks) > 1:
+            log.info(
+                "cross-check observation repair: chunking day=%s connector=%s "
+                "total_timeseries_ids=%s chunks=%s",
+                day_iso, connector_id, len(ts_ids), len(chunks),
+            )
+        stage_root = (
+            backfill_log_dir
+            / "_integrity_proposal"
+            / f"run_{run_id}"
+            / f"day_{day_iso}"
+            / f"connector_{connector_id}"
+        )
+        if len(chunks) > 1:
+            shutil.rmtree(stage_root, ignore_errors=True)
+        all_chunks_ok = True
+        for chunk_index, chunk_ids in enumerate(chunks, start=1):
+            chunk_label = (
+                f"cc_day_{day_iso}_connector_{connector_id}" if len(chunks) == 1
+                else f"cc_day_{day_iso}_connector_{connector_id}_chunk_{chunk_index}_of_{len(chunks)}"
+            )
+            extra_env: dict[str, str] | None = None
+            if len(chunks) > 1:
+                extra_env = {
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": (
+                        "true" if chunk_index == len(chunks) else "false"
+                    ),
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": (
+                        "true" if chunk_index == len(chunks) else "false"
+                    ),
+                }
+            bf = run_narrow_backfill(
+                wrapper_path=resolve_integrity_backfill_wrapper(),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
+                timeseries_ids=chunk_ids,
+                connector_ids=[connector_id],
+                day=day_obj,
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=chunk_label,
+                output_scope="observations_only",
+                extra_env=extra_env,
+            )
+            metrics["observation_backfills_attempted"] += 1
+            metrics["backfills_attempted"] += 1
+            if bf["status"] == "ok":
+                metrics["observation_backfills_ok"] += 1
+                metrics["backfills_ok"] += 1
+            else:
+                metrics["observation_backfills_failed"] += 1
+                metrics["backfills_failed"] += 1
+                all_chunks_ok = False
+        if all_chunks_ok:
+            queued = _queue_aqi_rebuild_from_obs_repair(
+                conn=conn,
+                run_id=run_id,
+                env_name=env_name,
+                connector_id=connector_id,
+                day_utc=day_iso,
+                requested_timeseries_ids=ts_ids,
+                queue_note=(
+                    f"queued_from_cross_check day={day_iso} connector_id={connector_id} origins={','.join(origins)}"
+                ),
+                log=log,
+            )
+            if queued in {"inserted", "merged"}:
+                if queued == "inserted":
+                    queued_aqi_rebuild_keys.add((day_iso, connector_id))
+
+    metrics["aqi_rebuilds_queued_from_obs_repair"] = len(queued_aqi_rebuild_keys)
+
+    log.info(
+        "cross-check observation-repair: candidate_days=%s candidate_timeseries_ids=%s source_change_days=%s source_change_timeseries_ids=%s attempted=%s ok=%s failed=%s queued_aqi_rebuilds=%s",
+        metrics["observation_backfill_candidate_days"],
+        metrics["observation_backfill_candidate_timeseries_ids"],
+        metrics["source_change_candidate_days"],
+        metrics["source_change_candidate_timeseries_ids"],
+        metrics["observation_backfills_attempted"],
+        metrics["observation_backfills_ok"],
+        metrics["observation_backfills_failed"],
+        metrics["aqi_rebuilds_queued_from_obs_repair"],
+    )
+    return metrics
+
+
+def _safe_non_negative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _load_obs_repaired_queue_keys(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+) -> set[tuple[str, int]]:
+    keys: set[tuple[str, int]] = set()
+    rows = conn.execute(
+        """
+        SELECT day_utc, connector_id, reason
+        FROM aqi_rebuild_queue
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchall()
+    for day_utc, connector_id, reason in rows:
+        if "obs_repaired" not in _parse_reason_tokens(reason):
+            continue
+        if not day_utc:
+            continue
+        try:
+            parsed_connector_id = int(connector_id)
+        except (TypeError, ValueError):
+            continue
+        if parsed_connector_id <= 0:
+            continue
+        keys.add((str(day_utc), parsed_connector_id))
+    return keys
+
+
+def _load_previous_aqi_rebuild_status(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    env_name: str,
+    connector_id: int,
+    day_utc: str,
+) -> tuple[str | None, int | None]:
+    row = conn.execute(
+        """
+        SELECT status, run_id
+        FROM aqi_rebuild_queue
+        WHERE env_name = ?
+          AND connector_id = ?
+          AND day_utc = ?
+          AND run_id <> ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (env_name, connector_id, day_utc, run_id),
+    ).fetchone()
+    if not row:
+        return None, None
+    status = str(row[0]).strip() if row[0] is not None else None
+    prev_run_id = int(row[1]) if row[1] is not None else None
+    return status, prev_run_id
+
+
+def run_aqi_health_checks(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    env_name: str,
+    r2_history_root: str | None,
+    r2_aqilevels_prefix: str | None,
+    dry_run: bool,
+    run_backfill: bool,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "aqi_health_ran": False,
+        "aqi_health_skipped_reason": None,
+        "aqi_health_connector_days_checked": 0,
+        "aqi_health_rebuilds_queued": 0,
+        "aqi_health_skipped_already_obs_repaired": 0,
+        "aqi_health_manifest_missing": 0,
+        "aqi_health_manifest_stale": 0,
+        "aqi_health_manifest_empty": 0,
+        "aqi_health_previous_rebuild_failed": 0,
+        "queued_aqi_only_connector_days": [],
+    }
+    if not run_backfill:
+        metrics["aqi_health_skipped_reason"] = "skipped because --run-backfill not set"
+        return metrics
+    if not r2_history_root:
+        metrics["aqi_health_skipped_reason"] = "UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set"
+        return metrics
+    root = Path(r2_history_root)
+    if not root.is_dir():
+        metrics["aqi_health_skipped_reason"] = f"R2 history root is not a directory: {root}"
+        return metrics
+    aqilevels_prefix = str(r2_aqilevels_prefix or R2_AQILEVELS_PREFIX).strip().strip("/")
+    if not aqilevels_prefix:
+        metrics["aqi_health_skipped_reason"] = "AQI history prefix is empty"
+        return metrics
+
+    obs_repaired_keys = _load_obs_repaired_queue_keys(conn, run_id=run_id)
+    candidate_rows = conn.execute(
+        """
+        SELECT
+          day_utc,
+          connector_id,
+          SUM(CASE WHEN source_row_count > 0 THEN source_row_count ELSE 0 END) AS source_row_count
+        FROM cross_checks
+        WHERE run_id = ?
+          AND day_utc IS NOT NULL
+        GROUP BY day_utc, connector_id
+        HAVING SUM(CASE WHEN source_row_count > 0 THEN source_row_count ELSE 0 END) > 0
+        ORDER BY day_utc, connector_id
+        """,
+        (run_id,),
+    ).fetchall()
+
+    queued_keys: set[tuple[str, int]] = set()
+    queued_rows: list[dict[str, Any]] = []
+
+    for day_utc, connector_id, source_row_count in candidate_rows:
+        if not day_utc:
+            continue
+        day_iso = str(day_utc)
+        try:
+            parsed_connector_id = int(connector_id)
+        except (TypeError, ValueError):
+            continue
+        if parsed_connector_id <= 0:
+            continue
+
+        key = (day_iso, parsed_connector_id)
+        if key in obs_repaired_keys:
+            metrics["aqi_health_skipped_already_obs_repaired"] += 1
+            continue
+
+        metrics["aqi_health_connector_days_checked"] += 1
+
+        reasons: set[str] = set()
+        notes: list[str] = []
+
+        previous_status, previous_run_id = _load_previous_aqi_rebuild_status(
+            conn,
+            run_id=run_id,
+            env_name=env_name,
+            connector_id=parsed_connector_id,
+            day_utc=day_iso,
+        )
+        if previous_status in {"failed", "queued", "running"}:
+            reasons.add("previous_rebuild_failed_or_pending")
+            notes.append(
+                f"previous_queue_status={previous_status} previous_run_id={previous_run_id}"
+            )
+            metrics["aqi_health_previous_rebuild_failed"] += 1
+
+        manifest_path = (
+            root
+            / aqilevels_prefix
+            / f"day_utc={day_iso}"
+            / f"connector_id={parsed_connector_id}"
+            / "manifest.json"
+        )
+        payload: dict[str, Any] | None = None
+        if not manifest_path.is_file():
+            reasons.add("manifest_missing")
+            notes.append(f"manifest_missing:{manifest_path}")
+            metrics["aqi_health_manifest_missing"] += 1
+        else:
+            try:
+                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    payload = raw
+                else:
+                    reasons.add("manifest_stale")
+                    notes.append("manifest_invalid:root_not_object")
+                    metrics["aqi_health_manifest_stale"] += 1
+            except Exception as exc:
+                reasons.add("manifest_stale")
+                notes.append(f"manifest_invalid_json:{exc}")
+                metrics["aqi_health_manifest_stale"] += 1
+
+        if payload is not None:
+            schema_name = str(payload.get("history_schema_name") or "").strip()
+            schema_version = _safe_non_negative_int(payload.get("history_schema_version"))
+            writer_version = str(payload.get("writer_version") or "").strip()
+            if (
+                schema_name != AQILEVELS_EXPECTED_HISTORY_SCHEMA_NAME
+                or schema_version != AQILEVELS_EXPECTED_HISTORY_SCHEMA_VERSION
+                or writer_version != AQILEVELS_EXPECTED_WRITER_VERSION
+            ):
+                reasons.add("manifest_stale")
+                notes.append(
+                    "manifest_schema_mismatch:"
+                    f"schema_name={schema_name or '<missing>'}"
+                    f",schema_version={schema_version}"
+                    f",writer_version={writer_version or '<missing>'}"
+                )
+                metrics["aqi_health_manifest_stale"] += 1
+
+            manifest_rows = _safe_non_negative_int(payload.get("source_row_count"))
+            if manifest_rows is None:
+                manifest_rows = _safe_non_negative_int(payload.get("total_rows"))
+            source_rows = _safe_non_negative_int(source_row_count) or 0
+            if source_rows > 0 and (manifest_rows is None or manifest_rows == 0):
+                reasons.add("manifest_empty")
+                notes.append(
+                    f"manifest_empty:source_rows={source_rows} manifest_rows={manifest_rows}"
+                )
+                metrics["aqi_health_manifest_empty"] += 1
+
+        if not reasons:
+            continue
+
+        queue_note = "; ".join(notes) if notes else None
+        queued_row = {
+            "day_utc": day_iso,
+            "connector_id": parsed_connector_id,
+            "reasons": sorted(reasons),
+            "notes": queue_note,
+        }
+
+        if dry_run:
+            queued_keys.add(key)
+            queued_rows.append(queued_row)
+            continue
+
+        action = _queue_aqi_rebuild(
+            conn=conn,
+            run_id=run_id,
+            env_name=env_name,
+            connector_id=parsed_connector_id,
+            day_utc=day_iso,
+            reason="aqi_health_check",
+            source_mode="live_r2",
+            requested_timeseries_ids=[],
+            queue_note=queue_note,
+            log=log,
+        )
+        if action in {"inserted", "merged"}:
+            queued_rows.append(queued_row)
+        if action == "inserted":
+            queued_keys.add(key)
+
+    metrics["aqi_health_ran"] = True
+    metrics["aqi_health_rebuilds_queued"] = len(queued_keys)
+    metrics["queued_aqi_only_connector_days"] = sorted(
+        queued_rows,
+        key=lambda row: (str(row.get("day_utc") or ""), int(row.get("connector_id") or 0)),
+    )
+    log.info(
+        "aqi-health-check done checked=%s queued=%s skipped_obs_repaired=%s manifest_missing=%s manifest_stale=%s manifest_empty=%s previous_rebuild_failed=%s",
+        metrics["aqi_health_connector_days_checked"],
+        metrics["aqi_health_rebuilds_queued"],
+        metrics["aqi_health_skipped_already_obs_repaired"],
+        metrics["aqi_health_manifest_missing"],
+        metrics["aqi_health_manifest_stale"],
+        metrics["aqi_health_manifest_empty"],
+        metrics["aqi_health_previous_rebuild_failed"],
+    )
+    return metrics
+
+
+def _planned_aqi_rebuild_command(
+    env: dict[str, str],
+    connector_id: int | None,
+    day: dt.date,
+    history_version: str = "v1",
+    env_name: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
+) -> str:
+    wrapper_raw = resolve_integrity_backfill_wrapper()
+    env_file = str(
+        env.get("UK_AQ_BACKFILL_ENV_FILE")
+        or os.environ.get("UK_AQ_BACKFILL_ENV_FILE")
+        or "<UK_AQ_BACKFILL_ENV_FILE unset>"
+    ).strip()
+    wrapper = wrapper_raw or "<integrity backfill wrapper unset>"
+    iso = day.isoformat()
+    connector_scope = ""
+    if connector_id is not None and int(connector_id) > 0:
+        connector_scope = f"UK_AQ_BACKFILL_CONNECTOR_IDS={int(connector_id)} "
+    wrapper_command = wrapper
+    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh":
+        cli_parts = [
+            shlex.quote(wrapper),
+            "--env",
+            shlex.quote(str(env_name or env.get("UK_AQ_ENV_NAME") or os.environ.get("UK_AQ_ENV_NAME") or "<env unset>")),
+            "--aqi-only",
+            "--history-version",
+            shlex.quote(str(history_version)),
+            "--from-day",
+            iso,
+            "--to-day",
+            iso,
+        ]
+        if connector_id is not None and int(connector_id) > 0:
+            cli_parts.extend(["--connector-id", str(int(connector_id))])
+        wrapper_command = " ".join(cli_parts)
+    extra_assignments = " ".join(
+        f"{key}={shlex.quote(str(value))}"
+        for key, value in sorted((extra_env or {}).items())
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key))
+    )
+    return (
+        f"UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels "
+        f"UK_AQ_BACKFILL_DRY_RUN=false "
+        f"UK_AQ_BACKFILL_FORCE_REPLACE=true "
+        f"UK_AQ_R2_HISTORY_VERSION={history_version} "
+        f"UK_AQ_R2_HISTORY_INDEX_VERSION={history_version} "
+        f"UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only "
+        f"{connector_scope}"
+        f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
+        f"UK_AQ_BACKFILL_TO_DAY_UTC={iso} "
+        f"UK_AQ_BACKFILL_ENV_FILE={env_file} "
+        f"{extra_assignments} "
+        f"{wrapper_command}"
+    )
+
+
+def run_aqi_rebuild_backfill(
+    *,
+    wrapper_path: str | None,
+    env_file_path: str | None,
+    env_name: str,
+    connector_id: int | None,
+    day: dt.date,
+    log: logging.Logger,
+    timeout_seconds: int = BACKFILL_DEFAULT_TIMEOUT_SECONDS,
+    log_dir: Path | None = None,
+    log_label: str | None = None,
+    history_version: str = "v1",
+    extra_env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": None,
+        "exit_code": None,
+        "duration_seconds": 0.0,
+        "wrapper_path": wrapper_path,
+        "env_file_path": env_file_path,
+        "stdout_tail": "",
+        "stderr_tail": "",
+        "log_path": None,
+        "error": None,
+    }
+    if not wrapper_path:
+        result["status"] = "no_wrapper"
+        result["error"] = "UK_AQ_BACKFILL_WRAPPER is not set"
+        return result
+    if not Path(wrapper_path).is_file():
+        result["status"] = "no_wrapper"
+        result["error"] = f"wrapper not found: {wrapper_path}"
+        return result
+
+    sub_env: dict[str, str] = {**os.environ}
+    sub_env.pop("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS", None)
+    if env_file_path:
+        if not Path(env_file_path).is_file():
+            result["status"] = "no_env_file"
+            result["error"] = f"env file not found: {env_file_path}"
+            return result
+        loaded = _load_env_file(Path(env_file_path))
+        interesting_keys = _summarize_loaded_backfill_env_keys(loaded)
+        log.info(
+            "aqi rebuild loading env_file=%s var_count=%s keys=%s",
+            env_file_path,
+            len(loaded),
+            interesting_keys,
+        )
+        sub_env.update(loaded)
+
+    iso = day.isoformat()
+
+    sub_env.update({
+        "UK_AQ_BACKFILL_RUN_MODE": "r2_history_obs_to_aqilevels",
+        "UK_AQ_BACKFILL_DRY_RUN": "false",
+        "UK_AQ_BACKFILL_FORCE_REPLACE": "true",
+        "UK_AQ_BACKFILL_OUTPUT_SCOPE": "aqilevels_only",
+        "UK_AQ_R2_HISTORY_VERSION": history_version,
+        "UK_AQ_R2_HISTORY_INDEX_VERSION": history_version,
+        "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
+        "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
+        "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
+        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE": str(
+            log_label or f"aqi_day_{iso}_connector_{connector_id or 'all'}"
+        ),
+    })
+    if extra_env:
+        sub_env.update({str(key): str(value) for key, value in extra_env.items()})
+    for protected_key in (
+        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON",
+        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE",
+        "UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT",
+        "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
+        "UK_AQ_INTEGRITY_INVOCATION",
+    ):
+        protected_value = os.environ.get(protected_key)
+        if protected_value is not None:
+            sub_env[protected_key] = protected_value
+    if connector_id is not None and int(connector_id) > 0:
+        sub_env["UK_AQ_BACKFILL_CONNECTOR_IDS"] = str(int(connector_id))
+    else:
+        sub_env.pop("UK_AQ_BACKFILL_CONNECTOR_IDS", None)
+    sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_IDS", None)
+    sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_ID", None)
+
+    wrapper_name = Path(wrapper_path).name
+    cmd = ["bash", wrapper_path]
+    if wrapper_name == "uk_aq_integrity_backfill.sh":
+        cmd = [
+            "bash",
+            wrapper_path,
+            "--env",
+            env_name,
+            "--aqi-only",
+            "--history-version",
+            history_version,
+            "--from-day",
+            iso,
+            "--to-day",
+            iso,
+        ]
+        if connector_id is not None and int(connector_id) > 0:
+            cmd.extend(["--connector-id", str(int(connector_id))])
+
+    started = time.monotonic()
+    connector_scope = str(int(connector_id)) if connector_id is not None and int(connector_id) > 0 else "all"
+    log.info(
+        "aqi rebuild invoke wrapper=%s day=%s connector_scope=%s",
+        wrapper_path,
+        iso,
+        connector_scope,
+    )
+
+    stdout_text = ""
+    stderr_text = ""
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=sub_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        stdout_text = proc.stdout or ""
+        stderr_text = proc.stderr or ""
+        result["exit_code"] = proc.returncode
+        result["status"] = "ok" if proc.returncode == 0 else "error"
+        if proc.returncode != 0:
+            result["error"] = f"wrapper exit_code={proc.returncode}"
+    except subprocess.TimeoutExpired as exc:
+        result["status"] = "timeout"
+        result["error"] = f"wrapper timed out after {timeout_seconds}s"
+        if isinstance(exc.stdout, (bytes, bytearray)):
+            stdout_text = exc.stdout.decode("utf-8", errors="replace")
+        else:
+            stdout_text = exc.stdout or ""
+        if isinstance(exc.stderr, (bytes, bytearray)):
+            stderr_text = exc.stderr.decode("utf-8", errors="replace")
+        else:
+            stderr_text = exc.stderr or ""
+    except OSError as exc:
+        result["status"] = "spawn_error"
+        result["error"] = f"spawn failed: {exc}"
+
+    result["stdout_tail"] = _tail_bytes(stdout_text)
+    result["stderr_tail"] = _tail_bytes(stderr_text)
+    result.update(_extract_source_to_r2_observation_status(stdout_text))
+
+    if log_dir is not None and (stdout_text or stderr_text or result["status"]):
+        log_dir.mkdir(parents=True, exist_ok=True)
+        label = log_label or f"aqi_day_{iso}_connector_{connector_scope}"
+        log_path = log_dir / f"{label}.log"
+        try:
+            with log_path.open("w", encoding="utf-8") as fh:
+                fh.write(f"# wrapper: {wrapper_path}\n")
+                fh.write(f"# env_file: {env_file_path}\n")
+                fh.write(f"# day: {iso}\n")
+                fh.write(f"# connector_scope: {connector_scope}\n")
+                fh.write("# run_mode: r2_history_obs_to_aqilevels\n")
+                fh.write("# output_scope: aqilevels_only\n")
+                fh.write(f"# command: {' '.join(cmd)}\n")
+                fh.write(f"# exit_code: {result['exit_code']}\n")
+                fh.write(f"# status: {result['status']}\n")
+                fh.write("\n# === STDOUT ===\n")
+                fh.write(stdout_text)
+                fh.write("\n# === STDERR ===\n")
+                fh.write(stderr_text)
+            result["log_path"] = str(log_path)
+        except OSError as exc:
+            log.warning("aqi rebuild log_path write failed: %s", exc)
+
+    result["duration_seconds"] = round(time.monotonic() - started, 3)
+    log.info(
+        "aqi rebuild done status=%s exit_code=%s duration=%.3fs",
+        result["status"], result["exit_code"], result["duration_seconds"],
+    )
+    return result
+
+
 
 
 def _timeseries_ids_for_connector(conn: sqlite3.Connection, connector_id: int) -> list[int]:
@@ -16147,16 +18262,15 @@ def _observation_rows_from_local_parquet_for_shared_hash(
                 "legacy observation Parquet is missing canonical columns: "
                 + ",".join(missing)
             )
-        # vstatus is read compatibility only for already-written erroneous TEST Parquet.
-        status_columns = [
-            name for name in ("verification_status", "vstatus", "status")
-            if name in columns
-        ]
-        if len(status_columns) > 1:
-            raise ValueError(
-                "competing observation status fields: " + ",".join(status_columns)
-            )
-        status_column = status_columns[0] if status_columns else None
+        status_column = (
+            "vstatus"
+            if "vstatus" in columns
+            else "verification_status"
+            if "verification_status" in columns
+            else "status"
+            if "status" in columns
+            else None
+        )
         status_select = (
             f', "{status_column}" AS source_status'
             if status_column
@@ -16400,7 +18514,7 @@ def run_v2_observation_content_hash_checks(
                     f"v2_obs_hash_day_{day_utc}_connector_{connector_id}"
                 ),
                 output_scope="observations_only",
-                history_version=CURRENT_INTEGRITY_HISTORY_VERSION,
+                history_version="v2",
                 extra_env={
                     "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
                     "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
@@ -16419,8 +18533,6 @@ def run_v2_observation_content_hash_checks(
                 },
                 complete_connector_day=True,
                 repair_pollutants=selected_pollutants,
-                worker_purpose="source_evidence_only",
-                canonical_writes_allowed=False,
             )
             if result.get("status") != "ok":
                 raise RuntimeError(
@@ -16679,6 +18791,7 @@ def run_v2_gap_backfills(
     limits: LimitTracker,
     log: logging.Logger,
     run_state: dict[str, Any] | None = None,
+    queue_aqi_from_observation_repairs: bool = True,
     repair_pollutants: Iterable[str] | None = None,
     source_scope: Mapping[str, Any] | None = None,
     explicit_selected_partitions: Iterable[Mapping[str, Any]] | None = None,
@@ -16710,6 +18823,9 @@ def run_v2_gap_backfills(
         "planned_v2_observation_index_rebuilds": [],
         "skipped_v2_observation_repairs": [],
         "v2_observation_repair_results": [],
+        "aqi_rebuilds_queued_from_obs_repair": 0,
+        "planned_aqi_rebuilds": [],
+        "planned_aqi_rebuild_connector_days": [],
         "unsupported_v2_backfill": False,
         "selected_partition_outcomes": [],
         "complete_replacements": 0,
@@ -16881,6 +18997,7 @@ def run_v2_gap_backfills(
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     metrics["skipped_v2_observation_metadata_gaps"] = skipped_metadata_gaps
     backfill_log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
+    queued: set[tuple[str, int]] = set()
     for day_iso, connector_id in standalone_index_keys:
         idx_cmd = _v2_observations_index_rebuild_command(day_iso, connector_id)
         metrics["planned_v2_observation_index_rebuilds"].append(" ".join(idx_cmd))
@@ -16978,8 +19095,6 @@ def run_v2_gap_backfills(
             },
             complete_connector_day=True,
             repair_pollutants=selected_pollutants,
-            worker_purpose="source_evidence_only",
-            canonical_writes_allowed=False,
         )
         _record_backfill_core_snapshot_identity_audits(
             run_state,
@@ -17213,12 +19328,7 @@ def run_v2_gap_backfills(
                 day=day_obj,
                 log=log,
                 log_dir=backfill_log_dir,
-                log_label=_v2_observation_worker_log_label(
-                    stage="detector",
-                    day_utc=day_iso,
-                    connector_id=connector_id,
-                    pollutant_code=partition_pollutant,
-                ),
+                log_label=f"v2_obs_detector_day_{day_iso}_connector_{connector_id}",
                 output_scope="observations_only",
                 history_version="v2",
                 extra_env={
@@ -17234,8 +19344,6 @@ def run_v2_gap_backfills(
                 },
                 complete_connector_day=True,
                 repair_pollutants=selected_repair_pollutants,
-                worker_purpose="source_evidence_only",
-                canonical_writes_allowed=False,
             )
             if run_state is not None:
                 _record_backfill_core_snapshot_identity_audits(
@@ -17362,12 +19470,7 @@ def run_v2_gap_backfills(
                 break
             if limits.should_stop():
                 break
-            chunk_label = _v2_observation_worker_log_label(
-                stage="proposal",
-                day_utc=day_iso,
-                connector_id=connector_id,
-                pollutant_code=partition_pollutant,
-            )
+            chunk_label = f"v2_obs_day_{day_iso}_connector_{connector_id}"
             if len(chunks) > 1:
                 chunk_label = f"{chunk_label}_chunk_{chunk_index:03d}_of_{len(chunks):03d}"
             # Chunking is local acquisition only. The final chunk builds one
@@ -17398,8 +19501,6 @@ def run_v2_gap_backfills(
                 extra_env=extra_env,
                 complete_connector_day=True,
                 repair_pollutants=selected_repair_pollutants,
-                worker_purpose="repair_proposal",
-                canonical_writes_allowed=False,
             )
             if run_state is not None:
                 _record_backfill_core_snapshot_identity_audits(
@@ -17430,7 +19531,7 @@ def run_v2_gap_backfills(
         failed_events = int(combined.get("source_connector_day_failed_events") or 0)
         backfill_run_status = combined.get("backfill_run_status")
         pending_days = list(combined.get("source_acquisition_pending_days") or [])
-        process_guard_ok, process_guard_reason = _validate_chunked_v2_observation_repair(
+        process_guard_ok, process_guard_reason = _validate_chunked_v2_observation_repair_for_aqi(
             chunk_count=len(chunks),
             chunk_results=chunk_results,
             repaired_observation_rows=repaired_observation_rows,
@@ -17622,19 +19723,19 @@ def run_v2_gap_backfills(
                 for timeseries_id, count in sorted(expected_timeseries_row_counts.items())
             },
             "expected_pollutant_codes": sorted({str(code) for code in expected_pollutant_codes}),
-            "observation_repair_guard_ok": (
+            "aqi_rebuild_guard_ok": (
                 process_guard_ok
                 and manifest_guard_ok
             ),
-            "observation_repair_guard_reason": (
+            "aqi_rebuild_guard_reason": (
                 process_guard_reason
                 or manifest_guard_reason
             ),
-            "observation_repair_process_guard_ok": process_guard_ok,
-            "observation_repair_process_guard_reason": process_guard_reason,
-            "observation_repair_manifest_guard_ok": manifest_guard_ok,
-            "observation_repair_manifest_guard_reason": manifest_guard_reason,
-            "observation_repair_manifest_guard": manifest_guard_details,
+            "aqi_rebuild_process_guard_ok": process_guard_ok,
+            "aqi_rebuild_process_guard_reason": process_guard_reason,
+            "aqi_rebuild_manifest_guard_ok": manifest_guard_ok,
+            "aqi_rebuild_manifest_guard_reason": manifest_guard_reason,
+            "aqi_rebuild_manifest_guard": manifest_guard_details,
             "backfill_run_status": backfill_run_status,
             "source_acquisition_pending_days": pending_days,
             "worker_first_value_at_reconciliation": combined.get(
@@ -17767,10 +19868,16 @@ def run_v2_gap_backfills(
                     metrics["authoritative_no_data_replacements"] += 1
                 else:
                     metrics["complete_replacements"] += 1
+            if queue_aqi_from_observation_repairs:
+                action = _queue_aqi_rebuild_from_obs_repair(conn=conn, run_id=run_id, env_name=env_name, connector_id=connector_id, day_utc=day_iso, requested_timeseries_ids=sorted(expected_timeseries_row_counts), queue_note="queued_from_complete_source_connector_day_repair", log=log, history_version="v2")
+                if action in {"inserted", "merged"}:
+                    queued.add((day_iso, connector_id))
+                metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired history_version=v2")
+                metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["obs_repaired"], "history_version": "v2"})
         elif no_observation_rows:
             metrics["v2_observation_repairs_no_rows"] += 1
             log.warning(
-                "v2 observation repair wrote no rows day=%s connector_id=%s attempted_chunks=%s complete_events=%s",
+                "v2 observation repair wrote no rows day=%s connector_id=%s attempted_chunks=%s complete_events=%s; AQI rebuild not queued",
                 day_iso,
                 connector_id,
                 repair_entry["attempted_chunks"],
@@ -17779,7 +19886,7 @@ def run_v2_gap_backfills(
         elif source_pending:
             metrics["v2_observation_repairs_source_unavailable"] += 1
             log.warning(
-                "v2 observation repair pending source acquisition day=%s connector_id=%s attempted_chunks=%s pending_events=%s pending_days=%s",
+                "v2 observation repair pending source acquisition day=%s connector_id=%s attempted_chunks=%s pending_events=%s pending_days=%s; AQI rebuild not queued",
                 day_iso,
                 connector_id,
                 repair_entry["attempted_chunks"],
@@ -17791,11 +19898,11 @@ def run_v2_gap_backfills(
             metrics["v2_observation_repairs_failed"] += 1
             metrics["observation_backfills_failed"] += 1
             log.warning(
-                "v2 observation repair blocked by guard day=%s connector_id=%s attempted_chunks=%s reason=%s",
+                "v2 observation repair blocked AQI rebuild by guard day=%s connector_id=%s attempted_chunks=%s reason=%s; AQI rebuild not queued",
                 day_iso,
                 connector_id,
                 repair_entry["attempted_chunks"],
-                repair_entry["observation_repair_guard_reason"],
+                repair_entry["aqi_rebuild_guard_reason"],
             )
         else:
             if wrapper_ok:
@@ -17826,7 +19933,378 @@ def run_v2_gap_backfills(
                 ),
                 "tombstone_created": False,
             })
+    metrics["aqi_rebuilds_queued_from_obs_repair"] = len(queued)
     return metrics
+
+def run_aqi_rebuild_queue_execution(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    env_name: str,
+    run_compact: str,
+    env: dict[str, str],
+    dry_run: bool,
+    run_backfill: bool,
+    limits: LimitTracker,
+    log: logging.Logger,
+    dry_run_planned_rows: list[dict[str, Any]] | None = None,
+    history_version: str = "v1",
+    extra_env: Mapping[str, str] | None = None,
+    skip_stale_local_post_validation: bool = False,
+    execute_local_proposal: bool = False,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "aqi_rebuild_ran": False,
+        "aqi_rebuild_skipped_reason": None,
+        "aqi_rebuilds_queued": 0,
+        "aqi_rebuilds_queued_total": 0,
+        "aqi_rebuilds_attempted": 0,
+        "aqi_rebuilds_complete": 0,
+        "aqi_rebuilds_proposal_validated": 0,
+        "aqi_rebuilds_failed": 0,
+        "aqi_rebuilds_skipped": 0,
+        "aqi_post_rebuild_validation_failed": 0,
+        "aqi_post_rebuild_validation_skipped_reason": None,
+        "planned_aqi_rebuild_commands": [],
+        "aqi_rebuild_results": [],
+    }
+    if not run_backfill:
+        metrics["aqi_rebuild_skipped_reason"] = "skipped because --run-backfill not set"
+        return metrics
+
+    queue_rows = conn.execute(
+        """
+        SELECT id, connector_id, day_utc, reason, source_mode, status, notes
+        FROM aqi_rebuild_queue
+        WHERE run_id = ?
+          AND status = 'queued'
+          AND day_utc IS NOT NULL
+        ORDER BY day_utc, connector_id, id
+        """,
+        (run_id,),
+    ).fetchall()
+
+    by_key: dict[tuple[str, int | None], list[tuple[Any, ...]]] = {}
+    for row in queue_rows:
+        row_id, connector_id, day_utc, *_ = row
+        day_iso = str(day_utc or "").strip()
+        if not day_iso:
+            metrics["aqi_rebuilds_skipped"] += 1
+            continue
+        try:
+            parsed_connector_id = int(connector_id)
+        except (TypeError, ValueError):
+            log.warning("aqi rebuild queue row id=%s has invalid connector_id=%r", row_id, connector_id)
+            metrics["aqi_rebuilds_skipped"] += 1
+            continue
+        if parsed_connector_id <= 0:
+            metrics["aqi_rebuilds_skipped"] += 1
+            continue
+        connector_scope = parsed_connector_id if history_version == "v2" else None
+        by_key.setdefault((day_iso, connector_scope), []).append(row)
+
+    metrics["aqi_rebuilds_queued_total"] = len(by_key)
+    metrics["aqi_rebuilds_queued"] = len(by_key)
+    if dry_run and not execute_local_proposal and metrics["aqi_rebuilds_queued_total"] == 0 and dry_run_planned_rows:
+        seed_by_key: dict[tuple[str, int | None], dict[str, Any]] = {}
+        for row in dry_run_planned_rows:
+            day_iso = str(row.get("day_utc") or "").strip()
+            if not day_iso:
+                continue
+            try:
+                connector_id = int(row.get("connector_id"))
+            except (TypeError, ValueError):
+                continue
+            if connector_id <= 0:
+                continue
+            connector_scope = connector_id if history_version == "v2" else None
+            seed_key = (day_iso, connector_scope)
+            current = seed_by_key.get(seed_key)
+            row_reasons = _parse_reason_tokens(",".join(str(v) for v in (row.get("reasons") or [])))
+            if not row_reasons and row.get("reason"):
+                row_reasons = _parse_reason_tokens(str(row.get("reason")))
+            if current is None:
+                seed_by_key[seed_key] = {
+                    "day_utc": day_iso,
+                    "connector_ids": [connector_id],
+                    "connector_scope": connector_scope,
+                    "reasons": sorted(row_reasons),
+                }
+                continue
+            merged = _parse_reason_tokens(",".join(current.get("reasons") or []))
+            merged.update(row_reasons)
+            current["reasons"] = sorted(merged)
+            if connector_id not in current["connector_ids"]:
+                current["connector_ids"].append(connector_id)
+
+        for (day_iso, connector_scope), seed in sorted(seed_by_key.items(), key=lambda item: (item[0][0], int(item[0][1] or 0))):
+            connector_ids = sorted(int(v) for v in seed.get("connector_ids") or [])
+            planned_cmd = _planned_aqi_rebuild_command(
+                env,
+                connector_scope,
+                dt.date.fromisoformat(day_iso),
+                history_version=history_version,
+                env_name=env_name,
+            )
+            metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
+            metrics["aqi_rebuild_results"].append({
+                "queue_row_ids": [],
+                "connector_id": connector_scope,
+                "connector_ids": connector_ids,
+                "day_utc": day_iso,
+                "reasons": seed.get("reasons") or [],
+                "status": "planned",
+                "source_mode": "combined_local",
+                "error": None,
+                "log_path": None,
+            })
+        metrics["aqi_rebuilds_queued_total"] = len(seed_by_key)
+        metrics["aqi_rebuilds_queued"] = len(seed_by_key)
+        metrics["aqi_rebuild_ran"] = True
+        return metrics
+
+    if not by_key:
+        metrics["aqi_rebuild_ran"] = True
+        return metrics
+
+    backfill_log_dir = (
+        Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
+    )
+    for (day_iso, connector_scope), rows_for_key in sorted(by_key.items(), key=lambda item: (item[0][0], int(item[0][1] or 0))):
+        day_obj = dt.date.fromisoformat(day_iso)
+        merged_reasons: set[str] = set()
+        connector_ids: set[int] = set()
+        for row in rows_for_key:
+            merged_reasons.update(_parse_reason_tokens(row[3]))
+            try:
+                parsed_connector_id = int(row[1])
+            except (TypeError, ValueError):
+                continue
+            if parsed_connector_id > 0:
+                connector_ids.add(parsed_connector_id)
+        reasons_sorted = sorted(merged_reasons)
+        connector_ids_sorted = sorted(connector_ids)
+        primary_row = rows_for_key[0]
+        duplicate_rows = rows_for_key[1:]
+        row_ids = [int(row[0]) for row in rows_for_key if row[0] is not None]
+
+        planned_cmd = _planned_aqi_rebuild_command(
+            env,
+            connector_scope,
+            day_obj,
+            history_version=history_version,
+            extra_env=extra_env,
+            env_name=env_name,
+        )
+        metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
+
+        if duplicate_rows:
+            metrics["aqi_rebuilds_skipped"] += len(duplicate_rows)
+            if not dry_run:
+                now_iso = fmt_iso(utc_now())
+                for dup in duplicate_rows:
+                    dup_id = int(dup[0])
+                    merged_note = _merge_notes(
+                        dup[6],
+                        f"skipped duplicate queue day; executed by queue_row_id={int(primary_row[0])}",
+                    )
+                    conn.execute(
+                        """
+                        UPDATE aqi_rebuild_queue
+                        SET status = 'skipped',
+                            finished_at_utc = ?,
+                            notes = ?
+                        WHERE id = ?
+                        """,
+                        (now_iso, merged_note, dup_id),
+                    )
+                conn.commit()
+
+        if dry_run and not execute_local_proposal:
+            metrics["aqi_rebuild_results"].append({
+                "queue_row_ids": row_ids,
+                "connector_id": connector_scope,
+                "connector_ids": connector_ids_sorted,
+                "day_utc": day_iso,
+                "reasons": reasons_sorted,
+                "status": "planned",
+                "source_mode": "combined_local",
+                "error": None,
+                "log_path": None,
+            })
+            continue
+
+        if limits.should_stop():
+            metrics["aqi_rebuilds_skipped"] += 1
+            metrics["aqi_rebuild_results"].append({
+                "queue_row_ids": row_ids,
+                "connector_id": connector_scope,
+                "connector_ids": connector_ids_sorted,
+                "day_utc": day_iso,
+                "reasons": reasons_sorted,
+                "status": "skipped_limit",
+                "source_mode": "combined_local" if execute_local_proposal else "live_r2",
+                "error": f"stopped_for={limits.stopped_for}",
+                "log_path": None,
+            })
+            continue
+
+        started_iso = fmt_iso(utc_now())
+        primary_row_id = int(primary_row[0])
+        conn.execute(
+            """
+            UPDATE aqi_rebuild_queue
+            SET status = 'running',
+                started_at_utc = ?,
+                notes = ?
+            WHERE id = ?
+            """,
+            (
+                started_iso,
+                _merge_notes(primary_row[6], f"rebuild_started_at={started_iso}"),
+                primary_row_id,
+            ),
+        )
+        conn.commit()
+
+        bf = run_aqi_rebuild_backfill(
+            wrapper_path=resolve_integrity_backfill_wrapper(),
+            env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+            env_name=env_name,
+            connector_id=connector_scope,
+            day=day_obj,
+            log=log,
+            log_dir=backfill_log_dir,
+            log_label=(
+                f"aqi_day_{day_iso}_connector_{connector_scope}"
+                if connector_scope is not None
+                else f"aqi_day_{day_iso}_all_connectors"
+            ),
+            history_version=history_version,
+            extra_env=extra_env,
+        )
+        metrics["aqi_rebuilds_attempted"] += 1
+
+        finished_iso = fmt_iso(utc_now())
+        post_validation_gaps: list[dict[str, Any]] = []
+        if (
+            bf.get("status") == "ok"
+            and history_version == "v2"
+            and connector_scope is not None
+            and not skip_stale_local_post_validation
+            and (
+                "obs_repaired" in merged_reasons
+                or AQI_INTEGRITY_OBS_COVERAGE_REASON in merged_reasons
+            )
+        ):
+            root_raw = resolve_r2_history_root({**os.environ, **env})
+            if root_raw:
+                post_validation_gaps = _v2_aqi_observation_coverage_gaps(
+                    root=Path(root_raw),
+                    config=resolve_history_path_config("v2", env),
+                    day_utc=day_iso,
+                    connector_id=int(connector_scope),
+                    conn=conn,
+                    missing_observations_gap_type="aqi_missing_after_obs_repair",
+                )
+            else:
+                post_validation_gaps = [_v2_aqi_gap(
+                    "aqi_post_rebuild_validation_failed",
+                    day_utc=day_iso,
+                    connector_id=connector_scope,
+                    related_paths=["UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set"],
+                )]
+        elif (
+            bf.get("status") == "ok"
+            and history_version == "v2"
+            and connector_scope is not None
+            and skip_stale_local_post_validation
+        ):
+            metrics["aqi_post_rebuild_validation_skipped_reason"] = (
+                "combined_local_proposal_validated_before_apply"
+                if execute_local_proposal else
+                "post_rebuild_validation_explicitly_skipped"
+            )
+
+        if bf.get("status") == "ok" and not post_validation_gaps:
+            success_status = "proposal_validated" if execute_local_proposal else "complete"
+            if execute_local_proposal:
+                metrics["aqi_rebuilds_proposal_validated"] += 1
+            else:
+                metrics["aqi_rebuilds_complete"] += 1
+            conn.execute(
+                """
+                UPDATE aqi_rebuild_queue
+                SET status = ?,
+                    finished_at_utc = ?,
+                    notes = ?
+                WHERE id = ?
+                """,
+                (
+                    success_status,
+                    finished_iso,
+                    _merge_notes(
+                        primary_row[6],
+                        "aqi_proposal_validated_locally" if execute_local_proposal
+                        else "aqi_rebuild_complete",
+                    ),
+                    primary_row_id,
+                ),
+            )
+            final_status = success_status
+            error_text = None
+        else:
+            metrics["aqi_rebuilds_failed"] += 1
+            if post_validation_gaps:
+                metrics["aqi_post_rebuild_validation_failed"] += 1
+                gap_types = ",".join(sorted({str(g.get("gap_type")) for g in post_validation_gaps}))
+                bf_status = f"post_validation_failed:{gap_types}"
+            else:
+                bf_status = str(bf.get("status") or "unknown")
+            failure_note = _merge_notes(
+                primary_row[6],
+                f"aqi_rebuild_failed status={bf_status} error={bf.get('error')}",
+            )
+            conn.execute(
+                """
+                UPDATE aqi_rebuild_queue
+                SET status = 'failed',
+                    finished_at_utc = ?,
+                    notes = ?
+                WHERE id = ?
+                """,
+                (finished_iso, failure_note, primary_row_id),
+            )
+            final_status = "failed"
+            error_text = str(bf.get("error") or bf_status or "unknown")
+        conn.commit()
+
+        metrics["aqi_rebuild_results"].append({
+            "queue_row_ids": row_ids,
+            "connector_id": connector_scope,
+            "connector_ids": connector_ids_sorted,
+            "day_utc": day_iso,
+            "reasons": reasons_sorted,
+            "status": final_status,
+            "source_mode": "combined_local" if execute_local_proposal else "live_r2",
+            "error": error_text,
+            "log_path": bf.get("log_path"),
+            "post_rebuild_validation_gaps": post_validation_gaps,
+            "core_snapshot_identity_validations": list(
+                bf.get("core_snapshot_identity_validations") or []
+            ),
+        })
+
+    metrics["aqi_rebuild_ran"] = True
+    metrics["aqi_rebuild_results"] = sorted(
+        metrics["aqi_rebuild_results"],
+        key=lambda row: (
+            str(row.get("day_utc") or ""),
+            int(((row.get("connector_ids") or [0])[0]) or 0),
+        ),
+    )
+    return metrics
+
 
 def fmt_iso(t: dt.datetime) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -18193,6 +20671,22 @@ def _v2_observation_metadata_actions(v2_observations: Mapping[str, Any]) -> list
     return _dedupe_v2_repair_actions(actions)
 
 
+def _v2_aqi_metadata_actions(v2_aqilevels: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return AQI data-manifest/index actions only; debug remains optional."""
+    supported = {
+        "aqi_pollutant_manifest_repair",
+        "aqi_connector_manifest_repair",
+        "aqi_day_manifest_repair",
+        "aqi_index_repair",
+        "rebuild_v2_aqi_index_only",
+    }
+    return _dedupe_v2_repair_actions([
+        dict(action)
+        for action in list(v2_aqilevels.get("repair_plan") or [])
+        if isinstance(action, Mapping) and str(action.get("kind") or "") in supported
+    ])
+
+
 def _authoritative_v2_core_timeseries_bindings(
     conn: sqlite3.Connection | None,
 ) -> list[dict[str, Any]]:
@@ -18297,6 +20791,7 @@ def _run_v2_observation_metadata_executor(
     *,
     env: Mapping[str, str],
     actions: list[dict[str, Any]],
+    domain: Literal["observations", "aqilevels"] = "observations",
     dry_run: bool,
     log: logging.Logger,
     run_state: Mapping[str, Any] | None = None,
@@ -18325,7 +20820,7 @@ def _run_v2_observation_metadata_executor(
         ])
     plan = {
         "history_version": "v2",
-        "domain": "observations",
+        "domain": domain,
         "repair_plan": actions,
         "authoritative_core_timeseries": _authoritative_v2_core_timeseries_bindings(conn),
     }
@@ -18378,73 +20873,6 @@ def _run_v2_observation_metadata_executor(
             "status": str(output.get("status") or "failed") if isinstance(output, Mapping) else "failed",
             "exit_code": proc.returncode,
             "error": _truncate_text(stderr or stdout or "", 4000),
-            "output": output if isinstance(output, Mapping) else {},
-            "results": output.get("results") if isinstance(output, Mapping) else [],
-        }
-    return {
-        "status": str(output.get("status") or "planned"),
-        "exit_code": proc.returncode,
-        "output": output,
-        "results": output.get("results") if isinstance(output, Mapping) else [],
-    }
-
-
-def _run_v3_observation_metadata_proposal(
-    *,
-    env: Mapping[str, str],
-    actions: list[dict[str, Any]],
-    dry_run: bool,
-    log: logging.Logger,
-    run_state: Mapping[str, Any],
-    conn: sqlite3.Connection | None = None,
-) -> dict[str, Any]:
-    """Run the proposal-only fixed-v3 observation metadata planner."""
-    if not actions:
-        return {"status": "not_run", "reason": "no_observation_metadata_actions", "results": []}
-    repo_root = _repo_root_for_integrity_script(env)
-    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
-    command = [
-        node_bin,
-        str(repo_root / "scripts/backup_r2/uk_aq_plan_sos_light_v3_observation_metadata.mjs"),
-        "--repair-plan-stdin",
-        "--overlay-root", str(run_state["overlay_root"]),
-        "--dropbox-root", str(run_state["base_dropbox_root"]),
-        "--run-state-json", str(run_state["run_state_path"]),
-    ]
-    plan = {
-        # Canonical manifest semantics deliberately remain v2; storage routing
-        # is selected independently by the dedicated fixed-v3 entry point.
-        "history_version": "v2",
-        "domain": "observations",
-        "repair_plan": actions,
-        "authoritative_core_timeseries": _authoritative_v2_core_timeseries_bindings(conn),
-    }
-    proc = subprocess.run(
-        command,
-        cwd=repo_root,
-        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        input=json.dumps(plan),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    for line in proc.stderr.splitlines():
-        log.info("v3 metadata proposal planner %s", line)
-    try:
-        output = json.loads(proc.stdout) if proc.stdout.strip() else {}
-    except json.JSONDecodeError:
-        output = {}
-    if proc.returncode != 0:
-        log.warning(
-            "v3 observation metadata proposal failed exit_code=%s stderr=%s",
-            proc.returncode,
-            _truncate_text(proc.stderr or proc.stdout or "", 2000),
-        )
-        return {
-            "status": str(output.get("status") or "failed") if isinstance(output, Mapping) else "failed",
-            "exit_code": proc.returncode,
-            "error": _truncate_text(proc.stderr or proc.stdout or "", 4000),
             "output": output if isinstance(output, Mapping) else {},
             "results": output.get("results") if isinstance(output, Mapping) else [],
         }
@@ -18616,35 +21044,6 @@ def _record_metadata_executor_overlay(
             })
     run_state["proposal_transition_planner_unchanged_keys"] = sorted(
         planner_unchanged_keys
-    )
-    prefix_tombstones = list(run_state.get("tombstone_prefixes") or [])
-    for removed_scope in list(planning.get("removed_exact_v3_scopes") or []):
-        if not isinstance(removed_scope, Mapping):
-            raise ValueError("fixed-v3 removed scope evidence is invalid")
-        for hierarchy, field in (
-            ("exact", "exact_prefix"),
-            ("aligned", "aligned_prefix"),
-        ):
-            prefix = _normalise_overlay_object_key(
-                str(removed_scope.get(field) or "")
-            ).rstrip("/")
-            prefix_tombstones.append({
-                "prefix": prefix,
-                "proposed": True,
-                "deleted": False,
-                "deletion_verified": False,
-                "stage": "sos_light_exact_v3_scope_removal",
-                "hierarchy": hierarchy,
-                "day_utc": str(removed_scope.get("day_utc") or ""),
-                "connector_id": int(removed_scope.get("connector_id") or 0),
-                "pollutant_code": str(
-                    removed_scope.get("pollutant_code") or ""
-                ),
-                "authority": "pinned_dropbox_latest_minus_canonical_reconstruction",
-            })
-    run_state["tombstone_prefixes"] = sorted(
-        {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
-        key=lambda entry: str(entry["prefix"]),
     )
     write_run_state(run_state)
 
@@ -19080,13 +21479,7 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         total_day_uploads += len(day_keys)
         raw_day.update(day)
 
-    existing_index_scope_removals = [
-        dict(entry)
-        for entry in list(run_state.get("tombstone_prefixes") or [])
-        if isinstance(entry, Mapping)
-        and entry.get("stage") == "sos_light_exact_v3_scope_removal"
-    ]
-    run_state["tombstone_prefixes"] = existing_index_scope_removals + [
+    run_state["tombstone_prefixes"] = [
         {
             "prefix": (
                 f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
@@ -19411,6 +21804,331 @@ def _capture_local_v2_observation_scope(
     write_run_state(run_state)
     return captured
 
+def _capture_local_v2_aqi_scope(
+    *,
+    run_state: dict[str, Any],
+    day_utc: str,
+    connector_id: int,
+    env: Mapping[str, str],
+    include_debug: bool = False,
+    repair_pollutants: Iterable[str] | None = None,
+) -> list[str]:
+    """Validate and stage generated AQI bytes without remote access."""
+    selected_pollutants = _normalise_repair_pollutants(repair_pollutants)
+    unsupported = sorted(
+        set(selected_pollutants) - set(V2_AQI_SUPPORTED_POLLUTANTS)
+    )
+    if unsupported:
+        raise ValueError(
+            "AQI proposal contains unsupported repair pollutants: "
+            + ",".join(unsupported)
+        )
+    config = resolve_history_path_config("v2", {**os.environ, **dict(env)})
+    prefixes = [config.aqilevels_hourly_data_prefix]
+    if include_debug and config.aqilevels_hourly_debug_prefix:
+        prefixes.append(config.aqilevels_hourly_debug_prefix)
+    generated_root = Path(str(run_state["overlay_root"])) / "generated-objects"
+    captured: list[str] = []
+    for prefix in prefixes:
+        normalized_prefix = str(prefix).strip("/")
+        connector_key = (
+            f"{normalized_prefix}/day_utc={day_utc}/connector_id={int(connector_id)}/manifest.json"
+        )
+        connector_source = generated_root / _normalise_overlay_object_key(connector_key)
+        if not connector_source.is_file():
+            raise FileNotFoundError(f"generated AQI connector manifest is unavailable: {connector_key}")
+        manifest = json.loads(connector_source.read_text(encoding="utf-8"))
+        if not isinstance(manifest, Mapping):
+            raise ValueError(f"invalid local AQI connector manifest: {connector_key}")
+        if (
+            manifest.get("history_version") != "v2"
+            or manifest.get("domain") != "aqilevels"
+            or str(manifest.get("day_utc") or "") != day_utc
+            or int(manifest.get("connector_id") or 0) != int(connector_id)
+        ):
+            raise ValueError(f"invalid local AQI connector identity: {connector_key}")
+        manifest_pollutants = sorted({
+            str(value or "").strip().lower()
+            for value in list(manifest.get("pollutant_codes") or [])
+            if str(value or "").strip()
+        })
+        if selected_pollutants and not set(selected_pollutants).issubset(
+            set(manifest_pollutants)
+        ):
+            raise ValueError(
+                "local AQI connector manifest does not contain every selected "
+                "repair pollutant"
+            )
+        connector_prefix = connector_key.removesuffix("/manifest.json")
+        source_root = generated_root / connector_prefix
+        object_paths = sorted(
+            path for path in source_root.rglob("*")
+            if path.is_file() and (
+                not selected_pollutants
+                or (
+                    path.relative_to(source_root).as_posix().startswith(
+                        "pollutant_code="
+                    )
+                    and path.relative_to(source_root).as_posix().split(
+                        "pollutant_code=", 1
+                    )[1].split("/", 1)[0] in selected_pollutants
+                )
+            )
+        )
+        if not object_paths:
+            raise ValueError(
+                f"local AQI proposal has no selected objects: {connector_key}"
+            )
+        for pollutant in selected_pollutants:
+            pollutant_root = source_root / f"pollutant_code={pollutant}"
+            if (
+                not (pollutant_root / "manifest.json").is_file()
+                or not any(pollutant_root.glob("part-*.parquet"))
+            ):
+                raise ValueError(
+                    "local AQI proposal is incomplete for selected pollutant: "
+                    f"{pollutant}"
+                )
+        parquet_pattern = re.compile(
+            rf"^{re.escape(connector_prefix)}/pollutant_code=[a-z0-9_]+/part-\d+\.parquet$"
+        )
+        for source in object_paths:
+            object_key = source.relative_to(generated_root).as_posix()
+            if object_key.endswith(".parquet") and not parquet_pattern.fullmatch(object_key):
+                raise ValueError(f"non-canonical AQI parquet proposal key: {object_key}")
+            stage_overlay_object(run_state, object_key=object_key, source_path=source, stage="aqilevels", dependencies=())
+            mark_overlay_structurally_validated(run_state, object_key)
+            captured.append(object_key)
+        tombstone_prefixes = (
+            [
+                f"{connector_prefix}/pollutant_code={pollutant}"
+                for pollutant in selected_pollutants
+            ]
+            if selected_pollutants else [connector_prefix]
+        )
+        for tombstone_prefix in tombstone_prefixes:
+            run_state.setdefault("tombstone_prefixes", []).append({
+                "prefix": tombstone_prefix,
+                "proposed": True,
+                "deleted": False,
+                "deletion_verified": False,
+                "stage": "aqilevels",
+                "repair_pollutants": selected_pollutants,
+            })
+    run_state["tombstone_prefixes"] = sorted(
+        {
+            entry["prefix"]: entry
+            for entry in list(run_state.get("tombstone_prefixes") or [])
+        }.values(),
+        key=lambda entry: str(entry["prefix"]),
+    )
+    write_run_state(run_state)
+    return sorted(set(captured))
+
+
+def _phase4_aqi_work(
+    *,
+    conn: sqlite3.Connection,
+    run_state: Mapping[str, Any],
+    v2_aqilevels: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return one eligible AQI connector/day rebuild work item per final scope."""
+    work: dict[tuple[str, int], dict[str, Any]] = {}
+    blocked: list[dict[str, Any]] = []
+
+    def scope_key(value: Mapping[str, Any]) -> tuple[str, int] | None:
+        day = str(value.get("day_utc") or "").strip()
+        try:
+            connector = int(value.get("connector_id"))
+        except (TypeError, ValueError):
+            return None
+        return (day, connector) if day and connector > 0 else None
+
+    def add(day_utc: Any, connector_id: Any, pollutants: Iterable[Any], reason: str) -> None:
+        day = str(day_utc or "").strip()
+        try:
+            connector = int(connector_id)
+        except (TypeError, ValueError):
+            connector = 0
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or connector <= 0:
+            return
+        requested = {str(value or "").strip().lower() for value in pollutants}
+        requested &= set(V2_AQI_SUPPORTED_POLLUTANTS)
+        if not requested:
+            return
+        eligible = _active_aqi_eligible_pollutants_for_connector(conn, connector_id=connector)
+        if eligible is None:
+            blocked.append({
+                "stage": "aqilevels",
+                "day_utc": day,
+                "connector_id": connector,
+                "reason": "aqi_eligibility_mapping_unavailable",
+            })
+            return
+        eligible_requested = requested & eligible
+        if not eligible_requested:
+            return
+        entry = work.setdefault((day, connector), {
+            "day_utc": day,
+            "connector_id": connector,
+            "pollutant_codes": set(),
+            "reasons": set(),
+        })
+        entry["pollutant_codes"].update(eligible_requested)
+        entry["reasons"].add(reason)
+
+    for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or []):
+        if isinstance(scope, Mapping):
+            add(
+                scope.get("day_utc"),
+                scope.get("connector_id"),
+                scope.get("affected_pollutant_codes") or scope.get("pollutant_codes") or [],
+                "observations_changed",
+            )
+
+    changed_keys = {
+        key for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or [])
+        if isinstance(scope, Mapping) for key in [scope_key(scope)] if key is not None
+    }
+    for action in list(v2_aqilevels.get("repair_plan") or []):
+        if not isinstance(action, Mapping) or str(action.get("kind") or "") != "aqi_rebuild":
+            continue
+        key = scope_key(action)
+        add(
+            action.get("day_utc"),
+            action.get("connector_id"),
+            [action.get("pollutant_code")],
+            "observations_changed" if key in changed_keys else "aqi_data_fault",
+        )
+    return (
+        [
+            {**entry, "pollutant_codes": sorted(entry["pollutant_codes"]), "reasons": sorted(entry["reasons"])}
+            for _, entry in sorted(work.items())
+        ],
+        blocked,
+    )
+
+
+def _phase4_aqi_work_from_integrity_bridge(
+    *,
+    conn: sqlite3.Connection,
+    planned_rows: Iterable[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Translate executable AQI-gap plans into canonical Phase 4 work."""
+    work: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for row in planned_rows:
+        day_utc = str(row.get("day_utc") or "").strip()
+        try:
+            connector_id = int(row.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc) or connector_id <= 0:
+            continue
+        eligible = _active_aqi_eligible_pollutants_for_connector(
+            conn, connector_id=connector_id,
+        )
+        if eligible is None:
+            blocked.append({
+                "stage": "aqilevels",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "reason": "aqi_eligibility_mapping_unavailable",
+            })
+            continue
+        requested = {
+            str(value or "").strip().lower()
+            for value in list(row.get("pollutants") or [])
+        } & set(V2_AQI_SUPPORTED_POLLUTANTS)
+        # A missing AQI day is not pollutant-specific. Preserve the existing
+        # eligibility rule by rebuilding every active eligible pollutant.
+        pollutant_codes = sorted((requested & eligible) if requested else eligible)
+        if not pollutant_codes:
+            continue
+        work.append({
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "pollutant_codes": pollutant_codes,
+            "reasons": [AQI_INTEGRITY_OBS_COVERAGE_REASON],
+        })
+    return work, blocked
+
+
+def _merge_phase4_aqi_work(*groups: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate canonical AQI work while retaining the full eligible scope."""
+    merged: dict[tuple[str, int], dict[str, Any]] = {}
+    for group in groups:
+        for row in group:
+            day_utc = str(row.get("day_utc") or "").strip()
+            try:
+                connector_id = int(row.get("connector_id"))
+            except (TypeError, ValueError):
+                continue
+            if not day_utc or connector_id <= 0:
+                continue
+            entry = merged.setdefault((day_utc, connector_id), {
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_codes": set(),
+                "reasons": set(),
+            })
+            entry["pollutant_codes"].update(
+                str(value).strip().lower()
+                for value in list(row.get("pollutant_codes") or [])
+                if str(value or "").strip()
+            )
+            entry["reasons"].update(
+                str(value).strip()
+                for value in list(row.get("reasons") or [])
+                if str(value or "").strip()
+            )
+    return [
+        {
+            **entry,
+            "pollutant_codes": sorted(entry["pollutant_codes"]),
+            "reasons": sorted(entry["reasons"]),
+        }
+        for _, entry in sorted(merged.items())
+    ]
+
+
+def _queue_phase4_aqi_work(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    work: Iterable[Mapping[str, Any]],
+    log: logging.Logger,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    planned: list[dict[str, Any]] = []
+    for entry in work:
+        day_utc = str(entry["day_utc"])
+        connector_id = int(entry["connector_id"])
+        row = {**dict(entry), "history_version": "v2", "source_mode": "combined_local"}
+        planned.append(row)
+        if dry_run:
+            continue
+        _queue_aqi_rebuild(
+            conn=conn,
+            run_id=run_id,
+            env_name=env_name,
+            connector_id=connector_id,
+            day_utc=day_utc,
+            reason="phase4_aqi_rebuild",
+            source_mode="combined_local",
+            requested_timeseries_ids=[],
+            queue_note=(
+                "phase4 ordered AQI rebuild "
+                f"pollutants={','.join(str(value) for value in row['pollutant_codes'])} "
+                f"reasons={','.join(str(value) for value in row['reasons'])}"
+            ),
+            log=log,
+            history_version="v2",
+        )
+    return planned
+
+
 def _create_final_verification_view(
     run_state: Mapping[str, Any], *, config: HistoryPathConfig, from_day: str, to_day: str,
     selected_days: Iterable[str] | None = None,
@@ -19442,11 +22160,15 @@ def _create_final_verification_view(
     prefixes = [
         *(f"{prefix.strip('/')}/day_utc={day}" for day in days for prefix in (
             config.observations_data_prefix,
+            config.aqilevels_hourly_data_prefix,
             config.observations_timeseries_index_prefix,
+            config.aqilevels_timeseries_index_prefix,
         )),
+        *([f"{config.aqilevels_hourly_debug_prefix.strip('/')}/day_utc={day}" for day in days]
+          if config.aqilevels_hourly_debug_prefix else []),
         config.timeseries_binding_index_prefix.strip("/"),
     ]
-    file_keys = [config.observations_latest_index_key.strip("/")]
+    file_keys = [config.observations_latest_index_key.strip("/"), config.aqilevels_latest_index_key.strip("/")]
     def link_file(source: Path, relative_key: str) -> None:
         normalized_key = _normalise_overlay_object_key(relative_key)
         if normalized_key in tombstones or any(
@@ -19487,10 +22209,277 @@ def _create_final_verification_view(
 def _final_verification_stage_for_gap(domain: str, gap: Mapping[str, Any]) -> str:
     gap_type = str(gap.get("gap_type") or "")
     if gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
-        return "observations_metadata_proposal"
+        return "observations_metadata_proposal" if domain == "observations" else "aqi_proposal"
     if "manifest" in gap_type or gap_type.startswith("day_") or gap_type.startswith("connector_"):
-        return "observations_metadata_proposal"
-    return "observations_proposal"
+        return "observations_metadata_proposal" if domain == "observations" else "aqi_proposal"
+    return "observations_proposal" if domain == "observations" else "aqi_proposal"
+
+
+def _metadata_iso_value(value: Any, *, field: str) -> tuple[dt.datetime | None, str | None]:
+    if value is None:
+        return None, None
+    parsed = _parse_required_timestamp_value(value)
+    if parsed is None:
+        raise ValueError(f"invalid_{field}")
+    return parsed, fmt_iso(parsed)
+
+
+def _metadata_positive_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"invalid_{field}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid_{field}") from exc
+    if parsed <= 0 or str(parsed) != str(value).strip():
+        raise ValueError(f"invalid_{field}")
+    return parsed
+
+
+def _metadata_identity(item: Mapping[str, Any]) -> str:
+    return (
+        f"{item['domain']}|{item['day_utc']}|{item['connector_id']}|"
+        f"{item['pollutant_code']}"
+    )
+
+
+def _metadata_index_identity_from_key(key: str, config: HistoryPathConfig) -> tuple[str, str, int, str]:
+    normalized = _normalise_overlay_object_key(key)
+    for domain, prefix in (
+        ("observations", config.observations_timeseries_index_prefix),
+        ("aqilevels", config.aqilevels_timeseries_index_prefix),
+    ):
+        escaped = re.escape(prefix.strip("/"))
+        match = re.fullmatch(
+            rf"{escaped}/day_utc=(\d{{4}}-\d{{2}}-\d{{2}})/connector_id=(\d+)/"
+            rf"pollutant_code=([^/]+)/manifest\.json",
+            normalized,
+        )
+        if match:
+            day_utc, connector_id, pollutant_code = match.groups()
+            dt.date.fromisoformat(day_utc)
+            connector = _metadata_positive_int(connector_id, field="affected_index_connector_id")
+            if not re.fullmatch(r"[a-z0-9_]+", pollutant_code):
+                raise ValueError("affected_index_pollutant_code_invalid")
+            return domain, day_utc, connector, pollutant_code
+    raise ValueError("affected_pollutant_index_key_invalid")
+
+
+def _validate_timeseries_metadata_coverage(
+    *, payload: Mapping[str, Any], domain: Literal["observations", "aqilevels"],
+) -> list[dict[str, Any]]:
+    coverage_name = "observations_coverage" if domain == "observations" else "aqi_coverage"
+    label = "observations" if domain == "observations" else "aqi"
+    coverage = payload.get(coverage_name)
+    if not isinstance(coverage, Mapping) or not isinstance(coverage.get("entries"), list):
+        raise ValueError(f"{label}_coverage_invalid")
+    entries: list[dict[str, Any]] = []
+    for raw in coverage["entries"]:
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{label}_coverage_entry_invalid")
+        if str(raw.get("domain") or "") != domain:
+            raise ValueError(f"{label}_coverage_entry_domain_mismatch")
+        day_utc = str(raw.get("day_utc") or "")
+        try:
+            dt.date.fromisoformat(day_utc)
+        except ValueError as exc:
+            raise ValueError(f"{label}_coverage_entry_day_utc_invalid") from exc
+        connector_id = _metadata_positive_int(raw.get("connector_id"), field=f"{label}_coverage_entry_connector_id")
+        pollutant_code = str(raw.get("pollutant_code") or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9_]+", pollutant_code):
+            raise ValueError(f"{label}_coverage_entry_pollutant_code_invalid")
+        if domain == "aqilevels" and pollutant_code not in V2_AQI_SUPPORTED_POLLUTANTS:
+            raise ValueError("aqi_coverage_entry_unsupported_pollutant")
+        row_count = _metadata_positive_int(raw.get("row_count"), field=f"{label}_coverage_entry_row_count")
+        min_name = "min_observed_at_utc" if domain == "observations" else "min_timestamp_hour_utc"
+        max_name = "max_observed_at_utc" if domain == "observations" else "max_timestamp_hour_utc"
+        minimum, minimum_text = _metadata_iso_value(raw.get(min_name), field=min_name)
+        maximum, maximum_text = _metadata_iso_value(raw.get(max_name), field=max_name)
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(f"{label}_coverage_timestamp_range_invalid")
+        backed, backed_text = _metadata_iso_value(raw.get("backed_up_at_utc"), field="backed_up_at_utc")
+        entries.append({
+            "domain": domain, "day_utc": day_utc, "connector_id": connector_id,
+            "pollutant_code": pollutant_code, "row_count": row_count,
+            min_name: minimum_text, max_name: maximum_text, "backed_up_at_utc": backed_text,
+            "_minimum": minimum, "_maximum": maximum, "_backed": backed,
+        })
+    identities = {_metadata_identity(item) for item in entries}
+    if len(identities) != len(entries):
+        raise ValueError(f"{label}_coverage_entry_identity_duplicate")
+    ordered = sorted(entries, key=lambda item: (item["day_utc"], item["connector_id"], item["pollutant_code"]))
+    timestamp_min = min((item["_minimum"] for item in ordered if item["_minimum"] is not None), default=None)
+    timestamp_max = max((item["_maximum"] for item in ordered if item["_maximum"] is not None), default=None)
+    backed_max = max((item["_backed"] for item in ordered if item["_backed"] is not None), default=None)
+    expected = {
+        "row_count": sum(item["row_count"] for item in ordered),
+        "day_count": len({item["day_utc"] for item in ordered}),
+        "first_day_utc": ordered[0]["day_utc"] if ordered else None,
+        "last_day_utc": ordered[-1]["day_utc"] if ordered else None,
+        "connector_ids": sorted({item["connector_id"] for item in ordered}),
+        "pollutant_codes": sorted({item["pollutant_code"] for item in ordered}),
+        "first_observed_at_utc": fmt_iso(timestamp_min) if domain == "observations" and timestamp_min else None,
+        "last_observed_at_utc": fmt_iso(timestamp_max) if domain == "observations" and timestamp_max else None,
+        "first_timestamp_hour_utc": fmt_iso(timestamp_min) if domain == "aqilevels" and timestamp_min else None,
+        "last_timestamp_hour_utc": fmt_iso(timestamp_max) if domain == "aqilevels" and timestamp_max else None,
+        "backed_up_at_utc": fmt_iso(backed_max) if backed_max else None,
+    }
+    for field, expected_value in expected.items():
+        if coverage.get(field) != expected_value:
+            raise ValueError(f"{label}_coverage_{field}_mismatch")
+    return entries
+
+
+def _validate_timeseries_metadata_payload(
+    *, payload: Mapping[str, Any], key: str, config: HistoryPathConfig,
+) -> tuple[int, list[dict[str, Any]]]:
+    match = re.search(r"/timeseries_id=(\d+)\.json$", key)
+    if not match:
+        raise ValueError("metadata_object_key_invalid")
+    timeseries_id = _metadata_positive_int(match.group(1), field="timeseries_id")
+    if payload.get("schema_version") != 1:
+        raise ValueError("schema_version_mismatch")
+    if payload.get("source") != "r2_history_v2_timeseries_indexes":
+        raise ValueError("source_mismatch")
+    if payload.get("history_version") != "v2" or payload.get("index_kind") != "timeseries_metadata":
+        raise ValueError("history_version_or_index_kind_mismatch")
+    if _metadata_positive_int(payload.get("timeseries_id"), field="timeseries_id") != timeseries_id:
+        raise ValueError("timeseries_id_mismatch")
+    index_prefix = config.observations_latest_index_key.rsplit("/", 1)[0]
+    metadata_prefix = key.rsplit("/", 1)[0]
+    if payload.get("index_prefix") != index_prefix:
+        raise ValueError("index_prefix_mismatch")
+    if payload.get("timeseries_metadata_index_prefix") != metadata_prefix:
+        raise ValueError("timeseries_metadata_index_prefix_mismatch")
+    observations = _validate_timeseries_metadata_coverage(payload=payload, domain="observations")
+    aqilevels = _validate_timeseries_metadata_coverage(payload=payload, domain="aqilevels")
+    entries = observations + aqilevels
+    connector_ids = sorted({item["connector_id"] for item in entries})
+    pollutant_codes = sorted({item["pollutant_code"] for item in entries})
+    backed_values = [item["_backed"] for item in entries if item["_backed"] is not None]
+    backed = max(backed_values) if backed_values else None
+    if payload.get("connector_ids") != connector_ids:
+        raise ValueError("top_level_connector_ids_mismatch")
+    if payload.get("connector_id") != (connector_ids[0] if len(connector_ids) == 1 else None):
+        raise ValueError("top_level_connector_id_mismatch")
+    if payload.get("pollutant_codes") != pollutant_codes:
+        raise ValueError("top_level_pollutant_codes_mismatch")
+    expected_backed = fmt_iso(backed) if backed else None
+    if payload.get("backed_up_at_utc") != expected_backed:
+        raise ValueError("top_level_backed_up_at_utc_mismatch")
+    generated, generated_text = _metadata_iso_value(payload.get("generated_at"), field="generated_at")
+    if backed is not None and generated_text != expected_backed:
+        raise ValueError("top_level_generated_at_mismatch")
+    if backed is None and payload.get("generated_at") is not None and generated is None:
+        raise ValueError("top_level_generated_at_invalid")
+    return timeseries_id, entries
+
+
+def _validate_affected_timeseries_index(
+    *, index_payload: Mapping[str, Any], index_key: str, identity: tuple[str, str, int, str],
+    config: HistoryPathConfig,
+) -> None:
+    domain, day_utc, connector_id, pollutant_code = identity
+    if index_payload.get("history_version") != "v2":
+        raise ValueError("affected_pollutant_index_history_version_mismatch")
+    if index_payload.get("index_kind") != "timeseries_file_ranges":
+        raise ValueError("affected_pollutant_index_kind_mismatch")
+    if index_payload.get("domain") != domain:
+        raise ValueError("affected_pollutant_index_domain_mismatch")
+    if index_payload.get("day_utc") != day_utc:
+        raise ValueError("affected_pollutant_index_day_utc_mismatch")
+    if index_payload.get("connector_id") != connector_id:
+        raise ValueError("affected_pollutant_index_connector_id_mismatch")
+    if index_payload.get("pollutant_code") != pollutant_code:
+        raise ValueError("affected_pollutant_index_pollutant_code_mismatch")
+    expected_grain = None if domain == "observations" else "hourly"
+    expected_profile = None if domain == "observations" else "data"
+    if index_payload.get("grain") != expected_grain:
+        raise ValueError("affected_pollutant_index_grain_mismatch")
+    if index_payload.get("profile") != expected_profile:
+        raise ValueError("affected_pollutant_index_profile_mismatch")
+    data_prefix = config.observations_data_prefix if domain == "observations" else config.aqilevels_hourly_data_prefix
+    if index_payload.get("data_prefix") != data_prefix:
+        raise ValueError("affected_pollutant_index_data_prefix_mismatch")
+    expected_manifest_key = (
+        f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
+        f"pollutant_code={pollutant_code}/manifest.json"
+    )
+    if index_payload.get("pollutant_manifest_key") != expected_manifest_key:
+        raise ValueError("affected_pollutant_index_manifest_key_mismatch")
+    if not isinstance(index_payload.get("timeseries_row_counts"), Mapping):
+        raise ValueError("affected_pollutant_index_timeseries_row_counts_invalid")
+
+
+def _validate_changed_timeseries_metadata(
+    *, run_state: Mapping[str, Any], view_root: Path, config: HistoryPathConfig,
+) -> list[dict[str, Any]]:
+    """Validate canonical metadata bodies and their exact affected indexes."""
+    gaps: list[dict[str, Any]] = []
+    operations_by_key: dict[str, dict[str, Any]] = {}
+    for raw in list(run_state.get("timeseries_metadata_operations") or []):
+        if not isinstance(raw, Mapping):
+            continue
+        key = _normalise_overlay_object_key(str(raw.get("metadata_object_key") or ""))
+        if not key or key in operations_by_key:
+            gaps.append({"stage": "timeseries_metadata", "object_key": key or None, "gap_type": "metadata_operation_key_invalid_or_duplicate"})
+            continue
+        operations_by_key[key] = dict(raw)
+    for key, operation in sorted(operations_by_key.items()):
+        try:
+            outcome = str(operation.get("outcome") or "")
+            if outcome not in {"succeeded", "skipped_unchanged"}:
+                raise ValueError("metadata_operation_missing_canonical_outcome")
+            overlay_entry = dict(run_state.get("objects") or {}).get(key)
+            if outcome == "succeeded" and (
+                not isinstance(overlay_entry, Mapping)
+                or not overlay_entry.get("uploaded") or not overlay_entry.get("r2_verified")
+            ):
+                raise ValueError("metadata_operation_verified_success_missing_overlay_evidence")
+            path = view_root / key
+            if not path.is_file():
+                raise ValueError("metadata_operation_final_object_missing")
+            raw_bytes = path.read_bytes()
+            if operation.get("expected_final_sha256") and hashlib.sha256(raw_bytes).hexdigest() != str(operation["expected_final_sha256"]):
+                raise ValueError("expected_final_metadata_hash_mismatch")
+            payload = json.loads(raw_bytes.decode("utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("metadata_payload_not_object")
+            timeseries_id, entries = _validate_timeseries_metadata_payload(
+                payload=payload, key=key, config=config,
+            )
+            entries_by_identity = {_metadata_identity(item): item for item in entries}
+            replacements = {str(value) for value in list(operation.get("replacement_identities") or [])}
+            removals = {str(value) for value in list(operation.get("removal_identities") or [])}
+            if replacements & removals:
+                raise ValueError("metadata_operation_identity_conflict")
+            if not replacements.issubset(entries_by_identity):
+                raise ValueError("requested_metadata_replacement_missing")
+            if removals & set(entries_by_identity):
+                raise ValueError("requested_metadata_removal_present")
+            affected_keys = sorted({_normalise_overlay_object_key(str(value)) for value in list(operation.get("affected_pollutant_index_keys") or [])})
+            for index_key in affected_keys:
+                identity = _metadata_index_identity_from_key(index_key, config)
+                identity_key = "|".join((identity[0], identity[1], str(identity[2]), identity[3]))
+                if identity_key not in replacements and identity_key not in removals:
+                    raise ValueError("affected_metadata_index_without_authoritative_identity")
+                index_path = view_root / index_key
+                if not index_path.is_file():
+                    raise ValueError("affected_pollutant_index_missing")
+                index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+                if not isinstance(index_payload, Mapping):
+                    raise ValueError("affected_pollutant_index_not_object")
+                _validate_affected_timeseries_index(
+                    index_payload=index_payload, index_key=index_key, identity=identity, config=config,
+                )
+                actual = int((index_payload.get("timeseries_row_counts") or {}).get(str(timeseries_id)) or 0)
+                if identity_key in replacements and actual != int(entries_by_identity[identity_key]["row_count"]):
+                    raise ValueError("affected_pollutant_index_entry_mismatch")
+                if identity_key in removals and actual != 0:
+                    raise ValueError("requested_metadata_removal_still_indexed")
+        except Exception as exc:
+            gaps.append({"stage": "timeseries_metadata", "object_key": key, "gap_type": f"timeseries_metadata_invalid:{exc}"})
+    return gaps
 
 
 def _expected_v2_core_timeseries_bindings(
@@ -19658,7 +22647,6 @@ def run_sos_timeseries_binding_verification(
         individual_root=individual_root,
         pack_root=pack_root,
         required_timeseries_ids=required_ids,
-        observation_generation="v3",
     ) as (view_root, mutable_audit):
         provider_audit = mutable_audit
         gaps = _validate_v2_timeseries_bindings(
@@ -19775,9 +22763,6 @@ def _verified_deleted_object_keys(
 
 MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1"
 PUBLICATION_SCHEDULE_CONTRACT_VERSION = "integrity-apply-publication-schedule-v1"
-SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT = (
-    "sos-light-v3-apply-persistence-v1"
-)
 
 
 def canonical_mutation_event_hash_input(event: Mapping[str, Any]) -> bytes:
@@ -19877,244 +22862,10 @@ def verify_publication_schedule(
     }
 
 
-def _verify_sos_light_v3_apply_persistence(
-    run_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    apply_summary = run_state.get("apply") or {}
-    persistence = apply_summary.get("persistence") or {}
-    journal_path = _resolve_run_scoped_apply_artifact(
-        run_state, persistence.get("mutation_journal_path")
-    )
-    body = journal_path.read_bytes()
-    expected_bytes = int(persistence.get("mutation_journal_bytes") or -1)
-    expected_sha256 = str(
-        persistence.get("mutation_journal_sha256") or ""
-    ).strip().lower()
-    if (
-        len(body) != expected_bytes
-        or hashlib.sha256(body).hexdigest() != expected_sha256
-    ):
-        raise ValueError(f"mutation journal identity mismatch: {journal_path}")
-    lines = [line for line in body.splitlines() if line]
-    if len(lines) != int(persistence.get("mutation_journal_event_count") or 0):
-        raise ValueError(
-            f"mutation journal event-count mismatch: {journal_path}"
-        )
-    run_id = str(run_state.get("run_id") or "")
-    previous_sha256: str | None = None
-    parsed_events: list[Mapping[str, Any]] = []
-    event_types: dict[str, int] = {}
-    publication_events: dict[int, list[Mapping[str, Any]]] = {}
-    publication_event_types = {
-        "put_started",
-        "put_completed",
-        "post_put_get_started",
-        "post_put_get_verified",
-        "put_or_verification_failed",
-    }
-    for line in lines:
-        event = json.loads(line.decode("utf-8"))
-        if not isinstance(event, Mapping):
-            raise ValueError("mutation journal event is not an object")
-        if str(event.get("run_id") or "") != run_id:
-            raise ValueError("mutation journal run identity mismatch")
-        if (
-            event.get("event_hash_contract_version")
-            != MUTATION_EVENT_HASH_CONTRACT_VERSION
-        ):
-            raise ValueError("unsupported legacy mutation journal contract")
-        if event.get("previous_event_sha256") != previous_sha256:
-            raise ValueError("mutation journal event-chain linkage mismatch")
-        event_sha256 = str(event.get("event_sha256") or "").strip().lower()
-        recomputed_sha256 = hashlib.sha256(
-            canonical_mutation_event_hash_input(event)
-        ).hexdigest()
-        if event_sha256 != recomputed_sha256:
-            raise ValueError("mutation journal event-hash mismatch")
-        previous_sha256 = recomputed_sha256
-        event_type = str(event.get("event_type") or "")
-        event_types[event_type] = event_types.get(event_type, 0) + 1
-        parsed_events.append(event)
-        if event_type in publication_event_types:
-            operation_id = int(event.get("operation_id") or 0)
-            if operation_id <= 0:
-                raise ValueError(
-                    "v3 publication event operation identity is invalid"
-                )
-            publication_events.setdefault(operation_id, []).append(event)
-    if (
-        previous_sha256
-        != persistence.get("mutation_journal_tail_event_sha256")
-    ):
-        raise ValueError("mutation journal event-chain tail mismatch")
-
-    evidence_entries = list(
-        apply_summary.get("v3_publication_evidence") or []
-    )
-    if apply_summary.get("status") == "succeeded":
-        if (
-            not parsed_events
-            or parsed_events[-1].get("event_type")
-            != "canonical_apply_completed"
-        ):
-            raise ValueError("v3 mutation journal completion is absent")
-        expected_event_sequence = [
-            "put_started",
-            "put_completed",
-            "post_put_get_started",
-            "post_put_get_verified",
-        ]
-        evidence_operation_ids: set[int] = set()
-        uploaded_count = 0
-        skipped_count = 0
-        for raw_evidence in evidence_entries:
-            if not isinstance(raw_evidence, Mapping):
-                raise ValueError("v3 publication evidence is invalid")
-            operation_id = int(raw_evidence.get("operation_id") or 0)
-            key = str(raw_evidence.get("object_key") or "")
-            sha256 = str(raw_evidence.get("sha256") or "").strip().lower()
-            byte_size = int(raw_evidence.get("bytes") or -1)
-            events = publication_events.get(operation_id) or []
-            if (
-                operation_id <= 0
-                or operation_id in evidence_operation_ids
-                or not key
-                or not re.fullmatch(r"[a-f0-9]{64}", sha256)
-                or byte_size < 0
-                or raw_evidence.get("r2_verified") is not True
-                or raw_evidence.get("durable") is not True
-                or int(
-                    raw_evidence.get("post_put_verification_get_count") or 0
-                )
-                != 1
-                or [str(event.get("event_type") or "") for event in events]
-                != expected_event_sequence
-                or any(
-                    str(event.get("canonical_key") or "") != key
-                    or str(event.get("sha256") or "") != sha256
-                    or int(event.get("byte_size") or -1) != byte_size
-                    for event in events
-                )
-            ):
-                raise ValueError(
-                    f"v3 publication evidence is incomplete: {key}"
-                )
-            uploaded = raw_evidence.get("uploaded") is True
-            skipped = raw_evidence.get("skipped_unchanged") is True
-            if uploaded == skipped:
-                raise ValueError(
-                    f"v3 publication disposition is contradictory: {key}"
-                )
-            uploaded_count += int(uploaded)
-            skipped_count += int(skipped)
-            evidence_operation_ids.add(operation_id)
-        if evidence_operation_ids != set(publication_events):
-            raise ValueError("v3 publication journal/evidence operations differ")
-        completed = len(evidence_entries)
-        if not (
-            completed
-            == int(apply_summary.get("completed_writes") or 0)
-            == int(
-                apply_summary.get("completed_post_put_verifications") or 0
-            )
-            == int(apply_summary.get("get_verified_writes") or 0)
-            and uploaded_count
-            == int(apply_summary.get("uploaded_writes") or 0)
-            and skipped_count
-            == int(apply_summary.get("skipped_unchanged_writes") or 0)
-        ):
-            raise ValueError("v3 publication evidence counts differ")
-        writer_result = apply_summary.get("canonical_v3_writer_result")
-        if (
-            not isinstance(writer_result, Mapping)
-            or writer_result.get("ok") is not True
-        ):
-            raise ValueError("canonical v3 writer result is absent")
-
-    sidecars: list[dict[str, Any]] = []
-    verified_deletions = 0
-    for raw_prefix in list(run_state.get("tombstone_prefixes") or []):
-        if not isinstance(raw_prefix, Mapping) or not raw_prefix.get("proposed"):
-            continue
-        if raw_prefix.get("deletion_verified") is not True:
-            if apply_summary.get("status") == "succeeded":
-                raise ValueError("successful v3 apply has unverified deletion")
-            continue
-        keys = _verified_deleted_object_keys(run_state, raw_prefix)
-        verified_deletions += 1
-        sidecars.append({
-            "prefix": str(raw_prefix.get("prefix") or ""),
-            "path": str(raw_prefix.get("deleted_keys_sidecar_path") or ""),
-            "bytes": int(raw_prefix.get("deleted_keys_sidecar_bytes") or 0),
-            "sha256": str(raw_prefix.get("deleted_keys_sha256") or ""),
-            "deleted_object_count": len(keys),
-        })
-    if (
-        len(sidecars)
-        != int(persistence.get("deleted_key_sidecar_count") or 0)
-    ):
-        raise ValueError("deleted-key sidecar-count mismatch")
-    if apply_summary.get("status") == "succeeded" and not (
-        verified_deletions
-        == int(apply_summary.get("completed_deletions") or 0)
-        == (
-            int(event_types.get("deletion_verified") or 0)
-            + int(event_types.get("exact_v3_scope_deletion_verified") or 0)
-        )
-    ):
-        raise ValueError("v3 deletion verification counts differ")
-
-    node_writes = int(
-        persistence.get("node_complete_run_state_write_count") or 0
-    )
-    coordinator_writes = int(
-        persistence.get("coordinator_complete_run_state_write_count") or 0
-    )
-    total_writes = int(
-        persistence.get("total_complete_run_state_write_count") or 0
-    )
-    if total_writes != node_writes + coordinator_writes:
-        raise ValueError("complete run-state write count mismatch")
-    if (
-        "complete_run_state_write_count" in persistence
-        and int(persistence.get("complete_run_state_write_count") or 0)
-        != total_writes
-    ):
-        raise ValueError(
-            "legacy complete run-state write count is not an exact total alias"
-        )
-    return {
-        "status": "verified",
-        "contract_version": SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT,
-        "mutation_journal_path": str(journal_path),
-        "mutation_journal_bytes": len(body),
-        "mutation_journal_sha256": expected_sha256,
-        "mutation_journal_event_count": len(lines),
-        "mutation_journal_tail_event_sha256": previous_sha256,
-        "event_type_counts": event_types,
-        "verified_publication_object_count": len(evidence_entries),
-        "deleted_key_sidecars": sidecars,
-        "compact_checkpoint_count": int(
-            persistence.get("compact_checkpoint_count") or 0
-        ),
-        "node_complete_run_state_write_count": node_writes,
-        "coordinator_complete_run_state_write_count": coordinator_writes,
-        "total_complete_run_state_write_count": total_writes,
-        "mutation_journal_flush_count": int(
-            persistence.get("mutation_journal_flush_count") or 0
-        ),
-    }
-
-
 def verify_apply_persistence_artifacts(
     run_state: Mapping[str, Any],
 ) -> dict[str, Any]:
     persistence = ((run_state.get("apply") or {}).get("persistence") or {})
-    if (
-        persistence.get("contract_version")
-        == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT
-    ):
-        return _verify_sos_light_v3_apply_persistence(run_state)
     journal_path_raw = persistence.get("mutation_journal_path")
     if not journal_path_raw:
         return {"status": "not_available", "reason": "mutation_journal_not_recorded"}
@@ -20385,6 +23136,8 @@ def run_v2_final_verification(
     to_day: str,
     allowed_connector_ids: set[int] | None,
     source_scope: dict[str, Any] | None,
+    check_aqi_debug: bool,
+    require_aqi_debug: bool,
     log: logging.Logger,
     selected_days: Iterable[str] | None = None,
     require_remote_state: bool = True,
@@ -20409,6 +23162,8 @@ def run_v2_final_verification(
         selected_days=selected_days,
         allowed_connector_ids=allowed_connector_ids,
         source_scope=source_scope,
+        check_aqi_debug=check_aqi_debug,
+        require_aqi_debug=require_aqi_debug,
         log=log,
         allowed_real_roots=(
             Path(str(run_state["overlay_root"])),
@@ -20440,6 +23195,8 @@ def run_v2_final_verification(
     ))
     for domain, gaps in (
         ("observations", list((recheck.get("observations") or {}).get("gaps") or [])),
+        ("aqilevels", list((recheck.get("aqilevels") or {}).get("gaps") or [])),
+        ("aqilevels", list(((recheck.get("aqilevels") or {}).get("debug") or {}).get("gaps") or [])),
     ):
         for gap in gaps:
             if isinstance(gap, Mapping) and str(gap.get("severity") or "error") == "error":
@@ -20604,7 +23361,7 @@ def cleanup_successful_repair_overlay(run_state: dict[str, Any]) -> dict[str, An
 
 
 def _object_operation_domain(object_key: str) -> str:
-    return "observations"
+    return "aqilevels" if "/aqilevels_" in object_key or "/aqilevels/" in object_key else "observations"
 
 
 def record_integrity_object_operations(
@@ -21224,7 +23981,7 @@ def run_canonical_apply_executor(
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
     command = [
         node_bin,
-        str(repo_root / "scripts/backup_r2/uk_aq_apply_sos_light_v3_proposal.mjs"),
+        str(repo_root / "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"),
         "--run-state-json", str(run_state["run_state_path"]),
         "--write-r2",
     ]
@@ -21461,7 +24218,6 @@ def run_integrity_dropbox_currentness_gate(
     dropbox_root: str | Path,
     observations_prefix: str,
     timeseries_binding_backup_mode: str,
-    checkpoint_only: bool = False,
 ) -> dict[str, Any]:
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -21472,12 +24228,10 @@ def run_integrity_dropbox_currentness_gate(
             / "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
         ),
         "--dropbox-root", str(dropbox_root),
-        "--observation-generation", "v3",
+        "--observation-generation", "v2",
         "--observations-prefix", observations_prefix,
         "--timeseries-binding-backup-mode", timeseries_binding_backup_mode,
     ]
-    if checkpoint_only:
-        command.append("--checkpoint-only")
     completed = subprocess.run(
         command,
         cwd=repo_root,
@@ -23095,41 +25849,14 @@ def summarize_ordered_apply_verification(
         })
     written_keys: list[str] = []
     verification_evidence: list[dict[str, Any]] = []
-    persistence_contract = str(
-        ((run_state.get("apply") or {}).get("persistence") or {}).get(
-            "contract_version"
-        )
-        or ""
-    )
-    if persistence_contract == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT:
-        ordered_entries = [
-            (
-                str(entry.get("object_key") or ""),
-                {
-                    **dict(entry),
-                    "proposed": True,
-                },
-            )
-            for entry in list(
-                (run_state.get("apply") or {}).get(
-                    "v3_publication_evidence"
-                )
-                or []
-            )
-            if isinstance(entry, Mapping)
-        ]
-    else:
-        ordered_entries = sorted(
-            dict(run_state.get("objects") or {}).items()
-        )
-    for object_key, raw_entry in ordered_entries:
+    for object_key, raw_entry in sorted(dict(run_state.get("objects") or {}).items()):
         if not isinstance(raw_entry, Mapping) or not raw_entry.get("proposed"):
             continue
         entry = dict(raw_entry)
         get_count = int(entry.get("post_put_verification_get_count") or 0)
         evidence = {
             "object_key": object_key,
-            "bytes": entry.get("bytes", entry.get("byte_size")),
+            "bytes": entry.get("bytes"),
             "sha256": entry.get("sha256"),
             "uploaded": bool(entry.get("uploaded")),
             "r2_verified": bool(entry.get("r2_verified")),
@@ -23141,17 +25868,6 @@ def summarize_ordered_apply_verification(
             "final_live_sha256": entry.get("final_live_sha256"),
         }
         verification_evidence.append(evidence)
-        if persistence_contract == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT and (
-            evidence["r2_verified"]
-            and get_count == 1
-            and (
-                evidence["uploaded"]
-                or evidence["skipped_unchanged"]
-            )
-        ):
-            if evidence["uploaded"]:
-                written_keys.append(str(object_key))
-            continue
         if (
             evidence["delegated_global_latest_finalization"]
             and evidence["skipped_unchanged"]
@@ -23236,11 +25952,14 @@ def run_v2_integrity_repair_flow(
     env: dict[str, str],
     v2_observations: Mapping[str, Any],
     verified_first_value_at_connector_days: Iterable[Mapping[str, Any]] = (),
+    v2_aqilevels: Mapping[str, Any],
     final_verification_config: HistoryPathConfig,
     from_day: str,
     to_day: str,
     allowed_connector_ids: set[int] | None,
     source_scope: dict[str, Any] | None,
+    check_aqi_debug: bool,
+    require_aqi_debug: bool,
     limits: LimitTracker,
     dry_run: bool,
     log: logging.Logger,
@@ -23290,6 +26009,7 @@ def run_v2_integrity_repair_flow(
             "mutation_connector_ids": [1],
             "protected_connector_ids": resolved_protected_connector_ids,
             "selected_mutation_connector_ids": [1],
+            "aqi_policy": "bypassed_observation_history_only",
             "target_authority": "explicit_selected_scope",
             "explicit_selected_partitions": explicit_selected_partitions,
             "explicit_selected_partition_count": len(
@@ -23309,6 +26029,9 @@ def run_v2_integrity_repair_flow(
         conn=conn, run_id=run_id, env_name=env_name, run_compact=run_compact,
         env=env, v2_observations=v2_observations, dry_run=dry_run,
         run_backfill=True, limits=limits, log=log, run_state=run_state,
+        # Phase 4 owns the only AQI queue for this coordinator run.  The
+        # historical observation specialist must not enqueue a duplicate.
+        queue_aqi_from_observation_repairs=False,
         repair_pollutants=repair_pollutants,
         source_scope=source_scope,
         explicit_selected_partitions=explicit_selected_partitions,
@@ -23412,7 +26135,7 @@ def run_v2_integrity_repair_flow(
     metadata = (
         {"status": "blocked_dependency", "reason": "observation_repair_failed", "results": []}
         if observation_failed else
-        _run_v3_observation_metadata_proposal(
+        _run_v2_observation_metadata_executor(
             env=env, actions=metadata_actions, dry_run=dry_run, log=log,
             run_state=run_state, conn=conn,
         )
@@ -23426,10 +26149,281 @@ def run_v2_integrity_repair_flow(
         assemble_sos_light_complete_days(run_state)
     observation_manifest_status = str(metadata.get("manifest_status") or metadata.get("status") or "not_run")
     observation_index_status = str(metadata.get("index_status") or metadata.get("status") or "not_run")
+    observation_stages_verified = not observation_failed and observation_manifest_status not in {
+        "failed", "blocked_dependency",
+    } and observation_index_status not in {
+        "failed", "blocked_dependency",
+    }
+    if dedicated_sos_historical_replacement:
+        aqi_work: list[dict[str, Any]] = []
+        aqi_blocked: list[dict[str, Any]] = []
+    else:
+        aqi_work, aqi_blocked = _phase4_aqi_work(
+            conn=conn, run_state=run_state, v2_aqilevels=v2_aqilevels,
+        )
+    aqi_bridge_metrics: dict[str, Any] = {
+        "v2_aqi_integrity_rebuild_bridge_ran": False,
+        "v2_aqi_rebuilds_queued_from_integrity": 0,
+        "planned_v2_aqi_rebuilds_from_integrity": [],
+        "planned_aqi_rebuild_connector_days": [],
+        "queued_aqi_only_connector_days": [],
+    }
+    if observation_stages_verified and not dedicated_sos_historical_replacement:
+        # The canonical coordinator owns the executable bridge.  The
+        # pre-coordinator check-only path deliberately does not queue work;
+        # doing so here makes observation-backed AQI coverage gaps available
+        # to the combined local proposal before final verification.
+        aqi_bridge_metrics = queue_v2_aqi_rebuilds_from_integrity_gaps(
+            conn=conn,
+            run_id=run_id,
+            env_name=env_name,
+            env=env,
+            v2_aqilevels=v2_aqilevels,
+            # Canonical dry-runs still prepare and validate their disposable
+            # local proposal.  Match the existing Phase 4 queue semantics;
+            # remote application remains disabled by the coordinator.
+            dry_run=False,
+            run_backfill=True,
+            log=log,
+            allowed_connector_ids=allowed_connector_ids,
+        )
+        bridge_work, bridge_blocked = _phase4_aqi_work_from_integrity_bridge(
+            conn=conn,
+            planned_rows=aqi_bridge_metrics["planned_aqi_rebuild_connector_days"],
+        )
+        aqi_work = _merge_phase4_aqi_work(aqi_work, bridge_work)
+        aqi_blocked.extend(bridge_blocked)
+    for blocked in aqi_blocked:
+        record_blocked_scope(run_state, blocked)
+    if not observation_stages_verified:
+        aqi_result: dict[str, Any] = {
+            **aqi_bridge_metrics,
+            "status": "blocked_dependency",
+            "reason": "observation_stages_not_verified",
+            "aqi_rebuilds_queued": 0,
+            "aqi_rebuilds_queued_total": 0,
+            "aqi_rebuilds_attempted": 0,
+            "aqi_rebuilds_complete": 0,
+            "aqi_rebuilds_failed": 0,
+            "aqi_rebuild_results": [],
+        }
+        if aqi_work:
+            record_blocked_scope(run_state, {
+                "stage": "aqilevels",
+                "reason": "observation_stages_not_verified",
+                "scope_count": len(aqi_work),
+            })
+    elif dedicated_sos_historical_replacement:
+        aqi_result = {
+            **aqi_bridge_metrics,
+            "status": "bypassed",
+            "reason": "dedicated_sos_observation_history_only",
+            "aqi_rebuilds_queued": 0,
+            "aqi_rebuilds_queued_total": 0,
+            "aqi_rebuilds_attempted": 0,
+            "aqi_rebuilds_complete": 0,
+            "aqi_rebuilds_failed": 0,
+            "aqi_rebuild_results": [],
+        }
+    else:
+        combined_observations_root = _create_final_verification_view(
+            run_state,
+            config=final_verification_config,
+            from_day=from_day,
+            to_day=to_day,
+            selected_days=selected_days,
+        )
+        planned_aqi_work = _queue_phase4_aqi_work(
+            conn=conn, run_id=run_id, env_name=env_name, work=aqi_work,
+            log=log, dry_run=False,
+        )
+        aqi_result = {
+            **aqi_bridge_metrics,
+            **run_aqi_rebuild_queue_execution(
+                conn,
+                run_id=run_id,
+                env_name=env_name,
+                run_compact=run_compact,
+                env=env,
+                dry_run=False,
+                run_backfill=True,
+                limits=limits,
+                log=log,
+                dry_run_planned_rows=planned_aqi_work,
+                history_version="v2",
+                skip_stale_local_post_validation=True,
+                execute_local_proposal=True,
+                extra_env={
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(run_state["overlay_root"]),
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
+                    "UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(combined_observations_root),
+                },
+            ),
+        }
+        aqi_result["planned_phase4_aqi_work"] = planned_aqi_work
+
+    for rebuild_result in list(aqi_result.get("aqi_rebuild_results") or []):
+        if not isinstance(rebuild_result, Mapping):
+            continue
+        if str(rebuild_result.get("status") or "") in {
+            "proposal_validated", "complete",
+        }:
+            _record_backfill_core_snapshot_identity_audits(
+                run_state,
+                {
+                    "status": "ok",
+                    "core_snapshot_identity_validations": list(
+                        rebuild_result.get(
+                            "core_snapshot_identity_validations"
+                        ) or []
+                    ),
+                },
+                stage=(
+                    "aqi_worker:"
+                    f"{rebuild_result.get('day_utc')}:"
+                    f"connector={rebuild_result.get('connector_id')}"
+                ),
+            )
+
+    rebuilt_aqi_scopes: set[tuple[str, int]] = set()
+    aqi_capture_failures = 0
+    for entry in list(aqi_result.get("aqi_rebuild_results") or []):
+            if not isinstance(entry, Mapping) or str(entry.get("status") or "") != "proposal_validated":
+                continue
+            day_utc = str(entry.get("day_utc") or "").strip()
+            try:
+                connector_id = int(entry.get("connector_id"))
+            except (TypeError, ValueError):
+                continue
+            try:
+                matching_work = next(
+                    (
+                        item for item in aqi_work
+                        if str(item["day_utc"]) == day_utc
+                        and int(item["connector_id"]) == connector_id
+                    ),
+                    {},
+                )
+                object_keys = _capture_local_v2_aqi_scope(
+                    run_state=run_state, day_utc=day_utc,
+                    connector_id=connector_id, env=env,
+                    include_debug=bool(
+                        check_aqi_debug
+                        or (v2_aqilevels.get("debug") or {}).get("required")
+                    ),
+                    repair_pollutants=list(
+                        matching_work.get("pollutant_codes") or []
+                    ),
+                )
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                aqi_capture_failures += 1
+                record_blocked_scope(run_state, {
+                    "stage": "aqilevels",
+                    "day_utc": day_utc,
+                    "connector_id": connector_id,
+                    "reason": f"aqi_local_proposal_validation_failed:{type(exc).__name__}",
+                })
+                continue
+            rebuilt_aqi_scopes.add((day_utc, connector_id))
+            record_changed_scope(run_state, "AQILEVELS_CHANGED", {
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_codes": list(matching_work.get("pollutant_codes") or []),
+                "object_keys": object_keys,
+                "stage": "aqilevels",
+            })
+
+    aqi_metadata_actions = (
+        []
+        if dedicated_sos_historical_replacement
+        else _v2_aqi_metadata_actions(v2_aqilevels)
+    )
+    # The AQI writer emits manifests, but they are not trusted as the final
+    # metadata layer. Rebuild and verify pollutant, connector and day manifests
+    # from the final combined view before the targeted index is rebuilt.
+    def aqi_action_scope(action: Mapping[str, Any]) -> tuple[str, int] | None:
+        try:
+            connector_id = int(action.get("connector_id"))
+        except (TypeError, ValueError):
+            return None
+        day_utc = str(action.get("day_utc") or "").strip()
+        return (day_utc, connector_id) if day_utc and connector_id > 0 else None
+
+    aqi_metadata_actions = [
+        action for action in aqi_metadata_actions
+        if aqi_action_scope(action) not in rebuilt_aqi_scopes
+    ]
+    for day_utc, connector_id in sorted(rebuilt_aqi_scopes):
+        matching_work = next(
+            (item for item in aqi_work if str(item["day_utc"]) == day_utc and int(item["connector_id"]) == connector_id),
+            {},
+        )
+        base = {
+            "status": "planned", "executes": False,
+            "data_changes_required": False, "operator_action_required": False,
+            "history_version": "v2", "domain": "aqilevels",
+            "day_utc": day_utc, "connector_id": connector_id,
+            "requires_index_rebuild": True,
+            "gap_types": ["aqi_data_rebuilt"],
+        }
+        rebuilt_scope = next(
+            (
+                scope for scope in list((run_state.get("changed_scopes") or {}).get("AQILEVELS_CHANGED") or [])
+                if isinstance(scope, Mapping)
+                and str(scope.get("day_utc") or "") == day_utc
+                and int(scope.get("connector_id") or 0) == connector_id
+            ),
+            {},
+        )
+        proposal_aqi_pollutants = {
+            match.group(1)
+            for key in list(rebuilt_scope.get("object_keys") or [])
+            if (match := re.search(r"/pollutant_code=([a-z0-9_]+)/", str(key)))
+        }
+        for pollutant_code in list(matching_work.get("pollutant_codes") or []):
+            if pollutant_code in proposal_aqi_pollutants:
+                aqi_metadata_actions.append({**base, "kind": "aqi_pollutant_manifest_repair", "pollutant_code": pollutant_code})
+            aqi_metadata_actions.append({**base, "kind": "aqi_index_repair", "pollutant_code": pollutant_code})
+        day_base = {
+            key: value for key, value in base.items()
+            if key not in {"connector_id", "pollutant_code"}
+        }
+        aqi_metadata_actions.extend([
+            {**base, "kind": "aqi_connector_manifest_repair"},
+            {**day_base, "kind": "aqi_day_manifest_repair"},
+        ])
+    aqi_metadata = (
+        {
+            "status": "bypassed",
+            "reason": "dedicated_sos_observation_history_only",
+            "results": [],
+        }
+        if dedicated_sos_historical_replacement else
+        {"status": "blocked_dependency", "reason": "aqi_data_repair_failed", "results": []}
+        if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0 else
+        _run_v2_observation_metadata_executor(
+            env=env, actions=aqi_metadata_actions, domain="aqilevels",
+            dry_run=dry_run, log=log, run_state=run_state, conn=conn,
+        )
+    )
+    if not dedicated_sos_historical_replacement:
+        _record_metadata_executor_overlay(
+            run_state=run_state, executor_result=aqi_metadata, dry_run=dry_run,
+            manifest_scope_set="AQI_MANIFESTS_CHANGED", index_scope_set="AQI_INDEXES_CHANGED",
+            manifest_stage="aqilevels_manifests", index_stage="aqilevels_indexes",
+        )
+    aqi_manifest_status = str(aqi_metadata.get("manifest_status") or aqi_metadata.get("status") or "not_run")
+    aqi_index_status = str(aqi_metadata.get("index_status") or aqi_metadata.get("status") or "not_run")
     proposal_failed = (
         observation_failed
         or observation_manifest_status in {"failed", "blocked_dependency"}
         or observation_index_status in {"failed", "blocked_dependency"}
+        or aqi_capture_failures > 0
+        or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0
+        or aqi_manifest_status in {"failed", "blocked_dependency"}
+        or aqi_index_status in {"failed", "blocked_dependency"}
         or bool(run_state.get("blocked_scopes"))
     )
     planned_operation_counts = record_integrity_object_operations(
@@ -23527,7 +26521,34 @@ def run_v2_integrity_repair_flow(
         apply_result = run_canonical_apply_executor(run_state=run_state, env=env, log=log)
         record_integrity_object_operations(conn, run_id=run_id, run_state=run_state)
         if apply_result.get("status") == "succeeded":
-            pass
+            completed_at = fmt_iso(utc_now())
+            validated_count = 0
+            for entry in list(aqi_result.get("aqi_rebuild_results") or []):
+                if not isinstance(entry, dict) or entry.get("status") != "proposal_validated":
+                    continue
+                entry["status"] = "complete"
+                entry["remote_get_verified"] = True
+                for queue_row_id in list(entry.get("queue_row_ids") or []):
+                    conn.execute(
+                        """
+                        UPDATE aqi_rebuild_queue
+                        SET status = 'complete', finished_at_utc = ?,
+                            notes = COALESCE(notes, '') || ?
+                        WHERE id = ? AND status = 'proposal_validated'
+                        """,
+                        (completed_at, "; canonical_apply_get_verified", int(queue_row_id)),
+                    )
+                validated_count += 1
+            if validated_count:
+                aqi_result["aqi_rebuilds_complete"] = (
+                    int(aqi_result.get("aqi_rebuilds_complete") or 0) + validated_count
+                )
+                aqi_result["aqi_rebuilds_proposal_validated"] = max(
+                    0,
+                    int(aqi_result.get("aqi_rebuilds_proposal_validated") or 0)
+                    - validated_count,
+                )
+                conn.commit()
 
     if proposal_failed or apply_result.get("status") == "failed":
         first_value_at_reconciliation: dict[str, Any] = {
@@ -23630,6 +26651,8 @@ def run_v2_integrity_repair_flow(
             selected_days=selected_days,
             allowed_connector_ids=allowed_connector_ids,
             source_scope=source_scope,
+            check_aqi_debug=check_aqi_debug,
+            require_aqi_debug=require_aqi_debug,
             log=log,
             require_remote_state=not dry_run,
             repair_pollutants=repair_pollutants,
@@ -23720,6 +26743,19 @@ def run_v2_integrity_repair_flow(
         {"stage": "observations_proposal", "status": "failed" if observation_failed else "validated", "result": observations},
         {"stage": "observations_metadata_proposal", "status": "failed" if observation_manifest_status in {"failed", "blocked_dependency"} or observation_index_status in {"failed", "blocked_dependency"} else "validated", "result": metadata},
         {
+            "stage": "aqi_proposal",
+            "status": (
+                "bypassed"
+                if dedicated_sos_historical_replacement
+                else "failed"
+                if aqi_capture_failures
+                or int(aqi_result.get("aqi_rebuilds_failed") or 0)
+                else "validated"
+            ),
+            "result": aqi_result,
+            "source_mode": "combined_local",
+        },
+        {
             "stage": "latest_snapshot_auth_preflight",
             "status": auth_preflight.get("status"),
             "result": auth_preflight,
@@ -23771,7 +26807,7 @@ def run_v2_integrity_repair_flow(
     metadata_r2_operation_counts = {
         name: sum(
             int(((entry.get("output") or {}).get("r2_operation_counts") or {}).get(name) or 0)
-            for entry in (metadata,)
+            for entry in (metadata, aqi_metadata)
             if isinstance(entry, Mapping)
         )
         for name in (
@@ -23819,6 +26855,10 @@ def run_v2_integrity_repair_flow(
             [
                 "observation_gap_detection",
                 "observation_content_hash_comparison",
+                "aqi_detection",
+                "aqi_proposal",
+                "aqi_metadata",
+                "aqi_indexes",
                 "broad_final_r2_scan",
             ]
             if dedicated_sos_historical_replacement else []
@@ -23974,7 +27014,7 @@ def run_v2_integrity_repair_flow(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="uk-aq-history-integrity",
-        description="UK-AQ SOS-light v3 History Integrity entrypoint (Phase 1).",
+        description="UK-AQ History Integrity entrypoint (Phase 1).",
     )
     p.add_argument("--env", required=True, choices=["TEST", "LIVE"])
     p.add_argument(
@@ -23998,14 +27038,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="UTC scheduled logical date (YYYY-MM-DD); daily profile retries reuse this identity.",
     )
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument(
-        "--check-only",
-        action="store_true",
-        help=(
-            "Detect changes and acquire diagnostic source evidence; do not "
-            "execute repairs or canonical writes."
-        ),
-    )
+    p.add_argument("--check-only", action="store_true",
+                   help="Detect changes; do not trigger backfill.")
     p.add_argument("--run-backfill", action="store_true",
                    help="Enable the ordered v2 repair flow after read-only detection.")
     p.add_argument(
@@ -24063,17 +27097,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=default_history_version,
         choices=list(HISTORY_VERSION_CHOICES),
         help=(
-            "Fixed SOS-light v3 history layout "
+            "R2 history layout version to check (v2 only) "
             f"(default {default_history_version!r}; env UK_AQ_R2_HISTORY_INTEGRITY_VERSION)."
         ),
     )
     p.add_argument(
         "--timeseries-binding-backup-mode",
         choices=["individual", "pack"],
-        default=None,
+        default="individual",
         help=(
-            "Physical Dropbox binding representation; fixed-v3 source=sos "
-            "owns pack mode and rejects individual mode."
+            "Physical Dropbox binding representation for source=sos "
+            "(default: individual)."
         ),
     )
     p.add_argument(
@@ -24083,6 +27117,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Absolute local Dropbox root containing packed bindings; defaults "
             "to the normal R2 history Dropbox root in pack mode."
         ),
+    )
+    p.add_argument(
+        "--check-aqi-debug",
+        action="store_true",
+        default=_parse_bool(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_CHECK_AQI_DEBUG"), False),
+        help="Check optional v2 AQI hourly debug partitions (default false; env UK_AQ_R2_HISTORY_INTEGRITY_CHECK_AQI_DEBUG).",
+    )
+    p.add_argument(
+        "--require-aqi-debug",
+        action="store_true",
+        default=_parse_bool(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG"), False),
+        help="Treat missing/invalid v2 AQI hourly debug partitions as errors (default false; env UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG).",
     )
     parsed = p.parse_args(argv)
     if parsed.logical_run_date:
@@ -24109,12 +27155,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         )
     if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
         p.error("historical identity repair must remain disabled in LIVE")
-    if parsed.timeseries_binding_backup_mode is None:
-        parsed.timeseries_binding_backup_mode = (
-            "pack" if parsed.source == "sos" else "individual"
-        )
-    if parsed.source == "sos" and parsed.timeseries_binding_backup_mode != "pack":
-        p.error("fixed-v3 SOS-light source=sos requires packed Timeseries Binding backup state")
     if parsed.timeseries_binding_pack_root:
         pack_root = Path(parsed.timeseries_binding_pack_root)
         if parsed.timeseries_binding_backup_mode != "pack":
@@ -24184,11 +27224,7 @@ def select_sos_historical_replacement_route(
     requirements = {
         "source_sos": str(getattr(args, "source", "")) == "sos",
         "real_run_backfill": resolve_effective_mode(args) == "repair_apply",
-        "fixed_history_generation_v3": (
-            str(getattr(args, "history_version", ""))
-            == CURRENT_INTEGRITY_HISTORY_VERSION
-            == "v3"
-        ),
+        "history_version_v2": str(getattr(args, "history_version", "")) == "v2",
         "explicit_from_day": bool(str(getattr(args, "from_day", "") or "").strip()),
         "explicit_to_day": bool(str(getattr(args, "to_day", "") or "").strip()),
         "explicit_repair_pollutants": bool(
@@ -24462,7 +27498,7 @@ def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dic
         supabase_url=supabase_url,
         service_role_key=service_role_key,
         integrity_started_at_utc=started_iso,
-        allow_stale_dropbox=bool(args.allow_stale_dropbox and not args.run_backfill),
+        allow_stale_dropbox=bool(args.allow_stale_dropbox),
         rpc_name=str(
             os.environ.get(
                 "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
@@ -25010,7 +28046,8 @@ def _collect_guardrail_errors(cli_env: str, env: dict[str, str]) -> list[str]:
 def _detect_integrity_wrapper_capabilities(
     wrapper_path: Path,
     env_name: str,
-) -> bool:
+) -> tuple[bool, bool]:
+    # Returns (supports_observs_only, supports_aqi_only)
     try:
         proc = subprocess.run(
             [str(wrapper_path), "--help"],
@@ -25022,9 +28059,9 @@ def _detect_integrity_wrapper_capabilities(
             env={**os.environ, "UK_AQ_ENV_NAME": env_name},
         )
     except (OSError, subprocess.SubprocessError):
-        return False
+        return (False, False)
     text = proc.stdout or ""
-    return "--observs-only" in text
+    return ("--observs-only" in text, "--aqi-only" in text)
 
 
 def collect_preflight_errors(
@@ -25272,7 +28309,7 @@ def collect_preflight_errors(
             )
 
         nested_wrapper = loaded_backfill_env.get("UK_AQ_BACKFILL_WRAPPER", "").strip()
-        wrapper_is_integrity = Path(wrapper_raw).name == "uk_aq_integrity_backfill_v3.sh" if wrapper_raw else False
+        wrapper_is_integrity = Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh" if wrapper_raw else False
         if wrapper_is_integrity and not nested_wrapper:
             errors.append(
                 "UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE is required when the integrity wrapper is used, but it is not set.",
@@ -25328,18 +28365,26 @@ def collect_preflight_errors(
 
         if wrapper_raw:
             wrapper_path = Path(wrapper_raw)
-            supports_obs = _detect_integrity_wrapper_capabilities(
+            supports_obs, supports_aqi = _detect_integrity_wrapper_capabilities(
                 wrapper_path=wrapper_path,
                 env_name=args.env,
             )
-            if not supports_obs:
+            if not supports_obs or not supports_aqi:
                 supports_output_scope = _is_truthy(
                     os.environ.get("UK_AQ_BACKFILL_SUPPORTS_OUTPUT_SCOPE"),
+                )
+                supports_aqi_mode = _is_truthy(
+                    os.environ.get("UK_AQ_BACKFILL_SUPPORTS_R2_HISTORY_OBS_TO_AQILEVELS"),
                 )
                 if not supports_output_scope:
                     errors.append(
                         "Backfill capability check failed: output-scope support not detected. "
-                        "Set UK_AQ_BACKFILL_SUPPORTS_OUTPUT_SCOPE=true or use a wrapper exposing --observs-only.",
+                        "Set UK_AQ_BACKFILL_SUPPORTS_OUTPUT_SCOPE=true or use a wrapper exposing --observs-only/--aqi-only.",
+                    )
+                if not supports_aqi_mode:
+                    errors.append(
+                        "Backfill capability check failed: AQI rebuild mode support not detected. "
+                        "Set UK_AQ_BACKFILL_SUPPORTS_R2_HISTORY_OBS_TO_AQILEVELS=true.",
                     )
 
     current_state_reconciliation_enabled = _is_truthy(
@@ -25574,9 +28619,8 @@ def _v2_top_level_status_after_repair_planning(
         if any_stopped:
             return "stopped_limit"
         return current_status
-    # Check-only has no repair phase.  Report observed differences in full,
-    # but do not turn a successfully completed diagnostic into a failed run
-    # merely because repairable differences remain.
+    if v2_gap_count > 0:
+        return "fail"
     return current_status
 
 
@@ -25616,6 +28660,13 @@ def open_db(db_path: str) -> sqlite3.Connection:
     ensure_columns(conn, "source_file_timeseries_counts", {
         "source_count_mapping_identity": "TEXT",
         "source_count_mapping_hash": "TEXT",
+    })
+    ensure_columns(conn, "aqi_rebuild_queue", {
+        "history_version": "TEXT",
+        "domain": "TEXT",
+        "profile": "TEXT",
+        "pollutant_code": "TEXT",
+        "source_observations_version": "TEXT",
     })
     ensure_columns(conn, "integrity_runs", {
         "effective_mode": "TEXT",
@@ -26030,7 +29081,7 @@ def setup_logging(log_dir: str, run_compact: str, verbose: bool) -> Path:
 
 def format_summary_md(s: dict[str, Any]) -> str:
     lines = [
-        f"# UK-AQ SOS-light v3 History Integrity run — {s['env']} / {s['profile']}",
+        f"# UK-AQ History Integrity run — {s['env']} / {s['profile']}",
         "",
         f"- Started:   {s['started_at_utc']}",
         f"- Finished:  {s.get('finished_at_utc', '')}",
@@ -26163,8 +29214,12 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 "",
                 f"- Checks implemented: {bool(config.get('checks_implemented'))}",
                 f"- Observations data prefix: {config.get('observations_data_prefix')}",
+                f"- AQI hourly data prefix: {config.get('aqilevels_hourly_data_prefix')}",
+                f"- AQI hourly debug prefix: {config.get('aqilevels_hourly_debug_prefix') or '(none)'}",
                 f"- Observations index prefix: {config.get('observations_timeseries_index_prefix')}",
+                f"- AQI index prefix: {config.get('aqilevels_timeseries_index_prefix')}",
                 f"- Observations latest index: {config.get('observations_latest_index_key')}",
+                f"- AQI latest index: {config.get('aqilevels_latest_index_key')}",
             ])
         lines.append("")
 
@@ -26279,7 +29334,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
     repair_flow = s.get("repair_flow") or {}
     if repair_flow:
         lines.extend([
-            "## Observation repair coordinator",
+            "## V2 repair coordinator",
             "",
             f"- Status: {repair_flow.get('status') or '(none)'}",
             f"- Execution path: {repair_flow.get('execution_path') or 'generic_integrity'}",
@@ -26602,6 +29657,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Not-found cooldown secs: {sos.get('not_found_cooldown_seconds', 0)}",
             f"- Cross-check discrepancies: {cc_for_sos.get('discrepancy_total', 0)}",
             f"- Observation repairs: attempted={cc_for_sos.get('observation_backfills_attempted', cc_for_sos.get('backfills_attempted', 0))} ok={cc_for_sos.get('observation_backfills_ok', cc_for_sos.get('backfills_ok', 0))} failed={cc_for_sos.get('observation_backfills_failed', cc_for_sos.get('backfills_failed', 0))}",
+            f"- AQI rebuilds: queued={cc_for_sos.get('aqi_rebuilds_queued_total', 0)} proposal_validated={cc_for_sos.get('aqi_rebuilds_proposal_validated', 0)} complete={cc_for_sos.get('aqi_rebuilds_complete', 0)} failed={cc_for_sos.get('aqi_rebuilds_failed', 0)}",
             f"- Stopped for:    {sos.get('stopped_for') or '(none)'}",
             f"- Backfills:      attempted={sos.get('backfills_attempted', 0)} ok={sos.get('backfills_ok', 0)} failed={sos.get('backfills_failed', 0)}",
         ])
@@ -26751,10 +29807,14 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     f"- Observations index prefix: {config.get('observations_timeseries_index_prefix')}",
                 ])
                 hvr = (s.get("history_version_results") or {}).get(version) or {}
-                if version == CURRENT_INTEGRITY_HISTORY_VERSION:
+                if version == "v2":
                     obs = hvr.get("observations") or (cc.get("v2_observations") or {})
+                    aqi = hvr.get("aqilevels") or (cc.get("v2_aqilevels") or {})
                     gaps = list(obs.get("gaps") or [])
-                    source_scope = obs.get("source_scope") or {}
+                    aqi_gaps = list(aqi.get("gaps") or []) + list((aqi.get("debug") or {}).get("gaps") or [])
+                    debug = aqi.get("debug") or {}
+                    debug_mode = "skipped" if not debug.get("checked") else ("required" if debug.get("required") else "warning-only")
+                    source_scope = obs.get("source_scope") or aqi.get("source_scope") or {}
                     hash_checks = (
                         obs.get("observation_content_hash_checks")
                         or cc.get("observation_content_hash_checks")
@@ -26774,7 +29834,11 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         source_scope_line = f"{source_scope.get('source')} connector_id={','.join(str(c) for c in connector_ids)}"
                     lines.extend([
                         f"- Source scope: {source_scope_line}",
-                        "- Observation checks: implemented",
+                        f"- AQI hourly data prefix: {config.get('aqilevels_hourly_data_prefix')}",
+                        f"- AQI hourly data index prefix: {config.get('aqilevels_timeseries_index_prefix')}",
+                        "- V2 observations checks: implemented",
+                        "- V2 AQI hourly data checks: implemented",
+                        f"- AQI debug checks: {debug_mode}",
                         f"- Checked observation partitions: {obs.get('checked_partitions', 0)}",
                         f"- Observation gaps: {obs.get('gap_count', len(gaps))}",
                         "- Observation hash checks: "
@@ -26794,6 +29858,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         f"status={first_value_evidence.get('status') or '(none)'} "
                         f"eligible={first_value_evidence.get('eligible_scope_count', 0)} "
                         f"blocked={first_value_evidence.get('blocked_scope_count', 0)}",
+                        f"- Checked AQI hourly data partitions: {aqi.get('checked_partitions', 0)}",
+                        f"- AQI hourly data gaps: {aqi.get('gap_count', len(aqi.get('gaps') or []))}",
                     ])
                     if binding_check:
                         lines.extend([
@@ -26852,7 +29918,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     if gaps:
                         lines.extend([
                             "",
-                            "### Observation gaps",
+                            "### V2 observation gaps",
                             "",
                             "| Severity | Gap type | Day | Connector | Pollutant | Expected path | Repair plan | Index rebuild |",
                             "| --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -26872,6 +29938,27 @@ def format_summary_md(s: dict[str, Any]) -> str:
                             )
                         if len(gaps) > 25:
                             lines.append(f"| info | truncated |  |  |  | {len(gaps) - 25} more gaps |  |  |")
+                    if aqi_gaps:
+                        lines.extend([
+                            "",
+                            "### V2 AQI gaps",
+                            "",
+                            "| Severity | Profile | Gap type | Day | Connector | Pollutant | Expected path |",
+                            "| --- | --- | --- | --- | --- | --- | --- |",
+                        ])
+                        for gap in aqi_gaps[:25]:
+                            lines.append(
+                                "| "
+                                f"{gap.get('severity') or ''} | "
+                                f"{gap.get('profile') or ''} | "
+                                f"{gap.get('gap_type') or ''} | "
+                                f"{gap.get('day_utc') or ''} | "
+                                f"{gap.get('connector_id') or ''} | "
+                                f"{gap.get('pollutant_code') or ''} | "
+                                f"{gap.get('expected_path') or ''} |"
+                            )
+                        if len(aqi_gaps) > 25:
+                            lines.append(f"| info |  | truncated |  |  |  | {len(aqi_gaps) - 25} more gaps |")
                 lines.append("")
         lines.extend([
             "## R2 Cross-check metrics",
@@ -26891,8 +29978,29 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Observation repair candidates: days={cc.get('observation_backfill_candidate_days', cc.get('backfill_candidate_days', 0))} timeseries_ids={cc.get('observation_backfill_candidate_timeseries_ids', cc.get('backfill_candidate_timeseries_ids', 0))}",
             f"- Source-change candidates:     days={cc.get('source_change_candidate_days', 0)} timeseries_ids={cc.get('source_change_candidate_timeseries_ids', 0)}",
             f"- Observation repairs:       attempted={cc.get('observation_backfills_attempted', cc.get('backfills_attempted', 0))} ok={cc.get('observation_backfills_ok', cc.get('backfills_ok', 0))} failed={cc.get('observation_backfills_failed', cc.get('backfills_failed', 0))}",
-            f"- Retired AQI Integrity excluded: {bool(cc.get('aqi_integrity_retired'))}",
+            f"- AQI rebuilds queued:       {cc.get('aqi_rebuilds_queued_from_obs_repair', 0)}",
+            f"- V2 AQI integrity rebuilds queued: {cc.get('v2_aqi_rebuilds_queued_from_integrity', 0)}",
+            f"- V2 AQI integrity bridge ran:      {bool(cc.get('v2_aqi_integrity_rebuild_bridge_ran'))}",
+            f"- AQI health checked connector-days: {cc.get('aqi_health_connector_days_checked', 0)}",
+            f"- AQI health rebuilds queued:        {cc.get('aqi_health_rebuilds_queued', 0)}",
+            f"- AQI health skipped obs-repaired:   {cc.get('aqi_health_skipped_already_obs_repaired', 0)}",
+            f"- AQI health manifest missing:       {cc.get('aqi_health_manifest_missing', 0)}",
+            f"- AQI health manifest stale:         {cc.get('aqi_health_manifest_stale', 0)}",
+            f"- AQI health manifest empty:         {cc.get('aqi_health_manifest_empty', 0)}",
+            f"- AQI health previous rebuild failed:{cc.get('aqi_health_previous_rebuild_failed', 0)}",
+            f"- AQI health ran:                    {bool(cc.get('aqi_health_ran'))}",
+            f"- AQI rebuild queued total:          {cc.get('aqi_rebuilds_queued_total', 0)}",
+            f"- AQI rebuild attempted:             {cc.get('aqi_rebuilds_attempted', 0)}",
+            f"- AQI rebuild complete:              {cc.get('aqi_rebuilds_complete', 0)}",
+            f"- AQI proposals validated locally:  {cc.get('aqi_rebuilds_proposal_validated', 0)}",
+            f"- AQI rebuild failed:                {cc.get('aqi_rebuilds_failed', 0)}",
+            f"- AQI rebuild skipped:               {cc.get('aqi_rebuilds_skipped', 0)}",
+            f"- AQI rebuild ran:                   {bool(cc.get('aqi_rebuild_ran'))}",
         ])
+        if cc.get("aqi_health_skipped_reason"):
+            lines.append(f"- AQI health skipped reason:        {cc.get('aqi_health_skipped_reason')}")
+        if cc.get("aqi_rebuild_skipped_reason"):
+            lines.append(f"- AQI rebuild skipped reason:       {cc.get('aqi_rebuild_skipped_reason')}")
         if cc.get("skipped_reason"):
             lines.append(f"- Skipped reason:           {cc['skipped_reason']}")
         cc_planned = cc.get("planned_observation_backfills") or cc.get("planned_backfills") or []
@@ -26904,7 +30012,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 lines.append(f"... {len(cc_planned) - 20} more")
         skipped_v2_repairs = cc.get("skipped_v2_observation_repairs") or []
         if skipped_v2_repairs:
-            lines.extend(["", "### Skipped observation repairs", ""])
+            lines.extend(["", "### Skipped v2 observation repairs", ""])
             for entry in skipped_v2_repairs[:50]:
                 lines.append(
                     f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
@@ -26914,7 +30022,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 lines.append(f"- ... {len(skipped_v2_repairs) - 50} more")
         v2_repair_results = cc.get("v2_observation_repair_results") or []
         if v2_repair_results:
-            lines.extend(["", "### Observation repair results", ""])
+            lines.extend(["", "### V2 observation repair results", ""])
             for entry in v2_repair_results[:25]:
                 source_cache = entry.get("source_cache") or {}
                 lines.append(
@@ -26927,6 +30035,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 )
                 if entry.get("error"):
                     lines.append(f"  - error: {entry.get('error')}")
+                if entry.get("status") != "ok":
+                    lines.append("  - AQI rebuild was not queued because the observation repair did not complete successfully.")
                 stdout_tail = _tail_lines(str(entry.get("stdout_tail") or ""), 80)
                 if stdout_tail:
                     lines.extend(["", "  stdout tail:", "  ```text"])
@@ -26939,6 +30049,37 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     lines.append("  ```")
             if len(v2_repair_results) > 25:
                 lines.append(f"- ... {len(v2_repair_results) - 25} more")
+        planned_aqi = cc.get("planned_aqi_rebuilds") or []
+        if planned_aqi:
+            lines.extend(["", "### Planned AQI rebuild queue entries from cross-check", ""])
+            for entry in planned_aqi[:50]:
+                lines.append(f"- {entry}")
+            if len(planned_aqi) > 50:
+                lines.append(f"- ... {len(planned_aqi) - 50} more")
+        aqi_only_queued = cc.get("queued_aqi_only_connector_days") or []
+        if aqi_only_queued:
+            lines.extend(["", "### AQI-only queued connector-days (Phase 6.7)", ""])
+            for entry in aqi_only_queued:
+                lines.append(
+                    f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
+                    f"reasons={entry.get('reasons')} notes={entry.get('notes')}"
+                )
+        planned_aqi_rebuilds = cc.get("planned_aqi_rebuild_commands") or []
+        if planned_aqi_rebuilds:
+            lines.extend(["", "### Planned AQI rebuild commands (Phase 6.8)", ""])
+            for cmd in planned_aqi_rebuilds[:50]:
+                lines.extend(["```bash", cmd, "```"])
+            if len(planned_aqi_rebuilds) > 50:
+                lines.append(f"... {len(planned_aqi_rebuilds) - 50} more")
+        aqi_rebuild_results = cc.get("aqi_rebuild_results") or []
+        if aqi_rebuild_results:
+            lines.extend(["", "### AQI rebuild results (Phase 6.8)", ""])
+            for entry in aqi_rebuild_results:
+                lines.append(
+                    f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
+                    f"status={entry.get('status')} reasons={entry.get('reasons')} "
+                    f"error={entry.get('error')} log_path={entry.get('log_path')}"
+                )
         discrepancies = cc.get("discrepancies") or []
         if discrepancies:
             lines.extend(["", "### Discrepancies", ""])
@@ -26979,8 +30120,21 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "observation_backfills_attempted",
         "observation_backfills_ok",
         "observation_backfills_failed",
+        "aqi_rebuilds_queued_from_obs_repair",
         "source_change_candidate_days",
         "source_change_candidate_timeseries_ids",
+        "aqi_health_connector_days_checked",
+        "aqi_health_rebuilds_queued",
+        "aqi_health_skipped_already_obs_repaired",
+        "aqi_health_manifest_missing",
+        "aqi_health_manifest_stale",
+        "aqi_health_manifest_empty",
+        "aqi_health_previous_rebuild_failed",
+        "aqi_rebuilds_queued_total",
+        "aqi_rebuilds_attempted",
+        "aqi_rebuilds_complete",
+        "aqi_rebuilds_failed",
+        "aqi_rebuilds_skipped",
         "sos_snapshots_successful",
         "sos_snapshots_no_data",
         "sos_not_found",
@@ -27015,7 +30169,6 @@ def main(argv: list[str]) -> int:
     sos_historical_route = select_sos_historical_replacement_route(args)
     dedicated_sos_historical_replacement = False
     env = load_env_or_die()
-    resolve_and_pin_integrity_target_writer_git_sha(env)
     protected_connector_ids = (
         resolve_protected_connector_ids(os.environ)
         if sos_historical_route.get("arguments_qualify") else None
@@ -27024,9 +30177,6 @@ def main(argv: list[str]) -> int:
     history_version_mode = resolve_history_version_mode(args)
     checked_history_versions = expand_history_versions(history_version_mode)
     history_path_configs = resolve_history_path_configs(history_version_mode)
-    observation_history_config = history_path_configs[
-        CURRENT_INTEGRITY_HISTORY_VERSION
-    ]
     serialized_history_path_configs = serialize_history_path_configs(history_path_configs)
     site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_VERSION", "")).strip() or None
 
@@ -27152,7 +30302,7 @@ def main(argv: list[str]) -> int:
                 "daily profile cannot discover the latest R2 observations day: "
                 "UK_AQ_R2_HISTORY_DROPBOX_ROOT is unavailable"
             )
-        observations_prefix = observation_history_config.observations_data_prefix
+        observations_prefix = history_path_configs["v2"].observations_data_prefix
         try:
             observations_days = discover_observations_days(r2_history_root, observations_prefix)
         except Exception as exc:
@@ -27284,18 +30434,17 @@ def main(argv: list[str]) -> int:
         dropbox_currentness = run_integrity_dropbox_currentness_gate(
             env={**env, **os.environ},
             dropbox_root=dropbox_root,
-            observations_prefix=observation_history_config.observations_data_prefix,
+            observations_prefix=history_path_configs["v2"].observations_data_prefix,
             timeseries_binding_backup_mode=(
                 args.timeseries_binding_backup_mode
             ),
-            checkpoint_only=True,
         )
     log.info(
         "observations global operation lock: %s",
         json.dumps(global_operation_lock, sort_keys=True, default=str),
     )
     log.info(
-        "Dropbox checkpoint completeness gate: %s",
+        "Dropbox checkpoint/live observations root gate: %s",
         json.dumps(dropbox_currentness, sort_keys=True, default=str),
     )
     if not dropbox_currentness.get("allowed"):
@@ -27308,7 +30457,7 @@ def main(argv: list[str]) -> int:
             "date_selection": selection_summary,
             "started_at_utc": started_iso,
             "finished_at_utc": fmt_iso(utc_now()),
-            "status": "blocked_dropbox_checkpoint_incomplete",
+            "status": "blocked_dropbox_checkpoint_not_current",
             "dry_run": bool(args.dry_run),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
@@ -27356,40 +30505,6 @@ def main(argv: list[str]) -> int:
             "history_version_mode": history_version_mode,
             "checked_versions": checked_history_versions,
             "history_path_configs": serialized_history_path_configs,
-            "backup_readiness": backup_gate_summary,
-            "ingestdb_boundary": ingest_boundary,
-            "observations_global_operation_lock": global_operation_lock,
-            "dropbox_currentness": dropbox_currentness,
-            "metrics": {},
-        }
-        write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
-        return 2
-
-    # The complete checkpoint is now proven newer than every relevant writer.
-    # Only now compare its observations-root hash with the locked live R2 root;
-    # successful equality pins this Dropbox generation for DETECT/PROPOSE.
-    dropbox_currentness = run_integrity_dropbox_currentness_gate(
-        env={**env, **os.environ},
-        dropbox_root=dropbox_root,
-        observations_prefix=observation_history_config.observations_data_prefix,
-        timeseries_binding_backup_mode=args.timeseries_binding_backup_mode,
-    )
-    log.info(
-        "Dropbox checkpoint/live observations root gate: %s",
-        json.dumps(dropbox_currentness, sort_keys=True, default=str),
-    )
-    if not dropbox_currentness.get("allowed"):
-        summary = {
-            "env": args.env,
-            "profile": args.profile,
-            "source": args.source,
-            "from_day": from_day,
-            "to_day": to_day,
-            "started_at_utc": started_iso,
-            "finished_at_utc": fmt_iso(utc_now()),
-            "status": "blocked_dropbox_checkpoint_not_current",
-            "effective_mode": effective_mode,
-            "dropbox_baseline": str(dropbox_root),
             "backup_readiness": backup_gate_summary,
             "ingestdb_boundary": ingest_boundary,
             "observations_global_operation_lock": global_operation_lock,
@@ -27623,18 +30738,14 @@ def main(argv: list[str]) -> int:
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
         )
-        # ``resolve_v2_source_scope`` is a legacy-named canonical core-snapshot
-        # helper, not a physical-v2 router.  Fixed-v3 SOS-light must preserve
-        # that authoritative connector/source mapping instead of falling back
-        # to a different lookup merely because its R2 generation is v3.
-        v3_allowed_connector_ids: set[int] | None = None
-        v3_source_scope = {"source": args.source, "connector_ids": None, "scope": "all"}
-        if snapshot_ok:
-            v3_allowed_connector_ids, v3_source_scope = resolve_v2_source_scope(conn, args.source)
-            log.info("fixed-v3 canonical source scope: %s", v3_source_scope)
+        v2_allowed_connector_ids: set[int] | None = None
+        v2_source_scope = {"source": args.source, "connector_ids": None, "scope": "all"}
+        if "v2" in checked_history_versions and snapshot_ok:
+            v2_allowed_connector_ids, v2_source_scope = resolve_v2_source_scope(conn, args.source)
+            log.info("v2 source scope: %s", v2_source_scope)
             sos_historical_route = select_sos_historical_replacement_route(
                 args,
-                mutation_connector_ids=v3_allowed_connector_ids,
+                mutation_connector_ids=v2_allowed_connector_ids,
                 protected_connector_ids=protected_connector_ids,
             )
             dedicated_sos_historical_replacement = bool(
@@ -27799,17 +30910,17 @@ def main(argv: list[str]) -> int:
                 r2_history_root = resolve_r2_history_root(os.environ)
                 v2_obs = run_v2_observations_integrity_checks(
                     r2_history_root=r2_history_root,
-                    config=observation_history_config,
+                    config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
                     selected_days=selected_day_values,
                     conn=conn,
                     env_name=args.env,
-                    allowed_connector_ids=v3_allowed_connector_ids,
-                    source_scope=v3_source_scope,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    source_scope=v2_source_scope,
                     log=log,
                     observation_total_connector_ids=(
-                        v3_source_scope.get("connector_ids") or []
+                        v2_source_scope.get("connector_ids") or []
                     ),
                     observation_total_pollutants=args.repair_pollutants,
                 )
@@ -27820,7 +30931,7 @@ def main(argv: list[str]) -> int:
                         run_compact=run_compact,
                         env=env,
                         v2_observations=v2_obs,
-                        source_scope=v3_source_scope,
+                        source_scope=v2_source_scope,
                         log=log,
                         repair_pollutants=args.repair_pollutants,
                         verified_first_value_at_scope_sink=(
@@ -27828,17 +30939,47 @@ def main(argv: list[str]) -> int:
                         ),
                     )
                 )
+            if dedicated_sos_historical_replacement:
+                v2_aqi = {
+                    "status": "bypassed",
+                    "reason": "dedicated_sos_observation_history_only",
+                    "checked_partitions": 0,
+                    "gap_count": 0,
+                    "gaps": [],
+                    "debug": {
+                        "checked": False,
+                        "required": False,
+                        "status": "bypassed",
+                        "gap_count": 0,
+                        "gaps": [],
+                    },
+                }
+            else:
+                v2_aqi = run_v2_aqilevels_integrity_checks(
+                    r2_history_root=r2_history_root,
+                    config=history_path_configs["v2"],
+                    from_day=from_day,
+                    to_day=to_day,
+                    selected_days=selected_day_values,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    source_scope=v2_source_scope,
+                    conn=conn,
+                    check_aqi_debug=bool(args.check_aqi_debug),
+                    require_aqi_debug=bool(args.require_aqi_debug),
+                    log=log,
+                )
             cross_check_metrics = {
                 "ran": True,
-                "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
+                "history_version": "v2",
                 "skipped_reason": None,
-                "source_scope": v3_source_scope,
+                "source_scope": v2_source_scope,
                 "v2_observations": v2_obs,
                 "observation_content_hash_checks": observation_hash_metrics,
-                "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0),
-                "cross_checks_ok": int(v2_obs.get("checked_partitions", 0) or 0) if v2_obs.get("status") == "ok" else 0,
-                "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0),
-                "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0),
+                "v2_aqilevels": v2_aqi,
+                "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0) + int(v2_aqi.get("checked_partitions", 0) or 0),
+                "cross_checks_ok": (int(v2_obs.get("checked_partitions", 0) or 0) + int(v2_aqi.get("checked_partitions", 0) or 0)) if v2_obs.get("status") == "ok" and v2_aqi.get("status") == "ok" else 0,
+                "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
+                "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
             }
         if args.source == "sos" and snapshot_ok:
             individual_binding_root = Path(
@@ -27850,7 +30991,7 @@ def main(argv: list[str]) -> int:
             )
             sos_binding_verification = run_pack_mode_sos_timeseries_binding_verification(
                 conn=conn,
-                config=observation_history_config,
+                config=history_path_configs["v2"],
                 individual_root=individual_binding_root,
                 backup_mode=args.timeseries_binding_backup_mode,
                 pack_root=packed_binding_root,
@@ -27898,12 +31039,41 @@ def main(argv: list[str]) -> int:
                 log=log,
             )
             cross_check_metrics.update(v2_backfill_metrics)
-            cross_check_metrics.update({
-                "aqi_integrity_retired": True,
-                "aqi_integrity_repair_skipped_reason": (
-                    "retired_aqi_r2_history_product"
-                ),
-            })
+            observation_gap_keys = {
+                (str(gap.get("day_utc") or ""), int(gap.get("connector_id") or 0))
+                for gap in list((cross_check_metrics.get("v2_observations") or {}).get("gaps") or [])
+                if str(gap.get("day_utc") or "") and int(gap.get("connector_id") or 0) > 0
+            }
+            v2_aqi_integrity_queue_metrics = (
+                {
+                    "v2_aqi_integrity_rebuild_bridge_ran": False,
+                    "v2_aqi_rebuilds_queued_from_integrity": 0,
+                    "planned_v2_aqi_rebuilds_from_integrity": [],
+                    "planned_aqi_rebuild_connector_days": [],
+                    "queued_aqi_only_connector_days": [],
+                    "aqi_rebuilds_queued": 0,
+                    "aqi_rebuilds_queued_total": 0,
+                    "aqi_rebuilds_attempted": 0,
+                    "aqi_rebuilds_complete": 0,
+                    "aqi_rebuilds_failed": 0,
+                    "aqi_rebuild_skipped_reason":
+                        "dedicated_sos_observation_history_only",
+                }
+                if dedicated_sos_historical_replacement else
+                queue_v2_aqi_rebuilds_from_integrity_gaps(
+                    conn=conn,
+                    run_id=int(run_id),
+                    env_name=args.env,
+                    env=env,
+                    v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
+                    dry_run=args.dry_run,
+                    run_backfill=False,
+                    log=log,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    blocked_connector_days=observation_gap_keys,
+                )
+            )
+            cross_check_metrics.update(v2_aqi_integrity_queue_metrics)
 
         if effective_mode == "check_only" and cross_check_metrics.get("ran"):
             current_state_plan = run_current_state_reconciliation(
@@ -28029,12 +31199,15 @@ def main(argv: list[str]) -> int:
                 verified_first_value_at_connector_days=(
                     verified_first_value_at_connector_days
                 ),
-                final_verification_config=observation_history_config,
+                v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
+                final_verification_config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
                 selected_days=selected_day_values,
-                allowed_connector_ids=v3_allowed_connector_ids,
-                source_scope=v3_source_scope,
+                allowed_connector_ids=v2_allowed_connector_ids,
+                source_scope=v2_source_scope,
+                check_aqi_debug=bool(args.check_aqi_debug),
+                require_aqi_debug=bool(args.require_aqi_debug),
                 limits=limits,
                 dry_run=not mode_allows_remote_apply(effective_mode),
                     log=log,
@@ -28052,6 +31225,33 @@ def main(argv: list[str]) -> int:
                         else Path(str(dropbox_root))
                     ),
                 )
+            aqi_stage = next(
+                (
+                    stage.get("result")
+                    for stage in list(repair_flow.get("stage_results") or [])
+                    if isinstance(stage, Mapping) and stage.get("stage") == "aqi_proposal"
+                    and isinstance(stage.get("result"), Mapping)
+                ),
+                {},
+            )
+            if isinstance(aqi_stage, Mapping):
+                cross_check_metrics.update({
+                    key: aqi_stage[key]
+                    for key in (
+                        "v2_aqi_integrity_rebuild_bridge_ran",
+                        "v2_aqi_rebuilds_queued_from_integrity",
+                        "planned_v2_aqi_rebuilds_from_integrity",
+                        "planned_aqi_rebuild_connector_days",
+                        "queued_aqi_only_connector_days",
+                        "aqi_rebuilds_queued",
+                        "aqi_rebuilds_queued_total",
+                        "aqi_rebuilds_attempted",
+                        "aqi_rebuilds_complete",
+                        "aqi_rebuilds_failed",
+                    )
+                    if key in aqi_stage
+                })
+
         any_adapter_ran = (
             openaq_metrics.get("ran")
             or sc_metrics.get("ran")
@@ -28064,33 +31264,7 @@ def main(argv: list[str]) -> int:
         )
 
         # Decide top-level run status.
-        source_execution_failed = (
-            not snapshot_ok
-            and snapshot_result.get("status") not in {"skipped", "dry_run"}
-        ) or any(
-            int(metrics.get(key) or 0) > 0
-            for metrics in (openaq_metrics, sc_metrics, sos_metrics)
-            for key in (
-                "errors",
-                "temporary_errors",
-                "permanent_errors",
-                "persistence_failed_count",
-                "worker_database_retry_exhausted_count",
-            )
-        )
-        diagnostic_check_failed = (
-            source_execution_failed
-            or int((cross_check_metrics.get(
-                "observation_content_hash_checks"
-            ) or {}).get("invalid_contract") or 0) > 0
-            or (
-                sos_binding_verification is not None
-                and sos_binding_verification.get("status") == "fail"
-            )
-        )
-        if source_execution_failed:
-            status = "fail"
-        elif any_stopped:
+        if any_stopped:
             status = "stopped_limit"
         elif any_adapter_ran:
             status = "ok"
@@ -28106,6 +31280,8 @@ def main(argv: list[str]) -> int:
             status = "noop"
         v2_gap_count_for_status = (
             int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
+            + int((cross_check_metrics.get("v2_aqilevels") or {}).get("gap_count", 0) or 0)
+            + int(((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0 if ((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("required") else 0)
             + int((sos_binding_verification or {}).get("gap_count") or 0)
         )
         coordinator_failed = repair_flow.get("status") in {"failed", "blocked_dependency"}
@@ -28127,8 +31303,6 @@ def main(argv: list[str]) -> int:
                 "remaining_gap_count"
             ),
         )
-        if effective_mode == "check_only" and diagnostic_check_failed:
-            status = "fail"
 
         if daily_selection is not None:
             daily_state_status = (
@@ -28224,7 +31398,7 @@ def main(argv: list[str]) -> int:
             if args.run_backfill:
                 if cross_check_metrics.get("v2_repair_status_message"):
                     notes_parts.append(
-                        "post-repair-check "
+                        "v2-post-repair-check "
                         f"status={(cross_check_metrics.get('v2_post_repair') or {}).get('status')} "
                         f"message={cross_check_metrics.get('v2_repair_status_message')}"
                     )
@@ -28236,8 +31410,37 @@ def main(argv: list[str]) -> int:
                     f"source_change_timeseries_ids={cross_check_metrics.get('source_change_candidate_timeseries_ids', 0)} "
                     f"attempted={cross_check_metrics.get('observation_backfills_attempted', cross_check_metrics.get('backfills_attempted', 0))} "
                     f"ok={cross_check_metrics.get('observation_backfills_ok', cross_check_metrics.get('backfills_ok', 0))} "
-                    f"failed={cross_check_metrics.get('observation_backfills_failed', cross_check_metrics.get('backfills_failed', 0))}"
+                    f"failed={cross_check_metrics.get('observation_backfills_failed', cross_check_metrics.get('backfills_failed', 0))} "
+                    f"aqi_rebuilds_queued={cross_check_metrics.get('aqi_rebuilds_queued_from_obs_repair', 0)}"
                 )
+                notes_parts.append(
+                    "aqi-health-check "
+                    f"checked={cross_check_metrics.get('aqi_health_connector_days_checked', 0)} "
+                    f"queued={cross_check_metrics.get('aqi_health_rebuilds_queued', 0)} "
+                    f"skipped_obs_repaired={cross_check_metrics.get('aqi_health_skipped_already_obs_repaired', 0)} "
+                    f"manifest_missing={cross_check_metrics.get('aqi_health_manifest_missing', 0)} "
+                    f"manifest_stale={cross_check_metrics.get('aqi_health_manifest_stale', 0)} "
+                    f"manifest_empty={cross_check_metrics.get('aqi_health_manifest_empty', 0)} "
+                    f"previous_rebuild_failed={cross_check_metrics.get('aqi_health_previous_rebuild_failed', 0)}"
+                )
+                if cross_check_metrics.get("aqi_health_skipped_reason"):
+                    notes_parts.append(
+                        "aqi-health-check-skipped "
+                        f"reason={cross_check_metrics.get('aqi_health_skipped_reason')}"
+                    )
+                notes_parts.append(
+                    "aqi-rebuild-execution "
+                    f"queued_total={cross_check_metrics.get('aqi_rebuilds_queued_total', 0)} "
+                    f"attempted={cross_check_metrics.get('aqi_rebuilds_attempted', 0)} "
+                    f"complete={cross_check_metrics.get('aqi_rebuilds_complete', 0)} "
+                    f"failed={cross_check_metrics.get('aqi_rebuilds_failed', 0)} "
+                    f"skipped={cross_check_metrics.get('aqi_rebuilds_skipped', 0)}"
+                )
+                if cross_check_metrics.get("aqi_rebuild_skipped_reason"):
+                    notes_parts.append(
+                        "aqi-rebuild-execution-skipped "
+                        f"reason={cross_check_metrics.get('aqi_rebuild_skipped_reason')}"
+                    )
         elif cross_check_metrics.get("skipped_reason"):
             notes_parts.append(f"cross-check skipped: {cross_check_metrics['skipped_reason']}")
 
@@ -28268,11 +31471,52 @@ def main(argv: list[str]) -> int:
                 cross_check_metrics.get("backfills_failed", 0),
             ) or 0
         )
+        aqi_rebuilds_queued_from_obs_repair = int(
+            cross_check_metrics.get("aqi_rebuilds_queued_from_obs_repair", 0) or 0
+        )
+        aqi_health_connector_days_checked = int(
+            cross_check_metrics.get("aqi_health_connector_days_checked", 0) or 0
+        )
+        aqi_health_rebuilds_queued = int(
+            cross_check_metrics.get("aqi_health_rebuilds_queued", 0) or 0
+        )
+        aqi_health_skipped_already_obs_repaired = int(
+            cross_check_metrics.get("aqi_health_skipped_already_obs_repaired", 0) or 0
+        )
+        aqi_health_manifest_missing = int(
+            cross_check_metrics.get("aqi_health_manifest_missing", 0) or 0
+        )
+        aqi_health_manifest_stale = int(
+            cross_check_metrics.get("aqi_health_manifest_stale", 0) or 0
+        )
+        aqi_health_manifest_empty = int(
+            cross_check_metrics.get("aqi_health_manifest_empty", 0) or 0
+        )
+        aqi_health_previous_rebuild_failed = int(
+            cross_check_metrics.get("aqi_health_previous_rebuild_failed", 0) or 0
+        )
+        aqi_rebuilds_queued_total = int(
+            cross_check_metrics.get("aqi_rebuilds_queued_total", 0) or 0
+        )
+        aqi_rebuilds_attempted = int(
+            cross_check_metrics.get("aqi_rebuilds_attempted", 0) or 0
+        )
+        aqi_rebuilds_complete = int(
+            cross_check_metrics.get("aqi_rebuilds_complete", 0) or 0
+        )
+        aqi_rebuilds_failed = int(
+            cross_check_metrics.get("aqi_rebuilds_failed", 0) or 0
+        )
+        aqi_rebuilds_skipped = int(
+            cross_check_metrics.get("aqi_rebuilds_skipped", 0) or 0
+        )
+
         downloaded_bytes_total = _sum("downloaded_bytes")
         errors_count = (
             _sum("errors")
             + _sum("backfills_failed")
             + cross_check_backfills_failed
+            + aqi_rebuilds_failed
             + (v2_gap_count_for_status if not args.run_backfill else 0)
         )
         warnings_count_total = warnings_delta
@@ -28325,6 +31569,35 @@ def main(argv: list[str]) -> int:
             "observation_backfills_attempted": cross_check_backfills_attempted,
             "observation_backfills_ok": cross_check_backfills_ok,
             "observation_backfills_failed": cross_check_backfills_failed,
+            "aqi_rebuilds_queued_from_obs_repair": aqi_rebuilds_queued_from_obs_repair,
+            "aqi_health_connector_days_checked": aqi_health_connector_days_checked,
+            "aqi_health_rebuilds_queued": aqi_health_rebuilds_queued,
+            "aqi_health_skipped_already_obs_repaired": aqi_health_skipped_already_obs_repaired,
+            "aqi_health_manifest_missing": aqi_health_manifest_missing,
+            "aqi_health_manifest_stale": aqi_health_manifest_stale,
+            "aqi_health_manifest_empty": aqi_health_manifest_empty,
+            "aqi_health_previous_rebuild_failed": aqi_health_previous_rebuild_failed,
+            "v2_aqi_integrity_rebuild_bridge_ran": bool(
+                cross_check_metrics.get("v2_aqi_integrity_rebuild_bridge_ran")
+            ),
+            "v2_aqi_rebuilds_queued_from_integrity": int(
+                cross_check_metrics.get("v2_aqi_rebuilds_queued_from_integrity", 0) or 0
+            ),
+            "planned_v2_aqi_rebuilds_from_integrity": list(
+                cross_check_metrics.get("planned_v2_aqi_rebuilds_from_integrity") or []
+            ),
+            "planned_aqi_rebuild_connector_days": list(
+                cross_check_metrics.get("planned_aqi_rebuild_connector_days") or []
+            ),
+            "queued_aqi_only_connector_days": list(
+                cross_check_metrics.get("queued_aqi_only_connector_days") or []
+            ),
+            "aqi_rebuilds_queued": aqi_rebuilds_queued_total,
+            "aqi_rebuilds_queued_total": aqi_rebuilds_queued_total,
+            "aqi_rebuilds_attempted": aqi_rebuilds_attempted,
+            "aqi_rebuilds_complete": aqi_rebuilds_complete,
+            "aqi_rebuilds_failed": aqi_rebuilds_failed,
+            "aqi_rebuilds_skipped": aqi_rebuilds_skipped,
             "warnings_count": warnings_count_total,
             "errors_count": errors_count,
             "snapshot_status": snapshot_result["status"],
@@ -28467,7 +31740,19 @@ def main(argv: list[str]) -> int:
                 metrics["observation_backfills_attempted"],
                 metrics["observation_backfills_ok"],
                 metrics["observation_backfills_failed"],
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                metrics["aqi_rebuilds_queued_from_obs_repair"],
+                metrics["aqi_health_connector_days_checked"],
+                metrics["aqi_health_rebuilds_queued"],
+                metrics["aqi_health_skipped_already_obs_repaired"],
+                metrics["aqi_health_manifest_missing"],
+                metrics["aqi_health_manifest_stale"],
+                metrics["aqi_health_manifest_empty"],
+                metrics["aqi_health_previous_rebuild_failed"],
+                metrics["aqi_rebuilds_queued_total"],
+                metrics["aqi_rebuilds_attempted"],
+                metrics["aqi_rebuilds_complete"],
+                metrics["aqi_rebuilds_failed"],
+                metrics["aqi_rebuilds_skipped"],
                 warnings_count_total,
                 errors_count,
                 notes,
@@ -28479,17 +31764,24 @@ def main(argv: list[str]) -> int:
         v2_obs = cross_check_metrics.get("v2_observations") or {
             "status": "not_implemented", "checked_partitions": 0, "gap_count": 0, "gaps": [],
         }
+        v2_aqi = cross_check_metrics.get("v2_aqilevels") or {
+            "status": "not_implemented", "checked_partitions": 0, "gap_count": 0,
+            "gaps": [],
+            "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []},
+        }
         v2_result: dict[str, Any] = {
             "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
             "checks_implemented": True,
             "status": "fail" if (
                 v2_obs.get("status") == "fail"
+                or v2_aqi.get("status") == "fail"
                 or (
                     sos_binding_verification is not None
                     and sos_binding_verification.get("status") == "fail"
                 )
             ) else "ok",
             "observations": v2_obs,
+            "aqilevels": v2_aqi,
         }
         if sos_binding_verification is not None:
             v2_result["timeseries_bindings"] = sos_binding_verification
@@ -28499,9 +31791,10 @@ def main(argv: list[str]) -> int:
             v2_result.update({
                 "status": "ok" if final_result.get("status") == "ok" else "fail",
                 "final_verified": final_result.get("status") == "ok",
-                "pre_repair": {"observations": v2_obs},
+                "pre_repair": {"observations": v2_obs, "aqilevels": v2_aqi},
                 "final_verification": final_result,
                 "observations": recheck.get("observations") or v2_obs,
+                "aqilevels": recheck.get("aqilevels") or v2_aqi,
             })
             final_binding_result = (
                 final_result.get("timeseries_binding")
@@ -28535,7 +31828,7 @@ def main(argv: list[str]) -> int:
         selected_total_connector_ids = (
             [1]
             if dedicated_sos_historical_replacement
-            else list(v3_source_scope.get("connector_ids") or [])
+            else list(v2_source_scope.get("connector_ids") or [])
         )
         connector_observation_totals = build_connector_observation_totals(
             successful_real_repair=bool(
@@ -28585,7 +31878,7 @@ def main(argv: list[str]) -> int:
             "checked_versions": checked_history_versions,
             "history_path_configs": serialized_history_path_configs,
             "history_version_results": history_version_results,
-            "source_scope": v3_source_scope,
+            "source_scope": v2_source_scope if "v2" in checked_history_versions else None,
             "requested_repair_pollutants": list(args.repair_pollutants),
             "site_read_version": site_read_version,
             "backfill_env_file": LAST_BACKFILL_ENV_LOAD_RESULT,
@@ -28725,6 +32018,9 @@ def main(argv: list[str]) -> int:
                 "backfills_triggered": metrics.get("backfills_triggered", 0),
                 "backfills_ok": metrics.get("backfills_ok", 0),
                 "backfills_failed": metrics.get("backfills_failed", 0),
+                "aqi_rebuilds_queued": metrics.get("aqi_rebuilds_queued_total", 0),
+                "aqi_rebuilds_ok": metrics.get("aqi_rebuilds_complete", 0),
+                "aqi_rebuilds_failed": metrics.get("aqi_rebuilds_failed", 0),
                 "r2_write_attempted": bool(repair_flow.get("r2_write_attempted")),
                 "r2_objects_written": int(repair_flow.get("r2_objects_written") or 0),
                 "r2_objects_deleted": int(repair_flow.get("r2_objects_deleted") or 0),

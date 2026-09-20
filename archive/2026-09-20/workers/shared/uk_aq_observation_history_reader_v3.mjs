@@ -8,10 +8,9 @@ import { compressors } from "hyparquet-compressors";
 
 import {
   OBSERVATION_HISTORY_COLUMNS_V3,
-  OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT,
+  OBSERVATION_HISTORY_COLUMNS_V3_LEGACY,
   OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
-  selectObservationVerificationStatusColumn,
 } from "./uk_aq_observation_history_schema.mjs";
 import { normalizeObservationPropertyCode } from "./uk_aq_observation_property_code.mjs";
 import {
@@ -789,7 +788,7 @@ function validateFooterMetadata(metadata, file, physicalIdentity) {
   const columns = parquetSchema(metadata).children.map((column) =>
     String(column.element.name)
   );
-  if (![OBSERVATION_HISTORY_COLUMNS_V3, OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT]
+  if (![OBSERVATION_HISTORY_COLUMNS_V3, OBSERVATION_HISTORY_COLUMNS_V3_LEGACY]
     .some((expected) => columns.length === expected.length &&
       columns.every((column, index) => column === expected[index]))) {
     throw new Error(`V3 Parquet footer schema mismatch: ${file.key}`);
@@ -1027,8 +1026,11 @@ function validateDecodedSegment(rows, segment, timeseriesId) {
       timeseries_id: timeseriesId,
       observed_at_utc: observedAtUtc,
       value: Object.is(value, -0) ? 0 : value,
-      verification_status: row?.verification_status === "R" ? "R"
-        : row?.verification_status === "P" ? "P" : null,
+      vstatus: row?.vstatus === "R" || row?.verification_status === "R"
+        ? "R"
+        : row?.vstatus === "P" || row?.verification_status === "P"
+        ? "P"
+        : null,
     });
   });
   if (
@@ -1453,9 +1455,6 @@ export async function readObservationHistoryExactV3({
         blocks,
       });
       for (const segment of context.fileSegments) {
-        const physicalStatusColumn = selectObservationVerificationStatusColumn(
-          context.footer.columns,
-        );
         const rows = await measureAsync(
           workload,
           "parquet_decode_elapsed_ms",
@@ -1465,7 +1464,9 @@ export async function readObservationHistoryExactV3({
             compressors,
             columns: [
               ...OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS,
-              physicalStatusColumn,
+              context.footer.columns.includes("vstatus")
+                ? "vstatus"
+                : "verification_status",
             ],
             rowStart: segment.row_start,
             rowEnd: segment.row_start + segment.row_count,
@@ -1476,12 +1477,7 @@ export async function readObservationHistoryExactV3({
           workload,
           "final_filter_validation_elapsed_ms",
           () => validateDecodedSegment(
-            rows.map((row) => ({
-              timeseries_id: row.timeseries_id,
-              observed_at_utc: row.observed_at_utc,
-              value: row.value,
-              verification_status: row[physicalStatusColumn],
-            })),
+            rows,
             segment,
             normalizedTimeseriesId,
           ),

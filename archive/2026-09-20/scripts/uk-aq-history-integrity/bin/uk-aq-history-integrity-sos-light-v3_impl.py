@@ -16147,16 +16147,15 @@ def _observation_rows_from_local_parquet_for_shared_hash(
                 "legacy observation Parquet is missing canonical columns: "
                 + ",".join(missing)
             )
-        # vstatus is read compatibility only for already-written erroneous TEST Parquet.
-        status_columns = [
-            name for name in ("verification_status", "vstatus", "status")
-            if name in columns
-        ]
-        if len(status_columns) > 1:
-            raise ValueError(
-                "competing observation status fields: " + ",".join(status_columns)
-            )
-        status_column = status_columns[0] if status_columns else None
+        status_column = (
+            "vstatus"
+            if "vstatus" in columns
+            else "verification_status"
+            if "verification_status" in columns
+            else "status"
+            if "status" in columns
+            else None
+        )
         status_select = (
             f', "{status_column}" AS source_status'
             if status_column

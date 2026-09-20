@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import * as arrow from "apache-arrow";
+import * as parquetWasm from "parquet-wasm/esm";
 
 import {
   assertCurrentRunManifestWriterGitSha,
@@ -31,6 +33,7 @@ import {
   buildObservationHistoryV3SteadyStatePartition,
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
 } from "../../../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
+import { parquetMetadataAsync, parquetSchema } from "../lib/uk_aq_parquet_dependencies.mjs";
 import {
   buildR2HistoryV2ObservationsMonthManifest,
   buildR2HistoryV2ObservationsMonthManifestKey,
@@ -82,29 +85,40 @@ test("fixed-v3 namespace guard requires an exact dependency identity map", () =>
   assert.throws(() => assertFixedV3Proposal(output), /identities are not exact/);
 });
 
-test("canonical v3 vstatus survives Parquet decoding", async () => {
+test("04 June NO2-style canonical v3 Parquet emits verification_status and survives decoding", async () => {
   const rows = ["P", "R"].map((verificationStatus, index) => ({
     connector_id: 1,
     station_id: 10,
     timeseries_id: 100,
-    pollutant_code: "pm25",
-    observed_at_utc: `2026-06-01T0${index}:00:00.000Z`,
+    pollutant_code: "no2",
+    observed_at_utc: `2026-06-04T0${index}:00:00.000Z`,
     value: 12.5 + index,
     verification_status: verificationStatus,
   }));
   const v3 = buildObservationHistoryV3SteadyStatePartition({
     source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
     rows,
-    scope: { day_utc: "2026-06-01", connector_id: 1, pollutant_code: "pm25" },
+    scope: { day_utc: "2026-06-04", connector_id: 1, pollutant_code: "no2" },
     targetWriterGitSha: "a".repeat(40),
     backedUpAtUtc: "2026-06-02T00:00:00.000Z",
   });
+  const firstBody = v3.file_intents[0].body;
+  const metadata = await parquetMetadataAsync(firstBody.buffer.slice(
+    firstBody.byteOffset, firstBody.byteOffset + firstBody.byteLength,
+  ));
+  assert.deepEqual(parquetSchema(metadata).children.map((column) =>
+    String(column.element.name)
+  ), ["connector_id", "station_id", "timeseries_id", "pollutant_code",
+    "observed_at_utc", "value", "verification_status"]);
+  assert.deepEqual(v3.canonical_pollutant_manifest.payload.columns,
+    ["connector_id", "station_id", "timeseries_id", "pollutant_code",
+      "observed_at_utc", "value", "verification_status"]);
   const decodedV3 = (await Promise.all(v3.file_intents.map(({ body }) =>
     readCanonicalObservationRows({ body, connectorId: 1 })
   ))).flat();
   assert.deepEqual(decodedV3.map(({ verification_status }) => verification_status), ["P", "R"]);
 
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-vstatus-decoders-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-verification-status-decoders-"));
   try {
     const inspectedRows = [];
     for (const [index, intent] of v3.file_intents.entries()) {
@@ -130,15 +144,61 @@ test("canonical v3 vstatus survives Parquet decoding", async () => {
   }
 });
 
-test("status-column selection prefers vstatus and retains legacy names", () => {
-  assert.equal(selectObservationVerificationStatusColumn(
+test("status-column selection rejects competing names and retains legacy reads", () => {
+  assert.throws(() => selectObservationVerificationStatusColumn(
     new Set(["status", "verification_status", "vstatus"]),
-  ), "vstatus");
-  assert.equal(selectObservationVerificationStatusColumn(
-    new Set(["status", "verification_status"]),
-  ), "verification_status");
+  ), /competing.*status/i);
+  assert.throws(() => selectObservationVerificationStatusColumn(
+    new Set(["verification_status", "vstatus"]),
+  ), /competing.*status/i);
+  assert.equal(selectObservationVerificationStatusColumn(new Set(["verification_status"])), "verification_status");
+  assert.equal(selectObservationVerificationStatusColumn(new Set(["vstatus"])), "vstatus");
   assert.equal(selectObservationVerificationStatusColumn(new Set(["status"])), "status");
   assert.equal(selectObservationVerificationStatusColumn(new Set()), null);
+});
+
+test("physical status compatibility normalises erroneous TEST, historical, and absent columns", async () => {
+  // Initialise the same local Parquet runtime used by the production writer.
+  buildObservationHistoryV3SteadyStatePartition({
+    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
+    rows: [{ connector_id: 1, station_id: 10, timeseries_id: 100,
+      pollutant_code: "pm25", observed_at_utc: "2026-06-01T00:00:00.000Z",
+      value: 12.5, verification_status: "R" }],
+    targetWriterGitSha: "a".repeat(40),
+  });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-status-compat-"));
+  try {
+    for (const [physicalName, expected] of [["vstatus", "R"], ["status", "R"], [null, null], ["both", null]]) {
+      const columns = {
+        connector_id: arrow.vectorFromArray([1], new arrow.Int32()),
+        station_id: arrow.vectorFromArray([10], new arrow.Int32()),
+        timeseries_id: arrow.vectorFromArray([100], new arrow.Int32()),
+        pollutant_code: arrow.vectorFromArray(["pm25"], new arrow.Utf8()),
+        observed_at_utc: arrow.vectorFromArray([new Date("2026-06-01T00:00:00.000Z")], new arrow.TimestampMillisecond()),
+        value: arrow.vectorFromArray([12.5], new arrow.Float64()),
+        ...(physicalName === "both"
+          ? { verification_status: arrow.vectorFromArray(["R"], new arrow.Utf8()),
+            vstatus: arrow.vectorFromArray(["P"], new arrow.Utf8()) }
+          : physicalName ? { [physicalName]: arrow.vectorFromArray(["R"], new arrow.Utf8()) } : {}),
+      };
+      const table = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(arrow.tableFromArrays(columns), "stream"));
+      const body = Buffer.from(parquetWasm.writeParquet(table, new parquetWasm.WriterPropertiesBuilder().build()));
+      const filePath = path.join(root, `${physicalName ?? "absent"}.parquet`);
+      fs.writeFileSync(filePath, body);
+      if (physicalName === "both") {
+        await assert.rejects(() => readCanonicalObservationRows({ body, connectorId: 1 }), /competing.*status/i);
+        await assert.rejects(() => inspectObservationParquetFile({ filePath, connectorId: 1 }), /competing.*status/i);
+        continue;
+      }
+      const decoded = await readCanonicalObservationRows({ body, connectorId: 1 });
+      assert.deepEqual(decoded.map((row) => row.verification_status), [expected]);
+      assert.equal(Object.hasOwn(decoded[0], "vstatus"), false);
+      const backupRead = await inspectObservationParquetFile({ filePath, connectorId: 1 });
+      assert.deepEqual(backupRead.canonicalRows.map((row) => row.verification_status), [expected]);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 

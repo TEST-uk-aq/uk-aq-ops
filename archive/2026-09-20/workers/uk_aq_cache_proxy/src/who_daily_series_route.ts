@@ -298,10 +298,10 @@ async function readDailyAurnProvenance(
   const daily = new Map<string, "P" | "R">();
   for (const raw of payload.rows) {
     if (!isObject(raw) || !isValidUtcDay(raw.day_utc) ||
-      (raw.source_validation_status !== "P" && raw.source_validation_status !== "R")) {
+      (raw.vstatus !== "P" && raw.vstatus !== "R")) {
       throw new Error("observation history provenance row is invalid");
     }
-    daily.set(raw.day_utc, raw.source_validation_status);
+    daily.set(raw.day_utc, raw.vstatus);
   }
   return daily;
 }

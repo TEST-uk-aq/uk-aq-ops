@@ -1,6 +1,5 @@
 import observationHistoryV3 from "./worker_v3.mjs";
 import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
-import { selectObservationVerificationStatusColumn } from "../shared/uk_aq_observation_history_schema.mjs";
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import {
@@ -17,7 +16,7 @@ const DEFAULT_TIMESERIES_BINDING_INDEX_SUBPREFIX = "timeseries_binding";
 const DEFAULT_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
-const OBSERVATIONS_CACHE_GENERATION = "3";
+const OBSERVATIONS_CACHE_GENERATION = "2";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const MAX_LIMIT = 20000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
@@ -503,7 +502,13 @@ async function fetchFilteredParquetRowsFromR2(
         chunkStart,
         chunkEnd,
       );
-      const verificationStatusColumn = selectObservationVerificationStatusColumn(schemaColumns);
+      const verificationStatusColumn = schemaColumns.includes("vstatus")
+        ? "vstatus"
+        : schemaColumns.includes("verification_status")
+        ? "verification_status"
+        : schemaColumns.includes("status")
+        ? "status"
+        : null;
       const verificationStatusValues = verificationStatusColumn
         ? await readParquetColumnValues(
           arrayBuffer,
@@ -520,7 +525,7 @@ async function fetchFilteredParquetRowsFromR2(
         outRows.push({
           observed_at: observedAtValues[idx],
           value: valueValues[idx],
-          verification_status:
+          vstatus:
             idx < verificationStatusValues.length &&
               verificationStatusValues[idx] != null
             ? String(verificationStatusValues[idx])
@@ -584,9 +589,11 @@ function appendFilteredRows(rows, {
     outByObservedAt.set(observedAt, {
       observed_at: observedAt,
       value: normalizeValue(row?.value),
-      verification_status: row?.verification_status === "R"
+      vstatus: row?.vstatus === "R" || row?.verification_status === "R"
         ? "R"
-        : row?.verification_status === "P" ? "P" : null,
+        : row?.vstatus === "P" || row?.verification_status === "P"
+        ? "P"
+        : null,
     });
   }
 }
@@ -731,11 +738,11 @@ function aggregateDailyProvenance(rows) {
     const observedAt = toIsoOrNull(row.observed_at);
     if (!observedAt) continue;
     const dayUtc = observedAt.slice(0, 10);
-    const status = row.verification_status === "R" ? "R" : "P";
+    const status = row.vstatus === "R" ? "R" : "P";
     if (status === "P" || !daily.has(dayUtc)) daily.set(dayUtc, status);
   }
   return [...daily].sort(([left], [right]) => left.localeCompare(right))
-    .map(([day_utc, source_validation_status]) => ({ day_utc, source_validation_status }));
+    .map(([day_utc, vstatus]) => ({ day_utc, vstatus }));
 }
 
 async function handleDailyProvenanceV2(params, env) {

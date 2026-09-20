@@ -73,7 +73,6 @@ import {
   normalizeUkAirVerificationStatus,
   preservePersistedRatifiedStatus,
   resolveLegacyVerificationStatus,
-  selectObservationVerificationStatusColumn,
 } from "../shared/uk_aq_observation_content_hash.mjs";
 import {
   DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
@@ -11407,8 +11406,16 @@ async function readCanonicalObservationRowsFromParquet(
     );
   }
   const rowCount = Number(metadata.num_rows || 0);
-  const statusColumn = selectObservationVerificationStatusColumn(schemaColumns);
-  const columnNames = [...required, ...(statusColumn ? [statusColumn] : [])];
+  const columnNames = [
+    ...required,
+    ...(schemaColumns.includes("vstatus")
+      ? ["vstatus"]
+      : schemaColumns.includes("verification_status")
+      ? ["verification_status"]
+      : schemaColumns.includes("status")
+      ? ["status"]
+      : []),
+  ];
   const values = await Promise.all(
     columnNames.map((column) =>
       readParquetColumnValues(file, metadata, column, 0, rowCount)
@@ -11422,8 +11429,15 @@ async function readCanonicalObservationRowsFromParquet(
     const observedAtUtc = parseHistoryIsoTimestamp(
       byName.get("observed_at_utc")?.[index],
     );
-    const statusRow = statusColumn
-      ? { [statusColumn]: byName.get(statusColumn)?.[index] ?? null }
+    const statusRow = schemaColumns.includes("vstatus")
+      ? { verification_status: byName.get("vstatus")?.[index] ?? null }
+      : schemaColumns.includes("verification_status")
+      ? {
+        verification_status:
+          byName.get("verification_status")?.[index] ?? null,
+      }
+      : schemaColumns.includes("status")
+      ? { status: byName.get("status")?.[index] ?? null }
       : {};
     rows.push(normalizeCanonicalObservationRow({
       connector_id: byName.get("connector_id")?.[index],

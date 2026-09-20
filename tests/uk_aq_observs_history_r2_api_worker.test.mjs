@@ -12,6 +12,10 @@ const workerSource = readFileSync(
   "workers/uk_aq_observs_history_r2_api_worker/worker.mjs",
   "utf8",
 );
+const v3WorkerSource = readFileSync(
+  "workers/uk_aq_observs_history_r2_api_worker/worker_v3.mjs",
+  "utf8",
+);
 
 function makeJsonR2Object(payload) {
   const text = `${JSON.stringify(payload)}\n`;
@@ -98,11 +102,14 @@ function bindingRequest(timeseriesId = 3742) {
   );
 }
 
-test("observations Worker prefers vstatus and reads legacy status columns", () => {
-  assert.match(workerSource, /schemaColumns\.includes\("vstatus"\)/);
-  assert.match(workerSource, /schemaColumns\.includes\("verification_status"\)/);
-  assert.match(workerSource, /schemaColumns\.includes\("status"\)/);
-  assert.match(workerSource, /vstatus:/);
+test("observation APIs emit canonical and presentation status names", () => {
+  assert.match(workerSource, /selectObservationVerificationStatusColumn\(schemaColumns\)/);
+  assert.match(workerSource, /verification_status:/);
+  assert.match(workerSource, /source_validation_status/);
+  assert.match(v3WorkerSource, /verification_status:/);
+  assert.match(v3WorkerSource, /source_validation_status/);
+  assert.doesNotMatch(workerSource, /\bvstatus\b/);
+  assert.doesNotMatch(v3WorkerSource, /\bvstatus\b/);
 });
 
 test("observations Cache API eligibility requires complete, gap-free coverage", () => {
@@ -150,7 +157,7 @@ test("observations Cache API keys use the corrected cache generation and retain 
     limit: null,
   }, "v2");
   const url = new URL(cacheKey.url);
-  assert.equal(url.searchParams.get("__ukaq_observs_history_cache_gen"), "2");
+  assert.equal(url.searchParams.get("__ukaq_observs_history_cache_gen"), "3");
   assert.notEqual(url.searchParams.get("__ukaq_observs_history_cache_gen"), "1");
   assert.doesNotMatch(workerSource, /OBSERVATIONS_CACHE_GENERATION = "1"/, "old-generation Cache API keys are not read by the new code");
   const env = {
@@ -174,7 +181,7 @@ test("partial and invalid observation responses are no-store and never seed Cach
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("Cache-Control"), "no-store");
     assert.equal(response.headers.get("x-ukaq-cache-eligible"), "false");
-    assert.equal(response.headers.get("x-ukaq-cache-generation"), "2");
+    assert.equal(response.headers.get("x-ukaq-cache-generation"), "3");
     const payload = await response.json();
     assert.equal(payload.response_complete, false);
     assert.equal(payload.has_gap, true);

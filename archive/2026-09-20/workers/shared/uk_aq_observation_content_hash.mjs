@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
-import { selectObservationVerificationStatusColumn } from "./uk_aq_observation_history_schema.mjs";
-export { selectObservationVerificationStatusColumn } from "./uk_aq_observation_history_schema.mjs";
 
 export const OBSERVATION_CONTENT_HASH_ALGORITHM = "sha256";
 export const OBSERVATION_CONTENT_HASH_CONTRACT_VERSION = 1;
@@ -52,16 +50,34 @@ export function requireCanonicalVerificationStatus(value) {
   throw new TypeError("verification_status must be P, R or null");
 }
 
+export function selectObservationVerificationStatusColumn(schemaColumns) {
+  return schemaColumns.has("vstatus")
+    ? "vstatus"
+    : schemaColumns.has("verification_status")
+    ? "verification_status"
+    : schemaColumns.has("status")
+    ? "status"
+    : null;
+}
+
 export function resolveLegacyVerificationStatus(row, { isSos = false } = {}) {
   const source = row && typeof row === "object" ? row : {};
-  const column = selectObservationVerificationStatusColumn(Object.keys(source));
-  if (column === "status") {
+  if (Object.hasOwn(source, "verification_status")) {
+    const value = source.verification_status;
+    return isSos
+      ? normalizeUkAirVerificationStatus(value)
+      : requireCanonicalVerificationStatus(value);
+  }
+  if (Object.hasOwn(source, "vstatus")) {
+    const value = source.vstatus;
+    return isSos
+      ? normalizeUkAirVerificationStatus(value)
+      : requireCanonicalVerificationStatus(value);
+  }
+  if (Object.hasOwn(source, "status")) {
     return isSos ? normalizeUkAirVerificationStatus(source.status) : null;
   }
-  if (column === null) return null;
-  return isSos
-    ? normalizeUkAirVerificationStatus(source[column])
-    : requireCanonicalVerificationStatus(source[column]);
+  return null;
 }
 
 export function float64BigEndianHex(value) {
@@ -81,10 +97,6 @@ export function float64BigEndianHex(value) {
 export function normalizeCanonicalObservationRow(row) {
   if (!row || typeof row !== "object" || Array.isArray(row)) {
     throw new TypeError("canonical observation row must be an object");
-  }
-  const physicalStatusField = selectObservationVerificationStatusColumn(Object.keys(row));
-  if (physicalStatusField && physicalStatusField !== "verification_status") {
-    throw new TypeError("canonical observation row requires verification_status");
   }
   const pollutantCode = row.pollutant_code;
   if (
@@ -154,13 +166,13 @@ export function preservePersistedRatifiedStatus(
   ]);
   const persistedRatified = new Set(existingRows
     .filter((row) => normalizeUkAirVerificationStatus(
-      resolveLegacyVerificationStatus(row, { isSos: true }),
+      row.vstatus ?? row.verification_status ?? row.status ?? null,
     ) === "R")
     .map(identity));
   return replacementRows.map((row) => {
     if (!persistedRatified.has(identity(row)) ||
       normalizeUkAirVerificationStatus(
-        resolveLegacyVerificationStatus(row, { isSos: true }),
+        row.vstatus ?? row.verification_status ?? row.status ?? null,
       ) === "R") return row;
     return { ...row, verification_status: "R" };
   });

@@ -19,7 +19,7 @@ const ALIGNED_ROW_CAP = 1024;
 const V3 = getObservationHistoryGeneration("v3");
 const ALIGNED_INDEX_PREFIX = `${V3.observations_timeseries_index_prefix}/_aligned`;
 const ALIGNED_DATA_PREFIX = V3.observations_prefix;
-const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-2";
+const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-1";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const DEFAULT_MUTABLE_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
@@ -223,7 +223,7 @@ async function handleDailyProvenance(params, env) {
   const daily = new Map();
   for (const row of result.rows) {
     const dayUtc = row.observed_at_utc.slice(0, 10);
-    const status = row.verification_status === "R" ? "R" : "P";
+    const status = row.vstatus === "R" ? "R" : "P";
     if (status === "P" || !daily.has(dayUtc)) daily.set(dayUtc, status);
   }
   return jsonResponse({
@@ -231,7 +231,7 @@ async function handleDailyProvenance(params, env) {
     pollutant: params.pollutantCode, start_utc: params.startIso, end_utc: params.endIso,
     response_complete: true, has_gap: false,
     rows: [...daily].sort(([left], [right]) => left.localeCompare(right))
-      .map(([day_utc, source_validation_status]) => ({ day_utc, source_validation_status })),
+      .map(([day_utc, vstatus]) => ({ day_utc, vstatus })),
   }, { noStore: true });
 }
 
@@ -382,7 +382,7 @@ async function handleObservations(params, env, diagnosticContext) {
   const rows = result.rows.map((row) => ({
     observed_at: row.observed_at_utc,
     value: row.value,
-    verification_status: row.verification_status ?? null,
+    vstatus: row.vstatus ?? row.verification_status ?? null,
   }));
   const partialReasons = result.partial_reasons;
   const complete = result.response_complete === true;

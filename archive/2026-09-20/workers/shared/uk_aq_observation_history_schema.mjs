@@ -17,28 +17,15 @@ export const OBSERVATION_HISTORY_COLUMNS_V2_STATUS = Object.freeze([
   "status",
 ]);
 
-export const OBSERVATION_HISTORY_COLUMNS_V3 = Object.freeze([
+export const OBSERVATION_HISTORY_COLUMNS_V3_LEGACY = Object.freeze([
   ...OBSERVATION_HISTORY_COLUMNS_V2,
   "verification_status",
 ]);
 
-// Read compatibility only for already-written TEST Parquet with the erroneous field.
-export const OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT = Object.freeze([
+export const OBSERVATION_HISTORY_COLUMNS_V3 = Object.freeze([
   ...OBSERVATION_HISTORY_COLUMNS_V2,
   "vstatus",
 ]);
-
-export function selectObservationVerificationStatusColumn(schemaColumns) {
-  const columns = schemaColumns instanceof Set ? schemaColumns : new Set(schemaColumns || []);
-  // The vstatus branch is physical read compatibility for erroneous TEST data only.
-  const present = ["verification_status", "vstatus", "status"].filter((name) =>
-    columns.has(name)
-  );
-  if (present.length > 1) {
-    throw new Error(`Competing observation status fields: ${present.join(",")}`);
-  }
-  return present[0] ?? null;
-}
 
 function sameColumns(left, right) {
   return Array.isArray(left) &&
@@ -57,7 +44,7 @@ function cloneDescriptor(descriptor) {
 export function observationHistoryPhysicalSchemaForColumns(columns) {
   if (
     sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3) ||
-    sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT)
+    sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3_LEGACY)
   ) {
     return cloneDescriptor({
       history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,

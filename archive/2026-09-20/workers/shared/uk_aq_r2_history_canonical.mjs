@@ -12,7 +12,6 @@ import {
   observationHistoryPhysicalSchemaForColumns,
   observationHistoryPhysicalSchemasFromManifest,
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
-  selectObservationVerificationStatusColumn,
 } from "./uk_aq_observation_history_schema.mjs";
 export { validateCanonicalHistoryV2Manifest } from "./uk_aq_r2_history_manifest_validation.mjs";
 
@@ -114,14 +113,6 @@ export function serializeCanonicalObservationV2Parquet(rows, {
   includeVerificationStatus = true,
   writerProperties: providedProperties = null,
 } = {}) {
-  if (includeVerificationStatus) {
-    for (const row of rows) {
-      const physicalStatusField = selectObservationVerificationStatusColumn(Object.keys(row));
-      if (physicalStatusField && physicalStatusField !== "verification_status") {
-        throw new TypeError("canonical observation row requires verification_status");
-      }
-    }
-  }
   const columns = {
     connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
     station_id: int32Vector(rows.map((row) => row.station_id == null ? null : Number(row.station_id))),
@@ -129,7 +120,7 @@ export function serializeCanonicalObservationV2Parquet(rows, {
     pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
     observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at_utc || row.observed_at))),
     value: rows.map((row) => nullableNumber(row.value)),
-    ...(includeVerificationStatus ? { verification_status: textVector(rows.map((row) => row.verification_status ?? null)) } : {}),
+    ...(includeVerificationStatus ? { vstatus: textVector(rows.map((row) => row.vstatus ?? row.verification_status ?? null)) } : {}),
   };
   return writeParquet(
     arrow.tableFromArrays(columns),
