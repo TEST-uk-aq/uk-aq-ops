@@ -100,8 +100,10 @@ function r2IdentityKind(key) {
 }
 
 async function readExactFromHead(r2, key, kind, head, expected = null) {
+  const storedBytes = head?.bytes;
   const storedSha256 = head?.sha256;
-  if (!head?.exists || !Number.isSafeInteger(head.bytes) || head.bytes < 0 ||
+  if (!head?.exists || (kind === "parquet" && storedBytes == null) ||
+      (storedBytes != null && (!Number.isSafeInteger(storedBytes) || storedBytes < 0)) ||
       (storedSha256 != null && !SHA256.test(storedSha256)) ||
       (kind === "parquet" && storedSha256 == null)) {
     throw new Error(`Strong stored R2 identity unavailable: ${key}`);
@@ -109,7 +111,7 @@ async function readExactFromHead(r2, key, kind, head, expected = null) {
   const object = await r2GetObject({ r2, key });
   const body = Buffer.from(object.body);
   const identity = exactIdentity(key, body);
-  if (identity.byte_size !== head.bytes ||
+  if ((storedBytes != null && identity.byte_size !== storedBytes) ||
       (storedSha256 != null && identity.sha256 !== storedSha256)) {
     throw new Error(`R2 HEAD/GET identity mismatch: ${key}`);
   }

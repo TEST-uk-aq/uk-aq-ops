@@ -34,13 +34,14 @@ function localObject(key, body, { bytes = body.byteLength, sha256 = null, exists
   } };
 }
 
-test("JSON identity comes from GET bytes when HEAD has no checksum", async () => {
+test("JSON identity comes from GET bytes when HEAD has no size or checksum", async () => {
   const key = "history/v3/observations/_manifests/manifest.json";
   const body = Buffer.from('{"kind":"observations-root"}');
   const expected = { key, byte_size: body.byteLength, sha256: createHash("sha256").update(body).digest("hex") };
-  const r2 = localObject(key, body);
+  const r2 = localObject(key, body, { bytes: null, sha256: null });
   const read = await migration.readExact(r2, key, expected);
   assert.deepEqual({ key: read.key, byte_size: read.byte_size, sha256: read.sha256 }, expected);
+  assert.equal(read.body.byteLength, body.byteLength);
   assert.deepEqual(await migration.currentIdentity(r2, key), expected);
   assert.equal(await migration.currentIdentity(localObject(key, body, { exists: false }), key), null);
 });
@@ -49,7 +50,8 @@ test("JSON identity rejects bad HEAD size, supplied checksum, or pinned identity
   const key = "history/v3/observations/_manifests/manifest.json";
   const body = Buffer.from("{}");
   const sha256 = createHash("sha256").update(body).digest("hex");
-  await assert.rejects(() => migration.readExact(localObject(key, body, { bytes: null }), key), /identity unavailable/);
+  assert.deepEqual(await migration.currentIdentity(localObject(key, body, { bytes: body.byteLength }), key),
+    { key, byte_size: body.byteLength, sha256 });
   await assert.rejects(() => migration.readExact(localObject(key, body, { bytes: body.byteLength + 1 }), key), /HEAD\/GET identity mismatch/);
   await assert.rejects(() => migration.readExact(localObject(key, body, { sha256: "not-a-sha256" }), key), /identity unavailable/);
   await assert.rejects(() => migration.currentIdentity(localObject(key, body, { sha256: "0".repeat(64) }), key), /HEAD\/GET identity mismatch/);
@@ -63,6 +65,7 @@ test("Parquet still requires stored HEAD SHA-256 and verifies GET bytes", async 
   const key = "history/v3/observations/day_utc=2026-09-19/part-00000.parquet";
   const body = Buffer.from("parquet fixture bytes");
   const sha256 = createHash("sha256").update(body).digest("hex");
+  await assert.rejects(() => migration.readExact(localObject(key, body, { bytes: null, sha256 }), key), /identity unavailable/);
   await assert.rejects(() => migration.readExact(localObject(key, body), key), /identity unavailable/);
   await assert.rejects(() => migration.currentIdentity(localObject(key, body), key), /identity unavailable/);
   await assert.rejects(() => migration.currentIdentity(localObject(key, body, { sha256: "0".repeat(64) }), key), /HEAD\/GET identity mismatch/);
