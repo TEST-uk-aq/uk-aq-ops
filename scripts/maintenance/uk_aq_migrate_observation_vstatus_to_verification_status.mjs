@@ -93,11 +93,17 @@ function exactIdentity(key, body) {
   return { key, byte_size: body.byteLength, sha256: sha256Hex(body) };
 }
 
-async function readExactFromHead(r2, key, head, expected = null) {
+function r2IdentityKind(key) {
+  if (typeof key === "string" && key.endsWith(".parquet")) return "parquet";
+  if (typeof key === "string" && key.endsWith(".json")) return "json";
+  throw new Error(`Unsupported migration R2 object type: ${String(key)}`);
+}
+
+async function readExactFromHead(r2, key, kind, head, expected = null) {
   const storedSha256 = head?.sha256;
   if (!head?.exists || !Number.isSafeInteger(head.bytes) || head.bytes < 0 ||
       (storedSha256 != null && !SHA256.test(storedSha256)) ||
-      (key.endsWith(".parquet") && storedSha256 == null)) {
+      (kind === "parquet" && storedSha256 == null)) {
     throw new Error(`Strong stored R2 identity unavailable: ${key}`);
   }
   const object = await r2GetObject({ r2, key });
@@ -115,8 +121,9 @@ async function readExactFromHead(r2, key, head, expected = null) {
 }
 
 export async function readExact(r2, key, expected = null) {
+  const kind = r2IdentityKind(key);
   const head = await r2HeadObject({ r2, key });
-  return readExactFromHead(r2, key, head, expected);
+  return readExactFromHead(r2, key, kind, head, expected);
 }
 
 function parseJson(object) {
@@ -757,9 +764,10 @@ function sameIdentity(left, right) {
 }
 
 export async function currentIdentity(r2, key) {
+  const kind = r2IdentityKind(key);
   const head = await r2HeadObject({ r2, key });
   if (head?.exists === false) return null;
-  const object = await readExactFromHead(r2, key, head);
+  const object = await readExactFromHead(r2, key, kind, head);
   return { key, byte_size: object.byte_size, sha256: object.sha256 };
 }
 

@@ -66,8 +66,19 @@ test("Parquet still requires stored HEAD SHA-256 and verifies GET bytes", async 
   await assert.rejects(() => migration.readExact(localObject(key, body), key), /identity unavailable/);
   await assert.rejects(() => migration.currentIdentity(localObject(key, body), key), /identity unavailable/);
   await assert.rejects(() => migration.currentIdentity(localObject(key, body, { sha256: "0".repeat(64) }), key), /HEAD\/GET identity mismatch/);
+  await assert.rejects(() => migration.readExact(localObject(key, body, { sha256 }), key,
+    { key, byte_size: body.byteLength, sha256: "0".repeat(64) }), /Pinned R2 identity mismatch/);
+  await assert.rejects(() => migration.readExact(localObject(key, body, { sha256 }), key,
+    { key, byte_size: body.byteLength + 1, sha256 }), /Pinned R2 identity mismatch/);
   assert.deepEqual(await migration.currentIdentity(localObject(key, body, { sha256 }), key),
     { key, byte_size: body.byteLength, sha256 });
+});
+
+test("unexpected R2 object type fails closed", async () => {
+  const key = "history/v3/observations/unexpected.bin";
+  const body = Buffer.from("not a migration R2 object");
+  await assert.rejects(() => migration.readExact(localObject(key, body), key), /unsupported.*R2 object type/i);
+  await assert.rejects(() => migration.currentIdentity(localObject(key, body, { exists: false }), key), /unsupported.*R2 object type/i);
 });
 
 function physicalFixture(statusName, statuses) {
