@@ -37,8 +37,6 @@ _ROUTES = (
     (re.compile(r"^/api/media/author-rules$"), {"POST"}),
     (re.compile(r"^/api/media/author-rules/[a-z0-9]+:[a-z0-9]+(?:-[a-z0-9]+)*$"), {"PUT"}),
     (re.compile(r"^/api/media/bluesky/settings$"), {"GET", "PUT"}),
-    (re.compile(r"^/api/media/facebook/settings$"), {"GET", "PUT"}),
-    (re.compile(r"^/api/media/facebook/connection-check$"), {"POST"}),
 )
 
 

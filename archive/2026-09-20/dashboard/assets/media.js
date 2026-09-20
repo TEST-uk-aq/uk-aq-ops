@@ -28,7 +28,6 @@
   const BLUESKY_TEMPLATE_LIMIT = 120;
   const BLUESKY_POST_LIMIT = 300;
   const BLUESKY_PLACEHOLDERS = ["{publisher}", "{publisher_mention}"];
-  const FACEBOOK_PLACEHOLDERS = ["{publisher}"];
   const articleDetailCache = new Map();
   let articleRefreshSequence = 0;
 
@@ -141,11 +140,6 @@
       .split("{publisher}").join("Example Publisher")
       .split("{publisher_mention}").join("@example.bsky.social");
     return `Example original publisher headline for an air-quality article\n${messageText}`;
-  }
-
-  function renderFacebookExample(template) {
-    const messageText = String(template ?? "").split("{publisher}").join("Example Publisher");
-    return `Example original publisher headline\n${messageText}`;
   }
 
   function setView(html) {
@@ -370,7 +364,7 @@
 
   function bulkToolbarHtml() {
     const count = state.selectedArticleIds.size;
-    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><div class="media-social-options" data-bulk-social hidden><label class="media-toggle" data-bulk-bluesky><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label><label class="media-toggle" data-bulk-facebook><input type="checkbox"> <span>Post to Facebook UK AQ - ukaq.co.uk</span></label></div><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
+    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><label class="media-toggle" data-bulk-bluesky hidden><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
   }
 
   function articleTableHtml(error = "") {
@@ -403,7 +397,7 @@
       state.articleCursor = data.page?.next_cursor || null;
       state.articleHasMore = Boolean(data.page?.has_more);
       setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>
-        <div class="media-actions"><button class="media-button" data-open-bluesky>Bluesky</button><button class="media-button" data-open-facebook>Facebook</button></div></div>
+        <div class="media-actions"><button class="media-button" data-open-bluesky>Bluesky</button></div></div>
         <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
         <div data-url-result></div>${aiUsageHtml()}</section>
         <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form></div>
@@ -458,7 +452,6 @@
 
   function bindArticleEvents() {
     state.root.querySelector("[data-open-bluesky]")?.addEventListener("click", () => void openBlueskySettings());
-    state.root.querySelector("[data-open-facebook]")?.addEventListener("click", () => void openFacebookSettings());
     state.root.querySelector("[data-url-lookup]")?.addEventListener("submit", event => { event.preventDefault(); void lookupUrl(new FormData(event.currentTarget).get("url")); });
     state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); clearArticleSelection(); void refreshArticleTable(); });
     state.root.querySelector("[data-clear-filters]")?.addEventListener("click", () => {
@@ -499,10 +492,11 @@
       refreshSelectionControls();
     }));
     state.root.querySelector("[data-bulk-status]")?.addEventListener("change", event => {
-      const social = state.root.querySelector("[data-bulk-social]");
-      if (social) {
-        social.hidden = event.currentTarget.value !== "approved";
-        social.querySelectorAll("input").forEach(input => { input.checked = false; });
+      const bluesky = state.root.querySelector("[data-bulk-bluesky]");
+      if (bluesky) {
+        bluesky.hidden = event.currentTarget.value !== "approved";
+        const input = bluesky.querySelector("input");
+        if (input) input.checked = false;
       }
       refreshSelectionControls();
     });
@@ -553,12 +547,13 @@
       if ([...target.options].some(option => option.value === previous)) target.value = previous;
       target.disabled = count === 0;
     }
-    const social = table.querySelector("[data-bulk-social]");
-    if (social) {
+    const bluesky = table.querySelector("[data-bulk-bluesky]");
+    if (bluesky) {
       const visible = count > 0 && target?.value === "approved";
-      social.hidden = !visible;
+      bluesky.hidden = !visible;
       if (!visible) {
-        social.querySelectorAll("input").forEach(input => { input.checked = false; });
+        const input = bluesky.querySelector("input");
+        if (input) input.checked = false;
       }
     }
     if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value;
@@ -578,13 +573,11 @@
     const changes = selected.map(article => ({ article, action: statusActionForTarget(article.status, target) })).filter(item => item.action);
     const save = table.querySelector("[data-save-bulk]"); save.disabled = true;
     const postToBluesky = target === "approved" && table.querySelector("[data-bulk-bluesky] input")?.checked === true;
-    const postToFacebook = target === "approved" && table.querySelector("[data-bulk-facebook] input")?.checked === true;
-    if (postToBluesky || postToFacebook) {
+    if (postToBluesky) {
       try {
         await request("articles/bulk-approve", { method: "POST", idempotent: "bulk-approve", body: {
           article_ids: changes.map(({ article }) => article.id),
-          post_to_bluesky: postToBluesky,
-          post_to_facebook: postToFacebook,
+          post_to_bluesky: true,
         } });
         state.batchMessage = { text: `${changes.length} changed${selected.length - changes.length ? `; ${selected.length - changes.length} already ${STATUS_LABELS[target]}` : ""}.`, kind: "success" };
         await refreshArticleTable(false);
@@ -744,98 +737,6 @@
     } catch (error) { dialog.innerHTML = `<div class="media-detail__inner"><h3>Bluesky</h3>${message(error.message, "error")}<div class="media-actions"><button class="media-button" onclick="this.closest('dialog').close()">Close</button></div></div>`; }
   }
 
-  function facebookDialog() {
-    let dialog = document.getElementById("media-facebook-settings");
-    if (!dialog) { dialog = document.createElement("dialog"); dialog.id = "media-facebook-settings"; dialog.className = "media-detail media-social-settings"; document.body.appendChild(dialog); }
-    return dialog;
-  }
-
-  function facebookSettingsFrom(data) { return data?.settings || data?.facebook || data || {}; }
-
-  function boundedCode(value) { return value ? String(value).slice(0, 160) : "—"; }
-
-  function facebookIdentityFingerprint(settings) {
-    return JSON.stringify([settings.last_identity_checked_at, settings.last_identity_verified_at,
-      settings.last_identity_observed_name, settings.last_identity_name_drift, settings.last_identity_error_code]);
-  }
-
-  async function pollFacebookIdentity(previousFingerprint) {
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      const data = await request("facebook/settings");
-      const settings = facebookSettingsFrom(data);
-      if (facebookIdentityFingerprint(settings) !== previousFingerprint) return data;
-    }
-    return null;
-  }
-
-  async function openFacebookSettings(notice = "", suppliedData = null) {
-    const dialog = facebookDialog();
-    dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading Facebook settings…</div></div>`;
-    if (!dialog.open) dialog.showModal();
-    try {
-      const data = suppliedData || await request("facebook/settings");
-      const settings = facebookSettingsFrom(data);
-      const template = settings.default_message_template ?? settings.default_message ?? "";
-      const cooldownMinutes = settings.cooldown_minutes ?? (Number.isFinite(Number(settings.cooldown_seconds)) ? Number(settings.cooldown_seconds) / 60 : "");
-      const minMinutes = Number(data?.constraints?.cooldown_minutes_min);
-      const maxMinutes = Number(data?.constraints?.cooldown_minutes_max);
-      const cooldownBounds = `${Number.isFinite(minMinutes) ? ` min="${minMinutes}"` : ""}${Number.isFinite(maxMinutes) ? ` max="${maxMinutes}"` : ""}`;
-      const drift = settings.last_identity_name_drift === true;
-      const verified = Boolean(settings.last_identity_verified_at) && !settings.last_identity_error_code;
-      dialog.innerHTML = `<form class="media-detail__inner" data-facebook-form><div class="media-detail__header"><div><h3>Facebook</h3><p>UK AQ - ukaq.co.uk</p></div><button type="button" class="media-button" data-close-facebook>Close</button></div>${notice ? message(notice, notice.includes("not updated") ? "" : "success") : ""}
-        <div class="media-social-identity${drift ? " is-warning" : verified ? " is-verified" : ""}"><dl>
-          <dt>Configured Page name</dt><dd>${esc(settings.configured_page_name ?? settings.page_name ?? "—")}</dd>
-          <dt>Page ID</dt><dd>${esc(settings.page_id || "—")}</dd><dt>Graph API version</dt><dd>${esc(settings.graph_api_version || "—")}</dd>
-          <dt>Identity</dt><dd>${verified ? "Verified" : "Not currently verified"}</dd><dt>Last identity checked</dt><dd>${esc(formatUtcDateTime(settings.last_identity_checked_at))}</dd>
-          <dt>Last identity verified</dt><dd>${esc(formatUtcDateTime(settings.last_identity_verified_at))}</dd><dt>Observed Page name</dt><dd>${esc(settings.last_identity_observed_name || "—")}</dd>
-          <dt>Page-name drift</dt><dd>${drift ? "Yes — configured and observed names differ" : "No"}</dd><dt>Identity error</dt><dd>${esc(boundedCode(settings.last_identity_error_code))}</dd>
-          <dt>Last successful post</dt><dd>${esc(formatUtcDateTime(settings.last_successful_post_at))}</dd></dl></div>
-        <label class="media-toggle"><input name="publishing_enabled" type="checkbox"${settings.publishing_enabled ? " checked" : ""}> <span>Publishing enabled</span></label>
-        <label class="media-field"><span>Default message template</span><textarea name="default_message_template" required>${esc(template)}</textarea></label>
-        <p class="media-subtext">Available placeholder: <code>{publisher}</code>. The Page token is held only by the Media service and is never displayed or requested here.</p>
-        <section class="media-social-settings__preview"><h4>Example preview</h4><pre data-facebook-preview></pre><p class="media-subtext">The original publisher headline is prepended by Media. The canonical publisher article URL is supplied separately as the Facebook link.</p></section>
-        <label class="media-field media-social-settings__cooldown"><span>Post cooldown (minutes)</span><input name="cooldown_minutes" type="number" required step="1" value="${esc(cooldownMinutes)}"${cooldownBounds}></label>
-        <div data-facebook-message></div><div class="media-actions media-social-settings__actions"><button type="button" class="media-button" data-check-facebook>Check connection</button><button type="button" class="media-button" data-cancel-facebook>Cancel</button><button class="media-button media-button--primary" data-save-facebook>Save settings</button></div></form>`;
-      const form = dialog.querySelector("[data-facebook-form]");
-      const textarea = form.querySelector("textarea");
-      const update = () => {
-        const unknown = [...String(textarea.value).matchAll(/\{[^{}]+\}/g)].map(match => match[0]).filter(token => !FACEBOOK_PLACEHOLDERS.includes(token));
-        form.querySelector("[data-facebook-preview]").textContent = renderFacebookExample(textarea.value);
-        form.querySelector("[data-save-facebook]").disabled = unknown.length > 0;
-        form.querySelector("[data-facebook-message]").innerHTML = unknown.length ? message(`Unsupported placeholder: ${unknown.join(", ")}`, "error") : "";
-      };
-      textarea.addEventListener("input", update); update();
-      form.querySelector("[data-close-facebook]").addEventListener("click", () => dialog.close());
-      form.querySelector("[data-cancel-facebook]").addEventListener("click", () => dialog.close());
-      form.querySelector("[data-check-facebook]").addEventListener("click", async event => {
-        const button = event.currentTarget; const output = form.querySelector("[data-facebook-message]");
-        button.disabled = true; button.textContent = "Requesting…";
-        try {
-          const fingerprint = facebookIdentityFingerprint(settings);
-          await request("facebook/connection-check", { method: "POST", idempotent: "facebook-connection-check" });
-          output.innerHTML = message("Connection check accepted. Waiting for the queued identity result…");
-          const updated = await pollFacebookIdentity(fingerprint);
-          await openFacebookSettings(updated ? "Connection check result updated." : "Connection check requested; status not updated yet.", updated);
-        } catch (error) { button.disabled = false; button.textContent = "Check connection"; output.innerHTML = message(error.message, "error"); }
-      });
-      form.addEventListener("submit", async event => {
-        event.preventDefault(); const output = form.querySelector("[data-facebook-message]"); const save = form.querySelector("[data-save-facebook]");
-        const minutes = Number(form.elements.cooldown_minutes.value);
-        if (!Number.isInteger(minutes)) { output.innerHTML = message("Cooldown must be a whole number of minutes.", "error"); return; }
-        save.disabled = true; save.textContent = "Saving…";
-        try {
-          await request("facebook/settings", { method: "PUT", idempotent: "facebook-settings", body: {
-            publishing_enabled: form.elements.publishing_enabled.checked,
-            default_message_template: textarea.value,
-            cooldown_minutes: minutes,
-          } });
-          await openFacebookSettings("Facebook settings saved.");
-        } catch (error) { save.disabled = false; save.textContent = "Save settings"; output.innerHTML = message(error.message, "error"); }
-      });
-    } catch (error) { dialog.innerHTML = `<div class="media-detail__inner"><h3>Facebook</h3>${message(error.message, "error")}<div class="media-actions"><button class="media-button" onclick="this.closest('dialog').close()">Close</button></div></div>`; }
-  }
-
   function blueskyState(data, article) {
     return { ...(article || {}), ...(article?.bluesky || {}), ...(data?.bluesky || {}) };
   }
@@ -855,42 +756,12 @@
     return `<section><h4>Bluesky publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(bluesky.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(bluesky.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(bluesky.latest_status || "—")}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--bluesky"><thead><tr><th>Status</th><th>Reason</th><th>Relevant time</th><th>Error code</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Bluesky publication history.</p>`}</section>`;
   }
 
-  function facebookState(data, article) {
-    return { ...(article || {}), ...(article?.facebook || {}), ...(data?.facebook || {}) };
-  }
-
-  function socialReasonLabel(reason) { return BLUESKY_REASON_LABELS[reason] || reason || "—"; }
-
-  function facebookStatusLabel(item) {
-    if (item.status === "queued" && item.next_attempt_at) return "Retry scheduled";
-    return ({ queued: "Queued", posting: "Posting", posted: "Posted", failed: "Failed", blocked: "Blocked",
-      unknown_remote_state: "Unknown remote state — held for operator review" })[item.status] || item.status || "—";
-  }
-
-  function facebookHistoryHtml(data, article) {
-    const facebook = facebookState(data, article); const publications = facebook.publications || [];
-    const rows = publications.map(item => {
-      const permalink = item.facebook_permalink_url
-        ? `<a href="${esc(item.facebook_permalink_url)}" target="_blank" rel="noopener noreferrer">Open post ↗</a>` : "—";
-      const remoteId = item.facebook_post_id ? `<code>${esc(item.facebook_post_id)}</code>` : "—";
-      const relevantTime = item.posted_at || item.next_attempt_at || item.last_attempted_at || item.updated_at || item.created_at;
-      const held = item.status === "unknown_remote_state" ? " media-publication-state--held" : "";
-      return `<tr class="media-publication-state--${esc(item.status || "unknown")}${held}"><td>${esc(facebookStatusLabel(item))}</td><td>${esc(socialReasonLabel(item.publication_reason))}</td><td>${esc(item.attempt_count ?? 0)}</td><td>${esc(formatUtcDateTime(relevantTime))}</td><td>${esc(boundedCode(item.last_error_code || item.error_code))}</td><td>${remoteId}</td><td>${permalink}</td><td>${esc(item.reconciliation_method || "—")}</td></tr>`;
-    }).join("");
-    return `<section><h4>Facebook publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(facebook.post_count ?? facebook.successful_post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(facebook.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(facebookStatusLabel({ status: facebook.latest_status }))}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--facebook"><thead><tr><th>Status</th><th>Reason</th><th>Attempts</th><th>Relevant time</th><th>Error code</th><th>Facebook post ID</th><th>Post</th><th>Reconciliation</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Facebook publication history.</p>`}</section>`;
-  }
-
   function manualBlueskyHtml(article, data) {
     const bluesky = blueskyState(data, article);
     if (article.status === "approved") return "";
     if (bluesky.manual_post_available === true) return `<label class="media-toggle" data-manual-bluesky><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label>${bluesky.manual_post_reason ? `<p class="media-subtext">Reason: ${esc(blueskyReasonLabel(bluesky.manual_post_reason))}</p>` : ""}`;
     const reason = bluesky.manual_post_unavailable_reason || bluesky.manual_post_reason;
     return reason ? `<p class="media-message">Bluesky posting unavailable: ${esc(blueskyReasonLabel(reason))}</p>` : "";
-  }
-
-  function manualFacebookHtml(article) {
-    if (article.status === "approved") return "";
-    return `<label class="media-toggle" data-manual-facebook><input type="checkbox"> <span>Post to Facebook UK AQ - ukaq.co.uk</span></label>`;
   }
 
   async function openArticle(id, notice = "", selectedStatus = "") {
@@ -907,9 +778,8 @@
       dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
         <div class="media-detail__grid"><div>${article.admin_preview_image_path ? `<img class="media-detail__preview" src="${esc(apiUrl(`articles/${id}/image`))}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
         <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatUtcDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
-        <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
+        <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div data-manual-bluesky-wrap hidden>${manualBlueskyHtml(article, data)}</div><div data-detail-status-message></div></section>
         ${blueskyHistoryHtml(data, article)}
-        ${facebookHistoryHtml(data, article)}
         <section><h4>Author</h4><form class="media-inline-form" data-detail-author><label class="media-field media-field--grow"><span>Author</span><input name="author" maxlength="500" value="${esc(article.author || "")}" autocomplete="off"></label><button class="media-button media-button--primary">Save Author</button></form><p class="media-subtext">Single line, maximum 500 characters. Saving a blank value clears the authoritative Author.</p><div data-detail-author-message></div></section>
         <section><h4>Display title</h4><p>${esc(aiSuggestionLabel(article))}${article.ai_title_generated_at ? ` · ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}` : ""}</p><p>${esc(article.ai_title_suggestion || "—")}</p><div class="media-actions"><button type="button" class="media-button" data-detail-generate-ai>${article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title"}</button>${detailAiActions}</div><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
         <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
@@ -922,8 +792,8 @@
         button.classList.toggle("is-unsaved", Boolean(event.currentTarget.value));
         button.setAttribute("aria-label", event.currentTarget.value ? "Save status change" : "Saved/current");
         button.title = event.currentTarget.value ? "Save status change" : "Saved/current";
-        const manual = dialog.querySelector("[data-manual-social]");
-        if (manual) { manual.hidden = event.currentTarget.value !== "approved"; manual.querySelectorAll("input").forEach(input => { input.checked = false; }); }
+        const manual = dialog.querySelector("[data-manual-bluesky-wrap]");
+        if (manual) { manual.hidden = event.currentTarget.value !== "approved"; manual.querySelector("input") && (manual.querySelector("input").checked = false); }
       });
       detailStatus?.querySelector("button")?.addEventListener("click", () => void saveDetailStatus(id, detailStatus, dialog));
       if (selectedStatus) {
@@ -951,8 +821,7 @@
     control.querySelector("button").disabled = true;
     try {
       const manual = dialog.querySelector("[data-manual-bluesky] input");
-      const facebook = dialog.querySelector("[data-manual-facebook] input");
-      const body = { post_to_bluesky: manual?.checked === true, post_to_facebook: facebook?.checked === true };
+      const body = { post_to_bluesky: manual?.checked === true };
       await request(`articles/${id}/${action}`, { method: "POST", idempotent: "status", body });
       await renderArticles(false);
       await openArticle(id);
