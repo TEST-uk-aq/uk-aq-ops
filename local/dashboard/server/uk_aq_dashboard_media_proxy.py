@@ -19,6 +19,7 @@ _ROUTES = (
     (re.compile(r"^/api/media/articles$"), {"GET", "POST"}),
     (re.compile(r"^/api/media/articles/selectors$"), {"GET"}),
     (re.compile(r"^/api/media/articles/lookup$"), {"POST"}),
+    (re.compile(r"^/api/media/articles/bulk-approve$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*$"), {"GET"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/image$"), {"GET"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/(?:approve|reject|hide|unhide)$"), {"POST"}),
@@ -109,7 +110,11 @@ def proxy_media_request(handler: Any, method: str) -> None:
         _send_json(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Media request body is too large")
         return
 
-    upstream_path = parsed.path.removeprefix("/api/media")
+    upstream_path = (
+        "/articles/bulk/approve"
+        if parsed.path == "/api/media/articles/bulk-approve"
+        else parsed.path.removeprefix("/api/media")
+    )
     target = f"{base_url}/admin{upstream_path}"
     if parsed.query:
         target = f"{target}?{parsed.query}"
