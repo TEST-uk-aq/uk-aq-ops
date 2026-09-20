@@ -108,8 +108,6 @@ test("observation APIs emit canonical and presentation status names", () => {
   assert.match(workerSource, /source_validation_status/);
   assert.match(v3WorkerSource, /verification_status:/);
   assert.match(v3WorkerSource, /source_validation_status/);
-  assert.doesNotMatch(workerSource, /\bvstatus\b/);
-  assert.doesNotMatch(v3WorkerSource, /\bvstatus\b/);
 });
 
 test("observations Cache API eligibility requires complete, gap-free coverage", () => {

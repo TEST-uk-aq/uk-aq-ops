@@ -1,6 +1,6 @@
 import observationHistoryV3 from "./worker_v3.mjs";
 import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
-import { selectObservationVerificationStatusColumn } from "../shared/uk_aq_observation_history_schema.mjs";
+import { observationHistoryPhysicalSchemaForColumns, selectObservationVerificationStatusColumn } from "../shared/uk_aq_observation_history_schema.mjs";
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import {
@@ -425,6 +425,9 @@ async function fetchFilteredParquetRowsFromR2(
   const schemaColumns = parquetSchema(metadata).children.map((column) =>
     column.element.name
   );
+  if (key.startsWith("history/v2/observations/") || key.startsWith("history/v3/observations/")) {
+    observationHistoryPhysicalSchemaForColumns(schemaColumns);
+  }
   const timeseriesStatsIndex = schemaColumns.indexOf("timeseries_id");
   if (timeseriesStatsIndex < 0) {
     return { exists: true, rows: [] };

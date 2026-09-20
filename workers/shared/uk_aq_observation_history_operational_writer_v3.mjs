@@ -20,7 +20,6 @@ import {
 } from "./uk_aq_observation_history_target_writer.mjs";
 import {
   OBSERVATION_HISTORY_COLUMNS_V3,
-  OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT,
 } from "./uk_aq_observation_history_schema.mjs";
 import {
   DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
@@ -247,22 +246,15 @@ function decodeAcceptedCanonicalObservationRows(body, key) {
     );
   }
   const columns = table.schema.fields.map((field) => field.name);
-  const supportedColumns = [
-    OBSERVATION_HISTORY_COLUMNS_V3,
-    OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT,
-  ];
-  if (!supportedColumns.some((expected) =>
-    columns.length === expected.length &&
-    columns.every((column, index) => column === expected[index])
-  )) {
+  if (columns.length !== OBSERVATION_HISTORY_COLUMNS_V3.length ||
+      columns.some((column, index) => column !== OBSERVATION_HISTORY_COLUMNS_V3[index])) {
     throw new Error(`Current canonical Parquet schema is unsupported: ${key}`);
   }
   const vectors = Object.fromEntries(columns.map((column) => [
     column,
     table.getChild(column),
   ]));
-  // The last validated column is canonical or erroneous TEST read compatibility.
-  const statusVector = vectors[columns.at(-1)];
+  const statusVector = vectors.verification_status;
   return Array.from({ length: table.numRows }, (_, index) => {
     const timestamp = Number(vectors.observed_at_utc.get(index));
     const observedAtUtc = new Date(timestamp);

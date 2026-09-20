@@ -20,7 +20,6 @@ test("WHO daily series degrades conservatively when provenance is unavailable", 
   );
   assert.doesNotMatch(source, /who_daily_series_provenance_failed/);
   assert.match(source, /raw\.source_validation_status/);
-  assert.doesNotMatch(source, /\bvstatus\b/);
   assert.match(
     source,
     /dailyProvenance\?\.get\(String\(item\.day_utc\)\) \?\?\s*\(item\.daily_mean_ugm3 !== null \? "P" : null\)/,

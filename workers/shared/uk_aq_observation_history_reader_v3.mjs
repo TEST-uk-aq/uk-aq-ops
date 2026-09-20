@@ -8,7 +8,6 @@ import { compressors } from "hyparquet-compressors";
 
 import {
   OBSERVATION_HISTORY_COLUMNS_V3,
-  OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT,
   OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
   selectObservationVerificationStatusColumn,
@@ -789,9 +788,8 @@ function validateFooterMetadata(metadata, file, physicalIdentity) {
   const columns = parquetSchema(metadata).children.map((column) =>
     String(column.element.name)
   );
-  if (![OBSERVATION_HISTORY_COLUMNS_V3, OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT]
-    .some((expected) => columns.length === expected.length &&
-      columns.every((column, index) => column === expected[index]))) {
+  if (columns.length !== OBSERVATION_HISTORY_COLUMNS_V3.length ||
+      columns.some((column, index) => column !== OBSERVATION_HISTORY_COLUMNS_V3[index])) {
     throw new Error(`V3 Parquet footer schema mismatch: ${file.key}`);
   }
   const rowCount = safeMetadataInteger(metadata.num_rows, "footer.num_rows");

@@ -146,18 +146,14 @@ test("04 June NO2-style canonical v3 Parquet emits verification_status and survi
 
 test("status-column selection rejects competing names and retains legacy reads", () => {
   assert.throws(() => selectObservationVerificationStatusColumn(
-    new Set(["status", "verification_status", "vstatus"]),
-  ), /competing.*status/i);
-  assert.throws(() => selectObservationVerificationStatusColumn(
-    new Set(["verification_status", "vstatus"]),
+    new Set(["status", "verification_status"]),
   ), /competing.*status/i);
   assert.equal(selectObservationVerificationStatusColumn(new Set(["verification_status"])), "verification_status");
-  assert.equal(selectObservationVerificationStatusColumn(new Set(["vstatus"])), "vstatus");
   assert.equal(selectObservationVerificationStatusColumn(new Set(["status"])), "status");
   assert.equal(selectObservationVerificationStatusColumn(new Set()), null);
 });
 
-test("physical status compatibility normalises erroneous TEST, historical, and absent columns", async () => {
+test("physical status compatibility normalises current, historical, and absent columns", async () => {
   // Initialise the same local Parquet runtime used by the production writer.
   buildObservationHistoryV3SteadyStatePartition({
     source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
@@ -168,7 +164,7 @@ test("physical status compatibility normalises erroneous TEST, historical, and a
   });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-status-compat-"));
   try {
-    for (const [physicalName, expected] of [["vstatus", "R"], ["status", "R"], [null, null], ["both", null]]) {
+    for (const [physicalName, expected] of [["verification_status", "R"], ["status", "R"], [null, null], ["both", null]]) {
       const columns = {
         connector_id: arrow.vectorFromArray([1], new arrow.Int32()),
         station_id: arrow.vectorFromArray([10], new arrow.Int32()),
@@ -178,7 +174,7 @@ test("physical status compatibility normalises erroneous TEST, historical, and a
         value: arrow.vectorFromArray([12.5], new arrow.Float64()),
         ...(physicalName === "both"
           ? { verification_status: arrow.vectorFromArray(["R"], new arrow.Utf8()),
-            vstatus: arrow.vectorFromArray(["P"], new arrow.Utf8()) }
+            status: arrow.vectorFromArray(["P"], new arrow.Utf8()) }
           : physicalName ? { [physicalName]: arrow.vectorFromArray(["R"], new arrow.Utf8()) } : {}),
       };
       const table = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(arrow.tableFromArrays(columns), "stream"));
@@ -186,13 +182,13 @@ test("physical status compatibility normalises erroneous TEST, historical, and a
       const filePath = path.join(root, `${physicalName ?? "absent"}.parquet`);
       fs.writeFileSync(filePath, body);
       if (physicalName === "both") {
-        await assert.rejects(() => readCanonicalObservationRows({ body, connectorId: 1 }), /competing.*status/i);
-        await assert.rejects(() => inspectObservationParquetFile({ filePath, connectorId: 1 }), /competing.*status/i);
+        await assert.rejects(() => readCanonicalObservationRows({ body, connectorId: 1 }), /unsupported.*columns/i);
+        await assert.rejects(() => inspectObservationParquetFile({ filePath, connectorId: 1 }), /unsupported.*columns/i);
         continue;
       }
       const decoded = await readCanonicalObservationRows({ body, connectorId: 1 });
       assert.deepEqual(decoded.map((row) => row.verification_status), [expected]);
-      assert.equal(Object.hasOwn(decoded[0], "vstatus"), false);
+      assert.deepEqual(Object.keys(decoded[0]), ["connector_id", "station_id", "timeseries_id", "pollutant_code", "observed_at_utc", "value", "verification_status"]);
       const backupRead = await inspectObservationParquetFile({ filePath, connectorId: 1 });
       assert.deepEqual(backupRead.canonicalRows.map((row) => row.verification_status), [expected]);
     }

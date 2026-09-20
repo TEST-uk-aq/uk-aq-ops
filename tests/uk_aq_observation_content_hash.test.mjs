@@ -98,18 +98,13 @@ test("observation content hash v1 is deterministic and status-aware", () => {
   assert.equal(normalizeUkAirVerificationStatus(" "), "P");
   assert.equal(normalizeUkAirVerificationStatus(null), "P");
   assert.throws(() => resolveLegacyVerificationStatus(
-    { verification_status: "R", vstatus: "P" }, { isSos: true },
-  ), /competing.*status/i);
-  assert.equal(resolveLegacyVerificationStatus({ vstatus: "P" }), "P");
-  assert.equal(resolveLegacyVerificationStatus({ vstatus: "R" }), "R");
-  assert.throws(() => resolveLegacyVerificationStatus(
-    { vstatus: "R", status: "Provisional" },
+    { verification_status: "R", status: "Provisional" }, { isSos: true },
   ), /competing.*status/i);
   assert.throws(() => resolveLegacyVerificationStatus(
-    { verification_status: null, vstatus: "R" },
+    { verification_status: null, status: "R" },
   ), /competing.*status/i);
   assert.throws(() => selectObservationVerificationStatusColumn(
-    new Set(["verification_status", "vstatus"]),
+    new Set(["verification_status", "status"]),
   ), /competing.*status/i);
   assert.equal(
     resolveLegacyVerificationStatus(
@@ -138,7 +133,7 @@ test("observation content hash v1 is deterministic and status-aware", () => {
 test("persisted ratified precedence changes status only for equivalent replacements", () => {
   const existing = {
     connector_id: 1, station_id: 10, timeseries_id: 101, pollutant_code: "no2",
-    observed_at_utc: "2026-07-24T01:00:00.000Z", value: 12.5, vstatus: "R",
+    observed_at_utc: "2026-07-24T01:00:00.000Z", value: 12.5, verification_status: "R",
   };
   const replacement = {
     connector_id: 1, station_id: 10, timeseries_id: 101, pollutant_code: "no2",
@@ -164,13 +159,13 @@ test("persisted ratified precedence changes status only for equivalent replaceme
 
 test("canonical logical rows reject physical compatibility fields", () => {
   assert.throws(() => normalizeCanonicalObservationRow({
-    ...baseRows[0], vstatus: "R",
+    ...baseRows[0], status: "R",
   }), /competing.*status/i);
   assert.throws(() => normalizeCanonicalObservationRow({
     ...baseRows[0], status: "R",
   }), /competing.*status/i);
   assert.throws(() => normalizeCanonicalObservationRow({
-    ...baseRows[0], verification_status: undefined, vstatus: "R",
+    ...baseRows[0], verification_status: undefined, status: "R",
   }), /competing.*status/i);
 });
 
@@ -183,6 +178,6 @@ test("shared observation serializer emits the canonical physical schema", async 
     String(column.element.name)
   ), OBSERVATION_HISTORY_COLUMNS_V3);
   assert.throws(() => serializeCanonicalObservationV2Parquet([{
-    ...baseRows[0], vstatus: "R",
+    ...baseRows[0], status: "R",
   }]), /competing.*status/i);
 });

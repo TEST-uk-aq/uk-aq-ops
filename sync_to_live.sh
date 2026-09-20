@@ -371,6 +371,10 @@ sync_repo() {
         # Stage 1: keep the dedicated WHO guidelines page in TEST until it is
         # ready for LIVE. Remove this exclusion when the page is promoted.
         --exclude='/who-guidelines/'
+
+        # Keep the legacy Sensors page in TEST. Sensor Map (/sensor_map/)
+        # remains part of the normal website promotion to LIVE.
+        --exclude='/sensors/'
       )
       ;;
     pop-ingest|integrity-factory)

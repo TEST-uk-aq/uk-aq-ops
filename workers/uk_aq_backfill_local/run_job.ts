@@ -75,6 +75,7 @@ import {
   resolveLegacyVerificationStatus,
   selectObservationVerificationStatusColumn,
 } from "../shared/uk_aq_observation_content_hash.mjs";
+import { observationHistoryPhysicalSchemaForColumns } from "../shared/uk_aq_observation_history_schema.mjs";
 import {
   DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
 } from "../shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
@@ -11392,6 +11393,7 @@ async function readCanonicalObservationRowsFromParquet(
   const schemaColumns = parquetSchema(metadata).children.map((column) =>
     column.element.name
   );
+  observationHistoryPhysicalSchemaForColumns(schemaColumns);
   const required = [
     "connector_id",
     "station_id",

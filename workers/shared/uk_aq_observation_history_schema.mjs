@@ -22,16 +22,9 @@ export const OBSERVATION_HISTORY_COLUMNS_V3 = Object.freeze([
   "verification_status",
 ]);
 
-// Read compatibility only for already-written TEST Parquet with the erroneous field.
-export const OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT = Object.freeze([
-  ...OBSERVATION_HISTORY_COLUMNS_V2,
-  "vstatus",
-]);
-
 export function selectObservationVerificationStatusColumn(schemaColumns) {
   const columns = schemaColumns instanceof Set ? schemaColumns : new Set(schemaColumns || []);
-  // The vstatus branch is physical read compatibility for erroneous TEST data only.
-  const present = ["verification_status", "vstatus", "status"].filter((name) =>
+  const present = ["verification_status", "status"].filter((name) =>
     columns.has(name)
   );
   if (present.length > 1) {
@@ -55,10 +48,7 @@ function cloneDescriptor(descriptor) {
 }
 
 export function observationHistoryPhysicalSchemaForColumns(columns) {
-  if (
-    sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3) ||
-    sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3_TEST_VSTATUS_COMPAT)
-  ) {
+  if (sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3)) {
     return cloneDescriptor({
       history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
       columns,

@@ -19,7 +19,6 @@ import {
   selectObservationVerificationStatusColumn,
   validateObservationContentHashMetadata,
 } from "../../workers/shared/uk_aq_observation_content_hash.mjs";
-import { observationHistoryPhysicalSchemaForColumns } from "../../workers/shared/uk_aq_observation_history_schema.mjs";
 import {
   runCanonicalConnectorDayWriter,
   runCanonicalDayFinalizer,
@@ -1585,9 +1584,9 @@ export async function readCanonicalObservationRows({ body, connectorId }) {
   if (!Number.isSafeInteger(rowCount) || rowCount <= 0) {
     throw new Error("Repaired observation Parquet must contain rows");
   }
-  const physicalColumns = parquetSchema(metadata).children.map((column) => String(column.element.name));
-  observationHistoryPhysicalSchemaForColumns(physicalColumns);
-  const schemaColumns = new Set(physicalColumns);
+  const schemaColumns = new Set(
+    parquetSchema(metadata).children.map((column) => String(column.element.name)),
+  );
   const required = [
     "connector_id",
     "station_id",

@@ -12,7 +12,6 @@ import {
   parquetRead,
   parquetSchema,
 } from "./uk_aq_parquet_dependencies.mjs";
-import { observationHistoryPhysicalSchemaForColumns } from "../../../workers/shared/uk_aq_observation_history_schema.mjs";
 
 function parquetIso(value) {
   const parsed = value instanceof Date ? value : new Date(value);
@@ -38,7 +37,6 @@ export async function inspectObservationParquetFile({ filePath, connectorId }) {
   const physicalColumns = parquetSchema(metadata).children.map((column) =>
     String(column.element.name)
   );
-  observationHistoryPhysicalSchemaForColumns(physicalColumns);
   const schemaColumns = new Set(physicalColumns);
   const required = [
     "connector_id",
