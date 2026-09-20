@@ -756,7 +756,7 @@
 
   function facebookIdentityFingerprint(settings) {
     return JSON.stringify([settings.last_identity_checked_at, settings.last_identity_verified_at,
-      settings.observed_page_name, settings.page_name_drift, settings.last_identity_error_code]);
+      settings.last_identity_observed_name, settings.last_identity_name_drift, settings.last_identity_error_code]);
   }
 
   async function pollFacebookIdentity(previousFingerprint) {
@@ -781,14 +781,14 @@
       const minMinutes = Number(data?.constraints?.cooldown_minutes_min);
       const maxMinutes = Number(data?.constraints?.cooldown_minutes_max);
       const cooldownBounds = `${Number.isFinite(minMinutes) ? ` min="${minMinutes}"` : ""}${Number.isFinite(maxMinutes) ? ` max="${maxMinutes}"` : ""}`;
-      const drift = settings.page_name_drift === true;
+      const drift = settings.last_identity_name_drift === true;
       const verified = Boolean(settings.last_identity_verified_at) && !settings.last_identity_error_code;
       dialog.innerHTML = `<form class="media-detail__inner" data-facebook-form><div class="media-detail__header"><div><h3>Facebook</h3><p>UK AQ - ukaq.co.uk</p></div><button type="button" class="media-button" data-close-facebook>Close</button></div>${notice ? message(notice, notice.includes("not updated") ? "" : "success") : ""}
         <div class="media-social-identity${drift ? " is-warning" : verified ? " is-verified" : ""}"><dl>
           <dt>Configured Page name</dt><dd>${esc(settings.configured_page_name ?? settings.page_name ?? "—")}</dd>
           <dt>Page ID</dt><dd>${esc(settings.page_id || "—")}</dd><dt>Graph API version</dt><dd>${esc(settings.graph_api_version || "—")}</dd>
           <dt>Identity</dt><dd>${verified ? "Verified" : "Not currently verified"}</dd><dt>Last identity checked</dt><dd>${esc(formatUtcDateTime(settings.last_identity_checked_at))}</dd>
-          <dt>Last identity verified</dt><dd>${esc(formatUtcDateTime(settings.last_identity_verified_at))}</dd><dt>Observed Page name</dt><dd>${esc(settings.observed_page_name || "—")}</dd>
+          <dt>Last identity verified</dt><dd>${esc(formatUtcDateTime(settings.last_identity_verified_at))}</dd><dt>Observed Page name</dt><dd>${esc(settings.last_identity_observed_name || "—")}</dd>
           <dt>Page-name drift</dt><dd>${drift ? "Yes — configured and observed names differ" : "No"}</dd><dt>Identity error</dt><dd>${esc(boundedCode(settings.last_identity_error_code))}</dd>
           <dt>Last successful post</dt><dd>${esc(formatUtcDateTime(settings.last_successful_post_at))}</dd></dl></div>
         <label class="media-toggle"><input name="publishing_enabled" type="checkbox"${settings.publishing_enabled ? " checked" : ""}> <span>Publishing enabled</span></label>
