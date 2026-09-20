@@ -93,30 +93,21 @@ function exactIdentity(key, body) {
   return { key, byte_size: body.byteLength, sha256: sha256Hex(body) };
 }
 
-async function readExactFromHead(r2, key, head, expected = null) {
-  const storedSha256 = head?.sha256;
-  if (!head?.exists || !Number.isSafeInteger(head.bytes) || head.bytes < 0 ||
-      (storedSha256 != null && !SHA256.test(storedSha256)) ||
-      (key.endsWith(".parquet") && storedSha256 == null)) {
+async function readExact(r2, key, expected = null) {
+  const head = await r2HeadObject({ r2, key });
+  if (!head?.exists || !Number.isSafeInteger(Number(head.bytes)) || !SHA256.test(String(head.sha256 || ""))) {
     throw new Error(`Strong stored R2 identity unavailable: ${key}`);
   }
   const object = await r2GetObject({ r2, key });
   const body = Buffer.from(object.body);
   const identity = exactIdentity(key, body);
-  if (identity.byte_size !== head.bytes ||
-      (storedSha256 != null && identity.sha256 !== storedSha256)) {
+  if (identity.byte_size !== Number(head.bytes) || identity.sha256 !== head.sha256) {
     throw new Error(`R2 HEAD/GET identity mismatch: ${key}`);
   }
-  if (expected && (identity.key !== expected.key || identity.byte_size !== expected.byte_size ||
-      identity.sha256 !== expected.sha256)) {
+  if (expected && (identity.byte_size !== expected.byte_size || identity.sha256 !== expected.sha256)) {
     throw new Error(`Pinned R2 identity mismatch: ${key}`);
   }
   return { ...identity, body };
-}
-
-export async function readExact(r2, key, expected = null) {
-  const head = await r2HeadObject({ r2, key });
-  return readExactFromHead(r2, key, head, expected);
 }
 
 function parseJson(object) {
@@ -756,11 +747,13 @@ function sameIdentity(left, right) {
     left.byte_size === right.byte_size && left.sha256 === right.sha256);
 }
 
-export async function currentIdentity(r2, key) {
+async function currentIdentity(r2, key) {
   const head = await r2HeadObject({ r2, key });
   if (head?.exists === false) return null;
-  const object = await readExactFromHead(r2, key, head);
-  return { key, byte_size: object.byte_size, sha256: object.sha256 };
+  if (!head?.exists || !Number.isSafeInteger(Number(head.bytes)) || !SHA256.test(String(head.sha256 || ""))) {
+    throw new Error(`Current R2 strong identity unavailable: ${key}`);
+  }
+  return { key, byte_size: Number(head.bytes), sha256: head.sha256 };
 }
 
 async function assertPinnedPrestate(r2, plan, { rootAlreadyTarget = false } = {}) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -12,12 +13,62 @@ import { computeObservationContentHash } from "../../workers/shared/uk_aq_observ
 import { OBSERVATION_HISTORY_COLUMNS_V3 } from "../../workers/shared/uk_aq_observation_history_schema.mjs";
 import { buildObservationHistoryV3SteadyStatePartition, OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES } from "../../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import { assertApplyArguments, classifyMigrationPhysicalColumns, decodeParquet, parseArgs, requireTestGuard, sealMigrationPlan } from "./uk_aq_migrate_observation_vstatus_to_verification_status.mjs";
+import * as migration from "./uk_aq_migrate_observation_vstatus_to_verification_status.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const base = {
   connector_id: 1, station_id: 2, timeseries_id: 3, pollutant_code: "no2",
   observed_at_utc: "2026-09-19T01:00:00.000Z", value: 12.5,
 };
+
+function localObject(key, body, { bytes = body.byteLength, sha256 = null, exists = true } = {}) {
+  return { adapter: {
+    headObject: async ({ key: requested }) => {
+      assert.equal(requested, key);
+      return { exists, key, bytes, sha256 };
+    },
+    getObject: async ({ key: requested }) => {
+      assert.equal(requested, key);
+      return { key, body };
+    },
+  } };
+}
+
+test("JSON identity comes from GET bytes when HEAD has no checksum", async () => {
+  const key = "history/v3/observations/_manifests/manifest.json";
+  const body = Buffer.from('{"kind":"observations-root"}');
+  const expected = { key, byte_size: body.byteLength, sha256: createHash("sha256").update(body).digest("hex") };
+  const r2 = localObject(key, body);
+  const read = await migration.readExact(r2, key, expected);
+  assert.deepEqual({ key: read.key, byte_size: read.byte_size, sha256: read.sha256 }, expected);
+  assert.deepEqual(await migration.currentIdentity(r2, key), expected);
+  assert.equal(await migration.currentIdentity(localObject(key, body, { exists: false }), key), null);
+});
+
+test("JSON identity rejects bad HEAD size, supplied checksum, or pinned identity", async () => {
+  const key = "history/v3/observations/_manifests/manifest.json";
+  const body = Buffer.from("{}");
+  const sha256 = createHash("sha256").update(body).digest("hex");
+  await assert.rejects(() => migration.readExact(localObject(key, body, { bytes: null }), key), /identity unavailable/);
+  await assert.rejects(() => migration.readExact(localObject(key, body, { bytes: body.byteLength + 1 }), key), /HEAD\/GET identity mismatch/);
+  await assert.rejects(() => migration.readExact(localObject(key, body, { sha256: "not-a-sha256" }), key), /identity unavailable/);
+  await assert.rejects(() => migration.currentIdentity(localObject(key, body, { sha256: "0".repeat(64) }), key), /HEAD\/GET identity mismatch/);
+  await assert.rejects(() => migration.readExact(localObject(key, body), key,
+    { key, byte_size: body.byteLength, sha256: "0".repeat(64) }), /Pinned R2 identity mismatch/);
+  assert.deepEqual(await migration.currentIdentity(localObject(key, body, { sha256 }), key),
+    { key, byte_size: body.byteLength, sha256 });
+});
+
+test("Parquet still requires stored HEAD SHA-256 and verifies GET bytes", async () => {
+  const key = "history/v3/observations/day_utc=2026-09-19/part-00000.parquet";
+  const body = Buffer.from("parquet fixture bytes");
+  const sha256 = createHash("sha256").update(body).digest("hex");
+  await assert.rejects(() => migration.readExact(localObject(key, body), key), /identity unavailable/);
+  await assert.rejects(() => migration.currentIdentity(localObject(key, body), key), /identity unavailable/);
+  await assert.rejects(() => migration.currentIdentity(localObject(key, body, { sha256: "0".repeat(64) }), key), /HEAD\/GET identity mismatch/);
+  assert.deepEqual(await migration.currentIdentity(localObject(key, body, { sha256 }), key),
+    { key, byte_size: body.byteLength, sha256 });
+});
 
 function physicalFixture(statusName, statuses) {
   const columns = {
