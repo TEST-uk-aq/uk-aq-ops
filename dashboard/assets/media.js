@@ -14,9 +14,12 @@
   ];
   const STATUS_LABELS = { approved: "Approved", pending: "Pending", rejected: "Rejected", hidden: "Hidden" };
   const BLUESKY_REASON_LABELS = {
+    auto_approved: "Automatically approved",
     pending_approved: "Approved from Pending",
     rejected_repost: "Approved from Rejected",
     unhidden_repost: "Approved from Hidden",
+    manual_post: "Manual post",
+    manual_repost: "Manual repost",
   };
   const STATUS_ACTIONS = {
     pending: [["approved", "Approve", "approve"], ["rejected", "Reject", "reject"]],
@@ -114,7 +117,9 @@
     const contentType = String(response.headers.get("Content-Type") || "");
     const payload = contentType.includes("json") ? await response.json().catch(() => null) : null;
     if (!response.ok) {
-      throw new Error(String(payload?.error?.message || payload?.error || payload?.message || `Media request failed (${response.status})`));
+      const error = new Error(String(payload?.error?.message || payload?.error || payload?.message || `Media request failed (${response.status})`));
+      error.payload = payload;
+      throw error;
     }
     return payload;
   }
@@ -370,7 +375,7 @@
 
   function bulkToolbarHtml() {
     const count = state.selectedArticleIds.size;
-    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><div class="media-social-options" data-bulk-social hidden><label class="media-toggle" data-bulk-bluesky><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label><label class="media-toggle" data-bulk-facebook><input type="checkbox"> <span>Post to Facebook UK AQ - ukaq.co.uk</span></label></div><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
+    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><div class="media-social-options" data-bulk-social hidden><label class="media-toggle" data-bulk-bluesky><input type="checkbox"> <span data-bulk-bluesky-label>Post to Bluesky @ukaq.co.uk</span></label><label class="media-toggle" data-bulk-facebook><input type="checkbox"> <span data-bulk-facebook-label>Post to Facebook UK AQ - ukaq.co.uk</span></label></div><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
   }
 
   function articleTableHtml(error = "") {
@@ -507,6 +512,7 @@
       refreshSelectionControls();
     });
     state.root.querySelector("[data-save-bulk]")?.addEventListener("click", () => void saveBulkStatus());
+    state.root.querySelectorAll("[data-bulk-social] input").forEach(input => input.addEventListener("change", refreshSelectionControls));
     state.root.querySelectorAll("[data-status-control] select").forEach(select => select.addEventListener("change", event => {
       const control = event.target.closest("[data-status-control]");
       const current = control.dataset.current;
@@ -560,8 +566,17 @@
       if (!visible) {
         social.querySelectorAll("input").forEach(input => { input.checked = false; });
       }
+      const allApproved = count > 0 && selectedArticles().every(article => article.status === "approved");
+      const blueskyLabel = social.querySelector("[data-bulk-bluesky-label]");
+      const facebookLabel = social.querySelector("[data-bulk-facebook-label]");
+      if (blueskyLabel) blueskyLabel.textContent = allApproved ? "Post/repost selected to Bluesky" : "Post to Bluesky @ukaq.co.uk";
+      if (facebookLabel) facebookLabel.textContent = allApproved ? "Post/repost selected to Facebook" : "Post to Facebook UK AQ - ukaq.co.uk";
     }
-    if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value;
+    const directPublishMode = target?.value === "approved" && count > 0
+      && selectedArticles().every(article => article.status === "approved");
+    const socialSelected = social?.querySelector("input:checked") !== null;
+    if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value
+      || (directPublishMode && !socialSelected);
     const output = table.querySelector("[data-bulk-message]"); if (output) output.innerHTML = state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : "";
   }
 
@@ -580,16 +595,34 @@
     const postToBluesky = target === "approved" && table.querySelector("[data-bulk-bluesky] input")?.checked === true;
     const postToFacebook = target === "approved" && table.querySelector("[data-bulk-facebook] input")?.checked === true;
     if (postToBluesky || postToFacebook) {
+      const approvedCount = selected.filter(article => article.status === "approved").length;
+      if (approvedCount > 0 && approvedCount < selected.length) {
+        state.batchMessage = { text: "For social publishing, select either only articles already Approved or only articles being moved to Approved.", kind: "error" };
+        refreshSelectionControls();
+        return;
+      }
       try {
-        await request("articles/bulk-approve", { method: "POST", idempotent: "bulk-approve", body: {
-          article_ids: changes.map(({ article }) => article.id),
-          post_to_bluesky: postToBluesky,
-          post_to_facebook: postToFacebook,
-        } });
-        state.batchMessage = { text: `${changes.length} changed${selected.length - changes.length ? `; ${selected.length - changes.length} already ${STATUS_LABELS[target]}` : ""}.`, kind: "success" };
+        const directPublish = approvedCount === selected.length;
+        await request(directPublish ? "articles/bulk-publish" : "articles/bulk-approve", {
+          method: "POST",
+          idempotent: directPublish ? "bulk-publish" : "bulk-approve",
+          body: {
+            article_ids: directPublish ? selected.map(article => article.id) : changes.map(({ article }) => article.id),
+            post_to_bluesky: postToBluesky,
+            post_to_facebook: postToFacebook,
+          },
+        });
+        state.batchMessage = directPublish
+          ? { text: `Social publication requests accepted for ${selected.length} selected article${selected.length === 1 ? "" : "s"}.`, kind: "success" }
+          : { text: `${changes.length} changed. Social publication requests accepted.`, kind: "success" };
         await refreshArticleTable(false);
       } catch (error) {
-        state.batchMessage = { text: error.message, kind: "error" };
+        const failures = Array.isArray(error.payload?.failures) ? error.payload.failures : [];
+        const detail = failures.slice(0, MAX_BATCH_SELECTION).map(failure => {
+          const platform = failure.platform ? ` (${failure.platform === "bluesky" ? "Bluesky" : "Facebook"})` : "";
+          return `article ${boundedCode(failure.article_id)}${platform}: ${directPublishUnavailableMessage(platform || "Social", failure.error)}`;
+        }).join(" ");
+        state.batchMessage = { text: detail ? `Bulk publish rejected. ${detail}` : error.message, kind: "error" };
         refreshSelectionControls();
       }
       return;
@@ -861,6 +894,36 @@
 
   function socialReasonLabel(reason) { return BLUESKY_REASON_LABELS[reason] || reason || "—"; }
 
+  function directPublishUnavailableMessage(platform, reason) {
+    const messages = {
+      thumbnail_missing: "Bluesky posting unavailable because no eligible thumbnail is available.",
+      publication_in_progress: "A publication is already queued or in progress.",
+      unknown_remote_state: "Facebook publication state is unknown and is being held to prevent a possible duplicate post.",
+      facebook_publishing_disabled: "Facebook publishing is disabled.",
+      article_not_approved: "Direct publishing is only available for Approved articles.",
+    };
+    return messages[reason] || `${platform} direct publishing is currently unavailable.`;
+  }
+
+  function directPublishOption(platform, social) {
+    const name = platform === "Bluesky" ? "Bluesky @ukaq.co.uk" : "Facebook UK AQ - ukaq.co.uk";
+    const key = platform.toLowerCase();
+    if (social.direct_publish_available === true) {
+      const verb = social.direct_publish_reason === "manual_repost" ? "Repost" : "Post";
+      return `<label class="media-toggle" data-direct-${key}><input type="checkbox"> <span>${verb} to ${name}</span></label>`;
+    }
+    const reason = social.direct_publish_unavailable_reason;
+    const held = platform === "Facebook" && reason === "unknown_remote_state";
+    return `<div class="media-message${held ? " media-message--error media-publication-state--held" : ""}">${esc(directPublishUnavailableMessage(platform, reason))}</div>`;
+  }
+
+  function directPublishHtml(data, article) {
+    if (article.status !== "approved") return "";
+    const bluesky = blueskyState(data, article);
+    const facebook = facebookState(data, article);
+    return `<section><h4>Direct social publishing</h4><p class="media-subtext">Queue a deliberate post or repost without changing this article’s Approved status.</p><div class="media-social-options">${directPublishOption("Bluesky", bluesky)}${directPublishOption("Facebook", facebook)}</div><div class="media-actions"><button type="button" class="media-button media-button--primary" data-direct-publish disabled>Publish selected</button></div><div data-direct-publish-message></div></section>`;
+  }
+
   function facebookStatusLabel(item) {
     if (item.status === "queued" && item.next_attempt_at) return "Retry scheduled";
     return ({ queued: "Queued", posting: "Posting", posted: "Posted", failed: "Failed", blocked: "Blocked",
@@ -908,6 +971,7 @@
         <div class="media-detail__grid"><div>${article.admin_preview_image_path ? `<img class="media-detail__preview" src="${esc(apiUrl(`articles/${id}/image`))}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
         <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatUtcDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
+        ${directPublishHtml(data, article)}
         ${blueskyHistoryHtml(data, article)}
         ${facebookHistoryHtml(data, article)}
         <section><h4>Author</h4><form class="media-inline-form" data-detail-author><label class="media-field media-field--grow"><span>Author</span><input name="author" maxlength="500" value="${esc(article.author || "")}" autocomplete="off"></label><button class="media-button media-button--primary">Save Author</button></form><p class="media-subtext">Single line, maximum 500 characters. Saving a blank value clears the authoritative Author.</p><div data-detail-author-message></div></section>
@@ -926,6 +990,11 @@
         if (manual) { manual.hidden = event.currentTarget.value !== "approved"; manual.querySelectorAll("input").forEach(input => { input.checked = false; }); }
       });
       detailStatus?.querySelector("button")?.addEventListener("click", () => void saveDetailStatus(id, detailStatus, dialog));
+      const directPublish = dialog.querySelector("[data-direct-publish]");
+      dialog.querySelectorAll("[data-direct-bluesky] input, [data-direct-facebook] input").forEach(input => input.addEventListener("change", () => {
+        directPublish.disabled = !dialog.querySelector("[data-direct-bluesky] input:checked, [data-direct-facebook] input:checked");
+      }));
+      directPublish?.addEventListener("click", () => void publishArticle(id, dialog));
       if (selectedStatus) {
         const select = detailStatus?.querySelector("select");
         if (select && [...select.options].some(option => option.value === selectedStatus)) {
@@ -958,6 +1027,25 @@
       await openArticle(id);
     } catch (error) {
       control.querySelector("button").disabled = false;
+      output.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function publishArticle(id, dialog) {
+    const button = dialog.querySelector("[data-direct-publish]");
+    const output = dialog.querySelector("[data-direct-publish-message]");
+    const body = {
+      post_to_bluesky: dialog.querySelector("[data-direct-bluesky] input")?.checked === true,
+      post_to_facebook: dialog.querySelector("[data-direct-facebook] input")?.checked === true,
+    };
+    if (!body.post_to_bluesky && !body.post_to_facebook) return;
+    button.disabled = true;
+    try {
+      await request(`articles/${id}/publish`, { method: "POST", idempotent: "publish", body });
+      await renderArticles(false);
+      await openArticle(id, "Selected social publication request(s) accepted.");
+    } catch (error) {
+      button.disabled = false;
       output.innerHTML = message(error.message, "error");
     }
   }
