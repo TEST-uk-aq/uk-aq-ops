@@ -18699,6 +18699,8 @@ def run_v2_observation_content_hash_checks(
                         f"parquet_hash={parquet_hash['observation_content_hash']}",
                     ],
                 )
+                if isinstance(candidate.get("source_evidence"), Mapping):
+                    gap["source_evidence"] = dict(candidate["source_evidence"])
                 new_gaps.append(gap)
                 metrics["mismatch"] += 1
             continue
@@ -18719,6 +18721,8 @@ def run_v2_observation_content_hash_checks(
                     f"dropbox_manifest_hash={manifest_hash['observation_content_hash']}",
                 ],
             )
+            if isinstance(candidate.get("source_evidence"), Mapping):
+                gap["source_evidence"] = dict(candidate["source_evidence"])
             new_gaps.append(gap)
             metrics["mismatch"] += 1
         else:

@@ -2501,6 +2501,156 @@ class V2RepairExecutionTests(unittest.TestCase):
             for action in observations["repair_plan"]
         ))
 
+    def test_sos_hash_mismatch_preserves_exact_partition_source_evidence(self) -> None:
+        day_utc = "2025-01-15"
+        manifest_path = self.root / "manifest.json"
+        source_hash = {
+            "observation_content_hash": "a" * 64,
+            "observation_content_hash_algorithm": "sha256",
+            "observation_content_hash_contract_version": 1,
+            "observation_content_hash_row_count": 1,
+            "observation_content_hash_columns": MODULE.OBSERVATION_CONTENT_HASH_COLUMNS,
+            "verification_status_counts": {"P": 1, "R": 0, "null": 0},
+        }
+        manifest_path.write_text(json.dumps({
+            **source_hash, "observation_content_hash": "b" * 64,
+        }), encoding="utf-8")
+        (self.root / "R2_history_backup").mkdir()
+        partition_evidence = {
+            "source_partition_state": "successful_non_empty",
+            "source_counts_available": True,
+            "source_skip_reason": None,
+            "unresolved_site_ref_groups": 0,
+            "unmapped_site_ref_groups": 0,
+            "ambiguous_site_ref_groups": 0,
+            "timeseries_conflict_groups": 0,
+            "required_source_file_count": 1,
+            "successful_source_file_count": 1,
+        }
+        candidate = {
+            "day_utc": day_utc,
+            "connector_id": 1,
+            "pollutant_code": "no2",
+            "manifest_path": str(manifest_path),
+            "manifest_rel": "history/v2/observations/day_utc=2025-01-15/connector_id=1/pollutant_code=no2/manifest.json",
+            "parquet_paths": [],
+            "source_row_count": 1,
+            "source_timeseries_row_counts": {"101": 1},
+            "source_evidence": partition_evidence,
+        }
+        observations = {
+            "gaps": [],
+            "hash_check_candidates": [candidate],
+            "hash_candidates_by_pollutant": {"no2": 1},
+        }
+        with (
+            mock.patch.object(MODULE, "run_narrow_backfill", return_value={"status": "ok"}),
+            mock.patch.object(MODULE, "write_uk_air_source_label_registry_snapshot", return_value={"path": "registry.json", "inventory": {}}),
+            mock.patch.object(MODULE, "write_sos_site_ref_bridge_snapshot", return_value={"path": "bridge.json"}),
+            mock.patch.object(MODULE, "_load_complete_connector_day_source_evidence", return_value=(
+                {"observation_content_hashes": {"no2": source_hash}}, [],
+            )),
+            mock.patch.object(MODULE, "_persist_complete_connector_day_source_evidence", return_value={}),
+        ):
+            metrics = MODULE.run_v2_observation_content_hash_checks(
+                conn=self.conn, env_name="TEST", run_compact="focused", env=self.env,
+                v2_observations=observations, source_scope={"source": "sos"},
+                log=self.log, repair_pollutants=["no2"],
+            )
+
+        self.assertEqual(metrics["mismatch"], 1)
+        gap = next(gap for gap in observations["gaps"] if gap["gap_type"] == "observation_content_hash_mismatch")
+        self.assertEqual(gap["source_evidence"], partition_evidence)
+        self.assertIn("observation_data_repair", [action["kind"] for action in observations["repair_plan"]])
+        with (
+            mock.patch.object(MODULE, "run_narrow_backfill", return_value={"status": "failed"}),
+            mock.patch.object(MODULE, "write_uk_air_source_label_registry_snapshot", return_value={"path": "registry.json", "inventory": {}}),
+            mock.patch.object(MODULE, "write_sos_site_ref_bridge_snapshot", return_value={"path": "bridge.json"}),
+        ):
+            repair_metrics = MODULE.run_v2_gap_backfills(
+                conn=self.conn, run_id=1, env_name="TEST", run_compact="focused",
+                env=self.env, v2_observations=observations, dry_run=True,
+                run_backfill=True,
+                limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+                log=self.log, repair_pollutants=["no2"], source_scope={"source": "sos"},
+            )
+        self.assertEqual(len(repair_metrics["planned_v2_observation_repairs"]), 1)
+        self.assertEqual(repair_metrics["executable_repair_pollutants_by_connector_day"], {
+            "2025-01-15/connector_id=1": ["no2"],
+        })
+
+        gap["source_evidence"] = {}
+        blocked = MODULE._derive_executable_observation_repair_pollutants(
+            v2_observations=observations, requested_pollutants=["no2"],
+        )
+        self.assertEqual(blocked[0], {})
+        self.assertEqual(blocked[1], set())
+        self.assertIn("source_partition_state=missing", blocked[2][0]["reason"])
+        blocked_metrics = MODULE.run_v2_gap_backfills(
+            conn=self.conn, run_id=2, env_name="TEST", run_compact="focused",
+            env=self.env, v2_observations=observations, dry_run=True,
+            run_backfill=True,
+            limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+            log=self.log, repair_pollutants=["no2"], source_scope={"source": "sos"},
+        )
+        self.assertEqual(blocked_metrics["planned_v2_observation_repairs"], [])
+
+    def test_v3_hash_mismatch_preserves_partition_source_evidence(self) -> None:
+        v3_path = MODULE_PATH.with_name("uk-aq-history-integrity-sos-light-v3.py")
+        spec = importlib.util.spec_from_file_location("uk_aq_integrity_v3_hash_regression", v3_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        v3 = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = v3
+        spec.loader.exec_module(v3)
+
+        source_hash = {
+            "observation_content_hash": "a" * 64,
+            "observation_content_hash_algorithm": "sha256",
+            "observation_content_hash_contract_version": 1,
+            "observation_content_hash_row_count": 1,
+            "observation_content_hash_columns": v3.OBSERVATION_CONTENT_HASH_COLUMNS,
+            "verification_status_counts": {"P": 1, "R": 0, "null": 0},
+        }
+        manifest_path = self.root / "manifest.json"
+        manifest_path.write_text(json.dumps({
+            **source_hash, "observation_content_hash": "b" * 64,
+        }), encoding="utf-8")
+        (self.root / "R2_history_backup").mkdir()
+        partition_evidence = {
+            "source_partition_state": "successful_non_empty",
+            "source_counts_available": True,
+            "required_source_file_count": 1,
+            "successful_source_file_count": 1,
+        }
+        observations = {
+            "gaps": [],
+            "hash_check_candidates": [{
+                "day_utc": "2025-01-15", "connector_id": 1,
+                "pollutant_code": "no2", "manifest_path": str(manifest_path),
+                "manifest_rel": "history/v2/observations/no2/manifest.json",
+                "source_row_count": 1,
+                "source_timeseries_row_counts": {"101": 1},
+                "source_evidence": partition_evidence,
+            }],
+        }
+        with (
+            mock.patch.object(v3, "run_narrow_backfill", return_value={"status": "ok"}),
+            mock.patch.object(v3, "write_uk_air_source_label_registry_snapshot", return_value={"path": "registry.json", "inventory": {}}),
+            mock.patch.object(v3, "write_sos_site_ref_bridge_snapshot", return_value={"path": "bridge.json"}),
+            mock.patch.object(v3, "_load_complete_connector_day_source_evidence", return_value=(
+                {"observation_content_hashes": {"no2": source_hash}}, [],
+            )),
+            mock.patch.object(v3, "_persist_complete_connector_day_source_evidence", return_value={}),
+        ):
+            metrics = v3.run_v2_observation_content_hash_checks(
+                conn=self.conn, env_name="TEST", run_compact="focused", env=self.env,
+                v2_observations=observations, source_scope={"source": "sos"},
+                log=self.log, repair_pollutants=["no2"],
+            )
+        self.assertEqual(metrics["mismatch"], 1)
+        self.assertEqual(observations["gaps"][0]["source_evidence"], partition_evidence)
+
     def test_all_pollutant_repair_requires_complete_source_for_every_pollutant(self) -> None:
         day_utc = "2026-07-15"
         connector_id = 1
