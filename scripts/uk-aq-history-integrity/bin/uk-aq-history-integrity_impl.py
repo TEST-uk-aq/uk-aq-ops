@@ -18216,7 +18216,7 @@ def _observation_rows_from_local_parquet_for_shared_hash(
     connection = _connect_duckdb_utc(duckdb)
     try:
         description = connection.execute(
-            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)",
+            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true, hive_partitioning=false, filename=false)",
             [paths],
         ).fetchall()
         columns = {str(row[0]) for row in description}
@@ -18246,7 +18246,7 @@ def _observation_rows_from_local_parquet_for_shared_hash(
         for parquet_path in paths:
             file_columns = {
                 str(row[0]) for row in connection.execute(
-                    "DESCRIBE SELECT * FROM read_parquet(?)", [parquet_path]
+                    "DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=false, filename=false)", [parquet_path]
                 ).fetchall()
             }
             if file_columns not in supported:
@@ -18263,7 +18263,7 @@ def _observation_rows_from_local_parquet_for_shared_hash(
                    observed_at_utc, "value"
             """
             + status_select
-            + " FROM read_parquet(?, union_by_name=true)",
+            + " FROM read_parquet(?, union_by_name=true, hive_partitioning=false, filename=false)",
             [paths],
         ).fetchall()
     finally:
