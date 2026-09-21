@@ -76,6 +76,14 @@ When R2 history Dropbox inventory/checkpoint or restore behaviour is in scope, a
 
 Do not preload every R2-history contract for an R2 task.
 
+## History Integrity dry-run reporting and dashboard presentation
+
+For v2/v3 History Integrity dry-run result semantics, start with [`r2_history/integrity_dry_run_reporting_contract.md`](r2_history/integrity_dry_run_reporting_contract.md).
+
+When the Operations dashboard Daily Tasks presentation is also in scope, add [`dashboards/history_integrity_dry_run_status_contract.md`](dashboards/history_integrity_dry_run_status_contract.md).
+
+R2 history owns execution, proposed-state and live-state semantics. Dashboards own the `FINISHED`/`FAILED` plus independent `DRY RUN` presentation. The dashboard must not infer data-health semantics independently.
+
 ## Connector ingest plus historical repair
 
 For connector ingestion, discovery or current acquisition behaviour, start with [`ingest/README.md`](ingest/README.md).
