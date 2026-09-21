@@ -25587,6 +25587,7 @@ def _v3_dry_run_repair_proposal_verified(repair_flow: Mapping[str, Any]) -> bool
 def _v3_dry_run_report_state(
     *, pre_repair_status: str, pre_repair_gap_count: int,
     repair_flow: Mapping[str, Any],
+    run_status: str,
 ) -> dict[str, Any]:
     final = repair_flow.get("final_verification") or {}
     remaining = final.get("remaining_gap_count")
@@ -25595,13 +25596,23 @@ def _v3_dry_run_report_state(
         and isinstance(remaining, int) and not isinstance(remaining, bool)
         and remaining == 0
     )
+    proposed_failed = (
+        final.get("ran") is True
+        and (final.get("status") == "failed" or (
+            isinstance(remaining, int)
+            and not isinstance(remaining, bool)
+            and remaining > 0
+        ))
+    )
     return {
+        "status": run_status if run_status in {"planned", "fail", "stopped_limit"} else pre_repair_status,
+        "final_verified": False,
+        "final_verification": dict(final),
+        "repair_applied": False,
         "pre_repair_status": pre_repair_status,
         "pre_repair_gap_count": pre_repair_gap_count,
         "proposed_state_status": (
-            "ok" if proposed_verified else "fail"
-            if final.get("ran") is True and final.get("status") == "failed"
-            else "not_verified"
+            "ok" if proposed_verified else "fail" if proposed_failed else "not_verified"
         ),
         "proposed_remaining_gap_count": (
             remaining if isinstance(remaining, int) and not isinstance(remaining, bool)
@@ -28618,8 +28629,12 @@ def main(argv: list[str]) -> int:
             if final_binding_result is not None:
                 v2_result["timeseries_bindings"] = final_binding_result
         elif args.run_backfill and args.dry_run:
-            v2_result["final_verified"] = False
-            v2_result["final_verification"] = final_result
+            v2_result.update(_v3_dry_run_report_state(
+                pre_repair_status=v2_result["status"],
+                pre_repair_gap_count=v2_gap_count_for_status,
+                repair_flow=repair_flow,
+                run_status=status,
+            ))
         history_version_results: dict[str, Any] = {
             CURRENT_INTEGRITY_HISTORY_VERSION: {
                 **v2_result,
@@ -28761,11 +28776,15 @@ def main(argv: list[str]) -> int:
         if args.dry_run:
             summary["repair_applied"] = False
             if args.run_backfill:
-                summary.update(_v3_dry_run_report_state(
-                    pre_repair_status=v2_result["status"],
-                    pre_repair_gap_count=v2_gap_count_for_status,
-                    repair_flow=repair_flow,
-                ))
+                summary.update({
+                    key: v2_result[key]
+                    for key in (
+                        "repair_applied", "pre_repair_status", "pre_repair_gap_count",
+                        "proposed_state_status", "proposed_remaining_gap_count",
+                        "live_state_status",
+                    )
+                    if key in v2_result
+                })
         # Dropbox DB copy on any non-error exit. Failures here are warnings,
         # not run failures — the local DB is the source of truth.
         db_copy = _copy_db_to_dropbox(env, conn, log)
