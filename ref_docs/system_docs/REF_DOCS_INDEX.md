@@ -18,11 +18,11 @@ Source repository:
 
 Source commit:
 
-`beaac2eda12265a1ed3ec9b832be7752f5836d4b`
+`e5e56bb8dfef81d80cdea61255d109514aeae359`
 
 Snapshot date:
 
-`18/09/2026`
+`21/09/2026`
 
 ## Reading rule
 
@@ -49,6 +49,7 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 - AURN validation-status behaviour;
 - Media Bluesky publication behaviour;
 - Media dashboard behaviour and article/Bluesky preview contracts.
+- History Integrity v2/v3 dry-run reporting and Operations dashboard dry-run status presentation.
 
 It is intentionally not a complete copy of all UK AQ system documentation.
 
