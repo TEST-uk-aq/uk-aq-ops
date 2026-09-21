@@ -867,15 +867,12 @@ class V2RepairExecutionTests(unittest.TestCase):
             "index_status": "blocked_dependency",
             "results": [],
         }
-        with mock.patch.object(MODULE, "run_v2_gap_backfills", return_value={
+        with mock.patch.object(MODULE, "validate_run_state_core_snapshot_identity"), mock.patch.object(MODULE, "run_v2_gap_backfills", return_value={
             "v2_observation_repairs_failed": 0,
             "v2_observation_repairs_guard_failed": 0,
-        }), mock.patch.object(MODULE, "_run_v2_observation_metadata_executor", side_effect=[
-            observation_metadata,
-            {"status": "not_run", "results": []},
-        ]), mock.patch.object(MODULE, "_record_metadata_executor_overlay"), mock.patch.object(
-            MODULE, "_phase4_aqi_work", return_value=([], [])
-        ):
+        }), mock.patch.object(
+            MODULE, "_run_v2_observation_metadata_executor", return_value=observation_metadata,
+        ), mock.patch.object(MODULE, "_record_metadata_executor_overlay"):
             result = MODULE.run_v2_integrity_repair_flow(
                 run_state=run_state,
                 conn=self.conn,
@@ -896,120 +893,129 @@ class V2RepairExecutionTests(unittest.TestCase):
                 dry_run=True,
                 log=self.log,
             )
-        stages = {entry["stage"]: entry["status"] for entry in result["stage_results"]}
-        self.assertEqual(stages["observs_manifests"], "planned")
-        self.assertEqual(stages["observs_indexes"], "blocked_dependency")
-        self.assertEqual(stages["aqilevels"], "planned")
+        stages = {entry["stage"]: entry for entry in result["stage_results"]}
+        metadata_stage = stages["observations_metadata_proposal"]
+        self.assertEqual(metadata_stage["status"], "failed")
+        self.assertEqual(metadata_stage["result"]["manifest_status"], "planned")
+        self.assertEqual(metadata_stage["result"]["index_status"], "blocked_dependency")
+        self.assertNotIn("aqilevels", stages)
         self.assertEqual(result["status"], "failed")
 
-    def test_canonical_coordinator_bridges_28_observation_backed_aqi_days_before_final_verification(self) -> None:
-        self.conn.execute("""
-            CREATE TABLE core_observed_property_mappings_snapshot (
-              id INTEGER PRIMARY KEY, connector_id INTEGER NOT NULL,
-              observed_property_code TEXT, mapping_kind TEXT NOT NULL,
-              is_aqi_eligible INTEGER NOT NULL, is_active INTEGER NOT NULL
-            )
-        """)
-        self.conn.executemany(
-            """
-            INSERT INTO core_observed_property_mappings_snapshot (
-              id, connector_id, observed_property_code, mapping_kind,
-              is_aqi_eligible, is_active
-            ) VALUES (?, 1, ?, 'direct', 1, 1)
-            """,
-            [(1, "no2"), (2, "pm10"), (3, "pm25")],
-        )
+    def test_v2_dry_run_ignores_retired_aqi_index_action(self) -> None:
         run_state = MODULE.create_run_overlay(
             tmp_dir=self.root / "tmp",
-            run_id="canonical-aqi-bridge",
+            run_id="observations-only",
             environment="TEST",
             base_dropbox_root=self.root / "R2_history_backup",
         )
-        gaps = []
-        for day_offset in range(28):
-            day_utc = (MODULE.dt.date(2026, 2, 1) + MODULE.dt.timedelta(days=day_offset)).isoformat()
-            gaps.append({
-                "gap_type": "day_dir_missing",
-                "day_utc": day_utc,
-                "connector_id": 1,
-                "source_evidence": {"v2_observations_present": True},
-                "suggested_repair": {"kind": MODULE.V2_AQI_OBS_REBUILD_KIND},
-            })
-            for pollutant_code in ("no2", "pm10", "pm25"):
-                gaps.append({
-                    "gap_type": "aqi_manifest_missing_after_obs_repair",
-                    "day_utc": day_utc,
-                    "connector_id": 1,
-                    "pollutant_code": pollutant_code,
-                    "source_evidence": {"v2_observations_present": True},
-                    "suggested_repair": {"kind": MODULE.V2_AQI_OBS_REBUILD_KIND},
-                })
-        execution_order: list[str] = []
-
-        def execute_aqi_queue(*_args, **_kwargs):
-            execution_order.append("aqi")
-            queued = self.conn.execute(
-                "SELECT COUNT(*) FROM aqi_rebuild_queue WHERE run_id = 281"
-            ).fetchone()[0]
-            self.assertEqual(queued, 28)
-            return {
-                "aqi_rebuild_ran": True,
-                "aqi_rebuilds_queued": 28,
-                "aqi_rebuilds_queued_total": 28,
-                "aqi_rebuilds_attempted": 28,
-                "aqi_rebuilds_complete": 28,
-                "aqi_rebuilds_failed": 0,
-                "aqi_rebuild_results": [],
-            }
-
-        def final_verification(*_args, **_kwargs):
-            execution_order.append("final_verification")
-            self.assertEqual(execution_order, ["aqi", "final_verification"])
-            return {
-                "status": "ok",
-                "remaining_gap_count": 0,
-                "r2_objects_written": 0,
-                "r2_objects_deleted": 0,
-                "r2_objects_changed": 0,
-            }
-
         metadata_ok = {"status": "ok", "manifest_status": "ok", "index_status": "ok", "results": []}
-        with mock.patch.object(MODULE, "run_v2_gap_backfills", return_value={
-            "v2_observation_repairs_failed": 0,
-            "v2_observation_repairs_guard_failed": 0,
-        }), mock.patch.object(MODULE, "_run_v2_observation_metadata_executor", side_effect=[metadata_ok, metadata_ok]), \
+        current_state = {
+            "overall_status": "complete",
+            "timeseries_reconciliation_status": "complete",
+            "latest_snapshot_reconciliation_status": "complete",
+            "timeseries": {},
+            "latest_snapshot": {},
+        }
+        forbidden = AssertionError("retired AQI repair path was invoked")
+        with mock.patch.object(MODULE, "validate_run_state_core_snapshot_identity"), \
+             mock.patch.object(MODULE, "run_v2_gap_backfills", return_value={
+                 "v2_observation_repairs_failed": 0,
+                 "v2_observation_repairs_guard_failed": 0,
+                 "v2_observation_repair_results": [],
+             }), \
+             mock.patch.object(MODULE, "_run_v2_observation_metadata_executor", return_value=metadata_ok) as metadata_executor, \
              mock.patch.object(MODULE, "_record_metadata_executor_overlay"), \
-             mock.patch.object(MODULE, "record_integrity_object_operations", return_value={}), \
-             mock.patch.object(MODULE, "run_aqi_rebuild_queue_execution", side_effect=execute_aqi_queue), \
-             mock.patch.object(MODULE, "run_canonical_apply_executor", return_value={"status": "succeeded"}), \
-             mock.patch.object(MODULE, "run_v2_final_verification", side_effect=final_verification):
+             mock.patch.object(MODULE, "record_integrity_object_operations", return_value={
+                 "planned_writes": 0, "planned_deletions": 0,
+             }), \
+             mock.patch.object(MODULE, "run_first_value_at_reconciliation", return_value={"status": "skipped_empty"}), \
+             mock.patch.object(MODULE, "run_v2_final_verification", return_value={
+                 "ran": True, "status": "ok", "remaining_gap_count": 0,
+             }), \
+             mock.patch.object(MODULE, "run_current_state_reconciliation", return_value=current_state), \
+             mock.patch.object(MODULE, "persist_current_state_reconciliation_audit"), \
+             mock.patch.object(MODULE, "_phase4_aqi_work", side_effect=forbidden), \
+             mock.patch.object(MODULE, "queue_v2_aqi_rebuilds_from_integrity_gaps", side_effect=forbidden), \
+             mock.patch.object(MODULE, "run_aqi_rebuild_queue_execution", side_effect=forbidden):
             result = MODULE.run_v2_integrity_repair_flow(
                 run_state=run_state,
                 conn=self.conn,
-                run_id=281,
+                run_id=1,
                 env_name="TEST",
                 run_compact="run",
                 env=self.env,
                 v2_observations={"repair_plan": []},
-                v2_aqilevels={"gaps": gaps, "repair_plan": []},
+                v2_aqilevels={"repair_plan": [{
+                    "kind": "aqi_index_repair", "day_utc": None,
+                    "requires_index_rebuild": True, "gap_types": ["latest_index_missing"],
+                }]},
                 final_verification_config=MODULE.resolve_history_path_config("v2", self.env),
-                from_day="2026-02-01",
-                to_day="2026-02-28",
+                from_day="2025-01-15",
+                to_day="2025-01-15",
                 allowed_connector_ids={1},
                 source_scope={"source": "sos", "connector_ids": [1]},
                 check_aqi_debug=False,
                 require_aqi_debug=False,
                 limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
-                dry_run=False,
+                dry_run=True,
                 log=self.log,
             )
 
-        aqi_stage = next(stage["result"] for stage in result["stage_results"] if stage["stage"] == "aqi_proposal")
-        self.assertTrue(aqi_stage["v2_aqi_integrity_rebuild_bridge_ran"])
-        self.assertEqual(aqi_stage["v2_aqi_rebuilds_queued_from_integrity"], 28)
-        self.assertEqual(len(aqi_stage["planned_aqi_rebuild_connector_days"]), 28)
-        self.assertEqual(aqi_stage["aqi_rebuilds_attempted"], 28)
-        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["status"], "planned")
+        self.assertEqual(metadata_executor.call_count, 1)
+        self.assertEqual(metadata_executor.call_args.kwargs["actions"], [])
+        self.assertFalse(any(stage["stage"] == "aqi_proposal" for stage in result["stage_results"]))
+
+    def test_observation_repair_plan_can_exclude_retired_aqi_work(self) -> None:
+        plan = MODULE.build_v2_repair_plan(
+            observation_gaps=[{
+                "gap_type": "source_r2_timeseries_row_mismatch",
+                "day_utc": "2025-01-15",
+                "connector_id": 1,
+                "pollutant_code": "pm10",
+                "source_evidence": {"source_partition_state": "successful_non_empty"},
+            }],
+            include_aqi_from_observation_repairs=False,
+        )
+        self.assertEqual([action["kind"] for action in plan], ["observation_data_repair"])
+
+    def test_v2_final_view_excludes_retired_aqi_history(self) -> None:
+        baseline = self.root / "R2_history_backup"
+        observation_key = (
+            "history/v2/observations/day_utc=2025-01-15/"
+            "connector_id=1/pollutant_code=pm10/manifest.json"
+        )
+        aqi_key = (
+            "history/v2/aqilevels/hourly/data/day_utc=2025-01-15/"
+            "connector_id=1/pollutant_code=pm10/manifest.json"
+        )
+        aqi_index_key = (
+            "history/_index_v2/aqilevels_hourly_data_timeseries/"
+            "day_utc=2025-01-15/connector_id=1/pollutant_code=pm10/manifest.json"
+        )
+        aqi_latest_key = "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"
+        for key in (observation_key, aqi_key, aqi_index_key, aqi_latest_key):
+            path = baseline / key
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}", encoding="utf-8")
+        run_state = MODULE.create_run_overlay(
+            tmp_dir=self.root / "tmp",
+            run_id="final-view",
+            environment="TEST",
+            base_dropbox_root=baseline,
+        )
+
+        view = MODULE._create_final_verification_view(
+            run_state,
+            config=MODULE.resolve_history_path_config("v2", self.env),
+            from_day="2025-01-15",
+            to_day="2025-01-15",
+        )
+
+        self.assertTrue((view / observation_key).is_file())
+        self.assertFalse((view / aqi_key).exists())
+        self.assertFalse((view / aqi_index_key).exists())
+        self.assertFalse((view / aqi_latest_key).exists())
 
     def test_data_repair_coalesces_same_day_index_only_gap(self) -> None:
         metrics = MODULE.run_v2_gap_backfills(
@@ -2845,20 +2851,17 @@ class V2RepairExecutionTests(unittest.TestCase):
             metrics["planned_v2_observation_repairs"][0],
         )
 
-    def test_v2_post_repair_recheck_reports_fixed_observations_and_failed_aqi(self) -> None:
+    def test_v2_post_repair_recheck_ignores_retired_aqi_history(self) -> None:
         config = MODULE.resolve_history_path_config("v2", {})
         with mock.patch.object(MODULE, "run_v2_observations_integrity_checks", return_value={
             "status": "ok",
             "checked_partitions": 1,
             "gap_count": 0,
             "gaps": [],
-        }) as obs_check, mock.patch.object(MODULE, "run_v2_aqilevels_integrity_checks", return_value={
-            "status": "fail",
-            "checked_partitions": 0,
-            "gap_count": 1,
-            "gaps": [{"gap_type": "connector_dir_missing", "day_utc": "2026-06-08", "connector_id": 6}],
-            "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []},
-        }) as aqi_check:
+        }) as obs_check, mock.patch.object(
+            MODULE, "run_v2_aqilevels_integrity_checks",
+            side_effect=AssertionError("retired AQI history was checked"),
+        ):
             result = MODULE.run_v2_post_repair_integrity_rechecks(
                 r2_history_root=self.root,
                 config=config,
@@ -2871,34 +2874,22 @@ class V2RepairExecutionTests(unittest.TestCase):
                 log=self.log,
             )
 
-        self.assertEqual(result["status"], "fail")
-        self.assertEqual(result["message"], "v2 observations fixed; v2 AQI still failing")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["message"], "v2 observations fixed")
         self.assertEqual(result["remaining_observation_gap_count"], 0)
-        self.assertEqual(result["remaining_aqi_gap_count"], 1)
-        self.assertEqual(result["remaining_aqi_debug_gap_count"], 0)
+        self.assertNotIn("aqilevels", result)
         obs_check.assert_called_once()
-        aqi_check.assert_called_once()
         self.assertEqual(obs_check.call_args.kwargs["allowed_connector_ids"], {6})
-        self.assertEqual(aqi_check.call_args.kwargs["allowed_connector_ids"], {6})
 
-    def test_v2_post_repair_recheck_final_status_ok_only_when_observations_and_aqi_pass(self) -> None:
+    def test_v2_post_repair_recheck_final_status_tracks_observations(self) -> None:
         config = MODULE.resolve_history_path_config("v2", {})
-        for obs_status, aqi_status, expected in (
-            ("ok", "ok", "ok"),
-            ("ok", "fail", "fail"),
-            ("fail", "ok", "fail"),
-            ("fail", "fail", "fail"),
+        for obs_status, expected in (
+            ("ok", "ok"),
+            ("fail", "fail"),
         ):
-            with self.subTest(obs_status=obs_status, aqi_status=aqi_status), \
+            with self.subTest(obs_status=obs_status), \
                  mock.patch.object(MODULE, "run_v2_observations_integrity_checks", return_value={
                      "status": obs_status, "checked_partitions": 1, "gap_count": 0 if obs_status == "ok" else 1, "gaps": [],
-                 }), \
-                 mock.patch.object(MODULE, "run_v2_aqilevels_integrity_checks", return_value={
-                     "status": aqi_status,
-                     "checked_partitions": 1,
-                     "gap_count": 0 if aqi_status == "ok" else 1,
-                     "gaps": [],
-                     "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []},
                  }):
                 result = MODULE.run_v2_post_repair_integrity_rechecks(
                     r2_history_root=self.root,
@@ -4477,11 +4468,10 @@ class DedicatedSosHistoricalReplacementTests(unittest.TestCase):
                 ],
                 [verified_partition_entry],
             )
-            aqi_stage = next(
-                stage for stage in result["stage_results"]
-                if stage["stage"] == "aqi_proposal"
-            )
-            self.assertEqual(aqi_stage["status"], "bypassed")
+            self.assertFalse(any(
+                stage["stage"] == "aqi_proposal"
+                for stage in result["stage_results"]
+            ))
 
 
 class ProposalRunStateTransitionTests(unittest.TestCase):
