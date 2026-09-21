@@ -25397,6 +25397,7 @@ def collect_preflight_errors(
         "to_day": window_to,
         "check_only": bool(args.check_only),
         "dry_run": bool(args.dry_run),
+        **({"repair_applied": False} if args.dry_run else {}),
         "run_backfill": bool(args.run_backfill),
         "daily_task_health_enabled": daily_task_health_enabled,
         "daily_task_health_strict": _daily_task_health_strict(),
@@ -25555,6 +25556,64 @@ class SingleLineProgress:
         self._active = False
 
 
+def _v3_dry_run_repair_proposal_verified(repair_flow: Mapping[str, Any]) -> bool:
+    """Report a verified local proposal without implying a LIVE apply."""
+    apply = repair_flow.get("canonical_apply") or {}
+    final = repair_flow.get("final_verification") or {}
+    first_value_at = repair_flow.get("first_value_at_reconciliation") or {}
+    current_state = repair_flow.get("current_state_reconciliation") or {}
+    remaining = final.get("remaining_gap_count")
+    return (
+        repair_flow.get("status") == "planned"
+        and apply.get("status") == "planned"
+        and final.get("ran") is True
+        and final.get("status") == "planned"
+        and isinstance(remaining, int)
+        and not isinstance(remaining, bool)
+        and remaining == 0
+        and first_value_at.get("status") in {"dry_run", "skipped_empty"}
+        and current_state.get("overall_status") in {"planned", "skipped_disabled"}
+        and not any(
+            stage.get("status") in {"fail", "failed", "error", "blocked_dependency"}
+            for stage in repair_flow.get("stage_results") or []
+            if isinstance(stage, Mapping)
+        )
+        and repair_flow.get("r2_write_attempted") is False
+        and repair_flow.get("r2_objects_written") == 0
+        and repair_flow.get("r2_objects_deleted") == 0
+    )
+
+
+def _v3_dry_run_report_state(
+    *, pre_repair_status: str, pre_repair_gap_count: int,
+    repair_flow: Mapping[str, Any],
+) -> dict[str, Any]:
+    final = repair_flow.get("final_verification") or {}
+    remaining = final.get("remaining_gap_count")
+    proposed_verified = (
+        final.get("ran") is True and final.get("status") == "planned"
+        and isinstance(remaining, int) and not isinstance(remaining, bool)
+        and remaining == 0
+    )
+    return {
+        "pre_repair_status": pre_repair_status,
+        "pre_repair_gap_count": pre_repair_gap_count,
+        "proposed_state_status": (
+            "ok" if proposed_verified else "fail"
+            if final.get("ran") is True and final.get("status") == "failed"
+            else "not_verified"
+        ),
+        "proposed_remaining_gap_count": (
+            remaining if isinstance(remaining, int) and not isinstance(remaining, bool)
+            else None
+        ),
+        "live_state_status": (
+            "unresolved" if pre_repair_gap_count > 0 or pre_repair_status == "fail"
+            else "ok" if pre_repair_status == "ok" else "unknown"
+        ),
+    }
+
+
 def _v2_top_level_status_after_repair_planning(
     current_status: str,
     *,
@@ -25565,6 +25624,7 @@ def _v2_top_level_status_after_repair_planning(
     v2_gap_count: int,
     real_repair_verified: bool | None = None,
     post_repair_gap_count: int | None = None,
+    dry_run_repair_verified: bool | None = None,
 ) -> str:
     if run_backfill:
         if not dry_run:
@@ -25581,10 +25641,14 @@ def _v2_top_level_status_after_repair_planning(
             if any_stopped:
                 return "stopped_limit"
             return "ok"
-        if coordinator_failed or v2_gap_count > 0:
+        if coordinator_failed:
+            return "fail"
+        if v2_gap_count > 0 and dry_run_repair_verified is not True:
             return "fail"
         if any_stopped:
             return "stopped_limit"
+        if dry_run_repair_verified is True:
+            return "planned"
         return current_status
     # Check-only has no repair phase.  Report observed differences in full,
     # but do not turn a successfully completed diagnostic into a failed run
@@ -26056,6 +26120,26 @@ def format_summary_md(s: dict[str, Any]) -> str:
         f"- Log:       {s['log_path']}",
         "",
     ]
+
+    if s.get("dry_run") and s.get("run_backfill") and "pre_repair_status" in s:
+        lines.extend([
+            "## V3 repair dry-run outcome",
+            "",
+            (
+                "Dry run planned successfully."
+                if s.get("status") == "planned"
+                else "Dry-run repair did not complete successfully."
+            ),
+            f"- Current LIVE before repair: {s.get('pre_repair_status')} / {s.get('pre_repair_gap_count')} gaps detected.",
+            f"- Proposed repaired state: {s.get('proposed_state_status')} / {s.get('proposed_remaining_gap_count')} remaining gaps.",
+            "- Repair applied: False.",
+            (
+                "- LIVE gaps remain unresolved; no R2 changes were applied."
+                if s.get("live_state_status") == "unresolved"
+                else f"- LIVE state: {s.get('live_state_status')}."
+            ),
+            "",
+        ])
 
     connector_totals = s.get("connector_observation_totals") or {}
     if connector_totals:
@@ -27126,6 +27210,7 @@ def main(argv: list[str]) -> int:
             "finished_at_utc": fmt_iso(utc_now()),
             "status": "failed",
             "dry_run": bool(args.dry_run),
+            **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
             "effective_mode": effective_mode,
@@ -27251,6 +27336,7 @@ def main(argv: list[str]) -> int:
             "finished_at_utc": fmt_iso(utc_now()),
             "status": "blocked_ingestdb_boundary",
             "dry_run": bool(args.dry_run),
+            **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
             "effective_mode": effective_mode,
@@ -27322,6 +27408,7 @@ def main(argv: list[str]) -> int:
             "finished_at_utc": fmt_iso(utc_now()),
             "status": "blocked_dropbox_checkpoint_incomplete",
             "dry_run": bool(args.dry_run),
+            **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
             "effective_mode": effective_mode,
@@ -27357,6 +27444,7 @@ def main(argv: list[str]) -> int:
             "finished_at_utc": fmt_iso(utc_now()),
             "status": "blocked_backup_not_ready",
             "dry_run": bool(args.dry_run),
+            **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
             "effective_mode": effective_mode,
@@ -27468,6 +27556,7 @@ def main(argv: list[str]) -> int:
                 "logical_run_date": logical_run_date.isoformat(),
                 "logical_run_date_source": logical_run_date_source,
                 "check_only": bool(args.check_only), "dry_run": bool(args.dry_run),
+                **({"repair_applied": False} if args.dry_run else {}),
                 "run_backfill": bool(args.run_backfill), "repair_mode": bool(args.run_backfill),
                 "effective_mode": effective_mode,
                 "dropbox_baseline": resolve_r2_history_root(os.environ),
@@ -28127,17 +28216,24 @@ def main(argv: list[str]) -> int:
             and final_verification.get("ran") is True
             and final_verification.get("status") == "ok"
         )
+        dry_run_repair_verified = (
+            args.run_backfill and args.dry_run
+            and _v3_dry_run_repair_proposal_verified(repair_flow)
+        )
         status = _v2_top_level_status_after_repair_planning(
             status,
             run_backfill=args.run_backfill,
             dry_run=args.dry_run,
-            coordinator_failed=coordinator_failed,
+            coordinator_failed=coordinator_failed or (
+                args.dry_run and diagnostic_check_failed
+            ),
             any_stopped=bool(any_stopped),
             v2_gap_count=v2_gap_count_for_status,
             real_repair_verified=real_repair_verified,
             post_repair_gap_count=final_verification.get(
                 "remaining_gap_count"
             ),
+            dry_run_repair_verified=dry_run_repair_verified,
         )
         if effective_mode == "check_only" and diagnostic_check_failed:
             status = "fail"
@@ -28523,7 +28619,7 @@ def main(argv: list[str]) -> int:
                 v2_result["timeseries_bindings"] = final_binding_result
         elif args.run_backfill and args.dry_run:
             v2_result["final_verified"] = False
-            v2_result["final_verification"] = {"status": "planned", "reason": "dry_run"}
+            v2_result["final_verification"] = final_result
         history_version_results: dict[str, Any] = {
             CURRENT_INTEGRITY_HISTORY_VERSION: {
                 **v2_result,
@@ -28662,6 +28758,14 @@ def main(argv: list[str]) -> int:
             summary["connector_observation_totals"] = (
                 connector_observation_totals
             )
+        if args.dry_run:
+            summary["repair_applied"] = False
+            if args.run_backfill:
+                summary.update(_v3_dry_run_report_state(
+                    pre_repair_status=v2_result["status"],
+                    pre_repair_gap_count=v2_gap_count_for_status,
+                    repair_flow=repair_flow,
+                ))
         # Dropbox DB copy on any non-error exit. Failures here are warnings,
         # not run failures — the local DB is the source of truth.
         db_copy = _copy_db_to_dropbox(env, conn, log)
@@ -28752,6 +28856,18 @@ def main(argv: list[str]) -> int:
                 "report_md_path": str(md_path),
                 "log_path": str(log_path),
             }
+            if args.dry_run:
+                finish_summary["repair_applied"] = False
+            if args.dry_run and args.run_backfill:
+                finish_summary.update({
+                    key: summary[key]
+                    for key in (
+                        "pre_repair_status", "pre_repair_gap_count",
+                        "proposed_state_status", "proposed_remaining_gap_count",
+                        "live_state_status",
+                    )
+                    if key in summary
+                })
             try:
                 if status in {"fail", "stopped_limit"}:
                     _daily_task_health_fail(
@@ -28846,6 +28962,8 @@ def main(argv: list[str]) -> int:
                 "backup_readiness": backup_gate_summary,
                 "log_path": str(log_path),
             }
+            if args.dry_run:
+                fail_summary["repair_applied"] = False
             try:
                 _daily_task_health_fail(
                     daily_task_health_config,

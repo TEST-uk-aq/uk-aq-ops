@@ -28089,6 +28089,7 @@ def collect_preflight_errors(
         "to_day": window_to,
         "check_only": bool(args.check_only),
         "dry_run": bool(args.dry_run),
+        **({"repair_applied": False} if args.dry_run else {}),
         "run_backfill": bool(args.run_backfill),
         "daily_task_health_enabled": daily_task_health_enabled,
         "daily_task_health_strict": _daily_task_health_strict(),
@@ -30024,6 +30025,7 @@ def main(argv: list[str]) -> int:
             "finished_at_utc": fmt_iso(utc_now()),
             "status": "failed",
             "dry_run": bool(args.dry_run),
+            **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
             "effective_mode": effective_mode,
@@ -30149,6 +30151,7 @@ def main(argv: list[str]) -> int:
             "finished_at_utc": fmt_iso(utc_now()),
             "status": "blocked_ingestdb_boundary",
             "dry_run": bool(args.dry_run),
+            **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
             "effective_mode": effective_mode,
@@ -30219,6 +30222,7 @@ def main(argv: list[str]) -> int:
             "finished_at_utc": fmt_iso(utc_now()),
             "status": "blocked_dropbox_checkpoint_not_current",
             "dry_run": bool(args.dry_run),
+            **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
             "effective_mode": effective_mode,
@@ -30254,6 +30258,7 @@ def main(argv: list[str]) -> int:
             "finished_at_utc": fmt_iso(utc_now()),
             "status": "blocked_backup_not_ready",
             "dry_run": bool(args.dry_run),
+            **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
             "effective_mode": effective_mode,
@@ -30331,6 +30336,7 @@ def main(argv: list[str]) -> int:
                 "logical_run_date": logical_run_date.isoformat(),
                 "logical_run_date_source": logical_run_date_source,
                 "check_only": bool(args.check_only), "dry_run": bool(args.dry_run),
+                **({"repair_applied": False} if args.dry_run else {}),
                 "run_backfill": bool(args.run_backfill), "repair_mode": bool(args.run_backfill),
                 "effective_mode": effective_mode,
                 "dropbox_baseline": resolve_r2_history_root(os.environ),
@@ -31650,6 +31656,18 @@ def main(argv: list[str]) -> int:
             summary["connector_observation_totals"] = (
                 connector_observation_totals
             )
+        if args.dry_run:
+            summary["repair_applied"] = False
+            if args.run_backfill:
+                summary.update({
+                    key: v2_result[key]
+                    for key in (
+                        "pre_repair_status", "pre_repair_gap_count",
+                        "proposed_state_status", "proposed_remaining_gap_count",
+                        "live_state_status",
+                    )
+                    if key in v2_result
+                })
         # Dropbox DB copy on any non-error exit. Failures here are warnings,
         # not run failures — the local DB is the source of truth.
         db_copy = _copy_db_to_dropbox(env, conn, log)
@@ -31743,6 +31761,18 @@ def main(argv: list[str]) -> int:
                 "report_md_path": str(md_path),
                 "log_path": str(log_path),
             }
+            if args.dry_run:
+                finish_summary["repair_applied"] = False
+            if args.dry_run and args.run_backfill:
+                finish_summary.update({
+                    key: summary[key]
+                    for key in (
+                        "pre_repair_status", "pre_repair_gap_count",
+                        "proposed_state_status", "proposed_remaining_gap_count",
+                        "live_state_status",
+                    )
+                    if key in summary
+                })
             try:
                 if status in {"fail", "stopped_limit"}:
                     _daily_task_health_fail(
@@ -31837,6 +31867,8 @@ def main(argv: list[str]) -> int:
                 "backup_readiness": backup_gate_summary,
                 "log_path": str(log_path),
             }
+            if args.dry_run:
+                fail_summary["repair_applied"] = False
             try:
                 _daily_task_health_fail(
                     daily_task_health_config,

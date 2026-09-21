@@ -1121,6 +1121,11 @@
         color: #2f8f5b;
       }
 
+      .status-pill.dry-run {
+        background: rgba(245, 193, 74, 0.2);
+        color: #a56800;
+      }
+
       .status-pill.html-fallback {
         background: rgba(245, 193, 74, 0.2);
         color: #a56800;
@@ -1259,6 +1264,13 @@
       .daily-task-table th:last-child,
       .daily-task-table td:last-child {
         padding-right: 6px;
+      }
+
+      .daily-task-status-pills {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        white-space: nowrap;
       }
 
       .daily-task-sort-btn {
@@ -6085,6 +6097,10 @@
               : (meta.finishedAtMs !== null ? formatTime(row.finished_at) : "—");
             const durationValue = meta.durationSeconds === null ? "n/a" : (formatDurationSeconds(meta.durationSeconds) || "n/a");
             const summaryText = formatDailyTaskSummary(row.summary);
+            const taskSummary = parseDailyTaskSummaryObject(row.summary);
+            const dryRunPill = taskSummary && taskSummary.dry_run === true
+              ? '<span class="status-pill dry-run">Dry Run</span>'
+              : "";
 
             return `
               <tr class="daily-task-row">
@@ -6095,7 +6111,7 @@
                   </div>
                 </td>
                 <td class="daily-task-platform">${escapeHtml(platformLabel)}</td>
-                <td><span class="status-pill ${escapeHtml(meta.statusClass)}">${escapeHtml(meta.statusLabel)}</span></td>
+                <td><span class="daily-task-status-pills"><span class="status-pill ${escapeHtml(meta.statusClass)}">${escapeHtml(meta.statusLabel)}</span>${dryRunPill}</span></td>
                 <td>${escapeHtml(scheduledValue)}</td>
                 <td>${escapeHtml(finishedValue)}</td>
                 <td>${escapeHtml(durationValue)}</td>
@@ -6113,9 +6129,9 @@
           <div class="table-scroll table-scroll-daily-task">
             <table class="daily-task-table">
               <colgroup>
-                <col style="width:40%" />
+                <col style="width:31%" />
                 <col style="width:9%" />
-                <col style="width:10%" />
+                <col style="width:19%" />
                 <col style="width:17%" />
                 <col style="width:17%" />
                 <col style="width:7%" />
