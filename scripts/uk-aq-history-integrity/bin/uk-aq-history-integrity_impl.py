@@ -28247,6 +28247,79 @@ class SingleLineProgress:
         self._active = False
 
 
+def _v2_dry_run_repair_proposal_verified(repair_flow: Mapping[str, Any]) -> bool:
+    """Recognise a complete local proposal without claiming a LIVE repair."""
+    apply = repair_flow.get("canonical_apply") or {}
+    final = repair_flow.get("final_verification") or {}
+    first_value_at = repair_flow.get("first_value_at_reconciliation") or {}
+    current_state = repair_flow.get("current_state_reconciliation") or {}
+    remaining = final.get("remaining_gap_count")
+    return (
+        repair_flow.get("status") == "planned"
+        and apply.get("status") == "planned"
+        and final.get("ran") is True
+        and final.get("status") == "planned"
+        and isinstance(remaining, int)
+        and not isinstance(remaining, bool)
+        and remaining == 0
+        and first_value_at.get("status") in {"dry_run", "skipped_empty"}
+        and current_state.get("overall_status") in {"planned", "skipped_disabled"}
+        and not any(
+            stage.get("status") in {"fail", "failed", "error", "blocked_dependency"}
+            for stage in repair_flow.get("stage_results") or []
+            if isinstance(stage, Mapping)
+        )
+        and repair_flow.get("r2_write_attempted") is False
+        and repair_flow.get("r2_objects_written") == 0
+        and repair_flow.get("r2_objects_deleted") == 0
+    )
+
+
+def _v2_dry_run_report_state(
+    *,
+    pre_repair_status: str,
+    pre_repair_gap_count: int,
+    repair_flow: Mapping[str, Any],
+    run_status: str,
+) -> dict[str, Any]:
+    final = repair_flow.get("final_verification") or {}
+    remaining = final.get("remaining_gap_count")
+    proposed_verified = (
+        final.get("ran") is True
+        and final.get("status") == "planned"
+        and isinstance(remaining, int)
+        and not isinstance(remaining, bool)
+        and remaining == 0
+    )
+    proposed_failed = (
+        final.get("ran") is True
+        and (final.get("status") == "failed" or (
+            isinstance(remaining, int)
+            and not isinstance(remaining, bool)
+            and remaining > 0
+        ))
+    )
+    return {
+        "status": run_status if run_status in {"planned", "fail", "stopped_limit"} else pre_repair_status,
+        "final_verified": False,
+        "final_verification": dict(final),
+        "repair_applied": False,
+        "pre_repair_status": pre_repair_status,
+        "pre_repair_gap_count": pre_repair_gap_count,
+        "proposed_state_status": (
+            "ok" if proposed_verified else "fail" if proposed_failed else "not_verified"
+        ),
+        "proposed_remaining_gap_count": (
+            remaining if isinstance(remaining, int) and not isinstance(remaining, bool)
+            else None
+        ),
+        "live_state_status": (
+            "unresolved" if pre_repair_gap_count > 0 or pre_repair_status == "fail"
+            else "ok" if pre_repair_status == "ok" else "unknown"
+        ),
+    }
+
+
 def _v2_top_level_status_after_repair_planning(
     current_status: str,
     *,
@@ -28257,6 +28330,7 @@ def _v2_top_level_status_after_repair_planning(
     v2_gap_count: int,
     real_repair_verified: bool | None = None,
     post_repair_gap_count: int | None = None,
+    dry_run_repair_verified: bool | None = None,
 ) -> str:
     if run_backfill:
         if not dry_run:
@@ -28273,10 +28347,14 @@ def _v2_top_level_status_after_repair_planning(
             if any_stopped:
                 return "stopped_limit"
             return "ok"
-        if coordinator_failed or v2_gap_count > 0:
+        if coordinator_failed:
+            return "fail"
+        if v2_gap_count > 0 and dry_run_repair_verified is not True:
             return "fail"
         if any_stopped:
             return "stopped_limit"
+        if dry_run_repair_verified is True:
+            return "planned"
         return current_status
     if v2_gap_count > 0:
         return "fail"
@@ -28754,6 +28832,29 @@ def format_summary_md(s: dict[str, Any]) -> str:
         f"- Log:       {s['log_path']}",
         "",
     ]
+
+    v2_state = (s.get("history_version_results") or {}).get("v2") or {}
+    if s.get("dry_run") and s.get("run_backfill") and "pre_repair_status" in v2_state:
+        pre_gap_count = v2_state.get("pre_repair_gap_count")
+        proposed_gap_count = v2_state.get("proposed_remaining_gap_count")
+        lines.extend([
+            "## V2 repair dry-run outcome",
+            "",
+            (
+                "Dry run planned successfully."
+                if s.get("status") == "planned"
+                else "Dry-run repair did not complete successfully."
+            ),
+            f"- Current LIVE before repair: {v2_state.get('pre_repair_status')} / {pre_gap_count} gaps detected.",
+            f"- Proposed repaired state: {v2_state.get('proposed_state_status')} / {proposed_gap_count} remaining gaps.",
+            f"- Repair applied: {bool(v2_state.get('repair_applied'))}.",
+            (
+                "- LIVE gaps remain unresolved; no R2 changes were applied."
+                if v2_state.get("live_state_status") == "unresolved"
+                else f"- LIVE state: {v2_state.get('live_state_status')}."
+            ),
+            "",
+        ])
 
     connector_totals = s.get("connector_observation_totals") or {}
     if connector_totals:
@@ -30887,6 +30988,11 @@ def main(argv: list[str]) -> int:
             and final_verification.get("ran") is True
             and final_verification.get("status") == "ok"
         )
+        dry_run_repair_verified = (
+            args.run_backfill
+            and args.dry_run
+            and _v2_dry_run_repair_proposal_verified(repair_flow)
+        )
         status = _v2_top_level_status_after_repair_planning(
             status,
             run_backfill=args.run_backfill,
@@ -30898,6 +31004,7 @@ def main(argv: list[str]) -> int:
             post_repair_gap_count=final_verification.get(
                 "remaining_gap_count"
             ),
+            dry_run_repair_verified=dry_run_repair_verified,
         )
 
         if daily_selection is not None:
@@ -31399,8 +31506,12 @@ def main(argv: list[str]) -> int:
             if final_binding_result is not None:
                 v2_result["timeseries_bindings"] = final_binding_result
         elif args.run_backfill and args.dry_run:
-            v2_result["final_verified"] = False
-            v2_result["final_verification"] = {"status": "planned", "reason": "dry_run"}
+            v2_result.update(_v2_dry_run_report_state(
+                pre_repair_status=v2_result["status"],
+                pre_repair_gap_count=v2_gap_count_for_status,
+                repair_flow=repair_flow,
+                run_status=status,
+            ))
         history_version_results: dict[str, Any] = {
             CURRENT_INTEGRITY_HISTORY_VERSION: {
                 **v2_result,

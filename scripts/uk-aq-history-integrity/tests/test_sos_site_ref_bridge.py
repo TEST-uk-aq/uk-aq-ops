@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import logging
@@ -637,7 +638,94 @@ class SosSiteRefBridgeTests(unittest.TestCase):
         )
         self.assertIsNone(gap)
 
-    def test_repair_dry_run_with_v2_gaps_is_top_level_failure(self):
+    def test_verified_repair_dry_run_reports_planned_without_claiming_live_repair(self):
+        repair_flow = {
+            "status": "planned",
+            "canonical_apply": {"status": "planned"},
+            "final_verification": {
+                "ran": True, "status": "planned", "remaining_gap_count": 0,
+            },
+            "first_value_at_reconciliation": {"status": "dry_run"},
+            "current_state_reconciliation": {"overall_status": "planned"},
+            "r2_write_attempted": False,
+            "r2_objects_written": 0,
+            "r2_objects_deleted": 0,
+        }
+        verified = MODULE._v2_dry_run_repair_proposal_verified(repair_flow)
+        self.assertTrue(verified)
+        run_status = MODULE._v2_top_level_status_after_repair_planning(
+            "ok", run_backfill=True, dry_run=True,
+            coordinator_failed=False, any_stopped=False, v2_gap_count=8,
+            dry_run_repair_verified=verified,
+        )
+        self.assertEqual(run_status, "planned")
+        state = MODULE._v2_dry_run_report_state(
+            pre_repair_status="fail", pre_repair_gap_count=8,
+            repair_flow=repair_flow, run_status=run_status,
+        )
+        self.assertEqual(state["status"], "planned")
+        self.assertEqual(state["pre_repair_status"], "fail")
+        self.assertEqual(state["pre_repair_gap_count"], 8)
+        self.assertEqual(state["proposed_state_status"], "ok")
+        self.assertEqual(state["proposed_remaining_gap_count"], 0)
+        self.assertEqual(state["live_state_status"], "unresolved")
+        self.assertFalse(state["repair_applied"])
+        self.assertFalse(state["final_verified"])
+        self.assertEqual(state["final_verification"], repair_flow["final_verification"])
+        markdown = MODULE.format_summary_md({
+            "env": "TEST", "profile": "manual", "started_at_utc": "2026-09-21T00:00:00Z",
+            "status": run_status, "source": "sos", "dry_run": True,
+            "check_only": False, "run_backfill": True,
+            "db_path": "local.sqlite", "log_path": "run.log",
+            "history_version_results": {"v2": state},
+        })
+        self.assertIn("Dry run planned successfully", markdown)
+        self.assertIn("8 gaps", markdown)
+        self.assertIn("0 remaining gaps", markdown)
+        self.assertIn("LIVE gaps remain unresolved", markdown)
+
+        for name, section, field, value in (
+            ("coordinator", None, "status", "failed"),
+            ("apply", "canonical_apply", "status", "failed"),
+            ("verification", "final_verification", "status", "failed"),
+            ("verification_not_run", "final_verification", "ran", False),
+            ("remaining_gap", "final_verification", "remaining_gap_count", 1),
+            ("missing_gap_count", "final_verification", "remaining_gap_count", None),
+            ("first_value_at", "first_value_at_reconciliation", "status", "failed"),
+            ("current_state", "current_state_reconciliation", "overall_status", "failed"),
+            ("blocked_dependency", None, "stage_results", [{"status": "blocked_dependency"}]),
+            ("write_attempt", None, "r2_write_attempted", True),
+            ("object_written", None, "r2_objects_written", 1),
+        ):
+            with self.subTest(case=name):
+                failed_flow = copy.deepcopy(repair_flow)
+                target = failed_flow if section is None else failed_flow[section]
+                target[field] = value
+                verified = MODULE._v2_dry_run_repair_proposal_verified(failed_flow)
+                self.assertFalse(verified)
+                self.assertEqual(
+                    MODULE._v2_top_level_status_after_repair_planning(
+                        "ok", run_backfill=True, dry_run=True,
+                        coordinator_failed=failed_flow["status"] == "failed",
+                        any_stopped=False, v2_gap_count=8,
+                        dry_run_repair_verified=verified,
+                    ),
+                    "fail",
+                )
+        failed_flow = copy.deepcopy(repair_flow)
+        failed_flow["final_verification"].update({
+            "status": "failed", "remaining_gap_count": 1,
+        })
+        failed_state = MODULE._v2_dry_run_report_state(
+            pre_repair_status="fail", pre_repair_gap_count=8,
+            repair_flow=failed_flow, run_status="fail",
+        )
+        self.assertEqual(failed_state["proposed_state_status"], "fail")
+        self.assertEqual(failed_state["proposed_remaining_gap_count"], 1)
+        self.assertEqual(failed_state["live_state_status"], "unresolved")
+        self.assertFalse(failed_state["repair_applied"])
+
+    def test_unverified_repair_dry_run_with_v2_gaps_is_top_level_failure(self):
         self.assertEqual(
             MODULE._v2_top_level_status_after_repair_planning(
                 "ok",
