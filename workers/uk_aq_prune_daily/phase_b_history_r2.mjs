@@ -2792,7 +2792,9 @@ function normalizeFrozenObservationRow(row) {
     observed_at: observedAt,
     observed_at_utc: observedAt,
     value: row.value,
-    status: row.status ?? null,
+    verification_status: Object.hasOwn(row || {}, "verification_status")
+      ? row.verification_status
+      : row.status ?? null,
   };
 }
 

@@ -224,7 +224,7 @@ test("Phase B compact transport expands to the canonical frozen source and fails
     observed_at: `${DAY}T12:34:56.000Z`,
     observed_at_utc: `${DAY}T12:34:56.000Z`,
     value: 18.25,
-    status: "P",
+    verification_status: "P",
   }];
   assert.deepEqual(expandedRows, canonicalSourceRows);
   assert.deepEqual(
