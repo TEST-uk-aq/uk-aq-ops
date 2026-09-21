@@ -804,7 +804,8 @@ function loadJournal(planPath, plan) {
   const location = journalPath(planPath);
   if (!fs.existsSync(location)) return null;
   const journal = JSON.parse(fs.readFileSync(location, "utf8"));
-  if (journal.plan_sha256 !== plan.plan_sha256 || journal.checkpoint_sha256 !== plan.backup_evidence.checkpoint.sha256 ||
+  if (journal.initial_gate_verified !== true ||
+      journal.plan_sha256 !== plan.plan_sha256 || journal.checkpoint_sha256 !== plan.backup_evidence.checkpoint.sha256 ||
       journal.backup_run_id !== plan.backup_evidence.readiness.backup_run_id) {
     throw new Error("Migration progress journal does not match pinned plan/backup");
   }
@@ -878,12 +879,19 @@ async function applyPlan(args, env, r2, lockContext) {
   assertPlanMatchesInvocation(plan, args, r2);
   if (!plan.affected_scopes.length) throw new Error("APPLY has no affected authoritative partitions");
   for (const put of plan.planned_puts) storedBody(args.planPath, put);
-  assertPinnedCheckpointExists(plan);
+  const journal = loadJournal(args.planPath, plan);
+  // A progress journal is written only after the original backup/currentness
+  // gate and full pinned-prestate verification have passed, immediately
+  // before the first mutation. On resume, the mutable Dropbox checkpoint may
+  // legitimately have advanced in a later scheduled backup, so rely on that
+  // pinned journal plus the exhaustive old-or-target prestate verification
+  // below rather than requiring the checkpoint file bytes to remain frozen.
+  if (!journal) assertPinnedCheckpointExists(plan);
   const rootNow = await currentIdentity(r2, plan.pre_migration_observations_root.key);
   const rootAlreadyTarget = sameIdentity(rootNow, plan.final_observations_root);
   if (rootAlreadyTarget) {
-    if (!loadJournal(args.planPath, plan)) throw new Error("Completed-root resume requires pinned initial gate journal");
-  } else {
+    if (!journal) throw new Error("Completed-root resume requires pinned initial gate journal");
+  } else if (!journal) {
     const gate = await backupGate(args, env, r2, lockContext);
     if (gate.checkpoint.sha256 !== plan.backup_evidence.checkpoint.sha256 ||
         gate.live_observations_root.content_hash !== plan.pre_migration_observations_root.content_hash ||
@@ -898,7 +906,7 @@ async function applyPlan(args, env, r2, lockContext) {
         throw new Error(`Completed-root resume has an unfinished child: ${put.key}`);
       }
     }
-  } else if (!loadJournal(args.planPath, plan)) recordJournal(args.planPath, plan);
+  } else if (!journal) recordJournal(args.planPath, plan);
   for (const put of plan.planned_puts) {
     requireObservationsGlobalOperationLockContext({ env, expectedOwner: "migration" });
     const body = storedBody(args.planPath, put);
@@ -914,7 +922,22 @@ async function applyPlan(args, env, r2, lockContext) {
       }
       const intent = buildR2ChecksumAwarePutIntent({ key: put.key, body,
         contentType: put.stage === "parquet" ? "application/octet-stream" : "application/json; charset=utf-8" });
-      await putAndVerifyR2ObjectWithSha256({ r2, intent });
+      if (put.stage === "parquet") {
+        await putAndVerifyR2ObjectWithSha256({ r2, intent });
+      } else {
+        // R2 may omit Content-Length and/or checksum metadata from HEAD for
+        // JSON objects. Reuse the migration's exact JSON reader so GET bytes
+        // establish the identity while any supplied HEAD metadata is still
+        // checked. Parquet remains on the stricter stored-HEAD path above.
+        await putAndVerifyR2ObjectWithSha256({
+          r2,
+          intent,
+          headObject: async ({ r2: verifyR2, key }) => {
+            const published = await readExact(verifyR2, key, put.target);
+            return { exists: true, key, bytes: published.byte_size, sha256: published.sha256 };
+          },
+        });
+      }
     }
     await verifyPublishedObject(r2, put, body, plan);
   }
