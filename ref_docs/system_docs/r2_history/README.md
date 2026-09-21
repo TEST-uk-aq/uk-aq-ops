@@ -11,6 +11,7 @@ For the cross-system map, start with [`../SYSTEM_OVERVIEW.md`](../SYSTEM_OVERVIE
 ## Current authority at a glance
 
 - The active canonical R2 history product is **observation history**.
+- The [observation-history schema contract](observation_history_schema_contract.md) owns canonical observation/Parquet names, status aliases, boundary mappings and persisted-name change rules. Read it for any writer, reader, hash or API naming change; use the [AURN validation-status contract](aurn_validation_status_contract.md) for connector `1` P/R semantics.
 - Calculated AQI / `aqilevels` is permanently retired as an R2 history product under [`aqi_r2_retirement_contract.md`](aqi_r2_retirement_contract.md). Current calculated station-chart AQI is owned by [`../aqi-levels/README.md`](../aqi-levels/README.md).
 - Canonical logical observation history remains v2. The selected final observation-timeseries physical/index authority is v3 under [`observation_history_index_v3_contract.md`](observation_history_index_v3_contract.md), as amended by the load-bearing [`observation_history_index_v3_exact_leaf_amendment.md`](observation_history_index_v3_exact_leaf_amendment.md) and [`observation_history_index_v3_transition_modes_amendment.md`](observation_history_index_v3_transition_modes_amendment.md). The exact-leaf design selects `timeseries-aligned-v2`, 1,024-row physical segments, exact-timeseries leaves and private bounded physical paging. An environment may already have persistent v3 authority from an earlier physical generation; that does not by itself mean the final exact-leaf generation has been accepted.
 - Stable physical timeseries binding remains a separate v2 contract under [`contract.md`](contract.md).
@@ -150,6 +151,7 @@ Then load only the specialised contract needed for the task. [`CONTRACT_INDEX.md
 
 Common additions are:
 
+- [`integrity_dry_run_reporting_contract.md`](integrity_dry_run_reporting_contract.md) for the shared v2/v3 repair dry-run execution, proposed-state and unresolved-LIVE reporting contract;
 - [`current_state_reconciliation.md`](current_state_reconciliation.md) when verified repair can affect timeseries freshness or Latest Snapshot;
 - [`daily_profile_selection.md`](daily_profile_selection.md) for scheduled selection;
 - [`observation_history_index_v3_contract.md`](observation_history_index_v3_contract.md) plus [`observation_history_index_v3_exact_leaf_amendment.md`](observation_history_index_v3_exact_leaf_amendment.md) for post-cut-over physical writing/index/read behaviour;
