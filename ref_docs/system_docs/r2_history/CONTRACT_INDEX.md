@@ -26,6 +26,8 @@ The linked contracts remain authoritative for their stated scope. This index doe
 
 | File | Scope |
 |---|---|
+| [`observation_history_schema_contract.md`](observation_history_schema_contract.md) | Canonical observation row/Parquet names, status compatibility, boundary mappings and persisted-name changes |
+| [`aurn_validation_status_contract.md`](aurn_validation_status_contract.md) | Connector `1` P/R semantics and trusted presentation fallback; field naming defers to the schema contract |
 | [`observations_run_exclusion_contract.md`](observations_run_exclusion_contract.md) | Global canonical-observation operation exclusion and backup/start-state boundary |
 | [`history_writer_coordination.md`](history_writer_coordination.md) | Shared observation writer/finaliser ownership and IngestDB boundary |
 | [`implementation_safety_contract.md`](implementation_safety_contract.md) | Shared writer, affected-day finalisation and implementation safety |
@@ -66,6 +68,7 @@ The exact-leaf amendment remains authoritative for `timeseries-aligned-v2`, 1,02
 | File | Scope |
 |---|---|
 | [`integrity.md`](integrity.md) | Main v2 Integrity detection, planning, repair and verification contract; generation-specific wording is amended for selected v3 operation by `integrity_generation_aware_core_snapshot_amendment.md` |
+| [`integrity_dry_run_reporting_contract.md`](integrity_dry_run_reporting_contract.md) | Shared v2/v3 repair dry-run execution status, proposed-state evidence, unresolved-LIVE state and task-completion semantics |
 | [`integrity_modularisation.md`](integrity_modularisation.md) | Integrity module ownership and stage boundaries |
 | [`integrity_core_snapshot_identity.md`](integrity_core_snapshot_identity.md) | Immutable run-scoped latest-complete core snapshot identity; generation-specific v2-only wording is amended by `integrity_generation_aware_core_snapshot_amendment.md` |
 | [`integrity_generation_aware_core_snapshot_amendment.md`](integrity_generation_aware_core_snapshot_amendment.md) | **Current generation-aware Integrity core identity boundary:** selected `UK_AQ_R2_HISTORY_VERSION` owns matching `history/v2/core` or `history/v3/core`, with one pinned generation-matched identity across check-only, proposal, apply and verification |
