@@ -24,6 +24,12 @@ For SOS-light, this contract supersedes any conflicting requirement in:
 
 Those contracts continue to govern their other scopes. This contract changes only SOS-light authority, planning and apply behaviour.
 
+Canonical observation and Parquet output from either SOS-light entry point MUST
+follow the [observation-history schema contract](observation_history_schema_contract.md):
+emit `verification_status`, never `vstatus`. Temporary legacy read compatibility
+does not authorise legacy output. This naming dependency does not change the
+planning or publication authority below.
+
 ## Non-negotiable model
 
 SOS-light has one small hard currentness gate followed by exactly three conceptual repair phases:
@@ -116,6 +122,15 @@ Normal SOS-light MUST NOT compare year/month/day hashes when the root hash match
 A root-hash mismatch is not a prompt to decide which side is correct. It means the accepted Dropbox baseline cannot be used for this repair until the underlying backup/currentness issue has been resolved.
 
 After Step 0 succeeds, the Dropbox baseline is pinned and becomes the pre-apply truth for DETECT and PROPOSE. Live R2 observation/index contents MUST NOT then be consulted again until APPLY/VERIFY, except for non-content coordination mechanisms.
+
+
+### Serial monthly wrapper boundary
+
+A wrapper that executes multiple historical months serially MAY satisfy the next invocation's freshness/currentness requirement by running the normal R2 History Dropbox Backup after each successful month and waiting for that exact backup generation to reach the local Dropbox mirror before starting the next month.
+
+This is external operator orchestration, not a fourth SOS-light repair phase. It MUST follow the serial-monthly rules in [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md). The preceding SOS-light invocation releases the global observations operation lock before the backup begins; the backup acquires that same global lock for its covered operation; the next SOS-light invocation then acquires the lock and performs this complete Step 0 again.
+
+The serial wrapper MUST NOT use `--allow-stale-dropbox`, weaken the backup-ordering requirement or bypass the exact Dropbox/live observations-root equality requirement.
 
 ## Phase 1: DETECT
 

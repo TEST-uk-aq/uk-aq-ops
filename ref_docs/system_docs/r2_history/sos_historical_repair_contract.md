@@ -17,6 +17,11 @@ Where older plans, reports or implementation names refer to “dedicated SOS his
 
 The generic Integrity path, check-only mode, dry-run mode, Prune Daily and non-SOS paths remain unchanged except where the run-scoped core-snapshot or connector-observation-total contracts explicitly apply.
 
+Any canonical observation/Parquet output from SOS-light uses
+`verification_status` under the [observation-history schema contract](observation_history_schema_contract.md).
+`vstatus` is permitted only as temporary read compatibility for already-written
+erroneous TEST objects, never as current output.
+
 ## Operator entrypoint
 
 The operator continues to use:
@@ -34,6 +39,33 @@ A real run selects SOS-light when all of these are true:
 - an explicit supported pollutant subset.
 
 The selected source connector is connector `1` only.
+
+
+## Serial monthly operator orchestration
+
+The tracked monthly operator wrappers may run multiple write-enabled SOS-light month ranges serially. This orchestration does not change the behaviour or authority of any individual SOS-light invocation. Each month remains a separate invocation and MUST pass the normal hard currentness precheck in [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md).
+
+For a serial monthly batch:
+
+1. run one month through the normal write-enabled SOS-light path;
+2. if that month fails, stop the batch and do not start a later month;
+3. after a successful month, including the final month in the requested batch, dispatch the normal environment-matched **R2 History Dropbox Backup** workflow;
+4. supply a unique caller correlation identifier that identifies the monthly batch and the completed month;
+5. identify and monitor the exact GitHub Actions backup run associated with that correlation identifier. The wrapper MUST NOT assume that the newest backup run is the one it dispatched;
+6. wait for that exact run to reach a terminal state;
+7. if the exact backup run fails, is cancelled, cannot be identified unambiguously or does not produce successful complete backup evidence, stop the monthly batch;
+8. after the cloud backup succeeds, obtain its backup report evidence and wait until the local Dropbox checkpoint used by Integrity reflects that same successful backup generation. At minimum, the local checkpoint's processed observations-root identity MUST match the successful backup report's processed observations-root identity;
+9. only then start the next month, whose own SOS-light Step 0 still performs the normal backup-ordering and live-R2 root-hash equality gates.
+
+The inter-month backup uses the same global observations operation lock as other covered observation operations. It runs after the preceding Integrity invocation has released its lock and before the following Integrity invocation acquires its lock.
+
+The monthly wrapper MUST NOT use `--allow-stale-dropbox`. A serial batch deliberately refreshes Dropbox between months so both the ordinary backup-readiness gate and the non-bypassable locked live-root equality gate remain active.
+
+A fixed cooldown or arbitrary sleep is not a substitute for this evidence. The former 300-second monthly cooldown is not part of the contract and SHOULD be removed. Waiting is driven by the exact backup run and local checkpoint evidence.
+
+Resume state MUST distinguish a successful Integrity month from completion of its required post-month backup/local-sync refresh. A marker that authorises a later invocation to skip a month MUST mean that both the month and its required refresh completed successfully. The wrapper MAY persist separate phase markers so a rerun can resume the refresh without needlessly rerunning an already successful month.
+
+The monthly summary MUST retain enough operator evidence to diagnose the chain, including the month, caller correlation identifier, exact GitHub Actions backup run ID and URL, terminal conclusion, backup report processed observations-root identity and the matching local checkpoint identity.
 
 ## Run-scoped core snapshot identity
 
