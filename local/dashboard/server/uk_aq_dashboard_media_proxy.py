@@ -26,6 +26,7 @@ _ROUTES = (
     (re.compile(r"^/api/media/articles/[1-9]\d*/publish$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/(?:approve|reject|hide|unhide)$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/author$"), {"PUT"}),
+    (re.compile(r"^/api/media/articles/[1-9]\d*/published-at$"), {"PUT"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/display-title$"), {"PUT"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/display-title/generate-ai$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/display-title/(?:accept-ai|reject-ai)$"), {"POST"}),

@@ -1109,11 +1109,12 @@
     const buttons = form.querySelectorAll("button");
     buttons.forEach(button => { button.disabled = true; });
     try {
-      await request(`articles/${id}/published-at`, {
+      const data = await request(`articles/${id}/published-at`, {
         method: "PUT",
         idempotent: "published-at",
         body: { published_at: publishedAt },
       });
+      updateArticleFromMutation(id, data?.article);
       await renderArticles(false);
       await openArticle(id, successMessage);
     } catch (error) {
