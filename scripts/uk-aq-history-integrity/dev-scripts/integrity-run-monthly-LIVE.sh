@@ -6,180 +6,567 @@ set -euo pipefail
 exec </dev/null
 
 INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v2.sh"
+INTEGRITY_ENV="LIVE"
+BACKUP_REPOSITORY="UK-AQ/uk-aq-ops"
+BACKUP_WORKFLOW="uk_aq_r2_history_dropbox_backup.yml"
+BACKUP_ARTIFACT="uk-aq-r2-history-dropbox-backup-report"
+BACKUP_REPORT="r2_history_dropbox_backup_report.json"
 LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/integrity-run-monthly"
-COOL_DOWN_SECONDS=300
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+DISCOVERY_TIMEOUT_SECONDS="${DISCOVERY_TIMEOUT_SECONDS:-300}"
+DISCOVERY_POLL_SECONDS="${DISCOVERY_POLL_SECONDS:-10}"
+BACKUP_TIMEOUT_SECONDS="${BACKUP_TIMEOUT_SECONDS:-21600}"
+BACKUP_POLL_SECONDS="${BACKUP_POLL_SECONDS:-30}"
+DROPBOX_SYNC_TIMEOUT_SECONDS="${DROPBOX_SYNC_TIMEOUT_SECONDS:-7200}"
+DROPBOX_SYNC_POLL_SECONDS="${DROPBOX_SYNC_POLL_SECONDS:-15}"
 
 mkdir -p "$LOG_ROOT"
 
 RUN_STARTED="$(date -u +%Y%m%dT%H%M%SZ)"
+BATCH_ID="${RUN_STARTED}-$$"
 SUMMARY="$LOG_ROOT/run-summary-${RUN_STARTED}.log"
+LOCAL_INTEGRITY_ROOT="$(cd -P -- "$(dirname -- "$INTEGRITY")/.." && pwd -P)"
+REPOSITORY_SELECTOR="$LOCAL_INTEGRITY_ROOT/env/${INTEGRITY_ENV}.env"
+OPS_REPO_ROOT=""
+DROPBOX_BACKUP_ROOT=""
 
-append_connector_totals() {
-  LOG_FILE="$1"
+log() {
+  echo "$(date -u +%FT%TZ) $*" | tee -a "$SUMMARY"
+}
 
-  "$PYTHON_BIN" - "$LOG_FILE" <<'PY' | tee -a "$SUMMARY"
+fail() {
+  log "ERROR $*"
+  return 1
+}
+
+json_field() {
+  local path="$1"
+  local field="$2"
+  "$PYTHON_BIN" - "$path" "$field" <<'PY'
 import json
+import sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+for part in sys.argv[2].split("."):
+    value = value[part]
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is None:
+    print("")
+else:
+    print(value)
+PY
+}
+
+receipt_valid() {
+  local path="$1"
+  shift
+  "$PYTHON_BIN" - "$path" "$@" <<'PY'
+import json
+import sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+for requirement in sys.argv[2:]:
+    key, expected = requirement.split("=", 1)
+    value = data
+    for part in key.split("."):
+        if not isinstance(value, dict) or part not in value:
+            raise SystemExit(1)
+        value = value[part]
+    if str(value).lower() != expected.lower():
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+integrity_receipt_valid() {
+  local path="$1"
+  local label="$2"
+  local from_day="$3"
+  local to_day="$4"
+  receipt_valid "$path" "phase=integrity_succeeded" "label=$label" "from_day=$from_day" "to_day=$to_day" || return 1
+  local recorded_log
+  recorded_log="$(json_field "$path" log)" || return 1
+  [ -f "$recorded_log" ]
+}
+
+month_state_valid() {
+  local label="$1"
+  local from_day="$2"
+  local to_day="$3"
+  local integrity_receipt="$4"
+  local dispatch_receipt="$5"
+  local backup_receipt="$6"
+  local sync_receipt="$7"
+  integrity_receipt_valid "$integrity_receipt" "$label" "$from_day" "$to_day" || return 1
+  receipt_valid "$dispatch_receipt" "phase=backup_dispatched_resolved" "label=$label" || return 1
+  local caller run_id state_key expected_hash
+  caller="$(json_field "$dispatch_receipt" caller_run_id)" || return 1
+  run_id="$(json_field "$dispatch_receipt" run_id)" || return 1
+  receipt_valid "$backup_receipt" "phase=backup_succeeded" "label=$label" "caller_run_id=$caller" "run_id=$run_id" || return 1
+  state_key="$(json_field "$backup_receipt" state_root_key)" || return 1
+  expected_hash="$(json_field "$backup_receipt" expected_hash)" || return 1
+  [[ "$state_key" != /* && "$state_key" != *".."* && "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+  receipt_valid "$sync_receipt" "phase=local_checkpoint_matched" "label=$label" \
+    "state_root_key=$state_key" "expected_hash=$expected_hash" "observed_hash=$expected_hash"
+}
+
+write_receipt() {
+  local path="$1"
+  shift
+  "$PYTHON_BIN" - "$path" "$@" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = {"recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+for item in sys.argv[2:]:
+    key, value = item.split("=", 1)
+    data[key] = value
+path.parent.mkdir(parents=True, exist_ok=True)
+tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(tmp, path)
+PY
+}
+
+resolve_ops_repo_root() {
+  "$PYTHON_BIN" - "$REPOSITORY_SELECTOR" <<'PY'
+import re
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(f"Integrity repository selector is unavailable: {path}")
+assignments = []
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    match = re.fullmatch(r"UK_AQ_OPS_REPO_ROOT\s*=\s*(.*?)\s*(?:#.*)?", line)
+    if not match:
+        raise SystemExit("Integrity repository selector contains an unsupported entry")
+    value = match.group(1).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    assignments.append(value)
+if len(assignments) != 1:
+    raise SystemExit("Integrity repository selector must define UK_AQ_OPS_REPO_ROOT exactly once")
+root = Path(assignments[0]).expanduser()
+if not root.is_absolute() or not root.is_dir() or "archive" in root.parts:
+    raise SystemExit(f"selected Integrity repository is invalid: {root}")
+print(root.resolve())
+PY
+}
+
+resolve_dropbox_backup_root() {
+  "$PYTHON_BIN" - "$OPS_REPO_ROOT/.env" <<'PY'
+import os
 import re
 import sys
 from pathlib import Path
 
-log_path = Path(sys.argv[1])
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(f"repository environment file is unavailable: {path}")
+values = dict(os.environ)
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    if key.startswith("export "):
+        key = key[len("export "):]
+    key = key.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    values[key] = value
+explicit = values.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT", "").strip()
+if explicit:
+    root = Path(explicit).expanduser()
+    if not root.is_absolute():
+        raise SystemExit("UK_AQ_R2_HISTORY_DROPBOX_ROOT must be absolute")
+else:
+    environment_root = values.get("UK_AQ_DROPBOX_ROOT", "").strip()
+    if not environment_root:
+        raise SystemExit("UK_AQ_DROPBOX_ROOT is not configured")
+    history_dir = values.get("UK_AQ_R2_HISTORY_DROPBOX_DIR", "R2_history_backup").strip()
+    app_root = Path(values.get("UK_AQ_DROPBOX_APP_ROOT", "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks")).expanduser()
+    environment_path = Path(environment_root).expanduser()
+    root = environment_path / history_dir if environment_path.is_absolute() else app_root / environment_path / history_dir
+if "archive" in root.parts:
+    raise SystemExit("resolved R2 history Dropbox root points into archive")
+if not root.is_dir():
+    raise SystemExit(f"resolved R2 history Dropbox root is not a directory: {root}")
+print(root.resolve())
+PY
+}
 
+preflight() {
+  log "PREFLIGHT target=${BACKUP_REPOSITORY} workflow=${BACKUP_WORKFLOW}"
+  command -v gh >/dev/null 2>&1 || fail "gh is not available"
+  gh auth status >/dev/null 2>&1 || fail "GitHub CLI authentication is unusable"
+  gh repo view "$BACKUP_REPOSITORY" --json nameWithOwner --jq .nameWithOwner >/dev/null || fail "cannot access backup repository ${BACKUP_REPOSITORY}"
+  gh workflow view "$BACKUP_WORKFLOW" --repo "$BACKUP_REPOSITORY" >/dev/null || fail "cannot access ${BACKUP_WORKFLOW} in ${BACKUP_REPOSITORY}"
+
+  local remote_workflow
+  remote_workflow="$(mktemp)"
+  if ! gh api -H 'Accept: application/vnd.github.raw+json' \
+    "repos/${BACKUP_REPOSITORY}/contents/.github/workflows/${BACKUP_WORKFLOW}" >"$remote_workflow"; then
+    rm -f "$remote_workflow"
+    fail "cannot read ${BACKUP_WORKFLOW} from ${BACKUP_REPOSITORY}"
+    return 1
+  fi
+  if ! "$PYTHON_BIN" - "$remote_workflow" <<'PY'
+import re
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+has_input = bool(re.search(r"(?m)^\s{6}caller_run_id:\s*$", text))
+has_run_name = bool(re.search(r"(?m)^run-name:.*caller_run_id", text))
+raise SystemExit(0 if has_input and has_run_name else 1)
+PY
+  then
+    rm -f "$remote_workflow"
+    if [ "$INTEGRITY_ENV" = "LIVE" ]; then
+      fail "LIVE backup workflow lacks caller_run_id correlation support; promote the correlation-capable workflow to ${BACKUP_REPOSITORY} before running LIVE Integrity"
+    else
+      fail "backup workflow lacks required caller_run_id input/display-name correlation support"
+    fi
+    return 1
+  fi
+  rm -f "$remote_workflow"
+
+  OPS_REPO_ROOT="$(resolve_ops_repo_root)" || fail "cannot resolve the ${INTEGRITY_ENV} repository selected by the Integrity dispatcher"
+  DROPBOX_BACKUP_ROOT="$(resolve_dropbox_backup_root)" || fail "local Dropbox backup root/checkpoint location cannot be resolved"
+  [ -r "$DROPBOX_BACKUP_ROOT" ] || fail "local Dropbox backup root is not readable: ${DROPBOX_BACKUP_ROOT}"
+  local checkpoint_location="$DROPBOX_BACKUP_ROOT/_ops/checkpoints/r2_history_backup_state_v2/root.json"
+  log "PREFLIGHT OK selected_repository=${OPS_REPO_ROOT} local_backup_root=${DROPBOX_BACKUP_ROOT} checkpoint_location=${checkpoint_location}"
+}
+
+append_connector_totals() {
+  local log_file="$1"
+  "$PYTHON_BIN" - "$log_file" <<'PY' | tee -a "$SUMMARY"
+import json
+import re
+import sys
+from pathlib import Path
+log_path = Path(sys.argv[1])
 try:
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
 except OSError:
     print("Connector observation totals unavailable")
     raise SystemExit(0)
-
-
-def last_existing_report_path(field: str):
-    candidates = re.findall(rf"\b{re.escape(field)}=(\S+)", log_text)
-    for candidate in reversed(candidates):
-        path = Path(candidate)
-        if path.is_file():
-            return path
-    return None
-
-
-def totals_from_json(report_path):
-    if report_path is None:
-        return None
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
+def last_existing_report_path(field):
+    for candidate in reversed(re.findall(rf"\b{re.escape(field)}=(\S+)", log_text)):
+        if Path(candidate).is_file():
+            return Path(candidate)
+def totals_from_json(path):
+    if path is None: return None
+    try: report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError): return None
     totals = report.get("connector_observation_totals")
     return totals if isinstance(totals, dict) and totals else None
-
-
-def totals_from_markdown(report_path):
-    if report_path is None:
-        return None
-    try:
-        lines = report_path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return None
-
-    try:
-        start = lines.index("## Connector observation totals") + 1
-    except ValueError:
-        return None
-
-    totals = {}
-    connector_id = None
-    labels = {
-        "Total Observs before": "total_observations_before",
-        "Total Observs added": "total_observations_added",
-        "Total Observs after": "total_observations_after",
-    }
-
+def totals_from_markdown(path):
+    if path is None: return None
+    try: lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError): return None
+    try: start = lines.index("## Connector observation totals") + 1
+    except ValueError: return None
+    totals, connector_id = {}, None
+    labels = {"Total Observs before": "total_observations_before", "Total Observs added": "total_observations_added", "Total Observs after": "total_observations_after"}
     for line in lines[start:]:
-        if line.startswith("## "):
-            break
-        connector_match = re.fullmatch(r"### Connector (.+)", line)
-        if connector_match:
-            connector_id = connector_match.group(1).strip()
-            totals.setdefault(connector_id, {})
-            continue
-        value_match = re.fullmatch(
-            r"- (Total Observs (?:before|added|after)): ([0-9,]+)",
-            line,
-        )
-        if connector_id and value_match:
-            totals[connector_id][labels[value_match.group(1)]] = int(
-                value_match.group(2).replace(",", "")
-            )
-
+        if line.startswith("## "): break
+        match = re.fullmatch(r"### Connector (.+)", line)
+        if match:
+            connector_id = match.group(1).strip(); totals.setdefault(connector_id, {}); continue
+        match = re.fullmatch(r"- (Total Observs (?:before|added|after)): ([0-9,]+)", line)
+        if connector_id and match: totals[connector_id][labels[match.group(1)]] = int(match.group(2).replace(",", ""))
     return totals or None
-
-
-report_json = last_existing_report_path("report_json")
-report_md = last_existing_report_path("report_md")
-totals = totals_from_json(report_json) or totals_from_markdown(report_md)
-
-if not isinstance(totals, dict) or not totals:
-    print("Connector observation totals unavailable")
-    raise SystemExit(0)
-
-
-def connector_sort_key(item):
-    connector_id = str(item[0])
-    try:
-        return (0, int(connector_id))
-    except ValueError:
-        return (1, connector_id)
-
-
+totals = totals_from_json(last_existing_report_path("report_json")) or totals_from_markdown(last_existing_report_path("report_md"))
+if not totals:
+    print("Connector observation totals unavailable"); raise SystemExit(0)
+def sort_key(item):
+    try: return (0, int(str(item[0])))
+    except ValueError: return (1, str(item[0]))
 printed = False
-for connector_id, values in sorted(totals.items(), key=connector_sort_key):
-    if not isinstance(values, dict):
-        continue
-
-    before = values.get("total_observations_before")
-    added = values.get("total_observations_added")
-    after = values.get("total_observations_after")
-
-    if not all(isinstance(value, int) and value >= 0 for value in (before, added, after)):
-        continue
-
+for connector_id, values in sorted(totals.items(), key=sort_key):
+    if not isinstance(values, dict): continue
+    fields = [values.get(name) for name in ("total_observations_before", "total_observations_added", "total_observations_after")]
+    if not all(isinstance(value, int) and value >= 0 for value in fields): continue
     print(f"Connector {connector_id}:")
-    print(f"Total Observs before: {before:,}")
-    print(f"Total Observs added: {added:,}")
-    print(f"Total Observs after: {after:,}")
+    print(f"Total Observs before: {fields[0]:,}")
+    print(f"Total Observs added: {fields[1]:,}")
+    print(f"Total Observs after: {fields[2]:,}")
     printed = True
-
-if not printed:
-    print("Connector observation totals unavailable")
+if not printed: print("Connector observation totals unavailable")
 PY
+}
 
-  return 0
+find_correlated_run() {
+  local caller_run_id="$1"
+  local runs_json="$2"
+  gh api \
+    "repos/${BACKUP_REPOSITORY}/actions/workflows/${BACKUP_WORKFLOW}/runs?event=workflow_dispatch&per_page=100" >"$runs_json" || return 1
+  "$PYTHON_BIN" - "$runs_json" "$caller_run_id" <<'PY'
+import json
+import sys
+matches = []
+with open(sys.argv[1], encoding="utf-8") as stream:
+    decoder = json.JSONDecoder()
+    text = stream.read()
+    pos = 0
+    while pos < len(text):
+        while pos < len(text) and text[pos].isspace(): pos += 1
+        if pos >= len(text): break
+        payload, pos = decoder.raw_decode(text, pos)
+        matches.extend(run for run in payload.get("workflow_runs", []) if sys.argv[2] in str(run.get("display_title", "")))
+if len(matches) != 1:
+    print(len(matches))
+    raise SystemExit(2)
+run = matches[0]
+print(f"{run['id']}\t{run['html_url']}")
+PY
+}
+
+resolve_exact_run() {
+  local caller_run_id="$1"
+  local dispatch_receipt="$2"
+  local label="$3"
+  local deadline=$(( $(date +%s) + DISCOVERY_TIMEOUT_SECONDS ))
+  local runs_json result count
+  runs_json="$(mktemp)"
+  while [ "$(date +%s)" -le "$deadline" ]; do
+    if result="$(find_correlated_run "$caller_run_id" "$runs_json")"; then
+      local run_id="${result%%$'\t'*}"
+      local run_url="${result#*$'\t'}"
+      write_receipt "$dispatch_receipt" \
+        "phase=backup_dispatched_resolved" "label=$label" "caller_run_id=$caller_run_id" \
+        "run_id=$run_id" "run_url=$run_url"
+      rm -f "$runs_json"
+      log "BACKUP RESOLVED caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url}"
+      return 0
+    else
+      count="${result:-query_failed}"
+      if [ "$count" != "0" ] && [ "$count" != "query_failed" ]; then
+        rm -f "$runs_json"
+        fail "backup run correlation is ambiguous for ${caller_run_id}: matches=${count}"
+        return 1
+      fi
+    fi
+    log "BACKUP DISCOVERY waiting caller_run_id=${caller_run_id}"
+    sleep "$DISCOVERY_POLL_SECONDS"
+  done
+  rm -f "$runs_json"
+  fail "timed out resolving exact backup run for ${caller_run_id}"
+}
+
+wait_for_backup_run() {
+  local run_id="$1"
+  local deadline=$(( $(date +%s) + BACKUP_TIMEOUT_SECONDS ))
+  local record status conclusion url
+  while [ "$(date +%s)" -le "$deadline" ]; do
+    if ! record="$(gh run view "$run_id" --repo "$BACKUP_REPOSITORY" --json status,conclusion,url --jq '[.status, (.conclusion // ""), .url] | @tsv' 2>/dev/null)"; then
+      fail "exact backup run ${run_id} disappeared or cannot be read"
+      return 1
+    fi
+    IFS=$'\t' read -r status conclusion url <<<"$record"
+    log "BACKUP POLL run_id=${run_id} status=${status} conclusion=${conclusion:-pending} url=${url}"
+    if [ "$status" = "completed" ]; then
+      [ "$conclusion" = "success" ] || { fail "exact backup run ${run_id} concluded ${conclusion}"; return 1; }
+      return 0
+    fi
+    sleep "$BACKUP_POLL_SECONDS"
+  done
+  fail "timed out waiting for exact backup run ${run_id}"
+}
+
+validate_backup_report() {
+  local report_path="$1"
+  "$PYTHON_BIN" - "$report_path" <<'PY'
+import json
+import re
+import sys
+from pathlib import PurePosixPath
+try:
+    report = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"backup report unreadable: {exc}")
+state_key = report.get("state_root_key")
+root_hash = (report.get("observations") or {}).get("processed_source_root_hash")
+if report.get("ok") is not True or report.get("complete") is not True or report.get("dry_run") is not False:
+    raise SystemExit("backup report does not show a successful complete non-dry-run backup")
+if report.get("max_days_per_run") != 0:
+    raise SystemExit("backup report does not show max_days_per_run=0")
+if not isinstance(state_key, str) or not state_key or state_key.startswith("/") or ".." in PurePosixPath(state_key).parts:
+    raise SystemExit("backup report state_root_key is invalid")
+if not isinstance(root_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", root_hash):
+    raise SystemExit("backup report observations.processed_source_root_hash is not SHA-256")
+print(f"{state_key}\t{root_hash}")
+PY
+}
+
+wait_for_local_checkpoint() {
+  local state_root_key="$1"
+  local expected_hash="$2"
+  local sync_receipt="$3"
+  local label="$4"
+  local checkpoint="$DROPBOX_BACKUP_ROOT/$state_root_key"
+  local deadline=$(( $(date +%s) + DROPBOX_SYNC_TIMEOUT_SECONDS ))
+  local observed=""
+  while [ "$(date +%s)" -le "$deadline" ]; do
+    observed="$("$PYTHON_BIN" - "$checkpoint" 2>/dev/null <<'PY' || true
+import json
+import re
+import sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))["observations"]["processed_source_root_hash"]
+except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+    raise SystemExit(1)
+if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+    raise SystemExit(1)
+print(value)
+PY
+)"
+    if [ "$observed" = "$expected_hash" ]; then
+      write_receipt "$sync_receipt" "phase=local_checkpoint_matched" "label=$label" \
+        "state_root_key=$state_root_key" "expected_hash=$expected_hash" "observed_hash=$observed"
+      log "LOCAL CHECKPOINT MATCH label=${label} checkpoint=${checkpoint} processed_source_root_hash=${observed}"
+      return 0
+    fi
+    log "LOCAL CHECKPOINT WAIT label=${label} checkpoint=${checkpoint} expected=${expected_hash} observed=${observed:-unreadable_or_not_synced}"
+    sleep "$DROPBOX_SYNC_POLL_SECONDS"
+  done
+  fail "local Dropbox checkpoint did not reach expected hash ${expected_hash}: ${checkpoint}"
 }
 
 run_batch() {
-  FROM_DAY="$1"
-  TO_DAY="$2"
-  LABEL="$3"
+  local from_day="$1"
+  local to_day="$2"
+  local label="$3"
+  local log_file="$LOG_ROOT/${label}-${RUN_STARTED}.log"
+  local ok_marker="$LOG_ROOT/${label}.ok"
+  local integrity_receipt="$LOG_ROOT/${label}.integrity-success.json"
+  local dispatch_receipt="$LOG_ROOT/${label}.backup-dispatch.json"
+  local backup_receipt="$LOG_ROOT/${label}.backup-success.json"
+  local sync_receipt="$LOG_ROOT/${label}.local-sync.json"
+  local artifact_dir="$LOG_ROOT/${label}.backup-artifact"
 
-  LOG="$LOG_ROOT/${LABEL}-${RUN_STARTED}.log"
-  OK_MARKER="$LOG_ROOT/${LABEL}.ok"
-
-  if [ -f "$OK_MARKER" ] && [ "${FORCE:-0}" != "1" ]; then
-    echo "$(date -u +%FT%TZ) SKIP $LABEL already completed" | tee -a "$SUMMARY"
-    return 0
+  if [ "${FORCE:-0}" = "1" ]; then
+    rm -f "$ok_marker" "$integrity_receipt" "$dispatch_receipt" "$backup_receipt" "$sync_receipt"
+    rm -rf "$artifact_dir"
+    log "FORCE RESET label=${label} phase state cleared"
+  elif [ -f "$ok_marker" ]; then
+    if month_state_valid "$label" "$from_day" "$to_day" "$integrity_receipt" "$dispatch_receipt" "$backup_receipt" "$sync_receipt"; then
+      log "SKIP label=${label} final_month_complete=true"
+      return 0
+    fi
+    rm -f "$ok_marker"
+    fail "stale final marker found without valid local-sync receipt for ${label}; refusing to treat it as complete"
+    return 1
   fi
 
-  echo "$(date -u +%FT%TZ) START $LABEL $FROM_DAY to $TO_DAY" | tee -a "$SUMMARY"
-  echo "Log: $LOG" | tee -a "$SUMMARY"
-
-  if nice -n 10 "$INTEGRITY" \
-    --env LIVE \
-    --profile manual \
-    --source sos \
-    --from-day "$FROM_DAY" \
-    --to-day "$TO_DAY" \
-    --run-backfill \
-    --repair-pollutants pm25,pm10,no2,o3 \
-    --allow-stale-dropbox \
-    --verbose \
-    </dev/null \
-    >"$LOG" 2>&1
-  then
-    touch "$OK_MARKER"
-    echo "$(date -u +%FT%TZ) SUCCESS $LABEL" | tee -a "$SUMMARY"
-    append_connector_totals "$LOG"
+  log "MONTH START label=${label} range=${from_day}..${to_day}"
+  if ! integrity_receipt_valid "$integrity_receipt" "$label" "$from_day" "$to_day"; then
+    rm -f "$dispatch_receipt" "$backup_receipt" "$sync_receipt" "$ok_marker"
+    rm -rf "$artifact_dir"
+    log "INTEGRITY START label=${label} log=${log_file}"
+    if nice -n 10 "$INTEGRITY" \
+      --env "$INTEGRITY_ENV" \
+      --profile manual \
+      --source sos \
+      --from-day "$from_day" \
+      --to-day "$to_day" \
+      --run-backfill \
+      --repair-pollutants pm25,pm10,no2,o3 \
+      --verbose \
+      </dev/null >"$log_file" 2>&1
+    then
+      write_receipt "$integrity_receipt" "phase=integrity_succeeded" "label=$label" \
+        "from_day=$from_day" "to_day=$to_day" "log=$log_file"
+      log "INTEGRITY SUCCESS label=${label}"
+      append_connector_totals "$log_file"
+    else
+      local exit_code=$?
+      log "INTEGRITY FAILURE label=${label} exit=${exit_code} final_month_complete=false"
+      return "$exit_code"
+    fi
   else
-    EXIT_CODE=$?
-    rm -f "$OK_MARKER"
-    echo "$(date -u +%FT%TZ) FAILED $LABEL exit=$EXIT_CODE" | tee -a "$SUMMARY"
+    log "INTEGRITY RESUME label=${label} status=success receipt=${integrity_receipt}"
   fi
 
-  if [ "$COOL_DOWN_SECONDS" -gt 0 ]; then
-    echo "$(date -u +%FT%TZ) Cooling down for ${COOL_DOWN_SECONDS}s" | tee -a "$SUMMARY"
-    sleep "$COOL_DOWN_SECONDS"
+  local caller_run_id run_id run_url
+  if receipt_valid "$dispatch_receipt" "phase=backup_dispatched_resolved" "label=$label"; then
+    caller_run_id="$(json_field "$dispatch_receipt" caller_run_id)"
+    run_id="$(json_field "$dispatch_receipt" run_id)"
+    run_url="$(json_field "$dispatch_receipt" run_url)"
+    log "BACKUP RESUME label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url}"
+  else
+    if [ -f "$dispatch_receipt" ] && receipt_valid "$dispatch_receipt" "phase=backup_dispatch_requested"; then
+      caller_run_id="$(json_field "$dispatch_receipt" caller_run_id)"
+      log "BACKUP DISCOVERY RESUME label=${label} caller_run_id=${caller_run_id}"
+    else
+      caller_run_id="integrity-monthly-${INTEGRITY_ENV}-${BATCH_ID}-after-${label}"
+      write_receipt "$dispatch_receipt" "phase=backup_dispatch_requested" "label=$label" "caller_run_id=$caller_run_id"
+      log "BACKUP DISPATCH label=${label} caller_run_id=${caller_run_id} repository=${BACKUP_REPOSITORY} max_days_per_run=0"
+      if ! gh workflow run "$BACKUP_WORKFLOW" --repo "$BACKUP_REPOSITORY" \
+        -f "caller_run_id=${caller_run_id}" -f "max_days_per_run=0"; then
+        rm -f "$dispatch_receipt"
+        fail "failed to dispatch backup for ${label}"
+        return 1
+      fi
+    fi
+    resolve_exact_run "$caller_run_id" "$dispatch_receipt" "$label" || return 1
+    run_id="$(json_field "$dispatch_receipt" run_id)"
+    run_url="$(json_field "$dispatch_receipt" run_url)"
   fi
+
+  local state_root_key expected_hash backup_status backup_conclusion
+  if receipt_valid "$backup_receipt" "phase=backup_succeeded" "caller_run_id=$caller_run_id" "run_id=$run_id"; then
+    state_root_key="$(json_field "$backup_receipt" state_root_key)"
+    expected_hash="$(json_field "$backup_receipt" expected_hash)"
+    backup_status="completed"
+    backup_conclusion="success"
+    [[ "$state_root_key" != /* && "$state_root_key" != *".."* ]] || { fail "persisted backup receipt has invalid state_root_key"; return 1; }
+    [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || { fail "persisted backup receipt has invalid expected hash"; return 1; }
+    log "BACKUP SUCCESS RESUME label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} status=${backup_status} conclusion=${backup_conclusion} expected_hash=${expected_hash}"
+  else
+    wait_for_backup_run "$run_id" || return 1
+    backup_status="completed"
+    backup_conclusion="success"
+    rm -rf "$artifact_dir"
+    mkdir -p "$artifact_dir"
+    gh run download "$run_id" --repo "$BACKUP_REPOSITORY" --name "$BACKUP_ARTIFACT" --dir "$artifact_dir" || { fail "failed to download report artifact for exact run ${run_id}"; return 1; }
+    local report_path="$artifact_dir/$BACKUP_REPORT"
+    [ -f "$report_path" ] || { fail "exact run artifact lacks ${BACKUP_REPORT}"; return 1; }
+    local report_identity
+    report_identity="$(validate_backup_report "$report_path")" || { fail "exact run ${run_id} backup report is not acceptable"; return 1; }
+    state_root_key="${report_identity%%$'\t'*}"
+    expected_hash="${report_identity#*$'\t'}"
+    write_receipt "$backup_receipt" "phase=backup_succeeded" "label=$label" \
+      "caller_run_id=$caller_run_id" "run_id=$run_id" "run_url=$run_url" \
+      "status=$backup_status" "conclusion=$backup_conclusion" \
+      "state_root_key=$state_root_key" "expected_hash=$expected_hash"
+    log "BACKUP SUCCESS label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} status=${backup_status} conclusion=${backup_conclusion} state_root_key=${state_root_key} expected_hash=${expected_hash}"
+  fi
+
+  if receipt_valid "$sync_receipt" "phase=local_checkpoint_matched" "label=$label" "state_root_key=$state_root_key" "expected_hash=$expected_hash" "observed_hash=$expected_hash"; then
+    log "LOCAL CHECKPOINT RESUME label=${label} observed_hash=${expected_hash}"
+  else
+    wait_for_local_checkpoint "$state_root_key" "$expected_hash" "$sync_receipt" "$label" || return 1
+  fi
+
+  touch "$ok_marker"
+  log "MONTH COMPLETE label=${label} integrity=success caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} backup_status=${backup_status} backup_conclusion=${backup_conclusion} expected_hash=${expected_hash} local_hash=${expected_hash} final_month_complete=true"
 }
 
+preflight
 run_batch 2025-05-01 2025-05-31 2025-05
 run_batch 2025-06-01 2025-06-30 2025-06
 run_batch 2025-07-01 2025-07-31 2025-07
@@ -189,7 +576,5 @@ run_batch 2025-10-01 2025-10-31 2025-10
 run_batch 2025-11-01 2025-11-30 2025-11
 run_batch 2025-12-01 2025-12-31 2025-12
 run_batch 2026-01-01 2026-01-31 2026-01
-
-
-echo "$(date -u +%FT%TZ) ALL BATCHES ATTEMPTED" | tee -a "$SUMMARY"
+log "ALL BATCHES COMPLETED"
 echo "Summary: $SUMMARY"
