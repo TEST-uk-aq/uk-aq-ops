@@ -48,7 +48,7 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 - R2 history Dropbox backup, inventory, sync and v3 backup evidence;
 - AURN validation-status behaviour;
 - Media Bluesky publication behaviour;
-- Media dashboard behaviour and article/Bluesky preview contracts.
+- Media dashboard behaviour and article/Bluesky preview contracts;
 - History Integrity v2/v3 dry-run reporting and Operations dashboard dry-run status presentation;
 - GCP Cloud Logging analysis archive source/archive/redaction identity, retrieval, publication, checkpoint and recovery behaviour;
 - operator-execution progress, persistent run-log and structured-run-report behaviour for qualifying local scripts.
@@ -80,5 +80,6 @@ The authoritative SOS-light contract now requires:
 - APPLY only the frozen changed/removed set, then verify those R2 results;
 - no pre-apply live-R2 observation/index dependency discovery beyond the single Step 0 observations-root hash comparison;
 - no normal Dropbox backup expansion for v3 scoped-root dependency evidence.
+- serial monthly SOS-light wrappers refresh Dropbox after every successful month, including the final month; correlate and wait for the exact backup run; wait for that backup generation to reach the local checkpoint; do not use `--allow-stale-dropbox`; stop on month/backup/sync failure; and do not use a fixed cooldown.
 
 PR #69's scoped-root backup expansion was reverted. The normal v3 backup continues to carry the generation-selected compact `observations_timeseries_latest.json` but not the full derived scoped/exact index tree.
