@@ -44,6 +44,7 @@ A normal coding task should enter through the relevant area below rather than re
 | Geography and postcode products | [`geography/README.md`](geography/README.md) | Active |
 | MacBook Pro local MySQL persistence, naming and TEST/LIVE isolation | [`local_mysql/README.md`](local_mysql/README.md) | Active |
 | GCP Cloud Billing export, Pro MySQL reporting and Dropbox archive | [`gcp_billing/README.md`](gcp_billing/README.md) | Future implementation authority; not yet deployed |
+| TEST GCP Cloud Logging analysis archive to Dropbox | [`gcp_logging_archive/README.md`](gcp_logging_archive/README.md) | Future implementation authority; collector prepared but not yet deployed/accepted |
 | Monitoring and Supabase egress attribution | [`monitoring/README.md`](monitoring/README.md) | Partly active; broader migration pending |
 | Backup, restore and R2 history Dropbox backup | [`backup_and_recovery/README.md`](backup_and_recovery/README.md) | Partly active; broader migration pending |
 | Prune daily and retention outside completed R2-history contracts | `prune_and_retention/` | Area migration pending |

@@ -18,7 +18,7 @@ Source repository:
 
 Source commit:
 
-`07159c45a4606170ba75323ce3711667e80b126d`
+`0ec58f7fe4208a2e3fc7343caabe0f258a1d0303`
 
 Snapshot date:
 
@@ -32,7 +32,7 @@ When it is unavailable, use this mirror for the bounded task. Start at:
 
 `ref_docs/system_docs/SYSTEM_OVERVIEW.md`
 
-then follow the local mirrored route for the relevant R2-history / backup task.
+then follow the local mirrored route for the relevant bounded task.
 
 If a routed contract is not present in this mirror, do not infer its contents. Report that the authoritative sibling file is unavailable.
 
@@ -48,8 +48,10 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 - R2 history Dropbox backup, inventory, sync and v3 backup evidence;
 - AURN validation-status behaviour;
 - Media Bluesky publication behaviour;
-- Media dashboard behaviour and article/Bluesky preview contracts.
-- History Integrity v2/v3 dry-run reporting and Operations dashboard dry-run status presentation.
+- Media dashboard behaviour and article/Bluesky preview contracts;
+- History Integrity v2/v3 dry-run reporting and Operations dashboard dry-run status presentation;
+- GCP Cloud Logging analysis archive source/archive/redaction identity, retrieval, publication, checkpoint and recovery behaviour;
+- operator-execution progress, persistent run-log and structured-run-report behaviour for qualifying local scripts.
 
 It is intentionally not a complete copy of all UK AQ system documentation.
 
