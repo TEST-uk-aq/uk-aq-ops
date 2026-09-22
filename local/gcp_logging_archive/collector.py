@@ -88,7 +88,7 @@ def archive_identity(config: dict) -> dict:
     return {
         "archive_id": config["archive_id"],
         "archive_path": str(
-            (Path(os.path.expanduser(config["archive_root"])) / "GCP Logs/TEST/raw").resolve()
+            (Path(os.path.expanduser(config["archive_root"])) / "TEST/GCP Logs/raw").resolve()
         ),
     }
 
@@ -225,7 +225,7 @@ class Collector:
     def __init__(self, config: dict):
         self.config = config
         self.project = config["project_id"]
-        self.archive = Path(os.path.expanduser(config["archive_root"])) / "GCP Logs/TEST/raw"
+        self.archive = Path(os.path.expanduser(config["archive_root"])) / "TEST/GCP Logs/raw"
         self.state = Path(os.path.expanduser(config["state_dir"]))
         self.redact = config.get("redact_paths", [])
         self.min_read_interval_seconds = float(config.get("min_read_interval_seconds", 1.5))
