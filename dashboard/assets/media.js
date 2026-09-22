@@ -70,6 +70,15 @@
     return includeUtcSuffix ? `${formatted} UTC` : formatted;
   }
 
+  function isDateOnly(value) {
+    return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+  }
+
+  function formatPublishedDateTime(value, includeUtcSuffix = true) {
+    if (isDateOnly(value)) return formatPublicationDate(value) || "—";
+    return formatUtcDateTime(value, includeUtcSuffix);
+  }
+
   function formatPublicationDate(value) {
     const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})(?:T|$)/);
     if (!match || Number.isNaN(Date.parse(value))) return "";
@@ -83,6 +92,15 @@
     if (!value) return "";
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 16);
+  }
+
+  function publicationDateInputs(value) {
+    if (!value) return { date: "", time: "" };
+    if (isDateOnly(value)) return { date: String(value), time: "" };
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return { date: "", time: "" };
+    const iso = parsed.toISOString();
+    return { date: iso.slice(0, 10), time: iso.slice(11, 16) };
   }
 
   function duration(start, finish) {
@@ -369,7 +387,7 @@
     return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}</td>
       <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
-      <td>${esc(formatUtcDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
+      <td>${esc(formatPublishedDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
       <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
   }
 
@@ -967,14 +985,16 @@
         : [];
       const detailAiActions = article.ai_title_suggestion_state === "pending"
         ? `<button type="button" class="media-button media-button--primary" data-detail-ai-decision="accept-ai">Accept AI title</button><button type="button" class="media-button" data-detail-ai-decision="reject-ai">Reject AI / use original</button>` : "";
+      const publicationInputs = publicationDateInputs(article.published_at);
       dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
         <div class="media-detail__grid"><div>${article.admin_preview_image_path ? `<img class="media-detail__preview" src="${esc(apiUrl(`articles/${id}/image`))}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
-        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatUtcDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
+        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
         ${directPublishHtml(data, article)}
         ${blueskyHistoryHtml(data, article)}
         ${facebookHistoryHtml(data, article)}
         <section><h4>Author</h4><form class="media-inline-form" data-detail-author><label class="media-field media-field--grow"><span>Author</span><input name="author" maxlength="500" value="${esc(article.author || "")}" autocomplete="off"></label><button class="media-button media-button--primary">Save Author</button></form><p class="media-subtext">Single line, maximum 500 characters. Saving a blank value clears the authoritative Author.</p><div data-detail-author-message></div></section>
+        <section><h4>Publication date</h4><form class="media-inline-form" data-detail-publication-date><label class="media-field media-field--grow"><span>Publication date</span><input name="publication_date" type="date" value="${esc(publicationInputs.date)}"></label><label class="media-field media-field--grow"><span>Publication time (UTC, optional)</span><input name="publication_time" type="time" value="${esc(publicationInputs.time)}"></label><button class="media-button media-button--primary" data-save-publication-date>Save publication date</button>${article.published_at ? `<button type="button" class="media-button" data-clear-publication-date>Clear publication date</button>` : ""}</form><div data-detail-publication-date-message></div></section>
         <section><h4>Display title</h4><p>${esc(aiSuggestionLabel(article))}${article.ai_title_generated_at ? ` · ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}` : ""}</p><p>${esc(article.ai_title_suggestion || "—")}</p><div class="media-actions"><button type="button" class="media-button" data-detail-generate-ai>${article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title"}</button>${detailAiActions}</div><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
         <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
         <section><details><summary>Discovery evidence and recent events (raw ISO UTC)</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
@@ -1003,6 +1023,8 @@
         }
       }
       dialog.querySelector("[data-detail-author]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailAuthor(id, new FormData(event.currentTarget).get("author"), dialog); });
+      dialog.querySelector("[data-detail-publication-date]")?.addEventListener("submit", event => { event.preventDefault(); void savePublicationDate(id, event.currentTarget, dialog); });
+      dialog.querySelector("[data-clear-publication-date]")?.addEventListener("click", () => void clearPublicationDate(id, dialog));
       dialog.querySelector("[data-detail-title]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailTitle(id, new FormData(event.currentTarget).get("display_title"), dialog); });
       dialog.querySelector("[data-clear-title]")?.addEventListener("click", () => void saveDetailTitle(id, null, dialog));
       dialog.querySelector("[data-detail-generate-ai]")?.addEventListener("click", event => void generateDetailAiTitle(id, event.currentTarget, dialog));
@@ -1079,6 +1101,47 @@
       saveButton.disabled = false;
       output.innerHTML = message(error.message, "error");
     }
+  }
+
+  async function updatePublicationDate(id, publishedAt, dialog, successMessage) {
+    const form = dialog.querySelector("[data-detail-publication-date]");
+    const output = dialog.querySelector("[data-detail-publication-date-message]");
+    const buttons = form.querySelectorAll("button");
+    buttons.forEach(button => { button.disabled = true; });
+    try {
+      const data = await request(`articles/${id}/published-at`, {
+        method: "PUT",
+        idempotent: "published-at",
+        body: { published_at: publishedAt },
+      });
+      updateArticleFromMutation(id, data?.article);
+      await renderArticles(false);
+      await openArticle(id, successMessage);
+    } catch (error) {
+      buttons.forEach(button => { button.disabled = false; });
+      output.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function savePublicationDate(id, form, dialog) {
+    const values = new FormData(form);
+    const date = String(values.get("publication_date") || "");
+    const time = String(values.get("publication_time") || "");
+    const output = dialog.querySelector("[data-detail-publication-date-message]");
+    if (time && !date) {
+      output.innerHTML = message("Enter a publication date before adding a UTC time.", "error");
+      return;
+    }
+    if (!date) {
+      output.innerHTML = message("Enter a publication date, or use Clear publication date.", "error");
+      return;
+    }
+    const publishedAt = time ? new Date(`${date}T${time}:00.000Z`).toISOString() : date;
+    await updatePublicationDate(id, publishedAt, dialog, "Publication date saved.");
+  }
+
+  async function clearPublicationDate(id, dialog) {
+    await updatePublicationDate(id, null, dialog, "Publication date cleared.");
   }
 
   async function generateDetailAiTitle(id, button, dialog) {
