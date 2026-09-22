@@ -673,8 +673,8 @@ run_batch() {
 }
 
 preflight
-run_batch 2025-01-01 2026-01-31 2026-01
-run_batch 2025-02-01 2026-02-28 2026-02
+run_batch 2025-01-01 2025-01-31 2025-01
+run_batch 2025-02-01 2025-02-28 2025-02
 
 log "ALL BATCHES COMPLETED"
 echo "Summary: $SUMMARY"
