@@ -4,7 +4,7 @@ This local-only collector reads retained TEST Cloud Logging entries and merges
 them into Dropbox-synchronised, UTC event-date files:
 
 ```text
-<archive_root>/GCP Logs/TEST/raw/YYYY/MM/YYYY-MM-DD.jsonl.gz
+<archive_root>/TEST/GCP Logs/raw/YYYY/MM/YYYY-MM-DD.jsonl.gz
 ```
 
 It does not change a Cloud Run service, scheduler, log sink, or retention
@@ -47,7 +47,7 @@ setting. The Google identity needs only `logging.logEntries.list` (normally the
   history in a new/empty destination and prevents a changed sanitisation policy
   from merging incompatible fallback identities or leaving older sensitive
   values untouched.
-- A separate `<archive_root>/GCP Logs/TEST/archive-identity.json` manifest binds
+- A separate `<archive_root>/TEST/GCP Logs/archive-identity.json` manifest binds
   the same source, archive destination and redaction identities to the archive
   itself. All three modes validate it before constructing the Cloud Logging
   client or changing daily files. The collector creates it with exclusive file
@@ -89,7 +89,7 @@ The example also carries the default Cloud Logging read controls:
 600-second retry timeout. These operational controls do not change archive,
 source or redaction identity.
 `archive_root` is the explicitly selected
-Dropbox root; the collector appends `GCP Logs/TEST/raw`. Keep `state_dir`
+Dropbox root; the collector appends `TEST/GCP Logs/raw`. Keep `state_dir`
 outside Dropbox so sync conflicts cannot become checkpoint authority. Keep
 `run_evidence_root` separate from both the raw archive and checkpoints.
 
@@ -162,16 +162,35 @@ without changing the stored `source` object.
 
 ### Moving or re-sanitising an archive
 
+The archive layout is environment-first:
+
+```text
+<archive_root>/TEST/GCP Logs/
+<archive_root>/LIVE/GCP Logs/    # future separate LIVE implementation only
+```
+
 For a path-only move with unchanged contents and redaction policy, stop
-launchd, wait for Dropbox to finish, copy/move the complete `GCP Logs/TEST`
+launchd, wait for Dropbox to finish, copy/move the complete `TEST/GCP Logs`
 tree, verify daily file counts and hashes at the destination, change
-`archive_root`, and preserve the manifest and checkpoints before updating only
-their `archive.archive_path` values to the resolved new `GCP Logs/TEST/raw`
-path. Keep the same `archive_id`, source and redaction identities in every
-file. Run one overlapping incremental collection manually and
-verify it before re-enabling launchd. Never point an existing checkpoint at an
-empty or partial destination, and never delete the manifest to make a moved or
-incompatible archive appear new.
+`archive_root` only when the configured parent itself changed, and preserve
+the manifest and checkpoints before updating only their
+`archive.archive_path` values to the resolved new `TEST/GCP Logs/raw` path.
+Keep the same `archive_id`, source and redaction identities in every file. Run
+one overlapping incremental collection manually and verify it before
+re-enabling launchd. Never point an existing checkpoint at an empty or partial
+destination, and never delete the manifest to make a moved or incompatible
+archive appear new.
+
+For the September 2026 TEST layout correction from the original
+`<archive_root>/GCP Logs/TEST` location to
+`<archive_root>/TEST/GCP Logs`, keep the same configured `archive_root`.
+Move the complete directory only after collection has stopped and Dropbox is
+settled, verify file counts/hashes, then update the manifest plus
+`backfill.json` and `incremental.json` so only
+`archive.archive_path` changes from the old resolved
+`GCP Logs/TEST/raw` path to the new resolved `TEST/GCP Logs/raw` path. Do
+not change the source, `archive_id`, redaction identity, backfill watermark or
+incremental watermark.
 
 A `redact_paths` change is intentionally incompatible, including a change that
 only adds a sensitive path: fallback identities are calculated from the
@@ -190,7 +209,7 @@ historical re-sanitisation instead:
    the new policy.
 4. Validate gzip/JSONL integrity, entry/date coverage, the run report, and that
    prohibited fields are absent. Run one manual incremental collection.
-5. Atomically rename the verified staging `GCP Logs/TEST` directory into its
+5. Atomically rename the verified staging `TEST/GCP Logs` directory into its
    final Dropbox location on the same filesystem, update `archive_root` if
    needed, and apply the verified path-only manifest/checkpoint move procedure
    above.
@@ -236,7 +255,7 @@ Check status and evidence:
 launchctl print "gui/$(id -u)/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test"
 tail -n 100 logs/gcp_logging_archive_test_launchd.log
 find "$HOME/Library/Logs/UK-AQ/gcp-logging-archive/test/runs" -name run-report.json -print | tail
-gzip -cd "DROPBOX_ROOT/GCP Logs/TEST/raw/YYYY/MM/YYYY-MM-DD.jsonl.gz" | head
+gzip -cd "DROPBOX_ROOT/TEST/GCP Logs/raw/YYYY/MM/YYYY-MM-DD.jsonl.gz" | head
 ```
 
 After installation, confirm that a successful run advances
