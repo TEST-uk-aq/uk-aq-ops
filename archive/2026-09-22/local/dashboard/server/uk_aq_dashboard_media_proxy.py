@@ -7,15 +7,13 @@ import os
 import re
 from http import HTTPStatus
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse
+from urllib.parse import urlparse
 
 import requests
 
 
 MAX_BODY_BYTES = 16 * 1024
 MEDIA_TIMEOUT_SECONDS = 30
-BROWSER_IMAGE_CACHE_CONTROL = "private, max-age=604800, immutable"
-_ARTICLE_IMAGE_PATH = re.compile(r"^/api/media/articles/[1-9]\d*/image$")
 
 _ROUTES = (
     (re.compile(r"^/api/media/articles$"), {"GET", "POST"}),
@@ -122,18 +120,9 @@ def proxy_media_request(handler: Any, method: str) -> None:
         "/api/media/articles/bulk-publish": "/articles/bulk/publish",
     }
     upstream_path = explicit_paths.get(parsed.path, parsed.path.removeprefix("/api/media"))
-    query_items = parse_qsl(parsed.query, keep_blank_values=True)
-    image_version = next((value.strip() for name, value in query_items if name == "v" and value.strip()), "")
-    is_versioned_image = method == "GET" and bool(image_version) and bool(
-        _ARTICLE_IMAGE_PATH.fullmatch(parsed.path)
-    )
-    upstream_query = urlencode(
-        [(name, value) for name, value in query_items if not (is_versioned_image and name == "v")],
-        doseq=True,
-    )
     target = f"{base_url}/admin{upstream_path}"
-    if upstream_query:
-        target = f"{target}?{upstream_query}"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
     headers = {"Authorization": f"Bearer {token}", "Accept": handler.headers.get("Accept", "*/*")}
     content_type = handler.headers.get("Content-Type")
     idempotency_key = handler.headers.get("Idempotency-Key")
@@ -162,13 +151,7 @@ def proxy_media_request(handler: Any, method: str) -> None:
             value = upstream.headers.get(name)
             if value:
                 handler.send_header(name, value)
-        response_content_type = str(upstream.headers.get("Content-Type") or "").lower()
-        cache_control = BROWSER_IMAGE_CACHE_CONTROL if (
-            is_versioned_image
-            and 200 <= upstream.status_code < 300
-            and response_content_type.startswith("image/")
-        ) else "no-store"
-        handler.send_header("Cache-Control", cache_control)
+        handler.send_header("Cache-Control", "no-store")
         handler.send_header("X-Content-Type-Options", "nosniff")
         handler.end_headers()
         for chunk in upstream.iter_content(chunk_size=64 * 1024):

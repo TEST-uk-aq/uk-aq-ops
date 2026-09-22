@@ -121,13 +121,6 @@
     return query ? `${url}?${query}` : url;
   }
 
-  function articleImageUrl(article) {
-    const id = Number(article?.id);
-    const version = String(article?.updated_at || "").trim();
-    if (!Number.isInteger(id) || id < 1 || !version) return null;
-    return apiUrl(`articles/${id}/image`, new URLSearchParams({ v: version }));
-  }
-
   async function request(path, options = {}) {
     const headers = new Headers(options.headers || {});
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
@@ -375,9 +368,8 @@
       ? `Generated ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}${article.ai_title_prompt_version ? ` · ${esc(article.ai_title_prompt_version)}` : ""}`
       : "No AI title has been generated.";
     const generateLabel = article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title";
-    const imageUrl = articleImageUrl(article);
-    const image = article.admin_preview_image_path && imageUrl
-      ? `<img class="media-site-preview__image" loading="lazy" src="${esc(imageUrl)}" alt="" data-ai-preview-image>` : "";
+    const image = article.admin_preview_image_path
+      ? `<img class="media-site-preview__image" loading="lazy" src="${esc(apiUrl(`articles/${article.id}/image`))}" alt="" data-ai-preview-image>` : "";
     const savedMessage = state.titleMessages.get(String(article.id));
     const homepagePublished = formatPublicationDate(article.published_at);
     const homepageSourceRow = `${esc(article.publisher)}<span data-homepage-preview-date>${homepagePublished ? ` · ${esc(homepagePublished)}` : ""}</span>`;
@@ -389,9 +381,8 @@
     const title = article.display_title || article.title;
     const [titleState, titleLabel] = titleStatus(article);
     const isExpanded = state.expandedArticleIds.has(String(article.id));
-    const imageUrl = articleImageUrl(article);
-    const thumb = article.admin_preview_image_path && imageUrl
-      ? `<img class="media-thumb" loading="lazy" src="${esc(imageUrl)}" alt="" data-media-thumb>`
+    const thumb = article.admin_preview_image_path
+      ? `<img class="media-thumb" loading="lazy" src="${esc(apiUrl(`articles/${article.id}/image`))}" alt="" data-media-thumb>`
       : `<span class="media-thumb-fallback">No image</span>`;
     return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}</td>
       <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}</td>
@@ -995,9 +986,8 @@
       const detailAiActions = article.ai_title_suggestion_state === "pending"
         ? `<button type="button" class="media-button media-button--primary" data-detail-ai-decision="accept-ai">Accept AI title</button><button type="button" class="media-button" data-detail-ai-decision="reject-ai">Reject AI / use original</button>` : "";
       const publicationInputs = publicationDateInputs(article.published_at);
-      const imageUrl = articleImageUrl(article);
       dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
-        <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
+        <div class="media-detail__grid"><div>${article.admin_preview_image_path ? `<img class="media-detail__preview" src="${esc(apiUrl(`articles/${id}/image`))}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
         <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
         ${directPublishHtml(data, article)}
