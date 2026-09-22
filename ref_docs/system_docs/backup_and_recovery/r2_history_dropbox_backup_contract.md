@@ -195,6 +195,23 @@ Copying committed R2 objects is read-only and does not itself require the canoni
 
 The pack publisher may author only its own backup-pack derivative namespace from already committed binding source manifests/objects. It MUST NOT mutate the physical binding tree or become a replacement for binding reconciliation.
 
+
+## Workflow-dispatch correlation for chained operator runs
+
+The normal GitHub Actions backup workflow MAY accept an optional caller correlation identifier for operator tooling that must dispatch and wait for one exact backup run, including the serial monthly SOS-light wrapper.
+
+When a caller correlation identifier is supplied:
+
+- the workflow MUST expose that identifier in stable GitHub Actions run metadata such as the workflow run display name, so the caller can resolve the exact resulting run unambiguously;
+- the correlation identifier is diagnostic/orchestration metadata only. It MUST NOT participate in backup inventory identities, hashes, checkpoint contents, copy planning, pruning decisions, lock identity or success/failure semantics;
+- the caller MUST monitor the exact resolved run ID to a terminal conclusion rather than selecting the newest run heuristically;
+- the existing uploaded backup report artifact MUST remain available to that exact run and MUST expose the state/checkpoint key plus the final `observations.processed_source_root_hash` needed to identify the successful observations checkpoint generation;
+- a chained caller MUST treat failed, cancelled, ambiguous or otherwise unconfirmed runs as failure and stop rather than proceeding on elapsed time.
+
+Calls that do not provide a correlation identifier retain the existing scheduled/manual backup behaviour.
+
+The correlation mechanism does not weaken writer coordination. The workflow continues to run the normal hierarchical backup under the shared global observations operation lock and publishes checkpoint completion according to the existing sync contract.
+
 ## Packed binding transport boundary
 
 Phase 1, Phase 2, Phase 3, Phase 4 and Phase 5 are implemented and accepted on TEST. The pack contract is current authority for the implemented pack format, R2 pack publication, additive inventory identity, guarded pack Dropbox transport, destination verification, pack checkpoint state, root-last completion semantics, pack-aware SOS-light Integrity materialisation/currentness behaviour, dedicated exact-byte pack-to-individual binding restore behaviour and the normal scheduled/default TEST binding payload.
