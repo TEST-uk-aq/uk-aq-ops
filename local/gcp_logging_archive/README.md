@@ -228,31 +228,34 @@ Run one incremental collection with:
 local/scripts/run_gcp_logging_archive_test.sh incremental
 ```
 
-## Enable the hourly launchd job
+## Enable the daily launchd job
 
 The template does not contain a user name or machine path and does not alter
-the existing dashboard or cloudflared jobs. Render and load it after the manual
-incremental run succeeds. The renderer uses `plistlib`, rather than raw XML
-text replacement, so repository paths containing `&` or other XML-sensitive
+the existing dashboard or cloudflared jobs. The normal schedule is daily via
+`StartInterval=86400`; Cloud Logging remains the recent troubleshooting source.
+An operator can use `launchctl kickstart -k` or run `incremental` manually when
+an immediate archive catch-up is wanted. Render and load the job after the
+manual incremental run succeeds. The renderer uses `plistlib`, rather than raw
+XML text replacement, so repository paths containing `&` or other XML-sensitive
 characters remain valid:
 
 ```bash
 cd "/path/to/TEST-uk-aq-ops"
 mkdir -p logs "$HOME/Library/LaunchAgents"
 python3 local/scripts/render_gcp_logging_archive_launchd.py \
-  local/launchd/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist.example \
-  "$HOME/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist"
-plutil -lint "$HOME/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist"
+  local/launchd/uk.co.ukaq.gcp-logging-archive.test.plist.example \
+  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
+plutil -lint "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
 launchctl bootstrap "gui/$(id -u)" \
-  "$HOME/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist"
+  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
 launchctl kickstart -k \
-  "gui/$(id -u)/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test"
+  "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.test"
 ```
 
 Check status and evidence:
 
 ```bash
-launchctl print "gui/$(id -u)/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test"
+launchctl print "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.test"
 tail -n 100 logs/gcp_logging_archive_test_launchd.log
 find "$HOME/Library/Logs/UK-AQ/gcp-logging-archive/test/runs" -name run-report.json -print | tail
 gzip -cd "DROPBOX_ROOT/TEST/GCP Logs/raw/YYYY/MM/YYYY-MM-DD.jsonl.gz" | head
@@ -298,8 +301,8 @@ Uninstall only this TEST job:
 
 ```bash
 launchctl bootout "gui/$(id -u)" \
-  "$HOME/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist"
-rm "$HOME/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist"
+  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
+rm "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
 ```
 
 This stops future runs; it intentionally leaves archives, checkpoints, run
