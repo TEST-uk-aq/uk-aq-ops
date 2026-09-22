@@ -90,7 +90,13 @@ Bounded range MUST use the same archive-manifest and redaction protections as in
 
 ## Pagination and source reads
 
-The Cloud Logging client MUST consume all API pages for the selected bounded query.
+The collector MUST consume all API pages for the selected bounded query.
+
+Cloud Logging `entries.list` reads MUST be explicitly paced below the project-wide API quota rather than allowing sparse backfill windows to issue requests as fast as the client can return them. The TEST implementation uses a 1.5-second minimum interval between page requests by default.
+
+Quota exhaustion responses, including HTTP 429 / `ResourceExhausted`, MUST use bounded exponential retry/backoff. Retried reads MUST remain read-only and page-stable: an unsuccessful page request MUST NOT publish entries or advance a checkpoint. If the bounded retry period is exhausted, the run MUST fail while retaining the last successfully published checkpoint so the same operation can resume safely.
+
+Read pacing and retry controls are operational configuration. Changing them does not by itself change source, archive or redaction identity.
 
 The configured TEST project and exact filter form the source identity used by the archive manifest, checkpoints and run evidence. A changed project/filter MUST fail against old identity evidence until the operator deliberately starts or rebuilds from an appropriate safe boundary.
 
