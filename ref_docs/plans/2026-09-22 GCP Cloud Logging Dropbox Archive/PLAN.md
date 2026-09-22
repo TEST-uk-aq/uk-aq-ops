@@ -44,8 +44,8 @@ Always-on MacBook Pro
         |      per-invocation log + bounded JSON report
         |
         +--> local Dropbox folder
-                 GCP Logs/TEST/archive-identity.json
-                 GCP Logs/TEST/raw/YYYY/MM/YYYY-MM-DD.jsonl.gz
+                 TEST/GCP Logs/archive-identity.json
+                 TEST/GCP Logs/raw/YYYY/MM/YYYY-MM-DD.jsonl.gz
                   |
                   v
              Dropbox cloud
@@ -132,8 +132,8 @@ Use a TEST-only Dropbox root for retained archive content:
 
 ```text
 <archive_root>/
-  GCP Logs/
-    TEST/
+  TEST/
+    GCP Logs/
       archive-identity.json
       raw/
         YYYY/
@@ -141,9 +141,20 @@ Use a TEST-only Dropbox root for retained archive content:
             YYYY-MM-DD.jsonl.gz
 ```
 
+The environment is deliberately the higher-level grouping. A later,
+separately authorised LIVE implementation would therefore use
+`<archive_root>/LIVE/GCP Logs/`, not `<archive_root>/GCP Logs/LIVE/`.
+
 Checkpoint/lock state and operator run evidence are intentionally outside the Dropbox raw archive and use explicit local `state_dir` and `run_evidence_root` configuration.
 
 The manifest binds the archive generation to the TEST project/filter source identity, stable `archive_id`, resolved raw destination and exact redaction policy. Incremental, backfill and bounded-range modes all validate it before source retrieval or daily-file mutation. A non-empty manifestless archive is not adopted implicitly.
+
+The September 2026 path correction from `<archive_root>/GCP Logs/TEST` to
+`<archive_root>/TEST/GCP Logs` is a path-only relocation of the same archive
+generation. Keep `archive_root`, source identity, `archive_id`, redaction
+identity and both source watermarks unchanged; move and verify the complete
+archive first, then update only the resolved `archive.archive_path` stored in
+the manifest and the incremental/backfill checkpoints.
 
 The LIVE equivalent must not be created or enabled by inference.
 
@@ -522,7 +533,7 @@ If TEST proves useful, create a structurally equivalent LIVE collector with:
 
 - separate LIVE GCP authentication;
 - explicit LIVE project/log filters;
-- separate `GCP Logs/LIVE/` Dropbox root;
+- separate `LIVE/GCP Logs/` Dropbox root;
 - separate checkpoint and run history;
 - no inferred reuse of TEST paths or identities.
 
