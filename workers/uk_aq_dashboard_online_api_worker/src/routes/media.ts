@@ -103,9 +103,11 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv,
   const upstreamPath = explicitPaths[incoming.pathname]
     || incoming.pathname.replace(/^\/api\/media/, '/admin');
   const upstreamUrl = new URL(`${base}${upstreamPath}`);
-  for (const [name, value] of incoming.searchParams) {
-    if (!(isVersionedImage && name === 'v')) upstreamUrl.searchParams.append(name, value);
-  }
+  incoming.searchParams.forEach((value, name) => {
+    if (!(isVersionedImage && name === 'v')) {
+      upstreamUrl.searchParams.append(name, value);
+    }
+  });
   const target = upstreamUrl.toString();
   const headers = new Headers({ Authorization: `Bearer ${token}`, Accept: request.headers.get('Accept') || '*/*' });
   const contentType = request.headers.get('Content-Type');
