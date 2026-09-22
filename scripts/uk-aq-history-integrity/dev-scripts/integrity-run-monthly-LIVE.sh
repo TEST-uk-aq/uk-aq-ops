@@ -110,7 +110,8 @@ month_state_valid() {
   state_key="$(json_field "$backup_receipt" state_root_key)" || return 1
   expected_hash="$(json_field "$backup_receipt" expected_hash)" || return 1
   [[ "$state_key" != /* && "$state_key" != *".."* && "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
-  receipt_valid "$sync_receipt" "phase=local_checkpoint_matched" "label=$label" \
+  receipt_valid "$sync_receipt" "phase=local_materialisation_verified" "label=$label" \
+    "caller_run_id=$caller" "run_id=$run_id" "generation=$OBSERVATION_HISTORY_VERSION" \
     "state_root_key=$state_key" "expected_hash=$expected_hash" "observed_hash=$expected_hash"
 }
 
@@ -462,8 +463,7 @@ PY
 wait_for_local_checkpoint() {
   local state_root_key="$1"
   local expected_hash="$2"
-  local sync_receipt="$3"
-  local label="$4"
+  local label="$3"
   local checkpoint="$DROPBOX_BACKUP_ROOT/$state_root_key"
   local deadline=$(( $(date +%s) + DROPBOX_SYNC_TIMEOUT_SECONDS ))
   local observed=""
@@ -482,8 +482,6 @@ print(value)
 PY
 )"
     if [ "$observed" = "$expected_hash" ]; then
-      write_receipt "$sync_receipt" "phase=local_checkpoint_matched" "label=$label" \
-        "state_root_key=$state_root_key" "expected_hash=$expected_hash" "observed_hash=$observed"
       log "LOCAL CHECKPOINT MATCH label=${label} checkpoint=${checkpoint} processed_source_root_hash=${observed}"
       return 0
     fi
@@ -491,6 +489,54 @@ PY
     sleep "$DROPBOX_SYNC_POLL_SECONDS"
   done
   fail "local Dropbox checkpoint did not reach expected hash ${expected_hash}: ${checkpoint}"
+}
+
+wait_for_local_materialisation() {
+  local report_path="$1"
+  local state_root_key="$2"
+  local expected_hash="$3"
+  local caller_run_id="$4"
+  local run_id="$5"
+  local label="$6"
+  local sync_receipt="$7"
+  local attempt_report="$LOG_ROOT/${label}.materialisation-attempt.json"
+  local verifier="$OPS_REPO_ROOT/scripts/backup_r2/verify_local_backup_materialisation.mjs"
+  local deadline=$(( $(date +%s) + DROPBOX_SYNC_TIMEOUT_SECONDS ))
+  [ -f "$verifier" ] || { fail "local materialisation verifier is unavailable: ${verifier}"; return 1; }
+  while [ "$(date +%s)" -le "$deadline" ]; do
+    if node "$verifier" \
+      --backup-root "$DROPBOX_BACKUP_ROOT" \
+      --backup-report "$report_path" \
+      --expected-observations-root "$expected_hash" \
+      --generation "$OBSERVATION_HISTORY_VERSION" \
+      --output "$attempt_report" >/dev/null 2>&1
+    then
+      local verified_days verified_objects verified_core verified_bindings completed_at
+      verified_days="$(json_field "$attempt_report" verified_observation_day_count)"
+      verified_objects="$(json_field "$attempt_report" verified_observation_object_count)"
+      verified_core="$(json_field "$attempt_report" verified_core_unit_count)"
+      verified_bindings="$(json_field "$attempt_report" verified_binding_unit_count)"
+      completed_at="$(json_field "$attempt_report" completed_at)"
+      write_receipt "$sync_receipt" "phase=local_materialisation_verified" "label=$label" \
+        "caller_run_id=$caller_run_id" "run_id=$run_id" \
+        "expected_hash=$expected_hash" "observed_hash=$expected_hash" \
+        "generation=$OBSERVATION_HISTORY_VERSION" "state_root_key=$state_root_key" \
+        "verified_observation_day_count=$verified_days" \
+        "verified_observation_object_count=$verified_objects" \
+        "verified_core_unit_count=$verified_core" \
+        "verified_binding_unit_count=$verified_bindings" \
+        "verifier_completed_at=$completed_at"
+      log "LOCAL MATERIALISATION VERIFIED label=${label} caller_run_id=${caller_run_id} run_id=${run_id} generation=${OBSERVATION_HISTORY_VERSION} observation_days=${verified_days} observation_objects=${verified_objects} core_units=${verified_core} binding_units=${verified_bindings}"
+      return 0
+    fi
+    local pending_error="unavailable"
+    if [ -f "$attempt_report" ]; then
+      pending_error="$(json_field "$attempt_report" error 2>/dev/null || echo unreadable_verifier_report)"
+    fi
+    log "LOCAL MATERIALISATION WAIT label=${label} run_id=${run_id} pending=${pending_error}"
+    sleep "$DROPBOX_SYNC_POLL_SECONDS"
+  done
+  fail "local Dropbox materialisation did not authenticate within ${DROPBOX_SYNC_TIMEOUT_SECONDS}s; evidence=${attempt_report}"
 }
 
 run_batch() {
@@ -576,7 +622,7 @@ run_batch() {
     run_url="$(json_field "$dispatch_receipt" run_url)"
   fi
 
-  local state_root_key expected_hash backup_status backup_conclusion
+  local state_root_key expected_hash backup_status backup_conclusion report_path
   if receipt_valid "$backup_receipt" "phase=backup_succeeded" "caller_run_id=$caller_run_id" "run_id=$run_id"; then
     state_root_key="$(json_field "$backup_receipt" state_root_key)"
     expected_hash="$(json_field "$backup_receipt" expected_hash)"
@@ -592,7 +638,7 @@ run_batch() {
     rm -rf "$artifact_dir"
     mkdir -p "$artifact_dir"
     gh run download "$run_id" --repo "$BACKUP_REPOSITORY" --name "$BACKUP_ARTIFACT" --dir "$artifact_dir" || { fail "failed to download report artifact for exact run ${run_id}"; return 1; }
-    local report_path="$artifact_dir/$BACKUP_REPORT"
+    report_path="$artifact_dir/$BACKUP_REPORT"
     [ -f "$report_path" ] || { fail "exact run artifact lacks ${BACKUP_REPORT}"; return 1; }
     local report_identity
     report_identity="$(validate_backup_report "$report_path")" || { fail "exact run ${run_id} backup report is not acceptable"; return 1; }
@@ -605,10 +651,21 @@ run_batch() {
     log "BACKUP SUCCESS label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} status=${backup_status} conclusion=${backup_conclusion} state_root_key=${state_root_key} expected_hash=${expected_hash}"
   fi
 
-  if receipt_valid "$sync_receipt" "phase=local_checkpoint_matched" "label=$label" "state_root_key=$state_root_key" "expected_hash=$expected_hash" "observed_hash=$expected_hash"; then
-    log "LOCAL CHECKPOINT RESUME label=${label} observed_hash=${expected_hash}"
+  report_path="$artifact_dir/$BACKUP_REPORT"
+  if [ ! -f "$report_path" ]; then
+    mkdir -p "$artifact_dir"
+    gh run download "$run_id" --repo "$BACKUP_REPOSITORY" --name "$BACKUP_ARTIFACT" --dir "$artifact_dir" || { fail "failed to restore report artifact for exact run ${run_id}"; return 1; }
+  fi
+  [ -f "$report_path" ] || { fail "exact run artifact lacks ${BACKUP_REPORT}"; return 1; }
+
+  wait_for_local_checkpoint "$state_root_key" "$expected_hash" "$label" || return 1
+  if receipt_valid "$sync_receipt" "phase=local_materialisation_verified" "label=$label" \
+    "caller_run_id=$caller_run_id" "run_id=$run_id" "generation=$OBSERVATION_HISTORY_VERSION" \
+    "state_root_key=$state_root_key" "expected_hash=$expected_hash" "observed_hash=$expected_hash"; then
+    log "LOCAL MATERIALISATION RESUME label=${label} run_id=${run_id} expected_hash=${expected_hash}"
   else
-    wait_for_local_checkpoint "$state_root_key" "$expected_hash" "$sync_receipt" "$label" || return 1
+    wait_for_local_materialisation "$report_path" "$state_root_key" "$expected_hash" \
+      "$caller_run_id" "$run_id" "$label" "$sync_receipt" || return 1
   fi
 
   touch "$ok_marker"

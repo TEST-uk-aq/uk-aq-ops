@@ -198,7 +198,7 @@ export function completeTimeseriesBindingRangeState(state, inventoryShard) {
   return current;
 }
 
-function normalizeRootState(stateRoot) {
+export function normalizeTimeseriesBindingRootState(stateRoot) {
   const raw = stateRoot.timeseries_binding;
   if (raw !== undefined && (!raw || typeof raw !== "object" || Array.isArray(raw))) {
     throw new Error("Timeseries binding root state must be an object");
@@ -315,7 +315,7 @@ export function syncTimeseriesBindingsToDropbox({
   if (!inventoryReference) {
     throw new Error("Hierarchical inventory root is missing timeseries_binding");
   }
-  const rootState = normalizeRootState(stateRoot);
+  const rootState = normalizeTimeseriesBindingRootState(stateRoot);
   let stateRootDirty = false;
   const currentRangeStarts = new Set(
     inventoryReference.ranges.map((range) => range.range_start),
