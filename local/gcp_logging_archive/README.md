@@ -38,6 +38,11 @@ setting. The Google identity needs only `logging.logEntries.list` (normally the
   fingerprint stops the run before retrieval instead of applying a cursor from
   different source coverage. Operational locations such as the run-evidence
   path do not affect the fingerprint.
+- Checkpoints separately bind the stable `archive_id`, resolved raw archive
+  destination, and exact redaction policy. This prevents a cursor from skipping
+  history in a new/empty destination and prevents a changed sanitisation policy
+  from merging incompatible fallback identities or leaving older sensitive
+  values untouched.
 
 Cloud Logging fields are otherwise preserved, including structured payloads,
 resource labels, severity, event/receive timestamps, trace/span data, and HTTP
@@ -67,7 +72,9 @@ cp local/gcp_logging_archive/config.test.example.json \
 chmod 600 "$HOME/.config/uk-aq/gcp-logging-archive-test.json"
 ```
 
-Edit every `REPLACE_WITH_...` value. `archive_root` is the explicitly selected
+Edit every `REPLACE_WITH_...` value. `archive_id` is a stable, TEST-only
+identity for this archive generation; do not reuse it for a separate rebuild.
+`archive_root` is the explicitly selected
 Dropbox root; the collector appends `GCP Logs/TEST/raw`. Keep `state_dir`
 outside Dropbox so sync conflicts cannot become checkpoint authority. Keep
 `run_evidence_root` separate from both the raw archive and checkpoints.
@@ -139,6 +146,46 @@ fingerprints to bypass validation is unsafe. To rewind without changing source
 coverage, preserve a copy and move the relevant `*_through` timestamp backward
 without changing the stored `source` object.
 
+### Moving or re-sanitising an archive
+
+For a path-only move with unchanged contents and redaction policy, stop
+launchd, wait for Dropbox to finish, copy/move the complete `GCP Logs/TEST`
+tree, verify daily file counts and hashes at the destination, change
+`archive_root`, and preserve the checkpoints before updating only their
+`archive.archive_path` to the resolved new `GCP Logs/TEST/raw` path. Keep the
+same `archive_id`. Run one overlapping incremental collection manually and
+verify it before re-enabling launchd. Never point an existing checkpoint at an
+empty or partial destination.
+
+A `redact_paths` change is intentionally incompatible, including a change that
+only adds a sensitive path: fallback identities are calculated from the
+redacted entry, and merging the new representation into old daily files could
+retain the old sensitive representation as a second record. Perform a clean
+historical re-sanitisation instead:
+
+1. Stop launchd and leave the existing archive and state untouched as rollback
+   evidence with access restricted.
+2. Select a new empty Dropbox staging root, a new `archive_id`, and a new empty
+   `state_dir`; retain the same TEST project/filter and configure the complete
+   new `redact_paths` set.
+3. Run a bounded historical backfill with a fixed end. Omit `--start` to record
+   the actual retained boundary, or choose an earlier known-safe retained UTC
+   boundary. This rebuild deduplicates fallback identities only after applying
+   the new policy.
+4. Validate gzip/JSONL integrity, entry/date coverage, the run report, and that
+   prohibited fields are absent. Run one manual incremental collection.
+5. Atomically rename the verified staging `GCP Logs/TEST` directory into its
+   final Dropbox location on the same filesystem, update `archive_root` if
+   needed, and apply the verified path-only checkpoint move procedure above.
+6. Re-enable launchd, then securely delete the superseded archive only after
+   the retention/rollback decision is approved.
+
+Cloud Logging entries older than its retained boundary cannot be reconstructed
+by that rebuild. If those old entries must be retained, do not weaken or bypass
+the policy check: keep the old archive quarantined and use separately reviewed
+offline re-sanitisation tooling before promotion. The collector deliberately
+does not claim that removing a checkpoint fingerprint sanitises existing data.
+
 Run one incremental collection with:
 
 ```bash
@@ -187,7 +234,8 @@ stale `collector.lock` file is harmless; the operating-system lock ends with
 the process. Do not delete or advance checkpoints merely because a daily file
 was already replaced.
 
-`run-report.json` records the TEST project and source/filter fingerprints,
+`run-report.json` records the TEST project, source/filter fingerprint, archive
+identity/destination, redaction paths/fingerprint,
 source timestamp field and bounded query-window evidence, incremental overlap,
 source/unique/new/duplicate counts, affected dates and files, bytes written,
 resulting watermark, final status and exit code, and bounded error details. A

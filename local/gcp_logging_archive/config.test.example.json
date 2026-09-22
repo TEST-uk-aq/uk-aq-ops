@@ -1,6 +1,7 @@
 {
   "project_id": "REPLACE_WITH_TEST_GCP_PROJECT_ID",
   "log_filter": "resource.type=\"cloud_run_revision\" AND (resource.labels.service_name=\"uk-aq-latest-snapshot-builder\" OR resource.labels.service_name=\"REPLACE_WITH_TEST_INGEST_SERVICE_NAME\")",
+  "archive_id": "test-gcp-logging-dropbox-v1",
   "archive_root": "~/Dropbox/REPLACE_WITH_ARCHIVE_FOLDER",
   "state_dir": "~/.local/state/uk-aq/gcp-logging-archive/test",
   "run_evidence_root": "~/Library/Logs/UK-AQ/gcp-logging-archive/test/runs",

@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 
-from google.cloud import logging_v2
+from google.cloud.logging_v2.services.logging_service_v2 import LoggingServiceV2Client
 from google.protobuf.json_format import MessageToDict
 
 UTC = dt.timezone.utc
@@ -79,6 +79,23 @@ def source_identity(config: dict) -> dict:
         "project_id": config["project_id"],
         "filter_sha256": filter_sha256,
         "source_fingerprint": hashlib.sha256(canonical(source)).hexdigest(),
+    }
+
+
+def archive_identity(config: dict) -> dict:
+    return {
+        "archive_id": config["archive_id"],
+        "archive_path": str(
+            (Path(os.path.expanduser(config["archive_root"])) / "GCP Logs/TEST/raw").resolve()
+        ),
+    }
+
+
+def redaction_identity(config: dict) -> dict:
+    paths = sorted(set(config.get("redact_paths", [])))
+    return {
+        "paths": paths,
+        "redaction_fingerprint": hashlib.sha256(canonical(paths)).hexdigest(),
     }
 
 
@@ -150,7 +167,7 @@ class Collector:
         self.archive = Path(os.path.expanduser(config["archive_root"])) / "GCP Logs/TEST/raw"
         self.state = Path(os.path.expanduser(config["state_dir"]))
         self.redact = config.get("redact_paths", [])
-        self.client = logging_v2.LoggingServiceV2Client()
+        self.client = LoggingServiceV2Client()
 
     def filter(self, start: dt.datetime | None, end: dt.datetime | None, field: str) -> str:
         clauses = [f"({self.config['log_filter']})"]
@@ -260,7 +277,7 @@ class Collector:
         }
 
 
-def checkpoint(path: Path, expected_source: dict) -> dict:
+def checkpoint(path: Path, expected_source: dict, expected_archive: dict, expected_redaction: dict) -> dict:
     if not path.exists():
         return {}
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -271,12 +288,27 @@ def checkpoint(path: Path, expected_source: dict) -> dict:
             f"{expected_source['project_id']} and filter SHA-256 {expected_source['filter_sha256']}; "
             "move the checkpoint aside and restart from an explicit safe boundary after reviewing source coverage"
         )
+    actual_archive = value.get("archive", {})
+    if actual_archive != expected_archive:
+        raise RuntimeError(
+            f"checkpoint archive mismatch at {path}: expected archive ID "
+            f"{expected_archive['archive_id']} at {expected_archive['archive_path']}; "
+            "complete and verify an archive move before updating the checkpoint, or use a new state directory "
+            "and rebuild history into the new archive"
+        )
+    actual_redaction = value.get("redaction", {})
+    if actual_redaction.get("redaction_fingerprint") != expected_redaction["redaction_fingerprint"]:
+        raise RuntimeError(
+            f"checkpoint redaction mismatch at {path}: archived entries were produced under a different "
+            "redaction policy; do not continue or edit the fingerprint—re-sanitise by rebuilding into a "
+            "new archive identity and state directory, verify it, then retire the old archive"
+        )
     return value
 
 
 def new_report(config: dict, args: argparse.Namespace, run_id: str, run_start: dt.datetime) -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": run_id,
         "environment": "TEST",
         "mode": args.mode,
@@ -284,6 +316,8 @@ def new_report(config: dict, args: argparse.Namespace, run_id: str, run_start: d
         "status": "running",
         "project_id": config["project_id"],
         "source": source_identity(config),
+        "archive": archive_identity(config),
+        "redaction": redaction_identity(config),
         "archive_root": config["archive_root"],
         "overlap_seconds": int(config.get("overlap_seconds", 7200)) if args.mode == "incremental" else None,
         "query_summary": {
@@ -336,7 +370,7 @@ def main() -> int:
     bounded.add_argument("--end", required=True)
     args = parser.parse_args()
     config = json.loads(args.config.read_text(encoding="utf-8"))
-    for key in ("project_id", "log_filter", "archive_root", "state_dir", "run_evidence_root"):
+    for key in ("project_id", "log_filter", "archive_id", "archive_root", "state_dir", "run_evidence_root"):
         if not config.get(key):
             parser.error(f"config requires {key}")
 
@@ -381,7 +415,7 @@ def main() -> int:
         now = dt.datetime.now(UTC)
         if args.mode == "incremental":
             cp_path = state_dir / "incremental.json"
-            cp = checkpoint(cp_path, report["source"])
+            cp = checkpoint(cp_path, report["source"], report["archive"], report["redaction"])
             collector = Collector(config)
             overlap = dt.timedelta(seconds=int(config.get("overlap_seconds", 7200)))
             start = utc(cp["receive_through"]) - overlap if cp else now - dt.timedelta(seconds=int(config.get("initial_lookback_seconds", 86400)))
@@ -392,7 +426,8 @@ def main() -> int:
                 window = collector.window(start, end, "receiveTimestamp")
                 record_window(report, window)
                 watermark = stamp(end)
-                atomic_json(cp_path, {"schema_version": 2, "source": report["source"], "receive_through": watermark,
+                atomic_json(cp_path, {"schema_version": 3, "source": report["source"], "archive": report["archive"],
+                                      "redaction": report["redaction"], "receive_through": watermark,
                                       "updated_at": stamp(dt.datetime.now(UTC)), "last_run_id": run_id})
                 report["resulting_watermark"] = {"field": "receiveTimestamp", "through": watermark}
         elif args.mode == "range":
@@ -403,7 +438,7 @@ def main() -> int:
             record_window(report, collector.window(start, end, "timestamp"))
         else:
             cp_path = state_dir / "backfill.json"
-            cp = checkpoint(cp_path, report["source"])
+            cp = checkpoint(cp_path, report["source"], report["archive"], report["redaction"])
             collector = Collector(config)
             if cp.get("event_through"):
                 start = utc(cp["event_through"])
@@ -425,7 +460,8 @@ def main() -> int:
                 record_window(report, window)
                 # Window publication is complete before this resumable cursor advances.
                 watermark = stamp(end)
-                atomic_json(cp_path, {"schema_version": 2, "source": report["source"], "event_through": watermark,
+                atomic_json(cp_path, {"schema_version": 3, "source": report["source"], "archive": report["archive"],
+                                      "redaction": report["redaction"], "event_through": watermark,
                                       "updated_at": stamp(dt.datetime.now(UTC)), "last_run_id": run_id})
                 report["resulting_watermark"] = {"field": "timestamp", "through": watermark}
                 atomic_json(report_path, report)
