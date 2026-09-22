@@ -2,18 +2,6 @@ import { errorEnvelope } from '../lib/http';
 import type { WorkerEnv } from '../lib/upstream';
 
 const MAX_BODY_BYTES = 16 * 1024;
-const BROWSER_IMAGE_CACHE_CONTROL = 'private, max-age=604800, immutable';
-const EDGE_IMAGE_CACHE_CONTROL = 'public, max-age=2592000';
-const ARTICLE_IMAGE_PATH = /^\/api\/media\/articles\/[1-9]\d*\/image$/;
-const IMAGE_CACHE_HEADER = 'X-UK-AQ-Media-Image-Cache';
-
-export type MediaExecutionContext = {
-  waitUntil(promise: Promise<unknown>): void;
-};
-
-function mediaImageCache(): Cache {
-  return (caches as CacheStorage & { default: Cache }).default;
-}
 
 const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/articles$/, methods: new Set(['GET', 'POST']) },
@@ -60,15 +48,7 @@ function mediaBaseUrl(env: WorkerEnv): string | null {
   } catch { return null; }
 }
 
-function browserImageResponse(response: Response, cacheStatus: 'HIT' | 'MISS'): Response {
-  const headers = new Headers(response.headers);
-  headers.set('Cache-Control', BROWSER_IMAGE_CACHE_CONTROL);
-  headers.set(IMAGE_CACHE_HEADER, cacheStatus);
-  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
-}
-
-export async function handleMediaRoute(request: Request, env: WorkerEnv,
-  ctx: MediaExecutionContext): Promise<Response> {
+export async function handleMediaRoute(request: Request, env: WorkerEnv): Promise<Response> {
   const incoming = new URL(request.url);
   const route = ROUTES.find(candidate => candidate.pattern.test(incoming.pathname));
   if (!route) return errorEnvelope('NOT_FOUND', 'Media API route not found', 404);
@@ -81,32 +61,13 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv,
   if (!base || !token) {
     return errorEnvelope('MEDIA_ADMIN_NOT_CONFIGURED', 'Media admin is unavailable', 503);
   }
-  const imageVersion = (incoming.searchParams.get('v') || '').trim();
-  const isVersionedImage = method === 'GET' && ARTICLE_IMAGE_PATH.test(incoming.pathname)
-    && imageVersion.length > 0;
-  let imageCacheKey: Request | null = null;
-  if (isVersionedImage) {
-    const cacheUrl = new URL(incoming.origin + incoming.pathname);
-    cacheUrl.searchParams.set('v', imageVersion);
-    imageCacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
-    try {
-      const cached = await mediaImageCache().match(imageCacheKey);
-      if (cached) return browserImageResponse(cached, 'HIT');
-    } catch {
-      // Cache API availability must not prevent the authenticated upstream fetch.
-    }
-  }
   const explicitPaths: Record<string, string> = {
     '/api/media/articles/bulk-approve': '/admin/articles/bulk/approve',
     '/api/media/articles/bulk-publish': '/admin/articles/bulk/publish',
   };
   const upstreamPath = explicitPaths[incoming.pathname]
     || incoming.pathname.replace(/^\/api\/media/, '/admin');
-  const upstreamUrl = new URL(`${base}${upstreamPath}`);
-  for (const [name, value] of incoming.searchParams) {
-    if (!(isVersionedImage && name === 'v')) upstreamUrl.searchParams.append(name, value);
-  }
-  const target = upstreamUrl.toString();
+  const target = `${base}${upstreamPath}${incoming.search}`;
   const headers = new Headers({ Authorization: `Bearer ${token}`, Accept: request.headers.get('Accept') || '*/*' });
   const contentType = request.headers.get('Content-Type');
   const idempotency = request.headers.get('Idempotency-Key');
@@ -128,16 +89,6 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv,
     if (value) responseHeaders.set(name, value);
   }
   responseHeaders.set('X-Content-Type-Options', 'nosniff');
-  const response = new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText,
+  return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText,
     headers: responseHeaders });
-  const upstreamContentType = (upstream.headers.get('Content-Type') || '').toLowerCase();
-  if (imageCacheKey && upstream.ok && upstreamContentType.startsWith('image/')) {
-    const cachedResponse = response.clone();
-    cachedResponse.headers.set('Cache-Control', EDGE_IMAGE_CACHE_CONTROL);
-    cachedResponse.headers.delete(IMAGE_CACHE_HEADER);
-    ctx.waitUntil(mediaImageCache().put(imageCacheKey, cachedResponse).catch(() => undefined));
-    return browserImageResponse(response, 'MISS');
-  }
-  if (ARTICLE_IMAGE_PATH.test(incoming.pathname)) response.headers.set(IMAGE_CACHE_HEADER, 'BYPASS');
-  return response;
 }
