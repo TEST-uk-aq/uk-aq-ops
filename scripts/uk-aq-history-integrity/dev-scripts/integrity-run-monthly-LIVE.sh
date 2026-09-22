@@ -29,6 +29,8 @@ LOCAL_INTEGRITY_ROOT="$(cd -P -- "$(dirname -- "$INTEGRITY")/.." && pwd -P)"
 REPOSITORY_SELECTOR="$LOCAL_INTEGRITY_ROOT/env/${INTEGRITY_ENV}.env"
 OPS_REPO_ROOT=""
 DROPBOX_BACKUP_ROOT=""
+OBSERVATION_HISTORY_VERSION=""
+LOCAL_CHECKPOINT_ROOT=""
 
 log() {
   echo "$(date -u +%FT%TZ) $*" | tee -a "$SUMMARY"
@@ -205,7 +207,10 @@ if "archive" in root.parts:
     raise SystemExit("resolved R2 history Dropbox root points into archive")
 if not root.is_dir():
     raise SystemExit(f"resolved R2 history Dropbox root is not a directory: {root}")
-print(root.resolve())
+history_version = values.get("UK_AQ_R2_HISTORY_VERSION", "").strip()
+if history_version not in {"v2", "v3"}:
+    raise SystemExit("UK_AQ_R2_HISTORY_VERSION must be exactly v2 or v3")
+print(f"{root.resolve()}\t{history_version}")
 PY
 }
 
@@ -244,10 +249,13 @@ PY
   rm -f "$remote_workflow"
 
   OPS_REPO_ROOT="$(resolve_ops_repo_root)" || fail "cannot resolve the ${INTEGRITY_ENV} repository selected by the Integrity dispatcher"
-  DROPBOX_BACKUP_ROOT="$(resolve_dropbox_backup_root)" || fail "local Dropbox backup root/checkpoint location cannot be resolved"
+  local dropbox_config
+  dropbox_config="$(resolve_dropbox_backup_root)" || fail "local Dropbox backup root/checkpoint location cannot be resolved"
+  IFS=$'\t' read -r DROPBOX_BACKUP_ROOT OBSERVATION_HISTORY_VERSION <<<"$dropbox_config"
   [ -r "$DROPBOX_BACKUP_ROOT" ] || fail "local Dropbox backup root is not readable: ${DROPBOX_BACKUP_ROOT}"
-  local checkpoint_location="$DROPBOX_BACKUP_ROOT/_ops/checkpoints/r2_history_backup_state_v2/root.json"
-  log "PREFLIGHT OK selected_repository=${OPS_REPO_ROOT} local_backup_root=${DROPBOX_BACKUP_ROOT} checkpoint_location=${checkpoint_location}"
+  LOCAL_CHECKPOINT_ROOT="$DROPBOX_BACKUP_ROOT/_ops/checkpoints/r2_history_backup_state_v2/observation_generation=${OBSERVATION_HISTORY_VERSION}/root.json"
+  [ -r "$LOCAL_CHECKPOINT_ROOT" ] || fail "generation-specific local Dropbox checkpoint is not readable: ${LOCAL_CHECKPOINT_ROOT}"
+  log "PREFLIGHT OK selected_repository=${OPS_REPO_ROOT} local_backup_root=${DROPBOX_BACKUP_ROOT} observation_history_version=${OBSERVATION_HISTORY_VERSION} checkpoint_location=${LOCAL_CHECKPOINT_ROOT}"
 }
 
 append_connector_totals() {
@@ -335,10 +343,27 @@ print(f"{run['id']}\t{run['html_url']}")
 PY
 }
 
+record_backup_failure() {
+  local receipt_path="$1"
+  local label="$2"
+  local caller_run_id="$3"
+  local run_id="$4"
+  local run_url="$5"
+  local status="$6"
+  local conclusion="$7"
+  local reason="$8"
+  write_receipt "$receipt_path" "phase=backup_failed" "label=$label" \
+    "caller_run_id=$caller_run_id" "run_id=$run_id" "run_url=$run_url" \
+    "status=$status" "conclusion=$conclusion" "reason=$reason"
+  log "BACKUP FAILURE EVIDENCE label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} status=${status} conclusion=${conclusion} receipt=${receipt_path}"
+}
+
 resolve_exact_run() {
   local caller_run_id="$1"
   local dispatch_receipt="$2"
-  local label="$3"
+  local backup_receipt="$3"
+  local sync_receipt="$4"
+  local label="$5"
   local deadline=$(( $(date +%s) + DISCOVERY_TIMEOUT_SECONDS ))
   local runs_json result count
   runs_json="$(mktemp)"
@@ -355,36 +380,58 @@ resolve_exact_run() {
     else
       count="${result:-query_failed}"
       if [ "$count" != "0" ] && [ "$count" != "query_failed" ]; then
-        rm -f "$runs_json"
-        fail "backup run correlation is ambiguous for ${caller_run_id}: matches=${count}"
+        local ambiguity_receipt="$LOG_ROOT/${label}.backup-dispatch-unresolved-${caller_run_id}.json"
+        write_receipt "$ambiguity_receipt" "phase=backup_dispatch_unresolved" "label=$label" \
+          "caller_run_id=$caller_run_id" "status=ambiguous" "matches=$count"
+        rm -f "$runs_json" "$dispatch_receipt" "$backup_receipt" "$sync_receipt"
+        fail "backup run correlation is ambiguous for ${caller_run_id}: matches=${count}; incomplete dispatch state cleared for a later fresh attempt; evidence=${ambiguity_receipt}"
         return 1
       fi
     fi
     log "BACKUP DISCOVERY waiting caller_run_id=${caller_run_id}"
     sleep "$DISCOVERY_POLL_SECONDS"
   done
-  rm -f "$runs_json"
-  fail "timed out resolving exact backup run for ${caller_run_id}"
+  local unresolved_receipt="$LOG_ROOT/${label}.backup-dispatch-unresolved-${caller_run_id}.json"
+  write_receipt "$unresolved_receipt" "phase=backup_dispatch_unresolved" "label=$label" \
+    "caller_run_id=$caller_run_id" "status=not_resolved" "conclusion=unconfirmed"
+  rm -f "$runs_json" "$dispatch_receipt" "$backup_receipt" "$sync_receipt"
+  fail "timed out resolving exact backup run for ${caller_run_id}; incomplete dispatch state cleared for a later fresh attempt; evidence=${unresolved_receipt}"
 }
 
 wait_for_backup_run() {
   local run_id="$1"
+  local run_url="$2"
+  local caller_run_id="$3"
+  local label="$4"
+  local dispatch_receipt="$5"
+  local backup_receipt="$6"
+  local sync_receipt="$7"
   local deadline=$(( $(date +%s) + BACKUP_TIMEOUT_SECONDS ))
   local record status conclusion url
   while [ "$(date +%s)" -le "$deadline" ]; do
-    if ! record="$(gh run view "$run_id" --repo "$BACKUP_REPOSITORY" --json status,conclusion,url --jq '[.status, (.conclusion // ""), .url] | @tsv' 2>/dev/null)"; then
-      fail "exact backup run ${run_id} disappeared or cannot be read"
+    if ! record="$(gh run view "$run_id" --repo "$BACKUP_REPOSITORY" --json status,conclusion,url --jq '[.status, (.conclusion // ""), .url] | join("|")' 2>/dev/null)"; then
+      local unavailable_receipt="$LOG_ROOT/${label}.backup-run-unconfirmed-${run_id}.json"
+      write_receipt "$unavailable_receipt" "phase=backup_run_unconfirmed" "label=$label" \
+        "caller_run_id=$caller_run_id" "run_id=$run_id" "run_url=$run_url" \
+        "status=unavailable" "conclusion=unconfirmed" "reason=exact_run_unreadable"
+      fail "exact backup run ${run_id} disappeared or cannot be read; resolved exact-run state retained for retry; evidence=${unavailable_receipt}"
       return 1
     fi
-    IFS=$'\t' read -r status conclusion url <<<"$record"
+    IFS='|' read -r status conclusion url <<<"$record"
     log "BACKUP POLL run_id=${run_id} status=${status} conclusion=${conclusion:-pending} url=${url}"
     if [ "$status" = "completed" ]; then
-      [ "$conclusion" = "success" ] || { fail "exact backup run ${run_id} concluded ${conclusion}"; return 1; }
+      if [ "$conclusion" != "success" ]; then
+        local failure_receipt="$LOG_ROOT/${label}.backup-failure-${run_id}.json"
+        record_backup_failure "$failure_receipt" "$label" "$caller_run_id" "$run_id" "$url" "$status" "${conclusion:-unknown}" "terminal_non_success"
+        rm -f "$dispatch_receipt" "$backup_receipt" "$sync_receipt"
+        fail "exact backup run ${run_id} concluded ${conclusion:-unknown}; failed backup state cleared for a later fresh attempt"
+        return 1
+      fi
       return 0
     fi
     sleep "$BACKUP_POLL_SECONDS"
   done
-  fail "timed out waiting for exact backup run ${run_id}"
+  fail "timed out waiting for exact backup run ${run_id}; resolved run state retained for continued polling on rerun"
 }
 
 validate_backup_report() {
@@ -513,6 +560,8 @@ run_batch() {
       log "BACKUP DISCOVERY RESUME label=${label} caller_run_id=${caller_run_id}"
     else
       caller_run_id="integrity-monthly-${INTEGRITY_ENV}-${BATCH_ID}-after-${label}"
+      rm -f "$backup_receipt" "$sync_receipt"
+      rm -rf "$artifact_dir"
       write_receipt "$dispatch_receipt" "phase=backup_dispatch_requested" "label=$label" "caller_run_id=$caller_run_id"
       log "BACKUP DISPATCH label=${label} caller_run_id=${caller_run_id} repository=${BACKUP_REPOSITORY} max_days_per_run=0"
       if ! gh workflow run "$BACKUP_WORKFLOW" --repo "$BACKUP_REPOSITORY" \
@@ -522,7 +571,7 @@ run_batch() {
         return 1
       fi
     fi
-    resolve_exact_run "$caller_run_id" "$dispatch_receipt" "$label" || return 1
+    resolve_exact_run "$caller_run_id" "$dispatch_receipt" "$backup_receipt" "$sync_receipt" "$label" || return 1
     run_id="$(json_field "$dispatch_receipt" run_id)"
     run_url="$(json_field "$dispatch_receipt" run_url)"
   fi
@@ -537,7 +586,7 @@ run_batch() {
     [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || { fail "persisted backup receipt has invalid expected hash"; return 1; }
     log "BACKUP SUCCESS RESUME label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} status=${backup_status} conclusion=${backup_conclusion} expected_hash=${expected_hash}"
   else
-    wait_for_backup_run "$run_id" || return 1
+    wait_for_backup_run "$run_id" "$run_url" "$caller_run_id" "$label" "$dispatch_receipt" "$backup_receipt" "$sync_receipt" || return 1
     backup_status="completed"
     backup_conclusion="success"
     rm -rf "$artifact_dir"
