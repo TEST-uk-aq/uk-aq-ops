@@ -265,19 +265,14 @@ Run the TEST collector on the MacBook Pro using launchd.
 Recommended normal cadence:
 
 ```text
-hourly
+daily
 ```
 
-The logs are for analysis rather than real-time alerting, so minute-level export is unnecessary.
+The Dropbox archive is primarily for historical service-usage, cost and configuration analysis, while Cloud Logging remains the recent operational troubleshooting source. Daily collection therefore provides enough continuity without keeping a near-real-time duplicate archive.
 
-Hourly collection gives:
+The launchd job uses `StartInterval=86400`. If a more current Dropbox copy is wanted for a specific investigation, the operator can trigger the launchd job immediately with `launchctl kickstart -k` or run the incremental collector manually. The incremental checkpoint, two-hour overlap and settling delay still make that catch-up resumable and safe.
 
-- reasonably fresh local evidence;
-- many opportunities to recover automatically from a transient failure;
-- small bounded queries;
-- minimal pressure to run cloud-side export infrastructure.
-
-A daily compaction/finalisation step is not required if the hourly collector safely replaces affected daily archives.
+A separate daily compaction/finalisation step is not required because each incremental run safely replaces affected daily archives.
 
 ## Retention
 
