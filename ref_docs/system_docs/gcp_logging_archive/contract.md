@@ -18,14 +18,19 @@ The Dropbox-retained archive generation has this logical layout:
 
 ```text
 <archive_root>/
-  GCP Logs/
-    TEST/
+  TEST/
+    GCP Logs/
       archive-identity.json
       raw/
         YYYY/
           MM/
             YYYY-MM-DD.jsonl.gz
 ```
+
+The environment directory is deliberately above `GCP Logs`. A future
+separately authorised LIVE implementation therefore uses the sibling layout
+`<archive_root>/LIVE/GCP Logs/`; TEST and LIVE archive generations MUST NOT be
+nested under one shared `GCP Logs` directory.
 
 Checkpoint state and operator run evidence MUST remain outside the Dropbox raw archive. Their locations are explicit local configuration.
 
@@ -170,7 +175,20 @@ A collector failure MUST remain isolated from all running UK AQ cloud workloads.
 
 A path-only move is compatible only when the complete archive generation is moved intact with unchanged source scope, `archive_id` and redaction policy.
 
-Before changing the configured path, the operator MUST stop scheduled collection, complete and verify the archive move, preserve identity/checkpoint evidence, then update the manifest and checkpoints to the verified resolved destination. Existing progress MUST NOT be pointed at an empty or partial destination.
+Before changing the effective archive path, the operator MUST stop scheduled
+collection, complete and verify the archive move, preserve
+identity/checkpoint evidence, then update the manifest and checkpoints to the
+verified resolved destination. Existing progress MUST NOT be pointed at an
+empty or partial destination.
+
+For the September 2026 TEST layout correction from
+`<archive_root>/GCP Logs/TEST` to `<archive_root>/TEST/GCP Logs`, the
+configured `archive_root` remains unchanged. The complete archive directory
+MUST be moved intact and verified first. Only the resolved
+`archive.archive_path` in the manifest, backfill checkpoint and incremental
+checkpoint may then change from the old `GCP Logs/TEST/raw` path to the new
+`TEST/GCP Logs/raw` path. Source identity, `archive_id`, redaction identity
+and both watermarks MUST remain unchanged.
 
 ## Credentials and security
 
