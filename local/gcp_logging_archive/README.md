@@ -43,6 +43,12 @@ setting. The Google identity needs only `logging.logEntries.list` (normally the
   history in a new/empty destination and prevents a changed sanitisation policy
   from merging incompatible fallback identities or leaving older sensitive
   values untouched.
+- A separate `<archive_root>/GCP Logs/TEST/archive-identity.json` manifest binds
+  the same source, archive destination and redaction identities to the archive
+  itself. All three modes validate it before constructing the Cloud Logging
+  client or changing daily files. The collector creates it with exclusive file
+  creation only when the raw archive is genuinely empty; a non-empty archive
+  without a manifest is rejected even when the state directory is new.
 
 Cloud Logging fields are otherwise preserved, including structured payloads,
 resource labels, severity, event/receive timestamps, trace/span data, and HTTP
@@ -151,11 +157,13 @@ without changing the stored `source` object.
 For a path-only move with unchanged contents and redaction policy, stop
 launchd, wait for Dropbox to finish, copy/move the complete `GCP Logs/TEST`
 tree, verify daily file counts and hashes at the destination, change
-`archive_root`, and preserve the checkpoints before updating only their
-`archive.archive_path` to the resolved new `GCP Logs/TEST/raw` path. Keep the
-same `archive_id`. Run one overlapping incremental collection manually and
+`archive_root`, and preserve the manifest and checkpoints before updating only
+their `archive.archive_path` values to the resolved new `GCP Logs/TEST/raw`
+path. Keep the same `archive_id`, source and redaction identities in every
+file. Run one overlapping incremental collection manually and
 verify it before re-enabling launchd. Never point an existing checkpoint at an
-empty or partial destination.
+empty or partial destination, and never delete the manifest to make a moved or
+incompatible archive appear new.
 
 A `redact_paths` change is intentionally incompatible, including a change that
 only adds a sensitive path: fallback identities are calculated from the
@@ -176,7 +184,8 @@ historical re-sanitisation instead:
    prohibited fields are absent. Run one manual incremental collection.
 5. Atomically rename the verified staging `GCP Logs/TEST` directory into its
    final Dropbox location on the same filesystem, update `archive_root` if
-   needed, and apply the verified path-only checkpoint move procedure above.
+   needed, and apply the verified path-only manifest/checkpoint move procedure
+   above.
 6. Re-enable launchd, then securely delete the superseded archive only after
    the retention/rollback decision is approved.
 
@@ -196,14 +205,16 @@ local/scripts/run_gcp_logging_archive_test.sh incremental
 
 The template does not contain a user name or machine path and does not alter
 the existing dashboard or cloudflared jobs. Render and load it after the manual
-incremental run succeeds:
+incremental run succeeds. The renderer uses `plistlib`, rather than raw XML
+text replacement, so repository paths containing `&` or other XML-sensitive
+characters remain valid:
 
 ```bash
 cd "/path/to/TEST-uk-aq-ops"
 mkdir -p logs "$HOME/Library/LaunchAgents"
-python3 -c 'import pathlib,sys; root=str(pathlib.Path.cwd()); print(pathlib.Path(sys.argv[1]).read_text().replace("__REPO_ROOT__", root))' \
+python3 local/scripts/render_gcp_logging_archive_launchd.py \
   local/launchd/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist.example \
-  > "$HOME/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist"
+  "$HOME/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist"
 plutil -lint "$HOME/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist"
 launchctl bootstrap "gui/$(id -u)" \
   "$HOME/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.gcp-logging-archive.test.plist"
@@ -233,6 +244,14 @@ checkpoint causes the entire incomplete interval to be safely replayed. A
 stale `collector.lock` file is harmless; the operating-system lock ends with
 the process. Do not delete or advance checkpoints merely because a daily file
 was already replaced.
+
+If manifest creation is interrupted while initialising an empty archive, rerun
+the same command: exclusive creation and directory syncing ensure the next run
+either validates a complete manifest or safely creates it again. If manifest
+validation fails, no retrieval or daily-file mutation has occurred. Restore the
+matching configuration/manifest or follow the deliberate move/rebuild process;
+do not remove the manifest or change identity fields merely to bypass the
+failure.
 
 `run-report.json` records the TEST project, source/filter fingerprint, archive
 identity/destination, redaction paths/fingerprint,

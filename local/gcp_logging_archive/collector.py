@@ -27,6 +27,7 @@ UTC = dt.timezone.utc
 LOG = logging.getLogger("uk_aq_gcp_log_archive")
 MAX_REPORTED_WINDOWS = 100
 MAX_REPORTED_FILES_PER_WINDOW = 100
+ARCHIVE_MANIFEST_SCHEMA_VERSION = 1
 
 
 class InterruptedRun(Exception):
@@ -97,6 +98,65 @@ def redaction_identity(config: dict) -> dict:
         "paths": paths,
         "redaction_fingerprint": hashlib.sha256(canonical(paths)).hexdigest(),
     }
+
+
+def expected_archive_manifest(config: dict) -> dict:
+    return {
+        "schema_version": ARCHIVE_MANIFEST_SCHEMA_VERSION,
+        "environment": "TEST",
+        "source": source_identity(config),
+        "archive": archive_identity(config),
+        "redaction": redaction_identity(config),
+    }
+
+
+def validate_archive_manifest(path: Path, actual: object, expected: dict) -> None:
+    if not isinstance(actual, dict):
+        raise RuntimeError(f"archive identity manifest is not a JSON object: {path}")
+    mismatches = [key for key in ("schema_version", "environment", "source", "archive", "redaction")
+                  if actual.get(key) != expected[key]]
+    if mismatches:
+        raise RuntimeError(
+            f"archive identity manifest mismatch at {path} for {', '.join(mismatches)}; "
+            "do not merge into this archive—restore the matching configuration, complete a verified archive "
+            "relocation, or rebuild history into a new empty archive_id/destination"
+        )
+
+
+def ensure_archive_manifest(config: dict) -> Path:
+    raw_path = Path(archive_identity(config)["archive_path"])
+    manifest_path = raw_path.parent / "archive-identity.json"
+    expected = expected_archive_manifest(config)
+    if manifest_path.exists():
+        validate_archive_manifest(manifest_path, json.loads(manifest_path.read_text(encoding="utf-8")), expected)
+        return manifest_path
+    if raw_path.exists() and any(item.is_file() for item in raw_path.rglob("*")):
+        raise RuntimeError(
+            f"refusing to initialise missing archive identity manifest {manifest_path}: raw archive "
+            f"{raw_path} is not empty; quarantine/rebuild it or restore its reviewed manifest"
+        )
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(expected, sort_keys=True, indent=2) + "\n"
+    try:
+        descriptor = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        validate_archive_manifest(manifest_path, json.loads(manifest_path.read_text(encoding="utf-8")), expected)
+        return manifest_path
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        directory_fd = os.open(manifest_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            manifest_path.unlink()
+        raise
+    return manifest_path
 
 
 def identity(entry: dict) -> str:
@@ -413,6 +473,9 @@ def main() -> int:
 
     try:
         now = dt.datetime.now(UTC)
+        manifest_path = ensure_archive_manifest(config)
+        report["archive_manifest"] = str(manifest_path)
+        atomic_json(report_path, report)
         if args.mode == "incremental":
             cp_path = state_dir / "incremental.json"
             cp = checkpoint(cp_path, report["source"], report["archive"], report["redaction"])
