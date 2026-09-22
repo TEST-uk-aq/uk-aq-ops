@@ -126,7 +126,7 @@ After Step 0 succeeds, the Dropbox baseline is pinned and becomes the pre-apply 
 
 ### Serial monthly wrapper boundary
 
-A wrapper that executes multiple historical months serially MAY satisfy the next invocation's freshness/currentness requirement by running the normal R2 History Dropbox Backup after each successful month and waiting for that exact backup generation to reach the local Dropbox mirror before starting the next month.
+A wrapper that executes multiple historical months serially MAY satisfy the next invocation's freshness/currentness requirement by running the normal R2 History Dropbox Backup after each successful month and waiting for that exact backup generation to reach the local Dropbox mirror before starting the next month. For this wrapper boundary, "reach the local Dropbox mirror" means both the matching generation-specific checkpoint identity is locally present **and** the refreshed local files required by the next SOS-light baseline have passed the read-only materialisation/authentication gate defined in [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md). Checkpoint-root arrival by itself is not sufficient evidence of local materialisation.
 
 This is external operator orchestration, not a fourth SOS-light repair phase. It MUST follow the serial-monthly rules in [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md). The preceding SOS-light invocation releases the global observations operation lock before the backup begins; the backup acquires that same global lock for its covered operation; the next SOS-light invocation then acquires the lock and performs this complete Step 0 again.
 

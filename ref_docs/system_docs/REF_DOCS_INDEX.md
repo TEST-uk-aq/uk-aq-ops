@@ -18,7 +18,7 @@ Source repository:
 
 Source commit:
 
-`85b56a9f918b89e9c34ea79118f98ef6d9c634b4`
+`431fba1d3e52dc3a645108d456c65d7b9d6cf55f`
 
 Snapshot date:
 
@@ -80,6 +80,6 @@ The authoritative SOS-light contract now requires:
 - APPLY only the frozen changed/removed set, then verify those R2 results;
 - no pre-apply live-R2 observation/index dependency discovery beyond the single Step 0 observations-root hash comparison;
 - no normal Dropbox backup expansion for v3 scoped-root dependency evidence.
-- serial monthly SOS-light wrappers refresh Dropbox after every successful month, including the final month; correlate and wait for the exact backup run; wait for that backup generation to reach the local checkpoint; do not use `--allow-stale-dropbox`; stop on month/backup/sync failure; and do not use a fixed cooldown.
+- serial monthly SOS-light wrappers refresh Dropbox after every successful month, including the final month; correlate and wait for the exact backup run; wait for that backup generation to reach the local checkpoint; do not use `--allow-stale-dropbox`; stop on month/backup/sync failure; and do not use a fixed cooldown. The local checkpoint root alone is insufficient: refreshed files consumed by the next SOS-light baseline must also pass the exact-run local materialisation/authentication gate.
 
 PR #69's scoped-root backup expansion was reverted. The normal v3 backup continues to carry the generation-selected compact `observations_timeseries_latest.json` but not the full derived scoped/exact index tree.

@@ -212,6 +212,23 @@ Calls that do not provide a correlation identifier retain the existing scheduled
 
 The correlation mechanism does not weaken writer coordination. The workflow continues to run the normal hierarchical backup under the shared global observations operation lock and publishes checkpoint completion according to the existing sync contract.
 
+### Local Dropbox client materialisation boundary
+
+A successful GitHub-hosted backup proves the Dropbox-cloud destination and checkpoint publication performed by that workflow. It does **not** by itself prove that a separate local Dropbox desktop client has downloaded every refreshed payload file before downloading the checkpoint root.
+
+For chained local consumers such as the serial monthly SOS-light wrapper:
+
+- matching the local generation-specific checkpoint root to the exact successful backup report is necessary but MUST NOT be treated as sufficient local-sync evidence;
+- the caller MUST perform a bounded, read-only local-materialisation verification before treating the refresh as complete;
+- verification MUST be tied to the same exact backup run and use its backup report plus the authenticated generation-specific checkpoint/state hierarchy;
+- the verifier MUST authenticate the local payload units newly copied or replaced by that exact backup which are within the next SOS-light baseline authority. Observation days copied by the backup MUST have their complete local manifest/Parquet dependency graph readable and identity-consistent. Any changed core or active timeseries-binding backup units consumed by SOS-light MUST likewise be locally readable and match their checkpoint/manifest/pack identities;
+- the verifier MAY use existing checkpoint state-shard `copied_at` and identity evidence together with the exact backup report's run interval when the report does not already enumerate a changed unit directly;
+- the verifier MUST fail closed on a missing, placeholder/unreadable, truncated or identity-mismatched local file and continue bounded polling while Dropbox is still materialising it;
+- the verifier MUST NOT query live R2 to decide local completeness, mutate Dropbox/R2, or turn local file arrival into a new source of truth;
+- unchanged payload units already authenticated by the preceding accepted local baseline do not need to be re-hashed merely because a new checkpoint root was published.
+
+The local-materialisation gate is consumer-side orchestration evidence. It does not change backup checkpoint format, cloud backup success semantics or SOS-light Step 0 authority.
+
 ## Packed binding transport boundary
 
 Phase 1, Phase 2, Phase 3, Phase 4 and Phase 5 are implemented and accepted on TEST. The pack contract is current authority for the implemented pack format, R2 pack publication, additive inventory identity, guarded pack Dropbox transport, destination verification, pack checkpoint state, root-last completion semantics, pack-aware SOS-light Integrity materialisation/currentness behaviour, dedicated exact-byte pack-to-individual binding restore behaviour and the normal scheduled/default TEST binding payload.
