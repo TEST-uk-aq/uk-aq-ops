@@ -1,10 +1,16 @@
 name: UK AQ R2 History Dropbox Backup
+run-name: ${{ inputs.caller_run_id != '' && format('UK AQ R2 History Dropbox Backup [{0}]', inputs.caller_run_id) || 'UK AQ R2 History Dropbox Backup' }}
 
 on:
   # Intended external schedule:
   #   04:35 UTC daily via Cloudflare Worker
   workflow_dispatch:
     inputs:
+      caller_run_id:
+        description: "Optional orchestration correlation identifier (metadata only)"
+        required: false
+        default: ""
+        type: string
       dry_run:
         description: "Run without writing Dropbox copy/checkpoint/prune changes"
         required: false
