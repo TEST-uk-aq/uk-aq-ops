@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 
+from google.api_core import exceptions as api_exceptions
 from google.cloud.logging_v2.services.logging_service_v2 import LoggingServiceV2Client
 from google.protobuf.json_format import MessageToDict
 
@@ -227,6 +228,19 @@ class Collector:
         self.archive = Path(os.path.expanduser(config["archive_root"])) / "GCP Logs/TEST/raw"
         self.state = Path(os.path.expanduser(config["state_dir"]))
         self.redact = config.get("redact_paths", [])
+        self.min_read_interval_seconds = float(config.get("min_read_interval_seconds", 1.5))
+        self.quota_retry_initial_seconds = float(config.get("quota_retry_initial_seconds", 5.0))
+        self.quota_retry_max_seconds = float(config.get("quota_retry_max_seconds", 60.0))
+        self.quota_retry_timeout_seconds = float(config.get("quota_retry_timeout_seconds", 600.0))
+        if self.min_read_interval_seconds <= 0:
+            raise ValueError("min_read_interval_seconds must be positive")
+        if self.quota_retry_initial_seconds <= 0:
+            raise ValueError("quota_retry_initial_seconds must be positive")
+        if self.quota_retry_max_seconds < self.quota_retry_initial_seconds:
+            raise ValueError("quota_retry_max_seconds must be >= quota_retry_initial_seconds")
+        if self.quota_retry_timeout_seconds <= 0:
+            raise ValueError("quota_retry_timeout_seconds must be positive")
+        self._next_read_at = 0.0
         self.client = LoggingServiceV2Client()
 
     def filter(self, start: dt.datetime | None, end: dt.datetime | None, field: str) -> str:
@@ -237,22 +251,69 @@ class Collector:
             clauses.append(f'{field} < "{stamp(end)}"')
         return " AND ".join(clauses)
 
+    def _wait_for_read_slot(self) -> None:
+        delay = self._next_read_at - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        self._next_read_at = time.monotonic() + self.min_read_interval_seconds
+
+    def _read_page(self, request: dict):
+        retry_delay = self.quota_retry_initial_seconds
+        retry_deadline = time.monotonic() + self.quota_retry_timeout_seconds
+        attempt = 0
+        while True:
+            self._wait_for_read_slot()
+            try:
+                # Disable the generated client's opaque retry loop so every
+                # entries.list attempt is paced and quota retries are visible.
+                return self.client.list_log_entries(request=request, retry=None)
+            except (api_exceptions.ResourceExhausted, api_exceptions.TooManyRequests) as error:
+                attempt += 1
+                now = time.monotonic()
+                if now + retry_delay > retry_deadline:
+                    LOG.error(
+                        "cloud_logging_quota_retry_exhausted attempts=%d timeout_seconds=%.1f error_type=%s",
+                        attempt,
+                        self.quota_retry_timeout_seconds,
+                        type(error).__name__,
+                    )
+                    raise
+                LOG.warning(
+                    "cloud_logging_quota_retry attempt=%d sleep_seconds=%.1f error_type=%s",
+                    attempt,
+                    retry_delay,
+                    type(error).__name__,
+                )
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, self.quota_retry_max_seconds)
+
     def read(self, start: dt.datetime | None, end: dt.datetime | None, field="receiveTimestamp", limit=None):
-        request = {
+        base_request = {
             "resource_names": [f"projects/{self.project}"],
             "filter": self.filter(start, end, field),
             "order_by": "timestamp asc",
             "page_size": int(self.config.get("page_size", 1000)),
         }
-        iterator = self.client.list_log_entries(request=request)
         count = 0
-        for proto in iterator:
-            entry = MessageToDict(proto._pb, preserving_proto_field_name=False)
-            for path in self.redact:
-                delete_path(entry, path)
-            yield entry
-            count += 1
-            if limit and count >= limit:
+        page_token = ""
+        while True:
+            request = dict(base_request)
+            if page_token:
+                request["page_token"] = page_token
+            pager = self._read_page(request)
+            # list_log_entries has already fetched the first page. Taking the
+            # first pager page here does not issue another API request.
+            page = next(pager.pages)
+            for proto in page.entries:
+                entry = MessageToDict(proto._pb, preserving_proto_field_name=False)
+                for path in self.redact:
+                    delete_path(entry, path)
+                yield entry
+                count += 1
+                if limit and count >= limit:
+                    return
+            page_token = page.next_page_token
+            if not page_token:
                 return
 
     def daily_path(self, day: str) -> Path:
@@ -380,6 +441,12 @@ def new_report(config: dict, args: argparse.Namespace, run_id: str, run_start: d
         "redaction": redaction_identity(config),
         "archive_root": config["archive_root"],
         "overlap_seconds": int(config.get("overlap_seconds", 7200)) if args.mode == "incremental" else None,
+        "api_read_control": {
+            "min_read_interval_seconds": float(config.get("min_read_interval_seconds", 1.5)),
+            "quota_retry_initial_seconds": float(config.get("quota_retry_initial_seconds", 5.0)),
+            "quota_retry_max_seconds": float(config.get("quota_retry_max_seconds", 60.0)),
+            "quota_retry_timeout_seconds": float(config.get("quota_retry_timeout_seconds", 600.0)),
+        },
         "query_summary": {
             "window_count": 0,
             "source_entries_returned": 0,
