@@ -81,7 +81,7 @@ The overlap protects against delayed delivery. Entries are still partitioned int
 
 The initial incremental run MAY use a configured bounded lookback when no incremental checkpoint exists.
 
-The normal schedule is hourly via TEST-specific launchd. The agreed cadence is `StartInterval=3600`; this contract does not authorise changing other UK AQ schedules.
+The normal schedule is daily via TEST-specific launchd using `StartInterval=86400`. Cloud Logging remains the recent troubleshooting source; the Dropbox archive is primarily retained for historical service-usage, cost and configuration analysis. An operator MAY trigger the launchd job or run incremental collection manually when a more current archive copy is wanted. This contract does not authorise changing other UK AQ schedules.
 
 ## Backfill and bounded range
 
