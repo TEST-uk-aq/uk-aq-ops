@@ -17,9 +17,13 @@ setting. The Google identity needs only `logging.logEntries.list` (normally the
   a settling delay. Entries are still filed by their original `timestamp`, so a
   late entry is merged into its older event-day file.
 - Backfill and manual ranges use bounded, half-open event-time windows. The
-  client library consumes every API page. Backfill discovers the earliest
-  matching retained entry when no start is supplied and records that real
-  boundary in its report; it does not imply that expired history exists.
+  collector consumes every API page explicitly. Cloud Logging `entries.list`
+  calls are paced to a 1.5-second minimum interval by default, keeping this
+  collector below the project-wide 60 requests/minute limit, and HTTP 429 /
+  `ResourceExhausted` responses use bounded exponential retry/backoff. Backfill
+  discovers the earliest matching retained entry when no start is supplied and
+  records that real boundary in its report; it does not imply that expired
+  history exists.
 - An entry with `insertId` is identified by the hash of log name, resource, and
   insert ID. Otherwise a stable hash of the complete entry except
   `receiveTimestamp` is used. Existing and new records are merged by identity.
@@ -80,6 +84,10 @@ chmod 600 "$HOME/.config/uk-aq/gcp-logging-archive-test.json"
 
 Edit every `REPLACE_WITH_...` value. `archive_id` is a stable, TEST-only
 identity for this archive generation; do not reuse it for a separate rebuild.
+The example also carries the default Cloud Logging read controls:
+`min_read_interval_seconds=1.5`, retry delays from 5 to 60 seconds, and a
+600-second retry timeout. These operational controls do not change archive,
+source or redaction identity.
 `archive_root` is the explicitly selected
 Dropbox root; the collector appends `GCP Logs/TEST/raw`. Keep `state_dir`
 outside Dropbox so sync conflicts cannot become checkpoint authority. Keep
@@ -239,8 +247,10 @@ small bounded interval's count and timestamps with the Cloud Logging console.
 Confirm an overlapping second run adds no duplicates.
 
 For a failed/interrupted run, inspect its report and log, correct the cause
-(credentials, filter, disk space, Dropbox availability), and rerun. The old
-checkpoint causes the entire incomplete interval to be safely replayed. A
+(credentials, filter, disk space, Dropbox availability), and rerun. A transient
+Cloud Logging quota response is retried automatically within the configured
+bounded timeout; if retries are exhausted, the old checkpoint causes the
+entire incomplete interval to be safely replayed. A
 stale `collector.lock` file is harmless; the operating-system lock ends with
 the process. Do not delete or advance checkpoints merely because a daily file
 was already replaced.
@@ -254,7 +264,8 @@ do not remove the manifest or change identity fields merely to bypass the
 failure.
 
 `run-report.json` records the TEST project, source/filter fingerprint, archive
-identity/destination, redaction paths/fingerprint,
+identity/destination, redaction paths/fingerprint, configured Cloud Logging
+read pacing/retry controls,
 source timestamp field and bounded query-window evidence, incremental overlap,
 source/unique/new/duplicate counts, affected dates and files, bytes written,
 resulting watermark, final status and exit code, and bounded error details. A
