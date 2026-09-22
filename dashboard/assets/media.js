@@ -1145,8 +1145,7 @@
           expected_proposed_image_url: data.changes.image?.expected_proposed_image_url ?? null,
           replace_existing_image: Boolean(data.changes.image?.replacement_required),
           apply_publisher_display_title: true,
-          expected_current_published_at:
-            data.changes.published_at?.current ?? article.published_at ?? null,
+          expected_current_published_at: data.changes.published_at?.current ?? null,
           expected_proposed_published_at: data.changes.published_at?.proposed ?? null,
           apply_publisher_published_at: Boolean(data.changes.published_at),
         } }); output.innerHTML = message("Metadata applied without changing editorial state.", "success"); void renderArticles(false); }
