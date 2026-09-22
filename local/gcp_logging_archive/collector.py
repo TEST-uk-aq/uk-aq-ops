@@ -25,6 +25,16 @@ from google.protobuf.json_format import MessageToDict
 
 UTC = dt.timezone.utc
 LOG = logging.getLogger("uk_aq_gcp_log_archive")
+MAX_REPORTED_WINDOWS = 100
+MAX_REPORTED_FILES_PER_WINDOW = 100
+
+
+class InterruptedRun(Exception):
+    """Raised by the main-thread signal handler so final evidence is written."""
+
+    def __init__(self, signum: int):
+        super().__init__(f"interrupted by signal {signum}")
+        self.signum = signum
 
 
 def utc(value: str) -> dt.datetime:
@@ -60,6 +70,16 @@ def atomic_json(path: Path, value: object) -> None:
 
 def canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def source_identity(config: dict) -> dict:
+    source = {"project_id": config["project_id"], "log_filter": config["log_filter"]}
+    filter_sha256 = hashlib.sha256(config["log_filter"].encode()).hexdigest()
+    return {
+        "project_id": config["project_id"],
+        "filter_sha256": filter_sha256,
+        "source_fingerprint": hashlib.sha256(canonical(source)).hexdigest(),
+    }
 
 
 def identity(entry: dict) -> str:
@@ -118,7 +138,8 @@ class TeeHandler(logging.Handler):
         self.file.flush()
 
     def close(self):
-        self.file.close()
+        if not self.file.closed:
+            self.file.close()
         super().close()
 
 
@@ -161,8 +182,8 @@ class Collector:
         parsed = dt.date.fromisoformat(day)
         return self.archive / f"{parsed:%Y/%m}/{day}.jsonl.gz"
 
-    def publish(self, grouped: dict[str, list[dict]]) -> dict:
-        result = {}
+    def publish(self, grouped: dict[str, list[dict]]) -> list[dict]:
+        result = []
         for day in sorted(grouped):
             path = self.daily_path(day)
             existing: dict[str, dict] = {}
@@ -171,9 +192,11 @@ class Collector:
                     for line in stream:
                         item = json.loads(line)
                         existing[identity(item)] = item
-            before = len(existing)
-            for item in grouped[day]:
-                existing[identity(item)] = item
+            before_ids = set(existing)
+            incoming = grouped[day]
+            incoming_by_id = {identity(item): item for item in incoming}
+            for item_id, item in incoming_by_id.items():
+                existing[item_id] = item
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
             try:
@@ -192,29 +215,112 @@ class Collector:
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(name)
-            result[day] = {"entries": len(existing), "added": len(existing) - before, "path": str(path)}
+            new_entries = len(set(incoming_by_id) - before_ids)
+            result.append({
+                "archive_date": day,
+                "path": str(path),
+                "source_entries": len(incoming),
+                "unique_source_entries": len(incoming_by_id),
+                "new_entries": new_entries,
+                "duplicate_source_entries": len(incoming) - len(incoming_by_id),
+                "already_present_entries": len(set(incoming_by_id) & before_ids),
+                "duplicate_or_already_present_entries": len(incoming) - new_entries,
+                "resulting_entries": len(existing),
+                "bytes_written": path.stat().st_size,
+            })
         return result
 
-    def window(self, start: dt.datetime, end: dt.datetime, field: str) -> tuple[int, dict]:
+    def window(self, start: dt.datetime, end: dt.datetime, field: str) -> dict:
         grouped: dict[str, list[dict]] = {}
         count = 0
         with Heartbeat(f"retrieve_{stamp(start)}_{stamp(end)}"):
             for entry in self.read(start, end, field):
+                count += 1
                 event = entry.get("timestamp") or entry.get("receiveTimestamp")
                 if not event:
                     LOG.warning("entry_without_timestamp identity=%s", identity(entry))
                     continue
                 grouped.setdefault(utc(event).date().isoformat(), []).append(entry)
-                count += 1
         with Heartbeat("publish_daily_files"):
             published = self.publish(grouped)
-        return count, published
+        return {
+            "source_field": field,
+            "start": stamp(start),
+            "end": stamp(end),
+            "source_entries_returned": count,
+            "unique_source_entries": sum(item["unique_source_entries"] for item in published),
+            "new_entries": sum(item["new_entries"] for item in published),
+            "duplicate_source_entries": sum(item["duplicate_source_entries"] for item in published),
+            "already_present_entries": sum(item["already_present_entries"] for item in published),
+            "duplicate_or_already_present_entries": sum(item["duplicate_or_already_present_entries"] for item in published),
+            "affected_file_count": len(published),
+            "bytes_written": sum(item["bytes_written"] for item in published),
+            "affected_files": published[:MAX_REPORTED_FILES_PER_WINDOW],
+            "affected_files_omitted": max(0, len(published) - MAX_REPORTED_FILES_PER_WINDOW),
+        }
 
 
-def checkpoint(path: Path) -> dict:
+def checkpoint(path: Path, expected_source: dict) -> dict:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(path.read_text(encoding="utf-8"))
+    actual = value.get("source", {})
+    if actual.get("source_fingerprint") != expected_source["source_fingerprint"]:
+        raise RuntimeError(
+            f"checkpoint source mismatch at {path}: expected TEST project "
+            f"{expected_source['project_id']} and filter SHA-256 {expected_source['filter_sha256']}; "
+            "move the checkpoint aside and restart from an explicit safe boundary after reviewing source coverage"
+        )
+    return value
+
+
+def new_report(config: dict, args: argparse.Namespace, run_id: str, run_start: dt.datetime) -> dict:
+    return {
+        "schema_version": 2,
+        "run_id": run_id,
+        "environment": "TEST",
+        "mode": args.mode,
+        "started_at": stamp(run_start),
+        "status": "running",
+        "project_id": config["project_id"],
+        "source": source_identity(config),
+        "archive_root": config["archive_root"],
+        "overlap_seconds": int(config.get("overlap_seconds", 7200)) if args.mode == "incremental" else None,
+        "query_summary": {
+            "window_count": 0,
+            "source_entries_returned": 0,
+            "unique_source_entries": 0,
+            "new_entries": 0,
+            "duplicate_source_entries": 0,
+            "already_present_entries": 0,
+            "duplicate_or_already_present_entries": 0,
+            "affected_file_count": 0,
+            "bytes_written": 0,
+        },
+        "windows": [],
+        "windows_omitted": 0,
+    }
+
+
+def record_window(report: dict, window: dict) -> None:
+    summary = report["query_summary"]
+    summary["window_count"] += 1
+    summary.setdefault("first_start", window["start"])
+    summary["last_end"] = window["end"]
+    summary["source_field"] = window["source_field"]
+    for key in (
+        "source_entries_returned", "unique_source_entries", "new_entries",
+        "duplicate_source_entries", "already_present_entries",
+        "duplicate_or_already_present_entries", "affected_file_count", "bytes_written",
+    ):
+        summary[key] += window[key]
+    if len(report["windows"]) < MAX_REPORTED_WINDOWS:
+        report["windows"].append(window)
+    else:
+        report["windows_omitted"] += 1
+        report["last_omitted_window"] = {
+            key: window[key] for key in ("source_field", "start", "end", "source_entries_returned")
+        }
 
 
 def main() -> int:
@@ -239,11 +345,16 @@ def main() -> int:
     run_dir = Path(os.path.expanduser(config["run_evidence_root"])) / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     handler = TeeHandler(run_dir / "run.log")
-    handler.setFormatter(logging.Formatter("%(asctime)sZ %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
+    formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+    formatter.converter = time.gmtime
+    handler.setFormatter(formatter)
     LOG.addHandler(handler)
     LOG.setLevel(logging.INFO)
     LOG.info("run_start run_id=%s mode=%s environment=TEST pid=%d work_dir=%s", run_id, args.mode, os.getpid(), run_dir)
 
+    report = new_report(config, args, run_id, run_start)
+    report_path = run_dir / "run-report.json"
+    atomic_json(report_path, report)
     state_dir = Path(os.path.expanduser(config["state_dir"]))
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_stream = (state_dir / "collector.lock").open("a")
@@ -251,36 +362,49 @@ def main() -> int:
         fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         LOG.error("another collector invocation holds %s", state_dir / "collector.lock")
+        finished = dt.datetime.now(UTC)
+        report.update({
+            "status": "not_run_lock_contention",
+            "finished_at": stamp(finished),
+            "elapsed_seconds": round((finished - run_start).total_seconds(), 3),
+            "exit_code": 75,
+            "error_type": "LockContention",
+            "error": "another collector invocation holds the exclusive lock",
+        })
+        atomic_json(report_path, report)
+        LOG.info("run_complete status=%s exit_code=75 report=%s", report["status"], report_path)
+        LOG.removeHandler(handler)
+        handler.close()
         return 75
 
-    report = {"schema_version": 1, "run_id": run_id, "environment": "TEST", "mode": args.mode,
-              "started_at": stamp(run_start), "status": "running", "windows": [], "archive_root": config["archive_root"]}
-    report_path = run_dir / "run-report.json"
-    atomic_json(report_path, report)
-    collector = Collector(config)
     try:
         now = dt.datetime.now(UTC)
         if args.mode == "incremental":
             cp_path = state_dir / "incremental.json"
-            cp = checkpoint(cp_path)
+            cp = checkpoint(cp_path, report["source"])
+            collector = Collector(config)
             overlap = dt.timedelta(seconds=int(config.get("overlap_seconds", 7200)))
             start = utc(cp["receive_through"]) - overlap if cp else now - dt.timedelta(seconds=int(config.get("initial_lookback_seconds", 86400)))
             end = now - dt.timedelta(seconds=int(config.get("settling_delay_seconds", 120)))
             if start >= end:
                 LOG.info("no settled incremental interval is available")
             else:
-                count, files = collector.window(start, end, "receiveTimestamp")
-                report["windows"].append({"start": stamp(start), "end": stamp(end), "entries": count, "files": files})
-                atomic_json(cp_path, {"receive_through": stamp(end), "updated_at": stamp(dt.datetime.now(UTC)), "last_run_id": run_id})
+                window = collector.window(start, end, "receiveTimestamp")
+                record_window(report, window)
+                watermark = stamp(end)
+                atomic_json(cp_path, {"schema_version": 2, "source": report["source"], "receive_through": watermark,
+                                      "updated_at": stamp(dt.datetime.now(UTC)), "last_run_id": run_id})
+                report["resulting_watermark"] = {"field": "receiveTimestamp", "through": watermark}
         elif args.mode == "range":
             start, end = utc(args.start), utc(args.end)
             if start >= end:
                 raise ValueError("--start must be before --end")
-            count, files = collector.window(start, end, "timestamp")
-            report["windows"].append({"start": stamp(start), "end": stamp(end), "entries": count, "files": files})
+            collector = Collector(config)
+            record_window(report, collector.window(start, end, "timestamp"))
         else:
             cp_path = state_dir / "backfill.json"
-            cp = checkpoint(cp_path)
+            cp = checkpoint(cp_path, report["source"])
+            collector = Collector(config)
             if cp.get("event_through"):
                 start = utc(cp["event_through"])
             elif args.start:
@@ -297,15 +421,31 @@ def main() -> int:
             hours = int(config.get("backfill_window_hours", 6))
             while start < end_limit:
                 end = min(start + dt.timedelta(hours=hours), end_limit)
-                count, files = collector.window(start, end, "timestamp")
-                report["windows"].append({"start": stamp(start), "end": stamp(end), "entries": count, "files": files})
+                window = collector.window(start, end, "timestamp")
+                record_window(report, window)
                 # Window publication is complete before this resumable cursor advances.
-                atomic_json(cp_path, {"event_through": stamp(end), "updated_at": stamp(dt.datetime.now(UTC)), "last_run_id": run_id})
+                watermark = stamp(end)
+                atomic_json(cp_path, {"schema_version": 2, "source": report["source"], "event_through": watermark,
+                                      "updated_at": stamp(dt.datetime.now(UTC)), "last_run_id": run_id})
+                report["resulting_watermark"] = {"field": "timestamp", "through": watermark}
                 atomic_json(report_path, report)
-                LOG.info("backfill_window_complete through=%s entries=%d", stamp(end), count)
+                LOG.info("backfill_window_complete through=%s entries=%d", watermark, window["source_entries_returned"])
                 start = end
         report["status"] = "succeeded"
         return_code = 0
+    except InterruptedRun as error:
+        LOG.error("collector_interrupted: %s", error)
+        report["status"] = "interrupted"
+        report["error_type"] = type(error).__name__
+        report["error"] = str(error)[:1000]
+        report["signal"] = error.signum
+        return_code = 128 + error.signum
+    except KeyboardInterrupt:
+        LOG.error("collector_interrupted: keyboard interrupt")
+        report["status"] = "interrupted"
+        report["error_type"] = "KeyboardInterrupt"
+        report["error"] = "interrupted by operator"
+        return_code = 130
     except Exception as error:
         LOG.exception("collector_failed: %s", error)
         report["status"] = "failed"
@@ -319,10 +459,15 @@ def main() -> int:
         report["exit_code"] = locals().get("return_code", 1)
         atomic_json(report_path, report)
         LOG.info("run_complete status=%s exit_code=%d report=%s", report["status"], report["exit_code"], report_path)
+        LOG.removeHandler(handler)
         handler.close()
     return return_code
 
 
+def handle_sigterm(signum, _frame) -> None:
+    raise InterruptedRun(signum)
+
+
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    signal.signal(signal.SIGTERM, handle_sigterm)
     raise SystemExit(main())

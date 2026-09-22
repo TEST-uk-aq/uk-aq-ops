@@ -30,7 +30,14 @@ setting. The Google identity needs only `logging.logEntries.list` (normally the
 - A non-blocking process lock separates concurrent invocations. Incremental
   and backfill checkpoints are also separate.
 - Every invocation creates a unique run directory containing `run.log` and a
-  bounded `run-report.json`. Active phases emit a 15-second heartbeat.
+  bounded `run-report.json`, including invocations rejected because the lock is
+  held. Active phases emit a 15-second heartbeat. Log timestamps bearing `Z`
+  are generated in UTC.
+- Checkpoints carry a deterministic source fingerprint derived only from the
+  TEST project ID and exact Cloud Logging filter. A missing or different
+  fingerprint stops the run before retrieval instead of applying a cursor from
+  different source coverage. Operational locations such as the run-evidence
+  path do not affect the fingerprint.
 
 Cloud Logging fields are otherwise preserved, including structured payloads,
 resource labels, severity, event/receive timestamps, trace/span data, and HTTP
@@ -110,6 +117,28 @@ If interrupted, run the same command again. The cursor in
 that cursor forward manually. It is safe to move it backward to deliberately
 replay a window because publication deduplicates.
 
+After changing `project_id` or `log_filter`, the old incremental and backfill
+checkpoints intentionally fail source validation. Review the newly covered
+history, stop the launchd job, and preserve the old evidence before restarting:
+
+```bash
+mkdir -p "$HOME/.local/state/uk-aq/gcp-logging-archive/test/retired"
+mv "$HOME/.local/state/uk-aq/gcp-logging-archive/test/incremental.json" \
+  "$HOME/.local/state/uk-aq/gcp-logging-archive/test/retired/incremental-before-filter-change.json"
+mv "$HOME/.local/state/uk-aq/gcp-logging-archive/test/backfill.json" \
+  "$HOME/.local/state/uk-aq/gcp-logging-archive/test/retired/backfill-before-filter-change.json"
+local/scripts/run_gcp_logging_archive_test.sh backfill \
+  --start SAFE_UTC_BOUNDARY --end FIXED_UTC_UPPER_BOUNDARY
+```
+
+Choose `SAFE_UTC_BOUNDARY` at or before the earliest time the added source may
+contain retained logs. Omitting `--start` discovers the current retained
+boundary instead. After the backfill succeeds, run incremental once and then
+re-enable launchd. Moving checkpoints aside is deliberate; editing their
+fingerprints to bypass validation is unsafe. To rewind without changing source
+coverage, preserve a copy and move the relevant `*_through` timestamp backward
+without changing the stored `source` object.
+
 Run one incremental collection with:
 
 ```bash
@@ -157,6 +186,16 @@ checkpoint causes the entire incomplete interval to be safely replayed. A
 stale `collector.lock` file is harmless; the operating-system lock ends with
 the process. Do not delete or advance checkpoints merely because a daily file
 was already replaced.
+
+`run-report.json` records the TEST project and source/filter fingerprints,
+source timestamp field and bounded query-window evidence, incremental overlap,
+source/unique/new/duplicate counts, affected dates and files, bytes written,
+resulting watermark, final status and exit code, and bounded error details. A
+long backfill retains at most 100 detailed windows (and 100 files per window),
+with aggregate totals, the omitted count, and the last omitted window retained
+so the report cannot grow without bound. SIGTERM and keyboard interruption are
+reported explicitly and retain their conventional exit codes; neither advances
+a checkpoint for a window whose publication did not finish.
 
 Uninstall only this TEST job:
 
