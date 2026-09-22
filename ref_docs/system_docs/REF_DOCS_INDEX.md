@@ -18,7 +18,7 @@ Source repository:
 
 Source commit:
 
-`0ec58f7fe4208a2e3fc7343caabe0f258a1d0303`
+`85b56a9f918b89e9c34ea79118f98ef6d9c634b4`
 
 Snapshot date:
 
@@ -50,7 +50,7 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 - Media Bluesky publication behaviour;
 - Media dashboard behaviour and article/Bluesky preview contracts;
 - History Integrity v2/v3 dry-run reporting and Operations dashboard dry-run status presentation;
-- GCP Cloud Logging analysis archive source/archive/redaction identity, retrieval, publication, checkpoint and recovery behaviour;
+- GCP Cloud Logging analysis archive source/archive/redaction identity, quota-safe retrieval, publication, checkpoint and recovery behaviour;
 - operator-execution progress, persistent run-log and structured-run-report behaviour for qualifying local scripts.
 
 It is intentionally not a complete copy of all UK AQ system documentation.
