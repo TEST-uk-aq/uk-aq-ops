@@ -8,6 +8,7 @@ import {
   createObservationHistoryV3CanonicalDayPublisher,
   createObservationHistoryV3LatestScopedReferenceRecovery,
   runDisconnectedPruneDailyObservationHistoryV3Writer,
+  runDisconnectedSelectedScopeReconciliationObservationHistoryV3Writer,
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
 } from "../workers/shared/uk_aq_observation_history_operational_writer_v3.mjs";
 import {
@@ -23,11 +24,33 @@ import {
   ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
   assertAcceptedObservationHistoryWriterLimitsV3,
 } from "../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
+import {
+  OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
+  observationsGlobalOperationLockIdentity,
+} from "../workers/shared/uk_aq_r2_history_writer.mjs";
 
 const TARGET_GIT_SHA = "2".repeat(40);
 const DAY_UTC = "2026-08-18";
 const OBSERVATIONS_PREFIX = "history/v3/observations";
 const EXACT_INDEX_ROOT = "history/_index_v3/observations_timeseries";
+
+function selectedScopeLockEnv() {
+  const identity = observationsGlobalOperationLockIdentity();
+  return {
+    UK_AQ_R2_HISTORY_VERSION: "v3",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: "selected-scope-wrapper-test",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: "selected-scope-wrapper-run",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.logicalIdentity]:
+      identity.logical_identity,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.classId]: String(identity.class_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.objectId]: String(identity.object_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.nonce]: "selected-scope-wrapper-nonce",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.acquired]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: "0",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
+  };
+}
 
 function rows(pollutantCode, timeseriesId) {
   return [{
@@ -1487,6 +1510,50 @@ test("aggregate publisher returns durable identities for hierarchy objects", asy
   assert.equal(result.aggregate_manifests[0].key, key);
   assert.equal(result.aggregate_manifests[0].byte_size, body.byteLength);
   assert.match(result.aggregate_manifests[0].sha256, /^[0-9a-f]{64}$/);
+});
+
+test("disconnected selected-scope wrapper preserves an explicit lock-context env", async () => {
+  const lockEnvironmentKeys = Object.values(
+    OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
+  );
+  const previousProcessValues = new Map(lockEnvironmentKeys.map((key) => [
+    key,
+    Object.prototype.hasOwnProperty.call(process.env, key)
+      ? process.env[key]
+      : undefined,
+  ]));
+  for (const key of lockEnvironmentKeys) delete process.env[key];
+
+  try {
+    let operation;
+    assert.doesNotThrow(() => {
+      operation =
+        runDisconnectedSelectedScopeReconciliationObservationHistoryV3Writer({
+          env: selectedScopeLockEnv(),
+          expectedObservationsGlobalOperationLockOwner:
+            "selected-scope-wrapper-test",
+          expectedObservationsGlobalOperationLockRunId:
+            "selected-scope-wrapper-run",
+          client: { query: async () => ({ rows: [] }) },
+          r2: { bucket: "test" },
+          partitions: [],
+          removedScopes: [],
+          targetWriterGitSha: TARGET_GIT_SHA,
+          getObject: async () => ({ exists: false }),
+          putIfChanged: async () => ({ ok: true, status: "unchanged" }),
+          recordDurableEvidence: async () => ({ durable: true }),
+        });
+    });
+    await assert.rejects(
+      operation,
+      /requires at least one non-empty replacement partition or explicit removal scope/,
+    );
+  } finally {
+    for (const [key, value] of previousProcessValues) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test("disconnected operational entry point is v3-only", () => {

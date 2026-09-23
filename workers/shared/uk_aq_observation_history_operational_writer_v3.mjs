@@ -1356,6 +1356,7 @@ function v3OnlyOptions({
     });
   return {
     ...options,
+    env,
     getObject,
     putIfChanged,
     recordDurableEvidence,
