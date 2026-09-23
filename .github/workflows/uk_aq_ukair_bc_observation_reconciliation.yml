@@ -1,0 +1,149 @@
+name: UK AQ UK-AIR Black Carbon Observation Reconciliation
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Reconciliation selection mode"
+        required: true
+        default: selected
+        type: choice
+        options:
+          - selected
+          - range
+          - year
+          - backfill
+          - daily
+      from_day:
+        description: "UTC start day for selected/range mode (YYYY-MM-DD)"
+        required: false
+        type: string
+      to_day:
+        description: "UTC end day for selected/range or optional backfill/daily end"
+        required: false
+        type: string
+      year:
+        description: "Source/canonical year for year mode"
+        required: false
+        type: string
+      horizon_days:
+        description: "Recent correction/ratification horizon for daily mode"
+        required: true
+        default: "14"
+        type: string
+      stations:
+        description: "Optional comma-separated UKA station refs; required for selected mode"
+        required: false
+        type: string
+      properties:
+        description: "Comma-separated canonical properties: bc,uv370"
+        required: true
+        default: "bc,uv370"
+        type: string
+      apply:
+        description: "Apply through the protected canonical R2 writer; otherwise source-only dry-run"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-ukair-bc-observation-reconciliation
+  cancel-in-progress: false
+
+jobs:
+  reconcile-ukair-bc-observations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'TEST' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      INPUT_MODE: ${{ inputs.mode }}
+      INPUT_FROM_DAY: ${{ inputs.from_day }}
+      INPUT_TO_DAY: ${{ inputs.to_day }}
+      INPUT_YEAR: ${{ inputs.year }}
+      INPUT_HORIZON_DAYS: ${{ inputs.horizon_days }}
+      INPUT_STATIONS: ${{ inputs.stations }}
+      INPUT_PROPERTIES: ${{ inputs.properties }}
+      INPUT_APPLY: ${{ inputs.apply }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate TEST configuration
+        run: |
+          set -euo pipefail
+          if [ "${UKAQ_ENV_NAME^^}" != "TEST" ]; then
+            echo "Refusing Black Carbon reconciliation outside TEST" >&2
+            exit 1
+          fi
+          if [ -z "${SUPABASE_DB_URL:-}" ]; then
+            echo "SUPABASE_DB_URL is required for canonical metadata resolution" >&2
+            exit 1
+          fi
+          if [ "${INPUT_APPLY}" = "true" ]; then
+            required=(
+              UK_AQ_R2_HISTORY_VERSION
+              CFLARE_R2_ENDPOINT
+              CFLARE_R2_BUCKET
+              CFLARE_R2_ACCESS_KEY_ID
+              CFLARE_R2_SECRET_ACCESS_KEY
+            )
+            for key in "${required[@]}"; do
+              if [ -z "${!key:-}" ]; then
+                echo "Missing required apply value: ${key}" >&2
+                exit 1
+              fi
+            done
+            if [ "${UK_AQ_R2_HISTORY_VERSION}" != "v3" ]; then
+              echo "Apply requires UK_AQ_R2_HISTORY_VERSION=v3" >&2
+              exit 1
+            fi
+            if [ "${CFLARE_R2_BUCKET}" != "uk-aq-history-cic-test" ]; then
+              echo "Apply requires the TEST R2 bucket uk-aq-history-cic-test" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Reconcile UK-AIR Black Carbon observations
+        run: |
+          set -euo pipefail
+          args=(
+            --mode "${INPUT_MODE}"
+            --environment TEST
+            --horizon-days "${INPUT_HORIZON_DAYS}"
+            --property "${INPUT_PROPERTIES}"
+            --run-id "ukair-bc-gha:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          )
+          if [ -n "${INPUT_FROM_DAY}" ]; then args+=(--from "${INPUT_FROM_DAY}"); fi
+          if [ -n "${INPUT_TO_DAY}" ]; then args+=(--to "${INPUT_TO_DAY}"); fi
+          if [ -n "${INPUT_YEAR}" ]; then args+=(--year "${INPUT_YEAR}"); fi
+          if [ -n "${INPUT_STATIONS}" ]; then args+=(--station "${INPUT_STATIONS}"); fi
+          if [ "${INPUT_APPLY}" = "true" ]; then args+=(--apply); else args+=(--dry-run); fi
+          node scripts/ukair_bc/uk_aq_ukair_bc_observation_reconciler.mjs "${args[@]}"
+
+      - name: Upload immutable source evidence and reconciliation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ukair-bc-observation-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tmp/ukair_bc_observation_reconciler/
+          if-no-files-found: warn
+          retention-days: 30

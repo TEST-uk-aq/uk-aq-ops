@@ -124,7 +124,7 @@ runtime parent. Examples for TEST:
 
 ```bash
 RUNNER=local/scripts/run_gcp_logging_archive.sh
-COMMON=(--env-file /absolute/path/to/TEST-uk-aq-ingest/.env \
+COMMON=(--env-file /absolute/path/to/TEST-uk-aq-ops/.env \
         --runtime-root /Users/mikehinford/uk-aq-gcp-logging-archive)
 "$RUNNER" "${COMMON[@]}" incremental
 "$RUNNER" "${COMMON[@]}" range \
@@ -165,7 +165,7 @@ RUNTIME=/Users/mikehinford/uk-aq-gcp-logging-archive
 mkdir -p "$HOME/Library/LaunchAgents" "$RUNTIME/TEST/logs"
 python3 local/scripts/render_gcp_logging_archive_launchd.py "$TEMPLATE" \
   "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist" \
-  --environment TEST --ingest-env-file /absolute/path/to/TEST-uk-aq-ingest/.env \
+  --environment TEST --ingest-env-file /absolute/path/to/TEST-uk-aq-ops/.env \
   --runtime-root "$RUNTIME"
 plutil -lint "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
 ```
@@ -233,7 +233,7 @@ Do not copy system documentation. From the local LIVE ops checkout, create only
 the LIVE runtime directories and give LIVE its own config, new/stated archive
 identity, empty appropriate state and read-only credential. Render the LIVE
 plist there, explicitly using the LIVE ops checkout as `--repo-root` and the
-LIVE ingest repository `.env` as its environment source:
+LIVE ops repository `.env` as its environment source:
 
 ```bash
 cd /absolute/path/to/LIVE-uk-aq-ops
@@ -243,7 +243,7 @@ install -d -m 700 "$RUNTIME/LIVE"/{state,runs,logs,credentials}
 # Provision LIVE/config.json and the mode-600 LIVE credential before collection.
 python3 local/scripts/render_gcp_logging_archive_launchd.py "$TEMPLATE" \
   "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.live.plist" \
-  --environment LIVE --ingest-env-file /absolute/path/to/LIVE-uk-aq-ingest/.env \
+  --environment LIVE --ingest-env-file /absolute/path/to/LIVE-uk-aq-ops/.env \
   --runtime-root "$RUNTIME" --repo-root /absolute/path/to/LIVE-uk-aq-ops
 plutil -lint "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.live.plist"
 ```
@@ -256,7 +256,7 @@ bootstrap normal LIVE scheduling:
 
 ```bash
 local/scripts/run_gcp_logging_archive.sh \
-  --env-file /absolute/path/to/LIVE-uk-aq-ingest/.env \
+  --env-file /absolute/path/to/LIVE-uk-aq-ops/.env \
   --runtime-root /Users/mikehinford/uk-aq-gcp-logging-archive \
   range --start BOUNDED_UTC_START --end BOUNDED_UTC_END
 # Verify the run report, selected account/project/filter and bounded output,
