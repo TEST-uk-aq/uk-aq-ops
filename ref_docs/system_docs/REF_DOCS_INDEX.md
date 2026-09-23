@@ -28,7 +28,7 @@ Task-specific refresh:
 
 - `ref_docs/system_docs/dashboards/README.md` and `ref_docs/system_docs/dashboards/daily_task_warning_status_contract.md` were refreshed from authoritative source commit `bc14d60ddee0996a2765d3f84ba69ed9025fa94f` on `23/09/2026`.
 - `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/observs_operations/README.md` and `ref_docs/system_docs/observs_operations/partition_maintenance.md` were refreshed from authoritative source commit `223a129526d6ffeba734d013b52a806c2d7c1de6` on `23/09/2026`.
-- `ref_docs/system_docs/gcp_logging_archive/README.md` and `ref_docs/system_docs/gcp_logging_archive/contract.md` were refreshed from authoritative source commit `7460d7c13f9ea9978c2f74373accb70b5b648398` on `23/09/2026`.
+- `ref_docs/system_docs/gcp_logging_archive/README.md` and `ref_docs/system_docs/gcp_logging_archive/contract.md` were refreshed after TEST acceptance from authoritative source contract commit `f005636e52314013abd249ae1e34a719d227983f` on `23/09/2026`; `ref_docs/system_docs/SYSTEM_OVERVIEW.md` was refreshed from authoritative source overview commit `bc75f9564953859733e4077d203590c52b9adb3f` in the same task.
 
 ## Reading rule
 
