@@ -16,13 +16,17 @@ Source repository:
 
 `TEST-uk-aq/uk-aq-system-docs`
 
-Source commit:
+Base snapshot source commit:
 
-`bc14d60ddee0996a2765d3f84ba69ed9025fa94f`
+`77ef0e55646beb2d50d70705b0c342e101a67429`
 
-Snapshot date:
+Base snapshot date:
 
-`23/09/2026`
+`22/09/2026`
+
+Task-specific refresh:
+
+- `ref_docs/system_docs/dashboards/README.md` and `ref_docs/system_docs/dashboards/daily_task_warning_status_contract.md` were refreshed from authoritative source commit `bc14d60ddee0996a2765d3f84ba69ed9025fa94f` on `23/09/2026`.
 
 ## Reading rule
 
