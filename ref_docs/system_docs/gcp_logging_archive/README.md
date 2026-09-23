@@ -2,7 +2,7 @@
 
 ## Status
 
-**Active TEST runtime and future shared TEST/LIVE implementation authority.** The TEST collector is installed and operating on the MacBook Pro. This area also authorises the next refactor to one environment-agnostic implementation for TEST and LIVE. LIVE collection is not active until its separate environment configuration and operational acceptance are completed.
+**Active accepted TEST runtime and shared TEST/LIVE implementation authority.** The environment-agnostic collector and runner are deployed and functionally accepted on the MacBook Pro for TEST, using the isolated TEST runtime and daily launchd job defined by this area. LIVE collection is not active until its separate environment configuration, bounded source/account verification and operational acceptance are completed.
 
 ## Purpose
 
@@ -32,6 +32,6 @@ The archive is for retrospective performance and cost analysis. Google Cloud Log
 
 ## Implementation ownership
 
-The authoritative implementation is developed and accepted first in `TEST-uk-aq/uk-aq-ops`. The collector, runner and templates MUST be environment-agnostic. After TEST acceptance, the bounded GCP logging implementation files may be promoted to the local LIVE ops repository without copying system documentation into LIVE.
+The environment-agnostic implementation is accepted in `TEST-uk-aq/uk-aq-ops`. The collector, runner and templates MUST remain environment-agnostic. The bounded GCP logging implementation files may now be promoted to the local LIVE ops repository for separate LIVE configuration and acceptance, without copying system documentation into LIVE.
 
 Codex and other coding agents treat this area as read-only. Behavioural changes discovered during implementation must be handed back to ChatGPT in Chat mode for authoritative documentation review.
