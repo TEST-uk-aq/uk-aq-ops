@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archive TEST Cloud Logging entries into deterministic daily gzip JSONL files."""
+"""Archive environment-scoped Cloud Logging entries into deterministic daily gzip JSONL files."""
 
 from __future__ import annotations
 
@@ -84,12 +84,27 @@ def source_identity(config: dict) -> dict:
     }
 
 
+def environment_name() -> str:
+    value = os.environ.get("UK_AQ_ENV_NAME", "").strip()
+    if value not in {"TEST", "LIVE"}:
+        raise RuntimeError("UK_AQ_ENV_NAME must be exactly TEST or LIVE")
+    return value
+
+
 def archive_identity(config: dict) -> dict:
+    configured_identity_path = str(config.get("archive_identity_path") or "").strip()
+    if configured_identity_path:
+        archive_path = configured_identity_path
+    else:
+        archive_path = str(
+            (
+                Path(os.path.expanduser(config["archive_root"]))
+                / f"{environment_name()}/GCP Logs/raw"
+            ).resolve()
+        )
     return {
         "archive_id": config["archive_id"],
-        "archive_path": str(
-            (Path(os.path.expanduser(config["archive_root"])) / "TEST/GCP Logs/raw").resolve()
-        ),
+        "archive_path": archive_path,
     }
 
 
@@ -104,7 +119,7 @@ def redaction_identity(config: dict) -> dict:
 def expected_archive_manifest(config: dict) -> dict:
     return {
         "schema_version": ARCHIVE_MANIFEST_SCHEMA_VERSION,
-        "environment": "TEST",
+        "environment": environment_name(),
         "source": source_identity(config),
         "archive": archive_identity(config),
         "redaction": redaction_identity(config),
@@ -225,7 +240,7 @@ class Collector:
     def __init__(self, config: dict):
         self.config = config
         self.project = config["project_id"]
-        self.archive = Path(os.path.expanduser(config["archive_root"])) / "TEST/GCP Logs/raw"
+        self.archive = Path(os.path.expanduser(config["archive_root"])) / f"{environment_name()}/GCP Logs/raw"
         self.state = Path(os.path.expanduser(config["state_dir"]))
         self.redact = config.get("redact_paths", [])
         self.min_read_interval_seconds = float(config.get("min_read_interval_seconds", 1.5))
@@ -405,7 +420,7 @@ def checkpoint(path: Path, expected_source: dict, expected_archive: dict, expect
     actual = value.get("source", {})
     if actual.get("source_fingerprint") != expected_source["source_fingerprint"]:
         raise RuntimeError(
-            f"checkpoint source mismatch at {path}: expected TEST project "
+            f"checkpoint source mismatch at {path}: expected {environment_name()} project "
             f"{expected_source['project_id']} and filter SHA-256 {expected_source['filter_sha256']}; "
             "move the checkpoint aside and restart from an explicit safe boundary after reviewing source coverage"
         )
@@ -431,7 +446,7 @@ def new_report(config: dict, args: argparse.Namespace, run_id: str, run_start: d
     return {
         "schema_version": 3,
         "run_id": run_id,
-        "environment": "TEST",
+        "environment": environment_name(),
         "mode": args.mode,
         "started_at": stamp(run_start),
         "status": "running",
@@ -511,7 +526,7 @@ def main() -> int:
     handler.setFormatter(formatter)
     LOG.addHandler(handler)
     LOG.setLevel(logging.INFO)
-    LOG.info("run_start run_id=%s mode=%s environment=TEST pid=%d work_dir=%s", run_id, args.mode, os.getpid(), run_dir)
+    LOG.info("run_start run_id=%s mode=%s environment=%s pid=%d work_dir=%s", run_id, args.mode, environment_name(), os.getpid(), run_dir)
 
     report = new_report(config, args, run_id, run_start)
     report_path = run_dir / "run-report.json"
@@ -575,7 +590,7 @@ def main() -> int:
             elif args.start:
                 start = utc(args.start)
             else:
-                LOG.info("discovering earliest retained matching TEST log entry")
+                LOG.info("discovering earliest retained matching %s log entry", environment_name())
                 first = next(collector.read(None, None, "timestamp", limit=1), None)
                 if not first:
                     raise RuntimeError("no matching retained log entries; historical boundary cannot be discovered")
