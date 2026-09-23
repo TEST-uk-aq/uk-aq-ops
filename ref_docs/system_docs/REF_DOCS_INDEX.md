@@ -18,11 +18,11 @@ Source repository:
 
 Source commit:
 
-`77ef0e55646beb2d50d70705b0c342e101a67429`
+`bc14d60ddee0996a2765d3f84ba69ed9025fa94f`
 
 Snapshot date:
 
-`22/09/2026`
+`23/09/2026`
 
 ## Reading rule
 
@@ -50,6 +50,7 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 - Media Bluesky publication behaviour;
 - Media dashboard behaviour and article/Bluesky preview contracts;
 - History Integrity v2/v3 dry-run reporting and Operations dashboard dry-run status presentation;
+- Finished daily-task warning presentation, including the additive yellow `WARNING` pill driven by structured `summary.warnings`;
 - GCP Cloud Logging analysis archive source/archive/redaction identity, quota-safe retrieval, publication, checkpoint and recovery behaviour;
 - operator-execution progress, persistent run-log and structured-run-report behaviour for qualifying local scripts.
 
