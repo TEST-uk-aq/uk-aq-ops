@@ -8,7 +8,7 @@
 
 The collector runs on the always-on MacBook Pro. One environment-agnostic implementation MUST support TEST and LIVE while keeping their configuration, credentials, state, evidence and archives isolated.
 
-The runner MUST obtain `UK_AQ_ENV_NAME` from the corresponding local ingest repository `.env`. The only valid values are exactly `TEST` and `LIVE`. A missing, ambiguous or different value MUST fail closed before selecting credentials, creating the Cloud Logging client, retrieving entries or mutating archive/state. Environment identity MUST NOT be inferred from the ops repository path, Google project, archive path or another default.
+The runner MUST obtain `UK_AQ_ENV_NAME` from the corresponding local ops repository `.env`. The only valid values are exactly `TEST` and `LIVE`. A missing, ambiguous or different value MUST fail closed before selecting credentials, creating the Cloud Logging client, retrieving entries or mutating archive/state. Environment identity MUST NOT be inferred from the ops repository path, Google project, archive path or another default.
 
 Each environment's source scope is its configured Cloud Run services needed for cost/performance and operational analysis, including Latest Snapshot, selected ingestion services, their structured application logs and Cloud Run request logs. Project IDs and exact log filters are environment-specific configuration and MUST NOT be copied or inferred from the other environment.
 
@@ -37,7 +37,7 @@ Equivalent filenames inside those owned directories are implementation detail, b
 
 After migration, this subsystem MUST NOT write new configuration, checkpoints, run evidence or operational logs beneath `~/Library/Logs/UK-AQ`, `~/Library/Logs/UK AQ`, `~/.config/uk-aq/gcp-logging-archive-*.json` or `~/.local/state/uk-aq/gcp-logging-archive`. Existing TEST evidence in superseded locations MAY be retained temporarily as rollback/history evidence until the migrated TEST runtime is accepted.
 
-Implementation code remains in the ops repository and is not part of the runtime-state tree. The corresponding ingest repository `.env` remains the authority only for `UK_AQ_ENV_NAME`; secrets and full process environments MUST NOT be copied into run evidence.
+Implementation code remains in the ops repository and is not part of the runtime-state tree. The corresponding ops repository `.env` remains the authority only for `UK_AQ_ENV_NAME`; secrets and full process environments MUST NOT be copied into run evidence.
 
 ## Archive layout and identities
 
@@ -117,7 +117,7 @@ uk.co.ukaq.gcp-logging-archive.test
 uk.co.ukaq.gcp-logging-archive.live
 ```
 
-Both jobs MUST use the same generic runner semantics and environment contract. Each job resolves the corresponding ingest `.env`, validates `UK_AQ_ENV_NAME`, and then selects only that environment's runtime/configuration and credentials. The jobs MUST NOT share checkpoints or a mutable global authentication selection.
+Both jobs MUST use the same generic runner semantics and environment contract. Each job resolves the corresponding ops repository `.env`, validates `UK_AQ_ENV_NAME`, and then selects only that environment's runtime/configuration and credentials. The jobs MUST NOT share checkpoints or a mutable global authentication selection.
 
 Cloud Logging remains the recent troubleshooting source; the Dropbox archive is primarily retained for historical service-usage, cost and configuration analysis. An operator MAY trigger the relevant launchd job or run incremental collection manually when a more current archive copy is wanted. This contract does not authorise changing other UK AQ schedules.
 
