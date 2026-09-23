@@ -1,0 +1,23 @@
+{
+  "environment": "REPLACE_WITH_TEST_OR_LIVE",
+  "project_id": "REPLACE_WITH_ENVIRONMENT_GCP_PROJECT_ID",
+  "log_filter": "resource.type=\"cloud_run_revision\" AND (resource.labels.service_name=\"uk-aq-latest-snapshot-builder\" OR resource.labels.service_name=\"REPLACE_WITH_ENVIRONMENT_INGEST_SERVICE_NAME\")",
+  "archive_id": "REPLACE_WITH_STABLE_ENVIRONMENT_ARCHIVE_ID",
+  "archive_path": "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/REPLACE_WITH_TEST_OR_LIVE/GCP Logs/raw",
+  "page_size": 1000,
+  "min_read_interval_seconds": 1.5,
+  "quota_retry_initial_seconds": 5.0,
+  "quota_retry_max_seconds": 60.0,
+  "quota_retry_timeout_seconds": 600.0,
+  "overlap_seconds": 7200,
+  "settling_delay_seconds": 120,
+  "initial_lookback_seconds": 86400,
+  "backfill_window_hours": 6,
+  "redact_paths": [
+    "httpRequest.requestUrl",
+    "jsonPayload.authorization",
+    "jsonPayload.headers.authorization",
+    "jsonPayload.token",
+    "jsonPayload.password"
+  ]
+}
