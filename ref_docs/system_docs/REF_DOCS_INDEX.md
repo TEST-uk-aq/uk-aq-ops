@@ -27,6 +27,7 @@ Base snapshot date:
 Task-specific refresh:
 
 - `ref_docs/system_docs/dashboards/README.md` and `ref_docs/system_docs/dashboards/daily_task_warning_status_contract.md` were refreshed from authoritative source commit `bc14d60ddee0996a2765d3f84ba69ed9025fa94f` on `23/09/2026`.
+- `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/observs_operations/README.md` and `ref_docs/system_docs/observs_operations/partition_maintenance.md` were refreshed from authoritative source commit `223a129526d6ffeba734d013b52a806c2d7c1de6` on `23/09/2026`.
 
 ## Reading rule
 
@@ -56,6 +57,7 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 - History Integrity v2/v3 dry-run reporting and Operations dashboard dry-run status presentation;
 - Finished daily-task warning presentation, including the additive yellow `WARNING` pill driven by structured `summary.warnings`;
 - GCP Cloud Logging analysis archive source/archive/redaction identity, quota-safe retrieval, publication, checkpoint and recovery behaviour;
+- Observs partition maintenance, including selected-generation R2 day-manifest deletion authority, fail-closed retention behaviour and TEST acceptance;
 - operator-execution progress, persistent run-log and structured-run-report behaviour for qualifying local scripts.
 
 It is intentionally not a complete copy of all UK AQ system documentation.
