@@ -31,7 +31,6 @@ import {
   runPruneDailyObservationHistoryV3ConnectorPublication,
   runPruneDailyObservationHistoryV3RunFinalization,
   runPruneDailyObservationHistoryV3Writer,
-  runSelectedScopeReconciliationObservationHistoryV3Writer,
   runSosHistoricalReplacementObservationHistoryV3Writer,
   runSupportedBackfillObservationHistoryV3Writer,
 } from "./uk_aq_observation_history_steady_state_writer_v3.mjs";
@@ -106,50 +105,6 @@ function sortedPollutantCodes(values) {
     throw new Error("Canonical connector state contains duplicate pollutant codes");
   }
   return unique;
-}
-
-function normalizeConnectorRemovalScopes({
-  source,
-  dayUtc,
-  connectorId,
-  removedScopes,
-}) {
-  if (!Array.isArray(removedScopes)) {
-    throw new TypeError("Canonical connector removed_scopes must be an array");
-  }
-  if (
-    removedScopes.length > 0 &&
-    source !==
-      OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation
-  ) {
-    throw new Error(
-      `Observation-history source ${source} is not authorised for selected-scope removal`,
-    );
-  }
-  const normalized = removedScopes.map((scope, index) => {
-    const scopeDay = String(scope?.day_utc || "").trim();
-    const scopeConnectorId = Number(scope?.connector_id);
-    const pollutantCode = String(scope?.pollutant_code || "").trim().toLowerCase();
-    if (
-      scopeDay !== dayUtc ||
-      scopeConnectorId !== connectorId ||
-      !/^[a-z0-9_]+$/.test(pollutantCode)
-    ) {
-      throw new Error(
-        `Canonical connector removal scope ${index} disagrees with its connector-day`,
-      );
-    }
-    return Object.freeze({
-      day_utc: scopeDay,
-      connector_id: scopeConnectorId,
-      pollutant_code: pollutantCode,
-    });
-  });
-  const codes = sortedPollutantCodes(
-    normalized.map((scope) => scope.pollutant_code),
-  );
-  const byCode = new Map(normalized.map((scope) => [scope.pollutant_code, scope]));
-  return Object.freeze(codes.map((code) => byCode.get(code)));
 }
 
 function parseCanonicalManifest({ body, key, manifestKind, scope }) {
@@ -649,57 +604,7 @@ async function readCurrentPollutantManifests({
   dayUtc,
   connectorId,
   completeConnectorSnapshot,
-  requireCurrentDayAuthority = false,
 }) {
-  let authoritativeConnectorReference = null;
-  if (requireCurrentDayAuthority) {
-    const dayKey = buildHistoryV2DayManifestKey(observationsPrefix, dayUtc);
-    const dayObject = await getOptionalObject(getObject, dayKey);
-    if (!dayObject) {
-      return Object.freeze({
-        connector_manifest: null,
-        current_pollutant_codes: Object.freeze([]),
-        pollutant_manifests: Object.freeze([]),
-        child_validation_mode: "absent_from_current_day_authority",
-        current_day_authority_checked: true,
-      });
-    }
-    const dayManifest = parseCanonicalManifest({
-      body: dayObject.body,
-      key: dayKey,
-      manifestKind: "day",
-      scope: { day_utc: dayUtc },
-    });
-    const connectorReferences = Array.isArray(dayManifest.connector_manifests)
-      ? dayManifest.connector_manifests
-      : Array.isArray(dayManifest.child_manifests)
-        ? dayManifest.child_manifests
-        : [];
-    const matches = connectorReferences.filter((entry) =>
-      Number(entry?.connector_id) === connectorId
-    );
-    if (matches.length > 1) {
-      throw new Error(`Current canonical day contains a duplicate connector: ${dayKey}`);
-    }
-    if (matches.length === 0) {
-      return Object.freeze({
-        connector_manifest: null,
-        current_pollutant_codes: Object.freeze([]),
-        pollutant_manifests: Object.freeze([]),
-        child_validation_mode: "absent_from_current_day_authority",
-        current_day_authority_checked: true,
-      });
-    }
-    authoritativeConnectorReference = matches[0];
-    const expectedConnectorKey = buildHistoryV2ConnectorManifestKey(
-      observationsPrefix,
-      dayUtc,
-      connectorId,
-    );
-    if (authoritativeConnectorReference.manifest_key !== expectedConnectorKey) {
-      throw new Error(`Current canonical day child key disagrees: ${dayKey}`);
-    }
-  }
   const connectorKey = buildHistoryV2ConnectorManifestKey(
     observationsPrefix,
     dayUtc,
@@ -707,9 +612,6 @@ async function readCurrentPollutantManifests({
   );
   const current = await getOptionalObject(getObject, connectorKey);
   if (!current) {
-    if (authoritativeConnectorReference) {
-      throw new Error(`Current canonical connector manifest is missing: ${connectorKey}`);
-    }
     return Object.freeze({
       connector_manifest: null,
       current_pollutant_codes: Object.freeze([]),
@@ -717,7 +619,6 @@ async function readCurrentPollutantManifests({
       child_validation_mode: completeConnectorSnapshot
         ? "parent_descriptors_only_complete_snapshot"
         : "strict_live_child_identity",
-      current_day_authority_checked: requireCurrentDayAuthority,
     });
   }
   const connectorManifest = parseCanonicalManifest({
@@ -732,12 +633,6 @@ async function readCurrentPollutantManifests({
   if (!Array.isArray(descriptors)) {
     throw new Error(`Canonical connector manifest has no pollutant children: ${connectorKey}`);
   }
-  if (
-    authoritativeConnectorReference &&
-    connectorManifest.manifest_hash !== authoritativeConnectorReference.manifest_hash
-  ) {
-    throw new Error(`Current canonical day child identity disagrees: ${connectorKey}`);
-  }
   const codes = sortedPollutantCodes(
     descriptors.map((entry) => entry?.pollutant_code),
   );
@@ -747,7 +642,6 @@ async function readCurrentPollutantManifests({
       current_pollutant_codes: Object.freeze(codes),
       pollutant_manifests: Object.freeze([]),
       child_validation_mode: "parent_descriptors_only_complete_snapshot",
-      current_day_authority_checked: requireCurrentDayAuthority,
     });
   }
   const manifests = [];
@@ -778,7 +672,6 @@ async function readCurrentPollutantManifests({
     current_pollutant_codes: Object.freeze(codes),
     pollutant_manifests: Object.freeze(manifests),
     child_validation_mode: "strict_live_child_identity",
-    current_day_authority_checked: requireCurrentDayAuthority,
   });
 }
 
@@ -868,7 +761,6 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
     day_utc: dayUtc,
     connector_id: connectorId,
     partitions,
-    removed_scopes: removedScopes = [],
   }) {
     // Prune owns a complete frozen connector-day snapshot. Its current parent
     // descriptors identify the previously authoritative pollutant set, but a
@@ -876,24 +768,12 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
     // Targeted repair modes still need the live child bodies to preserve peers.
     const completeConnectorSnapshot =
       source === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily;
-    const normalizedRemovalScopes = normalizeConnectorRemovalScopes({
-      source,
-      dayUtc,
-      connectorId,
-      removedScopes,
-    });
-    const removalCodes = normalizedRemovalScopes.map(
-      (scope) => scope.pollutant_code,
-    );
     const current = await readCurrentPollutantManifests({
       getObject,
       observationsPrefix,
       dayUtc,
       connectorId,
       completeConnectorSnapshot,
-      requireCurrentDayAuthority:
-        source ===
-          OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation,
     });
     if (
       source === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement &&
@@ -911,11 +791,6 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
     const changedCodes = sortedPollutantCodes(
       partitions.map((partition) => partition.scope.pollutant_code),
     );
-    if (changedCodes.some((pollutantCode) => removalCodes.includes(pollutantCode))) {
-      throw new Error(
-        `Canonical connector scope cannot be both replaced and removed: ${dayUtc}/${connectorId}`,
-      );
-    }
     for (const partition of partitions) {
       const artifact = partition.pollutant_manifest;
       const expectedDependencies = new Map(
@@ -936,7 +811,6 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
       }
       finalByCode.set(partition.scope.pollutant_code, artifact.payload);
     }
-    for (const pollutantCode of removalCodes) finalByCode.delete(pollutantCode);
 
     const finalPollutants = [...finalByCode.values()].sort((left, right) =>
       bytewiseCompare(left.pollutant_code, right.pollutant_code)
@@ -950,41 +824,37 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
         recordDurableEvidence,
       }));
     }
-    let connectorPayload = null;
-    let connectorEvidence = null;
-    if (finalPollutants.length > 0) {
-      const connectorKey = buildHistoryV2ConnectorManifestKey(
-        observationsPrefix,
-        dayUtc,
-        connectorId,
-      );
-      connectorPayload = buildHistoryV2ConnectorManifest({
-        domain: "observations",
-        dayUtc,
-        connectorId,
-        runId: null,
-        manifestKey: connectorKey,
-        pollutantManifests: finalPollutants,
-        writerGitSha,
-        backedUpAtUtc: maxBackedUpAtUtc(finalPollutants),
-      });
-      const connectorArtifact = jsonArtifact({
-        key: connectorKey,
-        payload: connectorPayload,
-        stage: "connector_manifest",
-        dependencies: finalPollutants.map((manifest) => ({
-          kind: "canonical_observation_pollutant_manifest",
-          key: manifest.manifest_key,
-          manifest_hash: manifest.manifest_hash,
-        })),
-      });
-      connectorEvidence = await publishVerifiedJsonArtifact({
-        artifact: connectorArtifact,
-        putIfChanged,
-        getObject,
-        recordDurableEvidence,
-      });
-    }
+    const connectorKey = buildHistoryV2ConnectorManifestKey(
+      observationsPrefix,
+      dayUtc,
+      connectorId,
+    );
+    const connectorPayload = buildHistoryV2ConnectorManifest({
+      domain: "observations",
+      dayUtc,
+      connectorId,
+      runId: null,
+      manifestKey: connectorKey,
+      pollutantManifests: finalPollutants,
+      writerGitSha,
+      backedUpAtUtc: maxBackedUpAtUtc(finalPollutants),
+    });
+    const connectorArtifact = jsonArtifact({
+      key: connectorKey,
+      payload: connectorPayload,
+      stage: "connector_manifest",
+      dependencies: finalPollutants.map((manifest) => ({
+        kind: "canonical_observation_pollutant_manifest",
+        key: manifest.manifest_key,
+        manifest_hash: manifest.manifest_hash,
+      })),
+    });
+    const connectorEvidence = await publishVerifiedJsonArtifact({
+      artifact: connectorArtifact,
+      putIfChanged,
+      getObject,
+      recordDurableEvidence,
+    });
     const currentCodes = [...current.current_pollutant_codes];
     const finalCodes = finalPollutants.map(
       (manifest) => manifest.pollutant_code,
@@ -992,23 +862,6 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
     const finalCodeSet = new Set(finalCodes);
     const removedCodes = completeConnectorSnapshot
       ? currentCodes.filter((pollutantCode) => !finalCodeSet.has(pollutantCode))
-      : removalCodes;
-    const selectedScopeReconciliation = source ===
-      OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation;
-    const reportedRemovedScopes = selectedScopeReconciliation
-      ? normalizedRemovalScopes
-      : removedCodes.map((pollutantCode) => Object.freeze({
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_code: pollutantCode,
-      }));
-    const removalResults = selectedScopeReconciliation
-      ? normalizedRemovalScopes.map((scope) => Object.freeze({
-        ...scope,
-        requested_removal: true,
-        previously_authoritative: currentCodes.includes(scope.pollutant_code),
-        final_scope_present: false,
-      }))
       : [];
     return Object.freeze({
       connector_scope_verified: true,
@@ -1016,17 +869,20 @@ export function createObservationHistoryV3CanonicalConnectorPublisher({
       day_utc: dayUtc,
       connector_id: connectorId,
       current_child_validation_mode: current.child_validation_mode,
-      current_day_authority_checked: current.current_day_authority_checked,
       current_pollutant_codes: Object.freeze(currentCodes),
       changed_pollutant_codes: Object.freeze(changedCodes),
       final_pollutant_codes: Object.freeze(finalCodes),
       removed_pollutant_codes: Object.freeze(removedCodes),
-      removed_scopes: Object.freeze(reportedRemovedScopes),
-      removal_results: Object.freeze(removalResults),
+      removed_scopes: Object.freeze(removedCodes.map((pollutantCode) =>
+        Object.freeze({
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          pollutant_code: pollutantCode,
+        })
+      )),
       pollutant_manifests: Object.freeze(changedEvidence),
       connector_manifest: connectorEvidence,
       connector_manifest_payload: connectorPayload,
-      connector_authority_present: finalPollutants.length > 0,
       prune_eligibility_created: false,
     });
   };
@@ -1079,26 +935,6 @@ export function createObservationHistoryV3CanonicalDayPublisher({
       );
       const payload = entry?.canonical?.connector_manifest_payload;
       const evidence = entry?.canonical?.connector_manifest;
-      const connectorAuthorityPresent =
-        entry?.canonical?.connector_authority_present !== false;
-      if (!connectorAuthorityPresent) {
-        if (
-          payload !== null || evidence !== null ||
-          !Array.isArray(entry?.canonical?.removal_results) ||
-          entry.canonical.removal_results.length === 0
-        ) {
-          throw new Error(
-            `Absent changed canonical connector evidence disagrees: ${dayUtc}/${connectorId}`,
-          );
-        }
-        changedByConnector.set(connectorId, Object.freeze({
-          connector_authority_present: false,
-          payload: null,
-          evidence: null,
-          body: null,
-        }));
-        continue;
-      }
       if (!payload) {
         throw new Error(`Changed canonical connector payload is missing: ${dayUtc}/${connectorId}`);
       }
@@ -1118,12 +954,7 @@ export function createObservationHistoryV3CanonicalDayPublisher({
       ) {
         throw new Error(`Changed canonical connector evidence disagrees: ${dayUtc}/${connectorId}`);
       }
-      changedByConnector.set(connectorId, Object.freeze({
-        connector_authority_present: true,
-        payload,
-        evidence,
-        body,
-      }));
+      changedByConnector.set(connectorId, Object.freeze({ payload, evidence, body }));
     }
     const finalByConnector = new Map();
     const seenCurrentConnectorIds = new Set();
@@ -1151,12 +982,6 @@ export function createObservationHistoryV3CanonicalDayPublisher({
       });
       const changed = changedByConnector.get(connectorId);
       if (changed) {
-        if (!changed.connector_authority_present) {
-          if (payload.manifest_hash !== reference.manifest_hash) {
-            throw new Error(`Removed canonical day child identity disagrees: ${key}`);
-          }
-          continue;
-        }
         if (
           payload.manifest_hash !== changed.payload.manifest_hash ||
           liveBody.byteLength !== changed.evidence.byte_size ||
@@ -1175,7 +1000,6 @@ export function createObservationHistoryV3CanonicalDayPublisher({
     const changedConnectorIds = changedConnectors.map((entry) => Number(entry.connector_id));
     for (const [connectorId, changed] of changedByConnector) {
       if (seenCurrentConnectorIds.has(connectorId)) continue;
-      if (!changed.connector_authority_present) continue;
       const key = changed.evidence.key;
       const object = await getObject({ key });
       const liveBody = exactBody(object.body, key);
@@ -1231,12 +1055,6 @@ export function createObservationHistoryV3CanonicalDayPublisher({
       day_utc: dayUtc,
       current_connector_ids: Object.freeze([...currentConnectorIds].sort((a, b) => a - b)),
       changed_connector_ids: Object.freeze([...changedConnectorIds].sort((a, b) => a - b)),
-      absent_changed_connector_ids: Object.freeze(
-        [...changedByConnector]
-          .filter(([, changed]) => !changed.connector_authority_present)
-          .map(([connectorId]) => connectorId)
-          .sort((a, b) => a - b),
-      ),
       final_connector_ids: Object.freeze([...finalByConnector.keys()].sort((a, b) => a - b)),
       day_manifest: dayEvidence,
       day_manifest_payload: payload,
@@ -1400,10 +1218,4 @@ export function runDisconnectedSosHistoricalReplacementObservationHistoryV3Write
 
 export function runDisconnectedSupportedBackfillObservationHistoryV3Writer(options) {
   return runSupportedBackfillObservationHistoryV3Writer(v3OnlyOptions(options));
-}
-
-export function runDisconnectedSelectedScopeReconciliationObservationHistoryV3Writer(options) {
-  return runSelectedScopeReconciliationObservationHistoryV3Writer(
-    v3OnlyOptions(options),
-  );
 }

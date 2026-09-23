@@ -881,13 +881,13 @@ test("v3 publication plan and finaliser enforce child verification durability", 
 test("observation-only v3 resolver rejects every unsupported generation", () => {
   assert.equal(
     resolveObservationHistoryIndexV3BuildConfig({
-      env: { UK_AQ_R2_HISTORY_INDEX_VERSION: "v3" },
+      env: { UK_AQ_R2_HISTORY_VERSION: "v3" },
     }).index_root,
     "history/_index_v3/observations_timeseries",
   );
   assert.equal(
     resolveObservationHistoryIndexV3BuildConfig({
-      env: { UK_AQ_R2_HISTORY_INDEX_VERSION: "v2" },
+      env: { UK_AQ_R2_HISTORY_VERSION: "v3" },
       requestedIndexGeneration: "v3",
     }).index_generation,
     "v3",
@@ -895,9 +895,9 @@ test("observation-only v3 resolver rejects every unsupported generation", () => 
   for (const generation of ["", "v1", "v2", "v4", "V3", " v3", "v3 ", " v3 ", "v3\n"]) {
     assert.throws(
       () => resolveObservationHistoryIndexV3BuildConfig({
-        env: { UK_AQ_R2_HISTORY_INDEX_VERSION: generation },
+        env: { UK_AQ_R2_HISTORY_VERSION: generation },
       }),
-      /Unsupported observation-history index generation/,
+      /Unsupported observation-history index generation|must be exactly v2 or v3/,
     );
   }
 });

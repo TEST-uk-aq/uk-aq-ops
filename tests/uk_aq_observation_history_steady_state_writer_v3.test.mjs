@@ -12,9 +12,14 @@ import {
   runPruneDailyObservationHistoryV3ConnectorPublication,
   runPruneDailyObservationHistoryV3RunFinalization,
   runPruneDailyObservationHistoryV3Writer,
+  runSelectedScopeReconciliationObservationHistoryV3Writer,
   runSosHistoricalReplacementObservationHistoryV3Writer,
   runSupportedBackfillObservationHistoryV3Writer,
 } from "../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
+import {
+  OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
+  observationsGlobalOperationLockIdentity,
+} from "../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
   ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
 } from "../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
@@ -22,6 +27,23 @@ import {
 const LIMITS = ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3;
 const TARGET_GIT_SHA = "1".repeat(40);
 const BACKED_UP_AT_UTC = "2026-08-21T00:00:00.000Z";
+
+function selectedScopeLockEnv({ owner = "selected-scope-test", runId = "run-1" } = {}) {
+  const identity = observationsGlobalOperationLockIdentity();
+  return {
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: owner,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: runId,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.logicalIdentity]:
+      identity.logical_identity,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.classId]: String(identity.class_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.objectId]: String(identity.object_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.nonce]: "selected-scope-test-nonce",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.acquired]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: "0",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
+  };
+}
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -65,6 +87,7 @@ function buildFixture({
   reportPruneEligibility = false,
   afterConnectorRelease = null,
   currentPollutantsFor = null,
+  currentConnectorIdsFor = null,
 } = {}) {
   const events = [];
   const objects = new Map();
@@ -161,6 +184,7 @@ function buildFixture({
       day_utc: dayUtc,
       connector_id: connectorId,
       partitions: changedPartitions,
+      removed_scopes: removedScopes,
     }) => {
       connectorCalls.push({
         day_utc: dayUtc,
@@ -187,21 +211,30 @@ function buildFixture({
           ? []
           : connectorId === 1 ? ["o3"] : [];
       const completePruneSnapshot = source === "prune_daily";
+      const selectedScopeReconciliation =
+        source === "selected_scope_reconciliation";
+      const requestedRemovalPollutants = removedScopes
+        .map((scope) => scope.pollutant_code)
+        .sort();
       const finalPollutants = completePruneSnapshot
         ? changedPollutants
-        : [...new Set([
-          ...currentPollutants,
-          ...changedPollutants,
-        ])].sort();
+        : [...new Set([...currentPollutants, ...changedPollutants])]
+          .filter((pollutantCode) =>
+            !selectedScopeReconciliation ||
+            !requestedRemovalPollutants.includes(pollutantCode)
+          )
+          .sort();
       const finalPollutantSet = new Set(finalPollutants);
       const removedPollutants = completePruneSnapshot
         ? currentPollutants.filter((pollutantCode) =>
           !finalPollutantSet.has(pollutantCode)
         )
-        : [];
+        : selectedScopeReconciliation ? requestedRemovalPollutants : [];
+      const connectorAuthorityPresent = finalPollutants.length > 0;
       return {
         connector_scope_verified: true,
         parent_state_reread_under_lock: true,
+        current_day_authority_checked: selectedScopeReconciliation,
         day_utc: dayUtc,
         connector_id: connectorId,
         current_pollutant_codes: currentPollutants,
@@ -213,19 +246,39 @@ function buildFixture({
           connector_id: connectorId,
           pollutant_code: pollutantCode,
         })),
+        removal_results: selectedScopeReconciliation
+          ? removedScopes.map((scope) => ({
+            ...scope,
+            requested_removal: true,
+            previously_authoritative:
+              currentPollutants.includes(scope.pollutant_code),
+            final_scope_present: false,
+          }))
+          : [],
         pollutant_manifests: pollutantManifests,
-        connector_manifest: evidence(
-          `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
-        ),
+        connector_manifest: connectorAuthorityPresent
+          ? evidence(
+            `history/v3/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
+          )
+          : null,
+        connector_manifest_payload: connectorAuthorityPresent ? {} : null,
+        connector_authority_present: connectorAuthorityPresent,
         prune_eligibility_created: reportPruneEligibility,
       };
     },
     finalizeCanonicalDayManifests: async ({ day_utc: dayUtc, changed_connectors: changed }) => {
       events.push(`canonical:day:${dayUtc}`);
       if (failDay) throw new Error("fixture day failure");
-      const current = dayUtc === "2026-08-18" ? [9] : [8];
+      const current = typeof currentConnectorIdsFor === "function"
+        ? currentConnectorIdsFor({ dayUtc, changed })
+        : dayUtc === "2026-08-18" ? [9] : [8];
       const changedIds = changed.map((entry) => entry.connector_id).sort((a, b) => a - b);
-      const finalIds = [...new Set([...current, ...changedIds])].sort((a, b) => a - b);
+      const absentIds = new Set(changed
+        .filter((entry) => entry.canonical.connector_authority_present === false)
+        .map((entry) => entry.connector_id));
+      const finalIds = [...new Set([...current, ...changedIds])]
+        .filter((connectorId) => !absentIds.has(connectorId))
+        .sort((a, b) => a - b);
       dayCalls.push({ day_utc: dayUtc, current, changed: changedIds, final: finalIds });
       return {
         canonical_day_authority_verified: true,
@@ -234,7 +287,7 @@ function buildFixture({
         current_connector_ids: current,
         changed_connector_ids: changedIds,
         final_connector_ids: finalIds,
-        day_manifest: evidence(`history/v2/observations/day_utc=${dayUtc}/manifest.json`),
+        day_manifest: evidence(`history/v3/observations/day_utc=${dayUtc}/manifest.json`),
       };
     },
     finalizeCanonicalAggregateManifests: async ({ affected_days_utc: affectedDays }) => {
@@ -244,7 +297,7 @@ function buildFixture({
         parent_state_reread_under_lock: true,
         affected_days_utc: affectedDays,
         aggregate_manifests: [
-          evidence("history/v2/observations/_manifests/manifest.json"),
+          evidence("history/v3/observations/_manifests/manifest.json"),
         ],
       };
     },
@@ -325,11 +378,13 @@ function finalizationEvidence({
         connector_scope_verified: true,
         parent_state_reread_under_lock: true,
         connector_manifest: evidence(
-          `history/v2/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
+          `history/v3/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
         ),
         connector_manifest_payload: {},
+        connector_authority_present: true,
         removed_pollutant_codes: [],
         removed_scopes: [],
+        removal_results: [],
       },
       v3_exact_publication: { ok: true, status: "written" },
     }],
@@ -778,6 +833,157 @@ test("a later connector generation blocks stale latest publication without rewri
   );
   assert.deepEqual(fixture.objects.get(replacementRoot.key), Buffer.from(replacementRoot.body));
   assert.equal(fixture.activeLocks.size, 0);
+});
+
+test("fixed selected-scope adapter performs removal-only finalization without empty child output", async () => {
+  const fixture = buildFixture({
+    currentPollutantsFor: ({ dayUtc, connectorId }) =>
+      dayUtc === "2026-08-18" && connectorId === 1 ? ["o3"] : [],
+    currentConnectorIdsFor: ({ dayUtc }) =>
+      dayUtc === "2026-08-18" ? [1, 9] : [],
+  });
+  const removedScope = {
+    day_utc: "2026-08-18",
+    connector_id: 1,
+    pollutant_code: "o3",
+  };
+  const result = await runSelectedScopeReconciliationObservationHistoryV3Writer({
+    ...fixture.options,
+    env: selectedScopeLockEnv(),
+    expectedObservationsGlobalOperationLockOwner: "selected-scope-test",
+    expectedObservationsGlobalOperationLockRunId: "run-1",
+    partitions: [],
+    removedScopes: [removedScope],
+  });
+
+  assert.deepEqual(result.removed_scopes, [removedScope]);
+  assert.equal(result.removal_results.length, 1);
+  assert.deepEqual(
+    {
+      day_utc: result.removal_results[0].day_utc,
+      connector_id: result.removal_results[0].connector_id,
+      pollutant_code: result.removal_results[0].pollutant_code,
+      requested_removal: result.removal_results[0].requested_removal,
+      previously_authoritative:
+        result.removal_results[0].previously_authoritative,
+      final_scope_present: result.removal_results[0].final_scope_present,
+    },
+    {
+      ...removedScope,
+      requested_removal: true,
+      previously_authoritative: true,
+      final_scope_present: false,
+    },
+  );
+  assert.equal(
+    result.removal_results[0]
+      .canonical_connector_result.connector_authority_present,
+    false,
+  );
+  assert.deepEqual(
+    result.removal_results[0].canonical_day_result.final_connector_ids,
+    [9],
+  );
+  assert.equal(
+    result.removal_results[0]
+      .exact_v3_removal_result.removed_from_latest_global,
+    true,
+  );
+
+  const latest = JSON.parse(fixture.objects.get(fixture.latestKey).toString("utf8"));
+  const latestRoots = latest.day_summaries.flatMap((day) => day.scoped_roots);
+  assert.equal(latestRoots.some((root) =>
+    root.day_utc === removedScope.day_utc &&
+    root.connector_id === removedScope.connector_id &&
+    root.pollutant_code === removedScope.pollutant_code
+  ), false);
+  assert.equal(latestRoots.some((root) => root.connector_id === 99), true);
+  assert.equal(
+    fixture.events.some((event) => event.startsWith("parquet:")),
+    false,
+  );
+  assert.deepEqual(
+    fixture.publicationCalls.map((entry) => entry.stage),
+    ["latest_global"],
+  );
+});
+
+test("selected-scope removal rejects missing authority, malformed input, duplicates, and replace/remove overlap", async () => {
+  const scope = {
+    day_utc: "2026-08-18",
+    connector_id: 1,
+    pollutant_code: "pm25",
+  };
+  const fixture = buildFixture();
+  assert.throws(
+    () => runSelectedScopeReconciliationObservationHistoryV3Writer({
+      ...fixture.options,
+      env: {},
+      partitions: [],
+      removedScopes: [scope],
+    }),
+    /valid coordinator-owned observations global operation lock context/,
+  );
+  await assert.rejects(
+    runSelectedScopeReconciliationObservationHistoryV3Writer({
+      ...fixture.options,
+      env: selectedScopeLockEnv(),
+      partitions: [fixture.options.partitions[0]],
+      removedScopes: [scope],
+    }),
+    /cannot be both replaced and removed/,
+  );
+  await assert.rejects(
+    runSelectedScopeReconciliationObservationHistoryV3Writer({
+      ...fixture.options,
+      env: selectedScopeLockEnv(),
+      partitions: [],
+      removedScopes: [scope, scope],
+    }),
+    /duplicate removal scope/,
+  );
+  await assert.rejects(
+    runSelectedScopeReconciliationObservationHistoryV3Writer({
+      ...fixture.options,
+      env: selectedScopeLockEnv(),
+      partitions: [],
+      removedScopes: [{ ...scope, pollutant_code: "PM2.5" }],
+    }),
+    /pollutant_code is invalid/,
+  );
+  assert.equal(fixture.connectorCalls.length, 0);
+  assert.equal(
+    fixture.events.some((event) => event.startsWith("parquet:")),
+    false,
+  );
+});
+
+test("existing fixed-source adapters cannot acquire selected-scope removal authority", async () => {
+  const removedScopes = [{
+    day_utc: "2026-08-18",
+    connector_id: 1,
+    pollutant_code: "o3",
+  }];
+  for (const writer of [
+    runPruneDailyObservationHistoryV3Writer,
+    runIntegrityObservationHistoryV3Writer,
+    runSosHistoricalReplacementObservationHistoryV3Writer,
+    runSupportedBackfillObservationHistoryV3Writer,
+  ]) {
+    const fixture = buildFixture();
+    await assert.rejects(
+      writer({
+        ...fixture.options,
+        removedScopes,
+      }),
+      /not authorised for selected-scope removal/,
+    );
+    assert.equal(fixture.connectorCalls.length, 0);
+    assert.equal(
+      fixture.events.some((event) => event.startsWith("parquet:")),
+      false,
+    );
+  }
 });
 
 test("a stale unchanged latest dependency fails closed before latest publication", async () => {
