@@ -19,7 +19,7 @@ The archive is for retrospective performance and cost analysis. Google Cloud Log
 
 ## Ownership and boundaries
 
-- `UK_AQ_ENV_NAME`, read from the corresponding local ingest repository `.env`, selects exactly one environment: `TEST` or `LIVE`.
+- `UK_AQ_ENV_NAME`, read from the corresponding local ops repository `.env`, selects exactly one environment: `TEST` or `LIVE`.
 - The selected environment's Google Cloud Logging project/filter and credentials are the source for retained log entries; TEST and LIVE identities MUST remain separate.
 - Operational runtime material belongs under `/Users/mikehinford/uk-aq-gcp-logging-archive/<ENV>/`; the GCP logging archive subsystem MUST NOT use either `~/Library/Logs/UK-AQ` or `~/Library/Logs/UK AQ` for new runtime logs/evidence.
 - Raw archives remain in `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/<ENV>/GCP Logs`.
