@@ -151,37 +151,45 @@ Each run report records the selected environment, project/filter fingerprint,
 archive/redaction identity, bounded window/count/file evidence, watermark,
 status and exit code. Logs/reports are diagnostic, not checkpoint authority.
 
-## Render and install launchd jobs
+## Render and install the TEST launchd job
 
-Both labels use the same template and generic runner, with `RunAtLoad=true` and
-`StartInterval=86400`. Render each with its explicit ingest `.env` path:
+Both environment labels ultimately use the same template and generic runner,
+with `RunAtLoad=true` and `StartInterval=86400`. During TEST deployment, create
+only TEST runtime directories and render only the TEST plist from the TEST ops
+checkout. Do not create a LIVE runtime tree or render a LIVE plist at this
+stage:
 
 ```bash
 TEMPLATE=local/launchd/uk.co.ukaq.gcp-logging-archive.plist.template
 RUNTIME=/Users/mikehinford/uk-aq-gcp-logging-archive
-mkdir -p "$HOME/Library/LaunchAgents" "$RUNTIME/TEST/logs" "$RUNTIME/LIVE/logs"
+mkdir -p "$HOME/Library/LaunchAgents" "$RUNTIME/TEST/logs"
 python3 local/scripts/render_gcp_logging_archive_launchd.py "$TEMPLATE" \
   "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist" \
   --environment TEST --ingest-env-file /absolute/path/to/TEST-uk-aq-ingest/.env \
   --runtime-root "$RUNTIME"
-python3 local/scripts/render_gcp_logging_archive_launchd.py "$TEMPLATE" \
-  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.live.plist" \
-  --environment LIVE --ingest-env-file /absolute/path/to/LIVE-uk-aq-ingest/.env \
-  --runtime-root "$RUNTIME"
 plutil -lint "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
-plutil -lint "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.live.plist"
 ```
 
-After the manual TEST run succeeds, install only TEST:
+After the manual TEST run succeeds, explicitly enable the TEST label in case a
+persistent launchctl disabled override exists, then bootstrap it:
 
 ```bash
+launchctl enable "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.test"
 launchctl bootstrap "gui/$(id -u)" \
   "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
+```
+
+Observe the invocation started by `RunAtLoad`; do not immediately use
+`kickstart -k`, because that can kill and restart the incremental collection
+which bootstrap just started. To deliberately force an already-loaded TEST job
+to run immediately at some later time, use this separate operator command:
+
+```bash
 launchctl kickstart -k "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.test"
 ```
 
-Stop/uninstall either environment without touching the other (replace `test`
-with `live` only when intentionally operating LIVE):
+To stop/uninstall TEST without affecting LIVE, boot it out and remove its
+installed plist:
 
 ```bash
 launchctl bootout "gui/$(id -u)" \
@@ -189,7 +197,13 @@ launchctl bootout "gui/$(id -u)" \
 rm "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
 ```
 
-This leaves runtime state, evidence, credentials and Dropbox data intact.
+This ordinary stop/reinstall flow leaves the label enabled and leaves runtime
+state, evidence, credentials and Dropbox data intact. Only when the operator
+intends TEST to remain persistently disabled should they additionally run:
+
+```bash
+launchctl disable "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.test"
+```
 
 ## TEST acceptance and later LIVE promotion
 
@@ -215,10 +229,51 @@ local/scripts/render_gcp_logging_archive_launchd.py
 local/launchd/uk.co.ukaq.gcp-logging-archive.plist.template
 ```
 
-Do not copy system documentation. Give LIVE its own config, new/stated archive
-identity, empty appropriate state, read-only credential and explicit LIVE
-ingest `.env`. Before enabling unattended LIVE daily collection, run one
-deliberately bounded LIVE range to verify the LIVE Google account, project and
-filter. Then complete LIVE backfill and incremental operational acceptance;
-only after that is normal daily LIVE scheduling considered accepted. This
-bounded check specifically prevents TEST/LIVE identity or account mix-up.
+Do not copy system documentation. From the local LIVE ops checkout, create only
+the LIVE runtime directories and give LIVE its own config, new/stated archive
+identity, empty appropriate state and read-only credential. Render the LIVE
+plist there, explicitly using the LIVE ops checkout as `--repo-root` and the
+LIVE ingest repository `.env` as its environment source:
+
+```bash
+cd /absolute/path/to/LIVE-uk-aq-ops
+TEMPLATE=local/launchd/uk.co.ukaq.gcp-logging-archive.plist.template
+RUNTIME=/Users/mikehinford/uk-aq-gcp-logging-archive
+install -d -m 700 "$RUNTIME/LIVE"/{state,runs,logs,credentials}
+# Provision LIVE/config.json and the mode-600 LIVE credential before collection.
+python3 local/scripts/render_gcp_logging_archive_launchd.py "$TEMPLATE" \
+  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.live.plist" \
+  --environment LIVE --ingest-env-file /absolute/path/to/LIVE-uk-aq-ingest/.env \
+  --runtime-root "$RUNTIME" --repo-root /absolute/path/to/LIVE-uk-aq-ops
+plutil -lint "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.live.plist"
+```
+
+Before loading the job, use the generic runner from the LIVE ops checkout for
+one deliberately bounded LIVE range and verify the LIVE Google account,
+project and filter. Then complete LIVE backfill and incremental operational
+acceptance. Only after those checks should the operator explicitly enable and
+bootstrap normal LIVE scheduling:
+
+```bash
+local/scripts/run_gcp_logging_archive.sh \
+  --env-file /absolute/path/to/LIVE-uk-aq-ingest/.env \
+  --runtime-root /Users/mikehinford/uk-aq-gcp-logging-archive \
+  range --start BOUNDED_UTC_START --end BOUNDED_UTC_END
+# Verify the run report, selected account/project/filter and bounded output,
+# then complete the reviewed LIVE backfill and manual incremental acceptance.
+launchctl enable "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.live"
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.live.plist"
+```
+
+Observe the LIVE `RunAtLoad` invocation; do not immediately kickstart it. A
+later deliberate immediate run may use
+`launchctl kickstart -k "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.live"`.
+Bootout/removal stops an installed LIVE job without creating a persistent
+disabled override. Use
+`launchctl disable "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.live"` only
+when LIVE is intentionally meant to stay disabled.
+
+The bounded LIVE check specifically prevents a TEST/LIVE identity or account
+mix-up. Normal daily LIVE scheduling is not accepted until its separate
+backfill and incremental acceptance has completed.
