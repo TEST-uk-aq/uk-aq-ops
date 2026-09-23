@@ -25,7 +25,6 @@ import {
 } from "../../workers/shared/uk_aq_observation_history_index_v3.mjs";
 import {
   buildHistoryV2ConnectorManifestKey,
-  buildHistoryV2DayManifestKey,
   buildHistoryV2PollutantManifestKey,
   validateCanonicalHistoryV2Manifest,
 } from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
@@ -260,77 +259,20 @@ function samePhysicalScope(left, right) {
     JSON.stringify(comparablePhysicalScope(right));
 }
 
-async function currentDayManifest({ r2, generation, dayUtc, cache }) {
-  if (cache.has(dayUtc)) return cache.get(dayUtc);
-  const key = buildHistoryV2DayManifestKey(
-    generation.observations_prefix,
-    dayUtc,
-  );
-  const object = await optionalR2Object(r2, key);
-  const payload = object === null ? null : parseManifestObject(object, key, {
-    manifest_kind: "day",
-    day_utc: dayUtc,
-  });
-  cache.set(dayUtc, payload);
-  return payload;
-}
-
-export async function currentConnectorManifest({
-  r2,
-  generation,
-  scope,
-  cache = new Map(),
-  dayCache = new Map(),
-}) {
+async function currentConnectorManifest({ r2, generation, scope, cache }) {
   const identity = `${scope.day_utc}\u0000${scope.connector_id}`;
   if (cache.has(identity)) return cache.get(identity);
-  const day = await currentDayManifest({
-    r2,
-    generation,
-    dayUtc: scope.day_utc,
-    cache: dayCache,
-  });
-  if (day === null) {
-    cache.set(identity, null);
-    return null;
-  }
-  if (!Array.isArray(day.connector_manifests)) {
-    throw new Error(`Canonical day manifest has no connector children: ${day.manifest_key}`);
-  }
-  const matches = day.connector_manifests.filter((entry) =>
-    Number(entry?.connector_id) === scope.connector_id
-  );
-  if (matches.length > 1) {
-    throw new Error(`Canonical day manifest has duplicate connector ${scope.connector_id}`);
-  }
-  if (matches.length === 0) {
-    cache.set(identity, null);
-    return null;
-  }
-  const selected = matches[0];
   const key = buildHistoryV2ConnectorManifestKey(
     generation.observations_prefix,
     scope.day_utc,
     scope.connector_id,
   );
-  if (
-    selected.connector_id !== scope.connector_id ||
-    selected.manifest_key !== key
-  ) {
-    throw new Error(`Canonical day connector identity is contradictory: ${identity}`);
-  }
   const object = await optionalR2Object(r2, key);
-  if (object === null) {
-    throw new Error(`Canonical day-selected connector manifest is missing: ${key}`);
-  }
-  const payload = parseManifestObject(object, key, {
+  const payload = object === null ? null : parseManifestObject(object, key, {
     manifest_kind: "connector",
     day_utc: scope.day_utc,
     connector_id: scope.connector_id,
   });
-  if (payload.manifest_hash !== selected.manifest_hash) {
-    throw new Error(`Canonical day connector identity is stale: ${key}`);
-  }
   cache.set(identity, payload);
   return payload;
 }
@@ -391,13 +333,12 @@ function parquetTimestampToIso(value) {
   return parsed.toISOString();
 }
 
-export async function readCurrentPollutantState({
+async function readCurrentPollutantState({
   r2,
   generation,
   scope,
-  dayCache = new Map(),
-  connectorCache = new Map(),
-  pollutantCache = new Map(),
+  connectorCache,
+  pollutantCache,
 }) {
   const identity = `${scope.day_utc}\u0000${scope.connector_id}\u0000${scope.pollutant_code}`;
   if (pollutantCache.has(identity)) return pollutantCache.get(identity);
@@ -406,7 +347,6 @@ export async function readCurrentPollutantState({
     generation,
     scope,
     cache: connectorCache,
-    dayCache,
   });
   const child = connectorPollutantChild(connector, scope.pollutant_code);
   if (!child) {
@@ -518,7 +458,6 @@ async function materializeCompleteSelectedScopes({ plan, r2, generation }) {
     if (desiredByIdentity.has(identity)) throw new Error(`Protected plan duplicates scope ${identity}`);
     desiredByIdentity.set(identity, { scope, rows: [] });
   }
-  const dayCache = new Map();
   const connectorCache = new Map();
   const pollutantCache = new Map();
   const partitions = [];
@@ -540,7 +479,6 @@ async function materializeCompleteSelectedScopes({ plan, r2, generation }) {
       r2,
       generation,
       scope: desired.scope,
-      dayCache,
       connectorCache,
       pollutantCache,
     });
@@ -555,7 +493,6 @@ async function materializeCompleteSelectedScopes({ plan, r2, generation }) {
   return Object.freeze({
     partitions: Object.freeze(partitions),
     removedScopes: Object.freeze(removedScopes),
-    dayCache,
     connectorCache,
     pollutantCache,
   });
@@ -563,7 +500,7 @@ async function materializeCompleteSelectedScopes({ plan, r2, generation }) {
 
 async function filterChangedWriterInputs({ plan, r2, generation }) {
   const materialized = await materializeCompleteSelectedScopes({ plan, r2, generation });
-  const { dayCache, connectorCache, pollutantCache } = materialized;
+  const { connectorCache, pollutantCache } = materialized;
   const exactLatest = await loadExactLatest({ r2, generation });
   const changedPartitions = [];
   const changedRemovals = [];
@@ -581,7 +518,6 @@ async function filterChangedWriterInputs({ plan, r2, generation }) {
       r2,
       generation,
       scope: partition.scope,
-      dayCache,
       connectorCache,
       pollutantCache,
     });
@@ -616,7 +552,6 @@ async function filterChangedWriterInputs({ plan, r2, generation }) {
       generation,
       scope,
       cache: connectorCache,
-      dayCache,
     });
     const canonicalPresent = Boolean(
       connectorPollutantChild(connector, scope.pollutant_code),

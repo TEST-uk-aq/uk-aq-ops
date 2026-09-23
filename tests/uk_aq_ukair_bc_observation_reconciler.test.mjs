@@ -14,12 +14,116 @@ import {
   runLockedReconciliation,
 } from "../scripts/ukair_bc/uk_aq_ukair_bc_observation_reconciler.mjs";
 import {
+  currentConnectorManifest,
   mergeSelectedTimeseriesRows,
+  readCurrentPollutantState,
 } from "../scripts/ukair_bc/uk_aq_ukair_bc_observation_reconciler_locked.mjs";
+import {
+  getObservationHistoryGeneration,
+} from "../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
   buildObservationHistoryV3SteadyStatePartition,
 } from "../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
+import {
+  buildHistoryV2ConnectorManifest,
+  buildHistoryV2ConnectorManifestKey,
+  buildHistoryV2DayManifest,
+  buildHistoryV2DayManifestKey,
+} from "../workers/shared/uk_aq_r2_history_canonical.mjs";
+
+const TEST_WRITER_GIT_SHA = "2".repeat(40);
+const TEST_SCOPE = Object.freeze({
+  day_utc: "2026-07-01",
+  connector_id: 8,
+  pollutant_code: "bc",
+});
+
+function blackCarbonCanonicalFixture(rows) {
+  const generation = getObservationHistoryGeneration("v3");
+  const partition = buildObservationHistoryV3SteadyStatePartition({
+    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation,
+    rows,
+    scope: TEST_SCOPE,
+    targetWriterGitSha: TEST_WRITER_GIT_SHA,
+    observationsPrefix: generation.observations_prefix,
+    indexRoot: generation.observations_timeseries_index_prefix,
+  });
+  const connectorKey = buildHistoryV2ConnectorManifestKey(
+    generation.observations_prefix,
+    TEST_SCOPE.day_utc,
+    TEST_SCOPE.connector_id,
+  );
+  const connector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc: TEST_SCOPE.day_utc,
+    connectorId: TEST_SCOPE.connector_id,
+    manifestKey: connectorKey,
+    pollutantManifests: [partition.canonical_pollutant_manifest.payload],
+    writerGitSha: TEST_WRITER_GIT_SHA,
+    backedUpAtUtc: null,
+  });
+  const dayKey = buildHistoryV2DayManifestKey(
+    generation.observations_prefix,
+    TEST_SCOPE.day_utc,
+  );
+  const day = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc: TEST_SCOPE.day_utc,
+    manifestKey: dayKey,
+    connectorManifests: [connector],
+    writerGitSha: TEST_WRITER_GIT_SHA,
+    backedUpAtUtc: null,
+  });
+  return { generation, partition, connectorKey, connector, dayKey, day };
+}
+
+function manifestBody(payload) {
+  return Buffer.from(JSON.stringify(payload), "utf8");
+}
+
+function canonicalFixtureObjects(fixture, { day = fixture.day, connector = fixture.connector } = {}) {
+  return new Map([
+    [fixture.dayKey, manifestBody(day)],
+    [fixture.connectorKey, manifestBody(connector)],
+    [fixture.partition.canonical_pollutant_manifest.key,
+      fixture.partition.canonical_pollutant_manifest.body],
+    ...fixture.partition.file_intents.map((intent) => [intent.key, intent.body]),
+  ]);
+}
+
+function memoryR2(objects) {
+  const calls = [];
+  const r2 = {
+    adapter: {
+      headObject: async ({ key }) => {
+        calls.push({ operation: "head", key });
+        const body = objects.get(key);
+        return body === undefined
+          ? { exists: false, key }
+          : { exists: true, key, bytes: body.byteLength };
+      },
+      getObject: async ({ key }) => {
+        calls.push({ operation: "get", key });
+        const body = objects.get(key);
+        if (body === undefined) throw new Error(`Unexpected missing test object: ${key}`);
+        return { exists: true, key, bytes: body.byteLength, body };
+      },
+    },
+  };
+  return { r2, calls };
+}
+
+function currentStateArgs(r2, generation) {
+  return {
+    r2,
+    generation,
+    scope: TEST_SCOPE,
+    dayCache: new Map(),
+    connectorCache: new Map(),
+    pollutantCache: new Map(),
+  };
+}
 
 function annualCsv(series = "Black Carbon (880nm)") {
   return Buffer.from([
@@ -216,6 +320,137 @@ test("station-narrowed reconciliation preserves unselected canonical peer rows",
     timeseries_id: 202,
     value: 2,
   }]);
+});
+
+test("day authority omission ignores an orphan connector and its unselected station rows", async () => {
+  const stationA = {
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-07-01T01:00:00.000Z",
+    value: 1,
+    verification_status: "R",
+  };
+  const stationB = {
+    ...stationA,
+    station_id: 102,
+    timeseries_id: 202,
+    value: 2,
+  };
+  const fixture = blackCarbonCanonicalFixture([stationA, stationB]);
+  const emptyDay = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc: TEST_SCOPE.day_utc,
+    manifestKey: fixture.dayKey,
+    connectorManifests: [],
+    writerGitSha: TEST_WRITER_GIT_SHA,
+    backedUpAtUtc: null,
+  });
+  const { r2, calls } = memoryR2(canonicalFixtureObjects(fixture, { day: emptyDay }));
+
+  const current = await readCurrentPollutantState(
+    currentStateArgs(r2, fixture.generation),
+  );
+  assert.equal(current.connector, null);
+  assert.deepEqual(current.rows, []);
+  assert.equal(calls.some((call) => call.key === fixture.connectorKey), false);
+
+  const desiredA = { ...stationA, value: 3 };
+  assert.deepEqual(mergeSelectedTimeseriesRows({
+    currentRows: current.rows,
+    desiredRows: [desiredA],
+    selectedTimeseriesIds: [stationA.timeseries_id],
+  }), [desiredA]);
+});
+
+test("day-selected connector identity mismatch fails closed", async () => {
+  const selected = blackCarbonCanonicalFixture([{
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-07-01T01:00:00.000Z",
+    value: 1,
+    verification_status: "R",
+  }]);
+  const staleBody = blackCarbonCanonicalFixture([{
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-07-01T01:00:00.000Z",
+    value: 9,
+    verification_status: "R",
+  }]);
+  assert.notEqual(selected.connector.manifest_hash, staleBody.connector.manifest_hash);
+  const { r2 } = memoryR2(canonicalFixtureObjects(selected, {
+    connector: staleBody.connector,
+  }));
+
+  await assert.rejects(
+    () => currentConnectorManifest({
+      r2,
+      generation: selected.generation,
+      scope: TEST_SCOPE,
+      cache: new Map(),
+      dayCache: new Map(),
+    }),
+    /Canonical day connector identity is stale/,
+  );
+});
+
+test("valid day-selected connector preserves an unselected station peer", async () => {
+  const stationA = {
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-07-01T01:00:00.000Z",
+    value: 1,
+    verification_status: "R",
+  };
+  const stationB = {
+    ...stationA,
+    station_id: 102,
+    timeseries_id: 202,
+    value: 2,
+  };
+  const fixture = blackCarbonCanonicalFixture([stationA, stationB]);
+  const { r2 } = memoryR2(canonicalFixtureObjects(fixture));
+
+  const current = await readCurrentPollutantState(
+    currentStateArgs(r2, fixture.generation),
+  );
+  assert.equal(current.connector.manifest_hash, fixture.connector.manifest_hash);
+  assert.deepEqual(mergeSelectedTimeseriesRows({
+    currentRows: current.rows,
+    desiredRows: [{ ...stationA, value: 3 }],
+    selectedTimeseriesIds: [stationA.timeseries_id],
+  }), [{ ...stationA, value: 3 }, stationB]);
+});
+
+test("missing day authority treats the connector as absent without probing its stale object", async () => {
+  const fixture = blackCarbonCanonicalFixture([{
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-07-01T01:00:00.000Z",
+    value: 1,
+    verification_status: "R",
+  }]);
+  const objects = canonicalFixtureObjects(fixture);
+  objects.delete(fixture.dayKey);
+  const { r2, calls } = memoryR2(objects);
+
+  const current = await readCurrentPollutantState(
+    currentStateArgs(r2, fixture.generation),
+  );
+  assert.equal(current.connector, null);
+  assert.deepEqual(current.rows, []);
+  assert.equal(calls.some((call) => call.key === fixture.connectorKey), false);
+  assert.deepEqual(calls, [{ operation: "head", key: fixture.dayKey }]);
 });
 
 test("the shared selected-scope target writer accepts canonical bc and uv370 rows", () => {
