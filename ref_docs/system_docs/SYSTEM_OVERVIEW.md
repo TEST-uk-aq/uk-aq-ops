@@ -48,7 +48,7 @@ A normal coding task should enter through the relevant area below rather than re
 | Monitoring and Supabase egress attribution | [`monitoring/README.md`](monitoring/README.md) | Partly active; broader migration pending |
 | Backup, restore and R2 history Dropbox backup | [`backup_and_recovery/README.md`](backup_and_recovery/README.md) | Partly active; broader migration pending |
 | Prune daily and retention outside completed R2-history contracts | `prune_and_retention/` | Area migration pending |
-| Observs outbox and partition maintenance | `observs_operations/` | Area migration pending |
+| Observs partition maintenance; outbox migration still pending | [`observs_operations/README.md`](observs_operations/README.md) | Active for partition maintenance; outbox/flush-service migration pending |
 | Public/private APIs outside completed history/AQI boundaries | `api_services/` | Area migration pending |
 | Cloudflare and GCP scheduling | `scheduling/` | Area migration pending |
 | Shared runtime components and cross-area invariants | `shared/` | Area migration pending |
