@@ -2,7 +2,7 @@
 
 ## Status
 
-**Active TEST current-runtime contract and future shared TEST/LIVE implementation contract.** The existing TEST collector is deployed and operating. These rules also constrain the environment-agnostic refactor and later LIVE activation. LIVE collection is not current runtime until its environment-specific configuration and operational acceptance are complete.
+**Active TEST current-runtime contract and shared TEST/LIVE implementation contract.** The environment-agnostic implementation is deployed and functionally accepted for TEST. These rules govern the accepted TEST runtime and the later, separate LIVE activation. LIVE collection is not current runtime until its environment-specific configuration, bounded source/account verification and operational acceptance are complete.
 
 ## Scope
 
@@ -35,7 +35,7 @@ where `<ENV>` is the validated `UK_AQ_ENV_NAME`. The environment tree owns its c
 
 Equivalent filenames inside those owned directories are implementation detail, but TEST and LIVE MUST NOT share mutable state, run evidence, logs or credentials.
 
-After migration, this subsystem MUST NOT write new configuration, checkpoints, run evidence or operational logs beneath `~/Library/Logs/UK-AQ`, `~/Library/Logs/UK AQ`, `~/.config/uk-aq/gcp-logging-archive-*.json` or `~/.local/state/uk-aq/gcp-logging-archive`. Existing TEST evidence in superseded locations MAY be retained temporarily as rollback/history evidence until the migrated TEST runtime is accepted.
+The accepted runtime MUST NOT write new configuration, checkpoints, run evidence or operational logs beneath `~/Library/Logs/UK-AQ`, `~/Library/Logs/UK AQ`, `~/.config/uk-aq/gcp-logging-archive-*.json` or `~/.local/state/uk-aq/gcp-logging-archive`. Existing TEST evidence in superseded locations MAY be retained temporarily as rollback/history evidence until the operator approves retirement.
 
 Implementation code remains in the ops repository and is not part of the runtime-state tree. The corresponding ops repository `.env` remains the authority only for `UK_AQ_ENV_NAME`; secrets and full process environments MUST NOT be copied into run evidence.
 
@@ -230,9 +230,9 @@ and both watermarks MUST remain unchanged.
 
 ## Local runtime migration
 
-The deployed TEST archive generation MUST be migrated, not recreated. Moving TEST configuration, checkpoints/state, run evidence and operational logs into `/Users/mikehinford/uk-aq-gcp-logging-archive/TEST/` MUST preserve the existing TEST source identity, stable `archive_id`, redaction identity and incremental/backfill watermarks. The Dropbox archive remains at `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/TEST/GCP Logs/`.
+The TEST archive generation was migrated and functionally accepted on 23/09/2026 without recreation. The accepted runtime is under `/Users/mikehinford/uk-aq-gcp-logging-archive/TEST/`; the existing TEST source identity, stable `archive_id`, redaction identity and incremental/backfill watermarks were preserved, and the Dropbox archive remains at `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/TEST/GCP Logs/`.
 
-The old TEST launchd job MUST be stopped while mutable state/configuration is moved. The new generic TEST runner MUST be structurally validated before deployment and then accepted through a real TEST incremental operation. Superseded runtime files MUST NOT be treated as active authority after acceptance.
+Superseded TEST configuration, state and evidence may remain temporarily for rollback/history, but MUST NOT be treated as active authority. Any future runtime relocation or recovery MUST preserve the same identity and checkpoint rules rather than reinitialising the accepted archive generation.
 
 ## Credentials and security
 
@@ -246,19 +246,20 @@ The collector MUST NOT require a Cloud Logging sink, BigQuery retention sink, Cl
 
 ## Functional acceptance
 
-Before deployment, validation is limited to structural viability and narrowly justified deterministic safety checks.
+Before any future deployment, validation is limited to structural viability and narrowly justified deterministic safety checks.
 
-The environment-agnostic refactor is accepted through real TEST operation after installation. Acceptance includes confirming:
+TEST acceptance completed on 23/09/2026 through real operation of the environment-agnostic implementation. Acceptance evidence confirmed:
 
-- `UK_AQ_ENV_NAME=TEST` resolves the TEST runtime/configuration and no LIVE material;
-- expected structured and request logs are archived;
-- pagination and overlapping reads do not leave gaps or amplify duplicates;
-- late-arriving entries are merged into their event-date files;
+- `UK_AQ_ENV_NAME=TEST` resolves the isolated TEST runtime/configuration and no LIVE material;
+- a real manual incremental run and the installed TEST `RunAtLoad` launchd run both succeeded;
+- expected structured, text and Cloud Run request logs are archived;
+- pagination and overlapping reads complete without duplicate amplification;
+- overlapping collection merges late-arriving/new entries into the correct event-date file;
 - checkpoints advance only after successful publication;
-- range replay is idempotent at the retained-identity level;
-- manifest mismatches fail before source retrieval/archive mutation;
+- a bounded range replay returned only already-retained entries, added zero new entries, left the deterministic gzip archive byte-identical and left both incremental/backfill checkpoints unchanged;
+- deliberate archive-manifest and checkpoint-environment mismatches fail closed before source retrieval/archive mutation, while the real manifest, archive and checkpoints remain unchanged;
 - Dropbox receives the raw files through normal filesystem synchronisation;
-- known sensitive fields are absent;
-- collector failures do not affect UK AQ cloud workloads.
+- configured sensitive fields are absent from the retained archive;
+- collector failures remain isolated from UK AQ cloud workloads.
 
-LIVE activation is permitted only after the shared implementation has been accepted on TEST and the LIVE runtime has its own project/filter, archive identity, credentials and empty/new state as appropriate. Before enabling the unattended LIVE daily job, perform one deliberately bounded LIVE read/collection to verify the separate LIVE Google identity and source selection, then complete the required LIVE backfill/incremental operational acceptance. This targeted check exists to prevent a TEST/LIVE account or project mix-up; it is not a speculative pre-implementation test suite.
+LIVE activation is permitted because the shared implementation has now been accepted on TEST, but LIVE is still a separate deployment and acceptance exercise. The LIVE runtime MUST have its own project/filter, archive identity, credentials and empty/new state as appropriate. Before enabling the unattended LIVE daily job, perform one deliberately bounded LIVE read/collection to verify the separate LIVE Google identity and source selection, then complete the required LIVE backfill/incremental operational acceptance. This targeted check exists to prevent a TEST/LIVE account or project mix-up; it is not a speculative pre-implementation test suite.
