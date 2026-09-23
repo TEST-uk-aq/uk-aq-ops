@@ -2,45 +2,74 @@
 
 ## Status
 
-**Future implementation contract.** These rules constrain the TEST collector implementation but are not evidence that the collector is deployed or accepted.
+**Active TEST current-runtime contract and future shared TEST/LIVE implementation contract.** The existing TEST collector is deployed and operating. These rules also constrain the environment-agnostic refactor and later LIVE activation. LIVE collection is not current runtime until its environment-specific configuration and operational acceptance are complete.
 
 ## Scope
 
-The first implementation is TEST-only and runs on the always-on MacBook Pro. It reads selected TEST Google Cloud Logging entries with read-only credentials and writes a compressed structured archive into the locally synchronised Dropbox filesystem.
+The collector runs on the always-on MacBook Pro. One environment-agnostic implementation MUST support TEST and LIVE while keeping their configuration, credentials, state, evidence and archives isolated.
 
-The initial source scope is the TEST Cloud Run services needed for cost/performance analysis, including Latest Snapshot, selected ingestion services, their structured application logs and Cloud Run request logs. The exact project and log filter are configuration, not inferred LIVE values.
+The runner MUST obtain `UK_AQ_ENV_NAME` from the corresponding local ingest repository `.env`. The only valid values are exactly `TEST` and `LIVE`. A missing, ambiguous or different value MUST fail closed before selecting credentials, creating the Cloud Logging client, retrieving entries or mutating archive/state. Environment identity MUST NOT be inferred from the ops repository path, Google project, archive path or another default.
+
+Each environment's source scope is its configured Cloud Run services needed for cost/performance and operational analysis, including Latest Snapshot, selected ingestion services, their structured application logs and Cloud Run request logs. Project IDs and exact log filters are environment-specific configuration and MUST NOT be copied or inferred from the other environment.
 
 The collector MUST NOT alter Cloud Run, schedulers, ingestion, Latest Snapshot cadence, application logging verbosity or another UK AQ cloud workload.
 
-## Archive layout and identities
+## Environment-isolated local runtime
 
-The Dropbox-retained archive generation has this logical layout:
+All GCP logging archive operational runtime material MUST live below:
 
 ```text
-<archive_root>/
-  TEST/
-    GCP Logs/
-      archive-identity.json
-      raw/
-        YYYY/
-          MM/
-            YYYY-MM-DD.jsonl.gz
+/Users/mikehinford/uk-aq-gcp-logging-archive/<ENV>/
 ```
 
-The environment directory is deliberately above `GCP Logs`. A future
-separately authorised LIVE implementation therefore uses the sibling layout
-`<archive_root>/LIVE/GCP Logs/`; TEST and LIVE archive generations MUST NOT be
-nested under one shared `GCP Logs` directory.
+where `<ENV>` is the validated `UK_AQ_ENV_NAME`. The environment tree owns its configuration, checkpoints/state, run evidence, launchd/operator logs and Google credential material. A conventional layout is:
 
-Checkpoint state and operator run evidence MUST remain outside the Dropbox raw archive. Their locations are explicit local configuration.
+```text
+<ENV>/
+  config.json
+  state/
+  runs/
+  logs/
+  credentials/
+```
+
+Equivalent filenames inside those owned directories are implementation detail, but TEST and LIVE MUST NOT share mutable state, run evidence, logs or credentials.
+
+After migration, this subsystem MUST NOT write new configuration, checkpoints, run evidence or operational logs beneath `~/Library/Logs/UK-AQ`, `~/Library/Logs/UK AQ`, `~/.config/uk-aq/gcp-logging-archive-*.json` or `~/.local/state/uk-aq/gcp-logging-archive`. Existing TEST evidence in superseded locations MAY be retained temporarily as rollback/history evidence until the migrated TEST runtime is accepted.
+
+Implementation code remains in the ops repository and is not part of the runtime-state tree. The corresponding ingest repository `.env` remains the authority only for `UK_AQ_ENV_NAME`; secrets and full process environments MUST NOT be copied into run evidence.
+
+## Archive layout and identities
+
+The effective Dropbox-retained archive destinations are:
+
+```text
+/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/TEST/GCP Logs/
+/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/LIVE/GCP Logs/
+```
+
+Each environment has the same logical archive layout:
+
+```text
+GCP Logs/
+  archive-identity.json
+  raw/
+    YYYY/
+      MM/
+        YYYY-MM-DD.jsonl.gz
+```
+
+The environment directory is deliberately above `GCP Logs`. TEST and LIVE archive generations MUST NOT be nested under one shared `GCP Logs` directory and MUST NOT share archive identity.
+
+Checkpoint state and operator run evidence MUST remain outside Dropbox under the environment-isolated runtime root defined above.
 
 Each archive generation MUST have a stable `archive_id`.
 
 The archive identity manifest MUST bind, at minimum:
 
 - manifest schema version;
-- TEST environment;
-- TEST project ID and exact log-filter identity;
+- validated environment (`TEST` or `LIVE`);
+- selected environment project ID and exact log-filter identity;
 - stable `archive_id`;
 - resolved raw archive destination;
 - exact redaction-policy identity.
@@ -65,7 +94,7 @@ A redaction-policy change is incompatible with an existing archive generation. I
 
 Overlapping reads and safe reruns are expected.
 
-When `insertId` is present, identity MUST be deterministic within the configured TEST source and include the log identity; the implementation MAY additionally include monitored-resource identity to prevent collisions between copied or reused IDs.
+When `insertId` is present, identity MUST be deterministic within the configured environment source and include the log identity; the implementation MAY additionally include monitored-resource identity to prevent collisions between copied or reused IDs.
 
 When `insertId` is absent, the fallback MUST be a deterministic content identity derived from stable sanitised source fields and MUST exclude `receiveTimestamp` so redelivery does not create a new identity.
 
@@ -81,7 +110,16 @@ The overlap protects against delayed delivery. Entries are still partitioned int
 
 The initial incremental run MAY use a configured bounded lookback when no incremental checkpoint exists.
 
-The normal schedule is daily via TEST-specific launchd using `StartInterval=86400`. Cloud Logging remains the recent troubleshooting source; the Dropbox archive is primarily retained for historical service-usage, cost and configuration analysis. An operator MAY trigger the launchd job or run incremental collection manually when a more current archive copy is wanted. This contract does not authorise changing other UK AQ schedules.
+The normal schedule is daily via separate environment launchd jobs using `StartInterval=86400`:
+
+```text
+uk.co.ukaq.gcp-logging-archive.test
+uk.co.ukaq.gcp-logging-archive.live
+```
+
+Both jobs MUST use the same generic runner semantics and environment contract. Each job resolves the corresponding ingest `.env`, validates `UK_AQ_ENV_NAME`, and then selects only that environment's runtime/configuration and credentials. The jobs MUST NOT share checkpoints or a mutable global authentication selection.
+
+Cloud Logging remains the recent troubleshooting source; the Dropbox archive is primarily retained for historical service-usage, cost and configuration analysis. An operator MAY trigger the relevant launchd job or run incremental collection manually when a more current archive copy is wanted. This contract does not authorise changing other UK AQ schedules.
 
 ## Backfill and bounded range
 
@@ -97,13 +135,13 @@ Bounded range MUST use the same archive-manifest and redaction protections as in
 
 The collector MUST consume all API pages for the selected bounded query.
 
-Cloud Logging `entries.list` reads MUST be explicitly paced below the project-wide API quota rather than allowing sparse backfill windows to issue requests as fast as the client can return them. The TEST implementation uses a 1.5-second minimum interval between page requests by default.
+Cloud Logging `entries.list` reads MUST be explicitly paced below the project-wide API quota rather than allowing sparse backfill windows to issue requests as fast as the client can return them. The implementation uses a 1.5-second minimum interval between page requests by default for each environment.
 
 Quota exhaustion responses, including HTTP 429 / `ResourceExhausted`, MUST use bounded exponential retry/backoff. Retried reads MUST remain read-only and page-stable: an unsuccessful page request MUST NOT publish entries or advance a checkpoint. If the bounded retry period is exhausted, the run MUST fail while retaining the last successfully published checkpoint so the same operation can resume safely.
 
 Read pacing and retry controls are operational configuration. Changing them does not by itself change source, archive or redaction identity.
 
-The configured TEST project and exact filter form the source identity used by the archive manifest, checkpoints and run evidence. A changed project/filter MUST fail against old identity evidence until the operator deliberately starts or rebuilds from an appropriate safe boundary.
+The selected environment, configured project and exact filter form the source identity used by the archive manifest, checkpoints and run evidence. A changed environment/project/filter MUST fail against old identity evidence until the operator deliberately starts or rebuilds from an appropriate safe boundary.
 
 ## Daily publication
 
@@ -145,11 +183,11 @@ Range mode does not require a progress checkpoint but remains protected by the a
 
 ## Locking
 
-The TEST collector MUST use an exclusive local invocation lock before source retrieval or archive mutation.
+Each environment collector invocation MUST use an exclusive local invocation lock within that environment's runtime state before source retrieval or archive mutation.
 
 If another invocation already holds the lock, the new invocation MUST not wait and MUST not retrieve or mutate archive data. It SHOULD leave bounded run evidence explaining the lock contention.
 
-The lock protects incremental, backfill and range operations from concurrent writes to the same archive/checkpoints. The operating-system lock, not the continued existence of the lock file, determines ownership.
+The lock protects incremental, backfill and range operations from concurrent writes to the same environment archive/checkpoints. TEST and LIVE MUST use distinct locks so one environment does not block the other. The operating-system lock, not the continued existence of the lock file, determines ownership.
 
 ## Run evidence and operator progress
 
@@ -190,9 +228,17 @@ checkpoint may then change from the old `GCP Logs/TEST/raw` path to the new
 `TEST/GCP Logs/raw` path. Source identity, `archive_id`, redaction identity
 and both watermarks MUST remain unchanged.
 
+## Local runtime migration
+
+The deployed TEST archive generation MUST be migrated, not recreated. Moving TEST configuration, checkpoints/state, run evidence and operational logs into `/Users/mikehinford/uk-aq-gcp-logging-archive/TEST/` MUST preserve the existing TEST source identity, stable `archive_id`, redaction identity and incremental/backfill watermarks. The Dropbox archive remains at `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/TEST/GCP Logs/`.
+
+The old TEST launchd job MUST be stopped while mutable state/configuration is moved. The new generic TEST runner MUST be structurally validated before deployment and then accepted through a real TEST incremental operation. Superseded runtime files MUST NOT be treated as active authority after acceptance.
+
 ## Credentials and security
 
-The collector MUST use TEST-specific read-only Google authentication.
+TEST and LIVE MUST use separate environment-specific read-only Google authentication. Scheduled jobs MUST NOT depend on one mutable global Application Default Credentials selection that is switched between accounts.
+
+Environment-specific credential material MUST be stored outside Git and Dropbox beneath the corresponding `/Users/mikehinford/uk-aq-gcp-logging-archive/<ENV>/credentials/` tree with restrictive local permissions. The generic runner MUST select only the credential material belonging to the validated environment.
 
 Credentials, access tokens, private keys and full process environments MUST NOT be written into Git, the raw archive or run evidence.
 
@@ -202,8 +248,9 @@ The collector MUST NOT require a Cloud Logging sink, BigQuery retention sink, Cl
 
 Before deployment, validation is limited to structural viability and narrowly justified deterministic safety checks.
 
-Functional acceptance occurs through real TEST operation after installation. Acceptance includes confirming:
+The environment-agnostic refactor is accepted through real TEST operation after installation. Acceptance includes confirming:
 
+- `UK_AQ_ENV_NAME=TEST` resolves the TEST runtime/configuration and no LIVE material;
 - expected structured and request logs are archived;
 - pagination and overlapping reads do not leave gaps or amplify duplicates;
 - late-arriving entries are merged into their event-date files;
@@ -214,4 +261,4 @@ Functional acceptance occurs through real TEST operation after installation. Acc
 - known sensitive fields are absent;
 - collector failures do not affect UK AQ cloud workloads.
 
-Only after TEST has operated successfully and proved useful may a separate LIVE implementation be considered.
+LIVE activation is permitted only after the shared implementation has been accepted on TEST and the LIVE runtime has its own project/filter, archive identity, credentials and empty/new state as appropriate. Before enabling the unattended LIVE daily job, perform one deliberately bounded LIVE read/collection to verify the separate LIVE Google identity and source selection, then complete the required LIVE backfill/incremental operational acceptance. This targeted check exists to prevent a TEST/LIVE account or project mix-up; it is not a speculative pre-implementation test suite.
