@@ -1,4 +1,5 @@
 key,target
+UK_AQ_ENV_NAME,variable
 SUPABASE_URL,variable
 OBS_AQIDB_SUPABASE_URL,variable
 SB_SECRET_KEY,secret
