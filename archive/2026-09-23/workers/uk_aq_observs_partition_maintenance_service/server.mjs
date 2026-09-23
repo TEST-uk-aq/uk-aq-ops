@@ -3,7 +3,6 @@ import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
-import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 import { validateRunAuth } from "./run_auth.mjs";
 
 const RPC_SCHEMA = "uk_aq_public";
@@ -309,7 +308,6 @@ function computeRetentionCutoffUtc(now, retentionDays) {
 
 export function buildObservsConfig(url) {
   const params = url.searchParams;
-  const historyGeneration = resolveObservationHistoryGeneration(process.env);
 
   const futurePartitionDays = parsePositiveInt(
     params.get("futureDays") ?? process.env.OBSERVS_PARTITIONS_FUTURE_DAYS,
@@ -355,8 +353,10 @@ export function buildObservsConfig(url) {
       accessKeyId: (process.env.CFLARE_R2_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || "").trim(),
       secretAccessKey: (process.env.CFLARE_R2_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || "").trim(),
       region: (process.env.CFLARE_R2_REGION || process.env.R2_REGION || "auto").trim() || "auto",
-      historyGeneration,
-      observationsPrefix: historyGeneration.observations_prefix,
+      observationsPrefix: (
+        process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX
+        || "history/v1/observations"
+      ).trim().replace(/^\/+|\/+$/g, ""),
     },
   };
 }
@@ -682,29 +682,11 @@ async function r2GetManifestJson(r2, manifestKey) {
   };
 }
 
-function validateManifestHash(dayUtc, manifestKey, manifest) {
+function validateManifestHash(dayUtc, manifest) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
     return {
       confirmed: false,
       reason: "manifest_not_object",
-    };
-  }
-
-  if (manifest.manifest_kind !== "day") {
-    return {
-      confirmed: false,
-      reason: "manifest_kind_mismatch",
-      manifest_kind: manifest.manifest_kind ?? null,
-      expected_manifest_kind: "day",
-    };
-  }
-
-  if (manifest.domain !== "observations") {
-    return {
-      confirmed: false,
-      reason: "manifest_domain_mismatch",
-      manifest_domain: manifest.domain ?? null,
-      expected_manifest_domain: "observations",
     };
   }
 
@@ -717,15 +699,6 @@ function validateManifestHash(dayUtc, manifestKey, manifest) {
       reason: "manifest_day_mismatch",
       manifest_day_utc: manifestDayUtc || null,
       expected_day_utc: dayUtc,
-    };
-  }
-
-  if (manifest.manifest_key !== manifestKey) {
-    return {
-      confirmed: false,
-      reason: "manifest_key_mismatch",
-      manifest_key: manifest.manifest_key ?? null,
-      expected_manifest_key: manifestKey,
     };
   }
 
@@ -791,7 +764,7 @@ async function historyManifestExists(dayUtc, r2) {
       };
     }
 
-    const validationResult = validateManifestHash(dayUtc, headResult.manifest_key, getResult.manifest);
+    const validationResult = validateManifestHash(dayUtc, getResult.manifest);
     if (!validationResult.confirmed) {
       return {
         confirmed: false,
@@ -962,8 +935,6 @@ async function runObservsPartitionMaintenance(config) {
     observs_retention_days: config.observsRetentionDays,
     retention_cutoff_utc: retentionCutoffIso,
     drop_dry_run: config.dropDryRun,
-    observation_history_generation: config.r2.historyGeneration.version,
-    observation_history_prefix: config.r2.observationsPrefix,
   });
 
   const ensured = await callRpcWithRetry(
@@ -1176,7 +1147,6 @@ async function runObservsPartitionMaintenance(config) {
         partition_name: candidate.partition_name,
         partition_day_utc: candidate.partition_day_utc,
         history_manifest_method: historyManifestCheck.method,
-        history_manifest_check: historyManifestCheck,
         day_count_deleted_rows: dayCountDelete.deleted_rows,
         day_count_delete_error: dayCountDelete.error,
       });
@@ -1185,7 +1155,6 @@ async function runObservsPartitionMaintenance(config) {
         partition_name: candidate.partition_name,
         partition_day_utc: candidate.partition_day_utc,
         history_manifest_method: historyManifestCheck.method,
-        history_manifest_check: historyManifestCheck,
         day_count_deleted_rows: dayCountDelete.deleted_rows,
         day_count_delete_error: dayCountDelete.error,
       });
@@ -1213,8 +1182,6 @@ async function runObservsPartitionMaintenance(config) {
     retention_cutoff_utc: retentionCutoffIso,
     observs_retention_days: config.observsRetentionDays,
     drop_dry_run: config.dropDryRun,
-    observation_history_generation: config.r2.historyGeneration.version,
-    observation_history_prefix: config.r2.observationsPrefix,
     ensured_partition_count: ensured.length,
     partitions_ensured_count: ensured.length,
     partitions_created_count: countCreatedPartitions(ensured),
