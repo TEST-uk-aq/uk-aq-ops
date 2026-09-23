@@ -6098,6 +6098,9 @@
             const durationValue = meta.durationSeconds === null ? "n/a" : (formatDurationSeconds(meta.durationSeconds) || "n/a");
             const summaryText = formatDailyTaskSummary(row.summary);
             const taskSummary = parseDailyTaskSummaryObject(row.summary);
+            const warningPill = meta.statusLabel === "Finished" && Array.isArray(taskSummary && taskSummary.warnings) && taskSummary.warnings.length > 0
+              ? '<span class="status-pill warning">WARNING</span>'
+              : "";
             const dryRunPill = taskSummary && taskSummary.dry_run === true
               ? '<span class="status-pill dry-run">Dry Run</span>'
               : "";
@@ -6111,7 +6114,7 @@
                   </div>
                 </td>
                 <td class="daily-task-platform">${escapeHtml(platformLabel)}</td>
-                <td><span class="daily-task-status-pills"><span class="status-pill ${escapeHtml(meta.statusClass)}">${escapeHtml(meta.statusLabel)}</span>${dryRunPill}</span></td>
+                <td><span class="daily-task-status-pills"><span class="status-pill ${escapeHtml(meta.statusClass)}">${escapeHtml(meta.statusLabel)}</span>${warningPill}${dryRunPill}</span></td>
                 <td>${escapeHtml(scheduledValue)}</td>
                 <td>${escapeHtml(finishedValue)}</td>
                 <td>${escapeHtml(durationValue)}</td>
