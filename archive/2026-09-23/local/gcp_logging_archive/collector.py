@@ -92,7 +92,16 @@ def environment_name() -> str:
 
 
 def archive_identity(config: dict) -> dict:
-    archive_path = str(Path(os.path.expanduser(config["archive_path"])).resolve())
+    configured_identity_path = str(config.get("archive_identity_path") or "").strip()
+    if configured_identity_path:
+        archive_path = configured_identity_path
+    else:
+        archive_path = str(
+            (
+                Path(os.path.expanduser(config["archive_root"]))
+                / f"{environment_name()}/GCP Logs/raw"
+            ).resolve()
+        )
     return {
         "archive_id": config["archive_id"],
         "archive_path": archive_path,
@@ -228,11 +237,11 @@ class TeeHandler(logging.Handler):
 
 
 class Collector:
-    def __init__(self, config: dict, state_dir: Path):
+    def __init__(self, config: dict):
         self.config = config
         self.project = config["project_id"]
-        self.archive = Path(archive_identity(config)["archive_path"])
-        self.state = state_dir
+        self.archive = Path(os.path.expanduser(config["archive_root"])) / f"{environment_name()}/GCP Logs/raw"
+        self.state = Path(os.path.expanduser(config["state_dir"]))
         self.redact = config.get("redact_paths", [])
         self.min_read_interval_seconds = float(config.get("min_read_interval_seconds", 1.5))
         self.quota_retry_initial_seconds = float(config.get("quota_retry_initial_seconds", 5.0))
@@ -404,16 +413,10 @@ class Collector:
         }
 
 
-def checkpoint(path: Path, expected_environment: str, expected_source: dict,
-               expected_archive: dict, expected_redaction: dict) -> dict:
+def checkpoint(path: Path, expected_source: dict, expected_archive: dict, expected_redaction: dict) -> dict:
     if not path.exists():
         return {}
     value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("environment") != expected_environment:
-        raise RuntimeError(
-            f"checkpoint environment mismatch at {path}: expected {expected_environment}; "
-            "do not reuse or rewrite another environment's checkpoint"
-        )
     actual = value.get("source", {})
     if actual.get("source_fingerprint") != expected_source["source_fingerprint"]:
         raise RuntimeError(
@@ -451,7 +454,7 @@ def new_report(config: dict, args: argparse.Namespace, run_id: str, run_start: d
         "source": source_identity(config),
         "archive": archive_identity(config),
         "redaction": redaction_identity(config),
-        "runtime_root": config["runtime_root"],
+        "archive_root": config["archive_root"],
         "overlap_seconds": int(config.get("overlap_seconds", 7200)) if args.mode == "incremental" else None,
         "api_read_control": {
             "min_read_interval_seconds": float(config.get("min_read_interval_seconds", 1.5)),
@@ -499,7 +502,6 @@ def record_window(report: dict, window: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--runtime-root", required=True, type=Path)
     sub = parser.add_subparsers(dest="mode", required=True)
     sub.add_parser("incremental")
     backfill = sub.add_parser("backfill")
@@ -509,27 +511,14 @@ def main() -> int:
     bounded.add_argument("--start", required=True)
     bounded.add_argument("--end", required=True)
     args = parser.parse_args()
-    selected_environment = environment_name()
-    runtime_root = args.runtime_root.expanduser().resolve()
-    if runtime_root.name != selected_environment:
-        parser.error("runtime root basename must exactly match UK_AQ_ENV_NAME")
     config = json.loads(args.config.read_text(encoding="utf-8"))
-    for key in ("environment", "project_id", "log_filter", "archive_id", "archive_path"):
+    for key in ("project_id", "log_filter", "archive_id", "archive_root", "state_dir", "run_evidence_root"):
         if not config.get(key):
             parser.error(f"config requires {key}")
-    if config["environment"] != selected_environment:
-        parser.error("config environment must exactly match UK_AQ_ENV_NAME")
-    expected_archive_path = Path(
-        f"/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/"
-        f"{selected_environment}/GCP Logs/raw"
-    ).resolve()
-    if Path(os.path.expanduser(config["archive_path"])).resolve() != expected_archive_path:
-        parser.error(f"archive_path must be the selected environment destination: {expected_archive_path}")
-    config["runtime_root"] = str(runtime_root)
 
     run_start = dt.datetime.now(UTC)
     run_id = f"{run_start:%Y%m%dT%H%M%SZ}_{args.mode}_{uuid.uuid4().hex[:8]}"
-    run_dir = runtime_root / "runs" / run_id
+    run_dir = Path(os.path.expanduser(config["run_evidence_root"])) / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     handler = TeeHandler(run_dir / "run.log")
     formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
@@ -542,7 +531,7 @@ def main() -> int:
     report = new_report(config, args, run_id, run_start)
     report_path = run_dir / "run-report.json"
     atomic_json(report_path, report)
-    state_dir = runtime_root / "state"
+    state_dir = Path(os.path.expanduser(config["state_dir"]))
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_stream = (state_dir / "collector.lock").open("a")
     try:
@@ -571,8 +560,8 @@ def main() -> int:
         atomic_json(report_path, report)
         if args.mode == "incremental":
             cp_path = state_dir / "incremental.json"
-            cp = checkpoint(cp_path, selected_environment, report["source"], report["archive"], report["redaction"])
-            collector = Collector(config, state_dir)
+            cp = checkpoint(cp_path, report["source"], report["archive"], report["redaction"])
+            collector = Collector(config)
             overlap = dt.timedelta(seconds=int(config.get("overlap_seconds", 7200)))
             start = utc(cp["receive_through"]) - overlap if cp else now - dt.timedelta(seconds=int(config.get("initial_lookback_seconds", 86400)))
             end = now - dt.timedelta(seconds=int(config.get("settling_delay_seconds", 120)))
@@ -582,8 +571,7 @@ def main() -> int:
                 window = collector.window(start, end, "receiveTimestamp")
                 record_window(report, window)
                 watermark = stamp(end)
-                atomic_json(cp_path, {"schema_version": 3, "environment": selected_environment,
-                                      "source": report["source"], "archive": report["archive"],
+                atomic_json(cp_path, {"schema_version": 3, "source": report["source"], "archive": report["archive"],
                                       "redaction": report["redaction"], "receive_through": watermark,
                                       "updated_at": stamp(dt.datetime.now(UTC)), "last_run_id": run_id})
                 report["resulting_watermark"] = {"field": "receiveTimestamp", "through": watermark}
@@ -591,12 +579,12 @@ def main() -> int:
             start, end = utc(args.start), utc(args.end)
             if start >= end:
                 raise ValueError("--start must be before --end")
-            collector = Collector(config, state_dir)
+            collector = Collector(config)
             record_window(report, collector.window(start, end, "timestamp"))
         else:
             cp_path = state_dir / "backfill.json"
-            cp = checkpoint(cp_path, selected_environment, report["source"], report["archive"], report["redaction"])
-            collector = Collector(config, state_dir)
+            cp = checkpoint(cp_path, report["source"], report["archive"], report["redaction"])
+            collector = Collector(config)
             if cp.get("event_through"):
                 start = utc(cp["event_through"])
             elif args.start:
@@ -617,8 +605,7 @@ def main() -> int:
                 record_window(report, window)
                 # Window publication is complete before this resumable cursor advances.
                 watermark = stamp(end)
-                atomic_json(cp_path, {"schema_version": 3, "environment": selected_environment,
-                                      "source": report["source"], "archive": report["archive"],
+                atomic_json(cp_path, {"schema_version": 3, "source": report["source"], "archive": report["archive"],
                                       "redaction": report["redaction"], "event_through": watermark,
                                       "updated_at": stamp(dt.datetime.now(UTC)), "last_run_id": run_id})
                 report["resulting_watermark"] = {"field": "timestamp", "through": watermark}

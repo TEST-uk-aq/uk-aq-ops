@@ -1,303 +1,187 @@
-# TEST GCP Cloud Logging archive
+# GCP Cloud Logging archive (TEST and LIVE)
 
-This local-only collector reads retained TEST Cloud Logging entries and merges
-them into Dropbox-synchronised, UTC event-date files:
+One collector and runner serve either environment. The runner reads exactly one
+`UK_AQ_ENV_NAME` assignment from an explicitly supplied ingest-repository
+`.env`; only the exact values `TEST` and `LIVE` are accepted. It does not source
+the file, infer an environment, or fall back between environments. It then uses
+only that environment's runtime tree, config, lock, state, evidence and Google
+credential file.
+
+LIVE support here is structural only. Deploy and accept TEST first; do not load
+the LIVE launchd job until the LIVE acceptance steps below are complete.
+
+## Layout and invariants
+
+The deployed runtime parent is `/Users/mikehinford/uk-aq-gcp-logging-archive`:
 
 ```text
-<archive_root>/TEST/GCP Logs/raw/YYYY/MM/YYYY-MM-DD.jsonl.gz
+/Users/mikehinford/uk-aq-gcp-logging-archive/
+  TEST/
+    config.json
+    credentials/google-application-credentials.json
+    state/{collector.lock,incremental.json,backfill.json}
+    runs/<UTC timestamp>_<mode>_<unique suffix>/{run.log,run-report.json}
+    logs/launchd.log
+  LIVE/                         # separate files with the same shape
 ```
 
-It does not change a Cloud Run service, scheduler, log sink, or retention
-setting. The Google identity needs only `logging.logEntries.list` (normally the
-`roles/logging.viewer` role) in the TEST project.
+The runtime trees never share mutable files. The runner exports only the
+selected tree's credential path as `GOOGLE_APPLICATION_CREDENTIALS`; it does
+not use a switched global Application Default Credentials login. Provision each
+read-only Google credential out of band, store it at the path above, and use
+restrictive directory/file permissions. Never commit credentials or put them
+in Dropbox.
 
-## Safety and data model
+Raw archives stay at these existing/declared destinations:
 
-- Incremental reads use `receiveTimestamp`, a two-hour overlap by default, and
-  a settling delay. Entries are still filed by their original `timestamp`, so a
-  late entry is merged into its older event-day file.
-- Backfill and manual ranges use bounded, half-open event-time windows. The
-  collector consumes every API page explicitly. Cloud Logging `entries.list`
-  calls are paced to a 1.5-second minimum interval by default, keeping this
-  collector below the project-wide 60 requests/minute limit, and HTTP 429 /
-  `ResourceExhausted` responses use bounded exponential retry/backoff. Backfill
-  discovers the earliest matching retained entry when no start is supplied and
-  records that real boundary in its report; it does not imply that expired
-  history exists.
-- An entry with `insertId` is identified by the hash of log name, resource, and
-  insert ID. Otherwise a stable hash of the complete entry except
-  `receiveTimestamp` is used. Existing and new records are merged by identity.
-- Daily content is sorted by identity and gzip's variable timestamp is set to
-  zero. Each replacement is written and synced beside its destination, then
-  atomically renamed. A checkpoint advances only after every daily replacement
-  for its window succeeds. Repeating a partially published window is safe.
-- A non-blocking process lock separates concurrent invocations. Incremental
-  and backfill checkpoints are also separate.
-- Every invocation creates a unique run directory containing `run.log` and a
-  bounded `run-report.json`, including invocations rejected because the lock is
-  held. Active phases emit a 15-second heartbeat. Log timestamps bearing `Z`
-  are generated in UTC.
-- Checkpoints carry a deterministic source fingerprint derived only from the
-  TEST project ID and exact Cloud Logging filter. A missing or different
-  fingerprint stops the run before retrieval instead of applying a cursor from
-  different source coverage. Operational locations such as the run-evidence
-  path do not affect the fingerprint.
-- Checkpoints separately bind the stable `archive_id`, resolved raw archive
-  destination, and exact redaction policy. This prevents a cursor from skipping
-  history in a new/empty destination and prevents a changed sanitisation policy
-  from merging incompatible fallback identities or leaving older sensitive
-  values untouched.
-- A separate `<archive_root>/TEST/GCP Logs/archive-identity.json` manifest binds
-  the same source, archive destination and redaction identities to the archive
-  itself. All three modes validate it before constructing the Cloud Logging
-  client or changing daily files. The collector creates it with exclusive file
-  creation only when the raw archive is genuinely empty; a non-empty archive
-  without a manifest is rejected even when the state directory is new.
+```text
+/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/TEST/GCP Logs/
+/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/LIVE/GCP Logs/
+```
 
-Cloud Logging fields are otherwise preserved, including structured payloads,
-resource labels, severity, event/receive timestamps, trace/span data, and HTTP
-metadata. The example configuration removes request URLs and common
-application-level authorization, token, and password paths because URLs may
-contain query secrets. Adapt `redact_paths` after inspecting the TEST logging
-schema: paths are exact, case-sensitive dotted object paths. Redaction never
-prints the removed value. Cloud Logging can contain application-specific
-sensitive fields unknown to this repository; those must be added explicitly
-before collection. Google credentials and the process environment are never
-written to the archive or run evidence.
+Each contains `archive-identity.json` and
+`raw/YYYY/MM/YYYY-MM-DD.jsonl.gz`. The collector's data, deduplication,
+redaction, pagination, pacing/backoff, atomic publication, watermark and
+failure semantics are unchanged. The manifest binds environment, source,
+archive and redaction identity. Checkpoints also require their environment and
+all identity fields to match before a Cloud Logging client is created.
 
-## Configuration and installation on the MacBook Pro
+`config.json` owns the environment-specific `environment`, `project_id`, exact
+`log_filter`, stable `archive_id`, absolute `archive_path`, read/retry controls,
+overlap/settling controls and exact redaction paths. Copy
+`config.example.json` separately into each runtime tree and replace every
+placeholder. Do not derive LIVE values from TEST. State and run paths are not
+configurable: the runner/collector derive them from the selected runtime tree.
 
-The repository establishes the Latest Snapshot default service name as
-`uk-aq-latest-snapshot-builder`. It does not establish the TEST project ID or a
-TEST ingestion Cloud Run service name. Obtain those values from the TEST GCP
-configuration; do not copy LIVE values. Then:
+## Python installation
+
+From the appropriate local ops checkout:
 
 ```bash
-cd "/path/to/TEST-uk-aq-ops"
 python3 -m venv .venv-gcp-logging
 .venv-gcp-logging/bin/python3 -m pip install -r local/gcp_logging_archive/requirements.txt
-mkdir -p "$HOME/.config/uk-aq"
-cp local/gcp_logging_archive/config.test.example.json \
-  "$HOME/.config/uk-aq/gcp-logging-archive-test.json"
-chmod 600 "$HOME/.config/uk-aq/gcp-logging-archive-test.json"
 ```
 
-Edit every `REPLACE_WITH_...` value. `archive_id` is a stable, TEST-only
-identity for this archive generation; do not reuse it for a separate rebuild.
-The example also carries the default Cloud Logging read controls:
-`min_read_interval_seconds=1.5`, retry delays from 5 to 60 seconds, and a
-600-second retry timeout. These operational controls do not change archive,
-source or redaction identity.
-`archive_root` is the explicitly selected
-Dropbox root; the collector appends `TEST/GCP Logs/raw`. Keep `state_dir`
-outside Dropbox so sync conflicts cannot become checkpoint authority. Keep
-`run_evidence_root` separate from both the raw archive and checkpoints.
+## Migrate the deployed TEST runtime
 
-The filter is ordinary Cloud Logging filter syntax. Use parentheses when
-adding services. A `cloud_run_revision` service filter includes application
-stdout/stderr and Cloud Run request logs for those revisions, across all
-severities. Only add operational services whose TEST identities have been
-verified. The filter, paths, and credentials are TEST-specific and must never
-be shared with LIVE.
+The existing TEST generation is authoritative and must not be reinitialised.
+Keep the old runtime material until the migrated TEST run is accepted.
+Substitute the actual old paths below if they differ, and inspect before every
+copy:
 
-Use Application Default Credentials without placing a key in the repository:
+1. Stop the old job and verify it is not running:
 
-```bash
-gcloud auth application-default login
-gcloud auth application-default set-quota-project TEST_PROJECT_ID
-```
+   ```bash
+   launchctl bootout "gui/$(id -u)" \
+     "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
+   launchctl print "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.test" || true
+   ```
 
-Grant the selected local identity read-only access out of band if it does not
-already have it. Confirm the config without reading logs:
+2. Create the isolated tree without deleting old evidence:
 
-```bash
-.venv-gcp-logging/bin/python3 -m json.tool \
-  "$HOME/.config/uk-aq/gcp-logging-archive-test.json" >/dev/null
-```
+   ```bash
+   install -d -m 700 /Users/mikehinford/uk-aq-gcp-logging-archive/TEST/{state,runs,logs,credentials}
+   install -m 600 "$HOME/.config/uk-aq/gcp-logging-archive-test.json" \
+     /Users/mikehinford/uk-aq-gcp-logging-archive/TEST/config.json
+   cp -a "$HOME/.local/state/uk-aq/gcp-logging-archive/test/." \
+     /Users/mikehinford/uk-aq-gcp-logging-archive/TEST/state/
+   cp -a "$HOME/Library/Logs/UK-AQ/gcp-logging-archive/test/runs/." \
+     /Users/mikehinford/uk-aq-gcp-logging-archive/TEST/runs/
+   cp -p /path/to/old/launchd.log \
+     /Users/mikehinford/uk-aq-gcp-logging-archive/TEST/logs/launchd.pre-migration.log
+   ```
+
+3. Edit only the configuration shape: add `"environment": "TEST"`; replace
+   `archive_root` with the already-effective absolute
+   `archive_path` `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/TEST/GCP Logs/raw`;
+   remove old `state_dir` and `run_evidence_root`. Preserve the exact existing
+   project, filter, `archive_id`, pacing, overlap/settling and redaction values.
+
+4. Review each copied `incremental.json` and `backfill.json`. Add the top-level
+   `"environment": "TEST"` explicitly if absent, without changing its source,
+   archive, redaction, `receive_through`/`event_through`, timestamps or run ID.
+   This reviewed additive migration binds old state to TEST; the collector will
+   not silently repair a missing/mismatched environment. Confirm the checkpoint
+   `archive.archive_path` and existing Dropbox `archive-identity.json` already
+   identify the same TEST raw path. If not, stop and follow the contract's
+   separately verified path-relocation procedure—never edit identity merely to
+   pass validation.
+
+5. Provision the TEST read-only Google credential as
+   `TEST/credentials/google-application-credentials.json` (mode 600), validate
+   JSON/config locally, then run one real TEST incremental manually. Do not
+   move or recreate the Dropbox archive.
+
+After TEST acceptance, retain the old files as rollback/history evidence until
+the operator approves retirement. They are no longer active and the new code
+writes nothing beneath `~/Library/Logs/UK-AQ`, `~/Library/Logs/UK AQ`,
+`~/.config/uk-aq`, or `~/.local/state/uk-aq/gcp-logging-archive`.
 
 ## Manual operation
 
-Collect an explicitly bounded half-open UTC event-time range:
+Every command explicitly supplies the corresponding ingest `.env` and common
+runtime parent. Examples for TEST:
 
 ```bash
-local/scripts/run_gcp_logging_archive_test.sh range \
+RUNNER=local/scripts/run_gcp_logging_archive.sh
+COMMON=(--env-file /absolute/path/to/TEST-uk-aq-ingest/.env \
+        --runtime-root /Users/mikehinford/uk-aq-gcp-logging-archive)
+"$RUNNER" "${COMMON[@]}" incremental
+"$RUNNER" "${COMMON[@]}" range \
   --start 2026-09-21T00:00:00Z --end 2026-09-22T00:00:00Z
+"$RUNNER" "${COMMON[@]}" backfill --end 2026-09-22T00:00:00Z
 ```
 
-Run the initial resumable historical backfill. Omitting `--start` discovers the
-earliest matching retained entry and reports it; `--end` freezes the upper
-boundary so a repeat has the same scope:
+Backfill without `--start` discovers the earliest retained matching entry.
+Reuse the same fixed end after interruption. Range remains manifest-protected
+and does not advance a checkpoint. A held environment lock exits immediately
+with bounded evidence; TEST and LIVE locks are independent.
 
-```bash
-local/scripts/run_gcp_logging_archive_test.sh backfill \
-  --end 2026-09-22T00:00:00Z
-```
-
-If interrupted, run the same command again. The cursor in
-`<state_dir>/backfill.json` resumes at the first unpublished window. Never move
-that cursor forward manually. It is safe to move it backward to deliberately
-replay a window because publication deduplicates.
-
-After changing `project_id` or `log_filter`, the old incremental and backfill
-checkpoints intentionally fail source validation. Review the newly covered
-history, stop the launchd job, and preserve the old evidence before restarting:
-
-```bash
-mkdir -p "$HOME/.local/state/uk-aq/gcp-logging-archive/test/retired"
-mv "$HOME/.local/state/uk-aq/gcp-logging-archive/test/incremental.json" \
-  "$HOME/.local/state/uk-aq/gcp-logging-archive/test/retired/incremental-before-filter-change.json"
-mv "$HOME/.local/state/uk-aq/gcp-logging-archive/test/backfill.json" \
-  "$HOME/.local/state/uk-aq/gcp-logging-archive/test/retired/backfill-before-filter-change.json"
-local/scripts/run_gcp_logging_archive_test.sh backfill \
-  --start SAFE_UTC_BOUNDARY --end FIXED_UTC_UPPER_BOUNDARY
-```
-
-Choose `SAFE_UTC_BOUNDARY` at or before the earliest time the added source may
-contain retained logs. Omitting `--start` discovers the current retained
-boundary instead. After the backfill succeeds, run incremental once and then
-re-enable launchd. Moving checkpoints aside is deliberate; editing their
-fingerprints to bypass validation is unsafe. To rewind without changing source
-coverage, preserve a copy and move the relevant `*_through` timestamp backward
-without changing the stored `source` object.
-
-### Moving or re-sanitising an archive
-
-The archive layout is environment-first:
-
-```text
-<archive_root>/TEST/GCP Logs/
-<archive_root>/LIVE/GCP Logs/    # future separate LIVE implementation only
-```
-
-For a path-only move with unchanged contents and redaction policy, stop
-launchd, wait for Dropbox to finish, copy/move the complete `TEST/GCP Logs`
-tree, verify daily file counts and hashes at the destination, change
-`archive_root` only when the configured parent itself changed, and preserve
-the manifest and checkpoints before updating only their
-`archive.archive_path` values to the resolved new `TEST/GCP Logs/raw` path.
-Keep the same `archive_id`, source and redaction identities in every file. Run
-one overlapping incremental collection manually and verify it before
-re-enabling launchd. Never point an existing checkpoint at an empty or partial
-destination, and never delete the manifest to make a moved or incompatible
-archive appear new.
-
-For the September 2026 TEST layout correction from the original
-`<archive_root>/GCP Logs/TEST` location to
-`<archive_root>/TEST/GCP Logs`, keep the same configured `archive_root`.
-Move the complete directory only after collection has stopped and Dropbox is
-settled, verify file counts/hashes, then update the manifest plus
-`backfill.json` and `incremental.json` so only
-`archive.archive_path` changes from the old resolved
-`GCP Logs/TEST/raw` path to the new resolved `TEST/GCP Logs/raw` path. Do
-not change the source, `archive_id`, redaction identity, backfill watermark or
-incremental watermark.
-
-A `redact_paths` change is intentionally incompatible, including a change that
-only adds a sensitive path: fallback identities are calculated from the
-redacted entry, and merging the new representation into old daily files could
-retain the old sensitive representation as a second record. Perform a clean
-historical re-sanitisation instead:
-
-1. Stop launchd and leave the existing archive and state untouched as rollback
-   evidence with access restricted.
-2. Select a new empty Dropbox staging root, a new `archive_id`, and a new empty
-   `state_dir`; retain the same TEST project/filter and configure the complete
-   new `redact_paths` set.
-3. Run a bounded historical backfill with a fixed end. Omit `--start` to record
-   the actual retained boundary, or choose an earlier known-safe retained UTC
-   boundary. This rebuild deduplicates fallback identities only after applying
-   the new policy.
-4. Validate gzip/JSONL integrity, entry/date coverage, the run report, and that
-   prohibited fields are absent. Run one manual incremental collection.
-5. Atomically rename the verified staging `TEST/GCP Logs` directory into its
-   final Dropbox location on the same filesystem, update `archive_root` if
-   needed, and apply the verified path-only manifest/checkpoint move procedure
-   above.
-6. Re-enable launchd, then securely delete the superseded archive only after
-   the retention/rollback decision is approved.
-
-Cloud Logging entries older than its retained boundary cannot be reconstructed
-by that rebuild. If those old entries must be retained, do not weaken or bypass
-the policy check: keep the old archive quarantined and use separately reviewed
-offline re-sanitisation tooling before promotion. The collector deliberately
-does not claim that removing a checkpoint fingerprint sanitises existing data.
-
-Run one incremental collection with:
-
-```bash
-local/scripts/run_gcp_logging_archive_test.sh incremental
-```
-
-## Enable the daily launchd job
-
-The template does not contain a user name or machine path and does not alter
-the existing dashboard or cloudflared jobs. The normal schedule is daily via
-`StartInterval=86400`; Cloud Logging remains the recent troubleshooting source.
-An operator can use `launchctl kickstart -k` or run `incremental` manually when
-an immediate archive catch-up is wanted. Render and load the job after the
-manual incremental run succeeds. The renderer uses `plistlib`, rather than raw
-XML text replacement, so repository paths containing `&` or other XML-sensitive
-characters remain valid:
-
-```bash
-cd "/path/to/TEST-uk-aq-ops"
-mkdir -p logs "$HOME/Library/LaunchAgents"
-python3 local/scripts/render_gcp_logging_archive_launchd.py \
-  local/launchd/uk.co.ukaq.gcp-logging-archive.test.plist.example \
-  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
-plutil -lint "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
-launchctl bootstrap "gui/$(id -u)" \
-  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
-launchctl kickstart -k \
-  "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.test"
-```
-
-Check status and evidence:
+Inspect status without exposing credentials:
 
 ```bash
 launchctl print "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.test"
-tail -n 100 logs/gcp_logging_archive_test_launchd.log
-find "$HOME/Library/Logs/UK-AQ/gcp-logging-archive/test/runs" -name run-report.json -print | tail
-gzip -cd "DROPBOX_ROOT/TEST/GCP Logs/raw/YYYY/MM/YYYY-MM-DD.jsonl.gz" | head
+tail -n 100 /Users/mikehinford/uk-aq-gcp-logging-archive/TEST/logs/launchd.log
+find /Users/mikehinford/uk-aq-gcp-logging-archive/TEST/runs \
+  -name run-report.json -print | tail
+python3 -m json.tool /Users/mikehinford/uk-aq-gcp-logging-archive/TEST/state/incremental.json
 ```
 
-After installation, confirm that a successful run advances
-`incremental.json`, produces valid gzip JSONL under the expected UTC dates,
-contains both `run.googleapis.com/requests` and structured application entries
-where the filter matches them, and does not contain known secrets. Compare a
-small bounded interval's count and timestamps with the Cloud Logging console.
-Confirm an overlapping second run adds no duplicates.
+Each run report records the selected environment, project/filter fingerprint,
+archive/redaction identity, bounded window/count/file evidence, watermark,
+status and exit code. Logs/reports are diagnostic, not checkpoint authority.
 
-For a failed/interrupted run, inspect its report and log, correct the cause
-(credentials, filter, disk space, Dropbox availability), and rerun. A transient
-Cloud Logging quota response is retried automatically within the configured
-bounded timeout; if retries are exhausted, the old checkpoint causes the
-entire incomplete interval to be safely replayed. A
-stale `collector.lock` file is harmless; the operating-system lock ends with
-the process. Do not delete or advance checkpoints merely because a daily file
-was already replaced.
+## Render and install launchd jobs
 
-If manifest creation is interrupted while initialising an empty archive, rerun
-the same command: exclusive creation and directory syncing ensure the next run
-either validates a complete manifest or safely creates it again. If manifest
-validation fails, no retrieval or daily-file mutation has occurred. Restore the
-matching configuration/manifest or follow the deliberate move/rebuild process;
-do not remove the manifest or change identity fields merely to bypass the
-failure.
+Both labels use the same template and generic runner, with `RunAtLoad=true` and
+`StartInterval=86400`. Render each with its explicit ingest `.env` path:
 
-`run-report.json` records the TEST project, source/filter fingerprint, archive
-identity/destination, redaction paths/fingerprint, configured Cloud Logging
-read pacing/retry controls,
-source timestamp field and bounded query-window evidence, incremental overlap,
-source/unique/new/duplicate counts, affected dates and files, bytes written,
-resulting watermark, final status and exit code, and bounded error details. A
-long backfill retains at most 100 detailed windows (and 100 files per window),
-with aggregate totals, the omitted count, and the last omitted window retained
-so the report cannot grow without bound. SIGTERM and keyboard interruption are
-reported explicitly and retain their conventional exit codes; neither advances
-a checkpoint for a window whose publication did not finish.
+```bash
+TEMPLATE=local/launchd/uk.co.ukaq.gcp-logging-archive.plist.template
+RUNTIME=/Users/mikehinford/uk-aq-gcp-logging-archive
+mkdir -p "$HOME/Library/LaunchAgents" "$RUNTIME/TEST/logs" "$RUNTIME/LIVE/logs"
+python3 local/scripts/render_gcp_logging_archive_launchd.py "$TEMPLATE" \
+  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist" \
+  --environment TEST --ingest-env-file /absolute/path/to/TEST-uk-aq-ingest/.env \
+  --runtime-root "$RUNTIME"
+python3 local/scripts/render_gcp_logging_archive_launchd.py "$TEMPLATE" \
+  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.live.plist" \
+  --environment LIVE --ingest-env-file /absolute/path/to/LIVE-uk-aq-ingest/.env \
+  --runtime-root "$RUNTIME"
+plutil -lint "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
+plutil -lint "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.live.plist"
+```
 
-Uninstall only this TEST job:
+After the manual TEST run succeeds, install only TEST:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
+launchctl kickstart -k "gui/$(id -u)/uk.co.ukaq.gcp-logging-archive.test"
+```
+
+Stop/uninstall either environment without touching the other (replace `test`
+with `live` only when intentionally operating LIVE):
 
 ```bash
 launchctl bootout "gui/$(id -u)" \
@@ -305,5 +189,36 @@ launchctl bootout "gui/$(id -u)" \
 rm "$HOME/Library/LaunchAgents/uk.co.ukaq.gcp-logging-archive.test.plist"
 ```
 
-This stops future runs; it intentionally leaves archives, checkpoints, run
-evidence, configuration, credentials, and the Python environment untouched.
+This leaves runtime state, evidence, credentials and Dropbox data intact.
+
+## TEST acceptance and later LIVE promotion
+
+On the MacBook Pro, confirm the real TEST incremental run selects TEST only,
+merges expected structured/request logs, advances its checkpoint only after
+publication, produces valid deterministic gzip JSONL, excludes configured
+sensitive fields and is idempotent across an overlapping bounded replay.
+Confirm a deliberate manifest/checkpoint mismatch fails before source access.
+Rollback is: stop the new job, preserve its tree, reinstall the old plist/code,
+and point only the old runner at the untouched old runtime; never roll back a
+watermark by inventing identity values.
+
+Only after real TEST acceptance, copy this bounded implementation set to the
+local LIVE ops repository:
+
+```text
+local/gcp_logging_archive/collector.py
+local/gcp_logging_archive/config.example.json
+local/gcp_logging_archive/requirements.txt
+local/gcp_logging_archive/README.md
+local/scripts/run_gcp_logging_archive.sh
+local/scripts/render_gcp_logging_archive_launchd.py
+local/launchd/uk.co.ukaq.gcp-logging-archive.plist.template
+```
+
+Do not copy system documentation. Give LIVE its own config, new/stated archive
+identity, empty appropriate state, read-only credential and explicit LIVE
+ingest `.env`. Before enabling unattended LIVE daily collection, run one
+deliberately bounded LIVE range to verify the LIVE Google account, project and
+filter. Then complete LIVE backfill and incremental operational acceptance;
+only after that is normal daily LIVE scheduling considered accepted. This
+bounded check specifically prevents TEST/LIVE identity or account mix-up.
