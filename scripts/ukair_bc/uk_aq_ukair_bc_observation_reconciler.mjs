@@ -648,9 +648,16 @@ export function buildDesiredScopes({
         }
         const stationRows = [];
         let currentYearCoverage = null;
+        let currentYearExpectedAbsence = null;
         for (const sourceYear of requiredYearsByDay.get(dayUtc)) {
           const identity = sourceIdentity(station.uk_air_ref, property, sourceYear);
-          if (absenceByIdentity.has(identity)) continue;
+          const expectedAbsence = absenceByIdentity.get(identity) || null;
+          if (expectedAbsence) {
+            if (sourceYear === currentYear && Number(dayUtc.slice(0, 4)) === currentYear) {
+              currentYearExpectedAbsence = expectedAbsence;
+            }
+            continue;
+          }
           const source = acquiredByIdentity.get(identity);
           if (!source || source.status !== "pinned" || source.parse_status !== "parsed") {
             blockers.push(
@@ -679,6 +686,23 @@ export function buildDesiredScopes({
               verification_status: sourceRow.verification_status,
             }));
           }
+        }
+        if (currentYearExpectedAbsence) {
+          temporarySourceGaps.push(Object.freeze({
+            station: station.uk_air_ref,
+            station_id: station.station_id,
+            timeseries_id: mapping.timeseries_id,
+            timeseries_ref: mapping.timeseries_ref,
+            property,
+            canonical_day_utc: dayUtc,
+            source_year: currentYear,
+            source_identity: currentYearExpectedAbsence.identity,
+            expected_annual_filename: path.basename(
+              new URL(currentYearExpectedAbsence.source_url).pathname,
+            ),
+            reason: "temporary_current_year_source_file_not_listed",
+          }));
+          continue;
         }
         if (currentYearCoverage?.selected_source_date_present === false) {
           temporarySourceGaps.push(Object.freeze({

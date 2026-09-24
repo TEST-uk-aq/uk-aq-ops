@@ -197,11 +197,21 @@ function annualCsv({
   ].join("\n"), "utf8");
 }
 
-function blackCarbonStation({ stationId, timeseriesId, ukAirRef, siteRef }) {
+function blackCarbonStation({
+  stationId,
+  timeseriesId,
+  ukAirRef,
+  siteRef,
+  supportingFiles,
+}) {
   return {
     station_id: stationId,
     uk_air_ref: ukAirRef,
     site_ref: siteRef,
+    raw_payload: supportingFiles === undefined ? {} : {
+      supported_properties: ["bc"],
+      supporting_files: { bc: supportingFiles },
+    },
     timeseries: new Map([["bc", {
       timeseries_id: timeseriesId,
       timeseries_ref: `${ukAirRef}:bc`,
@@ -210,22 +220,28 @@ function blackCarbonStation({ stationId, timeseriesId, ukAirRef, siteRef }) {
   };
 }
 
-function acquiredBlackCarbonSource(station, rows) {
+function acquiredBlackCarbonSource(station, rows, sourceYear = 2026) {
   return {
-    identity: `${station.uk_air_ref}\u0000bc\u00002026`,
+    identity: `${station.uk_air_ref}\u0000bc\u0000${sourceYear}`,
     status: "pinned",
     parse_status: "parsed",
     parsed: parseUkAirBlackCarbonAnnualCsv({
       bytes: annualCsv({ rows }),
       sourceProperty: "bc",
-      sourceYear: 2026,
+      sourceYear,
       ukAirRef: station.uk_air_ref,
       siteRef: station.site_ref,
     }),
   };
 }
 
-function buildCurrentYearDesiredScopes({ days, stations, acquiredSources }) {
+function buildCurrentYearDesiredScopes({
+  days,
+  stations,
+  acquiredSources,
+  acquisitionPlan = { expectedAbsences: [], metadataBlockers: [] },
+  requiredYearsByDay = new Map(days.map((day) => [day, [2026]])),
+}) {
   return buildDesiredScopes({
     days,
     properties: ["bc"],
@@ -233,11 +249,8 @@ function buildCurrentYearDesiredScopes({ days, stations, acquiredSources }) {
       connector_id: 8,
       selected_stations: stations,
     },
-    requiredYearsByDay: new Map(days.map((day) => [day, [2026]])),
-    acquisitionPlan: {
-      expectedAbsences: [],
-      metadataBlockers: [],
-    },
+    requiredYearsByDay,
+    acquisitionPlan,
     acquiredSources,
     currentYear: 2026,
   });
@@ -740,6 +753,182 @@ test("current-year missing station date skips only that timeseries and preserves
   ));
 });
 
+test("current-year expected-file absence skips only that timeseries and later availability restores authority", () => {
+  const missing = blackCarbonStation({
+    stationId: 101,
+    timeseriesId: 201,
+    ukAirRef: "UKA00001",
+    siteRef: "MISS",
+    supportingFiles: [],
+  });
+  const peer = blackCarbonStation({
+    stationId: 102,
+    timeseriesId: 202,
+    ukAirRef: "UKA00002",
+    siteRef: "PEER",
+    supportingFiles: ["PEER_BC_2026.csv"],
+  });
+  const acquisitionPlan = planAnnualSourceRequests({
+    metadata: { selected_stations: [missing, peer] },
+    properties: ["bc"],
+    requiredYears: [2026],
+  });
+  assert.equal(acquisitionPlan.expectedAbsences.length, 1);
+  assert.equal(acquisitionPlan.expectedAbsences[0].timeseries_id, 201);
+  assert.equal(acquisitionPlan.expectedAbsences[0].authority,
+    "ukair_bc_station_refs.raw_payload.supporting_files");
+
+  const routed = buildCurrentYearDesiredScopes({
+    days: ["2026-09-02"],
+    stations: [missing, peer],
+    acquisitionPlan,
+    acquiredSources: [acquiredBlackCarbonSource(peer, [
+      hourlyDataRow("01-09-2026", { 24: 2 }),
+      hourlyDataRow("02-09-2026", { 1: 3 }),
+    ])],
+  });
+
+  assert.equal(routed.blockedScopes.length, 0);
+  assert.equal(routed.partitions.length, 1);
+  assert.deepEqual(routed.partitions[0].selected_timeseries_authority, [{
+    timeseries_id: 202,
+    authoritative_hours_utc: ALL_UTC_HOURS,
+  }]);
+  assert.deepEqual(routed.temporarySourceGaps, [{
+    station: "UKA00001",
+    station_id: 101,
+    timeseries_id: 201,
+    timeseries_ref: "UKA00001:bc",
+    property: "bc",
+    canonical_day_utc: "2026-09-02",
+    source_year: 2026,
+    source_identity: "UKA00001\u0000bc\u00002026",
+    expected_annual_filename: "MISS_BC_2026.csv",
+    reason: "temporary_current_year_source_file_not_listed",
+  }]);
+  const existingMissingRow = {
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-09-02T01:00:00.000Z",
+    value: 99,
+    verification_status: "R",
+  };
+  const merged = mergeSelectedTimeseriesRows({
+    currentRows: [existingMissingRow],
+    desiredRows: routed.partitions[0].rows,
+    selectedTimeseriesAuthority: routed.partitions[0].selected_timeseries_authority,
+  });
+  assert.ok(merged.some((row) => JSON.stringify(row) === JSON.stringify(existingMissingRow)));
+
+  const nowAvailable = blackCarbonStation({
+    stationId: 101,
+    timeseriesId: 201,
+    ukAirRef: "UKA00001",
+    siteRef: "MISS",
+    supportingFiles: ["MISS_BC_2026.csv"],
+  });
+  const laterPlan = planAnnualSourceRequests({
+    metadata: { selected_stations: [nowAvailable, peer] },
+    properties: ["bc"],
+    requiredYears: [2026],
+  });
+  const later = buildCurrentYearDesiredScopes({
+    days: ["2026-09-02"],
+    stations: [nowAvailable, peer],
+    acquisitionPlan: laterPlan,
+    acquiredSources: [
+      acquiredBlackCarbonSource(nowAvailable, [
+        hourlyDataRow("01-09-2026", { 24: 1 }),
+        hourlyDataRow("02-09-2026", { 1: 7 }),
+      ]),
+      acquiredBlackCarbonSource(peer, [
+        hourlyDataRow("01-09-2026", { 24: 2 }),
+        hourlyDataRow("02-09-2026", { 1: 3 }),
+      ]),
+    ],
+  });
+  assert.equal(later.temporarySourceGaps.length, 0);
+  assert.deepEqual(
+    later.partitions[0].selected_timeseries_authority.map((entry) => entry.timeseries_id),
+    [201, 202],
+  );
+});
+
+test("all current-year expected-file absences route to the successful uncovered no-op path", () => {
+  const stations = [
+    blackCarbonStation({
+      stationId: 101,
+      timeseriesId: 201,
+      ukAirRef: "UKA00001",
+      siteRef: "ONE",
+      supportingFiles: [],
+    }),
+    blackCarbonStation({
+      stationId: 102,
+      timeseriesId: 202,
+      ukAirRef: "UKA00002",
+      siteRef: "TWO",
+      supportingFiles: [],
+    }),
+  ];
+  const acquisitionPlan = planAnnualSourceRequests({
+    metadata: { selected_stations: stations },
+    properties: ["bc"],
+    requiredYears: [2026],
+  });
+  const routed = buildCurrentYearDesiredScopes({
+    days: ["2026-09-02"],
+    stations,
+    acquisitionPlan,
+    acquiredSources: [],
+  });
+
+  assert.equal(routed.blockedScopes.length, 0);
+  assert.equal(routed.partitions.length, 0);
+  assert.equal(routed.removedScopes.length, 0);
+  assert.equal(routed.temporarySourceGaps.length, 2);
+  assert.deepEqual(routed.skippedUncoveredScopes, [{
+    day_utc: "2026-09-02",
+    connector_id: 8,
+    pollutant_code: "bc",
+    reason: "all_selected_timeseries_temporarily_uncovered",
+    temporarily_uncovered_timeseries_count: 2,
+  }]);
+});
+
+test("current-year expected-file absence wins over previous-year 24:00 at 1 January", () => {
+  const station = blackCarbonStation({
+    stationId: 101,
+    timeseriesId: 201,
+    ukAirRef: "UKA00001",
+    siteRef: "BOUND",
+    supportingFiles: ["BOUND_BC_2025.csv"],
+  });
+  const acquisitionPlan = planAnnualSourceRequests({
+    metadata: { selected_stations: [station] },
+    properties: ["bc"],
+    requiredYears: [2025, 2026],
+  });
+  const routed = buildCurrentYearDesiredScopes({
+    days: ["2026-01-01"],
+    stations: [station],
+    acquisitionPlan,
+    acquiredSources: [acquiredBlackCarbonSource(station, [
+      hourlyDataRow("31-12-2025", { 24: 7 }),
+    ], 2025)],
+    requiredYearsByDay: new Map([["2026-01-01", [2025, 2026]]]),
+  });
+
+  assert.equal(routed.blockedScopes.length, 0);
+  assert.equal(routed.partitions.length, 0);
+  assert.equal(routed.removedScopes.length, 0);
+  assert.equal(routed.skippedUncoveredScopes.length, 1);
+  assert.equal(routed.temporarySourceGaps[0].reason,
+    "temporary_current_year_source_file_not_listed");
+});
+
 test("represented current-year blank source dates retain selected removal authority", () => {
   const station = blackCarbonStation({
     stationId: 101,
@@ -917,6 +1106,38 @@ test("historical parsed files retain the existing conclusive selected-scope sema
       parse_status: "parsed",
       parsed,
     }],
+    currentYear: 2026,
+  });
+
+  assert.equal(routed.temporarySourceGaps.length, 0);
+  assert.equal(routed.skippedUncoveredScopes.length, 0);
+  assert.equal(routed.removedScopes.length, 1);
+  assert.deepEqual(routed.removedScopes[0].selected_timeseries_authority, [{
+    timeseries_id: 201,
+    authoritative_hours_utc: ALL_UTC_HOURS,
+  }]);
+});
+
+test("historical expected-file absence retains conclusive selected-scope semantics", () => {
+  const station = blackCarbonStation({
+    stationId: 101,
+    timeseriesId: 201,
+    ukAirRef: "UKA00001",
+    siteRef: "HIST",
+    supportingFiles: [],
+  });
+  const acquisitionPlan = planAnnualSourceRequests({
+    metadata: { selected_stations: [station] },
+    properties: ["bc"],
+    requiredYears: [2025],
+  });
+  const routed = buildDesiredScopes({
+    days: ["2025-09-02"],
+    properties: ["bc"],
+    metadata: { connector_id: 8, selected_stations: [station] },
+    requiredYearsByDay: new Map([["2025-09-02", [2025]]]),
+    acquisitionPlan,
+    acquiredSources: [],
     currentYear: 2026,
   });
 
