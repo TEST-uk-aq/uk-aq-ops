@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -8,9 +11,11 @@ import {
   routeBlackCarbonSelectedScopes,
 } from "../scripts/ukair_bc/uk_air_black_carbon_source.mjs";
 import {
+  buildBackfillYearRanges,
   parseReconcilerArgs,
   planAnnualSourceRequests,
   resolveBlackCarbonMetadata,
+  runBlackCarbonObservationReconciler,
   runLockedReconciliation,
 } from "../scripts/ukair_bc/uk_aq_ukair_bc_observation_reconciler.mjs";
 import {
@@ -524,4 +529,218 @@ test("daily CLI derives a configurable recent horizon without selecting the full
   assert.equal(args.toDay, "2026-09-22");
   assert.deepEqual(args.properties, ["bc", "uv370"]);
   assert.equal(args.apply, false);
+});
+
+test("backfill year selection starts at 2020 and bounds a partial final year", () => {
+  assert.deepEqual(buildBackfillYearRanges("2022-12-31"), [
+    { year: 2020, from_day: "2020-01-01", to_day: "2020-12-31" },
+    { year: 2021, from_day: "2021-01-01", to_day: "2021-12-31" },
+    { year: 2022, from_day: "2022-01-01", to_day: "2022-12-31" },
+  ]);
+  assert.deepEqual(buildBackfillYearRanges("2026-09-23").at(-1), {
+    year: 2026,
+    from_day: "2026-01-01",
+    to_day: "2026-09-23",
+  });
+  assert.ok(buildBackfillYearRanges("2026-09-23").every(
+    (range) => range.from_day >= "2020-01-01",
+  ));
+});
+
+function successfulBackfillChildReport(reportPath, overrides = {}) {
+  return {
+    ok: true,
+    report_path: reportPath,
+    selected_stations: ["UKA00001"],
+    source_files_successfully_pinned: 2,
+    failed_blocked_scope_count: 0,
+    non_empty_replacement_scope_count: 1,
+    explicit_removal_scope_count: 0,
+    unchanged_no_op_scope_count: 1,
+    r2_changed_scope_count: 0,
+    final_status: "dry_run_completed",
+    ...overrides,
+  };
+}
+
+test("backfill dry-run processes bounded years sequentially with identical narrowing", async (t) => {
+  const evidenceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "uk-aq-bc-backfill-dry-"));
+  t.after(async () => await fs.rm(evidenceRoot, { recursive: true, force: true }));
+  const calls = [];
+  let active = 0;
+  let maximumActive = 0;
+  const result = await runBlackCarbonObservationReconciler({
+    argv: [
+      "--mode", "backfill",
+      "--to", "2022-06-30",
+      "--station", "UKA00001",
+      "--property", "uv370,bc",
+      "--dry-run",
+      "--download-concurrency", "3",
+      "--download-timeout-ms", "45000",
+      "--download-retries", "2",
+      "--run-id", "backfill-dry-test",
+      "--evidence-root", evidenceRoot,
+    ],
+    env: { UKAQ_ENV_NAME: "TEST" },
+    now: new Date("2022-07-01T12:00:00.000Z"),
+    clock: () => new Date("2022-07-01T12:01:00.000Z"),
+    runBackfillYear: async (input) => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      calls.push(input);
+      await Promise.resolve();
+      active -= 1;
+      return {
+        code: 0,
+        report: successfulBackfillChildReport(input.reportPath),
+        report_read_error: null,
+      };
+    },
+  });
+
+  assert.equal(maximumActive, 1);
+  assert.deepEqual(calls.map((call) => call.range), [
+    { year: 2020, from_day: "2020-01-01", to_day: "2020-12-31" },
+    { year: 2021, from_day: "2021-01-01", to_day: "2021-12-31" },
+    { year: 2022, from_day: "2022-01-01", to_day: "2022-06-30" },
+  ]);
+  for (const call of calls) {
+    assert.deepEqual(call.childArgv.slice(0, 6), [
+      "--mode", "range", "--from", call.range.from_day, "--to", call.range.to_day,
+    ]);
+    assert.ok(call.childArgv.includes("--dry-run"));
+    assert.equal(call.childArgv[call.childArgv.indexOf("--station") + 1], "UKA00001");
+    assert.equal(call.childArgv[call.childArgv.indexOf("--property") + 1], "bc,uv370");
+    assert.equal(call.childArgv[call.childArgv.indexOf("--download-concurrency") + 1], "3");
+    assert.equal(call.childArgv[call.childArgv.indexOf("--download-timeout-ms") + 1], "45000");
+    assert.equal(call.childArgv[call.childArgv.indexOf("--download-retries") + 1], "2");
+  }
+  assert.equal(result.report.ok, true);
+  assert.deepEqual(result.report.years_completed, [2020, 2021, 2022]);
+  assert.deepEqual(result.report.years_failed, []);
+  assert.deepEqual(result.report.years_not_attempted, []);
+  assert.equal(result.report.current_or_failed_year, null);
+});
+
+test("backfill apply starts one independently protected range child per year", async (t) => {
+  const evidenceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "uk-aq-bc-backfill-apply-"));
+  t.after(async () => await fs.rm(evidenceRoot, { recursive: true, force: true }));
+  const calls = [];
+  const result = await runBlackCarbonObservationReconciler({
+    argv: [
+      "--mode", "backfill",
+      "--to", "2021-12-31",
+      "--apply",
+      "--run-id", "backfill-apply-test",
+      "--evidence-root", evidenceRoot,
+    ],
+    env: { UKAQ_ENV_NAME: "TEST" },
+    now: new Date("2022-01-01T12:00:00.000Z"),
+    runBackfillYear: async (input) => {
+      calls.push(input);
+      return {
+        code: 0,
+        report: successfulBackfillChildReport(input.reportPath, {
+          final_status: "protected_r2_phase_completed",
+        }),
+        report_read_error: null,
+      };
+    },
+  });
+
+  assert.equal(result.report.ok, true);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((call) => call.childArgv.includes("--apply")));
+  assert.ok(calls.every((call) => call.childArgv[1] === "range"));
+  assert.notEqual(calls[0].reportPath, calls[1].reportPath);
+  assert.match(calls[0].reportPath, /years\/year-2020\/report\.json$/);
+  assert.match(calls[1].reportPath, /years\/year-2021\/report\.json$/);
+});
+
+test("backfill failure stops later years and records completed, failed and unattempted state", async (t) => {
+  const evidenceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "uk-aq-bc-backfill-fail-"));
+  t.after(async () => await fs.rm(evidenceRoot, { recursive: true, force: true }));
+  const attempted = [];
+  const result = await runBlackCarbonObservationReconciler({
+    argv: [
+      "--mode", "backfill",
+      "--to", "2022-12-31",
+      "--dry-run",
+      "--run-id", "backfill-failure-test",
+      "--evidence-root", evidenceRoot,
+    ],
+    env: { UKAQ_ENV_NAME: "TEST" },
+    now: new Date("2023-01-01T12:00:00.000Z"),
+    runBackfillYear: async (input) => {
+      attempted.push(input.year);
+      if (input.year === 2021) {
+        return {
+          code: 1,
+          report: successfulBackfillChildReport(input.reportPath, {
+            ok: false,
+            failed_blocked_scope_count: 1,
+            final_status: "dry_run_completed_with_blocked_scopes",
+          }),
+          report_read_error: null,
+        };
+      }
+      return {
+        code: 0,
+        report: successfulBackfillChildReport(input.reportPath),
+        report_read_error: null,
+      };
+    },
+  });
+
+  assert.deepEqual(attempted, [2020, 2021]);
+  assert.equal(result.report.ok, false);
+  assert.equal(result.report.final_status, "failed_year_reconciliation");
+  assert.deepEqual(result.report.years_completed, [2020]);
+  assert.deepEqual(result.report.years_failed, [2021]);
+  assert.deepEqual(result.report.years_not_attempted, [2022]);
+  assert.equal(result.report.current_or_failed_year, 2021);
+  assert.deepEqual(result.report.per_year_results.map((entry) => entry.status), [
+    "completed", "failed", "not_attempted",
+  ]);
+  assert.equal(result.report.per_year_results[0].unchanged_no_op_scope_count, 1);
+  assert.equal(result.report.per_year_results[0].r2_changed_scope_count, 0);
+  const persisted = JSON.parse(await fs.readFile(result.report.report_path, "utf8"));
+  assert.deepEqual(persisted.years_not_attempted, [2022]);
+});
+
+test("a new backfill run still attempts an already canonical year and preserves child no-op results", async (t) => {
+  const evidenceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "uk-aq-bc-backfill-rerun-"));
+  t.after(async () => await fs.rm(evidenceRoot, { recursive: true, force: true }));
+  const attempted = [];
+  for (const runId of ["backfill-first-run", "backfill-second-run"]) {
+    const result = await runBlackCarbonObservationReconciler({
+      argv: [
+        "--mode", "backfill",
+        "--to", "2020-12-31",
+        "--apply",
+        "--run-id", runId,
+        "--evidence-root", evidenceRoot,
+      ],
+      env: { UKAQ_ENV_NAME: "TEST" },
+      now: new Date("2021-01-01T12:00:00.000Z"),
+      runBackfillYear: async (input) => {
+        attempted.push({ runId, year: input.year });
+        return {
+          code: 0,
+          report: successfulBackfillChildReport(input.reportPath, {
+            final_status: "protected_r2_phase_completed",
+          }),
+          report_read_error: null,
+        };
+      },
+    });
+    assert.equal(result.report.ok, true);
+    assert.equal(result.report.per_year_results[0].unchanged_no_op_scope_count, 1);
+    assert.equal(result.report.per_year_results[0].r2_changed_scope_count, 0);
+  }
+  assert.deepEqual(attempted, [
+    { runId: "backfill-first-run", year: 2020 },
+    { runId: "backfill-second-run", year: 2020 },
+  ]);
 });

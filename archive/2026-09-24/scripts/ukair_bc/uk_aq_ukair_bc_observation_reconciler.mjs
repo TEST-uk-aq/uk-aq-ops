@@ -22,7 +22,6 @@ import {
 } from "./uk_air_black_carbon_source.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const RECONCILER_PATH = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = path.resolve(SCRIPT_DIR, "../..");
 const LOCK_COORDINATOR_PATH = path.join(
   REPOSITORY_ROOT,
@@ -216,24 +215,6 @@ export function daysInclusive(fromDay, toDay) {
     days.push(new Date(current).toISOString().slice(0, 10));
   }
   return days;
-}
-
-export function buildBackfillYearRanges(toDay) {
-  const normalizedToDay = normalizeDay(toDay, "--to");
-  if (normalizedToDay < UKAIR_BC_HISTORY_START_DAY) {
-    throw new Error(`Backfill cannot end before ${UKAIR_BC_HISTORY_START_DAY}`);
-  }
-  const ranges = [];
-  const firstYear = Number(UKAIR_BC_HISTORY_START_DAY.slice(0, 4));
-  const finalYear = Number(normalizedToDay.slice(0, 4));
-  for (let year = firstYear; year <= finalYear; year += 1) {
-    ranges.push(Object.freeze({
-      year,
-      from_day: year === firstYear ? UKAIR_BC_HISTORY_START_DAY : `${year}-01-01`,
-      to_day: year === finalYear ? normalizedToDay : `${year}-12-31`,
-    }));
-  }
-  return Object.freeze(ranges);
 }
 
 function requiredDatabaseUrl(env) {
@@ -741,204 +722,6 @@ function spawnCommand(command, commandArgs, options) {
   });
 }
 
-function backfillChildArgv(args, range, yearsRoot) {
-  const childArgv = [
-    "--mode", "range",
-    "--from", range.from_day,
-    "--to", range.to_day,
-    "--environment", "TEST",
-    "--run-id", `year-${range.year}`,
-    "--evidence-root", yearsRoot,
-    "--download-concurrency", String(args.downloadConcurrency),
-    "--download-timeout-ms", String(args.downloadTimeoutMs),
-    "--download-retries", String(args.downloadRetries),
-    "--property", args.properties.join(","),
-  ];
-  if (args.stationRefs.length) childArgv.push("--station", args.stationRefs.join(","));
-  childArgv.push(args.apply ? "--apply" : "--dry-run");
-  return childArgv;
-}
-
-async function runBackfillYearProcess({ childArgv, env, reportPath }) {
-  const code = await spawnCommand(process.execPath, [RECONCILER_PATH, ...childArgv], {
-    cwd: REPOSITORY_ROOT,
-    env,
-    stdio: "inherit",
-  });
-  let report = null;
-  let report_read_error = null;
-  try {
-    report = JSON.parse(await fs.readFile(reportPath, "utf8"));
-  } catch (error) {
-    report_read_error = error instanceof Error ? error.message : String(error);
-  }
-  return Object.freeze({ code, report, report_read_error });
-}
-
-function finiteReportCount(report, field) {
-  const value = Number(report?.[field]);
-  return Number.isFinite(value) && value >= 0 ? value : null;
-}
-
-function summarizeBackfillYearResult({ range, status, reportPath, childReport, error }) {
-  return {
-    year: range.year,
-    from_day: range.from_day,
-    to_day: range.to_day,
-    status,
-    ok: status === "completed",
-    report_path: childReport?.report_path || reportPath,
-    source_files_successfully_pinned: finiteReportCount(
-      childReport,
-      "source_files_successfully_pinned",
-    ),
-    failed_blocked_scope_count: finiteReportCount(childReport, "failed_blocked_scope_count"),
-    non_empty_replacement_scope_count: finiteReportCount(
-      childReport,
-      "non_empty_replacement_scope_count",
-    ),
-    explicit_removal_scope_count: finiteReportCount(
-      childReport,
-      "explicit_removal_scope_count",
-    ),
-    unchanged_no_op_scope_count: finiteReportCount(childReport, "unchanged_no_op_scope_count"),
-    r2_changed_scope_count: finiteReportCount(childReport, "r2_changed_scope_count"),
-    child_final_status: childReport?.final_status || null,
-    error: error || null,
-  };
-}
-
-export async function runBackfillReconciliation({
-  args,
-  env,
-  now,
-  runYear = runBackfillYearProcess,
-  clock = () => new Date(),
-}) {
-  const ranges = buildBackfillYearRanges(args.toDay);
-  const runDir = path.join(args.evidenceRoot, args.runId);
-  const yearsRoot = path.join(runDir, "years");
-  const reportPath = path.join(runDir, "report.json");
-  await fs.mkdir(args.evidenceRoot, { recursive: true });
-  try {
-    await fs.mkdir(runDir);
-  } catch (error) {
-    if (error?.code === "EEXIST") {
-      throw new Error(`Run evidence directory already exists and will not be overwritten: ${runDir}`);
-    }
-    throw error;
-  }
-  await fs.mkdir(yearsRoot);
-
-  const yearsSelected = ranges.map((range) => range.year);
-  const report = {
-    schema_version: 1,
-    kind: "uk_aq_ukair_bc_observation_backfill_report",
-    environment: "TEST",
-    mode: "backfill",
-    execution: args.apply ? "apply" : "dry_run",
-    run_id: args.runId,
-    selected_properties: args.properties,
-    selected_stations: args.stationRefs,
-    selected_utc_date_range: { from: UKAIR_BC_HISTORY_START_DAY, to: args.toDay },
-    years_selected: yearsSelected,
-    years_attempted: [],
-    years_completed: [],
-    years_failed: [],
-    years_not_attempted: [...yearsSelected],
-    current_or_failed_year: null,
-    per_year_results: ranges.map((range) => summarizeBackfillYearResult({
-      range,
-      status: "not_attempted",
-      reportPath: path.join(yearsRoot, `year-${range.year}`, "report.json"),
-      childReport: null,
-      error: null,
-    })),
-    final_status: "running",
-    ok: false,
-    started_at_utc: new Date(now).toISOString(),
-    completed_at_utc: null,
-    report_path: reportPath,
-  };
-  await writeJson(reportPath, report);
-
-  for (let index = 0; index < ranges.length; index += 1) {
-    const range = ranges[index];
-    const childReportPath = path.join(yearsRoot, `year-${range.year}`, "report.json");
-    const childArgv = backfillChildArgv(args, range, yearsRoot);
-    report.years_attempted.push(range.year);
-    report.years_not_attempted = yearsSelected.filter(
-      (year) => !report.years_attempted.includes(year),
-    );
-    report.current_or_failed_year = range.year;
-    report.per_year_results[index] = summarizeBackfillYearResult({
-      range,
-      status: "running",
-      reportPath: childReportPath,
-      childReport: null,
-      error: null,
-    });
-    await writeJson(reportPath, report);
-
-    let outcome;
-    let childError = null;
-    try {
-      outcome = await runYear({
-        year: range.year,
-        range,
-        childArgv,
-        env,
-        reportPath: childReportPath,
-      });
-    } catch (error) {
-      childError = error instanceof Error ? error.message : String(error);
-      outcome = { code: null, report: null, report_read_error: null };
-    }
-    const childReport = outcome?.report || null;
-    if (!report.selected_stations.length && Array.isArray(childReport?.selected_stations)) {
-      report.selected_stations = [...childReport.selected_stations];
-    }
-    const completed = outcome?.code === 0 && childReport?.ok === true;
-    if (completed) {
-      report.years_completed.push(range.year);
-      report.per_year_results[index] = summarizeBackfillYearResult({
-        range,
-        status: "completed",
-        reportPath: childReportPath,
-        childReport,
-        error: null,
-      });
-      await writeJson(reportPath, report);
-      continue;
-    }
-
-    const error = childError || outcome?.report_read_error ||
-      `yearly reconciliation exited with code ${String(outcome?.code)}`;
-    report.years_failed.push(range.year);
-    report.per_year_results[index] = summarizeBackfillYearResult({
-      range,
-      status: "failed",
-      reportPath: childReportPath,
-      childReport,
-      error,
-    });
-    report.final_status = "failed_year_reconciliation";
-    break;
-  }
-
-  report.years_not_attempted = yearsSelected.filter(
-    (year) => !report.years_attempted.includes(year),
-  );
-  report.completed_at_utc = new Date(clock()).toISOString();
-  if (!report.years_failed.length && report.years_completed.length === yearsSelected.length) {
-    report.current_or_failed_year = null;
-    report.final_status = "completed";
-    report.ok = true;
-  }
-  await writeJson(reportPath, report);
-  return Object.freeze({ help: false, report });
-}
-
 export async function runLockedReconciliation({
   planPath,
   planSha256,
@@ -987,23 +770,12 @@ export async function runBlackCarbonObservationReconciler({
   env = process.env,
   fetchImpl = fetch,
   now = new Date(),
-  runBackfillYear,
-  clock,
 } = {}) {
   const args = parseReconcilerArgs(argv, { now });
   if (args.help) return Object.freeze({ help: true, text: usage() });
   const configuredEnvironment = String(env.UKAQ_ENV_NAME || env.UK_AQ_ENV_NAME || "TEST")
     .trim().toUpperCase();
   if (configuredEnvironment !== "TEST") throw new Error("Configured environment must be TEST");
-  if (args.mode === "backfill") {
-    return await runBackfillReconciliation({
-      args,
-      env,
-      now,
-      ...(runBackfillYear ? { runYear: runBackfillYear } : {}),
-      ...(clock ? { clock } : {}),
-    });
-  }
   const days = daysInclusive(args.fromDay, args.toDay);
   const requiredYears = requiredBlackCarbonAnnualSourceYears(days);
   const requiredYearsByDay = new Map(days.map((day) => [
