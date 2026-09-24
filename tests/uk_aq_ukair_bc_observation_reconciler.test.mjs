@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -20,12 +21,17 @@ import {
 } from "../scripts/ukair_bc/uk_aq_ukair_bc_observation_reconciler.mjs";
 import {
   currentConnectorManifest,
+  filterChangedWriterInputs,
   mergeSelectedTimeseriesRows,
   readCurrentPollutantState,
+  writerBatches,
 } from "../scripts/ukair_bc/uk_aq_ukair_bc_observation_reconciler_locked.mjs";
 import {
   getObservationHistoryGeneration,
 } from "../workers/shared/uk_aq_observation_history_generation.mjs";
+import {
+  buildObservationHistoryExactLeafIndexV3Latest,
+} from "../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
   buildObservationHistoryV3SteadyStatePartition,
@@ -97,6 +103,20 @@ function canonicalFixtureObjects(fixture, { day = fixture.day, connector = fixtu
   ]);
 }
 
+function publishedCanonicalAndExactFixtureObjects(fixture) {
+  const objects = canonicalFixtureObjects(fixture);
+  for (const artifact of fixture.partition.v3_hierarchy.publication_objects) {
+    objects.set(artifact.key, Buffer.from(artifact.body));
+  }
+  const latest = buildObservationHistoryExactLeafIndexV3Latest({
+    scopedHierarchies: [fixture.partition.v3_hierarchy],
+    indexRoot: fixture.generation.observations_timeseries_index_prefix,
+    latestKey: fixture.generation.observations_timeseries_latest_key,
+  });
+  objects.set(latest.key, Buffer.from(latest.body));
+  return objects;
+}
+
 function memoryR2(objects) {
   const calls = [];
   const r2 = {
@@ -127,6 +147,15 @@ function currentStateArgs(r2, generation) {
     dayCache: new Map(),
     connectorCache: new Map(),
     pollutantCache: new Map(),
+  };
+}
+
+function selectedScopePlan(rows) {
+  return {
+    target_writer_git_sha: TEST_WRITER_GIT_SHA,
+    partitions: [{ scope: TEST_SCOPE, rows }],
+    removed_scopes: [],
+    selected_timeseries_ids_by_property: { bc: [201] },
   };
 }
 
@@ -539,6 +568,116 @@ test("valid day-selected connector preserves an unselected station peer", async 
     desiredRows: [{ ...stationA, value: 3 }],
     selectedTimeseriesIds: [stationA.timeseries_id],
   }), [{ ...stationA, value: 3 }, stationB]);
+});
+
+test("an identical selected-scope lifecycle is a no-op when canonical and exact-v3 bodies match", async () => {
+  const selectedRow = {
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-07-01T01:00:00.000Z",
+    value: 1,
+    verification_status: "R",
+  };
+  const peerRow = {
+    ...selectedRow,
+    station_id: 102,
+    timeseries_id: 202,
+    value: 2,
+  };
+  const fixture = blackCarbonCanonicalFixture([selectedRow, peerRow]);
+  const { r2 } = memoryR2(publishedCanonicalAndExactFixtureObjects(fixture));
+
+  const filtered = await filterChangedWriterInputs({
+    plan: selectedScopePlan([selectedRow]),
+    r2,
+    generation: fixture.generation,
+  });
+
+  assert.deepEqual(filtered.partitions, []);
+  assert.deepEqual(filtered.removedScopes, []);
+  assert.deepEqual(filtered.unchangedScopes, [{ ...TEST_SCOPE, status: "unchanged" }]);
+  assert.deepEqual(filtered.scopeComparisonDiagnostics, [{
+    ...TEST_SCOPE,
+    category: "unchanged",
+    comparison_stage: "complete",
+  }]);
+  assert.deepEqual(writerBatches(filtered), []);
+});
+
+test("changed selected canonical rows remain eligible for reconciliation", async () => {
+  const currentRow = {
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-07-01T01:00:00.000Z",
+    value: 1,
+    verification_status: "R",
+  };
+  const fixture = blackCarbonCanonicalFixture([currentRow]);
+  const { r2 } = memoryR2(publishedCanonicalAndExactFixtureObjects(fixture));
+
+  const filtered = await filterChangedWriterInputs({
+    plan: selectedScopePlan([{ ...currentRow, value: 3 }]),
+    r2,
+    generation: fixture.generation,
+  });
+
+  assert.equal(filtered.partitions.length, 1);
+  assert.deepEqual(filtered.unchangedScopes, []);
+  assert.equal(filtered.scopeComparisonDiagnostics[0].category, "canonical_physical_mismatch");
+  assert.equal(filtered.scopeComparisonDiagnostics[0].comparison_stage, "canonical_physical");
+  assert.ok(writerBatches(filtered).length > 0);
+});
+
+test("correct canonical rows with a corrupt exact-v3 publication object remain eligible for reconciliation", async () => {
+  const currentRow = {
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-07-01T01:00:00.000Z",
+    value: 1,
+    verification_status: "R",
+  };
+  const fixture = blackCarbonCanonicalFixture([currentRow]);
+  const objects = publishedCanonicalAndExactFixtureObjects(fixture);
+  const corruptLeaf = fixture.partition.v3_hierarchy.publication_objects.find(
+    (artifact) => artifact.kind === "observation_history_index_v3_exact_leaf",
+  );
+  assert.ok(corruptLeaf);
+  const corruptBody = Buffer.from(objects.get(corruptLeaf.key));
+  corruptBody[0] = corruptBody[0] === 0x7b ? 0x5b : 0x7b;
+  objects.set(corruptLeaf.key, corruptBody);
+  const { r2 } = memoryR2(objects);
+
+  const filtered = await filterChangedWriterInputs({
+    plan: selectedScopePlan([currentRow]),
+    r2,
+    generation: fixture.generation,
+  });
+
+  assert.equal(filtered.partitions.length, 1);
+  assert.deepEqual(filtered.unchangedScopes, []);
+  assert.deepEqual(filtered.scopeComparisonDiagnostics, [{
+    ...TEST_SCOPE,
+    category: "exact_publication_object_mismatch",
+    comparison_stage: "exact_publication_object",
+    key: corruptLeaf.key,
+    expected: {
+      key: corruptLeaf.key,
+      byte_size: corruptLeaf.byte_size,
+      sha256: corruptLeaf.sha256,
+    },
+    actual: {
+      key: corruptLeaf.key,
+      byte_size: corruptBody.byteLength,
+      sha256: createHash("sha256").update(corruptBody).digest("hex"),
+    },
+  }]);
+  assert.ok(writerBatches(filtered).length > 0);
 });
 
 test("missing day authority treats the connector as absent without probing its stale object", async () => {

@@ -196,28 +196,7 @@ async function loadExactLatest({ r2, generation }) {
   return Object.freeze({ payload, byIdentity });
 }
 
-function comparisonDiagnostic(scope, category, fields = {}) {
-  return Object.freeze({
-    day_utc: scope.day_utc,
-    connector_id: scope.connector_id,
-    pollutant_code: scope.pollutant_code,
-    category,
-    ...fields,
-  });
-}
-
-function objectIdentityEvidence(value) {
-  if (!value) return null;
-  return Object.freeze({
-    key: value.key ?? null,
-    byte_size: Number.isSafeInteger(Number(value.byte_size))
-      ? Number(value.byte_size)
-      : null,
-    sha256: typeof value.sha256 === "string" ? value.sha256 : null,
-  });
-}
-
-async function compareExactScope({
+async function exactScopeMatches({
   r2,
   latest,
   scope,
@@ -226,114 +205,33 @@ async function compareExactScope({
 }) {
   const identity = `${scope.day_utc}\u0000${scope.connector_id}\u0000${scope.pollutant_code}`;
   const root = latest.byIdentity.get(identity) || null;
-  if (expectedScopedManifest === null) {
-    return Object.freeze({
-      matches: root === null,
-      diagnostic: root === null
-        ? comparisonDiagnostic(scope, "already_absent", {
-            comparison_stage: "exact_latest",
-          })
-        : comparisonDiagnostic(scope, "exact_latest_unexpected_scope", {
-            comparison_stage: "exact_latest",
-            key: root.key ?? null,
-            actual: objectIdentityEvidence(root),
-          }),
-    });
-  }
+  if (expectedScopedManifest === null) return root === null;
   if (
     !root || root.key !== expectedScopedManifest.key ||
     Number(root.byte_size) !== expectedScopedManifest.byte_size ||
     root.sha256 !== expectedScopedManifest.sha256
   ) {
-    return Object.freeze({
-      matches: false,
-      diagnostic: comparisonDiagnostic(scope, "exact_latest_mismatch", {
-        comparison_stage: "exact_latest",
-        key: expectedScopedManifest.key,
-        expected: objectIdentityEvidence(expectedScopedManifest),
-        actual: objectIdentityEvidence(root),
-      }),
-    });
+    return false;
   }
   const object = await optionalR2Object(r2, expectedScopedManifest.key);
-  if (object === null) {
-    return Object.freeze({
-      matches: false,
-      diagnostic: comparisonDiagnostic(scope, "exact_scoped_manifest_missing", {
-        comparison_stage: "exact_scoped_manifest",
-        key: expectedScopedManifest.key,
-        expected: objectIdentityEvidence(expectedScopedManifest),
-        actual: null,
-      }),
-    });
-  }
+  if (object === null) return false;
   const body = Buffer.from(object.body);
-  const actualScopedManifest = Object.freeze({
-    key: expectedScopedManifest.key,
-    byte_size: body.byteLength,
-    sha256: sha256Hex(body),
-  });
   if (
-    actualScopedManifest.byte_size !== expectedScopedManifest.byte_size ||
-    actualScopedManifest.sha256 !== expectedScopedManifest.sha256
+    body.byteLength !== expectedScopedManifest.byte_size ||
+    sha256Hex(body) !== expectedScopedManifest.sha256
   ) {
-    return Object.freeze({
-      matches: false,
-      diagnostic: comparisonDiagnostic(scope, "exact_scoped_manifest_mismatch", {
-        comparison_stage: "exact_scoped_manifest",
-        key: expectedScopedManifest.key,
-        expected: objectIdentityEvidence(expectedScopedManifest),
-        actual: objectIdentityEvidence(actualScopedManifest),
-      }),
-    });
+    return false;
   }
-  const verifiedObjects = new Map([
-    [expectedScopedManifest.key, actualScopedManifest],
-  ]);
   for (const artifact of expectedPublicationObjects) {
-    let actual = verifiedObjects.get(artifact.key) || null;
-    if (actual === null) {
-      const stored = await optionalR2Object(r2, artifact.key);
-      if (stored === null) {
-        return Object.freeze({
-          matches: false,
-          diagnostic: comparisonDiagnostic(scope, "exact_publication_object_missing", {
-            comparison_stage: "exact_publication_object",
-            key: artifact.key,
-            expected: objectIdentityEvidence(artifact),
-            actual: null,
-          }),
-        });
-      }
-      const storedBody = Buffer.from(stored.body);
-      actual = Object.freeze({
-        key: artifact.key,
-        byte_size: storedBody.byteLength,
-        sha256: sha256Hex(storedBody),
-      });
-      verifiedObjects.set(artifact.key, actual);
-    }
+    const head = await r2HeadObject({ r2, key: artifact.key });
     if (
-      actual.byte_size !== artifact.byte_size ||
-      actual.sha256 !== artifact.sha256
+      !head?.exists || Number(head.bytes ?? head.size) !== artifact.byte_size ||
+      head.sha256 !== artifact.sha256
     ) {
-      return Object.freeze({
-        matches: false,
-        diagnostic: comparisonDiagnostic(scope, "exact_publication_object_mismatch", {
-          comparison_stage: "exact_publication_object",
-          key: artifact.key,
-          expected: objectIdentityEvidence(artifact),
-          actual: objectIdentityEvidence(actual),
-        }),
-      });
+      return false;
     }
   }
-  return Object.freeze({
-    matches: true,
-    diagnostic: comparisonDiagnostic(scope, "unchanged", {
-      comparison_stage: "complete",
-    }),
-  });
+  return true;
 }
 
 function comparablePhysicalScope(manifest) {
@@ -357,75 +255,9 @@ function comparablePhysicalScope(manifest) {
   };
 }
 
-function compactFileIdentity(file) {
-  if (!file) return null;
-  return Object.freeze({
-    key: file.key ?? null,
-    row_count: file.row_count ?? null,
-    bytes: file.bytes ?? null,
-    etag_or_hash: file.etag_or_hash ?? null,
-  });
-}
-
-function compactPhysicalMismatch(field, current, expected) {
-  if (field !== "files") return { current, expected };
-  const currentFiles = Array.isArray(current) ? current : [];
-  const expectedFiles = Array.isArray(expected) ? expected : [];
-  const comparedLength = Math.max(currentFiles.length, expectedFiles.length);
-  let firstDifferingFileIndex = null;
-  for (let index = 0; index < comparedLength; index += 1) {
-    if (JSON.stringify(currentFiles[index]) !== JSON.stringify(expectedFiles[index])) {
-      firstDifferingFileIndex = index;
-      break;
-    }
-  }
-  return {
-    current: Object.freeze({
-      file_count: currentFiles.length,
-      first_differing_file: compactFileIdentity(currentFiles[firstDifferingFileIndex]),
-    }),
-    expected: Object.freeze({
-      file_count: expectedFiles.length,
-      first_differing_file: compactFileIdentity(expectedFiles[firstDifferingFileIndex]),
-    }),
-    first_differing_file_index: firstDifferingFileIndex,
-  };
-}
-
-function comparePhysicalScope(scope, left, right) {
-  if (!left) {
-    return Object.freeze({
-      matches: false,
-      diagnostic: comparisonDiagnostic(scope, "canonical_manifest_missing", {
-        comparison_stage: "canonical_physical",
-      }),
-    });
-  }
-  const current = comparablePhysicalScope(left);
-  const expected = comparablePhysicalScope(right);
-  for (const field of Object.keys(expected)) {
-    if (JSON.stringify(current[field]) !== JSON.stringify(expected[field])) {
-      const mismatch = compactPhysicalMismatch(
-        field,
-        current[field],
-        expected[field],
-      );
-      return Object.freeze({
-        matches: false,
-        diagnostic: comparisonDiagnostic(scope, "canonical_physical_mismatch", {
-          comparison_stage: "canonical_physical",
-          differing_field: field,
-          ...mismatch,
-        }),
-      });
-    }
-  }
-  return Object.freeze({
-    matches: true,
-    diagnostic: comparisonDiagnostic(scope, "canonical_physical_match", {
-      comparison_stage: "canonical_physical",
-    }),
-  });
+function samePhysicalScope(left, right) {
+  return JSON.stringify(comparablePhysicalScope(left)) ===
+    JSON.stringify(comparablePhysicalScope(right));
 }
 
 async function currentDayManifest({ r2, generation, dayUtc, cache }) {
@@ -729,14 +561,13 @@ async function materializeCompleteSelectedScopes({ plan, r2, generation }) {
   });
 }
 
-export async function filterChangedWriterInputs({ plan, r2, generation }) {
+async function filterChangedWriterInputs({ plan, r2, generation }) {
   const materialized = await materializeCompleteSelectedScopes({ plan, r2, generation });
   const { dayCache, connectorCache, pollutantCache } = materialized;
   const exactLatest = await loadExactLatest({ r2, generation });
   const changedPartitions = [];
   const changedRemovals = [];
   const unchangedScopes = [];
-  const scopeComparisonDiagnostics = [];
   for (const partition of materialized.partitions) {
     const prepared = buildObservationHistoryV3SteadyStatePartition({
       source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation,
@@ -754,37 +585,30 @@ export async function filterChangedWriterInputs({ plan, r2, generation }) {
       connectorCache,
       pollutantCache,
     });
-    const canonicalComparison = comparePhysicalScope(
-      partition.scope,
-      currentState.manifest,
-      prepared.canonical_pollutant_manifest.payload,
+    const canonicalUnchanged = Boolean(
+      currentState.manifest &&
+      samePhysicalScope(
+        currentState.manifest,
+        prepared.canonical_pollutant_manifest.payload,
+      ),
     );
-    const expectedCurrentExactHierarchy = canonicalComparison.matches
+    const expectedCurrentExactHierarchy = canonicalUnchanged
       ? buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
           metadata: prepared.target_metadata,
           canonicalManifest: currentState.manifest_artifact,
           indexRoot: generation.observations_timeseries_index_prefix,
         })
       : null;
-    const exactComparison = canonicalComparison.matches
-      ? await compareExactScope({
-          r2,
-          latest: exactLatest,
-          scope: partition.scope,
-          expectedScopedManifest: expectedCurrentExactHierarchy.scoped_manifest,
-          expectedPublicationObjects:
-            expectedCurrentExactHierarchy.publication_objects,
-        })
-      : null;
-    if (canonicalComparison.matches && exactComparison.matches) {
-      unchangedScopes.push(Object.freeze({ ...partition.scope, status: "unchanged" }));
-      scopeComparisonDiagnostics.push(exactComparison.diagnostic);
-    } else {
-      changedPartitions.push(partition);
-      scopeComparisonDiagnostics.push(
-        exactComparison?.diagnostic || canonicalComparison.diagnostic,
-      );
-    }
+    const unchanged = canonicalUnchanged && await exactScopeMatches({
+      r2,
+      latest: exactLatest,
+      scope: partition.scope,
+      expectedScopedManifest: expectedCurrentExactHierarchy.scoped_manifest,
+      expectedPublicationObjects:
+        expectedCurrentExactHierarchy.publication_objects,
+    });
+    if (unchanged) unchangedScopes.push(Object.freeze({ ...partition.scope, status: "unchanged" }));
+    else changedPartitions.push(partition);
   }
   for (const scope of materialized.removedScopes) {
     const connector = await currentConnectorManifest({
@@ -797,33 +621,23 @@ export async function filterChangedWriterInputs({ plan, r2, generation }) {
     const canonicalPresent = Boolean(
       connectorPollutantChild(connector, scope.pollutant_code),
     );
-    const exactComparison = await compareExactScope({
+    const exactAbsent = await exactScopeMatches({
       r2,
       latest: exactLatest,
       scope,
       expectedScopedManifest: null,
     });
-    if (canonicalPresent || !exactComparison.matches) {
-      changedRemovals.push(scope);
-      scopeComparisonDiagnostics.push(canonicalPresent
-        ? comparisonDiagnostic(scope, "canonical_scope_present", {
-            comparison_stage: "canonical_authority",
-          })
-        : exactComparison.diagnostic);
-    } else {
-      unchangedScopes.push(Object.freeze({ ...scope, status: "already_absent" }));
-      scopeComparisonDiagnostics.push(exactComparison.diagnostic);
-    }
+    if (canonicalPresent || !exactAbsent) changedRemovals.push(scope);
+    else unchangedScopes.push(Object.freeze({ ...scope, status: "already_absent" }));
   }
   return Object.freeze({
     partitions: Object.freeze(changedPartitions),
     removedScopes: Object.freeze(changedRemovals),
     unchangedScopes: Object.freeze(unchangedScopes),
-    scopeComparisonDiagnostics: Object.freeze(scopeComparisonDiagnostics),
   });
 }
 
-export function writerBatches(filtered) {
+function writerBatches(filtered) {
   const days = [...new Set([
     ...filtered.partitions.map((partition) => partition.scope.day_utc),
     ...filtered.removedScopes.map((scope) => scope.day_utc),
@@ -854,8 +668,6 @@ function summarizeWriterResult(writerResults, filtered) {
     submitted_removal_scope_count: filtered.removedScopes.length,
     unchanged_scope_count: filtered.unchangedScopes.length,
     unchanged_scope_samples: filtered.unchangedScopes.slice(0, 200),
-    scope_comparison_diagnostics:
-      filtered.scopeComparisonDiagnostics.slice(0, 200),
     affected_partition_count: results.reduce(
       (sum, result) => sum + Number(result?.affected_partition_count || 0),
       0,
