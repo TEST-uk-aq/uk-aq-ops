@@ -19,24 +19,12 @@ import {
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
 } from "../../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import {
-  inspectCanonicalObservationTimeseriesAlignedFiles,
-} from "../../workers/shared/uk_aq_observation_history_target_writer.mjs";
-import {
-  ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
-} from "../../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
-import {
   readCanonicalObservationRows,
 } from "./uk_aq_apply_integrity_proposal.mjs";
 import {
   buildHistoryV2DayManifestKey,
-  buildHistoryV2PartKey,
   validateCanonicalHistoryV2Manifest,
 } from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
-import {
-  OBSERVATION_HISTORY_COLUMNS_V3,
-  OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
-  OBSERVATION_HISTORY_WRITER_VERSION_V3,
-} from "../../workers/shared/uk_aq_observation_history_schema.mjs";
 import {
   buildR2HistoryV2ObservationsMonthManifest,
   buildR2HistoryV2ObservationsMonthManifestKey,
@@ -80,204 +68,6 @@ export function assertCurrentRunManifestWriterGitSha(manifest, targetWriterGitSh
     throw new Error(`Fixed-v3 staged manifest writer_git_sha contradicts pinned run: ${key}`);
   }
   return targetWriterGitSha;
-}
-
-function sameJson(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function fileRange(file, field, operation) {
-  return file.row_groups.reduce((value, group) => {
-    const candidate = group[field];
-    return value === null ? candidate : operation(value, candidate);
-  }, null);
-}
-
-function metadataRange(metadata, field, operation) {
-  return metadata.files.reduce((value, file) => {
-    const candidate = fileRange(file, field, operation);
-    return value === null ? candidate : operation(value, candidate);
-  }, null);
-}
-
-function assertFixedV3ManifestPhysicalSchema(manifest, manifestKey) {
-  if (
-    manifest.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
-    manifest.writer_version !== OBSERVATION_HISTORY_WRITER_VERSION_V3 ||
-    !sameJson(manifest.columns, OBSERVATION_HISTORY_COLUMNS_V3)
-  ) {
-    throw new Error(`Fixed-v3 manifest physical schema is unsupported: ${manifestKey}`);
-  }
-}
-
-function assertFixedV3ManifestMetadata(manifest, metadata, manifestKey) {
-  const expectedContentMetadata = {
-    observation_content_hash: metadata.observation_content_hash,
-    observation_content_hash_algorithm: metadata.observation_content_hash_algorithm,
-    observation_content_hash_contract_version:
-      metadata.observation_content_hash_contract_version,
-    observation_content_hash_row_count:
-      metadata.observation_content_hash_row_count,
-    observation_content_hash_columns: metadata.observation_content_hash_columns,
-    verification_status_counts: metadata.verification_status_counts,
-  };
-  for (const [field, expected] of Object.entries(expectedContentMetadata)) {
-    if (!sameJson(manifest[field], expected)) {
-      throw new Error(`Fixed-v3 manifest ${field} disagrees: ${manifestKey}`);
-    }
-  }
-  if (
-    Number(manifest.row_count) !== metadata.row_count ||
-    Number(manifest.source_row_count) !== metadata.row_count ||
-    Number(manifest.file_count) !== metadata.file_count ||
-    Number(manifest.total_bytes) !== metadata.files.reduce(
-      (sum, file) => sum + file.byte_size,
-      0,
-    )
-  ) {
-    throw new Error(`Fixed-v3 manifest partition totals disagree: ${manifestKey}`);
-  }
-  const aggregateTimeseriesCounts = {};
-  for (const file of metadata.files) {
-    for (const [timeseriesId, count] of Object.entries(file.timeseries_row_counts)) {
-      aggregateTimeseriesCounts[timeseriesId] =
-        (aggregateTimeseriesCounts[timeseriesId] || 0) + count;
-    }
-  }
-  const aggregateMetadata = {
-    min_timeseries_id: metadataRange(metadata, "min_timeseries_id", Math.min),
-    max_timeseries_id: metadataRange(metadata, "max_timeseries_id", Math.max),
-    min_observed_at_utc: metadataRange(
-      metadata,
-      "min_observed_at_utc",
-      (left, right) => left < right ? left : right,
-    ),
-    max_observed_at_utc: metadataRange(
-      metadata,
-      "max_observed_at_utc",
-      (left, right) => left > right ? left : right,
-    ),
-    timeseries_row_counts: aggregateTimeseriesCounts,
-  };
-  if (Object.entries(aggregateMetadata).some(
-    ([field, value]) => !sameJson(manifest[field], value),
-  )) {
-    throw new Error(`Fixed-v3 manifest aggregate metadata disagrees: ${manifestKey}`);
-  }
-  const manifestFiles = new Map((manifest.files || []).map((file) => [String(file?.key), file]));
-  if (manifestFiles.size !== metadata.files.length) {
-    throw new Error(`Fixed-v3 manifest file identities disagree: ${manifestKey}`);
-  }
-  for (const file of metadata.files) {
-    const expected = manifestFiles.get(file.key);
-    const actual = {
-      row_count: file.row_count,
-      bytes: file.byte_size,
-      etag_or_hash: file.sha256,
-      min_timeseries_id: fileRange(file, "min_timeseries_id", Math.min),
-      max_timeseries_id: fileRange(file, "max_timeseries_id", Math.max),
-      min_observed_at_utc: fileRange(
-        file,
-        "min_observed_at_utc",
-        (left, right) => left < right ? left : right,
-      ),
-      max_observed_at_utc: fileRange(
-        file,
-        "max_observed_at_utc",
-        (left, right) => left > right ? left : right,
-      ),
-      timeseries_row_counts: file.timeseries_row_counts,
-    };
-    if (!expected || Object.entries(actual).some(
-      ([field, value]) => !sameJson(expected[field], value),
-    )) {
-      throw new Error(`Fixed-v3 manifest file metadata disagrees: ${file.key}`);
-    }
-  }
-}
-
-export async function inspectPinnedBaselinePollutantPartition({
-  manifest,
-  manifestKey,
-  manifestObject,
-  scope,
-  getPinnedObject,
-}) {
-  validateCanonicalHistoryV2Manifest(manifest, {
-    manifest_kind: "pollutant",
-    domain: "observations",
-    day_utc: scope.day_utc,
-    connector_id: scope.connector_id,
-    pollutant_code: scope.pollutant_code,
-    manifest_key: manifestKey,
-  });
-  assertFixedV3ManifestPhysicalSchema(manifest, manifestKey);
-  const manifestFileKeys = (manifest.files || []).map((file) => String(file?.key || ""));
-  const parquetKeys = (manifest.parquet_object_keys || []).map(String);
-  if (
-    new Set(manifestFileKeys).size !== manifestFileKeys.length ||
-    !sameJson(manifestFileKeys, parquetKeys)
-  ) {
-    throw new Error(`Fixed-v3 pinned manifest Parquet membership disagrees: ${manifestKey}`);
-  }
-  const files = [];
-  for (const [ordinal, parquetKey] of parquetKeys.entries()) {
-    assertObservationHistoryGenerationKey(GENERATION, parquetKey, "observations");
-    const object = getPinnedObject(parquetKey);
-    if (!object) {
-      throw new Error(`Fixed-v3 pinned canonical Parquet is unavailable: ${parquetKey}`);
-    }
-    const body = Buffer.from(object.body);
-    const entry = manifest.files[ordinal];
-    if (
-      body.byteLength !== Number(entry.bytes) ||
-      sha256Hex(body) !== String(entry.etag_or_hash)
-    ) {
-      throw new Error(`Fixed-v3 pinned canonical Parquet identity disagrees: ${parquetKey}`);
-    }
-    files.push({
-      key: parquetKey,
-      body,
-      rows: await readCanonicalObservationRows({
-        body,
-        connectorId: scope.connector_id,
-      }),
-    });
-  }
-  const inspected = inspectCanonicalObservationTimeseriesAlignedFiles(files, {
-    limits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
-    partition: scope,
-    fileKeyForOrdinal: (ordinal) => buildHistoryV2PartKey(
-      GENERATION.observations_prefix,
-      scope.day_utc,
-      scope.connector_id,
-      scope.pollutant_code,
-      ordinal,
-    ),
-  });
-  assertFixedV3ManifestMetadata(manifest, inspected.metadata, manifestKey);
-  const manifestBody = Buffer.from(manifestObject.body);
-  return {
-    target_metadata: inspected.metadata,
-    canonical_manifest: {
-      key: manifestKey,
-      byte_size: manifestBody.byteLength,
-      sha256: sha256Hex(manifestBody),
-      manifest_hash: String(manifest.manifest_hash),
-      row_count: Number(manifest.row_count),
-      observation_content_hash: String(manifest.observation_content_hash),
-    },
-  };
-}
-
-export function assertCurrentRunParquetIdentities(fileIntents, getObject) {
-  for (const intent of fileIntents || []) {
-    const actual = getObject(intent.key);
-    if (!actual || exactIdentity(actual, actual.source).sha256 !== intent.sha256
-      || exactIdentity(actual, actual.source).bytes !== intent.byte_size) {
-      throw new Error(`Fixed-v3 staged Parquet identity disagrees: ${intent.key}`);
-    }
-  }
 }
 
 const POLLUTANT_MANIFEST = new RegExp(
@@ -805,83 +595,47 @@ async function addExactV3Indexes({ output, runState, env, repairPlan, targetWrit
   const hierarchies = [];
   for (const manifestKey of [...manifestKeys].sort()) {
     const match = manifestKey.match(POLLUTANT_MANIFEST);
-    let manifestObject = combinedObject(manifestKey);
+    const manifestObject = combinedObject(manifestKey);
     if (!manifestObject) throw new Error(`Fixed-v3 pollutant manifest is unavailable: ${manifestKey}`);
-    let manifest = JSON.parse(Buffer.from(manifestObject.body).toString("utf8"));
+    const manifest = JSON.parse(Buffer.from(manifestObject.body).toString("utf8"));
     const currentRunManifest = proposalsByKey.has(manifestKey) ||
       (runState.objects?.[manifestKey]?.proposed === true && manifestObject.source === "overlay");
-    const scope = {
-      day_utc: match[1],
-      connector_id: Number(match[2]),
-      pollutant_code: match[3],
-    };
-    let targetMetadata;
-    let canonicalManifest;
-    if (currentRunManifest) {
-      validateCanonicalHistoryV2Manifest(manifest, {
-        manifest_kind: "pollutant",
-        domain: "observations",
-        day_utc: scope.day_utc,
-        connector_id: scope.connector_id,
-        pollutant_code: scope.pollutant_code,
-        manifest_key: manifestKey,
-      });
-      assertFixedV3ManifestPhysicalSchema(manifest, manifestKey);
-      const writerGitSha = assertCurrentRunManifestWriterGitSha(
-        manifest,
-        targetWriterGitSha,
-        manifestKey,
-      );
-      const rows = [];
-      for (const parquetKey of (manifest.parquet_object_keys || []).map(String)) {
-        assertObservationHistoryGenerationKey(GENERATION, parquetKey, "observations");
-        const parquet = combinedObject(parquetKey);
-        if (!parquet) throw new Error(`Fixed-v3 canonical Parquet is unavailable: ${parquetKey}`);
-        rows.push(...await readCanonicalObservationRows({
-          body: parquet.body,
-          connectorId: scope.connector_id,
-        }));
+    const writerGitSha = currentRunManifest
+      ? assertCurrentRunManifestWriterGitSha(manifest, targetWriterGitSha, manifestKey)
+      : manifest.writer_git_sha;
+    const rows = [];
+    for (const parquetKey of (manifest.parquet_object_keys || []).map(String)) {
+      assertObservationHistoryGenerationKey(GENERATION, parquetKey, "observations");
+      const parquet = combinedObject(parquetKey);
+      if (!parquet) throw new Error(`Fixed-v3 canonical Parquet is unavailable: ${parquetKey}`);
+      rows.push(...await readCanonicalObservationRows({ body: parquet.body, connectorId: Number(match[2]) }));
+    }
+    const built = buildObservationHistoryV3SteadyStatePartition({
+      source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
+      rows,
+      scope: { day_utc: match[1], connector_id: Number(match[2]), pollutant_code: match[3] },
+      targetWriterGitSha: writerGitSha,
+      backedUpAtUtc: manifest.backed_up_at_utc ?? null,
+      observationsPrefix: GENERATION.observations_prefix,
+      indexRoot: GENERATION.observations_timeseries_index_prefix,
+    });
+    for (const intent of built.file_intents) {
+      const actual = combinedObject(intent.key);
+      if (!actual || exactIdentity(actual, actual.source).sha256 !== intent.sha256
+        || exactIdentity(actual, actual.source).bytes !== intent.byte_size) {
+        throw new Error(`Fixed-v3 staged/baseline Parquet identity disagrees: ${intent.key}`);
       }
-      const built = buildObservationHistoryV3SteadyStatePartition({
-        source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
-        rows,
-        scope,
-        targetWriterGitSha: writerGitSha,
-        backedUpAtUtc: manifest.backed_up_at_utc ?? null,
-        observationsPrefix: GENERATION.observations_prefix,
-        indexRoot: GENERATION.observations_timeseries_index_prefix,
-      });
-      assertCurrentRunParquetIdentities(built.file_intents, combinedObject);
-      assertFixedV3ManifestMetadata(manifest, built.target_metadata, manifestKey);
-      targetMetadata = built.target_metadata;
-      const manifestBody = Buffer.from(manifestObject.body);
-      canonicalManifest = {
+    }
+    hierarchies.push(buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+      metadata: built.target_metadata,
+      canonicalManifest: {
         key: manifestKey,
-        byte_size: manifestBody.byteLength,
-        sha256: sha256Hex(manifestBody),
+        byte_size: Number(manifestObject.bytes),
+        sha256: String(manifestObject.content_sha256),
         manifest_hash: String(manifest.manifest_hash),
         row_count: Number(manifest.row_count),
         observation_content_hash: String(manifest.observation_content_hash),
-      };
-    } else {
-      manifestObject = store.getObjectFromSourceIfExists(manifestKey, "dropbox");
-      if (!manifestObject) {
-        throw new Error(`Fixed-v3 pinned pollutant manifest is unavailable: ${manifestKey}`);
-      }
-      manifest = JSON.parse(Buffer.from(manifestObject.body).toString("utf8"));
-      const inspected = await inspectPinnedBaselinePollutantPartition({
-        manifest,
-        manifestKey,
-        manifestObject,
-        scope,
-        getPinnedObject: (key) => store.getObjectFromSourceIfExists(key, "dropbox"),
-      });
-      targetMetadata = inspected.target_metadata;
-      canonicalManifest = inspected.canonical_manifest;
-    }
-    hierarchies.push(buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
-      metadata: targetMetadata,
-      canonicalManifest,
+      },
       indexRoot: GENERATION.observations_timeseries_index_prefix,
     }));
   }

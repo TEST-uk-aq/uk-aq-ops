@@ -108,6 +108,32 @@ test("observation content hash v1 is deterministic and status-aware", () => {
   ), /competing.*status/i);
   assert.equal(
     resolveLegacyVerificationStatus(
+      { verification_status: null },
+      { isSos: true },
+    ),
+    null,
+    "persisted canonical AURN null must remain null",
+  );
+  assert.equal(
+    resolveLegacyVerificationStatus(
+      { verification_status: "P" },
+      { isSos: true },
+    ),
+    "P",
+  );
+  assert.equal(
+    resolveLegacyVerificationStatus(
+      { verification_status: "R" },
+      { isSos: true },
+    ),
+    "R",
+  );
+  assert.throws(() => resolveLegacyVerificationStatus(
+    { verification_status: "provisional" },
+    { isSos: true },
+  ), /verification_status must be P, R or null/);
+  assert.equal(
+    resolveLegacyVerificationStatus(
       { status: "Provisional" },
       { isSos: true },
     ),

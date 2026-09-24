@@ -7,8 +7,10 @@ import * as arrow from "apache-arrow";
 import * as parquetWasm from "parquet-wasm/esm";
 
 import {
+  assertCurrentRunParquetIdentities,
   assertCurrentRunManifestWriterGitSha,
   assertFixedV3Proposal,
+  inspectPinnedBaselinePollutantPartition,
   reconcileReconstructedExactV3Hierarchies,
   reconstructCanonicalObservationAggregateHierarchy,
   resolveExactV3LocalReferences,
@@ -85,8 +87,8 @@ test("fixed-v3 namespace guard requires an exact dependency identity map", () =>
   assert.throws(() => assertFixedV3Proposal(output), /identities are not exact/);
 });
 
-test("04 June NO2-style canonical v3 Parquet emits verification_status and survives decoding", async () => {
-  const rows = ["P", "R"].map((verificationStatus, index) => ({
+test("canonical v3 P, R, and historical null survive lossless decoding", async () => {
+  const rows = [null, "P", "R"].map((verificationStatus, index) => ({
     connector_id: 1,
     station_id: 10,
     timeseries_id: 100,
@@ -116,7 +118,7 @@ test("04 June NO2-style canonical v3 Parquet emits verification_status and survi
   const decodedV3 = (await Promise.all(v3.file_intents.map(({ body }) =>
     readCanonicalObservationRows({ body, connectorId: 1 })
   ))).flat();
-  assert.deepEqual(decodedV3.map(({ verification_status }) => verification_status), ["P", "R"]);
+  assert.deepEqual(decodedV3.map(({ verification_status }) => verification_status), [null, "P", "R"]);
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-verification-status-decoders-"));
   try {
@@ -129,7 +131,7 @@ test("04 June NO2-style canonical v3 Parquet emits verification_status and survi
     }
     assert.deepEqual(
       inspectedRows.map(({ verification_status }) => verification_status),
-      ["P", "R"],
+      [null, "P", "R"],
     );
     assert.equal(
       computeObservationContentHash(inspectedRows).observation_content_hash,
@@ -195,6 +197,131 @@ test("physical status compatibility normalises current, historical, and absent c
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+function rehashManifest(payload) {
+  const copy = structuredClone(payload);
+  delete copy.manifest_hash;
+  return { ...copy, manifest_hash: sha256Hex(JSON.stringify(copy)) };
+}
+
+test("pinned fixed-v3 inspection authenticates actual bodies without reserialising them", async () => {
+  const scope = {
+    day_utc: "2026-08-02",
+    connector_id: 1,
+    pollutant_code: "no2",
+  };
+  const built = buildObservationHistoryV3SteadyStatePartition({
+    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
+    rows: [null, "P", "R"].map((verificationStatus, index) => ({
+      connector_id: 1,
+      station_id: 10,
+      timeseries_id: 100,
+      pollutant_code: "no2",
+      observed_at_utc: `2026-08-02T0${index}:00:00.000Z`,
+      value: 12.5 + index,
+      verification_status: verificationStatus,
+    })),
+    scope,
+    targetWriterGitSha: "a".repeat(40),
+    backedUpAtUtc: "2026-08-07T02:31:56.906Z",
+  });
+  const manifestArtifact = built.canonical_pollutant_manifest;
+  const objects = new Map(built.file_intents.map((intent) => [intent.key, {
+    key: intent.key,
+    body: intent.body,
+    source: "dropbox",
+  }]));
+  const inspect = (manifest = manifestArtifact.payload, body = manifestArtifact.body,
+    getPinnedObject = (key) => objects.get(key)) =>
+    inspectPinnedBaselinePollutantPartition({
+      manifest,
+      manifestKey: manifestArtifact.key,
+      manifestObject: { key: manifestArtifact.key, body, source: "dropbox" },
+      scope,
+      getPinnedObject,
+    });
+
+  const inspected = await inspect();
+  assert.equal(
+    inspected.target_metadata.observation_content_hash,
+    manifestArtifact.payload.observation_content_hash,
+  );
+  assert.deepEqual(inspected.target_metadata.verification_status_counts, {
+    P: 1,
+    R: 1,
+    null: 1,
+  });
+  assert.deepEqual(
+    inspected.target_metadata.files.map(({ sha256 }) => sha256),
+    built.file_intents.map(({ sha256 }) => sha256),
+  );
+
+  const firstIntent = built.file_intents[0];
+  await assert.rejects(() => inspect(
+    manifestArtifact.payload,
+    manifestArtifact.body,
+    (key) => key === firstIntent.key
+      ? { key, body: Buffer.concat([firstIntent.body, Buffer.from([0])]), source: "dropbox" }
+      : objects.get(key),
+  ), /pinned canonical Parquet identity disagrees/);
+
+  const falseContentHash = rehashManifest({
+    ...manifestArtifact.payload,
+    observation_content_hash: "f".repeat(64),
+  });
+  await assert.rejects(() => inspect(
+    falseContentHash,
+    Buffer.from(JSON.stringify(falseContentHash)),
+  ), /observation_content_hash disagrees/);
+
+  const unsupportedWriterBody = Buffer.from(firstIntent.body);
+  const createdByMarker = unsupportedWriterBody.indexOf("writer_version=");
+  assert.ok(createdByMarker >= 0, "fixture has a created_by writer marker");
+  unsupportedWriterBody[createdByMarker] = "W".charCodeAt(0);
+  const unsupportedWriterManifest = structuredClone(manifestArtifact.payload);
+  unsupportedWriterManifest.files[0].etag_or_hash = sha256Hex(unsupportedWriterBody);
+  const rehashedUnsupportedWriterManifest = rehashManifest(unsupportedWriterManifest);
+  await assert.rejects(() => inspect(
+    rehashedUnsupportedWriterManifest,
+    Buffer.from(JSON.stringify(rehashedUnsupportedWriterManifest)),
+    (key) => key === firstIntent.key
+      ? { key, body: unsupportedWriterBody, source: "dropbox" }
+      : objects.get(key),
+  ), /footer writer identity mismatch/);
+});
+
+test("current-run fixed-v3 Parquet retains exact staged byte identity", () => {
+  const built = buildObservationHistoryV3SteadyStatePartition({
+    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
+    rows: [{
+      connector_id: 1,
+      station_id: 10,
+      timeseries_id: 100,
+      pollutant_code: "pm25",
+      observed_at_utc: "2026-06-01T00:00:00.000Z",
+      value: 12.5,
+      verification_status: "P",
+    }],
+    scope: { day_utc: "2026-06-01", connector_id: 1, pollutant_code: "pm25" },
+    targetWriterGitSha: "a".repeat(40),
+  });
+  const objects = new Map(built.file_intents.map((intent) => [intent.key, {
+    key: intent.key,
+    body: intent.body,
+    source: "planned_overlay",
+  }]));
+  assert.doesNotThrow(() => assertCurrentRunParquetIdentities(
+    built.file_intents,
+    (key) => objects.get(key),
+  ));
+  const first = built.file_intents[0];
+  assert.throws(() => assertCurrentRunParquetIdentities(
+    built.file_intents,
+    (key) => key === first.key
+      ? { key, body: Buffer.concat([first.body, Buffer.from([0])]), source: "planned_overlay" }
+      : objects.get(key),
+  ), /staged Parquet identity disagrees/);
 });
 
 
