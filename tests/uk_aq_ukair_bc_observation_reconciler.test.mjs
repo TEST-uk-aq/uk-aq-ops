@@ -130,15 +130,33 @@ function currentStateArgs(r2, generation) {
   };
 }
 
-function annualCsv(series = "Black Carbon (880nm)") {
+function hourlyDataRow(date, hourlyValues, { provisional = false } = {}) {
+  const values = Array(24).fill("");
+  for (const [hour, value] of Object.entries(hourlyValues)) {
+    values[Number(hour) - 1] = String(value);
+  }
+  return `${provisional ? "##" : ""}${date},${values.join(",")}`;
+}
+
+function annualCsv({
+  series = "Black Carbon (880nm)",
+  unit = "ug/m-3",
+  header = [
+    "Date",
+    ...Array.from({ length: 24 }, (_, index) => `${String(index + 1).padStart(2, "0")}:00`),
+  ],
+  rows = [
+    hourlyDataRow("30-06-2026", { 24: 0 }),
+    hourlyDataRow("01-07-2026", { 1: 1.25 }, { provisional: true }),
+  ],
+} = {}) {
   return Buffer.from([
-    "Data supplied by UK-AIR on 02 July 2026",
-    "All Data GMT hour ending",
+    "Data supplied by UK-AIR on 24/9/2026",
+    "All Data GMT hour ending  ",
     "Rows begining ## are Provisional",
-    `Date,Time,"${series}",Status,Unit`,
-    "30-06-2026,24:00,0,P,ugm-3",
-    "##01-07-2026,01:00,1.25,,ugm-3",
-    "01-07-2026,02:00,,,",
+    `Shrewsbury Underdale ${series} ${unit}`,
+    header.join(","),
+    ...rows,
   ].join("\n"), "utf8");
 }
 
@@ -160,9 +178,11 @@ test("Black Carbon annual parser preserves GMT boundary, P/R, blank and zero sem
     value: 1.25,
     verification_status: "P",
   }]);
-  assert.equal(parsed.source_rows, 3);
+  assert.equal(parsed.source_series, "Black Carbon (880 nm)");
+  assert.equal(parsed.source_supplied_date, "24/9/2026");
+  assert.equal(parsed.source_rows, 2);
   assert.equal(parsed.valid_observation_count, 2);
-  assert.equal(parsed.missing_cell_count, 1);
+  assert.equal(parsed.missing_cell_count, 46);
   assert.equal(parsed.provisional_count, 1);
   assert.equal(parsed.ratified_count, 1);
   assert.equal(parsed.zero_count, 1);
@@ -172,13 +192,99 @@ test("Black Carbon annual parser preserves GMT boundary, P/R, blank and zero sem
 test("Black Carbon annual parser fails closed for a contradictory source series", () => {
   assert.throws(
     () => parseUkAirBlackCarbonAnnualCsv({
-      bytes: annualCsv("UV Particulate Matter (370nm)"),
+      bytes: annualCsv({ series: "UV Particulate Matter (370nm)" }),
       sourceProperty: "bc",
       sourceYear: 2026,
       ukAirRef: "UKA01055",
       siteRef: "SHUN",
     }),
-    /source-property header mismatch for bc/,
+    /source-property declaration mismatch for bc: uv370/,
+  );
+  for (const series of [
+    "UV Particulate Matter (UV-BC)",
+    "Black Carbon (950nm)",
+  ]) {
+    assert.throws(
+      () => parseUkAirBlackCarbonAnnualCsv({
+        bytes: annualCsv({ series }),
+        sourceProperty: "uv370",
+        sourceYear: 2026,
+        ukAirRef: "UKA01055",
+        siteRef: "SHUN",
+      }),
+      /source-property declaration mismatch for uv370/,
+    );
+  }
+});
+
+test("Black Carbon annual parser identifies the official UV370 series", () => {
+  const parsed = parseUkAirBlackCarbonAnnualCsv({
+    bytes: annualCsv({ series: "UV Particulate Matter (370nm)" }),
+    sourceProperty: "uv370",
+    sourceYear: 2026,
+    ukAirRef: "UKA01055",
+    siteRef: "SHUN",
+  });
+
+  assert.equal(parsed.source_property, "uv370");
+  assert.equal(parsed.source_series, "UV Particulate Matter (370 nm)");
+  assert.equal(parsed.valid_observation_count, 2);
+});
+
+test("Black Carbon annual parser rejects unsupported units and malformed hourly layouts", () => {
+  assert.throws(
+    () => parseUkAirBlackCarbonAnnualCsv({
+      bytes: annualCsv({ unit: "mg/m-3" }),
+      sourceProperty: "bc",
+      sourceYear: 2026,
+      ukAirRef: "UKA01055",
+      siteRef: "SHUN",
+    }),
+    /source unit contradicts ug\/m3: mg\/m-3/,
+  );
+
+  assert.throws(
+    () => parseUkAirBlackCarbonAnnualCsv({
+      bytes: annualCsv({
+        header: [
+          "Date",
+          ...Array.from({ length: 23 }, (_, index) =>
+            `${String(index + 1).padStart(2, "0")}:00`
+          ),
+        ],
+      }),
+      sourceProperty: "bc",
+      sourceYear: 2026,
+      ukAirRef: "UKA01055",
+      siteRef: "SHUN",
+    }),
+    /data header must be Date followed by 01:00 through 24:00/,
+  );
+
+  assert.throws(
+    () => parseUkAirBlackCarbonAnnualCsv({
+      bytes: annualCsv({
+        rows: [`01-07-2026,${Array(23).fill("1").join(",")}`],
+      }),
+      sourceProperty: "bc",
+      sourceYear: 2026,
+      ukAirRef: "UKA01055",
+      siteRef: "SHUN",
+    }),
+    /data row at line 6 must contain 24 hourly cells/,
+  );
+});
+
+test("Black Carbon annual parser rejects source dates outside the requested year", () => {
+  assert.throws(
+    () => parseUkAirBlackCarbonAnnualCsv({
+      bytes: annualCsv({ rows: [hourlyDataRow("31-12-2025", { 24: 1 })] }),
+      sourceProperty: "bc",
+      sourceYear: 2026,
+      ukAirRef: "UKA01055",
+      siteRef: "SHUN",
+    }),
+    /row outside source year 2026/,
   );
 });
 
@@ -743,4 +849,15 @@ test("a new backfill run still attempts an already canonical year and preserves 
     { runId: "backfill-first-run", year: 2020 },
     { runId: "backfill-second-run", year: 2020 },
   ]);
+});
+
+test("the Black Carbon workflow generates artifact-safe run directory names", async () => {
+  const workflow = await fs.readFile(new URL(
+    "../.github/workflows/uk_aq_ukair_bc_observation_reconciliation.yml",
+    import.meta.url,
+  ), "utf8");
+  assert.ok(workflow.includes(
+    "--run-id \"ukair-bc-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\"",
+  ));
+  assert.ok(!workflow.includes("ukair-bc-gha:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"));
 });

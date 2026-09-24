@@ -130,7 +130,7 @@ jobs:
             --environment TEST
             --horizon-days "${INPUT_HORIZON_DAYS}"
             --property "${INPUT_PROPERTIES}"
-            --run-id "ukair-bc-gha:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+            --run-id "ukair-bc-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           )
           if [ -n "${INPUT_FROM_DAY}" ]; then args+=(--from "${INPUT_FROM_DAY}"); fi
           if [ -n "${INPUT_TO_DAY}" ]; then args+=(--to "${INPUT_TO_DAY}"); fi

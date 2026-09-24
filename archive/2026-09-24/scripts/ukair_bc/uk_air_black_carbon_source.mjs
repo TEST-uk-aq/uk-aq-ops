@@ -133,23 +133,20 @@ function compactSeriesLabel(value) {
     .replace(/\s+/g, " ");
 }
 
-function parseSeriesDeclaration(value) {
+function classifySeriesLabel(value) {
   const label = compactSeriesLabel(value);
-  const definitions = [
-    ["bc", /(?:^|\s)black carbon\s*\(\s*880\s*nm\s*\)/],
-    ["uv370", /(?:^|\s)uv particulate matter\s*\(\s*370\s*nm\s*\)/],
-    ["uvpm", /(?:^|\s)uv particulate matter\s*\(\s*uv\s*-\s*bc\s*\)/],
-  ];
-  for (const [sourceProperty, pattern] of definitions) {
-    const match = pattern.exec(label);
-    if (!match) continue;
-    return Object.freeze({
-      source_property: sourceProperty,
-      source_unit: label.slice(match.index + match[0].length).trim(),
-    });
+  const unit = "(?:ug\\s*(?:\\/\\s*m3|m-3))";
+  if (new RegExp(`^black carbon \\(\\s*880\\s*nm\\s*\\)(?:\\s+${unit})?$`).test(label)) {
+    return "bc";
   }
-  if (/(?:^|\s)(?:black carbon|uv particulate matter)\s*\([^)]*\)/.test(label)) {
-    return Object.freeze({ source_property: "unsupported", source_unit: "" });
+  if (new RegExp(`^uv particulate matter \\(\\s*370\\s*nm\\s*\\)(?:\\s+${unit})?$`).test(label)) {
+    return "uv370";
+  }
+  if (/^uv particulate matter\s*\(\s*uv\s*-\s*bc\s*\)/.test(label)) {
+    return "uvpm";
+  }
+  if (/^(?:black carbon|uv particulate matter)\s*\(/.test(label)) {
+    return "other_black_carbon_series";
   }
   return null;
 }
@@ -243,106 +240,99 @@ export function parseUkAirBlackCarbonAnnualCsv({
   }
   assertStationAttribution(text, canonicalUkaRef);
 
-  const seriesDeclarations = records
-    .map((record) => parseSeriesDeclaration(record.raw))
-    .filter(Boolean);
-  if (seriesDeclarations.length !== 1) {
-    throw new Error(
-      `UK-AIR annual CSV must contain exactly one source-series declaration; found ${seriesDeclarations.length}`,
-    );
-  }
-  const [seriesDeclaration] = seriesDeclarations;
-  if (seriesDeclaration.source_property !== property) {
-    throw new Error(
-      `UK-AIR source-property declaration mismatch for ${property}: ` +
-        seriesDeclaration.source_property,
-    );
-  }
-  const normalizedUnit = normalizeConcentrationUnit(seriesDeclaration.source_unit);
-  if (normalizedUnit !== "ug/m3") {
-    throw new Error(
-      `UK-AIR source unit contradicts ug/m3: ${seriesDeclaration.source_unit || "missing"}`,
-    );
-  }
-
-  const expectedHeader = Object.freeze([
-    "date",
-    ...Array.from({ length: 24 }, (_, index) => `${String(index + 1).padStart(2, "0")}:00`),
-  ]);
-  const headerIndexes = records.flatMap((record, index) =>
-    normalizeHeader(record.cells[0]) === "date" ? [index] : []
-  );
-  if (headerIndexes.length !== 1) {
-    throw new Error(
-      `UK-AIR annual CSV must contain exactly one 24-hour data header; found ${headerIndexes.length}`,
-    );
-  }
-  const headerIndex = headerIndexes[0];
-  const actualHeader = records[headerIndex].cells.map(normalizeHeader);
-  if (
-    actualHeader.length !== expectedHeader.length ||
-    actualHeader.some((value, index) => value !== expectedHeader[index])
-  ) {
-    throw new Error(
-      "UK-AIR annual CSV data header must be Date followed by 01:00 through 24:00",
-    );
-  }
-
   const rows = [];
   const seenTimestamps = new Set();
-  const seenSourceDays = new Set();
   const perDayCounts = new Map();
   let sourceRows = 0;
   let missingCells = 0;
   let provisionalCount = 0;
   let ratifiedCount = 0;
   let zeroCount = 0;
-  for (const record of records.slice(headerIndex + 1)) {
-    const cells = record.cells.map((cell) => String(cell).trim());
-    if (cells.length !== expectedHeader.length) {
+  let currentValueIndex = null;
+  let currentUnitIndex = null;
+  let headerCount = 0;
+  let currentSectionRows = [];
+  let currentSectionUnits = new Set();
+
+  const finishSection = () => {
+    if (!currentSectionRows.length) return;
+    if (currentSectionUnits.size === 0) {
+      throw new Error("UK-AIR source has values without canonical concentration-unit evidence");
+    }
+    if ([...currentSectionUnits].some((unit) => unit !== "ug/m3")) {
       throw new Error(
-        `UK-AIR annual CSV data row at line ${record.line_number} must contain 24 hourly cells`,
+        `UK-AIR source unit contradicts ug/m3: ${[...currentSectionUnits].join(",")}`,
       );
     }
+    rows.push(...currentSectionRows);
+    currentSectionRows = [];
+    currentSectionUnits = new Set();
+  };
+
+  for (const record of records) {
+    const cells = record.cells.map((cell) => String(cell).trim());
+    const first = normalizeHeader(cells[0]);
+    const second = normalizeHeader(cells[1]);
+    if (first === "date" && second === "time") {
+      finishSection();
+      headerCount += 1;
+      const classified = cells.map(classifySeriesLabel);
+      const targetIndexes = classified.flatMap((value, index) => value === property ? [index] : []);
+      const contradictory = classified.filter((value) => value && value !== property);
+      if (targetIndexes.length !== 1 || contradictory.length > 0) {
+        throw new Error(
+          `UK-AIR source-property header mismatch for ${property}: ` +
+            `${classified.filter(Boolean).join(",") || "no contractual series"}`,
+        );
+      }
+      currentValueIndex = targetIndexes[0];
+      if (currentValueIndex < 2) {
+        throw new Error("UK-AIR source-series column precedes Date/Time columns");
+      }
+      const statusHeader = normalizeHeader(cells[currentValueIndex + 1]);
+      const unitHeader = normalizeHeader(cells[currentValueIndex + 2]);
+      currentUnitIndex = statusHeader === "status" && unitHeader === "unit"
+        ? currentValueIndex + 2
+        : null;
+      continue;
+    }
+    if (currentValueIndex === null) continue;
+
     const provisional = record.raw.trimStart().startsWith("##");
     const rawDate = cells[0].replace(/^##\s*/, "").trim();
-    if (cells[0].startsWith("##") !== provisional) {
-      throw new Error(`UK-AIR provisional row marker is malformed at line ${record.line_number}`);
-    }
+    const rawTime = cells[1];
+    if (!rawDate && !rawTime) continue;
     sourceRows += 1;
     if (rawDateYear(rawDate) !== year) {
       throw new Error(`UK-AIR annual CSV contains a row outside source year ${year}`);
     }
-    const sourceDay = parseUkAirObservedAtUtc(rawDate, "01:00").slice(0, 10);
-    if (seenSourceDays.has(sourceDay)) {
-      throw new Error(`UK-AIR annual CSV contains duplicate source date ${rawDate}`);
+    const observedAtUtc = parseUkAirObservedAtUtc(rawDate, rawTime);
+    if (seenTimestamps.has(observedAtUtc)) {
+      throw new Error(`UK-AIR annual CSV contains duplicate timestamp ${observedAtUtc}`);
     }
-    seenSourceDays.add(sourceDay);
-
-    for (let hourIndex = 1; hourIndex <= 24; hourIndex += 1) {
-      const observedAtUtc = parseUkAirObservedAtUtc(rawDate, expectedHeader[hourIndex]);
-      if (seenTimestamps.has(observedAtUtc)) {
-        throw new Error(`UK-AIR annual CSV contains duplicate timestamp ${observedAtUtc}`);
-      }
-      seenTimestamps.add(observedAtUtc);
-      const value = parseFiniteObservation(cells[hourIndex], record.line_number);
-      if (value === null) {
-        missingCells += 1;
-        continue;
-      }
-      const verificationStatus = provisional ? "P" : "R";
-      if (verificationStatus === "P") provisionalCount += 1;
-      else ratifiedCount += 1;
-      if (Object.is(value, 0) || Object.is(value, -0)) zeroCount += 1;
-      const dayUtc = observedAtUtc.slice(0, 10);
-      perDayCounts.set(dayUtc, (perDayCounts.get(dayUtc) || 0) + 1);
-      rows.push(Object.freeze({
-        observed_at_utc: observedAtUtc,
-        value: Object.is(value, -0) ? 0 : value,
-        verification_status: verificationStatus,
-      }));
+    seenTimestamps.add(observedAtUtc);
+    const value = parseFiniteObservation(cells[currentValueIndex], record.line_number);
+    if (value === null) {
+      missingCells += 1;
+      continue;
     }
+    const rawUnit = currentUnitIndex === null ? "" : cells[currentUnitIndex];
+    const normalizedUnit = normalizeConcentrationUnit(rawUnit);
+    if (normalizedUnit) currentSectionUnits.add(normalizedUnit);
+    const verificationStatus = provisional ? "P" : "R";
+    if (verificationStatus === "P") provisionalCount += 1;
+    else ratifiedCount += 1;
+    if (Object.is(value, 0) || Object.is(value, -0)) zeroCount += 1;
+    const dayUtc = observedAtUtc.slice(0, 10);
+    perDayCounts.set(dayUtc, (perDayCounts.get(dayUtc) || 0) + 1);
+    currentSectionRows.push(Object.freeze({
+      observed_at_utc: observedAtUtc,
+      value: Object.is(value, -0) ? 0 : value,
+      verification_status: verificationStatus,
+    }));
   }
+  finishSection();
+  if (headerCount === 0) throw new Error("UK-AIR annual CSV data header is missing");
   rows.sort((left, right) => bytewiseCompare(left.observed_at_utc, right.observed_at_utc));
   return Object.freeze({
     source_property: property,
