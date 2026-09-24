@@ -13,6 +13,7 @@ import {
 } from "../scripts/ukair_bc/uk_air_black_carbon_source.mjs";
 import {
   buildBackfillYearRanges,
+  buildDesiredScopes,
   parseReconcilerArgs,
   planAnnualSourceRequests,
   resolveBlackCarbonMetadata,
@@ -49,6 +50,7 @@ const TEST_SCOPE = Object.freeze({
   connector_id: 8,
   pollutant_code: "bc",
 });
+const ALL_UTC_HOURS = Object.freeze(Array.from({ length: 24 }, (_, hour) => hour));
 
 function blackCarbonCanonicalFixture(rows) {
   const generation = getObservationHistoryGeneration("v3");
@@ -153,9 +155,15 @@ function currentStateArgs(r2, generation) {
 function selectedScopePlan(rows) {
   return {
     target_writer_git_sha: TEST_WRITER_GIT_SHA,
-    partitions: [{ scope: TEST_SCOPE, rows }],
+    partitions: [{
+      scope: TEST_SCOPE,
+      rows,
+      selected_timeseries_authority: [{
+        timeseries_id: 201,
+        authoritative_hours_utc: ALL_UTC_HOURS,
+      }],
+    }],
     removed_scopes: [],
-    selected_timeseries_ids_by_property: { bc: [201] },
   };
 }
 
@@ -189,6 +197,52 @@ function annualCsv({
   ].join("\n"), "utf8");
 }
 
+function blackCarbonStation({ stationId, timeseriesId, ukAirRef, siteRef }) {
+  return {
+    station_id: stationId,
+    uk_air_ref: ukAirRef,
+    site_ref: siteRef,
+    timeseries: new Map([["bc", {
+      timeseries_id: timeseriesId,
+      timeseries_ref: `${ukAirRef}:bc`,
+      pollutant_code: "bc",
+    }]]),
+  };
+}
+
+function acquiredBlackCarbonSource(station, rows) {
+  return {
+    identity: `${station.uk_air_ref}\u0000bc\u00002026`,
+    status: "pinned",
+    parse_status: "parsed",
+    parsed: parseUkAirBlackCarbonAnnualCsv({
+      bytes: annualCsv({ rows }),
+      sourceProperty: "bc",
+      sourceYear: 2026,
+      ukAirRef: station.uk_air_ref,
+      siteRef: station.site_ref,
+    }),
+  };
+}
+
+function buildCurrentYearDesiredScopes({ days, stations, acquiredSources }) {
+  return buildDesiredScopes({
+    days,
+    properties: ["bc"],
+    metadata: {
+      connector_id: 8,
+      selected_stations: stations,
+    },
+    requiredYearsByDay: new Map(days.map((day) => [day, [2026]])),
+    acquisitionPlan: {
+      expectedAbsences: [],
+      metadataBlockers: [],
+    },
+    acquiredSources,
+    currentYear: 2026,
+  });
+}
+
 test("Black Carbon annual parser preserves GMT boundary, P/R, blank and zero semantics", () => {
   const parsed = parseUkAirBlackCarbonAnnualCsv({
     bytes: annualCsv(),
@@ -215,6 +269,10 @@ test("Black Carbon annual parser preserves GMT boundary, P/R, blank and zero sem
   assert.equal(parsed.provisional_count, 1);
   assert.equal(parsed.ratified_count, 1);
   assert.equal(parsed.zero_count, 1);
+  assert.equal(parsed.source_date_count, 2);
+  assert.equal(parsed.first_source_date, "2026-06-30");
+  assert.equal(parsed.last_source_date, "2026-07-01");
+  assert.deepEqual(parsed.source_date_days, ["2026-06-30", "2026-07-01"]);
   assert.deepEqual(parsed.per_partition_day_row_counts, { "2026-07-01": 2 });
 });
 
@@ -405,12 +463,20 @@ test("selected scope routing sends rows to replacement, conclusive empty to remo
     connector_id: 8,
     pollutant_code: "bc",
     rows: [canonicalRow],
+    selected_timeseries_authority: [{
+      timeseries_id: 201,
+      authoritative_hours_utc: ALL_UTC_HOURS,
+    }],
     conclusive: true,
   }, {
     day_utc: "2026-07-01",
     connector_id: 8,
     pollutant_code: "uv370",
     rows: [],
+    selected_timeseries_authority: [{
+      timeseries_id: 202,
+      authoritative_hours_utc: ALL_UTC_HOURS,
+    }],
     conclusive: true,
   }, {
     day_utc: "2026-07-02",
@@ -423,9 +489,19 @@ test("selected scope routing sends rows to replacement, conclusive empty to remo
   assert.deepEqual(routed.partitions, [{
     scope: { day_utc: "2026-07-01", connector_id: 8, pollutant_code: "bc" },
     rows: [canonicalRow],
+    selected_timeseries_authority: [{
+      timeseries_id: 201,
+      authoritative_hours_utc: ALL_UTC_HOURS,
+    }],
   }]);
   assert.deepEqual(routed.removedScopes, [
-    { day_utc: "2026-07-01", connector_id: 8, pollutant_code: "uv370" },
+    {
+      scope: { day_utc: "2026-07-01", connector_id: 8, pollutant_code: "uv370" },
+      selected_timeseries_authority: [{
+        timeseries_id: 202,
+        authoritative_hours_utc: ALL_UTC_HOURS,
+      }],
+    },
   ]);
   assert.deepEqual(routed.blockedScopes, [{
     day_utc: "2026-07-02",
@@ -451,7 +527,10 @@ test("station-narrowed reconciliation preserves unselected canonical peer rows",
       value: 2,
     }],
     desiredRows: [],
-    selectedTimeseriesIds: [201],
+    selectedTimeseriesAuthority: [{
+      timeseries_id: 201,
+      authoritative_hours_utc: ALL_UTC_HOURS,
+    }],
   });
 
   assert.deepEqual(finalRows, [{
@@ -500,7 +579,10 @@ test("day authority omission ignores an orphan connector and its unselected stat
   assert.deepEqual(mergeSelectedTimeseriesRows({
     currentRows: current.rows,
     desiredRows: [desiredA],
-    selectedTimeseriesIds: [stationA.timeseries_id],
+    selectedTimeseriesAuthority: [{
+      timeseries_id: stationA.timeseries_id,
+      authoritative_hours_utc: ALL_UTC_HOURS,
+    }],
   }), [desiredA]);
 });
 
@@ -566,8 +648,285 @@ test("valid day-selected connector preserves an unselected station peer", async 
   assert.deepEqual(mergeSelectedTimeseriesRows({
     currentRows: current.rows,
     desiredRows: [{ ...stationA, value: 3 }],
-    selectedTimeseriesIds: [stationA.timeseries_id],
+    selectedTimeseriesAuthority: [{
+      timeseries_id: stationA.timeseries_id,
+      authoritative_hours_utc: ALL_UTC_HOURS,
+    }],
   }), [{ ...stationA, value: 3 }, stationB]);
+});
+
+test("current-year missing station date skips only that timeseries and preserves canonical rows", () => {
+  const missing = blackCarbonStation({
+    stationId: 101,
+    timeseriesId: 201,
+    ukAirRef: "UKA00001",
+    siteRef: "MISS",
+  });
+  const peer = blackCarbonStation({
+    stationId: 102,
+    timeseriesId: 202,
+    ukAirRef: "UKA00002",
+    siteRef: "PEER",
+  });
+  const routed = buildCurrentYearDesiredScopes({
+    days: ["2026-09-02"],
+    stations: [missing, peer],
+    acquiredSources: [
+      acquiredBlackCarbonSource(missing, [
+        hourlyDataRow("01-09-2026", { 24: 1 }),
+      ]),
+      acquiredBlackCarbonSource(peer, [
+        hourlyDataRow("01-09-2026", { 24: 2 }),
+        hourlyDataRow("02-09-2026", { 1: 3 }),
+      ]),
+    ],
+  });
+
+  assert.equal(routed.blockedScopes.length, 0);
+  assert.equal(routed.partitions.length, 1);
+  assert.deepEqual(routed.partitions[0].selected_timeseries_authority, [{
+    timeseries_id: 202,
+    authoritative_hours_utc: ALL_UTC_HOURS,
+  }]);
+  assert.deepEqual(routed.partitions[0].rows.map((row) => row.timeseries_id), [202, 202]);
+  assert.deepEqual(routed.temporarySourceGaps, [{
+    station: "UKA00001",
+    station_id: 101,
+    timeseries_id: 201,
+    timeseries_ref: "UKA00001:bc",
+    property: "bc",
+    canonical_day_utc: "2026-09-02",
+    source_year: 2026,
+    missing_source_date: "2026-09-02",
+    reason: "temporary_current_year_source_date_not_present",
+  }]);
+
+  const existingMissingRow = {
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-09-02T01:00:00.000Z",
+    value: 99,
+    verification_status: "R",
+  };
+  const merged = mergeSelectedTimeseriesRows({
+    currentRows: [existingMissingRow],
+    desiredRows: routed.partitions[0].rows,
+    selectedTimeseriesAuthority: routed.partitions[0].selected_timeseries_authority,
+  });
+  assert.ok(merged.some((row) => JSON.stringify(row) === JSON.stringify(existingMissingRow)));
+
+  const later = buildCurrentYearDesiredScopes({
+    days: ["2026-09-02"],
+    stations: [missing, peer],
+    acquiredSources: [
+      acquiredBlackCarbonSource(missing, [
+        hourlyDataRow("01-09-2026", { 24: 1 }),
+        hourlyDataRow("02-09-2026", { 1: 7 }),
+      ]),
+      acquiredBlackCarbonSource(peer, [
+        hourlyDataRow("01-09-2026", { 24: 2 }),
+        hourlyDataRow("02-09-2026", { 1: 3 }),
+      ]),
+    ],
+  });
+  assert.deepEqual(
+    later.partitions[0].selected_timeseries_authority.map((entry) => entry.timeseries_id),
+    [201, 202],
+  );
+  assert.ok(later.partitions[0].rows.some(
+    (row) => row.timeseries_id === 201 && row.value === 7,
+  ));
+});
+
+test("represented current-year blank source dates retain selected removal authority", () => {
+  const station = blackCarbonStation({
+    stationId: 101,
+    timeseriesId: 201,
+    ukAirRef: "UKA00001",
+    siteRef: "BLNK",
+  });
+  const routed = buildCurrentYearDesiredScopes({
+    days: ["2026-09-02"],
+    stations: [station],
+    acquiredSources: [acquiredBlackCarbonSource(station, [
+      hourlyDataRow("01-09-2026", {}),
+      hourlyDataRow("02-09-2026", {}),
+    ])],
+  });
+
+  assert.equal(routed.temporarySourceGaps.length, 0);
+  assert.equal(routed.removedScopes.length, 1);
+  const removal = routed.removedScopes[0];
+  assert.deepEqual(removal.selected_timeseries_authority, [{
+    timeseries_id: 201,
+    authoritative_hours_utc: ALL_UTC_HOURS,
+  }]);
+  assert.deepEqual(mergeSelectedTimeseriesRows({
+    currentRows: [{
+      connector_id: 8,
+      station_id: 101,
+      timeseries_id: 201,
+      pollutant_code: "bc",
+      observed_at_utc: "2026-09-02T01:00:00.000Z",
+      value: 4,
+      verification_status: "R",
+    }],
+    desiredRows: [],
+    selectedTimeseriesAuthority: removal.selected_timeseries_authority,
+  }), []);
+});
+
+test("represented blank authority materializes through the protected explicit-removal path", async () => {
+  const currentRow = {
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-07-01T01:00:00.000Z",
+    value: 4,
+    verification_status: "R",
+  };
+  const fixture = blackCarbonCanonicalFixture([currentRow]);
+  const { r2 } = memoryR2(publishedCanonicalAndExactFixtureObjects(fixture));
+  const filtered = await filterChangedWriterInputs({
+    plan: {
+      target_writer_git_sha: TEST_WRITER_GIT_SHA,
+      partitions: [],
+      removed_scopes: [{
+        scope: TEST_SCOPE,
+        selected_timeseries_authority: [{
+          timeseries_id: 201,
+          authoritative_hours_utc: ALL_UTC_HOURS,
+        }],
+      }],
+    },
+    r2,
+    generation: fixture.generation,
+  });
+
+  assert.deepEqual(filtered.partitions, []);
+  assert.deepEqual(filtered.removedScopes, [TEST_SCOPE]);
+  assert.deepEqual(filtered.unchangedScopes, []);
+});
+
+test("internal current-year source gaps are skipped while resumed dates reconcile covered hours", () => {
+  const station = blackCarbonStation({
+    stationId: 101,
+    timeseriesId: 201,
+    ukAirRef: "UKA00001",
+    siteRef: "GAPS",
+  });
+  const acquired = acquiredBlackCarbonSource(station, [
+    hourlyDataRow("01-09-2026", { 1: 1 }),
+    hourlyDataRow("10-09-2026", { 1: 10 }),
+  ]);
+  const routed = buildCurrentYearDesiredScopes({
+    days: ["2026-09-05", "2026-09-10"],
+    stations: [station],
+    acquiredSources: [acquired],
+  });
+
+  assert.deepEqual(routed.skippedUncoveredScopes, [{
+    day_utc: "2026-09-05",
+    connector_id: 8,
+    pollutant_code: "bc",
+    reason: "all_selected_timeseries_temporarily_uncovered",
+    temporarily_uncovered_timeseries_count: 1,
+  }]);
+  assert.equal(routed.partitions.length, 1);
+  assert.equal(routed.partitions[0].scope.day_utc, "2026-09-10");
+  assert.deepEqual(
+    routed.partitions[0].selected_timeseries_authority[0].authoritative_hours_utc,
+    ALL_UTC_HOURS.slice(1),
+  );
+  const preservedMidnight = {
+    connector_id: 8,
+    station_id: 101,
+    timeseries_id: 201,
+    pollutant_code: "bc",
+    observed_at_utc: "2026-09-10T00:00:00.000Z",
+    value: 9,
+    verification_status: "R",
+  };
+  const merged = mergeSelectedTimeseriesRows({
+    currentRows: [preservedMidnight, { ...preservedMidnight,
+      observed_at_utc: "2026-09-10T01:00:00.000Z", value: 2 }],
+    desiredRows: routed.partitions[0].rows,
+    selectedTimeseriesAuthority: routed.partitions[0].selected_timeseries_authority,
+  });
+  assert.ok(merged.some((row) => JSON.stringify(row) === JSON.stringify(preservedMidnight)));
+  assert.ok(merged.some((row) => row.observed_at_utc.endsWith("T01:00:00.000Z") && row.value === 10));
+});
+
+test("current-year acquisition and parse failures still block the canonical scope", () => {
+  const station = blackCarbonStation({
+    stationId: 101,
+    timeseriesId: 201,
+    ukAirRef: "UKA00001",
+    siteRef: "FAIL",
+  });
+  for (const [source, expected] of [[{
+    identity: "UKA00001\u0000bc\u00002026",
+    status: "failed",
+    error: "UK-AIR HTTP 503",
+  }, /UK-AIR HTTP 503/], [{
+    identity: "UKA00001\u0000bc\u00002026",
+    status: "pinned",
+    parse_status: "failed",
+    parse_error: "source series mismatch",
+  }, /source series mismatch/]]) {
+    const routed = buildCurrentYearDesiredScopes({
+      days: ["2026-09-02"],
+      stations: [station],
+      acquiredSources: [source],
+    });
+
+    assert.equal(routed.partitions.length, 0);
+    assert.equal(routed.removedScopes.length, 0);
+    assert.equal(routed.skippedUncoveredScopes.length, 0);
+    assert.equal(routed.blockedScopes.length, 1);
+    assert.match(routed.blockedScopes[0].blocked_reason, expected);
+  }
+});
+
+test("historical parsed files retain the existing conclusive selected-scope semantics", () => {
+  const station = blackCarbonStation({
+    stationId: 101,
+    timeseriesId: 201,
+    ukAirRef: "UKA00001",
+    siteRef: "HIST",
+  });
+  const parsed = parseUkAirBlackCarbonAnnualCsv({
+    bytes: annualCsv({ rows: [hourlyDataRow("01-01-2025", { 1: 1 })] }),
+    sourceProperty: "bc",
+    sourceYear: 2025,
+    ukAirRef: station.uk_air_ref,
+    siteRef: station.site_ref,
+  });
+  const routed = buildDesiredScopes({
+    days: ["2025-09-02"],
+    properties: ["bc"],
+    metadata: { connector_id: 8, selected_stations: [station] },
+    requiredYearsByDay: new Map([["2025-09-02", [2025]]]),
+    acquisitionPlan: { expectedAbsences: [], metadataBlockers: [] },
+    acquiredSources: [{
+      identity: "UKA00001\u0000bc\u00002025",
+      status: "pinned",
+      parse_status: "parsed",
+      parsed,
+    }],
+    currentYear: 2026,
+  });
+
+  assert.equal(routed.temporarySourceGaps.length, 0);
+  assert.equal(routed.skippedUncoveredScopes.length, 0);
+  assert.equal(routed.removedScopes.length, 1);
+  assert.deepEqual(routed.removedScopes[0].selected_timeseries_authority, [{
+    timeseries_id: 201,
+    authoritative_hours_utc: ALL_UTC_HOURS,
+  }]);
 });
 
 test("an identical selected-scope lifecycle is a no-op when canonical and exact-v3 bodies match", async () => {

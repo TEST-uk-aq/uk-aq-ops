@@ -38,6 +38,7 @@ const DEFAULT_DOWNLOAD_CONCURRENCY = 4;
 const DEFAULT_DOWNLOAD_TIMEOUT_MS = 60_000;
 const DEFAULT_DOWNLOAD_RETRIES = 3;
 const DEFAULT_DAILY_HORIZON_DAYS = 14;
+const ALL_UTC_HOURS = Object.freeze(Array.from({ length: 24 }, (_, hour) => hour));
 
 function usage() {
   return [
@@ -592,6 +593,9 @@ function summarizeSourceEvidence(entry) {
     provisional_count: entry.parsed?.provisional_count || 0,
     ratified_count: entry.parsed?.ratified_count || 0,
     zero_count: entry.parsed?.zero_count || 0,
+    source_date_count: entry.parsed?.source_date_count || 0,
+    first_source_date: entry.parsed?.first_source_date || null,
+    last_source_date: entry.parsed?.last_source_date || null,
     first_observed_at_utc: entry.parsed?.first_observed_at_utc || null,
     last_observed_at_utc: entry.parsed?.last_observed_at_utc || null,
   };
@@ -622,6 +626,8 @@ export function buildDesiredScopes({
     for (const property of properties) {
       const rows = [];
       const blockers = [];
+      const selectedTimeseriesAuthority = [];
+      const temporarySourceGaps = [];
       const seenTimeseriesTimestamps = new Set();
       if (!metadata.selected_stations.some((station) => station.timeseries.has(property))) {
         blockers.push(`no selected station has a canonical ${property} timeseries mapping`);
@@ -640,6 +646,8 @@ export function buildDesiredScopes({
           blockers.push(`${station.uk_air_ref}: ${metadataBlocker}`);
           continue;
         }
+        const stationRows = [];
+        let currentYearCoverage = null;
         for (const sourceYear of requiredYearsByDay.get(dayUtc)) {
           const identity = sourceIdentity(station.uk_air_ref, property, sourceYear);
           if (absenceByIdentity.has(identity)) continue;
@@ -650,22 +658,18 @@ export function buildDesiredScopes({
             );
             continue;
           }
-          const lastCoverageDay = source.parsed.last_observed_at_utc?.slice(0, 10) || null;
-          if (sourceYear === currentYear && (!lastCoverageDay || dayUtc > lastCoverageDay)) {
-            blockers.push(
-              `${station.uk_air_ref}/${property}/${sourceYear}: source lag (latest ${lastCoverageDay || "none"})`,
-            );
-            continue;
+          if (sourceYear === currentYear && Number(dayUtc.slice(0, 4)) === currentYear) {
+            const sourceDates = new Set(source.parsed.source_date_days || []);
+            const previousDay = shiftDay(dayUtc, -1);
+            currentYearCoverage = Object.freeze({
+              selected_source_date_present: sourceDates.has(dayUtc),
+              previous_source_date_present:
+                Number(previousDay.slice(0, 4)) !== currentYear || sourceDates.has(previousDay),
+            });
           }
           for (const sourceRow of source.parsed.rows) {
             if (sourceRow.observed_at_utc.slice(0, 10) !== dayUtc) continue;
-            const duplicateKey = `${mapping.timeseries_id}\u0000${sourceRow.observed_at_utc}`;
-            if (seenTimeseriesTimestamps.has(duplicateKey)) {
-              blockers.push(`${station.uk_air_ref}/${property}: duplicate canonical timestamp`);
-              continue;
-            }
-            seenTimeseriesTimestamps.add(duplicateKey);
-            rows.push(Object.freeze({
+            stationRows.push(Object.freeze({
               connector_id: metadata.connector_id,
               station_id: station.station_id,
               timeseries_id: mapping.timeseries_id,
@@ -675,6 +679,42 @@ export function buildDesiredScopes({
               verification_status: sourceRow.verification_status,
             }));
           }
+        }
+        if (currentYearCoverage?.selected_source_date_present === false) {
+          temporarySourceGaps.push(Object.freeze({
+            station: station.uk_air_ref,
+            station_id: station.station_id,
+            timeseries_id: mapping.timeseries_id,
+            timeseries_ref: mapping.timeseries_ref,
+            property,
+            canonical_day_utc: dayUtc,
+            source_year: currentYear,
+            missing_source_date: dayUtc,
+            reason: "temporary_current_year_source_date_not_present",
+          }));
+          continue;
+        }
+        const authoritativeHours = currentYearCoverage
+          ? [
+              ...(currentYearCoverage.previous_source_date_present ? [0] : []),
+              ...ALL_UTC_HOURS.slice(1),
+            ]
+          : ALL_UTC_HOURS;
+        selectedTimeseriesAuthority.push(Object.freeze({
+          timeseries_id: mapping.timeseries_id,
+          authoritative_hours_utc: Object.freeze(authoritativeHours),
+        }));
+        const authoritativeHourSet = new Set(authoritativeHours);
+        for (const row of stationRows) {
+          const hourUtc = Number(row.observed_at_utc.slice(11, 13));
+          if (!authoritativeHourSet.has(hourUtc)) continue;
+          const duplicateKey = `${mapping.timeseries_id}\u0000${row.observed_at_utc}`;
+          if (seenTimeseriesTimestamps.has(duplicateKey)) {
+            blockers.push(`${station.uk_air_ref}/${property}: duplicate canonical timestamp`);
+            continue;
+          }
+          seenTimeseriesTimestamps.add(duplicateKey);
+          rows.push(row);
         }
       }
       rows.sort((left, right) =>
@@ -686,6 +726,8 @@ export function buildDesiredScopes({
         connector_id: metadata.connector_id,
         pollutant_code: property,
         rows: Object.freeze(rows),
+        selected_timeseries_authority: Object.freeze(selectedTimeseriesAuthority),
+        temporary_source_gaps: Object.freeze(temporarySourceGaps),
         conclusive: blockers.length === 0,
         blocked_reason: blockers.length ? blockers.join("; ") : null,
       }));
@@ -793,6 +835,11 @@ function summarizeBackfillYearResult({ range, status, reportPath, childReport, e
       "source_files_successfully_pinned",
     ),
     failed_blocked_scope_count: finiteReportCount(childReport, "failed_blocked_scope_count"),
+    temporary_source_gap_count: finiteReportCount(childReport, "temporary_source_gap_count"),
+    skipped_uncovered_scope_count: finiteReportCount(
+      childReport,
+      "skipped_uncovered_scope_count",
+    ),
     non_empty_replacement_scope_count: finiteReportCount(
       childReport,
       "non_empty_replacement_scope_count",
@@ -1097,6 +1144,12 @@ export async function runBlackCarbonObservationReconciler({
     ),
     source_selected_non_empty_scope_count: routed.partitions.length,
     source_selected_empty_scope_count: routed.removedScopes.length,
+    temporary_source_gap_count: routed.temporarySourceGaps.length,
+    temporary_source_gap_samples:
+      routed.temporarySourceGaps.slice(0, REPORT_SCOPE_SAMPLE_LIMIT),
+    skipped_uncovered_scope_count: routed.skippedUncoveredScopes.length,
+    skipped_uncovered_scope_samples:
+      routed.skippedUncoveredScopes.slice(0, REPORT_SCOPE_SAMPLE_LIMIT),
     non_empty_replacement_scope_count: routed.partitions.length,
     explicit_removal_scope_count: routed.removedScopes.length,
     unchanged_no_op_scope_count: 0,
@@ -1105,7 +1158,11 @@ export async function runBlackCarbonObservationReconciler({
     r2_changed_scope_count: 0,
     failures,
     final_status: args.apply ? "ready_for_protected_r2_phase" :
-      (routed.blockedScopes.length ? "dry_run_completed_with_blocked_scopes" : "dry_run_completed"),
+      (routed.blockedScopes.length
+        ? "dry_run_completed_with_blocked_scopes"
+        : routed.skippedUncoveredScopes.length
+          ? "dry_run_completed_with_skipped_uncovered_scopes"
+          : "dry_run_completed"),
     ok: !args.apply && routed.blockedScopes.length === 0,
     report_path: reportPath,
   };
@@ -1123,19 +1180,13 @@ export async function runBlackCarbonObservationReconciler({
       to_day: args.toDay,
     },
     source_evidence: sourceEvidence,
-    selected_timeseries_ids_by_property: Object.fromEntries(
-      args.properties.map((property) => [
-        property,
-        metadata.selected_stations
-          .map((station) => station.timeseries.get(property)?.timeseries_id)
-          .filter((value) => Number.isSafeInteger(value))
-          .sort((left, right) => left - right),
-      ]),
-    ),
     partitions: routed.partitions,
     removed_scopes: routed.removedScopes,
     blocked_scope_count: routed.blockedScopes.length,
     blocked_scopes: routed.blockedScopes.slice(0, REPORT_SCOPE_SAMPLE_LIMIT),
+    skipped_uncovered_scope_count: routed.skippedUncoveredScopes.length,
+    skipped_uncovered_scopes:
+      routed.skippedUncoveredScopes.slice(0, REPORT_SCOPE_SAMPLE_LIMIT),
     failures,
     report_path: reportPath,
   };
@@ -1149,8 +1200,20 @@ export async function runBlackCarbonObservationReconciler({
 
   if (!args.apply) return Object.freeze({ help: false, report });
   if (!routed.partitions.length && !routed.removedScopes.length) {
-    report.ok = false;
-    report.final_status = "failed_no_conclusive_scope";
+    if (routed.blockedScopes.length === 0 && routed.skippedUncoveredScopes.length > 0) {
+      report.ok = true;
+      report.final_status = "completed_no_op_skipped_uncovered_scopes";
+      report.completed_at_utc = new Date().toISOString();
+      report.writer = {
+        invoked: false,
+        status: "no_authoritative_scopes",
+        submitted_replacement_scope_count: 0,
+        submitted_removal_scope_count: 0,
+      };
+    } else {
+      report.ok = false;
+      report.final_status = "failed_no_conclusive_scope";
+    }
     await writeJson(reportPath, report);
     return Object.freeze({ help: false, report });
   }

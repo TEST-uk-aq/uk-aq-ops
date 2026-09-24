@@ -104,7 +104,6 @@ async function loadProtectedPlan(args) {
     !Array.isArray(plan?.source_evidence) ||
     !Array.isArray(plan?.partitions) ||
     !Array.isArray(plan?.removed_scopes) ||
-    !plan?.selected_timeseries_ids_by_property ||
     !String(plan?.report_path || "").trim()
   ) {
     throw new Error("Protected plan identity or structure is invalid");
@@ -518,22 +517,49 @@ function connectorPollutantChild(connectorManifest, pollutantCode) {
 export function mergeSelectedTimeseriesRows({
   currentRows,
   desiredRows,
-  selectedTimeseriesIds,
+  selectedTimeseriesAuthority,
 }) {
   if (!Array.isArray(currentRows) || !Array.isArray(desiredRows)) {
     throw new TypeError("Selected-timeseries reconciliation rows must be arrays");
   }
-  const selected = new Set(Array.from(selectedTimeseriesIds || [], Number));
-  if (
-    selected.size === 0 ||
-    [...selected].some((value) => !Number.isSafeInteger(value) || value <= 0)
-  ) {
-    throw new Error("Selected-timeseries reconciliation requires positive timeseries IDs");
+  if (!Array.isArray(selectedTimeseriesAuthority) || selectedTimeseriesAuthority.length === 0) {
+    throw new Error("Selected-timeseries reconciliation requires scope-local authority");
+  }
+  const authorityByTimeseries = new Map();
+  for (const authority of selectedTimeseriesAuthority) {
+    const timeseriesId = Number(authority?.timeseries_id);
+    const hours = new Set(
+      (Array.isArray(authority?.authoritative_hours_utc)
+        ? authority.authoritative_hours_utc
+        : []).map(Number),
+    );
+    if (
+      !Number.isSafeInteger(timeseriesId) || timeseriesId <= 0 ||
+      authorityByTimeseries.has(timeseriesId) || hours.size === 0 ||
+      [...hours].some((hour) => !Number.isInteger(hour) || hour < 0 || hour > 23)
+    ) {
+      throw new Error("Selected-timeseries reconciliation authority is invalid");
+    }
+    authorityByTimeseries.set(timeseriesId, hours);
+  }
+  const canonicalCurrentRows = currentRows.map(normalizeCanonicalObservationRow);
+  const canonicalDesiredRows = desiredRows.map(normalizeCanonicalObservationRow);
+  for (const row of canonicalDesiredRows) {
+    const hours = authorityByTimeseries.get(row.timeseries_id);
+    const hourUtc = Number(row.observed_at_utc.slice(11, 13));
+    if (!hours?.has(hourUtc)) {
+      throw new Error(
+        `Desired observation is outside selected authority: ${row.timeseries_id}/${row.observed_at_utc}`,
+      );
+    }
   }
   const finalRows = [
-    ...currentRows.filter((row) => !selected.has(Number(row.timeseries_id))),
-    ...desiredRows,
-  ].map(normalizeCanonicalObservationRow).sort((left, right) =>
+    ...canonicalCurrentRows.filter((row) => {
+      const hours = authorityByTimeseries.get(row.timeseries_id);
+      return !hours?.has(Number(row.observed_at_utc.slice(11, 13)));
+    }),
+    ...canonicalDesiredRows,
+  ].sort((left, right) =>
     left.observed_at_utc.localeCompare(right.observed_at_utc) ||
     left.timeseries_id - right.timeseries_id
   );
@@ -678,13 +704,22 @@ async function materializeCompleteSelectedScopes({ plan, r2, generation }) {
   for (const partition of plan.partitions) {
     desiredByIdentity.set(
       `${partition.scope.day_utc}\u0000${partition.scope.connector_id}\u0000${partition.scope.pollutant_code}`,
-      { scope: partition.scope, rows: partition.rows },
+      {
+        scope: partition.scope,
+        rows: partition.rows,
+        selectedTimeseriesAuthority: partition.selected_timeseries_authority,
+      },
     );
   }
-  for (const scope of plan.removed_scopes) {
+  for (const removal of plan.removed_scopes) {
+    const scope = removal.scope;
     const identity = `${scope.day_utc}\u0000${scope.connector_id}\u0000${scope.pollutant_code}`;
     if (desiredByIdentity.has(identity)) throw new Error(`Protected plan duplicates scope ${identity}`);
-    desiredByIdentity.set(identity, { scope, rows: [] });
+    desiredByIdentity.set(identity, {
+      scope,
+      rows: [],
+      selectedTimeseriesAuthority: removal.selected_timeseries_authority,
+    });
   }
   const dayCache = new Map();
   const connectorCache = new Map();
@@ -696,14 +731,6 @@ async function materializeCompleteSelectedScopes({ plan, r2, generation }) {
     left.scope.connector_id - right.scope.connector_id ||
     left.scope.pollutant_code.localeCompare(right.scope.pollutant_code)
   )) {
-    const selectedTimeseriesIds = plan.selected_timeseries_ids_by_property[
-      desired.scope.pollutant_code
-    ];
-    if (!Array.isArray(selectedTimeseriesIds) || selectedTimeseriesIds.length === 0) {
-      throw new Error(
-        `Protected plan has no selected timeseries authority for ${desired.scope.pollutant_code}`,
-      );
-    }
     const current = await readCurrentPollutantState({
       r2,
       generation,
@@ -715,7 +742,7 @@ async function materializeCompleteSelectedScopes({ plan, r2, generation }) {
     const finalRows = mergeSelectedTimeseriesRows({
       currentRows: current.rows,
       desiredRows: desired.rows,
-      selectedTimeseriesIds,
+      selectedTimeseriesAuthority: desired.selectedTimeseriesAuthority,
     });
     if (finalRows.length) partitions.push(Object.freeze({ scope: desired.scope, rows: finalRows }));
     else removedScopes.push(desired.scope);
@@ -969,7 +996,9 @@ export async function runProtectedBlackCarbonReconciliation({
         writer.submitted_replacement_scope_count + writer.submitted_removal_scope_count,
       final_status: Number(plan.blocked_scope_count || 0) > 0
         ? "completed_with_blocked_scopes"
-        : "completed",
+        : Number(plan.skipped_uncovered_scope_count || 0) > 0
+          ? "completed_with_skipped_uncovered_scopes"
+          : "completed",
       ok: Number(plan.blocked_scope_count || 0) === 0,
       completed_at_utc: new Date().toISOString(),
     });

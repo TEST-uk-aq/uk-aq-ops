@@ -344,6 +344,7 @@ export function parseUkAirBlackCarbonAnnualCsv({
     }
   }
   rows.sort((left, right) => bytewiseCompare(left.observed_at_utc, right.observed_at_utc));
+  const sourceDateDays = [...seenSourceDays].sort(bytewiseCompare);
   return Object.freeze({
     source_property: property,
     source_series: PROPERTY_CONFIG[property].source_series,
@@ -355,6 +356,10 @@ export function parseUkAirBlackCarbonAnnualCsv({
     provisional_count: provisionalCount,
     ratified_count: ratifiedCount,
     zero_count: zeroCount,
+    source_date_count: sourceDateDays.length,
+    first_source_date: sourceDateDays[0] || null,
+    last_source_date: sourceDateDays.at(-1) || null,
+    source_date_days: Object.freeze(sourceDateDays),
     first_observed_at_utc: rows[0]?.observed_at_utc || null,
     last_observed_at_utc: rows.at(-1)?.observed_at_utc || null,
     per_partition_day_row_counts: Object.freeze(Object.fromEntries(
@@ -372,11 +377,46 @@ function scopeIdentity(scope) {
   return `${scope.day_utc}\u0000${scope.connector_id}\u0000${scope.pollutant_code}`;
 }
 
+function normalizeSelectedTimeseriesAuthority(rawAuthority) {
+  if (!Array.isArray(rawAuthority)) {
+    throw new TypeError("selected timeseries authority must be an array");
+  }
+  const seenTimeseries = new Set();
+  return Object.freeze([...rawAuthority].map((raw) => {
+    const timeseriesId = Number(raw?.timeseries_id);
+    if (!Number.isSafeInteger(timeseriesId) || timeseriesId <= 0) {
+      throw new Error("selected timeseries authority requires a positive timeseries_id");
+    }
+    if (seenTimeseries.has(timeseriesId)) {
+      throw new Error(`selected timeseries authority duplicates ${timeseriesId}`);
+    }
+    seenTimeseries.add(timeseriesId);
+    const hours = [...new Set(
+      (Array.isArray(raw?.authoritative_hours_utc) ? raw.authoritative_hours_utc : [])
+        .map(Number),
+    )].sort((left, right) => left - right);
+    if (
+      hours.length === 0 ||
+      hours.some((hour) => !Number.isInteger(hour) || hour < 0 || hour > 23)
+    ) {
+      throw new Error(
+        `selected timeseries authority for ${timeseriesId} requires UTC hours from 0 through 23`,
+      );
+    }
+    return Object.freeze({
+      timeseries_id: timeseriesId,
+      authoritative_hours_utc: Object.freeze(hours),
+    });
+  }));
+}
+
 export function routeBlackCarbonSelectedScopes(scopes) {
   if (!Array.isArray(scopes)) throw new TypeError("selected scopes must be an array");
   const partitions = [];
   const removedScopes = [];
   const blockedScopes = [];
+  const skippedUncoveredScopes = [];
+  const temporarySourceGaps = [];
   const seen = new Set();
   for (const raw of [...scopes].sort((left, right) =>
     bytewiseCompare(left.day_utc, right.day_utc) ||
@@ -398,12 +438,36 @@ export function routeBlackCarbonSelectedScopes(scopes) {
     if (seen.has(identity)) throw new Error(`duplicate selected scope: ${identity}`);
     seen.add(identity);
     const rows = Array.isArray(raw.rows) ? raw.rows : [];
+    const selectedTimeseriesAuthority = normalizeSelectedTimeseriesAuthority(
+      raw.selected_timeseries_authority || [],
+    );
+    const scopeGaps = (Array.isArray(raw.temporary_source_gaps)
+      ? raw.temporary_source_gaps
+      : []).map((gap) => Object.freeze({ ...gap }));
+    temporarySourceGaps.push(...scopeGaps);
     if (raw.blocked_reason) {
       blockedScopes.push(Object.freeze({ ...scope, blocked_reason: String(raw.blocked_reason) }));
-    } else if (rows.length > 0) {
-      partitions.push(Object.freeze({ scope, rows: Object.freeze([...rows]) }));
-    } else if (raw.conclusive === true) {
-      removedScopes.push(scope);
+    } else if (selectedTimeseriesAuthority.length > 0 && rows.length > 0) {
+      partitions.push(Object.freeze({
+        scope,
+        rows: Object.freeze([...rows]),
+        selected_timeseries_authority: selectedTimeseriesAuthority,
+      }));
+    } else if (selectedTimeseriesAuthority.length > 0 && raw.conclusive === true) {
+      removedScopes.push(Object.freeze({
+        scope,
+        selected_timeseries_authority: selectedTimeseriesAuthority,
+      }));
+    } else if (
+      selectedTimeseriesAuthority.length === 0 &&
+      raw.conclusive === true &&
+      scopeGaps.length > 0
+    ) {
+      skippedUncoveredScopes.push(Object.freeze({
+        ...scope,
+        reason: "all_selected_timeseries_temporarily_uncovered",
+        temporarily_uncovered_timeseries_count: scopeGaps.length,
+      }));
     } else {
       blockedScopes.push(Object.freeze({
         ...scope,
@@ -415,5 +479,7 @@ export function routeBlackCarbonSelectedScopes(scopes) {
     partitions: Object.freeze(partitions),
     removedScopes: Object.freeze(removedScopes),
     blockedScopes: Object.freeze(blockedScopes),
+    skippedUncoveredScopes: Object.freeze(skippedUncoveredScopes),
+    temporarySourceGaps: Object.freeze(temporarySourceGaps),
   });
 }
