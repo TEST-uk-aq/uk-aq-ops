@@ -53,6 +53,81 @@ def create_ops_git_repository(root: Path) -> str:
 
 
 class FixedV3WriterProvenanceTest(unittest.TestCase):
+    def test_canonical_proposal_parquet_under_hive_paths_is_validated_as_file_schema(
+        self,
+    ) -> None:
+        integrity = load_integrity_module()
+        with tempfile.TemporaryDirectory() as temp_raw:
+            parquet_path = (
+                Path(temp_raw) / "day_utc=2025-01-01" / "connector_id=1" /
+                "pollutant_code=no2" / "part-00000.parquet"
+            )
+            unsupported_path = parquet_path.with_name("part-unsupported.parquet")
+            parquet_path.parent.mkdir(parents=True)
+            script = """
+import fs from "node:fs";
+import * as arrow from "apache-arrow";
+import * as parquetWasm from "parquet-wasm/esm";
+import { serializeCanonicalObservationV2Parquet } from "./workers/shared/uk_aq_r2_history_canonical.mjs";
+const rows = [{
+  connector_id: 1,
+  station_id: 10,
+  timeseries_id: 100,
+  pollutant_code: "no2",
+  observed_at_utc: "2025-01-01T00:00:00.000Z",
+  value: 12.5,
+  verification_status: "P",
+}];
+fs.writeFileSync(process.argv[1], serializeCanonicalObservationV2Parquet(rows));
+const unsupportedTable = arrow.tableFromArrays({
+  connector_id: arrow.vectorFromArray([1], new arrow.Int32()),
+  station_id: arrow.vectorFromArray([10], new arrow.Int32()),
+  timeseries_id: arrow.vectorFromArray([100], new arrow.Int32()),
+  pollutant_code: arrow.vectorFromArray(["no2"], new arrow.Utf8()),
+  observed_at_utc: arrow.vectorFromArray(
+    [new Date("2025-01-01T00:00:00.000Z")],
+    new arrow.TimestampMillisecond(),
+  ),
+  value: arrow.vectorFromArray([12.5], new arrow.Float64()),
+  vstatus: arrow.vectorFromArray(["P"], new arrow.Utf8()),
+});
+const unsupportedWasmTable = parquetWasm.Table.fromIPCStream(
+  arrow.tableToIPC(unsupportedTable, "stream"),
+);
+fs.writeFileSync(
+  process.argv[2],
+  parquetWasm.writeParquet(
+    unsupportedWasmTable,
+    new parquetWasm.WriterPropertiesBuilder().build(),
+  ),
+);
+"""
+            subprocess.run(
+                [
+                    "node", "--input-type=module", "-e", script,
+                    str(parquet_path), str(unsupported_path),
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            rows = integrity._observation_rows_from_local_parquet_for_shared_hash(
+                parquet_paths=[str(parquet_path)],
+                require_canonical_schema=True,
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["verification_status"], "P")
+            self.assertNotIn("day_utc", rows[0])
+            with self.assertRaisesRegex(
+                ValueError,
+                r"expected_columns=.*verification_status.*actual=.*vstatus:VARCHAR",
+            ):
+                integrity._observation_rows_from_local_parquet_for_shared_hash(
+                    parquet_paths=[str(unsupported_path)],
+                    require_canonical_schema=True,
+                )
+
     def test_repo_head_is_resolved_with_explicit_repository_and_pinned(self) -> None:
         integrity = load_integrity_module()
         old = os.environ.pop(integrity.INTEGRITY_TARGET_WRITER_GIT_SHA_ENV, None)

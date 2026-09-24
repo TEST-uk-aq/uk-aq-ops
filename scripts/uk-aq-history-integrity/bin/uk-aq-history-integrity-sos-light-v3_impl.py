@@ -16115,9 +16115,31 @@ def _compute_observation_hash_with_shared_javascript(
     )
 
 
+_CANONICAL_OBSERVATION_PARQUET_PHYSICAL_SCHEMA = (
+    ("connector_id", "INT32", "OPTIONAL", None),
+    ("station_id", "INT32", "OPTIONAL", None),
+    ("timeseries_id", "INT32", "OPTIONAL", None),
+    ("pollutant_code", "BYTE_ARRAY", "OPTIONAL", "UTF8"),
+    ("observed_at_utc", "INT64", "OPTIONAL", "TIMESTAMP_MILLIS"),
+    ("value", "DOUBLE", "OPTIONAL", None),
+    ("verification_status", "BYTE_ARRAY", "OPTIONAL", "UTF8"),
+)
+
+
+def _format_observation_parquet_physical_schema(
+    schema: Iterable[tuple[str, str, str, str | None]],
+) -> str:
+    return "[" + ",".join(
+        f"{name}:{physical_type}:{repetition_type}"
+        + (f":{converted_type}" if converted_type else "")
+        for name, physical_type, repetition_type, converted_type in schema
+    ) + "]"
+
+
 def _observation_rows_from_local_parquet_for_shared_hash(
     *,
     parquet_paths: Iterable[str],
+    require_canonical_schema: bool = False,
 ) -> list[dict[str, Any]]:
     paths = sorted({str(Path(path)) for path in parquet_paths if Path(path).is_file()})
     if not paths:
@@ -16129,7 +16151,8 @@ def _observation_rows_from_local_parquet_for_shared_hash(
     connection = _connect_duckdb_utc(duckdb)
     try:
         description = connection.execute(
-            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)",
+            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true, "
+            "hive_partitioning=false)",
             [paths],
         ).fetchall()
         columns = {str(row[0]) for row in description}
@@ -16157,13 +16180,48 @@ def _observation_rows_from_local_parquet_for_shared_hash(
             )
         supported = (required, required | {"status"}, required | {"verification_status"})
         for parquet_path in paths:
-            file_columns = {
-                str(row[0]) for row in connection.execute(
-                    "DESCRIBE SELECT * FROM read_parquet(?)", [parquet_path]
-                ).fetchall()
-            }
+            file_description = connection.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=false)",
+                [parquet_path],
+            ).fetchall()
+            file_columns = {str(row[0]) for row in file_description}
             if file_columns not in supported:
-                raise ValueError("unsupported observation Parquet physical schema")
+                actual = ",".join(
+                    f"{str(row[0])}:{str(row[1])}" for row in file_description
+                )
+                raise ValueError(
+                    "unsupported observation Parquet physical schema: "
+                    "expected_columns="
+                    "[connector_id,station_id,timeseries_id,pollutant_code,"
+                    "observed_at_utc,value,(verification_status|status|absent)] "
+                    f"actual=[{actual}]"
+                )
+            if require_canonical_schema:
+                actual_physical_schema = tuple(
+                    (
+                        str(row[0]),
+                        str(row[1]),
+                        str(row[2]),
+                        None if row[3] is None else str(row[3]),
+                    )
+                    for row in connection.execute(
+                        "SELECT name, type, repetition_type, converted_type "
+                        "FROM parquet_schema(?) WHERE num_children IS NULL",
+                        [parquet_path],
+                    ).fetchall()
+                )
+                if actual_physical_schema != _CANONICAL_OBSERVATION_PARQUET_PHYSICAL_SCHEMA:
+                    raise ValueError(
+                        "unsupported canonical observation Parquet physical schema: "
+                        "expected="
+                        + _format_observation_parquet_physical_schema(
+                            _CANONICAL_OBSERVATION_PARQUET_PHYSICAL_SCHEMA
+                        )
+                        + " actual="
+                        + _format_observation_parquet_physical_schema(
+                            actual_physical_schema
+                        )
+                    )
         status_column = status_columns[0] if status_columns else None
         status_select = (
             f', "{status_column}" AS source_status'
@@ -16176,7 +16234,7 @@ def _observation_rows_from_local_parquet_for_shared_hash(
                    observed_at_utc, "value"
             """
             + status_select
-            + " FROM read_parquet(?, union_by_name=true)",
+            + " FROM read_parquet(?, union_by_name=true, hive_partitioning=false)",
             [paths],
         ).fetchall()
     finally:
@@ -19301,6 +19359,7 @@ def _capture_local_v2_observation_scope(
         parquet_rows = (
             _observation_rows_from_local_parquet_for_shared_hash(
                 parquet_paths=pollutant_paths,
+                require_canonical_schema=True,
             )
             if pollutant_paths else []
         )
