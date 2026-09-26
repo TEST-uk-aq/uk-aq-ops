@@ -173,6 +173,68 @@ Rclone compares individual files so unchanged connector/pollutant/manifest/Parqu
 
 After a changed-day copy, manifest-guided stale Parquet pruning remains required so Dropbox removes superseded Parquet files no longer referenced by current copied manifests.
 
+### Observation Parquet copy modes
+
+The observation day-copy path MUST support:
+
+```text
+--observation-parquet-copy-mode full
+--observation-parquet-copy-mode reuse_matching
+```
+
+If the option is absent, the effective mode MUST be `full`.
+
+The GitHub workflow MUST expose the equivalent dispatch input:
+
+```text
+observation_parquet_copy_mode
+```
+
+with the same accepted values and default `full`. Scheduled or manual calls that omit the input therefore retain today's complete-day rclone behaviour.
+
+#### `full`
+
+`full` retains the existing changed-day copy behaviour. A changed day is supplied to the normal complete-prefix rclone copy path and rclone decides which individual files transfer according to its ordinary cross-remote comparison behaviour.
+
+The backup MUST NOT assume that byte-identical R2 and Dropbox Parquet files will be skipped in this mode. R2 and Dropbox do not provide one common native checksum suitable for this canonical SHA-256 decision, and SOS-light complete-day republication can give byte-identical R2 objects new remote modification metadata.
+
+#### `reuse_matching`
+
+`reuse_matching` MAY avoid retransferring an observation Parquet body only when the backup can prove that the already accepted Dropbox body represents exactly the same canonical object identity as the current R2 source.
+
+For one Parquet key to be reusable, all of the following MUST be true:
+
+- the current authoritative R2 pollutant manifest references the key;
+- the current manifest supplies a valid canonical byte size and SHA-256 for that key;
+- the preceding accepted Dropbox baseline contains an authenticated prior manifest/reference for the same key;
+- the prior accepted reference has the same byte size and the same canonical SHA-256;
+- the preceding Dropbox day/checkpoint evidence that authenticated that reference is still the accepted predecessor state for this backup;
+- the destination file still exists at the expected path and has the expected byte size;
+- no contradictory manifest, stale-object or generation evidence exists.
+
+A missing file, missing prior authority, size mismatch, SHA-256 mismatch, ambiguous reference, unsupported manifest form or any other inability to prove exact reuse MUST fail closed to **copying that Parquet body normally**, not to accepting an unverified skip.
+
+The optimisation MUST compare canonical identities from the authoritative manifests/checkpoint evidence. It MUST NOT use modification time, ETag equality, filename alone, size alone, `--size-only`, or a cross-remote rclone checksum fallback as proof of canonical equality.
+
+The existing Dropbox Parquet body is allowed to retain its older Dropbox modification time when it is reused. The current R2 object's newer remote `Last-Modified` timestamp is transport metadata and is not part of canonical observation identity.
+
+The canonical post-Integrity publication state remains observable through the newly copied canonical metadata, including as applicable `backed_up_at_utc`, `writer_git_sha`, changed manifest hashes and the changed parent/root identities. These fields do not purport to preserve the literal R2 `Last-Modified` timestamp.
+
+When the Parquet body identity is unchanged, a restore from Dropbox remains exact because the destination contains the same key and the same authenticated bytes referenced by the new manifests. Reusing those bytes is therefore a transfer optimisation, not a stale-data exception.
+
+For a changed day in `reuse_matching` mode:
+
+1. identify reusable Parquet bodies from the preceding accepted Dropbox baseline using the rules above;
+2. copy any new or changed Parquet bodies;
+3. copy the current canonical pollutant/connector/day metadata required by the normal day copy;
+4. run the existing manifest-guided stale-Parquet pruning;
+5. verify the destination current day manifest against the source inventory identity;
+6. only then mark the new day identity processed and allow month/year/root checkpoint advancement.
+
+The normal backup completion rule remains unchanged: Dropbox checkpoint/root state represents the **current R2 source root**, even when some physical Parquet bodies were reused from the preceding accepted Dropbox baseline.
+
+The serial monthly SOS-light wrapper SHOULD explicitly request `reuse_matching` for the post-month backup that refreshes Dropbox before the next month begins. Other callers remain `full` when they omit the mode.
+
 ## Forced observation prune recheck
 
 The active sync MUST retain the operator input `force_prune_recheck` for an explicit observation-only destination-integrity sweep.
@@ -318,7 +380,13 @@ The pack publisher is a backup derivative publisher and may write only its own p
 
 Each backup report MUST expose enough evidence to explain copy/prune/checkpoint behaviour, including as applicable:
 
-- changed observation days sent to rclone;
+- selected observation Parquet copy mode and whether it was explicit or defaulted;
+- changed observation days selected for backup;
+- observation Parquet bodies reused because key + byte size + canonical SHA-256 matched the preceding accepted Dropbox baseline;
+- total bytes whose transfer was avoided by exact Parquet reuse;
+- observation Parquet bodies copied because they were new, changed or not safely reusable;
+- total observation Parquet bytes actually copied where available;
+- any reuse candidates that fell back to normal copy because proof was incomplete or contradictory;
 - stale observation Parquet files removed;
 - whether forced prune recheck was requested;
 - days audited by forced prune recheck, removals and failures;
@@ -358,6 +426,13 @@ Before deployment, use only the smallest checks needed to establish structural v
 
 The implementation MUST preserve the relevant properties below:
 
+- omitting observation Parquet copy mode resolves to `full`;
+- explicit `full` preserves the current changed-day copy behaviour;
+- `reuse_matching` reuses a Parquet body only when the current and preceding accepted canonical key + byte size + SHA-256 identities agree and destination presence/size is consistent;
+- uncertain or contradictory reuse evidence falls back to normal copy rather than accepting a skip;
+- reused Parquet may retain an older Dropbox modification time without changing canonical backup correctness;
+- current manifests/day identities and the final checkpoint/root still advance to the current R2 source state after successful `reuse_matching`;
+- stale-Parquet pruning still executes for changed days under both observation Parquet copy modes;
 - unchanged compact latest-timeseries content is not recopied;
 - compact processed state advances only after source/destination SHA-256 verification;
 - previous state for one compact-summary generation cannot satisfy another generation under the v3 amendment;

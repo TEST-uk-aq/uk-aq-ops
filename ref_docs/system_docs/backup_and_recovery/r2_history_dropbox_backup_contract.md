@@ -212,6 +212,35 @@ Calls that do not provide a correlation identifier retain the existing scheduled
 
 The correlation mechanism does not weaken writer coordination. The workflow continues to run the normal hierarchical backup under the shared global observations operation lock and publishes checkpoint completion according to the existing sync contract.
 
+### Observation Parquet copy mode for chained backups
+
+The normal backup workflow and lower-level sync MUST support an observation-Parquet copy-mode selector with exactly these steady-state values:
+
+```text
+full
+reuse_matching
+```
+
+The lower-level CLI contract is:
+
+```text
+--observation-parquet-copy-mode <full|reuse_matching>
+```
+
+The workflow-dispatch input is:
+
+```text
+observation_parquet_copy_mode
+```
+
+Omitting the CLI option or workflow input MUST resolve to `full`. An explicit `full` selection MUST be behaviourally equivalent to omission. This preserves the existing backup behaviour as the default until a later explicit contract changes that default.
+
+`reuse_matching` is an optimisation of physical transfer only. It MUST NOT reduce logical backup coverage, alter source authority, weaken destination/checkpoint verification, or change the post-backup observation root represented by Dropbox.
+
+The serial monthly SOS-light orchestration SHOULD request `reuse_matching` for its successful post-month backup before the next month starts. That use case deliberately republishes complete selected observation days and can therefore create fresh R2 object modification metadata and fresh canonical manifest/root identities even when many Parquet bodies are byte-identical to the preceding accepted Dropbox baseline.
+
+The detailed eligibility, fail-closed fallback, reporting and completion semantics for `reuse_matching` are owned by [`r2_history_dropbox_sync_contract.md`](r2_history_dropbox_sync_contract.md).
+
 ### Local Dropbox client materialisation boundary
 
 A successful GitHub-hosted backup proves the Dropbox-cloud destination and checkpoint publication performed by that workflow. It does **not** by itself prove that a separate local Dropbox desktop client has downloaded every refreshed payload file before downloading the checkpoint root.
