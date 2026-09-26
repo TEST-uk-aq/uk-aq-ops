@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Ordered metadata executor for v2 observations and AQI data.
-// It never rewrites parquet data or invokes either data backfill wrapper.
+// Ordered metadata executor for v2 observations.
+// It never rewrites parquet data or invokes the data backfill wrapper.
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
@@ -43,11 +43,6 @@ const SUPPORTED_ACTIONS = new Set([
   "observation_day_manifest_repair",
   "observation_index_repair",
   "rebuild_v2_observations_index_only",
-  "aqi_pollutant_manifest_repair",
-  "aqi_connector_manifest_repair",
-  "aqi_day_manifest_repair",
-  "aqi_index_repair",
-  "rebuild_v2_aqi_index_only",
 ]);
 export const SOURCE_DERIVED_OWNER = "source_derived_observation_repair";
 
@@ -62,11 +57,6 @@ const ACTION_SCOPE_RULES = {
   observation_day_manifest_repair: { connector: "absent", needsDay: true },
   observation_index_repair: { connector: "required", pollutant: "required" },
   rebuild_v2_observations_index_only: { connector: "required" },
-  aqi_pollutant_manifest_repair: { connector: "required", pollutant: "required", needsConnector: true, needsDay: true, pollutantRepair: true },
-  aqi_connector_manifest_repair: { connector: "required", needsConnector: true, needsDay: true },
-  aqi_day_manifest_repair: { connector: "absent", needsDay: true },
-  aqi_index_repair: { connector: "required", pollutant: "required" },
-  rebuild_v2_aqi_index_only: { connector: "required" },
 };
 
 function parseArgs(argv) {
@@ -134,11 +124,7 @@ export async function readChildren({
     // staged replacement is already the dependency body.
     if (identityOnlyKeys.has(key)) continue;
     const payload = jsonObject(object, key);
-    if (domain === "observations") {
-      assertV2ObservationsChildManifest(payload, { key, kind, dayUtc, connectorId });
-    } else if (payload?.domain !== "aqilevels" || payload?.manifest_kind !== kind) {
-      throw new Error(`Invalid AQI ${kind} manifest: ${key}`);
-    }
+    assertV2ObservationsChildManifest(payload, { key, kind, dayUtc, connectorId });
     children.push(payload);
   }
   return { children, identities };
@@ -708,12 +694,7 @@ export function createStagedObjectMap({
     if (observation) {
       return [`${observationGeneration.observations_prefix}/day_utc=${observation[1]}/connector_id=${observation[2]}/pollutant_code=${observation[3]}/manifest.json`];
     }
-    const aqi = String(key).match(
-      /^history\/_index_v2\/aqilevels_hourly_data_timeseries\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/,
-    );
-    return aqi
-      ? [`history/v2/aqilevels/hourly/data/day_utc=${aqi[1]}/connector_id=${aqi[2]}/pollutant_code=${aqi[3]}/manifest.json`]
-      : [];
+    return [];
   };
 
   function resolveDependencyIdentities(dependencies) {
@@ -1160,8 +1141,8 @@ function existingManifestMetadata(store, {
   pollutantCode,
   domain,
 }) {
-  const grain = domain === "aqilevels" ? "hourly" : null;
-  const profile = domain === "aqilevels" ? "data" : null;
+  const grain = null;
+  const profile = null;
   const leafExpectation = { domain, grain, profile, dayUtc, connectorId, pollutantCode, manifestKind: "pollutant" };
   for (const [source, label] of [["overlay", "overlay_manifest"], ["dropbox", "dropbox_manifest"]]) {
     const found = sourceManifestMetadata(store, source, label, manifestKey, leafExpectation);
@@ -1333,15 +1314,12 @@ function assertCanonicalManifestProposal(proposal) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error(`Invalid ${proposal.kind} payload: ${proposal.key}`);
   }
-  const isAqi = payload.domain === "aqilevels";
-  const expectedGrain = isAqi ? "hourly" : null;
-  const expectedProfile = isAqi ? "data" : null;
-  if (!['observations', 'aqilevels'].includes(payload.domain)
+  if (payload.domain !== "observations"
     || payload.history_version !== "v2"
     || payload.manifest_kind !== expectedKind
     || payload.manifest_key !== proposal.key
-    || payload.grain !== expectedGrain
-    || payload.profile !== expectedProfile) {
+    || payload.grain !== null
+    || payload.profile !== null) {
     throw new Error(`Invalid canonical ${proposal.kind} contract: ${proposal.key}`);
   }
   if (typeof payload.backed_up_at_utc !== "string" || Number.isNaN(Date.parse(payload.backed_up_at_utc))) {
@@ -1447,7 +1425,7 @@ function assertCanonicalProposalRelationships(proposal, proposals) {
 }
 
 function extractRepairPlan(input) {
-  if (input?.history_version === "v2" && ["observations", "aqilevels"].includes(input?.domain) && Array.isArray(input.repair_plan)) {
+  if (input?.history_version === "v2" && input?.domain === "observations" && Array.isArray(input.repair_plan)) {
     return { inputKind: `${input.domain}_repair_plan`, domain: input.domain, actions: input.repair_plan };
   }
   const v2 = input?.history_version_results?.v2;
@@ -1477,7 +1455,7 @@ function validateAction(action) {
   if (action.history_version !== undefined && action.history_version !== "v2") {
     throw new Error(`Unsupported history version for Phase 4 repair action: ${action.history_version}`);
   }
-  if (action.domain !== undefined && !["observations", "aqilevels"].includes(action.domain)) {
+  if (action.domain !== undefined && action.domain !== "observations") {
     throw new Error(`Unsupported domain for Phase 4 repair action: ${action.domain}`);
   }
   if (typeof action.requires_index_rebuild !== "boolean" || !Array.isArray(action.gap_types)
@@ -1702,32 +1680,26 @@ export async function runV2ObservationsRepair({
   if (!args.overlayRoot || !args.dropboxRoot || !args.runStateJson) {
     throw new Error("Combined local resolver paths are required for metadata repair");
   }
-  const dataPrefix = domain === "observations"
-    ? observationGeneration.observations_prefix
-    : config.aqilevels_hourly_data_prefix_v2;
-  const indexPrefix = domain === "observations"
-    ? observationGeneration.observations_timeseries_index_prefix
-    : config.aqilevels_hourly_data_timeseries_index_prefix_v2;
+  const dataPrefix = observationGeneration.observations_prefix;
+  const indexPrefix = observationGeneration.observations_timeseries_index_prefix;
   // Targeted index rebuilds merge the changed days into this global latest
   // summary.  Read exactly that key from the Dropbox baseline; scanning the
   // whole index tree would make the sparse overlay resolver non-deterministic.
-  const latestIndexKey = domain === "observations"
-    ? observationGeneration.observations_timeseries_latest_key
-    : `${config.index_prefix_v2}/aqilevels_hourly_data_timeseries_latest.json`;
+  const latestIndexKey = observationGeneration.observations_timeseries_latest_key;
   // An explicit index-only action can legitimately target a historical leaf
   // which is absent from the live connector/day hierarchy. Keep that leaf
   // out of parent discovery, but allow its Dropbox manifest as a narrowly
   // scoped index source. The target index itself is still live-only.
-  const additionalIndexPollutantTargets = domain === "observations"
-    ? scopes.flatMap((scope) => (scope.needsIndex && Number.isInteger(scope.connectorId) && scope.connectorId > 0
+  const additionalIndexPollutantTargets = scopes.flatMap((scope) => (
+    scope.needsIndex && Number.isInteger(scope.connectorId) && scope.connectorId > 0
       ? (scope.index_pollutant_codes || []).map((pollutantCode) => ({
-        day_utc: scope.dayUtc,
-        connector_id: scope.connectorId,
-        pollutant_code: pollutantCode,
-        manifest_key: `${dataPrefix}/day_utc=${scope.dayUtc}/connector_id=${scope.connectorId}/pollutant_code=${pollutantCode}/manifest.json`,
-      }))
-      : []))
-    : [];
+          day_utc: scope.dayUtc,
+          connector_id: scope.connectorId,
+          pollutant_code: pollutantCode,
+          manifest_key: `${dataPrefix}/day_utc=${scope.dayUtc}/connector_id=${scope.connectorId}/pollutant_code=${pollutantCode}/manifest.json`,
+        }))
+      : []
+  ));
   const localStore = createCombinedLocalStore({
     ...args,
     prefixes: [...new Set(scopes.flatMap((scope) => [
@@ -1808,8 +1780,8 @@ export async function runV2ObservationsRepair({
         } = source;
         const rebuilt = buildHistoryV2PollutantManifest({
           domain,
-          grain: domain === "aqilevels" ? "hourly" : null,
-          profile: domain === "aqilevels" ? "data" : null,
+          grain: null,
+          profile: null,
           dayUtc,
           connectorId: scope.connectorId,
           pollutantCode,
@@ -1864,18 +1836,14 @@ export async function runV2ObservationsRepair({
           continue;
         }
         const existingPayload = jsonObject(existing, key);
-        if (domain === "observations") {
-          assertV2ObservationsChildManifest(existingPayload, { key, kind: "connector", dayUtc, connectorId: scope.connectorId });
-        } else if (existingPayload?.domain !== "aqilevels" || existingPayload?.manifest_kind !== "connector") {
-          throw new Error(`Invalid empty AQI connector manifest: ${key}`);
-        }
+        assertV2ObservationsChildManifest(existingPayload, { key, kind: "connector", dayUtc, connectorId: scope.connectorId });
         if ((existingPayload.child_manifests || []).length || (existingPayload.files || []).length) {
           throw new Error(`Connector manifest has children hidden by the proposed final state: ${key}`);
         }
         proposalKeys.push(key);
         continue;
       }
-      const payload = buildHistoryV2ConnectorManifest({ domain, grain: domain === "aqilevels" ? "hourly" : null, profile: domain === "aqilevels" ? "data" : null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
+      const payload = buildHistoryV2ConnectorManifest({ domain, grain: null, profile: null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key,
         body: JSON.stringify(payload, null, 2),
@@ -1906,15 +1874,13 @@ export async function runV2ObservationsRepair({
       continue;
     }
     if (needsDay) {
-      if (domain === "observations") {
-        if (!sosLightReplacement) {
-          await stageRepairableObservationConnectorDependencies({
-            staged,
-            base,
-            dayUtc,
-            proposalKeys,
-          });
-        }
+      if (!sosLightReplacement) {
+        await stageRepairableObservationConnectorDependencies({
+          staged,
+          base,
+          dayUtc,
+          proposalKeys,
+        });
       }
       const child = sosLightReplacement
         ? await assembleSosLightDayParents({
@@ -1926,7 +1892,7 @@ export async function runV2ObservationsRepair({
           audit: sosLightAudit,
         })
         : await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain });
-      dayManifest = buildHistoryV2DayManifest({ domain, grain: domain === "aqilevels" ? "hourly" : null, profile: domain === "aqilevels" ? "data" : null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
+      dayManifest = buildHistoryV2DayManifest({ domain, grain: null, profile: null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key: dayManifestKey,
         body: JSON.stringify(dayManifest, null, 2),
@@ -2063,9 +2029,7 @@ export async function runV2ObservationsRepair({
   // targeted merge. Apply it last, after all lower-level index
   // proposals have completed their PUT-and-GET verification.
   const latestKeys = new Set(dayPlans.map((plan) => {
-    const domainResult = domain === "observations"
-      ? plan.index?.observations_timeseries
-      : plan.index?.aqilevels_timeseries;
+    const domainResult = plan.index?.observations_timeseries;
     return domainResult?.latest_index_key;
   }).filter(Boolean));
   for (const key of latestKeys) {

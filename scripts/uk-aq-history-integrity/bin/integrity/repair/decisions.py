@@ -7,7 +7,6 @@ from typing import Any, Mapping
 
 
 SUPPORTED_POLLUTANTS = frozenset({"pm25", "pm10", "no2", "o3"})
-AQI_POLLUTANTS = frozenset({"pm25", "pm10", "no2"})
 
 _POLLUTANT_MANIFEST_GAPS = frozenset({
     "data_manifest_file_count_mismatch",
@@ -49,7 +48,6 @@ class ObservationRepairDecision:
     requires_index_rebuild: bool
     source_evidence_required: bool
     operator_pollutant_permission_required: bool
-    aqi_policy: str
     executability_policy: str
     reason: str
 
@@ -86,7 +84,6 @@ def decide_observation_repair(
         index: bool = False,
         evidence: bool = False,
         permission: bool = False,
-        aqi: str = "none",
         executable: str = "metadata_only",
         reason: str,
         result_grain: str | None = None,
@@ -102,7 +99,6 @@ def decide_observation_repair(
             requires_index_rebuild=index,
             source_evidence_required=evidence,
             operator_pollutant_permission_required=permission,
-            aqi_policy=aqi,
             executability_policy=executable,
             reason=reason,
         )
@@ -151,14 +147,9 @@ def decide_observation_repair(
                 "source_mapping_issue", executable="operator_action_required",
                 reason="authoritative_source_partition_unavailable",
             )
-        aqi_policy = (
-            "observation_dependency" if scoped_pollutant in AQI_POLLUTANTS
-            else "requested_pollutants_only" if grain == "connector_day_wildcard"
-            else "none"
-        )
         return result(
             "observation_data_repair", data=True, index=True, evidence=True,
-            permission=True, aqi=aqi_policy,
+            permission=True,
             executable="explicit_plan_and_pollutant_permission",
             reason="authoritative_source_data_repair_required",
         )

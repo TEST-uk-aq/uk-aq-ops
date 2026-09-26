@@ -1172,12 +1172,6 @@ test("SOS-light same-day pollutants validate against distinct immutable source e
     execution_path: "sos_light",
     ...sosLightEvidence(dayUtc),
     mutation_connector_ids: [1],
-    aqi_policy: "bypassed_observation_history_only",
-    changed_scopes: {
-      AQILEVELS_CHANGED: [],
-      AQI_MANIFESTS_CHANGED: [],
-      AQI_INDEXES_CHANGED: [],
-    },
   });
   fixture.runState.tombstone_prefixes = [{
     prefix: `history/v2/observations/day_utc=${dayUtc}`,
@@ -1264,7 +1258,6 @@ test("SOS-light pollutant-scoped evidence accepts authoritative no-data", async 
     execution_path: "sos_light",
     ...sosLightEvidence(dayUtc),
     mutation_connector_ids: [1],
-    aqi_policy: "bypassed_observation_history_only",
     overlay_root: overlay,
     base_dropbox_root: dropbox,
     objects: {
@@ -1279,11 +1272,6 @@ test("SOS-light pollutant-scoped evidence accepts authoritative no-data", async 
       proposed: true,
       stage: "sos_light_complete_day",
     }],
-    changed_scopes: {
-      AQILEVELS_CHANGED: [],
-      AQI_MANIFESTS_CHANGED: [],
-      AQI_INDEXES_CHANGED: [],
-    },
   };
   const fixture = { root, runState };
   retainScopedEvidence(fixture, {
@@ -1401,12 +1389,8 @@ test("publication order and dependencies prevent indexes preceding manifests", a
     "history/v2/observations/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json",
     "history/v2/observations/day_utc=2026-06-17/connector_id=1/manifest.json",
     "history/_index_v2/observations_timeseries/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json",
-    "history/v2/aqilevels/hourly/data/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/part-00000.parquet",
-    "history/v2/aqilevels/hourly/data/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json",
-    "history/v2/aqilevels/hourly/data/day_utc=2026-06-17/connector_id=1/manifest.json",
-    "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json",
   ];
-  assert.deepEqual(keys.map(publicationRank), [10, 20, 30, 40, 50, 60, 70, 80]);
+  assert.deepEqual(keys.map(publicationRank), [10, 20, 30, 40]);
   const manifestKey = keys[1];
   const indexObject = { key: keys[3], entry: { dependencies: [manifestKey] } };
   const runState = { objects: { [manifestKey]: { proposed: true, structurally_validated: true, r2_verified: false } } };
@@ -1580,12 +1564,6 @@ test("SOS-light proposal requires one complete-day tombstone and complete local 
     execution_path: "sos_light",
     ...sosLightEvidence(dayUtc),
     mutation_connector_ids: [1],
-    aqi_policy: "bypassed_observation_history_only",
-    changed_scopes: {
-      AQILEVELS_CHANGED: [],
-      AQI_MANIFESTS_CHANGED: [],
-      AQI_INDEXES_CHANGED: [],
-    },
   });
   fixture.runState.tombstone_prefixes = [{
     prefix: `history/v2/observations/day_utc=${dayUtc}`,
@@ -1699,12 +1677,6 @@ test("SOS-light complete-day preflight carries an unchanged connector 2 parent w
     execution_path: "sos_light",
     ...sosLightEvidence(dayUtc),
     mutation_connector_ids: [1],
-    aqi_policy: "bypassed_observation_history_only",
-    changed_scopes: {
-      AQILEVELS_CHANGED: [],
-      AQI_MANIFESTS_CHANGED: [],
-      AQI_INDEXES_CHANGED: [],
-    },
   });
   fixture.runState.tombstone_prefixes = [{
     prefix: `history/v2/observations/day_utc=${dayUtc}`,

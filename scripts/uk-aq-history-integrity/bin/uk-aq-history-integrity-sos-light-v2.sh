@@ -229,8 +229,6 @@ export UK_AQ_HISTORY_INTEGRITY_TMP_DIR="${STATE_DIR}/tmp"
 export UK_AQ_HISTORY_INTEGRITY_LOCK_DIR="${STATE_DIR}/locks"
 export UK_AQ_HISTORY_INTEGRITY_LOG_DIR="${DROPBOX_ROOT}/uk-aq-history-integrity/logs"
 export UK_AQ_HISTORY_INTEGRITY_REPORT_DIR="${DROPBOX_ROOT}/uk-aq-history-integrity/reports"
-export UK_AQ_AQI_GAP_LOG_DIR="${DROPBOX_ROOT}/uk-aq-history-integrity/aqi_gap_check/logs"
-export UK_AQ_AQI_GAP_REPORT_DIR="${DROPBOX_ROOT}/uk-aq-history-integrity/aqi_gap_check/reports"
 export UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="${DROPBOX_ROOT}/uk-aq-history-integrity/uk_aq_history_integrity.sqlite"
 
 R2_ROOT_RAW="${UK_AQ_R2_HISTORY_DROPBOX_ROOT:-}"
@@ -259,9 +257,7 @@ for dir in \
   "${UK_AQ_HISTORY_INTEGRITY_TMP_DIR}" \
   "${UK_AQ_HISTORY_INTEGRITY_LOCK_DIR}" \
   "${UK_AQ_HISTORY_INTEGRITY_LOG_DIR}" \
-  "${UK_AQ_HISTORY_INTEGRITY_REPORT_DIR}" \
-  "${UK_AQ_AQI_GAP_LOG_DIR}" \
-  "${UK_AQ_AQI_GAP_REPORT_DIR}"; do
+  "${UK_AQ_HISTORY_INTEGRITY_REPORT_DIR}"; do
   mkdir -p -- "${dir}"
   [[ -d "${dir}" && -w "${dir}" ]] || error "required runtime directory is unavailable or not writable: ${dir}"
 done

@@ -163,76 +163,6 @@ test("an index-only action does not become a pollutant-manifest repair", () => {
   assert.deepEqual(plan.scopes[0].index_pollutant_codes, ["o3"]);
 });
 
-test("an AQI day-manifest action does not expand into child indexes", () => {
-  const plan = normalizePlan({
-    history_version: "v2",
-    domain: "aqilevels",
-    repair_plan: [repairAction({
-      kind: "aqi_day_manifest_repair",
-      connector_id: null,
-      pollutant_code: null,
-      requires_index_rebuild: false,
-    })],
-  });
-  assert.equal(plan.scopes[0].needsDay, true);
-  assert.equal(plan.scopes[0].needsIndex, false);
-  assert.equal(plan.scopes[0].connectorId, null);
-});
-
-test("AQI day-only repair retains all connectors without pollutant proposals", async () => {
-  const aqiPrefix = "history/v2/aqilevels/hourly/data";
-  const connectorIds = [1, 3, 6, 7];
-  const connectors = connectorIds.map((connectorId) => {
-    const pollutantCode = "pm25";
-    const manifestKey = `${aqiPrefix}/day_utc=${DAY}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
-    const pollutant = buildHistoryV2PollutantManifest({
-      domain: "aqilevels", grain: "hourly", profile: "data", dayUtc: DAY, connectorId, pollutantCode,
-      runId: "fixture", manifestKey, sourceRowCount: 1, writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
-      fileEntries: [{ key: manifestKey.replace("manifest.json", "part-00000.parquet"), bytes: 1, row_count: 1, etag_or_hash: "part", min_timeseries_id: connectorId, max_timeseries_id: connectorId, min_timestamp_hour_utc: `${DAY}T00:00:00.000Z`, max_timestamp_hour_utc: `${DAY}T00:00:00.000Z`, timeseries_row_counts: { [connectorId]: 1 } }],
-    });
-    const connectorKey = `${aqiPrefix}/day_utc=${DAY}/connector_id=${connectorId}/manifest.json`;
-    const manifest = buildHistoryV2ConnectorManifest({
-      domain: "aqilevels", grain: "hourly", profile: "data", dayUtc: DAY, connectorId, runId: "fixture", manifestKey: connectorKey,
-      pollutantManifests: [pollutant], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
-    });
-    return { pollutant, manifest };
-  });
-  const dayKey = `${aqiPrefix}/day_utc=${DAY}/manifest.json`;
-  const staleDay = buildHistoryV2DayManifest({
-    domain: "aqilevels", grain: "hourly", profile: "data", dayUtc: DAY, runId: "fixture", manifestKey: dayKey,
-    connectorManifests: [connectors[0].manifest], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
-  });
-  const objects = Object.fromEntries([
-    ...connectors.flatMap(({ pollutant, manifest }) => [
-      [pollutant.manifest_key, JSON.stringify(pollutant, null, 2)],
-      [manifest.manifest_key, JSON.stringify(manifest, null, 2)],
-    ]),
-    [dayKey, JSON.stringify(staleDay, null, 2)],
-  ]);
-  const resolver = combinedResolverEnv();
-  const fake = installFakeR2(objects);
-  try {
-    writeCombinedDropboxFixture(resolver, objects);
-    const output = await runV2ObservationsRepair({
-      env: resolver.env,
-      repairPlan: {
-        history_version: "v2",
-        domain: "aqilevels",
-        repair_plan: [repairAction({
-          kind: "aqi_day_manifest_repair", connector_id: null, pollutant_code: null, requires_index_rebuild: false,
-        })],
-      },
-    });
-    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
-    assert.deepEqual(output.planning.days[0].proposal_keys, [dayKey]);
-    assert.equal(output.planning.proposals.some((proposal) => proposal.kind === "pollutant_manifest"), false);
-    assert.equal(JSON.parse(output.planning.proposals[0].proposed_body).grain, "hourly");
-  } finally {
-    fake.restore();
-    resolver.cleanup();
-  }
-});
-
 async function assertNoR2Access(operation) {
   const originalFetch = globalThis.fetch;
   let calls = 0;
@@ -351,31 +281,13 @@ test("missing observation pollutant manifests are rebuilt from canonical readabl
   }
 });
 
-test("shared v2 manifest builders retain explicit observation and AQI grain/profile contracts", () => {
+test("shared v2 manifest builders retain the observation grain/profile contract", () => {
   const observationManifest = pollutant(1, "pm25");
   assert.equal(Object.hasOwn(observationManifest, "grain"), true);
   assert.equal(Object.hasOwn(observationManifest, "profile"), true);
   assert.equal(observationManifest.grain, null);
   assert.equal(observationManifest.profile, null);
 
-  const aqiManifest = buildHistoryV2PollutantManifest({
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: "data",
-    dayUtc: DAY,
-    connectorId: 1,
-    pollutantCode: "pm25",
-    runId: "fixture",
-    manifestKey: `history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=1/pollutant_code=pm25/manifest.json`,
-    writerGitSha: "fixture",
-    backedUpAtUtc: "2026-05-18T00:00:00.000Z",
-    sourceRowCount: 1,
-    fileEntries: [{ key: `history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=1/pollutant_code=pm25/part-00000.parquet`, bytes: 1, row_count: 1, etag_or_hash: "part", min_timeseries_id: 1, max_timeseries_id: 1, min_timestamp_hour_utc: `${DAY}T00:00:00.000Z`, max_timestamp_hour_utc: `${DAY}T00:00:00.000Z`, timeseries_row_counts: { 1: 1 } }],
-  });
-  assert.equal(Object.hasOwn(aqiManifest, "grain"), true);
-  assert.equal(Object.hasOwn(aqiManifest, "profile"), true);
-  assert.equal(aqiManifest.grain, "hourly");
-  assert.equal(aqiManifest.profile, "data");
 });
 
 function twoConnectorFixture() {
@@ -1122,7 +1034,7 @@ test("an index-only O3 leaf does not rewrite the observation connector/day hiera
     assert.deepEqual(first.planning.days[0].proposal_keys, [staleConnector.manifest_key, staleDay.manifest_key]);
     assert.deepEqual(first.planning.proposals.map((proposal) => proposal.kind), ["connector_manifest", "day_manifest"]);
     assert.deepEqual(JSON.parse(first.planning.proposals.find((proposal) => proposal.key === staleConnector.manifest_key).proposed_body).pollutant_codes, ["pm25"]);
-    assert.equal([...fake.puts.keys()].some((key) => key.endsWith(".parquet") || key.includes("aqilevels")), false);
+    assert.equal([...fake.puts.keys()].some((key) => key.endsWith(".parquet")), false);
     const second = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan });
     assert.equal(second.status, "skipped_unchanged");
     assert.equal(fake.puts.size, 0);
@@ -1385,7 +1297,7 @@ test("Phase 4 rejects every unsupported integrity action before R2 access", asyn
   for (const kind of [
     "observation_data_repair",
     "source_mapping_issue",
-    "aqi_rebuild",
+    "non_observation_repair",
     "unknown_repair_action",
   ]) {
     await assertNoR2Access(async () => {

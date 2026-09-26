@@ -47,14 +47,6 @@
           }
         ],
         "source_scope": { "scope": "all" }
-      },
-      "aqilevels": {
-        "status": "ok",
-        "checked_partitions": 0,
-        "gap_count": 0,
-        "gaps": [],
-        "repair_plan": [],
-        "debug": { "checked": false, "required": false, "status": "skipped", "gap_count": 0, "gaps": [] }
       }
     }
   },

@@ -115,7 +115,10 @@ function contentTypeForKey(key) {
 }
 
 function objectDomain(key) {
-  if (key.includes("/aqilevels_") || key.includes("/aqilevels/")) return "aqilevels";
+  if (!/^history\/v[23]\/observations(?:\/|$)/.test(key)
+    && !/^history\/_index_v[23]\//.test(key)) {
+    throw new Error(`Non-observation history is outside the Integrity proposal contract: ${key}`);
+  }
   return "observations";
 }
 
@@ -125,14 +128,9 @@ export function publicationRank(key) {
   if (/^history\/v2\/observations\/.+\/pollutant_code=[^/]+\/manifest\.json$/.test(value)) return 20;
   if (/^history\/v2\/observations\/.+\/connector_id=\d+\/manifest\.json$/.test(value)) return 30;
   if (/^history\/_index_v2\/observations_.+/.test(value)) return 40;
-  if (/^history\/v2\/aqilevels\/.+\.parquet$/.test(value)) return 50;
-  if (/^history\/v2\/aqilevels\/.+\/pollutant_code=[^/]+\/manifest\.json$/.test(value)) return 60;
-  if (/^history\/v2\/aqilevels\/.+\/connector_id=\d+\/manifest\.json$/.test(value)) return 70;
-  if (/^history\/_index_v2\/aqilevels_.+/.test(value)) return 80;
-  if (/^history\/v2\/observations\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 90;
-  if (/^history\/v2\/aqilevels\/.+\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 100;
-  if (value.includes("latest") || value.startsWith("history/_index_v2/")) return 120;
-  return 110;
+  if (/^history\/v2\/observations\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 50;
+  if (value.includes("latest") || value.startsWith("history/_index_v2/")) return 70;
+  return 60;
 }
 
 export const APPLY_PROGRESS_CHECKPOINT_OBJECT_INTERVAL = 50;
@@ -555,9 +553,7 @@ function objectPublicationStage(object) {
   if (rank <= 20) return "observation_pollutant_manifest";
   if (rank <= 30) return "observation_connector_manifest";
   if (rank <= 40) return "observation_index";
-  if (rank <= 50) return "aqi_parquet";
-  if (rank <= 70) return "aqi_manifest";
-  if (rank <= 100) return "day_parent";
+  if (rank <= 50) return "day_parent";
   return "global_index";
 }
 
@@ -997,18 +993,13 @@ export function createVerifiedGetBodyCache({
 }
 
 const OBSERVATION_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
-const AQI_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2"]);
 const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
-  /^history\/v2\/aqilevels\/hourly\/data\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
-  /^history\/v2\/aqilevels\/hourly\/debug\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
 ]);
 const CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN =
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN =
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
-const CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN =
-  /^history\/v2\/aqilevels\/hourly\/(data|debug)\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN =
   /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
 
@@ -1035,25 +1026,17 @@ function assertCanonicalDeletionPrefix(prefix, entry) {
     return;
   }
   const observationPollutantMatch = prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
-  const aqiPollutantMatch = prefix.match(CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN);
-  const pollutantMatch = observationPollutantMatch || aqiPollutantMatch;
-  if (pollutantMatch) {
-    const isObservation = Boolean(observationPollutantMatch);
-    const [, ...parts] = pollutantMatch;
-    const [dayUtc, connectorIdRaw, pollutant] = isObservation ? parts : parts.slice(1);
-    const supportedPollutants = isObservation
-      ? OBSERVATION_INTEGRITY_POLLUTANTS
-      : AQI_INTEGRITY_POLLUTANTS;
-    const domainName = isObservation ? "Observation" : "AQI";
+  if (observationPollutantMatch) {
+    const [, dayUtc, connectorIdRaw, pollutant] = observationPollutantMatch;
     validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw });
-    if (!supportedPollutants.has(pollutant)) {
-      throw new Error(`${domainName} deletion prefix has an unsupported pollutant: ${prefix}`);
+    if (!OBSERVATION_INTEGRITY_POLLUTANTS.has(pollutant)) {
+      throw new Error(`Observation deletion prefix has an unsupported pollutant: ${prefix}`);
     }
     const repairPollutants = Array.isArray(entry?.repair_pollutants)
       ? entry.repair_pollutants.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).sort()
       : [];
-    if (!repairPollutants.includes(pollutant) || repairPollutants.some((value) => !supportedPollutants.has(value))) {
-      throw new Error(`${domainName} pollutant deletion prefix is not backed by matching repair_pollutants evidence: ${prefix}`);
+    if (!repairPollutants.includes(pollutant) || repairPollutants.some((value) => !OBSERVATION_INTEGRITY_POLLUTANTS.has(value))) {
+      throw new Error(`Observation pollutant deletion prefix is not backed by matching repair_pollutants evidence: ${prefix}`);
     }
     return;
   }
@@ -1252,17 +1235,12 @@ export function validateLocalProposal(runState) {
   const scopedPollutantGroups = new Map();
   for (const item of normalizedPrefixes) {
     const observationMatch = item.prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
-    const aqiMatch = item.prefix.match(CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN);
-    const match = observationMatch || aqiMatch;
-    if (!match) continue;
-    const isObservation = Boolean(observationMatch);
-    const [, ...parts] = match;
-    const [dayUtc, connectorIdRaw, pollutant] = isObservation ? parts : parts.slice(1);
-    const scopeName = isObservation ? "observations" : `aqilevels/${parts[0]}`;
+    if (!observationMatch) continue;
+    const [, dayUtc, connectorIdRaw, pollutant] = observationMatch;
     const repairPollutants = Array.isArray(item.entry?.repair_pollutants)
       ? item.entry.repair_pollutants.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).sort()
       : [];
-    const groupKey = `${scopeName}|${dayUtc}|${connectorIdRaw}|${repairPollutants.join(",")}`;
+    const groupKey = `observations|${dayUtc}|${connectorIdRaw}|${repairPollutants.join(",")}`;
     const group = scopedPollutantGroups.get(groupKey) || { repairPollutants, prefixes: new Map() };
     group.prefixes.set(pollutant, (group.prefixes.get(pollutant) || 0) + 1);
     scopedPollutantGroups.set(groupKey, group);
@@ -1293,13 +1271,8 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
     || audit?.mode !== "sos-light"
     || audit?.validation_status !== "complete_local_days_validated"
     || audit?.old_live_r2_observation_bodies_used !== false
-    || audit?.no_old_live_r2_body_planning_or_preservation !== true
-    || runState.aqi_policy !== "bypassed_observation_history_only") {
+    || audit?.no_old_live_r2_body_planning_or_preservation !== true) {
     throw new Error("SOS-light proposal has invalid execution-scope or authority evidence");
-  }
-  const aqiScopeSets = ["AQILEVELS_CHANGED", "AQI_MANIFESTS_CHANGED", "AQI_INDEXES_CHANGED"];
-  if (aqiScopeSets.some((scope) => (runState.changed_scopes?.[scope] || []).length > 0)) {
-    throw new Error("SOS-light proposal must not contain AQI changed scopes");
   }
   const selectedDays = [...new Set((audit.days || []).map((entry) => String(entry?.day_utc || "")))].sort();
   const deletionDays = proposal.prefixes.map((item) => {
@@ -1320,8 +1293,8 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
       throw new Error(`SOS-light complete assembled day is missing required parents: ${day}`);
     }
   }
-  if (proposal.objects.some((object) => object.domain !== "observations" || object.key.includes("aqilevels"))) {
-    throw new Error("SOS-light proposal contains an AQI object");
+  if (proposal.objects.some((object) => object.domain !== "observations")) {
+    throw new Error("SOS-light proposal contains a non-observation object");
   }
   return {
     dedicated: true,
@@ -1987,12 +1960,8 @@ function validateFinalParentReferences({ proposal, runState }) {
     && candidate.key.includes("/day_utc=") && candidate.key.includes("/connector_id=")
     && candidate.key.includes("/pollutant_code="))) {
     const observation = object.key.match(/^history\/_index_v2\/observations_timeseries\/day_utc=([^/]+)\/connector_id=([^/]+)\/pollutant_code=([^/]+)\/manifest\.json$/);
-    const aqi = object.key.match(/^history\/_index_v2\/aqilevels_hourly_data_timeseries\/day_utc=([^/]+)\/connector_id=([^/]+)\/pollutant_code=([^/]+)\/manifest\.json$/);
-    const match = observation || aqi;
-    if (!match) continue;
-    const manifestKey = observation
-      ? `history/v2/observations/day_utc=${match[1]}/connector_id=${match[2]}/pollutant_code=${match[3]}/manifest.json`
-      : `history/v2/aqilevels/hourly/data/day_utc=${match[1]}/connector_id=${match[2]}/pollutant_code=${match[3]}/manifest.json`;
+    if (!observation) continue;
+    const manifestKey = `history/v2/observations/day_utc=${observation[1]}/connector_id=${observation[2]}/pollutant_code=${observation[3]}/manifest.json`;
     if (!(object.entry.dependencies || []).includes(manifestKey)) {
       throw finalProposalError({ key: object.key, object, differingFields: [`missing_index_manifest_dependency:${manifestKey}`] });
     }
@@ -3052,9 +3021,9 @@ export async function applyValidatedProposal({
                 ? "observation_connector_manifest"
                 : publicationRank(operation.key) <= 40
                 ? "observation_indexes"
-                : publicationRank(operation.key) <= 70
-                ? "aqi_manifests_and_data"
-                : "aqi_indexes";
+                : publicationRank(operation.key) <= 50
+                ? "observation_day_manifest"
+                : "observation_global_indexes";
             }
             runState.apply.connector_day_publication[groupKey].status = "succeeded";
             return { operation_count: group.operations.length };

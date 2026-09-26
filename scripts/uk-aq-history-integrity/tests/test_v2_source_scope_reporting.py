@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
@@ -10,6 +11,7 @@ SPEC = importlib.util.spec_from_file_location("uk_aq_history_integrity_scope_rep
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Unable to load module at {MODULE_PATH}")
 MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
@@ -37,7 +39,6 @@ class V2SourceScopeReportingTests(unittest.TestCase):
             "history_version_results": {
                 "v2": {
                     "observations": {"status": "ok", "checked_partitions": 1, "gap_count": 0, "gaps": [], "source_scope": {"source": "openaq", "connector_ids": [6], "scope": "source"}},
-                    "aqilevels": {"status": "ok", "checked_partitions": 1, "gap_count": 0, "gaps": [], "debug": {"checked": False, "required": False, "gaps": []}, "source_scope": {"source": "openaq", "connector_ids": [6], "scope": "source"}},
                 }
             },
             "cross_check": {"ran": True, "source_scope": {"source": "openaq", "connector_ids": [6], "scope": "source"}},

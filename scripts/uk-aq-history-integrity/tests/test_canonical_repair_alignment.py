@@ -8,6 +8,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -23,6 +24,7 @@ def load_integrity_module():
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load Integrity module")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -33,50 +35,6 @@ def identity(path: Path) -> tuple[str, int]:
 
 
 class CanonicalRepairAlignmentTest(unittest.TestCase):
-    def test_aqi_local_build_is_proposal_validated_not_complete(self) -> None:
-        import logging
-        import time
-
-        integrity = load_integrity_module()
-        with tempfile.TemporaryDirectory(prefix="uk-aq-aqi-proposal-test-") as temp_raw:
-            temp = Path(temp_raw)
-            conn = integrity.open_db(str(temp / "integrity.sqlite"))
-            conn.execute(
-                """
-                INSERT INTO aqi_rebuild_queue (
-                  run_id, env_name, history_version, connector_id, day_utc,
-                  reason, source_mode, status, created_at_utc
-                ) VALUES (1, 'TEST', 'v2', 7, '2026-07-12',
-                          'obs_repaired', 'combined_local', 'queued',
-                          '2026-07-19T00:00:00Z')
-                """
-            )
-            conn.commit()
-            original = integrity.run_aqi_rebuild_backfill
-            integrity.run_aqi_rebuild_backfill = lambda **_kwargs: {
-                "status": "ok", "log_path": None, "error": None,
-            }
-            try:
-                result = integrity.run_aqi_rebuild_queue_execution(
-                    conn, run_id=1, env_name="TEST", run_compact="test",
-                    env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": str(temp / "logs")},
-                    dry_run=False, run_backfill=True,
-                    limits=integrity.LimitTracker(None, None, time.monotonic()),
-                    log=logging.getLogger("aqi-proposal-test"),
-                    history_version="v2",
-                    skip_stale_local_post_validation=True,
-                    execute_local_proposal=True,
-                )
-            finally:
-                integrity.run_aqi_rebuild_backfill = original
-            self.assertEqual(result["aqi_rebuilds_complete"], 0)
-            self.assertEqual(result["aqi_rebuilds_proposal_validated"], 1)
-            self.assertEqual(result["aqi_rebuild_results"][0]["status"], "proposal_validated")
-            queue_status = conn.execute(
-                "SELECT status FROM aqi_rebuild_queue WHERE run_id = 1"
-            ).fetchone()[0]
-            self.assertEqual(queue_status, "proposal_validated")
-            conn.close()
 
     def test_exact_source_rows_are_required_before_tombstone(self) -> None:
         import duckdb
@@ -271,143 +229,7 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
             self.assertEqual(result["status"], "ok")
             self.assertNotIn("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS", captured)
 
-    def test_o3_observation_change_is_excluded_from_aqi_work(self) -> None:
-        integrity = load_integrity_module()
-        with tempfile.TemporaryDirectory(prefix="uk-aq-o3-aqi-test-") as temp_raw:
-            conn = integrity.open_db(str(Path(temp_raw) / "integrity.sqlite"))
-            try:
-                work, blocked = integrity._phase4_aqi_work(
-                    conn=conn,
-                    run_state={
-                        "changed_scopes": {
-                            "OBSERVS_CHANGED": [{
-                                "day_utc": "2026-07-12",
-                                "connector_id": 7,
-                                "affected_pollutant_codes": ["o3"],
-                            }]
-                        }
-                    },
-                    v2_aqilevels={},
-                )
-                self.assertEqual(work, [])
-                self.assertEqual(blocked, [])
-                original = integrity._active_aqi_eligible_pollutants_for_connector
-                integrity._active_aqi_eligible_pollutants_for_connector = (
-                    lambda _conn, *, connector_id: {"no2", "pm10", "pm25"}
-                )
-                try:
-                    work, blocked = integrity._phase4_aqi_work(
-                        conn=conn,
-                        run_state={
-                            "changed_scopes": {
-                                "OBSERVS_CHANGED": [{
-                                    "day_utc": "2026-07-12",
-                                    "connector_id": 7,
-                                    "affected_pollutant_codes": ["no2", "o3"],
-                                }]
-                            }
-                        },
-                        v2_aqilevels={},
-                    )
-                finally:
-                    integrity._active_aqi_eligible_pollutants_for_connector = original
-                self.assertEqual(len(work), 1)
-                self.assertEqual(work[0]["pollutant_codes"], ["no2"])
-                self.assertEqual(blocked, [])
-            finally:
-                conn.close()
 
-    def test_pollutant_scoped_aqi_capture_preserves_pm_baseline(self) -> None:
-        integrity = load_integrity_module()
-        day_utc = "2026-07-15"
-        connector_id = 1
-        with tempfile.TemporaryDirectory(prefix="uk-aq-aqi-scope-test-") as temp_raw:
-            temp = Path(temp_raw)
-            dropbox = temp / "dropbox"
-            run_state = integrity.create_run_overlay(
-                tmp_dir=temp,
-                run_id="aqi-scope",
-                environment="TEST",
-                base_dropbox_root=dropbox,
-            )
-            config = integrity.resolve_history_path_config("v2", {})
-            connector_prefix = (
-                f"{config.aqilevels_hourly_data_prefix}/day_utc={day_utc}/"
-                f"connector_id={connector_id}"
-            )
-            baseline_bodies = {
-                "no2": b"old-no2",
-                "pm10": b"unchanged-pm10",
-                "pm25": b"unchanged-pm25",
-            }
-            for pollutant, body in baseline_bodies.items():
-                path = (
-                    dropbox / connector_prefix /
-                    f"pollutant_code={pollutant}/part-00000.parquet"
-                )
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(body)
-
-            generated_root = (
-                Path(run_state["overlay_root"]) / "generated-objects" /
-                connector_prefix
-            )
-            generated_root.mkdir(parents=True)
-            (generated_root / "manifest.json").write_text(json.dumps({
-                "history_version": "v2",
-                "domain": "aqilevels",
-                "day_utc": day_utc,
-                "connector_id": connector_id,
-                "pollutant_codes": ["no2", "pm10", "pm25"],
-            }), encoding="utf-8")
-            for pollutant in ("no2", "pm10", "pm25"):
-                pollutant_root = generated_root / f"pollutant_code={pollutant}"
-                pollutant_root.mkdir()
-                (pollutant_root / "manifest.json").write_text(
-                    json.dumps({"pollutant_code": pollutant}), encoding="utf-8"
-                )
-                (pollutant_root / "part-00000.parquet").write_bytes(
-                    f"new-{pollutant}".encode()
-                )
-
-            object_keys = integrity._capture_local_v2_aqi_scope(
-                run_state=run_state,
-                day_utc=day_utc,
-                connector_id=connector_id,
-                env={},
-                repair_pollutants=["no2"],
-            )
-            self.assertTrue(object_keys)
-            self.assertTrue(all("pollutant_code=no2/" in key for key in object_keys))
-            self.assertFalse(any("pollutant_code=pm" in key for key in object_keys))
-            self.assertEqual(run_state["tombstone_prefixes"], [{
-                "prefix": f"{connector_prefix}/pollutant_code=no2",
-                "proposed": True,
-                "deleted": False,
-                "deletion_verified": False,
-                "stage": "aqilevels",
-                "repair_pollutants": ["no2"],
-            }])
-
-            view = integrity._create_final_verification_view(
-                run_state,
-                config=config,
-                from_day=day_utc,
-                to_day=day_utc,
-                selected_days=[day_utc],
-            )
-            self.assertEqual(
-                (view / connector_prefix / "pollutant_code=no2/part-00000.parquet").read_bytes(),
-                b"new-no2",
-            )
-            self.assertEqual(
-                (view / connector_prefix / "pollutant_code=pm10/part-00000.parquet").read_bytes(),
-                baseline_bodies["pm10"],
-            )
-            self.assertEqual(
-                (view / connector_prefix / "pollutant_code=pm25/part-00000.parquet").read_bytes(),
-                baseline_bodies["pm25"],
-            )
 
     def test_sos_missing_day_suggested_repair_enters_plan(self) -> None:
         integrity = load_integrity_module()
@@ -572,8 +394,6 @@ try { validateLocalProposal(broadDelete); } catch { broadDeleteRejected = true; 
 if (!broadDeleteRejected) throw new Error("apply preflight accepted a non-connector deletion prefix");
 for (const prefix of [
   "history/v2/observations/day_utc=2026-07-12/connector_id=7",
-  "history/v2/aqilevels/hourly/data/day_utc=2026-07-12/connector_id=7",
-  "history/v2/aqilevels/hourly/debug/day_utc=2026-07-12/connector_id=7",
 ]) {
   const allowed = structuredClone(state);
   allowed.tombstone_prefixes = [{ prefix, proposed: true }];
@@ -590,7 +410,7 @@ for (const prefix of [
   "history/v2/observations/day_utc=2026-07-12/connector_id=7/transactions",
   "history/v2/observations/day_utc=2026-07-12/connector_id=7/transactions/transaction_id=x/data-receipt.json",
   "history/v2/observations_timeseries",
-  "history/v2/aqilevels_hourly/day_utc=2026-07-12/connector_id=7",
+  "history/v2/non_observation_history/day_utc=2026-07-12/connector_id=7",
 ]) {
   const rejected = structuredClone(state);
   rejected.tombstone_prefixes = [{ prefix, proposed: true }];
@@ -614,22 +434,6 @@ scopedConnectorRejected.tombstone_prefixes = [{
 let scopedConnectorDidReject = false;
 try { validateLocalProposal(scopedConnectorRejected); } catch { scopedConnectorDidReject = true; }
 if (!scopedConnectorDidReject) throw new Error("apply preflight accepted scoped connector deletion");
-const scopedAqiPrefixAllowed = structuredClone(state);
-scopedAqiPrefixAllowed.tombstone_prefixes = [{
-  prefix: "history/v2/aqilevels/hourly/data/day_utc=2026-07-12/connector_id=7/pollutant_code=no2",
-  proposed: true,
-  repair_pollutants: ["no2"],
-}];
-validateLocalProposal(scopedAqiPrefixAllowed);
-const scopedAqiConnectorRejected = structuredClone(state);
-scopedAqiConnectorRejected.tombstone_prefixes = [{
-  prefix: "history/v2/aqilevels/hourly/data/day_utc=2026-07-12/connector_id=7",
-  proposed: true,
-  repair_pollutants: ["no2"],
-}];
-let scopedAqiConnectorDidReject = false;
-try { validateLocalProposal(scopedAqiConnectorRejected); } catch { scopedAqiConnectorDidReject = true; }
-if (!scopedAqiConnectorDidReject) throw new Error("apply preflight accepted scoped AQI connector deletion");
 """
             subprocess.run(
                 [

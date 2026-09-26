@@ -581,20 +581,6 @@ CREATE TABLE IF NOT EXISTS integrity_runs (
   observation_backfills_attempted INTEGER DEFAULT 0,
   observation_backfills_ok INTEGER DEFAULT 0,
   observation_backfills_failed INTEGER DEFAULT 0,
-  aqi_rebuilds_queued_from_obs_repair INTEGER DEFAULT 0,
-  aqi_health_connector_days_checked INTEGER DEFAULT 0,
-  aqi_health_rebuilds_queued INTEGER DEFAULT 0,
-  aqi_health_skipped_already_obs_repaired INTEGER DEFAULT 0,
-  aqi_health_manifest_missing INTEGER DEFAULT 0,
-  aqi_health_manifest_stale INTEGER DEFAULT 0,
-  aqi_health_manifest_empty INTEGER DEFAULT 0,
-  aqi_health_previous_rebuild_failed INTEGER DEFAULT 0,
-  aqi_rebuilds_queued_total INTEGER DEFAULT 0,
-  aqi_rebuilds_attempted INTEGER DEFAULT 0,
-  aqi_rebuilds_complete INTEGER DEFAULT 0,
-  aqi_rebuilds_failed INTEGER DEFAULT 0,
-  aqi_rebuilds_skipped INTEGER DEFAULT 0,
-
   warnings_count INTEGER DEFAULT 0,
   errors_count INTEGER DEFAULT 0,
 
@@ -10624,10 +10610,6 @@ def _read_parquet_partition_stats(
                         f"max={max_timestamp or '(none)'}"
                     )
 
-        # The v2 AQI writer groups valid source observations by UTC hour.  Keep
-        # that identity here so completeness never compares five-minute source
-        # row counts with hourly AQI row counts.
-        timeseries_hour_keys: dict[int, tuple[int, ...]] = {}
         timeseries_min_timestamp_utc: dict[int, str] = {}
         if timestamp_column and include_timeseries_min_timestamps:
             min_timestamp_rows = connection.execute(
@@ -10644,31 +10626,6 @@ def _read_parquet_partition_stats(
                 for timeseries_id, min_timestamp in min_timestamp_rows
                 if min_timestamp is not None
             }
-        if timestamp_column:
-            valid_value_filter = ""
-            if "value" in columns:
-                valid_value_filter = (
-                    " AND TRY_CAST(value AS DOUBLE) IS NOT NULL"
-                    " AND isfinite(TRY_CAST(value AS DOUBLE))"
-                    " AND TRY_CAST(value AS DOUBLE) >= 0"
-                )
-            hour_rows = connection.execute(
-                "SELECT CAST(timeseries_id AS BIGINT), "
-                f"CAST(FLOOR(epoch({timestamp_expression}) / 3600) AS BIGINT) "
-                "FROM read_parquet(?, union_by_name=true) "
-                "WHERE timeseries_id IS NOT NULL "
-                f"AND {timestamp_expression} IS NOT NULL"
-                f"{valid_value_filter} "
-                "GROUP BY 1, 2 ORDER BY 1, 2",
-                [parquet_files],
-            ).fetchall()
-            grouped_hour_keys: dict[int, list[int]] = {}
-            for timeseries_id, hour_key in hour_rows:
-                grouped_hour_keys.setdefault(int(timeseries_id), []).append(int(hour_key))
-            timeseries_hour_keys = {
-                timeseries_id: tuple(hour_keys)
-                for timeseries_id, hour_keys in grouped_hour_keys.items()
-            }
 
         # Determine if we have null timeseries_id rows
         has_null_timeseries_id_rows = null_timeseries_count > 0
@@ -10682,7 +10639,6 @@ def _read_parquet_partition_stats(
             "min_timestamp_utc": str(min_timestamp) if min_timestamp is not None else None,
             "max_timestamp_utc": str(max_timestamp) if max_timestamp is not None else None,
             "timeseries_min_timestamp_utc": timeseries_min_timestamp_utc,
-            "timeseries_hour_keys": timeseries_hour_keys,
             "parquet_null_timeseries_id_rows": has_null_timeseries_id_rows,
         }, None
     except Exception as exc:
@@ -13357,7 +13313,7 @@ def run_v2_post_repair_integrity_rechecks(
     observation_total_connector_ids: Iterable[int] | None = None,
     observation_total_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Re-run observation Integrity after repair without inspecting AQI R2."""
+    """Re-run observation Integrity after repair."""
     post_obs = run_v2_observations_integrity_checks(
         r2_history_root=r2_history_root,
         config=config,
@@ -14867,7 +14823,6 @@ def _set_v2_source_repair_plan(
             "steps": [
                 "Use the normal source-to-R2 backfill wrapper with --history-version v2.",
                 "Rebuild the affected v2 observations timeseries index after observations are written.",
-                "Queue connector-scoped v2 AQI rebuild only after the observation repair succeeds.",
             ],
             "notes": "Source cache for the connector/day is available; no v1 Dropbox evidence is required.",
         }
@@ -14881,7 +14836,6 @@ def _set_v2_source_repair_plan(
             "write_risk": "dry_run_only",
             "steps": [
                 "Dry-run plan: source-to-v2 observation repair would run with --history-version v2.",
-                "AQI rebuild would be queued only after a successful observation repair.",
             ],
             "notes": "Dry-run planning does not claim obs_repaired.",
         }
@@ -18787,7 +18741,7 @@ def _authoritative_v2_core_timeseries_bindings(
 
     The coverage entries still come from the rebuilt pollutant indexes, but
     their timeseries/connector/pollutant identity is checked against the
-    imported core snapshot rather than inferred from observation or AQI values.
+    imported core snapshot rather than inferred from observation values.
     """
     if conn is None:
         return []
@@ -20662,7 +20616,7 @@ def _validate_v2_timeseries_bindings(
 ) -> list[dict[str, Any]]:
     """Validate stable bindings against the imported v2 core snapshot.
 
-    Bindings are deliberately independent of daily observation/AQI coverage.
+    Bindings are deliberately independent of daily observation coverage.
     Missing or stale objects are reported only; this integrity path never
     deletes R2 objects.  The dedicated core-snapshot reconciliation command
     is the repair mechanism.  The optional connector scope lets SOS-light use
@@ -25887,7 +25841,7 @@ def _looks_like_r2_history_root(root: Path) -> bool:
         checked += 1
         if checked > 400:
             break
-        if "observations_timeseries" in dirpath or "aqilevels_station" in dirpath:
+        if "observations_timeseries" in dirpath:
             return True
         if any(name.endswith(".json") for name in filenames):
             return True
@@ -26964,19 +26918,6 @@ def open_db(db_path: str) -> sqlite3.Connection:
         "observation_backfills_attempted": "INTEGER DEFAULT 0",
         "observation_backfills_ok": "INTEGER DEFAULT 0",
         "observation_backfills_failed": "INTEGER DEFAULT 0",
-        "aqi_rebuilds_queued_from_obs_repair": "INTEGER DEFAULT 0",
-        "aqi_health_connector_days_checked": "INTEGER DEFAULT 0",
-        "aqi_health_rebuilds_queued": "INTEGER DEFAULT 0",
-        "aqi_health_skipped_already_obs_repaired": "INTEGER DEFAULT 0",
-        "aqi_health_manifest_missing": "INTEGER DEFAULT 0",
-        "aqi_health_manifest_stale": "INTEGER DEFAULT 0",
-        "aqi_health_manifest_empty": "INTEGER DEFAULT 0",
-        "aqi_health_previous_rebuild_failed": "INTEGER DEFAULT 0",
-        "aqi_rebuilds_queued_total": "INTEGER DEFAULT 0",
-        "aqi_rebuilds_attempted": "INTEGER DEFAULT 0",
-        "aqi_rebuilds_complete": "INTEGER DEFAULT 0",
-        "aqi_rebuilds_failed": "INTEGER DEFAULT 0",
-        "aqi_rebuilds_skipped": "INTEGER DEFAULT 0",
         "r2_history_status": "TEXT",
         "timeseries_reconciliation_status": "TEXT",
         "latest_snapshot_reconciliation_status": "TEXT",
@@ -28243,7 +28184,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Observation repair candidates: days={cc.get('observation_backfill_candidate_days', cc.get('backfill_candidate_days', 0))} timeseries_ids={cc.get('observation_backfill_candidate_timeseries_ids', cc.get('backfill_candidate_timeseries_ids', 0))}",
             f"- Source-change candidates:     days={cc.get('source_change_candidate_days', 0)} timeseries_ids={cc.get('source_change_candidate_timeseries_ids', 0)}",
             f"- Observation repairs:       attempted={cc.get('observation_backfills_attempted', cc.get('backfills_attempted', 0))} ok={cc.get('observation_backfills_ok', cc.get('backfills_ok', 0))} failed={cc.get('observation_backfills_failed', cc.get('backfills_failed', 0))}",
-            f"- Retired AQI Integrity excluded: {bool(cc.get('aqi_integrity_retired'))}",
         ])
         if cc.get("skipped_reason"):
             lines.append(f"- Skipped reason:           {cc['skipped_reason']}")
@@ -29255,12 +29195,6 @@ def main(argv: list[str]) -> int:
                 log=log,
             )
             cross_check_metrics.update(v2_backfill_metrics)
-            cross_check_metrics.update({
-                "aqi_integrity_retired": True,
-                "aqi_integrity_repair_skipped_reason": (
-                    "retired_aqi_r2_history_product"
-                ),
-            })
 
         if effective_mode == "check_only" and cross_check_metrics.get("ran"):
             current_state_plan = run_current_state_reconciliation(
@@ -29792,19 +29726,6 @@ def main(argv: list[str]) -> int:
               observation_backfills_attempted = ?,
               observation_backfills_ok = ?,
               observation_backfills_failed = ?,
-              aqi_rebuilds_queued_from_obs_repair = ?,
-              aqi_health_connector_days_checked = ?,
-              aqi_health_rebuilds_queued = ?,
-              aqi_health_skipped_already_obs_repaired = ?,
-              aqi_health_manifest_missing = ?,
-              aqi_health_manifest_stale = ?,
-              aqi_health_manifest_empty = ?,
-              aqi_health_previous_rebuild_failed = ?,
-              aqi_rebuilds_queued_total = ?,
-              aqi_rebuilds_attempted = ?,
-              aqi_rebuilds_complete = ?,
-              aqi_rebuilds_failed = ?,
-              aqi_rebuilds_skipped = ?,
               warnings_count = warnings_count + ?,
               errors_count = errors_count + ?,
               notes = ?
@@ -29831,7 +29752,6 @@ def main(argv: list[str]) -> int:
                 metrics["observation_backfills_attempted"],
                 metrics["observation_backfills_ok"],
                 metrics["observation_backfills_failed"],
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 warnings_count_total,
                 errors_count,
                 notes,

@@ -7,8 +7,8 @@ import importlib.util
 import logging
 import os
 import sqlite3
+import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -20,6 +20,7 @@ SPEC = importlib.util.spec_from_file_location("uk_aq_history_integrity", MODULE_
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Unable to load module at {MODULE_PATH}")
 MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
@@ -204,198 +205,6 @@ class SosCanonicalTests(unittest.TestCase):
             },
         )
         self.assertEqual(origins[("2026-05-11", 6)], ["cross_check", "source_change"])
-
-    def test_run_cross_check_backfills_first_seen_only_has_no_candidates(self) -> None:
-        conn = self._new_conn()
-        conn.execute(
-            "INSERT INTO core_connectors_snapshot (id, connector_code, label, display_name, service_url) VALUES (?, ?, ?, ?, ?)",
-            (6, "sos", "UK-AIR SOS", "UK-AIR SOS", None),
-        )
-        conn.commit()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            metrics = MODULE.run_cross_check_backfills(
-                conn=conn,
-                run_id=1,
-                env_name="TEST",
-                run_compact="20260518T000000Z",
-                env={
-                    "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
-                },
-                source_filter="sos",
-                sos_metrics={
-                    "first_seen_files": [{"day": "2026-05-11", "timeseries_ids": [101]}],
-                    "changed_files": [],
-                },
-                dry_run=True,
-                run_backfill=True,
-                limits=MODULE.LimitTracker(
-                    max_download_mb=None,
-                    max_runtime_minutes=None,
-                    started_mono=time.monotonic(),
-                ),
-                log=logging.getLogger("test-first-seen-no-candidates"),
-            )
-        self.assertEqual(metrics["observation_backfill_candidate_days"], 0)
-        self.assertEqual(metrics["observation_backfill_candidate_timeseries_ids"], 0)
-
-    def test_v2_mode_does_not_claim_obs_repaired_without_v2_repair(self) -> None:
-        conn = self._new_conn()
-        with tempfile.TemporaryDirectory() as tmp:
-            metrics = MODULE.run_cross_check_backfills(
-                conn=conn,
-                run_id=1,
-                env_name="TEST",
-                run_compact="20260518T000000Z",
-                env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp},
-                source_filter="sos",
-                sos_metrics={"changed_files": []},
-                dry_run=False,
-                run_backfill=True,
-                limits=MODULE.LimitTracker(
-                    max_download_mb=None,
-                    max_runtime_minutes=None,
-                    started_mono=time.monotonic(),
-                ),
-                log=logging.getLogger("test-v2-skips-legacy-cross-check-repair"),
-                history_version="v2",
-            )
-        conn.close()
-
-        self.assertEqual(metrics["observation_backfill_candidate_days"], 0)
-        self.assertEqual(metrics["observation_backfills_ok"], 0)
-        self.assertEqual(metrics["planned_aqi_rebuilds"], [])
-        self.assertIn(
-            "v2 observation gaps are handled by run_v2_gap_backfills",
-            metrics["cross_check_observation_repair_skipped_reason"],
-        )
-
-    def test_run_cross_check_backfills_not_found_only_has_no_candidates(self) -> None:
-        conn = self._new_conn()
-        conn.execute(
-            "INSERT INTO core_connectors_snapshot (id, connector_code, label, display_name, service_url) VALUES (?, ?, ?, ?, ?)",
-            (6, "sos", "UK-AIR SOS", "UK-AIR SOS", None),
-        )
-        conn.commit()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            metrics = MODULE.run_cross_check_backfills(
-                conn=conn,
-                run_id=1,
-                env_name="TEST",
-                run_compact="20260518T000000Z",
-                env={
-                    "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
-                },
-                source_filter="sos",
-                sos_metrics={
-                    "not_found": 1,
-                    "changed_files": [],
-                },
-                dry_run=True,
-                run_backfill=True,
-                limits=MODULE.LimitTracker(
-                    max_download_mb=None,
-                    max_runtime_minutes=None,
-                    started_mono=time.monotonic(),
-                ),
-                log=logging.getLogger("test-not-found-no-candidates"),
-            )
-        self.assertEqual(metrics["observation_backfill_candidate_days"], 0)
-        self.assertEqual(metrics["observation_backfill_candidate_timeseries_ids"], 0)
-
-    def test_run_cross_check_backfills_ignores_legacy_source_change_candidates(self) -> None:
-        conn = self._new_conn()
-        conn.execute(
-            "INSERT INTO core_connectors_snapshot (id, connector_code, label, display_name, service_url) VALUES (?, ?, ?, ?, ?)",
-            (6, "sos", "UK-AIR SOS", "UK-AIR SOS", None),
-        )
-        conn.execute(
-            "INSERT INTO core_timeseries_snapshot (id, station_id, connector_id, timeseries_ref, label, phenomenon_id, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (101, 1, 6, "ts-101", None, None, None),
-        )
-        conn.execute(
-            "INSERT INTO core_timeseries_snapshot (id, station_id, connector_id, timeseries_ref, label, phenomenon_id, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (102, 1, 6, "ts-102", None, None, None),
-        )
-        conn.execute(
-            "INSERT INTO core_timeseries_snapshot (id, station_id, connector_id, timeseries_ref, label, phenomenon_id, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (103, 1, 6, "ts-103", None, None, None),
-        )
-        conn.executemany(
-            """
-            INSERT INTO cross_checks (
-              run_id, env_name, connector_id, day_utc, timeseries_id,
-              source_row_count, r2_row_count, delta, status, checked_at_utc, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (1, "TEST", 6, "2026-05-11", 101, 10, 9, 1, "mismatch", "2026-05-18T00:00:00Z", None),
-                (1, "TEST", 6, "2026-05-11", 102, 3, None, 3, "source_only", "2026-05-18T00:00:00Z", None),
-            ],
-        )
-        MODULE._upsert_source_state(
-            conn=conn,
-            source_key=MODULE.SOS_SOURCE_KEY,
-            remote_scheme=MODULE.SOS_REMOTE_SCHEME,
-            source_file_key="sos:test-source-evidence:2026-05-11",
-            env_name="TEST",
-            remote_url_or_key="https://example.test/sos",
-            station_ref="station-1",
-            source_location_id="station-1",
-            day=MODULE.dt.date(2026, 5, 11),
-            exists_remote=True,
-            content_length=100,
-            etag=None,
-            last_modified_utc=None,
-            sha256_downloaded="source-sha",
-            sha256_uncompressed="source-sha",
-            local_cached_path=None,
-            now_iso="2026-05-18T00:00:00Z",
-            last_changed_at=None,
-            last_status="unchanged",
-        )
-        MODULE._record_source_file_timeseries_counts(
-            conn,
-            "sos:test-source-evidence:2026-05-11",
-            {101: 10, 102: 3},
-            "2026-05-18T00:00:00Z",
-            default_day_utc="2026-05-11",
-        )
-        conn.commit()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            metrics = MODULE.run_cross_check_backfills(
-                conn=conn,
-                run_id=1,
-                env_name="TEST",
-                run_compact="20260518T000000Z",
-                env={
-                    "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
-                },
-                source_filter="sos",
-                sos_metrics={
-                    "changed_files": [{"day": "2026-05-11", "timeseries_ids": [102, 103]}],
-                },
-                dry_run=True,
-                run_backfill=True,
-                limits=MODULE.LimitTracker(
-                    max_download_mb=None,
-                    max_runtime_minutes=None,
-                    started_mono=time.monotonic(),
-                ),
-                log=logging.getLogger("test-merge-candidates"),
-            )
-
-        self.assertEqual(metrics["source_change_candidate_days"], 0)
-        self.assertEqual(metrics["source_change_candidate_timeseries_ids"], 0)
-        self.assertEqual(metrics["observation_backfill_candidate_days"], 1)
-        self.assertEqual(metrics["observation_backfill_candidate_timeseries_ids"], 2)
-        self.assertEqual(len(metrics["planned_observation_backfills"]), 1)
-        self.assertIn("UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only", metrics["planned_observation_backfills"][0])
-        self.assertIn("UK_AQ_BACKFILL_CONNECTOR_IDS=6", metrics["planned_observation_backfills"][0])
-        self.assertIn("UK_AQ_BACKFILL_TIMESERIES_IDS=101,102", metrics["planned_observation_backfills"][0])
-        self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
 
     def test_no_data_baselines_zero_counts(self) -> None:
         conn = self._new_conn()

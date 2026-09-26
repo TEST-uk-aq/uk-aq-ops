@@ -777,14 +777,13 @@ class SosSiteRefBridgeTests(unittest.TestCase):
                     case["expected"],
                 )
 
-    def test_o3_is_part_of_sos_observation_scope_but_not_aqi_scope(self):
+    def test_o3_is_part_of_sos_observation_scope(self):
         self.assertEqual(
             MODULE._resolve_sos_target_pollutants({}),
             ("pm25", "pm10", "no2", "o3"),
         )
         self.assertEqual(MODULE._uk_air_normalize_pollutant_code("Ozone"), "o3")
         self.assertIn("o3", MODULE.V2_OBSERVATION_INTEGRITY_POLLUTANTS)
-        self.assertNotIn("o3", MODULE.V2_AQI_SUPPORTED_POLLUTANTS)
 
     def test_zero_hash_candidates_block_first_value_at_evidence(self):
         conn = self._connection()

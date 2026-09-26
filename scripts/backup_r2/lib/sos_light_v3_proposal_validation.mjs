@@ -341,8 +341,7 @@ export function validateDedicatedSosHistoricalProposalV3({ runState, proposal })
       || !["TEST", "LIVE"].includes(runState.environment)
       || !exactArray(runState.mutation_connector_ids, [1])
       || !exactArray(runState.selected_mutation_connector_ids, [1])
-      || !exactArray(runState.protected_connector_ids, [1])
-      || runState.aqi_policy !== "bypassed_observation_history_only") {
+      || !exactArray(runState.protected_connector_ids, [1])) {
     throw new Error("SOS-light-v3 proposal has invalid execution or connector scope");
   }
   const audit = runState.sos_light;
@@ -350,9 +349,6 @@ export function validateDedicatedSosHistoricalProposalV3({ runState, proposal })
       || audit?.old_live_r2_observation_bodies_used !== false
       || audit?.no_old_live_r2_body_planning_or_preservation !== true) {
     throw new Error("SOS-light-v3 proposal has invalid reconstruction authority evidence");
-  }
-  for (const scope of ["AQILEVELS_CHANGED", "AQI_MANIFESTS_CHANGED", "AQI_INDEXES_CHANGED"]) {
-    if ((runState.changed_scopes?.[scope] || []).length) throw new Error("SOS-light-v3 must not mutate AQI");
   }
   const selectedDays = [...new Set((audit.days || []).map((entry) => String(entry?.day_utc || "")))].sort();
   if (!selectedDays.length || selectedDays.some((day) => !validDay(day))) throw new Error("SOS-light-v3 selected days are invalid");
@@ -380,8 +376,9 @@ export function validateLocalSosLightV3Proposal(runState) {
   const objects = Object.entries(runState.objects || {}).map(([rawKey, entry]) => {
     const key = safeKey(rawKey);
     if (key.startsWith(V2_OBSERVATIONS_PREFIX) || key.startsWith(V2_INDEX_PREFIX)
-        || !(key.startsWith(`${OBSERVATIONS_PREFIX}/`) || key.startsWith(`${INDEX_PREFIX}/`))
-        || key.includes("/aqilevels/")) throw new Error(`Non-v3 SOS-light proposal key: ${key}`);
+        || !(key.startsWith(`${OBSERVATIONS_PREFIX}/`) || key.startsWith(`${INDEX_PREFIX}/`))) {
+      throw new Error(`Non-v3 SOS-light proposal key: ${key}`);
+    }
     const loaded = localBody(runState, entry, key);
     validateDependencies(runState, key, entry);
     return { key, entry, ...loaded, domain: "observations" };

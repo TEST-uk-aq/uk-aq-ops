@@ -388,27 +388,6 @@ class V2RepairPlanningTest(unittest.TestCase):
             self.assertIn("_index_v2 rebuild command is not listed", repair["notes"])
             self.assertTrue(gap["source_evidence"]["v1_local_dropbox_present"])
 
-    def test_missing_v2_aqi_with_v2_observations_present_plans_aqi_rebuild_without_command(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            cfg = integrity.resolve_history_path_config("v2", {})
-            (root / "history/v2/observations/day_utc=2026-06-11/connector_id=6/pollutant_code=pm25").mkdir(parents=True)
-            (root / cfg.aqilevels_latest_index_key).parent.mkdir(parents=True)
-            (root / cfg.aqilevels_latest_index_key).write_text("{}", encoding="utf-8")
-
-            result = integrity.run_v2_aqilevels_integrity_checks(
-                r2_history_root=root,
-                config=cfg,
-                from_day="2026-06-11",
-                to_day="2026-06-11",
-            )
-
-            gap = next(g for g in result["gaps"] if g["gap_type"] == "day_dir_missing")
-            repair = gap["suggested_repair"]
-            self.assertEqual(repair["kind"], "v2_aqi_hourly_rebuild_from_v2_observations_plan")
-            self.assertEqual(repair["commands"], [])
-            self.assertTrue(gap["source_evidence"]["v2_observations_present"])
-            self.assertIn("commands require confirmation", repair["notes"])
 
 
 if __name__ == "__main__":

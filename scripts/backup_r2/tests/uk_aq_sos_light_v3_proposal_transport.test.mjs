@@ -14,7 +14,44 @@ import {
   computeCoordinatorTransitionStateFingerprint,
   requireCoordinatorProposalFreeze,
   SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+  validateDedicatedSosHistoricalProposalV3,
 } from "../lib/sos_light_v3_proposal_validation.mjs";
+
+test("fixed-v3 execution scope does not require retired AQI fields", () => {
+  const dayUtc = "2025-01-15";
+  const runState = {
+    execution_path: "sos_light",
+    mode: "sos-light",
+    environment: "TEST",
+    mutation_connector_ids: [1],
+    selected_mutation_connector_ids: [1],
+    protected_connector_ids: [1],
+    sos_light: {
+      mode: "sos-light",
+      validation_status: "complete_local_days_validated",
+      old_live_r2_observation_bodies_used: false,
+      no_old_live_r2_body_planning_or_preservation: true,
+      days: [{ day_utc: dayUtc }],
+    },
+  };
+  const proposal = {
+    objects: [
+      { key: `history/v3/observations/day_utc=${dayUtc}/manifest.json` },
+      { key: `history/v3/observations/day_utc=${dayUtc}/connector_id=1/manifest.json` },
+    ],
+    prefixes: [{
+      prefix: `history/v3/observations/day_utc=${dayUtc}`,
+      entry: { stage: "sos_light_complete_day" },
+    }],
+  };
+
+  assert.doesNotThrow(() => validateDedicatedSosHistoricalProposalV3({
+    runState,
+    proposal,
+  }));
+  assert.equal(Object.hasOwn(runState, "aqi_policy"), false);
+  assert.equal(Object.hasOwn(runState, "changed_scopes"), false);
+});
 
 function proposal(key, body, overrides = {}) {
   return {

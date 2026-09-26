@@ -385,24 +385,10 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         state_transition.assert_not_called()
         write_reports.assert_called_once()
 
-    def test_repair_plan_queues_aqi_only_for_aqi_enabled_pollutants(self) -> None:
-        plan = MODULE.build_v2_repair_plan(observation_gaps=[
-            {"gap_type": "source_r2_timeseries_row_mismatch", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "pm10", "source_evidence": {"source_partition_state": "successful_non_empty"}},
-            {"gap_type": "source_r2_timeseries_row_mismatch", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "no2", "source_evidence": {"source_partition_state": "successful_non_empty"}},
-            {"gap_type": "source_r2_timeseries_row_mismatch", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3", "source_evidence": {"source_partition_state": "successful_non_empty"}},
-        ])
-        aqi = [a for a in plan if a["kind"] == "aqi_rebuild"]
-        self.assertEqual({a["pollutant_code"] for a in aqi}, {"pm10", "no2"})
-        self.assertTrue(all(a["status"] == "planned" for a in aqi))
-        self.assertTrue(all(a["executes"] is False for a in aqi))
-        self.assertTrue(all(a["data_changes_required"] is True for a in aqi))
-        self.assertFalse(any(a["pollutant_code"] == "o3" for a in aqi))
-
-    def test_manifest_only_repair_does_not_queue_unnecessary_aqi_rebuild(self) -> None:
+    def test_manifest_only_repair_stays_observation_only(self) -> None:
         plan = MODULE.build_v2_repair_plan(observation_gaps=[
             {"gap_type": "connector_manifest_missing_pollutant_child", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3"},
         ])
-        self.assertFalse(any(a["kind"] == "aqi_rebuild" for a in plan))
         self.assertTrue(any(a["kind"] == "observation_connector_manifest_repair" for a in plan))
 
     def test_check_only_plan_shape_makes_no_writes_by_construction(self) -> None:
@@ -436,7 +422,6 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
         self.assertFalse(any(a["kind"] == "observation_pollutant_manifest_repair" for a in plan))
-        self.assertFalse(any(a["kind"] == "aqi_rebuild" for a in plan))
 
     def test_manifest_only_gap_remains_manifest_only_for_o3(self) -> None:
         gap = MODULE._v2_obs_gap(
@@ -451,7 +436,6 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         MODULE._classify_v2_gaps([gap])
         plan = MODULE.build_v2_repair_plan(observation_gaps=[gap])
         self.assertTrue(any(a["kind"] == "observation_pollutant_manifest_repair" for a in plan))
-        self.assertFalse(any(a["kind"] == "aqi_rebuild" for a in plan))
         self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
@@ -481,9 +465,8 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
         self.assertFalse(any(a["kind"] == "observation_index_repair" for a in plan))
-        self.assertFalse(any(a["kind"] == "aqi_rebuild" for a in plan))
 
-    def test_pm10_data_fault_keeps_aqi_rebuild_planned_non_executing(self) -> None:
+    def test_pm10_data_fault_plans_only_observation_repair(self) -> None:
         gaps = [
             {
                 "gap_type": "source_r2_timeseries_row_mismatch",
@@ -511,13 +494,10 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         MODULE._classify_v2_gaps(gaps)
         plan = MODULE.build_v2_repair_plan(observation_gaps=gaps)
         self.assertTrue(any(a["kind"] == "observation_data_repair" for a in plan))
-        self.assertTrue(any(a["kind"] == "aqi_rebuild" for a in plan))
         self.assertFalse(any(a["kind"] == "observation_pollutant_manifest_repair" for a in plan))
         self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
-        self.assertTrue(all(a.get("data_changes_required") is True for a in plan if a["kind"] == "aqi_rebuild"))
-        self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
 
     def test_data_fault_preempts_operator_review_and_manifest_only_for_partition(self) -> None:
         gaps = [
@@ -546,8 +526,7 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         ]
         MODULE._classify_v2_gaps(gaps)
         plan = MODULE.build_v2_repair_plan(observation_gaps=gaps)
-        self.assertEqual([a["kind"] for a in plan], ["observation_data_repair", "aqi_rebuild"])
-        self.assertEqual(plan[1]["aqi_rebuild_origins"], ["observation_dependency"])
+        self.assertEqual([a["kind"] for a in plan], ["observation_data_repair"])
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
         self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
@@ -563,12 +542,6 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         day_action = next(a for a in plan if a["kind"] == "observation_day_manifest_repair")
         self.assertIsNone(day_action["connector_id"])
         self.assertIsNone(day_action["pollutant_code"])
-        aqi_plan = MODULE.build_v2_repair_plan(aqi_gaps=[
-            {"gap_type": "day_manifest_missing", "day_utc": "2026-05-17", "connector_id": 1},
-        ])
-        aqi_day_action = next(a for a in aqi_plan if a["kind"] == "aqi_day_manifest_repair")
-        self.assertIsNone(aqi_day_action["connector_id"])
-        self.assertIsNone(aqi_day_action["pollutant_code"])
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
 
