@@ -10,10 +10,15 @@ import {
   assertCurrentRunParquetIdentities,
   assertCurrentRunManifestWriterGitSha,
   assertFixedV3Proposal,
+  authenticateExactV3CompactLatest,
   buildExactV3ProposalDependencyFields,
+  buildExactV3ManifestCatalogue,
+  crossCheckExactV3RegistryCatalogue,
+  deriveExactV3ManifestDelta,
   inspectPinnedBaselinePollutantPartition,
   reconcileReconstructedExactV3Hierarchies,
   reconstructCanonicalObservationAggregateHierarchy,
+  resolveExactV3PlanningAuthority,
   resolveExactV3LocalReferences,
   resolveIntegrityTargetWriterGitSha,
 } from "../uk_aq_plan_sos_light_v3_observation_metadata.mjs";
@@ -21,6 +26,9 @@ import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import {
   buildObservationHistoryExactLeafIndexV3Latest,
   buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
+  encodeObservationHistoryIndexV3Json,
+  updateObservationHistoryExactLeafIndexV3Latest,
+  validateObservationHistoryExactLeafIndexV3LatestRegistry,
 } from "../../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   readCanonicalObservationRows,
@@ -971,4 +979,301 @@ test("reconstructed exact-v3 state republishes changed roots and drops absent ol
     exact_prefix: "history/_index_v3/observations_timeseries/day_utc=2026-06-03/connector_id=1/pollutant_code=no2",
     aligned_prefix: "history/_index_v3/observations_timeseries/_aligned/day_utc=2026-06-03/connector_id=1/pollutant_code=no2",
   }]);
+});
+
+function latestWithPayload(base, payload) {
+  const body = encodeObservationHistoryIndexV3Json(payload);
+  return {
+    ...base,
+    payload,
+    body,
+    byte_size: Buffer.byteLength(body),
+    sha256: sha256Hex(body),
+  };
+}
+
+test("compact latest validator rejects duplicate roots and aggregate contradictions", () => {
+  const first = exactHierarchy("2026-06-01", 101);
+  const second = exactHierarchy("2026-06-02", 102);
+  const latest = buildObservationHistoryExactLeafIndexV3Latest({
+    scopedHierarchies: [first, second],
+  });
+  const validated = validateObservationHistoryExactLeafIndexV3LatestRegistry({ artifact: latest });
+  assert.equal(validated.roots.length, 2);
+
+  assert.throws(
+    () => validateObservationHistoryExactLeafIndexV3LatestRegistry({
+      artifact: { ...latest, key: `${latest.key}.wrong` },
+    }),
+    /registry key/,
+  );
+  const nonCanonicalBody = JSON.stringify(latest.payload, null, 2);
+  assert.throws(
+    () => validateObservationHistoryExactLeafIndexV3LatestRegistry({
+      artifact: {
+        ...latest,
+        body: nonCanonicalBody,
+        byte_size: Buffer.byteLength(nonCanonicalBody),
+        sha256: sha256Hex(nonCanonicalBody),
+      },
+    }),
+    /identity mismatch/,
+  );
+  const wrongVersionPayload = { ...structuredClone(latest.payload), schema_version: 2 };
+  assert.throws(
+    () => validateObservationHistoryExactLeafIndexV3LatestRegistry({
+      artifact: latestWithPayload(latest, wrongVersionPayload),
+    }),
+    /aggregate fields are contradictory/,
+  );
+  const unsortedPayload = structuredClone(latest.payload);
+  unsortedPayload.day_summaries.reverse();
+  assert.throws(
+    () => validateObservationHistoryExactLeafIndexV3LatestRegistry({
+      artifact: latestWithPayload(latest, unsortedPayload),
+    }),
+    /aggregate fields are contradictory/,
+  );
+
+  const duplicatePayload = structuredClone(latest.payload);
+  duplicatePayload.day_summaries[0].scoped_roots.push(
+    structuredClone(duplicatePayload.day_summaries[0].scoped_roots[0]),
+  );
+  assert.throws(
+    () => validateObservationHistoryExactLeafIndexV3LatestRegistry({
+      artifact: latestWithPayload(latest, duplicatePayload),
+    }),
+    /duplicate scoped root/,
+  );
+
+  const aggregatePayload = structuredClone(latest.payload);
+  aggregatePayload.total_rows += 1;
+  assert.throws(
+    () => validateObservationHistoryExactLeafIndexV3LatestRegistry({
+      artifact: latestWithPayload(latest, aggregatePayload),
+    }),
+    /aggregate fields are contradictory/,
+  );
+});
+
+test("compact latest update handles unchanged, replacement, new, and removed scopes", () => {
+  const retained = exactHierarchy("2026-06-01", 101);
+  const removed = exactHierarchy("2026-06-02", 102);
+  const replacement = exactHierarchy("2026-06-01", 201);
+  const added = exactHierarchy("2026-06-03", 103);
+  const unaffected = exactHierarchy("2026-06-04", 104);
+  const latest = buildObservationHistoryExactLeafIndexV3Latest({
+    scopedHierarchies: [retained, removed, unaffected],
+  });
+  assert.equal(
+    updateObservationHistoryExactLeafIndexV3Latest({ existingLatest: latest }).sha256,
+    latest.sha256,
+    "a valid no-op must preserve the compact latest identity",
+  );
+  const updated = updateObservationHistoryExactLeafIndexV3Latest({
+    existingLatest: latest,
+    replacementScopedManifests: [replacement.scoped_manifest, added.scoped_manifest],
+    removedScopes: [removed.scoped_manifest.payload],
+  });
+  const roots = updated.payload.day_summaries.flatMap(({ scoped_roots }) => scoped_roots);
+  assert.deepEqual(
+    roots.map(({ day_utc }) => day_utc),
+    ["2026-06-01", "2026-06-03", "2026-06-04"],
+  );
+  assert.equal(roots[0].sha256, replacement.scoped_manifest.sha256);
+  assert.equal(roots[1].sha256, added.scoped_manifest.sha256);
+  assert.equal(roots[2].sha256, unaffected.scoped_manifest.sha256);
+  assert.equal(
+    updated.body,
+    buildObservationHistoryExactLeafIndexV3Latest({
+      scopedHierarchies: [replacement, added, unaffected],
+    }).body,
+    "incremental latest must equal complete deterministic reconstruction",
+  );
+});
+
+function cataloguePartition(dayUtc, timeseriesId, value = 12.5) {
+  return buildObservationHistoryV3SteadyStatePartition({
+    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
+    rows: [{
+      connector_id: 1,
+      station_id: 10,
+      timeseries_id: timeseriesId,
+      pollutant_code: "no2",
+      observed_at_utc: `${dayUtc}T00:00:00.000Z`,
+      value,
+      verification_status: "P",
+    }],
+    scope: { day_utc: dayUtc, connector_id: 1, pollutant_code: "no2" },
+    targetWriterGitSha: "a".repeat(40),
+    backedUpAtUtc: "2026-06-10T00:00:00.000Z",
+  });
+}
+
+test("manifest delta excludes byte-identical forced republication and selects actual changes", () => {
+  const unchanged = cataloguePartition("2026-06-01", 101);
+  const changed = cataloguePartition("2026-06-02", 102, 22.5);
+  const added = cataloguePartition("2026-06-03", 103);
+  const artifacts = [unchanged, changed, added].map((built) => built.canonical_pollutant_manifest);
+  const objects = new Map(artifacts.map((artifact) => [artifact.key, {
+    key: artifact.key,
+    body: Buffer.from(artifact.body),
+    source: "planned_overlay",
+  }]));
+  const catalogue = buildExactV3ManifestCatalogue({
+    manifestKeys: objects.keys(),
+    getObject: (key) => objects.get(key),
+  });
+  const removedKey = "history/v3/observations/day_utc=2026-06-04/connector_id=1/pollutant_code=no2/manifest.json";
+  const baselineObjects = [
+    {
+      key: unchanged.canonical_pollutant_manifest.key,
+      size: unchanged.canonical_pollutant_manifest.byte_size,
+      content_sha256: unchanged.canonical_pollutant_manifest.sha256,
+    },
+    {
+      key: changed.canonical_pollutant_manifest.key,
+      size: changed.canonical_pollutant_manifest.byte_size,
+      content_sha256: "f".repeat(64),
+    },
+    { key: removedKey, size: 1, content_sha256: "e".repeat(64) },
+  ];
+  const delta = deriveExactV3ManifestDelta({ finalCatalogue: catalogue, baselineObjects });
+  assert.deepEqual(
+    delta.affected_entries.map(({ key }) => key),
+    [changed.canonical_pollutant_manifest.key, added.canonical_pollutant_manifest.key],
+  );
+  assert.deepEqual(delta.removed_scopes.map(({ day_utc }) => day_utc), ["2026-06-04"]);
+});
+
+test("checkpoint authentication pins compact latest and registry provenance is explicit", () => {
+  const hierarchy = exactHierarchy("2026-06-01", 101);
+  const latest = buildObservationHistoryExactLeafIndexV3Latest({
+    scopedHierarchies: [hierarchy],
+  });
+  const object = {
+    key: latest.key,
+    body: Buffer.from(latest.body),
+    bytes: latest.byte_size,
+    content_sha256: latest.sha256,
+    source: "dropbox",
+  };
+  const authenticated = authenticateExactV3CompactLatest({
+    runState: {
+      dropbox_currentness: {
+        allowed: true,
+        checkpoint: {
+          observations_timeseries_latest: {
+            key: latest.key,
+            byte_size: latest.byte_size,
+            sha256: latest.sha256,
+          },
+        },
+      },
+    },
+    store: {
+      getObjectFromSourceIfExists: (key, source) =>
+        key === latest.key && source === "dropbox" ? object : null,
+    },
+  });
+  assert.equal(authenticated.artifact.sha256, latest.sha256);
+  assert.throws(() => authenticateExactV3CompactLatest({
+    runState: {
+      dropbox_currentness: {
+        allowed: true,
+        checkpoint: { observations_timeseries_latest: {
+          key: latest.key, byte_size: latest.byte_size, sha256: "0".repeat(64),
+        } },
+      },
+    },
+    store: { getObjectFromSourceIfExists: () => object },
+  }), /identity disagrees/);
+
+  const root = authenticated.roots[0];
+  const fields = buildExactV3ProposalDependencyFields({
+    entry: {
+      dependencies: [root],
+      publication_prerequisites: [],
+      external_dependencies: [root.key],
+      external_publication_prerequisites: [],
+    },
+    changedExactKeys: new Set(),
+    exactByKey: new Map(),
+    proposalsByKey: new Map(),
+    canonicalFinalizationPrerequisiteKeys: new Set(),
+    runState: { objects: {} },
+    store: { getObjectFromSourceIfExists: () => null },
+    resolvedLocalReferences: new Map([[root.key, {
+      key: root.key,
+      byte_size: root.byte_size,
+      sha256: root.sha256,
+      verified: true,
+      durable: true,
+    }]]),
+    registryRootKeys: new Set([root.key]),
+  });
+  assert.equal(
+    fields.pinned_baseline_references[root.key].source,
+    "pinned_checkpoint_compact_latest_registry",
+  );
+});
+
+test("registry catalogue cross-check rejects an unchanged summary contradiction", () => {
+  const built = cataloguePartition("2026-06-01", 101);
+  const artifact = built.canonical_pollutant_manifest;
+  const catalogue = buildExactV3ManifestCatalogue({
+    manifestKeys: [artifact.key],
+    getObject: () => ({ key: artifact.key, body: Buffer.from(artifact.body), source: "dropbox" }),
+  });
+  const hierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+    metadata: built.target_metadata,
+    canonicalManifest: {
+      key: artifact.key,
+      byte_size: artifact.byte_size,
+      sha256: artifact.sha256,
+      manifest_hash: artifact.payload.manifest_hash,
+      row_count: artifact.payload.row_count,
+      observation_content_hash: artifact.payload.observation_content_hash,
+    },
+  });
+  const latest = buildObservationHistoryExactLeafIndexV3Latest({ scopedHierarchies: [hierarchy] });
+  const registry = validateObservationHistoryExactLeafIndexV3LatestRegistry({ artifact: latest });
+  const contradictory = [{ ...registry.roots[0], row_count: registry.roots[0].row_count + 1 }];
+  assert.throws(() => crossCheckExactV3RegistryCatalogue({
+    registryRoots: contradictory,
+    finalCatalogue: catalogue,
+    delta: deriveExactV3ManifestDelta({
+      finalCatalogue: catalogue,
+      baselineObjects: [{
+        key: artifact.key, size: artifact.byte_size, content_sha256: artifact.sha256,
+      }],
+    }),
+  }), /contradicts unchanged scope row_count/);
+
+  const delta = deriveExactV3ManifestDelta({
+    finalCatalogue: catalogue,
+    baselineObjects: [{
+      key: artifact.key, size: artifact.byte_size, content_sha256: artifact.sha256,
+    }],
+  });
+  const fallback = resolveExactV3PlanningAuthority({
+    runState: { dropbox_currentness: { allowed: true, checkpoint: {
+      observations_timeseries_latest: {
+        key: latest.key,
+        byte_size: latest.byte_size,
+        sha256: "0".repeat(64),
+      },
+    } } },
+    store: { getObjectFromSourceIfExists: () => ({
+      key: latest.key,
+      body: Buffer.from(latest.body),
+      bytes: latest.byte_size,
+      content_sha256: latest.sha256,
+      source: "dropbox",
+    }) },
+    finalCatalogue: catalogue,
+    delta,
+  });
+  assert.equal(fallback.mode, "full_canonical_reconstruction_fallback");
+  assert.match(fallback.fallback_reason, /identity disagrees/);
 });

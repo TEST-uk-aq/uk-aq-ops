@@ -717,101 +717,15 @@ function rootIdentity(scope) {
   return `${scope.day_utc}\u0000${scope.connector_id}\u0000${scope.pollutant_code}`;
 }
 
-function canonicalIso(value, label) {
-  const text = String(value || "");
-  const parsed = new Date(text);
-  if (!text || Number.isNaN(parsed.getTime()) || parsed.toISOString() !== text) {
-    throw new TypeError(`${label} must be a canonical ISO timestamp`);
-  }
-  return text;
-}
-
-function normalizedRegistryRoot(raw, indexRoot, label) {
-  const scope = normalizeScope(raw);
-  const result = Object.freeze({
-    ...scope,
-    key: normalizeKey(raw?.key, `${label}.key`),
-    byte_size: integer(raw?.byte_size, `${label}.byte_size`),
-    sha256: exactSha256(raw?.sha256, `${label}.sha256`),
-    row_count: integer(raw?.row_count, `${label}.row_count`),
-    timeseries_count: integer(raw?.timeseries_count, `${label}.timeseries_count`),
-    child_shard_count: integer(raw?.child_shard_count, `${label}.child_shard_count`),
-    physical_leaf_count: integer(raw?.physical_leaf_count, `${label}.physical_leaf_count`),
-    physical_file_count: integer(raw?.physical_file_count, `${label}.physical_file_count`),
-    min_observed_at_utc: canonicalIso(
-      raw?.min_observed_at_utc,
-      `${label}.min_observed_at_utc`,
-    ),
-    max_observed_at_utc: canonicalIso(
-      raw?.max_observed_at_utc,
-      `${label}.max_observed_at_utc`,
-    ),
-  });
-  if (
-    result.key !== scopedManifestKey(indexRoot, scope) ||
-    result.child_shard_count !== result.timeseries_count ||
-    result.physical_leaf_count !== result.timeseries_count ||
-    result.min_observed_at_utc > result.max_observed_at_utc
-  ) {
-    throw new Error(`compact latest scoped root is contradictory: ${result.key}`);
-  }
-  return result;
-}
-
-export function validateObservationHistoryExactLeafIndexV3LatestRegistry({
-  artifact: raw,
-  indexRoot = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
-  latestKey = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
-}) {
-  const root = normalizePrefix(indexRoot, "indexRoot");
-  const key = normalizeKey(latestKey, "latestKey");
-  const value = artifactBodyIsExact(
-    raw,
+function rootsFromLatestArtifact(existingLatest) {
+  artifactBodyIsExact(
+    existingLatest,
     "observation_history_index_v3_latest_global",
     "latest_global",
   );
-  if (value.key !== key || !Array.isArray(value.payload?.day_summaries)) {
-    throw new Error(`compact latest registry key or day summaries are invalid: ${value.key}`);
-  }
-  const roots = [];
-  const scopeIds = new Set();
-  const rootKeys = new Set();
-  for (const [dayIndex, day] of value.payload.day_summaries.entries()) {
-    if (!Array.isArray(day?.scoped_roots) || day.scoped_roots.length === 0) {
-      throw new Error(`compact latest day summary is empty: ${dayIndex}`);
-    }
-    for (const [rootIndex, rawRoot] of day.scoped_roots.entries()) {
-      const registryRoot = normalizedRegistryRoot(
-        rawRoot,
-        root,
-        `day_summaries[${dayIndex}].scoped_roots[${rootIndex}]`,
-      );
-      const scopeId = rootIdentity(registryRoot);
-      if (scopeIds.has(scopeId) || rootKeys.has(registryRoot.key)) {
-        throw new Error(`compact latest has a duplicate scoped root: ${registryRoot.key}`);
-      }
-      scopeIds.add(scopeId);
-      rootKeys.add(registryRoot.key);
-      roots.push(registryRoot);
-    }
-  }
-  if (roots.length === 0) throw new Error("compact latest registry has no scoped roots");
-  const orderedRoots = [...roots].sort((left, right) =>
-    bytewiseCompare(left.day_utc, right.day_utc) ||
-    left.connector_id - right.connector_id ||
-    bytewiseCompare(left.pollutant_code, right.pollutant_code)
-  );
-  const expectedPayload = latestPayload(orderedRoots, root, key);
-  if (
-    encodeObservationHistoryIndexV3Json(value.payload) !==
-      encodeObservationHistoryIndexV3Json(expectedPayload)
-  ) {
-    throw new Error("compact latest registry ordering or aggregate fields are contradictory");
-  }
-  return Object.freeze({
-    artifact: latestArtifactFromRoots(orderedRoots, root, key),
-    roots: Object.freeze(orderedRoots),
-  });
+  return (Array.isArray(existingLatest.payload?.day_summaries)
+    ? existingLatest.payload.day_summaries
+    : []).flatMap((day) => Array.isArray(day?.scoped_roots) ? day.scoped_roots : []);
 }
 
 export function updateObservationHistoryExactLeafIndexV3Latest({
@@ -821,13 +735,8 @@ export function updateObservationHistoryExactLeafIndexV3Latest({
   indexRoot = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
   latestKey = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
 }) {
-  const validatedLatest = validateObservationHistoryExactLeafIndexV3LatestRegistry({
-    artifact: existingLatest,
-    indexRoot,
-    latestKey,
-  });
   const byScope = new Map(
-    validatedLatest.roots.map((root) => [rootIdentity(root), root]),
+    rootsFromLatestArtifact(existingLatest).map((root) => [rootIdentity(root), root]),
   );
   for (const scoped of replacementScopedManifests) {
     artifactBodyIsExact(

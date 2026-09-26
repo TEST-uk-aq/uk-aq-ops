@@ -194,7 +194,6 @@ export async function checkIntegrityDropboxCurrentness({
   }
   const checkpoint = validateHierarchicalStateRoot(checkpointRaw, normalizedStatePrefix, generation);
   requireCompleteCheckpoint(checkpoint, normalizedBindingBackupMode);
-  const latest = checkpoint.global_units.observations_timeseries_latest;
 
   const checkpointResult = {
     allowed: true,
@@ -208,11 +207,6 @@ export async function checkIntegrityDropboxCurrentness({
       sha256: sha256Hex(checkpointBody),
       observations_processed_source_root_hash:
         checkpoint.observations.processed_source_root_hash,
-      observations_timeseries_latest: {
-        key: latest.source_relative_path,
-        byte_size: latest.byte_size,
-        sha256: latest.processed_source_sha256,
-      },
     },
   };
   if (checkpointOnly) return checkpointResult;

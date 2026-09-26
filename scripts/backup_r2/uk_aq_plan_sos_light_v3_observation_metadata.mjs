@@ -10,9 +10,12 @@ import {
 import {
   buildObservationHistoryExactLeafIndexV3Latest,
   buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
+  updateObservationHistoryExactLeafIndexV3Latest,
+  validateObservationHistoryExactLeafIndexV3LatestRegistry,
 } from "../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   buildObservationHistoryIndexV3PublicationPlan,
+  OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONTRACT,
 } from "../../workers/shared/uk_aq_observation_history_index_v3.mjs";
 import {
   buildObservationHistoryV3SteadyStatePartition,
@@ -723,6 +726,235 @@ export function reconcileReconstructedExactV3Hierarchies({
   return { latest, changedHierarchies, unchangedRoots, removedScopes };
 }
 
+function scopeFromPollutantManifestKey(manifestKey) {
+  const match = String(manifestKey).match(POLLUTANT_MANIFEST);
+  if (!match) throw new Error(`Fixed-v3 pollutant manifest key is invalid: ${manifestKey}`);
+  return Object.freeze({
+    day_utc: match[1],
+    connector_id: Number(match[2]),
+    pollutant_code: match[3],
+  });
+}
+
+function removedScopeDescriptor(scope) {
+  return Object.freeze({
+    ...scope,
+    exact_prefix: `${GENERATION.observations_timeseries_index_prefix}/day_utc=${scope.day_utc}` +
+      `/connector_id=${scope.connector_id}/pollutant_code=${scope.pollutant_code}`,
+    aligned_prefix: `${GENERATION.observations_timeseries_index_prefix}/_aligned/day_utc=${scope.day_utc}` +
+      `/connector_id=${scope.connector_id}/pollutant_code=${scope.pollutant_code}`,
+  });
+}
+
+function canonicalIsoTimestamp(value, label) {
+  const text = String(value || "");
+  const parsed = new Date(text);
+  if (!text || Number.isNaN(parsed.getTime()) || parsed.toISOString() !== text) {
+    throw new Error(`${label} is not a canonical ISO timestamp`);
+  }
+  return text;
+}
+
+export function inspectExactV3PollutantManifestCatalogueEntry({
+  manifestKey,
+  manifestObject,
+}) {
+  const scope = scopeFromPollutantManifestKey(manifestKey);
+  const body = Buffer.from(manifestObject?.body || []);
+  const manifest = parseJsonBody(body, manifestKey);
+  validateCanonicalHistoryV2Manifest(manifest, {
+    manifest_kind: "pollutant",
+    domain: "observations",
+    day_utc: scope.day_utc,
+    connector_id: scope.connector_id,
+    pollutant_code: scope.pollutant_code,
+    manifest_key: manifestKey,
+  });
+  assertFixedV3ManifestPhysicalSchema(manifest, manifestKey);
+  const fileKeys = (manifest.files || []).map((file) => String(file?.key || ""));
+  const parquetKeys = (manifest.parquet_object_keys || []).map(String);
+  const timeseriesCounts = Object.entries(manifest.timeseries_row_counts || {});
+  const rowCount = Number(manifest.row_count);
+  const timeseriesCount = timeseriesCounts.length;
+  const minObservedAtUtc = canonicalIsoTimestamp(
+    manifest.min_observed_at_utc,
+    `${manifestKey}.min_observed_at_utc`,
+  );
+  const maxObservedAtUtc = canonicalIsoTimestamp(
+    manifest.max_observed_at_utc,
+    `${manifestKey}.max_observed_at_utc`,
+  );
+  if (
+    !Number.isSafeInteger(rowCount) || rowCount <= 0 ||
+    !Number.isSafeInteger(Number(manifest.file_count)) || Number(manifest.file_count) <= 0 ||
+    Number(manifest.file_count) !== fileKeys.length ||
+    fileKeys.length !== new Set(fileKeys).size ||
+    !sameJson(fileKeys, parquetKeys) ||
+    timeseriesCount <= 0 ||
+    timeseriesCounts.some(([timeseriesId, count]) =>
+      !Number.isSafeInteger(Number(timeseriesId)) || Number(timeseriesId) <= 0 ||
+      !Number.isSafeInteger(Number(count)) || Number(count) <= 0
+    ) ||
+    timeseriesCounts.reduce((sum, [, count]) => sum + Number(count), 0) !== rowCount ||
+    minObservedAtUtc > maxObservedAtUtc
+  ) {
+    throw new Error(`Fixed-v3 manifest catalogue summary is contradictory: ${manifestKey}`);
+  }
+  return Object.freeze({
+    key: manifestKey,
+    scope,
+    scope_id: scopeIdentity(scope),
+    manifest,
+    manifest_object: manifestObject,
+    identity: Object.freeze({
+      key: manifestKey,
+      byte_size: body.byteLength,
+      sha256: sha256Hex(body),
+    }),
+    summary: Object.freeze({
+      row_count: rowCount,
+      timeseries_count: timeseriesCount,
+      child_shard_count: timeseriesCount,
+      physical_leaf_count: timeseriesCount,
+      physical_file_count: fileKeys.length,
+      min_observed_at_utc: minObservedAtUtc,
+      max_observed_at_utc: maxObservedAtUtc,
+    }),
+  });
+}
+
+export function buildExactV3ManifestCatalogue({ manifestKeys, getObject }) {
+  const entries = [];
+  const byScope = new Map();
+  for (const manifestKey of [...manifestKeys].sort()) {
+    const manifestObject = getObject(manifestKey);
+    if (!manifestObject) {
+      throw new Error(`Fixed-v3 pollutant manifest is unavailable: ${manifestKey}`);
+    }
+    const entry = inspectExactV3PollutantManifestCatalogueEntry({
+      manifestKey,
+      manifestObject,
+    });
+    if (byScope.has(entry.scope_id)) {
+      throw new Error(`Fixed-v3 manifest catalogue has duplicate scope: ${manifestKey}`);
+    }
+    byScope.set(entry.scope_id, entry);
+    entries.push(entry);
+  }
+  if (entries.length === 0) throw new Error("Fixed-v3 manifest catalogue has no scopes");
+  return Object.freeze({ entries: Object.freeze(entries), by_scope: byScope });
+}
+
+export function deriveExactV3ManifestDelta({ finalCatalogue, baselineObjects }) {
+  const baselineByKey = new Map((baselineObjects || []).map((entry) => [entry.key, entry]));
+  const finalKeys = new Set(finalCatalogue.entries.map(({ key }) => key));
+  const affectedEntries = finalCatalogue.entries.filter((entry) => {
+    const baseline = baselineByKey.get(entry.key);
+    return !baseline || Number(baseline.size) !== entry.identity.byte_size ||
+      String(baseline.content_sha256 || "") !== entry.identity.sha256;
+  });
+  const removedScopes = [...baselineByKey.keys()]
+    .filter((key) => POLLUTANT_MANIFEST.test(key) && !finalKeys.has(key))
+    .sort()
+    .map((key) => removedScopeDescriptor(scopeFromPollutantManifestKey(key)));
+  return Object.freeze({
+    affected_entries: Object.freeze(affectedEntries),
+    affected_scope_ids: new Set(affectedEntries.map(({ scope_id }) => scope_id)),
+    new_scope_count: affectedEntries.filter(({ key }) => !baselineByKey.has(key)).length,
+    changed_scope_count: affectedEntries.filter(({ key }) => baselineByKey.has(key)).length,
+    removed_scopes: Object.freeze(removedScopes),
+    removed_scope_ids: new Set(removedScopes.map((scope) => scopeIdentity(scope))),
+  });
+}
+
+export function crossCheckExactV3RegistryCatalogue({ registryRoots, finalCatalogue, delta }) {
+  const registryByScope = new Map();
+  for (const root of registryRoots) {
+    const identity = scopeIdentity(root);
+    if (registryByScope.has(identity)) {
+      throw new Error(`Compact latest registry has duplicate scope: ${root.key}`);
+    }
+    registryByScope.set(identity, root);
+  }
+  for (const entry of finalCatalogue.entries) {
+    const root = registryByScope.get(entry.scope_id);
+    if (!root) {
+      if (!delta.affected_scope_ids.has(entry.scope_id)) {
+        throw new Error(`Compact latest registry is missing unchanged scope: ${entry.key}`);
+      }
+      continue;
+    }
+    if (delta.affected_scope_ids.has(entry.scope_id)) continue;
+    for (const [field, expected] of Object.entries(entry.summary)) {
+      if (root[field] !== expected) {
+        throw new Error(`Compact latest registry contradicts unchanged scope ${field}: ${root.key}`);
+      }
+    }
+  }
+  for (const root of registryRoots) {
+    const identity = scopeIdentity(root);
+    if (!finalCatalogue.by_scope.has(identity) && !delta.removed_scope_ids.has(identity)) {
+      throw new Error(`Compact latest registry has an unexplained extra scope: ${root.key}`);
+    }
+  }
+  return true;
+}
+
+export function authenticateExactV3CompactLatest({ runState, store }) {
+  const checkpoint = runState?.dropbox_currentness?.checkpoint;
+  const expected = checkpoint?.observations_timeseries_latest;
+  if (runState?.dropbox_currentness?.allowed !== true || !expected) {
+    throw new Error("Accepted checkpoint has no authenticated compact latest identity");
+  }
+  const key = GENERATION.observations_timeseries_latest_key;
+  if (expected.key !== key) {
+    throw new Error(`Checkpoint compact latest key disagrees: ${expected.key || "unset"}`);
+  }
+  const object = store.getObjectFromSourceIfExists(key, "dropbox");
+  if (!object) throw new Error("Checkpoint compact latest body is unavailable from Dropbox");
+  const actual = exactIdentity(object, "dropbox");
+  if (actual.bytes !== Number(expected.byte_size) || actual.sha256 !== expected.sha256) {
+    throw new Error("Checkpoint compact latest body identity disagrees");
+  }
+  return validateObservationHistoryExactLeafIndexV3LatestRegistry({
+    artifact: artifactFromStoredObject(
+      object,
+      "observation_history_index_v3_latest_global",
+      "latest_global",
+    ),
+    indexRoot: GENERATION.observations_timeseries_index_prefix,
+    latestKey: key,
+  });
+}
+
+export function resolveExactV3PlanningAuthority({
+  runState,
+  store,
+  finalCatalogue,
+  delta,
+}) {
+  let compactLatest = null;
+  try {
+    compactLatest = authenticateExactV3CompactLatest({ runState, store });
+    crossCheckExactV3RegistryCatalogue({
+      registryRoots: compactLatest.roots,
+      finalCatalogue,
+      delta,
+    });
+    return Object.freeze({
+      mode: "exact_index_fast_path",
+      compact_latest: compactLatest,
+      fallback_reason: null,
+    });
+  } catch (error) {
+    return Object.freeze({
+      mode: "full_canonical_reconstruction_fallback",
+      compact_latest: compactLatest,
+      fallback_reason: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 export function resolveExactV3LocalReferences({
   artifacts,
   changedKeys,
@@ -803,6 +1035,7 @@ export function buildExactV3ProposalDependencyFields({
   runState,
   store,
   resolvedLocalReferences,
+  registryRootKeys = new Set(),
 }) {
   const currentIdentities = new Map();
   const currentIdentityFor = (key) => {
@@ -853,7 +1086,9 @@ export function buildExactV3ProposalDependencyFields({
         throw new Error(`Fixed-v3 pinned canonical baseline identity is unavailable: ${key}`);
       }
       return [key, {
-        source: "pinned_dropbox_canonical_baseline",
+        source: registryRootKeys.has(key)
+          ? "pinned_checkpoint_compact_latest_registry"
+          : "pinned_dropbox_canonical_baseline",
         sha256: reference.sha256,
         bytes: reference.byte_size,
       }];
@@ -880,8 +1115,98 @@ export function assertFixedV3Proposal(output) {
       || JSON.stringify(Object.keys(identities).sort()) !== JSON.stringify([...dependencies].sort())) {
       throw new Error(`Fixed-v3 dependency identities are not exact: ${key}`);
     }
+    const pinned = proposal?.pinned_baseline_references || {};
+    if (typeof pinned !== "object" || Array.isArray(pinned)) {
+      throw new Error(`Fixed-v3 pinned baseline references are invalid: ${key}`);
+    }
+    for (const [referenceKey, identity] of Object.entries(pinned)) {
+      assertAllowedKey(referenceKey);
+      if (
+        dependencies.includes(referenceKey) ||
+        !["pinned_dropbox_canonical_baseline",
+          "pinned_checkpoint_compact_latest_registry"].includes(identity?.source) ||
+        !/^[a-f0-9]{64}$/.test(String(identity?.sha256 || "")) ||
+        !Number.isSafeInteger(Number(identity?.bytes)) || Number(identity?.bytes) <= 0
+      ) {
+        throw new Error(`Fixed-v3 pinned baseline reference identity is invalid: ${referenceKey}`);
+      }
+    }
   }
   return output;
+}
+
+async function buildExactV3HierarchyForCatalogueEntry({
+  entry,
+  proposalsByKey,
+  runState,
+  store,
+  combinedObject,
+  targetWriterGitSha,
+}) {
+  const { key: manifestKey, scope } = entry;
+  const currentRunManifest = proposalsByKey.has(manifestKey) ||
+    (runState.objects?.[manifestKey]?.proposed === true &&
+      entry.manifest_object.source === "overlay");
+  let targetMetadata;
+  let canonicalManifest;
+  if (currentRunManifest) {
+    const manifest = entry.manifest;
+    const writerGitSha = assertCurrentRunManifestWriterGitSha(
+      manifest,
+      targetWriterGitSha,
+      manifestKey,
+    );
+    const rows = [];
+    for (const parquetKey of (manifest.parquet_object_keys || []).map(String)) {
+      assertObservationHistoryGenerationKey(GENERATION, parquetKey, "observations");
+      const parquet = combinedObject(parquetKey);
+      if (!parquet) throw new Error(`Fixed-v3 canonical Parquet is unavailable: ${parquetKey}`);
+      rows.push(...await readCanonicalObservationRows({
+        body: parquet.body,
+        connectorId: scope.connector_id,
+      }));
+    }
+    const built = buildObservationHistoryV3SteadyStatePartition({
+      source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
+      rows,
+      scope,
+      targetWriterGitSha: writerGitSha,
+      backedUpAtUtc: manifest.backed_up_at_utc ?? null,
+      observationsPrefix: GENERATION.observations_prefix,
+      indexRoot: GENERATION.observations_timeseries_index_prefix,
+    });
+    assertCurrentRunParquetIdentities(built.file_intents, combinedObject);
+    assertFixedV3ManifestMetadata(manifest, built.target_metadata, manifestKey);
+    targetMetadata = built.target_metadata;
+    canonicalManifest = {
+      key: manifestKey,
+      byte_size: entry.identity.byte_size,
+      sha256: entry.identity.sha256,
+      manifest_hash: String(manifest.manifest_hash),
+      row_count: Number(manifest.row_count),
+      observation_content_hash: String(manifest.observation_content_hash),
+    };
+  } else {
+    const manifestObject = store.getObjectFromSourceIfExists(manifestKey, "dropbox");
+    if (!manifestObject) {
+      throw new Error(`Fixed-v3 pinned pollutant manifest is unavailable: ${manifestKey}`);
+    }
+    const manifest = parseJsonBody(manifestObject.body, manifestKey);
+    const inspected = await inspectPinnedBaselinePollutantPartition({
+      manifest,
+      manifestKey,
+      manifestObject,
+      scope,
+      getPinnedObject: (key) => store.getObjectFromSourceIfExists(key, "dropbox"),
+    });
+    targetMetadata = inspected.target_metadata;
+    canonicalManifest = inspected.canonical_manifest;
+  }
+  return buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+    metadata: targetMetadata,
+    canonicalManifest,
+    indexRoot: GENERATION.observations_timeseries_index_prefix,
+  });
 }
 
 async function addExactV3Indexes({
@@ -931,123 +1256,164 @@ async function addExactV3Indexes({
     : store.getObjectIfExists(key);
   const manifestKeys = new Set(store.listAllObjects({
     prefix: `${GENERATION.observations_prefix}/day_utc=`,
-  }).map(({ key }) => key).filter((key) => POLLUTANT_MANIFEST.test(key)));
+    keyFilter: (key) => POLLUTANT_MANIFEST.test(key),
+  }).map(({ key }) => key));
   for (const key of proposalsByKey.keys()) if (POLLUTANT_MANIFEST.test(key)) manifestKeys.add(key);
-  const sortedManifestKeys = [...manifestKeys].sort();
   reportProgress({
-    phase: "canonical_scoped_hierarchy_scan_identified",
+    phase: "canonical_scope_catalogue_started",
     completed_objects: 0,
-    total_objects: sortedManifestKeys.length,
+    total_objects: manifestKeys.size,
   });
+  const finalCatalogue = buildExactV3ManifestCatalogue({
+    manifestKeys,
+    getObject: combinedObject,
+  });
+  reportProgress({
+    phase: "canonical_scope_catalogue_complete",
+    completed_objects: finalCatalogue.entries.length,
+    total_objects: finalCatalogue.entries.length,
+  });
+  const baselineManifestObjects = store.listObjectsFromSource({
+    prefix: `${GENERATION.observations_prefix}/day_utc=`,
+    source: "dropbox",
+    keyFilter: (key) => POLLUTANT_MANIFEST.test(key),
+  });
+  const manifestDelta = deriveExactV3ManifestDelta({
+    finalCatalogue,
+    baselineObjects: baselineManifestObjects,
+  });
+  reportProgress({
+    phase: "affected_exact_v3_scopes_identified",
+    completed_objects: 0,
+    total_objects: manifestDelta.affected_entries.length,
+    canonical_scope_count: finalCatalogue.entries.length,
+    affected_scope_count: manifestDelta.affected_entries.length,
+    removed_scope_count: manifestDelta.removed_scopes.length,
+    new_scope_count: manifestDelta.new_scope_count,
+    changed_scope_count: manifestDelta.changed_scope_count,
+  });
+  reportProgress({
+    phase: "compact_latest_registry_validation_started",
+    completed_objects: 0,
+    total_objects: 1,
+  });
+  const authority = resolveExactV3PlanningAuthority({
+    runState,
+    store,
+    finalCatalogue,
+    delta: manifestDelta,
+  });
+  const compactLatest = authority.compact_latest;
+  const optimizationMode = authority.mode;
+  const fallbackReason = authority.fallback_reason;
+  if (optimizationMode === "full_canonical_reconstruction_fallback") {
+    reportProgress({
+      phase: "exact_v3_fast_path_abandoned",
+      failures: 0,
+      fallback_reason: fallbackReason,
+      canonical_scope_count: finalCatalogue.entries.length,
+    });
+  } else {
+    reportProgress({
+      phase: "compact_latest_registry_validation_complete",
+      completed_objects: 1,
+      total_objects: 1,
+      retained_root_count: compactLatest.roots.length,
+    });
+  }
 
+  const rebuildEntries = optimizationMode === "exact_index_fast_path"
+    ? manifestDelta.affected_entries
+    : finalCatalogue.entries;
   const hierarchies = [];
   let completedManifestCount = 0;
   let lastManifestProgressAt = Date.now();
-  for (const manifestKey of sortedManifestKeys) {
-    const match = manifestKey.match(POLLUTANT_MANIFEST);
-    let manifestObject = combinedObject(manifestKey);
-    if (!manifestObject) throw new Error(`Fixed-v3 pollutant manifest is unavailable: ${manifestKey}`);
-    let manifest = JSON.parse(Buffer.from(manifestObject.body).toString("utf8"));
-    const currentRunManifest = proposalsByKey.has(manifestKey) ||
-      (runState.objects?.[manifestKey]?.proposed === true && manifestObject.source === "overlay");
-    const scope = {
-      day_utc: match[1],
-      connector_id: Number(match[2]),
-      pollutant_code: match[3],
-    };
-    let targetMetadata;
-    let canonicalManifest;
-    if (currentRunManifest) {
-      validateCanonicalHistoryV2Manifest(manifest, {
-        manifest_kind: "pollutant",
-        domain: "observations",
-        day_utc: scope.day_utc,
-        connector_id: scope.connector_id,
-        pollutant_code: scope.pollutant_code,
-        manifest_key: manifestKey,
-      });
-      assertFixedV3ManifestPhysicalSchema(manifest, manifestKey);
-      const writerGitSha = assertCurrentRunManifestWriterGitSha(
-        manifest,
-        targetWriterGitSha,
-        manifestKey,
-      );
-      const rows = [];
-      for (const parquetKey of (manifest.parquet_object_keys || []).map(String)) {
-        assertObservationHistoryGenerationKey(GENERATION, parquetKey, "observations");
-        const parquet = combinedObject(parquetKey);
-        if (!parquet) throw new Error(`Fixed-v3 canonical Parquet is unavailable: ${parquetKey}`);
-        rows.push(...await readCanonicalObservationRows({
-          body: parquet.body,
-          connectorId: scope.connector_id,
-        }));
-      }
-      const built = buildObservationHistoryV3SteadyStatePartition({
-        source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement,
-        rows,
-        scope,
-        targetWriterGitSha: writerGitSha,
-        backedUpAtUtc: manifest.backed_up_at_utc ?? null,
-        observationsPrefix: GENERATION.observations_prefix,
-        indexRoot: GENERATION.observations_timeseries_index_prefix,
-      });
-      assertCurrentRunParquetIdentities(built.file_intents, combinedObject);
-      assertFixedV3ManifestMetadata(manifest, built.target_metadata, manifestKey);
-      targetMetadata = built.target_metadata;
-      const manifestBody = Buffer.from(manifestObject.body);
-      canonicalManifest = {
-        key: manifestKey,
-        byte_size: manifestBody.byteLength,
-        sha256: sha256Hex(manifestBody),
-        manifest_hash: String(manifest.manifest_hash),
-        row_count: Number(manifest.row_count),
-        observation_content_hash: String(manifest.observation_content_hash),
-      };
-    } else {
-      manifestObject = store.getObjectFromSourceIfExists(manifestKey, "dropbox");
-      if (!manifestObject) {
-        throw new Error(`Fixed-v3 pinned pollutant manifest is unavailable: ${manifestKey}`);
-      }
-      manifest = JSON.parse(Buffer.from(manifestObject.body).toString("utf8"));
-      const inspected = await inspectPinnedBaselinePollutantPartition({
-        manifest,
-        manifestKey,
-        manifestObject,
-        scope,
-        getPinnedObject: (key) => store.getObjectFromSourceIfExists(key, "dropbox"),
-      });
-      targetMetadata = inspected.target_metadata;
-      canonicalManifest = inspected.canonical_manifest;
-    }
-    hierarchies.push(buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
-      metadata: targetMetadata,
-      canonicalManifest,
-      indexRoot: GENERATION.observations_timeseries_index_prefix,
+  for (const entry of rebuildEntries) {
+    hierarchies.push(await buildExactV3HierarchyForCatalogueEntry({
+      entry,
+      proposalsByKey,
+      runState,
+      store,
+      combinedObject,
+      targetWriterGitSha,
     }));
     completedManifestCount += 1;
     const now = Date.now();
-    if (completedManifestCount === sortedManifestKeys.length
-        || completedManifestCount % 25 === 0
-        || now - lastManifestProgressAt >= 15_000) {
+    if (completedManifestCount === rebuildEntries.length || completedManifestCount % 25 === 0 ||
+        now - lastManifestProgressAt >= 15_000) {
       reportProgress({
-        phase: "canonical_scoped_hierarchy_scan_progress",
+        phase: optimizationMode === "exact_index_fast_path"
+          ? "affected_scoped_hierarchy_rebuild_progress"
+          : "fallback_canonical_scoped_hierarchy_scan_progress",
         completed_objects: completedManifestCount,
-        total_objects: sortedManifestKeys.length,
-        current_key: manifestKey,
+        total_objects: rebuildEntries.length,
+        current_key: entry.key,
       });
       lastManifestProgressAt = now;
     }
   }
-  if (!hierarchies.length) throw new Error("Fixed-v3 metadata proposal has no exact-leaf scopes");
-  const existingLatestObject = store.getObjectIfExists(GENERATION.observations_timeseries_latest_key);
-  if (!existingLatestObject) throw new Error("Pinned v3 exact-leaf latest baseline is unavailable");
-  const existingLatest = artifactFromStoredObject(
-    existingLatestObject, "observation_history_index_v3_latest_global", "latest_global",
-  );
-  const rebuilt = reconcileReconstructedExactV3Hierarchies({
-    existingLatest,
-    hierarchies,
+  reportProgress({
+    phase: optimizationMode === "exact_index_fast_path"
+      ? "affected_scope_reconstruction_complete"
+      : "fallback_canonical_scoped_hierarchy_scan_complete",
+    completed_objects: hierarchies.length,
+    total_objects: rebuildEntries.length,
   });
+
+  let rebuilt;
+  let latestNeedsPublication;
+  if (optimizationMode === "exact_index_fast_path") {
+    const oldByScope = new Map(compactLatest.roots.map((root) => [scopeIdentity(root), root]));
+    const changedHierarchies = hierarchies.filter((hierarchy) => {
+      const descriptor = rootDescriptor(hierarchy.scoped_manifest);
+      return !sameRootIdentity(oldByScope.get(scopeIdentity(descriptor)), descriptor);
+    });
+    const replacementScopedManifests = changedHierarchies
+      .map((hierarchy) => hierarchy.scoped_manifest);
+    const latest = updateObservationHistoryExactLeafIndexV3Latest({
+      existingLatest: compactLatest.artifact,
+      replacementScopedManifests,
+      removedScopes: manifestDelta.removed_scopes,
+      indexRoot: GENERATION.observations_timeseries_index_prefix,
+      latestKey: GENERATION.observations_timeseries_latest_key,
+    });
+    const changedScopeIds = new Set(changedHierarchies
+      .map((hierarchy) => scopeIdentity(hierarchy.scoped_manifest.payload)));
+    const unchangedRoots = compactLatest.roots.filter((root) =>
+      !changedScopeIds.has(scopeIdentity(root)) &&
+      !manifestDelta.removed_scope_ids.has(scopeIdentity(root))
+    );
+    latestNeedsPublication = latest.sha256 !== compactLatest.artifact.sha256;
+    rebuilt = {
+      latest,
+      changedHierarchies,
+      unchangedRoots,
+      removedScopes: manifestDelta.removed_scopes,
+    };
+  } else {
+    if (hierarchies.length === 0) {
+      throw new Error("Fixed-v3 fallback reconstruction has no exact-leaf scopes");
+    }
+    if (compactLatest) {
+      rebuilt = reconcileReconstructedExactV3Hierarchies({
+        existingLatest: compactLatest.artifact,
+        hierarchies,
+      });
+      latestNeedsPublication = rebuilt.latest.sha256 !== compactLatest.artifact.sha256;
+    } else {
+      rebuilt = {
+        latest: buildObservationHistoryExactLeafIndexV3Latest({
+          scopedHierarchies: hierarchies,
+          indexRoot: GENERATION.observations_timeseries_index_prefix,
+          latestKey: GENERATION.observations_timeseries_latest_key,
+        }),
+        changedHierarchies: hierarchies,
+        unchangedRoots: [],
+        removedScopes: manifestDelta.removed_scopes,
+      };
+      latestNeedsPublication = true;
+    }
+  }
   const exactObjects = rebuilt.changedHierarchies
     .flatMap((hierarchy) => hierarchy.publication_objects);
   const canonicalFinalizationPrerequisites = proposals
@@ -1073,9 +1439,11 @@ async function addExactV3Indexes({
     ...rebuilt.latest,
     publication_prerequisites: canonicalFinalizationPrerequisites,
   };
-  exactObjects.push(latest);
+  if (latestNeedsPublication) exactObjects.push(latest);
   reportProgress({
-    phase: "exact_v3_latest_scoped_index_reconstruction_complete",
+    phase: optimizationMode === "exact_index_fast_path"
+      ? "exact_v3_incremental_latest_complete"
+      : "exact_v3_full_latest_reconstruction_complete",
     completed_objects: exactObjects.length,
     total_objects: exactObjects.length,
     changed_scopes: rebuilt.changedHierarchies.length,
@@ -1083,14 +1451,8 @@ async function addExactV3Indexes({
     removed_scopes: rebuilt.removedScopes.length,
   });
   const exactByKey = new Map(exactObjects.map((artifact) => [artifact.key, artifact]));
-  const changedExactObjects = exactObjects.filter((artifact) => {
-    const existing = store.getObjectIfExists(artifact.key);
-    return !existing || exactIdentity(existing, existing.source).sha256 !== artifact.sha256;
-  });
+  const changedExactObjects = exactObjects;
   const changedExactKeys = new Set(changedExactObjects.map(({ key }) => key));
-  if (!changedExactObjects.length) {
-    throw new Error("Fixed-v3 metadata proposal unexpectedly produced no changed exact-v3 indexes");
-  }
   const localReferenceKeys = new Set(changedExactObjects.flatMap((artifact) => [
     ...(artifact.dependencies || []),
     ...(artifact.publication_prerequisites || []),
@@ -1115,12 +1477,19 @@ async function addExactV3Indexes({
     total_objects: localReferenceKeys.size,
     resolved_references: resolvedLocalReferences.size,
   });
-  const publicationPlan = buildObservationHistoryIndexV3PublicationPlan({
-    objects: changedExactObjects,
-    // These resolve either to frozen canonical writes or exact identities read
-    // from the pinned local Dropbox baseline, never retained live-R2 objects.
-    externalReferences: [...resolvedLocalReferences.values()],
-  });
+  const publicationPlan = changedExactObjects.length > 0
+    ? buildObservationHistoryIndexV3PublicationPlan({
+      objects: changedExactObjects,
+      // These resolve either to frozen canonical writes, checkpoint-authenticated
+      // compact-latest roots, or exact identities read from pinned Dropbox.
+      externalReferences: [...resolvedLocalReferences.values()],
+    })
+    : {
+      contract_version: OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONTRACT,
+      schedule_sha256: null,
+      entries: [],
+    };
+  const registryRootKeys = new Set(rebuilt.unchangedRoots.map(({ key }) => key));
   for (const entry of publicationPlan.entries) {
     const dependencyFields = buildExactV3ProposalDependencyFields({
       entry,
@@ -1131,6 +1500,7 @@ async function addExactV3Indexes({
       runState,
       store,
       resolvedLocalReferences,
+      registryRootKeys,
     });
     const existing = store.getObjectIfExists(entry.key);
     proposals.push({
@@ -1154,8 +1524,23 @@ async function addExactV3Indexes({
     contract_version: publicationPlan.contract_version,
     schedule_sha256: publicationPlan.schedule_sha256,
     object_count: publicationPlan.entries.length,
+    status: publicationPlan.entries.length === 0 ? "noop" : "planned",
   };
   output.planning.removed_exact_v3_scopes = rebuilt.removedScopes;
+  output.planning.v3_exact_leaf_optimization = {
+    mode: optimizationMode,
+    fallback_reason: fallbackReason,
+    canonical_scope_count: finalCatalogue.entries.length,
+    affected_scope_count: manifestDelta.affected_entries.length,
+    rebuilt_scope_count: rebuildEntries.length,
+    changed_root_count: rebuilt.changedHierarchies.length,
+    unchanged_registry_root_count: rebuilt.unchangedRoots.length,
+    byte_identical_rebuilt_scope_count:
+      Math.max(0, hierarchies.length - rebuilt.changedHierarchies.length),
+    new_scope_count: manifestDelta.new_scope_count,
+    changed_canonical_scope_count: manifestDelta.changed_scope_count,
+    removed_scope_count: rebuilt.removedScopes.length,
+  };
   reportProgress({
     phase: "exact_v3_planning_complete",
     completed_objects: publicationPlan.entries.length,

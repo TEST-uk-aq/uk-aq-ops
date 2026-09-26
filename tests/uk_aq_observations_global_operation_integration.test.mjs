@@ -231,6 +231,11 @@ test("Integrity currentness gate runs under the global lock and blocks a stale c
     current.checkpoint.observations_processed_source_root_hash,
     current.live_observations_root.content_hash,
   );
+  assert.deepEqual(current.checkpoint.observations_timeseries_latest, {
+    key: "history/_index_v2/observations_timeseries_latest.json",
+    byte_size: 123,
+    sha256: h("a"),
+  });
 
   fs.writeFileSync(checkpointPath, JSON.stringify(completeCheckpoint(h("9"))));
   await assert.rejects(

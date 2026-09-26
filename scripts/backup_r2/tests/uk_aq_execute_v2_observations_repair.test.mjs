@@ -148,6 +148,46 @@ test("combined local store classifies current-run objects independently of their
   }
 });
 
+test("combined local store filters manifest listings before reading object bodies", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-manifest-only-listing-"));
+  try {
+    const overlayRoot = path.join(root, "overlay");
+    const dropboxRoot = path.join(root, "dropbox");
+    const prefix = "history/v3/observations/day_utc=2026-07-30/connector_id=1/pollutant_code=no2";
+    const manifestKey = `${prefix}/manifest.json`;
+    const parquetKey = `${prefix}/part-00000.parquet`;
+    for (const [key, body] of [[manifestKey, "{}"], [parquetKey, "historical-parquet"]]) {
+      const filePath = path.join(dropboxRoot, ...key.split("/"));
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, body);
+    }
+    const runStatePath = path.join(root, "run-state.json");
+    fs.mkdirSync(overlayRoot, { recursive: true });
+    fs.writeFileSync(runStatePath, JSON.stringify({
+      objects: {}, tombstones: {}, tombstone_prefixes: [],
+    }));
+    const store = createCombinedLocalStore({
+      overlayRoot,
+      dropboxRoot,
+      runStateJson: runStatePath,
+      prefixes: [prefix],
+    });
+    fs.unlinkSync(path.join(dropboxRoot, ...parquetKey.split("/")));
+    const keyFilter = (key) => key.endsWith("/manifest.json");
+    assert.deepEqual(
+      store.listAllObjects({ prefix, keyFilter }).map(({ key }) => key),
+      [manifestKey],
+    );
+    assert.deepEqual(
+      store.listObjectsFromSource({ prefix, source: "dropbox", keyFilter })
+        .map(({ key }) => key),
+      [manifestKey],
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("final planner validation rejects staged overlay provenance before Python", () => {
   const childKey = "history/v2/observations/day_utc=2026-07-30/connector_id=1/pollutant_code=no2/part-00000.parquet";
   const parentKey = childKey.replace("part-00000.parquet", "manifest.json");

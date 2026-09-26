@@ -473,6 +473,7 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
     const candidate = `${dropboxRoot}/${key}`;
     if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) dropboxPaths.set(key, candidate);
   }
+  const pinnedDropboxPaths = new Map(dropboxPaths);
   for (const key of [...dropboxPaths.keys()]) {
     if (isProposedAbsent(key)) dropboxPaths.delete(key);
   }
@@ -545,10 +546,38 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
         throw error;
       }
     },
-    listAllObjects({ prefix }) {
+    listObjectsFromSource({ prefix, source, keyFilter = null }) {
+      const paths = source === "overlay" ? overlayPaths
+        : source === "dropbox" ? pinnedDropboxPaths : null;
+      if (!paths) throw new Error(`Unsupported local object source: ${source}`);
+      return [...paths.keys()]
+        .filter((key) => key.startsWith(prefix) &&
+          (typeof keyFilter !== "function" || keyFilter(key)))
+        .map((key) => {
+          const localPath = paths.get(key);
+          const body = fs.readFileSync(localPath);
+          const object = objectFromBody({
+            key,
+            body,
+            source,
+            content_sha256: sha256Hex(body),
+          });
+          return {
+            key,
+            size: object?.bytes ?? null,
+            source: object?.source ?? null,
+            content_sha256: object?.content_sha256 ?? null,
+            r2_etag: object?.r2_etag ?? null,
+          };
+        })
+        .sort((left, right) => left.key.localeCompare(right.key));
+    },
+    listAllObjects({ prefix, keyFilter = null }) {
       const keys = new Set([...dropboxPaths.keys(), ...overlayPaths.keys()]);
       return [...keys]
-        .filter((key) => key.startsWith(prefix) && (!isProposedAbsent(key) || overlayPaths.has(key)))
+        .filter((key) => key.startsWith(prefix) &&
+          (!isProposedAbsent(key) || overlayPaths.has(key)) &&
+          (typeof keyFilter !== "function" || keyFilter(key)))
         .map((key) => {
           const object = objectFor(key);
           return { key, size: object?.bytes ?? null, source: object?.source ?? null, content_sha256: object?.content_sha256 ?? null, r2_etag: object?.r2_etag ?? null };
