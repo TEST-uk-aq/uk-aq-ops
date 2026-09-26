@@ -132,6 +132,60 @@ For SOS-light:
 - unchanged Dropbox-backed dependencies MUST NOT be relabelled as current-run staged objects;
 - this provenance rule MUST NOT introduce pre-deletion live R2 reads.
 
+For the fixed-v3 compact-latest fast path defined by the narrower SOS-light authority contract, retained unchanged scoped-root descriptors MAY be sourced from the checkpoint-authenticated compact latest registry after strict canonical-scope cross-checking.
+
+That registry evidence MUST remain distinguishable in planning/audit provenance from both:
+
+- a canonical Dropbox object body that is actually present and identity-verified locally; and
+- a current-run `planned_overlay` object.
+
+A registry descriptor MUST NOT be relabelled as a locally present scoped-root body. It may establish the retained identity used by an incrementally rebuilt global latest only for an unaffected scope that the canonical Dropbox-plus-overlay catalogue independently proves still exists.
+
+Changed/new affected scoped roots remain `planned_overlay`. Removed scopes require explicit removal evidence. A malformed, contradictory or incomplete registry cannot be repaired by consulting live R2; the planner must fall back to complete canonical reconstruction or fail before mutation.
+
+## Proposal body storage and inter-process transport
+
+Proposal provenance is independent of how the proposal record is transported between planner and coordinator.
+
+A changed object remains:
+
+```text
+source = planned_overlay
+sha256 = proposed changed body SHA-256
+bytes = proposed changed body byte length
+```
+
+whether the exact proposed body is held inline in a small proposal record or referenced from the run-local overlay/staging area.
+
+For large plans, proposal records SHOULD NOT duplicate changed object bodies inline when those exact bytes already exist in the authenticated run-local overlay. Instead, a changed proposal MAY carry a bounded body reference such as:
+
+```text
+object_key
+body_ref / local_path
+sha256
+bytes
+source = planned_overlay
+```
+
+The referenced body MUST be inside the current run's controlled staging/overlay boundary. Before final proposal acceptance, the referenced file/body MUST exist and its actual byte length and SHA-256 MUST match the proposal identity.
+
+Once the final proposal is frozen:
+
+- the body reference is immutable for that run;
+- APPLY reads the exact staged bytes identified by the frozen proposal;
+- APPLY MUST NOT regenerate the body from logical fields or dependency metadata;
+- post-PUT verification continues to compare R2 with the frozen intended identity.
+
+The planner/coordinator boundary MUST NOT depend on a single monolithic JSON serialisation containing all `proposed_body` payloads. Large proposals MUST use a file-backed or otherwise bounded representation. A compact control-plane response MAY point to a run-local proposal artifact, but that artifact MUST be authenticated by path/reference plus integrity identity before the coordinator trusts it.
+
+A proposal artifact SHOULD avoid duplicating staged object bytes. It may contain the proposal graph, identities, dependency provenance and body references while the exact payload bytes remain in the run-local overlay.
+
+This representation change MUST NOT weaken the existing distinction between:
+
+- changed current-run bodies owned by the repair and resolved as `planned_overlay`;
+- unchanged pinned Dropbox baseline bodies;
+- retained compact-registry descriptors allowed by the fixed-v3 fast path.
+
 ## Mutation and publication
 
 The final mutation plan MUST contain only changed objects and explicit permitted deletions.
@@ -150,6 +204,9 @@ The validator MUST remain fail-closed. Do not weaken validation to accept contra
 
 Run state and reports MUST distinguish at least:
 
+- proposal transport mode / representation;
+- authenticated proposal artifact path/reference, SHA-256 and byte length when file-backed;
+- staged changed-body count and total staged changed-body bytes where practical;
 - changed proposal count;
 - skipped-unchanged proposal count;
 - changed dependency count;
@@ -173,12 +230,14 @@ included_in_write_set
 
 Before operational CIC-Test execution, use only the smallest targeted checks needed to prove:
 
-1. a latest index can depend on one changed child index and one unchanged child index;
-2. the changed child resolves as `planned_overlay` and is present in the write set;
-3. the unchanged child resolves as `dropbox`, retains its pinned baseline SHA-256 and bytes, and is absent from the write set;
-4. an unchanged proposal record does not shadow the Dropbox object in exact lookup or listings;
-5. the final proposal validator accepts the correct mixed provenance graph;
-6. the final proposal validator rejects an unchanged, unstaged dependency labelled `planned_overlay`;
-7. deterministic put-if-changed behaviour is retained without writing byte-identical child indexes.
+1. a file-backed changed proposal body resolves to the exact staged bytes and fails on SHA-256 or byte-length mismatch;
+2. the planner/coordinator hand-off can represent a multi-object proposal without requiring all changed bodies to be embedded in one stdout JSON payload;
+3. a latest index can depend on one changed child index and one unchanged child index;
+4. the changed child resolves as `planned_overlay` and is present in the write set;
+5. the unchanged child resolves as `dropbox`, retains its pinned baseline SHA-256 and bytes, and is absent from the write set;
+6. an unchanged proposal record does not shadow the Dropbox object in exact lookup or listings;
+7. the final proposal validator accepts the correct mixed provenance graph;
+8. the final proposal validator rejects an unchanged, unstaged dependency labelled `planned_overlay`;
+9. deterministic put-if-changed behaviour is retained without writing byte-identical child indexes.
 
 Do not add a broad speculative test suite. Functional validation belongs in the real CIC-Test operation.
