@@ -2,11 +2,9 @@ import { errorEnvelope } from '../lib/http';
 import type { WorkerEnv } from '../lib/upstream';
 
 const MAX_BODY_BYTES = 16 * 1024;
-const MAX_LOCAL_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024;
 const BROWSER_IMAGE_CACHE_CONTROL = 'private, max-age=604800, immutable';
 const EDGE_IMAGE_CACHE_CONTROL = 'public, max-age=2592000';
 const ARTICLE_IMAGE_PATH = /^\/api\/media\/articles\/[1-9]\d*\/image$/;
-const ARTICLE_LOCAL_IMAGE_PATH = /^\/api\/media\/articles\/[1-9]\d*\/local-image$/;
 const IMAGE_CACHE_HEADER = 'X-UK-AQ-Media-Image-Cache';
 
 export type MediaExecutionContext = {
@@ -25,7 +23,6 @@ const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/articles\/bulk-publish$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/image$/, methods: new Set(['GET']) },
-  { pattern: ARTICLE_LOCAL_IMAGE_PATH, methods: new Set(['PUT', 'DELETE']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/publish$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/(approve|reject|hide|unhide)$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/author$/, methods: new Set(['PUT']) },
@@ -114,21 +111,15 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv,
   const target = upstreamUrl.toString();
   const headers = new Headers({ Authorization: `Bearer ${token}`, Accept: request.headers.get('Accept') || '*/*' });
   const contentType = request.headers.get('Content-Type');
-  const contentLength = request.headers.get('Content-Length');
   const idempotency = request.headers.get('Idempotency-Key');
-  const ifMatch = request.headers.get('If-Match');
   if (contentType) headers.set('Content-Type', contentType);
-  if (contentLength) headers.set('Content-Length', contentLength);
   if (idempotency) headers.set('Idempotency-Key', idempotency);
-  if (ifMatch) headers.set('If-Match', ifMatch);
   let body: ArrayBuffer | undefined;
   if (!['GET', 'HEAD'].includes(method)) {
-    const maxBodyBytes = method === 'PUT' && ARTICLE_LOCAL_IMAGE_PATH.test(incoming.pathname)
-      ? MAX_LOCAL_IMAGE_UPLOAD_BYTES : MAX_BODY_BYTES;
     const declared = Number(request.headers.get('Content-Length') || 0);
-    if (declared > maxBodyBytes) return errorEnvelope('REQUEST_TOO_LARGE', 'Media request body is too large', 413);
+    if (declared > MAX_BODY_BYTES) return errorEnvelope('REQUEST_TOO_LARGE', 'Media request body is too large', 413);
     body = await request.arrayBuffer();
-    if (body.byteLength > maxBodyBytes) return errorEnvelope('REQUEST_TOO_LARGE', 'Media request body is too large', 413);
+    if (body.byteLength > MAX_BODY_BYTES) return errorEnvelope('REQUEST_TOO_LARGE', 'Media request body is too large', 413);
   }
   let upstream: Response;
   try { upstream = await fetch(target, { method, headers, body, redirect: 'manual' }); }

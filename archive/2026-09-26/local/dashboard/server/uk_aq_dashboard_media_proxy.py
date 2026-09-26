@@ -13,11 +13,9 @@ import requests
 
 
 MAX_BODY_BYTES = 16 * 1024
-MAX_LOCAL_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024
 MEDIA_TIMEOUT_SECONDS = 30
 BROWSER_IMAGE_CACHE_CONTROL = "private, max-age=604800, immutable"
 _ARTICLE_IMAGE_PATH = re.compile(r"^/api/media/articles/[1-9]\d*/image$")
-_ARTICLE_LOCAL_IMAGE_PATH = re.compile(r"^/api/media/articles/[1-9]\d*/local-image$")
 
 _ROUTES = (
     (re.compile(r"^/api/media/articles$"), {"GET", "POST"}),
@@ -27,7 +25,6 @@ _ROUTES = (
     (re.compile(r"^/api/media/articles/bulk-publish$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*$"), {"GET"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/image$"), {"GET"}),
-    (_ARTICLE_LOCAL_IMAGE_PATH, {"PUT", "DELETE"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/publish$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/(?:approve|reject|hide|unhide)$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/author$"), {"PUT"}),
@@ -112,16 +109,11 @@ def proxy_media_request(handler: Any, method: str) -> None:
     except ValueError:
         _send_json(handler, HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
         return
-    max_body_bytes = (
-        MAX_LOCAL_IMAGE_UPLOAD_BYTES
-        if method == "PUT" and _ARTICLE_LOCAL_IMAGE_PATH.fullmatch(parsed.path)
-        else MAX_BODY_BYTES
-    )
-    if content_length < 0 or content_length > max_body_bytes:
+    if content_length < 0 or content_length > MAX_BODY_BYTES:
         _send_json(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Media request body is too large")
         return
     body = handler.rfile.read(content_length) if content_length else None
-    if body is not None and len(body) > max_body_bytes:
+    if body is not None and len(body) > MAX_BODY_BYTES:
         _send_json(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Media request body is too large")
         return
 
@@ -145,15 +137,10 @@ def proxy_media_request(handler: Any, method: str) -> None:
     headers = {"Authorization": f"Bearer {token}", "Accept": handler.headers.get("Accept", "*/*")}
     content_type = handler.headers.get("Content-Type")
     idempotency_key = handler.headers.get("Idempotency-Key")
-    article_revision = handler.headers.get("If-Match")
     if content_type:
         headers["Content-Type"] = content_type
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
-    if content_length:
-        headers["Content-Length"] = str(content_length)
-    if article_revision:
-        headers["If-Match"] = article_revision
 
     try:
         upstream = requests.request(

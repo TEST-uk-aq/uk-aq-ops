@@ -561,10 +561,6 @@ class MediaDashboardHandler(core.DashboardHandler):
         if not self._serve_media("PUT"):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
-    def do_DELETE(self) -> None:
-        if not self._serve_media("DELETE"):
-            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
-
 
 core.DashboardHandler = MediaDashboardHandler
 

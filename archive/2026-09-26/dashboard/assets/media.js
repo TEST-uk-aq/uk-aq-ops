@@ -123,7 +123,7 @@
 
   function articleImageUrl(article) {
     const id = Number(article?.id);
-    const version = String(article?.admin_preview_image_version || article?.updated_at || "").trim();
+    const version = String(article?.updated_at || "").trim();
     if (!Number.isInteger(id) || id < 1 || !version) return null;
     return apiUrl(`articles/${id}/image`, new URLSearchParams({ v: version }));
   }
@@ -147,37 +147,6 @@
       throw error;
     }
     return payload;
-  }
-
-  async function binaryRequest(path, options) {
-    const headers = new Headers(options.headers || {});
-    if (options.idempotent) headers.set("Idempotency-Key", idempotencyKey(options.idempotent));
-    if (options.revision !== undefined) headers.set("If-Match", String(options.revision));
-    let response;
-    try {
-      response = await fetch(apiUrl(path), { method: options.method, headers, body: options.body });
-    } catch (_error) { throw new Error("Media admin unavailable."); }
-    const contentType = String(response.headers.get("Content-Type") || "");
-    const payload = contentType.includes("json") ? await response.json().catch(() => null) : null;
-    if (!response.ok) {
-      throw new Error(String(payload?.error?.message || payload?.error || payload?.message ||
-        `Media request failed (${response.status})`));
-    }
-    return payload;
-  }
-
-  function articleImageState(article) {
-    if (article.image_policy === "local_copy_permitted" &&
-        article.source_image_policy === "local_copy_permitted") {
-      return article.local_image?.exists || article.local_image_exists
-        ? ["retained", "Retained local copy"]
-        : ["unavailable", "Image unavailable · retained copy required"];
-    }
-    if (article.image_policy === "remote_preview" &&
-        article.source_image_policy === "remote_preview" && article.og_image_url) {
-      return ["remote", "Publisher remote preview"];
-    }
-    return ["unavailable", "Image unavailable"];
   }
 
   function message(text, kind = "") {
@@ -424,8 +393,7 @@
     const thumb = article.admin_preview_image_path && imageUrl
       ? `<img class="media-thumb" loading="lazy" src="${esc(imageUrl)}" alt="" data-media-thumb>`
       : `<span class="media-thumb-fallback">No image</span>`;
-    const imageState = articleImageState(article);
-    return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></td>
+    return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}</td>
       <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
       <td>${esc(formatPublishedDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
@@ -1028,14 +996,9 @@
         ? `<button type="button" class="media-button media-button--primary" data-detail-ai-decision="accept-ai">Accept AI title</button><button type="button" class="media-button" data-detail-ai-decision="reject-ai">Reject AI / use original</button>` : "";
       const publicationInputs = publicationDateInputs(article.published_at);
       const imageUrl = articleImageUrl(article);
-      const imageState = articleImageState(article);
-      const localImageControls = article.image_policy === "local_copy_permitted" &&
-        article.source_image_policy === "local_copy_permitted"
-        ? `<section><h4>Retained local image</h4><p class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</p>${article.local_image?.exists ? `<dl class="media-local-image-meta"><dt>Type</dt><dd>${esc(article.local_image.content_type)}</dd><dt>Size</dt><dd>${esc(Number(article.local_image.byte_size || 0).toLocaleString("en-GB"))} bytes</dd><dt>Stored</dt><dd>${esc(formatUtcDateTime(article.local_image.stored_at))}</dd><dt>Acquisition</dt><dd>${esc(article.local_image.acquisition_method)}</dd></dl>` : `<p class="media-subtext">A retained copy is required for reliable Bluesky posting. Upload only when copying permission has been recorded for both the source and article.</p>`}<form class="media-inline-form" data-local-image-upload><label class="media-field media-field--grow"><span>${article.local_image?.exists ? "Replacement image" : "Image file"}</span><input name="image" type="file" accept="image/jpeg,image/png,image/webp" required></label><button class="media-button media-button--primary">${article.local_image?.exists ? "Replace retained image" : "Upload retained image"}</button>${article.local_image?.exists ? `<button type="button" class="media-button media-button--danger" data-remove-local-image>Remove retained image</button>` : ""}</form><p class="media-subtext">JPEG, PNG or WebP · maximum 5 MiB. The destination is fixed to this article.</p><div data-local-image-message></div></section>` : "";
       dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
-        <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></div>
+        <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}</div>
         <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
-        ${localImageControls}
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
         ${directPublishHtml(data, article)}
         ${blueskyHistoryHtml(data, article)}
@@ -1077,51 +1040,8 @@
       dialog.querySelector("[data-detail-generate-ai]")?.addEventListener("click", event => void generateDetailAiTitle(id, event.currentTarget, dialog));
       dialog.querySelectorAll("[data-detail-ai-decision]").forEach(button => button.addEventListener("click", () => void decideDetailAiTitle(id, button.dataset.detailAiDecision, dialog)));
       dialog.querySelector("[data-reload-metadata]")?.addEventListener("click", () => void reloadMetadata(id, article, dialog));
-      dialog.querySelector("[data-local-image-upload]")?.addEventListener("submit", event => {
-        event.preventDefault(); void uploadLocalImage(id, article, event.currentTarget, dialog);
-      });
-      dialog.querySelector("[data-remove-local-image]")?.addEventListener("click", () => {
-        if (window.confirm("Remove this article’s retained local image? The publisher image provenance will be preserved.")) {
-          void removeLocalImage(id, article, dialog);
-        }
-      });
       dialog.querySelector(".media-detail__preview[src]")?.addEventListener("error", event => { event.currentTarget.outerHTML = `<div class="media-thumb-fallback media-detail__preview">Image unavailable</div>`; }, { once: true });
     } catch (error) { dialog.innerHTML = `<div class="media-detail__inner">${message(error.message, "error")}<button class="media-button" onclick="this.closest('dialog').close()">Close</button></div>`; }
-  }
-
-  async function uploadLocalImage(id, article, form, dialog) {
-    const output = dialog.querySelector("[data-local-image-message]");
-    const file = new FormData(form).get("image");
-    if (!(file instanceof File) || !file.size) {
-      output.innerHTML = message("Choose an image file.", "error"); return;
-    }
-    if (file.size > 5 * 1024 * 1024) {
-      output.innerHTML = message("The image exceeds the 5 MiB maximum.", "error"); return;
-    }
-    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
-      output.innerHTML = message("Choose a JPEG, PNG or WebP image.", "error"); return;
-    }
-    const button = form.querySelector("button[type='submit']");
-    button.disabled = true;
-    try {
-      await binaryRequest(`articles/${id}/local-image`, { method: "PUT", idempotent: "local_image",
-        revision: article.revision, headers: { "Content-Type": file.type }, body: file });
-      await renderArticles(false);
-      await openArticle(id, article.local_image?.exists
-        ? "Retained local image replaced." : "Retained local image uploaded.");
-    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
-  }
-
-  async function removeLocalImage(id, article, dialog) {
-    const output = dialog.querySelector("[data-local-image-message]");
-    const button = dialog.querySelector("[data-remove-local-image]");
-    button.disabled = true;
-    try {
-      await binaryRequest(`articles/${id}/local-image`, { method: "DELETE",
-        idempotent: "local_image_remove", revision: article.revision });
-      await renderArticles(false);
-      await openArticle(id, "Retained local image removed. Publisher provenance is unchanged.");
-    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
   }
 
   async function saveDetailStatus(id, control, dialog) {
