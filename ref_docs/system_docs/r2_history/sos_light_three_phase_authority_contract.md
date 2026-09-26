@@ -184,13 +184,36 @@ This includes, as applicable:
 
 Existing live-R2 index objects are never required as reconstruction inputs.
 
-Existing Dropbox index objects MAY be used as a convenience or diagnostic input only where doing so does not make them required authority. If a required derived index can be rebuilt from canonical Dropbox-backed data, rebuilding is preferred over preserving an old derived object as an external dependency.
+Existing Dropbox index objects MAY be used as a convenience or diagnostic input only where doing so does not make them canonical observation authority. If a required derived index can be rebuilt from canonical Dropbox-backed data, rebuilding remains the fail-safe path.
+
+For fixed-v3 SOS-light, the checkpoint-authenticated compact latest observation-timeseries object MAY also be used as a retained identity registry for unchanged exact-v3 scoped roots, subject to the strict fast-path rules below. This narrow permission does not make the compact latest authoritative for canonical observations or scoped child bodies.
 
 If the current implementation cannot rebuild a required index from the pinned canonical baseline plus overlay, that is an SOS-light implementation defect to fix. It is not permission to consult live R2 or expand the normal Dropbox backup with derived-index dependency evidence.
 
+### Fixed-v3 compact-latest retained-root fast path
+
+The fixed-v3 planner MAY avoid reconstructing every unchanged historical exact-v3 scope when all of the following are true:
+
+- the compact latest object is the generation-selected object authenticated by the accepted Dropbox checkpoint;
+- its schema, canonical encoding, generation, layout/version fields, ordering, uniqueness and aggregate summaries are strictly validated;
+- a canonical scope catalogue is independently derived from the pinned Dropbox pollutant manifests plus the current repair overlay;
+- every retained compact-latest scoped-root descriptor is cross-checked against that canonical catalogue, including its deterministic scope/key and all summary fields that the canonical manifests can prove without decoding unchanged Parquet;
+- the compact registry cannot create, change or remove canonical scopes;
+- every affected, new or removed scope is derived from the final canonical overlay state, not from the compact registry;
+- every affected non-empty scope is fully rebuilt from canonical Dropbox-backed data plus current-run replacements;
+- changed/new rebuilt roots replace registry descriptors deterministically, and conclusively removed scopes are removed explicitly;
+- no live R2 read is introduced during DETECT or PROPOSE;
+- no complete scoped/exact v3 tree is added to normal Dropbox backup scope.
+
+Under this fast path, retained compact-latest root descriptors are identity-registry evidence for unaffected derived scopes only. They are not evidence for canonical observation content and are not substitutes for rebuilding an affected scope.
+
+If the compact latest is missing, malformed, internally contradictory, contains duplicate scopes, disagrees with the canonical scope catalogue, or cannot otherwise satisfy this fast-path contract, the planner MUST abandon the fast path. It MAY fall back to complete canonical reconstruction from the pinned Dropbox baseline plus overlay. If that fallback cannot complete, the run MUST fail before mutation.
+
+The compact-latest fast path is therefore an optimisation. It MUST NOT become the only way to reconstruct required v3 indexes.
+
 ### No retained-external-dependency model
 
-SOS-light MUST NOT require a "retained external dependency" proof for unchanged v3 index roots.
+SOS-light MUST NOT require a "retained external dependency" proof against live R2 for unchanged v3 index roots.
 
 There is no requirement to:
 
@@ -199,9 +222,33 @@ There is no requirement to:
 - retain a live-R2 scoped root merely because a proposed global latest references the same logical scope;
 - treat an old scoped-root object as irreplaceable source evidence.
 
-The planner may regenerate a complete affected index chain from the overlay and then determine which resulting bytes actually differ.
+The planner may regenerate a complete affected index chain from the overlay and then determine which resulting bytes actually differ. Under the fixed-v3 fast path above, it may instead retain strictly validated compact-latest descriptors for unaffected scopes while rebuilding every affected scope from canonical inputs.
 
-Unchanged deterministic output naturally falls out of byte comparison/planning. It does not require live dependency validation.
+Unchanged deterministic output does not require live dependency validation.
+
+### Proposal payload materialisation and planner/coordinator transport
+
+"Complete proposal" means that every changed object's exact bytes are already materialised, identity-pinned and available to APPLY. It does **not** require every changed body to be embedded inline in one in-memory JSON object or emitted through one stdout payload.
+
+For large fixed-v3 plans, changed object bodies SHOULD be held once in the run-local overlay/staging area and proposal records SHOULD carry bounded control-plane references to those bytes. A body reference MUST identify at least:
+
+- the object key;
+- a run-local body location/reference;
+- exact byte length;
+- SHA-256;
+- the proposal/publication identity needed by the existing dependency graph.
+
+Before the proposal is frozen, the planner/final validator MUST prove that every referenced changed body exists locally and that its actual byte length and SHA-256 equal the recorded identity. Missing, unreadable or contradictory body references fail before mutation.
+
+After proposal freeze, referenced staged bytes are immutable for that run. APPLY MUST publish the already-validated staged bytes. It MUST NOT regenerate or reserialise an object during mutation in a way that can change the frozen identity.
+
+The planner/coordinator process boundary MUST remain bounded. It MUST NOT require serialising all proposed bodies into one monolithic stdout/stderr JSON string. Large proposal results MUST be handed off through a run-local proposal artifact or equivalent bounded file-backed representation, with only compact control/progress information crossing stdout/stderr.
+
+A file-backed proposal hand-off MUST itself be authenticated before use. The coordinator MUST receive or derive enough compact evidence to identify the exact artifact, including its run-local path/reference and integrity identity such as SHA-256 and byte length. The artifact MAY contain a compact proposal graph whose changed-body entries reference already-materialised overlay/staging files rather than duplicating those bodies inline.
+
+Progress events such as metadata-planning counters are diagnostic only. They do not replace the final authenticated proposal artifact and do not authorise APPLY.
+
+An inability to materialise, authenticate, persist or load the complete proposal representation is a pre-APPLY failure. It MUST NOT be worked around by reducing dependency validation, consulting live R2, or omitting required changed objects.
 
 ## V2 and V3 share the same model
 
