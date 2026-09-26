@@ -168,6 +168,8 @@ For SOS-light, start with the load-bearing authority contract:
 3. [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md)
 4. [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md)
 
+For the agreed upcoming fixed-v2 coordinator hardening, also read [`sos_light_v2_coordinator_hardening_amendment.md`](sos_light_v2_coordinator_hardening_amendment.md). **Status: future implementation authority; not current runtime behaviour.** It owns the planned bounded pre-APPLY checkpointing, final persisted-state equality, v2 transition fingerprint and extended v2 progress contract without changing Step 0, source authority, complete-day replacement or canonical APPLY semantics.
+
 The three-phase contract owns the simple fixed-v2/fixed-v3 authority model:
 
 ```text
@@ -183,6 +185,23 @@ Use [`CONTRACT_INDEX.md`](CONTRACT_INDEX.md) only if the SOS task also enters di
 Add [`current_state_reconciliation.md`](current_state_reconciliation.md) and [`../latest_snapshot/integrity_reconciliation.md`](../latest_snapshot/integrity_reconciliation.md) only when the repaired history can affect current state.
 
 Do not load Prune Daily deletion-gate contracts for an SOS-only task unless the task actually crosses that ownership boundary.
+
+### Future UK-AIR Black Carbon direct R2 history
+
+Status: **future implementation authority; not current runtime behaviour**.
+
+Start with:
+
+1. [`ukair_black_carbon_history_contract.md`](ukair_black_carbon_history_contract.md)
+2. [`../ingest/ukair_black_carbon/source_contract.md`](../ingest/ukair_black_carbon/source_contract.md)
+3. [`../ingest/ukair_black_carbon/identity_contract.md`](../ingest/ukair_black_carbon/identity_contract.md)
+4. [`observation_history_schema_contract.md`](observation_history_schema_contract.md)
+5. [`observations_run_exclusion_contract.md`](observations_run_exclusion_contract.md)
+6. [`observation_selected_scope_removal_contract.md`](observation_selected_scope_removal_contract.md)
+
+Then load the active shared observation-writer, manifest and index-v3 contracts selected by the steady-state route above.
+
+The Black Carbon path is deliberately R2-only for hourly observations. It does not use IngestDB observation storage, Prune Daily or SOS-light, and it must reuse the shared canonical R2 writer rather than creating a connector-private history layout.
 
 ### Current-state reconciliation after Integrity
 
