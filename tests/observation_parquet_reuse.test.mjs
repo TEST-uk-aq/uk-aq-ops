@@ -454,6 +454,49 @@ test("checkpoint shard authentication is required before prior manifests can be 
   assert.equal(fallback.copy_required_count, 1);
 });
 
+test("an incomplete month checkpoint cannot become preceding reuse authority", () => {
+  const monthState = {
+    ...emptyObservationMonthState("2026", "08"),
+    days: [{
+      day_utc: DAY_UTC,
+      manifest_hash: "d".repeat(64),
+      copied_at: "2026-08-07T00:00:00.000Z",
+    }],
+  };
+  const monthStateText = `${JSON.stringify(monthState)}\n`;
+  const summary = {
+    state_shard_key: "state/2026-08.json",
+    state_shard_hash: sha256Hex(monthStateText),
+    processed_source_month_hash: null,
+  };
+
+  const authority = authenticatePrecedingObservationDayState({
+    monthStateText,
+    monthState,
+    monthStateRelativePath: summary.state_shard_key,
+    stateMonthSummary: summary,
+    dayUtc: DAY_UTC,
+  });
+  assert.deepEqual(authority, {
+    ok: false,
+    reason: "preceding_checkpoint_shard_unauthenticated",
+  });
+
+  const fallback = planObservationParquetReuse({
+    dayRelativePath: DAY_ROOT,
+    currentFiles: authenticate(manifestChain()),
+    previousFiles: authenticate(manifestChain()),
+    destinationFiles: new Map([[PARQUET_KEY, { size: 123 }]]),
+    baselineFailureReason: authority.reason,
+  });
+  assert.equal(fallback.reused_count, 0);
+  assert.equal(fallback.copy_required_count, 1);
+  assert.equal(fallback.fallback_count, 1);
+  assert.deepEqual(fallback.fallback_reasons, {
+    preceding_checkpoint_shard_unauthenticated: 1,
+  });
+});
+
 test("reuse filter contains only Parquet while normal prune and verification gates remain", () => {
   const patterns = buildObservationParquetExcludePatterns([{
     filter_relative_path: "connector_id=7/pollutant_code=pm25/part-000.parquet",

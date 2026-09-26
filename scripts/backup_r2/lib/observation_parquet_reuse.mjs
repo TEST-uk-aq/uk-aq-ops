@@ -155,6 +155,8 @@ export function authenticatePrecedingObservationDayState({
     stateMonthSummary.state_shard_key !== monthStateRelativePath
     || !stateMonthSummary.state_shard_hash
     || sha256Hex(monthStateText) !== stateMonthSummary.state_shard_hash
+    || !stateMonthSummary.processed_source_month_hash
+    || !monthState.processed_source_month_hash
     || stateMonthSummary.processed_source_month_hash
       !== monthState.processed_source_month_hash
   ) {
