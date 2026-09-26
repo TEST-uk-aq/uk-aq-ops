@@ -18472,19 +18472,6 @@ def _run_v2_observation_metadata_executor(
     )
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
-    stdout_limit_exceeded = threading.Event()
-    stdout_byte_limit = 64 * 1024
-
-    def _drain_bounded_stdout(stream: Any) -> None:
-        captured_bytes = 0
-        for chunk in iter(lambda: stream.read(8192), ""):
-            encoded_bytes = len(chunk.encode("utf-8"))
-            captured_bytes += encoded_bytes
-            if captured_bytes <= stdout_byte_limit:
-                stdout_lines.append(chunk)
-            else:
-                stdout_limit_exceeded.set()
-        stream.close()
 
     def _drain(stream: Any, destination: list[str], *, progress: bool) -> None:
         for line in iter(stream.readline, ""):
@@ -18494,7 +18481,7 @@ def _run_v2_observation_metadata_executor(
         stream.close()
 
     stdout_thread = threading.Thread(
-        target=_drain_bounded_stdout, args=(proc.stdout,), daemon=True,
+        target=_drain, args=(proc.stdout, stdout_lines), kwargs={"progress": False}, daemon=True,
     )
     stderr_thread = threading.Thread(
         target=_drain, args=(proc.stderr, stderr_lines), kwargs={"progress": True}, daemon=True,
@@ -18801,6 +18788,19 @@ def _run_v3_observation_metadata_proposal(
     )
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
+    stdout_limit_exceeded = threading.Event()
+    stdout_byte_limit = 64 * 1024
+
+    def _drain_bounded_stdout(stream: Any) -> None:
+        captured_bytes = 0
+        for chunk in iter(lambda: stream.read(8192), ""):
+            encoded_bytes = len(chunk.encode("utf-8"))
+            captured_bytes += encoded_bytes
+            if captured_bytes <= stdout_byte_limit:
+                stdout_lines.append(chunk)
+            else:
+                stdout_limit_exceeded.set()
+        stream.close()
 
     def _drain(stream: Any, destination: list[str], *, progress: bool) -> None:
         for line in iter(stream.readline, ""):
@@ -18810,7 +18810,7 @@ def _run_v3_observation_metadata_proposal(
         stream.close()
 
     stdout_thread = threading.Thread(
-        target=_drain, args=(proc.stdout, stdout_lines), kwargs={"progress": False}, daemon=True,
+        target=_drain_bounded_stdout, args=(proc.stdout,), daemon=True,
     )
     stderr_thread = threading.Thread(
         target=_drain, args=(proc.stderr, stderr_lines), kwargs={"progress": True}, daemon=True,

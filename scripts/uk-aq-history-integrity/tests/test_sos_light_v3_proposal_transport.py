@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
+import logging
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = (
@@ -22,6 +25,17 @@ if SPEC is None or SPEC.loader is None:
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+
+class FakePlannerProcess:
+    def __init__(self, *, stdout: str, stderr: str = "", returncode: int = 0) -> None:
+        self.stdin = io.StringIO()
+        self.stdout = io.StringIO(stdout)
+        self.stderr = io.StringIO(stderr)
+        self.returncode = returncode
+
+    def wait(self) -> int:
+        return self.returncode
 
 
 class FixedV3ProposalTransportTests(unittest.TestCase):
@@ -181,6 +195,98 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 envelope=envelope,
                 expected_result_path=artifact_path,
             )
+
+    def test_v3_wrapper_accepts_a_small_authenticated_control_envelope(self) -> None:
+        envelope, _ = self._artifact()
+        encoded_envelope = json.dumps(envelope, separators=(",", ":")) + "\n"
+        self.assertLess(len(encoded_envelope.encode("utf-8")), 64 * 1024)
+        process = FakePlannerProcess(stdout=encoded_envelope)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_repo_root_for_integrity_script",
+                return_value=self.root,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_authoritative_v2_core_timeseries_bindings",
+                return_value=[],
+            ),
+            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+        ):
+            result = MODULE._run_v3_observation_metadata_proposal(
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                actions=[{"day_utc": "2025-01-01"}],
+                dry_run=False,
+                log=logging.getLogger("test.v3.transport.small"),
+                run_state=self.run_state,
+            )
+        self.assertEqual(result["status"], "planned")
+        self.assertEqual(result["transport"]["status"], "authenticated")
+        self.assertEqual(result["output"]["ok"], True)
+
+    def test_v3_wrapper_rejects_oversized_stdout_before_artifact_acceptance(self) -> None:
+        process = FakePlannerProcess(stdout="x" * (64 * 1024 + 1))
+        with (
+            mock.patch.object(
+                MODULE,
+                "_repo_root_for_integrity_script",
+                return_value=self.root,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_authoritative_v2_core_timeseries_bindings",
+                return_value=[],
+            ),
+            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                MODULE,
+                "_load_authenticated_v3_proposal_result",
+            ) as authenticate,
+        ):
+            result = MODULE._run_v3_observation_metadata_proposal(
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                actions=[{"day_utc": "2025-01-01"}],
+                dry_run=False,
+                log=logging.getLogger("test.v3.transport.oversized"),
+                run_state=self.run_state,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertIn(
+            "fixed-v3 proposal control envelope exceeded 64 KiB",
+            result["error"],
+        )
+        self.assertEqual(result["output"], {})
+        authenticate.assert_not_called()
+
+    def test_v2_wrapper_retains_ordinary_unbounded_stdout_drain(self) -> None:
+        padding = "x" * (64 * 1024 + 1)
+        process = FakePlannerProcess(stdout=json.dumps({
+            "status": "planned",
+            "results": [],
+            "padding": padding,
+        }))
+        with (
+            mock.patch.object(
+                MODULE,
+                "_repo_root_for_integrity_script",
+                return_value=self.root,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_authoritative_v2_core_timeseries_bindings",
+                return_value=[],
+            ),
+            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+        ):
+            result = MODULE._run_v2_observation_metadata_executor(
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                actions=[{"day_utc": "2025-01-01"}],
+                dry_run=False,
+                log=logging.getLogger("test.v2.transport.original"),
+            )
+        self.assertEqual(result["status"], "planned")
+        self.assertEqual(result["output"]["padding"], padding)
 
 
 if __name__ == "__main__":
