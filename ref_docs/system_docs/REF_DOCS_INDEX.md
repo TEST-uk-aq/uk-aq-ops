@@ -32,6 +32,8 @@ Task-specific refresh:
 - `ref_docs/system_docs/backup_and_recovery/r2_history_dropbox_backup_contract.md` and `ref_docs/system_docs/backup_and_recovery/r2_history_dropbox_sync_contract.md` were refreshed from authoritative source commit `d43ad102d7dee75a9d976161710b3ef66ac04045` on `26/09/2026` to add the `full` / `reuse_matching` observation-Parquet copy-mode contract and chained SOS-light backup behaviour.
 - `ref_docs/system_docs/r2_history/sos_light_three_phase_authority_contract.md` and `ref_docs/system_docs/r2_history/sos_historical_repair_contract.md` were refreshed from authoritative source commit `4a7b0a208dfd2fb7075d6bc8bdf3755eb3608e47` on `26/09/2026` so serial monthly SOS-light explicitly requests and verifies `reuse_matching`, and the local materialisation gate recognises authenticated reused Parquet bodies.
 
+- `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/r2_history/README.md`, `ref_docs/system_docs/r2_history/CONTRACT_INDEX.md`, `ref_docs/system_docs/r2_history/sos_light_v2_coordinator_hardening_amendment.md`, `ref_docs/system_docs/r2_history/proposal_run_state_transition_contract.md` and `ref_docs/system_docs/r2_history/integrity_apply_progress_persistence_contract.md` were refreshed from authoritative source commit `c9c943f811484b6c83c1486be38b7481ed202ce7` on `26/09/2026`. This adds the explicitly future fixed-v2 SOS-light coordinator hardening contract and brings the previously missing proposal-transition/apply-progress contracts into the ops mirror.
+
 ## Reading rule
 
 When `../TEST-uk-aq-system-docs/system_docs/` exists, coding agents should use that sibling authoritative tree.
