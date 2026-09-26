@@ -26,14 +26,6 @@ on:
         required: false
         default: false
         type: boolean
-      observation_parquet_copy_mode:
-        description: "Observation Parquet transfer mode"
-        required: false
-        default: "full"
-        type: choice
-        options:
-          - full
-          - reuse_matching
       timeseries_binding_backup_mode:
         description: "Timeseries binding Dropbox backup representation"
         required: false
@@ -77,7 +69,6 @@ jobs:
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
       INPUT_FORCE_PRUNE_RECHECK: ${{ github.event.inputs.force_prune_recheck || 'false' }}
-      INPUT_OBSERVATION_PARQUET_COPY_MODE: ${{ github.event.inputs.observation_parquet_copy_mode || 'full' }}
       INPUT_TIMESERIES_BINDING_BACKUP_MODE: ${{ github.event.inputs.timeseries_binding_backup_mode || 'pack' }}
 
     steps:
@@ -233,15 +224,6 @@ jobs:
               ;;
           esac
 
-          observation_parquet_copy_mode="${INPUT_OBSERVATION_PARQUET_COPY_MODE:-full}"
-          case "${observation_parquet_copy_mode}" in
-            full|reuse_matching) ;;
-            *)
-              echo "observation_parquet_copy_mode must be exactly full or reuse_matching" >&2
-              exit 1
-              ;;
-          esac
-
           dropbox_root="${UK_AQ_DROPBOX_ROOT%/}"
           dropbox_root="${dropbox_root#/}"
           dropbox_dir="${UK_AQ_R2_HISTORY_DROPBOX_DIR#/}"
@@ -266,7 +248,6 @@ jobs:
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
             --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
             --timeseries-binding-backup-mode "${selected_mode}"
-            --observation-parquet-copy-mode "${observation_parquet_copy_mode}"
             --max-days-per-run "${max_days}"
             --checkpoint-batch-units "${UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS}"
             --checkpoint-flush-seconds "${UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS}"

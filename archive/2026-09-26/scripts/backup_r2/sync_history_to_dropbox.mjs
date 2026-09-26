@@ -2,7 +2,6 @@
 
 import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,7 +10,6 @@ import {
   rcloneCat,
   rcloneCatMaybe,
   rcloneLsjsonFile,
-  rcloneLsjsonRecursive,
   runRclone,
   runRcloneWithRetry,
   uploadFromTempFile,
@@ -59,14 +57,6 @@ import {
 import {
   pruneStaleParquetForUnit,
 } from "./lib/stale_parquet_prune.mjs";
-import {
-  DEFAULT_OBSERVATION_PARQUET_COPY_MODE,
-  authenticateObservationDayParquetFiles,
-  authenticatePrecedingObservationDayState,
-  buildObservationParquetExcludePatterns,
-  normalizeObservationParquetCopyMode,
-  planObservationParquetReuse,
-} from "./lib/observation_parquet_reuse.mjs";
 import {
   requireLockedHistoryBackupMutation,
 } from "./uk_aq_run_locked_history_backup.mjs";
@@ -147,7 +137,6 @@ function usage() {
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
     `  --state-root-prefix <p>      Default: ${DEFAULT_STATE_ROOT_PREFIX}`,
     `  --timeseries-binding-backup-mode <individual|dual|pack> Default: ${DEFAULT_TIMESERIES_BINDING_BACKUP_MODE}`,
-    `  --observation-parquet-copy-mode <full|reuse_matching> Default: ${DEFAULT_OBSERVATION_PARQUET_COPY_MODE}`,
     "  --allow-experimental-pack-only Required for pack mode; isolated TEST destination only",
     "  --timeseries-binding-packs-only Proving path: sync no other backup domain",
     `  --max-days-per-run <N>       Default: ${DEFAULT_MAX_DAYS}; 0 = unlimited`,
@@ -169,8 +158,6 @@ function parseArgs(argv) {
     inventory_root_prefix: DEFAULT_INVENTORY_ROOT_PREFIX,
     state_root_prefix: DEFAULT_STATE_ROOT_PREFIX,
     timeseries_binding_backup_mode: DEFAULT_TIMESERIES_BINDING_BACKUP_MODE,
-    observation_parquet_copy_mode: DEFAULT_OBSERVATION_PARQUET_COPY_MODE,
-    observation_parquet_copy_mode_explicit: false,
     allow_experimental_pack_only: false,
     timeseries_binding_packs_only: false,
     max_days_per_run: DEFAULT_MAX_DAYS,
@@ -210,17 +197,6 @@ function parseArgs(argv) {
       args.timeseries_binding_backup_mode = normalizeTimeseriesBindingBackupMode(
         argv[index + 1],
       );
-      index += 1;
-      continue;
-    }
-    if (arg === "--observation-parquet-copy-mode") {
-      if (!argv[index + 1] || String(argv[index + 1]).startsWith("--")) {
-        throw new Error("--observation-parquet-copy-mode requires a value");
-      }
-      args.observation_parquet_copy_mode = normalizeObservationParquetCopyMode(
-        argv[index + 1],
-      );
-      args.observation_parquet_copy_mode_explicit = true;
       index += 1;
       continue;
     }
@@ -564,184 +540,12 @@ function readSelectedInventoryJson(args, relativePath, domain) {
   return value;
 }
 
-function bestEffortObservationParquetFiles(dayManifest, dayRelativePath) {
-  const prefix = `${String(dayRelativePath || "").replace(/\/+$/, "")}/`;
-  const files = new Map();
-  for (const entry of Array.isArray(dayManifest?.files) ? dayManifest.files : []) {
-    const key = String(entry?.key || "").trim().replace(/^\/+/, "");
-    const byteSize = Number(entry?.bytes);
-    if (
-      !key.startsWith(prefix)
-      || !key.endsWith(".parquet")
-      || !Number.isSafeInteger(byteSize)
-      || byteSize < 0
-      || files.has(key)
-    ) continue;
-    files.set(key, { key, byte_size: byteSize, sha256: null });
-  }
-  return Array.from(files.values()).sort((left, right) => left.key.localeCompare(right.key));
-}
-
-function destinationObservationFileMap(args, day) {
-  const entries = rcloneLsjsonRecursive(
-    args.rclone_bin,
-    joinTargetPath(args.dest_root, day.relative_path),
-    { hash: false, retryOptions: DROPBOX_READ_RETRY },
-  );
-  const files = new Map();
-  for (const entry of entries) {
-    const relative = String(entry?.Path || entry?.Name || "")
-      .trim().replace(/\\/g, "/").replace(/^\/+/, "");
-    const size = Number(entry?.Size);
-    if (!relative || !Number.isSafeInteger(size) || size < 0) continue;
-    files.set(`${day.relative_path}/${relative}`, { size });
-  }
-  return files;
-}
-
-function planObservationDayParquetReuse({
-  args,
-  day,
-  monthStateResult,
-  monthState,
-  monthStateRelativePath,
-  stateMonthSummary,
-}) {
-  const planningErrors = [];
-  const currentDayResult = readJsonRequired(
-    args.rclone_bin,
-    args.source_root,
-    day.manifest_key,
-  );
-  let currentFiles;
-  try {
-    currentFiles = authenticateObservationDayParquetFiles({
-      dayUtc: day.day_utc,
-      dayManifestKey: day.manifest_key,
-      expectedDayManifestHash: day.manifest_hash,
-      dayManifest: currentDayResult.parsed,
-      readManifest: (key) => readJsonRequired(
-        args.rclone_bin,
-        args.source_root,
-        key,
-      ).parsed,
-    });
-  } catch (error) {
-    planningErrors.push(error instanceof Error ? error.message : String(error));
-    currentFiles = bestEffortObservationParquetFiles(
-      currentDayResult.parsed,
-      day.relative_path,
-    );
-    const fallback = planObservationParquetReuse({
-      dayRelativePath: day.relative_path,
-      currentFiles,
-      previousFiles: [],
-      destinationFiles: new Map(),
-      baselineFailureReason: "current_manifest_chain_unauthenticated",
-    });
-    return { ...fallback, planning_errors: planningErrors };
-  }
-
-  const authority = authenticatePrecedingObservationDayState({
-    monthStateText: monthStateResult?.text || null,
-    monthState,
-    monthStateRelativePath,
-    stateMonthSummary,
-    dayUtc: day.day_utc,
-  });
-  if (!authority.ok) {
-    return {
-      ...planObservationParquetReuse({
-        dayRelativePath: day.relative_path,
-        currentFiles,
-        previousFiles: [],
-        destinationFiles: new Map(),
-        baselineFailureReason: authority.reason,
-      }),
-      planning_errors: planningErrors,
-    };
-  }
-
-  let previousFiles;
-  try {
-    const previousDayResult = readJsonRequired(
-      args.rclone_bin,
-      args.dest_root,
-      day.manifest_key,
-      DROPBOX_READ_RETRY,
-    );
-    previousFiles = authenticateObservationDayParquetFiles({
-      dayUtc: day.day_utc,
-      dayManifestKey: day.manifest_key,
-      expectedDayManifestHash: authority.prior_day.manifest_hash,
-      dayManifest: previousDayResult.parsed,
-      readManifest: (key) => readJsonRequired(
-        args.rclone_bin,
-        args.dest_root,
-        key,
-        DROPBOX_READ_RETRY,
-      ).parsed,
-    });
-  } catch (error) {
-    planningErrors.push(error instanceof Error ? error.message : String(error));
-    return {
-      ...planObservationParquetReuse({
-        dayRelativePath: day.relative_path,
-        currentFiles,
-        previousFiles: [],
-        destinationFiles: new Map(),
-        baselineFailureReason: "preceding_manifest_chain_unauthenticated",
-      }),
-      planning_errors: planningErrors,
-    };
-  }
-
-  return {
-    ...planObservationParquetReuse({
-      dayRelativePath: day.relative_path,
-      currentFiles,
-      previousFiles,
-      destinationFiles: destinationObservationFileMap(args, day),
-    }),
-    planning_errors: planningErrors,
-  };
-}
-
-function withObservationParquetExcludeFile(reusableFiles, callback) {
-  const patterns = buildObservationParquetExcludePatterns(reusableFiles);
-  if (patterns.length === 0) return callback(null);
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "uk_aq_observation_reuse_"));
-  const excludeFile = path.join(tempDir, "exclude-parquet.txt");
-  try {
-    fs.writeFileSync(excludeFile, `${patterns.join("\n")}\n`, "utf8");
-    return callback(excludeFile);
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  }
-}
-
-function copyAndVerifyObservationDay({
-  args,
-  day,
-  monthStateResult,
-  monthState,
-  monthStateRelativePath,
-  stateMonthSummary,
-}) {
+function copyAndVerifyObservationDay({ args, day }) {
   const sourceDayPath = joinTargetPath(args.source_root, day.relative_path);
   const destDayPath = joinTargetPath(args.dest_root, day.relative_path);
-  const parquet = args.observation_parquet_copy_mode === "reuse_matching"
-    ? planObservationDayParquetReuse({
-      args,
-      day,
-      monthStateResult,
-      monthState,
-      monthStateRelativePath,
-      stateMonthSummary,
-    })
-    : null;
-  withObservationParquetExcludeFile(parquet?.reusable || [], (excludeFile) => {
-    const copyArgs = [
+  copyWithRetry(
+    args.rclone_bin,
+    [
       "copy",
       sourceDayPath,
       destDayPath,
@@ -749,10 +553,9 @@ function copyAndVerifyObservationDay({
       "--transfers", "8",
       "--checkers", "16",
       "--fast-list",
-    ];
-    if (excludeFile) copyArgs.push("--exclude-from", excludeFile);
-    copyWithRetry(args.rclone_bin, copyArgs, args.dry_run);
-  });
+    ],
+    args.dry_run,
+  );
 
   let prune = null;
   if (args.prune_stale_parquet) {
@@ -769,7 +572,7 @@ function copyAndVerifyObservationDay({
   }
 
   if (args.dry_run) {
-    return { verified: false, dry_run: true, prune, parquet };
+    return { verified: false, dry_run: true, prune };
   }
   const destinationManifestPath = joinTargetPath(
     args.dest_root,
@@ -790,7 +593,7 @@ function copyAndVerifyObservationDay({
       + `expected=${day.manifest_hash} destination=${destinationHash}`,
     );
   }
-  return { verified: true, dry_run: false, prune, parquet };
+  return { verified: true, dry_run: false, prune };
 }
 
 function copyAndVerifyCoreDay({ args, day }) {
@@ -980,9 +783,6 @@ async function main() {
     started_at: startedAt,
     completed_at: null,
     dry_run: args.dry_run,
-    observation_parquet_copy_mode: args.observation_parquet_copy_mode,
-    observation_parquet_copy_mode_source:
-      args.observation_parquet_copy_mode_explicit ? "explicit" : "defaulted",
     timeseries_binding_backup_mode: args.timeseries_binding_backup_mode,
     timeseries_binding_packs_only: args.timeseries_binding_packs_only,
     source_root: args.source_root,
@@ -1004,29 +804,11 @@ async function main() {
       days_copied: 0,
       days_dry_run: 0,
       day_list: [],
-      changed_days_selected: [],
       hierarchy_files_copied: [],
       state_shards_written: 0,
       checkpoint_flush_count: 0,
       incomplete_months: [],
       incomplete_years: [],
-    },
-    observation_parquet: {
-      mode: args.observation_parquet_copy_mode,
-      mode_source:
-        args.observation_parquet_copy_mode_explicit ? "explicit" : "defaulted",
-      reused_count: 0,
-      reused_bytes: 0,
-      copy_required_count:
-        args.observation_parquet_copy_mode === "reuse_matching" ? 0 : null,
-      copy_required_bytes:
-        args.observation_parquet_copy_mode === "reuse_matching" ? 0 : null,
-      copied_bytes: null,
-      copied_bytes_measurement: "not_available_from_complete_prefix_rclone_copy",
-      fallback_count:
-        args.observation_parquet_copy_mode === "reuse_matching" ? 0 : null,
-      fallback_reasons: {},
-      planning_errors: [],
     },
     timeseries_binding: null,
     timeseries_binding_packs: null,
@@ -1213,37 +995,8 @@ async function main() {
       report.observations.days_candidates += candidates.length;
       for (const day of candidates) {
         if (args.max_days_per_run > 0 && copiedDayBudget <= 0) break;
-        report.observations.changed_days_selected.push(day.day_utc);
         try {
-          const result = copyAndVerifyObservationDay({
-            args,
-            day,
-            monthStateResult,
-            monthState,
-            monthStateRelativePath,
-            stateMonthSummary: existingSummary,
-          });
-          if (result.parquet) {
-            report.observation_parquet.reused_count += result.parquet.reused_count;
-            report.observation_parquet.reused_bytes += result.parquet.reused_bytes;
-            report.observation_parquet.copy_required_count +=
-              result.parquet.copy_required_count;
-            report.observation_parquet.copy_required_bytes +=
-              result.parquet.copy_required_bytes;
-            report.observation_parquet.fallback_count += result.parquet.fallback_count;
-            for (const [reason, count] of Object.entries(
-              result.parquet.fallback_reasons,
-            )) {
-              report.observation_parquet.fallback_reasons[reason] =
-                (report.observation_parquet.fallback_reasons[reason] || 0) + count;
-            }
-            report.observation_parquet.planning_errors.push(
-              ...result.parquet.planning_errors.map((message) => ({
-                day_utc: day.day_utc,
-                message,
-              })),
-            );
-          }
+          const result = copyAndVerifyObservationDay({ args, day });
           if (result.prune) {
             report.prune.deleted_count += Number(
               result.prune.prune_deleted_count || 0,
