@@ -5,7 +5,7 @@ set -euo pipefail
 # Always provide a valid detached stdin to Python and child processes.
 exec </dev/null
 
-INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v2.sh"
+INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-local-wrapper-v2.sh"
 INTEGRITY_ENV="LIVE"
 BACKUP_REPOSITORY="UK-AQ/uk-aq-ops"
 BACKUP_WORKFLOW="uk_aq_r2_history_dropbox_backup.yml"
@@ -263,7 +263,7 @@ PY
   fi
   rm -f "$remote_workflow"
 
-  OPS_REPO_ROOT="$(resolve_ops_repo_root)" || fail "cannot resolve the ${INTEGRITY_ENV} repository selected by the Integrity dispatcher"
+  OPS_REPO_ROOT="$(resolve_ops_repo_root)" || fail "cannot resolve the ${INTEGRITY_ENV} repository selected by the Integrity local wrapper"
   local dropbox_config
   dropbox_config="$(resolve_dropbox_backup_root)" || fail "local Dropbox backup root/checkpoint location cannot be resolved"
   IFS=$'\t' read -r DROPBOX_BACKUP_ROOT OBSERVATION_HISTORY_VERSION <<<"$dropbox_config"

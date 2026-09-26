@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Repository-owned UK-AQ History Integrity runner.
-# The local deployed dispatcher selects this repository; this runner loads only
+# The deployed local wrapper selects this repository; this runner loads only
 # the repository root .env, derives runtime paths, takes the per-env lock and
 # invokes the repository Python coordinator.
 
@@ -13,8 +13,8 @@ Usage:
 
 This repository runner loads the selected repository root .env and derives
 non-Dropbox state under /Users/mikehinford/uk-aq-history-integrity/state/<ENV>.
-The local dispatcher is a separate deployed file at:
-  /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh
+The local wrapper is a separate deployed file at:
+  /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-local-wrapper-v3.sh
 
 All options after --env are forwarded unchanged to the Python coordinator.
 USAGE
@@ -99,7 +99,7 @@ ROOT_ENV_FILE="${REPO_ROOT}/.env"
 [[ -f "${ROOT_ENV_FILE}" && -r "${ROOT_ENV_FILE}" ]] || error "repository root .env is unavailable: ${ROOT_ENV_FILE}"
 
 # The repository .env is the established shared environment source. Preserve
-# the dispatcher-provided local root across loading, then reassert all runner
+# the local-wrapper-provided local root across loading, then reassert all runner
 # ownership values below.
 LOCAL_ROOT="${UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT:-/Users/mikehinford/uk-aq-history-integrity}"
 [[ "${LOCAL_ROOT}" = /* ]] || error "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT must be absolute"

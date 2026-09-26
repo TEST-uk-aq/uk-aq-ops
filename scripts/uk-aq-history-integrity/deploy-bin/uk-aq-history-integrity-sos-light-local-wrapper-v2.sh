@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Small local deployment dispatcher. It selects a repository from one tiny,
+# Small local deployment wrapper. It selects a repository from one tiny,
 # local selector file and never loads the selected repository .env itself.
 
 set -euo pipefail
@@ -7,9 +7,9 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  uk-aq-history-integrity-sos-light-v3.sh --env TEST|LIVE [options]
+  uk-aq-history-integrity-sos-light-local-wrapper-v2.sh --env TEST|LIVE [options]
 
-This deployed dispatcher reads only:
+This deployed local wrapper reads only:
   /Users/mikehinford/uk-aq-history-integrity/env/TEST.env
   /Users/mikehinford/uk-aq-history-integrity/env/LIVE.env
 
@@ -107,7 +107,7 @@ reject_archive_path "UK_AQ_OPS_REPO_ROOT" "${OPS_REPO_ROOT}"
 [[ -d "${OPS_REPO_ROOT}" ]] || error "selected repository does not exist: ${OPS_REPO_ROOT}"
 OPS_REPO_ROOT="$(cd -P -- "${OPS_REPO_ROOT}" && pwd -P)"
 reject_archive_path "resolved UK_AQ_OPS_REPO_ROOT" "${OPS_REPO_ROOT}"
-RUNNER="${OPS_REPO_ROOT}/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh"
+RUNNER="${OPS_REPO_ROOT}/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-local-wrapper-v2.sh"
 [[ -f "${RUNNER}" && -x "${RUNNER}" ]] || error "selected repository runner is unavailable or not executable: ${RUNNER}"
 
 export UK_AQ_ENV_NAME="${ENV_NAME}"
