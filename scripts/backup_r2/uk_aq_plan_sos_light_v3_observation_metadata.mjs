@@ -63,6 +63,10 @@ import {
 import {
   validateIntegrityCoreSnapshotIdentity,
 } from "./lib/uk_aq_integrity_core_snapshot_identity.mjs";
+import {
+  materializeSosLightV3ProposalBodies,
+  writeSosLightV3ProposalArtifact,
+} from "./lib/sos_light_v3_proposal_transport.mjs";
 
 const GENERATION = getObservationHistoryGeneration("v3");
 const FULL_LOWER_GIT_SHA = /^[0-9a-f]{40}$/;
@@ -1628,7 +1632,44 @@ export async function planSosLightV3ObservationMetadata(options = {}) {
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) planSosLightV3ObservationMetadata().then((output) => {
-  process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+  const argv = process.argv.slice(2);
+  const resultPath = argvValue(argv, "--proposal-result-json");
+  const runStatePath = argvValue(argv, "--run-state-json")
+    || process.env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON;
+  if (!resultPath || !runStatePath) {
+    throw new Error(
+      "Fixed-v3 CLI requires --proposal-result-json and --run-state-json",
+    );
+  }
+  const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  const materialization = materializeSosLightV3ProposalBodies({
+    output,
+    overlayRoot: runState.overlay_root,
+    runState,
+  });
+  process.stderr.write(`UK_AQ_INTEGRITY_PROGRESS ${JSON.stringify({
+    phase: "proposal_bodies_materialized",
+    completed_objects: materialization.file_backed_body_count,
+    total_objects: materialization.file_backed_body_count,
+    failures: 0,
+    file_backed_changed_body_count:
+      materialization.file_backed_changed_body_count,
+    file_backed_changed_body_total_bytes:
+      materialization.file_backed_changed_body_total_bytes,
+  })}\n`);
+  const envelope = writeSosLightV3ProposalArtifact({
+    output,
+    resultPath,
+    runRoot: runState.run_root,
+  });
+  process.stderr.write(`UK_AQ_INTEGRITY_PROGRESS ${JSON.stringify({
+    phase: "proposal_artifact_complete",
+    completed_objects: envelope.proposal_count,
+    total_objects: envelope.proposal_count,
+    failures: 0,
+    proposal_artifact_bytes: envelope.proposal_artifact.bytes,
+  })}\n`);
+  process.stdout.write(`${JSON.stringify(envelope)}\n`);
   if (!output.ok) process.exitCode = 1;
 }).catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

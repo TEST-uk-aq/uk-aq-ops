@@ -1,6 +1,5 @@
 /** Fixed-v3, SOS-light-only proposal validation boundary. */
 import fs from "node:fs";
-import path from "node:path";
 import { createHash } from "node:crypto";
 import {
   loadImmutableSourcePartition,
@@ -30,25 +29,18 @@ function validDay(day) {
   return DAY.test(day) && !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === day;
 }
 function exactArray(value, expected) { return JSON.stringify(value) === JSON.stringify(expected); }
-function localBody(runState, entry, key) {
+function localBody(entry, key) {
   const localPath = String(entry?.local_path || "");
-  const overlayRoot = path.resolve(String(runState?.overlay_root || ""));
-  const resolvedLocalPath = path.resolve(localPath);
-  const expectedLocalPath = path.resolve(overlayRoot, ...key.split("/"));
-  const relative = path.relative(overlayRoot, resolvedLocalPath);
   if (!entry?.proposed || !entry?.built || !entry?.structurally_validated
-      || !relative || relative.startsWith("..") || path.isAbsolute(relative)
-      || resolvedLocalPath !== expectedLocalPath
-      || fs.lstatSync(resolvedLocalPath, { throwIfNoEntry: false })?.isSymbolicLink()
-      || !fs.statSync(resolvedLocalPath, { throwIfNoEntry: false })?.isFile()) {
+      || !fs.statSync(localPath, { throwIfNoEntry: false })?.isFile()) {
     throw new Error(`Fixed-v3 staged object is not structurally validated: ${key}`);
   }
-  const body = fs.readFileSync(resolvedLocalPath);
+  const body = fs.readFileSync(localPath);
   if (!Number.isSafeInteger(Number(entry.bytes)) || body.byteLength !== Number(entry.bytes)
       || !SHA256.test(String(entry.sha256 || "")) || sha256(body) !== entry.sha256) {
     throw new Error(`Fixed-v3 staged object identity changed: ${key}`);
   }
-  return { localPath: resolvedLocalPath, body };
+  return { localPath, body };
 }
 function validateDependencies(runState, key, entry) {
   if (!Array.isArray(entry.dependencies)) throw new Error(`Fixed-v3 dependencies are not an array: ${key}`);
@@ -69,7 +61,7 @@ function validateDependencies(runState, key, entry) {
     if (!staged) {
       throw new Error(`Fixed-v3 dependency is outside the frozen proposal: ${key} -> ${dependencyKey}`);
     }
-    const { body } = localBody(runState, staged, dependencyKey);
+    const { body } = localBody(staged, dependencyKey);
     if (identity.source !== "planned_overlay" || body.byteLength !== Number(identity.bytes)
         || sha256(body) !== identity.sha256) {
       throw new Error(`Fixed-v3 current-run dependency identity is invalid: ${key} -> ${dependencyKey}`);
@@ -122,7 +114,7 @@ export function validateLocalSosLightV3Proposal(runState) {
     if (key.startsWith(V2_OBSERVATIONS_PREFIX) || key.startsWith(V2_INDEX_PREFIX)
         || !(key.startsWith(`${OBSERVATIONS_PREFIX}/`) || key.startsWith(`${INDEX_PREFIX}/`))
         || key.includes("/aqilevels/")) throw new Error(`Non-v3 SOS-light proposal key: ${key}`);
-    const loaded = localBody(runState, entry, key);
+    const loaded = localBody(entry, key);
     validateDependencies(runState, key, entry);
     return { key, entry, ...loaded, domain: "observations" };
   }).sort((a, b) => a.key.localeCompare(b.key));

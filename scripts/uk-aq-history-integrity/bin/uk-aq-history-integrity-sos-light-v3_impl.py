@@ -18139,6 +18139,68 @@ def stage_overlay_object(
     return target
 
 
+def stage_file_backed_proposal_object(
+    run_state: dict[str, Any],
+    *,
+    proposal: Mapping[str, Any],
+    object_key: str,
+    stage: str,
+    dependencies: Iterable[str] = (),
+    dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
+    resolved_body_identity: tuple[Path, str, int] | None = None,
+) -> Path:
+    normalized_key = _normalise_overlay_object_key(object_key)
+    target, actual_sha256, actual_bytes = (
+        resolved_body_identity
+        or _resolve_v3_proposal_body_reference(
+            run_state=run_state,
+            proposal=proposal,
+            object_key=normalized_key,
+        )
+    )
+    normalized_dependencies = sorted({
+        _normalise_overlay_object_key(value) for value in dependencies
+    })
+    supplied_identities = dependency_identities or {}
+    normalized_identities: dict[str, dict[str, Any]] = {}
+    for dependency in normalized_dependencies:
+        identity = supplied_identities.get(dependency)
+        if not isinstance(identity, Mapping):
+            raise ValueError(
+                f"overlay dependency identity is unavailable: {normalized_key} -> {dependency}"
+            )
+        normalized_identities[dependency] = _normalise_proposal_dependency_identity(
+            parent_key=normalized_key,
+            dependency_key=dependency,
+            identity=identity,
+        )
+    objects = run_state.get("objects")
+    if not isinstance(objects, dict):
+        raise ValueError("overlay run state has no objects mapping")
+    objects[normalized_key] = {
+        "object_key": normalized_key,
+        "local_path": str(target),
+        "sha256": actual_sha256,
+        "bytes": actual_bytes,
+        "stage": stage,
+        "dependencies": normalized_dependencies,
+        "dependency_identities": normalized_identities,
+        "proposed": True,
+        "built": True,
+        "structurally_validated": False,
+        "structurally_validated_at_utc": None,
+        "uploaded": False,
+        "uploaded_at_utc": None,
+        "r2_verified": False,
+        "r2_verified_at_utc": None,
+        "body_reference_contract_version":
+            SOS_LIGHT_V3_BODY_REFERENCE_CONTRACT,
+        "body_reference_source": "planned_overlay",
+    }
+    write_run_state(run_state)
+    return target
+
+
 def mark_overlay_structurally_validated(
     run_state: dict[str, Any], object_key: str
 ) -> None:
@@ -18410,6 +18472,19 @@ def _run_v2_observation_metadata_executor(
     )
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
+    stdout_limit_exceeded = threading.Event()
+    stdout_byte_limit = 64 * 1024
+
+    def _drain_bounded_stdout(stream: Any) -> None:
+        captured_bytes = 0
+        for chunk in iter(lambda: stream.read(8192), ""):
+            encoded_bytes = len(chunk.encode("utf-8"))
+            captured_bytes += encoded_bytes
+            if captured_bytes <= stdout_byte_limit:
+                stdout_lines.append(chunk)
+            else:
+                stdout_limit_exceeded.set()
+        stream.close()
 
     def _drain(stream: Any, destination: list[str], *, progress: bool) -> None:
         for line in iter(stream.readline, ""):
@@ -18419,7 +18494,7 @@ def _run_v2_observation_metadata_executor(
         stream.close()
 
     stdout_thread = threading.Thread(
-        target=_drain, args=(proc.stdout, stdout_lines), kwargs={"progress": False}, daemon=True,
+        target=_drain_bounded_stdout, args=(proc.stdout,), daemon=True,
     )
     stderr_thread = threading.Thread(
         target=_drain, args=(proc.stderr, stderr_lines), kwargs={"progress": True}, daemon=True,
@@ -18459,6 +18534,226 @@ def _run_v2_observation_metadata_executor(
     }
 
 
+SOS_LIGHT_V3_BODY_REFERENCE_CONTRACT = (
+    "uk_aq_sos_light_v3_overlay_body_ref_v1"
+)
+SOS_LIGHT_V3_PROPOSAL_ARTIFACT_CONTRACT = (
+    "uk_aq_sos_light_v3_compact_proposal_artifact_v1"
+)
+SOS_LIGHT_V3_PROPOSAL_TRANSPORT_CONTRACT = (
+    "uk_aq_sos_light_v3_file_backed_transport_v1"
+)
+
+
+def _file_sha256_and_bytes(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    byte_count = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            byte_count += len(chunk)
+    return digest.hexdigest(), byte_count
+
+
+def _path_inside_run_root(
+    *, root: Path, candidate: Path, label: str,
+) -> Path:
+    resolved_root = root.resolve(strict=True)
+    resolved = candidate.resolve(strict=True)
+    try:
+        relative = resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"{label} is outside its permitted run-local boundary") from exc
+    if not relative.parts:
+        raise ValueError(f"{label} does not identify a run-local file")
+    return resolved
+
+
+def _resolve_v3_proposal_body_reference(
+    *, run_state: Mapping[str, Any], proposal: Mapping[str, Any], object_key: str,
+) -> tuple[Path, str, int]:
+    normalized_key = _normalise_overlay_object_key(object_key)
+    reference = proposal.get("body_ref")
+    if not isinstance(reference, Mapping):
+        raise ValueError(
+            f"fixed-v3 proposal body reference is unavailable: {normalized_key}"
+        )
+    if (
+        str(reference.get("contract_version") or "")
+        != SOS_LIGHT_V3_BODY_REFERENCE_CONTRACT
+        or str(reference.get("source") or "") != "planned_overlay"
+    ):
+        raise ValueError(
+            f"fixed-v3 proposal body reference contract is invalid: {normalized_key}"
+        )
+    relative_path = _normalise_overlay_object_key(
+        str(reference.get("relative_path") or "")
+    )
+    if relative_path != normalized_key:
+        raise ValueError(
+            f"fixed-v3 proposal body reference does not match its object key: {normalized_key}"
+        )
+    overlay_root = Path(str(run_state.get("overlay_root") or ""))
+    candidate = overlay_root / relative_path
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError(
+            f"fixed-v3 proposal staged body is missing or unsafe: {normalized_key}"
+        )
+    resolved = _path_inside_run_root(
+        root=overlay_root,
+        candidate=candidate,
+        label=f"fixed-v3 proposal staged body {normalized_key}",
+    )
+    actual_sha256, actual_bytes = _file_sha256_and_bytes(resolved)
+    declared_sha256 = str(proposal.get("new_sha256") or "").strip().lower()
+    reference_sha256 = str(reference.get("sha256") or "").strip().lower()
+    declared_bytes = proposal.get("bytes")
+    reference_bytes = reference.get("bytes")
+    if (
+        not re.fullmatch(r"[a-f0-9]{64}", declared_sha256)
+        or reference_sha256 != declared_sha256
+        or not isinstance(declared_bytes, int)
+        or isinstance(declared_bytes, bool)
+        or declared_bytes < 0
+        or not isinstance(reference_bytes, int)
+        or isinstance(reference_bytes, bool)
+        or reference_bytes != declared_bytes
+        or actual_sha256 != declared_sha256
+        or actual_bytes != declared_bytes
+    ):
+        raise ValueError(
+            f"fixed-v3 proposal staged body identity is invalid: {normalized_key}"
+        )
+    return resolved, actual_sha256, actual_bytes
+
+
+def _load_authenticated_v3_proposal_result(
+    *,
+    run_state: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    expected_result_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if (
+        not isinstance(envelope, Mapping)
+        or envelope.get("schema_version") != 1
+        or envelope.get("kind")
+        != "uk_aq_sos_light_v3_proposal_transport_envelope"
+        or envelope.get("transport_contract_version")
+        != SOS_LIGHT_V3_PROPOSAL_TRANSPORT_CONTRACT
+        or envelope.get("transport_mode") != "file_backed_compact_proposal"
+        or envelope.get("status") != "planned"
+    ):
+        raise ValueError("fixed-v3 proposal transport envelope is invalid")
+    artifact_identity = envelope.get("proposal_artifact")
+    if not isinstance(artifact_identity, Mapping):
+        raise ValueError("fixed-v3 proposal artifact identity is unavailable")
+    if (
+        artifact_identity.get("contract_version")
+        != SOS_LIGHT_V3_PROPOSAL_ARTIFACT_CONTRACT
+    ):
+        raise ValueError("fixed-v3 proposal artifact contract is invalid")
+    run_root = Path(str(run_state.get("run_root") or ""))
+    relative_path = _normalise_overlay_object_key(
+        str(artifact_identity.get("relative_path") or "")
+    )
+    candidate = run_root / relative_path
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError("fixed-v3 proposal artifact is missing or unsafe")
+    artifact_path = _path_inside_run_root(
+        root=run_root,
+        candidate=candidate,
+        label="fixed-v3 proposal artifact",
+    )
+    if artifact_path != expected_result_path.resolve(strict=True):
+        raise ValueError("fixed-v3 proposal artifact path is not the requested result path")
+    actual_sha256, actual_bytes = _file_sha256_and_bytes(artifact_path)
+    expected_sha256 = str(artifact_identity.get("sha256") or "").strip().lower()
+    expected_bytes = artifact_identity.get("bytes")
+    if (
+        not re.fullmatch(r"[a-f0-9]{64}", expected_sha256)
+        or actual_sha256 != expected_sha256
+        or not isinstance(expected_bytes, int)
+        or isinstance(expected_bytes, bool)
+        or actual_bytes != expected_bytes
+    ):
+        raise ValueError("fixed-v3 proposal artifact identity is invalid")
+    with artifact_path.open("r", encoding="utf-8") as handle:
+        artifact = json.load(handle)
+    if (
+        not isinstance(artifact, Mapping)
+        or artifact.get("contract_version")
+        != SOS_LIGHT_V3_PROPOSAL_ARTIFACT_CONTRACT
+        or artifact.get("kind") != "uk_aq_sos_light_v3_compact_proposal"
+        or not isinstance(artifact.get("output"), Mapping)
+    ):
+        raise ValueError("fixed-v3 compact proposal artifact is invalid")
+    output = dict(artifact["output"])
+    if output.get("ok") is not True:
+        raise ValueError("fixed-v3 compact proposal did not complete successfully")
+    planning = output.get("planning")
+    proposals = planning.get("proposals") if isinstance(planning, Mapping) else None
+    if not isinstance(proposals, list):
+        raise ValueError("fixed-v3 compact proposal graph is unavailable")
+    file_backed_count = 0
+    file_backed_bytes = 0
+    file_backed_changed_count = 0
+    file_backed_changed_bytes = 0
+    for raw in proposals:
+        if not isinstance(raw, Mapping):
+            raise ValueError("fixed-v3 compact proposal entry is invalid")
+        proposal = raw
+        object_key = _normalise_overlay_object_key(str(proposal.get("key") or ""))
+        if proposal.get("proposed_body") is not None or proposal.get("body") is not None:
+            raise ValueError(
+                f"fixed-v3 compact proposal still contains an inline body: {object_key}"
+            )
+        if proposal.get("changed") is True or proposal.get("included_in_write_set") is True:
+            _, _, body_bytes = _resolve_v3_proposal_body_reference(
+                run_state=run_state,
+                proposal=proposal,
+                object_key=object_key,
+            )
+            file_backed_count += 1
+            file_backed_bytes += body_bytes
+            if proposal.get("changed") is True:
+                file_backed_changed_count += 1
+                file_backed_changed_bytes += body_bytes
+    if envelope.get("proposal_count") != len(proposals):
+        raise ValueError("fixed-v3 proposal envelope count is contradictory")
+    transport = planning.get("proposal_transport")
+    expected_counts = {
+        "proposal_count": len(proposals),
+        "file_backed_body_count": file_backed_count,
+        "file_backed_body_total_bytes": file_backed_bytes,
+        "file_backed_changed_body_count": file_backed_changed_count,
+        "file_backed_changed_body_total_bytes": file_backed_changed_bytes,
+    }
+    if not isinstance(transport, Mapping) or any(
+        transport.get(field) != value for field, value in expected_counts.items()
+    ):
+        raise ValueError("fixed-v3 proposal transport audit is contradictory")
+    if (
+        envelope.get("file_backed_changed_body_count")
+        != file_backed_changed_count
+        or envelope.get("file_backed_changed_body_total_bytes")
+        != file_backed_changed_bytes
+    ):
+        raise ValueError("fixed-v3 proposal envelope body counts are contradictory")
+    audit = {
+        "status": "authenticated",
+        "transport_mode": "file_backed_compact_proposal",
+        "proposal_artifact_path": str(artifact_path),
+        "proposal_artifact_relative_path": relative_path,
+        "proposal_artifact_sha256": actual_sha256,
+        "proposal_artifact_bytes": actual_bytes,
+        **expected_counts,
+    }
+    return output, audit
+
+
 def _run_v3_observation_metadata_proposal(
     *,
     env: Mapping[str, str],
@@ -18473,6 +18768,11 @@ def _run_v3_observation_metadata_proposal(
         return {"status": "not_run", "reason": "no_observation_metadata_actions", "results": []}
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
+    proposal_result_path = (
+        Path(str(run_state["run_root"]))
+        / "proposal-results"
+        / "fixed-v3-observation-metadata.json"
+    )
     command = [
         node_bin,
         str(repo_root / "scripts/backup_r2/uk_aq_plan_sos_light_v3_observation_metadata.mjs"),
@@ -18480,6 +18780,7 @@ def _run_v3_observation_metadata_proposal(
         "--overlay-root", str(run_state["overlay_root"]),
         "--dropbox-root", str(run_state["base_dropbox_root"]),
         "--run-state-json", str(run_state["run_state_path"]),
+        "--proposal-result-json", str(proposal_result_path),
     ]
     plan = {
         # Canonical manifest semantics deliberately remain v2; storage routing
@@ -18524,10 +18825,18 @@ def _run_v3_observation_metadata_proposal(
     stderr_thread.join()
     stdout = "".join(stdout_lines)
     stderr = "".join(stderr_lines)
+    if stdout_limit_exceeded.is_set():
+        return {
+            "status": "failed",
+            "exit_code": proc.returncode,
+            "error": "fixed-v3 proposal control envelope exceeded 64 KiB",
+            "output": {},
+            "results": [],
+        }
     try:
-        output = json.loads(stdout) if stdout.strip() else {}
+        envelope = json.loads(stdout) if stdout.strip() else {}
     except json.JSONDecodeError:
-        output = {}
+        envelope = {}
     if proc.returncode != 0:
         log.warning(
             "v3 observation metadata proposal failed exit_code=%s stderr=%s",
@@ -18535,17 +18844,33 @@ def _run_v3_observation_metadata_proposal(
             _truncate_text(stderr or stdout or "", 2000),
         )
         return {
-            "status": str(output.get("status") or "failed") if isinstance(output, Mapping) else "failed",
+            "status": str(envelope.get("status") or "failed") if isinstance(envelope, Mapping) else "failed",
             "exit_code": proc.returncode,
             "error": _truncate_text(stderr or stdout or "", 4000),
-            "output": output if isinstance(output, Mapping) else {},
-            "results": output.get("results") if isinstance(output, Mapping) else [],
+            "output": {},
+            "results": [],
+        }
+    try:
+        output, transport_audit = _load_authenticated_v3_proposal_result(
+            run_state=run_state,
+            envelope=envelope,
+            expected_result_path=proposal_result_path,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        return {
+            "status": "failed",
+            "exit_code": proc.returncode,
+            "error": str(exc),
+            "output": {},
+            "results": [],
+            "transport": dict(envelope) if isinstance(envelope, Mapping) else {},
         }
     return {
         "status": str(output.get("status") or "planned"),
         "exit_code": proc.returncode,
         "output": output,
         "results": output.get("results") if isinstance(output, Mapping) else [],
+        "transport": transport_audit,
     }
 
 
@@ -18558,6 +18883,7 @@ def _record_metadata_executor_overlay(
     index_scope_set: str = "OBS_INDEXES_CHANGED",
     manifest_stage: str = "observs_manifests",
     index_stage: str = "observs_indexes",
+    require_file_backed_bodies: bool = False,
 ) -> None:
     """Stage structurally validated metadata/index proposals locally."""
     del dry_run
@@ -18565,6 +18891,13 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning") if isinstance(output, Mapping) else None
     if not isinstance(planning, Mapping):
         return
+    transport = executor_result.get("transport")
+    if require_file_backed_bodies:
+        if not isinstance(transport, Mapping) or transport.get("status") != "authenticated":
+            raise ValueError(
+                "fixed-v3 authenticated proposal transport evidence is unavailable"
+            )
+        run_state["proposal_transport"] = dict(transport)
     core_identity_audit = planning.get("core_snapshot_identity_validation")
     if isinstance(core_identity_audit, Mapping):
         consumer_audit = run_state.setdefault(
@@ -18602,7 +18935,6 @@ def _record_metadata_executor_overlay(
         key=lambda item: str(item.get("key") or ""),
     ):
         object_key = str(proposal.get("key") or "").strip()
-        body = proposal.get("proposed_body")
         if not object_key:
             continue
         normalized_object_key = _normalise_overlay_object_key(object_key)
@@ -18617,45 +18949,78 @@ def _record_metadata_executor_overlay(
                 continue
         else:
             planner_unchanged_keys.discard(normalized_object_key)
-        if not isinstance(body, str):
-            raise ValueError(
-                "required planner proposal body is unavailable: "
-                f"{normalized_object_key}"
+        body_bytes: bytes | None = None
+        file_backed_identity: tuple[Path, str, int] | None = None
+        if require_file_backed_bodies:
+            if proposal.get("proposed_body") is not None or proposal.get("body") is not None:
+                raise ValueError(
+                    "fixed-v3 compact proposal contains an inline body: "
+                    f"{normalized_object_key}"
+                )
+            file_backed_identity = _resolve_v3_proposal_body_reference(
+                run_state=run_state,
+                proposal=proposal,
+                object_key=normalized_object_key,
             )
-        body_bytes = body.encode("utf-8")
+            _, actual_sha256, actual_bytes = file_backed_identity
+        else:
+            body = proposal.get("proposed_body")
+            if not isinstance(body, str):
+                raise ValueError(
+                    "required planner proposal body is unavailable: "
+                    f"{normalized_object_key}"
+                )
+            body_bytes = body.encode("utf-8")
+            actual_sha256 = hashlib.sha256(body_bytes).hexdigest()
+            actual_bytes = len(body_bytes)
         if required_sos_light_day_object and not planner_changed:
             old_sha256 = str(proposal.get("old_sha256") or "").strip().lower()
             new_sha256 = str(proposal.get("new_sha256") or "").strip().lower()
             declared_bytes = proposal.get("bytes")
-            actual_sha256 = hashlib.sha256(body_bytes).hexdigest()
             if (
                 old_sha256 != new_sha256
                 or new_sha256 != actual_sha256
                 or not isinstance(declared_bytes, int)
                 or isinstance(declared_bytes, bool)
-                or declared_bytes != len(body_bytes)
+                or declared_bytes != actual_bytes
             ):
                 raise ValueError(
                     "SOS-light unchanged required object identity is invalid: "
                     f"{normalized_object_key}"
                 )
-        with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-proposal-") as temp_dir:
-            source = Path(temp_dir) / "generated-object"
-            source.write_text(body, encoding="utf-8")
-            stage = str(proposal.get("publication_stage") or "").strip() or (
-                manifest_stage
-                if "manifest" in str(proposal.get("kind") or "")
-                else index_stage
-            )
-            stage_overlay_object(
-                run_state, object_key=object_key, source_path=source, stage=stage,
+        stage = str(proposal.get("publication_stage") or "").strip() or (
+            manifest_stage
+            if "manifest" in str(proposal.get("kind") or "")
+            else index_stage
+        )
+        if require_file_backed_bodies:
+            stage_file_backed_proposal_object(
+                run_state,
+                proposal=proposal,
+                object_key=object_key,
+                stage=stage,
                 dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
                 dependency_identities=(
                     proposal.get("dependency_identities")
                     if isinstance(proposal.get("dependency_identities"), Mapping)
                     else None
                 ),
+                resolved_body_identity=file_backed_identity,
             )
+        else:
+            assert body_bytes is not None
+            with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-proposal-") as temp_dir:
+                source = Path(temp_dir) / "generated-object"
+                source.write_bytes(body_bytes)
+                stage_overlay_object(
+                    run_state, object_key=object_key, source_path=source, stage=stage,
+                    dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
+                    dependency_identities=(
+                        proposal.get("dependency_identities")
+                        if isinstance(proposal.get("dependency_identities"), Mapping)
+                        else None
+                    ),
+                )
         snapshot = proposal.get("local_dependency_snapshot")
         staged_entry = _overlay_object_entry(run_state, object_key)
         staged_entry["changed"] = planner_changed
@@ -20966,7 +21331,26 @@ def validate_proposal_run_state_transition(
                 dependency_in_final_write_set=True,
             )
         local_path = Path(str(entry.get("local_path") or ""))
-        body = local_path.read_bytes() if local_path.is_file() else None
+        overlay_root = Path(str(run_state.get("overlay_root") or ""))
+        expected_local_path = overlay_root / parent_key
+        try:
+            resolved_local_path = _path_inside_run_root(
+                root=overlay_root,
+                candidate=local_path,
+                label=f"final staged object {parent_key}",
+            )
+            safe_local_path = (
+                not local_path.is_symlink()
+                and resolved_local_path == expected_local_path.resolve(strict=True)
+            )
+        except (FileNotFoundError, OSError, ValueError):
+            safe_local_path = False
+            resolved_local_path = local_path
+        body = (
+            resolved_local_path.read_bytes()
+            if safe_local_path and resolved_local_path.is_file()
+            else None
+        )
         declared_sha256 = str(entry.get("sha256") or "").strip().lower()
         declared_bytes = entry.get("bytes")
         if (
@@ -23513,7 +23897,12 @@ def run_v2_integrity_repair_flow(
     )
     if observation_failed:
         record_blocked_scope(run_state, {"stage": "observs_manifests", "reason": "observation_repair_failed"})
-    _record_metadata_executor_overlay(run_state=run_state, executor_result=metadata, dry_run=dry_run)
+    _record_metadata_executor_overlay(
+        run_state=run_state,
+        executor_result=metadata,
+        dry_run=dry_run,
+        require_file_backed_bodies=True,
+    )
     if dedicated_sos_historical_replacement and not observation_failed and str(
         metadata.get("status") or ""
     ) not in {"failed", "blocked_dependency"}:
