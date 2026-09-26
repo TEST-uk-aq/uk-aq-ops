@@ -17930,6 +17930,106 @@ PROPOSAL_TRANSITION_DEPENDENCY_SOURCES = frozenset({
     "planned_overlay", *PROPOSAL_TRANSITION_EXTERNAL_SOURCES,
 })
 FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX = "exact_prefix_replacement"
+COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
+COORDINATOR_PROGRESS_SECONDS = 15.0
+
+
+class _BoundedCoordinatorProgress:
+    """Emit stable progress events without producing one log line per object."""
+
+    def __init__(
+        self,
+        *,
+        log: logging.Logger | None,
+        phase: str,
+        total_objects: int | None,
+    ) -> None:
+        self.log = log
+        self.phase = phase
+        self.total_objects = total_objects
+        self.started_at = time.monotonic()
+        self.last_progress_at = self.started_at
+        self.last_completed_objects = 0
+
+    def _emit(
+        self,
+        suffix: str,
+        *,
+        completed_objects: int,
+        checkpoint_count: int | None = None,
+        changed_scope_count: int | None = None,
+        **details: Any,
+    ) -> None:
+        if self.log is None:
+            return
+        payload: dict[str, Any] = {
+            "phase": f"{self.phase}_{suffix}",
+            "completed_objects": completed_objects,
+            "total_objects": self.total_objects,
+            "elapsed_seconds": round(time.monotonic() - self.started_at, 3),
+        }
+        if checkpoint_count is not None:
+            payload["checkpoint_count"] = checkpoint_count
+        if changed_scope_count is not None:
+            payload["changed_scope_count"] = changed_scope_count
+        payload.update(details)
+        self.log.info(
+            "UK_AQ_INTEGRITY_PROGRESS %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    def start(self, **details: Any) -> None:
+        self._emit("started", completed_objects=0, **details)
+
+    def is_due(self, completed_objects: int) -> bool:
+        now = time.monotonic()
+        return (
+            completed_objects - self.last_completed_objects
+            >= COORDINATOR_PROGRESS_OBJECT_INTERVAL
+            or now - self.last_progress_at >= COORDINATOR_PROGRESS_SECONDS
+        )
+
+    def progress(
+        self,
+        completed_objects: int,
+        *,
+        force: bool = False,
+        **details: Any,
+    ) -> bool:
+        if not force and not self.is_due(completed_objects):
+            return False
+        self._emit("progress", completed_objects=completed_objects, **details)
+        self.last_completed_objects = completed_objects
+        self.last_progress_at = time.monotonic()
+        return True
+
+    def complete(self, completed_objects: int, **details: Any) -> None:
+        self._emit("complete", completed_objects=completed_objects, **details)
+
+
+def _emit_proposal_checkpoint_progress(
+    *,
+    log: logging.Logger | None,
+    suffix: str,
+    completed_objects: int,
+    total_objects: int,
+    checkpoint_count: int,
+    changed_scope_count: int,
+    started_at: float,
+) -> None:
+    if log is None:
+        return
+    log.info(
+        "UK_AQ_INTEGRITY_PROGRESS %s",
+        json.dumps({
+            "phase": f"proposal_run_state_checkpoint_{suffix}",
+            "completed_objects": completed_objects,
+            "total_objects": total_objects,
+            "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            "checkpoint_count": checkpoint_count,
+            "changed_scope_count": changed_scope_count,
+        }, sort_keys=True, separators=(",", ":")),
+    )
 
 
 def _normalise_proposal_dependency_identity(
@@ -18148,6 +18248,7 @@ def stage_file_backed_proposal_object(
     dependencies: Iterable[str] = (),
     dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
     resolved_body_identity: tuple[Path, str, int] | None = None,
+    persist: bool = True,
 ) -> Path:
     normalized_key = _normalise_overlay_object_key(object_key)
     target, actual_sha256, actual_bytes = (
@@ -18197,17 +18298,19 @@ def stage_file_backed_proposal_object(
             SOS_LIGHT_V3_BODY_REFERENCE_CONTRACT,
         "body_reference_source": "planned_overlay",
     }
-    write_run_state(run_state)
+    if persist:
+        write_run_state(run_state)
     return target
 
 
 def mark_overlay_structurally_validated(
-    run_state: dict[str, Any], object_key: str
+    run_state: dict[str, Any], object_key: str, *, persist: bool = True,
 ) -> None:
     entry = _overlay_object_entry(run_state, object_key)
     entry["structurally_validated"] = True
     entry["structurally_validated_at_utc"] = fmt_iso(utc_now())
-    write_run_state(run_state)
+    if persist:
+        write_run_state(run_state)
 
 
 def mark_overlay_uploaded(run_state: dict[str, Any], object_key: str) -> None:
@@ -18230,6 +18333,8 @@ def record_changed_scope(
     run_state: dict[str, Any],
     scope_set: str,
     scope: Mapping[str, Any],
+    *,
+    persist: bool = True,
 ) -> None:
     if scope_set not in OVERLAY_CHANGED_SCOPE_SETS:
         raise ValueError(f"unknown changed scope set: {scope_set}")
@@ -18241,7 +18346,8 @@ def record_changed_scope(
     if canonical_scope not in entries:
         entries.append(canonical_scope)
         entries.sort(key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")))
-    write_run_state(run_state)
+    if persist:
+        write_run_state(run_state)
 
 
 def record_blocked_scope(run_state: dict[str, Any], scope: Mapping[str, Any]) -> None:
@@ -18622,7 +18728,22 @@ def _load_authenticated_v3_proposal_result(
     run_state: Mapping[str, Any],
     envelope: Mapping[str, Any],
     expected_result_path: Path,
+    log: logging.Logger | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    envelope_proposal_count = (
+        envelope.get("proposal_count") if isinstance(envelope, Mapping) else None
+    )
+    progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="proposal_artifact_authentication",
+        total_objects=(
+            envelope_proposal_count
+            if isinstance(envelope_proposal_count, int)
+            and not isinstance(envelope_proposal_count, bool)
+            else None
+        ),
+    )
+    progress.start()
     if (
         not isinstance(envelope, Mapping)
         or envelope.get("schema_version") != 1
@@ -18684,11 +18805,12 @@ def _load_authenticated_v3_proposal_result(
     proposals = planning.get("proposals") if isinstance(planning, Mapping) else None
     if not isinstance(proposals, list):
         raise ValueError("fixed-v3 compact proposal graph is unavailable")
+    progress.total_objects = len(proposals)
     file_backed_count = 0
     file_backed_bytes = 0
     file_backed_changed_count = 0
     file_backed_changed_bytes = 0
-    for raw in proposals:
+    for completed_objects, raw in enumerate(proposals, start=1):
         if not isinstance(raw, Mapping):
             raise ValueError("fixed-v3 compact proposal entry is invalid")
         proposal = raw
@@ -18708,6 +18830,7 @@ def _load_authenticated_v3_proposal_result(
             if proposal.get("changed") is True:
                 file_backed_changed_count += 1
                 file_backed_changed_bytes += body_bytes
+        progress.progress(completed_objects)
     if envelope.get("proposal_count") != len(proposals):
         raise ValueError("fixed-v3 proposal envelope count is contradictory")
     transport = planning.get("proposal_transport")
@@ -18738,6 +18861,7 @@ def _load_authenticated_v3_proposal_result(
         "proposal_artifact_bytes": actual_bytes,
         **expected_counts,
     }
+    progress.complete(len(proposals))
     return output, audit
 
 
@@ -18855,6 +18979,7 @@ def _run_v3_observation_metadata_proposal(
             run_state=run_state,
             envelope=envelope,
             expected_result_path=proposal_result_path,
+            log=log,
         )
     except (OSError, TypeError, ValueError) as exc:
         return {
@@ -18884,6 +19009,7 @@ def _record_metadata_executor_overlay(
     manifest_stage: str = "observs_manifests",
     index_stage: str = "observs_indexes",
     require_file_backed_bodies: bool = False,
+    log: logging.Logger | None = None,
 ) -> None:
     """Stage structurally validated metadata/index proposals locally."""
     del dry_run
@@ -18930,10 +19056,119 @@ def _record_metadata_executor_overlay(
             run_state.get("proposal_transition_planner_unchanged_keys") or []
         )
     }
-    for proposal in sorted(
+    proposals = sorted(
         (item for item in list(planning.get("proposals") or []) if isinstance(item, Mapping)),
         key=lambda item: str(item.get("key") or ""),
-    ):
+    )
+    staged_proposal_count = sum(
+        1
+        for proposal in proposals
+        if str(proposal.get("key") or "").strip()
+        and (
+            proposal.get("changed") is True
+            or any(
+                _normalise_overlay_object_key(
+                    str(proposal.get("key") or "")
+                ).startswith(f"{prefix}/")
+                for prefix in sos_light_day_prefixes
+            )
+        )
+    )
+    staging_progress = _BoundedCoordinatorProgress(
+        log=log if require_file_backed_bodies else None,
+        phase="proposal_overlay_staging",
+        total_objects=staged_proposal_count,
+    )
+    staging_started_at = time.monotonic()
+    staging_progress.start()
+    completed_objects = 0
+    checkpoint_count = 0
+    last_checkpoint_count = 0
+    last_checkpoint_at = staging_started_at
+    bulk_scope_indexes: dict[str, dict[str, dict[str, Any]]] = {}
+    if require_file_backed_bodies:
+        changed_scopes = run_state.get("changed_scopes")
+        if not isinstance(changed_scopes, dict):
+            raise ValueError("overlay run state has no changed_scopes mapping")
+        for scope_set in (manifest_scope_set, index_scope_set):
+            scope_index: dict[str, dict[str, Any]] = {}
+            for raw_scope in list(changed_scopes.get(scope_set) or []):
+                if not isinstance(raw_scope, Mapping):
+                    raise ValueError(
+                        f"overlay changed scope is invalid: {scope_set}"
+                    )
+                canonical_scope = json.loads(json.dumps(
+                    dict(raw_scope), sort_keys=True, default=str,
+                ))
+                scope_index[json.dumps(
+                    canonical_scope, sort_keys=True, separators=(",", ":"),
+                )] = canonical_scope
+            bulk_scope_indexes[scope_set] = scope_index
+        run_state["proposal_ingestion"] = {
+            "status": "in_progress",
+            "transport_mode": "file_backed_compact_proposal",
+            "completed_object_count": 0,
+            "total_object_count": staged_proposal_count,
+            "checkpoint_count": 0,
+            "node_apply_launch_permitted": False,
+            "started_at_utc": fmt_iso(utc_now()),
+        }
+
+    def persist_bulk_checkpoint(*, final: bool) -> None:
+        nonlocal checkpoint_count, last_checkpoint_at, last_checkpoint_count
+        if not require_file_backed_bodies:
+            return
+        changed_scopes = run_state["changed_scopes"]
+        for scope_set, scope_index in bulk_scope_indexes.items():
+            changed_scopes[scope_set] = [
+                scope_index[key] for key in sorted(scope_index)
+            ]
+        run_state["proposal_transition_planner_unchanged_keys"] = sorted(
+            planner_unchanged_keys
+        )
+        checkpoint_count += 1
+        changed_scope_count = sum(
+            len(scope_index) for scope_index in bulk_scope_indexes.values()
+        )
+        ingestion = run_state["proposal_ingestion"]
+        ingestion.update({
+            "status": "complete" if final else "in_progress",
+            "completed_object_count": completed_objects,
+            "total_object_count": staged_proposal_count,
+            "checkpoint_count": checkpoint_count,
+            "changed_scope_count": changed_scope_count,
+            "node_apply_launch_permitted": False,
+            "completed_at_utc": fmt_iso(utc_now()) if final else None,
+        })
+        _emit_proposal_checkpoint_progress(
+            log=log,
+            suffix="started",
+            completed_objects=completed_objects,
+            total_objects=staged_proposal_count,
+            checkpoint_count=checkpoint_count,
+            changed_scope_count=changed_scope_count,
+            started_at=staging_started_at,
+        )
+        write_run_state(run_state)
+        _emit_proposal_checkpoint_progress(
+            log=log,
+            suffix="complete",
+            completed_objects=completed_objects,
+            total_objects=staged_proposal_count,
+            checkpoint_count=checkpoint_count,
+            changed_scope_count=changed_scope_count,
+            started_at=staging_started_at,
+        )
+        staging_progress.progress(
+            completed_objects,
+            force=True,
+            checkpoint_count=checkpoint_count,
+            changed_scope_count=changed_scope_count,
+        )
+        last_checkpoint_count = completed_objects
+        last_checkpoint_at = time.monotonic()
+
+    for proposal in proposals:
         object_key = str(proposal.get("key") or "").strip()
         if not object_key:
             continue
@@ -19006,6 +19241,7 @@ def _record_metadata_executor_overlay(
                     else None
                 ),
                 resolved_body_identity=file_backed_identity,
+                persist=False,
             )
         else:
             assert body_bytes is not None
@@ -19064,14 +19300,37 @@ def _record_metadata_executor_overlay(
                     FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX,
                 "final_source": "planned_overlay",
             })
-        mark_overlay_structurally_validated(run_state, object_key)
+        mark_overlay_structurally_validated(
+            run_state,
+            object_key,
+            persist=not require_file_backed_bodies,
+        )
         if planner_changed:
             scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
-            record_changed_scope(run_state, scope_set, {
+            scope = {
                 "object_key": object_key,
                 "stage": stage,
                 "provenance": proposal.get("provenance") or "repair_generated",
-            })
+            }
+            if require_file_backed_bodies:
+                canonical_scope = json.loads(json.dumps(
+                    scope, sort_keys=True, default=str,
+                ))
+                bulk_scope_indexes[scope_set][json.dumps(
+                    canonical_scope,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )] = canonical_scope
+            else:
+                record_changed_scope(run_state, scope_set, scope)
+        completed_objects += 1
+        if require_file_backed_bodies and (
+            completed_objects - last_checkpoint_count
+            >= COORDINATOR_PROGRESS_OBJECT_INTERVAL
+            or time.monotonic() - last_checkpoint_at
+            >= COORDINATOR_PROGRESS_SECONDS
+        ):
+            persist_bulk_checkpoint(final=False)
     run_state["proposal_transition_planner_unchanged_keys"] = sorted(
         planner_unchanged_keys
     )
@@ -19104,16 +19363,36 @@ def _record_metadata_executor_overlay(
         {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
         key=lambda entry: str(entry["prefix"]),
     )
-    write_run_state(run_state)
+    if require_file_backed_bodies:
+        persist_bulk_checkpoint(final=True)
+        changed_scope_count = sum(
+            len(scope_index) for scope_index in bulk_scope_indexes.values()
+        )
+        staging_progress.complete(
+            completed_objects,
+            checkpoint_count=checkpoint_count,
+            changed_scope_count=changed_scope_count,
+        )
+    else:
+        write_run_state(run_state)
 
 
 def _finalise_staged_write_set_provenance(
     run_state: dict[str, Any],
+    *,
+    log: logging.Logger | None = None,
 ) -> dict[str, Any]:
     """Freeze dependency ownership from complete final staged membership."""
     objects = run_state.get("objects")
     if not isinstance(objects, dict):
         raise ValueError("final staged write-set objects mapping is unavailable")
+    progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="final_staged_write_set_finalisation",
+        total_objects=len(objects) * 2,
+    )
+    progress.start()
+    completed_objects = 0
     proposed_prefixes = [
         _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
         for entry in list(run_state.get("tombstone_prefixes") or [])
@@ -19151,6 +19430,8 @@ def _finalise_staged_write_set_provenance(
                     f"forced-republication audit is invalid: {object_key}"
                 )
             forced_republication_keys.append(object_key)
+        completed_objects += 1
+        progress.progress(completed_objects)
 
     rebuilt_identity_count = 0
     staged_dependency_edge_count = 0
@@ -19203,6 +19484,8 @@ def _finalise_staged_write_set_provenance(
                 rebuilt_identity_count += 1
             final_identities[dependency_key] = final_identity
         entry["dependency_identities"] = final_identities
+        completed_objects += 1
+        progress.progress(completed_objects)
 
     audit = {
         "status": "finalised",
@@ -19218,6 +19501,7 @@ def _finalise_staged_write_set_provenance(
         "external_dependency_edge_counts": external_dependency_edge_counts,
     }
     run_state["final_staged_write_set_provenance"] = audit
+    progress.complete(completed_objects)
     return audit
 
 
@@ -19256,7 +19540,11 @@ def _validated_observation_pollutant_manifest_row_count(
     return row_count
 
 
-def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any]:
+def assemble_sos_light_complete_days(
+    run_state: dict[str, Any],
+    *,
+    log: logging.Logger | None = None,
+) -> dict[str, Any]:
     """Materialise the source-plus-Dropbox day proposal, then select full-day deletion."""
     validate_run_state_core_snapshot_identity(
         run_state,
@@ -19270,6 +19558,13 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
     day_entries = [entry for entry in list(audit.get("days") or []) if isinstance(entry, Mapping)]
     if not day_entries:
         raise ValueError("SOS-light local assembly contains no selected days")
+    assembly_progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="sos_light_complete_day_assembly",
+        total_objects=None,
+    )
+    assembly_progress.start(selected_day_count=len(day_entries))
+    assembly_work_count = 0
     old_prefixes = [
         _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
         for entry in list(run_state.get("tombstone_prefixes") or [])
@@ -19321,7 +19616,7 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
 
     total_day_uploads = 0
     dropbox_day_absent_days: list[str] = []
-    for raw_day in day_entries:
+    for completed_days, raw_day in enumerate(day_entries, start=1):
         day = dict(raw_day)
         day_utc = str(day.get("day_utc") or "")
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc):
@@ -19375,6 +19670,11 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
             if dropbox_day_present
             else []
         ):
+            assembly_work_count += 1
+            assembly_progress.progress(
+                assembly_work_count,
+                completed_days=completed_days - 1,
+            )
             object_key = source.relative_to(dropbox_root).as_posix()
             baseline_pollutant = requested_baseline_manifest_keys.get(
                 object_key
@@ -19430,6 +19730,11 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         # including Dropbox-derived sibling connectors.  These identities are
         # part of the preflight graph; apply must never rediscover them live.
         for object_key in day_keys:
+            assembly_work_count += 1
+            assembly_progress.progress(
+                assembly_work_count,
+                completed_days=completed_days - 1,
+            )
             entry = objects[object_key]
             if object_key.endswith(".parquet"):
                 entry["stage"] = "observations_data"
@@ -19560,7 +19865,10 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         }
         for entry in sorted(day_entries, key=lambda value: str(value["day_utc"]))
     ]
-    final_provenance = _finalise_staged_write_set_provenance(run_state)
+    final_provenance = _finalise_staged_write_set_provenance(
+        run_state,
+        log=log,
+    )
     forced_republication_keys = set(
         final_provenance["forced_republication_keys"]
     )
@@ -19637,6 +19945,11 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
     })
     run_state["mode"] = "sos-light"
     write_run_state(run_state)
+    assembly_progress.total_objects = assembly_work_count
+    assembly_progress.complete(
+        assembly_work_count,
+        completed_days=len(day_entries),
+    )
     return dict(audit)
 
 def _capture_local_v2_observation_scope(
@@ -21071,11 +21384,20 @@ def record_integrity_object_operations(
     *,
     run_id: int,
     run_state: Mapping[str, Any],
+    log: logging.Logger | None = None,
 ) -> dict[str, int]:
     """Persist planned and completed object states without conflating them."""
     now_iso = fmt_iso(utc_now())
     counts = {"planned_writes": 0, "planned_deletions": 0, "completed_writes": 0, "completed_deletions": 0}
-    for object_key, entry in sorted(dict(run_state.get("objects") or {}).items()):
+    object_entries = sorted(dict(run_state.get("objects") or {}).items())
+    progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="integrity_object_operations_persistence",
+        total_objects=len(object_entries),
+    )
+    progress.start()
+    completed_objects = 0
+    for object_key, entry in object_entries:
         if not isinstance(entry, Mapping):
             continue
         remote_completed = bool(entry.get("remote_completed") or entry.get("r2_verified"))
@@ -21111,6 +21433,8 @@ def record_integrity_object_operations(
                 entry.get("error"), now_iso,
             ),
         )
+        completed_objects += 1
+        progress.progress(completed_objects)
     for prefix_entry in list(run_state.get("tombstone_prefixes") or []):
         if not isinstance(prefix_entry, Mapping) or not prefix_entry.get("prefix"):
             continue
@@ -21159,6 +21483,7 @@ def record_integrity_object_operations(
                 (int(run_id), deleted_key, _object_operation_domain(deleted_key), now_iso),
             )
     conn.commit()
+    progress.complete(completed_objects)
     return counts
 
 
@@ -21209,6 +21534,8 @@ def _proposal_transition_error(
 
 def validate_proposal_run_state_transition(
     run_state: Mapping[str, Any],
+    *,
+    log: logging.Logger | None = None,
 ) -> dict[str, Any]:
     objects = run_state.get("objects")
     if objects is None:
@@ -21221,6 +21548,13 @@ def validate_proposal_run_state_transition(
     changed_keys = {
         _normalise_overlay_object_key(str(key)) for key in objects
     }
+    progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="proposal_transition_validation",
+        total_objects=len(changed_keys),
+    )
+    progress.start()
+    completed_objects = 0
     unchanged_planner_keys = {
         _normalise_overlay_object_key(str(key))
         for key in list(
@@ -21629,8 +21963,10 @@ def validate_proposal_run_state_transition(
                         else None
                     ),
                 )
+        completed_objects += 1
+        progress.progress(completed_objects)
 
-    return {
+    result = {
         "status": "succeeded",
         "changed_object_count": len(changed_keys),
         "dependency_edge_count": staged_edge_count + sum(external_edge_counts.values()),
@@ -21642,6 +21978,50 @@ def validate_proposal_run_state_transition(
         "unchanged_planner_object_count": len(unchanged_planner_keys),
         "node_apply_launch_permitted": True,
     }
+    progress.complete(completed_objects)
+    return result
+
+
+def _require_complete_persisted_file_backed_proposal(
+    run_state: Mapping[str, Any],
+) -> None:
+    transport = run_state.get("proposal_transport")
+    if (
+        not isinstance(transport, Mapping)
+        or transport.get("transport_mode") != "file_backed_compact_proposal"
+    ):
+        return
+    ingestion = run_state.get("proposal_ingestion")
+    if (
+        not isinstance(ingestion, Mapping)
+        or ingestion.get("status") != "complete"
+        or ingestion.get("node_apply_launch_permitted") is not False
+        or ingestion.get("completed_object_count")
+        != ingestion.get("total_object_count")
+    ):
+        raise ValueError(
+            "fixed-v3 proposal ingestion has no complete fail-closed checkpoint"
+        )
+    final_provenance = run_state.get("final_staged_write_set_provenance")
+    if (
+        not isinstance(final_provenance, Mapping)
+        or final_provenance.get("status") != "finalised"
+    ):
+        raise ValueError(
+            "fixed-v3 final staged write-set provenance is not finalised"
+        )
+    state_path = Path(str(run_state.get("run_state_path") or ""))
+    try:
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "fixed-v3 complete final run-state checkpoint is unavailable"
+        ) from exc
+    current = json.loads(json.dumps(run_state, default=str))
+    if persisted != current:
+        raise ValueError(
+            "fixed-v3 complete final run-state checkpoint is stale"
+        )
 
 
 def run_canonical_apply_executor(
@@ -21650,6 +22030,27 @@ def run_canonical_apply_executor(
     env: Mapping[str, str],
     log: logging.Logger,
 ) -> dict[str, Any]:
+    try:
+        _require_complete_persisted_file_backed_proposal(run_state)
+    except (OSError, TypeError, ValueError) as exc:
+        error = str(exc)
+        run_state["proposal_transition_validation"] = {
+            "status": "failed",
+            "stage": "complete_final_run_state_checkpoint",
+            "error": error,
+            "node_apply_launch_permitted": False,
+            "r2_mutation_possible": False,
+            "validated_at_utc": fmt_iso(utc_now()),
+        }
+        write_run_state(run_state)
+        log.error("%s", error)
+        return {
+            "status": "failed",
+            "reason": "complete_final_run_state_checkpoint_invalid",
+            "error": error,
+            "node_apply_launched": False,
+            "r2_mutation_possible": False,
+        }
     try:
         validate_run_state_core_snapshot_identity(
             run_state,
@@ -21674,8 +22075,21 @@ def run_canonical_apply_executor(
             "node_apply_launched": False,
             "r2_mutation_possible": False,
         }
+    transport = run_state.get("proposal_transport")
+    if (
+        isinstance(transport, Mapping)
+        and transport.get("transport_mode")
+        == "file_backed_compact_proposal"
+    ):
+        # Core identity validation records its consumer audit in memory.  Freeze
+        # that final pre-transition state before the body/provenance pass.
+        write_run_state(run_state)
+        _require_complete_persisted_file_backed_proposal(run_state)
     try:
-        transition_validation = validate_proposal_run_state_transition(run_state)
+        transition_validation = validate_proposal_run_state_transition(
+            run_state,
+            log=log,
+        )
     except (OSError, TypeError, ValueError) as exc:
         error = str(exc)
         run_state["proposal_transition_validation"] = {
@@ -23902,11 +24316,12 @@ def run_v2_integrity_repair_flow(
         executor_result=metadata,
         dry_run=dry_run,
         require_file_backed_bodies=True,
+        log=log,
     )
     if dedicated_sos_historical_replacement and not observation_failed and str(
         metadata.get("status") or ""
     ) not in {"failed", "blocked_dependency"}:
-        assemble_sos_light_complete_days(run_state)
+        assemble_sos_light_complete_days(run_state, log=log)
     observation_manifest_status = str(metadata.get("manifest_status") or metadata.get("status") or "not_run")
     observation_index_status = str(metadata.get("index_status") or metadata.get("status") or "not_run")
     proposal_failed = (
@@ -23916,7 +24331,7 @@ def run_v2_integrity_repair_flow(
         or bool(run_state.get("blocked_scopes"))
     )
     planned_operation_counts = record_integrity_object_operations(
-        conn, run_id=run_id, run_state=run_state,
+        conn, run_id=run_id, run_state=run_state, log=log,
     )
     has_planned_r2_operations = (
         int(planned_operation_counts.get("planned_writes") or 0) > 0
@@ -24008,7 +24423,9 @@ def run_v2_integrity_repair_flow(
         }
     else:
         apply_result = run_canonical_apply_executor(run_state=run_state, env=env, log=log)
-        record_integrity_object_operations(conn, run_id=run_id, run_state=run_state)
+        record_integrity_object_operations(
+            conn, run_id=run_id, run_state=run_state, log=log,
+        )
         if apply_result.get("status") == "succeeded":
             pass
 

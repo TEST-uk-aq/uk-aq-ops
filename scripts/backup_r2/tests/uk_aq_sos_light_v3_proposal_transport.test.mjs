@@ -10,6 +10,9 @@ import {
   SOS_LIGHT_V3_BODY_REFERENCE_CONTRACT,
   writeSosLightV3ProposalArtifact,
 } from "../lib/sos_light_v3_proposal_transport.mjs";
+import {
+  requireCoordinatorProposalFreeze,
+} from "../lib/sos_light_v3_proposal_validation.mjs";
 
 function proposal(key, body, overrides = {}) {
   return {
@@ -137,4 +140,50 @@ test("materialisation reuses an exact staged body and rejects an outside staged 
     fs.rmSync(runRoot, { recursive: true, force: true });
     fs.rmSync(outsideRoot, { recursive: true, force: true });
   }
+});
+
+test("fixed-v3 apply rejects every intermediate coordinator checkpoint", () => {
+  const complete = {
+    objects: { "history/_index_v3/example.json": {} },
+    proposal_ingestion: {
+      status: "complete",
+      transport_mode: "file_backed_compact_proposal",
+      completed_object_count: 1,
+      total_object_count: 1,
+      node_apply_launch_permitted: false,
+    },
+    final_staged_write_set_provenance: {
+      status: "finalised",
+      final_staged_object_count: 1,
+    },
+    proposal_transition_validation: {
+      status: "succeeded",
+      node_apply_launch_permitted: true,
+    },
+  };
+  assert.doesNotThrow(() => requireCoordinatorProposalFreeze(complete));
+  assert.throws(
+    () => requireCoordinatorProposalFreeze({
+      ...complete,
+      proposal_ingestion: {
+        ...complete.proposal_ingestion,
+        status: "in_progress",
+      },
+    }),
+    /ingestion checkpoint is incomplete/,
+  );
+  assert.throws(
+    () => requireCoordinatorProposalFreeze({
+      ...complete,
+      final_staged_write_set_provenance: undefined,
+    }),
+    /write-set provenance is incomplete/,
+  );
+  assert.throws(
+    () => requireCoordinatorProposalFreeze({
+      ...complete,
+      proposal_transition_validation: undefined,
+    }),
+    /transition validation is not frozen/,
+  );
 });

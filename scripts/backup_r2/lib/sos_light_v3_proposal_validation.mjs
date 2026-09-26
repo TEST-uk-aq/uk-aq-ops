@@ -77,6 +77,28 @@ function validateDependencies(runState, key, entry) {
   }
 }
 
+export function requireCoordinatorProposalFreeze(runState) {
+  const ingestion = runState?.proposal_ingestion;
+  const finalProvenance = runState?.final_staged_write_set_provenance;
+  const transition = runState?.proposal_transition_validation;
+  if (ingestion?.status !== "complete"
+      || ingestion?.transport_mode !== "file_backed_compact_proposal"
+      || ingestion?.node_apply_launch_permitted !== false
+      || !Number.isSafeInteger(Number(ingestion?.completed_object_count))
+      || Number(ingestion.completed_object_count) !== Number(ingestion?.total_object_count)) {
+    throw new Error("Fixed-v3 proposal ingestion checkpoint is incomplete");
+  }
+  if (finalProvenance?.status !== "finalised"
+      || Number(finalProvenance?.final_staged_object_count)
+        !== Object.keys(runState?.objects || {}).length) {
+    throw new Error("Fixed-v3 final staged write-set provenance is incomplete");
+  }
+  if (transition?.status !== "succeeded"
+      || transition?.node_apply_launch_permitted !== true) {
+    throw new Error("Fixed-v3 coordinator transition validation is not frozen");
+  }
+}
+
 export function validateDedicatedSosHistoricalProposalV3({ runState, proposal }) {
   if (runState?.execution_path !== "sos_light" || runState.mode !== "sos-light"
       || !["TEST", "LIVE"].includes(runState.environment)
@@ -117,6 +139,7 @@ export function validateDedicatedSosHistoricalProposalV3({ runState, proposal })
 
 export function validateLocalSosLightV3Proposal(runState) {
   if (!runState || typeof runState !== "object") throw new Error("SOS-light-v3 run state must be an object");
+  requireCoordinatorProposalFreeze(runState);
   const objects = Object.entries(runState.objects || {}).map(([rawKey, entry]) => {
     const key = safeKey(rawKey);
     if (key.startsWith(V2_OBSERVATIONS_PREFIX) || key.startsWith(V2_INDEX_PREFIX)
