@@ -14,16 +14,6 @@ export const OBSERVATION_PARQUET_COPY_MODES = Object.freeze([
   "reuse_matching",
 ]);
 
-const OBSERVATION_PARQUET_PROOF_FALLBACK_REASONS = new Set([
-  "preceding_checkpoint_day_missing",
-  "preceding_checkpoint_shard_unauthenticated",
-  "preceding_manifest_chain_unauthenticated",
-  "current_manifest_chain_unauthenticated",
-  "destination_missing",
-  "destination_byte_size_mismatch",
-  "unsafe_filter_path",
-]);
-
 const SAFE_FILTER_RELATIVE_PATH = /^[A-Za-z0-9._=/-]+\.parquet$/;
 
 function normalizeKey(value, label) {
@@ -128,17 +118,6 @@ export function normalizeObservationParquetCopyMode(value) {
     );
   }
   return mode;
-}
-
-export function snapshotPrecedingObservationMonthState(monthState) {
-  if (!monthState || typeof monthState !== "object" || Array.isArray(monthState)) {
-    throw new Error("Preceding observation month state must be an object");
-  }
-  const days = Object.freeze(
-    (Array.isArray(monthState.days) ? monthState.days : [])
-      .map((day) => Object.freeze({ ...day })),
-  );
-  return Object.freeze({ ...monthState, days });
 }
 
 export function authenticatePrecedingObservationDayState({
@@ -325,49 +304,41 @@ export function planObservationParquetReuse({
   const reusable = [];
   const copyRequired = [];
   const fallbackReasons = {};
-  let fallbackCount = 0;
-  const recordCopyRequired = (file, reason) => {
-    const isFallback = OBSERVATION_PARQUET_PROOF_FALLBACK_REASONS.has(reason);
-    copyRequired.push({
-      ...file,
-      copy_reason: reason,
-      ...(isFallback ? { fallback_reason: reason } : {}),
-    });
-    if (!isFallback) return;
-    fallbackCount += 1;
+  const recordFallback = (file, reason) => {
+    copyRequired.push({ ...file, fallback_reason: reason });
     fallbackReasons[reason] = (fallbackReasons[reason] || 0) + 1;
   };
 
   for (const file of currentFiles || []) {
     if (baselineFailureReason) {
-      recordCopyRequired(file, baselineFailureReason);
+      recordFallback(file, baselineFailureReason);
       continue;
     }
     const prior = priorByKey.get(file.key);
     if (!prior) {
-      recordCopyRequired(file, "prior_key_missing");
+      recordFallback(file, "prior_key_missing");
       continue;
     }
     if (prior.sha256 !== file.sha256) {
-      recordCopyRequired(file, "canonical_sha256_mismatch");
+      recordFallback(file, "canonical_sha256_mismatch");
       continue;
     }
     if (prior.byte_size !== file.byte_size) {
-      recordCopyRequired(file, "canonical_byte_size_mismatch");
+      recordFallback(file, "canonical_byte_size_mismatch");
       continue;
     }
     const relative = observationParquetFilterRelativePath(file.key, dayRelativePath);
     if (!relative) {
-      recordCopyRequired(file, "unsafe_filter_path");
+      recordFallback(file, "unsafe_filter_path");
       continue;
     }
     const destination = destinationEntryFor(destinationFiles, file.key);
     if (!destination) {
-      recordCopyRequired(file, "destination_missing");
+      recordFallback(file, "destination_missing");
       continue;
     }
     if (Number(destination.size) !== file.byte_size) {
-      recordCopyRequired(file, "destination_byte_size_mismatch");
+      recordFallback(file, "destination_byte_size_mismatch");
       continue;
     }
     reusable.push({ ...file, filter_relative_path: relative });
@@ -380,7 +351,7 @@ export function planObservationParquetReuse({
     reused_bytes: reusable.reduce((sum, file) => sum + file.byte_size, 0),
     copy_required_count: copyRequired.length,
     copy_required_bytes: copyRequired.reduce((sum, file) => sum + file.byte_size, 0),
-    fallback_count: fallbackCount,
+    fallback_count: copyRequired.length,
     fallback_reasons: Object.freeze({ ...fallbackReasons }),
   });
 }

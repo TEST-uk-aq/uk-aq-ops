@@ -11,7 +11,12 @@ import {
   buildObservationParquetExcludePatterns,
   normalizeObservationParquetCopyMode,
   planObservationParquetReuse,
+  snapshotPrecedingObservationMonthState,
 } from "../scripts/backup_r2/lib/observation_parquet_reuse.mjs";
+import {
+  emptyObservationMonthState,
+  markObservationDayCopied,
+} from "../scripts/backup_r2/lib/hierarchical_backup_v2.mjs";
 import {
   parseLockedHistoryBackupArgs,
   runLockedHistoryBackup,
@@ -201,42 +206,208 @@ test("exact authenticated key, bytes and SHA-256 is reusable", () => {
   );
 });
 
-test("SHA mismatch, size mismatch and missing destination each fall back to copy", () => {
+test("copy-required and proof-fallback reporting classifications remain distinct", () => {
   const current = authenticate(manifestChain());
   const cases = [
     {
+      name: "exact match",
+      previous: current,
+      destination: new Map([[PARQUET_KEY, { size: 123 }]]),
+      copyRequired: 0,
+      fallback: 0,
+      reason: null,
+    },
+    {
+      name: "new key",
+      previous: [],
+      destination: new Map([[PARQUET_KEY, { size: 123 }]]),
+      copyRequired: 1,
+      fallback: 0,
+      reason: null,
+    },
+    {
+      name: "SHA mismatch",
       previous: authenticate(manifestChain({ sha256: "b".repeat(64) })),
       destination: new Map([[PARQUET_KEY, { size: 123 }]]),
-      reason: "canonical_sha256_mismatch",
+      copyRequired: 1,
+      fallback: 0,
+      reason: null,
     },
     {
+      name: "canonical size mismatch",
       previous: authenticate(manifestChain({ bytes: 122 })),
       destination: new Map([[PARQUET_KEY, { size: 123 }]]),
-      reason: "canonical_byte_size_mismatch",
+      copyRequired: 1,
+      fallback: 0,
+      reason: null,
     },
     {
+      name: "unauthenticated checkpoint",
+      previous: [],
+      destination: new Map(),
+      baselineFailureReason: "preceding_checkpoint_shard_unauthenticated",
+      copyRequired: 1,
+      fallback: 1,
+      reason: "preceding_checkpoint_shard_unauthenticated",
+    },
+    {
+      name: "missing preceding checkpoint day",
+      previous: [],
+      destination: new Map(),
+      baselineFailureReason: "preceding_checkpoint_day_missing",
+      copyRequired: 1,
+      fallback: 1,
+      reason: "preceding_checkpoint_day_missing",
+    },
+    {
+      name: "unauthenticated preceding manifest chain",
+      previous: [],
+      destination: new Map(),
+      baselineFailureReason: "preceding_manifest_chain_unauthenticated",
+      copyRequired: 1,
+      fallback: 1,
+      reason: "preceding_manifest_chain_unauthenticated",
+    },
+    {
+      name: "unauthenticated current manifest chain",
+      previous: [],
+      destination: new Map(),
+      baselineFailureReason: "current_manifest_chain_unauthenticated",
+      copyRequired: 1,
+      fallback: 1,
+      reason: "current_manifest_chain_unauthenticated",
+    },
+    {
+      name: "missing destination",
       previous: current,
       destination: new Map(),
+      copyRequired: 1,
+      fallback: 1,
       reason: "destination_missing",
     },
     {
+      name: "destination size mismatch",
       previous: current,
       destination: new Map([[PARQUET_KEY, { size: 122 }]]),
+      copyRequired: 1,
+      fallback: 1,
       reason: "destination_byte_size_mismatch",
+    },
+    {
+      name: "unsafe filter path",
+      current: [{
+        ...current[0],
+        key: "history/v2/observations/day_utc=2026-08-05/part-000.parquet",
+      }],
+      previous: [{
+        ...current[0],
+        key: "history/v2/observations/day_utc=2026-08-05/part-000.parquet",
+      }],
+      destination: new Map([
+        ["history/v2/observations/day_utc=2026-08-05/part-000.parquet", { size: 123 }],
+      ]),
+      copyRequired: 1,
+      fallback: 1,
+      reason: "unsafe_filter_path",
     },
   ];
   for (const entry of cases) {
     const plan = planObservationParquetReuse({
       dayRelativePath: DAY_ROOT,
-      currentFiles: current,
+      currentFiles: entry.current || current,
       previousFiles: entry.previous,
       destinationFiles: entry.destination,
+      baselineFailureReason: entry.baselineFailureReason,
     });
-    assert.equal(plan.reused_count, 0);
-    assert.equal(plan.copy_required_count, 1);
-    assert.equal(plan.copy_required_bytes, 123);
-    assert.equal(plan.fallback_reasons[entry.reason], 1);
+    assert.equal(
+      plan.reused_count,
+      entry.name === "exact match" ? 1 : 0,
+      entry.name,
+    );
+    assert.equal(plan.copy_required_count, entry.copyRequired, entry.name);
+    assert.equal(plan.copy_required_bytes, entry.copyRequired * 123, entry.name);
+    assert.equal(plan.fallback_count, entry.fallback, entry.name);
+    assert.deepEqual(
+      plan.fallback_reasons,
+      entry.reason ? { [entry.reason]: 1 } : {},
+      entry.name,
+    );
   }
+});
+
+test("all changed days authenticate against one immutable preceding month state", () => {
+  const secondDayUtc = "2026-08-07";
+  const monthState = {
+    ...emptyObservationMonthState("2026", "08"),
+    processed_source_month_hash: "c".repeat(64),
+    days: [
+      {
+        day_utc: DAY_UTC,
+        manifest_hash: "d".repeat(64),
+        copied_at: "2026-08-08T00:00:00.000Z",
+      },
+      {
+        day_utc: secondDayUtc,
+        manifest_hash: "e".repeat(64),
+        copied_at: "2026-08-08T00:00:00.000Z",
+      },
+    ],
+  };
+  const monthStateText = `${JSON.stringify(monthState)}\n`;
+  const summary = {
+    state_shard_key: "state/2026-08.json",
+    state_shard_hash: sha256Hex(monthStateText),
+    processed_source_month_hash: monthState.processed_source_month_hash,
+  };
+  const precedingMonthState = snapshotPrecedingObservationMonthState(monthState);
+
+  assert.equal(authenticatePrecedingObservationDayState({
+    monthStateText,
+    monthState: precedingMonthState,
+    monthStateRelativePath: summary.state_shard_key,
+    stateMonthSummary: summary,
+    dayUtc: DAY_UTC,
+  }).ok, true);
+
+  const advancingMonthState = markObservationDayCopied(
+    monthState,
+    { day_utc: DAY_UTC, manifest_hash: "f".repeat(64) },
+    "2026-08-09T00:00:00.000Z",
+  );
+  assert.equal(advancingMonthState.processed_source_month_hash, null);
+  assert.deepEqual(authenticatePrecedingObservationDayState({
+    monthStateText,
+    monthState: advancingMonthState,
+    monthStateRelativePath: summary.state_shard_key,
+    stateMonthSummary: summary,
+    dayUtc: secondDayUtc,
+  }), {
+    ok: false,
+    reason: "preceding_checkpoint_shard_unauthenticated",
+  });
+  const secondDayAuthority = authenticatePrecedingObservationDayState({
+    monthStateText,
+    monthState: precedingMonthState,
+    monthStateRelativePath: summary.state_shard_key,
+    stateMonthSummary: summary,
+    dayUtc: secondDayUtc,
+  });
+  assert.equal(secondDayAuthority.ok, true);
+  const secondDayRoot = `history/v2/observations/day_utc=${secondDayUtc}`;
+  const secondDayParquetKey = `${secondDayRoot}/connector_id=7/part-000.parquet`;
+  const secondDayFiles = [{
+    key: secondDayParquetKey,
+    byte_size: 123,
+    sha256: HASH,
+  }];
+  const secondDayPlan = planObservationParquetReuse({
+    dayRelativePath: secondDayRoot,
+    currentFiles: secondDayFiles,
+    previousFiles: secondDayFiles,
+    destinationFiles: new Map([[secondDayParquetKey, { size: 123 }]]),
+  });
+  assert.equal(secondDayPlan.reused_count, 1);
+  assert.equal(secondDayPlan.copy_required_count, 0);
 });
 
 test("checkpoint shard authentication is required before prior manifests can be used", () => {
