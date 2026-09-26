@@ -28,6 +28,8 @@ The linked contracts remain authoritative for their stated scope. This index doe
 |---|---|
 | [`observation_history_schema_contract.md`](observation_history_schema_contract.md) | Canonical observation row/Parquet names, status compatibility, boundary mappings and persisted-name changes |
 | [`aurn_validation_status_contract.md`](aurn_validation_status_contract.md) | Connector `1` P/R semantics and trusted presentation fallback; field naming defers to the schema contract |
+| [`ukair_black_carbon_history_contract.md`](ukair_black_carbon_history_contract.md) | Future dedicated UK-AIR Black Carbon direct-R2 source reconciliation using the shared canonical observation writer |
+| [`observation_selected_scope_removal_contract.md`](observation_selected_scope_removal_contract.md) | Future shared explicit exact-scope authority removal for admitted partial-reconciliation writers |
 | [`observations_run_exclusion_contract.md`](observations_run_exclusion_contract.md) | Global canonical-observation operation exclusion and backup/start-state boundary |
 | [`history_writer_coordination.md`](history_writer_coordination.md) | Shared observation writer/finaliser ownership and IngestDB boundary |
 | [`implementation_safety_contract.md`](implementation_safety_contract.md) | Shared writer, affected-day finalisation and implementation safety |
@@ -91,6 +93,7 @@ The exact-leaf amendment remains authoritative for `timeseries-aligned-v2`, 1,02
 | [`sos_light_model.md`](sos_light_model.md) | Broad SOS-light complete-day replacement model, subject to the three-phase authority contract |
 | [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md) | Additional SOS historical repair behaviour not superseded by SOS-light |
 | [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md) | Run-scoped SOS source acquisition |
+| [`sos_light_v2_coordinator_hardening_amendment.md`](sos_light_v2_coordinator_hardening_amendment.md) | **Future implementation authority:** fixed-v2 bounded coordinator checkpoints, final persisted-state equality, Python/Node transition fingerprint and bounded end-to-end progress; not current runtime until real TEST acceptance |
 
 SOS repair may also require the general Integrity provenance, replacement and current-state contracts above depending on task scope.
 
