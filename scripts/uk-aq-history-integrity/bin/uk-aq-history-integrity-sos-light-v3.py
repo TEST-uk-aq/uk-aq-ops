@@ -178,7 +178,11 @@ def _is_ignored_macos_metadata_path(candidate: Path) -> bool:
     return candidate.name == ".DS_Store" or candidate.name.startswith("._")
 
 
-def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any]:
+def assemble_sos_light_complete_days(
+    run_state: dict[str, Any],
+    *,
+    log: logging.Logger | None = None,
+) -> dict[str, Any]:
     """Exclude known macOS metadata while assembling the Dropbox baseline."""
     ignored_count = 0
 
@@ -202,7 +206,10 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
 
     Path.rglob = filtered_rglob
     try:
-        result = _ORIGINAL_ASSEMBLE_SOS_LIGHT_COMPLETE_DAYS(run_state)
+        result = _ORIGINAL_ASSEMBLE_SOS_LIGHT_COMPLETE_DAYS(
+            run_state,
+            log=log,
+        )
     finally:
         Path.rglob = _ORIGINAL_PATH_RGLOB
 

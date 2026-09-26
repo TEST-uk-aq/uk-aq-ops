@@ -59,6 +59,58 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_public_assembly_wrapper_forwards_logger_and_filters_metadata(
+        self,
+    ) -> None:
+        scan_root = self.root / "assembly-wrapper-scan"
+        scan_root.mkdir()
+        (scan_root / "manifest.json").write_text("{}\n", encoding="utf-8")
+        (scan_root / ".DS_Store").write_bytes(b"finder")
+        (scan_root / "._manifest.json").write_bytes(b"apple-double")
+        logger = mock.Mock(spec=logging.Logger)
+        observed_names: list[str] = []
+
+        def stub_assembler(
+            run_state: dict[str, object],
+            *,
+            log: logging.Logger | None = None,
+        ) -> dict[str, object]:
+            self.assertIs(run_state, self.run_state)
+            self.assertIs(log, logger)
+            observed_names.extend(
+                path.name for path in scan_root.rglob("*") if path.is_file()
+            )
+            return {"status": "stubbed"}
+
+        self.run_state["sos_light"] = {}
+        with (
+            mock.patch.object(
+                MODULE,
+                "_ORIGINAL_ASSEMBLE_SOS_LIGHT_COMPLETE_DAYS",
+                side_effect=stub_assembler,
+            ) as original_assembler,
+            mock.patch.object(MODULE, "write_run_state") as write_state,
+        ):
+            result = MODULE.assemble_sos_light_complete_days(
+                self.run_state,
+                log=logger,
+            )
+
+        original_assembler.assert_called_once_with(
+            self.run_state,
+            log=logger,
+        )
+        self.assertEqual(observed_names, ["manifest.json"])
+        self.assertEqual(
+            result["ignored_local_filesystem_metadata_count"], 2,
+        )
+        self.assertEqual(
+            result["ignored_local_filesystem_metadata_patterns"],
+            [".DS_Store", "._*"],
+        )
+        self.assertIs(MODULE.Path.rglob, MODULE._ORIGINAL_PATH_RGLOB)
+        write_state.assert_called_once_with(self.run_state)
+
     def _proposal(self, *, relative_path: str | None = None) -> dict[str, object]:
         digest = hashlib.sha256(self.body).hexdigest()
         return {
