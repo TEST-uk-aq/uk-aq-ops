@@ -30,6 +30,7 @@ Task-specific refresh:
 - `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/observs_operations/README.md` and `ref_docs/system_docs/observs_operations/partition_maintenance.md` were refreshed from authoritative source commit `223a129526d6ffeba734d013b52a806c2d7c1de6` on `23/09/2026`.
 - `ref_docs/system_docs/gcp_logging_archive/README.md` and `ref_docs/system_docs/gcp_logging_archive/contract.md` were refreshed after TEST acceptance from authoritative source contract commit `f005636e52314013abd249ae1e34a719d227983f` on `23/09/2026`; `ref_docs/system_docs/SYSTEM_OVERVIEW.md` was refreshed from authoritative source overview commit `bc75f9564953859733e4077d203590c52b9adb3f` in the same task.
 - `ref_docs/system_docs/backup_and_recovery/r2_history_dropbox_backup_contract.md` and `ref_docs/system_docs/backup_and_recovery/r2_history_dropbox_sync_contract.md` were refreshed from authoritative source commit `d43ad102d7dee75a9d976161710b3ef66ac04045` on `26/09/2026` to add the `full` / `reuse_matching` observation-Parquet copy-mode contract and chained SOS-light backup behaviour.
+- `ref_docs/system_docs/r2_history/sos_light_three_phase_authority_contract.md` and `ref_docs/system_docs/r2_history/sos_historical_repair_contract.md` were refreshed from authoritative source commit `4a7b0a208dfd2fb7075d6bc8bdf3755eb3608e47` on `26/09/2026` so serial monthly SOS-light explicitly requests and verifies `reuse_matching`, and the local materialisation gate recognises authenticated reused Parquet bodies.
 
 ## Reading rule
 
