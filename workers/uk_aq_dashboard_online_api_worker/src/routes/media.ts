@@ -7,6 +7,7 @@ const BROWSER_IMAGE_CACHE_CONTROL = 'private, max-age=604800, immutable';
 const EDGE_IMAGE_CACHE_CONTROL = 'public, max-age=2592000';
 const ARTICLE_IMAGE_PATH = /^\/api\/media\/articles\/[1-9]\d*\/image$/;
 const ARTICLE_LOCAL_IMAGE_PATH = /^\/api\/media\/articles\/[1-9]\d*\/local-image$/;
+const LOCAL_IMAGE_VERSION = /^[a-f0-9]{64}$/;
 const IMAGE_CACHE_HEADER = 'X-UK-AQ-Media-Image-Cache';
 
 export type MediaExecutionContext = {
@@ -70,6 +71,36 @@ function browserImageResponse(response: Response, cacheStatus: 'HIT' | 'MISS'): 
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
+async function readBoundedBody(request: Request, maxBytes: number): Promise<ArrayBuffer | null> {
+  const declared = Number(request.headers.get('Content-Length') || 0);
+  if (declared > maxBytes) return null;
+  if (!request.body) return new ArrayBuffer(0);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel('Media request body is too large'); } catch { /* best effort */ }
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes.buffer;
+}
+
 export async function handleMediaRoute(request: Request, env: WorkerEnv,
   ctx: MediaExecutionContext): Promise<Response> {
   const incoming = new URL(request.url);
@@ -85,10 +116,12 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv,
     return errorEnvelope('MEDIA_ADMIN_NOT_CONFIGURED', 'Media admin is unavailable', 503);
   }
   const imageVersion = (incoming.searchParams.get('v') || '').trim();
-  const isVersionedImage = method === 'GET' && ARTICLE_IMAGE_PATH.test(incoming.pathname)
+  const hasImageVersion = method === 'GET' && ARTICLE_IMAGE_PATH.test(incoming.pathname)
     && imageVersion.length > 0;
+  const isLocalImage = hasImageVersion && LOCAL_IMAGE_VERSION.test(imageVersion);
+  const isVersionedRemoteImage = hasImageVersion && !isLocalImage;
   let imageCacheKey: Request | null = null;
-  if (isVersionedImage) {
+  if (isVersionedRemoteImage) {
     const cacheUrl = new URL(incoming.origin + incoming.pathname);
     cacheUrl.searchParams.set('v', imageVersion);
     imageCacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
@@ -107,7 +140,7 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv,
     || incoming.pathname.replace(/^\/api\/media/, '/admin');
   const upstreamUrl = new URL(`${base}${upstreamPath}`);
   incoming.searchParams.forEach((value, name) => {
-    if (!(isVersionedImage && name === 'v')) {
+    if (!(hasImageVersion && name === 'v')) {
       upstreamUrl.searchParams.append(name, value);
     }
   });
@@ -125,10 +158,11 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv,
   if (!['GET', 'HEAD'].includes(method)) {
     const maxBodyBytes = method === 'PUT' && ARTICLE_LOCAL_IMAGE_PATH.test(incoming.pathname)
       ? MAX_LOCAL_IMAGE_UPLOAD_BYTES : MAX_BODY_BYTES;
-    const declared = Number(request.headers.get('Content-Length') || 0);
-    if (declared > maxBodyBytes) return errorEnvelope('REQUEST_TOO_LARGE', 'Media request body is too large', 413);
-    body = await request.arrayBuffer();
-    if (body.byteLength > maxBodyBytes) return errorEnvelope('REQUEST_TOO_LARGE', 'Media request body is too large', 413);
+    const boundedBody = await readBoundedBody(request, maxBodyBytes);
+    if (boundedBody === null) {
+      return errorEnvelope('REQUEST_TOO_LARGE', 'Media request body is too large', 413);
+    }
+    body = boundedBody;
   }
   let upstream: Response;
   try { upstream = await fetch(target, { method, headers, body, redirect: 'manual' }); }
@@ -142,7 +176,9 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv,
   const response = new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText,
     headers: responseHeaders });
   const upstreamContentType = (upstream.headers.get('Content-Type') || '').toLowerCase();
-  if (imageCacheKey && upstream.ok && upstreamContentType.startsWith('image/')) {
+  const upstreamNoStore = /(?:^|,)\s*no-store(?:\s*(?:,|$))/.test(
+    (upstream.headers.get('Cache-Control') || '').toLowerCase());
+  if (imageCacheKey && upstream.ok && upstreamContentType.startsWith('image/') && !upstreamNoStore) {
     const cachedResponse = response.clone();
     cachedResponse.headers.set('Cache-Control', EDGE_IMAGE_CACHE_CONTROL);
     cachedResponse.headers.delete(IMAGE_CACHE_HEADER);

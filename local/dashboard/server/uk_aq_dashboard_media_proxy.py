@@ -18,6 +18,7 @@ MEDIA_TIMEOUT_SECONDS = 30
 BROWSER_IMAGE_CACHE_CONTROL = "private, max-age=604800, immutable"
 _ARTICLE_IMAGE_PATH = re.compile(r"^/api/media/articles/[1-9]\d*/image$")
 _ARTICLE_LOCAL_IMAGE_PATH = re.compile(r"^/api/media/articles/[1-9]\d*/local-image$")
+_LOCAL_IMAGE_VERSION = re.compile(r"^[a-f0-9]{64}$")
 
 _ROUTES = (
     (re.compile(r"^/api/media/articles$"), {"GET", "POST"}),
@@ -132,11 +133,14 @@ def proxy_media_request(handler: Any, method: str) -> None:
     upstream_path = explicit_paths.get(parsed.path, parsed.path.removeprefix("/api/media"))
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
     image_version = next((value.strip() for name, value in query_items if name == "v" and value.strip()), "")
-    is_versioned_image = method == "GET" and bool(image_version) and bool(
+    has_image_version = method == "GET" and bool(image_version) and bool(
         _ARTICLE_IMAGE_PATH.fullmatch(parsed.path)
     )
+    is_versioned_remote_image = has_image_version and not _LOCAL_IMAGE_VERSION.fullmatch(
+        image_version
+    )
     upstream_query = urlencode(
-        [(name, value) for name, value in query_items if not (is_versioned_image and name == "v")],
+        [(name, value) for name, value in query_items if not (has_image_version and name == "v")],
         doseq=True,
     )
     target = f"{base_url}/admin{upstream_path}"
@@ -176,10 +180,14 @@ def proxy_media_request(handler: Any, method: str) -> None:
             if value:
                 handler.send_header(name, value)
         response_content_type = str(upstream.headers.get("Content-Type") or "").lower()
+        upstream_no_store = "no-store" in str(
+            upstream.headers.get("Cache-Control") or ""
+        ).lower()
         cache_control = BROWSER_IMAGE_CACHE_CONTROL if (
-            is_versioned_image
+            is_versioned_remote_image
             and 200 <= upstream.status_code < 300
             and response_content_type.startswith("image/")
+            and not upstream_no_store
         ) else "no-store"
         handler.send_header("Cache-Control", cache_control)
         handler.send_header("X-Content-Type-Options", "nosniff")
