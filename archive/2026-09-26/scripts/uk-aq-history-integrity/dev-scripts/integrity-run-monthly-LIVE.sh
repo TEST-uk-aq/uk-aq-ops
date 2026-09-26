@@ -5,14 +5,13 @@ set -euo pipefail
 # Always provide a valid detached stdin to Python and child processes.
 exec </dev/null
 
-INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3.sh"
-INTEGRITY_ENV="TEST"
-BACKUP_REPOSITORY="TEST-uk-aq/uk-aq-ops"
+INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v2.sh"
+INTEGRITY_ENV="LIVE"
+BACKUP_REPOSITORY="UK-AQ/uk-aq-ops"
 BACKUP_WORKFLOW="uk_aq_r2_history_dropbox_backup.yml"
 BACKUP_ARTIFACT="uk-aq-r2-history-dropbox-backup-report"
 BACKUP_REPORT="r2_history_dropbox_backup_report.json"
-OBSERVATION_PARQUET_COPY_MODE="reuse_matching"
-LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/TEST/logs/integrity-run-monthly"
+LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/integrity-run-monthly"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 DISCOVERY_TIMEOUT_SECONDS="${DISCOVERY_TIMEOUT_SECONDS:-300}"
 DISCOVERY_POLL_SECONDS="${DISCOVERY_POLL_SECONDS:-10}"
@@ -103,21 +102,17 @@ month_state_valid() {
   local backup_receipt="$6"
   local sync_receipt="$7"
   integrity_receipt_valid "$integrity_receipt" "$label" "$from_day" "$to_day" || return 1
-  receipt_valid "$dispatch_receipt" "phase=backup_dispatched_resolved" "label=$label" \
-    "requested_observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE" || return 1
+  receipt_valid "$dispatch_receipt" "phase=backup_dispatched_resolved" "label=$label" || return 1
   local caller run_id state_key expected_hash
   caller="$(json_field "$dispatch_receipt" caller_run_id)" || return 1
   run_id="$(json_field "$dispatch_receipt" run_id)" || return 1
-  receipt_valid "$backup_receipt" "phase=backup_succeeded" "label=$label" \
-    "caller_run_id=$caller" "run_id=$run_id" \
-    "observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE" || return 1
+  receipt_valid "$backup_receipt" "phase=backup_succeeded" "label=$label" "caller_run_id=$caller" "run_id=$run_id" || return 1
   state_key="$(json_field "$backup_receipt" state_root_key)" || return 1
   expected_hash="$(json_field "$backup_receipt" expected_hash)" || return 1
   [[ "$state_key" != /* && "$state_key" != *".."* && "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
   receipt_valid "$sync_receipt" "phase=local_materialisation_verified" "label=$label" \
     "caller_run_id=$caller" "run_id=$run_id" "generation=$OBSERVATION_HISTORY_VERSION" \
-    "state_root_key=$state_key" "expected_hash=$expected_hash" "observed_hash=$expected_hash" \
-    "observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE"
+    "state_root_key=$state_key" "expected_hash=$expected_hash" "observed_hash=$expected_hash"
 }
 
 write_receipt() {
@@ -235,29 +230,20 @@ preflight() {
     fail "cannot read ${BACKUP_WORKFLOW} from ${BACKUP_REPOSITORY}"
     return 1
   fi
-  if ! "$PYTHON_BIN" - "$remote_workflow" "$OBSERVATION_PARQUET_COPY_MODE" <<'PY'
+  if ! "$PYTHON_BIN" - "$remote_workflow" <<'PY'
 import re
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()
-required_mode = sys.argv[2]
 has_input = bool(re.search(r"(?m)^\s{6}caller_run_id:\s*$", text))
 has_run_name = bool(re.search(r"(?m)^run-name:.*caller_run_id", text))
-mode_input = re.search(
-    r"(?ms)^\s{6}observation_parquet_copy_mode:\s*\n(?P<body>(?:^\s{8,}.*\n?)*)",
-    text,
-)
-has_required_mode = bool(
-    mode_input
-    and re.search(rf"(?m)^\s+-\s+{re.escape(required_mode)}\s*$", mode_input.group("body"))
-)
-raise SystemExit(0 if has_input and has_run_name and has_required_mode else 1)
+raise SystemExit(0 if has_input and has_run_name else 1)
 PY
   then
     rm -f "$remote_workflow"
     if [ "$INTEGRITY_ENV" = "LIVE" ]; then
-      fail "LIVE backup workflow lacks caller_run_id correlation or observation_parquet_copy_mode=${OBSERVATION_PARQUET_COPY_MODE} support; promote the required workflow to ${BACKUP_REPOSITORY} before running LIVE Integrity"
+      fail "LIVE backup workflow lacks caller_run_id correlation support; promote the correlation-capable workflow to ${BACKUP_REPOSITORY} before running LIVE Integrity"
     else
-      fail "backup workflow lacks required caller_run_id correlation or observation_parquet_copy_mode=${OBSERVATION_PARQUET_COPY_MODE} input support"
+      fail "backup workflow lacks required caller_run_id input/display-name correlation support"
     fi
     return 1
   fi
@@ -270,7 +256,7 @@ PY
   [ -r "$DROPBOX_BACKUP_ROOT" ] || fail "local Dropbox backup root is not readable: ${DROPBOX_BACKUP_ROOT}"
   LOCAL_CHECKPOINT_ROOT="$DROPBOX_BACKUP_ROOT/_ops/checkpoints/r2_history_backup_state_v2/observation_generation=${OBSERVATION_HISTORY_VERSION}/root.json"
   [ -r "$LOCAL_CHECKPOINT_ROOT" ] || fail "generation-specific local Dropbox checkpoint is not readable: ${LOCAL_CHECKPOINT_ROOT}"
-  log "PREFLIGHT OK selected_repository=${OPS_REPO_ROOT} local_backup_root=${DROPBOX_BACKUP_ROOT} observation_history_version=${OBSERVATION_HISTORY_VERSION} checkpoint_location=${LOCAL_CHECKPOINT_ROOT} requested_observation_parquet_copy_mode=${OBSERVATION_PARQUET_COPY_MODE}"
+  log "PREFLIGHT OK selected_repository=${OPS_REPO_ROOT} local_backup_root=${DROPBOX_BACKUP_ROOT} observation_history_version=${OBSERVATION_HISTORY_VERSION} checkpoint_location=${LOCAL_CHECKPOINT_ROOT}"
 }
 
 append_connector_totals() {
@@ -388,8 +374,7 @@ resolve_exact_run() {
       local run_url="${result#*$'\t'}"
       write_receipt "$dispatch_receipt" \
         "phase=backup_dispatched_resolved" "label=$label" "caller_run_id=$caller_run_id" \
-        "run_id=$run_id" "run_url=$run_url" \
-        "requested_observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE"
+        "run_id=$run_id" "run_url=$run_url"
       rm -f "$runs_json"
       log "BACKUP RESOLVED caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url}"
       return 0
@@ -452,7 +437,7 @@ wait_for_backup_run() {
 
 validate_backup_report() {
   local report_path="$1"
-  "$PYTHON_BIN" - "$report_path" "$OBSERVATION_PARQUET_COPY_MODE" <<'PY'
+  "$PYTHON_BIN" - "$report_path" <<'PY'
 import json
 import re
 import sys
@@ -463,20 +448,15 @@ except (OSError, UnicodeError, json.JSONDecodeError) as exc:
     raise SystemExit(f"backup report unreadable: {exc}")
 state_key = report.get("state_root_key")
 root_hash = (report.get("observations") or {}).get("processed_source_root_hash")
-effective_mode = report.get("observation_parquet_copy_mode")
 if report.get("ok") is not True or report.get("complete") is not True or report.get("dry_run") is not False:
     raise SystemExit("backup report does not show a successful complete non-dry-run backup")
 if report.get("max_days_per_run") != 0:
     raise SystemExit("backup report does not show max_days_per_run=0")
-if effective_mode != sys.argv[2]:
-    raise SystemExit(
-        "backup report observation_parquet_copy_mode is not " + sys.argv[2]
-    )
 if not isinstance(state_key, str) or not state_key or state_key.startswith("/") or ".." in PurePosixPath(state_key).parts:
     raise SystemExit("backup report state_root_key is invalid")
 if not isinstance(root_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", root_hash):
     raise SystemExit("backup report observations.processed_source_root_hash is not SHA-256")
-print(f"{state_key}\t{root_hash}\t{effective_mode}")
+print(f"{state_key}\t{root_hash}")
 PY
 }
 
@@ -541,7 +521,6 @@ wait_for_local_materialisation() {
         "caller_run_id=$caller_run_id" "run_id=$run_id" \
         "expected_hash=$expected_hash" "observed_hash=$expected_hash" \
         "generation=$OBSERVATION_HISTORY_VERSION" "state_root_key=$state_root_key" \
-        "observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE" \
         "verified_observation_day_count=$verified_days" \
         "verified_observation_object_count=$verified_objects" \
         "verified_core_unit_count=$verified_core" \
@@ -616,29 +595,23 @@ run_batch() {
   fi
 
   local caller_run_id run_id run_url
-  if receipt_valid "$dispatch_receipt" "phase=backup_dispatched_resolved" "label=$label" \
-    "requested_observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE"; then
+  if receipt_valid "$dispatch_receipt" "phase=backup_dispatched_resolved" "label=$label"; then
     caller_run_id="$(json_field "$dispatch_receipt" caller_run_id)"
     run_id="$(json_field "$dispatch_receipt" run_id)"
     run_url="$(json_field "$dispatch_receipt" run_url)"
     log "BACKUP RESUME label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url}"
   else
-    if [ -f "$dispatch_receipt" ] && receipt_valid "$dispatch_receipt" \
-      "phase=backup_dispatch_requested" \
-      "requested_observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE"; then
+    if [ -f "$dispatch_receipt" ] && receipt_valid "$dispatch_receipt" "phase=backup_dispatch_requested"; then
       caller_run_id="$(json_field "$dispatch_receipt" caller_run_id)"
       log "BACKUP DISCOVERY RESUME label=${label} caller_run_id=${caller_run_id}"
     else
       caller_run_id="integrity-monthly-${INTEGRITY_ENV}-${BATCH_ID}-after-${label}"
       rm -f "$backup_receipt" "$sync_receipt"
       rm -rf "$artifact_dir"
-      write_receipt "$dispatch_receipt" "phase=backup_dispatch_requested" "label=$label" \
-        "caller_run_id=$caller_run_id" \
-        "requested_observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE"
-      log "BACKUP DISPATCH label=${label} caller_run_id=${caller_run_id} repository=${BACKUP_REPOSITORY} max_days_per_run=0 observation_parquet_copy_mode=${OBSERVATION_PARQUET_COPY_MODE}"
+      write_receipt "$dispatch_receipt" "phase=backup_dispatch_requested" "label=$label" "caller_run_id=$caller_run_id"
+      log "BACKUP DISPATCH label=${label} caller_run_id=${caller_run_id} repository=${BACKUP_REPOSITORY} max_days_per_run=0"
       if ! gh workflow run "$BACKUP_WORKFLOW" --repo "$BACKUP_REPOSITORY" \
-        -f "caller_run_id=${caller_run_id}" -f "max_days_per_run=0" \
-        -f "observation_parquet_copy_mode=${OBSERVATION_PARQUET_COPY_MODE}"; then
+        -f "caller_run_id=${caller_run_id}" -f "max_days_per_run=0"; then
         rm -f "$dispatch_receipt"
         fail "failed to dispatch backup for ${label}"
         return 1
@@ -649,18 +622,15 @@ run_batch() {
     run_url="$(json_field "$dispatch_receipt" run_url)"
   fi
 
-  local state_root_key expected_hash effective_mode backup_status backup_conclusion report_path
-  if receipt_valid "$backup_receipt" "phase=backup_succeeded" \
-    "caller_run_id=$caller_run_id" "run_id=$run_id" \
-    "observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE"; then
+  local state_root_key expected_hash backup_status backup_conclusion report_path
+  if receipt_valid "$backup_receipt" "phase=backup_succeeded" "caller_run_id=$caller_run_id" "run_id=$run_id"; then
     state_root_key="$(json_field "$backup_receipt" state_root_key)"
     expected_hash="$(json_field "$backup_receipt" expected_hash)"
-    effective_mode="$(json_field "$backup_receipt" observation_parquet_copy_mode)"
     backup_status="completed"
     backup_conclusion="success"
     [[ "$state_root_key" != /* && "$state_root_key" != *".."* ]] || { fail "persisted backup receipt has invalid state_root_key"; return 1; }
     [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || { fail "persisted backup receipt has invalid expected hash"; return 1; }
-    log "BACKUP SUCCESS RESUME label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} status=${backup_status} conclusion=${backup_conclusion} expected_hash=${expected_hash} observation_parquet_copy_mode=${effective_mode}"
+    log "BACKUP SUCCESS RESUME label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} status=${backup_status} conclusion=${backup_conclusion} expected_hash=${expected_hash}"
   else
     wait_for_backup_run "$run_id" "$run_url" "$caller_run_id" "$label" "$dispatch_receipt" "$backup_receipt" "$sync_receipt" || return 1
     backup_status="completed"
@@ -671,18 +641,14 @@ run_batch() {
     report_path="$artifact_dir/$BACKUP_REPORT"
     [ -f "$report_path" ] || { fail "exact run artifact lacks ${BACKUP_REPORT}"; return 1; }
     local report_identity
-    if ! report_identity="$(validate_backup_report "$report_path")"; then
-      rm -f "$dispatch_receipt" "$backup_receipt" "$sync_receipt"
-      fail "exact run ${run_id} backup report is not acceptable; incomplete backup state cleared for a fresh contracted dispatch"
-      return 1
-    fi
-    IFS=$'\t' read -r state_root_key expected_hash effective_mode <<<"$report_identity"
+    report_identity="$(validate_backup_report "$report_path")" || { fail "exact run ${run_id} backup report is not acceptable"; return 1; }
+    state_root_key="${report_identity%%$'\t'*}"
+    expected_hash="${report_identity#*$'\t'}"
     write_receipt "$backup_receipt" "phase=backup_succeeded" "label=$label" \
       "caller_run_id=$caller_run_id" "run_id=$run_id" "run_url=$run_url" \
       "status=$backup_status" "conclusion=$backup_conclusion" \
-      "state_root_key=$state_root_key" "expected_hash=$expected_hash" \
-      "observation_parquet_copy_mode=$effective_mode"
-    log "BACKUP SUCCESS label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} status=${backup_status} conclusion=${backup_conclusion} state_root_key=${state_root_key} expected_hash=${expected_hash} observation_parquet_copy_mode=${effective_mode}"
+      "state_root_key=$state_root_key" "expected_hash=$expected_hash"
+    log "BACKUP SUCCESS label=${label} caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} status=${backup_status} conclusion=${backup_conclusion} state_root_key=${state_root_key} expected_hash=${expected_hash}"
   fi
 
   report_path="$artifact_dir/$BACKUP_REPORT"
@@ -695,21 +661,26 @@ run_batch() {
   wait_for_local_checkpoint "$state_root_key" "$expected_hash" "$label" || return 1
   if receipt_valid "$sync_receipt" "phase=local_materialisation_verified" "label=$label" \
     "caller_run_id=$caller_run_id" "run_id=$run_id" "generation=$OBSERVATION_HISTORY_VERSION" \
-    "state_root_key=$state_root_key" "expected_hash=$expected_hash" "observed_hash=$expected_hash" \
-    "observation_parquet_copy_mode=$OBSERVATION_PARQUET_COPY_MODE"; then
-    log "LOCAL MATERIALISATION RESUME label=${label} run_id=${run_id} expected_hash=${expected_hash} observation_parquet_copy_mode=${OBSERVATION_PARQUET_COPY_MODE}"
+    "state_root_key=$state_root_key" "expected_hash=$expected_hash" "observed_hash=$expected_hash"; then
+    log "LOCAL MATERIALISATION RESUME label=${label} run_id=${run_id} expected_hash=${expected_hash}"
   else
     wait_for_local_materialisation "$report_path" "$state_root_key" "$expected_hash" \
       "$caller_run_id" "$run_id" "$label" "$sync_receipt" || return 1
   fi
 
   touch "$ok_marker"
-  log "MONTH COMPLETE label=${label} integrity=success caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} backup_status=${backup_status} backup_conclusion=${backup_conclusion} observation_parquet_copy_mode=${OBSERVATION_PARQUET_COPY_MODE} expected_hash=${expected_hash} local_hash=${expected_hash} final_month_complete=true"
+  log "MONTH COMPLETE label=${label} integrity=success caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} backup_status=${backup_status} backup_conclusion=${backup_conclusion} expected_hash=${expected_hash} local_hash=${expected_hash} final_month_complete=true"
 }
 
 preflight
-run_batch 2025-01-01 2025-01-31 2025-01
-run_batch 2025-02-01 2025-02-28 2025-02
-
+run_batch 2025-05-01 2025-05-31 2025-05
+run_batch 2025-06-01 2025-06-30 2025-06
+run_batch 2025-07-01 2025-07-31 2025-07
+run_batch 2025-08-01 2025-08-31 2025-08
+run_batch 2025-09-01 2025-09-30 2025-09
+run_batch 2025-10-01 2025-10-31 2025-10
+run_batch 2025-11-01 2025-11-30 2025-11
+run_batch 2025-12-01 2025-12-31 2025-12
+run_batch 2026-01-01 2026-01-31 2026-01
 log "ALL BATCHES COMPLETED"
 echo "Summary: $SUMMARY"

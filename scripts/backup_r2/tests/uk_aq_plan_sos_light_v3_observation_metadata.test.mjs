@@ -382,6 +382,106 @@ test("changed exact hierarchy resolves unchanged canonical inputs only from pinn
   assert.deepEqual([...resolved.keys()], [parquetKey, manifestKey]);
 });
 
+test("changed exact hierarchy resolves a frozen new current-run canonical object absent from Dropbox", () => {
+  const key = "history/v3/observations/day_utc=2025-01-01/connector_id=1/pollutant_code=no2/part-00000.parquet";
+  const body = Buffer.from("new-current-run-parquet");
+  const identity = {
+    key,
+    byte_size: body.byteLength,
+    sha256: sha256Hex(body),
+  };
+  const requested = [];
+  const resolved = resolveExactV3LocalReferences({
+    artifacts: [{ dependencies: [identity], publication_prerequisites: [] }],
+    changedKeys: new Set(),
+    proposalsByKey: new Map(),
+    runState: {
+      objects: {
+        [key]: {
+          proposed: true,
+          built: true,
+          structurally_validated: true,
+          changed: true,
+          included_in_write_set: true,
+          status: "planned",
+          sha256: identity.sha256,
+          bytes: identity.byte_size,
+        },
+      },
+    },
+    unchangedRoots: [],
+    store: {
+      getObjectFromSourceIfExists(requestedKey, source) {
+        requested.push([requestedKey, source]);
+        return requestedKey === key && source === "overlay"
+          ? { key, body, bytes: body.byteLength, content_sha256: sha256Hex(body), source: "planned_overlay" }
+          : null;
+      },
+    },
+  });
+  assert.deepEqual(requested, [[key, "overlay"]]);
+  assert.deepEqual(resolved.get(key), {
+    key,
+    byte_size: body.byteLength,
+    sha256: sha256Hex(body),
+    verified: true,
+    durable: true,
+  });
+});
+
+test("changed exact hierarchy still rejects a preserved dependency absent from Dropbox", () => {
+  const key = "history/v3/observations/day_utc=2025-01-01/connector_id=8/pollutant_code=bc/part-00000.parquet";
+  assert.throws(() => resolveExactV3LocalReferences({
+    artifacts: [{
+      dependencies: [{ key, byte_size: 12, sha256: "a".repeat(64) }],
+      publication_prerequisites: [],
+    }],
+    changedKeys: new Set(),
+    proposalsByKey: new Map(),
+    runState: { objects: {} },
+    unchangedRoots: [],
+    store: { getObjectFromSourceIfExists() { return null; } },
+  }), /pinned canonical baseline dependency is unavailable/);
+});
+
+test("changed exact hierarchy rejects unvalidated or identity-mismatched current-run objects", () => {
+  const key = "history/v3/observations/day_utc=2025-01-01/connector_id=1/pollutant_code=no2/part-00000.parquet";
+  const body = Buffer.from("new-current-run-parquet");
+  const reference = { key, byte_size: body.byteLength, sha256: sha256Hex(body) };
+  const baseEntry = {
+    proposed: true,
+    built: true,
+    structurally_validated: true,
+    changed: true,
+    included_in_write_set: true,
+    status: "planned",
+    sha256: reference.sha256,
+    bytes: reference.byte_size,
+  };
+  const resolve = (entry) => resolveExactV3LocalReferences({
+    artifacts: [{ dependencies: [reference], publication_prerequisites: [] }],
+    changedKeys: new Set(),
+    proposalsByKey: new Map(),
+    runState: { objects: { [key]: entry } },
+    unchangedRoots: [],
+    store: {
+      getObjectFromSourceIfExists(requestedKey, source) {
+        return requestedKey === key && source === "overlay"
+          ? { key, body, bytes: body.byteLength, content_sha256: sha256Hex(body), source: "planned_overlay" }
+          : null;
+      },
+    },
+  });
+  assert.throws(
+    () => resolve({ ...baseEntry, structurally_validated: false }),
+    /pinned canonical baseline dependency is unavailable/,
+  );
+  assert.throws(
+    () => resolve({ ...baseEntry, sha256: "f".repeat(64) }),
+    /current-run canonical dependency identity disagrees/,
+  );
+});
+
 function dayManifest(dayUtc, marker) {
   const manifestKey = `history/v3/observations/day_utc=${dayUtc}/manifest.json`;
   const payload = {

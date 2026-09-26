@@ -66,6 +66,7 @@ import {
   buildObservationParquetExcludePatterns,
   normalizeObservationParquetCopyMode,
   planObservationParquetReuse,
+  snapshotPrecedingObservationMonthState,
 } from "./lib/observation_parquet_reuse.mjs";
 import {
   requireLockedHistoryBackupMutation,
@@ -1174,6 +1175,9 @@ async function main() {
           inventoryYear.year,
           inventoryMonth.month,
         );
+      const precedingMonthState = snapshotPrecedingObservationMonthState(
+        monthState,
+      );
 
       let monthStateDirty = monthStateResult === null;
       let dirtyUnits = 0;
@@ -1219,7 +1223,7 @@ async function main() {
             args,
             day,
             monthStateResult,
-            monthState,
+            monthState: precedingMonthState,
             monthStateRelativePath,
             stateMonthSummary: existingSummary,
           });

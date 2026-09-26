@@ -318,36 +318,6 @@ function exactIdentity(object, source) {
   };
 }
 
-function currentRunCanonicalIdentity({ key, runState, store, reference = null }) {
-  const staged = runState?.objects?.[key];
-  if (staged?.proposed !== true || staged?.built !== true
-      || staged?.structurally_validated !== true
-      || staged?.changed === false || staged?.included_in_write_set === false
-      || staged?.status === "skipped_unchanged") {
-    return null;
-  }
-  const frozen = {
-    sha256: String(staged.sha256 || staged.content_sha256 || ""),
-    bytes: Number(staged.bytes),
-    source: "planned_overlay",
-  };
-  if (!/^[a-f0-9]{64}$/.test(frozen.sha256)
-      || !Number.isSafeInteger(frozen.bytes) || frozen.bytes < 0) {
-    throw new Error(`Fixed-v3 current-run canonical dependency identity is invalid: ${key}`);
-  }
-  const overlay = store.getObjectFromSourceIfExists(key, "overlay");
-  if (!overlay || overlay.source !== "planned_overlay") {
-    throw new Error(`Fixed-v3 current-run canonical dependency is unavailable: ${key}`);
-  }
-  const actual = exactIdentity(overlay, overlay.source);
-  if (actual.sha256 !== frozen.sha256 || actual.bytes !== frozen.bytes
-      || (reference && (actual.sha256 !== String(reference.sha256)
-        || actual.bytes !== Number(reference.byte_size)))) {
-    throw new Error(`Fixed-v3 current-run canonical dependency identity disagrees: ${key}`);
-  }
-  return frozen;
-}
-
 function proposalObject(proposal) {
   const body = Buffer.from(String(proposal.proposed_body ?? proposal.body ?? ""), "utf8");
   return {
@@ -727,7 +697,6 @@ export function resolveExactV3LocalReferences({
   changedKeys,
   proposalsByKey,
   plannedCanonicalKeys = new Set(),
-  runState = null,
   store,
   unchangedRoots,
 }) {
@@ -751,22 +720,6 @@ export function resolveExactV3LocalReferences({
           key: reference.key,
           byte_size: Number(plannedCanonical.bytes),
           sha256: String(plannedCanonical.new_sha256),
-          verified: true,
-          durable: true,
-        });
-        continue;
-      }
-      const currentRunIdentity = currentRunCanonicalIdentity({
-        key: reference.key,
-        runState,
-        store,
-        reference,
-      });
-      if (currentRunIdentity) {
-        resolved.set(reference.key, {
-          key: reference.key,
-          byte_size: currentRunIdentity.bytes,
-          sha256: currentRunIdentity.sha256,
           verified: true,
           durable: true,
         });
@@ -816,21 +769,9 @@ export function assertFixedV3Proposal(output) {
   return output;
 }
 
-async function addExactV3Indexes({
-  output,
-  runState,
-  env,
-  repairPlan,
-  targetWriterGitSha,
-  reportProgress = () => {},
-}) {
+async function addExactV3Indexes({ output, runState, env, repairPlan, targetWriterGitSha }) {
   const selectedDays = [...new Set((repairPlan.repair_plan || [])
     .map((action) => String(action?.day_utc || "")).filter(Boolean))].sort();
-  reportProgress({
-    phase: "exact_v3_planning_started",
-    completed_objects: 0,
-    total_objects: selectedDays.length,
-  });
   const selectedDayPrefixes = selectedDays
     .map((day) => `${GENERATION.observations_prefix}/day_utc=${day}/`);
   const proposals = (output.planning.proposals || [])
@@ -853,11 +794,6 @@ async function addExactV3Indexes({
     selectedDays,
     store,
   });
-  reportProgress({
-    phase: "aggregate_hierarchy_reconstruction_complete",
-    completed_objects: canonicalAggregateHierarchy.staged_keys.length,
-    total_objects: canonicalAggregateHierarchy.staged_keys.length,
-  });
   const combinedObject = (key) => proposalsByKey.has(key)
     ? proposalObject(proposalsByKey.get(key))
     : store.getObjectIfExists(key);
@@ -865,17 +801,9 @@ async function addExactV3Indexes({
     prefix: `${GENERATION.observations_prefix}/day_utc=`,
   }).map(({ key }) => key).filter((key) => POLLUTANT_MANIFEST.test(key)));
   for (const key of proposalsByKey.keys()) if (POLLUTANT_MANIFEST.test(key)) manifestKeys.add(key);
-  const sortedManifestKeys = [...manifestKeys].sort();
-  reportProgress({
-    phase: "canonical_scoped_hierarchy_scan_identified",
-    completed_objects: 0,
-    total_objects: sortedManifestKeys.length,
-  });
 
   const hierarchies = [];
-  let completedManifestCount = 0;
-  let lastManifestProgressAt = Date.now();
-  for (const manifestKey of sortedManifestKeys) {
+  for (const manifestKey of [...manifestKeys].sort()) {
     const match = manifestKey.match(POLLUTANT_MANIFEST);
     let manifestObject = combinedObject(manifestKey);
     if (!manifestObject) throw new Error(`Fixed-v3 pollutant manifest is unavailable: ${manifestKey}`);
@@ -956,19 +884,6 @@ async function addExactV3Indexes({
       canonicalManifest,
       indexRoot: GENERATION.observations_timeseries_index_prefix,
     }));
-    completedManifestCount += 1;
-    const now = Date.now();
-    if (completedManifestCount === sortedManifestKeys.length
-        || completedManifestCount % 25 === 0
-        || now - lastManifestProgressAt >= 15_000) {
-      reportProgress({
-        phase: "canonical_scoped_hierarchy_scan_progress",
-        completed_objects: completedManifestCount,
-        total_objects: sortedManifestKeys.length,
-        current_key: manifestKey,
-      });
-      lastManifestProgressAt = now;
-    }
   }
   if (!hierarchies.length) throw new Error("Fixed-v3 metadata proposal has no exact-leaf scopes");
   const existingLatestObject = store.getObjectIfExists(GENERATION.observations_timeseries_latest_key);
@@ -1006,14 +921,6 @@ async function addExactV3Indexes({
     publication_prerequisites: canonicalFinalizationPrerequisites,
   };
   exactObjects.push(latest);
-  reportProgress({
-    phase: "exact_v3_latest_scoped_index_reconstruction_complete",
-    completed_objects: exactObjects.length,
-    total_objects: exactObjects.length,
-    changed_scopes: rebuilt.changedHierarchies.length,
-    unchanged_scopes: rebuilt.unchangedRoots.length,
-    removed_scopes: rebuilt.removedScopes.length,
-  });
   const exactByKey = new Map(exactObjects.map((artifact) => [artifact.key, artifact]));
   const changedExactObjects = exactObjects.filter((artifact) => {
     const existing = store.getObjectIfExists(artifact.key);
@@ -1023,29 +930,13 @@ async function addExactV3Indexes({
   if (!changedExactObjects.length) {
     throw new Error("Fixed-v3 metadata proposal unexpectedly produced no changed exact-v3 indexes");
   }
-  const localReferenceKeys = new Set(changedExactObjects.flatMap((artifact) => [
-    ...(artifact.dependencies || []),
-    ...(artifact.publication_prerequisites || []),
-  ]).map(({ key }) => key).filter((key) => !changedExactKeys.has(key)));
-  reportProgress({
-    phase: "local_dependency_reference_resolution_started",
-    completed_objects: 0,
-    total_objects: localReferenceKeys.size,
-  });
   const resolvedLocalReferences = resolveExactV3LocalReferences({
     artifacts: changedExactObjects,
     changedKeys: changedExactKeys,
     proposalsByKey,
     plannedCanonicalKeys: canonicalFinalizationPrerequisiteKeys,
-    runState,
     store,
     unchangedRoots: rebuilt.unchangedRoots,
-  });
-  reportProgress({
-    phase: "local_dependency_reference_resolution_complete",
-    completed_objects: localReferenceKeys.size,
-    total_objects: localReferenceKeys.size,
-    resolved_references: resolvedLocalReferences.size,
   });
   const publicationPlan = buildObservationHistoryIndexV3PublicationPlan({
     objects: changedExactObjects,
@@ -1062,8 +953,11 @@ async function addExactV3Indexes({
     if (proposed?.changed === true || canonicalFinalizationPrerequisiteKeys.has(key)) return {
       sha256: proposed.new_sha256, bytes: proposed.bytes, source: "planned_overlay",
     };
-    const currentRunIdentity = currentRunCanonicalIdentity({ key, runState, store });
-    if (currentRunIdentity) return currentRunIdentity;
+    const staged = runState.objects?.[key];
+    if (staged?.proposed === true && staged?.structurally_validated === true
+      && staged?.changed !== false && staged?.included_in_write_set !== false) {
+      return { sha256: staged.sha256, bytes: staged.bytes, source: "planned_overlay" };
+    }
     const object = store.getObjectIfExists(key);
     if (!object || !["dropbox", "overlay"].includes(object.source)) {
       throw new Error(`Fixed-v3 local proposal input is unavailable: ${key}`);
@@ -1112,89 +1006,33 @@ async function addExactV3Indexes({
     object_count: publicationPlan.entries.length,
   };
   output.planning.removed_exact_v3_scopes = rebuilt.removedScopes;
-  reportProgress({
-    phase: "exact_v3_planning_complete",
-    completed_objects: publicationPlan.entries.length,
-    total_objects: publicationPlan.entries.length,
-  });
   return output;
 }
 
 export async function planSosLightV3ObservationMetadata(options = {}) {
-  const startedAtMs = Date.now();
-  const reportProgress = ({
-    phase,
-    completed_objects = 0,
-    total_objects = 0,
-    failures = 0,
-    ...details
-  }) => {
-    process.stderr.write(`UK_AQ_INTEGRITY_PROGRESS ${JSON.stringify({
-      phase,
-      completed_objects,
-      total_objects,
-      failures,
-      elapsed_seconds: Math.round((Date.now() - startedAtMs) / 1000),
-      ...details,
-    })}\n`);
-  };
   const argv = options.argv || process.argv.slice(2);
   const env = resolvedEnvironment(options.env || process.env, argv);
   const repairPlan = resolveRepairPlan({ argv, repairPlan: options.repairPlan });
   const targetWriterGitSha = resolveIntegrityTargetWriterGitSha(env);
   if (repairPlan?.domain !== "observations") throw new Error("Fixed-v3 planner is observation-only");
-  reportProgress({
-    phase: "v3_metadata_planner_started",
-    total_objects: Array.isArray(repairPlan.repair_plan) ? repairPlan.repair_plan.length : 0,
+  const runStatePath = String(env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON || "");
+  const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  const coreAudit = validateIntegrityCoreSnapshotIdentity({
+    env, runState, dropboxRoot: env.UK_AQ_R2_HISTORY_DROPBOX_ROOT,
+    stage: "fixed_v3_metadata_proposal_child",
   });
-  try {
-    const runStatePath = String(env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON || "");
-    const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
-    const coreAudit = validateIntegrityCoreSnapshotIdentity({
-      env, runState, dropboxRoot: env.UK_AQ_R2_HISTORY_DROPBOX_ROOT,
-      stage: "fixed_v3_metadata_proposal_child",
+  const output = await runGenerationNeutralObservationMetadataRepair({
+    argv, env, repairPlan, storageGeneration: "v3", planIndexes: false,
+  });
+  output.planning.core_snapshot_identity_validation = coreAudit;
+  if (output.ok === true) {
+    await addExactV3Indexes({
+      output, runState, env, repairPlan, targetWriterGitSha,
     });
-    const output = await runGenerationNeutralObservationMetadataRepair({
-      argv, env, repairPlan, storageGeneration: "v3", planIndexes: false,
-    });
-    reportProgress({
-      phase: "generation_neutral_observation_metadata_repair_complete",
-      completed_objects: output?.planning?.proposals?.length || 0,
-      total_objects: output?.planning?.proposals?.length || 0,
-      failures: output.ok === true ? 0 : 1,
-    });
-    output.planning.core_snapshot_identity_validation = coreAudit;
-    if (output.ok === true) {
-      await addExactV3Indexes({
-        output, runState, env, repairPlan, targetWriterGitSha, reportProgress,
-      });
-      reportProgress({
-        phase: "final_proposal_graph_validation_started",
-        total_objects: output.planning.proposals.length,
-      });
-      assertFixedV3Proposal(output);
-      validateFinalPlannerProposalGraph(output, { runState });
-      reportProgress({
-        phase: "final_proposal_graph_validation_complete",
-        completed_objects: output.planning.proposals.length,
-        total_objects: output.planning.proposals.length,
-      });
-    }
-    reportProgress({
-      phase: "v3_metadata_planner_completed",
-      completed_objects: output?.planning?.proposals?.length || 0,
-      total_objects: output?.planning?.proposals?.length || 0,
-      failures: output.ok === true ? 0 : 1,
-    });
-    return output;
-  } catch (error) {
-    reportProgress({
-      phase: "v3_metadata_planner_failed",
-      failures: 1,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    throw error;
+    assertFixedV3Proposal(output);
+    validateFinalPlannerProposalGraph(output, { runState });
   }
+  return output;
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

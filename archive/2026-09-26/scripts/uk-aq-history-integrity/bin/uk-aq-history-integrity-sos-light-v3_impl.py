@@ -18489,55 +18489,32 @@ def _run_v3_observation_metadata_proposal(
         "repair_plan": actions,
         "authoritative_core_timeseries": _authoritative_v2_core_timeseries_bindings(conn),
     }
-    proc = subprocess.Popen(
+    proc = subprocess.run(
         command,
         cwd=repo_root,
         env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        stdin=subprocess.PIPE,
+        input=json.dumps(plan),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        check=False,
     )
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
-
-    def _drain(stream: Any, destination: list[str], *, progress: bool) -> None:
-        for line in iter(stream.readline, ""):
-            destination.append(line)
-            if progress:
-                log.info("v3 metadata proposal planner %s", line.rstrip())
-        stream.close()
-
-    stdout_thread = threading.Thread(
-        target=_drain, args=(proc.stdout, stdout_lines), kwargs={"progress": False}, daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_drain, args=(proc.stderr, stderr_lines), kwargs={"progress": True}, daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    assert proc.stdin is not None
-    proc.stdin.write(json.dumps(plan))
-    proc.stdin.close()
-    proc.wait()
-    stdout_thread.join()
-    stderr_thread.join()
-    stdout = "".join(stdout_lines)
-    stderr = "".join(stderr_lines)
+    for line in proc.stderr.splitlines():
+        log.info("v3 metadata proposal planner %s", line)
     try:
-        output = json.loads(stdout) if stdout.strip() else {}
+        output = json.loads(proc.stdout) if proc.stdout.strip() else {}
     except json.JSONDecodeError:
         output = {}
     if proc.returncode != 0:
         log.warning(
             "v3 observation metadata proposal failed exit_code=%s stderr=%s",
             proc.returncode,
-            _truncate_text(stderr or stdout or "", 2000),
+            _truncate_text(proc.stderr or proc.stdout or "", 2000),
         )
         return {
             "status": str(output.get("status") or "failed") if isinstance(output, Mapping) else "failed",
             "exit_code": proc.returncode,
-            "error": _truncate_text(stderr or stdout or "", 4000),
+            "error": _truncate_text(proc.stderr or proc.stdout or "", 4000),
             "output": output if isinstance(output, Mapping) else {},
             "results": output.get("results") if isinstance(output, Mapping) else [],
         }
