@@ -28,9 +28,9 @@ A normal coding task should enter through the relevant area below rather than re
 
 | Task or subsystem | Start here | Status |
 |---|---|---|
-| Connector ingest, Daily Stations discovery, Breathe London reference discovery, UK-AIR SOS polling/fallback | [`ingest/README.md`](ingest/README.md) | Active current runtime; also routes explicitly labelled future high-frequency and UK-AIR Black Carbon contracts |
+| Connector ingest, Daily Stations discovery, Breathe London reference discovery, UK-AIR SOS polling/fallback | [`ingest/README.md`](ingest/README.md) | Active current runtime; also routes explicitly labelled future Breathe London Communities discovery and shared reference recovery, high-frequency and UK-AIR Black Carbon contracts |
 | Latest snapshot builder and current snapshot/API boundary | [`latest_snapshot/README.md`](latest_snapshot/README.md) | Active |
-| Canonical observation history, timeseries continuity, history indexes and current History Integrity repair | [`r2_history/README.md`](r2_history/README.md) | Active; also routes explicitly labelled future Black Carbon direct-R2 history authority |
+| Canonical observation history, timeseries continuity, history indexes and current History Integrity repair | [`r2_history/README.md`](r2_history/README.md) | Active; also routes explicitly labelled future Black Carbon direct-R2 history authority and future fixed-v2 SOS-light coordinator hardening authority |
 | Future dedicated Integrity Factory architecture | [`integrity_factory/README.md`](integrity_factory/README.md) | Future implementation authority; not current Integrity runtime |
 | UK AQ Media / AQ in the News discovery, editorial and public-feed subsystem | [`media/README.md`](media/README.md) | Active standalone runtime; also routes future homepage latest-six generation/cache authority; public website cut-over not yet done |
 | Calculated hourly DAQI / European AQI and station-history AQI behaviour | [`aqi-levels/README.md`](aqi-levels/README.md) | Active |
