@@ -687,47 +687,23 @@ export function reconstructCanonicalObservationAggregateHierarchy({
 }
 
 export function reconcileReconstructedExactV3Hierarchies({
-  existingLatest,
   hierarchies,
+  removedScopes = [],
 }) {
-  const oldRoots = (Array.isArray(existingLatest?.payload?.day_summaries)
-    ? existingLatest.payload.day_summaries : []).flatMap((summary) =>
-    Array.isArray(summary?.scoped_roots) ? summary.scoped_roots : []);
-  const oldByScope = new Map();
-  for (const root of oldRoots) {
-    const identity = scopeIdentity(root);
-    if (oldByScope.has(identity)) {
-      throw new Error(`Pinned v3 latest has duplicate scoped root: ${root?.key || identity}`);
-    }
-    oldByScope.set(identity, root);
-  }
-  const changedHierarchies = [];
-  const unchangedRoots = [];
-  const reconstructedScopes = new Set();
-  for (const hierarchy of hierarchies) {
-    const reconstructed = rootDescriptor(hierarchy.scoped_manifest);
-    reconstructedScopes.add(scopeIdentity(reconstructed));
-    const previous = oldByScope.get(scopeIdentity(reconstructed));
-    if (sameRootIdentity(previous, reconstructed)) unchangedRoots.push(reconstructed);
-    else changedHierarchies.push(hierarchy);
+  if (!Array.isArray(hierarchies) || hierarchies.length === 0) {
+    throw new Error("Fixed-v3 fallback reconstruction has no exact-leaf scopes");
   }
   const latest = buildObservationHistoryExactLeafIndexV3Latest({
     scopedHierarchies: hierarchies,
     indexRoot: GENERATION.observations_timeseries_index_prefix,
     latestKey: GENERATION.observations_timeseries_latest_key,
   });
-  const removedScopes = oldRoots
-    .filter((root) => !reconstructedScopes.has(scopeIdentity(root)))
-    .map((root) => ({
-      day_utc: root.day_utc,
-      connector_id: root.connector_id,
-      pollutant_code: root.pollutant_code,
-      exact_prefix: `${GENERATION.observations_timeseries_index_prefix}/day_utc=${root.day_utc}` +
-        `/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}`,
-      aligned_prefix: `${GENERATION.observations_timeseries_index_prefix}/_aligned/day_utc=${root.day_utc}` +
-        `/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}`,
-    }));
-  return { latest, changedHierarchies, unchangedRoots, removedScopes };
+  return {
+    latest,
+    changedHierarchies: [...hierarchies],
+    unchangedRoots: [],
+    removedScopes: [...removedScopes],
+  };
 }
 
 function scopeFromPollutantManifestKey(manifestKey) {
@@ -937,9 +913,8 @@ export function resolveExactV3PlanningAuthority({
   finalCatalogue,
   delta,
 }) {
-  let compactLatest = null;
   try {
-    compactLatest = authenticateExactV3CompactLatest({ runState, store });
+    const compactLatest = authenticateExactV3CompactLatest({ runState, store });
     crossCheckExactV3RegistryCatalogue({
       registryRoots: compactLatest.roots,
       finalCatalogue,
@@ -953,7 +928,7 @@ export function resolveExactV3PlanningAuthority({
   } catch (error) {
     return Object.freeze({
       mode: "full_canonical_reconstruction_fallback",
-      compact_latest: compactLatest,
+      compact_latest: null,
       fallback_reason: error instanceof Error ? error.message : String(error),
     });
   }
@@ -1139,7 +1114,7 @@ export function assertFixedV3Proposal(output) {
   return output;
 }
 
-async function buildExactV3HierarchyForCatalogueEntry({
+export async function buildExactV3HierarchyForCatalogueEntry({
   entry,
   proposalsByKey,
   runState,
@@ -1148,9 +1123,13 @@ async function buildExactV3HierarchyForCatalogueEntry({
   targetWriterGitSha,
 }) {
   const { key: manifestKey, scope } = entry;
-  const currentRunManifest = proposalsByKey.has(manifestKey) ||
-    (runState.objects?.[manifestKey]?.proposed === true &&
-      entry.manifest_object.source === "overlay");
+  const proposalOwner = resolveCurrentRunProposalOwner(proposalsByKey.get(manifestKey));
+  const stagedOwner = resolveCurrentRunProposalOwner(runState.objects?.[manifestKey]);
+  const owners = new Set([proposalOwner, stagedOwner].filter(Boolean));
+  if (owners.size > 1) {
+    throw new Error(`Fixed-v3 pollutant manifest ownership is contradictory: ${manifestKey}`);
+  }
+  const currentRunManifest = owners.has(SOURCE_DERIVED_OWNER);
   let targetMetadata;
   let canonicalManifest;
   if (currentRunManifest) {
@@ -1307,8 +1286,10 @@ async function addExactV3Indexes({
     finalCatalogue,
     delta: manifestDelta,
   });
-  const compactLatest = authority.compact_latest;
   const optimizationMode = authority.mode;
+  const compactLatest = optimizationMode === "exact_index_fast_path"
+    ? authority.compact_latest
+    : null;
   const fallbackReason = authority.fallback_reason;
   if (optimizationMode === "full_canonical_reconstruction_fallback") {
     reportProgress({
@@ -1395,28 +1376,11 @@ async function addExactV3Indexes({
       removedScopes: manifestDelta.removed_scopes,
     };
   } else {
-    if (hierarchies.length === 0) {
-      throw new Error("Fixed-v3 fallback reconstruction has no exact-leaf scopes");
-    }
-    if (compactLatest) {
-      rebuilt = reconcileReconstructedExactV3Hierarchies({
-        existingLatest: compactLatest.artifact,
-        hierarchies,
-      });
-      latestNeedsPublication = rebuilt.latest.sha256 !== compactLatest.artifact.sha256;
-    } else {
-      rebuilt = {
-        latest: buildObservationHistoryExactLeafIndexV3Latest({
-          scopedHierarchies: hierarchies,
-          indexRoot: GENERATION.observations_timeseries_index_prefix,
-          latestKey: GENERATION.observations_timeseries_latest_key,
-        }),
-        changedHierarchies: hierarchies,
-        unchangedRoots: [],
-        removedScopes: manifestDelta.removed_scopes,
-      };
-      latestNeedsPublication = true;
-    }
+    rebuilt = reconcileReconstructedExactV3Hierarchies({
+      hierarchies,
+      removedScopes: manifestDelta.removed_scopes,
+    });
+    latestNeedsPublication = true;
   }
   const exactObjects = rebuilt.changedHierarchies
     .flatMap((hierarchy) => hierarchy.publication_objects);
@@ -1506,7 +1470,9 @@ async function addExactV3Indexes({
       resolvedLocalReferences,
       registryRootKeys,
     });
-    const existing = store.getObjectIfExists(entry.key);
+    const existing = optimizationMode === "exact_index_fast_path"
+      ? store.getObjectIfExists(entry.key)
+      : null;
     proposals.push({
       key: entry.key,
       kind: exactByKey.get(entry.key).kind,

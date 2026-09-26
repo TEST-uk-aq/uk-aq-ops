@@ -11,6 +11,7 @@ import {
   assertCurrentRunManifestWriterGitSha,
   assertFixedV3Proposal,
   authenticateExactV3CompactLatest,
+  buildExactV3HierarchyForCatalogueEntry,
   buildExactV3ProposalDependencyFields,
   buildExactV3ManifestCatalogue,
   crossCheckExactV3RegistryCatalogue,
@@ -931,36 +932,25 @@ function exactHierarchy(dayUtc, timeseriesId) {
   });
 }
 
-test("reconstructed exact-v3 state republishes changed roots and drops absent old scopes", () => {
+test("full reconstructed exact-v3 fallback republishes every scope and applies explicit removals", () => {
   const unchanged = exactHierarchy("2026-06-01", 101);
   const changedUnselected = exactHierarchy("2026-06-02", 102);
-  const absent = exactHierarchy("2026-06-03", 103);
-  const builtOldLatest = buildObservationHistoryExactLeafIndexV3Latest({
-    scopedHierarchies: [unchanged, changedUnselected, absent],
-  });
-  const oldLatest = {
-    ...builtOldLatest,
-    payload: structuredClone(builtOldLatest.payload),
-  };
-  const changedRoot = oldLatest.payload.day_summaries
-    .flatMap(({ scoped_roots }) => scoped_roots)
-    .find(({ day_utc }) => day_utc === "2026-06-02");
-  changedRoot.sha256 = "f".repeat(64);
-
   const reconciled = reconcileReconstructedExactV3Hierarchies({
-    existingLatest: oldLatest,
     hierarchies: [unchanged, changedUnselected],
+    removedScopes: [{
+      day_utc: "2026-06-03",
+      connector_id: 1,
+      pollutant_code: "no2",
+      exact_prefix: "history/_index_v3/observations_timeseries/day_utc=2026-06-03/connector_id=1/pollutant_code=no2",
+      aligned_prefix: "history/_index_v3/observations_timeseries/_aligned/day_utc=2026-06-03/connector_id=1/pollutant_code=no2",
+    }],
   });
   assert.deepEqual(
     reconciled.changedHierarchies.map(({ scoped_manifest }) => scoped_manifest.key),
-    [changedUnselected.scoped_manifest.key],
-    "an unselected reconstructed mismatch must publish its complete hierarchy",
+    [unchanged.scoped_manifest.key, changedUnselected.scoped_manifest.key],
+    "fallback must publish every completely reconstructed hierarchy",
   );
-  assert.deepEqual(
-    reconciled.unchangedRoots.map(({ key }) => key),
-    [unchanged.scoped_manifest.key],
-    "a genuinely unchanged reconstructed root need not be republished",
-  );
+  assert.deepEqual(reconciled.unchangedRoots, []);
   const desiredRoots = reconciled.latest.payload.day_summaries
     .flatMap(({ scoped_roots }) => scoped_roots);
   assert.deepEqual(
@@ -1146,6 +1136,261 @@ test("manifest delta excludes byte-identical forced republication and selects ac
   assert.deepEqual(delta.removed_scopes.map(({ day_utc }) => day_utc), ["2026-06-04"]);
 });
 
+test("authenticated registry contradiction is discarded by conservative full fallback", () => {
+  const canonical = cataloguePartition("2026-06-01", 101, 12.5);
+  const canonicalManifest = canonical.canonical_pollutant_manifest;
+  const catalogue = buildExactV3ManifestCatalogue({
+    manifestKeys: [canonicalManifest.key],
+    getObject: () => ({
+      key: canonicalManifest.key,
+      body: Buffer.from(canonicalManifest.body),
+      source: "dropbox",
+    }),
+  });
+  const delta = deriveExactV3ManifestDelta({
+    finalCatalogue: catalogue,
+    baselineObjects: [{
+      key: canonicalManifest.key,
+      size: canonicalManifest.byte_size,
+      content_sha256: canonicalManifest.sha256,
+    }],
+  });
+  const contradictory = cataloguePartition("2026-06-02", 202, 99.5);
+  const contradictoryManifest = contradictory.canonical_pollutant_manifest;
+  const contradictoryHierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+    metadata: contradictory.target_metadata,
+    canonicalManifest: {
+      key: contradictoryManifest.key,
+      byte_size: contradictoryManifest.byte_size,
+      sha256: contradictoryManifest.sha256,
+      manifest_hash: contradictoryManifest.payload.manifest_hash,
+      row_count: contradictoryManifest.payload.row_count,
+      observation_content_hash: contradictoryManifest.payload.observation_content_hash,
+    },
+  });
+  const rejectedLatest = buildObservationHistoryExactLeafIndexV3Latest({
+    scopedHierarchies: [contradictoryHierarchy],
+  });
+  const dropboxReads = [];
+  const authority = resolveExactV3PlanningAuthority({
+    runState: { dropbox_currentness: { allowed: true, checkpoint: {
+      observations_timeseries_latest: {
+        key: rejectedLatest.key,
+        byte_size: rejectedLatest.byte_size,
+        sha256: rejectedLatest.sha256,
+      },
+    } } },
+    store: {
+      getObjectFromSourceIfExists(key, source) {
+        dropboxReads.push([key, source]);
+        return {
+          key,
+          body: Buffer.from(rejectedLatest.body),
+          bytes: rejectedLatest.byte_size,
+          content_sha256: rejectedLatest.sha256,
+          source,
+        };
+      },
+    },
+    finalCatalogue: catalogue,
+    delta,
+  });
+  assert.equal(authority.mode, "full_canonical_reconstruction_fallback");
+  assert.equal(authority.compact_latest, null);
+  assert.match(authority.fallback_reason, /missing unchanged scope/);
+  assert.deepEqual(dropboxReads, [[rejectedLatest.key, "dropbox"]]);
+
+  const canonicalHierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+    metadata: canonical.target_metadata,
+    canonicalManifest: {
+      key: canonicalManifest.key,
+      byte_size: canonicalManifest.byte_size,
+      sha256: canonicalManifest.sha256,
+      manifest_hash: canonicalManifest.payload.manifest_hash,
+      row_count: canonicalManifest.payload.row_count,
+      observation_content_hash: canonicalManifest.payload.observation_content_hash,
+    },
+  });
+  const removal = {
+    day_utc: "2026-05-31",
+    connector_id: 1,
+    pollutant_code: "no2",
+    exact_prefix: "history/_index_v3/observations_timeseries/day_utc=2026-05-31/connector_id=1/pollutant_code=no2",
+    aligned_prefix: "history/_index_v3/observations_timeseries/_aligned/day_utc=2026-05-31/connector_id=1/pollutant_code=no2",
+  };
+  const fallback = reconcileReconstructedExactV3Hierarchies({
+    hierarchies: [canonicalHierarchy],
+    removedScopes: [removal],
+  });
+  assert.deepEqual(fallback.changedHierarchies, [canonicalHierarchy]);
+  assert.deepEqual(fallback.unchangedRoots, []);
+  assert.deepEqual(fallback.removedScopes, [removal]);
+  assert.equal(
+    fallback.latest.body,
+    buildObservationHistoryExactLeafIndexV3Latest({
+      scopedHierarchies: [canonicalHierarchy],
+    }).body,
+  );
+  assert.notEqual(fallback.latest.sha256, rejectedLatest.sha256);
+
+  const exactObjects = [
+    ...fallback.changedHierarchies.flatMap(({ publication_objects }) => publication_objects),
+    fallback.latest,
+  ];
+  const changedExactKeys = new Set(exactObjects.map(({ key }) => key));
+  const dependencyFields = buildExactV3ProposalDependencyFields({
+    entry: {
+      dependencies: fallback.latest.dependencies,
+      publication_prerequisites: [],
+      external_dependencies: [],
+      external_publication_prerequisites: [],
+    },
+    changedExactKeys,
+    exactByKey: new Map(exactObjects.map((artifact) => [artifact.key, artifact])),
+    proposalsByKey: new Map(),
+    canonicalFinalizationPrerequisiteKeys: new Set(),
+    runState: { objects: {} },
+    store: { getObjectFromSourceIfExists: () => null },
+    resolvedLocalReferences: new Map(),
+    registryRootKeys: new Set(),
+  });
+  assert.equal(
+    Object.values(dependencyFields.pinned_baseline_references).some(
+      ({ source }) => source === "pinned_checkpoint_compact_latest_registry",
+    ),
+    false,
+  );
+});
+
+test("fallback treats a Dropbox-owned overlay manifest as pinned baseline", async () => {
+  const built = cataloguePartition("2026-06-05", 105);
+  const manifest = built.canonical_pollutant_manifest;
+  const overlayManifest = {
+    key: manifest.key,
+    body: Buffer.from(manifest.body),
+    source: "overlay",
+  };
+  const catalogue = buildExactV3ManifestCatalogue({
+    manifestKeys: [manifest.key],
+    getObject: () => overlayManifest,
+  });
+  const pinnedObjects = new Map([
+    [manifest.key, { key: manifest.key, body: Buffer.from(manifest.body), source: "dropbox" }],
+    ...built.file_intents.map((intent) => [intent.key, {
+      key: intent.key,
+      body: Buffer.from(intent.body),
+      source: "dropbox",
+    }]),
+  ]);
+  const pinnedReads = [];
+  const hierarchy = await buildExactV3HierarchyForCatalogueEntry({
+    entry: catalogue.entries[0],
+    proposalsByKey: new Map([[manifest.key, {
+      key: manifest.key,
+      proposal_owner: "dropbox_day_baseline",
+      changed: true,
+    }]]),
+    runState: { objects: { [manifest.key]: {
+      stage: "observations_data",
+      proposal_owner: "dropbox_day_baseline",
+      proposed: true,
+      built: true,
+      structurally_validated: true,
+      changed: true,
+      included_in_write_set: true,
+      status: "planned",
+    } } },
+    store: {
+      getObjectFromSourceIfExists(key, source) {
+        pinnedReads.push([key, source]);
+        return source === "dropbox" ? pinnedObjects.get(key) || null : null;
+      },
+    },
+    combinedObject: () => {
+      throw new Error("preserved baseline must not use current-run overlay reconstruction");
+    },
+    targetWriterGitSha: "b".repeat(40),
+  });
+  assert.equal(hierarchy.scoped_manifest.payload.day_utc, "2026-06-05");
+  assert.ok(pinnedReads.length > 1);
+  assert.equal(pinnedReads.every(([, source]) => source === "dropbox"), true);
+
+  await assert.rejects(() => buildExactV3HierarchyForCatalogueEntry({
+    entry: catalogue.entries[0],
+    proposalsByKey: new Map(),
+    runState: { objects: { [manifest.key]: {
+      stage: "observations_data",
+      proposal_owner: "dropbox_day_baseline",
+      proposed: true,
+      built: true,
+      structurally_validated: true,
+    } } },
+    store: { getObjectFromSourceIfExists: () => null },
+    combinedObject: () => overlayManifest,
+    targetWriterGitSha: "b".repeat(40),
+  }), /pinned pollutant manifest is unavailable/);
+
+  await assert.rejects(() => buildExactV3HierarchyForCatalogueEntry({
+    entry: catalogue.entries[0],
+    proposalsByKey: new Map([[manifest.key, {
+      proposal_owner: "source_derived_observation_repair",
+    }]]),
+    runState: { objects: { [manifest.key]: {
+      proposal_owner: "dropbox_day_baseline",
+    } } },
+    store: { getObjectFromSourceIfExists: () => null },
+    combinedObject: () => overlayManifest,
+    targetWriterGitSha: "b".repeat(40),
+  }), /ownership is contradictory/);
+});
+
+test("fallback retains derived ownership for a genuine current-run manifest", async () => {
+  const built = cataloguePartition("2026-06-06", 106);
+  const manifest = built.canonical_pollutant_manifest;
+  const objects = new Map([
+    [manifest.key, { key: manifest.key, body: Buffer.from(manifest.body), source: "overlay" }],
+    ...built.file_intents.map((intent) => [intent.key, {
+      key: intent.key,
+      body: Buffer.from(intent.body),
+      source: "planned_overlay",
+    }]),
+  ]);
+  const catalogue = buildExactV3ManifestCatalogue({
+    manifestKeys: [manifest.key],
+    getObject: (key) => objects.get(key),
+  });
+  const combinedReads = [];
+  const hierarchy = await buildExactV3HierarchyForCatalogueEntry({
+    entry: catalogue.entries[0],
+    proposalsByKey: new Map(),
+    runState: { objects: { [manifest.key]: {
+      stage: "observations_data",
+      proposed: true,
+      built: true,
+      structurally_validated: true,
+      changed: true,
+      included_in_write_set: true,
+      status: "planned",
+    } } },
+    store: {
+      getObjectFromSourceIfExists() {
+        throw new Error("current-run source-derived manifest must not use Dropbox baseline");
+      },
+    },
+    combinedObject(key) {
+      combinedReads.push(key);
+      return objects.get(key) || null;
+    },
+    targetWriterGitSha: "a".repeat(40),
+  });
+  assert.equal(hierarchy.scoped_manifest.payload.day_utc, "2026-06-06");
+  assert.deepEqual(
+    [...new Set(combinedReads)],
+    built.file_intents.map(({ key }) => key),
+  );
+  assert.ok(combinedReads.length >= built.file_intents.length);
+});
+
 test("checkpoint authentication pins compact latest and registry provenance is explicit", () => {
   const hierarchy = exactHierarchy("2026-06-01", 101);
   const latest = buildObservationHistoryExactLeafIndexV3Latest({
@@ -1275,5 +1520,6 @@ test("registry catalogue cross-check rejects an unchanged summary contradiction"
     delta,
   });
   assert.equal(fallback.mode, "full_canonical_reconstruction_fallback");
+  assert.equal(fallback.compact_latest, null);
   assert.match(fallback.fallback_reason, /identity disagrees/);
 });
