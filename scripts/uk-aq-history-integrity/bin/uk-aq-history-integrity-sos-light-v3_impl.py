@@ -17930,6 +17930,9 @@ PROPOSAL_TRANSITION_DEPENDENCY_SOURCES = frozenset({
     "planned_overlay", *PROPOSAL_TRANSITION_EXTERNAL_SOURCES,
 })
 FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX = "exact_prefix_replacement"
+SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
+    "uk_aq_sos_light_v3_transition_state_fingerprint_v1"
+)
 COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
 COORDINATOR_PROGRESS_SECONDS = 15.0
 
@@ -18064,6 +18067,352 @@ def _is_forced_republication_entry(entry: Mapping[str, Any]) -> bool:
         == FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX
         and str(entry.get("final_source") or "").strip() == "planned_overlay"
     )
+
+
+def _transition_fingerprint_optional_bool(
+    entry: Mapping[str, Any], field: str, *, object_key: str,
+) -> bool | None:
+    value = entry.get(field)
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(
+            "fixed-v3 transition fingerprint boolean is invalid: "
+            f"{object_key}:{field}"
+        )
+    return value
+
+
+def _transition_fingerprint_optional_text(
+    entry: Mapping[str, Any], field: str, *, object_key: str,
+) -> str | None:
+    value = entry.get(field)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(
+            "fixed-v3 transition fingerprint text is invalid: "
+            f"{object_key}:{field}"
+        )
+    return value
+
+
+def _transition_fingerprint_nonnegative_int(
+    entry: Mapping[str, Any], field: str, *, label: str,
+) -> int:
+    value = entry.get(field)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+    ):
+        raise ValueError(
+            f"fixed-v3 transition fingerprint count is invalid: {label}:{field}"
+        )
+    return value
+
+
+def _transition_fingerprint_identity_entries(
+    *,
+    parent_key: str,
+    raw_identities: Any,
+    label: str,
+) -> list[dict[str, Any]] | None:
+    if raw_identities is None:
+        return None
+    if not isinstance(raw_identities, Mapping):
+        raise ValueError(
+            f"fixed-v3 transition fingerprint {label} is invalid: {parent_key}"
+        )
+    identities: list[dict[str, Any]] = []
+    for raw_dependency_key, raw_identity in raw_identities.items():
+        dependency_key = _normalise_overlay_object_key(
+            str(raw_dependency_key)
+        )
+        if str(raw_dependency_key) != dependency_key:
+            raise ValueError(
+                "fixed-v3 transition fingerprint dependency key is not "
+                f"canonical: {parent_key} -> {raw_dependency_key}"
+            )
+        if not isinstance(raw_identity, Mapping):
+            raise ValueError(
+                f"fixed-v3 transition fingerprint {label} entry is invalid: "
+                f"{parent_key} -> {dependency_key}"
+            )
+        identity = _normalise_proposal_dependency_identity(
+            parent_key=parent_key,
+            dependency_key=dependency_key,
+            identity=raw_identity,
+        )
+        identities.append({
+            "object_key": dependency_key,
+            **identity,
+        })
+    return sorted(identities, key=lambda identity: identity["object_key"])
+
+
+def _proposal_transition_state_fingerprint_payload(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the narrow canonical state consumed by transition validation."""
+    objects = run_state.get("objects")
+    if not isinstance(objects, Mapping):
+        raise ValueError(
+            "fixed-v3 transition fingerprint objects mapping is invalid"
+        )
+    canonical_objects: list[dict[str, Any]] = []
+    for raw_object_key, raw_entry in objects.items():
+        object_key = _normalise_overlay_object_key(str(raw_object_key))
+        if str(raw_object_key) != object_key:
+            raise ValueError(
+                "fixed-v3 transition fingerprint object key is not canonical: "
+                f"{raw_object_key}"
+            )
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError(
+                f"fixed-v3 transition fingerprint object is invalid: {object_key}"
+            )
+        entry = raw_entry
+        sha256 = str(entry.get("sha256") or "").strip().lower()
+        byte_count = entry.get("bytes")
+        if (
+            not re.fullmatch(r"[a-f0-9]{64}", sha256)
+            or not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+        ):
+            raise ValueError(
+                f"fixed-v3 transition fingerprint object identity is invalid: "
+                f"{object_key}"
+            )
+        raw_dependencies = entry.get("dependencies")
+        if not isinstance(raw_dependencies, list):
+            raise ValueError(
+                f"fixed-v3 transition fingerprint dependencies are invalid: "
+                f"{object_key}"
+            )
+        dependencies = sorted({
+            _normalise_overlay_object_key(str(value))
+            for value in raw_dependencies
+        })
+        if len(dependencies) != len(raw_dependencies):
+            raise ValueError(
+                f"fixed-v3 transition fingerprint dependencies are duplicated: "
+                f"{object_key}"
+            )
+        planner_dependencies_raw = entry.get("planner_dependencies")
+        planner_dependencies = None
+        if planner_dependencies_raw is not None:
+            if not isinstance(planner_dependencies_raw, list):
+                raise ValueError(
+                    "fixed-v3 transition fingerprint planner dependencies are "
+                    f"invalid: {object_key}"
+                )
+            planner_dependencies = sorted({
+                _normalise_overlay_object_key(str(value))
+                for value in planner_dependencies_raw
+            })
+            if len(planner_dependencies) != len(planner_dependencies_raw):
+                raise ValueError(
+                    "fixed-v3 transition fingerprint planner dependencies are "
+                    f"duplicated: {object_key}"
+                )
+        canonical_objects.append({
+            "object_key": object_key,
+            "sha256": sha256,
+            "bytes": byte_count,
+            "stage": _transition_fingerprint_optional_text(
+                entry, "stage", object_key=object_key,
+            ),
+            "dependencies": dependencies,
+            "dependency_identities":
+                _transition_fingerprint_identity_entries(
+                    parent_key=object_key,
+                    raw_identities=entry.get("dependency_identities"),
+                    label="dependency identities",
+                ),
+            "proposed": _transition_fingerprint_optional_bool(
+                entry, "proposed", object_key=object_key,
+            ),
+            "built": _transition_fingerprint_optional_bool(
+                entry, "built", object_key=object_key,
+            ),
+            "structurally_validated": _transition_fingerprint_optional_bool(
+                entry, "structurally_validated", object_key=object_key,
+            ),
+            "changed": _transition_fingerprint_optional_bool(
+                entry, "changed", object_key=object_key,
+            ),
+            "included_in_write_set": _transition_fingerprint_optional_bool(
+                entry, "included_in_write_set", object_key=object_key,
+            ),
+            "status": _transition_fingerprint_optional_text(
+                entry, "status", object_key=object_key,
+            ),
+            "planner_changed": _transition_fingerprint_optional_bool(
+                entry, "planner_changed", object_key=object_key,
+            ),
+            "planner_status": _transition_fingerprint_optional_text(
+                entry, "planner_status", object_key=object_key,
+            ),
+            "planner_included_in_write_set":
+                _transition_fingerprint_optional_bool(
+                    entry,
+                    "planner_included_in_write_set",
+                    object_key=object_key,
+                ),
+            "planner_dependencies": planner_dependencies,
+            "planner_dependency_identities":
+                _transition_fingerprint_identity_entries(
+                    parent_key=object_key,
+                    raw_identities=entry.get(
+                        "planner_dependency_identities"
+                    ),
+                    label="planner dependency identities",
+                ),
+            "proposal_changed": _transition_fingerprint_optional_bool(
+                entry, "proposal_changed", object_key=object_key,
+            ),
+            "planner_source": _transition_fingerprint_optional_text(
+                entry, "planner_source", object_key=object_key,
+            ),
+            "baseline_source": _transition_fingerprint_optional_text(
+                entry, "baseline_source", object_key=object_key,
+            ),
+            "included_in_final_staged_write_set":
+                _transition_fingerprint_optional_bool(
+                    entry,
+                    "included_in_final_staged_write_set",
+                    object_key=object_key,
+                ),
+            "promotion_reason": _transition_fingerprint_optional_text(
+                entry, "promotion_reason", object_key=object_key,
+            ),
+            "final_source": _transition_fingerprint_optional_text(
+                entry, "final_source", object_key=object_key,
+            ),
+        })
+    canonical_objects.sort(key=lambda entry: entry["object_key"])
+
+    unchanged_keys_raw = run_state.get(
+        "proposal_transition_planner_unchanged_keys"
+    ) or []
+    if not isinstance(unchanged_keys_raw, list):
+        raise ValueError(
+            "fixed-v3 transition fingerprint unchanged-planner keys are invalid"
+        )
+    unchanged_keys = sorted({
+        _normalise_overlay_object_key(str(value))
+        for value in unchanged_keys_raw
+    })
+    tombstone_prefixes_raw = run_state.get("tombstone_prefixes") or []
+    if not isinstance(tombstone_prefixes_raw, list):
+        raise ValueError(
+            "fixed-v3 transition fingerprint tombstone prefixes are invalid"
+        )
+    proposed_prefixes = sorted({
+        _normalise_overlay_object_key(
+            str(entry.get("prefix") or "")
+        ).rstrip("/")
+        for entry in tombstone_prefixes_raw
+        if isinstance(entry, Mapping) and entry.get("proposed")
+    })
+    final_provenance = run_state.get("final_staged_write_set_provenance")
+    if not isinstance(final_provenance, Mapping):
+        raise ValueError(
+            "fixed-v3 transition fingerprint final provenance is invalid"
+        )
+    promotion_reason_counts = final_provenance.get(
+        "promotion_reason_counts"
+    )
+    external_edge_counts = final_provenance.get(
+        "external_dependency_edge_counts"
+    )
+    if (
+        not isinstance(promotion_reason_counts, Mapping)
+        or not isinstance(external_edge_counts, Mapping)
+    ):
+        raise ValueError(
+            "fixed-v3 transition fingerprint provenance counts are invalid"
+        )
+    canonical_promotion_reason_counts = {
+        str(key): _transition_fingerprint_nonnegative_int(
+            promotion_reason_counts,
+            key,
+            label="promotion_reason_counts",
+        )
+        for key in sorted(promotion_reason_counts, key=str)
+    }
+    canonical_external_edge_counts = {
+        str(key): _transition_fingerprint_nonnegative_int(
+            external_edge_counts,
+            key,
+            label="external_dependency_edge_counts",
+        )
+        for key in sorted(external_edge_counts, key=str)
+    }
+    forced_republication_keys_raw = final_provenance.get(
+        "forced_republication_keys"
+    )
+    if not isinstance(forced_republication_keys_raw, list):
+        raise ValueError(
+            "fixed-v3 transition fingerprint forced-republication keys are invalid"
+        )
+    return {
+        "contract_version":
+            SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+        "objects": canonical_objects,
+        "proposal_transition_planner_unchanged_keys": unchanged_keys,
+        "proposed_tombstone_prefixes": proposed_prefixes,
+        "final_staged_write_set_provenance": {
+            "status": _transition_fingerprint_optional_text(
+                final_provenance,
+                "status",
+                object_key="final_staged_write_set_provenance",
+            ),
+            "final_staged_object_count":
+                _transition_fingerprint_nonnegative_int(
+                    final_provenance,
+                    "final_staged_object_count",
+                    label="final_staged_write_set_provenance",
+                ),
+            "forced_republication_count":
+                _transition_fingerprint_nonnegative_int(
+                    final_provenance,
+                    "forced_republication_count",
+                    label="final_staged_write_set_provenance",
+                ),
+            "forced_republication_keys": sorted({
+                _normalise_overlay_object_key(str(value))
+                for value in forced_republication_keys_raw
+            }),
+            "promotion_reason_counts": canonical_promotion_reason_counts,
+            "rebuilt_dependency_identity_count":
+                _transition_fingerprint_nonnegative_int(
+                    final_provenance,
+                    "rebuilt_dependency_identity_count",
+                    label="final_staged_write_set_provenance",
+                ),
+            "staged_dependency_edge_count":
+                _transition_fingerprint_nonnegative_int(
+                    final_provenance,
+                    "staged_dependency_edge_count",
+                    label="final_staged_write_set_provenance",
+                ),
+            "external_dependency_edge_counts":
+                canonical_external_edge_counts,
+        },
+    }
+
+
+def proposal_transition_state_fingerprint_sha256(
+    run_state: Mapping[str, Any],
+) -> str:
+    payload = _proposal_transition_state_fingerprint_payload(run_state)
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _record_coordinator_complete_run_state_write(
@@ -22090,6 +22439,9 @@ def run_canonical_apply_executor(
             run_state,
             log=log,
         )
+        transition_fingerprint = proposal_transition_state_fingerprint_sha256(
+            run_state
+        )
     except (OSError, TypeError, ValueError) as exc:
         error = str(exc)
         run_state["proposal_transition_validation"] = {
@@ -22111,6 +22463,11 @@ def run_canonical_apply_executor(
         **transition_validation,
         "validated_at_utc": fmt_iso(utc_now()),
     }
+    run_state["proposal_transition_validation"].update({
+        "state_fingerprint_contract_version":
+            SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+        "state_fingerprint_sha256": transition_fingerprint,
+    })
     write_run_state(run_state)
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")

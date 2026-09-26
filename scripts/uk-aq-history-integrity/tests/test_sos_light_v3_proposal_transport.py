@@ -523,6 +523,18 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 "node_apply_launch_permitted"
             ]
         )
+        self.assertEqual(
+            persisted["proposal_transition_validation"][
+                "state_fingerprint_contract_version"
+            ],
+            MODULE.SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+        )
+        self.assertEqual(
+            persisted["proposal_transition_validation"][
+                "state_fingerprint_sha256"
+            ],
+            MODULE.proposal_transition_state_fingerprint_sha256(persisted),
+        )
         MODULE._finalise_staged_write_set_provenance(self.run_state)
         MODULE.write_run_state(self.run_state)
         MODULE._require_complete_persisted_file_backed_proposal(self.run_state)
@@ -533,6 +545,63 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
             MODULE._require_complete_persisted_file_backed_proposal(
                 self.run_state
             )
+
+    def test_python_and_node_transition_fingerprints_match(self) -> None:
+        executor = self._bulk_executor(2)
+        MODULE._record_metadata_executor_overlay(
+            run_state=self.run_state,
+            executor_result=executor,
+            dry_run=False,
+            require_file_backed_bodies=True,
+        )
+        child_key = "history/_index_v3/bulk/00000.json"
+        parent_key = "history/_index_v3/bulk/00001.json"
+        child = self.run_state["objects"][child_key]
+        identity = {
+            "sha256": child["sha256"],
+            "bytes": child["bytes"],
+            "source": "planned_overlay",
+        }
+        parent = self.run_state["objects"][parent_key]
+        parent["dependencies"] = [child_key]
+        parent["dependency_identities"] = {child_key: identity}
+        parent["planner_dependencies"] = [child_key]
+        parent["planner_dependency_identities"] = {child_key: identity}
+        self.run_state["tombstone_prefixes"] = [{
+            "prefix": "history/v3/observations/day_utc=2025-01-01",
+            "proposed": True,
+        }]
+        MODULE._finalise_staged_write_set_provenance(self.run_state)
+        MODULE.write_run_state(self.run_state)
+        transition = MODULE.validate_proposal_run_state_transition(
+            self.run_state
+        )
+        self.assertEqual(transition["status"], "succeeded")
+        python_fingerprint = (
+            MODULE.proposal_transition_state_fingerprint_sha256(self.run_state)
+        )
+        validation_module = (
+            Path(__file__).resolve().parents[3]
+            / "scripts/backup_r2/lib/sos_light_v3_proposal_validation.mjs"
+        ).as_uri()
+        result = MODULE.subprocess.run(
+            [
+                "node",
+                "--input-type=module",
+                "--eval",
+                (
+                    "import fs from 'node:fs';"
+                    f"import {{computeCoordinatorTransitionStateFingerprint}} from {json.dumps(validation_module)};"
+                    "const state=JSON.parse(fs.readFileSync("
+                    f"{json.dumps(self.run_state['run_state_path'])},'utf8'));"
+                    "process.stdout.write(computeCoordinatorTransitionStateFingerprint(state));"
+                ),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.stdout, python_fingerprint)
 
     def test_progress_throttles_by_count_and_elapsed_time(self) -> None:
         logger = mock.Mock(spec=logging.Logger)

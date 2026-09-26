@@ -11,7 +11,9 @@ import {
   writeSosLightV3ProposalArtifact,
 } from "../lib/sos_light_v3_proposal_transport.mjs";
 import {
+  computeCoordinatorTransitionStateFingerprint,
   requireCoordinatorProposalFreeze,
+  SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
 } from "../lib/sos_light_v3_proposal_validation.mjs";
 
 function proposal(key, body, overrides = {}) {
@@ -142,26 +144,127 @@ test("materialisation reuses an exact staged body and rejects an outside staged 
   }
 });
 
-test("fixed-v3 apply rejects every intermediate coordinator checkpoint", () => {
+function frozenCoordinatorState() {
+  const childKey = "history/_index_v3/child.json";
+  const parentKey = "history/_index_v3/parent.json";
+  const childIdentity = {
+    sha256: "a".repeat(64),
+    bytes: 11,
+    source: "planned_overlay",
+  };
+  const object = ({ key, sha256, bytes, dependencies, identities }) => ({
+    object_key: key,
+    sha256,
+    bytes,
+    stage: "child_shard",
+    dependencies,
+    dependency_identities: identities,
+    proposed: true,
+    built: true,
+    structurally_validated: true,
+    changed: true,
+    included_in_write_set: true,
+    status: "planned",
+    planner_changed: true,
+    planner_status: "planned",
+    planner_included_in_write_set: true,
+    planner_dependencies: dependencies,
+    planner_dependency_identities: identities,
+  });
   const complete = {
-    objects: { "history/_index_v3/example.json": {} },
+    objects: {
+      [childKey]: object({
+        key: childKey,
+        sha256: childIdentity.sha256,
+        bytes: childIdentity.bytes,
+        dependencies: [],
+        identities: {},
+      }),
+      [parentKey]: object({
+        key: parentKey,
+        sha256: "b".repeat(64),
+        bytes: 17,
+        dependencies: [childKey],
+        identities: { [childKey]: childIdentity },
+      }),
+    },
+    proposal_transition_planner_unchanged_keys: [],
+    tombstone_prefixes: [{
+      prefix: "history/v3/observations/day_utc=2025-01-01",
+      proposed: true,
+    }],
     proposal_ingestion: {
       status: "complete",
       transport_mode: "file_backed_compact_proposal",
-      completed_object_count: 1,
-      total_object_count: 1,
+      completed_object_count: 2,
+      total_object_count: 2,
       node_apply_launch_permitted: false,
     },
     final_staged_write_set_provenance: {
       status: "finalised",
-      final_staged_object_count: 1,
+      final_staged_object_count: 2,
+      forced_republication_count: 0,
+      forced_republication_keys: [],
+      promotion_reason_counts: { exact_prefix_replacement: 0 },
+      rebuilt_dependency_identity_count: 0,
+      staged_dependency_edge_count: 1,
+      external_dependency_edge_counts: { dropbox: 0, overlay: 0 },
     },
     proposal_transition_validation: {
       status: "succeeded",
       node_apply_launch_permitted: true,
     },
   };
+  complete.proposal_transition_validation.state_fingerprint_contract_version =
+    SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT;
+  complete.proposal_transition_validation.state_fingerprint_sha256 =
+    computeCoordinatorTransitionStateFingerprint(complete);
+  return { complete, childKey, parentKey };
+}
+
+test("fixed-v3 coordinator fingerprint accepts only the untouched frozen graph", () => {
+  const { complete, childKey, parentKey } = frozenCoordinatorState();
   assert.doesNotThrow(() => requireCoordinatorProposalFreeze(complete));
+
+  const changedDependency = structuredClone(complete);
+  changedDependency.objects[parentKey].dependency_identities[childKey].source = "overlay";
+  assert.throws(
+    () => requireCoordinatorProposalFreeze(changedDependency),
+    /transition evidence is stale or changed/,
+  );
+
+  const changedProvenance = structuredClone(complete);
+  changedProvenance.final_staged_write_set_provenance.rebuilt_dependency_identity_count = 1;
+  assert.throws(
+    () => requireCoordinatorProposalFreeze(changedProvenance),
+    /transition evidence is stale or changed/,
+  );
+
+  const changedPlannerEvidence = structuredClone(complete);
+  changedPlannerEvidence.objects[parentKey].planner_status = "changed_after_validation";
+  assert.throws(
+    () => requireCoordinatorProposalFreeze(changedPlannerEvidence),
+    /transition evidence is stale or changed/,
+  );
+});
+
+test("fixed-v3 apply rejects missing, unknown, and intermediate fingerprints", () => {
+  const { complete } = frozenCoordinatorState();
+  const missingFingerprint = structuredClone(complete);
+  delete missingFingerprint.proposal_transition_validation.state_fingerprint_sha256;
+  assert.throws(
+    () => requireCoordinatorProposalFreeze(missingFingerprint),
+    /transition-state fingerprint is missing/,
+  );
+
+  const unknownContract = structuredClone(complete);
+  unknownContract.proposal_transition_validation.state_fingerprint_contract_version =
+    "unknown_transition_fingerprint_v999";
+  assert.throws(
+    () => requireCoordinatorProposalFreeze(unknownContract),
+    /fingerprint contract is unknown/,
+  );
+
   assert.throws(
     () => requireCoordinatorProposalFreeze({
       ...complete,

@@ -16,6 +16,8 @@ const POLLUTANT_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2}
 const POLLUTANT_MANIFEST = new RegExp(`${POLLUTANT_PREFIX.source.slice(1, -1)}\\/manifest\\.json$`);
 const SHA256 = /^[a-f0-9]{64}$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
+export const SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT =
+  "uk_aq_sos_light_v3_transition_state_fingerprint_v1";
 
 function sha256(body) { return createHash("sha256").update(body).digest("hex"); }
 function safeKey(raw) {
@@ -77,6 +79,226 @@ function validateDependencies(runState, key, entry) {
   }
 }
 
+function optionalFingerprintBoolean(entry, field, label) {
+  const value = entry?.[field];
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "boolean") {
+    throw new Error(`Fixed-v3 transition fingerprint boolean is invalid: ${label}:${field}`);
+  }
+  return value;
+}
+
+function optionalFingerprintText(entry, field, label) {
+  const value = entry?.[field];
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") {
+    throw new Error(`Fixed-v3 transition fingerprint text is invalid: ${label}:${field}`);
+  }
+  return value;
+}
+
+function nonnegativeFingerprintInteger(entry, field, label) {
+  const value = entry?.[field];
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Fixed-v3 transition fingerprint count is invalid: ${label}:${field}`);
+  }
+  return value;
+}
+
+function fingerprintIdentityEntries(rawIdentities, parentKey, label) {
+  if (rawIdentities === undefined || rawIdentities === null) return null;
+  if (typeof rawIdentities !== "object" || Array.isArray(rawIdentities)) {
+    throw new Error(`Fixed-v3 transition fingerprint ${label} is invalid: ${parentKey}`);
+  }
+  return Object.entries(rawIdentities).map(([rawDependencyKey, rawIdentity]) => {
+    const dependencyKey = safeKey(rawDependencyKey);
+    if (rawDependencyKey !== dependencyKey) {
+      throw new Error(`Fixed-v3 transition fingerprint dependency key is not canonical: ${parentKey} -> ${rawDependencyKey}`);
+    }
+    if (!rawIdentity || typeof rawIdentity !== "object" || Array.isArray(rawIdentity)) {
+      throw new Error(`Fixed-v3 transition fingerprint ${label} entry is invalid: ${parentKey} -> ${dependencyKey}`);
+    }
+    const identitySha256 = String(rawIdentity.sha256 || "").trim().toLowerCase();
+    const identityBytes = Number(rawIdentity.bytes);
+    const identitySource = String(rawIdentity.source || "").trim();
+    if (!SHA256.test(identitySha256)
+        || !Number.isSafeInteger(identityBytes) || identityBytes < 0
+        || !["planned_overlay", "dropbox", "overlay"].includes(identitySource)) {
+      throw new Error(`Fixed-v3 transition fingerprint ${label} entry is invalid: ${parentKey} -> ${dependencyKey}`);
+    }
+    return {
+      object_key: dependencyKey,
+      sha256: identitySha256,
+      bytes: identityBytes,
+      source: identitySource,
+    };
+  }).sort(compareFingerprintObjectKeys);
+}
+
+function canonicalCountMap(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Fixed-v3 transition fingerprint ${label} is invalid`);
+  }
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [
+    key,
+    nonnegativeFingerprintInteger(value, key, label),
+  ]));
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) throw new Error("Fixed-v3 transition fingerprint number is invalid");
+    return String(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  throw new Error("Fixed-v3 transition fingerprint value is invalid");
+}
+
+function compareFingerprintObjectKeys(left, right) {
+  if (left.object_key < right.object_key) return -1;
+  if (left.object_key > right.object_key) return 1;
+  return 0;
+}
+
+export function coordinatorTransitionStateFingerprintPayload(runState) {
+  const rawObjects = runState?.objects;
+  if (!rawObjects || typeof rawObjects !== "object" || Array.isArray(rawObjects)) {
+    throw new Error("Fixed-v3 transition fingerprint objects mapping is invalid");
+  }
+  const objects = Object.entries(rawObjects).map(([rawObjectKey, entry]) => {
+    const objectKey = safeKey(rawObjectKey);
+    if (rawObjectKey !== objectKey) {
+      throw new Error(`Fixed-v3 transition fingerprint object key is not canonical: ${rawObjectKey}`);
+    }
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`Fixed-v3 transition fingerprint object is invalid: ${objectKey}`);
+    }
+    const objectSha256 = String(entry.sha256 || "").trim().toLowerCase();
+    if (!SHA256.test(objectSha256)
+        || !Number.isSafeInteger(entry.bytes) || entry.bytes < 0) {
+      throw new Error(`Fixed-v3 transition fingerprint object identity is invalid: ${objectKey}`);
+    }
+    if (!Array.isArray(entry.dependencies)) {
+      throw new Error(`Fixed-v3 transition fingerprint dependencies are invalid: ${objectKey}`);
+    }
+    const dependencies = [...new Set(entry.dependencies.map(safeKey))].sort();
+    if (dependencies.length !== entry.dependencies.length) {
+      throw new Error(`Fixed-v3 transition fingerprint dependencies are duplicated: ${objectKey}`);
+    }
+    let plannerDependencies = null;
+    if (entry.planner_dependencies !== undefined && entry.planner_dependencies !== null) {
+      if (!Array.isArray(entry.planner_dependencies)) {
+        throw new Error(`Fixed-v3 transition fingerprint planner dependencies are invalid: ${objectKey}`);
+      }
+      plannerDependencies = [...new Set(entry.planner_dependencies.map(safeKey))].sort();
+      if (plannerDependencies.length !== entry.planner_dependencies.length) {
+        throw new Error(`Fixed-v3 transition fingerprint planner dependencies are duplicated: ${objectKey}`);
+      }
+    }
+    return {
+      object_key: objectKey,
+      sha256: objectSha256,
+      bytes: entry.bytes,
+      stage: optionalFingerprintText(entry, "stage", objectKey),
+      dependencies,
+      dependency_identities: fingerprintIdentityEntries(
+        entry.dependency_identities, objectKey, "dependency identities",
+      ),
+      proposed: optionalFingerprintBoolean(entry, "proposed", objectKey),
+      built: optionalFingerprintBoolean(entry, "built", objectKey),
+      structurally_validated: optionalFingerprintBoolean(
+        entry, "structurally_validated", objectKey,
+      ),
+      changed: optionalFingerprintBoolean(entry, "changed", objectKey),
+      included_in_write_set: optionalFingerprintBoolean(
+        entry, "included_in_write_set", objectKey,
+      ),
+      status: optionalFingerprintText(entry, "status", objectKey),
+      planner_changed: optionalFingerprintBoolean(entry, "planner_changed", objectKey),
+      planner_status: optionalFingerprintText(entry, "planner_status", objectKey),
+      planner_included_in_write_set: optionalFingerprintBoolean(
+        entry, "planner_included_in_write_set", objectKey,
+      ),
+      planner_dependencies: plannerDependencies,
+      planner_dependency_identities: fingerprintIdentityEntries(
+        entry.planner_dependency_identities, objectKey, "planner dependency identities",
+      ),
+      proposal_changed: optionalFingerprintBoolean(entry, "proposal_changed", objectKey),
+      planner_source: optionalFingerprintText(entry, "planner_source", objectKey),
+      baseline_source: optionalFingerprintText(entry, "baseline_source", objectKey),
+      included_in_final_staged_write_set: optionalFingerprintBoolean(
+        entry, "included_in_final_staged_write_set", objectKey,
+      ),
+      promotion_reason: optionalFingerprintText(entry, "promotion_reason", objectKey),
+      final_source: optionalFingerprintText(entry, "final_source", objectKey),
+    };
+  }).sort(compareFingerprintObjectKeys);
+
+  const rawUnchangedKeys = runState?.proposal_transition_planner_unchanged_keys || [];
+  if (!Array.isArray(rawUnchangedKeys)) {
+    throw new Error("Fixed-v3 transition fingerprint unchanged-planner keys are invalid");
+  }
+  const unchangedKeys = [...new Set(rawUnchangedKeys.map(safeKey))].sort();
+  const rawTombstones = runState?.tombstone_prefixes || [];
+  if (!Array.isArray(rawTombstones)) {
+    throw new Error("Fixed-v3 transition fingerprint tombstone prefixes are invalid");
+  }
+  const proposedPrefixes = [...new Set(rawTombstones
+    .filter((entry) => entry && typeof entry === "object" && entry.proposed)
+    .map((entry) => safeKey(entry.prefix).replace(/\/+$/, "")))].sort();
+  const provenance = runState?.final_staged_write_set_provenance;
+  if (!provenance || typeof provenance !== "object" || Array.isArray(provenance)) {
+    throw new Error("Fixed-v3 transition fingerprint final provenance is invalid");
+  }
+  if (!Array.isArray(provenance.forced_republication_keys)) {
+    throw new Error("Fixed-v3 transition fingerprint forced-republication keys are invalid");
+  }
+  return {
+    contract_version: SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+    objects,
+    proposal_transition_planner_unchanged_keys: unchangedKeys,
+    proposed_tombstone_prefixes: proposedPrefixes,
+    final_staged_write_set_provenance: {
+      status: optionalFingerprintText(
+        provenance, "status", "final_staged_write_set_provenance",
+      ),
+      final_staged_object_count: nonnegativeFingerprintInteger(
+        provenance, "final_staged_object_count", "final_staged_write_set_provenance",
+      ),
+      forced_republication_count: nonnegativeFingerprintInteger(
+        provenance, "forced_republication_count", "final_staged_write_set_provenance",
+      ),
+      forced_republication_keys: [...new Set(
+        provenance.forced_republication_keys.map(safeKey),
+      )].sort(),
+      promotion_reason_counts: canonicalCountMap(
+        provenance.promotion_reason_counts, "promotion_reason_counts",
+      ),
+      rebuilt_dependency_identity_count: nonnegativeFingerprintInteger(
+        provenance, "rebuilt_dependency_identity_count", "final_staged_write_set_provenance",
+      ),
+      staged_dependency_edge_count: nonnegativeFingerprintInteger(
+        provenance, "staged_dependency_edge_count", "final_staged_write_set_provenance",
+      ),
+      external_dependency_edge_counts: canonicalCountMap(
+        provenance.external_dependency_edge_counts, "external_dependency_edge_counts",
+      ),
+    },
+  };
+}
+
+export function computeCoordinatorTransitionStateFingerprint(runState) {
+  const payload = coordinatorTransitionStateFingerprintPayload(runState);
+  return sha256(Buffer.from(canonicalJson(payload), "utf8"));
+}
+
 export function requireCoordinatorProposalFreeze(runState) {
   const ingestion = runState?.proposal_ingestion;
   const finalProvenance = runState?.final_staged_write_set_provenance;
@@ -96,6 +318,21 @@ export function requireCoordinatorProposalFreeze(runState) {
   if (transition?.status !== "succeeded"
       || transition?.node_apply_launch_permitted !== true) {
     throw new Error("Fixed-v3 coordinator transition validation is not frozen");
+  }
+  if (transition?.state_fingerprint_contract_version === undefined
+      || transition?.state_fingerprint_sha256 === undefined) {
+    throw new Error("Fixed-v3 coordinator transition-state fingerprint is missing");
+  }
+  if (transition.state_fingerprint_contract_version
+      !== SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT) {
+    throw new Error("Fixed-v3 coordinator transition-state fingerprint contract is unknown");
+  }
+  if (!SHA256.test(String(transition.state_fingerprint_sha256 || ""))) {
+    throw new Error("Fixed-v3 coordinator transition-state fingerprint is invalid");
+  }
+  const actualFingerprint = computeCoordinatorTransitionStateFingerprint(runState);
+  if (actualFingerprint !== transition.state_fingerprint_sha256) {
+    throw new Error("Fixed-v3 coordinator transition evidence is stale or changed");
   }
 }
 
