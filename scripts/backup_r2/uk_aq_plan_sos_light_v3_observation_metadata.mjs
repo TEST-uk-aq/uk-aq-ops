@@ -49,7 +49,10 @@ import {
 } from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import {
   createCombinedLocalStore,
+  isChangedCurrentRunObject,
+  resolveCurrentRunProposalOwner,
   runV2ObservationsRepair as runGenerationNeutralObservationMetadataRepair,
+  SOURCE_DERIVED_OWNER,
 } from "./uk_aq_execute_v2_observations_repair_impl.mjs";
 import {
   validateFinalPlannerProposalGraph,
@@ -320,10 +323,8 @@ function exactIdentity(object, source) {
 
 function currentRunCanonicalIdentity({ key, runState, store, reference = null }) {
   const staged = runState?.objects?.[key];
-  if (staged?.proposed !== true || staged?.built !== true
-      || staged?.structurally_validated !== true
-      || staged?.changed === false || staged?.included_in_write_set === false
-      || staged?.status === "skipped_unchanged") {
+  if (!isChangedCurrentRunObject(staged) || staged?.built !== true
+      || resolveCurrentRunProposalOwner(staged) !== SOURCE_DERIVED_OWNER) {
     return null;
   }
   const frozen = {
@@ -793,6 +794,73 @@ export function resolveExactV3LocalReferences({
   return resolved;
 }
 
+export function buildExactV3ProposalDependencyFields({
+  entry,
+  changedExactKeys,
+  exactByKey,
+  proposalsByKey,
+  canonicalFinalizationPrerequisiteKeys,
+  runState,
+  store,
+  resolvedLocalReferences,
+}) {
+  const currentIdentities = new Map();
+  const currentIdentityFor = (key) => {
+    if (currentIdentities.has(key)) return currentIdentities.get(key);
+    const artifact = exactByKey.get(key);
+    let identity = null;
+    if (artifact && changedExactKeys.has(key)) {
+      identity = {
+        sha256: artifact.sha256,
+        bytes: artifact.byte_size,
+        source: "planned_overlay",
+      };
+    } else {
+      const proposed = proposalsByKey.get(key);
+      if (proposed?.changed === true
+          || (proposed && canonicalFinalizationPrerequisiteKeys.has(key))) {
+        identity = {
+          sha256: proposed.new_sha256,
+          bytes: proposed.bytes,
+          source: "planned_overlay",
+        };
+      } else {
+        identity = currentRunCanonicalIdentity({ key, runState, store });
+      }
+    }
+    currentIdentities.set(key, identity);
+    return identity;
+  };
+  const referencedKeys = [...new Set([
+    ...entry.dependencies.map(({ key }) => key),
+    ...entry.publication_prerequisites.map(({ key }) => key),
+  ])];
+  const dependencies = referencedKeys
+    .filter((key) => currentIdentityFor(key) !== null)
+    .sort();
+  const pinnedBaselineKeys = [...new Set([
+    ...entry.external_dependencies,
+    ...entry.external_publication_prerequisites,
+  ])].filter((key) => currentIdentityFor(key) === null).sort();
+  return {
+    dependencies,
+    dependency_identities: Object.fromEntries(
+      dependencies.map((key) => [key, currentIdentityFor(key)]),
+    ),
+    pinned_baseline_references: Object.fromEntries(pinnedBaselineKeys.map((key) => {
+      const reference = resolvedLocalReferences.get(key);
+      if (!reference) {
+        throw new Error(`Fixed-v3 pinned canonical baseline identity is unavailable: ${key}`);
+      }
+      return [key, {
+        source: "pinned_dropbox_canonical_baseline",
+        sha256: reference.sha256,
+        bytes: reference.byte_size,
+      }];
+    })),
+  };
+}
+
 function assertAllowedKey(key) {
   if (key.startsWith(`${GENERATION.observations_prefix}/`)) {
     return assertObservationHistoryGenerationKey(GENERATION, key, "observations");
@@ -1053,32 +1121,17 @@ async function addExactV3Indexes({
     // from the pinned local Dropbox baseline, never retained live-R2 objects.
     externalReferences: [...resolvedLocalReferences.values()],
   });
-  const identityFor = (key) => {
-    const artifact = exactByKey.get(key);
-    if (artifact && changedExactKeys.has(key)) {
-      return { sha256: artifact.sha256, bytes: artifact.byte_size, source: "planned_overlay" };
-    }
-    const proposed = proposalsByKey.get(key);
-    if (proposed?.changed === true || canonicalFinalizationPrerequisiteKeys.has(key)) return {
-      sha256: proposed.new_sha256, bytes: proposed.bytes, source: "planned_overlay",
-    };
-    const currentRunIdentity = currentRunCanonicalIdentity({ key, runState, store });
-    if (currentRunIdentity) return currentRunIdentity;
-    const object = store.getObjectIfExists(key);
-    if (!object || !["dropbox", "overlay"].includes(object.source)) {
-      throw new Error(`Fixed-v3 local proposal input is unavailable: ${key}`);
-    }
-    return exactIdentity(object, object.source);
-  };
   for (const entry of publicationPlan.entries) {
-    const dependencies = [...new Set([
-      ...entry.dependencies.map(({ key }) => key),
-      ...entry.publication_prerequisites.map(({ key }) => key),
-    ])].filter((key) => changedExactKeys.has(key) || proposalsByKey.has(key)).sort();
-    const pinnedBaselineReferences = [...new Set([
-      ...entry.external_dependencies,
-      ...entry.external_publication_prerequisites,
-    ])].filter((key) => !proposalsByKey.has(key)).sort();
+    const dependencyFields = buildExactV3ProposalDependencyFields({
+      entry,
+      changedExactKeys,
+      exactByKey,
+      proposalsByKey,
+      canonicalFinalizationPrerequisiteKeys,
+      runState,
+      store,
+      resolvedLocalReferences,
+    });
     const existing = store.getObjectIfExists(entry.key);
     proposals.push({
       key: entry.key,
@@ -1091,16 +1144,7 @@ async function addExactV3Indexes({
       changed: !existing || exactIdentity(existing, existing.source).sha256 !== entry.sha256,
       included_in_write_set: true,
       status: "planned",
-      dependencies,
-      dependency_identities: Object.fromEntries(dependencies.map((key) => [key, identityFor(key)])),
-      pinned_baseline_references: Object.fromEntries(pinnedBaselineReferences.map((key) => {
-        const reference = resolvedLocalReferences.get(key);
-        return [key, {
-          source: "pinned_dropbox_canonical_baseline",
-          sha256: reference.sha256,
-          bytes: reference.byte_size,
-        }];
-      })),
+      ...dependencyFields,
       provenance: "fixed_v3_exact_leaf_operational_primitives",
     });
   }

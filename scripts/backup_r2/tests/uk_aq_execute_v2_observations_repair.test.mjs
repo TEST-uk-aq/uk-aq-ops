@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  createMetadataPlanningProgressTracker,
   createCombinedLocalStore,
   createStagedObjectMap,
   localDependencySnapshot,
@@ -47,6 +48,44 @@ function localObject(key, body, source = "dropbox") {
     content_sha256: sha256Hex(buffer),
   };
 }
+
+test("metadata planning progress reports by count, time, and final completion", () => {
+  const events = [];
+  let nowMs = 0;
+  const tracker = createMetadataPlanningProgressTracker({
+    totalObjects: 60,
+    reportProgress: (event) => events.push(event),
+    now: () => nowMs,
+  });
+
+  tracker.update(24, { blocked_count: 1 });
+  tracker.update(25, { blocked_count: 1 });
+  nowMs = 15_000;
+  tracker.update(26, { blocked_count: 2 });
+  tracker.update(50, { blocked_count: 2 });
+  tracker.finish(60, { blocked_count: 3 });
+
+  assert.deepEqual(events, [
+    {
+      phase: "metadata_planning_progress",
+      completed_objects: 25,
+      total_objects: 60,
+      blocked_count: 1,
+    },
+    {
+      phase: "metadata_planning_progress",
+      completed_objects: 26,
+      total_objects: 60,
+      blocked_count: 2,
+    },
+    {
+      phase: "metadata_planning_progress",
+      completed_objects: 60,
+      total_objects: 60,
+      blocked_count: 3,
+    },
+  ]);
+});
 
 test("combined local store classifies current-run objects independently of their overlay path", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-planner-provenance-"));

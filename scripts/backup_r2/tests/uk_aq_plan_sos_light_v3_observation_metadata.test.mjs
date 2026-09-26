@@ -10,6 +10,7 @@ import {
   assertCurrentRunParquetIdentities,
   assertCurrentRunManifestWriterGitSha,
   assertFixedV3Proposal,
+  buildExactV3ProposalDependencyFields,
   inspectPinnedBaselinePollutantPartition,
   reconcileReconstructedExactV3Hierarchies,
   reconstructCanonicalObservationAggregateHierarchy,
@@ -398,6 +399,7 @@ test("changed exact hierarchy resolves a frozen new current-run canonical object
     runState: {
       objects: {
         [key]: {
+          stage: "observations_data",
           proposed: true,
           built: true,
           structurally_validated: true,
@@ -429,8 +431,149 @@ test("changed exact hierarchy resolves a frozen new current-run canonical object
   });
 });
 
+test("new implicit source-derived Parquet is a planned-overlay proposal dependency", () => {
+  const key = "history/v3/observations/day_utc=2025-01-01/connector_id=1/pollutant_code=no2/part-00000.parquet";
+  const body = Buffer.from("new-current-run-parquet");
+  const reference = {
+    key,
+    byte_size: body.byteLength,
+    sha256: sha256Hex(body),
+  };
+  const store = {
+    getObjectFromSourceIfExists(requestedKey, source) {
+      return requestedKey === key && source === "overlay"
+        ? {
+          key,
+          body,
+          bytes: body.byteLength,
+          content_sha256: reference.sha256,
+          source: "planned_overlay",
+        }
+        : null;
+    },
+    getObjectIfExists(requestedKey) {
+      return requestedKey === key
+        ? {
+          key,
+          body,
+          bytes: body.byteLength,
+          content_sha256: reference.sha256,
+          source: "planned_overlay",
+        }
+        : null;
+    },
+  };
+  const fields = buildExactV3ProposalDependencyFields({
+    entry: {
+      dependencies: [reference],
+      publication_prerequisites: [],
+      external_dependencies: [key],
+      external_publication_prerequisites: [],
+    },
+    changedExactKeys: new Set(),
+    exactByKey: new Map(),
+    proposalsByKey: new Map(),
+    canonicalFinalizationPrerequisiteKeys: new Set(),
+    runState: {
+      objects: {
+        [key]: {
+          stage: "observations_data",
+          proposed: true,
+          built: true,
+          structurally_validated: true,
+          changed: true,
+          included_in_write_set: true,
+          status: "planned",
+          sha256: reference.sha256,
+          bytes: reference.byte_size,
+        },
+      },
+    },
+    store,
+    resolvedLocalReferences: new Map([[key, {
+      key,
+      byte_size: reference.byte_size,
+      sha256: reference.sha256,
+      verified: true,
+      durable: true,
+    }]]),
+  });
+
+  assert.deepEqual(fields.dependencies, [key]);
+  assert.deepEqual(fields.dependency_identities[key], {
+    source: "planned_overlay",
+    sha256: reference.sha256,
+    bytes: reference.byte_size,
+  });
+  assert.deepEqual(fields.pinned_baseline_references, {});
+});
+
+test("Dropbox-owned overlay copy remains a pinned proposal reference", () => {
+  const key = "history/v3/observations/day_utc=2025-01-01/connector_id=8/pollutant_code=bc/part-00000.parquet";
+  const body = Buffer.from("preserved-dropbox-parquet");
+  const reference = {
+    key,
+    byte_size: body.byteLength,
+    sha256: sha256Hex(body),
+  };
+  const fields = buildExactV3ProposalDependencyFields({
+    entry: {
+      dependencies: [reference],
+      publication_prerequisites: [],
+      external_dependencies: [key],
+      external_publication_prerequisites: [],
+    },
+    changedExactKeys: new Set(),
+    exactByKey: new Map(),
+    proposalsByKey: new Map(),
+    canonicalFinalizationPrerequisiteKeys: new Set(),
+    runState: {
+      objects: {
+        [key]: {
+          stage: "observations_data",
+          proposal_owner: "dropbox_day_baseline",
+          proposed: true,
+          built: true,
+          structurally_validated: true,
+          sha256: reference.sha256,
+          bytes: reference.byte_size,
+        },
+      },
+    },
+    store: {
+      getObjectFromSourceIfExists(requestedKey, source) {
+        return requestedKey === key && source === "overlay"
+          ? {
+            key,
+            body,
+            bytes: body.byteLength,
+            content_sha256: reference.sha256,
+            source: "planned_overlay",
+          }
+          : null;
+      },
+    },
+    resolvedLocalReferences: new Map([[key, {
+      key,
+      byte_size: reference.byte_size,
+      sha256: reference.sha256,
+      verified: true,
+      durable: true,
+    }]]),
+  });
+
+  assert.deepEqual(fields.dependencies, []);
+  assert.deepEqual(fields.dependency_identities, {});
+  assert.deepEqual(fields.pinned_baseline_references[key], {
+    source: "pinned_dropbox_canonical_baseline",
+    sha256: reference.sha256,
+    bytes: reference.byte_size,
+  });
+});
+
 test("changed exact hierarchy still rejects a preserved dependency absent from Dropbox", () => {
   const key = "history/v3/observations/day_utc=2025-01-01/connector_id=8/pollutant_code=bc/part-00000.parquet";
+  const body = Buffer.from("preserved-dropbox-parquet");
   assert.throws(() => resolveExactV3LocalReferences({
     artifacts: [{
       dependencies: [{ key, byte_size: 12, sha256: "a".repeat(64) }],
@@ -438,9 +581,33 @@ test("changed exact hierarchy still rejects a preserved dependency absent from D
     }],
     changedKeys: new Set(),
     proposalsByKey: new Map(),
-    runState: { objects: {} },
+    runState: {
+      objects: {
+        [key]: {
+          stage: "observations_data",
+          proposal_owner: "dropbox_day_baseline",
+          proposed: true,
+          built: true,
+          structurally_validated: true,
+          sha256: sha256Hex(body),
+          bytes: body.byteLength,
+        },
+      },
+    },
     unchangedRoots: [],
-    store: { getObjectFromSourceIfExists() { return null; } },
+    store: {
+      getObjectFromSourceIfExists(requestedKey, source) {
+        return requestedKey === key && source === "overlay"
+          ? {
+            key,
+            body,
+            bytes: body.byteLength,
+            content_sha256: sha256Hex(body),
+            source: "planned_overlay",
+          }
+          : null;
+      },
+    },
   }), /pinned canonical baseline dependency is unavailable/);
 });
 
@@ -449,6 +616,7 @@ test("changed exact hierarchy rejects unvalidated or identity-mismatched current
   const body = Buffer.from("new-current-run-parquet");
   const reference = { key, byte_size: body.byteLength, sha256: sha256Hex(body) };
   const baseEntry = {
+    stage: "observations_data",
     proposed: true,
     built: true,
     structurally_validated: true,

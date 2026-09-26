@@ -49,7 +49,7 @@ const SUPPORTED_ACTIONS = new Set([
   "aqi_index_repair",
   "rebuild_v2_aqi_index_only",
 ]);
-const SOURCE_DERIVED_OWNER = "source_derived_observation_repair";
+export const SOURCE_DERIVED_OWNER = "source_derived_observation_repair";
 
 // Scope is part of the repair-action contract.  In particular, a day
 // manifest is above the connector hierarchy: giving it a connector ID would
@@ -440,6 +440,23 @@ function walkLocalObjects(root, prefixes = []) {
   return found;
 }
 
+export function isChangedCurrentRunObject(entry) {
+  return entry?.structurally_validated === true
+    && entry?.proposed === true
+    && entry?.changed !== false
+    && entry?.included_in_write_set !== false
+    && entry?.status !== "skipped_unchanged";
+}
+
+export function resolveCurrentRunProposalOwner(entry) {
+  if (typeof entry?.proposal_owner === "string" && entry.proposal_owner) {
+    return entry.proposal_owner;
+  }
+  return isChangedCurrentRunObject(entry) && entry?.stage === "observations_data"
+    ? SOURCE_DERIVED_OWNER
+    : null;
+}
+
 export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes, exactKeys = [], dynamicExactKeyPrefixes = [] }) {
   const state = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
   const proposedTombstones = new Set(Object.entries(state?.tombstones || {})
@@ -466,11 +483,7 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
     const locallyValidatedObject = entry?.structurally_validated === true
       && typeof entry.local_path === "string"
       && fs.existsSync(entry.local_path);
-    const changedCurrentRunObject = entry?.structurally_validated === true
-      && entry?.proposed === true
-      && entry?.changed !== false
-      && entry?.included_in_write_set !== false
-      && entry?.status !== "skipped_unchanged";
+    const changedCurrentRunObject = isChangedCurrentRunObject(entry);
     if (locallyValidatedObject) {
       const normalizedKey = safeLocalKey(key);
       overlayPaths.set(normalizedKey, entry.local_path);
@@ -480,11 +493,8 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
       if (changedCurrentRunObject) {
         overlayProvenance.set(normalizedKey, "planned_overlay");
       }
-      if (typeof entry.proposal_owner === "string" && entry.proposal_owner) {
-        overlayOwners.set(normalizedKey, entry.proposal_owner);
-      } else if (changedCurrentRunObject && entry.stage === "observations_data") {
-        overlayOwners.set(normalizedKey, "source_derived_observation_repair");
-      }
+      const proposalOwner = resolveCurrentRunProposalOwner(entry);
+      if (proposalOwner) overlayOwners.set(normalizedKey, proposalOwner);
     }
   }
   function localObject(key, storageSource) {
@@ -1552,6 +1562,35 @@ function authoritativeTimeseriesById(input) {
   return bindings;
 }
 
+export function createMetadataPlanningProgressTracker({
+  totalObjects,
+  reportProgress,
+  now = () => Date.now(),
+}) {
+  let lastReportedCompleted = 0;
+  let lastReportedAtMs = now();
+  const emit = (completedObjects, details) => {
+    reportProgress({
+      phase: "metadata_planning_progress",
+      completed_objects: completedObjects,
+      total_objects: totalObjects,
+      ...details,
+    });
+    lastReportedCompleted = completedObjects;
+    lastReportedAtMs = now();
+  };
+  return {
+    update(completedObjects, details = {}) {
+      if (completedObjects - lastReportedCompleted < 25
+          && now() - lastReportedAtMs < 15_000) return;
+      emit(completedObjects, details);
+    },
+    finish(completedObjects, details = {}) {
+      emit(completedObjects, details);
+    },
+  };
+}
+
 export async function runV2ObservationsRepair({
   argv = process.argv.slice(2),
   env = process.env,
@@ -1615,6 +1654,11 @@ export async function runV2ObservationsRepair({
     throw new Error("Blocked dependency: SOS-light currently requires selected/protected connector IDs [1]");
   }
   reportProgress({ phase: "metadata_planning_start", total_objects: scopes.length });
+  const metadataPlanningProgress = createMetadataPlanningProgressTracker({
+    totalObjects: scopes.length,
+    reportProgress,
+  });
+  let completedMetadataPlanningScopes = 0;
   const config = resolveR2HistoryIndexConfig(env);
   const observationGeneration = getObservationHistoryGeneration(storageGeneration);
   if (args.writeR2) {
@@ -1682,6 +1726,12 @@ export async function runV2ObservationsRepair({
   ) ? plannedStageStatus : "not_run";
 
   for (const [dayUtc, dayScopes] of [...byDay.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    const reportCompletedDayScopes = () => {
+      completedMetadataPlanningScopes += dayScopes.length;
+      metadataPlanningProgress.update(completedMetadataPlanningScopes, {
+        blocked_count: blockedScopes.length,
+      });
+    };
     const base = `${dataPrefix}/day_utc=${dayUtc}`;
     const proposalKeys = [];
     // Pollutant manifests are the leaf metadata layer.  Rebuild them before
@@ -1823,6 +1873,7 @@ export async function runV2ObservationsRepair({
     if (dayBlocked) {
       blockedScopes.push({ day_utc: dayUtc, status: "blocked_dependency", reason: "connector_manifest_dependency_blocked" });
       dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", manifest_status: "blocked_dependency", index_status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
+      reportCompletedDayScopes();
       continue;
     }
     if (needsDay) {
@@ -1897,6 +1948,7 @@ export async function runV2ObservationsRepair({
         proposal_keys: [],
         index: null,
       });
+      reportCompletedDayScopes();
       continue;
     }
     if (planIndexes && indexRequested) {
@@ -1945,6 +1997,7 @@ export async function runV2ObservationsRepair({
           detail: message,
         });
         dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", manifest_status: manifestStageStatus(proposalKeys), index_status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
+        reportCompletedDayScopes();
         continue;
       }
       for (const key of staged.proposals.keys()) {
@@ -1961,7 +2014,11 @@ export async function runV2ObservationsRepair({
       proposal_keys: [...new Set(proposalKeys)].sort(),
       index,
     });
+    reportCompletedDayScopes();
   }
+  metadataPlanningProgress.finish(completedMetadataPlanningScopes, {
+    blocked_count: blockedScopes.length,
+  });
 
   if (planIndexes && sosLightAudit && !blockedScopes.length) {
     await stageSosLightLatestIndex({
