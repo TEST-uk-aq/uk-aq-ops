@@ -18122,6 +18122,49 @@ def _canonical_sos_light_connector_ids(value: Any, *, label: str) -> list[int]:
     return canonical
 
 
+def _canonical_sos_light_observation_object_keys(
+    value: Any,
+    *,
+    day_utc: str,
+) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(object_key, str) for object_key in value
+    ):
+        raise ValueError(
+            f"fixed-v3 SOS-light observation closure is invalid: {day_utc}"
+        )
+    root = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
+    day_manifest_key = f"{root}/manifest.json"
+    canonical = sorted({_normalise_overlay_object_key(key) for key in value})
+    patterns = (
+        re.compile(re.escape(root) + r"/connector_id=[1-9]\d*/manifest\.json"),
+        re.compile(
+            re.escape(root)
+            + r"/connector_id=[1-9]\d*/pollutant_code=[a-z0-9_]+/"
+            + r"manifest\.json"
+        ),
+        re.compile(
+            re.escape(root)
+            + r"/connector_id=[1-9]\d*/pollutant_code=[a-z0-9_]+/"
+            + r"[^/]+\.parquet"
+        ),
+    )
+    if (
+        value != canonical
+        or day_manifest_key not in canonical
+        or any(
+            key != day_manifest_key
+            and not any(pattern.fullmatch(key) for pattern in patterns)
+            for key in canonical
+        )
+    ):
+        raise ValueError(
+            "fixed-v3 SOS-light observation closure is not canonical: "
+            f"{day_utc}"
+        )
+    return canonical
+
+
 def _canonical_sos_light_connector_membership(
     run_state: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
@@ -18195,14 +18238,39 @@ def _canonical_sos_light_connector_membership(
             entry.get("final_assembled_connector_ids"),
             label=f"{day_utc}:final_assembled_connector_ids",
         )
+        authoritative_object_keys = (
+            _canonical_sos_light_observation_object_keys(
+                entry.get("authoritative_observation_object_keys"),
+                day_utc=day_utc,
+            )
+        )
         derived_preserved_ids = [
             connector_id for connector_id in baseline_ids if connector_id != 1
         ]
         derived_final_ids = sorted({1, *derived_preserved_ids})
+        root = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
+        connector_parent_pattern = re.compile(
+            re.escape(root) + r"/connector_id=([1-9]\d*)/manifest\.json"
+        )
+        connector_object_pattern = re.compile(
+            re.escape(root) + r"/connector_id=([1-9]\d*)/"
+        )
+        closure_connector_ids = sorted(
+            int(match.group(1))
+            for key in authoritative_object_keys
+            if (match := connector_parent_pattern.fullmatch(key))
+        )
+        closure_has_unexpected_connector = any(
+            int(match.group(1)) not in derived_final_ids
+            for key in authoritative_object_keys
+            if (match := connector_object_pattern.match(key))
+        )
         if (
             expected_preserved_ids != derived_preserved_ids
             or expected_final_ids != derived_final_ids
             or final_assembled_ids != derived_final_ids
+            or closure_connector_ids != derived_final_ids
+            or closure_has_unexpected_connector
         ):
             raise ValueError(
                 "fixed-v3 SOS-light frozen connector membership disagrees: "
@@ -18217,6 +18285,7 @@ def _canonical_sos_light_connector_membership(
             "expected_preserved_connector_ids": expected_preserved_ids,
             "expected_final_connector_ids": expected_final_ids,
             "final_assembled_connector_ids": final_assembled_ids,
+            "authoritative_observation_object_keys": authoritative_object_keys,
         })
     return sorted(membership, key=lambda entry: entry["day_utc"])
 
@@ -20086,25 +20155,21 @@ def assemble_sos_light_complete_days(
                 audit["dropbox_warning_count"] = int(
                     audit.get("dropbox_warning_count") or 0
                 ) + 1
-        omitted_prefixes = [
-            _normalise_overlay_object_key(str(value)).rstrip("/")
-            for value in list(day.get("omitted_dropbox_connector_prefixes") or [])
-        ]
-        for source in (
-            sorted(path for path in baseline_day.rglob("*") if path.is_file())
-            if dropbox_day_present
-            else []
-        ):
+        authoritative_day_keys = _canonical_sos_light_observation_object_keys(
+            day.get("authoritative_observation_object_keys"),
+            day_utc=day_utc,
+        )
+        for object_key in authoritative_day_keys:
             assembly_work_count += 1
             assembly_progress.progress(
                 assembly_work_count,
                 completed_days=completed_days - 1,
             )
-            object_key = source.relative_to(dropbox_root).as_posix()
             baseline_pollutant = requested_baseline_manifest_keys.get(
                 object_key
             )
-            if baseline_pollutant is not None:
+            source = dropbox_root / object_key
+            if baseline_pollutant is not None and source.is_file():
                 baseline_payload = json.loads(source.read_text(encoding="utf-8"))
                 baseline_partition_rows[
                     (day_utc, 1, baseline_pollutant)
@@ -20118,9 +20183,15 @@ def assemble_sos_light_complete_days(
             if object_key in objects:
                 continue
             if any(object_key.startswith(f"{prefix}/") for prefix in old_prefixes):
-                continue
-            if any(object_key.startswith(f"{prefix}/") for prefix in omitted_prefixes):
-                continue
+                raise ValueError(
+                    "SOS-light authoritative object beneath a replacement "
+                    f"scope was not rebuilt: {object_key}"
+                )
+            if not source.is_file():
+                raise ValueError(
+                    "SOS-light authoritative Dropbox object is unavailable: "
+                    f"{object_key}"
+                )
             target = overlay_root / object_key
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
@@ -20146,6 +20217,14 @@ def assemble_sos_light_complete_days(
         day_keys = sorted(
             key for key in objects if key.startswith(f"{day_prefix}/")
         )
+        if day_keys != authoritative_day_keys:
+            unexpected = sorted(set(day_keys) - set(authoritative_day_keys))
+            missing = sorted(set(authoritative_day_keys) - set(day_keys))
+            raise ValueError(
+                "SOS-light complete-day object closure differs from frozen "
+                f"authority: {day_utc}; unexpected={unexpected[:3]}; "
+                f"missing={missing[:3]}"
+            )
         if f"{day_prefix}/manifest.json" not in day_keys:
             raise ValueError(f"SOS-light assembled day parent is unavailable: {day_utc}")
         expected_connector_ids = _canonical_sos_light_connector_ids(

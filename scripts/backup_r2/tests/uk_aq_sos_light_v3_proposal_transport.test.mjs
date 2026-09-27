@@ -22,8 +22,18 @@ import {
   validateLocalSosLightV3Proposal,
 } from "../lib/sos_light_v3_proposal_validation.mjs";
 
-function connectorMembershipEvidence(dayUtc, connectorIds = [1]) {
+function connectorMembershipEvidence(
+  dayUtc,
+  connectorIds = [1],
+  authoritativeObjectKeys = null,
+) {
   const sortedConnectorIds = [...connectorIds].sort((left, right) => left - right);
+  const root = `history/v3/observations/day_utc=${dayUtc}`;
+  const closure = authoritativeObjectKeys || [
+    `${root}/manifest.json`,
+    ...sortedConnectorIds.map((connectorId) =>
+      `${root}/connector_id=${connectorId}/manifest.json`),
+  ];
   return {
     day_utc: dayUtc,
     pinned_day_manifest_present: true,
@@ -37,6 +47,7 @@ function connectorMembershipEvidence(dayUtc, connectorIds = [1]) {
     final_assembled_connector_ids: sortedConnectorIds.includes(1)
       ? sortedConnectorIds
       : [1, ...sortedConnectorIds].sort((left, right) => left - right),
+    authoritative_observation_object_keys: [...closure].sort(),
   };
 }
 
@@ -127,6 +138,45 @@ test("fixed-v3 rejects a final day that loses a frozen preserved connector", () 
     () => validateDedicatedSosHistoricalProposalV3({ runState, proposal }),
     /lacks required connector 8|differs from pinned authority/,
   );
+});
+
+test("fixed-v3 rejects unexpected canonical objects outside the frozen day closure", () => {
+  const dayUtc = "2025-01-15";
+  const root = `history/v3/observations/day_utc=${dayUtc}`;
+  const runState = {
+    execution_path: "sos_light",
+    mode: "sos-light",
+    environment: "TEST",
+    mutation_connector_ids: [1],
+    selected_mutation_connector_ids: [1],
+    protected_connector_ids: [1],
+    sos_light: {
+      mode: "sos-light",
+      validation_status: "complete_local_days_validated",
+      old_live_r2_observation_bodies_used: false,
+      no_old_live_r2_body_planning_or_preservation: true,
+      days: [connectorMembershipEvidence(dayUtc)],
+    },
+  };
+  const baseObjects = [
+    { key: `${root}/manifest.json`, body: finalDayManifestBody(dayUtc) },
+    { key: `${root}/connector_id=1/manifest.json`, body: Buffer.from("{}") },
+  ];
+  for (const unexpectedKey of [
+    `${root}/connector_id=1/pollutant_code=orphan/manifest.json`,
+    `${root}/connector_id=1/pollutant_code=no2/old-part.parquet`,
+  ]) {
+    assert.throws(
+      () => validateDedicatedSosHistoricalProposalV3({
+        runState,
+        proposal: {
+          objects: [...baseObjects, { key: unexpectedKey, body: Buffer.from("orphan") }],
+          prefixes: [{ prefix: root, entry: { stage: "sos_light_complete_day" } }],
+        },
+      }),
+      /final day object closure differs from frozen authority/,
+    );
+  }
 });
 
 function fixedV3LocalProposalState(indexKey) {
@@ -342,7 +392,12 @@ test("fixed-v3 final graph validates canonical pollutant data without misclassif
         validation_status: "complete_local_days_validated",
         old_live_r2_observation_bodies_used: false,
         no_old_live_r2_body_planning_or_preservation: true,
-        days: [connectorMembershipEvidence(dayUtc)],
+        days: [connectorMembershipEvidence(dayUtc, [1], [
+          `history/v3/observations/day_utc=${dayUtc}/manifest.json`,
+          `history/v3/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`,
+          manifestKey,
+          partKey,
+        ])],
       },
       source_evidence_partitions: {
         [identity]: {

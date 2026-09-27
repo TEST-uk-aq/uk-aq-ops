@@ -63,6 +63,11 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 "expected_preserved_connector_ids": [],
                 "expected_final_connector_ids": [1],
                 "final_assembled_connector_ids": [1],
+                "authoritative_observation_object_keys": [
+                    "history/v3/observations/day_utc=2025-01-01/"
+                    "connector_id=1/manifest.json",
+                    "history/v3/observations/day_utc=2025-01-01/manifest.json",
+                ],
             }],
         }
         self.key = "history/_index_v3/transport-test.json"
@@ -153,6 +158,11 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 "expected_preserved_connector_ids": [8],
                 "expected_final_connector_ids": [1, 8],
                 "final_assembled_connector_ids": [1, 8],
+                "authoritative_observation_object_keys": [
+                    connector_key,
+                    f"{day_prefix}/connector_id=8/manifest.json",
+                    day_key,
+                ],
                 "omitted_dropbox_connector_prefixes": [],
             }],
         }
@@ -161,10 +171,150 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
             mock.patch.object(MODULE, "validate_run_state_core_snapshot_identity"),
             self.assertRaisesRegex(
                 ValueError,
-                "complete-day connector membership differs from pinned authority",
+                "authoritative Dropbox object is unavailable",
             ),
         ):
             MODULE._ORIGINAL_ASSEMBLE_SOS_LIGHT_COMPLETE_DAYS(self.run_state)
+
+    def test_complete_day_assembly_copies_only_frozen_reachable_objects(
+        self,
+    ) -> None:
+        day_utc = "2025-01-15"
+        day_prefix = f"history/v3/observations/day_utc={day_utc}"
+        day_key = f"{day_prefix}/manifest.json"
+        connector_1_key = f"{day_prefix}/connector_id=1/manifest.json"
+        connector_8_key = f"{day_prefix}/connector_id=8/manifest.json"
+        bc_manifest_key = (
+            f"{day_prefix}/connector_id=8/pollutant_code=bc/manifest.json"
+        )
+        uv_manifest_key = (
+            f"{day_prefix}/connector_id=8/pollutant_code=uv370/manifest.json"
+        )
+        bc_parts = [
+            f"{day_prefix}/connector_id=8/pollutant_code=bc/part-00000.parquet",
+            f"{day_prefix}/connector_id=8/pollutant_code=bc/part-00001.parquet",
+        ]
+        uv_part = (
+            f"{day_prefix}/connector_id=8/pollutant_code=uv370/part-00000.parquet"
+        )
+        orphan_manifest = (
+            f"{day_prefix}/connector_id=8/pollutant_code=orphan/manifest.json"
+        )
+        orphan_part = (
+            f"{day_prefix}/connector_id=8/pollutant_code=orphan/part-00000.parquet"
+        )
+        old_bc_part = (
+            f"{day_prefix}/connector_id=8/pollutant_code=bc/old-part.parquet"
+        )
+
+        connector_references = [
+            {"manifest_key": connector_1_key},
+            {"manifest_key": connector_8_key},
+        ]
+        pollutant_references = [
+            {"manifest_key": bc_manifest_key},
+            {"manifest_key": uv_manifest_key},
+        ]
+        overlay_payloads = {
+            day_key: {
+                "manifest_kind": "day",
+                "connector_manifests": connector_references,
+                "child_manifests": connector_references,
+            },
+            connector_1_key: {
+                "manifest_kind": "connector",
+                "pollutant_manifests": [],
+                "child_manifests": [],
+            },
+        }
+        source_root = self.root / "source"
+        for key, payload in overlay_payloads.items():
+            source = source_root / key
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(json.dumps(payload), encoding="utf-8")
+            MODULE.stage_overlay_object(
+                self.run_state,
+                object_key=key,
+                source_path=source,
+                stage="day_parent" if key == day_key else "connector_manifest",
+            )
+            MODULE.mark_overlay_structurally_validated(
+                self.run_state, key, persist=False
+            )
+
+        dropbox_payloads = {
+            connector_8_key: {
+                "manifest_kind": "connector",
+                "pollutant_manifests": pollutant_references,
+                "child_manifests": pollutant_references,
+            },
+            bc_manifest_key: {
+                "manifest_kind": "pollutant",
+                "parquet_object_keys": bc_parts,
+                "files": [{"key": key} for key in bc_parts],
+            },
+            uv_manifest_key: {
+                "manifest_kind": "pollutant",
+                "parquet_object_keys": [uv_part],
+                "files": [{"key": uv_part}],
+            },
+            orphan_manifest: {
+                "manifest_kind": "pollutant",
+                "parquet_object_keys": [orphan_part],
+                "files": [{"key": orphan_part}],
+            },
+        }
+        for key, payload in dropbox_payloads.items():
+            target = self.dropbox / key
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(payload), encoding="utf-8")
+        for key in [*bc_parts, uv_part, orphan_part, old_bc_part]:
+            target = self.dropbox / key
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(key.encode())
+
+        authoritative_keys = sorted([
+            day_key,
+            connector_1_key,
+            connector_8_key,
+            bc_manifest_key,
+            uv_manifest_key,
+            *bc_parts,
+            uv_part,
+        ])
+        self.run_state["sos_light"] = {
+            "mode": "sos-light",
+            "validation_status": "validated_local_assembly",
+            "old_live_r2_observation_bodies_used": False,
+            "dropbox_warnings": [],
+            "days": [{
+                "day_utc": day_utc,
+                "pinned_day_manifest_present": True,
+                "pinned_day_manifest_key": day_key,
+                "pinned_day_manifest_hash": "a" * 64,
+                "pinned_baseline_connector_ids": [1, 8],
+                "expected_preserved_connector_ids": [8],
+                "expected_final_connector_ids": [1, 8],
+                "final_assembled_connector_ids": [1, 8],
+                "final_connector_1_child_set": [],
+                "authoritative_observation_object_keys": authoritative_keys,
+            }],
+        }
+
+        with mock.patch.object(
+            MODULE, "validate_run_state_core_snapshot_identity"
+        ):
+            result = MODULE._ORIGINAL_ASSEMBLE_SOS_LIGHT_COMPLETE_DAYS(
+                self.run_state
+            )
+
+        self.assertEqual(
+            result["days"][0]["complete_day_object_keys"], authoritative_keys
+        )
+        for key in authoritative_keys:
+            self.assertIn(key, self.run_state["objects"])
+        for key in (orphan_manifest, orphan_part, old_bc_part):
+            self.assertNotIn(key, self.run_state["objects"])
 
     def _proposal(self, *, relative_path: str | None = None) -> dict[str, object]:
         digest = hashlib.sha256(self.body).hexdigest()

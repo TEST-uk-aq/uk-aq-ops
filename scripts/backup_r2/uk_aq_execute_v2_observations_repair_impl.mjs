@@ -365,12 +365,19 @@ function manifestParquetKeys(payload) {
   return [...keys].sort();
 }
 
-function assertPinnedDropboxConnectorClosure({ adapter, base, dayUtc, reference }) {
+async function assertConnectorClosure({
+  adapter,
+  base,
+  dayUtc,
+  reference,
+  source = null,
+  connectorObject: suppliedConnectorObject = null,
+}) {
   const connectorId = reference.connector_id;
-  const connectorObject = adapter.getObjectFromSourceIfExists(
-    reference.manifest_key,
-    "dropbox",
-  );
+  const getObject = async (key) => source
+    ? adapter.getObjectFromSourceIfExists(key, source)
+    : adapter.getObject({ key });
+  const connectorObject = suppliedConnectorObject || await getObject(reference.manifest_key);
   if (!connectorObject) {
     throw new Error(`required_connector_manifest_missing:${reference.manifest_key}`);
   }
@@ -398,9 +405,11 @@ function assertPinnedDropboxConnectorClosure({ adapter, base, dayUtc, reference 
     connectorId,
   });
   const childParquetKeys = new Set();
+  const objectKeys = new Set([reference.manifest_key]);
+  const pollutantManifestKeys = [];
   for (const pollutantReference of pollutantReferences) {
     const pollutantKey = pollutantReference.manifest_key;
-    const pollutantObject = adapter.getObjectFromSourceIfExists(pollutantKey, "dropbox");
+    const pollutantObject = await getObject(pollutantKey);
     if (!pollutantObject) {
       throw new Error(`required_pollutant_manifest_missing:${pollutantKey}`);
     }
@@ -423,6 +432,8 @@ function assertPinnedDropboxConnectorClosure({ adapter, base, dayUtc, reference 
     if (pollutant.manifest_hash !== pollutantReference.manifest_hash) {
       throw new Error(`required_pollutant_manifest_hash_mismatch:${pollutantKey}`);
     }
+    objectKeys.add(pollutantKey);
+    pollutantManifestKeys.push(pollutantKey);
     const expectedPrefix = pollutantKey.slice(0, -"manifest.json".length);
     const fileSizes = new Map((pollutant.files || []).map((file) => [
       String(file?.key || ""),
@@ -432,7 +443,7 @@ function assertPinnedDropboxConnectorClosure({ adapter, base, dayUtc, reference 
       if (!parquetKey.startsWith(expectedPrefix) || !parquetKey.endsWith(".parquet")) {
         throw new Error(`required_pollutant_parquet_key_invalid:${parquetKey}`);
       }
-      const parquetObject = adapter.getObjectFromSourceIfExists(parquetKey, "dropbox");
+      const parquetObject = await getObject(parquetKey);
       if (!parquetObject) {
         throw new Error(`required_pollutant_parquet_missing:${parquetKey}`);
       }
@@ -442,13 +453,20 @@ function assertPinnedDropboxConnectorClosure({ adapter, base, dayUtc, reference 
         throw new Error(`required_pollutant_parquet_size_mismatch:${parquetKey}`);
       }
       childParquetKeys.add(parquetKey);
+      objectKeys.add(parquetKey);
     }
   }
   const connectorParquetKeys = manifestParquetKeys(connector);
   if (JSON.stringify(connectorParquetKeys) !== JSON.stringify([...childParquetKeys].sort())) {
     throw new Error(`required_connector_parquet_closure_mismatch:${reference.manifest_key}`);
   }
-  return { connector, connectorObject };
+  return {
+    connector,
+    connectorObject,
+    objectKeys: [...objectKeys].sort(),
+    pollutantManifestKeys: pollutantManifestKeys.sort(),
+    parquetKeys: [...childParquetKeys].sort(),
+  };
 }
 
 function newSosLightAudit({ protectedConnectorIds, selectedMutationConnectorIds }) {
@@ -532,6 +550,7 @@ export async function assembleSosLightDayParents({
   const connector1Key = `${base}/connector_id=1/manifest.json`;
   let connector1Object;
   let connector1;
+  let connector1Closure;
   try {
     connector1Object = await staged.stagedR2.adapter.getObject({ key: connector1Key });
     connector1 = jsonObject(connector1Object, connector1Key);
@@ -540,6 +559,17 @@ export async function assembleSosLightDayParents({
       kind: "connector",
       dayUtc,
       connectorId: 1,
+    });
+    connector1Closure = await assertConnectorClosure({
+      adapter: staged.stagedR2.adapter,
+      base,
+      dayUtc,
+      reference: {
+        connector_id: 1,
+        manifest_key: connector1Key,
+        manifest_hash: connector1.manifest_hash,
+      },
+      connectorObject: connector1Object,
     });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -553,20 +583,23 @@ export async function assembleSosLightDayParents({
     bytes: connector1Object.bytes ?? Buffer.byteLength(connector1Object.body),
     source: connector1Object.source || "combined_local",
   });
-  const connector1ChildKeys = canonicalConnectorReferences(connector1, {
-    base,
-    connectorId: 1,
-  }).map((reference) => reference.manifest_key);
+  const connector1ChildKeys = connector1Closure.pollutantManifestKeys;
+  const authoritativeObservationObjectKeys = new Set([
+    dayManifestKey,
+    ...connector1Closure.objectKeys,
+  ]);
 
   for (const reference of baselineReferences.filter((entry) => entry.connector_id !== 1)) {
     try {
-      const preserved = assertPinnedDropboxConnectorClosure({
+      const preserved = await assertConnectorClosure({
         adapter: staged.stagedR2.adapter,
         base,
         dayUtc,
         reference,
+        source: "dropbox",
       });
       children.push(preserved.connector);
+      for (const key of preserved.objectKeys) authoritativeObservationObjectKeys.add(key);
       identities.set(reference.manifest_key, {
         content_sha256: preserved.connectorObject.content_sha256
           || sha256Hex(preserved.connectorObject.body),
@@ -595,6 +628,32 @@ export async function assembleSosLightDayParents({
       omitted: true,
     });
   }
+  const unreferencedPhysicalObservationObjectKeys = physicalEntries
+    .map((entry) => entry.key)
+    .filter((key) => {
+      const connectorId = Number(key.match(/\/connector_id=([1-9]\d*)\//)?.[1]);
+      return expectedFinalConnectorIds.includes(connectorId)
+        && !authoritativeObservationObjectKeys.has(key)
+        && (/\/pollutant_code=[^/]+\/manifest\.json$/.test(key)
+          || /\/pollutant_code=[^/]+\/[^/]+\.parquet$/.test(key));
+    })
+    .sort();
+  for (const key of unreferencedPhysicalObservationObjectKeys) {
+    const connectorId = Number(key.match(/\/connector_id=([1-9]\d*)\//)?.[1]);
+    const pollutantCode = key.match(/\/pollutant_code=([^/]+)\//)?.[1] || null;
+    const classification = key.endsWith("/manifest.json")
+      ? "dropbox_unreferenced_physical_pollutant"
+      : "dropbox_unreferenced_physical_parquet";
+    addSosLightDropboxWarning(audit, {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      pollutant_code: pollutantCode,
+      object_key: key,
+      classification,
+      reason: "physical object is outside the manifest-reachable authoritative day closure",
+      omitted: true,
+    });
+  }
   children.sort((left, right) => Number(left.connector_id) - Number(right.connector_id));
   const finalAssembledConnectorIds = children.map((child) => Number(child.connector_id));
   if (JSON.stringify(finalAssembledConnectorIds) !== JSON.stringify(expectedFinalConnectorIds)) {
@@ -616,6 +675,10 @@ export async function assembleSosLightDayParents({
     physical_dropbox_connector_ids: physicalConnectorIds,
     unreferenced_physical_connector_ids: unreferencedPhysicalConnectorIds,
     unreferenced_physical_connector_prefixes: unreferencedPhysicalConnectorPrefixes,
+    authoritative_observation_object_keys:
+      [...authoritativeObservationObjectKeys].sort(),
+    unreferenced_physical_observation_object_keys:
+      unreferencedPhysicalObservationObjectKeys,
     final_connector_1_child_set: connector1ChildKeys,
     final_assembled_connector_ids: finalAssembledConnectorIds,
     omitted_dropbox_connector_ids: unreferencedPhysicalConnectorIds,

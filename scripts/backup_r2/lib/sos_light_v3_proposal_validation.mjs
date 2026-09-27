@@ -179,6 +179,29 @@ function canonicalConnectorIds(value, label) {
   return canonical;
 }
 
+function canonicalObservationObjectKeys(value, dayUtc) {
+  if (!Array.isArray(value) || value.some((key) => typeof key !== "string")) {
+    throw new Error(`Fixed-v3 SOS-light observation closure is invalid: ${dayUtc}`);
+  }
+  const root = `${OBSERVATIONS_PREFIX}/day_utc=${dayUtc}`;
+  const dayManifestKey = `${root}/manifest.json`;
+  const canonical = [...new Set(value.map(safeKey))].sort();
+  const validObject = (key) => key === dayManifestKey
+    || new RegExp(`^${root}/connector_id=[1-9]\\d*/manifest\\.json$`).test(key)
+    || new RegExp(
+      `^${root}/connector_id=[1-9]\\d*/pollutant_code=[a-z0-9_]+/manifest\\.json$`,
+    ).test(key)
+    || new RegExp(
+      `^${root}/connector_id=[1-9]\\d*/pollutant_code=[a-z0-9_]+/[^/]+\\.parquet$`,
+    ).test(key);
+  if (!exactArray(value, canonical)
+      || !canonical.includes(dayManifestKey)
+      || canonical.some((key) => !validObject(key))) {
+    throw new Error(`Fixed-v3 SOS-light observation closure is not canonical: ${dayUtc}`);
+  }
+  return canonical;
+}
+
 function canonicalSosLightConnectorMembership(runState) {
   const audit = runState?.sos_light;
   if (!audit || typeof audit !== "object" || Array.isArray(audit)
@@ -221,11 +244,27 @@ function canonicalSosLightConnectorMembership(runState) {
       entry.final_assembled_connector_ids,
       `${dayUtc}:final_assembled_connector_ids`,
     );
+    const authoritativeObservationObjectKeys = canonicalObservationObjectKeys(
+      entry.authoritative_observation_object_keys,
+      dayUtc,
+    );
     const derivedPreserved = baselineConnectorIds.filter((connectorId) => connectorId !== 1);
     const derivedFinal = [...new Set([1, ...derivedPreserved])].sort((left, right) => left - right);
+    const root = `${OBSERVATIONS_PREFIX}/day_utc=${dayUtc}`;
+    const closureConnectorIds = authoritativeObservationObjectKeys
+      .map((key) => key.match(new RegExp(`^${root}/connector_id=([1-9]\\d*)/manifest\\.json$`)))
+      .filter(Boolean)
+      .map((match) => Number(match[1]))
+      .sort((left, right) => left - right);
+    const closureHasUnexpectedConnector = authoritativeObservationObjectKeys.some((key) => {
+      const match = key.match(new RegExp(`^${root}/connector_id=([1-9]\\d*)/`));
+      return match && !derivedFinal.includes(Number(match[1]));
+    });
     if (!exactArray(expectedPreservedConnectorIds, derivedPreserved)
         || !exactArray(expectedFinalConnectorIds, derivedFinal)
-        || !exactArray(finalAssembledConnectorIds, derivedFinal)) {
+        || !exactArray(finalAssembledConnectorIds, derivedFinal)
+        || !exactArray(closureConnectorIds, derivedFinal)
+        || closureHasUnexpectedConnector) {
       throw new Error(`Fixed-v3 SOS-light frozen connector membership disagrees: ${dayUtc}`);
     }
     return {
@@ -237,6 +276,7 @@ function canonicalSosLightConnectorMembership(runState) {
       expected_preserved_connector_ids: expectedPreservedConnectorIds,
       expected_final_connector_ids: expectedFinalConnectorIds,
       final_assembled_connector_ids: finalAssembledConnectorIds,
+      authoritative_observation_object_keys: authoritativeObservationObjectKeys,
     };
   }).sort((left, right) => left.day_utc.localeCompare(right.day_utc));
 }
@@ -479,6 +519,17 @@ export function validateDedicatedSosHistoricalProposalV3({ runState, proposal })
         || referencesValid(connectorReferences) !== true
         || referencesValid(childReferences) !== true) {
       throw new Error(`SOS-light-v3 final day connector membership differs from pinned authority: ${day}`);
+    }
+    const finalDayObjectKeys = [...keys]
+      .filter((key) => key.startsWith(`${root}/`))
+      .sort();
+    if (!exactArray(
+      finalDayObjectKeys,
+      dayMembership.authoritative_observation_object_keys,
+    )) {
+      throw new Error(
+        `SOS-light-v3 final day object closure differs from frozen authority: ${day}`,
+      );
     }
   }
   return {

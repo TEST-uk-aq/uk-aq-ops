@@ -1994,7 +1994,89 @@ test("SOS-light preserves a day-declared schema-v3 connector with null backup ti
   assert.deepEqual(audit.days[0].expected_preserved_connector_ids, [8]);
   assert.deepEqual(audit.days[0].expected_final_connector_ids, [1, 8]);
   assert.deepEqual(audit.days[0].final_assembled_connector_ids, [1, 8]);
+  assert.deepEqual(
+    audit.days[0].authoritative_observation_object_keys.filter((key) =>
+      key.startsWith(`${fixture.base}/connector_id=1/pollutant_code=`)
+      && key.endsWith("/manifest.json")),
+    fixture.connector1Pollutants.map((payload) => payload.manifest_key).sort(),
+  );
+  assert.ok(audit.days[0].authoritative_observation_object_keys.includes(
+    `${fixture.base}/connector_id=8/pollutant_code=bc/manifest.json`,
+  ));
+  assert.ok(audit.days[0].authoritative_observation_object_keys.includes(
+    `${fixture.base}/connector_id=8/pollutant_code=uv370/manifest.json`,
+  ));
   assert.equal(audit.dropbox_warning_count, 0);
+});
+
+test("SOS-light freezes only manifest-reachable objects for a preserved connector", async () => {
+  const fixture = declaredPeerSosLightFixture();
+  const orphanManifestKey =
+    `${fixture.base}/connector_id=8/pollutant_code=orphan/manifest.json`;
+  const orphanParquetKey =
+    `${fixture.base}/connector_id=8/pollutant_code=orphan/part-00000.parquet`;
+  const staleBcParquetKey =
+    `${fixture.base}/connector_id=8/pollutant_code=bc/old-part.parquet`;
+  for (const [key, body] of [
+    [orphanManifestKey, Buffer.from('{"physical":"orphan"}')],
+    [orphanParquetKey, Buffer.from("orphan-parquet")],
+    [staleBcParquetKey, Buffer.from("stale-bc-parquet")],
+  ]) {
+    fixture.objects.set(key, {
+      key,
+      body,
+      bytes: body.byteLength,
+      source: "dropbox",
+      content_sha256: sha256Hex(body),
+    });
+  }
+  const staged = createStagedObjectMap({
+    r2: {},
+    store: inMemorySosLightStore(fixture.objects),
+  });
+  await staged.stage({
+    key: fixture.connector1Key,
+    body: JSON.stringify(fixture.finalConnector1, null, 2),
+    kind: "connector_manifest",
+    dayUtc: fixture.dayUtc,
+    dependencies: fixture.connector1Pollutants.map((payload) => payload.manifest_key),
+  });
+  const audit = {
+    days: [], dropbox_warnings: [], dropbox_warning_count: 0,
+    dropbox_omission_count: 0,
+  };
+
+  const assembled = await assembleSosLightDayParents({
+    staged,
+    base: fixture.base,
+    dayUtc: fixture.dayUtc,
+    protectedConnectorIds: [1],
+    selectedMutationConnectorIds: [1],
+    audit,
+  });
+
+  assert.deepEqual(assembled.children.map((payload) => payload.connector_id), [1, 8]);
+  const closure = audit.days[0].authoritative_observation_object_keys;
+  assert.ok(closure.includes(
+    `${fixture.base}/connector_id=8/pollutant_code=bc/manifest.json`,
+  ));
+  assert.ok(closure.includes(
+    `${fixture.base}/connector_id=8/pollutant_code=uv370/manifest.json`,
+  ));
+  assert.equal(closure.includes(orphanManifestKey), false);
+  assert.equal(closure.includes(orphanParquetKey), false);
+  assert.equal(closure.includes(staleBcParquetKey), false);
+  assert.deepEqual(
+    audit.days[0].unreferenced_physical_observation_object_keys,
+    [orphanManifestKey, orphanParquetKey, staleBcParquetKey].sort(),
+  );
+  assert.deepEqual(
+    [...new Set(audit.dropbox_warnings.map((warning) => warning.classification))].sort(),
+    [
+      "dropbox_unreferenced_physical_parquet",
+      "dropbox_unreferenced_physical_pollutant",
+    ],
+  );
 });
 
 test("SOS-light fails when a day-declared non-selected connector cannot be preserved", async () => {
