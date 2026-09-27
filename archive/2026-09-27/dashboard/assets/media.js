@@ -132,7 +132,6 @@
     const headers = new Headers(options.headers || {});
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
     if (options.idempotent) headers.set("Idempotency-Key", idempotencyKey(options.idempotent));
-    if (options.revision !== undefined) headers.set("If-Match", String(options.revision));
     let response;
     try {
       response = await fetch(apiUrl(path, options.params), { method: options.method || "GET", headers,
@@ -1016,21 +1015,6 @@
     return `<label class="media-toggle" data-manual-facebook><input type="checkbox"> <span>Post to Facebook UK AQ - ukaq.co.uk</span></label>`;
   }
 
-  function localCopyEvidenceHtml(evidence) {
-    return evidence?.permission_basis
-      ? `<p><strong>Latest recorded local-copy permission/basis:</strong> ${esc(evidence.permission_basis)}<span class="media-subtext">Recorded ${esc(formatUtcDateTime(evidence.recorded_at))}</span></p>`
-      : `<p class="media-subtext">No local-copy permission/basis evidence has been recorded through this workflow.</p>`;
-  }
-
-  function articleImagePolicyHtml(article) {
-    const sourceAllowsLocalCopy = article.source_image_policy === "local_copy_permitted";
-    const retainedWarning = article.image_policy === "local_copy_permitted"
-      ? `<div class="media-message">Changing away from local_copy_permitted makes any retained image immediately ineligible for delivery and Bluesky. The R2 object is not automatically deleted.</div>` : "";
-    const sourceWarning = sourceAllowsLocalCopy ? ""
-      : `<div class="media-message media-message--error">Article local_copy_permitted cannot be granted until source-wide local-copy permission is established on the Sources page.</div>`;
-    return `<section><h4>Image policy</h4><p>Article: <strong>${esc(article.image_policy)}</strong> · Source: <strong>${esc(article.source_image_policy)}</strong></p>${localCopyEvidenceHtml(article.local_copy_permission_evidence)}${sourceWarning}${retainedWarning}<form class="media-inline-form" data-article-image-policy><label class="media-field"><span>Article image policy</span><select name="image_policy"><option value="blocked"${article.image_policy === "blocked" ? " selected" : ""}>blocked</option><option value="remote_preview"${article.image_policy === "remote_preview" ? " selected" : ""}>remote_preview</option><option value="local_copy_permitted"${article.image_policy === "local_copy_permitted" ? " selected" : ""}${sourceAllowsLocalCopy ? "" : " disabled"}>local_copy_permitted</option></select></label><label class="media-field media-field--grow"><span>Permission/basis note</span><textarea name="permission_basis" maxlength="1000" placeholder="Required when granting or refreshing local-copy permission"></textarea></label><label class="media-toggle"><input name="confirm_local_copy_permitted" type="checkbox"> <span>I explicitly confirm that the recorded permission, licence or other right permits this article’s image to be retained locally.</span></label><button type="submit" class="media-button media-button--primary">Save image policy</button></form><p class="media-subtext">A retained image can be uploaded only after both source and article policies are local_copy_permitted.</p><div data-article-image-policy-message></div></section>`;
-  }
-
   async function openArticle(id, notice = "", selectedStatus = "") {
     const dialog = detailDialog();
     dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading article…</div></div>`;
@@ -1050,8 +1034,7 @@
         ? `<section><h4>Retained local image</h4><p class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</p>${article.local_image?.exists ? `<dl class="media-local-image-meta"><dt>Type</dt><dd>${esc(article.local_image.content_type)}</dd><dt>Size</dt><dd>${esc(Number(article.local_image.byte_size || 0).toLocaleString("en-GB"))} bytes</dd><dt>Stored</dt><dd>${esc(formatUtcDateTime(article.local_image.stored_at))}</dd><dt>Acquisition</dt><dd>${esc(article.local_image.acquisition_method)}</dd></dl>` : `<p class="media-subtext">A retained copy is required for reliable Bluesky posting. Upload only when copying permission has been recorded for both the source and article.</p>`}<form class="media-inline-form" data-local-image-upload><label class="media-field media-field--grow"><span>${article.local_image?.exists ? "Replacement image" : "Image file"}</span><input name="image" type="file" accept="image/jpeg,image/png,image/webp" required></label><button type="submit" class="media-button media-button--primary">${article.local_image?.exists ? "Replace retained image" : "Upload retained image"}</button>${article.local_image?.exists ? `<button type="button" class="media-button media-button--danger" data-remove-local-image>Remove retained image</button>` : ""}</form><p class="media-subtext">JPEG, PNG or WebP · maximum 5 MiB. The destination is fixed to this article.</p><div data-local-image-message></div></section>` : "";
       dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
         <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></div>
-        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
-        ${articleImagePolicyHtml(article)}
+        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Image policy</dt><dd>${esc(article.image_policy)} / source ${esc(article.source_image_policy)}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
         ${localImageControls}
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
         ${directPublishHtml(data, article)}
@@ -1094,9 +1077,6 @@
       dialog.querySelector("[data-detail-generate-ai]")?.addEventListener("click", event => void generateDetailAiTitle(id, event.currentTarget, dialog));
       dialog.querySelectorAll("[data-detail-ai-decision]").forEach(button => button.addEventListener("click", () => void decideDetailAiTitle(id, button.dataset.detailAiDecision, dialog)));
       dialog.querySelector("[data-reload-metadata]")?.addEventListener("click", () => void reloadMetadata(id, article, dialog));
-      dialog.querySelector("[data-article-image-policy]")?.addEventListener("submit", event => {
-        event.preventDefault(); void saveArticleImagePolicy(id, article, event.currentTarget, dialog);
-      });
       dialog.querySelector("[data-local-image-upload]")?.addEventListener("submit", event => {
         event.preventDefault(); void uploadLocalImage(id, article, event.currentTarget, dialog);
       });
@@ -1107,37 +1087,6 @@
       });
       dialog.querySelector(".media-detail__preview[src]")?.addEventListener("error", event => { event.currentTarget.outerHTML = `<div class="media-thumb-fallback media-detail__preview">Image unavailable</div>`; }, { once: true });
     } catch (error) { dialog.innerHTML = `<div class="media-detail__inner">${message(error.message, "error")}<button class="media-button" onclick="this.closest('dialog').close()">Close</button></div>`; }
-  }
-
-  async function saveArticleImagePolicy(id, article, form, dialog) {
-    const output = dialog.querySelector("[data-article-image-policy-message]");
-    const values = new FormData(form);
-    const imagePolicy = String(values.get("image_policy") || "");
-    const permissionBasis = String(values.get("permission_basis") || "").trim();
-    const confirmed = values.get("confirm_local_copy_permitted") === "on";
-    if (imagePolicy === "local_copy_permitted" && !permissionBasis) {
-      output.innerHTML = message("Enter the permission, licence or other basis for retaining this image locally.", "error"); return;
-    }
-    if (imagePolicy === "local_copy_permitted" && !confirmed) {
-      output.innerHTML = message("Explicitly confirm the local-copy permission decision before saving.", "error"); return;
-    }
-    if (article.image_policy === "local_copy_permitted" && imagePolicy !== "local_copy_permitted" &&
-        !window.confirm("Changing this article away from local_copy_permitted immediately makes its retained image ineligible for delivery and Bluesky. The R2 object will not be automatically deleted. Continue?")) return;
-    const button = form.querySelector("button[type='submit']");
-    button.disabled = true;
-    const body = { image_policy: imagePolicy,
-      confirm_local_copy_permitted: imagePolicy === "local_copy_permitted" && confirmed };
-    if (permissionBasis) body.permission_basis = permissionBasis;
-    try {
-      await request(`articles/${id}/image-policy`, { method: "PUT", idempotent: "image_policy",
-        revision: article.revision, body });
-      await renderArticles(false);
-      await openArticle(id, imagePolicy === article.image_policy
-        ? imagePolicy === "local_copy_permitted"
-          ? "Local-copy permission/basis evidence recorded."
-          : "Article image policy is unchanged."
-        : "Article image policy updated.");
-    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
   }
 
   async function uploadLocalImage(id, article, form, dialog) {
@@ -1518,26 +1467,19 @@
     try {
       const data = await request("sources");
       const rulesBySource = new Map(); (data.author_rules || []).forEach(rule => { const group = rulesBySource.get(rule.source_key) || []; group.push(rule); rulesBySource.set(rule.source_key, group); });
-      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Sources</h3><p>Publication and author-rule changes apply to future discovery. Image-policy revocation takes effect immediately.</p></div><button class="media-button media-button--primary" data-toggle-add-source>+ Add Source</button></div><div data-add-source></div><div class="media-source-list">${(data.sources || []).map(source => sourceCard(source, rulesBySource.get(source.source_key) || [])).join("") || `<div class="media-empty">No Media sources found.</div>`}</div></section>`);
+      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Sources</h3><p>Policy changes apply to future discovery only.</p></div><button class="media-button media-button--primary" data-toggle-add-source>+ Add Source</button></div><div data-add-source></div><div class="media-source-list">${(data.sources || []).map(source => sourceCard(source, rulesBySource.get(source.source_key) || [])).join("") || `<div class="media-empty">No Media sources found.</div>`}</div></section>`);
       bindSourceActions();
     } catch (error) { setView(`<section class="media-card"><h3>Sources</h3>${message(error.message, "error")}</section>`); }
   }
 
-  function sourceImagePolicyHtml(source) {
-    const revocationWarning = source.image_policy === "local_copy_permitted"
-      ? `<div class="media-message">Changing away from local_copy_permitted immediately makes retained copies for this source ineligible for delivery and Bluesky. R2 objects and audit metadata are not automatically deleted.</div>` : "";
-    return `<section><h4>Image policy</h4><p>Current source image policy: <strong>${esc(source.image_policy)}</strong></p>${localCopyEvidenceHtml(source.local_copy_permission_evidence)}<div class="media-message">Granting local_copy_permitted is a source-wide permission decision. Existing article policies are not bulk-updated. Future newly created or discovered article rows currently inherit the source image policy.</div>${revocationWarning}<form class="media-inline-form" data-source-image-policy-form><label class="media-field"><span>Source image policy</span><select name="image_policy" data-source-image-policy><option value="blocked"${source.image_policy === "blocked" ? " selected" : ""}>blocked</option><option value="remote_preview"${source.image_policy === "remote_preview" ? " selected" : ""}>remote_preview</option><option value="local_copy_permitted"${source.image_policy === "local_copy_permitted" ? " selected" : ""}>local_copy_permitted</option></select></label><label class="media-field media-field--grow"><span>Permission/basis note</span><textarea name="permission_basis" maxlength="1000" placeholder="Required when granting or refreshing source-wide local-copy permission"></textarea></label><label class="media-toggle"><input name="confirm_local_copy_permitted" type="checkbox"> <span>I explicitly confirm source-wide permission for retained images and future article inheritance.</span></label><button type="submit" class="media-button media-button--primary">Save image policy</button></form><div data-source-image-message></div></section>`;
-  }
-
   function sourceCard(source, rules) {
     let config = source.discovery_config_json; try { config = JSON.stringify(JSON.parse(config), null, 2); } catch (_error) {}
-    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}" data-current-image-policy="${esc(source.image_policy)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
+    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
       ${[["Canonical domain", source.canonical_domain], ["Source type", source.source_type], ["Discovery adapter", source.discovery_method], ["Review level", source.review_level], ["Content fetch", source.content_fetch_policy], ["AI content", source.ai_content_policy], ["Image policy", source.image_policy], ["Recent run", source.recent_run_status ? `${source.recent_run_status} · ${formatUtcDateTime(source.recent_run_started_at)}` : "No run"]].map(([label, value]) => `<div><span class="media-subtext">${label}</span>${esc(value)}</div>`).join("")}
       <label class="media-field"><span>Publication policy</span><select data-source-policy><option value="manual"${source.publication_policy === "manual" ? " selected" : ""}>manual</option><option value="auto_approve"${source.publication_policy === "auto_approve" ? " selected" : ""}>auto_approve</option></select></label>
       <label class="media-field"><span>Enabled</span><select data-source-enabled><option value="false"${!source.enabled ? " selected" : ""}>No</option><option value="true"${source.enabled ? " selected" : ""}>Yes</option></select></label>
       <button class="media-button media-button--primary" data-save-source>Save source policy</button></div>
       <details><summary>Bounded route/configuration</summary><pre>${esc(config)}</pre></details><div data-source-message></div>
-      ${sourceImagePolicyHtml(source)}
       <div class="media-author-rules"><div class="media-toolbar"><h4>Author rules</h4>${source.source_key === "the-guardian" ? `<button class="media-button" data-add-author>+ Add author rule</button>` : ""}</div><div data-add-author-form></div>
       ${rules.length ? rules.map(authorRuleRow).join("") : `<p>No author rules.</p>`}</div></details>`;
   }
@@ -1555,9 +1497,6 @@
       target.querySelector("form")?.addEventListener("submit", event => { event.preventDefault(); void submitAddSource(event.currentTarget, target); });
     });
     state.root.querySelectorAll("[data-save-source]").forEach(button => button.addEventListener("click", () => void saveSource(button.closest("[data-source-key]"))));
-    state.root.querySelectorAll("[data-source-image-policy-form]").forEach(form => form.addEventListener("submit", event => {
-      event.preventDefault(); void saveSourceImagePolicy(event.currentTarget.closest("[data-source-key]"), event.currentTarget);
-    }));
     state.root.querySelectorAll("[data-save-author]").forEach(button => button.addEventListener("click", () => void saveAuthor(button.closest("[data-author-key]"))));
     state.root.querySelectorAll("[data-add-author]").forEach(button => button.addEventListener("click", () => showAddAuthor(button.closest("[data-source-key]"))));
   }
@@ -1569,38 +1508,6 @@
     const output = container.querySelector("[data-source-message]");
     try { await request(`sources/${container.dataset.sourceKey}`, { method: "PUT", idempotent: "source", body: { publication_policy: policy, enabled } }); output.innerHTML = message("Source policy saved for future discovery.", "success"); }
     catch (error) { output.innerHTML = message(error.message, "error"); }
-  }
-
-  async function saveSourceImagePolicy(container, form) {
-    const output = container.querySelector("[data-source-image-message]");
-    const values = new FormData(form);
-    const imagePolicy = String(values.get("image_policy") || "");
-    const permissionBasis = String(values.get("permission_basis") || "").trim();
-    const confirmed = values.get("confirm_local_copy_permitted") === "on";
-    if (imagePolicy === "local_copy_permitted" && !permissionBasis) {
-      output.innerHTML = message("Enter the source-wide permission, licence or other basis for retaining images locally.", "error"); return;
-    }
-    if (imagePolicy === "local_copy_permitted" && !confirmed) {
-      output.innerHTML = message("Explicitly confirm the source-wide local-copy permission decision before saving.", "error"); return;
-    }
-    if (container.dataset.currentImagePolicy === "local_copy_permitted" &&
-        imagePolicy !== "local_copy_permitted" &&
-        !window.confirm("Changing this source away from local_copy_permitted immediately makes retained copies ineligible for delivery and Bluesky. R2 objects will not be automatically deleted. Continue?")) return;
-    const button = form.querySelector("button[type='submit']");
-    button.disabled = true;
-    const body = { image_policy: imagePolicy,
-      confirm_local_copy_permitted: imagePolicy === "local_copy_permitted" && confirmed };
-    if (permissionBasis) body.permission_basis = permissionBasis;
-    try {
-      await request(`sources/${container.dataset.sourceKey}`, { method: "PUT",
-        idempotent: "source_image_policy", body });
-      output.innerHTML = message(imagePolicy === container.dataset.currentImagePolicy
-        ? imagePolicy === "local_copy_permitted"
-          ? "Source local-copy permission/basis evidence recorded."
-          : "Source image policy is unchanged."
-        : "Source image policy updated. Existing article policies were not changed.", "success");
-      setTimeout(() => void renderSources(), 350);
-    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
   }
 
   async function saveAuthor(container) {
