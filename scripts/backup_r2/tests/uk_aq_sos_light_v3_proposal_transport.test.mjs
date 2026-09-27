@@ -4,6 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import {
+  computeObservationContentHash,
+} from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import {
   materializeSosLightV3ProposalBodies,
@@ -15,6 +18,7 @@ import {
   requireCoordinatorProposalFreeze,
   SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
   validateDedicatedSosHistoricalProposalV3,
+  validateFinalSosLightV3ProposalGraph,
   validateLocalSosLightV3Proposal,
 } from "../lib/sos_light_v3_proposal_validation.mjs";
 
@@ -133,13 +137,16 @@ function fixedV3LocalProposalState(indexKey) {
 }
 
 test("fixed-v3 local APPLY validation rejects unknown index families before mutation", () => {
-  const valid = fixedV3LocalProposalState(
+  for (const validKey of [
     "history/_index_v3/observations_timeseries/day_utc=2025-01-15/connector_id=1/pollutant_code=no2/timeseries_id=000000123.json",
-  );
-  try {
-    assert.doesNotThrow(() => validateLocalSosLightV3Proposal(valid.runState));
-  } finally {
-    fs.rmSync(valid.runRoot, { recursive: true, force: true });
+    "history/_index_v3/observations_timeseries/_aligned/day_utc=2025-01-15/connector_id=1/pollutant_code=no2/manifest.json",
+  ]) {
+    const valid = fixedV3LocalProposalState(validKey);
+    try {
+      assert.doesNotThrow(() => validateLocalSosLightV3Proposal(valid.runState));
+    } finally {
+      fs.rmSync(valid.runRoot, { recursive: true, force: true });
+    }
   }
 
   for (const invalidKey of [
@@ -155,6 +162,132 @@ test("fixed-v3 local APPLY validation rejects unknown index families before muta
     } finally {
       fs.rmSync(invalid.runRoot, { recursive: true, force: true });
     }
+  }
+});
+
+test("fixed-v3 final graph validates canonical pollutant data without misclassifying an aligned index manifest", async () => {
+  const dayUtc = "2025-01-15";
+  const pollutantCode = "no2";
+  const identity = `day_utc=${dayUtc}/connector_id=1/pollutant_code=${pollutantCode}`;
+  const runRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v3-final-graph-"));
+  const overlayRoot = path.join(runRoot, "overlay");
+  try {
+    const rawRows = [{
+      station_id: 10,
+      timeseries_id: 123,
+      pollutant_code: pollutantCode,
+      observed_at: `${dayUtc}T00:00:00.000Z`,
+      value: 17.5,
+      verification_status: "P",
+    }];
+    const canonicalRows = rawRows.map((row) => ({
+      connector_id: 1,
+      station_id: row.station_id,
+      timeseries_id: row.timeseries_id,
+      pollutant_code: row.pollutant_code,
+      observed_at_utc: row.observed_at,
+      value: row.value,
+      verification_status: row.verification_status,
+    }));
+    const { canonical_rows: _canonicalRows, ...contentHash } =
+      computeObservationContentHash(canonicalRows);
+    const evidenceDirectory = path.join(
+      overlayRoot,
+      "source-evidence",
+      `day_utc=${dayUtc}`,
+      "connector_id=1",
+      `pollutant_code=${pollutantCode}`,
+    );
+    fs.mkdirSync(evidenceDirectory, { recursive: true });
+    const rowsPath = path.join(evidenceDirectory, "obs_history_rows.json");
+    const evidencePath = path.join(evidenceDirectory, "source-evidence.json");
+    const rowsBody = Buffer.from(JSON.stringify(rawRows));
+    const evidenceBody = Buffer.from(JSON.stringify({
+      schema_version: 1,
+      enumeration_complete: true,
+      day_utc: dayUtc,
+      connector_id: 1,
+      requested_pollutant_set: [pollutantCode],
+      missing_binding_rows: 0,
+      canonical_rows_bytes: rowsBody.byteLength,
+      canonical_rows_sha256: sha256Hex(rowsBody),
+      total_rows: rawRows.length,
+      per_pollutant_counts: { [pollutantCode]: rawRows.length },
+      observation_content_hashes: { [pollutantCode]: contentHash },
+    }));
+    fs.writeFileSync(rowsPath, rowsBody);
+    fs.writeFileSync(evidencePath, evidenceBody);
+
+    const observationPrefix =
+      `history/v3/observations/day_utc=${dayUtc}/connector_id=1/pollutant_code=${pollutantCode}`;
+    const partKey = `${observationPrefix}/part-00000.parquet`;
+    const manifestKey = `${observationPrefix}/manifest.json`;
+    const alignedManifestKey =
+      "history/_index_v3/observations_timeseries/_aligned/"
+      + `day_utc=${dayUtc}/connector_id=1/pollutant_code=${pollutantCode}/manifest.json`;
+    const manifestEntry = {};
+    const alignedManifestEntry = {};
+    const proposal = {
+      objects: [
+        { key: `history/v3/observations/day_utc=${dayUtc}/manifest.json`, body: Buffer.from("{}"), entry: {} },
+        { key: `history/v3/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`, body: Buffer.from("{}"), entry: {} },
+        { key: partKey, body: Buffer.from("parquet"), entry: {} },
+        {
+          key: manifestKey,
+          body: Buffer.from(JSON.stringify({
+            row_count: rawRows.length,
+            parquet_object_keys: [partKey],
+          })),
+          entry: manifestEntry,
+        },
+        {
+          key: alignedManifestKey,
+          body: Buffer.from(JSON.stringify({ kind: "observation_timeseries_aligned_source_manifest" })),
+          entry: alignedManifestEntry,
+        },
+      ],
+      prefixes: [{
+        prefix: `history/v3/observations/day_utc=${dayUtc}`,
+        entry: { stage: "sos_light_complete_day" },
+      }],
+    };
+    const runState = {
+      overlay_root: overlayRoot,
+      execution_path: "sos_light",
+      mode: "sos-light",
+      environment: "TEST",
+      mutation_connector_ids: [1],
+      selected_mutation_connector_ids: [1],
+      protected_connector_ids: [1],
+      requested_repair_pollutants: [pollutantCode],
+      sos_light: {
+        mode: "sos-light",
+        validation_status: "complete_local_days_validated",
+        old_live_r2_observation_bodies_used: false,
+        no_old_live_r2_body_planning_or_preservation: true,
+        days: [{ day_utc: dayUtc }],
+      },
+      source_evidence_partitions: {
+        [identity]: {
+          identity,
+          day_utc: dayUtc,
+          connector_id: 1,
+          pollutant_code: pollutantCode,
+          evidence_path: evidencePath,
+          rows_path: rowsPath,
+          evidence_sha256: sha256Hex(evidenceBody),
+          rows_sha256: sha256Hex(rowsBody),
+        },
+      },
+    };
+
+    const result = await validateFinalSosLightV3ProposalGraph({ runState, proposal });
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.validated_partition_count, 1);
+    assert.equal(manifestEntry.final_proposal_graph_validated, true);
+    assert.equal(Object.hasOwn(alignedManifestEntry, "final_proposal_graph_validated"), false);
+  } finally {
+    fs.rmSync(runRoot, { recursive: true, force: true });
   }
 });
 

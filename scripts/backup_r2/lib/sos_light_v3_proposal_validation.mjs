@@ -401,9 +401,9 @@ export async function validateFinalSosLightV3ProposalGraph({ runState, proposal 
   const evidence = runState.source_evidence_partitions;
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) throw new Error("SOS-light-v3 immutable source evidence is absent");
   const objects = new Map(proposal.objects.map((object) => [object.key, object]));
-  for (const object of proposal.objects.filter(({ key }) => key.endsWith("/manifest.json") && key.includes("/pollutant_code="))) {
+  for (const object of proposal.objects.filter(({ key }) => POLLUTANT_MANIFEST.test(key))) {
     const match = object.key.match(POLLUTANT_MANIFEST);
-    if (!match || !dedicated.selected_days.includes(match[1])) {
+    if (!dedicated.selected_days.includes(match[1])) {
       throw new Error(`SOS-light-v3 pollutant manifest is outside the selected complete days: ${object.key}`);
     }
     let manifest;
