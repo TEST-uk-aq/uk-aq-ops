@@ -14,6 +14,111 @@
 #   ./sync_to_live.sh ops --apply
 set -euo pipefail
 
+# ── Website feature promotion switches ───────────────────────────────────────
+#
+# true  = copy/update the feature directory and its dedicated icon assets.
+# false = hold those paths back from promotion. Existing copies already present
+#         in the LIVE beta checkout are preserved; exclusions do not delete them.
+#
+# Related sidebar navigation entries are also removed from the promoted
+# sidebar.js while a feature is false.
+COPY_SENSORS=false
+COPY_WHO_GUIDELINES=false
+COPY_WOOD_BURNING=true
+COPY_NAEI_DATA=true
+COPY_RESEARCH=true
+
+WEBSITE_FEATURES=(sensors who_guidelines wood_burning naei_data research)
+
+validate_boolean() {
+  local name="$1"
+  local value="$2"
+  case "${value}" in
+    true|false) ;;
+    *)
+      echo "ERROR: ${name} must be true or false; found: ${value}" >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_boolean COPY_SENSORS "${COPY_SENSORS}"
+validate_boolean COPY_WHO_GUIDELINES "${COPY_WHO_GUIDELINES}"
+validate_boolean COPY_WOOD_BURNING "${COPY_WOOD_BURNING}"
+validate_boolean COPY_NAEI_DATA "${COPY_NAEI_DATA}"
+validate_boolean COPY_RESEARCH "${COPY_RESEARCH}"
+
+website_feature_enabled() {
+  case "$1" in
+    sensors)        printf '%s\n' "${COPY_SENSORS}" ;;
+    who_guidelines) printf '%s\n' "${COPY_WHO_GUIDELINES}" ;;
+    wood_burning)   printf '%s\n' "${COPY_WOOD_BURNING}" ;;
+    naei_data)      printf '%s\n' "${COPY_NAEI_DATA}" ;;
+    research)       printf '%s\n' "${COPY_RESEARCH}" ;;
+    *) return 1 ;;
+  esac
+}
+
+website_feature_name() {
+  case "$1" in
+    sensors)        printf '%s\n' 'Sensors' ;;
+    who_guidelines) printf '%s\n' 'WHO Guidelines' ;;
+    wood_burning)   printf '%s\n' 'Wood Burning' ;;
+    naei_data)      printf '%s\n' 'NAEI Data' ;;
+    research)       printf '%s\n' 'Research' ;;
+    *) return 1 ;;
+  esac
+}
+
+website_feature_route() {
+  case "$1" in
+    sensors)        printf '%s\n' '/sensors/' ;;
+    who_guidelines) printf '%s\n' '/who-guidelines/' ;;
+    wood_burning)   printf '%s\n' '/wood-burning/' ;;
+    naei_data)      printf '%s\n' '/naei-data/' ;;
+    research)       printf '%s\n' '/research/' ;;
+    *) return 1 ;;
+  esac
+}
+
+website_feature_paths() {
+  case "$1" in
+    sensors)
+      printf '%s\n' \
+        '/sensors/' \
+        '/images/UK-AQ-sensors.svg' \
+        '/sidebar-images/uk-aq-sensors-icon-blue.svg' \
+        '/sidebar-images/uk-aq-sensors-icon.svg'
+      ;;
+    who_guidelines)
+      printf '%s\n' \
+        '/who-guidelines/' \
+        '/images/UK-AQ-WHO-1line.svg' \
+        '/sidebar-images/UK-AQ-WHO-button.svg' \
+        '/sidebar-images/uk-aq-who-sidebar-button.svg'
+      ;;
+    wood_burning)
+      printf '%s\n' \
+        '/wood-burning/' \
+        '/images/UK-AQ-wood-burning-1line.svg' \
+        '/sidebar-images/uk-aq-wood-burning-stove.png'
+      ;;
+    naei_data)
+      printf '%s\n' \
+        '/naei-data/' \
+        '/images/UK-AQ-naei-data-1line.svg' \
+        '/sidebar-images/uk-aq-naei-data.png'
+      ;;
+    research)
+      printf '%s\n' \
+        '/research/' \
+        '/images/UK-AQ-research.svg' \
+        '/sidebar-images/uk-aq-research-icon.png'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 # ── Repo paths ───────────────────────────────────────────────────────────────
 
 TEST_BASE="/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos"
@@ -215,6 +320,53 @@ mark_failure() {
   FAILED_REPOS+=("${label}")
 }
 
+website_was_selected() {
+  local repo
+  for repo in "${SELECTED_REPOS[@]}"; do
+    if [[ "${repo}" == "website" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+print_website_feature_summary() {
+  local feature enabled name path
+  local excluded_count=0
+
+  if ! website_was_selected; then
+    return 0
+  fi
+
+  echo " WEBSITE FEATURE PROMOTION:"
+  for feature in "${WEBSITE_FEATURES[@]}"; do
+    enabled="$(website_feature_enabled "${feature}")"
+    name="$(website_feature_name "${feature}")"
+    if [[ "${enabled}" == "true" ]]; then
+      echo "   INCLUDED: ${name}"
+      continue
+    fi
+
+    excluded_count=$((excluded_count + 1))
+    echo "   EXCLUDED: ${name}"
+    while IFS= read -r path; do
+      if [[ "${path}" == */ ]]; then
+        echo "     dir:  ${path}"
+      else
+        echo "     icon: ${path}"
+      fi
+    done < <(website_feature_paths "${feature}")
+    echo "     sidebar nav: $(website_feature_route "${feature}")"
+  done
+
+  if [[ "${excluded_count}" -eq 0 ]]; then
+    echo "   Excluded features: none"
+  else
+    echo "   NOTE: excluded paths are not copied or deleted by rsync."
+    echo "         Existing copies already present in LIVE beta are preserved."
+  fi
+}
+
 clean_live_docs() {
   local label="$1"
   local dst="$2"
@@ -238,10 +390,9 @@ apply_live_website_overrides() {
   local src="$1"
   local dst="$2"
   local sidebar
+  local feature enabled name route
+  local disabled_nav_args=()
 
-  # TEST keeps the WHO navigation item. For Stage 1 LIVE, remove that complete
-  # nav-config line after rsync so every other sidebar.js change still promotes.
-  # Remove this override when the WHO guidelines page is ready for LIVE.
   if [[ "${APPLY}" -eq 0 ]]; then
     sidebar="${src}/sidebar.js"
   else
@@ -253,35 +404,60 @@ apply_live_website_overrides() {
     return 1
   fi
 
-  python3 - "${sidebar}" "${APPLY}" <<'PY'
+  for feature in "${WEBSITE_FEATURES[@]}"; do
+    enabled="$(website_feature_enabled "${feature}")"
+    if [[ "${enabled}" == "false" ]]; then
+      name="$(website_feature_name "${feature}")"
+      route="$(website_feature_route "${feature}")"
+      disabled_nav_args+=("${name}" "${route}")
+    fi
+  done
+
+  if [[ "${#disabled_nav_args[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  python3 - "${sidebar}" "${APPLY}" "${disabled_nav_args[@]}" <<'PY'
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
 apply = sys.argv[2] == "1"
+feature_args = sys.argv[3:]
+
+if len(feature_args) % 2:
+    raise SystemExit("Invalid website feature navigation arguments")
+
+features = list(zip(feature_args[0::2], feature_args[1::2]))
 text = path.read_text(encoding="utf-8")
 lines = text.splitlines(keepends=True)
+matched_indexes = []
 
-matches = [
-    index
-    for index, line in enumerate(lines)
-    if "href: '/who-guidelines/'" in line
-]
-
-if len(matches) != 1:
-    raise SystemExit(
-        f"Expected exactly one WHO guidelines nav line in {path}; found {len(matches)}"
-    )
+for name, route in features:
+    needle = f"href: '{route}'"
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if needle in line
+    ]
+    if len(matches) != 1:
+        raise SystemExit(
+            f"Expected exactly one {name} nav line for {route} in {path}; "
+            f"found {len(matches)}"
+        )
+    matched_indexes.append((matches[0], name, route))
 
 if apply:
-    del lines[matches[0]]
+    for index, name, route in sorted(matched_indexes, reverse=True):
+        del lines[index]
+        print(f"   LIVE override: removed {name} nav line ({route}) from {path}")
     path.write_text("".join(lines), encoding="utf-8")
-    print(f"   LIVE override: removed WHO guidelines nav line from {path}")
 else:
-    print(
-        "   DRY RUN [website]: would remove the WHO guidelines nav line "
-        f"from LIVE sidebar.js (validated source: {path})"
-    )
+    for _, name, route in matched_indexes:
+        print(
+            f"   DRY RUN [website]: would remove the {name} nav line ({route}) "
+            f"from LIVE sidebar.js (validated source: {path})"
+        )
 PY
 }
 
@@ -375,15 +551,18 @@ sync_repo() {
       )
       ;;
     website)
-      rsync_args+=(
-        # Stage 1: keep the dedicated WHO guidelines page in TEST until it is
-        # ready for LIVE. Remove this exclusion when the page is promoted.
-        --exclude='/who-guidelines/'
-
-        # Keep the legacy Sensors page in TEST. Sensor Map (/sensor_map/)
-        # remains part of the normal website promotion to LIVE.
-        --exclude='/sensors/'
-      )
+      # Feature directories and their dedicated icon assets are promoted only
+      # when the corresponding COPY_* switch at the top of this script is true.
+      # Normal rsync exclusions protect any existing beta copies from deletion.
+      local feature enabled path
+      for feature in "${WEBSITE_FEATURES[@]}"; do
+        enabled="$(website_feature_enabled "${feature}")"
+        if [[ "${enabled}" == "false" ]]; then
+          while IFS= read -r path; do
+            rsync_args+=(--exclude="${path}")
+          done < <(website_feature_paths "${feature}")
+        fi
+      done
       ;;
     pop-ingest|integrity-factory)
       # No extra repo-specific exclusions at present.
@@ -449,6 +628,8 @@ if [[ "${APPLY}" -eq 0 ]]; then
 else
   echo " MODE: APPLY"
 fi
+
+print_website_feature_summary
 
 if [[ "${ERRORS}" -gt 0 ]]; then
   echo " FAILED REPOS (${ERRORS}): ${FAILED_REPOS[*]}"
