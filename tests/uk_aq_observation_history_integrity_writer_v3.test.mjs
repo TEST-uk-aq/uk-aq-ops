@@ -23,6 +23,8 @@ import {
 import {
   partitionFrozenSosLightV3PublicationGraph,
   runPersistedSosLightV3Apply,
+  SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES,
+  SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_ENTRIES,
   validateSosLightV3SemanticCacheCapacity,
 } from "../scripts/backup_r2/lib/sos_light_v3_apply_persistence.mjs";
 
@@ -835,15 +837,29 @@ test("unrelated complete-day Parquet cannot evict the selected semantic GET body
       && entry.stored_byte_size_verified === true));
     assert.equal(persisted.apply.verified_get_body_cache.peak_entries, 1);
     assert.equal(persisted.apply.verified_get_body_cache.current_entries, 0);
+    assert.equal(
+      persisted.apply.verified_get_body_cache.max_entries,
+      persisted.apply.semantic_verification_cache_capacity.configured_max_entries,
+    );
+    assert.equal(
+      persisted.apply.verified_get_body_cache.max_bytes,
+      persisted.apply.semantic_verification_cache_capacity.configured_max_bytes,
+    );
+    assert.deepEqual(
+      persisted.apply.semantic_verification_cache_capacity,
+      persisted.semantic_verification_cache_capacity,
+    );
+    assert(persisted.apply.verified_get_body_cache.recent_events.some((event) =>
+      event.key === selectedPart.key
+      && event.reason === "semantic_verification_complete"));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("selected semantic cache overflow fails before the first mutation", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-sos-light-v3-cache-capacity-"));
+function makeSemanticCacheCapacityFixture({ partCount, partByteSize = 1 }) {
   const dayPrefix = `history/v3/observations/day_utc=${DAY_UTC}`;
-  const partKeys = Array.from({ length: 33 }, (_, index) =>
+  const partKeys = Array.from({ length: partCount }, (_, index) =>
     `${dayPrefix}/connector_id=1/pollutant_code=${POLLUTANT_CODE}`
       + `/part-${String(index).padStart(5, "0")}.parquet`
   );
@@ -851,9 +867,9 @@ test("selected semantic cache overflow fails before the first mutation", async (
     `${dayPrefix}/connector_id=1/pollutant_code=${POLLUTANT_CODE}/manifest.json`;
   const connectorKey = `${dayPrefix}/connector_id=1/manifest.json`;
   const dayKey = `${dayPrefix}/manifest.json`;
-  const partObjects = partKeys.map((key, index) => ({
+  const partObjects = partKeys.map((key) => ({
     key,
-    body: Buffer.from(`selected-${index}`),
+    body: Buffer.alloc(partByteSize, "x"),
     entry: {
       dependencies: [],
       content_type: "application/vnd.apache.parquet",
@@ -885,37 +901,128 @@ test("selected semantic cache overflow fails before the first mutation", async (
       publication_stage: "observation_day_manifest",
     },
   }];
-  let remoteCallCount = 0;
   const identity = `day_utc=${DAY_UTC}/connector_id=1/pollutant_code=${POLLUTANT_CODE}`;
+  const proposal = {
+    objects,
+    prefixes: [{
+      prefix: dayPrefix,
+      entry: { stage: "sos_light_complete_day" },
+    }],
+  };
+  const runState = {
+    run_id: `sos-light-v3-cache-capacity-${partCount}-${partByteSize}`,
+    execution_path: "sos_light",
+    sos_light: { days: [{ day_utc: DAY_UTC }] },
+    source_evidence_partitions: { [identity]: {} },
+  };
+  return {
+    dayPrefix,
+    partKeys,
+    proposal,
+    publicationPartitions: partitionFrozenSosLightV3PublicationGraph({
+      proposal,
+      days: [DAY_UTC],
+    }),
+    runState,
+  };
+}
+
+test("fixed-v3 semantic cache accepts 43 selected parts and reports the complete peak", () => {
+  const fixture = makeSemanticCacheCapacityFixture({ partCount: 43 });
+  const capacity = validateSosLightV3SemanticCacheCapacity({
+    publicationPartitions: fixture.publicationPartitions,
+    proposal: fixture.proposal,
+    runState: fixture.runState,
+    days: [DAY_UTC],
+  });
+  assert.equal(capacity.selected_parquet_keys.size, 43);
+  assert.deepEqual(capacity.semantic_verification_cache_capacity, {
+    required_peak_entries: 43,
+    required_peak_bytes: 43,
+    configured_max_entries: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_ENTRIES,
+    configured_max_bytes: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES,
+    peak_entries_day_utc: DAY_UTC,
+    peak_entries_trigger_object_key: fixture.partKeys[42],
+    peak_bytes_day_utc: DAY_UTC,
+    peak_bytes_trigger_object_key: fixture.partKeys[42],
+  });
+});
+
+async function assertSemanticCapacityFailureBeforeMutation({ fixture, expected }) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-sos-light-v3-cache-capacity-"));
+  const runStatePath = path.join(root, "run-state.json");
+  let remoteCallCount = 0;
   try {
-    await assert.rejects(runPersistedSosLightV3Apply({
-      runStatePath: path.join(root, "run-state.json"),
-      runState: {
-        run_id: "sos-light-v3-cache-capacity",
-        execution_path: "sos_light",
-        sos_light: { days: [{ day_utc: DAY_UTC }] },
-        source_evidence_partitions: { [identity]: {} },
-      },
-      proposal: {
-        objects,
-        prefixes: [{
-          prefix: dayPrefix,
-          entry: { stage: "sos_light_complete_day" },
-        }],
-      },
-      r2: {},
-      adapters: Object.fromEntries([
-        "getObject", "putObject", "putAndVerifyParquet", "listAllObjects", "deleteObjects",
-      ].map((name) => [name, async () => {
-        remoteCallCount += 1;
-        throw new Error(`unexpected ${name}`);
-      }])),
-    }), /selected semantic GET bodies exceed bounded cache.*entries=33\/32/);
+    let failure = null;
+    try {
+      await runPersistedSosLightV3Apply({
+        runStatePath,
+        runState: fixture.runState,
+        proposal: fixture.proposal,
+        r2: {},
+        adapters: Object.fromEntries([
+          "getObject", "putObject", "putAndVerifyParquet", "listAllObjects", "deleteObjects",
+        ].map((name) => [name, async () => {
+          remoteCallCount += 1;
+          throw new Error(`unexpected ${name}`);
+        }])),
+      });
+    } catch (error) {
+      failure = error;
+    }
+    assert(failure instanceof Error);
+    assert.match(failure.message, /selected semantic GET bodies exceed bounded cache/);
+    assert.deepEqual(failure.semantic_verification_cache_capacity, expected);
     assert.equal(remoteCallCount, 0);
-    assert.equal(fs.existsSync(path.join(root, "run-state.json")), false);
+    const persisted = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+    assert.equal(persisted.apply, undefined, "capacity failure must not begin APPLY");
+    assert.equal(persisted.pre_apply_failure.phase, "semantic_verification_cache_capacity");
+    assert.deepEqual(persisted.semantic_verification_cache_capacity, expected);
+    assert.deepEqual(
+      persisted.pre_apply_failure.semantic_verification_cache_capacity,
+      expected,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+}
+
+test("fixed-v3 semantic cache rejects more than 1024 retained bodies before mutation", async () => {
+  const fixture = makeSemanticCacheCapacityFixture({ partCount: 1025 });
+  await assertSemanticCapacityFailureBeforeMutation({
+    fixture,
+    expected: {
+      required_peak_entries: 1025,
+      required_peak_bytes: 1025,
+      configured_max_entries: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_ENTRIES,
+      configured_max_bytes: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES,
+      peak_entries_day_utc: DAY_UTC,
+      peak_entries_trigger_object_key: fixture.partKeys[1024],
+      peak_bytes_day_utc: DAY_UTC,
+      peak_bytes_trigger_object_key: fixture.partKeys[1024],
+    },
+  });
+});
+
+test("fixed-v3 semantic cache rejects more than 64 MiB before mutation", async () => {
+  const requiredBytes = SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES + 1;
+  const fixture = makeSemanticCacheCapacityFixture({
+    partCount: 1,
+    partByteSize: requiredBytes,
+  });
+  await assertSemanticCapacityFailureBeforeMutation({
+    fixture,
+    expected: {
+      required_peak_entries: 1,
+      required_peak_bytes: requiredBytes,
+      configured_max_entries: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_ENTRIES,
+      configured_max_bytes: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES,
+      peak_entries_day_utc: DAY_UTC,
+      peak_entries_trigger_object_key: fixture.partKeys[0],
+      peak_bytes_day_utc: DAY_UTC,
+      peak_bytes_trigger_object_key: fixture.partKeys[0],
+    },
+  });
 });
 
 test("fixed-v3 scheduler releases each selected pollutant partition before independent Parquet work", () => {
@@ -1106,6 +1213,18 @@ test("canonical root failure blocks global latest publication", async () => {
       },
     }), /simulated canonical root failure/);
     assert.deepEqual(attempted, [canonicalKey, rootKey]);
+    const persisted = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+    assert.equal(persisted.apply.status, "failed");
+    assert.deepEqual(persisted.apply.semantic_verification_cache_capacity, {
+      required_peak_entries: 0,
+      required_peak_bytes: 0,
+      configured_max_entries: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_ENTRIES,
+      configured_max_bytes: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES,
+      peak_entries_day_utc: null,
+      peak_entries_trigger_object_key: null,
+      peak_bytes_day_utc: null,
+      peak_bytes_trigger_object_key: null,
+    });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

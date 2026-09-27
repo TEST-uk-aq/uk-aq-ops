@@ -6,6 +6,7 @@ import {
   createApplyPersistence,
   createInitialApplyProgressState,
   VERIFIED_GET_CACHE_MAX_BYTES,
+  VERIFIED_GET_CACHE_MAX_ENTRIES,
   verifyLiveObservationPartition,
 } from "../uk_aq_apply_integrity_proposal.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
@@ -16,14 +17,6 @@ import {
 
 export const SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT =
   "sos-light-v3-apply-persistence-v1";
-export const SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_ENTRIES = 1024;
-export const SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES =
-  VERIFIED_GET_CACHE_MAX_BYTES;
-
-const SOS_LIGHT_V3_SEMANTIC_CACHE_CAPACITY = Object.freeze({
-  max_entries: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_ENTRIES,
-  max_bytes: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES,
-});
 
 function atomicWriteJson(filePath, value) {
   const target = path.resolve(filePath);
@@ -257,12 +250,6 @@ export function validateSosLightV3SemanticCacheCapacity({
   const selectedDays = new Set(days);
   const manifestParts = new Map();
   const selectedParquetKeys = new Set();
-  let requiredPeakEntries = 0;
-  let requiredPeakBytes = 0;
-  let peakEntriesDayUtc = null;
-  let peakEntriesTriggerObjectKey = null;
-  let peakBytesDayUtc = null;
-  let peakBytesTriggerObjectKey = null;
   for (const identity of Object.keys(runState.source_evidence_partitions || {}).sort()) {
     const match = identity.match(
       /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/,
@@ -310,15 +297,13 @@ export function validateSosLightV3SemanticCacheCapacity({
         const bytes = exactBody(object.body, object.key).byteLength;
         retained.set(object.key, bytes);
         retainedBytes += bytes;
-        if (retained.size > requiredPeakEntries) {
-          requiredPeakEntries = retained.size;
-          peakEntriesDayUtc = day;
-          peakEntriesTriggerObjectKey = object.key;
-        }
-        if (retainedBytes > requiredPeakBytes) {
-          requiredPeakBytes = retainedBytes;
-          peakBytesDayUtc = day;
-          peakBytesTriggerObjectKey = object.key;
+        if (retained.size > VERIFIED_GET_CACHE_MAX_ENTRIES
+            || retainedBytes > VERIFIED_GET_CACHE_MAX_BYTES) {
+          throw new Error(
+            `SOS-light-v3 selected semantic GET bodies exceed bounded cache before verification: `
+            + `day=${day} entries=${retained.size}/${VERIFIED_GET_CACHE_MAX_ENTRIES} `
+            + `bytes=${retainedBytes}/${VERIFIED_GET_CACHE_MAX_BYTES}`,
+          );
         }
       }
       const partKeys = manifestParts.get(object.key);
@@ -340,30 +325,7 @@ export function validateSosLightV3SemanticCacheCapacity({
       );
     }
   }
-  const capacity = Object.freeze({
-    required_peak_entries: requiredPeakEntries,
-    required_peak_bytes: requiredPeakBytes,
-    configured_max_entries: SOS_LIGHT_V3_SEMANTIC_CACHE_CAPACITY.max_entries,
-    configured_max_bytes: SOS_LIGHT_V3_SEMANTIC_CACHE_CAPACITY.max_bytes,
-    peak_entries_day_utc: peakEntriesDayUtc,
-    peak_entries_trigger_object_key: peakEntriesTriggerObjectKey,
-    peak_bytes_day_utc: peakBytesDayUtc,
-    peak_bytes_trigger_object_key: peakBytesTriggerObjectKey,
-  });
-  if (requiredPeakEntries > capacity.configured_max_entries
-      || requiredPeakBytes > capacity.configured_max_bytes) {
-    const error = new Error(
-      `SOS-light-v3 selected semantic GET bodies exceed bounded cache before verification: `
-      + `required_peak_entries=${requiredPeakEntries}/${capacity.configured_max_entries} `
-      + `required_peak_bytes=${requiredPeakBytes}/${capacity.configured_max_bytes}`,
-    );
-    error.semantic_verification_cache_capacity = capacity;
-    throw error;
-  }
-  return Object.freeze({
-    selected_parquet_keys: selectedParquetKeys,
-    semantic_verification_cache_capacity: capacity,
-  });
+  return Object.freeze({ selected_parquet_keys: selectedParquetKeys });
 }
 
 export async function runPersistedSosLightV3Apply({
@@ -397,34 +359,12 @@ export async function runPersistedSosLightV3Apply({
     proposal,
     days,
   });
-  let semanticCachePlan;
-  try {
-    semanticCachePlan = validateSosLightV3SemanticCacheCapacity({
-      publicationPartitions,
-      proposal,
-      runState,
-      days,
-    });
-  } catch (error) {
-    const capacity = error?.semantic_verification_cache_capacity;
-    if (capacity) {
-      const message = error instanceof Error ? error.message : String(error);
-      runState.semantic_verification_cache_capacity = capacity;
-      runState.pre_apply_failure = {
-        status: "failed",
-        phase: "semantic_verification_cache_capacity",
-        error: message,
-        failed_at_utc: new Date().toISOString(),
-        semantic_verification_cache_capacity: capacity,
-      };
-      atomicWriteJson(runStatePath, runState);
-    }
-    throw error;
-  }
-  const semanticVerificationCacheCapacity =
-    semanticCachePlan.semantic_verification_cache_capacity;
-  runState.semantic_verification_cache_capacity =
-    semanticVerificationCacheCapacity;
+  const semanticCachePlan = validateSosLightV3SemanticCacheCapacity({
+    publicationPartitions,
+    proposal,
+    runState,
+    days,
+  });
   const counts = {
     planned_deletions: proposal.prefixes.length,
     planned_writes: proposal.objects.length,
@@ -455,8 +395,6 @@ export async function runPersistedSosLightV3Apply({
     final_proposal_graph_validation: "succeeded",
     canonical_v3_writer_invoked: false,
     frozen_proposal_apply: true,
-    semantic_verification_cache_capacity:
-      semanticVerificationCacheCapacity,
     v3_publication_evidence: [],
     ...counts,
   };
@@ -493,10 +431,7 @@ export async function runPersistedSosLightV3Apply({
   }
 
   const publicationEvidence = [];
-  const verifiedBodyCache = createVerifiedGetBodyCache({
-    maxEntries: semanticVerificationCacheCapacity.configured_max_entries,
-    maxBytes: semanticVerificationCacheCapacity.configured_max_bytes,
-  });
+  const verifiedBodyCache = createVerifiedGetBodyCache();
   const pendingByKey = new Map();
   let nextOperationId = 1;
   let currentOperation = null;
