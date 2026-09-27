@@ -17,7 +17,13 @@ import {
   computeObservationContentHash,
 } from "../workers/shared/uk_aq_observation_content_hash.mjs";
 import {
+  VERIFIED_GET_CACHE_MAX_BYTES,
+  VERIFIED_GET_CACHE_MAX_ENTRIES,
+} from "../scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs";
+import {
+  partitionFrozenSosLightV3PublicationGraph,
   runPersistedSosLightV3Apply,
+  validateSosLightV3SemanticCacheCapacity,
 } from "../scripts/backup_r2/lib/sos_light_v3_apply_persistence.mjs";
 
 const DAY_UTC = "2026-08-18";
@@ -910,6 +916,125 @@ test("selected semantic cache overflow fails before the first mutation", async (
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("fixed-v3 scheduler releases each selected pollutant partition before independent Parquet work", () => {
+  const dayPrefix = `history/v3/observations/day_utc=${DAY_UTC}`;
+  const partitionSizes = new Map([
+    ["no2", 18],
+    ["o3", 9],
+    ["pm10", 9],
+    ["pm25", 9],
+  ]);
+  const objects = [];
+  const manifestParts = new Map();
+  const manifestKeys = [];
+  const sourceEvidencePartitions = {};
+  for (const [pollutantCode, partCount] of partitionSizes) {
+    const prefix = `${dayPrefix}/connector_id=1/pollutant_code=${pollutantCode}`;
+    const partKeys = Array.from({ length: partCount }, (_, index) =>
+      `${prefix}/part-${String(index).padStart(5, "0")}.parquet`
+    );
+    for (const [index, key] of partKeys.entries()) {
+      objects.push({
+        key,
+        body: Buffer.from(`${pollutantCode}-${index}`),
+        entry: { dependencies: [], publication_stage: "observation_parquet" },
+      });
+    }
+    const manifestKey = `${prefix}/manifest.json`;
+    objects.push({
+      key: manifestKey,
+      body: Buffer.from(JSON.stringify({ parquet_object_keys: partKeys })),
+      entry: {
+        dependencies: partKeys,
+        publication_stage: "observation_pollutant_manifest",
+      },
+    });
+    manifestKeys.push(manifestKey);
+    manifestParts.set(manifestKey, partKeys);
+    sourceEvidencePartitions[
+      `day_utc=${DAY_UTC}/connector_id=1/pollutant_code=${pollutantCode}`
+    ] = {};
+  }
+  const connectorKey = `${dayPrefix}/connector_id=1/manifest.json`;
+  const dayKey = `${dayPrefix}/manifest.json`;
+  objects.push({
+    key: connectorKey,
+    body: Buffer.from("{}"),
+    entry: {
+      dependencies: manifestKeys,
+      publication_stage: "observation_connector_manifest",
+    },
+  }, {
+    key: dayKey,
+    body: Buffer.from("{}"),
+    entry: {
+      dependencies: [connectorKey],
+      publication_stage: "observation_day_manifest",
+    },
+  });
+  const proposal = { objects };
+  const legacyBreadthOrder = (input) => {
+    const remaining = new Map(input.map((object) => [object.key, object]));
+    const ordered = [];
+    while (remaining.size) {
+      const ready = [...remaining.values()].filter((object) =>
+        object.entry.dependencies.every((key) => !remaining.has(key))
+      ).sort((left, right) => left.key.localeCompare(right.key));
+      assert(ready.length > 0, "synthetic graph must be acyclic");
+      for (const object of ready) {
+        ordered.push(object);
+        remaining.delete(object.key);
+      }
+    }
+    return ordered;
+  };
+  const retainedPeak = (ordered) => {
+    const retained = new Set();
+    let peak = 0;
+    for (const object of ordered) {
+      if (object.key.endsWith(".parquet")) retained.add(object.key);
+      for (const key of manifestParts.get(object.key) || []) retained.delete(key);
+      peak = Math.max(peak, retained.size);
+    }
+    return peak;
+  };
+
+  const legacyOrdered = legacyBreadthOrder(objects);
+  const legacyPeak = retainedPeak(legacyOrdered);
+  assert.equal(legacyPeak, 45);
+  assert(legacyPeak > VERIFIED_GET_CACHE_MAX_ENTRIES);
+
+  const publicationPartitions = partitionFrozenSosLightV3PublicationGraph({
+    proposal,
+    days: [DAY_UTC],
+  });
+  const ordered = publicationPartitions.ordered_by_day.get(DAY_UTC);
+  const positions = new Map(ordered.map((object, index) => [object.key, index]));
+  for (const object of ordered) {
+    for (const dependency of object.entry.dependencies) {
+      assert(positions.get(dependency) < positions.get(object.key));
+    }
+  }
+  for (const [manifestKey, partKeys] of manifestParts) {
+    const finalPartPosition = Math.max(...partKeys.map((key) => positions.get(key)));
+    assert.equal(positions.get(manifestKey), finalPartPosition + 1);
+  }
+  assert.equal(ordered.at(-1).key, dayKey);
+  const correctedPeak = retainedPeak(ordered);
+  assert.equal(correctedPeak, 18);
+  assert(correctedPeak <= VERIFIED_GET_CACHE_MAX_ENTRIES);
+  assert.equal(VERIFIED_GET_CACHE_MAX_ENTRIES, 32);
+  assert.equal(VERIFIED_GET_CACHE_MAX_BYTES, 64 * 1024 * 1024);
+
+  const capacity = validateSosLightV3SemanticCacheCapacity({
+    publicationPartitions,
+    proposal,
+    runState: { source_evidence_partitions: sourceEvidencePartitions },
+    days: [DAY_UTC],
+  });
+  assert.equal(capacity.selected_parquet_keys.size, 45);
 });
 
 test("canonical root failure blocks global latest publication", async () => {

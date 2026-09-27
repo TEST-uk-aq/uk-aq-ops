@@ -150,10 +150,9 @@ function topologicalOrder(objects, availableDependencyKeys = new Set()) {
     if (!ready.length) {
       throw new Error("SOS-light-v3 frozen proposal has a publication dependency cycle");
     }
-    for (const object of ready) {
-      ordered.push(object);
-      remaining.delete(object.key);
-    }
+    const next = ready[0];
+    ordered.push(next);
+    remaining.delete(next.key);
   }
   return ordered;
 }
