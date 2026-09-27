@@ -24,9 +24,9 @@ set -euo pipefail
 # sidebar.js while a feature is false.
 COPY_SENSORS=false
 COPY_WHO_GUIDELINES=false
-COPY_WOOD_BURNING=true
-COPY_NAEI_DATA=true
-COPY_RESEARCH=true
+COPY_WOOD_BURNING=false
+COPY_NAEI_DATA=false
+COPY_RESEARCH=false
 
 WEBSITE_FEATURES=(sensors who_guidelines wood_burning naei_data research)
 
