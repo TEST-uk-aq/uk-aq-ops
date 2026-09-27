@@ -15,6 +15,7 @@ import {
   requireCoordinatorProposalFreeze,
   SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
   validateDedicatedSosHistoricalProposalV3,
+  validateLocalSosLightV3Proposal,
 } from "../lib/sos_light_v3_proposal_validation.mjs";
 
 test("fixed-v3 execution scope does not require retired AQI fields", () => {
@@ -51,6 +52,110 @@ test("fixed-v3 execution scope does not require retired AQI fields", () => {
   }));
   assert.equal(Object.hasOwn(runState, "aqi_policy"), false);
   assert.equal(Object.hasOwn(runState, "changed_scopes"), false);
+});
+
+function fixedV3LocalProposalState(indexKey) {
+  const dayUtc = "2025-01-15";
+  const runRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v3-key-allowlist-"));
+  const overlayRoot = path.join(runRoot, "overlay");
+  const keys = [
+    `history/v3/observations/day_utc=${dayUtc}/manifest.json`,
+    `history/v3/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`,
+    indexKey,
+  ];
+  const objects = {};
+  for (const key of keys) {
+    const body = Buffer.from("{}\n");
+    const localPath = path.join(overlayRoot, ...key.split("/"));
+    fs.mkdirSync(path.dirname(localPath), { recursive: true });
+    fs.writeFileSync(localPath, body);
+    objects[key] = {
+      local_path: localPath,
+      proposed: true,
+      built: true,
+      structurally_validated: true,
+      bytes: body.byteLength,
+      sha256: sha256Hex(body),
+      dependencies: [],
+      dependency_identities: {},
+    };
+  }
+  const runState = {
+    run_root: runRoot,
+    overlay_root: overlayRoot,
+    execution_path: "sos_light",
+    mode: "sos-light",
+    environment: "TEST",
+    mutation_connector_ids: [1],
+    selected_mutation_connector_ids: [1],
+    protected_connector_ids: [1],
+    sos_light: {
+      mode: "sos-light",
+      validation_status: "complete_local_days_validated",
+      old_live_r2_observation_bodies_used: false,
+      no_old_live_r2_body_planning_or_preservation: true,
+      days: [{ day_utc: dayUtc }],
+    },
+    objects,
+    tombstone_prefixes: [{
+      prefix: `history/v3/observations/day_utc=${dayUtc}`,
+      proposed: true,
+      stage: "sos_light_complete_day",
+    }],
+    proposal_transition_planner_unchanged_keys: [],
+    proposal_ingestion: {
+      status: "complete",
+      transport_mode: "file_backed_compact_proposal",
+      completed_object_count: keys.length,
+      total_object_count: keys.length,
+      node_apply_launch_permitted: false,
+    },
+    final_staged_write_set_provenance: {
+      status: "finalised",
+      final_staged_object_count: keys.length,
+      forced_republication_count: 0,
+      forced_republication_keys: [],
+      promotion_reason_counts: {},
+      rebuilt_dependency_identity_count: 0,
+      staged_dependency_edge_count: 0,
+      external_dependency_edge_counts: {},
+    },
+    proposal_transition_validation: {
+      status: "succeeded",
+      node_apply_launch_permitted: true,
+      state_fingerprint_contract_version:
+        SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+    },
+  };
+  runState.proposal_transition_validation.state_fingerprint_sha256 =
+    computeCoordinatorTransitionStateFingerprint(runState);
+  return { runRoot, runState };
+}
+
+test("fixed-v3 local APPLY validation rejects unknown index families before mutation", () => {
+  const valid = fixedV3LocalProposalState(
+    "history/_index_v3/observations_timeseries/day_utc=2025-01-15/connector_id=1/pollutant_code=no2/timeseries_id=000000123.json",
+  );
+  try {
+    assert.doesNotThrow(() => validateLocalSosLightV3Proposal(valid.runState));
+  } finally {
+    fs.rmSync(valid.runRoot, { recursive: true, force: true });
+  }
+
+  for (const invalidKey of [
+    "history/_index_v3/not_an_observation_index/manifest.json",
+    "history/_index_v3/aqilevels_timeseries/manifest.json",
+  ]) {
+    const invalid = fixedV3LocalProposalState(invalidKey);
+    try {
+      assert.throws(
+        () => validateLocalSosLightV3Proposal(invalid.runState),
+        /Non-observation history is outside the Integrity proposal contract/,
+      );
+    } finally {
+      fs.rmSync(invalid.runRoot, { recursive: true, force: true });
+    }
+  }
 });
 
 function proposal(key, body, overrides = {}) {

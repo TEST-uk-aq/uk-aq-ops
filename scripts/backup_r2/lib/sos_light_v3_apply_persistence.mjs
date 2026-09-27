@@ -10,6 +10,10 @@ import {
   verifyLiveObservationPartition,
 } from "../uk_aq_apply_integrity_proposal.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
+import {
+  isObservationHistoryIntegrityIndexKey,
+  requireObservationHistoryIntegrityKey,
+} from "./observation_history_integrity_key_allowlist.mjs";
 
 export const SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT =
   "sos-light-v3-apply-persistence-v1";
@@ -85,6 +89,7 @@ function mutationContext(keyOrPrefix, stage = null) {
 }
 
 function publicationStage(key, supplied = null) {
+  const classification = requireObservationHistoryIntegrityKey(key, { generation: "v3" });
   const configured = String(supplied || "").trim();
   if (configured) return configured;
   if (key.endsWith(".parquet")) return "observation_parquet";
@@ -97,10 +102,10 @@ function publicationStage(key, supplied = null) {
   if (/\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key)) {
     return "observation_day_manifest";
   }
-  if (key === "history/_index_v3/observations_timeseries_latest.json") {
+  if (classification.kind === "observation_latest_index") {
     return "observation_latest_index";
   }
-  if (key.startsWith("history/_index_v3/")) return "observation_index";
+  if (classification.family === "observations_timeseries") return "observation_index";
   if (key.startsWith("history/v3/observations/")) {
     return "observation_aggregate_manifest";
   }
@@ -160,6 +165,7 @@ export function partitionFrozenSosLightV3PublicationGraph({ proposal, days }) {
   const allKeys = new Set();
   for (const object of proposal?.objects || []) {
     const key = normalizedKey(object?.key);
+    requireObservationHistoryIntegrityKey(key, { generation: "v3" });
     if (allKeys.has(key)) {
       throw new Error(`SOS-light-v3 frozen proposal has duplicate object key: ${key}`);
     }
@@ -175,7 +181,7 @@ export function partitionFrozenSosLightV3PublicationGraph({ proposal, days }) {
       continue;
     }
     if (key.startsWith("history/v3/observations/_manifests/")
-        || key.startsWith("history/_index_v3/")) {
+        || isObservationHistoryIntegrityIndexKey(key, { generation: "v3" })) {
       sharedTail.push(object);
       continue;
     }

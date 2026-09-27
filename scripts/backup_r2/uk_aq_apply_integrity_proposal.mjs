@@ -47,6 +47,13 @@ import {
 import {
   validateIntegrityCoreSnapshotIdentity,
 } from "./lib/uk_aq_integrity_core_snapshot_identity.mjs";
+import {
+  classifyObservationHistoryIntegrityKey,
+  isObservationHistoryIntegrityIndexKey,
+  isVersionedHistoryIntegrityNamespaceKey,
+  isVersionedHistoryIndexNamespaceKey,
+  requireObservationHistoryIntegrityKey,
+} from "./lib/observation_history_integrity_key_allowlist.mjs";
 
 function parseArgs(argv) {
   const args = { runStateJson: "", writeR2: false };
@@ -115,21 +122,22 @@ function contentTypeForKey(key) {
 }
 
 function objectDomain(key) {
-  if (!/^history\/v[23]\/observations(?:\/|$)/.test(key)
-    && !/^history\/_index_v[23]\//.test(key)) {
-    throw new Error(`Non-observation history is outside the Integrity proposal contract: ${key}`);
-  }
-  return "observations";
+  return requireObservationHistoryIntegrityKey(key).domain;
 }
 
 export function publicationRank(key) {
   const value = String(key || "");
-  if (/^history\/v2\/observations\/.+\.parquet$/.test(value)) return 10;
-  if (/^history\/v2\/observations\/.+\/pollutant_code=[^/]+\/manifest\.json$/.test(value)) return 20;
-  if (/^history\/v2\/observations\/.+\/connector_id=\d+\/manifest\.json$/.test(value)) return 30;
-  if (/^history\/_index_v2\/observations_.+/.test(value)) return 40;
-  if (/^history\/v2\/observations\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 50;
-  if (value.includes("latest") || value.startsWith("history/_index_v2/")) return 70;
+  const classification = classifyObservationHistoryIntegrityKey(value);
+  if (isVersionedHistoryIndexNamespaceKey(value) && !classification) {
+    requireObservationHistoryIntegrityKey(value);
+  }
+  if (/^history\/v[23]\/observations\/.+\.parquet$/.test(value)) return 10;
+  if (/^history\/v[23]\/observations\/.+\/pollutant_code=[^/]+\/manifest\.json$/.test(value)) return 20;
+  if (/^history\/v[23]\/observations\/.+\/connector_id=\d+\/manifest\.json$/.test(value)) return 30;
+  if (classification?.family === "observations_timeseries"
+      && classification.kind !== "observation_latest_index") return 40;
+  if (/^history\/v[23]\/observations\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 50;
+  if (classification?.kind === "observation_latest_index" || value.includes("latest")) return 70;
   return 60;
 }
 
@@ -169,7 +177,7 @@ function publicationStageRank(stage) {
 function scheduleScope(object, selectedDays, publicationMode) {
   if (publicationMode === "generic") {
     if (objectPublicationStage(object) === "latest_snapshot") return [3, 0, 0];
-    if (object.key.startsWith("history/_index_v2/")) return [2, 0, 0];
+    if (isObservationHistoryIntegrityIndexKey(object.key)) return [2, 0, 0];
     const context = mutationContext(object.key);
     const dayIndex = context.day_utc ? selectedDays.indexOf(context.day_utc) : -1;
     if (dayIndex < 0) return [2, 0, 0];
@@ -177,7 +185,7 @@ function scheduleScope(object, selectedDays, publicationMode) {
     return [1, dayIndex, 0];
   }
   if (objectPublicationStage(object) === "latest_snapshot") return [selectedDays.length, 3, 0];
-  if (object.key.startsWith("history/_index_v2/")) return [selectedDays.length, 2, 0];
+  if (isObservationHistoryIntegrityIndexKey(object.key)) return [selectedDays.length, 2, 0];
   const context = mutationContext(object.key);
   const dayUtc = context.day_utc;
   const dayIndex = dayUtc ? selectedDays.indexOf(dayUtc) : -1;
@@ -233,6 +241,11 @@ export function buildFrozenPublicationSchedule({
     throw new Error(`Unsupported publication schedule mode: ${publicationMode}`);
   }
   const objects = proposal?.objects || [];
+  for (const object of objects) {
+    if (isVersionedHistoryIntegrityNamespaceKey(object?.key)) {
+      requireObservationHistoryIntegrityKey(object.key);
+    }
+  }
   const byKey = new Map(objects.map((object) => [object.key, object]));
   if (byKey.size !== objects.length) throw new Error("Publication schedule contains duplicate object keys");
   const dayOrder = [...new Set(selectedDays)].sort();
@@ -245,6 +258,9 @@ export function buildFrozenPublicationSchedule({
     const canonicalIdentities = canonicalDependencyIdentities(object.entry);
     const dependencies = canonicalIdentities.map((identity) => identity.key);
     for (const dependencyKey of dependencies) {
+      if (isVersionedHistoryIntegrityNamespaceKey(dependencyKey)) {
+        requireObservationHistoryIntegrityKey(dependencyKey);
+      }
       const dependency = byKey.get(dependencyKey);
       const identity = dependencyIdentity(object.entry, dependencyKey);
       if (!dependency) {
@@ -1143,6 +1159,9 @@ export function validateExternalDependencyRoot({
   identity,
 }) {
   const key = safeKey(dependencyKey);
+  if (isVersionedHistoryIntegrityNamespaceKey(key)) {
+    requireObservationHistoryIntegrityKey(key);
+  }
   if (!identity || !["dropbox", "overlay"].includes(identity.source)) {
     throw new Error(`Changed publication dependency is missing from write set: ${objectKey} -> ${key}`);
   }
@@ -1185,8 +1204,13 @@ export function validateLocalProposal(runState) {
   const normalizedObjects = [];
   for (const [rawKey, entry] of objects) {
     const key = safeKey(rawKey);
-    if (!(key.startsWith("history/v2/") || key.startsWith("history/_index_v2/"))
-      || /\/(?:generation(?:=)|transactions\/)/.test(`/${key}`)) {
+    let classification;
+    try {
+      classification = requireObservationHistoryIntegrityKey(key, { generation: "v2" });
+    } catch {
+      throw new Error(`Non-observation history is outside the Integrity proposal contract: ${key}`);
+    }
+    if (/\/(?:generation(?:=)|transactions\/)/.test(`/${key}`)) {
       throw new Error(`Non-canonical Integrity proposal key: ${key}`);
     }
     if (!entry?.proposed || !entry?.built || !entry?.structurally_validated) {
@@ -1224,7 +1248,7 @@ export function validateLocalProposal(runState) {
         });
       }
     }
-    normalizedObjects.push({ key, entry, localPath, body, domain: objectDomain(key) });
+    normalizedObjects.push({ key, entry, localPath, body, domain: classification.domain });
   }
   const normalizedPrefixes = prefixes.map((entry) => {
     const prefix = safeKey(entry?.prefix).replace(/\/+$/, "");
@@ -1875,7 +1899,8 @@ function parseManifestObject(object, expectedKind) {
 function validateFinalParentReferences({ proposal, runState }) {
   const objects = new Map(proposal.objects.map((object) => [object.key, object]));
   for (const object of proposal.objects) {
-    if (!object.key.endsWith("/manifest.json") || object.key.startsWith("history/_index_v2/")) continue;
+    if (!object.key.endsWith("/manifest.json")
+        || isObservationHistoryIntegrityIndexKey(object.key)) continue;
     const expectedParentKind = /\/connector_id=\d+\/manifest\.json$/.test(object.key)
       ? "connector"
       : /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(object.key)
@@ -1956,9 +1981,11 @@ function validateFinalParentReferences({ proposal, runState }) {
       }
     }
   }
-  for (const object of proposal.objects.filter((candidate) => candidate.key.startsWith("history/_index_v2/")
-    && candidate.key.includes("/day_utc=") && candidate.key.includes("/connector_id=")
-    && candidate.key.includes("/pollutant_code="))) {
+  for (const object of proposal.objects.filter((candidate) => {
+    const classification = classifyObservationHistoryIntegrityKey(candidate.key);
+    return classification?.generation === "v2"
+      && classification.kind === "observation_scoped_index";
+  })) {
     const observation = object.key.match(/^history\/_index_v2\/observations_timeseries\/day_utc=([^/]+)\/connector_id=([^/]+)\/pollutant_code=([^/]+)\/manifest\.json$/);
     if (!observation) continue;
     const manifestKey = `history/v2/observations/day_utc=${observation[1]}/connector_id=${observation[2]}/pollutant_code=${observation[3]}/manifest.json`;
@@ -2917,7 +2944,7 @@ export async function applyValidatedProposal({
     const dayGroups = new Map();
     const globalOperations = [];
     for (const operation of operations) {
-      if (operation.key.startsWith("history/_index_v2/")) {
+      if (isObservationHistoryIntegrityIndexKey(operation.key)) {
         globalOperations.push(operation);
         continue;
       }

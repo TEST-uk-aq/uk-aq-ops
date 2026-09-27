@@ -5,11 +5,11 @@ import { createHash } from "node:crypto";
 import {
   loadImmutableSourcePartition,
 } from "../uk_aq_apply_integrity_proposal.mjs";
+import {
+  requireObservationHistoryIntegrityKey,
+} from "./observation_history_integrity_key_allowlist.mjs";
 
 const OBSERVATIONS_PREFIX = "history/v3/observations";
-const INDEX_PREFIX = "history/_index_v3";
-const V2_OBSERVATIONS_PREFIX = "history/v2/observations";
-const V2_INDEX_PREFIX = "history/_index_v2";
 const DAY_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
 const EXACT_SCOPE_PREFIX = /^history\/_index_v3\/observations_timeseries\/(?:_aligned\/)?day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const POLLUTANT_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
@@ -375,10 +375,7 @@ export function validateLocalSosLightV3Proposal(runState) {
   requireCoordinatorProposalFreeze(runState);
   const objects = Object.entries(runState.objects || {}).map(([rawKey, entry]) => {
     const key = safeKey(rawKey);
-    if (key.startsWith(V2_OBSERVATIONS_PREFIX) || key.startsWith(V2_INDEX_PREFIX)
-        || !(key.startsWith(`${OBSERVATIONS_PREFIX}/`) || key.startsWith(`${INDEX_PREFIX}/`))) {
-      throw new Error(`Non-v3 SOS-light proposal key: ${key}`);
-    }
+    requireObservationHistoryIntegrityKey(key, { generation: "v3" });
     const loaded = localBody(runState, entry, key);
     validateDependencies(runState, key, entry);
     return { key, entry, ...loaded, domain: "observations" };

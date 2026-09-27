@@ -55,6 +55,9 @@ import {
   r2PutObjectIfChanged,
   updateR2HistoryIndexesTargeted,
 } from "../../../workers/shared/uk_aq_r2_history_index.mjs";
+import {
+  requireObservationHistoryIntegrityKey,
+} from "../lib/observation_history_integrity_key_allowlist.mjs";
 
 function writeObject(root, key, body) {
   const filePath = path.join(root, ...key.split("/"));
@@ -104,10 +107,77 @@ function graphObject(key, bodyValue, {
   };
 }
 
+function scopedV2IndexKey(label, { dayUtc = "2099-12-31", connectorId = 999 } = {}) {
+  const pollutant = `test_${String(label).toLowerCase().replace(/[^a-z0-9_]+/g, "_")}`;
+  return "history/_index_v2/observations_timeseries/"
+    + `day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutant}/manifest.json`;
+}
+
+test("Integrity observation-index allowlist accepts owned families and rejects unknown namespaces", () => {
+  const allowed = [
+    "history/_index_v2/observations_timeseries/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json",
+    "history/_index_v2/observations_timeseries_latest.json",
+    "history/_index_v3/observations_timeseries/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json",
+    "history/_index_v3/observations_timeseries/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/timeseries_id=000000123.json",
+    "history/_index_v3/observations_timeseries/_aligned/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/range=000000-000999.json",
+    "history/_index_v3/observations_timeseries_latest.json",
+  ];
+  for (const key of allowed) {
+    assert.doesNotThrow(() => requireObservationHistoryIntegrityKey(key));
+  }
+
+  const rejected = [
+    "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json",
+    "history/_index_v2/not_an_observation_index/day_utc=2026-06-17/manifest.json",
+    "history/_index_v3/not_an_observation_index/day_utc=2026-06-17/manifest.json",
+    "history/v2/anything_other_than_observations/day_utc=2026-06-17/manifest.json",
+    "history/v3/anything_other_than_observations/day_utc=2026-06-17/manifest.json",
+  ];
+  for (const key of rejected) {
+    assert.throws(
+      () => requireObservationHistoryIntegrityKey(key),
+      /Non-observation history is outside the Integrity proposal contract/,
+    );
+    const object = graphObject(key, { invalid: true });
+    assert.throws(
+      () => buildFrozenPublicationSchedule({ proposal: { objects: [object] } }),
+      /Non-observation history is outside the Integrity proposal contract/,
+    );
+  }
+});
+
+test("generic local APPLY validation accepts only the v2 observation-index allowlist", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-index-allowlist-"));
+  try {
+    const validKey = scopedV2IndexKey("allowlist");
+    const validPath = writeObject(root, validKey, Buffer.from("{}\n"));
+    const validEntry = stateEntry(validPath, validKey);
+    assert.doesNotThrow(() => validateLocalProposal({
+      objects: { [validKey]: validEntry },
+      tombstone_prefixes: [],
+    }));
+
+    for (const invalidKey of [
+      "history/_index_v2/aqilevels_hourly_data_timeseries/manifest.json",
+      "history/_index_v2/not_an_observation_index/manifest.json",
+    ]) {
+      assert.throws(
+        () => validateLocalProposal({
+          objects: { [invalidKey]: validEntry },
+          tombstone_prefixes: [],
+        }),
+        /Non-observation history is outside the Integrity proposal contract/,
+      );
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("frozen publication schedule topologically reverses parent-first input and uses bytewise eligible ties", () => {
-  const childKey = "history/_index_v2/z-child.json";
-  const siblingKey = "history/_index_v2/a-independent.json";
-  const parentKey = "history/_index_v2/parent.json";
+  const childKey = scopedV2IndexKey("z_child");
+  const siblingKey = scopedV2IndexKey("a_independent");
+  const parentKey = scopedV2IndexKey("parent");
   const child = graphObject(childKey, { leaf: true });
   const sibling = graphObject(siblingKey, { leaf: true });
   const parent = graphObject(parentKey, { day_summaries: [{ day_utc: "2026-07-01" }] }, {
@@ -130,7 +200,7 @@ test("frozen publication schedule accepts pinned external roots and rejects inco
   const externalKey = "history/v2/observations/day_utc=2026-07-01/connector_id=1/pollutant_code=pm25/manifest.json";
   const externalBody = Buffer.from("pinned external body");
   writeObject(dropbox, externalKey, externalBody);
-  const parent = graphObject("history/_index_v2/scoped.json", { pollutant_manifest_key: externalKey }, {
+  const parent = graphObject(scopedV2IndexKey("scoped"), { pollutant_manifest_key: externalKey }, {
     dependencies: [externalKey],
     dependencyIdentities: {
       [externalKey]: { source: "dropbox", sha256: sha256Hex(externalBody), bytes: externalBody.byteLength },
@@ -176,8 +246,8 @@ test("frozen publication schedule accepts pinned external roots and rejects inco
 });
 
 test("frozen publication schedule rejects cycles and publication-stage conflicts", () => {
-  const a = graphObject("history/_index_v2/a.json", { leaf: true });
-  const b = graphObject("history/_index_v2/b.json", { leaf: true });
+  const a = graphObject(scopedV2IndexKey("a"), { leaf: true });
+  const b = graphObject(scopedV2IndexKey("b"), { leaf: true });
   a.entry.dependencies = [b.key];
   a.entry.dependency_identities = { [b.key]: { source: "planned_overlay", sha256: b.entry.sha256, bytes: b.entry.bytes } };
   b.entry.dependencies = [a.key];
@@ -187,8 +257,8 @@ test("frozen publication schedule rejects cycles and publication-stage conflicts
     /dependency cycle/,
   );
 
-  const late = graphObject("history/_index_v2/late.json", { leaf: true }, { stage: "latest_snapshot" });
-  const early = graphObject("history/_index_v2/early.json", { leaf: true }, {
+  const late = graphObject(scopedV2IndexKey("late"), { leaf: true }, { stage: "latest_snapshot" });
+  const early = graphObject(scopedV2IndexKey("early"), { leaf: true }, {
     dependencies: [late.key],
     dependencyIdentities: { [late.key]: { source: "planned_overlay", sha256: late.entry.sha256, bytes: late.entry.bytes } },
     stage: "scoped_timeseries_index",
@@ -203,7 +273,7 @@ test("frozen publication schedule preserves day barriers and places a changed la
   const day1Child = graphObject("history/v2/observations/day_utc=2026-07-01/connector_id=1/a.parquet", { leaf: 1 }, { stage: "observations_data" });
   const day1Parent = graphObject("history/v2/observations/day_utc=2026-07-01/manifest.json", { leaf: 1 }, { stage: "day_parent" });
   const day2Child = graphObject("history/v2/observations/day_utc=2026-07-02/connector_id=1/a.parquet", { leaf: 2 }, { stage: "observations_data" });
-  const globalIndex = graphObject("history/_index_v2/global.json", { leaf: 3 });
+  const globalIndex = graphObject("history/_index_v2/observations_timeseries_latest.json", { leaf: 3 });
   const snapshot = graphObject("latest_snapshots/v2/manifest.json", { leaf: 4 }, { stage: "latest_snapshot" });
   const schedule = buildFrozenPublicationSchedule({
     proposal: { objects: [snapshot, day2Child, globalIndex, day1Parent, day1Child] },
@@ -335,8 +405,8 @@ test("SOS-light complete publication schedule retains required unchanged objects
 
 test("frozen execution rejects every dependency identity tamper", async (t) => {
   const makeFixture = () => {
-    const child = graphObject("history/_index_v2/identity-child.json", { child: true });
-    const parent = graphObject("history/_index_v2/identity-parent.json", { parent: true }, {
+    const child = graphObject(scopedV2IndexKey("identity_child"), { child: true });
+    const parent = graphObject(scopedV2IndexKey("identity_parent"), { parent: true }, {
       dependencies: [child.key],
       dependencyIdentities: {
         [child.key]: {
@@ -380,8 +450,8 @@ test("frozen execution rejects every dependency identity tamper", async (t) => {
 });
 
 test("generated-index callback cannot spoof frozen dependency identities", async () => {
-  const child = graphObject("history/_index_v2/callback-child.json", { child: true });
-  const parent = graphObject("history/_index_v2/callback-parent.json", { parent: true }, {
+  const child = graphObject(scopedV2IndexKey("callback_child"), { child: true });
+  const parent = graphObject(scopedV2IndexKey("callback_parent"), { parent: true }, {
     dependencies: [child.key],
     dependencyIdentities: {
       [child.key]: { sha256: child.entry.sha256, bytes: child.entry.bytes, source: "planned_overlay" },
@@ -850,7 +920,7 @@ async function genericTwoDayApplyFixture({ externalOverlay = false } = {}) {
     connectorId: 1,
     pollutantManifestKey: second.manifestKey,
   });
-  const globalKey = "history/_index_v2/review-global-parent.json";
+  const globalKey = "history/_index_v2/observations_timeseries_latest.json";
   const globalBody = Buffer.from(JSON.stringify({ complete_days: ["2026-06-17", "2026-06-18"] }));
   const globalPath = writeObject(fixture.runState.overlay_root, globalKey, globalBody);
   const globalDependencies = [firstParents.dayKey, secondParents.dayKey];
@@ -861,7 +931,10 @@ async function genericTwoDayApplyFixture({ externalOverlay = false } = {}) {
   }]));
   let externalKey = null;
   if (externalOverlay) {
-    externalKey = "history/_index_v2/unchanged-overlay-root.json";
+    externalKey = scopedV2IndexKey("unchanged_overlay_root", {
+      dayUtc: "2026-06-16",
+      connectorId: 1,
+    });
     const externalBody = Buffer.from('{"unchanged":true}\n');
     writeObject(fixture.runState.overlay_root, externalKey, externalBody);
     globalDependencies.push(externalKey);
@@ -1389,8 +1462,10 @@ test("publication order and dependencies prevent indexes preceding manifests", a
     "history/v2/observations/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json",
     "history/v2/observations/day_utc=2026-06-17/connector_id=1/manifest.json",
     "history/_index_v2/observations_timeseries/day_utc=2026-06-17/connector_id=1/pollutant_code=pm25/manifest.json",
+    "history/v2/observations/day_utc=2026-06-17/manifest.json",
+    "history/_index_v2/observations_timeseries_latest.json",
   ];
-  assert.deepEqual(keys.map(publicationRank), [10, 20, 30, 40]);
+  assert.deepEqual(keys.map(publicationRank), [10, 20, 30, 40, 50, 70]);
   const manifestKey = keys[1];
   const indexObject = { key: keys[3], entry: { dependencies: [manifestKey] } };
   const runState = { objects: { [manifestKey]: { proposed: true, structurally_validated: true, r2_verified: false } } };
@@ -2003,7 +2078,7 @@ test("multiple object transitions append detailed events without rewriting compl
   const runState = { objects: {}, apply: {} };
   const objects = [];
   for (let index = 0; index < 3; index += 1) {
-    const key = `history/_index_v2/object-${index}.json`;
+    const key = scopedV2IndexKey(`object_${index}`);
     const body = Buffer.from(JSON.stringify({ index }));
     const entry = { bytes: body.byteLength, sha256: sha256Hex(body), dependencies: [], dependency_identities: {} };
     runState.objects[key] = entry;
@@ -2051,7 +2126,7 @@ test("a failed scheduled PUT preserves the completed position and leaves later p
   });
   const runState = { objects: {}, apply: {} };
   const objects = [1, 2, 3].map((position) => {
-    const key = `history/_index_v2/boundary-${position}.json`;
+    const key = scopedV2IndexKey(`boundary_${position}`);
     const body = Buffer.from(JSON.stringify({ position }));
     const entry = { bytes: body.byteLength, sha256: sha256Hex(body), dependencies: [], dependency_identities: {} };
     runState.objects[key] = entry;
@@ -2123,8 +2198,8 @@ test("generic generated index writes use canonical persistence and unchanged ind
   let getCount = 0;
   const unchangedBody = "{}\n";
   const unchangedEtag = createHash("md5").update(unchangedBody).digest("hex");
-  const unchangedKey = "history/_index_v2/observations_timeseries/unchanged.json";
-  const changedKey = "history/_index_v2/observations_timeseries/changed.json";
+  const unchangedKey = scopedV2IndexKey("unchanged");
+  const changedKey = scopedV2IndexKey("changed");
   const changedBody = "{\"changed\":true}\n";
   const changedBuffer = Buffer.from(changedBody);
   const changedEntry = {
@@ -2166,7 +2241,7 @@ test("generic generated index writes use canonical persistence and unchanged ind
   });
   await assert.rejects(
     generatedR2.proposal_sink({
-      key: "history/_index_v2/unscheduled.json",
+      key: scopedV2IndexKey("unscheduled"),
       body: "{}\n",
       status: "planned",
     }),
