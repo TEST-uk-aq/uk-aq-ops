@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # Promote files from TEST UK-AQ repo clones to their LIVE counterparts using rsync.
 #
-# The website is the deliberate exception to the naming: TEST website promotes
-# to the LIVE beta website repo. Use beta_sync_to_live.sh for beta -> public LIVE.
-#
 # Dry-run is the default. Use --apply to write changes.
 #
 # Examples:
@@ -59,7 +56,7 @@ Repos:
   ingest
   ops
   schema
-  website             TEST website -> LIVE beta website (not public LIVE)
+  website
   pop-ingest
   integrity-factory
 
@@ -295,10 +292,6 @@ sync_repo() {
   echo "── ${label} ──────────────────────────────────────"
   echo "   src: ${src}"
   echo "   dst: ${dst}"
-  if [[ "${label}" == "website" ]]; then
-    echo "   WEBSITE ROUTE: TEST website -> LIVE BETA website (UK-AQ/beta-uk-aq)"
-    echo "   NOTE: this does not update the public LIVE website (ukaq.co.uk)."
-  fi
   echo
 
   if [[ ! -d "${src}" ]]; then
@@ -329,9 +322,8 @@ sync_repo() {
   case "${label}" in
     ops)
       rsync_args+=(
-        # Promotion tools belong in TEST, not LIVE.
+        # This promotion tool belongs in TEST, not LIVE.
         --exclude='sync_to_live.sh'
-        --exclude='beta_sync_to_live.sh'
 
         # Environment/local-machine owned files.
         --exclude='env-vars-master.csv'
@@ -430,12 +422,6 @@ fi
 
 echo " GitHub workflows: INCLUDED"
 echo " Repos: ${SELECTED_REPOS[*]}"
-for selected_repo in "${SELECTED_REPOS[@]}"; do
-  if [[ "${selected_repo}" == "website" ]]; then
-    echo " Website destination: LIVE BETA website repo (UK-AQ/beta-uk-aq), not public LIVE."
-    break
-  fi
-done
 
 for repo in "${SELECTED_REPOS[@]}"; do
   sync_repo "${repo}"
