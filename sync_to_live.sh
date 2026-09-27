@@ -265,7 +265,7 @@ lines = text.splitlines(keepends=True)
 matches = [
     index
     for index, line in enumerate(lines)
-    if "WHO guidelines" in line and "href: '/who-guidelines/'" in line
+    if "href: '/who-guidelines/'" in line
 ]
 
 if len(matches) != 1:
