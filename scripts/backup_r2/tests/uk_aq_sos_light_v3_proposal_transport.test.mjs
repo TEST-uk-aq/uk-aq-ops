@@ -22,6 +22,39 @@ import {
   validateLocalSosLightV3Proposal,
 } from "../lib/sos_light_v3_proposal_validation.mjs";
 
+function connectorMembershipEvidence(dayUtc, connectorIds = [1]) {
+  const sortedConnectorIds = [...connectorIds].sort((left, right) => left - right);
+  return {
+    day_utc: dayUtc,
+    pinned_day_manifest_present: true,
+    pinned_day_manifest_key: `history/v3/observations/day_utc=${dayUtc}/manifest.json`,
+    pinned_day_manifest_hash: "a".repeat(64),
+    pinned_baseline_connector_ids: sortedConnectorIds,
+    expected_preserved_connector_ids: sortedConnectorIds.filter((connectorId) => connectorId !== 1),
+    expected_final_connector_ids: sortedConnectorIds.includes(1)
+      ? sortedConnectorIds
+      : [1, ...sortedConnectorIds].sort((left, right) => left - right),
+    final_assembled_connector_ids: sortedConnectorIds.includes(1)
+      ? sortedConnectorIds
+      : [1, ...sortedConnectorIds].sort((left, right) => left - right),
+  };
+}
+
+function finalDayManifestBody(dayUtc, connectorIds = [1]) {
+  const references = [...connectorIds]
+    .sort((left, right) => left - right)
+    .map((connectorId) => ({
+      connector_id: connectorId,
+      manifest_key:
+        `history/v3/observations/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
+    }));
+  return Buffer.from(JSON.stringify({
+    connector_ids: references.map(({ connector_id: connectorId }) => connectorId),
+    connector_manifests: references,
+    child_manifests: references,
+  }));
+}
+
 test("fixed-v3 execution scope does not require retired AQI fields", () => {
   const dayUtc = "2025-01-15";
   const runState = {
@@ -36,12 +69,15 @@ test("fixed-v3 execution scope does not require retired AQI fields", () => {
       validation_status: "complete_local_days_validated",
       old_live_r2_observation_bodies_used: false,
       no_old_live_r2_body_planning_or_preservation: true,
-      days: [{ day_utc: dayUtc }],
+      days: [connectorMembershipEvidence(dayUtc)],
     },
   };
   const proposal = {
     objects: [
-      { key: `history/v3/observations/day_utc=${dayUtc}/manifest.json` },
+      {
+        key: `history/v3/observations/day_utc=${dayUtc}/manifest.json`,
+        body: finalDayManifestBody(dayUtc),
+      },
       { key: `history/v3/observations/day_utc=${dayUtc}/connector_id=1/manifest.json` },
     ],
     prefixes: [{
@@ -58,6 +94,41 @@ test("fixed-v3 execution scope does not require retired AQI fields", () => {
   assert.equal(Object.hasOwn(runState, "changed_scopes"), false);
 });
 
+test("fixed-v3 rejects a final day that loses a frozen preserved connector", () => {
+  const dayUtc = "2025-01-15";
+  const root = `history/v3/observations/day_utc=${dayUtc}`;
+  const runState = {
+    execution_path: "sos_light",
+    mode: "sos-light",
+    environment: "TEST",
+    mutation_connector_ids: [1],
+    selected_mutation_connector_ids: [1],
+    protected_connector_ids: [1],
+    sos_light: {
+      mode: "sos-light",
+      validation_status: "complete_local_days_validated",
+      old_live_r2_observation_bodies_used: false,
+      no_old_live_r2_body_planning_or_preservation: true,
+      days: [connectorMembershipEvidence(dayUtc, [1, 8])],
+    },
+  };
+  const proposal = {
+    objects: [
+      { key: `${root}/manifest.json`, body: finalDayManifestBody(dayUtc, [1]) },
+      { key: `${root}/connector_id=1/manifest.json`, body: Buffer.from("{}") },
+    ],
+    prefixes: [{
+      prefix: root,
+      entry: { stage: "sos_light_complete_day" },
+    }],
+  };
+
+  assert.throws(
+    () => validateDedicatedSosHistoricalProposalV3({ runState, proposal }),
+    /lacks required connector 8|differs from pinned authority/,
+  );
+});
+
 function fixedV3LocalProposalState(indexKey) {
   const dayUtc = "2025-01-15";
   const runRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v3-key-allowlist-"));
@@ -69,7 +140,9 @@ function fixedV3LocalProposalState(indexKey) {
   ];
   const objects = {};
   for (const key of keys) {
-    const body = Buffer.from("{}\n");
+    const body = key === `history/v3/observations/day_utc=${dayUtc}/manifest.json`
+      ? finalDayManifestBody(dayUtc)
+      : Buffer.from("{}\n");
     const localPath = path.join(overlayRoot, ...key.split("/"));
     fs.mkdirSync(path.dirname(localPath), { recursive: true });
     fs.writeFileSync(localPath, body);
@@ -98,7 +171,7 @@ function fixedV3LocalProposalState(indexKey) {
       validation_status: "complete_local_days_validated",
       old_live_r2_observation_bodies_used: false,
       no_old_live_r2_body_planning_or_preservation: true,
-      days: [{ day_utc: dayUtc }],
+      days: [connectorMembershipEvidence(dayUtc)],
     },
     objects,
     tombstone_prefixes: [{
@@ -229,7 +302,11 @@ test("fixed-v3 final graph validates canonical pollutant data without misclassif
     const alignedManifestEntry = {};
     const proposal = {
       objects: [
-        { key: `history/v3/observations/day_utc=${dayUtc}/manifest.json`, body: Buffer.from("{}"), entry: {} },
+        {
+          key: `history/v3/observations/day_utc=${dayUtc}/manifest.json`,
+          body: finalDayManifestBody(dayUtc),
+          entry: {},
+        },
         { key: `history/v3/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`, body: Buffer.from("{}"), entry: {} },
         { key: partKey, body: Buffer.from("parquet"), entry: {} },
         {
@@ -265,7 +342,7 @@ test("fixed-v3 final graph validates canonical pollutant data without misclassif
         validation_status: "complete_local_days_validated",
         old_live_r2_observation_bodies_used: false,
         no_old_live_r2_body_planning_or_preservation: true,
-        days: [{ day_utc: dayUtc }],
+        days: [connectorMembershipEvidence(dayUtc)],
       },
       source_evidence_partitions: {
         [identity]: {
@@ -447,6 +524,10 @@ function frozenCoordinatorState() {
     planner_dependency_identities: identities,
   });
   const complete = {
+    sos_light: {
+      mode: "sos-light",
+      days: [connectorMembershipEvidence("2025-01-01")],
+    },
     objects: {
       [childKey]: object({
         key: childKey,

@@ -127,6 +127,60 @@ function canonicalPollutant(connectorId, pollutantCode, physicalSchema = null) {
   });
 }
 
+function rehashManifest(manifest) {
+  const payload = { ...manifest };
+  delete payload.manifest_hash;
+  payload.manifest_hash = createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex");
+  return payload;
+}
+
+test("backed_up_at_utc validation is manifest-schema sensitive", () => {
+  const canonical = canonicalPollutant(7, "pm10");
+  const validate = (manifest) => validateV2ObservationsChildManifest(manifest, {
+    key: manifest.manifest_key,
+    kind: "pollutant",
+    dayUtc: DAY,
+    connectorId: 7,
+  });
+  const schema2Timestamp = rehashManifest({
+    ...canonical,
+    manifest_schema_version: 2,
+    history_schema_version: 2,
+    backed_up_at_utc: "2026-07-17T14:07:48.000Z",
+  });
+  assert.equal(validate(schema2Timestamp).ok, true);
+
+  const schema2Null = rehashManifest({ ...schema2Timestamp, backed_up_at_utc: null });
+  assert.equal(validate(schema2Null).ok, false);
+  assert.ok(validate(schema2Null).failures.includes("backed_up_at_utc_invalid"));
+
+  const schema3Timestamp = rehashManifest({
+    ...canonical,
+    backed_up_at_utc: "2026-07-17T14:07:48.000Z",
+  });
+  assert.equal(validate(schema3Timestamp).ok, true);
+
+  const schema3Null = rehashManifest({ ...canonical, backed_up_at_utc: null });
+  assert.equal(validate(schema3Null).ok, true);
+
+  const schema3Missing = { ...canonical };
+  delete schema3Missing.backed_up_at_utc;
+  assert.ok(validate(rehashManifest(schema3Missing)).failures.includes(
+    "backed_up_at_utc_invalid",
+  ));
+
+  for (const malformed of ["", "not-a-timestamp", 123, false, undefined]) {
+    const result = validate(rehashManifest({
+      ...canonical,
+      backed_up_at_utc: malformed,
+    }));
+    assert.equal(result.ok, false);
+    assert.ok(result.failures.includes("backed_up_at_utc_invalid"));
+  }
+});
+
 test("observation manifests distinguish manifest contract from physical schema", () => {
   const schema2 = canonicalPollutant(
     7,

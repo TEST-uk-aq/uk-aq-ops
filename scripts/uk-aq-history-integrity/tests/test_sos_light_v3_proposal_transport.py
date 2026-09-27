@@ -50,6 +50,21 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
             environment="TEST",
             base_dropbox_root=self.dropbox,
         )
+        self.run_state["sos_light"] = {
+            "mode": "sos-light",
+            "days": [{
+                "day_utc": "2025-01-01",
+                "pinned_day_manifest_present": True,
+                "pinned_day_manifest_key": (
+                    "history/v3/observations/day_utc=2025-01-01/manifest.json"
+                ),
+                "pinned_day_manifest_hash": "a" * 64,
+                "pinned_baseline_connector_ids": [1],
+                "expected_preserved_connector_ids": [],
+                "expected_final_connector_ids": [1],
+                "final_assembled_connector_ids": [1],
+            }],
+        }
         self.key = "history/_index_v3/transport-test.json"
         self.body = b'{"transport":"exact"}\n'
         self.body_path = Path(self.run_state["overlay_root"]) / self.key
@@ -110,6 +125,46 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
         )
         self.assertIs(MODULE.Path.rglob, MODULE._ORIGINAL_PATH_RGLOB)
         write_state.assert_called_once_with(self.run_state)
+
+    def test_complete_day_assembly_rejects_a_missing_frozen_peer(self) -> None:
+        day_utc = "2025-01-15"
+        day_prefix = f"history/v3/observations/day_utc={day_utc}"
+        day_key = f"{day_prefix}/manifest.json"
+        connector_key = f"{day_prefix}/connector_id=1/manifest.json"
+        for key in (day_key, connector_key):
+            local_path = Path(self.run_state["overlay_root"]) / key
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_text("{}\n", encoding="utf-8")
+            self.run_state["objects"][key] = {
+                "object_key": key,
+                "local_path": str(local_path),
+                "structurally_validated": True,
+            }
+        self.run_state["sos_light"] = {
+            "mode": "sos-light",
+            "validation_status": "validated_local_assembly",
+            "old_live_r2_observation_bodies_used": False,
+            "days": [{
+                "day_utc": day_utc,
+                "pinned_day_manifest_present": True,
+                "pinned_day_manifest_key": f"{day_prefix}/manifest.json",
+                "pinned_day_manifest_hash": "a" * 64,
+                "pinned_baseline_connector_ids": [1, 8],
+                "expected_preserved_connector_ids": [8],
+                "expected_final_connector_ids": [1, 8],
+                "final_assembled_connector_ids": [1, 8],
+                "omitted_dropbox_connector_prefixes": [],
+            }],
+        }
+
+        with (
+            mock.patch.object(MODULE, "validate_run_state_core_snapshot_identity"),
+            self.assertRaisesRegex(
+                ValueError,
+                "complete-day connector membership differs from pinned authority",
+            ),
+        ):
+            MODULE._ORIGINAL_ASSEMBLE_SOS_LIGHT_COMPLETE_DAYS(self.run_state)
 
     def _proposal(self, *, relative_path: str | None = None) -> dict[str, object]:
         digest = hashlib.sha256(self.body).hexdigest()

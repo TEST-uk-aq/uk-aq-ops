@@ -30,7 +30,12 @@ import {
 } from "../scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs";
 import {
   buildStaleParquetPrunePlan,
+  ManifestBackedParquetDivergenceError,
+  pruneStaleParquetForUnit,
 } from "../scripts/backup_r2/lib/stale_parquet_prune.mjs";
+import {
+  recordForcedObservationPruneFailure,
+} from "../scripts/backup_r2/sync_history_to_dropbox.mjs";
 import {
   getObservationHistoryGeneration,
 } from "../workers/shared/uk_aq_observation_history_generation.mjs";
@@ -461,4 +466,144 @@ test("manifest-guided prune plan only marks unreferenced Parquet stale", () => {
   });
 
   assert.deepEqual(plan.stale_relative_paths, ["connector_id=1/stale.parquet"]);
+});
+
+test("manifest-backed destination-only Parquet is divergence, not stale deletion", () => {
+  const unitRelativePath = "history/v3/observations/day_utc=2025-01-15";
+  const currentParquet = "connector_id=1/pollutant_code=no2/current.parquet";
+  const preservedParquet = "connector_id=8/pollutant_code=bc/part-00000.parquet";
+  const destinationManifest = "connector_id=8/pollutant_code=bc/manifest.json";
+  const plan = buildStaleParquetPrunePlan({
+    unit_relative_path: unitRelativePath,
+    manifest_entries: [{
+      relative_path: "connector_id=1/pollutant_code=no2/manifest.json",
+      text: JSON.stringify({ parquet_object_keys: [`${unitRelativePath}/${currentParquet}`] }),
+    }],
+    destination_manifest_entries: [{
+      relative_path: destinationManifest,
+      text: JSON.stringify({ parquet_object_keys: [`${unitRelativePath}/${preservedParquet}`] }),
+    }],
+    actual_file_entries: [
+      { Path: currentParquet },
+      { Path: preservedParquet },
+    ],
+  });
+
+  assert.deepEqual(plan.stale_relative_paths, []);
+  assert.equal(plan.manifest_backed_divergence_count, 1);
+  assert.deepEqual(plan.manifest_backed_divergences[0], {
+    connector_id: 8,
+    pollutant_code: "bc",
+    parquet_relative_path: preservedParquet,
+    parquet_key: `${unitRelativePath}/${preservedParquet}`,
+    manifest_relative_paths: [destinationManifest],
+    manifest_keys: [`${unitRelativePath}/${destinationManifest}`],
+  });
+});
+
+test("manifest-backed divergence fails before any destination delete", () => {
+  const unitRelativePath = "history/v3/observations/day_utc=2025-01-15";
+  const currentParquet = "connector_id=1/pollutant_code=no2/current.parquet";
+  const preservedParquet = "connector_id=8/pollutant_code=uv370/part-00000.parquet";
+  let deleteAttempts = 0;
+
+  assert.throws(
+    () => pruneStaleParquetForUnit({
+      rcloneBin: "unused",
+      manifestRootPath: "source-day",
+      destUnitPath: "destination-day",
+      unitRelativePath,
+      manifestEntries: [{
+        relative_path: "connector_id=1/pollutant_code=no2/manifest.json",
+        text: JSON.stringify({ parquet_object_keys: [`${unitRelativePath}/${currentParquet}`] }),
+      }],
+      destinationManifestEntries: [{
+        relative_path: "connector_id=8/pollutant_code=uv370/manifest.json",
+        text: JSON.stringify({ parquet_object_keys: [`${unitRelativePath}/${preservedParquet}`] }),
+      }],
+      actualFileEntries: [{ Path: currentParquet }, { Path: preservedParquet }],
+      deleteFile: () => { deleteAttempts += 1; },
+    }),
+    (error) => {
+      assert.ok(error instanceof ManifestBackedParquetDivergenceError);
+      assert.equal(error.code, "MANIFEST_BACKED_DESTINATION_DIVERGENCE");
+      assert.equal(error.plan.manifest_backed_divergence_count, 1);
+      return true;
+    },
+  );
+  assert.equal(deleteAttempts, 0);
+});
+
+test("ordinary destination-only Parquet without manifest evidence is still pruned", () => {
+  const unitRelativePath = "history/v3/observations/day_utc=2025-01-15";
+  const currentParquet = "connector_id=1/pollutant_code=no2/current.parquet";
+  const staleParquet = "connector_id=1/pollutant_code=no2/stale.parquet";
+  const deletedTargets = [];
+  const result = pruneStaleParquetForUnit({
+    rcloneBin: "unused",
+    manifestRootPath: "source-day",
+    destUnitPath: "destination-day",
+    unitRelativePath,
+    manifestEntries: [{
+      relative_path: "connector_id=1/pollutant_code=no2/manifest.json",
+      text: JSON.stringify({ parquet_object_keys: [`${unitRelativePath}/${currentParquet}`] }),
+    }],
+    destinationManifestEntries: [{
+      relative_path: "connector_id=1/pollutant_code=no2/manifest.json",
+      text: JSON.stringify({ parquet_object_keys: [`${unitRelativePath}/${currentParquet}`] }),
+    }],
+    actualFileEntries: [{ Path: currentParquet }, { Path: staleParquet }],
+    deleteFile: (_bin, target) => { deletedTargets.push(target); },
+  });
+
+  assert.equal(result.prune_deleted_count, 1);
+  assert.deepEqual(result.pruned_relative_paths, [staleParquet]);
+  assert.equal(deletedTargets.length, 1);
+  assert.ok(deletedTargets[0].endsWith(`/destination-day/${staleParquet}`));
+});
+
+test("forced prune reports manifest-backed divergence as an unsuccessful day", () => {
+  const unitRelativePath = "history/v3/observations/day_utc=2025-01-15";
+  const manifestKey = `${unitRelativePath}/connector_id=8/pollutant_code=bc/manifest.json`;
+  const parquetKey = `${unitRelativePath}/connector_id=8/pollutant_code=bc/part-00000.parquet`;
+  const error = new ManifestBackedParquetDivergenceError({
+    unit_relative_path: unitRelativePath,
+    manifest_backed_divergence_count: 1,
+    manifest_backed_divergences: [{
+      connector_id: 8,
+      pollutant_code: "bc",
+      manifest_keys: [manifestKey],
+      parquet_key: parquetKey,
+    }],
+  });
+  const report = {
+    prune: {
+      manifest_backed_divergence_count: 0,
+      manifest_backed_divergent_days: [],
+      forced_failures: [],
+      forced_failed_days: 0,
+    },
+  };
+  const failures = [];
+
+  recordForcedObservationPruneFailure({
+    report,
+    failures,
+    dayUtc: "2025-01-15",
+    error,
+  });
+
+  assert.equal(report.prune.forced_failed_days, 1);
+  assert.equal(report.prune.manifest_backed_divergence_count, 1);
+  assert.deepEqual(report.prune.manifest_backed_divergent_days, ["2025-01-15"]);
+  assert.deepEqual(report.prune.forced_failures[0], {
+    day_utc: "2025-01-15",
+    classification: "manifest_backed_destination_divergence",
+    error: error.message,
+    divergence_count: 1,
+    connector_ids: [8],
+    pollutant_codes: ["bc"],
+    manifest_key_samples: [manifestKey],
+    parquet_key_samples: [parquetKey],
+  });
 });

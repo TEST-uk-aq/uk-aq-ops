@@ -66,6 +66,38 @@ function writeObject(root, key, body) {
   return filePath;
 }
 
+function inMemorySosLightStore(objects) {
+  return {
+    getObjectIfExists: (key) => objects.get(key) || null,
+    getObjectFromSourceIfExists: (key, source) => {
+      const object = objects.get(key) || null;
+      return object?.source === source ? object : null;
+    },
+    listObjectsFromSource: ({ prefix, source }) => [...objects.values()]
+      .filter((object) => object.source === source && object.key.startsWith(prefix))
+      .map((object) => ({
+        key: object.key,
+        size: object.bytes,
+        source: object.source,
+        content_sha256: object.content_sha256,
+      })),
+    listAllObjects: ({ prefix }) => [...objects.values()]
+      .filter((object) => object.key.startsWith(prefix))
+      .map((object) => ({ key: object.key, size: object.bytes, source: object.source })),
+  };
+}
+
+function inMemoryObject(payload, source) {
+  const body = Buffer.from(JSON.stringify(payload));
+  return {
+    key: payload.manifest_key,
+    body,
+    bytes: body.byteLength,
+    source,
+    content_sha256: sha256Hex(body),
+  };
+}
+
 function stateEntry(filePath, key, dependencies = [], dependencyIdentities = {}) {
   const body = fs.readFileSync(filePath);
   return {
@@ -1861,7 +1893,141 @@ test("SOS-light completes and verifies each day before deleting the next and pub
   }
 });
 
-test("SOS-light connector 1 parent uses every final local child and warns on unusable Dropbox peers", async () => {
+function declaredPeerSosLightFixture() {
+  const dayUtc = "2026-07-12";
+  const base = `history/v2/observations/day_utc=${dayUtc}`;
+  const contentHash = computeEmptyObservationContentHash();
+  delete contentHash.canonical_rows;
+  const buildPollutant = (connectorId, pollutantCode, backedUpAtUtc) => {
+    const manifestKey = `${base}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
+    return buildHistoryV2PollutantManifest({
+      domain: "observations", dayUtc, connectorId, pollutantCode,
+      runId: "fixture", manifestKey, sourceRowCount: 0, fileEntries: [],
+      writerGitSha: "fixture", backedUpAtUtc, observationContentHash: contentHash,
+    });
+  };
+  const connector1Pollutants = ["pm25", "pm10", "no2", "o3"]
+    .map((pollutantCode) => buildPollutant(
+      1,
+      pollutantCode,
+      "2026-07-13T00:00:00.000Z",
+    ));
+  const connector8Pollutants = ["bc", "uv370"]
+    .map((pollutantCode) => buildPollutant(8, pollutantCode, null));
+  const connector1Key = `${base}/connector_id=1/manifest.json`;
+  const oldConnector1 = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc, connectorId: 1, runId: "old-dropbox",
+    manifestKey: connector1Key, pollutantManifests: connector1Pollutants.slice(0, 3),
+    writerGitSha: "old", backedUpAtUtc: "2026-07-13T00:00:00.000Z",
+  });
+  const connector8 = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc, connectorId: 8, runId: "black-carbon",
+    manifestKey: `${base}/connector_id=8/manifest.json`,
+    pollutantManifests: connector8Pollutants,
+    writerGitSha: "dc1847dd53ca6803bc44d6b6ad93ab510098255d",
+    backedUpAtUtc: null,
+  });
+  const dayManifest = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc, runId: "old-dropbox",
+    manifestKey: `${base}/manifest.json`,
+    connectorManifests: [oldConnector1, connector8],
+    writerGitSha: "old", backedUpAtUtc: null,
+  });
+  const objects = new Map();
+  for (const payload of connector1Pollutants) {
+    objects.set(payload.manifest_key, inMemoryObject(payload, "overlay"));
+  }
+  objects.set(connector1Key, inMemoryObject(oldConnector1, "dropbox"));
+  for (const payload of connector8Pollutants) {
+    objects.set(payload.manifest_key, inMemoryObject(payload, "dropbox"));
+  }
+  objects.set(connector8.manifest_key, inMemoryObject(connector8, "dropbox"));
+  objects.set(dayManifest.manifest_key, inMemoryObject(dayManifest, "dropbox"));
+  const finalConnector1 = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc, connectorId: 1, runId: "test-run",
+    manifestKey: connector1Key, pollutantManifests: connector1Pollutants,
+    writerGitSha: "test", backedUpAtUtc: "2026-07-13T00:00:00.000Z",
+  });
+  return {
+    dayUtc,
+    base,
+    objects,
+    connector1Key,
+    connector1Pollutants,
+    connector8,
+    finalConnector1,
+  };
+}
+
+test("SOS-light preserves a day-declared schema-v3 connector with null backup timestamp", async () => {
+  const fixture = declaredPeerSosLightFixture();
+  const staged = createStagedObjectMap({
+    r2: {},
+    store: inMemorySosLightStore(fixture.objects),
+  });
+  await staged.stage({
+    key: fixture.connector1Key,
+    body: JSON.stringify(fixture.finalConnector1, null, 2),
+    kind: "connector_manifest",
+    dayUtc: fixture.dayUtc,
+    dependencies: fixture.connector1Pollutants.map((payload) => payload.manifest_key),
+  });
+  const audit = {
+    days: [], dropbox_warnings: [], dropbox_warning_count: 0,
+    dropbox_omission_count: 0,
+  };
+  const assembled = await assembleSosLightDayParents({
+    staged,
+    base: fixture.base,
+    dayUtc: fixture.dayUtc,
+    protectedConnectorIds: [1],
+    selectedMutationConnectorIds: [1],
+    audit,
+  });
+  assert.deepEqual(
+    assembled.children.map((payload) => payload.connector_id),
+    [1, 8],
+  );
+  assert.equal(assembled.children[1].manifest_hash, fixture.connector8.manifest_hash);
+  assert.equal(assembled.children[1].backed_up_at_utc, null);
+  assert.deepEqual(audit.days[0].pinned_baseline_connector_ids, [1, 8]);
+  assert.deepEqual(audit.days[0].expected_preserved_connector_ids, [8]);
+  assert.deepEqual(audit.days[0].expected_final_connector_ids, [1, 8]);
+  assert.deepEqual(audit.days[0].final_assembled_connector_ids, [1, 8]);
+  assert.equal(audit.dropbox_warning_count, 0);
+});
+
+test("SOS-light fails when a day-declared non-selected connector cannot be preserved", async () => {
+  const fixture = declaredPeerSosLightFixture();
+  fixture.objects.delete(fixture.connector8.manifest_key);
+  const staged = createStagedObjectMap({
+    r2: {},
+    store: inMemorySosLightStore(fixture.objects),
+  });
+  await staged.stage({
+    key: fixture.connector1Key,
+    body: JSON.stringify(fixture.finalConnector1, null, 2),
+    kind: "connector_manifest",
+    dayUtc: fixture.dayUtc,
+    dependencies: fixture.connector1Pollutants.map((payload) => payload.manifest_key),
+  });
+  await assert.rejects(
+    assembleSosLightDayParents({
+      staged,
+      base: fixture.base,
+      dayUtc: fixture.dayUtc,
+      protectedConnectorIds: [1],
+      selectedMutationConnectorIds: [1],
+      audit: {
+        days: [], dropbox_warnings: [], dropbox_warning_count: 0,
+        dropbox_omission_count: 0,
+      },
+    }),
+    /pinned Dropbox day requires connector 8 but it cannot be preserved/,
+  );
+});
+
+test("SOS-light excludes and warns about an unreferenced physical Dropbox connector", async () => {
   const dayUtc = "2026-07-12";
   const base = `history/v2/observations/day_utc=${dayUtc}`;
   const contentHash = computeEmptyObservationContentHash();
@@ -1893,18 +2059,19 @@ test("SOS-light connector 1 parent uses every final local child and warns on unu
     key: connectorKey, body: oldBody, bytes: oldBody.byteLength,
     source: "dropbox", content_sha256: sha256Hex(oldBody),
   });
+  const dayManifest = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc, runId: "old-dropbox",
+    manifestKey: `${base}/manifest.json`, connectorManifests: [oldConnector],
+    writerGitSha: "old", backedUpAtUtc: "2026-07-13T00:00:00.000Z",
+  });
+  objects.set(dayManifest.manifest_key, inMemoryObject(dayManifest, "dropbox"));
   const invalidKey = `${base}/connector_id=7/manifest.json`;
   const invalidBody = Buffer.from("{\"not\":\"canonical\"}");
   objects.set(invalidKey, {
     key: invalidKey, body: invalidBody, bytes: invalidBody.byteLength,
     source: "dropbox", content_sha256: sha256Hex(invalidBody),
   });
-  const store = {
-    getObjectIfExists: (key) => objects.get(key) || null,
-    listAllObjects: ({ prefix }) => [...objects.values()]
-      .filter((object) => object.key.startsWith(prefix))
-      .map((object) => ({ key: object.key, size: object.bytes, source: object.source })),
-  };
+  const store = inMemorySosLightStore(objects);
   const staged = createStagedObjectMap({ r2: {}, store });
   const finalConnector = buildHistoryV2ConnectorManifest({
     domain: "observations", dayUtc, connectorId: 1, runId: "test-run",
@@ -1937,8 +2104,14 @@ test("SOS-light connector 1 parent uses every final local child and warns on unu
   assert.deepEqual(audit.days[0].final_connector_1_child_set,
     pollutants.map((payload) => payload.manifest_key).sort());
   assert.deepEqual(audit.days[0].final_assembled_connector_ids, [1]);
+  assert.deepEqual(audit.days[0].expected_preserved_connector_ids, []);
+  assert.deepEqual(audit.days[0].unreferenced_physical_connector_ids, [7]);
   assert.deepEqual(audit.days[0].omitted_dropbox_connector_ids, [7]);
   assert.equal(audit.dropbox_warning_count, 1);
+  assert.equal(
+    audit.dropbox_warnings[0].classification,
+    "dropbox_unreferenced_physical_connector",
+  );
 });
 
 test("day finalizer can retain an exact validated connector set for generic callers", async () => {

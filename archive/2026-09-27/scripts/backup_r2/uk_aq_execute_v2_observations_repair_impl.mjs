@@ -19,7 +19,6 @@ import {
   buildHistoryV2PollutantManifest,
   buildHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest,
-  validateCanonicalHistoryV2Manifest,
 } from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
   combineObservationHistoryPhysicalSchemas,
@@ -295,162 +294,6 @@ function canonicalConnectorReferences(payload, { base, connectorId }) {
   return [...references.values()].sort((left, right) => left.manifest_key.localeCompare(right.manifest_key));
 }
 
-function canonicalDayConnectorReferences(payload, { base, dayUtc }) {
-  const dayManifestKey = `${base}/manifest.json`;
-  validateCanonicalHistoryV2Manifest(payload, {
-    history_version: "v2",
-    domain: "observations",
-    manifest_kind: "day",
-    day_utc: dayUtc,
-    manifest_key: dayManifestKey,
-  });
-  if (payload.manifest_key !== dayManifestKey || payload.connector_id !== null) {
-    throw new Error(`invalid_day_manifest_identity:${dayManifestKey}`);
-  }
-
-  const normalizeReferences = (field) => {
-    if (!Array.isArray(payload[field])) {
-      throw new Error(`invalid_day_connector_references:${field}`);
-    }
-    const references = new Map();
-    for (const reference of payload[field]) {
-      const connectorId = Number(reference?.connector_id);
-      const manifestKey = String(reference?.manifest_key || "").trim();
-      const manifestHash = String(reference?.manifest_hash || "").trim().toLowerCase();
-      const expectedKey = Number.isSafeInteger(connectorId) && connectorId > 0
-        ? `${base}/connector_id=${connectorId}/manifest.json`
-        : null;
-      if (!expectedKey || manifestKey !== expectedKey || !/^[a-f0-9]{64}$/.test(manifestHash)) {
-        throw new Error(`invalid_day_connector_reference:${manifestKey || "missing_key"}`);
-      }
-      if (references.has(connectorId)) {
-        throw new Error(`duplicate_day_connector_reference:${connectorId}`);
-      }
-      references.set(connectorId, {
-        connector_id: connectorId,
-        manifest_key: manifestKey,
-        manifest_hash: manifestHash,
-      });
-    }
-    return [...references.values()].sort((left, right) => left.connector_id - right.connector_id);
-  };
-
-  const connectorReferences = normalizeReferences("connector_manifests");
-  const childReferences = normalizeReferences("child_manifests");
-  if (JSON.stringify(connectorReferences) !== JSON.stringify(childReferences)) {
-    throw new Error(`contradictory_day_connector_references:${dayManifestKey}`);
-  }
-  const connectorIds = Array.isArray(payload.connector_ids)
-    ? payload.connector_ids.map(Number)
-    : null;
-  const expectedConnectorIds = connectorReferences.map((reference) => reference.connector_id);
-  if (!connectorIds
-    || connectorIds.some((value) => !Number.isSafeInteger(value) || value <= 0)
-    || JSON.stringify(connectorIds) !== JSON.stringify(expectedConnectorIds)) {
-    throw new Error(`day_connector_ids_disagree:${dayManifestKey}`);
-  }
-  return connectorReferences;
-}
-
-function manifestParquetKeys(payload) {
-  const keys = new Set(
-    Array.isArray(payload?.parquet_object_keys)
-      ? payload.parquet_object_keys.map(String)
-      : [],
-  );
-  for (const file of Array.isArray(payload?.files) ? payload.files : []) {
-    const key = String(file?.key || "");
-    if (key) keys.add(key);
-  }
-  return [...keys].sort();
-}
-
-function assertPinnedDropboxConnectorClosure({ adapter, base, dayUtc, reference }) {
-  const connectorId = reference.connector_id;
-  const connectorObject = adapter.getObjectFromSourceIfExists(
-    reference.manifest_key,
-    "dropbox",
-  );
-  if (!connectorObject) {
-    throw new Error(`required_connector_manifest_missing:${reference.manifest_key}`);
-  }
-  const connector = jsonObject(connectorObject, reference.manifest_key);
-  assertV2ObservationsChildManifest(connector, {
-    key: reference.manifest_key,
-    kind: "connector",
-    dayUtc,
-    connectorId,
-  });
-  validateCanonicalHistoryV2Manifest(connector, {
-    history_version: "v2",
-    domain: "observations",
-    manifest_kind: "connector",
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    manifest_key: reference.manifest_key,
-  });
-  if (connector.manifest_hash !== reference.manifest_hash) {
-    throw new Error(`required_connector_manifest_hash_mismatch:${reference.manifest_key}`);
-  }
-
-  const pollutantReferences = canonicalConnectorReferences(connector, {
-    base,
-    connectorId,
-  });
-  const childParquetKeys = new Set();
-  for (const pollutantReference of pollutantReferences) {
-    const pollutantKey = pollutantReference.manifest_key;
-    const pollutantObject = adapter.getObjectFromSourceIfExists(pollutantKey, "dropbox");
-    if (!pollutantObject) {
-      throw new Error(`required_pollutant_manifest_missing:${pollutantKey}`);
-    }
-    const pollutant = jsonObject(pollutantObject, pollutantKey);
-    assertV2ObservationsChildManifest(pollutant, {
-      key: pollutantKey,
-      kind: "pollutant",
-      dayUtc,
-      connectorId,
-    });
-    validateCanonicalHistoryV2Manifest(pollutant, {
-      history_version: "v2",
-      domain: "observations",
-      manifest_kind: "pollutant",
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantReference.pollutant_code,
-      manifest_key: pollutantKey,
-    });
-    if (pollutant.manifest_hash !== pollutantReference.manifest_hash) {
-      throw new Error(`required_pollutant_manifest_hash_mismatch:${pollutantKey}`);
-    }
-    const expectedPrefix = pollutantKey.slice(0, -"manifest.json".length);
-    const fileSizes = new Map((pollutant.files || []).map((file) => [
-      String(file?.key || ""),
-      Number(file?.bytes),
-    ]));
-    for (const parquetKey of manifestParquetKeys(pollutant)) {
-      if (!parquetKey.startsWith(expectedPrefix) || !parquetKey.endsWith(".parquet")) {
-        throw new Error(`required_pollutant_parquet_key_invalid:${parquetKey}`);
-      }
-      const parquetObject = adapter.getObjectFromSourceIfExists(parquetKey, "dropbox");
-      if (!parquetObject) {
-        throw new Error(`required_pollutant_parquet_missing:${parquetKey}`);
-      }
-      const expectedBytes = fileSizes.get(parquetKey);
-      if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0
-        || parquetObject.bytes !== expectedBytes) {
-        throw new Error(`required_pollutant_parquet_size_mismatch:${parquetKey}`);
-      }
-      childParquetKeys.add(parquetKey);
-    }
-  }
-  const connectorParquetKeys = manifestParquetKeys(connector);
-  if (JSON.stringify(connectorParquetKeys) !== JSON.stringify([...childParquetKeys].sort())) {
-    throw new Error(`required_connector_parquet_closure_mismatch:${reference.manifest_key}`);
-  }
-  return { connector, connectorObject };
-}
-
 function newSosLightAudit({ protectedConnectorIds, selectedMutationConnectorIds }) {
   return {
     mode: "sos-light",
@@ -486,140 +329,73 @@ export async function assembleSosLightDayParents({
     || JSON.stringify(selectedMutationConnectorIds) !== "[1]") {
     throw new Error("Blocked dependency: SOS-light currently supports selected/protected connector IDs [1] only");
   }
-  const dayManifestKey = `${base}/manifest.json`;
-  const pinnedDayObject = staged.stagedR2.adapter.getObjectFromSourceIfExists(
-    dayManifestKey,
-    "dropbox",
-  );
-  let pinnedDayManifest = null;
-  let baselineReferences = [];
-  if (pinnedDayObject) {
-    pinnedDayManifest = jsonObject(pinnedDayObject, dayManifestKey);
-    try {
-      baselineReferences = canonicalDayConnectorReferences(pinnedDayManifest, {
-        base,
-        dayUtc,
-      });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Blocked dependency: pinned Dropbox day manifest is unusable ${dayManifestKey}: ${reason}`,
-      );
-    }
-  }
-
-  const physicalEntries = await staged.stagedR2.adapter.listObjectsFromSource({
+  const entries = await staged.stagedR2.adapter.listAllObjects({
     prefix: `${base}/connector_id=`,
-    source: "dropbox",
   });
-  const physicalConnectorKeys = [...new Set(physicalEntries
+  const connectorKeys = [...new Set(entries
     .map((entry) => entry.key)
     .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key)))].sort();
-  const physicalConnectorIds = physicalConnectorKeys.map((key) =>
-    Number(key.match(/\/connector_id=(\d+)\/manifest\.json$/)?.[1]))
-    .filter((value) => Number.isSafeInteger(value) && value > 0)
-    .sort((left, right) => left - right);
-  const baselineConnectorIds = baselineReferences.map((reference) => reference.connector_id);
-  const expectedPreservedConnectorIds = baselineConnectorIds
-    .filter((connectorId) => connectorId !== 1);
-  const expectedFinalConnectorIds = [...new Set([1, ...expectedPreservedConnectorIds])]
-    .sort((left, right) => left - right);
-  const unreferencedPhysicalConnectorIds = physicalConnectorIds
-    .filter((connectorId) => connectorId !== 1 && !baselineConnectorIds.includes(connectorId));
-
   const children = [];
   const identities = new Map();
-  const connector1Key = `${base}/connector_id=1/manifest.json`;
-  let connector1Object;
-  let connector1;
-  try {
-    connector1Object = await staged.stagedR2.adapter.getObject({ key: connector1Key });
-    connector1 = jsonObject(connector1Object, connector1Key);
-    assertV2ObservationsChildManifest(connector1, {
-      key: connector1Key,
-      kind: "connector",
-      dayUtc,
-      connectorId: 1,
-    });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Blocked dependency: final SOS-light connector 1 parent is unusable ${connector1Key}: ${reason}`,
-    );
-  }
-  children.push(connector1);
-  identities.set(connector1Key, {
-    content_sha256: connector1Object.content_sha256 || sha256Hex(connector1Object.body),
-    bytes: connector1Object.bytes ?? Buffer.byteLength(connector1Object.body),
-    source: connector1Object.source || "combined_local",
-  });
-  const connector1ChildKeys = canonicalConnectorReferences(connector1, {
-    base,
-    connectorId: 1,
-  }).map((reference) => reference.manifest_key);
-
-  for (const reference of baselineReferences.filter((entry) => entry.connector_id !== 1)) {
+  const includedConnectorIds = [];
+  const omittedConnectorIds = [];
+  const omittedConnectorPrefixes = [];
+  let connector1ChildKeys = [];
+  for (const key of connectorKeys) {
+    const match = key.match(/\/connector_id=(\d+)\/manifest\.json$/);
+    const connectorId = Number(match?.[1]);
+    if (!Number.isInteger(connectorId) || connectorId <= 0) {
+      throw new Error(`Blocked dependency: invalid connector manifest key ${key}`);
+    }
     try {
-      const preserved = assertPinnedDropboxConnectorClosure({
-        adapter: staged.stagedR2.adapter,
-        base,
+      const object = await staged.stagedR2.adapter.getObject({ key });
+      if (connectorId !== 1 && object.source !== "dropbox") {
+        throw new Error(`unprotected connector parent is not Dropbox-backed: ${object.source}`);
+      }
+      const payload = jsonObject(object, key);
+      assertV2ObservationsChildManifest(payload, {
+        key,
+        kind: "connector",
         dayUtc,
-        reference,
+        connectorId,
       });
-      children.push(preserved.connector);
-      identities.set(reference.manifest_key, {
-        content_sha256: preserved.connectorObject.content_sha256
-          || sha256Hex(preserved.connectorObject.body),
-        bytes: preserved.connectorObject.bytes
-          ?? Buffer.byteLength(preserved.connectorObject.body),
-        source: "dropbox",
+      children.push(payload);
+      identities.set(key, {
+        content_sha256: object.content_sha256 || sha256Hex(object.body),
+        bytes: object.bytes ?? Buffer.byteLength(object.body),
+        source: object.source || "combined_local",
       });
+      includedConnectorIds.push(connectorId);
+      if (connectorId === 1) {
+        connector1ChildKeys = canonicalConnectorReferences(payload, { base, connectorId })
+          .map((reference) => reference.manifest_key);
+      }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Blocked dependency: pinned Dropbox day requires connector ${reference.connector_id} `
-        + `but it cannot be preserved ${reference.manifest_key}: ${reason}`,
-      );
+      if (connectorId === 1) {
+        throw new Error(`Blocked dependency: final SOS-light connector 1 parent is unusable ${key}: ${reason}`);
+      }
+      omittedConnectorIds.push(connectorId);
+      omittedConnectorPrefixes.push(`${base}/connector_id=${connectorId}`);
+      addSosLightDropboxWarning(audit, {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        object_key: key,
+        classification: "dropbox_unprotected_connector_parent_unusable",
+        reason,
+        omitted: true,
+      });
     }
   }
-
-  const unreferencedPhysicalConnectorPrefixes = unreferencedPhysicalConnectorIds
-    .map((connectorId) => `${base}/connector_id=${connectorId}`);
-  for (const connectorId of unreferencedPhysicalConnectorIds) {
-    addSosLightDropboxWarning(audit, {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      object_key: `${base}/connector_id=${connectorId}/manifest.json`,
-      classification: "dropbox_unreferenced_physical_connector",
-      reason: "physical connector parent is not declared by the pinned authoritative day manifest",
-      omitted: true,
-    });
+  if (!includedConnectorIds.includes(1)) {
+    throw new Error(`Blocked dependency: SOS-light assembled day has no final connector 1 parent: ${dayUtc}`);
   }
-  children.sort((left, right) => Number(left.connector_id) - Number(right.connector_id));
-  const finalAssembledConnectorIds = children.map((child) => Number(child.connector_id));
-  if (JSON.stringify(finalAssembledConnectorIds) !== JSON.stringify(expectedFinalConnectorIds)) {
-    throw new Error(
-      `Blocked dependency: SOS-light final connector membership differs from pinned authority `
-      + `day=${dayUtc} expected=${expectedFinalConnectorIds.join(",")} `
-      + `actual=${finalAssembledConnectorIds.join(",")}`,
-    );
-  }
-
   const dayAudit = {
     day_utc: dayUtc,
-    pinned_day_manifest_present: pinnedDayObject !== null,
-    pinned_day_manifest_key: pinnedDayObject ? dayManifestKey : null,
-    pinned_day_manifest_hash: pinnedDayManifest?.manifest_hash || null,
-    pinned_baseline_connector_ids: baselineConnectorIds,
-    expected_preserved_connector_ids: expectedPreservedConnectorIds,
-    expected_final_connector_ids: expectedFinalConnectorIds,
-    physical_dropbox_connector_ids: physicalConnectorIds,
-    unreferenced_physical_connector_ids: unreferencedPhysicalConnectorIds,
-    unreferenced_physical_connector_prefixes: unreferencedPhysicalConnectorPrefixes,
     final_connector_1_child_set: connector1ChildKeys,
-    final_assembled_connector_ids: finalAssembledConnectorIds,
-    omitted_dropbox_connector_ids: unreferencedPhysicalConnectorIds,
-    omitted_dropbox_connector_prefixes: unreferencedPhysicalConnectorPrefixes,
+    final_assembled_connector_ids: includedConnectorIds.sort((left, right) => left - right),
+    omitted_dropbox_connector_ids: omittedConnectorIds.sort((left, right) => left - right),
+    omitted_dropbox_connector_prefixes: omittedConnectorPrefixes.sort(),
   };
   audit.days.push(dayAudit);
   return { children, identities, dayAudit };
@@ -1002,10 +778,6 @@ export function createStagedObjectMap({
       });
     },
     adapter: {
-      getObjectFromSourceIfExists: (key, source) =>
-        store.getObjectFromSourceIfExists(key, source),
-      listObjectsFromSource: ({ prefix, source, keyFilter = null }) =>
-        store.listObjectsFromSource({ prefix, source, keyFilter }),
       getObject: async ({ key }) => {
         const staged = stagedObject(key);
         if (staged) return staged;

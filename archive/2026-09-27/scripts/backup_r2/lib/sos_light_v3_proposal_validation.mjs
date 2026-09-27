@@ -17,7 +17,7 @@ const POLLUTANT_MANIFEST = new RegExp(`${POLLUTANT_PREFIX.source.slice(1, -1)}\\
 const SHA256 = /^[a-f0-9]{64}$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 export const SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT =
-  "uk_aq_sos_light_v3_transition_state_fingerprint_v2";
+  "uk_aq_sos_light_v3_transition_state_fingerprint_v1";
 
 function sha256(body) { return createHash("sha256").update(body).digest("hex"); }
 function safeKey(raw) {
@@ -167,80 +167,6 @@ function compareFingerprintObjectKeys(left, right) {
   return 0;
 }
 
-function canonicalConnectorIds(value, label) {
-  if (!Array.isArray(value)
-      || value.some((connectorId) => !Number.isSafeInteger(connectorId) || connectorId <= 0)) {
-    throw new Error(`Fixed-v3 SOS-light connector membership is invalid: ${label}`);
-  }
-  const canonical = [...new Set(value)].sort((left, right) => left - right);
-  if (!exactArray(value, canonical)) {
-    throw new Error(`Fixed-v3 SOS-light connector membership is not canonical: ${label}`);
-  }
-  return canonical;
-}
-
-function canonicalSosLightConnectorMembership(runState) {
-  const audit = runState?.sos_light;
-  if (!audit || typeof audit !== "object" || Array.isArray(audit)
-      || audit.mode !== "sos-light" || !Array.isArray(audit.days) || !audit.days.length) {
-    throw new Error("Fixed-v3 SOS-light connector-membership evidence is unavailable");
-  }
-  const seenDays = new Set();
-  return audit.days.map((entry) => {
-    const dayUtc = String(entry?.day_utc || "");
-    if (!validDay(dayUtc) || seenDays.has(dayUtc)) {
-      throw new Error(`Fixed-v3 SOS-light connector-membership day is invalid: ${dayUtc}`);
-    }
-    seenDays.add(dayUtc);
-    if (typeof entry?.pinned_day_manifest_present !== "boolean") {
-      throw new Error(`Fixed-v3 SOS-light pinned day-manifest presence is invalid: ${dayUtc}`);
-    }
-    const pinnedDayManifestKey = entry.pinned_day_manifest_key;
-    const pinnedDayManifestHash = entry.pinned_day_manifest_hash;
-    if (entry.pinned_day_manifest_present) {
-      const expectedKey = `${OBSERVATIONS_PREFIX}/day_utc=${dayUtc}/manifest.json`;
-      if (pinnedDayManifestKey !== expectedKey || !SHA256.test(String(pinnedDayManifestHash || ""))) {
-        throw new Error(`Fixed-v3 SOS-light pinned day-manifest identity is invalid: ${dayUtc}`);
-      }
-    } else if (pinnedDayManifestKey !== null || pinnedDayManifestHash !== null) {
-      throw new Error(`Fixed-v3 SOS-light absent day-manifest identity is contradictory: ${dayUtc}`);
-    }
-    const baselineConnectorIds = canonicalConnectorIds(
-      entry.pinned_baseline_connector_ids,
-      `${dayUtc}:pinned_baseline_connector_ids`,
-    );
-    const expectedPreservedConnectorIds = canonicalConnectorIds(
-      entry.expected_preserved_connector_ids,
-      `${dayUtc}:expected_preserved_connector_ids`,
-    );
-    const expectedFinalConnectorIds = canonicalConnectorIds(
-      entry.expected_final_connector_ids,
-      `${dayUtc}:expected_final_connector_ids`,
-    );
-    const finalAssembledConnectorIds = canonicalConnectorIds(
-      entry.final_assembled_connector_ids,
-      `${dayUtc}:final_assembled_connector_ids`,
-    );
-    const derivedPreserved = baselineConnectorIds.filter((connectorId) => connectorId !== 1);
-    const derivedFinal = [...new Set([1, ...derivedPreserved])].sort((left, right) => left - right);
-    if (!exactArray(expectedPreservedConnectorIds, derivedPreserved)
-        || !exactArray(expectedFinalConnectorIds, derivedFinal)
-        || !exactArray(finalAssembledConnectorIds, derivedFinal)) {
-      throw new Error(`Fixed-v3 SOS-light frozen connector membership disagrees: ${dayUtc}`);
-    }
-    return {
-      day_utc: dayUtc,
-      pinned_day_manifest_present: entry.pinned_day_manifest_present,
-      pinned_day_manifest_key: pinnedDayManifestKey,
-      pinned_day_manifest_hash: pinnedDayManifestHash,
-      pinned_baseline_connector_ids: baselineConnectorIds,
-      expected_preserved_connector_ids: expectedPreservedConnectorIds,
-      expected_final_connector_ids: expectedFinalConnectorIds,
-      final_assembled_connector_ids: finalAssembledConnectorIds,
-    };
-  }).sort((left, right) => left.day_utc.localeCompare(right.day_utc));
-}
-
 export function coordinatorTransitionStateFingerprintPayload(runState) {
   const rawObjects = runState?.objects;
   if (!rawObjects || typeof rawObjects !== "object" || Array.isArray(rawObjects)) {
@@ -336,7 +262,6 @@ export function coordinatorTransitionStateFingerprintPayload(runState) {
   }
   return {
     contract_version: SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
-    sos_light_connector_membership: canonicalSosLightConnectorMembership(runState),
     objects,
     proposal_transition_planner_unchanged_keys: unchangedKeys,
     proposed_tombstone_prefixes: proposedPrefixes,
@@ -425,8 +350,7 @@ export function validateDedicatedSosHistoricalProposalV3({ runState, proposal })
       || audit?.no_old_live_r2_body_planning_or_preservation !== true) {
     throw new Error("SOS-light-v3 proposal has invalid reconstruction authority evidence");
   }
-  const membership = canonicalSosLightConnectorMembership(runState);
-  const selectedDays = membership.map((entry) => entry.day_utc);
+  const selectedDays = [...new Set((audit.days || []).map((entry) => String(entry?.day_utc || "")))].sort();
   if (!selectedDays.length || selectedDays.some((day) => !validDay(day))) throw new Error("SOS-light-v3 selected days are invalid");
   const deletionDays = proposal.prefixes
     .filter(({ entry }) => entry?.stage === "sos_light_complete_day")
@@ -436,58 +360,14 @@ export function validateDedicatedSosHistoricalProposalV3({ runState, proposal })
     return match[1];
   }).sort();
   if (!exactArray(selectedDays, deletionDays)) throw new Error("SOS-light-v3 requires exactly one complete observation-day deletion per selected day");
-  const objects = new Map(proposal.objects.map((object) => [object.key, object]));
-  const keys = new Set(objects.keys());
-  for (const dayMembership of membership) {
-    const day = dayMembership.day_utc;
+  const keys = new Set(proposal.objects.map(({ key }) => key));
+  for (const day of selectedDays) {
     const root = `${OBSERVATIONS_PREFIX}/day_utc=${day}`;
     if (!keys.has(`${root}/manifest.json`) || !keys.has(`${root}/connector_id=1/manifest.json`)) {
       throw new Error(`SOS-light-v3 assembled day lacks required parents: ${day}`);
     }
-    for (const connectorId of dayMembership.expected_final_connector_ids) {
-      if (!keys.has(`${root}/connector_id=${connectorId}/manifest.json`)) {
-        throw new Error(`SOS-light-v3 assembled day lacks required connector ${connectorId}: ${day}`);
-      }
-    }
-    const dayObject = objects.get(`${root}/manifest.json`);
-    let dayManifest;
-    try {
-      dayManifest = JSON.parse(dayObject?.body?.toString("utf8") || "");
-    } catch {
-      throw new Error(`SOS-light-v3 final day manifest is invalid JSON: ${day}`);
-    }
-    const connectorIds = Array.isArray(dayManifest?.connector_ids)
-      ? dayManifest.connector_ids.map(Number)
-      : null;
-    const connectorReferences = Array.isArray(dayManifest?.connector_manifests)
-      ? dayManifest.connector_manifests
-      : null;
-    const childReferences = Array.isArray(dayManifest?.child_manifests)
-      ? dayManifest.child_manifests
-      : null;
-    const referencedConnectorIds = connectorReferences?.map((reference) =>
-      Number(reference?.connector_id));
-    const childConnectorIds = childReferences?.map((reference) =>
-      Number(reference?.connector_id));
-    const referencesValid = (references) => references?.every((reference) => {
-      const connectorId = Number(reference?.connector_id);
-      return reference?.manifest_key === `${root}/connector_id=${connectorId}/manifest.json`;
-    });
-    if (!exactArray(connectorIds, dayMembership.expected_final_connector_ids)
-        || !exactArray(referencedConnectorIds, dayMembership.expected_final_connector_ids)
-        || !exactArray(childConnectorIds, dayMembership.expected_final_connector_ids)
-        || referencesValid(connectorReferences) !== true
-        || referencesValid(childReferences) !== true) {
-      throw new Error(`SOS-light-v3 final day connector membership differs from pinned authority: ${day}`);
-    }
   }
-  return {
-    dedicated: true,
-    mode: "sos-light",
-    connector_id: 1,
-    selected_days: selectedDays,
-    connector_membership: membership,
-  };
+  return { dedicated: true, mode: "sos-light", connector_id: 1, selected_days: selectedDays };
 }
 
 export function validateLocalSosLightV3Proposal(runState) {

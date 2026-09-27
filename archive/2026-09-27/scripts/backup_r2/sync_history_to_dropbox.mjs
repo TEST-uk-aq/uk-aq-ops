@@ -759,11 +759,11 @@ function copyAndVerifyObservationDay({
   if (args.prune_stale_parquet) {
     prune = pruneStaleParquetForUnit({
       rcloneBin: args.rclone_bin,
-      manifestRootPath: sourceDayPath,
+      manifestRootPath: args.dry_run ? sourceDayPath : destDayPath,
       destUnitPath: destDayPath,
       unitRelativePath: day.relative_path,
       dryRun: args.dry_run,
-      manifestReadListRetryOptions: null,
+      manifestReadListRetryOptions: args.dry_run ? null : DROPBOX_READ_RETRY,
       destinationReadListRetryOptions: DROPBOX_READ_RETRY,
       deleteRetryOptions: DROPBOX_WRITE_RETRY,
     });
@@ -868,45 +868,6 @@ function allYearsComplete(stateRoot, inventoryRoot) {
   );
 }
 
-export function recordForcedObservationPruneFailure({
-  report,
-  failures,
-  dayUtc,
-  error,
-}) {
-  const message = error instanceof Error ? error.message : String(error);
-  if (error?.code === "MANIFEST_BACKED_DESTINATION_DIVERGENCE"
-    && error?.plan?.manifest_backed_divergence_count > 0) {
-    const divergences = error.plan.manifest_backed_divergences || [];
-    report.prune.manifest_backed_divergence_count +=
-      error.plan.manifest_backed_divergence_count;
-    report.prune.manifest_backed_divergent_days.push(dayUtc);
-    failures.push({
-      day_utc: dayUtc,
-      classification: "manifest_backed_destination_divergence",
-      error: message,
-      divergence_count: error.plan.manifest_backed_divergence_count,
-      connector_ids: [...new Set(divergences
-        .map((entry) => entry.connector_id)
-        .filter((value) => Number.isSafeInteger(value)))].sort((left, right) => left - right),
-      pollutant_codes: [...new Set(divergences
-        .map((entry) => entry.pollutant_code)
-        .filter(Boolean))].sort(),
-      manifest_key_samples: [...new Set(divergences
-        .flatMap((entry) => entry.manifest_keys || []))].sort().slice(0, 10),
-      parquet_key_samples: divergences
-        .map((entry) => entry.parquet_key)
-        .filter(Boolean)
-        .sort()
-        .slice(0, 10),
-    });
-  } else {
-    failures.push({ day_utc: dayUtc, error: message });
-  }
-  report.prune.forced_failures = failures;
-  report.prune.forced_failed_days = failures.length;
-}
-
 function runForcedObservationPruneRecheck(args, inventoryRoot, report) {
   if (!args.force_prune_recheck) return;
   const failures = [];
@@ -945,12 +906,8 @@ function runForcedObservationPruneRecheck(args, inventoryRoot, report) {
             result.prune_dry_run_delete_count || 0,
           );
         } catch (error) {
-          recordForcedObservationPruneFailure({
-            report,
-            failures,
-            dayUtc: day.day_utc,
-            error,
-          });
+          const message = error instanceof Error ? error.message : String(error);
+          failures.push({ day_utc: day.day_utc, error: message });
         }
       }
     }
@@ -1106,8 +1063,6 @@ async function main() {
       forced_days_audited: 0,
       forced_failed_days: 0,
       forced_failures: [],
-      manifest_backed_divergence_count: 0,
-      manifest_backed_divergent_days: [],
     },
   };
 

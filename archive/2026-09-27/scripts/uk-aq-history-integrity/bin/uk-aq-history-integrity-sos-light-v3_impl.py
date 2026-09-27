@@ -17885,7 +17885,7 @@ PROPOSAL_TRANSITION_DEPENDENCY_SOURCES = frozenset({
 })
 FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX = "exact_prefix_replacement"
 SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_sos_light_v3_transition_state_fingerprint_v2"
+    "uk_aq_sos_light_v3_transition_state_fingerprint_v1"
 )
 COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
 COORDINATOR_PROGRESS_SECONDS = 15.0
@@ -18101,126 +18101,6 @@ def _transition_fingerprint_identity_entries(
     return sorted(identities, key=lambda identity: identity["object_key"])
 
 
-def _canonical_sos_light_connector_ids(value: Any, *, label: str) -> list[int]:
-    if (
-        not isinstance(value, list)
-        or any(
-            not isinstance(connector_id, int)
-            or isinstance(connector_id, bool)
-            or connector_id <= 0
-            for connector_id in value
-        )
-    ):
-        raise ValueError(
-            f"fixed-v3 SOS-light connector membership is invalid: {label}"
-        )
-    canonical = sorted(set(value))
-    if value != canonical:
-        raise ValueError(
-            f"fixed-v3 SOS-light connector membership is not canonical: {label}"
-        )
-    return canonical
-
-
-def _canonical_sos_light_connector_membership(
-    run_state: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    audit = run_state.get("sos_light")
-    if (
-        not isinstance(audit, Mapping)
-        or audit.get("mode") != "sos-light"
-        or not isinstance(audit.get("days"), list)
-        or not audit["days"]
-    ):
-        raise ValueError(
-            "fixed-v3 SOS-light connector-membership evidence is unavailable"
-        )
-    membership: list[dict[str, Any]] = []
-    seen_days: set[str] = set()
-    for entry in audit["days"]:
-        if not isinstance(entry, Mapping):
-            raise ValueError(
-                "fixed-v3 SOS-light connector-membership day is invalid"
-            )
-        day_utc = str(entry.get("day_utc") or "")
-        try:
-            valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
-        except ValueError:
-            valid_day = False
-        if not valid_day or day_utc in seen_days:
-            raise ValueError(
-                "fixed-v3 SOS-light connector-membership day is invalid: "
-                f"{day_utc}"
-            )
-        seen_days.add(day_utc)
-        pinned_present = entry.get("pinned_day_manifest_present")
-        if not isinstance(pinned_present, bool):
-            raise ValueError(
-                "fixed-v3 SOS-light pinned day-manifest presence is invalid: "
-                f"{day_utc}"
-            )
-        pinned_key = entry.get("pinned_day_manifest_key")
-        pinned_hash = entry.get("pinned_day_manifest_hash")
-        if pinned_present:
-            expected_key = (
-                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
-                f"day_utc={day_utc}/manifest.json"
-            )
-            if (
-                pinned_key != expected_key
-                or not re.fullmatch(r"[a-f0-9]{64}", str(pinned_hash or ""))
-            ):
-                raise ValueError(
-                    "fixed-v3 SOS-light pinned day-manifest identity is "
-                    f"invalid: {day_utc}"
-                )
-        elif pinned_key is not None or pinned_hash is not None:
-            raise ValueError(
-                "fixed-v3 SOS-light absent day-manifest identity is "
-                f"contradictory: {day_utc}"
-            )
-        baseline_ids = _canonical_sos_light_connector_ids(
-            entry.get("pinned_baseline_connector_ids"),
-            label=f"{day_utc}:pinned_baseline_connector_ids",
-        )
-        expected_preserved_ids = _canonical_sos_light_connector_ids(
-            entry.get("expected_preserved_connector_ids"),
-            label=f"{day_utc}:expected_preserved_connector_ids",
-        )
-        expected_final_ids = _canonical_sos_light_connector_ids(
-            entry.get("expected_final_connector_ids"),
-            label=f"{day_utc}:expected_final_connector_ids",
-        )
-        final_assembled_ids = _canonical_sos_light_connector_ids(
-            entry.get("final_assembled_connector_ids"),
-            label=f"{day_utc}:final_assembled_connector_ids",
-        )
-        derived_preserved_ids = [
-            connector_id for connector_id in baseline_ids if connector_id != 1
-        ]
-        derived_final_ids = sorted({1, *derived_preserved_ids})
-        if (
-            expected_preserved_ids != derived_preserved_ids
-            or expected_final_ids != derived_final_ids
-            or final_assembled_ids != derived_final_ids
-        ):
-            raise ValueError(
-                "fixed-v3 SOS-light frozen connector membership disagrees: "
-                f"{day_utc}"
-            )
-        membership.append({
-            "day_utc": day_utc,
-            "pinned_day_manifest_present": pinned_present,
-            "pinned_day_manifest_key": pinned_key,
-            "pinned_day_manifest_hash": pinned_hash,
-            "pinned_baseline_connector_ids": baseline_ids,
-            "expected_preserved_connector_ids": expected_preserved_ids,
-            "expected_final_connector_ids": expected_final_ids,
-            "final_assembled_connector_ids": final_assembled_ids,
-        })
-    return sorted(membership, key=lambda entry: entry["day_utc"])
-
-
 def _proposal_transition_state_fingerprint_payload(
     run_state: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -18431,8 +18311,6 @@ def _proposal_transition_state_fingerprint_payload(
     return {
         "contract_version":
             SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
-        "sos_light_connector_membership":
-            _canonical_sos_light_connector_membership(run_state),
         "objects": canonical_objects,
         "proposal_transition_planner_unchanged_keys": unchanged_keys,
         "proposed_tombstone_prefixes": proposed_prefixes,
@@ -20148,27 +20026,6 @@ def assemble_sos_light_complete_days(
         )
         if f"{day_prefix}/manifest.json" not in day_keys:
             raise ValueError(f"SOS-light assembled day parent is unavailable: {day_utc}")
-        expected_connector_ids = _canonical_sos_light_connector_ids(
-            day.get("expected_final_connector_ids"),
-            label=f"{day_utc}:expected_final_connector_ids",
-        )
-        actual_connector_ids = sorted({
-            int(match.group(1))
-            for key in day_keys
-            if (
-                match := re.fullmatch(
-                    re.escape(f"{day_prefix}/connector_id=")
-                    + r"([1-9]\d*)/manifest\.json",
-                    key,
-                )
-            )
-        })
-        if actual_connector_ids != expected_connector_ids:
-            raise ValueError(
-                "SOS-light complete-day connector membership differs from "
-                f"pinned authority: {day_utc}; "
-                f"expected={expected_connector_ids}; actual={actual_connector_ids}"
-            )
         connector1_parent = f"{day_prefix}/connector_id=1/manifest.json"
         if connector1_parent not in day_keys:
             raise ValueError(f"SOS-light connector 1 parent is unavailable: {day_utc}")
