@@ -33,6 +33,7 @@ import {
 import {
   assertV2ObservationsChildManifest,
   classifyRepairableV2ObservationsConnectorManifest,
+  isValidV2ObservationsBackedUpAtUtc,
 } from "./lib/uk_aq_v2_observations_manifest_validation.mjs";
 import {
   getObservationHistoryGeneration,
@@ -1589,7 +1590,7 @@ function assertCanonicalObjectKey(value, label) {
   return value;
 }
 
-function assertCanonicalManifestProposal(proposal) {
+export function assertCanonicalManifestProposal(proposal) {
   const expectedKind = {
     pollutant_manifest: "pollutant",
     connector_manifest: "connector",
@@ -1613,7 +1614,7 @@ function assertCanonicalManifestProposal(proposal) {
     || payload.profile !== null) {
     throw new Error(`Invalid canonical ${proposal.kind} contract: ${proposal.key}`);
   }
-  if (typeof payload.backed_up_at_utc !== "string" || Number.isNaN(Date.parse(payload.backed_up_at_utc))) {
+  if (!isValidV2ObservationsBackedUpAtUtc(payload)) {
     throw new Error(`Invalid canonical ${proposal.kind} backed_up_at_utc: ${proposal.key}`);
   }
   if (!Array.isArray(payload.files) || !Array.isArray(payload.parquet_object_keys)) {

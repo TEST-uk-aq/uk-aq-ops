@@ -22839,12 +22839,97 @@ def observations_global_operation_lock_context(
     }
 
 
+INTEGRITY_LOGICAL_RUN_CONTEXT_ENV = "UK_AQ_INTEGRITY_LOGICAL_RUN_CONTEXT"
+INTEGRITY_LOGICAL_RUN_CONTEXT_VERSION = 1
+
+
+def build_integrity_logical_run_context(
+    *,
+    env_name: str,
+    started_at_utc: str,
+    run_compact: str,
+    log_path: str | Path,
+) -> dict[str, Any]:
+    return {
+        "contract_version": INTEGRITY_LOGICAL_RUN_CONTEXT_VERSION,
+        "env_name": env_name,
+        "started_at_utc": started_at_utc,
+        "run_compact": run_compact,
+        "log_path": str(log_path),
+    }
+
+
+def inherited_integrity_logical_run_context(
+    env: Mapping[str, str],
+    *,
+    expected_env_name: str,
+    expected_log_dir: str | Path,
+    global_operation_lock: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    raw = str(env.get(INTEGRITY_LOGICAL_RUN_CONTEXT_ENV) or "").strip()
+    if not global_operation_lock.get("valid"):
+        # A top-level invocation always creates a fresh identity. In particular,
+        # stale caller environment cannot opt itself into an earlier run.
+        return None
+    if not raw:
+        raise RuntimeError(
+            "Integrity retained-lock child is missing its logical run context"
+        )
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Integrity retained-lock child logical run context is invalid JSON"
+        ) from exc
+    expected_fields = {
+        "contract_version", "env_name", "started_at_utc", "run_compact",
+        "log_path",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise RuntimeError(
+            "Integrity retained-lock child logical run context has an invalid shape"
+        )
+    if payload.get("contract_version") != INTEGRITY_LOGICAL_RUN_CONTEXT_VERSION:
+        raise RuntimeError(
+            "Integrity retained-lock child logical run context contract is unknown"
+        )
+    started_iso = str(payload.get("started_at_utc") or "")
+    run_compact = str(payload.get("run_compact") or "")
+    try:
+        started_at = dt.datetime.strptime(
+            started_iso, "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=dt.timezone.utc)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Integrity retained-lock child started_at_utc is invalid"
+        ) from exc
+    expected_log_path = Path(expected_log_dir) / f"run-{run_compact}.log"
+    expected_lock_run_id = f"integrity:{expected_env_name}:{run_compact}"
+    if (
+        payload.get("env_name") != expected_env_name
+        or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{6}Z", run_compact)
+        or fmt_iso(started_at) != started_iso
+        or fmt_compact(started_at) != run_compact
+        or str(payload.get("log_path") or "") != str(expected_log_path)
+        or global_operation_lock.get("run_id") != expected_lock_run_id
+    ):
+        raise RuntimeError(
+            "Integrity retained-lock child logical run context identity disagrees"
+        )
+    return {
+        **payload,
+        "started_at": started_at,
+    }
+
+
 def run_integrity_under_global_operation_lock(
     *,
     argv: Sequence[str],
     args: argparse.Namespace,
     env: Mapping[str, str],
     run_compact: str,
+    started_at_utc: str,
+    log_path: str | Path,
 ) -> int:
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -22867,6 +22952,13 @@ def run_integrity_under_global_operation_lock(
         str(Path(__file__).resolve()),
         *[str(value) for value in argv],
     ]
+    logical_run_context = build_integrity_logical_run_context(
+        env_name=args.env,
+        started_at_utc=started_at_utc,
+        run_compact=run_compact,
+        log_path=log_path,
+    )
+    close_logging_handlers()
     completed = subprocess.run(
         command,
         cwd=repo_root,
@@ -22874,6 +22966,11 @@ def run_integrity_under_global_operation_lock(
             **os.environ,
             **{str(key): str(value) for key, value in env.items()},
             "SUPABASE_DB_URL": database_url,
+            INTEGRITY_LOGICAL_RUN_CONTEXT_ENV: json.dumps(
+                logical_run_context,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         },
         check=False,
     )
@@ -27492,6 +27589,20 @@ def normalize_source_key_sensorcommunity(
         )
 
 
+def close_logging_handlers() -> None:
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        try:
+            handler.flush()
+        except Exception:
+            pass
+        root.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
 def setup_logging(log_dir: str, run_compact: str, verbose: bool) -> Path:
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     log_path = Path(log_dir) / f"run-{run_compact}.log"
@@ -27506,10 +27617,9 @@ def setup_logging(log_dir: str, run_compact: str, verbose: bool) -> Path:
     root = logging.getLogger()
     root.setLevel(level)
     # Clear any handlers carried over from re-entry in tests / repeated runs.
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
+    close_logging_handlers()
 
-    fh = logging.FileHandler(log_path)
+    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     fh.setFormatter(formatter)
     fh.setLevel(level)
     root.addHandler(fh)
@@ -28544,25 +28654,47 @@ def main(argv: list[str]) -> int:
     serialized_history_path_configs = serialize_history_path_configs(history_path_configs)
     site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_VERSION", "")).strip() or None
 
+    global_operation_lock = observations_global_operation_lock_context(os.environ)
+    inherited_logical_run = inherited_integrity_logical_run_context(
+        os.environ,
+        expected_env_name=args.env,
+        expected_log_dir=env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"],
+        global_operation_lock=global_operation_lock,
+    )
     started_mono = time.monotonic()
-    started_at = utc_now()
-    started_iso = fmt_iso(started_at)
-    run_compact = fmt_compact(started_at)
+    if inherited_logical_run is None:
+        started_at = utc_now()
+        started_iso = fmt_iso(started_at)
+        run_compact = fmt_compact(started_at)
+    else:
+        started_at = inherited_logical_run["started_at"]
+        started_iso = inherited_logical_run["started_at_utc"]
+        run_compact = inherited_logical_run["run_compact"]
+        started_mono -= max(
+            0.0,
+            (utc_now() - started_at).total_seconds(),
+        )
 
     log_path = setup_logging(
         env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"], run_compact, args.verbose
     )
     log = logging.getLogger("uk-aq-history-integrity")
 
-    log.info(
-        "start env=%s profile=%s source=%s dry_run=%s check_only=%s "
-        "run_backfill=%s timeseries_binding_backup_mode=%s",
-        args.env, args.profile, args.source,
-        args.dry_run, args.check_only, args.run_backfill,
-        args.timeseries_binding_backup_mode,
-    )
-    log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
-    log.info("log_file=%s", log_path)
+    if inherited_logical_run is None:
+        log.info(
+            "start env=%s profile=%s source=%s dry_run=%s check_only=%s "
+            "run_backfill=%s timeseries_binding_backup_mode=%s",
+            args.env, args.profile, args.source,
+            args.dry_run, args.check_only, args.run_backfill,
+            args.timeseries_binding_backup_mode,
+        )
+        log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
+        log.info("log_file=%s", log_path)
+    else:
+        log.info(
+            "resumed under observations global operation lock run_compact=%s",
+            run_compact,
+        )
     daily_task_health_config = _resolve_daily_task_health_config(env_name=args.env)
     daily_task_health_enabled = bool(daily_task_health_config.get("enabled"))
     daily_task_health_strict = bool(daily_task_health_config.get("strict"))
@@ -28578,7 +28710,6 @@ def main(argv: list[str]) -> int:
         "backup_gate_checked": False,
         "blocked_reason": "awaiting_ingestdb_boundary",
     }
-    global_operation_lock = observations_global_operation_lock_context(os.environ)
     dropbox_currentness: dict[str, Any] | None = None
 
     preflight_summary: dict[str, Any] | None = None
@@ -28782,6 +28913,8 @@ def main(argv: list[str]) -> int:
             args=args,
             env=env,
             run_compact=run_compact,
+            started_at_utc=started_iso,
+            log_path=log_path,
         )
 
     # The child process is now inside the retained PostgreSQL session lock.

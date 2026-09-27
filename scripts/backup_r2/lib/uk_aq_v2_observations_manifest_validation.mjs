@@ -24,13 +24,16 @@ function isValidIsoTimestamp(value) {
   return typeof value === "string" && value.length > 0 && !Number.isNaN(Date.parse(value));
 }
 
-function isValidBackedUpAtUtc(payload) {
+export function isValidV2ObservationsBackedUpAtUtc(payload) {
   if (!Object.hasOwn(payload, "backed_up_at_utc")) return false;
+  if (payload.manifest_schema_version === 2) {
+    return isValidIsoTimestamp(payload.backed_up_at_utc);
+  }
   if (payload.manifest_schema_version === 3) {
     return payload.backed_up_at_utc === null
       || isValidIsoTimestamp(payload.backed_up_at_utc);
   }
-  return isValidIsoTimestamp(payload.backed_up_at_utc);
+  return false;
 }
 
 function pushFailure(failures, condition, code) {
@@ -154,7 +157,11 @@ export function validateV2ObservationsChildManifest(payload, {
       payload.timeseries_row_counts === null || isPlainObject(payload.timeseries_row_counts),
       "timeseries_row_counts_not_object_or_null",
     );
-    pushFailure(failures, isValidBackedUpAtUtc(payload), "backed_up_at_utc_invalid");
+    pushFailure(
+      failures,
+      isValidV2ObservationsBackedUpAtUtc(payload),
+      "backed_up_at_utc_invalid",
+    );
 
     if (kind === "connector") {
       pushFailure(failures, payload.pollutant_code === null, "connector_pollutant_code_not_null");

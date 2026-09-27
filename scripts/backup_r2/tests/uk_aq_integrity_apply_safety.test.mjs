@@ -31,6 +31,7 @@ import {
 } from "../uk_aq_apply_integrity_proposal.mjs";
 import {
   assembleSosLightDayParents,
+  assertCanonicalManifestProposal,
   createStagedObjectMap,
 } from "../uk_aq_execute_v2_observations_repair_impl.mjs";
 import {
@@ -1958,6 +1959,62 @@ function declaredPeerSosLightFixture() {
     finalConnector1,
   };
 }
+
+test("canonical day proposals apply the schema-sensitive backup timestamp contract", () => {
+  const fixture = declaredPeerSosLightFixture();
+  const dayKey = `${fixture.base}/manifest.json`;
+  const rebuiltDay = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc: fixture.dayUtc,
+    runId: "test-run",
+    manifestKey: dayKey,
+    connectorManifests: [fixture.finalConnector1, fixture.connector8],
+    writerGitSha: "test",
+    backedUpAtUtc: null,
+  });
+  const proposal = (payload) => ({
+    kind: "day_manifest",
+    key: dayKey,
+    body: JSON.stringify(payload),
+  });
+  const rehash = (payload) => {
+    const next = { ...payload };
+    delete next.manifest_hash;
+    next.manifest_hash = createHash("sha256")
+      .update(JSON.stringify(next))
+      .digest("hex");
+    return next;
+  };
+
+  assert.equal(rebuiltDay.manifest_schema_version, 3);
+  assert.equal(fixture.finalConnector1.backed_up_at_utc,
+    "2026-07-13T00:00:00.000Z");
+  assert.equal(fixture.connector8.backed_up_at_utc, null);
+  assert.equal(rebuiltDay.backed_up_at_utc, null);
+  assert.doesNotThrow(() => assertCanonicalManifestProposal(proposal(rebuiltDay)));
+
+  const schema2Null = rehash({
+    ...rebuiltDay,
+    manifest_schema_version: 2,
+    history_schema_version: 2,
+  });
+  assert.throws(
+    () => assertCanonicalManifestProposal(proposal(schema2Null)),
+    /Invalid canonical day_manifest backed_up_at_utc/,
+  );
+
+  const missing = { ...rebuiltDay };
+  delete missing.backed_up_at_utc;
+  for (const invalid of [missing, { ...rebuiltDay, backed_up_at_utc: undefined },
+    { ...rebuiltDay, backed_up_at_utc: "not-a-timestamp" },
+    { ...rebuiltDay, backed_up_at_utc: 123 },
+    { ...rebuiltDay, backed_up_at_utc: false }]) {
+    assert.throws(
+      () => assertCanonicalManifestProposal(proposal(rehash(invalid))),
+      /Invalid canonical day_manifest backed_up_at_utc/,
+    );
+  }
+});
 
 test("SOS-light preserves a day-declared schema-v3 connector with null backup timestamp", async () => {
   const fixture = declaredPeerSosLightFixture();
