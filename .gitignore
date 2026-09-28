@@ -16,6 +16,7 @@ system_docs_ops.zip
 /scripts/aqi_gaps/r2_aqi_gap_check*
 /workers/GCP-vars
 sync_to_live.sh
+beta_sync_to_live.sh
 /.aider.tags.cache.v4
 *.xlsx
 .venv*
