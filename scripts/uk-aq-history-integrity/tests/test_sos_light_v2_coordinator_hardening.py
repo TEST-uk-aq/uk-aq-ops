@@ -110,6 +110,7 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
             allow_stale_dropbox=True,
             check_only=False,
             dry_run=False,
+            env="TEST",
             from_day="2026-09-01",
             history_version="v2",
             repair_pollutants=["pm25"],
@@ -117,6 +118,64 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
             source=source,
             to_day="2026-09-01",
         )
+
+    @staticmethod
+    def _recovery_authority_inputs() -> dict[str, object]:
+        writer_runs = [
+            {
+                "task_key": task_key,
+                "latest_finished_run": {
+                    "run_id": f"{task_key}:prior",
+                    "status": "succeeded",
+                    "started_at": "2026-09-28T06:00:00Z",
+                    "finished_at": "2026-09-28T06:10:00Z",
+                },
+                "running_run": None,
+            }
+            for task_key in (
+                "ops.prune_daily",
+                "ops.r2_core_snapshot",
+                "ops.history_integrity",
+            )
+        ]
+        return {
+            "global_operation_lock": {
+                "logical_identity": "uk_aq:r2_history:v2:observations_global_operation",
+                "run_id": "integrity:TEST:2026-09-29T090000Z",
+                "nonce": "original-session",
+                "wait_ms": 0,
+                "outcome": "held",
+            },
+            "backup_readiness": {
+                "backup_ready": True,
+                "backup_run_id": "backup-17",
+                "backup_started_at": "2026-09-28T07:00:00Z",
+                "backup_finished_at": "2026-09-28T07:30:00Z",
+                "writer_runs": writer_runs,
+            },
+            "dropbox_currentness": {
+                "checkpoint_live_root_match": True,
+                "checkpoint": {
+                    "relative_key": "_ops/checkpoints/root.json",
+                    "byte_size": 123,
+                    "sha256": "a" * 64,
+                    "observations_processed_source_root_hash": "b" * 64,
+                },
+                "live_observations_root": {
+                    "key": "history/v2/observations/_manifests/manifest.json",
+                    "content_hash": "b" * 64,
+                    "byte_size": 456,
+                },
+            },
+            "core_snapshot_identity": {
+                "core_snapshot_day_utc": "2026-09-28",
+                "core_snapshot_manifest_key": (
+                    "history/v2/core/day_utc=2026-09-28/manifest.json"
+                ),
+                "core_snapshot_manifest_hash": "c" * 64,
+                "core_snapshot_manifest_sha256": "d" * 64,
+            },
+        }
 
     def test_fixed_v2_currentness_gate_supports_checkpoint_only(self) -> None:
         completed = SimpleNamespace(
@@ -542,9 +601,29 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
 
     def test_successful_python_transition_is_persisted_before_node_launch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            state = self._run_state(Path(tmpdir))
+            root = Path(tmpdir)
+            state = self._run_state(root)
             self._freeze_one_object(state)
             observed_at_launch: dict[str, object] = {}
+            recovery_state_path = root / "recovery.json"
+            recovery_state = {
+                "contract_version": MODULE.FIXED_V2_SOS_LIGHT_RECOVERY_CONTRACT,
+                "profile": MODULE.FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+                "authority_status": "complete",
+                "generation": "v2",
+                "logical_run": {},
+                "r2_mutation_started": False,
+                "resume": "permitted",
+                "node_apply_launch_permitted": False,
+                "r2_mutation_possible": False,
+                "recovery": {"outcome": "not_required"},
+            }
+            MODULE._atomic_write_fixed_v2_recovery_state(
+                recovery_state_path, recovery_state
+            )
+            state["fixed_v2_lock_recovery_state_path"] = str(
+                recovery_state_path
+            )
 
             class FakeProcess:
                 returncode = 0
@@ -562,6 +641,13 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
                     Path(state["run_state_path"]).read_text(encoding="utf-8")
                 )
                 observed_at_launch.update(persisted)
+                recovery_at_launch = MODULE._read_fixed_v2_recovery_state(
+                    recovery_state_path
+                )
+                self.assertTrue(
+                    recovery_at_launch["node_apply_launch_permitted"]
+                )
+                self.assertTrue(recovery_at_launch["r2_mutation_possible"])
                 return FakeProcess()
 
             with (
@@ -661,6 +747,53 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
         self.assertEqual(
             run.call_args.args[0][run.call_args.args[0].index("--run-id") + 1],
             f"integrity:TEST:{run_compact}",
+        )
+        self.assertNotIn("--recovery-profile", run.call_args.args[0])
+
+    def test_only_explicit_fixed_v2_route_enables_lock_recovery_profile(self) -> None:
+        run_compact = "2026-09-29T090000Z"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_repo_root_for_integrity_script",
+                    return_value=Path("/tmp/repo"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_history_writer_database_url",
+                    return_value="postgresql://test",
+                ),
+                mock.patch.object(MODULE, "close_logging_handlers"),
+                mock.patch.object(
+                    MODULE.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0),
+                ) as run,
+            ):
+                MODULE.run_integrity_under_global_operation_lock(
+                    argv=["--env", "TEST"],
+                    args=SimpleNamespace(env="TEST"),
+                    env={
+                        "UK_AQ_BACKFILL_NODE_BIN": "node",
+                        "UK_AQ_HISTORY_INTEGRITY_TMP_DIR": tmpdir,
+                    },
+                    run_compact=run_compact,
+                    started_at_utc="2026-09-29T09:00:00Z",
+                    log_path=f"/tmp/logs/run-{run_compact}.log",
+                    fixed_v2_recovery_enabled=True,
+                )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--recovery-profile") + 1],
+            MODULE.FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+        )
+        state_path = command[command.index("--recovery-state-json") + 1]
+        self.assertEqual(
+            run.call_args.kwargs["env"][
+                MODULE.FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV
+            ],
+            state_path,
         )
 
     def test_lock_child_appends_to_parent_log_and_report_identity(self) -> None:
@@ -854,6 +987,137 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
                     "run-2026-09-27T161537Z.log",
                 ],
             )
+
+    def test_recovery_authority_accepts_only_the_original_exact_authority(self) -> None:
+        args = self._write_enabled_sos_args()
+        inputs = self._recovery_authority_inputs()
+        original = MODULE._fixed_v2_recovery_authority_projection(
+            args=args,
+            started_iso="2026-09-29T09:00:00Z",
+            run_compact="2026-09-29T090000Z",
+            integrity_run_id=41,
+            daily_task_health_run_id="health-41",
+            platform_run_id="TEST:2026-09-29T090000Z",
+            requested_from_day="2026-09-01",
+            requested_to_day="2026-09-01",
+            **inputs,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "recovery.json"
+            MODULE._initialise_fixed_v2_recovery_state(state_path, original)
+            recovered_inputs = json.loads(json.dumps(inputs))
+            history_writer = next(
+                entry
+                for entry in recovered_inputs["backup_readiness"]["writer_runs"]
+                if entry["task_key"] == "ops.history_integrity"
+            )
+            history_writer["running_run"] = {
+                "run_id": "health-41",
+                "platform_run_id": "TEST:2026-09-29T090000Z",
+                "status": "running",
+            }
+            recovered = MODULE._fixed_v2_recovery_authority_projection(
+                args=args,
+                started_iso="2026-09-29T09:00:00Z",
+                run_compact="2026-09-29T090000Z",
+                integrity_run_id=41,
+                daily_task_health_run_id="health-41",
+                platform_run_id="TEST:2026-09-29T090000Z",
+                requested_from_day="2026-09-01",
+                requested_to_day="2026-09-01",
+                **recovered_inputs,
+            )
+            state = MODULE._revalidate_fixed_v2_recovery_state(
+                state_path, recovered
+            )
+            self.assertEqual(state["resume"], "permitted")
+            self.assertEqual(state["recovery"]["outcome"], "resumed")
+
+            mutations = {
+                "backup": lambda value: value["backup"].update(
+                    {"backup_run_id": "backup-18"}
+                ),
+                "checkpoint": lambda value: value["checkpoint"].update(
+                    {"sha256": "e" * 64}
+                ),
+                "observations_root": lambda value: value[
+                    "observations_roots"
+                ].update({
+                    "dropbox_content_hash": "f" * 64,
+                    "live_r2_content_hash": "f" * 64,
+                }),
+                "core": lambda value: value["core_snapshot_identity"].update(
+                    {"core_snapshot_manifest_sha256": "1" * 64}
+                ),
+                "writer": lambda value: value["writer_watermarks"][
+                    "ops.prune_daily"
+                ]["latest_finished_run"].update({"run_id": "prune:different"}),
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    MODULE._initialise_fixed_v2_recovery_state(
+                        state_path, original
+                    )
+                    changed = json.loads(json.dumps(recovered))
+                    mutate(changed)
+                    with self.assertRaisesRegex(
+                        RuntimeError, "authority changed or is uncertain"
+                    ):
+                        MODULE._revalidate_fixed_v2_recovery_state(
+                            state_path, changed
+                        )
+                    blocked = MODULE._read_fixed_v2_recovery_state(state_path)
+                    self.assertEqual(blocked["resume"], "forbidden")
+                    self.assertEqual(
+                        blocked["recovery"]["outcome"],
+                        "blocked_authority_changed",
+                    )
+
+    def test_recovery_writer_ordering_uses_original_run_start_time(self) -> None:
+        args = self._write_enabled_sos_args()
+        with mock.patch.object(
+            MODULE,
+            "check_dropbox_backup_ready",
+            return_value={"backup_ready": True},
+        ) as readiness:
+            MODULE.run_scheduled_backup_gate(
+                args,
+                "2026-09-29T09:00:00Z",
+            )
+        self.assertEqual(
+            readiness.call_args.kwargs["integrity_started_at_utc"],
+            "2026-09-29T09:00:00Z",
+        )
+        self.assertFalse(readiness.call_args.kwargs["allow_stale_dropbox"])
+
+    def test_node_apply_permission_requires_resolved_recovery_authority(self) -> None:
+        inputs = self._recovery_authority_inputs()
+        original = MODULE._fixed_v2_recovery_authority_projection(
+            args=self._write_enabled_sos_args(),
+            started_iso="2026-09-29T09:00:00Z",
+            run_compact="2026-09-29T090000Z",
+            integrity_run_id=41,
+            daily_task_health_run_id="health-41",
+            platform_run_id="TEST:2026-09-29T090000Z",
+            requested_from_day="2026-09-01",
+            requested_to_day="2026-09-01",
+            **inputs,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "recovery.json"
+            MODULE._initialise_fixed_v2_recovery_state(state_path, original)
+            permitted = MODULE._permit_fixed_v2_node_apply_launch(state_path)
+            self.assertTrue(permitted["node_apply_launch_permitted"])
+            self.assertTrue(permitted["r2_mutation_possible"])
+
+            permitted["resume"] = "unresolved"
+            permitted["node_apply_launch_permitted"] = False
+            permitted["r2_mutation_possible"] = False
+            MODULE._atomic_write_fixed_v2_recovery_state(
+                state_path, permitted
+            )
+            with self.assertRaisesRegex(RuntimeError, "does not permit"):
+                MODULE._permit_fixed_v2_node_apply_launch(state_path)
 
 
 if __name__ == "__main__":

@@ -60,10 +60,6 @@ import {
 import {
   requireSosLightV2CoordinatorFreeze,
 } from "./lib/sos_light_v2_coordinator_validation.mjs";
-import {
-  FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV,
-  markR2MutationStarted,
-} from "../operations/lib/uk_aq_sos_light_v2_lock_recovery.mjs";
 
 function parseArgs(argv) {
   const args = { runStateJson: "", writeR2: false };
@@ -3007,17 +3003,6 @@ export async function applyValidatedProposal({
       if (!object) throw new Error(`Scheduled object is unavailable during apply setup: ${scheduleEntry.canonical_key}`);
       object.schedule = scheduleEntry;
       operations.push({ kind: "put", key: object.key, object });
-    }
-    if (sosLightV2CoordinatorFreeze.dedicated && operations.length > 0) {
-      markR2MutationStarted({
-        statePath: env[FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV],
-        expectedRunId: String(
-          runState.observations_global_operation_lock?.run_id || "",
-        ),
-      });
-      runState.apply.r2_mutation_started = true;
-      runState.apply.r2_mutation_started_at_utc = new Date().toISOString();
-      writeCompleteRunState();
     }
     const connectorGroups = new Map();
     const dayGroups = new Map();

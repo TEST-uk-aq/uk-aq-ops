@@ -9,17 +9,6 @@ import {
   withHistoryWriterClient,
   withObservationsGlobalOperationLock,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
-import {
-  FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV,
-  FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
-  FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV,
-  FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV,
-  FIXED_V2_SOS_LIGHT_RECOVERY_WINDOW_MS,
-  recordLockLoss,
-  recordReacquireAttempt,
-  recordReacquired,
-  recordRecoveryOutcome,
-} from "./lib/uk_aq_sos_light_v2_lock_recovery.mjs";
 
 const CHILD_SUPERVISOR_PATH = fileURLToPath(
   new URL("./uk_aq_observations_global_operation_child_supervisor.mjs", import.meta.url),
@@ -41,8 +30,6 @@ export function parseLockedCommandArgs(argv) {
     runId: null,
     timeoutMs: 60_000,
     heartbeatMs: 5_000,
-    recoveryProfile: null,
-    recoveryStateJson: null,
   };
   for (let index = 0; index < separator; index += 1) {
     const flag = argv[index];
@@ -50,8 +37,6 @@ export function parseLockedCommandArgs(argv) {
     else if (flag === "--run-id") options.runId = requireValue(argv, index++, flag);
     else if (flag === "--timeout-ms") options.timeoutMs = Number(requireValue(argv, index++, flag));
     else if (flag === "--heartbeat-ms") options.heartbeatMs = Number(requireValue(argv, index++, flag));
-    else if (flag === "--recovery-profile") options.recoveryProfile = requireValue(argv, index++, flag);
-    else if (flag === "--recovery-state-json") options.recoveryStateJson = requireValue(argv, index++, flag);
     else throw new Error(`Unknown lock coordinator argument: ${flag}`);
   }
   if (!String(options.owner || "").trim()) throw new Error("--owner is required");
@@ -61,16 +46,6 @@ export function parseLockedCommandArgs(argv) {
   }
   if (!Number.isFinite(options.heartbeatMs) || options.heartbeatMs < 250) {
     throw new Error("--heartbeat-ms must be at least 250");
-  }
-  if (options.recoveryProfile !== null
-      && options.recoveryProfile !== FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE) {
-    throw new Error("Unsupported observations-lock recovery profile");
-  }
-  if (options.recoveryProfile && !String(options.recoveryStateJson || "").trim()) {
-    throw new Error("--recovery-state-json is required for the fixed-v2 recovery profile");
-  }
-  if (!options.recoveryProfile && options.recoveryStateJson) {
-    throw new Error("--recovery-state-json requires --recovery-profile");
   }
   return Object.freeze({
     ...options,
@@ -194,12 +169,6 @@ export async function runCommandWithObservationsGlobalOperationLock({
   diagnostics = [],
   spawnProcess = spawn,
   withClient = withHistoryWriterClient,
-  withLock = withObservationsGlobalOperationLock,
-  runChild = runChildWhileLockHeld,
-  recoveryProfile = null,
-  recoveryStatePath = null,
-  now = Date.now,
-  sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
 } = {}) {
   const connectionString = String(databaseUrl || "").trim();
   if (!connectionString) {
@@ -209,140 +178,48 @@ export async function runCommandWithObservationsGlobalOperationLock({
     error.code = "UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_DATABASE_URL_REQUIRED";
     throw error;
   }
-  const recoveryEnabled = recoveryProfile === FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE;
-  if (recoveryEnabled && !String(recoveryStatePath || "").trim()) {
-    throw new Error("Fixed-v2 SOS-light recovery requires a durable state path");
-  }
-  let recoveryGeneration = 0;
-
-  const runOneSession = async ({
-    acquisitionTimeoutMs,
-    connectionTimeoutMs,
-    recoveryAttempt = 0,
-  }) => {
-    const nonce = randomUUID();
-    let acquired = false;
-    try {
-      return await withClient(connectionString, async (client) => {
-        return await withLock({
-          client,
-          owner,
-          runId,
-          timeoutMs: acquisitionTimeoutMs,
-          heartbeatMs,
-          diagnostics,
-          diagnosticEnvironment: env.UKAQ_ENV_NAME || env.UK_AQ_ENV || env.ENVIRONMENT,
-        }, async (identity, lock) => {
-          acquired = true;
-          const acquiredDiagnostic = [...diagnostics].reverse().find(
-            (entry) => entry.event === "lock_acquired",
-          );
-          if (recoveryAttempt > 0) {
-            recoveryGeneration += 1;
-            recordReacquired({
-              statePath: recoveryStatePath,
-              expectedRunId: runId,
-              attemptCount: recoveryAttempt,
-              recoveryGeneration,
-              lockIdentity: identity,
-              lockNonce: nonce,
-            });
-          }
-          const childEnv = {
-            ...env,
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: "true",
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: String(owner),
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: String(runId),
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.logicalIdentity]: identity.logical_identity,
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.classId]: String(identity.class_id),
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.objectId]: String(identity.object_id),
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.nonce]: nonce,
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.acquired]: "true",
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: String(acquiredDiagnostic?.wait_ms || 0),
-            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
-            ...(recoveryEnabled ? {
-              [FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV]: String(recoveryStatePath),
-            } : {}),
-            ...(recoveryAttempt > 0 ? {
-              [FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV]: "true",
-              [FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV]: String(recoveryGeneration),
-            } : {}),
-          };
-          const code = await runChild({
-            command,
-            commandArgs,
-            env: childEnv,
-            lockSignal: lock.signal,
-            spawnProcess,
-          });
-          lock.assertHeld();
-          return code;
-        });
-      }, {
-        applicationName: `uk-aq-observations-global-operation-lock:${String(owner)}`,
-        statementTimeoutMs: Math.min(30_000, Math.max(1, connectionTimeoutMs)),
-        queryTimeoutMs: Math.min(30_000, Math.max(1, connectionTimeoutMs)),
-        connectionTimeoutMs: Math.min(15_000, Math.max(1, connectionTimeoutMs)),
+  const nonce = randomUUID();
+  return await withClient(connectionString, async (client) => {
+    return await withObservationsGlobalOperationLock({
+      client,
+      owner,
+      runId,
+      timeoutMs,
+      heartbeatMs,
+      diagnostics,
+      diagnosticEnvironment: env.UKAQ_ENV_NAME || env.UK_AQ_ENV || env.ENVIRONMENT,
+    }, async (identity, lock) => {
+      const acquiredDiagnostic = [...diagnostics].reverse().find(
+        (entry) => entry.event === "lock_acquired",
+      );
+      const childEnv = {
+        ...env,
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: "true",
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: String(owner),
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: String(runId),
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.logicalIdentity]: identity.logical_identity,
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.classId]: String(identity.class_id),
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.objectId]: String(identity.object_id),
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.nonce]: nonce,
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.acquired]: "true",
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: String(acquiredDiagnostic?.wait_ms || 0),
+        [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
+      };
+      const code = await runChildWhileLockHeld({
+        command,
+        commandArgs,
+        env: childEnv,
+        lockSignal: lock.signal,
+        spawnProcess,
       });
-    } catch (error) {
-      error.ukAqLockAcquired = acquired;
-      throw error;
-    }
-  };
-
-  let recoveryDeadlineMs = null;
-  let recoveryAttempt = 0;
-  while (true) {
-    try {
-      const remainingMs = recoveryDeadlineMs === null
-        ? Math.max(1, Number(timeoutMs) || 1)
-        : Math.max(1, recoveryDeadlineMs - now());
-      return await runOneSession({
-        acquisitionTimeoutMs: recoveryDeadlineMs === null
-          ? timeoutMs : Math.min(30_000, remainingMs),
-        connectionTimeoutMs: recoveryDeadlineMs === null
-          ? 30_000 : Math.min(15_000, remainingMs),
-        recoveryAttempt,
-      });
-    } catch (error) {
-      const lostHeldSession = error?.code === "UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_LOST";
-      if (lostHeldSession) {
-        if (!recoveryEnabled) throw error;
-        const lossIso = new Date(now()).toISOString();
-        recordLockLoss({
-          statePath: recoveryStatePath,
-          expectedRunId: runId,
-          error,
-          nowIso: lossIso,
-        });
-        recoveryDeadlineMs = now() + FIXED_V2_SOS_LIGHT_RECOVERY_WINDOW_MS;
-        recoveryAttempt = 0;
-      } else if (recoveryDeadlineMs === null || error?.ukAqLockAcquired) {
-        throw error;
-      }
-      if (now() >= recoveryDeadlineMs) {
-        recordRecoveryOutcome({
-          statePath: recoveryStatePath,
-          expectedRunId: runId,
-          outcome: "reacquire_timeout",
-          error,
-        });
-        const timeout = new Error(
-          "Fixed-v2 SOS-light pre-mutation lock recovery timed out",
-          { cause: error instanceof Error ? error : undefined },
-        );
-        timeout.code = "UK_AQ_SOS_LIGHT_V2_LOCK_RECOVERY_TIMEOUT";
-        throw timeout;
-      }
-      recoveryAttempt += 1;
-      recordReacquireAttempt({
-        statePath: recoveryStatePath,
-        expectedRunId: runId,
-        attemptCount: recoveryAttempt,
-      });
-      await sleep(Math.min(1_000, Math.max(1, recoveryDeadlineMs - now())));
-    }
-  }
+      lock.assertHeld();
+      return code;
+    });
+  }, {
+    applicationName: `uk-aq-observations-global-operation-lock:${String(owner)}`,
+    statementTimeoutMs: 30_000,
+    queryTimeoutMs: 30_000,
+  });
 }
 
 export async function main({ argv = process.argv.slice(2), env = process.env } = {}) {
@@ -359,8 +236,6 @@ export async function main({ argv = process.argv.slice(2), env = process.env } =
       timeoutMs: args.timeoutMs,
       heartbeatMs: args.heartbeatMs,
       diagnostics,
-      recoveryProfile: args.recoveryProfile,
-      recoveryStatePath: args.recoveryStateJson,
     });
   } finally {
     for (const diagnostic of diagnostics) {

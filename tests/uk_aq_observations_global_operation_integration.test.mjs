@@ -13,7 +13,16 @@ import {
 } from "../scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs";
 import {
   runChildWhileLockHeld,
+  runCommandWithObservationsGlobalOperationLock,
 } from "../scripts/operations/uk_aq_with_observations_global_operation_lock.mjs";
+import {
+  FIXED_V2_SOS_LIGHT_RECOVERY_CONTRACT,
+  FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV,
+  FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+  FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV,
+  markR2MutationStarted,
+  recordLockLoss,
+} from "../scripts/operations/lib/uk_aq_sos_light_v2_lock_recovery.mjs";
 import {
   parseLockedHistoryBackupArgs,
   requireLockedHistoryBackupMutation,
@@ -44,6 +53,27 @@ import {
 } from "../workers/shared/uk_aq_r2_history_writer.mjs";
 
 const h = (char) => char.repeat(64);
+
+function recoveryAuthority(runId) {
+  return {
+    contract_version: FIXED_V2_SOS_LIGHT_RECOVERY_CONTRACT,
+    profile: FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+    authority_status: "complete",
+    generation: "v2",
+    logical_run: {
+      environment: "TEST",
+      started_at_utc: "2026-09-29T09:00:00Z",
+      run_compact: "2026-09-29T090000Z",
+      lock_run_id: runId,
+      integrity_run_id: 41,
+    },
+    r2_mutation_started: false,
+    resume: "permitted",
+    node_apply_launch_permitted: false,
+    r2_mutation_possible: false,
+    recovery: { recovery_generation: 0 },
+  };
+}
 
 function lockEnv(owner, runId) {
   const identity = observationsGlobalOperationLockIdentity();
@@ -422,6 +452,150 @@ test("lost retained lock terminates the entire owned child operation fail-closed
   controller.abort(lost);
   await assert.rejects(operation, (error) => error === lost);
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("fixed-v2 pre-mutation loss reacquires on a fresh session before same-run restart", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v2-lock-recovery-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const statePath = path.join(root, "recovery.json");
+  const runId = "integrity:TEST:2026-09-29T090000Z";
+  fs.writeFileSync(statePath, JSON.stringify(recoveryAuthority(runId)));
+  let clientCount = 0;
+  let childCount = 0;
+  const result = await runCommandWithObservationsGlobalOperationLock({
+    databaseUrl: "postgresql://fresh-session-per-attempt",
+    owner: "integrity",
+    runId,
+    command: "python",
+    commandArgs: ["integrity.py"],
+    env: {},
+    recoveryProfile: FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+    recoveryStatePath: statePath,
+    sleep: async () => {},
+    withClient: async (_url, callback) => {
+      clientCount += 1;
+      return await callback({ session: clientCount });
+    },
+    withLock: async ({ client }, callback) => await callback({
+      logical_identity: "uk_aq:r2_history:v2:observations_global_operation",
+      class_id: 1,
+      object_id: 2,
+    }, {
+      signal: new AbortController().signal,
+      assertHeld() {},
+      session: client.session,
+    }),
+    runChild: async ({ env }) => {
+      childCount += 1;
+      if (childCount === 1) {
+        const lost = new Error("retained session lost");
+        lost.code = "UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_LOST";
+        throw lost;
+      }
+      assert.equal(clientCount, 2);
+      assert.equal(env[FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV], "true");
+      assert.equal(env[FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV], "1");
+      return 0;
+    },
+  });
+  assert.equal(result, 0);
+  assert.equal(clientCount, 2);
+  assert.equal(childCount, 2);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.r2_mutation_started, false);
+  assert.equal(state.resume, "unresolved");
+  assert.equal(state.recovery.outcome, "revalidation_required");
+  assert.equal(state.recovery.reacquire_attempt_count, 1);
+});
+
+test("fixed-v2 post-mutation lock loss never enters automatic recovery", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v2-post-mutation-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const statePath = path.join(root, "recovery.json");
+  const runId = "integrity:TEST:2026-09-29T090000Z";
+  const authority = recoveryAuthority(runId);
+  authority.node_apply_launch_permitted = true;
+  authority.r2_mutation_possible = true;
+  fs.writeFileSync(statePath, JSON.stringify(authority));
+  markR2MutationStarted({ statePath, expectedRunId: runId });
+  assert.throws(
+    () => recordLockLoss({
+      statePath,
+      expectedRunId: runId,
+      error: new Error("session lost"),
+    }),
+    (error) => error.code === "UK_AQ_SOS_LIGHT_V2_POST_MUTATION_LOCK_LOSS",
+  );
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.r2_mutation_started, true);
+  assert.equal(state.resume, "forbidden");
+  assert.equal(state.recovery.outcome, "post_mutation_lock_loss");
+});
+
+test("fixed-v2 unresolved recovery cannot invoke a canonical R2 mutation adapter", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v2-no-unlocked-mutation-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const statePath = path.join(root, "recovery.json");
+  const runId = "integrity:TEST:2026-09-29T090000Z";
+  fs.writeFileSync(statePath, JSON.stringify(recoveryAuthority(runId)));
+  recordLockLoss({
+    statePath,
+    expectedRunId: runId,
+    error: new Error("retained session lost"),
+  });
+  let mutationAdapterCalls = 0;
+  assert.throws(() => {
+    markR2MutationStarted({ statePath, expectedRunId: runId });
+    mutationAdapterCalls += 1;
+  }, /not authorised/);
+  assert.equal(mutationAdapterCalls, 0);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.resume, "unresolved");
+  assert.equal(state.r2_mutation_started, false);
+});
+
+test("fixed-v2 pre-mutation recovery expires at the fifteen-minute deadline", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v2-lock-timeout-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const statePath = path.join(root, "recovery.json");
+  const runId = "integrity:TEST:2026-09-29T090000Z";
+  fs.writeFileSync(statePath, JSON.stringify(recoveryAuthority(runId)));
+  let currentMs = 0;
+  let clientCount = 0;
+  await assert.rejects(
+    runCommandWithObservationsGlobalOperationLock({
+      databaseUrl: "postgresql://fresh-session-per-attempt",
+      owner: "integrity",
+      runId,
+      command: "python",
+      recoveryProfile: FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+      recoveryStatePath: statePath,
+      now: () => currentMs,
+      sleep: async () => { currentMs = 15 * 60 * 1000 + 1; },
+      withClient: async (_url, callback) => {
+        clientCount += 1;
+        if (clientCount > 1) throw new Error("connection unavailable");
+        return await callback({});
+      },
+      withLock: async (_options, callback) => await callback({
+        logical_identity: "uk_aq:r2_history:v2:observations_global_operation",
+        class_id: 1,
+        object_id: 2,
+      }, {
+        signal: new AbortController().signal,
+        assertHeld() {},
+      }),
+      runChild: async () => {
+        const lost = new Error("retained session lost");
+        lost.code = "UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_LOST";
+        throw lost;
+      },
+    }),
+    (error) => error.code === "UK_AQ_SOS_LIGHT_V2_LOCK_RECOVERY_TIMEOUT",
+  );
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.resume, "forbidden");
+  assert.equal(state.recovery.outcome, "reacquire_timeout");
 });
 
 test("supervised locked command preserves normal successful completion", async (t) => {
