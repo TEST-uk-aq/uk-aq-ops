@@ -70,7 +70,10 @@ export async function handleCompatRoute(
     }
 
     const historyRoute = ["/api/dashboard", "/api/storage_coverage", "/api/r2_metrics", "/api/r2_connector_counts"].includes(pathname);
-    if (historyRoute) {
+    const requiresHistoryResolution =
+      historyRoute || pathname === "/api/operations_dropbox_mtime";
+
+    if (requiresHistoryResolution) {
       try { env = await resolveHistoryEnvironment(env); }
       catch { return errorEnvelope("HISTORY_AUTHORITY_UNAVAILABLE", "Stable history generation could not be resolved", 503); }
       // An upstream payload must not survive an authority switch in the proxy cache.
