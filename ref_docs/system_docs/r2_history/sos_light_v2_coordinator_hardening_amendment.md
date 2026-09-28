@@ -37,6 +37,8 @@ This amendment applies to the dedicated fixed-generation `sos-light-v2` path. It
 
 The fixed-v3 implementation remains separately owned by `sos-light-v3` and its v3-specific contracts and code. Equivalent safety goals do not require identical v2/v3 internal proposal transport.
 
+For the agreed future fixed-v2 pre-mutation global-lock recovery, also read [`sos_light_pre_mutation_lock_recovery_amendment.md`](sos_light_pre_mutation_lock_recovery_amendment.md). That amendment is independently load-bearing for lock-loss pause/reacquisition and original-authority revalidation. It does not replace this file's staging, persisted-state equality or transition-fingerprint requirements.
+
 ## Behaviour that remains unchanged
 
 The following existing authority remains unchanged:
@@ -63,6 +65,20 @@ The following existing authority remains unchanged:
 - failure/recovery semantics.
 
 The v2 coordinator hardening MUST improve persistence and pre-APPLY evidence without weakening any of these rules.
+
+## Interaction with pre-mutation lock recovery
+
+When the future fixed-v2 lock-recovery amendment is active, a successful pre-mutation recovery remains part of the same logical run.
+
+Recovery does not make incomplete coordinator state authoritative. After reacquisition:
+
+- the original Step 0/writer/backup/root/core authority must first pass the recovery amendment exactly;
+- any staging/proposal state retained from before lock loss remains subject to its normal body/dependency/persistence validation;
+- if final transition approval or fingerprint evidence existed before lock loss, it MUST be recomputed or revalidated from the current persisted final state after recovery before Node APPLY is permitted;
+- `node_apply_launch_permitted` MUST remain false while lock recovery or recovery revalidation is unresolved;
+- no automatic recovery is permitted after the monotonic first-mutation boundary has been crossed.
+
+The lock-recovery path therefore adds a precondition before the existing final freeze. It does not weaken or bypass the freeze.
 
 ## Bounded pre-APPLY coordinator persistence
 
@@ -197,10 +213,12 @@ This requirement supplements the existing core-snapshot identity checks and does
 The dedicated SOS-light v2 transition fingerprint contract is:
 
 ```text
-uk_aq_sos_light_v2_transition_state_fingerprint_v1
+uk_aq_sos_light_v2_transition_state_fingerprint_v2
 ```
 
 The fingerprint is an unkeyed deterministic SHA-256 integrity binding. It is not a MAC and does not protect against an actor who can deliberately rewrite the full run state and recompute the digest. Its purpose is to prevent stale successful Python transition evidence from being reused after a covered proposal-graph change.
+
+Version `v2` supersedes the earlier `v1` payload because the fingerprint now binds the dedicated operation identity and connector scope through an explicit `operation_identity` section. A producer/verifier contract-version mismatch MUST fail closed.
 
 ### Canonical payload
 
@@ -208,6 +226,14 @@ The fingerprint payload MUST be deliberately narrow and derived from the semanti
 
 It MUST bind, where present and transition-relevant:
 
+- `operation_identity`, containing the canonical dedicated-operation identity and connector scope:
+  - `environment`;
+  - `execution_path`;
+  - `mode`;
+  - `dedicated_sos_historical_replacement`;
+  - `mutation_connector_ids`;
+  - `selected_mutation_connector_ids`;
+  - `protected_connector_ids`;
 - exact final staged-object membership;
 - object key;
 - object SHA-256;
@@ -255,6 +281,7 @@ The contract requires:
 - canonical object-key normalisation;
 - deterministic object membership ordering;
 - deterministic ordering for set-like arrays;
+- connector-ID arrays inside `operation_identity` validated as unique non-negative safe integers and canonicalised into sorted order;
 - preserved order only where order is semantically meaningful;
 - recursively sorted object properties;
 - compact UTF-8 JSON;
@@ -277,6 +304,8 @@ Node MUST NOT be launched until that final transition evidence has itself been d
 
 ### Independent Node gate
 
+For the dedicated SOS-light v2 path, Node MUST recognise fixed-v2 evidence independently of the three normal identity markers (`execution_path`, `mode`, `dedicated_sos_historical_replacement`). Unmistakable fixed-v2 evidence includes the coordinator staging contract, fixed-v2 fingerprint fields, SOS-light complete-day tombstone/replacement evidence, SOS-light-specific audit fields, and SOS-light baseline/assembly object provenance. If such evidence exists, the complete dedicated fixed-v2 identity contract is mandatory. Missing, altered or inconsistent identity MUST fail closed before mutation rather than downgrading the proposal to the generic v2 path.
+
 For the dedicated SOS-light v2 path, Node MUST reject before any R2 mutation when:
 
 - coordinator staging is incomplete;
@@ -290,7 +319,7 @@ For the dedicated SOS-light v2 path, Node MUST reject before any R2 mutation whe
 
 A mismatch MUST be classified as stale or changed coordinator transition evidence.
 
-Generic non-SOS v2 Integrity proposals MUST remain compatible with their existing apply contract and MUST NOT be rejected solely for lacking this SOS-light-specific fingerprint.
+Generic non-SOS v2 Integrity proposals that contain no fixed-v2-only evidence MUST remain compatible with their existing apply contract and MUST NOT be rejected solely for lacking this SOS-light-specific fingerprint.
 
 After the new gate succeeds, all existing independent Node validation remains mandatory.
 
@@ -387,6 +416,7 @@ A completed or failed dedicated SOS-light v2 run MUST make it possible to determ
 - final staged-write-set provenance status;
 - transition-validation status;
 - transition fingerprint contract;
+- operation identity and connector scope bound into the fingerprint;
 - transition fingerprint SHA-256;
 - whether Node independently accepted the fingerprint;
 - detector and proposal completed counts;
@@ -407,14 +437,16 @@ They MUST cover:
 3. rejection of an intermediate/incomplete coordinator checkpoint before Node launch;
 4. rejection when the claimed final persisted state differs from the in-memory final state;
 5. Python production of the v2 fingerprint contract/version and SHA-256 after successful transition validation;
-6. Python/Node equality for the same realistic frozen v2 SOS-light proposal;
+6. Python/Node equality for the same realistic frozen v2 SOS-light proposal, including identical `operation_identity` canonicalisation;
 7. Node rejection after a covered dependency identity is changed while status/count success evidence remains intact;
 8. Node rejection after a covered planner/final-provenance field is changed;
 9. rejection of missing or unknown SOS-light v2 fingerprint evidence;
-10. continued compatibility of a generic non-SOS v2 proposal without SOS-light-specific freeze fields;
-11. continued independent Node body/dependency validation;
-12. bounded rather than per-object progress;
-13. unchanged APPLY journal/persistence safety.
+10. rejection when unmistakable fixed-v2 evidence remains but the dedicated identity markers are removed, altered or inconsistent;
+11. fingerprint invalidation when a covered operation-identity or connector-scope field changes;
+12. continued compatibility of a genuinely generic non-SOS v2 proposal without SOS-light-specific freeze/fingerprint evidence;
+13. continued independent Node body/dependency validation;
+14. bounded rather than per-object progress;
+15. unchanged APPLY journal/persistence safety.
 
 Do not add a broad speculative pre-deployment test suite.
 
@@ -439,8 +471,8 @@ The real operation MUST demonstrate:
 - final staged-write-set provenance completes;
 - persisted-state equality succeeds;
 - Python transition validation succeeds;
-- the v2 transition fingerprint is persisted;
-- Node independently accepts the same fingerprint;
+- the v2 transition fingerprint is persisted with the dedicated operation identity and connector scope bound into the canonical payload;
+- Node independently accepts the same fingerprint and does not permit fixed-v2 evidence to fall back to the generic v2 path;
 - canonical APPLY proceeds under the existing journal/order/verification contract;
 - final Integrity verification succeeds;
 - the subsequent required Dropbox backup/materialisation can establish the repaired state.
