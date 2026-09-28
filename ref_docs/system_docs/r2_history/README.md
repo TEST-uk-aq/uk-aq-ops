@@ -164,11 +164,14 @@ For Latest Snapshot reconciliation also read [`../latest_snapshot/integrity_reco
 For SOS-light, start with the load-bearing authority contract:
 
 1. [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md)
-2. [`sos_light_model.md`](sos_light_model.md)
-3. [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md)
-4. [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md)
+2. [`sos_light_pre_mutation_lock_recovery_amendment.md`](sos_light_pre_mutation_lock_recovery_amendment.md) for the agreed fixed-v2 pre-mutation global-lock recovery. **Status: future implementation authority; not current runtime behaviour.**
+3. [`sos_light_model.md`](sos_light_model.md)
+4. [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md)
+5. [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md)
 
 For the agreed upcoming fixed-v2 coordinator hardening, also read [`sos_light_v2_coordinator_hardening_amendment.md`](sos_light_v2_coordinator_hardening_amendment.md). **Status: future implementation authority; not current runtime behaviour.** It owns the planned bounded pre-APPLY checkpointing, final persisted-state equality, v2 transition fingerprint and extended v2 progress contract without changing Step 0, source authority, complete-day replacement or canonical APPLY semantics.
+
+The pre-mutation lock-recovery amendment is separately load-bearing for the planned fixed-v2 resilience path. It permits bounded fresh-session reacquisition only before the first possible R2 mutation and only after exact revalidation of the original Step 0, writer-history, backup/checkpoint, observations-root and core-snapshot authority. Until that implementation is deployed and accepted, current lock-session loss remains fail-closed.
 
 The three-phase contract owns the simple fixed-v2/fixed-v3 authority model:
 
@@ -232,6 +235,7 @@ Some established filenames remain because older active or historical documents l
 Current explicit precedence includes:
 
 - [`sos_light_three_phase_authority_contract.md`](sos_light_three_phase_authority_contract.md) over conflicting SOS-light planning/currentness/provenance/backup wording, including any requirement to use live R2 before apply or retain/copy derived v3 scoped-root dependencies merely for SOS-light;
+- [`sos_light_pre_mutation_lock_recovery_amendment.md`](sos_light_pre_mutation_lock_recovery_amendment.md) over conflicting future fixed-v2 wording only for bounded pre-mutation lock-session reacquisition and original-authority revalidation; current runtime remains fail-closed until that amendment is deployed and accepted;
 - [`aqi_r2_retirement_contract.md`](aqi_r2_retirement_contract.md) over older active-AQI-in-R2 wording;
 - [`prune_daily_observation_only_phase_b_contract.md`](prune_daily_observation_only_phase_b_contract.md) for the permanent observation-only Phase B model;
 - [`prune_daily_complete_snapshot_child_set_contract.md`](prune_daily_complete_snapshot_child_set_contract.md) over generic child-preservation wording when Prune Daily owns a complete connector-day source snapshot;
