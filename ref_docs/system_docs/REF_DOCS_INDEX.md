@@ -52,6 +52,7 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 
 - History Integrity;
 - SOS-light and SOS historical repair, including the load-bearing three-phase authority contract;
+- future fixed-v2 SOS-light pre-mutation global-lock recovery authority, including fresh-session reacquisition and exact original-authority revalidation;
 - observation-history index v3 and exact-leaf behaviour;
 - Integrity writer/core/proposal/apply safety;
 - direct selected-partition replacement and run exclusion;
@@ -92,7 +93,9 @@ The authoritative SOS-light contract now requires:
 - APPLY only the frozen changed/removed set, then verify those R2 results;
 - no pre-apply live-R2 observation/index dependency discovery beyond the single Step 0 observations-root hash comparison;
 - no normal Dropbox backup expansion for v3 scoped-root dependency evidence.
+- The mirrored pre-mutation lock-recovery amendment is **future implementation authority only**. Current runtime still fails closed on retained-lock session loss. The future fixed-v2 path may recover only before the first possible R2 mutation, only on a fresh PostgreSQL session, and only after the original run's writer/backup/checkpoint/Dropbox-root/live-root/core authority is proven unchanged.
 - serial monthly SOS-light wrappers refresh Dropbox after every successful month, including the final month; correlate and wait for the exact backup run; wait for that backup generation to reach the local checkpoint; do not use `--allow-stale-dropbox`; stop on month/backup/sync failure; and do not use a fixed cooldown. The local checkpoint root alone is insufficient: refreshed files consumed by the next SOS-light baseline must also pass the exact-run local materialisation/authentication gate.
 
 PR #69's scoped-root backup expansion was reverted. The normal v3 backup continues to carry the generation-selected compact `observations_timeseries_latest.json` but not the full derived scoped/exact index tree.
 - `ref_docs/system_docs/r2_history/sos_light_three_phase_authority_contract.md` and `ref_docs/system_docs/r2_history/proposal_dependency_provenance_contract.md` were refreshed from authoritative source commit `eca75cfe4c5eeda79a8a45f944173060b183cfc5` on `26/09/2026` to define bounded/file-backed SOS-light proposal transport and staged-body references, avoiding monolithic stdout JSON payloads while preserving the complete pre-APPLY proposal gate.
+- `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/r2_history/README.md`, `CONTRACT_INDEX.md`, `observations_run_exclusion_contract.md`, `history_writer_coordination.md`, `sos_light_three_phase_authority_contract.md`, `sos_light_v2_coordinator_hardening_amendment.md` and the new `sos_light_pre_mutation_lock_recovery_amendment.md` were refreshed from authoritative source head `2834bcb268f3ba71b4f2c50b36d40da97531b9b7` on `28/09/2026`. This adds the explicitly future fixed-v2 pre-mutation global-lock recovery contract: bounded fresh-session reacquisition for up to 15 minutes, followed by exact revalidation of the original Step 0 writer/backup/checkpoint/root/core authority before the same logical run may resume. Post-mutation lock loss remains fail-closed.
