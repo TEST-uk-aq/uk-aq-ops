@@ -110,6 +110,8 @@ Observation migration/maintenance also uses the same lock while active.
 
 A process that cannot acquire the lock within the bounded acquisition period fails or defers cleanly.
 
+For the **future fixed-v2 SOS-light path only**, [`sos_light_pre_mutation_lock_recovery_amendment.md`](sos_light_pre_mutation_lock_recovery_amendment.md) permits a bounded recovery attempt after a previously acquired lock session is lost, but only before the first possible R2 mutation. The protected child must stop forward progress, the lock must be reacquired on a fresh PostgreSQL session, and the original Step 0/writer/backup/root/core authority must be revalidated exactly before the same logical run may resume. This is not current runtime behaviour until deployed and accepted through real TEST operation. It does not change lock-loss handling for Prune Daily, backup, migration, generic Integrity, fixed-v3 SOS-light or any post-mutation state.
+
 This global lock is deliberately broader than the exact connector/day/pollutant mutation unit. The system does not need concurrent observation mutation/backup throughput enough to justify the additional cross-run coordination complexity.
 
 Normal public/private history readers do not participate in this lock.
