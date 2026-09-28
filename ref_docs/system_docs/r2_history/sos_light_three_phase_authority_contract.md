@@ -30,6 +30,13 @@ emit `verification_status`, never `vstatus`. Temporary legacy read compatibility
 does not authorise legacy output. This naming dependency does not change the
 planning or publication authority below.
 
+The agreed future fixed-v2 pre-mutation global-lock recovery is owned by
+[`sos_light_pre_mutation_lock_recovery_amendment.md`](sos_light_pre_mutation_lock_recovery_amendment.md).
+That amendment changes only the handling of a lost lock session before the first
+possible R2 mutation. It does not change the three-phase authority model, and it
+is not current runtime behaviour until deployed and accepted through real TEST
+operation.
+
 ## Non-negotiable model
 
 SOS-light has one small hard currentness gate followed by exactly three conceptual repair phases:
@@ -113,6 +120,10 @@ The write-enabled gate MUST establish, in this order:
 7. require exact equality between those two root hashes;
 8. only after all preceding checks succeed, pin the Dropbox baseline for DETECT and PROPOSE.
 
+This ordering is load-bearing for both fixed-v2 and fixed-v3 write-enabled SOS-light. A generation-specific helper MAY group implementation details internally, but the run MUST NOT accept a later Step 0 condition before every preceding condition has succeeded. In particular, the backup/writer-ordering requirement in step 4 MUST succeed before the Dropbox/live observations-root equality result is accepted as the run's currentness authority and before the baseline is pinned.
+
+For every write-enabled SOS-light invocation, `--allow-stale-dropbox` MUST NOT bypass, satisfy, suppress or downgrade the backup/writer-ordering requirement. If that option remains available to other Integrity modes, the fixed SOS-light route MUST still fail closed unless the normal writer-ordering gate succeeds.
+
 The observations-root hash is the primary and sufficient normal content comparison.
 
 If either the backup/writer ordering check or the root-hash equality check fails, SOS-light MUST stop immediately before DETECT. It MUST NOT continue into year/month comparison, child inspection, repair planning or reconciliation.
@@ -122,6 +133,8 @@ Normal SOS-light MUST NOT compare year/month/day hashes when the root hash match
 A root-hash mismatch is not a prompt to decide which side is correct. It means the accepted Dropbox baseline cannot be used for this repair until the underlying backup/currentness issue has been resolved.
 
 After Step 0 succeeds, the Dropbox baseline is pinned and becomes the pre-apply truth for DETECT and PROPOSE. Live R2 observation/index contents MUST NOT then be consulted again until APPLY/VERIFY, except for non-content coordination mechanisms.
+
+For the future fixed-v2 recovery path, loss of the global lock session before the first possible R2 mutation MAY enter the bounded recovery state defined by [`sos_light_pre_mutation_lock_recovery_amendment.md`](sos_light_pre_mutation_lock_recovery_amendment.md). Recovery is not permission to plan from live R2. The only additional live-R2 read is the same binary observations-root currentness comparison needed to prove that the **original** pinned authority is still unchanged after lock reacquisition. A different writer run, backup/checkpoint, observations root or core snapshot forbids same-run resume. Lock loss after mutation starts remains fail-closed.
 
 
 ### Serial monthly wrapper boundary
@@ -248,7 +261,42 @@ A file-backed proposal hand-off MUST itself be authenticated before use. The coo
 
 Progress events such as metadata-planning counters are diagnostic only. They do not replace the final authenticated proposal artifact and do not authorise APPLY.
 
-An inability to materialise, authenticate, persist or load the complete proposal representation is a pre-APPLY failure. It MUST NOT be worked around by reducing dependency validation, consulting live R2, or omitting required changed objects.
+### Bulk proposal staging, checkpointing and progress
+
+Large fixed-v3 proposals MAY be ingested and staged in bounded in-memory batches. The coordinator is not required to rewrite the complete run-state document after every staged object, every structural-validation flag change or every changed-scope record.
+
+This batching permission applies only to pre-APPLY proposal ingestion, local staging, validation and finalisation. It MUST NOT weaken APPLY journalling, deletion/PUT ordering, post-PUT verification persistence or any other mutation-time crash-safety rule.
+
+A persisted pre-APPLY checkpoint MUST be atomic and internally self-consistent. It MUST NOT claim an object is structurally validated unless:
+
+- the referenced staged body already exists inside the controlled run-local overlay;
+- its byte length and SHA-256 have been verified for that checkpoint;
+- the object's dependency metadata and proposal identity are present in the same checkpoint state.
+
+The coordinator MAY accumulate multiple such object updates, changed-scope records and related bookkeeping in memory before writing one checkpoint. Repeated full-state serialisation merely to record successive fields for the same object SHOULD be avoided.
+
+At minimum, the coordinator MUST persist:
+
+- bounded intermediate checkpoints during a long proposal-ingestion/staging phase;
+- one complete final run state after all proposal objects, tombstones, changed-scope bookkeeping and final staged-write-set provenance have been assembled;
+- the final frozen/validated state before the first R2 DELETE or PUT.
+
+A crash or interruption before the final frozen checkpoint MUST NOT make a partial pre-APPLY state mutation-authoritative. The run may validate and resume a supported checkpoint or recompute/restart the pre-APPLY phase, but it MUST NOT enter APPLY from an incomplete or internally inconsistent checkpoint.
+
+Long-running O(n) proposal phases MUST expose bounded progress. For phases that can process thousands of proposal records or body references, progress SHOULD be emitted at least every 250 completed objects or every 15 seconds, whichever occurs first, plus a final completion event. Progress SHOULD identify the phase, completed count, total count where known and elapsed time.
+
+At least these large-plan boundaries SHOULD be separately visible:
+
+- proposal-artifact/body-reference authentication;
+- proposal overlay staging and structural validation;
+- final run-state checkpoint/freeze;
+- final staged-write-set validation.
+
+Progress reporting MUST remain compact and MUST NOT emit one line per object during normal operation.
+
+The implementation SHOULD avoid redundant full-file hashing of the same staged body within one pre-APPLY hand-off when an equivalent integrity proof can be safely carried forward inside the same coordinator process. Any such optimisation MUST preserve fail-closed body identity verification before final proposal freeze and MUST NOT introduce a time-of-check/time-of-use gap that lets unverified bytes enter the frozen proposal.
+
+An inability to materialise, authenticate, checkpoint, persist or load the complete proposal representation is a pre-APPLY failure. It MUST NOT be worked around by reducing dependency validation, consulting live R2, or omitting required changed objects.
 
 ## V2 and V3 share the same model
 
@@ -322,6 +370,38 @@ During APPLY, R2 access is limited to the planned mutation and the bounded post-
 
 A list operation needed to delete a complete selected day prefix remains permitted as an execution mechanism. It MUST NOT feed planning/preservation decisions.
 
+### Fixed-v3 semantic verification cache capacity
+
+Fixed-v3 SOS-light semantic verification may require every changed Parquet body referenced by one selected pollutant manifest to remain available after its immediate post-PUT GET until that pollutant manifest is semantically verified.
+
+For this dedicated fixed-v3 path, the verified-body cache limits are:
+
+```text
+maximum retained entries = 1024
+maximum retained body bytes = 64 MiB
+```
+
+These limits apply to the dedicated fixed-v3 SOS-light semantic verification cache only. They do not silently change the generic Integrity verified-GET cache defaults used by other apply paths.
+
+The 64 MiB limit is the primary retained-body memory bound. The 1,024-entry limit is a secondary sanity/object-overhead guard and MUST NOT be treated as a memory-size proxy.
+
+Before the first R2 DELETE or PUT, fixed-v3 SOS-light MUST simulate retention against the exact frozen per-day publication order and selected source-evidence pollutant manifests. The validator MUST determine the actual peak retained entry count and retained body bytes required by the frozen proposal.
+
+The pre-APPLY validator and runtime cache MUST use the same fixed-v3 limits. If the frozen proposal requires more than either 1,024 simultaneously retained bodies or 64 MiB of simultaneously retained body bytes, the run MUST fail before mutation.
+
+For changed selected Parquets on this dedicated path, semantic verification continues to refuse a second GET as a substitute for a body that should still be retained from its verified post-PUT GET. A required body MUST therefore not be evicted before its consuming selected pollutant manifest is verified.
+
+Immediately after a selected pollutant manifest completes semantic verification, all cached Parquet bodies consumed by that manifest MUST be invalidated. At selected-day completion, any remaining cache entries MUST be cleared.
+
+The pre-APPLY calculation and final APPLY evidence MUST make visible at least:
+
+- required peak retained entries;
+- required peak retained body bytes;
+- configured maximum entries;
+- configured maximum body bytes.
+
+This cache remains an APPLY-time verification optimisation only. It is not persisted authority, does not change source truth, and does not permit pre-APPLY live-R2 planning.
+
 ## Normal Dropbox backup remains simple
 
 SOS-light MUST NOT expand the normal Dropbox history backup merely to preserve derived v3 index dependency objects.
@@ -348,7 +428,8 @@ Before APPLY, SOS-light fails closed when:
 - selected replacement observations cannot be built;
 - the complete local overlay cannot be assembled;
 - a required derived object/index cannot be deterministically rebuilt from the overlay;
-- the complete proposed write/delete set cannot be frozen and validated.
+- the complete proposed write/delete set cannot be frozen and validated;
+- fixed-v3 semantic verification would require more than the contracted 1,024 retained verified bodies or 64 MiB of retained verified body bytes at any point in the frozen publication order.
 
 It MUST NOT fail merely because an old live R2 child/index object is missing or differs before apply, because live R2 is not the pre-apply authority.
 
@@ -386,8 +467,10 @@ If a proposed SOS-light feature materially complicates the three-phase model, pr
 
 ## Implementation reconciliation
 
-As of 18/09/2026, the current fixed-v3 implementation contains retained/external-dependency behaviour that is more complicated than this contract and must be simplified before the next accepted fixed-v3 write-enabled repair.
+As of 28/09/2026, fixed-v3 planning has been reconciled to this three-phase authority model. Its accepted design uses the checkpoint-authenticated compact-latest retained-root fast path only for unaffected derived-scope descriptors, with canonical reconstruction fallback for required scopes, bounded APPLY-time semantic verification caching, and no pre-APPLY live-R2 body discovery for planning or preservation.
 
-The normal Dropbox backup code was restored to its pre-PR-69 behaviour. That rollback is consistent with this contract: normal backup must not carry a v3 scoped-root dependency-evidence set merely for SOS-light.
+The normal Dropbox backup remains intentionally simple and does not carry a complete v3 scoped/exact dependency tree merely for SOS-light.
 
-Implementation reconciliation must preserve the working fixed-v2 SOS-light path while bringing fixed-v3 back to the same three-phase authority model.
+Fixed-v2 remains a separate fixed-generation implementation with its own coordinator staging, persisted-state equality and transition-fingerprint contract. Sharing infrastructure with fixed-v3 does not merge their generation-specific freeze or publication semantics.
+
+Before the next accepted write-enabled TEST operation, implementation acceptance MUST also demonstrate the common Step 0 and process-boundary rules already defined by this contract and the generation-aware core-snapshot amendment. In particular, fixed-v2 must not permit `--allow-stale-dropbox` to bypass writer ordering and must honour the Step 0 ordering above, while a dedicated fixed-v3 APPLY child must independently validate the pinned generation-matched core snapshot before mutation authority is accepted. These are implementation acceptance requirements; they do not change the three-phase authority model.
