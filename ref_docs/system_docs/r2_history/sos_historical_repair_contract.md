@@ -194,7 +194,9 @@ Live R2 is used only for:
 - listing and deleting the selected complete day prefix;
 - bounded deletion verification;
 - uploading the assembled day and affected indexes;
-- one post-PUT verification GET per changed object.
+- one logical post-PUT verification operation per changed object.
+
+A logical post-PUT verification operation MAY make bounded transport retries when a GET fails with a classified transient transport or HTTP error. Those retries are part of the same logical verification and MUST NOT be treated as additional changed-object verifications. The operation succeeds only after a GET returns the exact expected object identity and content. Retry exhaustion, permanent GET failure or any byte, hash, content or semantic mismatch MUST fail closed.
 
 ## AQI exclusion
 

@@ -63,7 +63,9 @@ Each relevant event MUST include, as applicable:
 - event timestamp;
 - success or failure status;
 - failure message;
-- post-PUT verification count or equivalent proof that the required GET occurred exactly once.
+- post-PUT verification count or equivalent proof that exactly one logical post-PUT verification operation occurred for the changed object.
+
+The required post-PUT verification is one logical verification operation per changed object. That logical operation MAY contain bounded transport retries when an individual GET fails with a classified transient transport or HTTP error. Retry attempts MUST NOT be counted as additional logical post-PUT verifications or additional logical journal events. The logical verification succeeds only after a GET returns the exact expected object identity and content; retry exhaustion, a permanent GET failure or any byte, hash, content or semantic mismatch MUST fail closed.
 
 For prefix deletion, the journal MUST distinguish at least:
 
@@ -232,7 +234,7 @@ The final successful or failed report MUST identify:
 Before deployment, run only the smallest deterministic checks needed to prove structural viability. They MUST prove:
 
 1. multiple object transitions append evidence without rewriting the complete checkpoint for each transition;
-2. a changed object still receives its required post-PUT GET and durable verification evidence;
+2. a changed object still receives exactly one logical post-PUT verification operation and durable verification evidence, with any bounded transient transport retries remaining inside that logical operation;
 3. a parent cannot publish until required child verification evidence is durably recorded;
 4. SOS-light checkpoints after one day completes before the next day deletion starts;
 5. a simulated day failure leaves later days untouched and records the last completed day;
@@ -253,7 +255,7 @@ After deployment, validate through a real CIC-Test operation:
 3. confirm each day completes and checkpoints before the next day is deleted;
 4. confirm the compact checkpoint remains bounded rather than growing with every deleted key and transition;
 5. confirm detailed per-object and deletion evidence exists in identity-pinned run-scoped artifacts;
-6. confirm all changed objects still receive their required post-PUT GET verification;
+6. confirm all changed objects still receive exactly one logical post-PUT verification operation, with any transient GET retries bounded and recorded without inflating logical verification counts;
 7. confirm indexes publish only after all selected days complete;
 8. compare apply duration and local CPU use with the previous whole-state-rewrite implementation.
 
