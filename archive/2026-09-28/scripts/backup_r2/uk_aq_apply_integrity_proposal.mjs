@@ -54,9 +54,6 @@ import {
   isVersionedHistoryIndexNamespaceKey,
   requireObservationHistoryIntegrityKey,
 } from "./lib/observation_history_integrity_key_allowlist.mjs";
-import {
-  getIntegrityR2ObjectWithRetry,
-} from "./lib/integrity_r2_get_retry.mjs";
 
 function parseArgs(argv) {
   const args = { runStateJson: "", writeR2: false };
@@ -146,8 +143,8 @@ export function publicationRank(key) {
 
 export const APPLY_PROGRESS_CHECKPOINT_OBJECT_INTERVAL = 50;
 export const APPLY_PROGRESS_CHECKPOINT_ELAPSED_MS = 30_000;
-export const APPLY_PROGRESS_LOG_OBJECT_INTERVAL = 250;
-export const APPLY_PROGRESS_LOG_ELAPSED_MS = 15_000;
+export const APPLY_PROGRESS_LOG_OBJECT_INTERVAL = 50;
+export const APPLY_PROGRESS_LOG_ELAPSED_MS = 30_000;
 export const MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1";
 export const PUBLICATION_SCHEDULE_CONTRACT_VERSION = "integrity-apply-publication-schedule-v1";
 
@@ -802,7 +799,7 @@ export function createBoundedProgressReporter({
     if (!force
       && completedObjects - lastLoggedCompleted < objectInterval
       && currentTime - lastLoggedAt < elapsedMs) return false;
-    (log || ((line) => process.stderr.write(`UK_AQ_INTEGRITY_PROGRESS ${line}\n`)))(message);
+    (log || ((line) => process.stderr.write(`[canonical-apply] ${line}\n`)))(message);
     lastLoggedCompleted = completedObjects;
     lastLoggedAt = currentTime;
     return true;
@@ -1505,11 +1502,7 @@ export async function putAndVerifyObject({
       post_put_verification_count: 0,
       post_put_verification_attempt_count: 1,
     });
-    const fresh = await adapters.getObject({
-      r2,
-      key: object.key,
-      phase: `canonical_apply_post_put_readback_${objectPublicationStage(object)}`,
-    });
+    const fresh = await adapters.getObject({ r2, key: object.key });
     if (Number(fresh.bytes) !== object.body.byteLength || sha256Hex(fresh.body) !== entry.sha256) {
       throw new Error(`R2 GET verification identity mismatch: ${object.key}`);
     }
@@ -2334,11 +2327,7 @@ export async function verifyLiveObservationPartition({
           `Dedicated SOS semantic verification refuses a second GET for changed Parquet: ${key}`,
         );
       }
-      const live = await adapters.getObject({
-        r2,
-        key,
-        phase: "canonical_apply_semantic_readback",
-      });
+      const live = await adapters.getObject({ r2, key });
       body = live.body;
       sourceKind = "fresh_get";
       if (Number(live.bytes) !== Number(stagedEntry.bytes) || sha256Hex(body) !== expectedSha) {
@@ -2488,11 +2477,7 @@ export async function prepareMergedDayManifest({ r2, object, adapters, exactProp
     : mergeConnectorManifestReferences(currentReferences, references(proposed));
   const connectorManifests = [];
   for (const reference of mergedReferences) {
-    const child = JSON.parse((await adapters.getObject({
-      r2,
-      key: reference.manifest_key,
-      phase: "canonical_apply_parent_dependency_read",
-    })).body.toString("utf8"));
+    const child = JSON.parse((await adapters.getObject({ r2, key: reference.manifest_key })).body.toString("utf8"));
     validateCanonicalHistoryV2Manifest(child, {
       history_version: "v2",
       domain: proposed.domain,
@@ -2675,20 +2660,9 @@ export async function applyValidatedProposal({
   env = process.env,
 }) {
   assertIntegrityApplyGenerationEligible(env);
-  const baseGetObject = adapters.getObject || r2GetObject;
-  const retryLog = adapters.progressLog
-    ? (event) => adapters.progressLog(
-      `UK_AQ_INTEGRITY_PROGRESS ${JSON.stringify(event)}`,
-    )
-    : undefined;
   const resolvedAdapters = {
     deleteObjects: adapters.deleteObjects || r2DeleteObjects,
-    getObject: ({ phase, ...request }) => getIntegrityR2ObjectWithRetry({
-      getObject: baseGetObject,
-      ...request,
-      phase: phase || "canonical_apply_r2_get",
-      ...(retryLog ? { log: retryLog } : {}),
-    }),
+    getObject: adapters.getObject || r2GetObject,
     listAllObjects: adapters.listAllObjects || r2ListAllObjects,
     putObject: adapters.putObject || r2PutObject,
   };
@@ -2914,22 +2888,9 @@ export async function applyValidatedProposal({
   const startedAtMs = Date.now();
   const report = createBoundedProgressReporter({ log: adapters.progressLog });
   const elapsedSeconds = () => Math.max(0, Math.round((Date.now() - startedAtMs) / 1000));
-  const progressMessage = (label) => JSON.stringify({
-    phase: String(label || "canonical_apply_progress")
-      .trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, ""),
-    total_planned_operations: counts.planned_writes + counts.planned_deletions,
-    completed_operations: counts.completed_writes + counts.completed_deletions,
-    planned_writes: counts.planned_writes,
-    completed_writes: counts.completed_writes,
-    get_verified_writes: counts.get_verified_writes,
-    planned_post_put_verifications: counts.planned_post_put_verifications,
-    completed_post_put_verifications: counts.completed_post_put_verifications,
-    planned_deletions: counts.planned_deletions,
-    completed_deletions: counts.completed_deletions,
-    deleted_objects: counts.deleted_objects,
-    failed_operations: counts.failed_operations,
-    elapsed_seconds: elapsedSeconds(),
-  });
+  const progressMessage = (label) => `${label} completed_objects=${counts.completed_writes}/${counts.planned_writes} `
+    + `completed_verifications=${counts.completed_post_put_verifications}/${counts.planned_post_put_verifications} `
+    + `elapsed_seconds=${elapsedSeconds()}`;
   let lastOptionalCheckpointAt = Date.now();
   let lastOptionalCheckpointWrites = 0;
   const maybeCheckpointAndLog = async () => {
@@ -2948,7 +2909,7 @@ export async function applyValidatedProposal({
       : "within-day object progress";
     report({
       message: progressMessage(progressLabel),
-      completedObjects: counts.completed_writes + counts.completed_deletions,
+      completedObjects: counts.completed_writes,
     });
   };
   try {
@@ -3020,7 +2981,6 @@ export async function applyValidatedProposal({
           verifiedBodyCache,
         });
         counts.completed_deletions += 1;
-        await maybeCheckpointAndLog();
         if (!dedicatedSosProposal.dedicated) await checkpoint("after_deletion_verification");
       } else {
         const { object } = operation;

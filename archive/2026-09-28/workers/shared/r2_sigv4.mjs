@@ -296,7 +296,7 @@ export async function fetchWithTimeout(
   }
 }
 
-export function isRetryableR2Status(status) {
+function isRetryableR2Status(status) {
   return R2_RETRYABLE_STATUS_CODES.has(status);
 }
 
@@ -374,13 +374,8 @@ async function fetchR2WithRetry({
   buildRequest,
   body = undefined,
   consumeResponse = null,
-  maxAttempts = R2_REQUEST_MAX_ATTEMPTS,
 }) {
-  const boundedMaxAttempts = Number.isSafeInteger(Number(maxAttempts))
-    && Number(maxAttempts) > 0
-    ? Number(maxAttempts)
-    : R2_REQUEST_MAX_ATTEMPTS;
-  for (let attempt = 1; attempt <= boundedMaxAttempts; attempt += 1) {
+  for (let attempt = 1; attempt <= R2_REQUEST_MAX_ATTEMPTS; attempt += 1) {
     const request = buildRequest();
     try {
       const attemptResult = await fetchWithTimeout(
@@ -395,7 +390,7 @@ async function fetchR2WithRetry({
         async (response) => {
           if (
             isRetryableR2Status(response.status) &&
-            attempt < boundedMaxAttempts
+            attempt < R2_REQUEST_MAX_ATTEMPTS
           ) {
             cancelResponseBody(response);
             return { retry: true, value: null };
@@ -414,7 +409,7 @@ async function fetchR2WithRetry({
     } catch (error) {
       if (
         !isRetryableR2RequestError(error) ||
-        attempt === boundedMaxAttempts
+        attempt === R2_REQUEST_MAX_ATTEMPTS
       ) {
         throw error;
       }
@@ -574,7 +569,7 @@ export async function r2HeadObject({ r2, key }) {
   };
 }
 
-export async function r2GetObject({ r2, key, max_attempts = R2_REQUEST_MAX_ATTEMPTS }) {
+export async function r2GetObject({ r2, key }) {
   if (r2?.adapter?.getObject) {
     return r2.adapter.getObject({ key });
   }
@@ -594,14 +589,10 @@ export async function r2GetObject({ r2, key, max_attempts = R2_REQUEST_MAX_ATTEM
       arrayBuffer: response.ok ? await response.arrayBuffer() : null,
       errorText: response.ok ? "" : await readResponseText(response, 3000),
     }),
-    maxAttempts: max_attempts,
   });
 
   if (!response.ok) {
-    const error = new Error(`R2 GET failed (${response.status}) key=${key}: ${errorText}`);
-    error.status = response.status;
-    error.code = `HTTP_${response.status}`;
-    throw error;
+    throw new Error(`R2 GET failed (${response.status}) key=${key}: ${errorText}`);
   }
 
   return {

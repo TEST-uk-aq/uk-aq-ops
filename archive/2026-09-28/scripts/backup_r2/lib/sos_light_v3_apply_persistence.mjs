@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-  createBoundedProgressReporter,
   createVerifiedGetBodyCache,
   createApplyPersistence,
   createInitialApplyProgressState,
@@ -10,9 +9,6 @@ import {
   verifyLiveObservationPartition,
 } from "../uk_aq_apply_integrity_proposal.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
-import {
-  getIntegrityR2ObjectWithRetry,
-} from "./integrity_r2_get_retry.mjs";
 import {
   isObservationHistoryIntegrityIndexKey,
   requireObservationHistoryIntegrityKey,
@@ -442,31 +438,6 @@ export async function runPersistedSosLightV3Apply({
     completed_post_put_verifications: 0,
     failed_operations: 0,
   };
-  const applyStartedAtMs = Date.now();
-  const report = createBoundedProgressReporter({ log: adapters.progressLog });
-  const progressMessage = (phase) => JSON.stringify({
-    phase,
-    total_planned_operations: counts.planned_writes + counts.planned_deletions,
-    completed_operations: counts.completed_writes + counts.completed_deletions,
-    planned_writes: counts.planned_writes,
-    completed_writes: counts.completed_writes,
-    get_verified_writes: counts.get_verified_writes,
-    planned_post_put_verifications: counts.planned_post_put_verifications,
-    completed_post_put_verifications: counts.completed_post_put_verifications,
-    planned_deletions: counts.planned_deletions,
-    completed_deletions: counts.completed_deletions,
-    deleted_objects: counts.deleted_objects,
-    failed_operations: counts.failed_operations,
-    elapsed_seconds: Math.max(
-      0,
-      Math.round((Date.now() - applyStartedAtMs) / 1000),
-    ),
-  });
-  const reportProgress = (phase, force = false) => report({
-    message: progressMessage(phase),
-    completedObjects: counts.completed_writes + counts.completed_deletions,
-    force,
-  });
   const { progressState, perDayStatus } = createInitialApplyProgressState({
     runStatePath,
     runId: runState.run_id,
@@ -530,18 +501,6 @@ export async function runPersistedSosLightV3Apply({
   let nextOperationId = 1;
   let currentOperation = null;
   let activeDayUtc = null;
-  const baseGetObject = adapters.getObject;
-  const retryLog = adapters.progressLog
-    ? (event) => adapters.progressLog(
-      `UK_AQ_INTEGRITY_PROGRESS ${JSON.stringify(event)}`,
-    )
-    : undefined;
-  const getObject = ({ phase, ...request }) => getIntegrityR2ObjectWithRetry({
-    getObject: baseGetObject,
-    ...request,
-    phase: phase || "canonical_v3_apply_r2_get",
-    ...(retryLog ? { log: retryLog } : {}),
-  });
 
   const syncPersistence = () => {
     const coordinatorWrites = Number(
@@ -668,11 +627,7 @@ export async function runPersistedSosLightV3Apply({
   const trackedGetObject = async ({ key }) => {
     const normalized = normalizedKey(key);
     const operation = pendingByKey.get(normalized);
-    if (!operation) return await getObject({
-      r2,
-      key: normalized,
-      phase: "canonical_v3_apply_dependency_read",
-    });
+    if (!operation) return await adapters.getObject({ r2, key: normalized });
     persistence.appendEvent({
       event_type: "post_put_get_started",
       operation_id: operation.operation_id,
@@ -683,11 +638,7 @@ export async function runPersistedSosLightV3Apply({
       status: "started",
     });
     try {
-      const stored = await getObject({
-        r2,
-        key: normalized,
-        phase: `canonical_v3_apply_post_put_readback_${operation.publication_stage}`,
-      });
+      const stored = await adapters.getObject({ r2, key: normalized });
       const body = exactBody(stored?.body, normalized);
       if (
         stored?.exists === false ||
@@ -752,7 +703,6 @@ export async function runPersistedSosLightV3Apply({
       counts.get_verified_writes += 1;
       if (operation.uploaded) counts.uploaded_writes += 1;
       else counts.skipped_unchanged_writes += 1;
-      reportProgress("canonical_v3_apply_progress");
       return stored;
     } catch (error) {
       appendFailure(operation, error);
@@ -828,7 +778,6 @@ export async function runPersistedSosLightV3Apply({
       status: "preparing_deletion",
       operation_started: true,
     });
-    reportProgress("canonical_v3_day_deletion_started", true);
     const existing = await adapters.listAllObjects({
       r2,
       prefix: `${prefix}/`,
@@ -896,7 +845,6 @@ export async function runPersistedSosLightV3Apply({
       });
       counts.completed_deletions += 1;
       counts.deleted_objects += keys.length;
-      reportProgress("canonical_v3_day_deletion_completed", true);
       persistence.appendEvent({
         event_type: "deletion_verified",
         prefix,
@@ -993,7 +941,6 @@ export async function runPersistedSosLightV3Apply({
     });
     counts.completed_deletions += 1;
     counts.deleted_objects += keys.length;
-    reportProgress("canonical_v3_exact_scope_deletion_completed");
     persistence.appendEvent({
       event_type: "exact_v3_scope_deletion_verified",
       prefix,
@@ -1022,7 +969,6 @@ export async function runPersistedSosLightV3Apply({
     });
     persistence.flush();
     checkpoint("fixed_v3_apply_intent_before_first_mutation");
-    reportProgress("canonical_v3_apply_started", true);
     const publishObject = async (object) => {
       if (object.key.endsWith(".parquet")) {
         await trackedPutAndVerifyParquet(object);
@@ -1032,7 +978,7 @@ export async function runPersistedSosLightV3Apply({
         r2,
         runState,
         object,
-        adapters: { ...adapters, getObject },
+        adapters,
         persistence,
         verifiedBodyCache,
       });
@@ -1068,7 +1014,6 @@ export async function runPersistedSosLightV3Apply({
       activeDayUtc = null;
     }
     runState.apply.current_phase = "canonical_v3_shared_tail";
-    reportProgress("canonical_v3_shared_tail_started", true);
     for (const removal of exactScopeRemovalPrefixes) {
       await executePlannedExactScopeRemoval(removal);
     }
@@ -1109,7 +1054,6 @@ export async function runPersistedSosLightV3Apply({
       canonical_v3_writer_result: writerResult,
     };
     writeCompleteRunState();
-    reportProgress("canonical_v3_apply_completed", true);
     return {
       ok: true,
       status: "succeeded",
@@ -1119,7 +1063,6 @@ export async function runPersistedSosLightV3Apply({
     };
   } catch (error) {
     counts.failed_operations += 1;
-    reportProgress("canonical_v3_apply_failed", true);
     verifiedBodyCache.clear("apply_failure");
     if (activeDayUtc && perDayStatus[activeDayUtc]) {
       perDayStatus[activeDayUtc].status = "failed";

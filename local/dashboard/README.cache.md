@@ -28,6 +28,40 @@ UK_AQ_DASHBOARD_MYSQL_PASSWORD=REPLACE_LOCALLY
 
 The writer file uses `uk_aq_dashboard_test_writer` and its own password. Keep both mode `600`. Normal authoritative upstream credentials remain in `.env`.
 
+## Oracle MySQL boot prerequisite
+
+The dashboard LaunchAgents depend on the existing Oracle MySQL installation at
+`/usr/local/mysql`; they must never try to start MySQL with `sudo`. Before
+installing/reloading the dashboard agents, `local/launchd/install_launchd.sh`
+validates the Oracle plist and requires
+`system/com.oracle.oss.mysql.mysqld` to be registered and `/tmp/mysql.sock` to
+exist.
+
+If the plist exists but the service is absent from the system launchd domain,
+stop any manually started server and register the existing Oracle daemon once:
+
+```bash
+sudo /usr/local/mysql/support-files/mysql.server stop
+sudo launchctl enable system/com.oracle.oss.mysql.mysqld
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.oracle.oss.mysql.mysqld.plist
+sudo launchctl kickstart -k system/com.oracle.oss.mysql.mysqld
+```
+
+Confirm the persistent state before installing the dashboard agents:
+
+```bash
+sudo launchctl print-disabled system | grep 'com.oracle.oss.mysql.mysqld'
+sudo launchctl print system/com.oracle.oss.mysql.mysqld
+/usr/local/mysql/bin/mysqladmin --protocol=socket --socket=/tmp/mysql.sock ping
+ls -l /tmp/mysql.sock
+```
+
+Use `mysqladmin ping` for this check. The Oracle `mysql.server status` helper
+derives a hostname PID-file name, while this LaunchDaemon deliberately owns
+`/usr/local/mysql/data/mysqld.local.pid`.
+
+Do not install a second LaunchDaemon or replace Oracle MySQL with Homebrew.
+
 ## Canonical schema
 
 The canonical TEST/LIVE-compatible DDL is:
@@ -108,6 +142,7 @@ The background refresher runs independently of the browser.
 
 - Dashboard current summary: every 5 minutes. Its recent ingest-run input is first synchronised into rolling `ingest_runs` using a `created_at` watermark with overlap.
 - Daily task runs: every 5 minutes. Initial collection hydrates the retained window; later runs use an `updated_at` watermark with overlap. Latest and All runs are both served from the same local relational rows.
+- History Integrity Daily Task summaries use a narrow defensive compaction of `backup_readiness` in this derived cache. Complete nested `writer_runs`, prior run summaries and other writer evidence are excluded, while the backup decision, counts and compact running-run identities remain. Other task summaries are not byte-truncated or generically rewritten.
 - Service egress: every 5 minutes. Recent mutable minute buckets are re-read with overlap and upserted rather than repeatedly downloading the dashboard's whole graph window.
 - DB-size and schema-size metrics: hourly, with at least two recent hours re-read and upserted. Normal chart rendering reads MySQL.
 - R2 account usage: hourly. The Cloudflare fetch remains asynchronous to the browser and each successful result is persisted as an hourly local point.
@@ -150,5 +185,10 @@ launchctl kickstart -k \
 ```
 
 Real TEST acceptance should confirm: warm local reads report `local_mysql`; Daily Tasks Latest and All runs use the retained relational cache; Daily Tasks Refresh causes a source reconciliation and writer log entry; incremental sync watermarks advance without repeatedly downloading full history windows; DB/schema/egress charts read local history; R2 normal rendering stays fast even when the Cloudflare collector is slow; failed collection retains prior successful local data; and the hosted dashboard remains independent of the Pro/MySQL runtime.
+
+After repairing the Oracle LaunchDaemon, acceptance also requires a real Mac
+reboot. Without manually starting MySQL, verify the system service is loaded,
+MySQL reports running, `/tmp/mysql.sock` exists, both TEST LaunchAgents reconnect
+and Operations data becomes current.
 
 No LIVE database or runtime change is authorised by this runbook.

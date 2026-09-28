@@ -22723,41 +22723,8 @@ def run_canonical_apply_executor(
             "untouched_later_selected_days": apply_failure.get(
                 "untouched_later_selected_days"
             ),
-            **{
-                key: int(apply_failure.get(key) or 0)
-                for key in (
-                    "planned_deletions",
-                    "planned_writes",
-                    "planned_post_put_verifications",
-                    "completed_deletions",
-                    "deleted_objects",
-                    "completed_writes",
-                    "get_verified_writes",
-                    "completed_post_put_verifications",
-                    "failed_operations",
-                )
-            },
         }
-    apply_state = run_state.get("apply") or {}
-    return {
-        "status": "succeeded",
-        "exit_code": 0,
-        "output": output,
-        **{
-            key: int(apply_state.get(key) or output.get(key) or 0)
-            for key in (
-                "planned_deletions",
-                "planned_writes",
-                "planned_post_put_verifications",
-                "completed_deletions",
-                "deleted_objects",
-                "completed_writes",
-                "get_verified_writes",
-                "completed_post_put_verifications",
-                "failed_operations",
-            )
-        },
-    }
+    return {"status": "succeeded", "exit_code": 0, "output": output}
 
 
 def checkpoint_apply_progress_from_python(
@@ -24781,57 +24748,6 @@ def summarize_ordered_apply_verification(
     }
 
 
-def _canonical_apply_reporting_metrics(
-    *,
-    apply_result: Mapping[str, Any],
-    run_state: Mapping[str, Any],
-    planned_operation_counts: Mapping[str, Any],
-    final_verification: Mapping[str, Any],
-) -> dict[str, Any]:
-    output = apply_result.get("output")
-    output = output if isinstance(output, Mapping) else {}
-    state = run_state.get("apply")
-    state = state if isinstance(state, Mapping) else {}
-
-    def count(name: str, fallback: int = 0) -> int:
-        for source in (apply_result, output, state):
-            value = source.get(name)
-            if value is not None:
-                try:
-                    return max(0, int(value))
-                except (TypeError, ValueError):
-                    continue
-        return max(0, int(fallback))
-
-    planned_writes = count(
-        "planned_writes",
-        int(planned_operation_counts.get("planned_writes") or 0),
-    )
-    planned_deletions = count(
-        "planned_deletions",
-        int(planned_operation_counts.get("planned_deletions") or 0),
-    )
-    completed_writes = count("completed_writes")
-    completed_deletions = count("completed_deletions")
-    deleted_objects = count("deleted_objects")
-    return {
-        "apply_status": apply_result.get("status"),
-        "apply_planned_operations": planned_writes + planned_deletions,
-        "apply_completed_operations": completed_writes + completed_deletions,
-        "apply_planned_writes": planned_writes,
-        "apply_completed_writes": completed_writes,
-        "apply_get_verified_writes": count("get_verified_writes"),
-        "apply_completed_post_put_verifications": count(
-            "completed_post_put_verifications"
-        ),
-        "apply_planned_deletions": planned_deletions,
-        "apply_completed_deletions": completed_deletions,
-        "apply_deleted_objects": deleted_objects,
-        "apply_failed_operations": count("failed_operations"),
-        "final_verification_status": final_verification.get("status"),
-    }
-
-
 def run_v2_integrity_repair_flow(
     *,
     run_state: dict[str, Any],
@@ -25404,12 +25320,6 @@ def run_v2_integrity_repair_flow(
         dict(run_state.get("sos_light") or {})
         if dedicated_sos_historical_replacement else {}
     )
-    apply_reporting = _canonical_apply_reporting_metrics(
-        apply_result=apply_result,
-        run_state=run_state,
-        planned_operation_counts=planned_operation_counts,
-        final_verification=final_verification,
-    )
     result = {
         "status": "failed" if coordinator_failed else (
             "planned" if dry_run else "succeeded"
@@ -25552,7 +25462,6 @@ def run_v2_integrity_repair_flow(
             "exact_tombstones_created"
         ),
         "canonical_apply": apply_result,
-        **apply_reporting,
         "latest_snapshot_auth_preflight": auth_preflight,
         "first_value_at_reconciliation": first_value_at_reconciliation,
         "metadata_executor_r2_operation_counts": metadata_r2_operation_counts,
@@ -25574,12 +25483,9 @@ def run_v2_integrity_repair_flow(
             "latest_snapshot_reconciliation_status"
         ),
         "overall_status": current_state_reconciliation.get("overall_status"),
-        "r2_objects_written": apply_reporting["apply_completed_writes"],
-        "r2_objects_deleted": apply_reporting["apply_deleted_objects"],
-        "r2_objects_changed": (
-            apply_reporting["apply_completed_writes"]
-            + apply_reporting["apply_deleted_objects"]
-        ),
+        "r2_objects_written": int(final_verification.get("r2_objects_written") or 0),
+        "r2_objects_deleted": int(final_verification.get("r2_objects_deleted") or 0),
+        "r2_objects_changed": int(final_verification.get("r2_objects_changed") or 0),
         "remaining_gap_count": final_verification.get("remaining_gap_count"),
         "overlay_root": run_state["overlay_root"],
         "run_state_path": run_state["run_state_path"],
@@ -26316,58 +26222,6 @@ def _daily_task_health_error_payload(exc: Exception) -> dict[str, Any]:
         "message": _truncate_text(str(exc)),
         "stack_preview": _truncate_text(stack, 1800) if stack else None,
     }
-
-
-def _compact_daily_task_run_identity(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, Mapping):
-        return None
-    compact = {
-        key: value.get(key)
-        for key in ("run_id", "platform_run_id", "started_at", "status")
-        if value.get(key) is not None
-    }
-    return compact or None
-
-
-def _compact_daily_task_backup_readiness(
-    value: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    """Keep the backup decision while excluding nested writer-run evidence."""
-    source = value if isinstance(value, Mapping) else {}
-    writer_runs = [
-        item for item in list(source.get("writer_runs") or [])
-        if isinstance(item, Mapping)
-    ]
-    running_writers: list[dict[str, Any]] = []
-    for writer in writer_runs:
-        if not bool(writer.get("is_running")):
-            continue
-        identity = _compact_daily_task_run_identity(writer.get("running_run")) or {}
-        running_writers.append({
-            "task_key": writer.get("task_key"),
-            **identity,
-        })
-    ignored = list(source.get("concurrent_writer_runs_ignored") or [])
-    compact: dict[str, Any] = {
-        "backup_gate_checked": bool(source.get("backup_gate_checked")),
-        "backup_ready": source.get("backup_ready"),
-        "blocked_reason": source.get("blocked_reason"),
-        "allow_stale_dropbox": bool(source.get("allow_stale_dropbox")),
-        "backup_run_id": source.get("backup_run_id"),
-        "backup_started_at": source.get("backup_started_at"),
-        "backup_finished_at": source.get("backup_finished_at"),
-        "latest_writer_finished_at": source.get("latest_writer_finished_at"),
-        "writer_run_count": len(writer_runs),
-        "concurrent_writer_runs_ignored_count": len(ignored),
-    }
-    running_backup = _compact_daily_task_run_identity(
-        source.get("running_backup_run")
-    )
-    if running_backup:
-        compact["running_backup"] = running_backup
-    if running_writers:
-        compact["running_writer_runs"] = running_writers
-    return compact
 
 
 def _compact_daily_task_health_error_payload(
@@ -28145,21 +27999,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     "",
                 ])
         canonical_apply = repair_flow.get("canonical_apply") or {}
-        if canonical_apply:
-            lines.extend([
-                "### Canonical APPLY",
-                "",
-                f"- Status: {repair_flow.get('apply_status') or canonical_apply.get('status') or '(none)'}",
-                f"- Planned operations: {int(repair_flow.get('apply_planned_operations') or 0)}",
-                f"- Completed operations: {int(repair_flow.get('apply_completed_operations') or 0)}",
-                f"- Writes completed: {int(repair_flow.get('apply_completed_writes') or 0)}",
-                f"- GET-verified writes: {int(repair_flow.get('apply_get_verified_writes') or 0)}",
-                f"- Post-PUT verifications completed: {int(repair_flow.get('apply_completed_post_put_verifications') or 0)}",
-                f"- Deletion operations completed: {int(repair_flow.get('apply_completed_deletions') or 0)}",
-                f"- Objects deleted: {int(repair_flow.get('apply_deleted_objects') or 0)}",
-                f"- Failed operations: {int(repair_flow.get('apply_failed_operations') or 0)}",
-                "",
-            ])
         if canonical_apply.get("status") == "failed":
             failure_checkpoint = canonical_apply.get("failure_checkpoint") or {}
             lines.extend([
@@ -28195,9 +28034,9 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- Status: {final_verification.get('status') or '(none)'}",
                 f"- Source truth: {final_verification.get('source_truth') or '(none)'}",
                 f"- Local resolution: {final_verification.get('local_object_resolution') or '(none)'}",
-                f"- R2 writes confirmed by final verification: {final_verification.get('r2_objects_written', 0)}",
-                f"- R2 deletions confirmed by final verification: {final_verification.get('r2_objects_deleted', 0)}",
-                f"- R2 changes confirmed by final verification: {final_verification.get('r2_objects_changed', 0)}",
+                f"- R2 objects written: {final_verification.get('r2_objects_written', 0)}",
+                f"- R2 objects deleted: {final_verification.get('r2_objects_deleted', 0)}",
+                f"- R2 objects changed: {final_verification.get('r2_objects_changed', 0)}",
                 f"- Remaining gap count: {final_verification.get('remaining_gap_count', '(not run)')}",
                 "",
             ])
@@ -29279,9 +29118,7 @@ def main(argv: list[str]) -> int:
                 "r2_objects_changed": 0, "stage_result_counts": {},
                 "overlay_path": repair_overlay.get("overlay_root") if repair_overlay else None,
                 "remaining_gap_count": None, "log_path": str(log_path),
-                "backup_readiness": _compact_daily_task_backup_readiness(
-                    backup_gate_summary
-                ),
+                "backup_readiness": backup_gate_summary,
             }
             try:
                 daily_task_health_run_id = _daily_task_health_start(
@@ -30547,26 +30384,12 @@ def main(argv: list[str]) -> int:
                 "r2_objects_written": int(repair_flow.get("r2_objects_written") or 0),
                 "r2_objects_deleted": int(repair_flow.get("r2_objects_deleted") or 0),
                 "r2_objects_changed": int(repair_flow.get("r2_objects_changed") or 0),
-                "apply_status": repair_flow.get("apply_status"),
-                "apply_planned_operations": int(repair_flow.get("apply_planned_operations") or 0),
-                "apply_completed_operations": int(repair_flow.get("apply_completed_operations") or 0),
-                "apply_planned_writes": int(repair_flow.get("apply_planned_writes") or 0),
-                "apply_completed_writes": int(repair_flow.get("apply_completed_writes") or 0),
-                "apply_get_verified_writes": int(repair_flow.get("apply_get_verified_writes") or 0),
-                "apply_completed_post_put_verifications": int(repair_flow.get("apply_completed_post_put_verifications") or 0),
-                "apply_planned_deletions": int(repair_flow.get("apply_planned_deletions") or 0),
-                "apply_completed_deletions": int(repair_flow.get("apply_completed_deletions") or 0),
-                "apply_deleted_objects": int(repair_flow.get("apply_deleted_objects") or 0),
-                "apply_failed_operations": int(repair_flow.get("apply_failed_operations") or 0),
-                "final_verification_status": repair_flow.get("final_verification_status"),
                 "stage_result_counts": repair_flow.get("stage_result_counts") or {},
                 "overlay_path": repair_flow.get("overlay_root"),
                 "remaining_gap_count": repair_flow.get("remaining_gap_count"),
                 "runtime_seconds": runtime_seconds,
                 "report_json_path": str(json_path),
-                "backup_readiness": _compact_daily_task_backup_readiness(
-                    backup_gate_summary
-                ),
+                "backup_readiness": backup_gate_summary,
                 "observations_global_operation_lock": global_operation_lock,
                 "dropbox_currentness": dropbox_currentness,
                 "report_md_path": str(md_path),
@@ -30672,24 +30495,10 @@ def main(argv: list[str]) -> int:
                 "r2_objects_written": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_written") or 0),
                 "r2_objects_deleted": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_deleted") or 0),
                 "r2_objects_changed": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_changed") or 0),
-                "apply_status": (repair_flow if "repair_flow" in locals() else {}).get("apply_status"),
-                "apply_planned_operations": int((repair_flow if "repair_flow" in locals() else {}).get("apply_planned_operations") or 0),
-                "apply_completed_operations": int((repair_flow if "repair_flow" in locals() else {}).get("apply_completed_operations") or 0),
-                "apply_planned_writes": int((repair_flow if "repair_flow" in locals() else {}).get("apply_planned_writes") or 0),
-                "apply_completed_writes": int((repair_flow if "repair_flow" in locals() else {}).get("apply_completed_writes") or 0),
-                "apply_get_verified_writes": int((repair_flow if "repair_flow" in locals() else {}).get("apply_get_verified_writes") or 0),
-                "apply_completed_post_put_verifications": int((repair_flow if "repair_flow" in locals() else {}).get("apply_completed_post_put_verifications") or 0),
-                "apply_planned_deletions": int((repair_flow if "repair_flow" in locals() else {}).get("apply_planned_deletions") or 0),
-                "apply_completed_deletions": int((repair_flow if "repair_flow" in locals() else {}).get("apply_completed_deletions") or 0),
-                "apply_deleted_objects": int((repair_flow if "repair_flow" in locals() else {}).get("apply_deleted_objects") or 0),
-                "apply_failed_operations": int((repair_flow if "repair_flow" in locals() else {}).get("apply_failed_operations") or 0),
-                "final_verification_status": (repair_flow if "repair_flow" in locals() else {}).get("final_verification_status"),
                 "stage_result_counts": (repair_flow if "repair_flow" in locals() else {}).get("stage_result_counts") or {},
                 "overlay_path": (repair_flow if "repair_flow" in locals() else {}).get("overlay_root"),
                 "remaining_gap_count": (repair_flow if "repair_flow" in locals() else {}).get("remaining_gap_count"),
-                "backup_readiness": _compact_daily_task_backup_readiness(
-                    backup_gate_summary
-                ),
+                "backup_readiness": backup_gate_summary,
                 "log_path": str(log_path),
             }
             if args.dry_run:

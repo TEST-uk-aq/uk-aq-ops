@@ -117,84 +117,6 @@ def _decode_json(value: Any) -> Any:
         return value
 
 
-def _compact_run_identity(value: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(value, dict):
-        return None
-    compact = {
-        key: value.get(key)
-        for key in ("task_key", "run_id", "platform_run_id", "started_at", "status")
-        if value.get(key) is not None
-    }
-    return compact or None
-
-
-def _compact_integrity_backup_readiness(value: Any) -> Any:
-    if not isinstance(value, dict):
-        return value
-    writer_runs = [
-        item for item in list(value.get("writer_runs") or [])
-        if isinstance(item, dict)
-    ]
-    compact = {
-        key: value.get(key)
-        for key in (
-            "backup_gate_checked",
-            "backup_ready",
-            "blocked_reason",
-            "allow_stale_dropbox",
-            "backup_run_id",
-            "backup_started_at",
-            "backup_finished_at",
-            "latest_writer_finished_at",
-        )
-        if key in value
-    }
-    compact["writer_run_count"] = (
-        _int(value.get("writer_run_count"))
-        if "writer_run_count" in value else len(writer_runs)
-    )
-    ignored = list(value.get("concurrent_writer_runs_ignored") or [])
-    compact["concurrent_writer_runs_ignored_count"] = (
-        _int(value.get("concurrent_writer_runs_ignored_count"))
-        if "concurrent_writer_runs_ignored_count" in value else len(ignored)
-    )
-    running_backup = _compact_run_identity(
-        value.get("running_backup") or value.get("running_backup_run")
-    )
-    if running_backup:
-        compact["running_backup"] = running_backup
-    supplied_running = list(value.get("running_writer_runs") or [])
-    running_writers = [
-        identity for identity in (
-            _compact_run_identity(item) for item in supplied_running
-        ) if identity
-    ]
-    if not running_writers:
-        for writer in writer_runs:
-            if not bool(writer.get("is_running")):
-                continue
-            identity = _compact_run_identity(writer.get("running_run")) or {}
-            running_writers.append({
-                "task_key": writer.get("task_key"),
-                **identity,
-            })
-    if running_writers:
-        compact["running_writer_runs"] = running_writers
-    return compact
-
-
-def _compact_daily_task_summary(task_key: str, value: Any) -> Any:
-    """Bound only the known Integrity diagnostic branch in the derived cache."""
-    if task_key != "ops.history_integrity" or not isinstance(value, dict):
-        return value
-    compact = dict(value)
-    if "backup_readiness" in compact:
-        compact["backup_readiness"] = _compact_integrity_backup_readiness(
-            compact.get("backup_readiness")
-        )
-    return compact
-
-
 def _retention_start(now: Optional[datetime] = None) -> datetime:
     current = now or _utcnow()
     return current - timedelta(days=RETENTION_DAYS)
@@ -302,7 +224,6 @@ def _upsert_daily_task(cursor, row: Dict[str, Any]) -> bool:
         scheduled_day = date.fromisoformat(day_text[:10])
     except ValueError:
         return False
-    compact_summary = _compact_daily_task_summary(task_key, row.get("summary"))
     cursor.execute(
         """
         INSERT INTO daily_task_runs
@@ -327,7 +248,7 @@ def _upsert_daily_task(cursor, row: Dict[str, Any]) -> bool:
             row.get("scheduled_time_utc"), _parse_ts(row.get("scheduled_at_utc")), _int(row.get("attempt")),
             row.get("raw_status"), _parse_ts(row.get("started_at")), _parse_ts(row.get("finished_at")),
             _parse_ts(row.get("failed_at")), _parse_ts(row.get("updated_at")), _int(row.get("duration_seconds")),
-            _json(compact_summary), row.get("error_message"), row.get("log_url"), row.get("effective_status"),
+            _json(row.get("summary")), row.get("error_message"), row.get("log_url"), row.get("effective_status"),
             _parse_ts(row.get("scheduled_or_started_at")), _parse_ts(row.get("finished_or_failed_at")),
             _bool(row.get("is_failed")), _bool(row.get("is_overdue")), _bool(row.get("is_not_started")),
             _int(row.get("task_day_rank")),
