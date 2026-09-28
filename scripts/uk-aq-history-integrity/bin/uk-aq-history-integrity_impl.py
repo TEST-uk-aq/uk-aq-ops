@@ -21989,6 +21989,7 @@ def run_integrity_dropbox_currentness_gate(
     dropbox_root: str | Path,
     observations_prefix: str,
     timeseries_binding_backup_mode: str,
+    checkpoint_only: bool = False,
 ) -> dict[str, Any]:
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -22003,6 +22004,8 @@ def run_integrity_dropbox_currentness_gate(
         "--observations-prefix", observations_prefix,
         "--timeseries-binding-backup-mode", timeseries_binding_backup_mode,
     ]
+    if checkpoint_only:
+        command.append("--checkpoint-only")
     completed = subprocess.run(
         command,
         cwd=repo_root,
@@ -25016,11 +25019,17 @@ def resolve_backup_gate_credentials(values: Mapping[str, Any] | None = None) -> 
 
 def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dict[str, Any]:
     supabase_url, service_role_key = resolve_backup_gate_credentials()
+    fixed_v2_sos_light_write_enabled = bool(
+        select_sos_historical_replacement_route(args).get("arguments_qualify")
+    )
     return check_dropbox_backup_ready(
         supabase_url=supabase_url,
         service_role_key=service_role_key,
         integrity_started_at_utc=started_iso,
-        allow_stale_dropbox=bool(args.allow_stale_dropbox),
+        allow_stale_dropbox=bool(
+            args.allow_stale_dropbox
+            and not fixed_v2_sos_light_write_enabled
+        ),
         rpc_name=str(
             os.environ.get(
                 "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
@@ -27739,6 +27748,9 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     effective_mode = resolve_effective_mode(args)
     sos_historical_route = select_sos_historical_replacement_route(args)
+    fixed_v2_sos_light_write_enabled = bool(
+        sos_historical_route.get("arguments_qualify")
+    )
     dedicated_sos_historical_replacement = False
     env = load_env_or_die()
     protected_connector_ids = (
@@ -28016,9 +28028,9 @@ def main(argv: list[str]) -> int:
         )
 
     # The child process is now inside the retained PostgreSQL session lock.
-    # Load the existing optional backfill environment before resolving live R2
-    # credentials, then pin the complete Dropbox checkpoint to the locked live
-    # observations root. This gate cannot be bypassed by --allow-stale-dropbox.
+    # Qualifying fixed-v2 SOS-light separates checkpoint completeness from the
+    # later locked live-root comparison so writer ordering can run between
+    # them. Other Integrity modes retain their existing combined gate.
     load_backfill_env_file_if_set()
     dropbox_root = resolve_r2_history_root(os.environ)
     if not dropbox_root:
@@ -28035,13 +28047,18 @@ def main(argv: list[str]) -> int:
             timeseries_binding_backup_mode=(
                 args.timeseries_binding_backup_mode
             ),
+            checkpoint_only=fixed_v2_sos_light_write_enabled,
         )
     log.info(
         "observations global operation lock: %s",
         json.dumps(global_operation_lock, sort_keys=True, default=str),
     )
     log.info(
-        "Dropbox checkpoint/live observations root gate: %s",
+        (
+            "Dropbox checkpoint completeness gate: %s"
+            if fixed_v2_sos_light_write_enabled
+            else "Dropbox checkpoint/live observations root gate: %s"
+        ),
         json.dumps(dropbox_currentness, sort_keys=True, default=str),
     )
     if not dropbox_currentness.get("allowed"):
@@ -28054,7 +28071,11 @@ def main(argv: list[str]) -> int:
             "date_selection": selection_summary,
             "started_at_utc": started_iso,
             "finished_at_utc": fmt_iso(utc_now()),
-            "status": "blocked_dropbox_checkpoint_not_current",
+            "status": (
+                "blocked_dropbox_checkpoint_incomplete"
+                if fixed_v2_sos_light_write_enabled
+                else "blocked_dropbox_checkpoint_not_current"
+            ),
             "dry_run": bool(args.dry_run),
             **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
@@ -28112,6 +28133,55 @@ def main(argv: list[str]) -> int:
         }
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
         return 2
+
+    if fixed_v2_sos_light_write_enabled:
+        # The complete checkpoint is now proven newer than every relevant
+        # writer. Only now compare its observations-root hash with the locked
+        # live R2 root; equality pins this generation for DETECT/PROPOSE.
+        dropbox_currentness = run_integrity_dropbox_currentness_gate(
+            env={**env, **os.environ},
+            dropbox_root=dropbox_root,
+            observations_prefix=history_path_configs["v2"].observations_data_prefix,
+            timeseries_binding_backup_mode=args.timeseries_binding_backup_mode,
+        )
+        log.info(
+            "Dropbox checkpoint/live observations root gate: %s",
+            json.dumps(dropbox_currentness, sort_keys=True, default=str),
+        )
+        if not dropbox_currentness.get("allowed"):
+            summary = {
+                "env": args.env,
+                "profile": args.profile,
+                "source": args.source,
+                "from_day": from_day,
+                "to_day": to_day,
+                "date_selection": selection_summary,
+                "started_at_utc": started_iso,
+                "finished_at_utc": fmt_iso(utc_now()),
+                "status": "blocked_dropbox_checkpoint_not_current",
+                "dry_run": bool(args.dry_run),
+                **({"repair_applied": False} if args.dry_run else {}),
+                "check_only": bool(args.check_only),
+                "run_backfill": bool(args.run_backfill),
+                "effective_mode": effective_mode,
+                "dropbox_baseline": str(dropbox_root),
+                "repair_mode": bool(args.run_backfill),
+                "allow_stale_dropbox": bool(args.allow_stale_dropbox),
+                "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+                "log_path": str(log_path),
+                "history_version_mode": history_version_mode,
+                "checked_versions": checked_history_versions,
+                "history_path_configs": serialized_history_path_configs,
+                "backup_readiness": backup_gate_summary,
+                "ingestdb_boundary": ingest_boundary,
+                "observations_global_operation_lock": global_operation_lock,
+                "dropbox_currentness": dropbox_currentness,
+                "metrics": {},
+            }
+            write_reports(
+                env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary
+            )
+            return 2
 
     # Only after the request-wide boundary and backup readiness pass may
     # normal Dropbox inspection and mutable local run state begin.

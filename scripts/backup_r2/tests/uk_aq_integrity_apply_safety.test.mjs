@@ -59,6 +59,11 @@ import {
 import {
   requireObservationHistoryIntegrityKey,
 } from "../lib/observation_history_integrity_key_allowlist.mjs";
+import {
+  computeCoordinatorTransitionStateFingerprint,
+  SOS_LIGHT_V2_STAGING_CONTRACT,
+  SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+} from "../lib/sos_light_v2_coordinator_validation.mjs";
 
 function writeObject(root, key, body) {
   const filePath = path.join(root, ...key.split("/"));
@@ -564,6 +569,52 @@ function installCoreSnapshotIdentity(runState, root) {
     UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT: runState.base_dropbox_root,
     UK_AQ_INTEGRITY_INVOCATION: "true",
   };
+}
+
+function freezeSosLightV2CoordinatorState(runState) {
+  const objectCount = Object.keys(runState.objects || {}).length;
+  const stagedDependencyEdgeCount = Object.values(runState.objects || {})
+    .reduce((count, entry) => count + (entry.dependencies || []).length, 0);
+  Object.assign(runState, {
+    environment: "TEST",
+    execution_path: "sos_light",
+    mode: "sos-light",
+    dedicated_sos_historical_replacement: true,
+    mutation_connector_ids: [1],
+    selected_mutation_connector_ids: [1],
+    protected_connector_ids: [1],
+    proposal_transition_planner_unchanged_keys: [],
+    final_staged_write_set_provenance: {
+      status: "finalised",
+      final_staged_object_count: objectCount,
+      forced_republication_count: 0,
+      forced_republication_keys: [],
+      promotion_reason_counts: {},
+      rebuilt_dependency_identity_count: 0,
+      staged_dependency_edge_count: stagedDependencyEdgeCount,
+      external_dependency_edge_counts: {},
+    },
+    sos_light_v2_proposal_staging: {
+      contract_version: SOS_LIGHT_V2_STAGING_CONTRACT,
+      status: "complete",
+      completed_object_count: objectCount,
+      total_object_count: objectCount,
+      checkpoint_count: 1,
+      changed_scope_count: 0,
+      final_provenance_status: "complete",
+      python_transition_validation_status: "succeeded",
+      persisted_state_equality_status: "succeeded",
+      node_apply_launch_permitted: true,
+    },
+    proposal_transition_validation: {
+      status: "succeeded",
+      node_apply_launch_permitted: true,
+      state_fingerprint_contract_version:
+        SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+    },
+  });
+  runState.proposal_transition_validation.state_fingerprint_sha256 =
+    computeCoordinatorTransitionStateFingerprint(runState);
 }
 
 async function observationFixture({ wrongManifest = false } = {}) {
@@ -1711,6 +1762,7 @@ test("SOS-light proposal requires one complete-day tombstone and complete local 
     bytes: 2,
     sha256: sha256Hex(Buffer.from("{}")),
   });
+  freezeSosLightV2CoordinatorState(fixture.runState);
   fs.writeFileSync(fixture.runStatePath, JSON.stringify(fixture.runState));
   let remoteCalls = 0;
   const remote = async () => { remoteCalls += 1; throw new Error("remote must not run"); };

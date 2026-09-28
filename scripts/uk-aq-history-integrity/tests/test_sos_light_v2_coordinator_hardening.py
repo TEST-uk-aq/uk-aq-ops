@@ -92,6 +92,252 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
             "structurally_validated": True,
         }
 
+    @staticmethod
+    def _locked_context() -> dict[str, object]:
+        return {
+            "held": True,
+            "valid": True,
+            "owner": "integrity",
+            "run_id": "integrity:TEST:step-zero",
+            "logical_identity": (
+                "uk_aq:r2_history:v2:observations_global_operation"
+            ),
+        }
+
+    @staticmethod
+    def _write_enabled_sos_args(*, source: str = "sos") -> SimpleNamespace:
+        return SimpleNamespace(
+            allow_stale_dropbox=True,
+            check_only=False,
+            dry_run=False,
+            from_day="2026-09-01",
+            history_version="v2",
+            repair_pollutants=["pm25"],
+            run_backfill=True,
+            source=source,
+            to_day="2026-09-01",
+        )
+
+    def test_fixed_v2_currentness_gate_supports_checkpoint_only(self) -> None:
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout='{"allowed":true}',
+            stderr="",
+        )
+        with (
+            mock.patch.object(
+                MODULE, "_repo_root_for_integrity_script", return_value=Path("/tmp/repo")
+            ),
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run,
+        ):
+            result = MODULE.run_integrity_dropbox_currentness_gate(
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                dropbox_root="/dropbox",
+                observations_prefix="history/v2/observations",
+                timeseries_binding_backup_mode="individual",
+                checkpoint_only=True,
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertIn("--checkpoint-only", run.call_args.args[0])
+
+    def test_fixed_v2_sos_backup_gate_ignores_stale_override_only_for_qualifying_route(
+        self,
+    ) -> None:
+        calls: list[bool] = []
+
+        def observe(**kwargs: object) -> dict[str, object]:
+            calls.append(bool(kwargs["allow_stale_dropbox"]))
+            return {"backup_ready": True}
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "resolve_backup_gate_credentials",
+                return_value=("https://example.invalid", "secret"),
+            ),
+            mock.patch.object(
+                MODULE, "check_dropbox_backup_ready", side_effect=observe
+            ),
+        ):
+            MODULE.run_scheduled_backup_gate(
+                self._write_enabled_sos_args(), "2026-09-01T01:00:00Z"
+            )
+            MODULE.run_scheduled_backup_gate(
+                self._write_enabled_sos_args(source="openaq"),
+                "2026-09-01T01:00:00Z",
+            )
+
+        self.assertEqual(calls, [False, True])
+
+    def _run_locked_step_zero(
+        self,
+        root: Path,
+        *,
+        currentness_results: list[dict[str, object]],
+        backup_result: dict[str, object],
+        events: list[str],
+        stop_after_step_zero: bool = False,
+    ) -> tuple[int | None, mock.Mock]:
+        def currentness(**kwargs: object) -> dict[str, object]:
+            events.append(
+                "checkpoint" if kwargs.get("checkpoint_only") is True else "root"
+            )
+            return currentness_results.pop(0)
+
+        def backup(*_args: object, **_kwargs: object) -> dict[str, object]:
+            events.append("writer_order")
+            return backup_result
+
+        def preflight(*_args: object, **_kwargs: object) -> dict[str, object]:
+            events.append("detect_boundary")
+            if stop_after_step_zero:
+                raise RuntimeError("stop after fixed-v2 Step 0")
+            return {"status": "ok"}
+
+        env = self._base_env(root)
+        preflight_mock = mock.Mock(side_effect=preflight)
+        started_at = dt.datetime(
+            2026, 9, 1, 1, 0, 0, tzinfo=dt.timezone.utc
+        )
+        inherited_run = {
+            "started_at": started_at,
+            "started_at_utc": MODULE.fmt_iso(started_at),
+            "run_compact": MODULE.fmt_compact(started_at),
+            "log_path": str(
+                root / "logs" / f"run-{MODULE.fmt_compact(started_at)}.log"
+            ),
+        }
+        patches = (
+            mock.patch.object(MODULE, "load_env_or_die", return_value=env),
+            mock.patch.object(
+                MODULE, "resolve_history_path_configs", return_value=self._history_paths()
+            ),
+            mock.patch.object(MODULE, "serialize_history_path_configs", return_value={}),
+            mock.patch.object(
+                MODULE,
+                "_resolve_daily_task_health_config",
+                return_value={"enabled": False, "strict": False},
+            ),
+            mock.patch.object(
+                MODULE,
+                "observations_global_operation_lock_context",
+                return_value=self._locked_context(),
+            ),
+            mock.patch.object(
+                MODULE,
+                "inherited_integrity_logical_run_context",
+                return_value=inherited_run,
+            ),
+            mock.patch.object(
+                MODULE,
+                "run_integrity_ingest_boundary_check",
+                return_value={"allowed": True, "blockers": []},
+            ),
+            mock.patch.object(MODULE, "load_backfill_env_file_if_set"),
+            mock.patch.object(MODULE, "resolve_r2_history_root", return_value="/dropbox"),
+            mock.patch.object(
+                MODULE,
+                "run_integrity_dropbox_currentness_gate",
+                side_effect=currentness,
+            ),
+            mock.patch.object(MODULE, "run_scheduled_backup_gate", side_effect=backup),
+            mock.patch.object(MODULE, "run_preflight_or_die", preflight_mock),
+        )
+        with mock.patch.dict(MODULE.os.environ, {}, clear=True):
+            with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                    patches[5], patches[6], patches[7], patches[8], patches[9], \
+                    patches[10], patches[11]:
+                if stop_after_step_zero:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "stop after fixed-v2 Step 0"
+                    ):
+                        MODULE.main([
+                            "--env", "TEST",
+                            "--source", "sos",
+                            "--from-day", "2026-09-01",
+                            "--to-day", "2026-09-01",
+                            "--run-backfill",
+                            "--repair-pollutants", "pm25",
+                            "--allow-stale-dropbox",
+                        ])
+                    return None, preflight_mock
+                return MODULE.main([
+                    "--env", "TEST",
+                    "--source", "sos",
+                    "--from-day", "2026-09-01",
+                    "--to-day", "2026-09-01",
+                    "--run-backfill",
+                    "--repair-pollutants", "pm25",
+                    "--allow-stale-dropbox",
+                ]), preflight_mock
+
+    def test_fixed_v2_step_zero_orders_checkpoint_writer_and_root_before_detect(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events: list[str] = []
+            result, _preflight = self._run_locked_step_zero(
+                Path(tmpdir),
+                currentness_results=[
+                    {"allowed": True, "status": "checkpoint_complete"},
+                    {
+                        "allowed": True,
+                        "status": "current",
+                        "checkpoint_live_root_match": True,
+                    },
+                ],
+                backup_result={"backup_ready": True},
+                events=events,
+                stop_after_step_zero=True,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            events,
+            ["checkpoint", "writer_order", "root", "detect_boundary"],
+        )
+
+    def test_fixed_v2_failed_writer_order_stops_before_root_or_detect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events: list[str] = []
+            result, preflight = self._run_locked_step_zero(
+                Path(tmpdir),
+                currentness_results=[
+                    {"allowed": True, "status": "checkpoint_complete"},
+                ],
+                backup_result={
+                    "backup_ready": False,
+                    "blocked_reason": "backup_started_before_latest_writer_finished",
+                },
+                events=events,
+            )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(events, ["checkpoint", "writer_order"])
+        preflight.assert_not_called()
+
+    def test_fixed_v2_root_mismatch_stops_after_writer_order_before_detect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events: list[str] = []
+            result, preflight = self._run_locked_step_zero(
+                Path(tmpdir),
+                currentness_results=[
+                    {"allowed": True, "status": "checkpoint_complete"},
+                    {
+                        "allowed": False,
+                        "status": "blocked_stale_dropbox_checkpoint",
+                        "checkpoint_live_root_match": False,
+                    },
+                ],
+                backup_result={"backup_ready": True},
+                events=events,
+            )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(events, ["checkpoint", "writer_order", "root"])
+        preflight.assert_not_called()
+
     def test_501_objects_checkpoint_at_250_500_and_final(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = self._run_state(Path(tmpdir))

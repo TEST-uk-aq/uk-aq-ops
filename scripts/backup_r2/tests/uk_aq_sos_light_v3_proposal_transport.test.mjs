@@ -9,6 +9,12 @@ import {
 } from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import {
+  observationsGlobalOperationLockIdentity,
+} from "../../../workers/shared/uk_aq_r2_history_writer.mjs";
+import {
+  applyValidatedSosLightV3Proposal,
+} from "../uk_aq_apply_sos_light_v3_proposal.mjs";
+import {
   materializeSosLightV3ProposalBodies,
   SOS_LIGHT_V3_BODY_REFERENCE_CONTRACT,
   writeSosLightV3ProposalArtifact,
@@ -65,6 +71,171 @@ function finalDayManifestBody(dayUtc, connectorIds = [1]) {
     child_manifests: references,
   }));
 }
+
+function fixedV3CoreApplyFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v3-core-apply-"));
+  const dropboxRoot = path.join(root, "dropbox");
+  fs.mkdirSync(dropboxRoot, { recursive: true });
+  const dayUtc = "2026-09-15";
+  const manifestHash = "a".repeat(64);
+  const manifestKey = `history/v3/core/day_utc=${dayUtc}/manifest.json`;
+  const manifestBody = Buffer.from(JSON.stringify({
+    day_utc: dayUtc,
+    manifest_hash: manifestHash,
+  }));
+  const manifestPath = path.join(dropboxRoot, ...manifestKey.split("/"));
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, manifestBody);
+  const identity = {
+    core_snapshot_day_utc: dayUtc,
+    core_snapshot_manifest_key: manifestKey,
+    core_snapshot_manifest_hash: manifestHash,
+    core_snapshot_manifest_sha256: sha256Hex(manifestBody),
+  };
+  const identityPath = path.join(root, "core-snapshot-identity.json");
+  fs.writeFileSync(identityPath, JSON.stringify(identity));
+  const lockRunId = "integrity:TEST:v3-core-boundary";
+  const lockIdentity = observationsGlobalOperationLockIdentity();
+  const env = {
+    UK_AQ_R2_HISTORY_VERSION: "v3",
+    UK_AQ_R2_HISTORY_INDEX_VERSION: "v3",
+    UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON: JSON.stringify(identity),
+    UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE: identityPath,
+    UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT: dropboxRoot,
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_HELD: "true",
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_OWNER: "integrity",
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_RUN_ID: lockRunId,
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_IDENTITY:
+      lockIdentity.logical_identity,
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_CLASS_ID:
+      String(lockIdentity.class_id),
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_OBJECT_ID:
+      String(lockIdentity.object_id),
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_NONCE: "test-nonce",
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_ACQUIRED: "true",
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_WAIT_MS: "0",
+    UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_OUTCOME: "held",
+  };
+  const runStatePath = path.join(root, "run-state.json");
+  const runState = {
+    run_id: "v3-core-boundary",
+    execution_path: "sos_light",
+    observations_global_operation_lock: { run_id: lockRunId },
+    base_dropbox_root: dropboxRoot,
+    core_snapshot_identity: identity,
+    core_snapshot_consumer_audit: [],
+    objects: {},
+    tombstone_prefixes: [],
+  };
+  fs.writeFileSync(runStatePath, JSON.stringify(runState));
+  const r2 = {
+    endpoint: "https://example.invalid",
+    bucket: "test-bucket",
+    region: "auto",
+    access_key_id: "test-access-key",
+    secret_access_key: "test-secret-key",
+  };
+  return { root, runStatePath, runState, identity, identityPath, env, r2 };
+}
+
+function remoteMutationAdapters(counter) {
+  const remote = async () => {
+    counter.calls += 1;
+    throw new Error("remote mutation adapter must not run");
+  };
+  return {
+    getObject: remote,
+    putObject: remote,
+    putAndVerifyParquet: remote,
+    listAllObjects: remote,
+    deleteObjects: remote,
+  };
+}
+
+test("fixed-v3 APPLY child accepts a canonical pinned v3 core before proposal validation", async () => {
+  const fixture = fixedV3CoreApplyFixture();
+  const counter = { calls: 0 };
+  try {
+    await assert.rejects(
+      applyValidatedSosLightV3Proposal({
+        runStatePath: fixture.runStatePath,
+        env: fixture.env,
+        r2: fixture.r2,
+        adapters: remoteMutationAdapters(counter),
+      }),
+      /proposal ingestion checkpoint is incomplete/,
+    );
+    assert.equal(counter.calls, 0);
+    const persisted = JSON.parse(fs.readFileSync(fixture.runStatePath, "utf8"));
+    assert.equal(
+      persisted.core_snapshot_consumer_audit.at(-1).stage,
+      "fixed_v3_canonical_apply_child",
+    );
+    assert.equal(
+      persisted.core_snapshot_consumer_audit.at(-1).status,
+      "validated",
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("fixed-v3 APPLY child rejects missing, mismatched, and v2 core identity before mutation", async (t) => {
+  const cases = [
+    ["missing child identity", (fixture) => {
+      delete fixture.runState.core_snapshot_identity;
+    }, /child_requested_identity_invalid/],
+    ["coordinator and child mismatch", (fixture) => {
+      fixture.runState.core_snapshot_identity = {
+        ...fixture.identity,
+        core_snapshot_day_utc: "2026-09-14",
+        core_snapshot_manifest_key:
+          "history/v3/core/day_utc=2026-09-14/manifest.json",
+      };
+    }, /coordinator_child_identity_mismatch/],
+    ["v2 identity", (fixture) => {
+      const v2Identity = {
+        ...fixture.identity,
+        core_snapshot_manifest_key:
+          `history/v2/core/day_utc=${fixture.identity.core_snapshot_day_utc}/manifest.json`,
+      };
+      fixture.runState.core_snapshot_identity = v2Identity;
+      fixture.env.UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON =
+        JSON.stringify(v2Identity);
+      fs.writeFileSync(fixture.identityPath, JSON.stringify(v2Identity));
+    }, /coordinator_manifest_key_noncanonical/],
+  ];
+  for (const [name, mutate, expected] of cases) {
+    await t.test(name, async () => {
+      const fixture = fixedV3CoreApplyFixture();
+      const counter = { calls: 0 };
+      try {
+        mutate(fixture);
+        fs.writeFileSync(fixture.runStatePath, JSON.stringify(fixture.runState));
+        await assert.rejects(
+          applyValidatedSosLightV3Proposal({
+            runStatePath: fixture.runStatePath,
+            env: fixture.env,
+            r2: fixture.r2,
+            adapters: remoteMutationAdapters(counter),
+          }),
+          expected,
+        );
+        assert.equal(counter.calls, 0);
+        const persisted = JSON.parse(
+          fs.readFileSync(fixture.runStatePath, "utf8"),
+        );
+        assert.equal(
+          persisted.apply.current_phase,
+          "core_snapshot_identity_validation",
+        );
+        assert.equal(persisted.apply.r2_mutation_possible, false);
+      } finally {
+        fs.rmSync(fixture.root, { recursive: true, force: true });
+      }
+    });
+  }
+});
 
 test("fixed-v3 execution scope does not require retired AQI fields", () => {
   const dayUtc = "2025-01-15";

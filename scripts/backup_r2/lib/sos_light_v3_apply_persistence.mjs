@@ -71,6 +71,10 @@ function atomicWriteJson(filePath, value) {
   }
 }
 
+export function writeSosLightV3RunState(runStatePath, runState) {
+  atomicWriteJson(runStatePath, runState);
+}
+
 function exactBody(value, key) {
   if (Buffer.isBuffer(value)) return Buffer.from(value);
   if (value instanceof Uint8Array) {
