@@ -16519,6 +16519,7 @@ def run_v2_gap_backfills(
     repair_pollutants: Iterable[str] | None = None,
     source_scope: Mapping[str, Any] | None = None,
     explicit_selected_partitions: Iterable[Mapping[str, Any]] | None = None,
+    proposal_staging: _SosLightV2ProposalStaging | None = None,
 ) -> dict[str, Any]:
     """Execute direct source -> v2 observation repairs for missing v2 gaps.
 
@@ -16739,6 +16740,27 @@ def run_v2_gap_backfills(
     dedicated_registry_snapshot: dict[str, Any] | None = None
     dedicated_bridge_snapshot: dict[str, Any] | None = None
     dedicated_source_acquisition: dict[str, Any] | None = None
+    selected_partition_progress = _BoundedCoordinatorProgress(
+        log=log if direct_targets is not None else None,
+        phase="selected_partition_processing",
+        total_objects=len(work_items),
+    )
+    detector_progress = _BoundedCoordinatorProgress(
+        log=log if direct_targets is not None else None,
+        phase="detector_source_evidence",
+        total_objects=len(work_items),
+    )
+    proposal_worker_progress = _BoundedCoordinatorProgress(
+        log=log if direct_targets is not None else None,
+        phase="proposal_worker",
+        total_objects=len(work_items),
+    )
+    selected_partition_progress.start()
+    detector_progress.start()
+    proposal_worker_progress.start()
+    detector_completed = 0
+    proposal_worker_completed = 0
+    selected_partition_completed = 0
     if direct_targets is not None:
         if limits.should_stop():
             raise RuntimeError(
@@ -16750,6 +16772,16 @@ def run_v2_gap_backfills(
             )
         selected_dates = list(metrics["selected_dates"])
         selected_pollutants = list(metrics["selected_pollutants"])
+        acquisition_progress = _BoundedCoordinatorProgress(
+            log=log,
+            phase="sos_source_acquisition",
+            total_objects=len(selected_dates) * len(selected_pollutants),
+        )
+        acquisition_progress.start(
+            from_day=selected_dates[0],
+            to_day=selected_dates[-1],
+            pollutants=selected_pollutants,
+        )
         acquisition_root = (
             Path(str(run_state["run_root"])) / "sos-source-cache"
         )
@@ -16919,6 +16951,12 @@ def run_v2_gap_backfills(
             f"{snapshot_day}/connector_id=1/acquisition"
         ] = dedicated_registry_snapshot
         write_run_state(run_state)
+        acquisition_progress.complete(
+            int(dedicated_source_acquisition.get("partition_dataset_count") or 0),
+            source_files_opened=int(
+                dedicated_source_acquisition.get("source_files_opened") or 0
+            ),
+        )
     for day_iso, connector_id, ts_ids, selected_repair_pollutants in work_items:
         if not selected_repair_pollutants:
             metrics["skipped_v2_observation_repairs"].append({
@@ -17126,6 +17164,12 @@ def run_v2_gap_backfills(
             "reason": "complete canonical source rows and source-file hashes were persisted before proposal"
             if detector_evidence_error is None else detector_evidence_error,
         }
+        detector_completed += 1
+        detector_progress.progress(
+            detector_completed,
+            current_day=day_iso,
+            current_pollutant=partition_pollutant,
+        )
         all_unmapped_selected_partition = bool(
             direct_targets is not None
             and detector_evidence_error is None
@@ -17174,6 +17218,19 @@ def run_v2_gap_backfills(
                 connector_id,
                 partition_pollutant,
                 "all_groups_excluded_no_authoritative_binding",
+            )
+            proposal_worker_completed += 1
+            proposal_worker_progress.progress(
+                proposal_worker_completed,
+                current_day=day_iso,
+                current_pollutant=partition_pollutant,
+                outcome="skipped_all_unmapped",
+            )
+            selected_partition_completed += 1
+            selected_partition_progress.progress(
+                selected_partition_completed,
+                current_day=day_iso,
+                current_pollutant=partition_pollutant,
             )
             continue
         for gap in gaps_by_key.get((day_iso, connector_id), []):
@@ -17358,6 +17415,7 @@ def run_v2_gap_backfills(
                     day_utc=day_iso,
                     connector_id=connector_id,
                     repair_pollutants=selected_repair_pollutants,
+                    proposal_staging=proposal_staging,
                 )
                 expected_timeseries_row_counts = _normalize_timeseries_row_counts(
                     source_evidence.get("per_timeseries_counts")
@@ -17518,6 +17576,13 @@ def run_v2_gap_backfills(
             ],
         }
         metrics["v2_observation_repair_results"].append(repair_entry)
+        proposal_worker_completed += 1
+        proposal_worker_progress.progress(
+            proposal_worker_completed,
+            current_day=day_iso,
+            current_pollutant=partition_pollutant,
+            outcome=repair_status,
+        )
         if repair_ok:
             metrics["v2_observation_repairs_ok"] += 1
             metrics["observation_backfills_ok"] += 1
@@ -17535,7 +17600,7 @@ def run_v2_gap_backfills(
                     for gap in gaps_by_key.get((day_iso, connector_id), [])
                     if str(gap.get("pollutant_code") or "").strip()
                 } | set(proposal_pollutants))
-                record_changed_scope(run_state, "OBSERVS_CHANGED", {
+                changed_scope = {
                     "day_utc": day_iso,
                     "connector_id": connector_id,
                     "timeseries_ids": sorted(expected_timeseries_row_counts),
@@ -17554,7 +17619,15 @@ def run_v2_gap_backfills(
                     ),
                     "object_keys": validated_overlay_keys,
                     "stage": "observs",
-                })
+                }
+                if proposal_staging is not None:
+                    proposal_staging.record_changed_scope(
+                        "OBSERVS_CHANGED", changed_scope,
+                    )
+                else:
+                    record_changed_scope(
+                        run_state, "OBSERVS_CHANGED", changed_scope,
+                    )
                 tombstones_after = {
                     str(entry.get("prefix") or "")
                     for entry in list(
@@ -17647,6 +17720,15 @@ def run_v2_gap_backfills(
                 ),
                 "tombstone_created": False,
             })
+        selected_partition_completed += 1
+        selected_partition_progress.progress(
+            selected_partition_completed,
+            current_day=day_iso,
+            current_pollutant=partition_pollutant,
+        )
+    detector_progress.complete(detector_completed)
+    proposal_worker_progress.complete(proposal_worker_completed)
+    selected_partition_progress.complete(selected_partition_completed)
     return metrics
 
 def fmt_iso(t: dt.datetime) -> str:
@@ -17681,6 +17763,443 @@ PROPOSAL_TRANSITION_DEPENDENCY_SOURCES = frozenset({
     "planned_overlay", *PROPOSAL_TRANSITION_EXTERNAL_SOURCES,
 })
 FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX = "exact_prefix_replacement"
+SOS_LIGHT_V2_STAGING_CONTRACT = "uk_aq_sos_light_v2_coordinator_staging_v1"
+SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
+    "uk_aq_sos_light_v2_transition_state_fingerprint_v2"
+)
+COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
+COORDINATOR_PROGRESS_SECONDS = 15.0
+
+
+class _BoundedCoordinatorProgress:
+    """Emit compact count/time progress through the established log channel."""
+
+    def __init__(
+        self,
+        *,
+        log: logging.Logger | None,
+        phase: str,
+        total_objects: int | None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.log = log
+        self.phase = phase
+        self.total_objects = total_objects
+        self._monotonic = monotonic
+        self.started_at = monotonic()
+        self.last_progress_at = self.started_at
+        self.last_completed_objects = 0
+
+    def _emit(
+        self,
+        suffix: str,
+        *,
+        completed_objects: int,
+        **details: Any,
+    ) -> None:
+        if self.log is None:
+            return
+        payload: dict[str, Any] = {
+            "phase": f"{self.phase}_{suffix}",
+            "completed_objects": completed_objects,
+            "total_objects": self.total_objects,
+            "elapsed_seconds": round(self._monotonic() - self.started_at, 3),
+        }
+        payload.update(details)
+        self.log.info(
+            "UK_AQ_INTEGRITY_PROGRESS %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    def start(self, **details: Any) -> None:
+        self._emit("started", completed_objects=0, **details)
+
+    def is_due(self, completed_objects: int) -> bool:
+        now = self._monotonic()
+        return (
+            completed_objects - self.last_completed_objects
+            >= COORDINATOR_PROGRESS_OBJECT_INTERVAL
+            or now - self.last_progress_at >= COORDINATOR_PROGRESS_SECONDS
+        )
+
+    def progress(
+        self,
+        completed_objects: int,
+        *,
+        force: bool = False,
+        **details: Any,
+    ) -> bool:
+        if not force and not self.is_due(completed_objects):
+            return False
+        self._emit("progress", completed_objects=completed_objects, **details)
+        self.last_completed_objects = completed_objects
+        self.last_progress_at = self._monotonic()
+        return True
+
+    def complete(self, completed_objects: int, **details: Any) -> None:
+        self._emit("complete", completed_objects=completed_objects, **details)
+
+
+def _transition_fingerprint_optional_bool(
+    entry: Mapping[str, Any], field: str, *, object_key: str,
+) -> bool | None:
+    value = entry.get(field)
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(
+            "fixed-v2 transition fingerprint boolean is invalid: "
+            f"{object_key}:{field}"
+        )
+    return value
+
+
+def _transition_fingerprint_optional_text(
+    entry: Mapping[str, Any], field: str, *, object_key: str,
+) -> str | None:
+    value = entry.get(field)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(
+            "fixed-v2 transition fingerprint text is invalid: "
+            f"{object_key}:{field}"
+        )
+    return value
+
+
+def _transition_fingerprint_nonnegative_int(
+    entry: Mapping[str, Any], field: str, *, label: str,
+) -> int:
+    value = entry.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(
+            f"fixed-v2 transition fingerprint count is invalid: {label}:{field}"
+        )
+    return value
+
+
+def _transition_fingerprint_connector_ids(
+    run_state: Mapping[str, Any], field: str,
+) -> list[int]:
+    raw_values = run_state.get(field)
+    if not isinstance(raw_values, list):
+        raise ValueError(
+            f"fixed-v2 transition fingerprint connector IDs are invalid: {field}"
+        )
+    values: list[int] = []
+    for value in raw_values:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or value > 2**53 - 1
+        ):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint connector IDs are invalid: {field}"
+            )
+        values.append(value)
+    if len(set(values)) != len(values):
+        raise ValueError(
+            f"fixed-v2 transition fingerprint connector IDs are duplicated: {field}"
+        )
+    return sorted(values)
+
+
+def _transition_fingerprint_operation_identity(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    identity: dict[str, Any] = {}
+    for field in ("environment", "execution_path", "mode"):
+        value = run_state.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"fixed-v2 transition fingerprint operation identity is invalid: {field}"
+            )
+        identity[field] = value
+    dedicated = run_state.get("dedicated_sos_historical_replacement")
+    if not isinstance(dedicated, bool):
+        raise ValueError(
+            "fixed-v2 transition fingerprint operation identity is invalid: "
+            "dedicated_sos_historical_replacement"
+        )
+    identity["dedicated_sos_historical_replacement"] = dedicated
+    for field in (
+        "mutation_connector_ids",
+        "selected_mutation_connector_ids",
+        "protected_connector_ids",
+    ):
+        identity[field] = _transition_fingerprint_connector_ids(
+            run_state, field
+        )
+    return identity
+
+
+def _transition_fingerprint_identity_entries(
+    *,
+    parent_key: str,
+    raw_identities: Any,
+    label: str,
+) -> list[dict[str, Any]] | None:
+    if raw_identities is None:
+        return None
+    if not isinstance(raw_identities, Mapping):
+        raise ValueError(
+            f"fixed-v2 transition fingerprint {label} is invalid: {parent_key}"
+        )
+    identities: list[dict[str, Any]] = []
+    for raw_dependency_key, raw_identity in raw_identities.items():
+        dependency_key = _normalise_overlay_object_key(str(raw_dependency_key))
+        if str(raw_dependency_key) != dependency_key:
+            raise ValueError(
+                "fixed-v2 transition fingerprint dependency key is not canonical: "
+                f"{parent_key} -> {raw_dependency_key}"
+            )
+        if not isinstance(raw_identity, Mapping):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint {label} entry is invalid: "
+                f"{parent_key} -> {dependency_key}"
+            )
+        identity = _normalise_proposal_dependency_identity(
+            parent_key=parent_key,
+            dependency_key=dependency_key,
+            identity=raw_identity,
+        )
+        identities.append({"object_key": dependency_key, **identity})
+    return sorted(identities, key=lambda identity: identity["object_key"])
+
+
+def _proposal_transition_state_fingerprint_payload(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the narrow deterministic authority consumed by v2 validation."""
+    objects = run_state.get("objects")
+    if not isinstance(objects, Mapping):
+        raise ValueError("fixed-v2 transition fingerprint objects mapping is invalid")
+    canonical_objects: list[dict[str, Any]] = []
+    for raw_object_key, raw_entry in objects.items():
+        object_key = _normalise_overlay_object_key(str(raw_object_key))
+        if str(raw_object_key) != object_key or not isinstance(raw_entry, Mapping):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint object is invalid: {raw_object_key}"
+            )
+        entry = raw_entry
+        sha256 = str(entry.get("sha256") or "").strip().lower()
+        byte_count = entry.get("bytes")
+        if (
+            not re.fullmatch(r"[a-f0-9]{64}", sha256)
+            or not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+        ):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint object identity is invalid: {object_key}"
+            )
+        raw_dependencies = entry.get("dependencies")
+        if not isinstance(raw_dependencies, list):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint dependencies are invalid: {object_key}"
+            )
+        dependencies = sorted({
+            _normalise_overlay_object_key(str(value))
+            for value in raw_dependencies
+        })
+        if len(dependencies) != len(raw_dependencies):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint dependencies are duplicated: {object_key}"
+            )
+        planner_dependencies_raw = entry.get("planner_dependencies")
+        planner_dependencies = None
+        if planner_dependencies_raw is not None:
+            if not isinstance(planner_dependencies_raw, list):
+                raise ValueError(
+                    "fixed-v2 transition fingerprint planner dependencies are "
+                    f"invalid: {object_key}"
+                )
+            planner_dependencies = sorted({
+                _normalise_overlay_object_key(str(value))
+                for value in planner_dependencies_raw
+            })
+            if len(planner_dependencies) != len(planner_dependencies_raw):
+                raise ValueError(
+                    "fixed-v2 transition fingerprint planner dependencies are "
+                    f"duplicated: {object_key}"
+                )
+        canonical_objects.append({
+            "object_key": object_key,
+            "sha256": sha256,
+            "bytes": byte_count,
+            "stage": _transition_fingerprint_optional_text(
+                entry, "stage", object_key=object_key,
+            ),
+            "dependencies": dependencies,
+            "dependency_identities": _transition_fingerprint_identity_entries(
+                parent_key=object_key,
+                raw_identities=entry.get("dependency_identities"),
+                label="dependency identities",
+            ),
+            "proposed": _transition_fingerprint_optional_bool(
+                entry, "proposed", object_key=object_key,
+            ),
+            "built": _transition_fingerprint_optional_bool(
+                entry, "built", object_key=object_key,
+            ),
+            "structurally_validated": _transition_fingerprint_optional_bool(
+                entry, "structurally_validated", object_key=object_key,
+            ),
+            "changed": _transition_fingerprint_optional_bool(
+                entry, "changed", object_key=object_key,
+            ),
+            "included_in_write_set": _transition_fingerprint_optional_bool(
+                entry, "included_in_write_set", object_key=object_key,
+            ),
+            "status": _transition_fingerprint_optional_text(
+                entry, "status", object_key=object_key,
+            ),
+            "planner_changed": _transition_fingerprint_optional_bool(
+                entry, "planner_changed", object_key=object_key,
+            ),
+            "planner_status": _transition_fingerprint_optional_text(
+                entry, "planner_status", object_key=object_key,
+            ),
+            "planner_included_in_write_set": _transition_fingerprint_optional_bool(
+                entry, "planner_included_in_write_set", object_key=object_key,
+            ),
+            "planner_dependencies": planner_dependencies,
+            "planner_dependency_identities": _transition_fingerprint_identity_entries(
+                parent_key=object_key,
+                raw_identities=entry.get("planner_dependency_identities"),
+                label="planner dependency identities",
+            ),
+            "proposal_changed": _transition_fingerprint_optional_bool(
+                entry, "proposal_changed", object_key=object_key,
+            ),
+            "planner_source": _transition_fingerprint_optional_text(
+                entry, "planner_source", object_key=object_key,
+            ),
+            "baseline_source": _transition_fingerprint_optional_text(
+                entry, "baseline_source", object_key=object_key,
+            ),
+            "included_in_final_staged_write_set": _transition_fingerprint_optional_bool(
+                entry,
+                "included_in_final_staged_write_set",
+                object_key=object_key,
+            ),
+            "promotion_reason": _transition_fingerprint_optional_text(
+                entry, "promotion_reason", object_key=object_key,
+            ),
+            "final_source": _transition_fingerprint_optional_text(
+                entry, "final_source", object_key=object_key,
+            ),
+        })
+    canonical_objects.sort(key=lambda entry: entry["object_key"])
+
+    unchanged_keys_raw = run_state.get(
+        "proposal_transition_planner_unchanged_keys"
+    ) or []
+    if not isinstance(unchanged_keys_raw, list):
+        raise ValueError(
+            "fixed-v2 transition fingerprint unchanged-planner keys are invalid"
+        )
+    unchanged_keys = sorted({
+        _normalise_overlay_object_key(str(value))
+        for value in unchanged_keys_raw
+    })
+    tombstone_prefixes_raw = run_state.get("tombstone_prefixes") or []
+    if not isinstance(tombstone_prefixes_raw, list):
+        raise ValueError(
+            "fixed-v2 transition fingerprint tombstone prefixes are invalid"
+        )
+    proposed_prefixes = sorted({
+        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
+        for entry in tombstone_prefixes_raw
+        if isinstance(entry, Mapping) and entry.get("proposed")
+    })
+    final_provenance = run_state.get("final_staged_write_set_provenance")
+    if not isinstance(final_provenance, Mapping):
+        raise ValueError("fixed-v2 transition fingerprint final provenance is invalid")
+    promotion_reason_counts = final_provenance.get("promotion_reason_counts")
+    external_edge_counts = final_provenance.get(
+        "external_dependency_edge_counts"
+    )
+    forced_keys_raw = final_provenance.get("forced_republication_keys")
+    if (
+        not isinstance(promotion_reason_counts, Mapping)
+        or not isinstance(external_edge_counts, Mapping)
+        or not isinstance(forced_keys_raw, list)
+    ):
+        raise ValueError(
+            "fixed-v2 transition fingerprint provenance fields are invalid"
+        )
+    return {
+        "contract_version": SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+        "operation_identity": _transition_fingerprint_operation_identity(
+            run_state
+        ),
+        "objects": canonical_objects,
+        "proposal_transition_planner_unchanged_keys": unchanged_keys,
+        "proposed_tombstone_prefixes": proposed_prefixes,
+        "final_staged_write_set_provenance": {
+            "status": _transition_fingerprint_optional_text(
+                final_provenance,
+                "status",
+                object_key="final_staged_write_set_provenance",
+            ),
+            "final_staged_object_count": _transition_fingerprint_nonnegative_int(
+                final_provenance,
+                "final_staged_object_count",
+                label="final_staged_write_set_provenance",
+            ),
+            "forced_republication_count": _transition_fingerprint_nonnegative_int(
+                final_provenance,
+                "forced_republication_count",
+                label="final_staged_write_set_provenance",
+            ),
+            "forced_republication_keys": sorted({
+                _normalise_overlay_object_key(str(value))
+                for value in forced_keys_raw
+            }),
+            "promotion_reason_counts": {
+                str(key): _transition_fingerprint_nonnegative_int(
+                    promotion_reason_counts,
+                    key,
+                    label="promotion_reason_counts",
+                )
+                for key in sorted(promotion_reason_counts, key=str)
+            },
+            "rebuilt_dependency_identity_count":
+                _transition_fingerprint_nonnegative_int(
+                    final_provenance,
+                    "rebuilt_dependency_identity_count",
+                    label="final_staged_write_set_provenance",
+                ),
+            "staged_dependency_edge_count":
+                _transition_fingerprint_nonnegative_int(
+                    final_provenance,
+                    "staged_dependency_edge_count",
+                    label="final_staged_write_set_provenance",
+                ),
+            "external_dependency_edge_counts": {
+                str(key): _transition_fingerprint_nonnegative_int(
+                    external_edge_counts,
+                    key,
+                    label="external_dependency_edge_counts",
+                )
+                for key in sorted(external_edge_counts, key=str)
+            },
+        },
+    }
+
+
+def proposal_transition_state_fingerprint_sha256(
+    run_state: Mapping[str, Any],
+) -> str:
+    canonical = json.dumps(
+        _proposal_transition_state_fingerprint_payload(run_state),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 
 
 def _normalise_proposal_dependency_identity(
@@ -17769,6 +18288,137 @@ def write_run_state(run_state: Mapping[str, Any]) -> Path:
     return state_path
 
 
+class _SosLightV2ProposalStaging:
+    """Batch dedicated v2 proposal state while keeping persisted checkpoints exact."""
+
+    def __init__(
+        self,
+        *,
+        run_state: dict[str, Any],
+        log: logging.Logger | None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.run_state = run_state
+        self.log = log
+        self._monotonic = monotonic
+        self.started_at = monotonic()
+        self.last_checkpoint_at = self.started_at
+        self.completed_events = 0
+        self.last_checkpoint_events = 0
+        self.checkpoint_count = 0
+        self.scope_indexes: dict[str, dict[str, dict[str, Any]]] = {}
+        changed_scopes = run_state.get("changed_scopes")
+        if not isinstance(changed_scopes, dict):
+            raise ValueError("overlay run state has no changed_scopes mapping")
+        for scope_set in OVERLAY_CHANGED_SCOPE_SETS:
+            index: dict[str, dict[str, Any]] = {}
+            for raw_scope in list(changed_scopes.get(scope_set) or []):
+                if not isinstance(raw_scope, Mapping):
+                    raise ValueError(f"overlay changed scope is invalid: {scope_set}")
+                canonical_scope = json.loads(json.dumps(
+                    dict(raw_scope), sort_keys=True, default=str,
+                ))
+                identity = json.dumps(
+                    canonical_scope, sort_keys=True, separators=(",", ":"),
+                )
+                index[identity] = canonical_scope
+            self.scope_indexes[scope_set] = index
+        run_state["sos_light_v2_proposal_staging"] = {
+            "contract_version": SOS_LIGHT_V2_STAGING_CONTRACT,
+            "status": "in_progress",
+            "completed_object_count": len(dict(run_state.get("objects") or {})),
+            "total_object_count": None,
+            "checkpoint_count": 0,
+            "changed_scope_count": self.changed_scope_count,
+            "final_provenance_status": "not_started",
+            "python_transition_validation_status": "not_started",
+            "persisted_state_equality_status": "not_checked",
+            "node_apply_launch_permitted": False,
+        }
+
+    @property
+    def changed_scope_count(self) -> int:
+        return sum(len(index) for index in self.scope_indexes.values())
+
+    def record_changed_scope(
+        self, scope_set: str, scope: Mapping[str, Any],
+    ) -> None:
+        if scope_set not in self.scope_indexes:
+            raise ValueError(f"unknown changed scope set: {scope_set}")
+        canonical_scope = json.loads(json.dumps(
+            dict(scope), sort_keys=True, default=str,
+        ))
+        identity = json.dumps(
+            canonical_scope, sort_keys=True, separators=(",", ":"),
+        )
+        self.scope_indexes[scope_set][identity] = canonical_scope
+
+    def _materialise_changed_scopes(self) -> None:
+        changed_scopes = self.run_state["changed_scopes"]
+        for scope_set, index in self.scope_indexes.items():
+            changed_scopes[scope_set] = [index[key] for key in sorted(index)]
+
+    def object_completed(self, *, phase: str, **details: Any) -> bool:
+        self.completed_events += 1
+        return self.checkpoint_if_due(phase=phase, **details)
+
+    def checkpoint_if_due(self, *, phase: str, **details: Any) -> bool:
+        now = self._monotonic()
+        due = (
+            self.completed_events - self.last_checkpoint_events
+            >= COORDINATOR_PROGRESS_OBJECT_INTERVAL
+            or now - self.last_checkpoint_at >= COORDINATOR_PROGRESS_SECONDS
+        )
+        if not due:
+            return False
+        self.persist_checkpoint(phase=phase, final=False, **details)
+        return True
+
+    def persist_checkpoint(
+        self,
+        *,
+        phase: str,
+        final: bool,
+        **details: Any,
+    ) -> None:
+        self._materialise_changed_scopes()
+        self.checkpoint_count += 1
+        completed_object_count = len(dict(self.run_state.get("objects") or {}))
+        staging = self.run_state["sos_light_v2_proposal_staging"]
+        staging.update({
+            "status": "complete" if final else "in_progress",
+            "completed_object_count": completed_object_count,
+            "total_object_count": completed_object_count if final else None,
+            "checkpoint_count": self.checkpoint_count,
+            "changed_scope_count": self.changed_scope_count,
+            "last_checkpoint_phase": phase,
+            "node_apply_launch_permitted": False,
+        })
+        write_run_state(self.run_state)
+        elapsed_seconds = round(self._monotonic() - self.started_at, 3)
+        if self.log is not None:
+            payload = {
+                "phase": "sos_light_v2_proposal_staging_checkpoint",
+                "status": staging["status"],
+                "completed_objects": completed_object_count,
+                "total_objects": staging["total_object_count"],
+                "checkpoint_count": self.checkpoint_count,
+                "changed_scope_count": self.changed_scope_count,
+                "elapsed_seconds": elapsed_seconds,
+                "checkpoint_phase": phase,
+                **details,
+            }
+            self.log.info(
+                "UK_AQ_INTEGRITY_PROGRESS %s",
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            )
+        self.last_checkpoint_events = self.completed_events
+        self.last_checkpoint_at = self._monotonic()
+
+    def complete(self, *, phase: str = "complete_proposal_staging") -> None:
+        self.persist_checkpoint(phase=phase, final=True)
+
+
 def create_run_overlay(
     *,
     tmp_dir: str | Path,
@@ -17834,6 +18484,7 @@ def stage_overlay_object(
     stage: str,
     dependencies: Iterable[str] = (),
     dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
+    persist: bool = True,
 ) -> Path:
     normalized_key = _normalise_overlay_object_key(object_key)
     source = Path(source_path)
@@ -17886,17 +18537,19 @@ def stage_overlay_object(
         "r2_verified": False,
         "r2_verified_at_utc": None,
     }
-    write_run_state(run_state)
+    if persist:
+        write_run_state(run_state)
     return target
 
 
 def mark_overlay_structurally_validated(
-    run_state: dict[str, Any], object_key: str
+    run_state: dict[str, Any], object_key: str, *, persist: bool = True,
 ) -> None:
     entry = _overlay_object_entry(run_state, object_key)
     entry["structurally_validated"] = True
     entry["structurally_validated_at_utc"] = fmt_iso(utc_now())
-    write_run_state(run_state)
+    if persist:
+        write_run_state(run_state)
 
 
 def mark_overlay_uploaded(run_state: dict[str, Any], object_key: str) -> None:
@@ -17919,6 +18572,8 @@ def record_changed_scope(
     run_state: dict[str, Any],
     scope_set: str,
     scope: Mapping[str, Any],
+    *,
+    persist: bool = True,
 ) -> None:
     if scope_set not in OVERLAY_CHANGED_SCOPE_SETS:
         raise ValueError(f"unknown changed scope set: {scope_set}")
@@ -17930,7 +18585,8 @@ def record_changed_scope(
     if canonical_scope not in entries:
         entries.append(canonical_scope)
         entries.sort(key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")))
-    write_run_state(run_state)
+    if persist:
+        write_run_state(run_state)
 
 
 def record_blocked_scope(run_state: dict[str, Any], scope: Mapping[str, Any]) -> None:
@@ -18219,6 +18875,8 @@ def _record_metadata_executor_overlay(
     index_scope_set: str = "OBS_INDEXES_CHANGED",
     manifest_stage: str = "observs_manifests",
     index_stage: str = "observs_indexes",
+    proposal_staging: _SosLightV2ProposalStaging | None = None,
+    log: logging.Logger | None = None,
 ) -> None:
     """Stage structurally validated metadata/index proposals locally."""
     del dry_run
@@ -18316,6 +18974,7 @@ def _record_metadata_executor_overlay(
                     if isinstance(proposal.get("dependency_identities"), Mapping)
                     else None
                 ),
+                persist=proposal_staging is None,
             )
         snapshot = proposal.get("local_dependency_snapshot")
         staged_entry = _overlay_object_entry(run_state, object_key)
@@ -18360,27 +19019,50 @@ def _record_metadata_executor_overlay(
                     FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX,
                 "final_source": "planned_overlay",
             })
-        mark_overlay_structurally_validated(run_state, object_key)
+        mark_overlay_structurally_validated(
+            run_state,
+            object_key,
+            persist=proposal_staging is None,
+        )
         if planner_changed:
             scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
-            record_changed_scope(run_state, scope_set, {
+            scope = {
                 "object_key": object_key,
                 "stage": stage,
                 "provenance": proposal.get("provenance") or "repair_generated",
-            })
+            }
+            if proposal_staging is not None:
+                proposal_staging.record_changed_scope(scope_set, scope)
+            else:
+                record_changed_scope(run_state, scope_set, scope)
+        if proposal_staging is not None:
+            proposal_staging.object_completed(
+                phase="observation_metadata_staging",
+                publication_stage=stage,
+            )
     run_state["proposal_transition_planner_unchanged_keys"] = sorted(
         planner_unchanged_keys
     )
-    write_run_state(run_state)
+    if proposal_staging is None:
+        write_run_state(run_state)
 
 
 def _finalise_staged_write_set_provenance(
     run_state: dict[str, Any],
+    *,
+    log: logging.Logger | None = None,
 ) -> dict[str, Any]:
     """Freeze dependency ownership from complete final staged membership."""
     objects = run_state.get("objects")
     if not isinstance(objects, dict):
         raise ValueError("final staged write-set objects mapping is unavailable")
+    progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="final_staged_write_set_provenance",
+        total_objects=len(objects) * 2,
+    )
+    progress.start()
+    completed_objects = 0
     proposed_prefixes = [
         _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
         for entry in list(run_state.get("tombstone_prefixes") or [])
@@ -18418,6 +19100,8 @@ def _finalise_staged_write_set_provenance(
                     f"forced-republication audit is invalid: {object_key}"
                 )
             forced_republication_keys.append(object_key)
+        completed_objects += 1
+        progress.progress(completed_objects)
 
     rebuilt_identity_count = 0
     staged_dependency_edge_count = 0
@@ -18470,6 +19154,8 @@ def _finalise_staged_write_set_provenance(
                 rebuilt_identity_count += 1
             final_identities[dependency_key] = final_identity
         entry["dependency_identities"] = final_identities
+        completed_objects += 1
+        progress.progress(completed_objects)
 
     audit = {
         "status": "finalised",
@@ -18485,6 +19171,7 @@ def _finalise_staged_write_set_provenance(
         "external_dependency_edge_counts": external_dependency_edge_counts,
     }
     run_state["final_staged_write_set_provenance"] = audit
+    progress.complete(completed_objects)
     return audit
 
 
@@ -18523,7 +19210,12 @@ def _validated_observation_pollutant_manifest_row_count(
     return row_count
 
 
-def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any]:
+def assemble_sos_light_complete_days(
+    run_state: dict[str, Any],
+    *,
+    proposal_staging: _SosLightV2ProposalStaging | None = None,
+    log: logging.Logger | None = None,
+) -> dict[str, Any]:
     """Materialise the source-plus-Dropbox day proposal, then select full-day deletion."""
     validate_run_state_core_snapshot_identity(
         run_state,
@@ -18588,7 +19280,13 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
 
     total_day_uploads = 0
     dropbox_day_absent_days: list[str] = []
-    for raw_day in day_entries:
+    assembly_progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="complete_day_assembly",
+        total_objects=len(day_entries),
+    )
+    assembly_progress.start()
+    for completed_days, raw_day in enumerate(day_entries, start=1):
         day = dict(raw_day)
         day_utc = str(day.get("day_utc") or "")
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc):
@@ -18685,6 +19383,13 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
                 "r2_verified": False,
                 "r2_verified_at_utc": None,
             }
+            if proposal_staging is not None:
+                proposal_staging.object_completed(
+                    phase="complete_day_assembly",
+                    current_day=day_utc,
+                    assembled_days=completed_days - 1,
+                    total_days=len(day_entries),
+                )
         day_keys = sorted(
             key for key in objects if key.startswith(f"{day_prefix}/")
         )
@@ -18804,6 +19509,12 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         day["complete_day_delete_prefix"] = f"{day_prefix}/"
         total_day_uploads += len(day_keys)
         raw_day.update(day)
+        assembly_progress.progress(
+            completed_days,
+            force=True,
+            current_day=day_utc,
+            complete_day_object_count=len(day_keys),
+        )
 
     run_state["tombstone_prefixes"] = [
         {
@@ -18821,7 +19532,12 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         }
         for entry in sorted(day_entries, key=lambda value: str(value["day_utc"]))
     ]
-    final_provenance = _finalise_staged_write_set_provenance(run_state)
+    if proposal_staging is not None:
+        proposal_staging.complete()
+    final_provenance = _finalise_staged_write_set_provenance(
+        run_state,
+        log=log,
+    )
     forced_republication_keys = set(
         final_provenance["forced_republication_keys"]
     )
@@ -18897,7 +19613,14 @@ def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any
         "no_old_live_r2_body_planning_or_preservation": True,
     })
     run_state["mode"] = "sos-light"
+    staging = run_state.get("sos_light_v2_proposal_staging")
+    if isinstance(staging, dict):
+        staging["final_provenance_status"] = "complete"
     write_run_state(run_state)
+    assembly_progress.complete(
+        len(day_entries),
+        complete_day_object_count=total_day_uploads,
+    )
     return dict(audit)
 
 def _capture_local_v2_observation_scope(
@@ -18906,6 +19629,7 @@ def _capture_local_v2_observation_scope(
     day_utc: str,
     connector_id: int,
     repair_pollutants: Iterable[str] | None = None,
+    proposal_staging: _SosLightV2ProposalStaging | None = None,
 ) -> list[str]:
     """Prove source/Parquet equality, then stage one connector-day proposal."""
     stage_root = Path(str(run_state["overlay_root"]))
@@ -19109,9 +19833,24 @@ def _capture_local_v2_observation_scope(
         stage_overlay_object(
             run_state, object_key=object_key, source_path=source,
             stage="observations_data", dependencies=(),
+            persist=proposal_staging is None,
         )
-        mark_overlay_structurally_validated(run_state, object_key)
+        mark_overlay_structurally_validated(
+            run_state,
+            object_key,
+            persist=proposal_staging is None,
+        )
         captured.append(object_key)
+        if proposal_staging is not None:
+            relative_key = source.relative_to(source_root).as_posix()
+            pollutant_match = re.match(r"^pollutant_code=([^/]+)/", relative_key)
+            proposal_staging.object_completed(
+                phase="selected_partition_processing",
+                day_utc=day_utc,
+                pollutant_code=(
+                    pollutant_match.group(1) if pollutant_match else None
+                ),
+            )
     prefix_tombstones = run_state.setdefault("tombstone_prefixes", [])
     tombstone_prefixes = (
         [f"{connector_prefix}/pollutant_code={pollutant}" for pollutant in selected_pollutants]
@@ -19127,7 +19866,8 @@ def _capture_local_v2_observation_scope(
         {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
         key=lambda entry: str(entry["prefix"]),
     )
-    write_run_state(run_state)
+    if proposal_staging is None:
+        write_run_state(run_state)
     return captured
 
 def _create_final_verification_view(
@@ -20090,11 +20830,20 @@ def record_integrity_object_operations(
     *,
     run_id: int,
     run_state: Mapping[str, Any],
+    log: logging.Logger | None = None,
 ) -> dict[str, int]:
     """Persist planned and completed object states without conflating them."""
     now_iso = fmt_iso(utc_now())
     counts = {"planned_writes": 0, "planned_deletions": 0, "completed_writes": 0, "completed_deletions": 0}
-    for object_key, entry in sorted(dict(run_state.get("objects") or {}).items()):
+    object_entries = sorted(dict(run_state.get("objects") or {}).items())
+    progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="integrity_object_operations_persistence",
+        total_objects=len(object_entries),
+    )
+    progress.start()
+    completed_objects = 0
+    for object_key, entry in object_entries:
         if not isinstance(entry, Mapping):
             continue
         remote_completed = bool(entry.get("remote_completed") or entry.get("r2_verified"))
@@ -20130,6 +20879,8 @@ def record_integrity_object_operations(
                 entry.get("error"), now_iso,
             ),
         )
+        completed_objects += 1
+        progress.progress(completed_objects)
     for prefix_entry in list(run_state.get("tombstone_prefixes") or []):
         if not isinstance(prefix_entry, Mapping) or not prefix_entry.get("prefix"):
             continue
@@ -20178,6 +20929,7 @@ def record_integrity_object_operations(
                 (int(run_id), deleted_key, _object_operation_domain(deleted_key), now_iso),
             )
     conn.commit()
+    progress.complete(completed_objects)
     return counts
 
 
@@ -20228,6 +20980,8 @@ def _proposal_transition_error(
 
 def validate_proposal_run_state_transition(
     run_state: Mapping[str, Any],
+    *,
+    log: logging.Logger | None = None,
 ) -> dict[str, Any]:
     objects = run_state.get("objects")
     if objects is None:
@@ -20237,6 +20991,13 @@ def validate_proposal_run_state_transition(
             "coordinator proposal-transition validation failed: "
             "final run-state objects mapping is invalid"
         )
+    progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="proposal_transition_validation",
+        total_objects=len(objects),
+    )
+    progress.start()
+    completed_objects = 0
     changed_keys = {
         _normalise_overlay_object_key(str(key)) for key in objects
     }
@@ -20630,7 +21391,10 @@ def validate_proposal_run_state_transition(
                     ),
                 )
 
-    return {
+        completed_objects += 1
+        progress.progress(completed_objects)
+
+    result = {
         "status": "succeeded",
         "changed_object_count": len(changed_keys),
         "dependency_edge_count": staged_edge_count + sum(external_edge_counts.values()),
@@ -20642,6 +21406,84 @@ def validate_proposal_run_state_transition(
         "unchanged_planner_object_count": len(unchanged_planner_keys),
         "node_apply_launch_permitted": True,
     }
+    progress.complete(completed_objects)
+    return result
+
+
+def _is_dedicated_sos_light_v2_run_state(
+    run_state: Mapping[str, Any],
+) -> bool:
+    return (
+        run_state.get("execution_path") == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
+        and run_state.get("mode") == "sos-light"
+        and run_state.get("dedicated_sos_historical_replacement") is True
+        and run_state.get("mutation_connector_ids") == [1]
+        and run_state.get("selected_mutation_connector_ids") == [1]
+    )
+
+
+def _require_complete_v2_sos_light_staging(
+    run_state: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    staging = run_state.get("sos_light_v2_proposal_staging")
+    if (
+        not isinstance(staging, Mapping)
+        or staging.get("contract_version") != SOS_LIGHT_V2_STAGING_CONTRACT
+        or staging.get("status") != "complete"
+        or staging.get("node_apply_launch_permitted") is not False
+        or not isinstance(staging.get("completed_object_count"), int)
+        or isinstance(staging.get("completed_object_count"), bool)
+        or staging.get("completed_object_count") != staging.get("total_object_count")
+        or staging.get("completed_object_count")
+        != len(dict(run_state.get("objects") or {}))
+    ):
+        raise ValueError(
+            "fixed-v2 SOS-light proposal staging checkpoint is incomplete"
+        )
+    provenance = run_state.get("final_staged_write_set_provenance")
+    if (
+        not isinstance(provenance, Mapping)
+        or provenance.get("status") != "finalised"
+        or provenance.get("final_staged_object_count")
+        != len(dict(run_state.get("objects") or {}))
+        or staging.get("final_provenance_status") != "complete"
+        or staging.get("python_transition_validation_status") != "not_started"
+        or staging.get("persisted_state_equality_status") != "not_checked"
+    ):
+        raise ValueError(
+            "fixed-v2 SOS-light final staged write-set provenance is incomplete"
+        )
+    return staging
+
+
+def _v2_sos_light_persisted_equality_projection(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    staging = _require_complete_v2_sos_light_staging(run_state)
+    return {
+        "staging": json.loads(json.dumps(staging, sort_keys=True, default=str)),
+        "transition_authority": _proposal_transition_state_fingerprint_payload(
+            run_state
+        ),
+    }
+
+
+def _require_v2_sos_light_persisted_state_equality(
+    run_state: Mapping[str, Any],
+) -> None:
+    state_path = Path(str(run_state.get("run_state_path") or ""))
+    try:
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "fixed-v2 SOS-light complete final run-state checkpoint is unavailable"
+        ) from exc
+    current_projection = _v2_sos_light_persisted_equality_projection(run_state)
+    persisted_projection = _v2_sos_light_persisted_equality_projection(persisted)
+    if persisted_projection != current_projection:
+        raise ValueError(
+            "fixed-v2 SOS-light complete final run-state checkpoint is stale"
+        )
 
 
 def run_canonical_apply_executor(
@@ -20650,6 +21492,29 @@ def run_canonical_apply_executor(
     env: Mapping[str, str],
     log: logging.Logger,
 ) -> dict[str, Any]:
+    dedicated_sos_light_v2 = _is_dedicated_sos_light_v2_run_state(run_state)
+    if dedicated_sos_light_v2:
+        try:
+            _require_complete_v2_sos_light_staging(run_state)
+        except (OSError, TypeError, ValueError) as exc:
+            error = str(exc)
+            run_state["proposal_transition_validation"] = {
+                "status": "failed",
+                "stage": "complete_v2_sos_light_staging",
+                "error": error,
+                "node_apply_launch_permitted": False,
+                "r2_mutation_possible": False,
+                "validated_at_utc": fmt_iso(utc_now()),
+            }
+            write_run_state(run_state)
+            log.error("%s", error)
+            return {
+                "status": "failed",
+                "reason": "complete_v2_sos_light_staging_invalid",
+                "error": error,
+                "node_apply_launched": False,
+                "r2_mutation_possible": False,
+            }
     try:
         validate_run_state_core_snapshot_identity(
             run_state,
@@ -20674,8 +21539,49 @@ def run_canonical_apply_executor(
             "node_apply_launched": False,
             "r2_mutation_possible": False,
         }
+    if dedicated_sos_light_v2:
+        # Core validation may add consumer audit evidence, which is deliberately
+        # outside the transition-authoritative projection. Compare against the
+        # already persisted final checkpoint before writing any current state.
+        try:
+            _require_v2_sos_light_persisted_state_equality(run_state)
+        except (OSError, TypeError, ValueError) as exc:
+            error = str(exc)
+            staging = run_state.get("sos_light_v2_proposal_staging")
+            if isinstance(staging, dict):
+                staging.update({
+                    "persisted_state_equality_status": "failed",
+                    "node_apply_launch_permitted": False,
+                })
+            run_state["proposal_transition_validation"] = {
+                "status": "failed",
+                "stage": "persisted_state_equality",
+                "error": error,
+                "node_apply_launch_permitted": False,
+                "r2_mutation_possible": False,
+                "validated_at_utc": fmt_iso(utc_now()),
+            }
+            write_run_state(run_state)
+            log.error("%s", error)
+            return {
+                "status": "failed",
+                "reason": "v2_sos_light_persisted_state_equality_failed",
+                "error": error,
+                "node_apply_launched": False,
+                "r2_mutation_possible": False,
+            }
+        staging = run_state["sos_light_v2_proposal_staging"]
+        staging["persisted_state_equality_status"] = "succeeded"
+        write_run_state(run_state)
     try:
-        transition_validation = validate_proposal_run_state_transition(run_state)
+        transition_validation = validate_proposal_run_state_transition(
+            run_state,
+            log=log,
+        )
+        transition_fingerprint = (
+            proposal_transition_state_fingerprint_sha256(run_state)
+            if dedicated_sos_light_v2 else None
+        )
     except (OSError, TypeError, ValueError) as exc:
         error = str(exc)
         run_state["proposal_transition_validation"] = {
@@ -20684,6 +21590,12 @@ def run_canonical_apply_executor(
             "node_apply_launch_permitted": False,
             "validated_at_utc": fmt_iso(utc_now()),
         }
+        staging = run_state.get("sos_light_v2_proposal_staging")
+        if isinstance(staging, dict):
+            staging.update({
+                "python_transition_validation_status": "failed",
+                "node_apply_launch_permitted": False,
+            })
         write_run_state(run_state)
         log.error("%s", error)
         return {
@@ -20697,6 +21609,17 @@ def run_canonical_apply_executor(
         **transition_validation,
         "validated_at_utc": fmt_iso(utc_now()),
     }
+    if dedicated_sos_light_v2:
+        run_state["proposal_transition_validation"].update({
+            "state_fingerprint_contract_version":
+                SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+            "state_fingerprint_sha256": transition_fingerprint,
+        })
+        staging = run_state["sos_light_v2_proposal_staging"]
+        staging.update({
+            "python_transition_validation_status": "succeeded",
+            "node_apply_launch_permitted": True,
+        })
     write_run_state(run_state)
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -20925,12 +21848,94 @@ def observations_global_operation_lock_context(
     }
 
 
+INTEGRITY_LOGICAL_RUN_CONTEXT_ENV = "UK_AQ_INTEGRITY_LOGICAL_RUN_CONTEXT"
+INTEGRITY_LOGICAL_RUN_CONTEXT_VERSION = 1
+
+
+def build_integrity_logical_run_context(
+    *,
+    env_name: str,
+    started_at_utc: str,
+    run_compact: str,
+    log_path: str | Path,
+) -> dict[str, Any]:
+    return {
+        "contract_version": INTEGRITY_LOGICAL_RUN_CONTEXT_VERSION,
+        "env_name": env_name,
+        "started_at_utc": started_at_utc,
+        "run_compact": run_compact,
+        "log_path": str(log_path),
+    }
+
+
+def inherited_integrity_logical_run_context(
+    env: Mapping[str, str],
+    *,
+    expected_env_name: str,
+    expected_log_dir: str | Path,
+    global_operation_lock: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    raw = str(env.get(INTEGRITY_LOGICAL_RUN_CONTEXT_ENV) or "").strip()
+    if not global_operation_lock.get("valid"):
+        # Only a retained-lock child may inherit context. A stale variable in
+        # an ordinary top-level shell must never reuse an earlier identity.
+        return None
+    if not raw:
+        raise RuntimeError(
+            "Integrity retained-lock child is missing its logical run context"
+        )
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Integrity retained-lock child logical run context is invalid JSON"
+        ) from exc
+    expected_fields = {
+        "contract_version", "env_name", "started_at_utc", "run_compact",
+        "log_path",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise RuntimeError(
+            "Integrity retained-lock child logical run context has an invalid shape"
+        )
+    if payload.get("contract_version") != INTEGRITY_LOGICAL_RUN_CONTEXT_VERSION:
+        raise RuntimeError(
+            "Integrity retained-lock child logical run context contract is unknown"
+        )
+    started_iso = str(payload.get("started_at_utc") or "")
+    run_compact = str(payload.get("run_compact") or "")
+    try:
+        started_at = dt.datetime.strptime(
+            started_iso, "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=dt.timezone.utc)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Integrity retained-lock child started_at_utc is invalid"
+        ) from exc
+    expected_log_path = Path(expected_log_dir) / f"run-{run_compact}.log"
+    expected_lock_run_id = f"integrity:{expected_env_name}:{run_compact}"
+    if (
+        payload.get("env_name") != expected_env_name
+        or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{6}Z", run_compact)
+        or fmt_iso(started_at) != started_iso
+        or fmt_compact(started_at) != run_compact
+        or str(payload.get("log_path") or "") != str(expected_log_path)
+        or global_operation_lock.get("run_id") != expected_lock_run_id
+    ):
+        raise RuntimeError(
+            "Integrity retained-lock child logical run context identity disagrees"
+        )
+    return {**payload, "started_at": started_at}
+
+
 def run_integrity_under_global_operation_lock(
     *,
     argv: Sequence[str],
     args: argparse.Namespace,
     env: Mapping[str, str],
     run_compact: str,
+    started_at_utc: str,
+    log_path: str | Path,
 ) -> int:
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -20953,6 +21958,13 @@ def run_integrity_under_global_operation_lock(
         str(Path(__file__).resolve()),
         *[str(value) for value in argv],
     ]
+    logical_run_context = build_integrity_logical_run_context(
+        env_name=args.env,
+        started_at_utc=started_at_utc,
+        run_compact=run_compact,
+        log_path=log_path,
+    )
+    close_logging_handlers()
     completed = subprocess.run(
         command,
         cwd=repo_root,
@@ -20960,6 +21972,11 @@ def run_integrity_under_global_operation_lock(
             **os.environ,
             **{str(key): str(value) for key, value in env.items()},
             "SUPABASE_DB_URL": database_url,
+            INTEGRITY_LOGICAL_RUN_CONTEXT_ENV: json.dumps(
+                logical_run_context,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         },
         check=False,
     )
@@ -22779,6 +23796,7 @@ def run_v2_integrity_repair_flow(
     )
     write_run_state(run_state)
     explicit_selected_partitions: list[dict[str, Any]] | None = None
+    proposal_staging: _SosLightV2ProposalStaging | None = None
     if dedicated_sos_historical_replacement:
         if dry_run:
             raise RuntimeError(
@@ -22825,6 +23843,10 @@ def run_v2_integrity_repair_flow(
                 "reason": "explicit_selected_scope_is_replacement_authority",
             },
         })
+        proposal_staging = _SosLightV2ProposalStaging(
+            run_state=run_state,
+            log=log,
+        )
         write_run_state(run_state)
     observations = run_v2_gap_backfills(
         conn=conn, run_id=run_id, env_name=env_name, run_compact=run_compact,
@@ -22833,7 +23855,13 @@ def run_v2_integrity_repair_flow(
         repair_pollutants=repair_pollutants,
         source_scope=source_scope,
         explicit_selected_partitions=explicit_selected_partitions,
+        proposal_staging=proposal_staging,
     )
+    if proposal_staging is not None:
+        proposal_staging.persist_checkpoint(
+            phase="proposal_worker_complete",
+            final=False,
+        )
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
     if dedicated_sos_historical_replacement:
@@ -22940,11 +23968,26 @@ def run_v2_integrity_repair_flow(
     )
     if observation_failed:
         record_blocked_scope(run_state, {"stage": "observs_manifests", "reason": "observation_repair_failed"})
-    _record_metadata_executor_overlay(run_state=run_state, executor_result=metadata, dry_run=dry_run)
+    _record_metadata_executor_overlay(
+        run_state=run_state,
+        executor_result=metadata,
+        dry_run=dry_run,
+        proposal_staging=proposal_staging,
+        log=log,
+    )
+    if proposal_staging is not None:
+        proposal_staging.persist_checkpoint(
+            phase="observation_metadata_staging_complete",
+            final=False,
+        )
     if dedicated_sos_historical_replacement and not observation_failed and str(
         metadata.get("status") or ""
     ) not in {"failed", "blocked_dependency"}:
-        assemble_sos_light_complete_days(run_state)
+        assemble_sos_light_complete_days(
+            run_state,
+            proposal_staging=proposal_staging,
+            log=log,
+        )
     observation_manifest_status = str(metadata.get("manifest_status") or metadata.get("status") or "not_run")
     observation_index_status = str(metadata.get("index_status") or metadata.get("status") or "not_run")
     proposal_failed = (
@@ -22954,7 +23997,7 @@ def run_v2_integrity_repair_flow(
         or bool(run_state.get("blocked_scopes"))
     )
     planned_operation_counts = record_integrity_object_operations(
-        conn, run_id=run_id, run_state=run_state,
+        conn, run_id=run_id, run_state=run_state, log=log,
     )
     has_planned_r2_operations = (
         int(planned_operation_counts.get("planned_writes") or 0) > 0
@@ -23046,7 +24089,9 @@ def run_v2_integrity_repair_flow(
         }
     else:
         apply_result = run_canonical_apply_executor(run_state=run_state, env=env, log=log)
-        record_integrity_object_operations(conn, run_id=run_id, run_state=run_state)
+        record_integrity_object_operations(
+            conn, run_id=run_id, run_state=run_state, log=log,
+        )
 
     if proposal_failed or apply_result.get("status") == "failed":
         first_value_at_reconciliation: dict[str, Any] = {
@@ -25627,6 +26672,20 @@ def normalize_source_key_sensorcommunity(
         )
 
 
+def close_logging_handlers() -> None:
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        try:
+            handler.flush()
+        except Exception:
+            pass
+        root.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
 def setup_logging(log_dir: str, run_compact: str, verbose: bool) -> Path:
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     log_path = Path(log_dir) / f"run-{run_compact}.log"
@@ -25641,10 +26700,9 @@ def setup_logging(log_dir: str, run_compact: str, verbose: bool) -> Path:
     root = logging.getLogger()
     root.setLevel(level)
     # Clear any handlers carried over from re-entry in tests / repeated runs.
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
+    close_logging_handlers()
 
-    fh = logging.FileHandler(log_path)
+    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     fh.setFormatter(formatter)
     fh.setLevel(level)
     root.addHandler(fh)
@@ -26694,25 +27752,47 @@ def main(argv: list[str]) -> int:
     serialized_history_path_configs = serialize_history_path_configs(history_path_configs)
     site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_VERSION", "")).strip() or None
 
+    global_operation_lock = observations_global_operation_lock_context(os.environ)
+    inherited_logical_run = inherited_integrity_logical_run_context(
+        os.environ,
+        expected_env_name=args.env,
+        expected_log_dir=env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"],
+        global_operation_lock=global_operation_lock,
+    )
     started_mono = time.monotonic()
-    started_at = utc_now()
-    started_iso = fmt_iso(started_at)
-    run_compact = fmt_compact(started_at)
+    if inherited_logical_run is None:
+        started_at = utc_now()
+        started_iso = fmt_iso(started_at)
+        run_compact = fmt_compact(started_at)
+    else:
+        started_at = inherited_logical_run["started_at"]
+        started_iso = inherited_logical_run["started_at_utc"]
+        run_compact = inherited_logical_run["run_compact"]
+        started_mono -= max(
+            0.0,
+            (utc_now() - started_at).total_seconds(),
+        )
 
     log_path = setup_logging(
         env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"], run_compact, args.verbose
     )
     log = logging.getLogger("uk-aq-history-integrity")
 
-    log.info(
-        "start env=%s profile=%s source=%s dry_run=%s check_only=%s "
-        "run_backfill=%s timeseries_binding_backup_mode=%s",
-        args.env, args.profile, args.source,
-        args.dry_run, args.check_only, args.run_backfill,
-        args.timeseries_binding_backup_mode,
-    )
-    log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
-    log.info("log_file=%s", log_path)
+    if inherited_logical_run is None:
+        log.info(
+            "start env=%s profile=%s source=%s dry_run=%s check_only=%s "
+            "run_backfill=%s timeseries_binding_backup_mode=%s",
+            args.env, args.profile, args.source,
+            args.dry_run, args.check_only, args.run_backfill,
+            args.timeseries_binding_backup_mode,
+        )
+        log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
+        log.info("log_file=%s", log_path)
+    else:
+        log.info(
+            "resumed under observations global operation lock run_compact=%s",
+            run_compact,
+        )
     daily_task_health_config = _resolve_daily_task_health_config(env_name=args.env)
     daily_task_health_enabled = bool(daily_task_health_config.get("enabled"))
     daily_task_health_strict = bool(daily_task_health_config.get("strict"))
@@ -26728,7 +27808,6 @@ def main(argv: list[str]) -> int:
         "backup_gate_checked": False,
         "blocked_reason": "awaiting_ingestdb_boundary",
     }
-    global_operation_lock = observations_global_operation_lock_context(os.environ)
     dropbox_currentness: dict[str, Any] | None = None
 
     preflight_summary: dict[str, Any] | None = None
@@ -26932,6 +28011,8 @@ def main(argv: list[str]) -> int:
             args=args,
             env=env,
             run_compact=run_compact,
+            started_at_utc=started_iso,
+            log_path=log_path,
         )
 
     # The child process is now inside the retained PostgreSQL session lock.

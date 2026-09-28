@@ -57,6 +57,9 @@ import {
 import {
   getIntegrityR2ObjectWithRetry,
 } from "./lib/integrity_r2_get_retry.mjs";
+import {
+  requireSosLightV2CoordinatorFreeze,
+} from "./lib/sos_light_v2_coordinator_validation.mjs";
 
 function parseArgs(argv) {
   const args = { runStateJson: "", writeR2: false };
@@ -2694,6 +2697,28 @@ export async function applyValidatedProposal({
   };
   const indexConfig = resolveR2HistoryIndexConfig(env);
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  let sosLightV2CoordinatorFreeze;
+  try {
+    sosLightV2CoordinatorFreeze = requireSosLightV2CoordinatorFreeze(runState);
+    if (sosLightV2CoordinatorFreeze.dedicated) {
+      runState.sos_light_v2_node_transition_validation = {
+        ...sosLightV2CoordinatorFreeze,
+        accepted_at_utc: new Date().toISOString(),
+        r2_mutation_possible: false,
+      };
+      atomicWriteJson(runStatePath, runState);
+    }
+  } catch (error) {
+    runState.apply = {
+      status: "failed",
+      current_phase: "sos_light_v2_coordinator_freeze_validation",
+      r2_mutation_possible: false,
+      error: error instanceof Error ? error.message : String(error),
+      finished_at_utc: new Date().toISOString(),
+    };
+    atomicWriteJson(runStatePath, runState);
+    throw error;
+  }
   let coreSnapshotIdentityValidation;
   try {
     coreSnapshotIdentityValidation = validateIntegrityCoreSnapshotIdentity({

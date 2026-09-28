@@ -1,0 +1,614 @@
+from __future__ import annotations
+
+import datetime as dt
+import importlib.util
+import io
+import json
+import logging
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+
+MODULE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "bin"
+    / "uk-aq-history-integrity.py"
+)
+SPEC = importlib.util.spec_from_file_location(
+    "uk_aq_history_integrity_sos_light_v2_hardening", MODULE_PATH
+)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError(f"Unable to load module at {MODULE_PATH}")
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
+class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        MODULE.close_logging_handlers()
+
+    def _run_state(self, root: Path) -> dict[str, object]:
+        dropbox = root / "dropbox"
+        dropbox.mkdir()
+        state = MODULE.create_run_overlay(
+            tmp_dir=root,
+            run_id="v2-hardening",
+            environment="TEST",
+            base_dropbox_root=dropbox,
+        )
+        state.update({
+            "execution_path": "sos_light",
+            "mode": "sos-light",
+            "dedicated_sos_historical_replacement": True,
+            "mutation_connector_ids": [1],
+            "selected_mutation_connector_ids": [1],
+            "protected_connector_ids": [1],
+        })
+        return state
+
+    @staticmethod
+    def _base_env(root: Path) -> dict[str, str]:
+        return {
+            "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": str(root / "logs"),
+            "UK_AQ_HISTORY_INTEGRITY_REPORT_DIR": str(root / "reports"),
+            "UK_AQ_HISTORY_INTEGRITY_DB_PATH": str(root / "integrity.sqlite3"),
+        }
+
+    @staticmethod
+    def _history_paths() -> dict[str, SimpleNamespace]:
+        return {
+            "v2": SimpleNamespace(
+                observations_data_prefix="history/v2/observations"
+            ),
+        }
+
+    @staticmethod
+    def _add_object(state: dict[str, object], index: int) -> None:
+        key = f"history/v2/observations/day_utc=2026-01-01/object-{index:04d}.json"
+        state["objects"][key] = {
+            "object_key": key,
+            "local_path": f"/run/{index}",
+            "sha256": f"{index:064x}"[-64:],
+            "bytes": index,
+            "stage": "observations_data",
+            "dependencies": [],
+            "dependency_identities": {},
+            "proposed": True,
+            "built": True,
+            "structurally_validated": True,
+        }
+
+    def test_501_objects_checkpoint_at_250_500_and_final(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = self._run_state(Path(tmpdir))
+            writes: list[tuple[int, str]] = []
+            real_write = MODULE.write_run_state
+
+            def observe(run_state: dict[str, object]) -> Path:
+                staging = run_state["sos_light_v2_proposal_staging"]
+                writes.append((staging["completed_object_count"], staging["status"]))
+                return real_write(run_state)
+
+            with mock.patch.object(MODULE, "write_run_state", side_effect=observe):
+                staging = MODULE._SosLightV2ProposalStaging(
+                    run_state=state,
+                    log=None,
+                )
+                for index in range(1, 502):
+                    self._add_object(state, index)
+                    staging.object_completed(phase="fixture")
+                staging.complete()
+
+            self.assertEqual(writes, [(250, "in_progress"), (500, "in_progress"), (501, "complete")])
+            self.assertFalse(
+                state["sos_light_v2_proposal_staging"]["node_apply_launch_permitted"]
+            )
+
+    def test_time_checkpoint_occurs_before_250_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = self._run_state(Path(tmpdir))
+            clock = FakeClock()
+            with mock.patch.object(MODULE, "write_run_state") as write_state:
+                staging = MODULE._SosLightV2ProposalStaging(
+                    run_state=state,
+                    log=None,
+                    monotonic=clock,
+                )
+                self._add_object(state, 1)
+                staging.object_completed(phase="fixture")
+                clock.value = 15.0
+                self._add_object(state, 2)
+                staging.object_completed(phase="fixture")
+            write_state.assert_called_once_with(state)
+            self.assertEqual(
+                state["sos_light_v2_proposal_staging"]["completed_object_count"], 2
+            )
+
+    def test_changed_scopes_are_deduplicated_and_materialised_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = self._run_state(Path(tmpdir))
+            staging = MODULE._SosLightV2ProposalStaging(
+                run_state=state,
+                log=None,
+            )
+            later = {"day_utc": "2026-01-02", "connector_id": 1}
+            earlier = {"connector_id": 1, "day_utc": "2026-01-01"}
+            staging.record_changed_scope("OBSERVS_CHANGED", later)
+            staging.record_changed_scope("OBSERVS_CHANGED", earlier)
+            staging.record_changed_scope("OBSERVS_CHANGED", dict(later))
+            staging.persist_checkpoint(phase="fixture", final=False)
+            self.assertEqual(
+                state["changed_scopes"]["OBSERVS_CHANGED"],
+                [earlier, later],
+            )
+            self.assertEqual(
+                state["sos_light_v2_proposal_staging"]["changed_scope_count"],
+                2,
+            )
+
+    def test_progress_is_count_or_time_bounded_not_per_object(self) -> None:
+        clock = FakeClock()
+        log = mock.Mock(spec=logging.Logger)
+        progress = MODULE._BoundedCoordinatorProgress(
+            log=log,
+            phase="fixture",
+            total_objects=501,
+            monotonic=clock,
+        )
+        progress.start()
+        for completed in range(1, 502):
+            progress.progress(completed)
+        progress.complete(501)
+        self.assertEqual(log.info.call_count, 4)
+        messages = [call.args[1] for call in log.info.call_args_list]
+        self.assertIn('"completed_objects":250', messages[1])
+        self.assertIn('"completed_objects":500', messages[2])
+
+    def _freeze_one_object(self, state: dict[str, object]) -> str:
+        key = "history/v2/observations/day_utc=2026-01-01/manifest.json"
+        body_path = Path(state["run_root"]) / "fixture-source.json"
+        body_path.parent.mkdir(parents=True, exist_ok=True)
+        body_path.write_text('{"manifest_kind":"day"}\n', encoding="utf-8")
+        MODULE.stage_overlay_object(
+            state,
+            object_key=key,
+            source_path=body_path,
+            stage="day_parent",
+            persist=False,
+        )
+        MODULE.mark_overlay_structurally_validated(state, key, persist=False)
+        staging = MODULE._SosLightV2ProposalStaging(run_state=state, log=None)
+        staging.completed_events = 1
+        staging.complete()
+        MODULE._finalise_staged_write_set_provenance(state)
+        state["sos_light_v2_proposal_staging"]["final_provenance_status"] = "complete"
+        MODULE.write_run_state(state)
+        return key
+
+    def test_partial_checkpoint_is_rejected_before_node_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = self._run_state(Path(tmpdir))
+            MODULE._SosLightV2ProposalStaging(run_state=state, log=None)
+            MODULE.write_run_state(state)
+            with (
+                mock.patch.object(MODULE, "validate_run_state_core_snapshot_identity"),
+                mock.patch.object(MODULE.subprocess, "Popen") as popen,
+            ):
+                result = MODULE.run_canonical_apply_executor(
+                    run_state=state,
+                    env={},
+                    log=mock.Mock(spec=logging.Logger),
+                )
+            self.assertEqual(result["reason"], "complete_v2_sos_light_staging_invalid")
+            self.assertFalse(result["r2_mutation_possible"])
+            popen.assert_not_called()
+
+    def test_persisted_state_equality_rejects_transition_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = self._run_state(Path(tmpdir))
+            key = self._freeze_one_object(state)
+            MODULE._require_v2_sos_light_persisted_state_equality(state)
+            state["objects"][key]["stage"] = "tampered"
+            with self.assertRaisesRegex(ValueError, "checkpoint is stale"):
+                MODULE._require_v2_sos_light_persisted_state_equality(state)
+
+    def test_apply_checks_existing_checkpoint_before_any_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = self._run_state(Path(tmpdir))
+            key = self._freeze_one_object(state)
+            persisted_stage = state["objects"][key]["stage"]
+            state["objects"][key]["stage"] = "tampered-after-final-checkpoint"
+            observed_persisted_stage: list[str] = []
+            real_require = MODULE._require_v2_sos_light_persisted_state_equality
+
+            def observe_existing_checkpoint(run_state: dict[str, object]) -> None:
+                persisted = json.loads(
+                    Path(run_state["run_state_path"]).read_text(encoding="utf-8")
+                )
+                observed_persisted_stage.append(
+                    persisted["objects"][key]["stage"]
+                )
+                real_require(run_state)
+
+            with (
+                mock.patch.object(
+                    MODULE, "validate_run_state_core_snapshot_identity"
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_require_v2_sos_light_persisted_state_equality",
+                    side_effect=observe_existing_checkpoint,
+                ),
+                mock.patch.object(MODULE.subprocess, "Popen") as popen,
+            ):
+                result = MODULE.run_canonical_apply_executor(
+                    run_state=state,
+                    env={},
+                    log=mock.Mock(spec=logging.Logger),
+                )
+
+            self.assertEqual(observed_persisted_stage, [persisted_stage])
+            self.assertEqual(
+                result["reason"],
+                "v2_sos_light_persisted_state_equality_failed",
+            )
+            self.assertFalse(result["r2_mutation_possible"])
+            popen.assert_not_called()
+
+    def test_python_and_node_transition_fingerprints_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = self._run_state(Path(tmpdir))
+            self._freeze_one_object(state)
+            python_fingerprint = MODULE.proposal_transition_state_fingerprint_sha256(state)
+            module_url = (
+                Path(__file__).resolve().parents[2]
+                / "backup_r2/lib/sos_light_v2_coordinator_validation.mjs"
+            ).as_uri()
+            script = (
+                f'import {{ computeCoordinatorTransitionStateFingerprint as compute }} '
+                f'from {json.dumps(module_url)}; '
+                "let body=''; for await (const chunk of process.stdin) body += chunk; "
+                "process.stdout.write(compute(JSON.parse(body)));"
+            )
+            completed = subprocess.run(
+                ["node", "--input-type=module", "-e", script],
+                input=json.dumps(state),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertRegex(python_fingerprint, r"^[a-f0-9]{64}$")
+            self.assertEqual(completed.stdout, python_fingerprint)
+
+    def test_successful_python_transition_is_persisted_before_node_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = self._run_state(Path(tmpdir))
+            self._freeze_one_object(state)
+            observed_at_launch: dict[str, object] = {}
+
+            class FakeProcess:
+                returncode = 0
+
+                def __init__(self) -> None:
+                    self.stdout = io.StringIO('{"applied":true}\n')
+                    self.stderr = io.StringIO("")
+
+                def wait(self) -> int:
+                    return self.returncode
+
+            def launch(*args: object, **kwargs: object) -> FakeProcess:
+                del args, kwargs
+                persisted = json.loads(
+                    Path(state["run_state_path"]).read_text(encoding="utf-8")
+                )
+                observed_at_launch.update(persisted)
+                return FakeProcess()
+
+            with (
+                mock.patch.object(
+                    MODULE, "validate_run_state_core_snapshot_identity"
+                ),
+                mock.patch.object(MODULE.subprocess, "Popen", side_effect=launch),
+            ):
+                result = MODULE.run_canonical_apply_executor(
+                    run_state=state,
+                    env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                    log=mock.Mock(spec=logging.Logger),
+                )
+
+            transition = observed_at_launch["proposal_transition_validation"]
+            staging = observed_at_launch["sos_light_v2_proposal_staging"]
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(transition["status"], "succeeded")
+            self.assertEqual(
+                transition["state_fingerprint_contract_version"],
+                MODULE.SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+            )
+            self.assertRegex(
+                transition["state_fingerprint_sha256"], r"^[a-f0-9]{64}$"
+            )
+            self.assertTrue(transition["node_apply_launch_permitted"])
+            self.assertEqual(
+                staging["python_transition_validation_status"], "succeeded"
+            )
+            self.assertEqual(
+                staging["persisted_state_equality_status"], "succeeded"
+            )
+            self.assertTrue(staging["node_apply_launch_permitted"])
+
+    def test_retained_lock_context_reuses_identity_and_stale_context_is_ignored(self) -> None:
+        started = dt.datetime(2026, 9, 27, 16, 15, 33, tzinfo=dt.timezone.utc)
+        run_compact = MODULE.fmt_compact(started)
+        context = MODULE.build_integrity_logical_run_context(
+            env_name="TEST",
+            started_at_utc=MODULE.fmt_iso(started),
+            run_compact=run_compact,
+            log_path=Path("/tmp/logs") / f"run-{run_compact}.log",
+        )
+        self.assertIsNone(MODULE.inherited_integrity_logical_run_context(
+            {MODULE.INTEGRITY_LOGICAL_RUN_CONTEXT_ENV: json.dumps(context)},
+            expected_env_name="TEST",
+            expected_log_dir="/tmp/logs",
+            global_operation_lock={"valid": False},
+        ))
+        inherited = MODULE.inherited_integrity_logical_run_context(
+            {MODULE.INTEGRITY_LOGICAL_RUN_CONTEXT_ENV: json.dumps(context)},
+            expected_env_name="TEST",
+            expected_log_dir="/tmp/logs",
+            global_operation_lock={
+                "valid": True,
+                "run_id": f"integrity:TEST:{run_compact}",
+            },
+        )
+        self.assertEqual(inherited["run_compact"], run_compact)
+        mismatched = dict(context)
+        mismatched["log_path"] = "/tmp/logs/run-2026-09-27T161537Z.log"
+        with self.assertRaisesRegex(RuntimeError, "identity disagrees"):
+            MODULE.inherited_integrity_logical_run_context(
+                {
+                    MODULE.INTEGRITY_LOGICAL_RUN_CONTEXT_ENV:
+                        json.dumps(mismatched),
+                },
+                expected_env_name="TEST",
+                expected_log_dir="/tmp/logs",
+                global_operation_lock={
+                    "valid": True,
+                    "run_id": f"integrity:TEST:{run_compact}",
+                },
+            )
+
+    def test_parent_passes_original_identity_to_retained_lock_child(self) -> None:
+        run_compact = "2026-09-27T161533Z"
+        with (
+            mock.patch.object(MODULE, "_repo_root_for_integrity_script", return_value=Path("/tmp/repo")),
+            mock.patch.object(MODULE, "resolve_history_writer_database_url", return_value="postgresql://test"),
+            mock.patch.object(MODULE, "close_logging_handlers") as close_handlers,
+            mock.patch.object(MODULE.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run,
+        ):
+            MODULE.run_integrity_under_global_operation_lock(
+                argv=["--env", "TEST"],
+                args=SimpleNamespace(env="TEST"),
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                run_compact=run_compact,
+                started_at_utc="2026-09-27T16:15:33Z",
+                log_path=f"/tmp/logs/run-{run_compact}.log",
+            )
+        close_handlers.assert_called_once_with()
+        child_context = json.loads(
+            run.call_args.kwargs["env"][MODULE.INTEGRITY_LOGICAL_RUN_CONTEXT_ENV]
+        )
+        self.assertEqual(child_context["run_compact"], run_compact)
+        self.assertEqual(
+            run.call_args.args[0][run.call_args.args[0].index("--run-id") + 1],
+            f"integrity:TEST:{run_compact}",
+        )
+
+    def test_lock_child_appends_to_parent_log_and_report_identity(self) -> None:
+        parent_started = dt.datetime(
+            2026, 9, 27, 16, 15, 33, tzinfo=dt.timezone.utc
+        )
+        child_wall_clock = dt.datetime(
+            2026, 9, 27, 16, 15, 37, tzinfo=dt.timezone.utc
+        )
+        run_compact = MODULE.fmt_compact(parent_started)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env = self._base_env(root)
+            parent_log_path = MODULE.setup_logging(
+                env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"], run_compact, False
+            )
+            logging.getLogger("logical-run-test").info("start env=TEST")
+            MODULE.close_logging_handlers()
+            context = MODULE.build_integrity_logical_run_context(
+                env_name="TEST",
+                started_at_utc=MODULE.fmt_iso(parent_started),
+                run_compact=run_compact,
+                log_path=parent_log_path,
+            )
+            lock = {
+                "held": True,
+                "valid": True,
+                "owner": "integrity",
+                "run_id": f"integrity:TEST:{run_compact}",
+                "logical_identity": (
+                    "uk_aq:r2_history:v2:observations_global_operation"
+                ),
+            }
+            blocked_checkpoint = {
+                "allowed": False,
+                "status": "blocked_stale_dropbox_checkpoint",
+                "checkpoint_live_root_match": False,
+            }
+            with (
+                mock.patch.dict(
+                    MODULE.os.environ,
+                    {
+                        MODULE.INTEGRITY_LOGICAL_RUN_CONTEXT_ENV:
+                            json.dumps(context),
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(MODULE, "load_env_or_die", return_value=env),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_history_path_configs",
+                    return_value=self._history_paths(),
+                ),
+                mock.patch.object(
+                    MODULE, "serialize_history_path_configs", return_value={}
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_resolve_daily_task_health_config",
+                    return_value={"enabled": False, "strict": False},
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "observations_global_operation_lock_context",
+                    return_value=lock,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "run_integrity_ingest_boundary_check",
+                    return_value={"allowed": True, "blockers": []},
+                ),
+                mock.patch.object(MODULE, "load_backfill_env_file_if_set"),
+                mock.patch.object(
+                    MODULE, "resolve_r2_history_root", return_value="/dropbox"
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "run_integrity_dropbox_currentness_gate",
+                    return_value=blocked_checkpoint,
+                ),
+                mock.patch.object(
+                    MODULE, "utc_now", return_value=child_wall_clock
+                ),
+            ):
+                result = MODULE.main([
+                    "--env", "TEST",
+                    "--source", "sos",
+                    "--from-day", "2026-09-26",
+                    "--to-day", "2026-09-26",
+                    "--check-only",
+                ])
+
+            self.assertEqual(result, 2)
+            later_compact = MODULE.fmt_compact(child_wall_clock)
+            self.assertEqual(
+                sorted(path.name for path in (root / "logs").glob("run-*.log")),
+                [f"run-{run_compact}.log"],
+            )
+            self.assertFalse(
+                (root / "logs" / f"run-{later_compact}.log").exists()
+            )
+            combined_log = parent_log_path.read_text(encoding="utf-8")
+            self.assertEqual(combined_log.count("INFO start env=TEST"), 1)
+            self.assertIn(
+                "INFO resumed under observations global operation lock",
+                combined_log,
+            )
+            self.assertIn(
+                f'"run_id": "integrity:TEST:{run_compact}"', combined_log
+            )
+            self.assertTrue(
+                (root / "reports" / f"{run_compact}-summary.json").exists()
+            )
+            self.assertFalse(
+                (root / "reports" / f"{later_compact}-summary.json").exists()
+            )
+
+    def test_pre_lock_blocked_run_keeps_one_log_and_report(self) -> None:
+        started = dt.datetime(
+            2026, 9, 27, 16, 15, 33, tzinfo=dt.timezone.utc
+        )
+        run_compact = MODULE.fmt_compact(started)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env = self._base_env(root)
+            blocked = {
+                "allowed": False,
+                "blocked_reason": "integrity_range_overlaps_ingestdb_boundary",
+                "blockers": [{"connector_id": 1}],
+            }
+            with (
+                mock.patch.dict(MODULE.os.environ, {}, clear=True),
+                mock.patch.object(MODULE, "load_env_or_die", return_value=env),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_history_path_configs",
+                    return_value=self._history_paths(),
+                ),
+                mock.patch.object(
+                    MODULE, "serialize_history_path_configs", return_value={}
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_resolve_daily_task_health_config",
+                    return_value={"enabled": False, "strict": False},
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "run_integrity_ingest_boundary_check",
+                    return_value=blocked,
+                ),
+                mock.patch.object(MODULE, "utc_now", return_value=started),
+                mock.patch.object(
+                    MODULE, "run_integrity_under_global_operation_lock"
+                ) as global_lock,
+            ):
+                result = MODULE.main([
+                    "--env", "TEST",
+                    "--source", "sos",
+                    "--from-day", "2026-09-26",
+                    "--to-day", "2026-09-26",
+                    "--check-only",
+                ])
+
+            self.assertEqual(result, 2)
+            global_lock.assert_not_called()
+            self.assertEqual(
+                [path.name for path in (root / "logs").glob("run-*.log")],
+                [f"run-{run_compact}.log"],
+            )
+            self.assertTrue(
+                (root / "reports" / f"{run_compact}-summary.json").exists()
+            )
+
+    def test_independent_logging_setups_use_fresh_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir)
+            first = MODULE.setup_logging(
+                str(log_dir), "2026-09-27T161533Z", False
+            )
+            MODULE.close_logging_handlers()
+            second = MODULE.setup_logging(
+                str(log_dir), "2026-09-27T161537Z", False
+            )
+            MODULE.close_logging_handlers()
+            self.assertNotEqual(first, second)
+            self.assertEqual(
+                sorted(path.name for path in log_dir.glob("run-*.log")),
+                [
+                    "run-2026-09-27T161533Z.log",
+                    "run-2026-09-27T161537Z.log",
+                ],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
