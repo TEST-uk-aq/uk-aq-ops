@@ -68,6 +68,8 @@ Connection loss releases a PostgreSQL session advisory lock automatically. A pro
 
 A lightweight same-session health/ownership check MAY be used during long runs. A durable heartbeat table is not required.
 
+For the **future fixed-v2 SOS-light path only**, [`sos_light_pre_mutation_lock_recovery_amendment.md`](sos_light_pre_mutation_lock_recovery_amendment.md) defines a narrower recovery mechanism after a lock session is genuinely lost: protected child progress stops, a fresh session may try to reacquire the same global lock for a bounded period, and the original Step 0/writer/backup/root/core authority must be revalidated exactly before the same logical run may resume. This does not permit unlocked continuation. It applies only before the first possible R2 mutation. Post-mutation lock loss and all other covered operations retain immediate fail-closed behaviour. Until that amendment is deployed and accepted through real TEST operation, the current runtime remains the immediate fail-closed behaviour described above.
+
 Normal success, controlled failure, cancellation and exception paths MUST attempt explicit release in a `finally` path.
 
 ## Prune Daily protected lifetime
