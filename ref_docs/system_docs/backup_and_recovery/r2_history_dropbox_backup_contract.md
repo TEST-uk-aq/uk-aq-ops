@@ -212,6 +212,35 @@ Calls that do not provide a correlation identifier retain the existing scheduled
 
 The correlation mechanism does not weaken writer coordination. The workflow continues to run the normal hierarchical backup under the shared global observations operation lock and publishes checkpoint completion according to the existing sync contract.
 
+### Task-health delivery and workflow completion
+
+The GitHub-hosted R2 history Dropbox backup MUST treat its Daily Task Health lifecycle as part of workflow completion rather than best-effort diagnostics.
+
+For this workflow:
+
+- a backup run MUST establish its `Started` Daily Task Health row before entering the locked backup operation;
+- a successful backup/checkpoint operation MUST NOT be reported as a successful GitHub Actions workflow unless the same Daily Task Health run has also been persisted to its terminal `Finished` state;
+- an underlying failed/cancelled backup MUST continue to report terminal `Failed` health state where execution reaches the final health-reporting step;
+- failure to persist the required task-health state after bounded retries is itself workflow failure. The workflow MUST fail closed rather than emit only a warning and remain green;
+- Daily Task Health reporting for this workflow MUST therefore run in strict mode.
+
+Task-health RPC delivery MUST be bounded. Each RPC attempt MUST have a finite client-side timeout. Transient delivery failures MUST receive bounded retry with backoff. The retryable class includes network/timeout failures, HTTP `408`, HTTP `429`, and HTTP `5xx` responses including Cloudflare/Supabase `520`. Deterministic non-transient `4xx` responses other than `408` and `429` MUST fail immediately rather than be retried.
+
+Retries MUST be safe with respect to Daily Task Health identity and state:
+
+- terminal updates through `uk_aq_rpc_daily_task_finished(p_run_id, ...)` and `uk_aq_rpc_daily_task_failed(p_run_id, ...)` target the already-established Daily Task Health UUID and MUST be repeatable with the same payload without creating another run row;
+- the post-terminal daily-status recomputation is repeatable and MAY use the same transient retry policy;
+- the `Started` operation MUST be idempotent for one GitHub workflow attempt before transient retries are enabled for it. Its logical platform-execution identity is the exact tuple `(task_key, source_repo, platform_run_id, github_run_attempt)`;
+- retrying `Started` for that same exact platform-execution identity MUST return/reuse the existing Daily Task Health run UUID and MUST NOT create another Daily Task Health attempt;
+- the same GitHub `platform_run_id` with a different `github_run_attempt` is a distinct workflow attempt and MAY create a new Daily Task Health run;
+- callers without sufficient platform-execution identity retain the existing non-idempotent start semantics and MUST NOT gain unsafe blind retries merely because the shared reporter supports retries for idempotent calls.
+
+A timeout or `520` can occur after the database has committed a request but before the client receives a usable response. Retry design MUST therefore be based on the idempotency rules above, not on an assumption that an error response proves no database change occurred.
+
+Retry/timeout diagnostics MAY report RPC name, HTTP status, attempt number, elapsed wait and final failure reason, but MUST NOT expose service-role credentials or other secrets.
+
+This task-health requirement changes workflow completion semantics only. It does not change backup payload scope, inventory/checkpoint identities, copy planning, writer-lock identity, Dropbox layout or the meaning of a successfully published backup checkpoint.
+
 ### Observation Parquet copy mode for chained backups
 
 The normal backup workflow and lower-level sync MUST support an observation-Parquet copy-mode selector with exactly these steady-state values:
