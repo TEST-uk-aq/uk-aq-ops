@@ -280,6 +280,26 @@ test("Started without complete GitHub identity remains single-attempt", async ()
   assert.equal(calls, 1);
 });
 
+test("insert-style final fallback remains single-attempt", async () => {
+  let calls = 0;
+  await assert.rejects(
+    postRpc({
+      supabaseUrl: "https://example.invalid",
+      serviceRoleKey: "test-key",
+      rpcName: "uk_aq_rpc_daily_task_report_final",
+      body: { p: { task_key: "ops.some_other_task", status: "Finished" } },
+      fetchImpl: async () => {
+        calls += 1;
+        return rpcResponse(520, { message: "unknown commit state" });
+      },
+      retryDelaysMs: NO_RETRY_DELAY,
+      sleepImpl: noSleep,
+    }),
+    /failed \(520\)/,
+  );
+  assert.equal(calls, 1);
+});
+
 test("Started with complete GitHub identity uses the safe retry path", async () => {
   let calls = 0;
   const runId = await postRpc({
