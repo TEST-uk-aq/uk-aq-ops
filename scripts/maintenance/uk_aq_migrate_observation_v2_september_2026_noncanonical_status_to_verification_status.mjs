@@ -353,17 +353,17 @@ function requirePinnedParquetIdentity(key, expected) {
   return Object.freeze({ key, byte_size: expected.byte_size, sha256: expected.sha256 });
 }
 
-function normaliseHistoricalEtag(value, label) {
-  if (typeof value !== "string") throw new Error(`Historical ${label} ETag is missing or invalid`);
+function normaliseQuotedObjectIdentity(value, label) {
+  if (typeof value !== "string") throw new Error(`${label} is missing or invalid`);
   let normalised = value.trim();
   const startsQuoted = normalised.startsWith('"');
   const endsQuoted = normalised.endsWith('"');
   if (startsQuoted !== endsQuoted || (startsQuoted && normalised.length < 3)) {
-    throw new Error(`Historical ${label} ETag is missing or invalid`);
+    throw new Error(`${label} is missing or invalid`);
   }
   if (startsQuoted) normalised = normalised.slice(1, -1);
   if (!normalised || normalised.includes('"') || /[\u0000-\u001f\u007f]/.test(normalised)) {
-    throw new Error(`Historical ${label} ETag is missing or invalid`);
+    throw new Error(`${label} is missing or invalid`);
   }
   return normalised;
 }
@@ -427,21 +427,30 @@ export async function readMigrationSourceParquetWithDropboxEvidence({
 }) {
   if (manifestFile?.key !== key || !String(key).endsWith(".parquet") ||
       !Number.isSafeInteger(manifestFile?.bytes) || manifestFile.bytes < 0) {
-    throw new Error(`Historical manifest Parquet identity is invalid: ${key}`);
+    throw new Error(`Manifest Parquet identity is invalid: ${key}`);
   }
-  const manifestEtag = normaliseHistoricalEtag(manifestFile.etag_or_hash, "manifest");
+  const manifestIdentity = normaliseQuotedObjectIdentity(
+    manifestFile.etag_or_hash,
+    "Manifest Parquet etag_or_hash",
+  );
+  const manifestSha256 = SHA256.test(manifestIdentity) ? manifestIdentity : null;
+  const manifestEtag = manifestSha256 ? null : manifestIdentity;
   const dropbox = readDropboxSourceParquet(dropboxRoot, key, manifestFile.bytes);
+  if (manifestSha256 && dropbox.sha256 !== manifestSha256) {
+    throw new Error(`Manifest Parquet SHA-256 disagrees with Dropbox: ${key}`);
+  }
   const stored = head ?? await headObject({ r2, key });
   if (!stored?.exists || !Number.isSafeInteger(stored?.bytes) || stored.bytes < 0 ||
       stored.bytes !== dropbox.byte_size) {
     throw new Error(`Legacy source Parquet R2 HEAD byte-size mismatch: ${key}`);
   }
-  if (stored.etag !== null && stored.etag !== undefined && stored.etag !== "" &&
-      normaliseHistoricalEtag(stored.etag, "R2 HEAD") !== manifestEtag) {
+  if (manifestEtag && stored.etag !== null && stored.etag !== undefined && stored.etag !== "" &&
+      normaliseQuotedObjectIdentity(stored.etag, "Historical R2 HEAD ETag") !== manifestEtag) {
     throw new Error(`Legacy source Parquet historical ETag mismatch: ${key}`);
   }
   const hasStoredSha256 = stored.sha256 !== null && stored.sha256 !== undefined && stored.sha256 !== "";
-  if (hasStoredSha256 && (!SHA256.test(stored.sha256) || stored.sha256 !== dropbox.sha256)) {
+  const expectedSha256 = manifestSha256 || dropbox.sha256;
+  if (hasStoredSha256 && (!SHA256.test(stored.sha256) || stored.sha256 !== expectedSha256)) {
     throw new Error(`Legacy source Parquet stored SHA-256 disagrees with Dropbox: ${key}`);
   }
   const object = await getObject({ r2, key });

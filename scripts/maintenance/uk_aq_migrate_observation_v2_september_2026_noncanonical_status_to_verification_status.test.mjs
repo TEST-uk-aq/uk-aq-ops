@@ -331,6 +331,10 @@ test("bounded v2 September physical-name migration preserves content and publica
     bytes: legacyParquetBody.byteLength,
     etag_or_hash: `"${historicalEtag}"`,
   };
+  const checksumManifestFile = {
+    ...historicalManifestFile,
+    etag_or_hash: legacyParquetIdentity.sha256,
+  };
   const migrationR2 = (head, body) => ({
     adapter: {
       headObject: async ({ key }) => ({ key, ...head }),
@@ -344,6 +348,7 @@ test("bounded v2 September physical-name migration preserves content and publica
     sha256: null,
   }, legacyParquetBody);
   const dropboxDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-september-source-"));
+  const outsideDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-september-outside-"));
   const dropboxParquetPath = path.join(dropboxDirectory, ...legacyParquetKey.split("/"));
   try {
     fs.mkdirSync(path.dirname(dropboxParquetPath), { recursive: true });
@@ -361,6 +366,60 @@ test("bounded v2 September physical-name migration preserves content and publica
     assert.equal(verifiedLegacy.historical_etag, historicalEtag);
 
     const differentR2Body = Buffer.alloc(legacyParquetBody.byteLength, 0x78);
+    const verifiedChecksumManifest = await readMigrationSourceParquetWithDropboxEvidence({
+      r2: migrationR2({
+        exists: true,
+        bytes: legacyParquetIdentity.byte_size,
+        etag: '"ordinary-unrelated-etag"',
+        sha256: null,
+      }, legacyParquetBody),
+      key: legacyParquetKey,
+      manifestFile: checksumManifestFile,
+      dropboxRoot: dropboxDirectory,
+    });
+    assert.equal(verifiedChecksumManifest.sha256, legacyParquetIdentity.sha256);
+    assert.equal(verifiedChecksumManifest.historical_etag, null);
+
+    const verifiedChecksumManifestWithStoredSha = await readMigrationSourceParquetWithDropboxEvidence({
+      r2: migrationR2({
+        exists: true,
+        bytes: legacyParquetIdentity.byte_size,
+        etag: '"another-unrelated-etag"',
+        sha256: legacyParquetIdentity.sha256,
+      }, legacyParquetBody),
+      key: legacyParquetKey,
+      manifestFile: checksumManifestFile,
+      dropboxRoot: dropboxDirectory,
+    });
+    assert.equal(verifiedChecksumManifestWithStoredSha.sha256, legacyParquetIdentity.sha256);
+
+    fs.writeFileSync(dropboxParquetPath, differentR2Body);
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: checksumlessLegacyR2,
+        key: legacyParquetKey,
+        manifestFile: checksumManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /Manifest Parquet SHA-256 disagrees with Dropbox/i,
+    );
+    fs.writeFileSync(dropboxParquetPath, legacyParquetBody);
+
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: migrationR2({
+          exists: true,
+          bytes: legacyParquetIdentity.byte_size,
+          etag: '"ordinary-unrelated-etag"',
+          sha256: "0".repeat(64),
+        }, legacyParquetBody),
+        key: legacyParquetKey,
+        manifestFile: checksumManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /stored SHA-256 disagrees with Dropbox/i,
+    );
+
     await assert.rejects(
       () => readMigrationSourceParquetWithDropboxEvidence({
         r2: migrationR2({
@@ -466,8 +525,23 @@ test("bounded v2 September physical-name migration preserves content and publica
       }),
       /escapes configured root/i,
     );
+
+    const outsideParquetPath = path.join(outsideDirectory, "outside.parquet");
+    fs.writeFileSync(outsideParquetPath, legacyParquetBody);
+    fs.unlinkSync(dropboxParquetPath);
+    fs.symlinkSync(outsideParquetPath, dropboxParquetPath);
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: checksumlessLegacyR2,
+        key: legacyParquetKey,
+        manifestFile: historicalManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /escapes configured root/i,
+    );
   } finally {
     fs.rmSync(dropboxDirectory, { recursive: true, force: true });
+    fs.rmSync(outsideDirectory, { recursive: true, force: true });
   }
 
   assert.deepEqual(
