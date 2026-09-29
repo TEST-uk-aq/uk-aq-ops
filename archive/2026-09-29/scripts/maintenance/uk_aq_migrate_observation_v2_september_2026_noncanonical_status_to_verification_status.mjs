@@ -76,11 +76,9 @@ export const AUTHORISED_DAY_COUNTS = Object.freeze({
   "2026-09-15": 53,
   "2026-09-16": 53,
 });
-// Must be populated only from the previously reviewed exact LIVE affected-scope set.
-export const AUTHORISED_AFFECTED_SCOPE_SET_SHA256 = null;
 
 const GENERATION = getObservationHistoryGeneration("v2");
-const PLAN_SCHEMA_VERSION = 2;
+const PLAN_SCHEMA_VERSION = 1;
 const PURPOSE = "live-v2-september-2026-noncanonical-physical-status-to-verification_status";
 const SHA256 = /^[0-9a-f]{64}$/;
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -207,26 +205,7 @@ export function assertAuthorisedPartitionScope(scope) {
   return Object.freeze({ day_utc: day, connector_id: connectorId, pollutant_code: pollutantCode });
 }
 
-export function computeAuthorisedAffectedScopeSetSha256(scopes) {
-  if (!Array.isArray(scopes)) throw new Error("Authorised affected scopes must be an array");
-  const canonicalScopes = scopes.map((entry) => {
-    const scope = assertAuthorisedPartitionScope(entry?.scope ?? entry);
-    return [scope.day_utc, scope.connector_id, scope.pollutant_code];
-  }).sort((left, right) => {
-    const leftKey = JSON.stringify(left);
-    const rightKey = JSON.stringify(right);
-    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
-  });
-  const serialisedScopes = canonicalScopes.map((scope) => JSON.stringify(scope));
-  if (new Set(serialisedScopes).size !== serialisedScopes.length) {
-    throw new Error("Authorised September repair contains duplicate partition scope");
-  }
-  return sha256Hex(Buffer.from(JSON.stringify(canonicalScopes)));
-}
-
-export function selectAuthorisedAffectedPartitions(partitions, {
-  expectedScopeSetSha256 = AUTHORISED_AFFECTED_SCOPE_SET_SHA256,
-} = {}) {
+export function selectAuthorisedAffectedPartitions(partitions) {
   const selected = (Array.isArray(partitions) ? partitions : [])
     .filter((entry) => entry?.kind === "noncanonical_shape" &&
       String(entry?.scope?.day_utc || "") >= AUTHORISED_FROM_DAY &&
@@ -247,13 +226,6 @@ export function selectAuthorisedAffectedPartitions(partitions, {
   for (const entry of selected) dayCounts[entry.scope.day_utc] = (dayCounts[entry.scope.day_utc] || 0) + 1;
   if (JSON.stringify(dayCounts) !== JSON.stringify(AUTHORISED_DAY_COUNTS)) {
     throw new Error(`Authorised September day totals differ: ${JSON.stringify(dayCounts)}`);
-  }
-  if (!SHA256.test(String(expectedScopeSetSha256 || ""))) {
-    throw new Error("Authoritative September affected-scope SHA-256 is not configured");
-  }
-  const scopeSetSha256 = computeAuthorisedAffectedScopeSetSha256(selected);
-  if (scopeSetSha256 !== expectedScopeSetSha256) {
-    throw new Error(`Authorised September affected-scope set differs: ${scopeSetSha256}`);
   }
   return selected;
 }
@@ -765,9 +737,6 @@ function buildFileEntry(key, body, logical) {
 }
 
 async function makePlan(args, env, r2, lockContext) {
-  if (!SHA256.test(String(AUTHORISED_AFFECTED_SCOPE_SET_SHA256 || ""))) {
-    throw new Error("Authoritative September affected-scope SHA-256 is not configured");
-  }
   const gate = await backupGate(args, env, r2, lockContext);
   const inventory = await inventoryAuthorisedRange(r2);
   if (inventory.root.payload.content_hash !== gate.live_observations_root.content_hash) {
@@ -962,7 +931,6 @@ async function makePlan(args, env, r2, lockContext) {
     plan_schema_version: PLAN_SCHEMA_VERSION, purpose: PURPOSE, environment: "LIVE", bucket: r2.bucket,
     generation: "v2", from_day: AUTHORISED_FROM_DAY, to_day: AUTHORISED_TO_DAY,
     expected_affected_partition_count: AUTHORISED_PARTITION_COUNT,
-    authorised_affected_scope_set_sha256: computeAuthorisedAffectedScopeSetSha256(affectedScopes),
     repository_head: repositoryHead, target_writer_git_sha: args.targetWriterGitSha,
     code_identity: stableCodeIdentity(), backup_evidence: gate,
     pre_migration_observations_root: { ...oldIdentity(inventory.root), content_hash: inventory.root.payload.content_hash },
@@ -1024,13 +992,9 @@ function readPlan(planPath) {
 
 function assertPlanMatchesInvocation(plan, args, r2) {
   const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT, encoding: "utf8" }).trim();
-  const plannedScopeSetSha256 = computeAuthorisedAffectedScopeSetSha256(plan.affected_scopes);
   if (plan.environment !== "LIVE" || plan.bucket !== args.expectedBucket || r2.bucket !== plan.bucket ||
       plan.generation !== "v2" || plan.from_day !== AUTHORISED_FROM_DAY || plan.to_day !== AUTHORISED_TO_DAY ||
       plan.expected_affected_partition_count !== AUTHORISED_PARTITION_COUNT || plan.affected_scopes.length !== AUTHORISED_PARTITION_COUNT ||
-      !SHA256.test(String(AUTHORISED_AFFECTED_SCOPE_SET_SHA256 || "")) ||
-      plan.authorised_affected_scope_set_sha256 !== AUTHORISED_AFFECTED_SCOPE_SET_SHA256 ||
-      plannedScopeSetSha256 !== AUTHORISED_AFFECTED_SCOPE_SET_SHA256 ||
       plan.repository_head !== head || plan.target_writer_git_sha !== args.targetWriterGitSha ||
       JSON.stringify(plan.code_identity) !== JSON.stringify(stableCodeIdentity())) {
     throw new Error("Migration plan does not match LIVE bucket, repository, code or generation-v2 target");
@@ -1077,14 +1041,9 @@ function initialJournal(plan) {
     verified_objects: {} };
 }
 
-export function assertPinnedCheckpoint(plan) {
+function assertPinnedCheckpoint(plan) {
   const checkpoint = plan.backup_evidence.checkpoint;
-  let body;
-  try {
-    body = fs.readFileSync(checkpoint.path);
-  } catch {
-    throw new Error("Pinned Dropbox checkpoint is missing or unreadable");
-  }
+  const body = fs.readFileSync(checkpoint.path);
   if (body.byteLength !== checkpoint.byte_size || sha256Hex(body) !== checkpoint.sha256) {
     throw new Error("Pinned Dropbox checkpoint changed after migration PLAN");
   }
@@ -1114,36 +1073,6 @@ async function assertOldOrTargetPrestate(r2, plan) {
     currents.push(await currentIdentity(r2, pinned.key));
   }
   assertPinnedPrestateRecords(plan.pinned_authoritative_objects, plan.planned_puts, currents);
-}
-
-export async function prepareApplyInvocation({
-  plan,
-  args,
-  env,
-  r2,
-  lockContext,
-  dependencies = {},
-}) {
-  const loadJournalFn = dependencies.loadJournal ?? loadJournal;
-  const backupGateFn = dependencies.backupGate ?? backupGate;
-  const assertOldOrTargetPrestateFn = dependencies.assertOldOrTargetPrestate ?? assertOldOrTargetPrestate;
-  const saveJournalFn = dependencies.saveJournal ?? saveJournal;
-  assertPinnedCheckpoint(plan);
-  let journal = loadJournalFn(args.planPath, plan);
-  if (!journal) {
-    const gate = await backupGateFn(args, env, r2, lockContext);
-    if (gate.checkpoint.sha256 !== plan.backup_evidence.checkpoint.sha256 ||
-        gate.live_observations_root.content_hash !== plan.pre_migration_observations_root.content_hash ||
-        gate.readiness.backup_run_id !== plan.backup_evidence.readiness.backup_run_id) {
-      throw new Error("Current backup evidence differs from pinned PLAN");
-    }
-    await assertOldOrTargetPrestateFn(r2, plan);
-    journal = initialJournal(plan);
-    saveJournalFn(args.planPath, journal);
-  } else {
-    await assertOldOrTargetPrestateFn(r2, plan);
-  }
-  return journal;
 }
 
 export function assertDurableDependencyRecords(put, plannedPuts, currentObjects, verifiedObjects) {
@@ -1193,7 +1122,19 @@ async function applyPlan(args, env, r2, lockContext) {
   if (plan.plan_sha256 !== args.expectedPlanSha256) throw new Error("Expected migration plan SHA-256 disagrees");
   assertPlanMatchesInvocation(plan, args, r2);
   for (const put of plan.planned_puts) storedBody(args.planPath, put);
-  const journal = await prepareApplyInvocation({ plan, args, env, r2, lockContext });
+  let journal = loadJournal(args.planPath, plan);
+  if (!journal) {
+    assertPinnedCheckpoint(plan);
+    const gate = await backupGate(args, env, r2, lockContext);
+    if (gate.checkpoint.sha256 !== plan.backup_evidence.checkpoint.sha256 ||
+        gate.live_observations_root.content_hash !== plan.pre_migration_observations_root.content_hash ||
+        gate.readiness.backup_run_id !== plan.backup_evidence.readiness.backup_run_id) {
+      throw new Error("Current backup evidence differs from pinned PLAN");
+    }
+    await assertOldOrTargetPrestate(r2, plan);
+    journal = initialJournal(plan);
+    saveJournal(args.planPath, journal);
+  } else await assertOldOrTargetPrestate(r2, plan);
   const byKey = new Map(plan.planned_puts.map((entry) => [entry.key, entry]));
   for (const key of plan.publication_schedule) {
     requireObservationsGlobalOperationLockContext({ env, expectedOwner: "migration" });

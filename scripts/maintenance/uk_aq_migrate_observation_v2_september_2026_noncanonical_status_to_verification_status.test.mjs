@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import * as arrow from "apache-arrow";
 import * as parquetWasm from "parquet-wasm/esm";
@@ -13,6 +17,7 @@ import {
 import {
   AUTHORISED_CONNECTOR_COUNTS,
   AUTHORISED_DAY_COUNTS,
+  AUTHORISED_AFFECTED_SCOPE_SET_SHA256,
   AUTHORISED_FROM_DAY,
   AUTHORISED_PARTITION_COUNT,
   AUTHORISED_TO_DAY,
@@ -23,13 +28,16 @@ import {
   assertPinnedPrestateRecords,
   buildPublicationSchedule,
   classifyV2MigrationPhysicalColumns,
+  computeAuthorisedAffectedScopeSetSha256,
   decodeV2MigrationParquet,
   parseMigrationArgs,
+  prepareApplyInvocation,
   selectAuthorisedAffectedPartitions,
   validateV2MigrationTarget,
 } from "./uk_aq_migrate_observation_v2_september_2026_noncanonical_status_to_verification_status.mjs";
 
 const baseColumns = OBSERVATION_HISTORY_COLUMNS_V3.slice(0, 6);
+const DETERMINISTIC_SCOPE_FIXTURE_SHA256 = "484c4c6ccc7bf953aa35bc899f4cf9f3d96105ca61a4cbd6be63dd0f29d713bf";
 const baseRow = {
   connector_id: 1,
   station_id: 2,
@@ -123,6 +131,7 @@ test("bounded v2 September physical-name migration preserves content and publica
     "2026-09-15": 53,
     "2026-09-16": 53,
   });
+  assert.equal(AUTHORISED_AFFECTED_SCOPE_SET_SHA256, null);
 
   const structurallyAuthorisedUnsupportedColumns = [...baseColumns, "unsupported_final_column"];
   assert.equal(classifyV2MigrationPhysicalColumns(structurallyAuthorisedUnsupportedColumns), "noncanonical_shape");
@@ -178,12 +187,23 @@ test("bounded v2 September physical-name migration preserves content and publica
   assert.deepEqual(targetLogical.verification_status_counts, { P: 1, R: 1, null: 1 });
   assert.deepEqual(decodedTarget.rows.map((row) => row.verification_status), ["P", "R", null]);
 
-  const inventory = authorisedInventory();
+  const deterministicScopeFixture = authorisedInventory();
+  assert.equal(
+    computeAuthorisedAffectedScopeSetSha256(deterministicScopeFixture),
+    DETERMINISTIC_SCOPE_FIXTURE_SHA256,
+  );
+  assert.equal(
+    computeAuthorisedAffectedScopeSetSha256([...deterministicScopeFixture].reverse()),
+    DETERMINISTIC_SCOPE_FIXTURE_SHA256,
+  );
+  const inventory = [...deterministicScopeFixture];
   inventory.push({
     kind: "noncanonical_shape",
     scope: { day_utc: "2025-01-01", connector_id: 1, pollutant_code: "outside" },
   });
-  const selected = selectAuthorisedAffectedPartitions(inventory);
+  const selected = selectAuthorisedAffectedPartitions(inventory, {
+    expectedScopeSetSha256: DETERMINISTIC_SCOPE_FIXTURE_SHA256,
+  });
   assert.equal(selected.length, 294);
   assert.equal(selected.some((entry) => entry.scope.pollutant_code === "outside"), false);
   const wrongDayDistribution = authorisedInventory();
@@ -192,11 +212,15 @@ test("bounded v2 September physical-name migration preserves content and publica
     scope: { ...wrongDayDistribution[0].scope, day_utc: "2026-09-10" },
   };
   assert.throws(
-    () => selectAuthorisedAffectedPartitions(wrongDayDistribution),
+    () => selectAuthorisedAffectedPartitions(wrongDayDistribution, {
+      expectedScopeSetSha256: DETERMINISTIC_SCOPE_FIXTURE_SHA256,
+    }),
     /day totals differ/i,
   );
   assert.throws(
-    () => selectAuthorisedAffectedPartitions(inventory.slice(0, -2)),
+    () => selectAuthorisedAffectedPartitions(inventory.slice(0, -2), {
+      expectedScopeSetSha256: DETERMINISTIC_SCOPE_FIXTURE_SHA256,
+    }),
     /exactly 294/i,
   );
   const wrongConnectorDistribution = authorisedInventory();
@@ -205,8 +229,33 @@ test("bounded v2 September physical-name migration preserves content and publica
     scope: { ...wrongConnectorDistribution[0].scope, connector_id: 2 },
   };
   assert.throws(
-    () => selectAuthorisedAffectedPartitions(wrongConnectorDistribution),
+    () => selectAuthorisedAffectedPartitions(wrongConnectorDistribution, {
+      expectedScopeSetSha256: DETERMINISTIC_SCOPE_FIXTURE_SHA256,
+    }),
     /connector totals differ/i,
+  );
+  const wrongPollutantScope = authorisedInventory();
+  wrongPollutantScope[0] = {
+    ...wrongPollutantScope[0],
+    scope: { ...wrongPollutantScope[0].scope, pollutant_code: "changed_pollutant" },
+  };
+  assert.throws(
+    () => selectAuthorisedAffectedPartitions(wrongPollutantScope, {
+      expectedScopeSetSha256: DETERMINISTIC_SCOPE_FIXTURE_SHA256,
+    }),
+    /affected-scope set differs/i,
+  );
+  const duplicateScope = authorisedInventory();
+  duplicateScope[1] = { ...duplicateScope[1], scope: { ...duplicateScope[0].scope } };
+  assert.throws(
+    () => selectAuthorisedAffectedPartitions(duplicateScope, {
+      expectedScopeSetSha256: DETERMINISTIC_SCOPE_FIXTURE_SHA256,
+    }),
+    /duplicate partition scope/i,
+  );
+  assert.throws(
+    () => selectAuthorisedAffectedPartitions(authorisedInventory()),
+    /SHA-256 is not configured/i,
   );
   assert.throws(
     () => assertAuthorisedPartitionScope({ day_utc: "2026-09-17", connector_id: 1, pollutant_code: "no2" }),
@@ -262,6 +311,102 @@ test("bounded v2 September physical-name migration preserves content and publica
     { key: "day", stage: "day", dependencies: ["latest"] },
     { key: "latest", stage: "latest", dependencies: [] },
   ]), /contradicts dependency/i);
+
+  const checkpointDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-september-repair-"));
+  try {
+    const checkpointPath = path.join(checkpointDirectory, "root.json");
+    const checkpointBody = Buffer.from('{"checkpoint":"pinned"}\n');
+    fs.writeFileSync(checkpointPath, checkpointBody);
+    const checkpointSha256 = createHash("sha256").update(checkpointBody).digest("hex");
+    const applyPlanFixture = {
+      plan_sha256: "a".repeat(64),
+      backup_evidence: {
+        checkpoint: {
+          path: checkpointPath,
+          byte_size: checkpointBody.byteLength,
+          sha256: checkpointSha256,
+        },
+        readiness: { backup_run_id: "pinned-backup-run" },
+      },
+      pre_migration_observations_root: { content_hash: "pre-migration-root" },
+    };
+    const applyArgsFixture = { planPath: path.join(checkpointDirectory, "plan.json") };
+    const firstApplyEvents = [];
+    const firstJournal = await prepareApplyInvocation({
+      plan: applyPlanFixture,
+      args: applyArgsFixture,
+      env: {},
+      r2: {},
+      lockContext: {},
+      dependencies: {
+        loadJournal: () => { firstApplyEvents.push("load-journal"); return null; },
+        backupGate: async () => {
+          firstApplyEvents.push("backup-gate");
+          return {
+            checkpoint: { sha256: checkpointSha256 },
+            live_observations_root: { content_hash: "pre-migration-root" },
+            readiness: { backup_run_id: "pinned-backup-run" },
+          };
+        },
+        assertOldOrTargetPrestate: async () => { firstApplyEvents.push("old-or-target"); },
+        saveJournal: () => { firstApplyEvents.push("save-journal"); },
+      },
+    });
+    assert.equal(firstJournal.initial_gate_verified, true);
+    assert.deepEqual(firstApplyEvents, ["load-journal", "backup-gate", "old-or-target", "save-journal"]);
+
+    const resumedJournal = { ...firstJournal, verified_objects: { already: "partial-target" } };
+    let resumedPrestateChecks = 0;
+    const resumed = await prepareApplyInvocation({
+      plan: applyPlanFixture,
+      args: applyArgsFixture,
+      env: {},
+      r2: { observations_root: "partially-migrated-target" },
+      lockContext: {},
+      dependencies: {
+        loadJournal: () => resumedJournal,
+        backupGate: async () => { throw new Error("resumed APPLY must not run the live-root backup gate"); },
+        assertOldOrTargetPrestate: async () => { resumedPrestateChecks += 1; },
+        saveJournal: () => { throw new Error("resumed APPLY must not replace its journal"); },
+      },
+    });
+    assert.equal(resumed, resumedJournal);
+    assert.equal(resumedPrestateChecks, 1);
+
+    fs.writeFileSync(checkpointPath, Buffer.from("changed"));
+    let changedCheckpointLoadedJournal = false;
+    await assert.rejects(
+      () => prepareApplyInvocation({
+        plan: applyPlanFixture,
+        args: applyArgsFixture,
+        env: {},
+        r2: {},
+        lockContext: {},
+        dependencies: {
+          loadJournal: () => { changedCheckpointLoadedJournal = true; return resumedJournal; },
+        },
+      }),
+      /Pinned Dropbox checkpoint changed/i,
+    );
+    assert.equal(changedCheckpointLoadedJournal, false);
+
+    fs.unlinkSync(checkpointPath);
+    for (const journal of [null, resumedJournal]) {
+      await assert.rejects(
+        () => prepareApplyInvocation({
+          plan: applyPlanFixture,
+          args: applyArgsFixture,
+          env: {},
+          r2: {},
+          lockContext: {},
+          dependencies: { loadJournal: () => journal },
+        }),
+        /Pinned Dropbox checkpoint is missing or unreadable/i,
+      );
+    }
+  } finally {
+    fs.rmSync(checkpointDirectory, { recursive: true, force: true });
+  }
 
   const aggregateParent = {
     children: [{ manifest_key: "child.json", content_hash: "a".repeat(64) }],
