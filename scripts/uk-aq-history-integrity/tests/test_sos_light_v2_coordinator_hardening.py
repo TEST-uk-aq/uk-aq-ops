@@ -55,6 +55,84 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
     def tearDown(self) -> None:
         MODULE.close_logging_handlers()
 
+    def test_public_assembly_wrapper_forwards_staging_and_log_and_filters_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan_root = Path(tmpdir)
+            (scan_root / "manifest.json").write_text("{}\n", encoding="utf-8")
+            (scan_root / ".DS_Store").write_bytes(b"finder")
+            (scan_root / "._manifest.json").write_bytes(b"apple-double")
+            run_state: dict[str, object] = {"sos_light": {}}
+            staging = object()
+            operation_log = mock.Mock(spec=logging.Logger)
+            audit_log = mock.Mock(spec=logging.Logger)
+            observed_names: list[str] = []
+
+            def stub_assembler(
+                received_run_state: dict[str, object],
+                *,
+                proposal_staging: object | None = None,
+                log: logging.Logger | None = None,
+            ) -> dict[str, object]:
+                self.assertIs(received_run_state, run_state)
+                self.assertIs(proposal_staging, staging)
+                self.assertIs(log, operation_log)
+                observed_names.extend(
+                    path.name for path in scan_root.rglob("*") if path.is_file()
+                )
+                return {"status": "stubbed"}
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_ORIGINAL_ASSEMBLE_SOS_LIGHT_COMPLETE_DAYS",
+                    side_effect=stub_assembler,
+                ) as original_assembler,
+                mock.patch.object(MODULE, "write_run_state") as write_state,
+                mock.patch.object(
+                    MODULE.logging,
+                    "getLogger",
+                    return_value=audit_log,
+                ),
+            ):
+                result = MODULE.assemble_sos_light_complete_days(
+                    run_state,
+                    proposal_staging=staging,
+                    log=operation_log,
+                )
+
+            original_assembler.assert_called_once_with(
+                run_state,
+                proposal_staging=staging,
+                log=operation_log,
+            )
+            self.assertEqual(observed_names, ["manifest.json"])
+            self.assertEqual(
+                result["ignored_local_filesystem_metadata_count"],
+                2,
+            )
+            self.assertEqual(
+                result["ignored_local_filesystem_metadata_patterns"],
+                [".DS_Store", "._*"],
+            )
+            self.assertEqual(
+                run_state["sos_light"],
+                {
+                    "ignored_local_filesystem_metadata_count": 2,
+                    "ignored_local_filesystem_metadata_patterns": [
+                        ".DS_Store",
+                        "._*",
+                    ],
+                },
+            )
+            self.assertIs(MODULE.Path.rglob, MODULE._ORIGINAL_PATH_RGLOB)
+            write_state.assert_called_once_with(run_state)
+            audit_log.info.assert_called_once_with(
+                "SOS-light ignored %d known macOS metadata files from the Dropbox baseline",
+                2,
+            )
+
     def _run_state(self, root: Path) -> dict[str, object]:
         dropbox = root / "dropbox"
         dropbox.mkdir()
