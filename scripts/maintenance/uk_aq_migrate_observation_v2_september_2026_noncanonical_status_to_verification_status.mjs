@@ -344,16 +344,116 @@ async function readExactFromHead(r2, key, kind, head, expected = null) {
   return { ...identity, body };
 }
 
-function requireAuthoritativeParquetIdentity(key, expected) {
+function requirePinnedParquetIdentity(key, expected) {
   if (expected?.key !== key || !String(key).endsWith(".parquet") ||
       !Number.isSafeInteger(expected?.byte_size) || expected.byte_size < 0 ||
       typeof expected?.sha256 !== "string" || !SHA256.test(expected.sha256)) {
-    throw new Error(`Authoritative source Parquet identity is invalid: ${key}`);
+    throw new Error(`Pinned source Parquet identity is invalid: ${key}`);
   }
   return Object.freeze({ key, byte_size: expected.byte_size, sha256: expected.sha256 });
 }
 
-export async function readMigrationSourceParquetWithExpectedIdentity({
+function normaliseHistoricalEtag(value, label) {
+  if (typeof value !== "string") throw new Error(`Historical ${label} ETag is missing or invalid`);
+  let normalised = value.trim();
+  const startsQuoted = normalised.startsWith('"');
+  const endsQuoted = normalised.endsWith('"');
+  if (startsQuoted !== endsQuoted || (startsQuoted && normalised.length < 3)) {
+    throw new Error(`Historical ${label} ETag is missing or invalid`);
+  }
+  if (startsQuoted) normalised = normalised.slice(1, -1);
+  if (!normalised || normalised.includes('"') || /[\u0000-\u001f\u007f]/.test(normalised)) {
+    throw new Error(`Historical ${label} ETag is missing or invalid`);
+  }
+  return normalised;
+}
+
+function pathIsBelow(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
+}
+
+function readDropboxSourceParquet(dropboxRoot, key, expectedBytes) {
+  if (typeof dropboxRoot !== "string" || !dropboxRoot.trim()) {
+    throw new Error(`Dropbox source root is missing: ${key}`);
+  }
+  if (typeof key !== "string" || !key || path.posix.isAbsolute(key) || path.win32.isAbsolute(key) ||
+      key.includes("\\") || key.split("/").some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new Error(`Dropbox source Parquet key escapes configured root: ${String(key)}`);
+  }
+  const configuredRoot = path.resolve(dropboxRoot);
+  const candidate = path.resolve(configuredRoot, ...key.split("/"));
+  if (!pathIsBelow(configuredRoot, candidate)) {
+    throw new Error(`Dropbox source Parquet key escapes configured root: ${key}`);
+  }
+
+  let realRoot;
+  let realFile;
+  try {
+    realRoot = fs.realpathSync(configuredRoot);
+    if (!fs.statSync(realRoot).isDirectory()) throw new Error("not a directory");
+    realFile = fs.realpathSync(candidate);
+  } catch (error) {
+    throw new Error(`Dropbox source Parquet is missing or unreadable: ${key}`, { cause: error });
+  }
+  if (!pathIsBelow(realRoot, realFile)) {
+    throw new Error(`Dropbox source Parquet key escapes configured root: ${key}`);
+  }
+
+  let descriptor;
+  try {
+    descriptor = fs.openSync(realFile, "r");
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile()) throw new Error("not a regular file");
+    if (stat.size !== expectedBytes) throw new Error("byte size mismatch");
+    const body = fs.readFileSync(descriptor);
+    if (body.byteLength !== expectedBytes) throw new Error("byte size changed while reading");
+    return { ...exactIdentity(key, body), body };
+  } catch (error) {
+    throw new Error(`Dropbox source Parquet is missing, unreadable, or has a byte-size mismatch: ${key}`, { cause: error });
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
+export async function readMigrationSourceParquetWithDropboxEvidence({
+  r2,
+  key,
+  manifestFile,
+  dropboxRoot,
+  head = null,
+  headObject = r2HeadObject,
+  getObject = r2GetObject,
+}) {
+  if (manifestFile?.key !== key || !String(key).endsWith(".parquet") ||
+      !Number.isSafeInteger(manifestFile?.bytes) || manifestFile.bytes < 0) {
+    throw new Error(`Historical manifest Parquet identity is invalid: ${key}`);
+  }
+  const manifestEtag = normaliseHistoricalEtag(manifestFile.etag_or_hash, "manifest");
+  const dropbox = readDropboxSourceParquet(dropboxRoot, key, manifestFile.bytes);
+  const stored = head ?? await headObject({ r2, key });
+  if (!stored?.exists || !Number.isSafeInteger(stored?.bytes) || stored.bytes < 0 ||
+      stored.bytes !== dropbox.byte_size) {
+    throw new Error(`Legacy source Parquet R2 HEAD byte-size mismatch: ${key}`);
+  }
+  if (stored.etag !== null && stored.etag !== undefined && stored.etag !== "" &&
+      normaliseHistoricalEtag(stored.etag, "R2 HEAD") !== manifestEtag) {
+    throw new Error(`Legacy source Parquet historical ETag mismatch: ${key}`);
+  }
+  const hasStoredSha256 = stored.sha256 !== null && stored.sha256 !== undefined && stored.sha256 !== "";
+  if (hasStoredSha256 && (!SHA256.test(stored.sha256) || stored.sha256 !== dropbox.sha256)) {
+    throw new Error(`Legacy source Parquet stored SHA-256 disagrees with Dropbox: ${key}`);
+  }
+  const object = await getObject({ r2, key });
+  const body = Buffer.from(object.body);
+  const identity = exactIdentity(key, body);
+  if (!sameIdentity(identity, dropbox)) {
+    throw new Error(`Legacy source Parquet R2 GET disagrees with Dropbox: ${key}`);
+  }
+  return { ...identity, body, historical_etag: manifestEtag };
+}
+
+async function readPinnedLegacySourceParquet({
   r2,
   key,
   expected,
@@ -361,21 +461,21 @@ export async function readMigrationSourceParquetWithExpectedIdentity({
   headObject = r2HeadObject,
   getObject = r2GetObject,
 }) {
-  const authoritative = requireAuthoritativeParquetIdentity(key, expected);
+  const pinned = requirePinnedParquetIdentity(key, expected);
   const stored = head ?? await headObject({ r2, key });
   if (!stored?.exists || !Number.isSafeInteger(stored?.bytes) || stored.bytes < 0 ||
-      stored.bytes !== authoritative.byte_size) {
-    throw new Error(`Authoritative source Parquet HEAD identity mismatch: ${key}`);
+      stored.bytes !== pinned.byte_size) {
+    throw new Error(`Pinned source Parquet HEAD identity mismatch: ${key}`);
   }
   const hasStoredSha256 = stored.sha256 !== null && stored.sha256 !== undefined && stored.sha256 !== "";
-  if (hasStoredSha256 && (!SHA256.test(stored.sha256) || stored.sha256 !== authoritative.sha256)) {
-    throw new Error(`Authoritative source Parquet stored SHA-256 mismatch: ${key}`);
+  if (hasStoredSha256 && (!SHA256.test(stored.sha256) || stored.sha256 !== pinned.sha256)) {
+    throw new Error(`Pinned source Parquet stored SHA-256 mismatch: ${key}`);
   }
   const object = await getObject({ r2, key });
   const body = Buffer.from(object.body);
   const identity = exactIdentity(key, body);
-  if (!sameIdentity(identity, authoritative)) {
-    throw new Error(`Authoritative source Parquet GET identity mismatch: ${key}`);
+  if (!sameIdentity(identity, pinned)) {
+    throw new Error(`Pinned source Parquet GET identity mismatch: ${key}`);
   }
   return { ...identity, body };
 }
@@ -395,7 +495,7 @@ export async function readMigrationCurrentIdentity(r2, key, expectedLegacyParque
   if (head?.exists === false) return null;
   const hasStoredSha256 = head?.sha256 !== null && head?.sha256 !== undefined && head?.sha256 !== "";
   if (kind === "parquet" && !hasStoredSha256 && expectedLegacyParquetIdentity) {
-    const object = await readMigrationSourceParquetWithExpectedIdentity({
+    const object = await readPinnedLegacySourceParquet({
       r2,
       key,
       expected: expectedLegacyParquetIdentity,
@@ -543,7 +643,7 @@ function assertManifestInvariants(manifest, logical) {
   }
 }
 
-async function inspectPollutant(r2, object, scope, pins) {
+async function inspectPollutant(r2, object, scope, pins, dropboxRoot = null) {
   const manifest = validateManifestHash(object.payload, object.key, "pollutant");
   if (manifest.day_utc !== scope.day_utc || manifest.connector_id !== scope.connector_id ||
       manifest.pollutant_code !== scope.pollutant_code) throw new Error(`Pollutant scope mismatch: ${object.key}`);
@@ -562,13 +662,11 @@ async function inspectPollutant(r2, object, scope, pins) {
     if (!key.startsWith(object.key.replace(/manifest\.json$/, "")) || !/\/part-\d{5}\.parquet$/.test(key)) {
       throw new Error(`Invalid authoritative Parquet key: ${key}`);
     }
-    const part = await readMigrationSourceParquetWithExpectedIdentity({
-      r2,
-      key,
-      expected: { key: file.key, byte_size: file.bytes, sha256: file.etag_or_hash },
-    });
+    const part = dropboxRoot
+      ? await readMigrationSourceParquetWithDropboxEvidence({ r2, key, manifestFile: file, dropboxRoot })
+      : await readExact(r2, key);
     pins.set(key, oldIdentity(part));
-    if (file.bytes !== part.byte_size || file.etag_or_hash !== part.sha256) throw new Error(`Manifest/Parquet identity mismatch: ${key}`);
+    if (file.bytes !== part.byte_size) throw new Error(`Manifest/Parquet identity mismatch: ${key}`);
     const decoded = await decodeV2MigrationParquet(part.body);
     if (decoded.kind !== kind || !sameColumns(decoded.columns, manifest.columns) || decoded.rowCount !== file.row_count) {
       throw new Error(`Manifest/Parquet footer mismatch: ${key}`);
@@ -592,7 +690,7 @@ async function inspectPollutant(r2, object, scope, pins) {
   return { kind, scope, manifest: object, files, rows, logical };
 }
 
-async function inventoryAuthorisedRange(r2) {
+async function inventoryAuthorisedRange(r2, dropboxRoot = null) {
   const pins = new Map();
   const root = parseJson(await readExact(r2, GENERATION.observations_root_key));
   root.payload = validateR2HistoryV2ObservationsAggregateManifest(root.payload, { basePrefix: GENERATION.observations_prefix });
@@ -649,7 +747,7 @@ async function inventoryAuthorisedRange(r2) {
         assertChildReference(connector.payload, pollutant.payload, ["manifest_hash", "row_count", "file_count", "total_bytes"]);
         pins.set(pollutant.key, oldIdentity(pollutant));
         const scope = { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode };
-        pollutants.set(scopeKey(scope), await inspectPollutant(r2, pollutant, scope, pins));
+        pollutants.set(scopeKey(scope), await inspectPollutant(r2, pollutant, scope, pins, dropboxRoot));
       }
     }
   }
@@ -823,7 +921,7 @@ async function makePlan(args, env, r2, lockContext) {
     throw new Error("Authoritative September affected-scope SHA-256 is not configured");
   }
   const gate = await backupGate(args, env, r2, lockContext);
-  const inventory = await inventoryAuthorisedRange(r2);
+  const inventory = await inventoryAuthorisedRange(r2, args.dropboxRoot);
   if (inventory.root.payload.content_hash !== gate.live_observations_root.content_hash) {
     throw new Error("Locked inventory root changed after backup/currentness gate");
   }

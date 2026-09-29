@@ -33,7 +33,7 @@ import {
   parseMigrationArgs,
   prepareApplyInvocation,
   readMigrationCurrentIdentity,
-  readMigrationSourceParquetWithExpectedIdentity,
+  readMigrationSourceParquetWithDropboxEvidence,
   readMigrationTargetObjectStrict,
   selectAuthorisedAffectedPartitions,
   validateV2MigrationTarget,
@@ -325,6 +325,12 @@ test("bounded v2 September physical-name migration preserves content and publica
     byte_size: legacyParquetBody.byteLength,
     sha256: createHash("sha256").update(legacyParquetBody).digest("hex"),
   };
+  const historicalEtag = "72d6d9fc012462f36e0fdac7f305e01d";
+  const historicalManifestFile = {
+    key: legacyParquetKey,
+    bytes: legacyParquetBody.byteLength,
+    etag_or_hash: `"${historicalEtag}"`,
+  };
   const migrationR2 = (head, body) => ({
     adapter: {
       headObject: async ({ key }) => ({ key, ...head }),
@@ -334,77 +340,135 @@ test("bounded v2 September physical-name migration preserves content and publica
   const checksumlessLegacyR2 = migrationR2({
     exists: true,
     bytes: legacyParquetIdentity.byte_size,
+    etag: historicalEtag,
     sha256: null,
   }, legacyParquetBody);
-  const verifiedLegacy = await readMigrationSourceParquetWithExpectedIdentity({
-    r2: checksumlessLegacyR2,
-    key: legacyParquetKey,
-    expected: legacyParquetIdentity,
-  });
-  assert.deepEqual(
-    { key: verifiedLegacy.key, byte_size: verifiedLegacy.byte_size, sha256: verifiedLegacy.sha256 },
-    legacyParquetIdentity,
-  );
-  await assert.rejects(
-    () => readMigrationSourceParquetWithExpectedIdentity({
+  const dropboxDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-september-source-"));
+  const dropboxParquetPath = path.join(dropboxDirectory, ...legacyParquetKey.split("/"));
+  try {
+    fs.mkdirSync(path.dirname(dropboxParquetPath), { recursive: true });
+    fs.writeFileSync(dropboxParquetPath, legacyParquetBody);
+    const verifiedLegacy = await readMigrationSourceParquetWithDropboxEvidence({
       r2: checksumlessLegacyR2,
       key: legacyParquetKey,
-      expected: { ...legacyParquetIdentity, sha256: "0".repeat(64) },
-    }),
-    /GET identity mismatch/i,
-  );
-  await assert.rejects(
-    () => readMigrationSourceParquetWithExpectedIdentity({
-      r2: migrationR2({
-        exists: true,
-        bytes: legacyParquetIdentity.byte_size + 1,
-        sha256: null,
-      }, legacyParquetBody),
-      key: legacyParquetKey,
-      expected: legacyParquetIdentity,
-    }),
-    /HEAD identity mismatch/i,
-  );
-  await assert.rejects(
-    () => readMigrationSourceParquetWithExpectedIdentity({
-      r2: migrationR2({
-        exists: true,
-        bytes: legacyParquetIdentity.byte_size,
-        sha256: null,
-      }, Buffer.concat([legacyParquetBody, Buffer.from("x")])),
-      key: legacyParquetKey,
-      expected: legacyParquetIdentity,
-    }),
-    /GET identity mismatch/i,
-  );
-  await assert.rejects(
-    () => readMigrationSourceParquetWithExpectedIdentity({
-      r2: checksumlessLegacyR2,
-      key: legacyParquetKey,
-      expected: null,
-    }),
-    /identity is invalid/i,
-  );
-  await assert.rejects(
-    () => readMigrationSourceParquetWithExpectedIdentity({
-      r2: checksumlessLegacyR2,
-      key: legacyParquetKey,
-      expected: { ...legacyParquetIdentity, sha256: "arbitrary-etag" },
-    }),
-    /identity is invalid/i,
-  );
+      manifestFile: historicalManifestFile,
+      dropboxRoot: dropboxDirectory,
+    });
+    assert.deepEqual(
+      { key: verifiedLegacy.key, byte_size: verifiedLegacy.byte_size, sha256: verifiedLegacy.sha256 },
+      legacyParquetIdentity,
+    );
+    assert.equal(verifiedLegacy.historical_etag, historicalEtag);
 
-  const storedChecksumR2 = migrationR2({
-    exists: true,
-    bytes: legacyParquetIdentity.byte_size,
-    sha256: legacyParquetIdentity.sha256,
-  }, legacyParquetBody);
-  const verifiedStoredChecksum = await readMigrationSourceParquetWithExpectedIdentity({
-    r2: storedChecksumR2,
-    key: legacyParquetKey,
-    expected: legacyParquetIdentity,
-  });
-  assert.equal(verifiedStoredChecksum.sha256, legacyParquetIdentity.sha256);
+    const differentR2Body = Buffer.alloc(legacyParquetBody.byteLength, 0x78);
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: migrationR2({
+          exists: true, bytes: legacyParquetIdentity.byte_size, etag: `"${historicalEtag}"`, sha256: null,
+        }, differentR2Body),
+        key: legacyParquetKey,
+        manifestFile: historicalManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /R2 GET disagrees with Dropbox/i,
+    );
+
+    fs.writeFileSync(dropboxParquetPath, Buffer.concat([legacyParquetBody, Buffer.from("x")]));
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: checksumlessLegacyR2,
+        key: legacyParquetKey,
+        manifestFile: historicalManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /Dropbox source Parquet.*byte-size mismatch/i,
+    );
+    fs.writeFileSync(dropboxParquetPath, legacyParquetBody);
+
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: migrationR2({
+          exists: true, bytes: legacyParquetIdentity.byte_size + 1, etag: historicalEtag, sha256: null,
+        }, legacyParquetBody),
+        key: legacyParquetKey,
+        manifestFile: historicalManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /R2 HEAD byte-size mismatch/i,
+    );
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: migrationR2({
+          exists: true, bytes: legacyParquetIdentity.byte_size, etag: '"different-etag"', sha256: null,
+        }, legacyParquetBody),
+        key: legacyParquetKey,
+        manifestFile: historicalManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /historical ETag mismatch/i,
+    );
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: migrationR2({
+          exists: true, bytes: legacyParquetIdentity.byte_size, etag: historicalEtag, sha256: "0".repeat(64),
+        }, legacyParquetBody),
+        key: legacyParquetKey,
+        manifestFile: historicalManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /stored SHA-256 disagrees with Dropbox/i,
+    );
+
+    const storedChecksumR2 = migrationR2({
+      exists: true,
+      bytes: legacyParquetIdentity.byte_size,
+      etag: `"${historicalEtag}"`,
+      sha256: legacyParquetIdentity.sha256,
+    }, legacyParquetBody);
+    const verifiedStoredChecksum = await readMigrationSourceParquetWithDropboxEvidence({
+      r2: storedChecksumR2,
+      key: legacyParquetKey,
+      manifestFile: historicalManifestFile,
+      dropboxRoot: dropboxDirectory,
+    });
+    assert.equal(verifiedStoredChecksum.sha256, legacyParquetIdentity.sha256);
+
+    fs.unlinkSync(dropboxParquetPath);
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: checksumlessLegacyR2,
+        key: legacyParquetKey,
+        manifestFile: historicalManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /missing or unreadable/i,
+    );
+    fs.mkdirSync(dropboxParquetPath);
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: checksumlessLegacyR2,
+        key: legacyParquetKey,
+        manifestFile: historicalManifestFile,
+        dropboxRoot: dropboxDirectory,
+      }),
+      /missing, unreadable, or has a byte-size mismatch/i,
+    );
+    fs.rmdirSync(dropboxParquetPath);
+    fs.writeFileSync(dropboxParquetPath, legacyParquetBody);
+
+    const escapingKey = "../escape.parquet";
+    await assert.rejects(
+      () => readMigrationSourceParquetWithDropboxEvidence({
+        r2: checksumlessLegacyR2,
+        key: escapingKey,
+        manifestFile: { ...historicalManifestFile, key: escapingKey },
+        dropboxRoot: dropboxDirectory,
+      }),
+      /escapes configured root/i,
+    );
+  } finally {
+    fs.rmSync(dropboxDirectory, { recursive: true, force: true });
+  }
 
   assert.deepEqual(
     await readMigrationCurrentIdentity(checksumlessLegacyR2, legacyParquetKey, legacyParquetIdentity),
