@@ -28858,6 +28858,7 @@ def main(argv: list[str]) -> int:
         elif daily_task_health_enabled:
             start_summary = {
                 "env": args.env, "profile": args.profile, "source": args.source,
+                "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day, "to_day": to_day,
                 "date_selection": selection_summary,
                 "logical_run_date": logical_run_date.isoformat(),
@@ -30127,6 +30128,7 @@ def main(argv: list[str]) -> int:
                 "env": args.env,
                 "profile": args.profile,
                 "source": args.source,
+                "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day,
                 "to_day": to_day,
                 "date_selection": selection_summary,
@@ -30303,6 +30305,7 @@ def main(argv: list[str]) -> int:
                 "env": args.env,
                 "profile": args.profile,
                 "source": args.source,
+                "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day if "from_day" in locals() else args.from_day,
                 "to_day": to_day if "to_day" in locals() else args.to_day,
                 "date_selection": selection_summary if "selection_summary" in locals() else None,

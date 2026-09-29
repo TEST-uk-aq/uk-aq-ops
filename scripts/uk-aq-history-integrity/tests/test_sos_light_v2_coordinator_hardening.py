@@ -285,7 +285,13 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
         payload: dict[str, object],
         *,
         include_self_context: bool = True,
+        recovery_self_writer: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        selected_self_writer = (
+            recovery_self_writer
+            if recovery_self_writer is not None
+            else self._recovery_self_writer()
+        )
         with mock.patch.object(
             MODULE.urllib.request,
             "urlopen",
@@ -296,8 +302,7 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
                 service_role_key="secret",
                 integrity_started_at_utc="2026-09-29T09:00:00Z",
                 recovery_self_writer=(
-                    self._recovery_self_writer()
-                    if include_self_context else None
+                    selected_self_writer if include_self_context else None
                 ),
             )
 
@@ -1209,6 +1214,7 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
             "summary": {
                 "env": "TEST",
                 "integrity_run_id": 41,
+                "platform_run_id": "TEST:2026-09-29T090000Z",
                 "repair_mode": True,
             },
         }
@@ -1238,6 +1244,118 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
                 "original_history_integrity_watermark"
             ],
         )
+
+    def test_recovery_readiness_matches_self_by_summary_platform_id(self) -> None:
+        recovery_self_writer = self._recovery_self_writer()
+        recovery_self_writer["daily_task_health_run_id"] = None
+        own_running = {
+            "run_id": "health-rpc-row",
+            "status": "Started",
+            "started_at": "2026-09-29T09:00:00Z",
+            "summary": {
+                "env": "TEST",
+                "integrity_run_id": 41,
+                "platform_run_id": "TEST:2026-09-29T090000Z",
+                "repair_mode": True,
+            },
+        }
+
+        result = self._check_recovery_readiness(
+            self._readiness_payload(history_running=own_running),
+            recovery_self_writer=recovery_self_writer,
+        )
+
+        self.assertTrue(result["backup_ready"])
+        self.assertIsNone(result["blocked_reason"])
+        self.assertEqual(
+            result["recovery_self_writer_evidence"]["running_run"]["run_id"],
+            "health-rpc-row",
+        )
+        history = next(
+            writer for writer in result["writer_runs"]
+            if writer["task_key"] == "ops.history_integrity"
+        )
+        self.assertFalse(history["is_running"])
+        self.assertIsNone(history["running_run"])
+
+    def test_recovery_readiness_rejects_summary_platform_id_mismatch(
+        self,
+    ) -> None:
+        recovery_self_writer = self._recovery_self_writer()
+        recovery_self_writer["daily_task_health_run_id"] = None
+        different_running = {
+            "run_id": "health-rpc-row",
+            "status": "Started",
+            "started_at": "2026-09-29T09:00:00Z",
+            "summary": {
+                "env": "TEST",
+                "integrity_run_id": 41,
+                "platform_run_id": "TEST:2026-09-29T090001Z",
+                "repair_mode": True,
+            },
+        }
+
+        result = self._check_recovery_readiness(
+            self._readiness_payload(history_running=different_running),
+            recovery_self_writer=recovery_self_writer,
+        )
+
+        self.assertFalse(result["backup_ready"])
+        self.assertEqual(result["blocked_reason"], "relevant_writer_running")
+
+    def test_recovery_readiness_falls_back_to_integrity_id_and_environment(
+        self,
+    ) -> None:
+        recovery_self_writer = self._recovery_self_writer()
+        recovery_self_writer["daily_task_health_run_id"] = None
+        recovery_self_writer["platform_run_id"] = ""
+        own_running = {
+            "run_id": "health-rpc-row",
+            "status": "Started",
+            "started_at": "2026-09-29T09:00:00Z",
+            "summary": {
+                "env": "TEST",
+                "integrity_run_id": 41,
+                "repair_mode": True,
+            },
+        }
+
+        result = self._check_recovery_readiness(
+            self._readiness_payload(history_running=own_running),
+            recovery_self_writer=recovery_self_writer,
+        )
+
+        self.assertTrue(result["backup_ready"])
+        self.assertIsNone(result["blocked_reason"])
+        self.assertEqual(
+            result["recovery_self_writer_evidence"]["running_run"]["run_id"],
+            "health-rpc-row",
+        )
+
+    def test_recovery_readiness_rejects_integrity_id_from_different_environment(
+        self,
+    ) -> None:
+        recovery_self_writer = self._recovery_self_writer()
+        recovery_self_writer["daily_task_health_run_id"] = None
+        recovery_self_writer["platform_run_id"] = ""
+        different_running = {
+            "run_id": "health-rpc-row",
+            "status": "Started",
+            "started_at": "2026-09-29T09:00:00Z",
+            "summary": {
+                "env": "LIVE",
+                "integrity_run_id": 41,
+                "repair_mode": True,
+            },
+        }
+
+        result = self._check_recovery_readiness(
+            self._readiness_payload(history_running=different_running),
+            recovery_self_writer=recovery_self_writer,
+        )
+
+        self.assertFalse(result["backup_ready"])
+        self.assertEqual(result["blocked_reason"], "relevant_writer_running")
 
     def test_recovery_readiness_blocks_different_running_integrity(self) -> None:
         different_running = {
@@ -1273,6 +1391,7 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
                     "summary": {
                         "env": "TEST",
                         "integrity_run_id": 41,
+                        "platform_run_id": "TEST:2026-09-29T090000Z",
                         "repair_mode": True,
                     },
                 }
@@ -1355,6 +1474,7 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
             "summary": {
                 "env": "TEST",
                 "integrity_run_id": 41,
+                "platform_run_id": "TEST:2026-09-29T090000Z",
                 "repair_mode": True,
             },
         }
