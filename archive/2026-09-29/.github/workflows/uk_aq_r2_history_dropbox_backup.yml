@@ -99,7 +99,6 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
           DAILY_TASK_KEY: ops.r2_history_dropbox_backup
           DAILY_TASK_HEALTH_REPORT_STAGE: started
-          DAILY_TASK_HEALTH_STRICT: "true"
         run: node scripts/report_daily_task_health.mjs
 
       - name: Install rclone
@@ -317,6 +316,5 @@ jobs:
           DAILY_TASK_HEALTH_REPORT_STAGE: final
           DAILY_TASK_HEALTH_RUN_ID: ${{ steps.daily_task_health_started.outputs.health_run_id }}
           DAILY_TASK_HEALTH_SUPPLEMENTAL_SUMMARY_FILE: tmp/r2_history_dropbox_backup_task_summary.json
-          DAILY_TASK_HEALTH_STRICT: "true"
           JOB_STATUS: ${{ job.status }}
         run: node scripts/report_daily_task_health.mjs
