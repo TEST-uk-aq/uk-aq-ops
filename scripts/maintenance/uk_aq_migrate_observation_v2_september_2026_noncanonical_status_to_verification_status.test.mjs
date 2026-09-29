@@ -12,13 +12,14 @@ import {
 } from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
   AUTHORISED_CONNECTOR_COUNTS,
+  AUTHORISED_DAY_COUNTS,
   AUTHORISED_FROM_DAY,
   AUTHORISED_PARTITION_COUNT,
   AUTHORISED_TO_DAY,
   assertAuthorisedPartitionScope,
   assertCompleteAggregateChildSet,
   assertDurableDependencyRecords,
-  assertKnownErroneousV2ManifestIdentity,
+  assertKnownNoncanonicalV2ManifestIdentity,
   assertPinnedPrestateRecords,
   buildPublicationSchedule,
   classifyV2MigrationPhysicalColumns,
@@ -26,7 +27,7 @@ import {
   parseMigrationArgs,
   selectAuthorisedAffectedPartitions,
   validateV2MigrationTarget,
-} from "./uk_aq_migrate_observation_v2_september_2026_vstatus_to_verification_status.mjs";
+} from "./uk_aq_migrate_observation_v2_september_2026_noncanonical_status_to_verification_status.mjs";
 
 const baseColumns = OBSERVATION_HISTORY_COLUMNS_V3.slice(0, 6);
 const baseRow = {
@@ -38,7 +39,7 @@ const baseRow = {
   value: 12.5,
 };
 
-function physicalFixture(statusName, statuses) {
+function physicalFixture(finalColumnName, statuses) {
   const columns = {
     connector_id: arrow.vectorFromArray(statuses.map(() => 1), new arrow.Int32()),
     station_id: arrow.vectorFromArray(statuses.map(() => 2), new arrow.Int32()),
@@ -49,7 +50,7 @@ function physicalFixture(statusName, statuses) {
       new arrow.TimestampMillisecond(),
     ),
     value: arrow.vectorFromArray(statuses.map(() => 12.5), new arrow.Float64()),
-    [statusName]: arrow.vectorFromArray(statuses, new arrow.Utf8()),
+    [finalColumnName]: arrow.vectorFromArray(statuses, new arrow.Utf8()),
   };
   const table = parquetWasm.Table.fromIPCStream(
     arrow.tableToIPC(arrow.tableFromArrays(columns), "stream"),
@@ -81,7 +82,7 @@ function authorisedInventory() {
   for (const [dayUtc, count] of dayCounts) {
     for (let index = 0; index < count; index += 1) {
       entries.push({
-        kind: "erroneous",
+        kind: "noncanonical_shape",
         scope: {
           day_utc: dayUtc,
           connector_id: connectorIds[ordinal],
@@ -112,44 +113,59 @@ test("bounded v2 September physical-name migration preserves content and publica
   assert.equal(AUTHORISED_TO_DAY, "2026-09-16");
   assert.equal(AUTHORISED_PARTITION_COUNT, 294);
   assert.deepEqual(AUTHORISED_CONNECTOR_COUNTS, { 1: 185, 2: 20, 3: 10, 6: 79 });
+  assert.deepEqual(AUTHORISED_DAY_COUNTS, {
+    "2026-09-09": 10,
+    "2026-09-10": 9,
+    "2026-09-11": 10,
+    "2026-09-12": 53,
+    "2026-09-13": 53,
+    "2026-09-14": 53,
+    "2026-09-15": 53,
+    "2026-09-16": 53,
+  });
 
-  assert.equal(classifyV2MigrationPhysicalColumns([...baseColumns, "vstatus"]), "erroneous");
+  const structurallyAuthorisedUnsupportedColumns = [...baseColumns, "unsupported_final_column"];
+  assert.equal(classifyV2MigrationPhysicalColumns(structurallyAuthorisedUnsupportedColumns), "noncanonical_shape");
   assert.equal(classifyV2MigrationPhysicalColumns(OBSERVATION_HISTORY_COLUMNS_V3), "canonical");
   assert.equal(classifyV2MigrationPhysicalColumns(baseColumns), "historical");
+  assert.equal(classifyV2MigrationPhysicalColumns([...baseColumns, "status"]), "historical");
   assert.throws(
-    () => classifyV2MigrationPhysicalColumns([...baseColumns, "vstatus", "verification_status"]),
+    () => classifyV2MigrationPhysicalColumns(["unexpected_id", ...baseColumns.slice(1), "unsupported_final_column"]),
     /unsupported/i,
   );
-  const knownErroneousIdentity = {
+  const knownNoncanonicalIdentity = {
     history_schema_version: 3,
     writer_version: "parquet-wasm-zstd-v3",
     manifest_schema_version: 3,
   };
-  assert.doesNotThrow(() => assertKnownErroneousV2ManifestIdentity(
-    knownErroneousIdentity,
-    "erroneous",
+  assert.doesNotThrow(() => assertKnownNoncanonicalV2ManifestIdentity(
+    knownNoncanonicalIdentity,
+    "noncanonical_shape",
     "known.json",
   ));
   for (const invalid of [
-    { ...knownErroneousIdentity, history_schema_version: 2 },
-    { ...knownErroneousIdentity, writer_version: "parquet-wasm-zstd-v2" },
-    { ...knownErroneousIdentity, manifest_schema_version: 2 },
+    { ...knownNoncanonicalIdentity, history_schema_version: 2 },
+    { ...knownNoncanonicalIdentity, writer_version: "parquet-wasm-zstd-v2" },
+    { ...knownNoncanonicalIdentity, manifest_schema_version: 2 },
   ]) {
     assert.throws(
-      () => assertKnownErroneousV2ManifestIdentity(invalid, "erroneous", "invalid.json"),
+      () => assertKnownNoncanonicalV2ManifestIdentity(invalid, "noncanonical_shape", "invalid.json"),
       /unsupported writer identity/i,
     );
   }
-  assert.doesNotThrow(() => assertKnownErroneousV2ManifestIdentity({}, "canonical", "canonical.json"));
+  assert.doesNotThrow(() => assertKnownNoncanonicalV2ManifestIdentity({}, "canonical", "canonical.json"));
 
   // Initialise the same shared parquet-wasm runtime used by the canonical writer.
   serializeCanonicalObservationV2Parquet([{ ...baseRow, verification_status: "R" }]);
-  const oldBody = physicalFixture("vstatus", ["P", "R", null]);
-  const decodedOld = await decodeV2MigrationParquet(oldBody, "erroneous");
+  const oldBody = physicalFixture(structurallyAuthorisedUnsupportedColumns[6], ["P", "R", null]);
+  const decodedOld = await decodeV2MigrationParquet(oldBody, "noncanonical_shape");
   assert.deepEqual(decodedOld.rows.map((row) => row.verification_status), ["P", "R", null]);
   assert.deepEqual(decodedOld.rows.map(Object.keys), decodedOld.rows.map(() => OBSERVATION_HISTORY_COLUMNS_V3));
   await assert.rejects(
-    () => decodeV2MigrationParquet(physicalFixture("vstatus", ["invalid"]), "erroneous"),
+    () => decodeV2MigrationParquet(
+      physicalFixture(structurallyAuthorisedUnsupportedColumns[6], ["invalid"]),
+      "noncanonical_shape",
+    ),
     /exactly P, R or null/i,
   );
 
@@ -164,7 +180,7 @@ test("bounded v2 September physical-name migration preserves content and publica
 
   const inventory = authorisedInventory();
   inventory.push({
-    kind: "erroneous",
+    kind: "noncanonical_shape",
     scope: { day_utc: "2025-01-01", connector_id: 1, pollutant_code: "outside" },
   });
   const selected = selectAuthorisedAffectedPartitions(inventory);
@@ -182,6 +198,15 @@ test("bounded v2 September physical-name migration preserves content and publica
   assert.throws(
     () => selectAuthorisedAffectedPartitions(inventory.slice(0, -2)),
     /exactly 294/i,
+  );
+  const wrongConnectorDistribution = authorisedInventory();
+  wrongConnectorDistribution[0] = {
+    ...wrongConnectorDistribution[0],
+    scope: { ...wrongConnectorDistribution[0].scope, connector_id: 2 },
+  };
+  assert.throws(
+    () => selectAuthorisedAffectedPartitions(wrongConnectorDistribution),
+    /connector totals differ/i,
   );
   assert.throws(
     () => assertAuthorisedPartitionScope({ day_utc: "2026-09-17", connector_id: 1, pollutant_code: "no2" }),

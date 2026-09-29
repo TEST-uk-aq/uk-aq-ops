@@ -89,7 +89,7 @@ const unsupportedTable = arrow.tableFromArrays({
     new arrow.TimestampMillisecond(),
   ),
   value: arrow.vectorFromArray([12.5], new arrow.Float64()),
-  vstatus: arrow.vectorFromArray(["P"], new arrow.Utf8()),
+  unsupported_final_column: arrow.vectorFromArray(["P"], new arrow.Utf8()),
 });
 const unsupportedWasmTable = parquetWasm.Table.fromIPCStream(
   arrow.tableToIPC(unsupportedTable, "stream"),
@@ -121,7 +121,7 @@ fs.writeFileSync(
             self.assertNotIn("day_utc", rows[0])
             with self.assertRaisesRegex(
                 ValueError,
-                r"expected_columns=.*verification_status.*actual=.*vstatus:VARCHAR",
+                r"expected_columns=.*verification_status.*actual=.*unsupported_final_column:VARCHAR",
             ):
                 integrity._observation_rows_from_local_parquet_for_shared_hash(
                     parquet_paths=[str(unsupported_path)],

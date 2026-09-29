@@ -79,15 +79,14 @@ export const AUTHORISED_DAY_COUNTS = Object.freeze({
 
 const GENERATION = getObservationHistoryGeneration("v2");
 const PLAN_SCHEMA_VERSION = 1;
-const PURPOSE = "live-v2-september-2026-physical-vstatus-to-verification_status";
+const PURPOSE = "live-v2-september-2026-noncanonical-physical-status-to-verification_status";
 const SHA256 = /^[0-9a-f]{64}$/;
-const OLD_COLUMNS = Object.freeze([...OBSERVATION_HISTORY_COLUMNS_V3.slice(0, 6), "vstatus"]);
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const INTEGRITY_PYTHON = path.join(REPO_ROOT, "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py");
 const CODE_IDENTITY_FILES = Object.freeze([
   "package.json",
   "package-lock.json",
-  "scripts/maintenance/uk_aq_migrate_observation_v2_september_2026_vstatus_to_verification_status.mjs",
+  "scripts/maintenance/uk_aq_migrate_observation_v2_september_2026_noncanonical_status_to_verification_status.mjs",
   "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs",
   "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs",
   "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py",
@@ -119,16 +118,27 @@ function sameColumns(left, right) {
 }
 
 export function classifyV2MigrationPhysicalColumns(columns) {
-  if (sameColumns(columns, OLD_COLUMNS)) return "erroneous";
   if (sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3)) return "canonical";
-  observationHistoryPhysicalSchemaForColumns(columns);
-  return "historical";
+  try {
+    observationHistoryPhysicalSchemaForColumns(columns);
+    return "historical";
+  } catch {
+    const canonicalValueColumns = OBSERVATION_HISTORY_COLUMNS_V3.slice(0, 6);
+    if (Array.isArray(columns) && columns.length === 7 &&
+        sameColumns(columns.slice(0, 6), canonicalValueColumns) &&
+        columns[6] !== OBSERVATION_HISTORY_COLUMNS_V3[6]) {
+      return "noncanonical_shape";
+    }
+    throw new Error(`Unsupported observation Parquet physical columns: ${
+      Array.isArray(columns) ? columns.join(",") : String(columns)
+    }`);
+  }
 }
 
-export function assertKnownErroneousV2ManifestIdentity(manifest, kind, label) {
-  if (kind === "erroneous" && (manifest?.history_schema_version !== 3 ||
+export function assertKnownNoncanonicalV2ManifestIdentity(manifest, kind, label) {
+  if (kind === "noncanonical_shape" && (manifest?.history_schema_version !== 3 ||
       manifest?.writer_version !== "parquet-wasm-zstd-v3" || manifest?.manifest_schema_version !== 3)) {
-    throw new Error(`Erroneous physical manifest has unsupported writer identity: ${label}`);
+    throw new Error(`Noncanonical physical manifest has unsupported writer identity: ${label}`);
   }
 }
 
@@ -139,23 +149,22 @@ function exactStatus(value) {
 
 function decodePhysicalRow(values, columns) {
   const kind = classifyV2MigrationPhysicalColumns(columns);
-  if (!['erroneous', 'canonical'].includes(kind) || !Array.isArray(values) || values.length !== 7) {
+  if (!['noncanonical_shape', 'canonical'].includes(kind) || !Array.isArray(values) || values.length !== 7) {
     throw new Error("Migration row decoder requires an exact seven-column schema");
   }
-  const physical = Object.fromEntries(columns.map((column, index) => [column, values[index]]));
-  const timestamp = physical.observed_at_utc instanceof Date
-    ? physical.observed_at_utc : new Date(physical.observed_at_utc);
-  if (Number.isNaN(timestamp.getTime()) || typeof physical.value !== "number" || !Number.isFinite(physical.value)) {
+  const [connectorId, stationId, timeseriesId, pollutantCode, observedAtUtc, value, physicalStatus] = values;
+  const timestamp = observedAtUtc instanceof Date ? observedAtUtc : new Date(observedAtUtc);
+  if (Number.isNaN(timestamp.getTime()) || typeof value !== "number" || !Number.isFinite(value)) {
     throw new Error("Migration Parquet timestamp/value is invalid");
   }
   return normalizeCanonicalObservationRow({
-    connector_id: Number(physical.connector_id),
-    station_id: physical.station_id == null ? null : Number(physical.station_id),
-    timeseries_id: Number(physical.timeseries_id),
-    pollutant_code: physical.pollutant_code,
+    connector_id: Number(connectorId),
+    station_id: stationId == null ? null : Number(stationId),
+    timeseries_id: Number(timeseriesId),
+    pollutant_code: pollutantCode,
     observed_at_utc: timestamp.toISOString(),
-    value: physical.value,
-    verification_status: exactStatus(kind === "erroneous" ? physical.vstatus : physical.verification_status),
+    value,
+    verification_status: exactStatus(physicalStatus),
   });
 }
 
@@ -198,7 +207,7 @@ export function assertAuthorisedPartitionScope(scope) {
 
 export function selectAuthorisedAffectedPartitions(partitions) {
   const selected = (Array.isArray(partitions) ? partitions : [])
-    .filter((entry) => entry?.kind === "erroneous" &&
+    .filter((entry) => entry?.kind === "noncanonical_shape" &&
       String(entry?.scope?.day_utc || "") >= AUTHORISED_FROM_DAY &&
       String(entry?.scope?.day_utc || "") <= AUTHORISED_TO_DAY)
     .map((entry) => ({ ...entry, scope: assertAuthorisedPartitionScope(entry.scope) }))
@@ -461,12 +470,12 @@ async function inspectPollutant(r2, object, scope, pins) {
   if (manifest.day_utc !== scope.day_utc || manifest.connector_id !== scope.connector_id ||
       manifest.pollutant_code !== scope.pollutant_code) throw new Error(`Pollutant scope mismatch: ${object.key}`);
   const kind = classifyV2MigrationPhysicalColumns(manifest.columns);
-  assertKnownErroneousV2ManifestIdentity(manifest, kind, object.key);
+  assertKnownNoncanonicalV2ManifestIdentity(manifest, kind, object.key);
   if (!Array.isArray(manifest.files) || !manifest.files.length || manifest.file_count !== manifest.files.length) {
     throw new Error(`Invalid pollutant file set: ${object.key}`);
   }
-  if (kind === "erroneous" && manifest.files.length !== 1) {
-    throw new Error(`Authorised erroneous partition must contain exactly one Parquet file: ${object.key}`);
+  if (kind === "noncanonical_shape" && manifest.files.length !== 1) {
+    throw new Error(`Authorised noncanonical partition must contain exactly one Parquet file: ${object.key}`);
   }
   const rows = [];
   const files = [];
@@ -1177,8 +1186,8 @@ async function verifyPlan(args, r2) {
     assertScopedIndexMatches(index.payload, current, r2.bucket);
     canonicalCount += 1;
   }
-  const boundedResiduals = [...inventory.pollutants.values()].filter((entry) => entry.kind === "erroneous");
-  if (boundedResiduals.length) throw new Error(`Authoritative vstatus remains inside authorised range: ${boundedResiduals.length}`);
+  const boundedResiduals = [...inventory.pollutants.values()].filter((entry) => entry.kind === "noncanonical_shape");
+  if (boundedResiduals.length) throw new Error(`Authoritative noncanonical physical status remains inside authorised range: ${boundedResiduals.length}`);
   const latest = parseJson(await readExact(r2, plan.final_latest_index.key, plan.final_latest_index));
   for (const dayUtc of [...new Set(plan.affected_scopes.map((entry) => entry.scope.day_utc))].sort()) {
     const actual = (latest.payload.day_summaries || []).find((entry) => entry.day_utc === dayUtc);
@@ -1191,7 +1200,7 @@ async function verifyPlan(args, r2) {
     if (await currentIdentity(r2, obsolete.key)) throw new Error(`Obsolete replaced object remains: ${obsolete.key}`);
   }
   return { status: "verified", plan_sha256: plan.plan_sha256,
-    migrated_partition_count: canonicalCount, bounded_vstatus_partition_count: 0, ...plan.totals };
+    migrated_partition_count: canonicalCount, bounded_noncanonical_status_partition_count: 0, ...plan.totals };
 }
 
 export async function main({ argv = process.argv.slice(2), env = process.env } = {}) {
