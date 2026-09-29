@@ -18,10 +18,12 @@ import {
   assertAuthorisedPartitionScope,
   assertCompleteAggregateChildSet,
   assertDurableDependencyRecords,
+  assertKnownErroneousV2ManifestIdentity,
   assertPinnedPrestateRecords,
   buildPublicationSchedule,
   classifyV2MigrationPhysicalColumns,
   decodeV2MigrationParquet,
+  parseMigrationArgs,
   selectAuthorisedAffectedPartitions,
   validateV2MigrationTarget,
 } from "./uk_aq_migrate_observation_v2_september_2026_vstatus_to_verification_status.mjs";
@@ -59,16 +61,30 @@ function physicalFixture(statusName, statuses) {
 
 function authorisedInventory() {
   const entries = [];
+  const connectorIds = [
+    ...Array(185).fill(1),
+    ...Array(20).fill(2),
+    ...Array(10).fill(3),
+    ...Array(79).fill(6),
+  ];
+  const dayCounts = [
+    ["2026-09-09", 10],
+    ["2026-09-10", 9],
+    ["2026-09-11", 10],
+    ["2026-09-12", 53],
+    ["2026-09-13", 53],
+    ["2026-09-14", 53],
+    ["2026-09-15", 53],
+    ["2026-09-16", 53],
+  ];
   let ordinal = 0;
-  for (const [connectorIdText, count] of Object.entries(AUTHORISED_CONNECTOR_COUNTS)) {
-    const connectorId = Number(connectorIdText);
+  for (const [dayUtc, count] of dayCounts) {
     for (let index = 0; index < count; index += 1) {
-      const day = 9 + (ordinal % 8);
       entries.push({
         kind: "erroneous",
         scope: {
-          day_utc: `2026-09-${String(day).padStart(2, "0")}`,
-          connector_id: connectorId,
+          day_utc: dayUtc,
+          connector_id: connectorIds[ordinal],
           pollutant_code: `p${String(ordinal).padStart(3, "0")}`,
         },
       });
@@ -79,6 +95,19 @@ function authorisedInventory() {
 }
 
 test("bounded v2 September physical-name migration preserves content and publication safety", async () => {
+  const parsedDefaults = parseMigrationArgs([
+    "--mode", "plan",
+    "--plan-path", "/private/tmp/plan.json",
+    "--expected-environment", "LIVE",
+    "--expected-bucket", "operator-supplied-live-bucket",
+    "--target-writer-git-sha", "a".repeat(40),
+    "--dropbox-root", "/private/tmp/dropbox",
+    "--from-day", "2026-09-09",
+    "--to-day", "2026-09-16",
+    "--expected-affected-partitions", "294",
+  ]);
+  assert.equal(parsedDefaults.bindingBackupMode, "individual");
+
   assert.equal(AUTHORISED_FROM_DAY, "2026-09-09");
   assert.equal(AUTHORISED_TO_DAY, "2026-09-16");
   assert.equal(AUTHORISED_PARTITION_COUNT, 294);
@@ -91,6 +120,27 @@ test("bounded v2 September physical-name migration preserves content and publica
     () => classifyV2MigrationPhysicalColumns([...baseColumns, "vstatus", "verification_status"]),
     /unsupported/i,
   );
+  const knownErroneousIdentity = {
+    history_schema_version: 3,
+    writer_version: "parquet-wasm-zstd-v3",
+    manifest_schema_version: 3,
+  };
+  assert.doesNotThrow(() => assertKnownErroneousV2ManifestIdentity(
+    knownErroneousIdentity,
+    "erroneous",
+    "known.json",
+  ));
+  for (const invalid of [
+    { ...knownErroneousIdentity, history_schema_version: 2 },
+    { ...knownErroneousIdentity, writer_version: "parquet-wasm-zstd-v2" },
+    { ...knownErroneousIdentity, manifest_schema_version: 2 },
+  ]) {
+    assert.throws(
+      () => assertKnownErroneousV2ManifestIdentity(invalid, "erroneous", "invalid.json"),
+      /unsupported writer identity/i,
+    );
+  }
+  assert.doesNotThrow(() => assertKnownErroneousV2ManifestIdentity({}, "canonical", "canonical.json"));
 
   // Initialise the same shared parquet-wasm runtime used by the canonical writer.
   serializeCanonicalObservationV2Parquet([{ ...baseRow, verification_status: "R" }]);
@@ -120,6 +170,15 @@ test("bounded v2 September physical-name migration preserves content and publica
   const selected = selectAuthorisedAffectedPartitions(inventory);
   assert.equal(selected.length, 294);
   assert.equal(selected.some((entry) => entry.scope.pollutant_code === "outside"), false);
+  const wrongDayDistribution = authorisedInventory();
+  wrongDayDistribution[0] = {
+    ...wrongDayDistribution[0],
+    scope: { ...wrongDayDistribution[0].scope, day_utc: "2026-09-10" },
+  };
+  assert.throws(
+    () => selectAuthorisedAffectedPartitions(wrongDayDistribution),
+    /day totals differ/i,
+  );
   assert.throws(
     () => selectAuthorisedAffectedPartitions(inventory.slice(0, -2)),
     /exactly 294/i,

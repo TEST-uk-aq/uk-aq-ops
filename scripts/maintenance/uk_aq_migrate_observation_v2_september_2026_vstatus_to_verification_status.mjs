@@ -66,6 +66,16 @@ export const AUTHORISED_FROM_DAY = "2026-09-09";
 export const AUTHORISED_TO_DAY = "2026-09-16";
 export const AUTHORISED_PARTITION_COUNT = 294;
 export const AUTHORISED_CONNECTOR_COUNTS = Object.freeze({ 1: 185, 2: 20, 3: 10, 6: 79 });
+export const AUTHORISED_DAY_COUNTS = Object.freeze({
+  "2026-09-09": 10,
+  "2026-09-10": 9,
+  "2026-09-11": 10,
+  "2026-09-12": 53,
+  "2026-09-13": 53,
+  "2026-09-14": 53,
+  "2026-09-15": 53,
+  "2026-09-16": 53,
+});
 
 const GENERATION = getObservationHistoryGeneration("v2");
 const PLAN_SCHEMA_VERSION = 1;
@@ -113,6 +123,13 @@ export function classifyV2MigrationPhysicalColumns(columns) {
   if (sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3)) return "canonical";
   observationHistoryPhysicalSchemaForColumns(columns);
   return "historical";
+}
+
+export function assertKnownErroneousV2ManifestIdentity(manifest, kind, label) {
+  if (kind === "erroneous" && (manifest?.history_schema_version !== 3 ||
+      manifest?.writer_version !== "parquet-wasm-zstd-v3" || manifest?.manifest_schema_version !== 3)) {
+    throw new Error(`Erroneous physical manifest has unsupported writer identity: ${label}`);
+  }
 }
 
 function exactStatus(value) {
@@ -195,6 +212,11 @@ export function selectAuthorisedAffectedPartitions(partitions) {
   for (const entry of selected) counts[entry.scope.connector_id] = (counts[entry.scope.connector_id] || 0) + 1;
   if (JSON.stringify(counts) !== JSON.stringify(AUTHORISED_CONNECTOR_COUNTS)) {
     throw new Error(`Authorised September connector totals differ: ${JSON.stringify(counts)}`);
+  }
+  const dayCounts = {};
+  for (const entry of selected) dayCounts[entry.scope.day_utc] = (dayCounts[entry.scope.day_utc] || 0) + 1;
+  if (JSON.stringify(dayCounts) !== JSON.stringify(AUTHORISED_DAY_COUNTS)) {
+    throw new Error(`Authorised September day totals differ: ${JSON.stringify(dayCounts)}`);
   }
   return selected;
 }
@@ -439,6 +461,7 @@ async function inspectPollutant(r2, object, scope, pins) {
   if (manifest.day_utc !== scope.day_utc || manifest.connector_id !== scope.connector_id ||
       manifest.pollutant_code !== scope.pollutant_code) throw new Error(`Pollutant scope mismatch: ${object.key}`);
   const kind = classifyV2MigrationPhysicalColumns(manifest.columns);
+  assertKnownErroneousV2ManifestIdentity(manifest, kind, object.key);
   if (!Array.isArray(manifest.files) || !manifest.files.length || manifest.file_count !== manifest.files.length) {
     throw new Error(`Invalid pollutant file set: ${object.key}`);
   }
@@ -915,9 +938,9 @@ async function makePlan(args, env, r2, lockContext) {
     publication_schedule_sha256: publicationScheduleSha256, ...plan.totals } };
 }
 
-function parseArgs(argv) {
+export function parseMigrationArgs(argv) {
   const args = { mode: null, planPath: null, expectedPlanSha256: null, expectedEnvironment: null,
-    expectedBucket: null, targetWriterGitSha: null, dropboxRoot: null, bindingBackupMode: "pack",
+    expectedBucket: null, targetWriterGitSha: null, dropboxRoot: null, bindingBackupMode: "individual",
     fromDay: null, toDay: null, expectedAffectedPartitions: null, apply: false };
   const mapping = { "--mode": "mode", "--plan-path": "planPath", "--expected-plan-sha256": "expectedPlanSha256",
     "--expected-environment": "expectedEnvironment", "--expected-bucket": "expectedBucket",
@@ -1172,7 +1195,7 @@ async function verifyPlan(args, r2) {
 }
 
 export async function main({ argv = process.argv.slice(2), env = process.env } = {}) {
-  const args = parseArgs(argv);
+  const args = parseMigrationArgs(argv);
   const r2 = validateV2MigrationTarget({ args, env, resolvedR2: resolveR2HistoryIndexConfig(env).r2 });
   const lockContext = requireObservationsGlobalOperationLockContext({ env, expectedOwner: "migration" });
   const result = args.mode === "plan" ? (await makePlan(args, env, r2, lockContext)).summary
@@ -1186,7 +1209,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const argv = process.argv.slice(2);
   let args;
   try {
-    args = parseArgs(argv);
+    args = parseMigrationArgs(argv);
     validateV2MigrationTarget({ args, env: process.env, resolvedR2: resolveR2HistoryIndexConfig(process.env).r2 });
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
