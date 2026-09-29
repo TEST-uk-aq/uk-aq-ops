@@ -37,6 +37,20 @@ class FakeClock:
         return self.value
 
 
+class ReadinessResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> "ReadinessResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
+
+
 class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
     def tearDown(self) -> None:
         MODULE.close_logging_handlers()
@@ -177,6 +191,116 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def _recovery_self_writer() -> dict[str, object]:
+        return {
+            "daily_task_health_run_id": "health-41",
+            "platform_run_id": "TEST:2026-09-29T090000Z",
+            "integrity_run_id": 41,
+            "environment": "TEST",
+            "original_history_integrity_watermark": {
+                "latest_finished_run": {
+                    "run_id": "history-prior",
+                    "status": "Finished",
+                    "started_at": "2026-09-28T06:00:00Z",
+                    "finished_at": "2026-09-28T06:10:00Z",
+                    "failed_at": None,
+                    "completed_at": "2026-09-28T06:10:00Z",
+                    "summary": {"repair_mode": True},
+                },
+                "running_run": None,
+            },
+        }
+
+    @staticmethod
+    def _readiness_payload(
+        *,
+        history_running: dict[str, object] | None = None,
+        history_finished: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        prior = {
+            "run_id": "history-prior",
+            "status": "Finished",
+            "started_at": "2026-09-28T06:00:00Z",
+            "finished_at": "2026-09-28T06:10:00Z",
+            "failed_at": None,
+            "completed_at": "2026-09-28T06:10:00Z",
+            "summary": {"repair_mode": True},
+        }
+        latest_history = history_finished or prior
+        writer_runs = [
+            {
+                "task_key": "ops.prune_daily",
+                "latest_finished_run": {
+                    "run_id": "prune-prior",
+                    "status": "Finished",
+                    "completed_at": "2026-09-28T06:00:00Z",
+                },
+                "running_run": None,
+                "is_running": False,
+            },
+            {
+                "task_key": "ops.r2_core_snapshot",
+                "latest_finished_run": {
+                    "run_id": "core-prior",
+                    "status": "Finished",
+                    "completed_at": "2026-09-28T06:05:00Z",
+                },
+                "running_run": None,
+                "is_running": False,
+            },
+            {
+                "task_key": "ops.history_integrity",
+                "latest_finished_run": latest_history,
+                "running_run": history_running,
+                "is_running": history_running is not None,
+            },
+        ]
+        if history_running is not None:
+            ready = False
+            blocked_reason = "relevant_writer_running"
+        elif history_finished is not None:
+            ready = False
+            blocked_reason = "backup_started_before_latest_writer_finished"
+        else:
+            ready = True
+            blocked_reason = None
+        return {
+            "ready": ready,
+            "blocked_reason": blocked_reason,
+            "backup_run_id": "backup-17",
+            "backup_started_at": "2026-09-28T07:00:00Z",
+            "backup_finished_at": "2026-09-28T07:30:00Z",
+            "running_backup_run": None,
+            "latest_writer_finished_at": (
+                "2026-09-29T09:01:00Z"
+                if history_finished is not None
+                else "2026-09-28T06:10:00Z"
+            ),
+            "writer_runs": writer_runs,
+        }
+
+    def _check_recovery_readiness(
+        self,
+        payload: dict[str, object],
+        *,
+        include_self_context: bool = True,
+    ) -> dict[str, object]:
+        with mock.patch.object(
+            MODULE.urllib.request,
+            "urlopen",
+            return_value=ReadinessResponse(payload),
+        ):
+            return MODULE.check_dropbox_backup_ready(
+                supabase_url="https://example.supabase.co",
+                service_role_key="secret",
+                integrity_started_at_utc="2026-09-29T09:00:00Z",
+                recovery_self_writer=(
+                    self._recovery_self_writer()
+                    if include_self_context else None
+                ),
+            )
+
     def test_fixed_v2_currentness_gate_supports_checkpoint_only(self) -> None:
         completed = SimpleNamespace(
             returncode=0,
@@ -203,10 +327,13 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
     def test_fixed_v2_sos_backup_gate_ignores_stale_override_only_for_qualifying_route(
         self,
     ) -> None:
-        calls: list[bool] = []
+        calls: list[tuple[bool, object]] = []
 
         def observe(**kwargs: object) -> dict[str, object]:
-            calls.append(bool(kwargs["allow_stale_dropbox"]))
+            calls.append((
+                bool(kwargs["allow_stale_dropbox"]),
+                kwargs.get("recovery_self_writer"),
+            ))
             return {"backup_ready": True}
 
         with (
@@ -225,9 +352,10 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
             MODULE.run_scheduled_backup_gate(
                 self._write_enabled_sos_args(source="openaq"),
                 "2026-09-01T01:00:00Z",
+                recovery_self_writer=self._recovery_self_writer(),
             )
 
-        self.assertEqual(calls, [False, True])
+        self.assertEqual(calls, [(False, None), (True, None)])
 
     def _run_locked_step_zero(
         self,
@@ -1073,8 +1201,173 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
                         "blocked_authority_changed",
                     )
 
+    def test_recovery_readiness_ignores_only_exact_running_self(self) -> None:
+        own_running = {
+            "run_id": "health-41",
+            "status": "Started",
+            "started_at": "2026-09-29T09:00:00Z",
+            "summary": {
+                "env": "TEST",
+                "integrity_run_id": 41,
+                "repair_mode": True,
+            },
+        }
+        result = self._check_recovery_readiness(
+            self._readiness_payload(history_running=own_running)
+        )
+        self.assertTrue(result["backup_ready"])
+        self.assertIsNone(result["blocked_reason"])
+        self.assertEqual(
+            result["recovery_self_writer_evidence"]["running_run"]["run_id"],
+            "health-41",
+        )
+        history = next(
+            writer for writer in result["writer_runs"]
+            if writer["task_key"] == "ops.history_integrity"
+        )
+        self.assertFalse(history["is_running"])
+        self.assertIsNone(history["running_run"])
+        watermarks = MODULE._fixed_v2_writer_watermarks(
+            result,
+            daily_task_health_run_id="health-41",
+            platform_run_id="TEST:2026-09-29T090000Z",
+        )
+        self.assertEqual(
+            watermarks["ops.history_integrity"],
+            self._recovery_self_writer()[
+                "original_history_integrity_watermark"
+            ],
+        )
+
+    def test_recovery_readiness_blocks_different_running_integrity(self) -> None:
+        different_running = {
+            "run_id": "health-99",
+            "status": "Started",
+            "started_at": "2026-09-29T09:00:30Z",
+            "summary": {
+                "env": "TEST",
+                "integrity_run_id": 41,
+                "platform_run_id": "TEST:2026-09-29T090000Z",
+                "repair_mode": True,
+            },
+        }
+        result = self._check_recovery_readiness(
+            self._readiness_payload(history_running=different_running)
+        )
+        self.assertFalse(result["backup_ready"])
+        self.assertEqual(result["blocked_reason"], "relevant_writer_running")
+
+    def test_recovery_readiness_attributes_finished_or_failed_self(self) -> None:
+        for status, timestamp_field in (
+            ("Finished", "finished_at"),
+            ("Failed", "failed_at"),
+        ):
+            with self.subTest(status=status):
+                own_finished = {
+                    "run_id": "health-41",
+                    "status": status,
+                    "started_at": "2026-09-29T09:00:00Z",
+                    "finished_at": None,
+                    "failed_at": None,
+                    "completed_at": "2026-09-29T09:01:00Z",
+                    "summary": {
+                        "env": "TEST",
+                        "integrity_run_id": 41,
+                        "repair_mode": True,
+                    },
+                }
+                own_finished[timestamp_field] = "2026-09-29T09:01:00Z"
+                result = self._check_recovery_readiness(
+                    self._readiness_payload(history_finished=own_finished)
+                )
+                self.assertTrue(result["backup_ready"])
+                self.assertEqual(
+                    result["latest_writer_finished_at"],
+                    "2026-09-28T06:10:00Z",
+                )
+                self.assertEqual(
+                    result["recovery_self_writer_evidence"][
+                        "latest_finished_run"
+                    ]["status"],
+                    status,
+                )
+                history = next(
+                    writer for writer in result["writer_runs"]
+                    if writer["task_key"] == "ops.history_integrity"
+                )
+                self.assertEqual(
+                    history["latest_finished_run"]["run_id"],
+                    "history-prior",
+                )
+                watermarks = MODULE._fixed_v2_writer_watermarks(
+                    result,
+                    daily_task_health_run_id="health-41",
+                    platform_run_id="TEST:2026-09-29T090000Z",
+                )
+                self.assertEqual(
+                    watermarks["ops.history_integrity"],
+                    self._recovery_self_writer()[
+                        "original_history_integrity_watermark"
+                    ],
+                )
+
+    def test_recovery_readiness_blocks_different_finished_or_failed_integrity(
+        self,
+    ) -> None:
+        for status, timestamp_field in (
+            ("Finished", "finished_at"),
+            ("Failed", "failed_at"),
+        ):
+            with self.subTest(status=status):
+                different_finished = {
+                    "run_id": "health-99",
+                    "status": status,
+                    "started_at": "2026-09-29T09:00:10Z",
+                    "finished_at": None,
+                    "failed_at": None,
+                    "completed_at": "2026-09-29T09:01:00Z",
+                    "summary": {
+                        "env": "TEST",
+                        "integrity_run_id": 41,
+                        "platform_run_id": "TEST:2026-09-29T090000Z",
+                        "repair_mode": True,
+                    },
+                }
+                different_finished[timestamp_field] = (
+                    "2026-09-29T09:01:00Z"
+                )
+                result = self._check_recovery_readiness(
+                    self._readiness_payload(
+                        history_finished=different_finished
+                    )
+                )
+                self.assertFalse(result["backup_ready"])
+                self.assertEqual(
+                    result["blocked_reason"],
+                    "backup_started_before_latest_writer_finished",
+                )
+
+    def test_generic_readiness_still_blocks_running_integrity(self) -> None:
+        own_running = {
+            "run_id": "health-41",
+            "status": "Started",
+            "started_at": "2026-09-29T09:00:00Z",
+            "summary": {
+                "env": "TEST",
+                "integrity_run_id": 41,
+                "repair_mode": True,
+            },
+        }
+        result = self._check_recovery_readiness(
+            self._readiness_payload(history_running=own_running),
+            include_self_context=False,
+        )
+        self.assertFalse(result["backup_ready"])
+        self.assertEqual(result["blocked_reason"], "relevant_writer_running")
+
     def test_recovery_writer_ordering_uses_original_run_start_time(self) -> None:
         args = self._write_enabled_sos_args()
+        recovery_self_writer = self._recovery_self_writer()
         with mock.patch.object(
             MODULE,
             "check_dropbox_backup_ready",
@@ -1083,12 +1376,17 @@ class SosLightV2CoordinatorHardeningTests(unittest.TestCase):
             MODULE.run_scheduled_backup_gate(
                 args,
                 "2026-09-29T09:00:00Z",
+                recovery_self_writer=recovery_self_writer,
             )
         self.assertEqual(
             readiness.call_args.kwargs["integrity_started_at_utc"],
             "2026-09-29T09:00:00Z",
         )
         self.assertFalse(readiness.call_args.kwargs["allow_stale_dropbox"])
+        self.assertEqual(
+            readiness.call_args.kwargs["recovery_self_writer"],
+            recovery_self_writer,
+        )
 
     def test_node_apply_permission_requires_resolved_recovery_authority(self) -> None:
         inputs = self._recovery_authority_inputs()

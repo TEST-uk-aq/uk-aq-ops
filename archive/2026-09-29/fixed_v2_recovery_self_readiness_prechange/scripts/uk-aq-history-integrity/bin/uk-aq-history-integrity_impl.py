@@ -21922,124 +21922,20 @@ def _writer_run_matches_logical_identity(
     *,
     daily_task_health_run_id: str | None,
     platform_run_id: str,
-    integrity_run_id: int | None = None,
-    environment: str | None = None,
 ) -> bool:
-    summary = run.get("summary")
-    summary = summary if isinstance(summary, Mapping) else {}
-    actual_health_run_id = str(
-        run.get("run_id") or run.get("id") or ""
-    ).strip()
-    expected_health_run_id = str(daily_task_health_run_id or "").strip()
-    if expected_health_run_id:
-        return actual_health_run_id == expected_health_run_id
-
-    actual_platform_run_id = str(
-        run.get("platform_run_id")
-        or run.get("external_run_id")
-        or summary.get("platform_run_id")
-        or ""
-    ).strip()
-    expected_platform_run_id = str(platform_run_id or "").strip()
-    if expected_platform_run_id and actual_platform_run_id:
-        return actual_platform_run_id == expected_platform_run_id
-
-    actual_integrity_run_id = summary.get("integrity_run_id")
-    actual_environment = str(summary.get("env") or "").strip()
+    identities = {
+        str(value)
+        for key, value in run.items()
+        if key in {"id", "run_id", "platform_run_id", "external_run_id"}
+        and value is not None
+    }
     return bool(
-        integrity_run_id is not None
-        and actual_integrity_run_id is not None
-        and str(actual_integrity_run_id) == str(integrity_run_id)
-        and str(environment or "").strip()
-        and actual_environment == str(environment).strip()
-    )
-
-
-def _fixed_v2_recovery_self_writer_context(
-    recovery_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    logical_run = recovery_state.get("logical_run")
-    writer_watermarks = recovery_state.get("writer_watermarks")
-    if not isinstance(logical_run, Mapping) or not isinstance(
-        writer_watermarks, Mapping
-    ):
-        raise RuntimeError(
-            "fixed-v2 recovery self-writer authority is unavailable"
+        platform_run_id in identities
+        or (
+            daily_task_health_run_id
+            and str(daily_task_health_run_id) in identities
         )
-    original_integrity_watermark = writer_watermarks.get(
-        "ops.history_integrity"
     )
-    if not isinstance(original_integrity_watermark, Mapping):
-        raise RuntimeError(
-            "fixed-v2 recovery self-writer watermark is unavailable"
-        )
-    return {
-        "daily_task_health_run_id": logical_run.get(
-            "daily_task_health_run_id"
-        ),
-        "platform_run_id": logical_run.get("platform_run_id"),
-        "integrity_run_id": logical_run.get("integrity_run_id"),
-        "environment": logical_run.get("environment"),
-        "original_history_integrity_watermark": json.loads(json.dumps(
-            original_integrity_watermark,
-            sort_keys=True,
-            default=str,
-        )),
-    }
-
-
-def _normalise_recovery_self_writer_runs(
-    writer_runs: Iterable[Mapping[str, Any]],
-    recovery_self_writer: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    normalised = json.loads(json.dumps(
-        list(writer_runs), sort_keys=True, default=str,
-    ))
-    audit: dict[str, Any] = {
-        "running_run": None,
-        "latest_finished_run": None,
-    }
-    for writer in normalised:
-        if writer.get("task_key") != "ops.history_integrity":
-            continue
-        for field in ("running_run", "latest_finished_run"):
-            candidate = writer.get(field)
-            if not isinstance(candidate, Mapping):
-                continue
-            if not _writer_run_matches_logical_identity(
-                candidate,
-                daily_task_health_run_id=recovery_self_writer.get(
-                    "daily_task_health_run_id"
-                ),
-                platform_run_id=str(
-                    recovery_self_writer.get("platform_run_id") or ""
-                ),
-                integrity_run_id=recovery_self_writer.get("integrity_run_id"),
-                environment=str(
-                    recovery_self_writer.get("environment") or ""
-                ),
-            ):
-                continue
-            audit[field] = json.loads(json.dumps(
-                candidate, sort_keys=True, default=str,
-            ))
-            if field == "running_run":
-                writer["running_run"] = None
-                writer["is_running"] = False
-            else:
-                original = recovery_self_writer.get(
-                    "original_history_integrity_watermark"
-                )
-                if not isinstance(original, Mapping):
-                    raise RuntimeError(
-                        "fixed-v2 recovery original Integrity watermark is invalid"
-                    )
-                writer["latest_finished_run"] = json.loads(json.dumps(
-                    original.get("latest_finished_run"),
-                    sort_keys=True,
-                    default=str,
-                ))
-    return normalised, audit
 
 
 def _fixed_v2_writer_watermarks(
@@ -25319,7 +25215,6 @@ def check_dropbox_backup_ready(
     integrity_started_at_utc: str,
     allow_stale_dropbox: bool = False,
     rpc_name: str = "uk_aq_rpc_history_integrity_readiness",
-    recovery_self_writer: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "backup_gate_checked": True,
@@ -25416,44 +25311,6 @@ def check_dropbox_backup_ready(
         "latest_writer_finished_at",
     ):
         summary[key] = data.get(key)
-    recovery_self_evidence: dict[str, Any] | None = None
-    if recovery_self_writer is not None:
-        try:
-            writer_runs, recovery_self_evidence = (
-                _normalise_recovery_self_writer_runs(
-                    writer_runs,
-                    recovery_self_writer,
-                )
-            )
-        except (TypeError, ValueError, RuntimeError) as exc:
-            summary["blocked_reason"] = (
-                f"invalid_recovery_self_writer_context:{exc}"
-            )
-            return summary
-        summary["recovery_self_writer_evidence"] = recovery_self_evidence
-        if recovery_self_evidence.get("latest_finished_run") is not None:
-            completed_values = []
-            for writer_run in writer_runs:
-                latest = writer_run.get("latest_finished_run")
-                if not isinstance(latest, Mapping):
-                    continue
-                completed_raw = str(
-                    latest.get("completed_at")
-                    or latest.get("finished_at")
-                    or latest.get("failed_at")
-                    or ""
-                ).strip()
-                completed_at = _parse_iso_utc(completed_raw)
-                if completed_at is None:
-                    summary["blocked_reason"] = (
-                        "daily_task_health_query_returned_unexpected_shape"
-                    )
-                    return summary
-                completed_values.append((completed_at, completed_raw))
-            summary["latest_writer_finished_at"] = (
-                max(completed_values, key=lambda item: item[0])[1]
-                if completed_values else None
-            )
     summary["writer_runs"] = writer_runs
 
     if summary["running_backup_run"] is not None and not isinstance(summary["running_backup_run"], dict):
@@ -25476,22 +25333,7 @@ def check_dropbox_backup_ready(
             and bool(running_writer_keys)
             and running_writer_keys <= {"ops.prune_daily"}
         )
-        may_ignore_recovery_self_running = bool(
-            recovery_self_evidence
-            and recovery_self_evidence.get("running_run") is not None
-            and blocked_reason == "relevant_writer_running"
-            and running_writer_keys <= {"ops.prune_daily"}
-        )
-        may_ignore_recovery_self_finished = bool(
-            recovery_self_evidence
-            and recovery_self_evidence.get("latest_finished_run") is not None
-            and blocked_reason == "backup_started_before_latest_writer_finished"
-        )
-        if not (
-            may_overlap_prune
-            or may_ignore_recovery_self_running
-            or may_ignore_recovery_self_finished
-        ):
+        if not may_overlap_prune:
             summary["blocked_reason"] = blocked_reason
             return summary
 
@@ -25508,9 +25350,7 @@ def check_dropbox_backup_ready(
     if backup_finished_at >= integrity_started_at:
         summary["blocked_reason"] = "backup_finished_at_or_after_integrity_start"
         return summary
-    latest_writer_raw = str(
-        summary.get("latest_writer_finished_at") or ""
-    ).strip()
+    latest_writer_raw = str(data.get("latest_writer_finished_at") or "").strip()
     if latest_writer_raw:
         latest_writer_finished_at = _parse_iso_utc(latest_writer_raw)
         if latest_writer_finished_at is None:
@@ -25554,12 +25394,7 @@ def resolve_backup_gate_credentials(values: Mapping[str, Any] | None = None) -> 
     )
 
 
-def run_scheduled_backup_gate(
-    args: argparse.Namespace,
-    started_iso: str,
-    *,
-    recovery_self_writer: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dict[str, Any]:
     supabase_url, service_role_key = resolve_backup_gate_credentials()
     fixed_v2_sos_light_write_enabled = bool(
         select_sos_historical_replacement_route(args).get("arguments_qualify")
@@ -25577,10 +25412,6 @@ def run_scheduled_backup_gate(
                 "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
                 "uk_aq_rpc_history_integrity_readiness",
             )
-        ),
-        recovery_self_writer=(
-            recovery_self_writer
-            if fixed_v2_sos_light_write_enabled else None
         ),
     )
 
@@ -28673,18 +28504,7 @@ def main(argv: list[str]) -> int:
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
         return 2
 
-    backup_gate_summary = run_scheduled_backup_gate(
-        args,
-        started_iso,
-        recovery_self_writer=(
-            _fixed_v2_recovery_self_writer_context(
-                fixed_v2_recovery_state
-            )
-            if fixed_v2_recovery_reentry
-            and fixed_v2_recovery_state is not None
-            else None
-        ),
-    )
+    backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
     log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
     if not backup_gate_summary.get("backup_ready"):
         if fixed_v2_recovery_reentry and recovery_state_path_raw:
