@@ -26,7 +26,7 @@ The linked contracts remain authoritative for their stated scope. This index doe
 
 | File | Scope |
 |---|---|
-| [`observation_history_schema_contract.md`](observation_history_schema_contract.md) | Canonical observation row/Parquet names, status compatibility, boundary mappings and persisted-name changes |
+| [`observation_history_schema_contract.md`](observation_history_schema_contract.md) | Canonical observation row/Parquet names, strict verification-status naming, prohibited historical-name rules, boundary mappings and persisted-name changes |
 | [`aurn_validation_status_contract.md`](aurn_validation_status_contract.md) | Connector `1` P/R semantics and trusted presentation fallback; field naming defers to the schema contract |
 | [`ukair_black_carbon_history_contract.md`](ukair_black_carbon_history_contract.md) | Future dedicated UK-AIR Black Carbon direct-R2 source reconciliation using the shared canonical observation writer |
 | [`observation_selected_scope_removal_contract.md`](observation_selected_scope_removal_contract.md) | Future shared explicit exact-scope authority removal for admitted partial-reconciliation writers |
