@@ -77,7 +77,7 @@ export const AUTHORISED_DAY_COUNTS = Object.freeze({
   "2026-09-16": 53,
 });
 // Must be populated only from the previously reviewed exact LIVE affected-scope set.
-export const AUTHORISED_AFFECTED_SCOPE_SET_SHA256 = null;
+export const AUTHORISED_AFFECTED_SCOPE_SET_SHA256 = "62c23a1d25207bc0ac46d696ed611c8e920e1127067062ee7ba3fd2f23ab233d";
 
 const GENERATION = getObservationHistoryGeneration("v2");
 const PLAN_SCHEMA_VERSION = 2;
