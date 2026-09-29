@@ -32,6 +32,9 @@ import {
   decodeV2MigrationParquet,
   parseMigrationArgs,
   prepareApplyInvocation,
+  readMigrationCurrentIdentity,
+  readMigrationSourceParquetWithExpectedIdentity,
+  readMigrationTargetObjectStrict,
   selectAuthorisedAffectedPartitions,
   validateV2MigrationTarget,
 } from "./uk_aq_migrate_observation_v2_september_2026_noncanonical_status_to_verification_status.mjs";
@@ -131,7 +134,10 @@ test("bounded v2 September physical-name migration preserves content and publica
     "2026-09-15": 53,
     "2026-09-16": 53,
   });
-  assert.equal(AUTHORISED_AFFECTED_SCOPE_SET_SHA256, null);
+  assert.equal(
+    AUTHORISED_AFFECTED_SCOPE_SET_SHA256,
+    "62c23a1d25207bc0ac46d696ed611c8e920e1127067062ee7ba3fd2f23ab233d",
+  );
 
   const structurallyAuthorisedUnsupportedColumns = [...baseColumns, "unsupported_final_column"];
   assert.equal(classifyV2MigrationPhysicalColumns(structurallyAuthorisedUnsupportedColumns), "noncanonical_shape");
@@ -255,7 +261,7 @@ test("bounded v2 September physical-name migration preserves content and publica
   );
   assert.throws(
     () => selectAuthorisedAffectedPartitions(authorisedInventory()),
-    /SHA-256 is not configured/i,
+    /affected-scope set differs/i,
   );
   assert.throws(
     () => assertAuthorisedPartitionScope({ day_utc: "2026-09-17", connector_id: 1, pollutant_code: "no2" }),
@@ -311,6 +317,137 @@ test("bounded v2 September physical-name migration preserves content and publica
     { key: "day", stage: "day", dependencies: ["latest"] },
     { key: "latest", stage: "latest", dependencies: [] },
   ]), /contradicts dependency/i);
+
+  const legacyParquetKey = "history/v2/observations/day_utc=2026-09-09/connector_id=1/pollutant_code=no2/part-00000.parquet";
+  const legacyParquetBody = Buffer.from("legacy-source-parquet-body");
+  const legacyParquetIdentity = {
+    key: legacyParquetKey,
+    byte_size: legacyParquetBody.byteLength,
+    sha256: createHash("sha256").update(legacyParquetBody).digest("hex"),
+  };
+  const migrationR2 = (head, body) => ({
+    adapter: {
+      headObject: async ({ key }) => ({ key, ...head }),
+      getObject: async () => ({ body }),
+    },
+  });
+  const checksumlessLegacyR2 = migrationR2({
+    exists: true,
+    bytes: legacyParquetIdentity.byte_size,
+    sha256: null,
+  }, legacyParquetBody);
+  const verifiedLegacy = await readMigrationSourceParquetWithExpectedIdentity({
+    r2: checksumlessLegacyR2,
+    key: legacyParquetKey,
+    expected: legacyParquetIdentity,
+  });
+  assert.deepEqual(
+    { key: verifiedLegacy.key, byte_size: verifiedLegacy.byte_size, sha256: verifiedLegacy.sha256 },
+    legacyParquetIdentity,
+  );
+  await assert.rejects(
+    () => readMigrationSourceParquetWithExpectedIdentity({
+      r2: checksumlessLegacyR2,
+      key: legacyParquetKey,
+      expected: { ...legacyParquetIdentity, sha256: "0".repeat(64) },
+    }),
+    /GET identity mismatch/i,
+  );
+  await assert.rejects(
+    () => readMigrationSourceParquetWithExpectedIdentity({
+      r2: migrationR2({
+        exists: true,
+        bytes: legacyParquetIdentity.byte_size + 1,
+        sha256: null,
+      }, legacyParquetBody),
+      key: legacyParquetKey,
+      expected: legacyParquetIdentity,
+    }),
+    /HEAD identity mismatch/i,
+  );
+  await assert.rejects(
+    () => readMigrationSourceParquetWithExpectedIdentity({
+      r2: migrationR2({
+        exists: true,
+        bytes: legacyParquetIdentity.byte_size,
+        sha256: null,
+      }, Buffer.concat([legacyParquetBody, Buffer.from("x")])),
+      key: legacyParquetKey,
+      expected: legacyParquetIdentity,
+    }),
+    /GET identity mismatch/i,
+  );
+  await assert.rejects(
+    () => readMigrationSourceParquetWithExpectedIdentity({
+      r2: checksumlessLegacyR2,
+      key: legacyParquetKey,
+      expected: null,
+    }),
+    /identity is invalid/i,
+  );
+  await assert.rejects(
+    () => readMigrationSourceParquetWithExpectedIdentity({
+      r2: checksumlessLegacyR2,
+      key: legacyParquetKey,
+      expected: { ...legacyParquetIdentity, sha256: "arbitrary-etag" },
+    }),
+    /identity is invalid/i,
+  );
+
+  const storedChecksumR2 = migrationR2({
+    exists: true,
+    bytes: legacyParquetIdentity.byte_size,
+    sha256: legacyParquetIdentity.sha256,
+  }, legacyParquetBody);
+  const verifiedStoredChecksum = await readMigrationSourceParquetWithExpectedIdentity({
+    r2: storedChecksumR2,
+    key: legacyParquetKey,
+    expected: legacyParquetIdentity,
+  });
+  assert.equal(verifiedStoredChecksum.sha256, legacyParquetIdentity.sha256);
+
+  assert.deepEqual(
+    await readMigrationCurrentIdentity(checksumlessLegacyR2, legacyParquetKey, legacyParquetIdentity),
+    legacyParquetIdentity,
+  );
+  const targetParquetBody = Buffer.from("canonical-target-parquet");
+  const targetParquetIdentity = {
+    key: legacyParquetKey,
+    byte_size: targetParquetBody.byteLength,
+    sha256: createHash("sha256").update(targetParquetBody).digest("hex"),
+  };
+  const storedTargetR2 = migrationR2({
+    exists: true,
+    bytes: targetParquetIdentity.byte_size,
+    sha256: targetParquetIdentity.sha256,
+  }, targetParquetBody);
+  assert.deepEqual(
+    await readMigrationCurrentIdentity(storedTargetR2, legacyParquetKey, legacyParquetIdentity),
+    targetParquetIdentity,
+  );
+  const thirdBody = Buffer.alloc(legacyParquetBody.byteLength, 0x78);
+  await assert.rejects(
+    () => readMigrationCurrentIdentity(
+      migrationR2({ exists: true, bytes: thirdBody.byteLength, sha256: null }, thirdBody),
+      legacyParquetKey,
+      legacyParquetIdentity,
+    ),
+    /GET identity mismatch/i,
+  );
+  await assert.rejects(
+    () => readMigrationTargetObjectStrict(
+      checksumlessLegacyR2,
+      legacyParquetKey,
+      legacyParquetIdentity,
+    ),
+    /Strong stored R2 identity unavailable/i,
+  );
+  const strictTarget = await readMigrationTargetObjectStrict(
+    storedTargetR2,
+    legacyParquetKey,
+    targetParquetIdentity,
+  );
+  assert.equal(strictTarget.sha256, targetParquetIdentity.sha256);
 
   const checkpointDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-september-repair-"));
   try {

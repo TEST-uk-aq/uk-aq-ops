@@ -344,15 +344,65 @@ async function readExactFromHead(r2, key, kind, head, expected = null) {
   return { ...identity, body };
 }
 
+function requireAuthoritativeParquetIdentity(key, expected) {
+  if (expected?.key !== key || !String(key).endsWith(".parquet") ||
+      !Number.isSafeInteger(expected?.byte_size) || expected.byte_size < 0 ||
+      typeof expected?.sha256 !== "string" || !SHA256.test(expected.sha256)) {
+    throw new Error(`Authoritative source Parquet identity is invalid: ${key}`);
+  }
+  return Object.freeze({ key, byte_size: expected.byte_size, sha256: expected.sha256 });
+}
+
+export async function readMigrationSourceParquetWithExpectedIdentity({
+  r2,
+  key,
+  expected,
+  head = null,
+  headObject = r2HeadObject,
+  getObject = r2GetObject,
+}) {
+  const authoritative = requireAuthoritativeParquetIdentity(key, expected);
+  const stored = head ?? await headObject({ r2, key });
+  if (!stored?.exists || !Number.isSafeInteger(stored?.bytes) || stored.bytes < 0 ||
+      stored.bytes !== authoritative.byte_size) {
+    throw new Error(`Authoritative source Parquet HEAD identity mismatch: ${key}`);
+  }
+  const hasStoredSha256 = stored.sha256 !== null && stored.sha256 !== undefined && stored.sha256 !== "";
+  if (hasStoredSha256 && (!SHA256.test(stored.sha256) || stored.sha256 !== authoritative.sha256)) {
+    throw new Error(`Authoritative source Parquet stored SHA-256 mismatch: ${key}`);
+  }
+  const object = await getObject({ r2, key });
+  const body = Buffer.from(object.body);
+  const identity = exactIdentity(key, body);
+  if (!sameIdentity(identity, authoritative)) {
+    throw new Error(`Authoritative source Parquet GET identity mismatch: ${key}`);
+  }
+  return { ...identity, body };
+}
+
 async function readExact(r2, key, expected = null) {
   const kind = objectKind(key);
   return readExactFromHead(r2, key, kind, await r2HeadObject({ r2, key }), expected);
 }
 
-async function currentIdentity(r2, key) {
+export async function readMigrationTargetObjectStrict(r2, key, expected) {
+  return readExact(r2, key, expected);
+}
+
+export async function readMigrationCurrentIdentity(r2, key, expectedLegacyParquetIdentity = null) {
   const kind = objectKind(key);
   const head = await r2HeadObject({ r2, key });
   if (head?.exists === false) return null;
+  const hasStoredSha256 = head?.sha256 !== null && head?.sha256 !== undefined && head?.sha256 !== "";
+  if (kind === "parquet" && !hasStoredSha256 && expectedLegacyParquetIdentity) {
+    const object = await readMigrationSourceParquetWithExpectedIdentity({
+      r2,
+      key,
+      expected: expectedLegacyParquetIdentity,
+      head,
+    });
+    return { key, byte_size: object.byte_size, sha256: object.sha256 };
+  }
   const object = await readExactFromHead(r2, key, kind, head);
   return { key, byte_size: object.byte_size, sha256: object.sha256 };
 }
@@ -512,7 +562,11 @@ async function inspectPollutant(r2, object, scope, pins) {
     if (!key.startsWith(object.key.replace(/manifest\.json$/, "")) || !/\/part-\d{5}\.parquet$/.test(key)) {
       throw new Error(`Invalid authoritative Parquet key: ${key}`);
     }
-    const part = await readExact(r2, key);
+    const part = await readMigrationSourceParquetWithExpectedIdentity({
+      r2,
+      key,
+      expected: { key: file.key, byte_size: file.bytes, sha256: file.etag_or_hash },
+    });
     pins.set(key, oldIdentity(part));
     if (file.bytes !== part.byte_size || file.etag_or_hash !== part.sha256) throw new Error(`Manifest/Parquet identity mismatch: ${key}`);
     const decoded = await decodeV2MigrationParquet(part.body);
@@ -1111,7 +1165,7 @@ export function assertPinnedPrestateRecords(pinnedObjects, plannedPuts, currentO
 async function assertOldOrTargetPrestate(r2, plan) {
   const currents = [];
   for (const pinned of [...plan.pinned_authoritative_objects].sort((left, right) => left.key.localeCompare(right.key))) {
-    currents.push(await currentIdentity(r2, pinned.key));
+    currents.push(await readMigrationCurrentIdentity(r2, pinned.key, pinned));
   }
   assertPinnedPrestateRecords(plan.pinned_authoritative_objects, plan.planned_puts, currents);
 }
@@ -1163,13 +1217,13 @@ export function assertDurableDependencyRecords(put, plannedPuts, currentObjects,
 async function assertDependenciesPublished(r2, put, byKey, journal) {
   const currents = [];
   for (const key of put.dependencies || []) {
-    currents.push(await currentIdentity(r2, key));
+    currents.push(await readMigrationCurrentIdentity(r2, key));
   }
   assertDurableDependencyRecords(put, [...byKey.values()], currents, journal.verified_objects);
 }
 
 async function verifyPut(r2, put, body, plan) {
-  const published = await readExact(r2, put.key, put.target);
+  const published = await readMigrationTargetObjectStrict(r2, put.key, put.target);
   if (!published.body.equals(body)) throw new Error(`Published object bytes changed: ${put.key}`);
   if (put.stage === "parquet") {
     const scope = plan.affected_scopes.find((entry) => entry.target_parquet_file.key === put.key);
@@ -1200,7 +1254,11 @@ async function applyPlan(args, env, r2, lockContext) {
     const put = byKey.get(key);
     await assertDependenciesPublished(r2, put, byKey, journal);
     const body = storedBody(args.planPath, put);
-    const current = await currentIdentity(r2, put.key);
+    const current = await readMigrationCurrentIdentity(
+      r2,
+      put.key,
+      put.stage === "parquet" ? put.old : null,
+    );
     if (!sameIdentity(current, put.target)) {
       if (!sameIdentity(current, put.old)) throw new Error(`Migration PUT key has a third identity: ${put.key}`);
       const intent = buildR2ChecksumAwarePutIntent({ key: put.key, body,
@@ -1256,7 +1314,7 @@ async function verifyPlan(args, r2) {
   }
   for (const put of plan.planned_puts) await verifyPut(r2, put, storedBody(args.planPath, put), plan);
   for (const obsolete of plan.planned_deletions || []) {
-    if (await currentIdentity(r2, obsolete.key)) throw new Error(`Obsolete replaced object remains: ${obsolete.key}`);
+    if (await readMigrationCurrentIdentity(r2, obsolete.key)) throw new Error(`Obsolete replaced object remains: ${obsolete.key}`);
   }
   return { status: "verified", plan_sha256: plan.plan_sha256,
     migrated_partition_count: canonicalCount, bounded_noncanonical_status_partition_count: 0, ...plan.totals };
