@@ -8,6 +8,20 @@ import {
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+const OBSERVATION_PARQUET_SUMMARY_FIELDS = Object.freeze([
+  "mode",
+  "mode_source",
+  "reused_count",
+  "reused_bytes",
+  "copy_required_count",
+  "copy_required_bytes",
+  "copied_bytes",
+  "copied_bytes_measurement",
+  "fallback_count",
+  "fallback_reasons",
+  "planning_errors",
+]);
+
 function requireValue(argv, index, flag) {
   const value = argv[index + 1];
   if (!value || value.startsWith("--")) {
@@ -93,6 +107,25 @@ function buildStageTiming(report, stageName, warn) {
   return timing;
 }
 
+function buildObservationParquetSummary(report) {
+  const observationParquet = report?.observation_parquet;
+  if (
+    !observationParquet
+    || typeof observationParquet !== "object"
+    || Array.isArray(observationParquet)
+  ) {
+    return null;
+  }
+
+  const summary = {};
+  for (const field of OBSERVATION_PARQUET_SUMMARY_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(observationParquet, field)) {
+      summary[field] = observationParquet[field];
+    }
+  }
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
 export function buildHistoryBackupTaskSummary({
   inventoryReport = null,
   backupReport = null,
@@ -103,9 +136,15 @@ export function buildHistoryBackupTaskSummary({
   const backup = buildStageTiming(backupReport, "backup", warn);
   if (inventory) stageTimings.inventory = inventory;
   if (backup) stageTimings.backup = backup;
-  return Object.keys(stageTimings).length > 0
-    ? { stage_timings: stageTimings }
-    : {};
+  const summary = {};
+  if (Object.keys(stageTimings).length > 0) {
+    summary.stage_timings = stageTimings;
+  }
+  const observationParquet = buildObservationParquetSummary(backupReport);
+  if (observationParquet) {
+    summary.observation_parquet = observationParquet;
+  }
+  return summary;
 }
 
 function readOptionalReport(filename, stageName, warn) {
