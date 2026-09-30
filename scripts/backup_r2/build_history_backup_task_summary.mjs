@@ -113,6 +113,7 @@ function buildObservationParquetSummary(report) {
     !observationParquet
     || typeof observationParquet !== "object"
     || Array.isArray(observationParquet)
+    || observationParquet.mode !== "reuse_matching"
   ) {
     return null;
   }
