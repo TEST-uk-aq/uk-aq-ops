@@ -45,15 +45,38 @@ jobs:
           printf 'WORKER_BASE=https://%s.%s.workers.dev\n' "$WORKER_NAME" "$SUBDOMAIN" >> "$GITHUB_ENV"
           echo "worker_base=https://$WORKER_NAME.$SUBDOMAIN.workers.dev"
 
+      - name: Wait for temporary Worker availability
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            code="$(curl --silent --show-error --output "$RUNNER_TEMP/health.body" --write-out '%{http_code}' "$WORKER_BASE/health" || true)"
+            echo "health attempt $attempt status=$code"
+            if [ "$code" = "200" ]; then
+              cat "$RUNNER_TEMP/health.body"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Temporary Worker never became available"
+          exit 1
+
       - name: Probe feed through Cloudflare Worker
         run: |
           set -euo pipefail
           echo "=== WORKER FEED FETCH ==="
-          curl --fail-with-body --location --silent --show-error \
+          code="$(curl --location --silent --show-error \
             --dump-header "$RUNNER_TEMP/feed.headers" \
             --output "$RUNNER_TEMP/feed.xml" \
-            "$WORKER_BASE/feed"
+            --write-out '%{http_code}' \
+            "$WORKER_BASE/feed" || true)"
+          echo "status=$code"
           grep -Ei '^(HTTP/|content-type:|x-probe-upstream-status:|server:|cf-ray:)' "$RUNNER_TEMP/feed.headers" || true
+          if [ "$code" != "200" ]; then
+            echo -n "body_prefix="
+            head -c 500 "$RUNNER_TEMP/feed.xml" | tr '\n\r' '  ' || true
+            echo
+            exit 1
+          fi
           echo "feed_bytes=$(wc -c < "$RUNNER_TEMP/feed.xml" | tr -d ' ')"
 
           export FEED_FILE="$RUNNER_TEMP/feed.xml"
