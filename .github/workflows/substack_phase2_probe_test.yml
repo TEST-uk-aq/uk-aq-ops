@@ -1,4 +1,4 @@
-name: Substack Phase 2 Cloudflare Probe
+name: Substack Phase 2 Cloudflare Browser Probe
 
 on:
   push:
@@ -27,7 +27,7 @@ jobs:
           test -n "$CLOUDFLARE_ACCOUNT_ID"
           test -n "$CLOUDFLARE_API_TOKEN"
 
-      - name: Deploy temporary probe Worker
+      - name: Deploy temporary Browser Run probe Worker
         working-directory: workers/substack_phase2_probe_test
         run: |
           set -euo pipefail
@@ -60,113 +60,41 @@ jobs:
           echo "Temporary Worker never became available"
           exit 1
 
-      - name: Probe feed through Cloudflare Worker
+      - name: Probe feed through Browser Run
         run: |
           set -euo pipefail
-          echo "=== WORKER FEED FETCH ==="
           code="$(curl --location --silent --show-error \
             --dump-header "$RUNNER_TEMP/feed.headers" \
-            --output "$RUNNER_TEMP/feed.xml" \
+            --output "$RUNNER_TEMP/feed.html" \
             --write-out '%{http_code}' \
-            "$WORKER_BASE/feed" || true)"
+            "$WORKER_BASE/feed-browser" || true)"
           echo "status=$code"
-          grep -Ei '^(HTTP/|content-type:|x-probe-upstream-status:|server:|cf-ray:)' "$RUNNER_TEMP/feed.headers" || true
+          grep -Ei '^(HTTP/|content-type:|x-browser-ms-used:|x-uk-aq-probe-source:|server:|cf-ray:)' "$RUNNER_TEMP/feed.headers" || true
+          echo "feed_bytes=$(wc -c < "$RUNNER_TEMP/feed.html" | tr -d ' ')"
+          echo -n "feed_prefix="
+          head -c 800 "$RUNNER_TEMP/feed.html" | tr '\n\r' '  ' || true
+          echo
           if [ "$code" != "200" ]; then
-            echo -n "body_prefix="
-            head -c 500 "$RUNNER_TEMP/feed.xml" | tr '\n\r' '  ' || true
-            echo
             exit 1
           fi
-          echo "feed_bytes=$(wc -c < "$RUNNER_TEMP/feed.xml" | tr -d ' ')"
 
-          export FEED_FILE="$RUNNER_TEMP/feed.xml"
-          python - <<'PY'
-          import html
-          import os
-          import re
-          import urllib.parse
-          import xml.etree.ElementTree as ET
-
-          path = os.environ["FEED_FILE"]
-          root = ET.parse(path).getroot()
-          channel = root.find("channel")
-          if channel is None:
-              raise SystemExit("RSS channel missing")
-
-          def text_of(parent, tag):
-              node = parent.find(tag)
-              return (node.text or "").strip() if node is not None and node.text else ""
-
-          ns = {
-              "content": "http://purl.org/rss/1.0/modules/content/",
-              "media": "http://search.yahoo.com/mrss/",
-              "dc": "http://purl.org/dc/elements/1.1/",
-          }
-
-          items = channel.findall("item")
-          print("=== FEED STRUCTURE ===")
-          print("feed_title=", text_of(channel, "title"))
-          print("feed_link=", text_of(channel, "link"))
-          print("feed_description=", text_of(channel, "description"))
-          print("item_count=", len(items))
-          if not items:
-              raise SystemExit("No RSS items")
-
-          for i, item in enumerate(items[:3], 1):
-              title = text_of(item, "title")
-              link = text_of(item, "link")
-              guid = text_of(item, "guid")
-              pub = text_of(item, "pubDate")
-              desc = text_of(item, "description")
-              author = text_of(item, "{http://purl.org/dc/elements/1.1/}creator")
-              encoded_node = item.find("content:encoded", ns)
-              encoded = (encoded_node.text or "") if encoded_node is not None else ""
-              enclosure = item.find("enclosure")
-              media_content = item.find("media:content", ns)
-              media_thumb = item.find("media:thumbnail", ns)
-
-              parsed = urllib.parse.urlparse(link)
-              parts = [p for p in parsed.path.split("/") if p]
-              slug = parts[-1] if len(parts) >= 2 and parts[-2] == "p" else ""
-
-              imgs = re.findall(r'<img\b[^>]*\bsrc=["\']([^"\']+)["\']', encoded, flags=re.I)
-              desc_plain = re.sub(r"<[^>]+>", " ", html.unescape(desc))
-              desc_plain = re.sub(r"\s+", " ", desc_plain).strip()
-
-              print(f"--- item {i} ---")
-              print("title=", title)
-              print("link=", link)
-              print("guid=", guid)
-              print("pubDate=", pub)
-              print("author=", author)
-              print("derived_slug=", slug)
-              print("description_text=", desc_plain[:500])
-              print("description_length=", len(desc_plain))
-              print("content_encoded_length=", len(encoded))
-              print("content_first_img=", imgs[0] if imgs else "")
-              if enclosure is not None:
-                  print("enclosure_url=", enclosure.attrib.get("url", ""))
-                  print("enclosure_type=", enclosure.attrib.get("type", ""))
-                  print("enclosure_length=", enclosure.attrib.get("length", ""))
-              else:
-                  print("enclosure_url=")
-              if media_content is not None:
-                  print("media_content_url=", media_content.attrib.get("url", ""))
-                  print("media_content_type=", media_content.attrib.get("type", ""))
-              else:
-                  print("media_content_url=")
-              print("media_thumbnail_url=", media_thumb.attrib.get("url", "") if media_thumb is not None else "")
-          PY
-
-      - name: Probe article metadata through Cloudflare Worker
+      - name: Probe article through Browser Run
         run: |
           set -euo pipefail
-          echo "=== WORKER POST FETCH ==="
-          curl --fail-with-body --location --silent --show-error \
+          code="$(curl --location --silent --show-error \
             --dump-header "$RUNNER_TEMP/post.headers" \
             --output "$RUNNER_TEMP/post.html" \
-            "$WORKER_BASE/post"
-          grep -Ei '^(HTTP/|content-type:|x-probe-upstream-status:|server:|cf-ray:)' "$RUNNER_TEMP/post.headers" || true
+            --write-out '%{http_code}' \
+            "$WORKER_BASE/post-browser" || true)"
+          echo "status=$code"
+          grep -Ei '^(HTTP/|content-type:|x-browser-ms-used:|x-uk-aq-probe-source:|server:|cf-ray:)' "$RUNNER_TEMP/post.headers" || true
+          echo "post_bytes=$(wc -c < "$RUNNER_TEMP/post.html" | tr -d ' ')"
+          echo -n "post_prefix="
+          head -c 800 "$RUNNER_TEMP/post.html" | tr '\n\r' '  ' || true
+          echo
+          if [ "$code" != "200" ]; then
+            exit 1
+          fi
 
           export POST_FILE="$RUNNER_TEMP/post.html"
           python - <<'PY'
@@ -188,18 +116,16 @@ jobs:
               return ""
 
           def canonical():
-              pats = [
+              for pat in [
                   r'<link\b[^>]*\brel=["\']canonical["\'][^>]*\bhref=["\']([^"\']+)["\']',
                   r'<link\b[^>]*\bhref=["\']([^"\']+)["\'][^>]*\brel=["\']canonical["\']',
-              ]
-              for pat in pats:
+              ]:
                   m = re.search(pat, doc, flags=re.I)
                   if m:
                       return html.unescape(m.group(1))
               return ""
 
           print("=== POST META ===")
-          print("bytes=", len(doc.encode("utf-8")))
           print("canonical=", canonical())
           for attr, key in [
               ("property", "og:title"),
