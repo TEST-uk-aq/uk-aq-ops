@@ -1,0 +1,100 @@
+name: Deploy UK AQ Blog Feed Worker (TEST)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "workers/uk_aq_blog_feed/**"
+      - ".github/workflows/uk_aq_blog_feed_worker_deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    env:
+      UK_AQ_BLOG_FEED_WORKER_NAME: ${{ vars.UK_AQ_BLOG_FEED_WORKER_NAME || 'uk-aq-blog-feed-test' }}
+      UK_AQ_BLOG_FEED_KV_ID: ${{ vars.UK_AQ_BLOG_FEED_KV_ID || '' }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate TEST deployment configuration
+        env:
+          UK_AQ_BLOG_WORKER_HTTP_SECRET: ${{ secrets.UK_AQ_BLOG_WORKER_HTTP_SECRET || '' }}
+        run: |
+          set -euo pipefail
+          if [ "${UK_AQ_BLOG_FEED_WORKER_NAME}" != "uk-aq-blog-feed-test" ]; then
+            echo "Refusing non-TEST Blog feed Worker name: ${UK_AQ_BLOG_FEED_WORKER_NAME}"
+            exit 1
+          fi
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "Missing secret CLOUDFLARE_ACCOUNT_ID."
+            exit 1
+          fi
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+            echo "Missing secret CLOUDFLARE_API_TOKEN."
+            exit 1
+          fi
+          if ! [[ "${UK_AQ_BLOG_FEED_KV_ID}" =~ ^[0-9a-fA-F]{32}$ ]]; then
+            echo "UK_AQ_BLOG_FEED_KV_ID must be a 32-character Cloudflare KV namespace ID."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_BLOG_WORKER_HTTP_SECRET}" ]; then
+            echo "Missing secret UK_AQ_BLOG_WORKER_HTTP_SECRET."
+            exit 1
+          fi
+
+      - name: Prepare Wrangler configuration
+        working-directory: workers/uk_aq_blog_feed
+        run: |
+          set -euo pipefail
+          cp wrangler.toml wrangler.deploy.toml
+          sed -i "s|__UK_AQ_BLOG_FEED_KV_ID__|${UK_AQ_BLOG_FEED_KV_ID}|g" wrangler.deploy.toml
+          if grep -q '__UK_AQ_BLOG_FEED_KV_ID__' wrangler.deploy.toml; then
+            echo "KV namespace placeholder was not replaced."
+            exit 1
+          fi
+
+      - name: Deploy Worker base version
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: workers/uk_aq_blog_feed
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_BLOG_FEED_WORKER_NAME }}
+
+      - name: Set Worker refresh secret
+        working-directory: workers/uk_aq_blog_feed
+        env:
+          UK_AQ_BLOG_WORKER_HTTP_SECRET: ${{ secrets.UK_AQ_BLOG_WORKER_HTTP_SECRET }}
+        run: |
+          set -euo pipefail
+          secrets_json="$(jq -n \
+            --arg UK_AQ_BLOG_WORKER_HTTP_SECRET "${UK_AQ_BLOG_WORKER_HTTP_SECRET}" \
+            '{UK_AQ_BLOG_WORKER_HTTP_SECRET: $UK_AQ_BLOG_WORKER_HTTP_SECRET}')"
+          for attempt in 1 2 3; do
+            if printf '%s' "${secrets_json}" | npx --yes wrangler@4 secret bulk \
+              --config wrangler.deploy.toml \
+              --name "${UK_AQ_BLOG_FEED_WORKER_NAME}"; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "Failed to apply Blog Worker secret after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      - name: Deploy Worker with secret binding
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: workers/uk_aq_blog_feed
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_BLOG_FEED_WORKER_NAME }}

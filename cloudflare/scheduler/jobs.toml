@@ -124,3 +124,16 @@ github_workflow_file = "uk_aq_media_gdelt.yml"
 github_ref = "main"
 dry_run = false
 notes = "GDELT Web NGrams Media discovery"
+
+[jobs.uk_aq_blog_refresh]
+enabled = false
+cron_expr = "20 6 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/TEST-uk-aq.github.io"
+github_workflow_file = "pages.yml"
+github_ref = "main"
+dry_run = false
+notes = "Refresh UK AQ Blog from Substack and deploy Pages"
+
+[jobs.uk_aq_blog_refresh.github_inputs]
+refresh_blog_feed = "true"
