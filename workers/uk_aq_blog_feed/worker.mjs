@@ -4,6 +4,7 @@ const KV_KEY = "substack:rss:v1";
 const AUTH_HEADER = "x-uk-aq-worker-http-secret";
 
 const LIMITS = Object.freeze({
+  browserRunEnvelopeBytes: 4_000_000,
   renderedBytes: 3_000_000,
   xmlNodes: 10_000,
   itemCount: 50,
@@ -93,7 +94,7 @@ async function refreshFeed(env) {
       throw new Error(`Browser Run returned HTTP ${response.status}`);
     }
 
-    const rendered = await readBoundedText(response, LIMITS.renderedBytes);
+    const rendered = await readBrowserRunRenderedContent(response);
     const rssSource = extractRssSource(rendered);
     const candidate = normaliseRss(rssSource);
     validateNormalisedFeed(candidate);
@@ -129,16 +130,61 @@ function isAuthorised(request, env) {
   return difference === 0;
 }
 
-async function readBoundedText(response, maximumBytes) {
+async function readBrowserRunRenderedContent(response) {
+  const contentType = String(response.headers.get("content-type") || "").trim();
+  if (contentType && !isJsonContentType(contentType)) {
+    throw new Error("Browser Run returned a non-JSON content type");
+  }
+
+  const envelopeText = await readBoundedText(
+    response,
+    LIMITS.browserRunEnvelopeBytes,
+    "Browser Run response",
+  );
+  let envelope;
+  try {
+    envelope = JSON.parse(envelopeText);
+  } catch {
+    throw new Error("Browser Run response body is not valid JSON");
+  }
+
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+    throw new Error("Browser Run response body is not a JSON object");
+  }
+  if (envelope.success !== true) {
+    throw new Error(
+      envelope.success === false
+        ? "Browser Run content action reported failure"
+        : "Browser Run response has an unexpected success value",
+    );
+  }
+  if (typeof envelope.result !== "string") {
+    throw new Error("Browser Run response result is missing or is not text");
+  }
+  if (!envelope.result.trim()) {
+    throw new Error("Browser Run response result is empty");
+  }
+  if (new TextEncoder().encode(envelope.result).byteLength > LIMITS.renderedBytes) {
+    throw new Error("Browser Run rendered result exceeds the feed-size limit");
+  }
+  return envelope.result;
+}
+
+function isJsonContentType(rawValue) {
+  const mediaType = rawValue.split(";", 1)[0].trim().toLowerCase();
+  return mediaType === "application/json" || mediaType.endsWith("+json");
+}
+
+async function readBoundedText(response, maximumBytes, label) {
   const contentLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
-    throw new Error("Browser Run response exceeds the feed-size limit");
+    throw new Error(`${label} exceeds the feed-size limit`);
   }
 
   if (!response.body || typeof response.body.getReader !== "function") {
     const text = await response.text();
     if (new TextEncoder().encode(text).byteLength > maximumBytes) {
-      throw new Error("Browser Run response exceeds the feed-size limit");
+      throw new Error(`${label} exceeds the feed-size limit`);
     }
     return text;
   }
@@ -152,7 +198,7 @@ async function readBoundedText(response, maximumBytes) {
     byteLength += value.byteLength;
     if (byteLength > maximumBytes) {
       await reader.cancel("feed-size limit exceeded");
-      throw new Error("Browser Run response exceeds the feed-size limit");
+      throw new Error(`${label} exceeds the feed-size limit`);
     }
     chunks.push(value);
   }
@@ -195,9 +241,9 @@ function normaliseRss(rssSource) {
   const channel = childElements(root, "channel")[0];
   if (!channel) throw new Error("RSS channel is missing");
 
-  const channelTitle = normalisePlainText(childText(channel, "title"), LIMITS.titleLength, "channel title");
+  normalisePlainText(childText(channel, "title"), LIMITS.titleLength, "channel title");
   const channelLink = childText(channel, "link").trim();
-  validatePublicationIdentity(channelTitle, channelLink);
+  validatePublicationIdentity(channelLink);
 
   const items = childElements(channel, "item");
   if (!items.length) throw new Error("RSS channel contains no posts");
@@ -267,7 +313,7 @@ function normaliseItem(item) {
   };
 }
 
-function validatePublicationIdentity(title, rawUrl) {
+function validatePublicationIdentity(rawUrl) {
   const publication = new URL(boundedRequiredText(rawUrl, LIMITS.urlLength, "publication URL"));
   if (
     publication.protocol !== "https:"
@@ -280,10 +326,6 @@ function validatePublicationIdentity(title, rawUrl) {
     || publication.hash
   ) {
     throw new Error("RSS channel is not the canonical UK AQ publication");
-  }
-  const normalisedTitle = title.toLowerCase();
-  if (!normalisedTitle.includes("uk") || !normalisedTitle.includes("air quality")) {
-    throw new Error("RSS channel title does not identify UK Air Quality");
   }
 }
 
