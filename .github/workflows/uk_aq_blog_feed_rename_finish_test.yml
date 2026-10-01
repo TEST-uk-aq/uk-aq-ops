@@ -1,0 +1,123 @@
+name: Finish UK AQ Blog Feed Rename (TEST)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/uk_aq_blog_feed_rename_finish_test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  finish-rename:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
+      GH_ADMIN_TOKEN: ${{ secrets.UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT || '' }}
+      KV_ID: ${{ vars.UK_AQ_BLOG_FEED_KV_ID || '' }}
+      NEW_WORKER_NAME: uk-aq-blog-feed
+      OLD_WORKER_NAME: uk-aq-blog-feed-test
+      NEW_KV_TITLE: uk-aq-blog-feed
+      NEW_FEED_URL: https://uk-aq-blog-feed.cic-test.workers.dev/feed
+      WEBSITE_REPO: TEST-uk-aq/TEST-uk-aq.github.io
+
+    steps:
+      - name: Validate existing configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$GH_ADMIN_TOKEN"
+          if ! [[ "$KV_ID" =~ ^[0-9a-fA-F]{32}$ ]]; then
+            echo "Invalid or missing UK_AQ_BLOG_FEED_KV_ID."
+            exit 1
+          fi
+
+      - name: Rename TEST Blog KV namespace in place
+        shell: bash
+        run: |
+          set -euo pipefail
+          API="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_ID"
+          jq -n --arg title "$NEW_KV_TITLE" '{title:$title}' > "$RUNNER_TEMP/kv-rename.json"
+          curl --fail-with-body --silent --show-error -X PUT             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"             -H "Content-Type: application/json"             --data-binary @"$RUNNER_TEMP/kv-rename.json"             "$API" > "$RUNNER_TEMP/kv-rename-result.json"
+          jq -e '.success == true' "$RUNNER_TEMP/kv-rename-result.json" >/dev/null
+          echo "Renamed KV namespace title to $NEW_KV_TITLE without changing the namespace ID."
+
+      - name: Verify new Worker is live before switching website
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error             --connect-timeout 15             --max-time 30             "https://$NEW_WORKER_NAME.cic-test.workers.dev/health"             > "$RUNNER_TEMP/new-worker-health.json"
+          jq -e '.ok == true and .cached_feed == true' "$RUNNER_TEMP/new-worker-health.json" >/dev/null
+          echo "New generic-named Worker is live and sees the existing cached feed."
+
+      - name: Point TEST website at generic Worker
+        shell: bash
+        env:
+          GH_TOKEN: ${{ env.GH_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh variable set UK_AQ_BLOG_FEED_URL --repo "$WEBSITE_REPO" --body "$NEW_FEED_URL"
+          ACTUAL="$(gh variable get UK_AQ_BLOG_FEED_URL --repo "$WEBSITE_REPO")"
+          test "$ACTUAL" = "$NEW_FEED_URL"
+          echo "TEST website Blog feed URL updated to $NEW_FEED_URL."
+
+      - name: Dispatch and wait for real TEST Blog refresh
+        shell: bash
+        env:
+          GH_TOKEN: ${{ env.GH_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          STARTED_AT="$(date -u +%s)"
+          gh workflow run pages.yml --repo "$WEBSITE_REPO" -f refresh_blog_feed=true
+
+          RUN_ID=""
+          for attempt in $(seq 1 30); do
+            RUN_ID="$(gh run list               --repo "$WEBSITE_REPO"               --workflow pages.yml               --event workflow_dispatch               --limit 10               --json databaseId,createdAt               --jq ".[] | select((.createdAt | fromdateiso8601) >= $STARTED_AT) | .databaseId"               | head -n 1)"
+            if [ -n "$RUN_ID" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not resolve dispatched Pages workflow run."
+            exit 1
+          fi
+
+          echo "Waiting for TEST Pages run $RUN_ID."
+          gh run watch "$RUN_ID" --repo "$WEBSITE_REPO" --exit-status
+          echo "TEST Blog refresh/build/deploy completed successfully."
+
+      - name: Verify refreshed feed through new Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error             --connect-timeout 15             --max-time 30             "$NEW_FEED_URL" > "$RUNNER_TEMP/feed.json"
+          jq -e '.contract_version and (.posts | type == "array") and (.posts | length > 0)' "$RUNNER_TEMP/feed.json" >/dev/null
+          echo "New Worker /feed is serving a valid non-empty normalised feed."
+
+      - name: Delete obsolete TEST Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          API="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$OLD_WORKER_NAME"
+          HTTP_CODE="$(curl --silent --show-error             -o "$RUNNER_TEMP/delete-old-worker.json"             -w '%{http_code}'             -X DELETE             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"             "$API")"
+
+          if [ "$HTTP_CODE" = "404" ]; then
+            echo "Obsolete Worker was already absent."
+            exit 0
+          fi
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            cat "$RUNNER_TEMP/delete-old-worker.json"
+            echo "Failed to delete obsolete Worker: HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          jq -e '.success == true' "$RUNNER_TEMP/delete-old-worker.json" >/dev/null
+          echo "Deleted obsolete TEST Worker $OLD_WORKER_NAME."
