@@ -60,14 +60,25 @@ jobs:
       - name: Inspect rendered RSS structure through Browser Run
         run: |
           set -euo pipefail
-          code="$(curl --location --silent --show-error \
-            --dump-header "$RUNNER_TEMP/feed.headers" \
-            --output "$RUNNER_TEMP/feed-response.json" \
-            --write-out '%{http_code}' \
-            "$WORKER_BASE/feed-browser" || true)"
-          echo "status=$code"
-          grep -Ei '^(HTTP/|content-type:|x-browser-ms-used:|x-uk-aq-probe-source:)' "$RUNNER_TEMP/feed.headers" || true
-          test "$code" = "200"
+          success=0
+          for attempt in 1 2 3; do
+            code="$(curl --location --silent --show-error \
+              --dump-header "$RUNNER_TEMP/feed.headers" \
+              --output "$RUNNER_TEMP/feed-response.json" \
+              --write-out '%{http_code}' \
+              "$WORKER_BASE/feed-browser" || true)"
+            echo "Browser Run attempt $attempt status=$code"
+            grep -Ei '^(HTTP/|content-type:|x-browser-ms-used:|x-uk-aq-probe-source:)' "$RUNNER_TEMP/feed.headers" || true
+            if [ "$code" = "200" ]; then
+              success=1
+              break
+            fi
+            echo -n "response="
+            head -c 1000 "$RUNNER_TEMP/feed-response.json" | tr '\n\r' '  ' || true
+            echo
+            sleep 15
+          done
+          test "$success" = "1"
 
           export FEED_RESPONSE="$RUNNER_TEMP/feed-response.json"
           python - <<'PY'
