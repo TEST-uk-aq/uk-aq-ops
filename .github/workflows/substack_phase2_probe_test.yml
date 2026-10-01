@@ -1,0 +1,199 @@
+name: Substack Phase 2 Cloudflare Probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/substack_phase2_probe_test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID || '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN || '' }}
+      WORKER_NAME: uk-aq-substack-probe-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Cloudflare credentials
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$CLOUDFLARE_API_TOKEN"
+
+      - name: Deploy temporary probe Worker
+        working-directory: workers/substack_phase2_probe_test
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4 deploy --name "$WORKER_NAME"
+
+      - name: Resolve workers.dev hostname
+        run: |
+          set -euo pipefail
+          SUBDOMAIN="$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" \
+            | jq -r '.result.subdomain')"
+          test -n "$SUBDOMAIN"
+          test "$SUBDOMAIN" != "null"
+          printf 'WORKER_BASE=https://%s.%s.workers.dev\n' "$WORKER_NAME" "$SUBDOMAIN" >> "$GITHUB_ENV"
+          echo "worker_base=https://$WORKER_NAME.$SUBDOMAIN.workers.dev"
+
+      - name: Probe feed through Cloudflare Worker
+        run: |
+          set -euo pipefail
+          echo "=== WORKER FEED FETCH ==="
+          curl --fail-with-body --location --silent --show-error \
+            --dump-header "$RUNNER_TEMP/feed.headers" \
+            --output "$RUNNER_TEMP/feed.xml" \
+            "$WORKER_BASE/feed"
+          grep -Ei '^(HTTP/|content-type:|x-probe-upstream-status:|server:|cf-ray:)' "$RUNNER_TEMP/feed.headers" || true
+          echo "feed_bytes=$(wc -c < "$RUNNER_TEMP/feed.xml" | tr -d ' ')"
+
+          export FEED_FILE="$RUNNER_TEMP/feed.xml"
+          python - <<'PY'
+          import html
+          import os
+          import re
+          import urllib.parse
+          import xml.etree.ElementTree as ET
+
+          path = os.environ["FEED_FILE"]
+          root = ET.parse(path).getroot()
+          channel = root.find("channel")
+          if channel is None:
+              raise SystemExit("RSS channel missing")
+
+          def text_of(parent, tag):
+              node = parent.find(tag)
+              return (node.text or "").strip() if node is not None and node.text else ""
+
+          ns = {
+              "content": "http://purl.org/rss/1.0/modules/content/",
+              "media": "http://search.yahoo.com/mrss/",
+              "dc": "http://purl.org/dc/elements/1.1/",
+          }
+
+          items = channel.findall("item")
+          print("=== FEED STRUCTURE ===")
+          print("feed_title=", text_of(channel, "title"))
+          print("feed_link=", text_of(channel, "link"))
+          print("feed_description=", text_of(channel, "description"))
+          print("item_count=", len(items))
+          if not items:
+              raise SystemExit("No RSS items")
+
+          for i, item in enumerate(items[:3], 1):
+              title = text_of(item, "title")
+              link = text_of(item, "link")
+              guid = text_of(item, "guid")
+              pub = text_of(item, "pubDate")
+              desc = text_of(item, "description")
+              author = text_of(item, "{http://purl.org/dc/elements/1.1/}creator")
+              encoded_node = item.find("content:encoded", ns)
+              encoded = (encoded_node.text or "") if encoded_node is not None else ""
+              enclosure = item.find("enclosure")
+              media_content = item.find("media:content", ns)
+              media_thumb = item.find("media:thumbnail", ns)
+
+              parsed = urllib.parse.urlparse(link)
+              parts = [p for p in parsed.path.split("/") if p]
+              slug = parts[-1] if len(parts) >= 2 and parts[-2] == "p" else ""
+
+              imgs = re.findall(r'<img\b[^>]*\bsrc=["\']([^"\']+)["\']', encoded, flags=re.I)
+              desc_plain = re.sub(r"<[^>]+>", " ", html.unescape(desc))
+              desc_plain = re.sub(r"\s+", " ", desc_plain).strip()
+
+              print(f"--- item {i} ---")
+              print("title=", title)
+              print("link=", link)
+              print("guid=", guid)
+              print("pubDate=", pub)
+              print("author=", author)
+              print("derived_slug=", slug)
+              print("description_text=", desc_plain[:500])
+              print("description_length=", len(desc_plain))
+              print("content_encoded_length=", len(encoded))
+              print("content_first_img=", imgs[0] if imgs else "")
+              if enclosure is not None:
+                  print("enclosure_url=", enclosure.attrib.get("url", ""))
+                  print("enclosure_type=", enclosure.attrib.get("type", ""))
+                  print("enclosure_length=", enclosure.attrib.get("length", ""))
+              else:
+                  print("enclosure_url=")
+              if media_content is not None:
+                  print("media_content_url=", media_content.attrib.get("url", ""))
+                  print("media_content_type=", media_content.attrib.get("type", ""))
+              else:
+                  print("media_content_url=")
+              print("media_thumbnail_url=", media_thumb.attrib.get("url", "") if media_thumb is not None else "")
+          PY
+
+      - name: Probe article metadata through Cloudflare Worker
+        run: |
+          set -euo pipefail
+          echo "=== WORKER POST FETCH ==="
+          curl --fail-with-body --location --silent --show-error \
+            --dump-header "$RUNNER_TEMP/post.headers" \
+            --output "$RUNNER_TEMP/post.html" \
+            "$WORKER_BASE/post"
+          grep -Ei '^(HTTP/|content-type:|x-probe-upstream-status:|server:|cf-ray:)' "$RUNNER_TEMP/post.headers" || true
+
+          export POST_FILE="$RUNNER_TEMP/post.html"
+          python - <<'PY'
+          import html
+          import os
+          import re
+
+          doc = open(os.environ["POST_FILE"], encoding="utf-8", errors="replace").read()
+
+          def meta(attr, key):
+              pats = [
+                  rf'<meta\b[^>]*\b{attr}=["\']{re.escape(key)}["\'][^>]*\bcontent=["\']([^"\']*)["\'][^>]*>',
+                  rf'<meta\b[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\b{attr}=["\']{re.escape(key)}["\'][^>]*>',
+              ]
+              for pat in pats:
+                  m = re.search(pat, doc, flags=re.I)
+                  if m:
+                      return html.unescape(m.group(1))
+              return ""
+
+          def canonical():
+              pats = [
+                  r'<link\b[^>]*\brel=["\']canonical["\'][^>]*\bhref=["\']([^"\']+)["\']',
+                  r'<link\b[^>]*\bhref=["\']([^"\']+)["\'][^>]*\brel=["\']canonical["\']',
+              ]
+              for pat in pats:
+                  m = re.search(pat, doc, flags=re.I)
+                  if m:
+                      return html.unescape(m.group(1))
+              return ""
+
+          print("=== POST META ===")
+          print("bytes=", len(doc.encode("utf-8")))
+          print("canonical=", canonical())
+          for attr, key in [
+              ("property", "og:title"),
+              ("property", "og:description"),
+              ("property", "og:image"),
+              ("property", "og:image:width"),
+              ("property", "og:image:height"),
+              ("name", "twitter:card"),
+              ("name", "twitter:title"),
+              ("name", "twitter:description"),
+              ("name", "twitter:image"),
+          ]:
+              print(f"{key}=", meta(attr, key))
+          PY
+
+      - name: Delete temporary probe Worker
+        if: always()
+        working-directory: workers/substack_phase2_probe_test
+        run: |
+          npx --yes wrangler@4 delete --name "$WORKER_NAME" --force || true
