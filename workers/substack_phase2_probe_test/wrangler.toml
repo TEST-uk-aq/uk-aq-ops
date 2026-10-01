@@ -1,0 +1,4 @@
+name = "uk-aq-substack-probe-test"
+main = "src/index.js"
+compatibility_date = "2026-09-30"
+workers_dev = true
