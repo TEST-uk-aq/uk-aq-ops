@@ -43,7 +43,6 @@ jobs:
           test -n "$SUBDOMAIN"
           test "$SUBDOMAIN" != "null"
           printf 'WORKER_BASE=https://%s.%s.workers.dev\n' "$WORKER_NAME" "$SUBDOMAIN" >> "$GITHUB_ENV"
-          echo "worker_base=https://$WORKER_NAME.$SUBDOMAIN.workers.dev"
 
       - name: Wait for temporary Worker availability
         run: |
@@ -52,93 +51,60 @@ jobs:
             code="$(curl --silent --show-error --output "$RUNNER_TEMP/health.body" --write-out '%{http_code}' "$WORKER_BASE/health" || true)"
             echo "health attempt $attempt status=$code"
             if [ "$code" = "200" ]; then
-              cat "$RUNNER_TEMP/health.body"
               exit 0
             fi
             sleep 5
           done
-          echo "Temporary Worker never became available"
           exit 1
 
-      - name: Probe feed through Browser Run
+      - name: Inspect rendered RSS structure through Browser Run
         run: |
           set -euo pipefail
           code="$(curl --location --silent --show-error \
             --dump-header "$RUNNER_TEMP/feed.headers" \
-            --output "$RUNNER_TEMP/feed.html" \
+            --output "$RUNNER_TEMP/feed-response.json" \
             --write-out '%{http_code}' \
             "$WORKER_BASE/feed-browser" || true)"
           echo "status=$code"
-          grep -Ei '^(HTTP/|content-type:|x-browser-ms-used:|x-uk-aq-probe-source:|server:|cf-ray:)' "$RUNNER_TEMP/feed.headers" || true
-          echo "feed_bytes=$(wc -c < "$RUNNER_TEMP/feed.html" | tr -d ' ')"
-          echo -n "feed_prefix="
-          head -c 800 "$RUNNER_TEMP/feed.html" | tr '\n\r' '  ' || true
-          echo
-          if [ "$code" != "200" ]; then
-            exit 1
-          fi
+          grep -Ei '^(HTTP/|content-type:|x-browser-ms-used:|x-uk-aq-probe-source:)' "$RUNNER_TEMP/feed.headers" || true
+          test "$code" = "200"
 
-      - name: Probe article through Browser Run
-        run: |
-          set -euo pipefail
-          code="$(curl --location --silent --show-error \
-            --dump-header "$RUNNER_TEMP/post.headers" \
-            --output "$RUNNER_TEMP/post.html" \
-            --write-out '%{http_code}' \
-            "$WORKER_BASE/post-browser" || true)"
-          echo "status=$code"
-          grep -Ei '^(HTTP/|content-type:|x-browser-ms-used:|x-uk-aq-probe-source:|server:|cf-ray:)' "$RUNNER_TEMP/post.headers" || true
-          echo "post_bytes=$(wc -c < "$RUNNER_TEMP/post.html" | tr -d ' ')"
-          echo -n "post_prefix="
-          head -c 800 "$RUNNER_TEMP/post.html" | tr '\n\r' '  ' || true
-          echo
-          if [ "$code" != "200" ]; then
-            exit 1
-          fi
-
-          export POST_FILE="$RUNNER_TEMP/post.html"
+          export FEED_RESPONSE="$RUNNER_TEMP/feed-response.json"
           python - <<'PY'
           import html
+          import json
           import os
           import re
 
-          doc = open(os.environ["POST_FILE"], encoding="utf-8", errors="replace").read()
+          obj = json.load(open(os.environ["FEED_RESPONSE"], encoding="utf-8"))
+          rendered = obj.get("result", "")
+          print("browser_success=", obj.get("success"))
+          print("rendered_length=", len(rendered))
+          print("contains_xml_source=", "webkit-xml-viewer-source-xml" in rendered)
+          print("contains_first_title=", "Introducing UK AQ" in rendered)
 
-          def meta(attr, key):
-              pats = [
-                  rf'<meta\b[^>]*\b{attr}=["\']{re.escape(key)}["\'][^>]*\bcontent=["\']([^"\']*)["\'][^>]*>',
-                  rf'<meta\b[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\b{attr}=["\']{re.escape(key)}["\'][^>]*>',
-              ]
-              for pat in pats:
-                  m = re.search(pat, doc, flags=re.I)
-                  if m:
-                      return html.unescape(m.group(1))
-              return ""
+          for needle in ["webkit-xml-viewer-source-xml", "Introducing UK AQ"]:
+              idx = rendered.find(needle)
+              print(f"=== AROUND {needle} ===")
+              if idx < 0:
+                  print("not found")
+              else:
+                  start = max(0, idx - 1200)
+                  end = min(len(rendered), idx + 5000)
+                  print(rendered[start:end])
 
-          def canonical():
-              for pat in [
-                  r'<link\b[^>]*\brel=["\']canonical["\'][^>]*\bhref=["\']([^"\']+)["\']',
-                  r'<link\b[^>]*\bhref=["\']([^"\']+)["\'][^>]*\brel=["\']canonical["\']',
-              ]:
-                  m = re.search(pat, doc, flags=re.I)
-                  if m:
-                      return html.unescape(m.group(1))
-              return ""
-
-          print("=== POST META ===")
-          print("canonical=", canonical())
-          for attr, key in [
-              ("property", "og:title"),
-              ("property", "og:description"),
-              ("property", "og:image"),
-              ("property", "og:image:width"),
-              ("property", "og:image:height"),
-              ("name", "twitter:card"),
-              ("name", "twitter:title"),
-              ("name", "twitter:description"),
-              ("name", "twitter:image"),
-          ]:
-              print(f"{key}=", meta(attr, key))
+          # Also print candidate href/src URLs near the first post without the full article body.
+          idx = rendered.find("Introducing UK AQ")
+          if idx >= 0:
+              chunk = rendered[max(0, idx - 5000):min(len(rendered), idx + 15000)]
+              urls = []
+              for value in re.findall(r'https?://[^\s"\'<>]+', html.unescape(chunk)):
+                  value = value.rstrip(".,);")
+                  if value not in urls:
+                      urls.append(value)
+              print("=== CANDIDATE URLS NEAR FIRST ITEM ===")
+              for value in urls[:30]:
+                  print(value)
           PY
 
       - name: Delete temporary probe Worker
