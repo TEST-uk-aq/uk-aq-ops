@@ -1,4 +1,4 @@
-name: Deploy UK AQ Blog Feed Worker (TEST)
+name: Deploy UK AQ Blog Feed Worker
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
   deploy-worker:
     runs-on: ubuntu-latest
     env:
-      UK_AQ_BLOG_FEED_WORKER_NAME: ${{ vars.UK_AQ_BLOG_FEED_WORKER_NAME || 'uk-aq-blog-feed-test' }}
+      UK_AQ_BLOG_FEED_WORKER_NAME: ${{ vars.UK_AQ_BLOG_FEED_WORKER_NAME || 'uk-aq-blog-feed' }}
       UK_AQ_BLOG_FEED_KV_ID: ${{ vars.UK_AQ_BLOG_FEED_KV_ID || '' }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
@@ -24,13 +24,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate TEST deployment configuration
+      - name: Validate deployment configuration
         env:
           UK_AQ_BLOG_WORKER_HTTP_SECRET: ${{ secrets.UK_AQ_BLOG_WORKER_HTTP_SECRET || '' }}
         run: |
           set -euo pipefail
-          if [ "${UK_AQ_BLOG_FEED_WORKER_NAME}" != "uk-aq-blog-feed-test" ]; then
-            echo "Refusing non-TEST Blog feed Worker name: ${UK_AQ_BLOG_FEED_WORKER_NAME}"
+          if [ "${UK_AQ_BLOG_FEED_WORKER_NAME}" != "uk-aq-blog-feed" ]; then
+            echo "Refusing unexpected Blog feed Worker name: ${UK_AQ_BLOG_FEED_WORKER_NAME}"
             exit 1
           fi
           if [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then

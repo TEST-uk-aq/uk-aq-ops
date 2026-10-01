@@ -1,4 +1,4 @@
-name = "uk-aq-blog-feed-test"
+name = "uk-aq-blog-feed"
 main = "worker.mjs"
 compatibility_date = "2026-10-01"
 workers_dev = true
