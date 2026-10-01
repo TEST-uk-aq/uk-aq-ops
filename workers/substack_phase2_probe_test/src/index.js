@@ -1,6 +1,10 @@
 export default {
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/health") {
+      return new Response("ok\n", { status: 200, headers: { "cache-control": "no-store" } });
+    }
+
     let target;
     if (url.pathname === "/feed") {
       target = "https://ukairquality.substack.com/feed";
