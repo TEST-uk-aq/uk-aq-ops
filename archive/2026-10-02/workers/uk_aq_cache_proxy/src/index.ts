@@ -237,12 +237,7 @@ const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> =
 };
 
 const API_PREFIX = "/api/aq/";
-const SESSION_FREE_PUBLIC_READ_PATHS = new Set([
-  "/api/aq/networks",
-  "/api/aq/latest-snapshot",
-  "/api/aq/pcon-hex",
-  "/api/aq/la-hex",
-]);
+const PUBLIC_NETWORKS_PATH = "/api/aq/networks";
 const SESSION_START_PATH = "/api/aq/session/start";
 const SESSION_END_PATH = "/api/aq/session/end";
 const CHART_METRICS_PATH = "/api/aq/chart-metrics";
@@ -2764,11 +2759,8 @@ function isSessionRoute(pathname: string): boolean {
   return pathname === SESSION_START_PATH || pathname === SESSION_END_PATH;
 }
 
-function isSessionFreePublicReadRoute(method: string, pathname: string): boolean {
-  if (method !== "GET" && method !== "HEAD") {
-    return false;
-  }
-  return SESSION_FREE_PUBLIC_READ_PATHS.has(pathname.replace(/\/+$/, ""));
+function isPublicMetadataRoute(pathname: string): boolean {
+  return pathname.replace(/\/+$/, "") === PUBLIC_NETWORKS_PATH;
 }
 
 function requiresApiCORS(pathname: string): boolean {
@@ -2921,7 +2913,7 @@ export default {
       if (!isOriginAllowed(requestOrigin, allowedOrigins)) {
         return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
       }
-      if (!isSessionFreePublicReadRoute(request.method, url.pathname)) {
+      if (!isPublicMetadataRoute(url.pathname)) {
         const sessionToken = getCookieValue(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
         if (!sessionToken) {
           return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
