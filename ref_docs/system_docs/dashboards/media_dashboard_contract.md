@@ -149,9 +149,14 @@ The detail view SHOULD expose, where applicable:
 - publication, author and relevant timestamps;
 - status and permitted transitions;
 - current preview image and image-policy information;
+- controlled article image-policy editing where authorised by the Media local-image contract;
 - approval provenance, including trusted-source or trusted-author auto-approval where applicable;
 - discovery provenance/evidence where useful;
 - **Reload metadata** controls and preview/apply behaviour under the existing Media metadata/image contracts.
+
+Within article detail, **Article Status** MUST be the first editable section immediately after the article-information summary. **Image policy** MUST appear near the bottom, after **Display title** and before **Reload metadata**. Any retained-local-image controls MAY remain adjacent to the Image policy section.
+
+The article Image policy control MUST keep the policy selector and explicit local-copy confirmation checkbox, but MUST NOT show a separate article-level permission/basis note field. When the source is not `local_copy_permitted`, the article `local_copy_permitted` choice MUST remain unavailable/disabled; a separate red warning pill stating the same source-policy restriction is not required.
 
 Reloading metadata MUST NOT silently replace a different non-null image or alter editorial status. Existing source-specific contracts continue to govern metadata/image permissions.
 
@@ -312,6 +317,24 @@ Sources that require special sitemaps, overlapping feeds, author-profile routes 
 Once source/rule editing is exposed through the dashboard, authoritative runtime state is the corresponding Media D1/configuration state reached through `media-admin`.
 
 Repository seed/configuration files are bootstrap/deployment defaults and implementation references. Normal deployment MUST NOT overwrite later operator-managed D1 source/rule choices merely because a seed file still contains an older default. A deliberate migration MAY change existing rows only through an explicit, narrowly guarded migration/operation that preserves operator choices unless the migration is intentionally authorised to replace them.
+
+### 6.6 Image policy administration
+
+The Sources page MUST provide the normal operator path for source `image_policy` changes. Direct D1 SQL is not the normal workflow once this control is deployed.
+
+The control MUST:
+
+- show the current policy and the choices `blocked`, `remote_preview` and `local_copy_permitted`;
+- treat `local_copy_permitted` as a broad source-policy decision rather than an ordinary cosmetic setting;
+- require explicit confirmation and a bounded permission/basis note before granting `local_copy_permitted`;
+- clearly state that existing article rows are not bulk-updated, while future new article rows currently inherit source image policy;
+- warn before revoking `local_copy_permitted` that retained copies immediately become ineligible even though R2 cleanup is separate;
+- apply the mutation only through authenticated `media-admin`;
+- preserve append-only configuration-event provenance.
+
+Article detail MUST separately provide the article-level policy control defined by `media/media-local-image-copy-contract.md`. The article control MUST NOT offer/grant `local_copy_permitted` unless the current source is already `local_copy_permitted`, and it MUST preserve article revision/idempotency semantics plus append-only article-event provenance. The article-level control requires explicit confirmation but does not require its own free-text permission/basis note because the detailed basis is already recorded at source level.
+
+The dashboard SHOULD surface the latest recorded local-copy permission/basis note on the Sources page. Article detail MAY rely on that source-wide evidence without repeating the note.
 
 ## 7. Performance/query contract
 

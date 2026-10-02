@@ -1026,9 +1026,7 @@
     const sourceAllowsLocalCopy = article.source_image_policy === "local_copy_permitted";
     const retainedWarning = article.image_policy === "local_copy_permitted"
       ? `<div class="media-message">Changing away from local_copy_permitted makes any retained image immediately ineligible for delivery and Bluesky. The R2 object is not automatically deleted.</div>` : "";
-    const sourceWarning = sourceAllowsLocalCopy ? ""
-      : `<div class="media-message media-message--error">Article local_copy_permitted cannot be granted until source-wide local-copy permission is established on the Sources page.</div>`;
-    return `<section><h4>Image policy</h4><p>Article: <strong>${esc(article.image_policy)}</strong> · Source: <strong>${esc(article.source_image_policy)}</strong></p>${localCopyEvidenceHtml(article.local_copy_permission_evidence)}${sourceWarning}${retainedWarning}<form class="media-inline-form" data-article-image-policy><label class="media-field"><span>Article image policy</span><select name="image_policy"><option value="blocked"${article.image_policy === "blocked" ? " selected" : ""}>blocked</option><option value="remote_preview"${article.image_policy === "remote_preview" ? " selected" : ""}>remote_preview</option><option value="local_copy_permitted"${article.image_policy === "local_copy_permitted" ? " selected" : ""}${sourceAllowsLocalCopy ? "" : " disabled"}>local_copy_permitted</option></select></label><label class="media-field media-field--grow"><span>Permission/basis note</span><textarea name="permission_basis" maxlength="1000" placeholder="Required when granting or refreshing local-copy permission"></textarea></label><label class="media-toggle"><input name="confirm_local_copy_permitted" type="checkbox"> <span>I explicitly confirm that the recorded permission, licence or other right permits this article’s image to be retained locally.</span></label><button type="submit" class="media-button media-button--primary">Save image policy</button></form><p class="media-subtext">A retained image can be uploaded only after both source and article policies are local_copy_permitted.</p><div data-article-image-policy-message></div></section>`;
+    return `<section><h4>Image policy</h4><p>Article: <strong>${esc(article.image_policy)}</strong> · Source: <strong>${esc(article.source_image_policy)}</strong></p>${retainedWarning}<form class="media-inline-form" data-article-image-policy><label class="media-field"><span>Article image policy</span><select name="image_policy"><option value="blocked"${article.image_policy === "blocked" ? " selected" : ""}>blocked</option><option value="remote_preview"${article.image_policy === "remote_preview" ? " selected" : ""}>remote_preview</option><option value="local_copy_permitted"${article.image_policy === "local_copy_permitted" ? " selected" : ""}${sourceAllowsLocalCopy ? "" : " disabled"}>local_copy_permitted</option></select></label><label class="media-toggle"><input name="confirm_local_copy_permitted" type="checkbox"> <span>I explicitly confirm that the recorded permission, licence or other right permits this article’s image to be retained locally.</span></label><button type="submit" class="media-button media-button--primary">Save image policy</button></form><p class="media-subtext">A retained image can be uploaded only after both source and article policies are local_copy_permitted.</p><div data-article-image-policy-message></div></section>`;
   }
 
   async function openArticle(id, notice = "", selectedStatus = "") {
@@ -1051,8 +1049,6 @@
       dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
         <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></div>
         <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
-        ${articleImagePolicyHtml(article)}
-        ${localImageControls}
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
         ${directPublishHtml(data, article)}
         ${blueskyHistoryHtml(data, article)}
@@ -1060,6 +1056,8 @@
         <section><h4>Author</h4><form class="media-inline-form" data-detail-author><label class="media-field media-field--grow"><span>Author</span><input name="author" maxlength="500" value="${esc(article.author || "")}" autocomplete="off"></label><button class="media-button media-button--primary">Save Author</button></form><p class="media-subtext">Single line, maximum 500 characters. Saving a blank value clears the authoritative Author.</p><div data-detail-author-message></div></section>
         <section><h4>Publication date</h4><form class="media-inline-form" data-detail-publication-date><label class="media-field media-field--grow"><span>Publication date</span><input name="publication_date" type="date" value="${esc(publicationInputs.date)}"></label><label class="media-field media-field--grow"><span>Publication time (UTC, optional)</span><input name="publication_time" type="time" value="${esc(publicationInputs.time)}"></label><button class="media-button media-button--primary" data-save-publication-date>Save publication date</button>${article.published_at ? `<button type="button" class="media-button" data-clear-publication-date>Clear publication date</button>` : ""}</form><div data-detail-publication-date-message></div></section>
         <section><h4>Display title</h4><p>${esc(aiSuggestionLabel(article))}${article.ai_title_generated_at ? ` · ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}` : ""}</p><p>${esc(article.ai_title_suggestion || "—")}</p><div class="media-actions"><button type="button" class="media-button" data-detail-generate-ai>${article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title"}</button>${detailAiActions}</div><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
+        ${articleImagePolicyHtml(article)}
+        ${localImageControls}
         <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
         <section><details><summary>Discovery evidence and recent events (raw ISO UTC)</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
       dialog.querySelector("[data-close-detail]")?.addEventListener("click", () => dialog.close());
@@ -1113,11 +1111,7 @@
     const output = dialog.querySelector("[data-article-image-policy-message]");
     const values = new FormData(form);
     const imagePolicy = String(values.get("image_policy") || "");
-    const permissionBasis = String(values.get("permission_basis") || "").trim();
     const confirmed = values.get("confirm_local_copy_permitted") === "on";
-    if (imagePolicy === "local_copy_permitted" && !permissionBasis) {
-      output.innerHTML = message("Enter the permission, licence or other basis for retaining this image locally.", "error"); return;
-    }
     if (imagePolicy === "local_copy_permitted" && !confirmed) {
       output.innerHTML = message("Explicitly confirm the local-copy permission decision before saving.", "error"); return;
     }
@@ -1127,14 +1121,13 @@
     button.disabled = true;
     const body = { image_policy: imagePolicy,
       confirm_local_copy_permitted: imagePolicy === "local_copy_permitted" && confirmed };
-    if (permissionBasis) body.permission_basis = permissionBasis;
     try {
       await request(`articles/${id}/image-policy`, { method: "PUT", idempotent: "image_policy",
         revision: article.revision, body });
       await renderArticles(false);
       await openArticle(id, imagePolicy === article.image_policy
         ? imagePolicy === "local_copy_permitted"
-          ? "Local-copy permission/basis evidence recorded."
+          ? "Local-copy permission confirmed."
           : "Article image policy is unchanged."
         : "Article image policy updated.");
     } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }

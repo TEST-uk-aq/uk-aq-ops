@@ -26,6 +26,7 @@ Base snapshot date:
 
 Task-specific refresh:
 
+- `ref_docs/system_docs/dashboards/media_dashboard_contract.md` was refreshed from authoritative source commit `cc52669d6dabea44f851f8dc7d404e4c074682b8` on `02/10/2026` to make Article Status the first article-detail section, move Image policy below Display title, and use source-wide permission evidence plus an article confirmation checkbox without a duplicate article-level basis note.
 - `ref_docs/system_docs/dashboards/README.md` and `ref_docs/system_docs/dashboards/daily_task_warning_status_contract.md` were refreshed from authoritative source commit `bc14d60ddee0996a2765d3f84ba69ed9025fa94f` on `23/09/2026`.
 - `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/observs_operations/README.md` and `ref_docs/system_docs/observs_operations/partition_maintenance.md` were refreshed from authoritative source commit `223a129526d6ffeba734d013b52a806c2d7c1de6` on `23/09/2026`.
 - `ref_docs/system_docs/gcp_logging_archive/README.md` and `ref_docs/system_docs/gcp_logging_archive/contract.md` were refreshed after TEST acceptance from authoritative source contract commit `f005636e52314013abd249ae1e34a719d227983f` on `23/09/2026`; `ref_docs/system_docs/SYSTEM_OVERVIEW.md` was refreshed from authoritative source overview commit `bc75f9564953859733e4077d203590c52b9adb3f` in the same task.
