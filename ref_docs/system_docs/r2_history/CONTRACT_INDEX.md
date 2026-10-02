@@ -84,6 +84,7 @@ The exact-leaf amendment remains authoritative for `timeseries-aligned-v2`, 1,02
 | [`direct_selected_partition_replacement_contract.md`](direct_selected_partition_replacement_contract.md) | Direct selected-partition replacement |
 | [`daily_profile_selection.md`](daily_profile_selection.md) | Scheduled selection |
 | [`current_state_reconciliation.md`](current_state_reconciliation.md) | Post-verification timeseries and Latest Snapshot reconciliation |
+| [`official_network_rdata_historical_integrity_contract.md`](official_network_rdata_historical_integrity_contract.md) | **Future implementation authority:** WAQN connector `9` and SAQN connector `10` Ricardo/WSP RData historical source, range acquisition, timestamp alignment and pollutant-specific ratification mapping |
 
 ## SOS historical repair
 
@@ -95,6 +96,7 @@ The exact-leaf amendment remains authoritative for `timeseries-aligned-v2`, 1,02
 | [`sos_historical_repair_contract.md`](sos_historical_repair_contract.md) | Additional SOS historical repair behaviour not superseded by SOS-light |
 | [`sos_run_scoped_source_acquisition_contract.md`](sos_run_scoped_source_acquisition_contract.md) | Run-scoped SOS source acquisition |
 | [`sos_light_v2_coordinator_hardening_amendment.md`](sos_light_v2_coordinator_hardening_amendment.md) | **Future implementation authority:** fixed-v2 bounded coordinator checkpoints, final persisted-state equality, Python/Node transition fingerprint and bounded end-to-end progress; not current runtime until real TEST acceptance |
+| [`sos_light_stable_fallback_contract.md`](sos_light_stable_fallback_contract.md) | **Future implementation authority:** frozen executable SOS-light v3 fallback under `stable-sos-light/` plus a separate stable local wrapper, created before WAQN/SAQN active Integrity changes |
 
 SOS repair may also require the general Integrity provenance, replacement and current-state contracts above depending on task scope.
 
