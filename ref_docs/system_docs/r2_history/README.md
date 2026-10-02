@@ -189,6 +189,22 @@ Add [`current_state_reconciliation.md`](current_state_reconciliation.md) and [`.
 
 Do not load Prune Daily deletion-gate contracts for an SOS-only task unless the task actually crosses that ownership boundary.
 
+### Future WAQN/SAQN RData historical Integrity
+
+Status: **future implementation authority; not current runtime behaviour**.
+
+For historical observation repair/backfill for WAQN connector `9` and SAQN connector `10`, read:
+
+1. [`official_network_rdata_historical_integrity_contract.md`](official_network_rdata_historical_integrity_contract.md)
+2. the normal Generic Integrity route above;
+3. [`observation_history_schema_contract.md`](observation_history_schema_contract.md).
+
+Before any active Integrity implementation file is changed for this work, also read and implement the pre-change fallback boundary in [`sos_light_stable_fallback_contract.md`](sos_light_stable_fallback_contract.md).
+
+The RData contract owns the Ricardo/WSP site-year and metadata source authority, at-least-90-day range support, native-R decoding boundary, connector `9`/`10` mapping, timestamp-alignment check and pollutant-specific `ratified_to` to canonical `verification_status` mapping.
+
+The stable-fallback contract owns the pre-change archive ordering, frozen three-file `stable-sos-light/` copy and separate stable local wrapper. It does not change the normal scheduled SOS-light route.
+
 ### Future UK-AIR Black Carbon direct R2 history
 
 Status: **future implementation authority; not current runtime behaviour**.
