@@ -1217,6 +1217,19 @@
         flex-wrap: wrap;
       }
 
+      .daily-task-date-navigation {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .daily-task-day-button {
+        min-width: 32px;
+        padding: 5px 8px;
+        font-size: 17px;
+        line-height: 1;
+      }
+
       .daily-task-mode-switch {
         display: inline-flex;
         align-items: center;
@@ -1908,7 +1921,6 @@
       const DASHBOARD_MODE_STORAGE_KEY = "uk_aq_dashboard_mode";
       const DASHBOARD_REFRESH_INGEST_STORAGE_KEY = "uk_aq_dashboard_refresh_ingest_seconds";
       const DASHBOARD_REFRESH_OPERATIONS_STORAGE_KEY = "uk_aq_dashboard_refresh_operations_seconds";
-      const DAILY_TASK_RUNS_SELECTED_DAY_STORAGE_KEY = "ukAqDashboard.operations.dailyTaskRuns.selectedDay";
       const DAILY_TASK_RUNS_MODE_STORAGE_KEY = "ukAqDashboard.operations.dailyTaskRuns.mode";
       const DAILY_TASK_RUNS_MODE_VALUES = new Set(["latest", "all"]);
       const DAILY_TASK_RUNS_SORT_KEYS = new Set([
@@ -1927,7 +1939,7 @@
       let refreshNowBtn = null;
       let refreshTimer = null;
       let operationsDropboxPollTimer = null;
-      let dailyTaskRunsDayValue = null;
+      let dailyTaskRunsDayValue = toUtcDateKey(startOfUtcDay(new Date()));
       let dailyTaskRunsModeValue = "latest";
       let dailyTaskRunsRows = [];
       let dailyTaskRunsLoading = false;
@@ -2087,10 +2099,6 @@
             MIN_OPERATIONS_AUTO_REFRESH_SECONDS,
             storedOperationsRefresh
           );
-        }
-        const storedDailyTaskRunsDay = sessionStorage.getItem(DAILY_TASK_RUNS_SELECTED_DAY_STORAGE_KEY);
-        if (storedDailyTaskRunsDay && /^\d{4}-\d{2}-\d{2}$/.test(storedDailyTaskRunsDay)) {
-          dailyTaskRunsDayValue = storedDailyTaskRunsDay;
         }
         const storedDailyTaskRunsMode = sessionStorage.getItem(DAILY_TASK_RUNS_MODE_STORAGE_KEY);
         if (storedDailyTaskRunsMode && DAILY_TASK_RUNS_MODE_VALUES.has(storedDailyTaskRunsMode)) {
@@ -6189,6 +6197,54 @@
         });
       }
 
+      function getDailyTaskRunsTodayValue() {
+        return toUtcDateKey(startOfUtcDay(new Date()));
+      }
+
+      function updateDailyTaskRunsDateControls(panel) {
+        if (!panel) {
+          return;
+        }
+        const todayValue = getDailyTaskRunsTodayValue();
+        const selectedDay = dailyTaskRunsDayValue || todayValue;
+        const dayInput = panel.querySelector("#daily-task-runs-day-selector");
+        const previousButton = panel.querySelector("#daily-task-runs-previous-day");
+        const nextButton = panel.querySelector("#daily-task-runs-next-day");
+        const todayButton = panel.querySelector("#daily-task-runs-today");
+
+        if (dayInput) {
+          dayInput.value = selectedDay;
+          dayInput.max = todayValue;
+          dayInput.disabled = dailyTaskRunsLoading;
+        }
+        if (previousButton) {
+          previousButton.disabled = dailyTaskRunsLoading;
+        }
+        if (nextButton) {
+          nextButton.disabled = dailyTaskRunsLoading || selectedDay >= todayValue;
+        }
+        if (todayButton) {
+          todayButton.disabled = dailyTaskRunsLoading;
+        }
+      }
+
+      function setDailyTaskRunsDay(panel, nextValue) {
+        const parsed = parseUtcDateKey(nextValue);
+        if (!parsed) {
+          return;
+        }
+        const todayValue = getDailyTaskRunsTodayValue();
+        const normalizedValue = toUtcDateKey(parsed);
+        dailyTaskRunsDayValue = normalizedValue > todayValue ? todayValue : normalizedValue;
+        updateDailyTaskRunsDateControls(panel);
+        loadDailyTaskRunsCard({ force: true });
+      }
+
+      function moveDailyTaskRunsDay(panel, dayOffset) {
+        const currentDay = parseUtcDateKey(dailyTaskRunsDayValue) || startOfUtcDay(new Date());
+        setDailyTaskRunsDay(panel, toUtcDateKey(addUtcDays(currentDay, dayOffset)));
+      }
+
       function updateDailyTaskRunsModeButtons(panel) {
         const buttons = panel ? panel.querySelectorAll("[data-daily-task-mode]") : [];
         buttons.forEach((buttonEl) => {
@@ -6210,16 +6266,13 @@
         const requestId = ++dailyTaskRunsLoadSequence;
         dailyTaskRunsLoading = true;
 
-        const dayInput = panel.querySelector("#daily-task-runs-day-selector");
         const refreshButton = panel.querySelector("#daily-task-runs-refresh");
         const updatedEl = panel.querySelector("#daily-task-runs-updated");
-        if (dayInput) {
-          dayInput.disabled = true;
-        }
         if (refreshButton) {
           refreshButton.disabled = true;
           refreshButton.textContent = "Refreshing...";
         }
+        updateDailyTaskRunsDateControls(panel);
         updateDailyTaskRunsModeButtons(panel);
         if (!dailyTaskRunsRows.length) {
           renderDailyTaskRunsCardContent(panel, dailyTaskRunsRows, { loading: true, loadingMessage: "Loading daily task runs..." });
@@ -6279,13 +6332,11 @@
         } finally {
           if (requestId === dailyTaskRunsLoadSequence) {
             dailyTaskRunsLoading = false;
-            if (dayInput) {
-              dayInput.disabled = false;
-            }
             if (refreshButton) {
               refreshButton.disabled = false;
               refreshButton.textContent = "Refresh";
             }
+            updateDailyTaskRunsDateControls(panel);
             updateDailyTaskRunsModeButtons(panel);
           }
         }
@@ -6302,8 +6353,13 @@
             <div class="dispatch-filters">
               <label class="dispatch-filter" for="daily-task-runs-day-selector">
                 Day
-                <input class="settings-input" id="daily-task-runs-day-selector" type="date" value="${escapeHtml(dayValue)}" />
+                <input class="settings-input" id="daily-task-runs-day-selector" type="date" value="${escapeHtml(dayValue)}" max="${escapeHtml(getDailyTaskRunsTodayValue())}" />
               </label>
+              <div class="daily-task-date-navigation" role="group" aria-label="Daily task date navigation">
+                <button type="button" class="daily-task-mode-button daily-task-day-button" id="daily-task-runs-previous-day" aria-label="Previous day" title="Previous day">‹</button>
+                <button type="button" class="daily-task-mode-button daily-task-day-button" id="daily-task-runs-next-day" aria-label="Next day" title="Next day">›</button>
+                <button type="button" class="daily-task-mode-button" id="daily-task-runs-today">Today</button>
+              </div>
               <div class="daily-task-mode-switch" role="group" aria-label="Daily task run mode">
                 <button type="button" class="daily-task-mode-button${dailyTaskRunsModeValue === "latest" ? " is-active" : ""}" data-daily-task-mode="latest" aria-pressed="${dailyTaskRunsModeValue === "latest" ? "true" : "false"}">Latest</button>
                 <button type="button" class="daily-task-mode-button${dailyTaskRunsModeValue === "all" ? " is-active" : ""}" data-daily-task-mode="all" aria-pressed="${dailyTaskRunsModeValue === "all" ? "true" : "false"}">All runs</button>
@@ -6326,13 +6382,28 @@
             if (!/^\d{4}-\d{2}-\d{2}$/.test(nextValue)) {
               return;
             }
-            dailyTaskRunsDayValue = nextValue;
-            try {
-              sessionStorage.setItem(DAILY_TASK_RUNS_SELECTED_DAY_STORAGE_KEY, dailyTaskRunsDayValue);
-            } catch (_err) {
-              // Ignore storage write failures.
-            }
-            loadDailyTaskRunsCard({ force: true });
+            setDailyTaskRunsDay(panel, nextValue);
+          });
+        }
+
+        const previousDayButton = panel.querySelector("#daily-task-runs-previous-day");
+        if (previousDayButton) {
+          previousDayButton.addEventListener("click", () => {
+            moveDailyTaskRunsDay(panel, -1);
+          });
+        }
+
+        const nextDayButton = panel.querySelector("#daily-task-runs-next-day");
+        if (nextDayButton) {
+          nextDayButton.addEventListener("click", () => {
+            moveDailyTaskRunsDay(panel, 1);
+          });
+        }
+
+        const todayButton = panel.querySelector("#daily-task-runs-today");
+        if (todayButton) {
+          todayButton.addEventListener("click", () => {
+            setDailyTaskRunsDay(panel, getDailyTaskRunsTodayValue());
           });
         }
 
@@ -6363,6 +6434,7 @@
             loadDailyTaskRunsCard({ force: true });
           });
         }
+        updateDailyTaskRunsDateControls(panel);
         updateDailyTaskRunsModeButtons(panel);
         if (Array.isArray(dailyTaskRunsRows) && dailyTaskRunsRows.length) {
           renderDailyTaskRunsCardContent(panel, dailyTaskRunsRows);
