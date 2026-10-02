@@ -80,17 +80,6 @@ from integrity.current_state.audit import (
 )
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
 from integrity.timeseries_binding_provider import binding_backup_view
-from integrity.official_network_rdata import (
-    NETWORKS as OFFICIAL_RDATA_NETWORKS,
-    RDATA_COLUMN_TO_POLLUTANT,
-    canonical_rows_for_site_year,
-    download_pinned as download_official_rdata_pinned,
-    extract_metadata as extract_official_rdata_metadata,
-    extract_site_year as extract_official_rdata_site_year,
-    required_site_years as official_rdata_required_site_years,
-    resolve_rscript as resolve_official_rdata_rscript,
-    rscript_identity as official_rdata_rscript_identity,
-)
 
 
 REQUIRED_ENV_VARS = (
@@ -216,8 +205,6 @@ SOURCE_KEY_BY_CONNECTOR_CODE = {
     "openaq": "openaq",
     "sensorcommunity": "sensorcommunity",
     "sos": "sos",
-    "waqn": "waqn",
-    "saqn": "saqn",
 }
 
 # `--source all` includes all currently implemented source adapters.
@@ -225,24 +212,15 @@ CROSS_CHECK_SOURCE_KEYS_BY_FILTER: dict[str, tuple[str, ...]] = {
     "openaq": ("openaq",),
     "sensorcommunity": ("sensorcommunity",),
     "sos": ("sos",),
-    "waqn": ("waqn",),
-    "saqn": ("saqn",),
-    "all": ("openaq", "sensorcommunity", "sos", "waqn", "saqn"),
+    "all": ("openaq", "sensorcommunity", "sos"),
 }
 CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER: dict[str, tuple[str, ...]] = {
     "openaq": ("openaq",),
     "sensorcommunity": ("sensorcommunity",),
     # Phase 7.4: include sos in observation-repair candidates.
     "sos": ("sos",),
-    "waqn": ("waqn",),
-    "saqn": ("saqn",),
-    "all": ("openaq", "sensorcommunity", "sos", "waqn", "saqn"),
+    "all": ("openaq", "sensorcommunity", "sos"),
 }
-
-# Run-owned decoded rows. Exact RData bytes and their identities remain on disk;
-# this in-process index prevents a second source fetch/decoder pass in DETECT or
-# PROPOSE during the same Integrity run.
-OFFICIAL_RDATA_RUN_CONTEXTS: dict[str, dict[str, Any]] = {}
 
 # Subset of core tables that the integrity DB needs. Other tables in the
 # manifest (categories, observed_properties, offerings, features, procedures,
@@ -1903,9 +1881,7 @@ def classify_core_snapshot_status(
 
 def collect_lookup_active_counts_by_source(
     conn: sqlite3.Connection,
-    source_keys: Iterable[str] = (
-        "openaq", "sensorcommunity", "sos", "waqn", "saqn",
-    ),
+    source_keys: Iterable[str] = ("openaq", "sensorcommunity", "sos"),
 ) -> dict[str, dict[str, int]]:
     keys = tuple(dict.fromkeys(str(k) for k in source_keys if str(k)))
     if not keys:
@@ -14498,518 +14474,7 @@ def _source_file_keys_for_lookup_row(
             _uk_air_flat_file_source_file_key(source_location_id, int(year))
             for year in selection["years"]
         ]
-    if source_key in OFFICIAL_RDATA_NETWORKS:
-        return [
-            _official_rdata_source_file_key(source_key, source_location_id, year)
-            for year in official_rdata_required_site_years((day,))
-        ]
     return []
-
-
-def _official_rdata_source_file_key(
-    source_key: str,
-    site_code: str,
-    year: int,
-) -> str:
-    return f"{source_key}:site_ref={site_code.upper()}:year={int(year)}"
-
-
-def _official_rdata_bindings(
-    conn: sqlite3.Connection,
-    *,
-    source_key: str,
-) -> tuple[
-    dict[str, dict[str, dict[str, int]]],
-    str,
-    str,
-    dict[str, list[dict[str, Any]]],
-]:
-    """Resolve one authoritative active timeseries per site/pollutant."""
-    rows = conn.execute(
-        """
-        SELECT
-          UPPER(TRIM(l.source_location_id)),
-          l.station_id,
-          l.timeseries_id,
-          LOWER(TRIM(m.observed_property_code)),
-          m.observed_property_code_count
-        FROM source_station_timeseries_lookup l
-        JOIN core_timeseries_snapshot t ON t.id = l.timeseries_id
-        JOIN core_phenomena_snapshot p ON p.id = t.phenomenon_id
-        LEFT JOIN (
-          SELECT connector_id, observed_property_id,
-                 MIN(LOWER(TRIM(observed_property_code))) AS observed_property_code,
-                 COUNT(DISTINCT LOWER(TRIM(observed_property_code))) AS observed_property_code_count
-          FROM core_observed_property_mappings_snapshot
-          WHERE is_active = 1
-            AND observed_property_id IS NOT NULL
-            AND TRIM(observed_property_code) != ''
-          GROUP BY connector_id, observed_property_id
-        ) m
-          ON m.connector_id = t.connector_id
-         AND m.observed_property_id = p.observed_property_id
-        WHERE l.source_key = ?
-          AND l.is_active = 1
-          AND l.source_location_id IS NOT NULL
-        ORDER BY UPPER(TRIM(l.source_location_id)), l.timeseries_id
-        """,
-        (source_key,),
-    ).fetchall()
-    supported = set(RDATA_COLUMN_TO_POLLUTANT.values())
-    grouped: dict[tuple[str, str], list[dict[str, int]]] = {}
-    mapping_rows: list[dict[str, Any]] = []
-    observed_property_rows: list[dict[str, Any]] = []
-    excluded_rows: list[dict[str, Any]] = []
-    mapping_defects: list[dict[str, Any]] = []
-    for site_code, station_id, timeseries_id, pollutant_code, code_count in rows:
-        code = str(pollutant_code or "").strip().lower()
-        identity = {
-            "site_code": str(site_code),
-            "station_id": int(station_id),
-            "timeseries_id": int(timeseries_id),
-            "observed_property_code": code,
-            "observed_property_code_count": int(code_count or 0),
-        }
-        observed_property_rows.append(identity)
-        if int(code_count or 0) != 1:
-            mapping_defects.append({
-                **identity,
-                "reason": (
-                    "ambiguous_active_observed_property_mapping"
-                    if int(code_count or 0) > 1
-                    else "missing_active_observed_property_mapping"
-                ),
-            })
-            continue
-        if code not in supported:
-            excluded_rows.append({
-                **identity,
-                "reason": "unsupported_integrity_pollutant",
-            })
-            continue
-        binding = {
-            "station_id": int(station_id),
-            "timeseries_id": int(timeseries_id),
-        }
-        grouped.setdefault((str(site_code), code), []).append(binding)
-    if mapping_defects:
-        sample = ", ".join(
-            f"{row['site_code']}/timeseries={row['timeseries_id']}/"
-            f"{row['reason']}"
-            for row in mapping_defects[:10]
-        )
-        raise RuntimeError(
-            f"{source_key} authoritative observed-property mapping is defective: "
-            f"{sample}"
-        )
-    ambiguous = {
-        key: values for key, values in grouped.items() if len(values) != 1
-    }
-    if ambiguous:
-        sample = ", ".join(
-            f"{site}/{pollutant}={len(values)}"
-            for (site, pollutant), values in sorted(ambiguous.items())[:10]
-        )
-        raise RuntimeError(
-            f"{source_key} authoritative binding is ambiguous: {sample}"
-        )
-    bindings: dict[str, dict[str, dict[str, int]]] = {}
-    for (site_code, pollutant_code), values in sorted(grouped.items()):
-        bindings.setdefault(site_code, {})[pollutant_code] = values[0]
-        mapping_rows.append({
-            "site_code": site_code,
-            "pollutant_code": pollutant_code,
-            **values[0],
-        })
-    if not bindings:
-        raise RuntimeError(
-            f"{source_key} has no unambiguous active authoritative bindings"
-        )
-    mapping_hash = hashlib.sha256(json.dumps(
-        mapping_rows, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
-    observed_property_hash = hashlib.sha256(json.dumps(
-        observed_property_rows, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
-    return (
-        bindings,
-        mapping_hash,
-        observed_property_hash,
-        {
-            "mapped_source_groups": mapping_rows,
-            "excluded_source_groups": excluded_rows,
-        },
-    )
-
-
-def check_official_network_rdata(
-    *,
-    conn: sqlite3.Connection,
-    source_key: str,
-    env_name: str,
-    env: Mapping[str, str],
-    from_day: str,
-    to_day: str,
-    selected_days: Iterable[str] | None,
-    limits: LimitTracker,
-    log: logging.Logger,
-    run_compact: str,
-) -> dict[str, Any]:
-    """Acquire/decode one WAQN or SAQN run without refetching source bytes."""
-    config = OFFICIAL_RDATA_NETWORKS[source_key]
-    resolve_official_rdata_rscript()
-    days = _selected_dates_or_range(from_day, to_day, selected_days)
-    day_set = set(days)
-    if not days:
-        return {"ran": False, "skipped_reason": "empty selected date range"}
-    (
-        bindings,
-        mapping_hash,
-        observed_property_hash,
-        mapping_audit,
-    ) = _official_rdata_bindings(conn, source_key=source_key)
-    actual_connector_ids = {
-        int(row[0]) for row in conn.execute(
-            "SELECT DISTINCT connector_id FROM source_station_timeseries_lookup WHERE source_key = ?",
-            (source_key,),
-        ).fetchall()
-    }
-    if actual_connector_ids != {config.connector_id}:
-        raise RuntimeError(
-            f"{source_key} connector identity mismatch: expected={config.connector_id} "
-            f"resolved={sorted(actual_connector_ids)}"
-        )
-
-    run_root = (
-        Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"])
-        / source_key / "_runs" / run_compact
-    )
-    run_root.mkdir(parents=True, exist_ok=True)
-    now_iso = utc_now().isoformat()
-    identities_by_key: dict[str, dict[str, Any]] = {}
-    absent_keys: set[str] = set()
-    downloaded_bytes = 0
-
-    def acquire(
-        *, source_file_key: str, url: str, destination: Path,
-        site_code: str | None, year: int | None,
-    ) -> dict[str, Any] | None:
-        nonlocal downloaded_bytes
-        if limits.should_stop():
-            raise RuntimeError(
-                f"{source_key} RData acquisition stopped by {limits.stopped_for}"
-            )
-        prior = _fetch_prior_state(conn, source_file_key)
-        started = time.monotonic()
-        try:
-            pinned = download_official_rdata_pinned(url, destination)
-        except urllib.error.HTTPError as exc:
-            if exc.code != 404:
-                raise
-            absent_keys.add(source_file_key)
-            _upsert_source_state(
-                conn=conn, source_key=source_key, remote_scheme="openair_rdata",
-                source_file_key=source_file_key, env_name=env_name,
-                remote_url_or_key=url, station_ref=site_code,
-                source_location_id=site_code, day=days[0], exists_remote=False,
-                content_length=None, etag=None, last_modified_utc=None,
-                sha256_downloaded=None, sha256_uncompressed=None,
-                local_cached_path=None, now_iso=now_iso,
-                last_changed_at=None, last_status="missing",
-                notes=f"authoritative HTTP 404 year={year}" if year else "authoritative HTTP 404",
-                source_count_mapping_identity="official_network_rdata_v1",
-                source_count_mapping_hash=mapping_hash,
-            )
-            return None
-        limits.add_bytes(int(pinned["bytes"]))
-        downloaded_bytes += int(pinned["bytes"])
-        event_type = (
-            "first_seen" if prior is None
-            else "reappeared" if not int(prior.get("exists_remote") or 0)
-            else "unchanged" if str(prior.get("sha256_downloaded") or "") == pinned["sha256"]
-            else "changed"
-        )
-        _upsert_source_state(
-            conn=conn, source_key=source_key, remote_scheme="openair_rdata",
-            source_file_key=source_file_key, env_name=env_name,
-            remote_url_or_key=url, station_ref=site_code,
-            source_location_id=site_code, day=days[0], exists_remote=True,
-            content_length=int(pinned["bytes"]), etag=pinned.get("etag"),
-            last_modified_utc=pinned.get("last_modified"),
-            sha256_downloaded=str(pinned["sha256"]),
-            sha256_uncompressed=None, local_cached_path=str(destination),
-            now_iso=now_iso,
-            last_changed_at=now_iso if event_type != "unchanged" else None,
-            last_status=event_type,
-            notes=f"base R load(); year={year}" if year else "base R load(); current metadata",
-            source_count_mapping_identity="official_network_rdata_v1",
-            source_count_mapping_hash=mapping_hash,
-        )
-        if event_type != "unchanged":
-            _insert_source_event(
-                conn=conn, source_key=source_key, event_type=event_type,
-                env_name=env_name, source_file_key=source_file_key,
-                remote_url_or_key=url, station_ref=site_code,
-                source_location_id=site_code, day=days[0], prior=prior,
-                new_content_length=int(pinned["bytes"]),
-                new_etag=pinned.get("etag"),
-                new_last_modified_utc=pinned.get("last_modified"),
-                new_sha256_downloaded=str(pinned["sha256"]),
-                new_sha256_uncompressed=None,
-                downloaded_bytes=int(pinned["bytes"]),
-                hash_runtime_ms=int((time.monotonic() - started) * 1000),
-                now_iso=now_iso,
-                notes="native RData acquisition",
-            )
-        identity = {
-            "source_file": source_file_key,
-            "url": url,
-            "bytes": int(pinned["bytes"]),
-            "sha256": str(pinned["sha256"]),
-        }
-        identities_by_key[source_file_key] = identity
-        return identity
-
-    metadata_key = f"{source_key}:metadata"
-    metadata_path = run_root / config.metadata_filename
-    metadata_url = config.base_url + config.metadata_filename
-    if acquire(
-        source_file_key=metadata_key, url=metadata_url,
-        destination=metadata_path, site_code=None, year=None,
-    ) is None:
-        raise RuntimeError(f"{source_key} metadata RData is unavailable")
-    metadata_rows = extract_official_rdata_metadata(metadata_path, config=config)
-
-    rows_by_day: dict[str, list[dict[str, Any]]] = {
-        day.isoformat(): [] for day in days
-    }
-    audits_by_day: dict[str, list[dict[str, Any]]] = {
-        day.isoformat(): [] for day in days
-    }
-    required_by_day: dict[str, set[str]] = {
-        day.isoformat(): {metadata_key} for day in days
-    }
-    decoded_files = 0
-    for site_code, site_bindings in sorted(bindings.items()):
-        for year in official_rdata_required_site_years(days):
-            source_file_key = _official_rdata_source_file_key(
-                source_key, site_code, year,
-            )
-            for day in days:
-                if year in official_rdata_required_site_years((day,)):
-                    required_by_day[day.isoformat()].add(source_file_key)
-            filename = f"{site_code}_{year}.RData"
-            destination = run_root / f"site={site_code}" / filename
-            identity = acquire(
-                source_file_key=source_file_key,
-                url=config.base_url + filename,
-                destination=destination,
-                site_code=site_code,
-                year=year,
-            )
-            if identity is None:
-                _record_source_file_timeseries_counts(
-                    conn, source_file_key, {}, now_iso,
-                    source_count_mapping_identity="official_network_rdata_v1",
-                    source_count_mapping_hash=mapping_hash,
-                )
-                continue
-            decoded = extract_official_rdata_site_year(
-                destination, site_code=site_code, year=year,
-            )
-            canonical, audits = canonical_rows_for_site_year(
-                decoded,
-                connector_id=config.connector_id,
-                site_code=site_code,
-                bindings_by_pollutant=site_bindings,
-                metadata_rows=metadata_rows,
-                selected_days=day_set,
-            )
-            counts: dict[tuple[str, int], int] = {}
-            for row in canonical:
-                day_utc = str(row["observed_at_utc"])[:10]
-                rows_by_day[day_utc].append(row)
-                key = (day_utc, int(row["timeseries_id"]))
-                counts[key] = counts.get(key, 0) + 1
-                audits_by_day[day_utc].extend(audits)
-            _record_source_file_timeseries_counts(
-                conn, source_file_key, counts, now_iso,
-                source_count_mapping_identity="official_network_rdata_v1",
-                source_count_mapping_hash=mapping_hash,
-            )
-            decoded_files += 1
-
-    for day_utc, rows in rows_by_day.items():
-        rows.sort(key=lambda row: (
-            row["observed_at_utc"], row["timeseries_id"], row["pollutant_code"],
-        ))
-        identities = [
-            (row["timeseries_id"], row["observed_at_utc"], row["pollutant_code"])
-            for row in rows
-        ]
-        if len(identities) != len(set(identities)):
-            raise RuntimeError(
-                f"{source_key} RData produced duplicate canonical identities for {day_utc}"
-            )
-        audits_by_day[day_utc] = [
-            dict(values) for _key, values in sorted({
-                json.dumps(value, sort_keys=True, separators=(",", ":")): value
-                for value in audits_by_day[day_utc]
-            }.items())
-        ]
-
-    context = {
-        "source_key": source_key,
-        "connector_id": config.connector_id,
-        "rows_by_day": rows_by_day,
-        "audits_by_day": audits_by_day,
-        "required_by_day": {
-            key: sorted(value) for key, value in required_by_day.items()
-        },
-        "identities_by_key": identities_by_key,
-        "absent_keys": sorted(absent_keys),
-        "authoritative_mapping_sha256": mapping_hash,
-        "observed_property_mapping_sha256": observed_property_hash,
-        "mapping_audit": mapping_audit,
-        "rscript_identity": official_rdata_rscript_identity(),
-        "run_root": str(run_root),
-    }
-    OFFICIAL_RDATA_RUN_CONTEXTS[source_key] = context
-    manifest_path = run_root / "acquisition-manifest.json"
-    manifest_body = json.dumps(context, sort_keys=True, separators=(",", ":"))
-    manifest_path.write_text(manifest_body, encoding="utf-8")
-    conn.commit()
-    metrics = {
-        "ran": True,
-        "source_key": source_key,
-        "connector_id": config.connector_id,
-        "rscript": context["rscript_identity"],
-        "timestamp_mapping": "date_beginning_plus_one_hour",
-        "metadata_files_fetched": 1,
-        "site_year_files_fetched": len(identities_by_key) - 1,
-        "site_year_files_decoded": decoded_files,
-        "source_files_authoritatively_absent": len(absent_keys),
-        "downloaded_bytes": downloaded_bytes,
-        "canonical_rows": sum(len(rows) for rows in rows_by_day.values()),
-        "selected_day_count": len(days),
-        "source_years": official_rdata_required_site_years(days),
-        "acquisition_manifest": str(manifest_path),
-        "acquisition_manifest_sha256": hashlib.sha256(
-            manifest_body.encode("utf-8")
-        ).hexdigest(),
-        "stopped_for": limits.stopped_for,
-    }
-    log.info("%s RData: done %s", source_key, metrics)
-    return metrics
-
-
-def _prepare_official_rdata_proposal(
-    *,
-    source_key: str,
-    day_utc: str,
-    connector_id: int,
-    selected_pollutants: Iterable[str],
-    stage_root: Path,
-    env: Mapping[str, str],
-) -> dict[str, Any]:
-    context = OFFICIAL_RDATA_RUN_CONTEXTS.get(source_key)
-    if context is None:
-        raise RuntimeError(f"{source_key} run-owned RData context is unavailable")
-    if int(context["connector_id"]) != int(connector_id):
-        raise RuntimeError(f"{source_key} RData connector scope changed")
-    pollutants = _normalise_repair_pollutants(selected_pollutants)
-    rows = [
-        dict(row) for row in context["rows_by_day"].get(day_utc, [])
-        if str(row.get("pollutant_code") or "") in pollutants
-    ]
-    required = list(context["required_by_day"].get(day_utc, []))
-    identities = [
-        context["identities_by_key"][key]
-        for key in required if key in context["identities_by_key"]
-    ]
-    absent = sorted(set(required) - set(context["identities_by_key"]))
-    if set(absent) - set(context["absent_keys"]):
-        raise RuntimeError(f"{source_key} RData source identity set is incomplete")
-    repo_root = _repo_root_for_integrity_script(env)
-    helper = (
-        repo_root / "scripts/uk-aq-history-integrity/bin/integrity/"
-        "official_network_rdata_proposal.mjs"
-    )
-    writer_git_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
-    ).stdout.strip().lower()
-    input_payload = {
-        "day_utc": day_utc,
-        "connector_id": int(connector_id),
-        "source_adapter": source_key,
-        "requested_pollutant_set": pollutants,
-        "backed_up_at_utc": utc_now().isoformat().replace("+00:00", "Z"),
-        "rows": rows,
-        "source_file_identities": identities,
-        "required_source_files": required,
-        "authoritatively_absent_source_files": absent,
-        "authoritative_mapping_sha256": context[
-            "authoritative_mapping_sha256"
-        ],
-        "observed_property_mapping_sha256": context[
-            "observed_property_mapping_sha256"
-        ],
-        "ratification_audit": context["audits_by_day"].get(day_utc, []),
-        "mapping_audit": context["mapping_audit"],
-        "rscript_identity": context["rscript_identity"],
-    }
-    input_dir = stage_root / "official-rdata-input"
-    input_dir.mkdir(parents=True, exist_ok=True)
-    input_path = input_dir / f"{source_key}-{day_utc}-connector-{connector_id}.json"
-    input_path.write_text(
-        json.dumps(input_payload, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
-    process = subprocess.run(
-        [
-            node_bin, str(helper), str(input_path), str(stage_root),
-            R2_HISTORY_V2_OBSERVATIONS_PREFIX, writer_git_sha,
-        ],
-        cwd=repo_root,
-        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if process.returncode != 0:
-        raise RuntimeError(
-            f"{source_key} RData proposal helper failed: "
-            + _truncate_text(process.stderr or process.stdout or "", 2000)
-        )
-    result = json.loads(process.stdout)
-    if not isinstance(result, dict) or result.get("status") != "ok":
-        raise RuntimeError(f"{source_key} RData proposal helper returned invalid JSON")
-    result.update({
-        "exit_code": 0,
-        "backfill_run_status": "ok",
-        "integrity_proposal_chunk_staged_events": 1,
-        "integrity_proposal_staged_rows": len(rows),
-        "max_integrity_proposal_staged_rows": len(rows),
-        "repaired_timeseries_row_counts": result.get(
-            "source_timeseries_row_counts", {}
-        ),
-    })
-    return result
-
-
-def _official_rdata_source_for_connector(connector_id: int) -> str | None:
-    matches = sorted(
-        source_key for source_key, context in OFFICIAL_RDATA_RUN_CONTEXTS.items()
-        if int(context.get("connector_id") or 0) == int(connector_id)
-    )
-    if len(matches) > 1:
-        raise RuntimeError(
-            f"official RData connector maps to multiple run contexts: {connector_id}"
-        )
-    return matches[0] if matches else None
 
 
 def _source_cache_status_for_connector_day(
@@ -16714,9 +16179,6 @@ def run_v2_observation_content_hash_checks(
         )
     )
     evidence_by_connector_day: dict[tuple[str, int], dict[str, Any]] = {}
-    source_rows_by_connector_day: dict[
-        tuple[str, int], list[dict[str, Any]]
-    ] = {}
     errors_by_connector_day: dict[tuple[str, int], str] = {}
     sos_connector_id = int(
         str(env.get("UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK") or "1")
@@ -16738,9 +16200,6 @@ def run_v2_observation_content_hash_checks(
         registry_snapshot: dict[str, Any] | None = None
         bridge_snapshot: dict[str, Any] | None = None
         try:
-            official_rdata_source = _official_rdata_source_for_connector(
-                connector_id
-            )
             if connector_id == sos_connector_id:
                 registry_snapshot = write_uk_air_source_label_registry_snapshot(
                     conn=conn,
@@ -16763,49 +16222,39 @@ def run_v2_observation_content_hash_checks(
                         f"connector_id={connector_id}.json"
                     ),
                 )
-            if official_rdata_source:
-                result = _prepare_official_rdata_proposal(
-                    source_key=official_rdata_source,
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    selected_pollutants=selected_pollutants,
-                    stage_root=stage_root,
-                    env=env,
-                )
-            else:
-                result = run_narrow_backfill(
-                    wrapper_path=resolve_integrity_backfill_wrapper(),
-                    env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                    env_name=env_name,
-                    timeseries_ids=[],
-                    connector_ids=[connector_id],
-                    day=dt.date.fromisoformat(day_utc),
-                    log=log,
-                    log_dir=log_dir,
-                    log_label=(
-                        f"v2_obs_hash_day_{day_utc}_connector_{connector_id}"
-                    ),
-                    output_scope="observations_only",
-                    history_version="v2",
-                    extra_env={
-                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
-                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "false",
-                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
-                        "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
-                        "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
-                        **({
-                            "UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE":
-                                registry_snapshot["path"]
-                        } if registry_snapshot else {}),
-                        **({
-                            "UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE":
-                                bridge_snapshot["path"]
-                        } if bridge_snapshot else {}),
-                    },
-                    complete_connector_day=True,
-                    repair_pollutants=selected_pollutants,
-                )
+            result = run_narrow_backfill(
+                wrapper_path=resolve_integrity_backfill_wrapper(),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
+                timeseries_ids=[],
+                connector_ids=[connector_id],
+                day=dt.date.fromisoformat(day_utc),
+                log=log,
+                log_dir=log_dir,
+                log_label=(
+                    f"v2_obs_hash_day_{day_utc}_connector_{connector_id}"
+                ),
+                output_scope="observations_only",
+                history_version="v2",
+                extra_env={
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "false",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
+                    "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
+                    "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                    **({
+                        "UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE":
+                            registry_snapshot["path"]
+                    } if registry_snapshot else {}),
+                    **({
+                        "UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE":
+                            bridge_snapshot["path"]
+                    } if bridge_snapshot else {}),
+                },
+                complete_connector_day=True,
+                repair_pollutants=selected_pollutants,
+            )
             if result.get("status") != "ok":
                 raise RuntimeError(
                     "observation hash source evidence worker failed:"
@@ -16828,7 +16277,6 @@ def run_v2_observation_content_hash_checks(
                 canonical_rows=rows,
             )
             evidence_by_connector_day[(day_utc, connector_id)] = evidence
-            source_rows_by_connector_day[(day_utc, connector_id)] = rows
             conn.commit()
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             errors_by_connector_day[(day_utc, connector_id)] = str(exc)
@@ -16887,79 +16335,6 @@ def run_v2_observation_content_hash_checks(
             new_gaps.append(gap)
             metrics["invalid_contract"] += 1
             continue
-        if _official_rdata_source_for_connector(connector_id):
-            def canonical_timestamp(row: Mapping[str, Any]) -> str:
-                parsed = _parse_required_timestamp_value(
-                    row.get("observed_at_utc") or row.get("observed_at")
-                )
-                return _format_utc_timestamp(parsed) if parsed is not None else ""
-
-            try:
-                persisted_rows = _observation_rows_from_local_parquet_for_shared_hash(
-                    parquet_paths=candidate.get("parquet_paths") or [],
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                log.warning(
-                    "official RData ratification regression check could not read "
-                    "existing partition day=%s connector_id=%s pollutant=%s: %s",
-                    day_utc, connector_id, pollutant_code, exc,
-                )
-                gap = _v2_obs_gap(
-                    "source_mapping_issue",
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                    expected_path=str(candidate.get("manifest_rel") or ""),
-                    related_paths=[
-                        "rdata_ratification_regression_check_unavailable",
-                        _truncate_text(str(exc), 500),
-                    ],
-                )
-                new_gaps.append(gap)
-                metrics["invalid_contract"] += 1
-                continue
-            persisted_ratified = {
-                (
-                    int(row.get("timeseries_id") or 0),
-                    canonical_timestamp(row),
-                    float(row.get("value")),
-                )
-                for row in persisted_rows
-                if str(row.get("pollutant_code") or "").lower() == pollutant_code
-                and row.get("verification_status") == "R"
-            }
-            contradictions = [
-                row for row in source_rows_by_connector_day.get(
-                    (day_utc, connector_id), []
-                )
-                if str(row.get("pollutant_code") or "").lower() == pollutant_code
-                and row.get("verification_status") == "P"
-                and (
-                    int(row.get("timeseries_id") or 0),
-                    canonical_timestamp(row),
-                    float(row.get("value")),
-                ) in persisted_ratified
-            ]
-            if contradictions:
-                gap = _v2_obs_gap(
-                    "source_mapping_issue",
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                    expected_path=str(candidate.get("manifest_rel") or ""),
-                    related_paths=[
-                        "contradictory_rdata_ratification_regression",
-                        f"identical_existing_ratified_rows={len(contradictions)}",
-                    ],
-                )
-                gap["source_evidence"]["contradiction"] = {
-                    "kind": "ratification_boundary_regression",
-                    "row_count": len(contradictions),
-                    "samples": contradictions[:10],
-                }
-                new_gaps.append(gap)
-                metrics["invalid_contract"] += 1
-                continue
         source_hash = dict(
             (evidence.get("observation_content_hashes") or {}).get(
                 pollutant_code
@@ -17687,9 +17062,6 @@ def run_v2_gap_backfills(
         partition_source_evidence: dict[str, Any] = {}
         detector_evidence_error: str | None = None
         detector_result: dict[str, Any] | None = None
-        official_rdata_source = _official_rdata_source_for_connector(
-            connector_id
-        )
         source_acquisition_consumer_env = (
             {
                 "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE": "consume",
@@ -17705,43 +17077,33 @@ def run_v2_gap_backfills(
             ignore_errors=True,
         )
         try:
-            if official_rdata_source:
-                detector_result = _prepare_official_rdata_proposal(
-                    source_key=official_rdata_source,
-                    day_utc=day_iso,
-                    connector_id=connector_id,
-                    selected_pollutants=selected_repair_pollutants,
-                    stage_root=detector_stage_root,
-                    env=env,
-                )
-            else:
-                detector_result = run_narrow_backfill(
-                    wrapper_path=resolve_integrity_backfill_wrapper(),
-                    env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                    env_name=env_name,
-                    timeseries_ids=[],
-                    connector_ids=[connector_id],
-                    day=day_obj,
-                    log=log,
-                    log_dir=backfill_log_dir,
-                    log_label=f"v2_obs_detector_day_{day_iso}_connector_{connector_id}",
-                    output_scope="observations_only",
-                    history_version="v2",
-                    extra_env={
-                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(detector_stage_root),
-                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "false",
-                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
-                        "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
-                        "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
-                        **source_acquisition_consumer_env,
-                        **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
-                        **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
-                    },
-                    complete_connector_day=True,
-                    repair_pollutants=selected_repair_pollutants,
-                )
-            if run_state is not None and not official_rdata_source:
+            detector_result = run_narrow_backfill(
+                wrapper_path=resolve_integrity_backfill_wrapper(),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
+                timeseries_ids=[],
+                connector_ids=[connector_id],
+                day=day_obj,
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=f"v2_obs_detector_day_{day_iso}_connector_{connector_id}",
+                output_scope="observations_only",
+                history_version="v2",
+                extra_env={
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(detector_stage_root),
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "false",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
+                    "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
+                    "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                    **source_acquisition_consumer_env,
+                    **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
+                    **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
+                },
+                complete_connector_day=True,
+                repair_pollutants=selected_repair_pollutants,
+            )
+            if run_state is not None:
                 _record_backfill_core_snapshot_identity_audits(
                     run_state,
                     detector_result,
@@ -17901,33 +17263,23 @@ def run_v2_gap_backfills(
                 **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
                 **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
             }
-            if official_rdata_source:
-                bf = _prepare_official_rdata_proposal(
-                    source_key=official_rdata_source,
-                    day_utc=day_iso,
-                    connector_id=connector_id,
-                    selected_pollutants=selected_repair_pollutants,
-                    stage_root=stage_root,
-                    env=env,
-                )
-            else:
-                bf = run_narrow_backfill(
-                    wrapper_path=resolve_integrity_backfill_wrapper(),
-                    env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                    env_name=env_name,
-                    timeseries_ids=chunk_ids,
-                    connector_ids=[connector_id],
-                    day=day_obj,
-                    log=log,
-                    log_dir=backfill_log_dir,
-                    log_label=chunk_label,
-                    output_scope="observations_only",
-                    history_version="v2",
-                    extra_env=extra_env,
-                    complete_connector_day=True,
-                    repair_pollutants=selected_repair_pollutants,
-                )
-            if run_state is not None and not official_rdata_source:
+            bf = run_narrow_backfill(
+                wrapper_path=resolve_integrity_backfill_wrapper(),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
+                timeseries_ids=chunk_ids,
+                connector_ids=[connector_id],
+                day=day_obj,
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=chunk_label,
+                output_scope="observations_only",
+                history_version="v2",
+                extra_env=extra_env,
+                complete_connector_day=True,
+                repair_pollutants=selected_repair_pollutants,
+            )
+            if run_state is not None:
                 _record_backfill_core_snapshot_identity_audits(
                     run_state,
                     bf,
@@ -25691,7 +25043,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--source",
         default="all",
-        choices=["openaq", "sensorcommunity", "sos", "waqn", "saqn", "all"],
+        choices=["openaq", "sensorcommunity", "sos", "all"],
         help="Source adapter filter (also scopes cross-check source rows).",
     )
     p.add_argument("--from-day", dest="from_day", default=None,
@@ -26974,18 +26326,12 @@ def collect_preflight_errors(
                 )
 
     # Source adapter dependency checks (local import only; no network in preflight).
-    if args.source in {"openaq", "all", "sensorcommunity", "sos", "waqn", "saqn"}:
+    if args.source in {"openaq", "all", "sensorcommunity", "sos"}:
         for module_name in ("gzip", "hashlib", "urllib.request", "sqlite3"):
             try:
                 __import__(module_name)
             except Exception as exc:  # pragma: no cover - defensive
                 errors.append(f"required Python module '{module_name}' failed to import ({exc}).")
-
-    if args.source in {"waqn", "saqn", "all"}:
-        try:
-            resolve_official_rdata_rscript()
-        except RuntimeError as exc:
-            errors.append(str(exc))
 
     if args.source in {"sos", "all"}:
         flat_file_supabase = _resolve_ingestdb_supabase_rest_config(os.environ)
@@ -28432,7 +27778,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             "## Active lookup counts",
             "",
         ])
-        for source_key in ("openaq", "sensorcommunity", "sos", "waqn", "saqn"):
+        for source_key in ("openaq", "sensorcommunity", "sos"):
             entry = lookup_counts.get(source_key) or {}
             lines.append(
                 f"- {source_key}: stations={int(entry.get('active_stations', 0))} "
@@ -29728,8 +29074,6 @@ def main(argv: list[str]) -> int:
         openaq_metrics: dict[str, Any] = dict(empty_metrics)
         sc_metrics: dict[str, Any] = dict(empty_metrics)
         sos_metrics: dict[str, Any] = dict(empty_metrics)
-        waqn_metrics: dict[str, Any] = dict(empty_metrics)
-        saqn_metrics: dict[str, Any] = dict(empty_metrics)
         cross_check_metrics: dict[str, Any] = dict(empty_metrics)
         sos_binding_verification: dict[str, Any] | None = None
         verified_first_value_at_connector_days: list[dict[str, Any]] = []
@@ -29833,49 +29177,6 @@ def main(argv: list[str]) -> int:
                 concurrency=max(1, int(args.concurrency)),
                 history_version=source_adapter_history_version,
             )
-
-        for official_source in ("waqn", "saqn"):
-            should_run = args.source in {official_source, "all"} and snapshot_ok
-            if args.source in {official_source, "all"} and not should_run:
-                log.warning(
-                    "%s: skipped because core snapshot status=%s (need imported/reused)",
-                    official_source,
-                    snapshot_result["status"],
-                )
-            if not should_run:
-                continue
-            if int((lookup_source_counts.get(official_source) or {}).get(
-                "active_timeseries", 0
-            )) <= 0:
-                official_metrics = {
-                    "ran": False,
-                    "skipped_reason": (
-                        "no active authoritative timeseries bindings in "
-                        "the imported core snapshot"
-                    ),
-                }
-                if official_source == "waqn":
-                    waqn_metrics = official_metrics
-                else:
-                    saqn_metrics = official_metrics
-                log.warning("%s: skipped — %s", official_source, official_metrics["skipped_reason"])
-                continue
-            official_metrics = check_official_network_rdata(
-                conn=conn,
-                source_key=official_source,
-                env_name=args.env,
-                env=env,
-                from_day=from_day,
-                to_day=to_day,
-                selected_days=selected_day_values,
-                limits=limits,
-                log=log,
-                run_compact=run_compact,
-            )
-            if official_source == "waqn":
-                waqn_metrics = official_metrics
-            else:
-                saqn_metrics = official_metrics
 
         if args.skip_cross_check:
             cross_check_metrics = {
@@ -30210,15 +29511,11 @@ def main(argv: list[str]) -> int:
             openaq_metrics.get("ran")
             or sc_metrics.get("ran")
             or sos_metrics.get("ran")
-            or waqn_metrics.get("ran")
-            or saqn_metrics.get("ran")
         )
         any_stopped = (
             openaq_metrics.get("stopped_for")
             or sc_metrics.get("stopped_for")
             or sos_metrics.get("stopped_for")
-            or waqn_metrics.get("stopped_for")
-            or saqn_metrics.get("stopped_for")
         )
 
         # Decide top-level run status.
@@ -30330,8 +29627,6 @@ def main(argv: list[str]) -> int:
             ("openaq", openaq_metrics),
             ("sensorcommunity", sc_metrics),
             ("sos", sos_metrics),
-            ("waqn", waqn_metrics),
-            ("saqn", saqn_metrics),
         ):
             if adapter_metrics.get("ran"):
                 notes_parts.append(
@@ -30386,8 +29681,6 @@ def main(argv: list[str]) -> int:
                 int(openaq_metrics.get(key, 0))
                 + int(sc_metrics.get(key, 0))
                 + int(sos_metrics.get(key, 0))
-                + int(waqn_metrics.get(key, 0))
-                + int(saqn_metrics.get(key, 0))
             )
 
         cross_check_backfills_attempted = int(
@@ -30422,10 +29715,6 @@ def main(argv: list[str]) -> int:
             warnings_count_total += 1
         if sos_metrics.get("skipped_reason"):
             warnings_count_total += 1
-        if waqn_metrics.get("skipped_reason"):
-            warnings_count_total += 1
-        if saqn_metrics.get("skipped_reason"):
-            warnings_count_total += 1
         if cross_check_metrics.get("skipped_reason"):
             warnings_count_total += 1
         if openaq_metrics.get("stopped_for"):
@@ -30433,10 +29722,6 @@ def main(argv: list[str]) -> int:
         if sc_metrics.get("stopped_for"):
             warnings_count_total += 1
         if sos_metrics.get("stopped_for"):
-            warnings_count_total += 1
-        if waqn_metrics.get("stopped_for"):
-            warnings_count_total += 1
-        if saqn_metrics.get("stopped_for"):
             warnings_count_total += 1
         warnings_count_total += int(
             sos_metrics.get(
@@ -30785,8 +30070,6 @@ def main(argv: list[str]) -> int:
             "openaq": openaq_metrics,
             "sensor_community": sc_metrics,
             "sos": sos_metrics,
-            "waqn": waqn_metrics,
-            "saqn": saqn_metrics,
             "cross_check": cross_check_metrics,
             "metrics": metrics,
             "notes": notes,
