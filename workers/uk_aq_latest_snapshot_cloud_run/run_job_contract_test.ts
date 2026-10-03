@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import {
   buildMetadataIndex,
   buildSourceRows,
+  coreMetadataTableKeys,
+  metadataCacheRepresentsLatestCoreManifest,
+  normalizeCoreMetadataCacheFile,
   validateSnapshotContractPaths,
 } from "./run_job.ts";
 
@@ -27,6 +30,7 @@ function fixtureMetadata() {
       station_name: "BL Node 001",
       pcon_code: "E14000001",
       la_code: null,
+      removed_at: null,
     }, {
       id: 21,
       connector_id: 1,
@@ -37,6 +41,7 @@ function fixtureMetadata() {
       station_name: "AURN Node 001",
       pcon_code: "E14000001",
       la_code: null,
+      removed_at: null,
     }],
     networks: [{
       id: 30,
@@ -162,6 +167,115 @@ Deno.test("unmatched latest rows expose null canonical fields and one scalar sit
     network_id: 30,
     network_code: "breathelondon",
     network_label: "Breathe London Nodes",
+  }]);
+});
+
+Deno.test("older core metadata without station_matches remains a valid empty canonical projection", () => {
+  const fixture = {
+    schema_version: 2,
+    generated_at: "2026-10-03T12:00:00.000Z",
+    source_day_utc: "2026-10-03",
+    connectors: [],
+    stations: [],
+    networks: [],
+    timeseries: [],
+    phenomena: [],
+    observed_properties: [],
+  };
+
+  const normalized = normalizeCoreMetadataCacheFile(fixture);
+
+  assert.ok(normalized);
+  assert.deepEqual(normalized.station_matches, []);
+  assert.equal(metadataCacheRepresentsLatestCoreManifest(normalized, {
+    day_utc: "2026-10-03",
+    key: "history/v2/core/day_utc=2026-10-03/manifest.json",
+    last_modified: "2026-10-03T12:01:00.000Z",
+  }), false);
+});
+
+Deno.test("older core manifest may omit the additive station_matches table", () => {
+  const keys = coreMetadataTableKeys({
+    day_utc: "2026-10-02",
+    tables: [
+      { table: "connectors", key: "core/connectors.ndjson" },
+      { table: "networks", key: "core/networks.ndjson" },
+      { table: "stations", key: "core/stations.ndjson" },
+      { table: "timeseries", key: "core/timeseries.ndjson" },
+      { table: "phenomena", key: "core/phenomena.ndjson" },
+      { table: "observed_properties", key: "core/observed_properties.ndjson" },
+    ],
+  });
+
+  assert.equal(keys.has("station_matches"), false);
+});
+
+Deno.test("core metadata uses station_matches when the additive table is present", () => {
+  const keys = coreMetadataTableKeys({
+    day_utc: "2026-10-03",
+    tables: [
+      { table: "connectors", key: "core/connectors.ndjson" },
+      { table: "networks", key: "core/networks.ndjson" },
+      { table: "stations", key: "core/stations.ndjson" },
+      { table: "station_matches", key: "core/station_matches.ndjson" },
+      { table: "timeseries", key: "core/timeseries.ndjson" },
+      { table: "phenomena", key: "core/phenomena.ndjson" },
+      { table: "observed_properties", key: "core/observed_properties.ndjson" },
+    ],
+  });
+
+  assert.equal(keys.get("station_matches"), "core/station_matches.ndjson");
+});
+
+Deno.test("removed matched stations do not contribute current canonical memberships", () => {
+  const metadata = fixtureMetadata();
+  const regionalStation = metadata.stationsById.get(20);
+  const aurnStation = metadata.stationsById.get(21);
+  if (!regionalStation || !aurnStation) throw new Error("fixture stations missing");
+  regionalStation.removed_at = "2026-10-01T00:00:00.000Z";
+  aurnStation.removed_at = "2026-10-01T00:00:00.000Z";
+
+  const rebuilt = buildMetadataIndex({
+    schema_version: 2,
+    generated_at: "2026-06-29T00:00:00.000Z",
+    source_day_utc: "2026-06-29",
+    connectors: [...metadata.connectorsById.values()],
+    stations: [...metadata.stationsById.values()],
+    station_matches: [...metadata.stationMatchesById.values()],
+    networks: [...metadata.networksById.values()],
+    timeseries: [...metadata.timeseriesById.values()],
+    phenomena: [...metadata.phenomenaById.values()],
+    observed_properties: [...metadata.observedPropertyById.values()],
+  });
+  const item = buildSourceRows(fixtureState(), rebuilt, "v2").rows[0].item as Record<string, unknown>;
+
+  assert.deepEqual(item.site_networks, []);
+});
+
+Deno.test("current canonical memberships exclude only the removed source network", () => {
+  const metadata = fixtureMetadata();
+  const regionalStation = metadata.stationsById.get(20);
+  if (!regionalStation) throw new Error("fixture station missing");
+  regionalStation.removed_at = "2026-10-01T00:00:00.000Z";
+
+  const rebuilt = buildMetadataIndex({
+    schema_version: 2,
+    generated_at: "2026-06-29T00:00:00.000Z",
+    source_day_utc: "2026-06-29",
+    connectors: [...metadata.connectorsById.values()],
+    stations: [...metadata.stationsById.values()],
+    station_matches: [...metadata.stationMatchesById.values()],
+    networks: [...metadata.networksById.values()],
+    timeseries: [...metadata.timeseriesById.values()],
+    phenomena: [...metadata.phenomenaById.values()],
+    observed_properties: [...metadata.observedPropertyById.values()],
+  });
+  const item = buildSourceRows(fixtureState(), rebuilt, "v2").rows[0].item as Record<string, unknown>;
+
+  assert.deepEqual(item.site_networks, [{
+    network_id: 31,
+    network_code: "gov_uk_aurn",
+    network_label: "GOV.UK AURN",
   }]);
 });
 

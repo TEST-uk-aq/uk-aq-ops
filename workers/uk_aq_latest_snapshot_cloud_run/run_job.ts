@@ -246,6 +246,7 @@ type MetadataStation = {
   station_name: string | null;
   pcon_code: string | null;
   la_code: string | null;
+  removed_at: string | null;
 };
 
 type MetadataStationMatch = {
@@ -1095,7 +1096,7 @@ function buildMetadataIndex(cache: CoreMetadataCacheFile): MetadataIndex {
 
   const siteNetworkMaps = new Map<number, Map<number, SiteNetwork>>();
   for (const station of cache.stations) {
-    if (!station.match_id || !station.network_id) continue;
+    if (station.removed_at || !station.match_id || !station.network_id) continue;
     const network = networksById.get(station.network_id);
     if (!network?.public_display_enabled || !network.network_code || !network.display_name) continue;
     const byNetworkId = siteNetworkMaps.get(station.match_id) || new Map<number, SiteNetwork>();
@@ -1135,19 +1136,45 @@ function isMetadataCacheFresh(cache: CoreMetadataCacheFile): boolean {
   return ageMs <= UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS * 1000;
 }
 
-function isCoreMetadataCacheFile(value: unknown): value is CoreMetadataCacheFile {
-  if (!value || typeof value !== "object") return false;
+function normalizeCoreMetadataCacheFile(value: unknown): CoreMetadataCacheFile | null {
+  if (!value || typeof value !== "object") return null;
   const cache = value as Record<string, unknown>;
-  return cache.schema_version === 2 &&
+  if (!(cache.schema_version === 2 &&
     typeof cache.generated_at === "string" &&
     (cache.source_day_utc === null || typeof cache.source_day_utc === "string") &&
     Array.isArray(cache.connectors) &&
     Array.isArray(cache.stations) &&
-    Array.isArray(cache.station_matches) &&
+    (cache.station_matches === undefined || Array.isArray(cache.station_matches)) &&
     Array.isArray(cache.networks) &&
     Array.isArray(cache.timeseries) &&
     Array.isArray(cache.phenomena) &&
-    Array.isArray(cache.observed_properties);
+    Array.isArray(cache.observed_properties))) return null;
+  return {
+    ...(cache as unknown as CoreMetadataCacheFile),
+    station_matches: Array.isArray(cache.station_matches)
+      ? cache.station_matches as MetadataStationMatch[]
+      : [],
+  };
+}
+
+function coreMetadataTableKeys(manifest: CoreSnapshotManifest): Map<string, string> {
+  const keys = new Map<string, string>();
+  const requiredTables = [
+    "connectors",
+    "networks",
+    "stations",
+    "timeseries",
+    "phenomena",
+    "observed_properties",
+  ];
+  for (const tableName of requiredTables) {
+    const key = tableKeyFromManifest(manifest, tableName);
+    if (!key) throw new Error(`Core snapshot manifest missing table ${tableName}`);
+    keys.set(tableName, key);
+  }
+  const stationMatchesKey = tableKeyFromManifest(manifest, "station_matches");
+  if (stationMatchesKey) keys.set("station_matches", stationMatchesKey);
+  return keys;
 }
 
 function metadataCacheRepresentsLatestCoreManifest(
@@ -1217,6 +1244,7 @@ function mapStationRows(rows: Array<Record<string, unknown>>): MetadataStation[]
       station_name: normalizeNonEmptyText(String(row.station_name ?? "")),
       pcon_code: normalizeNonEmptyText(String(row.pcon_code ?? "")),
       la_code: normalizeNonEmptyText(String(row.la_code ?? "")),
+      removed_at: normalizeTimestamp(row.removed_at),
     });
   }
   return output;
@@ -1321,9 +1349,9 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
     objectsRead += 1;
     bytesRead += cacheObject.body.byteLength;
     const text = new TextDecoder().decode(cacheObject.body);
-    const parsed: unknown = JSON.parse(text);
+    const parsed = normalizeCoreMetadataCacheFile(JSON.parse(text));
     if (
-      isCoreMetadataCacheFile(parsed) &&
+      parsed &&
       isMetadataCacheFresh(parsed) &&
       metadataCacheRepresentsLatestCoreManifest(parsed, latestManifestInfo)
     ) {
@@ -1349,22 +1377,9 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
   const manifestText = new TextDecoder().decode(manifestObject.body);
   const manifest = parseCoreManifest(manifestText);
 
-  const requiredTables = [
-    "connectors",
-    "networks",
-    "stations",
-    "station_matches",
-    "timeseries",
-    "phenomena",
-    "observed_properties",
-  ];
-
   const tableRows = new Map<string, Array<Record<string, unknown>>>();
-  for (const tableName of requiredTables) {
-    const key = tableKeyFromManifest(manifest, tableName);
-    if (!key) {
-      throw new Error(`Core snapshot manifest missing table ${tableName}`);
-    }
+  const metadataTableKeys = coreMetadataTableKeys(manifest);
+  for (const [tableName, key] of metadataTableKeys) {
     const object = await r2GetObject({ r2: R2_CONFIG, key });
     objectsRead += 1;
     bytesRead += object.body.byteLength;
@@ -1648,7 +1663,7 @@ function buildSourceRows(
         match_id: stationMatch.id,
         uk_air_ref: stationMatch.uk_air_ref,
         canonical_station_label: stationMatch.match_name,
-        site_networks: (metadata.siteNetworksByMatchId.get(stationMatch.id) || [stationNetworkFields])
+        site_networks: (metadata.siteNetworksByMatchId.get(stationMatch.id) || [])
           .map((entry) => ({ ...entry })),
       }
       : {
@@ -2194,12 +2209,15 @@ async function main(): Promise<void> {
 export {
   buildMetadataIndex,
   buildSourceRows,
+  coreMetadataTableKeys,
   mapConnectorRows,
   mapNetworkRows,
   mapObservedPropertyRows,
   mapPhenomenonRows,
   mapStationRows,
   mapTimeseriesRows,
+  metadataCacheRepresentsLatestCoreManifest,
+  normalizeCoreMetadataCacheFile,
   parseContractVersion,
   validateSnapshotContractPaths,
 };
