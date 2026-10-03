@@ -112,6 +112,14 @@ For SOS-light fixed-v2/fixed-v3 repair, route back to [`../r2_history/sos_light_
 For the **first locked post-v3 backup after a controlled steady-state write**, also read [`../r2_history/observation_history_index_v3_steady_state_acceptance_amendment.md`](../r2_history/observation_history_index_v3_steady_state_acceptance_amendment.md). That contract owns any separate post-write acceptance gate.
 
 For an observation-history **`v3-rebuild`** or LIVE **`v2-to-v3`** migration, use the dedicated transition/migration contracts. Those migration/rollback rules are distinct from normal SOS-light repair and normal Dropbox backup scope.
+### Observation verification overlay backup
+
+When the future R2 verification overlay is in scope, also read:
+
+- [`r2_history_verification_overlay_backup_amendment.md`](r2_history_verification_overlay_backup_amendment.md)
+
+That future amendment makes `history/v3/verification/**` plus `history/_index_v3/verification/latest.json` mandatory backup payload, gives verification its own processed-source-root identity, and defines connector-manifest-first/latest-last restore ordering. It is not current backup runtime until the overlay is deployed and accepted on TEST.
+
 ### Restore or recovery
 
 Do not infer complete system-wide restore capability from the backup contracts. The generic R2 restore workflow predates the complete hierarchical design.
