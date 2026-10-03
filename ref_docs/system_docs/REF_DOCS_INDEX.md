@@ -42,6 +42,8 @@ Task-specific refresh:
 
 - `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, the R2-history router/index, observation schema/AURN/SOS/Prune/WAQN-SAQN contracts, the new `observation_verification_overlay_contract.md`, and the backup router/umbrella plus new verification-overlay backup amendment were refreshed from authoritative source head `b431c9952ffbb40a79b4d5620d6eb75c92df6621` on `03/10/2026`. This records the future measurement-only Parquet + parallel verification-period authority, schema-version-4 target, status-only no-Parquet-rewrite rule, Prune Daily change, and mandatory Dropbox backup/restore coverage for verification authority.
 
+- The verification-overlay mirror was refreshed from authoritative source head `d494186331bcee6c77bd444cf9f61da66f70ad9b` on `03/10/2026`. The refresh hardens the future design to immutable SHA-addressed connector manifests with latest-last crash-safe publication, separates semantic manifest identity from exact source-acquisition audit evidence, requires mixed schema-3/schema-4 exact reads during connector cut-over, bounds mutable verification-latest caching to 60 seconds while permitting long-lived immutable-manifest caching, and updates Dropbox backup/restore authority to copy referenced immutable manifests before latest.
+
 ## Reading rule
 
 When `../TEST-uk-aq-system-docs/system_docs/` exists, coding agents should use that sibling authoritative tree.
