@@ -38,7 +38,9 @@ Task-specific refresh:
 
 - `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/r2_history/README.md`, `ref_docs/system_docs/r2_history/CONTRACT_INDEX.md`, `ref_docs/system_docs/r2_history/sos_light_v2_coordinator_hardening_amendment.md`, `ref_docs/system_docs/r2_history/proposal_run_state_transition_contract.md` and `ref_docs/system_docs/r2_history/integrity_apply_progress_persistence_contract.md` were refreshed from authoritative source commit `c9c943f811484b6c83c1486be38b7481ed202ce7` on `26/09/2026`. This adds the explicitly future fixed-v2 SOS-light coordinator hardening contract and brings the previously missing proposal-transition/apply-progress contracts into the ops mirror.
 
-- `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/r2_history/README.md`, `ref_docs/system_docs/r2_history/CONTRACT_INDEX.md`, `ref_docs/system_docs/r2_history/official_network_rdata_historical_integrity_contract.md` and `ref_docs/system_docs/r2_history/sos_light_stable_fallback_contract.md` were refreshed from authoritative source head `02f69924785a37ebc621690fbe1d7a9c13256690` on `02/10/2026`. This adds the explicitly future WAQN connector `9` / SAQN connector `10` RData historical Integrity authority and the required pre-change frozen SOS-light v3 fallback with its separate stable local wrapper.
+- `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/r2_history/README.md`, `ref_docs/system_docs/r2_history/CONTRACT_INDEX.md`, `ref_docs/system_docs/r2_history/official_network_rdata_historical_integrity_contract.md` and `ref_docs/system_docs/r2_history/sos_light_stable_fallback_contract.md` were refreshed from authoritative source head `02f69924785a37ebc621690fbe1d7a9c13256690` on `03/10/2026`. This adds the explicitly future WAQN connector `9` / SAQN connector `10` RData historical Integrity authority and the required pre-change frozen SOS-light v3 fallback with its separate stable local wrapper.
+
+- `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, the R2-history router/index, observation schema/AURN/SOS/Prune/WAQN-SAQN contracts, the new `observation_verification_overlay_contract.md`, and the backup router/umbrella plus new verification-overlay backup amendment were refreshed from authoritative source head `b431c9952ffbb40a79b4d5620d6eb75c92df6621` on `03/10/2026`. This records the future measurement-only Parquet + parallel verification-period authority, schema-version-4 target, status-only no-Parquet-rewrite rule, Prune Daily change, and mandatory Dropbox backup/restore coverage for verification authority.
 
 ## Reading rule
 
@@ -59,6 +61,7 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 - History Integrity;
 - SOS-light and SOS historical repair, including the load-bearing three-phase authority contract;
 - future WAQN/SAQN RData historical Integrity source authority and the frozen SOS-light stable-fallback boundary;
+- future observation verification-overlay authority, including measurement-only Parquet, AURN/WAQN/SAQN verification periods, reader/cache semantics and Dropbox backup/restore coverage;
 - future fixed-v2 SOS-light pre-mutation global-lock recovery authority, including fresh-session reacquisition and exact original-authority revalidation;
 - observation-history index v3 and exact-leaf behaviour;
 - Integrity writer/core/proposal/apply safety;
